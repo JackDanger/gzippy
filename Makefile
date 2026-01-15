@@ -15,6 +15,7 @@ RESULTS_DIR := test_results
 GZIP_BIN := $(GZIP_DIR)/gzip
 PIGZ_BIN := $(PIGZ_DIR)/pigz
 RIGZ_BIN := $(RIGZ_DIR)/target/release/rigz
+UNRIGZ_BIN := $(RIGZ_DIR)/target/release/unrigz
 
 .PHONY: all build quick perf-full test-data clean help validate deps
 
@@ -27,7 +28,7 @@ all: quick
 # Build targets
 # =============================================================================
 
-build: $(RIGZ_BIN)
+build: $(RIGZ_BIN) $(UNRIGZ_BIN)
 
 deps: $(GZIP_BIN) $(PIGZ_BIN)
 	@echo "✓ Dependencies ready"
@@ -49,19 +50,24 @@ $(RIGZ_BIN): FORCE
 	@cd $(RIGZ_DIR) && cargo build --release 2>&1 | grep -E "(Compiling rigz|Finished|error)" || true
 	@echo "✓ Built rigz"
 
+# Create unrigz symlink (like unpigz)
+$(UNRIGZ_BIN): $(RIGZ_BIN)
+	@ln -sf rigz $(UNRIGZ_BIN)
+	@echo "✓ Created unrigz symlink"
+
 FORCE:
 
 # =============================================================================
 # Quick benchmark (~20 seconds) - for AI tools and fast iteration
 # =============================================================================
-quick: $(RIGZ_BIN) $(GZIP_BIN) $(PIGZ_BIN)
+quick: $(RIGZ_BIN) $(UNRIGZ_BIN) $(GZIP_BIN) $(PIGZ_BIN)
 	@chmod +x scripts/quick_bench.sh
 	@./scripts/quick_bench.sh
 
 # =============================================================================
 # Full performance tests (10+ minutes) - for humans at release time
 # =============================================================================
-perf-full: $(RIGZ_BIN) $(GZIP_BIN) $(PIGZ_BIN) test-data
+perf-full: $(RIGZ_BIN) $(UNRIGZ_BIN) $(GZIP_BIN) $(PIGZ_BIN) test-data
 	@echo "============================================"
 	@echo "  RIGZ Full Performance Suite"
 	@echo "  (This will take 10+ minutes)"
@@ -87,7 +93,7 @@ test-data:
 # =============================================================================
 # Validation target - verify all outputs decompress correctly
 # =============================================================================
-validate: $(RIGZ_BIN)
+validate: $(RIGZ_BIN) $(UNRIGZ_BIN)
 	@echo "Running validation suite..."
 	@mkdir -p $(TEST_DATA_DIR)
 	@echo "test content for validation" > $(TEST_DATA_DIR)/validate.txt
@@ -104,10 +110,28 @@ validate: $(RIGZ_BIN)
 			fi; \
 		done; \
 	done; \
+	echo "Testing unrigz symlink..."; \
+	$(RIGZ_BIN) -c $(TEST_DATA_DIR)/validate.txt > /tmp/v.gz 2>/dev/null; \
+	if $(UNRIGZ_BIN) -c /tmp/v.gz 2>/dev/null | diff -q - $(TEST_DATA_DIR)/validate.txt >/dev/null 2>&1; then \
+		echo "✓ unrigz decompression"; \
+		passed=$$((passed+1)); \
+	else \
+		echo "✗ unrigz decompression FAILED"; \
+		failed=$$((failed+1)); \
+	fi; \
 	rm -f /tmp/v.gz; \
 	echo ""; \
 	echo "Passed: $$passed, Failed: $$failed"; \
 	[ $$failed -eq 0 ] || exit 1
+
+# =============================================================================
+# Install target
+# =============================================================================
+install: $(RIGZ_BIN) $(UNRIGZ_BIN)
+	@echo "Installing to /usr/local/bin..."
+	@install -m 755 $(RIGZ_BIN) /usr/local/bin/rigz
+	@ln -sf rigz /usr/local/bin/unrigz
+	@echo "✓ Installed rigz and unrigz"
 
 # =============================================================================
 # Cleanup
@@ -130,7 +154,7 @@ help:
 	@echo "Quick commands (for AI tools and iteration):"
 	@echo "  make              Build and run quick benchmark (< 30 seconds)"
 	@echo "  make quick        Same as above"
-	@echo "  make build        Build rigz only"
+	@echo "  make build        Build rigz and unrigz"
 	@echo "  make deps         Build gzip and pigz from submodules"
 	@echo "  make validate     Run validation suite"
 	@echo ""
@@ -138,11 +162,13 @@ help:
 	@echo "  make perf-full    Comprehensive performance tests (10+ minutes)"
 	@echo "  make test-data    Generate all test data files"
 	@echo ""
+	@echo "Installation:"
+	@echo "  make install      Install rigz and unrigz to /usr/local/bin"
+	@echo ""
 	@echo "Maintenance:"
 	@echo "  make clean        Remove all build artifacts and test data"
 	@echo "  make help         Show this message"
 	@echo ""
-	@echo "Performance targets:"
-	@echo "  - Beat gzip single-threaded (within 5%)"
-	@echo "  - Beat pigz multi-threaded"
-	@echo "  - Valid gzip output that works with gunzip"
+	@echo "Binaries:"
+	@echo "  rigz              Compress (default) or decompress with -d"
+	@echo "  unrigz            Decompress (like gunzip/unpigz)"

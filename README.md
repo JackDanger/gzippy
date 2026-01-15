@@ -2,8 +2,9 @@
 
 **Fastest gzip implementation, written in Rust.**
 
-2%-15% faster than `gzip`
-2%-8% faster than [pigz](https://zlib.net/pigz/) on any number of cores
+2% - 15% faster than `gzip`
+
+2% - 8% faster than [pigz](https://zlib.net/pigz/) on any number of cores
 
 Inspired by [pigz](https://zlib.net/pigz/) from [Mark Adler](https://en.wikipedia.org/wiki/Mark_Adler), co-creator of zlib and gzip.
 
