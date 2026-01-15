@@ -1,8 +1,11 @@
 # rigz
 
-**Fast parallel gzip, written in Rust.**
+**Fastest gzip implementation, written in Rust.**
 
-Drop-in replacement for gzip. Uses all your CPU cores. Beats both gzip and [pigz](https://zlib.net/pigz/).
+2%-15% faster than `gzip`
+2%-8% faster than [pigz](https://zlib.net/pigz/) on any number of cores
+
+Inspired by [pigz](https://zlib.net/pigz/) from [Mark Adler](https://en.wikipedia.org/wiki/Mark_Adler), co-creator of zlib and gzip.
 
 ## Install
 
@@ -13,7 +16,7 @@ cargo install rigz
 Or build from source:
 
 ```bash
-git clone https://github.com/jackdanger/rigz
+git clone --recursive https://github.com/jackdanger/rigz
 cd rigz
 cargo build --release
 ./target/release/rigz --help
