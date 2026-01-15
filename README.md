@@ -51,12 +51,12 @@ Output is byte-for-byte compatible with `gunzip`.
 
 ## How It Works
 
-1. **Block-based parallelism**: Input splits into 128KB blocks (like pigz)
+1. **Block-based parallelism**: Input splits into 128KB blocks (this is what pigz does)
 2. **Independent compression**: Each block compresses in parallel via [rayon](https://docs.rs/rayon)
 3. **Concatenated gzip**: Blocks become separate gzip members ([RFC 1952](https://datatracker.ietf.org/doc/html/rfc1952) allows this)
 4. **System zlib**: Uses your system's zlib for identical compression to gzip
 
-Key architectural decisions:
+## Wait, but how?
 - **Single-threaded mode goes direct to flate2** - no overhead
 - **Memory-mapped I/O for large files** - zero-copy via [memmap2](https://docs.rs/memmap2)
 - **Global rayon thread pool** - no per-call initialization cost
