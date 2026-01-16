@@ -59,8 +59,8 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 4. ✅ **ISIZE buffer sizing** - Read gzip trailer for accurate pre-allocation
 5. ✅ **Thread-local decompressor** - Reuse libdeflate decompressor
 6. ✅ **CPU feature detection** - Runtime AVX/NEON/CRC32 detection
-7. ✅ **Parallel decompression** - rayon + libdeflate for multi-member files (>1MB)
-8. ✅ **Vectorized I/O** - write_vectored for reduced syscalls in compression/decompression
+7. ✅ **Vectorized I/O** - write_vectored for reduced syscalls in compression
+8. ✅ **Statistical validation** - 5+ trials per test with median/stdev reporting
 
 ## Future Optimizations (see OPTIMIZATION_OPPORTUNITIES.md)
 
@@ -72,8 +72,9 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 1. **Manual deflate boundary detection** - Deflate streams contain false gzip headers
 2. **Dynamic block sizing** - Added complexity, 14% slower
 3. **gzp crate** - Threading issues; custom rayon is better
-4. **Parallel libdeflate per-member** - Boundary detection requires full inflate
+4. **Parallel libdeflate per-member** - Boundary detection requires full inflate (2x overhead)
 5. **zlib-ng Level 1 directly** - Uses RLE strategy, produces 2-5x larger files on repetitive data (we map L1→L2)
+6. **Parallel decompression** - Requires finding member boundaries first, which means decompressing once to find them, then again in parallel. 2x overhead made it slower for files with many small members (like rigz's 128KB chunks). Sequential MultiGzDecoder is faster.
 
 ## Benchmarking
 

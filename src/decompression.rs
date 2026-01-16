@@ -256,21 +256,15 @@ fn decompress_single_member_libdeflate<W: Write>(data: &[u8], writer: &mut W) ->
     })
 }
 
-/// Minimum file size for parallel decompression (1MB)
-/// Below this, the overhead of finding member boundaries exceeds the parallel benefit
-const PARALLEL_DECOMPRESS_THRESHOLD: usize = 1024 * 1024;
-
-/// Decompress multi-member gzip - uses parallel path for large files
+/// Decompress multi-member gzip using sequential zlib-ng
+///
+/// Note: We previously had a parallel decompression path, but it required
+/// finding member boundaries first (which means decompressing once to find
+/// boundaries, then again in parallel). This 2x overhead made it slower
+/// for files with many small members (like rigz's 128KB chunks).
+///
+/// The sequential MultiGzDecoder is fast enough and doesn't have this overhead.
 fn decompress_multi_member_zlibng<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
-    // For large files, use parallel decompression
-    if data.len() >= PARALLEL_DECOMPRESS_THRESHOLD {
-        if let Ok(total) = decompress_multi_member_parallel(data, writer) {
-            return Ok(total);
-        }
-        // Fall through to sequential if parallel fails
-    }
-
-    // Sequential path for small files or fallback
     decompress_multi_member_sequential(data, writer)
 }
 
@@ -303,6 +297,11 @@ fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> 
 
 /// Find gzip member boundaries by inflating each member
 /// Returns vector of (start_offset, length) for each member
+///
+/// Note: Currently unused - the parallel decompression path was disabled
+/// because the boundary-finding overhead (requires full decompression)
+/// made it slower than sequential for files with many small members.
+#[allow(dead_code)]
 fn find_member_boundaries(data: &[u8]) -> Vec<(usize, usize)> {
     use flate2::bufread::GzDecoder;
     use std::io::Read;
@@ -344,6 +343,11 @@ fn find_member_boundaries(data: &[u8]) -> Vec<(usize, usize)> {
 }
 
 /// Parallel multi-member decompression using rayon + libdeflate
+///
+/// Note: Currently unused - requires finding member boundaries first,
+/// which means decompressing once to find boundaries, then again in parallel.
+/// This 2x overhead made it slower for files with many small members.
+#[allow(dead_code)]
 fn decompress_multi_member_parallel<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
     use libdeflater::{DecompressionError, Decompressor};
     use rayon::prelude::*;
