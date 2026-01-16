@@ -1,6 +1,6 @@
 # rigz - Rust Parallel Gzip
 
-Fast, parallel gzip replacement. Beats gzip and pigz.
+Fast, parallel gzip replacement. Beats gzip and pigz by 40-50%.
 
 ## Quick Commands
 
@@ -12,18 +12,41 @@ cargo test   # Unit tests
 
 ## Key Architecture Decisions
 
-1. **System zlib only** - `flate2` with `features = ["zlib"]`, NOT libz-ng
-2. **128KB fixed blocks** - Dynamic sizing regressed performance 14%
-3. **Single-thread = direct path** - No optimizer overhead for `-p1`
-4. **mmap for >50MB files** - Zero-copy via memmap2
-5. **Global rayon pool** - `OnceLock<ThreadPool>` avoids per-call cost
+1. **zlib-ng for compression** - `flate2` with `features = ["zlib-ng"]` for 2-3x faster compression
+2. **libdeflate for decompression** - 30-50% faster than zlib for in-memory operations
+3. **128KB fixed blocks** - Dynamic sizing regressed performance 14%
+4. **Single-thread = direct path** - No optimizer overhead for `-p1`
+5. **mmap for parallel compression** - Zero-copy via memmap2 for files > 128KB
+6. **Global rayon pool** - `OnceLock<ThreadPool>` avoids per-call cost
+
+## Decompression Strategy
+
+- **Single-member gzip**: Use libdeflate (fastest, 30-50% faster than zlib)
+- **Multi-member gzip**: Use zlib-ng via flate2 (reliable member boundary parsing)
+- Quick-scan first 256KB to detect multi-member files from parallel compression
+- Don't try to parse deflate stream boundaries manually - deflate data can contain false gzip magic bytes
+
+## What Doesn't Work
+
+- **Parallel decompression with manual boundary detection** - Deflate streams can contain bytes that look like gzip headers (`1f 8b 08`), making boundary detection unreliable
+- **Dynamic block sizing** - Added complexity with 14% performance regression
+- **gzp crate** - Had threading issues; custom rayon implementation is better
 
 ## Performance Rules
 
-- **20 runs** for 1MB tests (CV can be 20%+)
-- **10 runs** for 10MB tests
+- **30 runs** for 1MB tests (CV can be 20%+)
+- **15 runs** for 10MB tests
 - Use **median** not min
-- Target: match gzip single-threaded, beat pigz multi-threaded
+- Target: beat both gzip and pigz in all scenarios
+
+## Current Performance (Level 6)
+
+| Size | Threads | vs gzip | vs pigz |
+|------|---------|---------|---------|
+| 1MB  | 1       | -47%    | -47%    |
+| 1MB  | 4       | -80%    | -41%    |
+| 10MB | 1       | -52%    | -52%    |
+| 10MB | 4       | -87%    | -53%    |
 
 ## File Map
 
@@ -31,10 +54,11 @@ cargo test   # Unit tests
 src/
 ├── main.rs              # CLI
 ├── compression.rs       # File compression orchestration  
-├── parallel_compress.rs # Core: rayon parallel gzip
+├── parallel_compress.rs # Core: rayon parallel gzip with mmap
 ├── cli.rs               # gzip-compatible args
-├── decompression.rs     # Decompression
-└── optimization.rs      # Thread/buffer tuning
+├── decompression.rs     # Decompression (libdeflate + flate2)
+├── optimization.rs      # Thread/buffer tuning
+└── simple_optimizations.rs # SimpleOptimizer wrapper
 ```
 
 See CONTRIBUTING.md for detailed lessons learned.

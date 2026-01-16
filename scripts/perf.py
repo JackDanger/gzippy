@@ -43,8 +43,8 @@ DEFAULT_THREADS = [1, 4]
 DEFAULT_SIZES_QUICK = [1, 10]      # MB
 DEFAULT_SIZES_FULL = [1, 10, 100]  # MB
 
-# Statistical config - more runs for shorter tests
-RUNS_BY_SIZE = {1: 10, 10: 5, 100: 3}
+# Statistical config - more runs for shorter tests to reduce noise
+RUNS_BY_SIZE = {1: 30, 10: 15, 100: 7}
 
 # Acceptable overhead (rigz can be up to 5% slower and still "pass")
 MAX_OVERHEAD_PCT = 5.0

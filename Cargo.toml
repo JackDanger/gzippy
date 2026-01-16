@@ -13,9 +13,13 @@ categories = ["compression", "command-line-utilities"]
 authors = ["Jack Danger Canty"]
 
 [dependencies]
-# Compression: flate2 with system zlib for gzip-identical output at all levels
-# IMPORTANT: Do NOT use libz-ng - it produces different compression ratios at L1-L8
-flate2 = { version = "1.0", default-features = false, features = ["zlib"] }
+# Compression: flate2 with zlib-ng for maximum performance
+# zlib-ng is a modernized fork with SIMD optimizations (2-3x faster)
+flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
+
+# Decompression: libdeflater provides Rust bindings to libdeflate 
+# (30-50% faster than zlib for in-memory operations)
+libdeflater = "1.0"
 
 # Parallel processing
 rayon = "1.8"

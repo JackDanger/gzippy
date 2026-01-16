@@ -12,16 +12,16 @@ cargo test   # Run unit tests
 
 ```
 src/
-├── main.rs              # CLI entry point
-├── cli.rs               # gzip-compatible argument parsing
-├── compression.rs       # File compression orchestration
-├── decompression.rs     # File decompression
-├── parallel_compress.rs # Rayon-based parallel gzip (the core)
-├── optimization.rs      # Content detection, thread tuning
-├── simple_optimizations.rs  # SimpleOptimizer wrapper
-├── error.rs             # Error types
-├── format.rs            # Gzip/zlib format detection
-└── utils.rs             # File utilities
+├── main.rs                     # CLI entry point
+├── cli.rs                      # gzip-compatible argument parsing
+├── compression.rs              # File compression orchestration
+├── decompression.rs            # File decompression
+├── parallel_compress.rs        # Rayon-based parallel gzip (the core)
+├── optimization.rs             # Content detection, thread tuning
+├── simple_optimizations.rs     # SimpleOptimizer wrapper
+├── error.rs                    # Error types
+├── format.rs                   # Gzip/zlib format detection
+└── utils.rs                    # File utilities
 ```
 
 **Critical paths:**
@@ -30,15 +30,14 @@ src/
 
 ## Hard-Won Lessons
 
-### 1. Use system zlib, not libz-ng
+### 1. Use zlib-ng for maximum performance
 
 ```toml
-# CORRECT - produces identical output to gzip
-flate2 = { version = "1.0", default-features = false, features = ["zlib"] }
-
-# WRONG - produces different compression ratios at L1-L8
-flate2 = { version = "1.0" }  # defaults to libz-ng
+# zlib-ng is 2-3x faster than standard zlib (SIMD-optimized)
+flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
 ```
+
+zlib-ng produces valid gzip with equal or better compression ratios. The only reason to use standard zlib is byte-for-byte identical output to `gzip`, which is rarely needed.
 
 ### 2. Fixed block size beats dynamic
 
@@ -65,9 +64,10 @@ if thread_count == 1 {
 
 Use **median** not min. 3 runs gave us false failures.
 
-### 5. mmap only helps for large files
+### 5. mmap for zero-copy I/O
 
-The mmap overhead only pays off for files >50MB. For smaller files, regular `io::copy` is faster.
+For compression: mmap files >128KB (parallel mode benefits from zero-copy access).
+For decompression: always use mmap (faster than buffered reads on all platforms).
 
 ### 6. Global thread pool
 
@@ -97,6 +97,7 @@ make perf-full  # Full suite (10+ min)
 
 ## Future Optimization Ideas
 
-- **libdeflate** - 2-3x faster than zlib for single-block compression
+- **libdeflate** - Even faster single-block compression (but non-streaming API)
 - **Intel ISA-L** - Hardware-accelerated on Intel CPUs
 - **Shared dictionaries** - Like pigz, improve compression between adjacent blocks
+- **Parallel decompression** - Scan for gzip member boundaries and inflate in parallel
