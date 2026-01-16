@@ -7,16 +7,23 @@
 //! Key optimizations:
 //! - Memory-mapped files for zero-copy access (no read_to_end latency)
 //! - Global thread pool to avoid per-call initialization
-//! - Dynamic block sizing based on file size and thread count
+//! - Thread-local buffer reuse to minimize allocations
+//! - 128KB fixed blocks (matches pigz default)
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use memmap2::Mmap;
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::OnceLock;
+
+// Thread-local compression buffer to avoid per-block allocation
+thread_local! {
+    static COMPRESS_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256 * 1024));
+}
 
 /// Default block size for parallel compression (128KB like pigz)
 const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
@@ -82,21 +89,11 @@ impl ParallelGzEncoder {
         let pool = get_thread_pool(self.num_threads);
         let compression_level = self.compression_level;
 
-        // Pre-allocate output vectors to reduce allocation overhead
-        let estimated_compressed_size = block_size + 256; // gzip header/footer overhead
-
-        // Compress blocks in parallel - each block is a complete gzip member
+        // Compress blocks in parallel using thread-local buffers
         let compressed_blocks: Vec<Vec<u8>> = pool.install(|| {
             blocks
                 .par_iter()
-                .map(|block| {
-                    let mut compressed = Vec::with_capacity(estimated_compressed_size);
-                    // Each block is a complete gzip file
-                    let mut encoder = GzEncoder::new(&mut compressed, Compression::new(compression_level));
-                    encoder.write_all(block).ok();
-                    encoder.finish().ok();
-                    compressed
-                })
+                .map(|block| compress_block_with_reuse(block, compression_level))
                 .collect()
         });
 
@@ -150,21 +147,11 @@ impl ParallelGzEncoder {
         let pool = get_thread_pool(self.num_threads);
         let compression_level = self.compression_level;
 
-        // Pre-allocate output vectors to reduce allocation overhead
-        let estimated_compressed_size = block_size + 256; // gzip header/footer overhead
-
-        // Compress blocks in parallel - each block is a complete gzip member
+        // Compress blocks in parallel using thread-local buffers
         let compressed_blocks: Vec<Vec<u8>> = pool.install(|| {
             blocks
                 .par_iter()
-                .map(|block| {
-                    let mut compressed = Vec::with_capacity(estimated_compressed_size);
-                    // Each block is a complete gzip file
-                    let mut encoder = GzEncoder::new(&mut compressed, Compression::new(compression_level));
-                    encoder.write_all(block).ok();
-                    encoder.finish().ok();
-                    compressed
-                })
+                .map(|block| compress_block_with_reuse(block, compression_level))
                 .collect()
         });
 
@@ -175,6 +162,23 @@ impl ParallelGzEncoder {
 
         Ok(file_len as u64)
     }
+}
+
+/// Compress a single block using thread-local buffer to minimize allocations
+#[inline]
+fn compress_block_with_reuse(block: &[u8], compression_level: u32) -> Vec<u8> {
+    COMPRESS_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        buf.clear();
+        
+        // Each block is a complete gzip file
+        let mut encoder = GzEncoder::new(&mut *buf, Compression::new(compression_level));
+        encoder.write_all(block).ok();
+        encoder.finish().ok();
+        
+        // Return a copy (buffer stays allocated for next use)
+        buf.clone()
+    })
 }
 
 #[cfg(test)]

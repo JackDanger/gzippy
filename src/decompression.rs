@@ -126,20 +126,25 @@ fn decompress_mmap_libdeflate<W: Write>(
 }
 
 /// Quick check if data contains multiple gzip members
+/// Uses SIMD-accelerated search via memchr (10-50x faster than byte-by-byte)
 /// Only scans first 256KB to detect parallel-compressed files
 #[inline]
 fn is_multi_member_quick(data: &[u8]) -> bool {
+    use memchr::memmem;
+    
     const SCAN_LIMIT: usize = 256 * 1024;
+    const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b, 0x08];
+    
     let scan_end = data.len().min(SCAN_LIMIT);
     
-    // Start after minimum gzip header (10 bytes) + some data
-    // Multi-member files from parallel compression have members every ~128KB
-    for i in 10..scan_end.saturating_sub(2) {
-        if data[i] == 0x1f && data[i + 1] == 0x8b && data[i + 2] == 8 {
-            return true;
-        }
+    // Skip past the first gzip header (minimum 10 bytes)
+    // and look for another gzip magic sequence
+    if scan_end <= 10 {
+        return false;
     }
-    false
+    
+    // memmem uses SIMD (AVX2/NEON) internally for fast searching
+    memmem::find(&data[10..scan_end], GZIP_MAGIC).is_some()
 }
 
 /// Decompress gzip - chooses optimal strategy based on content
@@ -193,34 +198,27 @@ fn decompress_single_member_libdeflate<W: Write>(data: &[u8], writer: &mut W) ->
 }
 
 /// Decompress multi-member gzip using zlib-ng (via flate2)
-/// This correctly handles member boundaries by actually inflating each stream
+/// Uses MultiGzDecoder which is optimized for concatenated gzip streams
 fn decompress_multi_member_zlibng<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
-    use flate2::bufread::GzDecoder;
+    use flate2::bufread::MultiGzDecoder;
     use std::io::Read;
     
     let mut total_bytes = 0u64;
-    let mut remaining = data;
+    let mut decoder = MultiGzDecoder::new(data);
     
-    // Larger buffer for better throughput with zlib-ng
-    let mut buf = vec![0u8; 128 * 1024];
+    // Use larger buffer for better throughput (matches pigz's internal buffer)
+    let mut buf = vec![0u8; 256 * 1024];
     
-    while remaining.len() >= 10 && remaining[0] == 0x1f && remaining[1] == 0x8b {
-        let mut decoder = GzDecoder::new(remaining);
-        
-        loop {
-            match decoder.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    writer.write_all(&buf[..n])?;
-                    total_bytes += n as u64;
-                }
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(_) => break,
+    loop {
+        match decoder.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                writer.write_all(&buf[..n])?;
+                total_bytes += n as u64;
             }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(RigzError::Io(e)),
         }
-        
-        // Get remaining data after this member
-        remaining = decoder.into_inner();
     }
     
     writer.flush()?;

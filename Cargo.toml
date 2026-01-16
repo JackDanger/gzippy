@@ -44,6 +44,9 @@ crossbeam-deque = "0.8"
 # CRC32 (hardware-accelerated on ARM/x86)
 crc32fast = "1.4"
 
+# SIMD-accelerated byte searching (for fast gzip header detection)
+memchr = "2.7"
+
 # System utilities
 core_affinity = "0.8"
 libc = "0.2"

@@ -572,6 +572,7 @@ dependencies = [
  "flate2",
  "libc",
  "libdeflater",
+ "memchr",
  "memmap2",
  "num_cpus",
  "predicates",
