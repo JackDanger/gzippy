@@ -17,8 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        size: [1, 10]
-        level: [1, 6, 9]
+        size: [1, 10, 100]
+        level: [1, 3, 7, 9]
         thread_mode: [single, max]  # single=1 thread, max=all available cores
 
     steps:
