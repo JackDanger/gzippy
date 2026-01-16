@@ -218,7 +218,7 @@ def main():
                 
                 print()
                 
-                # Decompression matrix (single run for correctness, timing is less critical)
+                # Decompression matrix
                 for comp_tool, comp_file in compressed.items():
                     for decomp_tool in TOOLS:
                         out = tmpdir / f"test.{comp_tool}.{decomp_tool}.tar"
@@ -229,12 +229,12 @@ def main():
                             failed += 1
                             continue
                         
-                        time_str = format_time(median_time)
+                        stats_str = format_stats(times)
                         if files_identical(str(tarball), str(out)):
-                            print(f"  ✓ {comp_tool:5} → {decomp_tool:5}  {time_str:>8}")
+                            print(f"  ✓ {comp_tool:5} → {decomp_tool:5}  {stats_str}")
                             passed += 1
                         else:
-                            print(f"  ✗ {comp_tool:5} → {decomp_tool:5}  {time_str:>8}  MISMATCH")
+                            print(f"  ✗ {comp_tool:5} → {decomp_tool:5}  {stats_str}  MISMATCH")
                             failed += 1
                         
                         out.unlink()  # Clean up
@@ -257,12 +257,12 @@ def main():
                 elapsed = time.perf_counter() - start
                 times.append(elapsed)
             
-            time_str = format_time(statistics.median(times))
+            stats_str = format_stats(times)
             if result.returncode == 0 and files_identical(str(tarball), str(unrigz_out)):
-                print(f"  ✓ unrigz             {time_str:>8}")
+                print(f"  ✓ unrigz             {stats_str}")
                 passed += 1
             else:
-                print(f"  ✗ unrigz             {time_str:>8}  FAILED")
+                print(f"  ✗ unrigz             {stats_str}  FAILED")
                 failed += 1
     
     # Summary
