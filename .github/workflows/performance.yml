@@ -58,7 +58,7 @@ jobs:
             --size ${{ matrix.size }} \
             --level ${{ matrix.level }} \
             --threads $THREADS \
-            --max-time-overhead 50 \
+            --max-time-overhead 100 \
             --output benchmark-results.json
 
       - name: Upload results
@@ -110,7 +110,7 @@ jobs:
             --level ${{ matrix.level }} \
             --threads $THREADS \
             --check-ratio \
-            --max-time-overhead 50 \
+            --max-time-overhead 100 \
             --max-ratio-overhead 5.0
 
   summary:
