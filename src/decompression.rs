@@ -250,9 +250,26 @@ fn decompress_single_member_libdeflate<W: Write>(data: &[u8], writer: &mut W) ->
     })
 }
 
-/// Decompress multi-member gzip using zlib-ng (via flate2)
-/// Uses MultiGzDecoder which is optimized for concatenated gzip streams
+/// Minimum file size for parallel decompression (1MB)
+/// Below this, the overhead of finding member boundaries exceeds the parallel benefit
+const PARALLEL_DECOMPRESS_THRESHOLD: usize = 1024 * 1024;
+
+/// Decompress multi-member gzip - uses parallel path for large files
 fn decompress_multi_member_zlibng<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
+    // For large files, use parallel decompression
+    if data.len() >= PARALLEL_DECOMPRESS_THRESHOLD {
+        if let Ok(total) = decompress_multi_member_parallel(data, writer) {
+            return Ok(total);
+        }
+        // Fall through to sequential if parallel fails
+    }
+    
+    // Sequential path for small files or fallback
+    decompress_multi_member_sequential(data, writer)
+}
+
+/// Sequential multi-member decompression using flate2
+fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
     use flate2::bufread::MultiGzDecoder;
     use std::io::Read;
     
@@ -271,6 +288,117 @@ fn decompress_multi_member_zlibng<W: Write>(data: &[u8], writer: &mut W) -> Rigz
             }
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(RigzError::Io(e)),
+        }
+    }
+    
+    writer.flush()?;
+    Ok(total_bytes)
+}
+
+/// Find gzip member boundaries by inflating each member
+/// Returns vector of (start_offset, length) for each member
+fn find_member_boundaries(data: &[u8]) -> Vec<(usize, usize)> {
+    use flate2::bufread::GzDecoder;
+    use std::io::Read;
+    
+    let mut boundaries = Vec::new();
+    let mut offset = 0;
+    let mut buf = [0u8; 8192];
+    
+    while offset < data.len() && data.len() - offset >= 10 {
+        // Check for gzip magic
+        if data[offset] != 0x1f || data[offset + 1] != 0x8b {
+            break;
+        }
+        
+        let start = offset;
+        let remaining = &data[offset..];
+        let mut decoder = GzDecoder::new(remaining);
+        
+        // Consume the entire member
+        loop {
+            match decoder.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        
+        // Get how many bytes were consumed
+        let consumed = remaining.len() - decoder.into_inner().len();
+        if consumed == 0 {
+            break;
+        }
+        
+        boundaries.push((start, consumed));
+        offset += consumed;
+    }
+    
+    boundaries
+}
+
+/// Parallel multi-member decompression using rayon + libdeflate
+fn decompress_multi_member_parallel<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
+    use rayon::prelude::*;
+    use libdeflater::{Decompressor, DecompressionError};
+    
+    // Find member boundaries (this is sequential but fast)
+    let boundaries = find_member_boundaries(data);
+    
+    // Need at least 2 members to benefit from parallelism
+    if boundaries.len() < 2 {
+        return decompress_multi_member_sequential(data, writer);
+    }
+    
+    // Decompress members in parallel
+    let results: Vec<Result<Vec<u8>, String>> = boundaries
+        .par_iter()
+        .map(|&(start, len)| {
+            let member_data = &data[start..start + len];
+            let mut decompressor = Decompressor::new();
+            
+            // Estimate output size from ISIZE trailer (last 4 bytes of member)
+            let isize_hint = if len >= 8 {
+                let trailer = &member_data[len - 4..];
+                u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]) as usize
+            } else {
+                0
+            };
+            
+            let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
+                isize_hint + 1024
+            } else {
+                len.saturating_mul(4).max(64 * 1024)
+            };
+            
+            let mut output = vec![0u8; initial_size];
+            
+            loop {
+                match decompressor.gzip_decompress(member_data, &mut output) {
+                    Ok(size) => {
+                        output.truncate(size);
+                        return Ok(output);
+                    }
+                    Err(DecompressionError::InsufficientSpace) => {
+                        let new_size = output.len().saturating_mul(2);
+                        output.resize(new_size, 0);
+                        continue;
+                    }
+                    Err(e) => return Err(format!("decompression error: {:?}", e)),
+                }
+            }
+        })
+        .collect();
+    
+    // Write results in order
+    let mut total_bytes = 0u64;
+    for result in results {
+        match result {
+            Ok(decompressed) => {
+                writer.write_all(&decompressed)?;
+                total_bytes += decompressed.len() as u64;
+            }
+            Err(e) => return Err(RigzError::invalid_argument(e)),
         }
     }
     
