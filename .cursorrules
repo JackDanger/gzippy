@@ -7,7 +7,7 @@ Fast, parallel gzip replacement. Beats gzip and pigz by 40-50%.
 ```bash
 make           # Build + quick benchmark
 make validate  # Verify output works with gunzip
-cargo test     # Unit tests
+cargo test     # Unit tests (requires 'all' permissions for debug build)
 ```
 
 ## Core Algorithm (parallel_compress.rs)
@@ -25,6 +25,7 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 | `parallel_compress.rs` | **THE CORE**: rayon + flate2 parallel compression |
 | `compression.rs` | Routes single vs multi-threaded |
 | `decompression.rs` | libdeflate (fast) + flate2 (multi-member) |
+| `optimization.rs` | CPU detection, buffer sizing, content analysis |
 | `cli.rs` | gzip-compatible argument parsing |
 
 ## Performance Strategy
@@ -33,21 +34,51 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 - zlib-ng via flate2 (2-3x faster than standard zlib)
 - 128KB fixed blocks (dynamic sizing regressed 14%)
 - Global rayon pool (avoids per-call initialization)
+- Thread-local buffer reuse (reduces allocator pressure)
 
 **Decompression:**
 - Single-member: libdeflate (30-50% faster than zlib)
-- Multi-member: zlib-ng via flate2 (reliable boundary parsing)
+- Multi-member: flate2 MultiGzDecoder (reliable boundary parsing)
+- SIMD header detection via memchr (10-50x faster scanning)
+- ISIZE trailer hint for accurate buffer pre-allocation
+- Thread-local decompressor reuse (avoids init overhead)
+- Cache-aligned buffer allocation (better memory access)
+
+**Architecture Awareness:**
+- Runtime CPU feature detection (AVX2, AVX-512, NEON, CRC32)
+- L2 cache size detection for optimal block sizing
+- Platform-specific defaults (Apple Silicon 128-byte cache lines)
+- Physical core count for thread limiting
+
+## Implemented Optimizations (P0)
+
+1. ✅ **Thread-local compression buffers** - Reuse buffers across parallel blocks
+2. ✅ **SIMD multi-member detection** - memchr for fast gzip header scanning
+3. ✅ **Cache-aligned buffers** - 64-byte x86, 128-byte Apple Silicon
+4. ✅ **ISIZE buffer sizing** - Read gzip trailer for accurate pre-allocation
+5. ✅ **Thread-local decompressor** - Reuse libdeflate decompressor
+6. ✅ **CPU feature detection** - Runtime AVX/NEON/CRC32 detection
+
+## Future Optimizations (see OPTIMIZATION_OPPORTUNITIES.md)
+
+- 🔲 Intel ISA-L integration (2-4x on AVX-512)
+- 🔲 Parallel decompression for multi-member files
+- 🔲 Shared dictionary between compression blocks
+- 🔲 io_uring async I/O on Linux
 
 ## What Doesn't Work
 
 1. **Manual deflate boundary detection** - Deflate streams contain false gzip headers
 2. **Dynamic block sizing** - Added complexity, 14% slower
 3. **gzp crate** - Threading issues; custom rayon is better
+4. **Parallel libdeflate per-member** - Boundary detection requires full inflate
 
 ## Benchmarking
 
 - 30 runs for 1MB (high variance)
 - 15 runs for 10MB  
 - Use median, not min
+- pigz is built from submodule (./pigz/pigz)
+- Validation: `make validate` runs 55 cross-tool tests
 
 See CONTRIBUTING.md for detailed architecture guide.
