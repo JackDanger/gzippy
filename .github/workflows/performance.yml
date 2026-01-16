@@ -52,10 +52,13 @@ jobs:
           fi
           
           echo "Running with $THREADS threads"
+          # GHA runners have limited cores, so use relaxed thresholds
+          # Locally, use stricter thresholds via scripts/perf.py
           python3 scripts/benchmark_ci.py \
             --size ${{ matrix.size }} \
             --level ${{ matrix.level }} \
             --threads $THREADS \
+            --max-time-overhead 50 \
             --output benchmark-results.json
 
       - name: Upload results
@@ -101,11 +104,13 @@ jobs:
             THREADS=$CORES
           fi
           
+          # Relaxed time threshold for GHA, but strict ratio check
           python3 scripts/benchmark_ci.py \
             --size 10 \
             --level ${{ matrix.level }} \
             --threads $THREADS \
             --check-ratio \
+            --max-time-overhead 50 \
             --max-ratio-overhead 5.0
 
   summary:
