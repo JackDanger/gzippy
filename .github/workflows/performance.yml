@@ -12,19 +12,19 @@ env:
 
 jobs:
   benchmark:
-    name: Performance (${{ matrix.size }}MB, L${{ matrix.level }}, T${{ matrix.threads }})
+    name: Perf ${{ matrix.size }}MB L${{ matrix.level }} (${{ matrix.thread_mode }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         size: [1, 10]
         level: [1, 6, 9]
-        threads: [1, 4]
+        thread_mode: [single, max]  # single=1 thread, max=all available cores
 
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true  # Only direct submodules (pigz)
+          submodules: true
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -32,7 +32,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential zlib1g-dev
+          sudo apt-get install -y build-essential zlib1g-dev gzip
 
       - name: Build rigz
         run: cargo build --release
@@ -40,34 +40,43 @@ jobs:
       - name: Build pigz
         run: make -C pigz
 
-      - name: Run benchmark
-        id: bench
+      - name: Detect cores and run benchmark
         run: |
+          CORES=$(nproc)
+          echo "Available cores: $CORES"
+          
+          if [ "${{ matrix.thread_mode }}" = "single" ]; then
+            THREADS=1
+          else
+            THREADS=$CORES
+          fi
+          
+          echo "Running with $THREADS threads"
           python3 scripts/benchmark_ci.py \
             --size ${{ matrix.size }} \
             --level ${{ matrix.level }} \
-            --threads ${{ matrix.threads }} \
+            --threads $THREADS \
             --output benchmark-results.json
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: bench-${{ matrix.size }}mb-l${{ matrix.level }}-t${{ matrix.threads }}
+          name: bench-${{ matrix.size }}mb-l${{ matrix.level }}-${{ matrix.thread_mode }}
           path: benchmark-results.json
 
   compression-ratio:
-    name: Compression Ratio (${{ matrix.level }}, T${{ matrix.threads }})
+    name: Ratio L${{ matrix.level }} (${{ matrix.thread_mode }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         level: [1, 6, 9]
-        threads: [1, 4]
+        thread_mode: [single, max]
 
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true  # Only direct submodules (pigz)
+          submodules: true
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -75,7 +84,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential zlib1g-dev
+          sudo apt-get install -y build-essential zlib1g-dev gzip
 
       - name: Build rigz
         run: cargo build --release
@@ -85,10 +94,17 @@ jobs:
 
       - name: Check compression ratio
         run: |
+          CORES=$(nproc)
+          if [ "${{ matrix.thread_mode }}" = "single" ]; then
+            THREADS=1
+          else
+            THREADS=$CORES
+          fi
+          
           python3 scripts/benchmark_ci.py \
             --size 10 \
             --level ${{ matrix.level }} \
-            --threads ${{ matrix.threads }} \
+            --threads $THREADS \
             --check-ratio \
             --max-ratio-overhead 5.0
 
@@ -109,7 +125,6 @@ jobs:
           echo "## Performance Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Count pass/fail
           passed=0
           failed=0
           

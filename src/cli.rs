@@ -179,22 +179,17 @@ impl RigzArgs {
                     }
                     _ => {
                         // Handle options with values
-                        if arg.starts_with("--blocksize=") {
-                            let value = &arg[12..];
+                        if let Some(value) = arg.strip_prefix("--blocksize=") {
                             args.block_size = parse_block_size(value)?;
-                        } else if arg.starts_with("--processes=") {
-                            let value = &arg[12..];
+                        } else if let Some(value) = arg.strip_prefix("--processes=") {
                             args.processes = value.parse().map_err(|_| {
                                 RigzError::invalid_argument(format!("Invalid processes: {}", value))
                             })?;
-                        } else if arg.starts_with("--suffix=") {
-                            let value = &arg[9..];
+                        } else if let Some(value) = arg.strip_prefix("--suffix=") {
                             args.suffix = value.to_string();
-                        } else if arg.starts_with("--comment=") {
-                            let value = &arg[10..];
+                        } else if let Some(value) = arg.strip_prefix("--comment=") {
                             args.comment = Some(value.to_string());
-                        } else if arg.starts_with("--alias=") {
-                            let value = &arg[8..];
+                        } else if let Some(value) = arg.strip_prefix("--alias=") {
                             args.alias = Some(value.to_string());
                         } else if arg == "--blocksize"
                             || arg == "--processes"
@@ -360,9 +355,7 @@ fn parse_env_args(env_str: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current_arg = String::new();
     let mut in_quotes = false;
-    let mut chars = env_str.chars().peekable();
-
-    while let Some(ch) = chars.next() {
+    for ch in env_str.chars() {
         match ch {
             '"' => in_quotes = !in_quotes,
             ' ' | '\t' if !in_quotes => {

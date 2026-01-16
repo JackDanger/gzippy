@@ -2,8 +2,9 @@
 
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionFormat {
+    #[default]
     Gzip,
     Zlib,
     Zip,
@@ -43,11 +44,5 @@ impl fmt::Display for CompressionFormat {
             CompressionFormat::Zlib => write!(f, "zlib"),
             CompressionFormat::Zip => write!(f, "zip"),
         }
-    }
-}
-
-impl Default for CompressionFormat {
-    fn default() -> Self {
-        CompressionFormat::Gzip
     }
 }

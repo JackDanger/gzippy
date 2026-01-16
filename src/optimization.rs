@@ -79,7 +79,7 @@ impl CpuFeatures {
         // Aim for blocks that fit comfortably in L2 cache
         // Leave room for working memory (hash tables, output buffer, etc.)
         let available = self.l2_cache_size / 4;
-        available.max(64 * 1024).min(256 * 1024)
+        available.clamp(64 * 1024, 256 * 1024)
     }
 }
 
@@ -224,7 +224,7 @@ pub fn analyze_content_type(sample: &[u8]) -> ContentType {
 
 fn is_likely_utf8_byte(byte: u8) -> bool {
     // Simple heuristic for UTF-8 continuation bytes and common patterns
-    matches!(byte, 0x80..=0xBF | 0xC0..=0xDF | 0xE0..=0xEF | 0xF0..=0xF7)
+    matches!(byte, 0x80..=0xF7)
 }
 
 fn is_random_like(sample: &[u8]) -> bool {

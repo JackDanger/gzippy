@@ -60,3 +60,10 @@ predicates = "3.0"
 lto = true
 codegen-units = 1
 panic = "abort"
+opt-level = 3
+strip = true
+
+# Enable native CPU optimizations when building locally
+# (commented out for portable binaries - uncomment for max local perf)
+# [build]
+# rustflags = ["-C", "target-cpu=native"]

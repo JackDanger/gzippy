@@ -67,7 +67,7 @@ pub fn compress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
 
     // Create optimization configuration
     let opt_config = OptimizationConfig::new(
-        args.processes as usize,
+        args.processes,
         file_size,
         args.compression_level,
         content_type,
@@ -172,7 +172,7 @@ pub fn compress_stdin(args: &RigzArgs) -> RigzResult<i32> {
 
     // Create optimization configuration
     let opt_config = OptimizationConfig::new(
-        args.processes as usize,
+        args.processes,
         file_size,
         args.compression_level,
         content_type,
