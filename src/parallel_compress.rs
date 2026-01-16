@@ -155,13 +155,74 @@ impl ParallelGzEncoder {
                 .collect()
         });
 
-        // Concatenate all gzip members (valid per RFC 1952)
-        for block in &compressed_blocks {
-            writer.write_all(block)?;
-        }
+        // Write all gzip members using vectorized I/O when possible
+        // This reduces system calls by writing multiple blocks at once
+        write_compressed_blocks(&compressed_blocks, &mut writer)?;
 
         Ok(file_len as u64)
     }
+}
+
+/// Write compressed blocks efficiently
+/// Uses vectorized I/O (write_all_vectored) when available to reduce syscalls
+#[inline]
+fn write_compressed_blocks<W: Write>(blocks: &[Vec<u8>], writer: &mut W) -> io::Result<()> {
+    use std::io::IoSlice;
+    
+    // For small number of blocks, just write sequentially
+    if blocks.len() <= 4 {
+        for block in blocks {
+            writer.write_all(block)?;
+        }
+        return Ok(());
+    }
+    
+    // Use vectorized write for many blocks (reduces syscalls)
+    // Process in batches of up to 64 IoSlices (typical OS limit)
+    const MAX_IOVECS: usize = 64;
+    
+    for chunk in blocks.chunks(MAX_IOVECS) {
+        let slices: Vec<IoSlice<'_>> = chunk.iter().map(|b| IoSlice::new(b)).collect();
+        
+        // write_all_vectored handles partial writes
+        let mut remaining = &slices[..];
+        while !remaining.is_empty() {
+            let written = writer.write_vectored(remaining)?;
+            if written == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write compressed data",
+                ));
+            }
+            
+            // Advance past written data
+            let mut bytes_left = written;
+            let mut consumed = 0;
+            for slice in remaining.iter() {
+                if bytes_left >= slice.len() {
+                    bytes_left -= slice.len();
+                    consumed += 1;
+                } else {
+                    break;
+                }
+            }
+            remaining = &remaining[consumed..];
+            
+            // If we didn't consume complete slices, fall back to sequential
+            if bytes_left > 0 && !remaining.is_empty() {
+                // Partial write - finish the rest of this slice
+                writer.write_all(&remaining[0][bytes_left..])?;
+                remaining = &remaining[1..];
+                // Continue with remaining complete slices
+                for slice in remaining {
+                    writer.write_all(slice)?;
+                }
+                break;
+            }
+        }
+    }
+    
+    Ok(())
 }
 
 /// Compress a single block using thread-local buffer to minimize allocations
