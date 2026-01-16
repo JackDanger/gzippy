@@ -22,13 +22,17 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 /// Adjust compression level for zlib-ng compatibility
-/// 
+///
 /// zlib-ng's level 1 uses a faster but much less effective strategy than standard zlib.
 /// This produces files 2-5x larger than expected for repetitive data.
 /// We map level 1 to level 2 which gives similar speed but much better ratios.
 #[inline]
 fn adjust_compression_level(level: u32) -> u32 {
-    if level == 1 { 2 } else { level }
+    if level == 1 {
+        2
+    } else {
+        level
+    }
 }
 
 // Thread-local compression buffer to avoid per-block allocation
@@ -73,7 +77,10 @@ impl ParallelGzEncoder {
 
         if input_data.is_empty() {
             // Write empty gzip file
-            let encoder = GzEncoder::new(&mut writer, Compression::new(adjust_compression_level(self.compression_level)));
+            let encoder = GzEncoder::new(
+                &mut writer,
+                Compression::new(adjust_compression_level(self.compression_level)),
+            );
             encoder.finish()?;
             return Ok(0);
         }
@@ -86,7 +93,10 @@ impl ParallelGzEncoder {
 
         // For small files or single thread, use simple streaming compression
         if input_data.len() <= block_size || self.num_threads == 1 {
-            let mut encoder = GzEncoder::new(&mut writer, Compression::new(adjust_compression_level(self.compression_level)));
+            let mut encoder = GzEncoder::new(
+                &mut writer,
+                Compression::new(adjust_compression_level(self.compression_level)),
+            );
             encoder.write_all(&input_data)?;
             encoder.finish()?;
             return Ok(bytes_read);
@@ -126,13 +136,20 @@ impl ParallelGzEncoder {
 
     /// Compress a file using memory-mapped I/O for zero-copy access
     /// This eliminates the latency of reading the file into memory before compression
-    pub fn compress_file<P: AsRef<Path>, W: Write>(&self, path: P, mut writer: W) -> io::Result<u64> {
+    pub fn compress_file<P: AsRef<Path>, W: Write>(
+        &self,
+        path: P,
+        mut writer: W,
+    ) -> io::Result<u64> {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len() as usize;
 
         if file_len == 0 {
             // Write empty gzip file
-            let encoder = GzEncoder::new(&mut writer, Compression::new(adjust_compression_level(self.compression_level)));
+            let encoder = GzEncoder::new(
+                &mut writer,
+                Compression::new(adjust_compression_level(self.compression_level)),
+            );
             encoder.finish()?;
             return Ok(0);
         }
@@ -144,7 +161,10 @@ impl ParallelGzEncoder {
         // For small files or single thread, use simple streaming compression
         let block_size = self.calculate_block_size(file_len);
         if file_len <= block_size || self.num_threads == 1 {
-            let mut encoder = GzEncoder::new(&mut writer, Compression::new(adjust_compression_level(self.compression_level)));
+            let mut encoder = GzEncoder::new(
+                &mut writer,
+                Compression::new(adjust_compression_level(self.compression_level)),
+            );
             encoder.write_all(&mmap)?;
             encoder.finish()?;
             return Ok(file_len as u64);
@@ -179,7 +199,7 @@ impl ParallelGzEncoder {
 #[inline]
 fn write_compressed_blocks<W: Write>(blocks: &[Vec<u8>], writer: &mut W) -> io::Result<()> {
     use std::io::IoSlice;
-    
+
     // For small number of blocks, just write sequentially
     if blocks.len() <= 4 {
         for block in blocks {
@@ -187,14 +207,14 @@ fn write_compressed_blocks<W: Write>(blocks: &[Vec<u8>], writer: &mut W) -> io::
         }
         return Ok(());
     }
-    
+
     // Use vectorized write for many blocks (reduces syscalls)
     // Process in batches of up to 64 IoSlices (typical OS limit)
     const MAX_IOVECS: usize = 64;
-    
+
     for chunk in blocks.chunks(MAX_IOVECS) {
         let slices: Vec<IoSlice<'_>> = chunk.iter().map(|b| IoSlice::new(b)).collect();
-        
+
         // write_all_vectored handles partial writes
         let mut remaining = &slices[..];
         while !remaining.is_empty() {
@@ -205,7 +225,7 @@ fn write_compressed_blocks<W: Write>(blocks: &[Vec<u8>], writer: &mut W) -> io::
                     "failed to write compressed data",
                 ));
             }
-            
+
             // Advance past written data
             let mut bytes_left = written;
             let mut consumed = 0;
@@ -218,7 +238,7 @@ fn write_compressed_blocks<W: Write>(blocks: &[Vec<u8>], writer: &mut W) -> io::
                 }
             }
             remaining = &remaining[consumed..];
-            
+
             // If we didn't consume complete slices, fall back to sequential
             if bytes_left > 0 && !remaining.is_empty() {
                 // Partial write - finish the rest of this slice
@@ -232,7 +252,7 @@ fn write_compressed_blocks<W: Write>(blocks: &[Vec<u8>], writer: &mut W) -> io::
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -242,12 +262,12 @@ fn compress_block_with_reuse(block: &[u8], compression_level: u32) -> Vec<u8> {
     COMPRESS_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
         buf.clear();
-        
+
         // Each block is a complete gzip file
         let mut encoder = GzEncoder::new(&mut *buf, Compression::new(compression_level));
         encoder.write_all(block).ok();
         encoder.finish().ok();
-        
+
         // Return a copy (buffer stays allocated for next use)
         buf.clone()
     })
@@ -264,7 +284,9 @@ mod tests {
         let encoder = ParallelGzEncoder::new(6, 4);
 
         let mut output = Vec::new();
-        encoder.compress(Cursor::new(&data[..]), &mut output).unwrap();
+        encoder
+            .compress(Cursor::new(&data[..]), &mut output)
+            .unwrap();
 
         // Verify output is valid gzip by decompressing
         let mut decoder = flate2::read::GzDecoder::new(&output[..]);

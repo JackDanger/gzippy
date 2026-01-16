@@ -288,7 +288,7 @@ impl RigzArgs {
                         'b' | 'p' | 'S' | 'C' | 'A' => {
                             // Save the option character before potentially modifying j
                             let opt_char = chars[j];
-                            
+
                             // These require values
                             let value = if j + 1 < chars.len() {
                                 // Value is attached to the option

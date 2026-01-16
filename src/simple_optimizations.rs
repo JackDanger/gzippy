@@ -71,7 +71,11 @@ impl SimpleOptimizer {
     ) -> io::Result<u64> {
         // zlib-ng level 1 uses a different strategy that produces worse output.
         // Map level 1 → 2 for better compression ratio with similar speed.
-        let adjusted_level = if self.config.compression_level == 1 { 2 } else { self.config.compression_level };
+        let adjusted_level = if self.config.compression_level == 1 {
+            2
+        } else {
+            self.config.compression_level
+        };
         let compression = Compression::new(adjusted_level as u32);
 
         let mut encoder = GzEncoder::new(writer, compression);
@@ -85,18 +89,18 @@ impl SimpleOptimizer {
     fn calculate_optimal_threads(&self) -> usize {
         let base_threads = self.config.thread_count;
         let cpu = CpuFeatures::get();
-        
+
         // Cap at physical cores to avoid hyperthreading contention
         // for CPU-bound compression work
         base_threads.min(cpu.physical_cores)
     }
-    
+
     /// Get CPU feature summary for debugging/verbosity
     #[allow(dead_code)]
     pub fn cpu_features_summary() -> String {
         let cpu = CpuFeatures::get();
         let mut features = Vec::new();
-        
+
         if cpu.has_avx512 {
             features.push("AVX-512");
         } else if cpu.has_avx2 {
@@ -108,7 +112,7 @@ impl SimpleOptimizer {
         if cpu.has_crc32 {
             features.push("CRC32");
         }
-        
+
         format!(
             "CPU: {} cores, L2={}KB, features=[{}]",
             cpu.physical_cores,
@@ -125,9 +129,9 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn test_thread_count_passthrough() {
+    fn test_thread_count_capped_at_physical_cores() {
         let config = OptimizationConfig {
-            thread_count: 4,
+            thread_count: 100, // Request way more than available
             buffer_size: 65536,
             backend: CompressionBackend::Parallel,
             content_type: ContentType::Binary,
@@ -136,8 +140,9 @@ mod tests {
         };
 
         let optimizer = SimpleOptimizer::new(config);
-        // Thread count should pass through (no longer reduced)
-        assert_eq!(optimizer.calculate_optimal_threads(), 4);
+        let physical_cores = CpuFeatures::get().physical_cores;
+        // Thread count should be capped at physical cores
+        assert_eq!(optimizer.calculate_optimal_threads(), physical_cores);
     }
 
     #[test]

@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true  # Only direct submodules (pigz)
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -67,7 +67,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true  # Only direct submodules (pigz)
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

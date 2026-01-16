@@ -42,19 +42,19 @@ impl CpuFeatures {
                 physical_cores: num_cpus::get_physical(),
             }
         }
-        
+
         #[cfg(target_arch = "aarch64")]
         {
             Self {
                 has_avx2: false,
                 has_avx512: false,
-                has_neon: true, // NEON is mandatory on aarch64
+                has_neon: true,  // NEON is mandatory on aarch64
                 has_crc32: true, // CRC32 instructions available on ARMv8+
                 l2_cache_size: detect_l2_cache_arm(),
                 physical_cores: num_cpus::get_physical(),
             }
         }
-        
+
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             Self {
@@ -67,12 +67,12 @@ impl CpuFeatures {
             }
         }
     }
-    
+
     /// Get cached CPU features (detects once, caches for subsequent calls)
     pub fn get() -> &'static CpuFeatures {
         CPU_FEATURES.get_or_init(CpuFeatures::detect)
     }
-    
+
     /// Suggested block size based on cache hierarchy
     #[allow(dead_code)]
     pub fn optimal_block_size(&self) -> usize {
@@ -88,7 +88,7 @@ fn detect_l2_cache_x86() -> usize {
     // Use CPUID to detect L2 cache size
     // This is a simplified detection - production code might use more robust methods
     use std::arch::x86_64::__cpuid;
-    
+
     unsafe {
         // Check if extended CPUID is available
         let cpuid = __cpuid(0x80000000);
@@ -101,7 +101,7 @@ fn detect_l2_cache_x86() -> usize {
             }
         }
     }
-    
+
     // Default: assume 256KB L2 (conservative for modern CPUs)
     256 * 1024
 }
@@ -110,14 +110,14 @@ fn detect_l2_cache_x86() -> usize {
 fn detect_l2_cache_arm() -> usize {
     // ARM cache detection is more complex and often requires OS support
     // Use conservative defaults based on common ARM configurations
-    
+
     #[cfg(target_os = "macos")]
     {
         // Apple Silicon has very large L2 caches (shared up to 32MB)
         // Per-core effective L2 is typically 4-8MB
         4 * 1024 * 1024
     }
-    
+
     #[cfg(not(target_os = "macos"))]
     {
         // Generic ARM: assume 512KB L2 (common on Cortex-A series)
@@ -154,7 +154,8 @@ impl OptimizationConfig {
     ) -> Self {
         let thread_count = optimal_thread_count(requested_threads, file_size, compression_level);
         let buffer_size = optimal_buffer_size(file_size, content_type);
-        let backend = choose_compression_backend(compression_level, content_type, file_size, thread_count);
+        let backend =
+            choose_compression_backend(compression_level, content_type, file_size, thread_count);
         let use_numa_pinning = should_use_numa_pinning(thread_count, file_size);
 
         OptimizationConfig {
@@ -276,7 +277,7 @@ fn optimal_thread_count(requested: usize, file_size: u64, compression_level: u8)
 
     // Key insight from pigz: thread overhead only matters for very small files
     // For 1MB+, parallel compression is always beneficial
-    
+
     match compression_level {
         1 => {
             // Level 1: Maximum throughput, use all threads regardless of file size
@@ -311,7 +312,7 @@ fn optimal_buffer_size(file_size: u64, content_type: ContentType) -> usize {
         0..=102_400 => 32_768,             // 32KB for small files
         102_401..=1_048_576 => 65_536,     // 64KB for medium files
         1_048_577..=10_485_760 => 131_072, // 128KB for large files
-        _ => 524_288,                      // 512KB for very large files (increased for level 1 speed)
+        _ => 524_288, // 512KB for very large files (increased for level 1 speed)
     };
 
     // Adjust based on content type

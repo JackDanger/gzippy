@@ -87,7 +87,7 @@ pub fn compress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
     // On Linux, mmap is faster even for small files due to zero-copy and kernel page cache
     // Threshold: 128KB (one block) - below this, overhead exceeds benefit
     let use_mmap = opt_config.thread_count > 1 && file_size > 128 * 1024;
-    
+
     let result = if use_mmap {
         // MMAP PATH: Zero-copy parallel compression for large files
         if args.verbosity >= 2 {
@@ -98,11 +98,15 @@ pub fn compress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
         }
         let optimizer = SimpleOptimizer::new(opt_config.clone());
         if args.stdout {
-            optimizer.compress_file(input_path, stdout()).map_err(|e| e.into())
+            optimizer
+                .compress_file(input_path, stdout())
+                .map_err(|e| e.into())
         } else {
             let output_path = output_path.clone().unwrap();
             let output_file = BufWriter::new(File::create(&output_path)?);
-            optimizer.compress_file(input_path, output_file).map_err(|e| e.into())
+            optimizer
+                .compress_file(input_path, output_file)
+                .map_err(|e| e.into())
         }
     } else if args.stdout {
         compress_with_pipeline(input_file, stdout(), args, &opt_config)
@@ -222,14 +226,18 @@ fn compress_with_pipeline<R: Read, W: Write>(
     if opt_config.thread_count == 1 {
         use flate2::write::GzEncoder;
         use flate2::Compression;
-        
+
         if args.verbosity >= 2 {
             eprintln!("rigz: using direct flate2 single-threaded path");
         }
-        
+
         // zlib-ng level 1 uses a different strategy that produces 2-5x larger output
         // on repetitive data. Map level 1 → 2 for better compression ratio.
-        let adjusted_level = if args.compression_level == 1 { 2 } else { args.compression_level };
+        let adjusted_level = if args.compression_level == 1 {
+            2
+        } else {
+            args.compression_level
+        };
         let compression = Compression::new(adjusted_level as u32);
         let mut encoder = GzEncoder::new(writer, compression);
         let bytes = io::copy(&mut reader, &mut encoder)?;
@@ -288,18 +296,18 @@ fn print_compression_stats(input_size: u64, output_size: u64, path: &Path, args:
         .unwrap_or_default()
         .to_str()
         .unwrap_or("<unknown>");
-    
+
     let ratio = if input_size > 0 {
         output_size as f64 / input_size as f64
     } else {
         1.0
     };
     let saved_pct = (1.0 - ratio) * 100.0;
-    
+
     // Format sizes nicely
     let (in_size, in_unit) = format_size(input_size);
     let (out_size, out_unit) = format_size(output_size);
-    
+
     if args.processes > 1 {
         eprintln!(
             "{}: {:.1}{} → {:.1}{} ({:.1}% saved, {} threads)",
@@ -317,7 +325,7 @@ fn format_size(bytes: u64) -> (f64, &'static str) {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * 1024;
     const GB: u64 = 1024 * 1024 * 1024;
-    
+
     if bytes >= GB {
         (bytes as f64 / GB as f64, "GB")
     } else if bytes >= MB {
