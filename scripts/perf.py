@@ -281,15 +281,19 @@ def main():
                        help="Comma-separated sizes in MB (default: 1,10 or 1,10,100 with --full)")
     
     args = parser.parse_args()
-    
-    # Parse arguments
-    levels = [int(x) for x in args.levels.split(",")] if args.levels else DEFAULT_LEVELS
-    threads = [int(x) for x in args.threads.split(",")] if args.threads else DEFAULT_THREADS
-    
-    if args.sizes:
-        sizes = [int(x) for x in args.sizes.split(",")]
+
+    if args.full:
+        levels = [x + 1 for x in range(9)]
+        threads = [1, 2, 3, 7, os.cpu_count()]
+        sizes = DEFAULT_SIZES_FULL
     else:
-        sizes = DEFAULT_SIZES_FULL if args.full else DEFAULT_SIZES_QUICK
+        levels = [int(x) for x in args.levels.split(",")] if args.levels else DEFAULT_LEVELS
+        threads = [int(x) for x in args.threads.split(",")] if args.threads else DEFAULT_THREADS
+        
+        if args.sizes:
+            sizes = [int(x) for x in args.sizes.split(",")]
+        else:
+            sizes = DEFAULT_SIZES_QUICK
     
     print("=" * 60)
     print("  Rigz Performance Suite")
