@@ -59,11 +59,11 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 5. ✅ **Thread-local decompressor** - Reuse libdeflate decompressor
 6. ✅ **CPU feature detection** - Runtime AVX/NEON/CRC32 detection
 7. ✅ **Parallel decompression** - rayon + libdeflate for multi-member files (>1MB)
+8. ✅ **Vectorized I/O** - write_vectored for reduced syscalls in compression/decompression
 
 ## Future Optimizations (see OPTIMIZATION_OPPORTUNITIES.md)
 
 - 🔲 Intel ISA-L integration (2-4x on AVX-512)
-- 🔲 Shared dictionary between compression blocks
 - 🔲 io_uring async I/O on Linux
 
 ## What Doesn't Work

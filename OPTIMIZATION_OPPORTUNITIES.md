@@ -441,7 +441,8 @@ fn detect_amd() -> bool {
 | CPU feature detection | Low | Low | ✅ Full | **P0** | ✅ Done |
 | Intel ISA-L integration | High | Medium | ✅ Full | **P1** | 🔲 TODO |
 | Parallel decompression | High | Medium | ✅ Full | **P1** | ✅ Done |
-| Shared dictionaries | Medium | Medium | ✅ Full | **P2** | 🔲 TODO |
+| Vectorized I/O | Medium | Low | ✅ Full | **P1** | ✅ Done |
+| Shared dictionaries | Medium | Medium | ⚠️ Breaks compat | **P2** | ❌ Skip |
 | io_uring async I/O | Medium | Medium | ✅ Full | **P3** | 🔲 TODO |
 | Custom SIMD DEFLATE | High | High | ✅ Full | **P4** | 🔲 TODO |
 
