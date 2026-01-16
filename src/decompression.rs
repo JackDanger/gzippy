@@ -341,6 +341,7 @@ fn find_member_boundaries(data: &[u8]) -> Vec<(usize, usize)> {
 fn decompress_multi_member_parallel<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
     use rayon::prelude::*;
     use libdeflater::{Decompressor, DecompressionError};
+    use std::io::IoSlice;
     
     // Find member boundaries (this is sequential but fast)
     let boundaries = find_member_boundaries(data);
@@ -390,15 +391,60 @@ fn decompress_multi_member_parallel<W: Write>(data: &[u8], writer: &mut W) -> Ri
         })
         .collect();
     
-    // Write results in order
-    let mut total_bytes = 0u64;
+    // Collect successful results and check for errors
+    let mut decompressed_blocks: Vec<Vec<u8>> = Vec::with_capacity(results.len());
     for result in results {
         match result {
-            Ok(decompressed) => {
-                writer.write_all(&decompressed)?;
-                total_bytes += decompressed.len() as u64;
-            }
+            Ok(block) => decompressed_blocks.push(block),
             Err(e) => return Err(RigzError::invalid_argument(e)),
+        }
+    }
+    
+    // Use vectorized I/O to write all blocks efficiently
+    let total_bytes: u64 = decompressed_blocks.iter().map(|b| b.len() as u64).sum();
+    
+    // For many blocks, use write_vectored to reduce syscalls
+    if decompressed_blocks.len() > 4 {
+        const MAX_IOVECS: usize = 64;
+        for chunk in decompressed_blocks.chunks(MAX_IOVECS) {
+            let slices: Vec<IoSlice<'_>> = chunk.iter().map(|b| IoSlice::new(b)).collect();
+            let mut remaining = &slices[..];
+            
+            while !remaining.is_empty() {
+                let written = writer.write_vectored(remaining)?;
+                if written == 0 {
+                    return Err(RigzError::Io(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write decompressed data",
+                    )));
+                }
+                
+                // Advance past written data
+                let mut bytes_left = written;
+                let mut consumed = 0;
+                for slice in remaining.iter() {
+                    if bytes_left >= slice.len() {
+                        bytes_left -= slice.len();
+                        consumed += 1;
+                    } else {
+                        break;
+                    }
+                }
+                remaining = &remaining[consumed..];
+                
+                // Handle partial writes
+                if bytes_left > 0 && !remaining.is_empty() {
+                    writer.write_all(&remaining[0][bytes_left..])?;
+                    for slice in &remaining[1..] {
+                        writer.write_all(slice)?;
+                    }
+                    break;
+                }
+            }
+        }
+    } else {
+        for block in &decompressed_blocks {
+            writer.write_all(block)?;
         }
     }
     
