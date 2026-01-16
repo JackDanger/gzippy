@@ -52,8 +52,7 @@ $(GZIP_DIR)/gzip:
 
 $(PIGZ_BIN):
 	@echo "Building pigz from source..."
-	@$(MAKE) -C $(PIGZ_DIR) clean >/dev/null 2>&1 || true
-	@$(MAKE) -C $(PIGZ_DIR) pigz >/dev/null 2>&1
+	@$(MAKE) -C $(PIGZ_DIR) pigz 2>&1 || (echo "  Cleaning and rebuilding..." && $(MAKE) -C $(PIGZ_DIR) clean >/dev/null 2>&1 && $(MAKE) -C $(PIGZ_DIR) pigz)
 	@echo "✓ Built pigz"
 
 $(RIGZ_BIN): FORCE

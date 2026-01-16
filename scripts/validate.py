@@ -7,6 +7,8 @@ Tests that rigz produces gzip-compatible output by:
 2. Compressing at multiple levels with multiple thread counts
 3. Decompressing with gzip, pigz, and rigz
 4. Verifying all outputs are byte-identical
+
+Runs multiple trials per test for statistical significance.
 """
 
 import os
@@ -14,10 +16,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import statistics
 from pathlib import Path
 
 # Tool paths - prefer local builds, fall back to system
 import shutil
+
+# Number of trials per test for statistical significance
+TRIALS = 5
 
 def find_gzip():
     if os.path.isfile("./gzip/gzip") and os.access("./gzip/gzip", os.X_OK):
@@ -47,8 +53,8 @@ def get_tool_path(tool):
     """Get the binary path for a tool."""
     return {"gzip": GZIP, "pigz": PIGZ, "rigz": RIGZ}[tool]
 
-def compress(tool, level, threads, input_file, output_file):
-    """Compress a file with the given tool. Returns (success, elapsed_time)."""
+def compress_once(tool, level, threads, input_file, output_file):
+    """Compress a file once. Returns (success, elapsed_time)."""
     bin_path = get_tool_path(tool)
     cmd = [bin_path, f"-{level}"]
     if tool in ("pigz", "rigz"):
@@ -62,8 +68,21 @@ def compress(tool, level, threads, input_file, output_file):
     
     return result.returncode == 0, elapsed
 
-def decompress(tool, input_file, output_file):
-    """Decompress a file with the given tool. Returns (success, elapsed_time)."""
+def compress(tool, level, threads, input_file, output_file, trials=TRIALS):
+    """Compress a file multiple times, return median time. Returns (success, median_time, times)."""
+    times = []
+    success = False
+    
+    for i in range(trials):
+        success, elapsed = compress_once(tool, level, threads, input_file, output_file)
+        if not success:
+            return False, 0, []
+        times.append(elapsed)
+    
+    return True, statistics.median(times), times
+
+def decompress_once(tool, input_file, output_file):
+    """Decompress a file once. Returns (success, elapsed_time)."""
     bin_path = get_tool_path(tool)
     cmd = [bin_path, "-d", "-c", input_file]
     
@@ -73,6 +92,19 @@ def decompress(tool, input_file, output_file):
     elapsed = time.perf_counter() - start
     
     return result.returncode == 0, elapsed
+
+def decompress(tool, input_file, output_file, trials=TRIALS):
+    """Decompress a file multiple times, return median time. Returns (success, median_time, times)."""
+    times = []
+    success = False
+    
+    for i in range(trials):
+        success, elapsed = decompress_once(tool, input_file, output_file)
+        if not success:
+            return False, 0, []
+        times.append(elapsed)
+    
+    return True, statistics.median(times), times
 
 def files_identical(file1, file2):
     """Check if two files are byte-identical."""
@@ -97,6 +129,18 @@ def format_time(seconds):
         return f"{seconds:.2f}s"
     else:
         return f"{seconds:.0f}s"
+
+def format_stats(times):
+    """Format timing statistics."""
+    if not times:
+        return ""
+    median = statistics.median(times)
+    min_t = min(times)
+    max_t = max(times)
+    if len(times) >= 2:
+        stdev = statistics.stdev(times)
+        return f"med={format_time(median)} (±{format_time(stdev)}, {format_time(min_t)}-{format_time(max_t)})"
+    return format_time(median)
 
 def check_tools():
     """Verify all tools exist and are executable."""
@@ -125,9 +169,10 @@ def create_tarball(output_path):
     return result.returncode == 0
 
 def main():
-    print("=" * 60)
+    print("=" * 70)
     print("  Cross-Tool Validation Matrix")
-    print("=" * 60)
+    print(f"  ({TRIALS} trials per test for statistical significance)")
+    print("=" * 70)
     print()
     
     # Check tools exist
@@ -153,38 +198,38 @@ def main():
         for level in LEVELS:
             for threads in THREADS:
                 print(f"Level {level}, {threads} thread(s):")
-                print("-" * 60)
+                print("-" * 70)
                 
                 # Compress with each tool
                 compressed = {}
-                comp_times = {}
+                comp_stats = {}
                 for tool in TOOLS:
                     out = tmpdir / f"test.{tool}.l{level}.t{threads}.gz"
-                    success, elapsed = compress(tool, level, threads, str(tarball), str(out))
+                    success, median_time, times = compress(tool, level, threads, str(tarball), str(out))
                     if success:
                         compressed[tool] = out
-                        comp_times[tool] = elapsed
+                        comp_stats[tool] = times
                         size_str = format_size(out)
-                        time_str = format_time(elapsed)
-                        print(f"  {tool:5}: {size_str:>10}  {time_str:>8}")
+                        stats_str = format_stats(times)
+                        print(f"  {tool:5}: {size_str:>10}  {stats_str}")
                     else:
                         print(f"  {tool:5}: ✗ compression failed")
                         failed += 1
                 
                 print()
                 
-                # Decompression matrix
+                # Decompression matrix (single run for correctness, timing is less critical)
                 for comp_tool, comp_file in compressed.items():
                     for decomp_tool in TOOLS:
                         out = tmpdir / f"test.{comp_tool}.{decomp_tool}.tar"
                         
-                        success, elapsed = decompress(decomp_tool, str(comp_file), str(out))
+                        success, median_time, times = decompress(decomp_tool, str(comp_file), str(out))
                         if not success:
                             print(f"  ✗ {comp_tool} → {decomp_tool}: decompression failed")
                             failed += 1
                             continue
                         
-                        time_str = format_time(elapsed)
+                        time_str = format_time(median_time)
                         if files_identical(str(tarball), str(out)):
                             print(f"  ✓ {comp_tool:5} → {decomp_tool:5}  {time_str:>8}")
                             passed += 1
@@ -199,16 +244,20 @@ def main():
         # Test unrigz symlink
         print("Testing unrigz symlink...")
         rigz_file = tmpdir / "test.rigz.gz"
-        success, _ = compress("rigz", 6, 4, str(tarball), str(rigz_file))
+        success, _, _ = compress("rigz", 6, 4, str(tarball), str(rigz_file), trials=1)
         if success:
             unrigz_out = tmpdir / "test.unrigz.tar"
-            start = time.perf_counter()
-            cmd = [UNRIGZ, "-c", str(rigz_file)]
-            with open(unrigz_out, "wb") as f:
-                result = subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
-            elapsed = time.perf_counter() - start
             
-            time_str = format_time(elapsed)
+            times = []
+            for _ in range(TRIALS):
+                start = time.perf_counter()
+                cmd = [UNRIGZ, "-c", str(rigz_file)]
+                with open(unrigz_out, "wb") as f:
+                    result = subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
+                elapsed = time.perf_counter() - start
+                times.append(elapsed)
+            
+            time_str = format_time(statistics.median(times))
             if result.returncode == 0 and files_identical(str(tarball), str(unrigz_out)):
                 print(f"  ✓ unrigz             {time_str:>8}")
                 passed += 1
@@ -218,10 +267,10 @@ def main():
     
     # Summary
     print()
-    print("=" * 60)
+    print("=" * 70)
     total = passed + failed
     print(f"  Results: {passed}/{total} passed, {failed} failed")
-    print("=" * 60)
+    print("=" * 70)
     
     return 0 if failed == 0 else 1
 
