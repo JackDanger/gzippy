@@ -46,7 +46,10 @@ thread_local! {
 }
 
 /// Default block size for parallel compression (128KB like pigz)
-const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
+/// Block size for parallel compression
+/// BGZF format stores block size as u16, so max is 65535 bytes
+/// We use 64KB to stay within this limit while maximizing parallelism
+const DEFAULT_BLOCK_SIZE: usize = 64 * 1024;
 
 /// Global thread pool to avoid per-call initialization overhead
 static THREAD_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
@@ -349,7 +352,12 @@ fn compress_block_bgzf(output: &mut Vec<u8>, block: &[u8], compression_level: u3
 
     // Block size is stored as (size - 1) to match BGZF convention
     // This allows block sizes up to 65536 to fit in 16 bits
-    let block_size_minus_1 = (total_block_size - 1) as u16;
+    // If block exceeds u16 range, write 0 to signal "use sequential decompression"
+    let block_size_minus_1 = if total_block_size <= 65536 {
+        (total_block_size - 1) as u16
+    } else {
+        0 // Overflow marker - decompressor will fall back to sequential
+    };
     output[block_size_offset..block_size_offset + 2]
         .copy_from_slice(&block_size_minus_1.to_le_bytes());
 }

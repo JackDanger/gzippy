@@ -290,11 +290,12 @@ fn parse_bgzf_blocks(data: &[u8]) -> Vec<(usize, usize)> {
         }
 
         match block_size {
-            Some(size) if size > 0 && offset + size <= data.len() => {
+            Some(size) if size > 1 && offset + size <= data.len() => {
+                // size > 1 because size=1 means stored value was 0 (overflow marker)
                 blocks.push((offset, size));
                 offset += size;
             }
-            _ => break, // Invalid or missing block size
+            _ => break, // Invalid, overflow, or missing block size - fall back to sequential
         }
     }
 
@@ -481,12 +482,14 @@ fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> 
             output_buf.resize(min_size, 0);
         }
 
+        let mut success = false;
         loop {
             match decompressor.gzip_decompress_ex(remaining, &mut output_buf) {
                 Ok(result) => {
                     writer.write_all(&output_buf[..result.output_size])?;
                     total_bytes += result.output_size as u64;
                     offset += result.input_consumed;
+                    success = true;
                     break;
                 }
                 Err(DecompressError::InsufficientSpace) => {
@@ -496,10 +499,13 @@ fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> 
                     continue;
                 }
                 Err(DecompressError::BadData) => {
-                    // Might be trailing garbage, stop processing
+                    // Invalid data - stop processing entirely
                     break;
                 }
             }
+        }
+        if !success {
+            break; // Exit outer loop on error
         }
     }
 
