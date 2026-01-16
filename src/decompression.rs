@@ -237,8 +237,8 @@ fn has_bgzf_markers(data: &[u8]) -> bool {
 }
 
 /// Parse BGZF block boundaries from "RZ" markers
-/// Returns vector of (start_offset, block_size) tuples
-fn parse_bgzf_blocks(data: &[u8]) -> Vec<(usize, usize)> {
+/// Returns (blocks, consumed_all) where consumed_all is true if we parsed the entire file
+fn parse_bgzf_blocks(data: &[u8]) -> (Vec<(usize, usize)>, bool) {
     let mut blocks = Vec::new();
     let mut offset = 0;
 
@@ -295,11 +295,13 @@ fn parse_bgzf_blocks(data: &[u8]) -> Vec<(usize, usize)> {
                 blocks.push((offset, size));
                 offset += size;
             }
-            _ => break, // Invalid, overflow, or missing block size - fall back to sequential
+            _ => break, // Invalid, overflow, or missing block size
         }
     }
 
-    blocks
+    // Return whether we consumed the entire file
+    let consumed_all = offset >= data.len();
+    (blocks, consumed_all)
 }
 
 /// Parallel decompression for BGZF-style files (rigz output)
@@ -308,11 +310,12 @@ fn decompress_bgzf_parallel<W: Write>(data: &[u8], writer: &mut W) -> RigzResult
     use libdeflater::{DecompressionError, Decompressor};
     use rayon::prelude::*;
 
-    let blocks = parse_bgzf_blocks(data);
+    let (blocks, consumed_all) = parse_bgzf_blocks(data);
 
-    // Fall back to sequential if we couldn't parse blocks
-    if blocks.is_empty() {
-        return decompress_multi_member_zlibng(data, writer);
+    // Fall back to sequential if we couldn't parse ALL blocks
+    // This handles files with overflow markers or mixed content
+    if blocks.is_empty() || !consumed_all {
+        return decompress_multi_member_sequential(data, writer);
     }
 
     // For few blocks, sequential is faster (avoids rayon overhead)
