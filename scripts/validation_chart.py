@@ -7,9 +7,8 @@ Reads JSON output from validate.py and generates:
 2. Optional HTML chart (if --html flag used)
 
 Usage:
-    python3 scripts/validate.py --json | python3 scripts/validation_chart.py
-    python3 scripts/validation_chart.py results.json
-    python3 scripts/validation_chart.py results.json --html > chart.html
+    python3 scripts/validation_chart.py test_results/validation.json
+    python3 scripts/validation_chart.py test_results/validation.json --html > chart.html
 """
 
 import json
@@ -173,20 +172,51 @@ def generate_html_chart(results):
     """Generate an HTML page with interactive charts using Chart.js."""
     
     # Prepare compression data
-    comp_data = defaultdict(lambda: defaultdict(dict))
+    comp_data = defaultdict(dict)
     for r in results["compression"]:
         if r["success"]:
             key = f"L{r['level']} {r['threads']}t"
             comp_data[key][r["tool"]] = r["median_seconds"]
     
     # Prepare decompression data (rigz-compressed only)
-    decomp_data = defaultdict(lambda: defaultdict(dict))
+    decomp_data = defaultdict(dict)
     for r in results["decompression"]:
         if r["success"] and r["correct"] and r["compressor"] == "rigz":
             key = f"L{r['level']} {r['threads']}t"
             decomp_data[key][r["decompressor"]] = r["median_seconds"]
     
     configs = sorted(comp_data.keys())
+    
+    # Pre-compute all data as JSON strings to avoid f-string issues
+    configs_json = json.dumps(configs)
+    
+    # Build arrays for each tool directly (avoids the map lookup issue)
+    comp_gzip_data = [comp_data[c].get("gzip", 0) for c in configs]
+    comp_pigz_data = [comp_data[c].get("pigz", 0) for c in configs]
+    comp_rigz_data = [comp_data[c].get("rigz", 0) for c in configs]
+    
+    decomp_gzip_data = [decomp_data[c].get("gzip", 0) for c in configs]
+    decomp_pigz_data = [decomp_data[c].get("pigz", 0) for c in configs]
+    decomp_rigz_data = [decomp_data[c].get("rigz", 0) for c in configs]
+    
+    # Convert to JSON
+    comp_gzip_json = json.dumps(comp_gzip_data)
+    comp_pigz_json = json.dumps(comp_pigz_data)
+    comp_rigz_json = json.dumps(comp_rigz_data)
+    decomp_gzip_json = json.dumps(decomp_gzip_data)
+    decomp_pigz_json = json.dumps(decomp_pigz_data)
+    decomp_rigz_json = json.dumps(decomp_rigz_data)
+    
+    # Summary stats
+    passed = results['summary']['passed']
+    failed = results['summary']['failed']
+    total = passed + failed
+    test_size = format_size(results.get('test_size_bytes', 0))
+    
+    # Colors
+    gzip_color = TOOL_HTML_COLORS["gzip"]
+    pigz_color = TOOL_HTML_COLORS["pigz"]
+    rigz_color = TOOL_HTML_COLORS["rigz"]
     
     html = f"""<!DOCTYPE html>
 <html>
@@ -237,11 +267,11 @@ def generate_html_chart(results):
     
     <div class="summary">
         <div class="stat-card">
-            <div class="stat-value">{results['summary']['passed']}/{results['summary']['passed'] + results['summary']['failed']}</div>
+            <div class="stat-value">{passed}/{total}</div>
             <div class="stat-label">Tests Passed</div>
         </div>
         <div class="stat-card">
-            <div class="stat-value">{format_size(results.get('test_size_bytes', 0))}</div>
+            <div class="stat-value">{test_size}</div>
             <div class="stat-label">Test File Size</div>
         </div>
     </div>
@@ -257,25 +287,25 @@ def generate_html_chart(results):
     </div>
 
     <script>
-        const configs = {json.dumps(configs)};
+        const configs = {configs_json};
         
         const compData = {{
             labels: configs,
             datasets: [
                 {{
                     label: 'gzip',
-                    data: configs.map(c => {json.dumps({k: v.get('gzip', 0) for k, v in comp_data.items()})}[c] || 0),
-                    backgroundColor: '{TOOL_HTML_COLORS["gzip"]}',
+                    data: {comp_gzip_json},
+                    backgroundColor: '{gzip_color}',
                 }},
                 {{
                     label: 'pigz',
-                    data: configs.map(c => {json.dumps({k: v.get('pigz', 0) for k, v in comp_data.items()})}[c] || 0),
-                    backgroundColor: '{TOOL_HTML_COLORS["pigz"]}',
+                    data: {comp_pigz_json},
+                    backgroundColor: '{pigz_color}',
                 }},
                 {{
                     label: 'rigz',
-                    data: configs.map(c => {json.dumps({k: v.get('rigz', 0) for k, v in comp_data.items()})}[c] || 0),
-                    backgroundColor: '{TOOL_HTML_COLORS["rigz"]}',
+                    data: {comp_rigz_json},
+                    backgroundColor: '{rigz_color}',
                 }},
             ]
         }};
@@ -285,18 +315,18 @@ def generate_html_chart(results):
             datasets: [
                 {{
                     label: 'gzip',
-                    data: configs.map(c => {json.dumps({k: v.get('gzip', 0) for k, v in decomp_data.items()})}[c] || 0),
-                    backgroundColor: '{TOOL_HTML_COLORS["gzip"]}',
+                    data: {decomp_gzip_json},
+                    backgroundColor: '{gzip_color}',
                 }},
                 {{
                     label: 'pigz',
-                    data: configs.map(c => {json.dumps({k: v.get('pigz', 0) for k, v in decomp_data.items()})}[c] || 0),
-                    backgroundColor: '{TOOL_HTML_COLORS["pigz"]}',
+                    data: {decomp_pigz_json},
+                    backgroundColor: '{pigz_color}',
                 }},
                 {{
                     label: 'rigz',
-                    data: configs.map(c => {json.dumps({k: v.get('rigz', 0) for k, v in decomp_data.items()})}[c] || 0),
-                    backgroundColor: '{TOOL_HTML_COLORS["rigz"]}',
+                    data: {decomp_rigz_json},
+                    backgroundColor: '{rigz_color}',
                 }},
             ]
         }};

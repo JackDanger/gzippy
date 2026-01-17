@@ -100,20 +100,26 @@ test-data:
 validate: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
 	@python3 scripts/validate.py
 
-# Validation with JSON output
+# Validation with JSON output (run tests, save results)
 validate-json: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
-	@python3 scripts/validate.py --json -o $(RESULTS_DIR)/validation.json
-	@echo "Results saved to $(RESULTS_DIR)/validation.json"
-
-# Generate performance chart from validation results
-validation-chart: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
 	@mkdir -p $(RESULTS_DIR)
-	@echo "Running validation suite..."
 	@python3 scripts/validate.py --json -o $(RESULTS_DIR)/validation.json
+	@echo "✓ Results saved to $(RESULTS_DIR)/validation.json"
+
+# Run validation + generate charts (full workflow)
+validation-chart: validate-json render-chart
+
+# Render charts from existing JSON (fast iteration on chart rendering)
+render-chart:
+	@if [ ! -f $(RESULTS_DIR)/validation.json ]; then \
+		echo "Error: $(RESULTS_DIR)/validation.json not found. Run 'make validate-json' first."; \
+		exit 1; \
+	fi
 	@echo ""
 	@python3 scripts/validation_chart.py $(RESULTS_DIR)/validation.json
 	@python3 scripts/validation_chart.py $(RESULTS_DIR)/validation.json --html > $(RESULTS_DIR)/validation.html
-	@echo "HTML chart saved to $(RESULTS_DIR)/validation.html"
+	@echo ""
+	@echo "✓ HTML chart: $(RESULTS_DIR)/validation.html"
 
 # =============================================================================
 # Lint target
@@ -159,14 +165,18 @@ help:
 	@echo "======================================"
 	@echo ""
 	@echo "Quick commands (for AI tools and iteration):"
-	@echo "  make              			Build and run quick benchmark (< 30 seconds)"
-	@echo "  make quick        			Same as above"
-	@echo "  make build        			Build rigz and unrigz"
-	@echo "  make deps         			Build gzip and pigz from submodules"
-	@echo "  make validate     			Run validation suite (adaptive 3-10 trials)"
-	@echo "  make lint         			Run rustfmt and clippy (auto-fix)"
-	@echo "  make lint-check   			Check formatting without changes"
-	@echo "  make validation-chart  Run validation + generate charts"
+	@echo "  make              Build and run quick benchmark (< 30 seconds)"
+	@echo "  make quick        Same as above"
+	@echo "  make build        Build rigz and unrigz"
+	@echo "  make deps         Build gzip and pigz from submodules"
+	@echo "  make validate     Run validation suite (adaptive 3-17 trials)"
+	@echo "  make lint         Run rustfmt and clippy (auto-fix)"
+	@echo "  make lint-check   Check formatting without changes"
+	@echo ""
+	@echo "Charting (separate test running from rendering):"
+	@echo "  make validate-json     Run tests, save JSON to test_results/"
+	@echo "  make render-chart      Generate charts from existing JSON (fast)"
+	@echo "  make validation-chart  Both: run tests + generate charts"
 	@echo ""
 	@echo "Full testing (for humans at release time):"
 	@echo "  make perf-full    			Comprehensive performance tests (10+ minutes)"
