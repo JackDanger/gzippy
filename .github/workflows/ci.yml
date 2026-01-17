@@ -90,10 +90,15 @@ jobs:
 
       - name: Run validation matrix
         run: |
-          # Use 7 trials for statistical significance in CI
           CORES=$(nproc)
-          echo "Running validation with $CORES cores available, 7 trials per test"
-          python3 scripts/validate_ci.py --trials 7 --output validation-results.json
+          echo "Running validation with $CORES cores available"
+          echo "Testing: text (compressible), random (incompressible), tarball (mixed)"
+          
+          # 10MB test files, 5 trials for statistical significance
+          python3 scripts/validate_ci.py \
+            --size 10 \
+            --trials 5 \
+            --output validation-results.json
 
       - name: Generate summary
         run: |

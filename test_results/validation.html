@@ -286,7 +286,7 @@
         <header class="hero">
             <h1>rigz</h1>
             <p class="tagline">Drop-in gzip replacement. Parallel compression in Rust.</p>
-            <span class="hero-stat">2.6× faster than gzip</span>
+            <span class="hero-stat">3× faster than gzip</span>
         </header>
         
         <section>
@@ -326,7 +326,7 @@
         <section>
             <h2>Performance</h2>
             <p class="perf-intro">
-                Tested on 622.2MB. Right is faster. Hover for times.
+                Tested on 622.3MB. Right is faster. Hover for times.
             </p>
             <div class="legend">
                 <div class="legend-item"><div class="legend-dot rigz"></div> rigz</div>
@@ -352,8 +352,8 @@
     </div>
     
     <script>
-        const configs = [{"level": 1, "threads": 1, "tools": {"gzip": {"time": 5.464319459046237, "throughput": 113.87493504014674}, "pigz": {"time": 4.691971207968891, "throughput": 132.61995776544111}, "rigz": {"time": 3.3161114164977334, "throughput": 187.64418479481608}}, "gzip_speedup": 1.6478093684853643, "pigz_speedup": 1.4149015574766945}, {"level": 1, "threads": 4, "tools": {"gzip": {"time": 5.648937209043652, "throughput": 110.15329085997132}, "pigz": {"time": 1.3112795829074457, "throughput": 474.5357371139823}, "rigz": {"time": 0.8879357080440968, "throughput": 700.781619435219}}, "gzip_speedup": 6.3618763812155565, "pigz_speedup": 1.4767731165985778}, {"level": 6, "threads": 1, "tools": {"gzip": {"time": 14.251823207945563, "throughput": 43.66101195323478}, "pigz": {"time": 13.691367333056405, "throughput": 45.448274690223485}, "rigz": {"time": 5.209729042020626, "throughput": 119.4398054905667}}, "gzip_speedup": 2.735616976044862, "pigz_speedup": 2.628038276583022}, {"level": 6, "threads": 4, "tools": {"gzip": {"time": 14.183212083065882, "throughput": 43.872221595024826}, "pigz": {"time": 3.6169482909608632, "throughput": 172.0370249673091}, "rigz": {"time": 1.387794749927707, "throughput": 448.37251579883423}}, "gzip_speedup": 10.219963783408687, "pigz_speedup": 2.6062559259208014}, {"level": 9, "threads": 1, "tools": {"gzip": {"time": 41.55228879104834, "throughput": 14.975084202137905}, "pigz": {"time": 40.34980125003494, "throughput": 15.421365264765985}, "rigz": {"time": 15.704923124983907, "throughput": 39.62127152648114}}, "gzip_speedup": 2.645812937787998, "pigz_speedup": 2.5692453843244323}, {"level": 9, "threads": 4, "tools": {"gzip": {"time": 42.72683800000232, "throughput": 14.563423191706024}, "pigz": {"time": 11.059614458004944, "throughput": 56.2631749777784}, "rigz": {"time": 3.9510087920352817, "throughput": 157.49117660580075}}, "gzip_speedup": 10.81415918034251, "pigz_speedup": 2.7991875088457623}];
-        const globalMaxTime = 42.72683800000232;
+        const configs = [{"level": 1, "threads": 1, "tools": {"gzip": {"time": 5.592621417017654, "throughput": 111.27018007940653}, "pigz": {"time": 4.866453667054884, "throughput": 127.87381423156613}, "rigz": {"time": 3.303495084051974, "throughput": 188.37382116646415}}, "gzip_speedup": 1.6929407414640076, "pigz_speedup": 1.4731227210079056}, {"level": 1, "threads": 4, "tools": {"gzip": {"time": 5.897564333979972, "throughput": 105.51677895263352}, "pigz": {"time": 1.2559427920496091, "throughput": 495.47797569024925}, "rigz": {"time": 0.9389589170459658, "throughput": 662.7467729315322}}, "gzip_speedup": 6.280960995113764, "pigz_speedup": 1.3375907819278166}, {"level": 6, "threads": 1, "tools": {"gzip": {"time": 14.884891042020172, "throughput": 41.806956492376365}, "pigz": {"time": 14.135718957986683, "throughput": 44.02266301679017}, "rigz": {"time": 5.250200417009182, "throughput": 118.52728329597625}}, "gzip_speedup": 2.8351091119869034, "pigz_speedup": 2.6924151147051267}, {"level": 6, "threads": 4, "tools": {"gzip": {"time": 14.288277459098026, "throughput": 43.55262514805499}, "pigz": {"time": 3.5954992909682915, "throughput": 173.0752648875958}, "rigz": {"time": 1.3733457078924403, "throughput": 453.12115413567636}}, "gzip_speedup": 10.403991782247648, "pigz_speedup": 2.6180584177060604}, {"level": 9, "threads": 1, "tools": {"gzip": {"time": 42.58789904101286, "throughput": 14.61194391365074}, "pigz": {"time": 40.500820707995445, "throughput": 15.364923014131676}, "rigz": {"time": 16.109615332912654, "throughput": 38.62860653886192}}, "gzip_speedup": 2.6436322755642654, "pigz_speedup": 2.5140774544287523}, {"level": 9, "threads": 4, "tools": {"gzip": {"time": 40.7566267499933, "throughput": 15.268486177836154}, "pigz": {"time": 11.180532125057653, "throughput": 55.6585308487087}, "rigz": {"time": 4.009552667033859, "throughput": 155.20234895626203}}, "gzip_speedup": 10.164881255979056, "pigz_speedup": 2.788473691088502}];
+        const globalMaxTime = 42.58789904101286;
         
         function formatTime(s) {
             if (s < 1) return (s * 1000).toFixed(0) + 'ms';
