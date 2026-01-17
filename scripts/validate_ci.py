@@ -114,22 +114,23 @@ def generate_random_file(output_path: Path, size_mb: int) -> bool:
 
 
 def generate_tarball(output_path: Path, target_mb: int) -> bool:
-    """Generate tarball from repo."""
-    # Create base tarball
+    """Generate tarball from entire repo including .git (realistic mixed content)."""
+    # Include everything: source, .git objects, binaries - realistic workload
     tar_cmd = [
         "tar", "cf", str(output_path),
-        "--exclude=.git", "--exclude=target", "--exclude=test_data",
-        "--exclude=test_results", "--exclude=pigz", "--exclude=gzip",
+        "--exclude=target",      # Build artifacts (huge)
+        "--exclude=test_data",   # Generated test files
+        "--exclude=test_results",
         "."
     ]
     result = subprocess.run(tar_cmd, capture_output=True)
     if result.returncode != 0:
         return False
     
-    # Pad if too small
+    # Pad by repeating if too small
     actual = output_path.stat().st_size
     target = target_mb * 1024 * 1024
-    if actual < target * 0.5:
+    if actual < target * 0.8:
         base = output_path.read_bytes()
         with open(output_path, 'wb') as f:
             while f.tell() < target:
