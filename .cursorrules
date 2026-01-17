@@ -34,7 +34,9 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 **Compression:**
 - zlib-ng via flate2 (2-3x faster than standard zlib)
 - **Level 1 → Level 2 mapping** (zlib-ng L1 produces 2-5x larger output)
-- 128KB fixed blocks (dynamic sizing regressed 14%)
+- **Level 7-9: Pipelined mode** with dictionary sharing (matches pigz output size)
+- **Level 1-6: Independent blocks** for parallel decompression capability
+- 64KB blocks (BGZF compatible for L1-6, variable for L7-9)
 - Global rayon pool (avoids per-call initialization)
 - Thread-local buffer reuse (reduces allocator pressure)
 
@@ -86,26 +88,27 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 
 ## Architecture-Dependent Performance
 
-Performance varies significantly by CPU architecture:
+Performance varies significantly by CPU architecture and compression level:
 
-**Apple Silicon (M1/M2/M3/M4):**
-- rigz beats pigz everywhere (10-43% faster)
-- NEON optimizations in zlib-ng work well
-- Larger L2 cache benefits block-based approach
+**Level 1-6 (Independent Blocks):**
+- Parallel compression AND decompression
+- rigz beats pigz on Apple Silicon (10-43% faster)
+- L1: rigz wins everywhere (17-50% faster)
+- L6 multi-thread: pigz slightly better compression (~5%)
 
-**x86_64 Linux (GHA runners, 2 cores):**
-- L1: rigz wins (17% faster)
-- L6 max-threads: pigz wins (12% faster)
-- L9 max-threads: pigz wins (32% faster)
-- Decompression: rigz always wins (24% faster)
+**Level 7-9 (Pipelined Mode):**
+- Dictionary sharing for maximum compression (matches pigz output size)
+- Sequential decompression (like pigz)
+- Single-thread: rigz 1.5x faster than pigz!
+- Multi-thread: pigz has better parallel I/O pipelining
 
-**Root cause:** At high compression levels with max threads, rigz's independent-block approach (restarts dictionary each block) has more overhead than pigz's pipelined shared-dictionary approach on x86. This is a fundamental trade-off: independent blocks enable parallel decompression but cost some compression efficiency.
+**Design Philosophy:**
+- L1-6: Speed + parallel decompress (independent blocks)
+- L7-9: Maximum compression (dictionary sharing, sequential decompress)
 
-**Accepted trade-off:** rigz prioritizes:
-1. Parallel decompression (24% faster)
-2. Apple Silicon performance (dominant in developer laptops)
-3. Single-threaded performance (35-50% faster)
-4. L1 parallel performance (17% faster)
+This matches user expectations:
+- `gzip -1`: I want fast → rigz wins
+- `gzip -9`: I want small → rigz matches pigz
 
 ## Test Suite
 

@@ -16,6 +16,7 @@ use std::path::Path;
 
 use crate::optimization::{CompressionBackend, CpuFeatures, OptimizationConfig};
 use crate::parallel_compress::ParallelGzEncoder;
+use crate::pipelined_compress::PipelinedGzEncoder;
 
 /// Simple but effective optimizations that address pigz performance gaps
 pub struct SimpleOptimizer {
@@ -36,29 +37,53 @@ impl SimpleOptimizer {
     }
 
     /// Parallel compression using our custom implementation with system zlib
+    ///
+    /// At compression levels 7-9, uses pipelined compression with dictionary
+    /// sharing for maximum compression ratio (like pigz). This produces slightly
+    /// smaller output but requires sequential decompression.
+    ///
+    /// At levels 1-6, uses independent block compression for parallel
+    /// decompression capability.
     fn compress_parallel<R: Read, W: Write>(&self, reader: R, writer: W) -> io::Result<u64> {
         let optimal_threads = self.calculate_optimal_threads();
-
-        // Use the actual requested compression level - system zlib works correctly
         let compression_level = self.config.compression_level as u32;
 
+        // At high compression levels (7-9), users expect maximum compression.
+        // Use pipelined compression with dictionary sharing like pigz.
+        if self.config.compression_level >= 7 && optimal_threads > 1 {
+            let encoder = PipelinedGzEncoder::new(compression_level, optimal_threads);
+            return encoder.compress(reader, writer);
+        }
+
+        // At lower levels, use independent blocks for parallel decompression
         let encoder = ParallelGzEncoder::new(compression_level, optimal_threads);
         encoder.compress(reader, writer)
     }
 
     /// File-based parallel compression using memory-mapped I/O
     /// This eliminates the latency of reading the file into memory
+    ///
+    /// At compression levels 7-9, uses pipelined compression for maximum
+    /// compression ratio. At levels 1-6, uses independent blocks for
+    /// parallel decompression capability.
     pub fn compress_file<P: AsRef<Path>, W: Write>(&self, path: P, writer: W) -> io::Result<u64> {
         let optimal_threads = self.calculate_optimal_threads();
         let compression_level = self.config.compression_level as u32;
 
         // For single-threaded, fall back to regular compression
         if optimal_threads == 1 {
-            let file = std::fs::File::open(path)?;
+            let file = std::fs::File::open(&path)?;
             return self.compress_single_threaded(file, writer);
         }
 
-        // Use mmap-based parallel compression
+        // At high compression levels (7-9), use pipelined compression
+        // for maximum compression ratio (dictionary sharing like pigz)
+        if self.config.compression_level >= 7 {
+            let encoder = PipelinedGzEncoder::new(compression_level, optimal_threads);
+            return encoder.compress_file(path, writer);
+        }
+
+        // Use mmap-based parallel compression with independent blocks
         let encoder = ParallelGzEncoder::new(compression_level, optimal_threads);
         encoder.compress_file(path, writer)
     }

@@ -32,7 +32,7 @@ pub const RIGZ_SUBFIELD_ID: [u8; 2] = [b'R', b'Z'];
 /// This produces files 2-5x larger than expected for repetitive data.
 /// We map level 1 to level 2 which gives similar speed but much better ratios.
 #[inline]
-fn adjust_compression_level(level: u32) -> u32 {
+pub fn adjust_compression_level(level: u32) -> u32 {
     if level == 1 {
         2
     } else {
