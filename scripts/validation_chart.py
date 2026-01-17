@@ -179,7 +179,7 @@ def generate_html_chart(results):
     
     global_max_time = max(all_times) if all_times else 1
     
-    max_gzip_speedup = max((c["gzip_speedup"] for c in configs), default=1)
+    max_gzip_speedup = max((c["gzip_speedup"] for c in configs if c["threads"] == 1), default=1)
     max_pigz_speedup = max((c["pigz_speedup"] for c in configs), default=1)
     max_throughput = max(
         (c["tools"]["rigz"]["throughput"] for c in configs if "rigz" in c["tools"]),
