@@ -46,7 +46,10 @@ thread_local! {
 }
 
 /// Default block size for parallel compression (128KB like pigz)
-const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
+/// Block size for parallel compression
+/// BGZF format stores block size as u16, so max is 65535 bytes
+/// We use 64KB to stay within this limit while maximizing parallelism
+const DEFAULT_BLOCK_SIZE: usize = 64 * 1024;
 
 /// Global thread pool to avoid per-call initialization overhead
 static THREAD_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
@@ -270,7 +273,7 @@ fn compress_block_with_reuse(block: &[u8], compression_level: u32) -> Vec<u8> {
         buf.clear();
 
         // Compress with BGZF-style header (includes block size marker)
-        compress_block_bgzf(&mut *buf, block, compression_level);
+        compress_block_bgzf(&mut buf, block, compression_level);
 
         // Return a copy (buffer stays allocated for next use)
         buf.clone()
@@ -299,11 +302,11 @@ fn compress_block_bgzf(output: &mut Vec<u8>, block: &[u8], compression_level: u3
     // 10 bytes base header + 6 bytes XLEN + subfield
     output.extend_from_slice(&[
         0x1f, 0x8b, // Magic
-        0x08,       // Compression method (deflate)
-        0x04,       // Flags: FEXTRA
-        0, 0, 0, 0, // MTIME (zero)
-        0x00,       // XFL (no extra flags)
-        0xff,       // OS (unknown)
+        0x08, // Compression method (deflate)
+        0x04, // Flags: FEXTRA
+        0, 0, 0, 0,    // MTIME (zero)
+        0x00, // XFL (no extra flags)
+        0xff, // OS (unknown)
     ]);
 
     // XLEN: 6 bytes (2 byte ID + 2 byte len + 2 byte block size)
@@ -349,7 +352,12 @@ fn compress_block_bgzf(output: &mut Vec<u8>, block: &[u8], compression_level: u3
 
     // Block size is stored as (size - 1) to match BGZF convention
     // This allows block sizes up to 65536 to fit in 16 bits
-    let block_size_minus_1 = (total_block_size - 1) as u16;
+    // If block exceeds u16 range, write 0 to signal "use sequential decompression"
+    let block_size_minus_1 = if total_block_size <= 65536 {
+        (total_block_size - 1) as u16
+    } else {
+        0 // Overflow marker - decompressor will fall back to sequential
+    };
     output[block_size_offset..block_size_offset + 2]
         .copy_from_slice(&block_size_minus_1.to_le_bytes());
 }
