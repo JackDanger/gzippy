@@ -75,18 +75,15 @@ def generate_random_file(output_path: Path, size_mb: int) -> bool:
 
 
 def generate_tarball(output_path: Path, size_mb: int) -> bool:
-    """Generate tarball from current repo (mixed content)."""
+    """Generate tarball from entire repo including .git (realistic mixed content)."""
     print(f"  Generating ~{size_mb}MB tarball from repo...")
     
-    # Create a tar of the repo (excluding .git, target, test_data)
+    # Include .git for realistic binary/text mix
     tar_cmd = [
         "tar", "cf", str(output_path),
-        "--exclude=.git",
-        "--exclude=target", 
-        "--exclude=test_data",
+        "--exclude=target",       # Build artifacts
+        "--exclude=test_data",    # Generated test files
         "--exclude=test_results",
-        "--exclude=pigz",
-        "--exclude=gzip",
         "."
     ]
     
@@ -98,19 +95,15 @@ def generate_tarball(output_path: Path, size_mb: int) -> bool:
     actual_size = output_path.stat().st_size
     actual_mb = actual_size / 1024 / 1024
     
-    # If the tarball is smaller than desired, pad it by including it multiple times
+    # Pad by repeating if too small
     if actual_mb < size_mb * 0.8:
         print(f"  Tarball is {actual_mb:.1f}MB, padding to reach ~{size_mb}MB...")
-        
-        # Create a larger tarball by including copies of itself
         base_tar = output_path.read_bytes()
+        target = size_mb * 1024 * 1024
         with open(output_path, 'wb') as f:
-            bytes_written = 0
-            target = size_mb * 1024 * 1024
-            while bytes_written < target:
-                chunk = base_tar[:target - bytes_written]
-                f.write(chunk)
-                bytes_written += len(chunk)
+            while f.tell() < target:
+                remaining = target - f.tell()
+                f.write(base_tar[:remaining])
     
     actual_size = output_path.stat().st_size
     print(f"  Created: {output_path} ({actual_size / 1024 / 1024:.1f}MB)")
