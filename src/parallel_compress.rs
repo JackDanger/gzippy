@@ -273,7 +273,7 @@ fn compress_block_with_reuse(block: &[u8], compression_level: u32) -> Vec<u8> {
         buf.clear();
 
         // Compress with BGZF-style header (includes block size marker)
-        compress_block_bgzf(&mut *buf, block, compression_level);
+        compress_block_bgzf(&mut buf, block, compression_level);
 
         // Return a copy (buffer stays allocated for next use)
         buf.clone()
@@ -302,11 +302,11 @@ fn compress_block_bgzf(output: &mut Vec<u8>, block: &[u8], compression_level: u3
     // 10 bytes base header + 6 bytes XLEN + subfield
     output.extend_from_slice(&[
         0x1f, 0x8b, // Magic
-        0x08,       // Compression method (deflate)
-        0x04,       // Flags: FEXTRA
-        0, 0, 0, 0, // MTIME (zero)
-        0x00,       // XFL (no extra flags)
-        0xff,       // OS (unknown)
+        0x08, // Compression method (deflate)
+        0x04, // Flags: FEXTRA
+        0, 0, 0, 0,    // MTIME (zero)
+        0x00, // XFL (no extra flags)
+        0xff, // OS (unknown)
     ]);
 
     // XLEN: 6 bytes (2 byte ID + 2 byte len + 2 byte block size)

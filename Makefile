@@ -116,6 +116,22 @@ validation-chart: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
 	@echo "HTML chart saved to $(RESULTS_DIR)/validation.html"
 
 # =============================================================================
+# Lint target
+# =============================================================================
+lint:
+	@echo "Running rustfmt..."
+	@cargo fmt --all
+	@echo "Running clippy..."
+	@cargo clippy --release -- -D warnings
+	@echo "✓ Lint passed"
+
+lint-check:
+	@echo "Checking formatting..."
+	@cargo fmt --all --check
+	@cargo clippy --release -- -D warnings
+	@echo "✓ Lint check passed"
+
+# =============================================================================
 # Install target
 # =============================================================================
 install: $(RIGZ_BIN) $(UNRIGZ_BIN)
@@ -143,24 +159,26 @@ help:
 	@echo "======================================"
 	@echo ""
 	@echo "Quick commands (for AI tools and iteration):"
-	@echo "  make              Build and run quick benchmark (< 30 seconds)"
-	@echo "  make quick        Same as above"
-	@echo "  make build        Build rigz and unrigz"
-	@echo "  make deps         Build gzip and pigz from submodules"
-	@echo "  make validate     Run validation suite (adaptive 3-10 trials)"
+	@echo "  make              			Build and run quick benchmark (< 30 seconds)"
+	@echo "  make quick        			Same as above"
+	@echo "  make build        			Build rigz and unrigz"
+	@echo "  make deps         			Build gzip and pigz from submodules"
+	@echo "  make validate     			Run validation suite (adaptive 3-10 trials)"
+	@echo "  make lint         			Run rustfmt and clippy (auto-fix)"
+	@echo "  make lint-check   			Check formatting without changes"
 	@echo "  make validation-chart  Run validation + generate charts"
 	@echo ""
 	@echo "Full testing (for humans at release time):"
-	@echo "  make perf-full    Comprehensive performance tests (10+ minutes)"
-	@echo "  make test-data    Generate all test data files"
+	@echo "  make perf-full    			Comprehensive performance tests (10+ minutes)"
+	@echo "  make test-data    			Generate all test data files"
 	@echo ""
 	@echo "Installation:"
-	@echo "  make install      Install rigz and unrigz to /usr/local/bin"
+	@echo "  make install      			Install rigz and unrigz to /usr/local/bin"
 	@echo ""
 	@echo "Maintenance:"
-	@echo "  make clean        Remove all build artifacts and test data"
-	@echo "  make help         Show this message"
+	@echo "  make clean        			Remove all build artifacts and test data"
+	@echo "  make help         			Show this message"
 	@echo ""
 	@echo "Binaries:"
-	@echo "  rigz              Compress (default) or decompress with -d"
-	@echo "  unrigz            Decompress (like gunzip/unpigz)"
+	@echo "  rigz              			Compress (default) or decompress with -d"
+	@echo "  unrigz            			Decompress (like gunzip/unpigz)"
