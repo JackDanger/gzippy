@@ -2,6 +2,8 @@
 """
 Generate markdown summary from validation results.
 
+Handles both validate.py and validate_ci.py JSON formats.
+
 Usage:
     python3 scripts/validation_summary.py validation-results.json
     python3 scripts/validation_summary.py validation-results.json --format github  # For PR comments
@@ -10,6 +12,7 @@ Usage:
 import json
 import sys
 import argparse
+from collections import defaultdict
 
 
 def format_time(seconds):
@@ -32,8 +35,141 @@ def format_size(bytes_val):
     return f"{bytes_val / 1024:.1f}KB"
 
 
-def generate_summary(results, format_type="markdown"):
-    """Generate markdown summary from validation results."""
+def detect_format(results):
+    """Detect which script generated the JSON."""
+    if "summary" in results:
+        return "validate"  # validate.py format
+    elif "compression_stats" in results:
+        return "validate_ci"  # validate_ci.py format
+    else:
+        raise ValueError("Unknown JSON format")
+
+
+def generate_summary_from_ci(results, format_type="markdown"):
+    """Generate summary from validate_ci.py output."""
+    lines = []
+    
+    passed = results.get('passed', 0)
+    failed = results.get('failed', 0)
+    total = passed + failed
+    size_mb = results.get('config', {}).get('size_mb', 0)
+    test_size = f"{size_mb}MB" if size_mb else "unknown"
+    
+    # Header
+    if format_type == "github":
+        lines.append("## 🔄 rigz Validation Results")
+    else:
+        lines.append("# Validation Results")
+    lines.append("")
+    
+    # Status
+    if failed == 0:
+        lines.append(f"**✅ All {passed} tests passed** (tested on {test_size})")
+    else:
+        lines.append(f"**❌ {failed}/{total} tests failed** (tested on {test_size})")
+    lines.append("")
+    
+    # Compression performance table
+    lines.append("### Compression Performance")
+    lines.append("")
+    lines.append("| Config | gzip | pigz | rigz | Speedup |")
+    lines.append("|--------|------|------|------|---------|")
+    
+    # Group compression stats by config
+    comp_by_config = defaultdict(dict)
+    for stat in results.get("compression_stats", []):
+        key = (stat["level"], stat["threads"])
+        comp_by_config[key][stat["tool"]] = stat
+    
+    best_gzip_speedup = 0
+    best_pigz_speedup = 0
+    best_throughput = 0
+    
+    for (level, threads), tools in sorted(comp_by_config.items()):
+        config = f"L{level}, {threads}t"
+        
+        gzip_time = tools.get("gzip", {}).get("median_time", 0)
+        pigz_time = tools.get("pigz", {}).get("median_time", 0)
+        rigz_time = tools.get("rigz", {}).get("median_time", 0)
+        
+        gzip_str = format_time(gzip_time) if gzip_time else "—"
+        pigz_str = format_time(pigz_time) if pigz_time else "—"
+        rigz_str = format_time(rigz_time) if rigz_time else "—"
+        
+        if rigz_time and gzip_time:
+            speedup = gzip_time / rigz_time
+            speedup_str = f"**{speedup:.1f}×** vs gzip"
+            best_gzip_speedup = max(best_gzip_speedup, speedup)
+        else:
+            speedup_str = "—"
+        
+        if rigz_time and pigz_time:
+            pigz_speedup = pigz_time / rigz_time
+            best_pigz_speedup = max(best_pigz_speedup, pigz_speedup)
+        
+        if rigz_time and size_mb:
+            throughput = size_mb / rigz_time
+            best_throughput = max(best_throughput, throughput)
+        
+        lines.append(f"| {config} | {gzip_str} | {pigz_str} | {rigz_str} | {speedup_str} |")
+    
+    lines.append("")
+    
+    # Decompression summary
+    decomp_tests = [t for t in results.get("tests", []) if "decompress_tool" in t]
+    decomp_passed = sum(1 for t in decomp_tests if t.get("passed"))
+    decomp_total = len(decomp_tests)
+    
+    lines.append("### Decompression")
+    lines.append("")
+    if decomp_total > 0:
+        if decomp_passed == decomp_total:
+            lines.append(f"✅ All {decomp_total} cross-tool decompression tests passed")
+        else:
+            lines.append(f"⚠️ {decomp_passed}/{decomp_total} decompression tests passed")
+            for t in decomp_tests:
+                if not t.get("passed"):
+                    comp = t.get("compress_tool", "?")
+                    decomp = t.get("decompress_tool", "?")
+                    level = t.get("level", "?")
+                    threads = t.get("threads", "?")
+                    lines.append(f"  - ❌ {comp} → {decomp} (L{level}, {threads}t)")
+    else:
+        lines.append("No decompression tests recorded")
+    
+    lines.append("")
+    
+    # Key stats
+    if best_gzip_speedup > 0:
+        lines.append("### Key Stats")
+        lines.append("")
+        lines.append(f"- **{best_gzip_speedup:.0f}×** faster than gzip (best case)")
+        lines.append(f"- **{best_pigz_speedup:.1f}×** faster than pigz (best case)")
+        lines.append(f"- **{best_throughput:.0f} MB/s** peak throughput")
+        lines.append("")
+    
+    # Errors
+    if results.get("errors"):
+        lines.append("### Errors")
+        lines.append("")
+        for error in results["errors"]:
+            lines.append(f"- ❌ {error}")
+        lines.append("")
+    
+    # Footer
+    if format_type == "github":
+        lines.append("<details>")
+        lines.append("<summary>View full validation matrix</summary>")
+        lines.append("")
+        lines.append("See the uploaded `validation-results.json` artifact for complete data.")
+        lines.append("")
+        lines.append("</details>")
+    
+    return "\n".join(lines)
+
+
+def generate_summary_from_validate(results, format_type="markdown"):
+    """Generate summary from validate.py output."""
     lines = []
     
     passed = results['summary']['passed']
@@ -62,7 +198,6 @@ def generate_summary(results, format_type="markdown"):
     lines.append("|--------|------|------|------|---------|")
     
     # Group compression by config
-    from collections import defaultdict
     comp_by_config = defaultdict(dict)
     for r in results.get("compression", []):
         if r.get("success"):
@@ -70,6 +205,9 @@ def generate_summary(results, format_type="markdown"):
             comp_by_config[key][r["tool"]] = r
     
     test_size_mb = results.get("test_size_bytes", 0) / (1024 * 1024)
+    best_gzip_speedup = 0
+    best_pigz_speedup = 0
+    best_throughput = 0
     
     for (level, threads), tools in sorted(comp_by_config.items()):
         config = f"L{level}, {threads}t"
@@ -85,14 +223,23 @@ def generate_summary(results, format_type="markdown"):
         if rigz_time and gzip_time:
             speedup = gzip_time / rigz_time
             speedup_str = f"**{speedup:.1f}×** vs gzip"
+            best_gzip_speedup = max(best_gzip_speedup, speedup)
         else:
             speedup_str = "—"
+        
+        if rigz_time and pigz_time:
+            pigz_speedup = pigz_time / rigz_time
+            best_pigz_speedup = max(best_pigz_speedup, pigz_speedup)
+        
+        if rigz_time and test_size_mb:
+            throughput = test_size_mb / rigz_time
+            best_throughput = max(best_throughput, throughput)
         
         lines.append(f"| {config} | {gzip_str} | {pigz_str} | {rigz_str} | {speedup_str} |")
     
     lines.append("")
     
-    # Decompression summary (just show if all passed)
+    # Decompression summary
     decomp_results = results.get("decompression", [])
     decomp_passed = sum(1 for r in decomp_results if r.get("success") and r.get("correct"))
     decomp_total = len(decomp_results)
@@ -103,8 +250,6 @@ def generate_summary(results, format_type="markdown"):
         lines.append(f"✅ All {decomp_total} cross-tool decompression tests passed")
     else:
         lines.append(f"⚠️ {decomp_passed}/{decomp_total} decompression tests passed")
-        
-        # List failures
         for r in decomp_results:
             if not (r.get("success") and r.get("correct")):
                 comp = r.get("compressor", "?")
@@ -118,26 +263,6 @@ def generate_summary(results, format_type="markdown"):
     # Key stats
     lines.append("### Key Stats")
     lines.append("")
-    
-    # Find best speedups
-    best_gzip_speedup = 0
-    best_pigz_speedup = 0
-    best_throughput = 0
-    
-    for (level, threads), tools in comp_by_config.items():
-        if "rigz" in tools:
-            rigz_time = tools["rigz"]["median_seconds"]
-            if rigz_time > 0:
-                throughput = test_size_mb / rigz_time
-                best_throughput = max(best_throughput, throughput)
-                
-                if "gzip" in tools:
-                    speedup = tools["gzip"]["median_seconds"] / rigz_time
-                    best_gzip_speedup = max(best_gzip_speedup, speedup)
-                if "pigz" in tools:
-                    speedup = tools["pigz"]["median_seconds"] / rigz_time
-                    best_pigz_speedup = max(best_pigz_speedup, speedup)
-    
     lines.append(f"- **{best_gzip_speedup:.0f}×** faster than gzip (best case)")
     lines.append(f"- **{best_pigz_speedup:.1f}×** faster than pigz (best case)")
     lines.append(f"- **{best_throughput:.0f} MB/s** peak throughput")
@@ -153,6 +278,15 @@ def generate_summary(results, format_type="markdown"):
         lines.append("</details>")
     
     return "\n".join(lines)
+
+
+def generate_summary(results, format_type="markdown"):
+    """Generate markdown summary from validation results (auto-detect format)."""
+    fmt = detect_format(results)
+    if fmt == "validate":
+        return generate_summary_from_validate(results, format_type)
+    else:
+        return generate_summary_from_ci(results, format_type)
 
 
 def main():
