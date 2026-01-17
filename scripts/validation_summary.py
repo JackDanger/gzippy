@@ -53,6 +53,7 @@ def generate_summary_from_ci(results, format_type="markdown"):
     failed = results.get('failed', 0)
     total = passed + failed
     size_mb = results.get('config', {}).get('size_mb', 0)
+    data_types = results.get('config', {}).get('data_types', ['unknown'])
     test_size = f"{size_mb}MB" if size_mb else "unknown"
     
     # Header
@@ -63,27 +64,42 @@ def generate_summary_from_ci(results, format_type="markdown"):
     lines.append("")
     
     # Status
+    data_types_str = ", ".join(data_types) if len(data_types) <= 3 else f"{len(data_types)} types"
     if failed == 0:
-        lines.append(f"**✅ All {passed} tests passed** (tested on {test_size})")
+        lines.append(f"**✅ All {passed} tests passed** ({test_size} × {data_types_str})")
     else:
-        lines.append(f"**❌ {failed}/{total} tests failed** (tested on {test_size})")
+        lines.append(f"**❌ {failed}/{total} tests failed** ({test_size} × {data_types_str})")
     lines.append("")
     
-    # Compression performance table
-    lines.append("### Compression Performance")
-    lines.append("")
-    lines.append("| Config | gzip | pigz | rigz | Speedup |")
-    lines.append("|--------|------|------|------|---------|")
-    
-    # Group compression stats by config
-    comp_by_config = defaultdict(dict)
-    for stat in results.get("compression_stats", []):
-        key = (stat["level"], stat["threads"])
-        comp_by_config[key][stat["tool"]] = stat
-    
+    # Track overall best stats across all data types
     best_gzip_speedup = 0
     best_pigz_speedup = 0
     best_throughput = 0
+    
+    # Compression performance - one summary table (text data is most representative)
+    # Use first data type for the summary table, or all if only one
+    lines.append("### Compression Performance")
+    lines.append("")
+    
+    if len(data_types) > 1:
+        # Show just the text results in the main table (most representative)
+        primary_type = "text" if "text" in data_types else data_types[0]
+        lines.append(f"*Results on {primary_type} data ({test_size})*")
+        lines.append("")
+    
+    lines.append("| Config | gzip | pigz | rigz | Speedup |")
+    lines.append("|--------|------|------|------|---------|")
+    
+    # Group all compression stats by config
+    all_comp_by_config = defaultdict(lambda: defaultdict(dict))
+    for stat in results.get("compression_stats", []):
+        key = (stat["level"], stat["threads"])
+        dtype = stat.get("data_type", "unknown")
+        all_comp_by_config[dtype][key][stat["tool"]] = stat
+    
+    # Show primary type in main table
+    primary_type = "text" if "text" in data_types else (data_types[0] if data_types else "unknown")
+    comp_by_config = all_comp_by_config.get(primary_type, {})
     
     for (level, threads), tools in sorted(comp_by_config.items()):
         config = f"L{level}, {threads}t"
