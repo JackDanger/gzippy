@@ -520,7 +520,7 @@ def generate_html_chart(results):
         <section>
             <h2>Performance</h2>
             <p class="perf-intro">
-                Tested on {test_size_str}. Left is faster. Hover for times.
+                Tested on {test_size_str}. Right is faster. Hover for times.
             </p>
             <div class="legend">
                 <div class="legend-item"><div class="legend-dot rigz"></div> rigz</div>
