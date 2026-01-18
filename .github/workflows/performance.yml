@@ -130,6 +130,50 @@ jobs:
             --output ratio-results.json \
             $DEBUG_FLAG
 
+  # Test random (incompressible) data to catch edge cases
+  # This is critical - random data with L1 multi-thread previously had a bug
+  random-data:
+    name: Random Data L${{ matrix.level }} T${{ matrix.threads }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        level: [1, 9]
+        threads: [1, 4]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build rigz
+        run: cargo build --release
+
+      - name: Test random data compression/decompression
+        run: |
+          echo "Testing random data: L${{ matrix.level }} T${{ matrix.threads }}"
+          
+          # Generate 10MB random data
+          dd if=/dev/urandom of=/tmp/random.bin bs=1M count=10 2>/dev/null
+          
+          # Compress with rigz
+          ./target/release/rigz -${{ matrix.level }} -p${{ matrix.threads }} -c /tmp/random.bin > /tmp/random.bin.gz
+          
+          # Decompress with rigz
+          ./target/release/rigz -d /tmp/random.bin.gz > /tmp/random.out
+          
+          # Verify
+          diff /tmp/random.bin /tmp/random.out
+          echo "✓ Random data L${{ matrix.level }} T${{ matrix.threads }} works"
+          
+          # Also verify gzip can decompress
+          gzip -d < /tmp/random.bin.gz > /tmp/random.gzip.out
+          diff /tmp/random.bin /tmp/random.gzip.out
+          echo "✓ gzip can decompress rigz output"
+
   summary:
     name: Performance Summary
     runs-on: ubuntu-latest
