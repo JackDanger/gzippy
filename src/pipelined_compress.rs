@@ -48,12 +48,19 @@ unsafe impl Sync for CrcSlot {}
 
 /// Block size for pipelined compression.
 ///
-/// Pigz uses fixed 128KB blocks. We match this for maximum compression ratio.
-/// The optimization for larger blocks was tested but caused >0.5% size increase.
+/// For GHA's 4-vCPU environment with 100MB+ files, the coordination overhead
+/// of 780+ blocks dominates. Use slightly larger blocks (192KB) for very large
+/// files to reduce block count while staying within compression ratio limits.
 #[inline]
-fn pipelined_block_size(_input_len: usize, _num_threads: usize, _level: u32) -> usize {
-    // Match pigz: always use 128KB blocks for best compression ratio
-    DEFAULT_BLOCK_SIZE
+fn pipelined_block_size(input_len: usize, _num_threads: usize, _level: u32) -> usize {
+    if input_len >= 50 * 1024 * 1024 {
+        // For files >= 50MB, use 192KB blocks (520 blocks for 100MB)
+        // This is a compromise between pigz's 128KB and our tested 256KB
+        192 * 1024
+    } else {
+        // Match pigz for smaller files
+        DEFAULT_BLOCK_SIZE
+    }
 }
 
 /// Pipelined gzip compression with dictionary sharing

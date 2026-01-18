@@ -239,41 +239,15 @@ where
         // This keeps main thread busy instead of just spinning
         let mut next_write = 0;
 
-        // Use a write buffer to batch small writes (reduces syscall overhead on GHA)
-        let mut write_buf = Vec::with_capacity(block_size);
-
         loop {
-            // Check if we can write any blocks - batch consecutive ready blocks
-            let mut wrote_any = false;
+            // Check if we can write any blocks
             while next_write < num_blocks && slots[next_write].is_ready() {
-                let data = slots[next_write].data();
-                // Batch small blocks together
-                if write_buf.len() + data.len() <= block_size * 4 {
-                    write_buf.extend_from_slice(data);
-                } else {
-                    // Flush buffer and write directly
-                    if !write_buf.is_empty() {
-                        writer.write_all(&write_buf)?;
-                        write_buf.clear();
-                    }
-                    writer.write_all(data)?;
-                }
+                writer.write_all(slots[next_write].data())?;
                 next_write += 1;
-                wrote_any = true;
             }
 
-            // Flush any remaining buffered data if we've finished all blocks
             if next_write >= num_blocks {
-                if !write_buf.is_empty() {
-                    writer.write_all(&write_buf)?;
-                }
-                break;
-            }
-
-            // If we just wrote, flush the buffer before doing more compression
-            if wrote_any && !write_buf.is_empty() && write_buf.len() > block_size {
-                writer.write_all(&write_buf)?;
-                write_buf.clear();
+                break; // All blocks written
             }
 
             // Try to claim and compress a block
