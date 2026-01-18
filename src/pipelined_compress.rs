@@ -137,8 +137,9 @@ impl PipelinedGzEncoder {
     /// - Pre-allocated buffers (no allocation in hot path)
     fn compress_parallel_pipeline<W: Write>(&self, data: &[u8], mut writer: W) -> io::Result<()> {
         let level = adjust_compression_level(self.compression_level);
-        let block_size = pipelined_block_size(data.len(), self.num_threads, level);
-        let num_blocks = data.len().div_ceil(block_size);
+        let data_len = data.len();
+        let block_size = pipelined_block_size(data_len, self.num_threads, level);
+        let num_blocks = data_len.div_ceil(block_size);
 
         // Write gzip header
         let header = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
@@ -178,7 +179,7 @@ impl PipelinedGzEncoder {
         let combined_crc = combined_hasher.finalize();
 
         // Write gzip trailer
-        let isize = (data.len() as u32).to_le_bytes();
+        let isize = (data_len as u32).to_le_bytes();
         writer.write_all(&combined_crc.to_le_bytes())?;
         writer.write_all(&isize)?;
 
@@ -364,8 +365,6 @@ fn compress_block_with_dict(
 
         loop {
             let before_in = compress.total_in();
-            let before_len = output.len();
-
             let status = compress
                 .compress_vec(input, output, flush)
                 .expect("compression failed");
