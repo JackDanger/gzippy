@@ -38,10 +38,9 @@ const DICT_SIZE: usize = 32 * 1024;
 /// Maximum input size for pooled compression path.
 ///
 /// The pooled path uses persistent worker threads but requires copying input
-/// into a Vec (mmap can't be sent to thread pool). For small files, the copy
-/// overhead is less than thread spawn overhead. For larger files, use
-/// thread::scope which can borrow the mmap directly.
-const POOL_MAX_INPUT: usize = 1 * 1024 * 1024;
+/// into a Vec (mmap can't be sent to thread pool). Currently disabled (0)
+/// because the thread::scope path with main-thread-helps is more efficient.
+const POOL_MAX_INPUT: usize = 0;
 
 struct CrcSlot(UnsafeCell<MaybeUninit<crc32fast::Hasher>>);
 // Safety: each slot is written by exactly one worker before all threads join.
