@@ -1,20 +1,20 @@
-Source: rigz
+Source: gzippy
 Section: utils
 Priority: optional
 Maintainer: Jack Danger <github@jackdanger.com>
 Build-Depends: debhelper-compat (= 13), cargo, rustc (>= 1.70)
 Standards-Version: 4.6.2
-Homepage: https://github.com/jackdanger/rigz
-Vcs-Git: https://github.com/jackdanger/rigz.git
+Homepage: https://github.com/jackdanger/gzippy
+Vcs-Git: https://github.com/jackdanger/gzippy.git
 Rules-Requires-Root: no
 
-Package: rigz
+Package: gzippy
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
-Description: Fast parallel gzip compression
- Rigz is a high-performance, parallel gzip implementation written in Rust.
- It provides 40-50% faster compression than gzip and pigz by leveraging
- multiple CPU cores, SIMD instructions, and optimized memory management.
+Description: The fastest parallel gzip
+ Gzippy is a high-performance parallel gzip implementation written in Rust.
+ It beats gzip and pigz by leveraging multiple CPU cores, SIMD instructions,
+ and optimized compression libraries (libdeflate, zlib-ng).
  .
  Features:
   - Drop-in gzip replacement with compatible CLI
@@ -22,21 +22,21 @@ Description: Fast parallel gzip compression
   - Memory-mapped I/O for zero-copy file access
   - Compatible output that works with all standard gzip tools
  .
- This package provides the rigz and unrigz commands.
+ This package provides the gzippy and ungzippy commands.
 
-Package: rigz-replace-gzip
+Package: gzippy-replace-gzip
 Architecture: all
-Depends: rigz (= ${binary:Version}), ${misc:Depends}
+Depends: gzippy (= ${binary:Version}), ${misc:Depends}
 Conflicts: gzip
 Provides: gzip
 Replaces: gzip
-Description: Replace system gzip with rigz (fast parallel gzip)
+Description: Replace system gzip with gzippy (fast parallel gzip)
  This package replaces the system gzip, gunzip, gzcat, and zcat commands
- with rigz, providing significantly faster compression and decompression.
+ with gzippy, providing significantly faster compression and decompression.
  .
- When installed, all system gzip operations will use rigz transparently.
- This is fully compatible with standard gzip - files compressed with rigz
+ When installed, all system gzip operations will use gzippy transparently.
+ This is fully compatible with standard gzip - files compressed with gzippy
  can be decompressed by any standard gzip implementation.
  .
  WARNING: This package conflicts with and replaces the gzip package.
- Install only if you want rigz to handle all gzip operations system-wide.
+ Install only if you want gzippy to handle all gzip operations system-wide.

@@ -1,7 +1,7 @@
-//! rigz - Rust parallel gzip replacement
+//! gzippy - The fastest parallel gzip
 //!
 //! A drop-in replacement for gzip that uses multiple processors for compression.
-//! Based on [pigz](https://zlib.net/pigz/) by Mark Adler.
+//! Inspired by [pigz](https://zlib.net/pigz/) by Mark Adler.
 
 use std::env;
 use std::path::Path;
@@ -20,10 +20,10 @@ mod scheduler;
 mod simple_optimizations;
 mod utils;
 
-use cli::RigzArgs;
-use error::RigzError;
+use cli::GzippyArgs;
+use error::GzippyError;
 
-const VERSION: &str = concat!("rigz ", env!("CARGO_PKG_VERSION"));
+const VERSION: &str = concat!("gzippy ", env!("CARGO_PKG_VERSION"));
 
 fn main() {
     let result = run();
@@ -31,14 +31,14 @@ fn main() {
     match result {
         Ok(exit_code) => process::exit(exit_code),
         Err(e) => {
-            eprintln!("rigz: {}", e);
+            eprintln!("gzippy: {}", e);
             process::exit(1);
         }
     }
 }
 
-fn run() -> Result<i32, RigzError> {
-    let args = RigzArgs::parse()?;
+fn run() -> Result<i32, GzippyError> {
+    let args = GzippyArgs::parse()?;
 
     if args.version {
         println!("{}", VERSION);
@@ -55,15 +55,15 @@ fn run() -> Result<i32, RigzError> {
         return Ok(0);
     }
 
-    // Support gunzip/unrigz symlinks
-    let program_path = env::args().next().unwrap_or_else(|| "rigz".to_string());
+    // Support gunzip/ungzippy symlinks
+    let program_path = env::args().next().unwrap_or_else(|| "gzippy".to_string());
     let program_name = Path::new(&program_path)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("rigz");
+        .unwrap_or("gzippy");
 
     let decompress =
-        args.decompress || program_name.contains("unrigz") || program_name.contains("gunzip");
+        args.decompress || program_name.contains("ungzippy") || program_name.contains("gunzip");
 
     let mut exit_code = 0;
 
@@ -90,7 +90,7 @@ fn run() -> Result<i32, RigzError> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("rigz: {}: {}", file, e);
+                    eprintln!("gzippy: {}: {}", file, e);
                     exit_code = 1;
                 }
             }
@@ -101,7 +101,7 @@ fn run() -> Result<i32, RigzError> {
 }
 
 fn print_help() {
-    println!("Usage: rigz [OPTION]... [FILE]...");
+    println!("Usage: gzippy [OPTION]... [FILE]...");
     println!();
     println!("Compress or decompress FILEs (by default, compress in place).");
     println!("Uses multiple processors for parallel compression.");
@@ -121,16 +121,16 @@ fn print_help() {
     println!("  -L, --license    Show license");
     println!();
     println!("Examples:");
-    println!("  rigz file.txt          Compress file.txt → file.txt.gz");
-    println!("  rigz -d file.txt.gz    Decompress file.txt.gz → file.txt");
-    println!("  rigz -p4 -9 file.txt   Compress with 4 threads, best compression");
-    println!("  cat file | rigz > out  Compress stdin to stdout");
+    println!("  gzippy file.txt          Compress file.txt → file.txt.gz");
+    println!("  gzippy -d file.txt.gz    Decompress file.txt.gz → file.txt");
+    println!("  gzippy -p4 -9 file.txt   Compress with 4 threads, best compression");
+    println!("  cat file | gzippy > out  Compress stdin to stdout");
 }
 
 fn print_license() {
-    println!("rigz - Rust parallel gzip replacement");
+    println!("gzippy - The fastest parallel gzip");
     println!();
-    println!("Based on pigz by Mark Adler, Copyright (C) 2007-2023");
+    println!("Inspired by pigz by Mark Adler, Copyright (C) 2007-2023");
     println!();
     println!("zlib License - see LICENSE file for details.");
 }

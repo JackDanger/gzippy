@@ -24,8 +24,8 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 /// BGZF-style subfield ID for block size markers
-/// Using "RZ" to identify rigz-compressed blocks
-pub const RIGZ_SUBFIELD_ID: [u8; 2] = [b'R', b'Z'];
+/// Using "GZ" to identify gzippy-compressed blocks with embedded block sizes
+pub const GZ_SUBFIELD_ID: [u8; 2] = [b'G', b'Z'];
 
 /// Adjust compression level for backend compatibility
 ///
@@ -222,10 +222,10 @@ impl ParallelGzEncoder {
 /// The header includes:
 /// - Standard gzip magic (0x1f 0x8b)
 /// - FEXTRA flag set (0x04)
-/// - "RZ" subfield with compressed block size (allows parallel decompression)
+/// - "GZ" subfield with compressed block size (allows parallel decompression)
 ///
 /// This is compatible with all gzip decompressors (they ignore unknown subfields)
-/// but enables rigz to find block boundaries without inflating.
+/// but enables gzippy to find block boundaries without inflating.
 ///
 /// Uses libdeflate for L1-L6 (faster, no dictionary needed).
 fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compression_level: u32) {
@@ -250,7 +250,7 @@ fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compressio
     output.extend_from_slice(&[6, 0]);
 
     // Subfield: "RZ" + 2 bytes len + 2 bytes block size (placeholder)
-    output.extend_from_slice(&RIGZ_SUBFIELD_ID);
+    output.extend_from_slice(&GZ_SUBFIELD_ID);
     output.extend_from_slice(&[2, 0]); // Subfield data length
     let block_size_offset = output.len();
     output.extend_from_slice(&[0, 0]); // Placeholder for block size

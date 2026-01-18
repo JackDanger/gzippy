@@ -42,7 +42,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential zlib1g-dev gzip
 
-      - name: Build rigz
+      - name: Build gzippy
         run: cargo build --release
 
       - name: Build pigz
@@ -60,7 +60,7 @@ jobs:
           fi
           
           echo "Running with $THREADS threads"
-          # Strict thresholds: rigz must beat pigz everywhere
+          # Strict thresholds: gzippy must beat pigz everywhere
           # L1-8: Speed must beat pigz (0% overhead), size within 5%
           # L9: Size must match pigz (0.5%), speed within 5%
           python3 scripts/benchmark_ci.py \
@@ -98,7 +98,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential zlib1g-dev gzip
 
-      - name: Build rigz
+      - name: Build gzippy
         run: cargo build --release
 
       - name: Build pigz
@@ -141,7 +141,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build rigz
+      - name: Build gzippy
         run: cargo build --release
 
       - name: Test random data compression/decompression
@@ -151,11 +151,11 @@ jobs:
           # Generate 10MB random data
           dd if=/dev/urandom of=/tmp/random.bin bs=1M count=10 2>/dev/null
           
-          # Compress with rigz (using stdin to avoid file argument issues)
-          cat /tmp/random.bin | ./target/release/rigz -${{ matrix.level }} -p${{ matrix.threads }} > /tmp/random.bin.gz
+          # Compress with gzippy (using stdin to avoid file argument issues)
+          cat /tmp/random.bin | ./target/release/gzippy -${{ matrix.level }} -p${{ matrix.threads }} > /tmp/random.bin.gz
           
-          # Decompress with rigz
-          cat /tmp/random.bin.gz | ./target/release/rigz -d > /tmp/random.out
+          # Decompress with gzippy
+          cat /tmp/random.bin.gz | ./target/release/gzippy -d > /tmp/random.out
           
           # Verify
           diff /tmp/random.bin /tmp/random.out
@@ -164,7 +164,7 @@ jobs:
           # Also verify gzip can decompress
           gzip -d < /tmp/random.bin.gz > /tmp/random.gzip.out
           diff /tmp/random.bin /tmp/random.gzip.out
-          echo "✓ gzip can decompress rigz output"
+          echo "✓ gzip can decompress gzippy output"
 
   summary:
     name: Performance Summary

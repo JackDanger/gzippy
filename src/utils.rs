@@ -3,10 +3,10 @@
 use std::fs;
 use std::path::Path;
 
-use crate::error::{RigzError, RigzResult};
+use crate::error::{GzippyError, GzippyResult};
 
-pub fn get_file_metadata(path: &Path) -> RigzResult<fs::Metadata> {
-    fs::metadata(path).map_err(RigzError::Io)
+pub fn get_file_metadata(path: &Path) -> GzippyResult<fs::Metadata> {
+    fs::metadata(path).map_err(GzippyError::Io)
 }
 
 pub fn detect_format_from_file(path: &Path) -> Option<crate::format::CompressionFormat> {

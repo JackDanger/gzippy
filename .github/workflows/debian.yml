@@ -48,19 +48,19 @@ jobs:
 
       - name: Test package installation
         run: |
-          sudo dpkg -i ../rigz_*.deb
-          rigz --version
+          sudo dpkg -i ../gzippy_*.deb
+          gzippy --version
           
           # Test basic functionality
-          echo "Hello, World!" | rigz -c | rigz -d
+          echo "Hello, World!" | gzippy -c | gzippy -d
           
-          echo "✓ rigz package works correctly"
+          echo "✓ gzippy package works correctly"
 
       - name: Test gzip replacement package
         run: |
-          sudo dpkg -i ../rigz-replace-gzip_*.deb
+          sudo dpkg -i ../gzippy-replace-gzip_*.deb
           
-          # Verify gzip is now rigz
+          # Verify gzip is now gzippy
           which gzip
           ls -la /usr/bin/gzip
           
@@ -70,7 +70,7 @@ jobs:
           gunzip -c /tmp/test.txt.gz > /tmp/test2.txt
           diff /tmp/test.txt /tmp/test2.txt
           
-          echo "✓ rigz-replace-gzip package works correctly"
+          echo "✓ gzippy-replace-gzip package works correctly"
 
       - name: Upload packages
         uses: actions/upload-artifact@v4

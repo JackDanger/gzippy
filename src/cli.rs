@@ -1,10 +1,9 @@
-use std::env;
-// use std::path::PathBuf; // May be needed later
-use crate::error::{RigzError, RigzResult};
+use crate::error::{GzippyError, GzippyResult};
 use crate::format::CompressionFormat;
+use std::env;
 
 #[derive(Debug, Clone)]
-pub struct RigzArgs {
+pub struct GzippyArgs {
     pub files: Vec<String>,
     pub compression_level: u8,
     pub block_size: usize,
@@ -39,9 +38,9 @@ pub struct RigzArgs {
     pub fast: bool,
 }
 
-impl Default for RigzArgs {
+impl Default for GzippyArgs {
     fn default() -> Self {
-        RigzArgs {
+        GzippyArgs {
             files: Vec::new(),
             compression_level: 6,
             block_size: 128 * 1024, // 128KB
@@ -78,9 +77,9 @@ impl Default for RigzArgs {
     }
 }
 
-impl RigzArgs {
-    pub fn parse() -> RigzResult<Self> {
-        let mut args = RigzArgs::default();
+impl GzippyArgs {
+    pub fn parse() -> GzippyResult<Self> {
+        let mut args = GzippyArgs::default();
         let mut argv: Vec<String> = env::args().collect();
         argv.remove(0); // Remove program name
 
@@ -183,7 +182,10 @@ impl RigzArgs {
                             args.block_size = parse_block_size(value)?;
                         } else if let Some(value) = arg.strip_prefix("--processes=") {
                             args.processes = value.parse().map_err(|_| {
-                                RigzError::invalid_argument(format!("Invalid processes: {}", value))
+                                GzippyError::invalid_argument(format!(
+                                    "Invalid processes: {}",
+                                    value
+                                ))
                             })?;
                         } else if let Some(value) = arg.strip_prefix("--suffix=") {
                             args.suffix = value.to_string();
@@ -199,7 +201,7 @@ impl RigzArgs {
                         {
                             // These require the next argument
                             if i + 1 >= argv.len() {
-                                return Err(RigzError::invalid_argument(format!(
+                                return Err(GzippyError::invalid_argument(format!(
                                     "{} requires an argument",
                                     arg
                                 )));
@@ -211,7 +213,7 @@ impl RigzArgs {
                                 "--blocksize" => args.block_size = parse_block_size(value)?,
                                 "--processes" => {
                                     args.processes = value.parse().map_err(|_| {
-                                        RigzError::invalid_argument(format!(
+                                        GzippyError::invalid_argument(format!(
                                             "Invalid processes: {}",
                                             value
                                         ))
@@ -223,7 +225,7 @@ impl RigzArgs {
                                 _ => unreachable!(),
                             }
                         } else {
-                            return Err(RigzError::invalid_argument(format!(
+                            return Err(GzippyError::invalid_argument(format!(
                                 "Unknown option: {}",
                                 arg
                             )));
@@ -293,7 +295,7 @@ impl RigzArgs {
                             } else {
                                 // Value is the next argument
                                 if i + 1 >= argv.len() {
-                                    return Err(RigzError::invalid_argument(format!(
+                                    return Err(GzippyError::invalid_argument(format!(
                                         "-{} requires an argument",
                                         opt_char
                                     )));
@@ -306,7 +308,7 @@ impl RigzArgs {
                                 'b' => args.block_size = parse_block_size(&value)?,
                                 'p' => {
                                     args.processes = value.parse().map_err(|_| {
-                                        RigzError::invalid_argument(format!(
+                                        GzippyError::invalid_argument(format!(
                                             "Invalid processes: {}",
                                             value
                                         ))
@@ -319,7 +321,7 @@ impl RigzArgs {
                             }
                         }
                         _ => {
-                            return Err(RigzError::invalid_argument(format!(
+                            return Err(GzippyError::invalid_argument(format!(
                                 "Unknown option: -{}",
                                 chars[j]
                             )))
@@ -338,11 +340,11 @@ impl RigzArgs {
         }
 
         if args.compression_level > 9 {
-            return Err(RigzError::InvalidLevel(args.compression_level));
+            return Err(GzippyError::InvalidLevel(args.compression_level));
         }
 
         if args.block_size < 1024 {
-            return Err(RigzError::InvalidBlockSize(
+            return Err(GzippyError::InvalidBlockSize(
                 "Block size must be at least 1K".to_string(),
             ));
         }
@@ -375,11 +377,13 @@ fn parse_env_args(env_str: &str) -> Vec<String> {
     args
 }
 
-fn parse_block_size(value: &str) -> RigzResult<usize> {
+fn parse_block_size(value: &str) -> GzippyResult<usize> {
     let value = value.to_lowercase();
 
     if value.is_empty() {
-        return Err(RigzError::InvalidBlockSize("Empty block size".to_string()));
+        return Err(GzippyError::InvalidBlockSize(
+            "Empty block size".to_string(),
+        ));
     }
 
     let (num_str, multiplier) = if value.ends_with('k') {
@@ -394,7 +398,7 @@ fn parse_block_size(value: &str) -> RigzResult<usize> {
 
     let num: usize = num_str
         .parse()
-        .map_err(|_| RigzError::InvalidBlockSize(format!("Invalid block size: {}", value)))?;
+        .map_err(|_| GzippyError::InvalidBlockSize(format!("Invalid block size: {}", value)))?;
 
     Ok(num * multiplier)
 }

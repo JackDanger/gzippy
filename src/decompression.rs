@@ -20,8 +20,8 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
-use crate::cli::RigzArgs;
-use crate::error::{RigzError, RigzResult};
+use crate::cli::GzippyArgs;
+use crate::error::{GzippyError, GzippyResult};
 use crate::format::CompressionFormat;
 use crate::utils::strip_compression_extension;
 
@@ -52,18 +52,18 @@ thread_local! {
     static DECOMPRESS_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(1024 * 1024));
 }
 
-pub fn decompress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
+pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     if filename == "-" {
         return decompress_stdin(args);
     }
 
     let input_path = Path::new(filename);
     if !input_path.exists() {
-        return Err(RigzError::FileNotFound(filename.to_string()));
+        return Err(GzippyError::FileNotFound(filename.to_string()));
     }
 
     if input_path.is_dir() {
-        return Err(RigzError::invalid_argument(format!(
+        return Err(GzippyError::invalid_argument(format!(
             "{} is a directory",
             filename
         )));
@@ -77,7 +77,7 @@ pub fn decompress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
 
     if let Some(ref output_path) = output_path {
         if output_path.exists() && !args.force {
-            return Err(RigzError::invalid_argument(format!(
+            return Err(GzippyError::invalid_argument(format!(
                 "Output file {} already exists",
                 output_path.display()
             )));
@@ -123,7 +123,7 @@ pub fn decompress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
     }
 }
 
-pub fn decompress_stdin(_args: &RigzArgs) -> RigzResult<i32> {
+pub fn decompress_stdin(_args: &GzippyArgs) -> GzippyResult<i32> {
     use flate2::read::MultiGzDecoder;
 
     let stdin = stdin();
@@ -143,7 +143,7 @@ fn decompress_mmap_libdeflate<W: Write>(
     mmap: &Mmap,
     writer: &mut W,
     format: CompressionFormat,
-) -> RigzResult<u64> {
+) -> GzippyResult<u64> {
     match format {
         CompressionFormat::Gzip | CompressionFormat::Zip => {
             decompress_gzip_libdeflate(&mmap[..], writer)
@@ -177,14 +177,14 @@ fn is_multi_member_quick(data: &[u8]) -> bool {
 /// Decompress gzip - chooses optimal strategy based on content
 ///
 /// - Single member: libdeflate (fastest, 30-50% faster than zlib)
-/// - BGZF-style (rigz output): parallel libdeflate using embedded block sizes
+/// - BGZF-style (gzippy output): parallel libdeflate using embedded block sizes
 /// - Other multi-member: sequential zlib-ng
-fn decompress_gzip_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
+fn decompress_gzip_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
         return Ok(0);
     }
 
-    // Check for BGZF-style markers FIRST (rigz output with embedded block sizes)
+    // Check for BGZF-style markers FIRST (gzippy output with embedded block sizes)
     // This check is fast (only looks at first header) and must come before
     // is_multi_member_quick which only scans 256KB - not enough for random data
     // where the first block can be >256KB
@@ -202,7 +202,7 @@ fn decompress_gzip_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> RigzResu
     decompress_multi_member_zlibng(data, writer)
 }
 
-/// Check if data has BGZF-style "RZ" markers in the first gzip header
+/// Check if data has BGZF-style "GZ" markers in the first gzip header
 #[inline]
 fn has_bgzf_markers(data: &[u8]) -> bool {
     // Minimum header with FEXTRA: 10 base + 2 XLEN + 4 subfield header
@@ -229,7 +229,7 @@ fn has_bgzf_markers(data: &[u8]) -> bool {
         let subfield_len =
             u16::from_le_bytes([extra_field[pos + 2], extra_field[pos + 3]]) as usize;
 
-        if subfield_id == crate::parallel_compress::RIGZ_SUBFIELD_ID.as_slice() {
+        if subfield_id == crate::parallel_compress::GZ_SUBFIELD_ID.as_slice() {
             return true;
         }
 
@@ -279,7 +279,7 @@ fn parse_bgzf_blocks(data: &[u8]) -> (Vec<(usize, usize)>, bool) {
             let subfield_len =
                 u16::from_le_bytes([extra_field[pos + 2], extra_field[pos + 3]]) as usize;
 
-            if subfield_id == crate::parallel_compress::RIGZ_SUBFIELD_ID.as_slice()
+            if subfield_id == crate::parallel_compress::GZ_SUBFIELD_ID.as_slice()
                 && subfield_len >= 2
                 && pos + 4 + 2 <= extra_field.len()
             {
@@ -307,11 +307,11 @@ fn parse_bgzf_blocks(data: &[u8]) -> (Vec<(usize, usize)>, bool) {
     (blocks, consumed_all)
 }
 
-/// Parallel decompression for BGZF-style files (rigz output)
+/// Parallel decompression for BGZF-style files (gzippy output)
 /// Uses embedded block size markers to find boundaries without inflating
 ///
 /// Uses our custom scheduler for zero-overhead parallelism with streaming output.
-fn decompress_bgzf_parallel<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
+fn decompress_bgzf_parallel<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     use libdeflater::DecompressionError;
     use std::cell::UnsafeCell;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -451,7 +451,7 @@ fn read_gzip_isize(data: &[u8]) -> Option<u32> {
 
 /// Decompress single-member gzip using libdeflate (fastest path)
 /// Uses thread-local decompressor to avoid initialization overhead
-fn decompress_single_member_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
+fn decompress_single_member_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     use libdeflater::DecompressionError;
 
     // Use ISIZE from trailer for accurate buffer sizing (avoids resize loop)
@@ -486,7 +486,7 @@ fn decompress_single_member_libdeflate<W: Write>(data: &[u8], writer: &mut W) ->
                     continue;
                 }
                 Err(_) => {
-                    return Err(RigzError::invalid_argument(
+                    return Err(GzippyError::invalid_argument(
                         "gzip decompression failed".to_string(),
                     ));
                 }
@@ -500,10 +500,10 @@ fn decompress_single_member_libdeflate<W: Write>(data: &[u8], writer: &mut W) ->
 /// Note: We previously had a parallel decompression path, but it required
 /// finding member boundaries first (which means decompressing once to find
 /// boundaries, then again in parallel). This 2x overhead made it slower
-/// for files with many small members (like rigz's 128KB chunks).
+/// for files with many small members (like gzippy's 128KB chunks).
 ///
 /// The sequential MultiGzDecoder is fast enough and doesn't have this overhead.
-fn decompress_multi_member_zlibng<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
+fn decompress_multi_member_zlibng<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     decompress_multi_member_sequential(data, writer)
 }
 
@@ -511,7 +511,7 @@ fn decompress_multi_member_zlibng<W: Write>(data: &[u8], writer: &mut W) -> Rigz
 ///
 /// Uses our DecompressorEx wrapper that returns consumed bytes,
 /// allowing us to iterate through members without re-decompressing.
-fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
+fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     use crate::libdeflate_ext::{DecompressError, DecompressorEx};
 
     let mut decompressor = DecompressorEx::new();
@@ -569,83 +569,8 @@ fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> 
     Ok(total_bytes)
 }
 
-/// Fallback to flate2 for edge cases where libdeflate fails
-#[allow(dead_code)]
-fn decompress_multi_member_flate2<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
-    use flate2::bufread::MultiGzDecoder;
-    use std::io::Read;
-
-    let mut total_bytes = 0u64;
-    let mut decoder = MultiGzDecoder::new(data);
-
-    // Use cache-aligned buffer for better memory access patterns
-    let mut buf = alloc_aligned_buffer(STREAM_BUFFER_SIZE);
-
-    loop {
-        match decoder.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                writer.write_all(&buf[..n])?;
-                total_bytes += n as u64;
-            }
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(RigzError::Io(e)),
-        }
-    }
-
-    writer.flush()?;
-    Ok(total_bytes)
-}
-
-/// Find gzip member boundaries by inflating each member
-/// Returns vector of (start_offset, length) for each member
-///
-/// Note: Currently unused - the parallel decompression path was disabled
-/// because the boundary-finding overhead (requires full decompression)
-/// made it slower than sequential for files with many small members.
-#[allow(dead_code)]
-fn find_member_boundaries(data: &[u8]) -> Vec<(usize, usize)> {
-    use flate2::bufread::GzDecoder;
-    use std::io::Read;
-
-    let mut boundaries = Vec::new();
-    let mut offset = 0;
-    let mut buf = [0u8; 8192];
-
-    while offset < data.len() && data.len() - offset >= 10 {
-        // Check for gzip magic
-        if data[offset] != 0x1f || data[offset + 1] != 0x8b {
-            break;
-        }
-
-        let start = offset;
-        let remaining = &data[offset..];
-        let mut decoder = GzDecoder::new(remaining);
-
-        // Consume the entire member
-        loop {
-            match decoder.read(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => continue,
-                Err(_) => break,
-            }
-        }
-
-        // Get how many bytes were consumed
-        let consumed = remaining.len() - decoder.into_inner().len();
-        if consumed == 0 {
-            break;
-        }
-
-        boundaries.push((start, consumed));
-        offset += consumed;
-    }
-
-    boundaries
-}
-
 /// Decompress zlib using libdeflate
-fn decompress_zlib_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
+fn decompress_zlib_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     use libdeflater::{DecompressionError, Decompressor};
 
     let mut decompressor = Decompressor::new();
@@ -664,7 +589,7 @@ fn decompress_zlib_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> RigzResu
                 continue;
             }
             Err(_) => {
-                return Err(RigzError::invalid_argument(
+                return Err(GzippyError::invalid_argument(
                     "zlib decompression failed".to_string(),
                 ));
             }
@@ -672,7 +597,7 @@ fn decompress_zlib_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> RigzResu
     }
 }
 
-fn detect_compression_format_from_path(path: &Path) -> RigzResult<CompressionFormat> {
+fn detect_compression_format_from_path(path: &Path) -> GzippyResult<CompressionFormat> {
     if let Some(format) = crate::utils::detect_format_from_file(path) {
         Ok(format)
     } else {
@@ -680,7 +605,7 @@ fn detect_compression_format_from_path(path: &Path) -> RigzResult<CompressionFor
     }
 }
 
-fn get_output_filename(input_path: &Path, args: &RigzArgs) -> std::path::PathBuf {
+fn get_output_filename(input_path: &Path, args: &GzippyArgs) -> std::path::PathBuf {
     if args.stdout {
         return input_path.to_path_buf();
     }
