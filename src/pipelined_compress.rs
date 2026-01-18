@@ -323,19 +323,12 @@ fn compress_block_with_dict(
     PIPELINED_COMPRESS.with(|comp_cell| {
         let mut comp_opt = comp_cell.borrow_mut();
 
+        output.clear();
+
         // Ensure buffer is large enough (block_size + 10% + 1KB for headers)
         let initial_capacity = block_size + (block_size / 10) + 1024;
         if output.capacity() < initial_capacity {
             output.reserve(initial_capacity - output.capacity());
-            output.resize(initial_capacity, 0);
-        } else if output.is_empty() {
-            // Initialize once to avoid repeated zero-fill on reuse.
-            output.resize(initial_capacity, 0);
-        } else {
-            // Safe because the buffer has been initialized in previous use.
-            unsafe {
-                output.set_len(initial_capacity);
-            }
         }
 
         // Get or create Compress at the right level
@@ -367,36 +360,30 @@ fn compress_block_with_dict(
             FlushCompress::Sync
         };
 
-        let mut total_out = 0;
         let mut input = block;
 
         loop {
             let before_in = compress.total_in();
-            let before_out = compress.total_out();
+            let before_len = output.len();
 
             let status = compress
-                .compress(input, &mut output[total_out..], flush)
+                .compress_vec(input, output, flush)
                 .expect("compression failed");
 
             let consumed = (compress.total_in() - before_in) as usize;
-            let produced = (compress.total_out() - before_out) as usize;
-
-            total_out += produced;
             input = &input[consumed..];
 
             match status {
                 Status::Ok if input.is_empty() && flush != FlushCompress::Finish => break,
                 Status::BufError => {
                     // Need more output space (rare case for incompressible data)
-                    let new_len = output.len() * 2;
-                    output.resize(new_len, 0);
+                    let extra = output.capacity().max(1024);
+                    output.reserve(extra);
                 }
                 Status::StreamEnd => break,
                 _ => {}
             }
         }
-
-        output.truncate(total_out);
     })
 }
 
