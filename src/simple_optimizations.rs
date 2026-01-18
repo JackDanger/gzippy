@@ -30,6 +30,11 @@ impl SimpleOptimizer {
 
     /// Optimized compression with improved threading and buffer management
     pub fn compress<R: Read, W: Write + Send>(&self, reader: R, writer: W) -> io::Result<u64> {
+        // L10-L12 always use parallel path (libdeflate) since zlib doesn't support these levels
+        if self.config.compression_level >= 10 {
+            return self.compress_parallel(reader, writer);
+        }
+
         match self.config.backend {
             CompressionBackend::Parallel => self.compress_parallel(reader, writer),
             CompressionBackend::SingleThreaded => self.compress_single_threaded(reader, writer),
