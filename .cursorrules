@@ -213,22 +213,29 @@ This represents the theoretical maximum without:
 ## GHA-Specific Optimizations (4 vCPU)
 
 ### What Works
-1. **N workers compress, main thread writes**: Spawn N worker threads that all
-   compress; main thread only writes in order. Maximizes parallelism.
-2. **Hybrid spin/condvar wait**: Brief 64-spin, then condvar with 10μs timeout.
+1. **Pigz threading model (dedicated writer thread)**: N compress workers + 1
+   dedicated writer thread. Workers never block on I/O. Maximum parallelism.
+2. **Brief spin then park**: 64 spins then thread::park_timeout(10μs).
    Balances latency and CPU efficiency.
-3. **Condvar-based signaling**: Workers signal completion via condvar, main
-   thread sleeps efficiently instead of burning CPU.
-4. **192KB blocks for files >= 50MB**: Reduces coordination overhead from 780
+3. **192KB blocks for files >= 50MB**: Reduces coordination overhead from 780
    to 520 blocks, while staying within compression ratio limits.
-5. **madvise MADV_SEQUENTIAL**: Hint for mmap prefetching.
-6. **Conservative slot capacity**: block_size + 10% + 1KB to handle worst case.
+4. **madvise MADV_SEQUENTIAL**: Hint for mmap prefetching.
+5. **Conservative slot capacity**: block_size + 10% + 1KB to handle worst case.
+6. **Use all requested threads**: Don't cap at physical_cores (VMs underreport).
 
 ### What Doesn't Work on GHA
 1. **Main thread helping compress**: Causes write delays and serialization.
 2. **256KB blocks for all files**: Exceeds 0.5% size threshold on random data.
 3. **Pure spin-wait**: Burns vCPU time, reduces compression throughput.
 4. **Long condvar timeouts**: Adds latency between block writes.
+5. **Capping threads at physical cores**: GHA 4-vCPU VMs report 2 physical cores,
+   halving parallelism. Use all requested threads, not min(requested, physical).
+
+### Critical Bug Fixed (2025-01)
+`num_cpus::get_physical()` returns 2 on GHA's 4-vCPU runners. The optimization to
+"avoid hyperthreading contention" caused rigz to use only 2 threads when 4 were
+requested. This made rigz 50% slower than expected on GHA. **Always use the
+user's requested thread count directly.**
 
 ### GHA vs Local Performance
 | Metric | Local (Apple M4) | GHA (Intel Xeon 4vCPU) |
