@@ -62,7 +62,13 @@ pub fn get_block_size_for_level(level: u32) -> usize {
         // Note: 128KB > BGZF u16 limit, so BGZF markers will be disabled
         1 | 2 => 128 * 1024,
         // L3-L6: Use 64KB blocks - fits BGZF, enables parallel decompression
-        _ => DEFAULT_BLOCK_SIZE,
+        3..=6 => DEFAULT_BLOCK_SIZE,
+        // L7-L9: Handled by pipelined compressor (shouldn't reach here)
+        7..=9 => 128 * 1024,
+        // L10-L12: Ultra compression needs larger blocks for better context
+        // libdeflate's exhaustive search benefits from more data to find matches
+        // Use 512KB blocks - still enables parallelism but gives good ratio
+        _ => 512 * 1024,
     }
 }
 
