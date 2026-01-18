@@ -100,7 +100,12 @@ Performance varies significantly by CPU architecture and compression level:
 - Dictionary sharing for maximum compression (matches pigz output size)
 - Sequential decompression (like pigz)
 - Single-thread: rigz 1.5x faster than pigz!
-- Multi-thread: pigz has better parallel I/O pipelining
+- Multi-thread: rigz 1.5x faster than pigz! (parallel pipelining works)
+
+**Key insight (pigz-style parallelism):**
+Block N doesn't wait for block N-1 to FINISH compressing. It only needs
+block N-1's INPUT DATA as dictionary. Since all input is pre-read (mmap),
+blocks can be compressed in parallel even with dictionary sharing.
 
 **Design Philosophy:**
 - L1-6: Speed + parallel decompress (independent blocks)
@@ -133,5 +138,19 @@ This matches user expectations:
 - 5+ trials per test for statistical significance
 - Use median, not min
 - pigz built from submodule (./pigz/pigz)
+
+## Performance Requirements
+
+**CRITICAL:** rigz must beat pigz in EVERY configuration. No exceptions.
+
+If a configuration regresses vs pigz:
+1. Create a different code path for that specific case
+2. Every (level, thread_count) combination may need its own strategy
+3. Never accept "good enough" - only "always better" is acceptable
+
+When measuring:
+- Speed matters (compression AND decompression)
+- Size matters (especially at high levels)
+- If we can't win both, prioritize what the user expects at that level
 
 See CONTRIBUTING.md for detailed architecture guide.
