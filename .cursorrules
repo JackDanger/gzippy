@@ -122,6 +122,15 @@
 3. On real hardware (Apple Silicon, Intel x86), rigz is 30-40% faster at L9 compression.
 4. The compression+decompression total time strongly favors rigz.
 
+## What Doesn't Work
+
+1. **Independent blocks at L9**: 4% larger output (violates 0.5% threshold)
+2. **Hybrid chain compression**: Gzip format can't embed dictionaries
+3. **Forward-refs-only**: Hash priming provides 0% compression benefit
+4. **Overlapping blocks**: Standard tools output redundant data
+5. **libdeflate L12**: 4x slower than L9 for marginal gain
+6. **Small block sizes on 4-core systems**: More coordination overhead than benefit
+
 ## Performance Testing
 
 ### Required Tests
@@ -178,3 +187,10 @@ This represents the theoretical maximum without:
 - Custom DEFLATE implementation
 - Hardware acceleration beyond CPU SIMD
 - New compression algorithms
+
+## Notes From Recent Work
+
+- L9 pipelined path uses `PipelinedGzEncoder` with a fixed 128KB block size and
+  32KB dictionaries (last input bytes), writing a single gzip stream.
+- Parallel pipeline uses a custom scheduler with spin-waited ordered writes;
+  per-block CRCs are computed in workers then combined in-order after all blocks.

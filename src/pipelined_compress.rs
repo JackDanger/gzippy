@@ -34,20 +34,30 @@ const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
 
 /// Dictionary size (DEFLATE maximum is 32KB)
 const DICT_SIZE: usize = 32 * 1024;
-const POOL_MAX_INPUT: usize = 4 * 1024 * 1024;
+
+/// Maximum input size for pooled compression path.
+///
+/// The pooled path uses persistent worker threads but requires copying input
+/// into a Vec (mmap can't be sent to thread pool). For small files, the copy
+/// overhead is less than thread spawn overhead. For larger files, use
+/// thread::scope which can borrow the mmap directly.
+const POOL_MAX_INPUT: usize = 1 * 1024 * 1024;
 
 struct CrcSlot(UnsafeCell<MaybeUninit<crc32fast::Hasher>>);
 // Safety: each slot is written by exactly one worker before all threads join.
 unsafe impl Sync for CrcSlot {}
 
+/// Block size for pipelined compression.
+///
+/// Pigz uses fixed 128KB blocks regardless of file size. This provides:
+/// - Consistent parallelism (more blocks = better load balancing)
+/// - Lower per-block overhead (smaller dictionary setup cost amortized)
+/// - Predictable performance characteristics
+///
+/// We match pigz exactly for L9 to ensure we beat their performance.
 #[inline]
-fn pipelined_block_size(input_len: usize, num_threads: usize, level: u32) -> usize {
-    if level >= 9 && num_threads > 1 && input_len > 0 {
-        let blocks = num_threads.saturating_mul(2).max(1);
-        let target = input_len.div_ceil(blocks);
-        return target.clamp(256 * 1024, 4 * 1024 * 1024);
-    }
-
+fn pipelined_block_size(_input_len: usize, _num_threads: usize, _level: u32) -> usize {
+    // Match pigz: always use 128KB blocks
     DEFAULT_BLOCK_SIZE
 }
 
