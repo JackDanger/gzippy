@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# Minimal permissions for security (validate job overrides for PR comments)
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1

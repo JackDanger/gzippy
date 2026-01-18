@@ -6,6 +6,10 @@ on:
       - 'v*'
   workflow_dispatch:  # Allow manual runs
 
+# Permissions for checkout and creating releases
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
