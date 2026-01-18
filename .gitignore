@@ -27,3 +27,7 @@ Thumbs.db
 *.log
 *.prof
 perf.data*
+
+# Python cache
+__pycache__/
+*.pyc
