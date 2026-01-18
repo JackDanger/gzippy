@@ -147,11 +147,11 @@ jobs:
           # Generate 10MB random data
           dd if=/dev/urandom of=/tmp/random.bin bs=1M count=10 2>/dev/null
           
-          # Compress with rigz
-          ./target/release/rigz -${{ matrix.level }} -p${{ matrix.threads }} -c /tmp/random.bin > /tmp/random.bin.gz
+          # Compress with rigz (using stdin to avoid file argument issues)
+          cat /tmp/random.bin | ./target/release/rigz -${{ matrix.level }} -p${{ matrix.threads }} > /tmp/random.bin.gz
           
           # Decompress with rigz
-          ./target/release/rigz -d /tmp/random.bin.gz > /tmp/random.out
+          cat /tmp/random.bin.gz | ./target/release/rigz -d > /tmp/random.out
           
           # Verify
           diff /tmp/random.bin /tmp/random.out

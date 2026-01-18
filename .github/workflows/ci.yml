@@ -174,23 +174,23 @@ jobs:
       - name: Test empty file
         run: |
           touch /tmp/empty.txt
-          ./target/release/rigz -c /tmp/empty.txt > /tmp/empty.txt.gz
-          ./target/release/rigz -d /tmp/empty.txt.gz > /tmp/empty.out
+          cat /tmp/empty.txt | ./target/release/rigz > /tmp/empty.txt.gz
+          cat /tmp/empty.txt.gz | ./target/release/rigz -d > /tmp/empty.out
           diff /tmp/empty.txt /tmp/empty.out
           echo "✓ Empty file works"
 
       - name: Test small file (100 bytes)
         run: |
           head -c 100 /dev/urandom > /tmp/small.bin
-          ./target/release/rigz -c /tmp/small.bin > /tmp/small.bin.gz
-          ./target/release/rigz -d /tmp/small.bin.gz > /tmp/small.out
+          cat /tmp/small.bin | ./target/release/rigz > /tmp/small.bin.gz
+          cat /tmp/small.bin.gz | ./target/release/rigz -d > /tmp/small.out
           diff /tmp/small.bin /tmp/small.out
           echo "✓ Small file works"
 
       - name: Test stdin streaming
         run: |
           head -c 1000000 /dev/urandom > /tmp/stdin_test.bin
-          cat /tmp/stdin_test.bin | ./target/release/rigz -c | ./target/release/rigz -d > /tmp/stdin_test.out
+          cat /tmp/stdin_test.bin | ./target/release/rigz | ./target/release/rigz -d > /tmp/stdin_test.out
           diff /tmp/stdin_test.bin /tmp/stdin_test.out
           echo "✓ Stdin streaming works"
 
@@ -198,8 +198,8 @@ jobs:
         run: |
           head -c 100000 /dev/urandom > /tmp/levels_test.bin
           for level in 1 2 3 4 5 6 7 8 9; do
-            ./target/release/rigz -$level -c /tmp/levels_test.bin > /tmp/levels_test.gz
-            ./target/release/rigz -d /tmp/levels_test.gz > /tmp/levels_test.out
+            cat /tmp/levels_test.bin | ./target/release/rigz -$level > /tmp/levels_test.gz
+            cat /tmp/levels_test.gz | ./target/release/rigz -d > /tmp/levels_test.out
             diff /tmp/levels_test.bin /tmp/levels_test.out
             echo "✓ Level $level works"
           done
@@ -208,8 +208,8 @@ jobs:
         run: |
           head -c 1000000 /dev/urandom > /tmp/threads_test.bin
           for threads in 1 2 4 8; do
-            ./target/release/rigz -9 -p$threads -c /tmp/threads_test.bin > /tmp/threads_test.gz
-            ./target/release/rigz -d /tmp/threads_test.gz > /tmp/threads_test.out
+            cat /tmp/threads_test.bin | ./target/release/rigz -9 -p$threads > /tmp/threads_test.gz
+            cat /tmp/threads_test.gz | ./target/release/rigz -d > /tmp/threads_test.out
             diff /tmp/threads_test.bin /tmp/threads_test.out
             echo "✓ $threads threads works"
           done
@@ -218,7 +218,7 @@ jobs:
         run: |
           head -c 100000 /dev/urandom > /tmp/compat_test.bin
           # rigz compress → gzip decompress
-          ./target/release/rigz -c /tmp/compat_test.bin | gzip -d > /tmp/compat_test.out
+          cat /tmp/compat_test.bin | ./target/release/rigz | gzip -d > /tmp/compat_test.out
           diff /tmp/compat_test.bin /tmp/compat_test.out
           echo "✓ rigz→gzip works"
           # gzip compress → rigz decompress
