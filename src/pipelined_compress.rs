@@ -50,12 +50,14 @@ const DICT_SIZE: usize = 32 * 1024;
 fn get_block_size_for_file(level: u32, file_size: usize) -> usize {
     if level >= 9 {
         // Dynamic sizing for L9 based on file size
+        // Larger blocks reduce coordination overhead, especially important on
+        // resource-constrained systems like GHA VMs (4 cores)
         if file_size < 10 * 1024 * 1024 {
-            64 * 1024 // 64KB for small files - more parallelism
+            128 * 1024 // 128KB for small files
         } else if file_size < 50 * 1024 * 1024 {
-            128 * 1024 // 128KB for medium files
+            256 * 1024 // 256KB for medium files
         } else {
-            256 * 1024 // 256KB for large files - less overhead
+            512 * 1024 // 512KB for large files - significantly less overhead
         }
     } else {
         BLOCK_SIZE_DEFAULT
