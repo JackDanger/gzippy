@@ -180,7 +180,8 @@ def is_statistically_faster(times_a: list, times_b: list, threshold_pct: float =
 
 
 def benchmark_compress(tool: str, level: int, threads: int, 
-                       input_file: str, output_file: str, runs: int) -> dict:
+                       input_file: str, output_file: str, runs: int,
+                       debug: bool = False) -> dict:
     """Benchmark compression. Returns stats dict."""
     bin_path = find_tool(tool)
     
@@ -189,11 +190,18 @@ def benchmark_compress(tool: str, level: int, threads: int,
         cmd.append(f"-p{threads}")
     cmd.extend(["-c", input_file])
     
+    # Set up environment for rigz debug mode
+    env = os.environ.copy()
+    if tool == "rigz" and debug:
+        env["RIGZ_DEBUG"] = "1"
+    
     times = []
-    for _ in range(runs):
+    for i in range(runs):
         start = time.perf_counter()
         with open(output_file, 'wb') as f:
-            result = subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
+            # For debug mode, capture stderr on first run
+            stderr_dest = None if (tool == "rigz" and debug and i == 0) else subprocess.DEVNULL
+            result = subprocess.run(cmd, stdout=f, stderr=stderr_dest, env=env)
         if result.returncode != 0:
             raise RuntimeError(f"{tool} compression failed")
         times.append(time.perf_counter() - start)
@@ -301,6 +309,8 @@ def main():
                        help="Override max ratio overhead %% (default: level-based)")
     parser.add_argument("--show-cpu-info", action="store_true",
                        help="Show CPU info for debugging")
+    parser.add_argument("--debug", action="store_true",
+                       help="Enable RIGZ_DEBUG to show timing breakdown")
     
     args = parser.parse_args()
     
@@ -362,7 +372,8 @@ def main():
             out_file = tmpdir / f"test.{tool}.gz"
             try:
                 stats = benchmark_compress(tool, args.level, args.threads,
-                                         str(test_file), str(out_file), runs)
+                                         str(test_file), str(out_file), runs,
+                                         debug=args.debug)
                 results["compression"][tool] = stats
                 comp_files[tool] = out_file
                 print(f"  {tool:5}: {stats['median']:.3f}s (±{stats['stdev']:.3f}s) "

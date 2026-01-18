@@ -9,11 +9,19 @@
 //!
 //! This maximizes CPU utilization by never blocking the compress workers
 //! on I/O. The writer thread handles all disk writes independently.
+//!
+//! Set RIGZ_DEBUG=1 to enable timing diagnostics.
 
 use std::cell::UnsafeCell;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
+use std::time::Instant;
+
+/// Check if debug mode is enabled via RIGZ_DEBUG env var
+fn is_debug_enabled() -> bool {
+    std::env::var("RIGZ_DEBUG").is_ok_and(|v| v == "1" || v == "true")
+}
 
 /// A slot for storing a compressed block's output
 pub struct BlockSlot {
@@ -104,16 +112,40 @@ where
     W: Write + Send,
     F: Fn(usize, &[u8], Option<&[u8]>, bool, &mut Vec<u8>) + Sync,
 {
+    let debug = is_debug_enabled();
+    let start = Instant::now();
+
     let num_blocks = input.len().div_ceil(block_size);
     if num_blocks == 0 {
         return Ok(writer);
     }
 
+    if debug {
+        eprintln!(
+            "[rigz] compress_parallel: input={}KB, block_size={}KB, blocks={}, threads={}",
+            input.len() / 1024,
+            block_size / 1024,
+            num_blocks,
+            num_threads
+        );
+    }
+
     // Pre-allocate output slots with conservative capacity
+    let alloc_start = Instant::now();
     let slot_capacity = block_size + (block_size / 10) + 1024;
     let slots: Vec<BlockSlot> = (0..num_blocks)
         .map(|_| BlockSlot::new(slot_capacity))
         .collect();
+    let alloc_time = alloc_start.elapsed();
+
+    if debug {
+        eprintln!(
+            "[rigz] slot allocation: {}ms for {} slots ({}KB each)",
+            alloc_time.as_millis(),
+            num_blocks,
+            slot_capacity / 1024
+        );
+    }
 
     // Atomic counter for lock-free work distribution
     let next_block = AtomicUsize::new(0);
@@ -121,18 +153,31 @@ where
     // Track any write error from writer thread
     let write_error: AtomicBool = AtomicBool::new(false);
 
+    // Timing accumulators (atomic for thread-safe updates)
+    let total_compress_ns = AtomicU64::new(0);
+    let total_wait_ns = AtomicU64::new(0);
+    let total_write_ns = AtomicU64::new(0);
+    let blocks_compressed = AtomicUsize::new(0);
+
     // Use scoped threads - no Arc needed, everything is borrowed
-    thread::scope(|scope| {
+    let thread_start = Instant::now();
+    let result = thread::scope(|scope| {
         // Spawn dedicated writer thread (pigz model)
         // Returns the writer so caller can write trailer
         let writer_handle = scope.spawn(|| {
             let mut w = writer;
             for slot in slots.iter() {
+                let wait_start = Instant::now();
                 wait_for_slot_ready(slot);
+                total_wait_ns.fetch_add(wait_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+                let write_start = Instant::now();
                 if w.write_all(slot.data()).is_err() {
                     write_error.store(true, Ordering::Relaxed);
                     break;
                 }
+                total_write_ns
+                    .fetch_add(write_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
             w
         });
@@ -140,13 +185,15 @@ where
         // Spawn N compress worker threads
         for _ in 0..num_threads {
             scope.spawn(|| {
-                worker_loop(
+                worker_loop_timed(
                     input,
                     block_size,
                     num_blocks,
                     &slots,
                     &next_block,
                     &compress_fn,
+                    &total_compress_ns,
+                    &blocks_compressed,
                 );
             });
         }
@@ -159,18 +206,52 @@ where
         } else {
             Ok(w)
         }
-    })
+    });
+    let thread_time = thread_start.elapsed();
+    let total_time = start.elapsed();
+
+    if debug {
+        let compress_ms = total_compress_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let wait_ms = total_wait_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let write_ms = total_write_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let blocks = blocks_compressed.load(Ordering::Relaxed);
+
+        eprintln!("[rigz] timing breakdown:");
+        eprintln!("  total time: {}ms", total_time.as_millis());
+        eprintln!("  thread scope: {}ms", thread_time.as_millis());
+        eprintln!(
+            "  compress (sum across threads): {:.1}ms ({} blocks, {:.2}ms/block avg)",
+            compress_ms,
+            blocks,
+            if blocks > 0 {
+                compress_ms / blocks as f64
+            } else {
+                0.0
+            }
+        );
+        eprintln!("  writer wait: {:.1}ms", wait_ms);
+        eprintln!("  writer write: {:.1}ms", write_ms);
+        eprintln!(
+            "  overhead: {:.1}ms",
+            total_time.as_millis() as f64 - thread_time.as_millis() as f64
+        );
+    }
+
+    result
 }
 
-/// Worker loop: claims blocks via atomic counter and compresses them
+/// Worker loop with timing instrumentation
 #[inline]
-fn worker_loop<F>(
+#[allow(clippy::too_many_arguments)]
+fn worker_loop_timed<F>(
     input: &[u8],
     block_size: usize,
     num_blocks: usize,
     slots: &[BlockSlot],
     next_block: &AtomicUsize,
     compress_fn: &F,
+    total_compress_ns: &AtomicU64,
+    blocks_compressed: &AtomicUsize,
 ) where
     F: Fn(usize, &[u8], Option<&[u8]>, bool, &mut Vec<u8>),
 {
@@ -200,8 +281,14 @@ fn worker_loop<F>(
         // Get output buffer from pre-allocated slot
         let output = unsafe { slots[block_idx].data_mut() };
 
-        // Compress into the slot's buffer
+        // Time the compression
+        let compress_start = Instant::now();
         compress_fn(block_idx, block, dict, is_last, output);
+        total_compress_ns.fetch_add(
+            compress_start.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        blocks_compressed.fetch_add(1, Ordering::Relaxed);
 
         // Signal completion
         slots[block_idx].mark_ready();
