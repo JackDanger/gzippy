@@ -1,14 +1,14 @@
 [package]
-name = "rigz"
+name = "gzippy"
 version = "0.1.0"
 edition = "2021"
-description = "A fast, parallel gzip replacement written in Rust"
+description = "The fastest parallel gzip. Drop-in replacement for gzip and pigz."
 license = "Zlib"
-repository = "https://github.com/jackdanger/rigz"
-homepage = "https://github.com/jackdanger/rigz"
-documentation = "https://github.com/jackdanger/rigz#readme"
+repository = "https://github.com/jackdanger/gzippy"
+homepage = "https://github.com/jackdanger/gzippy"
+documentation = "https://github.com/jackdanger/gzippy#readme"
 readme = "README.md"
-keywords = ["gzip", "compression", "parallel", "pigz"]
+keywords = ["gzip", "compression", "parallel", "pigz", "zlib"]
 categories = ["compression", "command-line-utilities"]
 authors = ["Jack Danger Canty"]
 

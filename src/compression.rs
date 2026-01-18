@@ -6,19 +6,19 @@ use std::fs::File;
 use std::io::{self, stdin, stdout, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
-use crate::cli::RigzArgs;
-use crate::error::{RigzError, RigzResult};
+use crate::cli::GzippyArgs;
+use crate::error::{GzippyError, GzippyResult};
 use crate::optimization::{detect_content_type, ContentType, OptimizationConfig};
 use crate::simple_optimizations::SimpleOptimizer;
 
-pub fn compress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
+pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     if filename == "-" {
         return compress_stdin(args);
     }
 
     let input_path = Path::new(filename);
     if !input_path.exists() {
-        return Err(RigzError::FileNotFound(filename.to_string()));
+        return Err(GzippyError::FileNotFound(filename.to_string()));
     }
 
     // Handle directory recursion
@@ -26,7 +26,7 @@ pub fn compress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
         return if args.recursive {
             compress_directory(filename, args)
         } else {
-            Err(RigzError::invalid_argument(format!(
+            Err(GzippyError::invalid_argument(format!(
                 "{} is a directory",
                 filename
             )))
@@ -43,7 +43,7 @@ pub fn compress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
     // Check if output file exists and handle force flag
     if let Some(ref output_path) = output_path {
         if output_path.exists() && !args.force {
-            return Err(RigzError::invalid_argument(format!(
+            return Err(GzippyError::invalid_argument(format!(
                 "Output file {} already exists",
                 output_path.display()
             )));
@@ -75,7 +75,7 @@ pub fn compress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
 
     if args.verbosity >= 2 {
         eprintln!(
-            "rigz: optimizing for {:?} content, {} threads, {}KB buffer, {:?} backend",
+            "gzippy: optimizing for {:?} content, {} threads, {}KB buffer, {:?} backend",
             content_type,
             opt_config.thread_count,
             opt_config.buffer_size / 1024,
@@ -92,7 +92,7 @@ pub fn compress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
         // MMAP PATH: Zero-copy parallel compression for large files
         if args.verbosity >= 2 {
             eprintln!(
-                "rigz: using mmap parallel backend with {} threads",
+                "gzippy: using mmap parallel backend with {} threads",
                 opt_config.thread_count,
             );
         }
@@ -146,7 +146,7 @@ pub fn compress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
     }
 }
 
-pub fn compress_stdin(args: &RigzArgs) -> RigzResult<i32> {
+pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     let mut input = stdin();
     let output = stdout();
 
@@ -187,7 +187,7 @@ pub fn compress_stdin(args: &RigzArgs) -> RigzResult<i32> {
     }
 }
 
-fn compress_directory(dirname: &str, args: &RigzArgs) -> RigzResult<i32> {
+fn compress_directory(dirname: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     use walkdir::WalkDir;
 
     let mut exit_code = 0;
@@ -205,7 +205,7 @@ fn compress_directory(dirname: &str, args: &RigzArgs) -> RigzResult<i32> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("rigz: {}: {}", path_str, e);
+                    eprintln!("gzippy: {}: {}", path_str, e);
                     exit_code = 1;
                 }
             }
@@ -218,9 +218,9 @@ fn compress_directory(dirname: &str, args: &RigzArgs) -> RigzResult<i32> {
 fn compress_with_pipeline<R: Read, W: Write + Send>(
     mut reader: R,
     writer: W,
-    args: &RigzArgs,
+    args: &GzippyArgs,
     opt_config: &OptimizationConfig,
-) -> RigzResult<u64> {
+) -> GzippyResult<u64> {
     // FAST PATH: Single-threaded goes directly to flate2 with minimal overhead
     // This is critical for L1 performance where every microsecond matters
     if opt_config.thread_count == 1 {
@@ -228,7 +228,7 @@ fn compress_with_pipeline<R: Read, W: Write + Send>(
         use flate2::Compression;
 
         if args.verbosity >= 2 {
-            eprintln!("rigz: using direct flate2 single-threaded path");
+            eprintln!("gzippy: using direct flate2 single-threaded path");
         }
 
         // zlib-ng level 1 uses a different strategy that produces 2-5x larger output
@@ -250,7 +250,7 @@ fn compress_with_pipeline<R: Read, W: Write + Send>(
 
     if args.verbosity >= 2 {
         eprintln!(
-            "rigz: using parallel backend with {} threads",
+            "gzippy: using parallel backend with {} threads",
             opt_config.thread_count,
         );
     }
@@ -258,7 +258,7 @@ fn compress_with_pipeline<R: Read, W: Write + Send>(
     optimizer.compress(reader, writer).map_err(|e| e.into())
 }
 
-fn get_output_filename(input_path: &Path, args: &RigzArgs) -> std::path::PathBuf {
+fn get_output_filename(input_path: &Path, args: &GzippyArgs) -> std::path::PathBuf {
     let mut output_path = input_path.to_path_buf();
 
     // Remove existing compression extensions if forcing
@@ -290,7 +290,7 @@ fn get_output_filename(input_path: &Path, args: &RigzArgs) -> std::path::PathBuf
     output_path
 }
 
-fn print_compression_stats(input_size: u64, output_size: u64, path: &Path, args: &RigzArgs) {
+fn print_compression_stats(input_size: u64, output_size: u64, path: &Path, args: &GzippyArgs) {
     let filename = path
         .file_name()
         .unwrap_or_default()

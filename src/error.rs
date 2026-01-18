@@ -4,7 +4,7 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 #[allow(dead_code)]
-pub enum RigzError {
+pub enum GzippyError {
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
 
@@ -45,33 +45,31 @@ pub enum RigzError {
     WalkDir(#[from] walkdir::Error),
 }
 
-// gzp dependency removed - using custom parallel compression
-
 #[allow(dead_code)]
-impl RigzError {
+impl GzippyError {
     pub fn compression<T: fmt::Display>(msg: T) -> Self {
-        RigzError::Compression(msg.to_string())
+        GzippyError::Compression(msg.to_string())
     }
 
     pub fn decompression<T: fmt::Display>(msg: T) -> Self {
-        RigzError::Decompression(msg.to_string())
+        GzippyError::Decompression(msg.to_string())
     }
 
     pub fn invalid_argument<T: fmt::Display>(msg: T) -> Self {
-        RigzError::InvalidArgument(msg.to_string())
+        GzippyError::InvalidArgument(msg.to_string())
     }
 
     pub fn thread<T: fmt::Display>(msg: T) -> Self {
-        RigzError::Thread(msg.to_string())
+        GzippyError::Thread(msg.to_string())
     }
 
     pub fn internal<T: fmt::Display>(msg: T) -> Self {
-        RigzError::Internal(msg.to_string())
+        GzippyError::Internal(msg.to_string())
     }
 
     pub fn parse<T: fmt::Display>(msg: T) -> Self {
-        RigzError::Parse(msg.to_string())
+        GzippyError::Parse(msg.to_string())
     }
 }
 
-pub type RigzResult<T> = Result<T, RigzError>;
+pub type GzippyResult<T> = Result<T, GzippyError>;

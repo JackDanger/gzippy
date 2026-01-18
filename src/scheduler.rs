@@ -10,7 +10,7 @@
 //! This maximizes CPU utilization by never blocking the compress workers
 //! on I/O. The writer thread handles all disk writes independently.
 //!
-//! Set RIGZ_DEBUG=1 to enable timing diagnostics.
+//! Set GZIPPY_DEBUG=1 to enable timing diagnostics.
 
 use std::cell::UnsafeCell;
 use std::io::{self, Write};
@@ -18,9 +18,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
-/// Check if debug mode is enabled via RIGZ_DEBUG env var
+/// Check if debug mode is enabled via GZIPPY_DEBUG env var
 fn is_debug_enabled() -> bool {
-    std::env::var("RIGZ_DEBUG").is_ok_and(|v| v == "1" || v == "true")
+    std::env::var("GZIPPY_DEBUG").is_ok_and(|v| v == "1" || v == "true")
 }
 
 /// A slot for storing a compressed block's output
@@ -122,7 +122,7 @@ where
 
     if debug {
         eprintln!(
-            "[rigz] compress_parallel: input={}KB, block_size={}KB, blocks={}, threads={}",
+            "[gzippy] compress_parallel: input={}KB, block_size={}KB, blocks={}, threads={}",
             input.len() / 1024,
             block_size / 1024,
             num_blocks,
@@ -140,7 +140,7 @@ where
 
     if debug {
         eprintln!(
-            "[rigz] slot allocation: {}ms for {} slots ({}KB each)",
+            "[gzippy] slot allocation: {}ms for {} slots ({}KB each)",
             alloc_time.as_millis(),
             num_blocks,
             slot_capacity / 1024
@@ -216,7 +216,7 @@ where
         let write_ms = total_write_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
         let blocks = blocks_compressed.load(Ordering::Relaxed);
 
-        eprintln!("[rigz] timing breakdown:");
+        eprintln!("[gzippy] timing breakdown:");
         eprintln!("  total time: {}ms", total_time.as_millis());
         eprintln!("  thread scope: {}ms", thread_time.as_millis());
         eprintln!(

@@ -275,6 +275,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "gzippy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "clap",
+ "core_affinity",
+ "crc32fast",
+ "filetime",
+ "flate2",
+ "libc",
+ "libdeflate-sys",
+ "libdeflater",
+ "memchr",
+ "memmap2",
+ "num_cpus",
+ "predicates",
+ "tempfile",
+ "thiserror",
+ "walkdir",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -496,29 +519,6 @@ name = "regex-syntax"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
-
-[[package]]
-name = "rigz"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "clap",
- "core_affinity",
- "crc32fast",
- "filetime",
- "flate2",
- "libc",
- "libdeflate-sys",
- "libdeflater",
- "memchr",
- "memmap2",
- "num_cpus",
- "predicates",
- "tempfile",
- "thiserror",
- "walkdir",
-]
 
 [[package]]
 name = "rustix"
