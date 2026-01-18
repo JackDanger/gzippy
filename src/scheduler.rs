@@ -31,16 +31,23 @@ pub struct BlockSlot {
     data: UnsafeCell<Vec<u8>>,
 }
 
+/// Wait for a slot to become ready with adaptive backoff.
+///
+/// Optimized for GHA's 4-vCPU environment where spinning wastes shared resources.
+/// Uses aggressive backoff: few spins → quick yield → short sleep.
 #[inline]
 fn wait_for_ready(slot: &BlockSlot) {
     let mut spins = 0u32;
     while !slot.is_ready() {
-        if spins < 1_000 {
+        if spins < 32 {
+            // Brief spin for very fast completions
             std::hint::spin_loop();
-        } else if spins < 2_000 {
+        } else if spins < 64 {
+            // Yield quickly to avoid hogging vCPU
             thread::yield_now();
         } else {
-            thread::sleep(Duration::from_micros(50));
+            // Sleep with short duration - GHA vCPUs have high context switch cost
+            thread::sleep(Duration::from_micros(10));
         }
         spins += 1;
     }
@@ -199,8 +206,9 @@ where
         return Ok(());
     }
 
-    // Pre-allocate output slots
-    // Capacity: block_size + 10% + 1KB for gzip header/trailer overhead
+    // Pre-allocate output slots with conservative capacity.
+    // Must handle worst case (incompressible data) to avoid buffer overflow.
+    // Compressed output can be slightly larger than input for random data.
     let slot_capacity = block_size + (block_size / 10) + 1024;
     let slots: Vec<BlockSlot> = (0..num_blocks)
         .map(|_| BlockSlot::new(slot_capacity))
@@ -230,15 +238,42 @@ where
         // Main thread: alternate between compressing blocks and writing
         // This keeps main thread busy instead of just spinning
         let mut next_write = 0;
+
+        // Use a write buffer to batch small writes (reduces syscall overhead on GHA)
+        let mut write_buf = Vec::with_capacity(block_size);
+
         loop {
-            // Check if we can write any blocks
+            // Check if we can write any blocks - batch consecutive ready blocks
+            let mut wrote_any = false;
             while next_write < num_blocks && slots[next_write].is_ready() {
-                writer.write_all(slots[next_write].data())?;
+                let data = slots[next_write].data();
+                // Batch small blocks together
+                if write_buf.len() + data.len() <= block_size * 4 {
+                    write_buf.extend_from_slice(data);
+                } else {
+                    // Flush buffer and write directly
+                    if !write_buf.is_empty() {
+                        writer.write_all(&write_buf)?;
+                        write_buf.clear();
+                    }
+                    writer.write_all(data)?;
+                }
                 next_write += 1;
+                wrote_any = true;
             }
 
+            // Flush any remaining buffered data if we've finished all blocks
             if next_write >= num_blocks {
-                break; // All blocks written
+                if !write_buf.is_empty() {
+                    writer.write_all(&write_buf)?;
+                }
+                break;
+            }
+
+            // If we just wrote, flush the buffer before doing more compression
+            if wrote_any && !write_buf.is_empty() && write_buf.len() > block_size {
+                writer.write_all(&write_buf)?;
+                write_buf.clear();
             }
 
             // Try to claim and compress a block

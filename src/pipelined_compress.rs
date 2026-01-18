@@ -48,15 +48,11 @@ unsafe impl Sync for CrcSlot {}
 
 /// Block size for pipelined compression.
 ///
-/// Pigz uses fixed 128KB blocks regardless of file size. This provides:
-/// - Consistent parallelism (more blocks = better load balancing)
-/// - Lower per-block overhead (smaller dictionary setup cost amortized)
-/// - Predictable performance characteristics
-///
-/// We match pigz exactly for L9 to ensure we beat their performance.
+/// Pigz uses fixed 128KB blocks. We match this for maximum compression ratio.
+/// The optimization for larger blocks was tested but caused >0.5% size increase.
 #[inline]
 fn pipelined_block_size(_input_len: usize, _num_threads: usize, _level: u32) -> usize {
-    // Match pigz: always use 128KB blocks
+    // Match pigz: always use 128KB blocks for best compression ratio
     DEFAULT_BLOCK_SIZE
 }
 
@@ -342,7 +338,8 @@ fn compress_block_with_dict(
 
         output.clear();
 
-        // Ensure buffer is large enough (block_size + 10% + 1KB for headers)
+        // Ensure buffer is large enough for worst case (incompressible data).
+        // Compressed output can be slightly larger than input for random data.
         let initial_capacity = block_size + (block_size / 10) + 1024;
         if output.capacity() < initial_capacity {
             output.reserve(initial_capacity - output.capacity());
