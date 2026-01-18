@@ -29,7 +29,7 @@ impl SimpleOptimizer {
     }
 
     /// Optimized compression with improved threading and buffer management
-    pub fn compress<R: Read, W: Write>(&self, reader: R, writer: W) -> io::Result<u64> {
+    pub fn compress<R: Read, W: Write + Send>(&self, reader: R, writer: W) -> io::Result<u64> {
         match self.config.backend {
             CompressionBackend::Parallel => self.compress_parallel(reader, writer),
             CompressionBackend::SingleThreaded => self.compress_single_threaded(reader, writer),
@@ -47,7 +47,7 @@ impl SimpleOptimizer {
     /// The L9 multi-thread decision is based on benchmarks showing libdeflate
     /// is 2-3x faster than zlib-ng pipelined while staying within the 0.5%
     /// compression ratio threshold.
-    fn compress_parallel<R: Read, W: Write>(&self, reader: R, writer: W) -> io::Result<u64> {
+    fn compress_parallel<R: Read, W: Write + Send>(&self, reader: R, writer: W) -> io::Result<u64> {
         let optimal_threads = self.calculate_optimal_threads();
         let compression_level = self.config.compression_level as u32;
 
@@ -73,7 +73,11 @@ impl SimpleOptimizer {
     /// - L9 multi-thread: libdeflate L12 for speed (ratio within 0.5%)
     /// - L7-L8 multi-thread: pipelined zlib-ng for maximum ratio
     /// - L1-L6: independent blocks for parallel decompression
-    pub fn compress_file<P: AsRef<Path>, W: Write>(&self, path: P, writer: W) -> io::Result<u64> {
+    pub fn compress_file<P: AsRef<Path>, W: Write + Send>(
+        &self,
+        path: P,
+        writer: W,
+    ) -> io::Result<u64> {
         let optimal_threads = self.calculate_optimal_threads();
         let compression_level = self.config.compression_level as u32;
 

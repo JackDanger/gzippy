@@ -1,22 +1,21 @@
-//! Efficient parallel scheduler with condvar-based synchronization
+//! Pigz-style parallel scheduler with dedicated writer thread
 //!
-//! A pigz-inspired scheduler optimized for GHA's 4-vCPU environment:
+//! This implements pigz's proven threading model:
 //!
-//! 1. Dedicated worker threads that compress blocks
-//! 2. Main thread writes blocks in order using condvar (no spinning)
-//! 3. Pre-allocated output slots (zero allocation in hot path)
-//! 4. Lock-free work distribution (single atomic counter)
+//! 1. N compress worker threads (claim work via atomic counter)
+//! 2. 1 dedicated writer thread (writes blocks in order)
+//! 3. All N+1 threads run concurrently (no main-thread stalls)
+//! 4. Simple spin-wait for block completion (low latency)
 //!
-//! Key difference from spin-wait: workers signal completion via condvar,
-//! main thread sleeps efficiently instead of burning CPU cycles.
+//! This maximizes CPU utilization by never blocking the compress workers
+//! on I/O. The writer thread handles all disk writes independently.
 
 use std::cell::UnsafeCell;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
 use std::thread;
 
-/// A slot for storing a compressed block's output with completion signaling
+/// A slot for storing a compressed block's output
 pub struct BlockSlot {
     /// Whether this block has been compressed
     ready: AtomicBool,
@@ -24,54 +23,14 @@ pub struct BlockSlot {
     data: UnsafeCell<Vec<u8>>,
 }
 
-/// Shared state for signaling block completions
-struct CompletionSignal {
-    /// Mutex for condvar (value is next expected block to complete)
-    lock: Mutex<usize>,
-    /// Condvar for efficient waiting
-    cond: Condvar,
-}
-
-impl CompletionSignal {
-    fn new() -> Self {
-        Self {
-            lock: Mutex::new(0),
-            cond: Condvar::new(),
-        }
-    }
-
-    /// Signal that a block has been completed
-    #[inline]
-    fn signal_completion(&self, _block_idx: usize) {
-        // Just notify - the waiter will check the slot
-        self.cond.notify_one();
-    }
-
-    /// Wait for any block completion using condvar
-    #[inline]
-    fn wait_for_completion(&self) {
-        let guard = self.lock.lock().unwrap();
-        // Short timeout to avoid missing signals
-        let _ = self
-            .cond
-            .wait_timeout(guard, std::time::Duration::from_micros(10));
-    }
-}
-
-/// Efficient hybrid wait: brief spin, then condvar
+/// Efficient spin-wait for slot readiness
+///
+/// Uses brief spin with pause hint. For L9 compression where each block
+/// takes ~10ms, this adds negligible overhead while keeping latency low.
 #[inline]
-fn wait_for_slot_ready(slot: &BlockSlot, signal: &CompletionSignal) {
-    // Brief spin for fast completions (common case)
-    for _ in 0..64 {
-        if slot.is_ready() {
-            return;
-        }
-        std::hint::spin_loop();
-    }
-
-    // Fall back to condvar for efficient waiting
+fn wait_for_slot_ready(slot: &BlockSlot) {
     while !slot.is_ready() {
-        signal.wait_for_completion();
+        std::hint::spin_loop();
     }
 }
 
@@ -123,43 +82,34 @@ impl BlockSlot {
     }
 }
 
-/// Compress blocks in parallel with streaming output
+/// Compress blocks in parallel with dedicated writer thread (pigz model)
 ///
-/// This is the core function that replaces rayon. It:
-/// 1. Pre-allocates output slots for each block
-/// 2. Spawns worker threads that claim blocks via atomic counter
-/// 3. Workers compress into their claimed slot, then signal via condvar
-/// 4. Main thread waits efficiently on condvar and writes as blocks complete
+/// This implements the pigz threading model:
+/// 1. N compress worker threads claim blocks via atomic counter
+/// 2. 1 dedicated writer thread writes blocks in order
+/// 3. All threads run concurrently - no blocking on I/O
 ///
-/// # Arguments
-/// * `input` - The input data (typically memory-mapped)
-/// * `block_size` - Size of each block to compress
-/// * `num_threads` - Number of worker threads
-/// * `writer` - Where to write compressed output
-/// * `compress_fn` - Function to compress a block: (block_idx, block, dict, is_last, output)
-///
-/// # Type Parameters
-/// * `W` - Output writer type
-/// * `F` - Compression function type
+/// This is optimal because:
+/// - Compress workers never stall waiting for writes
+/// - Writer thread runs in parallel with compression
+/// - Simple spin-wait has low latency for fast blocks
 pub fn compress_parallel<W, F>(
     input: &[u8],
     block_size: usize,
     num_threads: usize,
-    mut writer: W,
+    writer: W,
     compress_fn: F,
-) -> io::Result<()>
+) -> io::Result<W>
 where
-    W: Write,
+    W: Write + Send,
     F: Fn(usize, &[u8], Option<&[u8]>, bool, &mut Vec<u8>) + Sync,
 {
     let num_blocks = input.len().div_ceil(block_size);
     if num_blocks == 0 {
-        return Ok(());
+        return Ok(writer);
     }
 
-    // Pre-allocate output slots with conservative capacity.
-    // Must handle worst case (incompressible data) to avoid buffer overflow.
-    // Compressed output can be slightly larger than input for random data.
+    // Pre-allocate output slots with conservative capacity
     let slot_capacity = block_size + (block_size / 10) + 1024;
     let slots: Vec<BlockSlot> = (0..num_blocks)
         .map(|_| BlockSlot::new(slot_capacity))
@@ -168,47 +118,59 @@ where
     // Atomic counter for lock-free work distribution
     let next_block = AtomicUsize::new(0);
 
-    // Completion signal for efficient waiting
-    let signal = CompletionSignal::new();
+    // Track any write error from writer thread
+    let write_error: AtomicBool = AtomicBool::new(false);
 
     // Use scoped threads - no Arc needed, everything is borrowed
     thread::scope(|scope| {
-        // Spawn N worker threads - all threads compress, main just writes
-        // This maximizes compression parallelism and CPU utilization
+        // Spawn dedicated writer thread (pigz model)
+        // Returns the writer so caller can write trailer
+        let writer_handle = scope.spawn(|| {
+            let mut w = writer;
+            for slot in slots.iter() {
+                wait_for_slot_ready(slot);
+                if w.write_all(slot.data()).is_err() {
+                    write_error.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            w
+        });
+
+        // Spawn N compress worker threads
         for _ in 0..num_threads {
             scope.spawn(|| {
-                worker_loop_with_signal(
+                worker_loop(
                     input,
                     block_size,
                     num_blocks,
                     &slots,
                     &next_block,
                     &compress_fn,
-                    &signal,
                 );
             });
         }
 
-        // Main thread: write blocks in order using hybrid spin/condvar wait
-        for slot in slots.iter() {
-            wait_for_slot_ready(slot, &signal);
-            writer.write_all(slot.data())?;
-        }
+        // Wait for writer to finish and get it back
+        let w = writer_handle.join().unwrap();
 
-        Ok(())
+        if write_error.load(Ordering::Relaxed) {
+            Err(io::Error::other("write failed"))
+        } else {
+            Ok(w)
+        }
     })
 }
 
-/// Worker loop with completion signaling via condvar
+/// Worker loop: claims blocks via atomic counter and compresses them
 #[inline]
-fn worker_loop_with_signal<F>(
+fn worker_loop<F>(
     input: &[u8],
     block_size: usize,
     num_blocks: usize,
     slots: &[BlockSlot],
     next_block: &AtomicUsize,
     compress_fn: &F,
-    signal: &CompletionSignal,
 ) where
     F: Fn(usize, &[u8], Option<&[u8]>, bool, &mut Vec<u8>),
 {
@@ -216,7 +178,7 @@ fn worker_loop_with_signal<F>(
         // Claim next block atomically
         let block_idx = next_block.fetch_add(1, Ordering::Relaxed);
         if block_idx >= num_blocks {
-            break; // No more work
+            break;
         }
 
         // Calculate block boundaries
@@ -236,35 +198,34 @@ fn worker_loop_with_signal<F>(
         let is_last = block_idx == num_blocks - 1;
 
         // Get output buffer from pre-allocated slot
-        // Safety: Each block_idx is claimed by exactly one worker
         let output = unsafe { slots[block_idx].data_mut() };
 
         // Compress into the slot's buffer
         compress_fn(block_idx, block, dict, is_last, output);
 
-        // Signal completion - main thread can now write this block
+        // Signal completion
         slots[block_idx].mark_ready();
-        signal.signal_completion(block_idx);
     }
 }
 
 /// Variant for independent blocks (L1-L6) that don't need dictionaries
 ///
-/// Slightly simpler since we don't compute dict slices.
+/// Uses same pigz model: N workers + dedicated writer thread.
+/// Returns the writer so caller can write any trailer.
 pub fn compress_parallel_independent<W, F>(
     input: &[u8],
     block_size: usize,
     num_threads: usize,
-    mut writer: W,
+    writer: W,
     compress_fn: F,
-) -> io::Result<()>
+) -> io::Result<W>
 where
-    W: Write,
+    W: Write + Send,
     F: Fn(&[u8], &mut Vec<u8>) + Sync,
 {
     let num_blocks = input.len().div_ceil(block_size);
     if num_blocks == 0 {
-        return Ok(());
+        return Ok(writer);
     }
 
     let slot_capacity = block_size + (block_size / 10) + 1024;
@@ -273,10 +234,23 @@ where
         .collect();
 
     let next_block = AtomicUsize::new(0);
-    let signal = CompletionSignal::new();
+    let write_error = AtomicBool::new(false);
 
     thread::scope(|scope| {
-        // Spawn workers with condvar signaling
+        // Spawn dedicated writer thread
+        let writer_handle = scope.spawn(|| {
+            let mut w = writer;
+            for slot in slots.iter() {
+                wait_for_slot_ready(slot);
+                if w.write_all(slot.data()).is_err() {
+                    write_error.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            w
+        });
+
+        // Spawn N compress workers
         for _ in 0..num_threads {
             scope.spawn(|| loop {
                 let block_idx = next_block.fetch_add(1, Ordering::Relaxed);
@@ -291,17 +265,16 @@ where
                 let output = unsafe { slots[block_idx].data_mut() };
                 compress_fn(block, output);
                 slots[block_idx].mark_ready();
-                signal.signal_completion(block_idx);
             });
         }
 
-        // Stream output in order using hybrid spin/condvar wait
-        for slot in slots.iter() {
-            wait_for_slot_ready(slot, &signal);
-            writer.write_all(slot.data())?;
-        }
+        let w = writer_handle.join().unwrap();
 
-        Ok(())
+        if write_error.load(Ordering::Relaxed) {
+            Err(io::Error::other("write failed"))
+        } else {
+            Ok(w)
+        }
     })
 }
 

@@ -115,7 +115,7 @@ impl ParallelGzEncoder {
     }
 
     /// Compress data in parallel and write to output
-    pub fn compress<R: Read, W: Write>(&self, mut reader: R, mut writer: W) -> io::Result<u64> {
+    pub fn compress<R: Read, W: Write + Send>(&self, mut reader: R, writer: W) -> io::Result<u64> {
         // Read all input data
         let mut input_data = Vec::new();
         let bytes_read = reader.read_to_end(&mut input_data)? as u64;
@@ -123,7 +123,7 @@ impl ParallelGzEncoder {
         if input_data.is_empty() {
             // Write empty gzip file
             let encoder = GzEncoder::new(
-                &mut writer,
+                writer,
                 Compression::new(adjust_compression_level(self.compression_level)),
             );
             encoder.finish()?;
@@ -136,7 +136,7 @@ impl ParallelGzEncoder {
         // For small files or single thread, use simple streaming compression
         if input_data.len() <= block_size || self.num_threads == 1 {
             let mut encoder = GzEncoder::new(
-                &mut writer,
+                writer,
                 Compression::new(adjust_compression_level(self.compression_level)),
             );
             encoder.write_all(&input_data)?;
@@ -145,7 +145,7 @@ impl ParallelGzEncoder {
         }
 
         // Large file with multiple threads: compress blocks in parallel
-        self.compress_parallel(&input_data, block_size, &mut writer)?;
+        let _ = self.compress_parallel(&input_data, block_size, writer)?;
 
         Ok(bytes_read)
     }
@@ -156,7 +156,7 @@ impl ParallelGzEncoder {
     }
 
     /// Compress a file using memory-mapped I/O for zero-copy access
-    pub fn compress_file<P: AsRef<Path>, W: Write>(
+    pub fn compress_file<P: AsRef<Path>, W: Write + Send>(
         &self,
         path: P,
         mut writer: W,
@@ -190,21 +190,21 @@ impl ParallelGzEncoder {
         }
 
         // Large file with multiple threads: compress blocks in parallel
-        self.compress_parallel(&mmap, block_size, &mut writer)?;
+        let _ = self.compress_parallel(&mmap, block_size, writer)?;
 
         Ok(file_len as u64)
     }
 
     /// Parallel compression using custom scheduler with streaming output
-    fn compress_parallel<W: Write>(
+    fn compress_parallel<W: Write + Send>(
         &self,
         data: &[u8],
         block_size: usize,
-        writer: &mut W,
-    ) -> io::Result<()> {
+        writer: W,
+    ) -> io::Result<W> {
         let compression_level = self.compression_level;
 
-        // Use custom scheduler - no rayon overhead, streaming output
+        // Use custom scheduler - dedicated writer thread for max parallelism
         compress_parallel_independent(
             data,
             block_size,

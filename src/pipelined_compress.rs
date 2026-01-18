@@ -76,7 +76,7 @@ impl PipelinedGzEncoder {
     }
 
     /// Compress data with dictionary sharing
-    pub fn compress<R: Read, W: Write>(&self, mut reader: R, writer: W) -> io::Result<u64> {
+    pub fn compress<R: Read, W: Write + Send>(&self, mut reader: R, writer: W) -> io::Result<u64> {
         // Read all input data
         let mut input_data = Vec::new();
         let bytes_read = reader.read_to_end(&mut input_data)? as u64;
@@ -97,7 +97,11 @@ impl PipelinedGzEncoder {
     }
 
     /// Compress file using memory-mapped I/O with dictionary sharing
-    pub fn compress_file<P: AsRef<Path>, W: Write>(&self, path: P, writer: W) -> io::Result<u64> {
+    pub fn compress_file<P: AsRef<Path>, W: Write + Send>(
+        &self,
+        path: P,
+        writer: W,
+    ) -> io::Result<u64> {
         use memmap2::Mmap;
         use std::fs::File;
 
@@ -137,13 +141,17 @@ impl PipelinedGzEncoder {
     /// - Zero work-stealing overhead (uniform block sizes)
     /// - Streaming output (no bulk collection)
     /// - Pre-allocated buffers (no allocation in hot path)
-    fn compress_parallel_pipeline<W: Write>(&self, data: &[u8], mut writer: W) -> io::Result<()> {
+    fn compress_parallel_pipeline<W: Write + Send>(
+        &self,
+        data: &[u8],
+        mut writer: W,
+    ) -> io::Result<()> {
         let level = adjust_compression_level(self.compression_level);
         let data_len = data.len();
         let block_size = pipelined_block_size(data_len, self.num_threads, level);
         let num_blocks = data_len.div_ceil(block_size);
 
-        // Write gzip header
+        // Write gzip header before spawning threads
         let header = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
         writer.write_all(&header)?;
 
@@ -153,12 +161,12 @@ impl PipelinedGzEncoder {
             .map(|_| CrcSlot(UnsafeCell::new(MaybeUninit::uninit())))
             .collect();
 
-        // Compress all blocks using custom scheduler
-        compress_parallel(
+        // Compress all blocks using custom scheduler with dedicated writer thread
+        let mut writer = compress_parallel(
             data,
             block_size,
             self.num_threads,
-            &mut writer,
+            writer,
             |block_idx, block, dict, is_last, output| {
                 // Compress this block with dictionary
                 compress_block_with_dict(block, dict, level, block_size, is_last, output);
