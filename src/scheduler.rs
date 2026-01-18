@@ -211,8 +211,10 @@ where
 
     // Use scoped threads - no Arc needed, everything is borrowed
     thread::scope(|scope| {
-        // Spawn worker threads
-        for _ in 0..num_threads {
+        // Spawn N-1 worker threads; main thread will also help compress
+        // This avoids over-subscription on limited vCPU systems
+        let spawn_workers = num_threads.saturating_sub(1);
+        for _ in 0..spawn_workers {
             scope.spawn(|| {
                 worker_loop(
                     input,
@@ -225,15 +227,44 @@ where
             });
         }
 
-        // Main thread: stream output in order
-        // This runs concurrently with workers, writing as soon as each block is ready
-        for i in 0..num_blocks {
-            // Spin-wait until block i is ready
-            // Use spin_loop hint for better CPU efficiency
-            wait_for_ready(&slots[i]);
+        // Main thread: alternate between compressing blocks and writing
+        // This keeps main thread busy instead of just spinning
+        let mut next_write = 0;
+        loop {
+            // Check if we can write any blocks
+            while next_write < num_blocks && slots[next_write].is_ready() {
+                writer.write_all(slots[next_write].data())?;
+                next_write += 1;
+            }
 
-            // Write immediately - no buffering or collection
-            writer.write_all(slots[i].data())?;
+            if next_write >= num_blocks {
+                break; // All blocks written
+            }
+
+            // Try to claim and compress a block
+            let block_idx = next_block.fetch_add(1, Ordering::Relaxed);
+            if block_idx < num_blocks {
+                // Compress this block
+                let start = block_idx * block_size;
+                let end = (start + block_size).min(input.len());
+                let block = &input[start..end];
+                let dict = if block_idx > 0 {
+                    let dict_end = start;
+                    let dict_start = dict_end.saturating_sub(32768);
+                    Some(&input[dict_start..dict_end])
+                } else {
+                    None
+                };
+                let is_last = block_idx == num_blocks - 1;
+                let output = unsafe { slots[block_idx].data_mut() };
+                compress_fn(block_idx, block, dict, is_last, output);
+                slots[block_idx].mark_ready();
+            } else {
+                // No more blocks to compress, just wait for remaining writes
+                if next_write < num_blocks {
+                    wait_for_ready(&slots[next_write]);
+                }
+            }
         }
 
         Ok(())
