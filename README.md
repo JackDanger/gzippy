@@ -85,6 +85,18 @@ L7-L9: Input → [Block₁] → [Block₂] → [Block₃] → zlib-ng → Output
                Dictionary chain (sequential decompress)
 ```
 
+## Not a bgzip Replacement
+
+gzippy uses BGZF-*style* concatenated gzip members with embedded block sizes, but it is **not compatible with bgzip** (from htslib/samtools):
+
+- **Different subfield ID**: gzippy uses "GZ", bgzip uses "BC"
+- **Different block sizes**: gzippy uses up to 128KB blocks, bgzip uses 64KB max
+- **No BAM/tabix integration**: gzippy doesn't produce index-compatible output
+
+Use bgzip for bioinformatics workflows that require indexed random access (BAM, VCF, etc.). Use gzippy for general-purpose fast parallel compression.
+
+Both produce valid gzip output that any gzip tool can decompress.
+
 ## License
 
 [zlib license](LICENSE) (same as zlib and pigz).
