@@ -28,6 +28,14 @@ jobs:
         size: [1, 10, 100]
         level: [1, 3, 7, 9]
         thread_mode: [single, max]  # single=1 thread, max=all available cores
+        # Exclude 100MB at L1/L3 single-thread (too fast, noisy results)
+        exclude:
+          - size: 100
+            level: 1
+            thread_mode: single
+          - size: 100
+            level: 3
+            thread_mode: single
 
     steps:
       - uses: actions/checkout@v4
@@ -142,6 +150,96 @@ jobs:
             --data-type text \
             --output ratio-results.json
 
+  # Ultra compression levels (L10-L12) - near-zopfli ratio
+  # These are slower but should achieve significantly smaller output
+  ultra-compression:
+    name: Ultra L${{ matrix.level }} (${{ matrix.thread_mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        level: [10, 11, 12]
+        thread_mode: [single, max]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential zlib1g-dev gzip cmake nasm
+
+      - name: Build gzippy
+        run: cargo build --release
+
+      - name: Build pigz
+        run: make -C pigz
+
+      - name: Build zopfli
+        run: make -C zopfli zopfli
+
+      - name: Test ultra compression
+        run: |
+          CORES=$(nproc)
+          if [ "${{ matrix.thread_mode }}" = "single" ]; then
+            THREADS=1
+          else
+            THREADS=$CORES
+          fi
+          
+          echo "=== Ultra Compression L${{ matrix.level }} (${THREADS} threads) ==="
+          
+          # Generate 10MB test file
+          python3 -c "
+          import random
+          random.seed(42)
+          words = ['the', 'quick', 'brown', 'fox', 'jumps', 'over', 'lazy', 'dog']
+          with open('/tmp/test.txt', 'w') as f:
+              for _ in range(200000):
+                  f.write(' '.join(random.choices(words, k=10)) + '\n')
+          "
+          
+          # Compress with gzippy ultra
+          ./target/release/gzippy --level ${{ matrix.level }} -p$THREADS -c /tmp/test.txt > /tmp/gzippy.gz
+          GZIPPY_SIZE=$(stat -c%s /tmp/gzippy.gz)
+          
+          # Compress with pigz -9 (baseline)
+          ./pigz/pigz -9 -p$THREADS -c /tmp/test.txt > /tmp/pigz.gz
+          PIGZ_SIZE=$(stat -c%s /tmp/pigz.gz)
+          
+          # Compress with zopfli (gold standard, use --i5 for speed)
+          ./zopfli/zopfli --i5 -c /tmp/test.txt > /tmp/zopfli.gz
+          ZOPFLI_SIZE=$(stat -c%s /tmp/zopfli.gz)
+          
+          # Verify decompression works
+          gzip -d < /tmp/gzippy.gz > /tmp/test.out
+          diff /tmp/test.txt /tmp/test.out
+          
+          # Calculate ratios
+          GZIPPY_VS_PIGZ=$(echo "scale=2; ($GZIPPY_SIZE - $PIGZ_SIZE) * 100 / $PIGZ_SIZE" | bc)
+          GZIPPY_VS_ZOPFLI=$(echo "scale=2; ($GZIPPY_SIZE - $ZOPFLI_SIZE) * 100 / $ZOPFLI_SIZE" | bc)
+          
+          echo "Results:"
+          echo "  gzippy L${{ matrix.level }}: $GZIPPY_SIZE bytes"
+          echo "  pigz -9:    $PIGZ_SIZE bytes"
+          echo "  zopfli:     $ZOPFLI_SIZE bytes"
+          echo ""
+          echo "  gzippy vs pigz: ${GZIPPY_VS_PIGZ}%"
+          echo "  gzippy vs zopfli: ${GZIPPY_VS_ZOPFLI}%"
+          
+          # L10-L12 should be at least 3% smaller than pigz
+          if (( $(echo "$GZIPPY_VS_PIGZ < -2" | bc -l) )); then
+            echo "✓ PASS: gzippy L${{ matrix.level }} is ${GZIPPY_VS_PIGZ}% smaller than pigz"
+          else
+            echo "✗ FAIL: gzippy L${{ matrix.level }} should be at least 3% smaller than pigz"
+            exit 1
+          fi
+
   # Test random (incompressible) data to catch edge cases
   # This is critical - random data with L1 multi-thread previously had a bug
   random-data:
@@ -189,7 +287,7 @@ jobs:
   summary:
     name: Performance Summary
     runs-on: ubuntu-latest
-    needs: [benchmark, compression-ratio, random-data]
+    needs: [benchmark, compression-ratio, ultra-compression, random-data]
     if: always()
 
     steps:

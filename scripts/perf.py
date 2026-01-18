@@ -114,10 +114,13 @@ def benchmark_compress(tool: str, level: int, threads: int,
     """Benchmark compression. Returns (median_time, stdev, output_size)."""
     bin_path = {"gzip": GZIP, "pigz": PIGZ, "igzip": IGZIP, "zopfli": ZOPFLI, "gzippy": GZIPPY}[tool]
     
+    # For L10-L12 benchmarks, compare other tools at their max level (9)
+    effective_level = level if tool == "gzippy" else min(level, 9)
+    
     # Handle tool-specific command line syntax
     if tool == "igzip":
         # Map gzip levels 1-9 to igzip levels 0-3
-        igzip_level = min(3, max(0, (level - 1) // 3))
+        igzip_level = min(3, max(0, (effective_level - 1) // 3))
         cmd = [bin_path, f"-{igzip_level}"]
         if threads > 1:
             cmd.append(f"-T{threads}")
@@ -125,8 +128,11 @@ def benchmark_compress(tool: str, level: int, threads: int,
     elif tool == "zopfli":
         # zopfli uses iterations, not levels. Use 5 iterations for speed.
         cmd = [bin_path, "--i5", "-c", input_file]
+    elif tool == "gzippy" and level >= 10:
+        # Ultra compression levels need --level flag
+        cmd = [bin_path, "--level", str(level), f"-p{threads}", "-c", input_file]
     else:
-        cmd = [bin_path, f"-{level}"]
+        cmd = [bin_path, f"-{effective_level}"]
         if tool in ("pigz", "gzippy"):
             cmd.append(f"-p{threads}")
         cmd.extend(["-c", input_file])
