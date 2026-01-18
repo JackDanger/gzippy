@@ -21,6 +21,8 @@
 //! - pugz paper: https://arxiv.org/abs/1905.07224
 //! - rapidgzip paper: https://arxiv.org/abs/2308.08955
 
+#![allow(dead_code)]
+
 use std::io::{self, Write};
 
 /// Minimum chunk size for parallel processing (256KB)

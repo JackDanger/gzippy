@@ -200,26 +200,16 @@ fn decompress_gzip_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> GzippyRe
         return decompress_single_member_libdeflate(data, writer);
     }
 
-    // For large files, try speculative parallel decompression
-    // This uses the rapidgzip-style algorithm for non-BGZF files
-    let num_threads = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4);
-
-    // Only use speculative decompression for files large enough to benefit
-    // Threshold: at least 1MB and at least 256KB per thread
-    const SPECULATIVE_THRESHOLD: usize = 1024 * 1024;
-    if data.len() >= SPECULATIVE_THRESHOLD && num_threads > 1 {
-        if let Ok(bytes) =
-            crate::speculative_decompress::decompress_speculative(data, writer, num_threads)
-        {
-            return Ok(bytes);
+    // Use the optimized hybrid decompressor for non-BGZF files
+    // This handles multi-member files in parallel and uses fast sequential for single-member
+    let hybrid = crate::indexed_decompress::HybridDecompressor::new();
+    match hybrid.decompress(data, writer) {
+        Ok(bytes) => Ok(bytes),
+        Err(_) => {
+            // Fallback to flate2 sequential
+            decompress_multi_member_zlibng(data, writer)
         }
-        // If speculative failed, fall through to sequential
     }
-
-    // Multi-member file without markers: use zlib-ng sequential
-    decompress_multi_member_zlibng(data, writer)
 }
 
 /// Check if data has BGZF-style "GZ" markers in the first gzip header
