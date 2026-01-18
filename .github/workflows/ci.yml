@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# Minimal permissions for security (validate job overrides for PR comments)
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -154,6 +158,77 @@ jobs:
                 body: body
               });
             }
+
+  edge-cases:
+    name: Edge Cases
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build rigz
+        run: cargo build --release
+
+      - name: Test empty file
+        run: |
+          touch /tmp/empty.txt
+          cat /tmp/empty.txt | ./target/release/rigz > /tmp/empty.txt.gz
+          cat /tmp/empty.txt.gz | ./target/release/rigz -d > /tmp/empty.out
+          diff /tmp/empty.txt /tmp/empty.out
+          echo "✓ Empty file works"
+
+      - name: Test small file (100 bytes)
+        run: |
+          head -c 100 /dev/urandom > /tmp/small.bin
+          cat /tmp/small.bin | ./target/release/rigz > /tmp/small.bin.gz
+          cat /tmp/small.bin.gz | ./target/release/rigz -d > /tmp/small.out
+          diff /tmp/small.bin /tmp/small.out
+          echo "✓ Small file works"
+
+      - name: Test stdin streaming
+        run: |
+          head -c 1000000 /dev/urandom > /tmp/stdin_test.bin
+          cat /tmp/stdin_test.bin | ./target/release/rigz | ./target/release/rigz -d > /tmp/stdin_test.out
+          diff /tmp/stdin_test.bin /tmp/stdin_test.out
+          echo "✓ Stdin streaming works"
+
+      - name: Test all compression levels
+        run: |
+          head -c 100000 /dev/urandom > /tmp/levels_test.bin
+          for level in 1 2 3 4 5 6 7 8 9; do
+            cat /tmp/levels_test.bin | ./target/release/rigz -$level > /tmp/levels_test.gz
+            cat /tmp/levels_test.gz | ./target/release/rigz -d > /tmp/levels_test.out
+            diff /tmp/levels_test.bin /tmp/levels_test.out
+            echo "✓ Level $level works"
+          done
+
+      - name: Test thread counts
+        run: |
+          head -c 1000000 /dev/urandom > /tmp/threads_test.bin
+          for threads in 1 2 4 8; do
+            cat /tmp/threads_test.bin | ./target/release/rigz -9 -p$threads > /tmp/threads_test.gz
+            cat /tmp/threads_test.gz | ./target/release/rigz -d > /tmp/threads_test.out
+            diff /tmp/threads_test.bin /tmp/threads_test.out
+            echo "✓ $threads threads works"
+          done
+
+      - name: Test gzip/gunzip compatibility
+        run: |
+          head -c 100000 /dev/urandom > /tmp/compat_test.bin
+          # rigz compress → gzip decompress
+          cat /tmp/compat_test.bin | ./target/release/rigz | gzip -d > /tmp/compat_test.out
+          diff /tmp/compat_test.bin /tmp/compat_test.out
+          echo "✓ rigz→gzip works"
+          # gzip compress → rigz decompress
+          gzip -c /tmp/compat_test.bin | ./target/release/rigz -d > /tmp/compat_test.out2
+          diff /tmp/compat_test.bin /tmp/compat_test.out2
+          echo "✓ gzip→rigz works"
 
   lint:
     name: Lint
