@@ -26,6 +26,9 @@ use std::sync::OnceLock;
 // Thread-local output buffer to avoid per-block allocation
 thread_local! {
     static PIPELINED_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(512 * 1024));
+    // Thread-local Compress object to avoid reinitializing zlib state (~300KB) per block
+    // Note: We store Option<(level, Compress)> to cache by level
+    static PIPELINED_COMPRESS: RefCell<Option<(u32, Compress)>> = RefCell::new(None);
 }
 
 /// Block size for pipelined compression
@@ -36,7 +39,7 @@ const BLOCK_SIZE_DEFAULT: usize = 128 * 1024;
 const DICT_SIZE: usize = 32 * 1024;
 
 /// Get optimal block size for pipelined compression
-/// 
+///
 /// For L9, we dynamically size blocks based on file size:
 /// - Small files (<10MB): 64KB blocks for more parallelism
 /// - Medium files (10-50MB): 128KB blocks
@@ -48,7 +51,7 @@ fn get_block_size_for_file(level: u32, file_size: usize) -> usize {
     if level >= 9 {
         // Dynamic sizing for L9 based on file size
         if file_size < 10 * 1024 * 1024 {
-            64 * 1024  // 64KB for small files - more parallelism
+            64 * 1024 // 64KB for small files - more parallelism
         } else if file_size < 50 * 1024 * 1024 {
             128 * 1024 // 128KB for medium files
         } else {
@@ -295,8 +298,8 @@ impl PipelinedGzEncoder {
 
 /// Compress a single block with optional dictionary
 ///
-/// Uses thread-local buffer to avoid per-block allocation.
-/// The buffer is reused across blocks within the same thread.
+/// Uses thread-local buffer AND Compress object to avoid per-block allocation.
+/// The buffer and compressor are reused across blocks within the same thread.
 fn compress_block_with_dict(
     block: &[u8],
     dict: Option<&[u8]>,
@@ -305,61 +308,75 @@ fn compress_block_with_dict(
     block_size: usize,
 ) -> Vec<u8> {
     PIPELINED_BUF.with(|buf_cell| {
-        let mut output = buf_cell.borrow_mut();
-        output.clear();
+        PIPELINED_COMPRESS.with(|comp_cell| {
+            let mut output = buf_cell.borrow_mut();
+            let mut comp_opt = comp_cell.borrow_mut();
+            
+            output.clear();
 
-        // Ensure buffer is large enough (block_size + 10% + 1KB for headers)
-        let initial_capacity = block_size + (block_size / 10) + 1024;
-        let current_capacity = output.capacity();
-        if current_capacity < initial_capacity {
-            output.reserve(initial_capacity - current_capacity);
-        }
-        output.resize(initial_capacity, 0);
-
-        let mut compress = Compress::new(Compression::new(level), false);
-
-        // Set dictionary if provided
-        if let Some(d) = dict {
-            let _ = compress.set_dictionary(d);
-        }
-
-        let flush = if is_last {
-            FlushCompress::Finish
-        } else {
-            FlushCompress::Sync
-        };
-
-        let mut total_out = 0;
-        let mut input = block;
-
-        loop {
-            let before_in = compress.total_in();
-            let before_out = compress.total_out();
-
-            let status = compress
-                .compress(input, &mut output[total_out..], flush)
-                .expect("compression failed");
-
-            let consumed = (compress.total_in() - before_in) as usize;
-            let produced = (compress.total_out() - before_out) as usize;
-
-            total_out += produced;
-            input = &input[consumed..];
-
-            match status {
-                Status::Ok if input.is_empty() && flush != FlushCompress::Finish => break,
-                Status::BufError => {
-                    // Need more output space (rare case for incompressible data)
-                    let new_len = output.len() * 2;
-                    output.resize(new_len, 0);
-                }
-                Status::StreamEnd => break,
-                _ => {}
+            // Ensure buffer is large enough (block_size + 10% + 1KB for headers)
+            let initial_capacity = block_size + (block_size / 10) + 1024;
+            let current_capacity = output.capacity();
+            if current_capacity < initial_capacity {
+                output.reserve(initial_capacity - current_capacity);
             }
-        }
+            output.resize(initial_capacity, 0);
 
-        // Return a copy; the buffer stays allocated for the next block
-        output[..total_out].to_vec()
+            // Get or create Compress at the right level
+            let compress = match comp_opt.as_mut() {
+                Some((cached_level, comp)) if *cached_level == level => {
+                    comp.reset();
+                    comp
+                }
+                _ => {
+                    *comp_opt = Some((level, Compress::new(Compression::new(level), false)));
+                    &mut comp_opt.as_mut().unwrap().1
+                }
+            };
+
+            // Set dictionary if provided
+            if let Some(d) = dict {
+                let _ = compress.set_dictionary(d);
+            }
+
+            let flush = if is_last {
+                FlushCompress::Finish
+            } else {
+                FlushCompress::Sync
+            };
+
+            let mut total_out = 0;
+            let mut input = block;
+
+            loop {
+                let before_in = compress.total_in();
+                let before_out = compress.total_out();
+
+                let status = compress
+                    .compress(input, &mut output[total_out..], flush)
+                    .expect("compression failed");
+
+                let consumed = (compress.total_in() - before_in) as usize;
+                let produced = (compress.total_out() - before_out) as usize;
+
+                total_out += produced;
+                input = &input[consumed..];
+
+                match status {
+                    Status::Ok if input.is_empty() && flush != FlushCompress::Finish => break,
+                    Status::BufError => {
+                        // Need more output space (rare case for incompressible data)
+                        let new_len = output.len() * 2;
+                        output.resize(new_len, 0);
+                    }
+                    Status::StreamEnd => break,
+                    _ => {}
+                }
+            }
+
+            // Return a copy; the buffer stays allocated for the next block
+            output[..total_out].to_vec()
+        })
     })
 }
 
