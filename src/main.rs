@@ -10,7 +10,6 @@ use std::process;
 mod cli;
 mod compression;
 mod decompression;
-mod deflate_fix;
 mod error;
 mod format;
 mod libdeflate_ext;
