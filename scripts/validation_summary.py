@@ -45,6 +45,16 @@ def detect_format(results):
         raise ValueError("Unknown JSON format")
 
 
+def get_thresholds(level: int) -> tuple:
+    """Returns (max_time_overhead_pct, max_size_overhead_pct) matching benchmark_ci.py."""
+    if level >= 9:
+        return (5.0, 0.5)
+    elif level >= 7:
+        return (5.0, 2.0)
+    else:
+        return (2.0, 8.0)
+
+
 def generate_summary_from_ci(results, format_type="markdown"):
     """Generate summary from validate_ci.py output."""
     lines = []
@@ -87,8 +97,8 @@ def generate_summary_from_ci(results, format_type="markdown"):
         lines.append(f"*Results on {primary_type} data ({test_size})*")
         lines.append("")
     
-    lines.append("| Config | gzip | pigz | rigz | Speedup |")
-    lines.append("|--------|------|------|------|---------|")
+    lines.append("| Config | rigz Time | vs gzip | vs pigz | Ratio | Size vs pigz |")
+    lines.append("|--------|-----------|---------|---------|-------|--------------|")
     
     # Group all compression stats by config
     all_comp_by_config = defaultdict(lambda: defaultdict(dict))
@@ -103,32 +113,70 @@ def generate_summary_from_ci(results, format_type="markdown"):
     
     for (level, threads), tools in sorted(comp_by_config.items()):
         config = f"L{level}, {threads}t"
+        max_time_overhead, max_size_overhead = get_thresholds(level)
         
         gzip_time = tools.get("gzip", {}).get("median_time", 0)
         pigz_time = tools.get("pigz", {}).get("median_time", 0)
         rigz_time = tools.get("rigz", {}).get("median_time", 0)
         
-        gzip_str = format_time(gzip_time) if gzip_time else "—"
-        pigz_str = format_time(pigz_time) if pigz_time else "—"
+        rigz_size = tools.get("rigz", {}).get("output_size", 0)
+        pigz_size = tools.get("pigz", {}).get("output_size", 0)
+        rigz_input = tools.get("rigz", {}).get("input_size", 0)
+        
         rigz_str = format_time(rigz_time) if rigz_time else "—"
         
+        # vs gzip speedup
         if rigz_time and gzip_time:
-            speedup = gzip_time / rigz_time
-            speedup_str = f"**{speedup:.1f}×** vs gzip"
-            best_gzip_speedup = max(best_gzip_speedup, speedup)
+            gzip_speedup = gzip_time / rigz_time
+            gzip_speedup_str = f"**{gzip_speedup:.1f}×**"
+            best_gzip_speedup = max(best_gzip_speedup, gzip_speedup)
+            # Italicize if we're slower than gzip
+            if gzip_speedup < 1.0:
+                gzip_speedup_str = f"*{gzip_speedup:.2f}×*"
         else:
-            speedup_str = "—"
+            gzip_speedup_str = "—"
         
+        # vs pigz speedup
         if rigz_time and pigz_time:
             pigz_speedup = pigz_time / rigz_time
+            pigz_overhead = (rigz_time / pigz_time - 1) * 100
             best_pigz_speedup = max(best_pigz_speedup, pigz_speedup)
+            # Italicize if we fail to beat threshold
+            if pigz_overhead > max_time_overhead:
+                pigz_speedup_str = f"*{pigz_speedup:.2f}×*"
+            else:
+                pigz_speedup_str = f"**{pigz_speedup:.1f}×**"
+        else:
+            pigz_speedup_str = "—"
+        
+        # Compression ratio
+        if rigz_size and rigz_input:
+            ratio = rigz_size / rigz_input * 100
+            ratio_str = f"{ratio:.1f}%"
+        else:
+            ratio_str = "—"
+        
+        # Size vs pigz
+        if rigz_size and pigz_size:
+            size_diff = (rigz_size / pigz_size - 1) * 100
+            if size_diff > max_size_overhead:
+                # Italicize if we fail threshold
+                size_str = f"*{size_diff:+.1f}%*"
+            elif size_diff < 0:
+                size_str = f"**{size_diff:+.1f}%**"
+            else:
+                size_str = f"{size_diff:+.1f}%"
+        else:
+            size_str = "—"
         
         if rigz_time and size_mb:
             throughput = size_mb / rigz_time
             best_throughput = max(best_throughput, throughput)
         
-        lines.append(f"| {config} | {gzip_str} | {pigz_str} | {rigz_str} | {speedup_str} |")
+        lines.append(f"| {config} | {rigz_str} | {gzip_speedup_str} | {pigz_speedup_str} | {ratio_str} | {size_str} |")
     
+    lines.append("")
+    lines.append("*Italics indicate failing to beat threshold*")
     lines.append("")
     
     # Decompression summary
@@ -210,8 +258,8 @@ def generate_summary_from_validate(results, format_type="markdown"):
     # Compression performance table
     lines.append("### Compression Performance")
     lines.append("")
-    lines.append("| Config | gzip | pigz | rigz | Speedup |")
-    lines.append("|--------|------|------|------|---------|")
+    lines.append("| Config | rigz Time | vs gzip | vs pigz | Ratio | Size vs pigz |")
+    lines.append("|--------|-----------|---------|---------|-------|--------------|")
     
     # Group compression by config
     comp_by_config = defaultdict(dict)
@@ -221,38 +269,74 @@ def generate_summary_from_validate(results, format_type="markdown"):
             comp_by_config[key][r["tool"]] = r
     
     test_size_mb = results.get("test_size_bytes", 0) / (1024 * 1024)
+    test_size_bytes = results.get("test_size_bytes", 0)
     best_gzip_speedup = 0
     best_pigz_speedup = 0
     best_throughput = 0
     
     for (level, threads), tools in sorted(comp_by_config.items()):
         config = f"L{level}, {threads}t"
+        max_time_overhead, max_size_overhead = get_thresholds(level)
         
         gzip_time = tools.get("gzip", {}).get("median_seconds", 0)
         pigz_time = tools.get("pigz", {}).get("median_seconds", 0)
         rigz_time = tools.get("rigz", {}).get("median_seconds", 0)
         
-        gzip_str = format_time(gzip_time) if gzip_time else "—"
-        pigz_str = format_time(pigz_time) if pigz_time else "—"
+        rigz_size = tools.get("rigz", {}).get("output_size", 0)
+        pigz_size = tools.get("pigz", {}).get("output_size", 0)
+        
         rigz_str = format_time(rigz_time) if rigz_time else "—"
         
+        # vs gzip speedup
         if rigz_time and gzip_time:
-            speedup = gzip_time / rigz_time
-            speedup_str = f"**{speedup:.1f}×** vs gzip"
-            best_gzip_speedup = max(best_gzip_speedup, speedup)
+            gzip_speedup = gzip_time / rigz_time
+            best_gzip_speedup = max(best_gzip_speedup, gzip_speedup)
+            if gzip_speedup < 1.0:
+                gzip_speedup_str = f"*{gzip_speedup:.2f}×*"
+            else:
+                gzip_speedup_str = f"**{gzip_speedup:.1f}×**"
         else:
-            speedup_str = "—"
+            gzip_speedup_str = "—"
         
+        # vs pigz speedup
         if rigz_time and pigz_time:
             pigz_speedup = pigz_time / rigz_time
+            pigz_overhead = (rigz_time / pigz_time - 1) * 100
             best_pigz_speedup = max(best_pigz_speedup, pigz_speedup)
+            if pigz_overhead > max_time_overhead:
+                pigz_speedup_str = f"*{pigz_speedup:.2f}×*"
+            else:
+                pigz_speedup_str = f"**{pigz_speedup:.1f}×**"
+        else:
+            pigz_speedup_str = "—"
+        
+        # Compression ratio
+        if rigz_size and test_size_bytes:
+            ratio = rigz_size / test_size_bytes * 100
+            ratio_str = f"{ratio:.1f}%"
+        else:
+            ratio_str = "—"
+        
+        # Size vs pigz
+        if rigz_size and pigz_size:
+            size_diff = (rigz_size / pigz_size - 1) * 100
+            if size_diff > max_size_overhead:
+                size_str = f"*{size_diff:+.1f}%*"
+            elif size_diff < 0:
+                size_str = f"**{size_diff:+.1f}%**"
+            else:
+                size_str = f"{size_diff:+.1f}%"
+        else:
+            size_str = "—"
         
         if rigz_time and test_size_mb:
             throughput = test_size_mb / rigz_time
             best_throughput = max(best_throughput, throughput)
         
-        lines.append(f"| {config} | {gzip_str} | {pigz_str} | {rigz_str} | {speedup_str} |")
+        lines.append(f"| {config} | {rigz_str} | {gzip_speedup_str} | {pigz_speedup_str} | {ratio_str} | {size_str} |")
     
+    lines.append("")
+    lines.append("*Italics indicate failing to beat threshold*")
     lines.append("")
     
     # Decompression summary
