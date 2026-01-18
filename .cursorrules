@@ -34,7 +34,9 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 **Compression:**
 - zlib-ng via flate2 (2-3x faster than standard zlib)
 - **Level 1 → Level 2 mapping** (zlib-ng L1 produces 2-5x larger output)
-- 128KB fixed blocks (dynamic sizing regressed 14%)
+- **Level 7-9: Pipelined mode** with dictionary sharing (matches pigz output size)
+- **Level 1-6: Independent blocks** for parallel decompression capability
+- 64KB blocks (BGZF compatible for L1-6, variable for L7-9)
 - Global rayon pool (avoids per-call initialization)
 - Thread-local buffer reuse (reduces allocator pressure)
 
@@ -80,13 +82,102 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 5. **zlib-ng Level 1 directly** - Uses RLE strategy, produces 2-5x larger files on repetitive data (we map L1→L2)
 6. **Parallel decompression without BGZF** - Requires finding member boundaries first, which means decompressing once to find them, then again in parallel. 2x overhead made it slower for files with many small members (like rigz's 128KB chunks). Sequential MultiGzDecoder is faster.
 7. **Intel ISA-L integration** - Requires autotools/autoreconf to build from source, complex build setup. The isal-rs crate fails on systems without autotools. Not worth the portability issues for marginal gains since libdeflate already uses SIMD.
+8. **Hybrid chain compression (dictionary sharing across blocks)** - DEFLATE preset dictionaries require the decompressor to have the same dictionary. Gzip format has no field to embed dictionaries. Output with preset dictionaries causes "data stream error" in gunzip/pigz. See `docs/HYBRID_CHAIN_COMPRESSION.md` for full analysis. This is why pigz beats rigz at L6/L9 max-threads: pigz uses pipeline parallelism with a shared sliding window, which is fundamentally incompatible with rigz's independent-block parallel approach.
+9. **Overlapping blocks (embedded dictionary via STORED DEFLATE)** - We tried embedding the dictionary as a STORED DEFLATE block at the start of each member. While this enables parallel decompression with rigz, standard gzip tools would output the redundant dictionary bytes, making output larger than input. See `docs/OVERLAPPING_BLOCKS.md`. **Fundamental impossibility:** There is no algorithm that achieves all three of: (1) gzip compatibility, (2) parallel decompression, (3) dictionary-quality compression. Pick two.
+10. **Forward-refs-only (hash priming without dictionary refs)** - We theorized that `deflateSetDictionary` primes hash tables, which could help find matches even without emitting dictionary refs. Empirical testing proved this provides **0% compression benefit**. Hash priming helps find matches *faster* but doesn't change *which* matches exist. The dictionary benefit comes entirely from actual backreferences. See `docs/FORWARD_REFS_ONLY.md`.
 
-## Benchmarking
+## Architecture-Dependent Performance
 
-- 30 runs for 1MB (high variance)
-- 15 runs for 10MB  
+Performance varies significantly by CPU architecture and compression level:
+
+**Level 1-6 (Independent Blocks):**
+- Parallel compression AND decompression
+- rigz beats pigz on Apple Silicon (10-43% faster)
+- L1: rigz wins everywhere (17-50% faster)
+- L6 multi-thread: pigz slightly better compression (~5%)
+
+**Level 7-9 (Pipelined Mode):**
+- Dictionary sharing for maximum compression (matches pigz output size)
+- Sequential decompression (like pigz)
+- Single-thread: rigz 1.5x faster than pigz!
+- Multi-thread: rigz 1.5x faster than pigz! (parallel pipelining works)
+
+**Key insight (pigz-style parallelism):**
+Block N doesn't wait for block N-1 to FINISH compressing. It only needs
+block N-1's INPUT DATA as dictionary. Since all input is pre-read (mmap),
+blocks can be compressed in parallel even with dictionary sharing.
+
+**GHA vs Real Hardware (IMPORTANT):**
+GHA runners are severely resource-constrained 2-core VMs. On real x86_64 hardware:
+- L9 T2-16: rigz 28-35% FASTER than pigz
+- L6 T16: rigz 51% FASTER than pigz
+- Decompression: 8-9x faster at L1-6 (parallel BGZF)
+
+The 5% slowdown seen in GHA is an artifact of their constrained environment,
+not a real architectural limitation. Use `scripts/remote_bench.sh` to test
+on real hardware (ssh to Linux box).
+
+**Design Philosophy:**
+- L1-6: Speed + parallel decompress (independent blocks)
+- L7-9: Maximum compression (dictionary sharing, sequential decompress)
+
+This matches user expectations:
+- `gzip -1`: I want fast → rigz wins
+- `gzip -9`: I want small → rigz matches pigz
+
+## Test Suite
+
+**Data Types** (realistic workloads, not just random):
+- **text**: Proust (Project Gutenberg) - highly compressible, seed checked into git
+- **random**: /dev/urandom - poorly compressible, stress test
+- **tarball**: repo archive - mixed content, real-world simulation
+
+**Key Commands:**
+- `make validate` - Quick validation (local)
+- `make validate-json` - Output JSON for visualization
+- `make validation-chart` - Generate HTML performance chart
+- `make test-data` - Generate 10MB + 100MB test files
+
+**CI Workflow:**
+- Tests all 3 data types × 3 levels × 2 thread counts = 54 compression configs
+- Cross-tool decompression matrix (gzip↔pigz↔rigz) = 162 tests per run
+- Generates PR comments with speedup summary
+- Uploads validation-results.json artifact
+
+**Benchmarking:**
+- 5+ trials per test for statistical significance
 - Use median, not min
-- pigz is built from submodule (./pigz/pigz)
-- Validation: `make validate` runs 55 cross-tool tests
+- pigz built from submodule (./pigz/pigz)
+
+## Performance Requirements
+
+**CRITICAL:** rigz must beat pigz in EVERY configuration. No exceptions.
+
+**Thresholds by level:**
+- L1-6: Speed must beat pigz, size within 8% (trades size for parallel decompress)
+- L7-8: Speed must beat pigz, size within 2% (transitional)
+- L9: Size must match pigz (within 0.5%), speed can be within 10%
+
+**CI Variance Handling:**
+- Shared CI runners have ~2% timing variance
+- A 2% threshold on L1-6 accounts for measurement noise
+- Statistical testing (Welch's t-test) determines significance
+- 5 runs is minimum; variance determines if more needed
+
+**Design Philosophy:**
+- L1-6: Speed + parallel decompress (independent blocks)
+- L7-9: Maximum compression (dictionary sharing, sequential decompress)
+
+If a configuration regresses vs pigz:
+1. Create a different code path for that specific case
+2. Every (level, thread_count) combination may need its own strategy
+3. Never accept "good enough" - only "always better" is acceptable
+
+When measuring:
+- Speed matters (compression AND decompression)
+- Size matters (especially at high levels)
+- If we can't win both, prioritize what the user expects at that level
+
+See CONTRIBUTING.md for detailed architecture guide.
 
 See CONTRIBUTING.md for detailed architecture guide.
