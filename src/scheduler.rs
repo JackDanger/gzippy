@@ -1,55 +1,77 @@
-//! Zero-overhead parallel scheduler
+//! Efficient parallel scheduler with condvar-based synchronization
 //!
-//! A minimal, pigz-inspired scheduler that replaces rayon with:
+//! A pigz-inspired scheduler optimized for GHA's 4-vCPU environment:
 //!
-//! 1. Dedicated worker threads (no work-stealing overhead)
-//! 2. Streaming output (writes blocks as they complete, no bulk collection)
+//! 1. Dedicated worker threads that compress blocks
+//! 2. Main thread writes blocks in order using condvar (no spinning)
 //! 3. Pre-allocated output slots (zero allocation in hot path)
 //! 4. Lock-free work distribution (single atomic counter)
 //!
-//! This is mathematically optimal for regular-sized blocks because:
-//! - Work-stealing adds overhead when tasks are uniform (compression blocks)
-//! - Bulk collection delays output until all work completes
-//! - Dynamic allocation in hot paths causes cache misses
+//! Key difference from spin-wait: workers signal completion via condvar,
+//! main thread sleeps efficiently instead of burning CPU cycles.
 
 use std::cell::UnsafeCell;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
 
-/// A slot for storing a compressed block's output
-///
-/// Memory layout optimized for cache line separation:
-/// - `ready` is checked frequently by main thread (polling)
-/// - `data` is written once by worker, read once by main thread
+/// A slot for storing a compressed block's output with completion signaling
 pub struct BlockSlot {
-    /// Whether this block has been compressed (polled by main thread)
+    /// Whether this block has been compressed
     ready: AtomicBool,
     /// The compressed data for this block
     data: UnsafeCell<Vec<u8>>,
 }
 
-/// Wait for a slot to become ready with adaptive backoff.
-///
-/// Optimized for GHA's 4-vCPU environment where spinning wastes shared resources.
-/// Uses aggressive backoff: few spins → quick yield → short sleep.
-#[inline]
-fn wait_for_ready(slot: &BlockSlot) {
-    let mut spins = 0u32;
-    while !slot.is_ready() {
-        if spins < 32 {
-            // Brief spin for very fast completions
-            std::hint::spin_loop();
-        } else if spins < 64 {
-            // Yield quickly to avoid hogging vCPU
-            thread::yield_now();
-        } else {
-            // Sleep with short duration - GHA vCPUs have high context switch cost
-            thread::sleep(Duration::from_micros(10));
+/// Shared state for signaling block completions
+struct CompletionSignal {
+    /// Mutex for condvar (value is next expected block to complete)
+    lock: Mutex<usize>,
+    /// Condvar for efficient waiting
+    cond: Condvar,
+}
+
+impl CompletionSignal {
+    fn new() -> Self {
+        Self {
+            lock: Mutex::new(0),
+            cond: Condvar::new(),
         }
-        spins += 1;
+    }
+
+    /// Signal that a block has been completed
+    #[inline]
+    fn signal_completion(&self, _block_idx: usize) {
+        // Just notify - the waiter will check the slot
+        self.cond.notify_one();
+    }
+
+    /// Wait for any block completion using condvar
+    #[inline]
+    fn wait_for_completion(&self) {
+        let guard = self.lock.lock().unwrap();
+        // Short timeout to avoid missing signals
+        let _ = self
+            .cond
+            .wait_timeout(guard, std::time::Duration::from_micros(10));
+    }
+}
+
+/// Efficient hybrid wait: brief spin, then condvar
+#[inline]
+fn wait_for_slot_ready(slot: &BlockSlot, signal: &CompletionSignal) {
+    // Brief spin for fast completions (common case)
+    for _ in 0..64 {
+        if slot.is_ready() {
+            return;
+        }
+        std::hint::spin_loop();
+    }
+
+    // Fall back to condvar for efficient waiting
+    while !slot.is_ready() {
+        signal.wait_for_completion();
     }
 }
 
@@ -177,8 +199,8 @@ impl BlockSlot {
 /// This is the core function that replaces rayon. It:
 /// 1. Pre-allocates output slots for each block
 /// 2. Spawns worker threads that claim blocks via atomic counter
-/// 3. Workers compress into their claimed slot, then signal ready
-/// 4. Main thread polls slots in order and writes as they complete
+/// 3. Workers compress into their claimed slot, then signal via condvar
+/// 4. Main thread waits efficiently on condvar and writes as blocks complete
 ///
 /// # Arguments
 /// * `input` - The input data (typically memory-mapped)
@@ -217,67 +239,84 @@ where
     // Atomic counter for lock-free work distribution
     let next_block = AtomicUsize::new(0);
 
+    // Completion signal for efficient waiting
+    let signal = CompletionSignal::new();
+
     // Use scoped threads - no Arc needed, everything is borrowed
     thread::scope(|scope| {
-        // Spawn N-1 worker threads; main thread will also help compress
-        // This avoids over-subscription on limited vCPU systems
-        let spawn_workers = num_threads.saturating_sub(1);
-        for _ in 0..spawn_workers {
+        // Spawn N worker threads - all threads compress, main just writes
+        // This maximizes compression parallelism and CPU utilization
+        for _ in 0..num_threads {
             scope.spawn(|| {
-                worker_loop(
+                worker_loop_with_signal(
                     input,
                     block_size,
                     num_blocks,
                     &slots,
                     &next_block,
                     &compress_fn,
+                    &signal,
                 );
             });
         }
 
-        // Main thread: alternate between compressing blocks and writing
-        // This keeps main thread busy instead of just spinning
-        let mut next_write = 0;
-
-        loop {
-            // Check if we can write any blocks
-            while next_write < num_blocks && slots[next_write].is_ready() {
-                writer.write_all(slots[next_write].data())?;
-                next_write += 1;
-            }
-
-            if next_write >= num_blocks {
-                break; // All blocks written
-            }
-
-            // Try to claim and compress a block
-            let block_idx = next_block.fetch_add(1, Ordering::Relaxed);
-            if block_idx < num_blocks {
-                // Compress this block
-                let start = block_idx * block_size;
-                let end = (start + block_size).min(input.len());
-                let block = &input[start..end];
-                let dict = if block_idx > 0 {
-                    let dict_end = start;
-                    let dict_start = dict_end.saturating_sub(32768);
-                    Some(&input[dict_start..dict_end])
-                } else {
-                    None
-                };
-                let is_last = block_idx == num_blocks - 1;
-                let output = unsafe { slots[block_idx].data_mut() };
-                compress_fn(block_idx, block, dict, is_last, output);
-                slots[block_idx].mark_ready();
-            } else {
-                // No more blocks to compress, just wait for remaining writes
-                if next_write < num_blocks {
-                    wait_for_ready(&slots[next_write]);
-                }
-            }
+        // Main thread: write blocks in order using hybrid spin/condvar wait
+        for next_write in 0..num_blocks {
+            wait_for_slot_ready(&slots[next_write], &signal);
+            writer.write_all(slots[next_write].data())?;
         }
 
         Ok(())
     })
+}
+
+/// Worker loop with completion signaling via condvar
+#[inline]
+fn worker_loop_with_signal<F>(
+    input: &[u8],
+    block_size: usize,
+    num_blocks: usize,
+    slots: &[BlockSlot],
+    next_block: &AtomicUsize,
+    compress_fn: &F,
+    signal: &CompletionSignal,
+) where
+    F: Fn(usize, &[u8], Option<&[u8]>, bool, &mut Vec<u8>),
+{
+    loop {
+        // Claim next block atomically
+        let block_idx = next_block.fetch_add(1, Ordering::Relaxed);
+        if block_idx >= num_blocks {
+            break; // No more work
+        }
+
+        // Calculate block boundaries
+        let start = block_idx * block_size;
+        let end = (start + block_size).min(input.len());
+        let block = &input[start..end];
+
+        // Get dictionary: last 32KB of input before this block
+        let dict = if block_idx > 0 {
+            let dict_end = start;
+            let dict_start = dict_end.saturating_sub(32768);
+            Some(&input[dict_start..dict_end])
+        } else {
+            None
+        };
+
+        let is_last = block_idx == num_blocks - 1;
+
+        // Get output buffer from pre-allocated slot
+        // Safety: Each block_idx is claimed by exactly one worker
+        let output = unsafe { slots[block_idx].data_mut() };
+
+        // Compress into the slot's buffer
+        compress_fn(block_idx, block, dict, is_last, output);
+
+        // Signal completion - main thread can now write this block
+        slots[block_idx].mark_ready();
+        signal.signal_completion(block_idx);
+    }
 }
 
 /// Compress blocks in parallel using a shared thread pool (for small inputs)
@@ -321,64 +360,15 @@ where
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
     }
 
+    // Wait for blocks using simple sleep (pooled path is rarely used)
     for i in 0..num_blocks {
-        wait_for_ready(&slots[i]);
+        while !slots[i].is_ready() {
+            thread::sleep(std::time::Duration::from_micros(100));
+        }
         writer.write_all(slots[i].data())?;
     }
 
     Ok(())
-}
-
-/// Worker thread loop
-///
-/// Claims blocks via atomic counter and compresses them until no work remains.
-#[inline]
-fn worker_loop<F>(
-    input: &[u8],
-    block_size: usize,
-    num_blocks: usize,
-    slots: &[BlockSlot],
-    next_block: &AtomicUsize,
-    compress_fn: &F,
-) where
-    F: Fn(usize, &[u8], Option<&[u8]>, bool, &mut Vec<u8>),
-{
-    loop {
-        // Claim next block atomically
-        let block_idx = next_block.fetch_add(1, Ordering::Relaxed);
-        if block_idx >= num_blocks {
-            break; // No more work
-        }
-
-        // Calculate block boundaries
-        let start = block_idx * block_size;
-        let end = (start + block_size).min(input.len());
-        let block = &input[start..end];
-
-        // Get dictionary: last 32KB of input before this block
-        // This is the key insight from pigz: we need the INPUT of the previous
-        // block as dictionary, not the OUTPUT. Since we have all input upfront,
-        // we can access it directly without waiting for previous blocks.
-        let dict = if block_idx > 0 {
-            let dict_end = start;
-            let dict_start = dict_end.saturating_sub(32768);
-            Some(&input[dict_start..dict_end])
-        } else {
-            None
-        };
-
-        let is_last = block_idx == num_blocks - 1;
-
-        // Get output buffer from pre-allocated slot
-        // Safety: Each block_idx is claimed by exactly one worker
-        let output = unsafe { slots[block_idx].data_mut() };
-
-        // Compress into the slot's buffer
-        compress_fn(block_idx, block, dict, is_last, output);
-
-        // Signal completion - main thread can now write this block
-        slots[block_idx].mark_ready();
-    }
 }
 
 /// Variant for independent blocks (L1-L6) that don't need dictionaries
@@ -406,9 +396,10 @@ where
         .collect();
 
     let next_block = AtomicUsize::new(0);
+    let signal = CompletionSignal::new();
 
     thread::scope(|scope| {
-        // Spawn workers
+        // Spawn workers with condvar signaling
         for _ in 0..num_threads {
             scope.spawn(|| loop {
                 let block_idx = next_block.fetch_add(1, Ordering::Relaxed);
@@ -423,12 +414,13 @@ where
                 let output = unsafe { slots[block_idx].data_mut() };
                 compress_fn(block, output);
                 slots[block_idx].mark_ready();
+                signal.signal_completion(block_idx);
             });
         }
 
-        // Stream output in order
+        // Stream output in order using hybrid spin/condvar wait
         for i in 0..num_blocks {
-            wait_for_ready(&slots[i]);
+            wait_for_slot_ready(&slots[i], &signal);
             writer.write_all(slots[i].data())?;
         }
 
