@@ -57,8 +57,8 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: rigz-${{ matrix.os }}
-          path: target/release/rigz
+          name: gzippy-${{ matrix.os }}
+          path: target/release/gzippy
 
   validate:
     name: Cross-tool Validation
@@ -83,11 +83,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential zlib1g-dev gzip
 
-      - name: Build rigz
+      - name: Build gzippy
         run: cargo build --release
 
-      - name: Create unrigz symlink
-        run: ln -sf rigz target/release/unrigz
+      - name: Create ungzippy symlink
+        run: ln -sf gzippy target/release/ungzippy
 
       - name: Build pigz
         run: make -C pigz
@@ -136,7 +136,7 @@ jobs:
             
             const botComment = comments.find(comment => 
               comment.user.type === 'Bot' && 
-              comment.body.includes('rigz Validation Results')
+              comment.body.includes('gzippy Validation Results')
             );
             
             const body = summary + '\n\n---\n*Updated by CI on ' + new Date().toISOString() + '*';
@@ -172,29 +172,29 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build rigz
+      - name: Build gzippy
         run: cargo build --release
 
       - name: Test empty file
         run: |
           touch /tmp/empty.txt
-          cat /tmp/empty.txt | ./target/release/rigz > /tmp/empty.txt.gz
-          cat /tmp/empty.txt.gz | ./target/release/rigz -d > /tmp/empty.out
+          cat /tmp/empty.txt | ./target/release/gzippy > /tmp/empty.txt.gz
+          cat /tmp/empty.txt.gz | ./target/release/gzippy -d > /tmp/empty.out
           diff /tmp/empty.txt /tmp/empty.out
           echo "✓ Empty file works"
 
       - name: Test small file (100 bytes)
         run: |
           head -c 100 /dev/urandom > /tmp/small.bin
-          cat /tmp/small.bin | ./target/release/rigz > /tmp/small.bin.gz
-          cat /tmp/small.bin.gz | ./target/release/rigz -d > /tmp/small.out
+          cat /tmp/small.bin | ./target/release/gzippy > /tmp/small.bin.gz
+          cat /tmp/small.bin.gz | ./target/release/gzippy -d > /tmp/small.out
           diff /tmp/small.bin /tmp/small.out
           echo "✓ Small file works"
 
       - name: Test stdin streaming
         run: |
           head -c 1000000 /dev/urandom > /tmp/stdin_test.bin
-          cat /tmp/stdin_test.bin | ./target/release/rigz | ./target/release/rigz -d > /tmp/stdin_test.out
+          cat /tmp/stdin_test.bin | ./target/release/gzippy | ./target/release/gzippy -d > /tmp/stdin_test.out
           diff /tmp/stdin_test.bin /tmp/stdin_test.out
           echo "✓ Stdin streaming works"
 
@@ -202,8 +202,8 @@ jobs:
         run: |
           head -c 100000 /dev/urandom > /tmp/levels_test.bin
           for level in 1 2 3 4 5 6 7 8 9; do
-            cat /tmp/levels_test.bin | ./target/release/rigz -$level > /tmp/levels_test.gz
-            cat /tmp/levels_test.gz | ./target/release/rigz -d > /tmp/levels_test.out
+            cat /tmp/levels_test.bin | ./target/release/gzippy -$level > /tmp/levels_test.gz
+            cat /tmp/levels_test.gz | ./target/release/gzippy -d > /tmp/levels_test.out
             diff /tmp/levels_test.bin /tmp/levels_test.out
             echo "✓ Level $level works"
           done
@@ -212,8 +212,8 @@ jobs:
         run: |
           head -c 1000000 /dev/urandom > /tmp/threads_test.bin
           for threads in 1 2 4 8; do
-            cat /tmp/threads_test.bin | ./target/release/rigz -9 -p$threads > /tmp/threads_test.gz
-            cat /tmp/threads_test.gz | ./target/release/rigz -d > /tmp/threads_test.out
+            cat /tmp/threads_test.bin | ./target/release/gzippy -9 -p$threads > /tmp/threads_test.gz
+            cat /tmp/threads_test.gz | ./target/release/gzippy -d > /tmp/threads_test.out
             diff /tmp/threads_test.bin /tmp/threads_test.out
             echo "✓ $threads threads works"
           done
@@ -221,14 +221,14 @@ jobs:
       - name: Test gzip/gunzip compatibility
         run: |
           head -c 100000 /dev/urandom > /tmp/compat_test.bin
-          # rigz compress → gzip decompress
-          cat /tmp/compat_test.bin | ./target/release/rigz | gzip -d > /tmp/compat_test.out
+          # gzippy compress → gzip decompress
+          cat /tmp/compat_test.bin | ./target/release/gzippy | gzip -d > /tmp/compat_test.out
           diff /tmp/compat_test.bin /tmp/compat_test.out
-          echo "✓ rigz→gzip works"
-          # gzip compress → rigz decompress
-          gzip -c /tmp/compat_test.bin | ./target/release/rigz -d > /tmp/compat_test.out2
+          echo "✓ gzippy→gzip works"
+          # gzip compress → gzippy decompress
+          gzip -c /tmp/compat_test.bin | ./target/release/gzippy -d > /tmp/compat_test.out2
           diff /tmp/compat_test.bin /tmp/compat_test.out2
-          echo "✓ gzip→rigz works"
+          echo "✓ gzip→gzippy works"
 
   lint:
     name: Lint
