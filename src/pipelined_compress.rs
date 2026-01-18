@@ -28,11 +28,22 @@ thread_local! {
     static PIPELINED_COMPRESS: RefCell<Option<(u32, Compress)>> = RefCell::new(None);
 }
 
-/// Block size for pipelined compression - matches pigz exactly (128KB)
-const BLOCK_SIZE: usize = 128 * 1024;
+/// Default block size for pipelined compression - matches pigz (128KB)
+const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
 
 /// Dictionary size (DEFLATE maximum is 32KB)
 const DICT_SIZE: usize = 32 * 1024;
+
+#[inline]
+fn pipelined_block_size(input_len: usize, num_threads: usize, level: u32) -> usize {
+    if level >= 9 && num_threads > 1 && input_len > 0 {
+        let blocks = num_threads.saturating_mul(2).max(1);
+        let target = input_len.div_ceil(blocks);
+        return target.clamp(256 * 1024, 4 * 1024 * 1024);
+    }
+
+    DEFAULT_BLOCK_SIZE
+}
 
 /// Pipelined gzip compression with dictionary sharing
 ///
@@ -111,7 +122,8 @@ impl PipelinedGzEncoder {
     /// - Pre-allocated buffers (no allocation in hot path)
     fn compress_parallel_pipeline<W: Write>(&self, data: &[u8], mut writer: W) -> io::Result<()> {
         let level = adjust_compression_level(self.compression_level);
-        let num_blocks = data.len().div_ceil(BLOCK_SIZE);
+        let block_size = pipelined_block_size(data.len(), self.num_threads, level);
+        let num_blocks = data.len().div_ceil(block_size);
 
         // Write gzip header
         let header = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
@@ -126,12 +138,12 @@ impl PipelinedGzEncoder {
         // Compress all blocks using custom scheduler
         compress_parallel(
             data,
-            BLOCK_SIZE,
+            block_size,
             self.num_threads,
             &mut writer,
             |block_idx, block, dict, is_last, output| {
                 // Compress this block with dictionary
-                compress_block_with_dict(block, dict, level, is_last, output);
+                compress_block_with_dict(block, dict, level, block_size, is_last, output);
                 
                 // Compute CRC for this block
                 let mut hasher = crc32fast::Hasher::new();
@@ -168,10 +180,11 @@ impl PipelinedGzEncoder {
         writer.write_all(&header)?;
 
         let mut compress = Compress::new(Compression::new(level), false);
-        let mut output_buf = vec![0u8; BLOCK_SIZE * 2];
+        let block_size = pipelined_block_size(data.len(), 1, level);
+        let mut output_buf = vec![0u8; block_size * 2];
         let mut crc_hasher = Hasher::new();
 
-        let blocks: Vec<&[u8]> = data.chunks(BLOCK_SIZE).collect();
+        let blocks: Vec<&[u8]> = data.chunks(block_size).collect();
 
         for (i, block) in blocks.iter().enumerate() {
             crc_hasher.update(block);
@@ -235,6 +248,7 @@ fn compress_block_with_dict(
     block: &[u8],
     dict: Option<&[u8]>,
     level: u32,
+    block_size: usize,
     is_last: bool,
     output: &mut Vec<u8>,
 ) {
@@ -244,7 +258,7 @@ fn compress_block_with_dict(
         output.clear();
 
         // Ensure buffer is large enough (block_size + 10% + 1KB for headers)
-        let initial_capacity = BLOCK_SIZE + (BLOCK_SIZE / 10) + 1024;
+        let initial_capacity = block_size + (block_size / 10) + 1024;
         if output.capacity() < initial_capacity {
             output.reserve(initial_capacity - output.capacity());
         }
