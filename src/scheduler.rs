@@ -16,6 +16,7 @@ use std::cell::UnsafeCell;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
+use std::time::Duration;
 
 /// A slot for storing a compressed block's output
 ///
@@ -27,6 +28,21 @@ pub struct BlockSlot {
     ready: AtomicBool,
     /// The compressed data for this block
     data: UnsafeCell<Vec<u8>>,
+}
+
+#[inline]
+fn wait_for_ready(slot: &BlockSlot) {
+    let mut spins = 0u32;
+    while !slot.is_ready() {
+        if spins < 1_000 {
+            std::hint::spin_loop();
+        } else if spins < 2_000 {
+            thread::yield_now();
+        } else {
+            thread::sleep(Duration::from_micros(50));
+        }
+        spins += 1;
+    }
 }
 
 // Safety: Each slot is written by exactly one worker thread, then read by main thread
@@ -140,9 +156,7 @@ where
         for i in 0..num_blocks {
             // Spin-wait until block i is ready
             // Use spin_loop hint for better CPU efficiency
-            while !slots[i].is_ready() {
-                std::hint::spin_loop();
-            }
+            wait_for_ready(&slots[i]);
 
             // Write immediately - no buffering or collection
             writer.write_all(slots[i].data())?;
@@ -253,9 +267,7 @@ where
 
         // Stream output in order
         for i in 0..num_blocks {
-            while !slots[i].is_ready() {
-                std::hint::spin_loop();
-            }
+            wait_for_ready(&slots[i]);
             writer.write_all(slots[i].data())?;
         }
 
