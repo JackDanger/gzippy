@@ -1,9 +1,9 @@
-rigz (0.1.0-1) unstable; urgency=medium
+gzippy (0.1.0-1) unstable; urgency=medium
 
   * Initial release.
-  * Parallel gzip compression using rayon and zlib-ng
+  * Parallel gzip compression using custom scheduler and zlib-ng
   * Fast decompression using libdeflate
   * Drop-in gzip replacement with compatible CLI
-  * Optional rigz-replace-gzip package for system-wide replacement
+  * Optional gzippy-replace-gzip package for system-wide replacement
 
- -- Jack Danger <github@jackdanger.com>  Thu, 15 Jan 2026 23:00:00 -0800
+ -- Jack Danger <github@jackdanger.com>  Sun, 18 Jan 2026 12:00:00 -0800

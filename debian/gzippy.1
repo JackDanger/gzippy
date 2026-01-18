@@ -1,20 +1,19 @@
-.TH RIGZ 1 "January 2026" "rigz 0.1.0" "User Commands"
+.TH GZIPPY 1 "January 2026" "gzippy 0.1.0" "User Commands"
 .SH NAME
-rigz \- fast parallel gzip compression
+gzippy \- the fastest parallel gzip
 .SH SYNOPSIS
-.B rigz
+.B gzippy
 [\fIOPTION\fR]... [\fIFILE\fR]...
 .SH DESCRIPTION
-.B rigz
-is a high-performance, parallel gzip implementation that provides 40-50%
-faster compression than gzip and pigz. It is a drop-in replacement for gzip
-with a compatible command-line interface.
+.B gzippy
+is a high-performance parallel gzip implementation that beats gzip and pigz.
+It is a drop-in replacement for gzip with a compatible command-line interface.
 .PP
 When invoked as
-.B unrigz
+.B ungzippy
 or with the
 .B \-d
-option, rigz decompresses files.
+option, gzippy decompresses files.
 .SH OPTIONS
 .TP
 .B \-c, \-\-stdout
@@ -70,16 +69,16 @@ Default is \-6.
 .SH EXAMPLES
 .TP
 Compress a file:
-.B rigz file.txt
+.B gzippy file.txt
 .TP
 Decompress a file:
-.B rigz -d file.txt.gz
+.B gzippy -d file.txt.gz
 .TP
 Compress to stdout using 8 threads:
-.B rigz -c -p8 file.txt > file.txt.gz
+.B gzippy -c -p8 file.txt > file.txt.gz
 .TP
 Decompress and keep original:
-.B rigz -dk file.txt.gz
+.B gzippy -dk file.txt.gz
 .SH "EXIT STATUS"
 .TP
 .B 0
@@ -88,9 +87,9 @@ Successful completion.
 .B 1
 An error occurred.
 .SH COMPATIBILITY
-rigz produces output that is fully compatible with standard gzip. Files
-compressed with rigz can be decompressed by any gzip implementation, and
-rigz can decompress any standard gzip file.
+gzippy produces output that is fully compatible with standard gzip. Files
+compressed with gzippy can be decompressed by any gzip implementation, and
+gzippy can decompress any standard gzip file.
 .PP
 The parallel compression works by creating multiple gzip "members" that
 are concatenated together. This is valid per RFC 1952 and all standard
