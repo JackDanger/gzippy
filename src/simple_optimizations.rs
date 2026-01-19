@@ -14,7 +14,7 @@ use flate2::Compression;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use crate::optimization::{CompressionBackend, CpuFeatures, OptimizationConfig};
+use crate::optimization::{CompressionBackend, OptimizationConfig};
 use crate::parallel_compress::ParallelGzEncoder;
 use crate::pipelined_compress::PipelinedGzEncoder;
 
@@ -145,32 +145,6 @@ impl SimpleOptimizer {
         // than available vCPUs (e.g., 2 physical on 4 vCPU), which hurts
         // performance. pigz uses all available threads and so should we.
         self.config.thread_count
-    }
-
-    /// Get CPU feature summary for debugging/verbosity
-    #[allow(dead_code)]
-    pub fn cpu_features_summary() -> String {
-        let cpu = CpuFeatures::get();
-        let mut features = Vec::new();
-
-        if cpu.has_avx512 {
-            features.push("AVX-512");
-        } else if cpu.has_avx2 {
-            features.push("AVX2");
-        }
-        if cpu.has_neon {
-            features.push("NEON");
-        }
-        if cpu.has_crc32 {
-            features.push("CRC32");
-        }
-
-        format!(
-            "CPU: {} cores, L2={}KB, features=[{}]",
-            cpu.physical_cores,
-            cpu.l2_cache_size / 1024,
-            features.join(", ")
-        )
     }
 }
 
