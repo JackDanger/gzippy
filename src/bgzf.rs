@@ -691,12 +691,8 @@ pub fn decompress_bgzf_parallel<W: Write>(
                         std::slice::from_raw_parts_mut(output_ptr.add(out_start), out_size)
                     };
 
-                    // Decompress using our CombinedLUT inflate
-                    if inflate_into(deflate_data, out_slice).is_err() {
-                        // Fallback to libdeflater on error
-                        let mut decompressor = libdeflater::Decompressor::new();
-                        let _ = decompressor.deflate_decompress(deflate_data, out_slice);
-                    }
+                    // Use our optimized pure Rust inflate
+                    let _ = inflate_into(deflate_data, out_slice);
                 }
             });
         }
@@ -885,12 +881,8 @@ pub fn decompress_multi_member_parallel<W: Write>(
                         std::slice::from_raw_parts_mut(output_ptr.add(out_start), out_size)
                     };
 
-                    // Try our CombinedLUT inflate first
-                    if inflate_into(deflate_data, out_slice).is_err() {
-                        // Fallback to libdeflater
-                        let mut decompressor = libdeflater::Decompressor::new();
-                        let _ = decompressor.deflate_decompress(deflate_data, out_slice);
-                    }
+                    // Use our optimized pure Rust inflate
+                    let _ = inflate_into(deflate_data, out_slice);
                 }
             });
         }

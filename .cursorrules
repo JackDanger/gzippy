@@ -218,55 +218,55 @@ Only distances 1,2,4,8 can use SIMD broadcast; others must use byte-by-byte copy
 
 ## Current Status (Jan 2026)
 
-### Performance Measurements
+### Performance Measurements (UPDATED)
 
-| Path | Speed | Notes |
-|------|-------|-------|
-| **Combined LUT inflate** | **10703 MB/s** | **Pure Rust, beats libdeflate!** |
-| libdeflate | 10631 MB/s | C library (previous best) |
-| Turbo inflate | 8542 MB/s | Previous best pure Rust |
-| Ultra-fast inflate | 7528 MB/s | Two-level table approach |
+**Key Insight**: Performance varies DRAMATICALLY by data complexity:
 
-### CombinedLUT Optimization (Completed)
+| Test Type | Our Pure Rust | libdeflate | Ratio |
+|-----------|---------------|------------|-------|
+| Simple 1MB (repetitive) | 17107 MB/s | 19242 MB/s | **89%** |
+| Complex silesia (real) | 687 MB/s | 1339 MB/s | **51%** |
+| BGZF parallel (8 threads) | 3893 MB/s | N/A | **2.9x single** |
 
-The `CombinedLUT` approach from rapidgzip is now integrated:
+**The 89% on simple data vs 51% on complex data shows our optimization path:**
+- We excel at copy-heavy workloads (SIMD memset/memcpy)
+- We lag on Huffman-heavy workloads (table lookups)
 
-1. **What it does**: Pre-computes literal and length code lookups in a 12-bit table (4096 entries)
-2. **Key insight**: Simplified version WITHOUT distance inlining matches libdeflate speed
-3. **Build time pitfall**: Original distance inlining approach took 75+ seconds to build due to O(n*m*k) loop structure
-4. **Solution**: Skip distance inlining; decode distance separately using two-level table. Same speed, instant build.
+### Parallel Decompression (Completed)
 
-Files involved:
-- `combined_lut.rs`: CacheEntry struct and CombinedLUT builder
-- `ultra_fast_inflate.rs`: `inflate_gzip_combined()` using CombinedLUT
+| File Type | Implementation | Speed | Target |
+|-----------|---------------|-------|--------|
+| BGZF | `bgzf::decompress_bgzf_parallel` | 3893 MB/s | 3500+ ✅ |
+| Multi-member | `bgzf::decompress_multi_member_parallel` | Working | - |
+| Single-member | Falls back to fast sequential | 687 MB/s | - |
 
-### What Slowed Down CombinedLUT Build (Lesson Learned)
+**Key: Parallel beats single-thread libdeflate by 2.9x on BGZF files.**
 
-The initial distance-inlining approach was O(length_codes × length_extras × distance_codes × distance_extras):
-- 29 length codes × 32 length extras × 30 distance codes × 8192 distance extras = billions of iterations
+### Why Pure Rust is Slower on Complex Data
 
-**Fix**: Skip distance inlining entirely. The 2% speed difference vs libdeflate isn't worth the complexity.
+1. **Huffman decode overhead**: Each symbol requires table lookup + bit consumption
+2. **TwoLevelTable vs libdeflate**: Our 2-level lookup adds one branch vs packed u32
+3. **Bit buffer operations**: libdeflate's branchless `bitsleft -= entry` is faster
 
-### Gap Analysis: Pure Rust vs libdeflate
+### What Works Well
 
-1. **Combined length+distance LUT** - ✅ COMPLETED (simplified version)
-   - Status: Integrated, 98% of libdeflate speed
-   - Distance inlining skipped (too slow to build)
+1. **SIMD copies** - Distance=1 memset is optimized with NEON/AVX2
+2. **Batched literal decode** - Decode 3-4 literals per loop iteration
+3. **Pre-allocated output** - Slice writes faster than Vec::push()
+4. **Parallel BGZF** - Lock-free parallel writes via UnsafeCell
 
-2. **Multi-symbol decode**
-   - Status: Defined in `multi_sym_decode.rs`, initial tests showed slowdown
-   - Note: Only helps with dynamic blocks that have very short codes
+### Remaining Gap to Close (Complex Data)
 
-3. **SIMD copy patterns**
-   - Status: Fixed critical bug for non-power-of-2 distances
-   - Optimization: Only distances 1,2,4,8 can use SIMD broadcast
+libdeflate achieves 1339 MB/s on silesia. Our pure Rust achieves 687 MB/s (51%).
 
-### Path to Surpassing rapidgzip
+To close this gap:
+1. **Entry preload** - Preload next table entry during copy (implemented)
+2. **Packed table format** - Single u32 encodes all decode info (tried, was slower)
+3. **Tighter decode loop** - May require unsafe Rust or inline assembly
+4. **Profile-guided optimization** - Identify actual hotspots with perf
 
-1. **Integrate combined LUT into decode loop** (highest priority)
-2. **Implement dictionary-based parallel re-decode** for single-member files
-3. **Optimize bit buffer operations** to match libdeflate's efficiency
-4. **Profile and optimize remaining bottlenecks**
+**Note**: The 51% gap on complex data is acceptable for parallel workflows.
+At 8 threads, we achieve 3893 MB/s which beats libdeflate's single-thread by 2.9x.
 
 ## Safety Features (Jan 2026)
 

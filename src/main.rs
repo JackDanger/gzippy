@@ -19,6 +19,8 @@ mod fast_decode;
 mod fast_inflate;
 mod fastloop_decode;
 mod format;
+mod hyper_inflate;
+mod hyper_table;
 mod inflate_tables;
 mod isal;
 mod libdeflate_ext;
