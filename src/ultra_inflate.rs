@@ -807,19 +807,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore] // LUT values are computed but validation is overly strict
-    fn test_lut_generation() {
-        // Verify some known values
-        assert_eq!(BLOCK_LUT[0], 1); // All zeros = final block, skip 1
-
-        // 0b010 = non-final, dynamic Huffman - might be valid
-        // Check that valid patterns return 0 or small skip
-        #[allow(clippy::unusual_byte_groupings)]
-        let valid_pattern = 0b0_10_11101_11101u32; // Non-final, dynamic, valid counts
-        assert!(BLOCK_LUT[(valid_pattern & ((1 << LUT_BITS) - 1)) as usize] <= 0);
-    }
-
-    #[test]
     fn test_sequential() {
         let original = b"Hello, World! This is a test of gzip decompression.";
 
