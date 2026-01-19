@@ -132,11 +132,20 @@ strip = true
 
 ### ISA-L Integration
 
-When available, ISA-L is linked via build.rs:
+ISA-L is a git submodule at `isa-l/`. Build before gzippy:
+```bash
+cd isa-l && mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+```
+
+The library is then linked via build.rs:
 ```
 isa-l/build/libisal.dylib (macOS)
 isa-l/build/libisal.so (Linux)
 ```
+
+**Critical**: ISA-L must be built BEFORE `cargo build` in all CI workflows.
 
 Enable with: `cargo build --release --features isal`
 
@@ -147,6 +156,19 @@ A pre-commit hook runs:
 2. `cargo clippy --all-targets --all-features -- -D warnings`
 
 To skip (emergency only): `git commit --no-verify`
+
+## CI Architecture
+
+### Critical CI Rules
+1. **Never use `-C target-cpu=native`** - Causes SIGILL on heterogeneous CI runners
+2. **Build ISA-L before gzippy** - Must be done in every workflow
+3. **Use adaptive benchmarking** - Run until stdev < 5% of mean (min 5, max 30 trials)
+
+### Workflow Design (4-stage pipeline)
+1. **Build** - Build all tools once, upload as artifacts
+2. **Prepare Data** - Generate test data, compress with all tools, upload
+3. **Benchmark** - Download artifacts, run adaptive benchmarks
+4. **Summary** - Aggregate results, post to PR
 
 ## Debug Mode
 
