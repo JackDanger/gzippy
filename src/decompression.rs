@@ -314,11 +314,29 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
     // is_multi_member_quick which only scans 256KB - not enough for random data
     // where the first block can be >256KB
     if has_bgzf_markers(data) {
-        // Try ultra-fast BGZF decompressor first (truly parallel, no writer bottleneck)
+        // Try our new CombinedLUT-based BGZF decompressor (fastest pure Rust)
         let num_threads = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(4);
 
+        match crate::bgzf::decompress_bgzf_parallel(data, writer, num_threads) {
+            Ok(bytes) => {
+                if std::env::var("GZIPPY_DEBUG").is_ok() {
+                    eprintln!(
+                        "[gzippy] BGZF parallel: {} bytes, {} threads",
+                        bytes, num_threads
+                    );
+                }
+                return Ok(bytes);
+            }
+            Err(e) => {
+                if std::env::var("GZIPPY_DEBUG").is_ok() {
+                    eprintln!("[gzippy] BGZF parallel failed: {}, trying ultra_inflate", e);
+                }
+            }
+        }
+
+        // Fallback to ultra_inflate BGZF (uses libdeflater)
         match crate::ultra_inflate::decompress_bgzf_ultra(data, writer, num_threads) {
             Ok(bytes) => {
                 if std::env::var("GZIPPY_DEBUG").is_ok() {
@@ -340,15 +358,17 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
     }
 
     // Check if this is multi-member using conservative heuristics
-    if !is_likely_multi_member(data) {
-        // Single-member: try parallel_decompress first (it detects multi-member internally)
-        let num_threads = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4);
+    let num_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
 
-        if let Ok(bytes) =
-            crate::parallel_decompress::decompress_parallel(data, writer, num_threads)
+    if !is_likely_multi_member(data) {
+        // Single-member: try our optimized single-member parallel first
+        if let Ok(bytes) = crate::bgzf::decompress_single_member_parallel(data, writer, num_threads)
         {
+            if std::env::var("GZIPPY_DEBUG").is_ok() {
+                eprintln!("[gzippy] Single-member: {} bytes", bytes);
+            }
             return Ok(bytes);
         }
 
@@ -356,12 +376,28 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
         return decompress_single_member_libdeflate(data, writer);
     }
 
-    // Multi-member: use parallel decompressor
-    let num_threads = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4);
+    // Multi-member: try our new pre-allocated parallel decompressor first (Phase 2)
+    match crate::bgzf::decompress_multi_member_parallel(data, writer, num_threads) {
+        Ok(bytes) => {
+            if std::env::var("GZIPPY_DEBUG").is_ok() {
+                eprintln!(
+                    "[gzippy] Multi-member parallel: {} bytes, {} threads",
+                    bytes, num_threads
+                );
+            }
+            return Ok(bytes);
+        }
+        Err(e) => {
+            if std::env::var("GZIPPY_DEBUG").is_ok() {
+                eprintln!(
+                    "[gzippy] Multi-member parallel failed: {}, trying fallback",
+                    e
+                );
+            }
+        }
+    }
 
-    // Try our new parallel_decompress first (5.46x speedup on multi-member)
+    // Fallback to parallel_decompress
     if let Ok(bytes) = crate::parallel_decompress::decompress_parallel(data, writer, num_threads) {
         return Ok(bytes);
     }

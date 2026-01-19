@@ -20,7 +20,7 @@
 //!   - 0xFFFE: length code needs slow path
 //!   - 0xFFFF: END_OF_BLOCK
 
-use crate::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
+use crate::inflate_tables::{LEN_EXTRA_BITS, LEN_START};
 use std::io;
 
 /// LUT bits for the combined table
@@ -107,13 +107,18 @@ pub struct CombinedLUT {
 
 impl CombinedLUT {
     /// Build a combined LUT from literal/length and distance code lengths
+    ///
+    /// Simplified version: only handles literals and length codes (no distance inlining)
+    /// This trades some performance for fast build times
     pub fn build(lit_len_lens: &[u8], dist_lens: &[u8]) -> io::Result<Self> {
-        let mut table = Box::new([CacheEntry::default(); COMBINED_LUT_SIZE]);
+        let _ = dist_lens; // Unused in simplified version
 
-        // First, build a simple distance decode table for reference
-        let dist_table = build_distance_table(dist_lens)?;
+        // Allocate table
+        let table_vec = vec![CacheEntry::default(); COMBINED_LUT_SIZE];
+        let table_ptr = Box::into_raw(table_vec.into_boxed_slice());
+        let mut table = unsafe { Box::from_raw(table_ptr as *mut [CacheEntry; COMBINED_LUT_SIZE]) };
 
-        // Build the lit/len table entries
+        // Build Huffman codes
         let (codes, code_lens) = build_huffman_codes(lit_len_lens)?;
 
         for (symbol, &code_len) in code_lens.iter().enumerate() {
@@ -141,41 +146,27 @@ impl CombinedLUT {
                     CacheEntry::end_of_block(code_len),
                 );
             } else if symbol <= 285 {
-                // Length code - try to pre-compute with distance
+                // Length code - store as slow path (distance decoded separately)
                 let len_idx = symbol - 257;
                 let len_extra = LEN_EXTRA_BITS[len_idx] as u8;
-
-                // Check if we can fit length + length_extra + distance in the table
                 let bits_for_length = code_len + len_extra;
 
-                if bits_for_length + 1 > COMBINED_LUT_BITS as u8 {
-                    // Can't fit, use slow path
-                    insert_entry(
-                        &mut table,
-                        reversed_code,
-                        code_len,
-                        CacheEntry::slow_path(code_len, (symbol - 257) as u8),
-                    );
-                    continue;
-                }
-
-                // Enumerate all possible extra length bits
+                // Enumerate length extra bits to compute actual length
                 let num_len_extras = 1u32 << len_extra;
                 for len_extra_val in 0..num_len_extras {
                     let length = LEN_START[len_idx] as usize + len_extra_val as usize;
-
-                    // Try to fit distance decodes
+                    let length_minus_3 = (length - 3) as u8;
                     let combined_code = reversed_code | ((len_extra_val as u16) << code_len);
-                    let remaining_bits = COMBINED_LUT_BITS as u8 - bits_for_length;
 
-                    insert_with_distance(
-                        &mut table,
-                        combined_code,
-                        bits_for_length,
-                        length,
-                        remaining_bits,
-                        &dist_table,
-                    );
+                    // Store as slow path - distance will be decoded separately
+                    if bits_for_length <= COMBINED_LUT_BITS as u8 {
+                        insert_entry(
+                            &mut table,
+                            combined_code,
+                            bits_for_length,
+                            CacheEntry::slow_path(bits_for_length, length_minus_3),
+                        );
+                    }
                 }
             }
         }
@@ -186,112 +177,6 @@ impl CombinedLUT {
     #[inline(always)]
     pub fn decode(&self, bits: u64) -> CacheEntry {
         self.table[(bits & COMBINED_LUT_MASK) as usize]
-    }
-}
-
-/// Simple distance decode entry
-#[derive(Clone, Copy, Default)]
-struct DistEntry {
-    code_len: u8,
-    symbol: u8,
-}
-
-fn build_distance_table(dist_lens: &[u8]) -> io::Result<[DistEntry; 32768]> {
-    let mut table = [DistEntry::default(); 32768];
-
-    let (codes, code_lens) = build_huffman_codes(dist_lens)?;
-
-    for (symbol, &code_len) in code_lens.iter().enumerate() {
-        if code_len == 0 || code_len > 15 {
-            continue;
-        }
-
-        let code = codes[symbol];
-        let reversed = reverse_bits(code, code_len);
-
-        // Fill all slots that match this prefix
-        let fill_count = 1u32 << (15 - code_len);
-        for i in 0..fill_count {
-            let idx = (reversed as usize) | ((i as usize) << code_len);
-            if idx < 32768 {
-                table[idx] = DistEntry {
-                    code_len,
-                    symbol: symbol as u8,
-                };
-            }
-        }
-    }
-
-    Ok(table)
-}
-
-fn insert_with_distance(
-    table: &mut [CacheEntry; COMBINED_LUT_SIZE],
-    base_code: u16,
-    bits_used: u8,
-    length: usize,
-    remaining_bits: u8,
-    dist_table: &[DistEntry; 32768],
-) {
-    // If length - 3 doesn't fit in u8, use slow path
-    if length < 3 || length > 258 {
-        insert_entry(
-            table,
-            base_code,
-            bits_used,
-            CacheEntry::slow_path(bits_used, 0),
-        );
-        return;
-    }
-    let length_minus_3 = (length - 3) as u8;
-
-    // Enumerate all possible bit patterns in remaining bits
-    let num_patterns = 1u32 << remaining_bits;
-
-    for dist_pattern in 0..num_patterns {
-        let full_code = base_code | ((dist_pattern as u16) << bits_used);
-        let idx = full_code as usize;
-        if idx >= COMBINED_LUT_SIZE {
-            continue;
-        }
-
-        // Look up distance from this pattern
-        let dist_entry = dist_table[(dist_pattern as usize) & 0x7FFF];
-        if dist_entry.code_len == 0 {
-            // Invalid distance code - mark as slow path
-            table[idx] = CacheEntry::slow_path(bits_used, length_minus_3);
-            continue;
-        }
-
-        let dist_sym = dist_entry.symbol as usize;
-        if dist_sym >= 30 {
-            table[idx] = CacheEntry::slow_path(bits_used, length_minus_3);
-            continue;
-        }
-
-        let dist_extra = DIST_EXTRA_BITS[dist_sym] as u8;
-        let total_bits = bits_used + dist_entry.code_len + dist_extra;
-
-        if total_bits > COMBINED_LUT_BITS as u8 {
-            // Doesn't fit - slow path
-            table[idx] = CacheEntry::slow_path(bits_used, length_minus_3);
-            continue;
-        }
-
-        // Extract distance extra bits
-        let extra_shift = dist_entry.code_len;
-        let extra_mask = (1u32 << dist_extra) - 1;
-        let dist_extra_val = ((dist_pattern >> extra_shift) as u32) & extra_mask;
-
-        let distance = DIST_START[dist_sym] as u32 + dist_extra_val;
-
-        if distance == 0 || distance > 32768 {
-            table[idx] = CacheEntry::slow_path(bits_used, length_minus_3);
-            continue;
-        }
-
-        // Success! Store the full LZ77 entry
-        table[idx] = CacheEntry::lz77(total_bits, length_minus_3, distance as u16);
     }
 }
 

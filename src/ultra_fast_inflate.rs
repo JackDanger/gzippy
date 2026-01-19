@@ -6,6 +6,7 @@
 //! 3. SIMD LZ77 copies
 
 #![allow(dead_code)]
+#![allow(clippy::needless_range_loop)]
 
 use std::io;
 
@@ -158,7 +159,10 @@ fn decode_dynamic_block(bits: &mut FastBits, output: &mut Vec<u8>) -> io::Result
 }
 
 /// Decode symbols using two-level tables
-/// Best-performing version: simple loop with proper refills
+/// Best-performing version with multi-literal optimization (libdeflate's key technique)
+///
+/// Safety: Loop terminates via END_OF_BLOCK (256) or error from invalid Huffman code.
+/// The FastBits.consume() uses saturating_sub() to prevent underflow that caused OOM.
 #[inline(never)]
 fn decode_huffman_block(
     bits: &mut FastBits,
@@ -171,7 +175,8 @@ fn decode_huffman_block(
     output.reserve(256 * 1024);
 
     loop {
-        bits.ensure(16);
+        // Ensure enough bits for multiple literals + length/distance
+        bits.ensure(32);
 
         let (symbol, code_len) = lit_len_table.decode(bits.buffer());
         if code_len == 0 {
@@ -182,45 +187,69 @@ fn decode_huffman_block(
         }
         bits.consume(code_len);
 
+        // Fast path: literal byte with multi-literal decode
         if symbol < 256 {
             output.push(symbol as u8);
-        } else if symbol == 256 {
-            break;
-        } else {
-            let len_idx = (symbol - 257) as usize;
-            if len_idx >= 29 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid length code",
-                ));
+
+            // Multi-literal decode: try up to 2 more literals (like libdeflate)
+            // This significantly reduces loop overhead for literal-heavy data
+            if bits.bits_available() >= 20 {
+                let (sym2, len2) = lit_len_table.decode(bits.buffer());
+                if len2 > 0 && sym2 < 256 {
+                    bits.consume(len2);
+                    output.push(sym2 as u8);
+
+                    // Third literal
+                    if bits.bits_available() >= 10 {
+                        let (sym3, len3) = lit_len_table.decode(bits.buffer());
+                        if len3 > 0 && sym3 < 256 {
+                            bits.consume(len3);
+                            output.push(sym3 as u8);
+                        }
+                    }
+                }
             }
-
-            bits.ensure(16);
-            let length =
-                LEN_START[len_idx] as usize + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
-
-            let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
-            if dist_len == 0 || dist_sym >= 30 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid distance code",
-                ));
-            }
-            bits.consume(dist_len);
-
-            bits.ensure(16);
-            let distance = DIST_START[dist_sym as usize] as usize
-                + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
-
-            if distance > output.len() || distance == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid distance",
-                ));
-            }
-
-            crate::simd_copy::lz77_copy_fast(output, distance, length);
+            continue;
         }
+
+        if symbol == 256 {
+            break;
+        }
+
+        // Length code - decode LZ77 match
+        let len_idx = (symbol - 257) as usize;
+        if len_idx >= 29 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid length code",
+            ));
+        }
+
+        bits.ensure(16);
+        let length =
+            LEN_START[len_idx] as usize + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
+
+        let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
+        if dist_len == 0 || dist_sym >= 30 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid distance code",
+            ));
+        }
+        bits.consume(dist_len);
+
+        bits.ensure(16);
+        let distance = DIST_START[dist_sym as usize] as usize
+            + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+
+        if distance > output.len() || distance == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid distance",
+            ));
+        }
+
+        crate::simd_copy::lz77_copy_fast(output, distance, length);
     }
 
     Ok(())
@@ -232,6 +261,9 @@ fn decode_huffman_block(
 /// 2. Inline all table lookups
 /// 3. Use raw pointer arithmetic for output
 /// 4. Prefetch next bits during copy operations
+///
+/// Safety: Loop terminates via END_OF_BLOCK (256) or error from invalid Huffman code.
+/// The FastBits.consume() uses saturating_sub() to prevent underflow that caused OOM.
 #[inline(never)]
 fn decode_huffman_block_fast(
     bits: &mut FastBits,
@@ -334,6 +366,205 @@ fn decode_huffman_block_fast(
     }
 
     Ok(())
+}
+
+// =============================================================================
+// CombinedLUT Decode (rapidgzip's key optimization)
+// =============================================================================
+
+use crate::combined_lut::{CombinedLUT, DIST_END_OF_BLOCK, DIST_LITERAL, DIST_SLOW_PATH};
+
+/// Decode using CombinedLUT - pre-computed length+distance lookup
+/// This is rapidgzip's key optimization: single lookup for entire LZ77 match
+///
+/// Expected speedup: +50% by eliminating separate distance table lookup
+#[inline(never)]
+fn decode_huffman_block_combined(
+    bits: &mut FastBits,
+    output: &mut Vec<u8>,
+    combined_lut: &CombinedLUT,
+    lit_len_table: &TwoLevelTable, // Fallback for long codes
+    dist_table: &TwoLevelTable,    // Fallback for slow path
+) -> io::Result<()> {
+    use crate::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
+
+    output.reserve(256 * 1024);
+
+    loop {
+        bits.ensure(32);
+
+        let entry = combined_lut.decode(bits.buffer());
+
+        // If bits_to_skip == 0, this is a long code (>12 bits) - use fallback
+        if entry.bits_to_skip == 0 {
+            // Fallback to regular two-level table decode
+            let (symbol, code_len) = lit_len_table.decode(bits.buffer());
+            if code_len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid Huffman code",
+                ));
+            }
+            bits.consume(code_len);
+
+            if symbol < 256 {
+                output.push(symbol as u8);
+                continue;
+            }
+            if symbol == 256 {
+                break;
+            }
+
+            // Length code - decode LZ77 match
+            let len_idx = (symbol - 257) as usize;
+            if len_idx >= 29 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid length code",
+                ));
+            }
+
+            bits.ensure(16);
+            let length =
+                LEN_START[len_idx] as usize + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
+
+            let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
+            if dist_len == 0 || dist_sym >= 30 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid distance code",
+                ));
+            }
+            bits.consume(dist_len);
+
+            bits.ensure(16);
+            let distance = DIST_START[dist_sym as usize] as usize
+                + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+
+            if distance > output.len() || distance == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid distance",
+                ));
+            }
+
+            crate::simd_copy::lz77_copy_fast(output, distance, length);
+            continue;
+        }
+
+        bits.consume(entry.bits_to_skip as u32);
+
+        match entry.distance {
+            DIST_LITERAL => {
+                // Literal byte
+                output.push(entry.symbol_or_length);
+
+                // Multi-literal decode: try 2 more literals
+                if bits.bits_available() >= 24 {
+                    let entry2 = combined_lut.decode(bits.buffer());
+                    if entry2.bits_to_skip > 0 && entry2.distance == DIST_LITERAL {
+                        bits.consume(entry2.bits_to_skip as u32);
+                        output.push(entry2.symbol_or_length);
+
+                        if bits.bits_available() >= 12 {
+                            let entry3 = combined_lut.decode(bits.buffer());
+                            if entry3.bits_to_skip > 0 && entry3.distance == DIST_LITERAL {
+                                bits.consume(entry3.bits_to_skip as u32);
+                                output.push(entry3.symbol_or_length);
+                            }
+                        }
+                    }
+                }
+            }
+
+            DIST_END_OF_BLOCK => {
+                break;
+            }
+
+            DIST_SLOW_PATH => {
+                // Length code that didn't fit in combined table - length is pre-computed
+                // symbol_or_length contains (length - 3), already computed from length code + extra bits
+                let length = entry.symbol_or_length as usize + 3;
+
+                // Decode distance using fallback table
+                let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
+                if dist_len == 0 || dist_sym >= 30 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Invalid distance code",
+                    ));
+                }
+                bits.consume(dist_len);
+
+                bits.ensure(16);
+                let distance = DIST_START[dist_sym as usize] as usize
+                    + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+
+                if distance > output.len() || distance == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Invalid distance",
+                    ));
+                }
+
+                crate::simd_copy::lz77_copy_fast(output, distance, length);
+            }
+
+            distance => {
+                // Pre-computed LZ77 match! This is the fast path.
+                let length = entry.length();
+                let dist = distance as usize;
+
+                if dist > output.len() || dist == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Invalid distance in combined entry",
+                    ));
+                }
+
+                crate::simd_copy::lz77_copy_fast(output, dist, length);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Build CombinedLUT for fixed Huffman codes
+fn build_fixed_combined_lut() -> CombinedLUT {
+    let mut lit_len_lens = vec![0u8; 288];
+    for i in 0..144 {
+        lit_len_lens[i] = 8;
+    }
+    for i in 144..256 {
+        lit_len_lens[i] = 9;
+    }
+    for i in 256..280 {
+        lit_len_lens[i] = 7;
+    }
+    for i in 280..288 {
+        lit_len_lens[i] = 8;
+    }
+
+    let dist_lens = vec![5u8; 32];
+
+    CombinedLUT::build(&lit_len_lens, &dist_lens).unwrap()
+}
+
+// Thread-local fixed CombinedLUT
+thread_local! {
+    static FIXED_COMBINED: CombinedLUT = build_fixed_combined_lut();
+}
+
+/// Decode fixed Huffman block using CombinedLUT
+fn decode_fixed_block_combined(bits: &mut FastBits, output: &mut Vec<u8>) -> io::Result<()> {
+    FIXED_COMBINED.with(|combined_lut| {
+        FIXED_LIT_LEN.with(|lit_len_table| {
+            FIXED_DIST.with(|dist_table| {
+                decode_huffman_block_combined(bits, output, combined_lut, lit_len_table, dist_table)
+            })
+        })
+    })
 }
 
 // =============================================================================
@@ -495,6 +726,205 @@ pub fn inflate_gzip_ultra_fast(input: &[u8], output: &mut Vec<u8>) -> io::Result
     inflate_ultra_fast(deflate_data, output)
 }
 
+/// Inflate using CombinedLUT for pre-computed length+distance lookup
+/// This is rapidgzip's key optimization - expected +50% speedup
+pub fn inflate_combined(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
+    let mut bits = FastBits::new(input);
+    let start_len = output.len();
+
+    loop {
+        bits.refill();
+
+        let bfinal = bits.read(1);
+        let btype = bits.read(2);
+
+        match btype {
+            0 => decode_stored_block(&mut bits, output)?,
+            1 => decode_fixed_block_combined(&mut bits, output)?,
+            2 => decode_dynamic_block_combined(&mut bits, output)?,
+            3 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Reserved block type",
+                ))
+            }
+            _ => unreachable!(),
+        }
+
+        if bfinal == 1 {
+            break;
+        }
+    }
+
+    Ok(output.len() - start_len)
+}
+
+/// Decode dynamic Huffman block using CombinedLUT
+fn decode_dynamic_block_combined(bits: &mut FastBits, output: &mut Vec<u8>) -> io::Result<()> {
+    // Read dynamic Huffman table parameters
+    bits.ensure(16);
+    let hlit = bits.read(5) as usize + 257;
+    let hdist = bits.read(5) as usize + 1;
+    let hclen = bits.read(4) as usize + 4;
+
+    // Read code length code lengths
+    let mut code_len_lens = [0u8; 19];
+    for i in 0..hclen {
+        bits.ensure(8);
+        code_len_lens[CODE_LENGTH_ORDER[i] as usize] = bits.read(3) as u8;
+    }
+
+    // Build code length table
+    let code_len_table = TwoLevelTable::build(&code_len_lens)?;
+
+    // Read literal/length and distance code lengths
+    let total_codes = hlit + hdist;
+    let mut code_lens = vec![0u8; total_codes];
+    let mut i = 0;
+
+    while i < total_codes {
+        bits.ensure(16);
+        let (symbol, sym_len) = code_len_table.decode(bits.buffer());
+        if sym_len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid code length code",
+            ));
+        }
+        bits.consume(sym_len);
+
+        match symbol {
+            0..=15 => {
+                code_lens[i] = symbol as u8;
+                i += 1;
+            }
+            16 => {
+                if i == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Invalid repeat at start",
+                    ));
+                }
+                let repeat = 3 + bits.read(2) as usize;
+                let last = code_lens[i - 1];
+                for _ in 0..repeat {
+                    if i >= total_codes {
+                        break;
+                    }
+                    code_lens[i] = last;
+                    i += 1;
+                }
+            }
+            17 => {
+                let repeat = 3 + bits.read(3) as usize;
+                for _ in 0..repeat {
+                    if i >= total_codes {
+                        break;
+                    }
+                    code_lens[i] = 0;
+                    i += 1;
+                }
+            }
+            18 => {
+                let repeat = 11 + bits.read(7) as usize;
+                for _ in 0..repeat {
+                    if i >= total_codes {
+                        break;
+                    }
+                    code_lens[i] = 0;
+                    i += 1;
+                }
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid code length code",
+                ));
+            }
+        }
+    }
+
+    // Split into lit/len and distance codes
+    let lit_len_lens = &code_lens[..hlit];
+    let dist_lens = &code_lens[hlit..];
+
+    // Build combined LUT
+    let combined_lut = CombinedLUT::build(lit_len_lens, dist_lens)?;
+
+    // Build fallback tables for long codes and slow path
+    let lit_len_table = TwoLevelTable::build(lit_len_lens)?;
+    let dist_table = TwoLevelTable::build(dist_lens)?;
+
+    decode_huffman_block_combined(bits, output, &combined_lut, &lit_len_table, &dist_table)
+}
+
+/// Gzip inflate using CombinedLUT
+pub fn inflate_gzip_combined(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
+    if input.len() < 10 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Input too short",
+        ));
+    }
+
+    if input[0] != 0x1f || input[1] != 0x8b {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Not a gzip file",
+        ));
+    }
+
+    if input[2] != 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Unsupported compression",
+        ));
+    }
+
+    let flags = input[3];
+    let mut pos = 10;
+
+    // Skip optional fields
+    if flags & 0x04 != 0 {
+        if pos + 2 > input.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Truncated extra field",
+            ));
+        }
+        let xlen = u16::from_le_bytes([input[pos], input[pos + 1]]) as usize;
+        pos += 2 + xlen;
+    }
+
+    if flags & 0x08 != 0 {
+        while pos < input.len() && input[pos] != 0 {
+            pos += 1;
+        }
+        pos += 1;
+    }
+
+    if flags & 0x10 != 0 {
+        while pos < input.len() && input[pos] != 0 {
+            pos += 1;
+        }
+        pos += 1;
+    }
+
+    if flags & 0x02 != 0 {
+        pos += 2;
+    }
+
+    if pos >= input.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Truncated header",
+        ));
+    }
+
+    let deflate_data = &input[pos..input.len().saturating_sub(8)];
+    inflate_combined(deflate_data, output)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -518,6 +948,34 @@ mod tests {
         inflate_gzip_ultra_fast(&compressed, &mut output).unwrap();
 
         assert_eq!(&output[..], &original[..]);
+    }
+
+    #[test]
+    fn test_combined_simple() {
+        let original = b"Hello, World! This is a test of combined LUT inflate.";
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut output = Vec::new();
+        inflate_gzip_combined(&compressed, &mut output).unwrap();
+
+        assert_eq!(&output[..], &original[..]);
+    }
+
+    #[test]
+    fn test_combined_repeated() {
+        let original: Vec<u8> = "ABCDEFGH".repeat(100).into_bytes();
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut output = Vec::new();
+        inflate_gzip_combined(&compressed, &mut output).unwrap();
+
+        assert_eq!(output, original);
     }
 
     #[test]
@@ -624,6 +1082,21 @@ mod tests {
         println!(
             "libdeflate:  {:>8?}/iter  ({:.0} MB/s)",
             libdeflate_avg, libdeflate_mbps
+        );
+        // Benchmark CombinedLUT implementation
+        let start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            let mut output = Vec::with_capacity(original.len());
+            inflate_gzip_combined(&compressed, &mut output).unwrap();
+            std::hint::black_box(&output);
+        }
+        let combined_time = start.elapsed();
+        let combined_avg = combined_time / ITERS as u32;
+        let combined_mbps = 1_000_000.0 / combined_avg.as_secs_f64() / 1_000_000.0;
+
+        println!(
+            "Combined:    {:>8?}/iter  ({:.0} MB/s)",
+            combined_avg, combined_mbps
         );
         println!(
             "Ultra vs libdeflate: {:.2}x",
