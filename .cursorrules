@@ -185,3 +185,47 @@ Set `GZIPPY_DEBUG=1` to enable timing diagnostics during compression.
 ### Architecture Decisions
 - **libdeflate over ISA-L**: ISA-L's complex FFI (200KB+ struct) and ARM fallback to pure C made libdeflate the pragmatic choice. libdeflate is ~90% of ISA-L's SIMD speed with simpler integration.
 - **Static linking only**: All dependencies are statically linked - no runtime library discovery issues.
+
+## Pure Rust Inflate Implementation (Jan 2026)
+
+Building toward full ISA-L parity in pure Rust. Current modules:
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `turbo_inflate.rs` | Optimized deflate decoder | 50% of libdeflate speed |
+| `fast_inflate.rs` | Basic reference implementation | Working |
+| `simd_copy.rs` | AVX2/NEON LZ77 copy | Complete |
+| `inflate_tables.rs` | Auto-generated lookup tables | Complete |
+
+### Key Learnings
+
+1. **Multi-symbol decode only helps dynamic blocks**: Fixed Huffman codes are 7-9 bits minimum, so 7+7=14 > 12 bits means no multi-symbol packing. Dynamic blocks with short codes (3-5 bits) benefit.
+
+2. **Table size vs cache**: 15-bit tables (32KB) cause L1 cache misses. libdeflate uses 10-11 bit primary tables. Must implement two-level lookup.
+
+3. **Bit buffer is critical**: 64-bit buffer with 57+ bits before decode loop is essential. Refill only when needed, not on every consume.
+
+4. **LZ77 copy patterns**:
+   - Distance 1 (RLE): Use memset/SIMD broadcast
+   - Distance 2-7: Pattern expansion
+   - Distance >= 32: SIMD copy non-overlapping
+
+5. **Dynamic block overhead**: Building Huffman tables per-block is expensive. Optimize table construction, not just lookup.
+
+### Remaining Optimizations
+
+- [ ] Two-level Huffman tables (10-bit primary + overflow)
+- [ ] Multi-symbol decode for dynamic blocks
+- [ ] Table construction SIMD
+- [ ] Inline assembly hot paths
+- [ ] Profile-guided optimization
+
+### Benchmark Baseline (1MB test data, ARM64)
+
+| Implementation | Speed | vs libdeflate |
+|----------------|-------|---------------|
+| libdeflate | 11.8 GB/s | 1.0x |
+| turbo_inflate | 5.7 GB/s | 0.48x |
+| fast_inflate | 5.9 GB/s | 0.50x |
+
+Target: Match or exceed libdeflate by implementing remaining optimizations.
