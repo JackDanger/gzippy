@@ -430,3 +430,22 @@ mod tests {
         );
     }
 }
+
+#[test]
+fn test_ultra_fast_large_file() {
+    let data = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("Skipping test - benchmark file not found");
+            return;
+        }
+    };
+    eprintln!("Compressed size: {} bytes", data.len());
+
+    let start = std::time::Instant::now();
+    let mut output = Vec::new();
+    match inflate_gzip_ultra_fast(&data, &mut output) {
+        Ok(sz) => eprintln!("ultra_fast_inflate: {} bytes in {:?}", sz, start.elapsed()),
+        Err(e) => eprintln!("ultra_fast_inflate error: {:?}", e),
+    }
+}

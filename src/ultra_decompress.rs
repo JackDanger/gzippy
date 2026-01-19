@@ -59,21 +59,16 @@ impl UltraDecompressor {
             return self.decompress_bgzf(data, writer);
         }
 
-        // Check for multi-member (pigz output)
+        // Check for multi-member (pigz output or concatenated gzip files)
         let members = find_members_fast(data);
-        if members.len() > 1 && data.len() >= PARALLEL_THRESHOLD {
+        if members.len() > 1 {
+            // Always use multi-member path - even for small files, we need all members
             return self.decompress_members(data, &members, writer);
         }
 
-        // Single member: try rapidgzip-style parallel decompression
-        if data.len() >= PARALLEL_THRESHOLD && self.num_threads > 1 {
-            if let Ok(bytes) = self.decompress_single_parallel(data, writer) {
-                return Ok(bytes);
-            }
-            // Fall through to sequential if parallel fails
-        }
-
-        // Small file or parallel failed: optimized sequential
+        // Single member: use ultra-fast sequential inflate
+        // Note: Speculative parallel decode (marker_decode, ultra_inflate) is disabled
+        // because it's not reliable on arbitrary gzip streams yet
         self.decompress_sequential(data, writer)
     }
 
@@ -186,8 +181,76 @@ impl UltraDecompressor {
         members: &[(usize, usize)],
         writer: &mut W,
     ) -> io::Result<u64> {
-        // Use marker-based decoder for multi-member files
-        crate::marker_decode::decompress_parallel(data, writer, self.num_threads)
+        // Use parallel member decompression - each member is independent
+        let num_members = members.len();
+        let results: Vec<Mutex<Option<Vec<u8>>>> =
+            (0..num_members).map(|_| Mutex::new(None)).collect();
+
+        let next_member = AtomicUsize::new(0);
+        let error_flag = AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            for _ in 0..self.num_threads.min(num_members) {
+                let next_ref = &next_member;
+                let results_ref = &results;
+                let error_ref = &error_flag;
+                let members_ref = members;
+
+                scope.spawn(move || loop {
+                    if error_ref.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let idx = next_ref.fetch_add(1, Ordering::Relaxed);
+                    if idx >= num_members {
+                        break;
+                    }
+
+                    let (start, end) = members_ref[idx];
+                    let member_data = &data[start..end];
+
+                    // Try ultra-fast inflate
+                    let mut output = Vec::new();
+                    let success = crate::ultra_fast_inflate::inflate_gzip_ultra_fast(
+                        member_data,
+                        &mut output,
+                    )
+                    .is_ok();
+
+                    if success {
+                        *results_ref[idx].lock().unwrap() = Some(output);
+                    } else {
+                        // Fallback to flate2
+                        use std::io::Read;
+                        let mut decoder = flate2::read::GzDecoder::new(member_data);
+                        let mut output = Vec::new();
+                        if decoder.read_to_end(&mut output).is_ok() {
+                            *results_ref[idx].lock().unwrap() = Some(output);
+                        } else {
+                            error_ref.store(true, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+
+        if error_flag.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Failed to decompress member",
+            ));
+        }
+
+        // Collect results in order
+        let mut total = 0u64;
+        for mutex in results.iter() {
+            if let Some(data) = mutex.lock().unwrap().take() {
+                total += data.len() as u64;
+                writer.write_all(&data)?;
+            }
+        }
+
+        Ok(total)
     }
 
     /// Parallel decompression for single-member gzip using ultra-fast engine
@@ -218,6 +281,15 @@ impl UltraDecompressor {
 
     /// Optimized sequential decompression
     fn decompress_sequential<W: Write>(&self, data: &[u8], writer: &mut W) -> io::Result<u64> {
+        // Try ultra-fast inflate first (fastest pure Rust)
+        let mut output = Vec::new();
+        if crate::ultra_fast_inflate::inflate_gzip_ultra_fast(data, &mut output).is_ok() {
+            writer.write_all(&output)?;
+            writer.flush()?;
+            return Ok(output.len() as u64);
+        }
+
+        // Fallback to libdeflater (via IsalInflater wrapper)
         INFLATER.with(|inf| {
             let mut inflater_opt = inf.borrow_mut();
             if let Some(ref mut inflater) = *inflater_opt {
@@ -503,4 +575,77 @@ mod tests {
         let members = find_members_fast(&compressed);
         assert_eq!(members.len(), 1);
     }
+}
+
+#[cfg(test)]
+mod multi_tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write as IoWrite;
+
+    #[test]
+    fn test_find_members_fast() {
+        let part1: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        let part2: Vec<u8> = (0..100_000).map(|i| ((i + 50) % 256) as u8).collect();
+
+        let mut encoder1 = GzEncoder::new(Vec::new(), Compression::default());
+        encoder1.write_all(&part1).unwrap();
+        let compressed1 = encoder1.finish().unwrap();
+
+        let mut encoder2 = GzEncoder::new(Vec::new(), Compression::default());
+        encoder2.write_all(&part2).unwrap();
+        let compressed2 = encoder2.finish().unwrap();
+
+        let mut multi = compressed1.clone();
+        multi.extend_from_slice(&compressed2);
+
+        eprintln!(
+            "Multi: {} bytes, c1={}, c2={}",
+            multi.len(),
+            compressed1.len(),
+            compressed2.len()
+        );
+
+        let members = find_members_fast(&multi);
+        eprintln!("find_members_fast: {:?}", members);
+
+        assert_eq!(members.len(), 2, "Should find 2 members");
+    }
+}
+
+#[test]
+fn test_large_file_decompress_timing() {
+    use std::io::Read;
+    let data = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("Skipping test - benchmark file not found");
+            return;
+        }
+    };
+    eprintln!("Compressed size: {} bytes", data.len());
+
+    // Try libdeflater directly
+    let start = std::time::Instant::now();
+    let mut decomp = libdeflater::Decompressor::new();
+    let isize = u32::from_le_bytes([
+        data[data.len() - 4],
+        data[data.len() - 3],
+        data[data.len() - 2],
+        data[data.len() - 1],
+    ]) as usize;
+    eprintln!("Expected size from trailer: {} bytes", isize);
+    let mut output = vec![0u8; isize + 1024 * 1024];
+    match decomp.gzip_decompress(&data, &mut output) {
+        Ok(sz) => eprintln!("libdeflater: {} bytes in {:?}", sz, start.elapsed()),
+        Err(e) => eprintln!("libdeflater error: {:?}", e),
+    }
+
+    // Try flate2
+    let start = std::time::Instant::now();
+    let mut decoder = flate2::read::GzDecoder::new(&data[..]);
+    let mut output2 = Vec::new();
+    decoder.read_to_end(&mut output2).unwrap();
+    eprintln!("flate2: {} bytes in {:?}", output2.len(), start.elapsed());
 }

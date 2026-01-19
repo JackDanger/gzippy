@@ -956,8 +956,17 @@ pub fn decompress_parallel<W: io::Write + Send>(
 
 /// Sequential decompression fallback
 pub fn decompress_sequential<W: io::Write>(data: &[u8], writer: &mut W) -> io::Result<u64> {
-    let mut decoder = flate2::read::GzDecoder::new(data);
+    // Try ultra-fast inflate first
     let mut output = Vec::new();
+    if crate::ultra_fast_inflate::inflate_gzip_ultra_fast(data, &mut output).is_ok() {
+        writer.write_all(&output)?;
+        writer.flush()?;
+        return Ok(output.len() as u64);
+    }
+
+    // Fallback to flate2
+    let mut decoder = flate2::read::GzDecoder::new(data);
+    output.clear();
     decoder.read_to_end(&mut output)?;
     writer.write_all(&output)?;
     writer.flush()?;

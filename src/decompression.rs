@@ -168,22 +168,133 @@ fn decompress_mmap_libdeflate<W: Write + Send>(
 /// Uses SIMD-accelerated search via memchr (10-50x faster than byte-by-byte)
 /// Only scans first 256KB to detect parallel-compressed files
 #[inline]
-fn is_multi_member_quick(data: &[u8]) -> bool {
+/// Check if this is a multi-member gzip by checking if there are more
+/// gzip headers after the first member's minimum size.
+///
+/// Uses conservative heuristics to avoid false positives from gzip magic
+/// appearing in compressed data.
+fn is_likely_multi_member(data: &[u8]) -> bool {
     use memchr::memmem;
 
-    const SCAN_LIMIT: usize = 256 * 1024;
-    const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b, 0x08];
-
-    let scan_end = data.len().min(SCAN_LIMIT);
-
-    // Skip past the first gzip header (minimum 10 bytes)
-    // and look for another gzip magic sequence
-    if scan_end <= 10 {
+    // A gzip member is minimum 18 bytes (10 header + 8 trailer)
+    if data.len() < 36 {
+        // Too small for multi-member
         return false;
     }
 
-    // memmem uses SIMD (AVX2/NEON) internally for fast searching
-    memmem::find(&data[10..scan_end], GZIP_MAGIC).is_some()
+    // Parse first header to find approximate end of first member
+    let header_size = parse_gzip_header_size(data).unwrap_or(10);
+
+    // Search for gzip magic after header
+    // Use a conservative approach: look for the 4-byte pattern 1f 8b 08 XX
+    // where XX has reserved bits zero
+    const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b, 0x08];
+    let finder = memmem::Finder::new(GZIP_MAGIC);
+
+    // Start searching after the header (the deflate data starts there)
+    let search_start = header_size + 1; // +1 to skip past first byte of deflate
+
+    let mut pos = search_start;
+    while let Some(offset) = finder.find(&data[pos..]) {
+        let header_pos = pos + offset;
+
+        // Must have room for full header (10 bytes minimum)
+        if header_pos + 10 > data.len() {
+            break;
+        }
+
+        let flags = data[header_pos + 3];
+
+        // Reserved bits must be zero
+        if flags & 0xE0 != 0 {
+            pos = header_pos + 1;
+            continue;
+        }
+
+        // MTIME (4 bytes) should be reasonable (before year 2100 = ~4102444800)
+        let mtime = u32::from_le_bytes([
+            data[header_pos + 4],
+            data[header_pos + 5],
+            data[header_pos + 6],
+            data[header_pos + 7],
+        ]);
+        // Allow mtime = 0 (common) or reasonable values
+        if mtime != 0 && mtime > 4_102_444_800 {
+            pos = header_pos + 1;
+            continue;
+        }
+
+        // XFL (extra flags) should be 0, 2, or 4 (0=default, 2=slowest, 4=fastest)
+        let xfl = data[header_pos + 8];
+        if xfl != 0 && xfl != 2 && xfl != 4 {
+            pos = header_pos + 1;
+            continue;
+        }
+
+        // OS should be a known value (0-13, 255)
+        let os = data[header_pos + 9];
+        if os > 13 && os != 255 {
+            pos = header_pos + 1;
+            continue;
+        }
+
+        // This looks like a valid header!
+        return true;
+    }
+
+    false
+}
+
+/// Parse gzip header size (variable due to FEXTRA, FNAME, FCOMMENT, FHCRC)
+fn parse_gzip_header_size(data: &[u8]) -> Option<usize> {
+    if data.len() < 10 {
+        return None;
+    }
+
+    if data[0] != 0x1f || data[1] != 0x8b || data[2] != 0x08 {
+        return None;
+    }
+
+    let flags = data[3];
+    let mut pos = 10;
+
+    // FEXTRA
+    if flags & 0x04 != 0 {
+        if pos + 2 > data.len() {
+            return None;
+        }
+        let xlen = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2 + xlen;
+    }
+
+    // FNAME (null-terminated)
+    if flags & 0x08 != 0 {
+        while pos < data.len() && data[pos] != 0 {
+            pos += 1;
+        }
+        pos += 1; // null terminator
+    }
+
+    // FCOMMENT (null-terminated)
+    if flags & 0x10 != 0 {
+        while pos < data.len() && data[pos] != 0 {
+            pos += 1;
+        }
+        pos += 1;
+    }
+
+    // FHCRC
+    if flags & 0x02 != 0 {
+        pos += 2;
+    }
+
+    Some(pos)
+}
+
+/// Legacy function for compatibility
+#[allow(dead_code)]
+fn is_multi_member_quick(data: &[u8]) -> bool {
+    is_likely_multi_member(data)
 }
 
 /// Decompress gzip - chooses optimal strategy based on content
@@ -228,14 +339,13 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
         return decompress_bgzf_parallel_prefetch(data, writer);
     }
 
-    // Fast path: check if this is likely multi-member (from parallel compression)
-    // Only scan first 256KB - if no second header found, use direct single-member path
-    if !is_multi_member_quick(data) {
+    // Check if this is multi-member using conservative heuristics
+    if !is_likely_multi_member(data) {
+        // Single-member: use fast libdeflater path
         return decompress_single_member_libdeflate(data, writer);
     }
 
-    // Use the ultra-fast parallel decompressor
-    // This uses block-level parallelism for maximum speed
+    // Multi-member: use parallel decompressor
     let num_threads = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(4);
@@ -590,15 +700,7 @@ fn decompress_single_member_libdeflate<W: Write>(data: &[u8], writer: &mut W) ->
         data.len().saturating_mul(4).max(64 * 1024)
     };
 
-    // Try ultra-fast pure Rust inflater first (faster than libdeflate)
-    let mut output_buf = Vec::with_capacity(initial_size);
-    if crate::ultra_fast_inflate::inflate_gzip_ultra_fast(data, &mut output_buf).is_ok() {
-        writer.write_all(&output_buf)?;
-        writer.flush()?;
-        return Ok(output_buf.len() as u64);
-    }
-
-    // Fallback to libdeflate for edge cases
+    // Use libdeflate (fastest for large files)
     use libdeflater::DecompressionError;
 
     // Use cache-aligned buffer for better memory access
@@ -795,4 +897,73 @@ fn format_size(bytes: u64) -> (f64, &'static str) {
     } else {
         (bytes as f64, "B")
     }
+}
+
+#[cfg(test)]
+mod multi_member_tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    #[test]
+    fn test_decompress_multi_member_file() {
+        // Create two separate gzip streams like: (gzip file1; gzip file2) > combined.gz
+        let part1: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        let part2: Vec<u8> = (0..100_000).map(|i| ((i + 50) % 256) as u8).collect();
+
+        let mut encoder1 = GzEncoder::new(Vec::new(), Compression::default());
+        encoder1.write_all(&part1).unwrap();
+        let compressed1 = encoder1.finish().unwrap();
+
+        let mut encoder2 = GzEncoder::new(Vec::new(), Compression::default());
+        encoder2.write_all(&part2).unwrap();
+        let compressed2 = encoder2.finish().unwrap();
+
+        // Concatenate them
+        let mut multi = compressed1.clone();
+        multi.extend_from_slice(&compressed2);
+
+        eprintln!(
+            "Multi-member: {} bytes total, member1={}, member2={}",
+            multi.len(),
+            compressed1.len(),
+            compressed2.len()
+        );
+
+        // Check detection
+        let is_multi = is_multi_member_quick(&multi);
+        eprintln!("is_multi_member_quick: {}", is_multi);
+
+        // Try the full decompression path
+        let mut output = Vec::new();
+        decompress_gzip_libdeflate(&multi, &mut output).unwrap();
+
+        let mut expected = part1.clone();
+        expected.extend_from_slice(&part2);
+
+        eprintln!(
+            "Expected: {} bytes, got: {} bytes",
+            expected.len(),
+            output.len()
+        );
+        assert_eq!(output.len(), expected.len(), "Output size mismatch!");
+        assert_eq!(output, expected, "Output content mismatch!");
+    }
+}
+
+#[test]
+fn test_is_multi_member_quick_timing() {
+    let data = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("Skipping test - benchmark file not found");
+            return;
+        }
+    };
+    eprintln!("File size: {} bytes", data.len());
+
+    let start = std::time::Instant::now();
+    let result = is_multi_member_quick(&data);
+    eprintln!("is_multi_member_quick: {} in {:?}", result, start.elapsed());
 }

@@ -214,22 +214,48 @@ pub fn parse_bgzf_blocks(data: &[u8]) -> Vec<BgzfBlock> {
 // =============================================================================
 
 /// Find gzip member boundaries (for pigz-style multi-member files)
-pub fn find_member_boundaries(data: &[u8]) -> Vec<usize> {
-    let mut boundaries = vec![0];
-    let mut pos = 0;
+/// Returns Vec of (start, end) byte positions for each member
+pub fn find_member_boundaries(data: &[u8]) -> Vec<(usize, usize)> {
+    let mut starts = vec![0];
 
+    // Find all member start positions by looking for gzip magic
+    // Note: 0x1f 0x8b can appear inside deflate streams, but followed by 0x08
+    // (compression method = deflate) is much rarer
+    let mut pos = 1;
     while pos + 10 < data.len() {
-        // Skip current member by finding its size
-        // This is tricky without full decompression
-        // We'll look for the next gzip magic number
-
-        if pos > 0 && data[pos] == 0x1f && data[pos + 1] == 0x8b && data[pos + 2] == 8 {
-            boundaries.push(pos);
+        if data[pos] == 0x1f && data[pos + 1] == 0x8b && data[pos + 2] == 8 {
+            // Validate this looks like a real header
+            let flags = data[pos + 3];
+            // Check reserved bits are zero
+            if flags & 0xE0 == 0 {
+                starts.push(pos);
+            }
         }
         pos += 1;
     }
 
-    boundaries
+    // Convert starts to (start, end) pairs
+    let mut members = Vec::with_capacity(starts.len());
+    for i in 0..starts.len() {
+        let start = starts[i];
+        let end = if i + 1 < starts.len() {
+            starts[i + 1]
+        } else {
+            data.len()
+        };
+        members.push((start, end));
+    }
+
+    members
+}
+
+/// Decompress a single gzip member using flate2 (fallback)
+fn decompress_member_flate2(data: &[u8]) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = flate2::read::GzDecoder::new(data);
+    let mut output = Vec::new();
+    decoder.read_to_end(&mut output)?;
+    Ok(output)
 }
 
 // =============================================================================
@@ -248,18 +274,105 @@ impl ParallelInflater {
 
     /// Decompress gzip data in parallel
     pub fn decompress<W: Write + Send>(&self, data: &[u8], writer: &mut W) -> io::Result<u64> {
-        // Check for BGZF (easiest to parallelize)
+        // Check for BGZF (easiest to parallelize - has embedded block sizes)
         if detect_bgzf(data) {
             return self.decompress_bgzf(data, writer);
         }
 
-        // For non-BGZF, use single-threaded fast decompress
-        // (parallel speculative decoding is complex)
+        // Check for multi-member (pigz output) - can parallelize per-member
+        let members = find_member_boundaries(data);
+        if members.len() > 1 && self.num_threads > 1 {
+            return self.decompress_multi_member(data, &members, writer);
+        }
+
+        // Single member: use ultra-fast sequential
         let mut output = Vec::new();
+        if crate::ultra_fast_inflate::inflate_gzip_ultra_fast(data, &mut output).is_ok() {
+            let len = output.len() as u64;
+            writer.write_all(&output)?;
+            return Ok(len);
+        }
+
+        // Fallback to simd_inflate
+        output.clear();
         simd_inflate::inflate_gzip_fast(data, &mut output)?;
         let len = output.len() as u64;
         writer.write_all(&output)?;
         Ok(len)
+    }
+
+    /// Decompress multi-member gzip file in parallel (pigz output)
+    fn decompress_multi_member<W: Write + Send>(
+        &self,
+        data: &[u8],
+        members: &[(usize, usize)],
+        writer: &mut W,
+    ) -> io::Result<u64> {
+        let num_members = members.len();
+        let results: Vec<Mutex<Option<ChunkResult>>> =
+            (0..num_members).map(|_| Mutex::new(None)).collect();
+
+        let next_member = AtomicUsize::new(0);
+
+        // Parallel decompression - each member is independent!
+        std::thread::scope(|scope| {
+            for _ in 0..self.num_threads.min(num_members) {
+                let next_ref = &next_member;
+                let results_ref = &results;
+                let members_ref = members;
+
+                scope.spawn(move || loop {
+                    let idx = next_ref.fetch_add(1, Ordering::Relaxed);
+                    if idx >= num_members {
+                        break;
+                    }
+
+                    let (start, end) = members_ref[idx];
+                    let member_data = &data[start..end];
+
+                    // Each member is a complete gzip stream - decompress independently
+                    let mut output = Vec::new();
+                    let result = if crate::ultra_fast_inflate::inflate_gzip_ultra_fast(
+                        member_data,
+                        &mut output,
+                    )
+                    .is_ok()
+                    {
+                        ChunkResult::success(idx, output)
+                    } else {
+                        // Fallback to flate2
+                        match decompress_member_flate2(member_data) {
+                            Ok(decompressed) => ChunkResult::success(idx, decompressed),
+                            Err(e) => ChunkResult::failure(idx, e.to_string()),
+                        }
+                    };
+
+                    *results_ref[idx].lock().unwrap() = Some(result);
+                });
+            }
+        });
+
+        // Collect results in order
+        let mut total = 0u64;
+        for mutex in results.iter() {
+            let result = mutex
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| io::Error::other("Missing result"))?;
+
+            if !result.success {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    result.error.unwrap_or_else(|| "Unknown error".to_string()),
+                ));
+            }
+
+            writer.write_all(&result.data)?;
+            total += result.data.len() as u64;
+        }
+
+        Ok(total)
     }
 
     /// Decompress BGZF file in parallel
@@ -332,6 +445,12 @@ impl ParallelInflater {
 /// Decompress a single BGZF block
 fn decompress_bgzf_block(block_data: &[u8]) -> io::Result<Vec<u8>> {
     let mut output = Vec::new();
+    // Try ultra-fast inflate first
+    if crate::ultra_fast_inflate::inflate_gzip_ultra_fast(block_data, &mut output).is_ok() {
+        return Ok(output);
+    }
+    // Fallback to simd_inflate
+    output.clear();
     simd_inflate::inflate_gzip_fast(block_data, &mut output)?;
     Ok(output)
 }
@@ -347,8 +466,15 @@ pub fn decompress_auto<W: Write + Send>(
     num_threads: usize,
 ) -> io::Result<u64> {
     if data.len() < PARALLEL_THRESHOLD || num_threads == 1 {
-        // Small file or single-threaded: use fast sequential
+        // Small file or single-threaded: use ultra-fast inflate
         let mut output = Vec::new();
+        if crate::ultra_fast_inflate::inflate_gzip_ultra_fast(data, &mut output).is_ok() {
+            let len = output.len() as u64;
+            writer.write_all(&output)?;
+            return Ok(len);
+        }
+        // Fallback to simd_inflate
+        output.clear();
         simd_inflate::inflate_gzip_fast(data, &mut output)?;
         let len = output.len() as u64;
         writer.write_all(&output)?;
@@ -409,5 +535,111 @@ mod tests {
         let compressed = encoder.finish().unwrap();
 
         assert!(!detect_bgzf(&compressed));
+    }
+
+    #[test]
+    fn test_multi_member_detection() {
+        // Create two separate gzip streams
+        let part1 = b"Hello, ";
+        let part2 = b"World!";
+
+        let mut encoder1 = GzEncoder::new(Vec::new(), Compression::default());
+        encoder1.write_all(part1).unwrap();
+        let compressed1 = encoder1.finish().unwrap();
+
+        let mut encoder2 = GzEncoder::new(Vec::new(), Compression::default());
+        encoder2.write_all(part2).unwrap();
+        let compressed2 = encoder2.finish().unwrap();
+
+        // Concatenate them
+        let mut multi = compressed1.clone();
+        multi.extend_from_slice(&compressed2);
+
+        // Test detection
+        let members = find_member_boundaries(&multi);
+        assert_eq!(
+            members.len(),
+            2,
+            "Should find 2 members, found: {:?}",
+            members
+        );
+        assert_eq!(members[0], (0, compressed1.len()));
+        assert_eq!(members[1], (compressed1.len(), multi.len()));
+    }
+
+    #[test]
+    fn test_multi_member_decompress() {
+        // Create two separate gzip streams
+        let part1 = b"Hello, ";
+        let part2 = b"World!";
+
+        let mut encoder1 = GzEncoder::new(Vec::new(), Compression::default());
+        encoder1.write_all(part1).unwrap();
+        let compressed1 = encoder1.finish().unwrap();
+
+        let mut encoder2 = GzEncoder::new(Vec::new(), Compression::default());
+        encoder2.write_all(part2).unwrap();
+        let compressed2 = encoder2.finish().unwrap();
+
+        // Concatenate them
+        let mut multi = compressed1;
+        multi.extend_from_slice(&compressed2);
+
+        // Decompress
+        let inflater = ParallelInflater::new(4);
+        let mut output = Vec::new();
+        inflater.decompress(&multi, &mut output).unwrap();
+
+        // Should get both parts
+        let expected = b"Hello, World!";
+        assert_eq!(&output[..], &expected[..]);
+    }
+
+    #[test]
+    fn test_multi_member_large() {
+        // Create two large gzip streams
+        let part1: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        let part2: Vec<u8> = (0..100_000).map(|i| ((i + 50) % 256) as u8).collect();
+
+        let mut encoder1 = GzEncoder::new(Vec::new(), Compression::default());
+        encoder1.write_all(&part1).unwrap();
+        let compressed1 = encoder1.finish().unwrap();
+
+        let mut encoder2 = GzEncoder::new(Vec::new(), Compression::default());
+        encoder2.write_all(&part2).unwrap();
+        let compressed2 = encoder2.finish().unwrap();
+
+        // Concatenate them
+        let mut multi = compressed1.clone();
+        multi.extend_from_slice(&compressed2);
+
+        eprintln!(
+            "Multi-member size: {}, member1: {}, member2: {}",
+            multi.len(),
+            compressed1.len(),
+            compressed2.len()
+        );
+
+        // Test detection
+        let members = find_member_boundaries(&multi);
+        eprintln!("Found {} members: {:?}", members.len(), members);
+        assert_eq!(members.len(), 2, "Should find 2 members");
+
+        // Decompress with parallel inflater
+        let inflater = ParallelInflater::new(4);
+        let mut output = Vec::new();
+        inflater.decompress(&multi, &mut output).unwrap();
+
+        // Should get both parts
+        let mut expected = part1.clone();
+        expected.extend_from_slice(&part2);
+
+        eprintln!(
+            "Expected: {} bytes, got: {} bytes",
+            expected.len(),
+            output.len()
+        );
+        assert_eq!(output.len(), expected.len(), "Output size mismatch");
+        assert_eq!(output, expected, "Output content mismatch");
     }
 }
