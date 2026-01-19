@@ -352,7 +352,18 @@ inflate_into(deflate_data, out_slice)?;
 | BGZF | 3850 MB/s | 4000+ MB/s | ✅ CLOSE (96%) |
 | Multi-member | Parallel | 3000+ MB/s | ✅ Working |
 | Single-member (CombinedLUT) | 10055 MB/s | 2500+ MB/s | ✅ EXCEEDED |
-| Single-member (silesia) | 574 MB/s | N/A | Complex data, expected |
+| Single-member (silesia, preallocated) | 677 MB/s | 720 MB/s (ISA-L target) | 94% |
+| Single-member (silesia, Vec) | 623 MB/s | N/A | Vec::push overhead |
+
+### Remaining Gap to libdeflate
+
+libdeflate achieves 1368 MB/s on silesia. Our pure Rust achieves 677 MB/s (50%).
+
+The gap is in the decode loop itself:
+1. **Combined entry format**: libdeflate packs all info (literal, length, extra bits, code length) in one u32
+2. **bitsleft -= entry**: Micro-optimization that subtracts whole entry instead of masked low byte
+3. **Aggressive loop unrolling**: 5 words initially, then loops
+4. **Table preload**: Preloads next entry before completing current copy
 
 ### Key Optimizations Implemented (Jan 2026)
 
