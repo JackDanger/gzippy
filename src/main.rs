@@ -8,6 +8,7 @@ use std::path::Path;
 use std::process;
 
 mod block_finder;
+mod block_finder_lut;
 mod cli;
 mod compression;
 mod decompression;
@@ -20,6 +21,7 @@ mod libdeflate_ext;
 mod marker_decode;
 mod optimization;
 mod parallel_compress;
+mod parallel_decompress;
 mod parallel_inflate;
 mod pipelined_compress;
 mod rapidgzip_decoder;

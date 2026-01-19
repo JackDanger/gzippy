@@ -578,24 +578,43 @@ impl MarkerDecoder {
 
     /// Decode all blocks until BFINAL
     pub fn decode_all(&mut self) -> io::Result<()> {
+        self.decode_until(usize::MAX)?;
+        Ok(())
+    }
+
+    /// Decode until output reaches max_output bytes OR stream ends (BFINAL=1)
+    /// Returns Ok(true) if stream ended, Ok(false) if output limit reached
+    pub fn decode_until(&mut self, max_output: usize) -> io::Result<bool> {
         loop {
+            if self.output.len() >= max_output {
+                return Ok(false); // Hit output limit
+            }
+
             match self.decode_block() {
                 Ok(is_final) => {
                     if is_final {
-                        break;
+                        return Ok(true); // Stream ended
                     }
                 }
                 Err(e) => {
                     // If we've decoded a substantial amount and hit EOF, consider it success
-                    // This handles the case where we read past the end of the last block
                     if e.kind() == io::ErrorKind::UnexpectedEof && !self.output.is_empty() {
-                        break;
+                        return Ok(true);
                     }
                     return Err(e);
                 }
             }
         }
-        Ok(())
+    }
+
+    /// Get number of markers in output
+    pub fn marker_count(&self) -> usize {
+        self.marker_count
+    }
+
+    /// Get distance to last marker (for optimization)
+    pub fn distance_to_last_marker(&self) -> usize {
+        self.distance_to_last_marker
     }
 
     /// Get the decoded output
@@ -622,11 +641,6 @@ impl MarkerDecoder {
     /// Check if output contains markers
     pub fn has_markers(&self) -> bool {
         self.marker_count > 0
-    }
-
-    /// Get marker count
-    pub fn marker_count(&self) -> usize {
-        self.marker_count
     }
 
     /// Convert output to bytes using window for marker replacement
