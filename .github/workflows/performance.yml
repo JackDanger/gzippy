@@ -15,8 +15,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_HOME: /home/runner/.cargo
   CARGO_INCREMENTAL: 0
-  # Enable native CPU optimizations for maximum performance
-  RUSTFLAGS: -C target-cpu=native
+  # Don't use -C target-cpu=native - causes SIGILL on heterogeneous CI runners
+  # ISA-L provides SIMD optimizations instead
 
 jobs:
   benchmark:
@@ -50,17 +50,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential zlib1g-dev gzip cmake nasm
 
-      - name: Build gzippy
+      - name: Build ISA-L library
+        run: |
+          cd isa-l
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
+
+      - name: Build gzippy (with ISA-L)
         run: cargo build --release
 
       - name: Build pigz
         run: make -C pigz
 
-      - name: Build igzip (ISA-L)
+      - name: Build igzip tool
         run: |
-          mkdir -p isa-l/build
           cd isa-l/build
-          cmake ..
           make -j$(nproc) igzip
 
       - name: Build zopfli
@@ -116,17 +121,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential zlib1g-dev gzip cmake nasm
 
-      - name: Build gzippy
+      - name: Build ISA-L library
+        run: |
+          cd isa-l
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
+
+      - name: Build gzippy (with ISA-L)
         run: cargo build --release
 
       - name: Build pigz
         run: make -C pigz
 
-      - name: Build igzip (ISA-L)
+      - name: Build igzip tool
         run: |
-          mkdir -p isa-l/build
           cd isa-l/build
-          cmake ..
           make -j$(nproc) igzip
 
       - name: Build zopfli
@@ -174,7 +184,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential zlib1g-dev gzip cmake nasm
 
-      - name: Build gzippy
+      - name: Build ISA-L library
+        run: |
+          cd isa-l
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
+
+      - name: Build gzippy (with ISA-L)
         run: cargo build --release
 
       - name: Build pigz
@@ -284,7 +301,19 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build gzippy
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake nasm
+
+      - name: Build ISA-L library
+        run: |
+          cd isa-l
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
+
+      - name: Build gzippy (with ISA-L)
         run: cargo build --release
 
       - name: Test random data compression/decompression
