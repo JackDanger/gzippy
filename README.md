@@ -6,6 +6,13 @@
 - **30-50% faster** decompression via libdeflate
 - **100% compatible** with standard gzip
 
+## Requirements
+
+- **64-bit operating system** (x86_64 or ARM64)
+- **Linux or macOS** (Windows support planned)
+
+gzippy is optimized for modern 64-bit systems. 32-bit systems should use standard gzip.
+
 ## Install
 
 ### From crates.io
