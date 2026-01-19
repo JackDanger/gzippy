@@ -484,7 +484,15 @@ mod tests {
         std::io::Write::write_all(&mut encoder, original).unwrap();
         let compressed = encoder.finish().unwrap();
 
-        let mut inflater = IsalInflater::new().unwrap();
+        // Skip if ISA-L not available
+        let inflater = match IsalInflater::new() {
+            Ok(i) => i,
+            Err(_) => {
+                eprintln!("ISA-L not available, skipping test");
+                return;
+            }
+        };
+        let mut inflater = inflater;
         let decompressed = inflater.decompress_all(&compressed, 1024).unwrap();
 
         assert_eq!(&decompressed, original);

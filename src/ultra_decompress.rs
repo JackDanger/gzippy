@@ -30,9 +30,9 @@ const PARALLEL_THRESHOLD: usize = 1024 * 1024; // 1MB
 /// Block size for prefetching
 const PREFETCH_SIZE: usize = 256 * 1024; // 256KB
 
-// Thread-local ISA-L inflater
+// Thread-local ISA-L inflater (None if ISA-L not available)
 thread_local! {
-    static INFLATER: RefCell<IsalInflater> = RefCell::new(IsalInflater::new().unwrap());
+    static INFLATER: RefCell<Option<IsalInflater>> = RefCell::new(IsalInflater::new().ok());
 }
 
 /// Main ultra-fast decompressor
@@ -128,19 +128,24 @@ impl UltraDecompressor {
 
                         // Decompress this block
                         let result = INFLATER.with(|inf| {
-                            let mut inflater = inf.borrow_mut();
-                            inflater.reset().ok();
+                            let mut inflater_opt = inf.borrow_mut();
+                            if let Some(ref mut inflater) = *inflater_opt {
+                                inflater.reset().ok();
 
-                            // Get ISIZE hint
-                            let isize_hint = if len >= 8 {
-                                let trailer = &block_data[len - 4..];
-                                u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]])
-                                    as usize
+                                // Get ISIZE hint
+                                let isize_hint = if len >= 8 {
+                                    let trailer = &block_data[len - 4..];
+                                    u32::from_le_bytes([
+                                        trailer[0], trailer[1], trailer[2], trailer[3],
+                                    ]) as usize
+                                } else {
+                                    len * 4
+                                };
+
+                                inflater.decompress_all(block_data, isize_hint.max(1024))
                             } else {
-                                len * 4
-                            };
-
-                            inflater.decompress_all(block_data, isize_hint.max(1024))
+                                Err(io::Error::other("ISA-L not available"))
+                            }
                         });
 
                         match result {
@@ -213,22 +218,32 @@ impl UltraDecompressor {
     /// Optimized sequential decompression
     fn decompress_sequential<W: Write>(&self, data: &[u8], writer: &mut W) -> io::Result<u64> {
         INFLATER.with(|inf| {
-            let mut inflater = inf.borrow_mut();
-            inflater.reset().ok();
+            let mut inflater_opt = inf.borrow_mut();
+            if let Some(ref mut inflater) = *inflater_opt {
+                inflater.reset().ok();
 
-            // Get ISIZE hint
-            let isize_hint = if data.len() >= 8 {
-                let trailer = &data[data.len() - 4..];
-                u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]) as usize
+                // Get ISIZE hint
+                let isize_hint = if data.len() >= 8 {
+                    let trailer = &data[data.len() - 4..];
+                    u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]) as usize
+                } else {
+                    data.len() * 4
+                };
+
+                let output = inflater.decompress_all(data, isize_hint.max(1024))?;
+                writer.write_all(&output)?;
+                writer.flush()?;
+
+                Ok(output.len() as u64)
             } else {
-                data.len() * 4
-            };
-
-            let output = inflater.decompress_all(data, isize_hint.max(1024))?;
-            writer.write_all(&output)?;
-            writer.flush()?;
-
-            Ok(output.len() as u64)
+                // Fallback to flate2
+                let mut decoder = flate2::read::GzDecoder::new(data);
+                let mut output = Vec::new();
+                decoder.read_to_end(&mut output)?;
+                writer.write_all(&output)?;
+                writer.flush()?;
+                Ok(output.len() as u64)
+            }
         })
     }
 }

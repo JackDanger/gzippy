@@ -2,9 +2,9 @@ name: Performance
 
 on:
   push:
-    branches: [main]
+    branches: ["*"]  # All branches
   pull_request:
-    branches: [main]
+    branches: ["*"]  # All PRs
   workflow_dispatch:  # Allow manual runs
 
 # Minimal permissions for security

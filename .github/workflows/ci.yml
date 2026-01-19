@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ["*"]  # All branches
   pull_request:
-    branches: [main]
+    branches: ["*"]  # All PRs
 
 # Minimal permissions for security (validate job overrides for PR comments)
 permissions:

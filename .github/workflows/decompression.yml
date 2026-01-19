@@ -1,0 +1,250 @@
+name: Decompression Benchmarks
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+    branches: ["*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -C target-cpu=native
+
+jobs:
+  # Build rapidgzip for comparison
+  build-tools:
+    name: Build Comparison Tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake nasm zlib1g-dev python3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build gzippy
+        run: cargo build --release
+
+      - name: Build pigz
+        run: make -C pigz
+
+      - name: Build rapidgzip
+        run: |
+          cd rapidgzip
+          pip3 install --user .
+          # Also build CLI if available
+          which rapidgzip || echo "Using Python module"
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: tools
+          path: |
+            target/release/gzippy
+            pigz/pigz
+            pigz/unpigz
+
+  # Test decompression of files created by different tools
+  decompress-matrix:
+    name: Decompress ${{ matrix.source }}-L${{ matrix.level }} T${{ matrix.threads }}
+    runs-on: ubuntu-latest
+    needs: build-tools
+    strategy:
+      fail-fast: false
+      matrix:
+        # Source tool that created the file
+        source: [gzippy, pigz, gzip]
+        level: [1, 6, 9]
+        threads: [1, 4]
+        size_mb: [10, 100]
+        content: [text, random]
+        exclude:
+          # gzip is single-threaded, don't test T4 creation
+          - source: gzip
+            threads: 4
+          # Random data at L9 is slow and uninteresting
+          - content: random
+            level: 9
+            size_mb: 100
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake nasm zlib1g-dev python3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build gzippy
+        run: cargo build --release
+
+      - name: Build pigz
+        run: make -C pigz
+
+      - name: Install rapidgzip
+        run: |
+          cd rapidgzip
+          pip3 install --user .
+
+      - name: Generate test data
+        run: |
+          if [ "${{ matrix.content }}" = "text" ]; then
+            python3 -c "
+          import random
+          random.seed(42)
+          words = ['the', 'quick', 'brown', 'fox', 'jumps', 'over', 'lazy', 'dog', 'and', 'cat']
+          with open('/tmp/test.dat', 'w') as f:
+              target = ${{ matrix.size_mb }} * 1024 * 1024
+              written = 0
+              while written < target:
+                  line = ' '.join(random.choices(words, k=10)) + '\n'
+                  f.write(line)
+                  written += len(line)
+          "
+          else
+            dd if=/dev/urandom of=/tmp/test.dat bs=1M count=${{ matrix.size_mb }} 2>/dev/null
+          fi
+          echo "Test data: $(stat -c%s /tmp/test.dat) bytes"
+
+      - name: Create compressed file
+        run: |
+          LEVEL=${{ matrix.level }}
+          THREADS=${{ matrix.threads }}
+          
+          case "${{ matrix.source }}" in
+            gzippy)
+              ./target/release/gzippy -$LEVEL -p$THREADS -c /tmp/test.dat > /tmp/test.gz
+              ;;
+            pigz)
+              ./pigz/pigz -$LEVEL -p$THREADS -c /tmp/test.dat > /tmp/test.gz
+              ;;
+            gzip)
+              gzip -$LEVEL -c /tmp/test.dat > /tmp/test.gz
+              ;;
+          esac
+          echo "Compressed: $(stat -c%s /tmp/test.gz) bytes"
+
+      - name: Benchmark decompression
+        run: |
+          echo "=== Decompression Benchmark ==="
+          echo "Source: ${{ matrix.source }} -${{ matrix.level }}"
+          echo "Threads: ${{ matrix.threads }}"
+          echo "Content: ${{ matrix.content }}"
+          echo "Size: ${{ matrix.size_mb }}MB"
+          echo ""
+          
+          COMPRESSED_SIZE=$(stat -c%s /tmp/test.gz)
+          ORIGINAL_SIZE=$(stat -c%s /tmp/test.dat)
+          
+          echo "| Tool | Threads | Time (s) | MB/s | Status |"
+          echo "|------|---------|----------|------|--------|"
+          
+          # gzippy decompression
+          for t in 1 ${{ matrix.threads }}; do
+            START=$(date +%s.%N)
+            ./target/release/gzippy -d -p$t < /tmp/test.gz > /tmp/out_gzippy.dat 2>/dev/null
+            END=$(date +%s.%N)
+            TIME=$(echo "$END - $START" | bc)
+            SPEED=$(echo "scale=1; $ORIGINAL_SIZE / 1048576 / $TIME" | bc)
+            
+            if diff -q /tmp/test.dat /tmp/out_gzippy.dat > /dev/null; then
+              STATUS="✓"
+            else
+              STATUS="✗ MISMATCH"
+            fi
+            echo "| gzippy | $t | $TIME | $SPEED | $STATUS |"
+          done
+          
+          # pigz decompression
+          for t in 1 ${{ matrix.threads }}; do
+            START=$(date +%s.%N)
+            ./pigz/unpigz -p$t < /tmp/test.gz > /tmp/out_pigz.dat 2>/dev/null
+            END=$(date +%s.%N)
+            TIME=$(echo "$END - $START" | bc)
+            SPEED=$(echo "scale=1; $ORIGINAL_SIZE / 1048576 / $TIME" | bc)
+            
+            if diff -q /tmp/test.dat /tmp/out_pigz.dat > /dev/null; then
+              STATUS="✓"
+            else
+              STATUS="✗ MISMATCH"
+            fi
+            echo "| pigz | $t | $TIME | $SPEED | $STATUS |"
+          done
+          
+          # gzip decompression (single-threaded baseline)
+          START=$(date +%s.%N)
+          gzip -d < /tmp/test.gz > /tmp/out_gzip.dat 2>/dev/null
+          END=$(date +%s.%N)
+          TIME=$(echo "$END - $START" | bc)
+          SPEED=$(echo "scale=1; $ORIGINAL_SIZE / 1048576 / $TIME" | bc)
+          
+          if diff -q /tmp/test.dat /tmp/out_gzip.dat > /dev/null; then
+            STATUS="✓"
+          else
+            STATUS="✗ MISMATCH"
+          fi
+          echo "| gzip | 1 | $TIME | $SPEED | $STATUS |"
+          
+          # rapidgzip decompression (if available)
+          if python3 -c "import rapidgzip" 2>/dev/null; then
+            for t in 1 ${{ matrix.threads }}; do
+              START=$(date +%s.%N)
+              python3 -c "
+          import rapidgzip
+          import sys
+          with rapidgzip.open('/tmp/test.gz', parallelization=$t) as f:
+              data = f.read()
+              sys.stdout.buffer.write(data)
+          " > /tmp/out_rapidgzip.dat 2>/dev/null
+              END=$(date +%s.%N)
+              TIME=$(echo "$END - $START" | bc)
+              SPEED=$(echo "scale=1; $ORIGINAL_SIZE / 1048576 / $TIME" | bc)
+              
+              if diff -q /tmp/test.dat /tmp/out_rapidgzip.dat > /dev/null; then
+                STATUS="✓"
+              else
+                STATUS="✗ MISMATCH"
+              fi
+              echo "| rapidgzip | $t | $TIME | $SPEED | $STATUS |"
+            done
+          fi
+
+  # Summary job
+  summary:
+    name: Decompression Summary
+    runs-on: ubuntu-latest
+    needs: decompress-matrix
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Decompression Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Tools Compared" >> $GITHUB_STEP_SUMMARY
+          echo "- **gzippy**: This project" >> $GITHUB_STEP_SUMMARY
+          echo "- **pigz**: Parallel gzip (baseline)" >> $GITHUB_STEP_SUMMARY
+          echo "- **gzip**: Standard gzip (single-threaded)" >> $GITHUB_STEP_SUMMARY
+          echo "- **rapidgzip**: Parallel decompression specialist" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Test Matrix" >> $GITHUB_STEP_SUMMARY
+          echo "- Sources: gzippy, pigz, gzip" >> $GITHUB_STEP_SUMMARY
+          echo "- Levels: 1, 6, 9" >> $GITHUB_STEP_SUMMARY
+          echo "- Threads: 1, 4" >> $GITHUB_STEP_SUMMARY
+          echo "- Sizes: 10MB, 100MB" >> $GITHUB_STEP_SUMMARY
+          echo "- Content: text, random" >> $GITHUB_STEP_SUMMARY
