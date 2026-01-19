@@ -763,6 +763,70 @@ pub fn inflate_gzip_ultra_fast(input: &[u8], output: &mut Vec<u8>) -> io::Result
     Ok(bytes_written)
 }
 
+/// Pre-allocated inflate using slice writes (no Vec::push overhead)
+/// Uses ISIZE to pre-allocate exact output size, then writes directly to slice
+pub fn inflate_gzip_preallocated(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
+    if input.len() < 18 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Input too short",
+        ));
+    }
+
+    if input[0] != 0x1f || input[1] != 0x8b || input[2] != 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Not a gzip file",
+        ));
+    }
+
+    let flags = input[3];
+    let mut pos = 10;
+
+    // Skip optional header fields
+    if flags & 0x04 != 0 {
+        let xlen = u16::from_le_bytes([input[pos], input[pos + 1]]) as usize;
+        pos += 2 + xlen;
+    }
+    if flags & 0x08 != 0 {
+        while pos < input.len() && input[pos] != 0 {
+            pos += 1;
+        }
+        pos += 1;
+    }
+    if flags & 0x10 != 0 {
+        while pos < input.len() && input[pos] != 0 {
+            pos += 1;
+        }
+        pos += 1;
+    }
+    if flags & 0x02 != 0 {
+        pos += 2;
+    }
+
+    // Read ISIZE from trailer
+    let n = input.len();
+    let isize =
+        u32::from_le_bytes([input[n - 4], input[n - 3], input[n - 2], input[n - 1]]) as usize;
+
+    // Pre-allocate exact output size
+    let start_len = output.len();
+    output.resize(start_len + isize, 0);
+
+    let deflate_data = &input[pos..n.saturating_sub(8)];
+    let out_slice = &mut output[start_len..start_len + isize];
+
+    // Use bgzf's optimized inflate_into
+    let written = crate::bgzf::inflate_into_pub(deflate_data, out_slice)?;
+
+    // Truncate if we wrote less than expected (shouldn't happen for valid files)
+    if written < isize {
+        output.truncate(start_len + written);
+    }
+
+    Ok(written)
+}
+
 /// Inflate using CombinedLUT for pre-computed length+distance lookup
 /// This is rapidgzip's key optimization - expected +50% speedup
 pub fn inflate_combined(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
@@ -1207,10 +1271,24 @@ mod dict_benchmark {
         let libdeflate_time = start.elapsed() / 3;
         let libdeflate_speed = expected_size as f64 / libdeflate_time.as_secs_f64() / 1_000_000.0;
 
+        // Benchmark preallocated version
+        let start = std::time::Instant::now();
+        for _ in 0..3 {
+            let mut output = Vec::new();
+            inflate_gzip_preallocated(&data, &mut output).unwrap();
+            assert_eq!(output.len(), expected_size);
+        }
+        let prealloc_time = start.elapsed() / 3;
+        let prealloc_speed = expected_size as f64 / prealloc_time.as_secs_f64() / 1_000_000.0;
+
         eprintln!("\n=== Pure Rust vs libdeflate ===");
         eprintln!(
-            "ultra_fast_inflate (Rust): {:?} = {:.1} MB/s",
+            "ultra_fast_inflate (Vec):  {:?} = {:.1} MB/s",
             ultra_time, ultra_speed
+        );
+        eprintln!(
+            "preallocated (slice):      {:?} = {:.1} MB/s",
+            prealloc_time, prealloc_speed
         );
         eprintln!(
             "libdeflate (C):            {:?} = {:.1} MB/s",

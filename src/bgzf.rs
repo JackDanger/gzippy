@@ -187,6 +187,11 @@ fn calculate_deflate_offset(block: &[u8]) -> usize {
 /// This is the key function for zero-copy parallel decompression.
 /// Uses our CombinedLUT for maximum speed (10700+ MB/s single-threaded).
 fn inflate_into(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
+    inflate_into_pub(deflate_data, output)
+}
+
+/// Public version of inflate_into for use by other modules
+pub fn inflate_into_pub(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
     let mut bits = FastBits::new(deflate_data);
     let mut out_pos = 0;
 
