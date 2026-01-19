@@ -28,7 +28,9 @@ mod simd_copy;
 mod simd_inflate;
 mod simple_optimizations;
 mod turbo_inflate;
+mod two_level_table;
 mod ultra_decompress;
+mod ultra_fast_inflate;
 mod ultra_inflate;
 mod utils;
 
