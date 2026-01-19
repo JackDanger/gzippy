@@ -7,7 +7,6 @@ use std::env;
 use std::path::Path;
 use std::process;
 
-mod arch_specific;
 mod bgzf;
 mod block_finder;
 mod block_finder_lut;
@@ -17,7 +16,6 @@ mod compression;
 mod decompression;
 mod error;
 mod fast_inflate;
-mod fixed_turbo;
 mod format;
 mod inflate_tables;
 mod isal;
