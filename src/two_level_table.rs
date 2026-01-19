@@ -344,9 +344,21 @@ impl<'a> FastBits<'a> {
     }
 
     /// Peek up to 15 bits
+    ///
+    /// Uses BMI2 `bzhi` instruction when available for faster bit extraction.
+    /// On x86_64 with BMI2: single `bzhi` instruction
+    /// On other platforms: shift + subtract + and (3 operations)
     #[inline(always)]
     pub fn peek(&self, n: u32) -> u64 {
-        self.buf & ((1u64 << n) - 1)
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        {
+            // BMI2: bzhi extracts lowest n bits in single instruction
+            unsafe { std::arch::x86_64::_bzhi_u64(self.buf, n) }
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        {
+            self.buf & ((1u64 << n) - 1)
+        }
     }
 
     /// Consume n bits - uses saturating subtraction to prevent underflow
