@@ -24,6 +24,7 @@ mod parallel_decompress;
 mod parallel_inflate;
 mod pipelined_compress;
 mod rapidgzip_algo;
+mod rapidgzip_decoder;
 mod scheduler;
 mod simple_optimizations;
 mod speculative_decompress;
