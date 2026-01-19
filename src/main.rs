@@ -10,15 +10,18 @@ use std::process;
 mod block_finder;
 mod block_finder_lut;
 mod cli;
+mod combined_lut;
 mod compression;
 mod decompression;
 mod error;
+mod fast_decode;
 mod fast_inflate;
 mod format;
 mod inflate_tables;
 mod isal;
 mod libdeflate_ext;
 mod marker_decode;
+mod multi_sym_decode;
 mod optimization;
 mod parallel_compress;
 mod parallel_decompress;
@@ -29,6 +32,7 @@ mod scheduler;
 mod simd_copy;
 mod simd_inflate;
 mod simple_optimizations;
+mod turbo_decode;
 mod turbo_inflate;
 mod two_level_table;
 mod ultra_decompress;
@@ -152,7 +156,7 @@ fn print_help() {
 }
 
 fn print_license() {
-    println!("gzippy - The fastest parallel gzip");
+    println!("gzippy - The fastest gzip");
     println!();
     println!("Inspired by pigz by Mark Adler, Copyright (C) 2007-2023");
     println!();

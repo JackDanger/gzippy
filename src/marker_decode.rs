@@ -1170,3 +1170,68 @@ mod speculative_tests {
         assert_eq!(output, expected, "Content mismatch");
     }
 }
+
+#[cfg(test)]
+mod redecode_benchmark {
+    use super::*;
+
+    #[test]
+    fn benchmark_marker_vs_libdeflate() {
+        let data = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("Skipping - no benchmark file");
+                return;
+            }
+        };
+
+        // Get expected size from flate2
+        use std::io::Read;
+        let mut flate2_decoder = flate2::read::GzDecoder::new(&data[..]);
+        let mut expected = Vec::new();
+        flate2_decoder.read_to_end(&mut expected).unwrap();
+        let expected_size = expected.len();
+        drop(expected);
+
+        // Benchmark MarkerDecoder
+        let start = std::time::Instant::now();
+        for _ in 0..3 {
+            let header_size = skip_gzip_header(&data).unwrap();
+            let deflate_data = &data[header_size..data.len() - 8];
+            let mut decoder = MarkerDecoder::new(deflate_data, 0);
+            decoder.decode_all().unwrap();
+            assert_eq!(decoder.output().len(), expected_size);
+        }
+        let marker_time = start.elapsed() / 3;
+        let marker_speed = expected_size as f64 / marker_time.as_secs_f64() / 1_000_000.0;
+
+        // Benchmark libdeflate
+        let start = std::time::Instant::now();
+        for _ in 0..3 {
+            let mut decompressor = libdeflater::Decompressor::new();
+            let mut output = vec![0u8; expected_size + 1024];
+            let _ = decompressor.gzip_decompress(&data, &mut output);
+        }
+        let libdeflate_time = start.elapsed() / 3;
+        let libdeflate_speed = expected_size as f64 / libdeflate_time.as_secs_f64() / 1_000_000.0;
+
+        eprintln!("\n=== Decode Speed Comparison ===");
+        eprintln!(
+            "MarkerDecoder:  {:?} = {:.1} MB/s",
+            marker_time, marker_speed
+        );
+        eprintln!(
+            "libdeflate:     {:?} = {:.1} MB/s",
+            libdeflate_time, libdeflate_speed
+        );
+        eprintln!(
+            "Gap: libdeflate is {:.1}x faster",
+            libdeflate_speed / marker_speed
+        );
+        eprintln!("\nKey insight: After MarkerDecoder finds boundaries,");
+        eprintln!(
+            "re-decode with libdeflate for {:.1}x speedup!",
+            libdeflate_speed / marker_speed
+        );
+    }
+}

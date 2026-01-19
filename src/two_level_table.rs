@@ -19,7 +19,7 @@ use crate::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_STA
 // =============================================================================
 
 /// Primary table bits (10 bits = 1024 entries = 2KB for u16)
-/// This fits in L1 cache for maximum decode speed
+/// Optimal for L1 cache on most architectures
 const L1_BITS: u32 = 10;
 const L1_SIZE: usize = 1 << L1_BITS;
 const L1_MASK: usize = L1_SIZE - 1;
@@ -337,6 +337,12 @@ impl<'a> FastBits<'a> {
     pub fn buffer(&self) -> u64 {
         self.buf
     }
+
+    /// Get current bit count
+    #[inline(always)]
+    pub fn bits_available(&self) -> u32 {
+        self.bits
+    }
 }
 
 // =============================================================================
@@ -536,5 +542,68 @@ mod tests {
             libdeflate_avg, libdeflate_mbps
         );
         println!("Target: Match this performance with two-level tables");
+    }
+}
+
+#[cfg(test)]
+mod fastbits_tests {
+    use super::*;
+
+    #[test]
+    fn test_fastbits_read_write() {
+        let data = [0b10101010u8, 0b11001100, 0b11110000, 0b00001111];
+        let mut bits = FastBits::new(&data);
+
+        // Read first 4 bits
+        assert_eq!(bits.read(4), 0b1010);
+        // Read next 4 bits
+        assert_eq!(bits.read(4), 0b1010);
+        // Read next 8 bits (crosses byte boundary)
+        assert_eq!(bits.read(8), 0b11001100);
+    }
+
+    #[test]
+    fn test_fastbits_peek_consume() {
+        let data = [0x12, 0x34, 0x56, 0x78];
+        let mut bits = FastBits::new(&data);
+
+        // Peek should not consume
+        let val1 = bits.peek(8);
+        let val2 = bits.peek(8);
+        assert_eq!(val1, val2);
+
+        // Consume then peek should give different value
+        bits.consume(8);
+        let val3 = bits.peek(8);
+        assert_ne!(val1, val3);
+    }
+
+    #[test]
+    fn test_fastbits_refill() {
+        let data = vec![0xFFu8; 100];
+        let mut bits = FastBits::new(&data);
+
+        // Consume many bits, then refill
+        for _ in 0..20 {
+            bits.read(8);
+            bits.refill();
+        }
+
+        // Should still work
+        assert!(bits.bits_available() >= 16);
+    }
+
+    #[test]
+    fn test_fastbits_align() {
+        let data = [0xFF, 0xAA, 0x55];
+        let mut bits = FastBits::new(&data);
+
+        // Read 5 bits
+        bits.read(5);
+        // Align to byte
+        bits.align();
+        // Now we should be at byte boundary
+        let next = bits.read(8);
+        assert_eq!(next, 0xAA);
     }
 }

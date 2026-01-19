@@ -14,3 +14,6 @@
 [submodule "rapidgzip"]
 	path = rapidgzip
 	url = https://github.com/mxmlnkn/rapidgzip.git
+[submodule "libdeflate"]
+	path = libdeflate
+	url = https://github.com/ebiggers/libdeflate.git

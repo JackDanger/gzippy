@@ -263,94 +263,74 @@ unsafe fn fill_rle(dst: *mut u8, byte: u8, mut length: usize) {
 }
 
 /// Copy small pattern (distance 2-7) with SIMD pattern expansion
+/// CRITICAL: Only distances that divide evenly into 8 can use SIMD broadcast
+/// (distances 1, 2, 4, 8). Others must use byte-by-byte copy.
 #[inline(always)]
 unsafe fn copy_small_pattern(src: *const u8, dst: *mut u8, distance: usize, mut length: usize) {
-    // Extract the base pattern and expand it to 8 bytes
-    let pattern = match distance {
+    match distance {
         2 => {
+            // Distance 2 divides 8 evenly - can use SIMD
             let a = *src;
             let b = *src.add(1);
-            u64::from_le_bytes([a, b, a, b, a, b, a, b])
-        }
-        3 => {
-            let a = *src;
-            let b = *src.add(1);
-            let c = *src.add(2);
-            // Pattern: abc abc ab (8 bytes, repeats at 24)
-            u64::from_le_bytes([a, b, c, a, b, c, a, b])
+            let pattern = u64::from_le_bytes([a, b, a, b, a, b, a, b]);
+            let mut p = dst;
+
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                while length >= 32 {
+                    avx2::fill_qword_32(pattern, p);
+                    p = p.add(32);
+                    length -= 32;
+                }
+            }
+
+            while length >= 8 {
+                (p as *mut u64).write_unaligned(pattern);
+                p = p.add(8);
+                length -= 8;
+            }
+
+            // Remainder
+            for i in 0..length {
+                *p.add(i) = *src.add(i % 2);
+            }
         }
         4 => {
+            // Distance 4 divides 8 evenly - can use SIMD
             let a = *src;
             let b = *src.add(1);
             let c = *src.add(2);
             let d = *src.add(3);
-            u64::from_le_bytes([a, b, c, d, a, b, c, d])
-        }
-        5 => {
-            let a = *src;
-            let b = *src.add(1);
-            let c = *src.add(2);
-            let d = *src.add(3);
-            let e = *src.add(4);
-            u64::from_le_bytes([a, b, c, d, e, a, b, c])
-        }
-        6 => {
-            let a = *src;
-            let b = *src.add(1);
-            let c = *src.add(2);
-            let d = *src.add(3);
-            let e = *src.add(4);
-            let f = *src.add(5);
-            u64::from_le_bytes([a, b, c, d, e, f, a, b])
-        }
-        7 => {
-            let a = *src;
-            let b = *src.add(1);
-            let c = *src.add(2);
-            let d = *src.add(3);
-            let e = *src.add(4);
-            let f = *src.add(5);
-            let g = *src.add(6);
-            u64::from_le_bytes([a, b, c, d, e, f, g, a])
+            let pattern = u64::from_le_bytes([a, b, c, d, a, b, c, d]);
+            let mut p = dst;
+
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                while length >= 32 {
+                    avx2::fill_qword_32(pattern, p);
+                    p = p.add(32);
+                    length -= 32;
+                }
+            }
+
+            while length >= 8 {
+                (p as *mut u64).write_unaligned(pattern);
+                p = p.add(8);
+                length -= 8;
+            }
+
+            // Remainder
+            for i in 0..length {
+                *p.add(i) = *src.add(i % 4);
+            }
         }
         _ => {
-            // Fallback for other distances
+            // Distances 3, 5, 6, 7 don't divide 8 evenly
+            // Must use byte-by-byte copy to ensure correctness
             for i in 0..length {
                 *dst.add(i) = *src.add(i % distance);
             }
-            return;
         }
-    };
-
-    let mut p = dst;
-
-    // Use SIMD to broadcast the 8-byte pattern
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    {
-        // Broadcast 8-byte pattern to 32 bytes
-        while length >= 32 {
-            avx2::fill_qword_32(pattern, p);
-            p = p.add(32);
-            length -= 32;
-        }
-    }
-
-    // Write 8-byte chunks for remainder
-    while length >= 8 {
-        (p as *mut u64).write_unaligned(pattern);
-        p = p.add(8);
-        length -= 8;
-    }
-
-    // Handle final bytes (respecting the actual pattern for non-power-of-2 distances)
-    if length > 0 {
-        let pattern_bytes = pattern.to_le_bytes();
-        let out_offset = (dst.offset_from(p) as usize) % distance;
-        for i in 0..length {
-            *p.add(i) = *src.add((out_offset + i) % distance);
-        }
-        // Silence warning about unused variable
-        let _ = pattern_bytes;
     }
 }
 
@@ -464,5 +444,56 @@ mod tests {
         println!("\n=== SIMD Copy Benchmark ===");
         println!("10K copies of 900 bytes: {:?}", elapsed);
         println!("Per copy: {:?}", elapsed / 10000);
+    }
+}
+
+#[cfg(test)]
+mod simd_tests {
+    use super::*;
+
+    #[test]
+    fn test_rle_copy() {
+        // RLE: distance 1, repeat single byte
+        let mut buf = vec![b'A'];
+        lz77_copy_fast(&mut buf, 1, 32);
+        assert_eq!(buf.len(), 33);
+        assert!(buf.iter().all(|&b| b == b'A'), "All bytes should be 'A'");
+    }
+
+    #[test]
+    fn test_pattern_copy_dist_2() {
+        // Distance 2: repeat 2-byte pattern
+        let mut buf = vec![b'A', b'B'];
+        lz77_copy_fast(&mut buf, 2, 32);
+        assert_eq!(buf.len(), 34);
+        for (i, &byte) in buf.iter().enumerate() {
+            let expected = if i % 2 == 0 { b'A' } else { b'B' };
+            assert_eq!(byte, expected, "Pattern mismatch at {}", i);
+        }
+    }
+
+    #[test]
+    fn test_large_copy() {
+        // Large distance, large length
+        let mut buf: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+        let original = buf.clone();
+        lz77_copy_fast(&mut buf, 500, 500);
+        assert_eq!(buf.len(), 1500);
+        // First 1000 bytes unchanged
+        assert_eq!(&buf[..1000], &original[..]);
+        // Next 500 bytes are copy from offset 500
+        assert_eq!(&buf[1000..1500], &original[500..1000]);
+    }
+
+    #[test]
+    fn test_overlapping_copy() {
+        // Overlapping: distance < length
+        let mut buf = vec![1u8, 2, 3, 4];
+        lz77_copy_fast(&mut buf, 4, 12);
+        assert_eq!(buf.len(), 16);
+        // Should repeat: 1,2,3,4,1,2,3,4,1,2,3,4,1,2,3,4
+        for (i, &byte) in buf.iter().enumerate() {
+            assert_eq!(byte, ((i % 4) + 1) as u8, "Mismatch at {}", i);
+        }
     }
 }

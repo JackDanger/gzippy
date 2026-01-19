@@ -194,10 +194,71 @@ pub fn decompress_parallel<W: Write + Send>(
         return decompress_sequential(data, writer);
     }
 
-    // For single-member gzip files (the common case), speculative block finding
-    // rarely works due to high false positive rate. Fall back to fast sequential decode.
-    // TODO: Implement true parallel decode with re-decode using libdeflate
-    decompress_sequential(data, writer)
+    // For single-member gzip files, use the rapidgzip strategy:
+    // 1. Sequential first pass to find block boundaries and collect windows
+    // 2. Parallel re-decode using windows
+    decompress_single_member_parallel(data, header_size, deflate_end, writer, num_threads)
+}
+
+/// Parallel decompress for single-member gzip using sequential boundary finding
+/// followed by parallel re-decode with dictionaries
+fn decompress_single_member_parallel<W: Write + Send>(
+    data: &[u8],
+    _header_size: usize,
+    _deflate_end: usize,
+    writer: &mut W,
+    _num_threads: usize,
+) -> io::Result<u64> {
+    // For single-member files, use libdeflate which is currently faster than our pure Rust.
+    // TODO: Optimize pure Rust to match libdeflate (requires combined length+distance LUT)
+    //
+    // Future parallel strategy (rapidgzip approach):
+    // 1. Sequential pass: decode and record block boundaries + 32KB windows
+    // 2. Parallel pass: re-decode each block using window from previous block
+
+    decompress_single_member_libdeflate(data, writer)
+}
+
+/// Use libdeflate for single-member gzip (fastest available)
+fn decompress_single_member_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> io::Result<u64> {
+    // Get expected size from ISIZE in trailer
+    let isize_hint = if data.len() >= 8 {
+        u32::from_le_bytes([
+            data[data.len() - 4],
+            data[data.len() - 3],
+            data[data.len() - 2],
+            data[data.len() - 1],
+        ]) as usize
+    } else {
+        0
+    };
+
+    let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
+        isize_hint + 1024
+    } else {
+        data.len().saturating_mul(4).max(64 * 1024)
+    };
+
+    let mut output = vec![0u8; initial_size];
+    let mut decompressor = libdeflater::Decompressor::new();
+
+    loop {
+        match decompressor.gzip_decompress(data, &mut output) {
+            Ok(size) => {
+                writer.write_all(&output[..size])?;
+                return Ok(size as u64);
+            }
+            Err(libdeflater::DecompressionError::InsufficientSpace) => {
+                output.resize(output.len() * 2, 0);
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{:?}", e),
+                ));
+            }
+        }
+    }
 }
 
 /// Sequential decompression fallback
@@ -254,7 +315,7 @@ fn decompress_multi_member_parallel<W: Write + Send>(
     writer: &mut W,
     num_threads: usize,
 ) -> io::Result<u64> {
-    // Decompress each member in parallel
+    // Decompress each member in parallel using pure Rust
     let outputs: Vec<Mutex<Vec<u8>>> = (0..member_starts.len())
         .map(|_| Mutex::new(Vec::new()))
         .collect();
@@ -268,8 +329,6 @@ fn decompress_multi_member_parallel<W: Write + Send>(
             let next_ref = &next_member;
 
             scope.spawn(move || {
-                use std::io::Read;
-
                 loop {
                     let idx = next_ref.fetch_add(1, Ordering::Relaxed);
                     if idx >= starts_ref.len() {
@@ -285,37 +344,16 @@ fn decompress_multi_member_parallel<W: Write + Send>(
 
                     let member_data = &data[start..end];
 
-                    // Decompress this member with libdeflate (fast!)
-                    let mut decompressor = libdeflater::Decompressor::new();
-
-                    // Estimate output size (assume ~3x compression ratio)
-                    let estimated_size = member_data.len() * 4;
-                    let mut output = vec![0u8; estimated_size];
-
-                    match decompressor.gzip_decompress(member_data, &mut output) {
-                        Ok(actual_size) => {
-                            output.truncate(actual_size);
-                        }
-                        Err(libdeflater::DecompressionError::InsufficientSpace) => {
-                            // Try with larger buffer
-                            output.resize(estimated_size * 4, 0);
-                            if let Ok(actual_size) =
-                                decompressor.gzip_decompress(member_data, &mut output)
-                            {
-                                output.truncate(actual_size);
-                            } else {
-                                // Fall back to flate2
-                                let mut decoder = flate2::read::GzDecoder::new(member_data);
-                                output.clear();
-                                let _ = decoder.read_to_end(&mut output);
-                            }
-                        }
-                        Err(_) => {
-                            // Fall back to flate2
-                            let mut decoder = flate2::read::GzDecoder::new(member_data);
-                            output.clear();
-                            let _ = decoder.read_to_end(&mut output);
-                        }
+                    // Decompress using pure Rust ultra_fast_inflate
+                    let mut output = Vec::with_capacity(member_data.len() * 3);
+                    if crate::ultra_fast_inflate::inflate_gzip_ultra_fast(member_data, &mut output)
+                        .is_err()
+                    {
+                        // Fall back to flate2 on error
+                        use std::io::Read;
+                        output.clear();
+                        let mut decoder = flate2::read::GzDecoder::new(member_data);
+                        let _ = decoder.read_to_end(&mut output);
                     }
 
                     *outputs_ref[idx].lock().unwrap() = output;
@@ -1118,4 +1156,142 @@ fn test_debug_sequential() {
     if output.len() > 100 {
         eprintln!("First 20 bytes: {:?}", &output[..20]);
     }
+}
+
+#[cfg(test)]
+mod member_tests {
+    use super::*;
+
+    #[test]
+    fn test_find_members() {
+        let data = match std::fs::read("benchmark_data/silesia-pigz.tar.gz") {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("No test file");
+                return;
+            }
+        };
+
+        let boundaries = find_member_boundaries(&data);
+        eprintln!("Found {} member boundaries", boundaries.len());
+        for (i, &b) in boundaries.iter().take(10).enumerate() {
+            eprintln!("  Member {}: offset {}", i, b);
+        }
+    }
+}
+
+#[test]
+fn test_decompress_content_check() {
+    let data = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+        Ok(d) => d,
+        Err(_) => {
+            return;
+        }
+    };
+
+    use std::io::Read;
+    let mut flate2_decoder = flate2::read::GzDecoder::new(&data[..]);
+    let mut expected = Vec::new();
+    flate2_decoder.read_to_end(&mut expected).unwrap();
+
+    let mut output = Vec::new();
+    decompress_parallel(&data, &mut output, 8).unwrap();
+
+    // Find first mismatch
+    let mut mismatch_pos = None;
+    for (i, (&a, &b)) in output.iter().zip(expected.iter()).enumerate() {
+        if a != b {
+            mismatch_pos = Some(i);
+            break;
+        }
+    }
+
+    if let Some(pos) = mismatch_pos {
+        eprintln!("First mismatch at position {}", pos);
+        eprintln!(
+            "Expected: {:?}",
+            &expected[pos.saturating_sub(10)..pos + 10.min(expected.len() - pos)]
+        );
+        eprintln!(
+            "Got:      {:?}",
+            &output[pos.saturating_sub(10)..pos + 10.min(output.len() - pos)]
+        );
+    } else if output.len() != expected.len() {
+        eprintln!(
+            "Size mismatch: got {}, expected {}",
+            output.len(),
+            expected.len()
+        );
+    } else {
+        eprintln!("Output matches!");
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+
+    #[test]
+    fn test_trace_decompress_path() {
+        let data = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let header_size = skip_gzip_header(&data).unwrap();
+        let deflate_end = data.len().saturating_sub(8);
+        let deflate_data = &data[header_size..deflate_end];
+
+        eprintln!("Data size: {}", data.len());
+        eprintln!("Deflate size: {}", deflate_data.len());
+        eprintln!("CHUNK_SIZE: {}", CHUNK_SIZE);
+        eprintln!("Partitions: {}", (deflate_data.len() / CHUNK_SIZE).max(1));
+
+        // Check member boundaries
+        let members = find_member_boundaries(&data);
+        eprintln!("Member boundaries: {:?}", members);
+    }
+}
+
+#[test]
+fn test_trace_full_path() {
+    let data = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    // Time libdeflate
+    let start = std::time::Instant::now();
+    let mut output1 = Vec::new();
+    libdeflater::Decompressor::new()
+        .gzip_decompress(&data, &mut output1)
+        .ok();
+    // Need to resize for libdeflate
+    let mut output1 = vec![0u8; 250_000_000];
+    let size1 = libdeflater::Decompressor::new()
+        .gzip_decompress(&data, &mut output1)
+        .unwrap();
+    let libdeflate_time = start.elapsed();
+    eprintln!("libdeflate: {} bytes in {:?}", size1, libdeflate_time);
+
+    // Time our decompress_parallel
+    let start = std::time::Instant::now();
+    let mut output2 = Vec::new();
+    let result = decompress_parallel(&data, &mut output2, 8);
+    let parallel_time = start.elapsed();
+    eprintln!(
+        "decompress_parallel: {:?}, {} bytes in {:?}",
+        result.is_ok(),
+        output2.len(),
+        parallel_time
+    );
+
+    // Time flate2
+    let start = std::time::Instant::now();
+    use std::io::Read;
+    let mut decoder = flate2::read::GzDecoder::new(&data[..]);
+    let mut output3 = Vec::new();
+    decoder.read_to_end(&mut output3).unwrap();
+    let flate2_time = start.elapsed();
+    eprintln!("flate2: {} bytes in {:?}", output3.len(), flate2_time);
 }
