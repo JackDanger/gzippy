@@ -18,7 +18,7 @@ env:
 jobs:
   # Test decompression of files created by different tools
   decompress-matrix:
-    name: Decompress ${{ matrix.source }}-L${{ matrix.level }} T${{ matrix.threads }}
+    name: ${{ matrix.source }}-L${{ matrix.level }}-${{ matrix.size_mb }}MB-${{ matrix.content }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -26,17 +26,8 @@ jobs:
         # Source tool that created the file
         source: [gzippy, pigz, gzip]
         level: [1, 6, 9]
-        threads: [1, 4]
-        size_mb: [10, 100]
-        content: [text, random]
-        exclude:
-          # gzip is single-threaded, don't test T4 creation
-          - source: gzip
-            threads: 4
-          # Random data at L9 is slow and uninteresting
-          - content: random
-            level: 9
-            size_mb: 100
+        size_mb: [100]  # Focus on 100MB for meaningful benchmarks
+        content: [text]  # Text compresses well, shows speed differences
 
     steps:
       - uses: actions/checkout@v4
@@ -101,7 +92,7 @@ jobs:
       - name: Create compressed file
         run: |
           LEVEL=${{ matrix.level }}
-          THREADS=${{ matrix.threads }}
+          THREADS=$(nproc)  # Use all available threads for compression
           
           case "${{ matrix.source }}" in
             gzippy)
@@ -120,19 +111,19 @@ jobs:
         run: |
           echo "=== Decompression Benchmark ==="
           echo "Source: ${{ matrix.source }} -${{ matrix.level }}"
-          echo "Threads: ${{ matrix.threads }}"
           echo "Content: ${{ matrix.content }}"
           echo "Size: ${{ matrix.size_mb }}MB"
           echo ""
           
           COMPRESSED_SIZE=$(stat -c%s /tmp/test.gz)
           ORIGINAL_SIZE=$(stat -c%s /tmp/test.dat)
+          MAX_THREADS=$(nproc)
           
           echo "| Tool | Threads | Time (s) | MB/s | Status |"
           echo "|------|---------|----------|------|--------|"
           
-          # gzippy decompression
-          for t in 1 ${{ matrix.threads }}; do
+          # gzippy decompression (1 thread and max threads)
+          for t in 1 $MAX_THREADS; do
             START=$(date +%s.%N)
             ./target/release/gzippy -d -p$t < /tmp/test.gz > /tmp/out_gzippy.dat 2>/dev/null
             END=$(date +%s.%N)
@@ -148,7 +139,7 @@ jobs:
           done
           
           # pigz decompression
-          for t in 1 ${{ matrix.threads }}; do
+          for t in 1 $MAX_THREADS; do
             START=$(date +%s.%N)
             ./pigz/unpigz -p$t < /tmp/test.gz > /tmp/out_pigz.dat 2>/dev/null
             END=$(date +%s.%N)
@@ -179,7 +170,7 @@ jobs:
           
           # rapidgzip decompression (CLI preferred, Python fallback)
           RAPIDGZIP_CLI="./rapidgzip/rapidgzip-cli"
-          for t in 1 ${{ matrix.threads }}; do
+          for t in 1 $MAX_THREADS; do
             START=$(date +%s.%N)
             if [ -x "$RAPIDGZIP_CLI" ]; then
               # Use CLI (faster, more accurate benchmark)
