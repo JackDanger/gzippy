@@ -235,7 +235,7 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
     }
 
     // Use the ultra-fast parallel decompressor
-    // This uses ISA-L and block-level parallelism for maximum speed
+    // This uses block-level parallelism for maximum speed
     let num_threads = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(4);
@@ -243,6 +243,10 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
     match crate::ultra_decompress::decompress_ultra(data, writer, num_threads) {
         Ok(bytes) => Ok(bytes),
         Err(_) => {
+            // Try our pure Rust parallel inflater
+            if let Ok(bytes) = crate::parallel_inflate::decompress_auto(data, writer, num_threads) {
+                return Ok(bytes);
+            }
             // Fallback to flate2 sequential
             decompress_multi_member_zlibng(data, writer)
         }
