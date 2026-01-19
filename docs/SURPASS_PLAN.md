@@ -1,4 +1,4 @@
-# Aggressive Plan to Beat ALL Competitors
+# Parallel Decompression Optimization Plan
 
 ## Current Status: Single-Threaded DONE ✅
 

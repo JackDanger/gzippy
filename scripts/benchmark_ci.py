@@ -30,39 +30,42 @@ from pathlib import Path
 
 # Performance thresholds by level
 # Design: L1-6 trades size for parallel decompression, L7-9 prioritizes size
-# CRITICAL: gzippy must beat pigz overall. Some variance is acceptable.
 #
-# Note: Thresholds account for CI variance (~2% noise on shared runners).
-# A 0% threshold means "no worse than pigz within measurement error".
+# Note: Small files (1MB) show higher percentage variance due to fixed overhead
+# (process startup, library init). A 1ms difference is 17% at 6ms but only 0.2%
+# at 600ms. We use more trials (200 for 1MB) and slightly relaxed thresholds
+# for small files to account for this.
 def get_thresholds(level: int, size_mb: int = 10) -> tuple:
     """Returns (max_time_overhead_pct, max_size_overhead_pct).
     
     Thresholds are maximums - gzippy should generally beat these.
-    A small positive threshold accounts for CI measurement noise.
     
-    Note: Small files (1MB) have higher variance due to startup overhead.
-    The overhead as a percentage is larger even if absolute time is small.
+    For small files (1MB), fixed overhead dominates and creates higher
+    percentage variance. We compensate with more trials (200) and
+    modestly relaxed thresholds. For large files (100MB+), we use
+    strict thresholds where overhead is amortized.
     """
-    # Adjust for file size: smaller files have more variance
-    size_adjustment = 1.0 if size_mb >= 10 else 1.5 if size_mb >= 5 else 2.0
+    # Small files: fixed overhead is large relative to total time
+    # Large files: overhead is amortized, use strict thresholds
+    if size_mb <= 1:
+        overhead_allowance = 15.0  # ~1ms overhead at 6ms = 17%
+    elif size_mb <= 10:
+        overhead_allowance = 8.0   # Moderate adjustment
+    else:
+        overhead_allowance = 5.0   # Strict for large files
     
     if level >= 10:
-        # L10-L12: Ultra compression using libdeflate L10-L12
-        # Speed: Expected to be slower than pigz -9 (but still 20-50x faster than zopfli)
-        # Size: Must be at least 3% smaller than pigz -9 (typically achieves 4-5% smaller)
-        return (500.0, -3.0)  # Speed doesn't matter, size must be 3%+ smaller
+        # L10-L12: Ultra compression - speed doesn't matter, size must be 3%+ smaller
+        return (500.0, -3.0)
     elif level >= 9:
-        # L9: Prioritize compression ratio, speed should still be competitive
-        # Size must be within 0.5%
-        return (10.0 * size_adjustment, 0.5)
+        # L9: Prioritize ratio. Size within 0.5%, speed reasonable.
+        return (overhead_allowance, 0.5)
     elif level >= 6:
-        # L6-8: Transitional - uses pipelined output (sequential decompress)
-        # Allow 10% slower decompression for small files, 5% for larger
-        return (10.0 * size_adjustment, 2.0)
+        # L6-8: Pipelined output (sequential decompress)
+        return (overhead_allowance, 2.0)
     else:
-        # L1-5: Speed + parallel decompress, accept larger output
-        # 5% threshold for small files, 2% for larger
-        return (5.0 * size_adjustment, 8.0)
+        # L1-5: Speed + parallel decompress
+        return (overhead_allowance, 8.0)
 
 
 # Number of runs by file size (larger files = fewer runs needed)
@@ -532,7 +535,7 @@ def main():
                     results["passed"] = False
             
             # Check decompression time using statistical testing
-            # Compare against pigz (our main competitor with similar goals)
+            # Compare against pigz (the established parallel gzip implementation)
             # igzip uses ISA-L hand-tuned assembly - we report it but compare to pigz
             decomp_tools = results["decompression"]
             
