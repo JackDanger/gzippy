@@ -18,17 +18,18 @@ use crate::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_STA
 // Constants
 // =============================================================================
 
-/// Primary table bits (12 bits = 4096 entries = 8KB for u16)
-/// 12 bits handles most codes directly without L2 lookup
-const L1_BITS: u32 = 12;
+/// Primary table bits (10 bits = 1024 entries = 2KB for u16)
+/// This fits in L1 cache for maximum decode speed
+const L1_BITS: u32 = 10;
 const L1_SIZE: usize = 1 << L1_BITS;
-const L1_MASK: u32 = (1 << L1_BITS) - 1;
+const L1_MASK: usize = L1_SIZE - 1;
 
-/// Secondary table bits for overflow
-const L2_BITS: u32 = 3;
+/// Secondary table handles codes > 10 bits (up to 15)
+/// Max extra bits = 15 - 10 = 5, so 32 entries per sub-table
+const L2_BITS: u32 = 5;
 const L2_SIZE: usize = 1 << L2_BITS;
 
-/// Flag indicating L2 lookup needed
+/// Flag indicating L2 lookup needed (bit 15 set)
 const L2_FLAG: u16 = 0x8000;
 
 /// Maximum code length supported
@@ -69,8 +70,7 @@ impl TwoLevelTable {
     }
 
     /// Build table from code lengths
-    /// Uses single-level 12-bit table for codes <= 12 bits
-    /// Falls back to per-code decode for longer codes (rare)
+    /// Uses two-level table: L1 for codes <= 10 bits, L2 for longer codes
     pub fn build(lens: &[u8]) -> io::Result<Self> {
         let mut table = Self::new();
 
@@ -87,7 +87,7 @@ impl TwoLevelTable {
 
         table.max_len = max_len;
 
-        // Calculate starting codes for each length
+        // Calculate starting codes for each length (canonical Huffman)
         let mut next_code = [0u32; MAX_CODE_LEN + 1];
         let mut code = 0u32;
         for bits in 1..=MAX_CODE_LEN {
@@ -95,7 +95,9 @@ impl TwoLevelTable {
             next_code[bits] = code;
         }
 
-        // Fill table - only handle codes <= L1_BITS
+        // First pass: fill L1 for short codes, mark which L1 entries need L2
+        let mut needs_l2 = [false; L1_SIZE];
+
         for (symbol, &len) in lens.iter().enumerate() {
             if len == 0 {
                 continue;
@@ -105,20 +107,79 @@ impl TwoLevelTable {
             let code = next_code[len as usize];
             next_code[len as usize] += 1;
 
-            // Only fill L1 for codes that fit
+            let rev = reverse_bits(code, len);
+
             if len <= L1_BITS {
-                let rev = reverse_bits(code, len);
+                // Short code: fill L1 directly
                 let fill_count = 1usize << (L1_BITS - len);
                 let entry = pack_l1_entry(symbol as u16, len as u8);
 
                 for i in 0..fill_count {
                     let idx = (rev as usize) | (i << len as usize);
-                    if idx < L1_SIZE {
-                        table.l1[idx] = entry;
-                    }
+                    table.l1[idx] = entry;
+                }
+            } else {
+                // Long code: mark L1 entry for L2
+                let l1_idx = (rev as usize) & L1_MASK;
+                needs_l2[l1_idx] = true;
+            }
+        }
+
+        // Second pass: allocate L2 sub-tables and fill them
+        // Reset next_code for second pass
+        code = 0u32;
+        for bits in 1..=MAX_CODE_LEN {
+            code = (code + bl_count[bits - 1]) << 1;
+            next_code[bits] = code;
+        }
+
+        for (l1_idx, &need_l2) in needs_l2.iter().enumerate() {
+            if need_l2 {
+                // Allocate L2 sub-table
+                let l2_start = table.l2.len();
+                table.l2.resize(l2_start + L2_SIZE, 0);
+
+                // Mark L1 entry as pointer to L2
+                table.l1[l1_idx] = L2_FLAG | (l2_start as u16);
+            }
+        }
+
+        // Third pass: fill L2 entries for long codes
+        code = 0u32;
+        for bits in 1..=MAX_CODE_LEN {
+            code = (code + bl_count[bits - 1]) << 1;
+            next_code[bits] = code;
+        }
+
+        for (symbol, &len) in lens.iter().enumerate() {
+            if len == 0 || (len as u32) <= L1_BITS {
+                continue;
+            }
+
+            let len = len as u32;
+            let code = next_code[len as usize];
+            next_code[len as usize] += 1;
+
+            let rev = reverse_bits(code, len);
+            let l1_idx = (rev as usize) & L1_MASK;
+            let l2_bits = rev >> L1_BITS;
+
+            // Get L2 base from L1
+            let l1_entry = table.l1[l1_idx];
+            debug_assert!(l1_entry & L2_FLAG != 0);
+            let l2_base = (l1_entry & !L2_FLAG) as usize;
+
+            // Fill L2 entries
+            let extra_bits = len - L1_BITS;
+            let fill_count = 1usize << (L2_BITS - extra_bits);
+            let entry = pack_l1_entry(symbol as u16, len as u8);
+
+            for i in 0..fill_count {
+                let l2_idx = (l2_bits as usize) | (i << extra_bits as usize);
+                if l2_idx < L2_SIZE {
+                    table.l2[l2_base + l2_idx] = entry;
                 }
             }
-            // Codes > L1_BITS are handled by slow path in decode()
         }
 
         Ok(table)
@@ -126,16 +187,26 @@ impl TwoLevelTable {
 
     /// Decode a symbol from bits
     /// Returns (symbol, code_length)
-    /// If code_length is 0, the code wasn't found (possibly longer than L1_BITS)
+    /// If code_length is 0, the code wasn't found
     #[inline(always)]
     pub fn decode(&self, bits: u64) -> (u16, u32) {
-        let l1_idx = (bits as usize) & (L1_SIZE - 1);
+        let l1_idx = (bits as usize) & L1_MASK;
         let entry = self.l1[l1_idx];
 
-        // Direct decode from L1 (no L2 for simplicity)
-        let symbol = entry & 0x1FF;
-        let len = ((entry >> 9) & 0x1F) as u32;
-        (symbol, len)
+        if entry & L2_FLAG == 0 {
+            // Direct decode from L1
+            let symbol = entry & 0x1FF;
+            let len = ((entry >> 9) & 0x1F) as u32;
+            (symbol, len)
+        } else {
+            // L2 lookup
+            let l2_base = (entry & !L2_FLAG) as usize;
+            let l2_idx = ((bits >> L1_BITS) as usize) & (L2_SIZE - 1);
+            let l2_entry = self.l2[l2_base + l2_idx];
+            let symbol = l2_entry & 0x1FF;
+            let len = ((l2_entry >> 9) & 0x1F) as u32;
+            (symbol, len)
+        }
     }
 }
 
@@ -187,9 +258,14 @@ impl<'a> FastBits<'a> {
         fb
     }
 
-    /// Refill to 56+ bits
+    /// Refill to 56+ bits (only if needed)
     #[inline(always)]
     pub fn refill(&mut self) {
+        // Only refill if we have room for at least one byte
+        if self.bits > 56 {
+            return;
+        }
+
         if self.pos + 8 <= self.data.len() {
             let bytes =
                 unsafe { (self.data.as_ptr().add(self.pos) as *const u64).read_unaligned() };

@@ -262,23 +262,153 @@ unsafe fn fill_rle(dst: *mut u8, byte: u8, mut length: usize) {
     }
 }
 
-/// Copy small pattern (distance 2-7)
+/// Copy small pattern (distance 2-7) with SIMD pattern expansion
 #[inline(always)]
-unsafe fn copy_small_pattern(src: *const u8, dst: *mut u8, distance: usize, length: usize) {
-    // For small distances, copy byte by byte from the repeating pattern
-    // This handles the modular pattern correctly
-    for i in 0..length {
-        *dst.add(i) = *src.add(i % distance);
+unsafe fn copy_small_pattern(src: *const u8, dst: *mut u8, distance: usize, mut length: usize) {
+    // Extract the base pattern and expand it to 8 bytes
+    let pattern = match distance {
+        2 => {
+            let a = *src;
+            let b = *src.add(1);
+            u64::from_le_bytes([a, b, a, b, a, b, a, b])
+        }
+        3 => {
+            let a = *src;
+            let b = *src.add(1);
+            let c = *src.add(2);
+            // Pattern: abc abc ab (8 bytes, repeats at 24)
+            u64::from_le_bytes([a, b, c, a, b, c, a, b])
+        }
+        4 => {
+            let a = *src;
+            let b = *src.add(1);
+            let c = *src.add(2);
+            let d = *src.add(3);
+            u64::from_le_bytes([a, b, c, d, a, b, c, d])
+        }
+        5 => {
+            let a = *src;
+            let b = *src.add(1);
+            let c = *src.add(2);
+            let d = *src.add(3);
+            let e = *src.add(4);
+            u64::from_le_bytes([a, b, c, d, e, a, b, c])
+        }
+        6 => {
+            let a = *src;
+            let b = *src.add(1);
+            let c = *src.add(2);
+            let d = *src.add(3);
+            let e = *src.add(4);
+            let f = *src.add(5);
+            u64::from_le_bytes([a, b, c, d, e, f, a, b])
+        }
+        7 => {
+            let a = *src;
+            let b = *src.add(1);
+            let c = *src.add(2);
+            let d = *src.add(3);
+            let e = *src.add(4);
+            let f = *src.add(5);
+            let g = *src.add(6);
+            u64::from_le_bytes([a, b, c, d, e, f, g, a])
+        }
+        _ => {
+            // Fallback for other distances
+            for i in 0..length {
+                *dst.add(i) = *src.add(i % distance);
+            }
+            return;
+        }
+    };
+
+    let mut p = dst;
+
+    // Use SIMD to broadcast the 8-byte pattern
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        // Broadcast 8-byte pattern to 32 bytes
+        while length >= 32 {
+            avx2::fill_qword_32(pattern, p);
+            p = p.add(32);
+            length -= 32;
+        }
+    }
+
+    // Write 8-byte chunks for remainder
+    while length >= 8 {
+        (p as *mut u64).write_unaligned(pattern);
+        p = p.add(8);
+        length -= 8;
+    }
+
+    // Handle final bytes (respecting the actual pattern for non-power-of-2 distances)
+    if length > 0 {
+        let pattern_bytes = pattern.to_le_bytes();
+        let out_offset = (dst.offset_from(p) as usize) % distance;
+        for i in 0..length {
+            *p.add(i) = *src.add((out_offset + i) % distance);
+        }
+        // Silence warning about unused variable
+        let _ = pattern_bytes;
     }
 }
 
 /// Copy with medium overlap (distance 8-31)
+/// Uses chunked copying to handle overlap safely
 #[inline(always)]
-unsafe fn copy_overlapping(src: *const u8, dst: *mut u8, distance: usize, length: usize) {
-    // For overlapping copies, we need to copy byte by byte or in small chunks
-    // The pattern repeats every `distance` bytes
+unsafe fn copy_overlapping(src: *const u8, dst: *mut u8, distance: usize, mut length: usize) {
+    let mut s = src;
+    let mut d = dst;
+
+    // For distances 8-15, copy 8 bytes at a time
+    // For distances 16-31, copy 16 bytes at a time
+    if distance >= 16 {
+        // Can safely copy 16 bytes at a time
+        #[cfg(target_arch = "x86_64")]
+        {
+            while length >= 16 {
+                let chunk = (s as *const u128).read_unaligned();
+                (d as *mut u128).write_unaligned(chunk);
+                s = s.add(16);
+                d = d.add(16);
+                length -= 16;
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            while length >= 16 {
+                neon::copy_16(s, d);
+                s = s.add(16);
+                d = d.add(16);
+                length -= 16;
+            }
+        }
+
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            while length >= 16 {
+                std::ptr::copy_nonoverlapping(s, d, 16);
+                s = s.add(16);
+                d = d.add(16);
+                length -= 16;
+            }
+        }
+    } else {
+        // distance 8-15: copy 8 bytes at a time
+        while length >= 8 {
+            let chunk = (s as *const u64).read_unaligned();
+            (d as *mut u64).write_unaligned(chunk);
+            s = s.add(8);
+            d = d.add(8);
+            length -= 8;
+        }
+    }
+
+    // Copy remainder byte by byte
     for i in 0..length {
-        *dst.add(i) = *src.add(i % distance);
+        *d.add(i) = *s.add(i);
     }
 }
 

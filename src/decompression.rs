@@ -579,8 +579,6 @@ fn read_gzip_isize(data: &[u8]) -> Option<u32> {
 /// Decompress single-member gzip using libdeflate (fastest path)
 /// Uses thread-local decompressor to avoid initialization overhead
 fn decompress_single_member_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
-    use libdeflater::DecompressionError;
-
     // Use ISIZE from trailer for accurate buffer sizing (avoids resize loop)
     // Add small margin for safety, handle files >4GB (ISIZE wraps at 2^32)
     let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
@@ -591,6 +589,17 @@ fn decompress_single_member_libdeflate<W: Write>(data: &[u8], writer: &mut W) ->
         // Fallback: estimate 4x compression ratio
         data.len().saturating_mul(4).max(64 * 1024)
     };
+
+    // Try ultra-fast pure Rust inflater first (faster than libdeflate)
+    let mut output_buf = Vec::with_capacity(initial_size);
+    if crate::ultra_fast_inflate::inflate_gzip_ultra_fast(data, &mut output_buf).is_ok() {
+        writer.write_all(&output_buf)?;
+        writer.flush()?;
+        return Ok(output_buf.len() as u64);
+    }
+
+    // Fallback to libdeflate for edge cases
+    use libdeflater::DecompressionError;
 
     // Use cache-aligned buffer for better memory access
     let mut output_buf = alloc_aligned_buffer(initial_size);
