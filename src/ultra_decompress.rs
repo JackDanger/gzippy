@@ -194,8 +194,18 @@ impl UltraDecompressor {
         match crate::ultra_inflate::decompress_ultra_fast(data, writer, self.num_threads) {
             Ok(bytes) => Ok(bytes),
             Err(_) => {
-                // Fallback to rapidgzip decoder
-                crate::rapidgzip_decoder::decompress_rapidgzip(data, writer, self.num_threads)
+                // Try the marker-based speculative decoder (like rapidgzip)
+                match crate::marker_decode::decompress_parallel(data, writer, self.num_threads) {
+                    Ok(bytes) => Ok(bytes),
+                    Err(_) => {
+                        // Fallback to rapidgzip decoder
+                        crate::rapidgzip_decoder::decompress_rapidgzip(
+                            data,
+                            writer,
+                            self.num_threads,
+                        )
+                    }
+                }
             }
         }
     }

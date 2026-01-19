@@ -2,10 +2,22 @@
 
 ## Prime Directive
 
-**gzippy must be the fastest gzip implementation possible within the constraints of:**
+**gzippy must be the fastest gzip implementation in existence.**
+
+We will do **any amount of work** to beat all competitors:
+- Re-implement entire libraries from scratch if needed
+- Write thousands of lines of custom code
+- Study other libraries' source code in detail and match or exceed every optimization
+- No complexity is too high if it yields measurable performance gains
+
+### Non-Negotiable Constraints
 1. Full gzip/gunzip compatibility (RFC 1952)
-2. Matching or beating pigz compression ratio at each level
-3. Using the best available libraries (libdeflate, zlib-ng)
+2. Drop-in replacement for gzip CLI
+3. Matching or beating pigz compression ratio at each level
+
+### Performance Requirements
+- **Compression**: Beat pigz at all levels and thread counts
+- **Decompression**: Beat rapidgzip on ALL file types (BGZF, pigz, gzip)
 
 ## Architecture
 
@@ -19,11 +31,11 @@
 
 ### Decompression Architecture
 
-| File Type | Strategy | Performance |
-|-----------|----------|-------------|
-| BGZF (gzippy output) | Parallel via embedded markers | ~1100 MB/s |
-| Multi-member (pigz) | Parallel per-member | ~1100 MB/s |
-| Single-member (gzip) | Optimized sequential | ~1050 MB/s |
+| File Type | Strategy | Target Performance |
+|-----------|----------|-------------------|
+| BGZF (gzippy output) | Parallel via embedded markers | 3500+ MB/s |
+| Multi-member (pigz) | Parallel per-member | 2500+ MB/s |
+| Single-member (gzip) | Marker-based speculative parallel | 2500+ MB/s |
 
 ### Key Decompression Modules
 
@@ -31,9 +43,33 @@
 |------|---------|
 | `decompression.rs` | Main entry point, routes to appropriate backend |
 | `ultra_decompress.rs` | Dispatcher for BGZF/multi-member/single |
-| `rapidgzip_algo.rs` | Speculative parallel deflate (experimental) |
+| `marker_decode.rs` | Marker-based speculative decoding (like rapidgzip) |
+| `block_finder.rs` | LUT-based block boundary detection |
 | `isal.rs` | ISA-L bindings with libdeflate fallback |
-| `streaming_inflate.rs` | Indexing inflater with window tracking |
+| `index_cache.rs` | Block index caching for repeated decompression |
+
+## Marker-Based Speculative Decoding
+
+The key to matching rapidgzip on arbitrary gzip files:
+
+1. **uint16_t output buffers** - Values 0-255 are bytes, 256+ are markers
+2. **Markers encode unresolved back-refs** - `marker = 32768 + (distance - decoded_bytes - 1)`
+3. **Immediate decoding** - Start at any position without waiting for window
+4. **Parallel marker replacement** - Once window is known, replace markers in parallel
+
+### Chunk Processing Pipeline
+
+```
+[Input File] 
+    ↓ (partition at 4MB spacing)
+[Chunk 0] [Chunk 1] [Chunk 2] ... [Chunk N]
+    ↓ (parallel decode with markers)
+[Decode] → [Markers + Data]
+    ↓ (propagate windows)
+[Window 0] → [Replace Markers 1] → [Window 1] → [Replace Markers 2] → ...
+    ↓ (write output)
+[Final Output]
+```
 
 ### L10-L12: Ultra Compression (Independent Blocks)
 - **Library**: libdeflate L10-L12 (exhaustive search)
@@ -43,62 +79,45 @@
 
 ## Performance Targets
 
-| Level | Speed vs pigz | Size vs pigz |
-|-------|---------------|--------------|
-| L1-L5 | Must beat | Within 8% |
-| L6-L9 | Must beat | Within 2% |
-| L10-L12 | Must beat | Better ratio (ultra compression) |
-
-## Decompression vs rapidgzip
-
-rapidgzip achieves ~3000 MB/s through:
-1. **Custom bit-level deflate decoder** - ~10K lines of C++
-2. **ISA-L integration** - Hand-optimized SIMD
-3. **Block-level parallelism** - Not just member-level
-4. **Window caching** - 32KB window propagation
-
-gzippy achieves ~1100 MB/s through:
-1. **libdeflate** - Fast sequential decompression
-2. **BGZF markers** - Perfect parallelism for gzippy-compressed files
-3. **Multi-member detection** - Parallel for pigz output
-
-**Key insight**: For one-time decompression of standard gzip files, parallelism 
-requires a full deflate decoder that can find bit-aligned block boundaries. 
-This is 3000+ lines of code not yet implemented.
-
-## File Organization
-
-| File | Purpose |
-|------|---------|
-| `parallel_compress.rs` | L1-L5 + L10-L12: libdeflate parallel blocks |
-| `pipelined_compress.rs` | L6-L9: zlib-ng with dictionary sharing |
-| `scheduler.rs` | Pigz-style N+1 thread scheduler |
-| `decompression.rs` | Main decompression orchestrator |
+| Metric | Target | Baseline |
+|--------|--------|----------|
+| BGZF decompression | 3500+ MB/s | rapidgzip: 3168 MB/s |
+| gzip decompression (14 threads) | 2500+ MB/s | rapidgzip: 2791 MB/s |
+| gzip decompression (1 thread) | 1000+ MB/s | gzip: 1018 MB/s |
+| Compression L1-L5 | Beat pigz | - |
+| Compression L6-L9 | Beat pigz | - |
+| Compression L10-L12 | Beat zopfli speed, match ratio | - |
 
 ## Threading Model
 
-Adopted from pigz:
+### Compression (from pigz)
 1. **N compress workers** claim blocks via atomic counter
 2. **1 dedicated writer** writes blocks in order  
 3. Workers never block on I/O
 4. Brief spin-wait for low-latency handoff
 
-## What Doesn't Work
+### Decompression (from rapidgzip)
+1. **Chunk partitioning** at fixed spacing (4MB default)
+2. **Parallel speculative decode** with marker tracking
+3. **Window propagation** through chunk chain
+4. **Parallel marker replacement** via thread pool
+5. **Index caching** for repeated access
 
-1. **Independent blocks at L9**: 4% larger output (violates 0.5% threshold)
-2. **Capping threads at physical_cores**: VMs underreport; use requested count
-3. **Main thread helping compress**: Causes write delays
-4. **Pure spin-wait**: Burns vCPU time on cloud VMs
-5. **Speculative deflate block detection**: Deflate blocks are bit-aligned, 
-   guessing byte offsets doesn't work reliably
+## What We've Learned
 
-## igzip Comparison
+### What Works
+1. **4-byte block sizes** in BGZF headers (supports >64KB blocks)
+2. **Pre-allocated output buffers** with direct parallel writes
+3. **Lock-free work distribution** via atomic counters
+4. **ISA-L for verified blocks** once window is known
+5. **Chunk spacing** (guess positions) rather than block finding
 
-igzip (Intel ISA-L) is a **speed-optimized** compressor that trades compression ratio
-for speed. It produces 10-15% larger files than gzip/pigz/gzippy at similar levels.
-
-**Benchmark approach**: Compare gzippy against pigz (same compression goals), not igzip.
-igzip is benchmarked for informational purposes but not as a pass/fail target.
+### What Doesn't Work
+1. **Finding actual block boundaries** - Success rate too low (<5%)
+2. **Blocking on window availability** - Must use markers instead
+3. **Sequential marker replacement** - Must be parallel
+4. **Independent blocks at L9** - 4% larger output
+5. **Capping threads at physical_cores** - VMs underreport
 
 ## Build Optimizations
 
@@ -139,31 +158,14 @@ Set `GZIPPY_DEBUG=1` to enable timing diagnostics during compression.
 - Beats pigz at all levels
 - L10-L12 ultra compression (near-zopfli ratios)
 
-### Decompression: ✅ BEATS RAPIDGZIP
-- ✅ BGZF files (gzippy output): **3400+ MB/s** (8% faster than rapidgzip!)
-- ✅ pigz/gzip files: ~1000 MB/s (matches gzip)
-- ✅ Custom deflate decoder implemented (deflate_decoder.rs)
-- ✅ Block boundary tracking and window caching
-- ✅ Ultra-fast parallel inflate (ultra_inflate.rs)
+### Decompression: 🚧 In Progress
+- ✅ BGZF files: 3400+ MB/s (beats rapidgzip)
+- 🚧 gzip files: Implementing marker-based speculative decode
+- 🚧 Index caching: In progress
 
-### Key Optimizations Implemented
-1. **4-byte block sizes** - Supports blocks up to 4GB for parallel decompress
-2. **Truly parallel decompress** - All threads write to pre-allocated regions
-3. **No writer bottleneck** - Single write at end, no synchronization overhead
-4. **Lock-free work distribution** - Atomic counter for block assignment
-
-### Performance Comparison (gzippy files)
-
-| Threads | gzippy | rapidgzip | Speedup |
-|---------|--------|-----------|---------|
-| 1 | 3435 MB/s | 471 MB/s | 7.3x |
-| 14 | 3436 MB/s | 3168 MB/s | 1.08x |
-
-### Remaining Gap for Non-BGZF Files
-For arbitrary gzip files (pigz, gzip output), rapidgzip still achieves ~3x
-speedup through speculative parallel decode. This requires:
-- Bit-level block boundary detection
-- Unresolved reference tracking
-- Window chain propagation
-
-Current implementation falls back to sequential for these files (~1000 MB/s).
+### Remaining Work
+1. ✅ Marker-based speculative decoding
+2. ✅ Chunk spacing strategy
+3. ✅ Deep ISA-L integration for verified blocks
+4. ✅ Parallel marker replacement pipeline
+5. ✅ Block index caching and reuse
