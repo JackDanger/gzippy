@@ -4632,6 +4632,270 @@ mod optimization_tests {
         );
     }
 
+    // =========================================================================
+    // Advanced optimization benchmarks
+    // =========================================================================
+
+    /// Benchmark subtable lookup vs fallback decode (current approach)
+    #[test]
+    fn bench_subtable_vs_fallback() {
+        // Simulate entries: 95% direct decode, 5% need subtable/fallback
+        // This matches real-world deflate where most codes are < 12 bits
+        let main_table: Vec<u32> = (0..4096)
+            .map(|i| {
+                if i % 20 == 0 {
+                    // Subtable pointer: index in high bits, extra bits in 8-13
+                    0x4000 | ((i as u32) << 16) | (4 << 8) | 12 // 12 bits consumed
+                } else {
+                    // Direct entry: literal or match
+                    0x8000_0008 | ((i as u32 & 0xFF) << 16) // Literal
+                }
+            })
+            .collect();
+
+        let subtable: Vec<u32> = (0..256).map(|i| 0x8000_0004 | (i << 16)).collect();
+
+        let bits_sequence: Vec<u64> = (0..100_000)
+            .map(|i| (i * 0x12345678) % 0xFFFFFFFF)
+            .collect();
+
+        let iterations = 500;
+
+        // Pattern 1: Fallback decode (our current approach)
+        let start = std::time::Instant::now();
+        let mut sum = 0u64;
+        for _ in 0..iterations {
+            for &bits in &bits_sequence {
+                let idx = (bits & 0xFFF) as usize;
+                let entry = main_table[idx];
+                if entry & 0xFF == 0 {
+                    // Fallback: expensive bit-by-bit decode
+                    sum = sum.wrapping_add(bits & 0xFF);
+                } else {
+                    sum = sum.wrapping_add(entry as u64);
+                }
+            }
+        }
+        let elapsed_fallback = start.elapsed();
+
+        // Pattern 2: Subtable lookup (libdeflate approach)
+        let start = std::time::Instant::now();
+        let mut sum2 = 0u64;
+        for _ in 0..iterations {
+            for &bits in &bits_sequence {
+                let idx = (bits & 0xFFF) as usize;
+                let entry = main_table[idx];
+                if entry & 0x4000 != 0 {
+                    // Subtable: use high bits as index, extra bits from input
+                    let subtable_idx = (entry >> 16) as usize;
+                    let extra_bits = (entry >> 8) & 0x3F;
+                    let sub_idx = (bits >> 12) & ((1 << extra_bits) - 1);
+                    let sub_entry = subtable[(subtable_idx + sub_idx as usize) % subtable.len()];
+                    sum2 = sum2.wrapping_add(sub_entry as u64);
+                } else {
+                    sum2 = sum2.wrapping_add(entry as u64);
+                }
+            }
+        }
+        let elapsed_subtable = start.elapsed();
+
+        eprintln!("\n[BENCH] Subtable vs Fallback (5% long codes):");
+        eprintln!(
+            "[BENCH]   Fallback (current):  {:.2}ms",
+            elapsed_fallback.as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "[BENCH]   Subtable (libdeflate): {:.2}ms",
+            elapsed_subtable.as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "[BENCH]   Ratio: {:.2}x",
+            elapsed_fallback.as_secs_f64() / elapsed_subtable.as_secs_f64()
+        );
+        eprintln!(
+            "[BENCH]   (sums: {} {} to prevent opt)",
+            sum % 1000,
+            sum2 % 1000
+        );
+    }
+
+    /// Benchmark JIT table caching (fingerprint + reuse)
+    #[test]
+    fn bench_jit_table_cache() {
+        use std::collections::HashMap;
+
+        // Simulate building vs caching Huffman tables
+        let code_lengths: Vec<Vec<u8>> = (0..100)
+            .map(|seed| {
+                (0..288)
+                    .map(|i| {
+                        // Realistic distribution: most codes 7-9 bits
+                        let base = (seed * 7 + i * 3) % 15;
+                        base.clamp(1, 15) as u8
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Create 10 unique patterns that repeat
+        let patterns: Vec<&Vec<u8>> = code_lengths.iter().take(10).collect();
+        let queries: Vec<usize> = (0..10000).map(|i| i % 10).collect();
+
+        let iterations = 50;
+
+        // Pattern 1: Always rebuild table (no caching)
+        let start = std::time::Instant::now();
+        let mut sum = 0u64;
+        for _ in 0..iterations {
+            for &pattern_idx in &queries {
+                let lens = &patterns[pattern_idx];
+                // Simulate table build cost (hash all code lengths)
+                let hash: u64 = lens.iter().map(|&b| b as u64).sum();
+                sum = sum.wrapping_add(hash);
+            }
+        }
+        let elapsed_rebuild = start.elapsed();
+
+        // Pattern 2: Cache by fingerprint
+        let start = std::time::Instant::now();
+        let mut sum2 = 0u64;
+        let mut cache: HashMap<u64, u64> = HashMap::new();
+        for _ in 0..iterations {
+            for &pattern_idx in &queries {
+                let lens = &patterns[pattern_idx];
+                // Simple fingerprint (in practice: use FNV or similar)
+                let fingerprint: u64 = lens
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &b)| (b as u64) << (i % 8))
+                    .fold(0, |a, b| a ^ b);
+
+                let value = *cache.entry(fingerprint).or_insert_with(|| {
+                    // Simulate table build
+                    lens.iter().map(|&b| b as u64).sum()
+                });
+                sum2 = sum2.wrapping_add(value);
+            }
+        }
+        let elapsed_cached = start.elapsed();
+
+        eprintln!("\n[BENCH] JIT Table Cache (10 unique patterns):");
+        eprintln!(
+            "[BENCH]   Always rebuild:  {:.2}ms",
+            elapsed_rebuild.as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "[BENCH]   Fingerprint cache: {:.2}ms",
+            elapsed_cached.as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "[BENCH]   Speedup: {:.1}x",
+            elapsed_rebuild.as_secs_f64() / elapsed_cached.as_secs_f64()
+        );
+        eprintln!(
+            "[BENCH]   (sums: {} {} to prevent opt)",
+            sum % 1000,
+            sum2 % 1000
+        );
+    }
+
+    /// Benchmark multi-symbol decode (2 symbols per lookup)
+    #[test]
+    fn bench_multi_symbol_decode() {
+        // Entry format for multi-symbol:
+        // [Sym1:8][Bits1:4][Sym2:8][Bits2:4][Flags:8]
+        // If Sym2 is valid (flag set), decode both in one lookup
+
+        let single_table: Vec<u32> = (0..4096)
+            .map(|i| {
+                // Single symbol: bits in low 8, symbol in high 8
+                ((i & 0xFF) as u32) << 16 | 8 // 8 bits consumed
+            })
+            .collect();
+
+        // Multi-symbol table: 60% have two literals
+        let multi_table: Vec<u64> = (0..4096)
+            .map(|i| {
+                if i % 10 < 6 {
+                    // Two literals: sym1 in bits 56-63, bits1 in 52-55
+                    //               sym2 in bits 44-51, bits2 in 40-43
+                    //               combined bits in low 8
+                    let sym1 = (i & 0xFF) as u64;
+                    let sym2 = ((i >> 4) & 0xFF) as u64;
+                    (sym1 << 56) | (8 << 52) | (sym2 << 44) | (8 << 40) | (16) | (1 << 8)
+                // flag: has second
+                } else {
+                    // Single symbol
+                    let sym1 = (i & 0xFF) as u64;
+                    (sym1 << 56) | (8 << 52) | 8 // no second symbol
+                }
+            })
+            .collect();
+
+        let indices: Vec<usize> = (0..100_000).map(|i| (i * 7919) % 4096).collect();
+
+        let iterations = 500;
+
+        // Pattern 1: Single symbol per lookup
+        let start = std::time::Instant::now();
+        let mut sum = 0u64;
+        let mut decoded = 0u64;
+        for _ in 0..iterations {
+            for &idx in &indices {
+                let entry = single_table[idx];
+                sum = sum.wrapping_add((entry >> 16) as u64);
+                decoded += 1;
+            }
+        }
+        let elapsed_single = start.elapsed();
+
+        // Pattern 2: Multi-symbol per lookup
+        let start = std::time::Instant::now();
+        let mut sum2 = 0u64;
+        let mut decoded2 = 0u64;
+        for _ in 0..iterations {
+            for &idx in &indices {
+                let entry = multi_table[idx];
+                let sym1 = entry >> 56;
+                sum2 = sum2.wrapping_add(sym1);
+                decoded2 += 1;
+
+                if entry & (1 << 8) != 0 {
+                    // Has second symbol
+                    let sym2 = (entry >> 44) & 0xFF;
+                    sum2 = sum2.wrapping_add(sym2);
+                    decoded2 += 1;
+                }
+            }
+        }
+        let elapsed_multi = start.elapsed();
+
+        eprintln!("\n[BENCH] Multi-Symbol Decode (60% doubles):");
+        eprintln!(
+            "[BENCH]   Single symbol: {:.2}ms ({} symbols)",
+            elapsed_single.as_secs_f64() * 1000.0,
+            decoded
+        );
+        eprintln!(
+            "[BENCH]   Multi symbol:  {:.2}ms ({} symbols)",
+            elapsed_multi.as_secs_f64() * 1000.0,
+            decoded2
+        );
+        eprintln!(
+            "[BENCH]   Symbols/ms single: {:.0}",
+            decoded as f64 / elapsed_single.as_secs_f64() / 1000.0
+        );
+        eprintln!(
+            "[BENCH]   Symbols/ms multi:  {:.0}",
+            decoded2 as f64 / elapsed_multi.as_secs_f64() / 1000.0
+        );
+        eprintln!(
+            "[BENCH]   (sums: {} {} to prevent opt)",
+            sum % 1000,
+            sum2 % 1000
+        );
+    }
+
     /// Combined benchmark with detailed path counting
     #[test]
     fn bench_with_path_counts() {
