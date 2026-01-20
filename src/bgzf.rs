@@ -25,6 +25,122 @@ use crate::inflate_tables::CODE_LENGTH_ORDER;
 use crate::packed_lut::PackedLUT;
 use crate::two_level_table::{FastBits, TurboBits, TwoLevelTable};
 
+// =============================================================================
+// Performance Tracing
+// =============================================================================
+//
+// Enable with GZIPPY_TRACE=1 to see detailed performance breakdown.
+// This helps identify where we lose time compared to libdeflate.
+
+/// Performance counters for decode loop analysis (future use)
+#[allow(dead_code)]
+#[derive(Default)]
+pub struct DecodeTrace {
+    /// Total literals decoded
+    pub literals: u64,
+    /// Total matches decoded  
+    pub matches: u64,
+    /// Literals decoded via fast literal chain (3+ in a row)
+    pub fast_literals: u64,
+    /// Matches using pre-computed distance (fast path)
+    pub fast_matches: u64,
+    /// Matches requiring slow distance decode
+    pub slow_matches: u64,
+    /// Times slow path was used for lit/len decode
+    pub slow_lit_len: u64,
+    /// Total bytes copied via match
+    pub match_bytes: u64,
+    /// Distance=1 memset optimizations used
+    pub memset_copies: u64,
+    /// Bit buffer refills performed
+    pub refills: u64,
+    /// EOB (end of block) encountered
+    pub eob_count: u64,
+}
+
+#[allow(dead_code)]
+impl DecodeTrace {
+    /// Print trace summary
+    pub fn print_summary(&self, output_bytes: usize, elapsed_ns: u64) {
+        let mb_per_sec = output_bytes as f64 / (elapsed_ns as f64 / 1_000_000_000.0) / 1_000_000.0;
+        let total_symbols = self.literals + self.matches;
+        let ns_per_symbol = if total_symbols > 0 {
+            elapsed_ns / total_symbols
+        } else {
+            0
+        };
+
+        eprintln!("\n=== DECODE TRACE ===");
+        eprintln!(
+            "Output: {} bytes in {:.2}ms = {:.1} MB/s",
+            output_bytes,
+            elapsed_ns as f64 / 1_000_000.0,
+            mb_per_sec
+        );
+        eprintln!("\nSymbols:");
+        eprintln!(
+            "  Literals:       {} ({} fast chain, {:.1}% fast)",
+            self.literals,
+            self.fast_literals,
+            if self.literals > 0 {
+                self.fast_literals as f64 / self.literals as f64 * 100.0
+            } else {
+                0.0
+            }
+        );
+        eprintln!(
+            "  Matches:        {} ({} fast, {} slow, {:.1}% fast)",
+            self.matches,
+            self.fast_matches,
+            self.slow_matches,
+            if self.matches > 0 {
+                self.fast_matches as f64 / self.matches as f64 * 100.0
+            } else {
+                0.0
+            }
+        );
+        eprintln!("  Slow lit/len:   {}", self.slow_lit_len);
+        eprintln!("\nCopy stats:");
+        eprintln!(
+            "  Match bytes:    {} ({:.1} bytes/match avg)",
+            self.match_bytes,
+            if self.matches > 0 {
+                self.match_bytes as f64 / self.matches as f64
+            } else {
+                0.0
+            }
+        );
+        eprintln!(
+            "  Memset optim:   {} ({:.1}% of matches)",
+            self.memset_copies,
+            if self.matches > 0 {
+                self.memset_copies as f64 / self.matches as f64 * 100.0
+            } else {
+                0.0
+            }
+        );
+        eprintln!("\nOverhead:");
+        eprintln!("  Bit refills:    {}", self.refills);
+        eprintln!("  EOB count:      {}", self.eob_count);
+        eprintln!("  ns/symbol:      {}", ns_per_symbol);
+        eprintln!(
+            "  symbols/byte:   {:.2}",
+            total_symbols as f64 / output_bytes as f64
+        );
+        eprintln!("====================\n");
+    }
+}
+
+// Tracing infrastructure (enable with GZIPPY_TRACE=1)
+// Note: Thread-local accumulator available for future detailed profiling
+
+/// Check if tracing is enabled (cached)
+#[inline]
+fn tracing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GZIPPY_TRACE").is_ok())
+}
+
 /// BGZF block information
 #[derive(Debug, Clone)]
 struct BgzfBlock {
@@ -202,6 +318,16 @@ fn inflate_into(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
 /// - PackedLUT for bitsleft -= entry optimization
 /// - Multi-symbol decode for literal runs
 fn inflate_into_turbo(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
+    let trace = tracing_enabled();
+    let start = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let mut stored_blocks = 0u32;
+    let mut fixed_blocks = 0u32;
+    let mut dynamic_blocks = 0u32;
+
     let mut bits = TurboBits::new(deflate_data);
     let mut out_pos = 0;
 
@@ -212,9 +338,24 @@ fn inflate_into_turbo(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usiz
         let btype = bits.read(2);
 
         match btype {
-            0 => out_pos = decode_stored_into_turbo(&mut bits, output, out_pos)?,
-            1 => out_pos = decode_fixed_into_turbo(&mut bits, output, out_pos)?,
-            2 => out_pos = decode_dynamic_into_turbo(&mut bits, output, out_pos)?,
+            0 => {
+                if trace {
+                    stored_blocks += 1;
+                }
+                out_pos = decode_stored_into_turbo(&mut bits, output, out_pos)?;
+            }
+            1 => {
+                if trace {
+                    fixed_blocks += 1;
+                }
+                out_pos = decode_fixed_into_turbo(&mut bits, output, out_pos)?;
+            }
+            2 => {
+                if trace {
+                    dynamic_blocks += 1;
+                }
+                out_pos = decode_dynamic_into_turbo(&mut bits, output, out_pos)?;
+            }
             3 => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -227,6 +368,26 @@ fn inflate_into_turbo(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usiz
         if bfinal == 1 {
             break;
         }
+    }
+
+    if trace {
+        let elapsed = start.unwrap().elapsed();
+        let mb_per_sec = out_pos as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+        eprintln!(
+            "[TRACE] inflate_into_turbo: {} bytes in {:.2}ms = {:.1} MB/s",
+            out_pos,
+            elapsed.as_secs_f64() * 1000.0,
+            mb_per_sec
+        );
+        eprintln!(
+            "[TRACE]   blocks: {} stored, {} fixed, {} dynamic",
+            stored_blocks, fixed_blocks, dynamic_blocks
+        );
+        eprintln!(
+            "[TRACE]   input: {} bytes, ratio: {:.2}x",
+            deflate_data.len(),
+            out_pos as f64 / deflate_data.len() as f64
+        );
     }
 
     Ok(out_pos)
@@ -367,35 +528,13 @@ fn decode_dynamic_into_turbo(
 }
 
 /// Public version of inflate_into for use by other modules
+///
+/// This uses the turbo path with all Phase 1 optimizations:
+/// - TurboBits with branchless refill (libdeflate-style)
+/// - PackedLUT for bitsleft -= entry optimization
+/// - Multi-symbol decode for literal runs
 pub fn inflate_into_pub(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
-    let mut bits = FastBits::new(deflate_data);
-    let mut out_pos = 0;
-
-    loop {
-        bits.refill();
-
-        let bfinal = bits.read(1);
-        let btype = bits.read(2);
-
-        match btype {
-            0 => out_pos = decode_stored_into(&mut bits, output, out_pos)?,
-            1 => out_pos = decode_fixed_into(&mut bits, output, out_pos)?,
-            2 => out_pos = decode_dynamic_into(&mut bits, output, out_pos)?,
-            3 => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Reserved block type",
-                ))
-            }
-            _ => unreachable!(),
-        }
-
-        if bfinal == 1 {
-            break;
-        }
-    }
-
-    Ok(out_pos)
+    inflate_into_turbo(deflate_data, output)
 }
 
 /// Decode stored block directly into output slice

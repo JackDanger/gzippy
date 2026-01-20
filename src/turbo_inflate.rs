@@ -648,12 +648,21 @@ impl<'a> TurboBits<'a> {
 // Turbo Inflate - Main Decode Loop
 // =============================================================================
 
-/// Ultra-fast inflate using combined LUT and multi-literal decode
+/// Ultra-fast inflate using TurboBits + PackedLUT from bgzf
 #[inline(never)]
 pub fn inflate_turbo(data: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
-    // Use ultra_fast_inflate which is fully tested
-    // The turbo tables are still experimental for dynamic blocks
-    crate::ultra_fast_inflate::inflate_ultra_fast(data, output)
+    // Ensure output has enough capacity
+    let estimated = data.len().saturating_mul(4).max(1024 * 1024);
+    output.resize(estimated, 0);
+
+    // Use the optimized turbo path from bgzf
+    match crate::bgzf::inflate_into_pub(data, output) {
+        Ok(size) => {
+            output.truncate(size);
+            Ok(size)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Experimental turbo inflate - still has issues with dynamic blocks
