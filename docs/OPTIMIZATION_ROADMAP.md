@@ -52,12 +52,31 @@ we already use memcpy. The remaining gap is in the decode loop itself, not the c
 | Loop unrolling | 50.5% | No improvement over simple loop |
 | `wrapping_sub` vs `saturating_sub` | 47.9% | Counter-intuitively worse |
 
+### What DOES Work (Tested Jan 2026)
+
+| Optimization | Before | After | Gain |
+|--------------|--------|-------|------|
+| Short distance copy (d=2-7) | 1,088 MB/s | 4,109 MB/s | **3.78x** |
+
+**Key Insight**: Short distance copy was 5x slower than other paths due to `i % distance`
+modulo. Implemented libdeflate's word-at-a-time + stride approach.
+
+### Current Path Benchmarks (Jan 2026)
+
+| Decode Path | Speed | Status |
+|-------------|-------|--------|
+| Pure Literals | 10,000+ MB/s | ✅ Fast |
+| RLE (d=1) | 6,221 MB/s | ✅ Fast |
+| Long Distance (d>=40) | 4,449 MB/s | ✅ Fast |
+| Short Distance (d=2-7) | 4,109 MB/s | ✅ Fixed |
+
 ### Where the Gap Actually Is
 
-Since copy is already optimal and LUT pre-computes everything, the remaining gap must be:
-1. **Decode loop overhead** - function calls, bounds checks, branch misprediction
-2. **Table lookup latency** - 12-bit table (8KB) vs libdeflate's 11-bit (4KB fits L1)
-3. **Bit buffer operations** - our `TurboBits` vs libdeflate's inline macros
+All copy paths are now optimized. The remaining 50% gap to libdeflate is:
+1. **Decode loop structure** - libdeflate's "consume first, then branch" pattern
+2. **Table size** - 12-bit table (8KB) vs libdeflate's 11-bit (4KB fits L1)
+3. **Inline macros** - libdeflate uses C macros, we use function calls
+4. **BMI2 intrinsics** - libdeflate uses bzhi/pext on x86_64
 
 ### What Actually Helps
 
