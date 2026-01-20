@@ -4896,6 +4896,166 @@ mod optimization_tests {
         );
     }
 
+    /// Benchmark valid-entries table with consume-first decode loop
+    #[test]
+    fn bench_valid_entries_consume_first() {
+        // Key insight: Make EVERY entry valid so we can consume-first
+        // Even subtable pointers have valid bits to consume
+
+        // Entry format: [type:2][data:22][bits:8]
+        // type: 00=subtable, 01=literal, 10=length, 11=EOB
+        const TYPE_SUBTABLE: u32 = 0b00 << 30;
+        const TYPE_LITERAL: u32 = 0b01 << 30;
+        const TYPE_LENGTH: u32 = 0b10 << 30;
+        const TYPE_EOB: u32 = 0b11 << 30;
+
+        // Build a table where ALL entries are valid
+        let table: Vec<u32> = (0..4096)
+            .map(|i| {
+                if i % 100 == 0 {
+                    // 1% subtable pointers (still has valid bits)
+                    TYPE_SUBTABLE | ((i & 0x3FFFFF) << 8) | 12 // 12 bits consumed
+                } else if i % 50 == 0 {
+                    // 2% EOB
+                    TYPE_EOB | 7 // 7 bits consumed
+                } else if i % 20 == 0 {
+                    // 5% length codes
+                    TYPE_LENGTH | ((i & 0x1F) << 8) | 10 // 10 bits consumed
+                } else {
+                    // 92% literals
+                    TYPE_LITERAL | ((i & 0xFF) << 8) | 8 // 8 bits consumed
+                }
+            })
+            .collect();
+
+        let bits_sequence: Vec<u64> = (0..100_000).map(|i| i * 0x1234567).collect();
+
+        let iterations = 500;
+
+        // Consume-first decode loop (like libdeflate)
+        let start = std::time::Instant::now();
+        let mut literals = 0u64;
+        let mut lengths = 0u64;
+        let mut subtables = 0u64;
+        let mut eobs = 0u64;
+        let mut bitbuf_accum = 0u64;
+        for _ in 0..iterations {
+            for &bits in &bits_sequence {
+                let mut bitbuf = bits;
+                let entry = table[(bitbuf & 0xFFF) as usize];
+
+                // CONSUME FIRST - always valid!
+                let bits_to_skip = entry & 0xFF;
+                bitbuf >>= bits_to_skip;
+                bitbuf_accum ^= bitbuf; // Use the result to prevent optimization
+
+                // Then branch on type
+                match entry >> 30 {
+                    0b01 => literals += 1, // literal
+                    0b10 => lengths += 1,  // length
+                    0b11 => eobs += 1,     // EOB
+                    _ => subtables += 1,   // subtable (needs extra lookup)
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+
+        eprintln!("\n[BENCH] Valid-Entries Consume-First:");
+        eprintln!("[BENCH]   Time: {:.2}ms", elapsed.as_secs_f64() * 1000.0);
+        eprintln!(
+            "[BENCH]   Throughput: {:.1} M entries/sec",
+            (iterations * bits_sequence.len()) as f64 / elapsed.as_secs_f64() / 1_000_000.0
+        );
+        eprintln!(
+            "[BENCH]   Distribution: {} lit, {} len, {} eob, {} sub (accum {})",
+            literals,
+            lengths,
+            eobs,
+            subtables,
+            bitbuf_accum % 1000
+        );
+    }
+
+    /// Benchmark libdeflate's consume-first pattern simulation
+    #[test]
+    fn bench_consume_first_simulation() {
+        // Simulate the key difference: consume-first vs check-first
+
+        // Entry format: [literal_flag:1][symbol:8][bits:8]
+        let table: Vec<u32> = (0..4096)
+            .map(|i| {
+                // 95% literals (high bit set), 5% other
+                if i % 20 != 0 {
+                    0x8000_0000 | ((i & 0xFF) << 16) | 8 // literal, symbol, 8 bits
+                } else {
+                    0x4000_0000 | 10 // match, 10 bits
+                }
+            })
+            .collect();
+
+        let bits_sequence: Vec<u64> = (0..100_000).map(|i| i * 0x1234567).collect();
+
+        let iterations = 500;
+
+        // Pattern 1: Check-first (our current approach)
+        // if is_literal { consume(); process(); }
+        let start = std::time::Instant::now();
+        let mut sum = 0u64;
+        for _ in 0..iterations {
+            for &bits in &bits_sequence {
+                let mut bitbuf = bits;
+                let entry = table[(bitbuf & 0xFFF) as usize];
+
+                // CHECK FIRST
+                if entry & 0x8000_0000 != 0 {
+                    // Then consume
+                    let bits_to_skip = entry & 0xFF;
+                    bitbuf >>= bits_to_skip;
+                    sum = sum.wrapping_add((entry >> 16) as u64 & 0xFF);
+                    sum ^= bitbuf; // Use bitbuf to prevent optimization
+                }
+            }
+        }
+        let elapsed_check_first = start.elapsed();
+
+        // Pattern 2: Consume-first (libdeflate approach)
+        // consume(); if is_literal { process(); }
+        let start = std::time::Instant::now();
+        let mut sum2 = 0u64;
+        for _ in 0..iterations {
+            for &bits in &bits_sequence {
+                let mut bitbuf = bits;
+                let entry = table[(bitbuf & 0xFFF) as usize];
+
+                // CONSUME FIRST (unconditionally)
+                let bits_to_skip = entry & 0xFF;
+                bitbuf >>= bits_to_skip;
+
+                // Then check
+                if entry & 0x8000_0000 != 0 {
+                    sum2 = sum2.wrapping_add((entry >> 16) as u64 & 0xFF);
+                }
+                sum2 ^= bitbuf; // Use bitbuf to prevent optimization
+            }
+        }
+        let elapsed_consume_first = start.elapsed();
+
+        eprintln!("\n[BENCH] Consume-First vs Check-First (95% literals):");
+        eprintln!(
+            "[BENCH]   Check-first:   {:.2}ms",
+            elapsed_check_first.as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "[BENCH]   Consume-first: {:.2}ms",
+            elapsed_consume_first.as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "[BENCH]   Speedup: {:.1}%",
+            (elapsed_check_first.as_secs_f64() / elapsed_consume_first.as_secs_f64() - 1.0) * 100.0
+        );
+        eprintln!("[BENCH]   (sums: {}, {} to prevent opt)", sum, sum2);
+    }
+
     /// Combined benchmark with detailed path counting
     #[test]
     fn bench_with_path_counts() {

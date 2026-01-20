@@ -70,11 +70,29 @@ Multi-symbol synthetic: 2.27x faster than single-symbol (3M vs 1.3M sym/ms)
 
 | Issue | Impact | Fix Difficulty |
 |-------|--------|----------------|
+| **🔥 CONSUME-FIRST PATTERN** | **36.3% faster!** | HIGH (table redesign) |
 | **Multi-symbol decode** | 2.27x potential (synthetic bench) | MEDIUM |
-| **Table design (BITS=0 entries)** | 12% (blocks consume-first) | HIGH |
+| **Table design (BITS=0 entries)** | Blocks consume-first | HIGH |
 | **Function call overhead** | 5-10% (Rust vs C inline) | MEDIUM |
-| **Branch prediction** | 5-10% (nested conditionals) | MEDIUM |
 | **No BMI2 intrinsics** | 5% on supported CPUs | LOW |
+
+### Key Discovery: Consume-First Pattern
+
+**Benchmark proof**: consume-first is 36.3% faster than check-first.
+
+```
+Check-first:   24.92ms
+Consume-first: 18.28ms  (36.3% faster!)
+```
+
+**Why it matters**: libdeflate consumes bits BEFORE checking the entry type.
+This allows better instruction pipelining and branch prediction.
+
+**The blocker**: Our table uses `BITS=0` for invalid entries. Consuming an invalid
+entry corrupts the bit buffer. libdeflate uses subtables so ALL entries are valid.
+
+**The fix**: Redesign table so every entry has valid bits-to-consume. Use a different
+sentinel (e.g., type bits) to distinguish entry types after consuming.
 
 ### What We've Ruled Out
 
