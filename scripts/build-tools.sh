@@ -5,7 +5,7 @@
 # This script builds gzippy and all competitor tools used in CI benchmarks.
 # It's shared across multiple workflows to ensure consistency.
 #
-# Usage: ./scripts/build-tools.sh [--gzippy] [--pigz] [--rapidgzip] [--igzip] [--zopfli]
+# Usage: ./scripts/build-tools.sh [--gzippy] [--pigz] [--rapidgzip] [--igzip] [--zopfli] [--libdeflate] [--gzip]
 #        ./scripts/build-tools.sh --all
 #
 # Output paths (relative to repo root):
@@ -14,6 +14,8 @@
 #   rapidgzip: rapidgzip/librapidarchive/build/src/tools/rapidgzip
 #   igzip:     isa-l/build/bin/igzip
 #   zopfli:    zopfli/zopfli
+#   libdeflate: libdeflate/build/programs/libdeflate-gzip
+#   gzip:      gzip/gzip, gzip/gunzip
 # =============================================================================
 
 set -euo pipefail
@@ -37,9 +39,11 @@ BUILD_PIGZ=false
 BUILD_RAPIDGZIP=false
 BUILD_IGZIP=false
 BUILD_ZOPFLI=false
+BUILD_LIBDEFLATE=false
+BUILD_GZIP=false
 
 if [[ $# -eq 0 ]]; then
-    log_error "Usage: $0 [--gzippy] [--pigz] [--rapidgzip] [--igzip] [--zopfli] [--all]"
+    log_error "Usage: $0 [--gzippy] [--pigz] [--rapidgzip] [--igzip] [--zopfli] [--libdeflate] [--gzip] [--all]"
     exit 1
 fi
 
@@ -50,12 +54,16 @@ for arg in "$@"; do
         --rapidgzip) BUILD_RAPIDGZIP=true ;;
         --igzip) BUILD_IGZIP=true ;;
         --zopfli) BUILD_ZOPFLI=true ;;
+        --libdeflate) BUILD_LIBDEFLATE=true ;;
+        --gzip) BUILD_GZIP=true ;;
         --all)
             BUILD_GZIPPY=true
             BUILD_PIGZ=true
             BUILD_RAPIDGZIP=true
             BUILD_IGZIP=true
             BUILD_ZOPFLI=true
+            BUILD_LIBDEFLATE=true
+            BUILD_GZIP=true
             ;;
         *)
             log_error "Unknown argument: $arg"
@@ -173,6 +181,77 @@ if $BUILD_ZOPFLI; then
     else
         log_error "zopfli build failed"
         exit 1
+    fi
+fi
+
+# =============================================================================
+# Build libdeflate
+# =============================================================================
+if $BUILD_LIBDEFLATE; then
+    log_info "Building libdeflate..."
+    
+    cd "$REPO_ROOT/libdeflate"
+    rm -rf build
+    mkdir -p build
+    cd build
+    
+    cmake .. -DCMAKE_BUILD_TYPE=Release -DLIBDEFLATE_BUILD_SHARED_LIB=OFF
+    make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+    
+    cd "$REPO_ROOT"
+    
+    LIBDEFLATE_BIN="libdeflate/build/programs/libdeflate-gzip"
+    if [[ -f "$LIBDEFLATE_BIN" ]]; then
+        log_info "✓ libdeflate built: $LIBDEFLATE_BIN"
+        "$LIBDEFLATE_BIN" -h 2>&1 | head -1 || true
+    else
+        log_error "libdeflate build failed - binary not found at $LIBDEFLATE_BIN"
+        find libdeflate/build -name "libdeflate*" -type f 2>/dev/null || true
+        exit 1
+    fi
+fi
+
+# =============================================================================
+# Build gzip (GNU gzip)
+# =============================================================================
+if $BUILD_GZIP; then
+    log_info "Building gzip..."
+    
+    cd "$REPO_ROOT/gzip"
+    
+    # gzip uses autotools - check if we need to configure
+    if [[ ! -f Makefile ]]; then
+        if [[ -f configure ]]; then
+            ./configure --prefix="$REPO_ROOT/gzip/install" || {
+                log_warn "gzip configure failed - may need autotools"
+                cd "$REPO_ROOT"
+            }
+        else
+            log_warn "gzip configure not found - trying autoreconf"
+            autoreconf -i 2>/dev/null || log_warn "autoreconf not available"
+            if [[ -f configure ]]; then
+                ./configure --prefix="$REPO_ROOT/gzip/install" || {
+                    log_warn "gzip configure failed"
+                    cd "$REPO_ROOT"
+                }
+            fi
+        fi
+    fi
+    
+    if [[ -f Makefile ]]; then
+        make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" || log_warn "gzip make failed"
+    fi
+    
+    cd "$REPO_ROOT"
+    
+    if [[ -f gzip/gzip ]]; then
+        log_info "✓ gzip built: gzip/gzip"
+        # Create gunzip symlink if missing
+        if [[ ! -f gzip/gunzip ]]; then
+            ln -sf gzip gzip/gunzip
+        fi
+    else
+        log_warn "gzip not built - may need system gzip instead"
     fi
 fi
 
