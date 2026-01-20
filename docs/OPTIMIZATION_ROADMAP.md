@@ -23,7 +23,25 @@ From profiling and analysis:
 | Literal loop preloading | +0.7% (53.8→54.5%) | Small win, keep it |
 | Pattern-based small distance copy | **BROKE TESTS** | Can't pre-build pattern when distance<8 |
 | Simplified slow path to use copy_match_into | Neutral | Slow path rarely hit |
-| 5-word unconditional copy | **BROKE TESTS** | Needs explicit margin management |
+| 5-word unconditional copy (d>=8) | **55.4%** then **BROKE TESTS** | Works in fastloop only, needs margin |
+| Loop unrolling (4x 8-byte) | 50.5% | Not better than simple loop |
+| Tracing overhead optimization | 52.3% | #[cold] nested function helps |
+
+### Data-Driven Insights (from tracing)
+
+**Distance Distribution (17.5M matches in silesia):**
+- d=1 (RLE): 0.1% - Already optimized with memset
+- d=2-7: 0.7% - Byte-by-byte (only 130K matches, not worth optimizing)
+- d=8-39: 7.8% - Chunk copy with potential for libdeflate-style stride copy
+- d>=40: **91.3%** - Uses memcpy when d>=length (which is often)
+
+**Length Distribution:**
+- len 3-8: 70.7% - Most matches are short
+- len 9-32: 24.5%
+- len 33+: 4.8%
+
+**Key Insight**: 91% of matches have d>=40. For most of these (when len<=d), 
+we already use memcpy. The remaining gap is in the decode loop itself, not the copy function.
 
 ### What Actually Helps
 
