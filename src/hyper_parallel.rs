@@ -49,7 +49,7 @@ use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::marker_decode::{MarkerDecoder, CHUNK_SIZE, MARKER_BASE, WINDOW_SIZE};
+use crate::marker_decode::{MarkerDecoder, CHUNK_SIZE, WINDOW_SIZE};
 
 // =============================================================================
 // Configuration
@@ -164,54 +164,70 @@ impl OutputBuffer {
 // SIMD Marker Replacement
 // =============================================================================
 
-/// Replace markers in a u16 buffer using SIMD
+/// Replace markers in a u16 buffer - scalar fallback for all platforms
+fn replace_markers_scalar(data: &mut [u16], window: &[u8]) {
+    const MARKER_BASE_LOCAL: u16 = 32768;
+    for val in data.iter_mut() {
+        if *val > 255 {
+            let offset = (*val - MARKER_BASE_LOCAL) as usize;
+            if offset < window.len() {
+                *val = window[window.len() - 1 - offset] as u16;
+            }
+        }
+    }
+}
+
+/// Replace markers in a u16 buffer using SIMD when available
 ///
 /// This is the key optimization: we process 8-16 values per cycle instead of 1.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
 fn replace_markers_simd(data: &mut [u16], window: &[u8]) {
+    // Use runtime detection for AVX2
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: We just checked AVX2 is available
+        unsafe { replace_markers_avx2(data, window) }
+    } else {
+        replace_markers_scalar(data, window)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn replace_markers_avx2(data: &mut [u16], window: &[u8]) {
     use std::arch::x86_64::*;
+
+    const MARKER_BASE_LOCAL: u16 = 32768;
 
     if data.is_empty() || window.is_empty() {
         return;
     }
 
-    // SIMD threshold
     let threshold = _mm256_set1_epi16(255);
-
     let mut i = 0;
     let simd_end = data.len().saturating_sub(16);
 
-    // Process 16 values at a time
     while i < simd_end {
-        unsafe {
-            // Load 16 u16 values
-            let v = _mm256_loadu_si256(data.as_ptr().add(i) as *const __m256i);
+        let v = _mm256_loadu_si256(data.as_ptr().add(i) as *const __m256i);
+        let mask = _mm256_cmpgt_epi16(v, threshold);
+        let any_markers = _mm256_movemask_epi8(mask);
 
-            // Compare: values > 255 are markers
-            let mask = _mm256_cmpgt_epi16(v, threshold);
-            let any_markers = _mm256_movemask_epi8(mask);
-
-            if any_markers != 0 {
-                // Has markers - process scalar for this block
-                for j in 0..16 {
-                    let val = data[i + j];
-                    if val > 255 {
-                        let offset = (val - MARKER_BASE) as usize;
-                        if offset < window.len() {
-                            data[i + j] = window[window.len() - 1 - offset] as u16;
-                        }
+        if any_markers != 0 {
+            for j in 0..16 {
+                let val = data[i + j];
+                if val > 255 {
+                    let offset = (val - MARKER_BASE_LOCAL) as usize;
+                    if offset < window.len() {
+                        data[i + j] = window[window.len() - 1 - offset] as u16;
                     }
                 }
             }
-            // else: no markers in this block, skip
         }
         i += 16;
     }
 
-    // Handle remainder
     for val in &mut data[i..] {
         if *val > 255 {
-            let offset = (*val - MARKER_BASE) as usize;
+            let offset = (*val - MARKER_BASE_LOCAL) as usize;
             if offset < window.len() {
                 *val = window[window.len() - 1 - offset] as u16;
             }
@@ -223,6 +239,8 @@ fn replace_markers_simd(data: &mut [u16], window: &[u8]) {
 #[cfg(target_arch = "aarch64")]
 fn replace_markers_simd(data: &mut [u16], window: &[u8]) {
     use std::arch::aarch64::*;
+
+    const MARKER_BASE_LOCAL: u16 = 32768;
 
     if data.is_empty() || window.is_empty() {
         return;
@@ -242,7 +260,7 @@ fn replace_markers_simd(data: &mut [u16], window: &[u8]) {
                 for j in 0..8 {
                     let val = data[i + j];
                     if val > 255 {
-                        let offset = (val - MARKER_BASE) as usize;
+                        let offset = (val - MARKER_BASE_LOCAL) as usize;
                         if offset < window.len() {
                             data[i + j] = window[window.len() - 1 - offset] as u16;
                         }
@@ -255,7 +273,7 @@ fn replace_markers_simd(data: &mut [u16], window: &[u8]) {
 
     for val in &mut data[i..] {
         if *val > 255 {
-            let offset = (*val - MARKER_BASE) as usize;
+            let offset = (*val - MARKER_BASE_LOCAL) as usize;
             if offset < window.len() {
                 *val = window[window.len() - 1 - offset] as u16;
             }
@@ -263,17 +281,10 @@ fn replace_markers_simd(data: &mut [u16], window: &[u8]) {
     }
 }
 
-/// Fallback scalar version
+/// Fallback scalar version for other architectures
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn replace_markers_simd(data: &mut [u16], window: &[u8]) {
-    for val in data.iter_mut() {
-        if *val > 255 {
-            let offset = (*val - MARKER_BASE) as usize;
-            if offset < window.len() {
-                *val = window[window.len() - 1 - offset] as u16;
-            }
-        }
-    }
+    replace_markers_scalar(data, window)
 }
 
 // =============================================================================
@@ -742,12 +753,13 @@ mod tests {
 
     #[test]
     fn test_simd_marker_replacement() {
+        const MARKER_BASE_TEST: u16 = 32768;
         let window: Vec<u8> = (0..WINDOW_SIZE).map(|i| (i % 256) as u8).collect();
 
         // Create data with markers
         let mut data: Vec<u16> = vec![0; 100];
-        data[10] = MARKER_BASE + 5; // Should be window[WINDOW_SIZE - 6]
-        data[50] = MARKER_BASE + 100;
+        data[10] = MARKER_BASE_TEST + 5; // Should be window[WINDOW_SIZE - 6]
+        data[50] = MARKER_BASE_TEST + 100;
         data[99] = 42; // Literal
 
         replace_markers_simd(&mut data, &window);
