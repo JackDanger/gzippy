@@ -4462,6 +4462,110 @@ mod optimization_tests {
         );
     }
 
+    // =========================================================================
+    // Decode loop micro-benchmarks (isolated component testing)
+    // =========================================================================
+
+    /// Benchmark raw table lookup speed (isolated from decode)
+    #[test]
+    fn bench_table_lookup_speed() {
+        // Create a 12-bit table (4096 entries)
+        let table: Vec<u32> = (0..4096).map(|i| i as u32 * 0x12345).collect();
+
+        // Simulate random lookups
+        let lookups: Vec<u64> = (0..100_000).map(|i| (i * 7919) % 4096).collect();
+
+        let iterations = 1000;
+        let start = std::time::Instant::now();
+        let mut sum = 0u64;
+        for _ in 0..iterations {
+            for &idx in &lookups {
+                sum = sum.wrapping_add(table[(idx & 0xFFF) as usize] as u64);
+            }
+        }
+        let elapsed = start.elapsed();
+        let lookups_per_sec =
+            (lookups.len() * iterations) as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+
+        eprintln!(
+            "\n[BENCH] Table Lookup: {:.1} M lookups/sec",
+            lookups_per_sec
+        );
+        eprintln!("[BENCH]   (sum={} to prevent optimization)", sum % 1000);
+    }
+
+    /// Benchmark branch prediction: check-first vs consume-first pattern
+    #[test]
+    fn bench_branch_pattern() {
+        // Entry format: high bit = literal, low byte = bits to consume
+        let entries: Vec<u32> = (0..100_000)
+            .map(|i| {
+                // 70% literals, 30% matches (realistic)
+                if (i * 7919) % 10 < 7 {
+                    0x8000_0008 | ((i as u32 & 0xFF) << 16) // Literal: high bit set
+                } else {
+                    0x0000_0008 | ((i as u32 & 0xFF) << 16) // Match: high bit clear
+                }
+            })
+            .collect();
+
+        let iterations = 1000;
+
+        // Pattern 1: Check first, then consume (our current pattern)
+        let start = std::time::Instant::now();
+        let mut sum = 0u64;
+        let mut bits_consumed = 0u64;
+        for _ in 0..iterations {
+            for &entry in &entries {
+                if (entry as i32) < 0 {
+                    bits_consumed += (entry & 0xFF) as u64;
+                    sum += ((entry >> 16) & 0xFF) as u64;
+                } else {
+                    bits_consumed += (entry & 0xFF) as u64;
+                    sum += entry as u64;
+                }
+            }
+        }
+        let elapsed1 = start.elapsed();
+
+        // Pattern 2: Consume first, then check (libdeflate pattern)
+        let start = std::time::Instant::now();
+        let mut sum2 = 0u64;
+        let mut bits_consumed2 = 0u64;
+        for _ in 0..iterations {
+            for &entry in &entries {
+                bits_consumed2 += (entry & 0xFF) as u64;
+                if (entry as i32) < 0 {
+                    sum2 += ((entry >> 16) & 0xFF) as u64;
+                } else {
+                    sum2 += entry as u64;
+                }
+            }
+        }
+        let elapsed2 = start.elapsed();
+
+        eprintln!("\n[BENCH] Branch Pattern Comparison:");
+        eprintln!(
+            "[BENCH]   Check-first (ours):  {:.2}ms",
+            elapsed1.as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "[BENCH]   Consume-first (libdeflate): {:.2}ms",
+            elapsed2.as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "[BENCH]   Consume-first speedup: {:.0}%",
+            (elapsed1.as_secs_f64() / elapsed2.as_secs_f64() - 1.0) * 100.0
+        );
+        eprintln!(
+            "[BENCH]   (sums: {} {} bits: {} {})",
+            sum % 1000,
+            sum2 % 1000,
+            bits_consumed % 1000,
+            bits_consumed2 % 1000
+        );
+    }
+
     /// Combined benchmark with detailed path counting
     #[test]
     fn bench_with_path_counts() {
