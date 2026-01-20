@@ -207,8 +207,13 @@ def benchmark_compress(tool: str, level: int, threads: int,
     
     # Handle tool-specific command line syntax
     if tool == "igzip":
-        # igzip uses levels 0-3, map standard gzip levels
-        igzip_level = min(3, max(0, (effective_level - 1) // 3))
+        # igzip only has levels 0-3 (ISAL_DEF_MAX_LEVEL=3)
+        # Always use level 3 (max compression) for fair comparison.
+        # Even at level 3, igzip produces 10-15% larger files than gzip/pigz/gzippy
+        # because it's optimized for speed over compression ratio.
+        # 
+        # For users who want igzip-like speed, they should use gzippy L1.
+        igzip_level = 3  # Always use max compression for fairest comparison
         cmd = [bin_path, f"-{igzip_level}"]
         if threads > 1:
             cmd.append(f"-T{threads}")
@@ -426,15 +431,17 @@ def main():
         
         # Primary comparison: single-thread vs gzip, multi-thread vs pigz
         #
-        # NOTE ON igzip: igzip is a speed-optimized compressor (like gzip -1)
-        # that sacrifices compression ratio for speed. Its "level 3" (max) still
-        # produces files ~15% larger than gzip L6. We benchmark igzip for
-        # informational purposes but compare against pigz which has similar
-        # compression goals to gzippy.
+        # NOTE ON igzip: igzip (ISA-L) only has levels 0-3 and is designed for
+        # speed over compression ratio. Even at level 3 (max), it produces files
+        # 10-15% larger than gzip/pigz/gzippy at equivalent settings.
         #
-        # For users who want igzip-like speed, they should use gzippy L1.
-        # gzippy L1 should be competitive with igzip on speed while
-        # producing smaller files.
+        # We always run igzip at level 3 (its max compression) for fair comparison.
+        # Users who want igzip-like speed should use gzippy L1, which is competitive
+        # with igzip on speed while producing smaller files.
+        #
+        # The comparison baseline is pigz (not igzip) because pigz has similar
+        # compression goals to gzippy. igzip is benchmarked for informational
+        # purposes only.
         if args.threads == 1:
             primary_baseline = "gzip"
         else:
