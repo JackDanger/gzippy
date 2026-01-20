@@ -1428,7 +1428,6 @@ unsafe fn decode_huffman_asm_x64(
     dist_table: &TwoLevelTable,
 ) -> io::Result<usize> {
     use crate::inflate_tables::{DIST_EXTRA_BITS, DIST_START};
-    use std::arch::x86_64::*;
 
     // Entry format constants
     const LUT_MASK: u64 = 0xFFF;
@@ -1493,8 +1492,8 @@ unsafe fn decode_huffman_asm_x64(
             output[out_pos] = ((entry >> SYMBOL_SHIFT) & 0xFF) as u8;
             out_pos += 1;
 
-            // Consume bits using BMI2 shrx
-            bitbuf = unsafe { _shrx_u64(bitbuf, entry_bits as u64) };
+            // Consume bits
+            bitbuf >>= entry_bits;
             bits = bits.wrapping_sub(entry_bits);
 
             // Tight inner loop for consecutive literals
@@ -1506,14 +1505,14 @@ unsafe fn decode_huffman_asm_x64(
                 let e_bits = (e & BITS_MASK) as u32;
                 output[out_pos] = ((e >> SYMBOL_SHIFT) & 0xFF) as u8;
                 out_pos += 1;
-                bitbuf = unsafe { _shrx_u64(bitbuf, e_bits as u64) };
+                bitbuf >>= e_bits;
                 bits = bits.wrapping_sub(e_bits);
             }
             continue 'main;
         }
 
         // Non-literal: consume bits first
-        bitbuf = unsafe { _shrx_u64(bitbuf, entry_bits as u64) };
+        bitbuf >>= entry_bits;
         bits = bits.wrapping_sub(entry_bits);
 
         let dist_field = entry & DIST_MASK;
@@ -1546,7 +1545,7 @@ unsafe fn decode_huffman_asm_x64(
                     "Invalid distance code",
                 ));
             }
-            bitbuf = unsafe { _shrx_u64(bitbuf, dist_len as u64) };
+            bitbuf >>= dist_len;
             bits = bits.wrapping_sub(dist_len);
 
             // Read distance extra bits
@@ -1564,7 +1563,7 @@ unsafe fn decode_huffman_asm_x64(
                 }
             }
             let extra_val = (bitbuf & ((1u64 << extra) - 1)) as usize;
-            bitbuf = unsafe { _shrx_u64(bitbuf, extra as u64) };
+            bitbuf >>= extra;
             bits = bits.wrapping_sub(extra);
 
             let distance = DIST_START[dist_sym as usize] as usize + extra_val;
