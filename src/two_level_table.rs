@@ -450,23 +450,36 @@ impl<'a> TurboBits<'a> {
 
     /// Branchless refill - always loads a word, adjusts pointer arithmetically
     /// Based on libdeflate's REFILL_BITS_BRANCHLESS() macro
+    ///
+    /// CRITICAL: This uses libdeflate's overlapping load technique:
+    /// - After initial 8-byte load, pos = 7 (not 8!)
+    /// - pos tracks where the NEXT load should start
+    /// - Subsequent loads re-read the last byte, which is already in the buffer
+    /// - This makes the OR operation idempotent for overlapping positions
     #[inline(always)]
     pub fn refill_branchless(&mut self) {
+        let bits_u8 = self.bits as u8;
+
         if self.pos + 8 <= self.data.len() {
-            // Load 8 bytes unconditionally
+            // Load 8 bytes unconditionally from current position
             let word = unsafe { (self.data.as_ptr().add(self.pos) as *const u64).read_unaligned() };
-            self.buf |= word.to_le() << (self.bits as u8);
+            self.buf |= word.to_le() << bits_u8;
 
-            // libdeflate trick: advance by (64 - bits) / 8 bytes
-            // This is branchless pointer arithmetic
-            let bytes_to_add = (64 - (self.bits as u8)) >> 3;
-            self.pos += bytes_to_add as usize;
+            // libdeflate's pointer arithmetic:
+            // Advance by 7 bytes, then back up based on how many bits we had
+            // This ensures we re-load the overlapping byte(s) next time
+            // pos += 7 - ((bits / 8) mod 8) = 7 - ((bits >> 3) & 7)
+            let bytes_back = (bits_u8 >> 3) & 7;
+            self.pos += 7usize.saturating_sub(bytes_back as usize);
 
-            // Set bits to 56+ (allow garbage in high bits)
-            // libdeflate uses: bitsleft |= MAX_BITSLEFT & ~7 which is 0x38 (56)
+            // Set bits to 56+
             self.bits |= 56;
         } else {
             // Near end of input - byte-by-byte
+            // Clear high bits first since we may have garbage there
+            if bits_u8 < 64 {
+                self.buf &= (1u64 << bits_u8).wrapping_sub(1);
+            }
             while (self.bits as u8) <= 56 && self.pos < self.data.len() {
                 self.buf |= (self.data[self.pos] as u64) << (self.bits as u8);
                 self.pos += 1;
@@ -481,15 +494,13 @@ impl<'a> TurboBits<'a> {
         self.buf
     }
 
-    /// Consume bits from a packed entry - subtracts full u32 (libdeflate style)
-    /// The entry's low byte contains bits to consume; high bits are ignored
-    /// because we only use low 8 bits of self.bits for comparisons
+    /// Consume bits from a packed entry
+    /// The entry's low byte contains bits to consume
     #[inline(always)]
     pub fn consume_entry(&mut self, entry: u32) {
-        // Shift buffer by low 8 bits of entry (CPU ignores high bits in shift)
-        self.buf >>= entry as u8;
-        // Subtract full entry - garbage in high bits is fine
-        self.bits = self.bits.wrapping_sub(entry);
+        let bits_to_consume = entry & 0xFF;
+        self.buf >>= bits_to_consume;
+        self.bits = self.bits.saturating_sub(bits_to_consume);
     }
 
     /// Consume n bits (standard method)
@@ -518,6 +529,15 @@ impl<'a> TurboBits<'a> {
     pub fn ensure(&mut self, n: u32) {
         if (self.bits as u8) < n as u8 {
             self.refill_branchless();
+        }
+    }
+
+    /// Align to byte boundary (discard partial byte)
+    #[inline(always)]
+    pub fn align(&mut self) {
+        let discard = (self.bits as u8) & 7;
+        if discard > 0 {
+            self.consume(discard as u32);
         }
     }
 }

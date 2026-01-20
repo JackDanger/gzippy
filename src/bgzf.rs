@@ -22,7 +22,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::combined_lut::CombinedLUT;
 use crate::inflate_tables::CODE_LENGTH_ORDER;
-use crate::two_level_table::{FastBits, TwoLevelTable};
+use crate::packed_lut::PackedLUT;
+use crate::two_level_table::{FastBits, TurboBits, TwoLevelTable};
 
 /// BGZF block information
 #[derive(Debug, Clone)]
@@ -185,9 +186,184 @@ fn calculate_deflate_offset(block: &[u8]) -> usize {
 /// Inflate directly into a pre-allocated output slice
 ///
 /// This is the key function for zero-copy parallel decompression.
-/// Uses our CombinedLUT for maximum speed (10700+ MB/s single-threaded).
+/// Uses the optimized TurboBits + PackedLUT path for maximum performance.
 fn inflate_into(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
-    inflate_into_pub(deflate_data, output)
+    // Use the turbo path with all Phase 1 optimizations:
+    // - TurboBits with branchless refill (libdeflate-style)
+    // - PackedLUT for bitsleft -= entry optimization
+    // - Multi-symbol decode for literal runs
+    inflate_into_turbo(deflate_data, output)
+}
+
+/// Turbo inflate using TurboBits + PackedLUT
+///
+/// This is the optimized hot path with all Phase 1 optimizations:
+/// - TurboBits with branchless refill (libdeflate-style overlapping loads)
+/// - PackedLUT for bitsleft -= entry optimization
+/// - Multi-symbol decode for literal runs
+fn inflate_into_turbo(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
+    let mut bits = TurboBits::new(deflate_data);
+    let mut out_pos = 0;
+
+    loop {
+        bits.ensure(16);
+
+        let bfinal = bits.read(1);
+        let btype = bits.read(2);
+
+        match btype {
+            0 => out_pos = decode_stored_into_turbo(&mut bits, output, out_pos)?,
+            1 => out_pos = decode_fixed_into_turbo(&mut bits, output, out_pos)?,
+            2 => out_pos = decode_dynamic_into_turbo(&mut bits, output, out_pos)?,
+            3 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Reserved block type",
+                ))
+            }
+            _ => unreachable!(),
+        }
+
+        if bfinal == 1 {
+            break;
+        }
+    }
+
+    Ok(out_pos)
+}
+
+/// Turbo decode for stored blocks
+#[allow(dead_code)]
+fn decode_stored_into_turbo(
+    bits: &mut TurboBits,
+    output: &mut [u8],
+    mut out_pos: usize,
+) -> io::Result<usize> {
+    bits.align();
+    bits.ensure(32);
+
+    let len = bits.read(16) as usize;
+    let nlen = bits.read(16) as usize;
+
+    if len != (!nlen & 0xFFFF) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Stored block length mismatch",
+        ));
+    }
+
+    for _ in 0..len {
+        if out_pos >= output.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "Output buffer full",
+            ));
+        }
+        bits.ensure(8);
+        output[out_pos] = bits.read(8) as u8;
+        out_pos += 1;
+    }
+
+    Ok(out_pos)
+}
+
+/// Turbo decode for fixed Huffman blocks
+#[allow(dead_code)]
+fn decode_fixed_into_turbo(
+    bits: &mut TurboBits,
+    output: &mut [u8],
+    out_pos: usize,
+) -> io::Result<usize> {
+    let (lit_len_table, dist_table, packed_lut) = get_fixed_tables_turbo();
+    decode_huffman_turbo(bits, output, out_pos, packed_lut, lit_len_table, dist_table)
+}
+
+/// Turbo decode for dynamic Huffman blocks
+#[allow(dead_code)]
+fn decode_dynamic_into_turbo(
+    bits: &mut TurboBits,
+    output: &mut [u8],
+    out_pos: usize,
+) -> io::Result<usize> {
+    bits.ensure(16);
+    let hlit = bits.read(5) as usize + 257;
+    let hdist = bits.read(5) as usize + 1;
+    let hclen = bits.read(4) as usize + 4;
+
+    // Read code length code lengths
+    let mut code_len_lens = [0u8; 19];
+    for i in 0..hclen {
+        bits.ensure(8);
+        code_len_lens[CODE_LENGTH_ORDER[i] as usize] = bits.read(3) as u8;
+    }
+
+    let code_len_table = TwoLevelTable::build(&code_len_lens)?;
+
+    // Read all code lengths
+    let total_codes = hlit + hdist;
+    let mut code_lens = vec![0u8; total_codes];
+    let mut i = 0;
+
+    while i < total_codes {
+        bits.ensure(16);
+        let (symbol, sym_len) = code_len_table.decode(bits.buffer());
+        if sym_len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid code length code",
+            ));
+        }
+        bits.consume(sym_len);
+
+        match symbol {
+            0..=15 => {
+                code_lens[i] = symbol as u8;
+                i += 1;
+            }
+            16 => {
+                if i == 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid repeat"));
+                }
+                let repeat = 3 + bits.read(2) as usize;
+                let last = code_lens[i - 1];
+                for _ in 0..repeat.min(total_codes - i) {
+                    code_lens[i] = last;
+                    i += 1;
+                }
+            }
+            17 => {
+                let repeat = 3 + bits.read(3) as usize;
+                i += repeat.min(total_codes - i);
+            }
+            18 => {
+                let repeat = 11 + bits.read(7) as usize;
+                i += repeat.min(total_codes - i);
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid code length symbol",
+                ))
+            }
+        }
+    }
+
+    let lit_len_lens = &code_lens[..hlit];
+    let dist_lens = &code_lens[hlit..];
+
+    // Build tables - PackedLUT for turbo decode + TwoLevelTable for fallback
+    let lit_len_table = TwoLevelTable::build(lit_len_lens)?;
+    let dist_table = TwoLevelTable::build(dist_lens)?;
+    let packed_lut = PackedLUT::build(lit_len_lens, dist_lens)?;
+
+    decode_huffman_turbo(
+        bits,
+        output,
+        out_pos,
+        &packed_lut,
+        &lit_len_table,
+        &dist_table,
+    )
 }
 
 /// Public version of inflate_into for use by other modules
@@ -256,6 +432,24 @@ fn decode_stored_into(
     Ok(out_pos)
 }
 
+/// Get fixed Huffman code lengths (RFC 1951)
+fn get_fixed_lit_len_lens() -> [u8; 288] {
+    let mut lens = [0u8; 288];
+    for i in 0..144 {
+        lens[i] = 8;
+    }
+    for i in 144..256 {
+        lens[i] = 9;
+    }
+    for i in 256..280 {
+        lens[i] = 7;
+    }
+    for i in 280..288 {
+        lens[i] = 8;
+    }
+    lens
+}
+
 /// Pre-built fixed Huffman tables
 fn get_fixed_tables() -> (
     &'static TwoLevelTable,
@@ -268,22 +462,8 @@ fn get_fixed_tables() -> (
     static FIXED_DIST: OnceLock<TwoLevelTable> = OnceLock::new();
     static FIXED_COMBINED: OnceLock<CombinedLUT> = OnceLock::new();
 
-    let lit_len = FIXED_LIT_LEN.get_or_init(|| {
-        let mut lens = [0u8; 288];
-        for i in 0..144 {
-            lens[i] = 8;
-        }
-        for i in 144..256 {
-            lens[i] = 9;
-        }
-        for i in 256..280 {
-            lens[i] = 7;
-        }
-        for i in 280..288 {
-            lens[i] = 8;
-        }
-        TwoLevelTable::build(&lens).unwrap()
-    });
+    let lit_len =
+        FIXED_LIT_LEN.get_or_init(|| TwoLevelTable::build(&get_fixed_lit_len_lens()).unwrap());
 
     let dist = FIXED_DIST.get_or_init(|| {
         let lens = [5u8; 32];
@@ -291,24 +471,40 @@ fn get_fixed_tables() -> (
     });
 
     let combined = FIXED_COMBINED.get_or_init(|| {
-        let mut lit_len_lens = vec![0u8; 288];
-        for i in 0..144 {
-            lit_len_lens[i] = 8;
-        }
-        for i in 144..256 {
-            lit_len_lens[i] = 9;
-        }
-        for i in 256..280 {
-            lit_len_lens[i] = 7;
-        }
-        for i in 280..288 {
-            lit_len_lens[i] = 8;
-        }
         let dist_lens = vec![5u8; 32];
-        CombinedLUT::build(&lit_len_lens, &dist_lens).unwrap()
+        CombinedLUT::build(&get_fixed_lit_len_lens(), &dist_lens).unwrap()
     });
 
     (lit_len, dist, combined)
+}
+
+/// Pre-built fixed Huffman tables with PackedLUT for turbo decode
+#[allow(dead_code)]
+fn get_fixed_tables_turbo() -> (
+    &'static TwoLevelTable,
+    &'static TwoLevelTable,
+    &'static PackedLUT,
+) {
+    use std::sync::OnceLock;
+
+    static FIXED_LIT_LEN: OnceLock<TwoLevelTable> = OnceLock::new();
+    static FIXED_DIST: OnceLock<TwoLevelTable> = OnceLock::new();
+    static FIXED_PACKED: OnceLock<PackedLUT> = OnceLock::new();
+
+    let lit_len =
+        FIXED_LIT_LEN.get_or_init(|| TwoLevelTable::build(&get_fixed_lit_len_lens()).unwrap());
+
+    let dist = FIXED_DIST.get_or_init(|| {
+        let lens = [5u8; 32];
+        TwoLevelTable::build(&lens).unwrap()
+    });
+
+    let packed = FIXED_PACKED.get_or_init(|| {
+        let dist_lens = vec![5u8; 32];
+        PackedLUT::build(&get_fixed_lit_len_lens(), &dist_lens).unwrap()
+    });
+
+    (lit_len, dist, packed)
 }
 
 /// Decode fixed Huffman block into output slice
@@ -845,47 +1041,64 @@ fn decode_huffman_turbo(
     let fastloop_end = out_end.saturating_sub(320);
     let table = &packed_lut.table;
 
-    // === FASTLOOP with Phase 1 + Phase 2 optimizations ===
-    // Phase 2.1: Try to decode 2 literals at the TOP of each iteration
-    // This halves loop overhead for literal-heavy data (libdeflate's key insight)
+    // === FASTLOOP with libdeflate-style entry preloading ===
+    // Key insight: Load NEXT entry BEFORE processing current entry
+    // This hides memory latency by overlapping lookup with processing
     while out_pos < fastloop_end {
         bits.ensure(56);
 
-        // === FIRST LITERAL ATTEMPT ===
-        let entry1 = table[(bits.buffer() & LUT_MASK) as usize].0;
+        // Load first entry
+        let mut entry = table[(bits.buffer() & LUT_MASK) as usize].0;
 
-        // Check if it's a valid literal (bit 31 set, bits > 0)
-        if (entry1 as i32) < 0 && (entry1 & BITS_MASK) != 0 {
-            bits.consume_entry(entry1);
-            output[out_pos] = ((entry1 >> SYMBOL_SHIFT) & 0xFF) as u8;
+        // === LITERAL CHAIN (up to 3 literals like libdeflate) ===
+        if (entry as i32) < 0 && (entry & BITS_MASK) != 0 {
+            // First literal - consume and PRELOAD next entry
+            bits.consume_entry(entry);
+            let lit1 = ((entry >> SYMBOL_SHIFT) & 0xFF) as u8;
+            entry = table[(bits.buffer() & LUT_MASK) as usize].0; // PRELOAD
+
+            output[out_pos] = lit1;
             out_pos += 1;
 
-            // === SECOND LITERAL ATTEMPT ===
-            let entry2 = table[(bits.buffer() & LUT_MASK) as usize].0;
+            // Second literal check (entry already preloaded)
+            if (entry as i32) < 0 && (entry & BITS_MASK) != 0 {
+                bits.consume_entry(entry);
+                let lit2 = ((entry >> SYMBOL_SHIFT) & 0xFF) as u8;
+                entry = table[(bits.buffer() & LUT_MASK) as usize].0; // PRELOAD
 
-            if (entry2 as i32) < 0 && (entry2 & BITS_MASK) != 0 {
-                bits.consume_entry(entry2);
-                output[out_pos] = ((entry2 >> SYMBOL_SHIFT) & 0xFF) as u8;
+                output[out_pos] = lit2;
                 out_pos += 1;
 
-                // Continue with tight literal loop for runs > 2
-                loop {
-                    if !bits.has_bits(12) {
-                        break;
-                    }
-                    let e = table[(bits.buffer() & LUT_MASK) as usize].0;
-                    if (e as i32) >= 0 || (e & BITS_MASK) == 0 {
-                        break;
-                    }
-                    bits.consume_entry(e);
-                    output[out_pos] = ((e >> SYMBOL_SHIFT) & 0xFF) as u8;
+                // Third literal check (entry already preloaded)
+                if (entry as i32) < 0 && (entry & BITS_MASK) != 0 {
+                    bits.consume_entry(entry);
+                    let lit3 = ((entry >> SYMBOL_SHIFT) & 0xFF) as u8;
+
+                    output[out_pos] = lit3;
                     out_pos += 1;
+
+                    // Continue with tight literal loop for runs > 3
+                    loop {
+                        if !bits.has_bits(12) {
+                            break;
+                        }
+                        let e = table[(bits.buffer() & LUT_MASK) as usize].0;
+                        if (e as i32) >= 0 || (e & BITS_MASK) == 0 {
+                            break;
+                        }
+                        bits.consume_entry(e);
+                        output[out_pos] = ((e >> SYMBOL_SHIFT) & 0xFF) as u8;
+                        out_pos += 1;
+                    }
+                    continue;
                 }
-                continue;
+                // Third wasn't literal - entry is already loaded, fall through
+            } else {
+                // Second wasn't literal - entry is already loaded, fall through
             }
-            // Second wasn't a literal - fall through to handle it
-            // (entry2 is already loaded, no need to reload)
-            if entry2 & BITS_MASK == 0 {
+
+            // Handle non-literal entry (already in 'entry' variable)
+            if entry & BITS_MASK == 0 {
                 // Invalid - use slow path
                 let (symbol, code_len) = lit_len_table.decode(bits.buffer());
                 if code_len == 0 {
@@ -920,14 +1133,14 @@ fn decode_huffman_turbo(
                 continue;
             }
 
-            bits.consume_entry(entry2);
-            // Handle entry2 as non-literal (EOB, match, etc.) - jump to match handling
-            let dist_field = entry2 & DIST_MASK;
+            bits.consume_entry(entry);
+            // Handle entry as non-literal (EOB, match, etc.)
+            let dist_field = entry & DIST_MASK;
             if dist_field == DIST_EOB {
                 return Ok(out_pos);
             }
             if dist_field == DIST_SLOW {
-                let length = ((entry2 >> SYMBOL_SHIFT) & 0xFF) as usize + 3;
+                let length = ((entry >> SYMBOL_SHIFT) & 0xFF) as usize + 3;
                 let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
                 if dist_len == 0 {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid dist"));
@@ -943,7 +1156,7 @@ fn decode_huffman_turbo(
                 continue;
             }
             // Pre-computed match
-            let length = ((entry2 >> SYMBOL_SHIFT) & 0xFF) as usize + 3;
+            let length = ((entry >> SYMBOL_SHIFT) & 0xFF) as usize + 3;
             let distance = (dist_field >> DIST_SHIFT) as usize;
             if distance > out_pos {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad dist"));
@@ -951,9 +1164,6 @@ fn decode_huffman_turbo(
             out_pos = copy_match_into(output, out_pos, distance, length);
             continue;
         }
-
-        // First entry wasn't a literal - handle it directly
-        let entry = entry1;
 
         // Invalid entry - fallback
         if entry & BITS_MASK == 0 {
@@ -2521,6 +2731,350 @@ pub fn is_multi_member(data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // TURBO PATH UNIT TESTS - Debug the optimized decoder
+    // =========================================================================
+
+    /// Test TurboBits basic operations
+    #[test]
+    fn test_turbo_bits_basic() {
+        // Simple data: 8 bytes
+        let data = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+        let mut bits = TurboBits::new(&data);
+
+        // Should have loaded data
+        assert!(bits.has_bits(8), "Should have at least 8 bits");
+
+        // Read first byte
+        let byte1 = bits.read(8);
+        assert_eq!(byte1, 0x12, "First byte should be 0x12");
+
+        // Read second byte
+        bits.ensure(8);
+        let byte2 = bits.read(8);
+        assert_eq!(byte2, 0x34, "Second byte should be 0x34");
+    }
+
+    /// Test TurboBits align operation
+    #[test]
+    fn test_turbo_bits_align() {
+        let data = [0xFF, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE];
+        let mut bits = TurboBits::new(&data);
+
+        // Read 3 bits
+        let _ = bits.read(3);
+
+        // Align to byte boundary (should skip 5 bits)
+        bits.align();
+
+        // Now read should give second byte
+        bits.ensure(8);
+        let byte = bits.read(8);
+        assert_eq!(byte, 0x12, "After align, should read 0x12");
+    }
+
+    /// Test turbo inflate with simple literal-only data
+    #[test]
+    fn test_turbo_inflate_literals() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as IoWrite;
+
+        // Simple literals - no back-references
+        let original = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(1)); // Fast = mostly literals
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        eprintln!(
+            "Original: {} bytes, Compressed: {} bytes",
+            original.len(),
+            compressed.len()
+        );
+        eprintln!(
+            "Compressed hex: {:02x?}",
+            &compressed[..compressed.len().min(32)]
+        );
+
+        // Test standard path
+        let mut output_std = vec![0u8; original.len() + 100];
+        let size_std = inflate_into_pub(&compressed, &mut output_std).unwrap();
+        assert_eq!(
+            &output_std[..size_std],
+            &original[..],
+            "Standard path failed"
+        );
+        eprintln!("Standard decoded: {} bytes", size_std);
+
+        // Test turbo path
+        let mut output_turbo = vec![0u8; original.len() + 100];
+        let size_turbo = inflate_into_turbo(&compressed, &mut output_turbo).unwrap();
+        eprintln!("Turbo decoded: {} bytes", size_turbo);
+        eprintln!(
+            "Turbo output: {:?}",
+            String::from_utf8_lossy(&output_turbo[..size_turbo])
+        );
+        eprintln!("Expected:     {:?}", String::from_utf8_lossy(original));
+
+        assert_eq!(
+            size_turbo, size_std,
+            "Turbo size mismatch: {} vs {}",
+            size_turbo, size_std
+        );
+        assert_eq!(
+            &output_turbo[..size_turbo],
+            &original[..],
+            "Turbo content mismatch"
+        );
+    }
+
+    /// Test turbo inflate with repetitive data (back-references)
+    #[test]
+    fn test_turbo_inflate_rle() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as IoWrite;
+
+        // Repetitive data - will use RLE (distance=1)
+        let original = vec![b'X'; 1000];
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Test standard path
+        let mut output_std = vec![0u8; original.len() + 100];
+        let size_std = inflate_into_pub(&compressed, &mut output_std).unwrap();
+        assert_eq!(
+            &output_std[..size_std],
+            &original[..],
+            "Standard path failed"
+        );
+
+        // Test turbo path
+        let mut output_turbo = vec![0u8; original.len() + 100];
+        let size_turbo = inflate_into_turbo(&compressed, &mut output_turbo).unwrap();
+
+        assert_eq!(
+            size_turbo, size_std,
+            "Turbo size mismatch: {} vs {}",
+            size_turbo, size_std
+        );
+        assert_eq!(
+            &output_turbo[..size_turbo],
+            &original[..],
+            "Turbo content mismatch"
+        );
+    }
+
+    /// Test turbo inflate with mixed data (literals + back-references)
+    #[test]
+    fn test_turbo_inflate_mixed() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as IoWrite;
+
+        // Mixed data - pattern that repeats
+        let pattern = b"The quick brown fox jumps over the lazy dog. ";
+        let original: Vec<u8> = pattern.iter().cycle().take(500).copied().collect();
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Test standard path
+        let mut output_std = vec![0u8; original.len() + 100];
+        let size_std = inflate_into_pub(&compressed, &mut output_std).unwrap();
+        assert_eq!(
+            &output_std[..size_std],
+            &original[..],
+            "Standard path failed"
+        );
+
+        // Test turbo path
+        let mut output_turbo = vec![0u8; original.len() + 100];
+        let size_turbo = inflate_into_turbo(&compressed, &mut output_turbo).unwrap();
+
+        assert_eq!(
+            size_turbo, size_std,
+            "Turbo size mismatch: {} vs {}",
+            size_turbo, size_std
+        );
+        assert_eq!(
+            &output_turbo[..size_turbo],
+            &original[..],
+            "Turbo content mismatch"
+        );
+    }
+
+    /// Test decode_huffman_turbo with fixed Huffman tables
+    #[test]
+    fn test_decode_huffman_turbo_fixed() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as IoWrite;
+
+        let original = b"Hello, World!";
+
+        // Use fast compression which uses fixed Huffman
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Skip the 3-bit block header (we assume BFINAL=1, BTYPE=01 for fixed)
+        let (lit_len_table, dist_table, packed_lut) = get_fixed_tables_turbo();
+
+        // Create TurboBits and skip header
+        let mut bits = TurboBits::new(&compressed);
+        bits.ensure(16);
+        let bfinal = bits.read(1);
+        let btype = bits.read(2);
+
+        eprintln!("Block: bfinal={}, btype={}", bfinal, btype);
+
+        if btype == 1 {
+            // Fixed Huffman - test our turbo decoder
+            let mut output = vec![0u8; original.len() + 100];
+            let result = decode_huffman_turbo(
+                &mut bits,
+                &mut output,
+                0,
+                packed_lut,
+                lit_len_table,
+                dist_table,
+            );
+
+            match result {
+                Ok(size) => {
+                    eprintln!("Decoded {} bytes", size);
+                    assert_eq!(size, original.len(), "Size mismatch");
+                    assert_eq!(&output[..size], &original[..], "Content mismatch");
+                }
+                Err(e) => {
+                    panic!("decode_huffman_turbo failed: {}", e);
+                }
+            }
+        } else {
+            eprintln!("Skipping - not a fixed Huffman block (btype={})", btype);
+        }
+    }
+
+    /// Test PackedLUT entry format
+    #[test]
+    fn test_packed_lut_entries() {
+        use crate::packed_lut::PackedLUT;
+
+        // Build fixed Huffman tables
+        let lit_len_lens = get_fixed_lit_len_lens();
+        let dist_lens = vec![5u8; 32];
+
+        eprintln!("Code lengths for A-Z:");
+        for ch in b'A'..=b'Z' {
+            eprintln!(
+                "  '{}' ({}) = {} bits",
+                ch as char, ch, lit_len_lens[ch as usize]
+            );
+        }
+
+        let packed_lut = PackedLUT::build(&lit_len_lens, &dist_lens).unwrap();
+
+        // Check some entries
+        let mut literals = 0;
+        let mut eobs = 0;
+        let mut slow_paths = 0;
+        let mut invalid = 0;
+
+        for entry in packed_lut.table.iter() {
+            if entry.is_valid() {
+                if entry.is_literal() {
+                    literals += 1;
+                } else if entry.is_eob() {
+                    eobs += 1;
+                } else if entry.is_slow_path() {
+                    slow_paths += 1;
+                }
+            } else {
+                invalid += 1;
+            }
+        }
+
+        eprintln!(
+            "PackedLUT entries: literals={}, eobs={}, slow_paths={}, invalid={}",
+            literals, eobs, slow_paths, invalid
+        );
+
+        assert!(literals > 0, "Should have literal entries");
+        assert!(eobs > 0, "Should have EOB entries");
+    }
+
+    /// Debug test: trace through turbo decode to find the bug
+    #[test]
+    fn test_turbo_decode_trace() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as IoWrite;
+
+        // Test with increasing sizes to find where it breaks
+        for size in [8, 10, 12, 16, 20, 24, 26] {
+            let original: Vec<u8> = (b'A'..).take(size).collect();
+
+            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(&original).unwrap();
+            let compressed = encoder.finish().unwrap();
+
+            // Standard path
+            let mut output_std = vec![0u8; 100];
+            let size_std = inflate_into_pub(&compressed, &mut output_std).unwrap();
+
+            // Turbo path
+            let mut output_turbo = vec![0u8; 100];
+            let size_turbo = inflate_into_turbo(&compressed, &mut output_turbo).unwrap();
+
+            let match_ok =
+                size_turbo == size_std && output_turbo[..size_turbo] == output_std[..size_std];
+
+            if !match_ok {
+                eprintln!("\n=== MISMATCH at size {} ===", size);
+                eprintln!("Original: {:?}", String::from_utf8_lossy(&original));
+                eprintln!(
+                    "Compressed: {} bytes, hex: {:02x?}",
+                    compressed.len(),
+                    &compressed
+                );
+                eprintln!(
+                    "Standard: {} bytes, output: {:?}",
+                    size_std,
+                    String::from_utf8_lossy(&output_std[..size_std])
+                );
+                eprintln!(
+                    "Turbo: {} bytes, output: {:?}",
+                    size_turbo,
+                    String::from_utf8_lossy(&output_turbo[..size_turbo])
+                );
+
+                // Show byte-by-byte comparison
+                for i in 0..size_std.max(size_turbo) {
+                    let std_byte = if i < size_std { output_std[i] } else { 0 };
+                    let turbo_byte = if i < size_turbo { output_turbo[i] } else { 0 };
+                    if std_byte != turbo_byte {
+                        eprintln!(
+                            "  Position {}: std='{}' (0x{:02x}) vs turbo='{}' (0x{:02x})",
+                            i, std_byte as char, std_byte, turbo_byte as char, turbo_byte
+                        );
+                    }
+                }
+                panic!("Turbo mismatch at size {}", size);
+            } else {
+                eprintln!("Size {}: OK", size);
+            }
+        }
+    }
+
+    // =========================================================================
+    // ORIGINAL TESTS
+    // =========================================================================
 
     #[test]
     fn test_inflate_into() {
