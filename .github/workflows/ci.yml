@@ -274,6 +274,158 @@ jobs:
           diff /tmp/compat_test.bin /tmp/compat_test.out2
           echo "✓ gzip→gzippy works"
 
+  # Cross-tool compatibility: verify gzippy output can be read by all tools and vice versa
+  cross-compatibility:
+    name: Cross-Tool Compatibility
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential zlib1g-dev cmake nasm
+
+      - name: Build gzippy
+        run: cargo build --release
+
+      - name: Build pigz
+        run: make -C pigz
+
+      - name: Build igzip
+        run: |
+          cd isa-l
+          rm -rf build
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          make -j$(nproc) igzip
+
+      - name: Create tarball test data from /usr/
+        run: |
+          echo "Creating 10MB tarball from /usr/share..."
+          # Create tarball from /usr/share, truncate to 10MB
+          tar cf - /usr/share 2>/dev/null | head -c $((10 * 1024 * 1024)) > /tmp/test_tarball.bin
+          ACTUAL_SIZE=$(stat -c%s /tmp/test_tarball.bin)
+          echo "Created test data: $ACTUAL_SIZE bytes"
+          
+          # Also create text data for comparison
+          python3 -c "
+          import random
+          random.seed(42)
+          with open('/tmp/test_text.bin', 'w') as f:
+              for _ in range(100000):
+                  f.write(''.join(random.choices('abcdefghij klmnopqrs tuvwxyz ', k=100)) + '\n')
+          "
+          echo "Created text data: $(stat -c%s /tmp/test_text.bin) bytes"
+
+      - name: Test gzippy output readable by all tools
+        run: |
+          echo "=== Testing gzippy output compatibility ==="
+          
+          for data_type in tarball text; do
+            INPUT="/tmp/test_${data_type}.bin"
+            echo ""
+            echo "--- Testing $data_type data ---"
+            
+            for level in 1 6 9; do
+              # Compress with gzippy
+              ./target/release/gzippy -$level -c "$INPUT" > /tmp/gzippy_output.gz
+              GZ_SIZE=$(stat -c%s /tmp/gzippy_output.gz)
+              echo "gzippy -$level compressed to $GZ_SIZE bytes"
+              
+              # Decompress with each tool and verify
+              for tool in gzip pigz igzip; do
+                case $tool in
+                  gzip)   CMD="gzip -d" ;;
+                  pigz)   CMD="./pigz/unpigz" ;;
+                  igzip)  CMD="./isa-l/build/igzip -d" ;;
+                esac
+                
+                $CMD < /tmp/gzippy_output.gz > /tmp/decompressed.bin 2>/dev/null
+                if diff -q "$INPUT" /tmp/decompressed.bin > /dev/null 2>&1; then
+                  echo "  ✓ $tool can decompress gzippy -$level output (byte-identical)"
+                else
+                  echo "  ✗ FAIL: $tool cannot decompress gzippy -$level output correctly!"
+                  exit 1
+                fi
+              done
+            done
+          done
+          
+          echo ""
+          echo "✅ All tools can read gzippy output"
+
+      - name: Test gzippy can read all tool outputs
+        run: |
+          echo "=== Testing gzippy decompression compatibility ==="
+          
+          for data_type in tarball text; do
+            INPUT="/tmp/test_${data_type}.bin"
+            echo ""
+            echo "--- Testing $data_type data ---"
+            
+            # Test gzip output
+            for level in 1 6 9; do
+              gzip -$level -c "$INPUT" > /tmp/gzip_output.gz
+              ./target/release/gzippy -d < /tmp/gzip_output.gz > /tmp/decompressed.bin
+              if diff -q "$INPUT" /tmp/decompressed.bin > /dev/null 2>&1; then
+                echo "  ✓ gzippy can decompress gzip -$level output (byte-identical)"
+              else
+                echo "  ✗ FAIL: gzippy cannot decompress gzip -$level output!"
+                exit 1
+              fi
+            done
+            
+            # Test pigz output
+            for level in 1 6 9; do
+              ./pigz/pigz -$level -c "$INPUT" > /tmp/pigz_output.gz
+              ./target/release/gzippy -d < /tmp/pigz_output.gz > /tmp/decompressed.bin
+              if diff -q "$INPUT" /tmp/decompressed.bin > /dev/null 2>&1; then
+                echo "  ✓ gzippy can decompress pigz -$level output (byte-identical)"
+              else
+                echo "  ✗ FAIL: gzippy cannot decompress pigz -$level output!"
+                exit 1
+              fi
+            done
+            
+            # Test igzip output (only has levels 0-3)
+            for level in 0 1 2 3; do
+              ./isa-l/build/igzip -$level -c "$INPUT" > /tmp/igzip_output.gz
+              ./target/release/gzippy -d < /tmp/igzip_output.gz > /tmp/decompressed.bin
+              if diff -q "$INPUT" /tmp/decompressed.bin > /dev/null 2>&1; then
+                echo "  ✓ gzippy can decompress igzip -$level output (byte-identical)"
+              else
+                echo "  ✗ FAIL: gzippy cannot decompress igzip -$level output!"
+                exit 1
+              fi
+            done
+          done
+          
+          echo ""
+          echo "✅ gzippy can read all tool outputs"
+
+      - name: Summary
+        run: |
+          echo "## 🔄 Cross-Tool Compatibility" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Compression | Decompression | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|---------------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| gzippy | gzip | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| gzippy | pigz | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| gzippy | igzip | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| gzip | gzippy | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| pigz | gzippy | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| igzip | gzippy | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All outputs verified byte-identical on both text and tarball data." >> $GITHUB_STEP_SUMMARY
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
