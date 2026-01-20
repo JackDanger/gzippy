@@ -32,8 +32,7 @@ use crate::two_level_table::{FastBits, TurboBits, TwoLevelTable};
 // Enable with GZIPPY_TRACE=1 to see detailed performance breakdown.
 // This helps identify where we lose time compared to libdeflate.
 
-/// Performance counters for decode loop analysis (future use)
-#[allow(dead_code)]
+/// Performance counters for decode loop analysis
 #[derive(Default)]
 pub struct DecodeTrace {
     /// Total literals decoded
@@ -50,15 +49,26 @@ pub struct DecodeTrace {
     pub slow_lit_len: u64,
     /// Total bytes copied via match
     pub match_bytes: u64,
-    /// Distance=1 memset optimizations used
-    pub memset_copies: u64,
+    /// Distance=1 memset optimizations used (RLE)
+    pub dist_1: u64,
+    /// Distance 2-7 (small, overlapping)
+    pub dist_2_7: u64,
+    /// Distance 8-39 (medium, overlapping chunks)
+    pub dist_8_39: u64,
+    /// Distance >= 40 (large, non-overlapping)
+    pub dist_40_plus: u64,
+    /// Match lengths <= 8
+    pub len_1_8: u64,
+    /// Match lengths 9-32
+    pub len_9_32: u64,
+    /// Match lengths 33-258
+    pub len_33_plus: u64,
     /// Bit buffer refills performed
     pub refills: u64,
     /// EOB (end of block) encountered
     pub eob_count: u64,
 }
 
-#[allow(dead_code)]
 impl DecodeTrace {
     /// Print trace summary
     pub fn print_summary(&self, output_bytes: usize, elapsed_ns: u64) {
@@ -100,21 +110,58 @@ impl DecodeTrace {
             }
         );
         eprintln!("  Slow lit/len:   {}", self.slow_lit_len);
+
+        eprintln!("\nDistance distribution:");
+        let total_dist = self.dist_1 + self.dist_2_7 + self.dist_8_39 + self.dist_40_plus;
+        if total_dist > 0 {
+            eprintln!(
+                "  d=1 (RLE):      {} ({:.1}%)",
+                self.dist_1,
+                self.dist_1 as f64 / total_dist as f64 * 100.0
+            );
+            eprintln!(
+                "  d=2-7:          {} ({:.1}%)",
+                self.dist_2_7,
+                self.dist_2_7 as f64 / total_dist as f64 * 100.0
+            );
+            eprintln!(
+                "  d=8-39:         {} ({:.1}%)",
+                self.dist_8_39,
+                self.dist_8_39 as f64 / total_dist as f64 * 100.0
+            );
+            eprintln!(
+                "  d>=40:          {} ({:.1}%)",
+                self.dist_40_plus,
+                self.dist_40_plus as f64 / total_dist as f64 * 100.0
+            );
+        }
+
+        eprintln!("\nLength distribution:");
+        let total_len = self.len_1_8 + self.len_9_32 + self.len_33_plus;
+        if total_len > 0 {
+            eprintln!(
+                "  len 3-8:        {} ({:.1}%)",
+                self.len_1_8,
+                self.len_1_8 as f64 / total_len as f64 * 100.0
+            );
+            eprintln!(
+                "  len 9-32:       {} ({:.1}%)",
+                self.len_9_32,
+                self.len_9_32 as f64 / total_len as f64 * 100.0
+            );
+            eprintln!(
+                "  len 33+:        {} ({:.1}%)",
+                self.len_33_plus,
+                self.len_33_plus as f64 / total_len as f64 * 100.0
+            );
+        }
+
         eprintln!("\nCopy stats:");
         eprintln!(
             "  Match bytes:    {} ({:.1} bytes/match avg)",
             self.match_bytes,
             if self.matches > 0 {
                 self.match_bytes as f64 / self.matches as f64
-            } else {
-                0.0
-            }
-        );
-        eprintln!(
-            "  Memset optim:   {} ({:.1}% of matches)",
-            self.memset_copies,
-            if self.matches > 0 {
-                self.memset_copies as f64 / self.matches as f64 * 100.0
             } else {
                 0.0
             }
@@ -132,13 +179,97 @@ impl DecodeTrace {
 }
 
 // Tracing infrastructure (enable with GZIPPY_TRACE=1)
-// Note: Thread-local accumulator available for future detailed profiling
+
+use std::cell::RefCell;
+
+thread_local! {
+    static DECODE_TRACE: RefCell<DecodeTrace> = RefCell::new(DecodeTrace::default());
+}
 
 /// Check if tracing is enabled (cached)
 #[inline]
 fn tracing_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("GZIPPY_TRACE").is_ok())
+}
+
+/// Reset the thread-local trace counters
+fn reset_trace() {
+    DECODE_TRACE.with(|t| *t.borrow_mut() = DecodeTrace::default());
+}
+
+/// Get a copy of the current trace and reset
+fn take_trace() -> DecodeTrace {
+    DECODE_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut()))
+}
+
+/// Record a match with given distance and length
+/// This is a no-op when not tracing - the check is cached in a static
+#[inline(always)]
+fn trace_match(_distance: usize, _length: usize) {
+    // Tracing is controlled by GZIPPY_TRACE env var
+    // Inlining + dead code elimination removes this when not tracing
+    #[cold]
+    #[inline(never)]
+    fn trace_match_slow(distance: usize, length: usize) {
+        DECODE_TRACE.with(|t| {
+            let mut trace = t.borrow_mut();
+            trace.matches += 1;
+            trace.match_bytes += length as u64;
+
+            // Distance distribution
+            if distance == 1 {
+                trace.dist_1 += 1;
+            } else if distance <= 7 {
+                trace.dist_2_7 += 1;
+            } else if distance <= 39 {
+                trace.dist_8_39 += 1;
+            } else {
+                trace.dist_40_plus += 1;
+            }
+
+            // Length distribution
+            if length <= 8 {
+                trace.len_1_8 += 1;
+            } else if length <= 32 {
+                trace.len_9_32 += 1;
+            } else {
+                trace.len_33_plus += 1;
+            }
+        });
+    }
+
+    if tracing_enabled() {
+        trace_match_slow(_distance, _length);
+    }
+}
+
+/// Record literals (for future use in literal chain tracing)
+#[allow(dead_code)]
+#[inline]
+fn trace_literals(count: u64, fast: bool) {
+    if !tracing_enabled() {
+        return;
+    }
+    DECODE_TRACE.with(|t| {
+        let mut trace = t.borrow_mut();
+        trace.literals += count;
+        if fast {
+            trace.fast_literals += count;
+        }
+    });
+}
+
+/// Record slow path usage (for future use in slow path analysis)
+#[allow(dead_code)]
+#[inline]
+fn trace_slow_path() {
+    if !tracing_enabled() {
+        return;
+    }
+    DECODE_TRACE.with(|t| {
+        t.borrow_mut().slow_lit_len += 1;
+    });
 }
 
 /// BGZF block information
@@ -320,6 +451,7 @@ fn inflate_into(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
 fn inflate_into_turbo(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
     let trace = tracing_enabled();
     let start = if trace {
+        reset_trace(); // Reset counters at start
         Some(std::time::Instant::now())
     } else {
         None
@@ -372,13 +504,8 @@ fn inflate_into_turbo(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usiz
 
     if trace {
         let elapsed = start.unwrap().elapsed();
-        let mb_per_sec = out_pos as f64 / elapsed.as_secs_f64() / 1_000_000.0;
-        eprintln!(
-            "[TRACE] inflate_into_turbo: {} bytes in {:.2}ms = {:.1} MB/s",
-            out_pos,
-            elapsed.as_secs_f64() * 1000.0,
-            mb_per_sec
-        );
+        let trace_data = take_trace();
+        trace_data.print_summary(out_pos, elapsed.as_nanos() as u64);
         eprintln!(
             "[TRACE]   blocks: {} stored, {} fixed, {} dynamic",
             stored_blocks, fixed_blocks, dynamic_blocks
@@ -2319,6 +2446,9 @@ unsafe fn copy_large_avx512(src: *const u8, dst: *mut u8, length: usize) {
 /// 4. small distance: byte-by-byte
 #[inline(always)]
 fn copy_match_into(output: &mut [u8], out_pos: usize, distance: usize, length: usize) -> usize {
+    // Record match statistics (no-op when tracing disabled)
+    trace_match(distance, length);
+
     let src_start = out_pos - distance;
 
     // Bounds check
