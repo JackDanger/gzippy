@@ -203,19 +203,17 @@ impl LitLenEntry {
 
     /// Decode length value using saved_bitbuf
     /// Length = base + extra_bits_value
+    /// Decode length from saved_bitbuf (branchless)
     #[inline(always)]
     pub fn decode_length(self, saved_bitbuf: u64) -> u32 {
         let base = self.length_base() as u32;
         let codeword_bits = self.codeword_bits();
         let total_bits = self.total_bits();
         let extra_bits = total_bits - codeword_bits;
-        if extra_bits == 0 {
-            base
-        } else {
-            let extra_mask = (1u64 << extra_bits) - 1;
-            let extra_value = (saved_bitbuf >> codeword_bits) & extra_mask;
-            base + extra_value as u32
-        }
+        // Branchless: when extra_bits is 0, mask is 0 and extra_value is 0
+        let extra_mask = (1u64 << extra_bits).wrapping_sub(1);
+        let extra_value = (saved_bitbuf >> codeword_bits) & extra_mask;
+        base + extra_value as u32
     }
 }
 
@@ -303,19 +301,17 @@ impl DistEntry {
 
     /// Decode distance value using saved_bitbuf
     /// Distance = base + extra_bits_value
+    /// Decode distance from saved_bitbuf (branchless)
     #[inline(always)]
     pub fn decode_distance(self, saved_bitbuf: u64) -> u32 {
         let base = self.distance_base() as u32;
         let codeword_bits = self.codeword_bits();
         let total_bits = self.total_bits();
         let extra_bits = total_bits - codeword_bits;
-        if extra_bits == 0 {
-            base
-        } else {
-            let extra_mask = (1u64 << extra_bits) - 1;
-            let extra_value = (saved_bitbuf >> codeword_bits) & extra_mask;
-            base + extra_value as u32
-        }
+        // Branchless: when extra_bits is 0, mask is 0 and extra_value is 0
+        let extra_mask = (1u64 << extra_bits).wrapping_sub(1);
+        let extra_value = (saved_bitbuf >> codeword_bits) & extra_mask;
+        base + extra_value as u32
     }
 }
 
@@ -425,7 +421,9 @@ impl LitLenTable {
     /// Look up an entry by bit pattern (unsafe unchecked for max speed)
     #[inline(always)]
     pub fn lookup(&self, bits: u64) -> LitLenEntry {
-        let idx = (bits as usize) & ((1usize << self.table_bits) - 1);
+        // Use const TABLE_BITS for compile-time optimization
+        const MASK: usize = (1usize << LitLenTable::TABLE_BITS) - 1;
+        let idx = (bits as usize) & MASK;
         // SAFETY: idx is masked to be within table_bits range,
         // and entries is always at least (1 << table_bits) in size
         unsafe { *self.entries.get_unchecked(idx) }
@@ -559,7 +557,9 @@ impl DistTable {
     /// Look up an entry by bit pattern (unsafe unchecked for max speed)
     #[inline(always)]
     pub fn lookup(&self, bits: u64) -> DistEntry {
-        let idx = (bits as usize) & ((1usize << self.table_bits) - 1);
+        // Use const TABLE_BITS for compile-time optimization
+        const MASK: usize = (1usize << DistTable::TABLE_BITS) - 1;
+        let idx = (bits as usize) & MASK;
         // SAFETY: idx is masked to be within table_bits range
         unsafe { *self.entries.get_unchecked(idx) }
     }

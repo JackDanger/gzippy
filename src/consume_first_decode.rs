@@ -95,7 +95,7 @@ impl<'a> Bits<'a> {
         self.bitsleft -= n;
     }
 
-    /// Consume using entry's low bits (libdeflate optimization)
+    /// Consume using entry's low 5 bits
     #[inline(always)]
     fn consume_entry(&mut self, entry: u32) {
         self.bitbuf >>= entry as u8;
@@ -137,6 +137,19 @@ impl<'a> Bits<'a> {
 // Match Copy - Matching libdeflate's decompress_template.h lines 575-680
 // =============================================================================
 
+/// Prefetch hint for x86_64
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn prefetch_read(ptr: *const u8) {
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn prefetch_read(_ptr: *const u8) {}
+
 #[inline(always)]
 fn copy_match(output: &mut [u8], out_pos: usize, distance: u32, length: u32) -> usize {
     let dist = distance as usize;
@@ -147,6 +160,11 @@ fn copy_match(output: &mut [u8], out_pos: usize, distance: u32, length: u32) -> 
         let mut dst = out_ptr.add(out_pos);
         let mut src = out_ptr.add(out_pos - dist);
         let end = dst.add(len);
+
+        // Prefetch for long matches
+        if len > 40 {
+            prefetch_read(src.add(40));
+        }
 
         if dist >= 8 {
             // Fast path: offset >= WORDBYTES (8)
@@ -243,7 +261,7 @@ fn decode_huffman_cf(
 
         // Step 3: Check if LITERAL (bit 31 set = negative as i32)
         if (entry.raw() as i32) < 0 {
-            // LITERAL PATH - Unrolled, no refill checks (fastloop has margin)
+            // LITERAL PATH - Unrolled 5 literals, strategic refills
             let out_ptr = output.as_mut_ptr();
 
             // Literal 1
@@ -284,11 +302,11 @@ fn decode_huffman_cf(
                         }
                         out_pos += 1;
 
-                        // Literal 5
+                        // Literal 5 - always refill after 5 literals (~45 bits consumed)
                         if (entry.raw() as i32) < 0 {
                             bits.consume_entry(entry.raw());
                             let lit5 = entry.literal_value();
-                            bits.refill(); // Only refill after 5 literals (~45 bits consumed)
+                            bits.refill();
                             entry = litlen.lookup(bits.peek());
                             unsafe {
                                 *out_ptr.add(out_pos) = lit5;
@@ -296,26 +314,19 @@ fn decode_huffman_cf(
                             out_pos += 1;
                             continue;
                         }
-                        // After 4 literals, check if refill needed
-                        if bits.available() < 30 {
-                            bits.refill();
-                        }
-                        continue;
                     }
-                    // After 3 literals, check if refill needed
-                    if bits.available() < 30 {
+                    // Conditional refill only when low (libdeflate pattern)
+                    if bits.available() < 32 {
                         bits.refill();
                     }
                     continue;
                 }
-                // After 2 literals, check if refill needed
-                if bits.available() < 30 {
+                if bits.available() < 32 {
                     bits.refill();
                 }
                 continue;
             }
-            // After 1 literal, check if refill needed
-            if bits.available() < 30 {
+            if bits.available() < 32 {
                 bits.refill();
             }
             continue;
@@ -388,22 +399,8 @@ fn decode_huffman_cf(
             continue; // NEVER fall through
         }
 
-        // Step 5: LENGTH CODE
-        // entry is a length code, saved_bitbuf has the extra bits
+        // Step 5: LENGTH CODE - decode from saved_bitbuf
         let length = entry.decode_length(saved_bitbuf);
-
-        // Debug: check if length is valid
-        if length == 0 || length > 258 {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "Invalid length {} at pos {}, entry={:#x}",
-                    length,
-                    out_pos,
-                    entry.raw()
-                ),
-            ));
-        }
 
         // Step 6: DISTANCE
         bits.refill();
@@ -730,6 +727,7 @@ fn build_code_length_table(lengths: &[u8; 19]) -> Result<[u16; 128]> {
 pub fn inflate_consume_first(input: &[u8], output: &mut [u8]) -> Result<usize> {
     let mut bits = Bits::new(input);
     let mut out_pos = 0;
+    #[allow(unused_variables)]
     let mut block_count = 0;
 
     loop {
@@ -740,14 +738,6 @@ pub fn inflate_consume_first(input: &[u8], output: &mut [u8]) -> Result<usize> {
         let bfinal = (bits.peek() & 1) != 0;
         let btype = ((bits.peek() >> 1) & 3) as u8;
         bits.consume(3);
-
-        // Debug: track blocks
-        if btype == 0 || block_count < 5 || bfinal {
-            eprintln!(
-                "Block {}: btype={} bfinal={} pos={} out_pos={}",
-                block_count, btype, bfinal, bits.pos, out_pos
-            );
-        }
         block_count += 1;
 
         match btype {
