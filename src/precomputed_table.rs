@@ -109,10 +109,11 @@ impl PEntry {
         )
     }
 
-    /// Check if literal (bit 31 set)
+    /// Check if literal (bit 31 set) - using signed comparison like libdeflate
+    /// This generates better code: just test if negative
     #[inline(always)]
     pub const fn is_literal(self) -> bool {
-        (self.0 & LITERAL_FLAG) != 0
+        (self.0 as i32) < 0
     }
 
     /// Check if subtable pointer (bit 30 set, bit 31 clear)
@@ -131,6 +132,16 @@ impl PEntry {
     #[inline(always)]
     pub const fn is_length(self) -> bool {
         (self.0 & (LITERAL_FLAG | SUBTABLE_FLAG | EOB_FLAG)) == 0
+    }
+
+    /// Check if exceptional (subtable OR EOB) - used to avoid checking both separately
+    /// This groups the rare cases that need special handling.
+    #[inline(always)]
+    pub const fn is_exceptional(self) -> bool {
+        // Either SUBTABLE (bit 30) or EOB (bit 29) is set, but not LITERAL (bit 31)
+        // Length entries have all 3 bits clear, so this checks if any of bits 29-30 are set
+        // when bit 31 is clear.
+        !self.is_literal() && (self.0 & (SUBTABLE_FLAG | EOB_FLAG)) != 0
     }
 
     /// Get codeword bits (always valid, bits 0-7)
@@ -409,39 +420,44 @@ pub fn decode_precomputed(
                     output[out_pos] = e3.literal_value();
                     out_pos += 1;
 
-                    // Tight literal loop
+                    // Tight literal loop - optimized with fewer branches
+                    // Structure: literal (fast), exceptional (rare), length (fall-through)
                     while bits.has_bits(24) {
                         let s = bits.buffer();
                         let e = lit_table.lookup(s);
 
                         if e.is_literal() {
+                            // Fast path - single bit test
                             bits.consume(e.codeword_bits());
                             output[out_pos] = e.literal_value();
                             out_pos += 1;
-                        } else if e.is_eob() {
-                            bits.consume(e.codeword_bits());
-                            return Ok(out_pos);
-                        } else if e.is_subtable() {
-                            bits.consume(e.codeword_bits());
-                            let sub_saved = bits.buffer();
-                            let sub_e = lit_table.lookup_sub(e, sub_saved);
-                            if sub_e.is_literal() {
-                                bits.consume(sub_e.codeword_bits());
-                                output[out_pos] = sub_e.literal_value();
-                                out_pos += 1;
-                            } else if sub_e.is_eob() {
-                                // EOB in subtable - consume and return
-                                bits.consume(sub_e.codeword_bits());
-                                return Ok(out_pos);
+                        } else if e.is_exceptional() {
+                            // Rare: subtable or EOB
+                            if e.is_subtable() {
+                                bits.consume(e.codeword_bits());
+                                let sub_saved = bits.buffer();
+                                let sub_e = lit_table.lookup_sub(e, sub_saved);
+                                if sub_e.is_literal() {
+                                    bits.consume(sub_e.codeword_bits());
+                                    output[out_pos] = sub_e.literal_value();
+                                    out_pos += 1;
+                                } else if sub_e.is_eob() {
+                                    bits.consume(sub_e.codeword_bits());
+                                    return Ok(out_pos);
+                                } else {
+                                    // Length in subtable
+                                    out_pos = handle_length(
+                                        bits, output, out_pos, sub_e, sub_saved, dist_table,
+                                    )?;
+                                    break;
+                                }
                             } else {
-                                // Length entry in subtable
-                                out_pos = handle_length(
-                                    bits, output, out_pos, sub_e, sub_saved, dist_table,
-                                )?;
-                                break;
+                                // EOB
+                                bits.consume(e.codeword_bits());
+                                return Ok(out_pos);
                             }
                         } else {
-                            // Length entry
+                            // Length entry - no check needed, fall through
                             out_pos = handle_length(bits, output, out_pos, e, s, dist_table)?;
                             break;
                         }
@@ -680,20 +696,10 @@ fn handle_length_generic(
     Ok(copy_match(output, out_pos, distance, length))
 }
 
-/// Copy match bytes
+/// Copy match bytes - use the optimized version from bgzf
 #[inline(always)]
 fn copy_match(output: &mut [u8], out_pos: usize, distance: usize, length: usize) -> usize {
-    let src_start = out_pos - distance;
-    if distance >= length {
-        // Non-overlapping copy
-        output.copy_within(src_start..src_start + length, out_pos);
-    } else {
-        // Overlapping copy - byte by byte
-        for i in 0..length {
-            output[out_pos + i] = output[src_start + (i % distance)];
-        }
-    }
-    out_pos + length
+    crate::bgzf::copy_match_into(output, out_pos, distance, length)
 }
 
 /// Create entry with pre-computed values

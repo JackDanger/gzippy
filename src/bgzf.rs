@@ -2716,7 +2716,7 @@ unsafe fn copy_large_avx512(src: *const u8, dst: *mut u8, length: usize) {
 /// 3. distance >= 8: chunk copy
 /// 4. small distance: byte-by-byte
 #[inline(always)]
-fn copy_match_into(output: &mut [u8], out_pos: usize, distance: usize, length: usize) -> usize {
+pub fn copy_match_into(output: &mut [u8], out_pos: usize, distance: usize, length: usize) -> usize {
     // Record match statistics (no-op when tracing disabled)
     trace_match(distance, length);
 
