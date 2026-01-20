@@ -562,15 +562,15 @@ fn decode_fixed_into_turbo(
     output: &mut [u8],
     out_pos: usize,
 ) -> io::Result<usize> {
-    use crate::consume_first_table::ConsumeFirstTable;
+    use crate::precomputed_table::{decode_precomputed, PrecomputedTable};
 
     // Fixed Huffman code lengths (RFC 1951)
     let lit_len_lens = get_fixed_lit_len_lens();
     let dist_lens = [5u8; 32];
 
-    let cf_lit_table = ConsumeFirstTable::build(&lit_len_lens)?;
-    let cf_dist_table = ConsumeFirstTable::build_distance(&dist_lens)?;
-    decode_huffman_consume_first(bits, output, out_pos, &cf_lit_table, &cf_dist_table)
+    let lit_table = PrecomputedTable::build_litlen(&lit_len_lens)?;
+    let dist_table = PrecomputedTable::build_distance(&dist_lens)?;
+    decode_precomputed(bits, output, out_pos, &lit_table, &dist_table)
 }
 
 /// Turbo decode for dynamic Huffman blocks
@@ -646,11 +646,12 @@ fn decode_dynamic_into_turbo(
     let lit_len_lens = &code_lens[..hlit];
     let dist_lens = &code_lens[hlit..];
 
-    // Use JIT table cache - avoids rebuilding identical tables
-    use crate::consume_first_table::get_or_build_tables;
+    // Use PrecomputedTable with saved_bitbuf optimization
+    use crate::precomputed_table::{decode_precomputed, PrecomputedTable};
 
-    let tables = get_or_build_tables(lit_len_lens, dist_lens)?;
-    decode_huffman_consume_first(bits, output, out_pos, &tables.lit_table, &tables.dist_table)
+    let lit_table = PrecomputedTable::build_litlen(lit_len_lens)?;
+    let dist_table = PrecomputedTable::build_distance(dist_lens)?;
+    decode_precomputed(bits, output, out_pos, &lit_table, &dist_table)
 }
 
 /// Public version of inflate_into for use by other modules
@@ -6735,5 +6736,79 @@ mod optimization_tests {
 
         eprintln!("[BENCH]   Output size: {} bytes", isize);
         eprintln!("[BENCH]   Speed: {:.1} MB/s", mb_per_sec);
+    }
+
+    /// Benchmark: Turbo path vs libdeflate on silesia
+    #[test]
+    fn bench_turbo_vs_libdeflate() {
+        let gzip_data = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("[BENCH] Skipping - no silesia file");
+                return;
+            }
+        };
+
+        // Extract deflate data from gzip
+        let deflate_start = 10
+            + if (gzip_data[3] & 0x08) != 0 {
+                gzip_data[10..].iter().position(|&b| b == 0).unwrap_or(0) + 1
+            } else {
+                0
+            };
+        let deflate_end = gzip_data.len() - 8;
+        let deflate_data = &gzip_data[deflate_start..deflate_end];
+
+        // Get expected size from ISIZE
+        let isize_bytes = &gzip_data[gzip_data.len() - 4..];
+        let isize = u32::from_le_bytes([
+            isize_bytes[0],
+            isize_bytes[1],
+            isize_bytes[2],
+            isize_bytes[3],
+        ]) as usize;
+        let mut output = vec![0u8; isize + 1000];
+
+        // Warmup
+        let _ = inflate_into_pub(deflate_data, &mut output);
+        let _ = libdeflater::Decompressor::new().deflate_decompress(deflate_data, &mut output);
+
+        eprintln!("\n=== Turbo Path vs libdeflate (silesia) ===");
+
+        // Benchmark libdeflate
+        let iterations = 5;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let size = libdeflater::Decompressor::new()
+                .deflate_decompress(deflate_data, &mut output)
+                .unwrap();
+            assert!(size > 0);
+        }
+        let libdeflate_time = start.elapsed();
+        let libdeflate_speed =
+            (isize * iterations) as f64 / libdeflate_time.as_secs_f64() / 1_000_000.0;
+
+        // Benchmark our turbo path
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let size = inflate_into_pub(deflate_data, &mut output).unwrap();
+            assert!(size > 0);
+        }
+        let turbo_time = start.elapsed();
+        let turbo_speed = (isize * iterations) as f64 / turbo_time.as_secs_f64() / 1_000_000.0;
+
+        let ratio = turbo_speed / libdeflate_speed * 100.0;
+
+        eprintln!(
+            "libdeflate (C):   {:>8.1?} = {:>7.1} MB/s",
+            libdeflate_time / iterations as u32,
+            libdeflate_speed
+        );
+        eprintln!(
+            "Turbo (Rust):     {:>8.1?} = {:>7.1} MB/s",
+            turbo_time / iterations as u32,
+            turbo_speed
+        );
+        eprintln!("Ratio: Turbo is {:.1}% of libdeflate", ratio);
     }
 }

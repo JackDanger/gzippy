@@ -30,6 +30,7 @@ mod parallel_compress;
 mod parallel_decompress;
 mod parallel_inflate;
 mod pipelined_compress;
+mod precomputed_table;
 mod rapidgzip_decoder;
 mod scheduler;
 mod simd_copy;
