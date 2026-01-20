@@ -4,9 +4,13 @@
 
 | Metric | Current | libdeflate | Target |
 |--------|---------|------------|--------|
-| Single-threaded silesia | 624 MB/s | 1321 MB/s | 1400+ MB/s |
+| Single-threaded silesia | **773 MB/s** | 1389 MB/s | 1400+ MB/s |
 | Parallel BGZF (8 threads) | 3770 MB/s | N/A | 4500+ MB/s |
-| Performance ratio | 47.2% | 100% | 106%+ |
+| Performance ratio | **55.6%** | 100% | 106%+ |
+
+### Progress Log
+- **v1**: 618 MB/s (45%) - Initial libdeflate-compatible decode
+- **v2**: 773 MB/s (55.6%) - Unsafe optimizations (unchecked lookups, pointer writes)
 
 ## Problems We Encountered
 
