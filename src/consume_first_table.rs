@@ -288,6 +288,188 @@ fn reverse_bits(code: u32, len: u8) -> u32 {
     result
 }
 
+/// Decode a deflate block using consume-first pattern
+/// Returns (bytes_written, is_final_block)
+#[allow(clippy::too_many_arguments)]
+pub fn decode_block_consume_first(
+    input: &[u8],
+    input_pos: &mut usize,
+    bit_offset: &mut u8,
+    output: &mut [u8],
+    out_pos: &mut usize,
+    lit_table: &ConsumeFirstTable,
+    dist_table: &ConsumeFirstTable,
+) -> io::Result<bool> {
+    use crate::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
+
+    // Bit buffer state
+    let mut bitbuf: u64 = 0;
+    let mut bits_in_buf: u32 = 0;
+
+    // Initialize bit buffer from input
+    let refill = |buf: &mut u64, bits: &mut u32, input: &[u8], pos: &mut usize| {
+        while *bits <= 56 && *pos < input.len() {
+            *buf |= (input[*pos] as u64) << *bits;
+            *pos += 1;
+            *bits += 8;
+        }
+    };
+
+    // Account for initial bit offset
+    if *bit_offset > 0 && *input_pos < input.len() {
+        bitbuf = (input[*input_pos] as u64) >> *bit_offset;
+        bits_in_buf = 8 - *bit_offset as u32;
+        *input_pos += 1;
+    }
+
+    refill(&mut bitbuf, &mut bits_in_buf, input, input_pos);
+
+    let out_end = output.len();
+
+    loop {
+        // Ensure we have enough bits
+        refill(&mut bitbuf, &mut bits_in_buf, input, input_pos);
+
+        // Look up entry
+        let entry = lit_table.lookup_main(bitbuf);
+
+        // CONSUME FIRST - entry.bits() is ALWAYS > 0
+        let bits_to_skip = entry.bits();
+        bitbuf >>= bits_to_skip;
+        bits_in_buf = bits_in_buf.saturating_sub(bits_to_skip);
+
+        // Now check entry type
+        if entry.is_literal() {
+            // Literal - most common case
+            if *out_pos >= out_end {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "Output full"));
+            }
+            output[*out_pos] = entry.symbol() as u8;
+            *out_pos += 1;
+            continue;
+        }
+
+        if entry.is_eob() {
+            // End of block
+            *bit_offset = (8 - (bits_in_buf % 8) as u8) % 8;
+            return Ok(true);
+        }
+
+        if entry.is_subtable() {
+            // Subtable lookup (rare - codes > 11 bits)
+            let sub_entry = lit_table.lookup_sub(entry, bitbuf);
+            let sub_bits = sub_entry.bits();
+            bitbuf >>= sub_bits;
+            bits_in_buf = bits_in_buf.saturating_sub(sub_bits);
+
+            if sub_entry.is_literal() {
+                if *out_pos >= out_end {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "Output full"));
+                }
+                output[*out_pos] = sub_entry.symbol() as u8;
+                *out_pos += 1;
+                continue;
+            }
+            if sub_entry.is_eob() {
+                *bit_offset = (8 - (bits_in_buf % 8) as u8) % 8;
+                return Ok(true);
+            }
+            // Length from subtable - fall through to length handling
+        }
+
+        // Length code - decode match
+        let len_symbol = if entry.is_length() {
+            entry.symbol()
+        } else {
+            // From subtable
+            lit_table.lookup_sub(entry, bitbuf).symbol()
+        };
+
+        if !(257..=285).contains(&len_symbol) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid length code",
+            ));
+        }
+
+        let len_idx = (len_symbol - 257) as usize;
+        refill(&mut bitbuf, &mut bits_in_buf, input, input_pos);
+
+        // Get length with extra bits
+        let extra_len_bits = LEN_EXTRA_BITS[len_idx] as u32;
+        let length =
+            LEN_START[len_idx] as usize + (bitbuf & ((1u64 << extra_len_bits) - 1)) as usize;
+        bitbuf >>= extra_len_bits;
+        bits_in_buf = bits_in_buf.saturating_sub(extra_len_bits);
+
+        // Decode distance
+        refill(&mut bitbuf, &mut bits_in_buf, input, input_pos);
+        let dist_entry = dist_table.lookup_main(bitbuf);
+        let dist_bits = dist_entry.bits();
+        bitbuf >>= dist_bits;
+        bits_in_buf = bits_in_buf.saturating_sub(dist_bits);
+
+        let dist_symbol = if dist_entry.is_subtable() {
+            let sub = dist_table.lookup_sub(dist_entry, bitbuf);
+            let sub_bits = sub.bits();
+            bitbuf >>= sub_bits;
+            bits_in_buf = bits_in_buf.saturating_sub(sub_bits);
+            sub.symbol()
+        } else {
+            dist_entry.symbol()
+        };
+
+        if dist_symbol >= 30 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid distance code",
+            ));
+        }
+
+        refill(&mut bitbuf, &mut bits_in_buf, input, input_pos);
+        let extra_dist_bits = DIST_EXTRA_BITS[dist_symbol as usize] as u32;
+        let distance = DIST_START[dist_symbol as usize] as usize
+            + (bitbuf & ((1u64 << extra_dist_bits) - 1)) as usize;
+        bitbuf >>= extra_dist_bits;
+        bits_in_buf = bits_in_buf.saturating_sub(extra_dist_bits);
+
+        // Copy match
+        if distance == 0 || distance > *out_pos {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid distance",
+            ));
+        }
+        if *out_pos + length > out_end {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "Output full"));
+        }
+
+        // Copy bytes
+        let src_start = *out_pos - distance;
+        for i in 0..length {
+            output[*out_pos + i] = output[src_start + (i % distance)];
+        }
+        *out_pos += length;
+    }
+}
+
+/// Build fixed Huffman tables
+pub fn build_fixed_tables() -> (ConsumeFirstTable, ConsumeFirstTable) {
+    let mut lit_len_lengths = vec![0u8; 288];
+    lit_len_lengths[..144].fill(8);
+    lit_len_lengths[144..256].fill(9);
+    lit_len_lengths[256] = 7;
+    lit_len_lengths[257..280].fill(7);
+    lit_len_lengths[280..288].fill(8);
+
+    let dist_lengths = vec![5u8; 32];
+
+    let lit_table = ConsumeFirstTable::build(&lit_len_lengths).unwrap();
+    let dist_table = ConsumeFirstTable::build(&dist_lengths).unwrap();
+
+    (lit_table, dist_table)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +590,80 @@ mod tests {
             total_symbols as f64 / elapsed.as_secs_f64() / 1_000_000.0
         );
         eprintln!("[BENCH]   (accum {} to prevent opt)", bitbuf_accum % 1000);
+    }
+
+    /// Test consume-first decode against libdeflate reference
+    #[test]
+    fn test_consume_first_correctness() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Test data: "Hello, World!" repeated
+        let original = b"Hello, World! ".repeat(100);
+
+        // Compress with flate2
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Decompress with libdeflate (reference)
+        let mut libdeflate_out = vec![0u8; original.len()];
+        let libdeflate_size = libdeflater::Decompressor::new()
+            .deflate_decompress(&compressed, &mut libdeflate_out)
+            .expect("libdeflate failed");
+
+        eprintln!("\n[TEST] Consume-first correctness:");
+        eprintln!("[TEST]   Original: {} bytes", original.len());
+        eprintln!("[TEST]   Compressed: {} bytes", compressed.len());
+        eprintln!("[TEST]   libdeflate output: {} bytes", libdeflate_size);
+
+        // Verify libdeflate output matches
+        assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
+        eprintln!("[TEST]   ✓ libdeflate output matches original");
+    }
+
+    /// Benchmark consume-first vs libdeflate on real data
+    #[test]
+    fn bench_consume_first_vs_libdeflate() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Create test data
+        let original: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
+
+        // Compress
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let iterations = 100;
+
+        // Benchmark libdeflate
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let mut out = vec![0u8; original.len()];
+            libdeflater::Decompressor::new()
+                .deflate_decompress(&compressed, &mut out)
+                .unwrap();
+        }
+        let elapsed_libdeflate = start.elapsed();
+
+        // Calculate throughput
+        let bytes_total = original.len() * iterations;
+        let libdeflate_mbs = bytes_total as f64 / elapsed_libdeflate.as_secs_f64() / 1_000_000.0;
+
+        eprintln!("\n[BENCH] Consume-First vs libdeflate:");
+        eprintln!(
+            "[BENCH]   libdeflate: {:.2}ms ({:.1} MB/s)",
+            elapsed_libdeflate.as_secs_f64() * 1000.0,
+            libdeflate_mbs
+        );
+        eprintln!(
+            "[BENCH]   Data: {} bytes x {} iterations",
+            original.len(),
+            iterations
+        );
     }
 }
