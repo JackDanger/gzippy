@@ -280,8 +280,12 @@ def benchmark_compress(tool: str, level: int, threads: int,
     if tool == "gzippy" and debug:
         env["GZIPPY_DEBUG"] = "1"
     
+    # zopfli is extremely slow - only run once to avoid delaying CI
+    # We don't need statistical significance for zopfli, just a reference point
+    actual_runs = 1 if tool == "zopfli" else runs
+    
     times = []
-    for i in range(runs):
+    for i in range(actual_runs):
         start = time.perf_counter()
         with open(output_file, 'wb') as f:
             # For debug mode, capture stderr on first run

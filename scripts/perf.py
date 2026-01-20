@@ -137,8 +137,11 @@ def benchmark_compress(tool: str, level: int, threads: int,
             cmd.append(f"-p{threads}")
         cmd.extend(["-c", input_file])
     
+    # zopfli is extremely slow - only run once to avoid delaying CI
+    actual_runs = 1 if tool == "zopfli" else runs
+    
     times = []
-    for _ in range(runs):
+    for _ in range(actual_runs):
         start = time.perf_counter()
         with open(output_file, 'wb') as f:
             subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
