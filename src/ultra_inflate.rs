@@ -434,29 +434,18 @@ impl UltraInflate {
     }
 
     fn decompress_sequential<W: Write>(&self, data: &[u8], writer: &mut W) -> io::Result<u64> {
-        // Use libdeflate for sequential decompression
-        let mut decompressor = libdeflater::Decompressor::new();
-
-        // Estimate output size
+        // Use our turbo inflate for sequential decompression
         let out_size = data.len() * 4;
         let mut output = vec![0u8; out_size];
 
-        match decompressor.deflate_decompress(data, &mut output) {
+        match crate::bgzf::inflate_into_pub(data, &mut output) {
             Ok(actual) => {
-                output.truncate(actual);
-                writer.write_all(&output)?;
+                writer.write_all(&output[..actual])?;
                 Ok(actual as u64)
             }
-            Err(_) => {
-                // Fallback to flate2
-                use flate2::read::DeflateDecoder;
-                use std::io::Read;
-
-                let mut decoder = DeflateDecoder::new(data);
-                let mut output = Vec::new();
-                decoder.read_to_end(&mut output)?;
-                writer.write_all(&output)?;
-                Ok(output.len() as u64)
+            Err(e) => {
+                // No fallback - return the error
+                Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
             }
         }
     }
@@ -489,11 +478,10 @@ fn decode_chunk(
         }
     }
 
-    // Fallback to libdeflate
-    let mut decompressor = libdeflater::Decompressor::new();
+    // Use our turbo inflate
     let mut output = vec![0u8; data.len() * 4];
 
-    if let Ok(actual) = decompressor.deflate_decompress(data, &mut output) {
+    if let Ok(actual) = crate::bgzf::inflate_into_pub(data, &mut output) {
         output.truncate(actual);
         let window = if output.len() >= WINDOW_SIZE {
             output[output.len() - WINDOW_SIZE..].to_vec()
@@ -604,8 +592,6 @@ pub fn decompress_bgzf_ultra<W: Write>(
             let output_ref = &output_cell;
 
             scope.spawn(move || {
-                let mut decompressor = libdeflater::Decompressor::new();
-
                 loop {
                     let idx = next_ref.fetch_add(1, Ordering::Relaxed);
                     if idx >= num_blocks {
@@ -630,7 +616,8 @@ pub fn decompress_bgzf_ultra<W: Write>(
 
                     if deflate_start < deflate_end {
                         let deflate_data = &block_data[deflate_start..deflate_end];
-                        let _ = decompressor.deflate_decompress(deflate_data, out_slice);
+                        // Use our turbo inflate instead of libdeflate
+                        let _ = crate::bgzf::inflate_into_pub(deflate_data, out_slice);
                     }
                 }
             });

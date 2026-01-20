@@ -209,18 +209,22 @@ fn decompress_single_member_parallel<W: Write + Send>(
     writer: &mut W,
     _num_threads: usize,
 ) -> io::Result<u64> {
-    // For single-member files, use libdeflate which is currently faster than our pure Rust.
-    // TODO: Optimize pure Rust to match libdeflate (requires combined length+distance LUT)
+    // For single-member files, use our turbo inflate (pure Rust)
+    // No libdeflate fallback - we want to see errors
     //
     // Future parallel strategy (rapidgzip approach):
     // 1. Sequential pass: decode and record block boundaries + 32KB windows
     // 2. Parallel pass: re-decode each block using window from previous block
 
-    decompress_single_member_libdeflate(data, writer)
+    decompress_single_member_turbo(data, writer)
 }
 
-/// Use libdeflate for single-member gzip (fastest available)
-fn decompress_single_member_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> io::Result<u64> {
+/// Use our turbo inflate for single-member gzip (pure Rust, no libdeflate)
+fn decompress_single_member_turbo<W: Write>(data: &[u8], writer: &mut W) -> io::Result<u64> {
+    // Parse gzip header
+    let header_size = crate::marker_decode::skip_gzip_header(data)?;
+    let deflate_data = &data[header_size..data.len().saturating_sub(8)];
+
     // Get expected size from ISIZE in trailer
     let isize_hint = if data.len() >= 8 {
         u32::from_le_bytes([
@@ -233,31 +237,21 @@ fn decompress_single_member_libdeflate<W: Write>(data: &[u8], writer: &mut W) ->
         0
     };
 
-    let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
+    let output_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
         isize_hint + 1024
     } else {
         data.len().saturating_mul(4).max(64 * 1024)
     };
 
-    let mut output = vec![0u8; initial_size];
-    let mut decompressor = libdeflater::Decompressor::new();
+    let mut output = vec![0u8; output_size];
 
-    loop {
-        match decompressor.gzip_decompress(data, &mut output) {
-            Ok(size) => {
-                writer.write_all(&output[..size])?;
-                return Ok(size as u64);
-            }
-            Err(libdeflater::DecompressionError::InsufficientSpace) => {
-                output.resize(output.len() * 2, 0);
-            }
-            Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{:?}", e),
-                ));
-            }
+    // Use our turbo inflate
+    match crate::bgzf::inflate_into_pub(deflate_data, &mut output) {
+        Ok(size) => {
+            writer.write_all(&output[..size])?;
+            Ok(size as u64)
         }
+        Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
     }
 }
 

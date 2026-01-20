@@ -43,15 +43,6 @@ fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
     vec![0u8; aligned_size]
 }
 
-use std::cell::RefCell;
-
-// Thread-local decompressor and buffer to avoid repeated allocation
-thread_local! {
-    static DECOMPRESSOR: RefCell<libdeflater::Decompressor> =
-        RefCell::new(libdeflater::Decompressor::new());
-    static DECOMPRESS_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(1024 * 1024));
-}
-
 pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     if filename == "-" {
         return decompress_stdin(args);
@@ -167,7 +158,7 @@ pub fn decompress_stdin(_args: &GzippyArgs) -> GzippyResult<i32> {
             decompress_gzip_libdeflate(&input_data, &mut output_buffer)?;
         }
         CompressionFormat::Zlib => {
-            decompress_zlib_libdeflate(&input_data, &mut output_buffer)?;
+            decompress_zlib_turbo(&input_data, &mut output_buffer)?;
         }
     }
 
@@ -190,7 +181,7 @@ fn decompress_mmap_libdeflate<W: Write + Send>(
         CompressionFormat::Gzip | CompressionFormat::Zip => {
             decompress_gzip_libdeflate(&mmap[..], writer)
         }
-        CompressionFormat::Zlib => decompress_zlib_libdeflate(&mmap[..], writer),
+        CompressionFormat::Zlib => decompress_zlib_turbo(&mmap[..], writer),
     }
 }
 
@@ -419,7 +410,7 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
             }
         }
 
-        // Fallback to ultra_inflate BGZF (uses libdeflater)
+        // Fallback to ultra_inflate BGZF (uses our turbo inflate)
         match crate::ultra_inflate::decompress_bgzf_ultra(data, writer, num_threads) {
             Ok(bytes) => {
                 if std::env::var("GZIPPY_DEBUG").is_ok() {
@@ -446,26 +437,12 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
         .unwrap_or(4);
 
     if !is_likely_multi_member(data) {
-        // Single-member: try our turbo inflate first (optimized pure Rust)
-        // This uses the same optimizations as our BGZF path which beats libdeflate
+        // Single-member: use our turbo inflate (optimized pure Rust)
+        // No fallback to libdeflate - we want to see errors
         if std::env::var("GZIPPY_DEBUG").is_ok() {
-            eprintln!("[gzippy] Single-member: trying turbo inflate (pure Rust)");
+            eprintln!("[gzippy] Single-member: turbo inflate (pure Rust)");
         }
-        match decompress_single_member_turbo(data, writer) {
-            Ok(bytes) => {
-                if std::env::var("GZIPPY_DEBUG").is_ok() {
-                    eprintln!("[gzippy] Single-member turbo: {} bytes", bytes);
-                }
-                return Ok(bytes);
-            }
-            Err(e) => {
-                if std::env::var("GZIPPY_DEBUG").is_ok() {
-                    eprintln!("[gzippy] Turbo failed: {}, falling back to libdeflate", e);
-                }
-                // Fall back to libdeflate
-                return decompress_single_member_libdeflate(data, writer);
-            }
-        }
+        return decompress_single_member_turbo(data, writer);
     }
 
     // Multi-member: try our new pre-allocated parallel decompressor first (Phase 2)
@@ -707,34 +684,28 @@ fn decompress_bgzf_parallel_prefetch<W: Write>(data: &[u8], writer: &mut W) -> G
                     let (start, len) = blocks[idx];
                     let block_data = &data[start..start + len];
 
-                    // Use thread-local decompressor
-                    DECOMPRESSOR.with(|decomp_cell| {
-                        let mut decompressor = decomp_cell.borrow_mut();
-                        let output = unsafe { &mut *slots[idx].data.get() };
+                    // Use our turbo inflate
+                    let output = unsafe { &mut *slots[idx].data.get() };
+                    output.clear();
 
-                        output.clear();
-                        // Capacity is pre-allocated based on ISIZE hint
-                        let initial_size = output.capacity().max(64 * 1024);
-                        output.resize(initial_size, 0);
+                    // Parse gzip header to get deflate data
+                    if let Some(header_size) = parse_gzip_header_size(block_data) {
+                        let deflate_end = len.saturating_sub(8); // Exclude trailer
+                        if header_size < deflate_end {
+                            let deflate_data = &block_data[header_size..deflate_end];
+                            let initial_size = output.capacity().max(64 * 1024);
+                            output.resize(initial_size, 0);
 
-                        loop {
-                            match decompressor.gzip_decompress(block_data, output) {
+                            match crate::bgzf::inflate_into_pub(deflate_data, output) {
                                 Ok(size) => {
                                     output.truncate(size);
-                                    break;
-                                }
-                                Err(libdeflater::DecompressionError::InsufficientSpace) => {
-                                    let new_size = output.len().saturating_mul(2);
-                                    output.resize(new_size, 0);
-                                    continue;
                                 }
                                 Err(_) => {
                                     output.clear();
-                                    break;
                                 }
                             }
                         }
-                    });
+                    }
 
                     slots[idx].ready.store(true, Ordering::Release);
                 }
@@ -830,53 +801,6 @@ fn read_gzip_isize(data: &[u8]) -> Option<u32> {
     ]))
 }
 
-/// Decompress single-member gzip using libdeflate (fastest path)
-/// Uses thread-local decompressor to avoid initialization overhead
-fn decompress_single_member_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
-    // Use ISIZE from trailer for accurate buffer sizing (avoids resize loop)
-    // Add small margin for safety, handle files >4GB (ISIZE wraps at 2^32)
-    let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
-    let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
-        // Trust ISIZE for files under 1GB, add 1KB margin
-        isize_hint + 1024
-    } else {
-        // Fallback: estimate 4x compression ratio
-        data.len().saturating_mul(4).max(64 * 1024)
-    };
-
-    // Use libdeflate (fastest for large files)
-    use libdeflater::DecompressionError;
-
-    // Use cache-aligned buffer for better memory access
-    let mut output_buf = alloc_aligned_buffer(initial_size);
-
-    // Reuse thread-local decompressor to avoid repeated initialization
-    DECOMPRESSOR.with(|decomp| {
-        let mut decompressor = decomp.borrow_mut();
-
-        loop {
-            match decompressor.gzip_decompress(data, &mut output_buf) {
-                Ok(decompressed_size) => {
-                    writer.write_all(&output_buf[..decompressed_size])?;
-                    writer.flush()?;
-                    return Ok(decompressed_size as u64);
-                }
-                Err(DecompressionError::InsufficientSpace) => {
-                    // Grow buffer and retry (rare with ISIZE hint)
-                    let new_size = output_buf.len().saturating_mul(2);
-                    output_buf.resize(new_size, 0);
-                    continue;
-                }
-                Err(_) => {
-                    return Err(GzippyError::invalid_argument(
-                        "gzip decompression failed".to_string(),
-                    ));
-                }
-            }
-        }
-    })
-}
-
 /// Decompress multi-member gzip using sequential zlib-ng
 ///
 /// Note: We previously had a parallel decompression path, but it required
@@ -951,31 +875,29 @@ fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> 
     Ok(total_bytes)
 }
 
-/// Decompress zlib using libdeflate
-fn decompress_zlib_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
-    use libdeflater::{DecompressionError, Decompressor};
+/// Decompress zlib using our turbo inflate
+fn decompress_zlib_turbo<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
+    // Zlib format: 2-byte header, deflate data, 4-byte Adler32
+    if data.len() < 6 {
+        return Err(GzippyError::invalid_argument(
+            "Zlib data too short".to_string(),
+        ));
+    }
 
-    let mut decompressor = Decompressor::new();
+    // Skip 2-byte zlib header, exclude 4-byte trailer
+    let deflate_data = &data[2..data.len() - 4];
     let mut output_buf = vec![0u8; data.len().saturating_mul(4).max(64 * 1024)];
 
-    loop {
-        match decompressor.zlib_decompress(data, &mut output_buf) {
-            Ok(decompressed_size) => {
-                writer.write_all(&output_buf[..decompressed_size])?;
-                writer.flush()?;
-                return Ok(decompressed_size as u64);
-            }
-            Err(DecompressionError::InsufficientSpace) => {
-                let new_size = output_buf.len().saturating_mul(2);
-                output_buf.resize(new_size, 0);
-                continue;
-            }
-            Err(_) => {
-                return Err(GzippyError::invalid_argument(
-                    "zlib decompression failed".to_string(),
-                ));
-            }
+    match crate::bgzf::inflate_into_pub(deflate_data, &mut output_buf) {
+        Ok(size) => {
+            writer.write_all(&output_buf[..size])?;
+            writer.flush()?;
+            Ok(size as u64)
         }
+        Err(e) => Err(GzippyError::invalid_argument(format!(
+            "zlib decompression failed: {}",
+            e
+        ))),
     }
 }
 
