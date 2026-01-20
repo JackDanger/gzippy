@@ -380,15 +380,14 @@ pub fn decompress_hyper_parallel<W: io::Write>(
     // Pre-allocate output based on ISIZE
     let mut full_output = vec![0u8; isize];
 
-    // Use libdeflate for fast sequential decode (it's faster than our parallel for most files)
-    let mut decompressor = libdeflater::Decompressor::new();
-    match decompressor.deflate_decompress(deflate_data, &mut full_output) {
+    // Use our turbo inflate (pure Rust with Phase 1 optimizations)
+    match crate::bgzf::inflate_into_pub(deflate_data, &mut full_output) {
         Ok(size) => {
             writer.write_all(&full_output[..size])?;
             return Ok(size as u64);
         }
         Err(_) => {
-            // libdeflate failed, try our decoder
+            // Turbo inflate failed, try marker-based decode
         }
     }
 
@@ -674,14 +673,13 @@ fn decompress_fast_sequential<W: io::Write>(data: &[u8], writer: &mut W) -> io::
     // Pre-allocate output buffer
     let mut output = vec![0u8; isize.max(64 * 1024)];
 
-    // Try libdeflate first (fastest for most data)
-    let mut decompressor = libdeflater::Decompressor::new();
-    if let Ok(size) = decompressor.deflate_decompress(deflate_data, &mut output) {
+    // Try our turbo inflate first (pure Rust with Phase 1 optimizations)
+    if let Ok(size) = crate::bgzf::inflate_into_pub(deflate_data, &mut output) {
         writer.write_all(&output[..size])?;
         return Ok(size as u64);
     }
 
-    // Try our ultra-fast inflate
+    // Fallback to ultra-fast inflate
     let mut output = Vec::new();
     if crate::ultra_fast_inflate::inflate_gzip_ultra_fast(data, &mut output).is_ok() {
         writer.write_all(&output)?;

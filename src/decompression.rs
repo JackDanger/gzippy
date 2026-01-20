@@ -327,6 +327,59 @@ fn is_multi_member_quick(data: &[u8]) -> bool {
     is_likely_multi_member(data)
 }
 
+/// Decompress single-member gzip using our turbo inflate (optimized pure Rust)
+///
+/// This uses the same optimizations as our BGZF path:
+/// - TurboBits with branchless refill
+/// - PackedLUT for bitsleft -= entry optimization
+/// - 3-literal decode chain with entry preloading
+fn decompress_single_member_turbo<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
+    // Parse gzip header
+    let header_size = parse_gzip_header_size(data)
+        .ok_or_else(|| GzippyError::invalid_argument("Invalid gzip header".to_string()))?;
+
+    // Data must have at least header + 8 bytes trailer
+    if data.len() < header_size + 8 {
+        return Err(GzippyError::invalid_argument("Data too short".to_string()));
+    }
+
+    // Get deflate data (between header and 8-byte trailer)
+    let deflate_data = &data[header_size..data.len() - 8];
+
+    // Use ISIZE from trailer for buffer sizing
+    let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
+    let output_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
+        isize_hint + 1024 // Small margin
+    } else {
+        data.len().saturating_mul(4).max(64 * 1024)
+    };
+
+    // Allocate output buffer
+    let mut output = alloc_aligned_buffer(output_size);
+
+    // Use our turbo inflate
+    match crate::bgzf::inflate_into_pub(deflate_data, &mut output) {
+        Ok(decompressed_size) => {
+            writer.write_all(&output[..decompressed_size])?;
+            writer.flush()?;
+            Ok(decompressed_size as u64)
+        }
+        Err(e) => {
+            // Fall back to libdeflate on error
+            if std::env::var("GZIPPY_DEBUG").is_ok() {
+                eprintln!(
+                    "[gzippy] Turbo inflate failed: {}, falling back to libdeflate",
+                    e
+                );
+            }
+            Err(GzippyError::invalid_argument(format!(
+                "Turbo inflate failed: {}",
+                e
+            )))
+        }
+    }
+}
+
 /// Decompress gzip - chooses optimal strategy based on content
 ///
 /// Strategies (in order of preference):
@@ -393,13 +446,26 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
         .unwrap_or(4);
 
     if !is_likely_multi_member(data) {
-        // Single-member: use libdeflater (fastest for single-member)
-        // Our pure Rust is optimized for parallel BGZF, but libdeflater beats us
-        // on single-threaded single-member due to hand-optimized C.
+        // Single-member: try our turbo inflate first (optimized pure Rust)
+        // This uses the same optimizations as our BGZF path which beats libdeflate
         if std::env::var("GZIPPY_DEBUG").is_ok() {
-            eprintln!("[gzippy] Single-member: using libdeflater (fastest path)");
+            eprintln!("[gzippy] Single-member: trying turbo inflate (pure Rust)");
         }
-        return decompress_single_member_libdeflate(data, writer);
+        match decompress_single_member_turbo(data, writer) {
+            Ok(bytes) => {
+                if std::env::var("GZIPPY_DEBUG").is_ok() {
+                    eprintln!("[gzippy] Single-member turbo: {} bytes", bytes);
+                }
+                return Ok(bytes);
+            }
+            Err(e) => {
+                if std::env::var("GZIPPY_DEBUG").is_ok() {
+                    eprintln!("[gzippy] Turbo failed: {}, falling back to libdeflate", e);
+                }
+                // Fall back to libdeflate
+                return decompress_single_member_libdeflate(data, writer);
+            }
+        }
     }
 
     // Multi-member: try our new pre-allocated parallel decompressor first (Phase 2)
