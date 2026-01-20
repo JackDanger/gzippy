@@ -1,7 +1,7 @@
 # =============================================================================
-# Decompression Benchmarks: Compare gzippy vs competitors
+# Decompression Benchmarks
 # =============================================================================
-# - Benchmarks decompression of files from gzippy, pigz, gzip, rapidgzip
+# - Benchmarks gzippy decompression against pigz, gzip, igzip, and rapidgzip
 # - Uses adaptive benchmarking (runs until CV < 5% or max 30 trials)
 # - Reports speed in MB/s for each tool at each thread count
 # =============================================================================
