@@ -1413,10 +1413,14 @@ fn decode_huffman_turbo(
 /// 3. Branchless literal detection (test sign bit)
 /// 4. Pre-computed LZ77 matches in single lookup
 /// 5. Optimized match copy with memset for RLE
-#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+///
+/// This function uses #[target_feature(enable = "bmi2")] for runtime selection.
+/// SAFETY: Caller MUST verify is_x86_feature_detected!("bmi2") before calling.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
 #[allow(dead_code)]
 #[inline(never)]
-pub fn decode_huffman_asm_x64(
+unsafe fn decode_huffman_asm_x64(
     compressed: &[u8],
     output: &mut [u8],
     mut out_pos: usize,
@@ -1637,10 +1641,10 @@ fn copy_match_asm(output: &mut [u8], out_pos: usize, distance: usize, length: us
     out_pos + length
 }
 
-// Non-x86_64 stub
-#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+// Non-x86_64 stub - the real function is only available on x86_64
+#[cfg(not(target_arch = "x86_64"))]
 #[allow(dead_code)]
-pub fn decode_huffman_asm_x64(
+fn decode_huffman_asm_x64(
     _compressed: &[u8],
     _output: &mut [u8],
     out_pos: usize,
