@@ -16,6 +16,22 @@ From profiling and analysis:
    - Most time in fastloop, not slow path
 5. **DecodeTrace infrastructure exists** but isn't connected to decode loop
 
+### Optimizations Attempted
+
+| Change | Result | Learning |
+|--------|--------|----------|
+| Literal loop preloading | +0.7% (53.8→54.5%) | Small win, keep it |
+| Pattern-based small distance copy | **BROKE TESTS** | Can't pre-build pattern when distance<8 |
+| Simplified slow path to use copy_match_into | Neutral | Slow path rarely hit |
+| 5-word unconditional copy | **BROKE TESTS** | Needs explicit margin management |
+
+### What Actually Helps
+
+1. **Entry preloading in literal loop** - Preload next entry BEFORE processing current (small but real gain)
+2. **3-literal chain decode** - Already implemented, helps a lot
+3. **RLE (distance=1) memset** - Already implemented, common case
+4. **Conditional refill (ensure())** - Already implemented
+
 ## Gap Analysis
 
 ### What libdeflate Does That We Don't
