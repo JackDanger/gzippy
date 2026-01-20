@@ -1217,16 +1217,14 @@ fn decode_huffman_turbo(
                     out_pos += 1;
 
                     // Continue with tight literal loop for runs > 3
-                    loop {
-                        if !bits.has_bits(12) {
-                            break;
-                        }
-                        let e = table[(bits.buffer() & LUT_MASK) as usize].0;
-                        if (e as i32) >= 0 || (e & BITS_MASK) == 0 {
-                            break;
-                        }
+                    // OPTIMIZATION: Preload next entry while processing current
+                    let mut e = table[(bits.buffer() & LUT_MASK) as usize].0;
+                    while bits.has_bits(24) && (e as i32) < 0 && (e & BITS_MASK) != 0 {
                         bits.consume_entry(e);
-                        output[out_pos] = ((e >> SYMBOL_SHIFT) & 0xFF) as u8;
+                        let lit = ((e >> SYMBOL_SHIFT) & 0xFF) as u8;
+                        // PRELOAD next entry (hides memory latency)
+                        e = table[(bits.buffer() & LUT_MASK) as usize].0;
+                        output[out_pos] = lit;
                         out_pos += 1;
                     }
                     continue;

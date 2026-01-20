@@ -1,26 +1,39 @@
 # Optimization Roadmap: Beating libdeflate
 
-**Current Status**: 703 MB/s (57.5% of libdeflate's 1223 MB/s)
+**Current Status**: 667 MB/s (54% of libdeflate's 1239 MB/s)
 **Target**: 1400+ MB/s (115% of libdeflate)
+
+## Key Discoveries (Jan 2026)
+
+From profiling and analysis:
+
+1. **Slow path is rarely hit** - Our LUT pre-computes length+distance for most matches
+2. **Entry format limitation** - Current format doesn't store codeword length separately from total bits, limiting saved_bitbuf optimization
+3. **Unconditional copy is risky** - Requires guaranteed buffer margin; broke tests when attempted
+4. **Profile data shows**:
+   - 2792 dynamic blocks, 10 stored, 0 fixed (silesia)
+   - 3.13x compression ratio
+   - Most time in fastloop, not slow path
+5. **DecodeTrace infrastructure exists** but isn't connected to decode loop
 
 ## Gap Analysis
 
 ### What libdeflate Does That We Don't
 
-| Optimization | libdeflate | gzippy | Impact |
-|--------------|-----------|--------|--------|
-| `saved_bitbuf` for extra bits | ✅ | ❌ | 10-15% |
-| `bitsleft -= entry` (full u32) | ✅ | ✅ | Done |
-| Entry preloading before copy | ✅ | ⚠️ partial | 5-10% |
-| 5-word unconditional copy | ✅ | ❌ 40-byte | 5-8% |
-| RLE (offset=1) broadcast | ✅ | ⚠️ partial | 3-5% |
-| JIT table rebuild avoidance | ✅ | ❌ | 5-10% |
-| BMI2 intrinsics (x86_64) | ✅ | ❌ | 5-10% |
-| 11-bit litlen table | ✅ | ❌ 12-bit | 2-3% |
-| Subtable for long codes | ✅ | ❌ L2 | 3-5% |
-| Preload slack calculation | ✅ | ❌ | 2-3% |
+| Optimization | libdeflate | gzippy | Impact | Status |
+|--------------|-----------|--------|--------|--------|
+| `saved_bitbuf` for extra bits | ✅ | ❌ | 10-15% | Tests written |
+| `bitsleft -= entry` (full u32) | ✅ | ✅ | Done | ✅ Implemented |
+| Entry preloading before copy | ✅ | ⚠️ | 5-10% | Partial |
+| 5-word unconditional copy | ✅ | ❌ | 5-8% | Needs margin |
+| RLE (offset=1) memset | ✅ | ✅ | 3-5% | ✅ Implemented |
+| JIT table rebuild avoidance | ✅ | ❌ | 5-10% | Not started |
+| BMI2 intrinsics (x86_64) | ✅ | ❌ | 5-10% | Tests written |
+| 11-bit litlen table | ✅ | ❌ 12-bit | 2-3% | Not started |
+| Subtable for long codes | ✅ | ✅ L2 | 3-5% | ✅ Implemented |
+| Preload slack (conditional refill) | ✅ | ✅ | 2-3% | ✅ Implemented |
 
-**Total potential gain: 40-70%** (gets us to 110-120% of libdeflate)
+**Remaining potential gain: 30-50%** (gets us to 85-105% of libdeflate)
 
 ---
 
