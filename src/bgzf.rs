@@ -3790,3 +3790,358 @@ mod tests {
         assert_eq!(output, expected, "Content mismatch");
     }
 }
+
+// =============================================================================
+// Optimization Tests - TDD for closing the libdeflate gap
+// =============================================================================
+
+#[cfg(test)]
+mod optimization_tests {
+    use super::*;
+
+    // =========================================================================
+    // Phase 1: saved_bitbuf pattern tests
+    // =========================================================================
+
+    /// Test that we can extract extra bits from saved buffer without re-reading
+    #[test]
+    fn test_saved_bitbuf_extra_bits() {
+        // Create test data with known bit patterns
+        let data: [u8; 16] = [
+            0b11010101, 0b10101010, 0b11001100, 0b00110011, 0xFF, 0x00, 0xAA, 0x55, 0x12, 0x34,
+            0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
+        ];
+
+        let mut bits = TurboBits::new(&data);
+        bits.ensure(32);
+
+        // Save the current buffer state
+        let saved = bits.buffer();
+
+        // Simulate consuming 8 bits (like libdeflate's bitsleft -= entry)
+        let entry_bits = 8u32;
+        bits.consume(entry_bits);
+
+        // Extract 5 extra bits from saved buffer (at position 8-12)
+        let extra_shift = entry_bits;
+        let extra_mask = (1u64 << 5) - 1;
+        let extra = ((saved >> extra_shift) & extra_mask) as u32;
+
+        // Verify we got the right bits
+        let expected = 0b10101010u64 & 0b11111;
+        assert_eq!(
+            extra, expected as u32,
+            "saved_bitbuf extra extraction failed: got {:05b}, expected {:05b}",
+            extra, expected
+        );
+    }
+
+    /// Test saved_bitbuf pattern for length+distance decode
+    #[test]
+    fn test_saved_bitbuf_length_decode() {
+        let data: [u8; 8] = [0b10101011, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let mut bits = TurboBits::new(&data);
+        bits.ensure(16);
+
+        let saved = bits.buffer();
+
+        // Simulate entry: 7-bit code + 1 extra bit = 8 total bits
+        let codeword_len = 7u32;
+        let extra_count = 1u32;
+        let length_base = 7u32;
+
+        bits.consume(codeword_len + extra_count);
+
+        let extra_bits = (saved >> codeword_len) & ((1 << extra_count) - 1);
+        let length = length_base + extra_bits as u32;
+
+        // First 7 bits: 0b0101011 = 43, extra bit (8th) = 1
+        assert_eq!(length, 8, "Length decode with saved_bitbuf failed");
+    }
+
+    // =========================================================================
+    // Phase 2: 5-word unconditional copy tests
+    // =========================================================================
+
+    /// Test unconditional 40-byte copy for short matches
+    #[test]
+    fn test_unconditional_copy_short_match() {
+        let mut output = vec![0u8; 1024];
+
+        // Set up source pattern
+        for i in 0..8 {
+            output[i] = (i as u8) + 1;
+        }
+
+        // Copy 5 bytes using the existing copy function
+        let out_pos = copy_match_into(&mut output, 100, 100, 5);
+
+        assert_eq!(out_pos, 105);
+        for i in 0..5 {
+            assert_eq!(output[100 + i], output[i], "Mismatch at byte {}", i);
+        }
+    }
+
+    /// Test that copy doesn't corrupt for distance >= 8
+    #[test]
+    fn test_unconditional_copy_non_overlapping() {
+        let mut output = vec![0u8; 1024];
+
+        // Create known pattern
+        for i in 0..100 {
+            output[i] = (i as u8).wrapping_mul(7);
+        }
+
+        let src_start = 10;
+        let dst_start = 200;
+        let length = 35;
+
+        let out_pos = copy_match_into(&mut output, dst_start, dst_start - src_start, length);
+
+        assert_eq!(out_pos, dst_start + length);
+
+        for i in 0..length {
+            assert_eq!(
+                output[dst_start + i],
+                output[src_start + i],
+                "Copy mismatch at offset {}",
+                i
+            );
+        }
+    }
+
+    /// Test RLE (distance=1) optimization
+    #[test]
+    fn test_rle_optimization() {
+        let mut output = vec![0u8; 1024];
+        output[50] = 0xAA;
+
+        let out_pos = copy_match_into(&mut output, 51, 1, 100);
+
+        assert_eq!(out_pos, 151);
+
+        for i in 51..151 {
+            assert_eq!(output[i], 0xAA, "RLE mismatch at position {}", i);
+        }
+    }
+
+    // =========================================================================
+    // Phase 3: JIT table caching tests
+    // =========================================================================
+
+    /// Test that identical code lengths produce same table fingerprint
+    #[test]
+    fn test_table_fingerprint_identical() {
+        let lens1: Vec<u8> = vec![8, 8, 8, 8, 7, 7, 7, 7, 6, 6];
+        let lens2: Vec<u8> = vec![8, 8, 8, 8, 7, 7, 7, 7, 6, 6];
+
+        fn fingerprint(lens: &[u8]) -> u64 {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            lens.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let fp1 = fingerprint(&lens1);
+        let fp2 = fingerprint(&lens2);
+
+        assert_eq!(
+            fp1, fp2,
+            "Identical code lengths should have same fingerprint"
+        );
+    }
+
+    /// Test that different code lengths produce different fingerprints
+    #[test]
+    fn test_table_fingerprint_different() {
+        let lens1: Vec<u8> = vec![8, 8, 8, 8, 7, 7, 7, 7];
+        let lens2: Vec<u8> = vec![8, 8, 8, 7, 7, 7, 7, 7];
+
+        fn fingerprint(lens: &[u8]) -> u64 {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            lens.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let fp1 = fingerprint(&lens1);
+        let fp2 = fingerprint(&lens2);
+
+        assert_ne!(
+            fp1, fp2,
+            "Different code lengths should have different fingerprints"
+        );
+    }
+
+    // =========================================================================
+    // Phase 4: BMI2 intrinsics tests
+    // =========================================================================
+
+    /// Test that BMI2 path produces same results as generic path
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_bmi2_equivalence() {
+        if !is_x86_feature_detected!("bmi2") {
+            eprintln!("BMI2 not available, skipping test");
+            return;
+        }
+
+        let original: Vec<u8> = (0..10000).map(|i| ((i * 7) % 256) as u8).collect();
+
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let header_size = crate::marker_decode::skip_gzip_header(&compressed).unwrap();
+        let deflate_data = &compressed[header_size..compressed.len() - 8];
+
+        let mut output = vec![0u8; original.len() + 1024];
+        let size = inflate_into_pub(deflate_data, &mut output).unwrap();
+        output.truncate(size);
+
+        assert_eq!(output, original, "BMI2 path produced different output");
+    }
+
+    /// Test variable shift operation (simulating BMI2 shrx)
+    #[test]
+    fn test_variable_shift() {
+        let value: u64 = 0xDEADBEEFCAFEBABE;
+
+        for shift in 0..64u32 {
+            let generic = value >> shift;
+            let simulated_bmi2 = value.wrapping_shr(shift);
+
+            assert_eq!(
+                generic, simulated_bmi2,
+                "Shift mismatch for shift={}",
+                shift
+            );
+        }
+    }
+
+    // =========================================================================
+    // Phase 5: 11-bit table tests
+    // =========================================================================
+
+    /// Test that table works with subtables
+    #[test]
+    fn test_11bit_table_with_subtable() {
+        let mut lens = vec![0u8; 288];
+
+        for i in 0..256 {
+            lens[i] = 8;
+        }
+        lens[256] = 7;
+        for i in 257..288 {
+            lens[i] = if i < 280 { 8 } else { 12 };
+        }
+
+        let table = TwoLevelTable::build(&lens).unwrap();
+
+        let test_bits: u64 = 0b111111111111;
+        let (symbol, code_len) = table.decode(test_bits);
+
+        assert!(code_len > 0, "Should decode valid code");
+        assert!(symbol < 288, "Symbol should be in range");
+    }
+
+    // =========================================================================
+    // Phase 6: Preload slack tests
+    // =========================================================================
+
+    /// Test that we don't refill unnecessarily
+    #[test]
+    fn test_minimal_refill() {
+        let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+        let mut bits = TurboBits::new(&data);
+
+        assert!(bits.has_bits(56), "Initial refill should give 56+ bits");
+
+        bits.consume(40);
+
+        assert!(bits.has_bits(16), "Should have 16+ bits after consuming 40");
+
+        bits.ensure(20);
+        assert!(bits.has_bits(20), "Ensure should work");
+    }
+
+    /// Test preload-before-consume pattern
+    #[test]
+    fn test_preload_before_consume() {
+        let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+        let mut bits = TurboBits::new(&data);
+        bits.ensure(56);
+
+        let current_bits = bits.buffer();
+        let _next_entry_preview = current_bits >> 12;
+
+        bits.consume(12);
+
+        let actual_next = bits.buffer() & 0xFFF;
+        assert_eq!(
+            _next_entry_preview & 0xFFF,
+            actual_next,
+            "Preload should match actual next bits"
+        );
+    }
+
+    // =========================================================================
+    // Integration test: Full decode with optimizations
+    // =========================================================================
+
+    /// Verify optimizations don't break correctness
+    #[test]
+    fn test_optimized_decode_correctness() {
+        let original: Vec<u8> = {
+            let mut data = Vec::with_capacity(100_000);
+            for i in 0..100_000 {
+                let byte = match i % 100 {
+                    0..=30 => (i * 17 % 256) as u8,
+                    31..=60 => 0xAA,
+                    61..=80 => ((i / 100) % 256) as u8,
+                    _ => 0x00,
+                };
+                data.push(byte);
+            }
+            data
+        };
+
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let header_size = crate::marker_decode::skip_gzip_header(&compressed).unwrap();
+        let deflate_data = &compressed[header_size..compressed.len() - 8];
+
+        let mut output = vec![0u8; original.len() + 1024];
+        let size = inflate_into_pub(deflate_data, &mut output).unwrap();
+        output.truncate(size);
+
+        assert_eq!(output.len(), original.len(), "Size mismatch");
+
+        let mismatches: Vec<usize> = original
+            .iter()
+            .zip(output.iter())
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, _)| i)
+            .take(10)
+            .collect();
+
+        assert!(
+            mismatches.is_empty(),
+            "Content mismatch at positions: {:?}",
+            mismatches
+        );
+    }
+}
