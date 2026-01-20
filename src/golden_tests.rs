@@ -4,6 +4,7 @@
 //! decode errors. They compare output against known-good reference data.
 
 #![allow(dead_code)]
+#![allow(unused_imports)]
 
 use std::io::Write;
 
@@ -59,7 +60,11 @@ mod tests {
             &libdeflate_out[..libdeflate_size],
             "Content mismatch"
         );
-        assert_eq!(&turbo_out[..turbo_size], original.as_slice(), "Original mismatch");
+        assert_eq!(
+            &turbo_out[..turbo_size],
+            original.as_slice(),
+            "Original mismatch"
+        );
 
         eprintln!("[GOLDEN] simple_literals: ✓ {} bytes verified", turbo_size);
     }
@@ -168,9 +173,12 @@ mod tests {
 
         // Get expected size from ISIZE
         let isize_bytes = &gzip_data[gzip_data.len() - 4..];
-        let isize =
-            u32::from_le_bytes([isize_bytes[0], isize_bytes[1], isize_bytes[2], isize_bytes[3]])
-                as usize;
+        let isize = u32::from_le_bytes([
+            isize_bytes[0],
+            isize_bytes[1],
+            isize_bytes[2],
+            isize_bytes[3],
+        ]) as usize;
 
         // Compare first 100KB
         let test_size = 100_000.min(isize);

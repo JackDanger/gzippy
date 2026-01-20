@@ -13,6 +13,8 @@
 //! 6. **Prefetch**: Hide memory latency with prefetch hints
 
 #![allow(dead_code)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::needless_range_loop)]
 #![allow(unused_unsafe)]
 
 use std::io::{Error, ErrorKind, Result};
@@ -63,18 +65,16 @@ impl<'a> UltimateBits<'a> {
     pub fn refill(&mut self) {
         if self.pos + 8 <= self.data.len() {
             // Load 8 bytes
-            let word = unsafe {
-                (self.data.as_ptr().add(self.pos) as *const u64).read_unaligned()
-            };
+            let word = unsafe { (self.data.as_ptr().add(self.pos) as *const u64).read_unaligned() };
             let word = u64::from_le(word);
-            
+
             // Branchless merge
             self.bitbuf |= word << (self.bitsleft as u8);
-            
+
             // Update position (libdeflate's trick)
             self.pos += 7;
             self.pos -= ((self.bitsleft >> 3) & 7) as usize;
-            
+
             // Set bits available
             self.bitsleft |= Self::MAX_BITSLEFT & !7;
         } else {
@@ -141,12 +141,7 @@ fn extract_bits(val: u64, n: u32) -> u64 {
 /// Copy match with maximum speed
 /// Uses overlapping writes for efficiency
 #[inline(always)]
-unsafe fn copy_match_ultimate(
-    out: *mut u8,
-    out_pos: usize,
-    distance: usize,
-    length: usize,
-) {
+unsafe fn copy_match_ultimate(out: *mut u8, out_pos: usize, distance: usize, length: usize) {
     let dst = out.add(out_pos);
     let src = out.add(out_pos - distance);
 
@@ -159,7 +154,7 @@ unsafe fn copy_match_ultimate(
         let mut s = src;
         let mut d = dst;
         let end = dst.add(length);
-        
+
         while d < end {
             let chunk = (s as *const u64).read_unaligned();
             (d as *mut u64).write_unaligned(chunk);
@@ -171,7 +166,7 @@ unsafe fn copy_match_ultimate(
         let mut s = src;
         let mut d = dst;
         let end = dst.add(length);
-        
+
         while d < end {
             let chunk = (s as *const u32).read_unaligned();
             (d as *mut u32).write_unaligned(chunk);
@@ -192,23 +187,22 @@ unsafe fn copy_match_ultimate(
 
 /// Length base values and extra bits
 const LENGTH_BASE: [u16; 29] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
-    35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
 ];
 
 const LENGTH_EXTRA: [u8; 29] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
-    3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
 
 const DIST_BASE: [u16; 30] = [
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
-    257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
 ];
 
 const DIST_EXTRA: [u8; 30] = [
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
-    7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
 ];
 
 // =============================================================================
@@ -399,7 +393,8 @@ impl UltimateTable {
 
                 if !entries[main_idx].is_subtable_ptr() {
                     let start = subtable_next as u16;
-                    entries[main_idx] = UltimateEntry::subtable_ptr(start, max_subtable, table_bits);
+                    entries[main_idx] =
+                        UltimateEntry::subtable_ptr(start, max_subtable, table_bits);
                     subtable_next += 1 << max_subtable;
                 }
 
@@ -416,7 +411,10 @@ impl UltimateTable {
         }
 
         entries.truncate(subtable_next);
-        Some(Self { entries, table_bits })
+        Some(Self {
+            entries,
+            table_bits,
+        })
     }
 
     fn create_litlen_entry(sym: usize, len: u8) -> UltimateEntry {
@@ -543,7 +541,7 @@ pub fn decode_ultimate(
         }
 
         bits.consume_entry(dentry.raw());
-        
+
         // Decode distance
         let dbase = ((dentry.raw() >> 16) & 0xFFFF) as u32;
         let dcw = ((dentry.raw() >> 8) & 0xF) as u8;
@@ -621,9 +619,13 @@ pub fn decode_ultimate(
         };
 
         if distance == 0 || distance as usize > out_pos || out_pos + length as usize > out_len {
-            return Err(Error::new(ErrorKind::InvalidData, 
-                format!("Invalid match: dist={} out_pos={} len={} out_len={} dbase={} dextra={}",
-                    distance, out_pos, length, out_len, dbase, dextra)));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "Invalid match: dist={} out_pos={} len={} out_len={} dbase={} dextra={}",
+                    distance, out_pos, length, out_len, dbase, dextra
+                ),
+            ));
         }
 
         for i in 0..length as usize {
@@ -651,7 +653,7 @@ pub fn inflate_ultimate(deflate_data: &[u8], output: &mut [u8]) -> Result<usize>
         let bfinal = (bits.peek() & 1) != 0;
         let btype = ((bits.peek() >> 1) & 3) as u8;
         bits.consume(3);
-        
+
         block_num += 1;
         let start_pos = out_pos;
 
@@ -659,19 +661,32 @@ pub fn inflate_ultimate(deflate_data: &[u8], output: &mut [u8]) -> Result<usize>
             0 => out_pos = decode_stored(&mut bits, output, out_pos)?,
             1 => out_pos = decode_fixed(&mut bits, output, out_pos)?,
             2 => out_pos = decode_dynamic(&mut bits, output, out_pos)?,
-            _ => return Err(Error::new(ErrorKind::InvalidData, 
-                format!("Reserved block type {} at block {} out_pos {}", btype, block_num, out_pos))),
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "Reserved block type {} at block {} out_pos {}",
+                        btype, block_num, out_pos
+                    ),
+                ))
+            }
         }
 
         if bfinal {
             break;
         }
-        
+
         // Safety check: don't decode more than expected
         if out_pos > output.len() {
-            return Err(Error::new(ErrorKind::InvalidData,
-                format!("Overflowed at block {} pos {} (decoded {} in this block)", 
-                    block_num, out_pos, out_pos - start_pos)));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "Overflowed at block {} pos {} (decoded {} in this block)",
+                    block_num,
+                    out_pos,
+                    out_pos - start_pos
+                ),
+            ));
         }
     }
 
@@ -758,7 +773,9 @@ fn decode_dynamic(bits: &mut UltimateBits, output: &mut [u8], out_pos: usize) ->
     let hclen = ((bits.peek() & 0xF) as usize) + 4;
     bits.consume(4);
 
-    const ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+    const ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
     let mut cl = [0u8; 19];
     for i in 0..hclen {
         bits.refill();
@@ -981,24 +998,30 @@ mod tests {
             }
         };
 
-        let start = 10 + if (gz[3] & 0x08) != 0 {
-            gz[10..].iter().position(|&b| b == 0).unwrap_or(0) + 1
-        } else {
-            0
-        };
+        let start = 10
+            + if (gz[3] & 0x08) != 0 {
+                gz[10..].iter().position(|&b| b == 0).unwrap_or(0) + 1
+            } else {
+                0
+            };
         let end = gz.len() - 8;
         let deflate = &gz[start..end];
-        let isize = u32::from_le_bytes([gz[gz.len()-4], gz[gz.len()-3], gz[gz.len()-2], gz[gz.len()-1]]) as usize;
+        let isize = u32::from_le_bytes([
+            gz[gz.len() - 4],
+            gz[gz.len() - 3],
+            gz[gz.len() - 2],
+            gz[gz.len() - 1],
+        ]) as usize;
 
         let mut out = vec![0u8; isize + 1000];
-        
+
         // Verify correctness
         let our_size = inflate_ultimate(deflate, &mut out).expect("our decode");
         let mut lib_out = vec![0u8; isize + 1000];
         let lib_size = libdeflater::Decompressor::new()
             .deflate_decompress(deflate, &mut lib_out)
             .expect("libdeflate");
-        
+
         assert_eq!(our_size, lib_size, "Size mismatch");
         for i in 0..10000.min(our_size) {
             if out[i] != lib_out[i] {

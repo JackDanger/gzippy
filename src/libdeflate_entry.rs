@@ -63,6 +63,7 @@
 //! ```
 
 #![allow(dead_code)]
+#![allow(clippy::needless_range_loop)]
 
 /// Flag: Entry is a literal (bit 31)
 pub const HUFFDEC_LITERAL: u32 = 0x8000_0000;
@@ -98,11 +99,7 @@ impl LitLenEntry {
         // Bit 11-8: remaining codeword length (for saved_bitbuf)
         // Bit 4-0: total bits = codeword_bits + extra_bits
         let total_bits = codeword_bits + extra_bits;
-        Self(
-            ((base as u32) << 16)
-                | ((codeword_bits as u32) << 8)
-                | (total_bits as u32),
-        )
+        Self(((base as u32) << 16) | ((codeword_bits as u32) << 8) | (total_bits as u32))
     }
 
     /// Create an end-of-block entry
@@ -235,11 +232,7 @@ impl DistEntry {
         // Bit 11-8: remaining codeword length
         // Bit 4-0: total bits = codeword_bits + extra_bits
         let total_bits = codeword_bits + extra_bits;
-        Self(
-            ((base as u32) << 16)
-                | ((codeword_bits as u32) << 8)
-                | (total_bits as u32),
-        )
+        Self(((base as u32) << 16) | ((codeword_bits as u32) << 8) | (total_bits as u32))
     }
 
     /// Create a subtable pointer entry
@@ -362,8 +355,8 @@ impl LitLenTable {
         }
 
         // Allocate table with space for subtables
-        let max_subtable_entries =
-            (1usize << Self::MAX_SUBTABLE_BITS) * code_lengths.iter().filter(|&&l| l > table_bits).count();
+        let max_subtable_entries = (1usize << Self::MAX_SUBTABLE_BITS)
+            * code_lengths.iter().filter(|&&l| l > table_bits).count();
         let mut entries = vec![LitLenEntry(0); main_size + max_subtable_entries];
         let mut subtable_next = main_size;
 
@@ -409,7 +402,10 @@ impl LitLenTable {
                 let subtable_bits = entries[main_idx].subtable_bits() as usize;
                 let subtable_idx = (reversed >> table_bits) as usize;
 
-                let entry = create_litlen_entry(symbol, len as u8);
+                // For subtable entries, store (len - table_bits) not full len
+                // This is the subtable portion only
+                let subtable_len = (len - table_bits as usize) as u8;
+                let entry = create_litlen_entry(symbol, subtable_len);
                 let stride = 1usize << extra_bits;
                 let mut idx = subtable_idx;
                 while idx < (1usize << subtable_bits) {
@@ -420,14 +416,17 @@ impl LitLenTable {
         }
 
         entries.truncate(subtable_next);
-        Some(Self { entries, table_bits })
+        Some(Self {
+            entries,
+            table_bits,
+        })
     }
 
     /// Look up an entry by bit pattern (unsafe unchecked for max speed)
     #[inline(always)]
     pub fn lookup(&self, bits: u64) -> LitLenEntry {
         let idx = (bits as usize) & ((1usize << self.table_bits) - 1);
-        // SAFETY: idx is masked to be within table_bits range, 
+        // SAFETY: idx is masked to be within table_bits range,
         // and entries is always at least (1 << table_bits) in size
         unsafe { *self.entries.get_unchecked(idx) }
     }
@@ -491,8 +490,8 @@ impl DistTable {
         }
 
         // Allocate table with space for subtables
-        let max_subtable_entries =
-            (1usize << Self::MAX_SUBTABLE_BITS) * code_lengths.iter().filter(|&&l| l > table_bits).count();
+        let max_subtable_entries = (1usize << Self::MAX_SUBTABLE_BITS)
+            * code_lengths.iter().filter(|&&l| l > table_bits).count();
         let mut entries = vec![DistEntry(0); main_size + max_subtable_entries];
         let mut subtable_next = main_size;
 
@@ -538,7 +537,9 @@ impl DistTable {
                 let subtable_bits = entries[main_idx].subtable_bits() as usize;
                 let subtable_idx = (reversed >> table_bits) as usize;
 
-                let entry = create_dist_entry(symbol, len as u8);
+                // For subtable entries, store (len - table_bits) not full len
+                let subtable_len = (len - table_bits as usize) as u8;
+                let entry = create_dist_entry(symbol, subtable_len);
                 let stride = 1usize << extra_bits;
                 let mut idx = subtable_idx;
                 while idx < (1usize << subtable_bits) {
@@ -549,7 +550,10 @@ impl DistTable {
         }
 
         entries.truncate(subtable_next);
-        Some(Self { entries, table_bits })
+        Some(Self {
+            entries,
+            table_bits,
+        })
     }
 
     /// Look up an entry by bit pattern (unsafe unchecked for max speed)
@@ -628,7 +632,7 @@ const LENGTH_TABLE: [(u16, u8); 29] = [
     (163, 5),
     (195, 5),
     (227, 5), // 281-284
-    (258, 0),                                 // 285
+    (258, 0), // 285
 ];
 
 /// Distance base values and extra bits (RFC 1951)
@@ -638,23 +642,23 @@ const DISTANCE_TABLE: [(u16, u8); 30] = [
     (3, 0),
     (4, 0), // 0-3
     (5, 1),
-    (7, 1),     // 4-5
+    (7, 1), // 4-5
     (9, 2),
-    (13, 2),    // 6-7
+    (13, 2), // 6-7
     (17, 3),
-    (25, 3),    // 8-9
+    (25, 3), // 8-9
     (33, 4),
-    (49, 4),    // 10-11
+    (49, 4), // 10-11
     (65, 5),
-    (97, 5),    // 12-13
+    (97, 5), // 12-13
     (129, 6),
-    (193, 6),   // 14-15
+    (193, 6), // 14-15
     (257, 7),
-    (385, 7),   // 16-17
+    (385, 7), // 16-17
     (513, 8),
-    (769, 8),   // 18-19
+    (769, 8), // 18-19
     (1025, 9),
-    (1537, 9),  // 20-21
+    (1537, 9), // 20-21
     (2049, 10),
     (3073, 10), // 22-23
     (4097, 11),
@@ -779,7 +783,7 @@ mod tests {
         assert_eq!(entry.total_bits(), 18);
 
         // Decode with extra bits = 0x1FFF (max) -> distance = 24577 + 8191 = 32768
-        let dist = entry.decode_distance(0b1111111111111_00000); // 5 codeword bits, 13 extra
+        let dist = entry.decode_distance(0b11_1111_1111_1110_0000); // 5 codeword bits, 13 extra
         assert_eq!(dist, 32768);
     }
 
@@ -821,15 +825,23 @@ mod tests {
         // Symbol 65 = 0x41 + 0x30 = 0x71 = 01110001 binary
         // Reversed: 10001110 = 0x8E
         let entry = table.resolve(0x8E);
-        assert!(entry.is_literal(), "Entry 0x8E should be literal, got {:08X}", entry.raw());
+        assert!(
+            entry.is_literal(),
+            "Entry 0x8E should be literal, got {:08X}",
+            entry.raw()
+        );
         assert_eq!(entry.literal_value(), 65, "Should decode to 'A'");
-        
+
         // Check end of block (symbol 256) which has 7-bit code
         // Fixed: symbols 256-279 get codes 0000000 + (symbol - 256) (7 bits)
         // Symbol 256 = 0000000
         // Reversed: 0000000 = 0x00
         let eob = table.resolve(0x00);
-        assert!(eob.is_end_of_block(), "Entry 0x00 should be EOB, got {:08X}", eob.raw());
+        assert!(
+            eob.is_end_of_block(),
+            "Entry 0x00 should be EOB, got {:08X}",
+            eob.raw()
+        );
     }
 
     #[test]
