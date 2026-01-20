@@ -68,11 +68,12 @@ jobs:
       - name: Build rapidgzip
         run: |
           cd rapidgzip/librapidarchive
+          rm -rf build
           mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_ISAL=OFF
           make -j$(nproc) rapidgzip
-          # Verify build succeeded
-          test -f tools/rapidgzip || (echo "ERROR: rapidgzip build failed" && exit 1)
+          # Binary is at build/src/tools/rapidgzip (not build/tools/rapidgzip)
+          test -f src/tools/rapidgzip || (echo "ERROR: rapidgzip build failed" && exit 1)
 
       - name: Build igzip
         run: |
@@ -91,7 +92,7 @@ jobs:
             target/release/gzippy
             pigz/pigz
             pigz/unpigz
-            rapidgzip/librapidarchive/build/tools/rapidgzip
+            rapidgzip/librapidarchive/build/src/tools/rapidgzip
             isa-l/build/bin/igzip
           retention-days: 1
 
@@ -198,9 +199,9 @@ jobs:
         run: |
           chmod +x tools/target/release/gzippy
           chmod +x tools/pigz/pigz tools/pigz/unpigz
-          chmod +x tools/rapidgzip/librapidarchive/build/tools/rapidgzip
+          chmod +x tools/rapidgzip/librapidarchive/build/src/tools/rapidgzip
           # Verify rapidgzip is available - this is REQUIRED, not optional
-          tools/rapidgzip/librapidarchive/build/tools/rapidgzip --version || (echo "ERROR: rapidgzip not available" && exit 1)
+          tools/rapidgzip/librapidarchive/build/src/tools/rapidgzip --version || (echo "ERROR: rapidgzip not available" && exit 1)
 
       - name: Run benchmark
         run: |
@@ -208,7 +209,7 @@ jobs:
             --type rapidgzip-multi \
             --gzippy tools/target/release/gzippy \
             --pigz tools/pigz/pigz \
-            --rapidgzip tools/rapidgzip/librapidarchive/build/tools/rapidgzip
+            --rapidgzip tools/rapidgzip/librapidarchive/build/src/tools/rapidgzip
 
   # ============================================================================
   # Guard: vs rapidgzip on single-member files
@@ -229,16 +230,16 @@ jobs:
       - name: Setup tools
         run: |
           chmod +x tools/target/release/gzippy
-          chmod +x tools/rapidgzip/librapidarchive/build/tools/rapidgzip
+          chmod +x tools/rapidgzip/librapidarchive/build/src/tools/rapidgzip
           # Verify rapidgzip is available - this is REQUIRED, not optional
-          tools/rapidgzip/librapidarchive/build/tools/rapidgzip --version || (echo "ERROR: rapidgzip not available" && exit 1)
+          tools/rapidgzip/librapidarchive/build/src/tools/rapidgzip --version || (echo "ERROR: rapidgzip not available" && exit 1)
 
       - name: Run benchmark
         run: |
           python3 scripts/benchmark_guard.py \
             --type rapidgzip-single \
             --gzippy tools/target/release/gzippy \
-            --rapidgzip tools/rapidgzip/librapidarchive/build/tools/rapidgzip
+            --rapidgzip tools/rapidgzip/librapidarchive/build/src/tools/rapidgzip
 
   # ============================================================================
   # Guard: vs igzip on single-threaded decompression

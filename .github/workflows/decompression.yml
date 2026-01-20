@@ -78,11 +78,13 @@ jobs:
         continue-on-error: true
         run: |
           cd rapidgzip/librapidarchive
+          rm -rf build
           mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_ISAL=OFF
           make -j$(nproc) rapidgzip || true
-          if [ -f tools/rapidgzip ]; then
-            cp tools/rapidgzip /tmp/rapidgzip-cli
+          # Binary is at build/src/tools/rapidgzip (not build/tools/rapidgzip)
+          if [ -f src/tools/rapidgzip ]; then
+            cp src/tools/rapidgzip /tmp/rapidgzip-cli
             echo "✓ rapidgzip CLI built"
           fi
 
