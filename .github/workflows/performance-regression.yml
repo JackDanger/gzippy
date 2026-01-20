@@ -261,18 +261,23 @@ jobs:
       - name: Setup tools
         run: |
           chmod +x tools/target/release/gzippy
-          [ -f tools/isa-l/build/igzip ] && chmod +x tools/isa-l/build/igzip || true
+          # igzip is REQUIRED for this guard - fail if not available
+          if [ ! -f tools/isa-l/build/igzip ]; then
+            echo "ERROR: igzip binary not found at tools/isa-l/build/igzip"
+            echo "Available files:"
+            find tools -name "*igzip*" -o -name "*isal*" 2>/dev/null | head -20
+            exit 1
+          fi
+          chmod +x tools/isa-l/build/igzip
+          # Verify it runs
+          tools/isa-l/build/igzip --help 2>&1 | head -1 || echo "Warning: igzip --help failed"
 
       - name: Run benchmark
         run: |
-          IGZIP=""
-          if [ -f tools/isa-l/build/igzip ]; then
-            IGZIP="--igzip tools/isa-l/build/igzip"
-          fi
           python3 scripts/benchmark_guard.py \
             --type igzip \
             --gzippy tools/target/release/gzippy \
-            $IGZIP
+            --igzip tools/isa-l/build/igzip
 
   # ============================================================================
   # Summary of all performance guard results

@@ -111,10 +111,14 @@ def benchmark_vs_tool(
     original_size: int,
     gzippy_extra_args: list[str] | None = None,
     other_extra_args: list[str] | None = None,
+    require_other_tool: bool = False,
 ) -> bool:
     """
     Benchmark gzippy vs another tool on decompression.
     Returns True if threshold is met.
+    
+    Args:
+        require_other_tool: If True, fail the guard when the comparison tool is unavailable.
     """
     gzippy_args = gzippy_extra_args or []
     other_args = other_extra_args or []
@@ -134,11 +138,20 @@ def benchmark_vs_tool(
     other_time, other_trials = adaptive_benchmark(other_cmd, compressed_file)
     
     if other_time == 0:
-        write_summary([
-            f"⚠️ {other_name} not available or failed, skipping comparison",
-            f"gzippy speed: {gzippy_speed:.0f} MB/s ({gzippy_trials} trials)",
-        ])
-        return True  # Don't fail if comparison tool isn't available
+        if require_other_tool:
+            write_summary([
+                f"❌ **FAIL**: {other_name} is required but failed to run",
+                f"gzippy speed: {gzippy_speed:.0f} MB/s ({gzippy_trials} trials)",
+                f"",
+                f"Check that {other_name} binary exists and is executable.",
+            ])
+            return False  # Fail the guard - comparison tool is required
+        else:
+            write_summary([
+                f"⚠️ {other_name} not available or failed, skipping comparison",
+                f"gzippy speed: {gzippy_speed:.0f} MB/s ({gzippy_trials} trials)",
+            ])
+            return True  # Don't fail if comparison tool isn't required
 
     other_speed = original_size / other_time / 1_000_000
     ratio = gzippy_speed / other_speed
@@ -283,6 +296,7 @@ def main():
                 "rapidgzip-multi", args.gzippy, args.rapidgzip, "rapidgzip",
                 compressed, original_size,
                 other_extra_args=["-d", f"-P{args.cores}"],
+                require_other_tool=True,  # rapidgzip MUST work for this guard
             )
 
         elif args.type == "rapidgzip-single":
@@ -300,12 +314,19 @@ def main():
                 "rapidgzip-single", args.gzippy, args.rapidgzip, "rapidgzip",
                 compressed, original_size,
                 other_extra_args=["-d", f"-P{args.cores}"],
+                require_other_tool=True,  # rapidgzip MUST work for this guard
             )
 
         elif args.type == "igzip":
             if not args.igzip or not args.igzip.exists():
                 print("❌ ERROR: igzip binary required but not available")
+                print(f"   Tried path: {args.igzip}")
                 print("   Pass --igzip /path/to/igzip")
+                sys.exit(1)
+            
+            # Verify igzip is executable
+            if not os.access(args.igzip, os.X_OK):
+                print(f"❌ ERROR: igzip binary exists but is not executable: {args.igzip}")
                 sys.exit(1)
             
             # Compress with gzip
@@ -317,6 +338,7 @@ def main():
                 "igzip", args.gzippy, args.igzip, "igzip",
                 compressed, original_size,
                 gzippy_extra_args=["-p1"],  # Single-threaded for fair comparison
+                require_other_tool=True,  # igzip MUST work for this guard
             )
 
         else:
