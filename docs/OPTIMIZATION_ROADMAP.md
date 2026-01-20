@@ -43,6 +43,22 @@ From profiling and analysis:
 **Key Insight**: 91% of matches have d>=40. For most of these (when len<=d), 
 we already use memcpy. The remaining gap is in the decode loop itself, not the copy function.
 
+### What DOESN'T Work (Tested Jan 2026)
+
+| Attempted | Result | Why |
+|-----------|--------|-----|
+| `saved_bitbuf` pattern | N/A | LUT pre-computes all matches, no extra bits to read |
+| Unconditional 5-word copy | **48% (slower!)** | Matches avg 10.5 bytes, writing 40 wastes bandwidth |
+| Loop unrolling | 50.5% | No improvement over simple loop |
+| `wrapping_sub` vs `saturating_sub` | 47.9% | Counter-intuitively worse |
+
+### Where the Gap Actually Is
+
+Since copy is already optimal and LUT pre-computes everything, the remaining gap must be:
+1. **Decode loop overhead** - function calls, bounds checks, branch misprediction
+2. **Table lookup latency** - 12-bit table (8KB) vs libdeflate's 11-bit (4KB fits L1)
+3. **Bit buffer operations** - our `TurboBits` vs libdeflate's inline macros
+
 ### What Actually Helps
 
 1. **Entry preloading in literal loop** - Preload next entry BEFORE processing current (small but real gain)
