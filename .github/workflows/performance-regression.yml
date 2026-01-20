@@ -4,10 +4,13 @@
 # All guards use RELATIVE comparisons (gzippy vs other tools on same machine).
 # This ensures CI doesn't break when runner specs change.
 #
-# Guards:
-# - vs pigz: MUST be faster on BGZF, multi-member, and single-member files
-# - vs rapidgzip: MUST be faster on both multi-member AND single-member files
-# - vs igzip: MUST be >= 90% of igzip speed (single-threaded decompression)
+# Uses adaptive benchmarking: runs until CV < 5% (min 10, max 30 trials)
+# for statistical significance.
+#
+# Performance expectations:
+# - vs pigz/gzip: MUST be faster (ratio > 1.0)
+# - vs rapidgzip: Must be within ±1% (ratio 0.99-1.01)
+# - vs igzip: MUST be >= 90% speed (0.90x)
 #
 # NOTE: Thread counts and compression levels are tested in ci.yml (edge-cases)
 # =============================================================================
@@ -58,6 +61,11 @@ jobs:
           echo "## BGZF: gzippy vs pigz" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
+          # Adaptive benchmarking parameters
+          MIN_TRIALS=10
+          MAX_TRIALS=30
+          TARGET_CV=0.05
+          
           # Create test data
           python3 -c "
           import random
@@ -71,44 +79,72 @@ jobs:
           ./target/release/gzippy -1 -c /tmp/test.txt > /tmp/test.gz
           SIZE=$(stat -c%s /tmp/test.txt)
           
+          # Adaptive benchmark function
+          benchmark_tool() {
+            local cmd="$1"
+            local times=""
+            local trial=0
+            
+            # Warmup
+            eval "$cmd" > /dev/null 2>&1
+            
+            while [ $trial -lt $MAX_TRIALS ]; do
+              trial=$((trial + 1))
+              START=$(date +%s.%N)
+              eval "$cmd" > /dev/null
+              END=$(date +%s.%N)
+              t=$(echo "$END - $START" | bc -l)
+              times="$times $t"
+              
+              if [ $trial -ge $MIN_TRIALS ]; then
+                cv=$(echo "$times" | python3 -c "
+          import sys, statistics
+          times = [float(x) for x in sys.stdin.read().split() if x]
+          mean = statistics.mean(times)
+          stdev = statistics.stdev(times) if len(times) > 1 else 0
+          print(f'{stdev/mean:.4f}' if mean > 0 else '1')
+          ")
+                if python3 -c "exit(0 if $cv < $TARGET_CV else 1)"; then
+                  break
+                fi
+              fi
+            done
+            
+            echo "$times" | python3 -c "
+          import sys, statistics
+          times = [float(x) for x in sys.stdin.read().split() if x]
+          mean = statistics.mean(times)
+          print(f'{mean:.6f} {len(times)}')"
+          }
+          
           # Test gzippy
-          ./target/release/gzippy -d < /tmp/test.gz > /tmp/out1.txt  # warmup
-          START=$(date +%s.%N)
-          for i in 1 2 3 4 5; do
-            ./target/release/gzippy -d < /tmp/test.gz > /tmp/out.txt
-          done
-          END=$(date +%s.%N)
-          GZIPPY_TIME=$(echo "($END - $START) / 5" | bc -l)
+          read GZIPPY_TIME GZIPPY_TRIALS <<< $(benchmark_tool "./target/release/gzippy -d < /tmp/test.gz > /tmp/out.txt")
           GZIPPY_SPEED=$(echo "$SIZE / $GZIPPY_TIME / 1000000" | bc -l)
           
-          # Test pigz (unpigz)
-          ./pigz/unpigz -c /tmp/test.gz > /tmp/out2.txt  # warmup
-          START=$(date +%s.%N)
-          for i in 1 2 3 4 5; do
-            ./pigz/unpigz -c /tmp/test.gz > /tmp/out.txt
-          done
-          END=$(date +%s.%N)
-          PIGZ_TIME=$(echo "($END - $START) / 5" | bc -l)
+          # Test pigz
+          read PIGZ_TIME PIGZ_TRIALS <<< $(benchmark_tool "./pigz/unpigz -c /tmp/test.gz > /tmp/out.txt")
           PIGZ_SPEED=$(echo "$SIZE / $PIGZ_TIME / 1000000" | bc -l)
           
           # Verify correctness
+          ./target/release/gzippy -d < /tmp/test.gz > /tmp/out.txt
           diff /tmp/test.txt /tmp/out.txt
           
           RATIO=$(echo "$GZIPPY_SPEED / $PIGZ_SPEED" | bc -l)
           
-          echo "| Tool | Speed (MB/s) |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|-------------|" >> $GITHUB_STEP_SUMMARY
-          printf "| gzippy | %.0f |\n" "$GZIPPY_SPEED" >> $GITHUB_STEP_SUMMARY
-          printf "| pigz | %.0f |\n" "$PIGZ_SPEED" >> $GITHUB_STEP_SUMMARY
+          echo "| Tool | Speed (MB/s) | Trials |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+          printf "| gzippy | %.0f | %d |\n" "$GZIPPY_SPEED" "$GZIPPY_TRIALS" >> $GITHUB_STEP_SUMMARY
+          printf "| pigz | %.0f | %d |\n" "$PIGZ_SPEED" "$PIGZ_TRIALS" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           printf "**Ratio**: gzippy is %.2fx of pigz\n" "$RATIO" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Must be faster than pigz (>= 0.95 allows for CI noise)
-          if awk "BEGIN {exit !($RATIO >= 0.95)}"; then
-            echo "✅ **PASS**: gzippy BGZF decompression is competitive" >> $GITHUB_STEP_SUMMARY
+          # Must be faster than pigz (ratio > 1.0 required)
+          if awk "BEGIN {exit !($RATIO >= 1.0)}"; then
+            echo "✅ **PASS**: gzippy is faster than pigz on BGZF" >> $GITHUB_STEP_SUMMARY
           else
             echo "❌ **FAIL**: gzippy slower than pigz on BGZF (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
+            echo "   We must always beat pigz. This is a regression." >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
@@ -139,6 +175,11 @@ jobs:
           echo "## Multi-member: gzippy vs pigz" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
+          # Adaptive benchmarking parameters
+          MIN_TRIALS=10
+          MAX_TRIALS=30
+          TARGET_CV=0.05
+          
           # Create test data
           python3 -c "
           import random
@@ -152,44 +193,71 @@ jobs:
           ./pigz/pigz -p4 -c /tmp/test.txt > /tmp/test-pigz.gz
           SIZE=$(stat -c%s /tmp/test.txt)
           
+          # Adaptive benchmark function
+          benchmark_tool() {
+            local cmd="$1"
+            local times=""
+            local trial=0
+            
+            eval "$cmd" > /dev/null 2>&1  # warmup
+            
+            while [ $trial -lt $MAX_TRIALS ]; do
+              trial=$((trial + 1))
+              START=$(date +%s.%N)
+              eval "$cmd" > /dev/null
+              END=$(date +%s.%N)
+              t=$(echo "$END - $START" | bc -l)
+              times="$times $t"
+              
+              if [ $trial -ge $MIN_TRIALS ]; then
+                cv=$(echo "$times" | python3 -c "
+          import sys, statistics
+          times = [float(x) for x in sys.stdin.read().split() if x]
+          mean = statistics.mean(times)
+          stdev = statistics.stdev(times) if len(times) > 1 else 0
+          print(f'{stdev/mean:.4f}' if mean > 0 else '1')
+          ")
+                if python3 -c "exit(0 if $cv < $TARGET_CV else 1)"; then
+                  break
+                fi
+              fi
+            done
+            
+            echo "$times" | python3 -c "
+          import sys, statistics
+          times = [float(x) for x in sys.stdin.read().split() if x]
+          mean = statistics.mean(times)
+          print(f'{mean:.6f} {len(times)}')"
+          }
+          
           # Test gzippy
-          ./target/release/gzippy -d < /tmp/test-pigz.gz > /tmp/out1.txt  # warmup
-          START=$(date +%s.%N)
-          for i in 1 2 3 4 5; do
-            ./target/release/gzippy -d < /tmp/test-pigz.gz > /tmp/out.txt
-          done
-          END=$(date +%s.%N)
-          GZIPPY_TIME=$(echo "($END - $START) / 5" | bc -l)
+          read GZIPPY_TIME GZIPPY_TRIALS <<< $(benchmark_tool "./target/release/gzippy -d < /tmp/test-pigz.gz > /tmp/out.txt")
           GZIPPY_SPEED=$(echo "$SIZE / $GZIPPY_TIME / 1000000" | bc -l)
           
-          # Test pigz (unpigz)
-          ./pigz/unpigz -c /tmp/test-pigz.gz > /tmp/out2.txt  # warmup
-          START=$(date +%s.%N)
-          for i in 1 2 3 4 5; do
-            ./pigz/unpigz -c /tmp/test-pigz.gz > /tmp/out.txt
-          done
-          END=$(date +%s.%N)
-          PIGZ_TIME=$(echo "($END - $START) / 5" | bc -l)
+          # Test pigz
+          read PIGZ_TIME PIGZ_TRIALS <<< $(benchmark_tool "./pigz/unpigz -c /tmp/test-pigz.gz > /tmp/out.txt")
           PIGZ_SPEED=$(echo "$SIZE / $PIGZ_TIME / 1000000" | bc -l)
           
           # Verify correctness
+          ./target/release/gzippy -d < /tmp/test-pigz.gz > /tmp/out.txt
           diff /tmp/test.txt /tmp/out.txt
           
           RATIO=$(echo "$GZIPPY_SPEED / $PIGZ_SPEED" | bc -l)
           
-          echo "| Tool | Speed (MB/s) |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|-------------|" >> $GITHUB_STEP_SUMMARY
-          printf "| gzippy | %.0f |\n" "$GZIPPY_SPEED" >> $GITHUB_STEP_SUMMARY
-          printf "| pigz | %.0f |\n" "$PIGZ_SPEED" >> $GITHUB_STEP_SUMMARY
+          echo "| Tool | Speed (MB/s) | Trials |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+          printf "| gzippy | %.0f | %d |\n" "$GZIPPY_SPEED" "$GZIPPY_TRIALS" >> $GITHUB_STEP_SUMMARY
+          printf "| pigz | %.0f | %d |\n" "$PIGZ_SPEED" "$PIGZ_TRIALS" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           printf "**Ratio**: gzippy is %.2fx of pigz\n" "$RATIO" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Must be faster than pigz (>= 0.95 allows for CI noise)
-          if awk "BEGIN {exit !($RATIO >= 0.95)}"; then
-            echo "✅ **PASS**: gzippy multi-member decompression is competitive" >> $GITHUB_STEP_SUMMARY
+          # Must be faster than pigz (ratio > 1.0 required)
+          if awk "BEGIN {exit !($RATIO >= 1.0)}"; then
+            echo "✅ **PASS**: gzippy is faster than pigz on multi-member" >> $GITHUB_STEP_SUMMARY
           else
             echo "❌ **FAIL**: gzippy slower than pigz on multi-member (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
+            echo "   We must always beat pigz. This is a regression." >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
@@ -210,6 +278,11 @@ jobs:
           echo "## Single-member: gzippy vs gzip" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
+          # Adaptive benchmarking parameters
+          MIN_TRIALS=10
+          MAX_TRIALS=30
+          TARGET_CV=0.05
+          
           # Create test data
           python3 -c "
           import random
@@ -225,45 +298,71 @@ jobs:
           
           cargo build --release
           
+          # Adaptive benchmark function
+          benchmark_tool() {
+            local cmd="$1"
+            local times=""
+            local trial=0
+            
+            eval "$cmd" > /dev/null 2>&1  # warmup
+            
+            while [ $trial -lt $MAX_TRIALS ]; do
+              trial=$((trial + 1))
+              START=$(date +%s.%N)
+              eval "$cmd" > /dev/null
+              END=$(date +%s.%N)
+              t=$(echo "$END - $START" | bc -l)
+              times="$times $t"
+              
+              if [ $trial -ge $MIN_TRIALS ]; then
+                cv=$(echo "$times" | python3 -c "
+          import sys, statistics
+          times = [float(x) for x in sys.stdin.read().split() if x]
+          mean = statistics.mean(times)
+          stdev = statistics.stdev(times) if len(times) > 1 else 0
+          print(f'{stdev/mean:.4f}' if mean > 0 else '1')
+          ")
+                if python3 -c "exit(0 if $cv < $TARGET_CV else 1)"; then
+                  break
+                fi
+              fi
+            done
+            
+            echo "$times" | python3 -c "
+          import sys, statistics
+          times = [float(x) for x in sys.stdin.read().split() if x]
+          mean = statistics.mean(times)
+          print(f'{mean:.6f} {len(times)}')"
+          }
+          
           # Test gzippy
-          ./target/release/gzippy -d < /tmp/test-gzip.gz > /tmp/out1.txt  # warmup
-          START=$(date +%s.%N)
-          for i in 1 2 3 4 5; do
-            ./target/release/gzippy -d < /tmp/test-gzip.gz > /tmp/out.txt
-          done
-          END=$(date +%s.%N)
-          GZIPPY_TIME=$(echo "($END - $START) / 5" | bc -l)
+          read GZIPPY_TIME GZIPPY_TRIALS <<< $(benchmark_tool "./target/release/gzippy -d < /tmp/test-gzip.gz > /tmp/out.txt")
           GZIPPY_SPEED=$(echo "$SIZE / $GZIPPY_TIME / 1000000" | bc -l)
           
           # Test gzip
-          gzip -d < /tmp/test-gzip.gz > /tmp/out2.txt  # warmup
-          gzip -c /tmp/test.txt > /tmp/test-gzip.gz  # recreate since gzip consumed it
-          START=$(date +%s.%N)
-          for i in 1 2 3 4 5; do
-            gzip -d -c /tmp/test-gzip.gz > /tmp/out.txt
-          done
-          END=$(date +%s.%N)
-          GZIP_TIME=$(echo "($END - $START) / 5" | bc -l)
+          read GZIP_TIME GZIP_TRIALS <<< $(benchmark_tool "gzip -d -c /tmp/test-gzip.gz > /tmp/out.txt")
           GZIP_SPEED=$(echo "$SIZE / $GZIP_TIME / 1000000" | bc -l)
           
           # Verify correctness
+          ./target/release/gzippy -d < /tmp/test-gzip.gz > /tmp/out.txt
           diff /tmp/test.txt /tmp/out.txt
           
           RATIO=$(echo "$GZIPPY_SPEED / $GZIP_SPEED" | bc -l)
           
-          echo "| Tool | Speed (MB/s) |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|-------------|" >> $GITHUB_STEP_SUMMARY
-          printf "| gzippy | %.0f |\n" "$GZIPPY_SPEED" >> $GITHUB_STEP_SUMMARY
-          printf "| gzip | %.0f |\n" "$GZIP_SPEED" >> $GITHUB_STEP_SUMMARY
+          echo "| Tool | Speed (MB/s) | Trials |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+          printf "| gzippy | %.0f | %d |\n" "$GZIPPY_SPEED" "$GZIPPY_TRIALS" >> $GITHUB_STEP_SUMMARY
+          printf "| gzip | %.0f | %d |\n" "$GZIP_SPEED" "$GZIP_TRIALS" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           printf "**Ratio**: gzippy is %.2fx of gzip\n" "$RATIO" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Must be faster than gzip (>= 1.0, no slack needed - gzip is slow)
+          # Must be faster than gzip (ratio > 1.0 required)
           if awk "BEGIN {exit !($RATIO >= 1.0)}"; then
             echo "✅ **PASS**: gzippy is faster than gzip" >> $GITHUB_STEP_SUMMARY
           else
             echo "❌ **FAIL**: gzippy slower than gzip (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
+            echo "   We must always beat gzip. This is a regression." >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
@@ -271,7 +370,7 @@ jobs:
   # Guard: Must beat rapidgzip on multi-member files
   # ============================================================================
   vs-rapidgzip:
-    name: Guard: Faster than rapidgzip
+    name: Guard: Within 1% of rapidgzip (multi-member)
     runs-on: ubuntu-latest
     
     steps:
@@ -300,8 +399,13 @@ jobs:
 
       - name: Compare gzippy vs rapidgzip
         run: |
-          echo "## gzippy vs rapidgzip Comparison" >> $GITHUB_STEP_SUMMARY
+          echo "## gzippy vs rapidgzip (Multi-member)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Adaptive benchmarking parameters
+          MIN_TRIALS=10
+          MAX_TRIALS=30
+          TARGET_CV=0.05
           
           # Create test data
           python3 -c "
@@ -317,48 +421,69 @@ jobs:
           SIZE=$(stat -c%s /tmp/test.txt)
           CORES=$(nproc)
           
+          # Adaptive benchmark function
+          benchmark_tool() {
+            local cmd="$1"
+            local times=""
+            local trial=0
+            
+            eval "$cmd" > /dev/null 2>&1  # warmup
+            
+            while [ $trial -lt $MAX_TRIALS ]; do
+              trial=$((trial + 1))
+              START=$(date +%s.%N)
+              eval "$cmd" > /dev/null 2>&1
+              END=$(date +%s.%N)
+              t=$(echo "$END - $START" | bc -l)
+              times="$times $t"
+              
+              if [ $trial -ge $MIN_TRIALS ]; then
+                cv=$(echo "$times" | python3 -c "
+          import sys, statistics
+          times = [float(x) for x in sys.stdin.read().split() if x]
+          mean = statistics.mean(times)
+          stdev = statistics.stdev(times) if len(times) > 1 else 0
+          print(f'{stdev/mean:.4f}' if mean > 0 else '1')
+          ")
+                if python3 -c "exit(0 if $cv < $TARGET_CV else 1)"; then
+                  break
+                fi
+              fi
+            done
+            
+            echo "$times" | python3 -c "
+          import sys, statistics
+          times = [float(x) for x in sys.stdin.read().split() if x]
+          mean = statistics.mean(times)
+          print(f'{mean:.6f} {len(times)}')"
+          }
+          
           # Test gzippy
-          ./target/release/gzippy -d < /tmp/test-pigz.gz > /tmp/out1.txt  # warmup
-          START=$(date +%s.%N)
-          for i in 1 2 3 4 5; do
-            ./target/release/gzippy -d < /tmp/test-pigz.gz > /tmp/out.txt
-          done
-          END=$(date +%s.%N)
-          GZIPPY_TIME=$(echo "($END - $START) / 5" | bc -l)
+          read GZIPPY_TIME GZIPPY_TRIALS <<< $(benchmark_tool "./target/release/gzippy -d < /tmp/test-pigz.gz > /tmp/out.txt")
           GZIPPY_SPEED=$(echo "$SIZE / $GZIPPY_TIME / 1000000" | bc -l)
           
           # Test rapidgzip (if available)
           RAPIDGZIP_BIN="rapidgzip/librapidarchive/build/tools/rapidgzip"
           if [ -x "$RAPIDGZIP_BIN" ]; then
-            $RAPIDGZIP_BIN -d -P $CORES < /tmp/test-pigz.gz > /tmp/out2.txt 2>/dev/null  # warmup
-            START=$(date +%s.%N)
-            for i in 1 2 3 4 5; do
-              $RAPIDGZIP_BIN -d -P $CORES < /tmp/test-pigz.gz > /tmp/out.txt 2>/dev/null
-            done
-            END=$(date +%s.%N)
-            RAPIDGZIP_TIME=$(echo "($END - $START) / 5" | bc -l)
+            read RAPIDGZIP_TIME RAPIDGZIP_TRIALS <<< $(benchmark_tool "$RAPIDGZIP_BIN -d -P $CORES < /tmp/test-pigz.gz > /tmp/out.txt")
             RAPIDGZIP_SPEED=$(echo "$SIZE / $RAPIDGZIP_TIME / 1000000" | bc -l)
             
             RATIO=$(echo "$GZIPPY_SPEED / $RAPIDGZIP_SPEED" | bc -l)
             
-            echo "| Tool | Speed (MB/s) |" >> $GITHUB_STEP_SUMMARY
-            echo "|------|-------------|" >> $GITHUB_STEP_SUMMARY
-            printf "| gzippy | %.0f |\n" "$GZIPPY_SPEED" >> $GITHUB_STEP_SUMMARY
-            printf "| rapidgzip | %.0f |\n" "$RAPIDGZIP_SPEED" >> $GITHUB_STEP_SUMMARY
+            echo "| Tool | Speed (MB/s) | Trials |" >> $GITHUB_STEP_SUMMARY
+            echo "|------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+            printf "| gzippy | %.0f | %d |\n" "$GZIPPY_SPEED" "$GZIPPY_TRIALS" >> $GITHUB_STEP_SUMMARY
+            printf "| rapidgzip | %.0f | %d |\n" "$RAPIDGZIP_SPEED" "$RAPIDGZIP_TRIALS" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             printf "**Ratio**: gzippy is %.2fx of rapidgzip\n" "$RATIO" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             
-            # Must be faster than rapidgzip (ratio >= 0.95 allows for CI noise)
-            if awk "BEGIN {exit !($RATIO >= 0.95)}"; then
-              if awk "BEGIN {exit !($RATIO >= 1.0)}"; then
-                echo "✅ **PASS**: gzippy is **faster** than rapidgzip (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
-              else
-                echo "✅ **PASS**: gzippy matches rapidgzip (within CI noise)" >> $GITHUB_STEP_SUMMARY
-              fi
+            # Must be within ±1% of rapidgzip (0.99-1.01)
+            if awk "BEGIN {exit !($RATIO >= 0.99)}"; then
+              echo "✅ **PASS**: gzippy matches rapidgzip (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
             else
-              echo "❌ **FAIL**: gzippy is slower than rapidgzip (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
-              echo "   We must be faster. This is a regression." >> $GITHUB_STEP_SUMMARY
+              echo "❌ **FAIL**: gzippy is >1% slower than rapidgzip (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
+              echo "   Expected: within ±1% of rapidgzip speed" >> $GITHUB_STEP_SUMMARY
               exit 1
             fi
           else
@@ -370,7 +495,7 @@ jobs:
   # Guard: Must beat rapidgzip on single-member (gzip) files too
   # ============================================================================
   vs-rapidgzip-single:
-    name: Guard: Faster than rapidgzip (single-member)
+    name: Guard: Within 1% of rapidgzip (single-member)
     runs-on: ubuntu-latest
     
     steps:
@@ -401,6 +526,11 @@ jobs:
           echo "## gzippy vs rapidgzip (Single-member)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
+          # Adaptive benchmarking parameters
+          MIN_TRIALS=10
+          MAX_TRIALS=30
+          TARGET_CV=0.05
+          
           # Create test data
           python3 -c "
           import random
@@ -415,43 +545,69 @@ jobs:
           SIZE=$(stat -c%s /tmp/test.txt)
           CORES=$(nproc)
           
+          # Adaptive benchmark function
+          benchmark_tool() {
+            local cmd="$1"
+            local times=""
+            local trial=0
+            
+            eval "$cmd" > /dev/null 2>&1  # warmup
+            
+            while [ $trial -lt $MAX_TRIALS ]; do
+              trial=$((trial + 1))
+              START=$(date +%s.%N)
+              eval "$cmd" > /dev/null 2>&1
+              END=$(date +%s.%N)
+              t=$(echo "$END - $START" | bc -l)
+              times="$times $t"
+              
+              if [ $trial -ge $MIN_TRIALS ]; then
+                cv=$(echo "$times" | python3 -c "
+          import sys, statistics
+          times = [float(x) for x in sys.stdin.read().split() if x]
+          mean = statistics.mean(times)
+          stdev = statistics.stdev(times) if len(times) > 1 else 0
+          print(f'{stdev/mean:.4f}' if mean > 0 else '1')
+          ")
+                if python3 -c "exit(0 if $cv < $TARGET_CV else 1)"; then
+                  break
+                fi
+              fi
+            done
+            
+            echo "$times" | python3 -c "
+          import sys, statistics
+          times = [float(x) for x in sys.stdin.read().split() if x]
+          mean = statistics.mean(times)
+          print(f'{mean:.6f} {len(times)}')"
+          }
+          
           # Test gzippy
-          ./target/release/gzippy -d < /tmp/test-gzip.gz > /tmp/out1.txt  # warmup
-          START=$(date +%s.%N)
-          for i in 1 2 3 4 5; do
-            ./target/release/gzippy -d < /tmp/test-gzip.gz > /tmp/out.txt
-          done
-          END=$(date +%s.%N)
-          GZIPPY_TIME=$(echo "($END - $START) / 5" | bc -l)
+          read GZIPPY_TIME GZIPPY_TRIALS <<< $(benchmark_tool "./target/release/gzippy -d < /tmp/test-gzip.gz > /tmp/out.txt")
           GZIPPY_SPEED=$(echo "$SIZE / $GZIPPY_TIME / 1000000" | bc -l)
           
           # Test rapidgzip (if available)
           RAPIDGZIP_BIN="rapidgzip/librapidarchive/build/tools/rapidgzip"
           if [ -x "$RAPIDGZIP_BIN" ]; then
-            $RAPIDGZIP_BIN -d -P $CORES < /tmp/test-gzip.gz > /tmp/out2.txt 2>/dev/null  # warmup
-            START=$(date +%s.%N)
-            for i in 1 2 3 4 5; do
-              $RAPIDGZIP_BIN -d -P $CORES < /tmp/test-gzip.gz > /tmp/out.txt 2>/dev/null
-            done
-            END=$(date +%s.%N)
-            RAPIDGZIP_TIME=$(echo "($END - $START) / 5" | bc -l)
+            read RAPIDGZIP_TIME RAPIDGZIP_TRIALS <<< $(benchmark_tool "$RAPIDGZIP_BIN -d -P $CORES < /tmp/test-gzip.gz > /tmp/out.txt")
             RAPIDGZIP_SPEED=$(echo "$SIZE / $RAPIDGZIP_TIME / 1000000" | bc -l)
             
             RATIO=$(echo "$GZIPPY_SPEED / $RAPIDGZIP_SPEED" | bc -l)
             
-            echo "| Tool | Speed (MB/s) |" >> $GITHUB_STEP_SUMMARY
-            echo "|------|-------------|" >> $GITHUB_STEP_SUMMARY
-            printf "| gzippy | %.0f |\n" "$GZIPPY_SPEED" >> $GITHUB_STEP_SUMMARY
-            printf "| rapidgzip | %.0f |\n" "$RAPIDGZIP_SPEED" >> $GITHUB_STEP_SUMMARY
+            echo "| Tool | Speed (MB/s) | Trials |" >> $GITHUB_STEP_SUMMARY
+            echo "|------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+            printf "| gzippy | %.0f | %d |\n" "$GZIPPY_SPEED" "$GZIPPY_TRIALS" >> $GITHUB_STEP_SUMMARY
+            printf "| rapidgzip | %.0f | %d |\n" "$RAPIDGZIP_SPEED" "$RAPIDGZIP_TRIALS" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             printf "**Ratio**: gzippy is %.2fx of rapidgzip\n" "$RATIO" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             
-            # Must be faster than rapidgzip (ratio >= 0.95 allows for CI noise)
-            if awk "BEGIN {exit !($RATIO >= 0.95)}"; then
-              echo "✅ **PASS**: gzippy competitive on single-member files" >> $GITHUB_STEP_SUMMARY
+            # Must be within ±1% of rapidgzip (0.99-1.01)
+            if awk "BEGIN {exit !($RATIO >= 0.99)}"; then
+              echo "✅ **PASS**: gzippy matches rapidgzip on single-member (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
             else
-              echo "❌ **FAIL**: gzippy slower than rapidgzip on single-member (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
+              echo "❌ **FAIL**: gzippy is >1% slower than rapidgzip (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
+              echo "   Expected: within ±1% of rapidgzip speed" >> $GITHUB_STEP_SUMMARY
               exit 1
             fi
           else
@@ -494,6 +650,11 @@ jobs:
           echo "## gzippy vs igzip (Single-threaded)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
+          # Adaptive benchmarking parameters
+          MIN_TRIALS=10
+          MAX_TRIALS=30
+          TARGET_CV=0.05
+          
           # Create test data
           python3 -c "
           import random
@@ -507,43 +668,68 @@ jobs:
           gzip -c /tmp/test.txt > /tmp/test.gz
           SIZE=$(stat -c%s /tmp/test.txt)
           
+          # Adaptive benchmark function
+          benchmark_tool() {
+            local cmd="$1"
+            local times=""
+            local trial=0
+            
+            eval "$cmd" > /dev/null 2>&1  # warmup
+            
+            while [ $trial -lt $MAX_TRIALS ]; do
+              trial=$((trial + 1))
+              START=$(date +%s.%N)
+              eval "$cmd" > /dev/null 2>&1
+              END=$(date +%s.%N)
+              t=$(echo "$END - $START" | bc -l)
+              times="$times $t"
+              
+              if [ $trial -ge $MIN_TRIALS ]; then
+                cv=$(echo "$times" | python3 -c "
+          import sys, statistics
+          times = [float(x) for x in sys.stdin.read().split() if x]
+          mean = statistics.mean(times)
+          stdev = statistics.stdev(times) if len(times) > 1 else 0
+          print(f'{stdev/mean:.4f}' if mean > 0 else '1')
+          ")
+                if python3 -c "exit(0 if $cv < $TARGET_CV else 1)"; then
+                  break
+                fi
+              fi
+            done
+            
+            echo "$times" | python3 -c "
+          import sys, statistics
+          times = [float(x) for x in sys.stdin.read().split() if x]
+          mean = statistics.mean(times)
+          print(f'{mean:.6f} {len(times)}')"
+          }
+          
           # Test gzippy (single-threaded)
-          ./target/release/gzippy -d -p1 < /tmp/test.gz > /tmp/out1.txt  # warmup
-          START=$(date +%s.%N)
-          for i in 1 2 3 4 5; do
-            ./target/release/gzippy -d -p1 < /tmp/test.gz > /tmp/out.txt
-          done
-          END=$(date +%s.%N)
-          GZIPPY_TIME=$(echo "($END - $START) / 5" | bc -l)
+          read GZIPPY_TIME GZIPPY_TRIALS <<< $(benchmark_tool "./target/release/gzippy -d -p1 < /tmp/test.gz > /tmp/out.txt")
           GZIPPY_SPEED=$(echo "$SIZE / $GZIPPY_TIME / 1000000" | bc -l)
           
           # Test igzip (if available)
           IGZIP_BIN="isa-l/build/bin/igzip"
           if [ -x "$IGZIP_BIN" ]; then
-            $IGZIP_BIN -d < /tmp/test.gz > /tmp/out2.txt 2>/dev/null  # warmup
-            START=$(date +%s.%N)
-            for i in 1 2 3 4 5; do
-              $IGZIP_BIN -d < /tmp/test.gz > /tmp/out.txt 2>/dev/null
-            done
-            END=$(date +%s.%N)
-            IGZIP_TIME=$(echo "($END - $START) / 5" | bc -l)
+            read IGZIP_TIME IGZIP_TRIALS <<< $(benchmark_tool "$IGZIP_BIN -d < /tmp/test.gz > /tmp/out.txt")
             IGZIP_SPEED=$(echo "$SIZE / $IGZIP_TIME / 1000000" | bc -l)
             
             RATIO=$(echo "$GZIPPY_SPEED / $IGZIP_SPEED" | bc -l)
             
-            echo "| Tool | Speed (MB/s) |" >> $GITHUB_STEP_SUMMARY
-            echo "|------|-------------|" >> $GITHUB_STEP_SUMMARY
-            printf "| gzippy (1 thread) | %.0f |\n" "$GZIPPY_SPEED" >> $GITHUB_STEP_SUMMARY
-            printf "| igzip | %.0f |\n" "$IGZIP_SPEED" >> $GITHUB_STEP_SUMMARY
+            echo "| Tool | Speed (MB/s) | Trials |" >> $GITHUB_STEP_SUMMARY
+            echo "|------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+            printf "| gzippy (1 thread) | %.0f | %d |\n" "$GZIPPY_SPEED" "$GZIPPY_TRIALS" >> $GITHUB_STEP_SUMMARY
+            printf "| igzip | %.0f | %d |\n" "$IGZIP_SPEED" "$IGZIP_TRIALS" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             printf "**Ratio**: gzippy is %.2fx of igzip\n" "$RATIO" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             
             # Must be at least 90% of igzip speed (igzip is hand-tuned assembly)
             if awk "BEGIN {exit !($RATIO >= 0.90)}"; then
-              echo "✅ **PASS**: gzippy competitive with igzip" >> $GITHUB_STEP_SUMMARY
+              echo "✅ **PASS**: gzippy competitive with igzip (≥90%)" >> $GITHUB_STEP_SUMMARY
             else
-              echo "❌ **FAIL**: gzippy too slow vs igzip (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
+              echo "❌ **FAIL**: gzippy too slow vs igzip (${RATIO}x, need ≥0.90)" >> $GITHUB_STEP_SUMMARY
               exit 1
             fi
           else
@@ -569,12 +755,12 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Guard | Threshold | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-----------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| BGZF vs pigz | Must be faster | ${{ needs.bgzf-parallel.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Multi-member vs pigz | Must be faster | ${{ needs.multi-member-parallel.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Single-member vs gzip | Must be faster | ${{ needs.single-member-gzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| vs rapidgzip (multi) | Must be faster | ${{ needs.vs-rapidgzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| vs rapidgzip (single) | Must be faster | ${{ needs.vs-rapidgzip-single.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| vs igzip | >= 90% speed | ${{ needs.vs-igzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| BGZF vs pigz | Must be faster (>1.0x) | ${{ needs.bgzf-parallel.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Multi-member vs pigz | Must be faster (>1.0x) | ${{ needs.multi-member-parallel.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Single-member vs gzip | Must be faster (>1.0x) | ${{ needs.single-member-gzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| vs rapidgzip (multi) | Within ±1% (0.99x) | ${{ needs.vs-rapidgzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| vs rapidgzip (single) | Within ±1% (0.99x) | ${{ needs.vs-rapidgzip-single.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| vs igzip | >= 90% speed (0.90x) | ${{ needs.vs-igzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
