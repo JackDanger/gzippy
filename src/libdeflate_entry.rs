@@ -429,6 +429,12 @@ impl LitLenTable {
         unsafe { *self.entries.get_unchecked(idx) }
     }
 
+    /// Get raw pointer to entries for even faster access
+    #[inline(always)]
+    pub fn entries_ptr(&self) -> *const LitLenEntry {
+        self.entries.as_ptr()
+    }
+
     /// Look up a subtable entry (unsafe unchecked for max speed)
     #[inline(always)]
     pub fn lookup_subtable(&self, entry: LitLenEntry, bits: u64) -> LitLenEntry {
