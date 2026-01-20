@@ -2515,8 +2515,31 @@ fn copy_match_into(output: &mut [u8], out_pos: usize, distance: usize, length: u
             for i in 0..remaining {
                 *d.add(i) = *s.add(i);
             }
+        } else if length >= 16 {
+            // Small distance (2-7): word-at-a-time with offset stride (like libdeflate)
+            // Key: copy 8 bytes but advance by distance, allowing overlapping writes
+            // to propagate the pattern
+            // Requires length >= 16 for safe unconditional writes
+            let mut d = dst;
+            let mut s = src;
+            let end = dst.add(length);
+
+            // Copy two 8-byte chunks unconditionally (covers up to 16 bytes)
+            (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
+            s = s.add(distance);
+            d = d.add(distance);
+            (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
+            s = s.add(distance);
+            d = d.add(distance);
+
+            // Continue until done
+            while d < end {
+                (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
+                s = s.add(distance);
+                d = d.add(distance);
+            }
         } else {
-            // Small distance (2-7): byte-by-byte
+            // Very short copy with small distance: byte-by-byte is fine
             for i in 0..length {
                 *dst.add(i) = *src.add(i % distance);
             }
@@ -4237,5 +4260,257 @@ mod optimization_tests {
             "Content mismatch at positions: {:?}",
             mismatches
         );
+    }
+
+    // =========================================================================
+    // Micro-benchmarks for each decode path with instrumentation
+    // =========================================================================
+
+    /// Benchmark pure literal decoding (no matches)
+    /// Creates data that compresses to mostly literals
+    #[test]
+    fn bench_pure_literals() {
+        // Random-ish data that doesn't compress well = mostly literals
+        let original: Vec<u8> = (0..50_000).map(|i| ((i * 17 + 31) % 256) as u8).collect();
+
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let header_size = crate::marker_decode::skip_gzip_header(&compressed).unwrap();
+        let deflate_data = &compressed[header_size..compressed.len() - 8];
+
+        // Warm up
+        let mut output = vec![0u8; original.len() + 1024];
+        for _ in 0..3 {
+            let _ = inflate_into_pub(deflate_data, &mut output);
+        }
+
+        // Measure
+        let iterations = 50;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = inflate_into_pub(deflate_data, &mut output);
+        }
+        let elapsed = start.elapsed();
+        let bytes_per_iter = original.len();
+        let total_bytes = bytes_per_iter * iterations;
+        let mb_per_sec = total_bytes as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+
+        eprintln!(
+            "\n[BENCH] Pure Literals: {} iterations, {} bytes each",
+            iterations, bytes_per_iter
+        );
+        eprintln!(
+            "[BENCH]   Time: {:.2}ms total, {:.1} MB/s",
+            elapsed.as_secs_f64() * 1000.0,
+            mb_per_sec
+        );
+        eprintln!(
+            "[BENCH]   Compression ratio: {:.2}x",
+            original.len() as f64 / deflate_data.len() as f64
+        );
+    }
+
+    /// Benchmark pure RLE (distance=1 matches)
+    /// Creates data with long runs of same byte
+    #[test]
+    fn bench_rle_matches() {
+        // Long runs of same byte = RLE (distance=1)
+        let mut original = Vec::with_capacity(50_000);
+        for i in 0..100 {
+            let byte = (i % 256) as u8;
+            for _ in 0..500 {
+                original.push(byte);
+            }
+        }
+
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let header_size = crate::marker_decode::skip_gzip_header(&compressed).unwrap();
+        let deflate_data = &compressed[header_size..compressed.len() - 8];
+
+        let mut output = vec![0u8; original.len() + 1024];
+        for _ in 0..3 {
+            let _ = inflate_into_pub(deflate_data, &mut output);
+        }
+
+        let iterations = 100;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = inflate_into_pub(deflate_data, &mut output);
+        }
+        let elapsed = start.elapsed();
+        let mb_per_sec = (original.len() * iterations) as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+
+        eprintln!("\n[BENCH] RLE Matches (d=1): {} iterations", iterations);
+        eprintln!(
+            "[BENCH]   Time: {:.2}ms total, {:.1} MB/s",
+            elapsed.as_secs_f64() * 1000.0,
+            mb_per_sec
+        );
+        eprintln!(
+            "[BENCH]   Compression ratio: {:.2}x",
+            original.len() as f64 / deflate_data.len() as f64
+        );
+    }
+
+    /// Benchmark short-distance matches (d=2-7)
+    /// Creates data with repeating 4-byte patterns
+    #[test]
+    fn bench_short_distance_matches() {
+        // Repeating 4-byte pattern = distance 4 matches
+        let pattern = [0xDE, 0xAD, 0xBE, 0xEF];
+        let original: Vec<u8> = pattern.iter().cycle().take(50_000).copied().collect();
+
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let header_size = crate::marker_decode::skip_gzip_header(&compressed).unwrap();
+        let deflate_data = &compressed[header_size..compressed.len() - 8];
+
+        let mut output = vec![0u8; original.len() + 1024];
+        for _ in 0..3 {
+            let _ = inflate_into_pub(deflate_data, &mut output);
+        }
+
+        let iterations = 100;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = inflate_into_pub(deflate_data, &mut output);
+        }
+        let elapsed = start.elapsed();
+        let mb_per_sec = (original.len() * iterations) as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+
+        eprintln!(
+            "\n[BENCH] Short Distance Matches (d=2-7): {} iterations",
+            iterations
+        );
+        eprintln!(
+            "[BENCH]   Time: {:.2}ms total, {:.1} MB/s",
+            elapsed.as_secs_f64() * 1000.0,
+            mb_per_sec
+        );
+        eprintln!(
+            "[BENCH]   Compression ratio: {:.2}x",
+            original.len() as f64 / deflate_data.len() as f64
+        );
+    }
+
+    /// Benchmark long-distance matches (d>=40)
+    /// Creates data with matches to earlier content
+    #[test]
+    fn bench_long_distance_matches() {
+        // Create content that will have long-distance matches
+        let mut original = Vec::with_capacity(50_000);
+        let base: Vec<u8> = (0..500).map(|i| (i * 7 % 256) as u8).collect();
+        for _ in 0..100 {
+            original.extend_from_slice(&base);
+        }
+
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let header_size = crate::marker_decode::skip_gzip_header(&compressed).unwrap();
+        let deflate_data = &compressed[header_size..compressed.len() - 8];
+
+        let mut output = vec![0u8; original.len() + 1024];
+        for _ in 0..3 {
+            let _ = inflate_into_pub(deflate_data, &mut output);
+        }
+
+        let iterations = 100;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = inflate_into_pub(deflate_data, &mut output);
+        }
+        let elapsed = start.elapsed();
+        let mb_per_sec = (original.len() * iterations) as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+
+        eprintln!(
+            "\n[BENCH] Long Distance Matches (d>=40): {} iterations",
+            iterations
+        );
+        eprintln!(
+            "[BENCH]   Time: {:.2}ms total, {:.1} MB/s",
+            elapsed.as_secs_f64() * 1000.0,
+            mb_per_sec
+        );
+        eprintln!(
+            "[BENCH]   Compression ratio: {:.2}x",
+            original.len() as f64 / deflate_data.len() as f64
+        );
+    }
+
+    /// Combined benchmark with detailed path counting
+    #[test]
+    fn bench_with_path_counts() {
+        let data = match std::fs::read("benchmark_data/silesia.tar.gz") {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("Skipping - no silesia.tar.gz");
+                return;
+            }
+        };
+
+        // Extract deflate data (skip gzip header)
+        let header_size = match crate::marker_decode::skip_gzip_header(&data) {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("Skipping - not a valid gzip file");
+                return;
+            }
+        };
+        let deflate_data = &data[header_size..data.len().saturating_sub(8)];
+
+        // Pre-allocate output (use ISIZE from trailer)
+        let isize = u32::from_le_bytes([
+            data[data.len() - 4],
+            data[data.len() - 3],
+            data[data.len() - 2],
+            data[data.len() - 1],
+        ]) as usize;
+        let mut output = vec![0u8; isize + 1024];
+
+        // Warm up
+        for _ in 0..2 {
+            let _ = inflate_into_pub(deflate_data, &mut output);
+        }
+
+        // Run with GZIPPY_TRACE to get path counts
+        eprintln!("\n[BENCH] Real-world data (silesia) with GZIPPY_TRACE=1:");
+        eprintln!("[BENCH]   Set GZIPPY_TRACE=1 to see detailed path counts");
+
+        let iterations = 3;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let size = inflate_into_pub(deflate_data, &mut output).unwrap();
+            assert!(size > 0);
+        }
+        let elapsed = start.elapsed();
+        let mb_per_sec = (isize * iterations) as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+
+        eprintln!("[BENCH]   Output size: {} bytes", isize);
+        eprintln!("[BENCH]   Speed: {:.1} MB/s", mb_per_sec);
     }
 }
