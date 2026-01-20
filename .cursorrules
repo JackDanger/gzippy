@@ -185,6 +185,22 @@ To skip (emergency only): `git commit --no-verify`
 1. **Never use `-C target-cpu=native`** - Causes SIGILL on heterogeneous CI runners
 2. **Use adaptive benchmarking** - Run until stdev < 5% of mean (min 5, max 30 trials)
 3. **All deps statically linked** - No ISA-L or other external libs to build
+4. **Always use `rm -rf build`** before cmake - Stale caches cause mysterious failures
+5. **Verify binary paths after cmake** - cmake output paths are NOT intuitive
+
+### Submodule Build Output Paths (Jan 2026)
+
+**CRITICAL**: These paths are NOT where you'd expect them. Always verify with `find . -name <binary> -type f`.
+
+| Submodule | Build Command | Binary Path |
+|-----------|---------------|-------------|
+| rapidgzip | `cd rapidgzip/librapidarchive/build && cmake .. && make rapidgzip` | `build/src/tools/rapidgzip` (NOT `build/tools/rapidgzip`) |
+| igzip | `cd isa-l/build && cmake .. && make igzip` | `build/igzip` (NOT `build/bin/igzip`) |
+| libdeflate | `cd libdeflate/build && cmake .. && make` | `build/programs/libdeflate-gzip` |
+| pigz | `make -C pigz` | `pigz/pigz`, `pigz/unpigz` |
+| zopfli | `make -C zopfli zopfli` | `zopfli/zopfli` |
+
+Use `scripts/build-tools.sh` for consistent builds across local dev and CI.
 
 ### Workflow Design (4-stage pipeline)
 1. **Build** - Build all tools once, upload as artifacts
