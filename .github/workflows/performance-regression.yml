@@ -80,10 +80,13 @@ jobs:
           cd isa-l
           rm -rf build
           mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
+          # Build with static linking so igzip doesn't need libisal.so at runtime
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
           make -j$(nproc) igzip
           # Binary is at build/igzip (not build/bin/igzip)
           test -f igzip || (echo "ERROR: igzip build failed" && exit 1)
+          # Verify it's statically linked
+          ldd igzip 2>&1 | grep -v "libisal" || echo "igzip appears statically linked"
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4

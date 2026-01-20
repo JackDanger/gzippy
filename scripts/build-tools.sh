@@ -153,7 +153,8 @@ if $BUILD_IGZIP; then
     mkdir -p build
     cd build
     
-    cmake .. -DCMAKE_BUILD_TYPE=Release
+    # Build with static linking so igzip doesn't need libisal.so at runtime
+    cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
     make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" igzip || {
         log_warn "igzip build failed (may be expected on some platforms)"
         cd "$REPO_ROOT"

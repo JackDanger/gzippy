@@ -68,7 +68,8 @@ jobs:
           cd isa-l
           rm -rf build
           mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
+          # Build with static linking so igzip doesn't need libisal.so at runtime
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
           make -j$(nproc) igzip || true
           # Binary is at build/igzip (not build/bin/igzip)
           if [ -f igzip ]; then
