@@ -736,3 +736,72 @@ cargo run --release --features consume_first -- -d file.gz
 # Run without consume_first (100% compatible)
 cargo run --release -- -d file.gz
 ```
+
+## Performance Regression Prevention (Jan 2026)
+
+### Historical Performance on Silesia (211MB)
+
+| Version | Throughput | % of libdeflate | Notes |
+|---------|------------|-----------------|-------|
+| Early pure Rust | 520-687 MB/s | 50-51% | Original implementations |
+| consume_first | 600 MB/s | 44.8% | **REGRESSION** - slower than baseline |
+| libdeflate_decode.rs | **770 MB/s** | **55%** | **BEST** - current production path |
+
+### Key Lesson: consume_first Was a Regression
+
+The consume_first pattern showed 39.8% speedup in **isolated simulation benchmarks**, but when
+integrated into the full decode loop, it was **SLOWER** on real data (44.8% vs 55%). This is
+because:
+1. Simulation didn't account for subtable handling complexity
+2. The fall-through control flow from literal chain to length handling was fragile
+3. Extra branches for handling non-literals after the literal chain added overhead
+
+**Rule**: Always benchmark on silesia BEFORE and AFTER changes. Simulation benchmarks can be misleading.
+
+### Optimizations That Did NOT Help
+
+| Optimization | Expected | Actual | Reason |
+|--------------|----------|--------|--------|
+| 12-bit table (vs 11-bit) | +5-8% | 0% | L1 cache pressure offset subtable reduction |
+| consume_first on complex data | +40% | -20% | Control flow overhead in real integration |
+| Preload-before-write (first attempt) | +15% | Broke tests | saved_bitbuf state corruption |
+| Pre-computed match data | +10% | Reverted | Correctness issues with bit layout |
+
+### Optimizations That DID Help
+
+| Optimization | Gain | Notes |
+|--------------|------|-------|
+| Unsafe unchecked table lookups | +5% | `get_unchecked()` eliminates bounds checks |
+| Unsafe pointer writes | +3% | Direct memory writes for literals |
+| Unaligned 8-byte refill | +2% | Matches libdeflate's branchless refill |
+| Unsafe overlapping match copy | +5% | 8-byte chunk copies with pointer math |
+| Unrolled 4-literal decode | +10% | Fewer loop iterations |
+
+### CRITICAL RULES FOR OPTIMIZATION WORK
+
+1. **Benchmark BEFORE changing anything** - Record the baseline on silesia
+2. **Run all tests after EVERY change** - Don't batch multiple changes
+3. **Keep the best-performing path as default** - Never switch defaults without proof
+4. **Revert immediately if tests fail** - Don't try to fix forward on a broken path
+5. **Simulation != Reality** - Always validate with full silesia decode
+6. **L1 cache matters more than subtable frequency** - 11-bit tables are optimal
+7. **Control flow complexity kills performance** - Flat loops beat nested conditionals
+8. **saved_bitbuf must be captured at the RIGHT point** - Before consumption, not after
+
+### Current Best Path
+
+The **libdeflate_decode.rs** module achieves our best single-threaded performance:
+- 770 MB/s on silesia (55% of libdeflate's 1390 MB/s)
+- Uses: signed literal check, unsafe lookups, unrolled literals, unsafe match copy
+
+For parallel workloads, **bgzf.rs** achieves 3770 MB/s (8 threads), which is 2.7x faster than
+libdeflate single-threaded.
+
+### What Would Actually Close the Gap
+
+Based on libdeflate source analysis, the remaining 45% gap requires:
+1. **Restructured decode loop** - Match libdeflate's exact control flow (no fall-through)
+2. **Entry preloading** - Start next lookup before writing current literal
+3. **Inline assembly** - Hand-tuned x86_64 for the inner fastloop
+
+See `docs/CLOSING_THE_GAP.md` for the full plan.
