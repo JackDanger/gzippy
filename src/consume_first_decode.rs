@@ -426,8 +426,8 @@ fn decode_huffman_cf(
             bits.refill();
             entry = litlen.lookup(bits.peek());
 
-            // Use safe copy to avoid corrupting data that will be backreferenced later
-            out_pos = copy_match_safe(output, out_pos, distance, length);
+            // FAST copy in fastloop - we have FASTLOOP_MARGIN bytes of buffer margin
+            out_pos = copy_match_fast(output, out_pos, distance, length);
             continue; // NEVER fall through
         }
 
@@ -462,8 +462,8 @@ fn decode_huffman_cf(
         bits.refill();
         entry = litlen.lookup(bits.peek());
 
-        // Use safe copy - fast copy corrupts future backreference data
-        out_pos = copy_match_safe(output, out_pos, distance, length);
+        // FAST copy in fastloop - we have FASTLOOP_MARGIN bytes of buffer margin
+        out_pos = copy_match_fast(output, out_pos, distance, length);
     }
 
     // GENERIC LOOP (near end of output)
