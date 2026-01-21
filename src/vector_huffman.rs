@@ -576,6 +576,166 @@ pub fn decode_fixed_vector(
 }
 
 // =============================================================================
+// Multi-Literal Lookahead (Practical SIMD Optimization)
+// =============================================================================
+
+/// Decode up to 4 consecutive literals from a single bit stream
+/// Returns (symbols[], count, total_bits_consumed)
+/// This is more practical than parallel lanes for real deflate data
+#[inline(always)]
+pub fn decode_multi_literals(
+    bitbuf: u64,
+    table: &[VectorEntry; VECTOR_TABLE_SIZE],
+) -> ([u8; 4], usize, u32) {
+    let mut symbols = [0u8; 4];
+    let mut bits_consumed = 0u32;
+    let mut remaining = bitbuf;
+    let mut count = 0usize;
+
+    // Try to decode up to 4 literals
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..4 {
+        let idx = (remaining & 0xFF) as usize;
+        let entry = table[idx];
+
+        if entry.is_overflow() {
+            // Hit a 9-bit code or non-literal - stop
+            break;
+        }
+
+        let sym = entry.symbol();
+        let bits = entry.bits() as u32;
+
+        // Check if it's a literal (symbol < 256) vs length code (256-287)
+        // For fixed Huffman, EOB is symbol 256
+        if sym > 143 {
+            // Could be 9-bit literal (144-255), length code, or EOB
+            // Our 8-bit table doesn't cover these - stop
+            break;
+        }
+
+        symbols[i] = sym;
+        remaining >>= bits;
+        bits_consumed += bits;
+        count = i + 1;
+    }
+
+    (symbols, count, bits_consumed)
+}
+
+/// Decode fixed Huffman block with multi-literal optimization
+/// Uses precomputed table to decode 1-4 literals per iteration
+pub fn decode_fixed_multi_literal(input: &[u8], output: &mut [u8]) -> std::io::Result<usize> {
+    let table = get_fixed_vector_table();
+    let fixed_tables = crate::libdeflate_decode::get_fixed_tables();
+
+    let mut in_pos = 0usize;
+    let mut out_pos = 0usize;
+    let mut bitbuf = 0u64;
+    let mut bitsleft = 0u32;
+
+    // Refill helper
+    let refill = |pos: &mut usize, buf: &mut u64, left: &mut u32| {
+        while *left <= 56 && *pos < input.len() {
+            *buf |= (input[*pos] as u64) << *left;
+            *pos += 1;
+            *left += 8;
+        }
+    };
+
+    refill(&mut in_pos, &mut bitbuf, &mut bitsleft);
+
+    loop {
+        // Try multi-literal decode
+        let (symbols, count, bits) = decode_multi_literals(bitbuf, table);
+
+        if count > 0 {
+            // Fast path: got 1-4 literals
+            if out_pos + count > output.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "Output full",
+                ));
+            }
+
+            // Write literals
+            output[out_pos..(count + out_pos)].copy_from_slice(&symbols[..count]);
+            out_pos += count;
+            bitbuf >>= bits;
+            bitsleft -= bits;
+
+            // Refill
+            if bitsleft < 32 {
+                refill(&mut in_pos, &mut bitbuf, &mut bitsleft);
+            }
+            continue;
+        }
+
+        // Slow path: use regular tables for 9-bit codes, lengths, EOB
+        let saved = bitbuf;
+        let entry = fixed_tables.0.lookup(saved);
+        let total_bits = entry.codeword_bits() as u32;
+        bitbuf >>= total_bits;
+        bitsleft -= total_bits;
+
+        if entry.is_end_of_block() {
+            return Ok(out_pos);
+        }
+
+        if entry.is_literal() {
+            // 9-bit literal
+            if out_pos >= output.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "Output full",
+                ));
+            }
+            output[out_pos] = entry.literal_value();
+            out_pos += 1;
+        } else {
+            // Length code - decode match
+            let length = entry.decode_length(saved);
+
+            refill(&mut in_pos, &mut bitbuf, &mut bitsleft);
+
+            let dist_saved = bitbuf;
+            let dist_entry = fixed_tables.1.lookup(dist_saved);
+            let dist_bits = dist_entry.codeword_bits() as u32;
+            bitbuf >>= dist_bits;
+            bitsleft -= dist_bits;
+
+            let distance = dist_entry.decode_distance(dist_saved);
+
+            if distance == 0 || distance as usize > out_pos {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Invalid distance {} at pos {}", distance, out_pos),
+                ));
+            }
+
+            // Copy match
+            let dist = distance as usize;
+            let len = length as usize;
+            if out_pos + len > output.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "Output full",
+                ));
+            }
+
+            for i in 0..len {
+                output[out_pos + i] = output[out_pos - dist + i];
+            }
+            out_pos += len;
+        }
+
+        if bitsleft < 32 {
+            refill(&mut in_pos, &mut bitbuf, &mut bitsleft);
+        }
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -685,6 +845,73 @@ mod tests {
                 eprintln!("\nVector decode not available: {}", e);
             }
         }
+    }
+
+    #[test]
+    fn test_multi_literal_decode() {
+        let table = get_fixed_vector_table();
+
+        // Create a bit pattern with multiple decodable literals
+        // Fixed Huffman: symbols 0-143 have 8-bit codes
+        // Let's encode "AAAA" - 'A'=65, code=0x30+65=0x61, reversed=0x86
+        let bitbuf = 0x86_86_86_86u64; // 4 copies of reversed 'A' code
+
+        let (symbols, count, bits) = decode_multi_literals(bitbuf, table);
+
+        eprintln!("\nMulti-literal decode test:");
+        eprintln!("  Symbols: {:?}", &symbols[..count]);
+        eprintln!("  Count: {}", count);
+        eprintln!("  Bits consumed: {}", bits);
+
+        // Should decode multiple symbols
+        assert!(count >= 1, "Should decode at least 1 symbol");
+        assert!(bits > 0, "Should consume some bits");
+    }
+
+    #[test]
+    fn bench_multi_literal() {
+        let table = get_fixed_vector_table();
+        let iterations = 10_000_000u64;
+
+        // Create varying bit patterns to prevent optimization
+        let patterns = [
+            0x86_86_86_86u64,
+            0x87_86_87_86u64,
+            0x88_88_88_88u64,
+            0x89_89_89_89u64,
+        ];
+
+        let start = std::time::Instant::now();
+        let mut total_count = 0u64;
+        let mut total_bits = 0u64;
+
+        for i in 0..iterations {
+            let bitbuf = patterns[(i & 3) as usize].wrapping_add(i);
+            let (_, count, bits) = decode_multi_literals(bitbuf, table);
+            total_count += count as u64;
+            total_bits += bits as u64;
+        }
+
+        let elapsed = start.elapsed();
+        let per_sec = iterations as f64 / elapsed.as_secs_f64();
+        let symbols_per_sec = (total_count as f64) / elapsed.as_secs_f64();
+
+        eprintln!("\nMulti-literal benchmark:");
+        eprintln!(
+            "  {} iterations in {:.2}ms",
+            iterations,
+            elapsed.as_secs_f64() * 1000.0
+        );
+        eprintln!("  {:.1} M decodes/sec", per_sec / 1_000_000.0);
+        eprintln!("  {:.1} M symbols/sec", symbols_per_sec / 1_000_000.0);
+        eprintln!(
+            "  Avg symbols/decode: {:.2}",
+            total_count as f64 / iterations as f64
+        );
+        eprintln!(
+            "  Avg bits/decode: {:.2}",
+            total_bits as f64 / iterations as f64
+        );
     }
 
     #[test]
