@@ -6,8 +6,8 @@
 
 | Metric | Current | Target | Gap |
 |--------|---------|--------|-----|
-| Single-thread silesia | **1016 MB/s (71.8%)** | 1840+ MB/s (130%) | +81% needed |
-| libdeflate reference | 1415 MB/s (100%) | Beat it | - |
+| Single-thread silesia | **970 MB/s (69.7%)** | 1840+ MB/s (130%) | +90% needed |
+| libdeflate reference | 1390 MB/s (100%) | Beat it | - |
 | Parallel BGZF (8 threads) | ~3000 MB/s | 4000+ MB/s | +33% needed |
 
 ---
@@ -35,12 +35,12 @@
 
 ### High Impact (10%+ each) — Must Do
 
-| # | Optimization | Source | Expected | Effort |
+| # | Optimization | Source | Expected | Status |
 |---|--------------|--------|----------|--------|
-| 1 | **Double-literal cache in hot path** | rapidgzip | +15-25% | Medium |
-| 2 | **BMI2 `_bzhi_u64` intrinsic** | libdeflate | +5-10% | Easy |
-| 3 | **Multi-literal decode (3 at once)** | ISA-L | +10-15% | Medium |
-| 4 | **Inline assembly inner loop** | ISA-L | +10-20% | Hard |
+| 1 | **Double-literal cache** | rapidgzip | +15-25% | ⚠️ Only helps fixed blocks; silesia is dynamic |
+| 2 | **BMI2 `_bzhi_u64` intrinsic** | libdeflate | +5-10% | ⚠️ N/A on Apple Silicon |
+| 3 | **Multi-literal decode (3 at once)** | ISA-L | +10-15% | Pending |
+| 4 | **Inline assembly inner loop** | ISA-L | +10-20% | Pending |
 
 ### Medium Impact (5-10% each) — Should Do
 
@@ -63,17 +63,23 @@
 
 ## Implementation Order
 
-### Phase 1: Low-Hanging Fruit (Target: 80% → 1132 MB/s)
+### Phase 1: Architecture-Independent Optimizations
 
-1. **BMI2 intrinsics** — Add `#[target_feature(enable = "bmi2")]` and use `_bzhi_u64`
-2. **12-bit litlen table** — Reduce subtable lookups from ~5% to ~1%
-3. **Prefetch** — Add `prefetch_read` after each refill
+1. ~~**BMI2 intrinsics**~~ — N/A on Apple Silicon (ARM64), module ready for x86_64
+2. ~~**12-bit litlen table**~~ — Broke correctness, needs more investigation  
+3. **Prefetch** — Add `prefetch_read` after each refill (TODO)
 
-### Phase 2: Double-Literal Integration (Target: 95% → 1345 MB/s)
+### Phase 2: REVISITED - Novel Optimizations Needed
 
-4. **Integrate DoubleLitCache** — Use in fastloop for literal runs
-   - Already built in `src/double_literal.rs`
-   - Need to wire into `decode_huffman_cf`
+The "standard" optimizations from libdeflate either:
+- Aren't applicable (BMI2 on ARM)
+- Break correctness (12-bit table)  
+- Only help fixed blocks (DoubleLitCache)
+
+**New approach**: Focus on what we CAN do:
+- **Inline assembly for ARM64** (NEON, not BMI2)
+- **Restructure decode loop** to match libdeflate's control flow exactly
+- **Profile-guided optimization** to find actual bottlenecks
 
 ### Phase 3: Multi-Literal Decode (Target: 110% → 1556 MB/s)
 
