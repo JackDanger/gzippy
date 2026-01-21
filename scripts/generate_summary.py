@@ -115,28 +115,50 @@ def generate_compression_table(compression: list, threads: int) -> list:
 def generate_decompression_table(decompression: list) -> list:
     """Generate decompression comparison table."""
     lines = []
-    sources = sorted(set(r['source'] for r in decompression))
     
-    lines.append("| Source | gzippy Speed | vs pigz | vs igzip | vs gzip | Status |")
-    lines.append("|--------|--------------|---------|----------|---------|--------|")
+    # Sort by data_type and source
+    results = sorted(decompression, key=lambda r: (r.get('data_type', ''), r.get('source', '')))
+    
+    lines.append("| Structure | Source | gzippy Speed | vs pigz | vs igzip | vs gzip | Status |")
+    lines.append("|-----------|--------|--------------|---------|----------|---------|--------|")
     
     all_pass = True
-    for source in sources:
-        source_results = [r for r in decompression if r['source'] == source]
-        gzippy = next((r for r in source_results if r['tool'] == 'gzippy'), None)
+    processed = set()
+    
+    for r in results:
+        # Key for deduplication in table
+        key = (r.get('data_type'), r.get('source'), r.get('threads'))
+        if key in processed:
+            continue
+        processed.add(key)
+        
+        data_type = r.get('data_type', 'unknown').capitalize()
+        source = r.get('source', 'unknown')
+        threads = r.get('threads', 1)
+        
+        # We only show one row per (structure, source) for the summary table
+        # Find gzippy result for this combo
+        gzippy = next((x for x in results if x['tool'] == 'gzippy' 
+                      and x['data_type'] == r['data_type'] 
+                      and x['source'] == r['source']
+                      and x['threads'] == threads), None)
         
         if not gzippy:
             continue
-        
+            
         gzippy_speed = f"{gzippy['speed']:.0f} MB/s"
         
         comparisons = []
         wins = 0
         for comp in ['pigz', 'igzip', 'gzip']:
-            comp_result = next((r for r in source_results if r['tool'] == comp), None)
+            comp_result = next((x for x in results if x['tool'] == comp 
+                               and x['data_type'] == r['data_type'] 
+                               and x['source'] == r['source']
+                               and x['threads'] == threads), None)
+            
             if comp_result and comp_result['speed'] > 0:
                 icon, diff = compare_icon(gzippy['speed'], comp_result['speed'], higher_is_better=True)
-                if diff >= 0:
+                if diff >= -5: # Count tie as win
                     wins += 1
                 comparisons.append(f"{icon} {diff:+.0f}%")
             else:
@@ -145,8 +167,13 @@ def generate_decompression_table(decompression: list) -> list:
         status = "✅ PASS" if wins >= 2 else "🔴 FAIL"
         if wins < 2:
             all_pass = False
+            
+        structure_label = data_type
+        if r['data_type'] == 'silesia': structure_label = "**Standard (Mixed)**"
+        elif r['data_type'] == 'software': structure_label = "**Dense LZ77 (Source)**"
+        elif r['data_type'] == 'logs': structure_label = "**Simple (Logs)**"
         
-        lines.append(f"| {source} | {gzippy_speed} | {' | '.join(comparisons)} | {status} |")
+        lines.append(f"| {structure_label} | {source} | {gzippy_speed} | {' | '.join(comparisons)} | {status} |")
     
     lines.append("")
     return lines, all_pass

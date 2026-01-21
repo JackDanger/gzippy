@@ -313,7 +313,7 @@ def main():
     parser.add_argument("--size", type=int, required=True,
                        help="Size of test data in MB")
     parser.add_argument("--data-type", type=str, required=True,
-                       choices=["text", "tarball"],
+                       choices=["silesia", "software", "logs", "text", "tarball"],
                        help="Type of test data")
     parser.add_argument("--output", type=str, required=True,
                        help="Output JSON file")

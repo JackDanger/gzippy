@@ -89,7 +89,13 @@ def normalize_compression_result(data: dict, source_file: str) -> list:
     # Extract data_type from filename or path
     data_type = "unknown"
     source_lower = source_file.lower()
-    if "text" in source_lower:
+    if "silesia" in source_lower:
+        data_type = "silesia"
+    elif "software" in source_lower:
+        data_type = "software"
+    elif "logs" in source_lower:
+        data_type = "logs"
+    elif "text" in source_lower:
         data_type = "text"
     elif "tarball" in source_lower:
         data_type = "tarball"
@@ -135,7 +141,13 @@ def normalize_decompression_result(data: dict, source_file: str) -> list:
     # Extract data_type from filename or path
     data_type = "unknown"
     source_lower = source_file.lower()
-    if "text" in source_lower:
+    if "silesia" in source_lower:
+        data_type = "silesia"
+    elif "software" in source_lower:
+        data_type = "software"
+    elif "logs" in source_lower:
+        data_type = "logs"
+    elif "text" in source_lower:
         data_type = "text"
     elif "tarball" in source_lower:
         data_type = "tarball"

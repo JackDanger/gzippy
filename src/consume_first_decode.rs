@@ -267,6 +267,113 @@ fn copy_match_safe(output: &mut [u8], out_pos: usize, distance: u32, length: u32
 /// Decode a Huffman block using consume-first pattern
 ///
 /// This matches libdeflate's decompress_template.h lines 340-580
+/// Huffman decode with Vector Huffman multi-literal optimization
+fn decode_huffman_cf_vector(
+    bits: &mut Bits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    litlen: &LitLenTable,
+    dist_table: &DistTable,
+    vector_table: &crate::vector_huffman::VectorTable,
+) -> Result<usize> {
+    const FASTLOOP_MARGIN: usize = 320;
+
+    // FASTLOOP with multi-literal optimization
+    while out_pos + FASTLOOP_MARGIN <= output.len() && bits.pos < bits.data.len() {
+        if bits.available() < 32 {
+            bits.refill();
+        }
+
+        // Try multi-literal lookahead (up to 4 literals)
+        let (symbols, count, bits_count) =
+            crate::vector_huffman::decode_multi_literals(bits.peek(), &vector_table.table);
+        if count > 0 {
+            output[out_pos..(out_pos + count)].copy_from_slice(&symbols[..count]);
+            out_pos += count;
+            bits.consume(bits_count);
+            continue;
+        }
+
+        // Fallback to standard decode (lengths/exceptional/overflow)
+        let saved_bitbuf = bits.peek();
+        let mut entry = litlen.lookup(saved_bitbuf);
+        bits.consume_entry(entry.raw());
+
+        if (entry.raw() as i32) < 0 {
+            // Literal
+            output[out_pos] = entry.literal_value();
+            out_pos += 1;
+            continue;
+        }
+
+        if entry.is_exceptional() {
+            if entry.is_end_of_block() {
+                return Ok(out_pos);
+            }
+
+            // Subtable
+            let sub_saved = bits.peek();
+            entry = litlen.lookup_subtable(entry, saved_bitbuf);
+            bits.consume_entry(entry.raw());
+
+            if entry.is_end_of_block() {
+                return Ok(out_pos);
+            }
+
+            if (entry.raw() as i32) < 0 {
+                // Literal from subtable
+                output[out_pos] = entry.literal_value();
+                out_pos += 1;
+                continue;
+            }
+
+            // Length from subtable
+            let length_val = entry.decode_length(sub_saved);
+            out_pos = decode_huffman_match(bits, output, out_pos, length_val, dist_table)?;
+        } else {
+            // Length
+            let length_val = entry.decode_length(saved_bitbuf);
+            out_pos = decode_huffman_match(bits, output, out_pos, length_val, dist_table)?;
+        }
+    }
+
+    // Generic loop for remainder
+    decode_huffman_cf(bits, output, out_pos, litlen, dist_table)
+}
+
+fn decode_huffman_match(
+    bits: &mut Bits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    length: u32,
+    dist_table: &DistTable,
+) -> Result<usize> {
+    bits.refill();
+    let dist_saved = bits.peek();
+    let mut dist_entry = dist_table.lookup(dist_saved);
+
+    if dist_entry.is_subtable_ptr() {
+        bits.consume(DistTable::TABLE_BITS as u32);
+        dist_entry = dist_table.lookup_subtable(dist_entry, dist_saved);
+    }
+
+    let dist_extra_saved = bits.peek();
+    bits.consume_entry(dist_entry.raw());
+    let distance = dist_entry.decode_distance(dist_extra_saved);
+
+    if distance == 0 || distance as usize > out_pos {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("Invalid distance {} at pos {}", distance, out_pos),
+        ));
+    }
+
+    // Copy match
+    out_pos = copy_match_fast(output, out_pos, distance, length);
+    bits.refill();
+    Ok(out_pos)
+}
+
 fn decode_huffman_cf(
     bits: &mut Bits,
     output: &mut [u8],
