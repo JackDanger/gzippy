@@ -46,6 +46,7 @@ mod thread_pool;
 mod turbo_inflate;
 mod two_level_table;
 mod ultimate_decode;
+mod ultra_decoder;
 mod ultra_decompress;
 mod ultra_fast_inflate;
 mod ultra_inflate;

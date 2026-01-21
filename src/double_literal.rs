@@ -101,12 +101,12 @@ impl DoubleLitCache {
     pub fn build(litlen_table: &LitLenTable) -> Self {
         let mut entries = vec![DoubleLitEntry::not_literal(); DOUBLE_LIT_SIZE];
 
-        // For each possible 13-bit pattern, try to decode one or two literals
+        // For each possible 16-bit pattern, try to decode one or two literals
         for pattern in 0..DOUBLE_LIT_SIZE {
             let bits = pattern as u64;
 
-            // Look up first symbol
-            let e1 = litlen_table.resolve(bits);
+            // Look up first symbol with TOTAL bits consumed (including subtable)
+            let (e1, bits1) = litlen_table.resolve_with_total_bits(bits);
 
             // If not a literal, mark as non-literal
             if !e1.is_literal() {
@@ -115,7 +115,6 @@ impl DoubleLitCache {
             }
 
             let sym1 = e1.literal_value();
-            let bits1 = e1.codeword_bits();
 
             // If first symbol uses too many bits, just store single
             if bits1 >= DOUBLE_LIT_BITS as u8 {
@@ -125,7 +124,7 @@ impl DoubleLitCache {
 
             // Try to decode second symbol
             let remaining = bits >> bits1;
-            let e2 = litlen_table.resolve(remaining);
+            let (e2, bits2) = litlen_table.resolve_with_total_bits(remaining);
 
             // If second is not a literal, store single
             if !e2.is_literal() {
@@ -134,7 +133,6 @@ impl DoubleLitCache {
             }
 
             let sym2 = e2.literal_value();
-            let bits2 = e2.codeword_bits();
             let total_bits = bits1 + bits2;
 
             // If total exceeds our cache bits, store single

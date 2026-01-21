@@ -316,6 +316,7 @@ impl DistEntry {
 }
 
 /// Literal/Length decode table
+#[derive(Clone)]
 pub struct LitLenTable {
     /// Main table (size: 1 << table_bits)
     entries: Vec<LitLenEntry>,
@@ -456,9 +457,24 @@ impl LitLenTable {
             entry
         }
     }
+
+    /// Resolve an entry and return total bits consumed (for double-literal cache)
+    /// Returns (entry, total_bits) where total_bits includes TABLE_BITS for subtable entries
+    #[inline(always)]
+    pub fn resolve_with_total_bits(&self, bits: u64) -> (LitLenEntry, u8) {
+        let entry = self.lookup(bits);
+        if entry.is_subtable_ptr() {
+            let subtable_entry = self.lookup_subtable(entry, bits);
+            let total_bits = Self::TABLE_BITS + subtable_entry.codeword_bits();
+            (subtable_entry, total_bits)
+        } else {
+            (entry, entry.codeword_bits())
+        }
+    }
 }
 
 /// Distance decode table
+#[derive(Clone)]
 pub struct DistTable {
     /// Main table (size: 1 << table_bits)
     entries: Vec<DistEntry>,
