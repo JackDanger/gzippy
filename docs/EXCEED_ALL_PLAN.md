@@ -1,6 +1,6 @@
 # Gap Analysis & Optimization Plan
 
-**Current: 970 MB/s (69.7%) | Target: 1840+ MB/s (130%+)**
+**Current: 992 MB/s (69.7%) | Target: 1840+ MB/s (130%+)**
 
 ---
 
@@ -131,6 +131,93 @@ for i in {1..3}; do cargo test --release bench_cf_silesia -- --nocapture 2>&1 | 
 cargo test --release  # Must pass 282 tests
 # Re-run baseline
 ```
+
+---
+
+## Radical Approaches (Extremely Hard)
+
+### 1. Vector Huffman Decode (AVX-512/SVE2) — Est: +100-200%
+Split input into 8-16 parallel bit streams at fixed offsets. Decode all simultaneously with SIMD gather. Challenge: variable-length codes desync lanes. Solution: decode in lockstep chunks (e.g., 4 symbols each), resync via prefix-sum of consumed bits. Requires careful lane management and scatter for output.
+
+```
+Input:  [========64 bytes (512 bits)========]
+Lanes:  [L0][L1][L2][L3][L4][L5][L6][L7]
+         ↓   ↓   ↓   ↓   ↓   ↓   ↓   ↓
+        decode simultaneously via VPGATHERDD
+         ↓
+        scatter to output positions
+```
+
+### 2. Precomputed Decode Sequences — Est: +50-100%
+For 16-22 bit input patterns, precompute: `(bits) → (out_bytes[], bits_consumed)`. Single lookup decodes 2-4 symbols. Table size: 4MB (22 bits × 8 bytes). Fits in L3 cache. Eliminates per-symbol loop overhead.
+
+```rust
+struct PrecomputedEntry {
+    out_bytes: [u8; 4],  // Up to 4 decoded literals
+    count: u8,          // How many symbols decoded
+    bits: u8,           // Total bits consumed
+}
+// 2^22 entries × 8 bytes = 32MB table
+```
+
+### 3. Speculative Multi-Path Decode — Est: +30-50%
+Fork execution into 3 paths: assume-literal, assume-match, assume-EOB. SIMD keeps all 3 hot. Commit correct path based on actual entry type. Like CPU branch prediction but at algorithm level. Eliminates branch misprediction entirely.
+
+### 4. JIT State Machine Compiler — Est: +40-60%
+Convert Huffman table to native machine code: each codeword → dedicated instruction sequence. No table lookups, no branches. Use computed goto (GNU extension) or tail calls. Requires mmap(PROT_EXEC) and careful code generation.
+
+```
+// For codeword 0b1011 (length 4) = literal 'A':
+L_1011:
+    *out++ = 'A';
+    bits >>= 4;
+    goto TABLE[bits & MASK];
+```
+
+### 5. FPGA/Hardware Accelerator — Est: +500%+
+Implement Huffman FSM in Verilog. Use PCIe FPGA board (Xilinx Alveo). Memory-map decode unit. 10GB/s+ possible. Requires hardware design expertise and $500+ FPGA.
+
+### 6. Tensor Core Abuse — Est: +200%+ (theoretical)
+Encode Huffman table as sparse matrix. Use WMMA (Tensor Core) for parallel lookup. Matrix multiply = 256 table lookups simultaneously. Only works on NVIDIA GPUs with FP16 Tensor Cores. Completely insane but mathematically sound.
+
+### 7. Two-Pass Table Precompute — Est: +20-40%
+**Pass 1**: Scan entire file, fingerprint all Huffman tables, identify repeats
+**Pass 2**: Decode with cached tables, parallel per-block
+For files with repeated tables (common in BGZF), amortizes table build cost.
+
+### 8. Bit-Parallel Decode via Carry-Less Multiply — Est: +30%
+Use PCLMULQDQ to extract multiple bit fields simultaneously. Process 8 symbols' worth of bits in one instruction. Combine with VPSHUFB for table lookup. Requires deep understanding of carry-less polynomial arithmetic.
+
+### 9. Branch-Free Computed Dispatch — Est: +15-25%
+Replace all `if` statements with branchless select:
+```rust
+let is_lit = (entry >> 31) as usize;  // 0 or 1
+let handlers = [handle_match, handle_literal];
+(handlers[is_lit])(...)  // Indirect call, but predictable
+```
+Or use CMOV chains for purely arithmetic dispatch.
+
+### 10. Decode-During-DMA Pipeline — Est: +20%
+Use io_uring for async I/O. While block N is decoding, DMA block N+1. Overlap memory transfers with computation. Requires careful buffer management and kernel-level async.
+
+### 11. Neural Network Predictor — Est: varies
+Train tiny NN to predict next N symbols from context. If prediction correct (>90% for repetitive data), skip decode entirely. For genomics/log data with patterns, could be 5-10x faster.
+
+### 12. Custom ISA Extension (RISC-V) — Est: +300%+
+Add Huffman decode instruction to RISC-V: `huffdec rd, rs1, rs2` (rd=symbol, rs1=bitbuf, rs2=table_ptr). Single-cycle decode. Requires custom silicon or FPGA soft-core.
+
+---
+
+## Feasibility Matrix
+
+| Approach | Gain | Effort | Deps |
+|----------|------|--------|------|
+| Vector Huffman (AVX-512) | +100% | 3 weeks | x86-64 only |
+| Precomputed Sequences | +50% | 1 week | 32MB RAM |
+| Speculative Multi-Path | +30% | 2 weeks | SIMD |
+| JIT State Machine | +40% | 2 weeks | mmap exec |
+| Two-Pass Precompute | +25% | 3 days | None |
+| Branch-Free Dispatch | +15% | 2 days | None |
 
 ---
 
