@@ -34,11 +34,14 @@
 
 ### What We Have That They Don't
 
-| Feature | Source |
-|---------|--------|
-| JIT table cache (fingerprint) | Novel |
-| Static fixed table (OnceLock) | Novel |
-| Pure Rust (no C/assembly deps) | Design |
+| Feature | Source | Status |
+|---------|--------|--------|
+| JIT table cache (fingerprint) | Novel | ✓ Ready |
+| Static fixed table (OnceLock) | Novel | ✓ Done |
+| Pure Rust (no C/assembly deps) | Design | ✓ Done |
+| Vector Huffman (8-lane SIMD) | Novel | ✓ **NEW** |
+| Multi-literal lookahead (4 syms) | Novel | ✓ **NEW** |
+| NEON/AVX2 platform detection | Novel | ✓ **NEW** |
 
 ---
 
