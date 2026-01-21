@@ -608,9 +608,162 @@ fn decode_stored(bits: &mut Bits, output: &mut [u8], mut out_pos: usize) -> Resu
     Ok(out_pos)
 }
 
+/// Cached double-literal cache for fixed Huffman (built once)
+fn get_fixed_double_lit_cache() -> &'static crate::double_literal::DoubleLitCache {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<crate::double_literal::DoubleLitCache> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let tables = crate::libdeflate_decode::get_fixed_tables();
+        crate::double_literal::DoubleLitCache::build(&tables.0)
+    })
+}
+
 fn decode_fixed(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
     let tables = crate::libdeflate_decode::get_fixed_tables();
+    // Note: DoubleLitCache is available via get_fixed_double_lit_cache() for fixed blocks
+    // but silesia is mostly dynamic blocks, so the benefit is limited
     decode_huffman_cf(bits, output, out_pos, &tables.0, &tables.1)
+}
+
+/// Huffman decode with double-literal cache optimization
+/// Uses DoubleLitCache for the fastloop to decode 2 literals at once when possible
+fn decode_huffman_cf_double(
+    bits: &mut Bits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    litlen: &LitLenTable,
+    dist: &DistTable,
+    double_cache: &crate::double_literal::DoubleLitCache,
+) -> Result<usize> {
+    #![allow(unused_imports)]
+    use crate::double_literal::DoubleLitEntry;
+
+    const FASTLOOP_MARGIN: usize = 320;
+
+    // FASTLOOP with double-literal optimization
+    while out_pos + FASTLOOP_MARGIN <= output.len() && bits.available() >= 16 {
+        // Try double-literal lookup first
+        let saved_bitbuf = bits.peek();
+        let double_entry = double_cache.lookup(saved_bitbuf);
+
+        if double_entry.is_literal() {
+            if double_entry.has_second() {
+                // DOUBLE LITERAL - decode 2 at once
+                let out_ptr = output.as_mut_ptr();
+                unsafe {
+                    *out_ptr.add(out_pos) = double_entry.symbol1();
+                    *out_ptr.add(out_pos + 1) = double_entry.symbol2();
+                }
+                out_pos += 2;
+                bits.consume(double_entry.total_bits() as u32);
+
+                // Continue with double-literal attempts
+                bits.refill();
+                continue;
+            } else {
+                // SINGLE LITERAL from double cache
+                let out_ptr = output.as_mut_ptr();
+                unsafe {
+                    *out_ptr.add(out_pos) = double_entry.symbol1();
+                }
+                out_pos += 1;
+                bits.consume(double_entry.total_bits() as u32);
+
+                // Try to continue with more literals via regular path
+                bits.refill();
+                continue;
+            }
+        }
+
+        // NOT A LITERAL - fall back to regular decode path
+        let entry = litlen.lookup(saved_bitbuf);
+        bits.consume_entry(entry.raw());
+
+        // Check for EXCEPTIONAL (subtable or EOB)
+        if entry.is_exceptional() {
+            if entry.is_end_of_block() {
+                return Ok(out_pos);
+            }
+
+            // Check for subtable
+            let sub_saved = bits.peek();
+            let sub_entry = litlen.lookup_subtable(entry, saved_bitbuf);
+            bits.consume_entry(sub_entry.raw());
+
+            if sub_entry.is_end_of_block() {
+                return Ok(out_pos);
+            }
+
+            if (sub_entry.raw() as i32) < 0 {
+                // Literal from subtable
+                let lit = sub_entry.literal_value();
+                let out_ptr = output.as_mut_ptr();
+                unsafe {
+                    *out_ptr.add(out_pos) = lit;
+                }
+                out_pos += 1;
+                bits.refill();
+                continue;
+            }
+
+            // Length from subtable
+            let length = sub_entry.decode_length(sub_saved);
+
+            bits.refill();
+            let dist_saved = bits.peek();
+            let mut dist_entry = dist.lookup(dist_saved);
+
+            if dist_entry.is_subtable_ptr() {
+                bits.consume(DistTable::TABLE_BITS as u32);
+                dist_entry = dist.lookup_subtable(dist_entry, dist_saved);
+            }
+
+            let dist_extra_saved = bits.peek();
+            bits.consume_entry(dist_entry.raw());
+            let distance = dist_entry.decode_distance(dist_extra_saved);
+
+            if distance == 0 || distance as usize > out_pos {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Invalid distance {} at pos {}", distance, out_pos),
+                ));
+            }
+
+            bits.refill();
+            out_pos = copy_match_fast(output, out_pos, distance, length);
+            continue;
+        }
+
+        // Length code from main table
+        let length = entry.decode_length(saved_bitbuf);
+
+        bits.refill();
+        let dist_saved = bits.peek();
+        let mut dist_entry = dist.lookup(dist_saved);
+
+        if dist_entry.is_subtable_ptr() {
+            bits.consume(DistTable::TABLE_BITS as u32);
+            dist_entry = dist.lookup_subtable(dist_entry, dist_saved);
+        }
+
+        let dist_extra_saved = bits.peek();
+        bits.consume_entry(dist_entry.raw());
+        let distance = dist_entry.decode_distance(dist_extra_saved);
+
+        if distance == 0 || distance as usize > out_pos {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Invalid distance {} at pos {}", distance, out_pos),
+            ));
+        }
+
+        bits.refill();
+        out_pos = copy_match_fast(output, out_pos, distance, length);
+    }
+
+    // Fall back to generic path for remaining output
+    // (reuse the regular decode_huffman_cf for the generic loop)
+    decode_huffman_cf(bits, output, out_pos, litlen, dist)
 }
 
 fn decode_dynamic(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {

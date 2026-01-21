@@ -10,6 +10,7 @@ use std::process;
 mod bgzf;
 mod block_finder;
 mod block_finder_lut;
+mod bmi2;
 mod cli;
 mod combined_lut;
 mod compression;
