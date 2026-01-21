@@ -102,14 +102,22 @@
 
 ## Implementation Priority
 
-| # | Optimization | Expected | Effort | Risk |
-|---|--------------|----------|--------|------|
-| 1 | Multi-symbol CacheEntry | +15% | Medium | Low |
-| 6 | `unlikely()` on exceptional | +5% | Easy | None |
-| 11 | JIT decode loop | +30% | Hard | Medium |
-| 15 | Table-free fixed Huffman | +20% (fixed) | Medium | Low |
-| 16 | SIMD output buffering | +10% | Medium | Low |
-| 12 | SIMD parallel decode | +40% | Very Hard | High |
+| # | Optimization | Expected | Effort | Result |
+|---|--------------|----------|--------|--------|
+| 1 | Multi-symbol CacheEntry | +15% | Medium | Pending - exists, needs integration |
+| 6 | `#[cold]` on error paths | +5% | Easy | **REGRESSED 4%** |
+| 15 | Table-free fixed Huffman | +20% | Medium | **3.25x SLOWER** |
+| - | Unconditional refill | +5% | Easy | **REGRESSED 12%** |
+| 11 | JIT decode loop | +30% | Hard | Pending |
+| 12 | SIMD parallel decode | +40% | Very Hard | Pending |
+
+### Key Finding
+
+**Simple micro-optimizations REGRESS performance.** The current code is already well-tuned.
+The remaining 30% gap requires novel approaches:
+- Compiler-level optimizations (target-cpu=native)
+- JIT code generation for specific Huffman tables
+- SIMD parallel decoding (multiple streams)
 
 ---
 
