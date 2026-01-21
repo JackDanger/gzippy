@@ -37,15 +37,16 @@ fn extract_bits(value: u64, n: u32) -> u64 {
 // =============================================================================
 
 /// Bit buffer matching libdeflate's structure
-struct Bits<'a> {
-    data: &'a [u8],
-    pos: usize,
-    bitbuf: u64,
-    bitsleft: u32,
+/// Bit buffer matching libdeflate's structure
+pub struct Bits<'a> {
+    pub data: &'a [u8],
+    pub pos: usize,
+    pub bitbuf: u64,
+    pub bitsleft: u32,
 }
 
 impl<'a> Bits<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub fn new(data: &'a [u8]) -> Self {
         let mut bits = Self {
             data,
             pos: 0,
@@ -58,7 +59,7 @@ impl<'a> Bits<'a> {
 
     /// Branchless refill matching libdeflate
     #[inline(always)]
-    fn refill(&mut self) {
+    pub fn refill(&mut self) {
         if self.pos + 8 <= self.data.len() {
             let word = unsafe { (self.data.as_ptr().add(self.pos) as *const u64).read_unaligned() };
             let word = u64::from_le(word);
@@ -72,7 +73,7 @@ impl<'a> Bits<'a> {
     }
 
     #[inline(never)]
-    fn refill_slow(&mut self) {
+    pub fn refill_slow(&mut self) {
         while self.bitsleft <= 56 {
             if self.pos < self.data.len() {
                 self.bitbuf |= (self.data[self.pos] as u64) << self.bitsleft;
@@ -85,37 +86,37 @@ impl<'a> Bits<'a> {
     }
 
     #[inline(always)]
-    fn peek(&self) -> u64 {
+    pub fn peek(&self) -> u64 {
         self.bitbuf
     }
 
     #[inline(always)]
-    fn consume(&mut self, n: u32) {
+    pub fn consume(&mut self, n: u32) {
         self.bitbuf >>= n as u8;
         self.bitsleft -= n;
     }
 
     /// Consume using entry's low 5 bits
     #[inline(always)]
-    fn consume_entry(&mut self, entry: u32) {
+    pub fn consume_entry(&mut self, entry: u32) {
         self.bitbuf >>= entry as u8;
         self.bitsleft = self.bitsleft.wrapping_sub(entry & 0x1F);
     }
 
     /// Available bits (low 8 bits only - matching libdeflate's (u8)bitsleft pattern)
     #[inline(always)]
-    fn available(&self) -> u32 {
+    pub fn available(&self) -> u32 {
         // libdeflate allows garbage in high bits, so cast to u8 for the real value
         (self.bitsleft as u8) as u32
     }
 
-    fn align_to_byte(&mut self) {
+    pub fn align_to_byte(&mut self) {
         // bitsleft may have garbage in high bits, use (u8) cast
         let discard = (self.bitsleft as u8) & 7;
         self.consume(discard as u32);
     }
 
-    fn read_u16(&mut self) -> u16 {
+    pub fn read_u16(&mut self) -> u16 {
         self.align_to_byte();
 
         // If we have bytes in the bit buffer, extract from there
@@ -619,10 +620,8 @@ fn get_fixed_double_lit_cache() -> &'static crate::double_literal::DoubleLitCach
 }
 
 fn decode_fixed(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
-    let tables = crate::libdeflate_decode::get_fixed_tables();
-    // USE the DoubleLitCache for fixed blocks - decodes 2 literals per lookup
-    let double_cache = get_fixed_double_lit_cache();
-    decode_huffman_cf_double(bits, output, out_pos, &tables.0, &tables.1, double_cache)
+    // USE the Vector Huffman multi-literal optimizer for fixed blocks
+    crate::vector_huffman::decode_fixed_multi_literal_bits(bits, output, out_pos)
 }
 
 /// Huffman decode with double-literal cache optimization
@@ -923,9 +922,13 @@ fn build_code_length_table(lengths: &[u8; 19]) -> Result<[u16; 128]> {
 /// Decode a deflate stream using consume-first pattern
 pub fn inflate_consume_first(input: &[u8], output: &mut [u8]) -> Result<usize> {
     let mut bits = Bits::new(input);
+    let out_size = inflate_consume_first_bits(&mut bits, output)?;
+    Ok(out_size)
+}
+
+/// Decode a deflate stream from a Bits reader
+pub fn inflate_consume_first_bits(bits: &mut Bits, output: &mut [u8]) -> Result<usize> {
     let mut out_pos = 0;
-    #[allow(unused_variables)]
-    let mut block_count = 0;
 
     loop {
         if bits.available() < 3 {
@@ -935,17 +938,18 @@ pub fn inflate_consume_first(input: &[u8], output: &mut [u8]) -> Result<usize> {
         let bfinal = (bits.peek() & 1) != 0;
         let btype = ((bits.peek() >> 1) & 3) as u8;
         bits.consume(3);
-        block_count += 1;
 
         match btype {
-            0 => out_pos = decode_stored(&mut bits, output, out_pos)?,
-            1 => out_pos = decode_fixed(&mut bits, output, out_pos)?,
-            2 => out_pos = decode_dynamic(&mut bits, output, out_pos)?,
+            0 => out_pos = decode_stored(bits, output, out_pos)?,
+            1 => out_pos = decode_fixed(bits, output, out_pos)?,
+            2 => out_pos = decode_dynamic(bits, output, out_pos)?,
             3 => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type")),
             _ => unreachable!(),
         }
 
         if bfinal {
+            // Align bits to byte boundary at end of deflate stream
+            bits.align_to_byte();
             return Ok(out_pos);
         }
     }
@@ -1037,6 +1041,94 @@ mod tests {
 
         assert_eq!(size, original.len());
         assert_eq!(&output[..size], original.as_slice());
+    }
+
+    /// REAL benchmark on multiple datasets - the only valid benchmark
+    #[test]
+    fn bench_cf_all_datasets() {
+        let datasets = match crate::benchmark_datasets::prepare_datasets() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Failed to prepare datasets: {}", e);
+                return;
+            }
+        };
+
+        eprintln!("\n=== Multi-Dataset Benchmark (Consume-First) ===");
+        eprintln!(
+            "{:<15} | {:>10} | {:>10} | {:>10}",
+            "Dataset", "Size (MB)", "Throughput", "Format"
+        );
+        eprintln!("{:-<15}-|-{:-<10}-|-{:-<10}-|-{:-<10}", "", "", "", "");
+
+        for (name, _raw_path, gz_path) in datasets {
+            let gz = match std::fs::read(&gz_path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            // Parse gzip header properly
+            let mut pos = 10;
+            let flg = gz[3];
+            if (flg & 0x04) != 0 {
+                let xlen = u16::from_le_bytes([gz[pos], gz[pos + 1]]) as usize;
+                pos += 2 + xlen;
+            }
+            if (flg & 0x08) != 0 {
+                while pos < gz.len() && gz[pos] != 0 {
+                    pos += 1;
+                }
+                pos += 1;
+            }
+            if (flg & 0x10) != 0 {
+                while pos < gz.len() && gz[pos] != 0 {
+                    pos += 1;
+                }
+                pos += 1;
+            }
+            if (flg & 0x02) != 0 {
+                pos += 2;
+            }
+
+            let deflate = &gz[pos..gz.len() - 8];
+            let isize = u32::from_le_bytes([
+                gz[gz.len() - 4],
+                gz[gz.len() - 3],
+                gz[gz.len() - 2],
+                gz[gz.len() - 1],
+            ]) as usize;
+
+            let mut output = vec![0u8; isize + 1024];
+
+            let format = if name == "software" {
+                "libdeflate L12"
+            } else if name == "logs" {
+                "libdeflate L1"
+            } else {
+                "flate2 Best"
+            };
+
+            // Warmup
+            let _ = inflate_consume_first(deflate, &mut output);
+
+            let iterations = 3;
+            let start = std::time::Instant::now();
+            let mut total_out = 0;
+            for _ in 0..iterations {
+                total_out = inflate_consume_first(deflate, &mut output).unwrap();
+            }
+            let elapsed = start.elapsed();
+            let mb_per_sec = (total_out * iterations) as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+
+            eprintln!(
+                "{:<15} | {:>10.1} | {:>8.1} MB/s | {:<13}",
+                name,
+                total_out as f64 / 1_000_000.0,
+                mb_per_sec,
+                format
+            );
+        }
+        eprintln!("===============================================");
     }
 
     /// REAL benchmark on silesia - the only valid benchmark

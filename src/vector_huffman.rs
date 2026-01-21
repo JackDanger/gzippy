@@ -77,25 +77,25 @@ pub const VECTOR_TABLE_BITS: usize = 8;
 pub const VECTOR_TABLE_SIZE: usize = 1 << VECTOR_TABLE_BITS;
 
 /// Vector decode entry: packed as u16 for efficient SIMD loads
-/// Low byte = symbol (or 0xFF for overflow)
-/// High byte = bits consumed (or 0 for overflow)
+/// bits 0-8: symbol (0-287)
+/// bits 9-12: length (0-15)
 #[derive(Clone, Copy, Default, Debug)]
 #[repr(C)]
 pub struct VectorEntry(u16);
 
 impl VectorEntry {
-    const fn new(symbol: u8, bits: u8) -> Self {
-        Self((symbol as u16) | ((bits as u16) << 8))
+    const fn new(symbol: u16, bits: u8) -> Self {
+        Self(symbol | ((bits as u16) << 9))
     }
 
     #[inline(always)]
-    pub fn symbol(self) -> u8 {
-        self.0 as u8
+    pub fn symbol(self) -> u16 {
+        self.0 & 0x1FF
     }
 
     #[inline(always)]
     pub fn bits(self) -> u8 {
-        (self.0 >> 8) as u8
+        ((self.0 >> 9) & 0xF) as u8
     }
 
     #[inline(always)]
@@ -137,7 +137,7 @@ fn build_fixed_vector_table() -> Box<[VectorEntry; VECTOR_TABLE_SIZE]> {
         for suffix in 0..(1 << fill_bits) {
             let idx = reversed as usize | (suffix << len as usize);
             if idx < VECTOR_TABLE_SIZE {
-                table[idx] = VectorEntry::new(sym as u8, len);
+                table[idx] = VectorEntry::new(sym, len);
             }
         }
     }
@@ -216,14 +216,14 @@ mod avx2_impl {
 
         // Extract symbols and bits
         let symbols = [
-            entries[0].symbol(),
-            entries[1].symbol(),
-            entries[2].symbol(),
-            entries[3].symbol(),
-            entries[4].symbol(),
-            entries[5].symbol(),
-            entries[6].symbol(),
-            entries[7].symbol(),
+            entries[0].symbol() as u8,
+            entries[1].symbol() as u8,
+            entries[2].symbol() as u8,
+            entries[3].symbol() as u8,
+            entries[4].symbol() as u8,
+            entries[5].symbol() as u8,
+            entries[6].symbol() as u8,
+            entries[7].symbol() as u8,
         ];
 
         let bits = [
@@ -310,14 +310,14 @@ mod neon_impl {
 
         // Extract symbols and bits
         let symbols = [
-            entries[0].symbol(),
-            entries[1].symbol(),
-            entries[2].symbol(),
-            entries[3].symbol(),
-            entries[4].symbol(),
-            entries[5].symbol(),
-            entries[6].symbol(),
-            entries[7].symbol(),
+            entries[0].symbol() as u8,
+            entries[1].symbol() as u8,
+            entries[2].symbol() as u8,
+            entries[3].symbol() as u8,
+            entries[4].symbol() as u8,
+            entries[5].symbol() as u8,
+            entries[6].symbol() as u8,
+            entries[7].symbol() as u8,
         ];
 
         let bits = [
@@ -607,14 +607,17 @@ pub fn decode_multi_literals(
         let bits = entry.bits() as u32;
 
         // Check if it's a literal (symbol < 256) vs length code (256-287)
-        // For fixed Huffman, EOB is symbol 256
-        if sym > 143 {
-            // Could be 9-bit literal (144-255), length code, or EOB
-            // Our 8-bit table doesn't cover these - stop
+        if sym >= 256 {
+            // Hit length code or EOB - stop
             break;
         }
 
-        symbols[i] = sym;
+        // Now we know it's a literal (0-255)
+        // But wait, fixed Huffman symbols 144-255 are 9 bits.
+        // Our 8-bit table only contains symbols with codes <= 8 bits.
+        // Symbols 0-143 (8 bits) and some length codes.
+
+        symbols[i] = sym as u8;
         remaining >>= bits;
         bits_consumed += bits;
         count = i + 1;
@@ -623,31 +626,23 @@ pub fn decode_multi_literals(
     (symbols, count, bits_consumed)
 }
 
-/// Decode fixed Huffman block with multi-literal optimization
-/// Uses precomputed table to decode 1-4 literals per iteration
-pub fn decode_fixed_multi_literal(input: &[u8], output: &mut [u8]) -> std::io::Result<usize> {
+/// Decode fixed Huffman block with multi-literal optimization using Bits struct
+pub fn decode_fixed_multi_literal_bits(
+    bits: &mut crate::consume_first_decode::Bits,
+    output: &mut [u8],
+    mut out_pos: usize,
+) -> std::io::Result<usize> {
     let table = get_fixed_vector_table();
     let fixed_tables = crate::libdeflate_decode::get_fixed_tables();
 
-    let mut in_pos = 0usize;
-    let mut out_pos = 0usize;
-    let mut bitbuf = 0u64;
-    let mut bitsleft = 0u32;
-
-    // Refill helper
-    let refill = |pos: &mut usize, buf: &mut u64, left: &mut u32| {
-        while *left <= 56 && *pos < input.len() {
-            *buf |= (input[*pos] as u64) << *left;
-            *pos += 1;
-            *left += 8;
-        }
-    };
-
-    refill(&mut in_pos, &mut bitbuf, &mut bitsleft);
-
     loop {
+        // Ensure we have at least 32 bits available for multi-literal lookahead
+        if bits.available() < 32 {
+            bits.refill();
+        }
+
         // Try multi-literal decode
-        let (symbols, count, bits) = decode_multi_literals(bitbuf, table);
+        let (symbols, count, bits_count) = decode_multi_literals(bits.peek(), table);
 
         if count > 0 {
             // Fast path: got 1-4 literals
@@ -661,22 +656,17 @@ pub fn decode_fixed_multi_literal(input: &[u8], output: &mut [u8]) -> std::io::R
             // Write literals
             output[out_pos..(count + out_pos)].copy_from_slice(&symbols[..count]);
             out_pos += count;
-            bitbuf >>= bits;
-            bitsleft -= bits;
-
-            // Refill
-            if bitsleft < 32 {
-                refill(&mut in_pos, &mut bitbuf, &mut bitsleft);
-            }
+            bits.consume(bits_count);
             continue;
         }
 
         // Slow path: use regular tables for 9-bit codes, lengths, EOB
-        let saved = bitbuf;
+        if bits.available() < 15 {
+            bits.refill();
+        }
+        let saved = bits.peek();
         let entry = fixed_tables.0.lookup(saved);
-        let total_bits = entry.codeword_bits() as u32;
-        bitbuf >>= total_bits;
-        bitsleft -= total_bits;
+        bits.consume_entry(entry.raw());
 
         if entry.is_end_of_block() {
             return Ok(out_pos);
@@ -696,13 +686,13 @@ pub fn decode_fixed_multi_literal(input: &[u8], output: &mut [u8]) -> std::io::R
             // Length code - decode match
             let length = entry.decode_length(saved);
 
-            refill(&mut in_pos, &mut bitbuf, &mut bitsleft);
+            if bits.available() < 15 {
+                bits.refill();
+            }
 
-            let dist_saved = bitbuf;
+            let dist_saved = bits.peek();
             let dist_entry = fixed_tables.1.lookup(dist_saved);
-            let dist_bits = dist_entry.codeword_bits() as u32;
-            bitbuf >>= dist_bits;
-            bitsleft -= dist_bits;
+            bits.consume_entry(dist_entry.raw());
 
             let distance = dist_entry.decode_distance(dist_saved);
 
@@ -728,11 +718,13 @@ pub fn decode_fixed_multi_literal(input: &[u8], output: &mut [u8]) -> std::io::R
             }
             out_pos += len;
         }
-
-        if bitsleft < 32 {
-            refill(&mut in_pos, &mut bitbuf, &mut bitsleft);
-        }
     }
+}
+
+/// Decode fixed Huffman block with multi-literal optimization
+pub fn decode_fixed_multi_literal(input: &[u8], output: &mut [u8]) -> std::io::Result<usize> {
+    let mut bits = crate::consume_first_decode::Bits::new(input);
+    decode_fixed_multi_literal_bits(&mut bits, output, 0)
 }
 
 // =============================================================================

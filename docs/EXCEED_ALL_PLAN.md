@@ -42,6 +42,19 @@
 | Vector Huffman (8-lane SIMD) | Novel | ✓ **NEW** |
 | Multi-literal lookahead (4 syms) | Novel | ✓ **NEW** |
 | NEON/AVX2 platform detection | Novel | ✓ **NEW** |
+| Multi-Dataset Benchmarking | Novel | ✓ **NEW** |
+
+---
+
+## Multi-Dataset Benchmarking
+
+We now report performance across 3 distinct archive structures and compression strategies:
+
+1. **Silesia** (212 MB): Mixed data, `flate2` Best (standard dynamic blocks).
+2. **Software Archive** (221 MB): Source code, `libdeflate` L12 (extreme match density).
+3. **Repetitive Logs** (221 MB): Structured logs, `libdeflate` L1 (fast/simple blocks).
+
+This diversity ensures our optimizations work across different encoders (`zlib`, `libdeflate`) and block types (`fixed`, `dynamic`, `stored`).
 
 ---
 
