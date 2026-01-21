@@ -53,6 +53,7 @@ mod ultra_decompress;
 mod ultra_fast_inflate;
 mod ultra_inflate;
 mod utils;
+mod vector_huffman;
 
 use cli::GzippyArgs;
 use error::GzippyError;
