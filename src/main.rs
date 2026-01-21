@@ -7,6 +7,7 @@ use std::env;
 use std::path::Path;
 use std::process;
 
+mod algebraic_decode;
 mod benchmark_datasets;
 mod bgzf;
 mod block_finder;
