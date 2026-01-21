@@ -1982,7 +1982,7 @@ unsafe fn decode_huffman_asm_x64(
             break;
         }
 
-        let entry_bits = (entry & BITS_MASK) as u32;
+        let entry_bits = entry & BITS_MASK;
 
         // === LITERAL PATH (most common - bit 31 set) ===
         if (entry as i32) < 0 {
@@ -2000,7 +2000,7 @@ unsafe fn decode_huffman_asm_x64(
                 if (e as i32) >= 0 || (e & BITS_MASK) == 0 {
                     break;
                 }
-                let e_bits = (e & BITS_MASK) as u32;
+                let e_bits = e & BITS_MASK;
                 output[out_pos] = ((e >> SYMBOL_SHIFT) & 0xFF) as u8;
                 out_pos += 1;
                 bitbuf >>= e_bits;
@@ -2048,16 +2048,13 @@ unsafe fn decode_huffman_asm_x64(
 
             // Read distance extra bits
             let extra = DIST_EXTRA_BITS[dist_sym as usize] as u32;
-            if extra > 0 && bits < extra {
-                if pos + 4 <= compressed.len() {
-                    unsafe {
-                        let word =
-                            (compressed.as_ptr().add(pos) as *const u32).read_unaligned() as u64;
-                        bitbuf |= word << bits;
-                        let consumed = (64 - bits) / 8;
-                        pos += consumed as usize;
-                        bits |= 56;
-                    }
+            if extra > 0 && bits < extra && pos + 4 <= compressed.len() {
+                unsafe {
+                    let word = (compressed.as_ptr().add(pos) as *const u32).read_unaligned() as u64;
+                    bitbuf |= word << bits;
+                    let consumed = (64 - bits) / 8;
+                    pos += consumed as usize;
+                    bits |= 56;
                 }
             }
             let extra_val = (bitbuf & ((1u64 << extra) - 1)) as usize;
@@ -2141,7 +2138,7 @@ fn copy_match_asm(output: &mut [u8], out_pos: usize, distance: usize, length: us
 // Non-x86_64 stub - the real function is only available on x86_64
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(dead_code)]
-fn decode_huffman_asm_x64(
+unsafe fn decode_huffman_asm_x64(
     _compressed: &[u8],
     _output: &mut [u8],
     out_pos: usize,
@@ -3699,8 +3696,9 @@ mod tests {
             let mut output = vec![0u8; expected.len() + 1000];
 
             // Use the asm decoder
-            let result =
-                decode_huffman_asm_x64(compressed, &mut output, 0, &packed_lut, &dist_table);
+            let result = unsafe {
+                decode_huffman_asm_x64(compressed, &mut output, 0, &packed_lut, &dist_table)
+            };
 
             match result {
                 Ok(size) => {
@@ -6011,7 +6009,6 @@ mod optimization_tests {
                 test_next_code[12] += 1;
             }
             let code = test_next_code[12];
-            test_next_code[12] += 1;
             let reversed = reverse_bits(code, 12);
 
             let main_entry = cf_table.lookup_main(reversed as u64);

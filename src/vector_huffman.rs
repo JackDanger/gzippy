@@ -159,7 +159,7 @@ fn fixed_huffman_code(sym: u16) -> (u16, u8) {
     }
 }
 
-/// Reverse n bits
+#[inline(always)]
 fn reverse_bits(code: u16, n: u8) -> u16 {
     let mut result = 0u16;
     let mut c = code;
@@ -168,6 +168,35 @@ fn reverse_bits(code: u16, n: u8) -> u16 {
         c >>= 1;
     }
     result
+}
+
+#[derive(Clone)]
+pub struct VectorTable {
+    pub table: Box<[VectorEntry; VECTOR_TABLE_SIZE]>,
+}
+
+impl VectorTable {
+    pub fn new() -> Self {
+        Self {
+            table: Box::new([VectorEntry::default(); VECTOR_TABLE_SIZE]),
+        }
+    }
+
+    /// Build a vector table from a libdeflate-style LitLenTable
+    pub fn build_from_litlen(&mut self, litlen: &crate::libdeflate_entry::LitLenTable) {
+        for i in 0..VECTOR_TABLE_SIZE {
+            // Only literals with codeword bits <= 8 can fit in our 8-bit lookahead table.
+            // If it's a subtable pointer or a longer code, we must mark it as overflow.
+            let entry = litlen.lookup(i as u64);
+            if entry.is_literal() && entry.codeword_bits() <= 8 {
+                self.table[i] =
+                    VectorEntry::new(entry.literal_value() as u16, entry.codeword_bits());
+            } else {
+                // Exceptional, length, or code > 8 bits - mark as overflow
+                self.table[i] = VectorEntry::new(0, 0);
+            }
+        }
+    }
 }
 
 /// Get the fixed vector table

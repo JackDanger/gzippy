@@ -301,17 +301,17 @@ impl DistEntry {
 
     /// Decode distance value using saved_bitbuf
     /// Distance = base + extra_bits_value
-    /// Decode distance from saved_bitbuf (branchless)
+    /// Decode distance from saved_bitbuf (branchless, uses BMI2 when available)
     #[inline(always)]
     pub fn decode_distance(self, saved_bitbuf: u64) -> u32 {
         let base = self.distance_base() as u32;
         let codeword_bits = self.codeword_bits();
         let total_bits = self.total_bits();
         let extra_bits = total_bits - codeword_bits;
-        // Branchless: when extra_bits is 0, mask is 0 and extra_value is 0
-        let extra_mask = (1u64 << extra_bits).wrapping_sub(1);
-        let extra_value = (saved_bitbuf >> codeword_bits) & extra_mask;
-        base + extra_value as u32
+        // Use BMI2 _bzhi_u64 when available for faster bit extraction
+        let extra_value =
+            crate::bmi2::decode_extra_bits(saved_bitbuf, codeword_bits, extra_bits) as u32;
+        base + extra_value
     }
 }
 
