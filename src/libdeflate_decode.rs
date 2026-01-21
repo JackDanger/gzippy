@@ -423,8 +423,7 @@ pub fn get_fixed_tables() -> &'static (LitLenTable, DistTable) {
 /// Decode fixed Huffman block
 fn decode_fixed(bits: &mut LibdeflateBits, output: &mut [u8], out_pos: usize) -> Result<usize> {
     let (litlen_table, dist_table) = get_fixed_tables();
-    let (litlen_table, dist_table) = (litlen_table, dist_table);
-    decode_huffman(bits, output, out_pos, &litlen_table, &dist_table)
+    decode_huffman(bits, output, out_pos, litlen_table, dist_table)
 }
 
 /// Decode dynamic Huffman block

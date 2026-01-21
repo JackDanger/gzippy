@@ -216,11 +216,16 @@ pub fn speculative_decode_8(
     batch
 }
 
-/// Decode using speculative batch with fallback
+/// Decode using ADAPTIVE speculative batch with bloom filter tracking
 ///
-/// This is the main decode loop that uses speculative batch decode
-/// for literal runs and falls back to regular decode for matches.
-#[allow(dead_code)]
+/// Key innovation: Track recent symbol patterns using a 64-bit bloom filter.
+/// Only use speculative batch when in literal-heavy regions (>50% literals).
+/// This avoids the overhead of failed speculative attempts in match-heavy data.
+///
+/// The bloom filter uses rolling history:
+/// - Shift in 1 for literal, 0 for match
+/// - If popcnt > threshold, we're in literal mode
+/// - Very cheap to update (1 shift + 1 popcnt)
 pub fn decode_speculative_batch(
     bits: &mut crate::libdeflate_decode::LibdeflateBits,
     output: &mut [u8],
@@ -232,27 +237,48 @@ pub fn decode_speculative_batch(
 
     const FASTLOOP_MARGIN: usize = 274;
 
+    // Adaptive mode tracking
+    // Rolling 64-bit pattern: 1 = literal, 0 = match
+    // When popcnt > 32 (>50% literals), use speculative batch
+    let mut pattern: u64 = 0xFFFF_FFFF_FFFF_FFFF; // Start optimistic (assume literals)
+    let mut speculative_mode = true;
+
     'fastloop: while out_pos + FASTLOOP_MARGIN <= output.len() {
         bits.refill_branchless();
 
-        // Try speculative batch decode (8 literals at once)
-        let batch = speculative_decode_8(bits.peek_bits(), bits.available(), litlen_table);
+        // ADAPTIVE: Only try speculative when in literal-heavy region
+        if speculative_mode {
+            let batch = speculative_decode_8(bits.peek_bits(), bits.available(), litlen_table);
 
-        if batch.valid_count >= 2 {
-            // Got at least 2 literals - worth it!
-            // Copy all valid literals at once
-            let count = batch.valid_count;
-            output[out_pos..out_pos + count].copy_from_slice(&batch.symbols[..count]);
-            out_pos += count;
-            bits.consume(batch.total_bits);
+            if batch.valid_count >= 4 {
+                // Good batch - copy literals and update pattern
+                let count = batch.valid_count;
+                output[out_pos..out_pos + count].copy_from_slice(&batch.symbols[..count]);
+                out_pos += count;
+                bits.consume(batch.total_bits);
 
-            // If we got all 8, try again immediately (likely more literals)
-            if batch.all_valid() {
-                continue 'fastloop;
+                // Update pattern: shift in 1s for each literal
+                pattern = (pattern << count) | ((1u64 << count) - 1);
+
+                // If we got all 8, stay in speculative mode
+                if batch.all_valid() {
+                    continue 'fastloop;
+                }
+            } else if batch.valid_count >= 1 {
+                // Got at least 1 literal - use it
+                let count = batch.valid_count;
+                output[out_pos..out_pos + count].copy_from_slice(&batch.symbols[..count]);
+                out_pos += count;
+                bits.consume(batch.total_bits);
+                pattern = (pattern << count) | ((1u64 << count) - 1);
+
+                // Update mode based on success rate
+                speculative_mode = pattern.count_ones() > 32;
             }
+            // If batch.valid_count == 0, fall through to regular decode
         }
 
-        // Either no batch or batch ended - decode next symbol normally
+        // Regular decode path (used when speculative_mode is false OR batch failed)
         bits.refill_branchless();
         let saved_bitbuf = bits.peek_bits();
 
@@ -266,6 +292,13 @@ pub fn decode_speculative_batch(
             output[out_pos] = entry.literal_value();
             out_pos += 1;
             bits.consume_entry(entry.raw());
+
+            // Update pattern: literal = 1
+            pattern = (pattern << 1) | 1;
+            // Check if we should switch to speculative mode
+            if !speculative_mode && pattern.count_ones() > 40 {
+                speculative_mode = true;
+            }
             continue 'fastloop;
         }
 
@@ -275,7 +308,7 @@ pub fn decode_speculative_batch(
             return Ok(out_pos);
         }
 
-        // Match
+        // Match - update pattern with 0s for match length
         bits.consume_entry(entry.raw());
         let length = entry.decode_length(saved_bitbuf);
 
@@ -299,9 +332,19 @@ pub fn decode_speculative_batch(
 
         crate::libdeflate_decode::copy_match(output, out_pos, distance, length);
         out_pos += length as usize;
+
+        // Update pattern: match = shift in 0s (one per byte output)
+        // But limit to avoid overflow - just shift by min(length, 32)
+        let shift_amount = length.min(32);
+        pattern <<= shift_amount;
+
+        // Switch to regular mode if too many matches
+        if pattern.count_ones() < 24 {
+            speculative_mode = false;
+        }
     }
 
-    // Generic loop for remainder - simple fallback
+    // Generic loop for remainder
     generic_decode_loop(bits, output, out_pos, litlen_table, dist_table)
 }
 

@@ -54,6 +54,7 @@ mod ultra_decoder;
 mod ultra_decompress;
 mod ultra_fast_inflate;
 mod ultra_inflate;
+mod unified_table;
 mod utils;
 mod vector_huffman;
 
