@@ -232,6 +232,16 @@ Add Huffman decode instruction to RISC-V: `huffdec rd, rs1, rs2` (rd=symbol, rs1
 | Two-Pass Precompute | +25% | 3 days | None |
 | Branch-Free Dispatch | +15% | 2 days | None |
 
+### What DOESN'T Work
+
+| Approach | Expected | Actual | Why |
+|----------|----------|--------|-----|
+| DoubleLitCache per dynamic block | +15% | **-73%** | Build cost (4x) exceeds decode gain |
+| Ultra-decoder with DoubleLit | +30% | 26.7% of libdeflate | 385 vs 1442 MB/s |
+
+**Key insight**: Per-block table building is fatal for dynamic blocks. We need
+either (1) reuse tables across similar blocks, or (2) JIT compile for amortization.
+
 ---
 
 ## Reference Files
