@@ -1560,9 +1560,31 @@ fn get_fixed_double_lit_cache() -> &'static crate::double_literal::DoubleLitCach
     })
 }
 
+/// Get or build the specialized decoder for fixed Huffman (cached)
+fn get_fixed_specialized_decoder() -> &'static crate::specialized_decode::SpecializedDecoder {
+    use std::sync::OnceLock;
+    static DECODER: OnceLock<crate::specialized_decode::SpecializedDecoder> = OnceLock::new();
+    DECODER.get_or_init(|| {
+        // Fixed Huffman code lengths per RFC 1951
+        let mut litlen_lens = vec![0u8; 288];
+        litlen_lens[0..144].fill(8);
+        litlen_lens[144..256].fill(9);
+        litlen_lens[256..280].fill(7);
+        litlen_lens[280..288].fill(8);
+
+        let mut dist_lens = vec![0u8; 32];
+        dist_lens.fill(5);
+
+        crate::specialized_decode::SpecializedDecoder::build(&litlen_lens, &dist_lens)
+            .expect("Fixed Huffman should always build")
+    })
+}
+
 fn decode_fixed(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
-    // USE the Vector Huffman multi-literal optimizer for fixed blocks (baseline)
-    crate::vector_huffman::decode_fixed_multi_literal_bits(bits, output, out_pos)
+    // Use the optimized specialized decoder for fixed Huffman blocks
+    // This uses the same fast path as dynamic Huffman with 11-bit tables
+    let spec = get_fixed_specialized_decoder();
+    decode_with_specialized_tables(bits, output, out_pos, spec)
 }
 
 /// Huffman decode with double-literal cache optimization
