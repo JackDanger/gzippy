@@ -4021,14 +4021,17 @@ mod tests {
         ];
 
         const WARMUP: usize = 3;
-        const ITERATIONS: usize = 10;
+        let iterations: usize = std::env::var("BENCH_RUNS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
 
         eprintln!("\n╔══════════════════════════════════════════════════════════════╗");
         eprintln!("║           GZIPPY DECOMPRESSION BENCHMARK                     ║");
         eprintln!("╠══════════════════════════════════════════════════════════════╣");
         eprintln!(
             "║  Warmup: {} iterations, Measured: {} iterations              ║",
-            WARMUP, ITERATIONS
+            WARMUP, iterations
         );
         eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
 
@@ -4093,13 +4096,13 @@ mod tests {
             }
             // Measure
             let start = std::time::Instant::now();
-            for _ in 0..ITERATIONS {
+            for _ in 0..iterations {
                 libdeflater::Decompressor::new()
                     .deflate_decompress(deflate, &mut output)
                     .unwrap();
             }
             let libdeflate_speed =
-                (expected_size * ITERATIONS) as f64 / start.elapsed().as_secs_f64() / 1_000_000.0;
+                (expected_size * iterations) as f64 / start.elapsed().as_secs_f64() / 1_000_000.0;
 
             // === gzippy (pure Rust) ===
             // Warmup
@@ -4108,11 +4111,11 @@ mod tests {
             }
             // Measure
             let start = std::time::Instant::now();
-            for _ in 0..ITERATIONS {
+            for _ in 0..iterations {
                 let _ = inflate_into_pub(deflate, &mut output);
             }
             let gzippy_speed =
-                (expected_size * ITERATIONS) as f64 / start.elapsed().as_secs_f64() / 1_000_000.0;
+                (expected_size * iterations) as f64 / start.elapsed().as_secs_f64() / 1_000_000.0;
 
             let ratio = gzippy_speed / libdeflate_speed * 100.0;
             let status = if ratio >= 100.0 { "✓" } else { " " };
