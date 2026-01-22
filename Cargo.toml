@@ -52,6 +52,13 @@ memchr = "2.7"
 core_affinity = "0.8"
 libc = "0.2"
 
+# JIT compilation (Cranelift)
+cranelift-codegen = "0.116"
+cranelift-frontend = "0.116"
+cranelift-jit = "0.116"
+cranelift-module = "0.116"
+cranelift-native = "0.116"
+
 [dev-dependencies]
 tempfile = "3.8"
 assert_cmd = "2.0"

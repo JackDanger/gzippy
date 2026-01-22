@@ -18,6 +18,7 @@ mod combined_lut;
 mod compression;
 mod consume_first_decode;
 mod consume_first_table;
+mod cranelift_jit;
 mod decompression;
 mod double_literal;
 mod error;
