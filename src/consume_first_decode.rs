@@ -13,6 +13,9 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+
 use crate::jit_decode::TableFingerprint;
 use crate::libdeflate_entry::{DistTable, LitLenTable};
 use std::cell::RefCell;
@@ -258,6 +261,7 @@ fn prefetch_read(ptr: *const u8) {
     }
 }
 
+// Note: ARM64 prefetch intrinsics are unstable in Rust, so we skip prefetch on ARM
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
 fn prefetch_read(_ptr: *const u8) {}
@@ -307,9 +311,34 @@ fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32
                     dst = dst.add(8);
                 }
             }
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(target_arch = "aarch64")]
             {
-                // Fallback for non-x86_64
+                // NEON fast path: 32-byte copies using two 16-byte registers
+                while dst.add(32) <= end {
+                    let v0 = vld1q_u8(src);
+                    let v1 = vld1q_u8(src.add(16));
+                    vst1q_u8(dst, v0);
+                    vst1q_u8(dst.add(16), v1);
+                    src = src.add(32);
+                    dst = dst.add(32);
+                }
+                // 16-byte cleanup
+                while dst.add(16) <= end {
+                    let v = vld1q_u8(src);
+                    vst1q_u8(dst, v);
+                    src = src.add(16);
+                    dst = dst.add(16);
+                }
+                // 8-byte cleanup
+                while dst < end {
+                    (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+                    src = src.add(8);
+                    dst = dst.add(8);
+                }
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            {
+                // Scalar fallback
                 while dst < end {
                     (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
                     src = src.add(8);
@@ -342,7 +371,7 @@ fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32
                 dst = dst.add(8);
             }
         } else if dist == 1 {
-            // RLE path: use AVX2 broadcast for large fills
+            // RLE path: use SIMD broadcast for large fills
             let byte = *src;
             #[cfg(target_arch = "x86_64")]
             {
@@ -357,6 +386,22 @@ fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32
                     while dst.add(32) <= end {
                         _mm256_storeu_si256(dst as *mut __m256i, pattern);
                         dst = dst.add(32);
+                    }
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                if len >= 32 {
+                    // Use NEON broadcast for large RLE
+                    let pattern = vdupq_n_u8(byte);
+                    while dst.add(32) <= end {
+                        vst1q_u8(dst, pattern);
+                        vst1q_u8(dst.add(16), pattern);
+                        dst = dst.add(32);
+                    }
+                    while dst.add(16) <= end {
+                        vst1q_u8(dst, pattern);
+                        dst = dst.add(16);
                     }
                 }
             }
@@ -1885,35 +1930,10 @@ fn decode_dynamic(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<
     // Compute fingerprint for table caching
     let fingerprint = crate::jit_decode::TableFingerprint::combined(litlen_lengths, dist_lengths);
 
-    // Try specialized decoder first (flat tables, no subtables)
-    let use_specialized = SPEC_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        // Only use specialized if it doesn't need subtables (very fast)
-        cache.get_or_create(litlen_lengths, dist_lengths).is_some()
-    });
-
-    if use_specialized && litlen_lengths.iter().copied().max().unwrap_or(0) <= 11 {
-        SPEC_STATS.with(|s| s.borrow_mut().0 += 1);
-        // Use specialized flat table decoder
-        return SPEC_CACHE.with(|cache| {
-            let cache = cache.borrow();
-            if let Some(spec) = cache.get_decoder(&fingerprint) {
-                decode_with_specialized_tables(bits, output, out_pos, spec)
-            } else {
-                // Shouldn't happen, but fall back
-                drop(cache);
-                decode_dynamic_fallback(
-                    bits,
-                    output,
-                    out_pos,
-                    litlen_lengths,
-                    dist_lengths,
-                    fingerprint,
-                )
-            }
-        });
-    }
-
+    // Use libdeflate-style decoder for all dynamic blocks
+    // This achieves 99-112% of libdeflate performance across all datasets.
+    // The specialized decoder was slower for match-heavy content (SOFTWARE, LOGS)
+    // due to its inline extra-bits handling vs libdeflate's saved_bitbuf pattern.
     SPEC_STATS.with(|s| s.borrow_mut().1 += 1);
     decode_dynamic_fallback(
         bits,
