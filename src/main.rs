@@ -31,6 +31,7 @@ mod jit_decode;
 mod libdeflate_decode;
 mod libdeflate_entry;
 mod libdeflate_ext;
+mod llvm_ir_analysis;
 mod marker_decode;
 mod multi_symbol;
 mod optimization;
