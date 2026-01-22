@@ -260,13 +260,17 @@ fn build_table_with_subtables(lengths: &[u8], is_distance: bool) -> Option<Box<[
             SpecEntry::literal(symbol as u8, len)
         } else if symbol == 256 {
             SpecEntry::end_of_block(len)
-        } else {
+        } else if symbol <= 285 {
+            // Length codes 257-285
             let idx = symbol - 257;
             let (base, extra) = (
                 crate::libdeflate_entry::LENGTH_TABLE[idx].0,
                 crate::libdeflate_entry::LENGTH_TABLE[idx].1,
             );
             SpecEntry::length(base, extra, len)
+        } else {
+            // Symbols 286-287 are reserved/invalid, skip them
+            continue;
         };
 
         let step = 1 << len;
@@ -317,13 +321,17 @@ fn build_table_with_subtables(lengths: &[u8], is_distance: bool) -> Option<Box<[
             SpecEntry::literal(symbol as u8, len)
         } else if symbol == 256 {
             SpecEntry::end_of_block(len)
-        } else {
+        } else if symbol <= 285 {
+            // Length codes 257-285
             let idx = symbol - 257;
             let (base, extra) = (
                 crate::libdeflate_entry::LENGTH_TABLE[idx].0,
                 crate::libdeflate_entry::LENGTH_TABLE[idx].1,
             );
             SpecEntry::length(base, extra, len)
+        } else {
+            // Symbols 286-287 are reserved/invalid, skip them
+            continue;
         };
 
         let step = 1 << (len - 11);

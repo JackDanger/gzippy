@@ -409,6 +409,7 @@ pub mod simd_fsm {
         states: &[FsmState; 8],
         input_bits: &[u32; 8],
     ) -> [FsmTransition; 8] {
+        #[allow(unused_imports)]
         use std::arch::x86_64::*;
 
         // Compute table indices: state * num_inputs + input_bits

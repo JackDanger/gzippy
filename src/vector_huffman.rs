@@ -31,6 +31,7 @@ use std::sync::OnceLock;
 // =============================================================================
 
 #[cfg(target_arch = "x86_64")]
+#[allow(unused_imports)]
 use std::arch::x86_64::*;
 
 /// Check if AVX2 is available at runtime
