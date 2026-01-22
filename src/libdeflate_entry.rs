@@ -201,6 +201,12 @@ impl LitLenEntry {
         self.0
     }
 
+    /// Create from raw u32 value
+    #[inline(always)]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
     /// Decode length value using saved_bitbuf
     /// Length = base + extra_bits_value
     /// Decode length from saved_bitbuf (branchless)
@@ -371,6 +377,31 @@ impl LitLenTable {
             let reversed = reverse_bits(codeword, len as u8);
 
             if len <= table_bits as usize {
+                // Check if this is a length code that can be pre-expanded
+                if let Some((base, extra_bits)) = get_length_info(symbol) {
+                    let total_bits = len + extra_bits as usize;
+                    if total_bits <= table_bits as usize && extra_bits > 0 {
+                        // PRE-EXPAND: Create separate entries for each extra bit combination
+                        // This eliminates runtime extra bit reading for these codes
+                        let num_expansions = 1usize << extra_bits;
+                        for extra_val in 0..num_expansions {
+                            let final_length = base + extra_val as u16;
+                            let entry =
+                                create_preexpanded_length_entry(final_length, total_bits as u8);
+
+                            // The expanded code is: reversed_codeword | (extra_val << codeword_len)
+                            let expanded_code = (reversed as usize) | (extra_val << len);
+                            let stride = 1usize << total_bits;
+                            let mut idx = expanded_code;
+                            while idx < main_size {
+                                entries[idx] = entry;
+                                idx += stride;
+                            }
+                        }
+                        continue; // Skip the normal entry creation
+                    }
+                }
+
                 // Direct entry in main table - replicate for all suffixes
                 let entry = create_litlen_entry(symbol, len as u8);
                 let stride = 1usize << len;
@@ -434,6 +465,13 @@ impl LitLenTable {
     #[inline(always)]
     pub fn entries_ptr(&self) -> *const LitLenEntry {
         self.entries.as_ptr()
+    }
+
+    /// Look up entry by direct index (for SIMD parallel decode)
+    #[inline(always)]
+    pub fn lookup_by_index(&self, idx: usize) -> LitLenEntry {
+        // SAFETY: caller must ensure idx is within table bounds (0..2048 for main table)
+        unsafe { *self.entries.get_unchecked(idx) }
     }
 
     /// Look up a subtable entry (unsafe unchecked for max speed)
@@ -597,6 +635,17 @@ impl DistTable {
         unsafe { *self.entries.get_unchecked(subtable_start + idx) }
     }
 
+    /// Look up subtable entry from already-shifted bitbuf (libdeflate fastloop pattern)
+    /// Use when bitbuf has already been shifted by main table bits
+    #[inline(always)]
+    pub fn lookup_subtable_direct(&self, entry: DistEntry, shifted_bits: u64) -> DistEntry {
+        let subtable_start = entry.subtable_start() as usize;
+        let subtable_bits = entry.subtable_bits();
+        let idx = (shifted_bits as usize) & ((1usize << subtable_bits) - 1);
+        // SAFETY: subtable entries are allocated during build
+        unsafe { *self.entries.get_unchecked(subtable_start + idx) }
+    }
+
     /// Resolve an entry (handle subtables)
     #[inline(always)]
     pub fn resolve(&self, bits: u64) -> DistEntry {
@@ -707,6 +756,29 @@ fn create_litlen_entry(symbol: usize, codeword_bits: u8) -> LitLenEntry {
     } else {
         // Invalid symbol, create a dummy entry
         LitLenEntry(0)
+    }
+}
+
+/// Create a pre-expanded length entry where length is already computed
+/// Used when codeword + extra_bits fits in the table, avoiding runtime extra bit reading
+#[inline(always)]
+fn create_preexpanded_length_entry(length: u16, total_bits: u8) -> LitLenEntry {
+    // For pre-expanded entries:
+    // - Bit 24-16: final length value (not base, but actual length)
+    // - Bit 11-8: total_bits (for saved_bitbuf, same as bits 4-0)
+    // - Bit 4-0: total_bits (no extra bits to read at decode time)
+    // The key insight: extra_bits field = 0, so decode_length just returns base
+    LitLenEntry(((length as u32) << 16) | ((total_bits as u32) << 8) | (total_bits as u32))
+}
+
+/// Check if a length symbol can be pre-expanded and return the expansion info
+/// Returns Some((base, extra_bits)) if symbol is a length code, None otherwise
+fn get_length_info(symbol: usize) -> Option<(u16, u8)> {
+    if (257..=285).contains(&symbol) {
+        let idx = symbol - 257;
+        Some(LENGTH_TABLE[idx])
+    } else {
+        None
     }
 }
 

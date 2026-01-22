@@ -492,10 +492,15 @@ pub fn get_algebraic_decoder() -> &'static AlgebraicFsmDecoder {
 /// Cached ANF table for fixed Huffman (built at compile time)
 static ANF_FIXED_TABLE: [u16; 512] = build_anf_table_fixed();
 
-/// Decode fixed Huffman block using ANF lookup table
+/// Decode fixed Huffman block using ANF lookup table with optimized fastloop
 ///
 /// This achieves 1.5x faster symbol lookups than the standard approach
-/// by using a branchless 9-bit direct table lookup.
+/// by using a compile-time generated 9-bit direct table lookup.
+///
+/// Optimizations:
+/// - 8-literal unrolling in the fastloop
+/// - Strategic refills to minimize branches
+/// - Preloading during match copy
 pub fn decode_fixed_anf(
     bits: &mut crate::consume_first_decode::Bits,
     output: &mut [u8],
@@ -504,13 +509,14 @@ pub fn decode_fixed_anf(
     use std::io::{Error, ErrorKind};
 
     let fixed_tables = crate::libdeflate_decode::get_fixed_tables();
+    let out_ptr = output.as_mut_ptr();
 
-    loop {
-        // Ensure we have enough bits
-        if bits.available() < 15 {
-            bits.refill();
-        }
+    const FASTLOOP_MARGIN: usize = 320;
 
+    // FASTLOOP with 8-literal unrolling
+    bits.refill();
+
+    'fastloop: while out_pos + FASTLOOP_MARGIN <= output.len() {
         // ANF lookup (branchless, 9-bit direct index)
         let peek = bits.peek();
         let idx = (peek & 0x1FF) as usize;
@@ -520,13 +526,111 @@ pub fn decode_fixed_anf(
 
         // Check for valid decode
         if consumed == 0 {
-            // Invalid entry, fall back to standard decode
             return decode_fixed_fallback(bits, output, out_pos, fixed_tables);
         }
 
         bits.consume(consumed as u32);
 
-        // Literal (0-255)
+        // Literal path with 8-literal unrolling
+        if symbol < 256 {
+            unsafe {
+                *out_ptr.add(out_pos) = symbol as u8;
+            }
+            out_pos += 1;
+
+            // Unroll 7 more literals
+            for _ in 0..7 {
+                if bits.available() < 9 {
+                    bits.refill();
+                }
+
+                let peek = bits.peek();
+                let idx = (peek & 0x1FF) as usize;
+                let entry = ANF_FIXED_TABLE[idx];
+                let symbol = entry >> 4;
+                let consumed = (entry & 0xF) as u8;
+
+                if consumed == 0 || symbol >= 256 {
+                    // Not a simple literal, go back to main loop
+                    if bits.available() < 32 {
+                        bits.refill();
+                    }
+                    continue 'fastloop;
+                }
+
+                bits.consume(consumed as u32);
+                unsafe {
+                    *out_ptr.add(out_pos) = symbol as u8;
+                }
+                out_pos += 1;
+            }
+
+            // After 8 literals, refill and continue
+            bits.refill();
+            continue 'fastloop;
+        }
+
+        // EOB (256)
+        if symbol == 256 {
+            return Ok(out_pos);
+        }
+
+        // Length code (257-285)
+        let length = decode_fixed_length(symbol, peek, consumed);
+
+        // Read distance
+        bits.refill();
+        let dist_saved = bits.peek();
+        let dist_entry = fixed_tables.1.lookup(dist_saved);
+        bits.consume_entry(dist_entry.raw());
+        let distance = dist_entry.decode_distance(dist_saved);
+
+        if distance == 0 || distance as usize > out_pos {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Invalid distance {} at pos {}", distance, out_pos),
+            ));
+        }
+
+        // Copy match with preload
+        crate::libdeflate_decode::copy_match(output, out_pos, distance, length);
+        out_pos += length as usize;
+        bits.refill();
+    }
+
+    // Generic loop for end of buffer
+    decode_fixed_anf_generic(bits, output, out_pos, fixed_tables)
+}
+
+/// Generic loop for near end of buffer (no fastloop margin)
+fn decode_fixed_anf_generic(
+    bits: &mut crate::consume_first_decode::Bits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    fixed_tables: &'static (
+        crate::libdeflate_entry::LitLenTable,
+        crate::libdeflate_entry::DistTable,
+    ),
+) -> std::io::Result<usize> {
+    use std::io::{Error, ErrorKind};
+
+    loop {
+        if bits.available() < 15 {
+            bits.refill();
+        }
+
+        let peek = bits.peek();
+        let idx = (peek & 0x1FF) as usize;
+        let entry = ANF_FIXED_TABLE[idx];
+        let symbol = entry >> 4;
+        let consumed = (entry & 0xF) as u8;
+
+        if consumed == 0 {
+            return decode_fixed_fallback(bits, output, out_pos, fixed_tables);
+        }
+
+        bits.consume(consumed as u32);
+
         if symbol < 256 {
             if out_pos >= output.len() {
                 return Err(Error::new(ErrorKind::WriteZero, "Output full"));
@@ -536,16 +640,12 @@ pub fn decode_fixed_anf(
             continue;
         }
 
-        // EOB (256)
         if symbol == 256 {
             return Ok(out_pos);
         }
 
-        // Length code (257-285)
-        // Need to handle extra bits for lengths
         let length = decode_fixed_length(symbol, peek, consumed);
 
-        // Read distance
         if bits.available() < 15 {
             bits.refill();
         }
@@ -562,10 +662,10 @@ pub fn decode_fixed_anf(
             ));
         }
 
-        // Copy match
         if out_pos + length as usize > output.len() {
             return Err(Error::new(ErrorKind::WriteZero, "Output full"));
         }
+
         crate::libdeflate_decode::copy_match(output, out_pos, distance, length);
         out_pos += length as usize;
     }
@@ -614,6 +714,307 @@ fn decode_fixed_fallback(
 ) -> std::io::Result<usize> {
     // Use standard vector_huffman decode
     crate::vector_huffman::decode_fixed_multi_literal_bits(bits, output, out_pos)
+}
+
+// =============================================================================
+// Part 6: Optimized Dynamic Block Decoder
+// =============================================================================
+
+/// Build a literal bitmap from the litlen table
+/// Each bit indicates whether the corresponding main table entry is a literal
+/// This allows O(1) literal detection using a single AND + CMP
+#[inline]
+fn build_literal_bitmap(litlen_table: &crate::libdeflate_entry::LitLenTable) -> [u64; 32] {
+    let mut bitmap = [0u64; 32];
+
+    for i in 0..2048 {
+        let entry = litlen_table.lookup(i as u64);
+        if entry.is_literal() {
+            // Set bit i in the bitmap
+            bitmap[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+
+    bitmap
+}
+
+/// Check if a table index is a literal using the bitmap
+#[inline(always)]
+fn is_literal_fast(bitmap: &[u64; 32], idx: usize) -> bool {
+    let word = idx / 64;
+    let bit = idx % 64;
+    (bitmap[word] >> bit) & 1 != 0
+}
+
+/// Optimized dynamic Huffman decode - Hyperoptimized
+///
+/// Key optimizations:
+/// 1. Resolve + track subtable bits for correct consumption
+/// 2. Aggressive 4-literal unrolling without refills
+/// 3. Inline subtable resolution with proper bit tracking
+/// 4. Strategic refills
+pub fn decode_dynamic_optimized(
+    bits: &mut crate::consume_first_decode::Bits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    litlen_table: &crate::libdeflate_entry::LitLenTable,
+    dist_table: &crate::libdeflate_entry::DistTable,
+) -> std::io::Result<usize> {
+    use crate::libdeflate_entry::{DistTable, LitLenTable};
+    use std::io::{Error, ErrorKind};
+
+    let out_ptr = output.as_mut_ptr();
+    const FASTLOOP_MARGIN: usize = 274;
+
+    // Helper: resolve entry and return (entry, extra_bits_to_consume)
+    // extra_bits_to_consume is TABLE_BITS if subtable was used, 0 otherwise
+    #[inline(always)]
+    fn resolve_litlen(
+        table: &LitLenTable,
+        bits: u64,
+    ) -> (crate::libdeflate_entry::LitLenEntry, u32) {
+        let entry = table.lookup(bits);
+        if entry.is_subtable_ptr() {
+            (
+                table.lookup_subtable(entry, bits),
+                LitLenTable::TABLE_BITS as u32,
+            )
+        } else {
+            (entry, 0)
+        }
+    }
+
+    #[inline(always)]
+    fn resolve_dist(table: &DistTable, bits: u64) -> (crate::libdeflate_entry::DistEntry, u32) {
+        let entry = table.lookup(bits);
+        if entry.is_subtable_ptr() {
+            (
+                table.lookup_subtable(entry, bits),
+                DistTable::TABLE_BITS as u32,
+            )
+        } else {
+            (entry, 0)
+        }
+    }
+
+    // Main decode loop
+    'fastloop: while out_pos + FASTLOOP_MARGIN <= output.len() {
+        bits.refill();
+        let saved_bitbuf = bits.peek();
+
+        // Resolve entry (handles subtable)
+        let (entry, subtable_bits) = resolve_litlen(litlen_table, saved_bitbuf);
+
+        // Fast path: literal (bit 31 set = negative as i32)
+        if (entry.raw() as i32) < 0 {
+            // First literal
+            unsafe {
+                *out_ptr.add(out_pos) = entry.literal_value();
+            }
+            out_pos += 1;
+            bits.consume(subtable_bits); // Consume main table bits if subtable used
+            bits.consume_entry(entry.raw()); // Consume entry bits
+
+            // Aggressive unrolling - up to 3 more literals without refill
+            if bits.available() >= 45 {
+                // Second literal attempt
+                let s2 = bits.peek();
+                let (e2, sub2) = resolve_litlen(litlen_table, s2);
+
+                if (e2.raw() as i32) < 0 {
+                    unsafe {
+                        *out_ptr.add(out_pos) = e2.literal_value();
+                    }
+                    out_pos += 1;
+                    bits.consume(sub2);
+                    bits.consume_entry(e2.raw());
+
+                    // Third literal attempt
+                    let s3 = bits.peek();
+                    let (e3, sub3) = resolve_litlen(litlen_table, s3);
+
+                    if (e3.raw() as i32) < 0 {
+                        unsafe {
+                            *out_ptr.add(out_pos) = e3.literal_value();
+                        }
+                        out_pos += 1;
+                        bits.consume(sub3);
+                        bits.consume_entry(e3.raw());
+
+                        // Fourth literal attempt
+                        let s4 = bits.peek();
+                        let (e4, sub4) = resolve_litlen(litlen_table, s4);
+
+                        if (e4.raw() as i32) < 0 {
+                            unsafe {
+                                *out_ptr.add(out_pos) = e4.literal_value();
+                            }
+                            out_pos += 1;
+                            bits.consume(sub4);
+                            bits.consume_entry(e4.raw());
+                        }
+                    }
+                }
+            }
+            continue 'fastloop;
+        }
+
+        // Check for exceptional (EOB or invalid)
+        if entry.is_exceptional() {
+            if entry.is_end_of_block() {
+                bits.consume(subtable_bits);
+                bits.consume_entry(entry.raw());
+                return Ok(out_pos);
+            }
+            return Err(Error::new(ErrorKind::InvalidData, "Unresolved subtable"));
+        }
+
+        // Length code - consume main table bits first, get correct saved bits, then entry
+        bits.consume(subtable_bits);
+        let length_saved = bits.peek(); // Get bits AFTER main table consumption
+        bits.consume_entry(entry.raw());
+        let length = entry.decode_length(length_saved);
+
+        // Distance code
+        bits.refill();
+        let dist_saved = bits.peek();
+        let (dist_entry, dist_subtable_bits) = resolve_dist(dist_table, dist_saved);
+
+        if dist_entry.is_exceptional() {
+            return Err(Error::new(ErrorKind::InvalidData, "Invalid distance code"));
+        }
+
+        bits.consume(dist_subtable_bits);
+        let dist_extra_saved = bits.peek(); // Get bits AFTER main table consumption
+        bits.consume_entry(dist_entry.raw());
+        let distance = dist_entry.decode_distance(dist_extra_saved);
+
+        if distance == 0 || distance as usize > out_pos {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Invalid distance {} at pos {}", distance, out_pos),
+            ));
+        }
+
+        crate::libdeflate_decode::copy_match(output, out_pos, distance, length);
+        out_pos += length as usize;
+    }
+
+    // Generic loop for end - use the working baseline function
+    crate::consume_first_decode::decode_huffman_cf_pub(
+        bits,
+        output,
+        out_pos,
+        litlen_table,
+        dist_table,
+    )
+}
+
+/// Generic loop for near end of buffer
+fn decode_dynamic_generic(
+    bits: &mut crate::consume_first_decode::Bits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    litlen_table: &crate::libdeflate_entry::LitLenTable,
+    dist_table: &crate::libdeflate_entry::DistTable,
+) -> std::io::Result<usize> {
+    use std::io::{Error, ErrorKind};
+
+    loop {
+        bits.refill();
+        let saved = bits.peek();
+        let mut entry = litlen_table.lookup(saved);
+
+        if entry.is_subtable_ptr() {
+            bits.consume(crate::libdeflate_entry::LitLenTable::TABLE_BITS as u32);
+            entry = litlen_table.lookup_subtable(entry, saved);
+            let sub_saved = bits.peek();
+            bits.consume_entry(entry.raw());
+
+            if (entry.raw() as i32) < 0 {
+                if out_pos >= output.len() {
+                    return Err(Error::new(ErrorKind::WriteZero, "Output full"));
+                }
+                output[out_pos] = entry.literal_value();
+                out_pos += 1;
+                continue;
+            }
+
+            if entry.is_end_of_block() {
+                return Ok(out_pos);
+            }
+
+            let length = entry.decode_length(sub_saved);
+
+            bits.refill();
+            let dist_saved = bits.peek();
+            let mut dist_entry = dist_table.lookup(dist_saved);
+            if dist_entry.is_subtable_ptr() {
+                bits.consume(crate::libdeflate_entry::DistTable::TABLE_BITS as u32);
+                dist_entry = dist_table.lookup_subtable(dist_entry, dist_saved);
+            }
+            let dist_extra = bits.peek();
+            bits.consume_entry(dist_entry.raw());
+            let distance = dist_entry.decode_distance(dist_extra);
+
+            if distance == 0 || distance as usize > out_pos {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Invalid distance {} at pos {}", distance, out_pos),
+                ));
+            }
+
+            if out_pos + length as usize > output.len() {
+                return Err(Error::new(ErrorKind::WriteZero, "Output full"));
+            }
+
+            crate::libdeflate_decode::copy_match(output, out_pos, distance, length);
+            out_pos += length as usize;
+            continue;
+        }
+
+        bits.consume_entry(entry.raw());
+
+        if (entry.raw() as i32) < 0 {
+            if out_pos >= output.len() {
+                return Err(Error::new(ErrorKind::WriteZero, "Output full"));
+            }
+            output[out_pos] = entry.literal_value();
+            out_pos += 1;
+            continue;
+        }
+
+        if entry.is_end_of_block() {
+            return Ok(out_pos);
+        }
+
+        let length = entry.decode_length(saved);
+
+        bits.refill();
+        let dist_saved = bits.peek();
+        let mut dist_entry = dist_table.lookup(dist_saved);
+        if dist_entry.is_subtable_ptr() {
+            bits.consume(crate::libdeflate_entry::DistTable::TABLE_BITS as u32);
+            dist_entry = dist_table.lookup_subtable(dist_entry, dist_saved);
+        }
+        let dist_extra = bits.peek();
+        bits.consume_entry(dist_entry.raw());
+        let distance = dist_entry.decode_distance(dist_extra);
+
+        if distance == 0 || distance as usize > out_pos {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Invalid distance {} at pos {}", distance, out_pos),
+            ));
+        }
+
+        if out_pos + length as usize > output.len() {
+            return Err(Error::new(ErrorKind::WriteZero, "Output full"));
+        }
+
+        crate::libdeflate_decode::copy_match(output, out_pos, distance, length);
+        out_pos += length as usize;
+    }
 }
 
 // =============================================================================
