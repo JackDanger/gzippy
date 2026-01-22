@@ -137,8 +137,11 @@ def benchmark_compress(tool: str, level: int, threads: int,
             cmd.append(f"-p{threads}")
         cmd.extend(["-c", input_file])
     
+    # zopfli is extremely slow - only run once to avoid delaying CI
+    actual_runs = 1 if tool == "zopfli" else runs
+    
     times = []
-    for _ in range(runs):
+    for _ in range(actual_runs):
         start = time.perf_counter()
         with open(output_file, 'wb') as f:
             subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
@@ -233,19 +236,19 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                         
                         print(f"  {tool:7}: {format_time(median):>8} ±{format_time(stdev):>6}  {format_size(out_size):>10}")
                     
-                    # Check gzippy compression performance against all competitors
+                    # Check gzippy compression performance against established tools
                     gzippy_time = comp_results["gzippy"][0]
                     
                     # Compare against gzip (single-thread) or pigz (multi-thread)
                     # NOTE: igzip is benchmarked for info but not used as comparison
                     # because it produces ~15% larger files (speed-only optimization)
                     if thread_count == 1:
-                        competitors = {"gzip": comp_results["gzip"][0]}
+                        baselines = {"gzip": comp_results["gzip"][0]}
                     else:
-                        competitors = {"pigz": comp_results["pigz"][0]}
+                        baselines = {"pigz": comp_results["pigz"][0]}
                     
-                    fastest_name = min(competitors, key=competitors.get)
-                    fastest_time = competitors[fastest_name]
+                    fastest_name = min(baselines, key=baselines.get)
+                    fastest_time = baselines[fastest_name]
                     
                     diff_pct = (gzippy_time / fastest_time - 1) * 100
                     if diff_pct <= MAX_OVERHEAD_PCT:
@@ -275,15 +278,15 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                     # Check gzippy decompression performance
                     gzippy_time = decomp_results["gzippy"][0]
                     
-                    # Compare against all competitors
-                    competitors = {
+                    # Compare against established tools
+                    baselines = {
                         "gzip": decomp_results["gzip"][0],
                         "pigz": decomp_results["pigz"][0],
                         "igzip": decomp_results["igzip"][0],
                     }
                     
-                    fastest_name = min(competitors, key=competitors.get)
-                    fastest_time = competitors[fastest_name]
+                    fastest_name = min(baselines, key=baselines.get)
+                    fastest_time = baselines[fastest_name]
                     
                     diff_pct = (gzippy_time / fastest_time - 1) * 100
                     if diff_pct <= MAX_OVERHEAD_PCT:

@@ -7,18 +7,61 @@ use std::env;
 use std::path::Path;
 use std::process;
 
+mod algebraic_decode;
+#[macro_use]
+mod test_utils;
+mod benchmark_datasets;
+mod bgzf;
+mod block_finder;
+mod block_finder_lut;
+mod bmi2;
 mod cli;
+mod combined_lut;
 mod compression;
+mod consume_first_decode;
+mod consume_first_table;
 mod decompression;
+mod double_literal;
 mod error;
+mod fast_inflate;
 mod format;
+mod golden_tests;
+mod hyper_parallel;
+mod inflate_tables;
+mod isal;
+mod jit_decode;
+mod libdeflate_decode;
+mod libdeflate_entry;
 mod libdeflate_ext;
+mod marker_decode;
+mod multi_symbol;
 mod optimization;
+mod packed_lut;
 mod parallel_compress;
+mod parallel_decompress;
+mod parallel_inflate;
 mod pipelined_compress;
+mod precomputed_decode;
+mod rapidgzip_decoder;
 mod scheduler;
+mod simd_copy;
+mod simd_huffman;
+mod simd_inflate;
+mod simd_parallel_decode;
 mod simple_optimizations;
+mod specialized_decode;
+mod speculative_batch;
+mod thread_pool;
+mod turbo_inflate;
+mod two_level_table;
+mod ultimate_decode;
+mod ultra_decoder;
+mod ultra_decompress;
+mod ultra_fast_inflate;
+mod ultra_inflate;
+mod unified_table;
 mod utils;
+mod vector_huffman;
 
 use cli::GzippyArgs;
 use error::GzippyError;
@@ -136,7 +179,7 @@ fn print_help() {
 }
 
 fn print_license() {
-    println!("gzippy - The fastest parallel gzip");
+    println!("gzippy - The fastest gzip");
     println!();
     println!("Inspired by pigz by Mark Adler, Copyright (C) 2007-2023");
     println!();
