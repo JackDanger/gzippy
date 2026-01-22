@@ -2698,6 +2698,134 @@ fn decode_match_for_lane(
 mod tests {
     use super::*;
 
+    /// Helper for benchmarking a single dataset
+    fn run_bench(name: &str, gz_path: &str) {
+        // Ensure files are prepared
+        let _ = crate::benchmark_datasets::prepare_datasets();
+
+        let gz = match std::fs::read(gz_path) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("Skipping {} benchmark - file not found: {}", name, gz_path);
+                return;
+            }
+        };
+
+        // Parse gzip header properly
+        let mut pos = 10;
+        let flg = gz[3];
+        if (flg & 0x04) != 0 {
+            let xlen = u16::from_le_bytes([gz[pos], gz[pos + 1]]) as usize;
+            pos += 2 + xlen;
+        }
+        if (flg & 0x08) != 0 {
+            while pos < gz.len() && gz[pos] != 0 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+        if (flg & 0x10) != 0 {
+            while pos < gz.len() && gz[pos] != 0 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+        if (flg & 0x02) != 0 {
+            pos += 2;
+        }
+
+        let deflate = &gz[pos..gz.len() - 8];
+        let isize = u32::from_le_bytes([
+            gz[gz.len() - 4],
+            gz[gz.len() - 3],
+            gz[gz.len() - 2],
+            gz[gz.len() - 1],
+        ]) as usize;
+
+        let mut output = vec![0u8; isize + 1024];
+        let mut lib_output = vec![0u8; isize + 1024];
+
+        // Verify libdeflate can decode it first
+        let lib_size = libdeflater::Decompressor::new()
+            .deflate_decompress(deflate, &mut lib_output)
+            .expect("libdeflate failed");
+
+        // Now try our decoder
+        let our_result = inflate_consume_first(deflate, &mut output);
+
+        if let Err(e) = &our_result {
+            eprintln!("Error decoding {}: {:?}", name, e);
+            let check_len = lib_size.min(output.len());
+            for i in 0..check_len {
+                if output[i] != lib_output[i] {
+                    eprintln!(
+                        "First mismatch at byte {}: got {:02x} expected {:02x}",
+                        i, output[i], lib_output[i]
+                    );
+                    break;
+                }
+            }
+            panic!("Our decode failed for {}", name);
+        }
+
+        let our_size = our_result.unwrap();
+        assert_eq!(our_size, lib_size, "Size mismatch for {}", name);
+
+        // Check first 10KB for correctness (matches original benchmark behavior)
+        let check_len = 10000.min(our_size);
+        if output[..check_len] != lib_output[..check_len] {
+            for i in 0..check_len {
+                if output[i] != lib_output[i] {
+                    panic!("Data mismatch at byte {} for {}", i, name);
+                }
+            }
+        }
+
+        // Benchmark
+        let iterations = 10;
+        reset_cache_stats();
+
+        let start_t = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = inflate_consume_first(deflate, &mut output);
+        }
+        let our_time = start_t.elapsed();
+
+        let start_t = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = libdeflater::Decompressor::new().deflate_decompress(deflate, &mut lib_output);
+        }
+        let lib_time = start_t.elapsed();
+
+        let our_throughput = (isize * iterations) as f64 / our_time.as_secs_f64() / 1e6;
+        let lib_throughput = (isize * iterations) as f64 / lib_time.as_secs_f64() / 1e6;
+
+        let (hits, misses, hit_rate) = get_cache_stats();
+
+        eprintln!("\n=== CONSUME-FIRST {} ===", name.to_uppercase());
+        eprintln!("Data size: {:.1} MB", isize as f64 / 1_000_000.0);
+        eprintln!("Our throughput:       {:>8.1} MB/s", our_throughput);
+        eprintln!("libdeflate throughput: {:>8.1} MB/s", lib_throughput);
+        eprintln!("Ratio: {:.1}%", 100.0 * our_throughput / lib_throughput);
+        eprintln!(
+            "Cache: {} hits, {} misses ({:.1}% hit rate)",
+            hits,
+            misses,
+            hit_rate * 100.0
+        );
+        let (spec_used, spec_fallback) = get_spec_stats();
+        if spec_used + spec_fallback > 0 {
+            let spec_rate = spec_used as f64 / (spec_used + spec_fallback) as f64;
+            eprintln!(
+                "Specialized: {} used, {} fallback ({:.1}% specialized)",
+                spec_used,
+                spec_fallback,
+                spec_rate * 100.0
+            );
+        }
+        eprintln!("=============================\n");
+    }
+
     #[test]
     fn test_cf_simple_literals() {
         let original = b"Hello, World!";
@@ -2778,267 +2906,22 @@ mod tests {
         assert_eq!(&output[..size], original.as_slice());
     }
 
-    /// REAL benchmark on multiple datasets - the only valid benchmark
-    #[test]
-    fn bench_cf_all_datasets() {
-        let datasets = match crate::benchmark_datasets::prepare_datasets() {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Failed to prepare datasets: {}", e);
-                return;
-            }
-        };
-
-        eprintln!("\n=== Multi-Dataset Benchmark (Consume-First) ===");
-        eprintln!(
-            "{:<15} | {:>10} | {:>10} | {:>10}",
-            "Dataset", "Size (MB)", "Throughput", "Format"
-        );
-        eprintln!("{:-<15}-|-{:-<10}-|-{:-<10}-|-{:-<10}", "", "", "", "");
-
-        for (name, _raw_path, gz_path) in datasets {
-            let gz = match std::fs::read(&gz_path) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-
-            // Parse gzip header properly
-            let mut pos = 10;
-            let flg = gz[3];
-            if (flg & 0x04) != 0 {
-                let xlen = u16::from_le_bytes([gz[pos], gz[pos + 1]]) as usize;
-                pos += 2 + xlen;
-            }
-            if (flg & 0x08) != 0 {
-                while pos < gz.len() && gz[pos] != 0 {
-                    pos += 1;
-                }
-                pos += 1;
-            }
-            if (flg & 0x10) != 0 {
-                while pos < gz.len() && gz[pos] != 0 {
-                    pos += 1;
-                }
-                pos += 1;
-            }
-            if (flg & 0x02) != 0 {
-                pos += 2;
-            }
-
-            let deflate = &gz[pos..gz.len() - 8];
-            let isize = u32::from_le_bytes([
-                gz[gz.len() - 4],
-                gz[gz.len() - 3],
-                gz[gz.len() - 2],
-                gz[gz.len() - 1],
-            ]) as usize;
-
-            let mut output = vec![0u8; isize + 1024];
-
-            let format = if name == "software" {
-                "libdeflate L12"
-            } else if name == "logs" {
-                "libdeflate L1"
-            } else {
-                "flate2 Best"
-            };
-
-            // Warmup
-            let _ = inflate_consume_first(deflate, &mut output);
-
-            let iterations = 3;
-            let start = std::time::Instant::now();
-            let mut total_out = 0;
-            for _ in 0..iterations {
-                total_out = inflate_consume_first(deflate, &mut output).unwrap();
-            }
-            let elapsed = start.elapsed();
-            let mb_per_sec = (total_out * iterations) as f64 / elapsed.as_secs_f64() / 1_000_000.0;
-
-            eprintln!(
-                "{:<15} | {:>10.1} | {:>8.1} MB/s | {:<13}",
-                name,
-                total_out as f64 / 1_000_000.0,
-                mb_per_sec,
-                format
-            );
-        }
-        eprintln!("===============================================");
-    }
-
-    /// REAL benchmark on silesia - the only valid benchmark
+    /// Benchmark on silesia dataset
     #[test]
     fn bench_cf_silesia() {
-        let gz = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("Skipping silesia benchmark - file not found");
-                return;
-            }
-        };
+        run_bench("silesia", "benchmark_data/silesia-gzip.tar.gz");
+    }
 
-        // Parse gzip header properly
-        let mut pos = 10; // Skip magic, method, flags, mtime, xfl, os
-        let flg = gz[3];
-        if (flg & 0x04) != 0 {
-            // FEXTRA
-            let xlen = u16::from_le_bytes([gz[pos], gz[pos + 1]]) as usize;
-            pos += 2 + xlen;
-        }
-        if (flg & 0x08) != 0 {
-            // FNAME
-            while pos < gz.len() && gz[pos] != 0 {
-                pos += 1;
-            }
-            pos += 1;
-        }
-        if (flg & 0x10) != 0 {
-            // FCOMMENT
-            while pos < gz.len() && gz[pos] != 0 {
-                pos += 1;
-            }
-            pos += 1;
-        }
-        if (flg & 0x02) != 0 {
-            // FHCRC
-            pos += 2;
-        }
+    /// Benchmark on software archive dataset (source code patterns)
+    #[test]
+    fn bench_cf_software() {
+        run_bench("software", "benchmark_data/software.archive.gz");
+    }
 
-        let start = pos;
-        let end = gz.len() - 8;
-        let deflate = &gz[start..end];
-        let isize = u32::from_le_bytes([
-            gz[gz.len() - 4],
-            gz[gz.len() - 3],
-            gz[gz.len() - 2],
-            gz[gz.len() - 1],
-        ]) as usize;
-
-        eprintln!(
-            "Deflate stream: start={} end={} len={} isize={}",
-            start,
-            end,
-            deflate.len(),
-            isize
-        );
-        eprintln!(
-            "First 20 deflate bytes: {:02x?}",
-            &deflate[..20.min(deflate.len())]
-        );
-
-        let mut output = vec![0u8; isize + 1000];
-        let mut lib_output = vec![0u8; isize + 1000];
-
-        // Verify libdeflate can decode it first
-        let lib_size = libdeflater::Decompressor::new()
-            .deflate_decompress(deflate, &mut lib_output)
-            .expect("libdeflate failed");
-        eprintln!("libdeflate decoded {} bytes successfully", lib_size);
-        eprintln!(
-            "First 20 output bytes: {:02x?}",
-            &lib_output[..20.min(lib_size)]
-        );
-
-        // Now try our decoder
-        let our_result = inflate_consume_first(deflate, &mut output);
-
-        if let Err(e) = &our_result {
-            eprintln!("Error: {:?}", e);
-            // Check how many bytes match
-            let check_len = lib_size.min(output.len());
-            let mut first_mismatch = None;
-            for i in 0..check_len {
-                if output[i] != lib_output[i] {
-                    first_mismatch = Some(i);
-                    eprintln!(
-                        "First mismatch at byte {}: got {:02x} expected {:02x}",
-                        i, output[i], lib_output[i]
-                    );
-                    let start = i.saturating_sub(5);
-                    let end = (i + 10).min(check_len);
-                    eprintln!("Our bytes around mismatch: {:02x?}", &output[start..end]);
-                    eprintln!(
-                        "Lib bytes around mismatch: {:02x?}",
-                        &lib_output[start..end]
-                    );
-                    break;
-                }
-            }
-            if let Some(pos) = first_mismatch {
-                eprintln!("First {} bytes matched before mismatch", pos);
-            } else {
-                // Count how many non-zero bytes we decoded
-                let decoded = output
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find(|(_, &b)| b != 0)
-                    .map(|(i, _)| i + 1)
-                    .unwrap_or(0);
-                eprintln!("Decoded {} bytes, all match!", decoded);
-            }
-        }
-
-        let our_size = our_result.expect("Our decode failed");
-
-        assert_eq!(our_size, lib_size, "Size mismatch");
-
-        // Check first 10KB
-        for i in 0..10000.min(our_size) {
-            if output[i] != lib_output[i] {
-                panic!(
-                    "Mismatch at byte {}: got {} expected {}",
-                    i, output[i], lib_output[i]
-                );
-            }
-        }
-
-        // Benchmark with more iterations for stability
-        let iterations = 10;
-
-        // Reset cache stats before benchmark
-        reset_cache_stats();
-
-        let start_t = std::time::Instant::now();
-        for _ in 0..iterations {
-            let _ = inflate_consume_first(deflate, &mut output);
-        }
-        let our_time = start_t.elapsed();
-
-        let start_t = std::time::Instant::now();
-        for _ in 0..iterations {
-            let _ = libdeflater::Decompressor::new().deflate_decompress(deflate, &mut lib_output);
-        }
-        let lib_time = start_t.elapsed();
-
-        let our_throughput = (isize * iterations) as f64 / our_time.as_secs_f64() / 1e6;
-        let lib_throughput = (isize * iterations) as f64 / lib_time.as_secs_f64() / 1e6;
-
-        // Get cache statistics
-        let (hits, misses, hit_rate) = get_cache_stats();
-
-        eprintln!("\n=== CONSUME-FIRST SILESIA ===");
-        eprintln!("Data size: {} MB", isize / 1_000_000);
-        eprintln!("Our throughput:       {:>8.1} MB/s", our_throughput);
-        eprintln!("libdeflate throughput: {:>8.1} MB/s", lib_throughput);
-        eprintln!("Ratio: {:.1}%", 100.0 * our_throughput / lib_throughput);
-        eprintln!(
-            "Cache: {} hits, {} misses ({:.1}% hit rate)",
-            hits,
-            misses,
-            hit_rate * 100.0
-        );
-        let (spec_used, spec_fallback) = get_spec_stats();
-        if spec_used + spec_fallback > 0 {
-            let spec_rate = spec_used as f64 / (spec_used + spec_fallback) as f64;
-            eprintln!(
-                "Specialized: {} used, {} fallback ({:.1}% specialized)",
-                spec_used,
-                spec_fallback,
-                spec_rate * 100.0
-            );
-        }
-        eprintln!("=============================\n");
+    /// Benchmark on repetitive logs dataset
+    #[test]
+    fn bench_cf_logs() {
+        run_bench("logs", "benchmark_data/logs.txt.gz");
     }
 
     #[test]
