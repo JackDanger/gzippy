@@ -19,12 +19,22 @@ Every change must be benchmarked. Every optimization must be measured. Speed is 
 ## Current Performance Status
 
 ```
-Our throughput:          ~950 MB/s
+Our throughput:          ~1350 MB/s
 libdeflate throughput:   ~1400 MB/s
-Ratio: 68%
-Gap to parity: 32%
-Gap to target (130%): 93%
+Ratio: 97-99% (with variance up to 101%)
+Gap to parity: 1-3%
+Gap to target (130%): 31-33%
 ```
+
+## CRITICAL: Commit and Push Frequently
+
+**ALWAYS commit and push after each optimization attempt:**
+```bash
+git add -A && git commit -m "perf: <description of what was tried>"
+git push origin <branch>
+```
+
+This ensures work is not lost and allows easy rollback if needed.
 
 ## What Has Been Tried and FAILED
 
@@ -37,8 +47,18 @@ Gap to target (130%): 93%
 | Multi-symbol (augment style) | +15% | **-3%** | Double lookup overhead |
 | Speculative batch (basic) | +28% | **-1%** | Still sequential lookups |
 | Adaptive bloom filter | +10% | **-2%** | Tracking overhead |
+| Multi-symbol (integrated) | +10% | **-5% to +2%** | High variance, check overhead exceeds savings |
 
 **KEY LESSON: Micro-optimizations often REGRESS. LLVM already optimizes well.**
+
+## What HAS Worked
+
+| Optimization | Gain | Notes |
+|--------------|------|-------|
+| BMI2 BZHI bit extraction | +2-3% | Branchless masking on ARM |
+| Pre-expanded length codes | +3-5% | Pack length+extra into table |
+| Early dist lookup | +1-2% | Overlap memory fetch with computation |
+| Table caching (fingerprint) | +5-10% | 90% cache hit rate |
 
 ## What MIGHT Work (Untried or Partially Tried)
 
