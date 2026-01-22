@@ -125,18 +125,26 @@ pub fn reset_cache_stats() {
 }
 
 // =============================================================================
-// Bit Extraction - BZHI equivalent for all platforms
+// Bit Extraction - BMI2 BZHI on x86_64, branchless fallback elsewhere
 // =============================================================================
 
-/// Extract low n bits from a value (BZHI equivalent)
-/// Branchless implementation - n must be in range 0..64
-/// In deflate decoding, n is always < 32 (max 15-bit codes + 13 extra bits)
+/// Extract low n bits from a value using BMI2 BZHI when available
+/// On x86_64 with BMI2, this compiles to a single `bzhi` instruction
+/// Elsewhere, uses branchless mask computation
 #[inline(always)]
 fn bzhi_u64(x: u64, n: u32) -> u64 {
-    // Branchless: compute mask and apply
-    // For n=0, mask = 0; for n=63, mask = 0x7FFF_FFFF_FFFF_FFFF
-    let mask = (1u64 << (n & 63)).wrapping_sub(1);
-    x & mask
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        // BMI2 bzhi instruction - single cycle bit extraction
+        unsafe { _bzhi_u64(x, n) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        // Branchless: compute mask and apply
+        // For n=0, mask = 0; for n=63, mask = 0x7FFF_FFFF_FFFF_FFFF
+        let mask = (1u64 << (n & 63)).wrapping_sub(1);
+        x & mask
+    }
 }
 
 /// Alias for backward compatibility
