@@ -13,6 +13,7 @@ mod bgzf;
 mod block_finder;
 mod block_finder_lut;
 mod bmi2;
+mod bytecode_decode;
 mod cli;
 mod combined_lut;
 mod compression;
