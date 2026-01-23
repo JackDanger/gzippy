@@ -6,7 +6,11 @@ Cargo.lock
 /test_data/*
 !/test_data/text-1MB.txt
 /test_results/
-/benchmark_data/
+
+# Benchmark data - only track silesia corpus (47MB xz), rest generated on demand
+# Run scripts/prepare_benchmark_data.sh to regenerate all datasets
+/benchmark_data/*
+!/benchmark_data/silesia.tar.xz
 
 # Compressed test outputs
 *.gz

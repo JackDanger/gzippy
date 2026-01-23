@@ -3,15 +3,15 @@
 # =============================================================================
 # Architecture:
 #   Stage 1: Build all tools ONCE
-#   Stage 2: Prepare test data for compression (3 content types)
-#   Stage 3a: Compression benchmarks (content × level × threads)
-#   Stage 3b: Prepare decompression archives (4 diverse structures)
-#   Stage 3c: Decompression benchmarks (archive_type × threads)
-#   Stage 4: Guards - apply threshold assertions
-#   Stage 5: Summary - aggregate and post to PR
+#   Stage 2: Prepare benchmark data (download silesia, generate software/logs)
+#   Stage 3: Compression benchmarks (data_type × level × threads)
+#   Stage 4: Decompression benchmarks (archive_type × threads)
+#   Stage 5: Guards and summary
 #
-# Compression tests: 3 content types × 3 levels × 2 thread configs = 18 jobs
-# Decompression tests: 4 archive types × 2 thread configs = 8 jobs
+# Benchmark data:
+#   - silesia-large.gz (~170MB compressed, ~500MB uncompressed) - mixed binary/text
+#   - software.archive.gz - synthetic source code patterns
+#   - logs.txt.gz - synthetic repetitive log data
 # =============================================================================
 name: Benchmarks
 
@@ -31,7 +31,7 @@ env:
 
 jobs:
   # ============================================================================
-  # STAGE 1: Build all tools once, share via artifacts
+  # STAGE 1: Build all tools once
   # ============================================================================
   build:
     name: Build Tools
@@ -101,92 +101,41 @@ jobs:
           retention-days: 1
 
   # ============================================================================
-  # STAGE 2: Prepare compression test data (3 content types)
+  # STAGE 2: Prepare benchmark data
+  # Uses shared script that downloads silesia and generates software/logs
+  # Compressed versions are cached in git; uncompressed regenerated on demand
   # ============================================================================
-  prepare-compression-data:
-    name: Prepare ${{ matrix.content_type }} 100MB
+  prepare-data:
+    name: Prepare Benchmark Data
     runs-on: ubuntu-latest
     needs: build
-    strategy:
-      matrix:
-        content_type: [silesia, software, logs]
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: binaries
-          path: ./bin
+      - uses: actions/checkout@v4
 
-      - name: Setup binaries
-        run: chmod +x ./bin/*
-
-      - name: Generate test data
+      - name: Prepare benchmark data
         run: |
-          if [ "${{ matrix.content_type }}" = "silesia" ]; then
-            # Silesia approximation: Mixed binary and text
-            python3 -c "
-          import random
-          random.seed(42)
-          with open('/tmp/test-data.bin', 'wb') as f:
-              for _ in range(100):
-                  f.write(random.randbytes(512 * 1024))
-                  f.write(b'The quick brown fox jumps over the lazy dog\n' * 10000)
-                  f.write(b'\x00' * 64 * 1024)
-          "
-          elif [ "${{ matrix.content_type }}" = "software" ]; then
-            # Software: High match density (source code patterns)
-            python3 -c "
-          patterns = [
-              b'    pub fn new() -> Self {\n        Self {\n            data: Vec::with_capacity(1024),\n            count: 0,\n        }\n    }\n',
-              b'    #[inline(always)]\n    pub fn get_count(&self) -> usize {\n        self.count\n    }\n',
-              b'// TODO: Implement SIMD optimization for this loop\nfor i in 0..data.len() {\n    sum += data[i] as u64;\n}\n',
-          ]
-          target = 100 * 1024 * 1024
-          with open('/tmp/test-data.bin', 'wb') as f:
-              written = 0
-              i = 0
-              while written < target:
-                  p = patterns[i % len(patterns)]
-                  f.write(p)
-                  written += len(p)
-                  i += 1
-          "
-          else
-            # Logs: Extreme repetition (structured logs)
-            python3 -c "
-          log_patterns = [
-              b'2026-01-20 14:30:05 INFO [com.gzippy.core] Processed block 1024 in 5.2ms\n',
-              b'2026-01-20 14:30:05 DEBUG [com.gzippy.sched] Lane 0 claimed chunk at offset 0x4000\n',
-          ]
-          target = 100 * 1024 * 1024
-          with open('/tmp/test-data.bin', 'wb') as f:
-              written = 0
-              i = 0
-              while written < target:
-                  p = log_patterns[i % len(log_patterns)]
-                  f.write(p)
-                  written += len(p)
-                  i += 1
-          "
-          fi
-          ls -lh /tmp/test-data.bin
+          chmod +x scripts/prepare_benchmark_data.sh
+          ./scripts/prepare_benchmark_data.sh all
+          echo "=== Benchmark data ready ==="
+          ls -lh benchmark_data/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: compression-data-${{ matrix.content_type }}
-          path: /tmp/test-data.bin
+          name: benchmark-data
+          path: benchmark_data/
           retention-days: 1
 
   # ============================================================================
-  # STAGE 3a: Compression benchmarks (content × level × threads)
+  # STAGE 3: Compression benchmarks (data_type × level × threads)
   # ============================================================================
   compression-benchmark:
-    name: Compress ${{ matrix.content_type }} L${{ matrix.level }} T${{ matrix.threads }}
+    name: Compress ${{ matrix.data_type }} L${{ matrix.level }} T${{ matrix.threads }}
     runs-on: ubuntu-latest
-    needs: prepare-compression-data
+    needs: prepare-data
     strategy:
       fail-fast: false
       matrix:
-        content_type: [silesia, software, logs]
+        data_type: [silesia, software, logs]
         level: [1, 6, 9]
         threads: ["1", "max"]
     steps:
@@ -199,8 +148,8 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: compression-data-${{ matrix.content_type }}
-          path: ./data
+          name: benchmark-data
+          path: ./benchmark_data
 
       - name: Setup
         run: |
@@ -213,151 +162,55 @@ jobs:
             echo "THREADS=${{ matrix.threads }}" >> $GITHUB_ENV
           fi
 
+          # Map data_type to actual file
+          case "${{ matrix.data_type }}" in
+            silesia)
+              echo "DATA_FILE=benchmark_data/silesia.tar" >> $GITHUB_ENV
+              ;;
+            software)
+              echo "DATA_FILE=benchmark_data/software.archive" >> $GITHUB_ENV
+              ;;
+            logs)
+              echo "DATA_FILE=benchmark_data/logs.txt" >> $GITHUB_ENV
+              ;;
+          esac
+
+      - name: Verify data exists
+        run: |
+          ls -lh benchmark_data/
+          if [ ! -f "$DATA_FILE" ]; then
+            echo "ERROR: $DATA_FILE not found"
+            exit 1
+          fi
+          echo "Using: $DATA_FILE ($(du -h $DATA_FILE | cut -f1))"
+
       - name: Run compression benchmark
         run: |
           python3 scripts/benchmark_compression.py \
             --binaries ./bin \
-            --data-file ./data/test-data.bin \
+            --data-file "$DATA_FILE" \
             --level ${{ matrix.level }} \
             --threads $THREADS \
-            --content-type ${{ matrix.content_type }} \
+            --content-type ${{ matrix.data_type }} \
             --output results/compression.json
 
       - uses: actions/upload-artifact@v4
         with:
-          name: results-compress-${{ matrix.content_type }}-l${{ matrix.level }}-t${{ matrix.threads }}
+          name: results-compress-${{ matrix.data_type }}-l${{ matrix.level }}-t${{ matrix.threads }}
           path: results/
           retention-days: 7
 
   # ============================================================================
-  # STAGE 3b: Prepare decompression archives (4 diverse structures)
-  # ============================================================================
-  # Archive diversity:
-  #   1. silesia-dynamic: Mixed content, dynamic Huffman, multi-block (gzip -9)
-  #   2. software-dense: Source code, dense LZ77 matches (libdeflate L12)
-  #   3. logs-fast: High repetition, simpler blocks (libdeflate L1)
-  #   4. tarball-single: Real /usr content, single-member 500MB (gzip -6)
-  # ============================================================================
-  prepare-decompression-archives:
-    name: Prepare ${{ matrix.archive_type }}
-    runs-on: ubuntu-latest
-    needs: build
-    strategy:
-      matrix:
-        archive_type: [silesia-dynamic, software-dense, logs-fast, tarball-single]
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: binaries
-          path: ./bin
-
-      - name: Setup binaries
-        run: chmod +x ./bin/*
-
-      - name: Create archive
-        run: |
-          mkdir -p /tmp/archive
-
-          case "${{ matrix.archive_type }}" in
-            silesia-dynamic)
-              # Mixed binary/text content, compressed with gzip -9
-              # Creates dynamic Huffman blocks, multi-block structure
-              python3 -c "
-          import random
-          random.seed(42)
-          with open('/tmp/original.bin', 'wb') as f:
-              for _ in range(100):
-                  f.write(random.randbytes(512 * 1024))
-                  f.write(b'The quick brown fox jumps over the lazy dog\n' * 10000)
-                  f.write(b'\x00' * 64 * 1024)
-          "
-              gzip -9 -c /tmp/original.bin > /tmp/archive/compressed.gz
-              echo "silesia-dynamic: Dynamic Huffman, multi-block, mixed content"
-              ;;
-
-            software-dense)
-              # Source code patterns, compressed with libdeflate L12
-              # Creates dense LZ77 match sequences
-              python3 -c "
-          patterns = [
-              b'    pub fn new() -> Self {\n        Self {\n            data: Vec::with_capacity(1024),\n            count: 0,\n        }\n    }\n',
-              b'    #[inline(always)]\n    pub fn get_count(&self) -> usize {\n        self.count\n    }\n',
-              b'// TODO: Implement SIMD optimization for this loop\nfor i in 0..data.len() {\n    sum += data[i] as u64;\n}\n',
-          ]
-          target = 100 * 1024 * 1024
-          with open('/tmp/original.bin', 'wb') as f:
-              written = 0
-              i = 0
-              while written < target:
-                  p = patterns[i % len(patterns)]
-                  f.write(p)
-                  written += len(p)
-                  i += 1
-          "
-              # Use gzippy at L12 (libdeflate) for dense match compression
-              ./bin/gzippy --level 12 -c /tmp/original.bin > /tmp/archive/compressed.gz
-              echo "software-dense: Dense LZ77 matches, source code patterns"
-              ;;
-
-            logs-fast)
-              # Structured logs, compressed with libdeflate L1
-              # Creates simpler block structures, high repetition
-              python3 -c "
-          log_patterns = [
-              b'2026-01-20 14:30:05 INFO [com.gzippy.core] Processed block 1024 in 5.2ms\n',
-              b'2026-01-20 14:30:05 DEBUG [com.gzippy.sched] Lane 0 claimed chunk at offset 0x4000\n',
-          ]
-          target = 100 * 1024 * 1024
-          with open('/tmp/original.bin', 'wb') as f:
-              written = 0
-              i = 0
-              while written < target:
-                  p = log_patterns[i % len(log_patterns)]
-                  f.write(p)
-                  written += len(p)
-                  i += 1
-          "
-              ./bin/gzippy -1 -c /tmp/original.bin > /tmp/archive/compressed.gz
-              echo "logs-fast: Simple blocks, extreme repetition"
-              ;;
-
-            tarball-single)
-              # Real /usr content as tarball, single-member gzip
-              # Tests hyper-parallel 4-phase pipeline
-              echo "Creating 500MB tarball from /usr..."
-              tar cf - /usr/share /usr/lib 2>/dev/null | head -c $((500 * 1024 * 1024)) > /tmp/original.bin
-
-              CURRENT_SIZE=$(stat -c%s /tmp/original.bin)
-              if [ "$CURRENT_SIZE" -lt $((500 * 1024 * 1024)) ]; then
-                dd if=/dev/zero bs=1 count=$((500 * 1024 * 1024 - CURRENT_SIZE)) >> /tmp/original.bin 2>/dev/null
-              fi
-
-              # Compress with standard gzip (creates single-member file)
-              gzip -6 -c /tmp/original.bin > /tmp/archive/compressed.gz
-              echo "tarball-single: Single-member, 500MB real content"
-              ;;
-          esac
-
-          ls -lh /tmp/original.bin /tmp/archive/compressed.gz
-          cp /tmp/original.bin /tmp/archive/original.bin
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: decompress-archive-${{ matrix.archive_type }}
-          path: /tmp/archive/
-          retention-days: 1
-
-  # ============================================================================
-  # STAGE 3c: Decompression benchmarks (archive_type × threads)
+  # STAGE 4: Decompression benchmarks (archive_type × threads)
   # ============================================================================
   decompression-benchmark:
     name: Decompress ${{ matrix.archive_type }} T${{ matrix.threads }}
     runs-on: ubuntu-latest
-    needs: prepare-decompression-archives
+    needs: prepare-data
     strategy:
       fail-fast: false
       matrix:
-        archive_type: [silesia-dynamic, software-dense, logs-fast, tarball-single]
+        archive_type: [silesia, software, logs]
         threads: ["1", "max"]
     steps:
       - uses: actions/checkout@v4
@@ -369,8 +222,8 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: decompress-archive-${{ matrix.archive_type }}
-          path: ./archive
+          name: benchmark-data
+          path: ./benchmark_data
 
       - name: Setup
         run: |
@@ -383,12 +236,48 @@ jobs:
             echo "THREADS=${{ matrix.threads }}" >> $GITHUB_ENV
           fi
 
+          # Map archive_type to actual files
+          case "${{ matrix.archive_type }}" in
+            silesia)
+              # Use the large silesia file for parallel benchmarks, fall back to regular
+              if [ -f benchmark_data/silesia-large.gz ]; then
+                echo "COMPRESSED_FILE=benchmark_data/silesia-large.gz" >> $GITHUB_ENV
+                echo "ORIGINAL_FILE=benchmark_data/silesia-large.bin" >> $GITHUB_ENV
+              else
+                echo "COMPRESSED_FILE=benchmark_data/silesia-gzip.tar.gz" >> $GITHUB_ENV
+                echo "ORIGINAL_FILE=benchmark_data/silesia.tar" >> $GITHUB_ENV
+              fi
+              ;;
+            software)
+              echo "COMPRESSED_FILE=benchmark_data/software.archive.gz" >> $GITHUB_ENV
+              echo "ORIGINAL_FILE=benchmark_data/software.archive" >> $GITHUB_ENV
+              ;;
+            logs)
+              echo "COMPRESSED_FILE=benchmark_data/logs.txt.gz" >> $GITHUB_ENV
+              echo "ORIGINAL_FILE=benchmark_data/logs.txt" >> $GITHUB_ENV
+              ;;
+          esac
+
+      - name: Verify data exists
+        run: |
+          ls -lh benchmark_data/
+          if [ ! -f "$COMPRESSED_FILE" ]; then
+            echo "ERROR: $COMPRESSED_FILE not found"
+            exit 1
+          fi
+          if [ ! -f "$ORIGINAL_FILE" ]; then
+            echo "ERROR: $ORIGINAL_FILE not found"
+            exit 1
+          fi
+          echo "Compressed: $COMPRESSED_FILE ($(du -h $COMPRESSED_FILE | cut -f1))"
+          echo "Original: $ORIGINAL_FILE ($(du -h $ORIGINAL_FILE | cut -f1))"
+
       - name: Run decompression benchmark
         run: |
           python3 scripts/benchmark_decompression.py \
             --binaries ./bin \
-            --compressed-file ./archive/compressed.gz \
-            --original-file ./archive/original.bin \
+            --compressed-file "$COMPRESSED_FILE" \
+            --original-file "$ORIGINAL_FILE" \
             --threads $THREADS \
             --archive-type ${{ matrix.archive_type }} \
             --output results/decompression.json
@@ -400,7 +289,7 @@ jobs:
           retention-days: 7
 
   # ============================================================================
-  # STAGE 3d: Random data edge cases
+  # STAGE 5: Random data correctness check
   # ============================================================================
   random-data:
     name: Random Data L${{ matrix.level }} T${{ matrix.threads }}
@@ -447,7 +336,7 @@ jobs:
           echo "✓ gzip can decompress gzippy output"
 
   # ============================================================================
-  # STAGE 4: Apply performance guards (threshold assertions)
+  # STAGE 6: Performance guards and summary
   # ============================================================================
   guards:
     name: Performance Guards
@@ -488,7 +377,7 @@ jobs:
             --compression aggregated/compression.json \
             --decompression aggregated/decompression.json \
             --output summary.md
-          
+
           cat summary.md >> $GITHUB_STEP_SUMMARY
 
       - uses: actions/upload-artifact@v4
@@ -507,27 +396,27 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            
+
             let summary;
             try {
               summary = fs.readFileSync('summary.md', 'utf8');
             } catch {
               summary = '## gzippy Performance Summary\n\nNo results available.';
             }
-            
+
             const body = summary + '\n\n---\n*Updated: ' + new Date().toISOString() + '*';
-            
+
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number
             });
-            
+
             const marker = '# 🚀 gzippy Performance Summary';
-            const existing = comments.find(c => 
+            const existing = comments.find(c =>
               c.user.type === 'Bot' && c.body && c.body.includes(marker)
             );
-            
+
             if (existing) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
