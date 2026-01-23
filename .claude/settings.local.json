@@ -41,7 +41,12 @@
       "Bash(RUSTFLAGS=\"-C target-cpu=x86-64-v3\" cargo check:*)",
       "Bash(./run-bench-on-linux.sh:*)",
       "Bash(ssh:*)",
-      "Bash(awk:*)"
+      "Bash(awk:*)",
+      "Bash(md5:*)",
+      "Bash(python3:*)",
+      "Bash(__NEW_LINE_1c96999828663da3__ echo \"\")",
+      "Bash(__NEW_LINE_74ae511e8e05472e__ echo \"\")",
+      "Bash(__NEW_LINE_cead8ab77c9dfcc2__ echo \"\")"
     ]
   }
 }

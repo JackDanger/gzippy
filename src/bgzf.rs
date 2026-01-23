@@ -3069,6 +3069,66 @@ pub fn is_multi_member(data: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    /// Helper to compare byte slices with concise error output
+    fn assert_bytes_eq(actual: &[u8], expected: &[u8], context: &str) {
+        if actual == expected {
+            return;
+        }
+        let first_diff = actual
+            .iter()
+            .zip(expected.iter())
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
+            .map(|(i, _)| i);
+
+        let mut msg = format!("\n{} - byte mismatch:\n", context);
+        msg.push_str(&format!(
+            "  lengths: actual={}, expected={}\n",
+            actual.len(),
+            expected.len()
+        ));
+        if let Some(pos) = first_diff {
+            msg.push_str(&format!("  first diff at byte {}\n", pos));
+            msg.push_str(&format!(
+                "  actual[{}]={:#04x}, expected[{}]={:#04x}\n",
+                pos, actual[pos], pos, expected[pos]
+            ));
+            let start = pos.saturating_sub(10);
+            let end = (pos + 20).min(actual.len()).min(expected.len());
+            if end > start {
+                let actual_ctx: String = actual[start..end]
+                    .iter()
+                    .map(|&b| {
+                        if b.is_ascii_graphic() || b == b' ' {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                let expected_ctx: String = expected[start..end]
+                    .iter()
+                    .map(|&b| {
+                        if b.is_ascii_graphic() || b == b' ' {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                msg.push_str(&format!(
+                    "  actual  [{}..{}]: \"{}\"\n",
+                    start, end, actual_ctx
+                ));
+                msg.push_str(&format!(
+                    "  expected[{}..{}]: \"{}\"\n",
+                    start, end, expected_ctx
+                ));
+            }
+        }
+        panic!("{}", msg);
+    }
+
     // =========================================================================
     // TURBO PATH UNIT TESTS - Debug the optimized decoder
     // =========================================================================
@@ -3224,11 +3284,7 @@ mod tests {
         // Test standard path
         let mut output_std = vec![0u8; original.len() + 100];
         let size_std = inflate_into_pub(&compressed, &mut output_std).unwrap();
-        assert_eq!(
-            &output_std[..size_std],
-            &original[..],
-            "Standard path failed"
-        );
+        assert_bytes_eq(&output_std[..size_std], &original[..], "standard path");
 
         // Test turbo path
         let mut output_turbo = vec![0u8; original.len() + 100];
@@ -3239,10 +3295,10 @@ mod tests {
             "Turbo size mismatch: {} vs {}",
             size_turbo, size_std
         );
-        assert_eq!(
+        assert_bytes_eq(
             &output_turbo[..size_turbo],
             &original[..],
-            "Turbo content mismatch"
+            "turbo_inflate_mixed",
         );
     }
 
@@ -4473,6 +4529,75 @@ mod tests {
 #[cfg(test)]
 mod optimization_tests {
     use super::*;
+
+    /// Helper to compare byte slices with concise error output
+    /// Shows first mismatch position and surrounding context instead of dumping entire arrays
+    fn assert_bytes_eq(actual: &[u8], expected: &[u8], context: &str) {
+        if actual == expected {
+            return;
+        }
+
+        let len_match = actual.len() == expected.len();
+        let first_diff = actual
+            .iter()
+            .zip(expected.iter())
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
+            .map(|(i, _)| i);
+
+        let mut msg = format!("\n{} - byte mismatch:\n", context);
+        msg.push_str(&format!(
+            "  lengths: actual={}, expected={}\n",
+            actual.len(),
+            expected.len()
+        ));
+
+        if let Some(pos) = first_diff {
+            msg.push_str(&format!("  first diff at byte {}\n", pos));
+            msg.push_str(&format!(
+                "  actual[{}]={:#04x}, expected[{}]={:#04x}\n",
+                pos, actual[pos], pos, expected[pos]
+            ));
+
+            // Show context around mismatch (as string if printable)
+            let start = pos.saturating_sub(10);
+            let end = (pos + 20).min(actual.len()).min(expected.len());
+            if end > start {
+                let actual_ctx: String = actual[start..end]
+                    .iter()
+                    .map(|&b| {
+                        if b.is_ascii_graphic() || b == b' ' {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                let expected_ctx: String = expected[start..end]
+                    .iter()
+                    .map(|&b| {
+                        if b.is_ascii_graphic() || b == b' ' {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                msg.push_str(&format!(
+                    "  actual  [{}..{}]: \"{}\"\n",
+                    start, end, actual_ctx
+                ));
+                msg.push_str(&format!(
+                    "  expected[{}..{}]: \"{}\"\n",
+                    start, end, expected_ctx
+                ));
+            }
+        } else if !len_match {
+            msg.push_str("  content matches up to shorter length\n");
+        }
+
+        panic!("{}", msg);
+    }
 
     // =========================================================================
     // Phase 1: saved_bitbuf pattern tests
@@ -5752,14 +5877,22 @@ mod optimization_tests {
             .deflate_decompress(&compressed, &mut libdeflate_out)
             .expect("libdeflate failed");
 
-        assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
+        assert_bytes_eq(
+            &libdeflate_out[..libdeflate_size],
+            &original[..],
+            "libdeflate",
+        );
 
         // Decompress with turbo
         let mut turbo_out = vec![0u8; original.len() + 100];
         let turbo_size =
             super::inflate_into_pub(&compressed, &mut turbo_out).expect("turbo failed");
 
-        assert_eq!(&turbo_out[..turbo_size], &original[..]);
+        assert_bytes_eq(
+            &turbo_out[..turbo_size],
+            &original[..],
+            "cf_complex_pattern",
+        );
         eprintln!("[CF-TEST]   ✓ Passed");
     }
 
@@ -5998,33 +6131,20 @@ mod optimization_tests {
             .deflate_decompress(&compressed, &mut libdeflate_out)
             .expect("libdeflate failed");
 
-        assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
+        assert_bytes_eq(
+            &libdeflate_out[..libdeflate_size],
+            &original[..],
+            "libdeflate",
+        );
 
         // Decompress with our turbo path
         let mut turbo_out = vec![0u8; original.len() + 100];
-        let result = super::inflate_into_pub(&compressed, &mut turbo_out);
+        let turbo_size =
+            super::inflate_into_pub(&compressed, &mut turbo_out).expect("turbo failed");
 
-        match result {
-            Ok(turbo_size) => {
-                assert_eq!(turbo_size, original.len());
-                assert_eq!(&turbo_out[..turbo_size], &original[..]);
-                eprintln!("[CF-TEST]   ✓ Passed");
-            }
-            Err(e) => {
-                // Find first mismatch
-                let cmp_size = turbo_out.len().min(libdeflate_out.len());
-                let first_mismatch = turbo_out[..cmp_size]
-                    .iter()
-                    .zip(libdeflate_out[..cmp_size].iter())
-                    .enumerate()
-                    .find(|(_, (a, b))| a != b);
-
-                if let Some((pos, _)) = first_mismatch {
-                    eprintln!("[CF-TEST]   First mismatch at byte {}", pos);
-                }
-                panic!("Decompression failed: {:?}", e);
-            }
-        }
+        assert_eq!(turbo_size, original.len());
+        assert_bytes_eq(&turbo_out[..turbo_size], &original[..], "cf_multi_block");
+        eprintln!("[CF-TEST]   ✓ Passed");
     }
 
     /// Test 10: Gzip format (not just deflate) - like the failing test
@@ -6800,14 +6920,22 @@ mod optimization_tests {
             .deflate_decompress(&compressed, &mut libdeflate_out)
             .expect("libdeflate failed");
 
-        assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
+        assert_bytes_eq(
+            &libdeflate_out[..libdeflate_size],
+            &original[..],
+            "libdeflate",
+        );
 
         // Decompress with turbo
         let mut turbo_out = vec![0u8; original.len() + 100];
         let turbo_size =
             super::inflate_into_pub(&compressed, &mut turbo_out).expect("turbo failed");
 
-        assert_eq!(&turbo_out[..turbo_size], &original[..]);
+        assert_bytes_eq(
+            &turbo_out[..turbo_size],
+            &original[..],
+            "cf_very_large_repetitive",
+        );
         eprintln!("[CF-TEST]   ✓ Passed");
     }
 

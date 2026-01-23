@@ -3244,6 +3244,7 @@ fn decode_match_for_lane(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assert_slices_eq;
 
     /// Helper for benchmarking a single dataset
     fn run_bench(name: &str, gz_path: &str) {
@@ -3390,7 +3391,7 @@ mod tests {
         let size = inflate_consume_first(&compressed, &mut output).expect("Decode failed");
 
         assert_eq!(size, original.len());
-        assert_eq!(&output[..size], original.as_slice());
+        assert_slices_eq!(&output[..size], original.as_slice());
     }
 
     #[test]
@@ -3410,7 +3411,7 @@ mod tests {
         let size = inflate_consume_first(&compressed, &mut output).expect("Decode failed");
 
         assert_eq!(size, original.len());
-        assert_eq!(&output[..size], original.as_slice());
+        assert_slices_eq!(&output[..size], original.as_slice());
     }
 
     #[test]
@@ -3430,7 +3431,7 @@ mod tests {
         let size = inflate_consume_first(&compressed, &mut output).expect("Decode failed");
 
         assert_eq!(size, original.len());
-        assert_eq!(&output[..size], original.as_slice());
+        assert_slices_eq!(&output[..size], original.as_slice());
     }
 
     #[test]
@@ -3450,7 +3451,7 @@ mod tests {
         let size = inflate_consume_first(&compressed, &mut output).expect("Decode failed");
 
         assert_eq!(size, original.len());
-        assert_eq!(&output[..size], original.as_slice());
+        assert_slices_eq!(&output[..size], original.as_slice());
     }
 
     /// Benchmark on silesia dataset
