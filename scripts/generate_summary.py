@@ -194,15 +194,15 @@ def generate_key_metrics(compression: list, decompression: list) -> list:
         gzippy_l1_mt = next((r for r in gzippy_comp if r['level'] == 1 and r['threads'] > 1), None)
         pigz_l1_mt = next((r for r in pigz_comp if r['level'] == 1 and r['threads'] > 1), None)
         
-        if gzippy_l1_mt and pigz_l1_mt:
+        if gzippy_l1_mt and pigz_l1_mt and pigz_l1_mt.get('speed', 0) > 0:
             speed_advantage = (gzippy_l1_mt['speed'] / pigz_l1_mt['speed'] - 1) * 100
             lines.append(f"- **Compression Speed (L1)**: {speed_advantage:+.0f}% vs pigz")
-        
+
         # L9 size comparison
         gzippy_l9 = next((r for r in gzippy_comp if r['level'] == 9), None)
         pigz_l9 = next((r for r in pigz_comp if r['level'] == 9), None)
-        
-        if gzippy_l9 and pigz_l9:
+
+        if gzippy_l9 and pigz_l9 and pigz_l9.get('size', 0) > 0:
             size_advantage = (gzippy_l9['size'] / pigz_l9['size'] - 1) * 100
             lines.append(f"- **Compression Ratio (L9)**: {size_advantage:+.1f}% vs pigz")
     
