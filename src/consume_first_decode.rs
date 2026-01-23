@@ -164,6 +164,7 @@ pub fn reset_cache_stats() {
 fn bzhi_u64(x: u64, n: u32) -> u64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
+        use std::arch::x86_64::_bzhi_u64;
         // BMI2 bzhi instruction - single cycle bit extraction
         unsafe { _bzhi_u64(x, n) }
     }
