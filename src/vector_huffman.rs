@@ -268,7 +268,7 @@ mod avx2_impl {
         ];
 
         // Check for overflow (any bits == 0)
-        let any_overflow = bits.iter().any(|&b| b == 0);
+        let any_overflow = bits.contains(&0);
 
         (symbols, bits, any_overflow)
     }
@@ -488,11 +488,11 @@ pub fn decode_fixed_vector(
         }
 
         // Write decoded symbols to output
-        for i in 0..8 {
+        for (i, &symbol) in symbols.iter().enumerate() {
             if !lanes.lane_overflow[i] {
                 let out_pos = lanes.output_positions[i];
-                if out_pos < output.len() && symbols[i] < 0xFF {
-                    output[out_pos] = symbols[i];
+                if out_pos < output.len() && symbol < 0xFF {
+                    output[out_pos] = symbol;
                     lanes.output_positions[i] += 1;
                     total_decoded += 1;
                 }
@@ -515,8 +515,8 @@ pub fn decode_fixed_vector(
         }
 
         // Update bits_left
-        for i in 0..8 {
-            lanes.bits_left[i] = lanes.bits_left[i].saturating_sub(bits_consumed[i] as u32);
+        for (i, &consumed) in bits_consumed.iter().enumerate() {
+            lanes.bits_left[i] = lanes.bits_left[i].saturating_sub(consumed as u32);
         }
     }
 
