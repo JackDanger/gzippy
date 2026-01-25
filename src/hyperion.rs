@@ -305,13 +305,34 @@ pub fn decompress_hyperion<W: Write + Send>(
             const MIN_PARALLEL_SIZE: usize = 8 * 1024 * 1024; // 8MB minimum for parallel
 
             if threads > 1 && data.len() >= MIN_PARALLEL_SIZE {
+                if std::env::var("GZIPPY_DEBUG").is_ok() {
+                    eprintln!(
+                        "[hyperion] SingleMember: trying hyper_parallel (size={}, threads={})",
+                        data.len(),
+                        threads
+                    );
+                }
                 // Try hyper_parallel first
                 match crate::hyper_parallel::decompress_hyper_parallel(data, writer, threads) {
-                    Ok(bytes) => return Ok(bytes),
-                    Err(_) => {
+                    Ok(bytes) => {
+                        if std::env::var("GZIPPY_DEBUG").is_ok() {
+                            eprintln!("[hyperion] hyper_parallel succeeded: {} bytes", bytes);
+                        }
+                        return Ok(bytes);
+                    }
+                    Err(e) => {
+                        if std::env::var("GZIPPY_DEBUG").is_ok() {
+                            eprintln!("[hyperion] hyper_parallel failed: {}, falling back", e);
+                        }
                         // Fall back to sequential turbo inflate
                     }
                 }
+            } else if std::env::var("GZIPPY_DEBUG").is_ok() {
+                eprintln!(
+                    "[hyperion] SingleMember: using sequential (size={}, threads={})",
+                    data.len(),
+                    threads
+                );
             }
 
             // Sequential: Use our optimized turbo inflate
