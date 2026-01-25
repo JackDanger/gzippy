@@ -27,6 +27,7 @@ mod fast_inflate;
 mod format;
 mod golden_tests;
 mod hyper_parallel;
+mod hyperion;
 mod inflate_tables;
 mod isal;
 mod jit_decode;
