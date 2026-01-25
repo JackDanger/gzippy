@@ -23,12 +23,12 @@ Every change must be benchmarked. Every optimization must be measured. Speed is 
 ### ARM (Apple M3) - Primary Development Platform
 ```
 Dataset          Our MB/s    libdeflate MB/s    Ratio
-SILESIA          1400        1400               ~99%    ✓ AT PARITY
-SOFTWARE         21500       20200              ~106%   ✓ EXCEEDS
-LOGS             9100        8000               ~114%   ✓ EXCEEDS
+SILESIA          1265        1385               91.4%   ✓ NEAR PARITY
+SOFTWARE         18680       19113              97.7%   ✓ AT PARITY
+LOGS             7723        7857               98.3%   ✓ AT PARITY
 
 Decoder: consume_first_decode.rs → decode_huffman_libdeflate_style
-Status: PARITY ACHIEVED on ARM!
+Status: 91-98% of libdeflate across all datasets!
 ```
 
 ### x86 (Intel i7-13700T) - Secondary Platform
