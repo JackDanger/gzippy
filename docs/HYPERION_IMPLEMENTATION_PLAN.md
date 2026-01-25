@@ -35,17 +35,36 @@
 | 5-word match unroll | `75b5763` | +10% | **-15%** | Hurts cache on short matches |
 | 2-3 literal batching x86 | `7df6559` | +5% | **-20%** | Hurt SOFTWARE dataset |
 
-### ⚡ DISCONNECTED MODULES (Ready but Not Integrated)
+### ⚡ DISCONNECTED MODULES (Inventory Jan 2026)
 
-| Module | Purpose | Potential | Blocker |
-|--------|---------|-----------|---------|
-| `algebraic_decode.rs` | ANF branchless decode | +52% isolated | Integration complexity |
-| `simd_parallel_decode.rs` | AVX2 speculative | +100% parallel | Lane synchronization |
-| `unified_table.rs` | Single 64-bit table | Better cache | Not tested |
-| `vector_huffman.rs` | 8-lane SIMD | +100% theory | Not integrated |
-| `hyper_parallel.rs` | 4-phase pipeline | Parallel single | Marker bugs |
-| `rapidgzip_decoder.rs` | Parallel single | 10x slower | Uses slow SpeculativeDecoder |
-| `marker_decode.rs` | Marker-based spec | Parallel single | Needs fast speculative |
+| Module | Purpose | Status | Potential |
+|--------|---------|--------|-----------|
+| `multi_symbol.rs` | 2-symbol per lookup | Implemented | **HIGH** - ISA-L's key win |
+| `double_literal.rs` | Double literal cache | Implemented | **HIGH** - pair decoding |
+| `algebraic_decode.rs` | ANF branchless decode | +52% isolated | Correctness bugs block it |
+| `unified_table.rs` | Single 64-bit table | Implemented | MEDIUM - needs benchmark |
+| `vector_huffman.rs` | 8-lane SIMD | Infrastructure | LOW - complex integration |
+| `simd_parallel_decode.rs` | AVX2 speculative | Infrastructure | LOW - lane sync issues |
+| `precomputed_decode.rs` | Pre-built sequences | Implemented | UNKNOWN - not tested |
+| `speculative_batch.rs` | CPU speculation | Implemented | UNKNOWN - not tested |
+| `two_level_table.rs` | Two-level lookup | **USED in bgzf.rs** | Working ✅ |
+| `combined_lut.rs` | Combined lit+dist | **USED in bgzf.rs** | Working ✅ |
+| `packed_lut.rs` | Packed entries | **USED in bgzf.rs** | Working ✅ |
+| `jit_decode.rs` | JIT compilation | TableFingerprint used | JIT itself too slow |
+| `hyper_parallel.rs` | Parallel single | **USED via hyperion** | Working ✅ |
+| `marker_turbo.rs` | Fast marker decode | **USED via hyper_parallel** | Working ✅ |
+
+### 📊 GAP ANALYSIS SUMMARY (Jan 2026)
+
+See `docs/GAP_ANALYSIS.md` for full comparison with libdeflate, ISA-L, and rapidgzip.
+
+| Category | Our Status | State-of-Art | Gap | Priority |
+|----------|-----------|--------------|-----|----------|
+| Huffman decode loop | 91% libdeflate | libdeflate | 9% | HIGH |
+| Multi-symbol tables | NOT integrated | ISA-L: 1-3 sym/lookup | **LARGE** | **HIGHEST** |
+| Runtime BMI2 | ✅ Implemented | libdeflate | 0% | Done |
+| Runtime AVX2 match | ❌ Compile-time only | libdeflate | ~5% | MEDIUM |
+| Parallel single-member | marker_turbo works | rapidgzip | ~same | Done |
 
 ---
 
@@ -481,6 +500,181 @@ These have unknown impact and should only be attempted after Phases 6-7 are comp
 
 ---
 
+## Phase 9: ISA-L-Style Multi-Symbol Tables (HIGH PRIORITY)
+
+**This is the biggest untapped opportunity based on gap analysis.**
+
+ISA-L achieves higher throughput by encoding 1-3 symbols per table entry, not just 1.
+We have `multi_symbol.rs` and `double_literal.rs` but they are NOT integrated.
+
+### Why Previous Attempts Failed
+
+Previous `DoubleLitCache` attempt (commit `aa3ea09`) showed -73% regression because:
+1. Built a SEPARATE cache per block (expensive)
+2. Cache building cost exceeded decode gain
+
+**ISA-L's approach:** Build multi-symbol entries DURING table construction, stored in the SAME table.
+
+### Step 9.1: Understand ISA-L's Table Format
+
+From `isa-l/igzip/igzip_inflate.c:450`:
+```c
+// ISA-L encodes sym_count in the entry itself:
+short_code_lookup[code] = sym1 | (sym2 << 8) |
+    (code_length << LARGE_SHORT_CODE_LEN_OFFSET) |
+    (2 << LARGE_SYM_COUNT_OFFSET);  // 2 symbols packed!
+```
+
+Key insight: During table building, when code1 + code2 <= LUT_BITS:
+- Pack both symbols into a single entry
+- Store combined bit length
+- Decode both with ONE lookup
+
+### Step 9.2: Extend LitLenEntry for Multi-Symbol
+
+```rust
+// Current: 32-bit entry, 1 symbol per lookup
+// New option 1: 64-bit entry, up to 2 symbols
+// New option 2: Keep 32-bit, add symbol_count field
+
+// Recommended: 64-bit entry (matches multi_symbol.rs)
+pub struct LitLenEntry64(u64);
+
+impl LitLenEntry64 {
+    // Bits 63-56: symbol1 (literal byte or length code 257-285)
+    // Bits 55-48: symbol2 (literal byte only, or 0xFF if single)
+    // Bits 47-40: total_bits (combined length of both codes)
+    // Bits 39-32: count (1 or 2)
+    // Bits 31-0:  flags + extra bits info
+}
+```
+
+### Step 9.3: Modify Table Building
+
+In `src/libdeflate_entry.rs`, modify `LitLenTable::build()`:
+
+```rust
+// After building single-symbol entries, add pairs:
+for code1 in 0..num_literals {
+    let len1 = code_lengths[code1];
+    if len1 == 0 || code1 >= 256 { continue; }  // Only pair literals
+    
+    for code2 in 0..num_symbols {
+        let len2 = code_lengths[code2];
+        if len2 == 0 || len1 + len2 > TABLE_BITS { continue; }
+        
+        // Combine: code1 followed by code2
+        let combined_code = code1_reversed | (code2_reversed << len1);
+        let combined_len = len1 + len2;
+        
+        // Fill all positions matching this combined pattern
+        let fill_count = 1 << (TABLE_BITS - combined_len);
+        for i in 0..fill_count {
+            let index = combined_code | (i << combined_len);
+            table[index] = LitLenEntry64::double(code1 as u8, code2 as u16, combined_len);
+        }
+    }
+}
+```
+
+### Step 9.4: Modify Decode Loop
+
+```rust
+// In decode_huffman_libdeflate_style:
+let entry = lookup!();
+let count = entry.symbol_count();  // 1 or 2
+
+if count == 2 && entry.is_double_literal() {
+    // Fast path: write both literals, advance by total_bits
+    let lit1 = entry.symbol1();
+    let lit2 = entry.symbol2();
+    unsafe {
+        *out_ptr.add(out_pos) = lit1;
+        *out_ptr.add(out_pos + 1) = lit2;
+    }
+    out_pos += 2;
+    bitbuf >>= entry.total_bits() as u8;
+    bitsleft -= entry.total_bits();
+    entry = lookup!();
+    continue;
+}
+// ... existing single-symbol path
+```
+
+### Step 9.5: Benchmark and Tune
+
+```bash
+cargo test --release bench_cf_silesia -- --nocapture
+```
+
+Expected improvement: 10-20% on SILESIA (which is 60%+ literals).
+
+### Critical Considerations
+
+1. **Table size doubles** (32-bit → 64-bit entries)
+   - May increase L1 cache pressure
+   - May need to reduce TABLE_BITS from 11 to 10
+
+2. **Only pair LITERALS**
+   - Don't pair length symbols (they need distance lookup)
+   - Don't pair EOB symbol
+
+3. **Fallback to single-symbol**
+   - If pairs don't fit in LUT, use existing path
+
+**Checkpoint:** `git commit -m "perf: ISA-L style multi-symbol table entries"`
+
+---
+
+## Phase 10: Runtime AVX2 Match Copy (MEDIUM PRIORITY)
+
+Currently AVX2 match copying is compile-time only. Add runtime detection.
+
+### Step 10.1: Add Runtime Detection
+
+```rust
+// In src/consume_first_decode.rs
+#[inline]
+fn has_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHE.get_or_init(|| is_x86_feature_detected!("avx2"))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
+```
+
+### Step 10.2: Add AVX2 Match Copy Function
+
+```rust
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn copy_match_avx2(output: &mut [u8], pos: usize, dist: usize, len: usize) {
+    // Use _mm256_loadu_si256 / _mm256_storeu_si256 for 32-byte copies
+}
+```
+
+### Step 10.3: Dispatch at Runtime
+
+```rust
+fn copy_match_fast(output: &mut [u8], pos: usize, dist: usize, len: usize) {
+    if has_avx2() && dist >= 32 && len >= 32 {
+        unsafe { copy_match_avx2(output, pos, dist, len) }
+    } else {
+        copy_match_scalar(output, pos, dist, len)
+    }
+}
+```
+
+**Expected improvement:** 3-5% on x86_64 for match-heavy content.
+
+**Checkpoint:** `git commit -m "perf: runtime AVX2 detection for match copy"`
+
+---
+
 ## Current Status Checkboxes (Updated Jan 2026)
 
 ### Phase 1: Unified Entrypoint ✅ COMPLETE
@@ -507,10 +701,24 @@ These have unknown impact and should only be attempted after Phases 6-7 are comp
 - [ ] Not yet benchmarked
 - Recommendation: Try after Phase 6
 
-### Phase 6: Tier 1 Optimizations 🔄 IN PROGRESS
-- [ ] Entry preloading
-- [ ] Packed bitsleft subtraction
-- [ ] Saved bitbuf pattern
+### Phase 6: Tier 1 Optimizations ✅ ALREADY IMPLEMENTED
+- [x] Entry preloading (lines 771-773, 810, 865)
+- [x] Packed bitsleft subtraction (line 804: `bitsleft.wrapping_sub(entry)`)
+- [x] Saved bitbuf pattern (line 788: `let saved_bitbuf = bitbuf`)
+
+These were already in consume_first_decode.rs and responsible for 91% parity!
+
+### Phase 9: ISA-L Multi-Symbol Tables 🎯 NEXT PRIORITY
+- [ ] Study ISA-L table building (igzip_inflate.c:400-550)
+- [ ] Extend LitLenEntry to 64-bit for 2-symbol packing
+- [ ] Modify table building to pack literal pairs
+- [ ] Update decode loop for multi-symbol path
+- [ ] Benchmark on SILESIA (target: +10-20%)
+
+### Phase 10: Runtime AVX2 Match Copy
+- [ ] Add runtime AVX2 detection (similar to BMI2)
+- [ ] Add AVX2 match copy function
+- [ ] Integrate into copy_match_fast
 
 ---
 
