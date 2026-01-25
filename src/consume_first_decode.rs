@@ -157,14 +157,12 @@ pub fn reset_cache_stats() {
 // Bit Extraction - BMI2 BZHI on x86_64, branchless fallback elsewhere
 // =============================================================================
 
-/// Extract low n bits from a value using BMI2 BZHI when available
-/// On x86_64 with BMI2, this compiles to a single `bzhi` instruction
-/// Elsewhere, uses branchless mask computation
+/// Extract low n bits from a value using BMI2 BZHI when available.
+/// On x86_64 with BMI2, this compiles to a single `bzhi` instruction.
+/// Elsewhere, uses branchless mask computation.
 ///
 /// SAFETY: Both paths produce identical results for n in [0, 63].
 /// For n >= 64, both paths return 0 due to the `n & 63` masking.
-
-/// BMI2-enabled bzhi - SAFETY: caller must verify BMI2 is available at runtime
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "bmi2")]
 #[inline]
