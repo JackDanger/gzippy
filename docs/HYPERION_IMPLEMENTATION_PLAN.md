@@ -708,12 +708,16 @@ fn copy_match_fast(output: &mut [u8], pos: usize, dist: usize, len: usize) {
 
 These were already in consume_first_decode.rs and responsible for 91% parity!
 
-### Phase 9: ISA-L Multi-Symbol Tables 🎯 NEXT PRIORITY
-- [ ] Study ISA-L table building (igzip_inflate.c:400-550)
-- [ ] Extend LitLenEntry to 64-bit for 2-symbol packing
-- [ ] Modify table building to pack literal pairs
-- [ ] Update decode loop for multi-symbol path
-- [ ] Benchmark on SILESIA (target: +10-20%)
+### Phase 9: ISA-L Multi-Symbol Tables ⚠️ COMPLEX
+- [x] Studied ISA-L table building (igzip_inflate.c:400-550)
+- [x] Added HUFFDEC_DOUBLE_LITERAL flag and entry format
+- [x] Attempted table upgrade - FAILED (correctness issues)
+- **Key learning:** Table replication means indices don't map directly to Huffman codes.
+  ISA-L's algorithm is more subtle - need to validate that combined index
+  actually decodes to the expected pair.
+- **Current status:** Infrastructure added but disabled. Existing 8-literal
+  batching achieves similar effect through sequential lookups.
+- [ ] Revisit with ISA-L's exact algorithm (future work)
 
 ### Phase 10: Runtime AVX2 Match Copy
 - [ ] Add runtime AVX2 detection (similar to BMI2)
