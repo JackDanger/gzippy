@@ -300,7 +300,21 @@ pub fn decompress_hyperion<W: Write + Send>(
             )?)
         }
         ArchiveType::SingleMember => {
-            // Single-member: Use our optimized turbo inflate
+            // Single-member: Try hyper_parallel for large files with multiple threads
+            // hyper_parallel uses marker_turbo which is 30x faster than old MarkerDecoder
+            const MIN_PARALLEL_SIZE: usize = 8 * 1024 * 1024; // 8MB minimum for parallel
+
+            if threads > 1 && data.len() >= MIN_PARALLEL_SIZE {
+                // Try hyper_parallel first
+                match crate::hyper_parallel::decompress_hyper_parallel(data, writer, threads) {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(_) => {
+                        // Fall back to sequential turbo inflate
+                    }
+                }
+            }
+
+            // Sequential: Use our optimized turbo inflate
             decompress_single_member_turbo(data, writer)
         }
     }
