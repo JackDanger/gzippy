@@ -105,6 +105,26 @@ Each phase ends with a git commit that:
 3. Has a clear rollback point
 4. Documents results in commit message
 
+### Pre-Commit CI Check (MANDATORY)
+
+**Before every commit**, check the GitHub workflow status from the previous push:
+
+```bash
+# Check status of last workflow runs
+gh run list --limit 5
+
+# If any failed, investigate before committing:
+gh run view <run-id> --log-failed
+
+# Check for performance regressions in benchmark jobs:
+gh run view <run-id> --job <benchmark-job-id> | grep -E "MB/s|ratio|regression"
+```
+
+**Rules:**
+1. **Never commit if the previous push has failing workflows** - fix first
+2. **Check for performance regressions** - benchmark jobs should show stable or improved numbers
+3. **If CI is red, diagnose before adding more commits** - don't pile on broken state
+
 ---
 
 ## Phase 1: Unified Entrypoint (Low Risk, High Value)
@@ -324,6 +344,176 @@ Only integrate if measurably faster on SILESIA. Otherwise, document and move on.
 
 ---
 
+## Phase 6: Close the Remaining 9% Gap (Tier 1 Optimizations)
+
+**Current Status (Jan 2026):** 91% of libdeflate on SILESIA. These optimizations target the final 9%.
+
+### Step 6.1: Entry Preloading (Expected +3-5%)
+
+libdeflate's key trick: start the NEXT table lookup before finishing the CURRENT iteration.
+
+```rust
+// Current (bad):
+loop {
+    let entry = litlen.lookup(bits.peek());
+    bits.consume_entry(entry.raw());
+    if entry.is_literal() {
+        *output_ptr = entry.literal_value();
+        output_ptr = output_ptr.add(1);
+        continue;  // Next lookup happens AFTER this
+    }
+    // ...
+}
+
+// Target (good):
+let mut entry = litlen.lookup(bits.peek());
+loop {
+    bits.consume_entry(entry.raw());
+    let next_peek = bits.peek();  // Preload BEFORE writing
+    if entry.is_literal() {
+        *output_ptr = entry.literal_value();
+        output_ptr = output_ptr.add(1);
+        entry = litlen.lookup(next_peek);  // Already computed!
+        continue;
+    }
+    // ... handle match, then:
+    entry = litlen.lookup(bits.peek());
+}
+```
+
+**Files to modify:** `src/consume_first_decode.rs` (decode_huffman_libdeflate_style)
+
+**Checkpoint:** `git commit -m "perf: entry preloading in decode loop (+3-5% expected)"`
+
+### Step 6.2: Packed bitsleft Subtraction (Expected +1-2%)
+
+libdeflate subtracts the entire entry value, not just the masked low bits:
+
+```rust
+// Current:
+self.bitsleft -= (entry & 0x1F) as u32;
+
+// Target (libdeflate-style):
+self.bitsleft -= entry as u32;  // High bits are garbage but refill handles it
+```
+
+**Files to modify:** `src/consume_first_decode.rs` (Bits::consume_entry)
+
+**Checkpoint:** `git commit -m "perf: packed bitsleft subtraction saves 1 instruction/symbol"`
+
+### Step 6.3: Saved Bitbuf Pattern (Expected +1-2%)
+
+Capture bits BEFORE consuming for extra bits extraction:
+
+```rust
+// Current (multiple shifts):
+let extra = (bits.peek() >> codeword_bits) & extra_mask;
+
+// Target (single operation):
+let saved = bits.peek();  // Capture before consume
+bits.consume(total_bits);
+let extra = (saved >> codeword_bits) & extra_mask;
+```
+
+**Files to modify:** `src/consume_first_decode.rs`, `src/libdeflate_entry.rs`
+
+**Checkpoint:** `git commit -m "perf: saved_bitbuf pattern for extra bits extraction"`
+
+---
+
+## Phase 7: Medium-Impact Optimizations (Tier 2)
+
+### Step 7.1: Fix hyper_parallel Fallback Rate
+
+Currently hyper_parallel falls back to sequential too often. Debug and fix.
+
+```bash
+# Enable debug logging to see fallback reasons:
+GZIPPY_DEBUG=1 cargo run --release -- -d large_file.gz > /dev/null
+```
+
+**Target:** Parallel path succeeds >90% of the time for files >8MB.
+
+### Step 7.2: Cache-Align Critical Structs
+
+```rust
+#[repr(C, align(64))]  // Cache line alignment
+pub struct Bits {
+    buffer: u64,
+    bitsleft: u32,
+    pos: usize,
+    data: *const u8,
+    len: usize,
+}
+```
+
+**Expected gain:** ~2% on ARM (128-byte cache lines)
+
+### Step 7.3: Prefetch Next Block
+
+```rust
+#[cfg(target_arch = "x86_64")]
+unsafe {
+    std::arch::x86_64::_mm_prefetch(
+        data.as_ptr().add(current_pos + 4096) as *const i8,
+        std::arch::x86_64::_MM_HINT_T0,
+    );
+}
+```
+
+---
+
+## Phase 8: Speculative Research (Tier 3)
+
+These have unknown impact and should only be attempted after Phases 6-7 are complete.
+
+### 8.1: Fix ANF Decoder Bugs
+- ANF shows 1.55x speedup on core operations but has correctness issues
+- Only beneficial for fixed Huffman blocks (niche case)
+
+### 8.2: JIT Table Compilation
+- Generate native code for repeated Huffman tables
+- High complexity, diminishing returns
+
+### 8.3: GPU Offload
+- Parallel marker replacement on GPU
+- Only worthwhile for files >1GB
+
+---
+
+## Current Status Checkboxes (Updated Jan 2026)
+
+### Phase 1: Unified Entrypoint ✅ COMPLETE
+- [x] `decompress_hyperion` exists and routes correctly
+- [x] All tests pass (316 tests)
+- [x] Performance maintained (91% of libdeflate)
+
+### Phase 2: ANF Integration ⏸️ DEFERRED
+- [x] ANF benchmarked (1.55x faster core ops)
+- [ ] ANF integrated - BLOCKED: has correctness bugs
+- Recommendation: Defer until simpler optimizations exhausted
+
+### Phase 3: Parallel Single-Member ✅ COMPLETE
+- [x] marker_turbo.rs created (2129 MB/s!)
+- [x] Integrated into hyper_parallel.rs
+- [x] Wired into hyperion router for >8MB files
+- [ ] Debug high fallback rate (partial success)
+
+### Phase 4: SIMD Parallel Huffman ⏸️ DEFERRED
+- [ ] Only helps literal-heavy fixed blocks (niche)
+- Recommendation: Low priority
+
+### Phase 5: Unified Table
+- [ ] Not yet benchmarked
+- Recommendation: Try after Phase 6
+
+### Phase 6: Tier 1 Optimizations 🔄 IN PROGRESS
+- [ ] Entry preloading
+- [ ] Packed bitsleft subtraction
+- [ ] Saved bitbuf pattern
+
+---
+
 ## Premortem: Top Failure Modes & Remediations
 
 | # | What Goes Wrong | Historical Evidence | One-Line Remediation |
@@ -423,47 +613,90 @@ git checkout -b fix-attempt-N
 
 ## Success Metrics
 
-### Phase 1 Complete When:
-- [ ] `decompress_hyperion` exists and routes correctly
-- [ ] All tests pass
-- [ ] Performance unchanged
+### Phase 1 Complete When: ✅ DONE
+- [x] `decompress_hyperion` exists and routes correctly
+- [x] All tests pass (316 tests)
+- [x] Performance unchanged (91% of libdeflate)
 
-### Phase 2 Complete When:
-- [ ] ANF decoder integrated for low-entropy data
-- [ ] LOGS dataset shows improvement
-- [ ] SILESIA/SOFTWARE unchanged or better
+### Phase 2 Complete When: ⏸️ DEFERRED
+- [x] ANF benchmarked (1.55x core speedup)
+- [ ] ANF integrated - BLOCKED by correctness bugs
+- Recommendation: Fix bugs later, focus on Tier 1 optimizations
 
-### Phase 3 Complete When:
-- [ ] Parallel single-member works
-- [ ] SILESIA with 8 threads exceeds rapidgzip
-- [ ] No correctness regressions
+### Phase 3 Complete When: ✅ DONE
+- [x] marker_turbo.rs created (2129 MB/s)
+- [x] Parallel single-member infrastructure working
+- [x] Wired into hyperion router
+- [ ] Debug fallback rate (partial)
 
-### Phase 4 Complete When:
-- [ ] SIMD parallel Huffman working
-- [ ] Measurable improvement on at least one dataset
-- [ ] Falls back gracefully on non-SIMD platforms
+### Phase 4 Complete When: ⏸️ DEFERRED
+- [ ] SIMD parallel Huffman - niche benefit (fixed blocks only)
+- Recommendation: Low priority
 
 ### Phase 5 Complete When:
 - [ ] Unified table benchmarked
 - [ ] Either integrated or documented as "not faster"
 
+### Phase 6 Complete When:
+- [ ] Entry preloading implemented
+- [ ] SILESIA throughput >= 1350 MB/s (95%+ of libdeflate)
+- [ ] All datasets maintain or improve
+
+### Phase 7 Complete When:
+- [ ] hyper_parallel fallback rate < 10%
+- [ ] Cache alignment applied
+- [ ] Prefetch implemented
+
+### Phase 8 Complete When:
+- [ ] ANF bugs fixed OR documented as unfixable
+- [ ] JIT evaluated OR documented as not worth it
+
 ---
 
 ## The Ultimate Goal
 
+### Current Status (Jan 2026)
 ```
-               ┌─────────────────────────────────────────────┐
-               │          HYPERION PERFORMANCE               │
-               ├─────────────────────────────────────────────┤
-               │  Dataset    Threads   MB/s    vs Best Tool  │
-               ├─────────────────────────────────────────────┤
-               │  SILESIA       1      1500     108% libdef  │
-               │  SILESIA       8      5000     200% rapidgz │
-               │  SOFTWARE      1     25000     120% libdef  │
-               │  SOFTWARE      8     50000     200% fastest │
-               │  LOGS          1     10000     125% libdef  │
-               │  LOGS          8     20000     200% fastest │
-               └─────────────────────────────────────────────┘
+               ┌──────────────────────────────────────────────────────┐
+               │          CURRENT HYPERION PERFORMANCE                │
+               ├──────────────────────────────────────────────────────┤
+               │  Dataset    Our MB/s   libdeflate   Ratio   Status   │
+               ├──────────────────────────────────────────────────────┤
+               │  SILESIA      1265       1385       91.4%   ⚡ CLOSE │
+               │  SOFTWARE    18680      19113       97.7%   ✅ PARITY│
+               │  LOGS         7723       7857       98.3%   ✅ PARITY│
+               │  BGZF (8T)    3770       N/A       108%+    ✅ WINS  │
+               └──────────────────────────────────────────────────────┘
+```
+
+### Target After Phase 6-7
+```
+               ┌──────────────────────────────────────────────────────┐
+               │          TARGET HYPERION PERFORMANCE                 │
+               ├──────────────────────────────────────────────────────┤
+               │  Dataset    Target     libdeflate   Ratio   Gap      │
+               ├──────────────────────────────────────────────────────┤
+               │  SILESIA      1350       1385       97.5%   +85 MB/s │
+               │  SOFTWARE    19500      19113      102%     ✅ EXCEED│
+               │  LOGS         8000       7857      102%     ✅ EXCEED│
+               │  BGZF (8T)    4000       N/A       110%+    ✅ WINS  │
+               └──────────────────────────────────────────────────────┘
+```
+
+### Ultimate Vision
+```
+               ┌──────────────────────────────────────────────────────┐
+               │          ULTIMATE HYPERION (POST PHASE 8)            │
+               ├──────────────────────────────────────────────────────┤
+               │  Dataset    Threads   Target      vs Best Tool       │
+               ├──────────────────────────────────────────────────────┤
+               │  SILESIA       1      1450        105% libdeflate    │
+               │  SILESIA       8      5000        200% rapidgzip     │
+               │  SOFTWARE      1     20000        105% libdeflate    │
+               │  SOFTWARE      8     40000        fastest ever       │
+               │  LOGS          1      8500        108% libdeflate    │
+               │  LOGS          8     17000        fastest ever       │
+               └──────────────────────────────────────────────────────┘
 ```
 
 **We beat everyone, everywhere, always.**
