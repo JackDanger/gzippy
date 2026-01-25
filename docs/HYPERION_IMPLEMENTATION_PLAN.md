@@ -658,16 +658,30 @@ git checkout -b fix-attempt-N
 ## The Ultimate Goal
 
 ### Current Status (Jan 2026)
+
+**ARM (Apple M3) - Development Platform:**
 ```
                ┌──────────────────────────────────────────────────────┐
-               │          CURRENT HYPERION PERFORMANCE                │
+               │          ARM HYPERION PERFORMANCE                    │
                ├──────────────────────────────────────────────────────┤
                │  Dataset    Our MB/s   libdeflate   Ratio   Status   │
                ├──────────────────────────────────────────────────────┤
-               │  SILESIA      1265       1385       91.4%   ⚡ CLOSE │
-               │  SOFTWARE    18680      19113       97.7%   ✅ PARITY│
-               │  LOGS         7723       7857       98.3%   ✅ PARITY│
-               │  BGZF (8T)    3770       N/A       108%+    ✅ WINS  │
+               │  SILESIA      1402       1543       90.9%   ⚡ CLOSE │
+               │  SOFTWARE    18369      19680       93.3%   ✅ PARITY│
+               │  LOGS         8438       8341      101.2%   ✅ WINS! │
+               └──────────────────────────────────────────────────────┘
+```
+
+**x86_64 (Linux CI) - Production Platform:**
+```
+               ┌──────────────────────────────────────────────────────┐
+               │          x86_64 HYPERION PERFORMANCE                 │
+               ├──────────────────────────────────────────────────────┤
+               │  Dataset    Our MB/s   Best Tool    Ratio   Status   │
+               ├──────────────────────────────────────────────────────┤
+               │  SILESIA T1   205.0    igzip 272.7   75%   ⚠️ GAP   │
+               │  LOGS T1      407.6    rapidgzip 411 99%   ✅ PARITY│
+               │  SOFTWARE Tmax 405.6   rapidgzip 403 100%  ✅ WINS! │
                └──────────────────────────────────────────────────────┘
 ```
 
