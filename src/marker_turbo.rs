@@ -37,7 +37,35 @@ use crate::marker_decode::{MARKER_BASE, WINDOW_SIZE};
 ///
 /// Returns (output_u16, end_bit_position)
 pub fn inflate_with_markers(deflate_data: &[u8], max_output: usize) -> Result<(Vec<u16>, usize)> {
-    let mut bits = Bits::new(deflate_data);
+    inflate_with_markers_at(deflate_data, 0, max_output)
+}
+
+/// Decode deflate stream starting at a specific bit position
+///
+/// This is the core function for parallel decompression - each chunk starts
+/// at a speculative boundary and decodes with markers for unresolved back-refs.
+///
+/// Returns (output_u16, end_bit_position)
+pub fn inflate_with_markers_at(
+    deflate_data: &[u8],
+    start_bit: usize,
+    max_output: usize,
+) -> Result<(Vec<u16>, usize)> {
+    // Initialize bit reader at the specified position
+    let start_byte = start_bit / 8;
+    let skip_bits = (start_bit % 8) as u32;
+
+    if start_byte >= deflate_data.len() {
+        return Ok((Vec::new(), start_bit));
+    }
+
+    let mut bits = Bits::new(&deflate_data[start_byte..]);
+
+    // Skip the fractional bits if starting mid-byte
+    if skip_bits > 0 {
+        bits.consume(skip_bits);
+    }
+
     let mut output: Vec<u16> = Vec::with_capacity(max_output.min(256 * 1024));
 
     loop {
@@ -68,8 +96,9 @@ pub fn inflate_with_markers(deflate_data: &[u8], max_output: usize) -> Result<(V
         }
     }
 
-    // Calculate end bit position
-    let end_bit = bits.pos * 8 - (bits.bitsleft as usize);
+    // Calculate end bit position (relative to original data, not the slice)
+    let consumed_bits = bits.pos * 8 - (bits.bitsleft as usize);
+    let end_bit = start_bit + consumed_bits;
 
     Ok((output, end_bit))
 }
