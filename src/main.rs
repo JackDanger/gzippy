@@ -55,6 +55,8 @@ mod simple_optimizations;
 mod specialized_decode;
 mod speculative_batch;
 mod thread_pool;
+mod threading_benchmarks;
+mod threading_dispatcher;
 mod turbo_inflate;
 mod two_level_table;
 mod ultimate_decode;
