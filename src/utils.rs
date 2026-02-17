@@ -25,10 +25,33 @@ pub fn is_compressed_file(path: &Path) -> bool {
 pub fn strip_compression_extension(path: &Path) -> std::path::PathBuf {
     let mut result = path.to_path_buf();
 
+    // Handle special suffix mappings first
     if let Some(ext) = path.extension() {
         if let Some(ext_str) = ext.to_str() {
+            match ext_str.to_lowercase().as_str() {
+                // .tgz → .tar, .taz → .tar (standard gzip convention)
+                "tgz" | "taz" => {
+                    result.set_extension("tar");
+                    return result;
+                }
+                _ => {}
+            }
             if crate::format::CompressionFormat::from_extension(ext_str).is_some() {
                 result.set_extension("");
+            }
+        }
+    }
+
+    // Also handle -gz, -z, _z suffixes (e.g., file-gz → file)
+    if result == path.to_path_buf() {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            let lower = name.to_lowercase();
+            for suffix in &["-gz", "-z", "_z"] {
+                if lower.ends_with(suffix) {
+                    let new_name = &name[..name.len() - suffix.len()];
+                    result.set_file_name(new_name);
+                    return result;
+                }
             }
         }
     }

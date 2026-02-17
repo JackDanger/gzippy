@@ -13,7 +13,7 @@ pub enum CompressionFormat {
 impl CompressionFormat {
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_lowercase().as_str() {
-            "gz" | "gzip" => Some(CompressionFormat::Gzip),
+            "gz" | "gzip" | "tgz" | "taz" | "z" => Some(CompressionFormat::Gzip),
             "zz" => Some(CompressionFormat::Zlib),
             "zip" => Some(CompressionFormat::Zip),
             _ => None,
