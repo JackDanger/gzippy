@@ -371,6 +371,15 @@ fn decompress_single_member_turbo<W: Write>(data: &[u8], writer: &mut W) -> Gzip
     }
 }
 
+/// Public entry point for decompressing gzip data to an arbitrary writer.
+/// Used by --test mode and other callers that need direct access.
+pub fn decompress_gzip_to_writer<W: Write + Send>(
+    data: &[u8],
+    writer: &mut W,
+) -> GzippyResult<u64> {
+    decompress_gzip_libdeflate(data, writer)
+}
+
 /// Decompress gzip - chooses optimal strategy based on content
 ///
 /// Strategies (in order of preference):
