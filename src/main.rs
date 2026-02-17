@@ -98,15 +98,38 @@ fn run() -> Result<i32, GzippyError> {
         return Ok(0);
     }
 
-    // Support gunzip/ungzippy symlinks
+    // Support gunzip/ungzippy/zcat/gzcat symlinks
     let program_path = env::args().next().unwrap_or_else(|| "gzippy".to_string());
     let program_name = Path::new(&program_path)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("gzippy");
 
-    let decompress =
-        args.decompress || program_name.contains("ungzippy") || program_name.contains("gunzip");
+    let decompress = args.decompress
+        || program_name.contains("ungzippy")
+        || program_name.contains("gunzip")
+        || program_name == "zcat"
+        || program_name == "gzcat";
+
+    // zcat/gzcat imply decompress-to-stdout
+    let stdout_mode = args.stdout || program_name == "zcat" || program_name == "gzcat";
+
+    // Refuse to write compressed binary data to a terminal (unless -f)
+    if !decompress && stdout_mode && !args.force {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            eprintln!(
+                "gzippy: compressed data not written to a terminal. Use -f to force compression."
+            );
+            return Ok(1);
+        }
+    }
+
+    // Apply stdout_mode back to args for downstream use
+    let mut args = args;
+    if stdout_mode {
+        args.stdout = true;
+    }
 
     let mut exit_code = 0;
 
