@@ -106,6 +106,13 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 
     match result {
         Ok(output_size) => {
+            // Preserve file permissions and timestamps on output file
+            if !args.stdout {
+                if let Some(ref output_path) = output_path {
+                    preserve_metadata(input_path, output_path);
+                }
+            }
+
             if args.verbosity > 0 && !args.quiet {
                 print_decompression_stats(file_size, output_size, input_path);
             }
@@ -893,6 +900,20 @@ fn print_decompression_stats(input_size: u64, output_size: u64, path: &Path) {
         out_unit,
         1.0 / ratio
     );
+}
+
+/// Copy file permissions and timestamps from source to destination.
+/// Errors are silently ignored (best-effort, matching gzip behavior).
+fn preserve_metadata(src: &Path, dst: &Path) {
+    if let Ok(metadata) = std::fs::metadata(src) {
+        // Copy permissions (mode bits on Unix)
+        let _ = std::fs::set_permissions(dst, metadata.permissions());
+
+        // Copy modification time
+        if let Ok(mtime) = metadata.modified() {
+            let _ = filetime::set_file_mtime(dst, filetime::FileTime::from_system_time(mtime));
+        }
+    }
 }
 
 fn format_size(bytes: u64) -> (f64, &'static str) {
