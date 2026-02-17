@@ -86,7 +86,7 @@ fn install_signal_handlers() {
     unsafe {
         // SIGINT (Ctrl-C), SIGTERM, SIGHUP: clean up and exit
         for &sig in &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-            libc::signal(sig, signal_handler as libc::sighandler_t);
+            libc::signal(sig, signal_handler as *const () as libc::sighandler_t);
         }
         // SIGPIPE: exit quietly (e.g., piping to head)
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
