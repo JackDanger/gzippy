@@ -437,17 +437,59 @@ fn calculate_deflate_offset(block: &[u8]) -> usize {
 
 /// Inflate directly into a pre-allocated output slice
 ///
+/// Decompress raw deflate data using libdeflate FFI.
+///
 /// This is the key function for zero-copy parallel decompression.
-/// Uses the optimized TurboBits + PackedLUT path for maximum performance.
+/// Each call allocates a lightweight (~4KB) libdeflate decompressor.
 fn inflate_into(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
-    // Use the consume_first decoder which achieves 70-76% of libdeflate
-    crate::consume_first_decode::inflate_consume_first(deflate_data, output)
+    inflate_into_libdeflate(deflate_data, output)
 }
 
-/// Public version of inflate_into for use by other modules
+/// Decompress raw deflate data using libdeflate's optimized C implementation.
 ///
-/// Uses the optimized consume-first decoder with SpecializedDecoder.
-/// This achieves 71-97% of libdeflate depending on data characteristics.
+/// Uses `libdeflate_deflate_decompress` which is 30-50% faster than zlib
+/// for in-memory operations. The decompressor is ~4KB and cheap to allocate.
+fn inflate_into_libdeflate(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
+    let decompressor = unsafe { libdeflate_sys::libdeflate_alloc_decompressor() };
+    if decompressor.is_null() {
+        return Err(io::Error::other(
+            "failed to allocate libdeflate decompressor",
+        ));
+    }
+
+    let mut actual_out = 0usize;
+    let result = unsafe {
+        libdeflate_sys::libdeflate_deflate_decompress(
+            decompressor,
+            deflate_data.as_ptr() as *const std::ffi::c_void,
+            deflate_data.len(),
+            output.as_mut_ptr() as *mut std::ffi::c_void,
+            output.len(),
+            &mut actual_out,
+        )
+    };
+
+    unsafe {
+        libdeflate_sys::libdeflate_free_decompressor(decompressor);
+    }
+
+    match result {
+        libdeflate_sys::libdeflate_result_LIBDEFLATE_SUCCESS => Ok(actual_out),
+        libdeflate_sys::libdeflate_result_LIBDEFLATE_BAD_DATA => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid deflate data",
+        )),
+        libdeflate_sys::libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE => Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "output buffer too small",
+        )),
+        _ => Err(io::Error::other("unknown libdeflate error")),
+    }
+}
+
+/// Public version of inflate_into for use by other modules.
+///
+/// Uses libdeflate FFI for maximum decompression speed.
 pub fn inflate_into_pub(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
     inflate_into(deflate_data, output)
 }
