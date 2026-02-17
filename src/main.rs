@@ -136,6 +136,41 @@ fn run() -> Result<i32, GzippyError> {
 
     let mut exit_code = 0;
 
+    // Handle --list mode
+    if args.list {
+        if args.files.is_empty() {
+            eprintln!("gzippy: --list does not support stdin");
+            return Ok(1);
+        }
+        println!("  compressed  uncompressed  ratio  uncompressed_name");
+        let mut total_comp = 0u64;
+        let mut total_uncomp = 0u64;
+        for file in &args.files {
+            match list_file(file, &args) {
+                Ok((comp, uncomp)) => {
+                    total_comp += comp;
+                    total_uncomp += uncomp;
+                }
+                Err(e) => {
+                    eprintln!("gzippy: {}: {}", file, e);
+                    exit_code = 1;
+                }
+            }
+        }
+        if args.files.len() > 1 {
+            let ratio = if total_uncomp > 0 {
+                (1.0 - total_comp as f64 / total_uncomp as f64) * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "{:>12}  {:>12}  {:4.1}%  (totals)",
+                total_comp, total_uncomp, ratio
+            );
+        }
+        return Ok(exit_code);
+    }
+
     if args.files.is_empty() {
         // Process stdin
         if decompress {
@@ -232,6 +267,54 @@ fn test_stdin(args: &GzippyArgs) -> Result<i32, GzippyError> {
             Ok(1)
         }
     }
+}
+
+/// List compressed file information (gzip -l format)
+fn list_file(filename: &str, _args: &GzippyArgs) -> Result<(u64, u64), GzippyError> {
+    use std::fs;
+
+    let metadata =
+        fs::metadata(filename).map_err(|_| GzippyError::FileNotFound(filename.to_string()))?;
+    let compressed_size = metadata.len();
+
+    // Read the gzip trailer to get ISIZE (uncompressed size mod 2^32)
+    let data = fs::read(filename).map_err(GzippyError::Io)?;
+
+    if data.len() < 18 || data[0] != 0x1f || data[1] != 0x8b {
+        return Err(GzippyError::invalid_argument(format!(
+            "{}: not in gzip format",
+            filename
+        )));
+    }
+
+    // ISIZE is last 4 bytes of the gzip file
+    let isize_bytes = &data[data.len() - 4..];
+    let uncompressed_size = u32::from_le_bytes([
+        isize_bytes[0],
+        isize_bytes[1],
+        isize_bytes[2],
+        isize_bytes[3],
+    ]) as u64;
+
+    let ratio = if uncompressed_size > 0 {
+        (1.0 - compressed_size as f64 / uncompressed_size as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    // Get the output name (what the file would decompress to)
+    let output_name = crate::utils::strip_compression_extension(Path::new(filename));
+    let display_name = output_name
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(filename);
+
+    println!(
+        "{:>12}  {:>12}  {:4.1}%  {}",
+        compressed_size, uncompressed_size, ratio, display_name
+    );
+
+    Ok((compressed_size, uncompressed_size))
 }
 
 fn print_help() {
