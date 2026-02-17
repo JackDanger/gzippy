@@ -106,6 +106,11 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     // Threshold: 128KB (one block) - below this, overhead exceeds benefit
     let use_mmap = opt_config.thread_count > 1 && file_size > 128 * 1024;
 
+    // Register output file for signal handler cleanup
+    if let Some(ref output_path) = output_path {
+        crate::set_output_file(Some(output_path.to_string_lossy().to_string()));
+    }
+
     let result = if use_mmap {
         // MMAP PATH: Zero-copy parallel compression for large files
         if args.verbosity >= 2 {
@@ -133,6 +138,9 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         let output_file = BufWriter::new(File::create(&output_path)?);
         compress_with_pipeline(input_file, output_file, args, &opt_config)
     };
+
+    // Clear signal handler's output file reference
+    crate::set_output_file(None);
 
     match result {
         Ok(_) => {

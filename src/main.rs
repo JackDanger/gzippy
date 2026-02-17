@@ -6,6 +6,8 @@
 use std::env;
 use std::path::Path;
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 mod algebraic_decode;
 #[macro_use]
@@ -68,7 +70,52 @@ use error::GzippyError;
 
 const VERSION: &str = concat!("gzippy ", env!("CARGO_PKG_VERSION"));
 
+/// Track the current output file so signal handlers can clean it up.
+/// When set, an incomplete output file exists that should be deleted on abort.
+static OUTPUT_FILE: Mutex<Option<String>> = Mutex::new(None);
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// Set the current output file path for signal handler cleanup.
+pub fn set_output_file(path: Option<String>) {
+    if let Ok(mut guard) = OUTPUT_FILE.lock() {
+        *guard = path;
+    }
+}
+
+fn install_signal_handlers() {
+    unsafe {
+        // SIGINT (Ctrl-C), SIGTERM, SIGHUP: clean up and exit
+        for &sig in &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::signal(sig, signal_handler as *const () as libc::sighandler_t);
+        }
+        // SIGPIPE: exit quietly (e.g., piping to head)
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+extern "C" fn signal_handler(sig: libc::c_int) {
+    // Mark as interrupted (atomic, signal-safe)
+    INTERRUPTED.store(true, Ordering::SeqCst);
+
+    // Try to clean up the output file.
+    // Mutex::lock may not be signal-safe, but try_lock is better.
+    // In the worst case we just skip cleanup.
+    if let Ok(guard) = OUTPUT_FILE.try_lock() {
+        if let Some(ref path) = *guard {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    // Restore default handler and re-raise so parent sees correct signal
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
 fn main() {
+    install_signal_handlers();
+
     let result = run();
 
     match result {
