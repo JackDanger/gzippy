@@ -131,19 +131,28 @@ fn run() -> Result<i32, GzippyError> {
         args.stdout = true;
     }
 
+    // --test implies decompress mode
+    let decompress = decompress || args.test;
+
     let mut exit_code = 0;
 
     if args.files.is_empty() {
         // Process stdin
         if decompress {
-            exit_code = decompression::decompress_stdin(&args)?;
+            if args.test {
+                exit_code = test_stdin(&args)?;
+            } else {
+                exit_code = decompression::decompress_stdin(&args)?;
+            }
         } else {
             exit_code = compression::compress_stdin(&args)?;
         }
     } else {
         // Process files
         for file in &args.files {
-            let result = if decompress {
+            let result = if args.test {
+                test_file(file, &args)
+            } else if decompress {
                 decompression::decompress_file(file, &args)
             } else {
                 compression::compress_file(file, &args)
@@ -164,6 +173,65 @@ fn run() -> Result<i32, GzippyError> {
     }
 
     Ok(exit_code)
+}
+
+/// Test integrity of a compressed file by decompressing to a sink
+fn test_file(filename: &str, args: &GzippyArgs) -> Result<i32, GzippyError> {
+    use memmap2::Mmap;
+    use std::fs::File;
+
+    let input_path = Path::new(filename);
+    if !input_path.exists() {
+        return Err(GzippyError::FileNotFound(filename.to_string()));
+    }
+
+    let input_file = File::open(input_path)?;
+    let mmap = unsafe { Mmap::map(&input_file)? };
+
+    // Decompress into a Vec (discarded after) to verify integrity
+    let mut sink = Vec::new();
+    let result = decompression::decompress_gzip_to_writer(&mmap, &mut sink);
+
+    match result {
+        Ok(_) => {
+            if !args.quiet {
+                eprintln!("{}: OK", filename);
+            }
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("{}: {}", filename, e);
+            Ok(1)
+        }
+    }
+}
+
+/// Test integrity of compressed data from stdin
+fn test_stdin(args: &GzippyArgs) -> Result<i32, GzippyError> {
+    use std::io::Read;
+
+    let stdin = std::io::stdin();
+    let mut input_data = Vec::new();
+    {
+        let mut reader = std::io::BufReader::new(stdin.lock());
+        reader.read_to_end(&mut input_data)?;
+    }
+
+    let mut sink = Vec::new();
+    let result = decompression::decompress_gzip_to_writer(&input_data, &mut sink);
+
+    match result {
+        Ok(_) => {
+            if !args.quiet {
+                eprintln!("stdin: OK");
+            }
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("stdin: {}", e);
+            Ok(1)
+        }
+    }
 }
 
 fn print_help() {
