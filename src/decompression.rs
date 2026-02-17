@@ -81,6 +81,11 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 
     let format = detect_compression_format_from_path(input_path)?;
 
+    // Register output file for signal handler cleanup
+    if let Some(ref output_path) = output_path {
+        crate::set_output_file(Some(output_path.to_string_lossy().to_string()));
+    }
+
     let result = if args.stdout {
         // For stdout, we need to buffer in memory first because StdoutLock isn't Send
         // This allows parallel decompression to work, then we write the result
@@ -103,6 +108,9 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
         decompress_mmap_libdeflate(&mmap, &mut writer, format)
     };
+
+    // Clear signal handler's output file reference
+    crate::set_output_file(None);
 
     match result {
         Ok(output_size) => {
