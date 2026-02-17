@@ -353,6 +353,7 @@ impl GzippyArgs {
             args.processes = 1;
         }
 
+        // Level 0: no compression (store)
         // Levels 1-9: gzip compatible
         // Levels 10-12: ultra compression (libdeflate high levels)
         if args.compression_level > 12 {

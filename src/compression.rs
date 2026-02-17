@@ -33,6 +33,24 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         };
     }
 
+    // Skip files with multiple hard links (unless -f)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(metadata) = std::fs::metadata(input_path) {
+            if metadata.nlink() > 1 && !args.force {
+                if !args.quiet {
+                    eprintln!(
+                        "gzippy: {}: has {} other links -- skipping (use -f to force)",
+                        filename,
+                        metadata.nlink() - 1
+                    );
+                }
+                return Ok(2); // Exit code 2 = warning
+            }
+        }
+    }
+
     // Determine output filename
     let output_path = if args.stdout {
         None
