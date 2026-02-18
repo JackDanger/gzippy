@@ -331,10 +331,16 @@ pub struct LitLenTable {
 }
 
 impl LitLenTable {
-    /// Number of bits for main table (11 = 8KB, fits L1 cache)
+    /// Number of bits for main table lookup.
+    /// ARM64 (Apple M-series): 15-bit table (128KB) fits in 192KB L1d cache,
+    /// eliminating ALL subtable lookups since deflate litlen codes are max 15 bits.
+    /// x86_64: 11-bit table (8KB) fits in 32-48KB L1d cache.
+    #[cfg(target_arch = "aarch64")]
+    pub const TABLE_BITS: u8 = 15;
+    #[cfg(not(target_arch = "aarch64"))]
     pub const TABLE_BITS: u8 = 11;
-    /// Maximum number of subtable bits
-    pub const MAX_SUBTABLE_BITS: u8 = 4; // 15 - 11
+    /// Maximum number of subtable bits (0 on ARM64 = no subtables needed)
+    pub const MAX_SUBTABLE_BITS: u8 = 15 - Self::TABLE_BITS;
 
     /// Build a literal/length decode table from code lengths
     pub fn build(code_lengths: &[u8]) -> Option<Self> {

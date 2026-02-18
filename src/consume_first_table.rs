@@ -24,7 +24,12 @@
 
 use std::io;
 
-/// Table size constants (11 bits like libdeflate)
+/// Table size constants - platform-conditional to match LitLenTable::TABLE_BITS
+/// ARM64: 15-bit (128KB, fits 192KB L1d, no subtables)
+/// x86_64: 11-bit (8KB, fits 32-48KB L1d)
+#[cfg(target_arch = "aarch64")]
+pub const CF_TABLE_BITS: usize = 15;
+#[cfg(not(target_arch = "aarch64"))]
 pub const CF_TABLE_BITS: usize = 11;
 pub const CF_TABLE_SIZE: usize = 1 << CF_TABLE_BITS;
 pub const CF_TABLE_MASK: u64 = (CF_TABLE_SIZE - 1) as u64;
