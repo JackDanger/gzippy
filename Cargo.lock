@@ -93,6 +93,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "copy_dir"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "543d1dd138ef086e2ff05e3a48cf9da045da2033d16f8538fd76b86cd49b2ca3"
+dependencies = [
+ "walkdir",
+]
+
+[[package]]
 name = "core_affinity"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -194,6 +203,7 @@ dependencies = [
  "crc32fast",
  "filetime",
  "flate2",
+ "isal-rs",
  "libc",
  "libdeflate-sys",
  "libdeflater",
@@ -211,6 +221,25 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+
+[[package]]
+name = "isal-rs"
+version = "0.5.3+496255c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ec7734f9db7ef4c18bac0e94210aaa717c149b168e076ff681a56b342fca9ed"
+dependencies = [
+ "isal-sys",
+]
+
+[[package]]
+name = "isal-sys"
+version = "0.5.3+496255c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aefc9239959a60eaba201ccdd99897b5270be98d01f561c2166f5e3343e5a29b"
+dependencies = [
+ "cc",
+ "copy_dir",
+]
 
 [[package]]
 name = "libc"
