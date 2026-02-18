@@ -235,7 +235,7 @@ jobs:
             data_type: logs
             level: 9
             threads: "max"
-          # ARM64 - representative subset (L1, L6, L9 × silesia, plus L6 for others)
+          # ARM64 - full matrix (matches x86_64)
           - platform: arm64
             runner: ubuntu-24.04-arm
             data_type: silesia
@@ -269,12 +269,42 @@ jobs:
           - platform: arm64
             runner: ubuntu-24.04-arm
             data_type: software
+            level: 1
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: software
+            level: 1
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: software
             level: 6
             threads: "1"
           - platform: arm64
             runner: ubuntu-24.04-arm
             data_type: software
             level: 6
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: software
+            level: 9
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: software
+            level: 9
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: logs
+            level: 1
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: logs
+            level: 1
             threads: "max"
           - platform: arm64
             runner: ubuntu-24.04-arm
@@ -285,6 +315,16 @@ jobs:
             runner: ubuntu-24.04-arm
             data_type: logs
             level: 6
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: logs
+            level: 9
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: logs
+            level: 9
             threads: "max"
     steps:
       - uses: actions/checkout@v4
@@ -384,7 +424,8 @@ jobs:
             runner: ubuntu-latest
             archive_type: logs
             threads: "max"
-          # ARM64 - full decompression matrix (this is where 15-bit table matters most)
+          # ARM64 - full decompression matrix
+          # Note: igzip and gzip are excluded from Tmax jobs (single-threaded tools)
           - platform: arm64
             runner: ubuntu-24.04-arm
             archive_type: silesia
