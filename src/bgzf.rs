@@ -6475,7 +6475,7 @@ mod optimization_tests {
         eprintln!("[CF-SUBTABLE-TEST] PASSED");
     }
 
-    /// Test: Mixed code lengths with subtables (like real deflate)
+    /// Test: Mixed code lengths with direct table entries (15-bit table, no subtables)
     #[test]
     fn test_cf_subtable_mixed() {
         use crate::consume_first_table::ConsumeFirstTable;
@@ -6483,7 +6483,7 @@ mod optimization_tests {
 
         // Create a more realistic code length distribution:
         // - Some short codes (frequent symbols)
-        // - Some long codes > 11 bits (rare symbols)
+        // - Some long codes up to 12 bits (all fit in 15-bit main table)
         let mut code_lens = vec![0u8; 286];
 
         // Common literals (0-127) get short 8-bit codes
@@ -6498,7 +6498,7 @@ mod optimization_tests {
         for i in 192..224 {
             code_lens[i] = 10;
         }
-        // Very rare (224-255) get 12-bit codes (needs subtables!)
+        // Very rare (224-255) get 12-bit codes (fits directly in 15-bit table)
         for i in 224..256 {
             code_lens[i] = 12;
         }
@@ -6511,7 +6511,7 @@ mod optimization_tests {
 
         let cf_table = ConsumeFirstTable::build(&code_lens).expect("CF build failed");
 
-        eprintln!("\n[CF-MIXED-TEST] Mixed code lengths with subtables:");
+        eprintln!("\n[CF-MIXED-TEST] Mixed code lengths (15-bit table, no subtables):");
         eprintln!(
             "[CF-MIXED-TEST]   Subtable size: {} entries",
             cf_table.sub.len()
@@ -6556,7 +6556,7 @@ mod optimization_tests {
 
         let mut errors = 0;
 
-        // Test a 12-bit symbol (needs subtable)
+        // Test a 12-bit symbol (direct in 15-bit main table)
         let sym = 230;
         let (reversed, len) = symbol_codes[sym];
         eprintln!(
@@ -6572,24 +6572,12 @@ mod optimization_tests {
             main_entry.is_subtable()
         );
 
+        // With 15-bit table, 12-bit codes resolve directly (no subtable)
         if main_entry.is_subtable() {
-            let remaining_bits = reversed >> 11;
-            let sub_entry = cf_table.lookup_sub(main_entry, remaining_bits as u64);
-            eprintln!(
-                "[CF-MIXED-TEST]     Sub entry: sym={}, bits={}, is_literal={}",
-                sub_entry.symbol(),
-                sub_entry.bits(),
-                sub_entry.is_literal()
-            );
-            let total_bits = main_entry.bits() + sub_entry.bits();
-            eprintln!("[CF-MIXED-TEST]     Total bits: {}", total_bits);
-
-            if !sub_entry.is_literal() || sub_entry.symbol() != sym as u16 {
-                eprintln!("[CF-MIXED-TEST]     ERROR: Symbol mismatch!");
-                errors += 1;
-            }
-        } else {
-            eprintln!("[CF-MIXED-TEST]     ERROR: Expected subtable for 12-bit code!");
+            eprintln!("[CF-MIXED-TEST]     ERROR: 12-bit code should NOT need subtable with 15-bit table!");
+            errors += 1;
+        } else if !main_entry.is_literal() || main_entry.symbol() != sym as u16 {
+            eprintln!("[CF-MIXED-TEST]     ERROR: Symbol mismatch!");
             errors += 1;
         }
 
@@ -6638,25 +6626,23 @@ mod optimization_tests {
             eprintln!("[CF-MIXED-TEST]     Decoded 'A' correctly");
         }
 
-        // Decode symbol 2: should be 230 (needs subtable)
-        let e2_main = cf_table.lookup_main(bits.buffer());
-        bits.consume(e2_main.bits());
-        if e2_main.is_subtable() {
-            let e2_sub = cf_table.lookup_sub(e2_main, bits.buffer());
-            bits.consume(e2_sub.bits());
-            if e2_sub.symbol() != sym_rare as u16 {
-                eprintln!(
-                    "[CF-MIXED-TEST]     ERROR: Expected {}, got {}!",
-                    sym_rare,
-                    e2_sub.symbol()
-                );
-                errors += 1;
-            } else {
-                eprintln!("[CF-MIXED-TEST]     Decoded {} correctly", sym_rare);
-            }
-        } else {
-            eprintln!("[CF-MIXED-TEST]     ERROR: Symbol 230 should need subtable!");
+        // Decode symbol 2: should be 230 (direct in 15-bit table)
+        let e2 = cf_table.lookup_main(bits.buffer());
+        bits.consume(e2.bits());
+        if e2.is_subtable() {
+            eprintln!(
+                "[CF-MIXED-TEST]     ERROR: Symbol 230 should NOT need subtable with 15-bit table!"
+            );
             errors += 1;
+        } else if e2.symbol() != sym_rare as u16 {
+            eprintln!(
+                "[CF-MIXED-TEST]     ERROR: Expected {}, got {}!",
+                sym_rare,
+                e2.symbol()
+            );
+            errors += 1;
+        } else {
+            eprintln!("[CF-MIXED-TEST]     Decoded {} correctly", sym_rare);
         }
 
         // Decode symbol 3: should be EOB

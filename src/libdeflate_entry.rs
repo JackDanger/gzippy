@@ -331,10 +331,12 @@ pub struct LitLenTable {
 }
 
 impl LitLenTable {
-    /// Number of bits for main table (11 = 8KB, fits L1 cache)
-    pub const TABLE_BITS: u8 = 11;
-    /// Maximum number of subtable bits
-    pub const MAX_SUBTABLE_BITS: u8 = 4; // 15 - 11
+    /// Number of bits for main table (15 = 128KB, fits M-series L1 cache)
+    /// Using 15 bits eliminates ALL subtable lookups since deflate litlen
+    /// codes are max 15 bits. Every lookup resolves in a single table access.
+    pub const TABLE_BITS: u8 = 15;
+    /// Maximum number of subtable bits (0 = no subtables needed with 15-bit main)
+    pub const MAX_SUBTABLE_BITS: u8 = 0; // 15 - 15
 
     /// Build a literal/length decode table from code lengths
     pub fn build(code_lengths: &[u8]) -> Option<Self> {

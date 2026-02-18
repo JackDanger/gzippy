@@ -24,8 +24,8 @@
 
 use std::io;
 
-/// Table size constants (11 bits like libdeflate)
-pub const CF_TABLE_BITS: usize = 11;
+/// Table size constants (15 bits = full deflate code range, no subtables needed)
+pub const CF_TABLE_BITS: usize = 15;
 pub const CF_TABLE_SIZE: usize = 1 << CF_TABLE_BITS;
 pub const CF_TABLE_MASK: u64 = (CF_TABLE_SIZE - 1) as u64;
 
