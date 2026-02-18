@@ -270,7 +270,7 @@ impl ParallelGzEncoder {
 
     /// Single-stream compression using the best available backend
     fn compress_single_stream<W: Write>(&self, data: &[u8], writer: &mut W) -> io::Result<u64> {
-        // For L0-L3, use ISA-L when available (fastest on x86 with AVX2)
+        // For L0-L3, use ISA-L direct slice API (fastest on x86 with AVX2)
         if self.compression_level <= 3 && crate::isal_compress::is_available() {
             return crate::isal_compress::compress_gzip_to_writer(
                 data,

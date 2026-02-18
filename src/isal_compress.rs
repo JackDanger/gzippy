@@ -98,6 +98,34 @@ pub fn compress_gzip_stream<R: std::io::Read, W: std::io::Write>(
     Ok(bytes)
 }
 
+/// Compress a slice directly to a writer using ISA-L gzip.
+/// Avoids the copy that compress_gzip_stream does when data is already in memory.
+#[cfg(feature = "isal-compression")]
+pub fn compress_gzip_to_writer<W: std::io::Write>(
+    data: &[u8],
+    mut writer: W,
+    level: u32,
+) -> std::io::Result<u64> {
+    let max_size = data.len() + data.len() / 10 + 256;
+    let mut output = vec![0u8; max_size];
+    let size = isal::compress_into(data, &mut output, to_isal_level(level), isal::Codec::Gzip)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    writer.write_all(&output[..size])?;
+    Ok(data.len() as u64)
+}
+
+#[cfg(not(feature = "isal-compression"))]
+pub fn compress_gzip_to_writer<W: std::io::Write>(
+    _data: &[u8],
+    _writer: W,
+    _level: u32,
+) -> std::io::Result<u64> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "ISA-L not available",
+    ))
+}
+
 #[cfg(not(feature = "isal-compression"))]
 pub fn compress_gzip_stream<R: std::io::Read, W: std::io::Write>(
     _reader: &mut R,
