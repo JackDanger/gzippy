@@ -65,6 +65,42 @@ pub fn compress_deflate(_data: &[u8], _level: u32) -> Option<Vec<u8>> {
     None
 }
 
+/// Streaming gzip compression using ISA-L.
+/// Takes a reader and writer, streams data through ISA-L's encoder.
+/// Returns bytes read from the input on success.
+#[cfg(feature = "isal-compression")]
+pub fn compress_gzip_stream<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: W,
+    level: u32,
+) -> std::io::Result<u64> {
+    use isal::write::Encoder;
+    use isal::{Codec, CompressionLevel};
+
+    let isal_level = match level {
+        0 => CompressionLevel::Zero,
+        1 => CompressionLevel::One,
+        _ => CompressionLevel::Three,
+    };
+
+    let mut encoder = Encoder::new(writer, isal_level, Codec::Gzip);
+    let bytes = std::io::copy(reader, &mut encoder)?;
+    encoder.finish()?;
+    Ok(bytes)
+}
+
+#[cfg(not(feature = "isal-compression"))]
+pub fn compress_gzip_stream<R: std::io::Read, W: std::io::Write>(
+    _reader: &mut R,
+    _writer: W,
+    _level: u32,
+) -> std::io::Result<u64> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "ISA-L not available",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
