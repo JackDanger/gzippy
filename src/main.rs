@@ -38,7 +38,7 @@ mod marker_decode;
 mod optimization;
 mod packed_lut;
 mod parallel_compress;
-mod parallel_decompress_pipeline;
+
 mod pipelined_compress;
 mod rapidgzip_decoder;
 mod scheduler;
