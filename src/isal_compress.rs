@@ -16,6 +16,7 @@ pub fn is_available() -> bool {
 ///
 /// Returns None if ISA-L is not available, allowing the caller to fall back.
 #[cfg(feature = "isal-compression")]
+#[allow(dead_code)]
 pub fn compress_gzip(data: &[u8], level: u32) -> Option<Vec<u8>> {
     use isal::write::Encoder;
     use isal::{Codec, CompressionLevel};
