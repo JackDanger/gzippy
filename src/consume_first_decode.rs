@@ -710,11 +710,54 @@ fn decode_huffman_libdeflate_style(
         };
     }
 
-    // Inline entry lookup
+    // Inline entry lookup: mask + indexed load
+    // On ARM64 compiles to: AND Xidx, Xbitbuf, #MASK; LDR Wentry, [Xtable, Xidx, LSL #2]
     macro_rules! lookup {
         () => {
             unsafe { (*litlen_ptr.add((bitbuf & LITLEN_TABLEMASK) as usize)).raw() }
         };
+    }
+
+    // =========================================================================
+    // HUFFDEC micro-ops: software equivalents of a fused indexed-load instruction
+    //
+    // These two macros capture the critical serial dependency chain in Huffman
+    // decoding. A hypothetical hardware HUFFDEC instruction would fuse the
+    // table lookup with the bit-buffer shift into a single pipeline stage.
+    // In software, we express the same intent by keeping these operations
+    // adjacent with nothing between them, giving the CPU's OoO engine the
+    // best chance to pipeline them.
+    //
+    // The critical path per symbol is:
+    //   LSR  Xbitbuf, Xbitbuf, Xentry       (1 cycle: consume)
+    //   AND  Xidx, Xbitbuf, #MASK           (1 cycle: mask, depends on LSR)
+    //   LDR  Wentry, [Xtable, Xidx, LSL #2] (3-4 cycles: load, depends on AND)
+    //   SUB  Wbitsleft, Wbitsleft, Wentry    (parallel with LSR, free)
+    // Total: 5-6 cycles per symbol on the critical path.
+    // =========================================================================
+
+    /// Consume current entry from bit buffer, return saved_bitbuf for extra bits.
+    /// Used at loop top where we need saved_bitbuf but don't know the entry type yet.
+    macro_rules! consume {
+        ($entry:expr) => {{
+            let saved = bitbuf;
+            bitbuf >>= $entry as u8;
+            bitsleft = bitsleft.wrapping_sub($entry);
+            saved
+        }};
+    }
+
+    /// Fused consume + lookup: the HUFFDEC micro-op.
+    /// Consumes current entry's bits from bitbuf, then immediately looks up the
+    /// next entry. This is the innermost serial dependency in deflate decoding —
+    /// the shift feeds the mask feeds the load. Keeping these adjacent and
+    /// uninterrupted is critical for throughput.
+    macro_rules! huffdec {
+        ($entry:expr) => {{
+            bitbuf >>= $entry as u8;
+            bitsleft = bitsleft.wrapping_sub($entry);
+            $entry = lookup!();
+        }};
     }
 
     // PRELOAD first entry BEFORE loop (libdeflate pattern)
@@ -740,90 +783,64 @@ fn decode_huffman_libdeflate_style(
             refill_branchless_fast!();
         }
 
-        // Save bitbuf for extra bits extraction
-        let saved_bitbuf = bitbuf;
-
-        // Consume bits - NOTE: subtract full entry, not masked!
-        // This is the key libdeflate optimization
-        #[cfg(feature = "debug_decode")]
-        let pre_shift_bitbuf = bitbuf;
-        bitbuf >>= entry as u8;
-        #[cfg(feature = "debug_decode")]
-        debug_write!(
-            out_pos,
-            "SHIFT pre={:016x} amt={} post={:016x} entry={:08x}",
-            pre_shift_bitbuf,
-            entry as u8,
-            bitbuf,
-            entry
-        );
-        bitsleft = bitsleft.wrapping_sub(entry);
+        // consume! — save bitbuf for extra bits, then consume entry's bits.
+        // saved_bitbuf is used by the length code path for extra bits extraction.
+        let saved_bitbuf = consume!(entry);
 
         // Check LITERAL (bit 31 set = negative as i32)
         if (entry as i32) < 0 {
             // LITERAL PATH - libdeflate style multi-literal decode
+            // Note: E1 was already consumed above. Bare lookup for E2.
             let lit1 = (entry >> 16) as u8;
             entry = lookup!();
 
             if (entry as i32) < 0 {
-                // 2nd literal
-                bitbuf >>= entry as u8;
-                bitsleft = bitsleft.wrapping_sub(entry);
+                // 2nd literal — huffdec! fuses consume + next lookup
                 let lit2 = (entry >> 16) as u8;
-                entry = lookup!();
+                huffdec!(entry);
 
                 if (entry as i32) < 0 {
                     // 3rd literal
-                    bitbuf >>= entry as u8;
-                    bitsleft = bitsleft.wrapping_sub(entry);
                     let lit3 = (entry >> 16) as u8;
                     // For TABLE_BITS > 13: 3 × TABLE_BITS can exceed 56 bits,
                     // so we need to refill before the 4th literal
                     if LitLenTable::TABLE_BITS > 13 && (bitsleft as u8) < 32 {
                         refill_branchless_fast!();
                     }
-                    entry = lookup!();
+                    huffdec!(entry);
 
                     if (entry as i32) < 0 {
                         // 4th literal
-                        bitbuf >>= entry as u8;
-                        bitsleft = bitsleft.wrapping_sub(entry);
                         let lit4 = (entry >> 16) as u8;
                         // Always refill before 5th lookup - we need bits for potential length/distance
                         // CRITICAL: Must refill BEFORE lookup so entry matches the post-refill bitbuf
+                        consume!(entry);
                         refill_branchless_fast!();
                         entry = lookup!();
 
                         if (entry as i32) < 0 {
                             // 5th literal
-                            bitbuf >>= entry as u8;
-                            bitsleft = bitsleft.wrapping_sub(entry);
                             let lit5 = (entry >> 16) as u8;
-                            entry = lookup!();
+                            huffdec!(entry);
 
                             // Try to decode 3 more literals for 8-literal batch
                             if (entry as i32) < 0 {
                                 // 6th literal
-                                bitbuf >>= entry as u8;
-                                bitsleft = bitsleft.wrapping_sub(entry);
                                 let lit6 = (entry >> 16) as u8;
-                                entry = lookup!();
+                                huffdec!(entry);
 
                                 if (entry as i32) < 0 {
                                     // 7th literal
-                                    bitbuf >>= entry as u8;
-                                    bitsleft = bitsleft.wrapping_sub(entry);
                                     let lit7 = (entry >> 16) as u8;
                                     // Refill BEFORE lookup to ensure entry matches post-refill bitbuf
+                                    consume!(entry);
                                     refill_branchless_fast!();
                                     entry = lookup!();
 
                                     if (entry as i32) < 0 {
-                                        // 8th literal - write all 8 at once
-                                        bitbuf >>= entry as u8;
-                                        bitsleft = bitsleft.wrapping_sub(entry);
+                                        // 8th literal — write all 8 at once
                                         let lit8 = (entry >> 16) as u8;
-                                        entry = lookup!();
+                                        huffdec!(entry);
 
                                         // Pack 8 literals into a u64 and write
                                         let packed = (lit1 as u64)
@@ -1088,9 +1105,7 @@ fn decode_huffman_libdeflate_style(
                 });
             }
 
-            let saved_sub = bitbuf;
-            bitbuf >>= entry as u8;
-            bitsleft = bitsleft.wrapping_sub(entry);
+            let saved_sub = consume!(entry);
 
             if (entry as i32) < 0 {
                 // Literal from subtable
@@ -1296,6 +1311,23 @@ fn decode_huffman_optimized(
         };
     }
 
+    // HUFFDEC micro-ops (same as in libdeflate_style, see docs there)
+    macro_rules! consume {
+        ($entry:expr) => {{
+            let saved = bitbuf;
+            bitbuf >>= $entry as u8;
+            bitsleft = bitsleft.wrapping_sub($entry);
+            saved
+        }};
+    }
+    macro_rules! huffdec {
+        ($entry:expr) => {{
+            bitbuf >>= $entry as u8;
+            bitsleft = bitsleft.wrapping_sub($entry);
+            $entry = lookup!();
+        }};
+    }
+
     refill_branchless!();
     let mut entry = lookup!();
 
@@ -1313,36 +1345,30 @@ fn decode_huffman_optimized(
             refill_branchless!();
         }
 
-        let saved_bitbuf = bitbuf;
-        bitbuf >>= entry as u8;
-        bitsleft = bitsleft.wrapping_sub(entry);
+        let saved_bitbuf = consume!(entry);
 
         if (entry as i32) < 0 {
-            // LITERAL PATH - multi-literal decode
+            // LITERAL PATH - multi-literal decode with huffdec! micro-op
+            // Note: E1 was already consumed above. Bare lookup for E2.
             let lit1 = (entry >> 16) as u8;
             entry = lookup!();
 
             if (entry as i32) < 0 {
-                bitbuf >>= entry as u8;
-                bitsleft = bitsleft.wrapping_sub(entry);
                 let lit2 = (entry >> 16) as u8;
-                entry = lookup!();
+                huffdec!(entry);
 
                 if (entry as i32) < 0 {
-                    bitbuf >>= entry as u8;
-                    bitsleft = bitsleft.wrapping_sub(entry);
                     let lit3 = (entry >> 16) as u8;
                     // For TABLE_BITS > 13: refill after 3rd literal
                     if LitLenTable::TABLE_BITS > 13 && (bitsleft as u8) < 32 {
                         refill_branchless!();
                     }
-                    entry = lookup!();
+                    huffdec!(entry);
 
                     if (entry as i32) < 0 {
-                        bitbuf >>= entry as u8;
-                        bitsleft = bitsleft.wrapping_sub(entry);
                         let lit4 = (entry >> 16) as u8;
                         // Refill BEFORE lookup to ensure entry matches post-refill bitbuf
+                        consume!(entry);
                         refill_branchless!();
                         entry = lookup!();
 
@@ -1396,9 +1422,7 @@ fn decode_huffman_optimized(
             let sub_idx = bzhi!(bitbuf, subtable_bits) as usize;
             entry = unsafe { (*litlen_ptr.add(subtable_start + sub_idx)).raw() };
 
-            let saved_sub = bitbuf;
-            bitbuf >>= entry as u8;
-            bitsleft = bitsleft.wrapping_sub(entry);
+            let saved_sub = consume!(entry);
 
             if (entry as i32) < 0 {
                 let lit = ((entry >> 16) & 0xFF) as u8;
