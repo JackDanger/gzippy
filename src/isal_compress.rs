@@ -11,27 +11,32 @@ pub fn is_available() -> bool {
     cfg!(feature = "isal-compression")
 }
 
+/// Map gzippy compression level to ISA-L CompressionLevel.
+/// ISA-L only supports levels 0, 1, 3 (no level 2).
+#[cfg(feature = "isal-compression")]
+#[inline]
+fn to_isal_level(level: u32) -> isal::CompressionLevel {
+    match level {
+        0 => isal::CompressionLevel::Zero,
+        1 => isal::CompressionLevel::One,
+        _ => isal::CompressionLevel::Three,
+    }
+}
+
 /// Compress data using ISA-L gzip at the given level (0-3).
-/// Returns the compressed data including gzip header and trailer.
+/// Uses stateless single-shot compression for maximum throughput.
 ///
 /// Returns None if ISA-L is not available, allowing the caller to fall back.
 #[cfg(feature = "isal-compression")]
 #[allow(dead_code)]
 pub fn compress_gzip(data: &[u8], level: u32) -> Option<Vec<u8>> {
-    use isal::write::Encoder;
-    use isal::{Codec, CompressionLevel};
-    use std::io::Write;
-
-    // ISA-L only supports levels 0, 1, 3 (no level 2)
-    let isal_level = match level {
-        0 => CompressionLevel::Zero,
-        1 => CompressionLevel::One,
-        _ => CompressionLevel::Three,
-    };
-
-    let mut encoder = Encoder::new(Vec::new(), isal_level, Codec::Gzip);
-    encoder.write_all(data).ok()?;
-    encoder.finish().ok()
+    // Worst case: incompressible data + gzip header/trailer overhead
+    let max_size = data.len() + data.len() / 10 + 256;
+    let mut output = vec![0u8; max_size];
+    let size =
+        isal::compress_into(data, &mut output, to_isal_level(level), isal::Codec::Gzip).ok()?;
+    output.truncate(size);
+    Some(output)
 }
 
 #[cfg(not(feature = "isal-compression"))]
@@ -41,23 +46,21 @@ pub fn compress_gzip(_data: &[u8], _level: u32) -> Option<Vec<u8>> {
 }
 
 /// Compress a block of data using ISA-L deflate (raw, no gzip wrapper).
+/// Uses stateless single-shot compression for maximum throughput.
 /// Returns None if ISA-L is not available.
 #[cfg(feature = "isal-compression")]
 pub fn compress_deflate(data: &[u8], level: u32) -> Option<Vec<u8>> {
-    use isal::write::Encoder;
-    use isal::{Codec, CompressionLevel};
-    use std::io::Write;
-
-    // ISA-L only supports levels 0, 1, 3 (no level 2)
-    let isal_level = match level {
-        0 => CompressionLevel::Zero,
-        1 => CompressionLevel::One,
-        _ => CompressionLevel::Three,
-    };
-
-    let mut encoder = Encoder::new(Vec::new(), isal_level, Codec::Deflate);
-    encoder.write_all(data).ok()?;
-    encoder.finish().ok()
+    let max_size = data.len() + data.len() / 10 + 256;
+    let mut output = vec![0u8; max_size];
+    let size = isal::compress_into(
+        data,
+        &mut output,
+        to_isal_level(level),
+        isal::Codec::Deflate,
+    )
+    .ok()?;
+    output.truncate(size);
+    Some(output)
 }
 
 #[cfg(not(feature = "isal-compression"))]
@@ -65,27 +68,33 @@ pub fn compress_deflate(_data: &[u8], _level: u32) -> Option<Vec<u8>> {
     None
 }
 
-/// Streaming gzip compression using ISA-L.
-/// Takes a reader and writer, streams data through ISA-L's encoder.
+/// Gzip compression using ISA-L's single-shot stateless API.
+/// Buffers all input, then compresses in one call for maximum throughput.
 /// Returns bytes read from the input on success.
 #[cfg(feature = "isal-compression")]
 pub fn compress_gzip_stream<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
-    writer: W,
+    mut writer: W,
     level: u32,
 ) -> std::io::Result<u64> {
-    use isal::write::Encoder;
-    use isal::{Codec, CompressionLevel};
+    let mut input = Vec::new();
+    reader.read_to_end(&mut input)?;
+    let bytes = input.len() as u64;
 
-    let isal_level = match level {
-        0 => CompressionLevel::Zero,
-        1 => CompressionLevel::One,
-        _ => CompressionLevel::Three,
-    };
+    if input.is_empty() {
+        // Write minimal gzip for empty input
+        let compressed = compress_gzip(&input, level).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "ISA-L compression failed")
+        })?;
+        writer.write_all(&compressed)?;
+        return Ok(0);
+    }
 
-    let mut encoder = Encoder::new(writer, isal_level, Codec::Gzip);
-    let bytes = std::io::copy(reader, &mut encoder)?;
-    encoder.finish()?;
+    let max_size = input.len() + input.len() / 10 + 256;
+    let mut output = vec![0u8; max_size];
+    let size = isal::compress_into(&input, &mut output, to_isal_level(level), isal::Codec::Gzip)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    writer.write_all(&output[..size])?;
     Ok(bytes)
 }
 
