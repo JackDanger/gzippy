@@ -103,25 +103,6 @@ pub fn get_optimal_block_size(level: u32, file_size: usize, num_threads: usize) 
     }
 }
 
-/// Check if a data sample is highly compressible (ratio < 5%).
-/// Used to skip parallelism when block overhead exceeds speedup.
-fn is_highly_compressible(sample: &[u8], level: u32) -> bool {
-    if sample.is_empty() {
-        return false;
-    }
-    let lvl = match libdeflater::CompressionLvl::new(level as i32) {
-        Ok(l) => l,
-        Err(_) => return false,
-    };
-    let mut compressor = libdeflater::Compressor::new(lvl);
-    let max_size = compressor.deflate_compress_bound(sample.len());
-    let mut output = vec![0u8; max_size];
-    match compressor.deflate_compress(sample, &mut output) {
-        Ok(size) => (size as f64 / sample.len() as f64) < 0.05,
-        Err(_) => false,
-    }
-}
-
 // Thread-local compression buffer to avoid per-block allocation
 thread_local! {
     static COMPRESS_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -185,20 +166,10 @@ impl ParallelGzEncoder {
                 .map(|_| bytes_read);
         }
 
-        // Ratio probe: skip parallelism for highly compressible data at fast levels.
-        // At L1-L5, compression is so fast that block overhead dominates for
-        // highly compressible data (e.g., software dataset: Tmax < T1).
-        if self.compression_level <= 5 && self.num_threads > 1 {
-            let sample = &input_data[..block_size.min(input_data.len())];
-            if is_highly_compressible(sample, self.compression_level) {
-                let mut w = writer;
-                return self
-                    .compress_single_stream(&input_data, &mut w)
-                    .map(|_| bytes_read);
-            }
-        }
-
         // Large file with multiple threads, or L10-L12: compress blocks in parallel with libdeflate
+        // Note: compress_parallel() has its own ratio probe that falls back to the
+        // fastest streaming backend (ISA-L on x86, flate2 on arm64) for highly
+        // compressible data where parallelism overhead exceeds benefit.
         let _ = self.compress_parallel(&input_data, block_size, writer)?;
 
         Ok(bytes_read)
@@ -252,17 +223,10 @@ impl ParallelGzEncoder {
             return self.compress_single_stream(&mmap, &mut writer);
         }
 
-        // Ratio probe: for multi-threaded L1-L5, check if data is highly compressible.
-        // When compression ratio < 5%, parallelism overhead (per-block headers, thread
-        // coordination, CRC32) exceeds speedup. Fall back to single-threaded streaming.
-        if self.compression_level <= 5 && self.num_threads > 1 {
-            let sample = &mmap[..block_size.min(file_len)];
-            if is_highly_compressible(sample, self.compression_level) {
-                return self.compress_single_stream(&mmap, &mut writer);
-            }
-        }
-
         // Large file with multiple threads, or L10-L12: compress blocks in parallel with libdeflate
+        // Note: compress_parallel() has its own ratio probe that falls back to the
+        // fastest streaming backend (ISA-L on x86, flate2 on arm64) for highly
+        // compressible data where parallelism overhead exceeds benefit.
         let _ = self.compress_parallel(&mmap, block_size, writer)?;
 
         Ok(file_len as u64)
@@ -312,8 +276,8 @@ impl ParallelGzEncoder {
 
         // Probe compression ratio on first block to detect highly compressible data.
         // When ratio < 10%, parallel coordination overhead exceeds the benefit of
-        // multi-threading — use flate2/zlib-ng streaming instead (faster for such data
-        // due to smaller buffer allocations and better cache behavior).
+        // multi-threading. Fall back to single-stream using the fastest available
+        // backend: ISA-L on x86 (AVX2), flate2/zlib-ng streaming on arm64.
         if compression_level <= 5 && data.len() > block_size && self.num_threads > 1 {
             let probe_block = &data[..block_size];
             let mut probe_output = Vec::new();
@@ -325,8 +289,18 @@ impl ParallelGzEncoder {
             );
             let ratio = probe_output.len() as f64 / probe_block.len() as f64;
             if ratio < 0.10 {
-                let adjusted_level = adjust_compression_level(compression_level.min(9));
                 let mut writer = writer;
+                // ISA-L stateless single-shot is fastest on x86 for L0-L3
+                if compression_level <= 3 && crate::isal_compress::is_available() {
+                    crate::isal_compress::compress_gzip_to_writer(
+                        data,
+                        &mut writer,
+                        compression_level,
+                    )?;
+                    return Ok(writer);
+                }
+                // flate2/zlib-ng streaming: best on arm64, good cache behavior
+                let adjusted_level = adjust_compression_level(compression_level.min(9));
                 let mut encoder = self
                     .gz_builder()
                     .write(&mut writer, Compression::new(adjusted_level));
