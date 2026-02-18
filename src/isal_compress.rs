@@ -17,22 +17,18 @@ pub fn is_available() -> bool {
 /// Returns None if ISA-L is not available, allowing the caller to fall back.
 #[cfg(feature = "isal-compression")]
 pub fn compress_gzip(data: &[u8], level: u32) -> Option<Vec<u8>> {
-    use isal_rs::igzip::compress::Encoder;
-    use isal_rs::igzip::CompressionLevel;
+    use isal_rs::write::Encoder;
+    use isal_rs::{Codec, CompressionLevel};
     use std::io::Write;
 
+    // ISA-L only supports levels 0, 1, 3 (no level 2)
     let isal_level = match level {
         0 => CompressionLevel::Zero,
         1 => CompressionLevel::One,
-        2 => CompressionLevel::Two,
         _ => CompressionLevel::Three,
     };
 
-    let mut encoder = Encoder::builder()
-        .compression_level(isal_level)
-        .build(Vec::new())
-        .ok()?;
-
+    let mut encoder = Encoder::new(Vec::new(), isal_level, Codec::Gzip);
     encoder.write_all(data).ok()?;
     encoder.finish().ok()
 }
@@ -47,24 +43,18 @@ pub fn compress_gzip(_data: &[u8], _level: u32) -> Option<Vec<u8>> {
 /// Returns None if ISA-L is not available.
 #[cfg(feature = "isal-compression")]
 pub fn compress_deflate(data: &[u8], level: u32) -> Option<Vec<u8>> {
-    use isal_rs::igzip::compress::Encoder;
-    use isal_rs::igzip::Codec;
-    use isal_rs::igzip::CompressionLevel;
+    use isal_rs::write::Encoder;
+    use isal_rs::{Codec, CompressionLevel};
     use std::io::Write;
 
+    // ISA-L only supports levels 0, 1, 3 (no level 2)
     let isal_level = match level {
         0 => CompressionLevel::Zero,
         1 => CompressionLevel::One,
-        2 => CompressionLevel::Two,
         _ => CompressionLevel::Three,
     };
 
-    let mut encoder = Encoder::builder()
-        .compression_level(isal_level)
-        .codec(Codec::Deflate)
-        .build(Vec::new())
-        .ok()?;
-
+    let mut encoder = Encoder::new(Vec::new(), isal_level, Codec::Deflate);
     encoder.write_all(data).ok()?;
     encoder.finish().ok()
 }

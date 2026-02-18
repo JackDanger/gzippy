@@ -65,12 +65,11 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ matrix.platform }}-cargo-bench-isal-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.platform }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build all tools
         run: |
           # Build gzippy (with ISA-L compression on x86_64 for fastest L0-L3)
-          cargo clean -p gzippy --release 2>/dev/null || true
           if [ "$(uname -m)" = "x86_64" ]; then
             cargo build --release --features isal-compression
           else

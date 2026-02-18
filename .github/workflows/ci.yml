@@ -71,7 +71,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ matrix.os }}-${{ matrix.arch }}-cargo-isal-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install ISA-L build deps (x86_64 Linux)
         if: matrix.os == 'linux' && matrix.arch == 'x86_64'
@@ -80,7 +80,6 @@ jobs:
       - name: Build release
         run: |
           if [ "${{ matrix.os }}" = "linux" ] && [ "${{ matrix.arch }}" = "x86_64" ]; then
-            cargo clean -p gzippy --release 2>/dev/null || true
             cargo build --release --features isal-compression
           else
             cargo build --release
@@ -125,7 +124,6 @@ jobs:
 
       - name: Build gzippy
         run: |
-          cargo clean -p gzippy --release 2>/dev/null || true
           cargo build --release --features isal-compression
 
       - name: Create ungzippy symlink
@@ -222,7 +220,6 @@ jobs:
 
       - name: Build gzippy
         run: |
-          cargo clean -p gzippy --release 2>/dev/null || true
           cargo build --release --features isal-compression
 
       - name: Test empty file
@@ -360,7 +357,6 @@ jobs:
 
       - name: Build gzippy
         run: |
-          cargo clean -p gzippy --release 2>/dev/null || true
           cargo build --release --features isal-compression
 
       - name: Generate test data (${{ matrix.size }}MB ${{ matrix.type }})
@@ -464,7 +460,6 @@ jobs:
 
       - name: Build gzippy
         run: |
-          cargo clean -p gzippy --release 2>/dev/null || true
           cargo build --release --features isal-compression
 
       - name: Setup test files
@@ -603,7 +598,6 @@ jobs:
 
       - name: Build gzippy
         run: |
-          cargo clean -p gzippy --release 2>/dev/null || true
           cargo build --release --features isal-compression
 
       - name: Test valid CRC32 roundtrip (pipe-based)
@@ -762,7 +756,6 @@ jobs:
 
       - name: Build gzippy
         run: |
-          cargo clean -p gzippy --release 2>/dev/null || true
           cargo build --release --features isal-compression
 
       - name: Build pigz
@@ -915,5 +908,4 @@ jobs:
 
       - name: Run clippy
         run: |
-          cargo clean -p gzippy --release 2>/dev/null || true
           cargo clippy --release --features isal-compression -- -D warnings
