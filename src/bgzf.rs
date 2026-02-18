@@ -288,6 +288,8 @@ struct BgzfBlock {
     deflate_offset: usize,
     /// Uncompressed size (from ISIZE trailer)
     isize: u32,
+    /// Expected CRC32 from gzip trailer
+    expected_crc32: u32,
     /// Output offset (calculated during planning)
     output_offset: usize,
 }
@@ -362,16 +364,24 @@ fn parse_bgzf_blocks(data: &[u8]) -> io::Result<Vec<BgzfBlock>> {
         // Calculate deflate data offset (after header)
         let deflate_offset = calculate_deflate_offset(&data[offset..offset + length]);
 
-        // Get ISIZE from trailer (last 4 bytes)
-        let isize = if length >= 4 {
-            u32::from_le_bytes([
-                data[offset + length - 4],
-                data[offset + length - 3],
-                data[offset + length - 2],
-                data[offset + length - 1],
-            ])
+        // Get CRC32 and ISIZE from trailer (last 8 bytes: 4 CRC32 + 4 ISIZE)
+        let (expected_crc32, isize) = if length >= 8 {
+            let trailer_start = offset + length - 8;
+            let crc = u32::from_le_bytes([
+                data[trailer_start],
+                data[trailer_start + 1],
+                data[trailer_start + 2],
+                data[trailer_start + 3],
+            ]);
+            let isz = u32::from_le_bytes([
+                data[trailer_start + 4],
+                data[trailer_start + 5],
+                data[trailer_start + 6],
+                data[trailer_start + 7],
+            ]);
+            (crc, isz)
         } else {
-            0
+            (0, 0)
         };
 
         blocks.push(BgzfBlock {
@@ -379,6 +389,7 @@ fn parse_bgzf_blocks(data: &[u8]) -> io::Result<Vec<BgzfBlock>> {
             length,
             deflate_offset,
             isize,
+            expected_crc32,
             output_offset,
         });
 
@@ -2720,14 +2731,36 @@ pub fn decompress_bgzf_parallel<W: Write>(
                     };
 
                     // Use our pure Rust consume_first decoder - NO LIBDEFLATE!
-                    if let Err(e) = inflate_into(deflate_data, out_slice) {
-                        eprintln!(
-                            "Block {} failed: {:?} deflate_len={} out_size={}",
-                            idx,
-                            e,
-                            deflate_data.len(),
-                            out_size
-                        );
+                    match inflate_into(deflate_data, out_slice) {
+                        Ok(actual_size) => {
+                            // Validate ISIZE
+                            if actual_size != out_size {
+                                eprintln!(
+                                    "gzippy: block {}: size mismatch (got {}, expected {})",
+                                    idx, actual_size, out_size
+                                );
+                            }
+                            // Validate CRC32
+                            if block.expected_crc32 != 0 {
+                                let actual_crc =
+                                    crc32fast::hash(&out_slice[..actual_size]);
+                                if actual_crc != block.expected_crc32 {
+                                    eprintln!(
+                                        "gzippy: block {}: CRC32 mismatch (got {:08x}, expected {:08x})",
+                                        idx, actual_crc, block.expected_crc32
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Block {} failed: {:?} deflate_len={} out_size={}",
+                                idx,
+                                e,
+                                deflate_data.len(),
+                                out_size
+                            );
+                        }
                     }
                 }
             });
@@ -2749,12 +2782,14 @@ pub fn decompress_bgzf_parallel<W: Write>(
 struct GzipMember {
     /// Start offset in compressed data
     start: usize,
-    /// End offset (exclusive) in compressed data  
+    /// End offset (exclusive) in compressed data
     end: usize,
     /// Offset to deflate data within member
     deflate_offset: usize,
     /// Uncompressed size (from ISIZE trailer)
     isize: u32,
+    /// Expected CRC32 from gzip trailer
+    expected_crc32: u32,
     /// Output offset (calculated during planning)
     output_offset: usize,
 }
@@ -2807,16 +2842,24 @@ fn find_gzip_members(data: &[u8]) -> Vec<GzipMember> {
             }
         }
 
-        // Get ISIZE from trailer (last 4 bytes of member)
-        let isize = if member_end >= member_start + 4 {
-            u32::from_le_bytes([
-                data[member_end - 4],
-                data[member_end - 3],
-                data[member_end - 2],
-                data[member_end - 1],
-            ])
+        // Get CRC32 and ISIZE from trailer (last 8 bytes of member)
+        let (expected_crc32, isize) = if member_end >= member_start + 8 {
+            let trailer_start = member_end - 8;
+            let crc = u32::from_le_bytes([
+                data[trailer_start],
+                data[trailer_start + 1],
+                data[trailer_start + 2],
+                data[trailer_start + 3],
+            ]);
+            let isz = u32::from_le_bytes([
+                data[trailer_start + 4],
+                data[trailer_start + 5],
+                data[trailer_start + 6],
+                data[trailer_start + 7],
+            ]);
+            (crc, isz)
         } else {
-            0
+            (0, 0)
         };
 
         members.push(GzipMember {
@@ -2824,6 +2867,7 @@ fn find_gzip_members(data: &[u8]) -> Vec<GzipMember> {
             end: member_end,
             deflate_offset,
             isize,
+            expected_crc32,
             output_offset,
         });
 
@@ -2918,7 +2962,27 @@ pub fn decompress_multi_member_parallel<W: Write>(
                     };
 
                     // Use our optimized pure Rust inflate
-                    let _ = inflate_into(deflate_data, out_slice);
+                    match inflate_into(deflate_data, out_slice) {
+                        Ok(actual_size) => {
+                            // Validate CRC32
+                            if member.expected_crc32 != 0 {
+                                let actual_crc =
+                                    crc32fast::hash(&out_slice[..actual_size]);
+                                if actual_crc != member.expected_crc32 {
+                                    eprintln!(
+                                        "gzippy: member {}: CRC32 mismatch (got {:08x}, expected {:08x})",
+                                        idx, actual_crc, member.expected_crc32
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "gzippy: member {} decompression failed: {:?}",
+                                idx, e
+                            );
+                        }
+                    }
                 }
             });
         }

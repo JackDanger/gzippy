@@ -34,6 +34,30 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         };
     }
 
+    // Skip symlinks (unless -f, which follows them)
+    if input_path.is_symlink() && !args.force {
+        if !args.quiet {
+            eprintln!(
+                "gzippy: {}: is a symbolic link -- skipping (use -f to force)",
+                filename
+            );
+        }
+        return Ok(2);
+    }
+
+    // Skip special files (devices, FIFOs, sockets)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let ft = std::fs::symlink_metadata(input_path)?.file_type();
+        if ft.is_block_device() || ft.is_char_device() || ft.is_fifo() || ft.is_socket() {
+            if !args.quiet {
+                eprintln!("gzippy: {}: is not a regular file -- skipping", filename);
+            }
+            return Ok(2);
+        }
+    }
+
     // Skip files with multiple hard links (unless -f)
     #[cfg(unix)]
     {
