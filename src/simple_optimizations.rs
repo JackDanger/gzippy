@@ -9,23 +9,31 @@
 //! - System zlib for gzip-compatible output at all compression levels
 //! - Cache-aware block sizing based on detected L2 cache
 
-use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
 use crate::optimization::{CompressionBackend, OptimizationConfig};
-use crate::parallel_compress::ParallelGzEncoder;
+use crate::parallel_compress::{GzipHeaderInfo, ParallelGzEncoder};
 use crate::pipelined_compress::PipelinedGzEncoder;
 
 /// Simple but effective optimizations that address pigz performance gaps
 pub struct SimpleOptimizer {
     config: OptimizationConfig,
+    header_info: GzipHeaderInfo,
 }
 
 impl SimpleOptimizer {
     pub fn new(config: OptimizationConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            header_info: GzipHeaderInfo::default(),
+        }
+    }
+
+    pub fn with_header_info(mut self, info: GzipHeaderInfo) -> Self {
+        self.header_info = info;
+        self
     }
 
     /// Optimized compression with improved threading and buffer management
@@ -57,19 +65,22 @@ impl SimpleOptimizer {
         // L10-L12: Ultra compression using libdeflate high levels
         // These use exhaustive search for near-zopfli compression ratios
         if self.config.compression_level >= 10 {
-            let encoder = ParallelGzEncoder::new(compression_level, optimal_threads);
+            let mut encoder = ParallelGzEncoder::new(compression_level, optimal_threads);
+            encoder.set_header_info(self.header_info.clone());
             return encoder.compress(reader, writer);
         }
 
         // L6-L9: Use pipelined compression with dictionary sharing like pigz
         // This ensures we match or beat pigz's compression ratio at all levels
         if self.config.compression_level >= 6 && optimal_threads > 1 {
-            let encoder = PipelinedGzEncoder::new(compression_level, optimal_threads);
+            let mut encoder = PipelinedGzEncoder::new(compression_level, optimal_threads);
+            encoder.set_header_info(self.header_info.clone());
             return encoder.compress(reader, writer);
         }
 
         // L1-L5: Use independent blocks for parallel decompression (fast)
-        let encoder = ParallelGzEncoder::new(compression_level, optimal_threads);
+        let mut encoder = ParallelGzEncoder::new(compression_level, optimal_threads);
+        encoder.set_header_info(self.header_info.clone());
         encoder.compress(reader, writer)
     }
 
@@ -90,14 +101,16 @@ impl SimpleOptimizer {
 
         // L10-L12: Ultra compression using libdeflate high levels
         if self.config.compression_level >= 10 {
-            let encoder = ParallelGzEncoder::new(compression_level, optimal_threads);
+            let mut encoder = ParallelGzEncoder::new(compression_level, optimal_threads);
+            encoder.set_header_info(self.header_info.clone());
             return encoder.compress_file(path, writer);
         }
 
         // For single-threaded L6-L9, use pipelined compression for max ratio
         if optimal_threads == 1 {
             if self.config.compression_level >= 6 {
-                let encoder = PipelinedGzEncoder::new(compression_level, 1);
+                let mut encoder = PipelinedGzEncoder::new(compression_level, 1);
+                encoder.set_header_info(self.header_info.clone());
                 return encoder.compress_file(path, writer);
             }
             let file = std::fs::File::open(&path)?;
@@ -106,12 +119,14 @@ impl SimpleOptimizer {
 
         // L6-L9: Use pipelined compression with dictionary sharing
         if self.config.compression_level >= 6 {
-            let encoder = PipelinedGzEncoder::new(compression_level, optimal_threads);
+            let mut encoder = PipelinedGzEncoder::new(compression_level, optimal_threads);
+            encoder.set_header_info(self.header_info.clone());
             return encoder.compress_file(path, writer);
         }
 
         // L1-L5: Use mmap-based parallel compression with independent blocks
-        let encoder = ParallelGzEncoder::new(compression_level, optimal_threads);
+        let mut encoder = ParallelGzEncoder::new(compression_level, optimal_threads);
+        encoder.set_header_info(self.header_info.clone());
         encoder.compress_file(path, writer)
     }
 
@@ -131,7 +146,15 @@ impl SimpleOptimizer {
         };
         let compression = Compression::new(adjusted_level as u32);
 
-        let mut encoder = GzEncoder::new(writer, compression);
+        let mut builder = flate2::GzBuilder::new();
+        if let Some(ref name) = self.header_info.filename {
+            builder = builder.filename(name.as_bytes());
+        }
+        builder = builder.mtime(self.header_info.mtime);
+        if let Some(ref comment) = self.header_info.comment {
+            builder = builder.comment(comment.as_bytes());
+        }
+        let mut encoder = builder.write(writer, compression);
         let bytes_written = io::copy(&mut reader, &mut encoder)?;
         encoder.finish()?;
 

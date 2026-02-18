@@ -9,6 +9,7 @@ use std::path::Path;
 use crate::cli::GzippyArgs;
 use crate::error::{GzippyError, GzippyResult};
 use crate::optimization::{detect_content_type, ContentType, OptimizationConfig};
+use crate::parallel_compress::GzipHeaderInfo;
 use crate::simple_optimizations::SimpleOptimizer;
 
 pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
@@ -31,6 +32,30 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
                 filename
             )))
         };
+    }
+
+    // Skip symlinks (unless -f, which follows them)
+    if input_path.is_symlink() && !args.force {
+        if !args.quiet {
+            eprintln!(
+                "gzippy: {}: is a symbolic link -- skipping (use -f to force)",
+                filename
+            );
+        }
+        return Ok(2);
+    }
+
+    // Skip special files (devices, FIFOs, sockets)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let ft = std::fs::symlink_metadata(input_path)?.file_type();
+        if ft.is_block_device() || ft.is_char_device() || ft.is_fifo() || ft.is_socket() {
+            if !args.quiet {
+                eprintln!("gzippy: {}: is not a regular file -- skipping", filename);
+            }
+            return Ok(2);
+        }
     }
 
     // Skip files with multiple hard links (unless -f)
@@ -58,13 +83,27 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         Some(get_output_filename(input_path, args))
     };
 
-    // Check if output file exists and handle force flag
+    // Check if output file exists and handle force/prompt
     if let Some(ref output_path) = output_path {
         if output_path.exists() && !args.force {
-            return Err(GzippyError::invalid_argument(format!(
-                "Output file {} already exists",
-                output_path.display()
-            )));
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() {
+                eprint!(
+                    "gzippy: {} already exists; do you wish to overwrite (y or n)? ",
+                    output_path.display()
+                );
+                let mut response = String::new();
+                std::io::stdin().read_line(&mut response)?;
+                if !response.trim().eq_ignore_ascii_case("y") {
+                    eprintln!("\tnot overwritten");
+                    return Ok(2);
+                }
+            } else {
+                return Err(GzippyError::invalid_argument(format!(
+                    "Output file {} already exists",
+                    output_path.display()
+                )));
+            }
         }
     }
 
@@ -84,12 +123,15 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     };
 
     // Create optimization configuration
-    let opt_config = OptimizationConfig::new(
-        args.processes,
-        file_size,
-        args.compression_level,
-        content_type,
-    );
+    // --independent forces L6 behavior (independent blocks) even at L7-L9
+    let effective_level =
+        if args.independent && args.compression_level >= 7 && args.compression_level <= 9 {
+            6
+        } else {
+            args.compression_level
+        };
+    let opt_config =
+        OptimizationConfig::new(args.processes, file_size, effective_level, content_type);
 
     if args.verbosity >= 2 {
         eprintln!(
@@ -101,6 +143,9 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         );
     }
 
+    // Build gzip header metadata from file
+    let header_info = build_header_info(input_path, args);
+
     // Use mmap for multi-threaded compression
     // On Linux, mmap is faster even for small files due to zero-copy and kernel page cache
     // Threshold: 128KB (one block) - below this, overhead exceeds benefit
@@ -111,7 +156,34 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         crate::set_output_file(Some(output_path.to_string_lossy().to_string()));
     }
 
-    let result = if use_mmap {
+    let result = if args.rsyncable && use_mmap {
+        // RSYNCABLE PATH: Content-determined block boundaries for rsync-friendly output
+        if args.verbosity >= 2 {
+            eprintln!("gzippy: using rsyncable compression");
+        }
+        let mmap = unsafe { memmap2::Mmap::map(&File::open(input_path)?)? };
+        if args.stdout {
+            crate::parallel_compress::compress_rsyncable(
+                &mmap,
+                args.compression_level as u32,
+                opt_config.thread_count,
+                &header_info,
+                stdout(),
+            )
+            .map_err(|e| e.into())
+        } else {
+            let output_path = output_path.clone().unwrap();
+            let output_file = BufWriter::new(File::create(&output_path)?);
+            crate::parallel_compress::compress_rsyncable(
+                &mmap,
+                args.compression_level as u32,
+                opt_config.thread_count,
+                &header_info,
+                output_file,
+            )
+            .map_err(|e| e.into())
+        }
+    } else if use_mmap {
         // MMAP PATH: Zero-copy parallel compression for large files
         if args.verbosity >= 2 {
             eprintln!(
@@ -119,7 +191,8 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
                 opt_config.thread_count,
             );
         }
-        let optimizer = SimpleOptimizer::new(opt_config.clone());
+        let optimizer =
+            SimpleOptimizer::new(opt_config.clone()).with_header_info(header_info.clone());
         if args.stdout {
             optimizer
                 .compress_file(input_path, stdout())
@@ -132,11 +205,11 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
                 .map_err(|e| e.into())
         }
     } else if args.stdout {
-        compress_with_pipeline(input_file, stdout(), args, &opt_config)
+        compress_with_pipeline(input_file, stdout(), args, &opt_config, &header_info)
     } else {
         let output_path = output_path.clone().unwrap();
         let output_file = BufWriter::new(File::create(&output_path)?);
-        compress_with_pipeline(input_file, output_file, args, &opt_config)
+        compress_with_pipeline(input_file, output_file, args, &opt_config, &header_info)
     };
 
     // Clear signal handler's output file reference
@@ -148,6 +221,13 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             if !args.stdout {
                 let output_path = get_output_filename(input_path, args);
                 preserve_metadata(input_path, &output_path);
+
+                // Synchronous: fsync after write
+                if args.synchronous {
+                    if let Ok(f) = File::open(&output_path) {
+                        let _ = f.sync_all();
+                    }
+                }
             }
 
             // Print stats if verbose (get actual compressed size from output file)
@@ -211,7 +291,8 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     );
 
     let cursor = Cursor::new(buffer);
-    let result = compress_with_pipeline(cursor, output, args, &opt_config);
+    let header_info = GzipHeaderInfo::default();
+    let result = compress_with_pipeline(cursor, output, args, &opt_config, &header_info);
 
     match result {
         Ok(_) => Ok(0),
@@ -252,34 +333,49 @@ fn compress_with_pipeline<R: Read, W: Write + Send>(
     writer: W,
     args: &GzippyArgs,
     opt_config: &OptimizationConfig,
+    header_info: &GzipHeaderInfo,
 ) -> GzippyResult<u64> {
     // FAST PATH: Single-threaded goes directly to flate2 with minimal overhead
     // This is critical for L1 performance where every microsecond matters
     // Exception: L10-L12 use libdeflate even single-threaded for ultra compression
     if opt_config.thread_count == 1 && args.compression_level <= 9 {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
 
         if args.verbosity >= 2 {
             eprintln!("gzippy: using direct flate2 single-threaded path");
         }
 
-        // zlib-ng level 1 uses a different strategy that produces 2-5x larger output
-        // on repetitive data. Map level 1 → 2 for better compression ratio.
-        let adjusted_level = if args.compression_level == 1 {
-            2
+        // Handle compression strategy flags
+        let compression = if args.huffman || args.rle {
+            Compression::new(1) // Huffman-only / RLE approximation (fastest)
         } else {
-            args.compression_level
+            // zlib-ng level 1 uses a different strategy that produces 2-5x larger output
+            // on repetitive data. Map level 1 → 2 for better compression ratio.
+            let adjusted_level = if args.compression_level == 1 {
+                2
+            } else {
+                args.compression_level
+            };
+            Compression::new(adjusted_level as u32)
         };
-        let compression = Compression::new(adjusted_level as u32);
-        let mut encoder = GzEncoder::new(writer, compression);
+
+        // Use GzBuilder for FNAME/MTIME/FCOMMENT
+        let mut builder = flate2::GzBuilder::new();
+        if let Some(ref name) = header_info.filename {
+            builder = builder.filename(name.as_bytes());
+        }
+        builder = builder.mtime(header_info.mtime);
+        if let Some(ref comment) = header_info.comment {
+            builder = builder.comment(comment.as_bytes());
+        }
+        let mut encoder = builder.write(writer, compression);
         let bytes = io::copy(&mut reader, &mut encoder)?;
         encoder.finish()?;
         return Ok(bytes);
     }
 
     // MULTI-THREADED PATH: Use optimizer for parallel compression
-    let optimizer = SimpleOptimizer::new(opt_config.clone());
+    let optimizer = SimpleOptimizer::new(opt_config.clone()).with_header_info(header_info.clone());
 
     if args.verbosity >= 2 {
         eprintln!(
@@ -365,6 +461,34 @@ fn preserve_metadata(src: &Path, dst: &Path) {
         if let Ok(mtime) = metadata.modified() {
             let _ = filetime::set_file_mtime(dst, filetime::FileTime::from_system_time(mtime));
         }
+    }
+}
+
+/// Build gzip header metadata from a file path and CLI args
+fn build_header_info(path: &Path, args: &GzippyArgs) -> GzipHeaderInfo {
+    let filename = if !args.no_name {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
+
+    let mtime = if !args.no_time {
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    GzipHeaderInfo {
+        filename,
+        mtime,
+        comment: args.comment.clone(),
     }
 }
 

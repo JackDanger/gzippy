@@ -9,7 +9,6 @@ use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-mod algebraic_decode;
 #[macro_use]
 mod test_utils;
 mod benchmark_datasets;
@@ -28,7 +27,6 @@ mod error;
 mod fast_inflate;
 mod format;
 mod golden_tests;
-mod hyper_parallel;
 mod inflate_tables;
 mod isal;
 mod jit_decode;
@@ -36,32 +34,22 @@ mod libdeflate_decode;
 mod libdeflate_entry;
 mod libdeflate_ext;
 mod marker_decode;
-mod multi_symbol;
 mod optimization;
 mod packed_lut;
 mod parallel_compress;
-mod parallel_decompress;
-mod parallel_inflate;
 mod pipelined_compress;
-mod precomputed_decode;
 mod rapidgzip_decoder;
 mod scheduler;
 mod simd_copy;
 mod simd_huffman;
 mod simd_inflate;
-mod simd_parallel_decode;
 mod simple_optimizations;
 mod specialized_decode;
-mod speculative_batch;
 mod thread_pool;
 mod turbo_inflate;
 mod two_level_table;
-mod ultimate_decode;
-mod ultra_decoder;
-mod ultra_decompress;
 mod ultra_fast_inflate;
 mod ultra_inflate;
-mod unified_table;
 mod utils;
 mod vector_huffman;
 
@@ -189,7 +177,14 @@ fn run() -> Result<i32, GzippyError> {
             eprintln!("gzippy: --list does not support stdin");
             return Ok(1);
         }
-        println!("  compressed  uncompressed  ratio  uncompressed_name");
+        if args.verbose {
+            println!(
+                "method    crc     date  time  {:>12} {:>12}  ratio  uncompressed_name",
+                "compressed", "uncompressed"
+            );
+        } else {
+            println!("  compressed  uncompressed  ratio  uncompressed_name");
+        }
         let mut total_comp = 0u64;
         let mut total_uncomp = 0u64;
         for file in &args.files {
@@ -317,14 +312,14 @@ fn test_stdin(args: &GzippyArgs) -> Result<i32, GzippyError> {
 }
 
 /// List compressed file information (gzip -l format)
-fn list_file(filename: &str, _args: &GzippyArgs) -> Result<(u64, u64), GzippyError> {
+fn list_file(filename: &str, args: &GzippyArgs) -> Result<(u64, u64), GzippyError> {
     use std::fs;
 
     let metadata =
         fs::metadata(filename).map_err(|_| GzippyError::FileNotFound(filename.to_string()))?;
     let compressed_size = metadata.len();
 
-    // Read the gzip trailer to get ISIZE (uncompressed size mod 2^32)
+    // Read the gzip file
     let data = fs::read(filename).map_err(GzippyError::Io)?;
 
     if data.len() < 18 || data[0] != 0x1f || data[1] != 0x8b {
@@ -343,25 +338,136 @@ fn list_file(filename: &str, _args: &GzippyArgs) -> Result<(u64, u64), GzippyErr
         isize_bytes[3],
     ]) as u64;
 
+    // CRC32 is 4 bytes before ISIZE
+    let crc_bytes = &data[data.len() - 8..data.len() - 4];
+    let crc32 = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+
     let ratio = if uncompressed_size > 0 {
         (1.0 - compressed_size as f64 / uncompressed_size as f64) * 100.0
     } else {
         0.0
     };
 
-    // Get the output name (what the file would decompress to)
-    let output_name = crate::utils::strip_compression_extension(Path::new(filename));
-    let display_name = output_name
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(filename);
+    // Get the output name - check for FNAME in header first
+    let fname = extract_list_fname(&data);
+    let display_name = if let Some(ref name) = fname {
+        name.as_str()
+    } else {
+        let output_name = crate::utils::strip_compression_extension(Path::new(filename));
+        // Use a leaked string since we need a &str that outlives the function
+        // This is fine since list_file is called a limited number of times
+        let name = output_name
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(filename)
+            .to_string();
+        // We need to handle the borrow differently for verbose vs non-verbose
+        Box::leak(name.into_boxed_str())
+    };
 
-    println!(
-        "{:>12}  {:>12}  {:4.1}%  {}",
-        compressed_size, uncompressed_size, ratio, display_name
-    );
+    if args.verbose {
+        // Parse header for verbose info
+        let mtime = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let date_str = if mtime > 0 {
+            // Format as "Jan 01 2024 12:00" using basic conversion
+            format_unix_timestamp(mtime)
+        } else {
+            "                ".to_string()
+        };
+
+        println!(
+            "defla {:08x} {} {:>12} {:>12} {:4.1}%  {}",
+            crc32, date_str, compressed_size, uncompressed_size, ratio, display_name
+        );
+    } else {
+        println!(
+            "{:>12}  {:>12}  {:4.1}%  {}",
+            compressed_size, uncompressed_size, ratio, display_name
+        );
+    }
 
     Ok((compressed_size, uncompressed_size))
+}
+
+/// Extract FNAME from gzip header for list display
+fn extract_list_fname(data: &[u8]) -> Option<String> {
+    if data.len() < 10 || data[0] != 0x1f || data[1] != 0x8b || data[2] != 0x08 {
+        return None;
+    }
+    let flags = data[3];
+    if flags & 0x08 == 0 {
+        return None;
+    }
+    let mut pos = 10;
+    if flags & 0x04 != 0 {
+        if pos + 2 > data.len() {
+            return None;
+        }
+        let xlen = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2 + xlen;
+    }
+    let start = pos;
+    while pos < data.len() && data[pos] != 0 {
+        pos += 1;
+    }
+    if pos >= data.len() {
+        return None;
+    }
+    String::from_utf8(data[start..pos].to_vec()).ok()
+}
+
+/// Format a Unix timestamp into a basic date/time string
+fn format_unix_timestamp(timestamp: u32) -> String {
+    const MONTHS: &[&str] = &[
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    // Simple Unix timestamp to date conversion
+    let secs = timestamp as u64;
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+
+    // Calculate year/month/day from days since epoch
+    let mut year = 1970u32;
+    let mut remaining_days = days;
+
+    loop {
+        let days_in_year =
+            if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) {
+                366
+            } else {
+                365
+            };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days_in_months: &[u64] = if leap {
+        &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 0usize;
+    for (i, &dim) in days_in_months.iter().enumerate() {
+        if remaining_days < dim {
+            month = i;
+            break;
+        }
+        remaining_days -= dim;
+    }
+    let day = remaining_days + 1;
+
+    format!(
+        "{} {:2} {} {:02}:{:02}",
+        MONTHS[month], day, year, hours, minutes
+    )
 }
 
 fn print_help() {
@@ -371,21 +477,35 @@ fn print_help() {
     println!("Uses multiple processors for parallel compression.");
     println!();
     println!("Options:");
-    println!("  -1..-9           Compression level (1=fast, 9=best, default=6)");
-    println!("  --level N        Set compression level 1-12");
-    println!("  --ultra          Ultra compression (level 11, near-zopfli)");
-    println!("  --max            Maximum compression (level 12, closest to zopfli)");
-    println!("  -c, --stdout     Write to stdout, keep original files");
-    println!("  -d, --decompress Decompress");
-    println!("  -f, --force      Force overwrite of output file");
-    println!("  -k, --keep       Keep original file");
-    println!("  -p, --processes  Number of threads (default: all CPUs)");
-    println!("  -r, --recursive  Recurse into directories");
-    println!("  -q, --quiet      Suppress output");
-    println!("  -v, --verbose    Verbose output");
-    println!("  -h, --help       Show this help");
-    println!("  -V, --version    Show version");
-    println!("  -L, --license    Show license");
+    println!("  -1..-9              Compression level (1=fast, 9=best, default=6)");
+    println!("  --level N           Set compression level 1-12");
+    println!("  --ultra             Ultra compression (level 11, near-zopfli)");
+    println!("  --max               Maximum compression (level 12, closest to zopfli)");
+    println!("  -c, --stdout        Write to stdout, keep original files");
+    println!("  -d, --decompress    Decompress");
+    println!("  -f, --force         Force overwrite / compress links / pass-through");
+    println!("  -k, --keep          Keep original file");
+    println!("  -l, --list          List compressed file info");
+    println!("  -t, --test          Test compressed file integrity");
+    println!("  -n, --no-name       Don't save/restore original name and timestamp");
+    println!("  -N, --name          Save/restore original name and timestamp");
+    println!("  -m, --no-time       Don't save/restore modification time");
+    println!("  -M, --time          Save/restore modification time (pigz)");
+    println!("  -p, --processes N   Number of threads (default: all CPUs)");
+    println!("  -b, --blocksize N   Block size for parallel compression");
+    println!("  -r, --recursive     Recurse into directories");
+    println!("  -R, --rsyncable     Make output rsync-friendly");
+    println!("  -S, --suffix .suf   Use suffix .suf instead of .gz");
+    println!("  -Y, --synchronous   Synchronous output (fsync after write)");
+    println!("  -i, --independent   Force independent blocks (parallel decompress)");
+    println!("  -C, --comment TEXT  Add comment to gzip header");
+    println!("  -H, --huffman       Huffman-only compression");
+    println!("  -U, --rle           Run-length encoding compression");
+    println!("  -q, --quiet         Suppress output");
+    println!("  -v, --verbose       Verbose output");
+    println!("  -h, --help          Show this help");
+    println!("  -V, --version       Show version");
+    println!("  -L, --license       Show license");
     println!();
     println!("Compression levels:");
     println!("  1-6              Fast (libdeflate, parallel decompress)");
@@ -393,8 +513,8 @@ fn print_help() {
     println!("  10-12            Ultra (libdeflate high, near-zopfli ratio)");
     println!();
     println!("Examples:");
-    println!("  gzippy file.txt          Compress file.txt → file.txt.gz");
-    println!("  gzippy -d file.txt.gz    Decompress file.txt.gz → file.txt");
+    println!("  gzippy file.txt          Compress file.txt -> file.txt.gz");
+    println!("  gzippy -d file.txt.gz    Decompress file.txt.gz -> file.txt");
     println!("  gzippy -p4 -9 file.txt   Compress with 4 threads, best compression");
     println!("  cat file | gzippy > out  Compress stdin to stdout");
 }
