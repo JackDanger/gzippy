@@ -103,6 +103,25 @@ pub fn get_optimal_block_size(level: u32, file_size: usize, num_threads: usize) 
     }
 }
 
+/// Check if a data sample is highly compressible (ratio < 5%).
+/// Used to skip parallelism when block overhead exceeds speedup.
+fn is_highly_compressible(sample: &[u8], level: u32) -> bool {
+    if sample.is_empty() {
+        return false;
+    }
+    let lvl = match libdeflater::CompressionLvl::new(level as i32) {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+    let mut compressor = libdeflater::Compressor::new(lvl);
+    let max_size = compressor.deflate_compress_bound(sample.len());
+    let mut output = vec![0u8; max_size];
+    match compressor.deflate_compress(sample, &mut output) {
+        Ok(size) => (size as f64 / sample.len() as f64) < 0.05,
+        Err(_) => false,
+    }
+}
+
 // Thread-local compression buffer to avoid per-block allocation
 thread_local! {
     static COMPRESS_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -160,25 +179,23 @@ impl ParallelGzEncoder {
         // For L10-L12, always use libdeflate blocks for better compression
         if self.compression_level <= 9 && (input_data.len() <= block_size || self.num_threads == 1)
         {
-            if self.compression_level <= 5 {
-                // L1-L5: libdeflate/ISA-L single member (faster than zlib-ng)
-                let mut writer = writer;
-                compress_single_member(
-                    &mut writer,
-                    &input_data,
-                    self.compression_level,
-                    &self.header_info,
-                )?;
-                return Ok(bytes_read);
+            let mut w = writer;
+            return self
+                .compress_single_stream(&input_data, &mut w)
+                .map(|_| bytes_read);
+        }
+
+        // Ratio probe: skip parallelism for highly compressible data at fast levels.
+        // At L1-L5, compression is so fast that block overhead dominates for
+        // highly compressible data (e.g., software dataset: Tmax < T1).
+        if self.compression_level <= 5 && self.num_threads > 1 {
+            let sample = &input_data[..block_size.min(input_data.len())];
+            if is_highly_compressible(sample, self.compression_level) {
+                let mut w = writer;
+                return self
+                    .compress_single_stream(&input_data, &mut w)
+                    .map(|_| bytes_read);
             }
-            // L6-L9: zlib-ng streaming (better ratio)
-            let mut encoder = self.gz_builder().write(
-                writer,
-                Compression::new(adjust_compression_level(self.compression_level)),
-            );
-            encoder.write_all(&input_data)?;
-            encoder.finish()?;
-            return Ok(bytes_read);
         }
 
         // Large file with multiple threads, or L10-L12: compress blocks in parallel with libdeflate
@@ -232,30 +249,55 @@ impl ParallelGzEncoder {
         // For L10-L12, always use libdeflate blocks for better compression
         let block_size = self.calculate_block_size(file_len);
         if self.compression_level <= 9 && (file_len <= block_size || self.num_threads == 1) {
-            if self.compression_level <= 5 {
-                // L1-L5: libdeflate/ISA-L single member (faster than zlib-ng)
-                compress_single_member(
-                    &mut writer,
-                    &mmap,
-                    self.compression_level,
-                    &self.header_info,
-                )?;
-                return Ok(file_len as u64);
+            return self.compress_single_stream(&mmap, &mut writer);
+        }
+
+        // Ratio probe: for multi-threaded L1-L5, check if data is highly compressible.
+        // When compression ratio < 5%, parallelism overhead (per-block headers, thread
+        // coordination, CRC32) exceeds speedup. Fall back to single-threaded streaming.
+        if self.compression_level <= 5 && self.num_threads > 1 {
+            let sample = &mmap[..block_size.min(file_len)];
+            if is_highly_compressible(sample, self.compression_level) {
+                return self.compress_single_stream(&mmap, &mut writer);
             }
-            // L6-L9: zlib-ng streaming (better ratio)
-            let mut encoder = self.gz_builder().write(
-                &mut writer,
-                Compression::new(adjust_compression_level(self.compression_level)),
-            );
-            encoder.write_all(&mmap)?;
-            encoder.finish()?;
-            return Ok(file_len as u64);
         }
 
         // Large file with multiple threads, or L10-L12: compress blocks in parallel with libdeflate
         let _ = self.compress_parallel(&mmap, block_size, writer)?;
 
         Ok(file_len as u64)
+    }
+
+    /// Single-stream compression using the best available backend
+    fn compress_single_stream<W: Write>(&self, data: &[u8], writer: &mut W) -> io::Result<u64> {
+        // For L0-L3, use ISA-L direct slice API (fastest on x86 with AVX2)
+        if self.compression_level <= 3 && crate::isal_compress::is_available() {
+            return crate::isal_compress::compress_gzip_to_writer(
+                data,
+                &mut *writer,
+                self.compression_level,
+            );
+        }
+
+        // For L1-L5, use libdeflate/ISA-L single member (faster than zlib-ng)
+        if self.compression_level >= 1 && self.compression_level <= 5 {
+            compress_single_member(
+                &mut *writer,
+                data,
+                self.compression_level,
+                &self.header_info,
+            )?;
+            return Ok(data.len() as u64);
+        }
+
+        // L6-L9: flate2/zlib-ng streaming (better ratio at higher levels)
+        let mut encoder = self.gz_builder().write(
+            &mut *writer,
+            Compression::new(adjust_compression_level(self.compression_level)),
+        );
+        encoder.write_all(data)?;
+        encoder.finish()?;
+        Ok(data.len() as u64)
     }
 
     /// Parallel compression using custom scheduler with streaming output

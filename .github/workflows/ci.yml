@@ -73,11 +73,25 @@ jobs:
             target/
           key: ${{ matrix.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Install ISA-L build deps (x86_64 Linux)
+        if: matrix.os == 'linux' && matrix.arch == 'x86_64'
+        run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool nasm
+
       - name: Build release
-        run: cargo build --release
+        run: |
+          if [ "${{ matrix.os }}" = "linux" ] && [ "${{ matrix.arch }}" = "x86_64" ]; then
+            cargo build --release --features isal-compression
+          else
+            cargo build --release
+          fi
 
       - name: Run unit tests
-        run: cargo test --release
+        run: |
+          if [ "${{ matrix.os }}" = "linux" ] && [ "${{ matrix.arch }}" = "x86_64" ]; then
+            cargo test --release --features isal-compression
+          else
+            cargo test --release
+          fi
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -106,10 +120,11 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential zlib1g-dev gzip cmake nasm
+          sudo apt-get install -y build-essential zlib1g-dev gzip cmake nasm autoconf automake libtool
 
       - name: Build gzippy
-        run: cargo build --release
+        run: |
+          cargo build --release --features isal-compression
 
       - name: Create ungzippy symlink
         run: ln -sf gzippy target/release/ungzippy
@@ -200,8 +215,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install ISA-L build deps
+        run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool nasm
+
       - name: Build gzippy
-        run: cargo build --release
+        run: |
+          cargo build --release --features isal-compression
 
       - name: Test empty file
         run: |
@@ -333,8 +352,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install ISA-L build deps
+        run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool nasm
+
       - name: Build gzippy
-        run: cargo build --release
+        run: |
+          cargo build --release --features isal-compression
 
       - name: Generate test data (${{ matrix.size }}MB ${{ matrix.type }})
         run: |
@@ -432,8 +455,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install ISA-L build deps
+        run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool nasm
+
       - name: Build gzippy
-        run: cargo build --release
+        run: |
+          cargo build --release --features isal-compression
 
       - name: Setup test files
         run: |
@@ -566,8 +593,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install ISA-L build deps
+        run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool nasm
+
       - name: Build gzippy
-        run: cargo build --release
+        run: |
+          cargo build --release --features isal-compression
 
       - name: Test valid CRC32 roundtrip (pipe-based)
         run: |
@@ -721,10 +752,11 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential zlib1g-dev cmake nasm
+          sudo apt-get install -y build-essential zlib1g-dev cmake nasm autoconf automake libtool
 
       - name: Build gzippy
-        run: cargo build --release
+        run: |
+          cargo build --release --features isal-compression
 
       - name: Build pigz
         run: make -C pigz
@@ -868,8 +900,12 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install ISA-L build deps
+        run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool nasm
+
       - name: Check formatting
         run: cargo fmt --check
 
       - name: Run clippy
-        run: cargo clippy --release -- -D warnings
+        run: |
+          cargo clippy --release --features isal-compression -- -D warnings

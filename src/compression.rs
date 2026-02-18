@@ -338,8 +338,25 @@ fn compress_with_pipeline<R: Read, W: Write + Send>(
     // FAST PATH: Single-threaded goes directly to the fastest available backend
     // Exception: L10-L12 use libdeflate even single-threaded for ultra compression
     if opt_config.thread_count == 1 && args.compression_level <= 9 {
-        // L1-L5: Use libdeflate/ISA-L for ~2x faster compression than zlib-ng,
-        // unless the data is highly compressible (ratio < 5%) where zlib-ng's
+        // For L0-L3, use ISA-L when available (fastest on x86 with AVX2)
+        if args.compression_level <= 3
+            && !args.huffman
+            && !args.rle
+            && crate::isal_compress::is_available()
+        {
+            if args.verbosity >= 2 {
+                eprintln!("gzippy: using ISA-L single-threaded compression");
+            }
+            let bytes = crate::isal_compress::compress_gzip_stream(
+                &mut reader,
+                writer,
+                args.compression_level as u32,
+            )?;
+            return Ok(bytes);
+        }
+
+        // L1-L5 (no ISA-L): Use libdeflate for ~2x faster compression than zlib-ng,
+        // unless the data is highly compressible (ratio < 10%) where zlib-ng's
         // streaming mode is faster (avoids large buffer allocation).
         if args.compression_level >= 1 && args.compression_level <= 5 && !args.huffman && !args.rle
         {
@@ -347,9 +364,6 @@ fn compress_with_pipeline<R: Read, W: Write + Send>(
             let mut probe_buf = Vec::with_capacity(65536);
             reader.by_ref().take(65536).read_to_end(&mut probe_buf)?;
 
-            // Probe: compress the sample to determine if data is highly compressible.
-            // libdeflate is ~2x faster for normal data but zlib-ng streaming is
-            // faster for highly compressible data (avoids large buffer allocation).
             let use_libdeflate = if probe_buf.len() >= 65536 {
                 let lvl = libdeflater::CompressionLvl::new(args.compression_level as i32)
                     .unwrap_or_default();
@@ -368,7 +382,6 @@ fn compress_with_pipeline<R: Read, W: Write + Send>(
                 if args.verbosity >= 2 {
                     eprintln!("gzippy: using libdeflate single-threaded path");
                 }
-                // Read rest of data and compress as single member
                 let mut input_data = probe_buf;
                 reader.read_to_end(&mut input_data)?;
                 let bytes = input_data.len() as u64;
@@ -400,7 +413,6 @@ fn compress_with_pipeline<R: Read, W: Write + Send>(
             if let Some(ref comment) = header_info.comment {
                 builder = builder.comment(comment.as_bytes());
             }
-            // Chain probe bytes with remaining reader for zero-copy streaming
             let mut chained = std::io::Cursor::new(probe_buf).chain(reader);
             let mut encoder = builder.write(writer, compression);
             let bytes = io::copy(&mut chained, &mut encoder)?;

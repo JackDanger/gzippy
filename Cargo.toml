@@ -16,7 +16,7 @@ build = "build.rs"
 [features]
 default = []
 isal = []  # ISA-L decompression (enabled by build.rs when static lib is built)
-isal-compression = ["dep:isal-rs"]  # ISA-L compression for fast levels (L0-L3)
+isal-compression = ["isal-rs"]  # ISA-L compression for fast levels (L0-L3)
 trace = []  # Enable decode tracing instrumentation
 profile = []  # Enable timing profiler (adds overhead, only use for profiling)
 debug_decode = []  # Log decode operations around DEBUG_POS (e.g., DEBUG_POS=124088477)

@@ -52,7 +52,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake nasm zlib1g-dev
+          sudo apt-get install -y build-essential cmake nasm zlib1g-dev autoconf automake libtool
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -69,8 +69,12 @@ jobs:
 
       - name: Build all tools
         run: |
-          # Build gzippy
-          cargo build --release
+          # Build gzippy (with ISA-L compression on x86_64 for fastest L0-L3)
+          if [ "$(uname -m)" = "x86_64" ]; then
+            cargo build --release --features isal-compression
+          else
+            cargo build --release
+          fi
 
           # Build pigz
           make -C pigz
