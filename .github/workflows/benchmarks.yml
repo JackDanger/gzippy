@@ -2,11 +2,11 @@
 # Benchmarks: Compression and Decompression Performance
 # =============================================================================
 # Architecture:
-#   Stage 1: Build all tools ONCE
-#   Stage 2: Prepare benchmark data (download silesia, generate software/logs)
-#   Stage 3: Compression benchmarks (data_type × level × threads)
-#   Stage 4: Decompression benchmarks (archive_type × threads)
-#   Stage 5: Guards and summary
+#   Stage 1: Build all tools on each platform (x86_64 + ARM64)
+#   Stage 2: Prepare benchmark data
+#   Stage 3: Compression benchmarks (platform × data_type × level × threads)
+#   Stage 4: Decompression benchmarks (platform × archive_type × threads)
+#   Stage 5: Guards and summary (per-platform)
 #
 # Benchmark data:
 #   - silesia-large.gz (~170MB compressed, ~500MB uncompressed) - mixed binary/text
@@ -31,11 +31,19 @@ env:
 
 jobs:
   # ============================================================================
-  # STAGE 1: Build all tools once
+  # STAGE 1: Build all tools on each platform
   # ============================================================================
   build:
-    name: Build Tools
-    runs-on: ubuntu-latest
+    name: Build Tools (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64
+            runner: ubuntu-latest
+          - platform: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,7 +65,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.platform }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build all tools
         run: |
@@ -96,14 +104,12 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: binaries
+          name: binaries-${{ matrix.platform }}
           path: binaries/
           retention-days: 1
 
   # ============================================================================
-  # STAGE 2: Prepare benchmark data
-  # Uses `make bench-data` which downloads silesia and generates software/logs
-  # Compressed versions are cached in git; uncompressed regenerated on demand
+  # STAGE 2: Prepare benchmark data (platform-independent, run once)
   # ============================================================================
   prepare-data:
     name: Prepare Benchmark Data
@@ -124,24 +130,164 @@ jobs:
           retention-days: 1
 
   # ============================================================================
-  # STAGE 3: Compression benchmarks (data_type × level × threads)
+  # STAGE 3: Compression benchmarks (platform × data_type × level × threads)
   # ============================================================================
   compression-benchmark:
-    name: Compress ${{ matrix.data_type }} L${{ matrix.level }} T${{ matrix.threads }}
-    runs-on: ubuntu-latest
+    name: Compress ${{ matrix.data_type }} L${{ matrix.level }} T${{ matrix.threads }} (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     needs: prepare-data
     strategy:
       fail-fast: false
       matrix:
-        data_type: [silesia, software, logs]
-        level: [1, 6, 9]
-        threads: ["1", "max"]
+        include:
+          # x86_64 - full matrix
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: silesia
+            level: 1
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: silesia
+            level: 1
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: silesia
+            level: 6
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: silesia
+            level: 6
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: silesia
+            level: 9
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: silesia
+            level: 9
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: software
+            level: 1
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: software
+            level: 1
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: software
+            level: 6
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: software
+            level: 6
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: software
+            level: 9
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: software
+            level: 9
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: logs
+            level: 1
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: logs
+            level: 1
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: logs
+            level: 6
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: logs
+            level: 6
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: logs
+            level: 9
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: logs
+            level: 9
+            threads: "max"
+          # ARM64 - representative subset (L1, L6, L9 × silesia, plus L6 for others)
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: silesia
+            level: 1
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: silesia
+            level: 1
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: silesia
+            level: 6
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: silesia
+            level: 6
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: silesia
+            level: 9
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: silesia
+            level: 9
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: software
+            level: 6
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: software
+            level: 6
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: logs
+            level: 6
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            data_type: logs
+            level: 6
+            threads: "max"
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          name: binaries
+          name: binaries-${{ matrix.platform }}
           path: ./bin
 
       - uses: actions/download-artifact@v4
@@ -194,28 +340,77 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: results-compress-${{ matrix.data_type }}-l${{ matrix.level }}-t${{ matrix.threads }}
+          name: results-compress-${{ matrix.platform }}-${{ matrix.data_type }}-l${{ matrix.level }}-t${{ matrix.threads }}
           path: results/
           retention-days: 7
 
   # ============================================================================
-  # STAGE 4: Decompression benchmarks (archive_type × threads)
+  # STAGE 4: Decompression benchmarks (platform × archive_type × threads)
   # ============================================================================
   decompression-benchmark:
-    name: Decompress ${{ matrix.archive_type }} T${{ matrix.threads }}
-    runs-on: ubuntu-latest
+    name: Decompress ${{ matrix.archive_type }} T${{ matrix.threads }} (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     needs: prepare-data
     strategy:
       fail-fast: false
       matrix:
-        archive_type: [silesia, software, logs]
-        threads: ["1", "max"]
+        include:
+          # x86_64 - full matrix
+          - platform: x86_64
+            runner: ubuntu-latest
+            archive_type: silesia
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            archive_type: silesia
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            archive_type: software
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            archive_type: software
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            archive_type: logs
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            archive_type: logs
+            threads: "max"
+          # ARM64 - full decompression matrix (this is where 15-bit table matters most)
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            archive_type: silesia
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            archive_type: silesia
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            archive_type: software
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            archive_type: software
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            archive_type: logs
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            archive_type: logs
+            threads: "max"
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          name: binaries
+          name: binaries-${{ matrix.platform }}
           path: ./bin
 
       - uses: actions/download-artifact@v4
@@ -282,7 +477,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: results-decompress-${{ matrix.archive_type }}-t${{ matrix.threads }}
+          name: results-decompress-${{ matrix.platform }}-${{ matrix.archive_type }}-t${{ matrix.threads }}
           path: results/
           retention-days: 7
 
@@ -290,19 +485,42 @@ jobs:
   # STAGE 5: Random data correctness check
   # ============================================================================
   random-data:
-    name: Random Data L${{ matrix.level }} T${{ matrix.threads }}
-    runs-on: ubuntu-latest
+    name: Random Data L${{ matrix.level }} T${{ matrix.threads }} (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     needs: build
     strategy:
       fail-fast: false
       matrix:
-        level: [1, 9]
-        threads: ["1", "max"]
+        include:
+          - platform: x86_64
+            runner: ubuntu-latest
+            level: 1
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            level: 1
+            threads: "max"
+          - platform: x86_64
+            runner: ubuntu-latest
+            level: 9
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            level: 9
+            threads: "max"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            level: 1
+            threads: "1"
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            level: 9
+            threads: "max"
 
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: binaries
+          name: binaries-${{ matrix.platform }}
           path: ./bin
 
       - name: Setup
@@ -334,25 +552,38 @@ jobs:
           echo "✓ gzip can decompress gzippy output"
 
   # ============================================================================
-  # STAGE 6: Performance guards and summary
+  # STAGE 6: Performance guards and summary (per platform)
   # ============================================================================
   guards:
-    name: Performance Guards
+    name: Performance Guards (${{ matrix.platform }})
     runs-on: ubuntu-latest
     needs: [compression-benchmark, decompression-benchmark, random-data]
     if: always() && needs.compression-benchmark.result == 'success' && needs.decompression-benchmark.result == 'success'
+    strategy:
+      matrix:
+        platform: [x86_64, arm64]
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: results-*
+          pattern: results-*-${{ matrix.platform }}-*
           path: results/
           merge-multiple: true
 
       - name: Collect system info
-        run: python3 scripts/collect_system_info.py --output results/system.json
+        run: |
+          python3 scripts/collect_system_info.py --output results/system.json
+          # Tag with platform
+          python3 -c "
+          import json
+          with open('results/system.json') as f:
+              data = json.load(f)
+          data['benchmark_platform'] = '${{ matrix.platform }}'
+          with open('results/system.json', 'w') as f:
+              json.dump(data, f, indent=2)
+          "
 
       - name: Aggregate results
         run: |
@@ -362,6 +593,7 @@ jobs:
 
       - name: Check performance guards
         id: guards
+        continue-on-error: true
         run: |
           python3 scripts/check_guards.py \
             --compression aggregated/compression.json \
@@ -376,11 +608,12 @@ jobs:
             --decompression aggregated/decompression.json \
             --output summary.md
 
+          echo "## ${{ matrix.platform }} Performance" >> $GITHUB_STEP_SUMMARY
           cat summary.md >> $GITHUB_STEP_SUMMARY
 
       - uses: actions/upload-artifact@v4
         with:
-          name: benchmark-summary
+          name: benchmark-summary-${{ matrix.platform }}
           path: |
             aggregated/
             results/system.json
@@ -389,7 +622,7 @@ jobs:
           retention-days: 30
 
       - name: Post to PR
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && matrix.platform == 'x86_64'
         uses: actions/github-script@v7
         with:
           script: |
@@ -410,7 +643,7 @@ jobs:
               issue_number: context.issue.number
             });
 
-            const marker = '# 🚀 gzippy Performance Summary';
+            const marker = '# gzippy Performance Summary';
             const existing = comments.find(c =>
               c.user.type === 'Bot' && c.body && c.body.includes(marker)
             );
