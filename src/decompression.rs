@@ -548,6 +548,33 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
     }
 
     if !is_likely_multi_member(data) {
+        // Single-member: try parallel decompression for large files
+        if data.len() >= 4 * 1024 * 1024 && num_threads > 1 {
+            if std::env::var("GZIPPY_DEBUG").is_ok() {
+                eprintln!("[gzippy] Trying parallel single-member decompress");
+            }
+            match crate::parallel_decompress_pipeline::decompress_parallel_arbitrary(
+                data,
+                writer,
+                num_threads,
+            ) {
+                Ok(bytes) => {
+                    if std::env::var("GZIPPY_DEBUG").is_ok() {
+                        eprintln!(
+                            "[gzippy] Parallel single-member: {} bytes, {} threads",
+                            bytes, num_threads
+                        );
+                    }
+                    return Ok(bytes);
+                }
+                Err(e) => {
+                    if std::env::var("GZIPPY_DEBUG").is_ok() {
+                        eprintln!("[gzippy] Parallel failed: {}, using libdeflate", e);
+                    }
+                }
+            }
+        }
+
         // Single-member: use libdeflate directly
         if std::env::var("GZIPPY_DEBUG").is_ok() {
             eprintln!("[gzippy] Single-member: libdeflate");
