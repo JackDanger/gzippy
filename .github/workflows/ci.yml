@@ -367,31 +367,35 @@ jobs:
 
       - name: Compress with gzippy (file-based, exercises mmap path)
         run: |
-          cp /tmp/test_input.bin /tmp/test_compress.bin
-          ./target/release/gzippy -${{ matrix.level }} -p${{ matrix.threads }} -k /tmp/test_compress.bin
-          ls -la /tmp/test_compress.bin.gz
-          echo "Compressed: $(stat -c%s /tmp/test_compress.bin.gz) bytes"
+          # Natural roundtrip: compress removes original, decompress restores it
+          # This avoids FNAME conflicts (branches that store original filename in gzip header)
+          cp /tmp/test_input.bin /tmp/test_roundtrip.bin
+          ./target/release/gzippy -${{ matrix.level }} -p${{ matrix.threads }} /tmp/test_roundtrip.bin
+          ls -la /tmp/test_roundtrip.bin.gz
+          echo "Compressed: $(stat -c%s /tmp/test_roundtrip.bin.gz) bytes"
+          # Save a copy for cross-tool test
+          cp /tmp/test_roundtrip.bin.gz /tmp/test_gzippy_output.gz
 
       - name: Decompress with gzippy (file-based, exercises mmap/BGZF path)
         run: |
-          cp /tmp/test_compress.bin.gz /tmp/test_decompress.gz
-          ./target/release/gzippy -d -p${{ matrix.threads }} /tmp/test_decompress.gz
-          diff /tmp/test_input.bin /tmp/test_decompress
+          # Decompress in place (natural roundtrip)
+          ./target/release/gzippy -d -p${{ matrix.threads }} /tmp/test_roundtrip.bin.gz
+          diff /tmp/test_input.bin /tmp/test_roundtrip.bin
           echo "✓ File-based roundtrip: ${{ matrix.size }}MB ${{ matrix.type }} L${{ matrix.level }} T${{ matrix.threads }}"
 
       - name: Decompress with gzip (cross-tool validation)
         run: |
-          gzip -d -c /tmp/test_compress.bin.gz > /tmp/test_gzip_out.bin
+          gzip -d -c /tmp/test_gzippy_output.gz > /tmp/test_gzip_out.bin
           diff /tmp/test_input.bin /tmp/test_gzip_out.bin
           echo "✓ gzip can read gzippy file-based output"
 
       - name: Compress with gzip, decompress with gzippy (file-based)
         run: |
           # Single-member gzip (no BGZF), exercises single-member parallel decompress
-          gzip -${{ matrix.level }} -c /tmp/test_input.bin > /tmp/test_gzip_compressed.gz
-          cp /tmp/test_gzip_compressed.gz /tmp/test_gzippy_input.gz
-          ./target/release/gzippy -d -p${{ matrix.threads }} /tmp/test_gzippy_input.gz
-          diff /tmp/test_input.bin /tmp/test_gzippy_input
+          cp /tmp/test_input.bin /tmp/test_gzip_roundtrip.bin
+          gzip -${{ matrix.level }} /tmp/test_gzip_roundtrip.bin
+          ./target/release/gzippy -d -p${{ matrix.threads }} /tmp/test_gzip_roundtrip.bin.gz
+          diff /tmp/test_input.bin /tmp/test_gzip_roundtrip.bin
           echo "✓ gzippy file-decompress of single-member gzip: ${{ matrix.size }}MB L${{ matrix.level }} T${{ matrix.threads }}"
 
       - name: Test concatenated multi-member gzip
@@ -582,11 +586,11 @@ jobs:
               for _ in range(5 * 1024):
                   f.write(bytes(random.getrandbits(8) for _ in range(1024)))
           "
-          cp /tmp/crc_mmap_test.bin /tmp/crc_mmap_compress.bin
-          ./target/release/gzippy -k /tmp/crc_mmap_compress.bin
-          cp /tmp/crc_mmap_compress.bin.gz /tmp/crc_mmap_decompress.gz
-          ./target/release/gzippy -d /tmp/crc_mmap_decompress.gz
-          diff /tmp/crc_mmap_test.bin /tmp/crc_mmap_decompress
+          # Natural roundtrip: compress removes original, decompress restores it
+          cp /tmp/crc_mmap_test.bin /tmp/crc_mmap_roundtrip.bin
+          ./target/release/gzippy /tmp/crc_mmap_roundtrip.bin
+          ./target/release/gzippy -d /tmp/crc_mmap_roundtrip.bin.gz
+          diff /tmp/crc_mmap_test.bin /tmp/crc_mmap_roundtrip.bin
           echo "✓ CRC32 valid through file-based (mmap) roundtrip"
 
       - name: Test CRC32 corruption detection
