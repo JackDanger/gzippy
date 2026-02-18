@@ -16,6 +16,7 @@ build = "build.rs"
 [features]
 default = []
 isal = []  # ISA-L decompression (enabled by build.rs when static lib is built)
+isal-compression = ["dep:isal-rs"]  # ISA-L compression for fast levels (L0-L3)
 trace = []  # Enable decode tracing instrumentation
 profile = []  # Enable timing profiler (adds overhead, only use for profiling)
 debug_decode = []  # Log decode operations around DEBUG_POS (e.g., DEBUG_POS=124088477)
@@ -30,6 +31,9 @@ flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
 libdeflater = "1.0"
 # Low-level bindings for _ex functions (returns consumed bytes)
 libdeflate-sys = "1.0"
+
+# ISA-L compression (optional, for fastest L0-L3 on x86)
+isal-rs = { version = "0.5", optional = true }
 
 # CLI and utilities
 walkdir = "2.4"
