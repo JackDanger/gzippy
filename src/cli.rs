@@ -152,6 +152,8 @@ impl GzippyArgs {
                     "--no-name" => {
                         args.no_name = true;
                         args.name = false;
+                        args.no_time = true;
+                        args.time = false;
                     }
                     "--no-time" => {
                         args.no_time = true;
@@ -160,6 +162,8 @@ impl GzippyArgs {
                     "--name" => {
                         args.name = true;
                         args.no_name = false;
+                        args.time = true;
+                        args.no_time = false;
                     }
                     "--time" => {
                         args.time = true;
@@ -284,14 +288,26 @@ impl GzippyArgs {
                         'n' => {
                             args.no_name = true;
                             args.name = false;
+                            args.no_time = true;
+                            args.time = false;
                         }
                         'N' => {
                             args.name = true;
                             args.no_name = false;
+                            args.time = true;
+                            args.no_time = false;
                         }
                         'H' => args.huffman = true,
                         'U' => args.rle = true,
                         'Y' => args.synchronous = true,
+                        'm' => {
+                            args.no_time = true;
+                            args.time = false;
+                        }
+                        'M' => {
+                            args.time = true;
+                            args.no_time = false;
+                        }
                         '0'..='9' => {
                             let level = chars[j] as u8 - b'0';
                             args.compression_level = level;

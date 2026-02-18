@@ -14,9 +14,8 @@
 //!
 //! This is used when compression_level >= 7 and threads > 1.
 
-use crate::parallel_compress::adjust_compression_level;
+use crate::parallel_compress::{adjust_compression_level, GzipHeaderInfo};
 use crate::scheduler::compress_parallel;
-use flate2::write::GzEncoder;
 use flate2::{Compress, Compression, FlushCompress, Status};
 use std::cell::{RefCell, UnsafeCell};
 use std::io::{self, Read, Write};
@@ -65,6 +64,7 @@ fn pipelined_block_size(input_len: usize, _num_threads: usize, _level: u32) -> u
 pub struct PipelinedGzEncoder {
     compression_level: u32,
     num_threads: usize,
+    header_info: GzipHeaderInfo,
 }
 
 impl PipelinedGzEncoder {
@@ -72,7 +72,25 @@ impl PipelinedGzEncoder {
         Self {
             compression_level,
             num_threads,
+            header_info: GzipHeaderInfo::default(),
         }
+    }
+
+    pub fn set_header_info(&mut self, info: GzipHeaderInfo) {
+        self.header_info = info;
+    }
+
+    /// Build a flate2 GzBuilder with FNAME/MTIME/FCOMMENT from header_info
+    fn gz_builder(&self) -> flate2::GzBuilder {
+        let mut builder = flate2::GzBuilder::new();
+        if let Some(ref name) = self.header_info.filename {
+            builder = builder.filename(name.as_bytes());
+        }
+        builder = builder.mtime(self.header_info.mtime);
+        if let Some(ref comment) = self.header_info.comment {
+            builder = builder.comment(comment.as_bytes());
+        }
+        builder
     }
 
     /// Compress data with dictionary sharing
@@ -83,7 +101,9 @@ impl PipelinedGzEncoder {
 
         if input_data.is_empty() {
             // Write empty gzip file
-            let encoder = GzEncoder::new(writer, Compression::new(self.compression_level));
+            let encoder = self
+                .gz_builder()
+                .write(writer, Compression::new(self.compression_level));
             encoder.finish()?;
             return Ok(0);
         }
@@ -109,7 +129,9 @@ impl PipelinedGzEncoder {
         let file_len = file.metadata()?.len() as usize;
 
         if file_len == 0 {
-            let encoder = GzEncoder::new(writer, Compression::new(self.compression_level));
+            let encoder = self
+                .gz_builder()
+                .write(writer, Compression::new(self.compression_level));
             encoder.finish()?;
             return Ok(0);
         }
@@ -152,7 +174,25 @@ impl PipelinedGzEncoder {
         let num_blocks = data_len.div_ceil(block_size);
 
         // Write gzip header before spawning threads
-        let header = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
+        let mut header = Vec::with_capacity(64);
+        let mut flags: u8 = 0x00;
+        if self.header_info.filename.is_some() {
+            flags |= 0x08;
+        }
+        if self.header_info.comment.is_some() {
+            flags |= 0x10;
+        }
+        header.extend_from_slice(&[0x1f, 0x8b, 0x08, flags]);
+        header.extend_from_slice(&self.header_info.mtime.to_le_bytes());
+        header.extend_from_slice(&[0x00, 0xff]);
+        if let Some(ref name) = self.header_info.filename {
+            header.extend_from_slice(name.as_bytes());
+            header.push(0);
+        }
+        if let Some(ref comment) = self.header_info.comment {
+            header.extend_from_slice(comment.as_bytes());
+            header.push(0);
+        }
         writer.write_all(&header)?;
 
         // Use a CRC combiner to compute final CRC
@@ -202,8 +242,26 @@ impl PipelinedGzEncoder {
 
         let level = adjust_compression_level(self.compression_level);
 
-        // Write gzip header
-        let header = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
+        // Write gzip header with FNAME/MTIME
+        let mut header = Vec::with_capacity(64);
+        let mut flags: u8 = 0x00;
+        if self.header_info.filename.is_some() {
+            flags |= 0x08;
+        }
+        if self.header_info.comment.is_some() {
+            flags |= 0x10;
+        }
+        header.extend_from_slice(&[0x1f, 0x8b, 0x08, flags]);
+        header.extend_from_slice(&self.header_info.mtime.to_le_bytes());
+        header.extend_from_slice(&[0x00, 0xff]);
+        if let Some(ref name) = self.header_info.filename {
+            header.extend_from_slice(name.as_bytes());
+            header.push(0);
+        }
+        if let Some(ref comment) = self.header_info.comment {
+            header.extend_from_slice(comment.as_bytes());
+            header.push(0);
+        }
         writer.write_all(&header)?;
 
         let mut compress = Compress::new(Compression::new(level), false);
