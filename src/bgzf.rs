@@ -2687,6 +2687,7 @@ pub fn decompress_bgzf_parallel<W: Write>(
     // Parallel decompression using scoped threads
     let num_blocks = blocks.len();
     let next_block = AtomicUsize::new(0);
+    let had_error = std::sync::atomic::AtomicBool::new(false);
 
     // Use UnsafeCell for parallel mutable access to disjoint regions
     use std::cell::UnsafeCell;
@@ -2700,6 +2701,7 @@ pub fn decompress_bgzf_parallel<W: Write>(
             let blocks_ref = &blocks;
             let next_ref = &next_block;
             let output_ref = &output_cell;
+            let error_ref = &had_error;
 
             scope.spawn(move || {
                 loop {
@@ -2735,24 +2737,18 @@ pub fn decompress_bgzf_parallel<W: Write>(
                         Ok(actual_size) => {
                             // Validate ISIZE
                             if actual_size != out_size {
-                                eprintln!(
-                                    "gzippy: block {}: size mismatch (got {}, expected {})",
-                                    idx, actual_size, out_size
-                                );
+                                error_ref.store(true, Ordering::Relaxed);
                             }
                             // Validate CRC32
                             if block.expected_crc32 != 0 {
-                                let actual_crc =
-                                    crc32fast::hash(&out_slice[..actual_size]);
+                                let actual_crc = crc32fast::hash(&out_slice[..actual_size]);
                                 if actual_crc != block.expected_crc32 {
-                                    eprintln!(
-                                        "gzippy: block {}: CRC32 mismatch (got {:08x}, expected {:08x})",
-                                        idx, actual_crc, block.expected_crc32
-                                    );
+                                    error_ref.store(true, Ordering::Relaxed);
                                 }
                             }
                         }
                         Err(e) => {
+                            error_ref.store(true, Ordering::Relaxed);
                             eprintln!(
                                 "Block {} failed: {:?} deflate_len={} out_size={}",
                                 idx,
@@ -2766,6 +2762,14 @@ pub fn decompress_bgzf_parallel<W: Write>(
             });
         }
     });
+
+    // Check for any errors during decompression
+    if had_error.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CRC32 or size mismatch in BGZF block",
+        ));
+    }
 
     // Get output back and write
     let output = output_cell.0.into_inner();
@@ -2914,6 +2918,7 @@ pub fn decompress_multi_member_parallel<W: Write>(
     // Parallel decompression
     let num_members = members.len();
     let next_member = AtomicUsize::new(0);
+    let had_error = std::sync::atomic::AtomicBool::new(false);
 
     use std::cell::UnsafeCell;
     struct OutputBuffer(UnsafeCell<Vec<u8>>);
@@ -2926,6 +2931,7 @@ pub fn decompress_multi_member_parallel<W: Write>(
             let members_ref = &members;
             let next_ref = &next_member;
             let output_ref = &output_cell;
+            let error_ref = &had_error;
 
             scope.spawn(move || {
                 loop {
@@ -2966,27 +2972,28 @@ pub fn decompress_multi_member_parallel<W: Write>(
                         Ok(actual_size) => {
                             // Validate CRC32
                             if member.expected_crc32 != 0 {
-                                let actual_crc =
-                                    crc32fast::hash(&out_slice[..actual_size]);
+                                let actual_crc = crc32fast::hash(&out_slice[..actual_size]);
                                 if actual_crc != member.expected_crc32 {
-                                    eprintln!(
-                                        "gzippy: member {}: CRC32 mismatch (got {:08x}, expected {:08x})",
-                                        idx, actual_crc, member.expected_crc32
-                                    );
+                                    error_ref.store(true, Ordering::Relaxed);
                                 }
                             }
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "gzippy: member {} decompression failed: {:?}",
-                                idx, e
-                            );
+                        Err(_e) => {
+                            error_ref.store(true, Ordering::Relaxed);
                         }
                     }
                 }
             });
         }
     });
+
+    // Check for any errors during decompression
+    if had_error.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CRC32 mismatch or decompression error in gzip member",
+        ));
+    }
 
     // Get output back and write
     let output = output_cell.0.into_inner();
