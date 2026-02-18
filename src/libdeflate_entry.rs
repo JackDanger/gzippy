@@ -331,10 +331,12 @@ pub struct LitLenTable {
 }
 
 impl LitLenTable {
-    /// Number of bits for main table (11 = 8KB, fits L1 cache)
+    /// Number of bits for main table lookup (11 bits = 8KB table).
+    /// Benchmarked 11-15 on ARM64: 11-bit is fastest due to L1d cache locality.
+    /// Larger tables (12-15 bit) reduce subtable lookups but cause cache misses.
     pub const TABLE_BITS: u8 = 11;
-    /// Maximum number of subtable bits
-    pub const MAX_SUBTABLE_BITS: u8 = 4; // 15 - 11
+    /// Maximum number of subtable bits for codes longer than TABLE_BITS
+    pub const MAX_SUBTABLE_BITS: u8 = 15 - Self::TABLE_BITS;
 
     /// Build a literal/length decode table from code lengths
     pub fn build(code_lengths: &[u8]) -> Option<Self> {
@@ -444,6 +446,7 @@ impl LitLenTable {
         }
 
         entries.truncate(subtable_next);
+
         Some(Self {
             entries,
             table_bits,

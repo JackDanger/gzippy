@@ -24,7 +24,8 @@
 
 use std::io;
 
-/// Table size constants (11 bits like libdeflate)
+/// Table size constants (11 bits like libdeflate) — kept at 11 for all platforms
+/// (CF table is only used in fallback paths, not the hot path)
 pub const CF_TABLE_BITS: usize = 11;
 pub const CF_TABLE_SIZE: usize = 1 << CF_TABLE_BITS;
 pub const CF_TABLE_MASK: u64 = (CF_TABLE_SIZE - 1) as u64;

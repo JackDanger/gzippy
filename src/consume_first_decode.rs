@@ -721,15 +721,22 @@ fn decode_huffman_libdeflate_style(
     refill_branchless!();
     let mut entry = lookup!();
 
+    // The multi-literal path consumes up to 4 entries (each up to TABLE_BITS) before
+    // the mandatory refill after literal 4. We need enough bits to cover this worst case.
+    // For TABLE_BITS=11: 4*11=44, for 13: 4*13=52, for 15: 4*15=60.
+    // After refill, bitsleft is at least 56, so threshold must be <= 56.
+    // For TABLE_BITS >= 15, we cap at 56 and rely on the intermediate refills in the
+    // multi-literal path (added below for literal 3 when TABLE_BITS > 13).
+    const REFILL_THRESHOLD: u8 = if LitLenTable::TABLE_BITS * 4 <= 56 {
+        LitLenTable::TABLE_BITS * 4
+    } else {
+        56
+    };
+
     // FASTLOOP - check BOTH input and output bounds to enable truly branchless refill
     while in_pos < in_fastloop_end && out_pos + FASTLOOP_MARGIN <= out_end {
         // CRITICAL: Ensure we have enough bits BEFORE starting a multi-literal batch.
-        // The multi-literal path can consume up to 60 bits (4 x 15-bit codes) before
-        // the mandatory refill after literal 4. With only 56 bits available after refill,
-        // pathological inputs can cause bitsleft to underflow, wrapping to a large value
-        // (e.g., 252). The `bitsleft |= 56` in refill then fails because 252|56=252.
-        // Solution: Always refill at loop start to ensure 56+ bits available.
-        if (bitsleft as u8) < 48 {
+        if (bitsleft as u8) < REFILL_THRESHOLD {
             refill_branchless_fast!();
         }
 
@@ -770,6 +777,11 @@ fn decode_huffman_libdeflate_style(
                     bitbuf >>= entry as u8;
                     bitsleft = bitsleft.wrapping_sub(entry);
                     let lit3 = (entry >> 16) as u8;
+                    // For TABLE_BITS > 13: 3 × TABLE_BITS can exceed 56 bits,
+                    // so we need to refill before the 4th literal
+                    if LitLenTable::TABLE_BITS > 13 && (bitsleft as u8) < 32 {
+                        refill_branchless_fast!();
+                    }
                     entry = lookup!();
 
                     if (entry as i32) < 0 {
@@ -1287,10 +1299,17 @@ fn decode_huffman_optimized(
     refill_branchless!();
     let mut entry = lookup!();
 
+    // Same threshold as decode_huffman_libdeflate_style
+    const REFILL_THRESHOLD2: u8 = if LitLenTable::TABLE_BITS * 4 <= 56 {
+        LitLenTable::TABLE_BITS * 4
+    } else {
+        56
+    };
+
     // FASTLOOP
     while out_pos + FASTLOOP_MARGIN <= out_end {
         // CRITICAL: Ensure enough bits before multi-literal batch (see decode_huffman_libdeflate_style)
-        if (bitsleft as u8) < 48 {
+        if (bitsleft as u8) < REFILL_THRESHOLD2 {
             refill_branchless!();
         }
 
@@ -1313,6 +1332,10 @@ fn decode_huffman_optimized(
                     bitbuf >>= entry as u8;
                     bitsleft = bitsleft.wrapping_sub(entry);
                     let lit3 = (entry >> 16) as u8;
+                    // For TABLE_BITS > 13: refill after 3rd literal
+                    if LitLenTable::TABLE_BITS > 13 && (bitsleft as u8) < 32 {
+                        refill_branchless!();
+                    }
                     entry = lookup!();
 
                     if (entry as i32) < 0 {
