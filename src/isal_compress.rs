@@ -17,8 +17,8 @@ pub fn is_available() -> bool {
 /// Returns None if ISA-L is not available, allowing the caller to fall back.
 #[cfg(feature = "isal-compression")]
 pub fn compress_gzip(data: &[u8], level: u32) -> Option<Vec<u8>> {
-    use isal_rs::write::Encoder;
-    use isal_rs::{Codec, CompressionLevel};
+    use isal::write::Encoder;
+    use isal::{Codec, CompressionLevel};
     use std::io::Write;
 
     // ISA-L only supports levels 0, 1, 3 (no level 2)
@@ -43,8 +43,8 @@ pub fn compress_gzip(_data: &[u8], _level: u32) -> Option<Vec<u8>> {
 /// Returns None if ISA-L is not available.
 #[cfg(feature = "isal-compression")]
 pub fn compress_deflate(data: &[u8], level: u32) -> Option<Vec<u8>> {
-    use isal_rs::write::Encoder;
-    use isal_rs::{Codec, CompressionLevel};
+    use isal::write::Encoder;
+    use isal::{Codec, CompressionLevel};
     use std::io::Write;
 
     // ISA-L only supports levels 0, 1, 3 (no level 2)
