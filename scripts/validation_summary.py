@@ -179,14 +179,68 @@ def generate_summary_from_ci(results, format_type="markdown"):
     lines.append("*Italics indicate failing to beat threshold*")
     lines.append("")
     
-    # Decompression summary
+    # Decompression performance table
     decomp_tests = [t for t in results.get("tests", []) if "decompress_tool" in t]
     decomp_passed = sum(1 for t in decomp_tests if t.get("passed"))
     decomp_total = len(decomp_tests)
-    
-    lines.append("### Decompression")
+
+    lines.append("### Decompression Performance")
     lines.append("")
-    if decomp_total > 0:
+
+    if decomp_total > 0 and decomp_passed > 0:
+        # Build table: for each (data_type, level, threads, compress_tool), compare decompressor speeds
+        # Group by (data_type, compress_tool, level, threads) -> {decompress_tool: median_time}
+        decomp_by_config = defaultdict(lambda: defaultdict(float))
+        for t in decomp_tests:
+            if not t.get("passed") or not t.get("median_time"):
+                continue
+            key = (t.get("data_type", "unknown"), t.get("compress_tool", "?"), t.get("level", 0), t.get("threads", 1))
+            decomp_by_config[key][t.get("decompress_tool", "?")] = t["median_time"]
+
+        if decomp_by_config:
+            # Show gzippy decompression speed compared to other tools
+            # Filter to primary data type
+            primary_decomp = {}
+            for key, tools in decomp_by_config.items():
+                dtype, comp_tool, level, threads = key
+                if dtype == primary_type:
+                    primary_decomp[key] = tools
+
+            if not primary_decomp:
+                primary_decomp = decomp_by_config
+
+            lines.append(f"*Decompression speed on {primary_type} data ({test_size}MB)*")
+            lines.append("")
+            lines.append("| Source | gzippy | gzip | pigz | vs gzip | vs pigz |")
+            lines.append("|--------|--------|------|------|---------|---------|")
+
+            for key in sorted(primary_decomp.keys()):
+                dtype, comp_tool, level, threads = key
+                tools = primary_decomp[key]
+
+                gzippy_time = tools.get("gzippy", 0)
+                gzip_time = tools.get("gzip", 0)
+                pigz_time = tools.get("pigz", 0)
+
+                if not gzippy_time:
+                    continue
+
+                gzippy_speed = size_mb / gzippy_time if gzippy_time and size_mb else 0
+                gzip_speed = size_mb / gzip_time if gzip_time and size_mb else 0
+                pigz_speed = size_mb / pigz_time if pigz_time and size_mb else 0
+
+                gzippy_str = f"{gzippy_speed:.0f} MB/s" if gzippy_speed else "—"
+                gzip_str = f"{gzip_speed:.0f} MB/s" if gzip_speed else "—"
+                pigz_str = f"{pigz_speed:.0f} MB/s" if pigz_speed else "—"
+
+                vs_gzip = f"**{gzip_time / gzippy_time:.1f}x**" if gzippy_time and gzip_time else "—"
+                vs_pigz = f"**{pigz_time / gzippy_time:.1f}x**" if gzippy_time and pigz_time else "—"
+
+                source = f"{comp_tool} L{level} {threads}t"
+                lines.append(f"| {source} | {gzippy_str} | {gzip_str} | {pigz_str} | {vs_gzip} | {vs_pigz} |")
+
+            lines.append("")
+
         if decomp_passed == decomp_total:
             lines.append(f"✅ All {decomp_total} cross-tool decompression tests passed")
         else:
@@ -200,7 +254,7 @@ def generate_summary_from_ci(results, format_type="markdown"):
                     lines.append(f"  - ❌ {comp} → {decomp} (L{level}, {threads}t)")
     else:
         lines.append("No decompression tests recorded")
-    
+
     lines.append("")
     
     # Key stats
@@ -339,13 +393,54 @@ def generate_summary_from_validate(results, format_type="markdown"):
     lines.append("*Italics indicate failing to beat threshold*")
     lines.append("")
     
-    # Decompression summary
+    # Decompression performance
     decomp_results = results.get("decompression", [])
     decomp_passed = sum(1 for r in decomp_results if r.get("success") and r.get("correct"))
     decomp_total = len(decomp_results)
-    
-    lines.append("### Decompression")
+
+    lines.append("### Decompression Performance")
     lines.append("")
+
+    if decomp_total > 0 and decomp_passed > 0:
+        # Build table from decompression results
+        decomp_by_config = defaultdict(lambda: defaultdict(float))
+        for r in decomp_results:
+            if not (r.get("success") and r.get("correct")):
+                continue
+            key = (r.get("compressor", "?"), r.get("level", 0), r.get("threads", 1))
+            decomp_by_config[key][r.get("decompressor", "?")] = r.get("median_seconds", 0)
+
+        if decomp_by_config:
+            lines.append("| Source | gzippy | gzip | pigz | vs gzip | vs pigz |")
+            lines.append("|--------|--------|------|------|---------|---------|")
+
+            for key in sorted(decomp_by_config.keys()):
+                comp_tool, level, threads = key
+                tools = decomp_by_config[key]
+
+                gzippy_time = tools.get("gzippy", 0)
+                gzip_time = tools.get("gzip", 0)
+                pigz_time = tools.get("pigz", 0)
+
+                if not gzippy_time:
+                    continue
+
+                gzippy_speed = test_size_mb / gzippy_time if gzippy_time and test_size_mb else 0
+                gzip_speed = test_size_mb / gzip_time if gzip_time and test_size_mb else 0
+                pigz_speed = test_size_mb / pigz_time if pigz_time and test_size_mb else 0
+
+                gzippy_str = f"{gzippy_speed:.0f} MB/s" if gzippy_speed else "—"
+                gzip_str = f"{gzip_speed:.0f} MB/s" if gzip_speed else "—"
+                pigz_str = f"{pigz_speed:.0f} MB/s" if pigz_speed else "—"
+
+                vs_gzip = f"**{gzip_time / gzippy_time:.1f}×**" if gzippy_time and gzip_time else "—"
+                vs_pigz = f"**{pigz_time / gzippy_time:.1f}×**" if gzippy_time and pigz_time else "—"
+
+                source = f"{comp_tool} L{level} {threads}t"
+                lines.append(f"| {source} | {gzippy_str} | {gzip_str} | {pigz_str} | {vs_gzip} | {vs_pigz} |")
+
+            lines.append("")
+
     if decomp_passed == decomp_total:
         lines.append(f"✅ All {decomp_total} cross-tool decompression tests passed")
     else:
@@ -357,7 +452,7 @@ def generate_summary_from_validate(results, format_type="markdown"):
                 level = r.get("level", "?")
                 threads = r.get("threads", "?")
                 lines.append(f"  - ❌ {comp} → {decomp} (L{level}, {threads}t)")
-    
+
     lines.append("")
     
     # Key stats
