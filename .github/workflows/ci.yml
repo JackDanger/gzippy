@@ -80,7 +80,7 @@ jobs:
       - name: Build release
         run: |
           if [ "${{ matrix.os }}" = "linux" ] && [ "${{ matrix.arch }}" = "x86_64" ]; then
-            cargo build --release --features isal-compression
+            cargo build -vv --release --features isal-compression 2>&1 | tail -200
           else
             cargo build --release
           fi
@@ -908,4 +908,4 @@ jobs:
 
       - name: Run clippy
         run: |
-          cargo clippy --release --features isal-compression -- -D warnings
+          cargo clippy -vv --release --features isal-compression -- -D warnings
