@@ -106,15 +106,25 @@ impl SimpleOptimizer {
             return encoder.compress_file(path, writer);
         }
 
-        // For single-threaded L6-L9, use pipelined compression for max ratio
+        // For single-threaded, choose the fastest backend per level
         if optimal_threads == 1 {
             if self.config.compression_level >= 6 {
+                // L6-L9: pipelined zlib-ng for maximum compression ratio
                 let mut encoder = PipelinedGzEncoder::new(compression_level, 1);
                 encoder.set_header_info(self.header_info.clone());
                 return encoder.compress_file(path, writer);
             }
+            // L1-L5: libdeflate/ISA-L for maximum speed
             let file = std::fs::File::open(&path)?;
-            return self.compress_single_threaded(file, writer);
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            let mut writer = writer;
+            crate::parallel_compress::compress_single_member(
+                &mut writer,
+                &mmap,
+                compression_level,
+                &self.header_info,
+            )?;
+            return Ok(mmap.len() as u64);
         }
 
         // L6-L9: Use pipelined compression with dictionary sharing
