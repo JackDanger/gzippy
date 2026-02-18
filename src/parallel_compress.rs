@@ -156,10 +156,22 @@ impl ParallelGzEncoder {
         // Calculate optimal block size
         let block_size = self.calculate_block_size(input_data.len());
 
-        // For small files or single thread with L1-L9, use simple zlib streaming
+        // For small files or single thread, choose the fastest single-member path
         // For L10-L12, always use libdeflate blocks for better compression
         if self.compression_level <= 9 && (input_data.len() <= block_size || self.num_threads == 1)
         {
+            if self.compression_level <= 5 {
+                // L1-L5: libdeflate/ISA-L single member (faster than zlib-ng)
+                let mut writer = writer;
+                compress_single_member(
+                    &mut writer,
+                    &input_data,
+                    self.compression_level,
+                    &self.header_info,
+                )?;
+                return Ok(bytes_read);
+            }
+            // L6-L9: zlib-ng streaming (better ratio)
             let mut encoder = self.gz_builder().write(
                 writer,
                 Compression::new(adjust_compression_level(self.compression_level)),
@@ -216,10 +228,21 @@ impl ParallelGzEncoder {
         // Memory-map the file for zero-copy access
         let mmap = unsafe { Mmap::map(&file)? };
 
-        // For small files or single thread with L1-L9, use simple zlib streaming
+        // For small files or single thread, choose the fastest single-member path
         // For L10-L12, always use libdeflate blocks for better compression
         let block_size = self.calculate_block_size(file_len);
         if self.compression_level <= 9 && (file_len <= block_size || self.num_threads == 1) {
+            if self.compression_level <= 5 {
+                // L1-L5: libdeflate/ISA-L single member (faster than zlib-ng)
+                compress_single_member(
+                    &mut writer,
+                    &mmap,
+                    self.compression_level,
+                    &self.header_info,
+                )?;
+                return Ok(file_len as u64);
+            }
+            // L6-L9: zlib-ng streaming (better ratio)
             let mut encoder = self.gz_builder().write(
                 &mut writer,
                 Compression::new(adjust_compression_level(self.compression_level)),
@@ -245,6 +268,32 @@ impl ParallelGzEncoder {
         let compression_level = self.compression_level;
         let header_info = self.header_info.clone();
 
+        // Probe compression ratio on first block to detect highly compressible data.
+        // When ratio < 10%, parallel coordination overhead exceeds the benefit of
+        // multi-threading — use flate2/zlib-ng streaming instead (faster for such data
+        // due to smaller buffer allocations and better cache behavior).
+        if compression_level <= 5 && data.len() > block_size && self.num_threads > 1 {
+            let probe_block = &data[..block_size];
+            let mut probe_output = Vec::new();
+            compress_block_bgzf_libdeflate(
+                &mut probe_output,
+                probe_block,
+                compression_level,
+                &header_info,
+            );
+            let ratio = probe_output.len() as f64 / probe_block.len() as f64;
+            if ratio < 0.10 {
+                let adjusted_level = adjust_compression_level(compression_level.min(9));
+                let mut writer = writer;
+                let mut encoder = self
+                    .gz_builder()
+                    .write(&mut writer, Compression::new(adjusted_level));
+                encoder.write_all(data)?;
+                encoder.finish()?;
+                return Ok(writer);
+            }
+        }
+
         // Use ISA-L for levels 0-3 when available (3-5x faster on x86)
         let use_isal = compression_level <= 3 && crate::isal_compress::is_available();
 
@@ -263,6 +312,40 @@ impl ParallelGzEncoder {
             },
         )
     }
+}
+
+/// Compress entire input as a single gzip member using the fastest available backend.
+///
+/// For L0-L3: Uses ISA-L (AVX2/NEON assembly) if available, otherwise libdeflate.
+/// For L4-L12: Uses libdeflate.
+///
+/// The output includes a standard gzip header with FNAME/MTIME and a BGZF-compatible
+/// block size marker in FEXTRA. This is valid gzip readable by any decompressor.
+pub fn compress_single_member<W: Write>(
+    writer: &mut W,
+    input: &[u8],
+    compression_level: u32,
+    header_info: &GzipHeaderInfo,
+) -> io::Result<u64> {
+    if input.is_empty() {
+        let encoder =
+            flate2::GzBuilder::new().write(writer, Compression::new(compression_level.min(9)));
+        encoder.finish()?;
+        return Ok(0);
+    }
+
+    let bytes = input.len() as u64;
+    let mut output = Vec::with_capacity(input.len());
+
+    // Use ISA-L for L0-L3 if available (3-5x faster on x86 with AVX2)
+    if compression_level <= 3 && crate::isal_compress::is_available() {
+        compress_block_bgzf_isal(&mut output, input, compression_level, header_info);
+    } else {
+        compress_block_bgzf_libdeflate(&mut output, input, compression_level, header_info);
+    }
+
+    writer.write_all(&output)?;
+    Ok(bytes)
 }
 
 /// Compress a block with BGZF-style gzip header containing block size

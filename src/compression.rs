@@ -335,10 +335,80 @@ fn compress_with_pipeline<R: Read, W: Write + Send>(
     opt_config: &OptimizationConfig,
     header_info: &GzipHeaderInfo,
 ) -> GzippyResult<u64> {
-    // FAST PATH: Single-threaded goes directly to flate2 with minimal overhead
-    // This is critical for L1 performance where every microsecond matters
+    // FAST PATH: Single-threaded goes directly to the fastest available backend
     // Exception: L10-L12 use libdeflate even single-threaded for ultra compression
     if opt_config.thread_count == 1 && args.compression_level <= 9 {
+        // L1-L5: Use libdeflate/ISA-L for ~2x faster compression than zlib-ng,
+        // unless the data is highly compressible (ratio < 5%) where zlib-ng's
+        // streaming mode is faster (avoids large buffer allocation).
+        if args.compression_level >= 1 && args.compression_level <= 5 && !args.huffman && !args.rle
+        {
+            // Read first 64KB to probe compression ratio without buffering all data
+            let mut probe_buf = Vec::with_capacity(65536);
+            reader.by_ref().take(65536).read_to_end(&mut probe_buf)?;
+
+            // Probe: compress the sample to determine if data is highly compressible.
+            // libdeflate is ~2x faster for normal data but zlib-ng streaming is
+            // faster for highly compressible data (avoids large buffer allocation).
+            let use_libdeflate = if probe_buf.len() >= 65536 {
+                let lvl = libdeflater::CompressionLvl::new(args.compression_level as i32)
+                    .unwrap_or_default();
+                let mut comp = libdeflater::Compressor::new(lvl);
+                let bound = comp.deflate_compress_bound(probe_buf.len());
+                let mut out = vec![0u8; bound];
+                let actual = comp
+                    .deflate_compress(&probe_buf, &mut out)
+                    .unwrap_or(probe_buf.len());
+                (actual as f64 / probe_buf.len() as f64) >= 0.10
+            } else {
+                true // Small files: libdeflate is fine
+            };
+
+            if use_libdeflate {
+                if args.verbosity >= 2 {
+                    eprintln!("gzippy: using libdeflate single-threaded path");
+                }
+                // Read rest of data and compress as single member
+                let mut input_data = probe_buf;
+                reader.read_to_end(&mut input_data)?;
+                let bytes = input_data.len() as u64;
+                let mut writer = writer;
+                crate::parallel_compress::compress_single_member(
+                    &mut writer,
+                    &input_data,
+                    args.compression_level as u32,
+                    header_info,
+                )?;
+                return Ok(bytes);
+            }
+
+            // Highly compressible: stream through flate2/zlib-ng (no full buffering)
+            if args.verbosity >= 2 {
+                eprintln!("gzippy: using flate2 single-threaded path (highly compressible)");
+            }
+            let adjusted_level = if args.compression_level == 1 {
+                2
+            } else {
+                args.compression_level
+            };
+            let compression = flate2::Compression::new(adjusted_level as u32);
+            let mut builder = flate2::GzBuilder::new();
+            if let Some(ref name) = header_info.filename {
+                builder = builder.filename(name.as_bytes());
+            }
+            builder = builder.mtime(header_info.mtime);
+            if let Some(ref comment) = header_info.comment {
+                builder = builder.comment(comment.as_bytes());
+            }
+            // Chain probe bytes with remaining reader for zero-copy streaming
+            let mut chained = std::io::Cursor::new(probe_buf).chain(reader);
+            let mut encoder = builder.write(writer, compression);
+            let bytes = io::copy(&mut chained, &mut encoder)?;
+            encoder.finish()?;
+            return Ok(bytes);
+        }
+
+        // L6-L9: Use flate2/zlib-ng streaming (better ratio at higher levels)
         use flate2::Compression;
 
         if args.verbosity >= 2 {
