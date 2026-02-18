@@ -83,9 +83,8 @@ pub fn compress_gzip_stream<R: std::io::Read, W: std::io::Write>(
 
     if input.is_empty() {
         // Write minimal gzip for empty input
-        let compressed = compress_gzip(&input, level).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "ISA-L compression failed")
-        })?;
+        let compressed = compress_gzip(&input, level)
+            .ok_or_else(|| std::io::Error::other("ISA-L compression failed"))?;
         writer.write_all(&compressed)?;
         return Ok(0);
     }
@@ -93,7 +92,7 @@ pub fn compress_gzip_stream<R: std::io::Read, W: std::io::Write>(
     let max_size = input.len() + input.len() / 10 + 256;
     let mut output = vec![0u8; max_size];
     let size = isal::compress_into(&input, &mut output, to_isal_level(level), isal::Codec::Gzip)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     writer.write_all(&output[..size])?;
     Ok(bytes)
 }
@@ -109,7 +108,7 @@ pub fn compress_gzip_to_writer<W: std::io::Write>(
     let max_size = data.len() + data.len() / 10 + 256;
     let mut output = vec![0u8; max_size];
     let size = isal::compress_into(data, &mut output, to_isal_level(level), isal::Codec::Gzip)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     writer.write_all(&output[..size])?;
     Ok(data.len() as u64)
 }
