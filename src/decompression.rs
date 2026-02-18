@@ -54,8 +54,37 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     }
 
     if input_path.is_dir() {
+        return if args.recursive {
+            decompress_directory(filename, args)
+        } else {
+            Err(GzippyError::invalid_argument(format!(
+                "{} is a directory",
+                filename
+            )))
+        };
+    }
+
+    let input_file = File::open(input_path)?;
+    let file_size = input_file.metadata()?.len();
+    let mmap = unsafe { Mmap::map(&input_file)? };
+
+    // Check if data looks like a compressed format
+    let is_compressed =
+        mmap.len() >= 2 && ((mmap[0] == 0x1f && mmap[1] == 0x8b) || mmap[0] == 0x78);
+
+    // Force pass-through: if force+stdout and data doesn't look compressed, copy unchanged
+    if args.force && args.stdout && !is_compressed {
+        let stdout = stdout();
+        let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
+        writer.write_all(&mmap)?;
+        writer.flush()?;
+        return Ok(0);
+    }
+
+    // Non-gzip data without stdout: can't decompress to a file
+    if !is_compressed {
         return Err(GzippyError::invalid_argument(format!(
-            "{} is a directory",
+            "{}: not in gzip format",
             filename
         )));
     }
@@ -63,21 +92,31 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     let output_path = if args.stdout {
         None
     } else {
-        Some(get_output_filename(input_path, args))
+        Some(get_output_filename(input_path, args, &mmap))
     };
 
     if let Some(ref output_path) = output_path {
         if output_path.exists() && !args.force {
-            return Err(GzippyError::invalid_argument(format!(
-                "Output file {} already exists",
-                output_path.display()
-            )));
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() {
+                eprint!(
+                    "gzippy: {} already exists; do you wish to overwrite (y or n)? ",
+                    output_path.display()
+                );
+                let mut response = String::new();
+                std::io::stdin().read_line(&mut response)?;
+                if !response.trim().eq_ignore_ascii_case("y") {
+                    eprintln!("\tnot overwritten");
+                    return Ok(2);
+                }
+            } else {
+                return Err(GzippyError::invalid_argument(format!(
+                    "Output file {} already exists",
+                    output_path.display()
+                )));
+            }
         }
     }
-
-    let input_file = File::open(input_path)?;
-    let file_size = input_file.metadata()?.len();
-    let mmap = unsafe { Mmap::map(&input_file)? };
 
     let format = detect_compression_format_from_path(input_path)?;
 
@@ -114,10 +153,29 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 
     match result {
         Ok(output_size) => {
-            // Preserve file permissions and timestamps on output file
             if !args.stdout {
                 if let Some(ref output_path) = output_path {
+                    // Preserve file permissions and timestamps on output file
                     preserve_metadata(input_path, output_path);
+
+                    // If --name, restore mtime from gzip header
+                    if args.name {
+                        if let Some(header_mtime) = extract_gzip_mtime(&mmap) {
+                            if header_mtime != 0 {
+                                let _ = filetime::set_file_mtime(
+                                    output_path,
+                                    filetime::FileTime::from_unix_time(header_mtime as i64, 0),
+                                );
+                            }
+                        }
+                    }
+
+                    // Synchronous: fsync after write
+                    if args.synchronous {
+                        if let Ok(f) = File::open(output_path) {
+                            let _ = f.sync_all();
+                        }
+                    }
                 }
             }
 
@@ -131,7 +189,7 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         }
         Err(e) => {
             if !args.stdout {
-                let cleanup_path = get_output_filename(input_path, args);
+                let cleanup_path = get_output_filename(input_path, args, &mmap);
                 if cleanup_path.exists() {
                     let _ = std::fs::remove_file(&cleanup_path);
                 }
@@ -141,7 +199,7 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     }
 }
 
-pub fn decompress_stdin(_args: &GzippyArgs) -> GzippyResult<i32> {
+pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     use std::io::Read;
 
     // Buffer stdin into memory to use our optimized parallel decompressor
@@ -158,9 +216,21 @@ pub fn decompress_stdin(_args: &GzippyArgs) -> GzippyResult<i32> {
     }
 
     // Detect format
-    let format = if input_data.len() >= 2 && input_data[0] == 0x1f && input_data[1] == 0x8b {
+    let is_gzip = input_data.len() >= 2 && input_data[0] == 0x1f && input_data[1] == 0x8b;
+    let is_zlib = input_data.len() >= 2 && input_data[0] == 0x78;
+
+    // Force pass-through: if force is set and data doesn't look compressed, pass through
+    if args.force && !is_gzip && !is_zlib {
+        let stdout = stdout();
+        let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
+        writer.write_all(&input_data)?;
+        writer.flush()?;
+        return Ok(0);
+    }
+
+    let format = if is_gzip {
         CompressionFormat::Gzip
-    } else if input_data.len() >= 2 && input_data[0] == 0x78 {
+    } else if is_zlib {
         CompressionFormat::Zlib
     } else {
         CompressionFormat::Gzip // Default
@@ -184,6 +254,35 @@ pub fn decompress_stdin(_args: &GzippyArgs) -> GzippyResult<i32> {
     writer.flush()?;
 
     Ok(0)
+}
+
+/// Recursively decompress all compressed files in a directory
+fn decompress_directory(dirname: &str, args: &GzippyArgs) -> GzippyResult<i32> {
+    use walkdir::WalkDir;
+
+    let mut exit_code = 0;
+
+    for entry in WalkDir::new(dirname) {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_file() && crate::utils::is_compressed_file(path) {
+            let path_str = path.to_string_lossy();
+            match decompress_file(&path_str, args) {
+                Ok(code) => {
+                    if code != 0 {
+                        exit_code = code;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("gzippy: {}: {}", path_str, e);
+                    exit_code = 1;
+                }
+            }
+        }
+    }
+
+    Ok(exit_code)
 }
 
 /// Decompress using libdeflate (fastest for in-memory data)
@@ -870,10 +969,36 @@ fn detect_compression_format_from_path(path: &Path) -> GzippyResult<CompressionF
     }
 }
 
-fn get_output_filename(input_path: &Path, args: &GzippyArgs) -> std::path::PathBuf {
+fn get_output_filename(input_path: &Path, args: &GzippyArgs, data: &[u8]) -> std::path::PathBuf {
     if args.stdout {
         return input_path.to_path_buf();
     }
+
+    // If --name is set, try to extract FNAME from gzip header
+    if args.name {
+        if let Some(fname) = extract_gzip_fname(data) {
+            if !fname.is_empty() {
+                let mut output = input_path.to_path_buf();
+                output.set_file_name(&fname);
+                return output;
+            }
+        }
+    }
+
+    // Check custom suffix for decompression
+    if args.suffix != ".gz" {
+        let suffix = args.suffix.trim_start_matches('.');
+        if let Some(name) = input_path.file_name().and_then(|n| n.to_str()) {
+            let lower = name.to_lowercase();
+            let suffix_with_dot = format!(".{}", suffix);
+            if lower.ends_with(&suffix_with_dot) {
+                let mut output = input_path.to_path_buf();
+                output.set_file_name(&name[..name.len() - suffix_with_dot.len()]);
+                return output;
+            }
+        }
+    }
+
     let mut output_path = strip_compression_extension(input_path);
     if output_path == input_path {
         output_path = input_path.to_path_buf();
@@ -881,6 +1006,48 @@ fn get_output_filename(input_path: &Path, args: &GzippyArgs) -> std::path::PathB
         output_path.set_file_name(format!("{}.out", current_name));
     }
     output_path
+}
+
+/// Extract MTIME from a gzip header
+fn extract_gzip_mtime(data: &[u8]) -> Option<u32> {
+    if data.len() < 10 || data[0] != 0x1f || data[1] != 0x8b {
+        return None;
+    }
+    Some(u32::from_le_bytes([data[4], data[5], data[6], data[7]]))
+}
+
+/// Extract the original filename (FNAME) from a gzip header
+fn extract_gzip_fname(data: &[u8]) -> Option<String> {
+    if data.len() < 10 || data[0] != 0x1f || data[1] != 0x8b || data[2] != 0x08 {
+        return None;
+    }
+
+    let flags = data[3];
+    if flags & 0x08 == 0 {
+        return None; // No FNAME
+    }
+
+    let mut pos = 10;
+
+    // Skip FEXTRA
+    if flags & 0x04 != 0 {
+        if pos + 2 > data.len() {
+            return None;
+        }
+        let xlen = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2 + xlen;
+    }
+
+    // Read FNAME (null-terminated)
+    let start = pos;
+    while pos < data.len() && data[pos] != 0 {
+        pos += 1;
+    }
+    if pos >= data.len() {
+        return None;
+    }
+
+    String::from_utf8(data[start..pos].to_vec()).ok()
 }
 
 fn print_decompression_stats(input_size: u64, output_size: u64, path: &Path) {

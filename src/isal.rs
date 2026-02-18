@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! High-Performance Decompression
 //!
 //! This module provides the fastest decompression using libdeflate,

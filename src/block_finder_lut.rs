@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Block Finder LUT for rapidgzip-style parallel decompression
 //!
 //! This module provides a 15-bit lookup table for quickly finding potential

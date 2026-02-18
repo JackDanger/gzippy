@@ -15,7 +15,6 @@
 //! - BGZF-style block size markers in FEXTRA for fast parallel decompression
 
 use crate::scheduler::compress_parallel_independent;
-use flate2::write::GzEncoder;
 use flate2::Compression;
 use memmap2::Mmap;
 use std::cell::RefCell;
@@ -26,6 +25,17 @@ use std::path::Path;
 /// BGZF-style subfield ID for block size markers
 /// Using "GZ" to identify gzippy-compressed blocks with embedded block sizes
 pub const GZ_SUBFIELD_ID: [u8; 2] = [b'G', b'Z'];
+
+/// Metadata for gzip header FNAME and MTIME fields
+#[derive(Clone, Debug, Default)]
+pub struct GzipHeaderInfo {
+    /// Original filename (basename only) for FNAME field
+    pub filename: Option<String>,
+    /// File modification time as Unix timestamp for MTIME field
+    pub mtime: u32,
+    /// Optional comment for FCOMMENT field
+    pub comment: Option<String>,
+}
 
 /// Adjust compression level for backend compatibility
 ///
@@ -110,6 +120,7 @@ const DEFAULT_BLOCK_SIZE: usize = 64 * 1024;
 pub struct ParallelGzEncoder {
     compression_level: u32,
     num_threads: usize,
+    header_info: GzipHeaderInfo,
 }
 
 impl ParallelGzEncoder {
@@ -117,7 +128,12 @@ impl ParallelGzEncoder {
         Self {
             compression_level,
             num_threads,
+            header_info: GzipHeaderInfo::default(),
         }
+    }
+
+    pub fn set_header_info(&mut self, info: GzipHeaderInfo) {
+        self.header_info = info;
     }
 
     /// Compress data in parallel and write to output
@@ -129,7 +145,7 @@ impl ParallelGzEncoder {
         if input_data.is_empty() {
             // Write empty gzip file - use level 9 for zlib (L10+ aren't supported by zlib)
             let zlib_level = self.compression_level.min(9);
-            let encoder = GzEncoder::new(
+            let encoder = self.gz_builder().write(
                 writer,
                 Compression::new(adjust_compression_level(zlib_level)),
             );
@@ -144,7 +160,7 @@ impl ParallelGzEncoder {
         // For L10-L12, always use libdeflate blocks for better compression
         if self.compression_level <= 9 && (input_data.len() <= block_size || self.num_threads == 1)
         {
-            let mut encoder = GzEncoder::new(
+            let mut encoder = self.gz_builder().write(
                 writer,
                 Compression::new(adjust_compression_level(self.compression_level)),
             );
@@ -157,6 +173,19 @@ impl ParallelGzEncoder {
         let _ = self.compress_parallel(&input_data, block_size, writer)?;
 
         Ok(bytes_read)
+    }
+
+    /// Build a flate2 GzBuilder with FNAME/MTIME/FCOMMENT from header_info
+    fn gz_builder(&self) -> flate2::GzBuilder {
+        let mut builder = flate2::GzBuilder::new();
+        if let Some(ref name) = self.header_info.filename {
+            builder = builder.filename(name.as_bytes());
+        }
+        builder = builder.mtime(self.header_info.mtime);
+        if let Some(ref comment) = self.header_info.comment {
+            builder = builder.comment(comment.as_bytes());
+        }
+        builder
     }
 
     /// Calculate optimal block size based on file size and thread count
@@ -176,7 +205,7 @@ impl ParallelGzEncoder {
         if file_len == 0 {
             // Write empty gzip file - use level 9 for zlib (L10+ aren't supported by zlib)
             let zlib_level = self.compression_level.min(9);
-            let encoder = GzEncoder::new(
+            let encoder = self.gz_builder().write(
                 &mut writer,
                 Compression::new(adjust_compression_level(zlib_level)),
             );
@@ -191,7 +220,7 @@ impl ParallelGzEncoder {
         // For L10-L12, always use libdeflate blocks for better compression
         let block_size = self.calculate_block_size(file_len);
         if self.compression_level <= 9 && (file_len <= block_size || self.num_threads == 1) {
-            let mut encoder = GzEncoder::new(
+            let mut encoder = self.gz_builder().write(
                 &mut writer,
                 Compression::new(adjust_compression_level(self.compression_level)),
             );
@@ -214,6 +243,7 @@ impl ParallelGzEncoder {
         writer: W,
     ) -> io::Result<W> {
         let compression_level = self.compression_level;
+        let header_info = self.header_info.clone();
 
         // Use custom scheduler - dedicated writer thread for max parallelism
         compress_parallel_independent(
@@ -222,7 +252,7 @@ impl ParallelGzEncoder {
             self.num_threads,
             writer,
             |block, output| {
-                compress_block_bgzf_libdeflate(output, block, compression_level);
+                compress_block_bgzf_libdeflate(output, block, compression_level, &header_info);
             },
         )
     }
@@ -232,14 +262,21 @@ impl ParallelGzEncoder {
 ///
 /// The header includes:
 /// - Standard gzip magic (0x1f 0x8b)
-/// - FEXTRA flag set (0x04)
+/// - FEXTRA flag set (0x04), optionally FNAME (0x08) and FCOMMENT (0x10)
 /// - "GZ" subfield with compressed block size (allows parallel decompression)
+/// - MTIME from file metadata (when available)
+/// - Original filename (when available)
 ///
 /// This is compatible with all gzip decompressors (they ignore unknown subfields)
 /// but enables gzippy to find block boundaries without inflating.
 ///
 /// Uses libdeflate for L1-L6 (faster, no dictionary needed).
-fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compression_level: u32) {
+fn compress_block_bgzf_libdeflate(
+    output: &mut Vec<u8>,
+    block: &[u8],
+    compression_level: u32,
+    header_info: &GzipHeaderInfo,
+) {
     use libdeflater::{CompressionLvl, Compressor};
 
     output.clear();
@@ -247,16 +284,28 @@ fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compressio
     // Reserve space for header (we'll write block size later)
     let header_start = output.len();
 
-    // Write gzip header with FEXTRA flag
+    // Build flags: FEXTRA always set, optionally FNAME and FCOMMENT
+    let mut flags: u8 = 0x04; // FEXTRA
+    if header_info.filename.is_some() {
+        flags |= 0x08; // FNAME
+    }
+    if header_info.comment.is_some() {
+        flags |= 0x10; // FCOMMENT
+    }
+
+    // Write gzip header
     output.extend_from_slice(&[
         0x1f, 0x8b, // Magic
         0x08, // Compression method (deflate)
-        0x04, // Flags: FEXTRA
-        0, 0, 0, 0,    // MTIME (zero)
+        flags,
+    ]);
+    output.extend_from_slice(&header_info.mtime.to_le_bytes()); // MTIME
+    output.extend_from_slice(&[
         0x00, // XFL (no extra flags)
         0xff, // OS (unknown)
     ]);
 
+    // FEXTRA: XLEN + subfield data
     // XLEN: 8 bytes (2 byte ID + 2 byte len + 4 byte block size)
     output.extend_from_slice(&[8, 0]);
 
@@ -266,6 +315,18 @@ fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compressio
     output.extend_from_slice(&[4, 0]); // Subfield data length (4 bytes)
     let block_size_offset = output.len();
     output.extend_from_slice(&[0, 0, 0, 0]); // Placeholder for block size
+
+    // FNAME (after FEXTRA, per RFC 1952 order)
+    if let Some(ref name) = header_info.filename {
+        output.extend_from_slice(name.as_bytes());
+        output.push(0); // null terminator
+    }
+
+    // FCOMMENT (after FNAME)
+    if let Some(ref comment) = header_info.comment {
+        output.extend_from_slice(comment.as_bytes());
+        output.push(0); // null terminator
+    }
 
     // Get or create compressor from thread-local cache
     let level = compression_level as i32;
@@ -312,6 +373,121 @@ fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compressio
     // Block size stored as u32 (no overflow possible for reasonable blocks)
     output[block_size_offset..block_size_offset + 4]
         .copy_from_slice(&(total_block_size as u32).to_le_bytes());
+}
+
+/// Split data into rsyncable blocks using a rolling hash.
+/// Block boundaries are determined by content, so small input changes
+/// only affect nearby blocks — ideal for rsync workflows.
+///
+/// Uses a simple Adler-style rolling hash with a window of 8KB.
+/// When the hash's low bits match a trigger mask, a block boundary is created.
+/// Target block size is ~128KB (mask = 0x1FFFF = 128K-1).
+pub fn split_rsyncable(data: &[u8]) -> Vec<&[u8]> {
+    const WINDOW: usize = 8192;
+    const MASK: u32 = 0x1FFFF; // ~128KB average block size
+    const MIN_BLOCK: usize = 32 * 1024; // 32KB minimum
+    const MAX_BLOCK: usize = 512 * 1024; // 512KB maximum
+
+    if data.len() <= MIN_BLOCK {
+        return vec![data];
+    }
+
+    let mut blocks = Vec::new();
+    let mut block_start = 0;
+    let mut hash: u32 = 0;
+
+    for i in 0..data.len() {
+        // Add new byte to hash
+        hash = hash.wrapping_add(data[i] as u32);
+
+        // Remove byte leaving the window
+        if i >= WINDOW {
+            hash = hash.wrapping_sub(data[i - WINDOW] as u32);
+        }
+
+        let block_len = i - block_start + 1;
+
+        // Check for boundary: hash hits trigger AND block is big enough
+        if block_len >= MIN_BLOCK && (hash & MASK == MASK || block_len >= MAX_BLOCK) {
+            blocks.push(&data[block_start..block_start + block_len]);
+            block_start += block_len;
+        }
+    }
+
+    // Last block
+    if block_start < data.len() {
+        blocks.push(&data[block_start..]);
+    }
+
+    blocks
+}
+
+/// Compress data with rsyncable block boundaries.
+/// Each content-determined block becomes an independent gzip member.
+pub fn compress_rsyncable<W: Write + Send>(
+    data: &[u8],
+    compression_level: u32,
+    num_threads: usize,
+    header_info: &GzipHeaderInfo,
+    mut writer: W,
+) -> io::Result<u64> {
+    let blocks = split_rsyncable(data);
+
+    if blocks.is_empty() {
+        return Ok(0);
+    }
+
+    // For single block or single thread, compress sequentially
+    if blocks.len() == 1 || num_threads <= 1 {
+        let mut total = 0u64;
+        for block in &blocks {
+            let mut output = Vec::new();
+            compress_block_bgzf_libdeflate(&mut output, block, compression_level, header_info);
+            writer.write_all(&output)?;
+            total += block.len() as u64;
+        }
+        return Ok(total);
+    }
+
+    // Parallel: compress blocks using thread pool
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    let num_blocks = blocks.len();
+    let next_block = AtomicUsize::new(0);
+
+    // Pre-allocate output slots
+    let outputs: Vec<std::sync::Mutex<Vec<u8>>> = (0..num_blocks)
+        .map(|_| std::sync::Mutex::new(Vec::new()))
+        .collect();
+
+    thread::scope(|scope| {
+        for _ in 0..num_threads.min(num_blocks) {
+            scope.spawn(|| loop {
+                let idx = next_block.fetch_add(1, Ordering::Relaxed);
+                if idx >= num_blocks {
+                    break;
+                }
+                let mut output = outputs[idx].lock().unwrap();
+                compress_block_bgzf_libdeflate(
+                    &mut output,
+                    blocks[idx],
+                    compression_level,
+                    header_info,
+                );
+            });
+        }
+    });
+
+    // Write outputs in order
+    let mut total = 0u64;
+    for (i, slot) in outputs.iter().enumerate() {
+        let output = slot.lock().unwrap();
+        writer.write_all(&output)?;
+        total += blocks[i].len() as u64;
+    }
+
+    Ok(total)
 }
 
 #[cfg(test)]
