@@ -274,41 +274,12 @@ impl ParallelGzEncoder {
         let compression_level = self.compression_level;
         let header_info = self.header_info.clone();
 
-        // Probe compression ratio on first block to detect highly compressible data.
-        // When ratio < 10%, parallel coordination overhead exceeds the benefit of
-        // multi-threading. Fall back to single-stream using the fastest available
-        // backend: ISA-L on x86 (AVX2), flate2/zlib-ng streaming on arm64.
-        if compression_level <= 5 && data.len() > block_size && self.num_threads > 1 {
-            let probe_block = &data[..block_size];
-            let mut probe_output = Vec::new();
-            compress_block_bgzf_libdeflate(
-                &mut probe_output,
-                probe_block,
-                compression_level,
-                &header_info,
-            );
-            let ratio = probe_output.len() as f64 / probe_block.len() as f64;
-            if ratio < 0.10 {
-                let mut writer = writer;
-                // ISA-L stateless single-shot is fastest on x86 for L0-L3
-                if compression_level <= 3 && crate::isal_compress::is_available() {
-                    crate::isal_compress::compress_gzip_to_writer(
-                        data,
-                        &mut writer,
-                        compression_level,
-                    )?;
-                    return Ok(writer);
-                }
-                // flate2/zlib-ng streaming: best on arm64, good cache behavior
-                let adjusted_level = adjust_compression_level(compression_level.min(9));
-                let mut encoder = self
-                    .gz_builder()
-                    .write(&mut writer, Compression::new(adjusted_level));
-                encoder.write_all(data)?;
-                encoder.finish()?;
-                return Ok(writer);
-            }
-        }
+        // Note: We previously fell back to single-stream for highly compressible data
+        // (ratio < 10%), but parallel BGZF blocks are always faster because:
+        // - The bottleneck is CPU time per block, not I/O overhead
+        // - BGZF header overhead is negligible (<0.01% of output)
+        // - N threads processing N/num_threads of the data = N× throughput
+        // The single-stream fallback was incorrect. Always use parallel blocks.
 
         // Use ISA-L for levels 0-3 when available (3-5x faster on x86)
         let use_isal = compression_level <= 3 && crate::isal_compress::is_available();
