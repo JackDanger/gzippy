@@ -326,6 +326,10 @@ struct SpeculativeDecoder<'a> {
     unresolved: Vec<UnresolvedRef>,
     /// Available window size (starts at 0 for speculative decode)
     available_window: usize,
+    /// Whether this is the final chunk in the stream.
+    /// Non-final chunks treat EOF as a successful end-of-chunk, not an error.
+    /// This prevents runaway decode when data is sliced at chunk boundaries.
+    is_final_chunk: bool,
 }
 
 impl<'a> SpeculativeDecoder<'a> {
@@ -337,7 +341,8 @@ impl<'a> SpeculativeDecoder<'a> {
             window_pos: 0,
             total_output: 0,
             unresolved: Vec::new(),
-            available_window: 0, // No window available initially
+            available_window: 0,  // No window available initially
+            is_final_chunk: true, // Default: treat as final (fail on EOF)
         }
     }
 
@@ -354,24 +359,40 @@ impl<'a> SpeculativeDecoder<'a> {
             total_output: 0,
             unresolved: Vec::new(),
             available_window: len, // Full window available
+            is_final_chunk: true,
         }
     }
 
     fn decode(&mut self) -> io::Result<()> {
         loop {
-            let bfinal = self.reader.read_bit()?;
-            let btype = self.reader.read_bits(2)? as u8;
+            // For non-final chunks, hitting EOF at a block boundary is expected and OK.
+            let bfinal = match self.reader.read_bit() {
+                Ok(b) => b,
+                Err(_) if !self.is_final_chunk => return Ok(()),
+                Err(e) => return Err(e),
+            };
+            let btype = match self.reader.read_bits(2) {
+                Ok(t) => t as u8,
+                Err(_) if !self.is_final_chunk => return Ok(()),
+                Err(e) => return Err(e),
+            };
 
-            match btype {
-                0 => self.decode_stored()?,
-                1 => self.decode_fixed()?,
-                2 => self.decode_dynamic()?,
+            // For non-final chunks, mid-block EOF is also OK — we just stop.
+            let result = match btype {
+                0 => self.decode_stored(),
+                1 => self.decode_fixed(),
+                2 => self.decode_dynamic(),
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "Invalid block type",
                     ))
                 }
+            };
+            match result {
+                Ok(()) => {}
+                Err(_) if !self.is_final_chunk => return Ok(()),
+                Err(e) => return Err(e),
             }
 
             if bfinal == 1 {
@@ -683,66 +704,43 @@ impl RapidgzipDecoder {
                             break;
                         }
 
-                        let chunk_data = &data[start..];
+                        // Slice data to this chunk's range only.
+                        // CRITICAL: passing data[start..] caused the -86% regression in
+                        // commit 384f419 — each decoder ran through the entire remaining
+                        // stream (up to 160MB) instead of just its chunk (20-40MB).
+                        let end = (start + chunk_size).min(data.len());
+                        let is_final = end == data.len();
 
                         // First chunk: known to start at bit 0
                         if idx == 0 {
-                            let result = decode_chunk_speculative(chunk_data, idx, 0, true);
+                            let chunk_data = &data[..end];
+                            let result =
+                                decode_chunk_speculative(chunk_data, idx, 0, true, is_final);
                             *results_ref[idx].lock().unwrap() = Some(result);
                             continue;
                         }
 
-                        // Other chunks: find valid block start
+                        // Other chunks: find valid block start within this chunk's range
                         let result = if let Some((block_offset, bit_offset)) =
                             find_block_start(data, start, MAX_BLOCK_SEARCH)
                         {
-                            // Found a potential block start, try to decode from there
-                            let adjusted_data = &data[block_offset..];
-                            if let Some(r) = try_decode_at_bit(adjusted_data, idx, bit_offset) {
-                                r
+                            if block_offset >= end {
+                                // Block start is beyond this chunk — skip
+                                failed_chunk_result(idx)
                             } else {
-                                // Try all bit offsets at the found position
-                                let mut best: Option<ChunkResult> = None;
-                                for bo in 0..8 {
-                                    if let Some(r) = try_decode_at_bit(adjusted_data, idx, bo) {
-                                        if r.success {
-                                            best = Some(r);
-                                            break;
-                                        }
-                                    }
-                                }
-                                best.unwrap_or(ChunkResult {
-                                    index: idx,
-                                    valid_bit_offset: None,
-                                    output: Vec::new(),
-                                    unresolved: Vec::new(),
-                                    final_window: Vec::new(),
-                                    success: false,
-                                    bytes_before_unresolved: 0,
-                                    end_bit_pos: 0,
-                                })
+                                // Decode from block_offset to end of this chunk
+                                let adjusted_data = &data[block_offset..end];
+                                decode_chunk_speculative(
+                                    adjusted_data,
+                                    idx,
+                                    bit_offset,
+                                    false,
+                                    is_final,
+                                )
                             }
                         } else {
-                            // No block start found, try all bit offsets at chunk start
-                            let mut best: Option<ChunkResult> = None;
-                            for bit_offset in 0..8 {
-                                if let Some(r) = try_decode_at_bit(chunk_data, idx, bit_offset) {
-                                    if r.success {
-                                        best = Some(r);
-                                        break;
-                                    }
-                                }
-                            }
-                            best.unwrap_or(ChunkResult {
-                                index: idx,
-                                valid_bit_offset: None,
-                                output: Vec::new(),
-                                unresolved: Vec::new(),
-                                final_window: Vec::new(),
-                                success: false,
-                                bytes_before_unresolved: 0,
-                                end_bit_pos: 0,
-                            })
+                            // No block start found near this chunk — skip, fall back to sequential
+                            failed_chunk_result(idx)
                         };
 
                         *results_ref[idx].lock().unwrap() = Some(result);
@@ -753,17 +751,11 @@ impl RapidgzipDecoder {
 
         results
             .into_iter()
-            .map(|m| {
-                m.into_inner().unwrap().unwrap_or_else(|| ChunkResult {
-                    index: 0,
-                    valid_bit_offset: None,
-                    output: Vec::new(),
-                    unresolved: Vec::new(),
-                    final_window: Vec::new(),
-                    success: false,
-                    bytes_before_unresolved: 0,
-                    end_bit_pos: 0,
-                })
+            .enumerate()
+            .map(|(i, m)| {
+                m.into_inner()
+                    .unwrap()
+                    .unwrap_or_else(|| failed_chunk_result(i))
             })
             .collect()
     }
@@ -833,11 +825,25 @@ impl RapidgzipDecoder {
 }
 
 /// Decode a chunk speculatively
+fn failed_chunk_result(index: usize) -> ChunkResult {
+    ChunkResult {
+        index,
+        valid_bit_offset: None,
+        output: Vec::new(),
+        unresolved: Vec::new(),
+        final_window: Vec::new(),
+        success: false,
+        bytes_before_unresolved: 0,
+        end_bit_pos: 0,
+    }
+}
+
 fn decode_chunk_speculative(
     data: &[u8],
     index: usize,
     bit_offset: u8,
     has_window: bool,
+    is_final_chunk: bool,
 ) -> ChunkResult {
     // Try ISA-L first if we have the feature enabled
     #[cfg(feature = "isal")]
@@ -851,9 +857,12 @@ fn decode_chunk_speculative(
     let mut decoder = if has_window {
         let mut d = SpeculativeDecoder::new(data, bit_offset);
         d.available_window = WINDOW_SIZE; // First chunk has full virtual window
+        d.is_final_chunk = is_final_chunk;
         d
     } else {
-        SpeculativeDecoder::new(data, bit_offset)
+        let mut d = SpeculativeDecoder::new(data, bit_offset);
+        d.is_final_chunk = is_final_chunk;
+        d
     };
 
     match decoder.decode() {
@@ -871,16 +880,7 @@ fn decode_chunk_speculative(
                 end_bit_pos: end_pos,
             }
         }
-        Err(_) => ChunkResult {
-            index,
-            valid_bit_offset: None,
-            output: Vec::new(),
-            unresolved: Vec::new(),
-            final_window: Vec::new(),
-            success: false,
-            bytes_before_unresolved: 0,
-            end_bit_pos: 0,
-        },
+        Err(_) => failed_chunk_result(index),
     }
 }
 
@@ -957,8 +957,14 @@ fn decode_chunk_isal(
 }
 
 /// Try to decode at a specific bit offset
-fn try_decode_at_bit(data: &[u8], index: usize, bit_offset: u8) -> Option<ChunkResult> {
+fn try_decode_at_bit(
+    data: &[u8],
+    index: usize,
+    bit_offset: u8,
+    is_final_chunk: bool,
+) -> Option<ChunkResult> {
     let mut decoder = SpeculativeDecoder::new(data, bit_offset);
+    decoder.is_final_chunk = is_final_chunk;
 
     match decoder.decode() {
         Ok(()) => {

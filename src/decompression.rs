@@ -457,6 +457,45 @@ fn is_multi_member_quick(data: &[u8]) -> bool {
     is_likely_multi_member(data)
 }
 
+/// Minimum single-member file size to attempt parallel decompression.
+/// Files smaller than this are fast enough with sequential libdeflate.
+const MIN_PARALLEL_DECOMPRESS_SIZE: usize = 16 * 1024 * 1024; // 16MB
+
+/// Decompress a single-member gzip file.
+/// For large files with multiple threads, attempts parallel decode (rapidgzip style).
+/// Falls back to sequential libdeflate on any failure.
+fn decompress_single_member<W: Write + Send>(
+    data: &[u8],
+    writer: &mut W,
+    num_threads: usize,
+) -> GzippyResult<u64> {
+    if num_threads > 1 && data.len() >= MIN_PARALLEL_DECOMPRESS_SIZE {
+        // Attempt parallel single-member decompression.
+        // This uses speculative block-boundary finding + parallel decode with window propagation.
+        // If it fails for any reason (no valid blocks found, decode errors), we fall back.
+        match crate::rapidgzip_decoder::decompress_rapidgzip(data, writer, num_threads) {
+            Ok(bytes) => {
+                if std::env::var("GZIPPY_DEBUG").is_ok() {
+                    eprintln!(
+                        "[gzippy] Parallel single-member: {} bytes, {} threads",
+                        bytes, num_threads
+                    );
+                }
+                return Ok(bytes);
+            }
+            Err(e) => {
+                if std::env::var("GZIPPY_DEBUG").is_ok() {
+                    eprintln!(
+                        "[gzippy] Parallel single-member failed: {}, falling back to sequential",
+                        e
+                    );
+                }
+            }
+        }
+    }
+    decompress_single_member_libdeflate(data, writer)
+}
+
 /// Decompress single-member gzip using libdeflate FFI (fastest path)
 ///
 /// Uses DecompressorEx::gzip_decompress_ex() which handles the full gzip
@@ -555,11 +594,12 @@ fn decompress_gzip_libdeflate<W: Write + Send>(
     }
 
     if !is_likely_multi_member(data) {
-        // Single-member: use libdeflate directly (fastest path for single-stream data)
+        // Single-member: attempt parallel decode for large files with multiple threads.
+        // Falls back to sequential libdeflate if parallel fails or isn't beneficial.
         if std::env::var("GZIPPY_DEBUG").is_ok() {
-            eprintln!("[gzippy] Single-member: libdeflate");
+            eprintln!("[gzippy] Single-member: {} threads", num_threads);
         }
-        return decompress_single_member_libdeflate(data, writer);
+        return decompress_single_member(data, writer, num_threads);
     }
 
     // Multi-member: try parallel decompression first
