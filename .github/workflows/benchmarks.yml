@@ -122,9 +122,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries-x86_64
+          path: ./bin
+
       - name: Prepare benchmark data
         run: |
+          chmod +x ./bin/*
           make bench-data
+
+          # Create multi-format archives for decompression benchmarks
+          # BGZF (gzippy parallel blocks) and multi-member (pigz-style)
+          for dataset in silesia-large software.archive logs.txt; do
+            base="benchmark_data/${dataset}"
+
+            # Determine uncompressed source file
+            if [ "$dataset" = "silesia-large" ]; then
+              src="${base}.bin"
+            elif [ "$dataset" = "software.archive" ]; then
+              src="${base}"
+            else
+              src="${base}"
+            fi
+
+            if [ ! -f "$src" ]; then
+              echo "WARN: $src not found, skipping multi-format for $dataset"
+              continue
+            fi
+
+            # Create BGZF (gzippy output)
+            echo "Creating BGZF: ${base}-bgzf.gz"
+            ./bin/gzippy -1 -c < "$src" > "${base}-bgzf.gz"
+
+            # Create multi-member (pigz output)
+            echo "Creating multi-member: ${base}-pigz.gz"
+            ./bin/pigz -1 -c < "$src" > "${base}-pigz.gz"
+          done
+
           ls -lh benchmark_data/
 
       - uses: actions/upload-artifact@v4
@@ -398,58 +433,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        platform: [x86_64, arm64]
+        archive_type: [silesia-gzip, silesia-bgzf, silesia-pigz, software-gzip, software-bgzf, software-pigz, logs-gzip, logs-bgzf, logs-pigz]
+        threads: ["1", "max"]
         include:
-          # x86_64 - full matrix
           - platform: x86_64
             runner: ubuntu-latest
-            archive_type: silesia
-            threads: "1"
-          - platform: x86_64
-            runner: ubuntu-latest
-            archive_type: silesia
-            threads: "max"
-          - platform: x86_64
-            runner: ubuntu-latest
-            archive_type: software
-            threads: "1"
-          - platform: x86_64
-            runner: ubuntu-latest
-            archive_type: software
-            threads: "max"
-          - platform: x86_64
-            runner: ubuntu-latest
-            archive_type: logs
-            threads: "1"
-          - platform: x86_64
-            runner: ubuntu-latest
-            archive_type: logs
-            threads: "max"
-          # ARM64 - full decompression matrix
-          # Note: igzip and gzip are excluded from Tmax jobs (single-threaded tools)
           - platform: arm64
             runner: ubuntu-24.04-arm
-            archive_type: silesia
-            threads: "1"
-          - platform: arm64
-            runner: ubuntu-24.04-arm
-            archive_type: silesia
-            threads: "max"
-          - platform: arm64
-            runner: ubuntu-24.04-arm
-            archive_type: software
-            threads: "1"
-          - platform: arm64
-            runner: ubuntu-24.04-arm
-            archive_type: software
-            threads: "max"
-          - platform: arm64
-            runner: ubuntu-24.04-arm
-            archive_type: logs
-            threads: "1"
-          - platform: arm64
-            runner: ubuntu-24.04-arm
-            archive_type: logs
-            threads: "max"
     steps:
       - uses: actions/checkout@v4
 
@@ -474,27 +465,41 @@ jobs:
             echo "THREADS=${{ matrix.threads }}" >> $GITHUB_ENV
           fi
 
-          # Map archive_type to actual files
-          case "${{ matrix.archive_type }}" in
+          # Parse archive_type: "dataset-format" e.g. "silesia-gzip", "software-bgzf"
+          ARCHIVE_TYPE="${{ matrix.archive_type }}"
+          DATASET="${ARCHIVE_TYPE%-*}"
+          FORMAT="${ARCHIVE_TYPE##*-}"
+
+          # Map dataset+format to actual files
+          case "$DATASET" in
             silesia)
-              # Use the large silesia file for parallel benchmarks, fall back to regular
-              if [ -f benchmark_data/silesia-large.gz ]; then
-                echo "COMPRESSED_FILE=benchmark_data/silesia-large.gz" >> $GITHUB_ENV
-                echo "ORIGINAL_FILE=benchmark_data/silesia-large.bin" >> $GITHUB_ENV
-              else
-                echo "COMPRESSED_FILE=benchmark_data/silesia-gzip.tar.gz" >> $GITHUB_ENV
-                echo "ORIGINAL_FILE=benchmark_data/silesia.tar" >> $GITHUB_ENV
-              fi
+              ORIG_FILE="benchmark_data/silesia-large.bin"
+              case "$FORMAT" in
+                gzip) COMP_FILE="benchmark_data/silesia-large.gz" ;;
+                bgzf) COMP_FILE="benchmark_data/silesia-large-bgzf.gz" ;;
+                pigz) COMP_FILE="benchmark_data/silesia-large-pigz.gz" ;;
+              esac
               ;;
             software)
-              echo "COMPRESSED_FILE=benchmark_data/software.archive.gz" >> $GITHUB_ENV
-              echo "ORIGINAL_FILE=benchmark_data/software.archive" >> $GITHUB_ENV
+              ORIG_FILE="benchmark_data/software.archive"
+              case "$FORMAT" in
+                gzip) COMP_FILE="benchmark_data/software.archive.gz" ;;
+                bgzf) COMP_FILE="benchmark_data/software.archive-bgzf.gz" ;;
+                pigz) COMP_FILE="benchmark_data/software.archive-pigz.gz" ;;
+              esac
               ;;
             logs)
-              echo "COMPRESSED_FILE=benchmark_data/logs.txt.gz" >> $GITHUB_ENV
-              echo "ORIGINAL_FILE=benchmark_data/logs.txt" >> $GITHUB_ENV
+              ORIG_FILE="benchmark_data/logs.txt"
+              case "$FORMAT" in
+                gzip) COMP_FILE="benchmark_data/logs.txt.gz" ;;
+                bgzf) COMP_FILE="benchmark_data/logs.txt-bgzf.gz" ;;
+                pigz) COMP_FILE="benchmark_data/logs.txt-pigz.gz" ;;
+              esac
               ;;
           esac
+
+          echo "COMPRESSED_FILE=$COMP_FILE" >> $GITHUB_ENV
+          echo "ORIGINAL_FILE=$ORIG_FILE" >> $GITHUB_ENV
 
       - name: Verify data exists
         run: |
