@@ -2781,245 +2781,165 @@ pub fn decompress_bgzf_parallel<W: Write>(
 // Multi-Member Parallel Decompression (for pigz-style files)
 // ============================================================================
 
-/// Information about a gzip member
-#[derive(Debug, Clone)]
-struct GzipMember {
-    /// Start offset in compressed data
-    start: usize,
-    /// End offset (exclusive) in compressed data
-    end: usize,
-    /// Offset to deflate data within member
-    deflate_offset: usize,
-    /// Uncompressed size (from ISIZE trailer)
-    isize: u32,
-    /// Expected CRC32 from gzip trailer
-    expected_crc32: u32,
-    /// Output offset (calculated during planning)
-    output_offset: usize,
-}
+/// Minimum file size to attempt parallel multi-member decompression.
+/// Below this, sequential is faster due to thread overhead.
+const MIN_PARALLEL_MULTI_MEMBER_SIZE: usize = 1024 * 1024; // 1MB
 
-/// Find all gzip member boundaries in a multi-member file
-/// Uses ISIZE trailer for pre-allocation
-fn find_gzip_members(data: &[u8]) -> Vec<GzipMember> {
-    let mut members = Vec::new();
-    let mut offset = 0;
-    let mut output_offset = 0;
+/// Find the next valid gzip member header at or after `start`.
+/// Validates candidates by attempting a trial decompression with libdeflate.
+/// Returns None if no valid member is found before `limit`.
+fn find_next_member_start(data: &[u8], start: usize, limit: usize) -> Option<usize> {
+    use crate::libdeflate_ext::{DecompressError, DecompressorEx};
 
-    while offset + 18 < data.len() {
-        // Check gzip magic
-        if data[offset] != 0x1f || data[offset + 1] != 0x8b || data[offset + 2] != 0x08 {
-            break;
-        }
+    let end = limit.min(data.len());
+    let mut pos = start;
+    let mut decompressor = DecompressorEx::new();
+    let mut trial_buf = vec![0u8; 64 * 1024];
 
-        // Validate flags (reserved bits must be 0)
-        let flags = data[offset + 3];
-        if flags & 0xe0 != 0 {
-            break;
-        }
-
-        // Calculate deflate start offset
-        let deflate_offset = calculate_deflate_offset(&data[offset..]);
-
-        // Find end of member by trying to decompress and checking trailer
-        // We use a fast scan for the next valid gzip header as an estimate
-        let member_start = offset;
-        let mut member_end = data.len();
-
-        // Search for next gzip header starting after minimum member size
-        let search_start = offset + deflate_offset + 18; // min: deflate + trailer
-        for i in search_start..data.len().saturating_sub(10) {
-            if data[i] == 0x1f && data[i + 1] == 0x8b && data[i + 2] == 0x08 {
-                // Validate this looks like a real header
-                let next_flags = data[i + 3];
-                if next_flags & 0xe0 == 0 {
-                    // XFL should be reasonable
-                    let xfl = data[i + 8];
-                    if xfl == 0 || xfl == 2 || xfl == 4 {
-                        // OS should be known
-                        let os = data[i + 9];
-                        if os <= 13 || os == 255 {
-                            member_end = i;
-                            break;
-                        }
-                    }
+    while pos + 10 <= end {
+        if data[pos] == 0x1f && data[pos + 1] == 0x8b && data[pos + 2] == 0x08 {
+            let flags = data[pos + 3];
+            if flags & 0xe0 == 0 {
+                match decompressor.gzip_decompress_ex(&data[pos..], &mut trial_buf) {
+                    Ok(_) | Err(DecompressError::InsufficientSpace) => return Some(pos),
+                    Err(DecompressError::BadData) => {}
                 }
             }
         }
-
-        // Get CRC32 and ISIZE from trailer (last 8 bytes of member)
-        let (expected_crc32, isize) = if member_end >= member_start + 8 {
-            let trailer_start = member_end - 8;
-            let crc = u32::from_le_bytes([
-                data[trailer_start],
-                data[trailer_start + 1],
-                data[trailer_start + 2],
-                data[trailer_start + 3],
-            ]);
-            let isz = u32::from_le_bytes([
-                data[trailer_start + 4],
-                data[trailer_start + 5],
-                data[trailer_start + 6],
-                data[trailer_start + 7],
-            ]);
-            (crc, isz)
-        } else {
-            (0, 0)
-        };
-
-        members.push(GzipMember {
-            start: member_start,
-            end: member_end,
-            deflate_offset,
-            isize,
-            expected_crc32,
-            output_offset,
-        });
-
-        output_offset += isize as usize;
-        offset = member_end;
+        pos += 1;
     }
-
-    members
+    None
 }
 
-/// Parallel decompression for multi-member gzip files (pigz output)
+/// Decompress a chunk of multi-member gzip data sequentially using libdeflate.
+/// Decompresses all members starting within [chunk_start, chunk_end).
+fn decompress_chunk_sequential(
+    data: &[u8],
+    chunk_start: usize,
+    chunk_end: usize,
+) -> io::Result<Vec<u8>> {
+    use crate::libdeflate_ext::{DecompressError, DecompressorEx};
+
+    let mut decompressor = DecompressorEx::new();
+    let mut output = Vec::new();
+    let mut offset = chunk_start;
+    let mut buf = vec![0u8; 256 * 1024];
+
+    while offset < chunk_end && offset + 10 <= data.len() {
+        if data[offset] != 0x1f || data[offset + 1] != 0x8b {
+            break;
+        }
+
+        let remaining = &data[offset..];
+        loop {
+            match decompressor.gzip_decompress_ex(remaining, &mut buf) {
+                Ok(result) => {
+                    output.extend_from_slice(&buf[..result.output_size]);
+                    offset += result.input_consumed;
+                    break;
+                }
+                Err(DecompressError::InsufficientSpace) => {
+                    buf.resize(buf.len() * 2, 0);
+                }
+                Err(DecompressError::BadData) => {
+                    return if output.is_empty() {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Invalid gzip member data",
+                        ))
+                    } else {
+                        Ok(output)
+                    };
+                }
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Parallel decompression for multi-member gzip files (pigz-style output).
 ///
-/// Strategy:
-/// 1. Find all member boundaries
-/// 2. Read ISIZE from each member's trailer for pre-allocation
-/// 3. Pre-allocate entire output buffer
-/// 4. Decompress members in parallel, writing directly to pre-calculated offsets
+/// Splits the input into N chunks, finds the first valid member boundary in each
+/// chunk via trial decompression, then decompresses all chunks in parallel.
+/// Each chunk is decompressed member-by-member using libdeflate's gzip_decompress_ex
+/// which reliably walks through members via its input_consumed return value.
 pub fn decompress_multi_member_parallel<W: Write>(
     data: &[u8],
     writer: &mut W,
     num_threads: usize,
 ) -> io::Result<u64> {
-    // Find all members
-    let members = find_gzip_members(data);
-
-    if members.is_empty() {
+    if data.len() < 18 || data[0] != 0x1f || data[1] != 0x8b {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "No gzip members found",
+            "Not a gzip file",
         ));
     }
 
-    // For single member, use single-threaded path
-    if members.len() == 1 || num_threads <= 1 {
-        return decompress_single_member(data, writer);
+    if num_threads <= 1 || data.len() < MIN_PARALLEL_MULTI_MEMBER_SIZE {
+        let output = decompress_chunk_sequential(data, 0, data.len())?;
+        let total = output.len() as u64;
+        writer.write_all(&output)?;
+        return Ok(total);
     }
 
-    // Calculate total output size from ISIZE values
-    let total_output: usize = members.iter().map(|m| m.isize as usize).sum();
+    // Find chunk boundaries: split input into N chunks, then find the first
+    // valid member start at or after each chunk boundary.
+    let chunk_size = data.len() / num_threads;
+    let mut boundaries = Vec::with_capacity(num_threads + 1);
+    boundaries.push(0usize);
 
-    // Pre-allocate output buffer
-    let output = vec![0u8; total_output];
-
-    // Parallel decompression
-    let num_members = members.len();
-    let next_member = AtomicUsize::new(0);
-    let had_error = std::sync::atomic::AtomicBool::new(false);
-
-    use std::cell::UnsafeCell;
-    struct OutputBuffer(UnsafeCell<Vec<u8>>);
-    unsafe impl Sync for OutputBuffer {}
-
-    let output_cell = OutputBuffer(UnsafeCell::new(output));
-
-    std::thread::scope(|scope| {
-        for _ in 0..num_threads.min(num_members) {
-            let members_ref = &members;
-            let next_ref = &next_member;
-            let output_ref = &output_cell;
-            let error_ref = &had_error;
-
-            scope.spawn(move || {
-                loop {
-                    let idx = next_ref.fetch_add(1, Ordering::Relaxed);
-                    if idx >= num_members {
-                        break;
-                    }
-
-                    let member = &members_ref[idx];
-                    let member_data = &data[member.start..member.end];
-
-                    // Get deflate data (skip header, exclude trailer)
-                    let deflate_start = member.deflate_offset;
-                    let deflate_end = (member.end - member.start).saturating_sub(8);
-
-                    if deflate_start >= deflate_end {
-                        continue;
-                    }
-
-                    let deflate_data = &member_data[deflate_start..deflate_end];
-
-                    // Get mutable slice for this member's output region
-                    // SAFETY: Each member writes to a disjoint region
-                    let output_ptr = unsafe { (*output_ref.0.get()).as_mut_ptr() };
-                    let out_start = member.output_offset;
-                    let out_size = member.isize as usize;
-
-                    if out_size == 0 {
-                        continue;
-                    }
-
-                    let out_slice = unsafe {
-                        std::slice::from_raw_parts_mut(output_ptr.add(out_start), out_size)
-                    };
-
-                    // Use our optimized pure Rust inflate
-                    match inflate_into(deflate_data, out_slice) {
-                        Ok(actual_size) => {
-                            // Validate CRC32
-                            if member.expected_crc32 != 0 {
-                                let actual_crc = crc32fast::hash(&out_slice[..actual_size]);
-                                if actual_crc != member.expected_crc32 {
-                                    error_ref.store(true, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                        Err(_e) => {
-                            error_ref.store(true, Ordering::Relaxed);
-                        }
-                    }
-                }
-            });
+    for i in 1..num_threads {
+        let target = i * chunk_size;
+        // Search within a generous window for the next member start
+        let search_limit = ((i + 1) * chunk_size).min(data.len());
+        if let Some(boundary) = find_next_member_start(data, target, search_limit) {
+            boundaries.push(boundary);
         }
+    }
+    boundaries.push(data.len());
+
+    // Deduplicate boundaries (can happen if search finds same position)
+    boundaries.dedup();
+
+    let num_chunks = boundaries.len() - 1;
+    if num_chunks <= 1 {
+        let output = decompress_chunk_sequential(data, 0, data.len())?;
+        let total = output.len() as u64;
+        writer.write_all(&output)?;
+        return Ok(total);
+    }
+
+    // Parallel decompress: each thread handles one chunk
+    let chunk_outputs: Vec<io::Result<Vec<u8>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..num_chunks)
+            .map(|i| {
+                let start = boundaries[i];
+                let end = boundaries[i + 1];
+                scope.spawn(move || decompress_chunk_sequential(data, start, end))
+            })
+            .collect();
+
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Check for any errors during decompression
-    if had_error.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "CRC32 mismatch or decompression error in gzip member",
-        ));
+    // Write outputs in order
+    let mut total = 0u64;
+    for result in chunk_outputs {
+        let chunk_output = result?;
+        writer.write_all(&chunk_output)?;
+        total += chunk_output.len() as u64;
     }
 
-    // Get output back and write
-    let output = output_cell.0.into_inner();
-    writer.write_all(&output)?;
-    Ok(output.len() as u64)
+    Ok(total)
 }
 
-/// Single-member decompression (sequential)
+/// Single-member decompression using libdeflate gzip_decompress_ex
 fn decompress_single_member<W: Write>(data: &[u8], writer: &mut W) -> io::Result<u64> {
-    // Parse gzip header to get deflate data and expected size
-    let members = find_gzip_members(data);
-    if members.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid gzip"));
-    }
-    let member = &members[0];
-    let member_data = &data[member.start..member.end];
-    let deflate_start = member.deflate_offset;
-    let deflate_end = (member.end - member.start).saturating_sub(8);
-    let deflate_data = &member_data[deflate_start..deflate_end];
-
-    // Use optimized inflate path
-    let mut output = vec![0u8; member.isize as usize];
-    let size = inflate_into(deflate_data, &mut output)?;
-    output.truncate(size);
+    let output = decompress_chunk_sequential(data, 0, data.len())?;
+    let total = output.len() as u64;
     writer.write_all(&output)?;
-    Ok(size as u64)
+    Ok(total)
 }
 
 // ============================================================================
@@ -3170,12 +3090,31 @@ pub fn decompress_single_member_parallel<W: Write>(
     Ok(out_pos as u64)
 }
 
-/// Check if data is a multi-member gzip file
-/// Note: Currently used internally, may be exposed in future API
+/// Check if data is a multi-member gzip file by attempting to decompress
+/// the first member and checking if more data follows.
 #[allow(dead_code)]
 pub fn is_multi_member(data: &[u8]) -> bool {
-    let members = find_gzip_members(data);
-    members.len() > 1
+    use crate::libdeflate_ext::{DecompressError, DecompressorEx};
+
+    if data.len() < 36 {
+        return false;
+    }
+    let mut decompressor = DecompressorEx::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        match decompressor.gzip_decompress_ex(data, &mut buf) {
+            Ok(result) => {
+                return result.input_consumed < data.len()
+                    && data.len() - result.input_consumed >= 18
+                    && data[result.input_consumed] == 0x1f
+                    && data[result.input_consumed + 1] == 0x8b;
+            }
+            Err(DecompressError::InsufficientSpace) => {
+                buf.resize(buf.len() * 2, 0);
+            }
+            Err(DecompressError::BadData) => return false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4118,10 +4057,7 @@ mod tests {
         multi.extend_from_slice(&compressed2);
         multi.extend_from_slice(&compressed3);
 
-        // Check we detect multiple members
-        let members = find_gzip_members(&multi);
-        eprintln!("Found {} gzip members", members.len());
-        assert_eq!(members.len(), 3, "Should find 3 members");
+        assert!(is_multi_member(&multi), "Should detect multi-member");
 
         // Get expected output
         let mut expected = part1.clone();
@@ -4157,9 +4093,7 @@ mod tests {
             expected.extend_from_slice(&part);
         }
 
-        // Check we detect all members
-        let members = find_gzip_members(&multi);
-        assert_eq!(members.len(), num_members, "Should find all members");
+        assert!(is_multi_member(&multi), "Should detect multi-member");
 
         // Test parallel decompressor
         let mut output = Vec::new();
