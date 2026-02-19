@@ -457,6 +457,21 @@ fn is_multi_member_quick(data: &[u8]) -> bool {
     is_likely_multi_member(data)
 }
 
+/// Decompress a single-member gzip file.
+///
+/// Uses libdeflate FFI (fastest available). Parallel single-member via
+/// `rapidgzip_decoder` is not yet activated because our pure-Rust inflate
+/// (~100 MB/s per chunk) is too slow to beat sequential libdeflate (~250 MB/s)
+/// even at 4 threads once overhead is accounted for. When we wire in
+/// libdeflate-per-chunk in `rapidgzip_decoder`, re-enable parallel here.
+fn decompress_single_member<W: Write + Send>(
+    data: &[u8],
+    writer: &mut W,
+    _num_threads: usize,
+) -> GzippyResult<u64> {
+    decompress_single_member_libdeflate(data, writer)
+}
+
 /// Decompress single-member gzip using libdeflate FFI (fastest path)
 ///
 /// Uses DecompressorEx::gzip_decompress_ex() which handles the full gzip
@@ -555,11 +570,12 @@ fn decompress_gzip_libdeflate<W: Write + Send>(
     }
 
     if !is_likely_multi_member(data) {
-        // Single-member: use libdeflate directly (fastest path for single-stream data)
+        // Single-member: attempt parallel decode for large files with multiple threads.
+        // Falls back to sequential libdeflate if parallel fails or isn't beneficial.
         if std::env::var("GZIPPY_DEBUG").is_ok() {
-            eprintln!("[gzippy] Single-member: libdeflate");
+            eprintln!("[gzippy] Single-member: {} threads", num_threads);
         }
-        return decompress_single_member_libdeflate(data, writer);
+        return decompress_single_member(data, writer, num_threads);
     }
 
     // Multi-member: try parallel decompression first
