@@ -1,0 +1,117 @@
+---
+description: CI performance analysis and strategy for beating all tools (Feb 2026)
+alwaysApply: true
+---
+
+# Performance Analysis & Strategy (Feb 2026)
+
+## Tooling
+
+Use `gzippy-dev` (built at `tools/devtool/`) for all CI and perf work:
+```bash
+./gzippy-dev ci status              # Recent CI runs
+./gzippy-dev ci watch               # Block until CI completes, show results
+./gzippy-dev ci gaps --branch main  # Performance gap analysis
+./gzippy-dev bench --dataset NAME   # Local benchmark
+./gzippy-dev path file.gz           # Trace decompression path
+```
+
+## CI Benchmark Architecture
+
+**Platforms**: x86_64 (EPYC 4-core), arm64 (Graviton 4-core)
+**Datasets**: silesia (211MB), software (~22MB), logs (~22MB)
+**Archive types**: gzip (single-member), bgzf (gzippy format), pigz (single-member!)
+**Thread configs**: T1, Tmax (4)
+
+## Critical Discovery: pigz Output Is Single-Member
+
+`pigz -1 -c` creates a **single gzip stream** with independent blocks inside, NOT
+multiple concatenated gzip members. All Tmax gaps on pigz files are
+**single-member parallel** problems, identical to the gzip gaps.
+
+## Where We Win (Compression)
+
+Compression is dominant. gzippy beats pigz by 1.5-2.5x at all levels/threads/platforms.
+Only gap: x86 L1 T1 vs igzip (ISA-L hand-written AVX2) is 12% slower.
+
+## Where We Lose (Decompression) — Latest CI Data
+
+### ARM64 Gaps (the major problem)
+
+| Gap | Scenario | Root Cause |
+|-----|----------|------------|
+| -24.5% | software-gzip T1 vs pigz | libdeflate FFI overhead for small decompression |
+| -21.7% | logs-bgzf T1 vs rapidgzip | BGZF detection overhead hurts T1 |
+| -20.3% | logs-gzip Tmax vs pigz/rapidgzip | No single-member parallel |
+| -16.5% | silesia-gzip Tmax vs rapidgzip | No single-member parallel |
+| -14.1% | silesia-pigz Tmax vs rapidgzip | No single-member parallel |
+| -7% to -3% | Various T1/Tmax vs pigz | General inflate throughput |
+
+### x86_64 Gaps (mostly small)
+
+| Gap | Scenario | Root Cause |
+|-----|----------|------------|
+| -21.0% | silesia-pigz Tmax vs rapidgzip | No single-member parallel |
+| -19.6% | silesia-gzip Tmax vs rapidgzip | No single-member parallel |
+| -6.5% | silesia-bgzf Tmax vs rapidgzip | BGZF parallel inefficiency |
+| -4.9% | silesia-bgzf T1 vs igzip | ISA-L hand-tuned assembly |
+| <3% | Everything else | Noise |
+
+## Gap Categories
+
+### Category A: ARM64 T1 decompression (24% gap, highest priority)
+gzippy is 20-25% slower than pigz/rapidgzip on ARM64 at T1 for ALL archive types.
+This is the single largest systemic gap. pigz and rapidgzip don't even parallelize
+at T1 — they're just faster at sequential inflate on ARM64.
+
+Hypothesis: libdeflate FFI call overhead, buffer allocation, or ISIZE-based
+pre-allocation is adding latency that dwarfs the actual inflate time for small files.
+
+### Category B: Tmax single-member parallel (19-21% gap)
+rapidgzip speculatively parallelizes single-member files. We don't.
+This affects silesia-gzip/pigz on both platforms at Tmax.
+
+### Category C: BGZF T1 overhead (4-22% gap on ARM64)
+Even at T1, BGZF path is slower than competitors because the parallel detection
+and BGZF header parsing adds overhead for single-threaded decompression.
+
+## Strategy
+
+### Phase 1: Fix ARM64 T1 (biggest systemic gap)
+- Profile where time goes: header parsing? buffer allocation? FFI overhead?
+- Add fast-path that skips parallel detection for small files or T1
+- For BGZF T1: bypass block parsing, use sequential inflate directly
+
+### Phase 2: Speculative parallel decompression
+- This is in progress (`speculative_parallel.rs`) but has stability issues
+- Key challenges: false-positive block finding in compressed data
+- Consider whether the 4-core CI environment even benefits enough from
+  speculative parallel to justify the complexity
+
+### Phase 3: Close BGZF Tmax gap vs rapidgzip
+- Currently 6.5% behind on x86 — investigate decompressor allocation
+  and thread scheduling overhead
+
+## Production Code Paths
+
+**Compression**: libdeflate (L1-L5, L10-L12), zlib-ng (L6-L9)
+**Decompression**:
+1. BGZF → `bgzf::decompress_bgzf_parallel` → libdeflate FFI
+2. Multi-member → `bgzf::decompress_multi_member_parallel` → libdeflate FFI
+3. Single-member → `decompression::decompress_single_member_libdeflate` → libdeflate FFI
+4. Single-member (WIP) → `speculative_parallel::decompress_speculative` → pure Rust
+
+## What Has Been Tried and FAILED for Single-Member Parallel
+
+- **Two-pass parallel**: Correct but slower. Scan pass costs as much as a full decode.
+- **Prefix-overlap (PR #45)**: Window convergence fails at high thread counts.
+- **rapidgzip_decoder**: Early attempt, removed.
+- **Circular-buffer scan**: Custom decode logic had subtle table construction bugs.
+
+## Implementation Lessons
+
+- NEVER reimplement decode logic; wrap existing proven functions
+- Simulation benchmarks lie — only full-file benchmarks count
+- One change at a time, benchmark before/after, revert on regression
+- ISA-L's advantage is hand-tuned assembly; we can't beat it with Rust alone
+  on the same algorithm, but we can beat it with parallelism

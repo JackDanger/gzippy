@@ -38,3 +38,9 @@ __pycache__/
 
 # Local settings
 .claude
+
+# Dev tool symlink (built binary)
+/gzippy-dev
+
+# Debug output
+gzippy_debug.txt
