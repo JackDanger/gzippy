@@ -284,12 +284,8 @@ struct BgzfBlock {
     start: usize,
     /// Total block length (including header and trailer)
     length: usize,
-    /// Offset into deflate data (after header)
-    deflate_offset: usize,
     /// Uncompressed size (from ISIZE trailer)
     isize: u32,
-    /// Expected CRC32 from gzip trailer
-    expected_crc32: u32,
     /// Output offset (calculated during planning)
     output_offset: usize,
 }
@@ -361,35 +357,23 @@ fn parse_bgzf_blocks(data: &[u8]) -> io::Result<Vec<BgzfBlock>> {
             _ => break,
         };
 
-        // Calculate deflate data offset (after header)
-        let deflate_offset = calculate_deflate_offset(&data[offset..offset + length]);
-
-        // Get CRC32 and ISIZE from trailer (last 8 bytes: 4 CRC32 + 4 ISIZE)
-        let (expected_crc32, isize) = if length >= 8 {
-            let trailer_start = offset + length - 8;
-            let crc = u32::from_le_bytes([
+        // Read ISIZE from trailer (last 4 bytes of block)
+        let isize = if length >= 8 {
+            let trailer_start = offset + length - 4;
+            u32::from_le_bytes([
                 data[trailer_start],
                 data[trailer_start + 1],
                 data[trailer_start + 2],
                 data[trailer_start + 3],
-            ]);
-            let isz = u32::from_le_bytes([
-                data[trailer_start + 4],
-                data[trailer_start + 5],
-                data[trailer_start + 6],
-                data[trailer_start + 7],
-            ]);
-            (crc, isz)
+            ])
         } else {
-            (0, 0)
+            0
         };
 
         blocks.push(BgzfBlock {
             start: offset,
             length,
-            deflate_offset,
             isize,
-            expected_crc32,
             output_offset,
         });
 
@@ -405,45 +389,6 @@ fn parse_bgzf_blocks(data: &[u8]) -> io::Result<Vec<BgzfBlock>> {
     }
 
     Ok(blocks)
-}
-
-/// Calculate offset to deflate data within a gzip block
-fn calculate_deflate_offset(block: &[u8]) -> usize {
-    if block.len() < 10 {
-        return block.len();
-    }
-
-    let flags = block[3];
-    let mut offset = 10;
-
-    // FEXTRA
-    if flags & 0x04 != 0 && offset + 2 <= block.len() {
-        let xlen = u16::from_le_bytes([block[offset], block[offset + 1]]) as usize;
-        offset += 2 + xlen;
-    }
-
-    // FNAME
-    if flags & 0x08 != 0 {
-        while offset < block.len() && block[offset] != 0 {
-            offset += 1;
-        }
-        offset += 1;
-    }
-
-    // FCOMMENT
-    if flags & 0x10 != 0 {
-        while offset < block.len() && block[offset] != 0 {
-            offset += 1;
-        }
-        offset += 1;
-    }
-
-    // FHCRC
-    if flags & 0x02 != 0 {
-        offset += 2;
-    }
-
-    offset.min(block.len())
 }
 
 /// Inflate directly into a pre-allocated output slice
@@ -2659,37 +2604,25 @@ pub fn copy_match_into(output: &mut [u8], out_pos: usize, distance: usize, lengt
     out_pos + length
 }
 
-/// Parallel BGZF decompression - the main entry point
+/// Parallel BGZF decompression returning output as a Vec.
 ///
-/// This achieves maximum parallelism by:
-/// 1. Pre-allocating entire output based on ISIZE values
-/// 2. Computing output offsets during parsing phase
-/// 3. Writing directly to disjoint regions (no locks needed)
-/// 4. Using our fast CombinedLUT inflate (10700+ MB/s single-threaded)
-pub fn decompress_bgzf_parallel<W: Write>(
-    data: &[u8],
-    writer: &mut W,
-    num_threads: usize,
-) -> io::Result<u64> {
-    // Parse all BGZF blocks
+/// This is the zero-copy path: the output Vec is filled in-place by
+/// parallel threads, then returned directly to the caller without any
+/// intermediate copies.
+pub fn decompress_bgzf_parallel_to_vec(data: &[u8], num_threads: usize) -> io::Result<Vec<u8>> {
     let blocks = parse_bgzf_blocks(data)?;
 
     if blocks.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
-    // Calculate total output size
     let total_output: usize = blocks.iter().map(|b| b.isize as usize).sum();
-
-    // Pre-allocate output buffer
     let output = vec![0u8; total_output];
 
-    // Parallel decompression using scoped threads
     let num_blocks = blocks.len();
     let next_block = AtomicUsize::new(0);
     let had_error = std::sync::atomic::AtomicBool::new(false);
 
-    // Use UnsafeCell for parallel mutable access to disjoint regions
     use std::cell::UnsafeCell;
     struct OutputBuffer(UnsafeCell<Vec<u8>>);
     unsafe impl Sync for OutputBuffer {}
@@ -2704,6 +2637,9 @@ pub fn decompress_bgzf_parallel<W: Write>(
             let error_ref = &had_error;
 
             scope.spawn(move || {
+                use crate::libdeflate_ext::DecompressorEx;
+                let mut decompressor = DecompressorEx::new();
+
                 loop {
                     let idx = next_ref.fetch_add(1, Ordering::Relaxed);
                     if idx >= num_blocks {
@@ -2713,17 +2649,6 @@ pub fn decompress_bgzf_parallel<W: Write>(
                     let block = &blocks_ref[idx];
                     let block_data = &data[block.start..block.start + block.length];
 
-                    // Get deflate data (skip header, exclude trailer)
-                    let deflate_start = block.deflate_offset;
-                    let deflate_end = block.length.saturating_sub(8);
-
-                    if deflate_start >= deflate_end {
-                        continue;
-                    }
-
-                    let deflate_data = &block_data[deflate_start..deflate_end];
-
-                    // Get mutable slice for this block's output region
                     // SAFETY: Each block writes to a disjoint region
                     let output_ptr = unsafe { (*output_ref.0.get()).as_mut_ptr() };
                     let out_start = block.output_offset;
@@ -2732,30 +2657,14 @@ pub fn decompress_bgzf_parallel<W: Write>(
                         std::slice::from_raw_parts_mut(output_ptr.add(out_start), out_size)
                     };
 
-                    // Use our pure Rust consume_first decoder - NO LIBDEFLATE!
-                    match inflate_into(deflate_data, out_slice) {
-                        Ok(actual_size) => {
-                            // Validate ISIZE
-                            if actual_size != out_size {
+                    match decompressor.gzip_decompress_ex(block_data, out_slice) {
+                        Ok(result) => {
+                            if result.output_size != out_size {
                                 error_ref.store(true, Ordering::Relaxed);
                             }
-                            // Validate CRC32
-                            if block.expected_crc32 != 0 {
-                                let actual_crc = crc32fast::hash(&out_slice[..actual_size]);
-                                if actual_crc != block.expected_crc32 {
-                                    error_ref.store(true, Ordering::Relaxed);
-                                }
-                            }
                         }
-                        Err(e) => {
+                        Err(_) => {
                             error_ref.store(true, Ordering::Relaxed);
-                            eprintln!(
-                                "Block {} failed: {:?} deflate_len={} out_size={}",
-                                idx,
-                                e,
-                                deflate_data.len(),
-                                out_size
-                            );
                         }
                     }
                 }
@@ -2763,7 +2672,6 @@ pub fn decompress_bgzf_parallel<W: Write>(
         }
     });
 
-    // Check for any errors during decompression
     if had_error.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2771,10 +2679,23 @@ pub fn decompress_bgzf_parallel<W: Write>(
         ));
     }
 
-    // Get output back and write
-    let output = output_cell.0.into_inner();
+    Ok(output_cell.0.into_inner())
+}
+
+/// Parallel BGZF decompression writing to a generic writer.
+///
+/// Delegates to `decompress_bgzf_parallel_to_vec` then writes the result.
+/// For callers that need zero-copy (e.g. stdout), call the `_to_vec`
+/// variant directly.
+pub fn decompress_bgzf_parallel<W: Write>(
+    data: &[u8],
+    writer: &mut W,
+    num_threads: usize,
+) -> io::Result<u64> {
+    let output = decompress_bgzf_parallel_to_vec(data, num_threads)?;
+    let len = output.len() as u64;
     writer.write_all(&output)?;
-    Ok(output.len() as u64)
+    Ok(len)
 }
 
 // ============================================================================

@@ -159,15 +159,10 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             && (has_bgzf_markers(&mmap) || is_likely_multi_member(&mmap));
 
         let size = if can_parallelize {
-            let mut buffer = Vec::new();
-            let result = decompress_mmap_libdeflate(&mmap, &mut buffer, format, args.processes);
-            match result {
-                Ok(size) => {
-                    writer.write_all(&buffer)?;
-                    Ok(size)
-                }
-                Err(e) => Err(e),
-            }
+            let output = decompress_gzip_to_vec(&mmap[..], args.processes)?;
+            let len = output.len() as u64;
+            writer.write_all(&output)?;
+            Ok(len)
         } else {
             match format {
                 CompressionFormat::Gzip | CompressionFormat::Zip => {
@@ -282,9 +277,8 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
                 && (has_bgzf_markers(&input_data) || is_likely_multi_member(&input_data));
 
             if can_parallelize {
-                let mut output_buffer = Vec::new();
-                decompress_gzip_libdeflate(&input_data, &mut output_buffer, args.processes)?;
-                writer.write_all(&output_buffer)?;
+                let output = decompress_gzip_to_vec(&input_data, args.processes)?;
+                writer.write_all(&output)?;
             } else {
                 decompress_multi_member_sequential(&input_data, &mut writer)?;
             }
@@ -544,6 +538,42 @@ pub fn decompress_gzip_to_writer<W: Write + Send>(
     decompress_gzip_libdeflate(data, writer, num_threads)
 }
 
+/// Decompress gzip to a Vec, returning the output directly.
+///
+/// For BGZF data, uses the zero-copy parallel path that avoids intermediate
+/// buffer copies. For other formats, decompresses into a Vec via Write trait.
+fn decompress_gzip_to_vec(data: &[u8], num_threads: usize) -> GzippyResult<Vec<u8>> {
+    if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
+        return Ok(Vec::new());
+    }
+
+    // BGZF: use zero-copy parallel path (output Vec filled in-place, no copies)
+    if has_bgzf_markers(data) {
+        match crate::bgzf::decompress_bgzf_parallel_to_vec(data, num_threads) {
+            Ok(output) => {
+                if std::env::var("GZIPPY_DEBUG").is_ok() {
+                    eprintln!(
+                        "[gzippy] BGZF parallel: {} bytes, {} threads",
+                        output.len(),
+                        num_threads
+                    );
+                }
+                return Ok(output);
+            }
+            Err(e) => {
+                if std::env::var("GZIPPY_DEBUG").is_ok() {
+                    eprintln!("[gzippy] BGZF parallel failed: {}, trying fallback", e);
+                }
+            }
+        }
+    }
+
+    // For non-BGZF formats, fall back to the Write-based API with a Vec
+    let mut output = Vec::new();
+    decompress_gzip_libdeflate(data, &mut output, num_threads)?;
+    Ok(output)
+}
+
 /// Decompress gzip - chooses optimal strategy based on content.
 ///
 /// All paths use libdeflate C FFI for maximum decompression speed.
@@ -553,9 +583,6 @@ pub fn decompress_gzip_to_writer<W: Write + Send>(
 /// 2. Multi-member (pigz-style): parallel libdeflate per member
 /// 3. Single member: libdeflate gzip_decompress_ex (sequential)
 /// 4. Sequential fallback: libdeflate member-by-member
-///
-/// Future: Phase 2 of BEAT_EVERYTHING_PLAN.md will add two-pass parallel
-/// decompression for single-member files at step 3.
 fn decompress_gzip_libdeflate<W: Write + Send>(
     data: &[u8],
     writer: &mut W,
@@ -589,8 +616,6 @@ fn decompress_gzip_libdeflate<W: Write + Send>(
     }
 
     if !is_likely_multi_member(data) {
-        // Single-member: attempt parallel decode for large files with multiple threads.
-        // Falls back to sequential libdeflate if parallel fails or isn't beneficial.
         if std::env::var("GZIPPY_DEBUG").is_ok() {
             eprintln!("[gzippy] Single-member: {} threads", num_threads);
         }
@@ -797,6 +822,9 @@ fn decompress_bgzf_parallel_prefetch<W: Write>(data: &[u8], writer: &mut W) -> G
         // Spawn worker threads with prefetching
         for _ in 0..num_threads {
             scope.spawn(|| {
+                use crate::libdeflate_ext::DecompressorEx;
+                let mut decompressor = DecompressorEx::new();
+
                 loop {
                     let idx = next_block.fetch_add(1, Ordering::Relaxed);
                     if idx >= num_blocks {
@@ -808,7 +836,6 @@ fn decompress_bgzf_parallel_prefetch<W: Write>(data: &[u8], writer: &mut W) -> G
                         let future_idx = idx + prefetch_idx;
                         if future_idx < num_blocks {
                             let (future_start, future_len) = blocks[future_idx];
-                            // Prefetch start and middle of block
                             prefetch_memory(&data[future_start..future_start + future_len.min(64)]);
                             if future_len > 4096 {
                                 prefetch_memory(
@@ -822,26 +849,20 @@ fn decompress_bgzf_parallel_prefetch<W: Write>(data: &[u8], writer: &mut W) -> G
                     let (start, len) = blocks[idx];
                     let block_data = &data[start..start + len];
 
-                    // Use our turbo inflate
                     let output = unsafe { &mut *slots[idx].data.get() };
                     output.clear();
 
-                    // Parse gzip header to get deflate data
-                    if let Some(header_size) = parse_gzip_header_size(block_data) {
-                        let deflate_end = len.saturating_sub(8); // Exclude trailer
-                        if header_size < deflate_end {
-                            let deflate_data = &block_data[header_size..deflate_end];
-                            let initial_size = output.capacity().max(64 * 1024);
-                            output.resize(initial_size, 0);
+                    // Each BGZF block is a complete gzip member.
+                    // Use gzip_decompress_ex which handles header + deflate + CRC32.
+                    let initial_size = output.capacity().max(64 * 1024);
+                    output.resize(initial_size, 0);
 
-                            match crate::bgzf::inflate_into_pub(deflate_data, output) {
-                                Ok(size) => {
-                                    output.truncate(size);
-                                }
-                                Err(_) => {
-                                    output.clear();
-                                }
-                            }
+                    match decompressor.gzip_decompress_ex(block_data, output) {
+                        Ok(result) => {
+                            output.truncate(result.output_size);
+                        }
+                        Err(_) => {
+                            output.clear();
                         }
                     }
 
