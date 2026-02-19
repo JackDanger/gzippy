@@ -1139,15 +1139,6 @@ mod tests {
         }
         let ultra_time = start.elapsed();
 
-        // Benchmark turbo implementation
-        let start = std::time::Instant::now();
-        for _ in 0..ITERS {
-            let mut output = Vec::with_capacity(original.len());
-            crate::turbo_inflate::inflate_gzip_turbo(&compressed, &mut output).unwrap();
-            std::hint::black_box(&output);
-        }
-        let turbo_time = start.elapsed();
-
         // Benchmark libdeflate
         let mut decompressor = libdeflater::Decompressor::new();
         let start = std::time::Instant::now();
@@ -1161,11 +1152,9 @@ mod tests {
         let libdeflate_time = start.elapsed();
 
         let ultra_avg = ultra_time / ITERS as u32;
-        let turbo_avg = turbo_time / ITERS as u32;
         let libdeflate_avg = libdeflate_time / ITERS as u32;
 
         let ultra_mbps = 1_000_000.0 / ultra_avg.as_secs_f64() / 1_000_000.0;
-        let turbo_mbps = 1_000_000.0 / turbo_avg.as_secs_f64() / 1_000_000.0;
         let libdeflate_mbps = 1_000_000.0 / libdeflate_avg.as_secs_f64() / 1_000_000.0;
 
         println!(
@@ -1175,10 +1164,6 @@ mod tests {
         println!(
             "Ultra-fast:  {:>8?}/iter  ({:.0} MB/s)",
             ultra_avg, ultra_mbps
-        );
-        println!(
-            "Turbo:       {:>8?}/iter  ({:.0} MB/s)",
-            turbo_avg, turbo_mbps
         );
         println!(
             "libdeflate:  {:>8?}/iter  ({:.0} MB/s)",
@@ -1202,10 +1187,6 @@ mod tests {
         println!(
             "Ultra vs libdeflate: {:.2}x",
             ultra_avg.as_secs_f64() / libdeflate_avg.as_secs_f64()
-        );
-        println!(
-            "Ultra vs turbo:      {:.2}x",
-            ultra_avg.as_secs_f64() / turbo_avg.as_secs_f64()
         );
     }
 }
