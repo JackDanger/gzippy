@@ -459,11 +459,17 @@ fn is_multi_member_quick(data: &[u8]) -> bool {
 
 /// Decompress a single-member gzip file.
 ///
-/// Uses libdeflate FFI (fastest available). Parallel single-member via
-/// `rapidgzip_decoder` is not yet activated because our pure-Rust inflate
-/// (~100 MB/s per chunk) is too slow to beat sequential libdeflate (~250 MB/s)
-/// even at 4 threads once overhead is accounted for. When we wire in
-/// libdeflate-per-chunk in `rapidgzip_decoder`, re-enable parallel here.
+/// Uses sequential libdeflate FFI (fastest available for single-member files).
+///
+/// Parallel single-member decompression (two_pass_parallel) is not yet activated
+/// because:
+/// 1. Our pure-Rust inflate (~400 MB/s on complex data) is slower than sequential
+///    libdeflate (~1400 MB/s), so parallelism doesn't overcome the per-thread gap.
+/// 2. The prefix-overlap strategy has correctness issues for > 4 threads (small chunks
+///    have cross-boundary back-references that corrupt the window).
+///
+/// When these are resolved (e.g., by using libdeflate-per-chunk or marker-based
+/// decoding), re-enable parallel here.
 fn decompress_single_member<W: Write + Send>(
     data: &[u8],
     writer: &mut W,
@@ -527,16 +533,13 @@ pub fn decompress_gzip_to_writer<W: Write + Send>(
 
 /// Decompress gzip - chooses optimal strategy based on content.
 ///
-/// All paths use libdeflate C FFI for maximum decompression speed.
+/// All single-member paths use libdeflate C FFI for maximum decompression speed.
 ///
 /// Strategies (in order of preference):
 /// 1. BGZF-style (gzippy output): parallel libdeflate using embedded block sizes
 /// 2. Multi-member (pigz-style): parallel libdeflate per member
-/// 3. Single member: libdeflate gzip_decompress_ex (sequential)
+/// 3. Single member: sequential libdeflate FFI
 /// 4. Sequential fallback: libdeflate member-by-member
-///
-/// Future: Phase 2 of BEAT_EVERYTHING_PLAN.md will add two-pass parallel
-/// decompression for single-member files at step 3.
 fn decompress_gzip_libdeflate<W: Write + Send>(
     data: &[u8],
     writer: &mut W,

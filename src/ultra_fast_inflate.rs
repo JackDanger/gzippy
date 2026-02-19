@@ -167,6 +167,20 @@ fn decode_dynamic_block(bits: &mut FastBits, output: &mut Vec<u8>) -> io::Result
 /// This prevents infinite loops on malformed data
 const MAX_OUTPUT_SIZE: usize = 1024 * 1024 * 1024;
 
+use std::cell::Cell;
+thread_local! {
+    /// Per-call output limit for `decode_huffman_block`. Defaults to MAX_OUTPUT_SIZE (1GB).
+    /// Set to a smaller value for trial decodes to prevent multi-second hangs on
+    /// false-positive split points that generate huge blocks of garbage output.
+    static BLOCK_OUTPUT_LIMIT: Cell<usize> = const { Cell::new(MAX_OUTPUT_SIZE) };
+}
+
+/// Set the per-block output limit for the current thread. Call before inflate functions.
+/// Restore to `MAX_OUTPUT_SIZE` when done.
+pub fn set_block_output_limit(limit: usize) {
+    BLOCK_OUTPUT_LIMIT.with(|c| c.set(limit));
+}
+
 #[inline(never)]
 fn decode_huffman_block(
     bits: &mut FastBits,
@@ -179,12 +193,14 @@ fn decode_huffman_block(
     output.reserve(256 * 1024);
     let start_len = output.len();
 
+    let block_limit = BLOCK_OUTPUT_LIMIT.with(|c| c.get());
+
     loop {
-        // Safety check: prevent infinite loops on corrupted data
-        if output.len() - start_len > MAX_OUTPUT_SIZE {
+        // Safety check: prevent infinite loops on corrupted data (limit configurable for trial decodes)
+        if output.len() - start_len > block_limit {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Output size exceeded maximum limit (corrupted stream?)",
+                "Output size exceeded block limit (corrupted stream or trial abort)",
             ));
         }
         // Ensure enough bits for multiple literals + length/distance
@@ -668,6 +684,164 @@ pub fn inflate_with_dictionary(
     output.extend_from_slice(&new_data);
 
     Ok(new_data.len())
+}
+
+/// Inflate from a bit offset with an optional seed window and output limit.
+///
+/// Used by `two_pass_parallel` to correct chunk boundaries after speculative decode:
+/// - `deflate_data`: the full deflate stream (NOT just the chunk)
+/// - `bit_offset`: bit position where this chunk's decode begins (from block_finder)
+/// - `window`: up to 32768 bytes of output from the previous chunk (the LZ77 back-ref window)
+/// - `max_output`: stop after producing this many bytes (0 = no limit, decode all blocks)
+///
+/// Returns: the decoded bytes (not including the seed window).
+pub fn inflate_from_bit_offset_with_window(
+    deflate_data: &[u8],
+    bit_offset: usize,
+    window: &[u8],
+    max_output: usize,
+) -> io::Result<Vec<u8>> {
+    let dict_len = window.len().min(32768);
+    let dict = &window[window.len() - dict_len..];
+
+    // Pre-allocate: window + expected output
+    let capacity = dict_len + max_output.max(64 * 1024);
+    let mut output: Vec<u8> = Vec::with_capacity(capacity);
+    output.extend_from_slice(dict);
+    let output_start = output.len();
+
+    let mut bits = FastBits::new_at_bit(deflate_data, bit_offset);
+
+    loop {
+        bits.refill();
+        if bits.is_overread() {
+            break;
+        }
+
+        let bfinal = bits.read(1);
+        let btype = bits.read(2);
+
+        match btype {
+            0 => decode_stored_block(&mut bits, &mut output)?,
+            1 => decode_fixed_block(&mut bits, &mut output)?,
+            2 => decode_dynamic_block(&mut bits, &mut output)?,
+            3 => break, // invalid, stop
+            _ => unreachable!(),
+        }
+
+        let new_bytes = output.len() - output_start;
+        if max_output > 0 && new_bytes >= max_output {
+            break;
+        }
+
+        if bfinal == 1 {
+            break;
+        }
+    }
+
+    // Return only the newly decoded bytes (not the seed window)
+    Ok(output[output_start..].to_vec())
+}
+
+/// Inflate from a bit offset with a seed window.
+///
+/// Decodes complete deflate blocks starting from `start_bit`.
+/// - Stops DECODING after the block that first passes `actual_stop_bit`.
+/// - Sets `prefix_output_len` = bytes produced before crossing `prefix_stop_bit`.
+///
+/// This enables prefix-overlap parallel decompression:
+///   Thread i: start=split[i-1], prefix_stop=split[i], actual_stop=split[i+1]
+///   - Decodes prefix [split[i-1]..split[i]] + actual [split[i]..split[i+1]]
+///   - prefix_output_len = bytes from the prefix (discard these)
+///   - remaining bytes = actual chunk output (correct, because prefix filled the window)
+///
+/// Returns: (output_bytes, prefix_output_len)
+/// where output[prefix_output_len..] is the actual chunk data.
+pub fn inflate_with_prefix_overlap(
+    deflate_data: &[u8],
+    start_bit: usize,
+    prefix_stop_bit: usize, // absolute bit position where prefix ends / actual chunk begins
+    actual_stop_bit: usize, // absolute bit position where actual chunk ends (stop decoding here)
+    window: &[u8],
+) -> io::Result<(Vec<u8>, usize)> {
+    inflate_with_prefix_overlap_limited(
+        deflate_data,
+        start_bit,
+        prefix_stop_bit,
+        actual_stop_bit,
+        window,
+        0,
+    )
+}
+
+/// Like `inflate_with_prefix_overlap` but with an additional per-call output byte cap.
+/// When `max_output_bytes > 0` and output exceeds that many bytes, returns early with Ok.
+/// Used by trial decodes to avoid multi-second hangs on false-positive split points.
+pub fn inflate_with_prefix_overlap_limited(
+    deflate_data: &[u8],
+    start_bit: usize,
+    prefix_stop_bit: usize,
+    actual_stop_bit: usize,
+    window: &[u8],
+    max_output_bytes: usize,
+) -> io::Result<(Vec<u8>, usize)> {
+    let dict_len = window.len().min(32768);
+    let dict = &window[window.len() - dict_len..];
+
+    let mut output: Vec<u8> = Vec::with_capacity(dict_len + 256 * 1024);
+    output.extend_from_slice(dict);
+    let output_start = output.len();
+
+    let mut bits = FastBits::new_at_bit(deflate_data, start_bit);
+    // When prefix_stop_bit == start_bit there is no prefix (thread 0 / thread with empty prefix).
+    // Pre-set prefix_output_len to 0 so all decoded output is treated as "actual".
+    let mut prefix_output_len: Option<usize> = if prefix_stop_bit == start_bit {
+        Some(0)
+    } else {
+        None
+    };
+
+    loop {
+        bits.refill();
+        if bits.is_overread() {
+            break;
+        }
+
+        let bfinal = bits.read(1);
+        let btype = bits.read(2);
+
+        // Early-exit if we've already exceeded the per-call output cap (trial decode guard).
+        if max_output_bytes > 0 && output.len() - output_start >= max_output_bytes {
+            break;
+        }
+
+        match btype {
+            0 => decode_stored_block(&mut bits, &mut output)?,
+            1 => decode_fixed_block(&mut bits, &mut output)?,
+            2 => decode_dynamic_block(&mut bits, &mut output)?,
+            3 => break,
+            _ => unreachable!(),
+        }
+
+        // Check if we've crossed the prefix boundary (AFTER decoding the block)
+        if prefix_output_len.is_none() && bits.consumed_bits() >= prefix_stop_bit {
+            prefix_output_len = Some(output.len() - output_start);
+        }
+
+        if bfinal == 1 {
+            break;
+        }
+
+        // Stop decoding when we've passed the actual stop position (AFTER completing a block)
+        if bits.consumed_bits() >= actual_stop_bit {
+            break;
+        }
+    }
+
+    let new_bytes = output[output_start..].to_vec();
+    let prefix_len = prefix_output_len.unwrap_or(new_bytes.len());
+
+    Ok((new_bytes, prefix_len))
 }
 
 /// Ultra-fast gzip inflate

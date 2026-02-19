@@ -50,6 +50,7 @@ mod specialized_decode;
 mod thread_pool;
 mod turbo_inflate;
 mod two_level_table;
+mod two_pass_parallel;
 mod ultra_fast_inflate;
 mod ultra_inflate;
 mod utils;

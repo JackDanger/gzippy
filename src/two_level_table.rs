@@ -298,6 +298,28 @@ impl<'a> FastBits<'a> {
         fb
     }
 
+    /// Create a FastBits reader starting at a specific bit offset.
+    /// Used by two_pass_parallel to decode chunks from mid-stream positions.
+    #[inline]
+    pub fn new_at_bit(data: &'a [u8], bit_offset: usize) -> Self {
+        let byte_pos = bit_offset / 8;
+        let bit_skip = (bit_offset % 8) as u32;
+        let mut fb = Self {
+            data,
+            pos: byte_pos,
+            buf: 0,
+            bits: 0,
+            overread_count: 0,
+        };
+        fb.refill();
+        // Skip the sub-byte bit offset within the first byte
+        if bit_skip > 0 {
+            fb.buf >>= bit_skip;
+            fb.bits = fb.bits.saturating_sub(bit_skip);
+        }
+        fb
+    }
+
     /// Refill to 56+ bits using optimized technique from libdeflate
     /// When input exhausts, we track implicit zero bytes like libdeflate
     #[inline(always)]
@@ -329,6 +351,13 @@ impl<'a> FastBits<'a> {
                 self.bits += 8;
             }
         }
+    }
+
+    /// Return the logical bit position consumed so far (relative to data start).
+    /// Accounts for read-ahead: actual consumed position = bytes_loaded × 8 - bits_in_buffer.
+    #[inline(always)]
+    pub fn consumed_bits(&self) -> usize {
+        self.pos * 8 - self.bits as usize
     }
 
     /// Check if the stream has been overread (input exhausted and too many zeros consumed)
