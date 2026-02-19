@@ -1,0 +1,44 @@
+---
+description: Lessons from implementing parallel single-member gzip decompression
+alwaysApply: true
+---
+
+# Parallel Single-Member Gzip: Key Lessons (Feb 2026)
+
+## Why Prefix-Overlap Doesn't Beat Sequential Libdeflate
+
+The `two_pass_parallel` module (PR #45) implements prefix-overlap parallel decoding:
+- Thread i decodes `split[i-1]..split[i+1]`, discards first chunk as "prefix"
+- Wall time = 2 × T_per_chunk = T_total × (2/N) → effective rate = N/2 × inflate_rate
+
+**The problem**: Our pure-Rust inflate (~400 MB/s on complex silesia) << sequential libdeflate FFI (~1400 MB/s). Even at 4T:
+- 4T prefix-overlap: 606 MB/s
+- Sequential libdeflate: 1400 MB/s
+
+**For this to matter**: We need pure-Rust inflate ≥ 700+ MB/s on complex data (2× current).
+
+## Correctness: Window Convergence
+
+Prefix-overlap threads 2+ start mid-stream with a zero window. Correctness requires that after decoding the prefix chunk with a zero window, the last 32KB of prefix output converges to the correct window state.
+
+- **Holds for**: Large chunks (>> 32KB output per chunk), few cross-boundary back-refs
+- **Fails for**: Small chunks (8T on silesia: chunks ~26MB compressed → some cross-boundary refs cause window divergence)
+- **Only guaranteed correct**: Threads 0 and 1 (both start from bit 0 with correct empty window)
+
+## The Correct Parallel Approach: Marker-Based Decoding
+
+Like rapidgzip: use `uint16_t` output buffers where values 256+ are "markers" for unresolved back-references. Resolve markers sequentially after all chunks decode. This gives true N× speedup with correctness guarantees.
+
+## Block Finder False Positives
+
+`BlockFinder` does 5-level validation but still produces false positives. Key symptoms:
+- False positive generates 1GB+ of garbage output before hitting the 1GB per-block safety limit (takes ~4 seconds at 250 MB/s)
+- Fix: Use a thread-local `BLOCK_OUTPUT_LIMIT` (512KB) during trial decodes to abort runaway false positives in < 1ms
+- Trial decode must produce ≥ 1KB of output to be accepted as a valid split point
+
+## Key Infrastructure Added
+
+- `FastBits::new_at_bit(data, bit_offset)`: Start decoding at arbitrary bit position. `consumed_bits()` returns absolute position in data.
+- `inflate_with_prefix_overlap(deflate_data, start_bit, prefix_stop_bit, actual_stop_bit, window)`: Stop after block crossing `actual_stop_bit`. Pre-init `prefix_output_len=0` when `prefix_stop_bit == start_bit`.
+- `set_block_output_limit(limit)`: Thread-local per-block output cap for safe trial decodes.
+- Stop check in `inflate_with_prefix_overlap` is AFTER each block (not before), to ensure complete blocks.
