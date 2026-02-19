@@ -13,6 +13,9 @@
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64;
+
 use crate::jit_decode::TableFingerprint;
 use crate::libdeflate_entry::{DistTable, LitLenTable};
 use std::cell::RefCell;
@@ -325,6 +328,43 @@ fn prefetch_read(ptr: *const u8) {
 #[inline(always)]
 fn prefetch_read(_ptr: *const u8) {}
 
+/// AVX2 copy for large non-overlapping matches (distance >= 32, length >= 64).
+/// Uses 32-byte stores for 4x throughput vs scalar 8-byte copies.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn copy_match_avx2(mut dst: *mut u8, mut src: *const u8, end: *const u8) {
+    while dst.add(32) <= end as *mut u8 {
+        let v = x86_64::_mm256_loadu_si256(src as *const x86_64::__m256i);
+        x86_64::_mm256_storeu_si256(dst as *mut x86_64::__m256i, v);
+        src = src.add(32);
+        dst = dst.add(32);
+    }
+    while dst < end as *mut u8 {
+        (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+        src = src.add(8);
+        dst = dst.add(8);
+    }
+}
+
+/// AVX2 byte fill for distance==1 RLE (memset-like).
+/// Uses 32-byte broadcast stores.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn fill_byte_avx2(mut dst: *mut u8, end: *const u8, byte: u8) {
+    let pattern = x86_64::_mm256_set1_epi8(byte as i8);
+    while dst.add(32) <= end as *mut u8 {
+        x86_64::_mm256_storeu_si256(dst as *mut x86_64::__m256i, pattern);
+        dst = dst.add(32);
+    }
+    let v = 0x0101010101010101u64 * (byte as u64);
+    while dst < end as *mut u8 {
+        (dst as *mut u64).write_unaligned(v);
+        dst = dst.add(8);
+    }
+}
+
 /// Fast match copy for fastloop - may write up to 40 bytes beyond length
 /// ONLY use when you have FASTLOOP_MARGIN bytes of buffer margin!
 #[inline(always)]
@@ -347,7 +387,6 @@ fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32
             // SIMD fast path for large non-overlapping matches
             #[cfg(target_arch = "aarch64")]
             {
-                // NEON fast path: 32-byte copies using two 16-byte registers
                 while dst.add(32) <= end {
                     let v0 = vld1q_u8(src);
                     let v1 = vld1q_u8(src.add(16));
@@ -356,25 +395,32 @@ fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32
                     src = src.add(32);
                     dst = dst.add(32);
                 }
-                // 16-byte cleanup
                 while dst.add(16) <= end {
                     let v = vld1q_u8(src);
                     vst1q_u8(dst, v);
                     src = src.add(16);
                     dst = dst.add(16);
                 }
-                // 8-byte cleanup
                 while dst < end {
                     (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
                     src = src.add(8);
                     dst = dst.add(8);
                 }
             }
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
             {
-                // Scalar fallback for x86_64 and other architectures
-                // Note: AVX2 path removed because it requires #[target_feature] annotation
-                // and runtime detection - using scalar path for safety
+                if is_x86_feature_detected!("avx2") {
+                    copy_match_avx2(dst, src, end);
+                } else {
+                    while dst < end {
+                        (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+                        src = src.add(8);
+                        dst = dst.add(8);
+                    }
+                }
+            }
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+            {
                 while dst < end {
                     (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
                     src = src.add(8);
@@ -409,12 +455,9 @@ fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32
         } else if dist == 1 {
             // RLE path: use SIMD broadcast for large fills
             let byte = *src;
-            // Note: x86_64 AVX2 path removed - requires #[target_feature(enable="avx2")]
-            // and proper runtime detection. Using scalar path for safety.
             #[cfg(target_arch = "aarch64")]
             {
                 if len >= 32 {
-                    // Use NEON broadcast for large RLE
                     let pattern = vdupq_n_u8(byte);
                     while dst.add(32) <= end {
                         vst1q_u8(dst, pattern);
@@ -427,7 +470,13 @@ fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32
                     }
                 }
             }
-            // Remainder with 8-byte broadcast
+            #[cfg(target_arch = "x86_64")]
+            {
+                if len >= 64 && is_x86_feature_detected!("avx2") {
+                    fill_byte_avx2(dst, end, byte);
+                    return out_pos + len;
+                }
+            }
             let v = 0x0101010101010101u64 * (byte as u64);
             while dst < end {
                 (dst as *mut u64).write_unaligned(v);
