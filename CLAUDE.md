@@ -4,48 +4,65 @@
 
 **gzippy aims to be the fastest gzip implementation ever created.**
 
-**ACHIEVED: 99-117% of libdeflate in pure Rust!**
-
-Current: **1400 MB/s on SILESIA (99% of libdeflate)**
-Status: **PARITY ACHIEVED** - We match or exceed libdeflate on all tested datasets!
-
 Every change must be benchmarked. Every optimization must be measured. Speed is the only metric that matters.
 
 ## ABSOLUTE RULES
 
-1. **NO LIBDEFLATE IN HOT PATHS** - We are REPLACING libdeflate, not using it
+1. **ONE PRODUCTION PATH** - Know exactly which inflate function the CLI calls. Test that function.
 2. **BENCHMARK EVERYTHING** - Run `./bench-decompress.sh` after EVERY change
 3. **REVERT REGRESSIONS** - If performance drops, revert immediately and try something different
-4. **ALL CODE IS RUST** - No FFI, no C, pure Rust only
+4. **INTERNAL BENCH = CLI PATH** - Never report bench numbers for code not in the CLI binary
 
-## Current Performance Status (Jan 2026)
+## ⚠️ CRITICAL: Two Sets of Numbers (Feb 2026)
 
-### ARM (Apple M3) - Primary Development Platform
+There are two completely different numbers that look like "gzippy performance":
+
+### 1. Raw inflate benchmark (experimental pure Rust, NOT production)
 ```
-Dataset          Our MB/s    libdeflate MB/s    Ratio
-SILESIA          1400        1400               ~99%    ✓ AT PARITY
-SOFTWARE         21500       20200              ~106%   ✓ EXCEEDS
-LOGS             9100        8000               ~114%   ✓ EXCEEDS
+bench_cf_silesia measures inflate_consume_first() — NOT what the CLI uses.
 
-Decoder: consume_first_decode.rs → decode_huffman_libdeflate_style
-Status: PARITY ACHIEVED on ARM!
-```
-
-### x86 (Intel i7-13700T) - Secondary Platform
-```
-Dataset          Our MB/s    libdeflate MB/s    Ratio      Notes
-SILESIA          580-620     620-680            ~90-98%    High variance
-SOFTWARE         1900-2300   1900-2200          100-115%   ✓ Often exceeds
-LOGS             1500-2000   1700-2300          ~90-95%    High variance
-
-Status: Near parity, high variance due to 35W TDP thermal throttling
+ARM (Apple M3):           ~1400 MB/s   vs libdeflate ~1543 MB/s  = 91% parity
+x86 (GitHub CI runner):   ~580-620 MB/s vs libdeflate ~680 MB/s  = ~90% parity
 ```
 
-**x86 Observations:**
-- BMI2 `bzhi` is used (verified in assembly)
-- High measurement variance (~10-20%) due to thermal throttling
-- 8-literal batching works well; 2-3 literal batching hurts SOFTWARE
-- 5-word match copy unrolling hurts cache performance
+### 2. CLI end-to-end throughput (PRODUCTION, what CI reports)
+```
+gzippy -d < silesia.gz > /dev/null
+
+x86_64 (GitHub CI ubuntu-latest):
+  silesia T1:    250 MB/s  vs igzip 258, rapidgzip 258  (gzippy within 3%)
+  silesia Tmax:  240 MB/s  vs rapidgzip 314             (gap: no parallel single-member)
+  software T1:   405 MB/s  vs igzip 405, rapidgzip 410  (tied)
+  logs T1:       966 MB/s  vs igzip 1030                (6% gap, AVX2 RLE advantage)
+
+arm64 (GitHub CI ubuntu-24.04-arm):
+  silesia T1:    129 MB/s  vs rapidgzip 121             (gzippy WINS +7%)
+  silesia Tmax:  130 MB/s  vs rapidgzip 120             (gzippy WINS +8%)
+  software T1:   120 MB/s  vs rapidgzip 152             (25% gap, no parallel)
+  logs T1:       124 MB/s  vs rapidgzip 137             (10% gap, no parallel)
+```
+
+Production inflate is `inflate_into_pub()` → `inflate_into_libdeflate()` (libdeflate C FFI).
+The experimental pure-Rust path (`inflate_consume_first`) is NOT used by the CLI.
+
+## Current CLI Compression Performance (Feb 2026, with ratio-probe-fix)
+```
+x86_64:
+  silesia  L1 T1:    327 MB/s  vs igzip 335  (-2%, noise)
+  silesia  L1 Tmax:  735 MB/s  vs igzip 394  (WINS +87%)
+  software L1 T1:   1694 MB/s  vs igzip 2603 (-35%, igzip AVX-512 L1 advantage)
+  software L1 Tmax: 2549 MB/s  vs igzip 1459 (WINS +75%)
+  logs     L1 Tmax: 1477 MB/s  vs igzip 1034 (WINS +43%)
+  L6/L9 all:        gzippy WINS every case
+
+arm64:
+  software L1 T1:   1250 MB/s  vs pigz 569   (WINS +120%)
+  software L1 Tmax: 1347 MB/s  vs pigz 1552  (-13%, ratio probe optimization pending)
+  logs     L1 Tmax:  761 MB/s  vs pigz 1076  (-29%, ratio probe optimization pending)
+  L6/L9 all:         gzippy WINS every case
+```
+
+## Scorecard: 36 wins / 12 losses (48 total CLI matchups, Feb 2026)
 
 ### Key Optimizations That Worked
 

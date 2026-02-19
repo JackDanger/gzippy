@@ -3407,11 +3407,23 @@ mod tests {
 
         let (hits, misses, hit_rate) = get_cache_stats();
 
-        eprintln!("\n=== CONSUME-FIRST {} ===", name.to_uppercase());
+        eprintln!(
+            "\n=== [EXPERIMENTAL] PURE-RUST INFLATE {} ===",
+            name.to_uppercase()
+        );
         eprintln!("Data size: {:.1} MB", isize as f64 / 1_000_000.0);
-        eprintln!("Our throughput:       {:>8.1} MB/s", our_throughput);
-        eprintln!("libdeflate throughput: {:>8.1} MB/s", lib_throughput);
-        eprintln!("Ratio: {:.1}%", 100.0 * our_throughput / lib_throughput);
+        eprintln!(
+            "experimental inflate_consume_first: {:>8.1} MB/s",
+            our_throughput
+        );
+        eprintln!(
+            "production  inflate_into_pub (FFI): {:>8.1} MB/s",
+            lib_throughput
+        );
+        eprintln!(
+            "Ratio: {:.1}% (goal: >100% to replace production)",
+            100.0 * our_throughput / lib_throughput
+        );
         eprintln!(
             "Cache: {} hits, {} misses ({:.1}% hit rate)",
             hits,
@@ -3511,19 +3523,30 @@ mod tests {
         assert_slices_eq!(&output[..size], original.as_slice());
     }
 
-    /// Benchmark on silesia dataset
+    /// EXPERIMENTAL pure-Rust inflate benchmark on silesia.
+    ///
+    /// IMPORTANT: inflate_consume_first() is NOT the production path.
+    /// Production uses inflate_into_pub() → libdeflate C FFI.
+    /// Use bench_production_inflate (in bgzf.rs) for production numbers.
+    ///
+    /// This bench exists to track progress of the experimental pure-Rust decoder.
+    /// When this consistently exceeds inflate_into_pub() speed, we'll switch production.
+    ///
+    /// Run with: cargo test --release bench_cf_silesia -- --nocapture
     #[test]
     fn bench_cf_silesia() {
         run_bench("silesia", "benchmark_data/silesia-gzip.tar.gz");
     }
 
-    /// Benchmark on software archive dataset (source code patterns)
+    /// EXPERIMENTAL pure-Rust inflate benchmark on software archive.
+    /// See bench_cf_silesia for full context on why this is experimental.
     #[test]
     fn bench_cf_software() {
         run_bench("software", "benchmark_data/software.archive.gz");
     }
 
-    /// Benchmark on repetitive logs dataset
+    /// EXPERIMENTAL pure-Rust inflate benchmark on logs dataset.
+    /// See bench_cf_silesia for full context on why this is experimental.
     #[test]
     fn bench_cf_logs() {
         run_bench("logs", "benchmark_data/logs.txt.gz");

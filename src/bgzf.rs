@@ -4170,9 +4170,13 @@ mod tests {
     }
 
     /// Main decompression benchmark - compares gzippy vs libdeflater crate
-    /// Run with: cargo test --release bench_decompress -- --nocapture
+    /// Benchmarks raw deflate decompression using the PRODUCTION path (libdeflate C FFI).
+    /// This is what inflate_into_pub() delivers — the function used by every production
+    /// decode call (BGZF blocks, multi-member members, single-member stream).
+    ///
+    /// Run with: cargo test --release bench_production_inflate -- --nocapture
     #[test]
-    fn bench_decompress() {
+    fn bench_production_inflate() {
         let _ = crate::benchmark_datasets::prepare_datasets();
 
         let datasets = [
@@ -4256,24 +4260,9 @@ mod tests {
                 expected_size as f64 / 1_000_000.0
             );
 
-            // === libdeflater crate (C libdeflate via FFI) ===
-            // Warmup
-            for _ in 0..WARMUP {
-                libdeflater::Decompressor::new()
-                    .deflate_decompress(deflate, &mut output)
-                    .unwrap();
-            }
-            // Measure
-            let start = std::time::Instant::now();
-            for _ in 0..iterations {
-                libdeflater::Decompressor::new()
-                    .deflate_decompress(deflate, &mut output)
-                    .unwrap();
-            }
-            let libdeflate_speed =
-                (expected_size * iterations) as f64 / start.elapsed().as_secs_f64() / 1_000_000.0;
-
-            // === gzippy (pure Rust) ===
+            // === PRODUCTION PATH: inflate_into_pub() → libdeflate C FFI ===
+            // This is THE function called for every block in production:
+            //   BGZF blocks, multi-member members, single-member inflate.
             // Warmup
             for _ in 0..WARMUP {
                 let _ = inflate_into_pub(deflate, &mut output);
@@ -4283,17 +4272,38 @@ mod tests {
             for _ in 0..iterations {
                 let _ = inflate_into_pub(deflate, &mut output);
             }
-            let gzippy_speed =
+            let production_speed =
                 (expected_size * iterations) as f64 / start.elapsed().as_secs_f64() / 1_000_000.0;
 
-            let ratio = gzippy_speed / libdeflate_speed * 100.0;
-            let status = if ratio >= 100.0 { "✓" } else { " " };
+            // === REFERENCE: libdeflater crate direct (no gzippy wrapper overhead) ===
+            // Shows how much wrapper overhead inflate_into_pub adds vs direct call.
+            // Should be within 1-2% — if not, investigate.
+            for _ in 0..WARMUP {
+                libdeflater::Decompressor::new()
+                    .deflate_decompress(deflate, &mut output)
+                    .unwrap();
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                libdeflater::Decompressor::new()
+                    .deflate_decompress(deflate, &mut output)
+                    .unwrap();
+            }
+            let direct_libdeflate_speed =
+                (expected_size * iterations) as f64 / start.elapsed().as_secs_f64() / 1_000_000.0;
 
-            eprintln!("│  libdeflater: {:>8.1} MB/s", libdeflate_speed);
+            let overhead_pct = (1.0 - production_speed / direct_libdeflate_speed) * 100.0;
+
             eprintln!(
-                "│  gzippy:      {:>8.1} MB/s  ({:>5.1}%) {}",
-                gzippy_speed, ratio, status
+                "│  production (inflate_into_pub):  {:>8.1} MB/s",
+                production_speed
             );
+            eprintln!(
+                "│  direct libdeflater (reference): {:>8.1} MB/s  (wrapper overhead: {:.1}%)",
+                direct_libdeflate_speed, overhead_pct
+            );
+            eprintln!("│  NOTE: These are raw deflate numbers. CLI throughput is lower due to");
+            eprintln!("│        gzip header parsing, mmap, routing, CRC32, and write I/O.");
             eprintln!("└────────────────────────────────────────────────\n");
         }
     }
