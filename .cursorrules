@@ -827,6 +827,9 @@ because:
 6. **L1 cache matters more than subtable frequency** - 11-bit tables are optimal
 7. **Control flow complexity kills performance** - Flat loops beat nested conditionals
 8. **saved_bitbuf must be captured at the RIGHT point** - Before consumption, not after
+9. **INTERNAL BENCH MUST CALL PRODUCTION CODE** - Never report bench numbers for code the CLI doesn't call
+10. **Two sets of numbers exist**: raw deflate inflate (~1400MB/s ARM) vs CLI end-to-end (~130MB/s ARM) — know which you're measuring
+11. **rapidgzip_decoder.rs fails slowly on complex data** - Do NOT wire into production without a fast-failure mechanism (see 384f419 revert for the regression this caused: -86% on silesia tmax)
 
 ### Current Best Path
 
