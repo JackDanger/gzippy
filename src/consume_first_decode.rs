@@ -3691,4 +3691,21 @@ mod tests {
         eprintln!("(Interleaved decode requires per-block table building - testing concept)");
         eprintln!("=====================================\n");
     }
+
+    /// Verify AVX2 is detected and used on x86_64 CI runners.
+    ///
+    /// All CI x86_64 runners (GitHub Actions ubuntu-latest, etc.) support AVX2.
+    /// If this test fails, our runtime AVX2 dispatch in copy_match_fast and
+    /// fill_byte_avx2 will silently fall back to scalar code, losing ~10% throughput.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_avx2_detected_on_x86() {
+        assert!(
+            is_x86_feature_detected!("avx2"),
+            "AVX2 not detected on this x86_64 machine. \
+             GitHub Actions runners always support AVX2. \
+             If this fails in CI, the AVX2 fast path in copy_match_fast \
+             and fill_byte_avx2 will be unused, reducing decompression throughput."
+        );
+    }
 }
