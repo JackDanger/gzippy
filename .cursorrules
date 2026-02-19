@@ -4,23 +4,36 @@
 
 **gzippy aims to be the fastest gzip implementation in existence.**
 
-## 🚫 ABSOLUTE RULE: NO LIBDEFLATE IN HOT PATHS
+## Production Path Reality (Feb 2026)
 
-**We are REPLACING libdeflate, not using it.**
+**CURRENT PRODUCTION DECOMPRESSION PATHS:**
+1. **BGZF parallel**: `bgzf::inflate_into` → `inflate_into_libdeflate` → libdeflate C FFI  
+2. **Single-member sequential**: `decompress_single_member_libdeflate` → libdeflate C FFI
+3. **Single-member parallel** (PR #43): `rapidgzip_decoder::decompress_rapidgzip` with fallback to libdeflate FFI
 
-libdeflate is our BENCHMARK, not our implementation. NEVER use libdeflate for:
-- Decompression in production paths
-- Per-block inflate in parallel decompression
-- Any hot path where performance matters
+**EXPERIMENTAL (not yet in production):**
+- `consume_first_decode::inflate_consume_first` — pure Rust, 99-117% of libdeflate on ARM
+- Use `bench_cf_silesia` (not `bench_production_inflate`) to track progress
 
-libdeflate is ONLY allowed for:
-- Test verification (comparing our output to known-good output)
-- Benchmark comparisons (measuring our speed against theirs)
+**GOAL: Replace libdeflate FFI with `inflate_consume_first` once it consistently beats FFI on both x86 and ARM.**
 
-If you find yourself reaching for libdeflate because "it's faster" or "it works", STOP.
-That's the problem we're solving. Implement the algorithm in pure Rust and make it faster.
+### Benchmark Honesty Rules
+- `bench_production_inflate` in `bgzf.rs` = actual shipped code (libdeflate FFI)
+- `bench_cf_silesia` in `consume_first_decode.rs` = experimental pure-Rust path
+- NEVER claim pure-Rust speed in docs unless it IS the production path
+- CI benchmarks exercise the SAME code that ships in binaries
 
-**The goal is 130%+ of libdeflate single-threaded throughput using novel algorithms.**
+## 🚫 ABSOLUTE RULE: NO NEW LIBDEFLATE FFI IN HOT PATHS
+
+We are BUILDING TOWARD replacing libdeflate. Do not add NEW libdeflate FFI calls.
+Existing libdeflate FFI is temporary until pure Rust inflate consistently beats it.
+
+libdeflate FFI is ONLY allowed in:
+- `bgzf::inflate_into_libdeflate` (existing, will be replaced when pure Rust is faster)
+- `decompression::decompress_single_member_libdeflate` (existing fallback)
+- `libdeflate_ext.rs` (test/benchmark comparisons)
+
+**The goal is 130%+ of libdeflate single-threaded throughput using pure Rust algorithms.**
 
 ## Key Lessons from libdeflate (Jan 2026)
 
@@ -51,7 +64,7 @@ every optimization needed to beat libdeflate. This is the primary reference for
 closing the performance gap. Current status (Jan 2026):
 - Single-thread silesia: 58% of libdeflate (819 MB/s vs 1403 MB/s)
 - BGZF parallel (8 threads): 2076 MB/s (148% of libdeflate single-threaded!)
-- ALL CODE IS NOW PURE RUST - NO LIBDEFLATE IN HOT PATHS
+- Production decompression uses libdeflate FFI; pure Rust path (consume_first) is near-parity on ARM
 
 The roadmap has 4 phases with 45 total optimizations. Work through them in order.
 
@@ -196,6 +209,14 @@ The key to matching rapidgzip on arbitrary gzip files:
 4. **Independent blocks at L9** - 4% larger output
 5. **Capping threads at physical_cores** - VMs underreport
 6. **ISA-L FFI on ARM** - Complex struct layout (200KB+), pure C fallback anyway
+7. **Internal fallback to slow pure-Rust in parallel decoder** - If `rapidgzip_decoder` fails, it
+   MUST return `Err` so the outer caller can fall back to fast libdeflate FFI (~250 MB/s). 
+   Internal fallback to `decompress_sequential` (~100 MB/s) caused a -57% regression (PR #43).
+8. **Passing `&data[start..]` to chunk decoders** - Caused -86% regression (PR #43).
+   Each chunk must receive only its slice `&data[start..end]`; passing the full tail forces
+   every decoder to run through the entire remaining stream including BFINAL=1 at the very end.
+9. **Ratio probe single-stream fallback for compressible data** - Parallel BGZF blocks are
+   always faster than single-stream even for highly compressible data. Removed in PR #42.
 
 ## Build & Dependencies
 

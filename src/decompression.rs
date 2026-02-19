@@ -457,42 +457,18 @@ fn is_multi_member_quick(data: &[u8]) -> bool {
     is_likely_multi_member(data)
 }
 
-/// Minimum single-member file size to attempt parallel decompression.
-/// Files smaller than this are fast enough with sequential libdeflate.
-const MIN_PARALLEL_DECOMPRESS_SIZE: usize = 16 * 1024 * 1024; // 16MB
-
 /// Decompress a single-member gzip file.
-/// For large files with multiple threads, attempts parallel decode (rapidgzip style).
-/// Falls back to sequential libdeflate on any failure.
+///
+/// Uses libdeflate FFI (fastest available). Parallel single-member via
+/// `rapidgzip_decoder` is not yet activated because our pure-Rust inflate
+/// (~100 MB/s per chunk) is too slow to beat sequential libdeflate (~250 MB/s)
+/// even at 4 threads once overhead is accounted for. When we wire in
+/// libdeflate-per-chunk in `rapidgzip_decoder`, re-enable parallel here.
 fn decompress_single_member<W: Write + Send>(
     data: &[u8],
     writer: &mut W,
-    num_threads: usize,
+    _num_threads: usize,
 ) -> GzippyResult<u64> {
-    if num_threads > 1 && data.len() >= MIN_PARALLEL_DECOMPRESS_SIZE {
-        // Attempt parallel single-member decompression.
-        // This uses speculative block-boundary finding + parallel decode with window propagation.
-        // If it fails for any reason (no valid blocks found, decode errors), we fall back.
-        match crate::rapidgzip_decoder::decompress_rapidgzip(data, writer, num_threads) {
-            Ok(bytes) => {
-                if std::env::var("GZIPPY_DEBUG").is_ok() {
-                    eprintln!(
-                        "[gzippy] Parallel single-member: {} bytes, {} threads",
-                        bytes, num_threads
-                    );
-                }
-                return Ok(bytes);
-            }
-            Err(e) => {
-                if std::env::var("GZIPPY_DEBUG").is_ok() {
-                    eprintln!(
-                        "[gzippy] Parallel single-member failed: {}, falling back to sequential",
-                        e
-                    );
-                }
-            }
-        }
-    }
     decompress_single_member_libdeflate(data, writer)
 }
 
