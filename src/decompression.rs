@@ -150,20 +150,30 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     }
 
     let result = if args.stdout {
-        // For stdout, we need to buffer in memory first because StdoutLock isn't Send
-        // This allows parallel decompression to work, then we write the result
-        let mut buffer = Vec::new();
-        let result = decompress_mmap_libdeflate(&mmap, &mut buffer, format, args.processes);
+        let stdout = stdout();
+        let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
 
-        // Write buffer to stdout
-        if let Ok(size) = result {
-            let stdout = stdout();
-            let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
-            writer.write_all(&buffer)?;
+        if args.processes <= 1 {
+            // T1 fast-path: write directly to stdout without intermediate buffer
+            let size = match format {
+                CompressionFormat::Gzip | CompressionFormat::Zip => {
+                    decompress_multi_member_sequential(&mmap[..], &mut writer)?
+                }
+                CompressionFormat::Zlib => decompress_zlib_turbo(&mmap[..], &mut writer)?,
+            };
             writer.flush()?;
             Ok(size)
         } else {
-            result
+            // Tmax: buffer in memory for parallel decompression (Send required)
+            let mut buffer = Vec::new();
+            let result = decompress_mmap_libdeflate(&mmap, &mut buffer, format, args.processes);
+            if let Ok(size) = result {
+                writer.write_all(&buffer)?;
+                writer.flush()?;
+                Ok(size)
+            } else {
+                result
+            }
         }
     } else {
         let output_path = output_path.clone().unwrap();
@@ -226,8 +236,6 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     use std::io::Read;
 
-    // Buffer stdin into memory to use our optimized parallel decompressor
-    // This trades memory for speed: ~20MB stdin fits easily in RAM
     let stdin = stdin();
     let mut input_data = Vec::new();
     {
@@ -239,11 +247,9 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         return Ok(0);
     }
 
-    // Detect format
     let is_gzip = input_data.len() >= 2 && input_data[0] == 0x1f && input_data[1] == 0x8b;
     let is_zlib = input_data.len() >= 2 && input_data[0] == 0x78;
 
-    // Force pass-through: if force is set and data doesn't look compressed, pass through
     if args.force && !is_gzip && !is_zlib {
         let stdout = stdout();
         let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
@@ -257,26 +263,39 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     } else if is_zlib {
         CompressionFormat::Zlib
     } else {
-        CompressionFormat::Gzip // Default
+        CompressionFormat::Gzip
     };
 
-    // Decompress into buffer (allows parallel decompression, then write to stdout)
-    let mut output_buffer = Vec::new();
-    match format {
-        CompressionFormat::Gzip | CompressionFormat::Zip => {
-            decompress_gzip_libdeflate(&input_data, &mut output_buffer, args.processes)?;
-        }
-        CompressionFormat::Zlib => {
-            decompress_zlib_turbo(&input_data, &mut output_buffer)?;
-        }
-    }
-
-    // Write to stdout
     let stdout = stdout();
     let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
-    writer.write_all(&output_buffer)?;
-    writer.flush()?;
 
+    if args.processes <= 1 {
+        // T1 fast-path: write directly to stdout, skip parallel infrastructure
+        // and eliminate the intermediate Vec<u8> buffer + memcpy that the parallel
+        // path requires (StdoutLock isn't Send).
+        match format {
+            CompressionFormat::Gzip | CompressionFormat::Zip => {
+                decompress_multi_member_sequential(&input_data, &mut writer)?;
+            }
+            CompressionFormat::Zlib => {
+                decompress_zlib_turbo(&input_data, &mut writer)?;
+            }
+        }
+    } else {
+        // Tmax: buffer output in memory (Send required for parallel paths)
+        let mut output_buffer = Vec::new();
+        match format {
+            CompressionFormat::Gzip | CompressionFormat::Zip => {
+                decompress_gzip_libdeflate(&input_data, &mut output_buffer, args.processes)?;
+            }
+            CompressionFormat::Zlib => {
+                decompress_zlib_turbo(&input_data, &mut output_buffer)?;
+            }
+        }
+        writer.write_all(&output_buffer)?;
+    }
+
+    writer.flush()?;
     Ok(0)
 }
 
@@ -920,10 +939,10 @@ fn read_gzip_isize(data: &[u8]) -> Option<u32> {
     ]))
 }
 
-/// Sequential multi-member decompression using libdeflate (fastest)
+/// Sequential multi-member decompression using libdeflate (fastest T1 path)
 ///
-/// Uses our DecompressorEx wrapper that returns consumed bytes,
-/// allowing us to iterate through members without re-decompressing.
+/// Uses DecompressorEx (returns consumed bytes) to iterate through members.
+/// Uses ISIZE trailer for accurate pre-allocation to avoid retry loops.
 fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     use crate::libdeflate_ext::{DecompressError, DecompressorEx};
 
@@ -931,11 +950,17 @@ fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> 
     let mut total_bytes = 0u64;
     let mut offset = 0;
 
-    // Pre-allocate a reasonably sized output buffer
-    let mut output_buf = alloc_aligned_buffer(256 * 1024);
+    // Use ISIZE from the last trailer for initial sizing (accurate for single-member)
+    let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
+    let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
+        // ISIZE is exact for files < 4GB; add small margin for alignment
+        (isize_hint + 4096) & !(CACHE_LINE_SIZE - 1)
+    } else {
+        data.len().saturating_mul(4).max(128 * 1024)
+    };
+    let mut output_buf = alloc_aligned_buffer(initial_size);
 
     while offset < data.len() {
-        // Check for gzip magic
         if data.len() - offset < 10 {
             break;
         }
@@ -945,10 +970,8 @@ fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> 
 
         let remaining = &data[offset..];
 
-        // Ensure buffer is large enough for estimated output
-        let min_size = remaining.len().saturating_mul(4).max(128 * 1024);
-        if output_buf.len() < min_size {
-            output_buf.resize(min_size, 0);
+        if output_buf.len() < remaining.len().max(128 * 1024) {
+            output_buf.resize(remaining.len().saturating_mul(4).max(128 * 1024), 0);
         }
 
         let mut success = false;
@@ -962,19 +985,17 @@ fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> 
                     break;
                 }
                 Err(DecompressError::InsufficientSpace) => {
-                    // Grow buffer and retry
                     let new_size = output_buf.len().saturating_mul(2);
                     output_buf.resize(new_size, 0);
                     continue;
                 }
                 Err(DecompressError::BadData) => {
-                    // Invalid data - stop processing entirely
                     break;
                 }
             }
         }
         if !success {
-            break; // Exit outer loop on error
+            break;
         }
     }
 
