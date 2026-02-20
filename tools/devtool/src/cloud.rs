@@ -21,6 +21,8 @@ const ARM64_TYPE: &str = "c7g.4xlarge";
 const TAG_KEY: &str = "gzippy-bench";
 const SSH_USER: &str = "ubuntu";
 const SETUP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+// Match CI runner core count for comparable Tmax results
+const BENCH_TMAX_THREADS: usize = 4;
 
 // Phase 1: initial sweep
 const SWEEP_MIN_TRIALS: u32 = 15;
@@ -465,20 +467,33 @@ fn scenario_key(r: &BenchResult) -> String {
 }
 
 fn run_benchmarks_on(ip: &str, key: &Path, label: &str) -> Result<Vec<BenchResult>, String> {
-    // Phase 1: Sweep
-    println!("\n  [{label}] Phase 1: Sweep ({SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.0}%)",
+    // Phase 1: Sweep — T1 and Tmax as separate runs for CI-comparable thread count
+    println!("\n  [{label}] Phase 1: Sweep ({SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.0}%, Tmax={BENCH_TMAX_THREADS} threads)",
         SWEEP_TARGET_CV * 100.0);
 
-    let sweep = remote_bench(
+    println!("  [{label}] T1...");
+    let t1 = remote_bench(
         ip, key, label,
         SWEEP_MIN_TRIALS, SWEEP_MAX_TRIALS, SWEEP_TARGET_CV,
-        None, None, None,
+        None, None, Some(1),
     )?;
-
-    for r in &sweep {
-        println!("    {}-{} {} {}: {:.1} MB/s (CV {:.1}%, {} trials)",
-            r.dataset, r.archive, r.threads, r.tool, r.speed_mbps, r.cv * 100.0, r.trials);
+    for r in &t1 {
+        println!("    {}-{} {} {}: {:.1} MB/s (CV {:.1}%)", r.dataset, r.archive, r.threads, r.tool, r.speed_mbps, r.cv * 100.0);
     }
+
+    println!("  [{label}] Tmax ({BENCH_TMAX_THREADS} threads)...");
+    let tmax = remote_bench(
+        ip, key, label,
+        SWEEP_MIN_TRIALS, SWEEP_MAX_TRIALS, SWEEP_TARGET_CV,
+        None, None, Some(BENCH_TMAX_THREADS),
+    )?;
+    for r in &tmax {
+        println!("    {}-{} {} {}: {:.1} MB/s (CV {:.1}%)", r.dataset, r.archive, r.threads, r.tool, r.speed_mbps, r.cv * 100.0);
+    }
+
+    let mut sweep: Vec<BenchResult> = Vec::new();
+    sweep.extend(t1);
+    sweep.extend(tmax);
 
     // Phase 2: Precision re-runs for close races
     let close_races = find_close_races(&sweep);
@@ -493,8 +508,7 @@ fn run_benchmarks_on(ip: &str, key: &Path, label: &str) -> Result<Vec<BenchResul
     let mut all = sweep;
 
     for (ds, arch, thr) in &close_races {
-        // T1 → only run single-threaded; Tmax → None means "use all CPUs" (matches sweep)
-        let threads: Option<usize> = if thr == "T1" { Some(1) } else { None };
+        let threads: Option<usize> = Some(if thr == "T1" { 1 } else { BENCH_TMAX_THREADS });
         println!("  [{label}] PRECISION {ds}-{arch} {thr}...");
 
         let precision = remote_bench(
@@ -689,7 +703,8 @@ pub fn bench() -> Result<(), String> {
     println!("  Commit:    {commit_short}");
     println!("  x86_64:    {X86_TYPE} on-demand");
     println!("  arm64:     {ARM64_TYPE} on-demand");
-    println!("  Benchmark: gzippy-dev bench --json (same code runs locally and in cloud)");
+    println!("  Benchmark: gzippy-dev bench --json (same code locally and in cloud)");
+    println!("  Threads:   T1 + Tmax={BENCH_TMAX_THREADS} (matches CI runner core count)");
     println!("  Sweep:     {SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.0}%", SWEEP_TARGET_CV * 100.0);
     println!("  Precision: {PRECISION_MIN_TRIALS}-{PRECISION_MAX_TRIALS} trials, CV<{:.1}% (close races <{CLOSE_RACE_THRESHOLD}%)", PRECISION_TARGET_CV * 100.0);
     println!("  I/O:       /dev/shm (RAM-backed, no EBS bottleneck)");
