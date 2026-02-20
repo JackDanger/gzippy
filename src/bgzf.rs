@@ -288,6 +288,8 @@ struct BgzfBlock {
     isize: u32,
     /// Output offset (calculated during planning)
     output_offset: usize,
+    /// Byte offset of raw deflate data within the block (past gzip header)
+    deflate_start: usize,
 }
 
 /// Parse all BGZF blocks from compressed data
@@ -370,11 +372,15 @@ fn parse_bgzf_blocks(data: &[u8]) -> io::Result<Vec<BgzfBlock>> {
             0
         };
 
+        // Deflate data starts after the fixed 10-byte gzip header + 2-byte XLEN + xlen bytes
+        let deflate_start = offset + 12 + xlen;
+
         blocks.push(BgzfBlock {
             start: offset,
             length,
             isize,
             output_offset,
+            deflate_start,
         });
 
         output_offset += isize as usize;
@@ -2706,9 +2712,10 @@ pub fn decompress_bgzf_parallel<W: Write>(
 
 /// Streaming BGZF decompression: decompress one block at a time into a
 /// reusable buffer, write immediately. No full-output-size allocation.
+///
+/// Uses raw deflate decompress with a reused decompressor (skipping both
+/// gzip header re-parsing and decompressor alloc/free per block).
 fn decompress_bgzf_streaming<W: Write>(data: &[u8], writer: &mut W) -> io::Result<u64> {
-    use crate::libdeflate_ext::DecompressorEx;
-
     let blocks = parse_bgzf_blocks(data)?;
     if blocks.is_empty() {
         return Ok(0);
@@ -2716,33 +2723,57 @@ fn decompress_bgzf_streaming<W: Write>(data: &[u8], writer: &mut W) -> io::Resul
 
     let max_block_output = blocks.iter().map(|b| b.isize as usize).max().unwrap_or(0);
     let mut buf = vec![0u8; max_block_output];
-    let mut decompressor = DecompressorEx::new();
     let mut total = 0u64;
 
-    for block in &blocks {
-        let block_data = &data[block.start..block.start + block.length];
-        let out_size = block.isize as usize;
-
-        if out_size > buf.len() {
-            buf.resize(out_size, 0);
-        }
-
-        let out_slice = &mut buf[..out_size];
-        match decompressor.gzip_decompress_ex(block_data, out_slice) {
-            Ok(result) => {
-                writer.write_all(&buf[..result.output_size])?;
-                total += result.output_size as u64;
-            }
-            Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "CRC32 or size mismatch in BGZF block",
-                ));
-            }
-        }
+    let decompressor = unsafe { libdeflate_sys::libdeflate_alloc_decompressor() };
+    if decompressor.is_null() {
+        return Err(io::Error::other(
+            "failed to allocate libdeflate decompressor",
+        ));
     }
 
-    Ok(total)
+    let result = (|| -> io::Result<u64> {
+        for block in &blocks {
+            let out_size = block.isize as usize;
+            if out_size == 0 {
+                continue;
+            }
+
+            if out_size > buf.len() {
+                buf.resize(out_size, 0);
+            }
+
+            // Raw deflate data: between header and 8-byte trailer (CRC32 + ISIZE)
+            let deflate_end = block.start + block.length - 8;
+            let deflate_data = &data[block.deflate_start..deflate_end];
+
+            let mut actual_out = 0usize;
+            let ret = unsafe {
+                libdeflate_sys::libdeflate_deflate_decompress(
+                    decompressor,
+                    deflate_data.as_ptr() as *const std::ffi::c_void,
+                    deflate_data.len(),
+                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    out_size,
+                    &mut actual_out,
+                )
+            };
+
+            if ret != libdeflate_sys::libdeflate_result_LIBDEFLATE_SUCCESS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "deflate decompression failed in BGZF block",
+                ));
+            }
+
+            writer.write_all(&buf[..actual_out])?;
+            total += actual_out as u64;
+        }
+        Ok(total)
+    })();
+
+    unsafe { libdeflate_sys::libdeflate_free_decompressor(decompressor) };
+    result
 }
 
 // ============================================================================
@@ -2794,11 +2825,35 @@ fn scan_member_boundaries_exact(data: &[u8]) -> Option<Vec<BgzfBlock>> {
             }
         };
 
+        // Compute deflate data offset (skip gzip header)
+        let mut ds = offset + 10;
+        let flg = data[offset + 3];
+        if flg & 0x04 != 0 && ds + 2 <= data.len() {
+            let xlen = u16::from_le_bytes([data[ds], data[ds + 1]]) as usize;
+            ds += 2 + xlen;
+        }
+        if flg & 0x08 != 0 {
+            while ds < data.len() && data[ds] != 0 {
+                ds += 1;
+            }
+            ds += 1;
+        }
+        if flg & 0x10 != 0 {
+            while ds < data.len() && data[ds] != 0 {
+                ds += 1;
+            }
+            ds += 1;
+        }
+        if flg & 0x02 != 0 {
+            ds += 2;
+        }
+
         members.push(BgzfBlock {
             start: offset,
             length: input_consumed,
             isize: output_size as u32,
             output_offset,
+            deflate_start: ds,
         });
 
         output_offset += output_size;
