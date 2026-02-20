@@ -2804,23 +2804,54 @@ pub fn decompress_multi_member_parallel<W: Write>(
         return Ok(total);
     }
 
-    // Find chunk boundaries: split input into N chunks, then find the first
-    // valid member start at or after each chunk boundary.
-    let chunk_size = data.len() / num_threads;
+    // Determine where the first member ends to avoid false-positive boundary
+    // detection inside the deflate stream. Without this, barely-compressed
+    // data containing embedded gzip files (e.g., tarballs with .gz files)
+    // would be incorrectly split at inner gzip headers.
+    let first_member_end = {
+        let mut d = crate::libdeflate_ext::DecompressorEx::new();
+        let mut trial = vec![0u8; 64 * 1024];
+        loop {
+            match d.gzip_decompress_ex(data, &mut trial) {
+                Ok(result) => break result.input_consumed,
+                Err(crate::libdeflate_ext::DecompressError::InsufficientSpace) => {
+                    trial.resize(trial.len() * 2, 0);
+                }
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Cannot determine first member size",
+                    ));
+                }
+            }
+        }
+    };
+
+    // If the first member consumes all (or nearly all) the data, it's single-member
+    if first_member_end + 18 >= data.len() {
+        let output = decompress_chunk_sequential(data, 0, data.len())?;
+        let total = output.len() as u64;
+        writer.write_all(&output)?;
+        return Ok(total);
+    }
+
+    // Only search for boundaries AFTER the first member ends
+    let multi_member_data = &data[first_member_end..];
+    let chunk_size = multi_member_data.len() / num_threads;
     let mut boundaries = Vec::with_capacity(num_threads + 1);
     boundaries.push(0usize);
+    boundaries.push(first_member_end);
 
     for i in 1..num_threads {
-        let target = i * chunk_size;
-        // Search within a generous window for the next member start
-        let search_limit = ((i + 1) * chunk_size).min(data.len());
+        let target = first_member_end + i * chunk_size;
+        let search_limit = (first_member_end + (i + 1) * chunk_size).min(data.len());
         if let Some(boundary) = find_next_member_start(data, target, search_limit) {
             boundaries.push(boundary);
         }
     }
     boundaries.push(data.len());
 
-    // Deduplicate boundaries (can happen if search finds same position)
+    boundaries.sort_unstable();
     boundaries.dedup();
 
     let num_chunks = boundaries.len() - 1;
@@ -7824,6 +7855,236 @@ mod optimization_tests {
                 }
             }
             eprintln!("  OK!");
+        }
+    }
+
+    /// Test BGZF round-trip on barely-compressible data.
+    ///
+    /// This specifically targets the CI failure where gzippy→gzippy fails
+    /// on tarball data at L1 T1. The data is designed to be mostly
+    /// incompressible (like git packfiles in a tarball).
+    #[test]
+    fn test_bgzf_roundtrip_barely_compressible() {
+        use crate::parallel_compress::GzipHeaderInfo;
+
+        // Create ~1MB of barely-compressible data (random-ish with structure)
+        let mut data = Vec::with_capacity(1024 * 1024);
+        let mut state: u64 = 0xdeadbeef;
+        while data.len() < 1024 * 1024 {
+            // Mix of random-looking bytes and short repeated sequences
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            data.extend_from_slice(&state.to_le_bytes());
+            if state & 0xff < 30 {
+                // ~12% chance of short repeat (simulates tar headers/alignment)
+                let repeat_len = ((state >> 8) & 0x3f) as usize + 1;
+                let repeat_byte = (state >> 16) as u8;
+                data.extend(std::iter::repeat_n(repeat_byte, repeat_len));
+            }
+        }
+        data.truncate(1024 * 1024);
+
+        // Compress with our BGZF block writer (simulating gzippy -1)
+        let header_info = GzipHeaderInfo {
+            filename: Some("test.tar".to_string()),
+            mtime: 1700000000,
+            comment: None,
+        };
+
+        let block_size = 128 * 1024; // 128KB, same as default
+        let mut compressed = Vec::new();
+        for chunk in data.chunks(block_size) {
+            let mut block_output = Vec::new();
+            crate::parallel_compress::compress_block_bgzf_libdeflate(
+                &mut block_output,
+                chunk,
+                1, // L1
+                &header_info,
+            );
+            compressed.extend_from_slice(&block_output);
+        }
+
+        // Verify compressed data is valid gzip (decompress with gzip_decompress_ex)
+        let mut decompressor = crate::libdeflate_ext::DecompressorEx::new();
+        let mut verify_buf = vec![0u8; data.len() + 1024];
+        let mut verify_offset = 0;
+        let mut comp_offset = 0;
+        while comp_offset < compressed.len() {
+            if compressed[comp_offset] != 0x1f || compressed[comp_offset + 1] != 0x8b {
+                break;
+            }
+            let result = decompressor
+                .gzip_decompress_ex(&compressed[comp_offset..], &mut verify_buf[verify_offset..])
+                .expect("sequential gzip_decompress_ex should succeed");
+            verify_offset += result.output_size;
+            comp_offset += result.input_consumed;
+        }
+        assert_eq!(
+            verify_offset,
+            data.len(),
+            "sequential decompress should produce correct size"
+        );
+        assert_eq!(
+            &verify_buf[..verify_offset],
+            &data[..],
+            "sequential decompress should match original"
+        );
+
+        // Now test the BGZF parallel path
+        assert!(
+            crate::decompression::has_bgzf_markers(&compressed),
+            "compressed data should have BGZF markers"
+        );
+
+        let parallel_output =
+            decompress_bgzf_parallel_to_vec(&compressed, 4).expect("BGZF parallel should succeed");
+
+        assert_eq!(
+            parallel_output.len(),
+            data.len(),
+            "BGZF parallel output size mismatch: expected={} got={} delta={}",
+            data.len(),
+            parallel_output.len(),
+            parallel_output.len() as i64 - data.len() as i64
+        );
+
+        if parallel_output != data {
+            // Find first difference
+            let first_diff = parallel_output
+                .iter()
+                .zip(data.iter())
+                .enumerate()
+                .find(|(_, (a, b))| a != b)
+                .map(|(i, _)| i)
+                .unwrap_or(data.len().min(parallel_output.len()));
+            panic!(
+                "BGZF parallel output content mismatch: first_diff_at={} of {}",
+                first_diff,
+                data.len()
+            );
+        }
+    }
+
+    /// Same test but with larger data (10MB) to match CI conditions
+    #[test]
+    fn test_bgzf_roundtrip_large_barely_compressible() {
+        use crate::parallel_compress::GzipHeaderInfo;
+
+        let mut data = Vec::with_capacity(10 * 1024 * 1024);
+        let mut state: u64 = 0xcafebabe;
+        while data.len() < 10 * 1024 * 1024 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            data.extend_from_slice(&state.to_le_bytes());
+            if state & 0xff < 30 {
+                let repeat_len = ((state >> 8) & 0x3f) as usize + 1;
+                let repeat_byte = (state >> 16) as u8;
+                data.extend(std::iter::repeat_n(repeat_byte, repeat_len));
+            }
+        }
+        data.truncate(10 * 1024 * 1024);
+
+        let header_info = GzipHeaderInfo {
+            filename: Some("test.tar".to_string()),
+            mtime: 1700000000,
+            comment: None,
+        };
+
+        let block_size = 128 * 1024;
+        let mut compressed = Vec::new();
+        for chunk in data.chunks(block_size) {
+            let mut block_output = Vec::new();
+            crate::parallel_compress::compress_block_bgzf_libdeflate(
+                &mut block_output,
+                chunk,
+                1,
+                &header_info,
+            );
+            compressed.extend_from_slice(&block_output);
+        }
+
+        assert!(crate::decompression::has_bgzf_markers(&compressed));
+
+        let parallel_output =
+            decompress_bgzf_parallel_to_vec(&compressed, 4).expect("BGZF parallel should succeed");
+
+        assert_eq!(
+            parallel_output.len(),
+            data.len(),
+            "Large BGZF parallel output size: expected={} got={} delta={}",
+            data.len(),
+            parallel_output.len(),
+            parallel_output.len() as i64 - data.len() as i64
+        );
+        assert_eq!(
+            parallel_output, data,
+            "Large BGZF parallel output content mismatch"
+        );
+    }
+
+    /// Test that a single-member gzip file containing embedded gzip data
+    /// doesn't produce extra bytes during multi-member parallel decompression.
+    ///
+    /// This reproduces the CI bug: a tarball containing .gz files is compressed
+    /// as a single gzip member at L1 (stored blocks). The embedded .gz files
+    /// appear as literal bytes in the deflate stream, and the multi-member
+    /// parallel decompressor must not mistake them for member boundaries.
+    #[test]
+    fn test_single_member_with_embedded_gzip() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Create inner gzip data (simulates a .gz file inside a tarball)
+        let inner_data = b"This is the inner gzip content that should not appear as extra output";
+        let mut inner_encoder = GzEncoder::new(Vec::new(), Compression::default());
+        inner_encoder.write_all(inner_data).unwrap();
+        let inner_gz = inner_encoder.finish().unwrap();
+
+        // Build a payload that contains the inner gzip as literal bytes
+        // (simulating a tarball with .gz files, compressed with stored blocks)
+        let mut payload = Vec::with_capacity(256 * 1024);
+        payload.extend_from_slice(b"TAR HEADER PADDING ");
+        payload.extend_from_slice(&[0u8; 493]); // pad to 512 bytes
+        payload.extend_from_slice(&inner_gz); // embedded gzip data
+                                              // Pad to make it large enough
+        while payload.len() < 256 * 1024 {
+            payload.push((payload.len() % 256) as u8);
+        }
+
+        // Compress the payload as a single gzip member
+        let mut outer_encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        outer_encoder.write_all(&payload).unwrap();
+        let compressed = outer_encoder.finish().unwrap();
+
+        // Verify the compressed data IS a single member
+        assert_eq!(compressed[0], 0x1f);
+        assert_eq!(compressed[1], 0x8b);
+
+        // Decompress with multi-member parallel
+        let mut output = Vec::new();
+        let result = decompress_multi_member_parallel(&compressed, &mut output, 4);
+
+        match result {
+            Ok(size) => {
+                assert_eq!(
+                    size as usize,
+                    payload.len(),
+                    "Multi-member parallel should produce exact original size, got {} extra bytes",
+                    size as usize - payload.len()
+                );
+                assert_eq!(output, payload);
+            }
+            Err(_) => {
+                // Error is also acceptable (falls back to sequential)
+                output.clear();
+                let output2 = decompress_chunk_sequential(&compressed, 0, compressed.len())
+                    .expect("sequential should work");
+                assert_eq!(output2.len(), payload.len());
+                assert_eq!(output2, payload);
+            }
         }
     }
 }

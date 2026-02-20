@@ -187,14 +187,23 @@ def compress_once(tool: str, level: int, threads: int, input_file: str, output_f
     return result.returncode == 0, elapsed
 
 
-def decompress_once(tool: str, input_file: str, output_file: str) -> Tuple[bool, float]:
+def decompress_once(tool: str, input_file: str, output_file: str, debug: bool = False) -> Tuple[bool, float]:
     """Decompress once, return (success, elapsed)."""
     bin_path = find_tool(tool)
     cmd = [bin_path, "-d", "-c", input_file]
     
+    env = os.environ.copy()
+    if debug:
+        env["GZIPPY_DEBUG"] = "1"
+    
     start = time.perf_counter()
     with open(output_file, "wb") as f:
-        result = subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
+        if debug:
+            result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, env=env)
+            if result.stderr:
+                print(f"    [DEBUG stderr] {result.stderr.decode('utf-8', errors='replace').strip()}")
+        else:
+            result = subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL, env=env)
     elapsed = time.perf_counter() - start
     
     return result.returncode == 0, elapsed
@@ -311,8 +320,10 @@ def run_validation(
                     for decomp_tool in tools:
                         out = tmpdir / f"{data_type}.{comp_tool}.{decomp_tool}.bin"
                         
+                        use_debug = (decomp_tool == "gzippy" and comp_tool == "gzippy"
+                                     and data_type == "tarball" and level == 1 and threads == 1)
                         stats = run_trials(
-                            lambda dt=decomp_tool, cf=comp_file, o=out: decompress_once(dt, str(cf), str(o)),
+                            lambda dt=decomp_tool, cf=comp_file, o=out, dbg=use_debug: decompress_once(dt, str(cf), str(o), debug=dbg),
                             trials
                         )
                         
@@ -332,11 +343,43 @@ def run_validation(
                             results["failed"] += 1
                             results["errors"].append(f"{test_id} ({data_type} L{level} T{threads}): decompression failed")
                         elif not files_identical(str(test_file), str(out)):
-                            print(f"    ❌ {test_id}: output mismatch")
+                            orig_size = test_file.stat().st_size
+                            out_size = out.stat().st_size
+                            diff_info = f"expected={orig_size} got={out_size} delta={out_size - orig_size}"
+                            # Show first differing byte position
+                            try:
+                                with open(test_file, 'rb') as f1, open(out, 'rb') as f2:
+                                    pos = 0
+                                    while True:
+                                        b1 = f1.read(8192)
+                                        b2 = f2.read(8192)
+                                        if not b1 and not b2:
+                                            break
+                                        min_len = min(len(b1), len(b2))
+                                        for i in range(min_len):
+                                            if b1[i] != b2[i]:
+                                                diff_info += f" first_diff_at={pos + i}"
+                                                raise StopIteration
+                                        if len(b1) != len(b2):
+                                            diff_info += f" first_diff_at={pos + min_len} (EOF)"
+                                            raise StopIteration
+                                        pos += len(b1)
+                            except StopIteration:
+                                pass
+                            # Show tail of output if it's longer
+                            if out_size > orig_size:
+                                try:
+                                    with open(out, 'rb') as f:
+                                        f.seek(orig_size)
+                                        extra = f.read(256)
+                                        diff_info += f" extra_bytes={repr(extra[:80])}"
+                                except Exception:
+                                    pass
+                            print(f"    ❌ {test_id}: output mismatch ({diff_info})")
                             test_result["passed"] = False
-                            test_result["error"] = "output mismatch"
+                            test_result["error"] = f"output mismatch ({diff_info})"
                             results["failed"] += 1
-                            results["errors"].append(f"{test_id} ({data_type} L{level} T{threads}): output mismatch")
+                            results["errors"].append(f"{test_id} ({data_type} L{level} T{threads}): output mismatch ({diff_info})")
                         else:
                             print(f"    ✅ {test_id}: OK ({format_time(stats['median'])})")
                             test_result["passed"] = True

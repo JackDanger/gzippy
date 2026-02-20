@@ -154,12 +154,29 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
 
         let is_gzip = matches!(format, CompressionFormat::Gzip | CompressionFormat::Zip);
-        let can_parallelize = args.processes > 1
-            && is_gzip
-            && (has_bgzf_markers(&mmap) || is_likely_multi_member(&mmap));
+        let bgzf = has_bgzf_markers(&mmap);
+        let multi = is_likely_multi_member(&mmap);
+        let can_parallelize = args.processes > 1 && is_gzip && (bgzf || multi);
+
+        if std::env::var("GZIPPY_DEBUG").is_ok() {
+            eprintln!(
+                "[gzippy] decompress_file stdout: len={} bgzf={} multi={} parallel={} procs={}",
+                mmap.len(),
+                bgzf,
+                multi,
+                can_parallelize,
+                args.processes
+            );
+        }
 
         let size = if can_parallelize {
             let output = decompress_gzip_to_vec(&mmap[..], args.processes)?;
+            if std::env::var("GZIPPY_DEBUG").is_ok() {
+                eprintln!(
+                    "[gzippy] decompress_gzip_to_vec returned {} bytes",
+                    output.len()
+                );
+            }
             let len = output.len() as u64;
             writer.write_all(&output)?;
             Ok(len)
@@ -351,29 +368,45 @@ fn is_likely_multi_member(data: &[u8]) -> bool {
 
     // A gzip member is minimum 18 bytes (10 header + 8 trailer)
     if data.len() < 36 {
-        // Too small for multi-member
         return false;
     }
 
-    // Parse first header to find approximate end of first member
     let header_size = parse_gzip_header_size(data).unwrap_or(10);
 
-    // Search for gzip magic after header
-    // Use a conservative approach: look for the 4-byte pattern 1f 8b 08 XX
-    // where XX has reserved bits zero
     const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b, 0x08];
     let finder = memmem::Finder::new(GZIP_MAGIC);
 
-    // Start searching after the header (the deflate data starts there)
-    let search_start = header_size + 1; // +1 to skip past first byte of deflate
+    // Start searching after the first header
+    let search_start = header_size + 1;
 
     let mut pos = search_start;
     while let Some(offset) = finder.find(&data[pos..]) {
         let header_pos = pos + offset;
 
-        // Must have room for full header (10 bytes minimum)
         if header_pos + 10 > data.len() {
             break;
+        }
+
+        // A real member boundary must be preceded by the previous member's
+        // gzip trailer (4-byte CRC32 + 4-byte ISIZE). Minimum member size
+        // is 18 bytes, so we need at least 18 bytes before the candidate.
+        if header_pos < 18 {
+            pos = header_pos + 1;
+            continue;
+        }
+
+        // Check ISIZE from the preceding trailer: the 4 bytes immediately
+        // before the candidate should be the previous member's uncompressed
+        // size (mod 2^32). Must be > 0 and plausible.
+        let preceding_isize = u32::from_le_bytes([
+            data[header_pos - 4],
+            data[header_pos - 3],
+            data[header_pos - 2],
+            data[header_pos - 1],
+        ]);
+        if preceding_isize == 0 || preceding_isize > 1_073_741_824 {
+            pos = header_pos + 1;
+            continue;
         }
 
         let flags = data[header_pos + 3];
@@ -384,20 +417,19 @@ fn is_likely_multi_member(data: &[u8]) -> bool {
             continue;
         }
 
-        // MTIME (4 bytes) should be reasonable (before year 2100 = ~4102444800)
+        // MTIME should be reasonable
         let mtime = u32::from_le_bytes([
             data[header_pos + 4],
             data[header_pos + 5],
             data[header_pos + 6],
             data[header_pos + 7],
         ]);
-        // Allow mtime = 0 (common) or reasonable values
         if mtime != 0 && mtime > 4_102_444_800 {
             pos = header_pos + 1;
             continue;
         }
 
-        // XFL (extra flags) should be 0, 2, or 4 (0=default, 2=slowest, 4=fastest)
+        // XFL should be 0, 2, or 4
         let xfl = data[header_pos + 8];
         if xfl != 0 && xfl != 2 && xfl != 4 {
             pos = header_pos + 1;
@@ -411,7 +443,6 @@ fn is_likely_multi_member(data: &[u8]) -> bool {
             continue;
         }
 
-        // This looks like a valid header!
         return true;
     }
 
@@ -617,9 +648,21 @@ fn decompress_gzip_libdeflate<W: Write + Send>(
 
     if !is_likely_multi_member(data) {
         if std::env::var("GZIPPY_DEBUG").is_ok() {
-            eprintln!("[gzippy] Single-member: {} threads", num_threads);
+            eprintln!(
+                "[gzippy] Single-member path: {} threads, {} bytes",
+                num_threads,
+                data.len()
+            );
         }
         return decompress_single_member(data, writer, num_threads);
+    }
+
+    if std::env::var("GZIPPY_DEBUG").is_ok() {
+        eprintln!(
+            "[gzippy] Multi-member path: {} threads, {} bytes",
+            num_threads,
+            data.len()
+        );
     }
 
     // Multi-member: try parallel decompression first
@@ -649,7 +692,7 @@ fn decompress_gzip_libdeflate<W: Write + Send>(
 
 /// Check if data has BGZF-style "GZ" markers in the first gzip header
 #[inline]
-fn has_bgzf_markers(data: &[u8]) -> bool {
+pub(crate) fn has_bgzf_markers(data: &[u8]) -> bool {
     // Minimum header with FEXTRA: 10 base + 2 XLEN + 4 subfield header
     if data.len() < 16 {
         return false;
@@ -970,6 +1013,7 @@ fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> 
     let mut decompressor = DecompressorEx::new();
     let mut total_bytes = 0u64;
     let mut offset = 0;
+    let mut member_count = 0u32;
 
     // Use ISIZE trailer hint for initial buffer sizing (avoids repeated reallocs)
     let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
@@ -1001,6 +1045,13 @@ fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> 
         loop {
             match decompressor.gzip_decompress_ex(remaining, &mut output_buf) {
                 Ok(result) => {
+                    member_count += 1;
+                    if std::env::var("GZIPPY_DEBUG").is_ok() {
+                        eprintln!(
+                            "[gzippy] sequential member {}: in_consumed={} out_size={} offset={}/{}",
+                            member_count, result.input_consumed, result.output_size, offset, data.len()
+                        );
+                    }
                     writer.write_all(&output_buf[..result.output_size])?;
                     total_bytes += result.output_size as u64;
                     offset += result.input_consumed;
