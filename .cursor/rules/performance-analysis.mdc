@@ -20,23 +20,53 @@ gzippy-dev ci push            # 2. Push → CI → auto-triage + vs-main
 gzippy-dev ci vs-main         # 3. Check anytime: did branch help or hurt?
 ```
 
-## When to Use Local Benchmarks
+## Current Status: ~70% Win Rate, ~86% Effective (Feb 20 2026)
 
-Only for rapid iteration before pushing:
-- `gzippy-dev instrument file.gz` to understand timing breakdown
-- `gzippy-dev path file.gz` to confirm which code path runs
-- `gzippy-dev bench` for quick sanity checks
+**~87 wins / ~36 gaps / 123 total comparisons** (fluctuates ±2% between runs due to arm64 noise)
+- ARCHITECTURE: ~10 gaps (parallel single-member vs rapidgzip, up to -24%)
+- SIMD: 3 gaps (L1 compression vs igzip, up to -13%)
+- ACTIONABLE: ~5-8 gaps (arm64 T1 overhead, up to -14%)
+- NOISE: ~16-19 gaps (all <2%)
 
-**Never claim a win/loss based on local results alone.**
+**Effective win rate (NOISE as ties): ~86%**
+
+## What Worked (perf/bgzf-t1-fast-path branch)
+
+| Change | Impact on CI | Notes |
+|---|---|---|
+| Streaming BGZF T1 | +5.5% silesia-bgzf T1 x86 | Eliminated 500MB alloc+copy |
+| BGZF T1 routing | Closed 3 ACTIONABLE gaps | Route BGZF before parallelism check |
+| Raw deflate + reused decompressor | +3% BGZF T1 arm64 | Skip gzip header + alloc per block |
+
+## arm64 Noise Reality
+
+**arm64 CI is very noisy.** Between consecutive runs on the same code:
+- 70.7% → 69.9% win rate (no code change between runs!)
+- Individual scenarios swing 10-30% (e.g., software-gzip T1 arm64)
+- `software` and `logs` datasets (~22MB) are worst affected
+
+**Rule**: If arm64 shows a regression >10% on a small dataset and x86 doesn't
+show the same regression, it's noise. Use `ci history` to confirm.
 
 ## Gap Categories (from `ci triage`)
 
 | Category | What it means | Action |
 |---|---|---|
-| ARCHITECTURE | Needs parallel single-member (rapidgzip-style pipeline) | Major feature, not micro-opt |
+| ARCHITECTURE | Needs parallel single-member (rapidgzip-style pipeline) | Major feature |
 | SIMD | igzip's AVX2/AVX-512 hand-tuned assembly | Accept or write asm |
 | ACTIONABLE | Closable with code changes | Work on these |
 | NOISE | <2% — measurement variance | Ignore |
+
+## Remaining ACTIONABLE Strategy
+
+The arm64 T1 gaps on small files are hard to close because:
+1. Process startup overhead is ~10% of measurement time (~0.15s for 22MB)
+2. arm64 Graviton has lower per-core IPC than x86 EPYC
+3. Competitors (rapidgzip, pigz) may have slightly different startup overhead
+
+Focus on **x86 ACTIONABLE gaps** (more stable measurements):
+- `silesia-gzip T1 x86` vs igzip: -5.4% — inflate loop optimization
+- `silesia-bgzf Tmax x86` vs rapidgzip: -3.4% — thread coordination
 
 ## CI Benchmark Architecture
 
@@ -44,16 +74,3 @@ Only for rapid iteration before pushing:
 **Datasets**: silesia (211MB), software (~22MB), logs (~22MB)
 **Archives**: gzip, bgzf, pigz — thread configs T1 and Tmax (4)
 **Convergence**: min 10, max 40 trials, target CV <3%
-**arm64 caveat**: CV 0.2-0.3 on small files, >10% swings between runs are noise
-
-## Key devtool Commands
-
-| Command | When to use |
-|---|---|
-| `ci triage` | Start of any optimization session |
-| `ci push` | After code change — pushes, watches CI, auto-triages + compares vs main |
-| `ci vs-main` | Quick check: how does branch compare to main right now? |
-| `ci history --limit 10` | Is win rate trending up or down? |
-| `ci compare ID_A ID_B` | Deep dive between specific runs |
-| `instrument file.gz` | Understand where time goes in a specific file |
-| `path file.gz` | Confirm which decompression code path runs |
