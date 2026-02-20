@@ -368,29 +368,45 @@ fn is_likely_multi_member(data: &[u8]) -> bool {
 
     // A gzip member is minimum 18 bytes (10 header + 8 trailer)
     if data.len() < 36 {
-        // Too small for multi-member
         return false;
     }
 
-    // Parse first header to find approximate end of first member
     let header_size = parse_gzip_header_size(data).unwrap_or(10);
 
-    // Search for gzip magic after header
-    // Use a conservative approach: look for the 4-byte pattern 1f 8b 08 XX
-    // where XX has reserved bits zero
     const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b, 0x08];
     let finder = memmem::Finder::new(GZIP_MAGIC);
 
-    // Start searching after the header (the deflate data starts there)
-    let search_start = header_size + 1; // +1 to skip past first byte of deflate
+    // Start searching after the first header
+    let search_start = header_size + 1;
 
     let mut pos = search_start;
     while let Some(offset) = finder.find(&data[pos..]) {
         let header_pos = pos + offset;
 
-        // Must have room for full header (10 bytes minimum)
         if header_pos + 10 > data.len() {
             break;
+        }
+
+        // A real member boundary must be preceded by the previous member's
+        // gzip trailer (4-byte CRC32 + 4-byte ISIZE). Minimum member size
+        // is 18 bytes, so we need at least 18 bytes before the candidate.
+        if header_pos < 18 {
+            pos = header_pos + 1;
+            continue;
+        }
+
+        // Check ISIZE from the preceding trailer: the 4 bytes immediately
+        // before the candidate should be the previous member's uncompressed
+        // size (mod 2^32). Must be > 0 and plausible.
+        let preceding_isize = u32::from_le_bytes([
+            data[header_pos - 4],
+            data[header_pos - 3],
+            data[header_pos - 2],
+            data[header_pos - 1],
+        ]);
+        if preceding_isize == 0 || preceding_isize > 1_073_741_824 {
+            pos = header_pos + 1;
+            continue;
         }
 
         let flags = data[header_pos + 3];
@@ -401,20 +417,19 @@ fn is_likely_multi_member(data: &[u8]) -> bool {
             continue;
         }
 
-        // MTIME (4 bytes) should be reasonable (before year 2100 = ~4102444800)
+        // MTIME should be reasonable
         let mtime = u32::from_le_bytes([
             data[header_pos + 4],
             data[header_pos + 5],
             data[header_pos + 6],
             data[header_pos + 7],
         ]);
-        // Allow mtime = 0 (common) or reasonable values
         if mtime != 0 && mtime > 4_102_444_800 {
             pos = header_pos + 1;
             continue;
         }
 
-        // XFL (extra flags) should be 0, 2, or 4 (0=default, 2=slowest, 4=fastest)
+        // XFL should be 0, 2, or 4
         let xfl = data[header_pos + 8];
         if xfl != 0 && xfl != 2 && xfl != 4 {
             pos = header_pos + 1;
@@ -428,7 +443,6 @@ fn is_likely_multi_member(data: &[u8]) -> bool {
             continue;
         }
 
-        // This looks like a valid header!
         return true;
     }
 
