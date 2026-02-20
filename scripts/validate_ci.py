@@ -332,11 +332,43 @@ def run_validation(
                             results["failed"] += 1
                             results["errors"].append(f"{test_id} ({data_type} L{level} T{threads}): decompression failed")
                         elif not files_identical(str(test_file), str(out)):
-                            print(f"    ❌ {test_id}: output mismatch")
+                            orig_size = test_file.stat().st_size
+                            out_size = out.stat().st_size
+                            diff_info = f"expected={orig_size} got={out_size} delta={out_size - orig_size}"
+                            # Show first differing byte position
+                            try:
+                                with open(test_file, 'rb') as f1, open(out, 'rb') as f2:
+                                    pos = 0
+                                    while True:
+                                        b1 = f1.read(8192)
+                                        b2 = f2.read(8192)
+                                        if not b1 and not b2:
+                                            break
+                                        min_len = min(len(b1), len(b2))
+                                        for i in range(min_len):
+                                            if b1[i] != b2[i]:
+                                                diff_info += f" first_diff_at={pos + i}"
+                                                raise StopIteration
+                                        if len(b1) != len(b2):
+                                            diff_info += f" first_diff_at={pos + min_len} (EOF)"
+                                            raise StopIteration
+                                        pos += len(b1)
+                            except StopIteration:
+                                pass
+                            # Show tail of output if it's longer
+                            if out_size > orig_size:
+                                try:
+                                    with open(out, 'rb') as f:
+                                        f.seek(orig_size)
+                                        extra = f.read(256)
+                                        diff_info += f" extra_bytes={repr(extra[:80])}"
+                                except Exception:
+                                    pass
+                            print(f"    ❌ {test_id}: output mismatch ({diff_info})")
                             test_result["passed"] = False
-                            test_result["error"] = "output mismatch"
+                            test_result["error"] = f"output mismatch ({diff_info})"
                             results["failed"] += 1
-                            results["errors"].append(f"{test_id} ({data_type} L{level} T{threads}): output mismatch")
+                            results["errors"].append(f"{test_id} ({data_type} L{level} T{threads}): output mismatch ({diff_info})")
                         else:
                             print(f"    ✅ {test_id}: OK ({format_time(stats['median'])})")
                             test_result["passed"] = True

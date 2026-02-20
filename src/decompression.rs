@@ -649,7 +649,7 @@ fn decompress_gzip_libdeflate<W: Write + Send>(
 
 /// Check if data has BGZF-style "GZ" markers in the first gzip header
 #[inline]
-fn has_bgzf_markers(data: &[u8]) -> bool {
+pub(crate) fn has_bgzf_markers(data: &[u8]) -> bool {
     // Minimum header with FEXTRA: 10 base + 2 XLEN + 4 subfield header
     if data.len() < 16 {
         return false;

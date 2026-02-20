@@ -348,7 +348,7 @@ pub fn compress_single_member<W: Write>(
 /// but enables gzippy to find block boundaries without inflating.
 ///
 /// Uses libdeflate for L1-L6 (faster, no dictionary needed).
-fn compress_block_bgzf_libdeflate(
+pub fn compress_block_bgzf_libdeflate(
     output: &mut Vec<u8>,
     block: &[u8],
     compression_level: u32,
