@@ -27,9 +27,21 @@ from pathlib import Path
 
 
 # Benchmark configuration
-MIN_TRIALS = 5
-MAX_TRIALS = 30
-TARGET_CV = 0.05  # 5% coefficient of variation
+MIN_TRIALS = 10
+MAX_TRIALS = 40
+TARGET_CV = 0.03  # 3% coefficient of variation
+
+
+def trimmed_stats(times):
+    """Compute stats after dropping the single fastest and slowest trials."""
+    if len(times) <= 4:
+        t = sorted(times)
+    else:
+        t = sorted(times)[1:-1]
+    mean = statistics.mean(t)
+    stdev = statistics.stdev(t) if len(t) > 1 else 0
+    cv = stdev / mean if mean > 0 else 1.0
+    return t, mean, stdev, cv
 
 
 def find_binary(binaries_dir: Path, name: str) -> str | None:
@@ -86,7 +98,7 @@ def benchmark_decompression(
     if not filecmp.cmp(original_file, output_file, shallow=False):
         return {"error": f"{tool} decompression produced incorrect output", "status": "fail"}
 
-    # Adaptive benchmark
+    # Adaptive benchmark with trimmed statistics
     times = []
     converged = False
 
@@ -97,28 +109,33 @@ def benchmark_decompression(
         times.append(time.perf_counter() - start)
 
         if len(times) >= MIN_TRIALS:
-            mean = statistics.mean(times)
-            stdev = statistics.stdev(times)
-            cv = stdev / mean if mean > 0 else 1.0
+            _, _, _, cv = trimmed_stats(times)
             if cv < TARGET_CV:
                 converged = True
                 break
 
-    median = statistics.median(times)
+    trimmed, t_mean, t_stdev, t_cv = trimmed_stats(times)
+    median = statistics.median(trimmed)
+    sorted_trimmed = sorted(trimmed)
+    p10 = sorted_trimmed[max(0, len(sorted_trimmed) // 10)]
+    p90 = sorted_trimmed[min(len(sorted_trimmed) - 1, len(sorted_trimmed) * 9 // 10)]
 
     return {
         "tool": tool,
         "operation": "decompress",
         "times": times,
         "median": median,
-        "mean": statistics.mean(times),
-        "stdev": statistics.stdev(times) if len(times) > 1 else 0,
-        "cv": statistics.stdev(times) / statistics.mean(times) if len(times) > 1 else 0,
+        "mean": t_mean,
+        "stdev": t_stdev,
+        "cv": t_cv,
         "trials": len(times),
+        "trimmed_trials": len(trimmed),
         "converged": converged,
         "original_size": original_size,
         "compressed_size": compressed_size,
         "speed_mbps": original_size / median / 1_000_000,
+        "p10_speed_mbps": original_size / p90 / 1_000_000,
+        "p90_speed_mbps": original_size / p10 / 1_000_000,
         "status": "pass",
     }
 
@@ -199,8 +216,11 @@ def main():
             )
 
             if "error" not in result:
-                print(f"  {tool_name}: {result['speed_mbps']:.1f} MB/s, "
-                      f"{result['trials']} trials")
+                ci = ""
+                if "p10_speed_mbps" in result:
+                    ci = f" [{result['p10_speed_mbps']:.0f}-{result['p90_speed_mbps']:.0f}]"
+                print(f"  {tool_name}: {result['speed_mbps']:.1f} MB/s{ci}, "
+                      f"{result['trials']} trials, CV={result.get('cv', 0):.1%}")
             else:
                 print(f"  {tool_name}: {result.get('error', 'failed')}")
 

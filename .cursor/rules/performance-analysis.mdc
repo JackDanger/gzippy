@@ -1,0 +1,80 @@
+---
+description: CI performance analysis and strategy for beating all tools (Feb 2026)
+alwaysApply: true
+---
+
+# Performance Analysis & Strategy (Feb 2026)
+
+## Tooling
+
+Use `gzippy-dev` (built at `tools/devtool/`) for all CI and perf work:
+```bash
+./gzippy-dev ci status              # Recent CI runs
+./gzippy-dev ci watch               # Block until CI completes, show results
+./gzippy-dev ci gaps --branch main  # Performance gap analysis
+./gzippy-dev bench --dataset NAME   # Local benchmark
+./gzippy-dev path file.gz           # Trace decompression path
+```
+
+## CI Benchmark Architecture
+
+**Platforms**: x86_64 (EPYC 4-core), arm64 (Graviton 4-core)
+**Datasets**: silesia (211MB), software (~22MB), logs (~22MB)
+**Archive types**: gzip (single-member), bgzf (gzippy format), pigz (single-member!)
+**Thread configs**: T1, Tmax (4)
+**Benchmark invocation**: stdin piped, stdout to file: `tool -d -p{N} < in.gz > out`
+
+## Critical Discoveries
+
+### Benchmark Uses Stdin Path
+CI benchmarks pipe stdin→tool→file. gzippy routes through `decompress_stdin`.
+
+### pigz Output Is Single-Member
+`pigz -1 -c` creates a **single gzip stream**, NOT multiple members. All Tmax
+gaps on pigz files are single-member parallel problems.
+
+### Double-Buffering Eliminated (PRs #49, #50)
+- PR #49: Added T1 fast-path for direct stdout writes
+- PR #50: Extended to ALL non-parallel paths (including Tmax single-member)
+- Key insight: the `Send` requirement for parallel writers is only needed when
+  actual parallelism occurs. Single-member files at Tmax run sequentially, so
+  `BufWriter<StdoutLock>` (not `Send`) works fine.
+
+## Current Gap Summary (PR #49 baseline, PR #50 pending)
+
+**76 wins, 47 gaps** across 123 comparisons.
+
+### Gap Categories
+
+**Category A: Tmax vs rapidgzip (15 gaps, 5 are >10%)**
+Largest gaps: silesia-gzip Tmax arm64 (-30%), x86 (-24%), silesia-pigz Tmax x86 (-21%).
+Root cause: zero parallel speedup on single-member files. No algorithmic shortcut —
+must implement speculative parallel decode.
+
+**Category B: T1 residual (25 gaps, only 3 are >5%)**
+Most are <2% noise. The meaningful ones: software-bgzf T1 arm64 (-14%, likely CI
+variance), compress L1 T1 x86 vs igzip (-12%, ISA-L hand-tuned AVX2 assembly).
+
+**Category C: Tmax vs pigz on arm64 (7 gaps, 2 are >8%)**
+silesia-gzip Tmax arm64 vs pigz (-13%), logs-gzip Tmax arm64 vs pigz (-9%).
+Partially caused by Tmax double-buffering (PR #50 should close ~50% of this).
+After PR #50, remaining gap = sequential inflate speed difference.
+
+### What Won't Help
+- Two-pass parallel: scan pass costs as much as full decode (proven, measured)
+- Prefix-overlap: window convergence fails at high thread counts
+- Simulation benchmarks: always lie about real performance
+- Micro-optimizations in decode loop: LLVM already optimizes well
+
+### Priority Actions
+1. **PR #50** closes Tmax double-buffering (~13% Category C gaps)
+2. **Speculative parallel decode** closes Category A (~20-30% vs rapidgzip)
+3. **igzip L1 compression** gap is not worth pursuing without SIMD assembly
+
+## Production Code Paths
+
+**Compression**: libdeflate (L1-L5, L10-L12), zlib-ng (L6-L9)
+**Decompression**:
+1. Non-parallel (T1 or single-member at Tmax) → `decompress_multi_member_sequential` → libdeflate FFI, direct stdout
+2. Tmax BGZF → `bgzf::decompress_bgzf_parallel` → libdeflate FFI, intermediate buffer
+3. Tmax Multi-member → `bgzf::decompress_multi_member_parallel` → libdeflate FFI, intermediate buffer
