@@ -5,6 +5,7 @@
 
 mod bench;
 mod ci;
+mod cloud;
 mod instrument;
 mod orient;
 mod path_trace;
@@ -82,6 +83,20 @@ fn main() {
             let threads = find_flag(&args, "--threads");
             instrument::run(&args[2], threads.as_deref())
         }
+        "cloud" => {
+            if args.len() < 3 {
+                eprintln!("Usage: gzippy-dev cloud <bench|cleanup>");
+                std::process::exit(1);
+            }
+            match args[2].as_str() {
+                "bench" => cloud::bench(),
+                "cleanup" => cloud::cleanup_all(),
+                _ => {
+                    eprintln!("Unknown cloud subcommand: {}", args[2]);
+                    std::process::exit(1);
+                }
+            }
+        }
         "orient" => orient::run(),
         "help" | "--help" | "-h" => {
             print_usage();
@@ -123,6 +138,10 @@ CI DETAILS:
   ci results [--run ID]        Parse and display benchmark results
   ci gaps [--run ID]           Show performance gaps vs all competitors
   ci compare <ID_A> <ID_B>     Compare gzippy results between two CI runs
+
+CLOUD (dedicated hardware, low jitter):
+  cloud bench                  Launch EC2 fleet, run full benchmarks, tear down
+  cloud cleanup                Delete any leaked cloud resources from prior runs
 
 LOCAL (use sparingly — CI results are authoritative):
   bench [--dataset NAME]       Run local decompression benchmark
