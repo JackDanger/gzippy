@@ -950,8 +950,14 @@ fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> 
     let mut total_bytes = 0u64;
     let mut offset = 0;
 
-    // Pre-allocate a reasonably sized output buffer
-    let mut output_buf = alloc_aligned_buffer(256 * 1024);
+    // Use ISIZE trailer hint for initial buffer sizing (avoids repeated reallocs)
+    let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
+    let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
+        isize_hint + 1024
+    } else {
+        data.len().saturating_mul(4).max(256 * 1024)
+    };
+    let mut output_buf = alloc_aligned_buffer(initial_size);
 
     while offset < data.len() {
         // Check for gzip magic
