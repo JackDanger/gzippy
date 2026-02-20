@@ -154,12 +154,29 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
 
         let is_gzip = matches!(format, CompressionFormat::Gzip | CompressionFormat::Zip);
-        let can_parallelize = args.processes > 1
-            && is_gzip
-            && (has_bgzf_markers(&mmap) || is_likely_multi_member(&mmap));
+        let bgzf = has_bgzf_markers(&mmap);
+        let multi = is_likely_multi_member(&mmap);
+        let can_parallelize = args.processes > 1 && is_gzip && (bgzf || multi);
+
+        if std::env::var("GZIPPY_DEBUG").is_ok() {
+            eprintln!(
+                "[gzippy] decompress_file stdout: len={} bgzf={} multi={} parallel={} procs={}",
+                mmap.len(),
+                bgzf,
+                multi,
+                can_parallelize,
+                args.processes
+            );
+        }
 
         let size = if can_parallelize {
             let output = decompress_gzip_to_vec(&mmap[..], args.processes)?;
+            if std::env::var("GZIPPY_DEBUG").is_ok() {
+                eprintln!(
+                    "[gzippy] decompress_gzip_to_vec returned {} bytes",
+                    output.len()
+                );
+            }
             let len = output.len() as u64;
             writer.write_all(&output)?;
             Ok(len)
@@ -617,9 +634,21 @@ fn decompress_gzip_libdeflate<W: Write + Send>(
 
     if !is_likely_multi_member(data) {
         if std::env::var("GZIPPY_DEBUG").is_ok() {
-            eprintln!("[gzippy] Single-member: {} threads", num_threads);
+            eprintln!(
+                "[gzippy] Single-member path: {} threads, {} bytes",
+                num_threads,
+                data.len()
+            );
         }
         return decompress_single_member(data, writer, num_threads);
+    }
+
+    if std::env::var("GZIPPY_DEBUG").is_ok() {
+        eprintln!(
+            "[gzippy] Multi-member path: {} threads, {} bytes",
+            num_threads,
+            data.len()
+        );
     }
 
     // Multi-member: try parallel decompression first
@@ -970,6 +999,7 @@ fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> 
     let mut decompressor = DecompressorEx::new();
     let mut total_bytes = 0u64;
     let mut offset = 0;
+    let mut member_count = 0u32;
 
     // Use ISIZE trailer hint for initial buffer sizing (avoids repeated reallocs)
     let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
@@ -1001,6 +1031,13 @@ fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> 
         loop {
             match decompressor.gzip_decompress_ex(remaining, &mut output_buf) {
                 Ok(result) => {
+                    member_count += 1;
+                    if std::env::var("GZIPPY_DEBUG").is_ok() {
+                        eprintln!(
+                            "[gzippy] sequential member {}: in_consumed={} out_size={} offset={}/{}",
+                            member_count, result.input_consumed, result.output_size, offset, data.len()
+                        );
+                    }
                     writer.write_all(&output_buf[..result.output_size])?;
                     total_bytes += result.output_size as u64;
                     offset += result.input_consumed;

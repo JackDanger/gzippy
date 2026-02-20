@@ -187,14 +187,23 @@ def compress_once(tool: str, level: int, threads: int, input_file: str, output_f
     return result.returncode == 0, elapsed
 
 
-def decompress_once(tool: str, input_file: str, output_file: str) -> Tuple[bool, float]:
+def decompress_once(tool: str, input_file: str, output_file: str, debug: bool = False) -> Tuple[bool, float]:
     """Decompress once, return (success, elapsed)."""
     bin_path = find_tool(tool)
     cmd = [bin_path, "-d", "-c", input_file]
     
+    env = os.environ.copy()
+    if debug:
+        env["GZIPPY_DEBUG"] = "1"
+    
     start = time.perf_counter()
     with open(output_file, "wb") as f:
-        result = subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
+        if debug:
+            result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, env=env)
+            if result.stderr:
+                print(f"    [DEBUG stderr] {result.stderr.decode('utf-8', errors='replace').strip()}")
+        else:
+            result = subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL, env=env)
     elapsed = time.perf_counter() - start
     
     return result.returncode == 0, elapsed
@@ -311,8 +320,10 @@ def run_validation(
                     for decomp_tool in tools:
                         out = tmpdir / f"{data_type}.{comp_tool}.{decomp_tool}.bin"
                         
+                        use_debug = (decomp_tool == "gzippy" and comp_tool == "gzippy"
+                                     and data_type == "tarball" and level == 1 and threads == 1)
                         stats = run_trials(
-                            lambda dt=decomp_tool, cf=comp_file, o=out: decompress_once(dt, str(cf), str(o)),
+                            lambda dt=decomp_tool, cf=comp_file, o=out, dbg=use_debug: decompress_once(dt, str(cf), str(o), debug=dbg),
                             trials
                         )
                         
