@@ -139,35 +139,44 @@ Key breakthroughs:
 - `src/multi_symbol.rs` - Multi-symbol table (not integrated)
 - `src/vector_huffman.rs` - SIMD infrastructure
 
-### Benchmarks
+### Benchmarks — CI Is the Source of Truth
+
 ```bash
-# Main benchmark (use this for all testing)
-cargo test --release bench_cf_silesia -- --nocapture
+# CI workflow (authoritative — covers x86_64 + arm64, all datasets, all competitors)
+gzippy-dev ci triage              # See categorized gaps and win rate
+gzippy-dev ci push                # Push → CI → auto-triage + compare vs main
+gzippy-dev ci vs-main             # Compare branch vs main (auto-finds runs)
+gzippy-dev ci history --limit 10  # Win rate trend
 
-# Multi-dataset benchmark
-cargo test --release bench_diversity -- --nocapture
-
-# Parallel benchmark (BGZF)
-cargo test --release bench_bgzf -- --nocapture
+# Local benchmarks (for rapid iteration only, NOT for final decisions)
+cargo test --release bench_cf_silesia -- --nocapture  # Pure Rust inflate speed
+gzippy-dev instrument file.gz                          # Timing breakdown
+gzippy-dev path file.gz                                # Which code path runs
 ```
 
 ## How to Make Progress
 
-### Step 1: Understand the Hot Path
-Read `src/libdeflate_decode.rs:607-791` (decode_huffman function). This is where 90%+ of time is spent.
-
-### Step 2: Profile
+### Step 1: See Where We Stand
 ```bash
-cargo build --release
-perf record ./target/release/gzippy -d < silesia.tar.gz > /dev/null
-perf report
+gzippy-dev ci triage   # Categorized gaps with root causes
 ```
 
-### Step 3: Try ONE Thing
-Make ONE small change, benchmark, compare. Never change multiple things at once.
+### Step 2: Understand the Code Path
+```bash
+gzippy-dev instrument file.gz  # Where does time go?
+gzippy-dev path file.gz        # Which inflate function runs?
+```
 
-### Step 4: Document Results
-Update this file with what you tried and the result.
+### Step 3: Make ONE Change
+Make ONE focused change. Run `cargo test --release` for correctness.
+
+### Step 4: Validate on CI
+```bash
+gzippy-dev ci push   # Push → watch CI → auto-triage + compare vs main
+```
+
+**Never claim a win/loss based on local results alone.** arm64 performance can
+differ significantly from local Apple M3 or x86 results.
 
 ## Key Insights from libdeflate/rapidgzip Analysis
 
@@ -203,34 +212,30 @@ Update this file with what you tried and the result.
 ## Test Commands
 
 ```bash
-# Quick correctness test
-cargo test --release test_silesia
-
-# Main performance benchmark
-cargo test --release bench_cf_silesia -- --nocapture
-
-# All tests
+# Correctness
 cargo test --release
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --check
 
-# Clippy (required before commit)
-cargo clippy
+# Performance (CI is authoritative, these are for rapid iteration)
+gzippy-dev ci triage          # Live gap analysis from CI
+gzippy-dev ci push            # Full CI cycle with auto-comparison
+gzippy-dev ci vs-main         # Branch vs main
 
-# Format
-cargo fmt
+# Devtool tests
+cd tools/devtool && cargo test && cargo clippy --all-targets -- -D warnings
 ```
 
 ## Commit Guidelines
 
-1. Every commit must pass clippy
-2. Every commit must be formatted with cargo fmt
-3. Performance changes must include benchmark results in commit message
-4. Use conventional commits: `feat:`, `fix:`, `perf:`, `refactor:`
+1. Every commit must pass clippy and cargo fmt
+2. Performance changes must cite CI results (not local benchmarks)
+3. Use conventional commits: `feat:`, `fix:`, `perf:`, `refactor:`
 
 ## Remember
 
-- **We MATCH or EXCEED libdeflate** - 99% on SILESIA, 106-114% on SOFTWARE/LOGS
-- **Pure Rust achieved parity** - No FFI, no unsafe C code needed
-- **Parallel exceeds libdeflate** - 148% with 8 threads on BGZF
-- **The 130% target is partially achieved** - SOFTWARE and LOGS exceed it!
-- **Simpler is often faster** - Specialized decoder was SLOWER than libdeflate-style
-- **Measure, measure, measure** - The specialized path regression was unexpected
+- **CI is the source of truth** — local benchmarks are for rapid iteration only
+- **One change at a time** — push, check CI, iterate
+- **arm64 CI is noisy** — CV 0.2-0.3 on small files, >10% swings are normal
+- **Program the tool, then use the tool** — don't do manual analysis
+- **Simpler is often faster** — micro-optimizations frequently regress on CI

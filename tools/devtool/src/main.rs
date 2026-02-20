@@ -31,6 +31,13 @@ fn main() {
                 "watch" => ci::watch(run_id.as_deref(), branch.as_deref()),
                 "results" => ci::results(run_id.as_deref(), branch.as_deref()),
                 "gaps" => ci::gaps(run_id.as_deref(), branch.as_deref()),
+                "triage" => ci::triage(run_id.as_deref(), branch.as_deref()),
+                "history" => {
+                    let limit = find_flag(&args, "--limit")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(5);
+                    ci::history(branch.as_deref(), limit)
+                }
                 "compare" => {
                     if args.len() < 5 {
                         eprintln!("Usage: gzippy-dev ci compare <run_id_a> <run_id_b>");
@@ -38,6 +45,8 @@ fn main() {
                     }
                     ci::compare(&args[3], &args[4])
                 }
+                "vs-main" => ci::vs_main(branch.as_deref()),
+                "push" => ci::push_and_watch(),
                 _ => {
                     eprintln!("Unknown ci subcommand: {}", args[2]);
                     std::process::exit(1);
@@ -45,8 +54,18 @@ fn main() {
             }
         }
         "bench" => {
-            let dataset = find_flag(&args, "--dataset");
-            bench::run(dataset.as_deref())
+            if args.len() >= 3 && args[2] == "ab" {
+                if args.len() < 5 {
+                    eprintln!("Usage: gzippy-dev bench ab <ref-a> <ref-b> [--dataset NAME] [--threads N]");
+                    std::process::exit(1);
+                }
+                let dataset = find_flag(&args, "--dataset");
+                let threads = find_flag(&args, "--threads");
+                bench::run_ab(&args[3], &args[4], dataset.as_deref(), threads.as_deref())
+            } else {
+                let dataset = find_flag(&args, "--dataset");
+                bench::run(dataset.as_deref())
+            }
         }
         "path" => {
             if args.len() < 3 {
@@ -92,13 +111,22 @@ fn print_usage() {
     eprintln!(
         r#"gzippy-dev — Development tool for the gzippy project
 
-COMMANDS:
+CI WORKFLOW (use these — CI is the source of truth):
+  ci triage [--run ID]         Categorized gap analysis with root causes and actions
+  ci vs-main                   Compare current branch vs main (auto-finds runs)
+  ci push                      Push, wait for CI, auto-triage + compare vs main
+  ci history [--limit N]       Win rate trend across recent CI runs
+
+CI DETAILS:
   ci status                    Show status of recent CI runs
   ci watch [--run ID]          Block until a CI run completes
   ci results [--run ID]        Parse and display benchmark results
   ci gaps [--run ID]           Show performance gaps vs all competitors
   ci compare <ID_A> <ID_B>     Compare gzippy results between two CI runs
+
+LOCAL (use sparingly — CI results are authoritative):
   bench [--dataset NAME]       Run local decompression benchmark
+  bench ab <ref-a> <ref-b>     A/B benchmark: build two refs, compare speeds
   path <file.gz>               Trace which decompression path a file takes
   instrument <file.gz>         Decompress with detailed timing breakdown
   orient                       Show project state, strategy, and what's next
@@ -107,14 +135,14 @@ OPTIONS:
   --run ID                     Specific GitHub Actions run ID
   --branch NAME                Filter CI runs to a specific branch
   --dataset NAME               silesia, software, logs (default: all available)
-  --threads N                  Thread count for instrument (default: 1)
+  --threads N                  Thread count for bench ab / instrument (default: 1)
+  --limit N                    Number of CI runs for history (default: 5)
 
-EXAMPLES:
-  gzippy-dev orient                              # Where are we? What's next?
-  gzippy-dev ci gaps                             # Live gap analysis
-  gzippy-dev ci compare 22205101167 22206170307  # Did PR help or hurt?
-  gzippy-dev instrument data.gz --threads 4      # Timing breakdown
-  gzippy-dev bench --dataset silesia             # Local benchmark
+TYPICAL WORKFLOW:
+  gzippy-dev ci triage                     # 1. See where we stand
+  # ... make code changes ...
+  gzippy-dev ci push                       # 2. Push → CI → auto-triage + vs-main
+  gzippy-dev ci vs-main                    # 3. Check anytime: branch vs main
 "#
     );
 }

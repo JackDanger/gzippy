@@ -47,7 +47,7 @@ pub fn run(dataset: Option<&str>) -> Result<(), String> {
             ("gzip -d", "gzip", vec!["-d", "-c"]),
         ] {
             if let Ok(path_str) = which(binary) {
-                match benchmark_tool(&path_str, &args.iter().map(|s| *s).collect::<Vec<_>>(), path, file_size) {
+                match benchmark_tool(&path_str, &args.to_vec(), path, file_size) {
                     Ok((speed, cv, trials)) => {
                         let vs_gzippy = (gzippy_result.0 / speed - 1.0) * 100.0;
                         let icon = if vs_gzippy > 5.0 {
@@ -153,7 +153,7 @@ fn discover_datasets(dir: &PathBuf, filter: Option<&str>) -> Result<Vec<(String,
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().map_or(false, |e| e == "gz") {
+        if path.extension().is_some_and(|e| e == "gz") {
             let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
             if let Some(f) = filter {
                 if !name.contains(f) {
@@ -178,5 +178,280 @@ fn which(binary: &str) -> Result<String, String> {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         Err(format!("{binary} not found in PATH"))
+    }
+}
+
+// ─── A/B benchmark comparison ───────────────────────────────────────────────
+
+pub fn run_ab(ref_a: &str, ref_b: &str, dataset: Option<&str>, threads: Option<&str>) -> Result<(), String> {
+    let data_dir = find_benchmark_data()?;
+    let datasets = discover_datasets(&data_dir, dataset)?;
+    if datasets.is_empty() {
+        return Err("No benchmark data found. Run: ./scripts/prepare_benchmark_data.sh".to_string());
+    }
+
+    // Save current state
+    let current_branch = git_output(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let is_dirty = !git_output(&["status", "--porcelain"])?.is_empty();
+
+    if is_dirty {
+        println!("  Stashing uncommitted changes...");
+        git_run(&["stash", "push", "-m", "gzippy-dev bench ab"])?;
+    }
+
+    let thread_count = threads.unwrap_or("1");
+    println!("╔══════════════════════════════════════════════════════════════════════════╗");
+    println!("║  A/B BENCHMARK COMPARISON                                              ║");
+    println!("╚══════════════════════════════════════════════════════════════════════════╝");
+    println!("  Ref A: {ref_a}");
+    println!("  Ref B: {ref_b}");
+    if thread_count != "1" {
+        println!("  Threads: {thread_count}");
+    }
+
+    let result = run_ab_inner(ref_a, ref_b, &datasets, thread_count);
+
+    // Restore original state regardless of outcome
+    let checkout_result = git_run(&["checkout", current_branch.trim()]);
+    if is_dirty {
+        let _ = git_run(&["stash", "pop"]);
+    }
+    checkout_result?;
+
+    result
+}
+
+fn run_ab_inner(
+    ref_a: &str,
+    ref_b: &str,
+    datasets: &[(String, PathBuf)],
+    threads: &str,
+) -> Result<(), String> {
+    let tmp_dir = std::env::temp_dir().join("gzippy-ab");
+    std::fs::create_dir_all(&tmp_dir)
+        .map_err(|e| format!("Cannot create {}: {e}", tmp_dir.display()))?;
+
+    let binary_a = tmp_dir.join("gzippy-a");
+    let binary_b = tmp_dir.join("gzippy-b");
+
+    // Build ref A
+    println!("\n  Building ref A ({ref_a})...");
+    git_run(&["checkout", ref_a])?;
+    cargo_build_release()?;
+    std::fs::copy("target/release/gzippy", &binary_a)
+        .map_err(|e| format!("Cannot copy binary: {e}"))?;
+    let commit_a = git_output(&["rev-parse", "--short", "HEAD"])?;
+    println!("    Built {} ({})", ref_a, commit_a.trim());
+
+    // Build ref B
+    println!("  Building ref B ({ref_b})...");
+    git_run(&["checkout", ref_b])?;
+    cargo_build_release()?;
+    std::fs::copy("target/release/gzippy", &binary_b)
+        .map_err(|e| format!("Cannot copy binary: {e}"))?;
+    let commit_b = git_output(&["rev-parse", "--short", "HEAD"])?;
+    println!("    Built {} ({})", ref_b, commit_b.trim());
+
+    let thread_flag = format!("-p{threads}");
+
+    // Benchmark both
+    println!("\n  {:<36} {:>10} {:>10} {:>9}",
+             "Dataset", ref_a, ref_b, "Change");
+    println!("  {}", "─".repeat(68));
+
+    let mut total_a = 0.0f64;
+    let mut total_b = 0.0f64;
+    let mut count = 0u32;
+
+    for (name, path) in datasets {
+        // Read input once and reuse for all trials
+        let input_data = std::fs::read(path)
+            .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+
+        let bin_a = binary_a.to_str().unwrap();
+        let bin_b = binary_b.to_str().unwrap();
+
+        // Interleave trials: A B A B A B ... to reduce temporal bias
+        let mut speeds_a = Vec::new();
+        let mut speeds_b = Vec::new();
+
+        for _ in 0..MAX_TRIALS {
+            if let Ok(s) = measure_with_threads(bin_a, &input_data, &thread_flag) {
+                speeds_a.push(s);
+            }
+            if let Ok(s) = measure_with_threads(bin_b, &input_data, &thread_flag) {
+                speeds_b.push(s);
+            }
+
+            if speeds_a.len() >= MIN_TRIALS as usize && speeds_b.len() >= MIN_TRIALS as usize {
+                let cv_a = coefficient_of_variation(&speeds_a);
+                let cv_b = coefficient_of_variation(&speeds_b);
+                if cv_a < TARGET_CV && cv_b < TARGET_CV {
+                    break;
+                }
+            }
+        }
+
+        if speeds_a.is_empty() || speeds_b.is_empty() {
+            println!("  {:<36} (benchmark failed)", name);
+            continue;
+        }
+
+        let mean_a = speeds_a.iter().sum::<f64>() / speeds_a.len() as f64;
+        let mean_b = speeds_b.iter().sum::<f64>() / speeds_b.len() as f64;
+        let change = (mean_b / mean_a - 1.0) * 100.0;
+
+        let flag = if change > 5.0 {
+            " FASTER"
+        } else if change < -5.0 {
+            " SLOWER"
+        } else {
+            ""
+        };
+
+        println!("  {:<36} {:>8.1}  {:>8.1}  {:>+7.1}%{}",
+                 name, mean_a, mean_b, change, flag);
+
+        total_a += mean_a;
+        total_b += mean_b;
+        count += 1;
+    }
+
+    if count > 0 {
+        let overall = (total_b / total_a - 1.0) * 100.0;
+        println!("  {}", "─".repeat(68));
+        println!("  {:<36} {:>8.1}  {:>8.1}  {:>+7.1}%",
+                 "TOTAL (sum of means)", total_a, total_b, overall);
+    }
+
+    // Cleanup
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    Ok(())
+}
+
+fn measure_with_threads(binary: &str, input_data: &[u8], thread_flag: &str) -> Result<f64, String> {
+    let start = Instant::now();
+    let mut child = Command::new(binary)
+        .args(["-d", thread_flag])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to run {binary}: {e}"))?;
+
+    if let Some(ref mut stdin) = child.stdin {
+        use std::io::Write;
+        stdin.write_all(input_data)
+            .map_err(|e| format!("Write to stdin failed: {e}"))?;
+    }
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output()
+        .map_err(|e| format!("Wait failed: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!("{binary} failed"));
+    }
+
+    let elapsed = start.elapsed();
+    let decompressed_size = output.stdout.len() as f64;
+    Ok(decompressed_size / elapsed.as_secs_f64() / 1_048_576.0)
+}
+
+pub(crate) fn coefficient_of_variation(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return f64::MAX;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    if mean == 0.0 {
+        return f64::MAX;
+    }
+    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+    variance.sqrt() / mean
+}
+
+fn git_run(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("git {} failed: {e}", args[0]))?;
+
+    if !output.status.success() {
+        return Err(format!("git {} failed: {}", args[0],
+                          String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(())
+}
+
+fn git_output(args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("git {} failed: {e}", args[0]))?;
+
+    if !output.status.success() {
+        return Err(format!("git {} failed: {}", args[0],
+                          String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn cargo_build_release() -> Result<(), String> {
+    let output = Command::new("cargo")
+        .args(["build", "--release"])
+        .output()
+        .map_err(|e| format!("cargo build failed: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!("cargo build --release failed:\n{}",
+                          String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cv_empty() {
+        assert_eq!(coefficient_of_variation(&[]), f64::MAX);
+    }
+
+    #[test]
+    fn test_cv_single_value() {
+        let cv = coefficient_of_variation(&[100.0]);
+        assert_eq!(cv, 0.0);
+    }
+
+    #[test]
+    fn test_cv_identical_values() {
+        let cv = coefficient_of_variation(&[100.0, 100.0, 100.0]);
+        assert!(cv < 0.001, "CV should be ~0 for identical values, got {cv}");
+    }
+
+    #[test]
+    fn test_cv_known_values() {
+        // mean = 100, stddev = 10, cv = 0.1
+        let cv = coefficient_of_variation(&[90.0, 100.0, 110.0]);
+        assert!((cv - 0.0816).abs() < 0.01, "CV should be ~0.08, got {cv}");
+    }
+
+    #[test]
+    fn test_cv_zeros() {
+        assert_eq!(coefficient_of_variation(&[0.0, 0.0]), f64::MAX);
+    }
+
+    #[test]
+    fn test_cv_high_variance() {
+        let cv = coefficient_of_variation(&[1.0, 100.0]);
+        assert!(cv > 0.5, "CV should be high for very different values, got {cv}");
+    }
+
+    #[test]
+    fn test_cv_low_variance() {
+        let cv = coefficient_of_variation(&[100.0, 101.0, 99.0, 100.5, 99.5]);
+        assert!(cv < 0.01, "CV should be low for tight values, got {cv}");
     }
 }
