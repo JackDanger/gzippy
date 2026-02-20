@@ -43,16 +43,16 @@ impl Default for BenchArgs {
 }
 
 #[derive(Clone)]
-struct ToolResult {
-    dataset: String,
-    archive: String,
-    threads: String,
-    tool: String,
-    speed_mbps: f64,
-    cv: f64,
-    trials: u32,
-    status: String,
-    error: Option<String>,
+pub struct ToolResult {
+    pub dataset: String,
+    pub archive: String,
+    pub threads: String,
+    pub tool: String,
+    pub speed_mbps: f64,
+    pub cv: f64,
+    pub trials: u32,
+    pub status: String,
+    pub error: Option<String>,
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
@@ -173,6 +173,114 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Run benchmarks and return structured results (for in-process use by cloud.rs).
+pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), String> {
+    let platform = detect_platform();
+    let max_threads = num_cpus();
+    let repo_root = find_repo_root()?;
+    let data_dir = find_data_dir(&repo_root)?;
+    let bin_dir = find_bin_dir(&repo_root);
+
+    let tools = discover_tools(&bin_dir);
+    if tools.is_empty() {
+        return Err("No benchmark tools found".into());
+    }
+
+    let datasets = discover_datasets(&data_dir, args.dataset.as_deref())?;
+    if datasets.is_empty() {
+        return Err(format!(
+            "No benchmark datasets found in {}",
+            data_dir.display()
+        ));
+    }
+
+    let thread_configs: Vec<(usize, &str)> = match args.threads {
+        Some(1) => vec![(1, "T1")],
+        Some(n) => vec![(n, "Tmax")],
+        None if max_threads > 1 => vec![(1, "T1"), (max_threads, "Tmax")],
+        None => vec![(1, "T1")],
+    };
+
+    eprintln!("[{platform}] bench: {} datasets, {} tools, trials {}-{}",
+        datasets.len(), tools.len(), args.min_trials, args.max_trials);
+
+    let mut results: Vec<ToolResult> = Vec::new();
+    let tmp_dir = std::env::temp_dir().join("gzippy-bench");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let output_file = tmp_dir.join("bench-output.bin");
+
+    for ds in &datasets {
+        for (archive_name, compressed_path) in &ds.archives {
+            if let Some(ref af) = args.archive {
+                if archive_name != af {
+                    continue;
+                }
+            }
+            for &(threads, threads_label) in &thread_configs {
+                eprint!("  [{platform}] {}-{archive_name} {threads_label}  ", ds.name);
+                let _ = std::io::stderr().flush();
+
+                for (tool_name, tool_path) in &tools {
+                    if threads > 1 && is_single_threaded(tool_name) {
+                        continue;
+                    }
+
+                    let result = benchmark_one(
+                        tool_name,
+                        tool_path,
+                        compressed_path,
+                        &ds.raw_path,
+                        ds.original_size,
+                        threads,
+                        &output_file,
+                        args.min_trials,
+                        args.max_trials,
+                        args.target_cv,
+                    );
+
+                    let tr = match result {
+                        Ok((speed, cv, trials)) => {
+                            eprint!("{tool_name}:{speed:.0}  ");
+                            let _ = std::io::stderr().flush();
+                            ToolResult {
+                                dataset: ds.name.clone(),
+                                archive: archive_name.clone(),
+                                threads: threads_label.to_string(),
+                                tool: tool_name.clone(),
+                                speed_mbps: speed,
+                                cv,
+                                trials,
+                                status: "pass".into(),
+                                error: None,
+                            }
+                        }
+                        Err(e) => {
+                            eprint!("{tool_name}:ERR  ");
+                            let _ = std::io::stderr().flush();
+                            ToolResult {
+                                dataset: ds.name.clone(),
+                                archive: archive_name.clone(),
+                                threads: threads_label.to_string(),
+                                tool: tool_name.clone(),
+                                speed_mbps: 0.0,
+                                cv: 0.0,
+                                trials: 0,
+                                status: "fail".into(),
+                                error: Some(e),
+                            }
+                        }
+                    };
+                    results.push(tr);
+                }
+                eprintln!();
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    Ok((platform, results))
 }
 
 // ─── Benchmark engine ─────────────────────────────────────────────────────────

@@ -9,10 +9,14 @@
 //!   6. Strict scoring: gzippy must be >= every competitor, or it's a loss
 //!
 //! Uses `aws-vault exec personal` for credentials.
+//!
+//! Also runs local Mac benchmarks in parallel with the cloud fleet.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+use crate::bench;
 use std::time::{Duration, Instant};
 
 const REGION: &str = "us-east-1";
@@ -812,20 +816,60 @@ fn run_fleet(
         }
     }
 
-    // Run benchmarks on all 6 instances in parallel
-    println!("\n  ═══ BENCHMARKS ({} instances in parallel) ═══", instances.len());
+    // Run benchmarks on all instances + local Mac in parallel
+    println!(
+        "\n  ═══ BENCHMARKS ({} cloud instances + local Mac in parallel) ═══",
+        instances.len()
+    );
 
-    let handles: Vec<_> = instances.iter().map(|inst| {
-        let ip = inst.ip.clone();
-        let key = key_path.clone();
-        let label = format!("{}/{}", inst.arch, inst.dataset);
-        let dataset = inst.dataset.to_string();
-        std::thread::spawn(move || run_benchmarks_on(&ip, &key, &label, Some(&dataset)))
-    }).collect();
+    let cloud_handles: Vec<_> = instances
+        .iter()
+        .map(|inst| {
+            let ip = inst.ip.clone();
+            let key = key_path.clone();
+            let label = format!("{}/{}", inst.arch, inst.dataset);
+            let dataset = inst.dataset.to_string();
+            std::thread::spawn(move || run_benchmarks_on(&ip, &key, &label, Some(&dataset)))
+        })
+        .collect();
+
+    // Local Mac benchmark runs in parallel with the cloud fleet
+    let local_handle = std::thread::spawn(|| -> Result<Vec<BenchResult>, String> {
+        let args = bench::BenchArgs {
+            min_trials: SWEEP_MIN_TRIALS,
+            max_trials: SWEEP_MAX_TRIALS,
+            target_cv: SWEEP_TARGET_CV,
+            ..Default::default()
+        };
+        let (platform, results) = bench::run_and_collect(&args)?;
+        let label = format!("local-{platform}");
+        Ok(results
+            .into_iter()
+            .filter(|r| r.status == "pass")
+            .map(|r| BenchResult {
+                platform: label.clone(),
+                dataset: r.dataset,
+                archive: r.archive,
+                threads: r.threads,
+                tool: r.tool,
+                speed_mbps: r.speed_mbps,
+                cv: r.cv,
+                trials: r.trials,
+            })
+            .collect())
+    });
 
     let mut all = Vec::new();
-    for h in handles {
-        all.extend(h.join().map_err(|_| "bench thread panic")??);
+    for h in cloud_handles {
+        all.extend(h.join().map_err(|_| "cloud bench thread panic")??);
+    }
+    match local_handle.join() {
+        Ok(Ok(local_results)) => {
+            println!("\n  [local] {} results collected", local_results.len());
+            all.extend(local_results);
+        }
+        Ok(Err(e)) => eprintln!("\n  [local] Benchmark failed: {e}"),
+        Err(_) => eprintln!("\n  [local] Benchmark thread panicked"),
     }
 
     let elapsed = total_start.elapsed();
