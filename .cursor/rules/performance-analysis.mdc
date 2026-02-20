@@ -11,6 +11,36 @@ alwaysApply: true
 and arm64 (Graviton) with all datasets, archive types, thread configs, and competitors.
 Local runs are useful for rapid iteration but CI is authoritative.
 
+**Never compromise performance under any conditions.** There is no threshold below
+which a regression is acceptable. Never accept a clippy/lint suggestion in a hot path
+without verifying identical codegen. Use `#[allow(clippy::...)]` to suppress lints
+rather than changing code that might be slower. Every nanosecond counts.
+
+## Benchmarking Architecture (Feb 2026)
+
+**ONE benchmark implementation**: `gzippy-dev bench` is THE authoritative benchmark.
+It runs everywhere — local, cloud fleet, CI — with identical logic.
+
+```
+gzippy-dev bench                    # human output, all datasets/archives/threads
+gzippy-dev bench --json             # machine-readable, same data
+gzippy-dev bench --dataset silesia  # one dataset
+gzippy-dev bench --archive bgzf     # one archive type
+gzippy-dev bench --threads 1        # T1 only
+gzippy-dev bench --min-trials 50 --max-trials 200 --target-cv 0.005  # precision
+```
+
+**Cloud fleet** (`gzippy-dev cloud bench`): launches x86 + arm64 EC2 instances,
+builds gzippy-dev on them, runs `gzippy-dev bench --json` via SSH, two-phase
+sweep+precision, strict scoring. Same code, same logic, deterministic numbers.
+
+**Key cloud learnings**:
+- EBS gp3 caps at ~131 MB/s; ALL data MUST be in /dev/shm (RAM) or numbers are wrong
+- On-demand instances avoid spot capacity errors; cost is negligible for ~15min runs
+- Two-phase: sweep at CV<2%, then precision re-run close races at CV<0.5%
+- Python benchmark scripts (`scripts/benchmark_*.py`) remain for CI compatibility
+  but gzippy-dev bench is the source of truth
+
 ## The Loop
 
 ```
@@ -18,6 +48,7 @@ gzippy-dev ci triage          # 1. What gaps remain?
 # ... make ONE focused code change ...
 gzippy-dev ci push            # 2. Push → CI → auto-triage + vs-main
 gzippy-dev ci vs-main         # 3. Check anytime: did branch help or hurt?
+gzippy-dev cloud bench        # 4. Low-jitter verification on dedicated hardware
 ```
 
 ## Current Status: ~92% Effective Win Rate (Feb 20 2026)
@@ -99,9 +130,14 @@ all optional fields to find the true deflate data offset.
 
 ## Remaining Gaps
 
-### ACTIONABLE: None
+### ACTIONABLE: 1 gap (pending CI verification)
 
-All previously ACTIONABLE gaps have been closed or reclassified:
+- `silesia-gzip Tmax arm64` vs pigz: -10.2% (113 vs 125.8 MB/s). Caused by
+  speculative parallel overhead (thread spawn + block search before fallback).
+  Fix pushed: removed speculative parallel from production path. Expecting
+  Tmax to match T1 performance (~133 MB/s), closing this gap.
+
+Previously closed:
 - `silesia-bgzf Tmax x86` vs rapidgzip: **CLOSED** (+6.6% ahead, 346.5 vs 325 MB/s)
 - `silesia-gzip T1 x86` vs igzip: **CLOSED** (+5.1% ahead, 266.6 vs 253.6 MB/s)
 - `software-bgzf T1 arm64` vs pigz: **NOISE** (24% swing between identical code runs)
@@ -112,24 +148,20 @@ All previously ACTIONABLE gaps have been closed or reclassified:
 - Requires rapidgzip-style pipeline (dedicated block-finder + decoder threads)
 - Two-pass approach proven insufficient (scan pass overhead too high on 4 cores)
 
-### Speculative Parallel (Feb 2026 — Evaluated, Infrastructure Ready)
+### Speculative Parallel (Feb 2026 — Removed from Production)
 
-Wired `speculative_parallel.rs` into production for Tmax single-member files.
-Safety: ISIZE early check + CRC32 final check + fast fallback (<1ms overhead).
+`speculative_parallel.rs` was wired into production for Tmax single-member files,
+but CI revealed it caused a **-15% regression on arm64** (133→113 MB/s on silesia).
+The block finder always falls back to sequential on complex data, but thread
+spawning + block search overhead is non-trivial, especially on Graviton.
 
-**Current status**: Always falls back to sequential on silesia data because the
-block finder produces false positives. The precode leaf count check (rapidgzip
-style) isn't sufficient to reject all false block starts in complex data.
+**Key lesson**: Even "fast-fail" attempts have real overhead. Thread spawn/join
+plus scanning 16KB windows with 8 bit offsets per thread costs enough to cause
+a measurable regression. Never wire experimental code into the hot path until
+it actually succeeds on representative data.
 
-**Why it fails**: The `validate_block_start` trial decode (256 symbols) isn't
-selective enough. Random bit patterns in compressed data can form valid Huffman
-tables that decode 256 symbols without error. Need either:
-1. Much longer trial decode (4096+ symbols)
-2. Entropy-based validation of decoded output
-3. rapidgzip's full block-finder pipeline (13-bit LUT + multiple search stages)
-
-**The infrastructure is safe and ready** — when the block finder improves, the
-parallel path will activate automatically with no production code changes.
+**The code is preserved** in `src/speculative_parallel.rs` (not compiled).
+Re-enable only when the block finder reliably finds boundaries on silesia.
 
 ### SIMD (3 gaps, accepted)
 - L1 compression vs igzip's AVX2/AVX-512 assembly
@@ -139,5 +171,23 @@ parallel path will activate automatically with no production code changes.
 **Platforms**: x86_64 (EPYC 4-core), arm64 (Graviton 4-core)
 **Datasets**: silesia (211MB), software (~22MB), logs (~22MB)
 **Archives**: gzip, bgzf, pigz — thread configs T1 and Tmax (4)
-**Benchmark path**: `subprocess.run([tool, "-d"], stdin=fin, stdout=fout)` (stdin pipe, not file arg)
-**Convergence**: min 10, max 40 trials, target CV <3%
+**CI path**: Python scripts + `subprocess.run([tool, "-d"], stdin=fin, stdout=fout)`
+**Cloud path**: `gzippy-dev bench --json` (stdin→file methodology, same semantics)
+**Convergence**: min 10, max 40 trials, target CV <3% (sweep); 50-200 trials, CV<0.5% (precision)
+
+## What Works vs What Doesn't for Benchmarking
+
+### Works
+- RAM-backed I/O (/dev/shm): eliminates disk bottleneck, reveals true CPU speed
+- On-demand instances: no capacity errors, reliable launch
+- Two-phase sweep+precision: fast sweep catches obvious wins, precision resolves close races
+- Trimmed stats (drop min/max): reduces outlier impact
+- Same binary for bench tool on cloud and local: no drift between implementations
+- ISIZE-based buffer pre-allocation: avoids speculative remaining*4 alloc
+
+### Doesn't Work
+- EBS gp3 for benchmarks: 131 MB/s cap makes all tools look identical
+- Spot instances: InsufficientInstanceCapacity errors in single-AZ setup
+- Simulation benchmarks: always lie about real-world performance
+- Multiple benchmark implementations: drift between Python scripts vs Rust code
+- Flat noise thresholds: arm64 small files have 25% variance, silesia x86 has 3%

@@ -64,8 +64,22 @@ fn main() {
                 let threads = find_flag(&args, "--threads");
                 bench::run_ab(&args[3], &args[4], dataset.as_deref(), threads.as_deref())
             } else {
-                let dataset = find_flag(&args, "--dataset");
-                bench::run(dataset.as_deref())
+                let bench_args = bench::BenchArgs {
+                    dataset: find_flag(&args, "--dataset"),
+                    archive: find_flag(&args, "--archive"),
+                    threads: find_flag(&args, "--threads").and_then(|s| s.parse().ok()),
+                    json: args.iter().any(|a| a == "--json"),
+                    min_trials: find_flag(&args, "--min-trials")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(10),
+                    max_trials: find_flag(&args, "--max-trials")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(40),
+                    target_cv: find_flag(&args, "--target-cv")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0.03),
+                };
+                bench::run(&bench_args)
             }
         }
         "path" => {
@@ -143,17 +157,26 @@ CLOUD (dedicated hardware, low jitter):
   cloud bench                  Launch EC2 fleet, run full benchmarks, tear down
   cloud cleanup                Delete any leaked cloud resources from prior runs
 
-LOCAL (use sparingly — CI results are authoritative):
-  bench [--dataset NAME]       Run local decompression benchmark
-  bench ab <ref-a> <ref-b>     A/B benchmark: build two refs, compare speeds
+BENCHMARK (one source of truth for all perf numbers):
+  bench [FLAGS]                Run decompression benchmark (human output)
+  bench --json                 Same, but JSON to stdout (used by cloud fleet)
+  bench ab <ref-a> <ref-b>     A/B comparison of two git refs
   path <file.gz>               Trace which decompression path a file takes
   instrument <file.gz>         Decompress with detailed timing breakdown
   orient                       Show project state, strategy, and what's next
 
+BENCH FLAGS:
+  --dataset NAME               silesia, software, logs (default: all found)
+  --archive TYPE               gzip, bgzf, pigz (default: all found)
+  --threads N                  1 for T1, >1 for Tmax (default: both)
+  --json                       Machine-readable JSON output on stdout
+  --min-trials N               Minimum trial runs (default: 10)
+  --max-trials N               Maximum trial runs (default: 40)
+  --target-cv F                Target coefficient of variation (default: 0.03)
+
 OPTIONS:
   --run ID                     Specific GitHub Actions run ID
   --branch NAME                Filter CI runs to a specific branch
-  --dataset NAME               silesia, software, logs (default: all available)
   --threads N                  Thread count for bench ab / instrument (default: 1)
   --limit N                    Number of CI runs for history (default: 5)
 

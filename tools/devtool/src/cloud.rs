@@ -1,24 +1,23 @@
 //! Cloud fleet benchmarking: spin up EC2 on-demand instances, run benchmarks, tear down.
 //!
-//! Optimized for lowest latency:
-//!   - On-demand instances (no spot capacity waits)
-//!   - Larger instances (faster builds, more cores)
-//!   - RAM-backed I/O (/dev/shm) to eliminate EBS bottleneck
-//!   - Both platforms run fully in parallel
-//!   - Two-phase benchmarks: sweep then precision re-runs for close races
+//! Architecture:
+//!   1. Launch x86_64 + arm64 EC2 instances in parallel
+//!   2. User-data builds gzippy, gzippy-dev, and all competitor tools
+//!   3. Benchmark data staged to /dev/shm (RAM-backed, no EBS bottleneck)
+//!   4. SSH: `gzippy-dev bench --json` — same tool, same code, local or cloud
+//!   5. Two-phase: sweep first, then precision re-runs for close races
+//!   6. Strict scoring: gzippy must be >= every competitor, or it's a loss
 //!
 //! Uses `aws-vault exec personal` for credentials.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const REGION: &str = "us-east-1";
-// 16 vCPU for fast builds; benchmarks use -p4 to match CI runner core count
 const X86_TYPE: &str = "c6i.4xlarge";
 const ARM64_TYPE: &str = "c7g.4xlarge";
-const BENCH_THREADS: usize = 4;
 const TAG_KEY: &str = "gzippy-bench";
 const SSH_USER: &str = "ubuntu";
 const SETUP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
@@ -32,7 +31,6 @@ const SWEEP_TARGET_CV: f64 = 0.02;
 const PRECISION_MIN_TRIALS: u32 = 50;
 const PRECISION_MAX_TRIALS: u32 = 200;
 const PRECISION_TARGET_CV: f64 = 0.005;
-// If gzippy is within this % of a competitor, it's a "close race" needing re-run
 const CLOSE_RACE_THRESHOLD: f64 = 3.0;
 
 // ─── AWS CLI ──────────────────────────────────────────────────────────────────
@@ -93,30 +91,6 @@ fn ssh_ok(ip: &str, key: &Path) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-#[allow(dead_code)]
-fn ssh_stream(
-    ip: &str, key: &Path, cmd: &str, prefix: &str,
-) -> Result<Vec<String>, String> {
-    let mut child = Command::new("ssh")
-        .args(ssh_opts(key))
-        .arg(format!("{SSH_USER}@{ip}"))
-        .arg(cmd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("SSH spawn to {ip}: {e}"))?;
-
-    let stdout = child.stdout.take().unwrap();
-    let reader = BufReader::new(stdout);
-    let mut lines = Vec::new();
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Read error: {e}"))?;
-        println!("  {prefix} {line}");
-        lines.push(line);
-    }
-    Ok(lines)
 }
 
 // ─── Resource lifecycle ───────────────────────────────────────────────────────
@@ -213,7 +187,11 @@ fn find_vpc_and_subnet() -> Result<(String, String), String> {
 }
 
 fn find_ubuntu_ami(arch: &str) -> Result<String, String> {
-    let arch_filter = match arch { "x86_64" => "amd64", "arm64" => "arm64", _ => return Err(format!("Unknown arch: {arch}")) };
+    let arch_filter = match arch {
+        "x86_64" => "amd64",
+        "arm64" => "arm64",
+        _ => return Err(format!("Unknown arch: {arch}")),
+    };
     let name_pattern = format!("ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-{arch_filter}-server-*");
     aws(&[
         "ec2", "describe-images",
@@ -322,7 +300,7 @@ fn wait_for_setup(ip: &str, key: &Path, label: &str) -> Result<(), String> {
             return Err(format!("[{label}] Setup timeout"));
         }
         let elapsed = start.elapsed().as_secs();
-        if elapsed % 30 == 0 && elapsed > 0 {
+        if elapsed.is_multiple_of(30) && elapsed > 0 {
             let progress = ssh(ip, key, "tail -1 /var/log/cloud-init-output.log 2>/dev/null | head -c 120").unwrap_or_default();
             let progress = progress.trim();
             if !progress.is_empty() {
@@ -359,6 +337,9 @@ sudo -u {SSH_USER} git submodule update --init --recursive
 echo "=== Building all tools ==="
 sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && ./scripts/build-tools.sh --all'
 
+echo "=== Building gzippy-dev ==="
+sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && cargo build --release --manifest-path tools/devtool/Cargo.toml'
+
 echo "=== Preparing benchmark data ==="
 sudo -u {SSH_USER} bash -c './scripts/prepare_benchmark_data.sh'
 
@@ -389,10 +370,11 @@ done
 chown {SSH_USER}:{SSH_USER} /dev/shm/* 2>/dev/null || true
 ls -lh /dev/shm/
 
-# Flat bin directory
+# Flat bin directory with all tools + gzippy-dev
 mkdir -p /home/{SSH_USER}/gzippy/bin
 cd /home/{SSH_USER}/gzippy/bin
 ln -sf ../target/release/gzippy gzippy
+ln -sf ../target/release/gzippy-dev gzippy-dev
 ln -sf ../pigz/pigz pigz
 ln -sf ../pigz/unpigz unpigz
 [ -f ../isa-l/build/igzip ] && ln -sf ../isa-l/build/igzip igzip || true
@@ -406,7 +388,7 @@ echo "=== Setup complete ==="
 "#)
 }
 
-// ─── Benchmark execution ─────────────────────────────────────────────────────
+// ─── Benchmark execution via gzippy-dev on remote host ────────────────────────
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -421,163 +403,122 @@ struct BenchResult {
     trials: u32,
 }
 
-fn scenario_key(r: &BenchResult) -> String {
-    format!("{}-{}-{}-{}", r.platform, r.dataset, r.archive, r.threads)
+#[allow(clippy::too_many_arguments)]
+fn remote_bench(
+    ip: &str, key: &Path, label: &str,
+    min_trials: u32, max_trials: u32, target_cv: f64,
+    dataset: Option<&str>, archive: Option<&str>, threads: Option<usize>,
+) -> Result<Vec<BenchResult>, String> {
+    let repo = format!("/home/{SSH_USER}/gzippy");
+
+    let mut cmd = format!(
+        "cd {repo} && export PATH={repo}/bin:$PATH && \
+         export TMPDIR=/dev/shm && \
+         source $HOME/.cargo/env && \
+         gzippy-dev bench --json \
+         --min-trials {min_trials} --max-trials {max_trials} --target-cv {target_cv}"
+    );
+    if let Some(ds) = dataset { cmd += &format!(" --dataset {ds}"); }
+    if let Some(ar) = archive { cmd += &format!(" --archive {ar}"); }
+    if let Some(th) = threads { cmd += &format!(" --threads {th}"); }
+
+    let output = ssh(ip, key, &cmd)?;
+
+    // gzippy-dev bench --json writes JSON to stdout, human progress to stderr
+    // SSH captures stdout; find the JSON line (starts with '{')
+    let json_line = output.lines()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| format!("[{label}] No JSON in bench output. Raw:\n{output}"))?;
+
+    parse_bench_json(json_line, label)
 }
 
-fn run_one_benchmark(
-    ip: &str, key: &Path, label: &str, repo: &str,
-    dataset: &str, archive: &str, threads: usize, threads_label: &str,
-    min_trials: u32, max_trials: u32, target_cv: f64,
-) -> Result<Vec<BenchResult>, String> {
-    let raw_file = match dataset {
-        "silesia" => "/dev/shm/silesia.tar",
-        "software" => "/dev/shm/software.archive",
-        "logs" => "/dev/shm/logs.txt",
-        _ => return Err(format!("Unknown dataset: {dataset}")),
-    };
-    let compressed = format!("/dev/shm/{dataset}-{archive}.gz");
-    let json_file = format!("/dev/shm/bench-{dataset}-{archive}-{threads}.json");
+fn parse_bench_json(json_str: &str, platform: &str) -> Result<Vec<BenchResult>, String> {
+    let parsed: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| format!("JSON parse error: {e}"))?;
 
-    // Verify files exist
-    let check = ssh(ip, key, &format!(
-        "test -f {compressed} && test -f {raw_file} && echo OK || echo MISSING"
-    ))?;
-    if check.trim() != "OK" {
-        eprintln!("  [{label}] SKIP {dataset}-{archive} {threads_label}: files missing");
-        return Ok(Vec::new());
-    }
-
-    let run_cmd = format!(
-        "cd {repo} && source $HOME/.cargo/env && \
-         TMPDIR=/dev/shm python3 scripts/benchmark_decompression.py \
-         --binaries {repo}/bin \
-         --compressed-file {compressed} \
-         --original-file {raw_file} \
-         --threads {threads} \
-         --archive-type {dataset}-{archive} \
-         --min-trials {min_trials} \
-         --max-trials {max_trials} \
-         --target-cv {target_cv} \
-         --output {json_file} 2>&1"
-    );
-    let _ = ssh(ip, key, &run_cmd);
-
-    let output = ssh(ip, key, &format!("cat {json_file} 2>/dev/null || echo '{{}}' "))?;
-    let trimmed = output.trim();
+    let items = parsed.get("results")
+        .and_then(|v| v.as_array())
+        .ok_or("Missing 'results' array in JSON")?;
 
     let mut results = Vec::new();
-    match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(parsed) => {
-            if let Some(items) = parsed.get("results").and_then(|v| v.as_array()) {
-                for item in items {
-                    let obj = match item.as_object() { Some(o) => o, None => continue };
-                    let tool = obj.get("tool").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-                    if obj.get("status").and_then(|v| v.as_str()) != Some("pass") {
-                        let err = obj.get("error").and_then(|v| v.as_str()).unwrap_or("failed");
-                        println!("    {:<12} {}", tool, err);
-                        continue;
-                    }
-                    let speed = obj.get("speed_mbps").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let cv = obj.get("cv").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let trials = obj.get("trials").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    for item in items {
+        let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("fail");
+        if status != "pass" { continue; }
 
-                    results.push(BenchResult {
-                        platform: label.to_string(),
-                        dataset: dataset.to_string(),
-                        archive: archive.to_string(),
-                        threads: threads_label.to_string(),
-                        tool,
-                        speed_mbps: speed,
-                        cv,
-                        trials,
-                    });
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("  [{label}] JSON error for {dataset}-{archive} {threads_label}: {e}");
-        }
+        results.push(BenchResult {
+            platform: platform.to_string(),
+            dataset: item.get("dataset").and_then(|v| v.as_str()).unwrap_or("?").into(),
+            archive: item.get("archive").and_then(|v| v.as_str()).unwrap_or("?").into(),
+            threads: item.get("threads").and_then(|v| v.as_str()).unwrap_or("?").into(),
+            tool: item.get("tool").and_then(|v| v.as_str()).unwrap_or("?").into(),
+            speed_mbps: item.get("speed_mbps").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            cv: item.get("cv").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            trials: item.get("trials").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        });
     }
     Ok(results)
 }
 
-fn run_benchmarks_on(
-    ip: &str, key: &Path, label: &str,
-) -> Result<Vec<BenchResult>, String> {
-    let datasets = ["silesia", "software", "logs"];
-    let archives = ["gzip", "bgzf", "pigz"];
-    let thread_configs = [1usize, BENCH_THREADS];
-    let repo = format!("/home/{SSH_USER}/gzippy");
-
-    // ── Phase 1: Initial sweep ──
-    println!("\n  [{label}] ── Phase 1: Sweep ({SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.0}%) ──",
-        SWEEP_TARGET_CV * 100.0);
-
-    let mut all_results: Vec<BenchResult> = Vec::new();
-
-    for dataset in &datasets {
-        for archive in &archives {
-            for &threads in &thread_configs {
-                let tl = if threads == 1 { "T1" } else { "Tmax" };
-                print!("  [{label}] {dataset}-{archive} {tl}  ");
-                let _ = std::io::stdout().flush();
-
-                let results = run_one_benchmark(
-                    ip, key, label, &repo,
-                    dataset, archive, threads, tl,
-                    SWEEP_MIN_TRIALS, SWEEP_MAX_TRIALS, SWEEP_TARGET_CV,
-                )?;
-
-                for r in &results {
-                    print!("{}:{:.0}  ", r.tool, r.speed_mbps);
-                }
-                println!();
-
-                all_results.extend(results);
-            }
-        }
-    }
-
-    // ── Phase 2: Precision re-runs for close races ──
-    let close_races = find_close_races(&all_results, label);
-    if close_races.is_empty() {
-        println!("  [{label}] ── Phase 2: No close races, all decisive ──");
-    } else {
-        println!("\n  [{label}] ── Phase 2: Re-running {} close race(s) ({PRECISION_MIN_TRIALS}-{PRECISION_MAX_TRIALS} trials, CV<{:.1}%) ──",
-            close_races.len(), PRECISION_TARGET_CV * 100.0);
-
-        for (dataset, archive, threads_label) in &close_races {
-            let threads: usize = if threads_label == "T1" { 1 } else { BENCH_THREADS };
-            print!("  [{label}] PRECISION {dataset}-{archive} {threads_label}  ");
-            let _ = std::io::stdout().flush();
-
-            let results = run_one_benchmark(
-                ip, key, label, &repo,
-                dataset, archive, threads, threads_label,
-                PRECISION_MIN_TRIALS, PRECISION_MAX_TRIALS, PRECISION_TARGET_CV,
-            )?;
-
-            for r in &results {
-                print!("{}:{:.1}  ", r.tool, r.speed_mbps);
-            }
-            println!();
-
-            // Replace sweep results with precision results
-            let scenario = format!("{label}-{dataset}-{archive}-{threads_label}");
-            all_results.retain(|r| scenario_key(r) != scenario);
-            all_results.extend(results);
-        }
-    }
-
-    Ok(all_results)
+fn scenario_key(r: &BenchResult) -> String {
+    format!("{}-{}-{}", r.dataset, r.archive, r.threads)
 }
 
-/// Find scenarios where gzippy is within CLOSE_RACE_THRESHOLD% of any competitor
-fn find_close_races(results: &[BenchResult], platform: &str) -> Vec<(String, String, String)> {
+fn run_benchmarks_on(ip: &str, key: &Path, label: &str) -> Result<Vec<BenchResult>, String> {
+    // Phase 1: Sweep
+    println!("\n  [{label}] Phase 1: Sweep ({SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.0}%)",
+        SWEEP_TARGET_CV * 100.0);
+
+    let sweep = remote_bench(
+        ip, key, label,
+        SWEEP_MIN_TRIALS, SWEEP_MAX_TRIALS, SWEEP_TARGET_CV,
+        None, None, None,
+    )?;
+
+    for r in &sweep {
+        println!("    {}-{} {} {}: {:.1} MB/s (CV {:.1}%, {} trials)",
+            r.dataset, r.archive, r.threads, r.tool, r.speed_mbps, r.cv * 100.0, r.trials);
+    }
+
+    // Phase 2: Precision re-runs for close races
+    let close_races = find_close_races(&sweep);
+    if close_races.is_empty() {
+        println!("  [{label}] Phase 2: No close races, all decisive");
+        return Ok(sweep);
+    }
+
+    println!("\n  [{label}] Phase 2: {} close race(s) ({PRECISION_MIN_TRIALS}-{PRECISION_MAX_TRIALS} trials, CV<{:.1}%)",
+        close_races.len(), PRECISION_TARGET_CV * 100.0);
+
+    let mut all = sweep;
+
+    for (ds, arch, thr) in &close_races {
+        // T1 → only run single-threaded; Tmax → None means "use all CPUs" (matches sweep)
+        let threads: Option<usize> = if thr == "T1" { Some(1) } else { None };
+        println!("  [{label}] PRECISION {ds}-{arch} {thr}...");
+
+        let precision = remote_bench(
+            ip, key, label,
+            PRECISION_MIN_TRIALS, PRECISION_MAX_TRIALS, PRECISION_TARGET_CV,
+            Some(ds), Some(arch), threads,
+        )?;
+
+        for r in &precision {
+            println!("    {}: {:.1} MB/s (CV {:.2}%, {} trials)", r.tool, r.speed_mbps, r.cv * 100.0, r.trials);
+        }
+
+        // Replace sweep results with precision results for this scenario
+        let key_prefix = format!("{ds}-{arch}-{thr}");
+        all.retain(|r| scenario_key(r) != key_prefix);
+        all.extend(precision);
+    }
+
+    Ok(all)
+}
+
+fn find_close_races(results: &[BenchResult]) -> Vec<(String, String, String)> {
     let mut races = Vec::new();
     let mut scenarios: Vec<(String, String, String)> = results.iter()
-        .filter(|r| r.platform == platform)
         .map(|r| (r.dataset.clone(), r.archive.clone(), r.threads.clone()))
         .collect();
     scenarios.sort();
@@ -585,7 +526,7 @@ fn find_close_races(results: &[BenchResult], platform: &str) -> Vec<(String, Str
 
     for (ds, arch, thr) in scenarios {
         let scenario: Vec<&BenchResult> = results.iter()
-            .filter(|r| r.platform == platform && r.dataset == ds && r.archive == arch && r.threads == thr)
+            .filter(|r| r.dataset == ds && r.archive == arch && r.threads == thr)
             .collect();
 
         let gzippy = scenario.iter().find(|r| r.tool == "gzippy");
@@ -607,7 +548,7 @@ fn find_close_races(results: &[BenchResult], platform: &str) -> Vec<(String, Str
 
 fn print_results(results: &[BenchResult]) {
     println!("\n╔══════════════════════════════════════════════════════════════════════════════════════╗");
-    println!("║  CLOUD FLEET RESULTS — STRICT SCORING (no parity, gzippy must win or it's a loss) ║");
+    println!("║  CLOUD FLEET RESULTS — STRICT SCORING (gzippy must win or it's a loss)             ║");
     println!("╚══════════════════════════════════════════════════════════════════════════════════════╝\n");
 
     let mut platforms: Vec<&str> = results.iter().map(|r| r.platform.as_str()).collect();
@@ -619,8 +560,8 @@ fn print_results(results: &[BenchResult]) {
 
     for platform in &platforms {
         println!("  ── {platform} ──");
-        println!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>6} {}",
-            "Scenario", "gzippy", "unpigz", "igzip", "rapidgzip", "gzip", "CV%", "Verdict");
+        println!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>6} Verdict",
+            "Scenario", "gzippy", "unpigz", "igzip", "rapidgzip", "gzip", "CV%");
         println!("  {}", "─".repeat(100));
 
         let plat_results: Vec<&BenchResult> = results.iter()
@@ -648,7 +589,6 @@ fn print_results(results: &[BenchResult]) {
             let gzippy = get("gzippy");
             let gzippy_cv = gzippy.map(|r| r.cv).unwrap_or(0.0);
 
-            // Find best competitor and compute gap
             let competitors = ["unpigz", "pigz", "igzip", "rapidgzip", "gzip"];
             let best = competitors.iter()
                 .filter_map(|t| get(t))
@@ -689,7 +629,7 @@ fn print_results(results: &[BenchResult]) {
     println!("  ══════════════════════════════════════════════════════");
     println!("  WINS: {total_wins}/{total}    LOSSES: {total_losses}/{total}");
     if total_losses > 0 {
-        println!("\n  ── LOSSES (gzippy slower than best competitor) ──");
+        println!("\n  ── LOSSES ──");
         let mut scenarios: Vec<(String, String, String, String)> = results.iter()
             .map(|r| (r.platform.clone(), r.dataset.clone(), r.archive.clone(), r.threads.clone()))
             .collect();
@@ -745,14 +685,15 @@ pub fn bench() -> Result<(), String> {
         ));
     }
 
-    println!("  Branch:   {branch}");
-    println!("  Commit:   {commit_short}");
-    println!("  x86_64:   {X86_TYPE} on-demand (16 vCPU, bench with -p{BENCH_THREADS})");
-    println!("  arm64:    {ARM64_TYPE} on-demand (16 vCPU, bench with -p{BENCH_THREADS})");
-    println!("  Sweep:    {SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.0}%", SWEEP_TARGET_CV * 100.0);
-    println!("  Precision: {PRECISION_MIN_TRIALS}-{PRECISION_MAX_TRIALS} trials, CV<{:.1}% (for close races <{CLOSE_RACE_THRESHOLD}%)", PRECISION_TARGET_CV * 100.0);
-    println!("  I/O:      /dev/shm (RAM-backed, no EBS bottleneck)");
-    println!("  Scoring:  STRICT — gzippy must be >= every competitor, no parity threshold");
+    println!("  Branch:    {branch}");
+    println!("  Commit:    {commit_short}");
+    println!("  x86_64:    {X86_TYPE} on-demand");
+    println!("  arm64:     {ARM64_TYPE} on-demand");
+    println!("  Benchmark: gzippy-dev bench --json (same code runs locally and in cloud)");
+    println!("  Sweep:     {SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.0}%", SWEEP_TARGET_CV * 100.0);
+    println!("  Precision: {PRECISION_MIN_TRIALS}-{PRECISION_MAX_TRIALS} trials, CV<{:.1}% (close races <{CLOSE_RACE_THRESHOLD}%)", PRECISION_TARGET_CV * 100.0);
+    println!("  I/O:       /dev/shm (RAM-backed, no EBS bottleneck)");
+    println!("  Scoring:   STRICT — gzippy must be >= every competitor");
     println!();
 
     let session = generate_session_id();
@@ -770,7 +711,6 @@ fn run_fleet(
 ) -> Result<(), String> {
     let total_start = Instant::now();
 
-    // All resource creation runs sequentially (fast API calls)
     print!("  VPC/subnet... ");
     let _ = std::io::stdout().flush();
     let (vpc_id, subnet_id) = find_vpc_and_subnet()?;
@@ -789,7 +729,6 @@ fn run_fleet(
     cleanup.sg_id = Some(sg_id.clone());
     println!("{sg_id}");
 
-    // AMI lookup in parallel
     print!("  AMIs... ");
     let _ = std::io::stdout().flush();
     let x86_ami = find_ubuntu_ami("x86_64")?;
@@ -799,7 +738,6 @@ fn run_fleet(
     let userdata = user_data_script(commit, repo_url);
     let userdata_b64 = base64_encode(&userdata);
 
-    // Launch both instances
     print!("  Launching x86_64 ({X86_TYPE})... ");
     let _ = std::io::stdout().flush();
     let x86_id = launch_on_demand(X86_TYPE, &x86_ami, &key_name, &sg_id, &subnet_id, &userdata_b64, session)?;
@@ -812,7 +750,6 @@ fn run_fleet(
     cleanup.instance_ids.push(arm64_id.clone());
     println!("{arm64_id}");
 
-    // Wait for both to be running
     print!("  Waiting for running state... ");
     let _ = std::io::stdout().flush();
     wait_running(&[&x86_id, &arm64_id])?;
@@ -823,7 +760,7 @@ fn run_fleet(
     println!("  x86_64: {x86_ip}");
     println!("  arm64:  {arm64_ip}");
 
-    // SSH + setup in parallel
+    // Wait for SSH + setup in parallel
     {
         let k1 = key_path.clone(); let ip1 = x86_ip.clone();
         let k2 = key_path.clone(); let ip2 = arm64_ip.clone();
