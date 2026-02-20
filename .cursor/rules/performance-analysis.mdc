@@ -51,19 +51,38 @@ gzippy-dev ci vs-main         # 3. Check anytime: did branch help or hurt?
 gzippy-dev cloud bench        # 4. Low-jitter verification on dedicated hardware
 ```
 
-## Current Status: ~92% Effective Win Rate (Feb 20 2026)
+## Current Status: Cloud Fleet Reality Check (Feb 20 2026)
 
-**Effective win rate: 94.3%** (up from 83% at start of session)
-- ARCHITECTURE: 4 gaps (silesia Tmax vs rapidgzip only, 10-16%)
-- SIMD: 3 gaps (L1 compression vs igzip, 4-50% but worst is CI noise)
-- ACTIONABLE: 0 gaps
-- NOISE: 27 gaps (properly thresholded by platform/dataset)
+**CI win rate: ~92%** (noisy, inflated by I/O overhead hiding real gaps)
+**Cloud win rate: 13/36 = 36%** (clean, RAM-backed, CPU-limited truth)
 
-Key wins from latest CI run (perf/bgzf-t1-fast-path vs main):
-- `silesia-bgzf Tmax x86`: +10.1% (314.8 → 346.5 MB/s, now BEATS rapidgzip by 6.6%)
-- `silesia-bgzf T1 x86`: +10.0% (234.0 → 257.5 MB/s)
-- `silesia-gzip T1 x86`: +4.8% (254.5 → 266.6 MB/s)
-- `silesia-pigz Tmax x86`: +7.6% (239.5 → 257.6 MB/s)
+The cloud fleet revealed gaps that CI's I/O noise was hiding. Three categories:
+
+### 1. BGZF (gzippy's format) — DOMINANT
+| Scenario | gzippy | Best comp | Gap |
+|---|---|---|---|
+| silesia-bgzf T1 arm64 | 651 | 285 unpigz | **+128%** |
+| silesia-bgzf T1 x86 | 668 | 567 igzip | **+18%** |
+| logs-bgzf T1 x86 | 1972 | 1813 igzip | **+9%** |
+| silesia-bgzf Tmax arm64 | 1265 | 962 rapidgzip | **+31%** |
+
+### 2. Non-BGZF T1 arm64 — WINS (no igzip competition)
+gzippy wins all 6 scenarios (+4% to +83%) because igzip has no ARM build
+and unpigz/rapidgzip are slower at T1.
+
+### 3. Non-BGZF x86 T1 — igzip AVX-512 advantage (REAL)
+| Scenario | gzippy | igzip | Gap |
+|---|---|---|---|
+| software-gzip T1 x86 | 1190 | 2468 | **-52%** |
+| logs-gzip T1 x86 | 1074 | 1841 | **-42%** |
+| silesia-gzip T1 x86 | 534 | 577 | **-8%** |
+
+igzip's AVX-512 Huffman decode + CRC32 gives 2x throughput on Ice Lake.
+CI hid this because both tools were ~equally bottlenecked by disk I/O.
+
+### 4. Tmax single-member — rapidgzip parallel advantage (ARCHITECTURE)
+rapidgzip parallelizes single-member gzip files. gzippy cannot.
+Gaps: -10% to -48%. Requires dedicated block-finder + decoder threads.
 
 ## What We Learned (Feb 20 2026)
 
@@ -130,41 +149,34 @@ all optional fields to find the true deflate data offset.
 
 ## Remaining Gaps
 
-### ACTIONABLE: 1 gap (pending CI verification)
+### Decompression Gap Priorities
 
-- `silesia-gzip Tmax arm64` vs pigz: -10.2% (113 vs 125.8 MB/s). Caused by
-  speculative parallel overhead (thread spawn + block search before fallback).
-  Fix pushed: removed speculative parallel from production path. Expecting
-  Tmax to match T1 performance (~133 MB/s), closing this gap.
+**HIGHEST IMPACT: x86 igzip AVX-512 gap (6 scenarios, -8% to -52%)**
+- Root cause: igzip uses AVX-512 vpclmulqdq for CRC32 + SIMD Huffman decode
+- gzippy uses libdeflate which is fast but doesn't exploit AVX-512 as aggressively
+- The gap is largest on repetitive data (software -52%, logs -42%)
+- On silesia (complex data) the gap is only -8%, close to noise
+- Fix: either implement AVX-512 Huffman decode or skip CRC32 when not needed
 
-Previously closed:
-- `silesia-bgzf Tmax x86` vs rapidgzip: **CLOSED** (+6.6% ahead, 346.5 vs 325 MB/s)
-- `silesia-gzip T1 x86` vs igzip: **CLOSED** (+5.1% ahead, 266.6 vs 253.6 MB/s)
-- `software-bgzf T1 arm64` vs pigz: **NOISE** (24% swing between identical code runs)
+**ARCHITECTURE: Tmax single-member parallel (12 scenarios, -10% to -48%)**
+- rapidgzip parallelizes single-member gzip via speculative decode
+- gzippy falls back to sequential for single-member files
+- Two-pass approach proven insufficient (scan pass cost too high at 4 cores)
+- Speculative parallel was tried but regressed arm64 by 15% (removed)
+- Requires dedicated block-finder + decoder thread architecture
 
-### ARCHITECTURE (4 gaps, needs major feature)
-- Silesia Tmax decompression vs rapidgzip only (10-16%)
-- arm64 small-file Tmax gaps reclassified as NOISE (pigz decompresses sequentially)
-- Requires rapidgzip-style pipeline (dedicated block-finder + decoder threads)
-- Two-pass approach proven insufficient (scan pass overhead too high on 4 cores)
+**BGZF Tmax on x86: rapidgzip edge (-6% to -16%)**
+- Even on BGZF (multi-member), rapidgzip slightly edges gzippy at Tmax=4 on x86
+- Possible cause: thread pool overhead in our parallel path
+- This is the most actionable gap — our BGZF parser should win here
 
-### Speculative Parallel (Feb 2026 — Removed from Production)
+### What CI Was Hiding
 
-`speculative_parallel.rs` was wired into production for Tmax single-member files,
-but CI revealed it caused a **-15% regression on arm64** (133→113 MB/s on silesia).
-The block finder always falls back to sequential on complex data, but thread
-spawning + block search overhead is non-trivial, especially on Graviton.
-
-**Key lesson**: Even "fast-fail" attempts have real overhead. Thread spawn/join
-plus scanning 16KB windows with 8 bit offsets per thread costs enough to cause
-a measurable regression. Never wire experimental code into the hot path until
-it actually succeeds on representative data.
-
-**The code is preserved** in `src/speculative_parallel.rs` (not compiled).
-Re-enable only when the block finder reliably finds boundaries on silesia.
-
-### SIMD (3 gaps, accepted)
-- L1 compression vs igzip's AVX2/AVX-512 assembly
+The cloud fleet revealed that CI's ~92% win rate was inflated by I/O noise.
+On fast, CPU-limited hardware:
+- igzip's AVX-512 advantage is 2x on repetitive data (hidden by disk I/O on CI)
+- gzippy's absolute throughput is excellent (500-2400 MB/s depending on data)
+- The BGZF advantage is massive (80-128% at T1) — this is gzippy's moat
 
 ## CI Benchmark Architecture
 
