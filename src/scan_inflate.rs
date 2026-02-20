@@ -11,7 +11,7 @@
 use crate::consume_first_decode::Bits;
 use std::io::{Error, ErrorKind, Result};
 
-const WINDOW_SIZE: usize = 32768;
+pub const WINDOW_SIZE: usize = 32768;
 
 /// A checkpoint recorded at a deflate block boundary during the scan pass.
 #[derive(Clone)]
@@ -121,6 +121,100 @@ pub fn scan_deflate(
     })
 }
 
+/// Fast scan: small circular buffer that stays in L2 cache.
+///
+/// Instead of allocating a full output buffer (211MB → page faults, cache misses),
+/// uses a 4MB buffer and resets at block boundaries, keeping only the last 32KB
+/// (the LZ77 window). This makes all output writes hit L2 cache, ~1.5-2x faster
+/// than full-output decode.
+pub fn scan_deflate_fast(
+    deflate_data: &[u8],
+    checkpoint_interval: usize,
+    _expected_output_size: usize,
+) -> Result<ScanResult> {
+    // 8MB buffer: large enough for any single deflate block, small enough
+    // that the hot working set (after reset) fits in L2/L3 cache.
+    const INITIAL_BUF: usize = 8 * 1024 * 1024;
+    const RESET_THRESHOLD: usize = 4 * 1024 * 1024;
+
+    let mut bits = Bits::new(deflate_data);
+    let mut checkpoints = Vec::new();
+    let mut next_checkpoint_at = checkpoint_interval;
+
+    let mut output = vec![0u8; INITIAL_BUF];
+    let mut out_pos: usize = 0;
+    let mut virtual_pos: usize = 0;
+
+    loop {
+        // Reset buffer between blocks to keep working set in cache.
+        // Preserve the last 32KB (LZ77 window) for match distances.
+        if out_pos > RESET_THRESHOLD {
+            let keep = WINDOW_SIZE.min(out_pos);
+            output.copy_within(out_pos - keep..out_pos, 0);
+            out_pos = keep;
+        }
+
+        // Record checkpoint at block boundary when we cross an interval
+        if virtual_pos >= next_checkpoint_at && virtual_pos >= WINDOW_SIZE {
+            let window_start = out_pos.saturating_sub(WINDOW_SIZE);
+            let window_end = out_pos;
+            checkpoints.push(ScanCheckpoint {
+                input_byte_pos: bits.pos,
+                bitbuf: bits.bitbuf,
+                bitsleft: bits.bitsleft,
+                output_offset: virtual_pos,
+                window: output[window_start..window_end].to_vec(),
+            });
+            next_checkpoint_at = virtual_pos + checkpoint_interval;
+        }
+
+        // Ensure enough buffer for the next block
+        if out_pos + 4 * 1024 * 1024 > output.len() {
+            output.resize((output.len() * 2).max(out_pos + 8 * 1024 * 1024), 0);
+        }
+
+        if bits.available() < 3 {
+            bits.refill();
+        }
+
+        let bfinal = (bits.peek() & 1) != 0;
+        let btype = ((bits.peek() >> 1) & 3) as u8;
+        bits.consume(3);
+
+        let old_out_pos = out_pos;
+        match btype {
+            0 => {
+                out_pos =
+                    crate::consume_first_decode::decode_stored_pub(&mut bits, &mut output, out_pos)?
+            }
+            1 => {
+                out_pos =
+                    crate::consume_first_decode::decode_fixed_pub(&mut bits, &mut output, out_pos)?
+            }
+            2 => {
+                out_pos = crate::consume_first_decode::decode_dynamic_pub(
+                    &mut bits,
+                    &mut output,
+                    out_pos,
+                )?
+            }
+            3 => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type")),
+            _ => unreachable!(),
+        }
+
+        virtual_pos += out_pos - old_out_pos;
+
+        if bfinal {
+            break;
+        }
+    }
+
+    Ok(ScanResult {
+        checkpoints,
+        total_output_size: virtual_pos,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +259,70 @@ mod tests {
             assert_eq!(cp.window.len(), WINDOW_SIZE);
             assert!(cp.output_offset >= WINDOW_SIZE);
             assert!(cp.input_byte_pos <= compressed.len());
+        }
+    }
+
+    #[test]
+    fn test_scan_fast_basic() {
+        let original = b"Hello, world! This is a test of the fast scan inflate module.";
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let result = scan_deflate_fast(&compressed, 1024, 0).unwrap();
+        assert_eq!(result.total_output_size, original.len());
+    }
+
+    #[test]
+    fn test_scan_fast_large() {
+        let mut original = Vec::new();
+        for i in 0..100_000 {
+            original.extend_from_slice(format!("Line {}: some test data\n", i).as_bytes());
+        }
+
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let result = scan_deflate_fast(&compressed, 256 * 1024, original.len()).unwrap();
+        assert_eq!(result.total_output_size, original.len());
+        assert!(!result.checkpoints.is_empty());
+
+        for cp in &result.checkpoints {
+            assert_eq!(cp.window.len(), WINDOW_SIZE);
+            assert!(cp.output_offset >= WINDOW_SIZE);
+            assert!(cp.input_byte_pos <= compressed.len());
+        }
+    }
+
+    #[test]
+    fn test_scan_fast_matches_full_scan() {
+        let mut original = Vec::new();
+        for i in 0..200_000 {
+            original.extend_from_slice(format!("Data item {}: payload\n", i).as_bytes());
+        }
+
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let full = scan_deflate(&compressed, 128 * 1024, original.len()).unwrap();
+        let fast = scan_deflate_fast(&compressed, 128 * 1024, original.len()).unwrap();
+
+        assert_eq!(full.total_output_size, fast.total_output_size);
+        assert_eq!(full.checkpoints.len(), fast.checkpoints.len());
+
+        for (f, s) in full.checkpoints.iter().zip(fast.checkpoints.iter()) {
+            assert_eq!(f.input_byte_pos, s.input_byte_pos);
+            assert_eq!(f.output_offset, s.output_offset);
+            assert_eq!(
+                f.window, s.window,
+                "Window mismatch at offset {}",
+                f.output_offset
+            );
         }
     }
 

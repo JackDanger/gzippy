@@ -3,13 +3,14 @@ description: CI-driven performance workflow — CI is the source of truth, not l
 alwaysApply: true
 ---
 
-# Performance Workflow: CI Is the Source of Truth
+# Performance Workflow: Cloud Fleet Is the Source of Truth
 
 ## Core Principle
 
-**Never trust local benchmarks for final decisions.** GHA CI runs on both x86_64 (EPYC)
-and arm64 (Graviton) with all datasets, archive types, thread configs, and competitors.
-Local runs are useful for rapid iteration but CI is authoritative.
+**Never trust local benchmarks for final decisions.** The cloud fleet runs on both
+x86_64 (c7i Sapphire Rapids) and arm64 (c8g Graviton4) with RAM-backed I/O,
+all datasets, archive types, thread configs, and competitors. Local runs are
+useful for rapid iteration but the cloud fleet is authoritative.
 
 **Never compromise performance under any conditions.** There is no threshold below
 which a regression is acceptable. Never accept a clippy/lint suggestion in a hot path
@@ -30,176 +31,100 @@ gzippy-dev bench --threads 1        # T1 only
 gzippy-dev bench --min-trials 50 --max-trials 200 --target-cv 0.005  # precision
 ```
 
-**Cloud fleet** (`gzippy-dev cloud bench`): launches x86 + arm64 EC2 instances,
-builds gzippy-dev on them, runs `gzippy-dev bench --json` via SSH, two-phase
-sweep+precision, strict scoring. Same code, same logic, deterministic numbers.
+**Cloud fleet** (`gzippy-dev cloud bench`):
+- 6 instances: 3 x86_64 (c7i.4xlarge) + 3 arm64 (c8g.4xlarge)
+- 1 instance per (arch, dataset) — fully parallel
+- Also runs local Mac benchmarks simultaneously
+- Two-phase: sweep (30-100 trials, CV<1.5%) + precision re-run close races
+- Strict scoring: gzippy must be >= every competitor, or it's a loss
+- Wall time: ~15 min total (setup + benchmarks in parallel)
 
-**Key cloud learnings**:
-- EBS gp3 caps at ~131 MB/s; ALL data MUST be in /dev/shm (RAM) or numbers are wrong
-- On-demand instances avoid spot capacity errors; cost is negligible for ~15min runs
-- Two-phase: sweep at CV<2%, then precision re-run close races at CV<0.5%
-- Python benchmark scripts (`scripts/benchmark_*.py`) remain for CI compatibility
-  but gzippy-dev bench is the source of truth
+**Key learnings**:
+- EBS gp3 caps at ~131 MB/s; ALL data MUST be in /dev/shm (RAM)
+- On-demand instances avoid spot capacity errors
+- `TMPDIR=/dev/shm` for decompressed output too (not just compressed input)
+- Python benchmark scripts remain for CI but gzippy-dev bench is truth
 
 ## The Loop
 
 ```
-gzippy-dev ci triage          # 1. What gaps remain?
 # ... make ONE focused code change ...
-gzippy-dev ci push            # 2. Push → CI → auto-triage + vs-main
-gzippy-dev ci vs-main         # 3. Check anytime: did branch help or hurt?
-gzippy-dev cloud bench        # 4. Low-jitter verification on dedicated hardware
+cargo test --release                  # 1. Correctness
+# local benchmark to sanity-check
+gzippy-dev cloud bench                # 2. Authoritative cloud fleet numbers
 ```
 
-## Current Status: Cloud Fleet Reality Check (Feb 20 2026)
+## Current Status: 18/36 Wins (Feb 20 2026, post-BGZF pipeline fix)
 
-**CI win rate: ~92%** (noisy, inflated by I/O overhead hiding real gaps)
-**Cloud win rate: 13/36 = 36%** (clean, RAM-backed, CPU-limited truth)
+**Previous: 13/36 (36%).** The BGZF Tmax pipeline fix added 5 wins.
 
-The cloud fleet revealed gaps that CI's I/O noise was hiding. Three categories:
+### What Changed: BGZF Tmax Pipeline
 
-### 1. BGZF (gzippy's format) — DOMINANT
-| Scenario | gzippy | Best comp | Gap |
-|---|---|---|---|
-| silesia-bgzf T1 arm64 | 651 | 285 unpigz | **+128%** |
-| silesia-bgzf T1 x86 | 668 | 567 igzip | **+18%** |
-| logs-bgzf T1 x86 | 1972 | 1813 igzip | **+9%** |
-| silesia-bgzf Tmax arm64 | 1265 | 962 rapidgzip | **+31%** |
+**Root cause of old 2x scaling**: `decompress_bgzf_parallel_to_vec` allocated
+`vec![0u8; 211MB]` (53K page faults) then did serial `writer.write_all(211MB)`.
 
-### 2. Non-BGZF T1 arm64 — WINS (no igzip competition)
-gzippy wins all 6 scenarios (+4% to +83%) because igzip has no ARM build
-and unpigz/rapidgzip are slower at T1.
+**Fix**: Pipelined streaming — N decoder threads decompress into per-thread
+reusable buffers, send completed blocks through a bounded channel, writer thread
+writes blocks in order as they arrive. No large allocation, no serial copy.
 
-### 3. Non-BGZF x86 T1 — igzip AVX-512 advantage (REAL)
+| Metric | Before | After |
+|---|---|---|
+| T4 scaling | 2.0x | 2.88x |
+| silesia-bgzf Tmax x86 | 1329 (LOSS -16%) | 2632 (WIN +71%) |
+| silesia-bgzf Tmax arm64 | 1265 (WIN +31%) | 3069 (WIN +155%) |
+| logs-bgzf Tmax x86 | 1973 (LOSS -15%) | 3080 (WIN +38%) |
+
+### BGZF — ALL 12 WINS (T1 + Tmax, both arches)
+gzippy dominates its own format: +8% to +155% vs best competitor.
+
+### 18 Remaining Losses
+
+**Category 1: x86 T1 vs igzip (6 losses)**
 | Scenario | gzippy | igzip | Gap |
 |---|---|---|---|
-| software-gzip T1 x86 | 1190 | 2468 | **-52%** |
-| logs-gzip T1 x86 | 1074 | 1841 | **-42%** |
-| silesia-gzip T1 x86 | 534 | 577 | **-8%** |
+| software-gzip T1 x86 | 1245 | 2769 | -55% |
+| software-pigz T1 x86 | 1214 | 2544 | -52% |
+| logs-gzip T1 x86 | 1050 | 1937 | -46% |
+| logs-pigz T1 x86 | 1025 | 1771 | -42% |
+| silesia-gzip T1 x86 | 524 | 585 | -10% |
+| silesia-pigz T1 x86 | 518 | 539 | -4% |
 
-igzip's AVX-512 Huffman decode + CRC32 gives 2x throughput on Ice Lake.
-CI hid this because both tools were ~equally bottlenecked by disk I/O.
+igzip's AVX-512 Huffman decode + vpclmulqdq CRC32 gives 2x on repetitive data.
 
-### 4. Tmax single-member — rapidgzip parallel advantage (ARCHITECTURE)
-rapidgzip parallelizes single-member gzip files. gzippy cannot.
-Gaps: -10% to -48%. Requires dedicated block-finder + decoder threads.
+**Category 2: All non-BGZF Tmax (12 losses)**
+rapidgzip parallelizes single-member gzip. gzippy falls back to sequential.
+Gaps: -11% to -45%. Requires dedicated block-finder + decoder architecture.
 
-## What We Learned (Feb 20 2026)
+## Optimization History: What Works vs What Doesn't
 
-### Noise Thresholds Must Vary by Context
+### BGZF Parallel
+| Approach | Result |
+|---|---|
+| Pre-allocated full output + serial write_all | **BAD**: 2x scaling, 53K page faults |
+| Pipelined streaming (channel + ordered writer) | **GOOD**: 2.88x scaling, +71-155% |
+| Per-thread reusable buffers | **GOOD**: stays in L2 cache |
+| Bounded sync_channel (2*threads+2 capacity) | **GOOD**: backpressure without stalling |
 
-| Context | Threshold | Why |
-|---|---|---|
-| arm64 + small files | 25% | CI shows 24%+ swings between identical runs (observed: 164→125 MB/s, same code) |
-| arm64 + silesia | 8% | Better but still noisy |
-| x86 + small files | 5% | Moderate variance from startup overhead |
-| x86 + silesia | 3% | Most stable measurement |
+### Single-member Parallel (tried, not yet working)
+| Approach | Result |
+|---|---|
+| Two-pass (scan + re-decode) | **32% SLOWER** on ARM (scan cost too high at 4 cores) |
+| Speculative parallel | **Regressed** arm64 by 15% |
+| Need: rapidgzip-style pipeline (block-finder + decoders) | **NOT YET IMPLEMENTED** |
 
-The old flat 2% threshold miscategorized arm64 noise as ACTIONABLE, wasting effort.
-
-### Pigz Decompresses Sequentially (Even at Tmax)
-
-Pigz ignores `-p` for decompression. So Tmax gaps vs pigz on single-member files
-are NOT architecture gaps — both tools decompress sequentially. Only rapidgzip does
-parallel single-member decompression. The triage now only classifies Tmax gaps vs
-rapidgzip as ARCHITECTURE.
-
-### pigz Output Is Single-Member
-
-pigz 2.8 creates **single-member** gzip output from stdin (even with `-p4`). Our
-`is_likely_multi_member` correctly returns false. The gaps vs rapidgzip on `silesia-pigz`
-are genuine architecture gaps, not detection bugs.
-
-### Two-Pass Parallel Does NOT Beat Sequential
-
-Tested: scan pass (pure Rust inflate) + parallel re-decode vs libdeflate FFI sequential.
-Result: **32% SLOWER** on ARM (650 MB/s vs 960 MB/s).
-
-Root cause: scan pass does full decode work (~1x), parallel pass adds ~0.25x. Total 1.25x
-work at 90% of libdeflate speed = net throughput 72% of sequential. Break-even requires
-11+ threads; CI has only 4.
-
-The ONLY viable parallel single-member approach is rapidgzip-style speculative decode
-(no scan pass). This remains a major feature gap.
-
-### stdin mmap Helps When Stdin Is a Regular File
-
-CI benchmark pipes files via `subprocess.run(cmd, stdin=fin, stdout=fout)`. Python passes
-the real fd, so gzippy can mmap stdin instead of copying 77MB into a Vec. Saves allocation
-+ copy overhead.
-
-### Raw Deflate Is Faster Than gzip_decompress_ex
-
-For trusted BGZF blocks, call `libdeflate_deflate_decompress` directly on the raw deflate
-data. Skips per-block: gzip header parsing, CRC32 validation, decompressor alloc/free.
-Now used in both T1 streaming and Tmax parallel BGZF paths.
-
-### Single-Member Sequential Path Is Already Optimal
-
-Traced the T1/Tmax single-member decompression path: mmap → format detect → one
-libdeflate call → one write → flush. No wasted work. T1 and Tmax use the identical
-code path (can_parallelize=false for single-member). The 1-2% x86 noise gaps vs
-rapidgzip/igzip on software/logs are pure measurement variance (55ms operations).
-
-### BGZF deflate_start Must Handle FNAME/FCOMMENT
-
-The `parse_bgzf_blocks` function's `deflate_start = offset + 12 + xlen` is WRONG when
-gzip headers have FNAME (0x08), FCOMMENT (0x10), or FHCRC (0x02) flags set. Must parse
-all optional fields to find the true deflate data offset.
-
-## Remaining Gaps
-
-### Decompression Gap Priorities
-
-**HIGHEST IMPACT: x86 igzip AVX-512 gap (6 scenarios, -8% to -52%)**
-- Root cause: igzip uses AVX-512 vpclmulqdq for CRC32 + SIMD Huffman decode
-- gzippy uses libdeflate which is fast but doesn't exploit AVX-512 as aggressively
-- The gap is largest on repetitive data (software -52%, logs -42%)
-- On silesia (complex data) the gap is only -8%, close to noise
-- Fix: either implement AVX-512 Huffman decode or skip CRC32 when not needed
-
-**ARCHITECTURE: Tmax single-member parallel (12 scenarios, -10% to -48%)**
-- rapidgzip parallelizes single-member gzip via speculative decode
-- gzippy falls back to sequential for single-member files
-- Two-pass approach proven insufficient (scan pass cost too high at 4 cores)
-- Speculative parallel was tried but regressed arm64 by 15% (removed)
-- Requires dedicated block-finder + decoder thread architecture
-
-**BGZF Tmax on x86: rapidgzip edge (-6% to -16%)**
-- Even on BGZF (multi-member), rapidgzip slightly edges gzippy at Tmax=4 on x86
-- Possible cause: thread pool overhead in our parallel path
-- This is the most actionable gap — our BGZF parser should win here
-
-### What CI Was Hiding
-
-The cloud fleet revealed that CI's ~92% win rate was inflated by I/O noise.
-On fast, CPU-limited hardware:
-- igzip's AVX-512 advantage is 2x on repetitive data (hidden by disk I/O on CI)
-- gzippy's absolute throughput is excellent (500-2400 MB/s depending on data)
-- The BGZF advantage is massive (80-128% at T1) — this is gzippy's moat
+### General
+| Approach | Result |
+|---|---|
+| RAM-backed I/O (/dev/shm) | **ESSENTIAL**: reveals true CPU speed |
+| 6-instance fleet (1 per arch×dataset) | **GOOD**: full parallelism, higher precision |
+| Local Mac in parallel with cloud | **GOOD**: free extra data point |
+| Simulation benchmarks | **BAD**: always lie about real-world perf |
+| EBS gp3 for benchmarks | **BAD**: 131 MB/s cap hides real differences |
 
 ## CI Benchmark Architecture
 
-**Platforms**: x86_64 (EPYC 4-core), arm64 (Graviton 4-core)
-**Datasets**: silesia (211MB), software (~22MB), logs (~22MB)
-**Archives**: gzip, bgzf, pigz — thread configs T1 and Tmax (4)
-**CI path**: Python scripts + `subprocess.run([tool, "-d"], stdin=fin, stdout=fout)`
-**Cloud path**: `gzippy-dev bench --json` (stdin→file methodology, same semantics)
-**Convergence**: min 10, max 40 trials, target CV <3% (sweep); 50-200 trials, CV<0.5% (precision)
-
-## What Works vs What Doesn't for Benchmarking
-
-### Works
-- RAM-backed I/O (/dev/shm): eliminates disk bottleneck, reveals true CPU speed
-- On-demand instances: no capacity errors, reliable launch
-- Two-phase sweep+precision: fast sweep catches obvious wins, precision resolves close races
-- Trimmed stats (drop min/max): reduces outlier impact
-- Same binary for bench tool on cloud and local: no drift between implementations
-- ISIZE-based buffer pre-allocation: avoids speculative remaining*4 alloc
-
-### Doesn't Work
-- EBS gp3 for benchmarks: 131 MB/s cap makes all tools look identical
-- Spot instances: InsufficientInstanceCapacity errors in single-AZ setup
-- Simulation benchmarks: always lie about real-world performance
-- Multiple benchmark implementations: drift between Python scripts vs Rust code
-- Flat noise thresholds: arm64 small files have 25% variance, silesia x86 has 3%
+**Cloud fleet**: c7i.4xlarge (Sapphire Rapids) + c8g.4xlarge (Graviton4)
+**Datasets**: silesia (211MB/503MB decompressed), software (~22MB), logs (~22MB)
+**Archives**: gzip, bgzf, pigz — thread configs T1 and Tmax=4
+**Sweep**: 30-100 trials, CV<1.5%
+**Precision**: 50-200 trials, CV<0.5% (close races <3%)

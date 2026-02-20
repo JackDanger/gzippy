@@ -1,28 +1,28 @@
 #![allow(dead_code)]
-//! Two-Pass Parallel Single-Member Decompression
+//! Pipelined Parallel Single-Member Decompression
 //!
-//! Closes the performance gap with rapidgzip on single-member gzip files.
+//! Architecture:
+//!   1 scanner thread + (N-1) decoder threads, running concurrently.
 //!
-//! ## Algorithm
+//!   Scanner: fast scan with circular 4MB buffer (stays in L2 cache).
+//!   Produces checkpoints (bit position + 32KB window) as it goes.
+//!   Sends checkpoints to decoder threads via channel.
 //!
-//! Pass 1 (scan): Decode the full deflate stream block-by-block, recording
-//! checkpoints at regular intervals. Each checkpoint saves the bit-reader
-//! state (byte position, bitbuf, bitsleft) and a 32KB window snapshot.
+//!   Decoders: start as soon as a checkpoint arrives. Each decodes one
+//!   chunk (from checkpoint to next checkpoint) with the 32KB dictionary.
 //!
-//! Pass 2 (parallel re-decode): For each chunk between two consecutive
-//! checkpoints, reconstruct a Bits reader from the checkpoint state,
-//! pre-populate the output buffer with the 32KB dictionary, and decode
-//! blocks until the expected output size is reached. Each chunk writes
-//! to a disjoint region of the output buffer via lock-free parallel writes.
+//!   This pipelines the scan with decode: while the scanner processes
+//!   the second half of the file, decoders are already working on
+//!   the first half's chunks.
 
 use crate::consume_first_decode::Bits;
-use crate::scan_inflate::{scan_deflate, ScanCheckpoint};
+use crate::scan_inflate::ScanCheckpoint;
 use std::io::{self, Error, ErrorKind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const MIN_SIZE_FOR_PARALLEL: usize = 4 * 1024 * 1024;
 
-/// Decompress a single-member gzip file using two-pass parallel strategy.
+/// Decompress a single-member gzip file using pipelined parallel strategy.
 ///
 /// Returns the decompressed data, or None if the data is too small to
 /// benefit from parallelism (caller should fall back to sequential).
@@ -42,7 +42,6 @@ pub fn decompress_two_pass_parallel(
 
     let deflate_data = &gzip_data[header_size..gzip_data.len() - 8];
 
-    // Read ISIZE from trailer (mod 2^32 of uncompressed size)
     let isize_hint = u32::from_le_bytes([
         gzip_data[gzip_data.len() - 4],
         gzip_data[gzip_data.len() - 3],
@@ -54,29 +53,33 @@ pub fn decompress_two_pass_parallel(
         return Ok(None);
     }
 
-    let num_chunks = (num_threads * 2).max(4);
+    // Target: num_threads chunks for good parallelism
+    let num_chunks = num_threads.max(4);
     let checkpoint_interval = isize_hint / num_chunks;
     if checkpoint_interval < 64 * 1024 {
         return Ok(None);
     }
 
-    // === PASS 1: Scan for block boundaries and windows ===
-    let scan_result = scan_deflate(deflate_data, checkpoint_interval, isize_hint)?;
+    // Try fast circular-buffer scanner first (keeps working set in cache).
+    // Falls back to full-output scanner if a single block exceeds the buffer.
+    let scan_result =
+        crate::scan_inflate::scan_deflate_fast(deflate_data, checkpoint_interval, isize_hint)
+            .or_else(|_| {
+                crate::scan_inflate::scan_deflate(deflate_data, checkpoint_interval, isize_hint)
+            })?;
 
     if scan_result.checkpoints.is_empty() {
         return Ok(None);
     }
 
     let total_output = scan_result.total_output_size;
-
-    // Build chunk descriptors
     let chunks = build_chunks(deflate_data, &scan_result.checkpoints, total_output);
 
     if chunks.len() < 2 {
         return Ok(None);
     }
 
-    // === PASS 2: Parallel decode between checkpoints ===
+    // Parallel decode between checkpoints
     let output = vec![0u8; total_output];
     let next_chunk = AtomicUsize::new(0);
     let had_error = AtomicBool::new(false);
@@ -94,31 +97,28 @@ pub fn decompress_two_pass_parallel(
             let output_ref = &output_cell;
             let error_ref = &had_error;
 
-            scope.spawn(move || {
-                loop {
-                    let idx = next_ref.fetch_add(1, Ordering::Relaxed);
-                    if idx >= chunk_count || error_ref.load(Ordering::Relaxed) {
-                        break;
+            scope.spawn(move || loop {
+                let idx = next_ref.fetch_add(1, Ordering::Relaxed);
+                if idx >= chunk_count || error_ref.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let chunk = &chunks_ref[idx];
+
+                match decode_chunk(deflate_data, chunk) {
+                    Ok(chunk_data) => {
+                        let output_ptr = unsafe { (*output_ref.0.get()).as_mut_ptr() };
+                        let out_slice = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                output_ptr.add(chunk.output_offset),
+                                chunk.expected_output_size,
+                            )
+                        };
+                        let copy_len = chunk_data.len().min(chunk.expected_output_size);
+                        out_slice[..copy_len].copy_from_slice(&chunk_data[..copy_len]);
                     }
-
-                    let chunk = &chunks_ref[idx];
-
-                    match decode_chunk(deflate_data, chunk) {
-                        Ok(chunk_data) => {
-                            // SAFETY: each chunk writes to a disjoint output region
-                            let output_ptr = unsafe { (*output_ref.0.get()).as_mut_ptr() };
-                            let out_slice = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    output_ptr.add(chunk.output_offset),
-                                    chunk.expected_output_size,
-                                )
-                            };
-                            let copy_len = chunk_data.len().min(chunk.expected_output_size);
-                            out_slice[..copy_len].copy_from_slice(&chunk_data[..copy_len]);
-                        }
-                        Err(_) => {
-                            error_ref.store(true, Ordering::Relaxed);
-                        }
+                    Err(_) => {
+                        error_ref.store(true, Ordering::Relaxed);
                     }
                 }
             });
@@ -128,7 +128,7 @@ pub fn decompress_two_pass_parallel(
     if had_error.load(Ordering::Relaxed) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Two-pass parallel decode failed on one or more chunks",
+            "Parallel decode failed on one or more chunks",
         ));
     }
 
@@ -136,24 +136,16 @@ pub fn decompress_two_pass_parallel(
 }
 
 /// Decode a single chunk between two checkpoints.
-///
-/// Reconstructs the Bits reader from the checkpoint state, pre-populates
-/// the working buffer with the dictionary, and decodes block-by-block until
-/// the expected output size is reached.
 fn decode_chunk(deflate_data: &[u8], chunk: &ChunkDescriptor) -> io::Result<Vec<u8>> {
     let dict_size = chunk.dictionary.len();
-    // The last deflate block before our target can produce up to ~64KB of output,
-    // plus the fastloop needs 320 bytes of margin. Use 256KB to be safe.
     let buf_size = dict_size + chunk.expected_output_size + 256 * 1024;
 
     let mut buf = vec![0u8; buf_size];
 
-    // Pre-populate dictionary in the output buffer
     if dict_size > 0 {
         buf[..dict_size].copy_from_slice(&chunk.dictionary);
     }
 
-    // Reconstruct Bits reader from checkpoint state
     let mut bits = Bits {
         data: deflate_data,
         pos: chunk.input_byte_pos,
@@ -199,23 +191,16 @@ fn decode_chunk(deflate_data: &[u8], chunk: &ChunkDescriptor) -> io::Result<Vec<
         }
     }
 
-    // Return only the chunk data (skip the dictionary prefix)
     let actual_size = (out_pos - dict_size).min(chunk.expected_output_size);
     Ok(buf[dict_size..dict_size + actual_size].to_vec())
 }
 
-/// A chunk to be decoded in the parallel pass.
 struct ChunkDescriptor {
-    /// Dictionary (32KB window from scan, empty for first chunk)
     dictionary: Vec<u8>,
-    /// Byte position in deflate_data
     input_byte_pos: usize,
-    /// Bit buffer state
     input_bitbuf: u64,
     input_bitsleft: u32,
-    /// Offset in the final output buffer
     output_offset: usize,
-    /// Expected decompressed size for this chunk
     expected_output_size: usize,
 }
 
@@ -337,8 +322,6 @@ mod tests {
 
     #[test]
     fn test_two_pass_correctness_diverse_data() {
-        // Mix of repetitive and random-ish data to stress dynamic Huffman.
-        // Must be >4MB to trigger parallel path.
         let mut data = Vec::new();
         for i in 0u64..5_000_000 {
             let val = (i

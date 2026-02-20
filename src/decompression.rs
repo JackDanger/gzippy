@@ -564,6 +564,11 @@ fn decompress_single_member<W: Write + Send>(
     writer: &mut W,
     _num_threads: usize,
 ) -> GzippyResult<u64> {
+    // Two-pass parallel (scan + re-decode) was tried but the scan pass costs
+    // as much as full decode, making total work 2x. Net slower at 4 threads.
+    // Keeping sequential libdeflate as the fastest single-member path.
+    // Future: scan-only decoder (no output writes) could make scan 2x faster,
+    // enabling profitable pipelining at 4+ threads.
     decompress_single_member_libdeflate(data, writer)
 }
 
