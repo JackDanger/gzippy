@@ -150,21 +150,34 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     }
 
     let result = if args.stdout {
-        // For stdout, we need to buffer in memory first because StdoutLock isn't Send
-        // This allows parallel decompression to work, then we write the result
-        let mut buffer = Vec::new();
-        let result = decompress_mmap_libdeflate(&mmap, &mut buffer, format, args.processes);
+        let stdout = stdout();
+        let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
 
-        // Write buffer to stdout
-        if let Ok(size) = result {
-            let stdout = stdout();
-            let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
-            writer.write_all(&buffer)?;
-            writer.flush()?;
-            Ok(size)
+        let is_gzip = matches!(format, CompressionFormat::Gzip | CompressionFormat::Zip);
+        let can_parallelize = args.processes > 1
+            && is_gzip
+            && (has_bgzf_markers(&mmap) || is_likely_multi_member(&mmap));
+
+        let size = if can_parallelize {
+            let mut buffer = Vec::new();
+            let result = decompress_mmap_libdeflate(&mmap, &mut buffer, format, args.processes);
+            match result {
+                Ok(size) => {
+                    writer.write_all(&buffer)?;
+                    Ok(size)
+                }
+                Err(e) => Err(e),
+            }
         } else {
-            result
-        }
+            match format {
+                CompressionFormat::Gzip | CompressionFormat::Zip => {
+                    Ok(decompress_multi_member_sequential(&mmap[..], &mut writer)?)
+                }
+                CompressionFormat::Zlib => Ok(decompress_zlib_turbo(&mmap[..], &mut writer)?),
+            }
+        };
+        writer.flush()?;
+        size
     } else {
         let output_path = output_path.clone().unwrap();
         let output_file = File::create(&output_path)?;
@@ -260,21 +273,27 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         CompressionFormat::Gzip // Default
     };
 
-    // Decompress into buffer (allows parallel decompression, then write to stdout)
-    let mut output_buffer = Vec::new();
+    let stdout = stdout();
+    let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
+
     match format {
         CompressionFormat::Gzip | CompressionFormat::Zip => {
-            decompress_gzip_libdeflate(&input_data, &mut output_buffer, args.processes)?;
+            let can_parallelize = args.processes > 1
+                && (has_bgzf_markers(&input_data) || is_likely_multi_member(&input_data));
+
+            if can_parallelize {
+                let mut output_buffer = Vec::new();
+                decompress_gzip_libdeflate(&input_data, &mut output_buffer, args.processes)?;
+                writer.write_all(&output_buffer)?;
+            } else {
+                decompress_multi_member_sequential(&input_data, &mut writer)?;
+            }
         }
         CompressionFormat::Zlib => {
-            decompress_zlib_turbo(&input_data, &mut output_buffer)?;
+            decompress_zlib_turbo(&input_data, &mut writer)?;
         }
     }
 
-    // Write to stdout
-    let stdout = stdout();
-    let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
-    writer.write_all(&output_buffer)?;
     writer.flush()?;
 
     Ok(0)
