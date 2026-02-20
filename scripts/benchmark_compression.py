@@ -26,9 +26,21 @@ from pathlib import Path
 
 
 # Benchmark configuration
-MIN_TRIALS = 5
-MAX_TRIALS = 30
-TARGET_CV = 0.05  # 5% coefficient of variation
+MIN_TRIALS = 10
+MAX_TRIALS = 40
+TARGET_CV = 0.03  # 3% coefficient of variation
+
+
+def trimmed_stats(times):
+    """Compute stats after dropping the single fastest and slowest trials."""
+    if len(times) <= 4:
+        t = sorted(times)
+    else:
+        t = sorted(times)[1:-1]
+    mean = statistics.mean(t)
+    stdev = statistics.stdev(t) if len(t) > 1 else 0
+    cv = stdev / mean if mean > 0 else 1.0
+    return t, mean, stdev, cv
 
 
 def find_binary(binaries_dir: Path, name: str) -> str | None:
@@ -121,31 +133,36 @@ def benchmark_compression(
         times.append(time.perf_counter() - start)
 
         if len(times) >= MIN_TRIALS:
-            mean = statistics.mean(times)
-            stdev = statistics.stdev(times)
-            cv = stdev / mean if mean > 0 else 1.0
+            _, _, _, cv = trimmed_stats(times)
             if cv < TARGET_CV:
                 converged = True
                 break
 
     output_size = os.path.getsize(output_file)
     input_size = os.path.getsize(input_file)
-    median = statistics.median(times)
+    trimmed, t_mean, t_stdev, t_cv = trimmed_stats(times)
+    median = statistics.median(trimmed)
+    sorted_trimmed = sorted(trimmed)
+    p10 = sorted_trimmed[max(0, len(sorted_trimmed) // 10)]
+    p90 = sorted_trimmed[min(len(sorted_trimmed) - 1, len(sorted_trimmed) * 9 // 10)]
 
     return {
         "tool": tool,
         "operation": "compress",
         "times": times,
         "median": median,
-        "mean": statistics.mean(times),
-        "stdev": statistics.stdev(times) if len(times) > 1 else 0,
-        "cv": statistics.stdev(times) / statistics.mean(times) if len(times) > 1 else 0,
+        "mean": t_mean,
+        "stdev": t_stdev,
+        "cv": t_cv,
         "trials": len(times),
+        "trimmed_trials": len(trimmed),
         "converged": converged,
         "output_size": output_size,
         "input_size": input_size,
         "ratio": output_size / input_size,
         "speed_mbps": input_size / median / 1_000_000,
+        "p10_speed_mbps": input_size / p90 / 1_000_000,
+        "p90_speed_mbps": input_size / p10 / 1_000_000,
     }
 
 
