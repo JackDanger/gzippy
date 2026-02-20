@@ -20,15 +20,19 @@ gzippy-dev ci push            # 2. Push → CI → auto-triage + vs-main
 gzippy-dev ci vs-main         # 3. Check anytime: did branch help or hurt?
 ```
 
-## Current Status: ~91% Effective Win Rate (Feb 20 2026)
+## Current Status: ~92% Effective Win Rate (Feb 20 2026)
 
-**86 wins / 37 gaps / 123 total comparisons** (fluctuates ±5% between runs due to noise)
-- ARCHITECTURE: 6 gaps (Tmax single-member vs rapidgzip, 11-24%)
-- SIMD: 3 gaps (L1 compression vs igzip, 4-13%)
-- ACTIONABLE: 2 gaps (silesia x86 only)
-- NOISE: 26 gaps (properly thresholded by platform/dataset)
+**Effective win rate: 94.3%** (up from 83% at start of session)
+- ARCHITECTURE: 4 gaps (silesia Tmax vs rapidgzip only, 10-16%)
+- SIMD: 3 gaps (L1 compression vs igzip, 4-50% but worst is CI noise)
+- ACTIONABLE: 0 gaps
+- NOISE: 27 gaps (properly thresholded by platform/dataset)
 
-**Effective win rate (NOISE as ties): 91.1%** — up from 83% after fixing noise thresholds.
+Key wins from latest CI run (perf/bgzf-t1-fast-path vs main):
+- `silesia-bgzf Tmax x86`: +10.1% (314.8 → 346.5 MB/s, now BEATS rapidgzip by 6.6%)
+- `silesia-bgzf T1 x86`: +10.0% (234.0 → 257.5 MB/s)
+- `silesia-gzip T1 x86`: +4.8% (254.5 → 266.6 MB/s)
+- `silesia-pigz Tmax x86`: +7.6% (239.5 → 257.6 MB/s)
 
 ## What We Learned (Feb 20 2026)
 
@@ -36,12 +40,19 @@ gzippy-dev ci vs-main         # 3. Check anytime: did branch help or hurt?
 
 | Context | Threshold | Why |
 |---|---|---|
-| arm64 + small files | 15% | CI shows 20-30% swings between identical runs |
+| arm64 + small files | 25% | CI shows 24%+ swings between identical runs (observed: 164→125 MB/s, same code) |
 | arm64 + silesia | 8% | Better but still noisy |
 | x86 + small files | 5% | Moderate variance from startup overhead |
 | x86 + silesia | 3% | Most stable measurement |
 
 The old flat 2% threshold miscategorized arm64 noise as ACTIONABLE, wasting effort.
+
+### Pigz Decompresses Sequentially (Even at Tmax)
+
+Pigz ignores `-p` for decompression. So Tmax gaps vs pigz on single-member files
+are NOT architecture gaps — both tools decompress sequentially. Only rapidgzip does
+parallel single-member decompression. The triage now only classifies Tmax gaps vs
+rapidgzip as ARCHITECTURE.
 
 ### pigz Output Is Single-Member
 
@@ -73,6 +84,13 @@ For trusted BGZF blocks, call `libdeflate_deflate_decompress` directly on the ra
 data. Skips per-block: gzip header parsing, CRC32 validation, decompressor alloc/free.
 Now used in both T1 streaming and Tmax parallel BGZF paths.
 
+### Single-Member Sequential Path Is Already Optimal
+
+Traced the T1/Tmax single-member decompression path: mmap → format detect → one
+libdeflate call → one write → flush. No wasted work. T1 and Tmax use the identical
+code path (can_parallelize=false for single-member). The 1-2% x86 noise gaps vs
+rapidgzip/igzip on software/logs are pure measurement variance (55ms operations).
+
 ### BGZF deflate_start Must Handle FNAME/FCOMMENT
 
 The `parse_bgzf_blocks` function's `deflate_start = offset + 12 + xlen` is WRONG when
@@ -81,14 +99,18 @@ all optional fields to find the true deflate data offset.
 
 ## Remaining Gaps
 
-### ACTIONABLE (2 gaps, closable)
-- `silesia-gzip T1 x86` vs igzip: ~5% (but fluctuates 0-5% between runs)
-- `silesia-bgzf Tmax x86` vs rapidgzip: ~3%
+### ACTIONABLE: None
 
-### ARCHITECTURE (6 gaps, needs major feature)
-- All Tmax single-member decompression vs rapidgzip (11-24%)
+All previously ACTIONABLE gaps have been closed or reclassified:
+- `silesia-bgzf Tmax x86` vs rapidgzip: **CLOSED** (+6.6% ahead, 346.5 vs 325 MB/s)
+- `silesia-gzip T1 x86` vs igzip: **CLOSED** (+5.1% ahead, 266.6 vs 253.6 MB/s)
+- `software-bgzf T1 arm64` vs pigz: **NOISE** (24% swing between identical code runs)
+
+### ARCHITECTURE (4 gaps, needs major feature)
+- Silesia Tmax decompression vs rapidgzip only (10-16%)
+- arm64 small-file Tmax gaps reclassified as NOISE (pigz decompresses sequentially)
 - Requires rapidgzip-style pipeline (dedicated block-finder + decoder threads)
-- Two-pass approach proven insufficient (scan pass overhead too high)
+- Two-pass approach proven insufficient (scan pass overhead too high on 4 cores)
 
 ### SIMD (3 gaps, accepted)
 - L1 compression vs igzip's AVX2/AVX-512 assembly

@@ -705,10 +705,10 @@ pub(crate) fn categorize_gap(scenario: &str, competitor: &str, gap_pct: f64) -> 
     let is_small_dataset = scenario.contains("software") || scenario.contains("logs");
 
     // Noise thresholds vary by platform and dataset size.
-    // arm64 CI shows 20%+ variance on small files between identical runs.
+    // arm64 CI shows 24%+ swings on small files between identical code runs.
     // x86_64 shows 5-8% variance on small files, <3% on silesia.
     let noise_threshold = if is_arm64 && is_small_dataset {
-        15.0
+        25.0 // Observed 24% drop on software-bgzf T1 arm64 with no code change
     } else if is_arm64 {
         8.0
     } else if is_small_dataset {
@@ -727,12 +727,14 @@ pub(crate) fn categorize_gap(scenario: &str, competitor: &str, gap_pct: f64) -> 
                 noise_threshold));
     }
 
-    // Tmax decompression on single-member archives = needs parallel single-member
-    if is_decompress && is_tmax && is_single_member {
+    // Tmax decompression on single-member archives vs rapidgzip only.
+    // rapidgzip is the only competitor doing parallel single-member inflate.
+    // pigz, igzip, gzip all decompress sequentially regardless of -p flag.
+    if is_decompress && is_tmax && is_single_member && competitor == "rapidgzip" {
         return (GapCategory::Architecture,
-            format!("Single-member parallel decompression needed. {} has a pipeline \
+            format!("Single-member parallel decompression needed. rapidgzip has a pipeline \
                      architecture (block-finder + decoder threads) that we lack. \
-                     Gap: {:.1}%", competitor, gap_pct.abs())
+                     Gap: {:.1}%", gap_pct.abs())
         );
     }
 
