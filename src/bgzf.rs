@@ -372,8 +372,27 @@ fn parse_bgzf_blocks(data: &[u8]) -> io::Result<Vec<BgzfBlock>> {
             0
         };
 
-        // Deflate data starts after the fixed 10-byte gzip header + 2-byte XLEN + xlen bytes
-        let deflate_start = offset + 12 + xlen;
+        // Deflate data starts after the full gzip header (including optional fields)
+        let mut deflate_start = offset + 12 + xlen;
+        let flags = data[offset + 3];
+        // FNAME: null-terminated filename
+        if flags & 0x08 != 0 {
+            while deflate_start < offset + length && data[deflate_start] != 0 {
+                deflate_start += 1;
+            }
+            deflate_start += 1; // skip null terminator
+        }
+        // FCOMMENT: null-terminated comment
+        if flags & 0x10 != 0 {
+            while deflate_start < offset + length && data[deflate_start] != 0 {
+                deflate_start += 1;
+            }
+            deflate_start += 1;
+        }
+        // FHCRC: 2-byte header CRC
+        if flags & 0x02 != 0 {
+            deflate_start += 2;
+        }
 
         blocks.push(BgzfBlock {
             start: offset,
@@ -2643,8 +2662,11 @@ pub fn decompress_bgzf_parallel_to_vec(data: &[u8], num_threads: usize) -> io::R
             let error_ref = &had_error;
 
             scope.spawn(move || {
-                use crate::libdeflate_ext::DecompressorEx;
-                let mut decompressor = DecompressorEx::new();
+                let decompressor = unsafe { libdeflate_sys::libdeflate_alloc_decompressor() };
+                if decompressor.is_null() {
+                    error_ref.store(true, Ordering::Relaxed);
+                    return;
+                }
 
                 loop {
                     let idx = next_ref.fetch_add(1, Ordering::Relaxed);
@@ -2653,27 +2675,39 @@ pub fn decompress_bgzf_parallel_to_vec(data: &[u8], num_threads: usize) -> io::R
                     }
 
                     let block = &blocks_ref[idx];
-                    let block_data = &data[block.start..block.start + block.length];
+                    let out_size = block.isize as usize;
+                    if out_size == 0 {
+                        continue;
+                    }
+
+                    // Raw deflate: skip gzip header, stop before 8-byte trailer
+                    let deflate_end = block.start + block.length - 8;
+                    let deflate_data = &data[block.deflate_start..deflate_end];
 
                     // SAFETY: Each block writes to a disjoint region
                     let output_ptr = unsafe { (*output_ref.0.get()).as_mut_ptr() };
                     let out_start = block.output_offset;
-                    let out_size = block.isize as usize;
                     let out_slice = unsafe {
                         std::slice::from_raw_parts_mut(output_ptr.add(out_start), out_size)
                     };
 
-                    match decompressor.gzip_decompress_ex(block_data, out_slice) {
-                        Ok(result) => {
-                            if result.output_size != out_size {
-                                error_ref.store(true, Ordering::Relaxed);
-                            }
-                        }
-                        Err(_) => {
-                            error_ref.store(true, Ordering::Relaxed);
-                        }
+                    let mut actual_out = 0usize;
+                    let ret = unsafe {
+                        libdeflate_sys::libdeflate_deflate_decompress(
+                            decompressor,
+                            deflate_data.as_ptr() as *const std::ffi::c_void,
+                            deflate_data.len(),
+                            out_slice.as_mut_ptr() as *mut std::ffi::c_void,
+                            out_size,
+                            &mut actual_out,
+                        )
+                    };
+                    if ret != 0 || actual_out != out_size {
+                        error_ref.store(true, Ordering::Relaxed);
                     }
                 }
+
+                unsafe { libdeflate_sys::libdeflate_free_decompressor(decompressor) };
             });
         }
     });

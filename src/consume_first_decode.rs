@@ -1694,6 +1694,19 @@ pub fn decode_huffman_cf_pub(
     decode_huffman_cf(bits, output, out_pos, litlen, dist)
 }
 
+/// Public wrappers for block-level decode functions (used by two-pass parallel)
+pub fn decode_stored_pub(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    decode_stored(bits, output, out_pos)
+}
+
+pub fn decode_fixed_pub(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    decode_fixed(bits, output, out_pos)
+}
+
+pub fn decode_dynamic_pub(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    decode_dynamic(bits, output, out_pos)
+}
+
 fn decode_huffman_cf(
     bits: &mut Bits,
     output: &mut [u8],

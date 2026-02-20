@@ -268,14 +268,44 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     use std::io::Read;
 
-    // Buffer stdin into memory to use our optimized parallel decompressor
-    // This trades memory for speed: ~20MB stdin fits easily in RAM
-    let stdin = stdin();
-    let mut input_data = Vec::new();
-    {
-        let mut reader = BufReader::with_capacity(STREAM_BUFFER_SIZE, stdin.lock());
-        reader.read_to_end(&mut input_data)?;
-    }
+    // Try to mmap stdin when it's a regular file (e.g. benchmark piping).
+    // This avoids copying the entire input into a Vec.
+    #[cfg(unix)]
+    let mmap_data: Option<Mmap> = {
+        use std::os::unix::io::FromRawFd;
+        let stdin_fd = 0;
+        let meta =
+            std::fs::File::from(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(stdin_fd) });
+        let ft = meta.metadata().map(|m| m.file_type());
+        let is_regular = ft.as_ref().map(|ft| ft.is_file()).unwrap_or(false);
+        let result = if is_regular {
+            unsafe { Mmap::map(&meta) }.ok()
+        } else {
+            None
+        };
+        std::mem::forget(meta); // don't close stdin
+        result
+    };
+
+    #[cfg(not(unix))]
+    let mmap_data: Option<Mmap> = None;
+
+    let input_data_vec;
+    let input_data: &[u8] = if let Some(ref mmap) = mmap_data {
+        if debug_enabled() {
+            eprintln!("[gzippy] stdin mmap'd: {} bytes", mmap.len());
+        }
+        &mmap[..]
+    } else {
+        let stdin_handle = stdin();
+        let mut data = Vec::new();
+        {
+            let mut reader = BufReader::with_capacity(STREAM_BUFFER_SIZE, stdin_handle.lock());
+            reader.read_to_end(&mut data)?;
+        }
+        input_data_vec = data;
+        &input_data_vec
+    };
 
     if input_data.is_empty() {
         return Ok(0);
@@ -289,7 +319,7 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     if args.force && !is_gzip && !is_zlib {
         let stdout = stdout();
         let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
-        writer.write_all(&input_data)?;
+        writer.write_all(input_data)?;
         writer.flush()?;
         return Ok(0);
     }
@@ -307,25 +337,22 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
 
     match format {
         CompressionFormat::Gzip | CompressionFormat::Zip => {
-            let is_bgzf = has_bgzf_markers(&input_data);
+            let is_bgzf = has_bgzf_markers(input_data);
             let can_parallelize =
-                args.processes > 1 && (is_bgzf || is_likely_multi_member(&input_data));
+                args.processes > 1 && (is_bgzf || is_likely_multi_member(input_data));
 
             if is_bgzf {
-                // BGZF: always use the BGZF-optimized path.
-                // decompress_bgzf_parallel handles T1 vs Tmax internally:
-                // T1 streams block-by-block (no huge allocation), Tmax uses parallel Vec.
                 let threads = if can_parallelize { args.processes } else { 1 };
-                crate::bgzf::decompress_bgzf_parallel(&input_data, &mut writer, threads)?;
+                crate::bgzf::decompress_bgzf_parallel(input_data, &mut writer, threads)?;
             } else if can_parallelize {
-                let output = decompress_gzip_to_vec(&input_data, args.processes)?;
+                let output = decompress_gzip_to_vec(input_data, args.processes)?;
                 writer.write_all(&output)?;
             } else {
-                decompress_multi_member_sequential(&input_data, &mut writer)?;
+                decompress_multi_member_sequential(input_data, &mut writer)?;
             }
         }
         CompressionFormat::Zlib => {
-            decompress_zlib_turbo(&input_data, &mut writer)?;
+            decompress_zlib_turbo(input_data, &mut writer)?;
         }
     }
 

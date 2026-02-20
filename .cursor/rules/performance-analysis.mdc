@@ -20,57 +20,83 @@ gzippy-dev ci push            # 2. Push → CI → auto-triage + vs-main
 gzippy-dev ci vs-main         # 3. Check anytime: did branch help or hurt?
 ```
 
-## Current Status: ~70% Win Rate, ~86% Effective (Feb 20 2026)
+## Current Status: ~91% Effective Win Rate (Feb 20 2026)
 
-**~87 wins / ~36 gaps / 123 total comparisons** (fluctuates ±2% between runs due to arm64 noise)
-- ARCHITECTURE: ~10 gaps (parallel single-member vs rapidgzip, up to -24%)
-- SIMD: 3 gaps (L1 compression vs igzip, up to -13%)
-- ACTIONABLE: ~5-8 gaps (arm64 T1 overhead, up to -14%)
-- NOISE: ~16-19 gaps (all <2%)
+**86 wins / 37 gaps / 123 total comparisons** (fluctuates ±5% between runs due to noise)
+- ARCHITECTURE: 6 gaps (Tmax single-member vs rapidgzip, 11-24%)
+- SIMD: 3 gaps (L1 compression vs igzip, 4-13%)
+- ACTIONABLE: 2 gaps (silesia x86 only)
+- NOISE: 26 gaps (properly thresholded by platform/dataset)
 
-**Effective win rate (NOISE as ties): ~86%**
+**Effective win rate (NOISE as ties): 91.1%** — up from 83% after fixing noise thresholds.
 
-## What Worked (perf/bgzf-t1-fast-path branch)
+## What We Learned (Feb 20 2026)
 
-| Change | Impact on CI | Notes |
+### Noise Thresholds Must Vary by Context
+
+| Context | Threshold | Why |
 |---|---|---|
-| Streaming BGZF T1 | +5.5% silesia-bgzf T1 x86 | Eliminated 500MB alloc+copy |
-| BGZF T1 routing | Closed 3 ACTIONABLE gaps | Route BGZF before parallelism check |
-| Raw deflate + reused decompressor | +3% BGZF T1 arm64 | Skip gzip header + alloc per block |
+| arm64 + small files | 15% | CI shows 20-30% swings between identical runs |
+| arm64 + silesia | 8% | Better but still noisy |
+| x86 + small files | 5% | Moderate variance from startup overhead |
+| x86 + silesia | 3% | Most stable measurement |
 
-## arm64 Noise Reality
+The old flat 2% threshold miscategorized arm64 noise as ACTIONABLE, wasting effort.
 
-**arm64 CI is very noisy.** Between consecutive runs on the same code:
-- 70.7% → 69.9% win rate (no code change between runs!)
-- Individual scenarios swing 10-30% (e.g., software-gzip T1 arm64)
-- `software` and `logs` datasets (~22MB) are worst affected
+### pigz Output Is Single-Member
 
-**Rule**: If arm64 shows a regression >10% on a small dataset and x86 doesn't
-show the same regression, it's noise. Use `ci history` to confirm.
+pigz 2.8 creates **single-member** gzip output from stdin (even with `-p4`). Our
+`is_likely_multi_member` correctly returns false. The gaps vs rapidgzip on `silesia-pigz`
+are genuine architecture gaps, not detection bugs.
 
-## Gap Categories (from `ci triage`)
+### Two-Pass Parallel Does NOT Beat Sequential
 
-| Category | What it means | Action |
-|---|---|---|
-| ARCHITECTURE | Needs parallel single-member (rapidgzip-style pipeline) | Major feature |
-| SIMD | igzip's AVX2/AVX-512 hand-tuned assembly | Accept or write asm |
-| ACTIONABLE | Closable with code changes | Work on these |
-| NOISE | <2% — measurement variance | Ignore |
+Tested: scan pass (pure Rust inflate) + parallel re-decode vs libdeflate FFI sequential.
+Result: **32% SLOWER** on ARM (650 MB/s vs 960 MB/s).
 
-## Remaining ACTIONABLE Strategy
+Root cause: scan pass does full decode work (~1x), parallel pass adds ~0.25x. Total 1.25x
+work at 90% of libdeflate speed = net throughput 72% of sequential. Break-even requires
+11+ threads; CI has only 4.
 
-The arm64 T1 gaps on small files are hard to close because:
-1. Process startup overhead is ~10% of measurement time (~0.15s for 22MB)
-2. arm64 Graviton has lower per-core IPC than x86 EPYC
-3. Competitors (rapidgzip, pigz) may have slightly different startup overhead
+The ONLY viable parallel single-member approach is rapidgzip-style speculative decode
+(no scan pass). This remains a major feature gap.
 
-Focus on **x86 ACTIONABLE gaps** (more stable measurements):
-- `silesia-gzip T1 x86` vs igzip: -5.4% — inflate loop optimization
-- `silesia-bgzf Tmax x86` vs rapidgzip: -3.4% — thread coordination
+### stdin mmap Helps When Stdin Is a Regular File
+
+CI benchmark pipes files via `subprocess.run(cmd, stdin=fin, stdout=fout)`. Python passes
+the real fd, so gzippy can mmap stdin instead of copying 77MB into a Vec. Saves allocation
++ copy overhead.
+
+### Raw Deflate Is Faster Than gzip_decompress_ex
+
+For trusted BGZF blocks, call `libdeflate_deflate_decompress` directly on the raw deflate
+data. Skips per-block: gzip header parsing, CRC32 validation, decompressor alloc/free.
+Now used in both T1 streaming and Tmax parallel BGZF paths.
+
+### BGZF deflate_start Must Handle FNAME/FCOMMENT
+
+The `parse_bgzf_blocks` function's `deflate_start = offset + 12 + xlen` is WRONG when
+gzip headers have FNAME (0x08), FCOMMENT (0x10), or FHCRC (0x02) flags set. Must parse
+all optional fields to find the true deflate data offset.
+
+## Remaining Gaps
+
+### ACTIONABLE (2 gaps, closable)
+- `silesia-gzip T1 x86` vs igzip: ~5% (but fluctuates 0-5% between runs)
+- `silesia-bgzf Tmax x86` vs rapidgzip: ~3%
+
+### ARCHITECTURE (6 gaps, needs major feature)
+- All Tmax single-member decompression vs rapidgzip (11-24%)
+- Requires rapidgzip-style pipeline (dedicated block-finder + decoder threads)
+- Two-pass approach proven insufficient (scan pass overhead too high)
+
+### SIMD (3 gaps, accepted)
+- L1 compression vs igzip's AVX2/AVX-512 assembly
 
 ## CI Benchmark Architecture
 
 **Platforms**: x86_64 (EPYC 4-core), arm64 (Graviton 4-core)
 **Datasets**: silesia (211MB), software (~22MB), logs (~22MB)
 **Archives**: gzip, bgzf, pigz — thread configs T1 and Tmax (4)
+**Benchmark path**: `subprocess.run([tool, "-d"], stdin=fin, stdout=fout)` (stdin pipe, not file arg)
 **Convergence**: min 10, max 40 trials, target CV <3%

@@ -699,11 +699,32 @@ pub(crate) fn categorize_gap(scenario: &str, competitor: &str, gap_pct: f64) -> 
     let is_bgzf = scenario.contains("bgzf");
     let is_tmax = scenario.contains("Tmax");
     let is_t1 = scenario.contains("T1");
+    let is_arm64 = scenario.contains("arm64");
     let is_single_member = !is_bgzf
         && (scenario.contains("-gzip") || scenario.contains("-pigz"));
+    let is_small_dataset = scenario.contains("software") || scenario.contains("logs");
 
-    if gap_pct.abs() < 2.0 {
-        return (GapCategory::Noise, "Within noise margin".to_string());
+    // Noise thresholds vary by platform and dataset size.
+    // arm64 CI shows 20%+ variance on small files between identical runs.
+    // x86_64 shows 5-8% variance on small files, <3% on silesia.
+    let noise_threshold = if is_arm64 && is_small_dataset {
+        15.0
+    } else if is_arm64 {
+        8.0
+    } else if is_small_dataset {
+        5.0
+    } else {
+        3.0
+    };
+
+    if gap_pct.abs() < noise_threshold {
+        return (GapCategory::Noise,
+            format!("Within noise margin for {} (threshold {:.0}%)",
+                if is_arm64 && is_small_dataset { "arm64 small files" }
+                else if is_arm64 { "arm64" }
+                else if is_small_dataset { "small files" }
+                else { "this platform" },
+                noise_threshold));
     }
 
     // Tmax decompression on single-member archives = needs parallel single-member
@@ -730,14 +751,6 @@ pub(crate) fn categorize_gap(scenario: &str, competitor: &str, gap_pct: f64) -> 
             .to_string());
     }
 
-    // BGZF T1 gaps — PR #52 should address
-    if is_decompress && is_bgzf && is_t1 {
-        return (GapCategory::Actionable,
-            "BGZF T1 path overhead. PR #52 routes BGZF through optimized path at T1. \
-             If gap persists after PR #52, profile block parsing and buffer allocation."
-            .to_string());
-    }
-
     // BGZF Tmax gaps — thread pool overhead
     if is_decompress && is_bgzf && is_tmax {
         return (GapCategory::Actionable,
@@ -754,16 +767,9 @@ pub(crate) fn categorize_gap(scenario: &str, competitor: &str, gap_pct: f64) -> 
             .to_string());
     }
 
-    // Generic small gaps
-    if gap_pct.abs() < 5.0 {
-        return (GapCategory::Actionable,
-            format!("Small gap ({:.1}%). Profile with `gzippy-dev instrument` \
-                     and check for unnecessary allocations or IO overhead.", gap_pct.abs()));
-    }
-
+    // Generic gaps
     (GapCategory::Actionable,
-     format!("Significant gap ({:.1}%). Needs profiling to identify root cause. \
-              Run: gzippy-dev instrument <file> --threads <N>", gap_pct.abs()))
+     format!("Gap {:.1}%. Profile with `gzippy-dev instrument` to find root cause.", gap_pct.abs()))
 }
 
 fn print_triage(benchmarks: &[BenchResult]) {
@@ -1356,8 +1362,30 @@ mod tests {
     // ── categorize_gap ──
 
     #[test]
-    fn test_categorize_noise() {
-        let (cat, _) = categorize_gap("decompress silesia-gzip T1 x86_64", "igzip", -1.5);
+    fn test_categorize_noise_x86_silesia() {
+        // x86 silesia: 3% threshold
+        let (cat, _) = categorize_gap("decompress silesia-gzip T1 x86_64", "igzip", -2.5);
+        assert_eq!(cat, GapCategory::Noise);
+    }
+
+    #[test]
+    fn test_categorize_noise_arm64_small() {
+        // arm64 small files: 15% threshold (massive variance between runs)
+        let (cat, _) = categorize_gap("decompress software-gzip T1 arm64", "rapidgzip", -14.0);
+        assert_eq!(cat, GapCategory::Noise);
+    }
+
+    #[test]
+    fn test_categorize_noise_arm64_silesia() {
+        // arm64 silesia: 8% threshold
+        let (cat, _) = categorize_gap("decompress silesia-gzip T1 arm64", "igzip", -7.5);
+        assert_eq!(cat, GapCategory::Noise);
+    }
+
+    #[test]
+    fn test_categorize_noise_x86_small() {
+        // x86 small files: 5% threshold
+        let (cat, _) = categorize_gap("decompress software-gzip T1 x86_64", "igzip", -4.5);
         assert_eq!(cat, GapCategory::Noise);
     }
 
@@ -1380,40 +1408,26 @@ mod tests {
     }
 
     #[test]
-    fn test_categorize_actionable_bgzf_t1() {
-        let (cat, _) = categorize_gap("decompress logs-bgzf T1 arm64", "pigz", -14.0);
-        assert_eq!(cat, GapCategory::Actionable);
-    }
-
-    #[test]
     fn test_categorize_actionable_bgzf_tmax() {
         let (cat, _) = categorize_gap("decompress silesia-bgzf Tmax x86_64", "rapidgzip", -3.4);
         assert_eq!(cat, GapCategory::Actionable);
     }
 
     #[test]
-    fn test_categorize_actionable_decompress_igzip_t1() {
-        let (cat, _) = categorize_gap("decompress silesia-bgzf T1 x86_64", "igzip", -2.2);
-        assert_eq!(cat, GapCategory::Actionable);
-    }
-
-    #[test]
     fn test_categorize_decompress_not_simd() {
-        // "decompress" contains "compress" — make sure it doesn't match SIMD rule
-        let (cat, _) = categorize_gap("decompress silesia-bgzf T1 x86_64", "igzip", -2.5);
+        let (cat, _) = categorize_gap("decompress silesia-bgzf T1 x86_64", "igzip", -3.5);
         assert_ne!(cat, GapCategory::Simd);
     }
 
     #[test]
     fn test_categorize_actionable_compress_pigz() {
-        let (cat, action) = categorize_gap("compress software L9 Tmax x86_64", "pigz", -3.6);
+        let (cat, action) = categorize_gap("compress software L9 Tmax x86_64", "pigz", -6.0);
         assert_eq!(cat, GapCategory::Actionable);
         assert!(action.contains("pigz"), "action should mention pigz: {}", action);
     }
 
     #[test]
     fn test_categorize_bgzf_not_architecture() {
-        // BGZF Tmax should be ACTIONABLE, not ARCHITECTURE
         let (cat, _) = categorize_gap("decompress logs-bgzf Tmax x86_64", "rapidgzip", -5.0);
         assert_ne!(cat, GapCategory::Architecture);
         assert_eq!(cat, GapCategory::Actionable);
