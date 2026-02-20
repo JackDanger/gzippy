@@ -112,6 +112,25 @@ All previously ACTIONABLE gaps have been closed or reclassified:
 - Requires rapidgzip-style pipeline (dedicated block-finder + decoder threads)
 - Two-pass approach proven insufficient (scan pass overhead too high on 4 cores)
 
+### Speculative Parallel (Feb 2026 — Evaluated, Infrastructure Ready)
+
+Wired `speculative_parallel.rs` into production for Tmax single-member files.
+Safety: ISIZE early check + CRC32 final check + fast fallback (<1ms overhead).
+
+**Current status**: Always falls back to sequential on silesia data because the
+block finder produces false positives. The precode leaf count check (rapidgzip
+style) isn't sufficient to reject all false block starts in complex data.
+
+**Why it fails**: The `validate_block_start` trial decode (256 symbols) isn't
+selective enough. Random bit patterns in compressed data can form valid Huffman
+tables that decode 256 symbols without error. Need either:
+1. Much longer trial decode (4096+ symbols)
+2. Entropy-based validation of decoded output
+3. rapidgzip's full block-finder pipeline (13-bit LUT + multiple search stages)
+
+**The infrastructure is safe and ready** — when the block finder improves, the
+parallel path will activate automatically with no production code changes.
+
 ### SIMD (3 gaps, accepted)
 - L1 compression vs igzip's AVX2/AVX-512 assembly
 

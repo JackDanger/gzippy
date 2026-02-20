@@ -197,6 +197,30 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             let len = output.len() as u64;
             writer.write_all(&output)?;
             Ok(len)
+        } else if args.processes > 1 && is_gzip && mmap.len() > 8 * 1024 * 1024 {
+            match crate::speculative_parallel::decompress_speculative(&mmap[..], args.processes) {
+                Ok(Some(output)) => {
+                    if debug_enabled() {
+                        eprintln!("[gzippy] speculative parallel: {} bytes", output.len());
+                    }
+                    let len = output.len() as u64;
+                    writer.write_all(&output)?;
+                    Ok(len)
+                }
+                _ => {
+                    if debug_enabled() {
+                        eprintln!("[gzippy] speculative failed, sequential fallback");
+                    }
+                    match format {
+                        CompressionFormat::Gzip | CompressionFormat::Zip => {
+                            Ok(decompress_multi_member_sequential(&mmap[..], &mut writer)?)
+                        }
+                        CompressionFormat::Zlib => {
+                            Ok(decompress_zlib_turbo(&mmap[..], &mut writer)?)
+                        }
+                    }
+                }
+            }
         } else {
             match format {
                 CompressionFormat::Gzip | CompressionFormat::Zip => {
@@ -347,6 +371,25 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             } else if can_parallelize {
                 let output = decompress_gzip_to_vec(input_data, args.processes)?;
                 writer.write_all(&output)?;
+            } else if args.processes > 1 && input_data.len() > 8 * 1024 * 1024 {
+                // Single-member Tmax: try speculative parallel with fast fallback
+                match crate::speculative_parallel::decompress_speculative(
+                    input_data,
+                    args.processes,
+                ) {
+                    Ok(Some(output)) => {
+                        if debug_enabled() {
+                            eprintln!("[gzippy] speculative parallel: {} bytes", output.len());
+                        }
+                        writer.write_all(&output)?;
+                    }
+                    _ => {
+                        if debug_enabled() {
+                            eprintln!("[gzippy] speculative failed, sequential fallback");
+                        }
+                        decompress_multi_member_sequential(input_data, &mut writer)?;
+                    }
+                }
             } else {
                 decompress_multi_member_sequential(input_data, &mut writer)?;
             }

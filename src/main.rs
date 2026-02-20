@@ -44,6 +44,7 @@ mod simd_copy;
 mod simd_huffman;
 mod simple_optimizations;
 mod specialized_decode;
+mod speculative_parallel;
 mod thread_pool;
 mod two_level_table;
 mod two_pass_parallel;
