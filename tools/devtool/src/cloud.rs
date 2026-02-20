@@ -338,7 +338,7 @@ echo "=== Building all tools ==="
 sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && ./scripts/build-tools.sh --all'
 
 echo "=== Building gzippy-dev ==="
-sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && cargo build --release --manifest-path tools/devtool/Cargo.toml'
+sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target'
 
 echo "=== Preparing benchmark data ==="
 sudo -u {SSH_USER} bash -c './scripts/prepare_benchmark_data.sh'
