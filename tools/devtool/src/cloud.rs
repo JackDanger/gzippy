@@ -16,18 +16,18 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const REGION: &str = "us-east-1";
-const X86_TYPE: &str = "c6i.4xlarge";
-const ARM64_TYPE: &str = "c7g.4xlarge";
+const X86_TYPE: &str = "c7i.4xlarge";
+const ARM64_TYPE: &str = "c8g.4xlarge";
 const TAG_KEY: &str = "gzippy-bench";
 const SSH_USER: &str = "ubuntu";
 const SETUP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 // Match CI runner core count for comparable Tmax results
 const BENCH_TMAX_THREADS: usize = 4;
 
-// Phase 1: initial sweep
-const SWEEP_MIN_TRIALS: u32 = 15;
-const SWEEP_MAX_TRIALS: u32 = 60;
-const SWEEP_TARGET_CV: f64 = 0.02;
+// Phase 1: initial sweep (higher counts since each instance handles 1 dataset)
+const SWEEP_MIN_TRIALS: u32 = 30;
+const SWEEP_MAX_TRIALS: u32 = 100;
+const SWEEP_TARGET_CV: f64 = 0.015;
 
 // Phase 2: precision re-run for close races
 const PRECISION_MIN_TRIALS: u32 = 50;
@@ -466,16 +466,20 @@ fn scenario_key(r: &BenchResult) -> String {
     format!("{}-{}-{}", r.dataset, r.archive, r.threads)
 }
 
-fn run_benchmarks_on(ip: &str, key: &Path, label: &str) -> Result<Vec<BenchResult>, String> {
+fn run_benchmarks_on(
+    ip: &str, key: &Path, label: &str, dataset: Option<&str>,
+) -> Result<Vec<BenchResult>, String> {
+    let ds_label = dataset.unwrap_or("all");
+
     // Phase 1: Sweep — T1 and Tmax as separate runs for CI-comparable thread count
-    println!("\n  [{label}] Phase 1: Sweep ({SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.0}%, Tmax={BENCH_TMAX_THREADS} threads)",
+    println!("\n  [{label}] Phase 1: Sweep {ds_label} ({SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.0}%, Tmax={BENCH_TMAX_THREADS})",
         SWEEP_TARGET_CV * 100.0);
 
     println!("  [{label}] T1...");
     let t1 = remote_bench(
         ip, key, label,
         SWEEP_MIN_TRIALS, SWEEP_MAX_TRIALS, SWEEP_TARGET_CV,
-        None, None, Some(1),
+        dataset, None, Some(1),
     )?;
     for r in &t1 {
         println!("    {}-{} {} {}: {:.1} MB/s (CV {:.1}%)", r.dataset, r.archive, r.threads, r.tool, r.speed_mbps, r.cv * 100.0);
@@ -485,7 +489,7 @@ fn run_benchmarks_on(ip: &str, key: &Path, label: &str) -> Result<Vec<BenchResul
     let tmax = remote_bench(
         ip, key, label,
         SWEEP_MIN_TRIALS, SWEEP_MAX_TRIALS, SWEEP_TARGET_CV,
-        None, None, Some(BENCH_TMAX_THREADS),
+        dataset, None, Some(BENCH_TMAX_THREADS),
     )?;
     for r in &tmax {
         println!("    {}-{} {} {}: {:.1} MB/s (CV {:.1}%)", r.dataset, r.archive, r.threads, r.tool, r.speed_mbps, r.cv * 100.0);
@@ -521,7 +525,6 @@ fn run_benchmarks_on(ip: &str, key: &Path, label: &str) -> Result<Vec<BenchResul
             println!("    {}: {:.1} MB/s (CV {:.2}%, {} trials)", r.tool, r.speed_mbps, r.cv * 100.0, r.trials);
         }
 
-        // Replace sweep results with precision results for this scenario
         let key_prefix = format!("{ds}-{arch}-{thr}");
         all.retain(|r| scenario_key(r) != key_prefix);
         all.extend(precision);
@@ -676,7 +679,7 @@ fn print_results(results: &[BenchResult]) {
 
 pub fn bench() -> Result<(), String> {
     println!("╔══════════════════════════════════════════════════════════════════════════╗");
-    println!("║  CLOUD BENCHMARK FLEET — ON-DEMAND, FULL PARALLELISM                   ║");
+    println!("║  CLOUD BENCHMARK FLEET — 6 INSTANCES, FULL PARALLELISM                 ║");
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
 
     let _ = Command::new("aws-vault").arg("--version")
@@ -701,11 +704,11 @@ pub fn bench() -> Result<(), String> {
 
     println!("  Branch:    {branch}");
     println!("  Commit:    {commit_short}");
-    println!("  x86_64:    {X86_TYPE} on-demand");
-    println!("  arm64:     {ARM64_TYPE} on-demand");
+    println!("  Fleet:     6 instances (3 x86_64 {X86_TYPE} + 3 arm64 {ARM64_TYPE})");
+    println!("  Layout:    1 instance per (arch, dataset) — fully parallel");
     println!("  Benchmark: gzippy-dev bench --json (same code locally and in cloud)");
     println!("  Threads:   T1 + Tmax={BENCH_TMAX_THREADS} (matches CI runner core count)");
-    println!("  Sweep:     {SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.0}%", SWEEP_TARGET_CV * 100.0);
+    println!("  Sweep:     {SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.1}%", SWEEP_TARGET_CV * 100.0);
     println!("  Precision: {PRECISION_MIN_TRIALS}-{PRECISION_MAX_TRIALS} trials, CV<{:.1}% (close races <{CLOSE_RACE_THRESHOLD}%)", PRECISION_TARGET_CV * 100.0);
     println!("  I/O:       /dev/shm (RAM-backed, no EBS bottleneck)");
     println!("  Scoring:   STRICT — gzippy must be >= every competitor");
@@ -720,6 +723,8 @@ pub fn bench() -> Result<(), String> {
     println!("  Done.");
     result
 }
+
+const DATASETS: &[&str] = &["silesia", "software", "logs"];
 
 fn run_fleet(
     commit: &str, repo_url: &str, session: &str, cleanup: &mut CleanupState,
@@ -753,58 +758,75 @@ fn run_fleet(
     let userdata = user_data_script(commit, repo_url);
     let userdata_b64 = base64_encode(&userdata);
 
-    print!("  Launching x86_64 ({X86_TYPE})... ");
-    let _ = std::io::stdout().flush();
-    let x86_id = launch_on_demand(X86_TYPE, &x86_ami, &key_name, &sg_id, &subnet_id, &userdata_b64, session)?;
-    cleanup.instance_ids.push(x86_id.clone());
-    println!("{x86_id}");
+    // Launch 6 instances: one per (arch, dataset) for full parallelism
+    struct Instance {
+        id: String,
+        ip: String,
+        arch: &'static str,
+        dataset: &'static str,
+        instance_type: &'static str,
+    }
+    let mut instances: Vec<Instance> = Vec::new();
 
-    print!("  Launching arm64 ({ARM64_TYPE})... ");
-    let _ = std::io::stdout().flush();
-    let arm64_id = launch_on_demand(ARM64_TYPE, &arm64_ami, &key_name, &sg_id, &subnet_id, &userdata_b64, session)?;
-    cleanup.instance_ids.push(arm64_id.clone());
-    println!("{arm64_id}");
+    for &dataset in DATASETS {
+        for (arch, itype, ami) in [
+            ("x86_64", X86_TYPE, &x86_ami),
+            ("arm64", ARM64_TYPE, &arm64_ami),
+        ] {
+            let label = format!("{arch}/{dataset}");
+            print!("  Launching {label} ({itype})... ");
+            let _ = std::io::stdout().flush();
+            let id = launch_on_demand(itype, ami, &key_name, &sg_id, &subnet_id, &userdata_b64, session)?;
+            cleanup.instance_ids.push(id.clone());
+            println!("{id}");
+            instances.push(Instance { id, ip: String::new(), arch, dataset, instance_type: itype });
+        }
+    }
 
-    print!("  Waiting for running state... ");
+    let all_ids: Vec<String> = instances.iter().map(|i| i.id.clone()).collect();
+    let id_refs: Vec<&str> = all_ids.iter().map(|s| s.as_str()).collect();
+
+    print!("  Waiting for {} instances... ", instances.len());
     let _ = std::io::stdout().flush();
-    wait_running(&[&x86_id, &arm64_id])?;
+    wait_running(&id_refs)?;
     println!("OK");
 
-    let x86_ip = get_public_ip(&x86_id)?;
-    let arm64_ip = get_public_ip(&arm64_id)?;
-    println!("  x86_64: {x86_ip}");
-    println!("  arm64:  {arm64_ip}");
-
-    // Wait for SSH + setup in parallel
-    {
-        let k1 = key_path.clone(); let ip1 = x86_ip.clone();
-        let k2 = key_path.clone(); let ip2 = arm64_ip.clone();
-        let t1 = std::thread::spawn(move || wait_for_ssh(&ip1, &k1, "x86_64"));
-        let t2 = std::thread::spawn(move || wait_for_ssh(&ip2, &k2, "arm64"));
-        t1.join().map_err(|_| "thread panic")??;
-        t2.join().map_err(|_| "thread panic")??;
-    }
-    {
-        let k1 = key_path.clone(); let ip1 = x86_ip.clone();
-        let k2 = key_path.clone(); let ip2 = arm64_ip.clone();
-        let t1 = std::thread::spawn(move || wait_for_setup(&ip1, &k1, "x86_64"));
-        let t2 = std::thread::spawn(move || wait_for_setup(&ip2, &k2, "arm64"));
-        t1.join().map_err(|_| "thread panic")??;
-        t2.join().map_err(|_| "thread panic")??;
+    for inst in &mut instances {
+        inst.ip = get_public_ip(&inst.id)?;
+        println!("  {}/{}: {} ({})", inst.arch, inst.dataset, inst.ip, inst.instance_type);
     }
 
-    // Run benchmarks on both platforms in parallel
-    println!("\n  ═══ BENCHMARKS (both platforms in parallel) ═══");
+    // Wait for SSH + setup on all instances in parallel
+    {
+        let handles: Vec<_> = instances.iter().map(|inst| {
+            let ip = inst.ip.clone();
+            let key = key_path.clone();
+            let label = format!("{}/{}", inst.arch, inst.dataset);
+            std::thread::spawn(move || -> Result<(), String> {
+                wait_for_ssh(&ip, &key, &label)?;
+                wait_for_setup(&ip, &key, &label)
+            })
+        }).collect();
+        for h in handles {
+            h.join().map_err(|_| "setup thread panic")??;
+        }
+    }
 
-    let k1 = key_path.clone(); let ip1 = x86_ip.clone();
-    let k2 = key_path.clone(); let ip2 = arm64_ip.clone();
+    // Run benchmarks on all 6 instances in parallel
+    println!("\n  ═══ BENCHMARKS ({} instances in parallel) ═══", instances.len());
 
-    let t1 = std::thread::spawn(move || run_benchmarks_on(&ip1, &k1, "x86_64"));
-    let t2 = std::thread::spawn(move || run_benchmarks_on(&ip2, &k2, "arm64"));
+    let handles: Vec<_> = instances.iter().map(|inst| {
+        let ip = inst.ip.clone();
+        let key = key_path.clone();
+        let label = format!("{}/{}", inst.arch, inst.dataset);
+        let dataset = inst.dataset.to_string();
+        std::thread::spawn(move || run_benchmarks_on(&ip, &key, &label, Some(&dataset)))
+    }).collect();
 
     let mut all = Vec::new();
-    all.extend(t1.join().map_err(|_| "x86 thread panic")??);
-    all.extend(t2.join().map_err(|_| "arm64 thread panic")??);
+    for h in handles {
+        all.extend(h.join().map_err(|_| "bench thread panic")??);
+    }
 
     let elapsed = total_start.elapsed();
     println!("\n  Total wall time: {:.0}s ({:.1} min)", elapsed.as_secs_f64(), elapsed.as_secs_f64() / 60.0);
