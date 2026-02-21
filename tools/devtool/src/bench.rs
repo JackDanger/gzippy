@@ -594,7 +594,7 @@ fn tool_compress_args(tool: &str, level: u32, threads: usize) -> Vec<String> {
     match tool {
         "gzippy" => vec![format!("-{level}"), "-c".into(), format!("-p{threads}")],
         "pigz" => vec![format!("-{level}"), "-c".into(), format!("-p{threads}")],
-        "igzip" => vec!["-c".into()],
+        "igzip" => vec![format!("-{level}"), "-c".into()],
         "gzip" => vec![format!("-{level}"), "-c".into()],
         _ => vec![format!("-{level}"), "-c".into()],
     }
@@ -802,7 +802,7 @@ fn discover_tools(bin_dir: &Option<PathBuf>) -> Vec<(String, String)> {
     tools
 }
 
-fn find_repo_root() -> Result<PathBuf, String> {
+pub fn find_repo_root() -> Result<PathBuf, String> {
     // Walk up from CWD looking for Cargo.toml with gzippy
     let mut dir = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     loop {

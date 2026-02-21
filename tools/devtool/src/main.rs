@@ -9,6 +9,7 @@ mod cloud;
 mod instrument;
 mod orient;
 mod path_trace;
+mod score;
 
 use std::env;
 
@@ -118,6 +119,8 @@ fn main() {
             }
         }
         "orient" => orient::run(),
+        "score" => score::run(),
+        "losses" => score::losses(),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -158,6 +161,10 @@ CI DETAILS:
   ci results [--run ID]        Parse and display benchmark results
   ci gaps [--run ID]           Show performance gaps vs all competitors
   ci compare <ID_A> <ID_B>     Compare gzippy results between two CI runs
+
+SCORECARD:
+  score                        Show current win/loss scorecard from cloud-results.json
+  losses                       Show losses grouped by root cause with actions
 
 CLOUD (dedicated hardware, low jitter):
   cloud bench                  Launch EC2 fleet, run full benchmarks, tear down

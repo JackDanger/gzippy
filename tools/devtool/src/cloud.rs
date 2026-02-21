@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::bench;
-use crate::bench::BenchDirection;
+use crate::bench::{find_repo_root, BenchDirection};
 use std::time::{Duration, Instant};
 
 const REGION: &str = "us-east-1";
@@ -894,10 +894,16 @@ fn dump_results_json(results: &[BenchResult], wall_time_secs: f64) {
         "scorecard": scorecard,
     });
 
-    let json_path = "cloud-results.json";
+    let json_path = find_repo_root()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("cloud-results.json");
     if let Ok(json_str) = serde_json::to_string_pretty(&output) {
-        if std::fs::write(json_path, &json_str).is_ok() {
-            println!("  Results written to {json_path} ({} scenarios, {wins}W/{losses}L)", wins + losses);
+        if std::fs::write(&json_path, &json_str).is_ok() {
+            println!(
+                "  Results written to {} ({} scenarios, {wins}W/{losses}L)",
+                json_path.display(),
+                wins + losses,
+            );
         }
     }
 }

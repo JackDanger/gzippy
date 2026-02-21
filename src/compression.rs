@@ -342,6 +342,19 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         return Ok(0);
     }
 
+    // T1 fast path: ISA-L L0-L3 directly from buffer (avoids double-read through Cursor)
+    if args.compression_level <= 3
+        && !args.huffman
+        && !args.rle
+        && crate::isal_compress::is_available()
+    {
+        if args.verbosity >= 2 {
+            eprintln!("gzippy: using ISA-L single-threaded compression (direct)");
+        }
+        crate::isal_compress::compress_gzip_to_writer(input_data, output, compression_level)?;
+        return Ok(0);
+    }
+
     // T1: go through compress_with_pipeline which has ratio probe optimization.
     // Drop references so we can move buffer_vec into the Cursor without copying.
     drop(mmap_data);

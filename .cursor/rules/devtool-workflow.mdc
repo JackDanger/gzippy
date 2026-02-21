@@ -5,49 +5,20 @@ alwaysApply: true
 
 # gzippy-dev Workflow
 
-## Rule: Automate the Toil
-
-When doing performance work, **program gzippy-dev to do the hard thing**, then invoke it.
-Don't manually parse CI logs, hunt for run IDs, or eyeball benchmark numbers.
-
 ## Starting a Session
 
 ```bash
-gzippy-dev ci triage    # See categorized gaps, win rate, projections
-gzippy-dev orient       # Project state overview
+gzippy-dev score      # Current win/loss from cloud fleet
+gzippy-dev losses     # Losses grouped by root cause
 ```
 
 ## Making a Change
 
-1. Make ONE focused change (never batch unrelated optimizations)
-2. Run `cargo test --release` for correctness
-3. `gzippy-dev ci push` — this does everything:
-   - Pushes to origin
-   - Waits for Benchmarks CI to complete
-   - Auto-triages the results
-   - Compares vs main
-4. If CI shows regression on arm64 <10%, suspect noise — check `ci history`
-
-## Interpreting CI Results
-
-- **Regressions >3%** on x86_64 silesia: real, investigate immediately
-- **Regressions >3%** on arm64 small files: likely noise (CV 0.2-0.3)
-- **Improvements >3%** without code changes touching that path: noise
-- Use `ci history --limit 10` to see if variance is consistent
-
-## What NOT to Do
-
-- Don't optimize for local Apple M3 performance alone
-- Don't claim improvements without CI confirmation
-- Don't batch multiple optimizations into one push
-- Don't manually search for CI run IDs — use `ci vs-main`
-- Don't ignore arm64 — it's half the benchmark matrix
-- Don't add new libdeflate FFI calls
+1. Make ONE focused change
+2. `cargo test --release` for correctness
+3. `gzippy-dev ci push` — pushes, waits for CI, auto-triages
+4. If CI looks good: `source .env && gzippy-dev cloud bench` for authoritative numbers
 
 ## When the Tool Is Missing Something
 
-If you find yourself doing manual analysis that the tool should handle:
-1. Add the capability to gzippy-dev (in `tools/devtool/src/`)
-2. Add unit tests for any parsing/categorization logic
-3. Update this rule with the new command
-4. Then use the new command to drive the work
+If you find yourself doing manual analysis, add the capability to `tools/devtool/src/`.
