@@ -1,0 +1,68 @@
+---
+description: Parallel decompression strategy — what works, what doesn't, and why
+alwaysApply: true
+---
+
+# Parallel Decompression: Architecture & Lessons
+
+## What Works
+
+**BGZF (gzippy's format)**: Members are independent → trivially parallel.
+Pipelined streaming (buffer pool + ordered writer) achieves 2.88x scaling at T4.
+
+**Multi-member (pigz output)**: Scan member boundaries, parallel decode per member.
+
+## What Does NOT Work for Single-Member
+
+### Two-Pass (scan + re-decode)
+**Tried, measured, rejected.** Scan pass does full inflate work (1x), parallel
+re-decode adds 0.25x/thread. Total: ~2x work. At 4 threads: net SLOWER.
+Break-even requires scan-only decoder (no output writes) which is 2x faster.
+
+### Speculative Block Finding
+**Tried, measured, rejected.** Block finder success rate <5% on complex data.
+Failed attempts waste 10s+ before fallback. Caused -86% regression (PR #43).
+
+### Giving `&data[start..]` to chunk decoders
+**Caused -86% regression (PR #43).** Each chunk must receive only its slice
+`&data[start..end]`; passing the full tail forces every decoder to scan
+through the entire remaining stream.
+
+## What MIGHT Work (Not Yet Implemented)
+
+### Scan-Only Decoder with Circular Window
+A decode pass that maintains only a 32KB circular buffer (L1-resident) instead
+of a full output buffer. Skips actual output writes but tracks positions and
+windows for checkpoints. Estimated 2x faster than full decode.
+
+Pipeline: 1 scanner thread (2x inflate speed) + 3 decoder threads.
+Estimated throughput: 2x sequential on 4 threads.
+
+### rapidgzip-Style Pipeline (block finder + decoder threads)
+rapidgzip achieves 1.8-2.7x scaling by NOT doing a full scan pass. Instead:
+1. Each decoder thread speculatively finds block boundaries via precode validation
+2. Decodes with markers for unresolved back-references
+3. Resolves markers after preceding chunk completes
+
+Key to making this work: FAST precode rejection (99.97% of bit positions rejected
+in ~10 cycles via LUT + Kraft inequality check).
+
+## Infrastructure Available
+
+| Module | Purpose | Status |
+|---|---|---|
+| `scan_inflate.rs` | Full + fast circular-buffer scanner | Ready, tested |
+| `two_pass_parallel.rs` | Two-pass decode with checkpoints | Ready, not wired |
+| `block_finder_lut.rs` | 15-bit LUT for block candidate detection | Ready |
+| `marker_decode.rs` | Marker-based speculative decoder | Partial |
+| `speculative_parallel.rs` | Full speculative parallel | Orphaned |
+
+## Current Single-Member Path
+
+```
+decompress_single_member → decompress_single_member_libdeflate
+  → libdeflate gzip_decompress_ex (sequential, always)
+```
+
+No parallel path for single-member is wired into production. This accounts
+for 12 of 18 remaining losses (all non-BGZF Tmax scenarios).

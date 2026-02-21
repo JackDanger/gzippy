@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::bench;
+use crate::bench::BenchDirection;
 use std::time::{Duration, Instant};
 
 const REGION: &str = "us-east-1";
@@ -407,6 +408,7 @@ struct BenchResult {
     speed_mbps: f64,
     cv: f64,
     trials: u32,
+    direction: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -414,6 +416,7 @@ fn remote_bench(
     ip: &str, key: &Path, label: &str,
     min_trials: u32, max_trials: u32, target_cv: f64,
     dataset: Option<&str>, archive: Option<&str>, threads: Option<usize>,
+    direction: Option<&str>,
 ) -> Result<Vec<BenchResult>, String> {
     let repo = format!("/home/{SSH_USER}/gzippy");
 
@@ -427,11 +430,10 @@ fn remote_bench(
     if let Some(ds) = dataset { cmd += &format!(" --dataset {ds}"); }
     if let Some(ar) = archive { cmd += &format!(" --archive {ar}"); }
     if let Some(th) = threads { cmd += &format!(" --threads {th}"); }
+    if let Some(dir) = direction { cmd += &format!(" --direction {dir}"); }
 
     let output = ssh(ip, key, &cmd)?;
 
-    // gzippy-dev bench --json writes JSON to stdout, human progress to stderr
-    // SSH captures stdout; find the JSON line (starts with '{')
     let json_line = output.lines()
         .find(|line| line.trim_start().starts_with('{'))
         .ok_or_else(|| format!("[{label}] No JSON in bench output. Raw:\n{output}"))?;
@@ -461,6 +463,7 @@ fn parse_bench_json(json_str: &str, platform: &str) -> Result<Vec<BenchResult>, 
             speed_mbps: item.get("speed_mbps").and_then(|v| v.as_f64()).unwrap_or(0.0),
             cv: item.get("cv").and_then(|v| v.as_f64()).unwrap_or(0.0),
             trials: item.get("trials").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            direction: item.get("direction").and_then(|v| v.as_str()).unwrap_or("decompress").into(),
         });
     }
     Ok(results)
@@ -472,18 +475,19 @@ fn scenario_key(r: &BenchResult) -> String {
 
 fn run_benchmarks_on(
     ip: &str, key: &Path, label: &str, dataset: Option<&str>,
+    direction: &str,
 ) -> Result<Vec<BenchResult>, String> {
     let ds_label = dataset.unwrap_or("all");
+    let dir_label = direction;
 
-    // Phase 1: Sweep — T1 and Tmax as separate runs for CI-comparable thread count
-    println!("\n  [{label}] Phase 1: Sweep {ds_label} ({SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.0}%, Tmax={BENCH_TMAX_THREADS})",
+    println!("\n  [{label}] Phase 1: {dir_label} sweep {ds_label} ({SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.0}%, Tmax={BENCH_TMAX_THREADS})",
         SWEEP_TARGET_CV * 100.0);
 
     println!("  [{label}] T1...");
     let t1 = remote_bench(
         ip, key, label,
         SWEEP_MIN_TRIALS, SWEEP_MAX_TRIALS, SWEEP_TARGET_CV,
-        dataset, None, Some(1),
+        dataset, None, Some(1), Some(direction),
     )?;
     for r in &t1 {
         println!("    {}-{} {} {}: {:.1} MB/s (CV {:.1}%)", r.dataset, r.archive, r.threads, r.tool, r.speed_mbps, r.cv * 100.0);
@@ -493,7 +497,7 @@ fn run_benchmarks_on(
     let tmax = remote_bench(
         ip, key, label,
         SWEEP_MIN_TRIALS, SWEEP_MAX_TRIALS, SWEEP_TARGET_CV,
-        dataset, None, Some(BENCH_TMAX_THREADS),
+        dataset, None, Some(BENCH_TMAX_THREADS), Some(direction),
     )?;
     for r in &tmax {
         println!("    {}-{} {} {}: {:.1} MB/s (CV {:.1}%)", r.dataset, r.archive, r.threads, r.tool, r.speed_mbps, r.cv * 100.0);
@@ -522,7 +526,7 @@ fn run_benchmarks_on(
         let precision = remote_bench(
             ip, key, label,
             PRECISION_MIN_TRIALS, PRECISION_MAX_TRIALS, PRECISION_TARGET_CV,
-            Some(ds), Some(arch), threads,
+            Some(ds), Some(arch), threads, Some(direction),
         )?;
 
         for r in &precision {
@@ -568,108 +572,197 @@ fn find_close_races(results: &[BenchResult]) -> Vec<(String, String, String)> {
 // ─── Results ──────────────────────────────────────────────────────────────────
 
 fn print_results(results: &[BenchResult]) {
+    let has_decomp = results.iter().any(|r| r.direction == "decompress");
+    let has_comp = results.iter().any(|r| r.direction == "compress");
+
     println!("\n╔══════════════════════════════════════════════════════════════════════════════════════╗");
     println!("║  CLOUD FLEET RESULTS — STRICT SCORING (gzippy must win or it's a loss)             ║");
     println!("╚══════════════════════════════════════════════════════════════════════════════════════╝\n");
 
-    let mut platforms: Vec<&str> = results.iter().map(|r| r.platform.as_str()).collect();
-    platforms.sort();
-    platforms.dedup();
-
     let mut total_wins = 0u32;
     let mut total_losses = 0u32;
 
-    for platform in &platforms {
-        println!("  ── {platform} ──");
-        println!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>6} Verdict",
-            "Scenario", "gzippy", "unpigz", "igzip", "rapidgzip", "gzip", "CV%");
-        println!("  {}", "─".repeat(100));
+    if has_decomp {
+        println!("  ══ DECOMPRESSION ══");
+        let mut platforms: Vec<&str> = results.iter()
+            .filter(|r| r.direction == "decompress")
+            .map(|r| r.platform.as_str()).collect();
+        platforms.sort();
+        platforms.dedup();
 
-        let plat_results: Vec<&BenchResult> = results.iter()
-            .filter(|r| r.platform == *platform)
-            .collect();
+        for platform in &platforms {
+            println!("\n  ── {platform} ──");
+            println!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>6} Verdict",
+                "Scenario", "gzippy", "unpigz", "igzip", "rapidgzip", "gzip", "CV%");
+            println!("  {}", "─".repeat(100));
 
-        let mut scenarios: Vec<(String, String, String)> = plat_results.iter()
-            .map(|r| (r.dataset.clone(), r.archive.clone(), r.threads.clone()))
-            .collect();
-        scenarios.sort();
-        scenarios.dedup();
-
-        for (dataset, archive, threads) in &scenarios {
-            let scenario: Vec<&&BenchResult> = plat_results.iter()
-                .filter(|r| r.dataset == *dataset && r.archive == *archive && r.threads == *threads)
+            let plat_results: Vec<&BenchResult> = results.iter()
+                .filter(|r| r.direction == "decompress" && r.platform == *platform)
                 .collect();
 
-            let get = |tool: &str| -> Option<&BenchResult> {
-                scenario.iter().find(|r| r.tool == tool).copied().copied()
-            };
-            let fmt_speed = |tool: &str| -> String {
-                get(tool).map(|r| format!("{:.1}", r.speed_mbps)).unwrap_or_else(|| "—".to_string())
-            };
+            let mut scenarios: Vec<(String, String, String)> = plat_results.iter()
+                .map(|r| (r.dataset.clone(), r.archive.clone(), r.threads.clone()))
+                .collect();
+            scenarios.sort();
+            scenarios.dedup();
 
-            let gzippy = get("gzippy");
-            let gzippy_cv = gzippy.map(|r| r.cv).unwrap_or(0.0);
+            for (dataset, archive, threads) in &scenarios {
+                let scenario: Vec<&BenchResult> = plat_results.iter()
+                    .filter(|r| r.dataset == *dataset && r.archive == *archive && r.threads == *threads)
+                    .copied()
+                    .collect();
 
-            let competitors = ["unpigz", "pigz", "igzip", "rapidgzip", "gzip"];
-            let best = competitors.iter()
-                .filter_map(|t| get(t))
-                .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap());
+                let get = |tool: &str| -> Option<&BenchResult> {
+                    scenario.iter().find(|r| r.tool == tool).copied()
+                };
+                let fmt_speed = |tool: &str| -> String {
+                    get(tool).map(|r| format!("{:.1}", r.speed_mbps)).unwrap_or_else(|| "—".to_string())
+                };
 
-            let (verdict, is_win) = if let (Some(g), Some(b)) = (gzippy, best) {
-                let gap = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
-                if gap >= 0.0 {
-                    (format!("WIN +{:.1}% vs {}", gap, b.tool), true)
+                let gzippy = get("gzippy");
+                let gzippy_cv = gzippy.map(|r| r.cv).unwrap_or(0.0);
+
+                let competitors = ["unpigz", "pigz", "igzip", "rapidgzip", "gzip"];
+                let best = competitors.iter()
+                    .filter_map(|t| get(t))
+                    .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap());
+
+                let (verdict, is_win) = if let (Some(g), Some(b)) = (gzippy, best) {
+                    let gap = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
+                    if gap >= 0.0 {
+                        (format!("WIN +{:.1}% vs {}", gap, b.tool), true)
+                    } else {
+                        (format!("LOSS {:.1}% vs {}", gap, b.tool), false)
+                    }
                 } else {
-                    (format!("LOSS {:.1}% vs {}", gap, b.tool), false)
+                    ("—".to_string(), false)
+                };
+
+                if gzippy.is_some() {
+                    if is_win { total_wins += 1; } else { total_losses += 1; }
                 }
-            } else {
-                ("—".to_string(), false)
-            };
 
-            if gzippy.is_some() {
-                if is_win { total_wins += 1; } else { total_losses += 1; }
+                let scenario_name = format!("{dataset}-{archive} {threads}");
+                let unpigz_speed = get("unpigz").or(get("pigz"));
+                println!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>5.1} {}",
+                    scenario_name,
+                    fmt_speed("gzippy"),
+                    unpigz_speed.map(|r| format!("{:.1}", r.speed_mbps)).unwrap_or_else(|| "—".to_string()),
+                    fmt_speed("igzip"),
+                    fmt_speed("rapidgzip"),
+                    fmt_speed("gzip"),
+                    gzippy_cv * 100.0,
+                    verdict,
+                );
             }
-
-            let scenario_name = format!("{dataset}-{archive} {threads}");
-            let unpigz_speed = get("unpigz").or(get("pigz"));
-            println!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>5.1} {}",
-                scenario_name,
-                fmt_speed("gzippy"),
-                unpigz_speed.map(|r| format!("{:.1}", r.speed_mbps)).unwrap_or_else(|| "—".to_string()),
-                fmt_speed("igzip"),
-                fmt_speed("rapidgzip"),
-                fmt_speed("gzip"),
-                gzippy_cv * 100.0,
-                verdict,
-            );
         }
-        println!();
     }
 
+    if has_comp {
+        println!("\n  ══ COMPRESSION ══");
+        let mut platforms: Vec<&str> = results.iter()
+            .filter(|r| r.direction == "compress")
+            .map(|r| r.platform.as_str()).collect();
+        platforms.sort();
+        platforms.dedup();
+
+        for platform in &platforms {
+            println!("\n  ── {platform} ──");
+            println!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>6} Verdict",
+                "Scenario", "gzippy", "pigz", "igzip", "gzip", "CV%");
+            println!("  {}", "─".repeat(85));
+
+            let plat_results: Vec<&BenchResult> = results.iter()
+                .filter(|r| r.direction == "compress" && r.platform == *platform)
+                .collect();
+
+            let mut scenarios: Vec<(String, String, String)> = plat_results.iter()
+                .map(|r| (r.dataset.clone(), r.archive.clone(), r.threads.clone()))
+                .collect();
+            scenarios.sort();
+            scenarios.dedup();
+
+            for (dataset, level, threads) in &scenarios {
+                let scenario: Vec<&BenchResult> = plat_results.iter()
+                    .filter(|r| r.dataset == *dataset && r.archive == *level && r.threads == *threads)
+                    .copied()
+                    .collect();
+
+                let get = |tool: &str| -> Option<&BenchResult> {
+                    scenario.iter().find(|r| r.tool == tool).copied()
+                };
+                let fmt_speed = |tool: &str| -> String {
+                    get(tool).map(|r| format!("{:.1}", r.speed_mbps)).unwrap_or_else(|| "—".to_string())
+                };
+
+                let gzippy = get("gzippy");
+                let gzippy_cv = gzippy.map(|r| r.cv).unwrap_or(0.0);
+
+                let competitors = ["pigz", "igzip", "gzip"];
+                let best = competitors.iter()
+                    .filter_map(|t| get(t))
+                    .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap());
+
+                let (verdict, is_win) = if let (Some(g), Some(b)) = (gzippy, best) {
+                    let gap = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
+                    if gap >= 0.0 {
+                        (format!("WIN +{:.1}% vs {}", gap, b.tool), true)
+                    } else {
+                        (format!("LOSS {:.1}% vs {}", gap, b.tool), false)
+                    }
+                } else {
+                    ("—".to_string(), false)
+                };
+
+                if gzippy.is_some() {
+                    if is_win { total_wins += 1; } else { total_losses += 1; }
+                }
+
+                let scenario_name = format!("{dataset} {level} {threads}");
+                println!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>5.1} {}",
+                    scenario_name,
+                    fmt_speed("gzippy"),
+                    fmt_speed("pigz"),
+                    fmt_speed("igzip"),
+                    fmt_speed("gzip"),
+                    gzippy_cv * 100.0,
+                    verdict,
+                );
+            }
+        }
+    }
+
+    // Summary
     let total = total_wins + total_losses;
-    println!("  ══════════════════════════════════════════════════════");
+    println!("\n  ══════════════════════════════════════════════════════");
     println!("  WINS: {total_wins}/{total}    LOSSES: {total_losses}/{total}");
     if total_losses > 0 {
         println!("\n  ── LOSSES ──");
-        let mut scenarios: Vec<(String, String, String, String)> = results.iter()
-            .map(|r| (r.platform.clone(), r.dataset.clone(), r.archive.clone(), r.threads.clone()))
-            .collect();
-        scenarios.sort();
-        scenarios.dedup();
-
-        for (plat, ds, arch, thr) in &scenarios {
-            let scenario: Vec<&BenchResult> = results.iter()
-                .filter(|r| r.platform == *plat && r.dataset == *ds && r.archive == *arch && r.threads == *thr)
+        for r_dir in ["decompress", "compress"] {
+            let dir_results: Vec<&BenchResult> = results.iter()
+                .filter(|r| r.direction == r_dir)
                 .collect();
-            let gzippy = scenario.iter().find(|r| r.tool == "gzippy");
-            let best = scenario.iter()
-                .filter(|r| r.tool != "gzippy")
-                .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap());
-            if let (Some(g), Some(b)) = (gzippy, best) {
-                let gap = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
-                if gap < 0.0 {
-                    println!("    [{plat}] {ds}-{arch} {thr}: gzippy {:.1} vs {} {:.1} ({:+.1}%)",
-                        g.speed_mbps, b.tool, b.speed_mbps, gap);
+            let mut scenarios: Vec<(String, String, String, String)> = dir_results.iter()
+                .map(|r| (r.platform.clone(), r.dataset.clone(), r.archive.clone(), r.threads.clone()))
+                .collect();
+            scenarios.sort();
+            scenarios.dedup();
+
+            for (plat, ds, arch, thr) in &scenarios {
+                let scenario: Vec<&&BenchResult> = dir_results.iter()
+                    .filter(|r| r.platform == *plat && r.dataset == *ds && r.archive == *arch && r.threads == *thr)
+                    .collect();
+                let gzippy = scenario.iter().find(|r| r.tool == "gzippy").copied();
+                let best = scenario.iter()
+                    .filter(|r| r.tool != "gzippy")
+                    .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap())
+                    .copied();
+                if let (Some(g), Some(b)) = (gzippy, best) {
+                    let gap = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
+                    if gap < 0.0 {
+                        println!("    [{r_dir}] [{plat}] {ds}-{arch} {thr}: gzippy {:.1} vs {} {:.1} ({:+.1}%)",
+                            g.speed_mbps, b.tool, b.speed_mbps, gap);
+                    }
                 }
             }
         }
@@ -679,11 +772,86 @@ fn print_results(results: &[BenchResult]) {
     println!();
 }
 
+fn dump_results_json(results: &[BenchResult], wall_time_secs: f64) {
+    let items: Vec<serde_json::Value> = results.iter().map(|r| {
+        serde_json::json!({
+            "platform": r.platform,
+            "dataset": r.dataset,
+            "archive": r.archive,
+            "threads": r.threads,
+            "tool": r.tool,
+            "speed_mbps": r.speed_mbps,
+            "cv": r.cv,
+            "trials": r.trials,
+        })
+    }).collect();
+
+    // Build scorecard: per-scenario win/loss with gap
+    let mut scenarios: Vec<(String, String, String, String)> = results.iter()
+        .map(|r| (r.platform.clone(), r.dataset.clone(), r.archive.clone(), r.threads.clone()))
+        .collect();
+    scenarios.sort();
+    scenarios.dedup();
+
+    let mut scorecard: Vec<serde_json::Value> = Vec::new();
+    for (plat, ds, arch, thr) in &scenarios {
+        let scenario: Vec<&BenchResult> = results.iter()
+            .filter(|r| r.platform == *plat && r.dataset == *ds && r.archive == *arch && r.threads == *thr)
+            .collect();
+        let gzippy = scenario.iter().find(|r| r.tool == "gzippy");
+        let best = scenario.iter()
+            .filter(|r| r.tool != "gzippy")
+            .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap());
+        if let (Some(g), Some(b)) = (gzippy, best) {
+            let gap = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
+            scorecard.push(serde_json::json!({
+                "platform": plat,
+                "scenario": format!("{ds}-{arch} {thr}"),
+                "gzippy_mbps": g.speed_mbps,
+                "best_competitor": b.tool,
+                "competitor_mbps": b.speed_mbps,
+                "gap_pct": (gap * 10.0).round() / 10.0,
+                "verdict": if gap >= 0.0 { "WIN" } else { "LOSS" },
+            }));
+        }
+    }
+
+    let wins = scorecard.iter().filter(|s| s["verdict"] == "WIN").count();
+    let losses = scorecard.iter().filter(|s| s["verdict"] == "LOSS").count();
+
+    let output = serde_json::json!({
+        "timestamp": chrono_now(),
+        "wall_time_secs": wall_time_secs,
+        "total_results": items.len(),
+        "wins": wins,
+        "losses": losses,
+        "total_scenarios": wins + losses,
+        "results": items,
+        "scorecard": scorecard,
+    });
+
+    let json_path = "cloud-results.json";
+    if let Ok(json_str) = serde_json::to_string_pretty(&output) {
+        if std::fs::write(json_path, &json_str).is_ok() {
+            println!("  Results written to {json_path} ({} scenarios, {wins}W/{losses}L)", wins + losses);
+        }
+    }
+}
+
+fn chrono_now() -> String {
+    let output = Command::new("date").arg("+%Y-%m-%dT%H:%M:%S%z")
+        .output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    output
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 pub fn bench() -> Result<(), String> {
+    let n_instances = DATASETS.len() * 2 * 2; // datasets × archs × directions
     println!("╔══════════════════════════════════════════════════════════════════════════╗");
-    println!("║  CLOUD BENCHMARK FLEET — 6 INSTANCES, FULL PARALLELISM                 ║");
+    println!("║  CLOUD BENCHMARK FLEET — {} INSTANCES (decompress + compress)           ║", n_instances);
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
 
     let _ = Command::new("aws-vault").arg("--version")
@@ -708,8 +876,8 @@ pub fn bench() -> Result<(), String> {
 
     println!("  Branch:    {branch}");
     println!("  Commit:    {commit_short}");
-    println!("  Fleet:     6 instances (3 x86_64 {X86_TYPE} + 3 arm64 {ARM64_TYPE})");
-    println!("  Layout:    1 instance per (arch, dataset) — fully parallel");
+    println!("  Fleet:     {n_instances} instances ({} x86_64 {X86_TYPE} + {} arm64 {ARM64_TYPE})", n_instances / 2, n_instances / 2);
+    println!("  Layout:    1 instance per (arch, dataset, direction) — fully parallel");
     println!("  Benchmark: gzippy-dev bench --json (same code locally and in cloud)");
     println!("  Threads:   T1 + Tmax={BENCH_TMAX_THREADS} (matches CI runner core count)");
     println!("  Sweep:     {SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.1}%", SWEEP_TARGET_CV * 100.0);
@@ -762,28 +930,33 @@ fn run_fleet(
     let userdata = user_data_script(commit, repo_url);
     let userdata_b64 = base64_encode(&userdata);
 
-    // Launch 6 instances: one per (arch, dataset) for full parallelism
     struct Instance {
         id: String,
         ip: String,
         arch: &'static str,
         dataset: &'static str,
         instance_type: &'static str,
+        direction: &'static str,
     }
     let mut instances: Vec<Instance> = Vec::new();
 
+    // Launch instances: one per (arch, dataset, direction) for full parallelism
+    // This gives us 12 instances: 3 datasets × 2 archs × 2 directions
+    let directions = ["decompress", "compress"];
     for &dataset in DATASETS {
         for (arch, itype, ami) in [
             ("x86_64", X86_TYPE, &x86_ami),
             ("arm64", ARM64_TYPE, &arm64_ami),
         ] {
-            let label = format!("{arch}/{dataset}");
-            print!("  Launching {label} ({itype})... ");
-            let _ = std::io::stdout().flush();
-            let id = launch_on_demand(itype, ami, &key_name, &sg_id, &subnet_id, &userdata_b64, session)?;
-            cleanup.instance_ids.push(id.clone());
-            println!("{id}");
-            instances.push(Instance { id, ip: String::new(), arch, dataset, instance_type: itype });
+            for &direction in &directions {
+                let label = format!("{arch}/{dataset}/{direction}");
+                print!("  Launching {label} ({itype})... ");
+                let _ = std::io::stdout().flush();
+                let id = launch_on_demand(itype, ami, &key_name, &sg_id, &subnet_id, &userdata_b64, session)?;
+                cleanup.instance_ids.push(id.clone());
+                println!("{id}");
+                instances.push(Instance { id, ip: String::new(), arch, dataset, instance_type: itype, direction });
+            }
         }
     }
 
@@ -797,7 +970,7 @@ fn run_fleet(
 
     for inst in &mut instances {
         inst.ip = get_public_ip(&inst.id)?;
-        println!("  {}/{}: {} ({})", inst.arch, inst.dataset, inst.ip, inst.instance_type);
+        println!("  {}/{}/{}: {} ({})", inst.arch, inst.dataset, inst.direction, inst.ip, inst.instance_type);
     }
 
     // Wait for SSH + setup on all instances in parallel
@@ -805,7 +978,7 @@ fn run_fleet(
         let handles: Vec<_> = instances.iter().map(|inst| {
             let ip = inst.ip.clone();
             let key = key_path.clone();
-            let label = format!("{}/{}", inst.arch, inst.dataset);
+            let label = format!("{}/{}/{}", inst.arch, inst.dataset, inst.direction);
             std::thread::spawn(move || -> Result<(), String> {
                 wait_for_ssh(&ip, &key, &label)?;
                 wait_for_setup(&ip, &key, &label)
@@ -816,7 +989,6 @@ fn run_fleet(
         }
     }
 
-    // Run benchmarks on all instances + local Mac in parallel
     println!(
         "\n  ═══ BENCHMARKS ({} cloud instances + local Mac in parallel) ═══",
         instances.len()
@@ -827,18 +999,20 @@ fn run_fleet(
         .map(|inst| {
             let ip = inst.ip.clone();
             let key = key_path.clone();
-            let label = format!("{}/{}", inst.arch, inst.dataset);
+            let label = format!("{}/{}/{}", inst.arch, inst.dataset, inst.direction);
             let dataset = inst.dataset.to_string();
-            std::thread::spawn(move || run_benchmarks_on(&ip, &key, &label, Some(&dataset)))
+            let direction = inst.direction.to_string();
+            std::thread::spawn(move || run_benchmarks_on(&ip, &key, &label, Some(&dataset), &direction))
         })
         .collect();
 
-    // Local Mac benchmark runs in parallel with the cloud fleet
+    // Local Mac benchmark runs both decompress + compress in parallel with cloud
     let local_handle = std::thread::spawn(|| -> Result<Vec<BenchResult>, String> {
         let args = bench::BenchArgs {
             min_trials: SWEEP_MIN_TRIALS,
             max_trials: SWEEP_MAX_TRIALS,
             target_cv: SWEEP_TARGET_CV,
+            direction: BenchDirection::Both,
             ..Default::default()
         };
         let (platform, results) = bench::run_and_collect(&args)?;
@@ -855,6 +1029,7 @@ fn run_fleet(
                 speed_mbps: r.speed_mbps,
                 cv: r.cv,
                 trials: r.trials,
+                direction: r.direction,
             })
             .collect())
     });
@@ -876,6 +1051,7 @@ fn run_fleet(
     println!("\n  Total wall time: {:.0}s ({:.1} min)", elapsed.as_secs_f64(), elapsed.as_secs_f64() / 60.0);
 
     print_results(&all);
+    dump_results_json(&all, elapsed.as_secs_f64());
     Ok(())
 }
 

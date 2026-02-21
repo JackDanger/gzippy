@@ -26,6 +26,14 @@ pub struct BenchArgs {
     pub min_trials: u32,
     pub max_trials: u32,
     pub target_cv: f64,
+    pub direction: BenchDirection,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum BenchDirection {
+    Decompress,
+    Compress,
+    Both,
 }
 
 impl Default for BenchArgs {
@@ -38,6 +46,7 @@ impl Default for BenchArgs {
             min_trials: DEFAULT_MIN_TRIALS,
             max_trials: DEFAULT_MAX_TRIALS,
             target_cv: DEFAULT_TARGET_CV,
+            direction: BenchDirection::Decompress,
         }
     }
 }
@@ -53,6 +62,7 @@ pub struct ToolResult {
     pub trials: u32,
     pub status: String,
     pub error: Option<String>,
+    pub direction: String,
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
@@ -99,66 +109,145 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
     let _ = std::fs::create_dir_all(&tmp_dir);
     let output_file = tmp_dir.join("bench-output.bin");
 
-    for ds in &datasets {
-        for (archive_name, compressed_path) in &ds.archives {
-            if let Some(ref af) = args.archive {
-                if archive_name != af { continue; }
-            }
-            for &(threads, threads_label) in &thread_configs {
-                if !args.json {
-                    eprint!("  {}-{archive_name} {threads_label}  ", ds.name);
-                    let _ = std::io::stderr().flush();
+    // Decompression benchmarks
+    if args.direction != BenchDirection::Compress {
+        for ds in &datasets {
+            for (archive_name, compressed_path) in &ds.archives {
+                if let Some(ref af) = args.archive {
+                    if archive_name != af { continue; }
                 }
-
-                for (tool_name, tool_path) in &tools {
-                    // Skip multi-threaded for single-threaded tools
-                    if threads > 1 && is_single_threaded(tool_name) {
-                        continue;
+                for &(threads, threads_label) in &thread_configs {
+                    if !args.json {
+                        eprint!("  {}-{archive_name} {threads_label}  ", ds.name);
+                        let _ = std::io::stderr().flush();
                     }
 
-                    let result = benchmark_one(
-                        tool_name, tool_path, compressed_path,
-                        &ds.raw_path, ds.original_size,
-                        threads, &output_file,
-                        args.min_trials, args.max_trials, args.target_cv,
-                    );
+                    for (tool_name, tool_path) in &tools {
+                        if threads > 1 && is_single_threaded(tool_name) {
+                            continue;
+                        }
 
-                    let tr = match result {
-                        Ok((speed, cv, trials)) => {
-                            if !args.json {
-                                eprint!("{tool_name}:{speed:.0}  ");
-                                let _ = std::io::stderr().flush();
+                        let result = benchmark_one(
+                            tool_name, tool_path, compressed_path,
+                            &ds.raw_path, ds.original_size,
+                            threads, &output_file,
+                            args.min_trials, args.max_trials, args.target_cv,
+                        );
+
+                        let tr = match result {
+                            Ok((speed, cv, trials)) => {
+                                if !args.json {
+                                    eprint!("{tool_name}:{speed:.0}  ");
+                                    let _ = std::io::stderr().flush();
+                                }
+                                ToolResult {
+                                    dataset: ds.name.clone(),
+                                    archive: archive_name.clone(),
+                                    threads: threads_label.to_string(),
+                                    tool: tool_name.clone(),
+                                    speed_mbps: speed, cv, trials,
+                                    status: "pass".into(),
+                                    error: None,
+                                    direction: "decompress".into(),
+                                }
                             }
-                            ToolResult {
-                                dataset: ds.name.clone(),
-                                archive: archive_name.clone(),
-                                threads: threads_label.to_string(),
-                                tool: tool_name.clone(),
-                                speed_mbps: speed, cv, trials,
-                                status: "pass".into(),
-                                error: None,
+                            Err(e) => {
+                                if !args.json {
+                                    eprint!("{tool_name}:ERR  ");
+                                    let _ = std::io::stderr().flush();
+                                }
+                                ToolResult {
+                                    dataset: ds.name.clone(),
+                                    archive: archive_name.clone(),
+                                    threads: threads_label.to_string(),
+                                    tool: tool_name.clone(),
+                                    speed_mbps: 0.0, cv: 0.0, trials: 0,
+                                    status: "fail".into(),
+                                    error: Some(e),
+                                    direction: "decompress".into(),
+                                }
                             }
-                        }
-                        Err(e) => {
-                            if !args.json {
-                                eprint!("{tool_name}:ERR  ");
-                                let _ = std::io::stderr().flush();
-                            }
-                            ToolResult {
-                                dataset: ds.name.clone(),
-                                archive: archive_name.clone(),
-                                threads: threads_label.to_string(),
-                                tool: tool_name.clone(),
-                                speed_mbps: 0.0, cv: 0.0, trials: 0,
-                                status: "fail".into(),
-                                error: Some(e),
-                            }
-                        }
-                    };
-                    results.push(tr);
+                        };
+                        results.push(tr);
+                    }
+                    if !args.json {
+                        eprintln!();
+                    }
                 }
-                if !args.json {
-                    eprintln!();
+            }
+        }
+    }
+
+    // Compression benchmarks
+    if args.direction != BenchDirection::Decompress {
+        let comp_tools = discover_compress_tools(&bin_dir);
+        let levels = [1, 6, 9];
+
+        if !args.json {
+            eprintln!("\n── Compression ──");
+        }
+
+        for ds in &datasets {
+            for &level in &levels {
+                for &(threads, threads_label) in &thread_configs {
+                    if !args.json {
+                        eprint!("  {} L{level} {threads_label}  ", ds.name);
+                        let _ = std::io::stderr().flush();
+                    }
+
+                    for (tool_name, tool_path) in &comp_tools {
+                        if threads > 1 && is_compress_single_threaded(tool_name) {
+                            continue;
+                        }
+                        if !tool_supports_level(tool_name, level) {
+                            continue;
+                        }
+
+                        let result = benchmark_compress(
+                            tool_name, tool_path, &ds.raw_path,
+                            ds.original_size, level, threads, &output_file,
+                            args.min_trials, args.max_trials, args.target_cv,
+                        );
+
+                        let tr = match result {
+                            Ok((speed, cv, trials, ratio)) => {
+                                if !args.json {
+                                    eprint!("{tool_name}:{speed:.0}({ratio:.2})  ");
+                                    let _ = std::io::stderr().flush();
+                                }
+                                ToolResult {
+                                    dataset: ds.name.clone(),
+                                    archive: format!("L{level}"),
+                                    threads: threads_label.to_string(),
+                                    tool: tool_name.clone(),
+                                    speed_mbps: speed, cv, trials,
+                                    status: "pass".into(),
+                                    error: None,
+                                    direction: "compress".into(),
+                                }
+                            }
+                            Err(e) => {
+                                if !args.json {
+                                    eprint!("{tool_name}:ERR  ");
+                                    let _ = std::io::stderr().flush();
+                                }
+                                ToolResult {
+                                    dataset: ds.name.clone(),
+                                    archive: format!("L{level}"),
+                                    threads: threads_label.to_string(),
+                                    tool: tool_name.clone(),
+                                    speed_mbps: 0.0, cv: 0.0, trials: 0,
+                                    status: "fail".into(),
+                                    error: Some(e),
+                                    direction: "compress".into(),
+                                }
+                            }
+                        };
+                        results.push(tr);
+                    }
+                    if !args.json {
+                        eprintln!();
+                    }
                 }
             }
         }
@@ -211,70 +300,126 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
     let _ = std::fs::create_dir_all(&tmp_dir);
     let output_file = tmp_dir.join("bench-output.bin");
 
-    for ds in &datasets {
-        for (archive_name, compressed_path) in &ds.archives {
-            if let Some(ref af) = args.archive {
-                if archive_name != af {
-                    continue;
+    // Decompression benchmarks
+    if args.direction != BenchDirection::Compress {
+        for ds in &datasets {
+            for (archive_name, compressed_path) in &ds.archives {
+                if let Some(ref af) = args.archive {
+                    if archive_name != af { continue; }
+                }
+                for &(threads, threads_label) in &thread_configs {
+                    eprint!("  [{platform}] {}-{archive_name} {threads_label}  ", ds.name);
+                    let _ = std::io::stderr().flush();
+
+                    for (tool_name, tool_path) in &tools {
+                        if threads > 1 && is_single_threaded(tool_name) {
+                            continue;
+                        }
+
+                        let result = benchmark_one(
+                            tool_name, tool_path, compressed_path,
+                            &ds.raw_path, ds.original_size,
+                            threads, &output_file,
+                            args.min_trials, args.max_trials, args.target_cv,
+                        );
+
+                        let tr = match result {
+                            Ok((speed, cv, trials)) => {
+                                eprint!("{tool_name}:{speed:.0}  ");
+                                let _ = std::io::stderr().flush();
+                                ToolResult {
+                                    dataset: ds.name.clone(),
+                                    archive: archive_name.clone(),
+                                    threads: threads_label.to_string(),
+                                    tool: tool_name.clone(),
+                                    speed_mbps: speed, cv, trials,
+                                    status: "pass".into(),
+                                    error: None,
+                                    direction: "decompress".into(),
+                                }
+                            }
+                            Err(e) => {
+                                eprint!("{tool_name}:ERR  ");
+                                let _ = std::io::stderr().flush();
+                                ToolResult {
+                                    dataset: ds.name.clone(),
+                                    archive: archive_name.clone(),
+                                    threads: threads_label.to_string(),
+                                    tool: tool_name.clone(),
+                                    speed_mbps: 0.0, cv: 0.0, trials: 0,
+                                    status: "fail".into(),
+                                    error: Some(e),
+                                    direction: "decompress".into(),
+                                }
+                            }
+                        };
+                        results.push(tr);
+                    }
+                    eprintln!();
                 }
             }
-            for &(threads, threads_label) in &thread_configs {
-                eprint!("  [{platform}] {}-{archive_name} {threads_label}  ", ds.name);
-                let _ = std::io::stderr().flush();
+        }
+    }
 
-                for (tool_name, tool_path) in &tools {
-                    if threads > 1 && is_single_threaded(tool_name) {
-                        continue;
+    // Compression benchmarks
+    if args.direction != BenchDirection::Decompress {
+        let comp_tools = discover_compress_tools(&bin_dir);
+        let levels = [1, 6, 9];
+
+        for ds in &datasets {
+            for &level in &levels {
+                for &(threads, threads_label) in &thread_configs {
+                    eprint!("  [{platform}] {} L{level} {threads_label}  ", ds.name);
+                    let _ = std::io::stderr().flush();
+
+                    for (tool_name, tool_path) in &comp_tools {
+                        if threads > 1 && is_compress_single_threaded(tool_name) {
+                            continue;
+                        }
+                        if !tool_supports_level(tool_name, level) {
+                            continue;
+                        }
+
+                        let result = benchmark_compress(
+                            tool_name, tool_path, &ds.raw_path,
+                            ds.original_size, level, threads, &output_file,
+                            args.min_trials, args.max_trials, args.target_cv,
+                        );
+
+                        let tr = match result {
+                            Ok((speed, cv, trials, _ratio)) => {
+                                eprint!("{tool_name}:{speed:.0}  ");
+                                let _ = std::io::stderr().flush();
+                                ToolResult {
+                                    dataset: ds.name.clone(),
+                                    archive: format!("L{level}"),
+                                    threads: threads_label.to_string(),
+                                    tool: tool_name.clone(),
+                                    speed_mbps: speed, cv, trials,
+                                    status: "pass".into(),
+                                    error: None,
+                                    direction: "compress".into(),
+                                }
+                            }
+                            Err(e) => {
+                                eprint!("{tool_name}:ERR  ");
+                                let _ = std::io::stderr().flush();
+                                ToolResult {
+                                    dataset: ds.name.clone(),
+                                    archive: format!("L{level}"),
+                                    threads: threads_label.to_string(),
+                                    tool: tool_name.clone(),
+                                    speed_mbps: 0.0, cv: 0.0, trials: 0,
+                                    status: "fail".into(),
+                                    error: Some(e),
+                                    direction: "compress".into(),
+                                }
+                            }
+                        };
+                        results.push(tr);
                     }
-
-                    let result = benchmark_one(
-                        tool_name,
-                        tool_path,
-                        compressed_path,
-                        &ds.raw_path,
-                        ds.original_size,
-                        threads,
-                        &output_file,
-                        args.min_trials,
-                        args.max_trials,
-                        args.target_cv,
-                    );
-
-                    let tr = match result {
-                        Ok((speed, cv, trials)) => {
-                            eprint!("{tool_name}:{speed:.0}  ");
-                            let _ = std::io::stderr().flush();
-                            ToolResult {
-                                dataset: ds.name.clone(),
-                                archive: archive_name.clone(),
-                                threads: threads_label.to_string(),
-                                tool: tool_name.clone(),
-                                speed_mbps: speed,
-                                cv,
-                                trials,
-                                status: "pass".into(),
-                                error: None,
-                            }
-                        }
-                        Err(e) => {
-                            eprint!("{tool_name}:ERR  ");
-                            let _ = std::io::stderr().flush();
-                            ToolResult {
-                                dataset: ds.name.clone(),
-                                archive: archive_name.clone(),
-                                threads: threads_label.to_string(),
-                                tool: tool_name.clone(),
-                                speed_mbps: 0.0,
-                                cv: 0.0,
-                                trials: 0,
-                                status: "fail".into(),
-                                error: Some(e),
-                            }
-                        }
-                    };
-                    results.push(tr);
+                    eprintln!();
                 }
-                eprintln!();
             }
         }
     }
@@ -367,6 +512,134 @@ fn time_decompress(binary: &str, args: &[String], input: &Path, output: &Path) -
     }
     Ok(start.elapsed().as_secs_f64())
 }
+
+// ─── Compression benchmark engine ─────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn benchmark_compress(
+    tool: &str, binary: &str,
+    raw_input: &Path, original_size: u64,
+    level: u32, threads: usize, output_file: &Path,
+    min_trials: u32, max_trials: u32, target_cv: f64,
+) -> Result<(f64, f64, u32, f64), String> {
+    let cmd_args = tool_compress_args(tool, level, threads);
+
+    // Warmup + get compressed size for ratio
+    run_compress(binary, &cmd_args, raw_input, output_file)?;
+    let compressed_size = std::fs::metadata(output_file)
+        .map_err(|e| format!("output file: {e}"))?
+        .len();
+    let ratio = compressed_size as f64 / original_size as f64;
+
+    let mut times: Vec<f64> = Vec::new();
+    for _ in 0..max_trials {
+        let elapsed = time_compress(binary, &cmd_args, raw_input, output_file)?;
+        times.push(elapsed);
+
+        if times.len() >= min_trials as usize {
+            let (_, _, _, cv) = trimmed_stats(&times);
+            if cv < target_cv {
+                break;
+            }
+        }
+    }
+
+    let (_, mean, _, cv) = trimmed_stats(&times);
+    let speed = original_size as f64 / mean / 1_000_000.0;
+    Ok((speed, cv, times.len() as u32, ratio))
+}
+
+fn run_compress(binary: &str, args: &[String], input: &Path, output: &Path) -> Result<(), String> {
+    let fin = std::fs::File::open(input)
+        .map_err(|e| format!("open {}: {e}", input.display()))?;
+    let fout = std::fs::File::create(output)
+        .map_err(|e| format!("create {}: {e}", output.display()))?;
+
+    let status = Command::new(binary)
+        .args(args)
+        .stdin(fin)
+        .stdout(fout)
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("{binary}: {e}"))?;
+
+    if !status.success() {
+        return Err(format!("{binary} exit {status}"));
+    }
+    Ok(())
+}
+
+fn time_compress(binary: &str, args: &[String], input: &Path, output: &Path) -> Result<f64, String> {
+    let fin = std::fs::File::open(input)
+        .map_err(|e| format!("open {}: {e}", input.display()))?;
+    let fout = std::fs::File::create(output)
+        .map_err(|e| format!("create {}: {e}", output.display()))?;
+
+    let start = Instant::now();
+    let status = Command::new(binary)
+        .args(args)
+        .stdin(fin)
+        .stdout(fout)
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("{binary}: {e}"))?;
+
+    if !status.success() {
+        return Err(format!("{binary} exit {status}"));
+    }
+    Ok(start.elapsed().as_secs_f64())
+}
+
+fn tool_compress_args(tool: &str, level: u32, threads: usize) -> Vec<String> {
+    match tool {
+        "gzippy" => vec![format!("-{level}"), "-c".into(), format!("-p{threads}")],
+        "pigz" => vec![format!("-{level}"), "-c".into(), format!("-p{threads}")],
+        "igzip" => vec!["-c".into()],
+        "gzip" => vec![format!("-{level}"), "-c".into()],
+        _ => vec![format!("-{level}"), "-c".into()],
+    }
+}
+
+fn discover_compress_tools(bin_dir: &Option<PathBuf>) -> Vec<(String, String)> {
+    let candidates = [
+        ("gzippy", &["target/release/gzippy", "bin/gzippy"][..]),
+        ("pigz", &["pigz/pigz", "bin/pigz"]),
+        ("igzip", &["isa-l/build/igzip", "bin/igzip"]),
+        ("gzip", &["/usr/bin/gzip"]),
+    ];
+
+    let mut tools = Vec::new();
+    for (name, paths) in &candidates {
+        if let Some(bd) = bin_dir {
+            let p = bd.join(name);
+            if p.exists() && is_executable(&p) {
+                tools.push((name.to_string(), p.to_string_lossy().to_string()));
+                continue;
+            }
+        }
+        for rpath in *paths {
+            let p = PathBuf::from(rpath);
+            if p.exists() && is_executable(&p) {
+                tools.push((name.to_string(), rpath.to_string()));
+                break;
+            }
+        }
+    }
+    tools
+}
+
+fn is_compress_single_threaded(tool: &str) -> bool {
+    matches!(tool, "gzip" | "igzip")
+}
+
+fn tool_supports_level(tool: &str, level: u32) -> bool {
+    match tool {
+        "igzip" => level == 1,
+        _ => true,
+    }
+}
+
+// ─── Decompression args ──────────────────────────────────────────────────────
 
 fn tool_decompress_args(tool: &str, threads: usize) -> Vec<String> {
     match tool {
@@ -609,6 +882,7 @@ fn output_json(platform: &str, results: &[ToolResult]) {
             "cv": r.cv,
             "trials": r.trials,
             "status": r.status,
+            "direction": r.direction,
         });
         if let Some(e) = &r.error {
             obj["error"] = serde_json::json!(e);
@@ -625,70 +899,132 @@ fn output_json(platform: &str, results: &[ToolResult]) {
 }
 
 fn output_human(results: &[ToolResult]) {
-    eprintln!("\n══════════════════════════════════════════════════════════════════════════");
+    let decomp: Vec<&ToolResult> = results.iter().filter(|r| r.direction == "decompress").collect();
+    let comp: Vec<&ToolResult> = results.iter().filter(|r| r.direction == "compress").collect();
 
-    let mut scenarios: Vec<(String, String, String)> = results.iter()
-        .map(|r| (r.dataset.clone(), r.archive.clone(), r.threads.clone()))
-        .collect();
-    scenarios.sort();
-    scenarios.dedup();
+    let mut total_wins = 0u32;
+    let mut total_losses = 0u32;
 
-    eprintln!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>6} Verdict",
-        "Scenario", "gzippy", "unpigz", "igzip", "rapidgzip", "gzip", "CV%");
-    eprintln!("  {}", "─".repeat(100));
+    if !decomp.is_empty() {
+        eprintln!("\n══ DECOMPRESSION ══════════════════════════════════════════════════════════");
 
-    let mut wins = 0u32;
-    let mut losses = 0u32;
-
-    for (ds, arch, thr) in &scenarios {
-        let scenario: Vec<&ToolResult> = results.iter()
-            .filter(|r| r.dataset == *ds && r.archive == *arch && r.threads == *thr && r.status == "pass")
+        let mut scenarios: Vec<(String, String, String)> = decomp.iter()
+            .map(|r| (r.dataset.clone(), r.archive.clone(), r.threads.clone()))
             .collect();
+        scenarios.sort();
+        scenarios.dedup();
 
-        let get = |tool: &str| scenario.iter().find(|r| r.tool == tool);
-        let fmt = |tool: &str| get(tool).map(|r| format!("{:.1}", r.speed_mbps)).unwrap_or_else(|| "—".into());
+        eprintln!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>6} Verdict",
+            "Scenario", "gzippy", "unpigz", "igzip", "rapidgzip", "gzip", "CV%");
+        eprintln!("  {}", "─".repeat(100));
 
-        let gzippy = get("gzippy");
-        let gzippy_cv = gzippy.map(|r| r.cv).unwrap_or(0.0);
-        let best_comp = ["unpigz", "igzip", "rapidgzip", "gzip"].iter()
-            .filter_map(|t| get(t))
-            .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap());
-
-        let verdict = if let (Some(g), Some(b)) = (gzippy, best_comp) {
-            let gap = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
-            if gap >= 0.0 {
-                wins += 1;
-                format!("WIN +{:.1}% vs {}", gap, b.tool)
-            } else {
-                losses += 1;
-                format!("LOSS {:.1}% vs {}", gap, b.tool)
-            }
-        } else {
-            "—".into()
-        };
-
-        let name = format!("{ds}-{arch} {thr}");
-        eprintln!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>5.1} {}",
-            name, fmt("gzippy"), fmt("unpigz"), fmt("igzip"), fmt("rapidgzip"), fmt("gzip"),
-            gzippy_cv * 100.0, verdict);
-    }
-
-    let total = wins + losses;
-    eprintln!("\n  WINS: {wins}/{total}    LOSSES: {losses}/{total}");
-    if losses > 0 {
-        eprintln!("\n  Losses:");
         for (ds, arch, thr) in &scenarios {
-            let scenario: Vec<&ToolResult> = results.iter()
+            let scenario: Vec<&&ToolResult> = decomp.iter()
                 .filter(|r| r.dataset == *ds && r.archive == *arch && r.threads == *thr && r.status == "pass")
                 .collect();
-            let gzippy = scenario.iter().find(|r| r.tool == "gzippy");
-            let best = scenario.iter().filter(|r| r.tool != "gzippy")
+
+            let get = |tool: &str| scenario.iter().find(|r| r.tool == tool).copied().copied();
+            let fmt = |tool: &str| get(tool).map(|r| format!("{:.1}", r.speed_mbps)).unwrap_or_else(|| "—".into());
+
+            let gzippy = get("gzippy");
+            let gzippy_cv = gzippy.map(|r| r.cv).unwrap_or(0.0);
+            let best_comp = ["unpigz", "igzip", "rapidgzip", "gzip"].iter()
+                .filter_map(|t| get(t))
                 .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap());
-            if let (Some(g), Some(b)) = (gzippy, best) {
+
+            let verdict = if let (Some(g), Some(b)) = (gzippy, best_comp) {
                 let gap = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
-                if gap < 0.0 {
-                    eprintln!("    {ds}-{arch} {thr}: gzippy {:.1} vs {} {:.1} ({:+.1}%)",
-                        g.speed_mbps, b.tool, b.speed_mbps, gap);
+                if gap >= 0.0 {
+                    total_wins += 1;
+                    format!("WIN +{:.1}% vs {}", gap, b.tool)
+                } else {
+                    total_losses += 1;
+                    format!("LOSS {:.1}% vs {}", gap, b.tool)
+                }
+            } else {
+                "—".into()
+            };
+
+            let name = format!("{ds}-{arch} {thr}");
+            eprintln!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>5.1} {}",
+                name, fmt("gzippy"), fmt("unpigz"), fmt("igzip"), fmt("rapidgzip"), fmt("gzip"),
+                gzippy_cv * 100.0, verdict);
+        }
+    }
+
+    if !comp.is_empty() {
+        eprintln!("\n══ COMPRESSION ═══════════════════════════════════════════════════════════");
+
+        let mut scenarios: Vec<(String, String, String)> = comp.iter()
+            .map(|r| (r.dataset.clone(), r.archive.clone(), r.threads.clone()))
+            .collect();
+        scenarios.sort();
+        scenarios.dedup();
+
+        eprintln!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>6} Verdict",
+            "Scenario", "gzippy", "pigz", "igzip", "gzip", "CV%");
+        eprintln!("  {}", "─".repeat(85));
+
+        for (ds, level, thr) in &scenarios {
+            let scenario: Vec<&&ToolResult> = comp.iter()
+                .filter(|r| r.dataset == *ds && r.archive == *level && r.threads == *thr && r.status == "pass")
+                .collect();
+
+            let get = |tool: &str| scenario.iter().find(|r| r.tool == tool).copied().copied();
+            let fmt = |tool: &str| get(tool).map(|r| format!("{:.1}", r.speed_mbps)).unwrap_or_else(|| "—".into());
+
+            let gzippy = get("gzippy");
+            let gzippy_cv = gzippy.map(|r| r.cv).unwrap_or(0.0);
+            let best = ["pigz", "igzip", "gzip"].iter()
+                .filter_map(|t| get(t))
+                .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap());
+
+            let verdict = if let (Some(g), Some(b)) = (gzippy, best) {
+                let gap = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
+                if gap >= 0.0 {
+                    total_wins += 1;
+                    format!("WIN +{:.1}% vs {}", gap, b.tool)
+                } else {
+                    total_losses += 1;
+                    format!("LOSS {:.1}% vs {}", gap, b.tool)
+                }
+            } else {
+                "—".into()
+            };
+
+            let name = format!("{ds} {level} {thr}");
+            eprintln!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>5.1} {}",
+                name, fmt("gzippy"), fmt("pigz"), fmt("igzip"), fmt("gzip"),
+                gzippy_cv * 100.0, verdict);
+        }
+    }
+
+    let total = total_wins + total_losses;
+    eprintln!("\n  ══════════════════════════════════════════════════════");
+    eprintln!("  WINS: {total_wins}/{total}    LOSSES: {total_losses}/{total}");
+    if total_losses > 0 {
+        eprintln!("\n  Losses:");
+        for r_set in [&decomp, &comp] {
+            let mut scenarios: Vec<(String, String, String)> = r_set.iter()
+                .map(|r| (r.dataset.clone(), r.archive.clone(), r.threads.clone()))
+                .collect();
+            scenarios.sort();
+            scenarios.dedup();
+
+            for (ds, arch, thr) in &scenarios {
+                let scenario: Vec<&&ToolResult> = r_set.iter()
+                    .filter(|r| r.dataset == *ds && r.archive == *arch && r.threads == *thr && r.status == "pass")
+                    .collect();
+                let gzippy = scenario.iter().find(|r| r.tool == "gzippy").copied().copied();
+                let best = scenario.iter().filter(|r| r.tool != "gzippy")
+                    .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap())
+                    .copied().copied();
+                if let (Some(g), Some(b)) = (gzippy, best) {
+                    let gap = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
+                    if gap < 0.0 {
+                        eprintln!("    {} {ds}-{arch} {thr}: gzippy {:.1} vs {} {:.1} ({:+.1}%)",
+                            g.direction, g.speed_mbps, b.tool, b.speed_mbps, gap);
+                    }
                 }
             }
         }

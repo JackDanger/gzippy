@@ -64,6 +64,11 @@ fn main() {
                 let threads = find_flag(&args, "--threads");
                 bench::run_ab(&args[3], &args[4], dataset.as_deref(), threads.as_deref())
             } else {
+                let direction = match find_flag(&args, "--direction").as_deref() {
+                    Some("compress") => bench::BenchDirection::Compress,
+                    Some("both") => bench::BenchDirection::Both,
+                    _ => bench::BenchDirection::Decompress,
+                };
                 let bench_args = bench::BenchArgs {
                     dataset: find_flag(&args, "--dataset"),
                     archive: find_flag(&args, "--archive"),
@@ -78,6 +83,7 @@ fn main() {
                     target_cv: find_flag(&args, "--target-cv")
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(0.03),
+                    direction,
                 };
                 bench::run(&bench_args)
             }
@@ -169,6 +175,7 @@ BENCH FLAGS:
   --dataset NAME               silesia, software, logs (default: all found)
   --archive TYPE               gzip, bgzf, pigz (default: all found)
   --threads N                  1 for T1, >1 for Tmax (default: both)
+  --direction MODE             decompress, compress, both (default: decompress)
   --json                       Machine-readable JSON output on stdout
   --min-trials N               Minimum trial runs (default: 10)
   --max-trials N               Maximum trial runs (default: 40)

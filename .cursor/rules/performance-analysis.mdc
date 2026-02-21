@@ -1,5 +1,5 @@
 ---
-description: CI-driven performance workflow — CI is the source of truth, not local benchmarks
+description: CI-driven performance workflow — cloud fleet is the source of truth
 alwaysApply: true
 ---
 
@@ -17,33 +17,62 @@ which a regression is acceptable. Never accept a clippy/lint suggestion in a hot
 without verifying identical codegen. Use `#[allow(clippy::...)]` to suppress lints
 rather than changing code that might be slower. Every nanosecond counts.
 
+## Full Benchmark Matrix
+
+### Decompression: 3 datasets × 3 archives × 2 threads × 2 archs = 36 scenarios
+| Axis | Values |
+|------|--------|
+| Datasets | silesia (211MB), software (~22MB), logs (~22MB) |
+| Archive types | gzip (single-member), bgzf (gzippy format), pigz (single-member!) |
+| Thread configs | T1 (1 thread), Tmax (4 on cloud fleet) |
+| Architectures | x86_64 (c7i.4xlarge), arm64 (c8g.4xlarge) |
+| Competitors | unpigz, igzip, rapidgzip, gzip |
+
+### Compression: 3 datasets × 3 levels × 2 threads × 2 archs = 36 scenarios
+| Axis | Values |
+|------|--------|
+| Datasets | silesia (211MB), software (~22MB), logs (~22MB) |
+| Levels | L1 (speed), L6 (balanced), L9 (ratio) |
+| Thread configs | T1 (1 thread), Tmax (4 on cloud fleet) |
+| Architectures | x86_64 (c7i.4xlarge), arm64 (c8g.4xlarge) |
+| Competitors | pigz, igzip (L1 only), gzip |
+
+### Total: 72 scenarios (36 decompress + 36 compress)
+Plus local Mac (arm64 Apple Silicon) for all scenarios = 108 total cells.
+
 ## Benchmarking Architecture (Feb 2026)
 
 **ONE benchmark implementation**: `gzippy-dev bench` is THE authoritative benchmark.
 It runs everywhere — local, cloud fleet, CI — with identical logic.
 
 ```
-gzippy-dev bench                    # human output, all datasets/archives/threads
-gzippy-dev bench --json             # machine-readable, same data
-gzippy-dev bench --dataset silesia  # one dataset
-gzippy-dev bench --archive bgzf     # one archive type
-gzippy-dev bench --threads 1        # T1 only
-gzippy-dev bench --min-trials 50 --max-trials 200 --target-cv 0.005  # precision
+gzippy-dev bench                        # decompression, all datasets
+gzippy-dev bench --direction compress   # compression benchmarks (L1, L6, L9)
+gzippy-dev bench --direction both       # everything
+gzippy-dev bench --json                 # machine-readable
+gzippy-dev bench --dataset silesia      # one dataset
+gzippy-dev bench --archive bgzf         # one archive type
+gzippy-dev bench --threads 1            # T1 only
+gzippy-dev bench --min-trials 50 --max-trials 200 --target-cv 0.005
 ```
 
 **Cloud fleet** (`gzippy-dev cloud bench`):
-- 6 instances: 3 x86_64 (c7i.4xlarge) + 3 arm64 (c8g.4xlarge)
-- 1 instance per (arch, dataset) — fully parallel
-- Also runs local Mac benchmarks simultaneously
+- 12 instances: 6 x86_64 (c7i.4xlarge) + 6 arm64 (c8g.4xlarge)
+- 1 instance per (arch, dataset, direction) — fully parallel
+- Also runs local Mac benchmarks simultaneously (both directions)
 - Two-phase: sweep (30-100 trials, CV<1.5%) + precision re-run close races
 - Strict scoring: gzippy must be >= every competitor, or it's a loss
-- Wall time: ~15 min total (setup + benchmarks in parallel)
+- Results dumped to `cloud-results.json` with per-scenario scorecard
+- Wall time: ~20 min total (setup + benchmarks in parallel)
 
-**Key learnings**:
-- EBS gp3 caps at ~131 MB/s; ALL data MUST be in /dev/shm (RAM)
-- On-demand instances avoid spot capacity errors
-- `TMPDIR=/dev/shm` for decompressed output too (not just compressed input)
-- Python benchmark scripts remain for CI but gzippy-dev bench is truth
+**Output**: `cloud-results.json` contains structured results with scorecard:
+```json
+{
+  "wins": N, "losses": M, "total_scenarios": N+M,
+  "scorecard": [{"scenario": "...", "verdict": "WIN/LOSS", "gap_pct": ...}],
+  "results": [{"platform": "...", "dataset": "...", "direction": "...", ...}]
+}
+```
 
 ## The Loop
 
@@ -52,79 +81,47 @@ gzippy-dev bench --min-trials 50 --max-trials 200 --target-cv 0.005  # precision
 cargo test --release                  # 1. Correctness
 # local benchmark to sanity-check
 gzippy-dev cloud bench                # 2. Authoritative cloud fleet numbers
+# read cloud-results.json for structured results
 ```
 
-## Current Status: 18/36 Wins (Feb 20 2026, post-BGZF pipeline fix)
+## Current Status: Decompression 18/36 Wins (Feb 20 2026)
 
-**Previous: 13/36 (36%).** The BGZF Tmax pipeline fix added 5 wins.
+### Decompression Wins
+- **BGZF — ALL 12 WINS** (T1 + Tmax, both arches): +8% to +155% vs best
+- **arm64 non-BGZF T1 — 6 WINS**: gzippy beats all competitors on ARM T1
 
-### What Changed: BGZF Tmax Pipeline
-
-**Root cause of old 2x scaling**: `decompress_bgzf_parallel_to_vec` allocated
-`vec![0u8; 211MB]` (53K page faults) then did serial `writer.write_all(211MB)`.
-
-**Fix**: Pipelined streaming — N decoder threads decompress into per-thread
-reusable buffers, send completed blocks through a bounded channel, writer thread
-writes blocks in order as they arrive. No large allocation, no serial copy.
-
-| Metric | Before | After |
-|---|---|---|
-| T4 scaling | 2.0x | 2.88x |
-| silesia-bgzf Tmax x86 | 1329 (LOSS -16%) | 2632 (WIN +71%) |
-| silesia-bgzf Tmax arm64 | 1265 (WIN +31%) | 3069 (WIN +155%) |
-| logs-bgzf Tmax x86 | 1973 (LOSS -15%) | 3080 (WIN +38%) |
-
-### BGZF — ALL 12 WINS (T1 + Tmax, both arches)
-gzippy dominates its own format: +8% to +155% vs best competitor.
-
-### 18 Remaining Losses
+### Decompression Losses (18)
 
 **Category 1: x86 T1 vs igzip (6 losses)**
-| Scenario | gzippy | igzip | Gap |
-|---|---|---|---|
-| software-gzip T1 x86 | 1245 | 2769 | -55% |
-| software-pigz T1 x86 | 1214 | 2544 | -52% |
-| logs-gzip T1 x86 | 1050 | 1937 | -46% |
-| logs-pigz T1 x86 | 1025 | 1771 | -42% |
-| silesia-gzip T1 x86 | 524 | 585 | -10% |
-| silesia-pigz T1 x86 | 518 | 539 | -4% |
-
 igzip's AVX-512 Huffman decode + vpclmulqdq CRC32 gives 2x on repetitive data.
 
 **Category 2: All non-BGZF Tmax (12 losses)**
 rapidgzip parallelizes single-member gzip. gzippy falls back to sequential.
-Gaps: -11% to -45%. Requires dedicated block-finder + decoder architecture.
+Requires dedicated block-finder + decoder architecture (not yet implemented).
+
+### Compression Status
+Compression benchmarks now measured but not yet cloud-validated. Local Mac shows:
+- T1: gzippy wins at all levels
+- Tmax: gzippy loses to pigz at L1 (pigz has better thread scaling)
 
 ## Optimization History: What Works vs What Doesn't
 
-### BGZF Parallel
+### Strategies That WORK
 | Approach | Result |
 |---|---|
-| Pre-allocated full output + serial write_all | **BAD**: 2x scaling, 53K page faults |
-| Pipelined streaming (channel + ordered writer) | **GOOD**: 2.88x scaling, +71-155% |
-| Per-thread reusable buffers | **GOOD**: stays in L2 cache |
-| Bounded sync_channel (2*threads+2 capacity) | **GOOD**: backpressure without stalling |
+| Pipelined BGZF streaming | 2.88x scaling, +71-155% vs before |
+| Per-thread reusable buffers | Stays in L2 cache |
+| RAM-backed I/O (/dev/shm) | Reveals true CPU speed |
+| Parallel fleet (1 per arch×dataset×direction) | Full parallelism, high precision |
+| Local Mac in parallel with cloud | Free extra data point |
+| JSON results dump | Easy to parse for analysis |
 
-### Single-member Parallel (tried, not yet working)
+### Strategies That DON'T WORK
 | Approach | Result |
 |---|---|
-| Two-pass (scan + re-decode) | **32% SLOWER** on ARM (scan cost too high at 4 cores) |
-| Speculative parallel | **Regressed** arm64 by 15% |
-| Need: rapidgzip-style pipeline (block-finder + decoders) | **NOT YET IMPLEMENTED** |
-
-### General
-| Approach | Result |
-|---|---|
-| RAM-backed I/O (/dev/shm) | **ESSENTIAL**: reveals true CPU speed |
-| 6-instance fleet (1 per arch×dataset) | **GOOD**: full parallelism, higher precision |
-| Local Mac in parallel with cloud | **GOOD**: free extra data point |
-| Simulation benchmarks | **BAD**: always lie about real-world perf |
-| EBS gp3 for benchmarks | **BAD**: 131 MB/s cap hides real differences |
-
-## CI Benchmark Architecture
-
-**Cloud fleet**: c7i.4xlarge (Sapphire Rapids) + c8g.4xlarge (Graviton4)
-**Datasets**: silesia (211MB/503MB decompressed), software (~22MB), logs (~22MB)
-**Archives**: gzip, bgzf, pigz — thread configs T1 and Tmax=4
-**Sweep**: 30-100 trials, CV<1.5%
-**Precision**: 50-200 trials, CV<0.5% (close races <3%)
+| Two-pass parallel (scan + re-decode) | 32% SLOWER (scan cost too high at 4 cores) |
+| Speculative parallel | Regressed arm64 by 15% |
+| Simulation benchmarks | Always lie about real-world perf |
+| EBS gp3 for benchmarks | 131 MB/s cap hides real differences |
+| Micro-optimizations in decode | LLVM already optimizes well |
+| Pre-allocated full output + serial write_all | 2x scaling, 53K page faults |
