@@ -348,15 +348,9 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
                 let output = decompress_gzip_to_vec(input_data, args.processes)?;
                 writer.write_all(&output)?;
             } else if !is_multi && crate::isal_decompress::is_available() {
-                // x86_64 ISA-L inflate: AVX2/AVX-512 Huffman + vpclmulqdq CRC32
-                let isize_hint = read_gzip_isize(input_data).unwrap_or(0) as usize;
-                match crate::isal_decompress::decompress_gzip(input_data, isize_hint) {
-                    Some(output) => {
-                        writer.write_all(&output)?;
-                    }
-                    None => {
-                        decompress_multi_member_sequential(input_data, &mut writer)?;
-                    }
+                if crate::isal_decompress::decompress_gzip_stream(input_data, &mut writer).is_none()
+                {
+                    decompress_multi_member_sequential(input_data, &mut writer)?;
                 }
             } else {
                 decompress_multi_member_sequential(input_data, &mut writer)?;
@@ -575,15 +569,10 @@ fn decompress_single_member<W: Write + Send>(
     writer: &mut W,
     _num_threads: usize,
 ) -> GzippyResult<u64> {
-    // On x86_64 with ISA-L: use ISA-L inflate (AVX2/AVX-512 Huffman decode,
-    // vpclmulqdq CRC32). 45-56% faster than libdeflate on repetitive data.
     if crate::isal_decompress::is_available() {
-        let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
-        if let Some(output) = crate::isal_decompress::decompress_gzip(data, isize_hint) {
-            let len = output.len() as u64;
-            writer.write_all(&output)?;
+        if let Some(bytes) = crate::isal_decompress::decompress_gzip_stream(data, writer) {
             writer.flush()?;
-            return Ok(len);
+            return Ok(bytes);
         }
     }
     decompress_single_member_libdeflate(data, writer)
