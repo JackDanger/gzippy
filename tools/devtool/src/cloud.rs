@@ -85,13 +85,35 @@ fn ssh_opts(key: &Path) -> Vec<String> {
     ]
 }
 
-fn ssh(ip: &str, key: &Path, cmd: &str) -> Result<String, String> {
-    let output = Command::new("ssh")
+fn ssh_timeout(ip: &str, key: &Path, cmd: &str, timeout: Duration) -> Result<String, String> {
+    let mut child = Command::new("ssh")
         .args(ssh_opts(key))
         .arg(format!("{SSH_USER}@{ip}"))
         .arg(cmd)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("SSH to {ip}: {e}"))?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("SSH command timed out after {}s on {ip}: {cmd}",
+                        timeout.as_secs()));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => return Err(format!("SSH wait error on {ip}: {e}")),
+        }
+    }
+
+    let output = child.wait_with_output()
+        .map_err(|e| format!("SSH output error on {ip}: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     if !output.status.success() && stdout.trim().is_empty() {
@@ -134,19 +156,33 @@ impl CleanupState {
             args.extend(ids.iter());
             let _ = aws(&args);
         }
-        if let Some(sg) = &self.sg_id {
-            if !self.instance_ids.is_empty() {
-                std::thread::sleep(Duration::from_secs(5));
-            }
-            println!("  Deleting security group {sg}...");
-            let _ = aws(&["ec2", "delete-security-group", "--group-id", sg]);
-        }
         if let Some(name) = &self.key_name {
             println!("  Deleting key pair {name}...");
             let _ = aws(&["ec2", "delete-key-pair", "--key-name", name]);
         }
         if let Some(path) = &self.key_path {
             let _ = std::fs::remove_file(path);
+        }
+        if let Some(sg) = &self.sg_id {
+            // SG can't be deleted until instances are fully terminated.
+            // Retry with backoff (10s, 20s, 40s) — total ~70s max wait.
+            for attempt in 0..4 {
+                let wait = if self.instance_ids.is_empty() { 0 } else { 10 * (1 << attempt) };
+                if wait > 0 {
+                    println!("  Waiting {wait}s for instance termination before SG cleanup...");
+                    std::thread::sleep(Duration::from_secs(wait));
+                }
+                match aws(&["ec2", "delete-security-group", "--group-id", sg]) {
+                    Ok(_) => { println!("  Security group {sg} deleted."); break; }
+                    Err(e) if attempt < 3 => {
+                        println!("  SG delete attempt {}: {e} (retrying...)", attempt + 1);
+                    }
+                    Err(e) => {
+                        eprintln!("  Warning: could not delete SG {sg}: {e}");
+                        eprintln!("  Run `gzippy-dev cloud cleanup` to clean up later.");
+                    }
+                }
+            }
         }
     }
 }
@@ -305,28 +341,31 @@ fn wait_for_ssh(ip: &str, key: &Path, label: &str) -> Result<(), String> {
 fn wait_for_setup(ip: &str, key: &Path, label: &str) -> Result<(), String> {
     let deadline = Instant::now() + SETUP_TIMEOUT;
     let start = Instant::now();
+    let mut last_progress_report = 0u64;
     println!("  [{label}] Waiting for setup...");
     loop {
-        if let Ok(out) = ssh(ip, key, "cat /tmp/gzippy-ready 2>/dev/null || echo NOT_READY") {
-            if out.trim() == "READY" {
+        let check_timeout = Duration::from_secs(15);
+        if let Ok(out) = ssh_timeout(ip, key, "cat /tmp/gzippy-ready 2>/dev/null || echo NOT_READY", check_timeout) {
+            if out.trim().contains("READY") && !out.trim().contains("NOT_READY") {
                 println!("  [{label}] Setup complete ({:.0}s)", start.elapsed().as_secs_f64());
                 return Ok(());
             }
         }
         if Instant::now() > deadline {
-            let log = ssh(ip, key, "tail -30 /var/log/cloud-init-output.log 2>/dev/null").unwrap_or_default();
+            let log = ssh_timeout(ip, key, "tail -30 /var/log/cloud-init-output.log 2>/dev/null", check_timeout).unwrap_or_default();
             eprintln!("  [{label}] Last setup output:\n{log}");
-            return Err(format!("[{label}] Setup timeout"));
+            return Err(format!("[{label}] Setup timeout after {}s", SETUP_TIMEOUT.as_secs()));
         }
         let elapsed = start.elapsed().as_secs();
-        if elapsed.is_multiple_of(30) && elapsed > 0 {
-            let progress = ssh(ip, key, "tail -1 /var/log/cloud-init-output.log 2>/dev/null | head -c 120").unwrap_or_default();
+        if elapsed >= last_progress_report + 30 {
+            last_progress_report = elapsed;
+            let progress = ssh_timeout(ip, key, "tail -1 /var/log/cloud-init-output.log 2>/dev/null | head -c 120", check_timeout).unwrap_or_default();
             let progress = progress.trim();
             if !progress.is_empty() {
                 println!("  [{label}] ({elapsed}s) {progress}");
             }
         }
-        std::thread::sleep(Duration::from_secs(8));
+        std::thread::sleep(Duration::from_secs(10));
     }
 }
 
@@ -448,11 +487,16 @@ fn remote_bench(
     if let Some(th) = threads { cmd += &format!(" --threads {th}"); }
     if let Some(dir) = direction { cmd += &format!(" --direction {dir}"); }
 
-    let output = ssh(ip, key, &cmd)?;
+    let bench_timeout = Duration::from_secs(25 * 60);
+    let output = ssh_timeout(ip, key, &cmd, bench_timeout)?;
 
     let json_line = output.lines()
         .find(|line| line.trim_start().starts_with('{'))
-        .ok_or_else(|| format!("[{label}] No JSON in bench output. Raw:\n{output}"))?;
+        .ok_or_else(|| {
+            let tail: String = output.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev()
+                .collect::<Vec<_>>().join("\n");
+            format!("[{label}] No JSON in bench output. Last 10 lines:\n{tail}")
+        })?;
 
     parse_bench_json(json_line, label)
 }
@@ -920,6 +964,7 @@ fn run_fleet(
     commit: &str, repo_url: &str, session: &str, cleanup: &mut CleanupState,
 ) -> Result<(), String> {
     let total_start = Instant::now();
+    let n_instances = DATASETS.len() * 2 * 2; // datasets × archs × directions
 
     print!("  VPC/subnet... ");
     let _ = std::io::stdout().flush();
@@ -991,26 +1036,51 @@ fn run_fleet(
         println!("  {}/{}/{}: {} ({})", inst.arch, inst.dataset, inst.direction, inst.ip, inst.instance_type);
     }
 
-    // Wait for SSH + setup on all instances in parallel
+    // Wait for SSH + setup on all instances in parallel.
+    // If some instances fail setup, continue with the rest.
     {
-        let handles: Vec<_> = instances.iter().map(|inst| {
+        let handles: Vec<_> = instances.iter().enumerate().map(|(idx, inst)| {
             let ip = inst.ip.clone();
             let key = key_path.clone();
             let label = format!("{}/{}/{}", inst.arch, inst.dataset, inst.direction);
-            std::thread::spawn(move || -> Result<(), String> {
-                wait_for_ssh(&ip, &key, &label)?;
-                wait_for_setup(&ip, &key, &label)
+            std::thread::spawn(move || -> (usize, Result<(), String>) {
+                let r = wait_for_ssh(&ip, &key, &label)
+                    .and_then(|_| wait_for_setup(&ip, &key, &label));
+                (idx, r)
             })
         }).collect();
+        let mut failed_indices = Vec::new();
         for h in handles {
-            h.join().map_err(|_| "setup thread panic")??;
+            match h.join() {
+                Ok((_idx, Ok(()))) => {}
+                Ok((idx, Err(e))) => {
+                    eprintln!("  WARNING: instance setup failed: {e}");
+                    failed_indices.push(idx);
+                }
+                Err(_) => eprintln!("  WARNING: setup thread panicked"),
+            }
         }
+        // Remove failed instances (iterate in reverse to preserve indices)
+        failed_indices.sort_unstable();
+        for idx in failed_indices.into_iter().rev() {
+            let inst = &instances[idx];
+            eprintln!("  Skipping failed instance {}/{}/{}", inst.arch, inst.dataset, inst.direction);
+            instances.remove(idx);
+        }
+        if instances.is_empty() {
+            return Err("All instances failed setup — aborting".into());
+        }
+        println!("  {} of {} instances ready for benchmarks", instances.len(), n_instances);
     }
 
     println!(
-        "\n  ═══ BENCHMARKS ({} cloud instances + local Mac in parallel) ═══",
+        "\n  ═══ BENCHMARKS ({} cloud instances) ═══",
         instances.len()
     );
+
+    let instance_count = instances.len();
+    let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let failed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let cloud_handles: Vec<_> = instances
         .iter()
@@ -1020,50 +1090,42 @@ fn run_fleet(
             let label = format!("{}/{}/{}", inst.arch, inst.dataset, inst.direction);
             let dataset = inst.dataset.to_string();
             let direction = inst.direction.to_string();
-            std::thread::spawn(move || run_benchmarks_on(&ip, &key, &label, Some(&dataset), &direction))
+            let completed = completed.clone();
+            let failed = failed.clone();
+            let total = instance_count;
+            std::thread::spawn(move || -> Vec<BenchResult> {
+                match run_benchmarks_on(&ip, &key, &label, Some(&dataset), &direction) {
+                    Ok(results) => {
+                        let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let fail = failed.load(std::sync::atomic::Ordering::Relaxed);
+                        println!("  [{label}] DONE ({done}/{total} complete, {fail} failed)");
+                        results
+                    }
+                    Err(e) => {
+                        let fail = failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let done = completed.load(std::sync::atomic::Ordering::Relaxed);
+                        eprintln!("  [{label}] FAILED: {e} ({done}/{total} complete, {fail} failed)");
+                        Vec::new()
+                    }
+                }
+            })
         })
         .collect();
 
-    // Local Mac benchmark runs both decompress + compress in parallel with cloud
-    let local_handle = std::thread::spawn(|| -> Result<Vec<BenchResult>, String> {
-        let args = bench::BenchArgs {
-            min_trials: SWEEP_MIN_TRIALS,
-            max_trials: SWEEP_MAX_TRIALS,
-            target_cv: SWEEP_TARGET_CV,
-            direction: BenchDirection::Both,
-            ..Default::default()
-        };
-        let (platform, results) = bench::run_and_collect(&args)?;
-        let label = format!("local-{platform}");
-        Ok(results
-            .into_iter()
-            .filter(|r| r.status == "pass")
-            .map(|r| BenchResult {
-                platform: label.clone(),
-                dataset: r.dataset,
-                archive: r.archive,
-                threads: r.threads,
-                tool: r.tool,
-                speed_mbps: r.speed_mbps,
-                cv: r.cv,
-                trials: r.trials,
-                direction: r.direction,
-            })
-            .collect())
-    });
-
     let mut all = Vec::new();
     for h in cloud_handles {
-        all.extend(h.join().map_err(|_| "cloud bench thread panic")??);
-    }
-    match local_handle.join() {
-        Ok(Ok(local_results)) => {
-            println!("\n  [local] {} results collected", local_results.len());
-            all.extend(local_results);
+        match h.join() {
+            Ok(results) => all.extend(results),
+            Err(_) => eprintln!("  Warning: a benchmark thread panicked"),
         }
-        Ok(Err(e)) => eprintln!("\n  [local] Benchmark failed: {e}"),
-        Err(_) => eprintln!("\n  [local] Benchmark thread panicked"),
     }
+
+    if all.is_empty() {
+        return Err("All instances failed — no results collected".into());
+    }
+    let done = completed.load(std::sync::atomic::Ordering::Relaxed);
+    let fail = failed.load(std::sync::atomic::Ordering::Relaxed);
+    println!("\n  Collected {} results from {done} instances ({fail} failed)", all.len());
 
     let elapsed = total_start.elapsed();
     println!("\n  Total wall time: {:.0}s ({:.1} min)", elapsed.as_secs_f64(), elapsed.as_secs_f64() / 60.0);
@@ -1112,6 +1174,7 @@ pub fn cleanup_all() -> Result<(), String> {
         "--output", "text",
     ])?;
     let ids: Vec<&str> = result.split_whitespace().filter(|s| !s.is_empty()).collect();
+    let had_instances = !ids.is_empty();
     if ids.is_empty() {
         println!("  No leaked instances.");
     } else {
@@ -1120,15 +1183,8 @@ pub fn cleanup_all() -> Result<(), String> {
         args.extend(ids);
         aws(&args)?;
     }
-    let result = aws(&[
-        "ec2", "describe-security-groups",
-        "--filters", &format!("Name=group-name,Values={TAG_KEY}-*"),
-        "--query", "SecurityGroups[].GroupId", "--output", "text",
-    ])?;
-    for sg in result.split_whitespace().filter(|s| !s.is_empty()) {
-        println!("  Deleting security group {sg}...");
-        let _ = aws(&["ec2", "delete-security-group", "--group-id", sg]);
-    }
+
+    // Delete key pairs first (no dependency on instances)
     let result = aws(&[
         "ec2", "describe-key-pairs",
         "--filters", &format!("Name=key-name,Values={TAG_KEY}-*"),
@@ -1137,6 +1193,34 @@ pub fn cleanup_all() -> Result<(), String> {
     for key in result.split_whitespace().filter(|s| !s.is_empty()) {
         println!("  Deleting key pair {key}...");
         let _ = aws(&["ec2", "delete-key-pair", "--key-name", key]);
+    }
+
+    // SGs require instances to be fully terminated — retry with backoff
+    let result = aws(&[
+        "ec2", "describe-security-groups",
+        "--filters", &format!("Name=group-name,Values={TAG_KEY}-*"),
+        "--query", "SecurityGroups[].GroupId", "--output", "text",
+    ])?;
+    let sgs: Vec<&str> = result.split_whitespace().filter(|s| !s.is_empty()).collect();
+    if !sgs.is_empty() {
+        for attempt in 0..4 {
+            let wait = if had_instances { 10 * (1 << attempt) } else { 0 };
+            if wait > 0 {
+                println!("  Waiting {wait}s for instances to terminate before SG cleanup...");
+                std::thread::sleep(Duration::from_secs(wait));
+            }
+            let mut all_deleted = true;
+            for sg in &sgs {
+                match aws(&["ec2", "delete-security-group", "--group-id", sg]) {
+                    Ok(_) => println!("  Security group {sg} deleted."),
+                    Err(_) => { all_deleted = false; }
+                }
+            }
+            if all_deleted { break; }
+            if attempt == 3 {
+                eprintln!("  Warning: some SGs could not be deleted. They will be cleaned up when instances fully terminate.");
+            }
+        }
     }
     println!("  Cleanup complete.");
     Ok(())
