@@ -3,168 +3,115 @@ description: CI-driven performance workflow — cloud fleet is the source of tru
 alwaysApply: true
 ---
 
-# Performance Workflow: Cloud Fleet Is the Source of Truth
+# Performance Analysis & Strategy (Feb 2026)
 
-## Core Principle
-
-**Never trust local benchmarks for final decisions.** The cloud fleet runs on both
-x86_64 (c7i Sapphire Rapids) and arm64 (c8g Graviton4) with RAM-backed I/O,
-all datasets, archive types, thread configs, and competitors. Local runs are
-useful for rapid iteration but the cloud fleet is authoritative.
-
-**Never compromise performance under any conditions.** There is no threshold below
-which a regression is acceptable. Never accept a clippy/lint suggestion in a hot path
-without verifying identical codegen. Use `#[allow(clippy::...)]` to suppress lints
-rather than changing code that might be slower. Every nanosecond counts.
-
-## Full Benchmark Matrix
-
-### Decompression: 3 datasets × 3 archives × 2 threads × 2 archs = 36 scenarios
-| Axis | Values |
-|------|--------|
-| Datasets | silesia (211MB), software (~22MB), logs (~22MB) |
-| Archive types | gzip (single-member), bgzf (gzippy format), pigz (single-member!) |
-| Thread configs | T1 (1 thread), Tmax (4 on cloud fleet) |
-| Architectures | x86_64 (c7i.4xlarge), arm64 (c8g.4xlarge) |
-| Competitors | unpigz, igzip, rapidgzip, gzip |
-
-### Compression: 3 datasets × 3 levels × 2 threads × 2 archs = 36 scenarios
-| Axis | Values |
-|------|--------|
-| Datasets | silesia (211MB), software (~22MB), logs (~22MB) |
-| Levels | L1 (speed), L6 (balanced), L9 (ratio) |
-| Thread configs | T1 (1 thread), Tmax (4 on cloud fleet) |
-| Architectures | x86_64 (c7i.4xlarge), arm64 (c8g.4xlarge) |
-| Competitors | pigz, igzip (L1 only), gzip |
-
-### Total: 72 scenarios (36 decompress + 36 compress)
-Plus local Mac (arm64 Apple Silicon) for all scenarios = 108 total cells.
-
-## Benchmarking Architecture (Feb 2026)
-
-**ONE benchmark implementation**: `gzippy-dev bench` is THE authoritative benchmark.
-It runs everywhere — local, cloud fleet, CI — with identical logic.
-
-```
-gzippy-dev bench                        # decompression, all datasets
-gzippy-dev bench --direction compress   # compression benchmarks (L1, L6, L9)
-gzippy-dev bench --direction both       # everything
-gzippy-dev bench --json                 # machine-readable
-gzippy-dev bench --dataset silesia      # one dataset
-gzippy-dev bench --archive bgzf         # one archive type
-gzippy-dev bench --threads 1            # T1 only
-gzippy-dev bench --min-trials 50 --max-trials 200 --target-cv 0.005
-```
-
-**Cloud fleet** (`gzippy-dev cloud bench`):
-- 12 instances: 6 x86_64 (c7i.4xlarge) + 6 arm64 (c8g.4xlarge)
-- 1 instance per (arch, dataset, direction) — fully parallel
-- Also runs local Mac benchmarks simultaneously (both directions)
-- Two-phase: sweep (30-100 trials, CV<1.5%) + precision re-run close races
-- Strict scoring: gzippy must be >= every competitor, or it's a loss
-- Results dumped to `cloud-results.json` with per-scenario scorecard
-- Wall time: ~20 min total (setup + benchmarks in parallel)
-
-**Output**: `cloud-results.json` contains structured results with scorecard:
-```json
-{
-  "wins": N, "losses": M, "total_scenarios": N+M,
-  "scorecard": [{"scenario": "...", "verdict": "WIN/LOSS", "gap_pct": ...}],
-  "results": [{"platform": "...", "dataset": "...", "direction": "...", ...}]
-}
-```
-
-## The Loop
-
-```
-# ... make ONE focused code change ...
-cargo test --release                  # 1. Correctness
-# local benchmark to sanity-check
-gzippy-dev cloud bench                # 2. Authoritative cloud fleet numbers
-# read cloud-results.json for structured results
-```
-
-## Current Status: 41W / 19L (Feb 21 2026, Cloud Fleet — complete)
+## Current Status: 41W / 19L (Cloud Fleet, Feb 21 2026)
 
 ### Decompression: 28 WINS / 12 LOSSES
 
 **WINS (28):**
-- **BGZF — ALL 12** (T1 + Tmax, both arches): gzippy is dominant
-- **arm64 non-BGZF T1 — ALL 6**: +76-173% vs nearest competitor
-- **x86 T1 logs-gzip, logs-pigz**: parity with igzip (precision: 1965 vs 1963)
-- **x86 T1 all BGZF**: gzippy beats igzip (+7% silesia, +100%+ logs/software)
+- BGZF: ALL 12 scenarios (T1 + Tmax, both arches) — gzippy is dominant
+- arm64 non-BGZF T1: ALL 6 — +76-173% vs nearest competitor
+- x86 T1: logs-gzip, logs-pigz — exact parity with igzip
+- x86 T1: all BGZF — +7% to +100%+ vs igzip
 
-**x86 T1 near-parity (4 losses, -0.2% to -1.0%, noise):**
-Direct ISA-L FFI achieved exact parity with igzip. These 4 are within CV.
+**Near-parity (4 losses, <1% gap, measurement noise):**
 - silesia-gzip T1: 594 vs igzip 597 (-0.5%)
 - silesia-pigz T1: 550 vs igzip 556 (-1.0%)
 - software-gzip T1: 2522 vs igzip 2528 (-0.2%)
 - software-pigz T1: 2277 vs igzip 2293 (-0.7%)
 
-**Tmax single-member parallel (8 losses, -18% to -41%):**
-Requires rapidgzip-style parallel decompression. Not actionable without
-major new architecture.
+**Tmax single-member (8 losses, -18% to -41%):**
+No single-member parallel decompression. rapidgzip achieves 1.5-1.8x via
+dedicated block-finder + decoder thread pipeline.
 
 ### Compression: 13 WINS / 7 LOSSES
 
-**WINS:** ALL L6/L9 everywhere. ALL silesia L1. ALL arm64 T1.
+**WINS:** ALL L6/L9, ALL silesia L1, ALL arm64 T1.
 
-**LOSSES:**
-- L1 T1 vs igzip (2 losses, -62% to -73%): igzip AVX-512 assembly
-- L1/L6 Tmax scaling (5 losses, -10% to -39%): pigz thread scaling
+**Losses:**
+- L1 T1 vs igzip (2): igzip AVX-512 assembly (-62% to -73%)
+- L1/L6 Tmax scaling (5): pigz 3.5x vs gzippy 1.2-1.3x (-10% to -39%)
 
-### Key Findings from Cloud Fleet (Feb 21 2026)
+## Remaining Gaps Analysis
 
-**Direct ISA-L FFI eliminated wrapper overhead completely.**
-Three iterations refined the approach:
-1. Buffered (allocate full output): -20% vs igzip (50K page faults)
-2. isal-rs Decoder streaming: -2% to -8% vs igzip (16KB buffer copies)
-3. Direct isal_sys FFI: **exact parity** with igzip (zero overhead)
+### Closable (13 losses)
+| Gap | Approach |
+|-----|----------|
+| 4 x86 T1 decompress (<1%) | Already won — noise |
+| 5 L1/L6 Tmax compress scaling | Reduce per-block overhead (hash init, headers, CRC32) |
+| 4 of 8 Tmax decompress (short files) | Pipeline overhead may close for <50MB files |
 
-Key insight: `isal_inflate()` pointed directly at mmap'd input with 1MB output
-buffer matches igzip's internal loop exactly. No Cursor, no intermediate buffer.
+### Hard to Close (6 losses)
+| Gap | Why |
+|-----|-----|
+| 2 L1 T1 compress vs igzip | igzip uses AVX-512 hand-tuned assembly |
+| 4 Tmax decompress (silesia 211MB) | Needs pipeline architecture (block-finder + decoder threads) |
 
-**pigz output is SINGLE-MEMBER gzip.**
-All pigz Tmax losses are the same root cause as gzip Tmax: no single-member
-parallel decompress.
+## Benchmark Architecture
 
-**Compression L1 Tmax gap persists.**
-pigz 3.5x scaling vs gzippy 1.2-1.3x. Per-block overhead dominates at L1.
+**Cloud fleet** (`gzippy-dev cloud bench`):
+- 12 instances: 6 x86_64 (c7i.4xlarge) + 6 arm64 (c8g.4xlarge)
+- 1 instance per (arch, dataset, direction) — fully parallel
+- RAM-backed I/O (/dev/shm) isolates CPU from EBS
+- Convergence: min 10, max 40 trials, target CV <3%
+- Strict scoring: gzippy must be >= EVERY competitor or it's a loss
 
-## Optimization History: What Works vs What Doesn't
+**Matrix**: 3 datasets × 3 archive types × 2 thread configs × 2 arches = 36 decompress + 36 compress = 72 scenarios.
 
-### Strategies That WORK
+## Proven Strategies
+
+### What WORKS
 | Approach | Result |
 |---|---|
-| Pipelined BGZF streaming | 2.88x scaling, +71-155% vs before |
+| Direct ISA-L FFI (bypass wrapper crates) | Exact parity with igzip on x86 T1 |
+| BGZF-specific path at T1 | +31% (pre-parsed blocks, exact ISIZE alloc) |
+| Pipelined BGZF streaming | 2.88x scaling |
 | Per-thread reusable buffers | Stays in L2 cache |
+| 1MB streaming output buffer | Avoids 50K page faults from large alloc |
 | RAM-backed I/O (/dev/shm) | Reveals true CPU speed |
-| Parallel fleet (1 per arch×dataset×direction) | Full parallelism, high precision |
-| Local Mac in parallel with cloud | Free extra data point |
-| JSON results dump | Easy to parse for analysis |
+| Parallel fleet (1 per arch×dataset×direction) | High precision, full parallelism |
 
-### Strategies That DON'T WORK
+### What DOESN'T WORK
 | Approach | Result |
 |---|---|
-| Two-pass parallel (scan + re-decode) | 32% SLOWER (scan cost too high at 4 cores) |
-| Full-decompression boundary scan | 2x total work (scan decompresses, then parallel re-decompresses) |
-| Speculative parallel | Regressed arm64 by 15% |
-| Assuming pigz=multi-member | pigz output IS single-member; can't parallelize via member splitting |
+| Speculative parallel decode | -15% to -86% regression on real data |
+| Two-pass parallel (scan + re-decode) | 32% SLOWER (scan costs as much as full decode) |
+| Finding deflate block boundaries | Success rate <5% |
+| Pre-allocated full output + write_all | 50K page faults = 55ms sys overhead |
+| isal-rs Decoder wrapper | 16KB internal buffer copies cost 2-8% |
+| Assuming pigz = multi-member | pigz IS single-member |
 | Simulation benchmarks | Always lie about real-world perf |
-| EBS gp3 for benchmarks | 131 MB/s cap hides real differences |
-| Micro-optimizations in decode | LLVM already optimizes well |
-| Pre-allocated full output + serial write_all | 50K page faults (55ms sys overhead), 20% slower |
-| isal-rs Decoder wrapper for streaming | 16KB internal buffer copies + Cursor overhead cost 2-8% |
+| Micro-optimizations in decode | LLVM already optimizes well at this level |
 
-## Cloud Fleet Resilience (Feb 21 2026)
+## Optimization History
 
-**Failure modes fixed:**
-- SSH command timeout (25min bench, 15s poll) — prevents indefinite hangs
-- Graceful degradation: failed instances are skipped, results from rest are collected
-- SG cleanup retries with exponential backoff (10/20/40s)
-- Progress counter: "3/12 complete, 0 failed" printed as instances finish
-- Setup failure isolation: one failed instance doesn't abort the fleet
+### Phase 1: Compression Scaling (DONE)
+Larger blocks (256KB→4MB), zero-copy stdin. Fixed L6/L9 scaling.
+L1 Tmax still lags (per-block overhead dominates at L1 speed).
 
-**Remaining concern:**
-- Silesia L9 compression takes ~15-20 minutes per instance (100 trials × 3 levels × slow speed)
-- This is the fleet bottleneck — consider reducing trial count for slow operations
+### Phase 2: Multi-Member Decompression (N/A)
+Discovered pigz output is single-member. Implemented fast boundary scan
+for actual multi-member files. pigz losses merge into Phase 4.
+
+### Phase 3: ISA-L x86 T1 Decompression (DONE)
+Three iterations to achieve igzip parity:
+1. Buffered (full pre-alloc): -20% (page faults)
+2. isal-rs Decoder streaming: -2% to -8% (wrapper overhead)
+3. Direct isal_sys FFI: **exact parity** (zero overhead)
+
+### Phase 4: Single-Member Parallel Decompression (OPEN)
+8 Tmax losses remain. rapidgzip achieves 1.5-1.8x via dedicated
+block-finder + decoder thread pipeline. All previous attempts
+at speculative/two-pass parallel have regressed.
+
+## Cloud Fleet Operations
+
+```bash
+source .env                          # AWS credentials
+gzippy-dev cloud bench               # Launch fleet, benchmark, collect results
+# Results in cloud-results.json
+```
+
+Fleet creates 12 instances, runs benchmarks in parallel, collects JSON results,
+and terminates all instances + security groups on completion.

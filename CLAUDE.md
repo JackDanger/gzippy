@@ -1,244 +1,60 @@
-# CLAUDE.md - Hyperoptimization Guide for gzippy
+# CLAUDE.md — gzippy Development Guide
 
 ## Prime Directive
 
 **gzippy aims to be the fastest gzip implementation ever created.**
 
-Every change must be benchmarked. Every optimization must be measured. Speed is the only metric that matters.
+## Rules
 
-## ABSOLUTE RULES
+1. **ONE PRODUCTION PATH** — know exactly which function the CLI calls. Test that function.
+2. **BENCHMARK EVERYTHING** — cloud fleet is authoritative, local is for iteration.
+3. **REVERT REGRESSIONS** — if performance drops, revert immediately.
+4. **NEVER COMPROMISE PERFORMANCE** — clippy, style, readability: none justify slower code.
 
-1. **ONE PRODUCTION PATH** - Know exactly which inflate function the CLI calls. Test that function.
-2. **BENCHMARK EVERYTHING** - Run `./bench-decompress.sh` after EVERY change
-3. **REVERT REGRESSIONS** - If performance drops, revert immediately and try something different
-4. **INTERNAL BENCH = CLI PATH** - Never report bench numbers for code not in the CLI binary
-5. **NEVER COMPROMISE PERFORMANCE** - No exception. No threshold below which a regression is acceptable.
-   Clippy suggestions, style improvements, readability changes — NONE of these justify ANY risk of
-   slower code in a hot path. Use `#[allow(clippy::...)]` and keep the fast construct. Every nanosecond matters.
+## Production Decompression Routing (Feb 2026)
 
-## ⚠️ CRITICAL: Two Sets of Numbers (Feb 2026)
-
-There are two completely different numbers that look like "gzippy performance":
-
-### 1. Raw inflate benchmark (experimental pure Rust, NOT production)
 ```
-bench_cf_silesia measures inflate_consume_first() — NOT what the CLI uses.
-
-ARM (Apple M3):           ~1400 MB/s   vs libdeflate ~1543 MB/s  = 91% parity
-x86 (GitHub CI runner):   ~580-620 MB/s vs libdeflate ~680 MB/s  = ~90% parity
+Input → decompression.rs
+  ├─ BGZF?          → bgzf::decompress_bgzf_parallel (libdeflate FFI, parallel)
+  ├─ Multi-member?   → bgzf::decompress_multi_member_parallel (libdeflate FFI)
+  ├─ Single x86_64?  → isal_decompress::decompress_gzip_stream (ISA-L direct FFI)
+  └─ Single arm64?   → decompress_single_member_libdeflate (libdeflate FFI)
 ```
 
-### 2. CLI end-to-end throughput (PRODUCTION, what CI reports)
-```
-gzippy -d < silesia.gz > /dev/null
+## Score: 41W / 19L (Feb 2026, cloud fleet)
 
-x86_64 (GitHub CI ubuntu-latest):
-  silesia T1:    250 MB/s  vs igzip 258, rapidgzip 258  (gzippy within 3%)
-  silesia Tmax:  240 MB/s  vs rapidgzip 314             (gap: no parallel single-member)
-  software T1:   405 MB/s  vs igzip 405, rapidgzip 410  (tied)
-  logs T1:       966 MB/s  vs igzip 1030                (6% gap, AVX2 RLE advantage)
+| Category | Losses | Gap | Actionability |
+|----------|--------|-----|---------------|
+| x86 T1 decompress | 4 | <1% | Noise — effectively won |
+| Tmax single-member parallel | 8 | -18% to -41% | Major architecture needed |
+| L1 T1 compress vs igzip | 2 | -62% to -73% | AVX-512 assembly |
+| L1/L6 Tmax compress scaling | 5 | -10% to -39% | Thread scaling |
 
-arm64 (GitHub CI ubuntu-24.04-arm):
-  silesia T1:    129 MB/s  vs rapidgzip 121             (gzippy WINS +7%)
-  silesia Tmax:  130 MB/s  vs rapidgzip 120             (gzippy WINS +8%)
-  software T1:   120 MB/s  vs rapidgzip 152             (25% gap, no parallel)
-  logs T1:       124 MB/s  vs rapidgzip 137             (10% gap, no parallel)
-```
+## Hard-Won Lessons
 
-Production inflate is `inflate_into_pub()` → `inflate_into_libdeflate()` (libdeflate C FFI).
-The experimental pure-Rust path (`inflate_consume_first`) is NOT used by the CLI.
+**What works**: Direct FFI (not wrapper crates), BGZF parallel, 1MB streaming
+output buffer, ISIZE-based pre-allocation, lock-free parallel writes.
 
-## Current CLI Compression Performance (Feb 2026, with ratio-probe-fix)
-```
-x86_64:
-  silesia  L1 T1:    327 MB/s  vs igzip 335  (-2%, noise)
-  silesia  L1 Tmax:  735 MB/s  vs igzip 394  (WINS +87%)
-  software L1 T1:   1694 MB/s  vs igzip 2603 (-35%, igzip AVX-512 L1 advantage)
-  software L1 Tmax: 2549 MB/s  vs igzip 1459 (WINS +75%)
-  logs     L1 Tmax: 1477 MB/s  vs igzip 1034 (WINS +43%)
-  L6/L9 all:        gzippy WINS every case
+**What doesn't**: Speculative parallel decode, two-pass scan-then-decode,
+deflate block finding, large pre-allocations (page faults), simulation benchmarks.
 
-arm64:
-  software L1 T1:   1250 MB/s  vs pigz 569   (WINS +120%)
-  software L1 Tmax: 1347 MB/s  vs pigz 1552  (-13%, ratio probe optimization pending)
-  logs     L1 Tmax:  761 MB/s  vs pigz 1076  (-29%, ratio probe optimization pending)
-  L6/L9 all:         gzippy WINS every case
-```
-
-## Scorecard: 36 wins / 12 losses (48 total CLI matchups, Feb 2026)
-
-### Key Optimizations That Worked
-
-1. **Libdeflate-style decode loop** - Exact match of libdeflate's algorithm
-2. **8-literal batching** - Decode up to 8 literals before refill
-3. **Packed writes** - Write 2/4/8 literals with single u16/u32/u64 store
-4. **saved_bitbuf pattern** - Extract extra bits from pre-shift buffer
-5. **bitsleft -= entry** - Full subtract trick (not masked!)
-6. **Preload pattern** - Preload next entry before writing current
-7. **Branchless refill** - Exact libdeflate refill pattern
-8. **AVX2 match copy** - 64-byte copies for large matches
-
-### What HURT Performance (disabled)
-
-- **Specialized decoder** - Slower for match-heavy content (SOFTWARE, LOGS)
-- The inline extra-bits handling added overhead vs saved_bitbuf pattern
-
-## What Has Been Tried and FAILED
-
-| Optimization | Expected | Actual | Why |
-|--------------|----------|--------|-----|
-| DoubleLitCache per block | +15% | **-73%** | Build cost exceeds decode gain |
-| `#[cold]` on errors | +5% | **-4%** | Function call overhead |
-| Table-free fixed Huffman | +20% | **-325%** | Bit reversal overhead |
-| Unconditional refill | +5% | **-12%** | Conditional was faster |
-| Multi-symbol (augment style) | +15% | **-3%** | Double lookup overhead |
-| Speculative batch (basic) | +28% | **-1%** | Still sequential lookups |
-| Adaptive bloom filter | +10% | **-2%** | Tracking overhead |
-| `bitsleft -= entry` (full) | +5% | **BROKE** | Refill shift corrupted by high bytes |
-| copy_match 5-word unroll | +10% | **-15%** | Overwrites data used by later matches |
-| Combined match lookup | +20% | **-10%** | Extra table lookups canceled gains |
-| x86 2-3 literal batching | +5% | **-20%** | Hurts SOFTWARE; libdeflate's advice is x86-specific |
-| x86 5-word loop unroll | +5% | **-10%** | Extra writes hurt cache on short matches |
-
-**KEY LESSON: Micro-optimizations often REGRESS. LLVM already optimizes well.**
-
-## What MIGHT Work (Untried or Partially Tried)
-
-### Tier 1: High Probability (Try These First)
-1. **Unified Table** - Single table for ALL symbol types, no fallback (`src/unified_table.rs`)
-2. **True SIMD Lanes** - Decode 8 symbols in parallel using AVX2/NEON (`src/vector_huffman.rs`)
-3. **JIT Code Generation** - Generate native code for repeated Huffman tables
-4. **BMI2 PEXT/PDEP** - Hardware bit extraction (`src/bmi2.rs`)
-
-### Tier 2: Medium Probability
-5. **Precomputed Decode Sequences** - 16-22 bit lookup → multiple symbols
-6. **Two-Pass with Table Caching** - Scan file, fingerprint tables, cache
-7. **Branch hints** - `likely()/unlikely()` macros
-
-### Tier 3: Radical Ideas
-8. **GPU Offload** - Use tensor cores for parallel table lookup
-9. **FPGA Huffman FSM** - Hardware Huffman decoder
-10. **Custom RISC-V Instructions** - `huffdec` opcode
-
-## Architecture Overview
-
-### Main Decode Paths
-- `src/consume_first_decode.rs` - **PRODUCTION PATH** (~1400 MB/s, 99-114% of libdeflate)
-  - `decode_huffman_libdeflate_style()` - Main hot path for all blocks
-- `src/libdeflate_decode.rs` - Entry format definitions (LitLenEntry, DistEntry)
-- `src/bgzf.rs:inflate_into_pub` - Entry point for decompression
-
-### Why We Achieved Parity
-
-Key breakthroughs:
-1. **Exact libdeflate algorithm** - Copied the decompress_template.h patterns exactly
-2. **bitsleft -= entry trick** - Full subtract works when high bits are garbage
-3. **8-literal batching** - More aggressive than libdeflate's 2-3 literal unroll
-4. **Disabled specialized decoder** - Was slower for match-heavy content
-5. **AVX2 match copy** - SIMD for large non-overlapping matches
-
-### Key Data Structures
-- `src/libdeflate_entry.rs` - LitLenEntry, DistEntry formats
-- `src/multi_symbol.rs` - Multi-symbol table (not integrated)
-- `src/vector_huffman.rs` - SIMD infrastructure
-
-### Benchmarks — CI Is the Source of Truth
+## Workflow
 
 ```bash
-# CI workflow (authoritative — covers x86_64 + arm64, all datasets, all competitors)
-gzippy-dev ci triage              # See categorized gaps and win rate
-gzippy-dev ci push                # Push → CI → auto-triage + compare vs main
-gzippy-dev ci vs-main             # Compare branch vs main (auto-finds runs)
-gzippy-dev ci history --limit 10  # Win rate trend
-
-# Local benchmarks (for rapid iteration only, NOT for final decisions)
-cargo test --release bench_cf_silesia -- --nocapture  # Pure Rust inflate speed
-gzippy-dev instrument file.gz                          # Timing breakdown
-gzippy-dev path file.gz                                # Which code path runs
+cargo test --release                      # Correctness (always use timeouts)
+gzippy-dev cloud bench                    # Authoritative cloud fleet numbers
 ```
 
-## How to Make Progress
+Never claim a win/loss based on local results. Cloud fleet on both x86_64 and
+arm64 with RAM-backed I/O is the only source of truth.
 
-### Step 1: See Where We Stand
-```bash
-gzippy-dev ci triage   # Categorized gaps with root causes
-```
+## Key Files
 
-### Step 2: Understand the Code Path
-```bash
-gzippy-dev instrument file.gz  # Where does time go?
-gzippy-dev path file.gz        # Which inflate function runs?
-```
-
-### Step 3: Make ONE Change
-Make ONE focused change. Run `cargo test --release` for correctness.
-
-### Step 4: Validate on CI
-```bash
-gzippy-dev ci push   # Push → watch CI → auto-triage + compare vs main
-```
-
-**Never claim a win/loss based on local results alone.** arm64 performance can
-differ significantly from local Apple M3 or x86 results.
-
-## Key Insights from libdeflate/rapidgzip Analysis
-
-### libdeflate's Tricks (decompress_template.h)
-1. **saved_bitbuf pattern** - Save bits BEFORE consuming for extra bit extraction
-2. **Multi-literal in fastloop** - Decode 2-3 literals when bits available
-3. **CAN_CONSUME_AND_THEN_PRELOAD** - Compile-time bit budget check
-4. **Preload during write** - Start next lookup before writing current
-5. **EXTRACT_VARBITS8** - Cast to u8 before shift
-
-### rapidgzip's Tricks (HuffmanCodingShortBitsMultiCached.hpp)
-1. **CacheEntry** - `needToReadDistanceBits` flag, `symbolCount`, packed symbols
-2. **DISTANCE_OFFSET** - Combine length+distance in symbol space
-3. **Marker-based parallel** - Find block boundaries, decode in parallel
-
-### What We Have That They Don't
-1. **Vector Huffman infrastructure** - 8-lane SIMD ready (`src/vector_huffman.rs`)
-2. **JIT table cache** - Framework for caching compiled tables
-3. **Unified table** - Single table for all symbol types (`src/unified_table.rs`)
-4. **Speculative batch** - CPU-speculative-execution inspired decode
-
-## Files to Study
-
-| File | Purpose | Priority |
-|------|---------|----------|
-| `src/libdeflate_decode.rs` | Current best decoder | ⭐⭐⭐⭐⭐ |
-| `src/libdeflate_entry.rs` | Entry format definitions | ⭐⭐⭐⭐ |
-| `src/unified_table.rs` | Novel unified approach | ⭐⭐⭐⭐ |
-| `src/vector_huffman.rs` | SIMD infrastructure | ⭐⭐⭐⭐ |
-| `libdeflate/lib/decompress_template.h` | libdeflate's implementation | ⭐⭐⭐⭐⭐ |
-| `rapidgzip/huffman/HuffmanCodingShortBitsMultiCached.hpp` | rapidgzip's optimization | ⭐⭐⭐⭐ |
-
-## Test Commands
-
-```bash
-# Correctness
-cargo test --release
-cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt --check
-
-# Performance (CI is authoritative, these are for rapid iteration)
-gzippy-dev ci triage          # Live gap analysis from CI
-gzippy-dev ci push            # Full CI cycle with auto-comparison
-gzippy-dev ci vs-main         # Branch vs main
-
-# Devtool tests
-cd tools/devtool && cargo test && cargo clippy --all-targets -- -D warnings
-```
-
-## Commit Guidelines
-
-1. Every commit must pass clippy and cargo fmt
-2. Performance changes must cite CI results (not local benchmarks)
-3. Use conventional commits: `feat:`, `fix:`, `perf:`, `refactor:`
-
-## Remember
-
-- **CI is the source of truth** — local benchmarks are for rapid iteration only
-- **One change at a time** — push, check CI, iterate
-- **arm64 CI is noisy** — CV 0.2-0.3 on small files, >10% swings are normal
-- **Program the tool, then use the tool** — don't do manual analysis
-- **Simpler is often faster** — micro-optimizations frequently regress on CI
+| File | Role |
+|------|------|
+| `src/decompression.rs` | Decompression entry, format detect, routing |
+| `src/bgzf.rs` | BGZF/multi-member parallel (8400 lines, core engine) |
+| `src/isal_decompress.rs` | ISA-L streaming inflate (x86_64) |
+| `src/compression.rs` | Compression entry |
+| `src/parallel_compress.rs` | Parallel BGZF compression |
+| `src/consume_first_decode.rs` | Experimental pure Rust inflate (NOT production) |
