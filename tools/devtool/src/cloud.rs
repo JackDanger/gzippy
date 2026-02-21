@@ -336,13 +336,16 @@ sudo -u {SSH_USER} bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rust
 
 echo "=== Cloning gzippy at {commit} ==="
 cd /home/{SSH_USER}
-sudo -u {SSH_USER} git clone --recursive {repo_url} gzippy
+sudo -u {SSH_USER} git clone {repo_url} gzippy
 cd gzippy
 sudo -u {SSH_USER} git checkout {commit}
-sudo -u {SSH_USER} git submodule update --init --recursive
+# Init only the submodules we need (skip gzip — its gnulib sub-submodule uses git:// which is blocked)
+for mod in isa-l libdeflate pigz rapidgzip zopfli; do
+    sudo -u {SSH_USER} git submodule update --init --recursive "$mod" || true
+done
 
-echo "=== Building all tools ==="
-sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && ./scripts/build-tools.sh --all'
+echo "=== Building competitor tools ==="
+sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && ./scripts/build-tools.sh --pigz --rapidgzip --igzip --libdeflate --zopfli'
 
 echo "=== Building gzippy-dev ==="
 sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target'
