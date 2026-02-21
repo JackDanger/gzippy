@@ -1149,7 +1149,12 @@ fn git_output(args: &[&str]) -> Result<String, String> {
 }
 
 fn cargo_build_release() -> Result<(), String> {
-    let output = Command::new("cargo").args(["build", "--release"]).output()
+    let mut args = vec!["build", "--release"];
+    if cfg!(target_arch = "x86_64") {
+        args.push("--features");
+        args.push("isal-compression");
+    }
+    let output = Command::new("cargo").args(&args).output()
         .map_err(|e| format!("cargo build: {e}"))?;
     if !output.status.success() {
         return Err(format!("cargo build failed:\n{}", String::from_utf8_lossy(&output.stderr)));

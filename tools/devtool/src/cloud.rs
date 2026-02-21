@@ -399,7 +399,11 @@ echo "=== Building competitor tools ==="
 sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && ./scripts/build-tools.sh --pigz --rapidgzip --igzip --libdeflate --zopfli'
 
 echo "=== Building gzippy + gzippy-dev ==="
-sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && cargo build --release'
+ISAL_FLAG=""
+if [ "$(uname -m)" = "x86_64" ]; then
+    ISAL_FLAG="--features isal-compression"
+fi
+sudo -u {SSH_USER} bash -c "source \$HOME/.cargo/env && cargo build --release $ISAL_FLAG"
 sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target'
 
 echo "=== Preparing benchmark data ==="

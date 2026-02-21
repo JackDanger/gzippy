@@ -29,6 +29,7 @@ mod golden_tests;
 mod inflate_tables;
 mod isal;
 mod isal_compress;
+mod isal_decompress;
 mod jit_decode;
 mod libdeflate_decode;
 mod libdeflate_entry;

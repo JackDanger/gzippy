@@ -338,8 +338,8 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     match format {
         CompressionFormat::Gzip | CompressionFormat::Zip => {
             let is_bgzf = has_bgzf_markers(input_data);
-            let can_parallelize =
-                args.processes > 1 && (is_bgzf || is_likely_multi_member(input_data));
+            let is_multi = !is_bgzf && is_likely_multi_member(input_data);
+            let can_parallelize = args.processes > 1 && (is_bgzf || is_multi);
 
             if is_bgzf {
                 let threads = if can_parallelize { args.processes } else { 1 };
@@ -347,6 +347,17 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             } else if can_parallelize {
                 let output = decompress_gzip_to_vec(input_data, args.processes)?;
                 writer.write_all(&output)?;
+            } else if !is_multi && crate::isal_decompress::is_available() {
+                // x86_64 ISA-L inflate: AVX2/AVX-512 Huffman + vpclmulqdq CRC32
+                let isize_hint = read_gzip_isize(input_data).unwrap_or(0) as usize;
+                match crate::isal_decompress::decompress_gzip(input_data, isize_hint) {
+                    Some(output) => {
+                        writer.write_all(&output)?;
+                    }
+                    None => {
+                        decompress_multi_member_sequential(input_data, &mut writer)?;
+                    }
+                }
             } else {
                 decompress_multi_member_sequential(input_data, &mut writer)?;
             }
@@ -564,11 +575,17 @@ fn decompress_single_member<W: Write + Send>(
     writer: &mut W,
     _num_threads: usize,
 ) -> GzippyResult<u64> {
-    // Two-pass parallel (scan + re-decode) was tried but the scan pass costs
-    // as much as full decode, making total work 2x. Net slower at 4 threads.
-    // Keeping sequential libdeflate as the fastest single-member path.
-    // Future: scan-only decoder (no output writes) could make scan 2x faster,
-    // enabling profitable pipelining at 4+ threads.
+    // On x86_64 with ISA-L: use ISA-L inflate (AVX2/AVX-512 Huffman decode,
+    // vpclmulqdq CRC32). 45-56% faster than libdeflate on repetitive data.
+    if crate::isal_decompress::is_available() {
+        let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
+        if let Some(output) = crate::isal_decompress::decompress_gzip(data, isize_hint) {
+            let len = output.len() as u64;
+            writer.write_all(&output)?;
+            writer.flush()?;
+            return Ok(len);
+        }
+    }
     decompress_single_member_libdeflate(data, writer)
 }
 

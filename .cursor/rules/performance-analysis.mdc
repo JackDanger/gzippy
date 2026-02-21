@@ -84,25 +84,55 @@ gzippy-dev cloud bench                # 2. Authoritative cloud fleet numbers
 # read cloud-results.json for structured results
 ```
 
-## Current Status: Decompression 18/36 Wins (Feb 20 2026)
+## Current Status: ~36W / ~36L (Feb 21 2026, Cloud Fleet - partial 10/12)
 
-### Decompression Wins
-- **BGZF — ALL 12 WINS** (T1 + Tmax, both arches): +8% to +155% vs best
-- **arm64 non-BGZF T1 — 6 WINS**: gzippy beats all competitors on ARM T1
+### Decompression: 18 WINS / 18 LOSSES
 
-### Decompression Losses (18)
+**WINS (18):**
+- **BGZF — ALL 12** (T1 + Tmax, both arches): +4% to +167% vs best
+- **arm64 non-BGZF T1 — ALL 6**: +7% to +76% vs rapidgzip/unpigz
+- **x86_64 non-BGZF T1 — 0** (igzip beats us on all non-BGZF)
 
-**Category 1: x86 T1 vs igzip (6 losses)**
-igzip's AVX-512 Huffman decode + vpclmulqdq CRC32 gives 2x on repetitive data.
+**LOSSES (18):**
+- x86_64 non-BGZF T1 vs igzip (6): igzip's AVX-512 CRC32 + Huffman gives 5-58% lead
+- All non-BGZF Tmax (12): rapidgzip parallelizes single-member; gzippy is sequential
+  - Note: pigz output IS single-member (not multi-member as previously assumed!)
 
-**Category 2: All non-BGZF Tmax (12 losses)**
-rapidgzip parallelizes single-member gzip. gzippy falls back to sequential.
-Requires dedicated block-finder + decoder architecture (not yet implemented).
+### Compression: 18+ WINS / ~6 LOSSES (2 instances still running)
 
-### Compression Status
-Compression benchmarks now measured but not yet cloud-validated. Local Mac shows:
-- T1: gzippy wins at all levels
-- Tmax: gzippy loses to pigz at L1 (pigz has better thread scaling)
+**WINS:**
+- ALL T1 (all datasets, levels, both arches) except x86 L1 vs igzip
+- ARM Tmax L6/L9 (all datasets)
+- x86 Tmax L9 (all datasets)
+
+**LOSSES:**
+- L1 Tmax: pigz 3.5x scaling vs gzippy 1.2-1.3x scaling (block overhead)
+- x86 L6 Tmax: pigz slightly faster on software (-11%)
+
+### Key Findings from Cloud Fleet (Feb 21 2026)
+
+**Critical discovery: pigz output is SINGLE-MEMBER gzip.**
+Phase 2 (multi-member parallel decompression) was based on a wrong assumption.
+All pigz-format losses are actually the same root cause as gzip-format losses:
+no single-member parallel decompression. The 6 Phase 2 losses merge into Phase 4.
+
+**Fixed: multi-member scan was doing 2x work.**
+`scan_member_boundaries_exact` fully decompressed every member to find boundaries,
+then `decompress_multi_member_parallel` re-decompressed them. Replaced with O(N)
+magic-byte scan (`scan_member_boundaries_fast`). Fixes actual multi-member files
+(like concatenated gzip streams) but doesn't affect CI benchmarks (pigz/gzip are
+single-member).
+
+**Phase 3 (ISA-L inflate for x86 T1) implemented:**
+Added `isal_decompress.rs` with ISA-L decompression bindings gated behind
+`#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]`. Routes
+x86_64 single-member decompression through ISA-L's AVX2/AVX-512 inflate.
+Expected to close 6 x86 T1 decompression losses.
+
+**Compression L1 Tmax gap persists:**
+Block size increase from 256KB→4MB helped L6/L9 scaling but L1 Tmax is still
+1.2-1.3x vs pigz's 3.5x. Root cause: per-block overhead (hash table init,
+header/trailer writes, CRC32) dominates at L1's fast compression speeds.
 
 ## Optimization History: What Works vs What Doesn't
 
@@ -120,8 +150,23 @@ Compression benchmarks now measured but not yet cloud-validated. Local Mac shows
 | Approach | Result |
 |---|---|
 | Two-pass parallel (scan + re-decode) | 32% SLOWER (scan cost too high at 4 cores) |
+| Full-decompression boundary scan | 2x total work (scan decompresses, then parallel re-decompresses) |
 | Speculative parallel | Regressed arm64 by 15% |
+| Assuming pigz=multi-member | pigz output IS single-member; can't parallelize via member splitting |
 | Simulation benchmarks | Always lie about real-world perf |
 | EBS gp3 for benchmarks | 131 MB/s cap hides real differences |
 | Micro-optimizations in decode | LLVM already optimizes well |
 | Pre-allocated full output + serial write_all | 2x scaling, 53K page faults |
+
+## Cloud Fleet Resilience (Feb 21 2026)
+
+**Failure modes fixed:**
+- SSH command timeout (25min bench, 15s poll) — prevents indefinite hangs
+- Graceful degradation: failed instances are skipped, results from rest are collected
+- SG cleanup retries with exponential backoff (10/20/40s)
+- Progress counter: "3/12 complete, 0 failed" printed as instances finish
+- Setup failure isolation: one failed instance doesn't abort the fleet
+
+**Remaining concern:**
+- Silesia L9 compression takes ~15-20 minutes per instance (100 trials × 3 levels × slow speed)
+- This is the fleet bottleneck — consider reducing trial count for slow operations

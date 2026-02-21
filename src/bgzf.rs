@@ -2939,87 +2939,109 @@ fn decompress_bgzf_streaming<W: Write>(data: &[u8], writer: &mut W) -> io::Resul
 // Multi-Member Parallel Decompression (for pigz-style files)
 // ============================================================================
 
-/// Scan for all gzip member boundaries using SIMD-accelerated header detection.
-///
-/// Walks through the file using libdeflate to decompress each member (getting
-/// exact `input_consumed` values), building a list of member boundaries with
-/// pre-computed output offsets. This is a sequential scan but only reads
-/// headers/trailers — the actual decompression work happens in parallel later.
-///
-/// Returns None if the data is not multi-member or boundary detection fails.
-fn scan_member_boundaries_exact(data: &[u8]) -> Option<Vec<BgzfBlock>> {
-    use crate::libdeflate_ext::{DecompressError, DecompressorEx};
+/// Parse a gzip header starting at `data[offset..]`, returning the byte offset
+/// of the raw deflate data (past the header). Returns None if the header is
+/// malformed or extends past the given `end` bound.
+fn parse_gzip_header(data: &[u8], offset: usize, end: usize) -> Option<usize> {
+    if end - offset < 10 {
+        return None;
+    }
+    let mut ds = offset + 10;
+    let flg = data[offset + 3];
+    if flg & 0x04 != 0 {
+        if ds + 2 > end {
+            return None;
+        }
+        let xlen = u16::from_le_bytes([data[ds], data[ds + 1]]) as usize;
+        ds += 2 + xlen;
+    }
+    if flg & 0x08 != 0 {
+        while ds < end && data[ds] != 0 {
+            ds += 1;
+        }
+        ds += 1;
+    }
+    if flg & 0x10 != 0 {
+        while ds < end && data[ds] != 0 {
+            ds += 1;
+        }
+        ds += 1;
+    }
+    if flg & 0x02 != 0 {
+        ds += 2;
+    }
+    if ds >= end {
+        None
+    } else {
+        Some(ds)
+    }
+}
 
-    if data.len() < 18 || data[0] != 0x1f || data[1] != 0x8b {
+/// Fast O(N) member boundary scan for multi-member gzip files (pigz-style).
+///
+/// Scans for gzip magic bytes (0x1f 0x8b 0x08) with header validation to find
+/// member boundaries without any decompression. Reads ISIZE from each member's
+/// trailer for output pre-allocation. This replaces the old `scan_member_boundaries_exact`
+/// which fully decompressed every member (doing 2x total work).
+///
+/// Returns None if the data is not multi-member or boundaries look suspicious.
+fn scan_member_boundaries_fast(data: &[u8]) -> Option<Vec<BgzfBlock>> {
+    if data.len() < 18 || data[0] != 0x1f || data[1] != 0x8b || data[2] != 0x08 {
         return None;
     }
 
-    let mut members = Vec::new();
-    let mut offset = 0;
-    let mut output_offset = 0;
-    let mut decompressor = DecompressorEx::new();
+    let mut starts = vec![0usize];
+    let mut pos = 10; // skip past the first gzip header minimum
 
-    // Small trial buffer — we only need to know input_consumed, not the output.
-    // InsufficientSpace still gives us input_consumed on retry with larger buf.
-    // But gzip_decompress_ex doesn't return input_consumed on InsufficientSpace,
-    // so we need to actually decompress each member to get its boundary.
-    //
-    // Optimization: start with a buffer sized for typical pigz members (~128KB
-    // uncompressed) and grow only when needed.
-    let mut trial = vec![0u8; 192 * 1024];
-
-    while offset + 18 <= data.len() {
-        if data[offset] != 0x1f || data[offset + 1] != 0x8b {
-            break;
+    while pos + 10 < data.len() {
+        if data[pos] == 0x1f
+            && data[pos + 1] == 0x8b
+            && data[pos + 2] == 0x08
+            && data[pos + 3] & 0xE0 == 0
+        {
+            starts.push(pos);
         }
-
-        let remaining = &data[offset..];
-        let (input_consumed, output_size) = loop {
-            match decompressor.gzip_decompress_ex(remaining, &mut trial) {
-                Ok(result) => break (result.input_consumed, result.output_size),
-                Err(DecompressError::InsufficientSpace) => {
-                    trial.resize(trial.len() * 2, 0);
-                }
-                Err(DecompressError::BadData) => return None,
-            }
-        };
-
-        // Compute deflate data offset (skip gzip header)
-        let mut ds = offset + 10;
-        let flg = data[offset + 3];
-        if flg & 0x04 != 0 && ds + 2 <= data.len() {
-            let xlen = u16::from_le_bytes([data[ds], data[ds + 1]]) as usize;
-            ds += 2 + xlen;
-        }
-        if flg & 0x08 != 0 {
-            while ds < data.len() && data[ds] != 0 {
-                ds += 1;
-            }
-            ds += 1;
-        }
-        if flg & 0x10 != 0 {
-            while ds < data.len() && data[ds] != 0 {
-                ds += 1;
-            }
-            ds += 1;
-        }
-        if flg & 0x02 != 0 {
-            ds += 2;
-        }
-
-        members.push(BgzfBlock {
-            start: offset,
-            length: input_consumed,
-            isize: output_size as u32,
-            output_offset,
-            deflate_start: ds,
-        });
-
-        output_offset += output_size;
-        offset += input_consumed;
+        pos += 1;
     }
 
-    if members.len() < 2 {
+    if starts.len() < 2 {
+        return None;
+    }
+
+    let mut members = Vec::with_capacity(starts.len());
+    let mut output_offset = 0usize;
+
+    for i in 0..starts.len() {
+        let start = starts[i];
+        let end = if i + 1 < starts.len() {
+            starts[i + 1]
+        } else {
+            data.len()
+        };
+        let length = end - start;
+
+        if length < 18 {
+            return None;
+        }
+
+        let isize_val =
+            u32::from_le_bytes([data[end - 4], data[end - 3], data[end - 2], data[end - 1]]);
+
+        let deflate_start = parse_gzip_header(data, start, end)?;
+
+        members.push(BgzfBlock {
+            start,
+            length,
+            isize: isize_val,
+            output_offset,
+            deflate_start,
+        });
+
+        output_offset += isize_val as usize;
+    }
+
+    // Sanity: total output shouldn't be wildly disproportionate to input
+    if output_offset > data.len().saturating_mul(100) {
         return None;
     }
 
@@ -3040,7 +3062,7 @@ pub fn decompress_multi_member_parallel_to_vec(
     data: &[u8],
     num_threads: usize,
 ) -> io::Result<Vec<u8>> {
-    let members = scan_member_boundaries_exact(data).ok_or_else(|| {
+    let members = scan_member_boundaries_fast(data).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "Not a multi-member gzip file or boundary scan failed",

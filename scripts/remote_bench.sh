@@ -74,7 +74,11 @@ remote "git log --oneline -1"
 
 # Build
 echo -e "\n${YELLOW}Building release...${NC}"
-remote "cargo build --release 2>&1 | tail -3"
+ISAL_FLAG=""
+if ssh -i "$KEY" ubuntu@"$HOST" "uname -m" 2>/dev/null | grep -q x86_64; then
+    ISAL_FLAG="--features isal-compression"
+fi
+remote "cargo build --release $ISAL_FLAG 2>&1 | tail -3"
 
 # Verify binary works
 echo -e "\n${YELLOW}Verifying binary:${NC}"
