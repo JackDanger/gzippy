@@ -14,26 +14,45 @@ pub fn is_available() -> bool {
     cfg!(all(feature = "isal-compression", target_arch = "x86_64"))
 }
 
-/// Stream-decompress a gzip stream using ISA-L, writing directly to the writer.
-/// Avoids allocating a buffer for the entire decompressed output.
+/// Stream-decompress a gzip stream using ISA-L's raw stateful inflate,
+/// writing directly to the writer. Bypasses the isal-rs Decoder wrapper
+/// to eliminate Cursor and 16KB internal buffer copy overhead.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub fn decompress_gzip_stream<W: std::io::Write>(input: &[u8], writer: &mut W) -> Option<u64> {
-    use std::io::Read;
-    let cursor = std::io::Cursor::new(input);
-    let mut decoder = isal::read::Decoder::new(cursor, isal::Codec::Gzip);
+    use isal::isal_sys::igzip_lib as isal_raw;
 
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::IGZIP_GZIP;
+
+    state.avail_in = input.len() as u32;
+    state.next_in = input.as_ptr() as *mut u8;
+
+    let mut out_buf = vec![0u8; 1024 * 1024];
     let mut total = 0u64;
+
     loop {
-        match decoder.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if writer.write_all(&buf[..n]).is_err() {
-                    return None;
-                }
-                total += n as u64;
+        state.avail_out = out_buf.len() as u32;
+        state.next_out = out_buf.as_mut_ptr();
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        if ret != 0 {
+            return None;
+        }
+
+        let written = out_buf.len() - state.avail_out as usize;
+        if written > 0 {
+            if writer.write_all(&out_buf[..written]).is_err() {
+                return None;
             }
-            Err(_) => return None,
+            total += written as u64;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            break;
+        }
+        if written == 0 && state.avail_in == 0 {
+            break;
         }
     }
     Some(total)
