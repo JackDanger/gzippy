@@ -12,6 +12,9 @@ Every change must be benchmarked. Every optimization must be measured. Speed is 
 2. **BENCHMARK EVERYTHING** - Run `./bench-decompress.sh` after EVERY change
 3. **REVERT REGRESSIONS** - If performance drops, revert immediately and try something different
 4. **INTERNAL BENCH = CLI PATH** - Never report bench numbers for code not in the CLI binary
+5. **NEVER COMPROMISE PERFORMANCE** - No exception. No threshold below which a regression is acceptable.
+   Clippy suggestions, style improvements, readability changes — NONE of these justify ANY risk of
+   slower code in a hot path. Use `#[allow(clippy::...)]` and keep the fast construct. Every nanosecond matters.
 
 ## ⚠️ CRITICAL: Two Sets of Numbers (Feb 2026)
 

@@ -23,6 +23,20 @@
 - NEVER claim pure-Rust speed in docs unless it IS the production path
 - CI benchmarks exercise the SAME code that ships in binaries
 
+## 🚫 ABSOLUTE RULE: NEVER COMPROMISE PERFORMANCE
+
+**Performance is unconditional. There is no threshold below which a regression is acceptable.**
+
+- NEVER accept a clippy/lint suggestion that changes code in a hot path without first
+  verifying via `cargo asm` or benchmarks that it compiles to identical or faster machine code.
+  If in doubt, `#[allow(clippy::...)]` the lint and keep the faster construct.
+- NEVER reason that an overhead is "only X%" or "negligible." Every nanosecond counts.
+  If two constructs differ, choose the faster one regardless of style or lint preference.
+- NEVER change hot-path code to satisfy formatting, naming conventions, or readability
+  if the change has ANY chance of being slower. Add a comment explaining why instead.
+- Clippy is a servant, not a master. When clippy and performance conflict, performance wins
+  unconditionally. Suppress the lint with `#[allow(...)]` and move on.
+
 ## 🚫 ABSOLUTE RULE: NO NEW LIBDEFLATE FFI IN HOT PATHS
 
 We are BUILDING TOWARD replacing libdeflate. Do not add NEW libdeflate FFI calls.
@@ -217,6 +231,9 @@ The key to matching rapidgzip on arbitrary gzip files:
    every decoder to run through the entire remaining stream including BFINAL=1 at the very end.
 9. **Ratio probe single-stream fallback for compressible data** - Parallel BGZF blocks are
    always faster than single-stream even for highly compressible data. Removed in PR #42.
+10. **Speculative parallel in production with always-fail block finder** - Thread spawn + 16KB
+   block search per target caused -15% regression on arm64 (133→113 MB/s) even with "fast-fail"
+   safety. Never wire experimental parallel code into the hot path until it succeeds on real data.
 
 ## Build & Dependencies
 

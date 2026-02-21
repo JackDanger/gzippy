@@ -609,7 +609,8 @@ fn quick_block_check(deflate_data: &[u8], byte_pos: usize, bit_offset: u8) -> bo
             }
             // Complete prefix code has exactly 128 leaves (2^7).
             // Allow slightly incomplete codes (some encoders produce them).
-            nonzero >= 2 && (64..=128).contains(&allocated_leaves)
+            #[allow(clippy::manual_range_contains)]
+            { nonzero >= 2 && allocated_leaves >= 64 && allocated_leaves <= 128 }
         }
         _ => false,
     }
