@@ -43,14 +43,26 @@ const CLOSE_RACE_THRESHOLD: f64 = 3.0;
 // ─── AWS CLI ──────────────────────────────────────────────────────────────────
 
 fn aws(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("aws-vault")
-        .args(["exec", "personal", "-d", "12h", "--"])
-        .arg("aws")
-        .arg("--region")
-        .arg(REGION)
-        .args(args)
-        .output()
-        .map_err(|e| format!("Failed to run aws-vault: {e}"))?;
+    // If AWS credentials are already in the environment, call aws directly
+    let have_env_creds = std::env::var("AWS_ACCESS_KEY_ID").is_ok();
+
+    let output = if have_env_creds {
+        Command::new("aws")
+            .arg("--region")
+            .arg(REGION)
+            .args(args)
+            .output()
+            .map_err(|e| format!("Failed to run aws: {e}"))?
+    } else {
+        Command::new("aws-vault")
+            .args(["exec", "personal", "-d", "12h", "--"])
+            .arg("aws")
+            .arg("--region")
+            .arg(REGION)
+            .args(args)
+            .output()
+            .map_err(|e| format!("Failed to run aws-vault: {e}"))?
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -347,7 +359,8 @@ done
 echo "=== Building competitor tools ==="
 sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && ./scripts/build-tools.sh --pigz --rapidgzip --igzip --libdeflate --zopfli'
 
-echo "=== Building gzippy-dev ==="
+echo "=== Building gzippy + gzippy-dev ==="
+sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && cargo build --release'
 sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target'
 
 echo "=== Preparing benchmark data ==="
@@ -857,8 +870,10 @@ pub fn bench() -> Result<(), String> {
     println!("║  CLOUD BENCHMARK FLEET — {} INSTANCES (decompress + compress)           ║", n_instances);
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
 
-    let _ = Command::new("aws-vault").arg("--version")
-        .output().map_err(|_| "aws-vault not found")?;
+    if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
+        let _ = Command::new("aws-vault").arg("--version")
+            .output().map_err(|_| "aws-vault not found and no AWS_ACCESS_KEY_ID in env")?;
+    }
 
     let commit = cmd_output("git", &["rev-parse", "HEAD"])?;
     let commit_short = &commit[..8.min(commit.len())];
