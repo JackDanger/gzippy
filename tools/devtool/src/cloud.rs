@@ -44,7 +44,7 @@ const CLOSE_RACE_THRESHOLD: f64 = 3.0;
 
 fn aws(args: &[&str]) -> Result<String, String> {
     let output = Command::new("aws-vault")
-        .args(["exec", "personal", "--"])
+        .args(["exec", "personal", "-d", "12h", "--"])
         .arg("aws")
         .arg("--region")
         .arg(REGION)
