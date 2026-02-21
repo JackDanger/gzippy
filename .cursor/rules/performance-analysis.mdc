@@ -5,48 +5,44 @@ alwaysApply: true
 
 # Performance Analysis & Strategy (Feb 2026)
 
-## Current Status: 41W / 19L (Cloud Fleet, Feb 21 2026)
+## Current Status: 47W / 13L (Cloud Fleet, Feb 21 2026)
 
-### Decompression: 28 WINS / 12 LOSSES
+### Key Change: mmap stdin + BufWriter for parallel compression (+6 wins)
 
-**WINS (28):**
-- BGZF: ALL 12 scenarios (T1 + Tmax, both arches) — gzippy is dominant
-- arm64 non-BGZF T1: ALL 6 — +76-173% vs nearest competitor
-- x86 T1: logs-gzip, logs-pigz — exact parity with igzip
-- x86 T1: all BGZF — +7% to +100%+ vs igzip
+Eliminated `read_to_end` serial copy for multi-threaded. All compress threads
+now share mmap'd input (zero-copy). Single-threaded still uses read_to_end
+(sequential read-ahead avoids mmap page fault overhead).
 
-**Near-parity (4 losses, <1% gap, measurement noise):**
-- silesia-gzip T1: 594 vs igzip 597 (-0.5%)
-- silesia-pigz T1: 550 vs igzip 556 (-1.0%)
-- software-gzip T1: 2522 vs igzip 2528 (-0.2%)
-- software-pigz T1: 2277 vs igzip 2293 (-0.7%)
+### Decompression: 30 WINS / 10 LOSSES
 
-**Tmax single-member (8 losses, -18% to -41%):**
-No single-member parallel decompression. rapidgzip achieves 1.5-1.8x via
-dedicated block-finder + decoder thread pipeline.
+**WINS (30):** BGZF all 12, arm64 T1 all 6, x86 T1 most, x86 Tmax BGZF.
+**Near-parity (2 losses, <2%):**
+- silesia-pigz T1 x86: 572 vs igzip 577 (-0.8%)
+- software-pigz T1 x86: 2412 vs igzip 2459 (-1.9%)
 
-### Compression: 13 WINS / 7 LOSSES
+**Tmax single-member (8 losses, -23% to -40%):**
+All vs rapidgzip/unpigz. Needs pipeline architecture.
 
-**WINS:** ALL L6/L9, ALL silesia L1, ALL arm64 T1.
+### Compression: 17 WINS / 3 LOSSES
 
+**WINS:** ALL L6/L9, ALL silesia, ALL x86 Tmax, most arm64 Tmax.
 **Losses:**
-- L1 T1 vs igzip (2): igzip AVX-512 assembly (-62% to -73%)
-- L1/L6 Tmax scaling (5): pigz 3.5x vs gzippy 1.2-1.3x (-10% to -39%)
+- L1 T1 x86 vs igzip (2): AVX-512 assembly (-63% to -74%)
+- software L1 Tmax arm64 (1): -3.3% vs pigz (close, possibly fixable)
 
 ## Remaining Gaps Analysis
 
-### Closable (13 losses)
+### Possibly Closable (3 losses)
 | Gap | Approach |
 |-----|----------|
-| 4 x86 T1 decompress (<1%) | Already won — noise |
-| 5 L1/L6 Tmax compress scaling | Reduce per-block overhead (hash init, headers, CRC32) |
-| 4 of 8 Tmax decompress (short files) | Pipeline overhead may close for <50MB files |
+| 2 x86 T1 decompress near-parity (<2%) | Noise, may flip on rerun |
+| 1 arm64 software L1 Tmax compress (-3.3%) | ARM mmap may need madvise(WILLNEED) |
 
-### Hard to Close (6 losses)
+### Hard to Close (10 losses)
 | Gap | Why |
 |-----|-----|
 | 2 L1 T1 compress vs igzip | igzip uses AVX-512 hand-tuned assembly |
-| 4 Tmax decompress (silesia 211MB) | Needs pipeline architecture (block-finder + decoder threads) |
+| 8 Tmax decompress (single-member) | Needs pipeline architecture (block-finder + decoder threads) |
 
 ## Benchmark Architecture
 
@@ -64,17 +60,20 @@ dedicated block-finder + decoder thread pipeline.
 ### What WORKS
 | Approach | Result |
 |---|---|
+| **mmap stdin for multi-threaded compress** | +44% software L1 T4, beats pigz by 42-78% |
+| **BufWriter(1MB) for stdout** | Reduces syscall overhead for many-block output |
 | Direct ISA-L FFI (bypass wrapper crates) | Exact parity with igzip on x86 T1 |
 | BGZF-specific path at T1 | +31% (pre-parsed blocks, exact ISIZE alloc) |
 | Pipelined BGZF streaming | 2.88x scaling |
 | Per-thread reusable buffers | Stays in L2 cache |
 | 1MB streaming output buffer | Avoids 50K page faults from large alloc |
 | RAM-backed I/O (/dev/shm) | Reveals true CPU speed |
-| Parallel fleet (1 per arch×dataset×direction) | High precision, full parallelism |
 
 ### What DOESN'T WORK
 | Approach | Result |
 |---|---|
+| **mmap stdin for single-threaded** | 4x SLOWER (page faults without read-ahead) |
+| **Larger blocks for L1 (>4MB)** | No improvement — cold-start isn't the bottleneck |
 | Speculative parallel decode | -15% to -86% regression on real data |
 | Two-pass parallel (scan + re-decode) | 32% SLOWER (scan costs as much as full decode) |
 | Finding deflate block boundaries | Success rate <5% |
@@ -82,13 +81,12 @@ dedicated block-finder + decoder thread pipeline.
 | isal-rs Decoder wrapper | 16KB internal buffer copies cost 2-8% |
 | Assuming pigz = multi-member | pigz IS single-member |
 | Simulation benchmarks | Always lie about real-world perf |
-| Micro-optimizations in decode | LLVM already optimizes well at this level |
 
 ## Optimization History
 
-### Phase 1: Compression Scaling (DONE)
+### Phase 1: Compression Scaling (DONE → then REVISITED)
 Larger blocks (256KB→4MB), zero-copy stdin. Fixed L6/L9 scaling.
-L1 Tmax still lags (per-block overhead dominates at L1 speed).
+Phase 5 (mmap stdin) fixed the remaining L1 Tmax scaling gap.
 
 ### Phase 2: Multi-Member Decompression (N/A)
 Discovered pigz output is single-member. Implemented fast boundary scan
@@ -104,6 +102,14 @@ Three iterations to achieve igzip parity:
 8 Tmax losses remain. rapidgzip achieves 1.5-1.8x via dedicated
 block-finder + decoder thread pipeline. All previous attempts
 at speculative/two-pass parallel have regressed.
+
+### Phase 5: mmap stdin + BufWriter (DONE, Feb 21 2026)
+mmap stdin for multi-threaded compress eliminates serial read_to_end copy.
+Converted 6 losses to wins (5 compress Tmax + 1 decompress T1 precision).
+Result: 41W/19L → 47W/13L.
+
+Key finding: mmap HURTS single-threaded (4x slower due to page faults without
+read-ahead). Only use mmap when multiple threads will access the data.
 
 ## Cloud Fleet Operations
 

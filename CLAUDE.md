@@ -21,22 +21,23 @@ Input → decompression.rs
   └─ Single arm64?   → decompress_single_member_libdeflate (libdeflate FFI)
 ```
 
-## Score: 41W / 19L (Feb 2026, cloud fleet)
+## Score: 47W / 13L (Feb 21 2026, cloud fleet)
 
 | Category | Losses | Gap | Actionability |
 |----------|--------|-----|---------------|
-| x86 T1 decompress | 4 | <1% | Noise — effectively won |
-| Tmax single-member parallel | 8 | -18% to -41% | Major architecture needed |
-| L1 T1 compress vs igzip | 2 | -62% to -73% | AVX-512 assembly |
-| L1/L6 Tmax compress scaling | 5 | -10% to -39% | Thread scaling |
+| T1 decompress near-parity | 2 | <2% | Noise |
+| Tmax single-member parallel | 8 | -23% to -40% | Pipeline architecture |
+| L1 T1 compress vs igzip | 2 | -63% to -74% | AVX-512 assembly |
+| arm64 L1 Tmax compress | 1 | -3.3% | madvise or block tuning |
 
 ## Hard-Won Lessons
 
-**What works**: Direct FFI (not wrapper crates), BGZF parallel, 1MB streaming
-output buffer, ISIZE-based pre-allocation, lock-free parallel writes.
+**What works**: mmap stdin for multi-threaded (zero-copy, +44%), BufWriter for
+stdout, direct FFI, BGZF parallel, 1MB streaming buffer, lock-free parallel.
 
-**What doesn't**: Speculative parallel decode, two-pass scan-then-decode,
-deflate block finding, large pre-allocations (page faults), simulation benchmarks.
+**What doesn't**: mmap for single-threaded (4x slower from page faults!),
+larger blocks for L1 (no help), speculative parallel decode,
+two-pass scan-then-decode, large pre-allocations.
 
 ## Workflow
 
