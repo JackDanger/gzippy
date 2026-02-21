@@ -83,20 +83,20 @@ pub fn get_block_size_for_level(level: u32) -> usize {
 }
 
 /// Get optimal block size considering both level and file size
-/// This ensures we have enough blocks for parallelism (minimum 4*num_threads)
-/// while not having too many blocks that synchronization overhead dominates.
+/// This ensures we have enough blocks for parallelism while keeping per-block
+/// overhead low. At L1, libdeflate's hash table init is ~0.1ms per block,
+/// so fewer larger blocks scale much better.
 #[inline]
 pub fn get_optimal_block_size(level: u32, file_size: usize, num_threads: usize) -> usize {
     let base_block_size = get_block_size_for_level(level);
 
     // For L1-L2, dynamically size blocks based on file size
-    // Goal: ~8 blocks per thread for good load balancing, max 256KB blocks
+    // Goal: ~4 blocks per thread for good load balancing with minimal overhead
     if level <= 2 {
-        let target_blocks = num_threads * 8;
+        let target_blocks = (num_threads * 4).max(4);
         let dynamic_size = file_size / target_blocks;
-        // Clamp between 64KB (minimum for efficiency) and 256KB (maximum for L1-L2)
-        let clamped = dynamic_size.clamp(64 * 1024, 256 * 1024);
-        // Round up to 64KB boundary for alignment
+        // Min 256KB (efficiency), max 4MB (for good parallelism on large files)
+        let clamped = dynamic_size.clamp(256 * 1024, 4 * 1024 * 1024);
         (clamped + 65535) & !65535
     } else {
         base_block_size
@@ -173,6 +173,32 @@ impl ParallelGzEncoder {
         let _ = self.compress_parallel(&input_data, block_size, writer)?;
 
         Ok(bytes_read)
+    }
+
+    /// Compress a pre-read buffer directly, avoiding the extra copy from Reader→Vec.
+    /// Used by compress_stdin for zero-copy parallel compression.
+    pub fn compress_buffer<W: Write + Send>(&self, data: &[u8], writer: W) -> io::Result<u64> {
+        if data.is_empty() {
+            let zlib_level = self.compression_level.min(9);
+            let encoder = self.gz_builder().write(
+                writer,
+                Compression::new(adjust_compression_level(zlib_level)),
+            );
+            encoder.finish()?;
+            return Ok(0);
+        }
+
+        let block_size = self.calculate_block_size(data.len());
+
+        if self.compression_level <= 9 && (data.len() <= block_size || self.num_threads == 1) {
+            let mut w = writer;
+            return self
+                .compress_single_stream(data, &mut w)
+                .map(|_| data.len() as u64);
+        }
+
+        let _ = self.compress_parallel(data, block_size, writer)?;
+        Ok(data.len() as u64)
     }
 
     /// Build a flate2 GzBuilder with FNAME/MTIME/FCOMMENT from header_info
@@ -455,72 +481,73 @@ pub fn compress_block_bgzf_libdeflate(
 /// Compress a block using ISA-L for levels 0-3, with BGZF-style header.
 /// Uses the same header format as compress_block_bgzf_libdeflate so blocks
 /// from either compressor can be mixed.
+/// Compresses directly into the output buffer to avoid per-block allocation.
 fn compress_block_bgzf_isal(
     output: &mut Vec<u8>,
     block: &[u8],
     compression_level: u32,
     header_info: &GzipHeaderInfo,
 ) {
-    // ISA-L produces complete gzip members, but we need BGZF-style headers
-    // with block size markers. So we:
-    // 1. Use ISA-L to get the raw deflate data
-    // 2. Wrap it in our BGZF header format
-    match crate::isal_compress::compress_deflate(block, compression_level) {
-        Some(deflate_data) => {
-            output.clear();
-            let header_start = output.len();
+    output.clear();
+    let header_start = output.len();
 
-            // Build flags: FEXTRA always set, optionally FNAME and FCOMMENT
-            let mut flags: u8 = 0x04; // FEXTRA
-            if header_info.filename.is_some() {
-                flags |= 0x08;
-            }
-            if header_info.comment.is_some() {
-                flags |= 0x10;
-            }
+    let mut flags: u8 = 0x04; // FEXTRA
+    if header_info.filename.is_some() {
+        flags |= 0x08;
+    }
+    if header_info.comment.is_some() {
+        flags |= 0x10;
+    }
 
-            // Write gzip header
-            output.extend_from_slice(&[0x1f, 0x8b, 0x08, flags]);
-            output.extend_from_slice(&header_info.mtime.to_le_bytes());
-            output.extend_from_slice(&[0x00, 0xff]);
+    output.extend_from_slice(&[0x1f, 0x8b, 0x08, flags]);
+    output.extend_from_slice(&header_info.mtime.to_le_bytes());
+    output.extend_from_slice(&[0x00, 0xff]);
 
-            // FEXTRA: 8 bytes (2 ID + 2 len + 4 block size)
-            output.extend_from_slice(&[8, 0]);
-            output.extend_from_slice(&GZ_SUBFIELD_ID);
-            output.extend_from_slice(&[4, 0]);
-            let block_size_offset = output.len();
-            output.extend_from_slice(&[0, 0, 0, 0]); // placeholder
+    // FEXTRA: 8 bytes (2 ID + 2 len + 4 block size)
+    output.extend_from_slice(&[8, 0]);
+    output.extend_from_slice(&GZ_SUBFIELD_ID);
+    output.extend_from_slice(&[4, 0]);
+    let block_size_offset = output.len();
+    output.extend_from_slice(&[0, 0, 0, 0]); // placeholder
 
-            // FNAME
-            if let Some(ref name) = header_info.filename {
-                output.extend_from_slice(name.as_bytes());
-                output.push(0);
-            }
+    if let Some(ref name) = header_info.filename {
+        output.extend_from_slice(name.as_bytes());
+        output.push(0);
+    }
+    if let Some(ref comment) = header_info.comment {
+        output.extend_from_slice(comment.as_bytes());
+        output.push(0);
+    }
 
-            // FCOMMENT
-            if let Some(ref comment) = header_info.comment {
-                output.extend_from_slice(comment.as_bytes());
-                output.push(0);
-            }
+    // Compress deflate data directly into output buffer (no intermediate alloc)
+    let deflate_start = output.len();
+    let max_compressed = block.len() + block.len() / 10 + 256;
+    output.resize(deflate_start + max_compressed, 0);
 
-            // Deflate data from ISA-L
-            output.extend_from_slice(&deflate_data);
+    let compressed_len = crate::isal_compress::compress_deflate_into(
+        block,
+        &mut output[deflate_start..],
+        compression_level,
+    );
 
-            // CRC32 + ISIZE trailer
-            let crc32 = crc32fast::hash(block);
-            output.extend_from_slice(&crc32.to_le_bytes());
-            output.extend_from_slice(&(block.len() as u32).to_le_bytes());
-
-            // Write total block size
-            let total_block_size = output.len() - header_start;
-            output[block_size_offset..block_size_offset + 4]
-                .copy_from_slice(&(total_block_size as u32).to_le_bytes());
+    match compressed_len {
+        Some(actual_len) => {
+            output.truncate(deflate_start + actual_len);
         }
         None => {
             // Fall back to libdeflate if ISA-L fails
             compress_block_bgzf_libdeflate(output, block, compression_level, header_info);
+            return;
         }
     }
+
+    let crc32 = crc32fast::hash(block);
+    output.extend_from_slice(&crc32.to_le_bytes());
+    output.extend_from_slice(&(block.len() as u32).to_le_bytes());
+
+    let total_block_size = output.len() - header_start;
+    output[block_size_offset..block_size_offset + 4]
+        .copy_from_slice(&(total_block_size as u32).to_le_bytes());
 }
 
 /// Split data into rsyncable blocks using a rolling hash.

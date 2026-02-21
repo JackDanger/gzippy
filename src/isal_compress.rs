@@ -64,7 +64,21 @@ pub fn compress_deflate(data: &[u8], level: u32) -> Option<Vec<u8>> {
 }
 
 #[cfg(not(feature = "isal-compression"))]
+#[allow(dead_code)]
 pub fn compress_deflate(_data: &[u8], _level: u32) -> Option<Vec<u8>> {
+    None
+}
+
+/// Compress data using ISA-L deflate directly into the provided output buffer
+/// starting at `offset`. Returns the number of compressed bytes written,
+/// or None if ISA-L is not available or compression fails.
+#[cfg(feature = "isal-compression")]
+pub fn compress_deflate_into(data: &[u8], output: &mut [u8], level: u32) -> Option<usize> {
+    isal::compress_into(data, output, to_isal_level(level), isal::Codec::Deflate).ok()
+}
+
+#[cfg(not(feature = "isal-compression"))]
+pub fn compress_deflate_into(_data: &[u8], _output: &mut [u8], _level: u32) -> Option<usize> {
     None
 }
 

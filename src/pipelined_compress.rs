@@ -93,6 +93,24 @@ impl PipelinedGzEncoder {
         builder
     }
 
+    /// Compress a pre-read buffer directly, avoiding the extra copy from Reader→Vec.
+    pub fn compress_buffer<W: Write + Send>(&self, data: &[u8], writer: W) -> io::Result<u64> {
+        if data.is_empty() {
+            let encoder = self
+                .gz_builder()
+                .write(writer, Compression::new(self.compression_level));
+            encoder.finish()?;
+            return Ok(0);
+        }
+
+        if self.num_threads > 1 {
+            self.compress_parallel_pipeline(data, writer)?;
+        } else {
+            self.compress_sequential(data, writer)?;
+        }
+        Ok(data.len() as u64)
+    }
+
     /// Compress data with dictionary sharing
     pub fn compress<R: Read, W: Write + Send>(&self, mut reader: R, writer: W) -> io::Result<u64> {
         // Read all input data

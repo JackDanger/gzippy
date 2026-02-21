@@ -262,7 +262,7 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     let mut input = stdin();
     let output = stdout();
 
-    // For stdin, we need to buffer some data to detect content type
+    // Read all stdin into memory (needed for both content detection and compression)
     let mut buffer = Vec::new();
     let mut sample = vec![0u8; 8192];
     let bytes_read = input.read(&mut sample)?;
@@ -270,8 +270,6 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     if bytes_read > 0 {
         sample.truncate(bytes_read);
         buffer.extend_from_slice(&sample);
-
-        // Read the rest of stdin
         input.read_to_end(&mut buffer)?;
     }
 
@@ -282,7 +280,6 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         ContentType::Binary
     };
 
-    // Create optimization configuration
     let opt_config = OptimizationConfig::new(
         args.processes,
         file_size,
@@ -290,8 +287,34 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         content_type,
     );
 
-    let cursor = Cursor::new(buffer);
     let header_info = GzipHeaderInfo::default();
+
+    // For multi-threaded compression, pass the buffer directly to avoid a second
+    // copy through Cursor → read_to_end in the parallel encoder
+    if opt_config.thread_count > 1 {
+        let compression_level = args.compression_level as u32;
+        if args.compression_level >= 6 && args.compression_level <= 9 {
+            let mut encoder = crate::pipelined_compress::PipelinedGzEncoder::new(
+                compression_level,
+                opt_config.thread_count,
+            );
+            encoder.set_header_info(header_info);
+            encoder.compress_buffer(&buffer, output)?;
+        } else if args.compression_level >= 10 || args.compression_level <= 5 {
+            let mut encoder = crate::parallel_compress::ParallelGzEncoder::new(
+                compression_level,
+                opt_config.thread_count,
+            );
+            encoder.set_header_info(header_info);
+            encoder.compress_buffer(&buffer, output)?;
+        } else {
+            let cursor = Cursor::new(buffer);
+            compress_with_pipeline(cursor, output, args, &opt_config, &header_info)?;
+        }
+        return Ok(0);
+    }
+
+    let cursor = Cursor::new(buffer);
     let result = compress_with_pipeline(cursor, output, args, &opt_config, &header_info);
 
     match result {
