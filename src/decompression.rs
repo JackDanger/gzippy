@@ -197,6 +197,14 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             let len = output.len() as u64;
             writer.write_all(&output)?;
             Ok(len)
+        } else if !multi && crate::isal_decompress::is_available() {
+            if let Some(bytes) =
+                crate::isal_decompress::decompress_gzip_stream(&mmap[..], &mut writer)
+            {
+                Ok(bytes)
+            } else {
+                Ok(decompress_multi_member_sequential(&mmap[..], &mut writer)?)
+            }
         } else {
             match format {
                 CompressionFormat::Gzip | CompressionFormat::Zip => {
