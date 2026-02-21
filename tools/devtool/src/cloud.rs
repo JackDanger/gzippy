@@ -404,6 +404,14 @@ if [ "$(uname -m)" = "x86_64" ]; then
     ISAL_FLAG="--features isal-compression"
 fi
 sudo -u {SSH_USER} bash -c "source \$HOME/.cargo/env && cargo build --release $ISAL_FLAG"
+# Verify ISA-L NASM assembly was built (x86 only)
+if [ "$(uname -m)" = "x86_64" ]; then
+    ISAL_CONFIG=$(find /home/{SSH_USER}/gzippy/target/release/build/isal-sys-*/out/isa-l/config.log 2>/dev/null | head -1)
+    if [ -n "$ISAL_CONFIG" ]; then
+        echo "=== ISA-L build config ==="
+        grep -E "HAVE_NASM|USE_NASM" "$ISAL_CONFIG" || echo "NASM vars not found"
+    fi
+fi
 sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target'
 
 echo "=== Preparing benchmark data ==="

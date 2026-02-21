@@ -1,64 +1,47 @@
 ---
-description: Plan for converting 13 remaining losses to wins — prioritized, actionable
+description: Plan for converting remaining losses to wins — prioritized, actionable
 alwaysApply: true
 ---
 
-# Remaining 13 Losses → Plan (Feb 21 2026)
+# Remaining 15 Losses — Plan (Feb 21 2026)
 
-## Tier 1: Actionable Now (3 losses)
+## Summary: 45W / 15L
 
-### 1. arm64 software L1 Tmax compress: -3.3% vs pigz
-**gzippy 2099 vs pigz 2169**
-Root cause: mmap page faults on Graviton4 may be slower than read_to_end.
-Try: `madvise(MADV_WILLNEED | MADV_SEQUENTIAL)` on the mmap. Or: pre-touch
-pages with a parallel prefault sweep before compress threads start.
-Risk: Low — isolated to compress_stdin on arm64 multi-threaded.
+## Tier 1: Noise-Level (<3%, likely measurement variance) — 4 losses
+- silesia-pigz T1 x86: -1.3% vs igzip
+- software-pigz T1 x86: -0.5% vs igzip
+- logs-pigz T1 x86: -0.4% vs igzip
+- software-gzip T1 x86: -0.3% vs igzip
 
-### 2-3. x86 T1 decompress near-parity (2 losses)
-- silesia-pigz T1: 572 vs igzip 577 (-0.8%)
-- software-pigz T1: 2412 vs igzip 2459 (-1.9%)
-Root cause: measurement noise + possible BufWriter overhead on decompress output.
-Try: Check if decompression stdout path uses BufWriter. Verify ISA-L streaming
-is at full speed for pigz-format files (single-member — same as gzip).
-Risk: Very low — these oscillate between win/loss across runs.
+**Action**: None. These oscillate between WIN and LOSS across runs.
 
-## Tier 2: Unfixable Without Major Change (10 losses)
+## Tier 2: Small gap, fixable — 1 loss
+- arm64 software L1 Tmax: -2.1% vs pigz
 
-### 4-5. x86 L1 T1 compress vs igzip (2 losses, -63% to -74%)
-- logs L1 T1: 650 vs igzip 1773
-- software L1 T1: 737 vs igzip 2854
-Root cause: igzip uses AVX-512 hand-tuned assembly for L1 compression.
-Our x86 L1 T1 uses ISA-L via `compress_gzip_to_writer`. Same library but
-our wrapper may add overhead, or the ISA-L build may not enable AVX-512.
-Investigate: Check if ISA-L build enables AVX-512. Compare `igzip -1 -c`
-vs `gzippy -1 -p1 -c` directly on cloud fleet. If ISA-L build issue, fix.
-If fundamental, accept — igzip's standalone binary may statically dispatch
-to AVX-512 while our ISA-L binding doesn't.
+**Action**: Add `madvise(Sequential)` to mmap in L1 parallel compress path.
+Already implemented in code, awaiting next cloud run to verify.
 
-### 6-13. Tmax single-member parallel decompress (8 losses, -23% to -40%)
-All vs rapidgzip (6) or unpigz (2) on gzip/pigz archives at Tmax.
-Root cause: No parallel decompression for single-member files. gzip/pigz
-archives are single-member — our Tmax falls back to sequential libdeflate.
-rapidgzip achieves 1.5-2.5x via block-finder + marker-based parallel decode.
+## Tier 3: ISA-L build issue — 2 losses
+- x86 software L1 T1: -56.6% vs igzip (2325 MB/s)
+- x86 logs L1 T1: -45.4% vs igzip (1773 MB/s)
 
-**Architecture needed**: rapidgzip-style pipeline:
-1. Multiple threads speculatively find deflate block boundaries
-2. Each thread decodes with markers for unresolved back-references
-3. Markers resolved after preceding chunk completes
-4. Key: fast precode rejection (99.97% of positions in ~10 cycles)
+gzippy (1009 MB/s) uses isal-rs which vendors ISA-L 2.31.0. The igzip binary
+uses our submodule ISA-L 2.31.1 built with NASM assembly (verified by
+`Building ASM_NASM` in logs). The 2.3x gap suggests isal-sys's ISA-L was
+built WITHOUT NASM on the cloud fleet.
 
-Previous attempts (speculative, two-pass) failed because:
-- Block finding is unreliable (<5% success on complex data)
-- Two-pass costs as much as full decode
-- Passing full tail to decoders caused -86% regression
+**Action**: Diagnostic added to cloud user-data to check NASM detection in
+isal-sys build. If confirmed, fix by either:
+1. Ensuring NASM is in PATH during `cargo build` (likely already there)
+2. Using our submodule's pre-built ISA-L instead of isal-sys vendored copy
+3. Calling ISA-L directly via isal-sys FFI with our own library linkage
 
-This requires a fresh approach with dedicated scanner thread architecture.
-Estimated effort: 2-4 weeks. Estimated gain: +50-100% on 8 scenarios.
+## Tier 4: Architecture change needed — 8 losses
+All Tmax single-member decompress vs rapidgzip/unpigz (-19% to -37%).
 
-## Summary
+**Action**: Implement rapidgzip-style pipeline architecture:
+1. Dedicated block-finder threads using precode validation LUT
+2. Marker-based parallel decode
+3. Window propagation + marker resolution
 
-| Tier | Losses | Effort | Expected Gain |
-|------|--------|--------|---------------|
-| 1: Actionable now | 3 | 1-2 days | 47W → 50W |
-| 2a: ISA-L investigation | 2 | 1 day | Possibly 50W → 52W |
-| 2b: Pipeline architecture | 8 | 2-4 weeks | 52W → 60W |
+Estimated effort: 2-4 weeks. Previous attempts (speculative, two-pass) failed.

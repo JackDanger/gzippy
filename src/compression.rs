@@ -276,7 +276,11 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             .map(|m| m.file_type().is_file())
             .unwrap_or(false);
         let result = if is_regular {
-            unsafe { memmap2::Mmap::map(&meta) }.ok()
+            let m = unsafe { memmap2::Mmap::map(&meta) }.ok();
+            if let Some(ref mmap) = m {
+                let _ = mmap.advise(memmap2::Advice::Sequential);
+            }
+            m
         } else {
             None
         };

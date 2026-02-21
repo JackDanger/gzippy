@@ -1,123 +1,44 @@
 ---
-description: CI-driven performance workflow — cloud fleet is the source of truth
+description: Performance status and strategy — cloud fleet is source of truth
 alwaysApply: true
 ---
 
-# Performance Analysis & Strategy (Feb 2026)
+# Performance Status: 45W / 15L (Feb 21 2026)
 
-## Current Status: 47W / 13L (Cloud Fleet, Feb 21 2026)
+## Score Breakdown
 
-### Key Change: mmap stdin + BufWriter for parallel compression (+6 wins)
+| Category | W | L | Notes |
+|----------|---|---|-------|
+| Decompress BGZF (all) | 12 | 0 | Dominant |
+| Decompress T1 | 12 | 4 | 4 losses within 1.3% (noise) |
+| Decompress Tmax (non-BGZF) | 4 | 8 | No parallel single-member |
+| Compress L6/L9 | 12 | 0 | Dominant |
+| Compress L1 | 5 | 3 | 2 igzip assembly, 1 arm64 -2.1% |
 
-Eliminated `read_to_end` serial copy for multi-threaded. All compress threads
-now share mmap'd input (zero-copy). Single-threaded still uses read_to_end
-(sequential read-ahead avoids mmap page fault overhead).
+## What Changed This Session
 
-### Decompression: 30 WINS / 10 LOSSES
-
-**WINS (30):** BGZF all 12, arm64 T1 all 6, x86 T1 most, x86 Tmax BGZF.
-**Near-parity (2 losses, <2%):**
-- silesia-pigz T1 x86: 572 vs igzip 577 (-0.8%)
-- software-pigz T1 x86: 2412 vs igzip 2459 (-1.9%)
-
-**Tmax single-member (8 losses, -23% to -40%):**
-All vs rapidgzip/unpigz. Needs pipeline architecture.
-
-### Compression: 17 WINS / 3 LOSSES
-
-**WINS:** ALL L6/L9, ALL silesia, ALL x86 Tmax, most arm64 Tmax.
-**Losses:**
-- L1 T1 x86 vs igzip (2): AVX-512 assembly (-63% to -74%)
-- software L1 Tmax arm64 (1): -3.3% vs pigz (close, possibly fixable)
-
-## Remaining Gaps Analysis
-
-### Possibly Closable (3 losses)
-| Gap | Approach |
-|-----|----------|
-| 2 x86 T1 decompress near-parity (<2%) | Noise, may flip on rerun |
-| 1 arm64 software L1 Tmax compress (-3.3%) | ARM mmap may need madvise(WILLNEED) |
-
-### Hard to Close (10 losses)
-| Gap | Why |
-|-----|-----|
-| 2 L1 T1 compress vs igzip | igzip uses AVX-512 hand-tuned assembly |
-| 8 Tmax decompress (single-member) | Needs pipeline architecture (block-finder + decoder threads) |
-
-## Benchmark Architecture
-
-**Cloud fleet** (`gzippy-dev cloud bench`):
-- 12 instances: 6 x86_64 (c7i.4xlarge) + 6 arm64 (c8g.4xlarge)
-- 1 instance per (arch, dataset, direction) — fully parallel
-- RAM-backed I/O (/dev/shm) isolates CPU from EBS
-- Convergence: min 10, max 40 trials, target CV <3%
-- Strict scoring: gzippy must be >= EVERY competitor or it's a loss
-
-**Matrix**: 3 datasets × 3 archive types × 2 thread configs × 2 arches = 36 decompress + 36 compress = 72 scenarios.
+| Change | Effect |
+|--------|--------|
+| igzip benchmark now passes `-1` (was default L2) | igzip L1 compress slower → gap improved 74%→57% |
+| T1 ISA-L compress uses direct buffer (no double-read) | gzippy L1 T1 improved 37% (737→1009 MB/s) |
+| `gzippy-dev score` and `gzippy-dev losses` commands | Quick scorecard from cloud-results.json |
+| cloud-results.json now writes to repo root | Was writing to tools/devtool/ |
 
 ## Proven Strategies
 
-### What WORKS
 | Approach | Result |
 |---|---|
-| **mmap stdin for multi-threaded compress** | +44% software L1 T4, beats pigz by 42-78% |
-| **BufWriter(1MB) for stdout** | Reduces syscall overhead for many-block output |
-| Direct ISA-L FFI (bypass wrapper crates) | Exact parity with igzip on x86 T1 |
+| mmap stdin for multi-threaded compress | +44% Tmax, beats pigz by 42-78% |
+| BufWriter(1MB) for stdout | Reduces syscall overhead |
+| Direct ISA-L FFI for decompression | Exact parity with igzip on x86 T1 |
 | BGZF-specific path at T1 | +31% (pre-parsed blocks, exact ISIZE alloc) |
-| Pipelined BGZF streaming | 2.88x scaling |
-| Per-thread reusable buffers | Stays in L2 cache |
-| 1MB streaming output buffer | Avoids 50K page faults from large alloc |
-| RAM-backed I/O (/dev/shm) | Reveals true CPU speed |
+| Direct buffer → ISA-L (no Cursor double-read) | +37% for L1 T1 compress |
 
-### What DOESN'T WORK
+## What DOESN'T WORK
+
 | Approach | Result |
 |---|---|
-| **mmap stdin for single-threaded** | 4x SLOWER (page faults without read-ahead) |
-| **Larger blocks for L1 (>4MB)** | No improvement — cold-start isn't the bottleneck |
-| Speculative parallel decode | -15% to -86% regression on real data |
-| Two-pass parallel (scan + re-decode) | 32% SLOWER (scan costs as much as full decode) |
-| Finding deflate block boundaries | Success rate <5% |
-| Pre-allocated full output + write_all | 50K page faults = 55ms sys overhead |
-| isal-rs Decoder wrapper | 16KB internal buffer copies cost 2-8% |
-| Assuming pigz = multi-member | pigz IS single-member |
-| Simulation benchmarks | Always lie about real-world perf |
-
-## Optimization History
-
-### Phase 1: Compression Scaling (DONE → then REVISITED)
-Larger blocks (256KB→4MB), zero-copy stdin. Fixed L6/L9 scaling.
-Phase 5 (mmap stdin) fixed the remaining L1 Tmax scaling gap.
-
-### Phase 2: Multi-Member Decompression (N/A)
-Discovered pigz output is single-member. Implemented fast boundary scan
-for actual multi-member files. pigz losses merge into Phase 4.
-
-### Phase 3: ISA-L x86 T1 Decompression (DONE)
-Three iterations to achieve igzip parity:
-1. Buffered (full pre-alloc): -20% (page faults)
-2. isal-rs Decoder streaming: -2% to -8% (wrapper overhead)
-3. Direct isal_sys FFI: **exact parity** (zero overhead)
-
-### Phase 4: Single-Member Parallel Decompression (OPEN)
-8 Tmax losses remain. rapidgzip achieves 1.5-1.8x via dedicated
-block-finder + decoder thread pipeline. All previous attempts
-at speculative/two-pass parallel have regressed.
-
-### Phase 5: mmap stdin + BufWriter (DONE, Feb 21 2026)
-mmap stdin for multi-threaded compress eliminates serial read_to_end copy.
-Converted 6 losses to wins (5 compress Tmax + 1 decompress T1 precision).
-Result: 41W/19L → 47W/13L.
-
-Key finding: mmap HURTS single-threaded (4x slower due to page faults without
-read-ahead). Only use mmap when multiple threads will access the data.
-
-## Cloud Fleet Operations
-
-```bash
-source .env                          # AWS credentials
-gzippy-dev cloud bench               # Launch fleet, benchmark, collect results
-# Results in cloud-results.json
-```
-
-Fleet creates 12 instances, runs benchmarks in parallel, collects JSON results,
-and terminates all instances + security groups on completion.
+| mmap stdin for single-threaded | 4x SLOWER (page faults) |
+| Speculative parallel decode | -15% to -86% regression |
+| Two-pass parallel (scan + re-decode) | 32% SLOWER |
+| isal-rs wrapper crate for compress | 2.3x overhead vs direct igzip |
