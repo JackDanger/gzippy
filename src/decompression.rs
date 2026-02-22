@@ -197,14 +197,12 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             let len = output.len() as u64;
             writer.write_all(&output)?;
             Ok(len)
-        } else if !multi && crate::isal_decompress::is_available() {
-            if let Some(bytes) =
-                crate::isal_decompress::decompress_gzip_stream(&mmap[..], &mut writer)
-            {
-                Ok(bytes)
-            } else {
-                Ok(decompress_multi_member_sequential(&mmap[..], &mut writer)?)
-            }
+        } else if is_gzip {
+            Ok(decompress_single_member(
+                &mmap[..],
+                &mut writer,
+                args.processes,
+            )?)
         } else {
             match format {
                 CompressionFormat::Gzip | CompressionFormat::Zip => {
@@ -355,13 +353,8 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             } else if can_parallelize {
                 let output = decompress_gzip_to_vec(input_data, args.processes)?;
                 writer.write_all(&output)?;
-            } else if !is_multi && crate::isal_decompress::is_available() {
-                if crate::isal_decompress::decompress_gzip_stream(input_data, &mut writer).is_none()
-                {
-                    decompress_multi_member_sequential(input_data, &mut writer)?;
-                }
             } else {
-                decompress_multi_member_sequential(input_data, &mut writer)?;
+                decompress_single_member(input_data, &mut writer, args.processes)?;
             }
         }
         CompressionFormat::Zlib => {
@@ -567,16 +560,37 @@ fn is_multi_member_quick(data: &[u8]) -> bool {
 
 /// Decompress a single-member gzip file.
 ///
-/// Uses libdeflate FFI (fastest available). Parallel single-member via
-/// `rapidgzip_decoder` is not yet activated because our pure-Rust inflate
-/// (~100 MB/s per chunk) is too slow to beat sequential libdeflate (~250 MB/s)
-/// even at 4 threads once overhead is accounted for. When we wire in
-/// libdeflate-per-chunk in `rapidgzip_decoder`, re-enable parallel here.
-fn decompress_single_member<W: Write + Send>(
+/// For Tmax (num_threads > 1) and large files, uses two-pass parallel:
+///   Pass 1: Fast sequential scan to find block boundaries + 32KB windows
+///   Pass 2: Parallel re-decode of chunks using windows as dictionaries
+///
+/// For T1 or small files, uses libdeflate/isal sequential (fastest available).
+fn decompress_single_member<W: Write>(
     data: &[u8],
     writer: &mut W,
-    _num_threads: usize,
+    num_threads: usize,
 ) -> GzippyResult<u64> {
+    // Try parallel two-pass for large single-member files at Tmax
+    if num_threads > 1 {
+        match crate::parallel_single_member::decompress_parallel(data, writer, num_threads) {
+            Ok(bytes) => {
+                if debug_enabled() {
+                    eprintln!("[gzippy] parallel single-member: {} bytes", bytes);
+                }
+                writer.flush()?;
+                return Ok(bytes);
+            }
+            Err(e) => {
+                if debug_enabled() {
+                    eprintln!(
+                        "[gzippy] parallel single-member failed ({}), falling back to sequential",
+                        e
+                    );
+                }
+            }
+        }
+    }
+
     if crate::isal_decompress::is_available() {
         if let Some(bytes) = crate::isal_decompress::decompress_gzip_stream(data, writer) {
             writer.flush()?;
@@ -1417,4 +1431,26 @@ fn test_is_multi_member_quick_timing() {
     let start = std::time::Instant::now();
     let result = is_multi_member_quick(&data);
     eprintln!("is_multi_member_quick: {} in {:?}", result, start.elapsed());
+}
+
+// Test-only public wrappers for internal functions
+#[cfg(test)]
+pub fn is_likely_multi_member_pub(data: &[u8]) -> bool {
+    is_likely_multi_member(data)
+}
+
+#[cfg(test)]
+pub fn decompress_multi_member_sequential_pub<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> GzippyResult<u64> {
+    decompress_multi_member_sequential(data, writer)
+}
+
+#[cfg(test)]
+pub fn decompress_single_member_libdeflate_pub<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> GzippyResult<u64> {
+    decompress_single_member_libdeflate(data, writer)
 }

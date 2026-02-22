@@ -682,11 +682,6 @@ macro_rules! debug_write {
     };
 }
 
-#[cfg(not(feature = "debug_decode"))]
-macro_rules! debug_write {
-    ($out_pos:expr, $($arg:tt)*) => {};
-}
-
 /// Libdeflate-style optimized decoder
 /// Key differences from baseline:
 /// 1. `bitsleft -= entry` (garbage in high bits allowed)
@@ -952,17 +947,6 @@ fn decode_huffman_libdeflate_style(
                             continue;
                         }
 
-                        // Pack 4 literals into a u32 and write at once
-                        debug_write!(
-                            out_pos,
-                            "LIT4 pos={} val={:02x},{:02x},{:02x},{:02x} bitsleft={}",
-                            out_pos,
-                            lit1,
-                            lit2,
-                            lit3,
-                            lit4,
-                            bitsleft as u8
-                        );
                         let packed = (lit1 as u32)
                             | ((lit2 as u32) << 8)
                             | ((lit3 as u32) << 16)
@@ -987,15 +971,6 @@ fn decode_huffman_libdeflate_style(
                     continue;
                 }
 
-                // 2 literals - pack into u16
-                debug_write!(
-                    out_pos,
-                    "LIT2 pos={} val={:02x},{:02x} bitsleft={}",
-                    out_pos,
-                    lit1,
-                    lit2,
-                    bitsleft as u8
-                );
                 let packed = (lit1 as u16) | ((lit2 as u16) << 8);
                 unsafe {
                     (out_ptr.add(out_pos) as *mut u16).write_unaligned(packed);
@@ -1008,14 +983,6 @@ fn decode_huffman_libdeflate_style(
                 continue;
             }
 
-            // Single literal
-            debug_write!(
-                out_pos,
-                "LIT1 pos={} val={:02x} bitsleft={}",
-                out_pos,
-                lit1,
-                bitsleft as u8
-            );
             unsafe {
                 *out_ptr.add(out_pos) = lit1;
             }
@@ -1029,65 +996,6 @@ fn decode_huffman_libdeflate_style(
 
         // Not a literal - check EXCEPTIONAL (subtable or EOB)
         if (entry & 0x8000) != 0 {
-            // HUFFDEC_EXCEPTIONAL
-            debug_write!(
-                out_pos,
-                "EXCEPTIONAL pos={} entry={:08x} bitbuf={:016x} bitsleft={}",
-                out_pos,
-                entry,
-                saved_bitbuf,
-                bitsleft as u8
-            );
-            // Dump the entry for literal 'F' (70 = 0x46) to see if it conflicts
-            #[cfg(feature = "debug_decode")]
-            {
-                DEBUG_POS.with(|pos| {
-                    if out_pos >= pos.get().saturating_sub(10) && out_pos <= pos.get() + 10 {
-                        DEBUG_LOG.with(|log| {
-                            if let Some(f) = log.borrow_mut().as_mut() {
-                                // Check main table entries that might contain 'F'
-                                writeln!(f, "  === CHECKING ENTRIES FOR LITERAL 'F' (70) ===").ok();
-                                for idx in 0..2048 {
-                                    let e = unsafe { (*litlen_ptr.add(idx)).raw() };
-                                    let is_lit = (e as i32) < 0;
-                                    if is_lit && ((e >> 16) & 0xFF) == 70 {
-                                        writeln!(f, "  main[{}] = {:08x} (LIT 'F')", idx, e).ok();
-                                    }
-                                }
-                                // Also check subtables for 'F'
-                                writeln!(f, "  === CHECKING ALL ENTRIES FOR LITERAL 'F' (70) ===")
-                                    .ok();
-                                // Check up to 4096 entries (main + subtables)
-                                for idx in 0..4096 {
-                                    let e = unsafe { (*litlen_ptr.add(idx)).raw() };
-                                    let is_lit = (e as i32) < 0;
-                                    if is_lit && ((e >> 16) & 0xFF) == 70 {
-                                        writeln!(f, "  entry[{}] = {:08x} (LIT 'F')", idx, e).ok();
-                                    }
-                                }
-                                // Find main table entries that are subtable pointers to ~2096
-                                writeln!(f, "  === CHECKING MAIN TABLE FOR SUBTABLES ===").ok();
-                                for idx in 0..2048 {
-                                    let e = unsafe { (*litlen_ptr.add(idx)).raw() };
-                                    let is_subtable = (e & 0xC000) == 0xC000; // EXCEPTIONAL + SUBTABLE_POINTER
-                                    if is_subtable {
-                                        let start = (e >> 16) as usize;
-                                        writeln!(
-                                            f,
-                                            "  main[{}] = {:08x} -> subtable {} (bits={})",
-                                            idx,
-                                            e,
-                                            start,
-                                            (e >> 8) & 0xF
-                                        )
-                                        .ok();
-                                    }
-                                }
-                            }
-                        });
-                    }
-                });
-            }
             if (entry & 0x2000) != 0 {
                 // HUFFDEC_END_OF_BLOCK
                 bits.bitbuf = bitbuf;
@@ -1100,59 +1008,7 @@ fn decode_huffman_libdeflate_style(
             let subtable_start = (entry >> 16) as usize;
             let subtable_bits = ((entry >> 8) & 0x3F) as u64;
             let sub_idx = (bitbuf & ((1u64 << subtable_bits) - 1)) as usize;
-            debug_write!(
-                out_pos,
-                "  SUBTABLE start={} bits={} sub_idx={} bitbuf={:016x}",
-                subtable_start,
-                subtable_bits,
-                sub_idx,
-                bitbuf
-            );
             entry = unsafe { (*litlen_ptr.add(subtable_start + sub_idx)).raw() };
-            debug_write!(out_pos, "  SUBTABLE_ENTRY={:08x}", entry);
-            // Dump all subtable entries for analysis
-            #[cfg(feature = "debug_decode")]
-            {
-                DEBUG_POS.with(|pos| {
-                    if out_pos >= pos.get().saturating_sub(10) && out_pos <= pos.get() + 10 {
-                        DEBUG_LOG.with(|log| {
-                            if let Some(f) = log.borrow_mut().as_mut() {
-                                writeln!(
-                                    f,
-                                    "  === DUMPING SUBTABLE {} (16 entries) ===",
-                                    subtable_start
-                                )
-                                .ok();
-                                for i in 0..16 {
-                                    let e = unsafe { (*litlen_ptr.add(subtable_start + i)).raw() };
-                                    let is_lit = (e as i32) < 0;
-                                    let is_except = (e & 0x8000) != 0;
-                                    let kind = if is_lit {
-                                        "LIT"
-                                    } else if is_except {
-                                        "EOB/SUB"
-                                    } else {
-                                        "LEN"
-                                    };
-                                    let symbol = if is_lit {
-                                        (e >> 16) & 0xFF
-                                    } else if !is_except {
-                                        (e >> 16) & 0x1FF
-                                    } else {
-                                        0
-                                    };
-                                    writeln!(
-                                        f,
-                                        "  subtable[{}] = {:08x} ({} symbol={})",
-                                        i, e, kind, symbol
-                                    )
-                                    .ok();
-                                }
-                            }
-                        });
-                    }
-                });
-            }
 
             let saved_sub = consume!(entry);
 
@@ -1209,40 +1065,16 @@ fn decode_huffman_libdeflate_style(
             refill_branchless_fast!();
             entry = lookup!();
 
-            // Fast copy
-            debug_write!(
-                out_pos,
-                "MATCH(sub) pos={} len={} dist={} bitsleft={}",
-                out_pos,
-                length,
-                distance,
-                bitsleft as u8
-            );
             out_pos = copy_match_fast(output, out_pos, distance, length);
             continue;
         }
 
-        // LENGTH CODE - Start distance lookup early to overlap with length computation
-        // The dist lookup uses post-consume bitbuf, length uses pre-consume saved_bitbuf
-        debug_write!(
-            out_pos,
-            "LENGTH pos={} entry={:08x} saved_bitbuf={:016x} bitsleft={}",
-            out_pos,
-            entry,
-            saved_bitbuf,
-            bitsleft as u8
-        );
-        let mut dist_entry = dist.lookup(bitbuf); // Start memory fetch
+        // LENGTH CODE - distance lookup overlaps with length computation
+        let mut dist_entry = dist.lookup(bitbuf);
 
         // Compute length while dist_entry fetch is in flight
         let length = (entry >> 16)
             + (extract_bits(saved_bitbuf, (entry as u8) as u32) >> ((entry >> 8) as u8)) as u32;
-        debug_write!(
-            out_pos,
-            "  length={} dist_entry={:08x}",
-            length,
-            dist_entry.raw()
-        );
 
         // Conditional refill after length computation
         if (bitsleft as u8) < 32 {
@@ -1276,15 +1108,6 @@ fn decode_huffman_libdeflate_style(
         refill_branchless_fast!();
         entry = lookup!();
 
-        // Fast copy
-        debug_write!(
-            out_pos,
-            "MATCH pos={} len={} dist={} bitsleft={}",
-            out_pos,
-            length,
-            distance,
-            bitsleft as u8
-        );
         out_pos = copy_match_fast(output, out_pos, distance, length);
     }
 

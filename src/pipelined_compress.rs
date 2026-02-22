@@ -311,20 +311,17 @@ impl PipelinedGzEncoder {
 
             let mut block_data = *block;
             loop {
+                let before_in = compress.total_in();
                 let before_out = compress.total_out();
                 let status = compress.compress(block_data, &mut output_buf, flush)?;
+                let consumed = (compress.total_in() - before_in) as usize;
                 let produced = (compress.total_out() - before_out) as usize;
 
                 if produced > 0 {
                     writer.write_all(&output_buf[..produced])?;
                 }
 
-                let before_in = compress.total_in();
-                let _ = compress.compress(&[], &mut [], FlushCompress::None);
-                let consumed = (compress.total_in() - before_in) as usize;
-                if consumed > 0 && consumed <= block_data.len() {
-                    block_data = &block_data[consumed..];
-                }
+                block_data = &block_data[consumed..];
 
                 match status {
                     Status::Ok if block_data.is_empty() && flush != FlushCompress::Finish => break,

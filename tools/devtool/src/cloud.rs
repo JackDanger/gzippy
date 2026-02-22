@@ -552,6 +552,31 @@ fn run_benchmarks_on(
     let ds_label = dataset.unwrap_or("all");
     let dir_label = direction;
 
+    // ISA-L compress diagnostic: run once before benchmarks on x86 compress instances
+    if direction == "compress" && label.contains("x86_64") {
+        println!("  [{label}] ISA-L compress diagnostic...");
+        let repo = format!("/home/{SSH_USER}/gzippy");
+        let diag_cmd = format!(
+            "cd {repo} && source $HOME/.cargo/env && \
+             echo '=== ISA-L build config ===' && \
+             (find target/release/build/isal-sys-*/out/isa-l/config.log -exec grep -E 'HAVE_NASM|nasm_cmd|result.*nasm|AS=|CCAS=|CFLAGS=' {{}} \\; 2>/dev/null || echo 'config.log not found') && \
+             echo '=== ISA-L compress micro-benchmark ===' && \
+             timeout 60 cargo test --release --features isal-compression bench_isal_compress_throughput -- --nocapture 2>&1 | tail -10 && \
+             echo '=== gzippy compress timing (software L1 T1) ===' && \
+             GZIPPY_DEBUG=1 ./target/release/gzippy -1 -c -p1 < /dev/shm/software.tar > /dev/null 2>&1 | head -5 && \
+             echo '=== igzip compress timing (software L1 T1) ===' && \
+             time ./bin/igzip -1 -c < /dev/shm/software.tar > /dev/null 2>&1"
+        );
+        match ssh_timeout(ip, key, &diag_cmd, Duration::from_secs(120)) {
+            Ok(output) => {
+                for line in output.lines() {
+                    println!("    {line}");
+                }
+            }
+            Err(e) => eprintln!("  [{label}] diagnostic failed (non-fatal): {e}"),
+        }
+    }
+
     println!("\n  [{label}] Phase 1: {dir_label} sweep {ds_label} ({SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.0}%, Tmax={BENCH_TMAX_THREADS})",
         SWEEP_TARGET_CV * 100.0);
 

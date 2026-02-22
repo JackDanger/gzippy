@@ -607,6 +607,33 @@ impl MarkerDecoder {
         }
     }
 
+    /// Decode until compressed bit position reaches max_bit OR output reaches max_output
+    /// OR stream ends (BFINAL=1). Used by parallel single-member to limit each chunk.
+    pub fn decode_until_bit(&mut self, max_output: usize, max_bit: usize) -> io::Result<bool> {
+        loop {
+            if self.output.len() >= max_output {
+                return Ok(false);
+            }
+            if self.bit_position() >= max_bit {
+                return Ok(false);
+            }
+
+            match self.decode_block() {
+                Ok(is_final) => {
+                    if is_final {
+                        return Ok(true);
+                    }
+                }
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::UnexpectedEof && !self.output.is_empty() {
+                        return Ok(true);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     /// Get number of markers in output
     pub fn marker_count(&self) -> usize {
         self.marker_count

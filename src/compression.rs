@@ -12,6 +12,13 @@ use crate::optimization::{detect_content_type, ContentType, OptimizationConfig};
 use crate::parallel_compress::GzipHeaderInfo;
 use crate::simple_optimizations::SimpleOptimizer;
 
+#[inline]
+fn debug_enabled() -> bool {
+    use std::sync::OnceLock;
+    static DEBUG: OnceLock<bool> = OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var("GZIPPY_DEBUG").is_ok())
+}
+
 pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     if filename == "-" {
         return compress_stdin(args);
@@ -355,7 +362,21 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         if args.verbosity >= 2 {
             eprintln!("gzippy: using ISA-L single-threaded compression (direct)");
         }
-        crate::isal_compress::compress_gzip_to_writer(input_data, output, compression_level)?;
+        if debug_enabled() {
+            let t0 = std::time::Instant::now();
+            crate::isal_compress::compress_gzip_to_writer(input_data, output, compression_level)?;
+            let elapsed = t0.elapsed();
+            let mbps = input_data.len() as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+            eprintln!(
+                "[gzippy] compress T1 ISA-L L{}: {:.1}ms, {:.1} MB/s ({} bytes in)",
+                compression_level,
+                elapsed.as_secs_f64() * 1000.0,
+                mbps,
+                input_data.len()
+            );
+        } else {
+            crate::isal_compress::compress_gzip_to_writer(input_data, output, compression_level)?;
+        }
         return Ok(0);
     }
 

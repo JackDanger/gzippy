@@ -119,11 +119,32 @@ pub fn compress_gzip_to_writer<W: std::io::Write>(
     mut writer: W,
     level: u32,
 ) -> std::io::Result<u64> {
+    let debug = std::env::var("GZIPPY_DEBUG").is_ok();
+    let t0 = std::time::Instant::now();
+
     let max_size = data.len() + data.len() / 10 + 256;
     let mut output = vec![0u8; max_size];
+    let t_alloc = t0.elapsed();
+
     let size = isal::compress_into(data, &mut output, to_isal_level(level), isal::Codec::Gzip)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let t_compress = t0.elapsed();
+
     writer.write_all(&output[..size])?;
+    let t_write = t0.elapsed();
+
+    if debug {
+        let alloc_ms = t_alloc.as_secs_f64() * 1000.0;
+        let compress_ms = (t_compress - t_alloc).as_secs_f64() * 1000.0;
+        let write_ms = (t_write - t_compress).as_secs_f64() * 1000.0;
+        let compress_mbps = data.len() as f64 / (t_compress - t_alloc).as_secs_f64() / 1_000_000.0;
+        let ratio = size as f64 / data.len() as f64 * 100.0;
+        eprintln!(
+            "[isal] L{} compress_gzip_to_writer: alloc={:.1}ms compress={:.1}ms ({:.0} MB/s) write={:.1}ms | {:.1}% ratio, {} → {} bytes",
+            level, alloc_ms, compress_ms, compress_mbps, write_ms, ratio, data.len(), size
+        );
+    }
+
     Ok(data.len() as u64)
 }
 
@@ -203,6 +224,61 @@ mod tests {
                 .gzip_decompress(&compressed, &mut output)
                 .expect("decompression failed");
             assert_eq!(&output[..size], &data[..]);
+        }
+    }
+
+    /// Micro-benchmark: raw ISA-L compress throughput, no I/O.
+    /// Run on cloud fleet to compare against standalone igzip.
+    #[test]
+    #[cfg(feature = "isal-compression")]
+    fn bench_isal_compress_throughput() {
+        use std::time::Instant;
+
+        // ~22MB of realistic data (similar to software/logs datasets)
+        let size = 22_000_000;
+        let mut data = Vec::with_capacity(size);
+        let mut rng: u64 = 0xdeadbeef;
+        while data.len() < size {
+            // Mix of compressible and incompressible: repeating patterns + noise
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let byte = if rng % 4 == 0 {
+                (rng >> 16) as u8
+            } else {
+                b"the quick brown fox jumps over the lazy dog "[(data.len() % 44)] as u8
+            };
+            data.push(byte);
+        }
+        let max_out = data.len() + data.len() / 10 + 256;
+        let mut output = vec![0u8; max_out];
+
+        for level in [0u32, 1, 3] {
+            // Warm up
+            let _ =
+                isal::compress_into(&data, &mut output, to_isal_level(level), isal::Codec::Gzip);
+
+            let iters = 10;
+            let start = Instant::now();
+            let mut compressed_size = 0;
+            for _ in 0..iters {
+                compressed_size = isal::compress_into(
+                    &data,
+                    &mut output,
+                    to_isal_level(level),
+                    isal::Codec::Gzip,
+                )
+                .unwrap();
+            }
+            let elapsed = start.elapsed();
+            let total = data.len() as f64 * iters as f64;
+            let mbps = total / elapsed.as_secs_f64() / 1_000_000.0;
+            let ratio = compressed_size as f64 / data.len() as f64 * 100.0;
+            eprintln!(
+                "[bench] ISA-L compress L{}: {:.0} MB/s ({:.1}ms per 22MB, {:.1}% ratio)",
+                level,
+                mbps,
+                elapsed.as_secs_f64() * 1000.0 / iters as f64,
+                ratio
+            );
         }
     }
 }
