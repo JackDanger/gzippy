@@ -1,80 +1,193 @@
 ---
-description: CI performance analysis and strategy for beating all tools (Feb 2026)
+description: Performance status and strategy — cloud fleet is source of truth
 alwaysApply: true
 ---
 
-# Performance Analysis & Strategy (Feb 2026)
+# Performance Status: 47W / 13L (Feb 21 2026, Fleet Run 3)
 
-## Tooling
+## Score Breakdown
 
-Use `gzippy-dev` (built at `tools/devtool/`) for all CI and perf work:
+| Category | W | L | Notes |
+|----------|---|---|-------|
+| Decompress BGZF (all) | 12 | 0 | Dominant |
+| Decompress T1 (all) | 15 | 3 | 3 losses within 1.2% (noise) |
+| Decompress Tmax (non-BGZF) | 4 | 8 | No parallel single-member |
+| Compress L6/L9 | 12 | 0 | Dominant |
+| Compress L1 | 4 | 2 | igzip AVX-512 assembly |
+
+## What Changed This Session
+
+| Change | Effect |
+|--------|--------|
+| madvise(Sequential) on mmap stdin | arm64 L1 Tmax compress: -2.1% → +0.5% (FLIPPED) |
+| igzip benchmark passes `-1` (was L2 default) | igzip compress gap: 74%→59%, 63%→42% |
+| T1 ISA-L uses direct buffer (no Cursor) | L1 T1 compress: 737→1160 MB/s (+57%) |
+| `gzippy-dev score` and `losses` commands | Quick scorecard from cloud-results.json |
+| silesia-gzip T1 x86 | -0.5% → +0.7% (FLIPPED) |
+| silesia-pigz T1 x86 | -0.8% → +0.2% (FLIPPED) |
+
+## Loss Categories
+
+### Noise (3 losses, <1.2%) — No action needed
+x86 T1 decompress vs igzip: oscillates between WIN and LOSS.
+
+### igzip L1 compress (2 losses, -42% to -59%)
+gzippy uses isal-rs which vendors ISA-L 2.31.0. The 2.5x gap suggests
+isal-sys's ISA-L may be built without NASM assembly even when NASM is
+installed. Standalone igzip uses our submodule built WITH NASM.
+
+### Tmax single-member parallel decompress (8 losses, -20% to -40%)
+Two-pass parallel implemented in `parallel_single_member.rs`:
+- Pass 1: scan_deflate_fast (sequential, records checkpoints + 32KB windows)
+- Pass 2: parallel re-decode chunks using checkpoint windows as dictionaries
+- Correctly produces byte-identical output
+- **BUT**: scan pass costs ~100% of sequential decode (both fully decode all blocks).
+  So total work = scan + decode/threads ≈ 1.25x sequential at 4 threads (SLOWER).
+  Gated behind MIN_THREADS_FOR_PARALLEL=8, won't activate on CI's 4-core machines.
+
+To actually close this gap, need one of:
+1. Pipeline architecture (block-finder thread feeds decoder threads concurrently)
+2. Scan pass that's significantly cheaper than full decode (skip output writes?)
+3. Speculative block finding (proven unreliable on complex data — <0.01% success)
+
+## Proven Strategies
+
+| Approach | Result |
+|---|---|
+| mmap stdin + madvise(Sequential) for Tmax compress | +44% on x86, fixes arm64 |
+| BufWriter(1MB) for stdout | Reduces syscall overhead |
+| Direct ISA-L FFI for decompression | Exact parity with igzip |
+| Direct buffer → ISA-L (skip Cursor double-read) | +57% for L1 T1 compress |
+| BGZF-specific path at T1 | +31% |
+
+## What Doesn't Work for Parallel Single-Member
+
+| Approach | Why it fails |
+|---|---|
+| Two-pass scan+redecode | Scan costs ~100% of sequential (both fully decode) |
+| Our block_finder on synthetic data | Tested wrong data, gave up too early |
+| Two-pass with libdeflate in pass 2 | libdeflate has no dictionary/resume API |
+| More threads (4→8→16) | Diminishing returns when scan is the bottleneck |
+
+## How Rapidgzip Actually Solves Parallel Single-Member (KEY INSIGHT)
+
+Studied rapidgzip source in detail. Their approach is fundamentally different
+from what we tried:
+
+1. **Partition-based guessing**: Guess block positions at regular spacing
+   (e.g., every 4 MiB). Don't scan — just GUESS.
+2. **LUT prefilter**: 13-15 bit lookup table eliminates ~97% of positions.
+   Checks: not-final-block, dynamic Huffman type, valid code counts.
+3. **Precode Kraft check**: Validates precode code lengths cheaply.
+4. **Try-decode validation**: Actually attempt to decode at each candidate.
+   Invalid positions throw exceptions — this is EXPECTED and CHEAP.
+5. **Limited search**: Only search 512 KiB per partition on failure. Bounded cost.
+6. **Markers for cross-boundary refs**: 16-bit markers replace back-references
+   into unknown data. Resolved when the preceding chunk's window is available.
+7. **Sequential orchestrator**: Chunks are post-processed in order (for window
+   propagation), but decode+replacement run in parallel thread pool.
+8. **Feedback**: Confirmed block offsets feed back into the block finder.
+
+**Why our approach failed**: We did a FULL SEQUENTIAL SCAN to find boundaries.
+This costs as much as a full decode. Rapidgzip GUESSES positions and validates
+cheaply, so the "finding" cost is negligible compared to actual decode work.
+
+**What we already have**: `marker_decode.rs` has working marker-based decode.
+`pipeline_tests.rs` proved oracle pipeline produces correct output. We just
+need a proper partition-guess-and-validate block finder + pipeline orchestrator.
+
+**False positives are fine**: Rapidgzip tracks `falsePositiveCount` as a stat.
+Invalid positions are caught by decode exceptions and cost only a few attempts.
+The 512 KiB search bound caps the worst case.
+
+## Pipeline Test Harness (`src/pipeline_tests.rs`)
+
+Layered oracle-verified test harness for building rapidgzip-style parallel
+single-member decompression. Uses `scan_deflate_fast` as ground truth.
+
+**Key findings from building the harness:**
+- `Bits.bitsleft` has garbage in high bits (libdeflate wrapping_sub pattern).
+  Use `(cp.bitsleft as u8) as usize` to get real bit count from checkpoints.
+- `MarkerDecoder` correctly decodes from any checkpoint when given the right
+  bit position and window — 13/13 checkpoints verified on synthetic, 665 on silesia.
+- Block finder has 16% precision / 67% recall on synthetic data (only finds
+  dynamic Huffman blocks, not stored/fixed).
+- Oracle pipeline (exact positions + windows) produces byte-identical output.
+  This proves the pipeline machinery (threading, ordering, marker resolution) works.
+- Spacing/adversarial pipelines degrade gracefully when block finder fails.
+
+## Oracle Test Harnesses (Feb 2026)
+
+Four test harnesses verify components independently with ground-truth oracles.
+All 278 tests pass (0 failures).
+
+### Pipeline Tests (`src/pipeline_tests.rs`) — 16 tests
+- `DeflateOracle` from `scan_deflate_fast` + sequential decode
+- Layer 1: MarkerDecoder with known boundaries (13/13 checkpoints pass)
+- Layer 2: Block finder precision (16%) / recall (67%) diagnostics
+- Layer 3: Chunk decoder (search + decode composition)
+- Layer 4: Pipeline with oracle/spacing/adversarial block sources
+- **Key finding**: `Bits.bitsleft` has garbage in high bits (libdeflate pattern).
+  Extract with `(cp.bitsleft as u8) as usize`.
+
+### Routing Tests (`src/routing_tests.rs`) — 8 tests
+- Creates BGZF, multi-member, single-member gzip from same input
+- Verifies format detection (`has_bgzf_markers`, `is_likely_multi_member`)
+- Each path (BGZF parallel, multi-member parallel/sequential, single-member
+  libdeflate) produces byte-identical output
+- Thread independence: BGZF T1-T8 all produce identical output
+
+### Inflate Oracle (`src/inflate_oracle_tests.rs`) — 7 tests
+- `consume_first` vs `libdeflate` correctness (byte-identical on silesia)
+- Per-pattern performance breakdown (ARM M3 numbers):
+
+  | Pattern | consume_first | libdeflate | Ratio |
+  |---|---|---|---|
+  | literals | 21,257 MB/s | 22,325 MB/s | 95.2% |
+  | rle | 51,064 MB/s | 33,200 MB/s | **153.8%** (WIN) |
+  | short_matches | 35,899 MB/s | 35,246 MB/s | **101.9%** (WIN) |
+  | mixed | 5,877 MB/s | 8,039 MB/s | 73.1% (GAP) |
+  | silesia (overall) | 1,225 MB/s | 1,366 MB/s | 89.7% |
+
+- **Key finding**: The gap is entirely in mixed literal+match patterns.
+  Literals, RLE, and short matches are at parity or faster.
+
+### Compression Oracle (`src/compress_oracle_tests.rs`) — 7 tests
+- Roundtrip correctness for all paths (libdeflate, parallel, pipelined)
+- Ratio comparison across 9 path/level combinations
+- Thread independence (parallel: <2% spread, pipelined: <1% spread)
+- **PipelinedGzEncoder T1 deadlock**: FIXED. Root cause was compress_sequential's
+  inner loop never advancing `block_data` (total_in captured AFTER compress call).
+  Fix: capture `before_in` BEFORE the compress call. All thread counts now work.
+
+## Session Findings (Feb 2026)
+
+### decode loop cleanup
+- Removed ~120 lines of `#[cfg(feature = "debug_decode")]` dump code from
+  the hot path in `consume_first_decode.rs`. These compiled to no-ops but
+  cluttered the source and made the fastloop hard to read.
+
+### Pure Rust inflate performance (ARM M3)
+- **94.5%** of libdeflate on silesia (1275 vs 1348 MB/s)
+- **133%** of libdeflate on literals, **158%** on RLE, **414%** on short_matches
+- Gap is in mixed literal+match patterns (77.9% on synthetic)
+- Per-block timing: 2637 dynamic blocks, average 1134 MB/s, slowest 100 MB/s
+- Remaining 5.5% gap needs inline assembly or LLVM-level work
+
+### Parallel single-member: why it doesn't help at 4 cores
+Tested both two-pass and pipelined approaches:
+- Two-pass: 508 MB/s (0.71x of sequential consume_first)
+- Pipelined (channels): 434 MB/s (0.61x — channel overhead)
+- Sequential libdeflate: 1348 MB/s
+Root cause: scan pass fully decodes the stream (same cost as sequential).
+Total work = scan + decode/threads ≈ 2x at 4 threads. Can't overcome 2x overhead.
+Pipelined is worse because rx.into_iter() blocks until scanner finishes anyway.
+Gated behind MIN_THREADS_FOR_PARALLEL=8.
+
+## Commands
+
 ```bash
-./gzippy-dev ci status              # Recent CI runs
-./gzippy-dev ci watch               # Block until CI completes, show results
-./gzippy-dev ci gaps --branch main  # Performance gap analysis
-./gzippy-dev bench --dataset NAME   # Local benchmark
-./gzippy-dev path file.gz           # Trace decompression path
+gzippy-dev score       # Current scorecard
+gzippy-dev losses      # Losses grouped by root cause
+source .env && gzippy-dev cloud bench  # Run fleet (~$0.50, ~20 min)
 ```
-
-## CI Benchmark Architecture
-
-**Platforms**: x86_64 (EPYC 4-core), arm64 (Graviton 4-core)
-**Datasets**: silesia (211MB), software (~22MB), logs (~22MB)
-**Archive types**: gzip (single-member), bgzf (gzippy format), pigz (single-member!)
-**Thread configs**: T1, Tmax (4)
-**Benchmark invocation**: stdin piped, stdout to file: `tool -d -p{N} < in.gz > out`
-
-## Critical Discoveries
-
-### Benchmark Uses Stdin Path
-CI benchmarks pipe stdin→tool→file. gzippy routes through `decompress_stdin`.
-
-### pigz Output Is Single-Member
-`pigz -1 -c` creates a **single gzip stream**, NOT multiple members. All Tmax
-gaps on pigz files are single-member parallel problems.
-
-### Double-Buffering Eliminated (PRs #49, #50)
-- PR #49: Added T1 fast-path for direct stdout writes
-- PR #50: Extended to ALL non-parallel paths (including Tmax single-member)
-- Key insight: the `Send` requirement for parallel writers is only needed when
-  actual parallelism occurs. Single-member files at Tmax run sequentially, so
-  `BufWriter<StdoutLock>` (not `Send`) works fine.
-
-## Current Gap Summary (PR #49 baseline, PR #50 pending)
-
-**76 wins, 47 gaps** across 123 comparisons.
-
-### Gap Categories
-
-**Category A: Tmax vs rapidgzip (15 gaps, 5 are >10%)**
-Largest gaps: silesia-gzip Tmax arm64 (-30%), x86 (-24%), silesia-pigz Tmax x86 (-21%).
-Root cause: zero parallel speedup on single-member files. No algorithmic shortcut —
-must implement speculative parallel decode.
-
-**Category B: T1 residual (25 gaps, only 3 are >5%)**
-Most are <2% noise. The meaningful ones: software-bgzf T1 arm64 (-14%, likely CI
-variance), compress L1 T1 x86 vs igzip (-12%, ISA-L hand-tuned AVX2 assembly).
-
-**Category C: Tmax vs pigz on arm64 (7 gaps, 2 are >8%)**
-silesia-gzip Tmax arm64 vs pigz (-13%), logs-gzip Tmax arm64 vs pigz (-9%).
-Partially caused by Tmax double-buffering (PR #50 should close ~50% of this).
-After PR #50, remaining gap = sequential inflate speed difference.
-
-### What Won't Help
-- Two-pass parallel: scan pass costs as much as full decode (proven, measured)
-- Prefix-overlap: window convergence fails at high thread counts
-- Simulation benchmarks: always lie about real performance
-- Micro-optimizations in decode loop: LLVM already optimizes well
-
-### Priority Actions
-1. **PR #50** closes Tmax double-buffering (~13% Category C gaps)
-2. **Speculative parallel decode** closes Category A (~20-30% vs rapidgzip)
-3. **igzip L1 compression** gap is not worth pursuing without SIMD assembly
-
-## Production Code Paths
-
-**Compression**: libdeflate (L1-L5, L10-L12), zlib-ng (L6-L9)
-**Decompression**:
-1. Non-parallel (T1 or single-member at Tmax) → `decompress_multi_member_sequential` → libdeflate FFI, direct stdout
-2. Tmax BGZF → `bgzf::decompress_bgzf_parallel` → libdeflate FFI, intermediate buffer
-3. Tmax Multi-member → `bgzf::decompress_multi_member_parallel` → libdeflate FFI, intermediate buffer

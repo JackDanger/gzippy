@@ -12,6 +12,13 @@ use crate::optimization::{detect_content_type, ContentType, OptimizationConfig};
 use crate::parallel_compress::GzipHeaderInfo;
 use crate::simple_optimizations::SimpleOptimizer;
 
+#[inline]
+fn debug_enabled() -> bool {
+    use std::sync::OnceLock;
+    static DEBUG: OnceLock<bool> = OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var("GZIPPY_DEBUG").is_ok())
+}
+
 pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     if filename == "-" {
         return compress_stdin(args);
@@ -194,8 +201,9 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
         let optimizer =
             SimpleOptimizer::new(opt_config.clone()).with_header_info(header_info.clone());
         if args.stdout {
+            let out = BufWriter::with_capacity(1024 * 1024, stdout());
             optimizer
-                .compress_file(input_path, stdout())
+                .compress_file(input_path, out)
                 .map_err(|e| e.into())
         } else {
             let output_path = output_path.clone().unwrap();
@@ -205,7 +213,8 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
                 .map_err(|e| e.into())
         }
     } else if args.stdout {
-        compress_with_pipeline(input_file, stdout(), args, &opt_config, &header_info)
+        let out = BufWriter::with_capacity(1024 * 1024, stdout());
+        compress_with_pipeline(input_file, out, args, &opt_config, &header_info)
     } else {
         let output_path = output_path.clone().unwrap();
         let output_file = BufWriter::new(File::create(&output_path)?);
@@ -259,30 +268,61 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 }
 
 pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
-    let mut input = stdin();
-    let output = stdout();
+    let can_parallelize = args.processes > 1;
 
-    // For stdin, we need to buffer some data to detect content type
-    let mut buffer = Vec::new();
-    let mut sample = vec![0u8; 8192];
-    let bytes_read = input.read(&mut sample)?;
+    // For multi-threaded: try to mmap stdin (zero-copy, all threads share).
+    // For single-threaded: read_to_end is faster (sequential read-ahead avoids page faults).
+    #[cfg(unix)]
+    let mmap_data: Option<memmap2::Mmap> = if can_parallelize {
+        use std::os::unix::io::FromRawFd;
+        let stdin_fd = 0;
+        let meta =
+            std::fs::File::from(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(stdin_fd) });
+        let is_regular = meta
+            .metadata()
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false);
+        let result = if is_regular {
+            let m = unsafe { memmap2::Mmap::map(&meta) }.ok();
+            if let Some(ref mmap) = m {
+                let _ = mmap.advise(memmap2::Advice::Sequential);
+            }
+            m
+        } else {
+            None
+        };
+        std::mem::forget(meta);
+        result
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let mmap_data: Option<memmap2::Mmap> = None;
 
-    if bytes_read > 0 {
-        sample.truncate(bytes_read);
-        buffer.extend_from_slice(&sample);
+    let mut buffer_vec = Vec::new();
+    let input_data: &[u8] = if let Some(ref mmap) = mmap_data {
+        &mmap[..]
+    } else {
+        let mut input = stdin();
+        let mut sample = vec![0u8; 8192];
+        let bytes_read = input.read(&mut sample)?;
+        if bytes_read > 0 {
+            sample.truncate(bytes_read);
+            buffer_vec.extend_from_slice(&sample);
+            input.read_to_end(&mut buffer_vec)?;
+        }
+        &buffer_vec
+    };
 
-        // Read the rest of stdin
-        input.read_to_end(&mut buffer)?;
-    }
-
-    let file_size = buffer.len() as u64;
-    let content_type = if !sample.is_empty() {
-        crate::optimization::analyze_content_type(&sample)
+    let file_size = input_data.len() as u64;
+    let content_type = if input_data.len() >= 8192 {
+        crate::optimization::analyze_content_type(&input_data[..8192])
+    } else if !input_data.is_empty() {
+        crate::optimization::analyze_content_type(input_data)
     } else {
         ContentType::Binary
     };
 
-    // Create optimization configuration
     let opt_config = OptimizationConfig::new(
         args.processes,
         file_size,
@@ -290,8 +330,60 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         content_type,
     );
 
-    let cursor = Cursor::new(buffer);
     let header_info = GzipHeaderInfo::default();
+    let compression_level = args.compression_level as u32;
+    let output = BufWriter::with_capacity(1024 * 1024, stdout());
+
+    if opt_config.thread_count > 1 {
+        if args.compression_level >= 6 && args.compression_level <= 9 {
+            let mut encoder = crate::pipelined_compress::PipelinedGzEncoder::new(
+                compression_level,
+                opt_config.thread_count,
+            );
+            encoder.set_header_info(header_info);
+            encoder.compress_buffer(input_data, output)?;
+        } else {
+            let mut encoder = crate::parallel_compress::ParallelGzEncoder::new(
+                compression_level,
+                opt_config.thread_count,
+            );
+            encoder.set_header_info(header_info);
+            encoder.compress_buffer(input_data, output)?;
+        }
+        return Ok(0);
+    }
+
+    // T1 fast path: ISA-L L0-L3 directly from buffer (avoids double-read through Cursor)
+    if args.compression_level <= 3
+        && !args.huffman
+        && !args.rle
+        && crate::isal_compress::is_available()
+    {
+        if args.verbosity >= 2 {
+            eprintln!("gzippy: using ISA-L single-threaded compression (direct)");
+        }
+        if debug_enabled() {
+            let t0 = std::time::Instant::now();
+            crate::isal_compress::compress_gzip_to_writer(input_data, output, compression_level)?;
+            let elapsed = t0.elapsed();
+            let mbps = input_data.len() as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+            eprintln!(
+                "[gzippy] compress T1 ISA-L L{}: {:.1}ms, {:.1} MB/s ({} bytes in)",
+                compression_level,
+                elapsed.as_secs_f64() * 1000.0,
+                mbps,
+                input_data.len()
+            );
+        } else {
+            crate::isal_compress::compress_gzip_to_writer(input_data, output, compression_level)?;
+        }
+        return Ok(0);
+    }
+
+    // T1: go through compress_with_pipeline which has ratio probe optimization.
+    // Drop references so we can move buffer_vec into the Cursor without copying.
+    drop(mmap_data);
+    let cursor = Cursor::new(buffer_vec);
     let result = compress_with_pipeline(cursor, output, args, &opt_config, &header_info);
 
     match result {

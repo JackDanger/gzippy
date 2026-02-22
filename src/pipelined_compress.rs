@@ -93,6 +93,24 @@ impl PipelinedGzEncoder {
         builder
     }
 
+    /// Compress a pre-read buffer directly, avoiding the extra copy from Reader→Vec.
+    pub fn compress_buffer<W: Write + Send>(&self, data: &[u8], writer: W) -> io::Result<u64> {
+        if data.is_empty() {
+            let encoder = self
+                .gz_builder()
+                .write(writer, Compression::new(self.compression_level));
+            encoder.finish()?;
+            return Ok(0);
+        }
+
+        if self.num_threads > 1 {
+            self.compress_parallel_pipeline(data, writer)?;
+        } else {
+            self.compress_sequential(data, writer)?;
+        }
+        Ok(data.len() as u64)
+    }
+
     /// Compress data with dictionary sharing
     pub fn compress<R: Read, W: Write + Send>(&self, mut reader: R, writer: W) -> io::Result<u64> {
         // Read all input data
@@ -293,20 +311,17 @@ impl PipelinedGzEncoder {
 
             let mut block_data = *block;
             loop {
+                let before_in = compress.total_in();
                 let before_out = compress.total_out();
                 let status = compress.compress(block_data, &mut output_buf, flush)?;
+                let consumed = (compress.total_in() - before_in) as usize;
                 let produced = (compress.total_out() - before_out) as usize;
 
                 if produced > 0 {
                     writer.write_all(&output_buf[..produced])?;
                 }
 
-                let before_in = compress.total_in();
-                let _ = compress.compress(&[], &mut [], FlushCompress::None);
-                let consumed = (compress.total_in() - before_in) as usize;
-                if consumed > 0 && consumed <= block_data.len() {
-                    block_data = &block_data[consumed..];
-                }
+                block_data = &block_data[consumed..];
 
                 match status {
                     Status::Ok if block_data.is_empty() && flush != FlushCompress::Finish => break,

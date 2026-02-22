@@ -170,17 +170,16 @@ fn analyze_structure(data: &[u8]) -> String {
         return "not gzip".to_string();
     }
 
-    // Check for BGZF
-    if data.len() >= 18 {
-        let has_bgzf_extra = data[3] & 0x04 != 0; // FEXTRA flag
-        if has_bgzf_extra && data.len() >= 16 {
-            // Look for BC subfield
-            let xlen = u16::from_le_bytes([data[10], data[11]]) as usize;
-            if xlen >= 4 && 12 + xlen <= data.len() {
-                let extra = &data[12..12 + xlen];
-                if extra.len() >= 4 && extra[0] == b'B' && extra[1] == b'C' {
-                    return "BGZF (parallel-friendly)".to_string();
-                }
+    if data.len() >= 18 && data[3] & 0x04 != 0 {
+        let xlen = u16::from_le_bytes([data[10], data[11]]) as usize;
+        if xlen >= 4 && 12 + xlen <= data.len() {
+            let extra = &data[12..12 + xlen];
+            // GZ = gzippy BGZF, BC = standard BGZF
+            if find_subfield(extra, b'G', b'Z').is_some() {
+                return "BGZF/gzippy (parallel-friendly, GZ markers)".to_string();
+            }
+            if find_subfield(extra, b'B', b'C').is_some() {
+                return "BGZF/standard (parallel-friendly, BC markers)".to_string();
             }
         }
     }
@@ -206,14 +205,84 @@ fn analyze_structure(data: &[u8]) -> String {
 }
 
 fn estimate_output_size(data: &[u8]) -> u64 {
-    if data.len() < 4 {
+    if data.len() < 18 {
         return 0;
     }
+
+    // For gzippy BGZF files, walk block boundaries using BSIZE from the
+    // GZ extra field and sum each member's ISIZE trailer.
+    let mut total: u64 = 0;
+    let mut pos = 0;
+
+    if data[3] & 0x04 != 0 {
+        // Has FEXTRA — check for GZ subfield (gzippy's BGZF marker)
+        let xlen = u16::from_le_bytes([data[10], data[11]]) as usize;
+        if xlen >= 8 && 12 + xlen <= data.len() {
+            let extra = &data[12..12 + xlen];
+            let has_gz = find_subfield(extra, b'G', b'Z').is_some();
+            if has_gz {
+                while pos + 20 <= data.len() {
+                    if data[pos] != 0x1f || data[pos + 1] != 0x8b {
+                        break;
+                    }
+                    if data[pos + 3] & 0x04 == 0 {
+                        break;
+                    }
+                    let member_xlen = u16::from_le_bytes([data[pos + 10], data[pos + 11]]) as usize;
+                    if pos + 12 + member_xlen > data.len() {
+                        break;
+                    }
+                    let member_extra = &data[pos + 12..pos + 12 + member_xlen];
+                    let bsize = match find_subfield(member_extra, b'G', b'Z') {
+                        Some(val) => val,
+                        None => break,
+                    };
+                    if bsize == 0 || pos + bsize > data.len() || bsize < 18 {
+                        break;
+                    }
+                    let isize_off = pos + bsize - 4;
+                    let isize_val = u32::from_le_bytes([
+                        data[isize_off], data[isize_off + 1],
+                        data[isize_off + 2], data[isize_off + 3],
+                    ]);
+                    total += isize_val as u64;
+                    pos += bsize;
+                }
+            }
+        }
+    }
+
+    if total > 0 {
+        return total;
+    }
+
+    // Fallback: last member's ISIZE (works for single-member)
     let isize_bytes = &data[data.len() - 4..];
     u32::from_le_bytes([
-        isize_bytes[0],
-        isize_bytes[1],
-        isize_bytes[2],
-        isize_bytes[3],
+        isize_bytes[0], isize_bytes[1],
+        isize_bytes[2], isize_bytes[3],
     ]) as u64
+}
+
+fn find_subfield(extra: &[u8], si1: u8, si2: u8) -> Option<usize> {
+    let mut p = 0;
+    while p + 4 <= extra.len() {
+        if extra[p] == si1 && extra[p + 1] == si2 {
+            let slen = u16::from_le_bytes([extra[p + 2], extra[p + 3]]) as usize;
+            if slen == 4 && p + 8 <= extra.len() {
+                // 4-byte block size (gzippy format)
+                let val = u32::from_le_bytes([
+                    extra[p + 4], extra[p + 5], extra[p + 6], extra[p + 7],
+                ]) as usize;
+                return Some(val);
+            } else if slen == 2 && p + 6 <= extra.len() {
+                // 2-byte block size (standard BGZF format)
+                let val = u16::from_le_bytes([extra[p + 4], extra[p + 5]]) as usize + 1;
+                return Some(val);
+            }
+        }
+        let slen = u16::from_le_bytes([extra[p + 2], extra[p + 3]]) as usize;
+        p += 4 + slen;
+    }
+    None
 }

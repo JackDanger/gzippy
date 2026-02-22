@@ -1,0 +1,24 @@
+---
+description: How to use gzippy-dev to drive optimization work
+alwaysApply: true
+---
+
+# gzippy-dev Workflow
+
+## Starting a Session
+
+```bash
+gzippy-dev score      # Current win/loss from cloud fleet
+gzippy-dev losses     # Losses grouped by root cause
+```
+
+## Making a Change
+
+1. Make ONE focused change
+2. `cargo test --release` for correctness
+3. `gzippy-dev ci push` — pushes, waits for CI, auto-triages
+4. If CI looks good: `source .env && gzippy-dev cloud bench` for authoritative numbers
+
+## When the Tool Is Missing Something
+
+If you find yourself doing manual analysis, add the capability to `tools/devtool/src/`.
