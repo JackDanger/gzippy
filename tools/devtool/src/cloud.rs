@@ -593,7 +593,7 @@ fn remote_bench(
     if let Some(th) = threads { cmd += &format!(" --threads {th}"); }
     if let Some(dir) = direction { cmd += &format!(" --direction {dir}"); }
 
-    let bench_timeout = Duration::from_secs(25 * 60);
+    let bench_timeout = Duration::from_secs(45 * 60);
     let output = ssh_timeout(ip, key, &cmd, bench_timeout).map_err(|e| {
         save_bench_log(label, &format!("SSH error: {e}"));
         e
