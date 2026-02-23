@@ -3,18 +3,22 @@ description: Performance status and strategy — cloud fleet is source of truth
 alwaysApply: true
 ---
 
-# Performance Status: 46W / 14L (Feb 23 2026, Fleet Run 7)
+# Performance Status: 54W / 18L (Feb 23 2026, Fleet Run 8)
 
-## Score Breakdown
+## Score Breakdown (Fleet Run 8, 72 scenarios)
 
 | Category | W | L | Notes |
 |----------|---|---|-------|
-| Decompress BGZF (all) | 12 | 0 | Dominant |
-| Decompress T1 (x86) | 7 | 3 | 3 losses <2% noise vs igzip |
-| Decompress T1 (arm64) | 9 | 0 | Dominant |
-| Decompress Tmax (non-BGZF) | 4 | 8 | x86 logs Tmax now wins |
+| Decompress BGZF | 11 | 1 | x86 sw-bgzf T1 -1.3% noise |
+| Decompress T1 x86 | 4 | 5 | All <3% vs igzip (noise) |
+| Decompress T1 arm64 | 9 | 0 | Dominant |
+| Decompress Tmax non-BGZF | 6 | 8 | x86 logs Tmax wins |
 | Compress L6/L9 | 12 | 0 | Dominant |
-| Compress L1 | 5 | 3 | igzip x86 L1 + arm64 sw L1 Tmax |
+| Compress L1 | 12 | 4 | x86 noise vs igzip + arm64 sw -4.3% |
+
+Fleet runner improvements: skip-on-failure, partial results per wave,
+SSH retry, direction-aware timeouts, timestamped log dirs. All 12 instances
+completed successfully.
 
 ## Critical Discovery: pigz Files Are Single-Member
 
