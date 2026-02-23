@@ -140,7 +140,12 @@ pub fn decompress_two_pass_parallel(
         ));
     }
 
-    Ok(Some(output_cell.0.into_inner()))
+    let output = output_cell.0.into_inner();
+
+    // Verify CRC32 and ISIZE from gzip trailer
+    verify_gzip_trailer(gzip_data, &output)?;
+
+    Ok(Some(output))
 }
 
 /// Decode a single chunk between two checkpoints.
@@ -290,6 +295,43 @@ fn parse_gzip_header_size(data: &[u8]) -> Option<usize> {
     }
 
     Some(pos)
+}
+
+/// Verify gzip trailer (CRC32 + ISIZE) matches the decompressed output.
+fn verify_gzip_trailer(gzip_data: &[u8], output: &[u8]) -> io::Result<()> {
+    if gzip_data.len() < 18 {
+        return Err(Error::new(ErrorKind::InvalidData, "gzip data too short"));
+    }
+
+    let trailer = &gzip_data[gzip_data.len() - 8..];
+    let expected_crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    let expected_isize =
+        u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]) as usize;
+
+    // ISIZE is mod 2^32
+    let actual_isize = output.len() & 0xFFFF_FFFF;
+    if actual_isize != expected_isize {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "ISIZE mismatch: expected {} but got {}",
+                expected_isize, actual_isize
+            ),
+        ));
+    }
+
+    let actual_crc = crc32fast::hash(output);
+    if actual_crc != expected_crc {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "CRC32 mismatch: expected {:#010x} but got {:#010x}",
+                expected_crc, actual_crc
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
