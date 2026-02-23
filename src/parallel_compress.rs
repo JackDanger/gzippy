@@ -525,7 +525,15 @@ fn compress_block_bgzf_isal(
     // Compress deflate data directly into output buffer (no intermediate alloc)
     let deflate_start = output.len();
     let max_compressed = block.len() + block.len() / 10 + 256;
-    output.resize(deflate_start + max_compressed, 0);
+    let needed = deflate_start + max_compressed;
+    // SAFETY: compress_deflate_into only writes to output[deflate_start..], never reads
+    // uninitialized bytes. We truncate to the actual written length immediately after.
+    // Using set_len avoids zeroing ~300KB per block in the hot compress loop.
+    #[allow(clippy::uninit_vec)]
+    {
+        output.reserve(needed.saturating_sub(output.len()));
+        unsafe { output.set_len(needed) };
+    }
 
     let compressed_len = crate::isal_compress::compress_deflate_into(
         block,

@@ -73,6 +73,16 @@ Close race: gzippy 2155.9 vs pigz 2170.7 (-0.7%). Noise level.
 
 ## Priority 1: ISA-L Compress Performance Gap (Feb 23 update)
 
+### Changes Applied (this session)
+1. **T1 L0-L3 file path now uses `compress_gzip_stream_direct`** — single
+   ZStream reused across chunks, ~2MB memory, no full-file buffering. Previously
+   used `compress_gzip_stream` which read entire file + allocated 1.1x output.
+2. **Zero-init eliminated in hot compress paths**:
+   - `compress_block_bgzf_isal`: `output.resize(N, 0)` → `unsafe set_len` (~300KB/block saved)
+   - `compress_gzip_to_writer`: `vec![0u8; N]` → `Vec::with_capacity` + `set_len`
+   - `compress_gzip_stream`: same pattern
+3. **ISA-L error paths now observable**: warnings logged via GZIPPY_DEBUG
+
 The 2 x86 L1 compress losses (-57%, -47% vs igzip) are NOT caused by
 missing assembly (gzippy has 2383 AVX insns vs igzip's 1812). The gap
 is likely in gzippy's compression wrapper overhead. Specific diagnostics

@@ -475,9 +475,9 @@ fn compress_with_pipeline<R: Read, W: Write + Send>(
             && crate::isal_compress::is_available()
         {
             if args.verbosity >= 2 {
-                eprintln!("gzippy: using ISA-L single-threaded compression");
+                eprintln!("gzippy: using ISA-L single-threaded streaming compression");
             }
-            let bytes = crate::isal_compress::compress_gzip_stream(
+            let bytes = crate::isal_compress::compress_gzip_stream_direct(
                 &mut reader,
                 writer,
                 args.compression_level as u32,

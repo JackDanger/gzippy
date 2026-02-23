@@ -1043,7 +1043,7 @@ pub fn bench() -> Result<(), String> {
     println!("  Branch:    {branch}");
     println!("  Commit:    {commit_short}");
     println!("  Fleet:     {n_instances} instances ({} x86_64 {X86_TYPE} + {} arm64 {ARM64_TYPE})", n_instances / 2, n_instances / 2);
-    println!("  Layout:    1 instance per (arch, dataset, direction) — fully parallel");
+    println!("  Layout:    2 instances per wave (32 vCPU limit), {} waves sequential", (n_instances + 1) / 2);
     println!("  Benchmark: gzippy-dev bench --json (same code locally and in cloud)");
     println!("  Threads:   T1 + Tmax={BENCH_TMAX_THREADS} (matches CI runner core count)");
     println!("  Sweep:     {SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.1}%", SWEEP_TARGET_CV * 100.0);
@@ -1097,146 +1097,175 @@ fn run_fleet(
     let userdata = user_data_script(commit, repo_url);
     let userdata_b64 = base64_encode(&userdata);
 
-    struct Instance {
-        id: String,
-        ip: String,
+    struct WorkItem {
         arch: &'static str,
         dataset: &'static str,
         instance_type: &'static str,
+        ami: String,
         direction: &'static str,
     }
-    let mut instances: Vec<Instance> = Vec::new();
 
-    // Launch instances: one per (arch, dataset, direction) for full parallelism
-    // This gives us 12 instances: 3 datasets × 2 archs × 2 directions
+    // Build all work items, then batch them to stay within vCPU limits.
+    // Each instance is 16 vCPUs. With a 32 vCPU limit, run 2 at a time.
     let directions = ["decompress", "compress"];
+    let mut work_items: Vec<WorkItem> = Vec::new();
     for &dataset in DATASETS {
         for (arch, itype, ami) in [
             ("x86_64", X86_TYPE, &x86_ami),
             ("arm64", ARM64_TYPE, &arm64_ami),
         ] {
             for &direction in &directions {
-                let label = format!("{arch}/{dataset}/{direction}");
-                print!("  Launching {label} ({itype})... ");
-                let _ = std::io::stdout().flush();
-                let id = launch_on_demand(itype, ami, &key_name, &sg_id, &subnet_id, &userdata_b64, session)?;
-                cleanup.instance_ids.push(id.clone());
-                println!("{id}");
-                instances.push(Instance { id, ip: String::new(), arch, dataset, instance_type: itype, direction });
+                work_items.push(WorkItem { arch, dataset, instance_type: itype, ami: ami.clone(), direction });
             }
         }
     }
 
-    let all_ids: Vec<String> = instances.iter().map(|i| i.id.clone()).collect();
-    let id_refs: Vec<&str> = all_ids.iter().map(|s| s.as_str()).collect();
+    const BATCH_SIZE: usize = 2; // 2 × 16 vCPUs = 32 = limit
+    let n_batches = work_items.len().div_ceil(BATCH_SIZE);
 
-    print!("  Waiting for {} instances... ", instances.len());
-    let _ = std::io::stdout().flush();
-    wait_running(&id_refs)?;
-    println!("OK");
+    let mut all = Vec::new();
+    let mut all_diags = serde_json::Map::new();
+    let mut total_done = 0usize;
+    let mut total_failed = 0usize;
 
-    for inst in &mut instances {
-        inst.ip = get_public_ip(&inst.id)?;
-        println!("  {}/{}/{}: {} ({})", inst.arch, inst.dataset, inst.direction, inst.ip, inst.instance_type);
-    }
+    for (batch_idx, batch) in work_items.chunks(BATCH_SIZE).enumerate() {
+        println!(
+            "\n  ─── Wave {}/{} ({} instances) ───",
+            batch_idx + 1, n_batches, batch.len()
+        );
 
-    // Wait for SSH + setup on all instances in parallel.
-    // If some instances fail setup, continue with the rest.
-    {
-        let handles: Vec<_> = instances.iter().enumerate().map(|(idx, inst)| {
-            let ip = inst.ip.clone();
-            let key = key_path.clone();
-            let label = format!("{}/{}/{}", inst.arch, inst.dataset, inst.direction);
-            std::thread::spawn(move || -> (usize, Result<(), String>) {
-                let r = wait_for_ssh(&ip, &key, &label)
-                    .and_then(|_| wait_for_setup(&ip, &key, &label));
-                (idx, r)
-            })
-        }).collect();
-        let mut failed_indices = Vec::new();
-        for h in handles {
-            match h.join() {
-                Ok((_idx, Ok(()))) => {}
-                Ok((idx, Err(e))) => {
-                    eprintln!("  WARNING: instance setup failed: {e}");
-                    failed_indices.push(idx);
+        // Launch this batch
+        struct Instance {
+            id: String,
+            ip: String,
+            arch: &'static str,
+            dataset: &'static str,
+            instance_type: &'static str,
+            direction: &'static str,
+        }
+        let mut instances: Vec<Instance> = Vec::new();
+
+        for item in batch {
+            let label = format!("{}/{}/{}", item.arch, item.dataset, item.direction);
+            print!("  Launching {label} ({})... ", item.instance_type);
+            let _ = std::io::stdout().flush();
+            let id = launch_on_demand(
+                item.instance_type, &item.ami, &key_name, &sg_id, &subnet_id,
+                &userdata_b64, session,
+            )?;
+            cleanup.instance_ids.push(id.clone());
+            println!("{id}");
+            instances.push(Instance {
+                id, ip: String::new(), arch: item.arch, dataset: item.dataset,
+                instance_type: item.instance_type, direction: item.direction,
+            });
+        }
+
+        // Wait for running
+        let batch_ids: Vec<String> = instances.iter().map(|i| i.id.clone()).collect();
+        let id_refs: Vec<&str> = batch_ids.iter().map(|s| s.as_str()).collect();
+        print!("  Waiting for {} instances... ", instances.len());
+        let _ = std::io::stdout().flush();
+        wait_running(&id_refs)?;
+        println!("OK");
+
+        for inst in &mut instances {
+            inst.ip = get_public_ip(&inst.id)?;
+            println!("  {}/{}/{}: {} ({})", inst.arch, inst.dataset, inst.direction, inst.ip, inst.instance_type);
+        }
+
+        // Wait for SSH + setup in parallel within this batch
+        {
+            let handles: Vec<_> = instances.iter().enumerate().map(|(idx, inst)| {
+                let ip = inst.ip.clone();
+                let key = key_path.clone();
+                let label = format!("{}/{}/{}", inst.arch, inst.dataset, inst.direction);
+                std::thread::spawn(move || -> (usize, Result<(), String>) {
+                    let r = wait_for_ssh(&ip, &key, &label)
+                        .and_then(|_| wait_for_setup(&ip, &key, &label));
+                    (idx, r)
+                })
+            }).collect();
+            let mut failed_indices = Vec::new();
+            for h in handles {
+                match h.join() {
+                    Ok((_idx, Ok(()))) => {}
+                    Ok((idx, Err(e))) => {
+                        eprintln!("  WARNING: instance setup failed: {e}");
+                        failed_indices.push(idx);
+                    }
+                    Err(_) => eprintln!("  WARNING: setup thread panicked"),
                 }
-                Err(_) => eprintln!("  WARNING: setup thread panicked"),
+            }
+            failed_indices.sort_unstable();
+            for idx in failed_indices.into_iter().rev() {
+                let inst = &instances[idx];
+                eprintln!("  Skipping failed instance {}/{}/{}", inst.arch, inst.dataset, inst.direction);
+                instances.remove(idx);
             }
         }
-        // Remove failed instances (iterate in reverse to preserve indices)
-        failed_indices.sort_unstable();
-        for idx in failed_indices.into_iter().rev() {
-            let inst = &instances[idx];
-            eprintln!("  Skipping failed instance {}/{}/{}", inst.arch, inst.dataset, inst.direction);
-            instances.remove(idx);
-        }
-        if instances.is_empty() {
-            return Err("All instances failed setup — aborting".into());
-        }
-        println!("  {} of {} instances ready for benchmarks", instances.len(), n_instances);
-    }
 
-    println!(
-        "\n  ═══ BENCHMARKS ({} cloud instances) ═══",
-        instances.len()
-    );
-
-    let instance_count = instances.len();
-    let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let failed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-    let cloud_handles: Vec<_> = instances
-        .iter()
-        .map(|inst| {
+        // Run benchmarks in parallel within this batch
+        let bench_handles: Vec<_> = instances.iter().map(|inst| {
             let ip = inst.ip.clone();
             let key = key_path.clone();
             let label = format!("{}/{}/{}", inst.arch, inst.dataset, inst.direction);
             let dataset = inst.dataset.to_string();
             let direction = inst.direction.to_string();
-            let completed = completed.clone();
-            let failed = failed.clone();
-            let total = instance_count;
-            std::thread::spawn(move || -> (Vec<BenchResult>, Option<(String, serde_json::Value)>) {
+            std::thread::spawn(move || -> (String, Vec<BenchResult>, Option<(String, serde_json::Value)>) {
                 match run_benchmarks_on(&ip, &key, &label, Some(&dataset), &direction) {
                     Ok((results, diag)) => {
-                        let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        let fail = failed.load(std::sync::atomic::Ordering::Relaxed);
-                        println!("  [{label}] DONE ({done}/{total} complete, {fail} failed)");
+                        println!("  [{label}] DONE");
                         let diag_entry = diag.map(|d| (label.clone(), d));
-                        (results, diag_entry)
+                        (label, results, diag_entry)
                     }
                     Err(e) => {
-                        let fail = failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        let done = completed.load(std::sync::atomic::Ordering::Relaxed);
-                        eprintln!("  [{label}] FAILED: {e} ({done}/{total} complete, {fail} failed)");
-                        (Vec::new(), None)
+                        eprintln!("  [{label}] FAILED: {e}");
+                        (label, Vec::new(), None)
                     }
                 }
             })
-        })
-        .collect();
+        }).collect();
 
-    let mut all = Vec::new();
-    let mut all_diags = serde_json::Map::new();
-    for h in cloud_handles {
-        match h.join() {
-            Ok((results, diag)) => {
-                all.extend(results);
-                if let Some((label, d)) = diag {
-                    all_diags.insert(label, d);
+        for h in bench_handles {
+            match h.join() {
+                Ok((_, results, diag)) => {
+                    if results.is_empty() {
+                        total_failed += 1;
+                    } else {
+                        total_done += 1;
+                    }
+                    all.extend(results);
+                    if let Some((label, d)) = diag {
+                        all_diags.insert(label, d);
+                    }
+                }
+                Err(_) => {
+                    eprintln!("  Warning: a benchmark thread panicked");
+                    total_failed += 1;
                 }
             }
-            Err(_) => eprintln!("  Warning: a benchmark thread panicked"),
         }
+
+        // Terminate this batch's instances before launching the next wave
+        let term_ids: Vec<&str> = batch_ids.iter().map(|s| s.as_str()).collect();
+        println!("  Terminating wave {} instances...", batch_idx + 1);
+        let mut args = vec!["ec2", "terminate-instances", "--instance-ids"];
+        args.extend(term_ids);
+        let _ = aws(&args);
+        // Remove from cleanup since we already terminated them
+        cleanup.instance_ids.retain(|id| !batch_ids.contains(id));
+
+        println!(
+            "  Progress: {total_done}/{n_instances} done, {total_failed} failed, {} results so far",
+            all.len()
+        );
     }
 
     if all.is_empty() {
         return Err("All instances failed — no results collected".into());
     }
-    let done = completed.load(std::sync::atomic::Ordering::Relaxed);
-    let fail = failed.load(std::sync::atomic::Ordering::Relaxed);
-    println!("\n  Collected {} results from {done} instances ({fail} failed)", all.len());
+    println!("\n  Collected {} results from {total_done} instances ({total_failed} failed)", all.len());
 
     let elapsed = total_start.elapsed();
     println!("\n  Total wall time: {:.0}s ({:.1} min)", elapsed.as_secs_f64(), elapsed.as_secs_f64() / 60.0);
