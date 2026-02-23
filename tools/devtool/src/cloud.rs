@@ -354,21 +354,47 @@ fn wait_for_setup(ip: &str, key: &Path, label: &str) -> Result<(), String> {
     println!("  [{label}] Waiting for setup...");
     loop {
         let check_timeout = Duration::from_secs(15);
+
+        // Check for READY marker
         if let Ok(out) = ssh_timeout(ip, key, "cat /tmp/gzippy-ready 2>/dev/null || echo NOT_READY", check_timeout) {
             if out.trim().contains("READY") && !out.trim().contains("NOT_READY") {
                 println!("  [{label}] Setup complete ({:.0}s)", start.elapsed().as_secs_f64());
                 return Ok(());
             }
         }
-        if Instant::now() > deadline {
-            let log = ssh_timeout(ip, key, "tail -30 /var/log/cloud-init-output.log 2>/dev/null", check_timeout).unwrap_or_default();
-            eprintln!("  [{label}] Last setup output:\n{log}");
-            return Err(format!("[{label}] Setup timeout after {}s", SETUP_TIMEOUT.as_secs()));
+
+        // Check for early build failure: cloud-init finished but no READY marker
+        if let Ok(status) = ssh_timeout(ip, key,
+            "cloud-init status --format json 2>/dev/null | grep -o '\"status\"[^,]*' || echo unknown",
+            check_timeout,
+        ) {
+            if status.contains("\"done\"") || status.contains("\"error\"") {
+                // cloud-init finished — check if our script succeeded
+                if let Ok(ready) = ssh_timeout(ip, key, "test -f /tmp/gzippy-ready && echo YES || echo NO", check_timeout) {
+                    if ready.trim() == "NO" {
+                        let log = save_instance_log(ip, key, label);
+                        return Err(format!(
+                            "[{label}] Build failed (cloud-init done but no READY marker). Log saved to {log}"
+                        ));
+                    }
+                }
+            }
         }
+
+        if Instant::now() > deadline {
+            let log = save_instance_log(ip, key, label);
+            return Err(format!("[{label}] Setup timeout after {}s. Log saved to {log}", SETUP_TIMEOUT.as_secs()));
+        }
+
         let elapsed = start.elapsed().as_secs();
         if elapsed >= last_progress_report + 30 {
             last_progress_report = elapsed;
-            let progress = ssh_timeout(ip, key, "tail -1 /var/log/cloud-init-output.log 2>/dev/null | head -c 120", check_timeout).unwrap_or_default();
+            // Show last non-cloud-init line (skip the "Cloud-init finished" noise)
+            let progress = ssh_timeout(
+                ip, key,
+                "grep -v '^Cloud-init\\|^2[0-9].*cc_scripts' /var/log/cloud-init-output.log 2>/dev/null | tail -1 | head -c 120",
+                check_timeout,
+            ).unwrap_or_default();
             let progress = progress.trim();
             if !progress.is_empty() {
                 println!("  [{label}] ({elapsed}s) {progress}");
@@ -376,6 +402,33 @@ fn wait_for_setup(ip: &str, key: &Path, label: &str) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_secs(10));
     }
+}
+
+/// Save benchmark output to a local log file for debugging.
+fn save_bench_log(label: &str, content: &str) {
+    let safe_label = label.replace('/', "_");
+    let log_dir = find_repo_root().unwrap_or_else(|_| PathBuf::from(".")).join("cloud-logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join(format!("{safe_label}_bench.log"));
+    let _ = std::fs::write(&log_path, content);
+}
+
+/// Save full cloud-init log from an instance to a local file. Returns the file path.
+fn save_instance_log(ip: &str, key: &Path, label: &str) -> String {
+    let check_timeout = Duration::from_secs(30);
+    let log_content = ssh_timeout(
+        ip, key,
+        "cat /var/log/cloud-init-output.log 2>/dev/null",
+        check_timeout,
+    ).unwrap_or_else(|e| format!("(failed to fetch log: {e})"));
+
+    let safe_label = label.replace('/', "_");
+    let log_dir = find_repo_root().unwrap_or_else(|_| PathBuf::from(".")).join("cloud-logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join(format!("{safe_label}.log"));
+    let _ = std::fs::write(&log_path, &log_content);
+    eprintln!("  [{label}] Full cloud-init log ({} bytes) saved to {}", log_content.len(), log_path.display());
+    log_path.display().to_string()
 }
 
 // ─── User-data script ─────────────────────────────────────────────────────────
@@ -525,14 +578,20 @@ fn remote_bench(
     if let Some(dir) = direction { cmd += &format!(" --direction {dir}"); }
 
     let bench_timeout = Duration::from_secs(25 * 60);
-    let output = ssh_timeout(ip, key, &cmd, bench_timeout)?;
+    let output = ssh_timeout(ip, key, &cmd, bench_timeout).map_err(|e| {
+        save_bench_log(label, &format!("SSH error: {e}"));
+        e
+    })?;
+
+    // Always save the full bench output to a log file for debugging
+    save_bench_log(label, &output);
 
     let json_line = output.lines()
         .find(|line| line.trim_start().starts_with('{'))
         .ok_or_else(|| {
             let tail: String = output.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev()
                 .collect::<Vec<_>>().join("\n");
-            format!("[{label}] No JSON in bench output. Last 10 lines:\n{tail}")
+            format!("[{label}] No JSON in bench output. Full output in cloud-logs/. Last 10 lines:\n{tail}")
         })?;
 
     parse_bench_json(json_line, label)
@@ -585,7 +644,8 @@ fn run_diagnostics(
 
     match ssh_timeout(ip, key, &diag_args, Duration::from_secs(300)) {
         Ok(output) => {
-            // Find the JSON object in the output (skip any [stderr] lines)
+            save_bench_log(&format!("{label}/diag"), &output);
+
             let json_lines: String = output.lines()
                 .filter(|l| !l.starts_with("[stderr]"))
                 .collect::<Vec<_>>()
@@ -593,7 +653,6 @@ fn run_diagnostics(
             match serde_json::from_str::<serde_json::Value>(&json_lines) {
                 Ok(v) => {
                     println!("  [{label}] Diagnostics collected.");
-                    // Print key highlights
                     if let Some(arch) = v.get("arch").and_then(|v| v.as_str()) {
                         print!("    arch={arch}");
                     }
@@ -611,11 +670,7 @@ fn run_diagnostics(
                     Some(v)
                 }
                 Err(e) => {
-                    eprintln!("  [{label}] Diagnostics JSON parse error: {e}");
-                    // Print raw output for debugging
-                    for line in output.lines().take(10) {
-                        eprintln!("    {line}");
-                    }
+                    eprintln!("  [{label}] Diagnostics JSON parse error: {e}. Full output in cloud-logs/");
                     None
                 }
             }

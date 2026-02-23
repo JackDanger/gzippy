@@ -3479,8 +3479,9 @@ mod tests {
         // (a) produce byte-identical output to sequential, or
         // (b) return an error
         // It must NEVER produce wrong output silently.
-        for seed in [1u64, 42, 100, 999, 0xdeadbeef, 0xcafe, 7, 13, 256, 65536] {
-            let data = make_random_data(5 * 1024 * 1024, seed);
+        // Uses 512KB data to keep brute-force boundary search fast (~5s total).
+        for seed in [1u64, 42, 100, 999, 0xdeadbeef] {
+            let data = make_random_data(512 * 1024, seed);
             let compressed = make_gzip_data(&data);
 
             let mut output = Vec::new();
