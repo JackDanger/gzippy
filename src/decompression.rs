@@ -98,6 +98,7 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     let input_file = File::open(input_path)?;
     let file_size = input_file.metadata()?.len();
     let mmap = unsafe { Mmap::map(&input_file)? };
+    let _ = mmap.advise(memmap2::Advice::Sequential);
 
     // Check if data looks like a compressed format
     let is_compressed =
@@ -285,7 +286,11 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         let ft = meta.metadata().map(|m| m.file_type());
         let is_regular = ft.as_ref().map(|ft| ft.is_file()).unwrap_or(false);
         let result = if is_regular {
-            unsafe { Mmap::map(&meta) }.ok()
+            let m = unsafe { Mmap::map(&meta) }.ok();
+            if let Some(ref mmap) = m {
+                let _ = mmap.advise(memmap2::Advice::Sequential);
+            }
+            m
         } else {
             None
         };
