@@ -60,10 +60,18 @@ pub fn decompress_two_pass_parallel(
         return Ok(None);
     }
 
-    // Try fast circular-buffer scanner first (keeps working set in cache).
-    // Falls back to full-output scanner if a single block exceeds the buffer.
+    // On x86_64 with ISA-L, use ISA-L's AVX-accelerated inflate for the scan.
+    // Falls back to pure-Rust scan on arm64 or if ISA-L scan fails.
     let scan_result =
-        crate::scan_inflate::scan_deflate_fast(deflate_data, checkpoint_interval, isize_hint)
+        crate::isal_decompress::scan_deflate_isal(deflate_data, checkpoint_interval, isize_hint)
+            .ok_or_else(|| io::Error::other("isal scan unavailable"))
+            .or_else(|_| {
+                crate::scan_inflate::scan_deflate_fast(
+                    deflate_data,
+                    checkpoint_interval,
+                    isize_hint,
+                )
+            })
             .or_else(|_| {
                 crate::scan_inflate::scan_deflate(deflate_data, checkpoint_interval, isize_hint)
             })?;

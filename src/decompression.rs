@@ -585,11 +585,37 @@ fn decompress_single_member<W: Write>(
     writer: &mut W,
     num_threads: usize,
 ) -> GzippyResult<u64> {
-    // Parallel single-member is NOT wired in yet.
-    // decompress_parallel has a size mismatch bug (decode_until_bit overshoot
-    // causes chunks to overlap, total output ≠ ISIZE). Must fix the bug first —
-    // wiring it in with fallback would hide the bug.
-    let _ = num_threads;
+    const MIN_PARALLEL_SIZE: usize = 1024 * 1024;
+
+    if num_threads >= 2 && data.len() >= MIN_PARALLEL_SIZE {
+        if debug_enabled() {
+            eprintln!(
+                "[gzippy] single-member parallel: {} bytes, {} threads",
+                data.len(),
+                num_threads
+            );
+        }
+        match crate::two_pass_parallel::decompress_two_pass_parallel(data, num_threads) {
+            Ok(Some(output)) => {
+                if debug_enabled() {
+                    eprintln!("[gzippy] parallel decode produced {} bytes", output.len());
+                }
+                writer.write_all(&output)?;
+                writer.flush()?;
+                return Ok(output.len() as u64);
+            }
+            Ok(None) => {
+                if debug_enabled() {
+                    eprintln!("[gzippy] parallel: data too small, using sequential");
+                }
+            }
+            Err(e) => {
+                if debug_enabled() {
+                    eprintln!("[gzippy] parallel decode error: {}, using sequential", e);
+                }
+            }
+        }
+    }
 
     if crate::isal_decompress::is_available() {
         if let Some(bytes) = crate::isal_decompress::decompress_gzip_stream(data, writer) {

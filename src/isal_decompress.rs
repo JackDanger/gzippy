@@ -91,6 +91,99 @@ pub fn decompress_deflate_into(_input: &[u8], _output: &mut [u8]) -> Option<usiz
     None
 }
 
+/// Scan a deflate stream using ISA-L, capturing checkpoints at block boundaries.
+///
+/// Faster than pure-Rust `scan_deflate_fast` on x86_64 because ISA-L uses
+/// AVX2/AVX-512 for Huffman decode. Produces `ScanCheckpoint` objects
+/// compatible with `two_pass_parallel`'s parallel decode phase.
+///
+/// Returns `None` if ISA-L is not available or an error occurs.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+pub fn scan_deflate_isal(
+    deflate_data: &[u8],
+    checkpoint_interval: usize,
+    expected_output_size: usize,
+) -> Option<crate::scan_inflate::ScanResult> {
+    use crate::scan_inflate::{ScanCheckpoint, ScanResult, WINDOW_SIZE};
+    use isal::isal_sys::igzip_lib as isal_raw;
+
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::ISAL_DEFLATE;
+
+    state.avail_in = deflate_data.len() as u32;
+    state.next_in = deflate_data.as_ptr() as *mut u8;
+
+    let buf_size = if expected_output_size > 0 {
+        expected_output_size + 256 * 1024
+    } else {
+        deflate_data.len().saturating_mul(32).max(1024 * 1024)
+    };
+    let mut output = vec![0u8; buf_size];
+
+    let mut out_pos: usize = 0;
+    let mut checkpoints = Vec::new();
+    let mut next_checkpoint_at = checkpoint_interval;
+
+    let chunk_size: u32 = 256 * 1024;
+
+    loop {
+        let remaining_out = output.len() - out_pos;
+        if remaining_out == 0 {
+            output.resize(output.len() * 2, 0);
+        }
+        let this_chunk = remaining_out.min(chunk_size as usize);
+
+        state.avail_out = this_chunk as u32;
+        state.next_out = output[out_pos..].as_mut_ptr();
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        if ret != 0 {
+            return None;
+        }
+
+        let written = this_chunk - state.avail_out as usize;
+        out_pos += written;
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_NEW_HDR
+            && out_pos >= next_checkpoint_at
+            && out_pos >= WINDOW_SIZE
+        {
+            let input_byte_pos = deflate_data.len() - state.avail_in as usize;
+            let window_start = out_pos - WINDOW_SIZE;
+            checkpoints.push(ScanCheckpoint {
+                input_byte_pos,
+                bitbuf: state.read_in,
+                bitsleft: state.read_in_length as u32,
+                output_offset: out_pos,
+                window: output[window_start..out_pos].to_vec(),
+            });
+            next_checkpoint_at = out_pos + checkpoint_interval;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            break;
+        }
+        if written == 0 && state.avail_in == 0 {
+            break;
+        }
+    }
+
+    Some(ScanResult {
+        checkpoints,
+        total_output_size: out_pos,
+    })
+}
+
+#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+pub fn scan_deflate_isal(
+    _deflate_data: &[u8],
+    _checkpoint_interval: usize,
+    _expected_output_size: usize,
+) -> Option<crate::scan_inflate::ScanResult> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -282,5 +375,92 @@ mod tests {
         };
         let mut output = Vec::new();
         assert!(decompress_gzip_stream(&valid_gzip, &mut output).is_none());
+    }
+
+    #[test]
+    fn test_scan_deflate_isal_stub_when_unavailable() {
+        use super::*;
+        if is_available() {
+            return;
+        }
+        let deflate = {
+            use std::io::Write;
+            let mut enc =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(b"hello world, this is enough data to test")
+                .unwrap();
+            enc.finish().unwrap()
+        };
+        assert!(scan_deflate_isal(&deflate, 1024, 0).is_none());
+    }
+
+    #[test]
+    fn test_scan_deflate_isal_large_data() {
+        use super::*;
+        if !is_available() {
+            eprintln!("skipping (ISA-L not available)");
+            return;
+        }
+
+        let mut data = Vec::new();
+        for i in 0..200_000u64 {
+            data.extend_from_slice(format!("Line {}: some test data for scan\n", i).as_bytes());
+        }
+
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &data).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let result = scan_deflate_isal(&compressed, 256 * 1024, data.len())
+            .expect("ISA-L scan should succeed");
+        assert_eq!(result.total_output_size, data.len());
+        assert!(!result.checkpoints.is_empty());
+
+        for cp in &result.checkpoints {
+            assert_eq!(cp.window.len(), crate::scan_inflate::WINDOW_SIZE);
+            assert!(cp.output_offset >= crate::scan_inflate::WINDOW_SIZE);
+            assert!(cp.input_byte_pos <= compressed.len());
+        }
+    }
+
+    #[test]
+    fn test_scan_deflate_isal_matches_pure_rust() {
+        use super::*;
+        if !is_available() {
+            eprintln!("skipping (ISA-L not available)");
+            return;
+        }
+
+        let mut data = Vec::new();
+        for i in 0..200_000u64 {
+            data.extend_from_slice(format!("Data item {}: payload\n", i).as_bytes());
+        }
+
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &data).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let isal_result = scan_deflate_isal(&compressed, 128 * 1024, data.len())
+            .expect("ISA-L scan should succeed");
+        let rust_result =
+            crate::scan_inflate::scan_deflate_fast(&compressed, 128 * 1024, data.len())
+                .expect("pure Rust scan should succeed");
+
+        assert_eq!(isal_result.total_output_size, rust_result.total_output_size);
+
+        // Windows at matching output positions must be identical
+        for isal_cp in &isal_result.checkpoints {
+            for rust_cp in &rust_result.checkpoints {
+                if isal_cp.output_offset == rust_cp.output_offset {
+                    assert_eq!(
+                        isal_cp.window, rust_cp.window,
+                        "Window mismatch at offset {}",
+                        isal_cp.output_offset
+                    );
+                }
+            }
+        }
     }
 }
