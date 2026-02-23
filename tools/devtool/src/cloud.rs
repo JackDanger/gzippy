@@ -215,7 +215,7 @@ fn create_key_pair(session: &str) -> Result<(String, PathBuf), String> {
     Ok((name, path))
 }
 
-fn find_vpc_and_subnet() -> Result<(String, String), String> {
+fn find_vpc_and_subnets() -> Result<(String, Vec<String>), String> {
     let vpc_id = aws(&[
         "ec2", "describe-vpcs",
         "--filters", "Name=isDefault,Values=true",
@@ -231,23 +231,39 @@ fn find_vpc_and_subnet() -> Result<(String, String), String> {
         return Err("No VPC found".into());
     }
 
-    let subnet_id = aws(&[
+    // Get ALL public subnets so we can try different AZs on capacity errors
+    let subnet_text = aws(&[
         "ec2", "describe-subnets",
         "--filters",
             &format!("Name=vpc-id,Values={vpc_id}"),
             "Name=map-public-ip-on-launch,Values=true",
-        "--query", "Subnets[0].SubnetId",
+        "--query", "Subnets[*].SubnetId",
         "--output", "text",
     ])?;
-    if subnet_id.is_empty() || subnet_id == "None" {
-        let subnet_id = aws(&[
+
+    let mut subnets: Vec<String> = subnet_text.split_whitespace()
+        .filter(|s| s.starts_with("subnet-"))
+        .map(|s| s.to_string())
+        .collect();
+
+    if subnets.is_empty() {
+        // Fallback: try any subnet
+        let fallback = aws(&[
             "ec2", "describe-subnets",
             "--filters", &format!("Name=vpc-id,Values={vpc_id}"),
-            "--query", "Subnets[0].SubnetId", "--output", "text",
+            "--query", "Subnets[*].SubnetId", "--output", "text",
         ])?;
-        return Ok((vpc_id, subnet_id));
+        subnets = fallback.split_whitespace()
+            .filter(|s| s.starts_with("subnet-"))
+            .map(|s| s.to_string())
+            .collect();
     }
-    Ok((vpc_id, subnet_id))
+
+    if subnets.is_empty() {
+        return Err("No subnets found".into());
+    }
+
+    Ok((vpc_id, subnets))
 }
 
 fn find_ubuntu_ami(arch: &str) -> Result<String, String> {
@@ -1125,10 +1141,10 @@ fn run_fleet(
     let total_start = Instant::now();
     let n_instances = DATASETS.len() * 2 * 2; // datasets × archs × directions
 
-    print!("  VPC/subnet... ");
+    print!("  VPC/subnets... ");
     let _ = std::io::stdout().flush();
-    let (vpc_id, subnet_id) = find_vpc_and_subnet()?;
-    println!("{vpc_id}/{subnet_id}");
+    let (vpc_id, subnets) = find_vpc_and_subnets()?;
+    println!("{vpc_id} ({} subnets across AZs)", subnets.len());
 
     print!("  SSH key... ");
     let _ = std::io::stdout().flush();
@@ -1160,8 +1176,6 @@ fn run_fleet(
         direction: &'static str,
     }
 
-    // Build all work items, then batch them to stay within vCPU limits.
-    // Each instance is 16 vCPUs. With a 32 vCPU limit, run 2 at a time.
     let directions = ["decompress", "compress"];
     let mut work_items: Vec<WorkItem> = Vec::new();
     for &dataset in DATASETS {
@@ -1204,10 +1218,24 @@ fn run_fleet(
             let label = format!("{}/{}/{}", item.arch, item.dataset, item.direction);
             print!("  Launching {label} ({})... ", item.instance_type);
             let _ = std::io::stdout().flush();
-            let id = launch_on_demand(
-                item.instance_type, &item.ami, &key_name, &sg_id, &subnet_id,
-                &userdata_b64, session,
-            )?;
+
+            // Try each subnet (different AZ) until one has capacity
+            let mut id = Err("no subnets".to_string());
+            for subnet in &subnets {
+                match launch_on_demand(
+                    item.instance_type, &item.ami, &key_name, &sg_id, subnet,
+                    &userdata_b64, session,
+                ) {
+                    Ok(instance_id) => { id = Ok(instance_id); break; }
+                    Err(e) if e.contains("InsufficientInstanceCapacity") => {
+                        print!("(no capacity in {}, trying next AZ) ", &subnet[..subnet.len().min(20)]);
+                        let _ = std::io::stdout().flush();
+                        continue;
+                    }
+                    Err(e) => { id = Err(e); break; }
+                }
+            }
+            let id = id?;
             cleanup.instance_ids.push(id.clone());
             println!("{id}");
             instances.push(Instance {
@@ -1437,10 +1465,10 @@ fn run_single_instance(
     arch: &str, instance_type: &str, commit: &str, repo_url: &str,
     user_cmd: &str, session: &str, cleanup: &mut CleanupState,
 ) -> Result<(), String> {
-    print!("  VPC/subnet... ");
+    print!("  VPC/subnets... ");
     let _ = std::io::stdout().flush();
-    let (vpc_id, subnet_id) = find_vpc_and_subnet()?;
-    println!("{vpc_id}/{subnet_id}");
+    let (vpc_id, subnets) = find_vpc_and_subnets()?;
+    println!("{vpc_id} ({} subnets)", subnets.len());
 
     print!("  SSH key... ");
     let _ = std::io::stdout().flush();
@@ -1465,7 +1493,19 @@ fn run_single_instance(
 
     print!("  Launching {instance_type}... ");
     let _ = std::io::stdout().flush();
-    let instance_id = launch_on_demand(instance_type, &ami, &key_name, &sg_id, &subnet_id, &userdata_b64, session)?;
+    let mut instance_id = Err("no subnets".to_string());
+    for subnet in &subnets {
+        match launch_on_demand(instance_type, &ami, &key_name, &sg_id, subnet, &userdata_b64, session) {
+            Ok(id) => { instance_id = Ok(id); break; }
+            Err(e) if e.contains("InsufficientInstanceCapacity") => {
+                print!("(retrying different AZ) ");
+                let _ = std::io::stdout().flush();
+                continue;
+            }
+            Err(e) => { instance_id = Err(e); break; }
+        }
+    }
+    let instance_id = instance_id?;
     cleanup.instance_ids.push(instance_id.clone());
     println!("{instance_id}");
 
