@@ -199,8 +199,8 @@ pub fn compress_gzip_stream_direct<R: std::io::Read, W: std::io::Write>(
     let mut stream: isal_raw::isal_zstream = unsafe { std::mem::zeroed() };
     unsafe { isal_raw::isal_deflate_init(&mut stream) };
     stream.level = isal_level;
-    stream.gzip_flag = isal_raw::IGZIP_GZIP;
-    stream.flush = isal_raw::NO_FLUSH as i32;
+    stream.gzip_flag = isal_raw::IGZIP_GZIP as u16;
+    stream.flush = isal_raw::NO_FLUSH as u16;
     stream.end_of_stream = 0;
 
     let level_buf_size = match isal_level {

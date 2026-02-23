@@ -1247,14 +1247,39 @@ fn run_fleet(
             }
         }
 
-        // Terminate this batch's instances before launching the next wave
+        // Terminate this batch's instances and wait for vCPU release before next wave
         let term_ids: Vec<&str> = batch_ids.iter().map(|s| s.as_str()).collect();
         println!("  Terminating wave {} instances...", batch_idx + 1);
         let mut args = vec!["ec2", "terminate-instances", "--instance-ids"];
         args.extend(term_ids);
         let _ = aws(&args);
-        // Remove from cleanup since we already terminated them
         cleanup.instance_ids.retain(|id| !batch_ids.contains(id));
+
+        // Wait for instances to reach "terminated" state so vCPUs are released
+        if batch_idx + 1 < n_batches {
+            print!("  Waiting for vCPU release... ");
+            let _ = std::io::stdout().flush();
+            for attempt in 0..12 {
+                std::thread::sleep(Duration::from_secs(10));
+                let mut args = vec![
+                    "ec2", "describe-instances",
+                    "--instance-ids",
+                ];
+                let id_refs: Vec<&str> = batch_ids.iter().map(|s| s.as_str()).collect();
+                args.extend(&id_refs);
+                args.extend(["--query", "Reservations[*].Instances[*].State.Name", "--output", "text"]);
+                let check = aws(&args);
+                if let Ok(states) = check {
+                    if states.split_whitespace().all(|s| s == "terminated") {
+                        println!("OK ({:.0}s)", (attempt + 1) * 10);
+                        break;
+                    }
+                }
+                if attempt == 11 {
+                    println!("timeout (proceeding anyway)");
+                }
+            }
+        }
 
         println!(
             "  Progress: {total_done}/{n_instances} done, {total_failed} failed, {} results so far",
