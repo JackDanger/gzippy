@@ -118,21 +118,20 @@ ship: $(GZIPPY_BIN)
 	@cargo clippy --all-targets -- -D warnings || (echo "CLIPPY FAILED — aborting ship" && exit 1)
 	@echo ""
 	@echo "── Step 3/4: rebuild gzippy-dev ──"
-	@cd tools/devtool && cargo build --release 2>&1 | grep -E "Compiling|Finished|error" || true
-	@cp tools/devtool/target/release/gzippy-dev . 2>/dev/null || true
+	@cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target 2>&1 | grep -E "Compiling|Finished|error" || true
 	@echo ""
 	@echo "── Step 4/4: cloud fleet benchmarks ──"
 	@if [ -z "$$AWS_ACCESS_KEY_ID" ]; then \
 		echo "No AWS creds in env — cloud.rs will use aws-vault exec gzippy-dev"; \
 	fi
-	./gzippy-dev cloud bench
+	target/release/gzippy-dev cloud bench
 	@echo ""
 	@echo "══════════════════════════════════════════════════════"
 	@echo "  Scorecard:"
 	@echo "══════════════════════════════════════════════════════"
-	./gzippy-dev score
+	target/release/gzippy-dev score
 	@echo ""
-	@echo "Done. Run './gzippy-dev losses' for gap analysis."
+	@echo "Done. Run 'target/release/gzippy-dev losses' for gap analysis."
 
 # =============================================================================
 # AWS credentials for cloud fleet benchmarks (optional — cloud.rs auto-uses

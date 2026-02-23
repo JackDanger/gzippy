@@ -16,8 +16,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::bench;
-use crate::bench::{find_repo_root, BenchDirection};
+use crate::bench::find_repo_root;
 use std::time::{Duration, Instant};
 
 const REGION: &str = "us-east-1";
@@ -307,6 +306,38 @@ fn get_my_public_ip() -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn is_retryable_launch_error(e: &str) -> bool {
+    e.contains("InsufficientInstanceCapacity")
+        || e.contains("Unsupported")
+        || e.contains("InsufficientFreeAddressesInSubnet")
+        || e.contains("InstanceLimitExceeded")
+}
+
+fn terminate_and_wait(batch_ids: &[String], cleanup: &mut CleanupState, wait_for_release: bool) {
+    if batch_ids.is_empty() { return; }
+    let term_ids: Vec<&str> = batch_ids.iter().map(|s| s.as_str()).collect();
+    println!("  Terminating {} instance(s)...", term_ids.len());
+    let mut args = vec!["ec2", "terminate-instances", "--instance-ids"];
+    args.extend(&term_ids);
+    let _ = aws(&args);
+    cleanup.instance_ids.retain(|id| !batch_ids.contains(id));
+
+    if wait_for_release {
+        print!("  Waiting for vCPU release... ");
+        let _ = std::io::stdout().flush();
+        let mut wait_args = vec!["ec2", "wait", "instance-terminated", "--instance-ids"];
+        let id_refs: Vec<&str> = batch_ids.iter().map(|s| s.as_str()).collect();
+        wait_args.extend(&id_refs);
+        match aws(&wait_args) {
+            Ok(_) => println!("OK"),
+            Err(_) => {
+                println!("(wait timed out, sleeping 30s)");
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
 fn launch_on_demand(
     instance_type: &str, ami: &str, key: &str, sg: &str,
     subnet: &str, userdata_b64: &str, session: &str,
@@ -420,16 +451,29 @@ fn wait_for_setup(ip: &str, key: &Path, label: &str) -> Result<(), String> {
     }
 }
 
-/// Save benchmark output to a local log file for debugging.
+fn cloud_log_dir() -> PathBuf {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let ts = Command::new("date").arg("+%Y%m%d-%H%M%S")
+            .output().ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let dir = find_repo_root().unwrap_or_else(|_| PathBuf::from("."))
+            .join("cloud-logs")
+            .join(ts);
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }).clone()
+}
+
 fn save_bench_log(label: &str, content: &str) {
     let safe_label = label.replace('/', "_");
-    let log_dir = find_repo_root().unwrap_or_else(|_| PathBuf::from(".")).join("cloud-logs");
-    let _ = std::fs::create_dir_all(&log_dir);
+    let log_dir = cloud_log_dir();
     let log_path = log_dir.join(format!("{safe_label}_bench.log"));
     let _ = std::fs::write(&log_path, content);
 }
 
-/// Save full cloud-init log from an instance to a local file. Returns the file path.
 fn save_instance_log(ip: &str, key: &Path, label: &str) -> String {
     let check_timeout = Duration::from_secs(30);
     let log_content = ssh_timeout(
@@ -439,11 +483,10 @@ fn save_instance_log(ip: &str, key: &Path, label: &str) -> String {
     ).unwrap_or_else(|e| format!("(failed to fetch log: {e})"));
 
     let safe_label = label.replace('/', "_");
-    let log_dir = find_repo_root().unwrap_or_else(|_| PathBuf::from(".")).join("cloud-logs");
-    let _ = std::fs::create_dir_all(&log_dir);
-    let log_path = log_dir.join(format!("{safe_label}.log"));
+    let log_dir = cloud_log_dir();
+    let log_path = log_dir.join(format!("{safe_label}_setup.log"));
     let _ = std::fs::write(&log_path, &log_content);
-    eprintln!("  [{label}] Full cloud-init log ({} bytes) saved to {}", log_content.len(), log_path.display());
+    eprintln!("  [{label}] Setup log ({} bytes) saved to {}", log_content.len(), log_path.display());
     log_path.display().to_string()
 }
 
@@ -593,11 +636,20 @@ fn remote_bench(
     if let Some(th) = threads { cmd += &format!(" --threads {th}"); }
     if let Some(dir) = direction { cmd += &format!(" --direction {dir}"); }
 
-    let bench_timeout = Duration::from_secs(45 * 60);
-    let output = ssh_timeout(ip, key, &cmd, bench_timeout).map_err(|e| {
-        save_bench_log(label, &format!("SSH error: {e}"));
-        e
-    })?;
+    let is_compress = direction.map(|d| d == "compress").unwrap_or(false);
+    let bench_timeout = Duration::from_secs(if is_compress { 45 * 60 } else { 20 * 60 });
+    let output = match ssh_timeout(ip, key, &cmd, bench_timeout) {
+        Ok(out) => out,
+        Err(e) => {
+            save_bench_log(label, &format!("SSH error (attempt 1): {e}"));
+            eprintln!("  [{label}] SSH failed, retrying in 10s: {e}");
+            std::thread::sleep(Duration::from_secs(10));
+            ssh_timeout(ip, key, &cmd, bench_timeout).map_err(|e2| {
+                save_bench_log(label, &format!("SSH error (attempt 2): {e2}"));
+                format!("[{label}] benchmark SSH failed twice: {e2}")
+            })?
+        }
+    };
 
     // Always save the full bench output to a log file for debugging
     save_bench_log(label, &output);
@@ -751,19 +803,23 @@ fn run_benchmarks_on(
         let threads: Option<usize> = Some(if thr == "T1" { 1 } else { BENCH_TMAX_THREADS });
         println!("  [{label}] PRECISION {ds}-{arch} {thr}...");
 
-        let precision = remote_bench(
+        match remote_bench(
             ip, key, label,
             PRECISION_MIN_TRIALS, PRECISION_MAX_TRIALS, PRECISION_TARGET_CV,
             Some(ds), Some(arch), threads, Some(direction),
-        )?;
-
-        for r in &precision {
-            println!("    {}: {:.1} MB/s (CV {:.2}%, {} trials)", r.tool, r.speed_mbps, r.cv * 100.0, r.trials);
+        ) {
+            Ok(precision) => {
+                for r in &precision {
+                    println!("    {}: {:.1} MB/s (CV {:.2}%, {} trials)", r.tool, r.speed_mbps, r.cv * 100.0, r.trials);
+                }
+                let key_prefix = format!("{ds}-{arch}-{thr}");
+                all.retain(|r| scenario_key(r) != key_prefix);
+                all.extend(precision);
+            }
+            Err(e) => {
+                eprintln!("  [{label}] PRECISION {ds}-{arch} {thr} FAILED (keeping sweep): {e}");
+            }
         }
-
-        let key_prefix = format!("{ds}-{arch}-{thr}");
-        all.retain(|r| scenario_key(r) != key_prefix);
-        all.extend(precision);
     }
 
     Ok((all, diagnostics))
@@ -1114,7 +1170,7 @@ pub fn bench() -> Result<(), String> {
     println!("  Branch:    {branch}");
     println!("  Commit:    {commit_short}");
     println!("  Fleet:     {n_instances} instances ({} x86_64 {X86_TYPE} + {} arm64 {ARM64_TYPE})", n_instances / 2, n_instances / 2);
-    println!("  Layout:    2 instances per wave (32 vCPU limit), {} waves sequential", (n_instances + 1) / 2);
+    println!("  Layout:    2 instances per wave (32 vCPU limit), {} waves, skip-on-failure", (n_instances + 1) / 2);
     println!("  Benchmark: gzippy-dev bench --json (same code locally and in cloud)");
     println!("  Threads:   T1 + Tmax={BENCH_TMAX_THREADS} (matches CI runner core count)");
     println!("  Sweep:     {SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.1}%", SWEEP_TARGET_CV * 100.0);
@@ -1192,10 +1248,11 @@ fn run_fleet(
     const BATCH_SIZE: usize = 2; // 2 × 16 vCPUs = 32 = limit
     let n_batches = work_items.len().div_ceil(BATCH_SIZE);
 
-    let mut all = Vec::new();
+    let mut all: Vec<BenchResult> = Vec::new();
     let mut all_diags = serde_json::Map::new();
     let mut total_done = 0usize;
     let mut total_failed = 0usize;
+    let mut skipped_labels: Vec<String> = Vec::new();
 
     for (batch_idx, batch) in work_items.chunks(BATCH_SIZE).enumerate() {
         println!(
@@ -1203,7 +1260,6 @@ fn run_fleet(
             batch_idx + 1, n_batches, batch.len()
         );
 
-        // Launch this batch
         struct Instance {
             id: String,
             ip: String,
@@ -1214,50 +1270,87 @@ fn run_fleet(
         }
         let mut instances: Vec<Instance> = Vec::new();
 
+        // ── Launch: try every subnet, skip instance on total failure ──
         for item in batch {
             let label = format!("{}/{}/{}", item.arch, item.dataset, item.direction);
             print!("  Launching {label} ({})... ", item.instance_type);
             let _ = std::io::stdout().flush();
 
-            // Try each subnet (different AZ) until one has capacity
-            let mut id = Err("no subnets".to_string());
+            let mut launched = false;
             for subnet in &subnets {
                 match launch_on_demand(
                     item.instance_type, &item.ami, &key_name, &sg_id, subnet,
                     &userdata_b64, session,
                 ) {
-                    Ok(instance_id) => { id = Ok(instance_id); break; }
-                    Err(e) if e.contains("InsufficientInstanceCapacity") => {
-                        print!("(no capacity in {}, trying next AZ) ", &subnet[..subnet.len().min(20)]);
-                        let _ = std::io::stdout().flush();
-                        continue;
+                    Ok(id) => {
+                        cleanup.instance_ids.push(id.clone());
+                        println!("{id}");
+                        instances.push(Instance {
+                            id, ip: String::new(), arch: item.arch, dataset: item.dataset,
+                            instance_type: item.instance_type, direction: item.direction,
+                        });
+                        launched = true;
+                        break;
                     }
-                    Err(e) => { id = Err(e); break; }
+                    Err(e) if is_retryable_launch_error(&e) => {
+                        print!("(unavailable, next AZ) ");
+                        let _ = std::io::stdout().flush();
+                    }
+                    Err(e) => {
+                        eprintln!("FAILED: {e}");
+                        break;
+                    }
                 }
             }
-            let id = id?;
-            cleanup.instance_ids.push(id.clone());
-            println!("{id}");
-            instances.push(Instance {
-                id, ip: String::new(), arch: item.arch, dataset: item.dataset,
-                instance_type: item.instance_type, direction: item.direction,
-            });
+            if !launched {
+                eprintln!("  SKIP {label}: no AZ had capacity for {}", item.instance_type);
+                skipped_labels.push(label);
+                total_failed += 1;
+            }
         }
 
-        // Wait for running
+        if instances.is_empty() {
+            println!("  No instances launched in this wave, skipping");
+            continue;
+        }
+
+        // ── Wait for running ──
         let batch_ids: Vec<String> = instances.iter().map(|i| i.id.clone()).collect();
-        let id_refs: Vec<&str> = batch_ids.iter().map(|s| s.as_str()).collect();
-        print!("  Waiting for {} instances... ", instances.len());
-        let _ = std::io::stdout().flush();
-        wait_running(&id_refs)?;
-        println!("OK");
-
-        for inst in &mut instances {
-            inst.ip = get_public_ip(&inst.id)?;
-            println!("  {}/{}/{}: {} ({})", inst.arch, inst.dataset, inst.direction, inst.ip, inst.instance_type);
+        {
+            let id_refs: Vec<&str> = batch_ids.iter().map(|s| s.as_str()).collect();
+            print!("  Waiting for {} instances... ", instances.len());
+            let _ = std::io::stdout().flush();
+            if let Err(e) = wait_running(&id_refs) {
+                eprintln!("FAILED: {e}");
+                terminate_and_wait(&batch_ids, cleanup, batch_idx + 1 < n_batches);
+                continue;
+            }
+            println!("OK");
         }
 
-        // Wait for SSH + setup in parallel within this batch
+        // ── Get IPs (skip instances that fail) ──
+        let mut ip_failed = Vec::new();
+        for (idx, inst) in instances.iter_mut().enumerate() {
+            match get_public_ip(&inst.id) {
+                Ok(ip) => {
+                    inst.ip = ip;
+                    println!("  {}/{}/{}: {} ({})", inst.arch, inst.dataset, inst.direction, inst.ip, inst.instance_type);
+                }
+                Err(e) => {
+                    eprintln!("  {}/{}/{}: no IP: {e}", inst.arch, inst.dataset, inst.direction);
+                    ip_failed.push(idx);
+                }
+            }
+        }
+        for idx in ip_failed.into_iter().rev() {
+            instances.remove(idx);
+        }
+        if instances.is_empty() {
+            terminate_and_wait(&batch_ids, cleanup, batch_idx + 1 < n_batches);
+            continue;
+        }
+
+        // ── Setup (parallel, skip failures) ──
         {
             let handles: Vec<_> = instances.iter().enumerate().map(|(idx, inst)| {
                 let ip = inst.ip.clone();
@@ -1274,7 +1367,7 @@ fn run_fleet(
                 match h.join() {
                     Ok((_idx, Ok(()))) => {}
                     Ok((idx, Err(e))) => {
-                        eprintln!("  WARNING: instance setup failed: {e}");
+                        eprintln!("  WARNING: setup failed: {e}");
                         failed_indices.push(idx);
                     }
                     Err(_) => eprintln!("  WARNING: setup thread panicked"),
@@ -1283,12 +1376,20 @@ fn run_fleet(
             failed_indices.sort_unstable();
             for idx in failed_indices.into_iter().rev() {
                 let inst = &instances[idx];
-                eprintln!("  Skipping failed instance {}/{}/{}", inst.arch, inst.dataset, inst.direction);
+                let label = format!("{}/{}/{}", inst.arch, inst.dataset, inst.direction);
+                eprintln!("  SKIP {label}: setup failed");
+                skipped_labels.push(label);
+                total_failed += 1;
                 instances.remove(idx);
             }
         }
 
-        // Run benchmarks in parallel within this batch
+        if instances.is_empty() {
+            terminate_and_wait(&batch_ids, cleanup, batch_idx + 1 < n_batches);
+            continue;
+        }
+
+        // ── Benchmarks (parallel, direction-aware timeout) ──
         let bench_handles: Vec<_> = instances.iter().map(|inst| {
             let ip = inst.ip.clone();
             let key = key_path.clone();
@@ -1298,7 +1399,7 @@ fn run_fleet(
             std::thread::spawn(move || -> (String, Vec<BenchResult>, Option<(String, serde_json::Value)>) {
                 match run_benchmarks_on(&ip, &key, &label, Some(&dataset), &direction) {
                     Ok((results, diag)) => {
-                        println!("  [{label}] DONE");
+                        println!("  [{label}] DONE ({} results)", results.len());
                         let diag_entry = diag.map(|d| (label.clone(), d));
                         (label, results, diag_entry)
                     }
@@ -1312,56 +1413,32 @@ fn run_fleet(
 
         for h in bench_handles {
             match h.join() {
-                Ok((_, results, diag)) => {
+                Ok((label, results, diag)) => {
                     if results.is_empty() {
                         total_failed += 1;
+                        skipped_labels.push(label);
                     } else {
                         total_done += 1;
                     }
                     all.extend(results);
-                    if let Some((label, d)) = diag {
-                        all_diags.insert(label, d);
+                    if let Some((l, d)) = diag {
+                        all_diags.insert(l, d);
                     }
                 }
                 Err(_) => {
-                    eprintln!("  Warning: a benchmark thread panicked");
+                    eprintln!("  Warning: benchmark thread panicked");
                     total_failed += 1;
                 }
             }
         }
 
-        // Terminate this batch's instances and wait for vCPU release before next wave
-        let term_ids: Vec<&str> = batch_ids.iter().map(|s| s.as_str()).collect();
-        println!("  Terminating wave {} instances...", batch_idx + 1);
-        let mut args = vec!["ec2", "terminate-instances", "--instance-ids"];
-        args.extend(term_ids);
-        let _ = aws(&args);
-        cleanup.instance_ids.retain(|id| !batch_ids.contains(id));
+        // ── Terminate + wait for vCPU release ──
+        terminate_and_wait(&batch_ids, cleanup, batch_idx + 1 < n_batches);
 
-        // Wait for instances to reach "terminated" state so vCPUs are released
-        if batch_idx + 1 < n_batches {
-            print!("  Waiting for vCPU release... ");
-            let _ = std::io::stdout().flush();
-            for attempt in 0..12 {
-                std::thread::sleep(Duration::from_secs(10));
-                let mut args = vec![
-                    "ec2", "describe-instances",
-                    "--instance-ids",
-                ];
-                let id_refs: Vec<&str> = batch_ids.iter().map(|s| s.as_str()).collect();
-                args.extend(&id_refs);
-                args.extend(["--query", "Reservations[*].Instances[*].State.Name", "--output", "text"]);
-                let check = aws(&args);
-                if let Ok(states) = check {
-                    if states.split_whitespace().all(|s| s == "terminated") {
-                        println!("OK ({:.0}s)", (attempt + 1) * 10);
-                        break;
-                    }
-                }
-                if attempt == 11 {
-                    println!("timeout (proceeding anyway)");
-                }
-            }
+        // ── Save partial results after each wave ──
+        if !all.is_empty() {
+            let elapsed = total_start.elapsed();
+            dump_results_json(&all, elapsed.as_secs_f64(), &all_diags);
         }
 
         println!(
@@ -1370,13 +1447,21 @@ fn run_fleet(
         );
     }
 
+    // ── Final results ──
+    let elapsed = total_start.elapsed();
+    println!("\n  Total wall time: {:.0}s ({:.1} min)", elapsed.as_secs_f64(), elapsed.as_secs_f64() / 60.0);
+
+    if !skipped_labels.is_empty() {
+        println!("\n  Skipped ({}):", skipped_labels.len());
+        for l in &skipped_labels {
+            println!("    - {l}");
+        }
+    }
+
     if all.is_empty() {
         return Err("All instances failed — no results collected".into());
     }
     println!("\n  Collected {} results from {total_done} instances ({total_failed} failed)", all.len());
-
-    let elapsed = total_start.elapsed();
-    println!("\n  Total wall time: {:.0}s ({:.1} min)", elapsed.as_secs_f64(), elapsed.as_secs_f64() / 60.0);
 
     print_results(&all);
     dump_results_json(&all, elapsed.as_secs_f64(), &all_diags);
@@ -1493,14 +1578,13 @@ fn run_single_instance(
 
     print!("  Launching {instance_type}... ");
     let _ = std::io::stdout().flush();
-    let mut instance_id = Err("no subnets".to_string());
+    let mut instance_id = Err("no subnets available".to_string());
     for subnet in &subnets {
         match launch_on_demand(instance_type, &ami, &key_name, &sg_id, subnet, &userdata_b64, session) {
             Ok(id) => { instance_id = Ok(id); break; }
-            Err(e) if e.contains("InsufficientInstanceCapacity") => {
+            Err(e) if is_retryable_launch_error(&e) => {
                 print!("(retrying different AZ) ");
                 let _ = std::io::stdout().flush();
-                continue;
             }
             Err(e) => { instance_id = Err(e); break; }
         }

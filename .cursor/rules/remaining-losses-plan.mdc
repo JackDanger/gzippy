@@ -38,6 +38,20 @@ alwaysApply: true
 - This forces ISA-L's autotools to use NASM assembler for AVX2/AVX-512 paths.
 - Root cause: `sudo -u` runs with limited PATH; `AS=nasm` bypasses PATH lookup.
 
+### Fleet Runner Reliability (Feb 23)
+- **Never abort for one failure**: Launch, setup, IP, and bench errors all skip
+  the single affected instance. The rest of the fleet continues.
+- **Partial results after every wave**: `cloud-results.json` is updated after
+  each wave, so even a crash preserves earlier results.
+- **Smart AZ retry**: `is_retryable_launch_error()` catches InsufficientCapacity,
+  Unsupported, InsufficientFreeAddresses, and InstanceLimitExceeded. All subnets
+  (AZs) are tried before skipping.
+- **`aws ec2 wait instance-terminated`**: Replaces manual 10s-poll loop for vCPU
+  release between waves. Falls back to 30s sleep on timeout.
+- **Direction-aware timeout**: Decompress benchmarks get 20 min, compress gets 45 min.
+- **Skipped instances listed at end**: Final summary shows exactly which
+  instances were skipped and why.
+
 ## Tier 1: Noise-Level (<3%) — 4 losses
 **Action**: None needed.
 
