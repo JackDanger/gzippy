@@ -560,6 +560,7 @@ mod tests {
 
     /// The chunk decoder function: given a guess position, search for a valid
     /// block start nearby and decode from it.
+    #[allow(dead_code)]
     struct ChunkResult {
         output: Vec<u16>,
         final_window: Vec<u8>,
@@ -645,27 +646,21 @@ mod tests {
 
         let idx = oracle.checkpoints.len() / 2;
         let cp = &oracle.checkpoints[idx];
-        let next_byte = if idx + 1 < oracle.checkpoints.len() {
-            oracle.checkpoints[idx + 1].input_byte_pos
-        } else {
-            oracle.deflate_data.len()
-        };
+        let bit_pos = checkpoint_bit_pos(cp);
 
-        let result = decode_chunk(
-            &oracle.deflate_data,
-            cp.input_byte_pos,
-            next_byte,
-            Some(&cp.window),
-        );
+        let max_output = oracle.expected_output.len();
+        let mut decoder = MarkerDecoder::with_window(&oracle.deflate_data, bit_pos, &cp.window);
+        decoder
+            .decode_until(max_output)
+            .expect("decode from oracle checkpoint should succeed");
 
-        let result = result.expect("decode from oracle checkpoint should succeed");
         assert!(
-            !result.has_markers,
+            !decoder.has_markers(),
             "should have no markers with correct window"
         );
 
-        let (_, end_offset, expected) = oracle.chunk_expected(idx, idx + 1);
-        let output_bytes: Vec<u8> = result.output.iter().map(|&v| v as u8).collect();
+        let (_, _end_offset, expected) = oracle.chunk_expected(idx, idx + 1);
+        let output_bytes: Vec<u8> = decoder.output().iter().map(|&v| v as u8).collect();
         let cmp_len = expected.len().min(output_bytes.len());
         assert_eq!(
             &output_bytes[..cmp_len],
@@ -686,20 +681,29 @@ mod tests {
 
         let idx = oracle.checkpoints.len() / 2;
         let cp = &oracle.checkpoints[idx];
-        let next_byte = if idx + 1 < oracle.checkpoints.len() {
-            oracle.checkpoints[idx + 1].input_byte_pos
-        } else {
-            oracle.deflate_data.len()
+        let bit_pos = checkpoint_bit_pos(cp);
+
+        let max_output = oracle.expected_output.len();
+        let mut decoder = MarkerDecoder::new(&oracle.deflate_data, bit_pos);
+        decoder
+            .decode_until(max_output)
+            .expect("decode should succeed");
+
+        let result = ChunkResult {
+            output: decoder.output().to_vec(),
+            final_window: decoder.final_window(),
+            start_bit: bit_pos,
+            has_markers: decoder.has_markers(),
+            marker_count: if decoder.has_markers() {
+                decoder
+                    .output()
+                    .iter()
+                    .filter(|&&v| v >= MARKER_BASE)
+                    .count()
+            } else {
+                0
+            },
         };
-
-        let result = decode_chunk(
-            &oracle.deflate_data,
-            cp.input_byte_pos,
-            next_byte,
-            None, // marker mode
-        );
-
-        let result = result.expect("decode should succeed");
         eprintln!(
             "marker mode: {} output values, {} markers ({:.1}%)",
             result.output.len(),

@@ -241,6 +241,9 @@ impl ParallelGzEncoder {
 
         // Memory-map the file for zero-copy access
         let mmap = unsafe { Mmap::map(&file)? };
+        if self.num_threads > 1 {
+            let _ = mmap.advise(memmap2::Advice::Sequential);
+        }
 
         // For small files or single thread, choose the fastest single-member path
         // For L10-L12, always use libdeflate blocks for better compression
@@ -535,7 +538,12 @@ fn compress_block_bgzf_isal(
             output.truncate(deflate_start + actual_len);
         }
         None => {
-            // Fall back to libdeflate if ISA-L fails
+            if std::env::var("GZIPPY_DEBUG").is_ok() {
+                eprintln!(
+                    "[gzippy] WARNING: ISA-L compress failed on {} byte block, using libdeflate",
+                    block.len()
+                );
+            }
             compress_block_bgzf_libdeflate(output, block, compression_level, header_info);
             return;
         }
@@ -703,5 +711,29 @@ mod tests {
         decoder.read_to_end(&mut decompressed).unwrap();
 
         assert_eq!(data.as_slice(), decompressed.as_slice());
+    }
+
+    #[test]
+    #[cfg(feature = "isal-compression")]
+    fn test_bgzf_isal_block_roundtrip() {
+        let data: Vec<u8> = (0..200_000).map(|i| (i % 256) as u8).collect();
+        let header = GzipHeaderInfo::default();
+        let mut output = Vec::new();
+
+        compress_block_bgzf_isal(&mut output, &data, 1, &header);
+
+        // Must be valid gzip
+        assert!(output.len() >= 18, "output too short");
+        assert_eq!(output[0], 0x1f, "bad gzip magic byte 0");
+        assert_eq!(output[1], 0x8b, "bad gzip magic byte 1");
+
+        // Must decompress correctly
+        let mut decoder = flate2::read::GzDecoder::new(&output[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+        assert_eq!(
+            decompressed, data,
+            "ISA-L BGZF block must roundtrip correctly"
+        );
     }
 }

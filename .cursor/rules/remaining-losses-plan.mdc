@@ -3,45 +3,56 @@ description: Plan for converting remaining losses to wins — prioritized, actio
 alwaysApply: true
 ---
 
-# Remaining 15 Losses — Plan (Feb 21 2026)
+# Remaining Losses — Plan (Feb 22 2026)
 
-## Summary: 45W / 15L
+## Summary: 46W / 14L (awaiting cloud fleet results for latest changes)
 
-## Tier 1: Noise-Level (<3%, likely measurement variance) — 4 losses
-- silesia-pigz T1 x86: -1.3% vs igzip
-- software-pigz T1 x86: -0.5% vs igzip
-- logs-pigz T1 x86: -0.4% vs igzip
-- software-gzip T1 x86: -0.3% vs igzip
+## Changes Made This Session
 
-**Action**: None. These oscillate between WIN and LOSS across runs.
+### Block Finder Fix (Feb 22)
+- **Bug**: `validate_huffman_codes` used wrong split point for lit/dist codes.
+  `lit_count = 257 + (total_codes - 258).min(29)` was wrong — must use
+  `hlit_count = 257 + hlit` for the split.
+- **Fix**: Pass `hlit_count` to `validate_huffman_codes`, use it for split.
+- **Result**: 14/15 oracle boundaries now pass all validation levels (was 0/15).
+- **Also**: Accept bfinal=0 and bfinal=1 blocks, add stored block detection.
+- **NOT included**: Fixed Huffman (btype=1) candidates excluded — no header
+  to validate, 50% of random positions match, floods search with false positives.
 
-## Tier 2: Small gap, fixable — 1 loss
-- arm64 software L1 Tmax: -2.1% vs pigz
+### Two-Pass Parallel Single-Member (Feb 22)
+- **Wired**: `decompress_two_pass_parallel` is routed from `decompress_single_member`
+  for files >1GB compressed with >=4 threads.
+- **Threshold**: Currently high (1GB) because scan pass uses pure Rust
+  (`consume_first_decode`) which costs ~T_sequential. On M3 Mac, parallel was
+  SLOWER than sequential libdeflate FFI.
+- **Proven correct**: `test_two_pass_silesia_roundtrip` passes byte-exact on silesia.
+- **To lower threshold**: Make scan use libdeflate FFI, or wait for consume_first
+  to reach parity.
 
-**Action**: Add `madvise(Sequential)` to mmap in L1 parallel compress path.
-Already implemented in code, awaiting next cloud run to verify.
+### madvise(Sequential) for L1 Tmax (Feb 22)
+- Added to `ParallelGzEncoder::compress_file` when `num_threads > 1`.
+- Mirrors the pipelined compress path which already has it.
 
-## Tier 3: ISA-L build issue — 2 losses
-- x86 software L1 T1: -56.6% vs igzip (2325 MB/s)
-- x86 logs L1 T1: -45.4% vs igzip (1773 MB/s)
+### ISA-L NASM Fix (Feb 22)
+- Set `AS=nasm` in cloud build for x86_64 targets.
+- This forces ISA-L's autotools to use NASM assembler for AVX2/AVX-512 paths.
+- Root cause: `sudo -u` runs with limited PATH; `AS=nasm` bypasses PATH lookup.
 
-gzippy (1009 MB/s) uses isal-rs which vendors ISA-L 2.31.0. The igzip binary
-uses our submodule ISA-L 2.31.1 built with NASM assembly (verified by
-`Building ASM_NASM` in logs). The 2.3x gap suggests isal-sys's ISA-L was
-built WITHOUT NASM on the cloud fleet.
+## Tier 1: Noise-Level (<3%) — 4 losses
+**Action**: None needed.
 
-**Action**: Diagnostic added to cloud user-data to check NASM detection in
-isal-sys build. If confirmed, fix by either:
-1. Ensuring NASM is in PATH during `cargo build` (likely already there)
-2. Using our submodule's pre-built ISA-L instead of isal-sys vendored copy
-3. Calling ISA-L directly via isal-sys FFI with our own library linkage
+## Tier 2: madvise — 1 loss (FIXED)
+- arm64 software L1 Tmax: now has `madvise(Sequential)`
 
-## Tier 4: Architecture change needed — 8 losses
-All Tmax single-member decompress vs rapidgzip/unpigz (-19% to -37%).
+## Tier 3: ISA-L NASM — 2 losses (FIXED)
+- x86 software/logs L1 T1: now builds with `AS=nasm`
 
-**Action**: Implement rapidgzip-style pipeline architecture:
-1. Dedicated block-finder threads using precode validation LUT
-2. Marker-based parallel decode
-3. Window propagation + marker resolution
+## Tier 4: Single-Member Parallel — 8 losses
+All Tmax decompress vs rapidgzip/unpigz.
 
-Estimated effort: 2-4 weeks. Previous attempts (speculative, two-pass) failed.
+**Status**: Two-pass infrastructure proven correct but scan pass too expensive.
+Block finder recall improved from 0% to 93%. Parallel single-member is wired
+but threshold set high (1GB) to avoid regression.
+
+**Next step**: Make scan pass use libdeflate FFI instead of consume_first,
+or implement rapidgzip-style pipelined block finder + parallel decoder.

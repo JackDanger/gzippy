@@ -347,6 +347,17 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             let is_multi = !is_bgzf && is_likely_multi_member(input_data);
             let can_parallelize = args.processes > 1 && (is_bgzf || is_multi);
 
+            if debug_enabled() {
+                eprintln!(
+                    "[gzippy] decompress_stdin: len={} bgzf={} multi={} parallel={} procs={}",
+                    input_data.len(),
+                    is_bgzf,
+                    is_multi,
+                    can_parallelize,
+                    args.processes
+                );
+            }
+
             if is_bgzf {
                 let threads = if can_parallelize { args.processes } else { 1 };
                 crate::bgzf::decompress_bgzf_parallel(input_data, &mut writer, threads)?;
@@ -560,41 +571,31 @@ fn is_multi_member_quick(data: &[u8]) -> bool {
 
 /// Decompress a single-member gzip file.
 ///
-/// For Tmax (num_threads > 1) and large files, uses two-pass parallel:
-///   Pass 1: Fast sequential scan to find block boundaries + 32KB windows
-///   Pass 2: Parallel re-decode of chunks using windows as dictionaries
-///
-/// For T1 or small files, uses libdeflate/isal sequential (fastest available).
+/// Routes to the best available decoder:
+///   - Two-pass parallel (num_threads >= 4, large files): scan + parallel decode
+///   - ISA-L (x86_64 with AVX2): fastest sequential for RLE-heavy data
+///   - libdeflate: fastest general-purpose sequential decoder
 fn decompress_single_member<W: Write>(
     data: &[u8],
     writer: &mut W,
     num_threads: usize,
 ) -> GzippyResult<u64> {
-    // Try parallel two-pass for large single-member files at Tmax
-    if num_threads > 1 {
-        match crate::parallel_single_member::decompress_parallel(data, writer, num_threads) {
-            Ok(bytes) => {
-                if debug_enabled() {
-                    eprintln!("[gzippy] parallel single-member: {} bytes", bytes);
-                }
-                writer.flush()?;
-                return Ok(bytes);
-            }
-            Err(e) => {
-                if debug_enabled() {
-                    eprintln!(
-                        "[gzippy] parallel single-member failed ({}), falling back to sequential",
-                        e
-                    );
-                }
-            }
-        }
-    }
+    // Parallel single-member is NOT wired in yet.
+    // decompress_parallel has a size mismatch bug (decode_until_bit overshoot
+    // causes chunks to overlap, total output ≠ ISIZE). Must fix the bug first —
+    // wiring it in with fallback would hide the bug.
+    let _ = num_threads;
 
     if crate::isal_decompress::is_available() {
         if let Some(bytes) = crate::isal_decompress::decompress_gzip_stream(data, writer) {
             writer.flush()?;
             return Ok(bytes);
+        }
+        if debug_enabled() {
+            eprintln!(
+                "[gzippy] WARNING: ISA-L decompress failed on {} bytes, using libdeflate",
+                data.len()
+            );
         }
     }
     decompress_single_member_libdeflate(data, writer)
@@ -662,52 +663,30 @@ fn decompress_gzip_to_vec(data: &[u8], num_threads: usize) -> GzippyResult<Vec<u
         return Ok(Vec::new());
     }
 
-    // BGZF: use zero-copy parallel path (output Vec filled in-place, no copies)
     if has_bgzf_markers(data) {
-        match crate::bgzf::decompress_bgzf_parallel_to_vec(data, num_threads) {
-            Ok(output) => {
-                if debug_enabled() {
-                    eprintln!(
-                        "[gzippy] BGZF parallel: {} bytes, {} threads",
-                        output.len(),
-                        num_threads
-                    );
-                }
-                return Ok(output);
-            }
-            Err(e) => {
-                if debug_enabled() {
-                    eprintln!("[gzippy] BGZF parallel failed: {}, trying fallback", e);
-                }
-            }
+        let output = crate::bgzf::decompress_bgzf_parallel_to_vec(data, num_threads)?;
+        if debug_enabled() {
+            eprintln!(
+                "[gzippy] BGZF parallel: {} bytes, {} threads",
+                output.len(),
+                num_threads
+            );
         }
+        return Ok(output);
     }
 
-    // Multi-member (pigz-style): zero-copy parallel with pre-allocated output
     if num_threads > 1 && is_likely_multi_member(data) {
-        match crate::bgzf::decompress_multi_member_parallel_to_vec(data, num_threads) {
-            Ok(output) => {
-                if debug_enabled() {
-                    eprintln!(
-                        "[gzippy] Multi-member parallel: {} bytes, {} threads",
-                        output.len(),
-                        num_threads
-                    );
-                }
-                return Ok(output);
-            }
-            Err(e) => {
-                if debug_enabled() {
-                    eprintln!(
-                        "[gzippy] Multi-member parallel failed: {}, trying fallback",
-                        e
-                    );
-                }
-            }
+        let output = crate::bgzf::decompress_multi_member_parallel_to_vec(data, num_threads)?;
+        if debug_enabled() {
+            eprintln!(
+                "[gzippy] Multi-member parallel: {} bytes, {} threads",
+                output.len(),
+                num_threads
+            );
         }
+        return Ok(output);
     }
 
-    // Fallback: Write-based API with a Vec (single-member or parallel failure)
     let mut output = Vec::new();
     decompress_gzip_libdeflate(data, &mut output, num_threads)?;
     Ok(output)
@@ -731,27 +710,17 @@ fn decompress_gzip_libdeflate<W: Write + Send>(
         return Ok(0);
     }
 
-    // Check for BGZF-style markers FIRST (gzippy output with embedded block sizes)
+    // Route based on format — each path is correct for its input type.
     if has_bgzf_markers(data) {
-        match crate::bgzf::decompress_bgzf_parallel(data, writer, num_threads) {
-            Ok(bytes) => {
-                if debug_enabled() {
-                    eprintln!(
-                        "[gzippy] BGZF parallel: {} bytes, {} threads",
-                        bytes, num_threads
-                    );
-                }
-                return Ok(bytes);
-            }
-            Err(e) => {
-                if debug_enabled() {
-                    eprintln!("[gzippy] BGZF parallel failed: {}, trying prefetch", e);
-                }
-            }
+        if debug_enabled() {
+            eprintln!(
+                "[gzippy] BGZF path: {} threads, {} bytes",
+                num_threads,
+                data.len()
+            );
         }
-
-        // Fallback to streaming parallel decompressor with prefetching
-        return decompress_bgzf_parallel_prefetch(data, writer);
+        let bytes = crate::bgzf::decompress_bgzf_parallel(data, writer, num_threads)?;
+        return Ok(bytes);
     }
 
     if !is_likely_multi_member(data) {
@@ -773,28 +742,11 @@ fn decompress_gzip_libdeflate<W: Write + Send>(
         );
     }
 
-    // Multi-member: try parallel decompression first
-    match crate::bgzf::decompress_multi_member_parallel(data, writer, num_threads) {
-        Ok(bytes) => {
-            if debug_enabled() {
-                eprintln!(
-                    "[gzippy] Multi-member parallel: {} bytes, {} threads",
-                    bytes, num_threads
-                );
-            }
-            return Ok(bytes);
-        }
-        Err(e) => {
-            if debug_enabled() {
-                eprintln!(
-                    "[gzippy] Multi-member parallel failed: {}, trying sequential",
-                    e
-                );
-            }
-        }
+    if num_threads > 1 {
+        let bytes = crate::bgzf::decompress_multi_member_parallel(data, writer, num_threads)?;
+        return Ok(bytes);
     }
 
-    // Fallback to sequential libdeflate member-by-member
     decompress_multi_member_sequential(data, writer)
 }
 
@@ -905,11 +857,10 @@ fn parse_bgzf_blocks(data: &[u8]) -> (Vec<(usize, usize)>, bool) {
 
 /// Enhanced parallel decompression for BGZF-style files with prefetching
 ///
-/// Improvements over basic parallel decompression:
-/// 1. Memory prefetching: Hint to CPU to load next blocks into cache
-/// 2. Batch processing: Process blocks in batches for better cache locality
-/// 3. Overlapped I/O: Write previous batch while decompressing next
-/// 4. Optimized slot management: Reuse output buffers
+/// Not currently wired into production (no-fallback policy: the primary
+/// BGZF path must succeed without cascading to this). Kept for reference
+/// and possible future use as an alternative BGZF strategy.
+#[allow(dead_code)]
 fn decompress_bgzf_parallel_prefetch<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     use std::cell::UnsafeCell;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1453,4 +1404,42 @@ pub fn decompress_single_member_libdeflate_pub<W: std::io::Write>(
     writer: &mut W,
 ) -> GzippyResult<u64> {
     decompress_single_member_libdeflate(data, writer)
+}
+
+#[cfg(test)]
+pub fn decompress_gzip_libdeflate_pub<W: std::io::Write + Send>(
+    data: &[u8],
+    writer: &mut W,
+    num_threads: usize,
+) -> GzippyResult<u64> {
+    decompress_gzip_libdeflate(data, writer, num_threads)
+}
+
+#[cfg(test)]
+pub fn decompress_gzip_to_vec_pub(data: &[u8], num_threads: usize) -> GzippyResult<Vec<u8>> {
+    decompress_gzip_to_vec(data, num_threads)
+}
+
+#[cfg(test)]
+pub fn decompress_single_member_pub<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+    num_threads: usize,
+) -> GzippyResult<u64> {
+    decompress_single_member(data, writer, num_threads)
+}
+
+#[cfg(test)]
+pub fn has_bgzf_markers_pub(data: &[u8]) -> bool {
+    has_bgzf_markers(data)
+}
+
+#[cfg(test)]
+pub fn parse_gzip_header_size_pub(data: &[u8]) -> Option<usize> {
+    parse_gzip_header_size(data)
+}
+
+#[cfg(test)]
+pub fn read_gzip_isize_pub(data: &[u8]) -> Option<u32> {
+    read_gzip_isize(data)
 }

@@ -270,6 +270,44 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     let can_parallelize = args.processes > 1;
 
+    // T1 L0-L3 streaming fast path: compress directly from stdin with ~2MB memory.
+    // Must happen BEFORE read_to_end to avoid buffering the entire input.
+    if !can_parallelize
+        && args.compression_level <= 3
+        && !args.huffman
+        && !args.rle
+        && crate::isal_compress::is_available()
+    {
+        let mut input = stdin();
+        let output = BufWriter::with_capacity(1024 * 1024, stdout());
+        let compression_level = args.compression_level as u32;
+
+        if debug_enabled() {
+            let t0 = std::time::Instant::now();
+            let bytes = crate::isal_compress::compress_gzip_stream_direct(
+                &mut input,
+                output,
+                compression_level,
+            )?;
+            let elapsed = t0.elapsed();
+            let mbps = bytes as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+            eprintln!(
+                "[gzippy] compress T1 ISA-L L{} streaming: {:.1}ms, {:.1} MB/s ({} bytes in)",
+                compression_level,
+                elapsed.as_secs_f64() * 1000.0,
+                mbps,
+                bytes
+            );
+        } else {
+            crate::isal_compress::compress_gzip_stream_direct(
+                &mut input,
+                output,
+                compression_level,
+            )?;
+        }
+        return Ok(0);
+    }
+
     // For multi-threaded: try to mmap stdin (zero-copy, all threads share).
     // For single-threaded: read_to_end is faster (sequential read-ahead avoids page faults).
     #[cfg(unix)]

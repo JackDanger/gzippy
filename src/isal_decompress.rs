@@ -136,4 +136,151 @@ mod tests {
         assert_eq!(bytes, original.len());
         assert_eq!(&output[..bytes], &original[..]);
     }
+
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_isal_decompress_corrupt_returns_none() {
+        use super::*;
+
+        let original: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
+        let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
+        let max_size = compressor.gzip_compress_bound(original.len());
+        let mut compressed = vec![0u8; max_size];
+        let size = compressor
+            .gzip_compress(&original, &mut compressed)
+            .unwrap();
+        compressed.truncate(size);
+
+        // Flip a byte in the middle of the compressed data
+        let mid = compressed.len() / 2;
+        compressed[mid] ^= 0xFF;
+
+        let mut output = Vec::new();
+        let result = decompress_gzip_stream(&compressed, &mut output);
+        assert!(result.is_none(), "corrupt data must return None");
+    }
+
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_isal_decompress_truncated_returns_none() {
+        use super::*;
+
+        let original: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
+        let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
+        let max_size = compressor.gzip_compress_bound(original.len());
+        let mut compressed = vec![0u8; max_size];
+        let size = compressor
+            .gzip_compress(&original, &mut compressed)
+            .unwrap();
+        compressed.truncate(size);
+
+        // Truncate to half
+        let truncated = &compressed[..compressed.len() / 2];
+
+        let mut output = Vec::new();
+        let result = decompress_gzip_stream(truncated, &mut output);
+        assert!(result.is_none(), "truncated data must return None");
+    }
+
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_isal_decompress_empty_returns_none() {
+        use super::*;
+
+        let mut output = Vec::new();
+        let result = decompress_gzip_stream(&[], &mut output);
+        assert!(result.is_none(), "empty input must return None");
+    }
+
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_isal_decompress_large_roundtrip() {
+        use super::*;
+
+        let mut data = Vec::with_capacity(4 * 1024 * 1024);
+        let mut rng: u64 = 0xdeadbeef;
+        let phrases: &[&[u8]] = &[
+            b"the quick brown fox jumps over the lazy dog. ",
+            b"pack my box with five dozen liquor jugs! ",
+        ];
+        while data.len() < 4 * 1024 * 1024 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if (rng >> 32) % 5 < 2 {
+                data.push((rng >> 16) as u8);
+            } else {
+                let phrase = phrases[((rng >> 24) as usize) % phrases.len()];
+                let remaining = 4 * 1024 * 1024 - data.len();
+                data.extend_from_slice(&phrase[..remaining.min(phrase.len())]);
+            }
+        }
+        data.truncate(4 * 1024 * 1024);
+
+        let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
+        let max_size = compressor.gzip_compress_bound(data.len());
+        let mut compressed = vec![0u8; max_size];
+        let size = compressor.gzip_compress(&data, &mut compressed).unwrap();
+        compressed.truncate(size);
+
+        let mut result = Vec::new();
+        let bytes = decompress_gzip_stream(&compressed, &mut result).expect("ISA-L failed on 4MB");
+        assert_eq!(bytes as usize, data.len());
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_isal_decompress_into_corrupt_returns_none() {
+        use super::*;
+
+        let original: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+        let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
+        let max_size = compressor.gzip_compress_bound(original.len());
+        let mut compressed = vec![0u8; max_size];
+        let size = compressor
+            .gzip_compress(&original, &mut compressed)
+            .unwrap();
+        compressed.truncate(size);
+
+        let mid = compressed.len() / 2;
+        compressed[mid] ^= 0xFF;
+
+        let mut output = vec![0u8; original.len() + 1024];
+        let result = decompress_gzip_into(&compressed, &mut output);
+        assert!(
+            result.is_none(),
+            "corrupt data into fixed buffer must return None"
+        );
+    }
+
+    // Tests that work on ALL architectures (ISA-L or not)
+
+    #[test]
+    fn test_isal_is_available_consistent() {
+        use super::*;
+        let available = is_available();
+        if cfg!(all(feature = "isal-compression", target_arch = "x86_64")) {
+            assert!(available, "ISA-L must be available on x86_64 with feature");
+        } else {
+            assert!(
+                !available,
+                "ISA-L must not be available without feature/arch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_isal_stub_returns_none_when_unavailable() {
+        use super::*;
+        if is_available() {
+            return;
+        }
+        let valid_gzip = {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(b"hello world").unwrap();
+            enc.finish().unwrap()
+        };
+        let mut output = Vec::new();
+        assert!(decompress_gzip_stream(&valid_gzip, &mut output).is_none());
+    }
 }

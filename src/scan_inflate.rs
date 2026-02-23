@@ -358,4 +358,124 @@ mod tests {
             );
         }
     }
+
+    /// Head-to-head: scan_deflate_fast vs sequential libdeflate on silesia.
+    /// This answers: "Is scan cheap enough to make two-pass parallel viable?"
+    ///
+    /// If scan_ratio > 0.8 → two-pass is hopeless (scan ≈ sequential)
+    /// If scan_ratio ≈ 0.5 → two-pass breaks even at 4 threads
+    /// If scan_ratio < 0.3 → two-pass wins at 4 threads
+    #[test]
+    fn bench_scan_vs_sequential_silesia() {
+        let gz = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping (silesia not found)");
+                return;
+            }
+        };
+
+        let header_size = crate::marker_decode::skip_gzip_header(&gz).expect("valid header");
+        let deflate = &gz[header_size..gz.len() - 8];
+        let isize_val = u32::from_le_bytes([
+            gz[gz.len() - 4],
+            gz[gz.len() - 3],
+            gz[gz.len() - 2],
+            gz[gz.len() - 1],
+        ]) as usize;
+
+        // Warmup
+        let _ = scan_deflate_fast(deflate, isize_val / 8, isize_val);
+        let mut out = vec![0u8; isize_val + 256 * 1024];
+        let _ = crate::consume_first_decode::inflate_consume_first(deflate, &mut out);
+
+        // Measure scan_deflate_fast (5 trials)
+        let mut scan_times = Vec::new();
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let r = scan_deflate_fast(deflate, isize_val / 8, isize_val).unwrap();
+            scan_times.push(t.elapsed());
+            assert_eq!(r.total_output_size, isize_val);
+        }
+
+        // Measure sequential inflate_consume_first (5 trials)
+        let mut seq_times = Vec::new();
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let sz = crate::consume_first_decode::inflate_consume_first(deflate, &mut out).unwrap();
+            seq_times.push(t.elapsed());
+            assert_eq!(sz, isize_val);
+        }
+
+        // Measure sequential libdeflate FFI (5 trials)
+        let mut ffi_times = Vec::new();
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let mut ffi_out = Vec::new();
+            crate::decompression::decompress_single_member_libdeflate_pub(&gz, &mut ffi_out)
+                .unwrap();
+            ffi_times.push(t.elapsed());
+            assert_eq!(ffi_out.len(), isize_val);
+        }
+
+        let scan_median = median_duration(&scan_times);
+        let seq_median = median_duration(&seq_times);
+        let ffi_median = median_duration(&ffi_times);
+
+        let scan_mbps = isize_val as f64 / scan_median.as_secs_f64() / 1e6;
+        let seq_mbps = isize_val as f64 / seq_median.as_secs_f64() / 1e6;
+        let ffi_mbps = isize_val as f64 / ffi_median.as_secs_f64() / 1e6;
+
+        let scan_vs_seq = scan_median.as_secs_f64() / seq_median.as_secs_f64();
+        let scan_vs_ffi = scan_median.as_secs_f64() / ffi_median.as_secs_f64();
+
+        eprintln!(
+            "=== Scan vs Sequential on silesia ({:.1} MB) ===",
+            isize_val as f64 / 1e6
+        );
+        eprintln!(
+            "  scan_deflate_fast:    {:.1} MB/s ({:.1}ms)",
+            scan_mbps,
+            scan_median.as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "  inflate_consume_first:{:.1} MB/s ({:.1}ms)",
+            seq_mbps,
+            seq_median.as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "  libdeflate FFI:       {:.1} MB/s ({:.1}ms)",
+            ffi_mbps,
+            ffi_median.as_secs_f64() * 1000.0
+        );
+        eprintln!("  scan/sequential ratio: {:.2}x", scan_vs_seq);
+        eprintln!("  scan/FFI ratio:        {:.2}x", scan_vs_ffi);
+        eprintln!();
+
+        // Two-pass viability math (4 threads):
+        // total = scan_time + sequential_time / N
+        // speedup = sequential_time / total = 1 / (scan_ratio + 1/N)
+        for n in [2, 4, 8] {
+            let two_pass_time = scan_median.as_secs_f64() + ffi_median.as_secs_f64() / n as f64;
+            let speedup = ffi_median.as_secs_f64() / two_pass_time;
+            let two_pass_mbps = isize_val as f64 / two_pass_time / 1e6;
+            eprintln!(
+                "  Two-pass T{}: {:.1} MB/s ({:.2}x vs FFI sequential) {}",
+                n,
+                two_pass_mbps,
+                speedup,
+                if speedup > 1.0 {
+                    "← FASTER"
+                } else {
+                    "← SLOWER"
+                }
+            );
+        }
+    }
+
+    fn median_duration(times: &[std::time::Duration]) -> std::time::Duration {
+        let mut sorted: Vec<_> = times.to_vec();
+        sorted.sort();
+        sorted[sorted.len() / 2]
+    }
 }

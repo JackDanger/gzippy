@@ -8,7 +8,7 @@
 //!   5. Two-phase: sweep first, then precision re-runs for close races
 //!   6. Strict scoring: gzippy must be >= every competitor, or it's a loss
 //!
-//! Uses `aws-vault exec personal` for credentials.
+//! Uses `aws-vault exec gzippy-dev` for credentials.
 //!
 //! Also runs local Mac benchmarks in parallel with the cloud fleet.
 
@@ -55,7 +55,7 @@ fn aws(args: &[&str]) -> Result<String, String> {
             .map_err(|e| format!("Failed to run aws: {e}"))?
     } else {
         Command::new("aws-vault")
-            .args(["exec", "personal", "-d", "12h", "--"])
+            .args(["exec", "gzippy-dev", "-d", "12h", "--"])
             .arg("aws")
             .arg("--region")
             .arg(REGION)
@@ -119,7 +119,16 @@ fn ssh_timeout(ip: &str, key: &Path, cmd: &str, timeout: Duration) -> Result<Str
     if !output.status.success() && stdout.trim().is_empty() {
         return Err(format!("SSH command failed on {ip}: {stderr}"));
     }
-    Ok(stdout)
+    // Merge stderr into output so diagnostics (GZIPPY_DEBUG, time, etc.) are never lost
+    let mut merged = stdout;
+    if !stderr.trim().is_empty() {
+        for line in stderr.lines() {
+            merged.push_str("[stderr] ");
+            merged.push_str(line);
+            merged.push('\n');
+        }
+    }
+    Ok(merged)
 }
 
 fn ssh_ok(ip: &str, key: &Path) -> bool {
@@ -403,13 +412,29 @@ ISAL_FLAG=""
 if [ "$(uname -m)" = "x86_64" ]; then
     ISAL_FLAG="--features isal-compression"
 fi
-sudo -u {SSH_USER} bash -c "source \$HOME/.cargo/env && cargo build --release $ISAL_FLAG"
+if [ "$(uname -m)" = "x86_64" ]; then
+    # Ensure nasm is on PATH for ISA-L's autotools configure (AC_CHECK_PROG).
+    # sudo -u strips PATH; we pass /usr/bin explicitly so configure finds nasm.
+    # Also clean isal-sys build cache to force re-configure with NASM.
+    NASM_PATH=$(which nasm 2>/dev/null || echo "/usr/bin/nasm")
+    echo "NASM binary: $NASM_PATH ($(nasm -v 2>&1 || echo 'not found'))"
+    sudo -u {SSH_USER} bash -c "source \$HOME/.cargo/env && \
+        cargo clean -p isal-sys 2>/dev/null; \
+        rm -rf target/release/build/isal-sys-* 2>/dev/null; \
+        export PATH=\"/usr/bin:/usr/local/bin:\$PATH\" && \
+        cargo build --release $ISAL_FLAG"
+else
+    sudo -u {SSH_USER} bash -c "source \$HOME/.cargo/env && cargo build --release $ISAL_FLAG"
+fi
 # Verify ISA-L NASM assembly was built (x86 only)
 if [ "$(uname -m)" = "x86_64" ]; then
     ISAL_CONFIG=$(find /home/{SSH_USER}/gzippy/target/release/build/isal-sys-*/out/isa-l/config.log 2>/dev/null | head -1)
     if [ -n "$ISAL_CONFIG" ]; then
         echo "=== ISA-L build config ==="
-        grep -E "HAVE_NASM|USE_NASM" "$ISAL_CONFIG" || echo "NASM vars not found"
+        grep -E "HAVE_NASM|USE_NASM|^AS=|^CCAS=|nasm_cmd|result.*nasm" "$ISAL_CONFIG" || echo "NASM vars not found"
+        echo "=== ISA-L Makefile AS ==="
+        ISAL_MAKEFILE=$(dirname "$ISAL_CONFIG")/Makefile
+        grep -E "^AS = |^CCAS = |^am__append" "$ISAL_MAKEFILE" 2>/dev/null | head -5 || echo "Makefile not found"
     fi
 fi
 sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target'
@@ -545,37 +570,72 @@ fn scenario_key(r: &BenchResult) -> String {
     format!("{}-{}-{}", r.dataset, r.archive, r.threads)
 }
 
+fn run_diagnostics(
+    ip: &str, key: &Path, label: &str, dataset: Option<&str>, direction: &str,
+) -> Option<serde_json::Value> {
+    println!("  [{label}] Running diagnostics...");
+    let repo = format!("/home/{SSH_USER}/gzippy");
+    let mut diag_args = format!(
+        "cd {repo} && export PATH={repo}/bin:$PATH && source $HOME/.cargo/env && \
+         gzippy-dev diag --direction {direction}"
+    );
+    if let Some(ds) = dataset {
+        diag_args.push_str(&format!(" --dataset {ds}"));
+    }
+
+    match ssh_timeout(ip, key, &diag_args, Duration::from_secs(300)) {
+        Ok(output) => {
+            // Find the JSON object in the output (skip any [stderr] lines)
+            let json_lines: String = output.lines()
+                .filter(|l| !l.starts_with("[stderr]"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            match serde_json::from_str::<serde_json::Value>(&json_lines) {
+                Ok(v) => {
+                    println!("  [{label}] Diagnostics collected.");
+                    // Print key highlights
+                    if let Some(arch) = v.get("arch").and_then(|v| v.as_str()) {
+                        print!("    arch={arch}");
+                    }
+                    if let Some(features) = v.get("cpu_features").and_then(|v| v.as_str()) {
+                        let short: String = features.split_whitespace().take(6).collect::<Vec<_>>().join(" ");
+                        print!(" cpu=[{short}...]");
+                    }
+                    if let Some(avx) = v.get("avx_insns_gzippy") {
+                        print!(" avx_gzippy={avx}");
+                    }
+                    if let Some(dispatch) = v.get("dispatch_check").and_then(|v| v.get("verdict")).and_then(|v| v.as_str()) {
+                        print!(" dispatch={dispatch}");
+                    }
+                    println!();
+                    Some(v)
+                }
+                Err(e) => {
+                    eprintln!("  [{label}] Diagnostics JSON parse error: {e}");
+                    // Print raw output for debugging
+                    for line in output.lines().take(10) {
+                        eprintln!("    {line}");
+                    }
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("  [{label}] Diagnostics failed (non-fatal): {e}");
+            None
+        }
+    }
+}
+
 fn run_benchmarks_on(
     ip: &str, key: &Path, label: &str, dataset: Option<&str>,
     direction: &str,
-) -> Result<Vec<BenchResult>, String> {
+) -> Result<(Vec<BenchResult>, Option<serde_json::Value>), String> {
     let ds_label = dataset.unwrap_or("all");
     let dir_label = direction;
 
-    // ISA-L compress diagnostic: run once before benchmarks on x86 compress instances
-    if direction == "compress" && label.contains("x86_64") {
-        println!("  [{label}] ISA-L compress diagnostic...");
-        let repo = format!("/home/{SSH_USER}/gzippy");
-        let diag_cmd = format!(
-            "cd {repo} && source $HOME/.cargo/env && \
-             echo '=== ISA-L build config ===' && \
-             (find target/release/build/isal-sys-*/out/isa-l/config.log -exec grep -E 'HAVE_NASM|nasm_cmd|result.*nasm|AS=|CCAS=|CFLAGS=' {{}} \\; 2>/dev/null || echo 'config.log not found') && \
-             echo '=== ISA-L compress micro-benchmark ===' && \
-             timeout 60 cargo test --release --features isal-compression bench_isal_compress_throughput -- --nocapture 2>&1 | tail -10 && \
-             echo '=== gzippy compress timing (software L1 T1) ===' && \
-             GZIPPY_DEBUG=1 ./target/release/gzippy -1 -c -p1 < /dev/shm/software.tar > /dev/null 2>&1 | head -5 && \
-             echo '=== igzip compress timing (software L1 T1) ===' && \
-             time ./bin/igzip -1 -c < /dev/shm/software.tar > /dev/null 2>&1"
-        );
-        match ssh_timeout(ip, key, &diag_cmd, Duration::from_secs(120)) {
-            Ok(output) => {
-                for line in output.lines() {
-                    println!("    {line}");
-                }
-            }
-            Err(e) => eprintln!("  [{label}] diagnostic failed (non-fatal): {e}"),
-        }
-    }
+    // Structured diagnostics (replaces ad-hoc ISA-L diagnostic block)
+    let diagnostics = run_diagnostics(ip, key, label, dataset, direction);
 
     println!("\n  [{label}] Phase 1: {dir_label} sweep {ds_label} ({SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.0}%, Tmax={BENCH_TMAX_THREADS})",
         SWEEP_TARGET_CV * 100.0);
@@ -608,7 +668,7 @@ fn run_benchmarks_on(
     let close_races = find_close_races(&sweep);
     if close_races.is_empty() {
         println!("  [{label}] Phase 2: No close races, all decisive");
-        return Ok(sweep);
+        return Ok((sweep, diagnostics));
     }
 
     println!("\n  [{label}] Phase 2: {} close race(s) ({PRECISION_MIN_TRIALS}-{PRECISION_MAX_TRIALS} trials, CV<{:.1}%)",
@@ -635,7 +695,7 @@ fn run_benchmarks_on(
         all.extend(precision);
     }
 
-    Ok(all)
+    Ok((all, diagnostics))
 }
 
 fn find_close_races(results: &[BenchResult]) -> Vec<(String, String, String)> {
@@ -869,7 +929,7 @@ fn print_results(results: &[BenchResult]) {
     println!();
 }
 
-fn dump_results_json(results: &[BenchResult], wall_time_secs: f64) {
+fn dump_results_json(results: &[BenchResult], wall_time_secs: f64, diagnostics: &serde_json::Map<String, serde_json::Value>) {
     let items: Vec<serde_json::Value> = results.iter().map(|r| {
         serde_json::json!({
             "platform": r.platform,
@@ -925,6 +985,7 @@ fn dump_results_json(results: &[BenchResult], wall_time_secs: f64) {
         "total_scenarios": wins + losses,
         "results": items,
         "scorecard": scorecard,
+        "diagnostics": serde_json::Value::Object(diagnostics.clone()),
     });
 
     let json_path = find_repo_root()
@@ -1136,19 +1197,20 @@ fn run_fleet(
             let completed = completed.clone();
             let failed = failed.clone();
             let total = instance_count;
-            std::thread::spawn(move || -> Vec<BenchResult> {
+            std::thread::spawn(move || -> (Vec<BenchResult>, Option<(String, serde_json::Value)>) {
                 match run_benchmarks_on(&ip, &key, &label, Some(&dataset), &direction) {
-                    Ok(results) => {
+                    Ok((results, diag)) => {
                         let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         let fail = failed.load(std::sync::atomic::Ordering::Relaxed);
                         println!("  [{label}] DONE ({done}/{total} complete, {fail} failed)");
-                        results
+                        let diag_entry = diag.map(|d| (label.clone(), d));
+                        (results, diag_entry)
                     }
                     Err(e) => {
                         let fail = failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         let done = completed.load(std::sync::atomic::Ordering::Relaxed);
                         eprintln!("  [{label}] FAILED: {e} ({done}/{total} complete, {fail} failed)");
-                        Vec::new()
+                        (Vec::new(), None)
                     }
                 }
             })
@@ -1156,9 +1218,15 @@ fn run_fleet(
         .collect();
 
     let mut all = Vec::new();
+    let mut all_diags = serde_json::Map::new();
     for h in cloud_handles {
         match h.join() {
-            Ok(results) => all.extend(results),
+            Ok((results, diag)) => {
+                all.extend(results);
+                if let Some((label, d)) = diag {
+                    all_diags.insert(label, d);
+                }
+            }
             Err(_) => eprintln!("  Warning: a benchmark thread panicked"),
         }
     }
@@ -1174,7 +1242,7 @@ fn run_fleet(
     println!("\n  Total wall time: {:.0}s ({:.1} min)", elapsed.as_secs_f64(), elapsed.as_secs_f64() / 60.0);
 
     print_results(&all);
-    dump_results_json(&all, elapsed.as_secs_f64());
+    dump_results_json(&all, elapsed.as_secs_f64(), &all_diags);
     Ok(())
 }
 
@@ -1204,6 +1272,131 @@ fn base64_encode(input: &str) -> String {
     }
     let output = child.wait_with_output().expect("base64 failed");
     String::from_utf8_lossy(&output.stdout).replace('\n', "")
+}
+
+/// Launch a single EC2 instance, wait for setup, run a command with live output, tear down.
+pub fn run_command(arch: &str, user_cmd: &str) -> Result<(), String> {
+    let arch = match arch {
+        "x86" | "x86_64" | "amd64" => "x86_64",
+        "arm" | "arm64" | "aarch64" | "graviton" => "arm64",
+        _ => return Err(format!("Unknown arch '{arch}'. Use x86 or arm64.")),
+    };
+    let instance_type = if arch == "x86_64" { X86_TYPE } else { ARM64_TYPE };
+
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║  CLOUD RUN — single {arch} instance ({instance_type})");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+
+    if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
+        let _ = Command::new("aws-vault").arg("--version")
+            .output().map_err(|_| "aws-vault not found and no AWS_ACCESS_KEY_ID in env")?;
+    }
+
+    let commit = cmd_output("git", &["rev-parse", "HEAD"])?;
+    let commit_short = &commit[..8.min(commit.len())];
+    let branch = cmd_output("git", &["branch", "--show-current"]).unwrap_or_else(|_| "detached".into());
+    let raw_repo_url = cmd_output("git", &["remote", "get-url", "origin"])?;
+    let repo_url = if raw_repo_url.starts_with("git@github.com:") {
+        raw_repo_url.replace("git@github.com:", "https://github.com/")
+    } else {
+        raw_repo_url.clone()
+    };
+
+    let remote_check = cmd_output("git", &["branch", "-r", "--contains", "HEAD"]);
+    if remote_check.map(|s| s.trim().is_empty()).unwrap_or(true) {
+        return Err(format!(
+            "HEAD ({commit_short}) is not pushed. Run `git push` first."
+        ));
+    }
+
+    println!("  Branch: {branch}  Commit: {commit_short}");
+    println!("  Arch: {arch}  Instance: {instance_type}");
+    println!("  Command: {user_cmd}");
+    println!();
+
+    let session = generate_session_id();
+    let mut cleanup = CleanupState::new();
+    let result = run_single_instance(arch, instance_type, &commit, &repo_url, user_cmd, &session, &mut cleanup);
+
+    println!("\n  Cleaning up...");
+    cleanup.run();
+    println!("  Done.");
+    result
+}
+
+fn run_single_instance(
+    arch: &str, instance_type: &str, commit: &str, repo_url: &str,
+    user_cmd: &str, session: &str, cleanup: &mut CleanupState,
+) -> Result<(), String> {
+    print!("  VPC/subnet... ");
+    let _ = std::io::stdout().flush();
+    let (vpc_id, subnet_id) = find_vpc_and_subnet()?;
+    println!("{vpc_id}/{subnet_id}");
+
+    print!("  SSH key... ");
+    let _ = std::io::stdout().flush();
+    let (key_name, key_path) = create_key_pair(session)?;
+    cleanup.key_name = Some(key_name.clone());
+    cleanup.key_path = Some(key_path.clone());
+    println!("OK");
+
+    print!("  Security group... ");
+    let _ = std::io::stdout().flush();
+    let sg_id = create_security_group(session, &vpc_id)?;
+    cleanup.sg_id = Some(sg_id.clone());
+    println!("{sg_id}");
+
+    print!("  AMI ({arch})... ");
+    let _ = std::io::stdout().flush();
+    let ami = find_ubuntu_ami(arch)?;
+    println!("{ami}");
+
+    let userdata = user_data_script(commit, repo_url);
+    let userdata_b64 = base64_encode(&userdata);
+
+    print!("  Launching {instance_type}... ");
+    let _ = std::io::stdout().flush();
+    let instance_id = launch_on_demand(instance_type, &ami, &key_name, &sg_id, &subnet_id, &userdata_b64, session)?;
+    cleanup.instance_ids.push(instance_id.clone());
+    println!("{instance_id}");
+
+    let label = format!("{arch}/run");
+    let ip = get_public_ip(&instance_id)?;
+    println!("  IP: {ip}");
+
+    wait_for_ssh(&ip, &key_path, &label)?;
+    wait_for_setup(&ip, &key_path, &label)?;
+
+    println!();
+    println!("  ═══ RUNNING COMMAND ═══");
+    println!();
+
+    let full_cmd = format!(
+        "cd /home/{SSH_USER}/gzippy && \
+         export PATH=/home/{SSH_USER}/gzippy/bin:$PATH && \
+         export TMPDIR=/dev/shm && \
+         source $HOME/.cargo/env && \
+         {user_cmd}"
+    );
+
+    // Stream output live to terminal (no buffering)
+    let status = Command::new("ssh")
+        .args(ssh_opts(&key_path))
+        .arg(format!("{SSH_USER}@{ip}"))
+        .arg(&full_cmd)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("SSH to {ip}: {e}"))?;
+
+    println!();
+    if status.success() {
+        println!("  Command completed successfully.");
+    } else {
+        println!("  Command exited with status: {}", status.code().unwrap_or(-1));
+    }
+
+    Ok(())
 }
 
 pub fn cleanup_all() -> Result<(), String> {

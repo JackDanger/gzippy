@@ -326,4 +326,109 @@ mod tests {
             spread * 100.0
         );
     }
+
+    // =========================================================================
+    // Pipelined block size boundary tests
+    // =========================================================================
+
+    #[test]
+    fn test_pipelined_block_size_below_50mb() {
+        let data = make_mixed_data(49 * 1024 * 1024);
+        let compressed = compress_pipelined(&data, 6, 2);
+        let decompressed = decompress_reference(&compressed);
+        assert_eq!(decompressed.len(), data.len());
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_pipelined_block_size_above_50mb() {
+        let data = make_mixed_data(51 * 1024 * 1024);
+        let compressed = compress_pipelined(&data, 6, 2);
+        let decompressed = decompress_reference(&compressed);
+        assert_eq!(decompressed.len(), data.len());
+        assert_eq!(decompressed, data);
+    }
+
+    // =========================================================================
+    // T1 pipelined deadlock regression test
+    // =========================================================================
+
+    #[test]
+    fn test_t1_pipelined_completes_without_deadlock() {
+        use std::time::Duration;
+        let data = make_mixed_data(500_000);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let data_clone = data.clone();
+        let handle = std::thread::spawn(move || {
+            let compressed = compress_pipelined(&data_clone, 6, 1);
+            tx.send(compressed).unwrap();
+        });
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(compressed) => {
+                let decompressed = decompress_reference(&compressed);
+                assert_eq!(decompressed, data, "T1 pipelined output must match");
+            }
+            Err(_) => panic!("T1 pipelined compression deadlocked (>30s)"),
+        }
+        handle.join().unwrap();
+    }
+
+    // =========================================================================
+    // Ratio probe routing tests
+    // =========================================================================
+
+    #[test]
+    fn test_ratio_probe_libdeflate_for_incompressible_data() {
+        // Random data is incompressible (ratio >= 10%) → libdeflate path
+        let data = make_literal_data(200_000);
+        let level = 3u32;
+        let lvl = libdeflater::CompressionLvl::new(level as i32).unwrap();
+        let mut comp = libdeflater::Compressor::new(lvl);
+        let bound = comp.deflate_compress_bound(65536);
+        let mut out = vec![0u8; bound];
+        let actual = comp
+            .deflate_compress(&data[..65536], &mut out)
+            .unwrap_or(65536);
+        let ratio = actual as f64 / 65536.0;
+        assert!(
+            ratio >= 0.10,
+            "random data ratio {:.3} should be >= 0.10 (libdeflate path)",
+            ratio
+        );
+    }
+
+    #[test]
+    fn test_ratio_probe_flate2_for_highly_compressible() {
+        // All-zeros data should route to flate2 (ratio < 10%)
+        let data = vec![0u8; 200_000];
+        let level = 3u32;
+        let lvl = libdeflater::CompressionLvl::new(level as i32).unwrap();
+        let mut comp = libdeflater::Compressor::new(lvl);
+        let bound = comp.deflate_compress_bound(65536);
+        let mut out = vec![0u8; bound];
+        let actual = comp
+            .deflate_compress(&data[..65536], &mut out)
+            .unwrap_or(65536);
+        let ratio = actual as f64 / 65536.0;
+        assert!(
+            ratio < 0.10,
+            "all-zeros ratio {:.3} should be < 0.10 (flate2 path)",
+            ratio
+        );
+    }
+
+    #[test]
+    fn test_both_ratio_paths_produce_valid_gzip() {
+        // Regardless of which path the ratio probe chooses,
+        // the output must be valid gzip that decompresses correctly.
+        let normal_data = make_mixed_data(200_000);
+        let compressed_normal = compress_libdeflate(&normal_data, 3);
+        let dec_normal = decompress_reference(&compressed_normal);
+        assert_eq!(dec_normal, normal_data, "libdeflate path output must match");
+
+        let zeros = vec![0u8; 200_000];
+        let compressed_zeros = compress_flate2(&zeros, 3);
+        let dec_zeros = decompress_reference(&compressed_zeros);
+        assert_eq!(dec_zeros, zeros, "flate2 path output must match");
+    }
 }

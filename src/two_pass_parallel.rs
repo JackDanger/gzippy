@@ -343,4 +343,127 @@ mod tests {
         assert_eq!(output.len(), data.len());
         assert_eq!(output, data, "Output mismatch on diverse data");
     }
+
+    #[test]
+    fn test_two_pass_thread_counts() {
+        let original = b"Thread count test data for parallel decompression. ";
+        let mut big_data = Vec::new();
+        for _ in 0..100_000 {
+            big_data.extend_from_slice(original);
+        }
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&big_data).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        for threads in [2, 4, 8, 16] {
+            let result = decompress_two_pass_parallel(&compressed, threads).unwrap();
+            if threads < 2 {
+                assert!(
+                    result.is_none(),
+                    "Should return None for {} threads",
+                    threads
+                );
+            } else if let Some(output) = result {
+                assert_eq!(
+                    output.len(),
+                    big_data.len(),
+                    "Size mismatch at {} threads",
+                    threads
+                );
+                assert_eq!(output, big_data, "Content mismatch at {} threads", threads);
+            }
+        }
+    }
+
+    #[test]
+    fn test_two_pass_chunk_boundaries_consistent() {
+        let mut data = Vec::with_capacity(10 * 1024 * 1024);
+        let mut rng: u64 = 42;
+        while data.len() < 10 * 1024 * 1024 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            data.push((rng >> 32) as u8);
+            if rng % 20 < 10 {
+                let byte = ((rng >> 16) % 26 + b'a' as u64) as u8;
+                for _ in 0..(rng % 10 + 2) as usize {
+                    if data.len() < 10 * 1024 * 1024 {
+                        data.push(byte);
+                    }
+                }
+            }
+        }
+        data.truncate(10 * 1024 * 1024);
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&data).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let header_size = parse_gzip_header_size(&compressed).unwrap();
+        let deflate_data = &compressed[header_size..compressed.len() - 8];
+        let isize_hint = u32::from_le_bytes([
+            compressed[compressed.len() - 4],
+            compressed[compressed.len() - 3],
+            compressed[compressed.len() - 2],
+            compressed[compressed.len() - 1],
+        ]) as usize;
+
+        let scan = crate::scan_inflate::scan_deflate_fast(deflate_data, isize_hint / 8, isize_hint)
+            .expect("scan should succeed");
+
+        let chunks = build_chunks(deflate_data, &scan.checkpoints, scan.total_output_size);
+
+        // Verify chunks cover the entire output without gaps or overlaps
+        let mut covered = 0;
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert_eq!(
+                chunk.output_offset, covered,
+                "chunk {} starts at {} but expected {}",
+                i, chunk.output_offset, covered
+            );
+            covered += chunk.expected_output_size;
+        }
+        assert_eq!(
+            covered, scan.total_output_size,
+            "chunks don't cover entire output"
+        );
+    }
+
+    #[test]
+    fn test_two_pass_silesia_roundtrip() {
+        let gz = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping (silesia not found)");
+                return;
+            }
+        };
+
+        let mut ref_output = Vec::new();
+        {
+            let mut decoder = flate2::read::GzDecoder::new(&gz[..]);
+            std::io::Read::read_to_end(&mut decoder, &mut ref_output).unwrap();
+        }
+
+        let result = decompress_two_pass_parallel(&gz, 4).unwrap();
+        assert!(result.is_some(), "silesia should use parallel path");
+        let output = result.unwrap();
+        assert_eq!(output.len(), ref_output.len(), "silesia size mismatch");
+        assert_eq!(output, ref_output, "silesia content mismatch");
+    }
+
+    #[test]
+    fn test_two_pass_single_thread_returns_none() {
+        let original = b"Single thread should not use parallel path. ";
+        let mut big_data = Vec::new();
+        for _ in 0..100_000 {
+            big_data.extend_from_slice(original);
+        }
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&big_data).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let result = decompress_two_pass_parallel(&compressed, 1).unwrap();
+        assert!(result.is_none(), "Single thread should return None");
+    }
 }

@@ -109,6 +109,9 @@ pub struct MarkerDecoder {
     distance_to_last_marker: usize,
     /// Number of markers written
     marker_count: usize,
+    /// Maximum output bytes (checked inside block decode loops).
+    /// usize::MAX means no limit.
+    output_limit: usize,
 }
 
 impl MarkerDecoder {
@@ -128,6 +131,7 @@ impl MarkerDecoder {
             marker_mode: true,
             distance_to_last_marker: 0,
             marker_count: 0,
+            output_limit: usize::MAX,
         }
     }
 
@@ -295,9 +299,11 @@ impl MarkerDecoder {
 
     /// Decode fixed Huffman block
     fn decode_fixed_huffman(&mut self) -> io::Result<()> {
-        // Fixed Huffman uses predefined tables
-        // Literals 0-143: 8 bits, 144-255: 9 bits, 256-279: 7 bits, 280-287: 8 bits
         loop {
+            if self.output_limit_reached() {
+                return Ok(());
+            }
+
             let symbol = self.decode_fixed_literal()?;
 
             if symbol < 256 {
@@ -349,10 +355,13 @@ impl MarkerDecoder {
         ))
     }
 
-    /// Decode distance using fixed Huffman
+    /// Decode distance using fixed Huffman.
+    /// Per RFC 1951 §3.1.1, Huffman codes are packed MSB-first.
     fn decode_fixed_distance(&mut self) -> io::Result<usize> {
-        // Fixed distance: 5 bits, codes 0-29
-        let code = self.read_bits(5)? as usize;
+        let mut code = 0usize;
+        for _ in 0..5 {
+            code = (code << 1) | self.read_bit()? as usize;
+        }
         self.decode_distance_from_code(code)
     }
 
@@ -435,6 +444,10 @@ impl MarkerDecoder {
 
         // Decode symbols
         loop {
+            if self.output_limit_reached() {
+                return Ok(());
+            }
+
             let symbol = self.decode_huffman(&lit_table, 15)?;
 
             if symbol < 256 {
@@ -450,18 +463,26 @@ impl MarkerDecoder {
         }
     }
 
-    /// Decode Huffman symbol
+    /// Decode Huffman symbol.
+    ///
+    /// Peeks up to `max_bits` from the input, zero-filling if EOF is reached
+    /// mid-peek (matching libdeflate's generic loop behavior). Only errors if
+    /// the actual code length exceeds the bits that were available.
     fn decode_huffman(&mut self, table: &[(u16, u8)], max_bits: u8) -> io::Result<u16> {
-        // Peek max_bits from the input (LSB first, which is already reversed for the table)
+        let saved_byte_pos = self.byte_pos;
+        let saved_bit_pos = self.bit_pos;
+
         let mut code = 0u32;
+        let mut bits_read: u8 = 0;
+
         for i in 0..max_bits {
             if self.byte_pos >= self.data.len() {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
+                break; // zero-fill remaining bits (code already 0 in high positions)
             }
             let bit = (self.data[self.byte_pos] >> self.bit_pos) & 1;
             code |= (bit as u32) << i;
+            bits_read = i + 1;
 
-            // Advance position temporarily
             self.bit_pos += 1;
             if self.bit_pos >= 8 {
                 self.bit_pos = 0;
@@ -469,18 +490,10 @@ impl MarkerDecoder {
             }
         }
 
-        // Look up in table
         let idx = code as usize;
         if idx >= table.len() {
-            // Rewind
-            for _ in 0..max_bits {
-                if self.bit_pos == 0 {
-                    self.bit_pos = 7;
-                    self.byte_pos -= 1;
-                } else {
-                    self.bit_pos -= 1;
-                }
-            }
+            self.byte_pos = saved_byte_pos;
+            self.bit_pos = saved_bit_pos;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid Huffman code (out of bounds)",
@@ -489,29 +502,31 @@ impl MarkerDecoder {
 
         let (symbol, len) = table[idx];
         if len == 0 || len > max_bits {
-            // Rewind
-            for _ in 0..max_bits {
-                if self.bit_pos == 0 {
-                    self.bit_pos = 7;
-                    self.byte_pos -= 1;
-                } else {
-                    self.bit_pos -= 1;
-                }
-            }
+            self.byte_pos = saved_byte_pos;
+            self.bit_pos = saved_bit_pos;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid Huffman code (zero length)",
             ));
         }
 
-        // Rewind by (max_bits - len) to only consume the bits we used
-        let extra_bits = max_bits - len;
-        for _ in 0..extra_bits {
-            if self.bit_pos == 0 {
-                self.bit_pos = 7;
-                self.byte_pos -= 1;
-            } else {
-                self.bit_pos -= 1;
+        if len > bits_read {
+            self.byte_pos = saved_byte_pos;
+            self.bit_pos = saved_bit_pos;
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "EOF in Huffman code",
+            ));
+        }
+
+        // Restore and advance exactly `len` bits
+        self.byte_pos = saved_byte_pos;
+        self.bit_pos = saved_bit_pos;
+        for _ in 0..len {
+            self.bit_pos += 1;
+            if self.bit_pos >= 8 {
+                self.bit_pos = 0;
+                self.byte_pos += 1;
             }
         }
 
@@ -582,22 +597,37 @@ impl MarkerDecoder {
         Ok(())
     }
 
+    /// Set a hard output limit enforced INSIDE block decode loops.
+    /// Without this, a single large block can produce unbounded output
+    /// because decode_until only checks between blocks.
+    pub fn set_output_limit(&mut self, limit: usize) {
+        self.output_limit = limit;
+    }
+
+    #[inline]
+    fn output_limit_reached(&self) -> bool {
+        self.output.len() >= self.output_limit
+    }
+
     /// Decode until output reaches max_output bytes OR stream ends (BFINAL=1)
     /// Returns Ok(true) if stream ended, Ok(false) if output limit reached
     pub fn decode_until(&mut self, max_output: usize) -> io::Result<bool> {
+        self.output_limit = max_output;
         loop {
             if self.output.len() >= max_output {
-                return Ok(false); // Hit output limit
+                return Ok(false);
             }
 
             match self.decode_block() {
                 Ok(is_final) => {
                     if is_final {
-                        return Ok(true); // Stream ended
+                        return Ok(true);
+                    }
+                    if self.output_limit_reached() {
+                        return Ok(false);
                     }
                 }
                 Err(e) => {
-                    // If we've decoded a substantial amount and hit EOF, consider it success
                     if e.kind() == io::ErrorKind::UnexpectedEof && !self.output.is_empty() {
                         return Ok(true);
                     }
@@ -610,6 +640,7 @@ impl MarkerDecoder {
     /// Decode until compressed bit position reaches max_bit OR output reaches max_output
     /// OR stream ends (BFINAL=1). Used by parallel single-member to limit each chunk.
     pub fn decode_until_bit(&mut self, max_output: usize, max_bit: usize) -> io::Result<bool> {
+        self.output_limit = max_output;
         loop {
             if self.output.len() >= max_output {
                 return Ok(false);
@@ -622,6 +653,9 @@ impl MarkerDecoder {
                 Ok(is_final) => {
                     if is_final {
                         return Ok(true);
+                    }
+                    if self.output_limit_reached() {
+                        return Ok(false);
                     }
                 }
                 Err(e) => {

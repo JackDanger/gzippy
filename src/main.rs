@@ -22,6 +22,7 @@ mod compress_oracle_tests;
 mod compression;
 mod consume_first_decode;
 mod consume_first_table;
+mod correctness_tests;
 mod decompression;
 mod double_literal;
 mod error;
@@ -40,6 +41,7 @@ mod marker_decode;
 mod optimization;
 mod packed_lut;
 mod parallel_compress;
+#[allow(dead_code)]
 mod parallel_single_member;
 mod pipeline_tests;
 mod pipelined_compress;

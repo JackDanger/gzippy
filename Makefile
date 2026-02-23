@@ -26,7 +26,7 @@ RAPIDGZIP_BIN := $(RAPIDGZIP_DIR)/librapidarchive/build/src/tools/rapidgzip
 GZIP_BIN := $(shell if [ -x $(GZIP_DIR)/gzip ]; then echo $(GZIP_DIR)/gzip; else echo $$(which gzip); fi)
 SYSTEM_GZIP := $(shell which gzip)
 
-.PHONY: all build quick perf-full test-data test-data-quick clean help validate deps
+.PHONY: all build quick perf-full test-data test-data-quick clean help validate deps ship
 
 # =============================================================================
 # Default target: quick benchmark for fast iteration (< 30 seconds)
@@ -96,6 +96,51 @@ FORCE:
 # =============================================================================
 quick: $(GZIPPY_BIN) $(UNGZIPPY_BIN) $(PIGZ_BIN) deps
 	@python3 scripts/perf.py --sizes 1,10 --levels 6 --threads 1,4
+
+# =============================================================================
+# Ship: tests + clippy + cloud fleet benchmarks (the "are we good?" command)
+#
+# Runs the full correctness test suite, then launches the EC2 fleet for
+# performance benchmarks. Fails fast if tests or clippy don't pass.
+#
+# AWS: auto-uses aws-vault gzippy-dev, or source .env for explicit creds
+# Time: ~15 minutes (tests: ~30s, fleet: ~12-15 min)
+# =============================================================================
+ship: $(GZIPPY_BIN)
+	@echo "══════════════════════════════════════════════════════"
+	@echo "  SHIP: tests → clippy → cloud fleet benchmarks"
+	@echo "══════════════════════════════════════════════════════"
+	@echo ""
+	@echo "── Step 1/4: cargo test ──"
+	@cargo test --release || (echo "TESTS FAILED — aborting ship" && exit 1)
+	@echo ""
+	@echo "── Step 2/4: cargo clippy ──"
+	@cargo clippy --all-targets -- -D warnings || (echo "CLIPPY FAILED — aborting ship" && exit 1)
+	@echo ""
+	@echo "── Step 3/4: rebuild gzippy-dev ──"
+	@cd tools/devtool && cargo build --release 2>&1 | grep -E "Compiling|Finished|error" || true
+	@cp tools/devtool/target/release/gzippy-dev . 2>/dev/null || true
+	@echo ""
+	@echo "── Step 4/4: cloud fleet benchmarks ──"
+	@if [ -z "$$AWS_ACCESS_KEY_ID" ]; then \
+		echo "No AWS creds in env — cloud.rs will use aws-vault exec gzippy-dev"; \
+	fi
+	./gzippy-dev cloud bench
+	@echo ""
+	@echo "══════════════════════════════════════════════════════"
+	@echo "  Scorecard:"
+	@echo "══════════════════════════════════════════════════════"
+	./gzippy-dev score
+	@echo ""
+	@echo "Done. Run './gzippy-dev losses' for gap analysis."
+
+# =============================================================================
+# AWS credentials for cloud fleet benchmarks (optional — cloud.rs auto-uses
+# aws-vault exec gzippy-dev when no env creds are present)
+# =============================================================================
+.env:
+	aws-vault exec gzippy-dev --no-session -d 12h -- env | grep '^AWS_' > .env
+	@echo "AWS credentials written to .env (gzippy-dev account)"
 
 # =============================================================================
 # Full performance tests (10+ minutes) - for humans at release time
@@ -420,6 +465,10 @@ bench-exhaustive: bench-all
 help:
 	@echo "gzippy - The Fastest Parallel Gzip"
 	@echo "======================================"
+	@echo ""
+	@echo "The one command:"
+	@echo "  make ship         Tests + clippy + EC2 fleet benchmarks + scorecard"
+	@echo "                    (uses aws-vault gzippy-dev, or source .env)"
 	@echo ""
 	@echo "Quick commands (for AI tools and iteration):"
 	@echo "  make              Build and run quick benchmark (< 30 seconds)"

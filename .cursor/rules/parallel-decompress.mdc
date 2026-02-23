@@ -1,68 +1,136 @@
 ---
-description: Parallel decompression strategy — what works, what doesn't, and why
+description: Parallel decompression — architecture, proven failures, and invariants
 alwaysApply: true
 ---
 
-# Parallel Decompression: Architecture & Lessons
+# Parallel Single-Member Decompression: What We Know
 
-## What Works
+## Architecture That Works (BGZF / Multi-Member)
 
-**BGZF (gzippy's format)**: Members are independent → trivially parallel.
-Pipelined streaming (buffer pool + ordered writer) achieves 2.88x scaling at T4.
+BGZF and multi-member files have explicit boundaries between independent gzip
+members. Each member decompresses independently → trivially parallel. This is
+production-proven and dominant in benchmarks.
 
-**Multi-member (pigz output)**: Scan member boundaries, parallel decode per member.
+## Single-Member Parallel: The Hard Problem
 
-## What Does NOT Work for Single-Member
+Single-member gzip = one deflate stream = no natural split points.
 
-### Two-Pass (scan + re-decode)
-**Tried, measured, rejected.** Scan pass does full inflate work (1x), parallel
-re-decode adds 0.25x/thread. Total: ~2x work. At 4 threads: net SLOWER.
-Break-even requires scan-only decoder (no output writes) which is 2x faster.
+### Current State (Feb 2026)
 
-### Speculative Block Finding
-**Tried, measured, rejected.** Block finder success rate <5% on complex data.
-Failed attempts waste 10s+ before fallback. Caused -86% regression (PR #43).
+Pipeline infrastructure is complete and tested (124 tests, 0 failures).
+Not wired into production — block finder still produces false positives
+on silesia that the chain convergence check correctly detects and rejects.
 
-### Giving `&data[start..]` to chunk decoders
-**Caused -86% regression (PR #43).** Each chunk must receive only its slice
-`&data[start..end]`; passing the full tail forces every decoder to scan
-through the entire remaining stream.
+### What Works
 
-## What MIGHT Work (Not Yet Implemented)
+- **try_decode_at**: Three-layer validation (output volume ≥512KB, markers >0,
+  marker rate <20%) eliminates >99% of false positives at random positions.
+- **Chain convergence check**: After `decode_until_bit`, verify
+  `bit_position() == target`. If not, the boundary is a false positive.
+  This is the definitive test — no false positive can pass it.
+- **Buffered output**: `resolve_and_write` buffers all output, verifies
+  CRC32 + ISIZE against gzip trailer, only writes on success. Wrong data
+  NEVER reaches the writer.
+- **Oracle pipeline**: With oracle boundaries (from scan_deflate_fast),
+  the pipeline produces byte-exact output on all data patterns.
+- **MarkerDecoder**: Correct for all block types (stored, fixed, dynamic).
+  Markers propagate through the window — this is correct behavior.
 
-### Scan-Only Decoder with Circular Window
-A decode pass that maintains only a 32KB circular buffer (L1-resident) instead
-of a full output buffer. Skips actual output writes but tracks positions and
-windows for checkpoints. Estimated 2x faster than full decode.
+### What Doesn't Work Yet
 
-Pipeline: 1 scanner thread (2x inflate speed) + 3 decoder threads.
-Estimated throughput: 2x sequential on 4 threads.
+- **Block finder recall on real data**: Block finder finds candidates near
+  real boundaries, but `try_decode_at` sometimes accepts positions on a
+  different deflate block chain. The chain convergence check catches these
+  (returns DecodeFailed), but means the parallel attempt fails.
+- **max_output_for_chunk at extreme ratios**: Uses 8:1 ratio cap. RLE data
+  (100:1+) hits the limit and produces truncated output. Need ISIZE-based
+  per-chunk limits.
 
-### rapidgzip-Style Pipeline (block finder + decoder threads)
-rapidgzip achieves 1.8-2.7x scaling by NOT doing a full scan pass. Instead:
-1. Each decoder thread speculatively finds block boundaries via precode validation
-2. Decodes with markers for unresolved back-references
-3. Resolves markers after preceding chunk completes
+## False Positive Detection (3 Layers)
 
-Key to making this work: FAST precode rejection (99.97% of bit positions rejected
-in ~10 cycles via LUT + Kraft inequality check).
+### Layer 1: try_decode_at
+- Output volume ≥ 512KB (scaled down near end of stream)
+- Marker count > 0 (stream start has no markers)
+- Marker rate < 20% (false positives have 50-100% markers)
 
-## Infrastructure Available
+### Layer 2: Chain convergence (in decode_chunks_parallel)
+- After `decode_until_bit(target)`, verify `bit_position() == target`
+- Exact equality = real boundary (on same block chain)
+- Overshoot = false positive (different block chain)
+- This is the ONLY definitive test — all other checks are heuristic
+
+### Layer 3: CRC32 verification (in resolve_and_write)
+- Buffer all output before writing
+- Compute CRC32, compare to gzip trailer
+- If mismatch: return CrcMismatch, writer receives nothing
+- This catches any corruption that slips through layers 1-2
+
+## Proven Failure Modes
+
+### 1. False positive boundaries (THE PRIMARY BUG)
+**Symptom**: try_decode accepts positions that produce 34K output (tiny
+self-contained false sequences) or 55M output (wrong block chain with
+mostly-literal decode).
+**Root cause**: Original threshold too low (32KB output). No marker rate
+check. No chain convergence verification.
+**Fix**: Three-layer detection (above). 512KB output threshold + marker
+rate <20% + chain convergence check + CRC32 verification.
+
+### 2. Marker propagation through window
+**Symptom**: Markers appear after 32KB of chunk output.
+**Root cause**: When a resolved reference copies a position that contains
+a marker, the marker is copied. This is CORRECT — the marker means "I
+don't know what byte goes here."
+**Impact**: Marker rate decreases but doesn't reach 0 within a chunk.
+Tests must NOT assume markers disappear after 32KB.
+
+### 3. Output written before verification
+**Symptom**: Wrong data reaches stdout before size check.
+**Root cause**: resolve_and_write wrote chunk-by-chunk then checked total.
+**Fix**: Buffer all output, verify CRC32 + ISIZE, then write_all.
+
+### 4-8. (unchanged: &data[start..], overshoot, pigz, simulation benchmarks)
+
+## Invariants (Tested by 124 Tests)
+
+1. **Chain convergence**: decode from boundary[i] lands EXACTLY at boundary[i+1]
+2. **CRC32 match**: resolved output CRC32 == gzip trailer CRC32
+3. **ISIZE match**: resolved output length == gzip trailer ISIZE
+4. **Chunk 0 has 0 markers** and matches sequential decode byte-exact
+5. **Mid-stream chunks have markers** (>0) with rate <20%
+6. **No output on error**: writer receives nothing if verification fails
+7. **Thread count independence**: same input → same output regardless of threads
+8. **Data slices bounded**: `&data[start..end]`, never `&data[start..]`
+9. **Boundaries strictly sorted** and within data range
+10. **Per-chunk output bounded** by max_output_for_chunk
+
+## Test Coverage (124 tests in parallel_single_member.rs)
+
+| Category | Count |
+|----------|-------|
+| Chain convergence (oracle + found boundaries, 5 data patterns) | 8 |
+| try_decode validation (oracle, random, mid-block, marker rate) | 11 |
+| MarkerDecoder internals (encoding, block types, EOF, tracking) | 8 |
+| Marker resolution / window (propagation, rotation, edge cases) | 14 |
+| False positive detection (marker rate, volume, chain, overshoot) | 6 |
+| Output verification (CRC32, buffered write, references) | 7 |
+| Data patterns (compressible, zeros, random, text, RLE, mixed) | 6 |
+| Compression levels (L1, L6, L9) | 3 |
+| Thread/concurrency (independence, ordering, error propagation) | 5 |
+| Pipeline integration (e2e, silesia, oracle pipeline) | 4 |
+| Property tests (never wrong, oracle correct, monotonic sizes) | 4 |
+| Edge cases (headers, single block, max distance, boundaries) | 8 |
+| Regression tests (34K false pos, all-markers, full-tail) | 3 |
+| Size/error handling (min size, below min, invalid, truncated) | 6 |
+| Structural (sorted, in-range, count, spacing, determinism) | 7 |
+| **Total** | **124** |
+
+## Infrastructure
 
 | Module | Purpose | Status |
 |---|---|---|
-| `scan_inflate.rs` | Full + fast circular-buffer scanner | Ready, tested |
-| `two_pass_parallel.rs` | Two-pass decode with checkpoints | Ready, not wired |
-| `block_finder_lut.rs` | 15-bit LUT for block candidate detection | Ready |
-| `marker_decode.rs` | Marker-based speculative decoder | Partial |
-| `speculative_parallel.rs` | Full speculative parallel | Orphaned |
-
-## Current Single-Member Path
-
-```
-decompress_single_member → decompress_single_member_libdeflate
-  → libdeflate gzip_decompress_ex (sequential, always)
-```
-
-No parallel path for single-member is wired into production. This accounts
-for 12 of 18 remaining losses (all non-BGZF Tmax scenarios).
+| `parallel_single_member.rs` | Production pipeline + 124 tests | Chain convergence check, CRC verification |
+| `marker_decode.rs` | Marker-based decoder | Correct, all block types |
+| `block_finder.rs` | LUT + precode + Huffman validation | ~93% recall, false positives caught by chain check |
+| `scan_inflate.rs` | Sequential scanner, oracle boundaries | Ready |
+| `pipeline_tests.rs` | Oracle pipeline test harness | Ready |

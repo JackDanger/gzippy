@@ -6,6 +6,7 @@
 mod bench;
 mod ci;
 mod cloud;
+mod diag;
 mod instrument;
 mod orient;
 mod path_trace;
@@ -106,11 +107,24 @@ fn main() {
         }
         "cloud" => {
             if args.len() < 3 {
-                eprintln!("Usage: gzippy-dev cloud <bench|cleanup>");
+                eprintln!("Usage: gzippy-dev cloud <bench|run|cleanup>");
                 std::process::exit(1);
             }
             match args[2].as_str() {
                 "bench" => cloud::bench(),
+                "run" => {
+                    if args.len() < 5 {
+                        eprintln!("Usage: gzippy-dev cloud run <x86|arm64> <command>");
+                        eprintln!();
+                        eprintln!("Examples:");
+                        eprintln!("  gzippy-dev cloud run x86 'cargo test --release bench_isal -- --nocapture'");
+                        eprintln!("  gzippy-dev cloud run arm64 'gzippy -d -p1 < /dev/shm/silesia-gzip.gz > /dev/null'");
+                        eprintln!("  gzippy-dev cloud run x86 'perf stat gzippy -1 -c -p1 < /dev/shm/software.archive > /dev/null'");
+                        std::process::exit(1);
+                    }
+                    let cmd = args[4..].join(" ");
+                    cloud::run_command(&args[3], &cmd)
+                }
                 "cleanup" => cloud::cleanup_all(),
                 _ => {
                     eprintln!("Unknown cloud subcommand: {}", args[2]);
@@ -118,9 +132,19 @@ fn main() {
                 }
             }
         }
+        "diag" => {
+            let diag_args = diag::DiagArgs {
+                direction: find_flag(&args, "--direction"),
+                dataset: find_flag(&args, "--dataset"),
+            };
+            diag::run(&diag_args)
+        }
         "orient" => orient::run(),
         "score" => score::run(),
-        "losses" => score::losses(),
+        "losses" => {
+            let explain = args.iter().any(|a| a == "--explain");
+            score::losses(explain)
+        }
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -165,10 +189,18 @@ CI DETAILS:
 SCORECARD:
   score                        Show current win/loss scorecard from cloud-results.json
   losses                       Show losses grouped by root cause with actions
+  losses --explain             Annotate each loss with diagnostic data
 
 CLOUD (dedicated hardware, low jitter):
   cloud bench                  Launch EC2 fleet, run full benchmarks, tear down
+  cloud run <arch> <cmd>       Launch one instance, run command, stream output, tear down
   cloud cleanup                Delete any leaked cloud resources from prior runs
+
+DIAGNOSTICS:
+  diag [FLAGS]                 Collect platform + ISA-L + timing diagnostics as JSON
+  diag --direction compress    Compress-only diagnostics (ISA-L timing, dispatch check)
+  diag --direction decompress  Decompress-only diagnostics (path traces)
+  diag --dataset NAME          Limit to specific dataset
 
 BENCHMARK (one source of truth for all perf numbers):
   bench [FLAGS]                Run decompression benchmark (human output)
