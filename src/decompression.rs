@@ -577,7 +577,7 @@ fn is_multi_member_quick(data: &[u8]) -> bool {
 /// Decompress a single-member gzip file.
 ///
 /// Routes to the best available decoder:
-///   - Two-pass parallel (num_threads >= 4, large files): scan + parallel decode
+///   - Rapidgzip-style parallel (num_threads >= 2, large files): guess+validate pipeline
 ///   - ISA-L (x86_64 with AVX2): fastest sequential for RLE-heavy data
 ///   - libdeflate: fastest general-purpose sequential decoder
 fn decompress_single_member<W: Write>(
@@ -585,9 +585,7 @@ fn decompress_single_member<W: Write>(
     writer: &mut W,
     num_threads: usize,
 ) -> GzippyResult<u64> {
-    const MIN_PARALLEL_SIZE: usize = 1024 * 1024;
-
-    if num_threads >= 2 && data.len() >= MIN_PARALLEL_SIZE {
+    if num_threads >= 2 {
         if debug_enabled() {
             eprintln!(
                 "[gzippy] single-member parallel: {} bytes, {} threads",
@@ -595,18 +593,17 @@ fn decompress_single_member<W: Write>(
                 num_threads
             );
         }
-        match crate::two_pass_parallel::decompress_two_pass_parallel(data, num_threads) {
-            Ok(Some(output)) => {
+        match crate::parallel_single_member::decompress_parallel(data, writer, num_threads) {
+            Ok(bytes) => {
                 if debug_enabled() {
-                    eprintln!("[gzippy] parallel decode produced {} bytes", output.len());
+                    eprintln!("[gzippy] parallel decode produced {} bytes", bytes);
                 }
-                writer.write_all(&output)?;
                 writer.flush()?;
-                return Ok(output.len() as u64);
+                return Ok(bytes);
             }
-            Ok(None) => {
+            Err(ref e) if e.is_routing() => {
                 if debug_enabled() {
-                    eprintln!("[gzippy] parallel: data too small, using sequential");
+                    eprintln!("[gzippy] parallel: {}, using sequential", e);
                 }
             }
             Err(e) => {

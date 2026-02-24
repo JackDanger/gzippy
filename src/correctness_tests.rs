@@ -1795,4 +1795,70 @@ mod tests {
         crate::decompression::decompress_single_member_pub(&gz, &mut out, 1).unwrap();
         assert_eq!(out, data);
     }
+
+    // =========================================================================
+    // Gap 1: End-to-end routing through parallel single-member path (>=4MB)
+    // =========================================================================
+
+    #[test]
+    fn test_routing_single_member_4mb_parallel_correct() {
+        let data = make_mixed(5 * 1024 * 1024);
+        let gz = compress_single_member(&data);
+        let mut out = Vec::new();
+        crate::decompression::decompress_single_member_pub(&gz, &mut out, 4).unwrap();
+        assert_eq!(out, data, "parallel single-member 5MB must match original");
+    }
+
+    #[test]
+    fn test_routing_single_member_8mb_parallel_through_router() {
+        let data = make_mixed(8 * 1024 * 1024);
+        let gz = compress_single_member(&data);
+        let result = crate::decompression::decompress_gzip_to_vec_pub(&gz, 4).unwrap();
+        assert_eq!(
+            result, data,
+            "8MB single-member through full router must match"
+        );
+    }
+
+    #[test]
+    fn test_routing_single_member_parallel_t2_correct() {
+        let data = make_mixed(5 * 1024 * 1024);
+        let gz = compress_single_member(&data);
+        let mut out = Vec::new();
+        crate::decompression::decompress_single_member_pub(&gz, &mut out, 2).unwrap();
+        assert_eq!(
+            out, data,
+            "parallel at T2 must still produce correct output"
+        );
+    }
+
+    #[test]
+    fn test_routing_single_member_parallel_thread_independence_large() {
+        let data = make_mixed(6 * 1024 * 1024);
+        let gz = compress_single_member(&data);
+        let mut results = Vec::new();
+        for threads in [2, 4, 8] {
+            let mut out = Vec::new();
+            crate::decompression::decompress_single_member_pub(&gz, &mut out, threads).unwrap();
+            results.push(out);
+        }
+        for (i, r) in results.iter().enumerate().skip(1) {
+            assert_eq!(
+                results[0],
+                *r,
+                "T{} output must match T{} output",
+                [2, 4, 8][i],
+                [2, 4, 8][0]
+            );
+        }
+        assert_eq!(results[0], data);
+    }
+
+    #[test]
+    fn test_routing_single_member_zeros_8mb_parallel() {
+        let data = make_zeros(8 * 1024 * 1024);
+        let gz = compress_single_member(&data);
+        let result = crate::decompression::decompress_gzip_to_vec_pub(&gz, 4).unwrap();
+        assert_eq!(result, data, "8MB zeros through parallel must match");
+    }
 }

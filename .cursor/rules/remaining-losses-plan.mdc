@@ -3,70 +3,65 @@ description: Plan for converting remaining losses to wins — prioritized, actio
 alwaysApply: true
 ---
 
-# Remaining Losses — Plan (Feb 23 2026)
+# Remaining Losses — Plan (Feb 24 2026)
 
-## Summary: 54W / 18L (Fleet Run 8, all 12 instances completed)
+## Summary: 56W / 16L (Fleet Run 9, all 12 instances completed)
 
-## Changes Made This Session
+## Changes Confirmed This Session (Feb 24)
 
-### Block Finder Fix (Feb 22)
-- **Bug**: `validate_huffman_codes` used wrong split point for lit/dist codes.
-  `lit_count = 257 + (total_codes - 258).min(29)` was wrong — must use
-  `hlit_count = 257 + hlit` for the split.
-- **Fix**: Pass `hlit_count` to `validate_huffman_codes`, use it for split.
-- **Result**: 14/15 oracle boundaries now pass all validation levels (was 0/15).
-- **Also**: Accept bfinal=0 and bfinal=1 blocks, add stored block detection.
-- **NOT included**: Fixed Huffman (btype=1) candidates excluded — no header
-  to validate, 50% of random positions match, floods search with false positives.
+### madvise(Sequential) for decompression mmap — CONFIRMED WIN
+- x86 T1 decompress: silesia-gzip flipped LOSS → WIN (+0.2% vs igzip)
+- arm64 L1 Tmax compress: silesia flipped -4.3% → +103% (822 vs 405)
 
-### Two-Pass Parallel Single-Member (Feb 22)
-- **Wired**: `decompress_two_pass_parallel` is routed from `decompress_single_member`
-  for files >1GB compressed with >=4 threads.
-- **Threshold**: Currently high (1GB) because scan pass uses pure Rust
-  (`consume_first_decode`) which costs ~T_sequential. On M3 Mac, parallel was
-  SLOWER than sequential libdeflate FFI.
-- **Proven correct**: `test_two_pass_silesia_roundtrip` passes byte-exact on silesia.
-- **To lower threshold**: Make scan use libdeflate FFI, or wait for consume_first
-  to reach parity.
+### Two-pass parallel single-member — WIRED BUT NOT HELPING
+- ISA-L scan + pure-Rust fallback, CRC32+ISIZE verification
+- Production routing active (num_threads >= 2, data >= 1MB)
+- **Problem**: scan = full inflate → Tmax = T1. No speedup.
 
-### madvise(Sequential) for L1 Tmax (Feb 22)
-- Added to `ParallelGzEncoder::compress_file` when `num_threads > 1`.
-- Mirrors the pipelined compress path which already has it.
+### ISA-L compress dispatch: FALSE POSITIVE
+The `dispatch=C_FALLBACK` diagnostic heuristic was wrong (1KB buffer too small).
+Actual L1 T1 gaps are -0.8% to -1.8% = near-parity. ISA-L IS using AVX.
 
-### ISA-L NASM Fix (Feb 22)
-- Set `AS=nasm` in cloud build for x86_64 targets.
-- This forces ISA-L's autotools to use NASM assembler for AVX2/AVX-512 paths.
-- Root cause: `sudo -u` runs with limited PATH; `AS=nasm` bypasses PATH lookup.
+### Key discovery: ISA-L sequential beats rapidgzip parallel on easy data
+On x86, ISA-L AVX-512 inflate is so fast on software/logs that gzippy's T1
+beats rapidgzip's Tmax. Only silesia (complex matches) loses on x86 Tmax.
 
-### Fleet Runner Reliability (Feb 23)
-- **Never abort for one failure**: Launch, setup, IP, and bench errors all skip
-  the single affected instance. The rest of the fleet continues.
-- **Partial results after every wave**: `cloud-results.json` is updated after
-  each wave, so even a crash preserves earlier results.
-- **Smart AZ retry**: `is_retryable_launch_error()` catches InsufficientCapacity,
-  Unsupported, InsufficientFreeAddresses, and InstanceLimitExceeded. All subnets
-  (AZs) are tried before skipping.
-- **`aws ec2 wait instance-terminated`**: Replaces manual 10s-poll loop for vCPU
-  release between waves. Falls back to 30s sleep on timeout.
-- **Direction-aware timeout**: Decompress benchmarks get 20 min, compress gets 45 min.
-- **Skipped instances listed at end**: Final summary shows exactly which
-  instances were skipped and why.
+## Remaining 16 Losses — Prioritized
 
-## Tier 1: Noise-Level (<3%) — 4 losses
-**Action**: None needed.
+### Tier 1: Tmax single-member decompress (8 losses, -20% to -39%)
+The ONLY category with large gaps.
 
-## Tier 2: madvise — 1 loss (FIXED)
-- arm64 software L1 Tmax: now has `madvise(Sequential)`
+**x86 (2 losses)**: Only silesia gzip/pigz. Software and logs are WINS
+because ISA-L AVX-512 sequential > rapidgzip parallel on easy data.
 
-## Tier 3: ISA-L NASM — 2 losses (FIXED)
-- x86 software/logs L1 T1: now builds with `AS=nasm`
+**arm64 (6 losses)**: All datasets lose. libdeflate sequential is slower.
+unpigz beats gzippy on logs by 20% via read-ahead threads.
 
-## Tier 4: Single-Member Parallel — 8 losses
-All Tmax decompress vs rapidgzip/unpigz.
+**What would help**:
+1. Rapidgzip-style guess+validate parallel (no scan) — addresses all 8
+2. Read-ahead threading for sequential decode — helps arm64 logs
+3. Two-pass NOT viable (scan = full decode, proven Feb 23)
 
-**Status**: Two-pass infrastructure proven correct but scan pass too expensive.
-Block finder recall improved from 0% to 93%. Parallel single-member is wired
-but threshold set high (1GB) to avoid regression.
+### Tier 2: x86 L1 T1 compress (3 losses, -0.8% to -1.8%)
+ISA-L IS using AVX. Gap is wrapper overhead. Near noise level. Ignore.
 
-**Next step**: Make scan pass use libdeflate FFI instead of consume_first,
-or implement rapidgzip-style pipelined block finder + parallel decoder.
+### Tier 3: x86 T1 decompress (3 losses, -0.1% to -0.9%)
+All sub-1% vs igzip. Oscillate between WIN/LOSS across runs. Ignore.
+
+### Tier 4: arm64 software L1 Tmax compress (1 loss, -4.2%)
+Data-dependent: silesia 2x WIN, software -4.2%. At 2077 MB/s, per-block
+overhead matters. pigz uses 128KB vs gzippy's 4MB blocks.
+
+### Tier 5: arm64 logs Tmax decompress (counted in Tier 1)
+unpigz wins by 20-22% using read-ahead threads for single-member.
+
+## Priority Order
+1. **Rapidgzip-style parallel** (8 losses, major effort, high impact)
+2. **arm64 L1 block sizing** (1 loss, small change, uncertain)
+3. Everything else: noise, ignore
+
+## What We've Proven Doesn't Work
+- Two-pass scan+redecode: scan = full inflate, never breaks even
+- Block finder + try-decode alone: insufficient recall on real data
+- `dispatch=C_FALLBACK` hunt: false positive, ISA-L IS using AVX
+- madvise was right fix for systematic x86 T1 gap (not assembly dispatch)

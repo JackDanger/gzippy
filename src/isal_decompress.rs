@@ -99,6 +99,7 @@ pub fn decompress_deflate_into(_input: &[u8], _output: &mut [u8]) -> Option<usiz
 ///
 /// Returns `None` if ISA-L is not available or an error occurs.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)]
 pub fn scan_deflate_isal(
     deflate_data: &[u8],
     checkpoint_interval: usize,
@@ -176,6 +177,7 @@ pub fn scan_deflate_isal(
 }
 
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[allow(dead_code)]
 pub fn scan_deflate_isal(
     _deflate_data: &[u8],
     _checkpoint_interval: usize,

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Scan Inflate - Block-boundary-aware deflate decoder for two-pass parallel.
 //!
 //! Decodes a deflate stream block-by-block using the proven production decode

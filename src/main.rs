@@ -41,7 +41,6 @@ mod marker_decode;
 mod optimization;
 mod packed_lut;
 mod parallel_compress;
-#[allow(dead_code)]
 mod parallel_single_member;
 mod pipeline_tests;
 mod pipelined_compress;
@@ -54,7 +53,7 @@ mod simple_optimizations;
 mod specialized_decode;
 mod thread_pool;
 mod two_level_table;
-mod two_pass_parallel;
+// two_pass_parallel.rs: deprecated, superseded by parallel_single_member.rs
 mod ultra_fast_inflate;
 mod ultra_inflate;
 mod utils;

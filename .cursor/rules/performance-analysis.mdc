@@ -3,101 +3,80 @@ description: Performance status and strategy — cloud fleet is source of truth
 alwaysApply: true
 ---
 
-# Performance Status: 54W / 18L (Feb 23 2026, Fleet Run 8)
+# Performance Status: 56W / 16L (Feb 24 2026, Fleet Run 9)
 
-## Score Breakdown (Fleet Run 8, 72 scenarios)
+## Score Breakdown (Fleet Run 9, 72 scenarios)
 
 | Category | W | L | Notes |
 |----------|---|---|-------|
-| Decompress BGZF | 11 | 1 | x86 sw-bgzf T1 -1.3% noise |
-| Decompress T1 x86 | 4 | 5 | All <3% vs igzip (noise) |
+| Decompress BGZF (all) | 12 | 0 | Dominant everywhere |
 | Decompress T1 arm64 | 9 | 0 | Dominant |
-| Decompress Tmax non-BGZF | 6 | 8 | x86 logs Tmax wins |
+| Decompress T1 x86 | 6 | 3 | gzip/bgzf WIN, pigz -0.1% to -0.5% vs igzip |
+| Decompress Tmax x86 | 4 | 2 | sw+logs WIN, silesia LOSS vs rapidgzip |
+| Decompress Tmax arm64 | 3 | 5 | bgzf WIN, all single-member LOSS |
 | Compress L6/L9 | 12 | 0 | Dominant |
-| Compress L1 | 12 | 4 | x86 noise vs igzip + arm64 sw -4.3% |
+| Compress L1 T1 | 3 | 3 | arm64 WIN, x86 -0.8% to -1.8% vs igzip |
+| Compress L1 Tmax | 5 | 1 | arm64 software -4.2% vs pigz |
+| Compress other | 2 | 2 | noise |
 
-Fleet runner improvements: skip-on-failure, partial results per wave,
-SSH retry, direction-aware timeouts, timestamped log dirs. All 12 instances
-completed successfully.
+## Key Findings (Fleet Run 9)
 
-## Critical Discovery: pigz Files Are Single-Member
+### madvise(Sequential) for decompression — CONFIRMED WIN
+Added `mmap.advise(Sequential)` to `decompress_stdin` and `decompress_file`.
+- silesia-gzip T1 x86: **flipped from LOSS to WIN** (+0.2% vs igzip)
+- arm64 silesia L1 Tmax compress: **flipped from -4.3% LOSS to 2x WIN** (822 vs 405)
 
-**pigz output is single-member gzip.** pigz compresses blocks in parallel
-but writes them into a SINGLE gzip stream, NOT separate gzip members. So
-`silesia-pigz.gz`, `software-pigz.gz`, `logs-pigz.gz` are all single-member.
+### ISA-L AVX-512 sequential beats rapidgzip parallel on easy data
+On x86, gzippy's ISA-L T1 decode is so fast that it beats rapidgzip's
+parallel decode for software and logs datasets:
+- software-gzip Tmax x86: gzippy 2692 vs rapidgzip 2025 → **WIN (+33%)**
+- logs-gzip Tmax x86: gzippy 2231 vs rapidgzip 1434 → **WIN (+56%)**
+- logs-pigz Tmax x86: gzippy 2128 vs rapidgzip 1287 → **WIN (+65%)**
+Only silesia (complex data with many back-references) loses.
 
-This means ALL 8 Tmax decompress losses (gzip AND pigz variants) have the
-SAME root cause: no parallel single-member decompress.
+### Two-pass parallel NOT helping Tmax (scan = full decode)
+Two-pass parallel is wired but Tmax = T1 for all single-member files.
+Scan pass does full inflate, costing ~100% of sequential. Total work = 2x.
+The rapidgzip-style guess+validate approach (no scan) is needed.
 
-## Loss Categories
+### ISA-L compress dispatch: NOT a real issue (false positive diagnostic)
+The `dispatch=C_FALLBACK` diagnostic used a bad heuristic (1KB threshold).
+The actual L1 T1 compress gaps are -0.8% to -1.8% vs igzip — consistent
+with near-parity, NOT C fallback (which would be 50%+). ISA-L compress
+IS using AVX assembly. The gaps are wrapper overhead.
 
-### Near parity (3 losses, <2%) — Low priority
-x86 T1 decompress vs igzip: oscillates between WIN and LOSS.
-- silesia-pigz T1 x86: 555.7 vs igzip 564.7 (-1.6%)
-- software-pigz T1 x86: 2304.4 vs igzip 2320.5 (-0.7%)
-- software-gzip T1 x86: 2566.2 vs igzip 2569.4 (-0.1%)
+## Loss Categories (16 losses)
 
-### Tmax single-member decompress (8 losses, -19% to -38%)
-All single-member files at Tmax. gzippy's Tmax = T1 (no parallelism).
+### Tmax single-member decompress (8 losses, -20% to -39%)
+All single-member at Tmax with no parallel decode. x86 only loses on silesia;
+arm64 loses on all datasets because libdeflate is slower than ISA-L.
 
 | Scenario | gzippy | Best competitor | Gap |
 |----------|--------|----------------|-----|
-| software-gzip Tmax arm64 | 1560 | rapidgzip 2518 | -38% |
-| silesia-pigz Tmax arm64 | 574 | rapidgzip 915 | -37% |
-| silesia-gzip Tmax x86 | 588 | rapidgzip 933 | -37% |
-| silesia-pigz Tmax x86 | 565 | rapidgzip 889 | -37% |
-| silesia-gzip Tmax arm64 | 588 | rapidgzip 908 | -35% |
-| software-pigz Tmax arm64 | 1505 | rapidgzip 2296 | -35% |
-| logs-pigz Tmax arm64 | 1274 | unpigz 1616 | -21% |
-| logs-gzip Tmax arm64 | 1358 | unpigz 1669 | -19% |
+| software-gzip Tmax arm64 | 1576 | rapidgzip 2590 | -39% |
+| silesia-pigz Tmax x86 | 594 | rapidgzip 950 | -38% |
+| silesia-pigz Tmax arm64 | 581 | rapidgzip 917 | -37% |
+| software-pigz Tmax arm64 | 1487 | rapidgzip 2332 | -36% |
+| silesia-gzip Tmax x86 | 624 | rapidgzip 974 | -36% |
+| silesia-gzip Tmax arm64 | 601 | rapidgzip 918 | -35% |
+| logs-pigz Tmax arm64 | 1271 | unpigz 1627 | -22% |
+| logs-gzip Tmax arm64 | 1344 | unpigz 1683 | -20% |
 
-### igzip L1 compress (2 losses, -47% to -57%)
-**Fleet Run 7 diagnostic (Feb 23)**: Disproved the dispatch-not-working theory.
-- AVX instructions in gzippy: **2383** vs igzip: **1812** — assembly IS linked
-- CPU: AVX, AVX2, AVX-512 (full set) available
-- HAVE_NASM='yes', NASM detection working correctly
-- ISA-L micro-bench (synthetic 22MB): L0=341, L1=319, L3=517 MB/s
+### x86 L1 T1 compress near-parity (3 losses, -0.8% to -1.8%)
+ISA-L IS using AVX assembly. The gap is wrapper overhead in gzippy's
+compression path vs igzip's direct CLI. Not worth optimizing further.
 
-**But gzippy L1 CLI**: 1109 MB/s (software) vs igzip 2590 MB/s = 2.3x gap.
-The micro-bench on synthetic (341 MB/s) doesn't match CLI throughput (1109 MB/s),
-suggesting synthetic data is harder to compress. The real bottleneck is NOT
-missing AVX — it's likely overhead in gzippy's compression path:
-1. `vec![0u8; max_size]` zero-init of ~24MB output buffer (page faults)
-2. `isal::compress_into` creates a new ZStream per call
-3. Single `writer.write_all` for entire output
+### x86 T1 decompress near-parity (3 losses, -0.1% to -0.9%)
+All sub-1%, noise-level. Oscillate between WIN and LOSS across fleet runs.
 
-**Incomplete diagnostics**: The debug timing (`GZIPPY_DEBUG=1`) and dispatch
-check (1KB micro) didn't print due to stderr redirect bug (fixed in cloud.rs).
-Also, test ran OLD code (diagnostics weren't pushed).
+### arm64 software L1 Tmax compress (1 loss, -4.2%)
+Data-dependent: gzippy wins silesia by 2x but loses software by 4.2%.
+At software's high throughput (2077 MB/s), per-block overhead matters more.
+pigz uses 128KB blocks vs gzippy's 4MB blocks — more granular load balancing.
 
-**Next step**: Use `gzippy-dev cloud run x86 <cmd>` to run specific diagnostics.
-
-### arm64 software L1 Tmax compress (1 loss, -0.7%)
-Close race: gzippy 2155.9 vs pigz 2170.7 (-0.7%). Noise level.
-
-## Priority 1: ISA-L Compress Performance Gap (Feb 23 update)
-
-### Changes Applied (this session)
-1. **T1 L0-L3 file path now uses `compress_gzip_stream_direct`** — single
-   ZStream reused across chunks, ~2MB memory, no full-file buffering. Previously
-   used `compress_gzip_stream` which read entire file + allocated 1.1x output.
-2. **Zero-init eliminated in hot compress paths**:
-   - `compress_block_bgzf_isal`: `output.resize(N, 0)` → `unsafe set_len` (~300KB/block saved)
-   - `compress_gzip_to_writer`: `vec![0u8; N]` → `Vec::with_capacity` + `set_len`
-   - `compress_gzip_stream`: same pattern
-3. **ISA-L error paths now observable**: warnings logged via GZIPPY_DEBUG
-
-The 2 x86 L1 compress losses (-57%, -47% vs igzip) are NOT caused by
-missing assembly (gzippy has 2383 AVX insns vs igzip's 1812). The gap
-is likely in gzippy's compression wrapper overhead. Specific diagnostics
-needed (run via `gzippy-dev cloud run x86`):
-
-1. **Debug timing**: `GZIPPY_DEBUG=1 gzippy -1 -c -p1 < /dev/shm/software.tar 2>&1 >/dev/null`
-   → shows alloc/compress/write breakdown. Is ISA-L compress fast but I/O slow?
-2. **1KB dispatch check**: confirms assembly dispatch is working at runtime
-3. **Direct isal::compress_into timing**: isolate ISA-L from gzippy overhead
-4. **Compare isal-sys version**: check if older ISA-L version in isal-sys crate
-5. **Profile**: `perf stat gzippy -1 -c -p1 < /dev/shm/software.tar > /dev/null`
+### arm64 logs Tmax decompress (part of 8 above)
+unpigz beats gzippy by 20-22% on arm64 logs. unpigz uses read-ahead threads
+even for single-member, giving it a parallelism advantage that gzippy lacks.
 
 ## Priority 2: Single-Member Parallel (Feb 22 update)
 

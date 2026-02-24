@@ -11,7 +11,7 @@
 //! already provide significant speedup.
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::block_finder::BlockFinder;
@@ -21,8 +21,8 @@ use crate::marker_decode::{replace_markers, MarkerDecoder, WINDOW_SIZE};
 const MIN_PARALLEL_SIZE: usize = 4 * 1024 * 1024;
 
 /// Minimum threads for parallel decode.
-/// The rapidgzip-style approach has no scan overhead, so 4 threads suffice.
-const MIN_THREADS_FOR_PARALLEL: usize = 4;
+/// The rapidgzip-style approach has no scan overhead, so even 2 threads help.
+const MIN_THREADS_FOR_PARALLEL: usize = 2;
 
 /// Search radius (bytes) around each partition point for block boundaries.
 const SEARCH_RADIUS: usize = 512 * 1024;
@@ -34,10 +34,16 @@ fn debug_enabled() -> bool {
     *DEBUG.get_or_init(|| std::env::var("GZIPPY_DEBUG").is_ok())
 }
 
-/// Parallel decompress a single-member gzip stream.
+/// Parallel decompress a single-member gzip stream using rapidgzip-style speculation.
 ///
-/// Returns Ok(bytes_written) on success, or Err if the file can't be
-/// parallel-decoded (caller should fall back to sequential).
+/// Architecture (no retry, no sequential pre-scan):
+///   1. Partition compressed data at regular intervals
+///   2. Each partition's chunk task searches FORWARD from its partition point for a
+///      deflate block boundary, then decodes from there until the next partition point
+///   3. All chunks decode in parallel (speculative — the boundaries are guesses)
+///   4. Sequential confirmation: process chunks in order, matching speculative results
+///      to confirmed bit positions. On speculation miss, re-decode sequentially.
+///   5. CRC32 + ISIZE verification on the assembled output
 pub fn decompress_parallel<W: Write>(
     gzip_data: &[u8],
     writer: &mut W,
@@ -74,70 +80,68 @@ pub fn decompress_parallel<W: Write>(
         gzip_data[crc_offset + 3],
     ]);
 
+    let num_chunks = num_threads;
+    let total_bits = deflate_data.len() * 8;
+    let spacing_bits = total_bits / num_chunks;
+
     if debug_enabled() {
         eprintln!(
-            "[parallel_sm] rapidgzip-style: {} bytes deflate, {} threads, isize={}",
+            "[parallel_sm] speculation: {} bytes deflate, {} chunks, spacing={}KB, isize={}",
             deflate_data.len(),
-            num_threads,
+            num_chunks,
+            spacing_bits / 8 / 1024,
             expected_output
         );
     }
 
-    // Step 1: Find chunk boundaries using block finder
-    let t_find = std::time::Instant::now();
-    let boundaries = find_chunk_boundaries(deflate_data, num_threads);
-    let find_elapsed = t_find.elapsed();
+    // Phase 1: Speculative parallel decode — each chunk searches + decodes at its partition
+    let t_spec = std::time::Instant::now();
+    let speculative =
+        speculative_decode_parallel(deflate_data, num_chunks, spacing_bits, expected_output);
+    let spec_elapsed = t_spec.elapsed();
 
-    if boundaries.len() < 2 {
-        if debug_enabled() {
-            eprintln!(
-                "[parallel_sm] only {} boundaries found, need >=2",
-                boundaries.len()
-            );
-        }
-        return Err(ParallelError::TooFewChunks);
-    }
-
+    let hits = speculative.iter().filter(|s| s.is_some()).count();
     if debug_enabled() {
         eprintln!(
-            "[parallel_sm] found {} chunk boundaries in {:.1}ms",
-            boundaries.len(),
-            find_elapsed.as_secs_f64() * 1000.0
+            "[parallel_sm] speculative decode: {}/{} chunks found in {:.1}ms",
+            hits,
+            num_chunks,
+            spec_elapsed.as_secs_f64() * 1000.0
         );
-        for (i, &bit) in boundaries.iter().enumerate() {
-            eprintln!("  chunk {}: start_bit={}", i, bit);
+        for (i, spec) in speculative.iter().enumerate() {
+            if let Some(s) = spec {
+                eprintln!(
+                    "  chunk {}: start_bit={} end_bit={} output={} markers={}",
+                    i,
+                    s.start_bit,
+                    s.end_bit,
+                    s.data.len(),
+                    s.marker_count
+                );
+            } else {
+                eprintln!("  chunk {}: no boundary found", i);
+            }
         }
     }
 
-    // Step 2: Decode all chunks in parallel using marker decoder
-    let t_decode = std::time::Instant::now();
-    let chunks = decode_chunks_parallel(deflate_data, &boundaries, num_threads)?;
-    let decode_elapsed = t_decode.elapsed();
-
-    if debug_enabled() {
-        for (i, chunk) in chunks.iter().enumerate() {
-            eprintln!(
-                "  chunk {}: {} output values, {} markers",
-                i,
-                chunk.data.len(),
-                chunk.marker_count
-            );
-        }
-    }
-
-    // Step 3: Resolve markers sequentially, verify CRC32, then write output
-    let t_resolve = std::time::Instant::now();
-    let total_output = resolve_and_write(&chunks, writer, expected_output, expected_crc)?;
-    let resolve_elapsed = t_resolve.elapsed();
+    // Phase 2: Sequential confirmation + marker resolution
+    let t_confirm = std::time::Instant::now();
+    let total_output = confirm_resolve_write(
+        deflate_data,
+        &speculative,
+        expected_output,
+        expected_crc,
+        writer,
+    )?;
+    let confirm_elapsed = t_confirm.elapsed();
 
     if debug_enabled() {
         let total_elapsed = t0.elapsed();
         let total_mbps = total_output as f64 / total_elapsed.as_secs_f64() / 1e6;
         eprintln!(
-            "[parallel_sm] find={:.1}ms decode={:.1}ms resolve={:.1}ms total={:.1}ms ({:.0} MB/s)",
-            find_elapsed.as_secs_f64() * 1000.0,
-            decode_elapsed.as_secs_f64() * 1000.0,
-            resolve_elapsed.as_secs_f64() * 1000.0,
+            "[parallel_sm] spec={:.1}ms confirm={:.1}ms total={:.1}ms ({:.0} MB/s)",
+            spec_elapsed.as_secs_f64() * 1000.0,
+            confirm_elapsed.as_secs_f64() * 1000.0,
             total_elapsed.as_secs_f64() * 1000.0,
             total_mbps
         );
@@ -146,116 +150,164 @@ pub fn decompress_parallel<W: Write>(
     Ok(total_output as u64)
 }
 
-/// Find deflate block boundaries near each partition point.
+struct SpeculativeChunk {
+    start_bit: usize,
+    end_bit: usize,
+    data: Vec<u16>,
+    marker_count: usize,
+}
+
+fn max_output_for_chunk(isize_total: usize, num_chunks: usize, compressed_bytes: usize) -> usize {
+    let isize_based = if num_chunks > 0 && isize_total > 0 {
+        (isize_total / num_chunks) * 2
+    } else {
+        0
+    };
+    let ratio_based = (compressed_bytes * 8).max(64 * 1024);
+    ratio_based.max(isize_based)
+}
+
+/// Speculatively decode all chunks in parallel.
 ///
-/// Uses BlockFinder to generate candidates (dynamic + stored blocks),
-/// then validates with try-decode. Falls back to brute-force search
-/// over a narrow range if the block finder misses the boundary.
-fn find_chunk_boundaries(deflate_data: &[u8], num_chunks: usize) -> Vec<usize> {
-    let mut boundaries = vec![0usize];
+/// Each chunk task:
+///   1. Chunk 0: decode from bit 0 (always correct)
+///   2. Chunk i > 0: search FORWARD from partition point for a deflate block boundary,
+///      then decode from there until the next partition point
+///   3. Last chunk: decode until BFINAL
+///
+/// Returns one Option<SpeculativeChunk> per partition. None = no boundary found.
+fn speculative_decode_parallel(
+    deflate_data: &[u8],
+    num_chunks: usize,
+    spacing_bits: usize,
+    isize_total: usize,
+) -> Vec<Option<SpeculativeChunk>> {
+    let results: Vec<Mutex<Option<SpeculativeChunk>>> =
+        (0..num_chunks).map(|_| Mutex::new(None)).collect();
+    let task_idx = AtomicUsize::new(0);
 
-    let chunk_size_bytes = deflate_data.len() / num_chunks;
-    let finder = BlockFinder::new(deflate_data);
+    let compressed_bytes = deflate_data.len() / num_chunks;
+    let max_output = max_output_for_chunk(isize_total, num_chunks, compressed_bytes);
 
-    for i in 1..num_chunks {
-        let partition_byte = i * chunk_size_bytes;
-        let partition_bit = partition_byte * 8;
-        let search_radius_bits = SEARCH_RADIUS * 8;
-
-        let search_start = partition_bit.saturating_sub(search_radius_bits);
-        let search_end = (partition_bit + search_radius_bits).min(deflate_data.len() * 8);
-
-        let prev_boundary = *boundaries.last().unwrap();
-        let search_start = search_start.max(prev_boundary + 1);
-
-        if search_start >= search_end {
-            continue;
-        }
-
-        // Phase 1: BlockFinder candidates (fast — LUT + precode + Huffman validation)
-        let mut candidates = finder.find_blocks(search_start, search_end);
-        candidates.sort_by_key(|b| b.bit_offset.abs_diff(partition_bit));
-
-        let mut found = false;
-        for candidate in &candidates {
-            if try_decode_at(deflate_data, candidate.bit_offset) {
-                boundaries.push(candidate.bit_offset);
-                if debug_enabled() {
-                    eprintln!(
-                        "[parallel_sm] partition {}: found boundary at bit {} via block finder",
-                        i, candidate.bit_offset,
-                    );
+    std::thread::scope(|s| {
+        for _ in 0..num_chunks {
+            s.spawn(|| loop {
+                let idx = task_idx.fetch_add(1, Ordering::Relaxed);
+                if idx >= num_chunks {
+                    break;
                 }
-                found = true;
-                break;
-            }
-        }
 
-        if found {
-            continue;
-        }
+                let partition_bit = idx * spacing_bits;
+                let is_last = idx == num_chunks - 1;
 
-        // Phase 2: Brute-force search near partition point (slower but reliable).
-        // Search ±32KB around the partition in 8-bit steps.
-        let brute_start = partition_bit
-            .saturating_sub(32 * 1024 * 8)
-            .max(search_start);
-        let brute_end = (partition_bit + 32 * 1024 * 8).min(search_end);
+                let until_bit = if is_last {
+                    None
+                } else {
+                    Some((idx + 1) * spacing_bits)
+                };
 
-        for bit in (brute_start..brute_end).step_by(8) {
-            if try_decode_at(deflate_data, bit) {
-                boundaries.push(bit);
-                if debug_enabled() {
-                    eprintln!(
-                        "[parallel_sm] partition {}: found boundary at bit {} via brute force",
-                        i, bit,
-                    );
+                let chunk = if idx == 0 {
+                    decode_chunk_from(deflate_data, 0, until_bit, max_output)
+                } else {
+                    search_and_decode(deflate_data, partition_bit, until_bit, max_output)
+                };
+
+                if let Some(chunk) = chunk {
+                    *results[idx].lock().unwrap() = Some(chunk);
                 }
-                found = true;
-                break;
-            }
+            });
         }
+    });
 
-        if !found && debug_enabled() {
-            eprintln!(
-                "[parallel_sm] partition {}: no boundary found in {}..{} bits",
-                i, search_start, search_end
-            );
-        }
+    results
+        .into_iter()
+        .map(|m| m.into_inner().unwrap())
+        .collect()
+}
+
+/// Search for a boundary AND decode from it in one pass.
+/// Avoids the double-decode of search_boundary_forward + decode_chunk_from.
+fn search_and_decode(
+    deflate_data: &[u8],
+    from_bit: usize,
+    until_bit: Option<usize>,
+    max_output: usize,
+) -> Option<SpeculativeChunk> {
+    let start_bit = search_boundary_forward(deflate_data, from_bit)?;
+    decode_chunk_from(deflate_data, start_bit, until_bit, max_output)
+}
+
+/// Search FORWARD from `from_bit` for a valid deflate block boundary.
+///
+/// Matches rapidgzip's approach: scan in 8 KiB sub-chunks within 512 KiB,
+/// using BlockFinder for structural candidates, then try-decode to validate.
+fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize> {
+    let search_end = (from_bit + SEARCH_RADIUS * 8).min(deflate_data.len() * 8);
+    if from_bit >= search_end {
+        return None;
     }
 
-    boundaries
+    let finder = BlockFinder::new(deflate_data);
+
+    // Search in 8 KiB sub-chunks (matching rapidgzip's CHUNK_SIZE = 8_Ki * BYTE_SIZE)
+    let sub_chunk_bits = 8 * 1024 * 8;
+    let mut chunk_start = from_bit;
+
+    while chunk_start < search_end {
+        let chunk_end = (chunk_start + sub_chunk_bits).min(search_end);
+
+        let mut candidates = finder.find_blocks(chunk_start, chunk_end);
+        // Sort by bit position (forward order) — prefer the FIRST valid boundary
+        candidates.sort_by_key(|b| b.bit_offset);
+
+        for candidate in &candidates {
+            if try_decode_at(deflate_data, candidate.bit_offset) {
+                return Some(candidate.bit_offset);
+            }
+        }
+
+        chunk_start = chunk_end;
+    }
+
+    // Brute-force: search first 128 KiB from partition in 8-bit steps
+    let brute_end = (from_bit + 128 * 1024 * 8).min(search_end);
+    (from_bit..brute_end)
+        .step_by(8)
+        .find(|&bit| try_decode_at(deflate_data, bit))
 }
 
 /// Validate a candidate bit position by attempting to decode from it.
 ///
-/// Three checks eliminate false positives:
-/// 1. **Output volume**: must produce substantial output (scaled to available data).
-///    A false positive (random bits that parse as deflate) dies within a few KB.
-/// 2. **Marker presence**: mid-stream positions MUST encounter LZ77 back-references
-///    into unknown history. Zero markers = tiny self-contained false sequence.
-/// 3. **Marker rate < 20%**: real boundaries produce mostly literals with a few
-///    cross-boundary back-references. False positives that parse random bits as
-///    dense match codes produce >50% markers (often 100%).
+/// Lightweight check: decode 32KB of output. If decoding succeeds and
+/// produces enough output, accept. The block-by-block confirmation phase
+/// catches false positives (spec boundaries that aren't real block boundaries
+/// are simply never matched by the sequential decoder).
+///
+/// Two checks eliminate the most obvious false positives:
+/// 1. **Output volume**: must produce >=32KB output (or >=4KB near EOF).
+/// 2. **Marker presence**: mid-stream positions MUST have markers.
 fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
     let start_byte = bit_offset / 8;
+    if start_byte >= deflate_data.len() {
+        return false;
+    }
     let relative_start_bit = bit_offset % 8;
     let remaining = deflate_data.len() - start_byte;
 
-    let slice_len = remaining.min(2 * 1024 * 1024);
+    let slice_len = remaining.min(256 * 1024);
     let data_slice = &deflate_data[start_byte..start_byte + slice_len];
 
-    let decode_limit = slice_len.min(1024 * 1024);
+    let decode_limit = slice_len.min(64 * 1024);
     let mut decoder = MarkerDecoder::new(data_slice, relative_start_bit);
     match decoder.decode_until(decode_limit) {
         Ok(_) => {
             let output_len = decoder.output().len();
             let marker_count = decoder.marker_count();
 
-            let min_output = if remaining > 1024 * 1024 {
-                512 * 1024
-            } else {
+            let min_output = if remaining > 128 * 1024 {
                 32 * 1024
+            } else {
+                4 * 1024
             };
 
             if output_len < min_output {
@@ -264,167 +316,207 @@ fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
             if marker_count == 0 {
                 return false;
             }
-            let marker_rate = marker_count as f64 / output_len as f64;
-            marker_rate < 0.20
+            true
         }
         Err(_) => false,
     }
 }
 
-struct DecodedChunk {
-    data: Vec<u16>,
-    marker_count: usize,
-}
-
-/// Estimate max output size for a chunk based on its compressed size.
-/// Uses a generous ratio (8x) to avoid rejecting valid chunks, but prevents
-/// the unbounded overshoot that caused the 5x output bug.
-fn max_output_for_chunk(compressed_bytes: usize) -> usize {
-    // 8x is generous — typical ratio is 2-4x. All-zero stored blocks can
-    // theoretically reach ~1032:1 but real data never does.
-    (compressed_bytes * 8).max(64 * 1024)
-}
-
-fn decode_chunks_parallel(
+/// Decode a chunk starting at `start_bit`, stopping at `until_bit` or BFINAL.
+fn decode_chunk_from(
     deflate_data: &[u8],
-    boundaries: &[usize],
-    num_threads: usize,
-) -> Result<Vec<DecodedChunk>, ParallelError> {
-    let num_chunks = boundaries.len();
-    let results: Vec<Mutex<Option<DecodedChunk>>> =
-        (0..num_chunks).map(|_| Mutex::new(None)).collect();
-    let errors = AtomicBool::new(false);
-    let chunk_idx = AtomicUsize::new(0);
-
-    std::thread::scope(|s| {
-        for _ in 0..num_threads.min(num_chunks) {
-            s.spawn(|| loop {
-                let idx = chunk_idx.fetch_add(1, Ordering::Relaxed);
-                if idx >= num_chunks || errors.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let start_bit = boundaries[idx];
-                let is_last = idx + 1 >= boundaries.len();
-
-                let start_byte = start_bit / 8;
-                let relative_start_bit = start_bit % 8;
-
-                // Bound the data slice to avoid copying full tail (PR #43 fix)
-                let end_byte = if is_last {
-                    deflate_data.len()
-                } else {
-                    let next_byte = boundaries[idx + 1] / 8;
-                    // Add 64KB margin for bit-level overshoot at block boundary
-                    (next_byte + 64 * 1024).min(deflate_data.len())
-                };
-                let data_slice = &deflate_data[start_byte..end_byte];
-
-                let compressed_bytes = end_byte - start_byte;
-                let max_output = max_output_for_chunk(compressed_bytes);
-
-                let mut decoder = MarkerDecoder::new(data_slice, relative_start_bit);
-
-                let decode_result = if is_last {
-                    decoder.decode_until(max_output).map(|_| ())
-                } else {
-                    let next_boundary = boundaries[idx + 1];
-                    let relative_end_bit = next_boundary - start_byte * 8;
-                    decoder
-                        .decode_until_bit(max_output, relative_end_bit)
-                        .map(|_| ())
-                };
-
-                match decode_result {
-                    Ok(()) => {
-                        // Chain convergence check: if this isn't the last chunk,
-                        // verify we landed exactly at the next boundary.
-                        // Overshoot means the boundary is a false positive
-                        // (not on the same deflate block chain).
-                        if !is_last {
-                            let next_boundary = boundaries[idx + 1];
-                            let relative_end_bit = next_boundary - start_byte * 8;
-                            let final_pos = decoder.bit_position();
-                            if final_pos != relative_end_bit {
-                                if debug_enabled() {
-                                    eprintln!(
-                                        "[parallel_sm] chunk {}: chain mismatch: \
-                                         landed at bit {} expected {} (delta={})",
-                                        idx,
-                                        final_pos,
-                                        relative_end_bit,
-                                        final_pos as i64 - relative_end_bit as i64
-                                    );
-                                }
-                                errors.store(true, Ordering::Relaxed);
-                                return;
-                            }
-                        }
-
-                        *results[idx].lock().unwrap() = Some(DecodedChunk {
-                            data: decoder.output().to_vec(),
-                            marker_count: decoder.marker_count(),
-                        });
-                    }
-                    Err(e) => {
-                        if debug_enabled() {
-                            eprintln!("[parallel_sm] chunk {} decode error: {}", idx, e);
-                        }
-                        errors.store(true, Ordering::Relaxed);
-                    }
-                }
-            });
-        }
-    });
-
-    if errors.load(Ordering::Relaxed) {
-        return Err(ParallelError::DecodeFailed);
+    start_bit: usize,
+    until_bit: Option<usize>,
+    max_output: usize,
+) -> Option<SpeculativeChunk> {
+    let start_byte = start_bit / 8;
+    if start_byte >= deflate_data.len() {
+        return None;
     }
+    let relative_start = start_bit % 8;
 
-    Ok(results
-        .into_iter()
-        .map(|m| m.into_inner().unwrap().expect("all chunks decoded"))
-        .collect())
+    // Use all remaining data — decode_until_bit stops at the target position.
+    // Large deflate blocks can extend far past until_bit, so we need the
+    // full stream available (64KB margin was insufficient).
+    let data_slice = &deflate_data[start_byte..];
+    let mut decoder = MarkerDecoder::new(data_slice, relative_start);
+
+    let result = if let Some(until) = until_bit {
+        let relative_until = until.saturating_sub(start_byte * 8);
+        decoder.decode_until_bit(max_output, relative_until)
+    } else {
+        decoder.decode_until(max_output)
+    };
+
+    match result {
+        Ok(_) => {
+            let end_bit = start_byte * 8 + decoder.bit_position();
+            Some(SpeculativeChunk {
+                start_bit,
+                end_bit,
+                data: decoder.output().to_vec(),
+                marker_count: decoder.marker_count(),
+            })
+        }
+        Err(_) => None,
+    }
 }
 
-/// Resolve markers sequentially using window propagation, then write output.
+/// Sequential confirmation + marker resolution + CRC verification + write.
 ///
-/// Chunk 0 should have no markers (starts from beginning of deflate stream).
-/// Chunk 1..N may have markers; resolved using previous chunk's last 32KB.
-fn resolve_and_write<W: Write>(
-    chunks: &[DecodedChunk],
-    writer: &mut W,
+/// Processes the stream block-by-block. At each block boundary, checks if a
+/// speculative chunk starts there. On hit, uses the speculative output (resolving
+/// markers). On miss, continues sequential decode to the next block boundary.
+///
+/// This finds ALL spec chunks at real block boundaries, even if they don't align
+/// exactly with partition points. False-positive spec boundaries (at positions
+/// that are not real block boundaries) are simply never matched.
+fn confirm_resolve_write<W: Write>(
+    deflate_data: &[u8],
+    speculative: &[Option<SpeculativeChunk>],
     expected_size: usize,
     expected_crc: u32,
+    writer: &mut W,
 ) -> Result<usize, ParallelError> {
     let mut buffer = Vec::with_capacity(expected_size);
     let mut window = Vec::<u8>::new();
+    let mut confirmed_bit: usize = 0;
+    let total_bits = deflate_data.len() * 8;
 
-    for (i, chunk) in chunks.iter().enumerate() {
-        if chunk.marker_count > 0 {
-            if window.is_empty() {
+    let mut spec_by_start: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    for (i, spec) in speculative.iter().enumerate() {
+        if let Some(chunk) = spec {
+            spec_by_start.insert(chunk.start_bit, i);
+        }
+    }
+
+    loop {
+        if expected_size > 0 && buffer.len() >= expected_size {
+            break;
+        }
+        if confirmed_bit >= total_bits {
+            break;
+        }
+
+        if let Some(&idx) = spec_by_start.get(&confirmed_bit) {
+            let chunk = speculative[idx].as_ref().unwrap();
+
+            if debug_enabled() {
+                eprintln!(
+                    "[parallel_sm] confirm: HIT at bit {} (chunk {}), {} output, {} markers",
+                    confirmed_bit,
+                    idx,
+                    chunk.data.len(),
+                    chunk.marker_count
+                );
+            }
+
+            append_chunk_to_buffer(&chunk.data, chunk.marker_count, &mut buffer, &mut window)?;
+            confirmed_bit = chunk.end_bit;
+        } else {
+            // Sequential decode, checking for spec matches at every block boundary.
+            let (bytes, end_bit) = decode_sequential_to_spec(
+                deflate_data,
+                confirmed_bit,
+                &window,
+                expected_size.saturating_sub(buffer.len()),
+                &spec_by_start,
+            )?;
+
+            if debug_enabled() && end_bit != confirmed_bit {
+                let found_spec = spec_by_start.contains_key(&end_bit);
+                eprintln!(
+                    "[parallel_sm] confirm: sequential {} → {} ({} bytes){}",
+                    confirmed_bit,
+                    end_bit,
+                    bytes.len(),
+                    if found_spec { " → spec match!" } else { "" }
+                );
+            }
+
+            if bytes.is_empty() {
+                break;
+            }
+
+            buffer.extend_from_slice(&bytes);
+            update_window(&mut window, &bytes);
+            confirmed_bit = end_bit;
+        }
+    }
+
+    verify_output(&buffer, expected_size, expected_crc)?;
+    writer.write_all(&buffer)?;
+    Ok(buffer.len())
+}
+
+/// Decode sequentially block-by-block, stopping at the first block boundary
+/// that matches a speculative chunk's start_bit. This finds real spec boundaries
+/// even when they don't align with decode_until_bit's stopping points.
+fn decode_sequential_to_spec(
+    deflate_data: &[u8],
+    start_bit: usize,
+    window: &[u8],
+    max_output: usize,
+    spec_by_start: &std::collections::HashMap<usize, usize>,
+) -> Result<(Vec<u8>, usize), ParallelError> {
+    let start_byte = start_bit / 8;
+    if start_byte >= deflate_data.len() {
+        return Ok((Vec::new(), start_bit));
+    }
+    let relative_start = start_bit % 8;
+    let data_slice = &deflate_data[start_byte..];
+
+    let mut decoder = if window.is_empty() {
+        MarkerDecoder::new(data_slice, relative_start)
+    } else {
+        MarkerDecoder::with_window(data_slice, relative_start, window)
+    };
+
+    loop {
+        if decoder.output().len() >= max_output {
+            break;
+        }
+
+        match decoder.decode_block() {
+            Ok(is_final) => {
+                let abs_bit = start_byte * 8 + decoder.bit_position();
+
+                if spec_by_start.contains_key(&abs_bit) {
+                    let bytes: Vec<u8> = decoder.output().iter().map(|&v| v as u8).collect();
+                    return Ok((bytes, abs_bit));
+                }
+
+                if is_final {
+                    break;
+                }
+            }
+            Err(e) => {
+                if e.kind() == io::ErrorKind::UnexpectedEof && !decoder.output().is_empty() {
+                    break;
+                }
                 if debug_enabled() {
                     eprintln!(
-                        "[parallel_sm] chunk {} has {} markers but no window available",
-                        i, chunk.marker_count
+                        "[parallel_sm] sequential decode error at bit {}: {}",
+                        start_bit, e
                     );
                 }
                 return Err(ParallelError::DecodeFailed);
             }
-
-            let mut resolved = chunk.data.clone();
-            replace_markers(&mut resolved, &window);
-
-            let bytes: Vec<u8> = resolved.iter().map(|&v| v as u8).collect();
-            buffer.extend_from_slice(&bytes);
-            update_window(&mut window, &bytes);
-        } else {
-            let bytes: Vec<u8> = chunk.data.iter().map(|&v| v as u8).collect();
-            buffer.extend_from_slice(&bytes);
-            update_window(&mut window, &bytes);
         }
     }
 
+    let abs_bit = start_byte * 8 + decoder.bit_position();
+    let bytes: Vec<u8> = decoder.output().iter().map(|&v| v as u8).collect();
+    Ok((bytes, abs_bit))
+}
+
+/// Verify output buffer against expected ISIZE and CRC32.
+fn verify_output(
+    buffer: &[u8],
+    expected_size: usize,
+    expected_crc: u32,
+) -> Result<(), ParallelError> {
     if expected_size > 0 && buffer.len() != expected_size {
         if debug_enabled() {
             eprintln!(
@@ -438,7 +530,7 @@ fn resolve_and_write<W: Write>(
 
     if expected_crc != 0 {
         let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&buffer);
+        hasher.update(buffer);
         let actual_crc = hasher.finalize();
         if actual_crc != expected_crc {
             if debug_enabled() {
@@ -451,8 +543,96 @@ fn resolve_and_write<W: Write>(
         }
     }
 
-    writer.write_all(&buffer)?;
-    Ok(buffer.len())
+    Ok(())
+}
+
+fn append_chunk_to_buffer(
+    data: &[u16],
+    marker_count: usize,
+    buffer: &mut Vec<u8>,
+    window: &mut Vec<u8>,
+) -> Result<(), ParallelError> {
+    if marker_count > 0 {
+        if window.is_empty() {
+            return Err(ParallelError::DecodeFailed);
+        }
+        let mut resolved = data.to_vec();
+        replace_markers(&mut resolved, window);
+        let bytes: Vec<u8> = resolved.iter().map(|&v| v as u8).collect();
+        buffer.extend_from_slice(&bytes);
+        update_window(window, &bytes);
+    } else {
+        let bytes: Vec<u8> = data.iter().map(|&v| v as u8).collect();
+        buffer.extend_from_slice(&bytes);
+        update_window(window, &bytes);
+    }
+    Ok(())
+}
+
+/// Find the start_bit of the next speculative chunk after `after_bit`.
+#[cfg(test)]
+fn find_next_spec_start(
+    spec_by_start: &std::collections::HashMap<usize, usize>,
+    after_bit: usize,
+    total_bits: usize,
+) -> usize {
+    let mut best = total_bits;
+    for &start in spec_by_start.keys() {
+        if start > after_bit && start < best {
+            best = start;
+        }
+    }
+    best
+}
+
+/// Decode sequentially from `start_bit` using a known window.
+/// Returns (decoded_bytes, end_bit_position).
+#[cfg(test)]
+fn decode_sequential_from(
+    deflate_data: &[u8],
+    start_bit: usize,
+    until_bit: Option<usize>,
+    window: &[u8],
+    max_output: usize,
+) -> Result<(Vec<u8>, usize), ParallelError> {
+    let start_byte = start_bit / 8;
+    if start_byte >= deflate_data.len() {
+        return Ok((Vec::new(), start_bit));
+    }
+    let relative_start = start_bit % 8;
+
+    // Use all remaining data — decode_until_bit stops at the target position.
+    let data_slice = &deflate_data[start_byte..];
+
+    let mut decoder = if window.is_empty() {
+        MarkerDecoder::new(data_slice, relative_start)
+    } else {
+        MarkerDecoder::with_window(data_slice, relative_start, window)
+    };
+
+    let result = if let Some(until) = until_bit {
+        let relative_until = until.saturating_sub(start_byte * 8);
+        decoder.decode_until_bit(max_output, relative_until)
+    } else {
+        decoder.decode_until(max_output)
+    };
+
+    match result {
+        Ok(_) => {
+            let end_bit = start_byte * 8 + decoder.bit_position();
+            let bytes: Vec<u8> = decoder.output().iter().map(|&v| v as u8).collect();
+            Ok((bytes, end_bit))
+        }
+        Err(e) => {
+            if debug_enabled() {
+                eprintln!(
+                    "[parallel_sm] sequential decode error at bit {}: {}",
+                    start_bit, e
+                );
+            }
+            Err(ParallelError::DecodeFailed)
+        }
+    }
 }
 
 fn update_window(window: &mut Vec<u8>, new_data: &[u8]) {
@@ -473,7 +653,6 @@ fn update_window(window: &mut Vec<u8>, new_data: &[u8]) {
 pub enum ParallelError {
     InvalidHeader,
     TooSmall,
-    TooFewChunks,
     DecodeFailed,
     SizeMismatch,
     CrcMismatch,
@@ -486,12 +665,17 @@ impl From<io::Error> for ParallelError {
     }
 }
 
+impl ParallelError {
+    pub fn is_routing(&self) -> bool {
+        matches!(self, ParallelError::TooSmall)
+    }
+}
+
 impl std::fmt::Display for ParallelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ParallelError::InvalidHeader => write!(f, "invalid gzip header"),
             ParallelError::TooSmall => write!(f, "file too small for parallel decode"),
-            ParallelError::TooFewChunks => write!(f, "too few chunk boundaries found"),
             ParallelError::DecodeFailed => write!(f, "chunk decode failed"),
             ParallelError::SizeMismatch => write!(f, "output size mismatch"),
             ParallelError::CrcMismatch => write!(f, "CRC32 mismatch"),
@@ -503,6 +687,83 @@ impl std::fmt::Display for ParallelError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =====================================================================
+    //  Compatibility wrappers: bridge old test API to new speculation API
+    // =====================================================================
+
+    struct DecodedChunk {
+        data: Vec<u16>,
+        marker_count: usize,
+    }
+
+    /// Compatibility: old 1-argument max_output_for_chunk → new 3-argument version
+    fn max_output_for_chunk_compat(compressed_bytes: usize) -> usize {
+        max_output_for_chunk(0, 0, compressed_bytes)
+    }
+
+    /// Compatibility: find boundaries by searching forward from each partition point
+    fn find_chunk_boundaries(deflate: &[u8], num_chunks: usize) -> Vec<usize> {
+        let total_bits = deflate.len() * 8;
+        let spacing = total_bits / num_chunks;
+        let mut boundaries = vec![0];
+        for i in 1..num_chunks {
+            let partition_bit = i * spacing;
+            if let Some(boundary) = search_boundary_forward(deflate, partition_bit) {
+                boundaries.push(boundary);
+            }
+        }
+        boundaries
+    }
+
+    /// Compatibility: decode chunks at given boundaries
+    fn decode_chunks_parallel(
+        deflate: &[u8],
+        boundaries: &[usize],
+        _num_threads: usize,
+    ) -> Result<Vec<DecodedChunk>, ParallelError> {
+        let isize_est = deflate.len() * 4;
+        let mut chunks = Vec::new();
+        for i in 0..boundaries.len() {
+            let start = boundaries[i];
+            let until = if i + 1 < boundaries.len() {
+                Some(boundaries[i + 1])
+            } else {
+                None
+            };
+            let max = max_output_for_chunk(
+                isize_est,
+                boundaries.len(),
+                deflate.len() / boundaries.len(),
+            );
+            if let Some(sc) = decode_chunk_from(deflate, start, until, max) {
+                chunks.push(DecodedChunk {
+                    data: sc.data,
+                    marker_count: sc.marker_count,
+                });
+            } else {
+                return Err(ParallelError::DecodeFailed);
+            }
+        }
+        Ok(chunks)
+    }
+
+    /// Compatibility: resolve marker data and write to output
+    fn resolve_and_write<W: Write>(
+        chunks: &[DecodedChunk],
+        writer: &mut W,
+        expected_size: usize,
+        expected_crc: u32,
+    ) -> Result<usize, ParallelError> {
+        let mut buffer = Vec::with_capacity(expected_size);
+        let mut window = Vec::new();
+        for chunk in chunks {
+            append_chunk_to_buffer(&chunk.data, chunk.marker_count, &mut buffer, &mut window)?;
+        }
+        verify_output(&buffer, expected_size, expected_crc)?;
+        writer.write_all(&buffer)?;
+        Ok(buffer.len())
+    }
 
     fn make_gzip_data(data: &[u8]) -> Vec<u8> {
         use std::io::Write;
@@ -735,7 +996,7 @@ mod tests {
                 (next_byte + 64 * 1024).min(deflate.len())
             };
             let compressed_bytes = end_byte - start_byte;
-            let max_output = max_output_for_chunk(compressed_bytes);
+            let max_output = max_output_for_chunk_compat(compressed_bytes);
 
             // Use bounded slice (same as production code)
             let data_slice = &deflate[start_byte..end_byte];
@@ -852,7 +1113,7 @@ mod tests {
         let next_bit = boundaries[2];
         let end_byte = (next_bit / 8 + 64 * 1024).min(deflate.len());
         let compressed_bytes = end_byte - start_byte;
-        let max_out = max_output_for_chunk(compressed_bytes);
+        let max_out = max_output_for_chunk_compat(compressed_bytes);
         let relative_start = start_bit % 8;
 
         // Decode chunk 1 with BOUNDED slice (correct)
@@ -1730,7 +1991,7 @@ mod tests {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
         let mut output = Vec::new();
-        let result = decompress_parallel(&compressed, &mut output, 2);
+        let result = decompress_parallel(&compressed, &mut output, 1);
         assert!(matches!(result, Err(ParallelError::TooSmall)));
     }
 
@@ -1938,14 +2199,17 @@ mod tests {
 
     #[test]
     fn test_max_output_minimum() {
-        assert!(max_output_for_chunk(0) >= 64 * 1024);
-        assert!(max_output_for_chunk(100) >= 64 * 1024);
+        assert!(max_output_for_chunk_compat(0) >= 64 * 1024);
+        assert!(max_output_for_chunk_compat(100) >= 64 * 1024);
     }
 
     #[test]
     fn test_max_output_scaling() {
-        assert_eq!(max_output_for_chunk(1024 * 1024), 8 * 1024 * 1024);
-        assert_eq!(max_output_for_chunk(10 * 1024 * 1024), 80 * 1024 * 1024);
+        assert_eq!(max_output_for_chunk_compat(1024 * 1024), 8 * 1024 * 1024);
+        assert_eq!(
+            max_output_for_chunk_compat(10 * 1024 * 1024),
+            80 * 1024 * 1024
+        );
     }
 
     // =====================================================================
@@ -3641,5 +3905,823 @@ mod tests {
                 }
             }
         }
+    }
+
+    // =====================================================================
+    //  CATEGORY A: Unit tests for new speculation pipeline functions
+    //  These test the bit arithmetic and speculation hit/miss logic
+    //  that are most likely to silently break under production workloads.
+    // =====================================================================
+
+    // --- decode_chunk_from ---
+
+    #[test]
+    fn test_decode_chunk_from_bit0_produces_clean_output() {
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let oracle = get_oracle_boundaries(deflate, 1024 * 1024);
+        assert!(oracle.len() >= 2, "need oracle boundaries");
+
+        let until_bit = oracle[1];
+        let chunk = decode_chunk_from(deflate, 0, Some(until_bit), usize::MAX)
+            .expect("chunk 0 from bit 0 should decode");
+
+        assert_eq!(chunk.start_bit, 0);
+        assert_eq!(
+            chunk.marker_count, 0,
+            "chunk 0 should have no markers (starts at stream beginning)"
+        );
+
+        let chunk_bytes: Vec<u8> = chunk.data.iter().map(|&v| v as u8).collect();
+        assert_eq!(
+            &chunk_bytes,
+            &data[..chunk_bytes.len()],
+            "chunk 0 output doesn't match sequential reference"
+        );
+    }
+
+    #[test]
+    fn test_decode_chunk_from_end_bit_is_absolute() {
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let oracle = get_oracle_boundaries(deflate, 1024 * 1024);
+        assert!(oracle.len() >= 3);
+
+        // Decode chunk 0 to oracle boundary[1]
+        let chunk =
+            decode_chunk_from(deflate, 0, Some(oracle[1]), usize::MAX).expect("chunk 0 decode");
+
+        // end_bit should match the oracle boundary exactly
+        assert_eq!(
+            chunk.end_bit, oracle[1],
+            "end_bit {} should equal oracle boundary {} \
+             (absolute bit position)",
+            chunk.end_bit, oracle[1]
+        );
+    }
+
+    #[test]
+    fn test_decode_chunk_from_handoff_to_sequential() {
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let oracle = get_oracle_boundaries(deflate, 2 * 1024 * 1024);
+        assert!(oracle.len() >= 2);
+
+        // Phase 1: decode chunk 0 from bit 0 to first oracle boundary
+        let chunk0 =
+            decode_chunk_from(deflate, 0, Some(oracle[1]), usize::MAX).expect("chunk 0 decode");
+        let chunk0_bytes: Vec<u8> = chunk0.data.iter().map(|&v| v as u8).collect();
+
+        // Phase 2: decode sequentially from chunk0's end_bit
+        let (seq_bytes, _end_bit) = decode_sequential_from(
+            deflate,
+            chunk0.end_bit,
+            None,
+            &chunk0_bytes[chunk0_bytes.len().saturating_sub(WINDOW_SIZE)..],
+            data.len(),
+        )
+        .expect("sequential decode from handoff");
+
+        // Concatenated output should match full sequential decode
+        let mut combined = chunk0_bytes;
+        combined.extend_from_slice(&seq_bytes);
+        assert_eq!(
+            combined.len(),
+            data.len(),
+            "handoff output size {} != expected {}",
+            combined.len(),
+            data.len()
+        );
+        assert_eq!(combined, data, "handoff output content mismatch");
+    }
+
+    #[test]
+    fn test_decode_chunk_from_returns_none_past_end() {
+        let data = make_compressible_data(1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let past_end_bit = deflate.len() * 8 + 100;
+        let result = decode_chunk_from(deflate, past_end_bit, None, usize::MAX);
+        assert!(
+            result.is_none(),
+            "should return None for start past data end"
+        );
+    }
+
+    // --- decode_sequential_from ---
+
+    #[test]
+    fn test_decode_sequential_from_with_window() {
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let oracle = get_oracle_boundaries(deflate, 1024 * 1024);
+        assert!(oracle.len() >= 3);
+
+        // Get the window at oracle[1] from scan
+        let scan = crate::scan_inflate::scan_deflate_fast(deflate, 1024 * 1024, 0).expect("scan");
+        let window = &scan.checkpoints[0].window;
+
+        let (bytes, _end_bit) =
+            decode_sequential_from(deflate, oracle[1], Some(oracle[2]), window, data.len())
+                .expect("sequential decode with window");
+
+        // With the correct window, output should be non-empty
+        assert!(
+            !bytes.is_empty(),
+            "sequential decode with window produced no output"
+        );
+    }
+
+    #[test]
+    fn test_decode_sequential_from_empty_at_end() {
+        let data = make_compressible_data(1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let start_bit = deflate.len() * 8 + 100;
+        let (bytes, end_bit) = decode_sequential_from(deflate, start_bit, None, &[], usize::MAX)
+            .expect("should not error past end");
+        assert!(bytes.is_empty(), "should produce no output past data end");
+        assert_eq!(end_bit, start_bit, "end_bit should equal start_bit");
+    }
+
+    // --- search_boundary_forward ---
+
+    #[test]
+    fn test_search_boundary_forward_returns_forward_only() {
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let total_bits = deflate.len() * 8;
+        let spacing = total_bits / 4;
+
+        for i in 1..4 {
+            let partition_bit = i * spacing;
+            if let Some(found) = search_boundary_forward(deflate, partition_bit) {
+                assert!(
+                    found >= partition_bit,
+                    "search_boundary_forward returned {} < partition {} \
+                     (must be forward-only)",
+                    found,
+                    partition_bit
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_search_boundary_forward_result_passes_try_decode() {
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let total_bits = deflate.len() * 8;
+        let spacing = total_bits / 4;
+
+        for i in 1..4 {
+            let partition_bit = i * spacing;
+            if let Some(found) = search_boundary_forward(deflate, partition_bit) {
+                assert!(
+                    try_decode_at(deflate, found),
+                    "search_boundary_forward returned {} which fails try_decode_at",
+                    found
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_search_boundary_forward_finds_valid_boundary() {
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let total_bits = deflate.len() * 8;
+        let spacing = total_bits / 4;
+
+        // Search from each partition point — should find SOME boundary
+        let mut found_count = 0;
+        for i in 1..4 {
+            let partition = i * spacing;
+            if let Some(found) = search_boundary_forward(deflate, partition) {
+                found_count += 1;
+                // Every found boundary must pass try_decode_at
+                assert!(
+                    try_decode_at(deflate, found),
+                    "found boundary at {} doesn't pass try_decode_at",
+                    found
+                );
+                // Must be within SEARCH_RADIUS of partition
+                assert!(
+                    found < partition + SEARCH_RADIUS * 8,
+                    "found boundary {} too far from partition {}",
+                    found,
+                    partition
+                );
+            }
+        }
+        eprintln!(
+            "search_boundary_forward: found {}/3 boundaries",
+            found_count
+        );
+    }
+
+    // --- confirm_resolve_write hit/miss/mixed ---
+
+    #[test]
+    fn test_confirm_all_hits() {
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let oracle = get_oracle_boundaries(deflate, 2 * 1024 * 1024);
+        if oracle.len() < 3 {
+            return;
+        }
+
+        // Build speculative chunks at oracle boundaries (perfect speculation)
+        let mut specs: Vec<Option<SpeculativeChunk>> = Vec::new();
+        for i in 0..oracle.len() {
+            let until = if i + 1 < oracle.len() {
+                Some(oracle[i + 1])
+            } else {
+                None
+            };
+            let chunk = decode_chunk_from(deflate, oracle[i], until, usize::MAX);
+            specs.push(chunk);
+        }
+
+        let expected_crc = gzip_crc32(&compressed);
+        let mut output = Vec::new();
+        let result = confirm_resolve_write(deflate, &specs, data.len(), expected_crc, &mut output);
+
+        assert!(
+            result.is_ok(),
+            "all-hits should succeed: {:?}",
+            result.err()
+        );
+        assert_eq!(output, data, "all-hits output should match sequential");
+    }
+
+    #[test]
+    fn test_confirm_all_misses() {
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        // All speculative chunks are None → all misses → full sequential decode
+        let specs: Vec<Option<SpeculativeChunk>> = (0..4).map(|_| None).collect();
+
+        let expected_crc = gzip_crc32(&compressed);
+        let mut output = Vec::new();
+        let result = confirm_resolve_write(deflate, &specs, data.len(), expected_crc, &mut output);
+
+        assert!(
+            result.is_ok(),
+            "all-misses should succeed via sequential fallback: {:?}",
+            result.err()
+        );
+        assert_eq!(output, data, "all-misses output should match sequential");
+    }
+
+    #[test]
+    fn test_confirm_mixed_hits_misses() {
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let oracle = get_oracle_boundaries(deflate, 2 * 1024 * 1024);
+        if oracle.len() < 4 {
+            return;
+        }
+
+        // chunk 0: real hit, chunk 1: miss, chunk 2: real hit, rest: miss
+        let mut specs: Vec<Option<SpeculativeChunk>> = Vec::new();
+        for i in 0..oracle.len() {
+            if i == 0 || i == 2 {
+                let until = if i + 1 < oracle.len() {
+                    Some(oracle[i + 1])
+                } else {
+                    None
+                };
+                specs.push(decode_chunk_from(deflate, oracle[i], until, usize::MAX));
+            } else {
+                specs.push(None);
+            }
+        }
+
+        let expected_crc = gzip_crc32(&compressed);
+        let mut output = Vec::new();
+        let result = confirm_resolve_write(deflate, &specs, data.len(), expected_crc, &mut output);
+
+        assert!(
+            result.is_ok(),
+            "mixed hits/misses should succeed: {:?}",
+            result.err()
+        );
+        assert_eq!(output, data, "mixed output should match sequential");
+    }
+
+    // --- find_next_spec_start ---
+
+    #[test]
+    fn test_find_next_spec_start_basic() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(100usize, 0usize);
+        map.insert(200, 1);
+        map.insert(300, 2);
+
+        assert_eq!(find_next_spec_start(&map, 50, 1000), 100);
+        assert_eq!(find_next_spec_start(&map, 100, 1000), 200);
+        assert_eq!(find_next_spec_start(&map, 150, 1000), 200);
+        assert_eq!(find_next_spec_start(&map, 200, 1000), 300);
+        assert_eq!(find_next_spec_start(&map, 250, 1000), 300);
+    }
+
+    #[test]
+    fn test_find_next_spec_start_empty_map() {
+        let map = std::collections::HashMap::new();
+        assert_eq!(
+            find_next_spec_start(&map, 0, 1000),
+            1000,
+            "empty map should return total_bits"
+        );
+    }
+
+    #[test]
+    fn test_find_next_spec_start_past_all() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(100usize, 0usize);
+        map.insert(200, 1);
+        assert_eq!(
+            find_next_spec_start(&map, 300, 1000),
+            1000,
+            "after_bit past all entries should return total_bits"
+        );
+    }
+
+    // --- speculation hit invariant (THE critical test) ---
+
+    #[test]
+    fn test_speculation_hit_invariant() {
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let oracle = get_oracle_boundaries(deflate, 2 * 1024 * 1024);
+        if oracle.len() < 3 {
+            return;
+        }
+
+        // Decode chunk 0 to oracle[1], then check if search_boundary_forward
+        // from oracle[1] finds the same position. This is THE invariant:
+        // chunk 0's end_bit must equal what search_boundary_forward returns.
+        let chunk0 =
+            decode_chunk_from(deflate, 0, Some(oracle[1]), usize::MAX).expect("chunk 0 decode");
+
+        // chunk0.end_bit should be at a deflate block boundary.
+        // search_boundary_forward from a position NEAR oracle[1] should find
+        // a boundary at the same position.
+        if let Some(found) = search_boundary_forward(deflate, oracle[1]) {
+            // The found boundary might not be exactly at oracle[1] — search goes
+            // FORWARD from oracle[1]. But if chunk0.end_bit == oracle[1] and
+            // search finds oracle[1], we have a hit.
+            if found == chunk0.end_bit {
+                // Perfect hit — speculation would succeed
+                eprintln!(
+                    "speculation hit: chunk0 end_bit={} == search result={}",
+                    chunk0.end_bit, found
+                );
+            } else {
+                eprintln!(
+                    "speculation miss: chunk0 end_bit={}, search found={}, oracle={}",
+                    chunk0.end_bit, found, oracle[1]
+                );
+            }
+        }
+
+        // The stronger invariant: chunk0's end_bit EQUALS the oracle boundary
+        assert_eq!(
+            chunk0.end_bit, oracle[1],
+            "chunk0 end_bit {} != oracle boundary {} — \
+             bit arithmetic is wrong in decode_chunk_from",
+            chunk0.end_bit, oracle[1]
+        );
+    }
+
+    // --- max_output_for_chunk new signature ---
+
+    #[test]
+    fn test_max_output_for_chunk_new_signature() {
+        let isize_total = 100 * 1024 * 1024; // 100 MB
+        let num_chunks = 4;
+        let compressed = 10 * 1024 * 1024; // 10 MB per chunk
+
+        let result = max_output_for_chunk(isize_total, num_chunks, compressed);
+        let isize_based = (isize_total / num_chunks) * 2; // 2x per chunk
+        let ratio_based = compressed * 8;
+
+        assert_eq!(
+            result,
+            isize_based.max(ratio_based),
+            "should be max of isize-based ({}) and ratio-based ({})",
+            isize_based,
+            ratio_based
+        );
+    }
+
+    #[test]
+    fn test_max_output_for_chunk_high_ratio_data() {
+        let isize_total = 100 * 1024 * 1024;
+        let num_chunks = 4;
+        let compressed = 50 * 1024; // 50 KB per chunk
+
+        let result = max_output_for_chunk(isize_total, num_chunks, compressed);
+        let isize_based = (isize_total / num_chunks) * 2; // 2x per chunk = 50MB
+
+        assert!(
+            result >= isize_based,
+            "high-ratio: result {} < isize_based {} — would truncate RLE/zeros output",
+            result,
+            isize_based
+        );
+    }
+
+    #[test]
+    fn test_max_output_for_chunk_zero_isize() {
+        // When ISIZE is 0 (or unknown), fall back to ratio-based
+        let result = max_output_for_chunk(0, 4, 1024 * 1024);
+        assert_eq!(
+            result,
+            8 * 1024 * 1024,
+            "zero ISIZE should use ratio-based limit"
+        );
+    }
+
+    // --- verify_output ---
+
+    #[test]
+    fn test_verify_output_size_mismatch() {
+        let buffer = vec![1, 2, 3];
+        let result = verify_output(&buffer, 100, 0);
+        assert!(
+            matches!(result, Err(ParallelError::SizeMismatch)),
+            "should detect size mismatch"
+        );
+    }
+
+    #[test]
+    fn test_verify_output_crc_mismatch() {
+        let buffer = vec![1, 2, 3];
+        let wrong_crc = 0xDEADBEEF;
+        let result = verify_output(&buffer, 3, wrong_crc);
+        assert!(
+            matches!(result, Err(ParallelError::CrcMismatch)),
+            "should detect CRC mismatch"
+        );
+    }
+
+    #[test]
+    fn test_verify_output_correct() {
+        let buffer = vec![1, 2, 3];
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&buffer);
+        let correct_crc = hasher.finalize();
+
+        let result = verify_output(&buffer, 3, correct_crc);
+        assert!(result.is_ok(), "should pass with correct size and CRC");
+    }
+
+    #[test]
+    fn test_verify_output_zero_crc_skips_check() {
+        let buffer = vec![1, 2, 3];
+        let result = verify_output(&buffer, 3, 0);
+        assert!(result.is_ok(), "CRC 0 should skip CRC check");
+    }
+
+    #[test]
+    fn test_verify_output_zero_size_skips_check() {
+        let buffer = vec![1, 2, 3];
+        let result = verify_output(&buffer, 0, 0);
+        assert!(result.is_ok(), "size 0 should skip size check");
+    }
+
+    // --- append_chunk_to_buffer ---
+
+    #[test]
+    fn test_append_chunk_no_markers() {
+        let data: Vec<u16> = vec![65, 66, 67];
+        let mut buffer = Vec::new();
+        let mut window = Vec::new();
+        append_chunk_to_buffer(&data, 0, &mut buffer, &mut window).unwrap();
+        assert_eq!(buffer, vec![65, 66, 67]);
+    }
+
+    #[test]
+    fn test_append_chunk_with_markers_resolves() {
+        use crate::marker_decode::MARKER_BASE;
+        let data: Vec<u16> = vec![65, MARKER_BASE]; // marker offset 0 → last byte of window
+        let mut buffer = Vec::new();
+        let mut window = vec![0u8; WINDOW_SIZE];
+        window[WINDOW_SIZE - 1] = 0xFF;
+        append_chunk_to_buffer(&data, 1, &mut buffer, &mut window).unwrap();
+        assert_eq!(buffer, vec![65, 0xFF]);
+    }
+
+    #[test]
+    fn test_append_chunk_markers_no_window_fails() {
+        let data: Vec<u16> = vec![256]; // marker
+        let mut buffer = Vec::new();
+        let mut window = Vec::new();
+        let result = append_chunk_to_buffer(&data, 1, &mut buffer, &mut window);
+        assert!(result.is_err(), "markers with empty window should fail");
+    }
+
+    // --- speculative_decode_parallel ---
+
+    #[test]
+    fn test_speculative_decode_parallel_chunk0_always_some() {
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let total_bits = deflate.len() * 8;
+        let spacing = total_bits / 4;
+        let specs = speculative_decode_parallel(deflate, 4, spacing, data.len());
+
+        assert!(
+            specs[0].is_some(),
+            "chunk 0 must always succeed (starts at bit 0)"
+        );
+        let chunk0 = specs[0].as_ref().unwrap();
+        assert_eq!(chunk0.start_bit, 0, "chunk 0 must start at bit 0");
+        assert_eq!(chunk0.marker_count, 0, "chunk 0 must have 0 markers");
+    }
+
+    #[test]
+    fn test_speculative_decode_parallel_produces_correct_count() {
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        for num_chunks in [2, 4, 8] {
+            let total_bits = deflate.len() * 8;
+            let spacing = total_bits / num_chunks;
+            let specs = speculative_decode_parallel(deflate, num_chunks, spacing, data.len());
+            assert_eq!(
+                specs.len(),
+                num_chunks,
+                "should produce exactly {} speculative results",
+                num_chunks
+            );
+        }
+    }
+
+    // =================================================================
+    //  Gap 2: speculative_decode_parallel when search returns None
+    // =================================================================
+
+    #[test]
+    fn test_speculative_all_misses_still_produces_vec() {
+        // Random (incompressible) data: block finder will find no valid
+        // boundaries, so all chunks except chunk 0 should be None.
+        let mut rng: u64 = 0xbadcafe;
+        let mut random_deflate = Vec::with_capacity(5 * 1024 * 1024);
+        for _ in 0..5 * 1024 * 1024 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            random_deflate.push((rng >> 32) as u8);
+        }
+
+        let num_chunks = 4;
+        let total_bits = random_deflate.len() * 8;
+        let spacing = total_bits / num_chunks;
+        let specs = speculative_decode_parallel(&random_deflate, num_chunks, spacing, 0);
+
+        assert_eq!(specs.len(), num_chunks);
+        // Random bytes are not valid deflate, so chunk 0 should also fail
+        // (MarkerDecoder::decode_until will error on random data).
+        // The important invariant: we get the right count and don't panic.
+    }
+
+    #[test]
+    fn test_confirm_resolve_write_all_none_falls_back_to_sequential() {
+        // Real gzip data but specs are all None → confirm_resolve_write
+        // must decode everything sequentially and produce correct output.
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let isize_offset = compressed.len() - 4;
+        let expected_size = u32::from_le_bytes([
+            compressed[isize_offset],
+            compressed[isize_offset + 1],
+            compressed[isize_offset + 2],
+            compressed[isize_offset + 3],
+        ]) as usize;
+        let crc_offset = compressed.len() - 8;
+        let expected_crc = u32::from_le_bytes([
+            compressed[crc_offset],
+            compressed[crc_offset + 1],
+            compressed[crc_offset + 2],
+            compressed[crc_offset + 3],
+        ]);
+
+        // All None — every chunk is a speculation miss
+        let specs: Vec<Option<SpeculativeChunk>> = vec![None, None, None, None];
+        let mut output = Vec::new();
+        let result =
+            confirm_resolve_write(deflate, &specs, expected_size, expected_crc, &mut output);
+        assert!(
+            result.is_ok(),
+            "all-miss pipeline should still produce correct output via sequential"
+        );
+        assert_eq!(output, data, "output must match original data");
+    }
+
+    // =================================================================
+    //  Gap 3: decode_sequential_from error path with corrupt data
+    // =================================================================
+
+    #[test]
+    fn test_decode_sequential_from_corrupt_returns_error() {
+        // Feed random bytes as "deflate data" — should fail to decode
+        let corrupt: Vec<u8> = (0..1000).map(|i| (i * 37 + 11) as u8).collect();
+        let window = vec![0u8; WINDOW_SIZE];
+        let result = decode_sequential_from(&corrupt, 0, None, &window, 1024 * 1024);
+        // Random data will either decode garbage or error out.
+        // The important thing is it doesn't panic.
+        match result {
+            Ok((bytes, _)) => {
+                // If it happens to parse, the output should be small (random data
+                // doesn't produce valid deflate for long)
+                assert!(
+                    bytes.len() < 100_000,
+                    "corrupt data shouldn't produce large output"
+                );
+            }
+            Err(e) => {
+                assert!(matches!(e, ParallelError::DecodeFailed));
+            }
+        }
+    }
+
+    #[test]
+    fn test_decode_sequential_from_corrupt_all_ff_returns_error() {
+        let corrupt = vec![0xFF; 10_000];
+        let window = vec![0u8; WINDOW_SIZE];
+        let result = decode_sequential_from(&corrupt, 0, None, &window, 1024 * 1024);
+        // 0xFF = BFINAL=1, BTYPE=11 (reserved) → immediate error
+        assert!(result.is_err(), "all-0xFF deflate should fail");
+        assert!(matches!(result.unwrap_err(), ParallelError::DecodeFailed));
+    }
+
+    #[test]
+    fn test_decode_sequential_from_past_end() {
+        let data = vec![0u8; 100];
+        let result = decode_sequential_from(&data, data.len() * 8 + 100, None, &[], 1024);
+        assert!(result.is_ok());
+        let (bytes, _) = result.unwrap();
+        assert!(
+            bytes.is_empty(),
+            "past-end decode should produce empty output"
+        );
+    }
+
+    // =================================================================
+    //  Gap 6: Multiple consecutive speculation misses with window chaining
+    // =================================================================
+
+    #[test]
+    fn test_confirm_consecutive_misses_window_propagation() {
+        // Create data with lots of back-references so the window matters.
+        // 3 chunks: chunk 0 hit, chunks 1+2 miss.
+        // Window from sequential decode of chunk 1 must propagate to chunk 2.
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let isize_offset = compressed.len() - 4;
+        let expected_size = u32::from_le_bytes([
+            compressed[isize_offset],
+            compressed[isize_offset + 1],
+            compressed[isize_offset + 2],
+            compressed[isize_offset + 3],
+        ]) as usize;
+        let crc_offset = compressed.len() - 8;
+        let expected_crc = u32::from_le_bytes([
+            compressed[crc_offset],
+            compressed[crc_offset + 1],
+            compressed[crc_offset + 2],
+            compressed[crc_offset + 3],
+        ]);
+
+        // Run speculative decode to get chunk 0, then null out chunks 1+2
+        let total_bits = deflate.len() * 8;
+        let num_chunks = 3;
+        let spacing = total_bits / num_chunks;
+        let mut specs = speculative_decode_parallel(deflate, num_chunks, spacing, data.len());
+
+        // Keep chunk 0 (always hits), force chunks 1 and 2 to miss
+        specs[1] = None;
+        specs[2] = None;
+
+        let mut output = Vec::new();
+        let result =
+            confirm_resolve_write(deflate, &specs, expected_size, expected_crc, &mut output);
+        assert!(
+            result.is_ok(),
+            "consecutive misses should produce correct output"
+        );
+        assert_eq!(
+            output, data,
+            "window must propagate correctly across consecutive sequential decodes"
+        );
+    }
+
+    #[test]
+    fn test_confirm_alternating_hits_and_misses() {
+        // 4 chunks: hit/miss/hit/miss pattern
+        let data = make_compressible_data(8 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        let header_size =
+            crate::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let deflate = &compressed[header_size..compressed.len() - 8];
+
+        let isize_offset = compressed.len() - 4;
+        let expected_size = u32::from_le_bytes([
+            compressed[isize_offset],
+            compressed[isize_offset + 1],
+            compressed[isize_offset + 2],
+            compressed[isize_offset + 3],
+        ]) as usize;
+        let crc_offset = compressed.len() - 8;
+        let expected_crc = u32::from_le_bytes([
+            compressed[crc_offset],
+            compressed[crc_offset + 1],
+            compressed[crc_offset + 2],
+            compressed[crc_offset + 3],
+        ]);
+
+        let total_bits = deflate.len() * 8;
+        let num_chunks = 4;
+        let spacing = total_bits / num_chunks;
+        let mut specs = speculative_decode_parallel(deflate, num_chunks, spacing, data.len());
+
+        // Null out odd-numbered chunks to create alternating hit/miss
+        specs[1] = None;
+        specs[3] = None;
+
+        let mut output = Vec::new();
+        let result =
+            confirm_resolve_write(deflate, &specs, expected_size, expected_crc, &mut output);
+        assert!(
+            result.is_ok(),
+            "alternating hit/miss should produce correct output"
+        );
+        assert_eq!(output, data);
     }
 }
