@@ -1861,4 +1861,128 @@ mod tests {
         let result = crate::decompression::decompress_gzip_to_vec_pub(&gz, 4).unwrap();
         assert_eq!(result, data, "8MB zeros through parallel must match");
     }
+
+    // =========================================================================
+    // Streaming decompress tests (zlib-ng path for arm64 large files)
+    // =========================================================================
+
+    #[test]
+    fn test_streaming_decompress_roundtrip_mixed() {
+        let data = make_mixed(2 * 1024 * 1024);
+        let gz = compress_single_member(&data);
+        let mut out = Vec::new();
+        crate::decompression::decompress_single_member_streaming_pub(&gz, &mut out).unwrap();
+        assert_eq!(out, data, "streaming decompress must match original");
+    }
+
+    #[test]
+    fn test_streaming_decompress_roundtrip_zeros() {
+        let data = make_zeros(5 * 1024 * 1024);
+        let gz = compress_single_member(&data);
+        let mut out = Vec::new();
+        crate::decompression::decompress_single_member_streaming_pub(&gz, &mut out).unwrap();
+        assert_eq!(out, data, "streaming zeros must match");
+    }
+
+    #[test]
+    fn test_streaming_decompress_roundtrip_random() {
+        let data = make_random_seeded(1024 * 1024, 0xdeadbeef);
+        let gz = compress_single_member(&data);
+        let mut out = Vec::new();
+        crate::decompression::decompress_single_member_streaming_pub(&gz, &mut out).unwrap();
+        assert_eq!(out, data, "streaming random data must match");
+    }
+
+    #[test]
+    fn test_streaming_matches_libdeflate() {
+        let data = make_mixed(3 * 1024 * 1024);
+        let gz = compress_single_member(&data);
+
+        let mut streaming_out = Vec::new();
+        crate::decompression::decompress_single_member_streaming_pub(&gz, &mut streaming_out)
+            .unwrap();
+
+        let mut libdeflate_out = Vec::new();
+        crate::decompression::decompress_single_member_libdeflate_pub(&gz, &mut libdeflate_out)
+            .unwrap();
+
+        assert_eq!(
+            streaming_out, libdeflate_out,
+            "streaming and libdeflate must produce byte-identical output"
+        );
+    }
+
+    #[test]
+    fn test_streaming_decompress_small_file() {
+        let data = b"hello world streaming test".to_vec();
+        let gz = compress_single_member(&data);
+        let mut out = Vec::new();
+        crate::decompression::decompress_single_member_streaming_pub(&gz, &mut out).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn test_streaming_decompress_empty() {
+        let data = Vec::new();
+        let gz = compress_single_member(&data);
+        let mut out = Vec::new();
+        crate::decompression::decompress_single_member_streaming_pub(&gz, &mut out).unwrap();
+        assert!(out.is_empty());
+    }
+
+    // =========================================================================
+    // Block size tuning tests (L1/L2 with many threads)
+    // =========================================================================
+
+    #[test]
+    fn test_block_size_capped_at_256k_with_many_threads() {
+        let size = crate::parallel_compress::get_optimal_block_size(1, 100 * 1024 * 1024, 16);
+        assert!(
+            size <= 256 * 1024,
+            "L1 with 16 threads should use <= 256KB blocks, got {}KB",
+            size / 1024
+        );
+    }
+
+    #[test]
+    fn test_block_size_allows_large_with_few_threads() {
+        let size = crate::parallel_compress::get_optimal_block_size(1, 100 * 1024 * 1024, 4);
+        assert!(
+            size > 256 * 1024,
+            "L1 with 4 threads should allow blocks > 256KB, got {}KB",
+            size / 1024
+        );
+    }
+
+    #[test]
+    fn test_block_size_threshold_at_8_threads() {
+        let below = crate::parallel_compress::get_optimal_block_size(1, 100 * 1024 * 1024, 7);
+        let at = crate::parallel_compress::get_optimal_block_size(1, 100 * 1024 * 1024, 8);
+        assert!(
+            below >= at,
+            "threshold should change at 8 threads: 7t={}KB, 8t={}KB",
+            below / 1024,
+            at / 1024
+        );
+    }
+
+    #[test]
+    fn test_block_size_l2_also_capped() {
+        let size = crate::parallel_compress::get_optimal_block_size(2, 50 * 1024 * 1024, 14);
+        assert!(
+            size <= 256 * 1024,
+            "L2 with 14 threads should use <= 256KB blocks, got {}KB",
+            size / 1024
+        );
+    }
+
+    #[test]
+    fn test_block_size_l6_unchanged() {
+        let size = crate::parallel_compress::get_optimal_block_size(6, 100 * 1024 * 1024, 16);
+        assert_eq!(
+            size,
+            64 * 1024,
+            "L6 block size should be 64KB regardless of threads"
+        );
+    }
 }

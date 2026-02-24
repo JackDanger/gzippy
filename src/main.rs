@@ -30,6 +30,7 @@ mod format;
 mod golden_tests;
 mod inflate_oracle_tests;
 mod inflate_tables;
+mod io_thread;
 mod isal;
 mod isal_compress;
 mod isal_decompress;

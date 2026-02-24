@@ -63,6 +63,68 @@ pub fn decompress_gzip_stream<W: std::io::Write>(_input: &[u8], _writer: &mut W)
     None
 }
 
+/// Write-ahead variant: ISA-L decode with writes on a background thread.
+/// Overlaps write syscalls with the next inflate iteration.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)]
+pub fn decompress_gzip_stream_threaded<W: std::io::Write + Send + 'static>(
+    input: &[u8],
+    writer: W,
+) -> Option<(u64, W)> {
+    use isal::isal_sys::igzip_lib as isal_raw;
+
+    let wa = crate::io_thread::WriteAhead::new(writer, 4);
+
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::IGZIP_GZIP;
+
+    state.avail_in = input.len() as u32;
+    state.next_in = input.as_ptr() as *mut u8;
+
+    let mut out_buf = vec![0u8; 1024 * 1024];
+    let mut total = 0u64;
+
+    loop {
+        state.avail_out = out_buf.len() as u32;
+        state.next_out = out_buf.as_mut_ptr();
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        if ret != 0 {
+            return None;
+        }
+
+        let written = out_buf.len() - state.avail_out as usize;
+        if written > 0 {
+            if wa.send(&out_buf[..written]).is_err() {
+                return None;
+            }
+            total += written as u64;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            break;
+        }
+        if written == 0 && state.avail_in == 0 {
+            break;
+        }
+    }
+
+    match wa.finish() {
+        Ok(w) => Some((total, w)),
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[allow(dead_code)]
+pub fn decompress_gzip_stream_threaded<W: std::io::Write + Send + 'static>(
+    _input: &[u8],
+    _writer: W,
+) -> Option<(u64, W)> {
+    None
+}
+
 /// Decompress a full gzip stream into a pre-allocated output buffer.
 /// Returns the number of bytes written, or None on failure.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]

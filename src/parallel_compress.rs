@@ -95,8 +95,14 @@ pub fn get_optimal_block_size(level: u32, file_size: usize, num_threads: usize) 
     if level <= 2 {
         let target_blocks = (num_threads * 4).max(4);
         let dynamic_size = file_size / target_blocks;
-        // Min 256KB (efficiency), max 4MB (for good parallelism on large files)
-        let clamped = dynamic_size.clamp(256 * 1024, 4 * 1024 * 1024);
+        // With many threads, use smaller blocks for finer load balancing.
+        // pigz uses 128KB; 256KB is a good balance of parallelism vs overhead.
+        let max_size = if num_threads >= 8 {
+            256 * 1024
+        } else {
+            4 * 1024 * 1024
+        };
+        let clamped = dynamic_size.clamp(256 * 1024, max_size);
         (clamped + 65535) & !65535
     } else {
         base_block_size

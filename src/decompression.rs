@@ -579,7 +579,8 @@ fn is_multi_member_quick(data: &[u8]) -> bool {
 /// Routes to the best available decoder:
 ///   - Rapidgzip-style parallel (num_threads >= 2, large files): guess+validate pipeline
 ///   - ISA-L (x86_64 with AVX2): fastest sequential for RLE-heavy data
-///   - libdeflate: fastest general-purpose sequential decoder
+///   - Streaming zlib-ng (arm64, large files): avoids page fault overhead
+///   - libdeflate one-shot: fastest for small files
 fn decompress_single_member<W: Write>(
     data: &[u8],
     writer: &mut W,
@@ -626,7 +627,44 @@ fn decompress_single_member<W: Write>(
             );
         }
     }
+
+    // For large single-member files without ISA-L (arm64), use streaming
+    // zlib-ng to avoid allocating a full-size output buffer. The one-shot
+    // libdeflate path allocates vec![0u8; isize_hint] which triggers
+    // ~isize/4096 minor page faults on first write to each page.
+    if !crate::isal_decompress::is_available() && data.len() > 1024 * 1024 {
+        if debug_enabled() {
+            eprintln!("[gzippy] streaming zlib-ng decode: {} bytes", data.len());
+        }
+        return decompress_single_member_streaming(data, writer);
+    }
+
     decompress_single_member_libdeflate(data, writer)
+}
+
+/// Streaming single-member decompress using zlib-ng (flate2).
+/// Uses a fixed 1MB buffer reused every iteration, eliminating the
+/// page fault overhead of allocating a full-size output buffer.
+/// On arm64, zlib-ng uses NEON for inflate.
+fn decompress_single_member_streaming<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
+    use std::io::Read;
+
+    const BUF_SIZE: usize = 1024 * 1024;
+
+    let mut decoder = flate2::read::GzDecoder::new(data);
+    let mut buf = vec![0u8; BUF_SIZE];
+    let mut total = 0u64;
+
+    loop {
+        let n = decoder.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        total += n as u64;
+    }
+    writer.flush()?;
+    Ok(total)
 }
 
 /// Decompress single-member gzip using libdeflate FFI (fastest path)
@@ -1470,4 +1508,12 @@ pub fn parse_gzip_header_size_pub(data: &[u8]) -> Option<usize> {
 #[cfg(test)]
 pub fn read_gzip_isize_pub(data: &[u8]) -> Option<u32> {
     read_gzip_isize(data)
+}
+
+#[cfg(test)]
+pub fn decompress_single_member_streaming_pub<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> GzippyResult<u64> {
+    decompress_single_member_streaming(data, writer)
 }
