@@ -16,8 +16,19 @@ gzippy-dev losses     # Losses grouped by root cause
 
 1. Make ONE focused change
 2. `cargo test --release` for correctness
-3. `gzippy-dev ci push` — pushes, waits for CI, auto-triages
-4. If CI looks good: `source .env && gzippy-dev cloud bench` for authoritative numbers
+3. **Commit** — commit after every working milestone, before pushing
+4. `gzippy-dev ci push` — pushes, waits for CI, auto-triages
+5. If CI looks good: `source .env && gzippy-dev cloud bench` for authoritative numbers
+
+## Commit Discipline
+
+**Commit early and often.** A commit costs nothing; lost work costs hours.
+
+- Commit after: tests pass, rules updated, clippy clean
+- Commit before: any risky refactor, cloud bench run, or session end
+- Each commit should be one logical unit (rule update, algorithm change, test addition)
+- `cargo fmt && git add -p && git commit` is the standard sequence
+- Never let a session end with unstaged working code
 
 ## When the Tool Is Missing Something
 
