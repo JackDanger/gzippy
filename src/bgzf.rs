@@ -3090,8 +3090,14 @@ pub fn decompress_multi_member_parallel_to_vec(
             let error_ref = &had_error;
 
             scope.spawn(move || {
-                use crate::libdeflate_ext::DecompressorEx;
-                let mut decompressor = DecompressorEx::new();
+                // Allocate a raw libdeflate decompressor (same as BGZF path).
+                // scan_member_boundaries_fast already parsed each gzip header and
+                // stored deflate_start, so we skip re-parsing with gzip_decompress_ex.
+                let decompressor = unsafe { libdeflate_sys::libdeflate_alloc_decompressor() };
+                if decompressor.is_null() {
+                    error_ref.store(true, Ordering::Relaxed);
+                    return;
+                }
 
                 loop {
                     let idx = next_ref.fetch_add(1, Ordering::Relaxed);
@@ -3100,7 +3106,9 @@ pub fn decompress_multi_member_parallel_to_vec(
                     }
 
                     let member = &members_ref[idx];
-                    let member_data = &data[member.start..member.start + member.length];
+                    // deflate_start is absolute offset in data; trailer is 8 bytes (CRC32+ISIZE)
+                    let deflate_end = member.start + member.length - 8;
+                    let deflate_data = &data[member.deflate_start..deflate_end];
 
                     // SAFETY: Each member writes to a disjoint region
                     let output_ptr = unsafe { (*output_ref.0.get()).as_mut_ptr() };
@@ -3110,17 +3118,23 @@ pub fn decompress_multi_member_parallel_to_vec(
                         std::slice::from_raw_parts_mut(output_ptr.add(out_start), out_size)
                     };
 
-                    match decompressor.gzip_decompress_ex(member_data, out_slice) {
-                        Ok(result) => {
-                            if result.output_size != out_size {
-                                error_ref.store(true, Ordering::Relaxed);
-                            }
-                        }
-                        Err(_) => {
-                            error_ref.store(true, Ordering::Relaxed);
-                        }
+                    let mut actual_out = 0usize;
+                    let ret = unsafe {
+                        libdeflate_sys::libdeflate_deflate_decompress(
+                            decompressor,
+                            deflate_data.as_ptr() as *const std::ffi::c_void,
+                            deflate_data.len(),
+                            out_slice.as_mut_ptr() as *mut std::ffi::c_void,
+                            out_size,
+                            &mut actual_out,
+                        )
+                    };
+                    if ret != 0 || actual_out != out_size {
+                        error_ref.store(true, Ordering::Relaxed);
                     }
                 }
+
+                unsafe { libdeflate_sys::libdeflate_free_decompressor(decompressor) };
             });
         }
     });

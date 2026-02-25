@@ -9,6 +9,11 @@
 //! This eliminates the expensive sequential scan pass that made the old two-pass
 //! approach require 8+ threads to beat sequential. With this approach, 4 threads
 //! already provide significant speedup.
+//!
+//! NOTE: This module is not currently wired into the production path — the
+//! speculation pipeline runs at 88-148 MB/s vs 600-2000 MB/s for sequential
+//! ISA-L/libdeflate. All functions are retained for testing and future use.
+#![allow(dead_code)]
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -435,7 +440,12 @@ fn confirm_resolve_write<W: Write>(
                 );
             }
 
-            if bytes.is_empty() {
+            // Only stop if no progress at all (true deadlock).
+            // 0 bytes with end_bit > confirmed_bit is valid: the block boundary
+            // landed exactly on a spec match with no output (e.g. zero-content
+            // stored block or alignment bits). Continue so the next iteration
+            // can pick up the spec hit at end_bit.
+            if end_bit == confirmed_bit {
                 break;
             }
 
