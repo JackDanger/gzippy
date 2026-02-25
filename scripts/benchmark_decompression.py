@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 
-# Benchmark configuration
+# Benchmark configuration (overridable via CLI args)
 MIN_TRIALS = 10
 MAX_TRIALS = 40
 TARGET_CV = 0.03  # 3% coefficient of variation
@@ -154,8 +154,22 @@ def main():
                        help="Type of archive being decompressed")
     parser.add_argument("--output", type=str, required=True,
                        help="Output JSON file")
+    parser.add_argument("--min-trials", type=int, default=None,
+                       help="Override minimum trials (default: 10)")
+    parser.add_argument("--max-trials", type=int, default=None,
+                       help="Override maximum trials (default: 40)")
+    parser.add_argument("--target-cv", type=float, default=None,
+                       help="Override target CV (default: 0.03)")
 
     args = parser.parse_args()
+
+    global MIN_TRIALS, MAX_TRIALS, TARGET_CV
+    if args.min_trials is not None:
+        MIN_TRIALS = args.min_trials
+    if args.max_trials is not None:
+        MAX_TRIALS = args.max_trials
+    if args.target_cv is not None:
+        TARGET_CV = args.target_cv
 
     binaries_dir = Path(args.binaries)
     original_size = os.path.getsize(args.original_file)

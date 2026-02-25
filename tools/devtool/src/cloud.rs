@@ -1,0 +1,1696 @@
+//! Cloud fleet benchmarking: spin up EC2 on-demand instances, run benchmarks, tear down.
+//!
+//! Architecture:
+//!   1. Launch x86_64 + arm64 EC2 instances in parallel
+//!   2. User-data builds gzippy, gzippy-dev, and all competitor tools
+//!   3. Benchmark data staged to /dev/shm (RAM-backed, no EBS bottleneck)
+//!   4. SSH: `gzippy-dev bench --json` — same tool, same code, local or cloud
+//!   5. Two-phase: sweep first, then precision re-runs for close races
+//!   6. Strict scoring: gzippy must be >= every competitor, or it's a loss
+//!
+//! Uses `aws-vault exec gzippy-dev` for credentials.
+//!
+//! Also runs local Mac benchmarks in parallel with the cloud fleet.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use crate::bench::find_repo_root;
+use std::time::{Duration, Instant};
+
+const REGION: &str = "us-east-1";
+const X86_TYPE: &str = "c7i.4xlarge";
+const ARM64_TYPE: &str = "c8g.4xlarge";
+const TAG_KEY: &str = "gzippy-bench";
+const SSH_USER: &str = "ubuntu";
+const SETUP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+// Match CI runner core count for comparable Tmax results
+const BENCH_TMAX_THREADS: usize = 4;
+
+// Phase 1: initial sweep (higher counts since each instance handles 1 dataset)
+const SWEEP_MIN_TRIALS: u32 = 30;
+const SWEEP_MAX_TRIALS: u32 = 100;
+const SWEEP_TARGET_CV: f64 = 0.015;
+
+// Phase 2: precision re-run for close races
+const PRECISION_MIN_TRIALS: u32 = 50;
+const PRECISION_MAX_TRIALS: u32 = 200;
+const PRECISION_TARGET_CV: f64 = 0.005;
+const CLOSE_RACE_THRESHOLD: f64 = 3.0;
+
+// ─── AWS CLI ──────────────────────────────────────────────────────────────────
+
+fn aws(args: &[&str]) -> Result<String, String> {
+    // If AWS credentials are already in the environment, call aws directly
+    let have_env_creds = std::env::var("AWS_ACCESS_KEY_ID").is_ok();
+
+    let output = if have_env_creds {
+        Command::new("aws")
+            .arg("--region")
+            .arg(REGION)
+            .args(args)
+            .output()
+            .map_err(|e| format!("Failed to run aws: {e}"))?
+    } else {
+        Command::new("aws-vault")
+            .args(["exec", "gzippy-dev", "-d", "12h", "--"])
+            .arg("aws")
+            .arg("--region")
+            .arg(REGION)
+            .args(args)
+            .output()
+            .map_err(|e| format!("Failed to run aws-vault: {e}"))?
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("aws {}: {}", args.first().unwrap_or(&""), stderr));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+// ─── SSH ──────────────────────────────────────────────────────────────────────
+
+fn ssh_opts(key: &Path) -> Vec<String> {
+    vec![
+        "-o".into(), "StrictHostKeyChecking=no".into(),
+        "-o".into(), "UserKnownHostsFile=/dev/null".into(),
+        "-o".into(), "ConnectTimeout=10".into(),
+        "-o".into(), "ServerAliveInterval=30".into(),
+        "-o".into(), "ServerAliveCountMax=10".into(),
+        "-o".into(), "LogLevel=ERROR".into(),
+        "-i".into(), key.to_string_lossy().into(),
+    ]
+}
+
+fn ssh_timeout(ip: &str, key: &Path, cmd: &str, timeout: Duration) -> Result<String, String> {
+    let mut child = Command::new("ssh")
+        .args(ssh_opts(key))
+        .arg(format!("{SSH_USER}@{ip}"))
+        .arg(cmd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("SSH to {ip}: {e}"))?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("SSH command timed out after {}s on {ip}: {cmd}",
+                        timeout.as_secs()));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => return Err(format!("SSH wait error on {ip}: {e}")),
+        }
+    }
+
+    let output = child.wait_with_output()
+        .map_err(|e| format!("SSH output error on {ip}: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !output.status.success() && stdout.trim().is_empty() {
+        return Err(format!("SSH command failed on {ip}: {stderr}"));
+    }
+    // Merge stderr into output so diagnostics (GZIPPY_DEBUG, time, etc.) are never lost
+    let mut merged = stdout;
+    if !stderr.trim().is_empty() {
+        for line in stderr.lines() {
+            merged.push_str("[stderr] ");
+            merged.push_str(line);
+            merged.push('\n');
+        }
+    }
+    Ok(merged)
+}
+
+fn ssh_ok(ip: &str, key: &Path) -> bool {
+    Command::new("ssh")
+        .args(ssh_opts(key))
+        .arg(format!("{SSH_USER}@{ip}"))
+        .arg("true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+// ─── Resource lifecycle ───────────────────────────────────────────────────────
+
+struct CleanupState {
+    key_name: Option<String>,
+    key_path: Option<PathBuf>,
+    sg_id: Option<String>,
+    instance_ids: Vec<String>,
+}
+
+impl CleanupState {
+    fn new() -> Self {
+        Self { key_name: None, key_path: None, sg_id: None, instance_ids: Vec::new() }
+    }
+
+    fn run(&self) {
+        if !self.instance_ids.is_empty() {
+            let ids: Vec<&str> = self.instance_ids.iter().map(|s| s.as_str()).collect();
+            println!("  Terminating {} instance(s)...", ids.len());
+            let mut args = vec!["ec2", "terminate-instances", "--instance-ids"];
+            args.extend(ids.iter());
+            let _ = aws(&args);
+        }
+        if let Some(name) = &self.key_name {
+            println!("  Deleting key pair {name}...");
+            let _ = aws(&["ec2", "delete-key-pair", "--key-name", name]);
+        }
+        if let Some(path) = &self.key_path {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(sg) = &self.sg_id {
+            // SG can't be deleted until instances are fully terminated.
+            // Retry with backoff (10s, 20s, 40s) — total ~70s max wait.
+            for attempt in 0..4 {
+                let wait = if self.instance_ids.is_empty() { 0 } else { 10 * (1 << attempt) };
+                if wait > 0 {
+                    println!("  Waiting {wait}s for instance termination before SG cleanup...");
+                    std::thread::sleep(Duration::from_secs(wait));
+                }
+                match aws(&["ec2", "delete-security-group", "--group-id", sg]) {
+                    Ok(_) => { println!("  Security group {sg} deleted."); break; }
+                    Err(e) if attempt < 3 => {
+                        println!("  SG delete attempt {}: {e} (retrying...)", attempt + 1);
+                    }
+                    Err(e) => {
+                        eprintln!("  Warning: could not delete SG {sg}: {e}");
+                        eprintln!("  Run `gzippy-dev cloud cleanup` to clean up later.");
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn create_key_pair(session: &str) -> Result<(String, PathBuf), String> {
+    let name = format!("{TAG_KEY}-{session}");
+    let path = std::env::temp_dir().join(format!("{name}.pem"));
+    let material = aws(&[
+        "ec2", "create-key-pair",
+        "--key-name", &name,
+        "--query", "KeyMaterial",
+        "--output", "text",
+    ])?;
+    std::fs::write(&path, &material).map_err(|e| format!("Write key: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod key: {e}"))?;
+    }
+    Ok((name, path))
+}
+
+fn find_vpc_and_subnets() -> Result<(String, Vec<String>), String> {
+    let vpc_id = aws(&[
+        "ec2", "describe-vpcs",
+        "--filters", "Name=isDefault,Values=true",
+        "--query", "Vpcs[0].VpcId",
+        "--output", "text",
+    ])?;
+    let vpc_id = if vpc_id.is_empty() || vpc_id == "None" {
+        aws(&["ec2", "describe-vpcs", "--query", "Vpcs[0].VpcId", "--output", "text"])?
+    } else {
+        vpc_id
+    };
+    if vpc_id.is_empty() || vpc_id == "None" {
+        return Err("No VPC found".into());
+    }
+
+    // Get ALL public subnets so we can try different AZs on capacity errors
+    let subnet_text = aws(&[
+        "ec2", "describe-subnets",
+        "--filters",
+            &format!("Name=vpc-id,Values={vpc_id}"),
+            "Name=map-public-ip-on-launch,Values=true",
+        "--query", "Subnets[*].SubnetId",
+        "--output", "text",
+    ])?;
+
+    let mut subnets: Vec<String> = subnet_text.split_whitespace()
+        .filter(|s| s.starts_with("subnet-"))
+        .map(|s| s.to_string())
+        .collect();
+
+    if subnets.is_empty() {
+        // Fallback: try any subnet
+        let fallback = aws(&[
+            "ec2", "describe-subnets",
+            "--filters", &format!("Name=vpc-id,Values={vpc_id}"),
+            "--query", "Subnets[*].SubnetId", "--output", "text",
+        ])?;
+        subnets = fallback.split_whitespace()
+            .filter(|s| s.starts_with("subnet-"))
+            .map(|s| s.to_string())
+            .collect();
+    }
+
+    if subnets.is_empty() {
+        return Err("No subnets found".into());
+    }
+
+    Ok((vpc_id, subnets))
+}
+
+fn find_ubuntu_ami(arch: &str) -> Result<String, String> {
+    let arch_filter = match arch {
+        "x86_64" => "amd64",
+        "arm64" => "arm64",
+        _ => return Err(format!("Unknown arch: {arch}")),
+    };
+    let name_pattern = format!("ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-{arch_filter}-server-*");
+    aws(&[
+        "ec2", "describe-images",
+        "--owners", "099720109477",
+        "--filters", &format!("Name=name,Values={name_pattern}"), "Name=state,Values=available",
+        "--query", "sort_by(Images, &CreationDate)[-1].ImageId",
+        "--output", "text",
+    ])
+}
+
+fn create_security_group(session: &str, vpc_id: &str) -> Result<String, String> {
+    let name = format!("{TAG_KEY}-{session}");
+    let sg_id = aws(&[
+        "ec2", "create-security-group",
+        "--group-name", &name,
+        "--description", "Ephemeral SG for gzippy cloud benchmarks",
+        "--vpc-id", vpc_id,
+        "--query", "GroupId", "--output", "text",
+    ])?;
+    let my_ip = get_my_public_ip().unwrap_or_else(|_| "0.0.0.0/0".to_string());
+    let cidr = if my_ip.contains('/') { my_ip } else { format!("{my_ip}/32") };
+    aws(&[
+        "ec2", "authorize-security-group-ingress",
+        "--group-id", &sg_id, "--protocol", "tcp", "--port", "22", "--cidr", &cidr,
+    ])?;
+    Ok(sg_id)
+}
+
+fn get_my_public_ip() -> Result<String, String> {
+    let output = Command::new("curl")
+        .args(["-s", "--max-time", "5", "https://checkip.amazonaws.com"])
+        .output().map_err(|e| format!("curl: {e}"))?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn is_retryable_launch_error(e: &str) -> bool {
+    e.contains("InsufficientInstanceCapacity")
+        || e.contains("Unsupported")
+        || e.contains("InsufficientFreeAddressesInSubnet")
+        || e.contains("InstanceLimitExceeded")
+}
+
+fn terminate_and_wait(batch_ids: &[String], cleanup: &mut CleanupState, wait_for_release: bool) {
+    if batch_ids.is_empty() { return; }
+    let term_ids: Vec<&str> = batch_ids.iter().map(|s| s.as_str()).collect();
+    println!("  Terminating {} instance(s)...", term_ids.len());
+    let mut args = vec!["ec2", "terminate-instances", "--instance-ids"];
+    args.extend(&term_ids);
+    let _ = aws(&args);
+    cleanup.instance_ids.retain(|id| !batch_ids.contains(id));
+
+    if wait_for_release {
+        print!("  Waiting for vCPU release... ");
+        let _ = std::io::stdout().flush();
+        let mut wait_args = vec!["ec2", "wait", "instance-terminated", "--instance-ids"];
+        let id_refs: Vec<&str> = batch_ids.iter().map(|s| s.as_str()).collect();
+        wait_args.extend(&id_refs);
+        match aws(&wait_args) {
+            Ok(_) => println!("OK"),
+            Err(_) => {
+                println!("(wait timed out, sleeping 30s)");
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+fn launch_on_demand(
+    instance_type: &str, ami: &str, key: &str, sg: &str,
+    subnet: &str, userdata_b64: &str, session: &str,
+) -> Result<String, String> {
+    let tag_spec = format!(
+        "ResourceType=instance,Tags=[{{Key=Name,Value={TAG_KEY}-{session}}},{{Key={TAG_KEY},Value={session}}}]"
+    );
+    aws(&[
+        "ec2", "run-instances",
+        "--instance-type", instance_type,
+        "--image-id", ami,
+        "--key-name", key,
+        "--security-group-ids", sg,
+        "--subnet-id", subnet,
+        "--associate-public-ip-address",
+        "--block-device-mappings",
+            "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":50,\"VolumeType\":\"gp3\",\"Iops\":3000,\"Throughput\":250}}]",
+        "--user-data", userdata_b64,
+        "--tag-specifications", &tag_spec,
+        "--query", "Instances[0].InstanceId",
+        "--output", "text",
+    ])
+}
+
+fn wait_running(ids: &[&str]) -> Result<(), String> {
+    let mut args = vec!["ec2", "wait", "instance-running", "--instance-ids"];
+    args.extend(ids);
+    aws(&args)?;
+    Ok(())
+}
+
+fn get_public_ip(id: &str) -> Result<String, String> {
+    aws(&[
+        "ec2", "describe-instances",
+        "--instance-ids", id,
+        "--query", "Reservations[0].Instances[0].PublicIpAddress",
+        "--output", "text",
+    ])
+}
+
+fn wait_for_ssh(ip: &str, key: &Path, label: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(5 * 60);
+    loop {
+        if ssh_ok(ip, key) {
+            println!("  [{label}] SSH ready");
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            return Err(format!("[{label}] SSH timeout after 5 min"));
+        }
+        std::thread::sleep(Duration::from_secs(8));
+        print!(".");
+        let _ = std::io::stdout().flush();
+    }
+}
+
+fn wait_for_setup(ip: &str, key: &Path, label: &str) -> Result<(), String> {
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    let start = Instant::now();
+    let mut last_progress_report = 0u64;
+    println!("  [{label}] Waiting for setup...");
+    loop {
+        let check_timeout = Duration::from_secs(15);
+
+        // Check for READY marker
+        if let Ok(out) = ssh_timeout(ip, key, "cat /tmp/gzippy-ready 2>/dev/null || echo NOT_READY", check_timeout) {
+            if out.trim().contains("READY") && !out.trim().contains("NOT_READY") {
+                println!("  [{label}] Setup complete ({:.0}s)", start.elapsed().as_secs_f64());
+                return Ok(());
+            }
+        }
+
+        // Check for early build failure: cloud-init finished but no READY marker
+        if let Ok(status) = ssh_timeout(ip, key,
+            "cloud-init status --format json 2>/dev/null | grep -o '\"status\"[^,]*' || echo unknown",
+            check_timeout,
+        ) {
+            if status.contains("\"done\"") || status.contains("\"error\"") {
+                // cloud-init finished — check if our script succeeded
+                if let Ok(ready) = ssh_timeout(ip, key, "test -f /tmp/gzippy-ready && echo YES || echo NO", check_timeout) {
+                    if ready.trim() == "NO" {
+                        let log = save_instance_log(ip, key, label);
+                        return Err(format!(
+                            "[{label}] Build failed (cloud-init done but no READY marker). Log saved to {log}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        if Instant::now() > deadline {
+            let log = save_instance_log(ip, key, label);
+            return Err(format!("[{label}] Setup timeout after {}s. Log saved to {log}", SETUP_TIMEOUT.as_secs()));
+        }
+
+        let elapsed = start.elapsed().as_secs();
+        if elapsed >= last_progress_report + 30 {
+            last_progress_report = elapsed;
+            // Show last non-cloud-init line (skip the "Cloud-init finished" noise)
+            let progress = ssh_timeout(
+                ip, key,
+                "grep -v '^Cloud-init\\|^2[0-9].*cc_scripts' /var/log/cloud-init-output.log 2>/dev/null | tail -1 | head -c 120",
+                check_timeout,
+            ).unwrap_or_default();
+            let progress = progress.trim();
+            if !progress.is_empty() {
+                println!("  [{label}] ({elapsed}s) {progress}");
+            }
+        }
+        std::thread::sleep(Duration::from_secs(10));
+    }
+}
+
+fn cloud_log_dir() -> PathBuf {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let ts = Command::new("date").arg("+%Y%m%d-%H%M%S")
+            .output().ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let dir = find_repo_root().unwrap_or_else(|_| PathBuf::from("."))
+            .join("cloud-logs")
+            .join(ts);
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }).clone()
+}
+
+fn save_bench_log(label: &str, content: &str) {
+    let safe_label = label.replace('/', "_");
+    let log_dir = cloud_log_dir();
+    let log_path = log_dir.join(format!("{safe_label}_bench.log"));
+    let _ = std::fs::write(&log_path, content);
+}
+
+fn save_instance_log(ip: &str, key: &Path, label: &str) -> String {
+    let check_timeout = Duration::from_secs(30);
+    let log_content = ssh_timeout(
+        ip, key,
+        "cat /var/log/cloud-init-output.log 2>/dev/null",
+        check_timeout,
+    ).unwrap_or_else(|e| format!("(failed to fetch log: {e})"));
+
+    let safe_label = label.replace('/', "_");
+    let log_dir = cloud_log_dir();
+    let log_path = log_dir.join(format!("{safe_label}_setup.log"));
+    let _ = std::fs::write(&log_path, &log_content);
+    eprintln!("  [{label}] Setup log ({} bytes) saved to {}", log_content.len(), log_path.display());
+    log_path.display().to_string()
+}
+
+// ─── User-data script ─────────────────────────────────────────────────────────
+
+fn user_data_script(commit: &str, repo_url: &str) -> String {
+    format!(r#"#!/bin/bash
+set -euxo pipefail
+exec > /var/log/cloud-init-output.log 2>&1
+
+echo "=== Installing dependencies ==="
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq build-essential cmake git curl pigz nasm python3 \
+    zlib1g-dev pkg-config unzip wget xz-utils autoconf automake libtool
+
+echo "=== Installing Rust ==="
+sudo -u {SSH_USER} bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
+
+echo "=== Cloning gzippy at {commit} ==="
+cd /home/{SSH_USER}
+sudo -u {SSH_USER} git clone {repo_url} gzippy
+cd gzippy
+sudo -u {SSH_USER} git checkout {commit}
+# Init only the submodules we need (skip gzip — its gnulib sub-submodule uses git:// which is blocked)
+for mod in isa-l libdeflate pigz rapidgzip zopfli; do
+    sudo -u {SSH_USER} git submodule update --init --recursive "$mod" || true
+done
+
+echo "=== Building competitor tools ==="
+sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && ./scripts/build-tools.sh --pigz --rapidgzip --igzip --libdeflate --zopfli'
+
+echo "=== Building gzippy + gzippy-dev ==="
+ISAL_FLAG=""
+if [ "$(uname -m)" = "x86_64" ]; then
+    ISAL_FLAG="--features isal-compression"
+fi
+if [ "$(uname -m)" = "x86_64" ]; then
+    # Ensure nasm is on PATH for ISA-L's autotools configure (AC_CHECK_PROG).
+    # sudo -u strips PATH; we pass /usr/bin explicitly so configure finds nasm.
+    # Also clean isal-sys build cache to force re-configure with NASM.
+    NASM_PATH=$(which nasm 2>/dev/null || echo "/usr/bin/nasm")
+    echo "NASM binary: $NASM_PATH ($(nasm -v 2>&1 || echo 'not found'))"
+    sudo -u {SSH_USER} bash -c "source \$HOME/.cargo/env && \
+        cargo clean -p isal-sys 2>/dev/null; \
+        rm -rf target/release/build/isal-sys-* 2>/dev/null; \
+        export PATH=\"/usr/bin:/usr/local/bin:\$PATH\" && \
+        cargo build --release $ISAL_FLAG"
+else
+    sudo -u {SSH_USER} bash -c "source \$HOME/.cargo/env && cargo build --release $ISAL_FLAG"
+fi
+# Verify ISA-L NASM assembly was built (x86 only)
+if [ "$(uname -m)" = "x86_64" ]; then
+    ISAL_CONFIG=$(find /home/{SSH_USER}/gzippy/target/release/build/isal-sys-*/out/isa-l/config.log 2>/dev/null | head -1)
+    if [ -n "$ISAL_CONFIG" ]; then
+        echo "=== ISA-L build config ==="
+        grep -E "HAVE_NASM|USE_NASM|^AS=|^CCAS=|nasm_cmd|result.*nasm" "$ISAL_CONFIG" || echo "NASM vars not found"
+        echo "=== ISA-L Makefile AS ==="
+        ISAL_MAKEFILE=$(dirname "$ISAL_CONFIG")/Makefile
+        grep -E "^AS = |^CCAS = |^am__append" "$ISAL_MAKEFILE" 2>/dev/null | head -5 || echo "Makefile not found"
+    fi
+fi
+sudo -u {SSH_USER} bash -c 'source $HOME/.cargo/env && cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target'
+
+echo "=== Preparing benchmark data ==="
+sudo -u {SSH_USER} bash -c './scripts/prepare_benchmark_data.sh'
+
+echo "=== Compressing for decompression benchmarks ==="
+cd /home/{SSH_USER}/gzippy
+GZIPPY=./target/release/gzippy
+DATA_DIR=benchmark_data
+
+for DATASET in silesia software logs; do
+    case $DATASET in
+        silesia) RAW="$DATA_DIR/silesia.tar" ;;
+        software) RAW="$DATA_DIR/software.archive" ;;
+        logs) RAW="$DATA_DIR/logs.txt" ;;
+    esac
+    [ ! -f "$RAW" ] && echo "SKIP: $RAW" && continue
+    echo "Compressing $DATASET..."
+    sudo -u {SSH_USER} bash -c "gzip -1 -c $RAW > $DATA_DIR/$DATASET-gzip.gz"
+    sudo -u {SSH_USER} bash -c "source \$HOME/.cargo/env && $GZIPPY -1 -c $RAW > $DATA_DIR/$DATASET-bgzf.gz"
+    sudo -u {SSH_USER} bash -c "./pigz/pigz -1 -c $RAW > $DATA_DIR/$DATASET-pigz.gz"
+done
+
+# Copy ALL data to /dev/shm — eliminates EBS I/O bottleneck
+echo "=== Staging data to RAM (/dev/shm) ==="
+for f in $DATA_DIR/silesia.tar $DATA_DIR/software.archive $DATA_DIR/logs.txt \
+         $DATA_DIR/*-gzip.gz $DATA_DIR/*-bgzf.gz $DATA_DIR/*-pigz.gz; do
+    [ -f "$f" ] && cp "$f" /dev/shm/
+done
+chown {SSH_USER}:{SSH_USER} /dev/shm/* 2>/dev/null || true
+ls -lh /dev/shm/
+
+# Flat bin directory with all tools + gzippy-dev
+mkdir -p /home/{SSH_USER}/gzippy/bin
+cd /home/{SSH_USER}/gzippy/bin
+ln -sf ../target/release/gzippy gzippy
+ln -sf ../target/release/gzippy-dev gzippy-dev
+ln -sf ../pigz/pigz pigz
+ln -sf ../pigz/unpigz unpigz
+[ -f ../isa-l/build/igzip ] && ln -sf ../isa-l/build/igzip igzip || true
+[ -f ../rapidgzip/librapidarchive/build/src/tools/rapidgzip ] && \
+    ln -sf ../rapidgzip/librapidarchive/build/src/tools/rapidgzip rapidgzip || true
+ln -sf /usr/bin/gzip gzip
+chown -R {SSH_USER}:{SSH_USER} /home/{SSH_USER}/gzippy/bin
+
+echo "READY" > /tmp/gzippy-ready
+echo "=== Setup complete ==="
+"#)
+}
+
+// ─── Benchmark execution via gzippy-dev on remote host ────────────────────────
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct BenchResult {
+    platform: String,
+    dataset: String,
+    archive: String,
+    threads: String,
+    tool: String,
+    speed_mbps: f64,
+    cv: f64,
+    trials: u32,
+    direction: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remote_bench(
+    ip: &str, key: &Path, label: &str,
+    min_trials: u32, max_trials: u32, target_cv: f64,
+    dataset: Option<&str>, archive: Option<&str>, threads: Option<usize>,
+    direction: Option<&str>,
+) -> Result<Vec<BenchResult>, String> {
+    let repo = format!("/home/{SSH_USER}/gzippy");
+
+    let mut cmd = format!(
+        "cd {repo} && export PATH={repo}/bin:$PATH && \
+         export TMPDIR=/dev/shm && \
+         source $HOME/.cargo/env && \
+         gzippy-dev bench --json \
+         --min-trials {min_trials} --max-trials {max_trials} --target-cv {target_cv}"
+    );
+    if let Some(ds) = dataset { cmd += &format!(" --dataset {ds}"); }
+    if let Some(ar) = archive { cmd += &format!(" --archive {ar}"); }
+    if let Some(th) = threads { cmd += &format!(" --threads {th}"); }
+    if let Some(dir) = direction { cmd += &format!(" --direction {dir}"); }
+
+    let is_compress = direction.map(|d| d == "compress").unwrap_or(false);
+    let bench_timeout = Duration::from_secs(if is_compress { 45 * 60 } else { 20 * 60 });
+    let output = match ssh_timeout(ip, key, &cmd, bench_timeout) {
+        Ok(out) => out,
+        Err(e) => {
+            save_bench_log(label, &format!("SSH error (attempt 1): {e}"));
+            eprintln!("  [{label}] SSH failed, retrying in 10s: {e}");
+            std::thread::sleep(Duration::from_secs(10));
+            ssh_timeout(ip, key, &cmd, bench_timeout).map_err(|e2| {
+                save_bench_log(label, &format!("SSH error (attempt 2): {e2}"));
+                format!("[{label}] benchmark SSH failed twice: {e2}")
+            })?
+        }
+    };
+
+    // Always save the full bench output to a log file for debugging
+    save_bench_log(label, &output);
+
+    let json_line = output.lines()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| {
+            let tail: String = output.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev()
+                .collect::<Vec<_>>().join("\n");
+            format!("[{label}] No JSON in bench output. Full output in cloud-logs/. Last 10 lines:\n{tail}")
+        })?;
+
+    parse_bench_json(json_line, label)
+}
+
+fn parse_bench_json(json_str: &str, platform: &str) -> Result<Vec<BenchResult>, String> {
+    let parsed: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| format!("JSON parse error: {e}"))?;
+
+    let items = parsed.get("results")
+        .and_then(|v| v.as_array())
+        .ok_or("Missing 'results' array in JSON")?;
+
+    let mut results = Vec::new();
+    for item in items {
+        let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("fail");
+        if status != "pass" { continue; }
+
+        results.push(BenchResult {
+            platform: platform.to_string(),
+            dataset: item.get("dataset").and_then(|v| v.as_str()).unwrap_or("?").into(),
+            archive: item.get("archive").and_then(|v| v.as_str()).unwrap_or("?").into(),
+            threads: item.get("threads").and_then(|v| v.as_str()).unwrap_or("?").into(),
+            tool: item.get("tool").and_then(|v| v.as_str()).unwrap_or("?").into(),
+            speed_mbps: item.get("speed_mbps").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            cv: item.get("cv").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            trials: item.get("trials").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            direction: item.get("direction").and_then(|v| v.as_str()).unwrap_or("decompress").into(),
+        });
+    }
+    Ok(results)
+}
+
+fn scenario_key(r: &BenchResult) -> String {
+    format!("{}-{}-{}", r.dataset, r.archive, r.threads)
+}
+
+fn run_diagnostics(
+    ip: &str, key: &Path, label: &str, dataset: Option<&str>, direction: &str,
+) -> Option<serde_json::Value> {
+    println!("  [{label}] Running diagnostics...");
+    let repo = format!("/home/{SSH_USER}/gzippy");
+    let mut diag_args = format!(
+        "cd {repo} && export PATH={repo}/bin:$PATH && source $HOME/.cargo/env && \
+         gzippy-dev diag --direction {direction}"
+    );
+    if let Some(ds) = dataset {
+        diag_args.push_str(&format!(" --dataset {ds}"));
+    }
+
+    match ssh_timeout(ip, key, &diag_args, Duration::from_secs(300)) {
+        Ok(output) => {
+            save_bench_log(&format!("{label}/diag"), &output);
+
+            let json_lines: String = output.lines()
+                .filter(|l| !l.starts_with("[stderr]"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            match serde_json::from_str::<serde_json::Value>(&json_lines) {
+                Ok(v) => {
+                    println!("  [{label}] Diagnostics collected.");
+                    if let Some(arch) = v.get("arch").and_then(|v| v.as_str()) {
+                        print!("    arch={arch}");
+                    }
+                    if let Some(features) = v.get("cpu_features").and_then(|v| v.as_str()) {
+                        let short: String = features.split_whitespace().take(6).collect::<Vec<_>>().join(" ");
+                        print!(" cpu=[{short}...]");
+                    }
+                    if let Some(avx) = v.get("avx_insns_gzippy") {
+                        print!(" avx_gzippy={avx}");
+                    }
+                    if let Some(dispatch) = v.get("dispatch_check").and_then(|v| v.get("verdict")).and_then(|v| v.as_str()) {
+                        print!(" dispatch={dispatch}");
+                    }
+                    println!();
+                    Some(v)
+                }
+                Err(e) => {
+                    eprintln!("  [{label}] Diagnostics JSON parse error: {e}. Full output in cloud-logs/");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("  [{label}] Diagnostics failed (non-fatal): {e}");
+            None
+        }
+    }
+}
+
+fn run_benchmarks_on(
+    ip: &str, key: &Path, label: &str, dataset: Option<&str>,
+    direction: &str,
+) -> Result<(Vec<BenchResult>, Option<serde_json::Value>), String> {
+    let ds_label = dataset.unwrap_or("all");
+    let dir_label = direction;
+
+    // Structured diagnostics (replaces ad-hoc ISA-L diagnostic block)
+    let diagnostics = run_diagnostics(ip, key, label, dataset, direction);
+
+    println!("\n  [{label}] Phase 1: {dir_label} sweep {ds_label} ({SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.0}%, Tmax={BENCH_TMAX_THREADS})",
+        SWEEP_TARGET_CV * 100.0);
+
+    println!("  [{label}] T1...");
+    let t1 = remote_bench(
+        ip, key, label,
+        SWEEP_MIN_TRIALS, SWEEP_MAX_TRIALS, SWEEP_TARGET_CV,
+        dataset, None, Some(1), Some(direction),
+    )?;
+    for r in &t1 {
+        println!("    {}-{} {} {}: {:.1} MB/s (CV {:.1}%)", r.dataset, r.archive, r.threads, r.tool, r.speed_mbps, r.cv * 100.0);
+    }
+
+    println!("  [{label}] Tmax ({BENCH_TMAX_THREADS} threads)...");
+    let tmax = remote_bench(
+        ip, key, label,
+        SWEEP_MIN_TRIALS, SWEEP_MAX_TRIALS, SWEEP_TARGET_CV,
+        dataset, None, Some(BENCH_TMAX_THREADS), Some(direction),
+    )?;
+    for r in &tmax {
+        println!("    {}-{} {} {}: {:.1} MB/s (CV {:.1}%)", r.dataset, r.archive, r.threads, r.tool, r.speed_mbps, r.cv * 100.0);
+    }
+
+    let mut sweep: Vec<BenchResult> = Vec::new();
+    sweep.extend(t1);
+    sweep.extend(tmax);
+
+    // Phase 2: Precision re-runs for close races
+    let close_races = find_close_races(&sweep);
+    if close_races.is_empty() {
+        println!("  [{label}] Phase 2: No close races, all decisive");
+        return Ok((sweep, diagnostics));
+    }
+
+    println!("\n  [{label}] Phase 2: {} close race(s) ({PRECISION_MIN_TRIALS}-{PRECISION_MAX_TRIALS} trials, CV<{:.1}%)",
+        close_races.len(), PRECISION_TARGET_CV * 100.0);
+
+    let mut all = sweep;
+
+    for (ds, arch, thr) in &close_races {
+        let threads: Option<usize> = Some(if thr == "T1" { 1 } else { BENCH_TMAX_THREADS });
+        println!("  [{label}] PRECISION {ds}-{arch} {thr}...");
+
+        match remote_bench(
+            ip, key, label,
+            PRECISION_MIN_TRIALS, PRECISION_MAX_TRIALS, PRECISION_TARGET_CV,
+            Some(ds), Some(arch), threads, Some(direction),
+        ) {
+            Ok(precision) => {
+                for r in &precision {
+                    println!("    {}: {:.1} MB/s (CV {:.2}%, {} trials)", r.tool, r.speed_mbps, r.cv * 100.0, r.trials);
+                }
+                let key_prefix = format!("{ds}-{arch}-{thr}");
+                all.retain(|r| scenario_key(r) != key_prefix);
+                all.extend(precision);
+            }
+            Err(e) => {
+                eprintln!("  [{label}] PRECISION {ds}-{arch} {thr} FAILED (keeping sweep): {e}");
+            }
+        }
+    }
+
+    Ok((all, diagnostics))
+}
+
+fn find_close_races(results: &[BenchResult]) -> Vec<(String, String, String)> {
+    let mut races = Vec::new();
+    let mut scenarios: Vec<(String, String, String)> = results.iter()
+        .map(|r| (r.dataset.clone(), r.archive.clone(), r.threads.clone()))
+        .collect();
+    scenarios.sort();
+    scenarios.dedup();
+
+    for (ds, arch, thr) in scenarios {
+        let scenario: Vec<&BenchResult> = results.iter()
+            .filter(|r| r.dataset == ds && r.archive == arch && r.threads == thr)
+            .collect();
+
+        let gzippy = scenario.iter().find(|r| r.tool == "gzippy");
+        let best_competitor = scenario.iter()
+            .filter(|r| r.tool != "gzippy")
+            .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap());
+
+        if let (Some(g), Some(b)) = (gzippy, best_competitor) {
+            let gap_pct = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
+            if gap_pct.abs() < CLOSE_RACE_THRESHOLD {
+                races.push((ds, arch, thr));
+            }
+        }
+    }
+    races
+}
+
+// ─── Results ──────────────────────────────────────────────────────────────────
+
+fn print_results(results: &[BenchResult]) {
+    let has_decomp = results.iter().any(|r| r.direction == "decompress");
+    let has_comp = results.iter().any(|r| r.direction == "compress");
+
+    println!("\n╔══════════════════════════════════════════════════════════════════════════════════════╗");
+    println!("║  CLOUD FLEET RESULTS — STRICT SCORING (gzippy must win or it's a loss)             ║");
+    println!("╚══════════════════════════════════════════════════════════════════════════════════════╝\n");
+
+    let mut total_wins = 0u32;
+    let mut total_losses = 0u32;
+
+    if has_decomp {
+        println!("  ══ DECOMPRESSION ══");
+        let mut platforms: Vec<&str> = results.iter()
+            .filter(|r| r.direction == "decompress")
+            .map(|r| r.platform.as_str()).collect();
+        platforms.sort();
+        platforms.dedup();
+
+        for platform in &platforms {
+            println!("\n  ── {platform} ──");
+            println!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>6} Verdict",
+                "Scenario", "gzippy", "unpigz", "igzip", "rapidgzip", "gzip", "CV%");
+            println!("  {}", "─".repeat(100));
+
+            let plat_results: Vec<&BenchResult> = results.iter()
+                .filter(|r| r.direction == "decompress" && r.platform == *platform)
+                .collect();
+
+            let mut scenarios: Vec<(String, String, String)> = plat_results.iter()
+                .map(|r| (r.dataset.clone(), r.archive.clone(), r.threads.clone()))
+                .collect();
+            scenarios.sort();
+            scenarios.dedup();
+
+            for (dataset, archive, threads) in &scenarios {
+                let scenario: Vec<&BenchResult> = plat_results.iter()
+                    .filter(|r| r.dataset == *dataset && r.archive == *archive && r.threads == *threads)
+                    .copied()
+                    .collect();
+
+                let get = |tool: &str| -> Option<&BenchResult> {
+                    scenario.iter().find(|r| r.tool == tool).copied()
+                };
+                let fmt_speed = |tool: &str| -> String {
+                    get(tool).map(|r| format!("{:.1}", r.speed_mbps)).unwrap_or_else(|| "—".to_string())
+                };
+
+                let gzippy = get("gzippy");
+                let gzippy_cv = gzippy.map(|r| r.cv).unwrap_or(0.0);
+
+                let competitors = ["unpigz", "pigz", "igzip", "rapidgzip", "gzip"];
+                let best = competitors.iter()
+                    .filter_map(|t| get(t))
+                    .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap());
+
+                let (verdict, is_win) = if let (Some(g), Some(b)) = (gzippy, best) {
+                    let gap = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
+                    if gap >= 0.0 {
+                        (format!("WIN +{:.1}% vs {}", gap, b.tool), true)
+                    } else {
+                        (format!("LOSS {:.1}% vs {}", gap, b.tool), false)
+                    }
+                } else {
+                    ("—".to_string(), false)
+                };
+
+                if gzippy.is_some() {
+                    if is_win { total_wins += 1; } else { total_losses += 1; }
+                }
+
+                let scenario_name = format!("{dataset}-{archive} {threads}");
+                let unpigz_speed = get("unpigz").or(get("pigz"));
+                println!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>5.1} {}",
+                    scenario_name,
+                    fmt_speed("gzippy"),
+                    unpigz_speed.map(|r| format!("{:.1}", r.speed_mbps)).unwrap_or_else(|| "—".to_string()),
+                    fmt_speed("igzip"),
+                    fmt_speed("rapidgzip"),
+                    fmt_speed("gzip"),
+                    gzippy_cv * 100.0,
+                    verdict,
+                );
+            }
+        }
+    }
+
+    if has_comp {
+        println!("\n  ══ COMPRESSION ══");
+        let mut platforms: Vec<&str> = results.iter()
+            .filter(|r| r.direction == "compress")
+            .map(|r| r.platform.as_str()).collect();
+        platforms.sort();
+        platforms.dedup();
+
+        for platform in &platforms {
+            println!("\n  ── {platform} ──");
+            println!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>6} Verdict",
+                "Scenario", "gzippy", "pigz", "igzip", "gzip", "CV%");
+            println!("  {}", "─".repeat(85));
+
+            let plat_results: Vec<&BenchResult> = results.iter()
+                .filter(|r| r.direction == "compress" && r.platform == *platform)
+                .collect();
+
+            let mut scenarios: Vec<(String, String, String)> = plat_results.iter()
+                .map(|r| (r.dataset.clone(), r.archive.clone(), r.threads.clone()))
+                .collect();
+            scenarios.sort();
+            scenarios.dedup();
+
+            for (dataset, level, threads) in &scenarios {
+                let scenario: Vec<&BenchResult> = plat_results.iter()
+                    .filter(|r| r.dataset == *dataset && r.archive == *level && r.threads == *threads)
+                    .copied()
+                    .collect();
+
+                let get = |tool: &str| -> Option<&BenchResult> {
+                    scenario.iter().find(|r| r.tool == tool).copied()
+                };
+                let fmt_speed = |tool: &str| -> String {
+                    get(tool).map(|r| format!("{:.1}", r.speed_mbps)).unwrap_or_else(|| "—".to_string())
+                };
+
+                let gzippy = get("gzippy");
+                let gzippy_cv = gzippy.map(|r| r.cv).unwrap_or(0.0);
+
+                let competitors = ["pigz", "igzip", "gzip"];
+                let best = competitors.iter()
+                    .filter_map(|t| get(t))
+                    .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap());
+
+                let (verdict, is_win) = if let (Some(g), Some(b)) = (gzippy, best) {
+                    let gap = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
+                    if gap >= 0.0 {
+                        (format!("WIN +{:.1}% vs {}", gap, b.tool), true)
+                    } else {
+                        (format!("LOSS {:.1}% vs {}", gap, b.tool), false)
+                    }
+                } else {
+                    ("—".to_string(), false)
+                };
+
+                if gzippy.is_some() {
+                    if is_win { total_wins += 1; } else { total_losses += 1; }
+                }
+
+                let scenario_name = format!("{dataset} {level} {threads}");
+                println!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>5.1} {}",
+                    scenario_name,
+                    fmt_speed("gzippy"),
+                    fmt_speed("pigz"),
+                    fmt_speed("igzip"),
+                    fmt_speed("gzip"),
+                    gzippy_cv * 100.0,
+                    verdict,
+                );
+            }
+        }
+    }
+
+    // Summary
+    let total = total_wins + total_losses;
+    println!("\n  ══════════════════════════════════════════════════════");
+    println!("  WINS: {total_wins}/{total}    LOSSES: {total_losses}/{total}");
+    if total_losses > 0 {
+        println!("\n  ── LOSSES ──");
+        for r_dir in ["decompress", "compress"] {
+            let dir_results: Vec<&BenchResult> = results.iter()
+                .filter(|r| r.direction == r_dir)
+                .collect();
+            let mut scenarios: Vec<(String, String, String, String)> = dir_results.iter()
+                .map(|r| (r.platform.clone(), r.dataset.clone(), r.archive.clone(), r.threads.clone()))
+                .collect();
+            scenarios.sort();
+            scenarios.dedup();
+
+            for (plat, ds, arch, thr) in &scenarios {
+                let scenario: Vec<&&BenchResult> = dir_results.iter()
+                    .filter(|r| r.platform == *plat && r.dataset == *ds && r.archive == *arch && r.threads == *thr)
+                    .collect();
+                let gzippy = scenario.iter().find(|r| r.tool == "gzippy").copied();
+                let best = scenario.iter()
+                    .filter(|r| r.tool != "gzippy")
+                    .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap())
+                    .copied();
+                if let (Some(g), Some(b)) = (gzippy, best) {
+                    let gap = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
+                    if gap < 0.0 {
+                        println!("    [{r_dir}] [{plat}] {ds}-{arch} {thr}: gzippy {:.1} vs {} {:.1} ({:+.1}%)",
+                            g.speed_mbps, b.tool, b.speed_mbps, gap);
+                    }
+                }
+            }
+        }
+    } else {
+        println!("  CLEAN SWEEP — gzippy wins every scenario!");
+    }
+    println!();
+}
+
+fn dump_results_json(results: &[BenchResult], wall_time_secs: f64, diagnostics: &serde_json::Map<String, serde_json::Value>) {
+    let items: Vec<serde_json::Value> = results.iter().map(|r| {
+        serde_json::json!({
+            "platform": r.platform,
+            "dataset": r.dataset,
+            "archive": r.archive,
+            "threads": r.threads,
+            "tool": r.tool,
+            "speed_mbps": r.speed_mbps,
+            "cv": r.cv,
+            "trials": r.trials,
+        })
+    }).collect();
+
+    // Build scorecard: per-scenario win/loss with gap
+    let mut scenarios: Vec<(String, String, String, String)> = results.iter()
+        .map(|r| (r.platform.clone(), r.dataset.clone(), r.archive.clone(), r.threads.clone()))
+        .collect();
+    scenarios.sort();
+    scenarios.dedup();
+
+    let mut scorecard: Vec<serde_json::Value> = Vec::new();
+    for (plat, ds, arch, thr) in &scenarios {
+        let scenario: Vec<&BenchResult> = results.iter()
+            .filter(|r| r.platform == *plat && r.dataset == *ds && r.archive == *arch && r.threads == *thr)
+            .collect();
+        let gzippy = scenario.iter().find(|r| r.tool == "gzippy");
+        let best = scenario.iter()
+            .filter(|r| r.tool != "gzippy")
+            .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap());
+        if let (Some(g), Some(b)) = (gzippy, best) {
+            let gap = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
+            scorecard.push(serde_json::json!({
+                "platform": plat,
+                "scenario": format!("{ds}-{arch} {thr}"),
+                "gzippy_mbps": g.speed_mbps,
+                "best_competitor": b.tool,
+                "competitor_mbps": b.speed_mbps,
+                "gap_pct": (gap * 10.0).round() / 10.0,
+                "verdict": if gap >= 0.0 { "WIN" } else { "LOSS" },
+            }));
+        }
+    }
+
+    let wins = scorecard.iter().filter(|s| s["verdict"] == "WIN").count();
+    let losses = scorecard.iter().filter(|s| s["verdict"] == "LOSS").count();
+
+    let output = serde_json::json!({
+        "timestamp": chrono_now(),
+        "wall_time_secs": wall_time_secs,
+        "total_results": items.len(),
+        "wins": wins,
+        "losses": losses,
+        "total_scenarios": wins + losses,
+        "results": items,
+        "scorecard": scorecard,
+        "diagnostics": serde_json::Value::Object(diagnostics.clone()),
+    });
+
+    let json_path = find_repo_root()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("cloud-results.json");
+    if let Ok(json_str) = serde_json::to_string_pretty(&output) {
+        if std::fs::write(&json_path, &json_str).is_ok() {
+            println!(
+                "  Results written to {} ({} scenarios, {wins}W/{losses}L)",
+                json_path.display(),
+                wins + losses,
+            );
+        }
+    }
+}
+
+fn chrono_now() -> String {
+    let output = Command::new("date").arg("+%Y-%m-%dT%H:%M:%S%z")
+        .output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    output
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+pub fn bench() -> Result<(), String> {
+    let n_instances = DATASETS.len() * 2 * 2; // datasets × archs × directions
+    println!("╔══════════════════════════════════════════════════════════════════════════╗");
+    println!("║  CLOUD BENCHMARK FLEET — {} INSTANCES (decompress + compress)           ║", n_instances);
+    println!("╚══════════════════════════════════════════════════════════════════════════╝");
+
+    if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
+        let _ = Command::new("aws-vault").arg("--version")
+            .output().map_err(|_| "aws-vault not found and no AWS_ACCESS_KEY_ID in env")?;
+    }
+
+    let commit = cmd_output("git", &["rev-parse", "HEAD"])?;
+    let commit_short = &commit[..8.min(commit.len())];
+    let branch = cmd_output("git", &["branch", "--show-current"]).unwrap_or_else(|_| "detached".into());
+    let raw_repo_url = cmd_output("git", &["remote", "get-url", "origin"])?;
+    let repo_url = if raw_repo_url.starts_with("git@github.com:") {
+        raw_repo_url.replace("git@github.com:", "https://github.com/")
+    } else {
+        raw_repo_url.clone()
+    };
+
+    let remote_check = cmd_output("git", &["branch", "-r", "--contains", "HEAD"]);
+    if remote_check.map(|s| s.trim().is_empty()).unwrap_or(true) {
+        return Err(format!(
+            "HEAD ({commit_short}) is not pushed. Run `git push` first."
+        ));
+    }
+
+    println!("  Branch:    {branch}");
+    println!("  Commit:    {commit_short}");
+    println!("  Fleet:     {n_instances} instances ({} x86_64 {X86_TYPE} + {} arm64 {ARM64_TYPE})", n_instances / 2, n_instances / 2);
+    println!("  Layout:    2 instances per wave (32 vCPU limit), {} waves, skip-on-failure", (n_instances + 1) / 2);
+    println!("  Benchmark: gzippy-dev bench --json (same code locally and in cloud)");
+    println!("  Threads:   T1 + Tmax={BENCH_TMAX_THREADS} (matches CI runner core count)");
+    println!("  Sweep:     {SWEEP_MIN_TRIALS}-{SWEEP_MAX_TRIALS} trials, CV<{:.1}%", SWEEP_TARGET_CV * 100.0);
+    println!("  Precision: {PRECISION_MIN_TRIALS}-{PRECISION_MAX_TRIALS} trials, CV<{:.1}% (close races <{CLOSE_RACE_THRESHOLD}%)", PRECISION_TARGET_CV * 100.0);
+    println!("  I/O:       /dev/shm (RAM-backed, no EBS bottleneck)");
+    println!("  Scoring:   STRICT — gzippy must be >= every competitor");
+    println!();
+
+    let session = generate_session_id();
+    let mut cleanup = CleanupState::new();
+    let result = run_fleet(&commit, &repo_url, &session, &mut cleanup);
+
+    println!("\n  Cleaning up...");
+    cleanup.run();
+    println!("  Done.");
+    result
+}
+
+const DATASETS: &[&str] = &["silesia", "software", "logs"];
+
+fn run_fleet(
+    commit: &str, repo_url: &str, session: &str, cleanup: &mut CleanupState,
+) -> Result<(), String> {
+    let total_start = Instant::now();
+    let n_instances = DATASETS.len() * 2 * 2; // datasets × archs × directions
+
+    print!("  VPC/subnets... ");
+    let _ = std::io::stdout().flush();
+    let (vpc_id, subnets) = find_vpc_and_subnets()?;
+    println!("{vpc_id} ({} subnets across AZs)", subnets.len());
+
+    print!("  SSH key... ");
+    let _ = std::io::stdout().flush();
+    let (key_name, key_path) = create_key_pair(session)?;
+    cleanup.key_name = Some(key_name.clone());
+    cleanup.key_path = Some(key_path.clone());
+    println!("OK");
+
+    print!("  Security group... ");
+    let _ = std::io::stdout().flush();
+    let sg_id = create_security_group(session, &vpc_id)?;
+    cleanup.sg_id = Some(sg_id.clone());
+    println!("{sg_id}");
+
+    print!("  AMIs... ");
+    let _ = std::io::stdout().flush();
+    let x86_ami = find_ubuntu_ami("x86_64")?;
+    let arm64_ami = find_ubuntu_ami("arm64")?;
+    println!("x86={x86_ami} arm64={arm64_ami}");
+
+    let userdata = user_data_script(commit, repo_url);
+    let userdata_b64 = base64_encode(&userdata);
+
+    struct WorkItem {
+        arch: &'static str,
+        dataset: &'static str,
+        instance_type: &'static str,
+        ami: String,
+        direction: &'static str,
+    }
+
+    let directions = ["decompress", "compress"];
+    let mut work_items: Vec<WorkItem> = Vec::new();
+    for &dataset in DATASETS {
+        for (arch, itype, ami) in [
+            ("x86_64", X86_TYPE, &x86_ami),
+            ("arm64", ARM64_TYPE, &arm64_ami),
+        ] {
+            for &direction in &directions {
+                work_items.push(WorkItem { arch, dataset, instance_type: itype, ami: ami.clone(), direction });
+            }
+        }
+    }
+
+    const BATCH_SIZE: usize = 2; // 2 × 16 vCPUs = 32 = limit
+    let n_batches = work_items.len().div_ceil(BATCH_SIZE);
+
+    let mut all: Vec<BenchResult> = Vec::new();
+    let mut all_diags = serde_json::Map::new();
+    let mut total_done = 0usize;
+    let mut total_failed = 0usize;
+    let mut skipped_labels: Vec<String> = Vec::new();
+
+    for (batch_idx, batch) in work_items.chunks(BATCH_SIZE).enumerate() {
+        println!(
+            "\n  ─── Wave {}/{} ({} instances) ───",
+            batch_idx + 1, n_batches, batch.len()
+        );
+
+        struct Instance {
+            id: String,
+            ip: String,
+            arch: &'static str,
+            dataset: &'static str,
+            instance_type: &'static str,
+            direction: &'static str,
+        }
+        let mut instances: Vec<Instance> = Vec::new();
+
+        // ── Launch: try every subnet, skip instance on total failure ──
+        for item in batch {
+            let label = format!("{}/{}/{}", item.arch, item.dataset, item.direction);
+            print!("  Launching {label} ({})... ", item.instance_type);
+            let _ = std::io::stdout().flush();
+
+            let mut launched = false;
+            for subnet in &subnets {
+                match launch_on_demand(
+                    item.instance_type, &item.ami, &key_name, &sg_id, subnet,
+                    &userdata_b64, session,
+                ) {
+                    Ok(id) => {
+                        cleanup.instance_ids.push(id.clone());
+                        println!("{id}");
+                        instances.push(Instance {
+                            id, ip: String::new(), arch: item.arch, dataset: item.dataset,
+                            instance_type: item.instance_type, direction: item.direction,
+                        });
+                        launched = true;
+                        break;
+                    }
+                    Err(e) if is_retryable_launch_error(&e) => {
+                        print!("(unavailable, next AZ) ");
+                        let _ = std::io::stdout().flush();
+                    }
+                    Err(e) => {
+                        eprintln!("FAILED: {e}");
+                        break;
+                    }
+                }
+            }
+            if !launched {
+                eprintln!("  SKIP {label}: no AZ had capacity for {}", item.instance_type);
+                skipped_labels.push(label);
+                total_failed += 1;
+            }
+        }
+
+        if instances.is_empty() {
+            println!("  No instances launched in this wave, skipping");
+            continue;
+        }
+
+        // ── Wait for running ──
+        let batch_ids: Vec<String> = instances.iter().map(|i| i.id.clone()).collect();
+        {
+            let id_refs: Vec<&str> = batch_ids.iter().map(|s| s.as_str()).collect();
+            print!("  Waiting for {} instances... ", instances.len());
+            let _ = std::io::stdout().flush();
+            if let Err(e) = wait_running(&id_refs) {
+                eprintln!("FAILED: {e}");
+                terminate_and_wait(&batch_ids, cleanup, batch_idx + 1 < n_batches);
+                continue;
+            }
+            println!("OK");
+        }
+
+        // ── Get IPs (skip instances that fail) ──
+        let mut ip_failed = Vec::new();
+        for (idx, inst) in instances.iter_mut().enumerate() {
+            match get_public_ip(&inst.id) {
+                Ok(ip) => {
+                    inst.ip = ip;
+                    println!("  {}/{}/{}: {} ({})", inst.arch, inst.dataset, inst.direction, inst.ip, inst.instance_type);
+                }
+                Err(e) => {
+                    eprintln!("  {}/{}/{}: no IP: {e}", inst.arch, inst.dataset, inst.direction);
+                    ip_failed.push(idx);
+                }
+            }
+        }
+        for idx in ip_failed.into_iter().rev() {
+            instances.remove(idx);
+        }
+        if instances.is_empty() {
+            terminate_and_wait(&batch_ids, cleanup, batch_idx + 1 < n_batches);
+            continue;
+        }
+
+        // ── Setup (parallel, skip failures) ──
+        {
+            let handles: Vec<_> = instances.iter().enumerate().map(|(idx, inst)| {
+                let ip = inst.ip.clone();
+                let key = key_path.clone();
+                let label = format!("{}/{}/{}", inst.arch, inst.dataset, inst.direction);
+                std::thread::spawn(move || -> (usize, Result<(), String>) {
+                    let r = wait_for_ssh(&ip, &key, &label)
+                        .and_then(|_| wait_for_setup(&ip, &key, &label));
+                    (idx, r)
+                })
+            }).collect();
+            let mut failed_indices = Vec::new();
+            for h in handles {
+                match h.join() {
+                    Ok((_idx, Ok(()))) => {}
+                    Ok((idx, Err(e))) => {
+                        eprintln!("  WARNING: setup failed: {e}");
+                        failed_indices.push(idx);
+                    }
+                    Err(_) => eprintln!("  WARNING: setup thread panicked"),
+                }
+            }
+            failed_indices.sort_unstable();
+            for idx in failed_indices.into_iter().rev() {
+                let inst = &instances[idx];
+                let label = format!("{}/{}/{}", inst.arch, inst.dataset, inst.direction);
+                eprintln!("  SKIP {label}: setup failed");
+                skipped_labels.push(label);
+                total_failed += 1;
+                instances.remove(idx);
+            }
+        }
+
+        if instances.is_empty() {
+            terminate_and_wait(&batch_ids, cleanup, batch_idx + 1 < n_batches);
+            continue;
+        }
+
+        // ── Benchmarks (parallel, direction-aware timeout) ──
+        let bench_handles: Vec<_> = instances.iter().map(|inst| {
+            let ip = inst.ip.clone();
+            let key = key_path.clone();
+            let label = format!("{}/{}/{}", inst.arch, inst.dataset, inst.direction);
+            let dataset = inst.dataset.to_string();
+            let direction = inst.direction.to_string();
+            std::thread::spawn(move || -> (String, Vec<BenchResult>, Option<(String, serde_json::Value)>) {
+                match run_benchmarks_on(&ip, &key, &label, Some(&dataset), &direction) {
+                    Ok((results, diag)) => {
+                        println!("  [{label}] DONE ({} results)", results.len());
+                        let diag_entry = diag.map(|d| (label.clone(), d));
+                        (label, results, diag_entry)
+                    }
+                    Err(e) => {
+                        eprintln!("  [{label}] FAILED: {e}");
+                        (label, Vec::new(), None)
+                    }
+                }
+            })
+        }).collect();
+
+        for h in bench_handles {
+            match h.join() {
+                Ok((label, results, diag)) => {
+                    if results.is_empty() {
+                        total_failed += 1;
+                        skipped_labels.push(label);
+                    } else {
+                        total_done += 1;
+                    }
+                    all.extend(results);
+                    if let Some((l, d)) = diag {
+                        all_diags.insert(l, d);
+                    }
+                }
+                Err(_) => {
+                    eprintln!("  Warning: benchmark thread panicked");
+                    total_failed += 1;
+                }
+            }
+        }
+
+        // ── Terminate + wait for vCPU release ──
+        terminate_and_wait(&batch_ids, cleanup, batch_idx + 1 < n_batches);
+
+        // ── Save partial results after each wave ──
+        if !all.is_empty() {
+            let elapsed = total_start.elapsed();
+            dump_results_json(&all, elapsed.as_secs_f64(), &all_diags);
+        }
+
+        println!(
+            "  Progress: {total_done}/{n_instances} done, {total_failed} failed, {} results so far",
+            all.len()
+        );
+    }
+
+    // ── Final results ──
+    let elapsed = total_start.elapsed();
+    println!("\n  Total wall time: {:.0}s ({:.1} min)", elapsed.as_secs_f64(), elapsed.as_secs_f64() / 60.0);
+
+    if !skipped_labels.is_empty() {
+        println!("\n  Skipped ({}):", skipped_labels.len());
+        for l in &skipped_labels {
+            println!("    - {l}");
+        }
+    }
+
+    if all.is_empty() {
+        return Err("All instances failed — no results collected".into());
+    }
+    println!("\n  Collected {} results from {total_done} instances ({total_failed} failed)", all.len());
+
+    print_results(&all);
+    dump_results_json(&all, elapsed.as_secs_f64(), &all_diags);
+    Ok(())
+}
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
+fn cmd_output(program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program).args(args)
+        .output().map_err(|e| format!("{program}: {e}"))?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn generate_session_id() -> String {
+    use std::time::SystemTime;
+    let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis();
+    format!("{:x}", t & 0xFFFFFFFF)
+}
+
+fn base64_encode(input: &str) -> String {
+    let mut child = Command::new("base64")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("base64 command not found");
+    {
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().expect("base64 failed");
+    String::from_utf8_lossy(&output.stdout).replace('\n', "")
+}
+
+/// Launch a single EC2 instance, wait for setup, run a command with live output, tear down.
+pub fn run_command(arch: &str, user_cmd: &str) -> Result<(), String> {
+    let arch = match arch {
+        "x86" | "x86_64" | "amd64" => "x86_64",
+        "arm" | "arm64" | "aarch64" | "graviton" => "arm64",
+        _ => return Err(format!("Unknown arch '{arch}'. Use x86 or arm64.")),
+    };
+    let instance_type = if arch == "x86_64" { X86_TYPE } else { ARM64_TYPE };
+
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║  CLOUD RUN — single {arch} instance ({instance_type})");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+
+    if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
+        let _ = Command::new("aws-vault").arg("--version")
+            .output().map_err(|_| "aws-vault not found and no AWS_ACCESS_KEY_ID in env")?;
+    }
+
+    let commit = cmd_output("git", &["rev-parse", "HEAD"])?;
+    let commit_short = &commit[..8.min(commit.len())];
+    let branch = cmd_output("git", &["branch", "--show-current"]).unwrap_or_else(|_| "detached".into());
+    let raw_repo_url = cmd_output("git", &["remote", "get-url", "origin"])?;
+    let repo_url = if raw_repo_url.starts_with("git@github.com:") {
+        raw_repo_url.replace("git@github.com:", "https://github.com/")
+    } else {
+        raw_repo_url.clone()
+    };
+
+    let remote_check = cmd_output("git", &["branch", "-r", "--contains", "HEAD"]);
+    if remote_check.map(|s| s.trim().is_empty()).unwrap_or(true) {
+        return Err(format!(
+            "HEAD ({commit_short}) is not pushed. Run `git push` first."
+        ));
+    }
+
+    println!("  Branch: {branch}  Commit: {commit_short}");
+    println!("  Arch: {arch}  Instance: {instance_type}");
+    println!("  Command: {user_cmd}");
+    println!();
+
+    let session = generate_session_id();
+    let mut cleanup = CleanupState::new();
+    let result = run_single_instance(arch, instance_type, &commit, &repo_url, user_cmd, &session, &mut cleanup);
+
+    println!("\n  Cleaning up...");
+    cleanup.run();
+    println!("  Done.");
+    result
+}
+
+fn run_single_instance(
+    arch: &str, instance_type: &str, commit: &str, repo_url: &str,
+    user_cmd: &str, session: &str, cleanup: &mut CleanupState,
+) -> Result<(), String> {
+    print!("  VPC/subnets... ");
+    let _ = std::io::stdout().flush();
+    let (vpc_id, subnets) = find_vpc_and_subnets()?;
+    println!("{vpc_id} ({} subnets)", subnets.len());
+
+    print!("  SSH key... ");
+    let _ = std::io::stdout().flush();
+    let (key_name, key_path) = create_key_pair(session)?;
+    cleanup.key_name = Some(key_name.clone());
+    cleanup.key_path = Some(key_path.clone());
+    println!("OK");
+
+    print!("  Security group... ");
+    let _ = std::io::stdout().flush();
+    let sg_id = create_security_group(session, &vpc_id)?;
+    cleanup.sg_id = Some(sg_id.clone());
+    println!("{sg_id}");
+
+    print!("  AMI ({arch})... ");
+    let _ = std::io::stdout().flush();
+    let ami = find_ubuntu_ami(arch)?;
+    println!("{ami}");
+
+    let userdata = user_data_script(commit, repo_url);
+    let userdata_b64 = base64_encode(&userdata);
+
+    print!("  Launching {instance_type}... ");
+    let _ = std::io::stdout().flush();
+    let mut instance_id = Err("no subnets available".to_string());
+    for subnet in &subnets {
+        match launch_on_demand(instance_type, &ami, &key_name, &sg_id, subnet, &userdata_b64, session) {
+            Ok(id) => { instance_id = Ok(id); break; }
+            Err(e) if is_retryable_launch_error(&e) => {
+                print!("(retrying different AZ) ");
+                let _ = std::io::stdout().flush();
+            }
+            Err(e) => { instance_id = Err(e); break; }
+        }
+    }
+    let instance_id = instance_id?;
+    cleanup.instance_ids.push(instance_id.clone());
+    println!("{instance_id}");
+
+    let label = format!("{arch}/run");
+    let ip = get_public_ip(&instance_id)?;
+    println!("  IP: {ip}");
+
+    wait_for_ssh(&ip, &key_path, &label)?;
+    wait_for_setup(&ip, &key_path, &label)?;
+
+    println!();
+    println!("  ═══ RUNNING COMMAND ═══");
+    println!();
+
+    let full_cmd = format!(
+        "cd /home/{SSH_USER}/gzippy && \
+         export PATH=/home/{SSH_USER}/gzippy/bin:$PATH && \
+         export TMPDIR=/dev/shm && \
+         source $HOME/.cargo/env && \
+         {user_cmd}"
+    );
+
+    // Stream output live to terminal (no buffering)
+    let status = Command::new("ssh")
+        .args(ssh_opts(&key_path))
+        .arg(format!("{SSH_USER}@{ip}"))
+        .arg(&full_cmd)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("SSH to {ip}: {e}"))?;
+
+    println!();
+    if status.success() {
+        println!("  Command completed successfully.");
+    } else {
+        println!("  Command exited with status: {}", status.code().unwrap_or(-1));
+    }
+
+    Ok(())
+}
+
+pub fn cleanup_all() -> Result<(), String> {
+    println!("  Searching for leaked gzippy-bench resources...");
+    let result = aws(&[
+        "ec2", "describe-instances",
+        "--filters",
+            &format!("Name=tag-key,Values={TAG_KEY}"),
+            "Name=instance-state-name,Values=pending,running,stopping,stopped",
+        "--query", "Reservations[].Instances[].InstanceId",
+        "--output", "text",
+    ])?;
+    let ids: Vec<&str> = result.split_whitespace().filter(|s| !s.is_empty()).collect();
+    let had_instances = !ids.is_empty();
+    if ids.is_empty() {
+        println!("  No leaked instances.");
+    } else {
+        println!("  Terminating {} instance(s): {:?}", ids.len(), ids);
+        let mut args = vec!["ec2", "terminate-instances", "--instance-ids"];
+        args.extend(ids);
+        aws(&args)?;
+    }
+
+    // Delete key pairs first (no dependency on instances)
+    let result = aws(&[
+        "ec2", "describe-key-pairs",
+        "--filters", &format!("Name=key-name,Values={TAG_KEY}-*"),
+        "--query", "KeyPairs[].KeyName", "--output", "text",
+    ])?;
+    for key in result.split_whitespace().filter(|s| !s.is_empty()) {
+        println!("  Deleting key pair {key}...");
+        let _ = aws(&["ec2", "delete-key-pair", "--key-name", key]);
+    }
+
+    // SGs require instances to be fully terminated — retry with backoff
+    let result = aws(&[
+        "ec2", "describe-security-groups",
+        "--filters", &format!("Name=group-name,Values={TAG_KEY}-*"),
+        "--query", "SecurityGroups[].GroupId", "--output", "text",
+    ])?;
+    let sgs: Vec<&str> = result.split_whitespace().filter(|s| !s.is_empty()).collect();
+    if !sgs.is_empty() {
+        for attempt in 0..4 {
+            let wait = if had_instances { 10 * (1 << attempt) } else { 0 };
+            if wait > 0 {
+                println!("  Waiting {wait}s for instances to terminate before SG cleanup...");
+                std::thread::sleep(Duration::from_secs(wait));
+            }
+            let mut all_deleted = true;
+            for sg in &sgs {
+                match aws(&["ec2", "delete-security-group", "--group-id", sg]) {
+                    Ok(_) => println!("  Security group {sg} deleted."),
+                    Err(_) => { all_deleted = false; }
+                }
+            }
+            if all_deleted { break; }
+            if attempt == 3 {
+                eprintln!("  Warning: some SGs could not be deleted. They will be cleaned up when instances fully terminate.");
+            }
+        }
+    }
+    println!("  Cleanup complete.");
+    Ok(())
+}

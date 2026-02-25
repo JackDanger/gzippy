@@ -31,6 +31,7 @@ Thumbs.db
 *.log
 *.prof
 perf.data*
+/cloud-logs/
 
 # Python cache
 __pycache__/

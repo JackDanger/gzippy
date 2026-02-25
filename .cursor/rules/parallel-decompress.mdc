@@ -1,0 +1,190 @@
+---
+description: Parallel decompression — architecture, proven failures, and invariants
+alwaysApply: true
+---
+
+# Parallel Single-Member Decompression: What We Know
+
+## Architecture That Works (BGZF / Multi-Member)
+
+BGZF and multi-member files have explicit boundaries between independent gzip
+members. Each member decompresses independently → trivially parallel. This is
+production-proven and dominant in benchmarks.
+
+## Single-Member Parallel: The Hard Problem
+
+Single-member gzip = one deflate stream = no natural split points.
+
+### Current State (Feb 24 2026)
+
+Rapidgzip-style speculation pipeline is complete and tested (160 tests, 0 failures).
+
+**Production routing**: `parallel_single_member::decompress_parallel` is gated on
+`isal_decompress::is_available()` — **x86_64 only**. On arm64, parallel speculation
+is catastrophically slow for low-redundancy data (16x slower than sequential — block
+boundaries are rare, most chunks become all-marker forcing large sequential re-decodes).
+
+Pipeline produces **correct output** (CRC32-verified). Performance on x86_64:
+- Test data (40MB): T10=164ms (255 MB/s), 10/10 spec hits
+- Silesia (212MB): T10=2410ms (88 MB/s), 7/10 spec hits
+- Still slower than sequential libdeflate (~700 MB/s) on silesia
+
+**arm64 single-member path** (gated out of parallel):
+- data ≤ 1GB → `decompress_single_member_libdeflate` (near-parity with pigz, -0.7%)
+- data > 1GB → `decompress_single_member_streaming` (avoids huge allocation only)
+- Streaming zlib-ng was tested and is ~19% SLOWER than libdeflate for 10MB on M4.
+  Do NOT lower the 1GB streaming threshold.
+
+Key improvements (Feb 24):
+- Block-by-block confirmation: checks for spec matches at EVERY block boundary
+- Lightweight try_decode_at: 64KB decode limit (was 2MB), 5x faster search
+- Fixed 64KB margin bug: data slice now uses full remaining stream
+- Removed TooFewChunks dead code, two_pass_parallel.rs deprecated
+
+#### Architecture (no retry, no sequential pre-scan)
+1. Partition compressed data at regular intervals
+2. Each chunk task searches FORWARD from partition for deflate block boundary
+3. All chunks decode in parallel (speculative)
+4. Sequential confirmation: process in order, use hits, re-decode misses
+5. CRC32 + ISIZE verification on assembled output
+
+### What Works
+
+- **Block-by-block confirmation**: `decode_sequential_to_spec` checks for spec
+  matches at EVERY block boundary during sequential fallback. This finds real
+  boundaries that `decode_until_bit` would overshoot past. Key improvement.
+- **Lightweight try_decode_at**: 64KB decode limit + 32KB output min.
+  Validation is cheap (~0.1ms per candidate) so the search phase is fast (724ms
+  for 10 chunks on silesia vs 3735ms previously).
+- **Buffered output**: `confirm_resolve_write` buffers all output, calls
+  `verify_output` for CRC32 + ISIZE, only writes on success.
+- **Oracle pipeline**: With oracle boundaries, `confirm_resolve_write` with
+  all-hits produces byte-exact output on all data patterns (tested).
+- **MarkerDecoder**: Correct for all block types (stored, fixed, dynamic).
+- **ISIZE-based max_output_for_chunk**: Uses max(isize/chunks*2, bytes*8).
+
+### What Doesn't Work Yet
+
+- **Speculation hit rate on silesia**: 7/10 hits (up from 3/10), but confirmation
+  phase still sequentially decodes ~35% of the data.
+- **MarkerDecoder speed**: ~550 MB/s on ARM vs libdeflate ~711 MB/s. Even with
+  100% spec hits, parallel throughput per thread is limited by MarkerDecoder.
+- **Confirmation is single-threaded**: All sequential fallback + marker
+  resolution happens in one thread. This is the main bottleneck.
+- **False positive spec boundaries**: Some positions pass try_decode_at but are
+  NOT real block boundaries in the sequential stream. The block-by-block
+  confirmation correctly ignores these, but the speculative decode wastes work.
+
+### Remaining Performance Gap
+
+Sequential libdeflate on silesia: ~300ms (711 MB/s).
+Current parallel on silesia: ~2410ms (88 MB/s).
+Gap: 8x. Root causes:
+1. Spec phase: 724ms (10 chunks × MarkerDecoder search+decode at ~550 MB/s)
+2. Confirm phase: 1686ms (35% sequential + marker resolution, single-threaded)
+To beat sequential, need confirmation phase < 300ms AND spec hits > 80%.
+
+### Critical Bug Fixed (Feb 24)
+
+**64KB margin bug**: `decode_chunk_from` and `decode_sequential_from` used
+`&deflate_data[start..until/8 + 64KB]` as input slice. Large deflate blocks
+(>64KB compressed) would run past the slice, causing early EOF. Fix: use
+`&deflate_data[start..]` (full remaining stream). `decode_until_bit` stops at
+the target position regardless of slice size.
+
+### Root cause of overshooting (why exact match matters)
+
+`decode_until_bit(target)` stops at the FIRST block boundary >= target.
+If a speculative chunk starts at bit X and the sequential decoder lands at
+bit Y (the next block boundary after X), then Y > X and the spec chunk is
+behind confirmed_bit → wasted. The block-by-block confirmation fixes this
+by checking EVERY block boundary for spec matches, not just the target.
+  re-decode the gap.
+
+## False Positive Detection (3 Layers)
+
+### Layer 1: try_decode_at
+- Output volume ≥ 512KB (scaled down near end of stream)
+- Marker count > 0 (stream start has no markers)
+- Marker rate < 20% (false positives have 50-100% markers)
+
+### Layer 2: Chain convergence (in decode_chunks_parallel)
+- After `decode_until_bit(target)`, verify `bit_position() == target`
+- Exact equality = real boundary (on same block chain)
+- Overshoot = false positive (different block chain)
+- This is the ONLY definitive test — all other checks are heuristic
+
+### Layer 3: CRC32 verification (in resolve_and_write)
+- Buffer all output before writing
+- Compute CRC32, compare to gzip trailer
+- If mismatch: return CrcMismatch, writer receives nothing
+- This catches any corruption that slips through layers 1-2
+
+## Proven Failure Modes
+
+### 1. False positive boundaries (THE PRIMARY BUG)
+**Symptom**: try_decode accepts positions that produce 34K output (tiny
+self-contained false sequences) or 55M output (wrong block chain with
+mostly-literal decode).
+**Root cause**: Original threshold too low (32KB output). No marker rate
+check. No chain convergence verification.
+**Fix**: Three-layer detection (above). 512KB output threshold + marker
+rate <20% + chain convergence check + CRC32 verification.
+
+### 2. Marker propagation through window
+**Symptom**: Markers appear after 32KB of chunk output.
+**Root cause**: When a resolved reference copies a position that contains
+a marker, the marker is copied. This is CORRECT — the marker means "I
+don't know what byte goes here."
+**Impact**: Marker rate decreases but doesn't reach 0 within a chunk.
+Tests must NOT assume markers disappear after 32KB.
+
+### 3. Output written before verification
+**Symptom**: Wrong data reaches stdout before size check.
+**Root cause**: resolve_and_write wrote chunk-by-chunk then checked total.
+**Fix**: Buffer all output, verify CRC32 + ISIZE, then write_all.
+
+### 4-8. (unchanged: &data[start..], overshoot, pigz, simulation benchmarks)
+
+## Invariants (Tested by 124 Tests)
+
+1. **Chain convergence**: decode from boundary[i] lands EXACTLY at boundary[i+1]
+2. **CRC32 match**: resolved output CRC32 == gzip trailer CRC32
+3. **ISIZE match**: resolved output length == gzip trailer ISIZE
+4. **Chunk 0 has 0 markers** and matches sequential decode byte-exact
+5. **Mid-stream chunks have markers** (>0) with rate <20%
+6. **No output on error**: writer receives nothing if verification fails
+7. **Thread count independence**: same input → same output regardless of threads
+8. **Data slices bounded**: `&data[start..end]`, never `&data[start..]`
+9. **Boundaries strictly sorted** and within data range
+10. **Per-chunk output bounded** by max_output_for_chunk
+
+## Test Coverage (160 tests in parallel_single_member.rs, 595 total)
+
+### Gap closure tests (Feb 24)
+| Gap | Test | What it covers |
+|-----|------|----------------|
+| 1 | correctness_tests: 5 routing tests (4MB-8MB, T2-T8, zeros) | Production entry point |
+| 2 | test_speculative_all_misses, test_confirm_all_none | search returns None |
+| 3 | test_decode_sequential_from_corrupt (×3) | Error paths |
+| 5 | TooFewChunks removed | Dead code cleanup |
+| 6 | test_confirm_consecutive_misses, test_confirm_alternating | Window propagation |
+
+### Category A: Speculation pipeline tests (36 tests)
+Covers: decode_chunk_from, decode_sequential_from, search_boundary_forward,
+confirm_resolve_write (all hits/all misses/mixed/alternating/consecutive),
+find_next_spec_start, speculation_hit_invariant, max_output_for_chunk,
+verify_output, append_chunk_to_buffer, speculative_decode_parallel.
+
+### Category B+C: Adapted + unchanged tests (124 tests)
+Old API functions bridged via test-only compatibility wrappers.
+
+## Infrastructure
+
+| Module | Purpose | Status |
+|---|---|---|
+| `parallel_single_member.rs` | Speculation pipeline + 153 tests | CRC-verified correct, not yet faster |
+| `marker_decode.rs` | Marker-based decoder | Correct, all block types |
+| `block_finder.rs` | LUT + precode + Huffman validation | ~93% recall |
+| `scan_inflate.rs` | Sequential scanner, oracle boundaries | Ready |
+| `pipeline_tests.rs` | Oracle pipeline test harness | Ready |

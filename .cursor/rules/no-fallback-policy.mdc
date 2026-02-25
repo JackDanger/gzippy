@@ -1,0 +1,130 @@
+---
+description: No-fallback policy — every algorithm must be correct, routing must be deterministic
+alwaysApply: true
+---
+
+# No-Fallback Policy
+
+## Principle
+
+**There is no "fallback." There are only algorithms with different performance
+characteristics for different content types.**
+
+Every decompression path must be bug-free. The routing layer DECIDES which
+algorithm to use based on content analysis, then COMMITS to that decision.
+If an algorithm can't handle a content type, it must not be routed there.
+
+## What This Means in Practice
+
+### Before (wrong)
+```rust
+match parallel_decompress(data) {
+    Ok(bytes) => return Ok(bytes),
+    Err(e) => {
+        eprintln!("parallel failed, falling back to sequential");
+        // Bug is hidden — parallel produced wrong output
+    }
+}
+sequential_decompress(data)
+```
+
+### After (correct)
+```rust
+let strategy = choose_strategy(data, num_threads);
+match strategy {
+    Strategy::BgzfParallel => bgzf_parallel(data, num_threads),
+    Strategy::MultiMemberParallel => multi_member_parallel(data, num_threads),
+    Strategy::SingleMemberSequential => single_member_sequential(data),
+    Strategy::SingleMemberParallel => single_member_parallel(data, num_threads),
+}
+// Each arm is correct for its input. No fallback.
+```
+
+### What "TooSmall" means
+`TooSmall` is NOT a bug — it's a routing decision. A file too small for
+parallel decompress should be routed to the sequential path by the ROUTER,
+not by the parallel function returning an error that gets caught.
+
+### What "DecodeFailed" means
+`DecodeFailed` IS a bug. If the router chose an algorithm and it fails,
+that's a correctness problem to fix, not a reason to fall back.
+
+## The Three Legitimate Algorithm Choices
+
+| Content Type | T1 | Tmax |
+|---|---|---|
+| BGZF (gzippy output) | BGZF sequential | BGZF parallel |
+| Multi-member (pigz) | Sequential per-member | Parallel per-member |
+| Single-member (gzip) | libdeflate sequential | libdeflate sequential* |
+
+*Single-member Tmax currently uses sequential because parallel isn't
+proven correct yet. When it is, the router will use it. Until then,
+sequential is the CORRECT choice, not a "fallback."
+
+## Test Requirements
+
+Every algorithm must have:
+1. **Unit tests**: byte-exact output for diverse inputs
+2. **Invariant tests**: output size matches ISIZE, CRC matches, etc.
+3. **Cross-validation**: output matches other algorithms on same input
+4. **Performance bounds**: throughput within expected range for content type
+5. **No fallback in tests**: tests must assert success, not "success OR fallback"
+
+## Implementation Status (Feb 2026)
+
+### Refactored (no-fallback applied)
+- `decompress_gzip_to_vec`: BGZF/multi-member errors propagate directly
+- `decompress_gzip_libdeflate`: deterministic routing, no cascading
+- `decompress_single_member`: parallel gated on `isal_decompress::is_available()` (x86_64 only)
+  - x86_64: parallel speculation → ISA-L → libdeflate
+  - arm64: streaming zlib-ng (>1MB) → libdeflate (≤1MB)
+
+### marker_decode: Correct (Feb 2026)
+Two bugs were fixed:
+1. **EOF handling in `decode_huffman`**: zero-fills unavailable bits instead of
+   erroring (matches libdeflate's generic loop approach)
+2. **Fixed Huffman distance codes**: `decode_fixed_distance` now reads MSB-first
+   per RFC 1951 §3.1.1 (was using LSB-first `read_bits`)
+
+All 375 tests pass with 0 ignored. marker_decode is ready for parallel
+single-member integration.
+
+### ISA-L Error Paths: Observable (Feb 23 2026)
+ISA-L failures are no longer silent:
+- `decompress_single_member`: logs warning when ISA-L returns None (GZIPPY_DEBUG)
+- `compress_block_bgzf_isal`: logs warning when ISA-L compress fails
+- `gzippy-dev diag`: detects ISA-L fallback via `isal_decompress_fallback` key
+- Tests: corrupt/truncated/empty inputs verified to return None on x86
+- Tests: all 6 data patterns roundtrip through `decompress_single_member_pub`
+
+### Test Suite: `src/correctness_tests.rs`
+- 553 passing tests, 0 ignored
+- All paths (libdeflate, consume_first, inflate_into_pub, marker_decode,
+  BGZF, multi-member, ISA-L) pass at all sizes and data patterns
+
+### Test Gap Audit (Feb 23 2026)
+- **Routing tests**: `decompress_gzip_libdeflate` now tested end-to-end for
+  all three formats (BGZF, multi-member, single-member) at T1 and T4.
+  `decompress_single_member` tested directly. `decompress_gzip_to_vec` tested
+  for all three formats.
+- **Format detection**: `is_likely_multi_member` tested for false positives
+  (embedded magic, zero ISIZE, reserved flags, bad XFL, bad OS).
+  `has_bgzf_markers` tested with non-RZ FEXTRA, multiple subfields, short xlen.
+  `parse_gzip_header_size` tested for all flag combos (FEXTRA+FNAME+FCOMMENT+FHCRC).
+- **Compression routing**: Ratio probe threshold tested (libdeflate vs flate2
+  path selection). T1 pipelined deadlock regression test with 30s timeout.
+  Pipelined block size boundary at 50MB tested.
+- **Block finder**: `find_blocks_parallel` verified against sequential.
+- **Silent empty output**: Non-gzip input through `decompress_gzip_to_vec` and
+  `decompress_gzip_libdeflate` explicitly asserted as `Ok(empty)`.
+- **Known remaining gap**: `--independent` flag ignored in `compress_stdin`
+  (uses `args.compression_level` instead of `effective_level`).
+
+## Applying This Rule
+
+When writing new decompression code:
+1. Route first, execute second — never try/catch/fallback
+2. If a path can fail for valid input, fix the path, don't add fallback
+3. If a path is not ready, don't wire it into production
+4. Tests must assert exact correctness, never "approximate or fallback"
+5. Run `cargo test --release correctness_tests` after any decompression change

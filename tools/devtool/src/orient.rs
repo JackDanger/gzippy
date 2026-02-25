@@ -30,7 +30,7 @@ fn print_git_summary() -> Result<(), String> {
         "rev-list",
         "--left-right",
         "--count",
-        &format!("origin/main...HEAD"),
+        "origin/main...HEAD",
     ])
     .unwrap_or_default();
 
@@ -109,56 +109,53 @@ fn print_architecture() {
 
 fn print_perf_status() {
     println!("\n── PERFORMANCE STATUS ─────────────────────────────────────────────────────");
-    println!("  Single-thread inflate (ARM M3):");
-    println!("    Silesia: ~1400 MB/s (99% of libdeflate)  ← AT PARITY");
-    println!("    Software: ~21500 MB/s (106% of libdeflate)  ← EXCEEDS");
-    println!("    Logs: ~9100 MB/s (114% of libdeflate)  ← EXCEEDS");
+    println!("  Win rate: 68% (84/123 comparisons)");
+    println!("  Effective: 85% (counting 21 noise gaps <2% as ties)");
     println!();
-    println!("  Parallel (BGZF, 8 threads): 3770 MB/s (2.7x libdeflate single-thread)");
+    println!("  Gap categories:");
+    println!("    ARCHITECTURE (7): Tmax single-member vs rapidgzip (-20% worst)");
+    println!("    SIMD (3): L1 compression x86 vs igzip (-12% worst)");
+    println!("    ACTIONABLE (8): BGZF T1/Tmax overhead (-14% worst)");
+    println!("    NOISE (21): all <2%, measurement variance");
     println!();
-    println!("  CI benchmarks (stdin-piped, 4 threads):");
-    println!("    Compression: BEAT pigz everywhere, close to igzip on L1 x86");
-    println!("    Decompression: competitive except Tmax single-member vs rapidgzip");
+    println!("  Run `gzippy-dev ci triage` for live categorized analysis.");
 }
 
 fn print_strategy() {
     println!("\n── STRATEGY ───────────────────────────────────────────────────────────────");
     println!("  Completed:");
     println!("    [x] Pure Rust inflate at libdeflate parity");
-    println!("    [x] BGZF parallel decompression (3770 MB/s)");
+    println!("    [x] BGZF parallel decompression");
     println!("    [x] T1 direct-write (no intermediate buffer)");
-    println!("    [x] Tmax single-member direct-write (PR #50)");
+    println!("    [x] Tmax single-member direct-write");
     println!("    [x] ISIZE-based buffer pre-allocation");
+    println!("    [x] BGZF T1 fast path (PR #52 — detect BGZF before parallelism check)");
     println!();
     println!("  In Progress:");
-    println!("    [ ] CI sampling improvements (MIN_TRIALS=10, trimmed stats, CV=3%)");
+    println!("    [ ] Validate PR #52 impact on arm64 BGZF T1 gaps (-14%)");
+    println!("    [ ] BGZF Tmax optimization (thread pool overhead, -2% to -3.4%)");
     println!();
     println!("  Next:");
-    println!("    [ ] Tmax BGZF/multi-member direct-write via Mutex<stdout>");
-    println!("    [ ] Speculative parallel for single-member (closes rapidgzip gap)");
+    println!("    [ ] Parallel single-member decompression (rapidgzip-style pipeline)");
+    println!("        7 gaps, -20% worst — largest remaining performance opportunity");
     println!();
     println!("  Won't Fix:");
     println!("    [-] igzip compression L1 T1 x86 gap (requires hand-tuned AVX2 asm)");
+    println!("    [-] Speculative parallel (proven infeasible Feb 2026)");
     println!("    [-] Two-pass parallel (scan pass costs as much as full decode)");
 }
 
 fn print_gaps_summary() {
-    println!("\n── GAP CATEGORIES ─────────────────────────────────────────────────────────");
-    println!("  A. Tmax vs rapidgzip (single-member): 15 gaps, 5 are >10%");
-    println!("     Root cause: no parallel single-member decompress");
-    println!("     Fix: speculative parallel decode (Phase 3)");
+    println!("\n── WORKFLOW (CI is the source of truth) ────────────────────────────────────");
+    println!("  gzippy-dev ci triage          # See categorized gaps, win rate");
+    println!("  # ... make ONE code change ...");
+    println!("  gzippy-dev ci push            # Push → CI → auto-triage + vs-main");
+    println!("  gzippy-dev ci vs-main         # Branch vs main (auto-finds runs)");
+    println!("  gzippy-dev ci history         # Win rate trend over time");
     println!();
-    println!("  B. T1 residual: 25 gaps, most <2% (noise)");
-    println!("     Only 3 meaningful: software-bgzf T1 arm64, compress L1 x86 vs igzip");
-    println!("     Fix for bgzf: already addressed in PR #50");
-    println!("     Fix for igzip: not feasible without SIMD assembly");
-    println!();
-    println!("  C. Tmax vs pigz on arm64: 7 gaps, 2 are >8%");
-    println!("     Root cause: Tmax double-buffering (fixed in PR #50)");
-    println!("     Remaining: sequential inflate speed diff on Graviton");
-    println!();
-    println!("  Run `gzippy-dev ci gaps` for live numbers.");
-    println!("  Run `gzippy-dev ci gaps --run ID1 --compare ID2` to compare runs.");
+    println!("  Local tools (for rapid iteration, not final decisions):");
+    println!("    gzippy-dev instrument f.gz  # Timing breakdown");
+    println!("    gzippy-dev path f.gz        # Which code path runs");
 }
 
 fn run_git(args: &[&str]) -> Result<String, String> {

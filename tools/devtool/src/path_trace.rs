@@ -206,10 +206,9 @@ fn find_member_end(data: &[u8], start: usize) -> Option<usize> {
     // For BGZF we already know the block size from BSIZE.
     let search_from = pos;
     for i in search_from..data.len().saturating_sub(2) {
-        if data[i] == 0x1f && data[i + 1] == 0x8b && i + 2 < data.len() && data[i + 2] == 0x08 {
-            if i > start + 18 {
-                return Some(i);
-            }
+        if data[i] == 0x1f && data[i + 1] == 0x8b && i + 2 < data.len() && data[i + 2] == 0x08
+            && i > start + 18 {
+            return Some(i);
         }
     }
 

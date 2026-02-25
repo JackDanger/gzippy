@@ -5,9 +5,12 @@
 
 mod bench;
 mod ci;
+mod cloud;
+mod diag;
 mod instrument;
 mod orient;
 mod path_trace;
+mod score;
 
 use std::env;
 
@@ -31,6 +34,13 @@ fn main() {
                 "watch" => ci::watch(run_id.as_deref(), branch.as_deref()),
                 "results" => ci::results(run_id.as_deref(), branch.as_deref()),
                 "gaps" => ci::gaps(run_id.as_deref(), branch.as_deref()),
+                "triage" => ci::triage(run_id.as_deref(), branch.as_deref()),
+                "history" => {
+                    let limit = find_flag(&args, "--limit")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(5);
+                    ci::history(branch.as_deref(), limit)
+                }
                 "compare" => {
                     if args.len() < 5 {
                         eprintln!("Usage: gzippy-dev ci compare <run_id_a> <run_id_b>");
@@ -38,6 +48,8 @@ fn main() {
                     }
                     ci::compare(&args[3], &args[4])
                 }
+                "vs-main" => ci::vs_main(branch.as_deref()),
+                "push" => ci::push_and_watch(),
                 _ => {
                     eprintln!("Unknown ci subcommand: {}", args[2]);
                     std::process::exit(1);
@@ -45,8 +57,38 @@ fn main() {
             }
         }
         "bench" => {
-            let dataset = find_flag(&args, "--dataset");
-            bench::run(dataset.as_deref())
+            if args.len() >= 3 && args[2] == "ab" {
+                if args.len() < 5 {
+                    eprintln!("Usage: gzippy-dev bench ab <ref-a> <ref-b> [--dataset NAME] [--threads N]");
+                    std::process::exit(1);
+                }
+                let dataset = find_flag(&args, "--dataset");
+                let threads = find_flag(&args, "--threads");
+                bench::run_ab(&args[3], &args[4], dataset.as_deref(), threads.as_deref())
+            } else {
+                let direction = match find_flag(&args, "--direction").as_deref() {
+                    Some("compress") => bench::BenchDirection::Compress,
+                    Some("both") => bench::BenchDirection::Both,
+                    _ => bench::BenchDirection::Decompress,
+                };
+                let bench_args = bench::BenchArgs {
+                    dataset: find_flag(&args, "--dataset"),
+                    archive: find_flag(&args, "--archive"),
+                    threads: find_flag(&args, "--threads").and_then(|s| s.parse().ok()),
+                    json: args.iter().any(|a| a == "--json"),
+                    min_trials: find_flag(&args, "--min-trials")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(10),
+                    max_trials: find_flag(&args, "--max-trials")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(40),
+                    target_cv: find_flag(&args, "--target-cv")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0.03),
+                    direction,
+                };
+                bench::run(&bench_args)
+            }
         }
         "path" => {
             if args.len() < 3 {
@@ -63,7 +105,46 @@ fn main() {
             let threads = find_flag(&args, "--threads");
             instrument::run(&args[2], threads.as_deref())
         }
+        "cloud" => {
+            if args.len() < 3 {
+                eprintln!("Usage: gzippy-dev cloud <bench|run|cleanup>");
+                std::process::exit(1);
+            }
+            match args[2].as_str() {
+                "bench" => cloud::bench(),
+                "run" => {
+                    if args.len() < 5 {
+                        eprintln!("Usage: gzippy-dev cloud run <x86|arm64> <command>");
+                        eprintln!();
+                        eprintln!("Examples:");
+                        eprintln!("  gzippy-dev cloud run x86 'cargo test --release bench_isal -- --nocapture'");
+                        eprintln!("  gzippy-dev cloud run arm64 'gzippy -d -p1 < /dev/shm/silesia-gzip.gz > /dev/null'");
+                        eprintln!("  gzippy-dev cloud run x86 'perf stat gzippy -1 -c -p1 < /dev/shm/software.archive > /dev/null'");
+                        std::process::exit(1);
+                    }
+                    let cmd = args[4..].join(" ");
+                    cloud::run_command(&args[3], &cmd)
+                }
+                "cleanup" => cloud::cleanup_all(),
+                _ => {
+                    eprintln!("Unknown cloud subcommand: {}", args[2]);
+                    std::process::exit(1);
+                }
+            }
+        }
+        "diag" => {
+            let diag_args = diag::DiagArgs {
+                direction: find_flag(&args, "--direction"),
+                dataset: find_flag(&args, "--dataset"),
+            };
+            diag::run(&diag_args)
+        }
         "orient" => orient::run(),
+        "score" => score::run(),
+        "losses" => {
+            let explain = args.iter().any(|a| a == "--explain");
+            score::losses(explain)
+        }
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -92,29 +173,64 @@ fn print_usage() {
     eprintln!(
         r#"gzippy-dev — Development tool for the gzippy project
 
-COMMANDS:
+CI WORKFLOW (use these — CI is the source of truth):
+  ci triage [--run ID]         Categorized gap analysis with root causes and actions
+  ci vs-main                   Compare current branch vs main (auto-finds runs)
+  ci push                      Push, wait for CI, auto-triage + compare vs main
+  ci history [--limit N]       Win rate trend across recent CI runs
+
+CI DETAILS:
   ci status                    Show status of recent CI runs
   ci watch [--run ID]          Block until a CI run completes
   ci results [--run ID]        Parse and display benchmark results
   ci gaps [--run ID]           Show performance gaps vs all competitors
   ci compare <ID_A> <ID_B>     Compare gzippy results between two CI runs
-  bench [--dataset NAME]       Run local decompression benchmark
+
+SCORECARD:
+  score                        Show current win/loss scorecard from cloud-results.json
+  losses                       Show losses grouped by root cause with actions
+  losses --explain             Annotate each loss with diagnostic data
+
+CLOUD (dedicated hardware, low jitter):
+  cloud bench                  Launch EC2 fleet, run full benchmarks, tear down
+  cloud run <arch> <cmd>       Launch one instance, run command, stream output, tear down
+  cloud cleanup                Delete any leaked cloud resources from prior runs
+
+DIAGNOSTICS:
+  diag [FLAGS]                 Collect platform + ISA-L + timing diagnostics as JSON
+  diag --direction compress    Compress-only diagnostics (ISA-L timing, dispatch check)
+  diag --direction decompress  Decompress-only diagnostics (path traces)
+  diag --dataset NAME          Limit to specific dataset
+
+BENCHMARK (one source of truth for all perf numbers):
+  bench [FLAGS]                Run decompression benchmark (human output)
+  bench --json                 Same, but JSON to stdout (used by cloud fleet)
+  bench ab <ref-a> <ref-b>     A/B comparison of two git refs
   path <file.gz>               Trace which decompression path a file takes
   instrument <file.gz>         Decompress with detailed timing breakdown
   orient                       Show project state, strategy, and what's next
 
+BENCH FLAGS:
+  --dataset NAME               silesia, software, logs (default: all found)
+  --archive TYPE               gzip, bgzf, pigz (default: all found)
+  --threads N                  1 for T1, >1 for Tmax (default: both)
+  --direction MODE             decompress, compress, both (default: decompress)
+  --json                       Machine-readable JSON output on stdout
+  --min-trials N               Minimum trial runs (default: 10)
+  --max-trials N               Maximum trial runs (default: 40)
+  --target-cv F                Target coefficient of variation (default: 0.03)
+
 OPTIONS:
   --run ID                     Specific GitHub Actions run ID
   --branch NAME                Filter CI runs to a specific branch
-  --dataset NAME               silesia, software, logs (default: all available)
-  --threads N                  Thread count for instrument (default: 1)
+  --threads N                  Thread count for bench ab / instrument (default: 1)
+  --limit N                    Number of CI runs for history (default: 5)
 
-EXAMPLES:
-  gzippy-dev orient                              # Where are we? What's next?
-  gzippy-dev ci gaps                             # Live gap analysis
-  gzippy-dev ci compare 22205101167 22206170307  # Did PR help or hurt?
-  gzippy-dev instrument data.gz --threads 4      # Timing breakdown
-  gzippy-dev bench --dataset silesia             # Local benchmark
+TYPICAL WORKFLOW:
+  gzippy-dev ci triage                     # 1. See where we stand
+  # ... make code changes ...
+  gzippy-dev ci push                       # 2. Push → CI → auto-triage + vs-main
+  gzippy-dev ci vs-main                    # 3. Check anytime: branch vs main
 "#
     );
 }
