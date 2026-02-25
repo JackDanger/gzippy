@@ -582,60 +582,20 @@ fn is_multi_member_quick(data: &[u8]) -> bool {
 ///
 /// Returns true for compressible data (parallel likely helps), false otherwise.
 /// On ISIZE=0 (unknown/wraps), defaults to false (sequential is safe).
-#[inline]
-fn is_compressible_enough_for_parallel(data: &[u8]) -> bool {
-    let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
-    isize_hint >= data.len().saturating_mul(2)
-}
-
 /// Decompress a single-member gzip file.
 ///
 /// Routes to the best available decoder:
-///   - Rapidgzip-style parallel (x86_64 always; arm64 only for compressible data)
-///   - ISA-L (x86_64 with AVX2): fastest sequential for RLE-heavy data
+///   - ISA-L (x86_64 with AVX2): fastest sequential path
 ///   - libdeflate one-shot: fastest arm64 path for all practical files
+///   - streaming zlib-ng: only for files > 1GB (avoids huge allocation)
+///
+/// Note: parallel_single_member::decompress_parallel exists but is not yet
+/// faster than sequential paths (88-148 MB/s vs 600-2000 MB/s). Not wired in.
 fn decompress_single_member<W: Write>(
     data: &[u8],
     writer: &mut W,
-    num_threads: usize,
+    _num_threads: usize,
 ) -> GzippyResult<u64> {
-    // Parallel speculation routing:
-    //   x86_64: always try (ISA-L provides fast sequential fallback)
-    //   arm64:  only for well-compressible data (ISIZE/len >= 2.0).
-    //           Incompressible data causes near-zero spec hit rates → all chunks
-    //           become all-marker → 16x slower than sequential. Compressible data
-    //           (silesia, software, logs) achieves 1500+ MB/s with parallel.
-    let try_parallel = num_threads >= 2
-        && (crate::isal_decompress::is_available() || is_compressible_enough_for_parallel(data));
-    if try_parallel {
-        if debug_enabled() {
-            eprintln!(
-                "[gzippy] single-member parallel: {} bytes, {} threads",
-                data.len(),
-                num_threads
-            );
-        }
-        match crate::parallel_single_member::decompress_parallel(data, writer, num_threads) {
-            Ok(bytes) => {
-                if debug_enabled() {
-                    eprintln!("[gzippy] parallel decode produced {} bytes", bytes);
-                }
-                writer.flush()?;
-                return Ok(bytes);
-            }
-            Err(ref e) if e.is_routing() => {
-                if debug_enabled() {
-                    eprintln!("[gzippy] parallel: {}, using sequential", e);
-                }
-            }
-            Err(e) => {
-                if debug_enabled() {
-                    eprintln!("[gzippy] parallel decode error: {}, using sequential", e);
-                }
-            }
-        }
-    }
-
     if crate::isal_decompress::is_available() {
         if let Some(bytes) = crate::isal_decompress::decompress_gzip_stream(data, writer) {
             writer.flush()?;
