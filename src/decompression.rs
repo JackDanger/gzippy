@@ -586,7 +586,10 @@ fn decompress_single_member<W: Write>(
     writer: &mut W,
     num_threads: usize,
 ) -> GzippyResult<u64> {
-    if num_threads >= 2 {
+    // Parallel speculation only on x86_64 (where ISA-L is available).
+    // On arm64, speculation quality is poor for low-redundancy data and
+    // sequential streaming zlib-ng (NEON) is faster than parallel fallback.
+    if num_threads >= 2 && crate::isal_decompress::is_available() {
         if debug_enabled() {
             eprintln!(
                 "[gzippy] single-member parallel: {} bytes, {} threads",
@@ -628,11 +631,11 @@ fn decompress_single_member<W: Write>(
         }
     }
 
-    // For large single-member files without ISA-L (arm64), use streaming
-    // zlib-ng to avoid allocating a full-size output buffer. The one-shot
-    // libdeflate path allocates vec![0u8; isize_hint] which triggers
-    // ~isize/4096 minor page faults on first write to each page.
-    if !crate::isal_decompress::is_available() && data.len() > 1024 * 1024 {
+    // Streaming zlib-ng is only used when the output would exceed 1GB (ISIZE
+    // wraps at 4GB per RFC 1952, so isize_hint is unreliable for huge files).
+    // For normal files, libdeflate one-shot is faster than streaming zlib-ng
+    // on arm64 even accounting for page fault overhead (warm after 1st run).
+    if !crate::isal_decompress::is_available() && data.len() > 1024 * 1024 * 1024 {
         if debug_enabled() {
             eprintln!("[gzippy] streaming zlib-ng decode: {} bytes", data.len());
         }

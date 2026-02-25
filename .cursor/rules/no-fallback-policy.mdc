@@ -75,7 +75,9 @@ Every algorithm must have:
 ### Refactored (no-fallback applied)
 - `decompress_gzip_to_vec`: BGZF/multi-member errors propagate directly
 - `decompress_gzip_libdeflate`: deterministic routing, no cascading
-- `decompress_single_member`: parallel removed (not ready), routes to ISA-L or libdeflate
+- `decompress_single_member`: parallel gated on `isal_decompress::is_available()` (x86_64 only)
+  - x86_64: parallel speculation → ISA-L → libdeflate
+  - arm64: streaming zlib-ng (>1MB) → libdeflate (≤1MB)
 
 ### marker_decode: Correct (Feb 2026)
 Two bugs were fixed:

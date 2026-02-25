@@ -26,7 +26,7 @@ RAPIDGZIP_BIN := $(RAPIDGZIP_DIR)/librapidarchive/build/src/tools/rapidgzip
 GZIP_BIN := $(shell if [ -x $(GZIP_DIR)/gzip ]; then echo $(GZIP_DIR)/gzip; else echo $$(which gzip); fi)
 SYSTEM_GZIP := $(shell which gzip)
 
-.PHONY: all build quick perf-full test-data test-data-quick clean help validate deps ship
+.PHONY: all build quick perf-full test-data test-data-quick clean help validate deps ship route-check
 
 # =============================================================================
 # Default target: quick benchmark for fast iteration (< 30 seconds)
@@ -96,6 +96,14 @@ FORCE:
 # =============================================================================
 quick: $(GZIPPY_BIN) $(UNGZIPPY_BIN) $(PIGZ_BIN) deps
 	@python3 scripts/perf.py --sizes 1,10 --levels 6 --threads 1,4
+
+# =============================================================================
+# Route check: generate test files and show which decompression path is taken
+# for each T1/T4 × 1MB/10MB combo, with timing vs pigz.
+# Run before ANY decompression code change to verify routing.
+# =============================================================================
+route-check: $(GZIPPY_BIN) $(PIGZ_BIN)
+	@python3 scripts/route_check.py $(GZIPPY_BIN) $(PIGZ_BIN)
 
 # =============================================================================
 # Ship: tests + clippy + cloud fleet benchmarks (the "are we good?" command)
@@ -472,6 +480,7 @@ help:
 	@echo "Quick commands (for AI tools and iteration):"
 	@echo "  make              Build and run quick benchmark (< 30 seconds)"
 	@echo "  make quick        Same as above"
+	@echo "  make route-check  Show decompression routing + timing for T1/T4 x 1MB/10MB"
 	@echo "  make build        Build gzippy and ungzippy"
 	@echo "  make deps         Build gzip and pigz from submodules"
 	@echo "  make validate     Run validation suite (adaptive 3-17 trials)"

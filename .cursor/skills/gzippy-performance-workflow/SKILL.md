@@ -11,9 +11,27 @@ description: Run gzippy performance benchmarks, interpret results, and iterate o
 1. gzippy-dev score                  # Current win/loss from cloud fleet
 2. gzippy-dev losses                 # Losses grouped by root cause + actions
 3. # ... make ONE focused code change ...
-4. cargo test --release              # Correctness
-5. gzippy-dev ci push                # Push → CI → auto-triage
-6. source .env && gzippy-dev cloud bench  # Authoritative numbers on dedicated HW
+4. make route-check                  # Verify routing is correct (30s, before touching decomp)
+5. make                              # Local sanity: catch catastrophic regressions (30s)
+6. cargo test --release              # Correctness
+7. gzippy-dev ci push                # Push → CI → auto-triage
+8. source .env && gzippy-dev cloud bench  # Authoritative numbers on dedicated HW
+```
+
+**IMPORTANT**: Steps 4-5 (`make route-check` + `make`) take 60s total and catch
+regressions before cloud fleet. NEVER skip them before pushing decompression changes.
+
+## Debug a regression
+
+```bash
+# 1. See exactly which path is taken
+GZIPPY_DEBUG=1 gzippy -d -c testfile.gz > /dev/null
+
+# 2. Show routing for all T1/T4 × 1MB/10MB combos
+make route-check
+
+# 3. Quick benchmark (local, not authoritative)
+make
 ```
 
 ## Quick Reference

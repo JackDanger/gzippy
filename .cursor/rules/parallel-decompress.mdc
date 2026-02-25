@@ -17,14 +17,23 @@ Single-member gzip = one deflate stream = no natural split points.
 
 ### Current State (Feb 24 2026)
 
-Rapidgzip-style speculation pipeline is complete, tested (160 tests, 0 failures),
-and wired into production routing (`decompress_single_member` calls
-`parallel_single_member::decompress_parallel` for T >= 2, data >= 4MB).
+Rapidgzip-style speculation pipeline is complete and tested (160 tests, 0 failures).
 
-Pipeline produces **correct output** (CRC32-verified). Performance:
+**Production routing**: `parallel_single_member::decompress_parallel` is gated on
+`isal_decompress::is_available()` — **x86_64 only**. On arm64, parallel speculation
+is catastrophically slow for low-redundancy data (16x slower than sequential — block
+boundaries are rare, most chunks become all-marker forcing large sequential re-decodes).
+
+Pipeline produces **correct output** (CRC32-verified). Performance on x86_64:
 - Test data (40MB): T10=164ms (255 MB/s), 10/10 spec hits
 - Silesia (212MB): T10=2410ms (88 MB/s), 7/10 spec hits
 - Still slower than sequential libdeflate (~700 MB/s) on silesia
+
+**arm64 single-member path** (gated out of parallel):
+- data ≤ 1GB → `decompress_single_member_libdeflate` (near-parity with pigz, -0.7%)
+- data > 1GB → `decompress_single_member_streaming` (avoids huge allocation only)
+- Streaming zlib-ng was tested and is ~19% SLOWER than libdeflate for 10MB on M4.
+  Do NOT lower the 1GB streaming threshold.
 
 Key improvements (Feb 24):
 - Block-by-block confirmation: checks for spec matches at EVERY block boundary
