@@ -25,8 +25,9 @@ Input → decompression.rs: decompress_file / decompress_stdin
         x86_64 Tmax (ISA-L available, data ≥ 4MB) → parallel_single_member::decompress_parallel
         x86_64 T1  → isal_decompress::decompress_gzip_stream (ISA-L direct FFI)
         x86_64 fallback → decompress_single_member_libdeflate
-        arm64 (data ≤ 1GB)  → decompress_single_member_libdeflate (libdeflate FFI)
-        arm64 (data > 1GB)  → decompress_single_member_streaming (zlib-ng, avoid huge alloc)
+        arm64 compressible (ISIZE/len ≥ 2.0) → parallel_single_member (MarkerDecoder)
+        arm64 incompressible (ISIZE/len < 2.0) → decompress_single_member_libdeflate
+        arm64 huge (data > 1GB) → decompress_single_member_streaming (avoid huge alloc)
 ```
 
 **Compression (L6 with ≥2 threads)**: `PipelinedGzEncoder` → produces **single-member** output
@@ -52,9 +53,11 @@ larger blocks for L1 (no help), **speculative parallel decode on arm64**
 become all-marker forcing huge sequential re-decodes),
 two-pass scan-then-decode, large pre-allocations.
 
-**arm64 single-member**: libdeflate one-shot for files ≤1GB (near-parity with pigz).
-Streaming zlib-ng only for >1GB files (avoids huge allocation). ISA-L unavailable on arm64.
-Do NOT lower the 1GB threshold — tested streaming zlib-ng vs libdeflate and libdeflate wins.
+**arm64 single-member routing** (compressibility check via ISIZE/len ratio):
+- ISIZE/len ≥ 2.0 (compressible): parallel_single_member (MarkerDecoder, 1500+ MB/s on real workloads)
+- ISIZE/len < 2.0 (incompressible/random): libdeflate sequential (near-parity, safe)
+- data > 1GB: streaming zlib-ng (avoids huge allocation only for pathological files)
+ISA-L is unavailable on arm64. Do NOT remove the compressibility check.
 
 **Parallel speculation guard**: `parallel_single_member` is gated on
 `isal_decompress::is_available()` — x86_64 only. Never remove this guard

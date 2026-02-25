@@ -574,22 +574,40 @@ fn is_multi_member_quick(data: &[u8]) -> bool {
     is_likely_multi_member(data)
 }
 
+/// Check whether the data is compressible enough to benefit from parallel speculation.
+///
+/// Reads the ISIZE hint from the gzip trailer (mod 2^32) and compares to the
+/// compressed size. Ratio >= 2.0 means decompressed is at least 2x compressed —
+/// a reasonable proxy for data that has enough redundancy to produce good spec hits.
+///
+/// Returns true for compressible data (parallel likely helps), false otherwise.
+/// On ISIZE=0 (unknown/wraps), defaults to false (sequential is safe).
+#[inline]
+fn is_compressible_enough_for_parallel(data: &[u8]) -> bool {
+    let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
+    isize_hint >= data.len().saturating_mul(2)
+}
+
 /// Decompress a single-member gzip file.
 ///
 /// Routes to the best available decoder:
-///   - Rapidgzip-style parallel (num_threads >= 2, large files): guess+validate pipeline
+///   - Rapidgzip-style parallel (x86_64 always; arm64 only for compressible data)
 ///   - ISA-L (x86_64 with AVX2): fastest sequential for RLE-heavy data
-///   - Streaming zlib-ng (arm64, large files): avoids page fault overhead
-///   - libdeflate one-shot: fastest for small files
+///   - libdeflate one-shot: fastest arm64 path for all practical files
 fn decompress_single_member<W: Write>(
     data: &[u8],
     writer: &mut W,
     num_threads: usize,
 ) -> GzippyResult<u64> {
-    // Parallel speculation only on x86_64 (where ISA-L is available).
-    // On arm64, speculation quality is poor for low-redundancy data and
-    // sequential streaming zlib-ng (NEON) is faster than parallel fallback.
-    if num_threads >= 2 && crate::isal_decompress::is_available() {
+    // Parallel speculation routing:
+    //   x86_64: always try (ISA-L provides fast sequential fallback)
+    //   arm64:  only for well-compressible data (ISIZE/len >= 2.0).
+    //           Incompressible data causes near-zero spec hit rates → all chunks
+    //           become all-marker → 16x slower than sequential. Compressible data
+    //           (silesia, software, logs) achieves 1500+ MB/s with parallel.
+    let try_parallel = num_threads >= 2
+        && (crate::isal_decompress::is_available() || is_compressible_enough_for_parallel(data));
+    if try_parallel {
         if debug_enabled() {
             eprintln!(
                 "[gzippy] single-member parallel: {} bytes, {} threads",
@@ -631,10 +649,9 @@ fn decompress_single_member<W: Write>(
         }
     }
 
-    // Streaming zlib-ng is only used when the output would exceed 1GB (ISIZE
-    // wraps at 4GB per RFC 1952, so isize_hint is unreliable for huge files).
-    // For normal files, libdeflate one-shot is faster than streaming zlib-ng
-    // on arm64 even accounting for page fault overhead (warm after 1st run).
+    // Streaming zlib-ng only for files that would need a >1GB output buffer
+    // (ISIZE wraps at 4GB; isize_hint unreliable for very large files).
+    // For all practical files, libdeflate one-shot is faster.
     if !crate::isal_decompress::is_available() && data.len() > 1024 * 1024 * 1024 {
         if debug_enabled() {
             eprintln!("[gzippy] streaming zlib-ng decode: {} bytes", data.len());
