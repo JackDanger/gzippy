@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-const DEFAULT_MIN_TRIALS: u32 = 30;
-const DEFAULT_MAX_TRIALS: u32 = 300;
-const DEFAULT_TARGET_CV: f64 = 0.01;
+pub const DEFAULT_MIN_TRIALS: u32 = 30;
+pub const DEFAULT_MAX_TRIALS: u32 = 300;
+pub const DEFAULT_TARGET_CV: f64 = 0.01;
 
 pub struct BenchArgs {
     pub dataset: Option<String>,

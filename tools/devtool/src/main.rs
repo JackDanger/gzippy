@@ -59,7 +59,9 @@ fn main() {
         "bench" => {
             if args.len() >= 3 && args[2] == "ab" {
                 if args.len() < 5 {
-                    eprintln!("Usage: gzippy-dev bench ab <ref-a> <ref-b> [--dataset NAME] [--threads N]");
+                    eprintln!(
+                        "Usage: gzippy-dev bench ab <ref-a> <ref-b> [--dataset NAME] [--threads N]"
+                    );
                     std::process::exit(1);
                 }
                 let dataset = find_flag(&args, "--dataset");
@@ -78,13 +80,13 @@ fn main() {
                     json: args.iter().any(|a| a == "--json"),
                     min_trials: find_flag(&args, "--min-trials")
                         .and_then(|s| s.parse().ok())
-                        .unwrap_or(10),
+                        .unwrap_or(bench::DEFAULT_MIN_TRIALS),
                     max_trials: find_flag(&args, "--max-trials")
                         .and_then(|s| s.parse().ok())
-                        .unwrap_or(40),
+                        .unwrap_or(bench::DEFAULT_MAX_TRIALS),
                     target_cv: find_flag(&args, "--target-cv")
                         .and_then(|s| s.parse().ok())
-                        .unwrap_or(0.03),
+                        .unwrap_or(bench::DEFAULT_TARGET_CV),
                     direction,
                 };
                 bench::run(&bench_args)
