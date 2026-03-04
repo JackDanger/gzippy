@@ -106,17 +106,17 @@ route-check: $(GZIPPY_BIN) $(PIGZ_BIN)
 	@python3 scripts/route_check.py $(GZIPPY_BIN) $(PIGZ_BIN)
 
 # =============================================================================
-# Ship: tests + clippy + cloud fleet benchmarks (the "are we good?" command)
+# Ship: tests + clippy + homelab benchmarks (the "are we good?" command)
 #
-# Runs the full correctness test suite, then launches the EC2 fleet for
-# performance benchmarks. Fails fast if tests or clippy don't pass.
+# Runs the full correctness test suite, then runs benchmarks on neurotic homelab.
+# Fails fast if tests or clippy don't pass.
 #
-# AWS: auto-uses aws-vault gzippy-dev, or source .env for explicit creds
-# Time: ~15 minutes (tests: ~30s, fleet: ~12-15 min)
+# Target: ssh -J neurotic root@10.30.0.199 (homelab intel i9-14000)
+# Time: ~20-30 minutes (tests: ~30s, benchmarks: ~20-25 min)
 # =============================================================================
 ship: $(GZIPPY_BIN)
 	@echo "══════════════════════════════════════════════════════"
-	@echo "  SHIP: tests → clippy → cloud fleet benchmarks"
+	@echo "  SHIP: tests → clippy → neurotic homelab benchmarks"
 	@echo "══════════════════════════════════════════════════════"
 	@echo ""
 	@echo "── Step 1/4: cargo test ──"
@@ -128,18 +128,16 @@ ship: $(GZIPPY_BIN)
 	@echo "── Step 3/4: rebuild gzippy-dev ──"
 	@cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target 2>&1 | grep -E "Compiling|Finished|error" || true
 	@echo ""
-	@echo "── Step 4/4: cloud fleet benchmarks ──"
-	@if [ -z "$$AWS_ACCESS_KEY_ID" ]; then \
-		echo "No AWS creds in env — cloud.rs will use aws-vault exec gzippy-dev"; \
-	fi
-	target/release/gzippy-dev cloud bench
+	@echo "── Step 4/4: neurotic homelab benchmarks ──"
+	@echo "Connecting to neurotic (root@10.30.0.199)..."
+	ssh -J neurotic root@10.30.0.199 'cd gzippy && ./target/release/gzippy-dev cloud bench'
 	@echo ""
 	@echo "══════════════════════════════════════════════════════"
 	@echo "  Scorecard:"
 	@echo "══════════════════════════════════════════════════════"
-	target/release/gzippy-dev score
+	ssh -J neurotic root@10.30.0.199 'cd gzippy && ./target/release/gzippy-dev score'
 	@echo ""
-	@echo "Done. Run 'target/release/gzippy-dev losses' for gap analysis."
+	@echo "Done. Run 'ssh -J neurotic root@10.30.0.199 gzippy/target/release/gzippy-dev losses' for gap analysis."
 
 # =============================================================================
 # AWS credentials for cloud fleet benchmarks (optional — cloud.rs auto-uses
@@ -474,8 +472,8 @@ help:
 	@echo "======================================"
 	@echo ""
 	@echo "The one command:"
-	@echo "  make ship         Tests + clippy + EC2 fleet benchmarks + scorecard"
-	@echo "                    (uses aws-vault gzippy-dev, or source .env)"
+	@echo "  make ship         Tests + clippy + neurotic homelab benchmarks + scorecard"
+	@echo "                    (runs on ssh -J neurotic root@10.30.0.199)"
 	@echo ""
 	@echo "Quick commands (for AI tools and iteration):"
 	@echo "  make              Build and run quick benchmark (< 30 seconds)"
