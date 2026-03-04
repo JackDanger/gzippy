@@ -750,4 +750,189 @@ mod tests {
             "ISA-L BGZF block must roundtrip correctly"
         );
     }
+
+    /// Verification: Check if libdeflate and zlib-ng produce equivalent gzip output
+    ///
+    /// The benchmark above uses raw DEFLATE, but gzippy uses gzip format with
+    /// headers. This test verifies both backends produce valid, decompressible gzip.
+    #[test]
+    fn test_libdeflate_vs_zlib_ng_gzip_roundtrip() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let data = b"Hello, world! ".repeat(1000); // 14KB test data
+
+        // Compress with libdeflate L1 using compress_block_bgzf_libdeflate
+        let header = GzipHeaderInfo::default();
+        let mut output_libdeflate = Vec::new();
+        compress_block_bgzf_libdeflate(&mut output_libdeflate, &data, 1, &header);
+
+        // Compress with zlib-ng L1 using flate2
+        let mut output_zlib_ng = Vec::new();
+        let encoder = GzEncoder::new(&mut output_zlib_ng, Compression::new(1));
+        let mut w = std::io::BufWriter::new(encoder);
+        w.write_all(&data).expect("write failed");
+        drop(w); // Ensure encoder is flushed
+
+        // Both should decompress to original data
+        let mut decoder1 = flate2::read::GzDecoder::new(&output_libdeflate[..]);
+        let mut decompressed1 = Vec::new();
+        decoder1.read_to_end(&mut decompressed1).unwrap();
+
+        let mut decoder2 = flate2::read::GzDecoder::new(&output_zlib_ng[..]);
+        let mut decompressed2 = Vec::new();
+        decoder2.read_to_end(&mut decompressed2).unwrap();
+
+        // Both must decompress to original
+        assert_eq!(decompressed1, data, "libdeflate L1 roundtrip failed");
+        assert_eq!(decompressed2, data, "zlib-ng L1 roundtrip failed");
+
+        println!(
+            "\nGzip roundtrip test passed:\n  libdeflate L1: {} bytes -> {:.2}% ratio\n  zlib-ng L1: {} bytes -> {:.2}% ratio",
+            output_libdeflate.len(),
+            (output_libdeflate.len() as f64 / data.len() as f64) * 100.0,
+            output_zlib_ng.len(),
+            (output_zlib_ng.len() as f64 / data.len() as f64) * 100.0
+        );
+    }
+
+    /// Benchmark: libdeflate L1 vs zlib-ng L1 compression on arm64
+    ///
+    /// This test compares compression throughput (MB/s) of:
+    /// - libdeflate at level 1 (current gzippy choice for Tmax)
+    /// - zlib-ng at level 1 (via flate2, alternative)
+    ///
+    /// Run with: cargo test --release -- --ignored bench_libdeflate_vs_zlib_ng_l1 --nocapture
+    #[ignore]
+    #[test]
+    fn bench_libdeflate_vs_zlib_ng_l1() {
+        use std::fs;
+        use std::time::Instant;
+
+        // Load test data (silesia.tar = 202MB uncompressed, realistic workload)
+        let test_file = "benchmark_data/silesia.tar";
+        if !std::path::Path::new(test_file).exists() {
+            eprintln!("SKIP: benchmark_data/silesia.tar not found");
+            return;
+        }
+
+        let input = fs::read(test_file).expect("failed to read test file");
+        let input_size_mb = input.len() as f64 / 1024.0 / 1024.0;
+        println!("\nInput size: {:.2} MB", input_size_mb);
+        println!("Running 3 iterations of each compressor...\n");
+
+        // Benchmark libdeflate L1
+        let mut libdeflate_times = Vec::new();
+        let mut libdeflate_sizes = Vec::new();
+
+        println!("=== libdeflate L1 ===");
+        for run in 1..=3 {
+            let output_size = LIBDEFLATE_COMPRESSOR.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                let level = 1i32;
+                let compressor = match cache.as_mut() {
+                    Some((cached_level, comp)) if *cached_level == level => comp,
+                    _ => {
+                        use libdeflater::CompressionLvl;
+                        let lvl = CompressionLvl::new(level).unwrap_or_default();
+                        *cache = Some((level, libdeflater::Compressor::new(lvl)));
+                        &mut cache.as_mut().unwrap().1
+                    }
+                };
+
+                let max_len = compressor.deflate_compress_bound(input.len());
+                let mut output = vec![0u8; max_len];
+
+                let start = Instant::now();
+                let actual_len = compressor
+                    .deflate_compress(&input, &mut output)
+                    .expect("libdeflate compression failed");
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+                libdeflate_times.push(elapsed_ms);
+                actual_len
+            });
+            libdeflate_sizes.push(output_size);
+
+            let throughput = input_size_mb / (libdeflate_times.last().unwrap() / 1000.0);
+            let ratio = (output_size as f64 / input.len() as f64) * 100.0;
+            println!(
+                "  Run {}: {:.2} MB/s (ratio: {:.2}%, compressed: {:.2} MB)",
+                run,
+                throughput,
+                ratio,
+                output_size as f64 / 1024.0 / 1024.0
+            );
+        }
+
+        let libdeflate_avg_ms = libdeflate_times.iter().sum::<f64>() / 3.0;
+        let libdeflate_throughput = input_size_mb / (libdeflate_avg_ms / 1000.0);
+
+        // Benchmark zlib-ng L1 (via flate2)
+        let mut zlib_ng_times = Vec::new();
+        let mut zlib_ng_sizes = Vec::new();
+
+        println!("\n=== zlib-ng L1 (flate2) ===");
+        for run in 1..=3 {
+            use flate2::write::DeflateEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+
+            let mut output = Vec::new();
+            let mut encoder = DeflateEncoder::new(&mut output, Compression::new(1));
+
+            let start = Instant::now();
+            encoder.write_all(&input).expect("zlib-ng write failed");
+            encoder.finish().expect("zlib-ng finish failed");
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            zlib_ng_times.push(elapsed_ms);
+            zlib_ng_sizes.push(output.len());
+
+            let throughput = input_size_mb / (zlib_ng_times.last().unwrap() / 1000.0);
+            let ratio = (output.len() as f64 / input.len() as f64) * 100.0;
+            println!(
+                "  Run {}: {:.2} MB/s (ratio: {:.2}%, compressed: {:.2} MB)",
+                run,
+                throughput,
+                ratio,
+                output.len() as f64 / 1024.0 / 1024.0
+            );
+        }
+
+        let zlib_ng_avg_ms = zlib_ng_times.iter().sum::<f64>() / 3.0;
+        let zlib_ng_throughput = input_size_mb / (zlib_ng_avg_ms / 1000.0);
+
+        // Report results
+        println!("\n=== RESULTS ===");
+        println!(
+            "libdeflate L1: {:.2} MB/s (avg compression: {:.2}%)",
+            libdeflate_throughput,
+            (libdeflate_sizes[0] as f64 / input.len() as f64) * 100.0
+        );
+        println!(
+            "zlib-ng L1:    {:.2} MB/s (avg compression: {:.2}%)",
+            zlib_ng_throughput,
+            (zlib_ng_sizes[0] as f64 / input.len() as f64) * 100.0
+        );
+
+        let diff_percent =
+            ((zlib_ng_throughput - libdeflate_throughput) / libdeflate_throughput) * 100.0;
+        println!("Difference:    {:.2}%", diff_percent);
+
+        if diff_percent > 2.0 {
+            println!(
+                "\nRESULT: zlib-ng L1 is FASTER by {:.2}%. But compression ratio is worse.",
+                diff_percent
+            );
+        } else if diff_percent < -2.0 {
+            println!(
+                "\nRESULT: libdeflate L1 is FASTER by {:.2}%. Keep libdeflate.",
+                -diff_percent
+            );
+        } else {
+            println!("\nRESULT: Performance within noise (±2%). Keep current libdeflate.");
+        }
+    }
 }

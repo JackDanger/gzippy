@@ -125,8 +125,8 @@ ship: $(GZIPPY_BIN)
 	@echo "── Step 2/4: cargo clippy ──"
 	@cargo clippy --all-targets -- -D warnings || (echo "CLIPPY FAILED — aborting ship" && exit 1)
 	@echo ""
-	@echo "── Step 3/4: rebuild gzippy-dev ──"
-	@cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target 2>&1 | grep -E "Compiling|Finished|error" || true
+	@echo "── Step 3/4: rebuild gzippy-dev on homelab ──"
+	@ssh -J neurotic root@10.30.0.199 'cd gzippy && git pull --ff-only && cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target 2>&1 | grep -E "Compiling|Finished|error" || true'
 	@echo ""
 	@echo "── Step 4/4: neurotic homelab benchmarks ──"
 	@echo "Connecting to neurotic (root@10.30.0.199)..."
