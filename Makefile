@@ -126,18 +126,14 @@ ship: $(GZIPPY_BIN)
 	@cargo clippy --all-targets -- -D warnings || (echo "CLIPPY FAILED — aborting ship" && exit 1)
 	@echo ""
 	@echo "── Step 3/4: rebuild gzippy-dev on homelab ──"
-	@ssh -J neurotic root@10.30.0.199 'cd gzippy && git pull --ff-only && cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target 2>&1 | grep -E "Compiling|Finished|error" || true'
+	@ssh -J neurotic root@10.30.0.199 'cd gzippy && git fetch origin main && git checkout main && git reset --hard origin/main && cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target 2>&1 | grep -E "Compiling|Finished|error" || true'
 	@echo ""
 	@echo "── Step 4/4: neurotic homelab benchmarks ──"
 	@echo "Connecting to neurotic (root@10.30.0.199)..."
-	ssh -J neurotic root@10.30.0.199 'cd gzippy && ./target/release/gzippy-dev cloud bench'
+	ssh -J neurotic root@10.30.0.199 'cd gzippy && ./target/release/gzippy-dev bench'
 	@echo ""
-	@echo "══════════════════════════════════════════════════════"
-	@echo "  Scorecard:"
-	@echo "══════════════════════════════════════════════════════"
-	ssh -J neurotic root@10.30.0.199 'cd gzippy && ./target/release/gzippy-dev score'
 	@echo ""
-	@echo "Done. Run 'ssh -J neurotic root@10.30.0.199 gzippy/target/release/gzippy-dev losses' for gap analysis."
+	@echo "Done. Run 'ssh -J neurotic root@10.30.0.199 \"cd gzippy && ./target/release/gzippy-dev bench\"' to re-run benchmarks."
 
 # =============================================================================
 # AWS credentials for cloud fleet benchmarks (optional — cloud.rs auto-uses
