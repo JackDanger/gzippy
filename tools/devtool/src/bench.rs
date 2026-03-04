@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-const DEFAULT_MIN_TRIALS: u32 = 10;
-const DEFAULT_MAX_TRIALS: u32 = 40;
-const DEFAULT_TARGET_CV: f64 = 0.03;
+const DEFAULT_MIN_TRIALS: u32 = 30;
+const DEFAULT_MAX_TRIALS: u32 = 300;
+const DEFAULT_TARGET_CV: f64 = 0.01;
 
 pub struct BenchArgs {
     pub dataset: Option<String>,
@@ -98,14 +98,33 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
         eprintln!("Platform:    {platform}");
         eprintln!("CPUs:        {max_threads}");
         eprintln!("Data dir:    {}", data_dir.display());
-        eprintln!("Trials:      {}-{}, CV<{:.1}%", args.min_trials, args.max_trials, args.target_cv * 100.0);
-        eprintln!("Tools:       {}", tools.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", "));
-        eprintln!("Datasets:    {}", datasets.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", "));
+        eprintln!(
+            "Trials:      {}-{}, CV<{:.1}%",
+            args.min_trials,
+            args.max_trials,
+            args.target_cv * 100.0
+        );
+        eprintln!(
+            "Tools:       {}",
+            tools
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        eprintln!(
+            "Datasets:    {}",
+            datasets
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         eprintln!();
     }
 
     let mut results: Vec<ToolResult> = Vec::new();
-    let tmp_dir = std::env::temp_dir().join("gzippy-bench");
+    let tmp_dir = bench_tmp_dir();
     let _ = std::fs::create_dir_all(&tmp_dir);
     let output_file = tmp_dir.join("bench-output.bin");
 
@@ -114,7 +133,9 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
         for ds in &datasets {
             for (archive_name, compressed_path) in &ds.archives {
                 if let Some(ref af) = args.archive {
-                    if archive_name != af { continue; }
+                    if archive_name != af {
+                        continue;
+                    }
                 }
                 for &(threads, threads_label) in &thread_configs {
                     if !args.json {
@@ -128,10 +149,16 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
                         }
 
                         let result = benchmark_one(
-                            tool_name, tool_path, compressed_path,
-                            &ds.raw_path, ds.original_size,
-                            threads, &output_file,
-                            args.min_trials, args.max_trials, args.target_cv,
+                            tool_name,
+                            tool_path,
+                            compressed_path,
+                            &ds.raw_path,
+                            ds.original_size,
+                            threads,
+                            &output_file,
+                            args.min_trials,
+                            args.max_trials,
+                            args.target_cv,
                         );
 
                         let tr = match result {
@@ -145,7 +172,9 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
                                     archive: archive_name.clone(),
                                     threads: threads_label.to_string(),
                                     tool: tool_name.clone(),
-                                    speed_mbps: speed, cv, trials,
+                                    speed_mbps: speed,
+                                    cv,
+                                    trials,
                                     status: "pass".into(),
                                     error: None,
                                     direction: "decompress".into(),
@@ -161,7 +190,9 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
                                     archive: archive_name.clone(),
                                     threads: threads_label.to_string(),
                                     tool: tool_name.clone(),
-                                    speed_mbps: 0.0, cv: 0.0, trials: 0,
+                                    speed_mbps: 0.0,
+                                    cv: 0.0,
+                                    trials: 0,
                                     status: "fail".into(),
                                     error: Some(e),
                                     direction: "decompress".into(),
@@ -204,9 +235,16 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
                         }
 
                         let result = benchmark_compress(
-                            tool_name, tool_path, &ds.raw_path,
-                            ds.original_size, level, threads, &output_file,
-                            args.min_trials, args.max_trials, args.target_cv,
+                            tool_name,
+                            tool_path,
+                            &ds.raw_path,
+                            ds.original_size,
+                            level,
+                            threads,
+                            &output_file,
+                            args.min_trials,
+                            args.max_trials,
+                            args.target_cv,
                         );
 
                         let tr = match result {
@@ -220,7 +258,9 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
                                     archive: format!("L{level}"),
                                     threads: threads_label.to_string(),
                                     tool: tool_name.clone(),
-                                    speed_mbps: speed, cv, trials,
+                                    speed_mbps: speed,
+                                    cv,
+                                    trials,
                                     status: "pass".into(),
                                     error: None,
                                     direction: "compress".into(),
@@ -236,7 +276,9 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
                                     archive: format!("L{level}"),
                                     threads: threads_label.to_string(),
                                     tool: tool_name.clone(),
-                                    speed_mbps: 0.0, cv: 0.0, trials: 0,
+                                    speed_mbps: 0.0,
+                                    cv: 0.0,
+                                    trials: 0,
                                     status: "fail".into(),
                                     error: Some(e),
                                     direction: "compress".into(),
@@ -292,11 +334,16 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
         None => vec![(1, "T1")],
     };
 
-    eprintln!("[{platform}] bench: {} datasets, {} tools, trials {}-{}",
-        datasets.len(), tools.len(), args.min_trials, args.max_trials);
+    eprintln!(
+        "[{platform}] bench: {} datasets, {} tools, trials {}-{}",
+        datasets.len(),
+        tools.len(),
+        args.min_trials,
+        args.max_trials
+    );
 
     let mut results: Vec<ToolResult> = Vec::new();
-    let tmp_dir = std::env::temp_dir().join("gzippy-bench");
+    let tmp_dir = bench_tmp_dir();
     let _ = std::fs::create_dir_all(&tmp_dir);
     let output_file = tmp_dir.join("bench-output.bin");
 
@@ -305,10 +352,15 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
         for ds in &datasets {
             for (archive_name, compressed_path) in &ds.archives {
                 if let Some(ref af) = args.archive {
-                    if archive_name != af { continue; }
+                    if archive_name != af {
+                        continue;
+                    }
                 }
                 for &(threads, threads_label) in &thread_configs {
-                    eprint!("  [{platform}] {}-{archive_name} {threads_label}  ", ds.name);
+                    eprint!(
+                        "  [{platform}] {}-{archive_name} {threads_label}  ",
+                        ds.name
+                    );
                     let _ = std::io::stderr().flush();
 
                     for (tool_name, tool_path) in &tools {
@@ -317,10 +369,16 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
                         }
 
                         let result = benchmark_one(
-                            tool_name, tool_path, compressed_path,
-                            &ds.raw_path, ds.original_size,
-                            threads, &output_file,
-                            args.min_trials, args.max_trials, args.target_cv,
+                            tool_name,
+                            tool_path,
+                            compressed_path,
+                            &ds.raw_path,
+                            ds.original_size,
+                            threads,
+                            &output_file,
+                            args.min_trials,
+                            args.max_trials,
+                            args.target_cv,
                         );
 
                         let tr = match result {
@@ -332,7 +390,9 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
                                     archive: archive_name.clone(),
                                     threads: threads_label.to_string(),
                                     tool: tool_name.clone(),
-                                    speed_mbps: speed, cv, trials,
+                                    speed_mbps: speed,
+                                    cv,
+                                    trials,
                                     status: "pass".into(),
                                     error: None,
                                     direction: "decompress".into(),
@@ -346,7 +406,9 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
                                     archive: archive_name.clone(),
                                     threads: threads_label.to_string(),
                                     tool: tool_name.clone(),
-                                    speed_mbps: 0.0, cv: 0.0, trials: 0,
+                                    speed_mbps: 0.0,
+                                    cv: 0.0,
+                                    trials: 0,
                                     status: "fail".into(),
                                     error: Some(e),
                                     direction: "decompress".into(),
@@ -381,9 +443,16 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
                         }
 
                         let result = benchmark_compress(
-                            tool_name, tool_path, &ds.raw_path,
-                            ds.original_size, level, threads, &output_file,
-                            args.min_trials, args.max_trials, args.target_cv,
+                            tool_name,
+                            tool_path,
+                            &ds.raw_path,
+                            ds.original_size,
+                            level,
+                            threads,
+                            &output_file,
+                            args.min_trials,
+                            args.max_trials,
+                            args.target_cv,
                         );
 
                         let tr = match result {
@@ -395,7 +464,9 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
                                     archive: format!("L{level}"),
                                     threads: threads_label.to_string(),
                                     tool: tool_name.clone(),
-                                    speed_mbps: speed, cv, trials,
+                                    speed_mbps: speed,
+                                    cv,
+                                    trials,
                                     status: "pass".into(),
                                     error: None,
                                     direction: "compress".into(),
@@ -409,7 +480,9 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
                                     archive: format!("L{level}"),
                                     threads: threads_label.to_string(),
                                     tool: tool_name.clone(),
-                                    speed_mbps: 0.0, cv: 0.0, trials: 0,
+                                    speed_mbps: 0.0,
+                                    cv: 0.0,
+                                    trials: 0,
                                     status: "fail".into(),
                                     error: Some(e),
                                     direction: "compress".into(),
@@ -432,10 +505,16 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
 
 #[allow(clippy::too_many_arguments)]
 fn benchmark_one(
-    tool: &str, binary: &str,
-    compressed: &Path, original: &Path, original_size: u64,
-    threads: usize, output_file: &Path,
-    min_trials: u32, max_trials: u32, target_cv: f64,
+    tool: &str,
+    binary: &str,
+    compressed: &Path,
+    original: &Path,
+    original_size: u64,
+    threads: usize,
+    output_file: &Path,
+    min_trials: u32,
+    max_trials: u32,
+    target_cv: f64,
 ) -> Result<(f64, f64, u32), String> {
     let cmd_args = tool_decompress_args(tool, threads);
 
@@ -445,7 +524,11 @@ fn benchmark_one(
         .map_err(|e| format!("output file: {e}"))?
         .len();
     // Use actual decompressed size if original file unavailable
-    let ref_size = if original.exists() { original_size } else { out_size };
+    let ref_size = if original.exists() {
+        original_size
+    } else {
+        out_size
+    };
 
     if original.exists() && out_size != original_size {
         return Err(format!(
@@ -472,11 +555,15 @@ fn benchmark_one(
     Ok((speed, cv, times.len() as u32))
 }
 
-fn run_decompress(binary: &str, args: &[String], input: &Path, output: &Path) -> Result<(), String> {
-    let fin = std::fs::File::open(input)
-        .map_err(|e| format!("open {}: {e}", input.display()))?;
-    let fout = std::fs::File::create(output)
-        .map_err(|e| format!("create {}: {e}", output.display()))?;
+fn run_decompress(
+    binary: &str,
+    args: &[String],
+    input: &Path,
+    output: &Path,
+) -> Result<(), String> {
+    let fin = std::fs::File::open(input).map_err(|e| format!("open {}: {e}", input.display()))?;
+    let fout =
+        std::fs::File::create(output).map_err(|e| format!("create {}: {e}", output.display()))?;
 
     let status = Command::new(binary)
         .args(args)
@@ -492,11 +579,15 @@ fn run_decompress(binary: &str, args: &[String], input: &Path, output: &Path) ->
     Ok(())
 }
 
-fn time_decompress(binary: &str, args: &[String], input: &Path, output: &Path) -> Result<f64, String> {
-    let fin = std::fs::File::open(input)
-        .map_err(|e| format!("open {}: {e}", input.display()))?;
-    let fout = std::fs::File::create(output)
-        .map_err(|e| format!("create {}: {e}", output.display()))?;
+fn time_decompress(
+    binary: &str,
+    args: &[String],
+    input: &Path,
+    output: &Path,
+) -> Result<f64, String> {
+    let fin = std::fs::File::open(input).map_err(|e| format!("open {}: {e}", input.display()))?;
+    let fout =
+        std::fs::File::create(output).map_err(|e| format!("create {}: {e}", output.display()))?;
 
     let start = Instant::now();
     let status = Command::new(binary)
@@ -517,10 +608,16 @@ fn time_decompress(binary: &str, args: &[String], input: &Path, output: &Path) -
 
 #[allow(clippy::too_many_arguments)]
 fn benchmark_compress(
-    tool: &str, binary: &str,
-    raw_input: &Path, original_size: u64,
-    level: u32, threads: usize, output_file: &Path,
-    min_trials: u32, max_trials: u32, target_cv: f64,
+    tool: &str,
+    binary: &str,
+    raw_input: &Path,
+    original_size: u64,
+    level: u32,
+    threads: usize,
+    output_file: &Path,
+    min_trials: u32,
+    max_trials: u32,
+    target_cv: f64,
 ) -> Result<(f64, f64, u32, f64), String> {
     let cmd_args = tool_compress_args(tool, level, threads);
 
@@ -550,10 +647,9 @@ fn benchmark_compress(
 }
 
 fn run_compress(binary: &str, args: &[String], input: &Path, output: &Path) -> Result<(), String> {
-    let fin = std::fs::File::open(input)
-        .map_err(|e| format!("open {}: {e}", input.display()))?;
-    let fout = std::fs::File::create(output)
-        .map_err(|e| format!("create {}: {e}", output.display()))?;
+    let fin = std::fs::File::open(input).map_err(|e| format!("open {}: {e}", input.display()))?;
+    let fout =
+        std::fs::File::create(output).map_err(|e| format!("create {}: {e}", output.display()))?;
 
     let status = Command::new(binary)
         .args(args)
@@ -569,11 +665,15 @@ fn run_compress(binary: &str, args: &[String], input: &Path, output: &Path) -> R
     Ok(())
 }
 
-fn time_compress(binary: &str, args: &[String], input: &Path, output: &Path) -> Result<f64, String> {
-    let fin = std::fs::File::open(input)
-        .map_err(|e| format!("open {}: {e}", input.display()))?;
-    let fout = std::fs::File::create(output)
-        .map_err(|e| format!("create {}: {e}", output.display()))?;
+fn time_compress(
+    binary: &str,
+    args: &[String],
+    input: &Path,
+    output: &Path,
+) -> Result<f64, String> {
+    let fin = std::fs::File::open(input).map_err(|e| format!("open {}: {e}", input.display()))?;
+    let fout =
+        std::fs::File::create(output).map_err(|e| format!("create {}: {e}", output.display()))?;
 
     let start = Instant::now();
     let status = Command::new(binary)
@@ -696,14 +796,18 @@ fn discover_datasets(data_dir: &Path, filter: Option<&str>) -> Result<Vec<Datase
     let mut datasets = Vec::new();
     for (name, raw_name) in &known {
         if let Some(f) = filter {
-            if !name.contains(f) { continue; }
+            if !name.contains(f) {
+                continue;
+            }
         }
 
         // Look for raw file in data_dir or /dev/shm
         let raw_path = [
             data_dir.join(raw_name),
             PathBuf::from(format!("/dev/shm/{raw_name}")),
-        ].into_iter().find(|p| p.exists());
+        ]
+        .into_iter()
+        .find(|p| p.exists());
 
         let raw_path = match raw_path {
             Some(p) => p,
@@ -720,7 +824,9 @@ fn discover_datasets(data_dir: &Path, filter: Option<&str>) -> Result<Vec<Datase
             let compressed_path = [
                 PathBuf::from(format!("/dev/shm/{compressed_name}")),
                 data_dir.join(&compressed_name),
-            ].into_iter().find(|p| p.exists());
+            ]
+            .into_iter()
+            .find(|p| p.exists());
 
             if let Some(p) = compressed_path {
                 archives.push((atype.to_string(), p));
@@ -734,13 +840,19 @@ fn discover_datasets(data_dir: &Path, filter: Option<&str>) -> Result<Vec<Datase
                     let p = entry.path();
                     let fname = p.file_name().and_then(|f| f.to_str()).unwrap_or("");
                     if fname.starts_with(name) && fname.ends_with(".gz") {
-                        let atype = fname.trim_start_matches(name)
+                        let atype = fname
+                            .trim_start_matches(name)
                             .trim_start_matches('-')
                             .trim_end_matches(".gz")
                             .trim_end_matches(".tar")
                             .trim_end_matches(".txt")
                             .trim_end_matches(".archive");
                         let label = if atype.is_empty() { "gzip" } else { atype };
+                        // Only accept known archive types to avoid accidentally
+                        // picking up unrelated files (e.g. silesia-large.gz).
+                        if !["gzip", "bgzf", "pigz"].contains(&label) {
+                            continue;
+                        }
                         archives.push((label.to_string(), p));
                     }
                 }
@@ -748,7 +860,12 @@ fn discover_datasets(data_dir: &Path, filter: Option<&str>) -> Result<Vec<Datase
         }
 
         if !archives.is_empty() {
-            datasets.push(Dataset { name: name.to_string(), raw_path, original_size, archives });
+            datasets.push(Dataset {
+                name: name.to_string(),
+                raw_path,
+                original_size,
+                archives,
+            });
         }
     }
 
@@ -762,7 +879,13 @@ fn discover_tools(bin_dir: &Option<PathBuf>) -> Vec<(String, String)> {
         ("gzippy", &["target/release/gzippy", "bin/gzippy"][..]),
         ("unpigz", &["pigz/unpigz", "bin/unpigz"]),
         ("igzip", &["isa-l/build/igzip", "bin/igzip"]),
-        ("rapidgzip", &["rapidgzip/librapidarchive/build/src/tools/rapidgzip", "bin/rapidgzip"]),
+        (
+            "rapidgzip",
+            &[
+                "rapidgzip/librapidarchive/build/src/tools/rapidgzip",
+                "bin/rapidgzip",
+            ],
+        ),
         ("gzip", &["/usr/bin/gzip"]),
     ];
 
@@ -786,7 +909,9 @@ fn discover_tools(bin_dir: &Option<PathBuf>) -> Vec<(String, String)> {
                 break;
             }
         }
-        if found { continue; }
+        if found {
+            continue;
+        }
 
         // Check PATH
         if let Ok(output) = Command::new("which").arg(name).output() {
@@ -816,10 +941,7 @@ pub fn find_repo_root() -> Result<PathBuf, String> {
 }
 
 fn find_data_dir(repo_root: &Path) -> Result<PathBuf, String> {
-    let candidates = [
-        repo_root.join("benchmark_data"),
-        PathBuf::from("/dev/shm"),
-    ];
+    let candidates = [repo_root.join("benchmark_data"), PathBuf::from("/dev/shm")];
     for c in &candidates {
         if c.is_dir() {
             // Verify it has at least one relevant file
@@ -837,7 +959,21 @@ fn find_data_dir(repo_root: &Path) -> Result<PathBuf, String> {
 
 fn find_bin_dir(repo_root: &Path) -> Option<PathBuf> {
     let p = repo_root.join("bin");
-    if p.is_dir() { Some(p) } else { None }
+    if p.is_dir() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// Use /dev/shm when available (RAM-backed, no disk I/O noise).
+fn bench_tmp_dir() -> PathBuf {
+    let shm = PathBuf::from("/dev/shm/gzippy-bench");
+    if PathBuf::from("/dev/shm").is_dir() {
+        shm
+    } else {
+        std::env::temp_dir().join("gzippy-bench")
+    }
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -872,23 +1008,26 @@ fn num_cpus() -> usize {
 // ─── Output ───────────────────────────────────────────────────────────────────
 
 fn output_json(platform: &str, results: &[ToolResult]) {
-    let items: Vec<serde_json::Value> = results.iter().map(|r| {
-        let mut obj = serde_json::json!({
-            "dataset": r.dataset,
-            "archive": r.archive,
-            "threads": r.threads,
-            "tool": r.tool,
-            "speed_mbps": r.speed_mbps,
-            "cv": r.cv,
-            "trials": r.trials,
-            "status": r.status,
-            "direction": r.direction,
-        });
-        if let Some(e) = &r.error {
-            obj["error"] = serde_json::json!(e);
-        }
-        obj
-    }).collect();
+    let items: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            let mut obj = serde_json::json!({
+                "dataset": r.dataset,
+                "archive": r.archive,
+                "threads": r.threads,
+                "tool": r.tool,
+                "speed_mbps": r.speed_mbps,
+                "cv": r.cv,
+                "trials": r.trials,
+                "status": r.status,
+                "direction": r.direction,
+            });
+            if let Some(e) = &r.error {
+                obj["error"] = serde_json::json!(e);
+            }
+            obj
+        })
+        .collect();
 
     let output = serde_json::json!({
         "platform": platform,
@@ -899,8 +1038,14 @@ fn output_json(platform: &str, results: &[ToolResult]) {
 }
 
 fn output_human(results: &[ToolResult]) {
-    let decomp: Vec<&ToolResult> = results.iter().filter(|r| r.direction == "decompress").collect();
-    let comp: Vec<&ToolResult> = results.iter().filter(|r| r.direction == "compress").collect();
+    let decomp: Vec<&ToolResult> = results
+        .iter()
+        .filter(|r| r.direction == "decompress")
+        .collect();
+    let comp: Vec<&ToolResult> = results
+        .iter()
+        .filter(|r| r.direction == "compress")
+        .collect();
 
     let mut total_wins = 0u32;
     let mut total_losses = 0u32;
@@ -908,27 +1053,41 @@ fn output_human(results: &[ToolResult]) {
     if !decomp.is_empty() {
         eprintln!("\n══ DECOMPRESSION ══════════════════════════════════════════════════════════");
 
-        let mut scenarios: Vec<(String, String, String)> = decomp.iter()
+        let mut scenarios: Vec<(String, String, String)> = decomp
+            .iter()
             .map(|r| (r.dataset.clone(), r.archive.clone(), r.threads.clone()))
             .collect();
         scenarios.sort();
         scenarios.dedup();
 
-        eprintln!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>6} Verdict",
-            "Scenario", "gzippy", "unpigz", "igzip", "rapidgzip", "gzip", "CV%");
+        eprintln!(
+            "  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>6} Verdict",
+            "Scenario", "gzippy", "unpigz", "igzip", "rapidgzip", "gzip", "CV%"
+        );
         eprintln!("  {}", "─".repeat(100));
 
         for (ds, arch, thr) in &scenarios {
-            let scenario: Vec<&&ToolResult> = decomp.iter()
-                .filter(|r| r.dataset == *ds && r.archive == *arch && r.threads == *thr && r.status == "pass")
+            let scenario: Vec<&&ToolResult> = decomp
+                .iter()
+                .filter(|r| {
+                    r.dataset == *ds
+                        && r.archive == *arch
+                        && r.threads == *thr
+                        && r.status == "pass"
+                })
                 .collect();
 
             let get = |tool: &str| scenario.iter().find(|r| r.tool == tool).copied().copied();
-            let fmt = |tool: &str| get(tool).map(|r| format!("{:.1}", r.speed_mbps)).unwrap_or_else(|| "—".into());
+            let fmt = |tool: &str| {
+                get(tool)
+                    .map(|r| format!("{:.1}", r.speed_mbps))
+                    .unwrap_or_else(|| "—".into())
+            };
 
             let gzippy = get("gzippy");
             let gzippy_cv = gzippy.map(|r| r.cv).unwrap_or(0.0);
-            let best_comp = ["unpigz", "igzip", "rapidgzip", "gzip"].iter()
+            let best_comp = ["unpigz", "igzip", "rapidgzip", "gzip"]
+                .iter()
                 .filter_map(|t| get(t))
                 .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap());
 
@@ -946,36 +1105,58 @@ fn output_human(results: &[ToolResult]) {
             };
 
             let name = format!("{ds}-{arch} {thr}");
-            eprintln!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>5.1} {}",
-                name, fmt("gzippy"), fmt("unpigz"), fmt("igzip"), fmt("rapidgzip"), fmt("gzip"),
-                gzippy_cv * 100.0, verdict);
+            eprintln!(
+                "  {:<25} {:>10} {:>10} {:>10} {:>10} {:>10} {:>5.1} {}",
+                name,
+                fmt("gzippy"),
+                fmt("unpigz"),
+                fmt("igzip"),
+                fmt("rapidgzip"),
+                fmt("gzip"),
+                gzippy_cv * 100.0,
+                verdict
+            );
         }
     }
 
     if !comp.is_empty() {
         eprintln!("\n══ COMPRESSION ═══════════════════════════════════════════════════════════");
 
-        let mut scenarios: Vec<(String, String, String)> = comp.iter()
+        let mut scenarios: Vec<(String, String, String)> = comp
+            .iter()
             .map(|r| (r.dataset.clone(), r.archive.clone(), r.threads.clone()))
             .collect();
         scenarios.sort();
         scenarios.dedup();
 
-        eprintln!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>6} Verdict",
-            "Scenario", "gzippy", "pigz", "igzip", "gzip", "CV%");
+        eprintln!(
+            "  {:<25} {:>10} {:>10} {:>10} {:>10} {:>6} Verdict",
+            "Scenario", "gzippy", "pigz", "igzip", "gzip", "CV%"
+        );
         eprintln!("  {}", "─".repeat(85));
 
         for (ds, level, thr) in &scenarios {
-            let scenario: Vec<&&ToolResult> = comp.iter()
-                .filter(|r| r.dataset == *ds && r.archive == *level && r.threads == *thr && r.status == "pass")
+            let scenario: Vec<&&ToolResult> = comp
+                .iter()
+                .filter(|r| {
+                    r.dataset == *ds
+                        && r.archive == *level
+                        && r.threads == *thr
+                        && r.status == "pass"
+                })
                 .collect();
 
             let get = |tool: &str| scenario.iter().find(|r| r.tool == tool).copied().copied();
-            let fmt = |tool: &str| get(tool).map(|r| format!("{:.1}", r.speed_mbps)).unwrap_or_else(|| "—".into());
+            let fmt = |tool: &str| {
+                get(tool)
+                    .map(|r| format!("{:.1}", r.speed_mbps))
+                    .unwrap_or_else(|| "—".into())
+            };
 
             let gzippy = get("gzippy");
             let gzippy_cv = gzippy.map(|r| r.cv).unwrap_or(0.0);
-            let best = ["pigz", "igzip", "gzip"].iter()
+            let best = ["pigz", "igzip", "gzip"]
+                .iter()
                 .filter_map(|t| get(t))
                 .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap());
 
@@ -993,9 +1174,16 @@ fn output_human(results: &[ToolResult]) {
             };
 
             let name = format!("{ds} {level} {thr}");
-            eprintln!("  {:<25} {:>10} {:>10} {:>10} {:>10} {:>5.1} {}",
-                name, fmt("gzippy"), fmt("pigz"), fmt("igzip"), fmt("gzip"),
-                gzippy_cv * 100.0, verdict);
+            eprintln!(
+                "  {:<25} {:>10} {:>10} {:>10} {:>10} {:>5.1} {}",
+                name,
+                fmt("gzippy"),
+                fmt("pigz"),
+                fmt("igzip"),
+                fmt("gzip"),
+                gzippy_cv * 100.0,
+                verdict
+            );
         }
     }
 
@@ -1005,25 +1193,41 @@ fn output_human(results: &[ToolResult]) {
     if total_losses > 0 {
         eprintln!("\n  Losses:");
         for r_set in [&decomp, &comp] {
-            let mut scenarios: Vec<(String, String, String)> = r_set.iter()
+            let mut scenarios: Vec<(String, String, String)> = r_set
+                .iter()
                 .map(|r| (r.dataset.clone(), r.archive.clone(), r.threads.clone()))
                 .collect();
             scenarios.sort();
             scenarios.dedup();
 
             for (ds, arch, thr) in &scenarios {
-                let scenario: Vec<&&ToolResult> = r_set.iter()
-                    .filter(|r| r.dataset == *ds && r.archive == *arch && r.threads == *thr && r.status == "pass")
+                let scenario: Vec<&&ToolResult> = r_set
+                    .iter()
+                    .filter(|r| {
+                        r.dataset == *ds
+                            && r.archive == *arch
+                            && r.threads == *thr
+                            && r.status == "pass"
+                    })
                     .collect();
-                let gzippy = scenario.iter().find(|r| r.tool == "gzippy").copied().copied();
-                let best = scenario.iter().filter(|r| r.tool != "gzippy")
+                let gzippy = scenario
+                    .iter()
+                    .find(|r| r.tool == "gzippy")
+                    .copied()
+                    .copied();
+                let best = scenario
+                    .iter()
+                    .filter(|r| r.tool != "gzippy")
                     .max_by(|a, b| a.speed_mbps.partial_cmp(&b.speed_mbps).unwrap())
-                    .copied().copied();
+                    .copied()
+                    .copied();
                 if let (Some(g), Some(b)) = (gzippy, best) {
                     let gap = ((g.speed_mbps / b.speed_mbps) - 1.0) * 100.0;
                     if gap < 0.0 {
-                        eprintln!("    {} {ds}-{arch} {thr}: gzippy {:.1} vs {} {:.1} ({:+.1}%)",
-                            g.direction, g.speed_mbps, b.tool, b.speed_mbps, gap);
+                        eprintln!(
+                            "    {} {ds}-{arch} {thr}: gzippy {:.1} vs {} {:.1} ({:+.1}%)",
+                            g.direction, g.speed_mbps, b.tool, b.speed_mbps, gap
+                        );
                     }
                 }
             }
@@ -1034,7 +1238,12 @@ fn output_human(results: &[ToolResult]) {
 
 // ─── A/B comparison (kept as-is) ──────────────────────────────────────────────
 
-pub fn run_ab(ref_a: &str, ref_b: &str, dataset: Option<&str>, threads: Option<&str>) -> Result<(), String> {
+pub fn run_ab(
+    ref_a: &str,
+    ref_b: &str,
+    dataset: Option<&str>,
+    threads: Option<&str>,
+) -> Result<(), String> {
     let repo_root = find_repo_root()?;
     let data_dir = find_data_dir(&repo_root)?;
     let datasets_raw = discover_datasets(&data_dir, dataset)?;
@@ -1063,13 +1272,16 @@ pub fn run_ab(ref_a: &str, ref_b: &str, dataset: Option<&str>, threads: Option<&
     let result = run_ab_inner(ref_a, ref_b, &bench_files, thread_count);
 
     let _ = git_run(&["checkout", current_branch.trim()]);
-    if is_dirty { let _ = git_run(&["stash", "pop"]); }
+    if is_dirty {
+        let _ = git_run(&["stash", "pop"]);
+    }
 
     result
 }
 
 fn run_ab_inner(
-    ref_a: &str, ref_b: &str,
+    ref_a: &str,
+    ref_b: &str,
     files: &[(String, PathBuf)],
     threads: usize,
 ) -> Result<(), String> {
@@ -1092,7 +1304,10 @@ fn run_ab_inner(
     let args_a = tool_decompress_args("gzippy", threads);
     let args_b = tool_decompress_args("gzippy", threads);
 
-    eprintln!("\n  {:<30} {:>10} {:>10} {:>9}", "Dataset", ref_a, ref_b, "Change");
+    eprintln!(
+        "\n  {:<30} {:>10} {:>10} {:>9}",
+        "Dataset", ref_a, ref_b, "Change"
+    );
     eprintln!("  {}", "─".repeat(65));
 
     for (name, path) in files {
@@ -1110,10 +1325,14 @@ fn run_ab_inner(
                 let size = std::fs::metadata(&out_file).map(|m| m.len()).unwrap_or(0) as f64;
                 speeds_b.push(size / t / 1_000_000.0);
             }
-            if speeds_a.len() >= DEFAULT_MIN_TRIALS as usize && speeds_b.len() >= DEFAULT_MIN_TRIALS as usize {
+            if speeds_a.len() >= DEFAULT_MIN_TRIALS as usize
+                && speeds_b.len() >= DEFAULT_MIN_TRIALS as usize
+            {
                 let (_, _, _, cv_a) = trimmed_stats(&speeds_a);
                 let (_, _, _, cv_b) = trimmed_stats(&speeds_b);
-                if cv_a < DEFAULT_TARGET_CV && cv_b < DEFAULT_TARGET_CV { break; }
+                if cv_a < DEFAULT_TARGET_CV && cv_b < DEFAULT_TARGET_CV {
+                    break;
+                }
             }
         }
 
@@ -1125,8 +1344,17 @@ fn run_ab_inner(
         let (_, mean_a, _, _) = trimmed_stats(&speeds_a);
         let (_, mean_b, _, _) = trimmed_stats(&speeds_b);
         let change = (mean_b / mean_a - 1.0) * 100.0;
-        let flag = if change > 3.0 { " FASTER" } else if change < -3.0 { " SLOWER" } else { "" };
-        eprintln!("  {:<30} {:>8.1}  {:>8.1}  {:>+7.1}%{}", name, mean_a, mean_b, change, flag);
+        let flag = if change > 3.0 {
+            " FASTER"
+        } else if change < -3.0 {
+            " SLOWER"
+        } else {
+            ""
+        };
+        eprintln!(
+            "  {:<30} {:>8.1}  {:>8.1}  {:>+7.1}%{}",
+            name, mean_a, mean_b, change, flag
+        );
     }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -1136,15 +1364,25 @@ fn run_ab_inner(
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 fn git_run(args: &[&str]) -> Result<(), String> {
-    let output = Command::new("git").args(args).output().map_err(|e| format!("git: {e}"))?;
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
     if !output.status.success() {
-        return Err(format!("git {}: {}", args[0], String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "git {}: {}",
+            args[0],
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
     Ok(())
 }
 
 fn git_output(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git").args(args).output().map_err(|e| format!("git: {e}"))?;
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
@@ -1154,10 +1392,15 @@ fn cargo_build_release() -> Result<(), String> {
         args.push("--features");
         args.push("isal-compression");
     }
-    let output = Command::new("cargo").args(&args).output()
+    let output = Command::new("cargo")
+        .args(&args)
+        .output()
         .map_err(|e| format!("cargo build: {e}"))?;
     if !output.status.success() {
-        return Err(format!("cargo build failed:\n{}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "cargo build failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
     Ok(())
 }

@@ -126,11 +126,26 @@ ship: $(GZIPPY_BIN)
 	@cargo clippy --all-targets -- -D warnings || (echo "CLIPPY FAILED — aborting ship" && exit 1)
 	@echo ""
 	@echo "── Step 3/4: rebuild gzippy-dev on homelab ──"
-	@ssh -J neurotic root@10.30.0.199 'cd gzippy && git fetch origin main && git checkout main && git reset --hard origin/main && cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target 2>&1 | grep -E "Compiling|Finished|error" || true'
+	@ssh -J neurotic root@10.30.0.199 'set -e; cd gzippy; \
+	  git fetch origin main; git checkout main; git reset --hard origin/main; \
+	  cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target \
+	    2>&1 | grep -E "Compiling|Finished|error" || true; \
+	  BD=benchmark_data; BIN=target/release/gzippy; \
+	  for DS in silesia software logs; do \
+	    case $$DS in \
+	      silesia)  RAW=$$BD/silesia.tar;; \
+	      software) RAW=$$BD/software.archive;; \
+	      logs)     RAW=$$BD/logs.txt;; \
+	    esac; \
+	    [ -f "$$BD/$$DS-gzip.gz" ] || { echo "Creating $$BD/$$DS-gzip.gz..."; gzip -1 -c "$$RAW" > "$$BD/$$DS-gzip.gz"; }; \
+	    [ -f "$$BD/$$DS-bgzf.gz" ] || { echo "Creating $$BD/$$DS-bgzf.gz..."; $$BIN -1 -c "$$RAW" > "$$BD/$$DS-bgzf.gz"; }; \
+	    [ -f "$$BD/$$DS-pigz.gz" ] || { echo "Creating $$BD/$$DS-pigz.gz..."; pigz/pigz -1 -c "$$RAW" > "$$BD/$$DS-pigz.gz"; }; \
+	  done; \
+	  echo "Archives: $$(ls $$BD/*-{gzip,bgzf,pigz}.gz 2>/dev/null | wc -l) files ready"'
 	@echo ""
 	@echo "── Step 4/4: neurotic homelab benchmarks ──"
 	@echo "Connecting to neurotic (root@10.30.0.199)..."
-	ssh -J neurotic root@10.30.0.199 'cd gzippy && ./target/release/gzippy-dev bench'
+	ssh -J neurotic root@10.30.0.199 'cd gzippy && TMPDIR=/dev/shm ./target/release/gzippy-dev bench'
 	@echo ""
 	@echo ""
 	@echo "Done. Run 'ssh -J neurotic root@10.30.0.199 \"cd gzippy && ./target/release/gzippy-dev bench\"' to re-run benchmarks."
