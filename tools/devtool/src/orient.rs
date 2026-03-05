@@ -26,13 +26,8 @@ fn print_git_summary() -> Result<(), String> {
     let branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
     let dirty = run_git(&["status", "--porcelain"])?;
     let dirty_count = dirty.lines().count();
-    let ahead_behind = run_git(&[
-        "rev-list",
-        "--left-right",
-        "--count",
-        "origin/main...HEAD",
-    ])
-    .unwrap_or_default();
+    let ahead_behind =
+        run_git(&["rev-list", "--left-right", "--count", "origin/main...HEAD"]).unwrap_or_default();
 
     println!("  Branch: {}", branch.trim());
     if dirty_count > 0 {
@@ -69,7 +64,17 @@ fn print_git_summary() -> Result<(), String> {
 
     // Open PRs
     println!("\n  Open PRs:");
-    let prs = run_cmd("gh", &["pr", "list", "--state", "open", "--json", "number,title,headBranch"])?;
+    let prs = run_cmd(
+        "gh",
+        &[
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--json",
+            "number,title,headBranch",
+        ],
+    )?;
     if let Ok(pr_list) = serde_json::from_str::<Vec<serde_json::Value>>(&prs) {
         if pr_list.is_empty() {
             println!("    (none)");
