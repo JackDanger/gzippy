@@ -967,12 +967,14 @@ fn find_bin_dir(repo_root: &Path) -> Option<PathBuf> {
 }
 
 /// Use /dev/shm when available (RAM-backed, no disk I/O noise).
+/// Include PID so concurrent bench instances don't collide.
 fn bench_tmp_dir() -> PathBuf {
-    let shm = PathBuf::from("/dev/shm/gzippy-bench");
+    let pid = std::process::id();
+    let name = format!("gzippy-bench-{pid}");
     if PathBuf::from("/dev/shm").is_dir() {
-        shm
+        PathBuf::from("/dev/shm").join(name)
     } else {
-        std::env::temp_dir().join("gzippy-bench")
+        std::env::temp_dir().join(name)
     }
 }
 
