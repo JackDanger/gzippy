@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::bench::{find_repo_root};
+use crate::bench::find_repo_root;
 
 pub struct DiagArgs {
     pub direction: Option<String>,
@@ -23,7 +23,10 @@ pub fn run(args: &DiagArgs) -> Result<(), String> {
     let platform = detect_platform();
 
     let mut diag = serde_json::Map::new();
-    diag.insert("platform".into(), serde_json::Value::String(platform.clone()));
+    diag.insert(
+        "platform".into(),
+        serde_json::Value::String(platform.clone()),
+    );
 
     // Platform info
     collect_platform_info(&mut diag);
@@ -40,7 +43,13 @@ pub fn run(args: &DiagArgs) -> Result<(), String> {
     // Compress diagnostics
     let do_compress = args.direction.as_deref() != Some("decompress");
     if do_compress && platform == "x86_64" {
-        collect_compress_diagnostics(&mut diag, &data_dir, &repo_root, &bin_dir, args.dataset.as_deref());
+        collect_compress_diagnostics(
+            &mut diag,
+            &data_dir,
+            &repo_root,
+            &bin_dir,
+            args.dataset.as_deref(),
+        );
     }
 
     // Decompress path traces
@@ -50,7 +59,10 @@ pub fn run(args: &DiagArgs) -> Result<(), String> {
     }
 
     let output = serde_json::Value::Object(diag);
-    println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).unwrap_or_default()
+    );
     Ok(())
 }
 
@@ -78,7 +90,11 @@ fn find_data_dir(repo_root: &Path) -> PathBuf {
 
 fn find_bin_dir(repo_root: &Path) -> Option<PathBuf> {
     let p = repo_root.join("bin");
-    if p.is_dir() { Some(p) } else { None }
+    if p.is_dir() {
+        Some(p)
+    } else {
+        None
+    }
 }
 
 fn cmd_stdout(program: &str, args: &[&str]) -> Option<String> {
@@ -127,7 +143,16 @@ fn collect_tool_versions(
     let mut versions = serde_json::Map::new();
 
     // gzippy commit
-    if let Some(commit) = cmd_stdout("git", &["-C", &repo_root.to_string_lossy(), "rev-parse", "--short", "HEAD"]) {
+    if let Some(commit) = cmd_stdout(
+        "git",
+        &[
+            "-C",
+            &repo_root.to_string_lossy(),
+            "rev-parse",
+            "--short",
+            "HEAD",
+        ],
+    ) {
         versions.insert("gzippy_commit".into(), serde_json::Value::String(commit));
     }
 
@@ -135,7 +160,8 @@ fn collect_tool_versions(
     if let Some(bd) = bin_dir {
         let igzip = bd.join("igzip");
         if igzip.exists() {
-            if let Some(v) = shell_stdout(&format!("{} --version 2>&1 | head -1", igzip.display())) {
+            if let Some(v) = shell_stdout(&format!("{} --version 2>&1 | head -1", igzip.display()))
+            {
                 versions.insert("igzip".into(), serde_json::Value::String(v));
             }
         }
@@ -234,7 +260,10 @@ fn collect_compress_diagnostics(
 ) {
     let gzippy_bin = repo_root.join("target/release/gzippy");
     if !gzippy_bin.exists() {
-        diag.insert("compress_error".into(), serde_json::json!("gzippy binary not found"));
+        diag.insert(
+            "compress_error".into(),
+            serde_json::json!("gzippy binary not found"),
+        );
         return;
     }
 
@@ -248,14 +277,20 @@ fn collect_compress_diagnostics(
 
     for (name, file) in &datasets {
         if let Some(filter) = dataset_filter {
-            if *name != filter { continue; }
+            if *name != filter {
+                continue;
+            }
         }
 
         let raw_path = data_dir.join(file);
-        if !raw_path.exists() { continue; }
+        if !raw_path.exists() {
+            continue;
+        }
 
         let input_size = std::fs::metadata(&raw_path).map(|m| m.len()).unwrap_or(0);
-        if input_size == 0 { continue; }
+        if input_size == 0 {
+            continue;
+        }
 
         // Run gzippy with GZIPPY_DEBUG=1 to get timing breakdown
         let output = Command::new(&gzippy_bin)
@@ -268,11 +303,17 @@ fn collect_compress_diagnostics(
 
         let mut timing = serde_json::Map::new();
         timing.insert("input_bytes".into(), serde_json::json!(input_size));
-        timing.insert("input_mb".into(), serde_json::json!((input_size as f64 / 1e6 * 10.0).round() / 10.0));
+        timing.insert(
+            "input_mb".into(),
+            serde_json::json!((input_size as f64 / 1e6 * 10.0).round() / 10.0),
+        );
 
         if let Ok(out) = output {
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            timing.insert("debug_output".into(), serde_json::Value::String(stderr.clone()));
+            timing.insert(
+                "debug_output".into(),
+                serde_json::Value::String(stderr.clone()),
+            );
 
             // Parse "[isal] L1 compress_gzip_to_writer: alloc=X.Xms compress=X.Xms (XXXX MB/s) write=X.Xms"
             for line in stderr.lines() {
@@ -303,8 +344,14 @@ fn collect_compress_diagnostics(
             let elapsed = t0.elapsed();
             let total_ms = elapsed.as_secs_f64() * 1000.0;
             let total_mbps = input_size as f64 / elapsed.as_secs_f64() / 1e6;
-            timing.insert("total_ms".into(), serde_json::json!((total_ms * 10.0).round() / 10.0));
-            timing.insert("total_mbps".into(), serde_json::json!((total_mbps * 10.0).round() / 10.0));
+            timing.insert(
+                "total_ms".into(),
+                serde_json::json!((total_ms * 10.0).round() / 10.0),
+            );
+            timing.insert(
+                "total_mbps".into(),
+                serde_json::json!((total_mbps * 10.0).round() / 10.0),
+            );
         } else {
             timing.insert("error".into(), serde_json::json!("failed to run gzippy"));
         }
@@ -322,15 +369,24 @@ fn collect_compress_diagnostics(
                     .status();
                 let elapsed = t0.elapsed();
                 let igzip_mbps = input_size as f64 / elapsed.as_secs_f64() / 1e6;
-                timing.insert("igzip_mbps".into(), serde_json::json!((igzip_mbps * 10.0).round() / 10.0));
-                timing.insert("igzip_ms".into(), serde_json::json!((elapsed.as_secs_f64() * 1000.0 * 10.0).round() / 10.0));
+                timing.insert(
+                    "igzip_mbps".into(),
+                    serde_json::json!((igzip_mbps * 10.0).round() / 10.0),
+                );
+                timing.insert(
+                    "igzip_ms".into(),
+                    serde_json::json!((elapsed.as_secs_f64() * 1000.0 * 10.0).round() / 10.0),
+                );
             }
         }
 
         compress_timings.insert((*name).into(), serde_json::Value::Object(timing));
     }
 
-    diag.insert("compress_timing".into(), serde_json::Value::Object(compress_timings));
+    diag.insert(
+        "compress_timing".into(),
+        serde_json::Value::Object(compress_timings),
+    );
 
     // Dispatch check: 1KB block at L0
     collect_dispatch_check(diag, &gzippy_bin);
@@ -343,8 +399,15 @@ fn collect_dispatch_check(
     // We can't call isal::compress_into directly from the devtool (different binary).
     // Instead, run the test that does the dispatch check.
     let output = Command::new("cargo")
-        .args(["test", "--release", "--features", "isal-compression",
-               "bench_isal_compress_throughput", "--", "--nocapture"])
+        .args([
+            "test",
+            "--release",
+            "--features",
+            "isal-compression",
+            "bench_isal_compress_throughput",
+            "--",
+            "--nocapture",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output();
@@ -364,7 +427,11 @@ fn collect_dispatch_check(
                 check.insert("raw".into(), serde_json::Value::String(line.trim().into()));
                 if let Some(mbps) = extract_first_number(line) {
                     check.insert("1kb_mbps".into(), serde_json::json!(mbps));
-                    let verdict = if mbps > 1500.0 { "ASSEMBLY" } else { "C_FALLBACK" };
+                    let verdict = if mbps > 1500.0 {
+                        "ASSEMBLY"
+                    } else {
+                        "C_FALLBACK"
+                    };
                     check.insert("verdict".into(), serde_json::Value::String(verdict.into()));
                 }
             }
@@ -383,13 +450,19 @@ fn collect_dispatch_check(
         if !out.status.success() {
             check.insert("test_passed".into(), serde_json::Value::Bool(false));
             if !gzippy_bin.exists() {
-                check.insert("note".into(), serde_json::json!("isal-compression feature may not be enabled"));
+                check.insert(
+                    "note".into(),
+                    serde_json::json!("isal-compression feature may not be enabled"),
+                );
             }
         } else {
             check.insert("test_passed".into(), serde_json::Value::Bool(true));
         }
     } else {
-        check.insert("error".into(), serde_json::json!("failed to run cargo test"));
+        check.insert(
+            "error".into(),
+            serde_json::json!("failed to run cargo test"),
+        );
     }
 
     diag.insert("dispatch_check".into(), serde_json::Value::Object(check));
@@ -403,7 +476,10 @@ fn collect_decompress_paths(
 ) {
     let gzippy_bin = repo_root.join("target/release/gzippy");
     if !gzippy_bin.exists() {
-        diag.insert("decompress_error".into(), serde_json::json!("gzippy binary not found"));
+        diag.insert(
+            "decompress_error".into(),
+            serde_json::json!("gzippy binary not found"),
+        );
         return;
     }
 
@@ -425,11 +501,15 @@ fn collect_decompress_paths(
 
     for (dataset, archive_type, filename) in &archives {
         if let Some(filter) = dataset_filter {
-            if *dataset != filter { continue; }
+            if *dataset != filter {
+                continue;
+            }
         }
 
         let gz_path = data_dir.join(filename);
-        if !gz_path.exists() { continue; }
+        if !gz_path.exists() {
+            continue;
+        }
 
         let output = Command::new(&gzippy_bin)
             .args(["-d", "-p4"])
@@ -454,9 +534,15 @@ fn collect_decompress_paths(
     }
 
     diag.insert("decompress_paths".into(), serde_json::Value::Object(paths));
-    diag.insert("isal_decompress_fallback".into(), serde_json::json!(isal_fallback_detected));
+    diag.insert(
+        "isal_decompress_fallback".into(),
+        serde_json::json!(isal_fallback_detected),
+    );
     if !isal_fallback_files.is_empty() {
-        diag.insert("isal_fallback_files".into(), serde_json::json!(isal_fallback_files));
+        diag.insert(
+            "isal_fallback_files".into(),
+            serde_json::json!(isal_fallback_files),
+        );
     }
 }
 
@@ -478,19 +564,32 @@ fn parse_decompress_path(debug_output: &str) -> String {
             route = format!("BGZF parallel | {trimmed}");
         } else if trimmed.contains("BGZF decompress") {
             route = format!("BGZF | {trimmed}");
-        } else if trimmed.contains("Multi-member parallel") || trimmed.contains("Multi-member path") {
+        } else if trimmed.contains("Multi-member parallel") || trimmed.contains("Multi-member path")
+        {
             route = format!("multi-member parallel | {trimmed}");
-        } else if trimmed.contains("Single-member path") || trimmed.contains("Single-member parallel") {
+        } else if trimmed.contains("Single-member path")
+            || trimmed.contains("Single-member parallel")
+        {
             route = format!("single-member | {trimmed}");
-        } else if trimmed.contains("decompress_file stdout") || trimmed.contains("decompress_stdin:") {
+        } else if trimmed.contains("decompress_file stdout")
+            || trimmed.contains("decompress_stdin:")
+        {
             // Parse the format detection line to build route info
             let bgzf = trimmed.contains("bgzf=true");
             let multi = trimmed.contains("multi=true");
             let parallel = trimmed.contains("parallel=true");
             let path_desc = if bgzf {
-                if parallel { "BGZF parallel" } else { "BGZF sequential" }
+                if parallel {
+                    "BGZF parallel"
+                } else {
+                    "BGZF sequential"
+                }
             } else if multi {
-                if parallel { "multi-member parallel" } else { "multi-member sequential" }
+                if parallel {
+                    "multi-member parallel"
+                } else {
+                    "multi-member sequential"
+                }
             } else {
                 "single-member sequential"
             };
@@ -502,7 +601,10 @@ fn parse_decompress_path(debug_output: &str) -> String {
         if debug_output.trim().is_empty() {
             return "no debug output (GZIPPY_DEBUG not working?)".into();
         }
-        return format!("unknown path | {}", debug_output.lines().next().unwrap_or(""));
+        return format!(
+            "unknown path | {}",
+            debug_output.lines().next().unwrap_or("")
+        );
     }
 
     if route.is_empty() {

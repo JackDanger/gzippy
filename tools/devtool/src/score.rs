@@ -28,9 +28,7 @@ struct ScoreEntry {
 pub fn run() -> Result<(), String> {
     let data = load_results()?;
 
-    println!(
-        "\n╔══════════════════════════════════════════════════════════════╗"
-    );
+    println!("\n╔══════════════════════════════════════════════════════════════╗");
     println!(
         "║  SCORECARD: {}W / {}L  ({}%)    {}  ║",
         data.wins,
@@ -38,9 +36,7 @@ pub fn run() -> Result<(), String> {
         data.wins * 100 / data.total_scenarios,
         &data.timestamp[..19],
     );
-    println!(
-        "╚══════════════════════════════════════════════════════════════╝\n"
-    );
+    println!("╚══════════════════════════════════════════════════════════════╝\n");
 
     let mut wins: Vec<&ScoreEntry> = Vec::new();
     let mut loss_list: Vec<&ScoreEntry> = Vec::new();
@@ -61,7 +57,12 @@ pub fn run() -> Result<(), String> {
             let platform_short = platform_tag(&s.platform);
             println!(
                 "    {:<30} {:>7.1} vs {:<10} {:>7.1}  {:>+6.1}%  [{}]",
-                s.scenario, s.gzippy_mbps, s.best_competitor, s.competitor_mbps, s.gap_pct, platform_short,
+                s.scenario,
+                s.gzippy_mbps,
+                s.best_competitor,
+                s.competitor_mbps,
+                s.gap_pct,
+                platform_short,
             );
         }
     }
@@ -90,10 +91,15 @@ pub fn losses(explain: bool) -> Result<(), String> {
     }
 
     let diags = data.diagnostics.as_ref();
-    let has_diags = diags.map(|d| d.as_object().map(|o| !o.is_empty()).unwrap_or(false)).unwrap_or(false);
+    let has_diags = diags
+        .map(|d| d.as_object().map(|o| !o.is_empty()).unwrap_or(false))
+        .unwrap_or(false);
 
     println!("\n╔══════════════════════════════════════════════════════════════╗");
-    println!("║  {} LOSSES — grouped by root cause                          ║", loss_list.len());
+    println!(
+        "║  {} LOSSES — grouped by root cause                          ║",
+        loss_list.len()
+    );
     if explain && !has_diags {
         println!("║  (--explain: no diagnostics in cloud-results.json)         ║");
     }
@@ -110,7 +116,8 @@ pub fn losses(explain: bool) -> Result<(), String> {
         let is_decompress = s.platform.contains("decompress");
         if s.best_competitor == "igzip" && s.scenario.contains("L1") {
             igzip_l1.push(s);
-        } else if s.scenario.contains("Tmax") && is_decompress
+        } else if s.scenario.contains("Tmax")
+            && is_decompress
             && (s.best_competitor == "rapidgzip" || s.best_competitor == "unpigz")
         {
             tmax_parallel.push(s);
@@ -128,7 +135,9 @@ pub fn losses(explain: bool) -> Result<(), String> {
         println!("  Action: May flip to wins with measurement variance. Low priority.\n");
         for s in &near_parity {
             print_loss(s);
-            if explain { print_explanation(s, diags); }
+            if explain {
+                print_explanation(s, diags);
+            }
         }
         println!();
     }
@@ -138,7 +147,9 @@ pub fn losses(explain: bool) -> Result<(), String> {
         println!("  Action: Investigate mmap vs read_to_end on Graviton, madvise hints.\n");
         for s in &arm64_compress {
             print_loss(s);
-            if explain { print_explanation(s, diags); }
+            if explain {
+                print_explanation(s, diags);
+            }
         }
         println!();
     }
@@ -148,7 +159,9 @@ pub fn losses(explain: bool) -> Result<(), String> {
         println!("  Action: Check ISA-L AVX-512 build flags. May be unfixable.\n");
         for s in &igzip_l1 {
             print_loss(s);
-            if explain { print_explanation(s, diags); }
+            if explain {
+                print_explanation(s, diags);
+            }
         }
         println!();
     }
@@ -158,7 +171,9 @@ pub fn losses(explain: bool) -> Result<(), String> {
         println!("  Action: Implement rapidgzip-style block-finder + marker pipeline.\n");
         for s in &tmax_parallel {
             print_loss(s);
-            if explain { print_explanation(s, diags); }
+            if explain {
+                print_explanation(s, diags);
+            }
         }
         println!();
     }
@@ -167,14 +182,21 @@ pub fn losses(explain: bool) -> Result<(), String> {
         println!("  ── OTHER ──\n");
         for s in &other {
             print_loss(s);
-            if explain { print_explanation(s, diags); }
+            if explain {
+                print_explanation(s, diags);
+            }
         }
         println!();
     }
 
     let fixable = near_parity.len() + arm64_compress.len();
     let hard = igzip_l1.len() + tmax_parallel.len();
-    println!("  Summary: {} likely fixable, {} require architecture changes, {} other", fixable, hard, other.len());
+    println!(
+        "  Summary: {} likely fixable, {} require architecture changes, {} other",
+        fixable,
+        hard,
+        other.len()
+    );
 
     Ok(())
 }
@@ -250,7 +272,10 @@ fn print_explanation(s: &ScoreEntry, diags: Option<&serde_json::Value>) {
         // Show dispatch check
         if let Some(dispatch) = diag.get("dispatch_check").and_then(|d| d.as_object()) {
             if let Some(verdict) = dispatch.get("verdict").and_then(|v| v.as_str()) {
-                let mbps = dispatch.get("1kb_mbps").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let mbps = dispatch
+                    .get("1kb_mbps")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
                 println!("      Dispatch: {verdict} ({mbps:.0} MB/s on 1KB)");
             }
         }
@@ -332,9 +357,17 @@ fn find_matching_diag<'a>(
 fn platform_tag(platform: &str) -> &str {
     let is_decompress = platform.contains("decompress");
     if platform.contains("x86_64") {
-        if is_decompress { "x86 decomp" } else { "x86 comp" }
+        if is_decompress {
+            "x86 decomp"
+        } else {
+            "x86 comp"
+        }
     } else if platform.contains("arm64") {
-        if is_decompress { "arm64 decomp" } else { "arm64 comp" }
+        if is_decompress {
+            "arm64 decomp"
+        } else {
+            "arm64 comp"
+        }
     } else {
         platform
     }
@@ -351,6 +384,5 @@ fn load_results() -> Result<CloudResults, String> {
     }
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-    serde_json::from_str(&contents)
-        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))
+    serde_json::from_str(&contents).map_err(|e| format!("Failed to parse {}: {e}", path.display()))
 }
