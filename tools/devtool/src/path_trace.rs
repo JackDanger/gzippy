@@ -45,17 +45,30 @@ pub fn trace(path: &str) -> Result<(), String> {
     println!("║  DECOMPRESSION PATH TRACE                                  ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!("  File:         {path}");
-    println!("  Size:         {:.2} MB ({file_size} bytes)", file_size as f64 / 1_048_576.0);
-    println!("  Method:       {} ({})", method, if method == 8 { "deflate" } else { "UNKNOWN" });
-    println!("  ISIZE:        {isize} ({:.2} MB)", isize as f64 / 1_048_576.0);
+    println!(
+        "  Size:         {:.2} MB ({file_size} bytes)",
+        file_size as f64 / 1_048_576.0
+    );
+    println!(
+        "  Method:       {} ({})",
+        method,
+        if method == 8 { "deflate" } else { "UNKNOWN" }
+    );
+    println!(
+        "  ISIZE:        {isize} ({:.2} MB)",
+        isize as f64 / 1_048_576.0
+    );
     println!("  Ratio:        {:.1}x", isize as f64 / file_size as f64);
 
     // Check for BGZF
     let is_bgzf = has_extra && data.len() > 16 && {
         let xlen = u16::from_le_bytes([data[10], data[11]]) as usize;
-        xlen >= 6 && data.len() > 12 + xlen
-            && data[12] == b'B' && data[13] == b'C'
-            && data[14] == 2 && data[15] == 0
+        xlen >= 6
+            && data.len() > 12 + xlen
+            && data[12] == b'B'
+            && data[13] == b'C'
+            && data[14] == 2
+            && data[15] == 0
     };
 
     // Count gzip members
@@ -104,16 +117,17 @@ pub fn trace(path: &str) -> Result<(), String> {
         while pos < data.len() - 18 {
             if data[pos] == 0x1f && data[pos + 1] == 0x8b && data[pos + 2] == 0x08 {
                 let member_isize = if let Some(end) = find_member_end(&data, pos) {
-                    u32::from_le_bytes([
-                        data[end - 4], data[end - 3], data[end - 2], data[end - 1],
-                    ])
+                    u32::from_le_bytes([data[end - 4], data[end - 3], data[end - 2], data[end - 1]])
                 } else {
                     0
                 };
                 if idx < 10 || idx == member_count - 1 {
                     println!(
                         "    #{:<4} offset={:<10} isize={:<10} ({:.1} KB)",
-                        idx, pos, member_isize, member_isize as f64 / 1024.0,
+                        idx,
+                        pos,
+                        member_isize,
+                        member_isize as f64 / 1024.0,
                     );
                 } else if idx == 10 {
                     println!("    ... ({} more members) ...", member_count - 11);
@@ -206,8 +220,12 @@ fn find_member_end(data: &[u8], start: usize) -> Option<usize> {
     // For BGZF we already know the block size from BSIZE.
     let search_from = pos;
     for i in search_from..data.len().saturating_sub(2) {
-        if data[i] == 0x1f && data[i + 1] == 0x8b && i + 2 < data.len() && data[i + 2] == 0x08
-            && i > start + 18 {
+        if data[i] == 0x1f
+            && data[i + 1] == 0x8b
+            && i + 2 < data.len()
+            && data[i + 2] == 0x08
+            && i > start + 18
+        {
             return Some(i);
         }
     }
