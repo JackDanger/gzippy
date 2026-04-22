@@ -20,6 +20,50 @@
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+// =============================================================================
+// Hot-path counters (active only in test builds or with feature "counters")
+// =============================================================================
+//
+// Zero overhead in production: the cfg gate eliminates all counter code.
+// Use in tests: crate::bgzf::hot_counters::reset() / snapshot()
+// Use manually: cargo build --features counters
+#[cfg(any(test, feature = "counters"))]
+pub mod hot_counters {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static DYNAMIC_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    static MULTI_SYM_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    static STANDARD_BLOCKS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn reset() {
+        DYNAMIC_BLOCKS.store(0, Ordering::SeqCst);
+        MULTI_SYM_BLOCKS.store(0, Ordering::SeqCst);
+        STANDARD_BLOCKS.store(0, Ordering::SeqCst);
+    }
+
+    /// Returns (dynamic_blocks, multi_sym_blocks, standard_blocks).
+    pub fn snapshot() -> (u64, u64, u64) {
+        (
+            DYNAMIC_BLOCKS.load(Ordering::SeqCst),
+            MULTI_SYM_BLOCKS.load(Ordering::SeqCst),
+            STANDARD_BLOCKS.load(Ordering::SeqCst),
+        )
+    }
+
+    #[inline(always)]
+    pub fn inc_dynamic() {
+        DYNAMIC_BLOCKS.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline(always)]
+    pub fn inc_multi_sym() {
+        MULTI_SYM_BLOCKS.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline(always)]
+    pub fn inc_standard() {
+        STANDARD_BLOCKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 use crate::combined_lut::CombinedLUT;
 use crate::inflate_tables::CODE_LENGTH_ORDER;
 use crate::packed_lut::PackedLUT;
@@ -670,9 +714,14 @@ fn decode_dynamic_into(
     let max_lit_len = code_lens[..hlit].iter().copied().max().unwrap_or(0);
     let use_multi_sym = max_lit_len <= 6 && max_lit_len > 0;
 
+    #[cfg(any(test, feature = "counters"))]
+    hot_counters::inc_dynamic();
+
     if use_multi_sym {
         // Try multi-symbol decode for literal-heavy blocks
         if let Ok(multi_sym_table) = crate::simd_huffman::MultiSymTable::build(&code_lens[..hlit]) {
+            #[cfg(any(test, feature = "counters"))]
+            hot_counters::inc_multi_sym();
             return decode_huffman_multi_sym(
                 bits,
                 output,
@@ -684,6 +733,9 @@ fn decode_dynamic_into(
             );
         }
     }
+
+    #[cfg(any(test, feature = "counters"))]
+    hot_counters::inc_standard();
 
     decode_huffman_into(
         bits,

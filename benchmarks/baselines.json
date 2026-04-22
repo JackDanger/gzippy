@@ -1,0 +1,22 @@
+{
+  "fixtures": {
+    "text_1mb_seed": 12345,
+    "text_10mb_seed": 67890,
+    "text_1mb_gz_sha256": "TBD"
+  },
+  "alloc_budget": {
+    "decompress_1mb_max_allocs": 2,
+    "decompress_bgzf_10mb_max_allocs": 7
+  },
+  "diff_ratio": {
+    "max_ratio": 1.30,
+    "max_ratio_bgzf_10mb": 2.00
+  },
+  "hit_rates": {
+    "multi_sym_min": 0.0,
+    "slow_path_max": 1.0
+  },
+  "cachegrind": {
+    "max_ir": 0
+  }
+}
