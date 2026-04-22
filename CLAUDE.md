@@ -12,26 +12,46 @@
 4. **REVERT REGRESSIONS** — if `make` or cloud fleet shows a loss, revert immediately.
 5. **NEVER COMPROMISE PERFORMANCE** — clippy, style, readability: none justify slower code.
 
-## Production Decompression Routing (Feb 2026)
+## Production Routing (Apr 2026)
+
+### Decompression
 
 ```
-Input → decompression.rs: decompress_file / decompress_stdin
-  ├─ BGZF? ("GZ" extra field)
-  │     → bgzf::decompress_bgzf_parallel (libdeflate FFI, T1 or Tmax)
+Input → decompression.rs: decompress_gzip_libdeflate
+  ├─ gzippy-parallel? ("GZ" subfield in FEXTRA)
+  │     → bgzf::decompress_bgzf_parallel (libdeflate FFI, T1 or Tmax internally)
   ├─ Multi-member? (trailing gzip headers detected)
   │     T1  → decompress_multi_member_sequential (libdeflate, member-by-member)
-  │     Tmax → bgzf::decompress_multi_member_parallel (libdeflate FFI, parallel)
+  │     Tmax → bgzf::decompress_multi_member_parallel (libdeflate FFI)
   └─ Single-member?
-        x86_64 Tmax (ISA-L available, data ≥ 4MB) → parallel_single_member::decompress_parallel
-        x86_64 T1  → isal_decompress::decompress_gzip_stream (ISA-L direct FFI)
-        x86_64 fallback → decompress_single_member_libdeflate
-        arm64 compressible (ISIZE/len ≥ 2.0) → parallel_single_member (MarkerDecoder)
-        arm64 incompressible (ISIZE/len < 2.0) → decompress_single_member_libdeflate
-        arm64 huge (data > 1GB) → decompress_single_member_streaming (avoid huge alloc)
+        x86_64 (ISA-L available) → isal_decompress::decompress_gzip_stream
+        any arch, data > 1GB (no ISA-L) → decompress_single_member_streaming (zlib-ng)
+        default → decompress_single_member_libdeflate
 ```
 
-**Compression (L6 with ≥2 threads)**: `PipelinedGzEncoder` → produces **single-member** output
-(not BGZF). Decompress routes to single-member path, not BGZF.
+### Compression
+
+```
+T1, L0–L3, ISA-L available → isal_compress::compress_gzip_to_writer
+T>1, L6–L9               → pipelined_compress::PipelinedGzEncoder → single-member output
+T>1, L0–L5               → parallel_compress::ParallelGzEncoder  → "GZ" subfield multi-block
+T1, all other            → flate2 single-threaded
+```
+
+**"GZ" subfield**: gzippy's own parallel format (not standard BGZF). Files produced by
+`ParallelGzEncoder` carry a "GZ" FEXTRA subfield with per-block size info; decompression
+routes them to `bgzf::decompress_bgzf_parallel`. `PipelinedGzEncoder` output is plain
+single-member — decompresses on the single-member path.
+
+## Experiments (not yet wired into production)
+
+- `parallel_single_member.rs` — speculative parallel for single-member files.
+  Measured at 88–148 MB/s vs 600–2000 MB/s sequential. **Not wired in.**
+- `speculative_parallel.rs` — RapidGzip-style u16 marker approach.
+  Not declared in `main.rs`; not compiled. Preserved for future experimentation.
+
+To wire in an experiment: add it to `decompress_single_member` in `decompression.rs`
+behind a size gate, verify with `make route-check`, then run `make quick`.
 
 ## Score: 47W / 13L (Feb 21 2026, cloud fleet)
 
@@ -53,15 +73,13 @@ larger blocks for L1 (no help), **speculative parallel decode on arm64**
 become all-marker forcing huge sequential re-decodes),
 two-pass scan-then-decode, large pre-allocations.
 
-**arm64 single-member routing** (compressibility check via ISIZE/len ratio):
-- ISIZE/len ≥ 2.0 (compressible): parallel_single_member (MarkerDecoder, 1500+ MB/s on real workloads)
-- ISIZE/len < 2.0 (incompressible/random): libdeflate sequential (near-parity, safe)
-- data > 1GB: streaming zlib-ng (avoids huge allocation only for pathological files)
-ISA-L is unavailable on arm64. Do NOT remove the compressibility check.
+**arm64 single-member**: currently falls through to libdeflate one-shot (fast enough).
+Streaming path only for files > 1GB. ISA-L is unavailable on arm64.
 
-**Parallel speculation guard**: `parallel_single_member` is gated on
-`isal_decompress::is_available()` — x86_64 only. Never remove this guard
-without measuring on both architectures.
+**Parallel speculation guard** (future work): if `parallel_single_member` is ever wired in,
+it must be gated on `isal_decompress::is_available()` — x86_64 only. Speculative parallel
+on arm64 was 16× slower on low-redundancy data (block boundaries rare, most chunks become
+all-marker forcing huge sequential re-decodes).
 
 ## Iteration Loop
 
@@ -88,10 +106,13 @@ vs pigz for all four combos (T1/T4 × 1MB/10MB). Use this before ANY decompressi
 | File | Role |
 |------|------|
 | `src/decompression.rs` | Decompression entry, format detect, routing |
-| `src/bgzf.rs` | BGZF/multi-member parallel (8400 lines, core engine) |
-| `src/isal_decompress.rs` | ISA-L streaming inflate (x86_64) |
-| `src/parallel_single_member.rs` | Speculative parallel (x86_64 only, gated on ISA-L) |
-| `src/compression.rs` | Compression entry |
-| `src/parallel_compress.rs` | Parallel BGZF compression |
-| `src/pipelined_compress.rs` | L6-L9 Tmax → single-member output |
-| `src/consume_first_decode.rs` | Experimental pure Rust inflate (NOT production) |
+| `src/bgzf.rs` | gzippy-parallel + multi-member parallel (~8400 lines, core engine) |
+| `src/isal_decompress.rs` | ISA-L streaming inflate (x86_64 production path) |
+| `src/libdeflate_ext.rs` | libdeflate FFI — gzip_decompress_ex (arm64 + fallback) |
+| `src/compression.rs` | Compression entry, routing |
+| `src/parallel_compress.rs` | ParallelGzEncoder — T>1 L0–L5, "GZ" multi-block output |
+| `src/pipelined_compress.rs` | PipelinedGzEncoder — T>1 L6–L9, single-member output |
+| `src/isal_compress.rs` | ISA-L compression (x86_64 T1 L0–L3) |
+| `src/parallel_single_member.rs` | EXPERIMENT: speculative parallel (not wired in, 88–148 MB/s) |
+| `src/speculative_parallel.rs` | EXPERIMENT: RapidGzip u16-marker approach (not in main.rs) |
+| `src/consume_first_decode.rs` | EXPERIMENT: pure Rust inflate (not production) |

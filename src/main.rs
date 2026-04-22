@@ -9,56 +9,71 @@ use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+// ── Test infrastructure (macros must load first) ──────────────────────────────
 #[macro_use]
 mod test_utils;
+mod alloc_counter; // counting allocator — #[global_allocator] in test builds
 mod benchmark_datasets;
-mod bgzf;
-mod block_finder;
-mod block_finder_lut;
-mod bmi2;
-mod cli;
-mod combined_lut;
 mod compress_oracle_tests;
-mod compression;
-mod consume_first_decode;
-mod consume_first_table;
 mod correctness_tests;
-mod decompression;
-mod double_literal;
-mod error;
-mod format;
+mod diff_ratio_tests;
+mod alloc_budget_tests;
+mod hot_path_tests;
 mod golden_tests;
 mod inflate_oracle_tests;
-mod inflate_tables;
-mod io_thread;
+mod pipeline_tests;
+mod routing_tests;
+mod test_fixtures;
+
+// ── Production modules ────────────────────────────────────────────────────────
+mod bgzf;           // gzippy-parallel + multi-member parallel decompression (~8400 lines)
+mod cli;
+mod combined_lut;   // combined lit/len+dist LUT used by bgzf
+mod compression;
+mod decompression;
+mod error;
+mod format;
+mod inflate_tables; // Huffman table constants used by bgzf
+mod io_thread;      // WriteAhead background I/O used by isal_decompress
 mod isal;
 mod isal_compress;
 mod isal_decompress;
-mod jit_decode;
-mod libdeflate_decode;
-mod libdeflate_entry;
-mod libdeflate_ext;
-mod marker_decode;
+mod libdeflate_ext; // libdeflate FFI: gzip_decompress_ex (arm64 + fallback)
 mod optimization;
-mod packed_lut;
+mod packed_lut;     // packed LUT used by bgzf
 mod parallel_compress;
-mod parallel_single_member;
-mod pipeline_tests;
 mod pipelined_compress;
-mod routing_tests;
-mod scan_inflate;
 mod scheduler;
-mod simd_copy;
-mod simd_huffman;
+mod simd_copy;      // SIMD LZ77 copy used by two_level_table
+mod simd_huffman;   // multi-symbol Huffman decode used by bgzf
 mod simple_optimizations;
-mod specialized_decode;
 mod thread_pool;
-mod two_level_table;
-// two_pass_parallel.rs: deprecated, superseded by parallel_single_member.rs
-mod ultra_fast_inflate;
-mod ultra_inflate;
+mod two_level_table; // two-level Huffman table used by bgzf
 mod utils;
-mod vector_huffman;
+
+// ── Experiments: parallel single-member decode (not yet wired in) ─────────────
+// These implement speculative parallel decompression for standard single-member files.
+// Current measurements: 88–148 MB/s vs 600–2000 MB/s for sequential libdeflate.
+// See CLAUDE.md "Experiments" section and decompression.rs::decompress_single_member
+// before wiring any of these in.
+mod bmi2;
+mod block_finder;        // deflate block boundary finder (used by parallel_single_member)
+mod block_finder_lut;    // 13-bit LUT for block_finder
+mod consume_first_decode; // pure-Rust inflate (used as oracle in tests)
+mod consume_first_table;  // pre-computed tables for consume_first_decode
+mod double_literal;       // double-literal optimization (used by consume_first_decode)
+mod jit_decode;           // JIT fingerprint caching (used by consume_first_decode)
+mod libdeflate_decode;    // pure-Rust libdeflate-style decoder
+mod libdeflate_entry;     // Huffman entry format matching libdeflate
+mod marker_decode;        // u16 marker-based decode for speculative parallel
+mod parallel_single_member; // speculative parallel single-member (88–148 MB/s)
+mod scan_inflate;         // block-by-block scan used by parallel_single_member
+mod specialized_decode;   // specialized Huffman decoders (used by consume_first_decode)
+mod ultra_fast_inflate;   // two-level Huffman + SIMD (used by marker_decode)
+mod ultra_inflate;        // variant of ultra_fast_inflate (unused in any active path)
+mod vector_huffman;       // SIMD Huffman tree construction (used by consume_first_decode)
+// speculative_parallel.rs: EXPERIMENT — RapidGzip u16-marker approach. Not compiled (not in main.rs).
+// two_pass_parallel.rs:    DELETED — deprecated two-pass scan approach (superseded).
 
 use cli::GzippyArgs;
 use error::GzippyError;

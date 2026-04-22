@@ -26,7 +26,7 @@ RAPIDGZIP_BIN := $(RAPIDGZIP_DIR)/librapidarchive/build/src/tools/rapidgzip
 GZIP_BIN := $(shell if [ -x $(GZIP_DIR)/gzip ]; then echo $(GZIP_DIR)/gzip; else echo $$(which gzip); fi)
 SYSTEM_GZIP := $(shell which gzip)
 
-.PHONY: all build quick perf-full test-data test-data-quick clean help validate deps ship route-check
+.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship route-check
 
 # =============================================================================
 # Default target: quick benchmark for fast iteration (< 30 seconds)
@@ -45,15 +45,18 @@ deps: $(PIGZ_BIN) $(IGZIP_BIN) $(ZOPFLI_BIN) $(RAPIDGZIP_BIN)
 	@echo "✓ Dependencies ready (gzip, pigz, igzip, zopfli, rapidgzip)"
 
 $(GZIP_DIR)/gzip:
-	@echo "Building gzip from source..."
-	@# Fix autotools timestamps to prevent regeneration
-	@cd $(GZIP_DIR) && find . -name "*.in" -exec touch {} \; 2>/dev/null; \
-		touch configure aclocal.m4 Makefile.in 2>/dev/null || true
-	@cd $(GZIP_DIR) && ./configure --quiet 2>/dev/null || true
-	@if $(MAKE) -C $(GZIP_DIR) -j4 2>/dev/null; then \
-		echo "✓ Built gzip from source"; \
+	@if [ "$$(uname)" = "Darwin" ]; then \
+		echo "⚠ Skipping gzip source build on macOS, using system gzip: $(SYSTEM_GZIP)"; \
 	else \
-		echo "⚠ gzip build failed, using system gzip: $(SYSTEM_GZIP)"; \
+		echo "Building gzip from source..."; \
+		cd $(GZIP_DIR) && find . -name "*.in" -exec touch {} \; 2>/dev/null; \
+		touch configure aclocal.m4 Makefile.in 2>/dev/null || true; \
+		cd $(GZIP_DIR) && ./configure --quiet 2>/dev/null || true; \
+		if $(MAKE) -C $(GZIP_DIR) -j4 2>/dev/null; then \
+			echo "✓ Built gzip from source"; \
+		else \
+			echo "⚠ gzip build failed, using system gzip: $(SYSTEM_GZIP)"; \
+		fi; \
 	fi
 
 $(PIGZ_BIN):
@@ -92,9 +95,45 @@ $(UNGZIPPY_BIN): $(GZIPPY_BIN)
 FORCE:
 
 # =============================================================================
-# Quick benchmark (~30 seconds) - for AI tools and fast iteration
+# Quick test suite — deterministic, layered, <30 seconds.
+# Replaces wall-clock benchmarks with proxies that fail specifically:
+#   Stage 1: correctness + routing smoke (cargo test)
+#   Stage 2: allocation budget (any new alloc on hot path = fail)
+#   Stage 3: differential ratio vs libdeflate (cancels thermal noise)
+#   Stage 4: hot-path hit rates in bgzf decoder
+#   Stage 5: cachegrind instruction count (Linux only, skipped on macOS)
+# See benchmarks/baselines.json for thresholds. Run 'make update-baselines'
+# after an intentional perf change.
 # =============================================================================
-quick: $(GZIPPY_BIN) $(UNGZIPPY_BIN) $(PIGZ_BIN) deps
+quick: $(GZIPPY_BIN)
+	@echo "══ make quick ══════════════════════════════════════════"
+	@echo "── Stage 1: correctness + routing smoke ────────────────"
+	@cargo test --release correctness 2>&1 | tail -3
+	@cargo test --release routing 2>&1 | tail -3
+	@echo "── Stage 2: allocation budget ──────────────────────────"
+	@cargo test --release alloc_budget 2>&1 | tail -3
+	@echo "── Stage 3: differential ratio vs libdeflate ───────────"
+	@cargo test --release diff_ratio 2>&1 | tail -3
+	@echo "── Stage 4: hot-path hit rates ─────────────────────────"
+	@cargo test --release hot_path 2>&1 | tail -3
+	@echo "── Stage 5: cachegrind (Linux only) ────────────────────"
+	@bash scripts/cachegrind_check.sh
+	@echo "════════════════════════════════════════════════════════"
+	@echo "✓ make quick passed"
+
+# Record current measurements as new baselines. Run after intentional perf changes.
+update-baselines: $(GZIPPY_BIN)
+	@echo "Recording baselines — review benchmarks/baselines.json before committing."
+	@RECORD_BASELINES=1 cargo test --release alloc_budget -- --nocapture 2>&1 | grep -E "baseline:|RECORD" || true
+	@RECORD_BASELINES=1 cargo test --release diff_ratio -- --nocapture 2>&1 | grep -E "baseline:|RECORD" || true
+	@RECORD_BASELINES=1 cargo test --release hot_path -- --nocapture 2>&1 | grep -E "baseline:|RECORD" || true
+	@bash scripts/cachegrind_check.sh --record
+	@echo "Done."
+
+# =============================================================================
+# Wall-clock benchmark (~30 seconds) - manual use before 'make ship'
+# =============================================================================
+quick-wallclock: $(GZIPPY_BIN) $(UNGZIPPY_BIN) $(PIGZ_BIN) deps
 	@python3 scripts/perf.py --sizes 1,10 --levels 6 --threads 1,4
 
 # =============================================================================
