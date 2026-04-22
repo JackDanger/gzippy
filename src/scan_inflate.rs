@@ -413,7 +413,7 @@ mod tests {
         for _ in 0..5 {
             let t = std::time::Instant::now();
             let mut ffi_out = Vec::new();
-            crate::decompression::decompress_single_member_libdeflate_pub(&gz, &mut ffi_out)
+            crate::decompression::decompress_single_member_libdeflate(&gz, &mut ffi_out)
                 .unwrap();
             ffi_times.push(t.elapsed());
             assert_eq!(ffi_out.len(), isize_val);

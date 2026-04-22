@@ -245,37 +245,37 @@ mod tests {
     #[test]
     fn test_detect_bgzf_positive() {
         let bgzf = compress_bgzf(&make_mixed(512 * 1024));
-        assert!(crate::decompression::has_bgzf_markers(&bgzf));
+        assert!(crate::gzip_format::has_bgzf_markers(&bgzf));
     }
 
     #[test]
     fn test_detect_bgzf_negative_single() {
         let single = compress_single_member(&make_mixed(512 * 1024));
-        assert!(!crate::decompression::has_bgzf_markers(&single));
+        assert!(!crate::gzip_format::has_bgzf_markers(&single));
     }
 
     #[test]
     fn test_detect_bgzf_negative_multi() {
         let multi = compress_multi_member(&make_mixed(512 * 1024));
-        assert!(!crate::decompression::has_bgzf_markers(&multi));
+        assert!(!crate::gzip_format::has_bgzf_markers(&multi));
     }
 
     #[test]
     fn test_detect_bgzf_too_short() {
-        assert!(!crate::decompression::has_bgzf_markers(&[0x1f, 0x8b]));
-        assert!(!crate::decompression::has_bgzf_markers(&[]));
+        assert!(!crate::gzip_format::has_bgzf_markers(&[0x1f, 0x8b]));
+        assert!(!crate::gzip_format::has_bgzf_markers(&[]));
     }
 
     #[test]
     fn test_detect_multi_member_positive() {
         let multi = compress_multi_member(&make_mixed(2 * 1024 * 1024));
-        assert!(crate::decompression::is_likely_multi_member_pub(&multi));
+        assert!(crate::gzip_format::is_likely_multi_member(&multi));
     }
 
     #[test]
     fn test_detect_multi_member_negative_single() {
         let single = compress_single_member(&make_mixed(2 * 1024 * 1024));
-        assert!(!crate::decompression::is_likely_multi_member_pub(&single));
+        assert!(!crate::gzip_format::is_likely_multi_member(&single));
     }
 
     #[test]
@@ -285,13 +285,13 @@ mod tests {
         let multi = compress_multi_member(&data);
         let bgzf = compress_bgzf(&data);
 
-        assert!(!crate::decompression::has_bgzf_markers(&single));
-        assert!(!crate::decompression::is_likely_multi_member_pub(&single));
+        assert!(!crate::gzip_format::has_bgzf_markers(&single));
+        assert!(!crate::gzip_format::is_likely_multi_member(&single));
 
-        assert!(!crate::decompression::has_bgzf_markers(&multi));
-        assert!(crate::decompression::is_likely_multi_member_pub(&multi));
+        assert!(!crate::gzip_format::has_bgzf_markers(&multi));
+        assert!(crate::gzip_format::is_likely_multi_member(&multi));
 
-        assert!(crate::decompression::has_bgzf_markers(&bgzf));
+        assert!(crate::gzip_format::has_bgzf_markers(&bgzf));
     }
 
     // =========================================================================
@@ -302,7 +302,7 @@ mod tests {
     fn test_libdeflate_empty() {
         let gz = compress_single_member(b"");
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_libdeflate_pub(&gz, &mut out).unwrap();
+        crate::decompression::decompress_single_member_libdeflate(&gz, &mut out).unwrap();
         assert!(out.is_empty());
     }
 
@@ -311,7 +311,7 @@ mod tests {
         for b in [0u8, 1, 127, 128, 254, 255] {
             let gz = compress_single_member(&[b]);
             let mut out = Vec::new();
-            crate::decompression::decompress_single_member_libdeflate_pub(&gz, &mut out).unwrap();
+            crate::decompression::decompress_single_member_libdeflate(&gz, &mut out).unwrap();
             assert_eq!(out, vec![b], "byte {}", b);
         }
     }
@@ -321,7 +321,7 @@ mod tests {
         let data = make_zeros(1_000_000);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_libdeflate_pub(&gz, &mut out).unwrap();
+        crate::decompression::decompress_single_member_libdeflate(&gz, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -330,7 +330,7 @@ mod tests {
         let data = make_random_seeded(1_000_000, 42);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_libdeflate_pub(&gz, &mut out).unwrap();
+        crate::decompression::decompress_single_member_libdeflate(&gz, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -339,7 +339,7 @@ mod tests {
         let data = make_mixed(2_000_000);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_libdeflate_pub(&gz, &mut out).unwrap();
+        crate::decompression::decompress_single_member_libdeflate(&gz, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -820,7 +820,7 @@ mod tests {
         let data = make_mixed(2_000_000);
         let multi = compress_multi_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_multi_member_sequential_pub(&multi, &mut out).unwrap();
+        crate::decompression::decompress_multi_member_sequential(&multi, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -829,7 +829,7 @@ mod tests {
         let data = make_zeros(500_000);
         let multi = compress_multi_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_multi_member_sequential_pub(&multi, &mut out).unwrap();
+        crate::decompression::decompress_multi_member_sequential(&multi, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -841,7 +841,7 @@ mod tests {
     fn test_bgzf_route_t1() {
         let data = make_mixed(2 * 1024 * 1024);
         let bgzf = compress_bgzf(&data);
-        assert!(crate::decompression::has_bgzf_markers(&bgzf));
+        assert!(crate::gzip_format::has_bgzf_markers(&bgzf));
         let output = crate::bgzf::decompress_bgzf_parallel_to_vec(&bgzf, 1).unwrap();
         assert_eq!(output, data);
     }
@@ -866,7 +866,7 @@ mod tests {
     fn test_bgzf_route_zeros() {
         let data = make_zeros(1_000_000);
         let bgzf = compress_bgzf(&data);
-        assert!(crate::decompression::has_bgzf_markers(&bgzf));
+        assert!(crate::gzip_format::has_bgzf_markers(&bgzf));
         let output = crate::bgzf::decompress_bgzf_parallel_to_vec(&bgzf, 4).unwrap();
         assert_eq!(output, data);
     }
@@ -883,7 +883,7 @@ mod tests {
     fn test_multi_member_parallel_route() {
         let data = make_mixed(2 * 1024 * 1024);
         let multi = compress_multi_member(&data);
-        assert!(crate::decompression::is_likely_multi_member_pub(&multi));
+        assert!(crate::gzip_format::is_likely_multi_member(&multi));
         let output = crate::bgzf::decompress_multi_member_parallel_to_vec(&multi, 4).unwrap();
         assert_eq!(output, data);
     }
@@ -892,10 +892,10 @@ mod tests {
     fn test_single_member_route() {
         let data = make_mixed(2 * 1024 * 1024);
         let single = compress_single_member(&data);
-        assert!(!crate::decompression::has_bgzf_markers(&single));
-        assert!(!crate::decompression::is_likely_multi_member_pub(&single));
+        assert!(!crate::gzip_format::has_bgzf_markers(&single));
+        assert!(!crate::gzip_format::is_likely_multi_member(&single));
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_libdeflate_pub(&single, &mut out).unwrap();
+        crate::decompression::decompress_single_member_libdeflate(&single, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -912,7 +912,7 @@ mod tests {
 
         // libdeflate (production gzip path)
         let mut ld_out = Vec::new();
-        crate::decompression::decompress_single_member_libdeflate_pub(&gz, &mut ld_out).unwrap();
+        crate::decompression::decompress_single_member_libdeflate(&gz, &mut ld_out).unwrap();
         assert_eq!(ld_out, data, "{}: libdeflate", label);
 
         // consume_first (experimental pure-Rust)
@@ -1023,7 +1023,7 @@ mod tests {
         let multi = compress_multi_member(&data);
 
         let mut t1 = Vec::new();
-        crate::decompression::decompress_multi_member_sequential_pub(&multi, &mut t1).unwrap();
+        crate::decompression::decompress_multi_member_sequential(&multi, &mut t1).unwrap();
         assert_eq!(t1, data, "T1 sequential");
 
         for t in 2..=8 {
@@ -1063,7 +1063,7 @@ mod tests {
         let single = compress_single_member(&data);
         let t = std::time::Instant::now();
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_libdeflate_pub(&single, &mut out).unwrap();
+        crate::decompression::decompress_single_member_libdeflate(&single, &mut out).unwrap();
         let mbps = out.len() as f64 / t.elapsed().as_secs_f64() / 1e6;
         assert_eq!(out, data);
         assert!(mbps > 50.0, "single-member: {:.0} MB/s too slow", mbps);
@@ -1103,7 +1103,7 @@ mod tests {
         let data = vec![b'A'; 10_000_000];
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_libdeflate_pub(&gz, &mut out).unwrap();
+        crate::decompression::decompress_single_member_libdeflate(&gz, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1113,7 +1113,7 @@ mod tests {
         let gz = compress_single_member(&data);
         assert!(gz.len() > data.len() * 95 / 100);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_libdeflate_pub(&gz, &mut out).unwrap();
+        crate::decompression::decompress_single_member_libdeflate(&gz, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1130,7 +1130,7 @@ mod tests {
         let data = make_mixed(100_000);
         let multi = compress_multi_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_multi_member_sequential_pub(&multi, &mut out).unwrap();
+        crate::decompression::decompress_multi_member_sequential(&multi, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1145,7 +1145,7 @@ mod tests {
         let mid = gz.len() / 2;
         gz[mid] ^= 0xFF;
         let mut out = Vec::new();
-        let result = crate::decompression::decompress_single_member_libdeflate_pub(&gz, &mut out);
+        let result = crate::decompression::decompress_single_member_libdeflate(&gz, &mut out);
         assert!(result.is_err() || out != data);
     }
 
@@ -1156,7 +1156,7 @@ mod tests {
         let truncated = &gz[..gz.len() - 100];
         let mut out = Vec::new();
         let result =
-            crate::decompression::decompress_single_member_libdeflate_pub(truncated, &mut out);
+            crate::decompression::decompress_single_member_libdeflate(truncated, &mut out);
         assert!(result.is_err());
     }
 
@@ -1183,11 +1183,11 @@ mod tests {
         let data = make_mixed(500_000);
         let bgzf = compress_bgzf(&data);
         assert!(
-            crate::decompression::has_bgzf_markers_pub(&bgzf),
+            crate::gzip_format::has_bgzf_markers(&bgzf),
             "BGZF data must be detected as BGZF"
         );
         let mut output = Vec::new();
-        crate::decompression::decompress_gzip_libdeflate_pub(&bgzf, &mut output, 4).unwrap();
+        crate::decompression::decompress_gzip_libdeflate(&bgzf, &mut output, 4).unwrap();
         assert_eq!(output, data, "BGZF through router must match original");
     }
 
@@ -1196,15 +1196,15 @@ mod tests {
         let data = make_mixed(500_000);
         let multi = compress_multi_member(&data);
         assert!(
-            !crate::decompression::has_bgzf_markers_pub(&multi),
+            !crate::gzip_format::has_bgzf_markers(&multi),
             "multi-member must not be detected as BGZF"
         );
         assert!(
-            crate::decompression::is_likely_multi_member_pub(&multi),
+            crate::gzip_format::is_likely_multi_member(&multi),
             "multi-member must be detected as multi-member"
         );
         let mut output = Vec::new();
-        crate::decompression::decompress_gzip_libdeflate_pub(&multi, &mut output, 4).unwrap();
+        crate::decompression::decompress_gzip_libdeflate(&multi, &mut output, 4).unwrap();
         assert_eq!(
             output, data,
             "multi-member through router must match original"
@@ -1216,15 +1216,15 @@ mod tests {
         let data = make_mixed(500_000);
         let single = compress_single_member(&data);
         assert!(
-            !crate::decompression::has_bgzf_markers_pub(&single),
+            !crate::gzip_format::has_bgzf_markers(&single),
             "single-member must not be detected as BGZF"
         );
         assert!(
-            !crate::decompression::is_likely_multi_member_pub(&single),
+            !crate::gzip_format::is_likely_multi_member(&single),
             "single-member must not be detected as multi-member"
         );
         let mut output = Vec::new();
-        crate::decompression::decompress_gzip_libdeflate_pub(&single, &mut output, 4).unwrap();
+        crate::decompression::decompress_gzip_libdeflate(&single, &mut output, 4).unwrap();
         assert_eq!(
             output, data,
             "single-member through router must match original"
@@ -1236,7 +1236,7 @@ mod tests {
         let data = make_mixed(200_000);
         let bgzf = compress_bgzf(&data);
         let mut output = Vec::new();
-        crate::decompression::decompress_gzip_libdeflate_pub(&bgzf, &mut output, 1).unwrap();
+        crate::decompression::decompress_gzip_libdeflate(&bgzf, &mut output, 1).unwrap();
         assert_eq!(output, data, "BGZF T1 through router must match");
     }
 
@@ -1245,7 +1245,7 @@ mod tests {
         let data = make_mixed(500_000);
         let multi = compress_multi_member(&data);
         let mut output = Vec::new();
-        crate::decompression::decompress_gzip_libdeflate_pub(&multi, &mut output, 1).unwrap();
+        crate::decompression::decompress_gzip_libdeflate(&multi, &mut output, 1).unwrap();
         assert_eq!(output, data, "multi-member T1 through router must match");
     }
 
@@ -1253,7 +1253,7 @@ mod tests {
     fn test_routing_decompress_gzip_to_vec_bgzf() {
         let data = make_mixed(500_000);
         let bgzf = compress_bgzf(&data);
-        let output = crate::decompression::decompress_gzip_to_vec_pub(&bgzf, 4).unwrap();
+        let output = crate::decompression::decompress_gzip_to_vec(&bgzf, 4).unwrap();
         assert_eq!(output, data);
     }
 
@@ -1261,7 +1261,7 @@ mod tests {
     fn test_routing_decompress_gzip_to_vec_single() {
         let data = make_mixed(500_000);
         let single = compress_single_member(&data);
-        let output = crate::decompression::decompress_gzip_to_vec_pub(&single, 4).unwrap();
+        let output = crate::decompression::decompress_gzip_to_vec(&single, 4).unwrap();
         assert_eq!(output, data);
     }
 
@@ -1269,7 +1269,7 @@ mod tests {
     fn test_routing_decompress_gzip_to_vec_multi() {
         let data = make_mixed(500_000);
         let multi = compress_multi_member(&data);
-        let output = crate::decompression::decompress_gzip_to_vec_pub(&multi, 4).unwrap();
+        let output = crate::decompression::decompress_gzip_to_vec(&multi, 4).unwrap();
         assert_eq!(output, data);
     }
 
@@ -1278,7 +1278,7 @@ mod tests {
         let data = make_mixed(200_000);
         let single = compress_single_member(&data);
         let mut output = Vec::new();
-        crate::decompression::decompress_single_member_pub(&single, &mut output, 1).unwrap();
+        crate::decompression::decompress_single_member(&single, &mut output, 1).unwrap();
         assert_eq!(
             output, data,
             "decompress_single_member must produce correct output"
@@ -1290,7 +1290,7 @@ mod tests {
         let data = make_mixed(200_000);
         let single = compress_single_member(&data);
         let mut output = Vec::new();
-        crate::decompression::decompress_single_member_pub(&single, &mut output, 4).unwrap();
+        crate::decompression::decompress_single_member(&single, &mut output, 4).unwrap();
         assert_eq!(output, data);
     }
 
@@ -1301,9 +1301,9 @@ mod tests {
         let multi = compress_multi_member(&data);
         let single = compress_single_member(&data);
 
-        let out_bgzf = crate::decompression::decompress_gzip_to_vec_pub(&bgzf, 4).unwrap();
-        let out_multi = crate::decompression::decompress_gzip_to_vec_pub(&multi, 4).unwrap();
-        let out_single = crate::decompression::decompress_gzip_to_vec_pub(&single, 4).unwrap();
+        let out_bgzf = crate::decompression::decompress_gzip_to_vec(&bgzf, 4).unwrap();
+        let out_multi = crate::decompression::decompress_gzip_to_vec(&multi, 4).unwrap();
+        let out_single = crate::decompression::decompress_gzip_to_vec(&single, 4).unwrap();
 
         assert_eq!(out_bgzf, data, "BGZF output mismatch");
         assert_eq!(out_multi, data, "multi-member output mismatch");
@@ -1327,7 +1327,7 @@ mod tests {
         }
         let gz = compress_single_member(&data);
         assert!(
-            !crate::decompression::is_likely_multi_member_pub(&gz),
+            !crate::gzip_format::is_likely_multi_member(&gz),
             "single-member with embedded magic must not be detected as multi-member"
         );
     }
@@ -1350,7 +1350,7 @@ mod tests {
         combined.extend_from_slice(&member2);
 
         assert!(
-            !crate::decompression::is_likely_multi_member_pub(&combined),
+            !crate::gzip_format::is_likely_multi_member(&combined),
             "multi-member with zero ISIZE trailer must be rejected"
         );
     }
@@ -1367,7 +1367,7 @@ mod tests {
         combined.extend_from_slice(&member2);
 
         assert!(
-            !crate::decompression::is_likely_multi_member_pub(&combined),
+            !crate::gzip_format::is_likely_multi_member(&combined),
             "multi-member with reserved flags must be rejected"
         );
     }
@@ -1384,7 +1384,7 @@ mod tests {
         combined.extend_from_slice(&member2);
 
         assert!(
-            !crate::decompression::is_likely_multi_member_pub(&combined),
+            !crate::gzip_format::is_likely_multi_member(&combined),
             "multi-member with bad XFL byte must be rejected"
         );
     }
@@ -1401,7 +1401,7 @@ mod tests {
         combined.extend_from_slice(&member2);
 
         assert!(
-            !crate::decompression::is_likely_multi_member_pub(&combined),
+            !crate::gzip_format::is_likely_multi_member(&combined),
             "multi-member with bad OS byte must be rejected"
         );
     }
@@ -1411,18 +1411,18 @@ mod tests {
         let data = make_mixed(600_000);
         let multi = compress_multi_member(&data);
         assert!(
-            crate::decompression::is_likely_multi_member_pub(&multi),
+            crate::gzip_format::is_likely_multi_member(&multi),
             "valid multi-member must be detected"
         );
     }
 
     #[test]
     fn test_multi_member_rejects_too_short() {
-        assert!(!crate::decompression::is_likely_multi_member_pub(&[
+        assert!(!crate::gzip_format::is_likely_multi_member(&[
             0x1f, 0x8b, 0x08
         ]));
-        assert!(!crate::decompression::is_likely_multi_member_pub(&[]));
-        assert!(!crate::decompression::is_likely_multi_member_pub(
+        assert!(!crate::gzip_format::is_likely_multi_member(&[]));
+        assert!(!crate::gzip_format::is_likely_multi_member(
             &[0u8; 35]
         ));
     }
@@ -1446,7 +1446,7 @@ mod tests {
         header.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
 
         assert!(
-            !crate::decompression::has_bgzf_markers_pub(&header),
+            !crate::gzip_format::has_bgzf_markers(&header),
             "FEXTRA with non-RZ subfield must not be detected as BGZF"
         );
     }
@@ -1472,7 +1472,7 @@ mod tests {
         header.extend_from_slice(&[0x00, 0x00]);
 
         assert!(
-            crate::decompression::has_bgzf_markers_pub(&header),
+            crate::gzip_format::has_bgzf_markers(&header),
             "FEXTRA with GZ subfield after another subfield must be detected"
         );
     }
@@ -1488,7 +1488,7 @@ mod tests {
         header.extend_from_slice(&[0x00, 0x00, 0x00]); // 3 bytes of garbage
 
         assert!(
-            !crate::decompression::has_bgzf_markers_pub(&header),
+            !crate::gzip_format::has_bgzf_markers(&header),
             "FEXTRA with xlen too short must not match"
         );
     }
@@ -1499,14 +1499,14 @@ mod tests {
             0x1f, 0x8b, 0x08, 0x00, // flags: no FEXTRA
             0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
-        assert!(!crate::decompression::has_bgzf_markers_pub(&header));
+        assert!(!crate::gzip_format::has_bgzf_markers(&header));
     }
 
     #[test]
     fn test_bgzf_markers_too_short_input() {
-        assert!(!crate::decompression::has_bgzf_markers_pub(&[]));
-        assert!(!crate::decompression::has_bgzf_markers_pub(&[0x1f, 0x8b]));
-        assert!(!crate::decompression::has_bgzf_markers_pub(&[0x1f; 15]));
+        assert!(!crate::gzip_format::has_bgzf_markers(&[]));
+        assert!(!crate::gzip_format::has_bgzf_markers(&[0x1f, 0x8b]));
+        assert!(!crate::gzip_format::has_bgzf_markers(&[0x1f; 15]));
     }
 
     // --- parse_gzip_header_size edge cases ---
@@ -1514,7 +1514,7 @@ mod tests {
     #[test]
     fn test_parse_header_size_minimal() {
         let gz = compress_single_member(b"hello");
-        let size = crate::decompression::parse_gzip_header_size_pub(&gz);
+        let size = crate::gzip_format::parse_gzip_header_size(&gz);
         assert_eq!(size, Some(10), "minimal gzip header is 10 bytes");
     }
 
@@ -1528,7 +1528,7 @@ mod tests {
         // Pad to make it look reasonable
         header.extend_from_slice(&[0u8; 20]);
 
-        let size = crate::decompression::parse_gzip_header_size_pub(&header);
+        let size = crate::gzip_format::parse_gzip_header_size(&header);
         assert_eq!(size, Some(12), "FHCRC adds 2 bytes to header");
     }
 
@@ -1541,7 +1541,7 @@ mod tests {
         header.extend_from_slice(b"test.txt\0");
         header.extend_from_slice(&[0u8; 20]);
 
-        let size = crate::decompression::parse_gzip_header_size_pub(&header);
+        let size = crate::gzip_format::parse_gzip_header_size(&header);
         assert_eq!(size, Some(10 + 9), "FNAME 'test.txt\\0' adds 9 bytes");
     }
 
@@ -1554,7 +1554,7 @@ mod tests {
         header.extend_from_slice(b"a comment\0");
         header.extend_from_slice(&[0u8; 20]);
 
-        let size = crate::decompression::parse_gzip_header_size_pub(&header);
+        let size = crate::gzip_format::parse_gzip_header_size(&header);
         assert_eq!(size, Some(10 + 10), "FCOMMENT 'a comment\\0' adds 10 bytes");
     }
 
@@ -1569,7 +1569,7 @@ mod tests {
         header.extend_from_slice(&[0u8; 6]); // 6 bytes of extra data
         header.extend_from_slice(&[0u8; 20]);
 
-        let size = crate::decompression::parse_gzip_header_size_pub(&header);
+        let size = crate::gzip_format::parse_gzip_header_size(&header);
         assert_eq!(size, Some(10 + 2 + 6), "FEXTRA with xlen=6 adds 8 bytes");
     }
 
@@ -1591,7 +1591,7 @@ mod tests {
         header.extend_from_slice(&[0x00, 0x00]);
         header.extend_from_slice(&[0u8; 20]);
 
-        let size = crate::decompression::parse_gzip_header_size_pub(&header);
+        let size = crate::gzip_format::parse_gzip_header_size(&header);
         // 10 base + 2 xlen + 4 extra + 5 fname + 2 fcomment + 2 fhcrc = 25
         assert_eq!(size, Some(25));
     }
@@ -1605,7 +1605,7 @@ mod tests {
             0x06,
         ];
         assert_eq!(
-            crate::decompression::parse_gzip_header_size_pub(&header),
+            crate::gzip_format::parse_gzip_header_size(&header),
             None
         );
     }
@@ -1614,7 +1614,7 @@ mod tests {
     fn test_parse_header_size_bad_magic() {
         let header = vec![0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF];
         assert_eq!(
-            crate::decompression::parse_gzip_header_size_pub(&header),
+            crate::gzip_format::parse_gzip_header_size(&header),
             None
         );
     }
@@ -1622,10 +1622,10 @@ mod tests {
     #[test]
     fn test_parse_header_size_too_short() {
         assert_eq!(
-            crate::decompression::parse_gzip_header_size_pub(&[0x1f, 0x8b]),
+            crate::gzip_format::parse_gzip_header_size(&[0x1f, 0x8b]),
             None
         );
-        assert_eq!(crate::decompression::parse_gzip_header_size_pub(&[]), None);
+        assert_eq!(crate::gzip_format::parse_gzip_header_size(&[]), None);
     }
 
     // --- Non-gzip silent empty output ---
@@ -1633,7 +1633,7 @@ mod tests {
     #[test]
     fn test_non_gzip_through_to_vec_returns_empty() {
         let non_gzip = b"this is not gzip data at all";
-        let result = crate::decompression::decompress_gzip_to_vec_pub(non_gzip, 4).unwrap();
+        let result = crate::decompression::decompress_gzip_to_vec(non_gzip, 4).unwrap();
         assert!(result.is_empty(), "non-gzip data must produce empty output");
     }
 
@@ -1642,20 +1642,20 @@ mod tests {
         let non_gzip = b"this is not gzip data at all";
         let mut output = Vec::new();
         let bytes =
-            crate::decompression::decompress_gzip_libdeflate_pub(non_gzip, &mut output, 4).unwrap();
+            crate::decompression::decompress_gzip_libdeflate(non_gzip, &mut output, 4).unwrap();
         assert_eq!(bytes, 0, "non-gzip must return 0 bytes written");
         assert!(output.is_empty());
     }
 
     #[test]
     fn test_single_byte_input_returns_empty() {
-        let result = crate::decompression::decompress_gzip_to_vec_pub(&[0x1f], 1).unwrap();
+        let result = crate::decompression::decompress_gzip_to_vec(&[0x1f], 1).unwrap();
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_empty_input_returns_empty() {
-        let result = crate::decompression::decompress_gzip_to_vec_pub(&[], 1).unwrap();
+        let result = crate::decompression::decompress_gzip_to_vec(&[], 1).unwrap();
         assert!(result.is_empty());
     }
 
@@ -1665,7 +1665,7 @@ mod tests {
     fn test_read_gzip_isize_correct() {
         let data = make_mixed(100_000);
         let gz = compress_single_member(&data);
-        let isize_val = crate::decompression::read_gzip_isize_pub(&gz).unwrap();
+        let isize_val = crate::gzip_format::read_gzip_isize(&gz).unwrap();
         assert_eq!(
             isize_val as usize,
             data.len(),
@@ -1675,14 +1675,14 @@ mod tests {
 
     #[test]
     fn test_read_gzip_isize_too_short() {
-        assert!(crate::decompression::read_gzip_isize_pub(&[0u8; 17]).is_none());
-        assert!(crate::decompression::read_gzip_isize_pub(&[]).is_none());
+        assert!(crate::gzip_format::read_gzip_isize(&[0u8; 17]).is_none());
+        assert!(crate::gzip_format::read_gzip_isize(&[]).is_none());
     }
 
     #[test]
     fn test_read_gzip_isize_empty_original() {
         let gz = compress_single_member(&[]);
-        let isize_val = crate::decompression::read_gzip_isize_pub(&gz).unwrap();
+        let isize_val = crate::gzip_format::read_gzip_isize(&gz).unwrap();
         assert_eq!(isize_val, 0, "ISIZE of empty data must be 0");
     }
 
@@ -1703,7 +1703,7 @@ mod tests {
         // But decompress_single_member_libdeflate_pub uses gzip_decompress_ex
         // which verifies the trailer. A wrong ISIZE = bad data.
         let mut out = Vec::new();
-        let result = crate::decompression::decompress_single_member_libdeflate_pub(&gz, &mut out);
+        let result = crate::decompression::decompress_single_member_libdeflate(&gz, &mut out);
         // Either error (CRC/ISIZE mismatch) or the data is wrong
         assert!(result.is_err() || out != data);
     }
@@ -1719,7 +1719,7 @@ mod tests {
         gz[len - 2] = 0;
         gz[len - 1] = 0;
         let mut out = Vec::new();
-        let result = crate::decompression::decompress_single_member_libdeflate_pub(&gz, &mut out);
+        let result = crate::decompression::decompress_single_member_libdeflate(&gz, &mut out);
         assert!(result.is_err() || out != data);
     }
 
@@ -1734,7 +1734,7 @@ mod tests {
         let mid = gz.len() / 2;
         gz[mid] ^= 0xFF;
         let mut out = Vec::new();
-        let result = crate::decompression::decompress_single_member_pub(&gz, &mut out, 1);
+        let result = crate::decompression::decompress_single_member(&gz, &mut out, 1);
         // Must error or produce wrong output — never silently succeed with wrong data
         assert!(
             result.is_err() || out != data,
@@ -1747,7 +1747,7 @@ mod tests {
         let data = make_zeros(200_000);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_pub(&gz, &mut out, 1).unwrap();
+        crate::decompression::decompress_single_member(&gz, &mut out, 1).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1756,7 +1756,7 @@ mod tests {
         let data = make_sequential(200_000);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_pub(&gz, &mut out, 1).unwrap();
+        crate::decompression::decompress_single_member(&gz, &mut out, 1).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1765,7 +1765,7 @@ mod tests {
         let data = make_random_seeded(200_000, 42);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_pub(&gz, &mut out, 1).unwrap();
+        crate::decompression::decompress_single_member(&gz, &mut out, 1).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1774,7 +1774,7 @@ mod tests {
         let data = make_mixed(200_000);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_pub(&gz, &mut out, 1).unwrap();
+        crate::decompression::decompress_single_member(&gz, &mut out, 1).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1783,7 +1783,7 @@ mod tests {
         let data = make_binary(200_000);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_pub(&gz, &mut out, 1).unwrap();
+        crate::decompression::decompress_single_member(&gz, &mut out, 1).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1792,7 +1792,7 @@ mod tests {
         let data = make_single_byte(200_000, 0xAA);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_pub(&gz, &mut out, 1).unwrap();
+        crate::decompression::decompress_single_member(&gz, &mut out, 1).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1805,7 +1805,7 @@ mod tests {
         let data = make_mixed(5 * 1024 * 1024);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_pub(&gz, &mut out, 4).unwrap();
+        crate::decompression::decompress_single_member(&gz, &mut out, 4).unwrap();
         assert_eq!(out, data, "parallel single-member 5MB must match original");
     }
 
@@ -1813,7 +1813,7 @@ mod tests {
     fn test_routing_single_member_8mb_parallel_through_router() {
         let data = make_mixed(8 * 1024 * 1024);
         let gz = compress_single_member(&data);
-        let result = crate::decompression::decompress_gzip_to_vec_pub(&gz, 4).unwrap();
+        let result = crate::decompression::decompress_gzip_to_vec(&gz, 4).unwrap();
         assert_eq!(
             result, data,
             "8MB single-member through full router must match"
@@ -1825,7 +1825,7 @@ mod tests {
         let data = make_mixed(5 * 1024 * 1024);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_pub(&gz, &mut out, 2).unwrap();
+        crate::decompression::decompress_single_member(&gz, &mut out, 2).unwrap();
         assert_eq!(
             out, data,
             "parallel at T2 must still produce correct output"
@@ -1839,7 +1839,7 @@ mod tests {
         let mut results = Vec::new();
         for threads in [2, 4, 8] {
             let mut out = Vec::new();
-            crate::decompression::decompress_single_member_pub(&gz, &mut out, threads).unwrap();
+            crate::decompression::decompress_single_member(&gz, &mut out, threads).unwrap();
             results.push(out);
         }
         for (i, r) in results.iter().enumerate().skip(1) {
@@ -1858,7 +1858,7 @@ mod tests {
     fn test_routing_single_member_zeros_8mb_parallel() {
         let data = make_zeros(8 * 1024 * 1024);
         let gz = compress_single_member(&data);
-        let result = crate::decompression::decompress_gzip_to_vec_pub(&gz, 4).unwrap();
+        let result = crate::decompression::decompress_gzip_to_vec(&gz, 4).unwrap();
         assert_eq!(result, data, "8MB zeros through parallel must match");
     }
 
@@ -1871,7 +1871,7 @@ mod tests {
         let data = make_mixed(2 * 1024 * 1024);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_streaming_pub(&gz, &mut out).unwrap();
+        crate::decompression::decompress_single_member_streaming(&gz, &mut out).unwrap();
         assert_eq!(out, data, "streaming decompress must match original");
     }
 
@@ -1880,7 +1880,7 @@ mod tests {
         let data = make_zeros(5 * 1024 * 1024);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_streaming_pub(&gz, &mut out).unwrap();
+        crate::decompression::decompress_single_member_streaming(&gz, &mut out).unwrap();
         assert_eq!(out, data, "streaming zeros must match");
     }
 
@@ -1889,7 +1889,7 @@ mod tests {
         let data = make_random_seeded(1024 * 1024, 0xdeadbeef);
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_streaming_pub(&gz, &mut out).unwrap();
+        crate::decompression::decompress_single_member_streaming(&gz, &mut out).unwrap();
         assert_eq!(out, data, "streaming random data must match");
     }
 
@@ -1899,11 +1899,11 @@ mod tests {
         let gz = compress_single_member(&data);
 
         let mut streaming_out = Vec::new();
-        crate::decompression::decompress_single_member_streaming_pub(&gz, &mut streaming_out)
+        crate::decompression::decompress_single_member_streaming(&gz, &mut streaming_out)
             .unwrap();
 
         let mut libdeflate_out = Vec::new();
-        crate::decompression::decompress_single_member_libdeflate_pub(&gz, &mut libdeflate_out)
+        crate::decompression::decompress_single_member_libdeflate(&gz, &mut libdeflate_out)
             .unwrap();
 
         assert_eq!(
@@ -1917,7 +1917,7 @@ mod tests {
         let data = b"hello world streaming test".to_vec();
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_streaming_pub(&gz, &mut out).unwrap();
+        crate::decompression::decompress_single_member_streaming(&gz, &mut out).unwrap();
         assert_eq!(out, data);
     }
 
@@ -1926,7 +1926,7 @@ mod tests {
         let data = Vec::new();
         let gz = compress_single_member(&data);
         let mut out = Vec::new();
-        crate::decompression::decompress_single_member_streaming_pub(&gz, &mut out).unwrap();
+        crate::decompression::decompress_single_member_streaming(&gz, &mut out).unwrap();
         assert!(out.is_empty());
     }
 

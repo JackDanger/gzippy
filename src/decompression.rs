@@ -1,53 +1,27 @@
-//! Ultra-fast decompression using libdeflate + zlib-ng
+//! Gzip decompression engine — pure bytes-in / bytes-out.
 //!
-//! Strategy:
-//! - Single-member gzip: libdeflate (30-50% faster than zlib)
-//! - Multi-member gzip: zlib-ng via flate2 (reliable member boundary handling)
-//! - Stdin streaming: flate2 MultiGzDecoder
+//! Entry points for the I/O layer (`decompress_io`) are in that module.
+//! This module only handles: classify → route → decompress.
 //!
-//! Key optimizations:
-//! - ISIZE trailer hint for accurate buffer pre-allocation
-//! - SIMD-accelerated header detection via memchr
-//! - Cache-line aligned buffers (64 bytes on x86, 128 on Apple Silicon)
-//!
-//! Key insight: Deflate streams can contain bytes that look like gzip headers
-//! (0x1f 0x8b 0x08), so we can't reliably detect member boundaries by scanning.
-//! Instead, we use flate2's GzDecoder which properly parses each member.
+//! All functions are `pub(crate)` so tests can call them directly without
+//! `_pub` wrappers. There is no I/O, no file handling, no stats printing here.
 
-use std::fs::File;
-use std::io::{stdin, stdout, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::io::Write;
 
-use memmap2::Mmap;
-
-use crate::cli::GzippyArgs;
 use crate::error::{GzippyError, GzippyResult};
-use crate::format::CompressionFormat;
-use crate::utils::strip_compression_extension;
+use crate::gzip_format::{has_bgzf_markers, is_likely_multi_member, read_gzip_isize};
 
-/// Output buffer size for streaming (1MB for better throughput on large files)
 const STREAM_BUFFER_SIZE: usize = 1024 * 1024;
 
-#[inline]
-fn debug_enabled() -> bool {
-    use std::sync::OnceLock;
-    static DEBUG: OnceLock<bool> = OnceLock::new();
-    *DEBUG.get_or_init(|| std::env::var("GZIPPY_DEBUG").is_ok())
-}
-
-/// Cache line size for buffer alignment
 #[cfg(target_os = "macos")]
-const CACHE_LINE_SIZE: usize = 128; // Apple Silicon uses 128-byte cache lines
-
+const CACHE_LINE_SIZE: usize = 128;
 #[cfg(not(target_os = "macos"))]
-const CACHE_LINE_SIZE: usize = 64; // x86 and most ARM use 64-byte cache lines
+const CACHE_LINE_SIZE: usize = 64;
 
-/// Allocate a buffer aligned to cache line boundaries
 #[inline]
 fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
-    // Round up size to cache line boundary for better memory access patterns
-    let aligned_size = (size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
-    vec![0u8; aligned_size]
+    let aligned = (size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+    vec![0u8; aligned]
 }
 
 // =============================================================================
@@ -61,11 +35,11 @@ fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
 /// here, a condition in `classify_gzip`, and a dispatch arm below.
 ///
 /// Current paths (in priority order):
-///   GzippyParallel  — gzippy-produced multi-block files ("GZ" FEXTRA subfield)
-///   MultiMemberPar  — pigz-style multi-member, Tmax threads
-///   MultiMemberSeq  — pigz-style multi-member, T1
-///   IsalSingle      — x86_64 single-member via ISA-L (fastest sequential)
-///   StreamingSingle — single-member > 1GB, no ISA-L (avoids huge allocation)
+///   GzippyParallel   — gzippy-produced multi-block files ("GZ" FEXTRA subfield)
+///   MultiMemberPar   — pigz-style multi-member, Tmax threads
+///   MultiMemberSeq   — pigz-style multi-member, T1
+///   IsalSingle       — x86_64 single-member via ISA-L (fastest sequential)
+///   StreamingSingle  — single-member > 1GB, no ISA-L (avoids huge allocation)
 ///   LibdeflateSingle — default single-member via libdeflate one-shot
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodePath {
@@ -79,13 +53,12 @@ pub enum DecodePath {
 
 /// Classify a gzip input into the optimal `DecodePath`.
 ///
-/// This is the single source of truth for routing. All classification logic
-/// lives here; `decompress_gzip_libdeflate` only dispatches.
+/// Single source of truth for routing. All classification logic lives here;
+/// `decompress_gzip_libdeflate` only dispatches on the result.
 pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
     if has_bgzf_markers(data) {
         return DecodePath::GzippyParallel;
     }
-
     if is_likely_multi_member(data) {
         return if num_threads > 1 {
             DecodePath::MultiMemberPar
@@ -93,659 +66,21 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
             DecodePath::MultiMemberSeq
         };
     }
-
-    // Single-member paths
     if crate::isal_decompress::is_available() {
         return DecodePath::IsalSingle;
     }
-
     if data.len() > 1024 * 1024 * 1024 {
         return DecodePath::StreamingSingle;
     }
-
     DecodePath::LibdeflateSingle
 }
 
-pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
-    if filename == "-" {
-        return decompress_stdin(args);
-    }
-
-    let input_path = Path::new(filename);
-    if !input_path.exists() {
-        return Err(GzippyError::FileNotFound(filename.to_string()));
-    }
-
-    if input_path.is_dir() {
-        return if args.recursive {
-            decompress_directory(filename, args)
-        } else {
-            Err(GzippyError::invalid_argument(format!(
-                "{} is a directory",
-                filename
-            )))
-        };
-    }
-
-    // Skip symlinks (unless -f)
-    if input_path.is_symlink() && !args.force {
-        if !args.quiet {
-            eprintln!(
-                "gzippy: {}: is a symbolic link -- skipping (use -f to force)",
-                filename
-            );
-        }
-        return Ok(2);
-    }
-
-    // Skip special files (devices, FIFOs, sockets)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        let ft = std::fs::symlink_metadata(input_path)?.file_type();
-        if ft.is_block_device() || ft.is_char_device() || ft.is_fifo() || ft.is_socket() {
-            if !args.quiet {
-                eprintln!("gzippy: {}: is not a regular file -- skipping", filename);
-            }
-            return Ok(2);
-        }
-    }
-
-    let input_file = File::open(input_path)?;
-    let file_size = input_file.metadata()?.len();
-    let mmap = unsafe { Mmap::map(&input_file)? };
-    let _ = mmap.advise(memmap2::Advice::Sequential);
-
-    // Check if data looks like a compressed format
-    let is_compressed =
-        mmap.len() >= 2 && ((mmap[0] == 0x1f && mmap[1] == 0x8b) || mmap[0] == 0x78);
-
-    // Force pass-through: if force+stdout and data doesn't look compressed, copy unchanged
-    if args.force && args.stdout && !is_compressed {
-        let stdout = stdout();
-        let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
-        writer.write_all(&mmap)?;
-        writer.flush()?;
-        return Ok(0);
-    }
-
-    // Non-gzip data without stdout: can't decompress to a file
-    if !is_compressed {
-        return Err(GzippyError::invalid_argument(format!(
-            "{}: not in gzip format",
-            filename
-        )));
-    }
-
-    let output_path = if args.stdout {
-        None
-    } else {
-        Some(get_output_filename(input_path, args, &mmap))
-    };
-
-    if let Some(ref output_path) = output_path {
-        if output_path.exists() && !args.force {
-            use std::io::IsTerminal;
-            if std::io::stdin().is_terminal() {
-                eprint!(
-                    "gzippy: {} already exists; do you wish to overwrite (y or n)? ",
-                    output_path.display()
-                );
-                let mut response = String::new();
-                std::io::stdin().read_line(&mut response)?;
-                if !response.trim().eq_ignore_ascii_case("y") {
-                    eprintln!("\tnot overwritten");
-                    return Ok(2);
-                }
-            } else {
-                return Err(GzippyError::invalid_argument(format!(
-                    "Output file {} already exists",
-                    output_path.display()
-                )));
-            }
-        }
-    }
-
-    let format = detect_compression_format_from_path(input_path)?;
-
-    // Register output file for signal handler cleanup
-    if let Some(ref output_path) = output_path {
-        crate::set_output_file(Some(output_path.to_string_lossy().to_string()));
-    }
-
-    let result = if args.stdout {
-        let stdout = stdout();
-        let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
-
-        let is_gzip = matches!(format, CompressionFormat::Gzip | CompressionFormat::Zip);
-        let bgzf = has_bgzf_markers(&mmap);
-        let multi = is_likely_multi_member(&mmap);
-        let can_parallelize = args.processes > 1 && is_gzip && (bgzf || multi);
-
-        if debug_enabled() {
-            eprintln!(
-                "[gzippy] decompress_file stdout: len={} bgzf={} multi={} parallel={} procs={}",
-                mmap.len(),
-                bgzf,
-                multi,
-                can_parallelize,
-                args.processes
-            );
-        }
-
-        let size = if bgzf && is_gzip {
-            // BGZF: always use BGZF-optimized path.
-            // decompress_bgzf_parallel handles T1 vs Tmax internally:
-            // T1 streams block-by-block (no huge allocation), Tmax uses parallel Vec.
-            let threads = if can_parallelize { args.processes } else { 1 };
-            let bytes = crate::bgzf::decompress_bgzf_parallel(&mmap[..], &mut writer, threads)?;
-            if debug_enabled() {
-                eprintln!("[gzippy] BGZF decompress returned {} bytes", bytes);
-            }
-            Ok(bytes)
-        } else if can_parallelize {
-            let output = decompress_gzip_to_vec(&mmap[..], args.processes)?;
-            if debug_enabled() {
-                eprintln!(
-                    "[gzippy] decompress_gzip_to_vec returned {} bytes",
-                    output.len()
-                );
-            }
-            let len = output.len() as u64;
-            writer.write_all(&output)?;
-            Ok(len)
-        } else if is_gzip {
-            Ok(decompress_single_member(
-                &mmap[..],
-                &mut writer,
-                args.processes,
-            )?)
-        } else {
-            match format {
-                CompressionFormat::Gzip | CompressionFormat::Zip => {
-                    Ok(decompress_multi_member_sequential(&mmap[..], &mut writer)?)
-                }
-                CompressionFormat::Zlib => Ok(decompress_zlib_turbo(&mmap[..], &mut writer)?),
-            }
-        };
-        writer.flush()?;
-        size
-    } else {
-        let output_path = output_path.clone().unwrap();
-        let output_file = File::create(&output_path)?;
-        let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
-        decompress_mmap_libdeflate(&mmap, &mut writer, format, args.processes)
-    };
-
-    // Clear signal handler's output file reference
-    crate::set_output_file(None);
-
-    match result {
-        Ok(output_size) => {
-            if !args.stdout {
-                if let Some(ref output_path) = output_path {
-                    // Preserve file permissions and timestamps on output file
-                    preserve_metadata(input_path, output_path);
-
-                    // If --name, restore mtime from gzip header
-                    if args.name {
-                        if let Some(header_mtime) = extract_gzip_mtime(&mmap) {
-                            if header_mtime != 0 {
-                                let _ = filetime::set_file_mtime(
-                                    output_path,
-                                    filetime::FileTime::from_unix_time(header_mtime as i64, 0),
-                                );
-                            }
-                        }
-                    }
-
-                    // Synchronous: fsync after write
-                    if args.synchronous {
-                        if let Ok(f) = File::open(output_path) {
-                            let _ = f.sync_all();
-                        }
-                    }
-                }
-            }
-
-            if args.verbosity > 0 && !args.quiet {
-                print_decompression_stats(file_size, output_size, input_path);
-            }
-            if !args.keep && !args.stdout {
-                std::fs::remove_file(input_path)?;
-            }
-            Ok(0)
-        }
-        Err(e) => {
-            if !args.stdout {
-                let cleanup_path = get_output_filename(input_path, args, &mmap);
-                if cleanup_path.exists() {
-                    let _ = std::fs::remove_file(&cleanup_path);
-                }
-            }
-            Err(e)
-        }
-    }
-}
-
-pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
-    use std::io::Read;
-
-    // Try to mmap stdin when it's a regular file (e.g. benchmark piping).
-    // This avoids copying the entire input into a Vec.
-    #[cfg(unix)]
-    let mmap_data: Option<Mmap> = {
-        use std::os::unix::io::FromRawFd;
-        let stdin_fd = 0;
-        let meta =
-            std::fs::File::from(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(stdin_fd) });
-        let ft = meta.metadata().map(|m| m.file_type());
-        let is_regular = ft.as_ref().map(|ft| ft.is_file()).unwrap_or(false);
-        let result = if is_regular {
-            let m = unsafe { Mmap::map(&meta) }.ok();
-            if let Some(ref mmap) = m {
-                let _ = mmap.advise(memmap2::Advice::Sequential);
-            }
-            m
-        } else {
-            None
-        };
-        std::mem::forget(meta); // don't close stdin
-        result
-    };
-
-    #[cfg(not(unix))]
-    let mmap_data: Option<Mmap> = None;
-
-    let input_data_vec;
-    let input_data: &[u8] = if let Some(ref mmap) = mmap_data {
-        if debug_enabled() {
-            eprintln!("[gzippy] stdin mmap'd: {} bytes", mmap.len());
-        }
-        &mmap[..]
-    } else {
-        let stdin_handle = stdin();
-        let mut data = Vec::new();
-        {
-            let mut reader = BufReader::with_capacity(STREAM_BUFFER_SIZE, stdin_handle.lock());
-            reader.read_to_end(&mut data)?;
-        }
-        input_data_vec = data;
-        &input_data_vec
-    };
-
-    if input_data.is_empty() {
-        return Ok(0);
-    }
-
-    // Detect format
-    let is_gzip = input_data.len() >= 2 && input_data[0] == 0x1f && input_data[1] == 0x8b;
-    let is_zlib = input_data.len() >= 2 && input_data[0] == 0x78;
-
-    // Force pass-through: if force is set and data doesn't look compressed, pass through
-    if args.force && !is_gzip && !is_zlib {
-        let stdout = stdout();
-        let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
-        writer.write_all(input_data)?;
-        writer.flush()?;
-        return Ok(0);
-    }
-
-    let format = if is_gzip {
-        CompressionFormat::Gzip
-    } else if is_zlib {
-        CompressionFormat::Zlib
-    } else {
-        CompressionFormat::Gzip // Default
-    };
-
-    let stdout = stdout();
-    let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
-
-    match format {
-        CompressionFormat::Gzip | CompressionFormat::Zip => {
-            let is_bgzf = has_bgzf_markers(input_data);
-            let is_multi = !is_bgzf && is_likely_multi_member(input_data);
-            let can_parallelize = args.processes > 1 && (is_bgzf || is_multi);
-
-            if debug_enabled() {
-                eprintln!(
-                    "[gzippy] decompress_stdin: len={} bgzf={} multi={} parallel={} procs={}",
-                    input_data.len(),
-                    is_bgzf,
-                    is_multi,
-                    can_parallelize,
-                    args.processes
-                );
-            }
-
-            if is_bgzf {
-                let threads = if can_parallelize { args.processes } else { 1 };
-                crate::bgzf::decompress_bgzf_parallel(input_data, &mut writer, threads)?;
-            } else if can_parallelize {
-                let output = decompress_gzip_to_vec(input_data, args.processes)?;
-                writer.write_all(&output)?;
-            } else {
-                decompress_single_member(input_data, &mut writer, args.processes)?;
-            }
-        }
-        CompressionFormat::Zlib => {
-            decompress_zlib_turbo(input_data, &mut writer)?;
-        }
-    }
-
-    writer.flush()?;
-
-    Ok(0)
-}
-
-/// Recursively decompress all compressed files in a directory
-fn decompress_directory(dirname: &str, args: &GzippyArgs) -> GzippyResult<i32> {
-    use walkdir::WalkDir;
-
-    let mut exit_code = 0;
-
-    for entry in WalkDir::new(dirname) {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_file() && crate::utils::is_compressed_file(path) {
-            let path_str = path.to_string_lossy();
-            match decompress_file(&path_str, args) {
-                Ok(code) => {
-                    if code != 0 {
-                        exit_code = code;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("gzippy: {}: {}", path_str, e);
-                    exit_code = 1;
-                }
-            }
-        }
-    }
-
-    Ok(exit_code)
-}
-
-/// Decompress using libdeflate (fastest for in-memory data)
-fn decompress_mmap_libdeflate<W: Write + Send>(
-    mmap: &Mmap,
-    writer: &mut W,
-    format: CompressionFormat,
-    num_threads: usize,
-) -> GzippyResult<u64> {
-    match format {
-        CompressionFormat::Gzip | CompressionFormat::Zip => {
-            decompress_gzip_libdeflate(&mmap[..], writer, num_threads)
-        }
-        CompressionFormat::Zlib => decompress_zlib_turbo(&mmap[..], writer),
-    }
-}
-
-/// Quick check if data contains multiple gzip members
-/// Uses SIMD-accelerated search via memchr (10-50x faster than byte-by-byte)
-/// Only scans first 256KB to detect parallel-compressed files
-#[inline]
-/// Check if this is a multi-member gzip by checking if there are more
-/// gzip headers after the first member's minimum size.
-///
-/// Uses conservative heuristics to avoid false positives from gzip magic
-/// appearing in compressed data.
-fn is_likely_multi_member(data: &[u8]) -> bool {
-    use memchr::memmem;
-
-    // A gzip member is minimum 18 bytes (10 header + 8 trailer)
-    if data.len() < 36 {
-        return false;
-    }
-
-    let header_size = parse_gzip_header_size(data).unwrap_or(10);
-
-    const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b, 0x08];
-    let finder = memmem::Finder::new(GZIP_MAGIC);
-
-    // Start searching after the first header
-    let search_start = header_size + 1;
-
-    let mut pos = search_start;
-    while let Some(offset) = finder.find(&data[pos..]) {
-        let header_pos = pos + offset;
-
-        if header_pos + 10 > data.len() {
-            break;
-        }
-
-        // A real member boundary must be preceded by the previous member's
-        // gzip trailer (4-byte CRC32 + 4-byte ISIZE). Minimum member size
-        // is 18 bytes, so we need at least 18 bytes before the candidate.
-        if header_pos < 18 {
-            pos = header_pos + 1;
-            continue;
-        }
-
-        // Check ISIZE from the preceding trailer: the 4 bytes immediately
-        // before the candidate should be the previous member's uncompressed
-        // size (mod 2^32). Must be > 0 and plausible.
-        let preceding_isize = u32::from_le_bytes([
-            data[header_pos - 4],
-            data[header_pos - 3],
-            data[header_pos - 2],
-            data[header_pos - 1],
-        ]);
-        if preceding_isize == 0 || preceding_isize > 1_073_741_824 {
-            pos = header_pos + 1;
-            continue;
-        }
-
-        let flags = data[header_pos + 3];
-
-        // Reserved bits must be zero
-        if flags & 0xE0 != 0 {
-            pos = header_pos + 1;
-            continue;
-        }
-
-        // MTIME should be reasonable
-        let mtime = u32::from_le_bytes([
-            data[header_pos + 4],
-            data[header_pos + 5],
-            data[header_pos + 6],
-            data[header_pos + 7],
-        ]);
-        if mtime != 0 && mtime > 4_102_444_800 {
-            pos = header_pos + 1;
-            continue;
-        }
-
-        // XFL should be 0, 2, or 4
-        let xfl = data[header_pos + 8];
-        if xfl != 0 && xfl != 2 && xfl != 4 {
-            pos = header_pos + 1;
-            continue;
-        }
-
-        // OS should be a known value (0-13, 255)
-        let os = data[header_pos + 9];
-        if os > 13 && os != 255 {
-            pos = header_pos + 1;
-            continue;
-        }
-
-        return true;
-    }
-
-    false
-}
-
-/// Parse gzip header size (variable due to FEXTRA, FNAME, FCOMMENT, FHCRC)
-fn parse_gzip_header_size(data: &[u8]) -> Option<usize> {
-    if data.len() < 10 {
-        return None;
-    }
-
-    if data[0] != 0x1f || data[1] != 0x8b || data[2] != 0x08 {
-        return None;
-    }
-
-    let flags = data[3];
-    let mut pos = 10;
-
-    // FEXTRA
-    if flags & 0x04 != 0 {
-        if pos + 2 > data.len() {
-            return None;
-        }
-        let xlen = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2 + xlen;
-    }
-
-    // FNAME (null-terminated)
-    if flags & 0x08 != 0 {
-        while pos < data.len() && data[pos] != 0 {
-            pos += 1;
-        }
-        pos += 1; // null terminator
-    }
-
-    // FCOMMENT (null-terminated)
-    if flags & 0x10 != 0 {
-        while pos < data.len() && data[pos] != 0 {
-            pos += 1;
-        }
-        pos += 1;
-    }
-
-    // FHCRC
-    if flags & 0x02 != 0 {
-        pos += 2;
-    }
-
-    Some(pos)
-}
-
-/// Legacy function for compatibility
-#[allow(dead_code)]
-fn is_multi_member_quick(data: &[u8]) -> bool {
-    is_likely_multi_member(data)
-}
-
-/// Check whether the data is compressible enough to benefit from parallel speculation.
-///
-/// Reads the ISIZE hint from the gzip trailer (mod 2^32) and compares to the
-/// compressed size. Ratio >= 2.0 means decompressed is at least 2x compressed —
-/// a reasonable proxy for data that has enough redundancy to produce good spec hits.
-///
-/// Returns true for compressible data (parallel likely helps), false otherwise.
-/// On ISIZE=0 (unknown/wraps), defaults to false (sequential is safe).
-/// Decompress a single-member gzip file.
-///
-/// Routes to the best available decoder:
-///   - ISA-L (x86_64 with AVX2): fastest sequential path
-///   - libdeflate one-shot: fastest arm64 path for all practical files
-///   - streaming zlib-ng: only for files > 1GB (avoids huge allocation)
-///
-/// Note: parallel_single_member::decompress_parallel exists but is not yet
-/// faster than sequential paths (88-148 MB/s vs 600-2000 MB/s). Not wired in.
-fn decompress_single_member<W: Write>(
-    data: &[u8],
-    writer: &mut W,
-    _num_threads: usize,
-) -> GzippyResult<u64> {
-    if crate::isal_decompress::is_available() {
-        if let Some(bytes) = crate::isal_decompress::decompress_gzip_stream(data, writer) {
-            writer.flush()?;
-            return Ok(bytes);
-        }
-        if debug_enabled() {
-            eprintln!(
-                "[gzippy] WARNING: ISA-L decompress failed on {} bytes, using libdeflate",
-                data.len()
-            );
-        }
-    }
-
-    // Streaming zlib-ng only for files that would need a >1GB output buffer
-    // (ISIZE wraps at 4GB; isize_hint unreliable for very large files).
-    // For all practical files, libdeflate one-shot is faster.
-    if !crate::isal_decompress::is_available() && data.len() > 1024 * 1024 * 1024 {
-        if debug_enabled() {
-            eprintln!("[gzippy] streaming zlib-ng decode: {} bytes", data.len());
-        }
-        return decompress_single_member_streaming(data, writer);
-    }
-
-    decompress_single_member_libdeflate(data, writer)
-}
-
-/// Streaming single-member decompress using zlib-ng (flate2).
-/// Uses a fixed 1MB buffer reused every iteration, eliminating the
-/// page fault overhead of allocating a full-size output buffer.
-/// On arm64, zlib-ng uses NEON for inflate.
-fn decompress_single_member_streaming<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
-    use std::io::Read;
-
-    const BUF_SIZE: usize = 1024 * 1024;
-
-    let mut decoder = flate2::read::GzDecoder::new(data);
-    let mut buf = vec![0u8; BUF_SIZE];
-    let mut total = 0u64;
-
-    loop {
-        let n = decoder.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        writer.write_all(&buf[..n])?;
-        total += n as u64;
-    }
-    writer.flush()?;
-    Ok(total)
-}
-
-/// Decompress single-member gzip using libdeflate FFI (fastest path)
-///
-/// Uses DecompressorEx::gzip_decompress_ex() which handles the full gzip
-/// format (header + deflate + trailer) in a single call. Grows the output
-/// buffer and retries on insufficient space.
-fn decompress_single_member_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
-    use crate::libdeflate_ext::{DecompressError, DecompressorEx};
-
-    let mut decompressor = DecompressorEx::new();
-
-    // Use ISIZE from trailer for initial buffer sizing
-    let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
-    let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
-        isize_hint + 1024
-    } else {
-        data.len().saturating_mul(4).max(64 * 1024)
-    };
-
-    let mut output = alloc_aligned_buffer(initial_size);
-
-    loop {
-        match decompressor.gzip_decompress_ex(data, &mut output) {
-            Ok(result) => {
-                writer.write_all(&output[..result.output_size])?;
-                writer.flush()?;
-                return Ok(result.output_size as u64);
-            }
-            Err(DecompressError::InsufficientSpace) => {
-                let new_size = output.len().saturating_mul(2);
-                output.resize(new_size, 0);
-                continue;
-            }
-            Err(DecompressError::BadData) => {
-                return Err(GzippyError::invalid_argument(
-                    "invalid gzip data".to_string(),
-                ));
-            }
-        }
-    }
-}
-
-/// Public entry point for decompressing gzip data to an arbitrary writer.
-/// Used by --test mode and other callers that need direct access.
+// =============================================================================
+// Public entry point
+// =============================================================================
+
+/// Decompress gzip data to an arbitrary writer. Used by --test mode and
+/// callers that need direct access without going through the file I/O layer.
 pub fn decompress_gzip_to_writer<W: Write + Send>(
     data: &[u8],
     writer: &mut W,
@@ -756,54 +91,12 @@ pub fn decompress_gzip_to_writer<W: Write + Send>(
     decompress_gzip_libdeflate(data, writer, num_threads)
 }
 
-/// Decompress gzip to a Vec, returning the output directly.
-///
-/// For BGZF data, uses the zero-copy parallel path that avoids intermediate
-/// buffer copies. For other formats, decompresses into a Vec via Write trait.
-fn decompress_gzip_to_vec(data: &[u8], num_threads: usize) -> GzippyResult<Vec<u8>> {
-    if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
-        return Ok(Vec::new());
-    }
+// =============================================================================
+// Core engine — all pub(crate) so tests can reach them directly
+// =============================================================================
 
-    if has_bgzf_markers(data) {
-        let output = crate::bgzf::decompress_bgzf_parallel_to_vec(data, num_threads)?;
-        if debug_enabled() {
-            eprintln!(
-                "[gzippy] BGZF parallel: {} bytes, {} threads",
-                output.len(),
-                num_threads
-            );
-        }
-        return Ok(output);
-    }
-
-    if num_threads > 1 && is_likely_multi_member(data) {
-        let output = crate::bgzf::decompress_multi_member_parallel_to_vec(data, num_threads)?;
-        if debug_enabled() {
-            eprintln!(
-                "[gzippy] Multi-member parallel: {} bytes, {} threads",
-                output.len(),
-                num_threads
-            );
-        }
-        return Ok(output);
-    }
-
-    let mut output = Vec::new();
-    decompress_gzip_libdeflate(data, &mut output, num_threads)?;
-    Ok(output)
-}
-
-/// Decompress gzip - chooses optimal strategy based on content.
-///
-/// All paths use libdeflate C FFI for maximum decompression speed.
-///
-/// Strategies (in order of preference):
-/// 1. BGZF-style (gzippy output): parallel libdeflate using embedded block sizes
-/// 2. Multi-member (pigz-style): parallel libdeflate per member
-/// 3. Single member: libdeflate gzip_decompress_ex (sequential)
-/// 4. Sequential fallback: libdeflate member-by-member
-fn decompress_gzip_libdeflate<W: Write + Send>(
+/// Route and decompress a gzip byte slice to `writer`.
+pub(crate) fn decompress_gzip_libdeflate<W: Write + Send>(
     data: &[u8],
     writer: &mut W,
     num_threads: usize,
@@ -814,12 +107,10 @@ fn decompress_gzip_libdeflate<W: Write + Send>(
 
     let path = classify_gzip(data, num_threads);
 
-    if debug_enabled() {
+    if crate::utils::debug_enabled() {
         eprintln!(
             "[gzippy] path={:?} threads={} bytes={}",
-            path,
-            num_threads,
-            data.len()
+            path, num_threads, data.len()
         );
     }
 
@@ -839,331 +130,118 @@ fn decompress_gzip_libdeflate<W: Write + Send>(
     }
 }
 
-/// Check if data has BGZF-style "GZ" markers in the first gzip header
-#[inline]
-pub(crate) fn has_bgzf_markers(data: &[u8]) -> bool {
-    // Minimum header with FEXTRA: 10 base + 2 XLEN + 4 subfield header
-    if data.len() < 16 {
-        return false;
+/// Decompress gzip to an owned Vec. Used by the I/O layer for parallel paths
+/// that benefit from a Vec intermediate (e.g. multi-member Tmax).
+pub(crate) fn decompress_gzip_to_vec(data: &[u8], num_threads: usize) -> GzippyResult<Vec<u8>> {
+    if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
+        return Ok(Vec::new());
     }
-
-    // Check FEXTRA flag (bit 2 of flags byte at offset 3)
-    if data[3] & 0x04 == 0 {
-        return false;
+    if has_bgzf_markers(data) {
+        return Ok(crate::bgzf::decompress_bgzf_parallel_to_vec(data, num_threads)?);
     }
-
-    // Get XLEN (2 bytes at offset 10, little-endian)
-    let xlen = u16::from_le_bytes([data[10], data[11]]) as usize;
-    if xlen < 6 || data.len() < 12 + xlen {
-        return false;
+    if num_threads > 1 && is_likely_multi_member(data) {
+        return Ok(crate::bgzf::decompress_multi_member_parallel_to_vec(data, num_threads)?);
     }
-
-    // Look for "RZ" subfield ID
-    let extra_field = &data[12..12 + xlen];
-    let mut pos = 0;
-    while pos + 4 <= extra_field.len() {
-        let subfield_id = &extra_field[pos..pos + 2];
-        let subfield_len =
-            u16::from_le_bytes([extra_field[pos + 2], extra_field[pos + 3]]) as usize;
-
-        if subfield_id == crate::parallel_compress::GZ_SUBFIELD_ID.as_slice() {
-            return true;
-        }
-
-        pos += 4 + subfield_len;
-    }
-
-    false
+    let mut output = Vec::new();
+    decompress_gzip_libdeflate(data, &mut output, num_threads)?;
+    Ok(output)
 }
 
-/// Parse BGZF block boundaries from "RZ" markers
-/// Returns (blocks, consumed_all) where consumed_all is true if we parsed the entire file
-fn parse_bgzf_blocks(data: &[u8]) -> (Vec<(usize, usize)>, bool) {
-    let mut blocks = Vec::new();
-    let mut offset = 0;
-
-    while offset < data.len() {
-        // Check for gzip magic
-        if data.len() - offset < 18 {
-            break;
+/// Route to the best available single-member decoder.
+pub(crate) fn decompress_single_member<W: Write>(
+    data: &[u8],
+    writer: &mut W,
+    _num_threads: usize,
+) -> GzippyResult<u64> {
+    if crate::isal_decompress::is_available() {
+        if let Some(bytes) = crate::isal_decompress::decompress_gzip_stream(data, writer) {
+            writer.flush()?;
+            return Ok(bytes);
         }
-        if data[offset] != 0x1f || data[offset + 1] != 0x8b {
-            break;
-        }
-
-        // Check FEXTRA flag
-        if data[offset + 3] & 0x04 == 0 {
-            break; // No FEXTRA, can't parse block size
-        }
-
-        // Get XLEN
-        if data.len() - offset < 12 {
-            break;
-        }
-        let xlen = u16::from_le_bytes([data[offset + 10], data[offset + 11]]) as usize;
-        if data.len() - offset < 12 + xlen {
-            break;
-        }
-
-        // Find "RZ" subfield
-        let extra_start = offset + 12;
-        let extra_field = &data[extra_start..extra_start + xlen];
-        let mut block_size = None;
-        let mut pos = 0;
-
-        while pos + 4 <= extra_field.len() {
-            let subfield_id = &extra_field[pos..pos + 2];
-            let subfield_len =
-                u16::from_le_bytes([extra_field[pos + 2], extra_field[pos + 3]]) as usize;
-
-            if subfield_id == crate::parallel_compress::GZ_SUBFIELD_ID.as_slice()
-                && subfield_len >= 2
-                && pos + 4 + 2 <= extra_field.len()
-            {
-                // Block size is stored as (size - 1)
-                let size_minus_1 = u16::from_le_bytes([extra_field[pos + 4], extra_field[pos + 5]]);
-                block_size = Some((size_minus_1 as usize) + 1);
-                break;
-            }
-
-            pos += 4 + subfield_len;
-        }
-
-        match block_size {
-            Some(size) if size > 1 && offset + size <= data.len() => {
-                // size > 1 because size=1 means stored value was 0 (overflow marker)
-                blocks.push((offset, size));
-                offset += size;
-            }
-            _ => break, // Invalid, overflow, or missing block size
+        if crate::utils::debug_enabled() {
+            eprintln!(
+                "[gzippy] WARNING: ISA-L decompress failed on {} bytes, using libdeflate",
+                data.len()
+            );
         }
     }
-
-    // Return whether we consumed the entire file
-    let consumed_all = offset >= data.len();
-    (blocks, consumed_all)
+    if !crate::isal_decompress::is_available() && data.len() > 1024 * 1024 * 1024 {
+        if crate::utils::debug_enabled() {
+            eprintln!("[gzippy] streaming zlib-ng decode: {} bytes", data.len());
+        }
+        return decompress_single_member_streaming(data, writer);
+    }
+    decompress_single_member_libdeflate(data, writer)
 }
 
-/// Enhanced parallel decompression for BGZF-style files with prefetching
-///
-/// Not currently wired into production (no-fallback policy: the primary
-/// BGZF path must succeed without cascading to this). Kept for reference
-/// and possible future use as an alternative BGZF strategy.
-#[allow(dead_code)]
-fn decompress_bgzf_parallel_prefetch<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
-    use std::cell::UnsafeCell;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::thread;
-
-    let (blocks, consumed_all) = parse_bgzf_blocks(data);
-
-    // Fall back to sequential if we couldn't parse ALL blocks
-    if blocks.is_empty() || !consumed_all {
-        return decompress_multi_member_sequential(data, writer);
-    }
-
-    // For few blocks, sequential is faster (avoids thread overhead)
-    if blocks.len() < 4 {
-        return decompress_multi_member_sequential(data, writer);
-    }
-
-    let num_blocks = blocks.len();
-    let num_threads = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4)
-        .min(num_blocks);
-
-    // Output slot for each block - pre-allocated based on ISIZE hints
-    struct Slot {
-        ready: AtomicBool,
-        data: UnsafeCell<Vec<u8>>,
-    }
-    unsafe impl Sync for Slot {}
-
-    // Pre-calculate output sizes from ISIZE hints for better allocation
-    let slots: Vec<Slot> = blocks
-        .iter()
-        .map(|(start, len)| {
-            let block_data = &data[*start..*start + *len];
-            let isize_hint = if *len >= 8 {
-                let trailer = &block_data[*len - 4..];
-                u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]) as usize
-            } else {
-                0
-            };
-            let capacity = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
-                isize_hint + 1024
-            } else {
-                len.saturating_mul(4).max(64 * 1024)
-            };
-            Slot {
-                ready: AtomicBool::new(false),
-                data: UnsafeCell::new(Vec::with_capacity(capacity)),
-            }
-        })
-        .collect();
-
-    let next_block = AtomicUsize::new(0);
-    let mut total_bytes = 0u64;
-
-    // Number of blocks to prefetch ahead
-    const PREFETCH_AHEAD: usize = 4;
-
-    thread::scope(|scope| {
-        // Spawn worker threads with prefetching
-        for _ in 0..num_threads {
-            scope.spawn(|| {
-                use crate::libdeflate_ext::DecompressorEx;
-                let mut decompressor = DecompressorEx::new();
-
-                loop {
-                    let idx = next_block.fetch_add(1, Ordering::Relaxed);
-                    if idx >= num_blocks {
-                        break;
-                    }
-
-                    // Prefetch next blocks into CPU cache
-                    for prefetch_idx in 1..=PREFETCH_AHEAD {
-                        let future_idx = idx + prefetch_idx;
-                        if future_idx < num_blocks {
-                            let (future_start, future_len) = blocks[future_idx];
-                            prefetch_memory(&data[future_start..future_start + future_len.min(64)]);
-                            if future_len > 4096 {
-                                prefetch_memory(
-                                    &data[future_start + future_len / 2
-                                        ..future_start + future_len / 2 + 64],
-                                );
-                            }
-                        }
-                    }
-
-                    let (start, len) = blocks[idx];
-                    let block_data = &data[start..start + len];
-
-                    let output = unsafe { &mut *slots[idx].data.get() };
-                    output.clear();
-
-                    // Each BGZF block is a complete gzip member.
-                    // Use gzip_decompress_ex which handles header + deflate + CRC32.
-                    let initial_size = output.capacity().max(64 * 1024);
-                    output.resize(initial_size, 0);
-
-                    match decompressor.gzip_decompress_ex(block_data, output) {
-                        Ok(result) => {
-                            output.truncate(result.output_size);
-                        }
-                        Err(_) => {
-                            output.clear();
-                        }
-                    }
-
-                    slots[idx].ready.store(true, Ordering::Release);
-                }
-            });
+/// Streaming single-member decompress via flate2/zlib-ng. Fixed 1MB buffer —
+/// avoids the page-fault overhead of allocating a full-size output buffer.
+pub(crate) fn decompress_single_member_streaming<W: Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> GzippyResult<u64> {
+    use std::io::Read;
+    let mut decoder = flate2::read::GzDecoder::new(data);
+    let mut buf = vec![0u8; STREAM_BUFFER_SIZE];
+    let mut total = 0u64;
+    loop {
+        let n = decoder.read(&mut buf)?;
+        if n == 0 {
+            break;
         }
-
-        // Main thread: stream output in order with batched writes
-        // Write in batches to reduce syscall overhead
-        const WRITE_BATCH_SIZE: usize = 16;
-        let mut batch_buffer: Vec<u8> = Vec::with_capacity(WRITE_BATCH_SIZE * 128 * 1024);
-
-        for batch in slots.chunks(WRITE_BATCH_SIZE) {
-            batch_buffer.clear();
-
-            for slot in batch.iter() {
-                // Spin-wait with backoff for slot to be ready
-                let mut spin_count = 0;
-                while !slot.ready.load(Ordering::Acquire) {
-                    spin_count += 1;
-                    if spin_count < 100 {
-                        std::hint::spin_loop();
-                    } else if spin_count < 1000 {
-                        std::thread::yield_now();
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_micros(10));
-                    }
-                }
-
-                let output = unsafe { &*slot.data.get() };
-                if !output.is_empty() {
-                    batch_buffer.extend_from_slice(output);
-                }
-            }
-
-            if !batch_buffer.is_empty() {
-                writer.write_all(&batch_buffer).unwrap();
-                total_bytes += batch_buffer.len() as u64;
-            }
-        }
-    });
-
+        writer.write_all(&buf[..n])?;
+        total += n as u64;
+    }
     writer.flush()?;
-    Ok(total_bytes)
+    Ok(total)
 }
 
-/// Prefetch memory into CPU cache (hint only, no guarantee)
-#[inline]
-fn prefetch_memory(data: &[u8]) {
-    // Use platform-specific prefetch intrinsics when available
-    #[cfg(target_arch = "x86_64")]
-    {
-        for chunk in data.chunks(64) {
-            // PREFETCHT0: Prefetch into all cache levels
-            unsafe {
-                std::arch::x86_64::_mm_prefetch(
-                    chunk.as_ptr() as *const i8,
-                    std::arch::x86_64::_MM_HINT_T0,
-                );
+/// Single-member decompress via libdeflate FFI (fastest path).
+/// Uses the ISIZE trailer hint for initial buffer sizing; grows and retries
+/// on InsufficientSpace.
+pub(crate) fn decompress_single_member_libdeflate<W: Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> GzippyResult<u64> {
+    use crate::libdeflate_ext::{DecompressError, DecompressorEx};
+    let mut decompressor = DecompressorEx::new();
+    let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
+    let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
+        isize_hint + 1024
+    } else {
+        data.len().saturating_mul(4).max(64 * 1024)
+    };
+    let mut output = alloc_aligned_buffer(initial_size);
+    loop {
+        match decompressor.gzip_decompress_ex(data, &mut output) {
+            Ok(result) => {
+                writer.write_all(&output[..result.output_size])?;
+                writer.flush()?;
+                return Ok(result.output_size as u64);
+            }
+            Err(DecompressError::InsufficientSpace) => {
+                let new_size = output.len().saturating_mul(2);
+                output.resize(new_size, 0);
+            }
+            Err(DecompressError::BadData) => {
+                return Err(GzippyError::invalid_argument("invalid gzip data".to_string()));
             }
         }
     }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        // On ARM, we use a simple volatile read to encourage prefetch
-        // The compiler may optimize this, but it's a hint
-        for chunk in data.chunks(128) {
-            let _ = unsafe { std::ptr::read_volatile(chunk.as_ptr()) };
-        }
-    }
-
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        // Fallback: touch memory to trigger hardware prefetch
-        let _ = data.first();
-    }
 }
 
-/// Read the ISIZE field from gzip trailer (last 4 bytes) for buffer sizing
-/// Returns uncompressed size mod 2^32 (per RFC 1952)
-#[inline]
-fn read_gzip_isize(data: &[u8]) -> Option<u32> {
-    if data.len() < 18 {
-        // Minimum gzip: 10 header + 8 trailer
-        return None;
-    }
-    let isize_bytes = &data[data.len() - 4..];
-    Some(u32::from_le_bytes([
-        isize_bytes[0],
-        isize_bytes[1],
-        isize_bytes[2],
-        isize_bytes[3],
-    ]))
-}
-
-/// Sequential multi-member decompression using libdeflate (fastest)
-///
-/// Uses our DecompressorEx wrapper that returns consumed bytes,
-/// allowing us to iterate through members without re-decompressing.
-fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
+/// Sequential multi-member decompress via libdeflate. Uses `gzip_decompress_ex`
+/// which returns `input_consumed` so we can step through members without
+/// re-scanning.
+pub(crate) fn decompress_multi_member_sequential<W: Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> GzippyResult<u64> {
     use crate::libdeflate_ext::{DecompressError, DecompressorEx};
-
     let mut decompressor = DecompressorEx::new();
     let mut total_bytes = 0u64;
     let mut offset = 0;
     let mut member_count = 0u32;
-
-    // Use ISIZE trailer hint for initial buffer sizing (avoids repeated reallocs)
     let isize_hint = read_gzip_isize(data).unwrap_or(0) as usize;
     let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
         isize_hint + 1024
@@ -1173,33 +251,30 @@ fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> 
     let mut output_buf = alloc_aligned_buffer(initial_size);
 
     while offset < data.len() {
-        // Check for gzip magic
         if data.len() - offset < 10 {
             break;
         }
         if data[offset] != 0x1f || data[offset + 1] != 0x8b {
             break;
         }
-
         let remaining = &data[offset..];
-
-        // Ensure buffer is at least as large as the remaining input.
-        // The initial_size from ISIZE trailer is usually correct for single-member
-        // files; for multi-member, InsufficientSpace triggers exponential growth.
         let min_size = remaining.len().max(128 * 1024);
         if output_buf.len() < min_size {
             output_buf.resize(min_size, 0);
         }
-
         let mut success = false;
         loop {
             match decompressor.gzip_decompress_ex(remaining, &mut output_buf) {
                 Ok(result) => {
                     member_count += 1;
-                    if debug_enabled() {
+                    if crate::utils::debug_enabled() {
                         eprintln!(
                             "[gzippy] sequential member {}: in_consumed={} out_size={} offset={}/{}",
-                            member_count, result.input_consumed, result.output_size, offset, data.len()
+                            member_count,
+                            result.input_consumed,
+                            result.output_size,
+                            offset,
+                            data.len()
                         );
                     }
                     writer.write_all(&output_buf[..result.output_size])?;
@@ -1209,39 +284,29 @@ fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> 
                     break;
                 }
                 Err(DecompressError::InsufficientSpace) => {
-                    // Grow buffer and retry
                     let new_size = output_buf.len().saturating_mul(2);
                     output_buf.resize(new_size, 0);
-                    continue;
                 }
                 Err(DecompressError::BadData) => {
-                    // Invalid data - stop processing entirely
                     break;
                 }
             }
         }
         if !success {
-            break; // Exit outer loop on error
+            break;
         }
     }
-
     writer.flush()?;
     Ok(total_bytes)
 }
 
-/// Decompress zlib using libdeflate FFI (via inflate_into_pub)
-fn decompress_zlib_turbo<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
-    // Zlib format: 2-byte header, deflate data, 4-byte Adler32
+/// Decompress zlib data (2-byte header + deflate + 4-byte Adler32).
+pub(crate) fn decompress_zlib_turbo<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     if data.len() < 6 {
-        return Err(GzippyError::invalid_argument(
-            "Zlib data too short".to_string(),
-        ));
+        return Err(GzippyError::invalid_argument("Zlib data too short".to_string()));
     }
-
-    // Skip 2-byte zlib header, exclude 4-byte trailer
     let deflate_data = &data[2..data.len() - 4];
     let mut output_buf = vec![0u8; data.len().saturating_mul(4).max(64 * 1024)];
-
     match crate::bgzf::inflate_into_pub(deflate_data, &mut output_buf) {
         Ok(size) => {
             writer.write_all(&output_buf[..size])?;
@@ -1255,154 +320,12 @@ fn decompress_zlib_turbo<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<
     }
 }
 
-fn detect_compression_format_from_path(path: &Path) -> GzippyResult<CompressionFormat> {
-    if let Some(format) = crate::utils::detect_format_from_file(path) {
-        Ok(format)
-    } else {
-        Ok(CompressionFormat::Gzip)
-    }
-}
-
-fn get_output_filename(input_path: &Path, args: &GzippyArgs, data: &[u8]) -> std::path::PathBuf {
-    if args.stdout {
-        return input_path.to_path_buf();
-    }
-
-    // If --name is set, try to extract FNAME from gzip header
-    if args.name {
-        if let Some(fname) = extract_gzip_fname(data) {
-            if !fname.is_empty() {
-                let mut output = input_path.to_path_buf();
-                output.set_file_name(&fname);
-                return output;
-            }
-        }
-    }
-
-    // Check custom suffix for decompression
-    if args.suffix != ".gz" {
-        let suffix = args.suffix.trim_start_matches('.');
-        if let Some(name) = input_path.file_name().and_then(|n| n.to_str()) {
-            let lower = name.to_lowercase();
-            let suffix_with_dot = format!(".{}", suffix);
-            if lower.ends_with(&suffix_with_dot) {
-                let mut output = input_path.to_path_buf();
-                output.set_file_name(&name[..name.len() - suffix_with_dot.len()]);
-                return output;
-            }
-        }
-    }
-
-    let mut output_path = strip_compression_extension(input_path);
-    if output_path == input_path {
-        output_path = input_path.to_path_buf();
-        let current_name = output_path.file_name().unwrap().to_str().unwrap();
-        output_path.set_file_name(format!("{}.out", current_name));
-    }
-    output_path
-}
-
-/// Extract MTIME from a gzip header
-fn extract_gzip_mtime(data: &[u8]) -> Option<u32> {
-    if data.len() < 10 || data[0] != 0x1f || data[1] != 0x8b {
-        return None;
-    }
-    Some(u32::from_le_bytes([data[4], data[5], data[6], data[7]]))
-}
-
-/// Extract the original filename (FNAME) from a gzip header
-fn extract_gzip_fname(data: &[u8]) -> Option<String> {
-    if data.len() < 10 || data[0] != 0x1f || data[1] != 0x8b || data[2] != 0x08 {
-        return None;
-    }
-
-    let flags = data[3];
-    if flags & 0x08 == 0 {
-        return None; // No FNAME
-    }
-
-    let mut pos = 10;
-
-    // Skip FEXTRA
-    if flags & 0x04 != 0 {
-        if pos + 2 > data.len() {
-            return None;
-        }
-        let xlen = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2 + xlen;
-    }
-
-    // Read FNAME (null-terminated)
-    let start = pos;
-    while pos < data.len() && data[pos] != 0 {
-        pos += 1;
-    }
-    if pos >= data.len() {
-        return None;
-    }
-
-    String::from_utf8(data[start..pos].to_vec()).ok()
-}
-
-fn print_decompression_stats(input_size: u64, output_size: u64, path: &Path) {
-    let filename = path
-        .file_name()
-        .unwrap_or_default()
-        .to_str()
-        .unwrap_or("<unknown>");
-
-    let ratio = if output_size > 0 {
-        input_size as f64 / output_size as f64
-    } else {
-        1.0
-    };
-
-    let (in_size, in_unit) = format_size(input_size);
-    let (out_size, out_unit) = format_size(output_size);
-
-    eprintln!(
-        "{}: {:.1}{} → {:.1}{} ({:.1}x expansion)",
-        filename,
-        in_size,
-        in_unit,
-        out_size,
-        out_unit,
-        1.0 / ratio
-    );
-}
-
-/// Copy file permissions and timestamps from source to destination.
-/// Errors are silently ignored (best-effort, matching gzip behavior).
-fn preserve_metadata(src: &Path, dst: &Path) {
-    if let Ok(metadata) = std::fs::metadata(src) {
-        // Copy permissions (mode bits on Unix)
-        let _ = std::fs::set_permissions(dst, metadata.permissions());
-
-        // Copy modification time
-        if let Ok(mtime) = metadata.modified() {
-            let _ = filetime::set_file_mtime(dst, filetime::FileTime::from_system_time(mtime));
-        }
-    }
-}
-
-fn format_size(bytes: u64) -> (f64, &'static str) {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * 1024;
-    const GB: u64 = 1024 * 1024 * 1024;
-
-    if bytes >= GB {
-        (bytes as f64 / GB as f64, "GB")
-    } else if bytes >= MB {
-        (bytes as f64 / MB as f64, "MB")
-    } else if bytes >= KB {
-        (bytes as f64 / KB as f64, "KB")
-    } else {
-        (bytes as f64, "B")
-    }
-}
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
-mod multi_member_tests {
+mod tests {
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;
@@ -1410,133 +333,28 @@ mod multi_member_tests {
 
     #[test]
     fn test_decompress_multi_member_file() {
-        // Create two separate gzip streams like: (gzip file1; gzip file2) > combined.gz
         let part1: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
         let part2: Vec<u8> = (0..100_000).map(|i| ((i + 50) % 256) as u8).collect();
 
-        let mut encoder1 = GzEncoder::new(Vec::new(), Compression::default());
-        encoder1.write_all(&part1).unwrap();
-        let compressed1 = encoder1.finish().unwrap();
+        let mut enc1 = GzEncoder::new(Vec::new(), Compression::default());
+        enc1.write_all(&part1).unwrap();
+        let compressed1 = enc1.finish().unwrap();
 
-        let mut encoder2 = GzEncoder::new(Vec::new(), Compression::default());
-        encoder2.write_all(&part2).unwrap();
-        let compressed2 = encoder2.finish().unwrap();
+        let mut enc2 = GzEncoder::new(Vec::new(), Compression::default());
+        enc2.write_all(&part2).unwrap();
+        let compressed2 = enc2.finish().unwrap();
 
-        // Concatenate them
-        let mut multi = compressed1.clone();
+        let mut multi = compressed1;
         multi.extend_from_slice(&compressed2);
 
-        eprintln!(
-            "Multi-member: {} bytes total, member1={}, member2={}",
-            multi.len(),
-            compressed1.len(),
-            compressed2.len()
-        );
-
-        // Check detection
-        let is_multi = is_multi_member_quick(&multi);
-        eprintln!("is_multi_member_quick: {}", is_multi);
-
-        // Try the full decompression path
         let mut output = Vec::new();
         let num_threads = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(4);
         decompress_gzip_libdeflate(&multi, &mut output, num_threads).unwrap();
 
-        let mut expected = part1.clone();
+        let mut expected = part1;
         expected.extend_from_slice(&part2);
-
-        eprintln!(
-            "Expected: {} bytes, got: {} bytes",
-            expected.len(),
-            output.len()
-        );
-        assert_eq!(output.len(), expected.len(), "Output size mismatch!");
-        assert_eq!(output, expected, "Output content mismatch!");
+        assert_eq!(output, expected);
     }
-}
-
-#[test]
-fn test_is_multi_member_quick_timing() {
-    let data = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
-        Ok(d) => d,
-        Err(_) => {
-            eprintln!("Skipping test - benchmark file not found");
-            return;
-        }
-    };
-    eprintln!("File size: {} bytes", data.len());
-
-    let start = std::time::Instant::now();
-    let result = is_multi_member_quick(&data);
-    eprintln!("is_multi_member_quick: {} in {:?}", result, start.elapsed());
-}
-
-// Test-only public wrappers for internal functions
-#[cfg(test)]
-pub fn is_likely_multi_member_pub(data: &[u8]) -> bool {
-    is_likely_multi_member(data)
-}
-
-#[cfg(test)]
-pub fn decompress_multi_member_sequential_pub<W: std::io::Write>(
-    data: &[u8],
-    writer: &mut W,
-) -> GzippyResult<u64> {
-    decompress_multi_member_sequential(data, writer)
-}
-
-#[cfg(test)]
-pub fn decompress_single_member_libdeflate_pub<W: std::io::Write>(
-    data: &[u8],
-    writer: &mut W,
-) -> GzippyResult<u64> {
-    decompress_single_member_libdeflate(data, writer)
-}
-
-#[cfg(test)]
-pub fn decompress_gzip_libdeflate_pub<W: std::io::Write + Send>(
-    data: &[u8],
-    writer: &mut W,
-    num_threads: usize,
-) -> GzippyResult<u64> {
-    decompress_gzip_libdeflate(data, writer, num_threads)
-}
-
-#[cfg(test)]
-pub fn decompress_gzip_to_vec_pub(data: &[u8], num_threads: usize) -> GzippyResult<Vec<u8>> {
-    decompress_gzip_to_vec(data, num_threads)
-}
-
-#[cfg(test)]
-pub fn decompress_single_member_pub<W: std::io::Write>(
-    data: &[u8],
-    writer: &mut W,
-    num_threads: usize,
-) -> GzippyResult<u64> {
-    decompress_single_member(data, writer, num_threads)
-}
-
-#[cfg(test)]
-pub fn has_bgzf_markers_pub(data: &[u8]) -> bool {
-    has_bgzf_markers(data)
-}
-
-#[cfg(test)]
-pub fn parse_gzip_header_size_pub(data: &[u8]) -> Option<usize> {
-    parse_gzip_header_size(data)
-}
-
-#[cfg(test)]
-pub fn read_gzip_isize_pub(data: &[u8]) -> Option<u32> {
-    read_gzip_isize(data)
-}
-
-#[cfg(test)]
-pub fn decompress_single_member_streaming_pub<W: std::io::Write>(
-    data: &[u8],
-    writer: &mut W,
-) -> GzippyResult<u64> {
-    decompress_single_member_streaming(data, writer)
 }

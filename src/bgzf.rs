@@ -8303,7 +8303,7 @@ mod optimization_tests {
 
         // Now test the BGZF parallel path
         assert!(
-            crate::decompression::has_bgzf_markers(&compressed),
+            crate::gzip_format::has_bgzf_markers(&compressed),
             "compressed data should have BGZF markers"
         );
 
@@ -8375,7 +8375,7 @@ mod optimization_tests {
             compressed.extend_from_slice(&block_output);
         }
 
-        assert!(crate::decompression::has_bgzf_markers(&compressed));
+        assert!(crate::gzip_format::has_bgzf_markers(&compressed));
 
         let parallel_output =
             decompress_bgzf_parallel_to_vec(&compressed, 4).expect("BGZF parallel should succeed");

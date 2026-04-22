@@ -11,7 +11,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::decompression::has_bgzf_markers;
+    use crate::gzip_format::has_bgzf_markers;
     use crate::parallel_compress::{compress_single_member, GzipHeaderInfo};
     use std::io::Write;
 
@@ -158,9 +158,9 @@ mod tests {
     fn test_detect_multi_member() {
         let oracle = FileOracle::new(2 * 1024 * 1024);
 
-        let multi = crate::decompression::is_likely_multi_member_pub(&oracle.multi_member_gz);
-        let single = crate::decompression::is_likely_multi_member_pub(&oracle.single_member_gz);
-        let bgzf = crate::decompression::is_likely_multi_member_pub(&oracle.bgzf_gz);
+        let multi = crate::gzip_format::is_likely_multi_member(&oracle.multi_member_gz);
+        let single = crate::gzip_format::is_likely_multi_member(&oracle.single_member_gz);
+        let bgzf = crate::gzip_format::is_likely_multi_member(&oracle.bgzf_gz);
 
         eprintln!("detection: multi={} single={} bgzf={}", multi, single, bgzf);
 
@@ -211,7 +211,7 @@ mod tests {
 
         // Sequential path
         let mut output_seq = Vec::new();
-        crate::decompression::decompress_multi_member_sequential_pub(
+        crate::decompression::decompress_multi_member_sequential(
             &oracle.multi_member_gz,
             &mut output_seq,
         )
@@ -230,7 +230,7 @@ mod tests {
 
         // Sequential fallback
         let mut output = Vec::new();
-        crate::decompression::decompress_single_member_libdeflate_pub(
+        crate::decompression::decompress_single_member_libdeflate(
             &oracle.single_member_gz,
             &mut output,
         )
@@ -287,7 +287,7 @@ mod tests {
                 .unwrap();
 
         let mut from_single = Vec::new();
-        crate::decompression::decompress_single_member_libdeflate_pub(
+        crate::decompression::decompress_single_member_libdeflate(
             &oracle.single_member_gz,
             &mut from_single,
         )
