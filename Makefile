@@ -117,7 +117,11 @@ quick: $(GZIPPY_BIN)
 	@echo "── Stage 4: hot-path hit rates ─────────────────────────"
 	@cargo test --release hot_path 2>&1 | tail -3
 	@echo "── Stage 5: cachegrind (Linux only) ────────────────────"
-	@bash scripts/cachegrind_check.sh
+	@if [ "$$(uname)" = "Darwin" ]; then \
+		echo "  (skipped — cachegrind not available on macOS)"; \
+	else \
+		bash scripts/cachegrind_check.sh; \
+	fi
 	@echo "════════════════════════════════════════════════════════"
 	@echo "✓ make quick passed"
 
