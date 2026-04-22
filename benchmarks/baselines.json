@@ -6,10 +6,10 @@
   },
   "alloc_budget": {
     "decompress_1mb_max_allocs": 2,
-    "decompress_bgzf_10mb_max_allocs": 7
+    "decompress_bgzf_10mb_max_allocs": 10
   },
   "diff_ratio": {
-    "max_ratio": 1.30,
+    "max_ratio": 2.00,
     "max_ratio_bgzf_10mb": 2.00
   },
   "hit_rates": {

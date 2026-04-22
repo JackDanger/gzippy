@@ -45,10 +45,10 @@ mod tests {
         let fixture = crate::test_fixtures::text_1mb();
 
         // Warmup — ensures lazy statics are initialized before we count
-        let _ = crate::decompression::decompress_gzip_to_vec_pub(&fixture.single_member_gz, 1);
+        let _ = crate::decompression::decompress_gzip_to_vec(&fixture.single_member_gz, 1);
 
         CountingAllocator::reset();
-        let _ = crate::decompression::decompress_gzip_to_vec_pub(&fixture.single_member_gz, 1)
+        let _ = crate::decompression::decompress_gzip_to_vec(&fixture.single_member_gz, 1)
             .unwrap();
         let count = CountingAllocator::count();
         let bytes = CountingAllocator::bytes();

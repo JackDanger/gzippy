@@ -5,6 +5,25 @@ use std::path::Path;
 
 use crate::error::{GzippyError, GzippyResult};
 
+/// Check whether `GZIPPY_DEBUG` is set. Cached after first call.
+#[inline]
+pub fn debug_enabled() -> bool {
+    use std::sync::OnceLock;
+    static DEBUG: OnceLock<bool> = OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var("GZIPPY_DEBUG").is_ok())
+}
+
+/// Copy permissions and mtime from `src` to `dst`.
+/// Errors are silently ignored — best-effort, matching gzip behavior.
+pub fn preserve_metadata(src: &Path, dst: &Path) {
+    if let Ok(metadata) = fs::metadata(src) {
+        let _ = fs::set_permissions(dst, metadata.permissions());
+        if let Ok(mtime) = metadata.modified() {
+            let _ = filetime::set_file_mtime(dst, filetime::FileTime::from_system_time(mtime));
+        }
+    }
+}
+
 pub fn get_file_metadata(path: &Path) -> GzippyResult<fs::Metadata> {
     fs::metadata(path).map_err(GzippyError::Io)
 }

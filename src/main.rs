@@ -26,29 +26,32 @@ mod routing_tests;
 mod test_fixtures;
 
 // ── Production modules ────────────────────────────────────────────────────────
-mod bgzf;           // gzippy-parallel + multi-member parallel decompression (~8400 lines)
+mod bgzf;              // gzippy-parallel + multi-member parallel (~8400 lines)
 mod cli;
-mod combined_lut;   // combined lit/len+dist LUT used by bgzf
-mod compression;
-mod decompression;
+mod combined_lut;      // combined lit/len+dist LUT used by bgzf
+mod compress_io;       // compress_file / compress_stdin (file I/O layer)
+mod compression;       // compress_with_pipeline (pure engine)
+mod decompress_io;     // decompress_file / decompress_stdin (file I/O layer)
+mod decompression;     // classify_gzip + engine functions (pure engine)
 mod error;
 mod format;
-mod inflate_tables; // Huffman table constants used by bgzf
-mod io_thread;      // WriteAhead background I/O used by isal_decompress
+mod gzip_format;       // pure gzip header parsing (no I/O): has_bgzf_markers, is_likely_multi_member, …
+mod inflate_tables;    // Huffman table constants used by bgzf
+mod io_thread;         // WriteAhead background I/O used by isal_decompress
 mod isal;
 mod isal_compress;
 mod isal_decompress;
-mod libdeflate_ext; // libdeflate FFI: gzip_decompress_ex (arm64 + fallback)
+mod libdeflate_ext;    // libdeflate FFI: gzip_decompress_ex (arm64 + fallback)
 mod optimization;
-mod packed_lut;     // packed LUT used by bgzf
+mod packed_lut;        // packed LUT used by bgzf
 mod parallel_compress;
 mod pipelined_compress;
 mod scheduler;
-mod simd_copy;      // SIMD LZ77 copy used by two_level_table
-mod simd_huffman;   // multi-symbol Huffman decode used by bgzf
+mod simd_copy;         // SIMD LZ77 copy used by two_level_table
+mod simd_huffman;      // multi-symbol Huffman decode used by bgzf
 mod simple_optimizations;
 mod thread_pool;
-mod two_level_table; // two-level Huffman table used by bgzf
+mod two_level_table;   // two-level Huffman table used by bgzf
 mod utils;
 
 // ── Experiments: parallel single-member decode (not yet wired in) ─────────────
@@ -241,10 +244,10 @@ fn run() -> Result<i32, GzippyError> {
             if args.test {
                 exit_code = test_stdin(&args)?;
             } else {
-                exit_code = decompression::decompress_stdin(&args)?;
+                exit_code = decompress_io::decompress_stdin(&args)?;
             }
         } else {
-            exit_code = compression::compress_stdin(&args)?;
+            exit_code = compress_io::compress_stdin(&args)?;
         }
     } else {
         // Process files
@@ -252,9 +255,9 @@ fn run() -> Result<i32, GzippyError> {
             let result = if args.test {
                 test_file(file, &args)
             } else if decompress {
-                decompression::decompress_file(file, &args)
+                decompress_io::decompress_file(file, &args)
             } else {
-                compression::compress_file(file, &args)
+                compress_io::compress_file(file, &args)
             };
 
             match result {
