@@ -50,6 +50,62 @@ fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
     vec![0u8; aligned_size]
 }
 
+// =============================================================================
+// Routing
+// =============================================================================
+
+/// The decompression path selected for a given input.
+///
+/// This is the canonical routing table. `classify_gzip` returns one of these;
+/// `decompress_gzip_libdeflate` dispatches on it. To add a new path: add a variant
+/// here, a condition in `classify_gzip`, and a dispatch arm below.
+///
+/// Current paths (in priority order):
+///   GzippyParallel  — gzippy-produced multi-block files ("GZ" FEXTRA subfield)
+///   MultiMemberPar  — pigz-style multi-member, Tmax threads
+///   MultiMemberSeq  — pigz-style multi-member, T1
+///   IsalSingle      — x86_64 single-member via ISA-L (fastest sequential)
+///   StreamingSingle — single-member > 1GB, no ISA-L (avoids huge allocation)
+///   LibdeflateSingle — default single-member via libdeflate one-shot
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodePath {
+    GzippyParallel,
+    MultiMemberPar,
+    MultiMemberSeq,
+    IsalSingle,
+    StreamingSingle,
+    LibdeflateSingle,
+}
+
+/// Classify a gzip input into the optimal `DecodePath`.
+///
+/// This is the single source of truth for routing. All classification logic
+/// lives here; `decompress_gzip_libdeflate` only dispatches.
+pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
+    if has_bgzf_markers(data) {
+        return DecodePath::GzippyParallel;
+    }
+
+    if is_likely_multi_member(data) {
+        return if num_threads > 1 {
+            DecodePath::MultiMemberPar
+        } else {
+            DecodePath::MultiMemberSeq
+        };
+    }
+
+    // Single-member paths
+    if crate::isal_decompress::is_available() {
+        return DecodePath::IsalSingle;
+    }
+
+    if data.len() > 1024 * 1024 * 1024 {
+        return DecodePath::StreamingSingle;
+    }
+
+    DecodePath::LibdeflateSingle
+}
+
 pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     if filename == "-" {
         return decompress_stdin(args);
@@ -756,44 +812,31 @@ fn decompress_gzip_libdeflate<W: Write + Send>(
         return Ok(0);
     }
 
-    // Route based on format — each path is correct for its input type.
-    if has_bgzf_markers(data) {
-        if debug_enabled() {
-            eprintln!(
-                "[gzippy] BGZF path: {} threads, {} bytes",
-                num_threads,
-                data.len()
-            );
-        }
-        let bytes = crate::bgzf::decompress_bgzf_parallel(data, writer, num_threads)?;
-        return Ok(bytes);
-    }
-
-    if !is_likely_multi_member(data) {
-        if debug_enabled() {
-            eprintln!(
-                "[gzippy] Single-member path: {} threads, {} bytes",
-                num_threads,
-                data.len()
-            );
-        }
-        return decompress_single_member(data, writer, num_threads);
-    }
+    let path = classify_gzip(data, num_threads);
 
     if debug_enabled() {
         eprintln!(
-            "[gzippy] Multi-member path: {} threads, {} bytes",
+            "[gzippy] path={:?} threads={} bytes={}",
+            path,
             num_threads,
             data.len()
         );
     }
 
-    if num_threads > 1 {
-        let bytes = crate::bgzf::decompress_multi_member_parallel(data, writer, num_threads)?;
-        return Ok(bytes);
+    match path {
+        DecodePath::GzippyParallel => {
+            let bytes = crate::bgzf::decompress_bgzf_parallel(data, writer, num_threads)?;
+            Ok(bytes)
+        }
+        DecodePath::MultiMemberPar => {
+            let bytes = crate::bgzf::decompress_multi_member_parallel(data, writer, num_threads)?;
+            Ok(bytes)
+        }
+        DecodePath::MultiMemberSeq => decompress_multi_member_sequential(data, writer),
+        DecodePath::IsalSingle | DecodePath::StreamingSingle | DecodePath::LibdeflateSingle => {
+            decompress_single_member(data, writer, num_threads)
+        }
     }
-
-    decompress_multi_member_sequential(data, writer)
 }
 
 /// Check if data has BGZF-style "GZ" markers in the first gzip header

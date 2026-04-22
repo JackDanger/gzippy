@@ -308,4 +308,62 @@ mod tests {
 
         eprintln!("all three formats produce byte-identical output from the same input");
     }
+
+    // =========================================================================
+    // Layer 1b: classify_gzip routing table assertions
+    //
+    // These tests are the canonical check that the routing table in
+    // decompression.rs::classify_gzip matches the actual file formats.
+    // If routing changes, update CLAUDE.md first, then fix these tests.
+    // =========================================================================
+
+    #[test]
+    fn test_classify_gzippy_parallel() {
+        let oracle = FileOracle::new(512 * 1024);
+        // gzippy-parallel output ("GZ" FEXTRA) → GzippyParallel regardless of threads
+        assert_eq!(
+            crate::decompression::classify_gzip(&oracle.bgzf_gz, 1),
+            crate::decompression::DecodePath::GzippyParallel,
+            "gzippy-parallel T1 should classify as GzippyParallel"
+        );
+        assert_eq!(
+            crate::decompression::classify_gzip(&oracle.bgzf_gz, 4),
+            crate::decompression::DecodePath::GzippyParallel,
+            "gzippy-parallel T4 should classify as GzippyParallel"
+        );
+    }
+
+    #[test]
+    fn test_classify_multi_member() {
+        let oracle = FileOracle::new(2 * 1024 * 1024);
+        // T1 multi-member → sequential
+        assert_eq!(
+            crate::decompression::classify_gzip(&oracle.multi_member_gz, 1),
+            crate::decompression::DecodePath::MultiMemberSeq,
+            "multi-member T1 should classify as MultiMemberSeq"
+        );
+        // T4 multi-member → parallel
+        assert_eq!(
+            crate::decompression::classify_gzip(&oracle.multi_member_gz, 4),
+            crate::decompression::DecodePath::MultiMemberPar,
+            "multi-member T4 should classify as MultiMemberPar"
+        );
+    }
+
+    #[test]
+    fn test_classify_single_member() {
+        use crate::decompression::{classify_gzip, DecodePath};
+        let oracle = FileOracle::new(512 * 1024);
+        let path = classify_gzip(&oracle.single_member_gz, 4);
+        // Single-member must route to one of the three single-member paths.
+        // The exact path depends on whether ISA-L is available on this machine.
+        assert!(
+            matches!(
+                path,
+                DecodePath::IsalSingle | DecodePath::StreamingSingle | DecodePath::LibdeflateSingle
+            ),
+            "single-member should classify as a single-member path, got {:?}",
+            path
+        );
+    }
 }
