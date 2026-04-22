@@ -9,74 +9,30 @@ use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-// ── Test infrastructure (macros must load first) ──────────────────────────────
-#[macro_use]
-mod test_utils;
-mod alloc_counter; // counting allocator — #[global_allocator] in test builds
-mod benchmark_datasets;
-mod compress_oracle_tests;
-mod correctness_tests;
-mod diff_ratio_tests;
-mod alloc_budget_tests;
-mod hot_path_tests;
-mod golden_tests;
-mod inflate_oracle_tests;
-mod pipeline_tests;
-mod routing_tests;
-mod test_fixtures;
-
-// ── Production modules ────────────────────────────────────────────────────────
-mod bgzf;              // gzippy-parallel + multi-member parallel (~8400 lines)
+// ── Core infrastructure ───────────────────────────────────────────────────────
 mod cli;
-mod combined_lut;      // combined lit/len+dist LUT used by bgzf
-mod compress_io;       // compress_file / compress_stdin (file I/O layer)
-mod compression;       // compress_with_pipeline (pure engine)
-mod decompress_io;     // decompress_file / decompress_stdin (file I/O layer)
-mod decompression;     // classify_gzip + engine functions (pure engine)
 mod error;
 mod format;
-mod gzip_format;       // pure gzip header parsing (no I/O): has_bgzf_markers, is_likely_multi_member, …
-mod inflate_tables;    // Huffman table constants used by bgzf
-mod io_thread;         // WriteAhead background I/O used by isal_decompress
-mod isal;
-mod isal_compress;
-mod isal_decompress;
-mod libdeflate_ext;    // libdeflate FFI: gzip_decompress_ex (arm64 + fallback)
-mod optimization;
-mod packed_lut;        // packed LUT used by bgzf
-mod parallel_compress;
-mod pipelined_compress;
-mod scheduler;
-mod simd_copy;         // SIMD LZ77 copy used by two_level_table
-mod simd_huffman;      // multi-symbol Huffman decode used by bgzf
-mod simple_optimizations;
-mod thread_pool;
-mod two_level_table;   // two-level Huffman table used by bgzf
 mod utils;
 
-// ── Experiments: parallel single-member decode (not yet wired in) ─────────────
-// These implement speculative parallel decompression for standard single-member files.
-// Current measurements: 88–148 MB/s vs 600–2000 MB/s for sequential libdeflate.
-// See CLAUDE.md "Experiments" section and decompression.rs::decompress_single_member
-// before wiring any of these in.
-mod bmi2;
-mod block_finder;        // deflate block boundary finder (used by parallel_single_member)
-mod block_finder_lut;    // 13-bit LUT for block_finder
-mod consume_first_decode; // pure-Rust inflate (used as oracle in tests)
-mod consume_first_table;  // pre-computed tables for consume_first_decode
-mod double_literal;       // double-literal optimization (used by consume_first_decode)
-mod jit_decode;           // JIT fingerprint caching (used by consume_first_decode)
-mod libdeflate_decode;    // pure-Rust libdeflate-style decoder
-mod libdeflate_entry;     // Huffman entry format matching libdeflate
-mod marker_decode;        // u16 marker-based decode for speculative parallel
-mod parallel_single_member; // speculative parallel single-member (88–148 MB/s)
-mod scan_inflate;         // block-by-block scan used by parallel_single_member
-mod specialized_decode;   // specialized Huffman decoders (used by consume_first_decode)
-mod ultra_fast_inflate;   // two-level Huffman + SIMD (used by marker_decode)
-mod ultra_inflate;        // variant of ultra_fast_inflate (unused in any active path)
-mod vector_huffman;       // SIMD Huffman tree construction (used by consume_first_decode)
-// speculative_parallel.rs: EXPERIMENT — RapidGzip u16-marker approach. Not compiled (not in main.rs).
-// two_pass_parallel.rs:    DELETED — deprecated two-pass scan approach (superseded).
+// ── Compression & decompression stacks ───────────────────────────────────────
+mod compress;    // engine (mod.rs) + io, parallel, pipelined, optimization, simple
+mod decompress;  // engine (mod.rs) + io, format, bgzf, SIMD tables, scan_inflate
+
+// ── Hardware backends (ISA-L, libdeflate FFI) ─────────────────────────────────
+mod backends;    // isal, isal_compress, isal_decompress, libdeflate
+
+// ── Threading infrastructure ──────────────────────────────────────────────────
+mod infra;       // thread_pool, scheduler, io_thread
+
+// ── Experimental paths (not wired into production) ────────────────────────────
+// See CLAUDE.md "Experiments" section and CLAUDE.md score table before wiring in.
+// Current best: parallel_single_member at 88–148 MB/s vs 600–2000 MB/s sequential.
+mod experiments; // parallel_single_member, speculative_parallel, marker_decode, …
+
+// ── Test infrastructure ───────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests;
 
 use cli::GzippyArgs;
 use error::GzippyError;
@@ -244,10 +200,10 @@ fn run() -> Result<i32, GzippyError> {
             if args.test {
                 exit_code = test_stdin(&args)?;
             } else {
-                exit_code = decompress_io::decompress_stdin(&args)?;
+                exit_code = decompress::io::decompress_stdin(&args)?;
             }
         } else {
-            exit_code = compress_io::compress_stdin(&args)?;
+            exit_code = compress::io::compress_stdin(&args)?;
         }
     } else {
         // Process files
@@ -255,9 +211,9 @@ fn run() -> Result<i32, GzippyError> {
             let result = if args.test {
                 test_file(file, &args)
             } else if decompress {
-                decompress_io::decompress_file(file, &args)
+                decompress::io::decompress_file(file, &args)
             } else {
-                compress_io::compress_file(file, &args)
+                compress::io::compress_file(file, &args)
             };
 
             match result {
@@ -292,7 +248,7 @@ fn test_file(filename: &str, args: &GzippyArgs) -> Result<i32, GzippyError> {
 
     // Decompress into a Vec (discarded after) to verify integrity
     let mut sink = Vec::new();
-    let result = decompression::decompress_gzip_to_writer(&mmap, &mut sink);
+    let result = decompress::decompress_gzip_to_writer(&mmap, &mut sink);
 
     match result {
         Ok(_) => {
@@ -320,7 +276,7 @@ fn test_stdin(args: &GzippyArgs) -> Result<i32, GzippyError> {
     }
 
     let mut sink = Vec::new();
-    let result = decompression::decompress_gzip_to_writer(&input_data, &mut sink);
+    let result = decompress::decompress_gzip_to_writer(&input_data, &mut sink);
 
     match result {
         Ok(_) => {
