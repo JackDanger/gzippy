@@ -40,9 +40,10 @@ jobs:
             apt_extras: ""
             features: ""
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-latest
             apt_extras: ""
             features: ""
+            cross_target: x86_64-apple-darwin
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             apt_extras: cmake
@@ -58,6 +59,8 @@ jobs:
           submodules: true
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.cross_target }}
 
       - uses: actions/cache@v4
         with:
@@ -72,12 +75,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt_extras }}
 
       - name: Build
-        run: cargo build --release ${{ matrix.features }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
 
       - name: Package tarball + SHA256
         run: |
           TARBALL="gzippy-${{ matrix.target }}.tar.gz"
-          tar -czf "$TARBALL" -C target/release gzippy
+          tar -czf "$TARBALL" -C target/${{ matrix.target }}/release gzippy
           shasum -a 256 "$TARBALL" | awk '{print $1}' > "$TARBALL.sha256"
           echo "Packaged $TARBALL ($(cat $TARBALL.sha256))"
 
