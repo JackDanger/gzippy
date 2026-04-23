@@ -22,9 +22,12 @@ IGZIP_BIN := $(ISAL_DIR)/build/igzip
 ZOPFLI_BIN := $(ZOPFLI_DIR)/zopfli
 RAPIDGZIP_BIN := $(RAPIDGZIP_DIR)/librapidarchive/build/src/tools/rapidgzip
 
-# Prefer local gzip build, fall back to system gzip
-GZIP_BIN := $(shell if [ -x $(GZIP_DIR)/gzip ]; then echo $(GZIP_DIR)/gzip; else echo $$(which gzip); fi)
+# Prefer source-built gzip; on macOS fall back to brew gzip then /usr/bin/gzip
+GZIP_BIN := $(shell if [ -x $(GZIP_DIR)/gzip ]; then echo $(GZIP_DIR)/gzip; elif [ -x /opt/homebrew/bin/gzip ]; then echo /opt/homebrew/bin/gzip; else which gzip; fi)
 SYSTEM_GZIP := $(shell which gzip)
+# macOS ships its own NEON-accelerated gzip at /usr/bin/gzip (Apple gzip 479)
+# Set APPLE_GZIP when it differs from GZIP_BIN so bench targets compare both
+APPLE_GZIP := $(if $(filter Darwin,$(shell uname)),/usr/bin/gzip,)
 
 .PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship route-check
 
@@ -46,7 +49,8 @@ deps: $(PIGZ_BIN) $(IGZIP_BIN) $(ZOPFLI_BIN) $(RAPIDGZIP_BIN)
 
 $(GZIP_DIR)/gzip:
 	@if [ "$$(uname)" = "Darwin" ]; then \
-		echo "⚠ Skipping gzip source build on macOS, using system gzip: $(SYSTEM_GZIP)"; \
+		echo "⚠ gzip submodule needs autotools — skipping source build on macOS"; \
+		echo "  Using $(GZIP_BIN) (run 'brew install gzip' for GNU gzip)"; \
 	else \
 		echo "Building gzip from source..."; \
 		cd $(GZIP_DIR) && find . -name "*.in" -exec touch {} \; 2>/dev/null; \
@@ -84,7 +88,8 @@ $(RAPIDGZIP_BIN):
 
 $(GZIPPY_BIN): FORCE
 	@echo "Building gzippy..."
-	@cd $(GZIPPY_DIR) && cargo build --release 2>&1 | grep -E "(Compiling gzippy|Finished|error)" || true
+	@cd $(GZIPPY_DIR) && cargo build --release 2>&1 | grep -E "(Compiling gzippy|Finished|error)"
+	@test -f $(GZIPPY_BIN) || (echo "✗ gzippy build failed"; exit 1)
 	@echo "✓ Built gzippy"
 
 # Create ungzippy symlink (like unpigz)
@@ -299,6 +304,12 @@ bench-bin: $(GZIPPY_BIN) $(PIGZ_BIN) $(IGZIP_BIN)
 	@cp -f $(IGZIP_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
 	@cp -f $(RAPIDGZIP_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
 	@cp -f $(ZOPFLI_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
+	@cp -f $(GZIP_BIN) $(BENCH_BIN_DIR)/gzip 2>/dev/null || true
+ifneq ($(APPLE_GZIP),$(GZIP_BIN))
+ifneq ($(APPLE_GZIP),)
+	@cp -f $(APPLE_GZIP) $(BENCH_BIN_DIR)/apple-gzip 2>/dev/null || true
+endif
+endif
 	@echo "✓ Benchmark binaries ready in $(BENCH_BIN_DIR)/"
 
 # Benchmark data files
@@ -466,8 +477,19 @@ bench-compress-logs-l1-all: bench-bin bench-data
 		--output $(BENCH_RESULTS_DIR)/compress-logs-l1.json
 
 bench-compress-logs-l6: $(GZIPPY_BIN) bench-data
-	@echo "=== Compression: logs L6 (gzippy only) ==="
+	@echo "=== Compression: logs L6 ==="
+	@echo "--- gzippy T1 ---"
+	@time sh -c '$(GZIPPY_BIN) -6 -p1 -c $(LOGS) > /dev/null'
+	@echo "--- gzippy T$(THREADS) ---"
 	@time sh -c '$(GZIPPY_BIN) -6 -p$(THREADS) -c $(LOGS) > /dev/null'
+	@echo "--- $(GZIP_BIN) (T1) ---"
+	@time sh -c '$(GZIP_BIN) -6 -c $(LOGS) > /dev/null'
+ifneq ($(APPLE_GZIP),$(GZIP_BIN))
+ifneq ($(APPLE_GZIP),)
+	@echo "--- Apple gzip $(APPLE_GZIP) (T1) ---"
+	@time sh -c '$(APPLE_GZIP) -6 -c $(LOGS) > /dev/null'
+endif
+endif
 
 bench-compress-logs-l6-all: bench-bin bench-data
 	@mkdir -p $(BENCH_RESULTS_DIR)
@@ -522,62 +544,63 @@ bench-exhaustive: bench-all
 # Help
 # =============================================================================
 help:
-	@echo "gzippy - The Fastest Parallel Gzip"
-	@echo "======================================"
-	@echo ""
-	@echo "The one command:"
-	@echo "  make ship         Tests + clippy + neurotic homelab benchmarks + scorecard"
-	@echo "                    (runs on ssh -J neurotic root@10.30.0.199)"
-	@echo ""
-	@echo "Quick commands (for AI tools and iteration):"
-	@echo "  make              Build and run quick benchmark (< 30 seconds)"
-	@echo "  make quick        Same as above"
-	@echo "  make route-check  Show decompression routing + timing for T1/T4 x 1MB/10MB"
-	@echo "  make build        Build gzippy and ungzippy"
-	@echo "  make deps         Build gzip and pigz from submodules"
-	@echo "  make validate     Run validation suite (adaptive 3-17 trials)"
-	@echo "  make lint         Run rustfmt and clippy (auto-fix)"
-	@echo "  make lint-check   Check formatting without changes"
-	@echo ""
-	@echo "Benchmarks (gzippy only - fast):"
-	@echo "  make bench                       Quick benchmark (L6, all datasets)"
-	@echo "  make bench-decompress-silesia    Decompress silesia"
-	@echo "  make bench-decompress-software   Decompress software"
-	@echo "  make bench-decompress-logs       Decompress logs"
-	@echo "  make bench-compress-silesia-l6   Compress silesia L6"
-	@echo "  make bench-compress-software-l6  Compress software L6"
-	@echo "  make bench-compress-logs-l6      Compress logs L6"
-	@echo ""
-	@echo "Benchmarks (all tools compared - exhaustive):"
-	@echo "  make bench-all                       Full comparison (all tools, all levels)"
-	@echo "  make bench-decompress-all            All decompression (3 datasets)"
-	@echo "  make bench-decompress-silesia-all    Decompress silesia (all tools)"
-	@echo "  make bench-decompress-software-all   Decompress software (all tools)"
-	@echo "  make bench-decompress-logs-all       Decompress logs (all tools)"
-	@echo "  make bench-compress-all              All compression (3 datasets x 3 levels)"
-	@echo "  make bench-compress-silesia-l6-all   Compress silesia L6 (all tools)"
-	@echo "  make bench-compress-software-l6-all  Compress software L6 (all tools)"
-	@echo "  make bench-compress-logs-l6-all      Compress logs L6 (all tools)"
-	@echo ""
-	@echo "Data preparation:"
-	@echo "  make bench-data   Prepare benchmark datasets (silesia, software, logs)"
-	@echo ""
-	@echo "Charting (separate test running from rendering):"
-	@echo "  make validate-json     Run tests, save JSON to test_results/"
-	@echo "  make render-chart      Generate charts from existing JSON (fast)"
-	@echo "  make validation-chart  Both: run tests + generate charts"
-	@echo ""
-	@echo "Full testing (for humans at release time):"
-	@echo "  make perf-full    			Comprehensive performance tests (10+ minutes)"
-	@echo "  make test-data    			Generate all test data files"
-	@echo ""
-	@echo "Installation:"
-	@echo "  make install      			Install gzippy and ungzippy to /usr/local/bin"
-	@echo ""
-	@echo "Maintenance:"
-	@echo "  make clean        			Remove all build artifacts and test data"
-	@echo "  make help         			Show this message"
-	@echo ""
-	@echo "Binaries:"
-	@echo "  gzippy              			Compress (default) or decompress with -d"
-	@echo "  ungzippy            			Decompress (like gunzip/unpigz)"
+	@printf '%s\n' \
+		'gzippy - The Fastest Parallel Gzip' \
+		'======================================' \
+		'' \
+		'The one command:' \
+		'  make ship         Tests + clippy + neurotic homelab benchmarks + scorecard' \
+		'                    (runs on ssh -J neurotic root@10.30.0.199)' \
+		'' \
+		'Quick commands (for AI tools and iteration):' \
+		'  make              Build and run quick benchmark (< 30 seconds)' \
+		'  make quick        Same as above' \
+		'  make route-check  Show decompression routing + timing for T1/T4 x 1MB/10MB' \
+		'  make build        Build gzippy and ungzippy' \
+		'  make deps         Build gzip and pigz from submodules' \
+		'  make validate     Run validation suite (adaptive 3-17 trials)' \
+		'  make lint         Run rustfmt and clippy (auto-fix)' \
+		'  make lint-check   Check formatting without changes' \
+		'' \
+		'Benchmarks (gzippy only - fast):' \
+		'  make bench                       Quick benchmark (L6, all datasets)' \
+		'  make bench-decompress-silesia    Decompress silesia' \
+		'  make bench-decompress-software   Decompress software' \
+		'  make bench-decompress-logs       Decompress logs' \
+		'  make bench-compress-silesia-l6   Compress silesia L6' \
+		'  make bench-compress-software-l6  Compress software L6' \
+		'  make bench-compress-logs-l6      Compress logs L6' \
+		'' \
+		'Benchmarks (all tools compared - exhaustive):' \
+		'  make bench-all                       Full comparison (all tools, all levels)' \
+		'  make bench-decompress-all            All decompression (3 datasets)' \
+		'  make bench-decompress-silesia-all    Decompress silesia (all tools)' \
+		'  make bench-decompress-software-all   Decompress software (all tools)' \
+		'  make bench-decompress-logs-all       Decompress logs (all tools)' \
+		'  make bench-compress-all              All compression (3 datasets x 3 levels)' \
+		'  make bench-compress-silesia-l6-all   Compress silesia L6 (all tools)' \
+		'  make bench-compress-software-l6-all  Compress software L6 (all tools)' \
+		'  make bench-compress-logs-l6-all      Compress logs L6 (all tools)' \
+		'' \
+		'Data preparation:' \
+		'  make bench-data   Prepare benchmark datasets (silesia, software, logs)' \
+		'' \
+		'Charting (separate test running from rendering):' \
+		'  make validate-json     Run tests, save JSON to test_results/' \
+		'  make render-chart      Generate charts from existing JSON (fast)' \
+		'  make validation-chart  Both: run tests + generate charts' \
+		'' \
+		'Full testing (for humans at release time):' \
+		'  make perf-full    Comprehensive performance tests (10+ minutes)' \
+		'  make test-data    Generate all test data files' \
+		'' \
+		'Installation:' \
+		'  make install      Install gzippy and ungzippy to /usr/local/bin' \
+		'' \
+		'Maintenance:' \
+		'  make clean        Remove all build artifacts and test data' \
+		'  make help         Show this message' \
+		'' \
+		'Binaries:' \
+		'  gzippy            Compress (default) or decompress with -d' \
+		'  ungzippy          Decompress (like gunzip/unpigz)'
