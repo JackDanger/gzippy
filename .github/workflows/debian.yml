@@ -61,7 +61,10 @@ jobs:
           diff /tmp/test.txt /tmp/test2.txt
           echo "✓ gzippy-replace-gzip works"
 
+      - name: Collect .deb files into workspace
+        run: cp ../*.deb ./
+
       - uses: actions/upload-artifact@v4
         with:
           name: debian-packages-${{ matrix.arch }}
-          path: ../*.deb
+          path: "*.deb"

@@ -126,10 +126,13 @@ jobs:
           echo "Hello gzippy" | gzippy -c | gzippy -d
           echo "✓ gzippy package works"
 
+      - name: Collect .deb files into workspace
+        run: cp ../*.deb ./
+
       - uses: actions/upload-artifact@v4
         with:
           name: deb-${{ matrix.arch }}
-          path: ../*.deb
+          path: "*.deb"
 
   # ---------------------------------------------------------------------------
   # Publish: update formula, create GitHub release
