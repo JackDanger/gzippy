@@ -1,5 +1,5 @@
 Package: gzippy
-Version: 0.1.4-1
+Version: 0.1.5-1
 Architecture: arm64
 Maintainer: Jack Danger <github@jackdanger.com>
 Installed-Size: 852
@@ -7,11 +7,11 @@ Depends: libc6 (>= 2.34), libgcc-s1 (>= 4.2)
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy_0.1.4-1_arm64.deb
-Size: 375752
-SHA256: f226d9fb68a48f232388abe9131adba3ba9b6fed081f6fcb5dd1c2d032607d3a
-SHA1: 7bdf97c1e84df56776b4ac72f8910cec180d2623
-MD5sum: 8fe09468719d4150b5baf1ce7c46b424
+Filename: pool/main/g/gzippy/gzippy_0.1.5-1_arm64.deb
+Size: 384156
+SHA256: 78bd290927d4021944256056aa42156e8859a0c8e697ecd6fcc356a5e982a908
+SHA1: e1a368abf7dfc17762c69c70121fa1f8cd9e13ce
+MD5sum: cf2fc612824791bb84bb37855e09e247
 Description: The fastest parallel gzip
  Gzippy is a high-performance parallel gzip implementation written in Rust.
  It beats gzip and pigz by leveraging multiple CPU cores, SIMD instructions,
@@ -27,22 +27,22 @@ Description: The fastest parallel gzip
 
 Package: gzippy-replace-gzip
 Source: gzippy
-Version: 0.1.4-1
+Version: 0.1.5-1
 Architecture: all
 Maintainer: Jack Danger <github@jackdanger.com>
 Installed-Size: 22
-Depends: gzippy (= 0.1.4-1)
+Depends: gzippy (= 0.1.5-1)
 Conflicts: gzip
 Replaces: gzip
 Provides: gzip
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.1.4-1_all.deb
-Size: 2194
-SHA256: d60e4bf1f6c4340d1e506973e23d0d1b16309c770f7ad900b82017303eaca1fd
-SHA1: a2cc0b2d82137f7fc51a3fec4b1332f130434b79
-MD5sum: 1d4b4f07c7819b105dc710c007af582f
+Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.1.5-1_all.deb
+Size: 2196
+SHA256: 5110980935e8d1a6b752875d883f5ca1367ce638b4abf4c1215f871773b75d29
+SHA1: 4c9649ae410bf5a9c7ef9d7e10b2019c48364474
+MD5sum: dbd156005f12a289293f0b2669f5d3b6
 Description: Replace system gzip with gzippy (fast parallel gzip)
  This package replaces the system gzip, gunzip, gzcat, and zcat commands
  with gzippy, providing significantly faster compression and decompression.
