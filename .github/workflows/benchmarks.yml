@@ -45,7 +45,7 @@ jobs:
           - platform: arm64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -58,7 +58,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -106,7 +106,7 @@ jobs:
           cp zopfli/zopfli binaries/ 2>/dev/null || echo "zopfli not available"
           ls -la binaries/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.platform }}
           path: binaries/
@@ -120,9 +120,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: binaries-x86_64
           path: ./bin
@@ -162,7 +162,7 @@ jobs:
 
           ls -lh benchmark_data/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: benchmark-data
           path: benchmark_data/
@@ -362,14 +362,14 @@ jobs:
             level: 9
             threads: "max"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: binaries-${{ matrix.platform }}
           path: ./bin
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: benchmark-data
           path: ./benchmark_data
@@ -417,7 +417,7 @@ jobs:
             --content-type ${{ matrix.data_type }} \
             --output results/compression.json
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: results-compress-${{ matrix.platform }}-${{ matrix.data_type }}-l${{ matrix.level }}-t${{ matrix.threads }}
           path: results/
@@ -442,14 +442,14 @@ jobs:
           - platform: arm64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: binaries-${{ matrix.platform }}
           path: ./bin
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: benchmark-data
           path: ./benchmark_data
@@ -525,7 +525,7 @@ jobs:
             --archive-type ${{ matrix.archive_type }} \
             --output results/decompression.json
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: results-decompress-${{ matrix.platform }}-${{ matrix.archive_type }}-t${{ matrix.threads }}
           path: results/
@@ -568,7 +568,7 @@ jobs:
             threads: "max"
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: binaries-${{ matrix.platform }}
           path: ./bin
@@ -614,9 +614,9 @@ jobs:
         platform: [x86_64, arm64]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: results-*-${{ matrix.platform }}-*
           path: results/
@@ -661,7 +661,7 @@ jobs:
           echo "## ${{ matrix.platform }} Performance" >> $GITHUB_STEP_SUMMARY
           cat summary.md >> $GITHUB_STEP_SUMMARY
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: benchmark-summary-${{ matrix.platform }}
           path: |
@@ -673,7 +673,7 @@ jobs:
 
       - name: Post to PR
         if: github.event_name == 'pull_request' && matrix.platform == 'x86_64'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');

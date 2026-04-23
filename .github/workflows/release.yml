@@ -60,7 +60,7 @@ jobs:
             features: --features isal-compression
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: true
 
@@ -68,7 +68,7 @@ jobs:
         with:
           targets: ${{ matrix.cross_target }}
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -104,7 +104,7 @@ jobs:
           shasum -a 256 "$TARBALL" | awk '{print $1}' > "$TARBALL.sha256"
           echo "Packaged $TARBALL ($(cat $TARBALL.sha256))"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.target }}
           path: |
@@ -127,7 +127,7 @@ jobs:
             runner: ubuntu-24.04-arm
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: true
 
@@ -161,7 +161,7 @@ jobs:
       - name: Collect .deb files into workspace
         run: cp ../*.deb ./
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: deb-${{ matrix.arch }}
           path: "*.deb"
@@ -175,12 +175,12 @@ jobs:
     needs: [build-binary, build-deb]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
 
@@ -237,7 +237,7 @@ jobs:
           git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
