@@ -6,8 +6,24 @@
 //! preservation, stats printing, and signal-handler registration.
 
 use std::fs::File;
-use std::io::{stdin, stdout, BufWriter, Cursor, Read};
+use std::io::{self, stdin, stdout, BufWriter, Cursor, Read, Write};
 use std::path::Path;
+
+struct CountingWriter<W: Write> {
+    inner: W,
+    count: u64,
+}
+impl<W: Write> CountingWriter<W> {
+    fn new(inner: W) -> Self { Self { inner, count: 0 } }
+}
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> { self.inner.flush() }
+}
 
 use crate::cli::GzippyArgs;
 use crate::error::{GzippyError, GzippyResult};
@@ -232,6 +248,7 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 
 pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     let can_parallelize = args.processes > 1;
+    let verbose = args.verbose && !args.quiet;
 
     // T1 L0-L3 streaming fast path: compress directly from stdin with ~2MB memory.
     // Must happen BEFORE read_to_end to avoid buffering the entire input.
@@ -242,31 +259,33 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         && crate::backends::isal_compress::is_available()
     {
         let mut input = stdin();
-        let output = BufWriter::with_capacity(1024 * 1024, stdout());
+        let mut counted = CountingWriter::new(BufWriter::with_capacity(1024 * 1024, stdout()));
         let compression_level = args.compression_level as u32;
-        if debug_enabled() {
+        let in_bytes = if debug_enabled() {
             let t0 = std::time::Instant::now();
             let bytes = crate::backends::isal_compress::compress_gzip_stream_direct(
                 &mut input,
-                output,
+                &mut counted,
                 compression_level,
             )?;
             let elapsed = t0.elapsed();
-            let mbps = bytes as f64 / elapsed.as_secs_f64() / 1_000_000.0;
             eprintln!(
                 "[gzippy] compress T1 ISA-L L{} streaming: {:.1}ms, {:.1} MB/s ({} bytes in)",
                 compression_level,
                 elapsed.as_secs_f64() * 1000.0,
-                mbps,
+                bytes as f64 / elapsed.as_secs_f64() / 1_000_000.0,
                 bytes
             );
+            bytes
         } else {
             crate::backends::isal_compress::compress_gzip_stream_direct(
                 &mut input,
-                output,
+                &mut counted,
                 compression_level,
-            )?;
-        }
+            )?
+        };
+        counted.flush()?;
+        if verbose { print_stdin_stats(in_bytes, counted.count, args); }
         return Ok(0);
     }
 
@@ -311,7 +330,7 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         &buffer_vec
     };
 
-    let file_size = input_data.len() as u64;
+    let in_bytes = input_data.len() as u64;
     let content_type = if input_data.len() >= 8192 {
         crate::compress::optimization::analyze_content_type(&input_data[..8192])
     } else if !input_data.is_empty() {
@@ -322,14 +341,14 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
 
     let opt_config = OptimizationConfig::new(
         args.processes,
-        file_size,
+        in_bytes,
         args.compression_level,
         content_type,
     );
 
     let header_info = GzipHeaderInfo::default();
     let compression_level = args.compression_level as u32;
-    let output = BufWriter::with_capacity(1024 * 1024, stdout());
+    let mut counted = CountingWriter::new(BufWriter::with_capacity(1024 * 1024, stdout()));
 
     if opt_config.thread_count > 1 {
         if args.compression_level >= 6 && args.compression_level <= 9 {
@@ -338,15 +357,17 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
                 opt_config.thread_count,
             );
             encoder.set_header_info(header_info);
-            encoder.compress_buffer(input_data, output)?;
+            encoder.compress_buffer(input_data, &mut counted)?;
         } else {
             let mut encoder = crate::compress::parallel::ParallelGzEncoder::new(
                 compression_level,
                 opt_config.thread_count,
             );
             encoder.set_header_info(header_info);
-            encoder.compress_buffer(input_data, output)?;
+            encoder.compress_buffer(input_data, &mut counted)?;
         }
+        counted.flush()?;
+        if verbose { print_stdin_stats(in_bytes, counted.count, args); }
         return Ok(0);
     }
 
@@ -360,27 +381,50 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         }
         if debug_enabled() {
             let t0 = std::time::Instant::now();
-            crate::backends::isal_compress::compress_gzip_to_writer(input_data, output, compression_level)?;
+            crate::backends::isal_compress::compress_gzip_to_writer(input_data, &mut counted, compression_level)?;
             let elapsed = t0.elapsed();
-            let mbps = input_data.len() as f64 / elapsed.as_secs_f64() / 1_000_000.0;
             eprintln!(
                 "[gzippy] compress T1 ISA-L L{}: {:.1}ms, {:.1} MB/s ({} bytes in)",
                 compression_level,
                 elapsed.as_secs_f64() * 1000.0,
-                mbps,
+                input_data.len() as f64 / elapsed.as_secs_f64() / 1_000_000.0,
                 input_data.len()
             );
         } else {
-            crate::backends::isal_compress::compress_gzip_to_writer(input_data, output, compression_level)?;
+            crate::backends::isal_compress::compress_gzip_to_writer(input_data, &mut counted, compression_level)?;
         }
+        counted.flush()?;
+        if verbose { print_stdin_stats(in_bytes, counted.count, args); }
         return Ok(0);
     }
 
     drop(mmap_data);
     let cursor = Cursor::new(buffer_vec);
-    match crate::compress::compress_with_pipeline(cursor, output, args, &opt_config, &header_info) {
-        Ok(_) => Ok(0),
+    match crate::compress::compress_with_pipeline(cursor, &mut counted, args, &opt_config, &header_info) {
+        Ok(_) => {
+            counted.flush()?;
+            if verbose { print_stdin_stats(in_bytes, counted.count, args); }
+            Ok(0)
+        }
         Err(e) => Err(e),
+    }
+}
+
+fn print_stdin_stats(in_bytes: u64, out_bytes: u64, args: &GzippyArgs) {
+    let ratio = if in_bytes > 0 { out_bytes as f64 / in_bytes as f64 } else { 1.0 };
+    let saved_pct = (1.0 - ratio) * 100.0;
+    let (in_size, in_unit) = human_size(in_bytes);
+    let (out_size, out_unit) = human_size(out_bytes);
+    if args.processes > 1 {
+        eprintln!(
+            "(stdin): {:.1}{} → {:.1}{} ({:.1}% saved, {} threads)",
+            in_size, in_unit, out_size, out_unit, saved_pct, args.processes
+        );
+    } else {
+        eprintln!(
+            "(stdin): {:.1}{} → {:.1}{} ({:.1}% saved)",
+            in_size, in_unit, out_size, out_unit, saved_pct
+        );
     }
 }
 

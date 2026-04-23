@@ -6,8 +6,24 @@
 //! stats printing, and signal-handler registration.
 
 use std::fs::File;
-use std::io::{stdin, stdout, BufReader, BufWriter, Read, Write};
+use std::io::{self, stdin, stdout, BufReader, BufWriter, Read, Write};
 use std::path::Path;
+
+struct CountingWriter<W: Write> {
+    inner: W,
+    count: u64,
+}
+impl<W: Write> CountingWriter<W> {
+    fn new(inner: W) -> Self { Self { inner, count: 0 } }
+}
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> { self.inner.flush() }
+}
 
 use memmap2::Mmap;
 
@@ -240,8 +256,11 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         CompressionFormat::Gzip
     };
 
+    let verbose = args.verbose && !args.quiet;
+    let in_bytes = input_data.len() as u64;
+
     let stdout = stdout();
-    let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
+    let mut counted = CountingWriter::new(BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock()));
 
     match format {
         CompressionFormat::Gzip | CompressionFormat::Zip => {
@@ -262,20 +281,30 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
 
             if is_bgzf {
                 let threads = if can_parallelize { args.processes } else { 1 };
-                crate::decompress::bgzf::decompress_bgzf_parallel(input_data, &mut writer, threads)?;
+                crate::decompress::bgzf::decompress_bgzf_parallel(input_data, &mut counted, threads)?;
             } else if can_parallelize {
                 let output = crate::decompress::decompress_gzip_to_vec(input_data, args.processes)?;
-                writer.write_all(&output)?;
+                counted.write_all(&output)?;
             } else {
-                crate::decompress::decompress_single_member(input_data, &mut writer, args.processes)?;
+                crate::decompress::decompress_single_member(input_data, &mut counted, args.processes)?;
             }
         }
         CompressionFormat::Zlib => {
-            crate::decompress::decompress_zlib_turbo(input_data, &mut writer)?;
+            crate::decompress::decompress_zlib_turbo(input_data, &mut counted)?;
         }
     }
 
-    writer.flush()?;
+    counted.flush()?;
+    if verbose {
+        let out_bytes = counted.count;
+        let ratio = if in_bytes > 0 { out_bytes as f64 / in_bytes as f64 } else { 1.0 };
+        let (in_size, in_unit) = human_size(in_bytes);
+        let (out_size, out_unit) = human_size(out_bytes);
+        eprintln!(
+            "(stdin): {:.1}{} → {:.1}{} ({:.1}x expansion)",
+            in_size, in_unit, out_size, out_unit, ratio
+        );
+    }
     Ok(0)
 }
 

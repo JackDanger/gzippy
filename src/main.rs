@@ -130,12 +130,23 @@ fn run() -> Result<i32, GzippyError> {
     // zcat/gzcat imply decompress-to-stdout
     let stdout_mode = args.stdout || program_name == "zcat" || program_name == "gzcat";
 
-    // Refuse to write compressed binary data to a terminal (unless -f)
-    if !decompress && stdout_mode && !args.force {
+    // Refuse to write compressed binary data to a terminal (unless -f).
+    // Applies to: explicit -c/stdout mode, OR no files given (stdin→stdout compress).
+    if !decompress && !args.test && !args.force && (stdout_mode || args.files.is_empty()) {
         use std::io::IsTerminal;
         if std::io::stdout().is_terminal() {
             eprintln!(
                 "gzippy: compressed data not written to a terminal. Use -f to force compression."
+            );
+            return Ok(1);
+        }
+    }
+    // Refuse to read compressed data from a terminal (unless -f).
+    if (decompress || args.test) && !args.force && args.files.is_empty() {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            eprintln!(
+                "gzippy: compressed data not read from a terminal. Use -f to force decompression."
             );
             return Ok(1);
         }
