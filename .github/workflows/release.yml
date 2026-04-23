@@ -1,11 +1,15 @@
 # =============================================================================
-# Release: build binaries + .deb packages, publish GitHub release, update formula
+# Release: build binaries + .deb packages, publish GitHub release, update formula,
+#          rebuild apt repository on GitHub Pages (jackdanger.github.io/gzippy)
 # =============================================================================
 # Triggered by version tags (v*) or manual dispatch.
 # Produces:
 #   - gzippy-{target}.tar.gz for 4 platforms
 #   - gzippy_{version}_{arch}.deb for amd64 + arm64
-#   - Updated Formula/gzippy.rb committed to main
+#   - Updated Formula/gzippy.rb + Cargo.toml committed to main
+#   - apt repo at https://jackdanger.github.io/gzippy (gh-pages branch)
+#
+# Required secret: APT_SIGNING_KEY — armored GPG private key (from 1Password)
 # =============================================================================
 name: Release
 
@@ -20,6 +24,8 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -134,6 +140,15 @@ jobs:
             debhelper devscripts build-essential \
             zlib1g-dev cmake nasm autoconf automake libtool
 
+      - name: Set version from tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          DEB_VERSION="${VERSION}-1"
+          sed -i "1s/gzippy ([^)]*)/gzippy ($DEB_VERSION)/" debian/changelog
+          echo "debian/changelog version set to $DEB_VERSION"
+
       - name: Build Debian packages
         run: dpkg-buildpackage -us -uc -b -d
 
@@ -232,3 +247,70 @@ jobs:
             dist/binary-*/gzippy-*.tar.gz.sha256
             dist/deb-amd64/*.deb
             dist/deb-arm64/gzippy_*_arm64.deb
+
+      # -----------------------------------------------------------------------
+      # Rebuild apt repository and deploy to GitHub Pages
+      # -----------------------------------------------------------------------
+      - name: Install reprepro
+        run: sudo apt-get install -y reprepro
+
+      - name: Import apt signing key
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          echo "$APT_SIGNING_KEY" | gpg --batch --import
+          KEY_FPR=$(gpg --list-keys --with-colons releases@jackdanger.com \
+            | grep '^fpr' | head -1 | cut -d: -f10)
+          echo "${KEY_FPR}:6:" | gpg --import-ownertrust
+          echo "KEY_FPR=$KEY_FPR" >> "$GITHUB_ENV"
+
+      - name: Build apt repository
+        run: |
+          DEB_VERSION="${VERSION}-1"
+          mkdir -p apt-repo/conf
+
+          cat > apt-repo/conf/distributions << EOF
+          Origin: gzippy
+          Label: gzippy
+          Codename: stable
+          Architectures: amd64 arm64
+          Components: main
+          Description: gzippy apt repository
+          SignWith: ${KEY_FPR}
+          EOF
+
+          for deb in \
+            dist/deb-amd64/gzippy_${DEB_VERSION}_amd64.deb \
+            dist/deb-amd64/gzippy-replace-gzip_${DEB_VERSION}_all.deb \
+            dist/deb-arm64/gzippy_${DEB_VERSION}_arm64.deb; do
+            reprepro -b apt-repo includedeb stable "$deb"
+          done
+
+          # Public key + install script for the web root
+          cp apt/gzippy-signing-key.asc apt-repo/gzippy-signing-key.asc
+          cp scripts/install.sh apt-repo/install.sh
+
+          # Stage for GitHub Pages (exclude reprepro internals)
+          mkdir -p apt-publish
+          cp -r apt-repo/dists apt-repo/pool apt-publish/
+          cp apt-repo/gzippy-signing-key.asc apt-repo/install.sh apt-publish/
+          touch apt-publish/.nojekyll
+
+      - name: Deploy apt repo to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: apt-publish
+          user_name: 'github-actions[bot]'
+          user_email: 'github-actions[bot]@users.noreply.github.com'
+          commit_message: 'chore: apt repo ${{ env.RELEASE_TAG }} [skip ci]'
+
+      - name: Enable GitHub Pages (idempotent)
+        run: |
+          gh api --method POST "repos/$GITHUB_REPOSITORY/pages" \
+            --field 'source[branch]=gh-pages' --field 'source[path]=/' 2>/dev/null \
+          || gh api --method PUT "repos/$GITHUB_REPOSITORY/pages" \
+            --field 'source[branch]=gh-pages' --field 'source[path]=/' 2>/dev/null \
+          || echo "GitHub Pages already configured"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

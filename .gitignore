@@ -39,3 +39,6 @@ __pycache__/
 
 # Local settings
 .claude
+
+# GPG private key — export to 1Password, never commit
+gzippy-apt-signing-key.asc

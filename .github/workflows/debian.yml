@@ -41,6 +41,13 @@ jobs:
             debhelper devscripts build-essential \
             zlib1g-dev cmake nasm autoconf automake libtool
 
+      - name: Set version from git
+        run: |
+          VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.0.0-dev")
+          DEB_VERSION="${VERSION}-1"
+          sed -i "1s/gzippy ([^)]*)/gzippy ($DEB_VERSION)/" debian/changelog
+          echo "debian/changelog version set to $DEB_VERSION"
+
       - name: Build Debian packages
         run: dpkg-buildpackage -us -uc -b -d
 

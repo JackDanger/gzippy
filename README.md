@@ -10,17 +10,52 @@ cat data | gzippy > out   # Works with pipes too
 
 ## Install
 
-**macOS / Linux — Homebrew**
+**One-liner (macOS, Debian, Ubuntu, and other Linux)**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JackDanger/gzippy/main/install.sh | bash
+```
+
+Detects your platform and uses the right package manager.
+
+---
+
+**macOS — Homebrew**
 
 ```bash
 brew tap jackdanger/gzippy https://github.com/JackDanger/gzippy
 brew install jackdanger/gzippy/gzippy
 ```
 
-Installs `gzippy`, `gzip`, `gunzip`, `ungzippy`, and `zcat` — all the same binary.
-
-> If Homebrew's `gzip` package is installed, remove it first: `brew uninstall gzip`  
+> Remove Homebrew's gzip first if installed: `brew uninstall gzip`  
 > The macOS system `/usr/bin/gzip` is untouched.
+
+**Debian / Ubuntu — apt**
+
+```bash
+curl -fsSL https://jackdanger.github.io/gzippy/gzippy-signing-key.asc \
+    | gpg --dearmor \
+    | sudo tee /etc/apt/keyrings/gzippy.gpg >/dev/null
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/gzippy.gpg] \
+    https://jackdanger.github.io/gzippy stable main" \
+    | sudo tee /etc/apt/sources.list.d/gzippy.list >/dev/null
+sudo apt-get update
+sudo apt-get install gzippy
+```
+
+To replace system `gzip` with gzippy:
+
+```bash
+sudo apt-get install gzippy-replace-gzip
+```
+
+**Other Linux — binary**
+
+```bash
+# Replace ARCH with x86_64 or aarch64
+curl -fsSL https://github.com/JackDanger/gzippy/releases/latest/download/gzippy-ARCH-unknown-linux-gnu.tar.gz \
+    | tar -xz -C ~/.local/bin
+```
 
 **Cargo (all platforms)**
 
