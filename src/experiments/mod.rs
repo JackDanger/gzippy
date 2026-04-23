@@ -4,9 +4,9 @@
 // Speculative parallel (parallel_single_member): 88–148 MB/s vs 600–2000 MB/s sequential.
 // arm64 warning: speculative paths are 16× slower on low-redundancy data.
 
-pub mod bmi2;
 pub mod block_finder;
 pub mod block_finder_lut;
+pub mod bmi2;
 pub mod consume_first_decode;
 pub mod consume_first_table;
 pub mod double_literal;

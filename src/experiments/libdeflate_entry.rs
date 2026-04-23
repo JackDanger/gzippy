@@ -316,7 +316,8 @@ impl DistEntry {
         let extra_bits = total_bits - codeword_bits;
         // Use BMI2 _bzhi_u64 when available for faster bit extraction
         let extra_value =
-            crate::experiments::bmi2::decode_extra_bits(saved_bitbuf, codeword_bits, extra_bits) as u32;
+            crate::experiments::bmi2::decode_extra_bits(saved_bitbuf, codeword_bits, extra_bits)
+                as u32;
         base + extra_value
     }
 }

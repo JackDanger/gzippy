@@ -184,7 +184,10 @@ impl VectorTable {
     }
 
     /// Build a vector table from a libdeflate-style LitLenTable
-    pub fn build_from_litlen(&mut self, litlen: &crate::experiments::libdeflate_entry::LitLenTable) {
+    pub fn build_from_litlen(
+        &mut self,
+        litlen: &crate::experiments::libdeflate_entry::LitLenTable,
+    ) {
         for i in 0..VECTOR_TABLE_SIZE {
             // Only literals with codeword bits <= 8 can fit in our 8-bit lookahead table.
             // If it's a subtable pointer or a longer code, we must mark it as overflow.

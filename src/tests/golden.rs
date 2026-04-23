@@ -50,8 +50,8 @@ mod tests {
 
         // Get our turbo output
         let mut turbo_out = vec![0u8; original.len() + 100];
-        let turbo_size =
-            crate::decompress::bgzf::inflate_into_pub(&compressed, &mut turbo_out).expect("turbo failed");
+        let turbo_size = crate::decompress::bgzf::inflate_into_pub(&compressed, &mut turbo_out)
+            .expect("turbo failed");
 
         // Byte-exact comparison
         assert_eq!(turbo_size, libdeflate_size, "Size mismatch");
@@ -86,7 +86,8 @@ mod tests {
             .unwrap();
 
         let mut turbo_out = vec![0u8; original.len() + 100];
-        let turbo_size = crate::decompress::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
+        let turbo_size =
+            crate::decompress::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
 
         assert_eq!(turbo_size, libdeflate_size);
         assert_slices_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
@@ -110,7 +111,8 @@ mod tests {
             .unwrap();
 
         let mut turbo_out = vec![0u8; original.len() + 100];
-        let turbo_size = crate::decompress::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
+        let turbo_size =
+            crate::decompress::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
 
         assert_eq!(turbo_size, libdeflate_size);
         assert_slices_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
@@ -142,7 +144,8 @@ mod tests {
             .unwrap();
 
         let mut turbo_out = vec![0u8; original.len() + 100];
-        let turbo_size = crate::decompress::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
+        let turbo_size =
+            crate::decompress::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
 
         assert_eq!(turbo_size, libdeflate_size);
         assert_slices_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
@@ -189,7 +192,8 @@ mod tests {
             .unwrap();
 
         let mut turbo_out = vec![0u8; isize + 1000];
-        let turbo_size = crate::decompress::bgzf::inflate_into_pub(deflate_data, &mut turbo_out).unwrap();
+        let turbo_size =
+            crate::decompress::bgzf::inflate_into_pub(deflate_data, &mut turbo_out).unwrap();
 
         // Find first mismatch
         let first_mismatch = turbo_out[..test_size]
@@ -227,7 +231,8 @@ mod tests {
             .unwrap();
 
         let mut turbo_out = vec![0u8; original.len() + 100];
-        let turbo_size = crate::decompress::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
+        let turbo_size =
+            crate::decompress::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
 
         assert_eq!(turbo_size, libdeflate_size);
         assert_slices_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
@@ -256,7 +261,8 @@ mod tests {
             .unwrap();
 
         let mut turbo_out = vec![0u8; original.len() + 100];
-        let turbo_size = crate::decompress::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
+        let turbo_size =
+            crate::decompress::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
 
         assert_eq!(turbo_size, libdeflate_size);
         assert_slices_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
@@ -280,7 +286,8 @@ mod tests {
             .unwrap();
 
         let mut turbo_out = vec![0u8; original.len() + 100];
-        let turbo_size = crate::decompress::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
+        let turbo_size =
+            crate::decompress::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
 
         assert_eq!(turbo_size, libdeflate_size);
         assert_slices_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);

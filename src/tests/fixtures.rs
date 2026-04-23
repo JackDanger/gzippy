@@ -11,10 +11,10 @@
 //! - `bgzf_gz`          — gzippy parallel format ("GZ" FEXTRA subfield)
 
 #[cfg(test)]
-pub use fixtures::*;
+pub use inner::*;
 
 #[cfg(test)]
-mod fixtures {
+mod inner {
     use crate::compress::parallel::{compress_single_member, GzipHeaderInfo};
     use std::io::Write;
     use std::sync::OnceLock;
@@ -22,6 +22,7 @@ mod fixtures {
     pub struct Fixtures {
         pub plain: Vec<u8>,
         pub single_member_gz: Vec<u8>,
+        #[allow(dead_code)]
         pub multi_member_gz: Vec<u8>,
         pub bgzf_gz: Vec<u8>,
     }
@@ -39,6 +40,7 @@ mod fixtures {
     }
 
     /// 1MB of near-random binary (seed 99999) — tests incompressible path.
+    #[allow(dead_code)]
     pub fn binary_1mb() -> &'static Fixtures {
         static CELL: OnceLock<Fixtures> = OnceLock::new();
         CELL.get_or_init(|| build_random(1024 * 1024, 99999))
@@ -58,7 +60,9 @@ mod fixtures {
             b"fn decompress(data: &[u8]) -> Result<Vec<u8>, Error> {\n",
         ];
         while data.len() < size {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             if (rng >> 32) % 10 < 3 {
                 data.push((rng >> 16) as u8);
             } else {
@@ -72,6 +76,7 @@ mod fixtures {
     }
 
     /// Near-random binary — exercises incompressible path.
+    #[allow(dead_code)]
     fn make_random(size: usize, seed: u64) -> Vec<u8> {
         let mut data = Vec::with_capacity(size);
         let mut rng = seed;
@@ -94,8 +99,7 @@ mod fixtures {
         let chunk = 256 * 1024;
         let mut out = Vec::new();
         for c in plain.chunks(chunk) {
-            let mut enc =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
             enc.write_all(c).unwrap();
             out.extend_from_slice(&enc.finish().unwrap());
         }
@@ -116,15 +120,26 @@ mod fixtures {
         let single_member_gz = compress_single_member_gz(&plain);
         let multi_member_gz = compress_multi_member_gz(&plain);
         let bgzf_gz = compress_bgzf_gz(&plain);
-        Fixtures { plain, single_member_gz, multi_member_gz, bgzf_gz }
+        Fixtures {
+            plain,
+            single_member_gz,
+            multi_member_gz,
+            bgzf_gz,
+        }
     }
 
+    #[allow(dead_code)]
     fn build_random(size: usize, seed: u64) -> Fixtures {
         let plain = make_random(size, seed);
         let single_member_gz = compress_single_member_gz(&plain);
         let multi_member_gz = compress_multi_member_gz(&plain);
         let bgzf_gz = compress_bgzf_gz(&plain);
-        Fixtures { plain, single_member_gz, multi_member_gz, bgzf_gz }
+        Fixtures {
+            plain,
+            single_member_gz,
+            multi_member_gz,
+            bgzf_gz,
+        }
     }
 
     // ── self-test ────────────────────────────────────────────────────────────

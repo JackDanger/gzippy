@@ -16,14 +16,14 @@ mod format;
 mod utils;
 
 // ── Compression & decompression stacks ───────────────────────────────────────
-mod compress;    // engine (mod.rs) + io, parallel, pipelined, optimization, simple
-mod decompress;  // engine (mod.rs) + io, format, bgzf, SIMD tables, scan_inflate
+mod compress; // engine (mod.rs) + io, parallel, pipelined, optimization, simple
+mod decompress; // engine (mod.rs) + io, format, bgzf, SIMD tables, scan_inflate
 
 // ── Hardware backends (ISA-L, libdeflate FFI) ─────────────────────────────────
-mod backends;    // isal, isal_compress, isal_decompress, libdeflate
+mod backends; // isal, isal_compress, isal_decompress, libdeflate
 
 // ── Threading infrastructure ──────────────────────────────────────────────────
-mod infra;       // thread_pool, scheduler, io_thread
+mod infra; // thread_pool, scheduler, io_thread
 
 // ── Experimental paths (not wired into production) ────────────────────────────
 // See CLAUDE.md "Experiments" section and CLAUDE.md score table before wiring in.

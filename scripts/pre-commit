@@ -1,34 +1,23 @@
-#!/bin/bash
-# Pre-commit hook to validate code before committing
-# Install with: ln -sf ../../scripts/pre-commit .git/hooks/pre-commit
+#!/usr/bin/env bash
+# Pre-commit hook — auto-installed by build.rs on every cargo build.
+set -euo pipefail
 
-set -e
+changed_rs=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
+changed_yaml=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.github/.*\.ya?ml$' || true)
 
-# Check YAML syntax in .github/ directory
-echo "Checking YAML syntax in .github/..."
-yaml_error=0
-for yaml_file in $(git diff --cached --name-only --diff-filter=ACM | grep -E '\.github/.*\.ya?ml$' || true); do
-    if [ -f "$yaml_file" ]; then
-        if ! ruby -ryaml -e "YAML.safe_load(File.read('$yaml_file'))" 2>&1; then
-            echo "Error: YAML syntax error in $yaml_file"
-            yaml_error=1
-        fi
-    fi
-done
-if [ $yaml_error -eq 1 ]; then
-    exit 1
+# Only run checks relevant to what's staged
+if [ -n "$changed_yaml" ]; then
+    for f in $changed_yaml; do
+        ruby -ryaml -e "YAML.safe_load(File.read('$f'))" 2>/dev/null \
+            || { echo "YAML syntax error: $f"; exit 1; }
+    done
 fi
 
-echo "Running cargo fmt --check..."
-if ! cargo fmt --check; then
-    echo "Error: Code is not formatted. Run 'cargo fmt' to fix."
-    exit 1
-fi
+if [ -n "$changed_rs" ]; then
+    cargo fmt --check 2>&1 \
+        || { echo "Run 'cargo fmt' then re-stage."; exit 1; }
 
-echo "Running cargo clippy..."
-if ! cargo clippy --all-targets --all-features -- -D warnings 2>&1; then
-    echo "Error: Clippy found warnings. Fix them before committing."
-    exit 1
+    # Default features only — isal-compression requires Linux autotools
+    cargo clippy --all-targets -- -D warnings 2>&1 \
+        || { echo "Fix clippy warnings before committing."; exit 1; }
 fi
-
-echo "Pre-commit checks passed!"

@@ -559,7 +559,10 @@ fn decode_huffman_cf_vector(
 
         // Try multi-literal lookahead (up to 4 literals)
         let (symbols, count, bits_count) =
-            crate::experiments::vector_huffman::decode_multi_literals(bits.peek(), &vector_table.table);
+            crate::experiments::vector_huffman::decode_multi_literals(
+                bits.peek(),
+                &vector_table.table,
+            );
         if count > 0 {
             output[out_pos..(out_pos + count)].copy_from_slice(&symbols[..count]);
             out_pos += count;
@@ -1883,9 +1886,11 @@ fn get_fixed_double_lit_cache() -> &'static crate::experiments::double_literal::
 }
 
 /// Get or build the specialized decoder for fixed Huffman (cached)
-fn get_fixed_specialized_decoder() -> &'static crate::experiments::specialized_decode::SpecializedDecoder {
+fn get_fixed_specialized_decoder(
+) -> &'static crate::experiments::specialized_decode::SpecializedDecoder {
     use std::sync::OnceLock;
-    static DECODER: OnceLock<crate::experiments::specialized_decode::SpecializedDecoder> = OnceLock::new();
+    static DECODER: OnceLock<crate::experiments::specialized_decode::SpecializedDecoder> =
+        OnceLock::new();
     DECODER.get_or_init(|| {
         // Fixed Huffman code lengths per RFC 1951
         let mut litlen_lens = vec![0u8; 288];
@@ -2149,7 +2154,8 @@ fn decode_dynamic(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<
     let dist_lengths = &all_lengths[hlit..];
 
     // Compute fingerprint for table caching
-    let fingerprint = crate::experiments::jit_decode::TableFingerprint::combined(litlen_lengths, dist_lengths);
+    let fingerprint =
+        crate::experiments::jit_decode::TableFingerprint::combined(litlen_lengths, dist_lengths);
 
     // Use libdeflate-style decoder for all dynamic blocks
     // This achieves 99-112% of libdeflate performance across all datasets.

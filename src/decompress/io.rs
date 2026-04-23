@@ -14,7 +14,9 @@ struct CountingWriter<W: Write> {
     count: u64,
 }
 impl<W: Write> CountingWriter<W> {
-    fn new(inner: W) -> Self { Self { inner, count: 0 } }
+    fn new(inner: W) -> Self {
+        Self { inner, count: 0 }
+    }
 }
 impl<W: Write> Write for CountingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -22,17 +24,19 @@ impl<W: Write> Write for CountingWriter<W> {
         self.count += n as u64;
         Ok(n)
     }
-    fn flush(&mut self) -> io::Result<()> { self.inner.flush() }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 use memmap2::Mmap;
 
 use crate::cli::GzippyArgs;
-use crate::error::{GzippyError, GzippyResult};
-use crate::format::CompressionFormat;
 use crate::decompress::format::{
     extract_gzip_fname, extract_gzip_mtime, has_bgzf_markers, is_likely_multi_member,
 };
+use crate::error::{GzippyError, GzippyResult};
+use crate::format::CompressionFormat;
 use crate::utils::{debug_enabled, preserve_metadata, strip_compression_extension};
 
 const STREAM_BUFFER_SIZE: usize = 1024 * 1024;
@@ -200,7 +204,10 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         let meta = std::fs::File::from(unsafe {
             std::os::unix::io::OwnedFd::from_raw_fd(0 /* stdin */)
         });
-        let is_regular = meta.metadata().map(|m| m.file_type().is_file()).unwrap_or(false);
+        let is_regular = meta
+            .metadata()
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false);
         let result = if is_regular {
             let m = unsafe { Mmap::map(&meta) }.ok();
             if let Some(ref mmap) = m {
@@ -260,7 +267,8 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     let in_bytes = input_data.len() as u64;
 
     let stdout = stdout();
-    let mut counted = CountingWriter::new(BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock()));
+    let mut counted =
+        CountingWriter::new(BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock()));
 
     match format {
         CompressionFormat::Gzip | CompressionFormat::Zip => {
@@ -281,12 +289,20 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
 
             if is_bgzf {
                 let threads = if can_parallelize { args.processes } else { 1 };
-                crate::decompress::bgzf::decompress_bgzf_parallel(input_data, &mut counted, threads)?;
+                crate::decompress::bgzf::decompress_bgzf_parallel(
+                    input_data,
+                    &mut counted,
+                    threads,
+                )?;
             } else if can_parallelize {
                 let output = crate::decompress::decompress_gzip_to_vec(input_data, args.processes)?;
                 counted.write_all(&output)?;
             } else {
-                crate::decompress::decompress_single_member(input_data, &mut counted, args.processes)?;
+                crate::decompress::decompress_single_member(
+                    input_data,
+                    &mut counted,
+                    args.processes,
+                )?;
             }
         }
         CompressionFormat::Zlib => {
@@ -297,7 +313,11 @@ pub fn decompress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     counted.flush()?;
     if verbose {
         let out_bytes = counted.count;
-        let ratio = if in_bytes > 0 { out_bytes as f64 / in_bytes as f64 } else { 1.0 };
+        let ratio = if in_bytes > 0 {
+            out_bytes as f64 / in_bytes as f64
+        } else {
+            1.0
+        };
         let (in_size, in_unit) = human_size(in_bytes);
         let (out_size, out_unit) = human_size(out_bytes);
         eprintln!(
@@ -352,13 +372,18 @@ fn decompress_to_writer<W: Write>(
             if debug_enabled() {
                 eprintln!(
                     "[gzippy] decompress_file: len={} bgzf={} multi={} parallel={} procs={}",
-                    mmap.len(), bgzf, multi, can_parallelize, args.processes
+                    mmap.len(),
+                    bgzf,
+                    multi,
+                    can_parallelize,
+                    args.processes
                 );
             }
 
             if bgzf {
                 let threads = if can_parallelize { args.processes } else { 1 };
-                let bytes = crate::decompress::bgzf::decompress_bgzf_parallel(&mmap[..], writer, threads)?;
+                let bytes =
+                    crate::decompress::bgzf::decompress_bgzf_parallel(&mmap[..], writer, threads)?;
                 Ok(bytes)
             } else if can_parallelize {
                 let output = crate::decompress::decompress_gzip_to_vec(&mmap[..], args.processes)?;
@@ -369,9 +394,7 @@ fn decompress_to_writer<W: Write>(
                 crate::decompress::decompress_single_member(&mmap[..], writer, args.processes)
             }
         }
-        CompressionFormat::Zlib => {
-            crate::decompress::decompress_zlib_turbo(&mmap[..], writer)
-        }
+        CompressionFormat::Zlib => crate::decompress::decompress_zlib_turbo(&mmap[..], writer),
     }
 }
 
@@ -428,7 +451,12 @@ fn print_stats(input_size: u64, output_size: u64, path: &Path) {
     let (out_size, out_unit) = human_size(output_size);
     eprintln!(
         "{}: {:.1}{} → {:.1}{} ({:.1}x expansion)",
-        filename, in_size, in_unit, out_size, out_unit, 1.0 / ratio
+        filename,
+        in_size,
+        in_unit,
+        out_size,
+        out_unit,
+        1.0 / ratio
     );
 }
 

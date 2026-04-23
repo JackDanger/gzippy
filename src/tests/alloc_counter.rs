@@ -78,9 +78,7 @@ mod counter {
                 ENABLED.with(|e| {
                     if e.get() {
                         COUNT.with(|c| c.set(c.get() + 1));
-                        BYTES.with(|b| {
-                            b.set(b.get() + (new_size - layout.size()) as u64)
-                        });
+                        BYTES.with(|b| b.set(b.get() + (new_size - layout.size()) as u64));
                     }
                 });
             }

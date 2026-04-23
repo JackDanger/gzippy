@@ -13,10 +13,10 @@ pub mod simple;
 use std::io::{Read, Write};
 
 use crate::cli::GzippyArgs;
-use crate::error::GzippyResult;
 use crate::compress::optimization::OptimizationConfig;
 use crate::compress::parallel::GzipHeaderInfo;
 use crate::compress::simple::SimpleOptimizer;
+use crate::error::GzippyResult;
 
 /// Select the fastest available compression backend and drive it to completion.
 ///
@@ -91,7 +91,11 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
             if args.verbosity >= 2 {
                 eprintln!("gzippy: using flate2 single-threaded path (highly compressible)");
             }
-            let adjusted_level = if args.compression_level == 1 { 2 } else { args.compression_level };
+            let adjusted_level = if args.compression_level == 1 {
+                2
+            } else {
+                args.compression_level
+            };
             let compression = flate2::Compression::new(adjusted_level as u32);
             let mut builder = flate2::GzBuilder::new();
             if let Some(ref name) = header_info.filename {
@@ -115,7 +119,11 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
         let compression = if args.huffman || args.rle {
             flate2::Compression::new(1)
         } else {
-            let adjusted_level = if args.compression_level == 1 { 2 } else { args.compression_level };
+            let adjusted_level = if args.compression_level == 1 {
+                2
+            } else {
+                args.compression_level
+            };
             flate2::Compression::new(adjusted_level as u32)
         };
         let mut builder = flate2::GzBuilder::new();

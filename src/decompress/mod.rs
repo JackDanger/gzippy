@@ -17,8 +17,8 @@ pub mod two_level_table;
 
 use std::io::Write;
 
-use crate::error::{GzippyError, GzippyResult};
 use crate::decompress::format::{has_bgzf_markers, is_likely_multi_member, read_gzip_isize};
+use crate::error::{GzippyError, GzippyResult};
 
 const STREAM_BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -119,17 +119,24 @@ pub(crate) fn decompress_gzip_libdeflate<W: Write + Send>(
     if crate::utils::debug_enabled() {
         eprintln!(
             "[gzippy] path={:?} threads={} bytes={}",
-            path, num_threads, data.len()
+            path,
+            num_threads,
+            data.len()
         );
     }
 
     match path {
         DecodePath::GzippyParallel => {
-            let bytes = crate::decompress::bgzf::decompress_bgzf_parallel(data, writer, num_threads)?;
+            let bytes =
+                crate::decompress::bgzf::decompress_bgzf_parallel(data, writer, num_threads)?;
             Ok(bytes)
         }
         DecodePath::MultiMemberPar => {
-            let bytes = crate::decompress::bgzf::decompress_multi_member_parallel(data, writer, num_threads)?;
+            let bytes = crate::decompress::bgzf::decompress_multi_member_parallel(
+                data,
+                writer,
+                num_threads,
+            )?;
             Ok(bytes)
         }
         DecodePath::MultiMemberSeq => decompress_multi_member_sequential(data, writer),
@@ -146,10 +153,15 @@ pub(crate) fn decompress_gzip_to_vec(data: &[u8], num_threads: usize) -> GzippyR
         return Ok(Vec::new());
     }
     if has_bgzf_markers(data) {
-        return Ok(crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(data, num_threads)?);
+        return Ok(crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(
+            data,
+            num_threads,
+        )?);
     }
     if num_threads > 1 && is_likely_multi_member(data) {
-        return Ok(crate::decompress::bgzf::decompress_multi_member_parallel_to_vec(data, num_threads)?);
+        return Ok(
+            crate::decompress::bgzf::decompress_multi_member_parallel_to_vec(data, num_threads)?,
+        );
     }
     let mut output = Vec::new();
     decompress_gzip_libdeflate(data, &mut output, num_threads)?;
@@ -163,7 +175,8 @@ pub(crate) fn decompress_single_member<W: Write>(
     _num_threads: usize,
 ) -> GzippyResult<u64> {
     if crate::backends::isal_decompress::is_available() {
-        if let Some(bytes) = crate::backends::isal_decompress::decompress_gzip_stream(data, writer) {
+        if let Some(bytes) = crate::backends::isal_decompress::decompress_gzip_stream(data, writer)
+        {
             writer.flush()?;
             return Ok(bytes);
         }
@@ -233,7 +246,9 @@ pub(crate) fn decompress_single_member_libdeflate<W: Write>(
                 output.resize(new_size, 0);
             }
             Err(DecompressError::BadData) => {
-                return Err(GzippyError::invalid_argument("invalid gzip data".to_string()));
+                return Err(GzippyError::invalid_argument(
+                    "invalid gzip data".to_string(),
+                ));
             }
         }
     }
@@ -312,7 +327,9 @@ pub(crate) fn decompress_multi_member_sequential<W: Write>(
 /// Decompress zlib data (2-byte header + deflate + 4-byte Adler32).
 pub(crate) fn decompress_zlib_turbo<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     if data.len() < 6 {
-        return Err(GzippyError::invalid_argument("Zlib data too short".to_string()));
+        return Err(GzippyError::invalid_argument(
+            "Zlib data too short".to_string(),
+        ));
     }
     let deflate_data = &data[2..data.len() - 4];
     let mut output_buf = vec![0u8; data.len().saturating_mul(4).max(64 * 1024)];

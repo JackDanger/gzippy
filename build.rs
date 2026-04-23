@@ -9,7 +9,34 @@
 //! fallback on ARM anyway, libdeflate is the pragmatic choice.
 
 fn main() {
-    // All dependencies are statically linked via Cargo
-    // No custom build steps needed
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=scripts/pre-commit");
+    install_git_hooks();
+}
+
+fn install_git_hooks() {
+    let hook_src = std::path::Path::new("scripts/pre-commit");
+    let hook_dst = std::path::Path::new(".git/hooks/pre-commit");
+
+    if !hook_src.exists() || !std::path::Path::new(".git").exists() {
+        return;
+    }
+
+    // Overwrite if missing or stale (src newer than dst)
+    let needs_update = !hook_dst.exists() || {
+        let src_mtime = hook_src.metadata().and_then(|m| m.modified()).ok();
+        let dst_mtime = hook_dst.metadata().and_then(|m| m.modified()).ok();
+        src_mtime > dst_mtime
+    };
+
+    if needs_update {
+        let content = std::fs::read(hook_src).expect("read scripts/pre-commit");
+        std::fs::write(hook_dst, content).expect("write .git/hooks/pre-commit");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(hook_dst, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod +x .git/hooks/pre-commit");
+        }
+    }
 }

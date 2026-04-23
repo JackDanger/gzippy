@@ -342,7 +342,9 @@ pub fn decode_block_consume_first(
     lit_table: &ConsumeFirstTable,
     dist_table: &ConsumeFirstTable,
 ) -> io::Result<bool> {
-    use crate::decompress::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
+    use crate::decompress::inflate_tables::{
+        DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START,
+    };
 
     // Bit buffer state
     let mut bitbuf: u64 = 0;

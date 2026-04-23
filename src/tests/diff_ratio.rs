@@ -66,7 +66,7 @@ mod tests {
         (median(&mut times_a), median(&mut times_b))
     }
 
-    fn median(v: &mut Vec<u64>) -> u64 {
+    fn median(v: &mut [u64]) -> u64 {
         v.sort_unstable();
         v[v.len() / 2]
     }
@@ -137,7 +137,8 @@ mod tests {
         let (gzippy_ns, libdeflate_ns) = measure_alternating(
             10,
             || {
-                let _ = crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(bgzf_data, 4).unwrap();
+                let _ =
+                    crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(bgzf_data, 4).unwrap();
             },
             || {
                 let mut d = libdeflater::Decompressor::new();
@@ -157,7 +158,10 @@ mod tests {
         );
 
         if std::env::var("RECORD_BASELINES").is_ok() {
-            println!("baseline: diff_ratio.max_ratio_bgzf_10mb = {:.3}", ratio * 1.15);
+            println!(
+                "baseline: diff_ratio.max_ratio_bgzf_10mb = {:.3}",
+                ratio * 1.15
+            );
             return;
         }
 

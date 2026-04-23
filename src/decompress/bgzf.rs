@@ -719,7 +719,9 @@ fn decode_dynamic_into(
 
     if use_multi_sym {
         // Try multi-symbol decode for literal-heavy blocks
-        if let Ok(multi_sym_table) = crate::decompress::simd_huffman::MultiSymTable::build(&code_lens[..hlit]) {
+        if let Ok(multi_sym_table) =
+            crate::decompress::simd_huffman::MultiSymTable::build(&code_lens[..hlit])
+        {
             #[cfg(any(test, feature = "counters"))]
             hot_counters::inc_multi_sym();
             return decode_huffman_multi_sym(
@@ -758,7 +760,9 @@ fn decode_huffman_multi_sym(
     lit_len_table: &TwoLevelTable,
     dist_table: &TwoLevelTable,
 ) -> io::Result<usize> {
-    use crate::decompress::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
+    use crate::decompress::inflate_tables::{
+        DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START,
+    };
 
     loop {
         bits.ensure(32);
@@ -940,7 +944,9 @@ fn decode_huffman_into(
     dist_table: &TwoLevelTable,
 ) -> io::Result<usize> {
     use crate::decompress::combined_lut::{DIST_END_OF_BLOCK, DIST_LITERAL, DIST_SLOW_PATH};
-    use crate::decompress::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
+    use crate::decompress::inflate_tables::{
+        DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START,
+    };
 
     // Branch prediction hints (stable workaround for likely/unlikely)
     // These help the compiler optimize hot paths by marking cold paths
@@ -1150,8 +1156,10 @@ fn decode_huffman_consume_first(
     lit_table: &crate::experiments::consume_first_table::ConsumeFirstTable,
     dist_table: &crate::experiments::consume_first_table::ConsumeFirstTable,
 ) -> io::Result<usize> {
+    use crate::decompress::inflate_tables::{
+        DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START,
+    };
     use crate::experiments::consume_first_table::CFEntry;
-    use crate::decompress::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
 
     let out_end = output.len();
     let fastloop_end = out_end.saturating_sub(320);
@@ -1422,7 +1430,9 @@ fn decode_huffman_turbo(
     lit_len_table: &TwoLevelTable,
     dist_table: &TwoLevelTable,
 ) -> io::Result<usize> {
-    use crate::decompress::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
+    use crate::decompress::inflate_tables::{
+        DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START,
+    };
 
     // Entry format constants
     const BITS_MASK: u32 = 0xFF;
@@ -2040,7 +2050,9 @@ fn decode_huffman_ultra(
     lit_len_table: &TwoLevelTable,
     dist_table: &TwoLevelTable,
 ) -> io::Result<usize> {
-    use crate::decompress::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
+    use crate::decompress::inflate_tables::{
+        DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START,
+    };
 
     // Entry format constants (inlined for speed)
     const BITS_MASK: u32 = 0xFF;
@@ -6557,9 +6569,11 @@ mod optimization_tests {
 
         // Decompress with our gzip preallocated function
         let mut our_out = Vec::new();
-        let our_size =
-            crate::experiments::ultra_fast_inflate::inflate_gzip_preallocated(&compressed, &mut our_out)
-                .expect("our inflate failed");
+        let our_size = crate::experiments::ultra_fast_inflate::inflate_gzip_preallocated(
+            &compressed,
+            &mut our_out,
+        )
+        .expect("our inflate failed");
 
         assert_eq!(our_size, original.len());
         assert_eq!(&our_out[..our_size], &original[..]);
@@ -6569,8 +6583,8 @@ mod optimization_tests {
     /// Test: Compare ConsumeFirstTable and TwoLevelTable decode results
     #[test]
     fn test_cf_table_comparison() {
-        use crate::experiments::consume_first_table::ConsumeFirstTable;
         use crate::decompress::two_level_table::TwoLevelTable;
+        use crate::experiments::consume_first_table::ConsumeFirstTable;
 
         // Use the same code lengths as would be built for a real stream
         // Standard fixed Huffman: 0-143 have 8 bits, 144-255 have 9 bits, etc.
@@ -6816,8 +6830,8 @@ mod optimization_tests {
     /// Test: Mixed code lengths with subtables on x86 / direct on ARM64
     #[test]
     fn test_cf_subtable_mixed() {
-        use crate::experiments::consume_first_table::{ConsumeFirstTable, CF_TABLE_BITS};
         use crate::decompress::two_level_table::TurboBits;
+        use crate::experiments::consume_first_table::{ConsumeFirstTable, CF_TABLE_BITS};
 
         // Create a more realistic code length distribution:
         // - Some short codes (frequent symbols)
@@ -7239,7 +7253,10 @@ mod optimization_tests {
 
         // Decompress with our function
         let mut our_out = Vec::new();
-        let result = crate::experiments::ultra_fast_inflate::inflate_gzip_preallocated(&full_data, &mut our_out);
+        let result = crate::experiments::ultra_fast_inflate::inflate_gzip_preallocated(
+            &full_data,
+            &mut our_out,
+        );
 
         match result {
             Ok(our_size) => {
@@ -7760,7 +7777,10 @@ mod optimization_tests {
         let mut output = vec![0u8; original.len() + 1024];
         eprintln!("\nDecompressing with consume_first_decode...");
 
-        let result = crate::experiments::consume_first_decode::inflate_consume_first(deflate_data, &mut output);
+        let result = crate::experiments::consume_first_decode::inflate_consume_first(
+            deflate_data,
+            &mut output,
+        );
 
         match result {
             Ok(decompressed_size) => {

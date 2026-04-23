@@ -754,10 +754,12 @@ mod tests {
             enc.finish().unwrap();
         }
 
-        let header_size = crate::experiments::marker_decode::skip_gzip_header(&gz).expect("valid header");
+        let header_size =
+            crate::experiments::marker_decode::skip_gzip_header(&gz).expect("valid header");
         let deflate = &gz[header_size..gz.len() - 8];
 
-        let scan = crate::decompress::scan_inflate::scan_deflate_fast(deflate, 512 * 1024, 0).expect("scan");
+        let scan = crate::decompress::scan_inflate::scan_deflate_fast(deflate, 512 * 1024, 0)
+            .expect("scan");
 
         let lut = get_lut();
         let finder = BlockFinder::new(deflate);
@@ -874,7 +876,8 @@ mod tests {
             enc.finish().unwrap();
         }
 
-        let header_size = crate::experiments::marker_decode::skip_gzip_header(&gz).expect("valid header");
+        let header_size =
+            crate::experiments::marker_decode::skip_gzip_header(&gz).expect("valid header");
         let deflate = &gz[header_size..gz.len() - 8];
 
         let sequential = BlockFinder::new(deflate).find_blocks(0, deflate.len() * 8);

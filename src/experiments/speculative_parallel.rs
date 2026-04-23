@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Speculative parallel decompression for single-member gzip files
 //!
 //! Implements rapidgzip's key insight: decode chunks IN PARALLEL from the start,
@@ -610,7 +611,9 @@ fn quick_block_check(deflate_data: &[u8], byte_pos: usize, bit_offset: u8) -> bo
             // Complete prefix code has exactly 128 leaves (2^7).
             // Allow slightly incomplete codes (some encoders produce them).
             #[allow(clippy::manual_range_contains)]
-            { nonzero >= 2 && allocated_leaves >= 64 && allocated_leaves <= 128 }
+            {
+                nonzero >= 2 && allocated_leaves >= 64 && allocated_leaves <= 128
+            }
         }
         _ => false,
     }

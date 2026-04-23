@@ -174,7 +174,9 @@ fn decode_huffman_block(
     lit_len_table: &TwoLevelTable,
     dist_table: &TwoLevelTable,
 ) -> io::Result<()> {
-    use crate::decompress::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
+    use crate::decompress::inflate_tables::{
+        DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START,
+    };
 
     output.reserve(256 * 1024);
     let start_len = output.len();
@@ -282,7 +284,9 @@ fn decode_huffman_block_fast(
     lit_len_table: &TwoLevelTable,
     dist_table: &TwoLevelTable,
 ) -> io::Result<()> {
-    use crate::decompress::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
+    use crate::decompress::inflate_tables::{
+        DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START,
+    };
 
     // Pre-allocate generously
     output.reserve(256 * 1024);
@@ -383,7 +387,9 @@ fn decode_huffman_block_fast(
 // CombinedLUT Decode (rapidgzip's key optimization)
 // =============================================================================
 
-use crate::decompress::combined_lut::{CombinedLUT, DIST_END_OF_BLOCK, DIST_LITERAL, DIST_SLOW_PATH};
+use crate::decompress::combined_lut::{
+    CombinedLUT, DIST_END_OF_BLOCK, DIST_LITERAL, DIST_SLOW_PATH,
+};
 
 /// Decode using CombinedLUT - pre-computed length+distance lookup
 /// This is rapidgzip's key optimization: single lookup for entire LZ77 match
@@ -397,7 +403,9 @@ fn decode_huffman_block_combined(
     lit_len_table: &TwoLevelTable, // Fallback for long codes
     dist_table: &TwoLevelTable,    // Fallback for slow path
 ) -> io::Result<()> {
-    use crate::decompress::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
+    use crate::decompress::inflate_tables::{
+        DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START,
+    };
 
     output.reserve(256 * 1024);
 

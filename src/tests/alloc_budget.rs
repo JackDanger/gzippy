@@ -48,8 +48,7 @@ mod tests {
         let _ = crate::decompress::decompress_gzip_to_vec(&fixture.single_member_gz, 1);
 
         CountingAllocator::reset();
-        let _ = crate::decompress::decompress_gzip_to_vec(&fixture.single_member_gz, 1)
-            .unwrap();
+        let _ = crate::decompress::decompress_gzip_to_vec(&fixture.single_member_gz, 1).unwrap();
         let count = CountingAllocator::count();
         let bytes = CountingAllocator::bytes();
 
@@ -61,7 +60,10 @@ mod tests {
         );
 
         if std::env::var("RECORD_BASELINES").is_ok() {
-            println!("baseline: alloc_budget.decompress_1mb_max_allocs = {}", (count as f64 * 1.20) as u64);
+            println!(
+                "baseline: alloc_budget.decompress_1mb_max_allocs = {}",
+                (count as f64 * 1.20) as u64
+            );
             return;
         }
 
@@ -83,7 +85,8 @@ mod tests {
         let _ = crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(&fixture.bgzf_gz, 4);
 
         CountingAllocator::reset();
-        let _ = crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(&fixture.bgzf_gz, 4).unwrap();
+        let _ =
+            crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(&fixture.bgzf_gz, 4).unwrap();
         let count = CountingAllocator::count();
         let bytes = CountingAllocator::bytes();
 
@@ -95,7 +98,10 @@ mod tests {
         );
 
         if std::env::var("RECORD_BASELINES").is_ok() {
-            println!("baseline: alloc_budget.decompress_bgzf_10mb_max_allocs = {}", (count as f64 * 1.20) as u64);
+            println!(
+                "baseline: alloc_budget.decompress_bgzf_10mb_max_allocs = {}",
+                (count as f64 * 1.20) as u64
+            );
             return;
         }
 

@@ -11,8 +11,8 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::decompress::format::has_bgzf_markers;
     use crate::compress::parallel::{compress_single_member, GzipHeaderInfo};
+    use crate::decompress::format::has_bgzf_markers;
     use std::io::Write;
 
     // =========================================================================
@@ -180,14 +180,16 @@ mod tests {
         let oracle = FileOracle::new(2 * 1024 * 1024);
 
         // T1
-        let output_t1 = crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(&oracle.bgzf_gz, 1).unwrap();
+        let output_t1 =
+            crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(&oracle.bgzf_gz, 1).unwrap();
         assert_eq!(
             output_t1, oracle.original,
             "BGZF T1 output doesn't match original"
         );
 
         // T4
-        let output_t4 = crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(&oracle.bgzf_gz, 4).unwrap();
+        let output_t4 =
+            crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(&oracle.bgzf_gz, 4).unwrap();
         assert_eq!(
             output_t4, oracle.original,
             "BGZF T4 output doesn't match original"
@@ -201,9 +203,11 @@ mod tests {
         let oracle = FileOracle::new(2 * 1024 * 1024);
 
         // Parallel path
-        let output_par =
-            crate::decompress::bgzf::decompress_multi_member_parallel_to_vec(&oracle.multi_member_gz, 4)
-                .unwrap();
+        let output_par = crate::decompress::bgzf::decompress_multi_member_parallel_to_vec(
+            &oracle.multi_member_gz,
+            4,
+        )
+        .unwrap();
         assert_eq!(
             output_par, oracle.original,
             "multi-member parallel output doesn't match original"
@@ -252,7 +256,10 @@ mod tests {
         let oracle = FileOracle::new(4 * 1024 * 1024);
 
         let outputs: Vec<Vec<u8>> = (1..=8)
-            .map(|t| crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(&oracle.bgzf_gz, t).unwrap())
+            .map(|t| {
+                crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(&oracle.bgzf_gz, t)
+                    .unwrap()
+            })
             .collect();
 
         for (i, output) in outputs.iter().enumerate() {
@@ -281,10 +288,13 @@ mod tests {
     fn test_cross_format_output_identity() {
         let oracle = FileOracle::new(2 * 1024 * 1024);
 
-        let from_bgzf = crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(&oracle.bgzf_gz, 4).unwrap();
-        let from_multi =
-            crate::decompress::bgzf::decompress_multi_member_parallel_to_vec(&oracle.multi_member_gz, 4)
-                .unwrap();
+        let from_bgzf =
+            crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(&oracle.bgzf_gz, 4).unwrap();
+        let from_multi = crate::decompress::bgzf::decompress_multi_member_parallel_to_vec(
+            &oracle.multi_member_gz,
+            4,
+        )
+        .unwrap();
 
         let mut from_single = Vec::new();
         crate::decompress::decompress_single_member_libdeflate(

@@ -50,7 +50,8 @@ mod tests {
         let _ = crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(&fixture.bgzf_gz, 4);
 
         hot_counters::reset();
-        let _ = crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(&fixture.bgzf_gz, 4).unwrap();
+        let _ =
+            crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(&fixture.bgzf_gz, 4).unwrap();
         let (dynamic, multi_sym, standard) = hot_counters::snapshot();
 
         if dynamic == 0 {
@@ -71,7 +72,10 @@ mod tests {
 
         if std::env::var("RECORD_BASELINES").is_ok() {
             // Record observed rate with 10% downward margin
-            println!("baseline: hit_rates.multi_sym_min = {:.3}", (rate * 0.90).max(0.0));
+            println!(
+                "baseline: hit_rates.multi_sym_min = {:.3}",
+                (rate * 0.90).max(0.0)
+            );
             return;
         }
 

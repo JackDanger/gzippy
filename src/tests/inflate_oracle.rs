@@ -13,8 +13,8 @@
 mod tests {
     #![allow(unused_variables)]
 
-    use crate::experiments::consume_first_decode::{inflate_consume_first, Bits};
     use crate::decompress::scan_inflate::scan_deflate_fast;
+    use crate::experiments::consume_first_decode::{inflate_consume_first, Bits};
     use std::io::Write;
     use std::time::Instant;
 
@@ -42,8 +42,8 @@ mod tests {
 
     impl InflateOracle {
         fn from_gzip(gzip_data: &[u8]) -> Self {
-            let header_size =
-                crate::experiments::marker_decode::skip_gzip_header(gzip_data).expect("valid gzip header");
+            let header_size = crate::experiments::marker_decode::skip_gzip_header(gzip_data)
+                .expect("valid gzip header");
             let deflate_data = &gzip_data[header_size..gzip_data.len() - 8];
 
             // Scan to get block boundaries
@@ -253,8 +253,9 @@ mod tests {
 
         // libdeflate
         let mut ld_output = vec![0u8; oracle.expected_output.len() + 65536];
-        let ld_size = crate::decompress::bgzf::inflate_into_pub(&oracle.deflate_data, &mut ld_output)
-            .expect("ld inflate");
+        let ld_size =
+            crate::decompress::bgzf::inflate_into_pub(&oracle.deflate_data, &mut ld_output)
+                .expect("ld inflate");
         ld_output.truncate(ld_size);
 
         assert_eq!(
@@ -287,8 +288,9 @@ mod tests {
             inflate_consume_first(&oracle.deflate_data, &mut cf_output).expect("cf inflate");
 
         let mut ld_output = vec![0u8; oracle.expected_output.len() + 65536];
-        let ld_size = crate::decompress::bgzf::inflate_into_pub(&oracle.deflate_data, &mut ld_output)
-            .expect("ld inflate");
+        let ld_size =
+            crate::decompress::bgzf::inflate_into_pub(&oracle.deflate_data, &mut ld_output)
+                .expect("ld inflate");
 
         assert_eq!(cf_size, ld_size, "silesia output size mismatch");
         assert_eq!(
@@ -593,7 +595,8 @@ mod tests {
         for (name, gen) in patterns {
             let data = gen();
             let gz = compress_gzip(&data);
-            let header_size = crate::experiments::marker_decode::skip_gzip_header(&gz).expect("valid header");
+            let header_size =
+                crate::experiments::marker_decode::skip_gzip_header(&gz).expect("valid header");
             let deflate = &gz[header_size..gz.len() - 8];
 
             let mut output = vec![0u8; data.len() + 65536];

@@ -482,7 +482,10 @@ mod tests {
         assert!(!result.checkpoints.is_empty());
 
         for cp in &result.checkpoints {
-            assert_eq!(cp.window.len(), crate::decompress::scan_inflate::WINDOW_SIZE);
+            assert_eq!(
+                cp.window.len(),
+                crate::decompress::scan_inflate::WINDOW_SIZE
+            );
             assert!(cp.output_offset >= crate::decompress::scan_inflate::WINDOW_SIZE);
             assert!(cp.input_byte_pos <= compressed.len());
         }

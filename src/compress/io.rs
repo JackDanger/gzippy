@@ -14,7 +14,9 @@ struct CountingWriter<W: Write> {
     count: u64,
 }
 impl<W: Write> CountingWriter<W> {
-    fn new(inner: W) -> Self { Self { inner, count: 0 } }
+    fn new(inner: W) -> Self {
+        Self { inner, count: 0 }
+    }
 }
 impl<W: Write> Write for CountingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -22,14 +24,16 @@ impl<W: Write> Write for CountingWriter<W> {
         self.count += n as u64;
         Ok(n)
     }
-    fn flush(&mut self) -> io::Result<()> { self.inner.flush() }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 use crate::cli::GzippyArgs;
-use crate::error::{GzippyError, GzippyResult};
 use crate::compress::optimization::{detect_content_type, ContentType, OptimizationConfig};
 use crate::compress::parallel::GzipHeaderInfo;
 use crate::compress::simple::SimpleOptimizer;
+use crate::error::{GzippyError, GzippyResult};
 use crate::utils::{debug_enabled, preserve_metadata};
 
 pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
@@ -189,7 +193,9 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             SimpleOptimizer::new(opt_config.clone()).with_header_info(header_info.clone());
         if args.stdout {
             let out = BufWriter::with_capacity(1024 * 1024, stdout());
-            optimizer.compress_file(input_path, out).map_err(|e| e.into())
+            optimizer
+                .compress_file(input_path, out)
+                .map_err(|e| e.into())
         } else {
             let output_file = BufWriter::new(File::create(output_path.as_ref().unwrap())?);
             optimizer
@@ -285,15 +291,18 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             )?
         };
         counted.flush()?;
-        if verbose { print_stdin_stats(in_bytes, counted.count, args); }
+        if verbose {
+            print_stdin_stats(in_bytes, counted.count, args);
+        }
         return Ok(0);
     }
 
     #[cfg(unix)]
     let mmap_data: Option<memmap2::Mmap> = if can_parallelize {
         use std::os::unix::io::FromRawFd;
-        let meta =
-            std::fs::File::from(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(0 /* stdin */) });
+        let meta = std::fs::File::from(unsafe {
+            std::os::unix::io::OwnedFd::from_raw_fd(0 /* stdin */)
+        });
         let is_regular = meta
             .metadata()
             .map(|m| m.file_type().is_file())
@@ -367,7 +376,9 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             encoder.compress_buffer(input_data, &mut counted)?;
         }
         counted.flush()?;
-        if verbose { print_stdin_stats(in_bytes, counted.count, args); }
+        if verbose {
+            print_stdin_stats(in_bytes, counted.count, args);
+        }
         return Ok(0);
     }
 
@@ -381,7 +392,11 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         }
         if debug_enabled() {
             let t0 = std::time::Instant::now();
-            crate::backends::isal_compress::compress_gzip_to_writer(input_data, &mut counted, compression_level)?;
+            crate::backends::isal_compress::compress_gzip_to_writer(
+                input_data,
+                &mut counted,
+                compression_level,
+            )?;
             let elapsed = t0.elapsed();
             eprintln!(
                 "[gzippy] compress T1 ISA-L L{}: {:.1}ms, {:.1} MB/s ({} bytes in)",
@@ -391,19 +406,33 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
                 input_data.len()
             );
         } else {
-            crate::backends::isal_compress::compress_gzip_to_writer(input_data, &mut counted, compression_level)?;
+            crate::backends::isal_compress::compress_gzip_to_writer(
+                input_data,
+                &mut counted,
+                compression_level,
+            )?;
         }
         counted.flush()?;
-        if verbose { print_stdin_stats(in_bytes, counted.count, args); }
+        if verbose {
+            print_stdin_stats(in_bytes, counted.count, args);
+        }
         return Ok(0);
     }
 
     drop(mmap_data);
     let cursor = Cursor::new(buffer_vec);
-    match crate::compress::compress_with_pipeline(cursor, &mut counted, args, &opt_config, &header_info) {
+    match crate::compress::compress_with_pipeline(
+        cursor,
+        &mut counted,
+        args,
+        &opt_config,
+        &header_info,
+    ) {
         Ok(_) => {
             counted.flush()?;
-            if verbose { print_stdin_stats(in_bytes, counted.count, args); }
+            if verbose {
+                print_stdin_stats(in_bytes, counted.count, args);
+            }
             Ok(0)
         }
         Err(e) => Err(e),
@@ -411,7 +440,11 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
 }
 
 fn print_stdin_stats(in_bytes: u64, out_bytes: u64, args: &GzippyArgs) {
-    let ratio = if in_bytes > 0 { out_bytes as f64 / in_bytes as f64 } else { 1.0 };
+    let ratio = if in_bytes > 0 {
+        out_bytes as f64 / in_bytes as f64
+    } else {
+        1.0
+    };
     let saved_pct = (1.0 - ratio) * 100.0;
     let (in_size, in_unit) = human_size(in_bytes);
     let (out_size, out_unit) = human_size(out_bytes);
