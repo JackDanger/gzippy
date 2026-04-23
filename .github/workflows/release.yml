@@ -74,6 +74,20 @@ jobs:
         if: runner.os == 'Linux' && matrix.apt_extras != ''
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt_extras }}
 
+      - name: Set version from tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          python3 -c "
+          import re, sys
+          version = sys.argv[1]
+          content = open('Cargo.toml').read()
+          content = re.sub(r'^version = \"[^\"]+\"', f'version = \"{version}\"', content, count=1, flags=re.M)
+          open('Cargo.toml', 'w').write(content)
+          print(f'Set Cargo.toml version to {version}')
+          " "$VERSION"
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
 
@@ -190,16 +204,21 @@ jobs:
               )
 
           open('Formula/gzippy.rb', 'w').write(formula)
-          print(f'Updated formula to v{version}')
+
+          cargo_toml = open('Cargo.toml').read()
+          cargo_toml = re.sub(r'^version = "[^"]+"', f'version = "{version}"', cargo_toml, count=1, flags=re.M)
+          open('Cargo.toml', 'w').write(cargo_toml)
+
+          print(f'Updated formula and Cargo.toml to v{version}')
           PYEOF
 
       - name: Commit updated formula
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/gzippy.rb
-          git diff --cached --quiet && echo "Formula unchanged" && exit 0
-          git commit -m "chore: update formula to v${VERSION} [skip ci]"
+          git add Formula/gzippy.rb Cargo.toml
+          git diff --cached --quiet && echo "Nothing changed" && exit 0
+          git commit -m "chore: update formula and version to v${VERSION} [skip ci]"
           git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)
 
       - name: Create GitHub release
