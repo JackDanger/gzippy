@@ -1,0 +1,56 @@
+Package: gzippy
+Version: 0.1.4-1
+Architecture: amd64
+Maintainer: Jack Danger <github@jackdanger.com>
+Installed-Size: 942
+Depends: libc6 (>= 2.34), libgcc-s1 (>= 4.2)
+Homepage: https://github.com/jackdanger/gzippy
+Priority: optional
+Section: utils
+Filename: pool/main/g/gzippy/gzippy_0.1.4-1_amd64.deb
+Size: 414042
+SHA256: 6f554e03872dc4adc4cac5407ca910924f53992478fb10f12020700bade97ac7
+SHA1: 9cb218cbdd665b25cd5341269d01055e7d17b262
+MD5sum: cf9a63cb1066cccf941a45378b6cbf57
+Description: The fastest parallel gzip
+ Gzippy is a high-performance parallel gzip implementation written in Rust.
+ It beats gzip and pigz by leveraging multiple CPU cores, SIMD instructions,
+ and optimized compression libraries (libdeflate, zlib-ng).
+ .
+ Features:
+  - Drop-in gzip replacement with compatible CLI
+  - Parallel compression using all available cores
+  - Memory-mapped I/O for zero-copy file access
+  - Compatible output that works with all standard gzip tools
+ .
+ This package provides the gzippy and ungzippy commands.
+
+Package: gzippy-replace-gzip
+Source: gzippy
+Version: 0.1.4-1
+Architecture: all
+Maintainer: Jack Danger <github@jackdanger.com>
+Installed-Size: 22
+Depends: gzippy (= 0.1.4-1)
+Conflicts: gzip
+Replaces: gzip
+Provides: gzip
+Homepage: https://github.com/jackdanger/gzippy
+Priority: optional
+Section: utils
+Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.1.4-1_all.deb
+Size: 2194
+SHA256: d60e4bf1f6c4340d1e506973e23d0d1b16309c770f7ad900b82017303eaca1fd
+SHA1: a2cc0b2d82137f7fc51a3fec4b1332f130434b79
+MD5sum: 1d4b4f07c7819b105dc710c007af582f
+Description: Replace system gzip with gzippy (fast parallel gzip)
+ This package replaces the system gzip, gunzip, gzcat, and zcat commands
+ with gzippy, providing significantly faster compression and decompression.
+ .
+ When installed, all system gzip operations will use gzippy transparently.
+ This is fully compatible with standard gzip - files compressed with gzippy
+ can be decompressed by any standard gzip implementation.
+ .
+ WARNING: This package conflicts with and replaces the gzip package.
+ Install only if you want gzippy to handle all gzip operations system-wide.
+

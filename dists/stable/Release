@@ -1,0 +1,28 @@
+Origin: gzippy
+Label: gzippy
+Codename: stable
+Date: Thu, 23 Apr 2026 22:57:40 UTC
+Architectures: amd64 arm64
+Components: main
+Description: gzippy apt repository
+MD5Sum:
+ 8c288f8e84740972fb068417e1c260ac 2126 main/binary-amd64/Packages
+ b2b278eae98ede34a65bab70f568927a 1052 main/binary-amd64/Packages.gz
+ d1bf88a87b781dfb4af5cb585b2a5e4d 100 main/binary-amd64/Release
+ 2e78f939a224e6098474be925fd1d932 2126 main/binary-arm64/Packages
+ 9f472562ff5b6d39d510041b1e271619 1053 main/binary-arm64/Packages.gz
+ 68be66fc4c4f1fdd5b48c51d33231e62 100 main/binary-arm64/Release
+SHA1:
+ aa6eb982c5aba71ebecbb72ed05a1f979ab40d34 2126 main/binary-amd64/Packages
+ e8d67214638a939763f2047d942c2eba201ff2c2 1052 main/binary-amd64/Packages.gz
+ f033482ce54250324f07a74ea284f3bc7d403fe6 100 main/binary-amd64/Release
+ 336ba4f7e027e71a1fa201bbe5de429ac1c0c73d 2126 main/binary-arm64/Packages
+ 1ac5b0c9756c64723e322dcead5b4c622237e4f3 1053 main/binary-arm64/Packages.gz
+ 46a42f89d6a3827d034f5f2c7e879e02de582d47 100 main/binary-arm64/Release
+SHA256:
+ dd1c5d2c836e1f52545232b06833c0ff757e2a6dfa01ba97e4a08f5da9d5a233 2126 main/binary-amd64/Packages
+ 4d8cb34a800658b26bc436fd87f18a0bc2acbf93c032539413073c8d0e141ce2 1052 main/binary-amd64/Packages.gz
+ 319041dd1d2b783ab334498a7d40d9384ec7b5d261c73696333a3e2bcc3888b3 100 main/binary-amd64/Release
+ 2896939f1d7bfe02129ba09fe418e67014ab5abb2c19c3dc5b46716bcb827a20 2126 main/binary-arm64/Packages
+ 0e85aa540982e50e88e42c6442ff3a35540ee9b4c59b588106c90da847782e81 1053 main/binary-arm64/Packages.gz
+ ed9ad03ca0dc35e30b68b73402cdf73561f5fb246a4608675e5abdb9d1a50336 100 main/binary-arm64/Release

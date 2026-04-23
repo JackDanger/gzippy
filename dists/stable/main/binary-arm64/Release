@@ -1,0 +1,5 @@
+Component: main
+Origin: gzippy
+Label: gzippy
+Architecture: arm64
+Description: gzippy apt repository
