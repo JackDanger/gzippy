@@ -211,4 +211,5 @@ jobs:
           files: |
             dist/binary-*/gzippy-*.tar.gz
             dist/binary-*/gzippy-*.tar.gz.sha256
-            dist/deb-*/*.deb
+            dist/deb-amd64/*.deb
+            dist/deb-arm64/gzippy_*_arm64.deb
