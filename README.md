@@ -1,10 +1,6 @@
 # gzippy
 
-A fast parallel gzip, written in Rust.
-
-## What is this?
-
-gzippy compresses and decompresses files using the gzip format. It uses all your CPU cores to work faster, while producing output that any gzip tool can read.
+The fastest gzip. Parallel, written in Rust.
 
 ```bash
 gzippy file.txt           # Compress → file.txt.gz
@@ -14,29 +10,43 @@ cat data | gzippy > out   # Works with pipes too
 
 ## Install
 
+**macOS / Linux — Homebrew**
+
+```bash
+brew tap jackdanger/gzippy https://github.com/JackDanger/gzippy
+brew install jackdanger/gzippy/gzippy
+```
+
+Installs `gzippy`, `gzip`, `gunzip`, `ungzippy`, and `zcat` — all the same binary.
+
+> If Homebrew's `gzip` package is installed, remove it first: `brew uninstall gzip`  
+> The macOS system `/usr/bin/gzip` is untouched.
+
+**Cargo (all platforms)**
+
 ```bash
 cargo install gzippy
 ```
 
-Or build from source:
+**Build from source**
 
 ```bash
-git clone --recursive https://github.com/jackdanger/gzippy
-cd gzippy
-cargo build --release
+git clone --recursive https://github.com/JackDanger/gzippy
+cd gzippy && cargo build --release
 ```
 
-## How fast is it?
+## How fast?
 
-On a 4-core machine compressing 10MB of text:
+Compressing 211 MB of logs on an M4 MacBook Pro (14 cores):
 
-| Level | Time | Output size |
-|-------|------|-------------|
-| Fast (`-1`) | 24ms | 4.5 MB |
-| Default (`-6`) | 76ms | 4.0 MB |
-| Best (`-9`) | 201ms | 3.9 MB |
+| Tool | Speed | Time |
+|------|-------|------|
+| gzippy (14 threads) | ~3000 MB/s | 0.07s |
+| gzippy (1 thread) | ~400 MB/s | 0.53s |
+| GNU gzip | ~360 MB/s | 0.58s |
+| Apple gzip (NEON) | ~315 MB/s | 0.67s |
 
-Decompression runs at 300-500 MB/s depending on the file.
+Decompression: 300–2000 MB/s depending on file type and thread count.
 
 ## Options
 
@@ -44,25 +54,21 @@ Works like gzip: `-1` to `-9`, `-c` (stdout), `-d` (decompress), `-k` (keep orig
 
 Extra options:
 - `-p4` — use 4 threads (default: all cores)
-- `--level 11` or `--ultra` — smaller output, slower
-- `--level 12` or `--max` — smallest output
+- `--level 11` / `--ultra` — smaller output, slower
+- `--level 12` / `--max` — smallest output
 
 ## Requirements
 
 - 64-bit Linux or macOS
-- Rust 1.70+
+- Rust 1.70+ (for `cargo install` or build from source only)
 
 ## Standing on shoulders
 
-gzippy exists because of the brilliant work done by others:
-
-- [**pigz**](https://zlib.net/pigz/) by Mark Adler — showed how to parallelize gzip
-- [**libdeflate**](https://github.com/ebiggers/libdeflate) by Eric Biggers — fast, modern deflate
-- [**zlib-ng**](https://github.com/zlib-ng/zlib-ng) — keeps zlib fast on modern CPUs
-- [**rapidgzip**](https://github.com/mxmlnkn/rapidgzip) — parallel decompression techniques
-- [**ISA-L**](https://github.com/intel/isa-l) by Intel — SIMD-optimized assembly
-
-We study their code, learn from their optimizations, and try to combine the best ideas into one tool.
+- [**pigz**](https://zlib.net/pigz/) by Mark Adler — how to parallelize gzip
+- [**libdeflate**](https://github.com/ebiggers/libdeflate) by Eric Biggers — fast deflate
+- [**zlib-ng**](https://github.com/zlib-ng/zlib-ng) — zlib with SIMD
+- [**rapidgzip**](https://github.com/mxmlnkn/rapidgzip) — parallel decompression
+- [**ISA-L**](https://github.com/intel/isa-l) by Intel — SIMD assembly
 
 ## License
 
@@ -70,4 +76,4 @@ We study their code, learn from their optimizations, and try to combine the best
 
 ## About
 
-Made by [Jack Danger](https://github.com/jackdanger) as a [centaur](https://doctorow.medium.com/https-pluralistic-net-2025-12-05-pop-that-bubble-u-washington-8b6b75abc28e) on a mix of current models and tools.
+Made by [Jack Danger](https://github.com/jackdanger).

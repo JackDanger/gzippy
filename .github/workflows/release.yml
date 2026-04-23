@@ -1,0 +1,209 @@
+# =============================================================================
+# Release: build binaries + .deb packages, publish GitHub release, update formula
+# =============================================================================
+# Triggered by version tags (v*) or manual dispatch.
+# Produces:
+#   - gzippy-{target}.tar.gz for 4 platforms
+#   - gzippy_{version}_{arch}.deb for amd64 + arm64
+#   - Updated Formula/gzippy.rb committed to main
+# =============================================================================
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build native binaries for all 4 platforms
+  # ---------------------------------------------------------------------------
+  build-binary:
+    name: Binary / ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            apt_extras: ""
+            features: ""
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            apt_extras: ""
+            features: ""
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            apt_extras: cmake
+            features: ""
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            apt_extras: cmake nasm autoconf automake libtool
+            features: --features isal-compression
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux' && matrix.apt_extras != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt_extras }}
+
+      - name: Build
+        run: cargo build --release ${{ matrix.features }}
+
+      - name: Package tarball + SHA256
+        run: |
+          TARBALL="gzippy-${{ matrix.target }}.tar.gz"
+          tar -czf "$TARBALL" -C target/release gzippy
+          shasum -a 256 "$TARBALL" | awk '{print $1}' > "$TARBALL.sha256"
+          echo "Packaged $TARBALL ($(cat $TARBALL.sha256))"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: |
+            gzippy-${{ matrix.target }}.tar.gz
+            gzippy-${{ matrix.target }}.tar.gz.sha256
+
+  # ---------------------------------------------------------------------------
+  # Build Debian packages for amd64 + arm64
+  # ---------------------------------------------------------------------------
+  build-deb:
+    name: Deb / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            debhelper devscripts build-essential \
+            zlib1g-dev cmake nasm autoconf automake libtool
+
+      - name: Build Debian packages
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Smoke test installation
+        run: |
+          sudo dpkg -i ../gzippy_*.deb
+          echo "Hello gzippy" | gzippy -c | gzippy -d
+          echo "✓ gzippy package works"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: ../*.deb
+
+  # ---------------------------------------------------------------------------
+  # Publish: update formula, create GitHub release
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish
+    runs-on: ubuntu-latest
+    needs: [build-binary, build-deb]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Resolve version
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Update Formula/gzippy.rb
+        run: |
+          python3 - <<'PYEOF'
+          import os, re
+
+          version = os.environ['VERSION']
+          formula = open('Formula/gzippy.rb').read()
+
+          # Update version string
+          formula = re.sub(r'version "[^"]+"', f'version "{version}"', formula, count=1)
+
+          # Update each sha256 sentinel: sha256 "..." # TARGET_KEY
+          targets = [
+              'AARCH64_APPLE_DARWIN',
+              'X86_64_APPLE_DARWIN',
+              'AARCH64_UNKNOWN_LINUX_GNU',
+              'X86_64_UNKNOWN_LINUX_GNU',
+          ]
+          for key in targets:
+              tarball_path = f'dist/binary-{key.lower().replace("_", "-")}/gzippy-{key.lower().replace("_", "-")}.tar.gz.sha256'
+              sha = open(tarball_path).read().strip()
+              formula = re.sub(
+                  rf'sha256 "[0-9a-f]+" # {key}',
+                  f'sha256 "{sha}" # {key}',
+                  formula,
+              )
+
+          open('Formula/gzippy.rb', 'w').write(formula)
+          print(f'Updated formula to v{version}')
+          PYEOF
+
+      - name: Commit updated formula
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/gzippy.rb
+          git diff --cached --quiet && echo "Formula unchanged" && exit 0
+          git pull --rebase origin main
+          git commit -m "chore: update formula to v${VERSION} [skip ci]"
+          git push origin HEAD:main
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/binary-*/gzippy-*.tar.gz
+            dist/binary-*/gzippy-*.tar.gz.sha256
+            dist/deb-*/*.deb
