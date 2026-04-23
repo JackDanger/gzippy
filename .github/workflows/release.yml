@@ -203,7 +203,7 @@ jobs:
           git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
