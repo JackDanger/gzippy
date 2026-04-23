@@ -118,7 +118,7 @@ jobs:
             zlib1g-dev cmake nasm autoconf automake libtool
 
       - name: Build Debian packages
-        run: dpkg-buildpackage -us -uc -b
+        run: dpkg-buildpackage -us -uc -b -d
 
       - name: Smoke test installation
         run: |
