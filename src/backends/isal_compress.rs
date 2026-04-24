@@ -49,6 +49,7 @@ pub fn compress_gzip(_data: &[u8], _level: u32) -> Option<Vec<u8>> {
 /// Uses stateless single-shot compression for maximum throughput.
 /// Returns None if ISA-L is not available.
 #[cfg(feature = "isal-compression")]
+#[allow(dead_code)]
 pub fn compress_deflate(data: &[u8], level: u32) -> Option<Vec<u8>> {
     let max_size = data.len() + data.len() / 10 + 256;
     let mut output = vec![0u8; max_size];
@@ -105,9 +106,7 @@ pub fn compress_gzip_stream<R: std::io::Read, W: std::io::Write>(
     }
 
     let max_size = input.len() + input.len() / 10 + 256;
-    let mut output = Vec::with_capacity(max_size);
-    // SAFETY: compress_into only writes to output, never reads uninitialized data.
-    unsafe { output.set_len(max_size) };
+    let mut output = vec![0u8; max_size];
     let size = isal::compress_into(&input, &mut output, to_isal_level(level), isal::Codec::Gzip)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     writer.write_all(&output[..size])?;
@@ -126,10 +125,7 @@ pub fn compress_gzip_to_writer<W: std::io::Write>(
     let t0 = std::time::Instant::now();
 
     let max_size = data.len() + data.len() / 10 + 256;
-    let mut output = Vec::with_capacity(max_size);
-    // SAFETY: compress_into only writes to output, never reads uninitialized data.
-    // We use the returned size to determine the valid region.
-    unsafe { output.set_len(max_size) };
+    let mut output = vec![0u8; max_size];
     let t_alloc = t0.elapsed();
 
     let size = isal::compress_into(data, &mut output, to_isal_level(level), isal::Codec::Gzip)
@@ -244,7 +240,7 @@ pub fn compress_gzip_stream_direct<R: std::io::Read, W: std::io::Write>(
             writer.write_all(&out_buf[..written])?;
         }
 
-        if stream.internal_state.state == isal_raw::isal_zstate_state_ZSTATE_END as u32 {
+        if stream.internal_state.state == isal_raw::isal_zstate_state_ZSTATE_END {
             break;
         }
 
