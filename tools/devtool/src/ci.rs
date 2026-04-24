@@ -35,18 +35,18 @@ struct Run {
 #[derive(Debug, Clone)]
 pub struct BenchResult {
     #[allow(dead_code)]
-    pub job: String,        // "Decompress silesia-gzip Tmax (x86_64)"
-    pub tool: String,       // "gzippy", "rapidgzip", etc.
+    pub job: String, // "Decompress silesia-gzip Tmax (x86_64)"
+    pub tool: String, // "gzippy", "rapidgzip", etc.
     pub speed_mbps: f64,
     pub trials: u32,
     pub ratio: Option<f64>, // compression ratio (compress only)
     // Parsed from job name:
-    pub dataset: String,    // "silesia", "software", "logs"
-    pub archive: String,    // "gzip", "bgzf", "pigz"
-    pub threads: String,    // "T1", "Tmax"
-    pub platform: String,   // "x86_64", "arm64"
-    pub mode: String,       // "Decompress", "Compress"
-    pub level: String,      // "L1", "L6", "L9" (compress only)
+    pub dataset: String,  // "silesia", "software", "logs"
+    pub archive: String,  // "gzip", "bgzf", "pigz"
+    pub threads: String,  // "T1", "Tmax"
+    pub platform: String, // "x86_64", "arm64"
+    pub mode: String,     // "Decompress", "Compress"
+    pub level: String,    // "L1", "L6", "L9" (compress only)
 }
 
 // ─── Public commands ─────────────────────────────────────────────────────────
@@ -58,7 +58,10 @@ pub fn status(branch: Option<&str>) -> Result<(), String> {
         return Ok(());
     }
 
-    println!("{:<12} {:<10} {:<10} {:<28} Title", "ID", "Status", "Branch", "Workflow");
+    println!(
+        "{:<12} {:<10} {:<10} {:<28} Title",
+        "ID", "Status", "Branch", "Workflow"
+    );
     println!("{}", "─".repeat(90));
     for run in runs.iter().take(10) {
         let conclusion = run.conclusion.as_deref().unwrap_or("");
@@ -88,16 +91,26 @@ pub fn watch(run_id: Option<&str>, branch: Option<&str>) -> Result<(), String> {
     loop {
         let current = fetch_run_by_id(target.id)?;
         if current.status == "completed" {
-            println!("\nRun completed: {}", current.conclusion.as_deref().unwrap_or("unknown"));
+            println!(
+                "\nRun completed: {}",
+                current.conclusion.as_deref().unwrap_or("unknown")
+            );
             return results_for_run(target.id);
         }
 
         if start.elapsed() > MAX_WAIT {
-            return Err(format!("Timed out after {}s waiting for run {}", MAX_WAIT.as_secs(), target.id));
+            return Err(format!(
+                "Timed out after {}s waiting for run {}",
+                MAX_WAIT.as_secs(),
+                target.id
+            ));
         }
 
         let elapsed = start.elapsed().as_secs();
-        print!("\r  Waiting... ({elapsed}s elapsed, polling every {}s)  ", POLL_INTERVAL.as_secs());
+        print!(
+            "\r  Waiting... ({elapsed}s elapsed, polling every {}s)  ",
+            POLL_INTERVAL.as_secs()
+        );
         io::stdout().flush().ok();
         thread::sleep(POLL_INTERVAL);
     }
@@ -210,10 +223,7 @@ pub fn compare(run_a: &str, run_b: &str) -> Result<(), String> {
         println!("  Significant changes (>3%):");
         for (key, a, b, pct) in &significant {
             let flag = if pct.abs() > 10.0 { " <<<" } else { "" };
-            println!(
-                "  {:<55} {:>7.1} {:>7.1} {:>+7.1}%{}",
-                key, a, b, pct, flag
-            );
+            println!("  {:<55} {:>7.1} {:>7.1} {:>+7.1}%{}", key, a, b, pct, flag);
         }
 
         let noise: Vec<_> = diffs
@@ -221,10 +231,7 @@ pub fn compare(run_a: &str, run_b: &str) -> Result<(), String> {
             .filter(|(_, _, _, pct)| pct.abs() <= 3.0)
             .collect();
         if !noise.is_empty() {
-            println!(
-                "\n  {} scenarios within noise margin (<=3%)",
-                noise.len()
-            );
+            println!("\n  {} scenarios within noise margin (<=3%)", noise.len());
         }
     }
 
@@ -261,20 +268,27 @@ fn resolve_benchmark_run(run_id: Option<&str>, branch: Option<&str>) -> Result<R
 
 fn fetch_runs(branch: Option<&str>) -> Result<Vec<Run>, String> {
     let mut cmd = Command::new("gh");
-    cmd.args(["run", "list", "--json",
+    cmd.args([
+        "run",
+        "list",
+        "--json",
         "databaseId,displayTitle,status,conclusion,headBranch,workflowName,createdAt,updatedAt,url",
-        "--limit", "20"]);
+        "--limit",
+        "20",
+    ]);
     if let Some(b) = branch {
         cmd.args(["--branch", b]);
     }
 
     let output = cmd.output().map_err(|e| format!("Failed to run gh: {e}"))?;
     if !output.status.success() {
-        return Err(format!("gh failed: {}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "gh failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
-    serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("Failed to parse gh output: {e}"))
+    serde_json::from_slice(&output.stdout).map_err(|e| format!("Failed to parse gh output: {e}"))
 }
 
 fn fetch_run_by_id(id: u64) -> Result<Run, String> {
@@ -285,11 +299,13 @@ fn fetch_run_by_id(id: u64) -> Result<Run, String> {
         .map_err(|e| format!("Failed to run gh: {e}"))?;
 
     if !output.status.success() {
-        return Err(format!("gh failed: {}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "gh failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
-    serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("Failed to parse run: {e}"))
+    serde_json::from_slice(&output.stdout).map_err(|e| format!("Failed to parse run: {e}"))
 }
 
 // ─── Internal: log parsing ───────────────────────────────────────────────────
@@ -301,7 +317,10 @@ fn parse_run_logs(run_id: u64) -> Result<Vec<BenchResult>, String> {
         .map_err(|e| format!("Failed to fetch logs: {e}"))?;
 
     if !output.status.success() {
-        return Err(format!("gh log fetch failed: {}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "gh log fetch failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
     let log = String::from_utf8_lossy(&output.stdout);
@@ -357,7 +376,8 @@ pub(crate) fn parse_result_line(job_name: &str, line: &str) -> Option<BenchResul
     let tool = trimmed[..colon].trim().to_string();
 
     // Must be a known tool name
-    if !matches!(tool.as_str(),
+    if !matches!(
+        tool.as_str(),
         "gzippy" | "pigz" | "unpigz" | "igzip" | "rapidgzip" | "gzip" | "zopfli"
     ) {
         return None;
@@ -485,9 +505,15 @@ fn print_results_table(benchmarks: &[BenchResult]) {
 
     for b in benchmarks {
         let key = if b.mode == "compress" {
-            format!("{} {} {} {} {}", b.mode, b.dataset, b.level, b.threads, b.platform)
+            format!(
+                "{} {} {} {} {}",
+                b.mode, b.dataset, b.level, b.threads, b.platform
+            )
         } else {
-            format!("{} {}-{} {} {}", b.mode, b.dataset, b.archive, b.threads, b.platform)
+            format!(
+                "{} {}-{} {} {}",
+                b.mode, b.dataset, b.archive, b.threads, b.platform
+            )
         };
         groups.entry(key).or_default().push(b);
     }
@@ -525,9 +551,15 @@ fn print_gap_analysis(benchmarks: &[BenchResult]) {
 
     for b in benchmarks {
         let key = if b.mode == "compress" {
-            format!("{} {} {} {} {}", b.mode, b.dataset, b.level, b.threads, b.platform)
+            format!(
+                "{} {} {} {} {}",
+                b.mode, b.dataset, b.level, b.threads, b.platform
+            )
         } else {
-            format!("{} {}-{} {} {}", b.mode, b.dataset, b.archive, b.threads, b.platform)
+            format!(
+                "{} {}-{} {} {}",
+                b.mode, b.dataset, b.archive, b.threads, b.platform
+            )
         };
         by_scenario.entry(key).or_default().push(b);
     }
@@ -571,14 +603,20 @@ fn print_gap_analysis(benchmarks: &[BenchResult]) {
 
     let total = gaps.len() + wins.len();
     println!("╔══════════════════════════════════════════════════════════════════════════╗");
-    println!("║  PERFORMANCE GAP ANALYSIS — {} wins, {} gaps out of {} comparisons",
-             wins.len(), gaps.len(), total);
+    println!(
+        "║  PERFORMANCE GAP ANALYSIS — {} wins, {} gaps out of {} comparisons",
+        wins.len(),
+        gaps.len(),
+        total
+    );
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
 
     if !gaps.is_empty() {
         println!("\n  GAPS (gzippy is SLOWER):");
-        println!("  {:<55} {:<12} {:>8} {:>8} {:>7}",
-                 "Scenario", "Competitor", "gzippy", "them", "gap");
+        println!(
+            "  {:<55} {:<12} {:>8} {:>8} {:>7}",
+            "Scenario", "Competitor", "gzippy", "them", "gap"
+        );
         println!("  {}", "─".repeat(92));
         for g in &gaps {
             println!(
@@ -590,8 +628,10 @@ fn print_gap_analysis(benchmarks: &[BenchResult]) {
 
     if !wins.is_empty() {
         println!("\n  WINS (gzippy is FASTER):");
-        println!("  {:<55} {:<12} {:>8} {:>8} {:>7}",
-                 "Scenario", "Competitor", "gzippy", "them", "lead");
+        println!(
+            "  {:<55} {:<12} {:>8} {:>8} {:>7}",
+            "Scenario", "Competitor", "gzippy", "them", "lead"
+        );
         println!("  {}", "─".repeat(92));
         for w in wins.iter().take(15) {
             println!(
@@ -610,7 +650,13 @@ fn print_gap_analysis(benchmarks: &[BenchResult]) {
         println!("  {}", "─".repeat(72));
         for (i, g) in gaps.iter().take(5).enumerate() {
             let root_cause = diagnose_gap(&g.scenario, &g.competitor);
-            println!("  {}. [{:>+5.1}%] {} vs {}", i + 1, g.gap_pct, g.scenario, g.competitor);
+            println!(
+                "  {}. [{:>+5.1}%] {} vs {}",
+                i + 1,
+                g.gap_pct,
+                g.scenario,
+                g.competitor
+            );
             println!("     Root cause: {}", root_cause);
         }
     }
@@ -663,14 +709,14 @@ impl GapCategory {
     }
     fn description(&self) -> &'static str {
         match self {
-            GapCategory::Architecture =>
-                "Needs parallel single-member decompression (rapidgzip-style pipeline)",
-            GapCategory::Simd =>
-                "Competitor uses hand-tuned SIMD/AVX assembly we can't match in pure Rust",
-            GapCategory::Actionable =>
-                "Can potentially be closed with code-level optimizations",
-            GapCategory::Noise =>
-                "Within measurement variance (<2%), not worth investigating",
+            GapCategory::Architecture => {
+                "Needs parallel single-member decompression (rapidgzip-style pipeline)"
+            }
+            GapCategory::Simd => {
+                "Competitor uses hand-tuned SIMD/AVX assembly we can't match in pure Rust"
+            }
+            GapCategory::Actionable => "Can potentially be closed with code-level optimizations",
+            GapCategory::Noise => "Within measurement variance (<2%), not worth investigating",
         }
     }
     fn effort(&self) -> &'static str {
@@ -693,15 +739,18 @@ struct TriageGap {
     action: String,
 }
 
-pub(crate) fn categorize_gap(scenario: &str, competitor: &str, gap_pct: f64) -> (GapCategory, String) {
+pub(crate) fn categorize_gap(
+    scenario: &str,
+    competitor: &str,
+    gap_pct: f64,
+) -> (GapCategory, String) {
     let is_compress = scenario.starts_with("compress ");
     let is_decompress = scenario.starts_with("decompress ");
     let is_bgzf = scenario.contains("bgzf");
     let is_tmax = scenario.contains("Tmax");
     let is_t1 = scenario.contains("T1");
     let is_arm64 = scenario.contains("arm64");
-    let is_single_member = !is_bgzf
-        && (scenario.contains("-gzip") || scenario.contains("-pigz"));
+    let is_single_member = !is_bgzf && (scenario.contains("-gzip") || scenario.contains("-pigz"));
     let is_small_dataset = scenario.contains("software") || scenario.contains("logs");
 
     // Noise thresholds vary by platform and dataset size.
@@ -718,60 +767,89 @@ pub(crate) fn categorize_gap(scenario: &str, competitor: &str, gap_pct: f64) -> 
     };
 
     if gap_pct.abs() < noise_threshold {
-        return (GapCategory::Noise,
-            format!("Within noise margin for {} (threshold {:.0}%)",
-                if is_arm64 && is_small_dataset { "arm64 small files" }
-                else if is_arm64 { "arm64" }
-                else if is_small_dataset { "small files" }
-                else { "this platform" },
-                noise_threshold));
+        return (
+            GapCategory::Noise,
+            format!(
+                "Within noise margin for {} (threshold {:.0}%)",
+                if is_arm64 && is_small_dataset {
+                    "arm64 small files"
+                } else if is_arm64 {
+                    "arm64"
+                } else if is_small_dataset {
+                    "small files"
+                } else {
+                    "this platform"
+                },
+                noise_threshold
+            ),
+        );
     }
 
     // Tmax decompression on single-member archives vs rapidgzip only.
     // rapidgzip is the only competitor doing parallel single-member inflate.
     // pigz, igzip, gzip all decompress sequentially regardless of -p flag.
     if is_decompress && is_tmax && is_single_member && competitor == "rapidgzip" {
-        return (GapCategory::Architecture,
-            format!("Single-member parallel decompression needed. rapidgzip has a pipeline \
+        return (
+            GapCategory::Architecture,
+            format!(
+                "Single-member parallel decompression needed. rapidgzip has a pipeline \
                      architecture (block-finder + decoder threads) that we lack. \
-                     Gap: {:.1}%", gap_pct.abs())
+                     Gap: {:.1}%",
+                gap_pct.abs()
+            ),
         );
     }
 
     // Compression vs igzip — ISA-L has hand-tuned SIMD assembly
     if is_compress && competitor == "igzip" {
-        return (GapCategory::Simd,
-            format!("ISA-L uses hand-tuned AVX2/AVX-512 assembly for L1 compression. \
-                     Gap is {:.1}% — only closable with SIMD intrinsics.", gap_pct.abs()));
+        return (
+            GapCategory::Simd,
+            format!(
+                "ISA-L uses hand-tuned AVX2/AVX-512 assembly for L1 compression. \
+                     Gap is {:.1}% — only closable with SIMD intrinsics.",
+                gap_pct.abs()
+            ),
+        );
     }
 
     // T1 decompression vs igzip — their inflate is optimized C
     if is_decompress && is_t1 && competitor == "igzip" {
-        return (GapCategory::Actionable,
+        return (
+            GapCategory::Actionable,
             "igzip inflate uses optimized C with SIMD. Profile with `gzippy-dev instrument` \
              to find bottleneck — likely buffer allocation or IO path overhead."
-            .to_string());
+                .to_string(),
+        );
     }
 
     // BGZF Tmax gaps — thread pool overhead
     if is_decompress && is_bgzf && is_tmax {
-        return (GapCategory::Actionable,
+        return (
+            GapCategory::Actionable,
             "BGZF Tmax gap. Check thread pool overhead, lock contention, or \
              decompressor allocation cost. Profile with `gzippy-dev instrument --threads 4`."
-            .to_string());
+                .to_string(),
+        );
     }
 
     // Compression vs pigz — should be winning
     if is_compress && competitor == "pigz" {
-        return (GapCategory::Actionable,
+        return (
+            GapCategory::Actionable,
             "Should be winning vs pigz. Check if ratio-probe or block sizing \
              is suboptimal for this dataset/level combination."
-            .to_string());
+                .to_string(),
+        );
     }
 
     // Generic gaps
-    (GapCategory::Actionable,
-     format!("Gap {:.1}%. Profile with `gzippy-dev instrument` to find root cause.", gap_pct.abs()))
+    (
+        GapCategory::Actionable,
+        format!(
+            "Gap {:.1}%. Profile with `gzippy-dev instrument` to find root cause.",
+            gap_pct.abs()
+        ),
+    )
 }
 
 fn print_triage(benchmarks: &[BenchResult]) {
@@ -784,9 +862,15 @@ fn print_triage(benchmarks: &[BenchResult]) {
         std::collections::BTreeMap::new();
     for b in benchmarks {
         let key = if b.mode == "compress" {
-            format!("{} {} {} {} {}", b.mode, b.dataset, b.level, b.threads, b.platform)
+            format!(
+                "{} {} {} {} {}",
+                b.mode, b.dataset, b.level, b.threads, b.platform
+            )
         } else {
-            format!("{} {}-{} {} {}", b.mode, b.dataset, b.archive, b.threads, b.platform)
+            format!(
+                "{} {}-{} {} {}",
+                b.mode, b.dataset, b.archive, b.threads, b.platform
+            )
         };
         by_scenario.entry(key).or_default().push(b);
     }
@@ -827,8 +911,10 @@ fn print_triage(benchmarks: &[BenchResult]) {
     let win_rate = total_wins as f64 / total_comparisons as f64 * 100.0;
 
     println!("╔══════════════════════════════════════════════════════════════════════════╗");
-    println!("║  GAP TRIAGE — {} wins / {} gaps / {} total ({:.0}% win rate)",
-             total_wins, total_gaps, total_comparisons, win_rate);
+    println!(
+        "║  GAP TRIAGE — {} wins / {} gaps / {} total ({:.0}% win rate)",
+        total_wins, total_gaps, total_comparisons, win_rate
+    );
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
 
     // Group by category
@@ -840,60 +926,101 @@ fn print_triage(benchmarks: &[BenchResult]) {
 
     // Summary table
     println!("\n  CATEGORY SUMMARY");
-    println!("  {:<16} {:>5} {:>10} {:>10}  Effort", "Category", "Gaps", "Worst", "Avg");
+    println!(
+        "  {:<16} {:>5} {:>10} {:>10}  Effort",
+        "Category", "Gaps", "Worst", "Avg"
+    );
     println!("  {}", "─".repeat(78));
 
-    for cat in &[GapCategory::Architecture, GapCategory::Simd, GapCategory::Actionable, GapCategory::Noise] {
+    for cat in &[
+        GapCategory::Architecture,
+        GapCategory::Simd,
+        GapCategory::Actionable,
+        GapCategory::Noise,
+    ] {
         if let Some(gaps) = by_cat.get(cat) {
             let worst = gaps.iter().map(|g| g.gap_pct).fold(f64::MAX, f64::min);
             let avg = gaps.iter().map(|g| g.gap_pct).sum::<f64>() / gaps.len() as f64;
-            println!("  {:<16} {:>5} {:>+9.1}% {:>+9.1}%  {}",
-                     cat.label(), gaps.len(), worst, avg, cat.effort());
+            println!(
+                "  {:<16} {:>5} {:>+9.1}% {:>+9.1}%  {}",
+                cat.label(),
+                gaps.len(),
+                worst,
+                avg,
+                cat.effort()
+            );
         }
     }
 
     // Win rate projection
     println!("\n  WIN RATE PROJECTIONS");
     println!("  {}", "─".repeat(78));
-    println!("  Current:                                                  {:>5.1}% ({}/{})",
-             win_rate, total_wins, total_comparisons);
+    println!(
+        "  Current:                                                  {:>5.1}% ({}/{})",
+        win_rate, total_wins, total_comparisons
+    );
 
     let noise_count = by_cat.get(&GapCategory::Noise).map_or(0, |v| v.len()) as u32;
     let actionable_count = by_cat.get(&GapCategory::Actionable).map_or(0, |v| v.len()) as u32;
-    let arch_count = by_cat.get(&GapCategory::Architecture).map_or(0, |v| v.len()) as u32;
+    let arch_count = by_cat
+        .get(&GapCategory::Architecture)
+        .map_or(0, |v| v.len()) as u32;
     let simd_count = by_cat.get(&GapCategory::Simd).map_or(0, |v| v.len()) as u32;
 
     if noise_count > 0 {
         let proj = (total_wins + noise_count) as f64 / total_comparisons as f64 * 100.0;
-        println!("  If NOISE gaps are wins (measurement variance):           {:>5.1}% ({}/{})",
-                 proj, total_wins + noise_count, total_comparisons);
+        println!(
+            "  If NOISE gaps are wins (measurement variance):           {:>5.1}% ({}/{})",
+            proj,
+            total_wins + noise_count,
+            total_comparisons
+        );
     }
     if actionable_count > 0 {
-        let proj = (total_wins + noise_count + actionable_count) as f64 / total_comparisons as f64 * 100.0;
-        println!("  If ACTIONABLE gaps are closed:                           {:>5.1}% ({}/{})",
-                 proj, total_wins + noise_count + actionable_count, total_comparisons);
+        let proj =
+            (total_wins + noise_count + actionable_count) as f64 / total_comparisons as f64 * 100.0;
+        println!(
+            "  If ACTIONABLE gaps are closed:                           {:>5.1}% ({}/{})",
+            proj,
+            total_wins + noise_count + actionable_count,
+            total_comparisons
+        );
     }
     if arch_count > 0 {
-        let proj = (total_wins + noise_count + actionable_count + arch_count) as f64 / total_comparisons as f64 * 100.0;
-        println!("  If ARCHITECTURE gaps are closed (parallel single-member): {:>5.1}% ({}/{})",
-                 proj, total_wins + noise_count + actionable_count + arch_count, total_comparisons);
+        let proj = (total_wins + noise_count + actionable_count + arch_count) as f64
+            / total_comparisons as f64
+            * 100.0;
+        println!(
+            "  If ARCHITECTURE gaps are closed (parallel single-member): {:>5.1}% ({}/{})",
+            proj,
+            total_wins + noise_count + actionable_count + arch_count,
+            total_comparisons
+        );
     }
     if simd_count > 0 {
-        println!("  If ALL gaps closed (including SIMD — unrealistic):       100.0% ({}/{})",
-                 total_comparisons, total_comparisons);
+        println!(
+            "  If ALL gaps closed (including SIMD — unrealistic):       100.0% ({}/{})",
+            total_comparisons, total_comparisons
+        );
     }
 
     // Detailed gaps by category
-    for cat in &[GapCategory::Architecture, GapCategory::Simd, GapCategory::Actionable, GapCategory::Noise] {
+    for cat in &[
+        GapCategory::Architecture,
+        GapCategory::Simd,
+        GapCategory::Actionable,
+        GapCategory::Noise,
+    ] {
         if let Some(gaps) = by_cat.get(cat) {
             println!("\n  ── {} ({}) ──", cat.label(), cat.description());
             let mut sorted: Vec<&&TriageGap> = gaps.iter().collect();
             sorted.sort_by(|a, b| a.gap_pct.partial_cmp(&b.gap_pct).unwrap());
 
             for g in &sorted {
-                println!("    [{:>+5.1}%] {} vs {}  ({:.1} vs {:.1} MB/s)",
-                         g.gap_pct, g.scenario, g.competitor,
-                         g.gzippy_speed, g.competitor_speed);
+                println!(
+                    "    [{:>+5.1}%] {} vs {}  ({:.1} vs {:.1} MB/s)",
+                    g.gap_pct, g.scenario, g.competitor, g.gzippy_speed, g.competitor_speed
+                );
             }
 
             if *cat != GapCategory::Noise {
@@ -910,23 +1037,31 @@ fn print_triage(benchmarks: &[BenchResult]) {
     println!("  {}", "─".repeat(72));
 
     if actionable_count > 0 {
-        println!("  1. Close ACTIONABLE gaps ({} scenarios, {:.0}% win rate uplift):",
-                 actionable_count,
-                 actionable_count as f64 / total_comparisons as f64 * 100.0);
+        println!(
+            "  1. Close ACTIONABLE gaps ({} scenarios, {:.0}% win rate uplift):",
+            actionable_count,
+            actionable_count as f64 / total_comparisons as f64 * 100.0
+        );
 
         if let Some(gaps) = by_cat.get(&GapCategory::Actionable) {
             let mut sorted: Vec<&&TriageGap> = gaps.iter().collect();
             sorted.sort_by(|a, b| a.gap_pct.partial_cmp(&b.gap_pct).unwrap());
             for g in sorted.iter().take(3) {
-                println!("     - [{:>+5.1}%] {}: {}",
-                         g.gap_pct, g.scenario,
-                         g.action.chars().take(70).collect::<String>());
+                println!(
+                    "     - [{:>+5.1}%] {}: {}",
+                    g.gap_pct,
+                    g.scenario,
+                    g.action.chars().take(70).collect::<String>()
+                );
             }
         }
     }
 
     if arch_count > 0 {
-        println!("  2. Parallel single-member decompression ({} scenarios, largest gaps):", arch_count);
+        println!(
+            "  2. Parallel single-member decompression ({} scenarios, largest gaps):",
+            arch_count
+        );
         println!("     Implement rapidgzip-style pipeline with dedicated block-finder threads.");
         println!("     This is the only path to beating rapidgzip on Tmax single-member files.");
     }
@@ -939,7 +1074,8 @@ fn print_triage(benchmarks: &[BenchResult]) {
 
 pub fn history(branch: Option<&str>, limit: usize) -> Result<(), String> {
     let runs = fetch_runs(branch)?;
-    let benchmark_runs: Vec<_> = runs.into_iter()
+    let benchmark_runs: Vec<_> = runs
+        .into_iter()
         .filter(|r| r.workflow == "Benchmarks" && r.status == "completed")
         .take(limit)
         .collect();
@@ -950,7 +1086,10 @@ pub fn history(branch: Option<&str>, limit: usize) -> Result<(), String> {
     }
 
     println!("╔══════════════════════════════════════════════════════════════════════════╗");
-    println!("║  PERFORMANCE HISTORY — last {} runs", benchmark_runs.len());
+    println!(
+        "║  PERFORMANCE HISTORY — last {} runs",
+        benchmark_runs.len()
+    );
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
 
     let mut all_run_data: Vec<(u64, String, u32, u32, u32)> = Vec::new();
@@ -965,17 +1104,35 @@ pub fn history(branch: Option<&str>, limit: usize) -> Result<(), String> {
         all_run_data.push((run.id, run.branch.clone(), wins, gaps, total));
     }
 
-    println!("\n  {:<14} {:<20} {:>6} {:>6} {:>6} {:>8}",
-             "Run ID", "Branch", "Wins", "Gaps", "Total", "Win %");
+    println!(
+        "\n  {:<14} {:<20} {:>6} {:>6} {:>6} {:>8}",
+        "Run ID", "Branch", "Wins", "Gaps", "Total", "Win %"
+    );
     println!("  {}", "─".repeat(68));
 
     for (id, branch, wins, gaps, total) in &all_run_data {
-        let pct = if *total > 0 { *wins as f64 / *total as f64 * 100.0 } else { 0.0 };
-        let trend = if pct >= 90.0 { " ★" }
-            else if pct >= 80.0 { " ↑" }
-            else { "" };
-        println!("  {:<14} {:<20} {:>6} {:>6} {:>6} {:>7.1}%{}",
-                 id, truncate(branch, 20), wins, gaps, total, pct, trend);
+        let pct = if *total > 0 {
+            *wins as f64 / *total as f64 * 100.0
+        } else {
+            0.0
+        };
+        let trend = if pct >= 90.0 {
+            " ★"
+        } else if pct >= 80.0 {
+            " ↑"
+        } else {
+            ""
+        };
+        println!(
+            "  {:<14} {:<20} {:>6} {:>6} {:>6} {:>7.1}%{}",
+            id,
+            truncate(branch, 20),
+            wins,
+            gaps,
+            total,
+            pct,
+            trend
+        );
     }
 
     if all_run_data.len() >= 2 {
@@ -984,8 +1141,10 @@ pub fn history(branch: Option<&str>, limit: usize) -> Result<(), String> {
         let latest_pct = latest.2 as f64 / latest.4 as f64 * 100.0;
         let prev_pct = prev.2 as f64 / prev.4 as f64 * 100.0;
         let delta = latest_pct - prev_pct;
-        println!("\n  Trend: {:>+.1}% vs previous run ({} → {})",
-                 delta, prev.0, latest.0);
+        println!(
+            "\n  Trend: {:>+.1}% vs previous run ({} → {})",
+            delta, prev.0, latest.0
+        );
     }
 
     Ok(())
@@ -999,9 +1158,15 @@ fn count_wins_gaps(benchmarks: &[BenchResult]) -> (u32, u32, u32) {
         std::collections::BTreeMap::new();
     for b in benchmarks {
         let key = if b.mode == "compress" {
-            format!("{} {} {} {} {}", b.mode, b.dataset, b.level, b.threads, b.platform)
+            format!(
+                "{} {} {} {} {}",
+                b.mode, b.dataset, b.level, b.threads, b.platform
+            )
         } else {
-            format!("{} {}-{} {} {}", b.mode, b.dataset, b.archive, b.threads, b.platform)
+            format!(
+                "{} {}-{} {} {}",
+                b.mode, b.dataset, b.archive, b.threads, b.platform
+            )
         };
         by_scenario.entry(key).or_default().push(b);
     }
@@ -1016,7 +1181,11 @@ fn count_wins_gaps(benchmarks: &[BenchResult]) -> (u32, u32, u32) {
                 continue;
             }
             let gap_pct = (gzippy.speed_mbps / t.speed_mbps - 1.0) * 100.0;
-            if gap_pct >= 0.0 { wins += 1; } else { gaps += 1; }
+            if gap_pct >= 0.0 {
+                wins += 1;
+            } else {
+                gaps += 1;
+            }
         }
     }
 
@@ -1038,7 +1207,10 @@ pub fn vs_main(branch: Option<&str>) -> Result<(), String> {
     let main_run = find_latest_benchmark_run(Some("main"))?;
 
     if branch_run.status != "completed" {
-        println!("  Branch run {} is {}, watching...", branch_run.id, branch_run.status);
+        println!(
+            "  Branch run {} is {}, watching...",
+            branch_run.id, branch_run.status
+        );
         watch(Some(&branch_run.id.to_string()), None)?;
     }
 
@@ -1082,28 +1254,42 @@ pub fn vs_main(branch: Option<&str>) -> Result<(), String> {
 
     if !regressions.is_empty() {
         println!("\n  REGRESSIONS (>3% slower than main):");
-        println!("  {:<55} {:>8} {:>8} {:>8}", "Scenario", "main", "branch", "change");
+        println!(
+            "  {:<55} {:>8} {:>8} {:>8}",
+            "Scenario", "main", "branch", "change"
+        );
         println!("  {}", "─".repeat(85));
         for (key, main_s, branch_s, pct) in &regressions {
             let flag = if *pct < -10.0 { " <<<" } else { "" };
-            println!("  {:<55} {:>7.1} {:>7.1} {:>+7.1}%{}",
-                     key, main_s, branch_s, pct, flag);
+            println!(
+                "  {:<55} {:>7.1} {:>7.1} {:>+7.1}%{}",
+                key, main_s, branch_s, pct, flag
+            );
         }
     }
 
     if !improvements.is_empty() {
         println!("\n  IMPROVEMENTS (>3% faster than main):");
-        println!("  {:<55} {:>8} {:>8} {:>8}", "Scenario", "main", "branch", "change");
+        println!(
+            "  {:<55} {:>8} {:>8} {:>8}",
+            "Scenario", "main", "branch", "change"
+        );
         println!("  {}", "─".repeat(85));
         for (key, main_s, branch_s, pct) in improvements.iter().rev() {
             let flag = if *pct > 10.0 { " <<<" } else { "" };
-            println!("  {:<55} {:>7.1} {:>7.1} {:>+7.1}%{}",
-                     key, main_s, branch_s, pct, flag);
+            println!(
+                "  {:<55} {:>7.1} {:>7.1} {:>+7.1}%{}",
+                key, main_s, branch_s, pct, flag
+            );
         }
     }
 
-    println!("\n  Summary: {} regressions, {} improvements, {} neutral",
-             regressions.len(), improvements.len(), neutral);
+    println!(
+        "\n  Summary: {} regressions, {} improvements, {} neutral",
+        regressions.len(),
+        improvements.len(),
+        neutral
+    );
 
     // Also show triage for the branch
     println!();
@@ -1132,8 +1318,10 @@ pub fn push_and_watch() -> Result<(), String> {
         .map_err(|e| format!("git push failed: {e}"))?;
 
     if !output.status.success() {
-        return Err(format!("git push failed: {}",
-                          String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "git push failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
     println!("  Pushed.");
 
@@ -1256,7 +1444,8 @@ mod tests {
         let br = parse_result_line(
             "Decompress silesia-gzip T1 (x86_64)",
             "  gzippy: 257.8 MB/s, 23 trials",
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(br.tool, "gzippy");
         assert!((br.speed_mbps - 257.8).abs() < 0.01);
         assert_eq!(br.trials, 23);
@@ -1271,7 +1460,8 @@ mod tests {
         let br = parse_result_line(
             "Compress software L1 T1 (x86_64)",
             "  gzippy: 328.3 MB/s, ratio 0.369, 30 trials",
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(br.tool, "gzippy");
         assert!((br.speed_mbps - 328.3).abs() < 0.01);
         assert_eq!(br.trials, 30);
@@ -1285,7 +1475,8 @@ mod tests {
         let br = parse_result_line(
             "Decompress logs-bgzf T1 (arm64)",
             "  rapidgzip: 148.1 MB/s, 15 trials",
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(br.tool, "rapidgzip");
         assert!((br.speed_mbps - 148.1).abs() < 0.01);
         assert_eq!(br.trials, 15);
@@ -1296,7 +1487,8 @@ mod tests {
         let br = parse_result_line(
             "Decompress silesia-gzip T1 (x86_64)",
             "  unpigz: 200.5 MB/s, 10 trials",
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(br.tool, "unpigz");
     }
 
@@ -1342,10 +1534,17 @@ mod tests {
     #[test]
     fn test_scenario_key_decompress() {
         let br = BenchResult {
-            job: String::new(), tool: "gzippy".into(), speed_mbps: 100.0,
-            trials: 10, ratio: None, dataset: "silesia".into(),
-            archive: "gzip".into(), threads: "T1".into(),
-            platform: "x86_64".into(), mode: "decompress".into(), level: String::new(),
+            job: String::new(),
+            tool: "gzippy".into(),
+            speed_mbps: 100.0,
+            trials: 10,
+            ratio: None,
+            dataset: "silesia".into(),
+            archive: "gzip".into(),
+            threads: "T1".into(),
+            platform: "x86_64".into(),
+            mode: "decompress".into(),
+            level: String::new(),
         };
         assert_eq!(scenario_key(&br), "decompress silesia-gzip T1 x86_64");
     }
@@ -1353,10 +1552,17 @@ mod tests {
     #[test]
     fn test_scenario_key_compress() {
         let br = BenchResult {
-            job: String::new(), tool: "gzippy".into(), speed_mbps: 100.0,
-            trials: 10, ratio: Some(0.35), dataset: "logs".into(),
-            archive: String::new(), threads: "Tmax".into(),
-            platform: "arm64".into(), mode: "compress".into(), level: "L6".into(),
+            job: String::new(),
+            tool: "gzippy".into(),
+            speed_mbps: 100.0,
+            trials: 10,
+            ratio: Some(0.35),
+            dataset: "logs".into(),
+            archive: String::new(),
+            threads: "Tmax".into(),
+            platform: "arm64".into(),
+            mode: "compress".into(),
+            level: "L6".into(),
         };
         assert_eq!(scenario_key(&br), "compress logs L6 Tmax arm64");
     }
@@ -1425,7 +1631,11 @@ mod tests {
     fn test_categorize_actionable_compress_pigz() {
         let (cat, action) = categorize_gap("compress software L9 Tmax x86_64", "pigz", -6.0);
         assert_eq!(cat, GapCategory::Actionable);
-        assert!(action.contains("pigz"), "action should mention pigz: {}", action);
+        assert!(
+            action.contains("pigz"),
+            "action should mention pigz: {}",
+            action
+        );
     }
 
     #[test]
@@ -1477,29 +1687,47 @@ mod tests {
         let benchmarks = vec![
             BenchResult {
                 job: "Decompress silesia-gzip T1 (x86_64)".into(),
-                tool: "gzippy".into(), speed_mbps: 260.0, trials: 10,
-                ratio: None, dataset: "silesia".into(), archive: "gzip".into(),
-                threads: "T1".into(), platform: "x86_64".into(),
-                mode: "decompress".into(), level: String::new(),
+                tool: "gzippy".into(),
+                speed_mbps: 260.0,
+                trials: 10,
+                ratio: None,
+                dataset: "silesia".into(),
+                archive: "gzip".into(),
+                threads: "T1".into(),
+                platform: "x86_64".into(),
+                mode: "decompress".into(),
+                level: String::new(),
             },
             BenchResult {
                 job: "Decompress silesia-gzip T1 (x86_64)".into(),
-                tool: "rapidgzip".into(), speed_mbps: 250.0, trials: 10,
-                ratio: None, dataset: "silesia".into(), archive: "gzip".into(),
-                threads: "T1".into(), platform: "x86_64".into(),
-                mode: "decompress".into(), level: String::new(),
+                tool: "rapidgzip".into(),
+                speed_mbps: 250.0,
+                trials: 10,
+                ratio: None,
+                dataset: "silesia".into(),
+                archive: "gzip".into(),
+                threads: "T1".into(),
+                platform: "x86_64".into(),
+                mode: "decompress".into(),
+                level: String::new(),
             },
             BenchResult {
                 job: "Decompress silesia-gzip T1 (x86_64)".into(),
-                tool: "igzip".into(), speed_mbps: 270.0, trials: 10,
-                ratio: None, dataset: "silesia".into(), archive: "gzip".into(),
-                threads: "T1".into(), platform: "x86_64".into(),
-                mode: "decompress".into(), level: String::new(),
+                tool: "igzip".into(),
+                speed_mbps: 270.0,
+                trials: 10,
+                ratio: None,
+                dataset: "silesia".into(),
+                archive: "gzip".into(),
+                threads: "T1".into(),
+                platform: "x86_64".into(),
+                mode: "decompress".into(),
+                level: String::new(),
             },
         ];
         let (wins, gaps, total) = count_wins_gaps(&benchmarks);
-        assert_eq!(wins, 1);  // beats rapidgzip
-        assert_eq!(gaps, 1);  // loses to igzip
+        assert_eq!(wins, 1); // beats rapidgzip
+        assert_eq!(gaps, 1); // loses to igzip
         assert_eq!(total, 2);
     }
 
@@ -1507,26 +1735,47 @@ mod tests {
     fn test_count_wins_gaps_skips_gzip_zopfli() {
         let benchmarks = vec![
             BenchResult {
-                job: "test".into(), tool: "gzippy".into(), speed_mbps: 260.0,
-                trials: 10, ratio: None, dataset: "s".into(), archive: "g".into(),
-                threads: "T1".into(), platform: "x".into(),
-                mode: "decompress".into(), level: String::new(),
+                job: "test".into(),
+                tool: "gzippy".into(),
+                speed_mbps: 260.0,
+                trials: 10,
+                ratio: None,
+                dataset: "s".into(),
+                archive: "g".into(),
+                threads: "T1".into(),
+                platform: "x".into(),
+                mode: "decompress".into(),
+                level: String::new(),
             },
             BenchResult {
-                job: "test".into(), tool: "gzip".into(), speed_mbps: 500.0,
-                trials: 10, ratio: None, dataset: "s".into(), archive: "g".into(),
-                threads: "T1".into(), platform: "x".into(),
-                mode: "decompress".into(), level: String::new(),
+                job: "test".into(),
+                tool: "gzip".into(),
+                speed_mbps: 500.0,
+                trials: 10,
+                ratio: None,
+                dataset: "s".into(),
+                archive: "g".into(),
+                threads: "T1".into(),
+                platform: "x".into(),
+                mode: "decompress".into(),
+                level: String::new(),
             },
             BenchResult {
-                job: "test".into(), tool: "zopfli".into(), speed_mbps: 500.0,
-                trials: 10, ratio: None, dataset: "s".into(), archive: "g".into(),
-                threads: "T1".into(), platform: "x".into(),
-                mode: "decompress".into(), level: String::new(),
+                job: "test".into(),
+                tool: "zopfli".into(),
+                speed_mbps: 500.0,
+                trials: 10,
+                ratio: None,
+                dataset: "s".into(),
+                archive: "g".into(),
+                threads: "T1".into(),
+                platform: "x".into(),
+                mode: "decompress".into(),
+                level: String::new(),
             },
         ];
         let (wins, gaps, total) = count_wins_gaps(&benchmarks);
-        assert_eq!(total, 0);  // gzip and zopfli are excluded
+        assert_eq!(total, 0); // gzip and zopfli are excluded
         assert_eq!(wins, 0);
         assert_eq!(gaps, 0);
     }

@@ -242,8 +242,10 @@ fn estimate_output_size(data: &[u8]) -> u64 {
                     }
                     let isize_off = pos + bsize - 4;
                     let isize_val = u32::from_le_bytes([
-                        data[isize_off], data[isize_off + 1],
-                        data[isize_off + 2], data[isize_off + 3],
+                        data[isize_off],
+                        data[isize_off + 1],
+                        data[isize_off + 2],
+                        data[isize_off + 3],
                     ]);
                     total += isize_val as u64;
                     pos += bsize;
@@ -259,8 +261,10 @@ fn estimate_output_size(data: &[u8]) -> u64 {
     // Fallback: last member's ISIZE (works for single-member)
     let isize_bytes = &data[data.len() - 4..];
     u32::from_le_bytes([
-        isize_bytes[0], isize_bytes[1],
-        isize_bytes[2], isize_bytes[3],
+        isize_bytes[0],
+        isize_bytes[1],
+        isize_bytes[2],
+        isize_bytes[3],
     ]) as u64
 }
 
@@ -271,9 +275,9 @@ fn find_subfield(extra: &[u8], si1: u8, si2: u8) -> Option<usize> {
             let slen = u16::from_le_bytes([extra[p + 2], extra[p + 3]]) as usize;
             if slen == 4 && p + 8 <= extra.len() {
                 // 4-byte block size (gzippy format)
-                let val = u32::from_le_bytes([
-                    extra[p + 4], extra[p + 5], extra[p + 6], extra[p + 7],
-                ]) as usize;
+                let val =
+                    u32::from_le_bytes([extra[p + 4], extra[p + 5], extra[p + 6], extra[p + 7]])
+                        as usize;
                 return Some(val);
             } else if slen == 2 && p + 6 <= extra.len() {
                 // 2-byte block size (standard BGZF format)
