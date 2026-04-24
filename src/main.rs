@@ -171,11 +171,10 @@ fn run() -> Result<i32, GzippyError> {
         }
         if args.verbose {
             println!(
-                "method    crc     date  time  {:>12} {:>12}  ratio  uncompressed_name",
-                "compressed", "uncompressed"
+                "method  crc     date  time    compressed uncompressed  ratio uncompressed_name"
             );
         } else {
-            println!("  compressed  uncompressed  ratio  uncompressed_name");
+            println!("  compressed uncompressed  ratio uncompressed_name");
         }
         let mut total_comp = 0u64;
         let mut total_uncomp = 0u64;
@@ -198,7 +197,7 @@ fn run() -> Result<i32, GzippyError> {
                 0.0
             };
             println!(
-                "{:>12}  {:>12}  {:4.1}%  (totals)",
+                "{:>12} {:>12} {:4.1}% (totals)",
                 total_comp, total_uncomp, ratio
             );
         }
@@ -335,45 +334,37 @@ fn list_file(filename: &str, args: &GzippyArgs) -> Result<(u64, u64), GzippyErro
     let crc32 = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
 
     let ratio = if uncompressed_size > 0 {
-        (1.0 - compressed_size as f64 / uncompressed_size as f64) * 100.0
+        ((1.0 - compressed_size as f64 / uncompressed_size as f64) * 100.0).clamp(-99.9, 99.9)
     } else {
         0.0
     };
 
-    // Get the output name - check for FNAME in header first
+    // Output name: prefer FNAME from header, else strip suffix from the given path.
+    // Show the full path as given (matching gzip -l behavior).
     let fname = extract_list_fname(&data);
-    let display_name = if let Some(ref name) = fname {
+    let display_name_owned;
+    let display_name: &str = if let Some(ref name) = fname {
         name.as_str()
     } else {
         let output_name = crate::utils::strip_compression_extension(Path::new(filename));
-        // Use a leaked string since we need a &str that outlives the function
-        // This is fine since list_file is called a limited number of times
-        let name = output_name
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(filename)
-            .to_string();
-        // We need to handle the borrow differently for verbose vs non-verbose
-        Box::leak(name.into_boxed_str())
+        display_name_owned = output_name.to_str().unwrap_or(filename).to_string();
+        &display_name_owned
     };
 
     if args.verbose {
-        // Parse header for verbose info
         let mtime = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let date_str = if mtime > 0 {
-            // Format as "Jan 01 2024 12:00" using basic conversion
             format_unix_timestamp(mtime)
         } else {
-            "                ".to_string()
+            "            ".to_string() // 12 spaces matching "MMM DD HH:MM"
         };
-
         println!(
-            "defla {:08x} {} {:>12} {:>12} {:4.1}%  {}",
+            "defla {:08x} {} {:>12} {:>12} {:4.1}% {}",
             crc32, date_str, compressed_size, uncompressed_size, ratio, display_name
         );
     } else {
         println!(
-            "{:>12}  {:>12}  {:4.1}%  {}",
+            "{:>12} {:>12} {:4.1}% {}",
             compressed_size, uncompressed_size, ratio, display_name
         );
     }
@@ -456,10 +447,8 @@ fn format_unix_timestamp(timestamp: u32) -> String {
     }
     let day = remaining_days + 1;
 
-    format!(
-        "{} {:2} {} {:02}:{:02}",
-        MONTHS[month], day, year, hours, minutes
-    )
+    // gzip format: "Jan  1 12:00" — no year, day right-aligned in 2 chars
+    format!("{} {:2} {:02}:{:02}", MONTHS[month], day, hours, minutes)
 }
 
 fn print_help() {

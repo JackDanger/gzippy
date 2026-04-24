@@ -178,7 +178,13 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
                 }
             }
             if args.verbosity > 0 && !args.quiet {
-                print_stats(file_size, output_size, input_path);
+                print_stats(
+                    file_size,
+                    output_size,
+                    input_path,
+                    output_path.as_deref(),
+                    args,
+                );
             }
             if !args.keep && !args.stdout {
                 std::fs::remove_file(input_path)?;
@@ -436,28 +442,46 @@ fn get_output_filename(input_path: &Path, args: &GzippyArgs, data: &[u8]) -> std
     output_path
 }
 
-fn print_stats(input_size: u64, output_size: u64, path: &Path) {
-    let filename = path
-        .file_name()
-        .unwrap_or_default()
-        .to_str()
-        .unwrap_or("<unknown>");
-    let ratio = if output_size > 0 {
-        input_size as f64 / output_size as f64
+fn print_stats(
+    input_size: u64,
+    output_size: u64,
+    input_path: &Path,
+    output_path: Option<&Path>,
+    args: &GzippyArgs,
+) {
+    // ratio: how much the original was compressed (positive = shrank, negative = grew)
+    let saved_pct = if output_size > 0 {
+        (1.0_f64 - input_size as f64 / output_size as f64) * 100.0
     } else {
-        1.0
+        0.0
     };
-    let (in_size, in_unit) = human_size(input_size);
-    let (out_size, out_unit) = human_size(output_size);
-    eprintln!(
-        "{}: {:.1}{} → {:.1}{} ({:.1}x expansion)",
-        filename,
-        in_size,
-        in_unit,
-        out_size,
-        out_unit,
-        1.0 / ratio
-    );
+    if args.verbosity >= 2 {
+        // gzippy detail format for -vv
+        let name = input_path
+            .file_name()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or("<unknown>");
+        let (in_sz, in_u) = human_size(input_size);
+        let (out_sz, out_u) = human_size(output_size);
+        let expansion = output_size as f64 / input_size.max(1) as f64;
+        eprintln!(
+            "{}: {:.1}{} → {:.1}{} ({:.1}x expansion)",
+            name, in_sz, in_u, out_sz, out_u, expansion
+        );
+    } else {
+        // gzip-compatible format for -v: "path:   X.X% -- replaced with outpath"
+        let in_name = input_path.to_str().unwrap_or("<unknown>");
+        match output_path {
+            Some(out) => eprintln!(
+                "{}:\t{:7.1}% -- replaced with {}",
+                in_name,
+                saved_pct.clamp(-99.9, 99.9),
+                out.to_str().unwrap_or("<unknown>")
+            ),
+            None => eprintln!("{}:\t{:7.1}%", in_name, saved_pct.clamp(-99.9, 99.9)),
+        }
+    }
 }
 
 fn human_size(bytes: u64) -> (f64, &'static str) {

@@ -53,7 +53,7 @@ impl Default for GzippyArgs {
             force: false,
             quiet: false,
             verbose: false,
-            verbosity: 1,
+            verbosity: 0,
             recursive: false,
             independent: false,
             suffix: ".gz".to_string(),
