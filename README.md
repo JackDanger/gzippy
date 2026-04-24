@@ -1,6 +1,6 @@
 # gzippy
 
-The fastest gzip. Parallel, written in Rust.
+The fastest gzip on any hardware. Drop-in replacement for `gzip`
 
 ```bash
 gzippy file.txt           # Compress → file.txt.gz
@@ -49,20 +49,6 @@ To replace system `gzip` with gzippy:
 sudo apt-get install gzippy-replace-gzip
 ```
 
-**Other Linux — binary**
-
-```bash
-# Replace ARCH with x86_64 or aarch64
-curl -fsSL https://github.com/JackDanger/gzippy/releases/latest/download/gzippy-ARCH-unknown-linux-gnu.tar.gz \
-    | tar -xz -C ~/.local/bin
-```
-
-**Cargo (all platforms)**
-
-```bash
-cargo install gzippy
-```
-
 **Build from source**
 
 ```bash
@@ -91,11 +77,6 @@ Extra options:
 - `-p4` — use 4 threads (default: all cores)
 - `--level 11` / `--ultra` — smaller output, slower
 - `--level 12` / `--max` — smallest output
-
-## Requirements
-
-- 64-bit Linux or macOS
-- Rust 1.70+ (for `cargo install` or build from source only)
 
 ## Standing on shoulders
 

@@ -97,6 +97,44 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
 
+      - name: Sign and notarize (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERT_P12:      ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          NOTARYTOOL_APPLE_ID: ${{ secrets.NOTARYTOOL_APPLE_ID }}
+          NOTARYTOOL_PASSWORD: ${{ secrets.NOTARYTOOL_PASSWORD }}
+          NOTARYTOOL_TEAM_ID:  ${{ secrets.NOTARYTOOL_TEAM_ID }}
+        run: |
+          BINARY="target/${{ matrix.target }}/release/gzippy"
+
+          # Import Developer ID Application cert into a throw-away keychain
+          echo "$MACOS_CERT_P12" | base64 --decode > /tmp/cert.p12
+          security create-keychain -p "ci" ci.keychain
+          security list-keychains -d user -s ci.keychain $(security list-keychains -d user | tr -d '"' | xargs)
+          security set-keychain-settings -lut 21600 ci.keychain
+          security unlock-keychain -p "ci" ci.keychain
+          security import /tmp/cert.p12 -k ci.keychain -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "ci" ci.keychain
+          rm /tmp/cert.p12
+
+          # Sign with hardened runtime (required for notarization)
+          codesign --sign "Developer ID Application: Jack Danger (LWLMGDKSM9)" \
+                   --options runtime \
+                   --timestamp \
+                   --force \
+                   "$BINARY"
+          codesign --verify --strict "$BINARY"
+
+          # Notarize
+          ditto -c -k --keepParent "$BINARY" /tmp/gzippy-notarize.zip
+          xcrun notarytool submit /tmp/gzippy-notarize.zip \
+            --apple-id  "$NOTARYTOOL_APPLE_ID" \
+            --password  "$NOTARYTOOL_PASSWORD" \
+            --team-id   "$NOTARYTOOL_TEAM_ID" \
+            --wait
+          rm /tmp/gzippy-notarize.zip
+
       - name: Package tarball + SHA256
         run: |
           TARBALL="gzippy-${{ matrix.target }}.tar.gz"

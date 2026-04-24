@@ -33,8 +33,9 @@ class Gzippy < Formula
     bin.install "gzippy"
     bin.install_symlink "gzippy" => "gzip"
     bin.install_symlink "gzippy" => "gunzip"
-    bin.install_symlink "gzippy" => "ungzippy"
+    bin.install_symlink "gzippy" => "gzcat"
     bin.install_symlink "gzippy" => "zcat"
+    bin.install_symlink "gzippy" => "ungzippy"
     man1.install "man/gzippy.1" if File.exist?("man/gzippy.1")
     man5.install "man/gzippy-format.5" if File.exist?("man/gzippy-format.5")
     man7.install "man/gzippy-tuning.7" if File.exist?("man/gzippy-tuning.7")
@@ -42,13 +43,10 @@ class Gzippy < Formula
 
   def caveats
     <<~EOS
-      gzippy is now your gzip and gunzip.
+      gzip, gunzip, gzcat, zcat, ungzippy → gzippy
 
-      If you had Homebrew's gzip installed, it was removed automatically due
-      to the conflict. The macOS system gzip at /usr/bin/gzip is untouched.
-
-      All four commands point to the same binary:
-        gzip, gunzip, ungzippy, zcat → gzippy
+      Homebrew's bin precedes /usr/bin in PATH, so these shadow the system
+      gzip automatically. The system /usr/bin/gzip is untouched.
     EOS
   end
 
@@ -59,9 +57,10 @@ class Gzippy < Formula
     system bin/"gzip", "-d", "-f", "hello.txt.gz"
     assert_equal "Hello, world!\n", (testpath/"hello.txt").read
 
-    # Verify all symlinks resolve
     assert_equal bin/"gzippy", (bin/"gzip").realpath
     assert_equal bin/"gzippy", (bin/"gunzip").realpath
+    assert_equal bin/"gzippy", (bin/"gzcat").realpath
+    assert_equal bin/"gzippy", (bin/"zcat").realpath
     assert_equal bin/"gzippy", (bin/"ungzippy").realpath
   end
 end
