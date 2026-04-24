@@ -304,9 +304,9 @@ pub fn decompress_deflate_from_bit(
 
     if !dict.is_empty() {
         let ret = unsafe {
-            isal_raw::isal_inflate_set_dict(&mut state, dict.as_ptr() as *mut u8, dict.len() as u32)
+            isal_raw::isal_inflate_set_dict(&mut state, dict.as_ptr(), dict.len() as u32)
         };
-        if ret != 0 {
+        if ret != isal_raw::COMP_OK {
             return None;
         }
     }
