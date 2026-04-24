@@ -214,10 +214,10 @@ pub fn scan_deflate_isal(
         let written = this_chunk - state.avail_out as usize;
         out_pos += written;
 
-        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_NEW_HDR
-            && out_pos >= next_checkpoint_at
-            && out_pos >= WINDOW_SIZE
-        {
+        // Checkpoint at output-position intervals. ISAL_BLOCK_NEW_HDR is not used
+        // because ISA-L often transitions through it within a single isal_inflate call,
+        // so the caller never sees it — yielding zero checkpoints for most real streams.
+        if out_pos >= next_checkpoint_at && out_pos >= WINDOW_SIZE {
             let input_byte_pos = deflate_data.len() - state.avail_in as usize;
             let window_start = out_pos - WINDOW_SIZE;
             checkpoints.push(ScanCheckpoint {
@@ -477,12 +477,8 @@ mod tests {
             data.extend_from_slice(format!("Line {}: some test data for scan\n", i).as_bytes());
         }
 
-        // Use level-0 (stored) so deflate emits TYPE0 blocks every 65535 bytes.
-        // Compressed blocks with Z_SYNC_FLUSH may not surface ISAL_BLOCK_NEW_HDR
-        // between isal_inflate() calls because ISA-L reads the next header in the
-        // same call. Stored blocks guarantee block boundaries ISA-L reports.
         let mut encoder =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::none());
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
         std::io::Write::write_all(&mut encoder, &data).unwrap();
         let compressed = encoder.finish().unwrap();
 
