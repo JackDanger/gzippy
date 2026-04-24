@@ -156,7 +156,9 @@ jobs:
         run: |
           sudo dpkg -i ../gzippy_*.deb
           echo "Hello gzippy" | gzippy -c | gzippy -d
-          echo "✓ gzippy package works"
+          [ "$(readlink /usr/bin/gzip)" = "gzippy" ] || (echo "gzip not diverted"; exit 1)
+          echo "Test data" | gzip -c | gunzip -c
+          echo "✓ gzippy installed, gzip/gunzip/zcat diverted"
 
       - name: Collect .deb files into workspace
         run: cp ../*.deb ./

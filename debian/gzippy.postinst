@@ -1,0 +1,36 @@
+#!/bin/sh
+set -e
+
+CMDS="gzip gunzip zcat"
+
+divert_cmd() {
+    cmd="$1"
+    target="/usr/bin/$cmd"
+    diverted="/usr/bin/$cmd.distrib"
+
+    # Already diverted by us — ensure symlink is in place
+    if dpkg-divert --list "$target" 2>/dev/null | grep -q "by gzippy"; then
+        [ -L "$target" ] || ln -sf gzippy "$target"
+        return 0
+    fi
+
+    # Divert the original file aside (if it exists)
+    if [ -e "$target" ] && [ ! -L "$target" ]; then
+        dpkg-divert --package gzippy --divert "$diverted" --rename --add "$target"
+    elif [ -e "$target" ]; then
+        # It's already a symlink (e.g. gunzip -> gzip); divert it
+        dpkg-divert --package gzippy --divert "$diverted" --rename --add "$target"
+    fi
+
+    ln -sf gzippy "$target"
+}
+
+case "$1" in
+    configure)
+        for cmd in $CMDS; do
+            divert_cmd "$cmd"
+        done
+        ;;
+esac
+
+#DEBHELPER#

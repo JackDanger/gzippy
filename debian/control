@@ -26,17 +26,8 @@ Description: The fastest parallel gzip
 
 Package: gzippy-replace-gzip
 Architecture: all
-Depends: gzippy (= ${binary:Version}), ${misc:Depends}
-Conflicts: gzip
-Provides: gzip
-Replaces: gzip
-Description: Replace system gzip with gzippy (fast parallel gzip)
- This package replaces the system gzip, gunzip, gzcat, and zcat commands
- with gzippy, providing significantly faster compression and decompression.
- .
- When installed, all system gzip operations will use gzippy transparently.
- This is fully compatible with standard gzip - files compressed with gzippy
- can be decompressed by any standard gzip implementation.
- .
- WARNING: This package conflicts with and replaces the gzip package.
- Install only if you want gzippy to handle all gzip operations system-wide.
+Depends: gzippy (>= ${binary:Version}), ${misc:Depends}
+Description: Transitional package — gzippy now replaces gzip automatically
+ This is a no-op transitional package. As of gzippy 0.1.6, installing the
+ gzippy package automatically diverts /usr/bin/gzip, /usr/bin/gunzip, and
+ /usr/bin/zcat to gzippy via dpkg-divert. This package can be safely removed.

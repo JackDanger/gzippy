@@ -12,24 +12,9 @@ override_dh_auto_build:
 override_dh_auto_install:
 	# Install gzippy binary
 	install -D -m 755 target/release/gzippy debian/gzippy/usr/bin/gzippy
-	# Create ungzippy symlink
+	# ungzippy alias
 	ln -sf gzippy debian/gzippy/usr/bin/ungzippy
-	
-	# For gzippy-replace-gzip: create symlinks in /usr/lib/gzippy
-	mkdir -p debian/gzippy-replace-gzip/usr/lib/gzippy
-	ln -sf /usr/bin/gzippy debian/gzippy-replace-gzip/usr/lib/gzippy/gzip
-	ln -sf /usr/bin/gzippy debian/gzippy-replace-gzip/usr/lib/gzippy/gunzip
-	ln -sf /usr/bin/gzippy debian/gzippy-replace-gzip/usr/lib/gzippy/gzcat
-	ln -sf /usr/bin/gzippy debian/gzippy-replace-gzip/usr/lib/gzippy/zcat
-	ln -sf /usr/bin/gzippy debian/gzippy-replace-gzip/usr/lib/gzippy/uncompress
-	
-	# Create the actual /usr/bin replacements
-	mkdir -p debian/gzippy-replace-gzip/usr/bin
-	ln -sf /usr/bin/gzippy debian/gzippy-replace-gzip/usr/bin/gzip
-	ln -sf /usr/bin/gzippy debian/gzippy-replace-gzip/usr/bin/gunzip
-	ln -sf /usr/bin/gzippy debian/gzippy-replace-gzip/usr/bin/gzcat
-	ln -sf /usr/bin/gzippy debian/gzippy-replace-gzip/usr/bin/zcat
-	ln -sf /usr/bin/gzippy debian/gzippy-replace-gzip/usr/bin/uncompress
+	# gzippy-replace-gzip is now a transitional package — no files to install
 
 override_dh_auto_test:
 	# Skip tests during package build (they require special permissions)

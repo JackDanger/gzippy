@@ -56,17 +56,19 @@ jobs:
           sudo dpkg -i ../gzippy_*.deb
           gzippy --version
           echo "Hello, World!" | gzippy -c | gzippy -d
-          echo "✓ gzippy package works"
+          echo "✓ gzippy installed"
 
-      - name: Test gzip replacement package
+      - name: Test gzip replacement via dpkg-divert
         run: |
-          sudo dpkg -i ../gzippy-replace-gzip_*.deb
-          which gzip
           ls -la /usr/bin/gzip
+          [ "$(readlink /usr/bin/gzip)" = "gzippy" ] || (echo "gzip symlink wrong: $(readlink /usr/bin/gzip)"; exit 1)
+          [ "$(readlink /usr/bin/gunzip)" = "gzippy" ] || (echo "gunzip symlink wrong"; exit 1)
+          [ "$(readlink /usr/bin/zcat)" = "gzippy" ] || (echo "zcat symlink wrong"; exit 1)
           echo "Test data" > /tmp/test.txt
           gzip -c /tmp/test.txt | gunzip -c > /tmp/test2.txt
           diff /tmp/test.txt /tmp/test2.txt
-          echo "✓ gzippy-replace-gzip works"
+          dpkg-divert --list | grep gzippy
+          echo "✓ gzip/gunzip/zcat point to gzippy via dpkg-divert"
 
       - name: Collect .deb files into workspace
         run: cp ../*.deb ./
