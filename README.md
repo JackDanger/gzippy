@@ -1,24 +1,44 @@
 # gzippy
 
-The fastest gzip on any hardware. Drop-in replacement for `gzip`
+The fastest gzip on any hardware. Drop-in for `gzip`, `gunzip`, `gzcat`,
+`zcat`, and `ungzippy` — same RFC 1952 output, every decompressor on Earth
+still reads your files.
 
-```bash
-gzippy file.txt           # Compress → file.txt.gz
-gzippy -d file.txt.gz     # Decompress → file.txt
-cat data | gzippy > out   # Works with pipes too
+## How fast?
+
+Compressing 211 MB of logs on an M4 MacBook Pro, 14 cores:
+
+| Tool                   |      Speed     |   Time   |
+|------------------------|---------------:|---------:|
+| **gzippy, 14 threads** | **~3000 MB/s** | **0.07 s** |
+| gzippy, 1 thread       |     ~400 MB/s  |   0.53 s |
+| GNU gzip               |     ~360 MB/s  |   0.58 s |
+| Apple gzip (NEON)      |     ~315 MB/s  |   0.67 s |
+
+Decompression: 300–2000 MB/s depending on file type and thread count.
+
+## One binary, many names
+
+```
+gzip    gunzip    gzcat    zcat    ungzippy    gzippy
 ```
 
-## Install
+All six commands are the same Rust binary. `gunzip file.gz` and
+`gzippy -d file.gz` take identical code paths at identical speed.
+Installers put gzippy ahead of the system gzip in `$PATH`, so the
+takeover is silent — and `/usr/bin/gzip` stays untouched.
 
-**One-liner (macOS, Debian, Ubuntu, and other Linux)**
+## Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/JackDanger/gzippy/main/scripts/install.sh | bash
 ```
 
-Detects your platform and uses the right package manager.
+One line. Detects macOS, Debian, Ubuntu, and most Linux, then uses the
+right package manager.
 
----
+<details>
+<summary>Per-platform commands</summary>
 
 **macOS — Homebrew**
 
@@ -26,9 +46,6 @@ Detects your platform and uses the right package manager.
 brew tap jackdanger/gzippy https://github.com/JackDanger/gzippy
 brew install jackdanger/gzippy/gzippy
 ```
-
-> Remove Homebrew's gzip first if installed: `brew uninstall gzip`  
-> The macOS system `/usr/bin/gzip` is untouched.
 
 **Debian / Ubuntu — apt**
 
@@ -43,7 +60,7 @@ sudo apt-get update
 sudo apt-get install gzippy
 ```
 
-To replace system `gzip` with gzippy:
+Replace system gzip (via dpkg-divert):
 
 ```bash
 sudo apt-get install gzippy-replace-gzip
@@ -56,27 +73,34 @@ git clone --recursive https://github.com/JackDanger/gzippy
 cd gzippy && cargo build --release
 ```
 
-## How fast?
+</details>
 
-Compressing 211 MB of logs on an M4 MacBook Pro (14 cores):
+## Beyond gzip
 
-| Tool | Speed | Time |
-|------|-------|------|
-| gzippy (14 threads) | ~3000 MB/s | 0.07s |
-| gzippy (1 thread) | ~400 MB/s | 0.53s |
-| GNU gzip | ~360 MB/s | 0.58s |
-| Apple gzip (NEON) | ~315 MB/s | 0.67s |
+```
+$ gzippy --analyze Cargo.lock
+gzippy --analyze  Cargo.lock  (22.1 KB)
+──────────────────────────────────────────────────────────────────────────────
+  entropy    [██████▄   ]   5.22/8   MEDIUM      (mixed text and binary, or a data file)
+  LZ77 cover [████████▄ ]   85.4%    EXTREME     (most bytes come for free — this file is very squishy)
+  matches    2.05K  avg length 9.4 B  avg back-distance 4.8 KB
+  est. gzip  [█▅        ]  ~16% of raw
 
-Decompression: 300–2000 MB/s depending on file type and thread count.
+  match-length histogram — how long is each reused sequence?
+     3 -   4 B  ████████████████         73.0%  literal repeats; common everywhere
+     9 -  16 B  █▇                        8.3%  words, variable names, small keys
+    17 -  32 B  █▆                        7.7%  lines of code, struct layouts
 
-## Options
+  (canvas, colour legend, distance histogram, verdict — see `man gzippy`)
+```
 
-Works like gzip: `-1` to `-9`, `-c` (stdout), `-d` (decompress), `-k` (keep original), `-f` (force), `-v` (verbose).
+`gzippy --analyze FILE` prints a compression fingerprint: entropy, LZ77
+coverage, an 80×20 colour canvas of the bytes, match-length and
+distance histograms, and a one-line verdict. No other gzip does this.
 
-Extra options:
-- `-p4` — use 4 threads (default: all cores)
-- `--level 11` / `--ultra` — smaller output, slower
-- `--level 12` / `--max` — smallest output
+The full manual lives in `man gzippy`. The `"GZ"` parallel-block wire
+format and the tuning guide have their own pages: `man gzippy-format`,
+`man gzippy-tuning`.
 
 ## Standing on shoulders
 
