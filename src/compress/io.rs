@@ -6,7 +6,7 @@
 //! preservation, stats printing, and signal-handler registration.
 
 use std::fs::File;
-use std::io::{self, stdin, stdout, BufWriter, Cursor, Read, Write};
+use std::io::{self, stdin, stdout, BufWriter, Cursor, Write};
 use std::path::Path;
 
 struct CountingWriter<W: Write> {
@@ -63,6 +63,17 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             );
         }
         return Ok(2);
+    }
+
+    // Refuse to compress files that already carry the target suffix (e.g. foo.gz → foo.gz.gz).
+    if !args.force && filename.ends_with(args.suffix.as_str()) {
+        if !args.quiet {
+            eprintln!(
+                "gzippy: {}: already has {} suffix -- unchanged",
+                filename, args.suffix
+            );
+        }
+        return Ok(1);
     }
     #[cfg(unix)]
     {
@@ -232,7 +243,7 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             if args.verbosity > 0 && !args.quiet && !args.stdout {
                 let output_path = get_output_filename(input_path, args);
                 if let Ok(metadata) = std::fs::metadata(&output_path) {
-                    print_stats(file_size, metadata.len(), input_path, args);
+                    print_stats(file_size, metadata.len(), input_path, &output_path, args);
                 }
             }
             if !args.keep && !args.stdout {
@@ -256,8 +267,7 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     let can_parallelize = args.processes > 1;
     let verbose = args.verbose && !args.quiet;
 
-    // T1 L0-L3 streaming fast path: compress directly from stdin with ~2MB memory.
-    // Must happen BEFORE read_to_end to avoid buffering the entire input.
+    // T1 L0-L3 ISA-L streaming fast path: directly pipe stdin→stdout with ~2MB memory.
     if !can_parallelize
         && args.compression_level <= 3
         && !args.huffman
@@ -297,6 +307,8 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
         return Ok(0);
     }
 
+    // Try to mmap stdin when it's a regular file (< file redirection).
+    // For pipes, mmap_data stays None and we fall through to streaming.
     #[cfg(unix)]
     let mmap_data: Option<memmap2::Mmap> = if can_parallelize {
         use std::os::unix::io::FromRawFd;
@@ -324,119 +336,77 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
     #[cfg(not(unix))]
     let mmap_data: Option<memmap2::Mmap> = None;
 
-    let mut buffer_vec = Vec::new();
-    let input_data: &[u8] = if let Some(ref mmap) = mmap_data {
-        &mmap[..]
-    } else {
-        let mut input = stdin();
-        let mut sample = vec![0u8; 8192];
-        let bytes_read = input.read(&mut sample)?;
-        if bytes_read > 0 {
-            sample.truncate(bytes_read);
-            buffer_vec.extend_from_slice(&sample);
-            input.read_to_end(&mut buffer_vec)?;
-        }
-        &buffer_vec
-    };
-
-    let in_bytes = input_data.len() as u64;
-    let content_type = if input_data.len() >= 8192 {
-        crate::compress::optimization::analyze_content_type(&input_data[..8192])
-    } else if !input_data.is_empty() {
-        crate::compress::optimization::analyze_content_type(input_data)
-    } else {
-        ContentType::Binary
-    };
-
-    let opt_config = OptimizationConfig::new(
-        args.processes,
-        in_bytes,
-        args.compression_level,
-        content_type,
-    );
-
     let header_info = GzipHeaderInfo::default();
-    let compression_level = args.compression_level as u32;
     let mut counted = CountingWriter::new(BufWriter::with_capacity(1024 * 1024, stdout()));
 
-    if opt_config.thread_count > 1 {
-        if args.compression_level >= 6 && args.compression_level <= 9 {
-            let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
-                compression_level,
-                opt_config.thread_count,
-            );
-            encoder.set_header_info(header_info);
-            encoder.compress_buffer(input_data, &mut counted)?;
+    let in_bytes = if let Some(ref mmap) = mmap_data {
+        // Regular-file stdin (< file): multi-threaded parallel compression.
+        let input_data = &mmap[..];
+        let file_size = input_data.len() as u64;
+        let content_type = if input_data.len() >= 8192 {
+            crate::compress::optimization::analyze_content_type(&input_data[..8192])
+        } else if !input_data.is_empty() {
+            crate::compress::optimization::analyze_content_type(input_data)
         } else {
-            let mut encoder = crate::compress::parallel::ParallelGzEncoder::new(
-                compression_level,
-                opt_config.thread_count,
-            );
-            encoder.set_header_info(header_info);
-            encoder.compress_buffer(input_data, &mut counted)?;
-        }
-        counted.flush()?;
-        if verbose {
-            print_stdin_stats(in_bytes, counted.count, args);
-        }
-        return Ok(0);
-    }
-
-    if args.compression_level <= 3
-        && !args.huffman
-        && !args.rle
-        && crate::backends::isal_compress::is_available()
-    {
-        if args.verbosity >= 2 {
-            eprintln!("gzippy: using ISA-L single-threaded compression (direct)");
-        }
-        if debug_enabled() {
-            let t0 = std::time::Instant::now();
-            crate::backends::isal_compress::compress_gzip_to_writer(
-                input_data,
-                &mut counted,
-                compression_level,
-            )?;
-            let elapsed = t0.elapsed();
-            eprintln!(
-                "[gzippy] compress T1 ISA-L L{}: {:.1}ms, {:.1} MB/s ({} bytes in)",
-                compression_level,
-                elapsed.as_secs_f64() * 1000.0,
-                input_data.len() as f64 / elapsed.as_secs_f64() / 1_000_000.0,
-                input_data.len()
-            );
-        } else {
-            crate::backends::isal_compress::compress_gzip_to_writer(
-                input_data,
-                &mut counted,
-                compression_level,
-            )?;
-        }
-        counted.flush()?;
-        if verbose {
-            print_stdin_stats(in_bytes, counted.count, args);
-        }
-        return Ok(0);
-    }
-
-    drop(mmap_data);
-    let cursor = Cursor::new(buffer_vec);
-    match crate::compress::compress_with_pipeline(
-        cursor,
-        &mut counted,
-        args,
-        &opt_config,
-        &header_info,
-    ) {
-        Ok(_) => {
+            ContentType::Binary
+        };
+        let opt_config = OptimizationConfig::new(
+            args.processes,
+            file_size,
+            args.compression_level,
+            content_type,
+        );
+        let compression_level = args.compression_level as u32;
+        if opt_config.thread_count > 1 {
+            if args.compression_level >= 6 && args.compression_level <= 9 {
+                let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
+                    compression_level,
+                    opt_config.thread_count,
+                );
+                encoder.set_header_info(header_info.clone());
+                encoder.compress_buffer(input_data, &mut counted)?;
+            } else {
+                let mut encoder = crate::compress::parallel::ParallelGzEncoder::new(
+                    compression_level,
+                    opt_config.thread_count,
+                );
+                encoder.set_header_info(header_info.clone());
+                encoder.compress_buffer(input_data, &mut counted)?;
+            }
             counted.flush()?;
             if verbose {
-                print_stdin_stats(in_bytes, counted.count, args);
+                print_stdin_stats(file_size, counted.count, args);
             }
-            Ok(0)
+            return Ok(0);
         }
-        Err(e) => Err(e),
+        // Single-threaded with mmap'd file: stream through compress_with_pipeline.
+        let opt_config_t1 =
+            OptimizationConfig::new(1, file_size, args.compression_level, content_type);
+        crate::compress::compress_with_pipeline(
+            Cursor::new(input_data),
+            &mut counted,
+            args,
+            &opt_config_t1,
+            &header_info,
+        )?
+    } else {
+        // Pipe stdin: stream directly without buffering all input first.
+        // Single-threaded so output begins immediately without OOM risk.
+        let opt_config = OptimizationConfig::new(1, 0, args.compression_level, ContentType::Binary);
+        crate::compress::compress_with_pipeline(
+            stdin(),
+            &mut counted,
+            args,
+            &opt_config,
+            &header_info,
+        )?
+    };
+
+    counted.flush()?;
+    if verbose {
+        print_stdin_stats(in_bytes, counted.count, args);
     }
+    Ok(0)
 }
 
 fn print_stdin_stats(in_bytes: u64, out_bytes: u64, args: &GzippyArgs) {
@@ -487,54 +457,61 @@ fn compress_directory(dirname: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 
 fn get_output_filename(input_path: &Path, args: &GzippyArgs) -> std::path::PathBuf {
     let mut output_path = input_path.to_path_buf();
-    if args.force {
-        let mut stem = input_path
-            .file_stem()
-            .unwrap_or(input_path.as_os_str())
-            .to_str()
-            .unwrap();
-        if stem.ends_with(".tar") {
-            stem = &stem[..stem.len() - 4];
-        }
-        output_path.set_file_name(stem);
-    }
     let current_extension = output_path
         .extension()
         .unwrap_or_default()
         .to_str()
         .unwrap_or("");
     let new_extension = if current_extension.is_empty() {
-        args.suffix.trim_start_matches('.')
+        args.suffix.trim_start_matches('.').to_string()
     } else {
-        &format!("{}{}", current_extension, args.suffix)
+        format!("{}{}", current_extension, args.suffix)
     };
-    output_path.set_extension(new_extension);
+    output_path.set_extension(&new_extension);
     output_path
 }
 
-fn print_stats(input_size: u64, output_size: u64, path: &Path, args: &GzippyArgs) {
-    let filename = path
-        .file_name()
-        .unwrap_or_default()
-        .to_str()
-        .unwrap_or("<unknown>");
-    let ratio = if input_size > 0 {
-        output_size as f64 / input_size as f64
+fn print_stats(
+    input_size: u64,
+    output_size: u64,
+    input_path: &Path,
+    output_path: &Path,
+    args: &GzippyArgs,
+) {
+    let saved_pct = if input_size > 0 {
+        (1.0_f64 - output_size as f64 / input_size as f64) * 100.0
     } else {
-        1.0
+        0.0
     };
-    let saved_pct = (1.0 - ratio) * 100.0;
-    let (in_size, in_unit) = human_size(input_size);
-    let (out_size, out_unit) = human_size(output_size);
-    if args.processes > 1 {
-        eprintln!(
-            "{}: {:.1}{} → {:.1}{} ({:.1}% saved, {} threads)",
-            filename, in_size, in_unit, out_size, out_unit, saved_pct, args.processes
-        );
+    if args.verbosity >= 2 {
+        // gzippy detail format for -vv
+        let name = input_path
+            .file_name()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or("<unknown>");
+        let (in_sz, in_u) = human_size(input_size);
+        let (out_sz, out_u) = human_size(output_size);
+        if args.processes > 1 {
+            eprintln!(
+                "{}: {:.1}{} → {:.1}{} ({:.1}% saved, {} threads)",
+                name, in_sz, in_u, out_sz, out_u, saved_pct, args.processes
+            );
+        } else {
+            eprintln!(
+                "{}: {:.1}{} → {:.1}{} ({:.1}% saved)",
+                name, in_sz, in_u, out_sz, out_u, saved_pct
+            );
+        }
     } else {
+        // gzip-compatible format for -v: "path:   X.X% -- replaced with outpath"
+        let in_name = input_path.to_str().unwrap_or("<unknown>");
+        let out_name = output_path.to_str().unwrap_or("<unknown>");
         eprintln!(
-            "{}: {:.1}{} → {:.1}{} ({:.1}% saved)",
-            filename, in_size, in_unit, out_size, out_unit, saved_pct
+            "{}:\t{:7.1}% -- replaced with {}",
+            in_name,
+            saved_pct.clamp(-99.9, 99.9),
+            out_name
         );
     }
 }
