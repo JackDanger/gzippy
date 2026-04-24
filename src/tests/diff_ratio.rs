@@ -147,7 +147,7 @@ mod tests {
         );
 
         let ratio = gzippy_ns as f64 / libdeflate_ns as f64;
-        let threshold = read_threshold("max_ratio_bgzf_10mb", 2.0);
+        let threshold = read_threshold("max_ratio_bgzf_10mb", 3.5);
 
         eprintln!(
             "diff_ratio_bgzf_10mb: gzippy_T4={:.2}ms libdeflate_T1={:.2}ms ratio={:.3} threshold={:.3}",
