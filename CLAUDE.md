@@ -81,6 +81,37 @@ it must be gated on `isal_decompress::is_available()` — x86_64 only. Speculati
 on arm64 was 16× slower on low-redundancy data (block boundaries rare, most chunks become
 all-marker forcing huge sequential re-decodes).
 
+## Branch and PR Workflow
+
+**main is protected** — no direct pushes. Every change goes through a PR.
+The pre-push hook (auto-installed by `cargo build`) enforces this locally.
+
+```bash
+# Start work
+git checkout -b fix/my-change     # or feat/, refactor/, chore/, etc.
+
+# Iterate (same as before)
+GZIPPY_DEBUG=1 gzippy -d -c testfile.gz > /dev/null
+make
+cargo test --release
+
+# Ship
+git push origin fix/my-change
+gh pr create --fill               # title + body from commit messages
+# CI runs → merge when green
+```
+
+Emergency bypass (never for performance-affecting changes):
+```bash
+git push --no-verify origin fix/my-change   # skip local hook only
+```
+
+Releasing:
+```bash
+git tag v0.X.Y && git push origin v0.X.Y   # triggers Release workflow
+# Release workflow creates a formula-update PR and auto-merges it
+```
+
 ## Iteration Loop
 
 ```bash
