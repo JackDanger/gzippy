@@ -79,13 +79,8 @@ pub fn analyze_content_type(sample: &[u8]) -> ContentType {
             // Control characters that might be in text files
             0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F => control_chars += 1,
             // High bytes - could be UTF-8 or binary
-            0x80..=0xFF => {
-                // Simple UTF-8 heuristic - check for valid sequences
-                if is_likely_utf8_byte(byte) {
-                    text_chars += 1;
-                }
-                // Binary chars don't affect classification, only text/control ratio
-            }
+            0x80..=0xFF if is_likely_utf8_byte(byte) => text_chars += 1,
+            0x80..=0xFF => {}
             _ => {} // Binary - doesn't affect classification
         }
     }

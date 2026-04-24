@@ -121,11 +121,7 @@ impl DecodeTrace {
     pub fn print_summary(&self, output_bytes: usize, elapsed_ns: u64) {
         let mb_per_sec = output_bytes as f64 / (elapsed_ns as f64 / 1_000_000_000.0) / 1_000_000.0;
         let total_symbols = self.literals + self.matches;
-        let ns_per_symbol = if total_symbols > 0 {
-            elapsed_ns / total_symbols
-        } else {
-            0
-        };
+        let ns_per_symbol = elapsed_ns.checked_div(total_symbols).unwrap_or(0);
 
         eprintln!("\n=== DECODE TRACE ===");
         eprintln!(
@@ -5182,6 +5178,7 @@ mod optimization_tests {
 
         let original: Vec<u8> = (0..10000).map(|i| ((i * 7) % 256) as u8).collect();
 
+        use crate::assert_slices_eq;
         use flate2::write::GzEncoder;
         use flate2::Compression;
         use std::io::Write;

@@ -30,6 +30,7 @@ pub fn decompress_gzip_stream<W: std::io::Write>(input: &[u8], writer: &mut W) -
 
     let mut out_buf = vec![0u8; 1024 * 1024];
     let mut total = 0u64;
+    let mut finished = false;
 
     loop {
         state.avail_out = out_buf.len() as u32;
@@ -49,13 +50,18 @@ pub fn decompress_gzip_stream<W: std::io::Write>(input: &[u8], writer: &mut W) -
         }
 
         if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            finished = true;
             break;
         }
         if written == 0 && state.avail_in == 0 {
             break;
         }
     }
-    Some(total)
+    if finished {
+        Some(total)
+    } else {
+        None
+    }
 }
 
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
@@ -208,10 +214,10 @@ pub fn scan_deflate_isal(
         let written = this_chunk - state.avail_out as usize;
         out_pos += written;
 
-        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_NEW_HDR
-            && out_pos >= next_checkpoint_at
-            && out_pos >= WINDOW_SIZE
-        {
+        // Checkpoint at output-position intervals. ISAL_BLOCK_NEW_HDR is not used
+        // because ISA-L often transitions through it within a single isal_inflate call,
+        // so the caller never sees it — yielding zero checkpoints for most real streams.
+        if out_pos >= next_checkpoint_at && out_pos >= WINDOW_SIZE {
             let input_byte_pos = deflate_data.len() - state.avail_in as usize;
             let window_start = out_pos - WINDOW_SIZE;
             checkpoints.push(ScanCheckpoint {
