@@ -1,28 +1,28 @@
 class Gzippy < Formula
   desc "Fastest parallel gzip — drop-in replacement for gzip and gunzip"
   homepage "https://github.com/JackDanger/gzippy"
-  version "0.1.6"
+  version "0.1.7"
   license "Zlib"
 
   on_macos do
     on_arm do
       url "https://github.com/JackDanger/gzippy/releases/download/v#{version}/gzippy-aarch64-apple-darwin.tar.gz"
-      sha256 "6fe0928fc6c7bc497872eb31dbef52f715830510e03ceb9039894f79cae64d73" # AARCH64_APPLE_DARWIN
+      sha256 "eec908f517cbda2250d0f84ca9af3b6fe9a8f61c323b08e6707bfee2c8647ed0" # AARCH64_APPLE_DARWIN
     end
     on_intel do
       url "https://github.com/JackDanger/gzippy/releases/download/v#{version}/gzippy-x86_64-apple-darwin.tar.gz"
-      sha256 "2f4468f1c6fd06fbe8a3bdc8989141314f84d4f5c2985f72839bdc8f8ac6909f" # X86_64_APPLE_DARWIN
+      sha256 "5e223e8180bbf230b781290489b8ec64b1d7e173f547b1a312a6dd37ef9dd945" # X86_64_APPLE_DARWIN
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/JackDanger/gzippy/releases/download/v#{version}/gzippy-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "c8a196a801e45b6f2554db1d566a30943c0a5da9aa050fedc1a39ebae86b9d8e" # AARCH64_UNKNOWN_LINUX_GNU
+      sha256 "8c9431612db7de6de3ae9ec501df5cfdafccc2d6e71910a176b9bc95d33652b0" # AARCH64_UNKNOWN_LINUX_GNU
     end
     on_intel do
       url "https://github.com/JackDanger/gzippy/releases/download/v#{version}/gzippy-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "084bf058be9df5aed5098ef8012782737a79662fde8a387d5f24fe9e9cf33523" # X86_64_UNKNOWN_LINUX_GNU
+      sha256 "cce4c3904f46feb529de518527058263d84b5db373eca798656d029b98d005f0" # X86_64_UNKNOWN_LINUX_GNU
     end
   end
 
