@@ -30,6 +30,7 @@ pub fn decompress_gzip_stream<W: std::io::Write>(input: &[u8], writer: &mut W) -
 
     let mut out_buf = vec![0u8; 1024 * 1024];
     let mut total = 0u64;
+    let mut finished = false;
 
     loop {
         state.avail_out = out_buf.len() as u32;
@@ -49,13 +50,18 @@ pub fn decompress_gzip_stream<W: std::io::Write>(input: &[u8], writer: &mut W) -
         }
 
         if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            finished = true;
             break;
         }
         if written == 0 && state.avail_in == 0 {
             break;
         }
     }
-    Some(total)
+    if finished {
+        Some(total)
+    } else {
+        None
+    }
 }
 
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
@@ -471,9 +477,14 @@ mod tests {
             data.extend_from_slice(format!("Line {}: some test data for scan\n", i).as_bytes());
         }
 
+        // Write in 512KB chunks with sync flushes to force multiple deflate block boundaries.
+        // A single finish() produces one block with no intermediate ISAL_BLOCK_NEW_HDR → no checkpoints.
         let mut encoder =
             flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-        std::io::Write::write_all(&mut encoder, &data).unwrap();
+        for chunk in data.chunks(512 * 1024) {
+            std::io::Write::write_all(&mut encoder, chunk).unwrap();
+            std::io::Write::flush(&mut encoder).unwrap();
+        }
         let compressed = encoder.finish().unwrap();
 
         let result = scan_deflate_isal(&compressed, 256 * 1024, data.len())
