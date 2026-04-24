@@ -7989,7 +7989,12 @@ mod optimization_tests {
             panic!("gzip compression failed");
         }
 
-        // Read compressed data
+        // gzip creates .bin.gz (correct) or .gz (old gzippy ≤0.1.4 bug with -f)
+        let compressed_path = if compressed_path.exists() {
+            compressed_path
+        } else {
+            tmp_dir.join("gzip_test_input.gz")
+        };
         let compressed = std::fs::read(&compressed_path).expect("Failed to read compressed file");
         eprintln!(
             "Compressed with gzip -1: {} bytes ({:.1}%)",
