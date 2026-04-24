@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install gzippy — detects platform and uses the right package manager.
-# Usage: curl -fsSL https://raw.githubusercontent.com/JackDanger/gzippy/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/JackDanger/gzippy/main/scripts/install.sh | bash
 set -euo pipefail
 
 REPO="JackDanger/gzippy"

@@ -13,7 +13,7 @@ cat data | gzippy > out   # Works with pipes too
 **One-liner (macOS, Debian, Ubuntu, and other Linux)**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JackDanger/gzippy/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/JackDanger/gzippy/main/scripts/install.sh | bash
 ```
 
 Detects your platform and uses the right package manager.
