@@ -6,16 +6,28 @@ still reads your files.
 
 ## How fast?
 
-Compressing 211 MB of logs on an M4 MacBook Pro, 14 cores:
+Measured on the [Silesia compression corpus](http://sun.aei.polsl.pl/~sdeor/index.php?page=silesia)
+(202 MB of mixed text, source code, images, and database dumps), Apple
+M4 Pro with 14 cores, macOS 15. Level 6. Median of 15 runs per tool.
 
-| Tool                   |      Speed     |   Time   |
-|------------------------|---------------:|---------:|
-| **gzippy, 14 threads** | **~3000 MB/s** | **0.07 s** |
-| gzippy, 1 thread       |     ~400 MB/s  |   0.53 s |
-| GNU gzip               |     ~360 MB/s  |   0.58 s |
-| Apple gzip (NEON)      |     ~315 MB/s  |   0.67 s |
+### Compression
 
-Decompression: 300–2000 MB/s depending on file type and thread count.
+| Tool        |    Throughput  |   Time  |
+|-------------|---------------:|--------:|
+| **gzippy**  | **~700 MB/s**  | **0.29 s** |
+| pigz        |    ~150 MB/s   |  1.30 s |
+| Apple gzip  |     ~40 MB/s   |  5.00 s |
+
+### Decompression
+
+| Tool        | Throughput |
+|-------------|-----------:|
+| **gzippy**  | **~930 MB/s** |
+| Apple gzip  |    ~900 MB/s |
+| pigz        |    ~790 MB/s |
+
+Reproduce with [`scripts/readme_benchmark.py`](scripts/readme_benchmark.py)
+after `cargo build --release` and `(cd pigz && make)`.
 
 ## One binary, many names
 
