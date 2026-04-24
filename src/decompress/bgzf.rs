@@ -5178,6 +5178,7 @@ mod optimization_tests {
 
         let original: Vec<u8> = (0..10000).map(|i| ((i * 7) % 256) as u8).collect();
 
+        use crate::assert_slices_eq;
         use flate2::write::GzEncoder;
         use flate2::Compression;
         use std::io::Write;

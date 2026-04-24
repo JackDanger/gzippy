@@ -373,7 +373,7 @@ mod tests {
                 let byte = if rng % 4 == 0 {
                     (rng >> 16) as u8
                 } else {
-                    b"the quick brown fox jumps over the lazy dog "[(data.len() % 44)] as u8
+                    b"the quick brown fox jumps over the lazy dog "[data.len() % 44] as u8
                 };
                 data.push(byte);
             }
