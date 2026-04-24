@@ -35,6 +35,9 @@ class Gzippy < Formula
     bin.install_symlink "gzippy" => "gunzip"
     bin.install_symlink "gzippy" => "ungzippy"
     bin.install_symlink "gzippy" => "zcat"
+    man1.install "man/gzippy.1" if File.exist?("man/gzippy.1")
+    man5.install "man/gzippy-format.5" if File.exist?("man/gzippy-format.5")
+    man7.install "man/gzippy-tuning.7" if File.exist?("man/gzippy-tuning.7")
   end
 
   def caveats

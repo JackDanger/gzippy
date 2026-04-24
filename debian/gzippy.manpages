@@ -1,1 +1,3 @@
-debian/gzippy.1
+man/gzippy.1
+man/gzippy-format.5
+man/gzippy-tuning.7

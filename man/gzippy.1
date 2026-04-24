@@ -1,0 +1,610 @@
+.\" gzippy(1) — the fastest gzip. Hand-written troff.
+.\" Lint:   mandoc -Tlint man/gzippy.1
+.\" Render: man -l man/gzippy.1
+.TH GZIPPY 1 2026-04-24 "gzippy 0.1.7" "User Commands"
+.
+.SH NAME
+gzippy \- the fastest gzip
+.
+.SH SYNOPSIS
+.B gzippy
+.RI [ OPTION \|.\|.\|.\&]
+.RI [ FILE \|.\|.\|.]
+.br
+.B gunzip
+.RI [ OPTION \|.\|.\|.\&]
+.RI [ FILE \|.\|.\|.]
+.br
+.B zcat
+.RI [ FILE \|.\|.\|.]
+.br
+.IR command
+.B |
+.B gzippy
+.RI [ OPTION \|.\|.\|.\&]
+.B >
+.IR FILE .gz
+.
+.SH DESCRIPTION
+.B gzippy
+is a parallel gzip compressor and decompressor. It reads and writes RFC 1952
+gzip streams that are byte-for-byte interchangeable with
+.BR gzip (1),
+.BR pigz (1),
+and every other gzip implementation in existence \(em including the one
+baked into your router.
+.PP
+gzippy aims to be the fastest gzip ever written. On a 14-core laptop it
+compresses a 211 MB log file in 0.07 seconds. Decompression runs at
+300\(en2000 MB/s depending on input and thread count. It uses libdeflate,
+zlib-ng, and ISA-L under the hood, picks the right one for your data, and
+spreads the work across every core you give it.
+.PP
+Parallel output carries a small FEXTRA subfield identified by
+.BR \(dqGZ\(dq .
+Standard gzip readers ignore it; gzippy uses it to find block boundaries
+without inflating, enabling parallel decompression. The wire format is
+documented in
+.BR gzippy-format (5).
+.PP
+.nf
+   +==============================================================+
+   |   gzippy  <=>  <=   <=    <=     <=      the fastest gzip    |
+   |   LZ77 reference window: references point backwards          |
+   |   gzippy     <=     <=       <=         parallel, in Rust    |
+   +==============================================================+
+.fi
+.
+.SH INVOCATION AND MODES
+gzippy chooses its mode from its program name, its flags, and its input.
+.TP
+.B gzippy
+Compress
+.I FILE
+to
+.IR FILE .gz
+and remove the original (unless
+.B -k
+is given).
+.TP
+.B "gzippy -d, gunzip, ungzippy"
+Decompress
+.IR FILE .gz
+to
+.I FILE
+and remove the compressed form (unless
+.B -k
+is given).
+.TP
+.B "zcat, gzcat, gzippy -dc"
+Decompress to standard output.
+.TP
+.B "gzippy -t"
+Test integrity by decompressing to a sink. Prints
+.RI \(oq FILE :\ OK\(cq
+on success.
+.TP
+.B "gzippy -l"
+List compressed, uncompressed, and ratio for each
+.IR FILE .gz .
+Does not read from stdin.
+.PP
+With no
+.I FILE
+(or with \fB-\fR as a file), gzippy reads standard input and writes
+standard output.
+gzippy refuses to write compressed data to a terminal; pass
+.B -f
+to force it anyway.
+.
+.SH OPTIONS
+Options may be clustered (\c
+.BR -dcf )
+and values may be attached to their flag (\c
+.BR -p4 ,
+.BR -b256k )
+or separated by a space. A bare
+.B --
+ends option parsing.
+.
+.SS Mode
+.TP
+.BR -d ", " --decompress ", " --uncompress
+Decompress.
+.TP
+.BR -t ", " --test
+Test integrity. Implies
+.BR -d .
+.TP
+.BR -l ", " --list
+List compressed file information. In verbose mode the output is
+.IR "method crc date time compressed uncompressed ratio name" .
+.TP
+.BR -c ", " --stdout ", " --to-stdout
+Write to standard output; do not touch input files.
+.TP
+.BR -k ", " --keep
+Keep input files. Default is to delete them after a successful operation.
+.TP
+.BR -f ", " --force
+Force: overwrite existing files, follow symlinks, compress files with multiple
+hard links, write binary to a terminal, decompress even if the suffix is wrong.
+.TP
+.BR -r ", " --recursive
+Recurse into directories.
+.
+.SS Compression level
+Trade time for size. Higher is smaller and slower. gzippy adds two levels
+beyond gzip's 1\(en9.
+.TP
+.B -0
+Store (no compression), full gzip framing.
+.TP
+.B -1 " \(em " -9
+Standard gzip levels. Default is
+.BR -6 .
+.TP
+.BR --level " " \fIN\fR
+Set level
+.IR N ,
+0\(en12. Same as above for 0\(en9.
+.TP
+.BR --fast
+Alias for
+.BR -1 .
+.TP
+.BR --best
+Alias for
+.BR -9 .
+.TP
+.BR --ultra
+Level 11 \(em libdeflate's near-zopfli mode at roughly pigz speed.
+.TP
+.BR --max
+Level 12 \(em libdeflate's densest mode, closest to zopfli ratio.
+Slower than
+.BR --ultra .
+.TP
+.BR -H ", " --huffman
+Huffman-only compression (no LZ77 matching). Fastest possible; worst ratio
+that is not \-0. Useful when input is already well compressed.
+.TP
+.BR -U ", " --rle
+Run-length-only matching. A middle ground between
+.B -H
+and
+.BR -1 .
+.TP
+.BR -z ", " --zlib
+Write zlib stream (RFC 1950) instead of gzip. Default suffix changes to
+.BR .zz .
+.TP
+.BR -K ", " --zip
+Write a single-entry ZIP archive. Default suffix changes to
+.BR .zip .
+.
+.SS Parallelism and blocks
+.TP
+.BR -p ", " --processes " " \fIN\fR
+Use
+.I N
+threads. Default is every online CPU. With
+.BR -p1 ,
+gzippy emits a plain single-member gzip; with
+.B -p>1
+at levels 0\(en5 it emits the "GZ" multi-block format for parallel decode.
+.TP
+.BR -b ", " --blocksize " " \fISIZE\fR
+Parallel block size. Accepts
+.BR K ,
+.BR M ,
+.B G
+suffixes (e.g.\&
+.BR 256k ,
+.BR 2m ).
+Default 128K. Minimum 1K.
+.TP
+.BR -i ", " --independent
+Force fully independent blocks even when the compressor could share state
+across them. Slightly larger output; enables parallel decompression and
+random access on pure stdin streams.
+.TP
+.BR -R ", " --rsyncable
+Insert periodic sync points so small source changes produce small rsync deltas.
+Costs about 1% ratio.
+.TP
+.BR -Y ", " --synchronous
+.BR fsync (2)
+the output after closing. Slower; survives power loss.
+.
+.SS Metadata
+.TP
+.BR -N ", " --name
+Save original filename and mtime in the gzip header, and restore them on
+decompression. This is the default.
+.TP
+.BR -n ", " --no-name
+Do not save or restore the original filename or timestamp.
+.TP
+.BR -M ", " --time
+Save or restore the modification time (pigz-compatible flag).
+.TP
+.BR -m ", " --no-time
+Do not save or restore the modification time.
+.TP
+.BR -S ", " --suffix " " \fISUF\fR
+Use
+.I SUF
+instead of
+.BR .gz .
+.TP
+.BR -C ", " --comment " " \fITEXT\fR
+Attach
+.I TEXT
+as the gzip FCOMMENT field.
+.TP
+.BR -A ", " --alias " " \fIALIAS\fR
+Record
+.I ALIAS
+for decompression. For round-trip tooling.
+.
+.SS Diagnostics
+.TP
+.BR -v ", " --verbose
+Verbose. Repeat for more (\c
+.BR -vv ).
+Shows per-file compression ratio, throughput, and chosen route.
+.TP
+.BR -q ", " --quiet ", " --silent
+Suppress warnings.
+.TP
+.BR -V ", " --version
+Print version and exit.
+.TP
+.BR -L ", " --license
+Print license and exit.
+.TP
+.BR -h ", " --help
+Print brief help and exit.
+.
+.SH ROUTING
+gzippy picks its encoder and decoder from the input, the flags, and the
+platform. You can see the decision at run time with
+.BR "GZIPPY_DEBUG=1" .
+.PP
+.nf
+\fBCompression\fR
+  -p1, -0 to -3, x86_64 with ISA-L .... ISA-L
+  -p>1,  -6 to -9 ....................... pipelined encoder, single-member
+  -p>1,  -0 to -5 ....................... parallel encoder, \(dqGZ\(dq multi-block
+  -p1, all other levels ................. flate2 single-threaded
+\fBDecompression\fR
+  \(dqGZ\(dq subfield present .................. parallel libdeflate FFI
+  Multi-member, -p1 ..................... sequential libdeflate
+  Multi-member, -p>1 .................... parallel libdeflate FFI
+  Single-member, x86_64 ................. ISA-L streaming inflate
+  Single-member, > 1 GB, no ISA-L ....... zlib-ng streaming
+  Single-member, default ................ libdeflate one-shot
+.fi
+.PP
+This table is reproduced from the
+.I Production Routing
+section of the in-tree development guide; it is the source of truth for
+which function runs your data.
+.
+.SH THE "GZ" FEXTRA SUBFIELD
+Parallel output at levels 0\(en5 carries per-block metadata in an RFC 1952
+FEXTRA subfield:
+.PP
+.nf
+    +----+----+----+----+----+----+----+----+
+    | G  | Z  | 04 | 00 | <block_size: u32> |
+    +----+----+----+----+----+----+----+----+
+      ID       SLEN   total size of the member
+                      (header + deflate + trailer),
+                      little-endian
+.fi
+.PP
+gzippy uses this to find block boundaries without inflating. Any
+spec-compliant reader skips unknown FEXTRA subfields and decompresses the
+file normally. See
+.BR gzippy-format (5)
+for the full wire format and a reference C struct.
+.
+.SH ENVIRONMENT
+.TP
+.B GZIP
+Whitespace-separated options prepended to the command line, as in GNU gzip.
+.TP
+.B PIGZ
+Same, for pigz compatibility. Applied after
+.BR GZIP .
+.TP
+.B GZIPPY_DEBUG
+If set to anything, prints routing and timing diagnostics to stderr. The
+simplest way to confirm which path ran your input:
+.IP
+.EX
+GZIPPY_DEBUG=1 gzippy -dc mystery.gz > /dev/null
+.EE
+.TP
+.B GZIPPY_TRACE
+If set, emits a detailed per-phase performance breakdown of the BGZF
+decompression engine. Noisy; turn it on only when you are chasing a
+microsecond.
+.TP
+.B GZIPPY_SPEC_DEBUG
+Diagnostics for the speculative-parallel experimental path. See
+.IR CLAUDE.md
+in the source tree.
+.TP
+.B DEBUG_POS
+Byte offset in the compressed stream to trace during inflate, when built
+with the
+.B debug_decode
+feature.
+.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Any error: invalid argument, I/O failure, bad CRC, truncated input,
+integrity-test failure, or a file that already exists when
+.B -f
+was not given.
+.PP
+A single
+.B gzippy
+invocation processing multiple files continues past a per-file error and
+returns
+.B 1
+if any file failed.
+.
+.SH PERFORMANCE
+Compressing 211 MB of logs on an M4 MacBook Pro with 14 cores:
+.PP
+.TS
+l l l.
+Tool	Speed	Time
+\_	\_	\_
+gzippy, 14 threads	~3000 MB/s	0.07 s
+gzippy, 1 thread	~400 MB/s	0.53 s
+GNU gzip	~360 MB/s	0.58 s
+Apple gzip (NEON)	~315 MB/s	0.67 s
+.TE
+.PP
+Decompression: 300\(en2000 MB/s depending on file type and thread count.
+.PP
+As of February 2026 the in-tree cloud fleet benchmark stands at 47 wins
+and 13 losses against pigz and gzip across levels, sizes, and platforms.
+The remaining losses are in single-member Tmax decompress (a pipelining
+gap), L1 T1 compress vs
+.BR igzip ,
+and one small arm64 L1 Tmax case. See
+.BR gzippy-tuning (7).
+.
+.SH EXAMPLES
+Compress a directory as a tarball at the best ratio:
+.PP
+.EX
+tar c big-dir | gzippy -9 > big-dir.tgz
+.EE
+.PP
+Grep through a compressed log without decompressing to disk:
+.PP
+.EX
+gzippy -dc /var/log/prod-2026-04-22.gz | grep -i error
+.EE
+.PP
+Recompress every log older than 30 days, in place, keeping originals until
+you are sure it worked:
+.PP
+.EX
+find /var/log -name '*.log' -mtime +30 -print0 \\
+    | xargs -0 gzippy -k -9
+.EE
+.PP
+Make a rsync-friendly backup with four threads:
+.PP
+.EX
+gzippy -p4 -R backup.sql
+.EE
+.PP
+Ask what path gzippy took for a mystery file:
+.PP
+.EX
+GZIPPY_DEBUG=1 gzippy -dc mystery.gz > /dev/null
+.EE
+.PP
+Replace the system gzip with gzippy (your system, your call):
+.PP
+.EX
+sudo ln -sf "$(which gzippy)" /usr/local/bin/gzip
+sudo ln -sf "$(which gzippy)" /usr/local/bin/gunzip
+.EE
+.PP
+Squeeze every bit out of something you are going to ship once:
+.PP
+.EX
+gzippy --max precious.tar
+.EE
+.PP
+List every
+.BR .gz
+in the current directory:
+.PP
+.EX
+gzippy -l *.gz
+.EE
+.PP
+Stream through a pipe without ever touching the disk:
+.PP
+.EX
+pg_dump mydb | gzippy -6 | aws s3 cp - s3://bucket/dump.gz
+.EE
+.PP
+Render a compression fingerprint of a file (see
+.B ANALYSIS
+below):
+.PP
+.EX
+gzippy --analyze file.gz
+gzippy --analyze --full bigfile.log
+cat mystery.bin | gzippy --analyze -
+.EE
+.
+.SH DIAGNOSTICS
+Verbose output for a compression looks like this:
+.PP
+.EX
+file.txt: 12.4% -- replaced with file.txt.gz (14 threads, 2.8 GB/s)
+.EE
+.PP
+Fields: percent reduction from input size, replacement path, thread count
+used, observed throughput.
+.PP
+.B -t
+prints
+.I FILE: OK
+on success and the error reason on failure. Exit status is
+.B 0
+or
+.B 1
+respectively.
+.PP
+.B -l
+output matches
+.BR gzip (1)
+column layout: compressed, uncompressed, ratio, stored filename. In verbose
+mode it adds method, CRC32, and mtime. Ratios are clamped to
+.BR \(+-99.9% .
+.
+.SH COMPATIBILITY
+gzippy writes standard gzip. Files it produces decompress with every known
+gzip, and gzippy decompresses every standard gzip file. It understands:
+.IP \(bu 2
+Multi-member streams, concatenated gzips.
+.IP \(bu 2
+BGZF (the bioinformatics block format).
+.IP \(bu 2
+Zopfli-compressed streams (decode only; compression is
+.B --ultra
+or
+.BR --max ).
+.IP \(bu 2
+pigz's output.
+.PP
+The
+.B "\(dqGZ\(dq"
+FEXTRA subfield is a gzippy extension. Readers that do not parse it decode
+the file normally \(em the subfield is in the optional FEXTRA area, which
+RFC 1952 requires decoders to skip on unknown IDs.
+.PP
+.B Not supported:
+encrypted gzip, gzip over non-seekable tape without
+.BR -i ,
+the legacy
+.B .z
+(pack) format, the legacy LZW
+.B .Z
+format (use
+.BR uncompress (1)),
+or the Windows
+.B gzexe
+self-extractor shell wrapper.
+.
+.SH ANALYSIS
+.SS --analyze [\fIFILE\fR] [--full]
+Render an ANSI-coloured compression fingerprint of
+.I FILE
+(or stdin) that also teaches you how to read it. If the input is gzipped,
+gzippy decompresses it first so the visualization depicts the raw data
+deflate actually saw.
+.PP
+The output has six layers, top to bottom:
+.TP
+.B stat card
+Shannon entropy (bits/byte, 0\(en8) and LZ77 coverage (percent of bytes
+inside a back-reference of length \(>=3), each shown as a labelled
+progress bar with a qualitative tag (\fBLOW\fR, \fBHIGH\fR,
+\fBEXTREME\fR, \fBMAX\fR, ...) and a plain-English hint. A third row
+lists the number of matches, their average length, and their average
+back-distance. A fourth row projects an expected gzip ratio from the
+coverage \(em or, if the input was gzip, reports the observed ratio.
+.TP
+.B canvas
+An 80\(mu20 grid (or the full terminal with
+.BR --full )
+with a left-side byte-offset ruler. Each cell's foreground colour is a
+monotonic blue\(->cyan\(->green\(->yellow\(->red rainbow of the mean byte
+value in that region \(em so similar colours mean similar byte values.
+Each cell's glyph density
+.RB ( "\ ·░▒▓█" )
+is the fraction of bytes in that region inside an LZ77 match of length
+\(>=3. Greedy matching, 32 KiB window, byte-verified \(em the same
+decisions deflate's fast path makes.
+.TP
+.B colour legend
+A horizontal byte-value gradient from 0x00 to 0xFF, tick-labelled and
+annotated (\fIzeros\fR, \fIASCII\fR, \fItext\fR, \fIhi-bit\fR) so you can
+read the canvas without guessing.
+.TP
+.B match-length histogram
+Seven buckets from
+.IR "3\(en4 B" " ("
+literal repeats\^) through
+.IR "129\(en258 B" " ("
+deflate's hard cap\^), each with a percentage bar and a one-line hint at
+what kind of content lives in that bucket.
+.TP
+.B back-reference-distance histogram
+Five buckets from
+.IR "1\(en8 B" " (tight loops)"
+to
+.IR "4\(en32 KB" " (long-range reuse)",
+each with the same percentage bar and hint. Together the two histograms
+tell you whether the file reuses short phrases locally or long phrases
+globally \(em i.e.\&, whether LZ77 or Huffman coding will do the heavy
+lifting.
+.TP
+.B fingerprint reading
+Three short interpretation lines \(em
+.BR shape ,
+.BR reach ,
+.B peak
+\(em that turn the numbers into a sentence a human can quote.
+.PP
+Requires a 256-colour terminal. The output is safe to pipe into
+.BR less (1)
+with
+.BR -R .
+Redirecting to a file writes terminal escape sequences.
+.PP
+.B --analyze
+does not touch any file on disk. It always exits 0 unless the input is
+unreadable or empty.
+.
+.SH HISTORY
+.B gzippy
+was born in 2026 with one job: be faster than every other gzip. It is
+named for the sound of a thing going fast past your ear. It stands on
+.BR pigz (1)
+by Mark Adler, libdeflate by Eric Biggers, zlib-ng, and Intel's ISA-L.
+.
+.SH SEE ALSO
+.BR gzippy-format (5),
+.BR gzippy-tuning (7),
+.BR gzip (1),
+.BR gunzip (1),
+.BR pigz (1),
+.BR zcat (1),
+.BR xz (1),
+.BR zstd (1)
+.
+.SH BUGS
+Report bugs at <https://github.com/jackdanger/gzippy/issues>.
+.
+.SH AUTHOR
+Jack Danger Canty.

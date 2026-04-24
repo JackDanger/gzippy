@@ -1,0 +1,211 @@
+.\" gzippy-tuning(7) — how to pick threads, blocks, and levels.
+.TH GZIPPY-TUNING 7 2026-04-24 "gzippy 0.1.7" "Miscellaneous"
+.
+.SH NAME
+gzippy-tuning \- how to pick threads, block size, and compression level
+.
+.SH DESCRIPTION
+This page is a tutorial for getting the most out of
+.BR gzippy (1).
+Read it once; the rules fit in a napkin.
+.
+.SH THE THREE KNOBS
+gzippy has three knobs that matter for performance:
+.TP
+.B -p
+Number of threads. Defaults to every online CPU.
+.TP
+.B -b
+Block size for parallel work. Defaults to 128K.
+.TP
+.B -1 " \(em " --max
+Compression level. Defaults to
+.BR -6 .
+.PP
+Everything else is plumbing. If you want a single rule:
+.IP
+.EX
+gzippy -9 file
+.EE
+.PP
+will make most people happy most of the time.
+.
+.SH PICK A LEVEL
+.TS
+l l l.
+Level	Speed	Use when
+\_	\_	\_
+-0	infinite	Input is already compressed (video, JPEG, encrypted)
+-1	fastest	Log rotation, ephemeral data, a tight loop
+-6	fast	The default. Covers 90% of real use
+-9	slower	You are storing this for a while
+--ultra (11)	much slower	Archive you will ship once, read often
+--max (12)	slowest	You want zopfli but can't wait hours
+-H	fastest	Huffman only; last-resort when LZ77 finds nothing
+.TE
+.PP
+The ratio gain from
+.B -6
+to
+.B -9
+on real text is 3\(en5%. The time cost is 2\(en3x. The gain from
+.B -9
+to
+.BR --max
+is another 3\(en5%, at 10\(en30x the time. Decide if those bytes are worth it.
+.
+.SH PICK A THREAD COUNT
+Default is fine. If you want the detail:
+.IP \(bu 2
+gzippy is embarrassingly parallel on input larger than one block. Throughput
+scales linearly with cores until memory bandwidth saturates (typically
+12\(en16 cores on a modern laptop).
+.IP \(bu 2
+At
+.B -p1
+gzippy emits plain single-member gzip. No "GZ" subfield, no block framing.
+Useful if you need output that is byte-identical to pigz
+.BR -p1 .
+.IP \(bu 2
+On small input (under one block), extra threads are overhead. gzippy detects
+this and collapses to a single-threaded path.
+.IP \(bu 2
+On bandwidth-limited hardware (Raspberry Pi, cheap VPS), fewer threads may
+be faster. Measure.
+.
+.SH PICK A BLOCK SIZE
+Default (128K) is tuned for pigz compatibility and memory locality. Reasons
+to change it:
+.TP
+.B Bigger blocks (256K\(en1M)
+Slightly better ratio because the deflate matcher has more context per
+block. Slightly higher per-block latency. Use
+.B -b 1m
+when you have huge input, fast disks, and you care more about size than
+latency.
+.TP
+.B Smaller blocks (32K, 64K)
+Faster response to slow input, more parallelism on short files. Worse
+ratio. Rarely useful unless you are piping from a slow producer.
+.TP
+.B --independent ( -i )
+Forces no cross-block state. Makes every block an independent gzip member.
+Adds 0.5\(en1% to output size. Unlocks parallel decompression for pure stdin
+streams where the compressor can't seek.
+.PP
+If you are not sure, leave it at 128K.
+.
+.SH BACKENDS AND WHAT RUNS WHERE
+gzippy has four compression backends and five decompression backends. You
+do not pick them \(em gzippy picks for you. You can see the choice with
+.BR "GZIPPY_DEBUG=1" .
+.PP
+.TS
+l l l.
+Backend	When	Notes
+\_	\_	\_
+libdeflate	L1\(en6, parallel	30\(en50% faster than zlib
+zlib-ng	L7\(en9	SIMD-optimized, gzip-ng compatible
+ISA-L	L0\(en3, x86_64	Intel's SIMD assembly, fastest at low levels
+libdeflate high	L10\(en12	Near-zopfli at tractable speed
+.TE
+.PP
+Decompression:
+.TS
+l l.
+When	Path
+\_	\_
+"GZ" subfield	Parallel libdeflate (Tmax)
+Multi-member, -p1	Sequential libdeflate, member-by-member
+Multi-member, -p>1	Parallel libdeflate (Tmax)
+Single-member, x86_64	ISA-L streaming inflate
+Single-member, > 1 GB	zlib-ng streaming
+Single-member, default	libdeflate one-shot
+.TE
+.
+.SH SCORE CARD
+As of February 2026 the in-tree cloud fleet benchmark stands at
+.B "47 wins / 13 losses"
+against pigz and gzip across levels, sizes, and platforms. The honest
+breakdown of the losses:
+.PP
+.TS
+l l l.
+Category	Losses	Gap
+\_	\_	\_
+T1 decompress near-parity	2	<2%, noise
+Tmax single-member parallel	8	\-23% to \-40%
+L1 T1 compress vs igzip	2	\-63% to \-74%
+arm64 L1 Tmax compress	1	\-3.3%
+.TE
+.PP
+The Tmax single-member gap is a pipeline architecture limit, not a bug.
+Fixing it requires speculative parallel decode, which is live work (see
+the
+.B parallel_single_member
+experiment in the source tree). The L1 T1 vs igzip gap is AVX-512
+hand-assembly territory; gzippy's own ISA-L path is a couple of generations
+behind.
+.PP
+Translation: on everything you are likely to throw at it, gzippy is the
+fastest. On a narrow slice of single-member Tmax decode, pigz is still
+ahead.
+.
+.SH COMMON RECIPES
+.SS Log rotation
+.EX
+gzippy -1 -f /var/log/*.log
+.EE
+.PP
+Fast level, force (logs get rewritten), no thread limit.
+.SS Backup an entire directory tree
+.EX
+tar c my-dir | gzippy -9 -p$(nproc) > my-dir.tgz
+.EE
+.PP
+Best ratio, every core.
+.SS Ship a release tarball
+.EX
+tar c release | gzippy --max > release.tar.gz
+.EE
+.PP
+Smallest output. Readers do not need anything special.
+.SS Stream to S3
+.EX
+pg_dump mydb | gzippy -6 | aws s3 cp - s3://bucket/dump.gz
+.EE
+.PP
+Default level, no disk. Use
+.B -p1
+if you want single-member output for downstream tools that do not cope with
+multi-member streams (rare in 2026, but it happens).
+.SS Inspect a mystery gzip
+.EX
+GZIPPY_DEBUG=1 gzippy -dc mystery.gz > /dev/null
+gzippy -l mystery.gz
+gzippy -t mystery.gz
+.EE
+.PP
+Debug env prints the decode path. List shows sizes and the original
+filename if the header stored it. Test verifies CRC.
+.
+.SH WHEN TO NOT USE GZIPPY
+gzippy is gzip. If you care about ratio above all else, use
+.BR xz (1)
+or
+.BR zstd (1)
+at level 19+. If you care about latency on a single CPU, use
+.BR zstd (1)
+at level 1 \(em it is still 2\(en3x faster than any gzip. Gzip exists for
+ecosystem compatibility; gzippy exists to make that compatibility cheap.
+.
+.SH SEE ALSO
+.BR gzippy (1),
+.BR gzippy-format (5),
+.BR gzip (1),
+.BR pigz (1),
+.BR xz (1),
+.BR zstd (1)
+.
+.SH AUTHOR
+Jack Danger Canty.

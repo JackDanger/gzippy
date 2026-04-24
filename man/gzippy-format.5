@@ -1,0 +1,140 @@
+.\" gzippy-format(5) — the "GZ" FEXTRA subfield wire format.
+.TH GZIPPY-FORMAT 5 2026-04-24 "gzippy 0.1.7" "File Formats"
+.
+.SH NAME
+gzippy-format \- the \(dqGZ\(dq FEXTRA subfield used by gzippy
+.
+.SH SYNOPSIS
+.I any-valid-gzip-file
+with an FEXTRA subfield whose two-byte ID equals
+.BR "GZ" .
+.
+.SH DESCRIPTION
+gzippy-format is not a separate file format. It is a convention layered on
+top of RFC 1952 gzip. A gzippy file is a sequence of one or more gzip
+members. Each parallel block is one member. Each member carries an FEXTRA
+subfield that records the total size of the member.
+.PP
+Standard gzip readers ignore unknown FEXTRA subfields (RFC 1952 \(sc 2.3.1.1)
+and decode the file normally. gzippy uses the subfield to find block
+boundaries in the compressed stream without inflating, which is what makes
+parallel decompression safe and cheap.
+.
+.SH LAYOUT
+Each member begins with the standard gzip header. The subfield sits inside
+the FEXTRA area, which is selected by setting bit 2 (0x04) in the FLG byte.
+.PP
+.nf
+    Offset  Size  Field         Value
+    ------  ----  -----         -----
+      0     2     ID1 ID2       0x1f 0x8b
+      2     1     CM            0x08        (deflate)
+      3     1     FLG           FEXTRA=0x04, optionally |FNAME|FCOMMENT
+      4     4     MTIME         u32 LE, unix seconds
+      8     1     XFL           0x00
+      9     1     OS            0xff        (unknown)
+     10     2     XLEN          0x08 0x00   (8 bytes of FEXTRA data)
+     12     2     SI1 SI2       'G' 'Z'     subfield identifier
+     14     2     SLEN          0x04 0x00   (4 bytes of subfield data)
+     16     4     BLOCK_SIZE    u32 LE, total member size
+     20     ...   FNAME?        NUL-terminated, if FNAME flag set
+      ...   ...   FCOMMENT?     NUL-terminated, if FCOMMENT flag set
+      ...   ...   deflate data
+      ...   4     CRC32         u32 LE of uncompressed data
+      ...   4     ISIZE         u32 LE, uncompressed size mod 2^32
+.fi
+.PP
+BLOCK_SIZE is the length in bytes of the entire gzip member \(em from
+the magic number through the ISIZE trailer. A reader that has just finished
+member
+.I M
+can skip to byte
+.RI offset( M )\ +\ BLOCK_SIZE
+to find the next member, without looking at the deflate stream at all.
+.
+.SH WHY NOT BGZF
+BGZF (the bioinformatics block gzip format) uses the same FEXTRA trick with
+the identifier
+.BR "BC" .
+gzippy does not emit BGZF for two reasons:
+.IP \(bu 2
+BGZF caps block size at 64 KiB. gzippy uses blocks up to 512 KiB for higher
+throughput on low-redundancy data.
+.IP \(bu 2
+BGZF encodes block size as "this member minus one." gzippy encodes plain
+block size, which is simpler and lets the u32 field address the full 4 GiB
+range.
+.PP
+gzippy decompresses BGZF files correctly; see
+.BR gzippy (1).
+.
+.SH REFERENCE STRUCT
+A reader in C can locate the BLOCK_SIZE in 16 bytes of parsing:
+.PP
+.EX
+struct gzippy_header {
+    uint8_t  id1, id2;       /* 0x1f 0x8b                         */
+    uint8_t  cm;             /* 8 = deflate                       */
+    uint8_t  flg;            /* bit 2 (0x04) must be set          */
+    uint32_t mtime;          /* little-endian                     */
+    uint8_t  xfl;
+    uint8_t  os;
+    uint16_t xlen;           /* 8 for a bare "GZ" subfield        */
+    uint8_t  si1, si2;       /* 'G' 'Z'                           */
+    uint16_t slen;           /* 4                                 */
+    uint32_t block_size;     /* little-endian, total member size  */
+} __attribute__((packed));
+.EE
+.PP
+If the file carries FNAME or FCOMMENT, they follow FEXTRA in the order
+specified by RFC 1952 \(sc 2.3.1 and push the deflate stream further into
+the member. BLOCK_SIZE accounts for them.
+.
+.SH VALIDITY
+A gzippy file is valid gzip iff every member is valid gzip. gzippy itself
+verifies on decompression:
+.IP \(bu 2
+The magic number on every member.
+.IP \(bu 2
+The XLEN and SLEN framing around the "GZ" subfield when present.
+.IP \(bu 2
+CRC32 and ISIZE on every member.
+.PP
+If any check fails, gzippy aborts with a non-zero exit status and an error
+written to stderr. It does not attempt recovery; use
+.BR gzip (1)
+or a forensic tool to salvage a truncated stream.
+.
+.SH ENDIANNESS
+All multi-byte integers in the header and in the "GZ" subfield are
+little-endian, as required by RFC 1952.
+.
+.SH COMPATIBILITY
+Every compliant gzip decompressor reads gzippy output. Verified against:
+.IP \(bu 2
+GNU gzip 1.10, 1.12, 1.13.
+.IP \(bu 2
+Apple gzip (macOS 14, 15).
+.IP \(bu 2
+pigz 2.6, 2.7, 2.8.
+.IP \(bu 2
+Go
+.IR compress/gzip ,
+Python
+.IR gzip ,
+Node.js
+.IR zlib ,
+libdeflate 1.19.
+.PP
+If a reader chokes on gzippy output, the bug is in the reader. Report it
+upstream; gzippy emits only valid RFC 1952.
+.
+.SH SEE ALSO
+.BR gzippy (1),
+.BR gzippy-tuning (7),
+.BR gzip (1),
+RFC 1952 (GZIP file format specification version 4.3),
+RFC 1950 (ZLIB).
+.
+.SH AUTHOR
+Jack Danger Canty.

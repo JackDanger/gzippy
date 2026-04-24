@@ -36,6 +36,8 @@ pub struct GzippyArgs {
     pub synchronous: bool,
     pub best: bool,
     pub fast: bool,
+    pub analyze: bool,
+    pub analyze_full: bool,
 }
 
 impl Default for GzippyArgs {
@@ -73,6 +75,8 @@ impl Default for GzippyArgs {
             synchronous: false,
             best: false,
             fast: false,
+            analyze: false,
+            analyze_full: false,
         }
     }
 }
@@ -188,6 +192,8 @@ impl GzippyArgs {
                     "--max" => {
                         args.compression_level = 12;
                     }
+                    "--analyze" => args.analyze = true,
+                    "--full" => args.analyze_full = true,
                     _ => {
                         // Handle options with values
                         if let Some(value) = arg.strip_prefix("--level=") {

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 // ── Core infrastructure ───────────────────────────────────────────────────────
+mod analyze;
 mod cli;
 mod error;
 mod format;
@@ -112,6 +113,11 @@ fn run() -> Result<i32, GzippyError> {
     if args.license {
         print_license();
         return Ok(0);
+    }
+
+    // --analyze short-circuits the normal compress/decompress flow.
+    if let Some(code) = analyze::maybe_run(&args) {
+        return Ok(code);
     }
 
     // Support gunzip/ungzippy/zcat/gzcat symlinks
