@@ -4,42 +4,6 @@ The fastest gzip on any hardware. Drop-in for `gzip`, `gunzip`, `gzcat`,
 `zcat`, and `ungzippy` — same RFC 1952 output, every decompressor on Earth
 still reads your files.
 
-## How fast?
-
-Measured on the [Silesia compression corpus](http://sun.aei.polsl.pl/~sdeor/index.php?page=silesia)
-(202 MB of mixed text, source code, images, and database dumps), Apple
-M4 Pro with 14 cores, macOS 15. Level 6. Median of 15 runs per tool.
-
-### Compression
-
-| Tool        |    Throughput  |   Time  |
-|-------------|---------------:|--------:|
-| **gzippy**  | **~700 MB/s**  | **0.29 s** |
-| pigz        |    ~150 MB/s   |  1.30 s |
-| Apple gzip  |     ~40 MB/s   |  5.00 s |
-
-### Decompression
-
-| Tool        | Throughput |
-|-------------|-----------:|
-| **gzippy**  | **~930 MB/s** |
-| Apple gzip  |    ~900 MB/s |
-| pigz        |    ~790 MB/s |
-
-Reproduce with [`scripts/readme_benchmark.py`](scripts/readme_benchmark.py)
-after `cargo build --release` and `(cd pigz && make)`.
-
-## One binary, many names
-
-```
-gzip    gunzip    gzcat    zcat    ungzippy    gzippy
-```
-
-All six commands are the same Rust binary. `gunzip file.gz` and
-`gzippy -d file.gz` take identical code paths at identical speed.
-Installers put gzippy ahead of the system gzip in `$PATH`, so the
-takeover is silent — and `/usr/bin/gzip` stays untouched.
-
 ## Install
 
 ```bash
@@ -86,6 +50,42 @@ cd gzippy && cargo build --release
 ```
 
 </details>
+
+## How fast?
+
+Measured on the [Silesia compression corpus](http://sun.aei.polsl.pl/~sdeor/index.php?page=silesia)
+(202 MB of mixed text, source code, images, and database dumps), Apple
+M4 Pro with 14 cores, macOS 15. Level 6. Median of 15 runs per tool.
+
+### Compression
+
+| Tool        |    Throughput  |   Time  |
+|-------------|---------------:|--------:|
+| **gzippy**  | **~700 MB/s**  | **0.29 s** |
+| pigz        |    ~150 MB/s   |  1.30 s |
+| Apple gzip  |     ~40 MB/s   |  5.00 s |
+
+### Decompression
+
+| Tool        | Throughput |
+|-------------|-----------:|
+| **gzippy**  | **~930 MB/s** |
+| Apple gzip  |    ~900 MB/s |
+| pigz        |    ~790 MB/s |
+
+Reproduce with [`scripts/readme_benchmark.py`](scripts/readme_benchmark.py)
+after `cargo build --release` and `(cd pigz && make)`.
+
+## One binary, many names
+
+```
+gzip    gunzip    gzcat    zcat    ungzippy    gzippy
+```
+
+All six commands are the same Rust binary. `gunzip file.gz` and
+`gzippy -d file.gz` take identical code paths at identical speed.
+Installers put gzippy ahead of the system gzip in `$PATH`, so the
+takeover is silent — and `/usr/bin/gzip` stays untouched.
 
 ## Beyond gzip
 
