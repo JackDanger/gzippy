@@ -89,6 +89,17 @@ install_apt() {
     sudo apt-get install -y gzippy
 }
 
+install_arch() {
+    if command -v yay &>/dev/null; then
+        yay -S --noconfirm gzippy-bin
+    elif command -v paru &>/dev/null; then
+        paru -S --noconfirm gzippy-bin
+    else
+        die "No AUR helper found. Install yay or paru, then: yay -S gzippy-bin
+Or see: https://aur.archlinux.org/packages/gzippy-bin"
+    fi
+}
+
 install_linux_binary() {
     local target
     case $(uname -m) in
@@ -128,6 +139,9 @@ install_linux_binary() {
 OS=$(uname -s)
 if [ "$OS" = "Darwin" ]; then
     install_macos
+elif [ -f /etc/arch-release ] \
+     || grep -qi "arch linux" /etc/os-release 2>/dev/null; then
+    install_arch
 elif [ -f /etc/debian_version ] \
      || grep -qi "debian\|ubuntu" /etc/os-release 2>/dev/null; then
     install_apt
