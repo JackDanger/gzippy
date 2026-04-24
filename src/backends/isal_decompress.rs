@@ -477,14 +477,13 @@ mod tests {
             data.extend_from_slice(format!("Line {}: some test data for scan\n", i).as_bytes());
         }
 
-        // Write in 512KB chunks with sync flushes to force multiple deflate block boundaries.
-        // A single finish() produces one block with no intermediate ISAL_BLOCK_NEW_HDR → no checkpoints.
+        // Use level-0 (stored) so deflate emits TYPE0 blocks every 65535 bytes.
+        // Compressed blocks with Z_SYNC_FLUSH may not surface ISAL_BLOCK_NEW_HDR
+        // between isal_inflate() calls because ISA-L reads the next header in the
+        // same call. Stored blocks guarantee block boundaries ISA-L reports.
         let mut encoder =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-        for chunk in data.chunks(512 * 1024) {
-            std::io::Write::write_all(&mut encoder, chunk).unwrap();
-            std::io::Write::flush(&mut encoder).unwrap();
-        }
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::none());
+        std::io::Write::write_all(&mut encoder, &data).unwrap();
         let compressed = encoder.finish().unwrap();
 
         let result = scan_deflate_isal(&compressed, 256 * 1024, data.len())
