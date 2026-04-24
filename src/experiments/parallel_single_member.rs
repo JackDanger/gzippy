@@ -417,7 +417,29 @@ fn confirm_resolve_write<W: Write>(
                 );
             }
 
-            append_chunk_to_buffer(&chunk.data, chunk.marker_count, &mut buffer, &mut window)?;
+            // Fast path: ISA-L re-decode using the confirmed window + inflatePrime.
+            // This avoids the slow marker resolution for confirmed chunks.
+            let isal_ok = if crate::backends::isal_decompress::is_available() {
+                if let Some(decoded) = crate::backends::isal_decompress::decompress_deflate_from_bit(
+                    deflate_data,
+                    chunk.start_bit,
+                    &window,
+                    chunk.data.len(),
+                ) {
+                    update_window(&mut window, &decoded);
+                    buffer.extend_from_slice(&decoded);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !isal_ok {
+                append_chunk_to_buffer(&chunk.data, chunk.marker_count, &mut buffer, &mut window)?;
+            }
+
             confirmed_bit = chunk.end_bit;
         } else {
             // Sequential decode, checking for spec matches at every block boundary.

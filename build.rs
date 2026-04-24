@@ -18,8 +18,9 @@ fn install_git_hooks() {
     let hook_src = std::path::Path::new("scripts/pre-commit");
     let hook_dst = std::path::Path::new(".git/hooks/pre-commit");
 
-    if !hook_src.exists() || !std::path::Path::new(".git").exists() {
-        return;
+    let git_path = std::path::Path::new(".git");
+    if !hook_src.exists() || !git_path.exists() || !git_path.is_dir() {
+        return; // skip in git worktrees (.git is a file, not a dir)
     }
 
     // Overwrite if missing or stale (src newer than dst)

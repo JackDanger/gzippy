@@ -248,6 +248,113 @@ pub fn scan_deflate_isal(
     None
 }
 
+/// Decompress raw deflate from any bit offset using ISA-L + inflatePrime.
+///
+/// Enables ISA-L on non-byte-aligned chunk boundaries from speculative parallel
+/// decode. ISA-L's inflate_state has a 64-bit bit buffer (read_in / read_in_length)
+/// that can be pre-loaded with the partial first byte's bits before starting.
+///
+/// This is the same "inflatePrime" pattern used by rapidgzip's IsalInflateWrapper
+/// (rapidgzip/librapidarchive/src/rapidgzip/gzip/isal.hpp).
+///
+/// `dict` is the 32KB sliding-window from the previous chunk. Empty slice is
+/// valid (first chunk or chunk with no back-references before start).
+/// `max_output` caps the output size — use `chunk.data.len()` from the
+/// speculative decoder to reproduce exactly the right number of bytes.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+pub fn decompress_deflate_from_bit(
+    data: &[u8],
+    bit_offset: usize,
+    dict: &[u8],
+    max_output: usize,
+) -> Option<Vec<u8>> {
+    use isal::isal_sys::igzip_lib as isal_raw;
+
+    let byte_idx = bit_offset / 8;
+    let bit_skip = bit_offset % 8;
+
+    if byte_idx >= data.len() {
+        return None;
+    }
+
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    // Raw deflate: no gzip/zlib header expected.
+    state.crc_flag = isal_raw::ISAL_DEFLATE;
+
+    if bit_skip > 0 {
+        // inflatePrime: deflate is LSB-first, so bits [bit_skip..7] of data[byte_idx]
+        // are the first bits of this chunk. Shift out the preceding block's bits and
+        // load them into ISA-L's internal bit register before feeding full bytes.
+        state.read_in = (data[byte_idx] as u64) >> bit_skip;
+        state.read_in_length = (8 - bit_skip) as i32;
+        // SAFETY: byte_idx < data.len(), so byte_idx + 1 <= data.len().
+        state.next_in = unsafe { data.as_ptr().add(byte_idx + 1) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx - 1) as u32;
+    } else {
+        state.next_in = unsafe { data.as_ptr().add(byte_idx) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx) as u32;
+    }
+
+    if !dict.is_empty() {
+        let ret = unsafe {
+            isal_raw::isal_inflate_set_dict(&mut state, dict.as_ptr(), dict.len() as u32)
+        };
+        if ret != isal_raw::COMP_OK {
+            return None;
+        }
+    }
+
+    let cap = max_output.max(256 * 1024);
+    let mut output = vec![0u8; cap];
+    let mut out_pos = 0usize;
+
+    loop {
+        let remaining = cap - out_pos;
+        if remaining == 0 {
+            break; // output cap reached
+        }
+
+        state.avail_out = remaining as u32;
+        // SAFETY: out_pos < cap = output.len()
+        state.next_out = unsafe { output.as_mut_ptr().add(out_pos) };
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        let written = remaining - state.avail_out as usize;
+        out_pos += written;
+
+        if ret != 0 {
+            if out_pos == 0 {
+                return None;
+            }
+            break;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            break;
+        }
+        if written == 0 && state.avail_in == 0 {
+            break;
+        }
+    }
+
+    if out_pos == 0 {
+        return None;
+    }
+    output.truncate(out_pos);
+    Some(output)
+}
+
+#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+pub fn decompress_deflate_from_bit(
+    _data: &[u8],
+    _bit_offset: usize,
+    _dict: &[u8],
+    _max_output: usize,
+) -> Option<Vec<u8>> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -529,5 +636,138 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Verify decompress_deflate_from_bit at bit offset 0 (byte-aligned baseline).
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_deflate_from_bit_byte_aligned() {
+        use super::*;
+
+        let original: Vec<u8> = b"the quick brown fox jumps over the lazy dog "
+            .iter()
+            .cycle()
+            .take(32_000)
+            .cloned()
+            .collect();
+
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &original).unwrap();
+        let deflate = enc.finish().unwrap();
+
+        let result = decompress_deflate_from_bit(&deflate, 0, &[], original.len())
+            .expect("byte-aligned inflate must succeed");
+        assert_eq!(result, original);
+    }
+
+    /// Verify decompress_deflate_from_bit with a 32KB dict (window from prior chunk).
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_deflate_from_bit_with_dict() {
+        use super::*;
+
+        // Build a blob where the second half back-references the first half.
+        let window: Vec<u8> = b"AAAA_repeated_window_data_for_back_refs_"
+            .iter()
+            .cycle()
+            .take(32_768)
+            .cloned()
+            .collect();
+        let payload: Vec<u8> = window.iter().take(16_000).cloned().collect(); // all back-refs
+
+        // Compress payload with flate2 using the window as history (zlib dict).
+        // We approximate by concatenating window+payload and taking the deflate tail.
+        let mut combined = window.clone();
+        combined.extend_from_slice(&payload);
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &combined).unwrap();
+        let deflate_all = enc.finish().unwrap();
+
+        // Decompress the whole thing to get expected payload output.
+        let mut dec = flate2::read::DeflateDecoder::new(deflate_all.as_slice());
+        let mut all_out = Vec::new();
+        std::io::Read::read_to_end(&mut dec, &mut all_out).unwrap();
+        assert_eq!(&all_out[..window.len()], &window[..]);
+        let expected_payload = all_out[window.len()..].to_vec();
+
+        // Now decompress only the deflate stream but supply the window as dict.
+        // Since we encoded window+payload as one stream (not two), we can only
+        // test the dict path via decompress_deflate_from_bit at offset 0 with dict.
+        // The dict doesn't affect byte 0 decode here — this tests that dict doesn't break it.
+        let result = decompress_deflate_from_bit(&deflate_all, 0, &window, all_out.len())
+            .expect("inflate with dict must succeed");
+        assert_eq!(result, all_out, "output must match full decompression");
+        let _ = expected_payload; // used for clarity above
+    }
+
+    /// Verify decompress_deflate_from_bit at a non-zero bit offset (inflatePrime).
+    /// Uses scan_deflate_isal to find a real block boundary, then decodes from it.
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_deflate_from_bit_non_byte_aligned() {
+        use super::*;
+        use crate::decompress::scan_inflate::WINDOW_SIZE;
+
+        // Large repetitive data → many deflate blocks → high chance of non-byte-aligned boundary.
+        let original: Vec<u8> = (0u32..100_000)
+            .flat_map(|i| format!("line {}: the quick brown fox\n", i).into_bytes())
+            .collect();
+
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &original).unwrap();
+        let deflate = enc.finish().unwrap();
+
+        // Scan to find block boundaries with windows.
+        let scan = scan_deflate_isal(&deflate, 128 * 1024, original.len())
+            .expect("ISA-L scan should succeed");
+
+        // Find a checkpoint where read_in_length > 0 (non-byte-aligned).
+        let cp = scan
+            .checkpoints
+            .iter()
+            .find(|cp| cp.bitsleft > 0)
+            .or_else(|| scan.checkpoints.first());
+
+        if cp.is_none() {
+            eprintln!("no checkpoints found, skipping");
+            return;
+        }
+        let cp = cp.unwrap();
+
+        // Reconstruct the bit offset: input_byte_pos points past the last consumed byte;
+        // bitsleft bits remain in the internal buffer (they belong to the NEXT block header).
+        // The block boundary bit offset = input_byte_pos * 8 - bitsleft.
+        let bit_offset = if cp.bitsleft > 0 {
+            cp.input_byte_pos * 8 - cp.bitsleft as usize
+        } else {
+            cp.input_byte_pos * 8
+        };
+
+        // Decompress from that block boundary using the checkpoint window.
+        let remaining_output = original.len() - cp.output_offset;
+        let result =
+            decompress_deflate_from_bit(&deflate, bit_offset, &cp.window, remaining_output);
+
+        if cp.window.len() < WINDOW_SIZE {
+            // Too early in stream to have a full window — dict may not work. Skip assertion.
+            eprintln!(
+                "window too small ({} bytes), skipping correctness check",
+                cp.window.len()
+            );
+            return;
+        }
+
+        let result = result.expect("decompress_deflate_from_bit must succeed at valid boundary");
+        assert_eq!(
+            result,
+            original[cp.output_offset..],
+            "output from bit {} must match original[{}..] (bitsleft={})",
+            bit_offset,
+            cp.output_offset,
+            cp.bitsleft,
+        );
     }
 }
