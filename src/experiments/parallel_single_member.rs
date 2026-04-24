@@ -283,42 +283,45 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
 
 /// Validate a candidate bit position by attempting to decode from it.
 ///
-/// Lightweight check: decode 32KB of output. If decoding succeeds and
-/// produces enough output, accept. The block-by-block confirmation phase
-/// catches false positives (spec boundaries that aren't real block boundaries
-/// are simply never matched by the sequential decoder).
+/// On x86_64 with ISA-L: calls `decompress_deflate_from_bit` (~1500 MB/s).
+/// Fallback: MarkerDecoder (~22 MB/s) for non-ISA-L platforms.
 ///
-/// Two checks eliminate the most obvious false positives:
-/// 1. **Output volume**: must produce >=32KB output (or >=4KB near EOF).
-/// 2. **Marker presence**: mid-stream positions MUST have markers.
+/// Accepts if decoding produces >= min_output bytes without error.
+/// The block-by-block confirmation phase catches false positives.
 fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
     let start_byte = bit_offset / 8;
     if start_byte >= deflate_data.len() {
         return false;
     }
-    let relative_start_bit = bit_offset % 8;
     let remaining = deflate_data.len() - start_byte;
+    let min_output = if remaining > 128 * 1024 {
+        32 * 1024
+    } else {
+        4 * 1024
+    };
 
+    // ISA-L fast path: ~1500 MB/s vs MarkerDecoder's ~22 MB/s
+    if crate::backends::isal_decompress::is_available() {
+        return crate::backends::isal_decompress::decompress_deflate_from_bit(
+            deflate_data,
+            bit_offset,
+            &[],
+            min_output,
+        )
+        .is_some_and(|out| out.len() >= min_output);
+    }
+
+    // Fallback: pure-Rust MarkerDecoder
+    let relative_start_bit = bit_offset % 8;
     let slice_len = remaining.min(256 * 1024);
     let data_slice = &deflate_data[start_byte..start_byte + slice_len];
-
     let decode_limit = slice_len.min(64 * 1024);
     let mut decoder = MarkerDecoder::new(data_slice, relative_start_bit);
     match decoder.decode_until(decode_limit) {
         Ok(_) => {
             let output_len = decoder.output().len();
             let marker_count = decoder.marker_count();
-
-            let min_output = if remaining > 128 * 1024 {
-                32 * 1024
-            } else {
-                4 * 1024
-            };
-
-            if output_len < min_output {
-                return false;
-            }
-            if marker_count == 0 {
+            if output_len < min_output || marker_count == 0 {
                 return false;
             }
             true
@@ -496,6 +499,36 @@ fn decode_sequential_to_spec(
     if start_byte >= deflate_data.len() {
         return Ok((Vec::new(), start_bit));
     }
+
+    // ISA-L fast path: ~70x faster than MarkerDecoder for gap regions.
+    // No input limiting — ISA-L decodes until a natural block boundary or the
+    // output cap. Phase 2 advances confirmed_bit to wherever ISA-L stopped,
+    // potentially skipping spec chunks that fall within the decoded range
+    // (correct but loses parallel benefit for those chunks).
+    // On ISA-L failure the deflate data is genuinely bad → propagate the error.
+    if crate::backends::isal_decompress::is_available() {
+        match crate::backends::isal_decompress::decompress_deflate_from_bit_with_end(
+            deflate_data,
+            start_bit,
+            window,
+            max_output,
+        ) {
+            Some((decoded, end_bit)) => {
+                if debug_enabled() {
+                    eprintln!(
+                        "[parallel_sm] sequential ISA-L: {} → {} ({} bytes)",
+                        start_bit,
+                        end_bit,
+                        decoded.len()
+                    );
+                }
+                return Ok((decoded, end_bit));
+            }
+            None => return Err(ParallelError::DecodeFailed),
+        }
+    }
+
+    // Non-ISA-L platforms: pure-Rust MarkerDecoder
     let relative_start = start_bit % 8;
     let data_slice = &deflate_data[start_byte..];
 

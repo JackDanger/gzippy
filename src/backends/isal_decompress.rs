@@ -361,6 +361,114 @@ pub fn decompress_deflate_from_bit(
     None
 }
 
+/// Same as `decompress_deflate_from_bit` but also returns the end bit position.
+///
+/// The end bit is derived from ISA-L's post-decode state:
+///   `end_bit = data.len() * 8 - state.avail_in * 8 - state.read_in_length`
+///
+/// This works for both byte-aligned (bit_skip=0) and non-aligned (bit_skip>0) starts
+/// because the formula accounts for bits pre-loaded into the bit buffer at setup time.
+///
+/// Tip: pass `data` as `&full_data[..until_byte]` to limit ISA-L's input consumption.
+/// The end_bit is still in `full_data` coordinates since both slices share the same layout.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)]
+pub fn decompress_deflate_from_bit_with_end(
+    data: &[u8],
+    bit_offset: usize,
+    dict: &[u8],
+    max_output: usize,
+) -> Option<(Vec<u8>, usize)> {
+    use isal::isal_sys::igzip_lib as isal_raw;
+
+    let byte_idx = bit_offset / 8;
+    let bit_skip = bit_offset % 8;
+
+    if byte_idx >= data.len() {
+        return None;
+    }
+
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::ISAL_DEFLATE;
+
+    if bit_skip > 0 {
+        state.read_in = (data[byte_idx] as u64) >> bit_skip;
+        state.read_in_length = (8 - bit_skip) as i32;
+        state.next_in = unsafe { data.as_ptr().add(byte_idx + 1) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx - 1) as u32;
+    } else {
+        state.next_in = unsafe { data.as_ptr().add(byte_idx) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx) as u32;
+    }
+
+    if !dict.is_empty() {
+        let ret = unsafe {
+            isal_raw::isal_inflate_set_dict(&mut state, dict.as_ptr() as *mut u8, dict.len() as u32)
+        };
+        if ret != 0 {
+            return None;
+        }
+    }
+
+    let cap = max_output.max(256 * 1024);
+    let mut output = vec![0u8; cap];
+    let mut out_pos = 0usize;
+
+    loop {
+        let remaining = cap - out_pos;
+        if remaining == 0 {
+            break;
+        }
+
+        state.avail_out = remaining as u32;
+        state.next_out = unsafe { output.as_mut_ptr().add(out_pos) };
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        let written = remaining - state.avail_out as usize;
+        out_pos += written;
+
+        if ret != 0 {
+            if out_pos == 0 {
+                return None;
+            }
+            break;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            break;
+        }
+        if written == 0 && state.avail_in == 0 {
+            break;
+        }
+    }
+
+    if out_pos == 0 {
+        return None;
+    }
+    output.truncate(out_pos);
+
+    // end_bit formula (valid for both bit_skip=0 and bit_skip>0):
+    //   All bits available = pre_loaded + avail_in_bytes * 8
+    //   Bits remaining     = final_avail_in * 8 + final_read_in_length
+    //   Bits consumed      = available - remaining
+    //   end_bit            = start_bit + bits_consumed = data.len()*8 - final_avail_in*8 - final_read_in_length
+    let end_bit =
+        data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+
+    Some((output, end_bit))
+}
+
+#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+pub fn decompress_deflate_from_bit_with_end(
+    _data: &[u8],
+    _bit_offset: usize,
+    _dict: &[u8],
+    _max_output: usize,
+) -> Option<(Vec<u8>, usize)> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
