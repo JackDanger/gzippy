@@ -1,17 +1,17 @@
 Package: gzippy
-Version: 0.1.5-1
+Version: 0.1.6-1
 Architecture: arm64
 Maintainer: Jack Danger <github@jackdanger.com>
-Installed-Size: 852
+Installed-Size: 854
 Depends: libc6 (>= 2.34), libgcc-s1 (>= 4.2)
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy_0.1.5-1_arm64.deb
-Size: 384156
-SHA256: 78bd290927d4021944256056aa42156e8859a0c8e697ecd6fcc356a5e982a908
-SHA1: e1a368abf7dfc17762c69c70121fa1f8cd9e13ce
-MD5sum: cf2fc612824791bb84bb37855e09e247
+Filename: pool/main/g/gzippy/gzippy_0.1.6-1_arm64.deb
+Size: 384566
+SHA256: 6a95851d2d272f8745b68b7e9e4229a3fb5ffd17fc827a7adc4f21310a9116a0
+SHA1: e9ea3b27a54fd9143f131b61ea32ba04bcd44b15
+MD5sum: 51b7b201736d0a0fdfd89c5c51a630ba
 Description: The fastest parallel gzip
  Gzippy is a high-performance parallel gzip implementation written in Rust.
  It beats gzip and pigz by leveraging multiple CPU cores, SIMD instructions,
@@ -27,30 +27,21 @@ Description: The fastest parallel gzip
 
 Package: gzippy-replace-gzip
 Source: gzippy
-Version: 0.1.5-1
+Version: 0.1.6-1
 Architecture: all
 Maintainer: Jack Danger <github@jackdanger.com>
-Installed-Size: 22
-Depends: gzippy (= 0.1.5-1)
-Conflicts: gzip
-Replaces: gzip
-Provides: gzip
+Installed-Size: 9
+Depends: gzippy (>= 0.1.6-1)
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.1.5-1_all.deb
-Size: 2196
-SHA256: 5110980935e8d1a6b752875d883f5ca1367ce638b4abf4c1215f871773b75d29
-SHA1: 4c9649ae410bf5a9c7ef9d7e10b2019c48364474
-MD5sum: dbd156005f12a289293f0b2669f5d3b6
-Description: Replace system gzip with gzippy (fast parallel gzip)
- This package replaces the system gzip, gunzip, gzcat, and zcat commands
- with gzippy, providing significantly faster compression and decompression.
- .
- When installed, all system gzip operations will use gzippy transparently.
- This is fully compatible with standard gzip - files compressed with gzippy
- can be decompressed by any standard gzip implementation.
- .
- WARNING: This package conflicts with and replaces the gzip package.
- Install only if you want gzippy to handle all gzip operations system-wide.
+Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.1.6-1_all.deb
+Size: 1882
+SHA256: 4ab433c59dbffadf1523df8d720bc91d6a11786051019c1e5f5df03928091b85
+SHA1: d0eca09587f86099087bdc6978b1a2c7c32305a2
+MD5sum: 0cfbff5d81c6f93c87d9aff04521ce64
+Description: Transitional package — gzippy now replaces gzip automatically
+ This is a no-op transitional package. As of gzippy 0.1.6, installing the
+ gzippy package automatically diverts /usr/bin/gzip, /usr/bin/gunzip, and
+ /usr/bin/zcat to gzippy via dpkg-divert. This package can be safely removed.
 
