@@ -11,32 +11,40 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=scripts/pre-commit");
+    println!("cargo:rerun-if-changed=scripts/pre-push");
     install_git_hooks();
 }
 
 fn install_git_hooks() {
-    let hook_src = std::path::Path::new("scripts/pre-commit");
-    let hook_dst = std::path::Path::new(".git/hooks/pre-commit");
+    if !std::path::Path::new(".git").exists() {
+        return;
+    }
+    install_hook("scripts/pre-commit", ".git/hooks/pre-commit");
+    install_hook("scripts/pre-push", ".git/hooks/pre-push");
+}
 
-    if !hook_src.exists() || !std::path::Path::new(".git").exists() {
+fn install_hook(src: &str, dst: &str) {
+    let src = std::path::Path::new(src);
+    let dst = std::path::Path::new(dst);
+
+    if !src.exists() {
         return;
     }
 
-    // Overwrite if missing or stale (src newer than dst)
-    let needs_update = !hook_dst.exists() || {
-        let src_mtime = hook_src.metadata().and_then(|m| m.modified()).ok();
-        let dst_mtime = hook_dst.metadata().and_then(|m| m.modified()).ok();
+    let needs_update = !dst.exists() || {
+        let src_mtime = src.metadata().and_then(|m| m.modified()).ok();
+        let dst_mtime = dst.metadata().and_then(|m| m.modified()).ok();
         src_mtime > dst_mtime
     };
 
     if needs_update {
-        let content = std::fs::read(hook_src).expect("read scripts/pre-commit");
-        std::fs::write(hook_dst, content).expect("write .git/hooks/pre-commit");
+        let content = std::fs::read(src).unwrap_or_else(|_| panic!("read {}", src.display()));
+        std::fs::write(dst, &content).unwrap_or_else(|_| panic!("write {}", dst.display()));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(hook_dst, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod +x .git/hooks/pre-commit");
+            std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755))
+                .unwrap_or_else(|_| panic!("chmod +x {}", dst.display()));
         }
     }
 }

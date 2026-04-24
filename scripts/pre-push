@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Pre-push hook — auto-installed by build.rs on every cargo build.
+# Refuses direct pushes to main. Use a branch and open a PR instead.
+set -euo pipefail
+
+remote="$1"
+url="$2"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    if [[ "$remote_ref" == "refs/heads/main" ]]; then
+        echo ""
+        echo "Direct push to main is not allowed."
+        echo ""
+        echo "Use a branch and open a PR:"
+        echo "  git checkout -b your-branch-name"
+        echo "  git push origin your-branch-name"
+        echo "  gh pr create --fill"
+        echo ""
+        echo "To bypass in an emergency: git push --no-verify"
+        echo ""
+        exit 1
+    fi
+done
+
+exit 0
