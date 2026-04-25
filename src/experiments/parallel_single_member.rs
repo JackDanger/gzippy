@@ -300,9 +300,10 @@ fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
         4 * 1024
     };
 
-    // ISA-L fast path: ~1500 MB/s vs MarkerDecoder's ~22 MB/s
-    if crate::backends::isal_decompress::is_available() {
-        return crate::backends::isal_decompress::decompress_deflate_from_bit(
+    // Fast path: ISA-L (~1500 MB/s) on x86_64, zlib-ng (~600 MB/s) on arm64.
+    // Both are ~30–70× faster than the MarkerDecoder fallback.
+    if crate::backends::inflate_bit::is_available() {
+        return crate::backends::inflate_bit::decompress_deflate_from_bit(
             deflate_data,
             bit_offset,
             &[],
@@ -420,10 +421,10 @@ fn confirm_resolve_write<W: Write>(
                 );
             }
 
-            // Fast path: ISA-L re-decode using the confirmed window + inflatePrime.
-            // This avoids the slow marker resolution for confirmed chunks.
-            let isal_ok = if crate::backends::isal_decompress::is_available() {
-                if let Some(decoded) = crate::backends::isal_decompress::decompress_deflate_from_bit(
+            // Fast path: re-decode using the confirmed window + inflatePrime.
+            // ISA-L on x86_64, zlib-ng on arm64. Avoids slow marker resolution.
+            let isal_ok = if crate::backends::inflate_bit::is_available() {
+                if let Some(decoded) = crate::backends::inflate_bit::decompress_deflate_from_bit(
                     deflate_data,
                     chunk.start_bit,
                     &window,
@@ -500,14 +501,14 @@ fn decode_sequential_to_spec(
         return Ok((Vec::new(), start_bit));
     }
 
-    // ISA-L fast path: ~70x faster than MarkerDecoder for gap regions.
-    // No input limiting — ISA-L decodes until a natural block boundary or the
-    // output cap. Phase 2 advances confirmed_bit to wherever ISA-L stopped,
-    // potentially skipping spec chunks that fall within the decoded range
-    // (correct but loses parallel benefit for those chunks).
-    // On ISA-L failure the deflate data is genuinely bad → propagate the error.
-    if crate::backends::isal_decompress::is_available() {
-        match crate::backends::isal_decompress::decompress_deflate_from_bit_with_end(
+    // Fast path: decode sequential gaps at full inflate speed (no input limiting).
+    // ISA-L (~1500 MB/s) on x86_64, zlib-ng (~600 MB/s) on arm64.
+    // Phase 2 advances confirmed_bit to wherever the decoder stopped, potentially
+    // skipping spec chunks that fall within the decoded range (correct, loses
+    // parallel benefit for those chunks).
+    // On failure, the deflate data is genuinely bad — propagate, no fallback.
+    if crate::backends::inflate_bit::is_available() {
+        match crate::backends::inflate_bit::decompress_deflate_from_bit_with_end(
             deflate_data,
             start_bit,
             window,
@@ -516,7 +517,7 @@ fn decode_sequential_to_spec(
             Some((decoded, end_bit)) => {
                 if debug_enabled() {
                     eprintln!(
-                        "[parallel_sm] sequential ISA-L: {} → {} ({} bytes)",
+                        "[parallel_sm] sequential fast: {} → {} ({} bytes)",
                         start_bit,
                         end_bit,
                         decoded.len()
@@ -528,7 +529,7 @@ fn decode_sequential_to_spec(
         }
     }
 
-    // Non-ISA-L platforms: pure-Rust MarkerDecoder
+    // Pure-Rust MarkerDecoder (fallback when neither ISA-L nor zlib-ng is available)
     let relative_start = start_bit % 8;
     let data_slice = &deflate_data[start_byte..];
 
@@ -1679,11 +1680,12 @@ mod tests {
             crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
-        // Bit 0 is a real boundary but has NO markers (it's the stream start).
-        // try_decode_at should reject it because marker_count == 0.
+        // Bit 0 is a real boundary and should be accepted.
+        // The old MarkerDecoder rejected it due to marker_count==0, but the
+        // inflate_bit backend accepts any position that decodes min_output bytes.
         assert!(
-            !try_decode_at(deflate, 0),
-            "bit 0 should be rejected (no markers at stream start)"
+            try_decode_at(deflate, 0),
+            "bit 0 should be accepted (it IS the stream start)"
         );
     }
 
@@ -3274,10 +3276,11 @@ mod tests {
             crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
-        // Bit 0 should be rejected because it has 0 markers (stream start)
+        // Bit 0 is the actual stream start — inflate_bit accepts it correctly.
+        // The old marker_count==0 heuristic no longer applies.
         assert!(
-            !try_decode_at(deflate, 0),
-            "bit 0 should be rejected (0 markers)"
+            try_decode_at(deflate, 0),
+            "bit 0 should be accepted (real stream start)"
         );
     }
 

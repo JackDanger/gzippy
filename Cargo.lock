@@ -219,6 +219,7 @@ dependencies = [
  "libc",
  "libdeflate-sys",
  "libdeflater",
+ "libz-ng-sys",
  "memchr",
  "memmap2",
  "num_cpus",

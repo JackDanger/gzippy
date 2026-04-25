@@ -352,6 +352,7 @@ pub fn decompress_deflate_from_bit(
 }
 
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[allow(dead_code)]
 pub fn decompress_deflate_from_bit(
     _data: &[u8],
     _bit_offset: usize,
@@ -460,6 +461,7 @@ pub fn decompress_deflate_from_bit_with_end(
 }
 
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[allow(dead_code)]
 pub fn decompress_deflate_from_bit_with_end(
     _data: &[u8],
     _bit_offset: usize,
