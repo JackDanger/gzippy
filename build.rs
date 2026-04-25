@@ -16,8 +16,9 @@ fn main() {
 }
 
 fn install_git_hooks() {
-    if !std::path::Path::new(".git").exists() {
-        return;
+    let git = std::path::Path::new(".git");
+    if !git.is_dir() {
+        return; // missing or a file (git worktree)
     }
     install_hook("scripts/pre-commit", ".git/hooks/pre-commit");
     install_hook("scripts/pre-push", ".git/hooks/pre-push");

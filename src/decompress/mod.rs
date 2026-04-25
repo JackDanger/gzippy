@@ -172,8 +172,33 @@ pub(crate) fn decompress_gzip_to_vec(data: &[u8], num_threads: usize) -> GzippyR
 pub(crate) fn decompress_single_member<W: Write>(
     data: &[u8],
     writer: &mut W,
-    _num_threads: usize,
+    num_threads: usize,
 ) -> GzippyResult<u64> {
+    // Parallel single-member path: speculative block-boundary search + ISA-L
+    // re-decode per confirmed chunk via inflatePrime. x86_64 + ISA-L only.
+    // Arm64: sequential libdeflate (~14,000 MB/s) beats parallel zlib-ng (4 × 600 = 2,400 MB/s).
+    const MIN_PARALLEL_COMPRESSED: usize = 10 * 1024 * 1024;
+    if crate::backends::isal_decompress::is_available()
+        && num_threads > 1
+        && data.len() > MIN_PARALLEL_COMPRESSED
+    {
+        match crate::experiments::parallel_single_member::decompress_parallel(
+            data,
+            writer,
+            num_threads,
+        ) {
+            Ok(n) => {
+                writer.flush()?;
+                return Ok(n);
+            }
+            Err(_) => {
+                if crate::utils::debug_enabled() {
+                    eprintln!("[gzippy] parallel single-member failed, falling back to sequential");
+                }
+            }
+        }
+    }
+
     if crate::backends::isal_decompress::is_available() {
         if let Some(bytes) = crate::backends::isal_decompress::decompress_gzip_stream(data, writer)
         {

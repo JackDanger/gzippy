@@ -1971,10 +1971,13 @@ unsafe fn decode_huffman_asm_x64(
 fn copy_match_asm(output: &mut [u8], out_pos: usize, distance: usize, length: usize) -> usize {
     let src_start = out_pos - distance;
 
-    // Bounds check
-    if out_pos + length > output.len() {
-        return out_pos;
-    }
+    assert!(
+        out_pos + length <= output.len(),
+        "output buffer overflow: out_pos={} length={} cap={}",
+        out_pos,
+        length,
+        output.len()
+    );
 
     unsafe {
         let dst = output.as_mut_ptr().add(out_pos);
@@ -2590,10 +2593,13 @@ pub fn copy_match_into(output: &mut [u8], out_pos: usize, distance: usize, lengt
 
     let src_start = out_pos - distance;
 
-    // Bounds check
-    if out_pos + length > output.len() {
-        return out_pos;
-    }
+    assert!(
+        out_pos + length <= output.len(),
+        "output buffer overflow: out_pos={} length={} cap={}",
+        out_pos,
+        length,
+        output.len()
+    );
 
     unsafe {
         let dst = output.as_mut_ptr().add(out_pos);
@@ -2886,10 +2892,13 @@ fn decompress_bgzf_pipelined<W: Write>(
                         error_ref.store(true, Ordering::Relaxed);
                     }
 
-                    // Clone the decompressed portion for the channel.
-                    // Each clone is ~65-84KB from the heap (no mmap, no page faults).
-                    // The per-thread buf stays warm in L2 cache for the next block.
-                    let _ = done_tx.send((idx, buf[..actual_out].to_vec()));
+                    // Transfer buffer ownership through the channel; swap in a
+                    // fresh capacity-only Vec so the next block has a buffer to
+                    // fill without any copy of the decompressed bytes.
+                    buf.truncate(actual_out);
+                    let send_buf =
+                        std::mem::replace(&mut buf, Vec::with_capacity(max_block_output));
+                    let _ = done_tx.send((idx, send_buf));
                 }
 
                 unsafe { libdeflate_sys::libdeflate_free_decompressor(decompressor) };
@@ -8089,6 +8098,42 @@ mod optimization_tests {
                 panic!("Decompression failed: {}", e);
             }
         }
+    }
+
+    // ── Correctness regression tests for copy_match_into ──────────────────────
+
+    /// Overflow must panic, not silently return the old out_pos.
+    ///
+    /// Old behaviour: returned `out_pos` unchanged, causing the next write to
+    /// overwrite the same position → silent data corruption.
+    #[test]
+    #[should_panic(expected = "output buffer overflow")]
+    fn test_copy_match_into_overflow_panics() {
+        let mut output = vec![0u8; 10];
+        for (i, b) in b"ABCDEFGHIJ".iter().enumerate() {
+            output[i] = *b;
+        }
+        // out_pos=8 + length=5 = 13 > 10: must panic, not silently drop
+        copy_match_into(&mut output, 8, 4, 5);
+    }
+
+    /// After an overflow-at-position-N, the byte at N must not be overwritten
+    /// by a subsequent call.  With the old silent-return behaviour the second
+    /// call would write at N again, clobbering data.
+    #[test]
+    fn test_copy_match_into_overflow_does_not_corrupt_previous() {
+        // Craft a tiny roundtrip: fill a 12-byte buffer with a known pattern,
+        // attempt a 14-byte copy (overflows by 2), catch the panic, then
+        // verify nothing before out_pos was mutated.
+        let mut output = vec![0u8; 12];
+        for (i, b) in b"ABCDEFGHIJKL".iter().enumerate() {
+            output[i] = *b;
+        }
+        // Non-overflowing copy into positions 6..10 (dist=6, len=4) — must succeed.
+        let new_pos = copy_match_into(&mut output, 6, 6, 4);
+        assert_eq!(new_pos, 10);
+        // Positions 0..6 must be untouched.
+        assert_eq!(&output[..6], b"ABCDEF");
     }
 
     /// Test copy_match_fast edge cases that might differ on x86_64

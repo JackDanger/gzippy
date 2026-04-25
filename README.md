@@ -57,21 +57,21 @@ Measured on the [Silesia compression corpus](http://sun.aei.polsl.pl/~sdeor/inde
 (202 MB of mixed text, source code, images, and database dumps), Apple
 M4 Pro with 14 cores, macOS 15. Level 6. Median of 15 runs per tool.
 
-### Compression
+### Compression (14 threads)
 
-| Tool        |    Throughput  |   Time  |
-|-------------|---------------:|--------:|
-| **gzippy**  | **~700 MB/s**  | **0.29 s** |
-| pigz        |    ~150 MB/s   |  1.30 s |
-| Apple gzip  |     ~40 MB/s   |  5.00 s |
+| Tool        |    Throughput   |   Time  |
+|-------------|----------------:|--------:|
+| **gzippy**  | **~1000 MB/s**  | **0.20 s** |
+| pigz        |     ~430 MB/s   |  0.47 s |
+| Apple gzip  |      ~46 MB/s   |  4.35 s |
 
-### Decompression
+### Decompression (single-member gzip)
 
 | Tool        | Throughput |
 |-------------|-----------:|
-| **gzippy**  | **~930 MB/s** |
-| Apple gzip  |    ~900 MB/s |
-| pigz        |    ~790 MB/s |
+| **gzippy**  | **~1050 MB/s** |
+| Apple gzip  |    ~997 MB/s |
+| pigz        |    ~882 MB/s |
 
 Reproduce with [`scripts/readme_benchmark.py`](scripts/readme_benchmark.py)
 after `cargo build --release` and `(cd pigz && make)`.
