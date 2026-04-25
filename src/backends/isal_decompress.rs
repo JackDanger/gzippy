@@ -879,6 +879,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
     fn test_deflate_from_bit_non_byte_aligned() {
         use super::*;
 
