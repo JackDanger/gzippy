@@ -2892,10 +2892,9 @@ fn decompress_bgzf_pipelined<W: Write>(
                         error_ref.store(true, Ordering::Relaxed);
                     }
 
-                    // Transfer ownership of the filled buffer to the writer.
-                    // Swap in a fresh buffer for the next iteration so the thread
-                    // never copies data — the filled bytes move through the channel
-                    // without an extra allocation or memcpy.
+                    // Transfer buffer ownership through the channel; swap in a
+                    // fresh capacity-only Vec so the next block has a buffer to
+                    // fill without any copy of the decompressed bytes.
                     buf.truncate(actual_out);
                     let send_buf =
                         std::mem::replace(&mut buf, Vec::with_capacity(max_block_output));
