@@ -320,7 +320,7 @@ pub fn decompress_deflate_from_bit(
                 window.len() as u32,
             )
         };
-        if ret != isal_raw::COMP_OK {
+        if ret != 0 {
             return None;
         }
     }
