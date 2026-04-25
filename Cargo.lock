@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "gzippy"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -219,6 +219,7 @@ dependencies = [
  "libc",
  "libdeflate-sys",
  "libdeflater",
+ "libz-ng-sys",
  "memchr",
  "memmap2",
  "num_cpus",

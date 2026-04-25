@@ -1,3 +1,14 @@
+gzippy (0.2.0-1) unstable; urgency=medium
+
+  * New: gzippy --analyze FILE prints a compression fingerprint —
+    entropy, LZ77 coverage, match-length and back-reference-distance
+    histograms, and a one-line verdict.
+  * New: man pages ship with the package — gzippy(1), gzippy-format(5),
+    gzippy-tuning(7).
+  * No breaking changes; every existing flag still behaves the same.
+
+ -- Jack Danger <github@jackdanger.com>  Fri, 24 Apr 2026 09:32:02 -0700
+
 gzippy (0.1.0-1) unstable; urgency=medium
 
   * Initial release.

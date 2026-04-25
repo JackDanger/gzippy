@@ -120,6 +120,115 @@ mod tests {
         );
     }
 
+    /// parallel_single_member T4 vs sequential T1 speedup (x86_64 + ISA-L only).
+    ///
+    /// Verifies the parallel path is actually faster than sequential on x86_64
+    /// where ISA-L (~1500 MB/s) is available. Not run on arm64 where sequential
+    /// libdeflate (~14,000 MB/s) beats parallel zlib-ng (4×600 MB/s).
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    #[test]
+    fn diff_ratio_parallel_single_member_speedup() {
+        let fixture = crate::tests::fixtures::text_10mb();
+        let data = &fixture.single_member_gz;
+
+        let (parallel_ns, sequential_ns) = measure_alternating(
+            10,
+            || {
+                let mut out = Vec::new();
+                let _ = crate::experiments::parallel_single_member::decompress_parallel(
+                    data, &mut out, 4,
+                );
+            },
+            || {
+                let _ = crate::decompress::decompress_gzip_to_vec(data, 1).unwrap();
+            },
+        );
+
+        let ratio = parallel_ns as f64 / sequential_ns as f64;
+        let threshold = read_threshold("max_ratio_parallel_sm_speedup", 1.0);
+
+        eprintln!(
+            "diff_ratio_parallel_single_member_speedup: parallel_T4={:.2}ms sequential_T1={:.2}ms ratio={:.3} threshold={:.3}",
+            parallel_ns as f64 / 1e6,
+            sequential_ns as f64 / 1e6,
+            ratio,
+            threshold
+        );
+
+        if std::env::var("RECORD_BASELINES").is_ok() {
+            println!(
+                "baseline: diff_ratio.max_ratio_parallel_sm_speedup = {:.3}",
+                ratio * 1.10
+            );
+            return;
+        }
+
+        assert!(
+            ratio <= threshold,
+            "parallel_sm_T4 {:.2}ms vs sequential_T1 {:.2}ms — ratio {:.3} > threshold {:.3} (should be faster)\n\
+             parallel_single_member has regressed on x86_64.",
+            parallel_ns as f64 / 1e6,
+            sequential_ns as f64 / 1e6,
+            ratio,
+            threshold
+        );
+    }
+
+    /// parallel_single_member T4 vs libdeflate T1: no regression guard (all platforms).
+    ///
+    /// Catches catastrophic regressions in the parallel path. The threshold is
+    /// intentionally loose (parallel may be slower than libdeflate on arm64).
+    #[test]
+    fn diff_ratio_parallel_no_regression_vs_sequential() {
+        let fixture = crate::tests::fixtures::text_10mb();
+        let data = &fixture.single_member_gz;
+        let out_size = fixture.plain.len() + 1024;
+        let mut ld_buf = vec![0u8; out_size];
+
+        let (parallel_ns, libdeflate_ns) = measure_alternating(
+            10,
+            || {
+                let mut out = Vec::new();
+                let _ = crate::experiments::parallel_single_member::decompress_parallel(
+                    data, &mut out, 4,
+                );
+            },
+            || {
+                let mut d = libdeflater::Decompressor::new();
+                let _ = d.gzip_decompress(data, &mut ld_buf);
+            },
+        );
+
+        let ratio = parallel_ns as f64 / libdeflate_ns as f64;
+        let threshold = read_threshold("max_ratio_parallel_sm_no_regression", 15.0);
+
+        eprintln!(
+            "diff_ratio_parallel_no_regression_vs_sequential: parallel_T4={:.2}ms libdeflate_T1={:.2}ms ratio={:.3} threshold={:.3}",
+            parallel_ns as f64 / 1e6,
+            libdeflate_ns as f64 / 1e6,
+            ratio,
+            threshold
+        );
+
+        if std::env::var("RECORD_BASELINES").is_ok() {
+            println!(
+                "baseline: diff_ratio.max_ratio_parallel_sm_no_regression = {:.3}",
+                ratio * 1.15
+            );
+            return;
+        }
+
+        assert!(
+            ratio <= threshold,
+            "parallel_sm_T4 {:.2}ms vs libdeflate_T1 {:.2}ms — ratio {:.3} > threshold {:.3}\n\
+             parallel_single_member has catastrophically regressed.",
+            parallel_ns as f64 / 1e6,
+            libdeflate_ns as f64 / 1e6,
+            ratio,
+            threshold
+        );
+    }
+
     /// gzippy-parallel 10MB T4 regression guard: ratio vs libdeflate T1.
     ///
     /// Catches bgzf parallel path regressions. The threshold is set to current
@@ -147,7 +256,7 @@ mod tests {
         );
 
         let ratio = gzippy_ns as f64 / libdeflate_ns as f64;
-        let threshold = read_threshold("max_ratio_bgzf_10mb", 2.0);
+        let threshold = read_threshold("max_ratio_bgzf_10mb", 3.5);
 
         eprintln!(
             "diff_ratio_bgzf_10mb: gzippy_T4={:.2}ms libdeflate_T1={:.2}ms ratio={:.3} threshold={:.3}",

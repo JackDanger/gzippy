@@ -14,9 +14,9 @@ name: Build & Test
 
 on:
   push:
-    branches: ["*"]  # All branches
+    branches: ["**"]  # All branches (** matches slashes; * does not)
   pull_request:
-    branches: ["*"]  # All PRs
+    branches: ["**"]  # All PRs
 
 # Minimal permissions for security (validate job overrides for PR comments)
 permissions:

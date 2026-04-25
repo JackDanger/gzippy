@@ -1,6 +1,6 @@
 [package]
 name = "gzippy"
-version = "0.1.7"
+version = "0.2.0"
 edition = "2021"
 description = "The fastest parallel gzip. Drop-in replacement for gzip and pigz."
 license = "Zlib"
@@ -27,11 +27,13 @@ counters = []     # Enable AtomicU64 hot-path counters in bgzf (always on in tes
 # zlib-ng is a modernized fork with SIMD optimizations (2-3x faster)
 flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
 
-# Decompression: libdeflater provides Rust bindings to libdeflate 
+# Decompression: libdeflater provides Rust bindings to libdeflate
 # (30-50% faster than zlib for in-memory operations)
 libdeflater = "1.0"
 # Low-level bindings for _ex functions (returns consumed bytes)
 libdeflate-sys = "1.0"
+# zlib-ng low-level API: inflatePrime for non-byte-aligned restart (parallel arm64)
+libz-ng-sys = "1"
 
 # ISA-L compression (optional, for fastest L0-L3 on x86)
 isal-rs = { version = "0.5", optional = true }
