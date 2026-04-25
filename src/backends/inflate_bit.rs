@@ -57,7 +57,8 @@ pub fn decompress_deflate_from_bit(
     dict: &[u8],
     min_output: usize,
 ) -> Option<Vec<u8>> {
-    let cap = min_output.max(256 * 1024);
+    const MAX_CAP: usize = 512 * 1024 * 1024;
+    let cap = min_output.clamp(256 * 1024, MAX_CAP);
     let (out, _) = decompress_zng(data, bit_offset, dict, cap)?;
     if out.len() >= min_output {
         Some(out)
@@ -73,7 +74,14 @@ pub fn decompress_deflate_from_bit_with_end(
     dict: &[u8],
     max_output: usize,
 ) -> Option<(Vec<u8>, usize)> {
-    decompress_zng(data, bit_offset, dict, max_output.max(256 * 1024))
+    // Cap to avoid allocation overflow when callers pass usize::MAX.
+    const MAX_CAP: usize = 512 * 1024 * 1024;
+    decompress_zng(
+        data,
+        bit_offset,
+        dict,
+        max_output.clamp(256 * 1024, MAX_CAP),
+    )
 }
 
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]

@@ -174,11 +174,14 @@ pub(crate) fn decompress_single_member<W: Write>(
     writer: &mut W,
     num_threads: usize,
 ) -> GzippyResult<u64> {
-    // Parallel single-member path: speculative block-boundary search + inflate
-    // re-decode per confirmed chunk via inflatePrime. ISA-L on x86_64 (~1500 MB/s),
-    // zlib-ng on arm64 (~600 MB/s, NEON-optimized).
+    // Parallel single-member path: speculative block-boundary search + ISA-L
+    // re-decode per confirmed chunk via inflatePrime. x86_64 + ISA-L only.
+    // Arm64: sequential libdeflate (~14,000 MB/s) beats parallel zlib-ng (4 × 600 = 2,400 MB/s).
     const MIN_PARALLEL_COMPRESSED: usize = 10 * 1024 * 1024;
-    if num_threads > 1 && data.len() > MIN_PARALLEL_COMPRESSED {
+    if crate::backends::isal_decompress::is_available()
+        && num_threads > 1
+        && data.len() > MIN_PARALLEL_COMPRESSED
+    {
         match crate::experiments::parallel_single_member::decompress_parallel(
             data,
             writer,
