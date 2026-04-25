@@ -69,9 +69,9 @@ M4 Pro with 14 cores, macOS 15. Level 6. Median of 15 runs per tool.
 
 | Tool        | Throughput |
 |-------------|-----------:|
-| Apple gzip  |   ~990 MB/s |
-| **gzippy**  | **~944 MB/s** |
-| pigz        |   ~846 MB/s |
+| **gzippy**  | **~1050 MB/s** |
+| Apple gzip  |    ~997 MB/s |
+| pigz        |    ~882 MB/s |
 
 Reproduce with [`scripts/readme_benchmark.py`](scripts/readme_benchmark.py)
 after `cargo build --release` and `(cd pigz && make)`.
