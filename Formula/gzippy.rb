@@ -1,7 +1,7 @@
 class Gzippy < Formula
   desc "Fastest parallel gzip — drop-in replacement for gzip and gunzip"
   homepage "https://github.com/JackDanger/gzippy"
-  version File.read(File.join(__dir__, "..", "VERSION")).strip rescue "0.3.0"
+  version "0.3.0"
   license "Zlib"
 
   on_macos do
