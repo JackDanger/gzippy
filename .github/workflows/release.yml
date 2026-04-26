@@ -26,6 +26,7 @@ permissions:
   contents: write
   pages: write
   id-token: write
+  pull-requests: write
 
 env:
   CARGO_TERM_COLOR: always
