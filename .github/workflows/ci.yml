@@ -909,3 +909,6 @@ jobs:
       - name: Run clippy
         run: |
           cargo clippy --release --features isal-compression -- -D warnings
+
+      - name: Check version consistency
+        run: scripts/check-versions.sh

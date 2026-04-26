@@ -4,6 +4,12 @@ set -euo pipefail
 
 changed_rs=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
 changed_yaml=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.github/.*\.ya?ml$' || true)
+changed_version=$(git diff --cached --name-only --diff-filter=ACM | grep -E '^(VERSION|Cargo\.toml|Formula/gzippy\.rb)$' || true)
+
+# Check version consistency if any version file changed
+if [ -n "$changed_version" ]; then
+    "$(dirname "$0")/check-versions.sh" || exit 1
+fi
 
 # Only run checks relevant to what's staged
 if [ -n "$changed_yaml" ]; then
