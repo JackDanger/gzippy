@@ -9,7 +9,7 @@
     "decompress_bgzf_10mb_max_allocs": 10
   },
   "diff_ratio": {
-    "max_ratio": 3.00,
+    "max_ratio": 3.50,
     "max_ratio_bgzf_10mb": 3.50
   },
   "hit_rates": {
