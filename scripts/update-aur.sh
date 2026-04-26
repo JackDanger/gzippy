@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Update AUR packages and push to aur.archlinux.org.
-# Usage: update-aur.sh <version> <x86_64-sha256> <aarch64-sha256>
+# Usage: update-aur.sh [<version>] [<x86_64-sha256>] [<aarch64-sha256>]
 #
+# If version not provided, reads from VERSION file.
 # Requires: AUR_SSH_KEY env var (path to SSH private key registered on aur.archlinux.org)
 # Or called from CI where ~/.ssh/aur is already configured.
 set -euo pipefail
 
-VERSION="${1:?version required (e.g. 0.1.8)}"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+VERSION="${1:-$(cat "$REPO_ROOT/VERSION")}"
 X86_SHA="${2:?x86_64 sha256 required}"
 ARM_SHA="${3:?aarch64 sha256 required}"
-
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 update_and_push() {
     local pkgname="$1"
@@ -42,7 +42,7 @@ update_and_push() {
             su builder -c 'makepkg --printsrcinfo' > /pkg/.SRCINFO
         "
 
-    git config user.email "releases@jackdanger.com"
+    git config user.email "gzippy@jackdanger.com"
     git config user.name "gzippy-bot"
     git add PKGBUILD .SRCINFO
     git diff --cached --quiet && echo "$pkgname: nothing changed" && return
@@ -52,3 +52,4 @@ update_and_push() {
 }
 
 update_and_push gzippy-bin
+update_and_push gzippy-replace-gzip
