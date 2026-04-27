@@ -1,19 +1,19 @@
 [submodule "pigz"]
-	path = pigz
+	path = vendor/pigz
 	url = https://github.com/madler/pigz.git
 [submodule "gzip"]
-	path = gzip
+	path = vendor/gzip
 	url = https://github.com/JackDanger/gzip.git
 [submodule "isa-l"]
-	path = isa-l
+	path = vendor/isa-l
 	url = https://github.com/JackDanger/isa-l.git
 	branch = apple-arm64-fix
 [submodule "zopfli"]
-	path = zopfli
+	path = vendor/zopfli
 	url = https://github.com/google/zopfli.git
 [submodule "rapidgzip"]
-	path = rapidgzip
+	path = vendor/rapidgzip
 	url = https://github.com/mxmlnkn/rapidgzip.git
 [submodule "libdeflate"]
-	path = libdeflate
+	path = vendor/libdeflate
 	url = https://github.com/ebiggers/libdeflate.git
