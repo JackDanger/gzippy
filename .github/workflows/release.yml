@@ -2,12 +2,19 @@
 # Release: build binaries + .deb packages, publish GitHub release, update formula,
 #          rebuild apt repository on GitHub Pages (jackdanger.github.io/gzippy)
 # =============================================================================
-# Triggered by version tags (v*) or manual dispatch.
+# Triggered by:
+#   - A push to main that modifies the top-level VERSION file.
+#     VERSION is the source of truth — bumping it kicks off a release to every
+#     channel (GitHub release, apt repo, Homebrew formula, AUR).
+#   - Manual workflow_dispatch with an optional version override (defaults to
+#     VERSION file). Use this to re-run a failed release for the same version.
+#
 # Produces:
 #   - gzippy-{target}.tar.gz for 4 platforms
 #   - gzippy_{version}_{arch}.deb for amd64 + arm64
 #   - Updated Formula/gzippy.rb + Cargo.toml committed to main
 #   - apt repo at https://jackdanger.github.io/gzippy (gh-pages branch)
+#   - AUR packages gzippy-bin + gzippy-replace-gzip
 #
 # Required secret: APT_SIGNING_KEY — armored GPG private key (from 1Password)
 # =============================================================================
@@ -15,12 +22,13 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
+    paths: [VERSION]
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Tag to release (e.g. v0.1.0)'
-        required: true
+      version:
+        description: 'Version override (e.g. 0.3.1) — defaults to VERSION file'
+        required: false
 
 permissions:
   contents: write
@@ -28,15 +36,52 @@ permissions:
   id-token: write
   pull-requests: write
 
+# One release at a time per version. Don't cancel: a partial release is worse
+# than a delayed one.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Single source of truth: VERSION file (or workflow_dispatch input).
+  # All downstream jobs read `version` and `tag` from this job's outputs —
+  # nothing else derives version from `github.ref_name` or other implicit state.
+  # ---------------------------------------------------------------------------
+  resolve-version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag:     ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: v
+        run: |
+          OVERRIDE="${{ github.event.inputs.version }}"
+          if [ -n "$OVERRIDE" ]; then
+            VERSION="${OVERRIDE#v}"
+            echo "Using workflow_dispatch override: $VERSION"
+          else
+            VERSION=$(tr -d '[:space:]' < VERSION)
+            echo "Read VERSION file: $VERSION"
+          fi
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$'; then
+            echo "::error::VERSION '$VERSION' is not a valid semver"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION"    >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
   # Build native binaries for all 4 platforms
   # ---------------------------------------------------------------------------
   build-binary:
     name: Binary / ${{ matrix.target }}
+    needs: resolve-version
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -81,19 +126,18 @@ jobs:
         if: runner.os == 'Linux' && matrix.apt_extras != ''
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt_extras }}
 
-      - name: Set version from tag
+      - name: Stamp version into Cargo.toml
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
         run: |
-          TAG="${{ github.event.inputs.tag }}"
-          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
-          VERSION="${TAG#v}"
           python3 -c "
-          import re, sys
-          version = sys.argv[1]
+          import re, os
+          version = os.environ['VERSION']
           content = open('Cargo.toml').read()
           content = re.sub(r'^version = \"[^\"]+\"', f'version = \"{version}\"', content, count=1, flags=re.M)
           open('Cargo.toml', 'w').write(content)
           print(f'Set Cargo.toml version to {version}')
-          " "$VERSION"
+          "
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
@@ -155,6 +199,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-deb:
     name: Deb / ${{ matrix.arch }}
+    needs: resolve-version
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -179,11 +224,10 @@ jobs:
             debhelper devscripts build-essential \
             zlib1g-dev cmake nasm autoconf automake libtool
 
-      - name: Set version from tag
+      - name: Stamp version into debian/changelog
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
         run: |
-          TAG="${{ github.event.inputs.tag }}"
-          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
-          VERSION="${TAG#v}"
           DEB_VERSION="${VERSION}-1"
           sed -i "1s/gzippy ([^)]*)/gzippy ($DEB_VERSION)/" debian/changelog
           echo "debian/changelog version set to $DEB_VERSION"
@@ -213,24 +257,41 @@ jobs:
   release:
     name: Publish
     runs-on: ubuntu-latest
-    needs: [build-binary, build-deb]
+    needs: [resolve-version, build-binary, build-deb]
+    env:
+      VERSION:     ${{ needs.resolve-version.outputs.version }}
+      RELEASE_TAG: ${{ needs.resolve-version.outputs.tag }}
 
     steps:
       - uses: actions/checkout@v6
         with:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0  # need full history to inspect/create tags
 
       - uses: actions/download-artifact@v8
         with:
           path: dist
 
-      - name: Resolve version
+      # Ensure a git tag exists for this release. Idempotent: if the tag is
+      # already present (re-running a workflow_dispatch for the same version),
+      # leave it alone. Otherwise create it at main HEAD and push it.
+      - name: Ensure tag ${{ env.RELEASE_TAG }} exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ github.event.inputs.tag }}"
-          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
-          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
-          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git rev-parse --verify "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Tag ${RELEASE_TAG} already exists locally"
+          elif git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Tag ${RELEASE_TAG} already exists on origin; fetching"
+            git fetch origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          else
+            echo "Creating tag ${RELEASE_TAG} at main HEAD ($(git rev-parse HEAD))"
+            git tag -a "${RELEASE_TAG}" -m "Release ${RELEASE_TAG}"
+            git push origin "${RELEASE_TAG}"
+          fi
 
       - name: Update Formula/gzippy.rb
         run: |
@@ -272,23 +333,44 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/gzippy.rb Cargo.toml
-          git diff --cached --quiet && echo "Nothing changed" && exit 0
+          if git diff --cached --quiet; then
+            echo "Formula and Cargo.toml already match; no PR needed"
+            exit 0
+          fi
 
           BRANCH="release/formula-${VERSION}"
-          git checkout -b "$BRANCH"
-          git commit -m "chore: update formula and version to v${VERSION} [skip ci]"
-          git push origin "$BRANCH"
 
-          PR_URL=$(gh pr create \
-            --title "chore: update formula to v${VERSION}" \
-            --body "Automated formula and Cargo.toml update for v${VERSION}." \
-            --base main \
-            --head "$BRANCH")
-          echo "PR: $PR_URL"
-          gh pr merge "$PR_URL" --squash --auto
+          # `checkout -B` (re)creates the branch at the current HEAD even if
+          # one with that name already exists locally. Combined with
+          # `push --force-with-lease`, this overwrites a stale remote branch
+          # left by a previous failed run while still refusing to clobber
+          # commits we don't know about (the lease).
+          git checkout -B "$BRANCH"
+          git commit -m "chore: update formula and version to v${VERSION} [skip ci]"
+          git push --force-with-lease origin "$BRANCH"
+
+          # If a PR for this branch is already open (prior failed run got far
+          # enough to create one), reuse it. Otherwise open a fresh PR.
+          EXISTING=$(gh pr list \
+            --head "$BRANCH" --base main --state open \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "Reusing existing PR #${EXISTING} on branch ${BRANCH}"
+            PR_NUMBER="$EXISTING"
+          else
+            PR_URL=$(gh pr create \
+              --title "chore: update formula to v${VERSION}" \
+              --body  "Automated formula and Cargo.toml update for v${VERSION}." \
+              --base  main \
+              --head  "$BRANCH")
+            PR_NUMBER="${PR_URL##*/}"
+            echo "Created PR #${PR_NUMBER}: ${PR_URL}"
+          fi
+          echo "Auto-merging PR #${PR_NUMBER}"
+          gh pr merge "$PR_NUMBER" --squash --auto
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
@@ -379,7 +461,9 @@ jobs:
   publish-aur:
     name: AUR / gzippy-bin
     runs-on: ubuntu-latest
-    needs: release
+    needs: [resolve-version, release]
+    env:
+      VERSION: ${{ needs.resolve-version.outputs.version }}
 
     steps:
       - uses: actions/checkout@v6
@@ -405,20 +489,12 @@ jobs:
 
       - name: Update and push AUR package
         run: |
-          TAG="${{ github.event.inputs.tag }}"
-          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
-          VERSION="${TAG#v}"
-
           X86_SHA=$(cat gzippy-x86_64-unknown-linux-gnu.tar.gz.sha256 | awk '{print $1}')
           ARM_SHA=$(cat gzippy-aarch64-unknown-linux-gnu.tar.gz.sha256 | awk '{print $1}')
-
           bash scripts/update-aur.sh "$VERSION" "$X86_SHA" "$ARM_SHA"
 
       - name: Smoke-test PKGBUILD (Docker)
         run: |
-          TAG="${{ github.event.inputs.tag }}"
-          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
-          VERSION="${TAG#v}"
 
           # Stamp version into a local copy and verify makepkg --verifysource passes
           cp aur/gzippy-bin/PKGBUILD /tmp/PKGBUILD-test
