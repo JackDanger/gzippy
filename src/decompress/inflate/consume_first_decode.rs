@@ -16,8 +16,8 @@ use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64;
 
-use crate::experiments::jit_decode::TableFingerprint;
-use crate::experiments::libdeflate_entry::{DistTable, LitLenTable};
+use crate::decompress::inflate::jit_decode::TableFingerprint;
+use crate::decompress::inflate::libdeflate_entry::{DistTable, LitLenTable};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Result};
@@ -33,8 +33,8 @@ thread_local! {
     static TABLE_CACHE: RefCell<HashMap<TableFingerprint, (LitLenTable, DistTable)>> =
         RefCell::new(HashMap::new());
     static CACHE_STATS: RefCell<(usize, usize)> = const { RefCell::new((0, 0)) }; // (hits, misses)
-    static SPEC_CACHE: RefCell<crate::experiments::specialized_decode::SpecializedCache> =
-        RefCell::new(crate::experiments::specialized_decode::SpecializedCache::new());
+    static SPEC_CACHE: RefCell<crate::decompress::inflate::specialized_decode::SpecializedCache> =
+        RefCell::new(crate::decompress::inflate::specialized_decode::SpecializedCache::new());
     static SPEC_STATS: RefCell<(usize, usize)> = const { RefCell::new((0, 0)) }; // (specialized_used, generic_used)
     static BLOCK_STATS: RefCell<BlockStats> = const { RefCell::new(BlockStats::new()) };
     // Timing stats: (table_build_nanos, decode_nanos, header_parse_nanos)
@@ -149,7 +149,8 @@ pub fn reset_cache_stats() {
         cache.borrow_mut().clear();
     });
     SPEC_CACHE.with(|cache| {
-        *cache.borrow_mut() = crate::experiments::specialized_decode::SpecializedCache::new();
+        *cache.borrow_mut() =
+            crate::decompress::inflate::specialized_decode::SpecializedCache::new();
     });
     TIMING_STATS.with(|stats| {
         *stats.borrow_mut() = TimingStats::new();
@@ -547,7 +548,7 @@ fn decode_huffman_cf_vector(
     mut out_pos: usize,
     litlen: &LitLenTable,
     dist_table: &DistTable,
-    vector_table: &crate::experiments::vector_huffman::VectorTable,
+    vector_table: &crate::decompress::inflate::vector_huffman::VectorTable,
 ) -> Result<usize> {
     const FASTLOOP_MARGIN: usize = 320;
 
@@ -559,7 +560,7 @@ fn decode_huffman_cf_vector(
 
         // Try multi-literal lookahead (up to 4 literals)
         let (symbols, count, bits_count) =
-            crate::experiments::vector_huffman::decode_multi_literals(
+            crate::decompress::inflate::vector_huffman::decode_multi_literals(
                 bits.peek(),
                 &vector_table.table,
             );
@@ -1876,20 +1877,22 @@ fn decode_stored(bits: &mut Bits, output: &mut [u8], mut out_pos: usize) -> Resu
 }
 
 /// Cached double-literal cache for fixed Huffman (built once)
-fn get_fixed_double_lit_cache() -> &'static crate::experiments::double_literal::DoubleLitCache {
+fn get_fixed_double_lit_cache(
+) -> &'static crate::decompress::inflate::double_literal::DoubleLitCache {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<crate::experiments::double_literal::DoubleLitCache> = OnceLock::new();
+    static CACHE: OnceLock<crate::decompress::inflate::double_literal::DoubleLitCache> =
+        OnceLock::new();
     CACHE.get_or_init(|| {
-        let tables = crate::experiments::libdeflate_decode::get_fixed_tables();
-        crate::experiments::double_literal::DoubleLitCache::build(&tables.0)
+        let tables = crate::decompress::inflate::libdeflate_decode::get_fixed_tables();
+        crate::decompress::inflate::double_literal::DoubleLitCache::build(&tables.0)
     })
 }
 
 /// Get or build the specialized decoder for fixed Huffman (cached)
 fn get_fixed_specialized_decoder(
-) -> &'static crate::experiments::specialized_decode::SpecializedDecoder {
+) -> &'static crate::decompress::inflate::specialized_decode::SpecializedDecoder {
     use std::sync::OnceLock;
-    static DECODER: OnceLock<crate::experiments::specialized_decode::SpecializedDecoder> =
+    static DECODER: OnceLock<crate::decompress::inflate::specialized_decode::SpecializedDecoder> =
         OnceLock::new();
     DECODER.get_or_init(|| {
         // Fixed Huffman code lengths per RFC 1951
@@ -1902,15 +1905,18 @@ fn get_fixed_specialized_decoder(
         let mut dist_lens = vec![0u8; 32];
         dist_lens.fill(5);
 
-        crate::experiments::specialized_decode::SpecializedDecoder::build(&litlen_lens, &dist_lens)
-            .expect("Fixed Huffman should always build")
+        crate::decompress::inflate::specialized_decode::SpecializedDecoder::build(
+            &litlen_lens,
+            &dist_lens,
+        )
+        .expect("Fixed Huffman should always build")
     })
 }
 
 fn decode_fixed(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
     // Use the same fast path as dynamic Huffman for maximum speed
     // The libdeflate-style path achieves 99% of libdeflate vs 69% for specialized path
-    let (litlen, dist) = crate::experiments::libdeflate_decode::get_fixed_tables();
+    let (litlen, dist) = crate::decompress::inflate::libdeflate_decode::get_fixed_tables();
     decode_huffman_libdeflate_style(bits, output, out_pos, litlen, dist)
 }
 
@@ -1922,10 +1928,10 @@ fn decode_huffman_cf_double(
     mut out_pos: usize,
     litlen: &LitLenTable,
     dist: &DistTable,
-    double_cache: &crate::experiments::double_literal::DoubleLitCache,
+    double_cache: &crate::decompress::inflate::double_literal::DoubleLitCache,
 ) -> Result<usize> {
     #![allow(unused_imports)]
-    use crate::experiments::double_literal::DoubleLitEntry;
+    use crate::decompress::inflate::double_literal::DoubleLitEntry;
 
     const FASTLOOP_MARGIN: usize = 320;
 
@@ -2154,8 +2160,10 @@ fn decode_dynamic(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<
     let dist_lengths = &all_lengths[hlit..];
 
     // Compute fingerprint for table caching
-    let fingerprint =
-        crate::experiments::jit_decode::TableFingerprint::combined(litlen_lengths, dist_lengths);
+    let fingerprint = crate::decompress::inflate::jit_decode::TableFingerprint::combined(
+        litlen_lengths,
+        dist_lengths,
+    );
 
     // Use libdeflate-style decoder for all dynamic blocks
     // This achieves 99-112% of libdeflate performance across all datasets.
@@ -2268,10 +2276,10 @@ fn decode_with_specialized_tables(
     bits: &mut Bits,
     output: &mut [u8],
     mut out_pos: usize,
-    spec: &crate::experiments::specialized_decode::SpecializedDecoder,
+    spec: &crate::decompress::inflate::specialized_decode::SpecializedDecoder,
 ) -> Result<usize> {
     #[allow(unused_imports)]
-    use crate::experiments::specialized_decode::SpecEntry;
+    use crate::decompress::inflate::specialized_decode::SpecEntry;
 
     const FASTLOOP_MARGIN: usize = 320;
     let out_ptr = output.as_mut_ptr();
@@ -2466,7 +2474,7 @@ fn decode_generic_with_spec(
     bits: &mut Bits,
     output: &mut [u8],
     mut out_pos: usize,
-    spec: &crate::experiments::specialized_decode::SpecializedDecoder,
+    spec: &crate::decompress::inflate::specialized_decode::SpecializedDecoder,
 ) -> Result<usize> {
     loop {
         bits.refill();
@@ -2667,7 +2675,7 @@ fn decode_dynamic_hyperfast(
         }
 
         // Not a literal - use regular path for exceptional/length
-        let entry = crate::experiments::libdeflate_entry::LitLenEntry::from_raw(entry);
+        let entry = crate::decompress::inflate::libdeflate_entry::LitLenEntry::from_raw(entry);
 
         if entry.is_exceptional() {
             if entry.is_end_of_block() {
@@ -3023,7 +3031,8 @@ pub fn decode_interleaved_4(
                 continue;
             }
 
-            let entry = crate::experiments::libdeflate_entry::LitLenEntry::from_raw(entries[i]);
+            let entry =
+                crate::decompress::inflate::libdeflate_entry::LitLenEntry::from_raw(entries[i]);
             let saved = lanes[i].peek();
             lanes[i].bitbuf >>= entries[i] as u8;
             lanes[i].bitsleft = lanes[i].bitsleft.wrapping_sub(entries[i]);
@@ -3496,7 +3505,7 @@ mod tests {
             .collect();
 
         // Build fixed Huffman tables for all blocks
-        let tables = crate::experiments::libdeflate_decode::get_fixed_tables();
+        let tables = crate::decompress::inflate::libdeflate_decode::get_fixed_tables();
         let _litlen = &tables.0;
         let _dist = &tables.1;
 

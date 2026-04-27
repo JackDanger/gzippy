@@ -30,9 +30,9 @@
 
 #![allow(dead_code)]
 
-use crate::experiments::jit_decode::TableFingerprint;
+use crate::decompress::inflate::jit_decode::TableFingerprint;
 #[allow(unused_imports)]
-use crate::experiments::libdeflate_entry::{DistTable, LitLenTable};
+use crate::decompress::inflate::libdeflate_entry::{DistTable, LitLenTable};
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Result};
 
@@ -249,8 +249,8 @@ fn build_table_with_subtables(lengths: &[u8], is_distance: bool) -> Option<Box<[
         let entry = if is_distance {
             let (base, extra) = if symbol < 30 {
                 (
-                    crate::experiments::libdeflate_entry::DISTANCE_TABLE[symbol].0,
-                    crate::experiments::libdeflate_entry::DISTANCE_TABLE[symbol].1,
+                    crate::decompress::inflate::libdeflate_entry::DISTANCE_TABLE[symbol].0,
+                    crate::decompress::inflate::libdeflate_entry::DISTANCE_TABLE[symbol].1,
                 )
             } else {
                 (0, 0)
@@ -264,8 +264,8 @@ fn build_table_with_subtables(lengths: &[u8], is_distance: bool) -> Option<Box<[
             // Length codes 257-285
             let idx = symbol - 257;
             let (base, extra) = (
-                crate::experiments::libdeflate_entry::LENGTH_TABLE[idx].0,
-                crate::experiments::libdeflate_entry::LENGTH_TABLE[idx].1,
+                crate::decompress::inflate::libdeflate_entry::LENGTH_TABLE[idx].0,
+                crate::decompress::inflate::libdeflate_entry::LENGTH_TABLE[idx].1,
             );
             SpecEntry::length(base, extra, len)
         } else {
@@ -310,8 +310,8 @@ fn build_table_with_subtables(lengths: &[u8], is_distance: bool) -> Option<Box<[
         let entry = if is_distance {
             let (base, extra) = if symbol < 30 {
                 (
-                    crate::experiments::libdeflate_entry::DISTANCE_TABLE[symbol].0,
-                    crate::experiments::libdeflate_entry::DISTANCE_TABLE[symbol].1,
+                    crate::decompress::inflate::libdeflate_entry::DISTANCE_TABLE[symbol].0,
+                    crate::decompress::inflate::libdeflate_entry::DISTANCE_TABLE[symbol].1,
                 )
             } else {
                 (0, 0)
@@ -325,8 +325,8 @@ fn build_table_with_subtables(lengths: &[u8], is_distance: bool) -> Option<Box<[
             // Length codes 257-285
             let idx = symbol - 257;
             let (base, extra) = (
-                crate::experiments::libdeflate_entry::LENGTH_TABLE[idx].0,
-                crate::experiments::libdeflate_entry::LENGTH_TABLE[idx].1,
+                crate::decompress::inflate::libdeflate_entry::LENGTH_TABLE[idx].0,
+                crate::decompress::inflate::libdeflate_entry::LENGTH_TABLE[idx].1,
             );
             SpecEntry::length(base, extra, len)
         } else {

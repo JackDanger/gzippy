@@ -13,8 +13,8 @@
 mod tests {
     #![allow(unused_variables)]
 
+    use crate::decompress::inflate::consume_first_decode::{inflate_consume_first, Bits};
     use crate::decompress::scan_inflate::scan_deflate_fast;
-    use crate::experiments::consume_first_decode::{inflate_consume_first, Bits};
     use std::io::Write;
     use std::time::Instant;
 
@@ -42,8 +42,9 @@ mod tests {
 
     impl InflateOracle {
         fn from_gzip(gzip_data: &[u8]) -> Self {
-            let header_size = crate::experiments::marker_decode::skip_gzip_header(gzip_data)
-                .expect("valid gzip header");
+            let header_size =
+                crate::decompress::parallel::marker_decode::skip_gzip_header(gzip_data)
+                    .expect("valid gzip header");
             let deflate_data = &gzip_data[header_size..gzip_data.len() - 8];
 
             // Scan to get block boundaries
@@ -136,7 +137,7 @@ mod tests {
             let prev_pos = out_pos;
             match btype {
                 0 => {
-                    out_pos = crate::experiments::consume_first_decode::decode_stored_pub(
+                    out_pos = crate::decompress::inflate::consume_first_decode::decode_stored_pub(
                         &mut bits,
                         &mut output,
                         out_pos,
@@ -144,7 +145,7 @@ mod tests {
                     .unwrap()
                 }
                 1 => {
-                    out_pos = crate::experiments::consume_first_decode::decode_fixed_pub(
+                    out_pos = crate::decompress::inflate::consume_first_decode::decode_fixed_pub(
                         &mut bits,
                         &mut output,
                         out_pos,
@@ -152,7 +153,7 @@ mod tests {
                     .unwrap()
                 }
                 2 => {
-                    out_pos = crate::experiments::consume_first_decode::decode_dynamic_pub(
+                    out_pos = crate::decompress::inflate::consume_first_decode::decode_dynamic_pub(
                         &mut bits,
                         &mut output,
                         out_pos,
@@ -441,7 +442,7 @@ mod tests {
 
             match btype {
                 0 => {
-                    out_pos = crate::experiments::consume_first_decode::decode_stored_pub(
+                    out_pos = crate::decompress::inflate::consume_first_decode::decode_stored_pub(
                         &mut bits,
                         &mut output,
                         out_pos,
@@ -449,7 +450,7 @@ mod tests {
                     .unwrap();
                 }
                 1 => {
-                    out_pos = crate::experiments::consume_first_decode::decode_fixed_pub(
+                    out_pos = crate::decompress::inflate::consume_first_decode::decode_fixed_pub(
                         &mut bits,
                         &mut output,
                         out_pos,
@@ -457,7 +458,7 @@ mod tests {
                     .unwrap();
                 }
                 2 => {
-                    out_pos = crate::experiments::consume_first_decode::decode_dynamic_pub(
+                    out_pos = crate::decompress::inflate::consume_first_decode::decode_dynamic_pub(
                         &mut bits,
                         &mut output,
                         out_pos,
@@ -595,8 +596,8 @@ mod tests {
         for (name, gen) in patterns {
             let data = gen();
             let gz = compress_gzip(&data);
-            let header_size =
-                crate::experiments::marker_decode::skip_gzip_header(&gz).expect("valid header");
+            let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&gz)
+                .expect("valid header");
             let deflate = &gz[header_size..gz.len() - 8];
 
             let mut output = vec![0u8; data.len() + 65536];

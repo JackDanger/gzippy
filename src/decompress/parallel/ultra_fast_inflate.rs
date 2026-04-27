@@ -1301,7 +1301,7 @@ fn profile_ultra_fast_components() {
     };
 
     // Parse gzip header
-    let header_size = crate::experiments::marker_decode::skip_gzip_header(&data).unwrap();
+    let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&data).unwrap();
     let deflate_data = &data[header_size..data.len() - 8];
 
     eprintln!(
@@ -1337,7 +1337,8 @@ mod profiling {
             }
         };
 
-        let header_size = crate::experiments::marker_decode::skip_gzip_header(&data).unwrap();
+        let header_size =
+            crate::decompress::parallel::marker_decode::skip_gzip_header(&data).unwrap();
         let deflate_data = &data[header_size..data.len() - 8];
 
         // Time just bit buffer operations
@@ -1524,7 +1525,7 @@ fn test_with_flate2_fallback() {
     flate2_decoder.read_to_end(&mut expected).unwrap();
 
     // Use our header parsing but flate2 for inflate
-    let header_size = crate::experiments::marker_decode::skip_gzip_header(&data).unwrap();
+    let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&data).unwrap();
     let deflate_end = data.len() - 8;
     let deflate_data = &data[header_size..deflate_end];
 
@@ -1552,7 +1553,7 @@ fn test_compare_sizes() {
         }
     };
 
-    let header_size = crate::experiments::marker_decode::skip_gzip_header(&data).unwrap();
+    let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&data).unwrap();
     let deflate_end = data.len() - 8;
     let deflate_data = &data[header_size..deflate_end];
 
@@ -1587,7 +1588,7 @@ fn test_count_mismatches() {
         }
     };
 
-    let header_size = crate::experiments::marker_decode::skip_gzip_header(&data).unwrap();
+    let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&data).unwrap();
     let deflate_end = data.len() - 8;
     let deflate_data = &data[header_size..deflate_end];
 

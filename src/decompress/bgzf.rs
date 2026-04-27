@@ -1149,13 +1149,13 @@ fn decode_huffman_consume_first(
     bits: &mut crate::decompress::two_level_table::TurboBits,
     output: &mut [u8],
     mut out_pos: usize,
-    lit_table: &crate::experiments::consume_first_table::ConsumeFirstTable,
-    dist_table: &crate::experiments::consume_first_table::ConsumeFirstTable,
+    lit_table: &crate::decompress::inflate::consume_first_table::ConsumeFirstTable,
+    dist_table: &crate::decompress::inflate::consume_first_table::ConsumeFirstTable,
 ) -> io::Result<usize> {
+    use crate::decompress::inflate::consume_first_table::CFEntry;
     use crate::decompress::inflate_tables::{
         DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START,
     };
-    use crate::experiments::consume_first_table::CFEntry;
 
     let out_end = output.len();
     let fastloop_end = out_end.saturating_sub(320);
@@ -1168,7 +1168,7 @@ fn decode_huffman_consume_first(
     #[inline(always)]
     fn resolve_entry(
         bits: &mut crate::decompress::two_level_table::TurboBits,
-        table: &crate::experiments::consume_first_table::ConsumeFirstTable,
+        table: &crate::decompress::inflate::consume_first_table::ConsumeFirstTable,
     ) -> CFEntry {
         let entry = table.lookup_main(bits.buffer());
         bits.consume(entry.bits());
@@ -3343,7 +3343,7 @@ pub fn decompress_single_member_parallel<W: Write>(
     }
 
     // Parse gzip header
-    let header_size = crate::experiments::marker_decode::skip_gzip_header(data)?;
+    let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(data)?;
     let deflate_data = &data[header_size..data.len().saturating_sub(8)];
 
     // === FIRST PASS: Sequential decode to collect chunk boundaries and windows ===
@@ -4586,7 +4586,7 @@ mod tests {
     /// Run with: cargo test --release bench_analyze -- --nocapture
     #[test]
     fn bench_analyze() {
-        use crate::experiments::consume_first_decode::{
+        use crate::decompress::inflate::consume_first_decode::{
             get_block_stats, get_cache_stats, get_spec_cache_stats, get_spec_stats,
             get_table_cache_size, reset_cache_stats,
         };
@@ -4787,7 +4787,9 @@ mod tests {
     /// Run with: cargo test --release bench_profile -- --nocapture
     #[test]
     fn bench_profile() {
-        use crate::experiments::consume_first_decode::{get_timing_stats, reset_cache_stats};
+        use crate::decompress::inflate::consume_first_decode::{
+            get_timing_stats, reset_cache_stats,
+        };
 
         let _ = crate::tests::datasets::prepare_datasets();
 
@@ -5196,7 +5198,8 @@ mod optimization_tests {
         encoder.write_all(&original).unwrap();
         let compressed = encoder.finish().unwrap();
 
-        let header_size = crate::experiments::marker_decode::skip_gzip_header(&compressed).unwrap();
+        let header_size =
+            crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed).unwrap();
         let deflate_data = &compressed[header_size..compressed.len() - 8];
 
         let mut output = vec![0u8; original.len() + 1024];
@@ -5318,7 +5321,8 @@ mod optimization_tests {
         encoder.write_all(&original).unwrap();
         let compressed = encoder.finish().unwrap();
 
-        let header_size = crate::experiments::marker_decode::skip_gzip_header(&compressed).unwrap();
+        let header_size =
+            crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed).unwrap();
         let deflate_data = &compressed[header_size..compressed.len() - 8];
 
         let mut output = vec![0u8; original.len() + 1024];
@@ -5362,7 +5366,8 @@ mod optimization_tests {
         encoder.write_all(&original).unwrap();
         let compressed = encoder.finish().unwrap();
 
-        let header_size = crate::experiments::marker_decode::skip_gzip_header(&compressed).unwrap();
+        let header_size =
+            crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed).unwrap();
         let deflate_data = &compressed[header_size..compressed.len() - 8];
 
         // Warm up
@@ -5418,7 +5423,8 @@ mod optimization_tests {
         encoder.write_all(&original).unwrap();
         let compressed = encoder.finish().unwrap();
 
-        let header_size = crate::experiments::marker_decode::skip_gzip_header(&compressed).unwrap();
+        let header_size =
+            crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed).unwrap();
         let deflate_data = &compressed[header_size..compressed.len() - 8];
 
         let mut output = vec![0u8; original.len() + 1024];
@@ -5462,7 +5468,8 @@ mod optimization_tests {
         encoder.write_all(&original).unwrap();
         let compressed = encoder.finish().unwrap();
 
-        let header_size = crate::experiments::marker_decode::skip_gzip_header(&compressed).unwrap();
+        let header_size =
+            crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed).unwrap();
         let deflate_data = &compressed[header_size..compressed.len() - 8];
 
         let mut output = vec![0u8; original.len() + 1024];
@@ -5512,7 +5519,8 @@ mod optimization_tests {
         encoder.write_all(&original).unwrap();
         let compressed = encoder.finish().unwrap();
 
-        let header_size = crate::experiments::marker_decode::skip_gzip_header(&compressed).unwrap();
+        let header_size =
+            crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed).unwrap();
         let deflate_data = &compressed[header_size..compressed.len() - 8];
 
         let mut output = vec![0u8; original.len() + 1024];
@@ -6011,7 +6019,7 @@ mod optimization_tests {
     /// Debug consume-first entry types
     #[test]
     fn test_consume_first_entry_debug() {
-        use crate::experiments::consume_first_table::ConsumeFirstTable;
+        use crate::decompress::inflate::consume_first_table::ConsumeFirstTable;
 
         // Fixed Huffman code lengths
         let mut lit_len_lengths = vec![0u8; 288];
@@ -6575,7 +6583,7 @@ mod optimization_tests {
 
         // Decompress with our gzip preallocated function
         let mut our_out = Vec::new();
-        let our_size = crate::experiments::ultra_fast_inflate::inflate_gzip_preallocated(
+        let our_size = crate::decompress::parallel::ultra_fast_inflate::inflate_gzip_preallocated(
             &compressed,
             &mut our_out,
         )
@@ -6589,8 +6597,8 @@ mod optimization_tests {
     /// Test: Compare ConsumeFirstTable and TwoLevelTable decode results
     #[test]
     fn test_cf_table_comparison() {
+        use crate::decompress::inflate::consume_first_table::ConsumeFirstTable;
         use crate::decompress::two_level_table::TwoLevelTable;
-        use crate::experiments::consume_first_table::ConsumeFirstTable;
 
         // Use the same code lengths as would be built for a real stream
         // Standard fixed Huffman: 0-143 have 8 bits, 144-255 have 9 bits, etc.
@@ -6654,7 +6662,7 @@ mod optimization_tests {
     /// Test: Verify subtable construction for long codes (>11 bits)
     #[test]
     fn test_cf_subtable_construction() {
-        use crate::experiments::consume_first_table::ConsumeFirstTable;
+        use crate::decompress::inflate::consume_first_table::ConsumeFirstTable;
 
         // Create code lengths that require subtables:
         // Symbols 0-255 get 12-bit codes (need 1-bit subtables)
@@ -6836,8 +6844,8 @@ mod optimization_tests {
     /// Test: Mixed code lengths with subtables on x86 / direct on ARM64
     #[test]
     fn test_cf_subtable_mixed() {
+        use crate::decompress::inflate::consume_first_table::{ConsumeFirstTable, CF_TABLE_BITS};
         use crate::decompress::two_level_table::TurboBits;
-        use crate::experiments::consume_first_table::{ConsumeFirstTable, CF_TABLE_BITS};
 
         // Create a more realistic code length distribution:
         // - Some short codes (frequent symbols)
@@ -7078,7 +7086,7 @@ mod optimization_tests {
     /// Test: Verify distance table builds correctly
     #[test]
     fn test_cf_distance_table() {
-        use crate::experiments::consume_first_table::ConsumeFirstTable;
+        use crate::decompress::inflate::consume_first_table::ConsumeFirstTable;
 
         // Standard 5-bit distance codes
         let dist_lens: Vec<u8> = vec![5; 30];
@@ -7259,7 +7267,7 @@ mod optimization_tests {
 
         // Decompress with our function
         let mut our_out = Vec::new();
-        let result = crate::experiments::ultra_fast_inflate::inflate_gzip_preallocated(
+        let result = crate::decompress::parallel::ultra_fast_inflate::inflate_gzip_preallocated(
             &full_data,
             &mut our_out,
         );
@@ -7549,7 +7557,8 @@ mod optimization_tests {
         };
 
         // Extract deflate data (skip gzip header)
-        let header_size = match crate::experiments::marker_decode::skip_gzip_header(&data) {
+        let header_size = match crate::decompress::parallel::marker_decode::skip_gzip_header(&data)
+        {
             Ok(n) => n,
             Err(_) => {
                 eprintln!("Skipping - not a valid gzip file");
@@ -7783,7 +7792,7 @@ mod optimization_tests {
         let mut output = vec![0u8; original.len() + 1024];
         eprintln!("\nDecompressing with consume_first_decode...");
 
-        let result = crate::experiments::consume_first_decode::inflate_consume_first(
+        let result = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
             deflate_data,
             &mut output,
         );
@@ -7936,7 +7945,7 @@ mod optimization_tests {
     /// Test using actual gzip binary (if available)
     #[test]
     fn test_with_system_gzip() {
-        use crate::experiments::consume_first_decode::inflate_consume_first;
+        use crate::decompress::inflate::consume_first_decode::inflate_consume_first;
         use std::process::Command;
 
         // Check if gzip is available
@@ -8139,7 +8148,7 @@ mod optimization_tests {
     /// Test copy_match_fast edge cases that might differ on x86_64
     #[test]
     fn test_copy_match_edge_cases() {
-        use crate::experiments::consume_first_decode::inflate_consume_first;
+        use crate::decompress::inflate::consume_first_decode::inflate_consume_first;
         use flate2::write::GzEncoder;
         use flate2::Compression;
         use std::io::Write;

@@ -12,9 +12,9 @@
 #[cfg(test)]
 mod tests {
     #![allow(unused_variables)]
+    use crate::decompress::parallel::block_finder::BlockFinder;
+    use crate::decompress::parallel::marker_decode::{MarkerDecoder, MARKER_BASE, WINDOW_SIZE};
     use crate::decompress::scan_inflate::{scan_deflate_fast, ScanCheckpoint};
-    use crate::experiments::block_finder::BlockFinder;
-    use crate::experiments::marker_decode::{MarkerDecoder, MARKER_BASE, WINDOW_SIZE};
     use std::collections::HashSet;
     use std::io::Write;
 
@@ -35,8 +35,9 @@ mod tests {
     impl DeflateOracle {
         /// Build oracle from raw gzip data.
         fn from_gzip(gzip_data: &[u8]) -> Self {
-            let header_size = crate::experiments::marker_decode::skip_gzip_header(gzip_data)
-                .expect("valid gzip header");
+            let header_size =
+                crate::decompress::parallel::marker_decode::skip_gzip_header(gzip_data)
+                    .expect("valid gzip header");
             let deflate_data = &gzip_data[header_size..gzip_data.len() - 8];
 
             // Get checkpoints via scan pass (every 256KB for dense coverage)
@@ -45,11 +46,12 @@ mod tests {
 
             // Get expected output via full decode
             let mut output = vec![0u8; scan.total_output_size + 65536];
-            let actual_size = crate::experiments::consume_first_decode::inflate_consume_first(
-                deflate_data,
-                &mut output,
-            )
-            .expect("inflate should succeed");
+            let actual_size =
+                crate::decompress::inflate::consume_first_decode::inflate_consume_first(
+                    deflate_data,
+                    &mut output,
+                )
+                .expect("inflate should succeed");
             output.truncate(actual_size);
 
             assert_eq!(

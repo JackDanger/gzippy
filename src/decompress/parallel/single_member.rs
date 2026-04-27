@@ -1,25 +1,24 @@
-//! Parallel single-member gzip decompression (rapidgzip-style)
+//! Parallel single-member gzip decompression (rapidgzip-style).
+//!
+//! Production path: wired into `decompress::decompress_single_member` for
+//! `num_threads > 1`, ISA-L available (x86_64), and compressed size > 10 MiB.
 //!
 //! Architecture (no sequential pre-scan):
-//! 1. Partition compressed data at regular intervals
-//! 2. Find deflate block boundaries near each partition point using BlockFinder
-//! 3. Decode all chunks in parallel using marker-based decoder
-//! 4. Resolve markers sequentially using window propagation
 //!
-//! This eliminates the expensive sequential scan pass that made the old two-pass
-//! approach require 8+ threads to beat sequential. With this approach, 4 threads
-//! already provide significant speedup.
-//!
-//! NOTE: This module is not currently wired into the production path — the
-//! speculation pipeline runs at 88-148 MB/s vs 600-2000 MB/s for sequential
-//! ISA-L/libdeflate. All functions are retained for testing and future use.
+//! 1. Partition the compressed stream at regular intervals.
+//! 2. Each chunk searches forward for a deflate block boundary using `BlockFinder`,
+//!    then decodes from there until the next partition point in parallel.
+//! 3. Confirmed chunks re-decode via ISA-L `inflatePrime` (non-byte-aligned restart
+//!    plus 32 KiB sliding-window dictionary). v0.3.0 made this the path that beats
+//!    rapidgzip at scale.
+//! 4. CRC32 + ISIZE verification on the assembled output.
 #![allow(dead_code)]
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crate::experiments::block_finder::BlockFinder;
+use crate::decompress::parallel::block_finder::BlockFinder;
 
 const WINDOW_SIZE: usize = 32768;
 
@@ -57,7 +56,7 @@ pub fn decompress_parallel<W: Write>(
 ) -> Result<u64, ParallelError> {
     let t0 = std::time::Instant::now();
 
-    let header_size = crate::experiments::marker_decode::skip_gzip_header(gzip_data)
+    let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(gzip_data)
         .map_err(|_| ParallelError::InvalidHeader)?;
 
     let trailer_size = 8;
@@ -616,7 +615,7 @@ impl std::fmt::Display for ParallelError {
 mod tests {
     use super::*;
     // MarkerDecoder still used in tests that test boundary-finding and MarkerDecoder internals.
-    use crate::experiments::marker_decode::{replace_markers, MarkerDecoder};
+    use crate::decompress::parallel::marker_decode::{replace_markers, MarkerDecoder};
 
     // =====================================================================
     //  Compatibility wrappers: bridge old test API to new speculation API
@@ -735,13 +734,15 @@ mod tests {
     }
 
     fn get_deflate_and_expected(gzip_data: &[u8]) -> (&[u8], Vec<u8>) {
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(gzip_data).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(gzip_data)
+            .expect("valid header");
         let deflate = &gzip_data[header_size..gzip_data.len() - 8];
         let mut expected = vec![0u8; deflate.len() * 10 + 65536];
-        let size =
-            crate::experiments::consume_first_decode::inflate_consume_first(deflate, &mut expected)
-                .expect("reference inflate");
+        let size = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
+            deflate,
+            &mut expected,
+        )
+        .expect("reference inflate");
         expected.truncate(size);
         (deflate, expected)
     }
@@ -768,8 +769,8 @@ mod tests {
     fn test_try_decode_rejects_random_positions() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let mut rng: u64 = 12345;
@@ -812,8 +813,8 @@ mod tests {
     fn test_try_decode_accepts_oracle_boundaries() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let scan = crate::decompress::scan_inflate::scan_deflate_fast(deflate, 512 * 1024, 0)
@@ -870,8 +871,8 @@ mod tests {
     fn test_block_finder_with_try_decode_finds_boundaries() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let scan = crate::decompress::scan_inflate::scan_deflate_fast(deflate, 512 * 1024, 0)
@@ -920,8 +921,8 @@ mod tests {
     fn test_chunk_output_bounded() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = find_chunk_boundaries(deflate, 4);
@@ -995,8 +996,8 @@ mod tests {
     fn test_chunk0_no_markers_matches_sequential() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = find_chunk_boundaries(deflate, 4);
@@ -1020,8 +1021,11 @@ mod tests {
 
         // Compare with sequential reference
         let mut ref_output = vec![0u8; data.len() + 65536];
-        crate::experiments::consume_first_decode::inflate_consume_first(deflate, &mut ref_output)
-            .expect("reference inflate");
+        crate::decompress::inflate::consume_first_decode::inflate_consume_first(
+            deflate,
+            &mut ref_output,
+        )
+        .expect("reference inflate");
 
         let chunk0_bytes: Vec<u8> = decoder.output().iter().map(|&v| v as u8).collect();
         let cmp_len = chunk0_bytes.len().min(ref_output.len());
@@ -1045,8 +1049,8 @@ mod tests {
     fn test_bounded_slice_not_full_tail() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = find_chunk_boundaries(deflate, 4);
@@ -1152,6 +1156,39 @@ mod tests {
     }
 
     // =========================================================================
+    // INVARIANT: parallel path must succeed (no fallback) on the production
+    // gate's input range — ISA-L available, T>1, compressed > 10 MiB.
+    //
+    // Locks in the v0.3.0 wiring. If decompress_parallel starts returning Err
+    // on inputs that satisfy the production gate, the routing layer silently
+    // falls back to ISA-L sequential and we lose ~2× throughput without any
+    // test catching it. This test fires loudly instead.
+    // =========================================================================
+
+    #[test]
+    fn test_parallel_path_no_silent_fallback() {
+        if !crate::backends::isal_decompress::is_available() {
+            eprintln!("skipping: ISA-L unavailable on this build/arch");
+            return;
+        }
+
+        let data = make_compressible_data(20 * 1024 * 1024);
+        let compressed = make_gzip_data(&data);
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "test input must exceed production MIN_PARALLEL_COMPRESSED gate; \
+             got {} bytes",
+            compressed.len()
+        );
+
+        let mut output = Vec::new();
+        let bytes = decompress_parallel(&compressed, &mut output, 4)
+            .expect("parallel path must succeed on ISA-L + T>1 + >10MB input");
+        assert_eq!(bytes as usize, data.len());
+        assert_eq!(output, data, "parallel output content mismatch");
+    }
+
+    // =========================================================================
     // INVARIANT: pipeline on silesia produces correct output
     // Catches: real-world data failures
     // =========================================================================
@@ -1201,8 +1238,8 @@ mod tests {
     fn test_chunk_output_sum_matches_isize() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
         let expected_size = data.len();
 
@@ -1253,8 +1290,8 @@ mod tests {
     fn test_boundaries_sorted_and_unique() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = find_chunk_boundaries(deflate, 4);
@@ -1390,8 +1427,8 @@ mod tests {
     fn test_oracle_chain_convergence_8mb() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = get_oracle_boundaries(deflate, 1024 * 1024);
@@ -1429,8 +1466,8 @@ mod tests {
     fn test_found_boundary_chain_convergence() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = find_chunk_boundaries(deflate, 4);
@@ -1474,8 +1511,8 @@ mod tests {
     fn test_chunk_output_tiles_exactly_with_oracle() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = get_oracle_boundaries(deflate, 1024 * 1024);
@@ -1557,8 +1594,8 @@ mod tests {
     fn test_try_decode_rejects_bit0() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         // Bit 0 is a real boundary and should be accepted.
@@ -1574,8 +1611,8 @@ mod tests {
     fn test_try_decode_accepts_mid_stream_oracle() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = get_oracle_boundaries(deflate, 512 * 1024);
@@ -1596,8 +1633,8 @@ mod tests {
     fn test_try_decode_rejects_mid_block_positions() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = get_oracle_boundaries(deflate, 512 * 1024);
@@ -1636,8 +1673,8 @@ mod tests {
     fn test_try_decode_marker_rate_at_oracle_boundary() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = get_oracle_boundaries(deflate, 1024 * 1024);
@@ -1669,8 +1706,8 @@ mod tests {
     fn test_try_decode_500_random_positions() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let total_bits = deflate.len() * 8;
@@ -1761,7 +1798,7 @@ mod tests {
 
     #[test]
     fn test_replace_markers_with_markers() {
-        use crate::experiments::marker_decode::MARKER_BASE;
+        use crate::decompress::parallel::marker_decode::MARKER_BASE;
         let mut window = vec![0u8; WINDOW_SIZE];
         window[WINDOW_SIZE - 1] = 0xFF;
         window[WINDOW_SIZE - 2] = 0xFE;
@@ -1861,8 +1898,8 @@ mod tests {
         // Verify inflate_bit can decode the full deflate section of an 8MB gzip.
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
         let result = crate::backends::inflate_bit::decompress_deflate_from_bit_with_end(
             deflate,
@@ -1888,8 +1925,8 @@ mod tests {
         // the correct LZ77 window, producing the exact remaining data.
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let oracle = get_oracle_boundaries(deflate, 2 * 1024 * 1024);
@@ -2076,7 +2113,8 @@ mod tests {
         ] {
             let compressed = make_gzip_data(&data);
             let header_size =
-                crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+                crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+                    .expect("header");
             let deflate = &compressed[header_size..compressed.len() - 8];
             let boundaries = find_chunk_boundaries(deflate, 4);
             if boundaries.len() < 2 {
@@ -2102,8 +2140,8 @@ mod tests {
     fn test_mid_chunks_have_markers() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = get_oracle_boundaries(deflate, 1024 * 1024);
@@ -2134,8 +2172,8 @@ mod tests {
     fn test_marker_rate_reasonable_at_oracle_boundaries() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = get_oracle_boundaries(deflate, 1024 * 1024);
@@ -2172,8 +2210,8 @@ mod tests {
     fn test_each_oracle_chunk_matches_sequential_range() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let scan = crate::decompress::scan_inflate::scan_deflate_fast(deflate, 1024 * 1024, 0)
@@ -2261,7 +2299,8 @@ mod tests {
             let data = make_compressible_data(size);
             let compressed = make_gzip_data(&data);
             let header_size =
-                crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+                crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+                    .expect("header");
             let deflate = &compressed[header_size..compressed.len() - 8];
 
             let boundaries = find_chunk_boundaries(deflate, 4);
@@ -2277,8 +2316,8 @@ mod tests {
     fn test_boundaries_within_data_range() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         for num_chunks in [2, 4, 8, 16] {
@@ -2301,8 +2340,8 @@ mod tests {
     fn test_boundaries_strictly_increasing() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         for num_chunks in [2, 4, 8] {
@@ -2324,8 +2363,8 @@ mod tests {
     fn test_boundaries_count_reasonable() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         for num_chunks in [4, 8] {
@@ -2349,8 +2388,8 @@ mod tests {
     fn test_boundaries_roughly_evenly_spaced() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = find_chunk_boundaries(deflate, 4);
@@ -2382,8 +2421,8 @@ mod tests {
     fn test_resolve_single_chunk_correct_output() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
         let oracle = get_oracle_boundaries(deflate, 4 * 1024 * 1024);
         if oracle.len() < 2 {
@@ -2410,8 +2449,8 @@ mod tests {
     fn test_resolve_size_mismatch_detected() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
         let oracle = get_oracle_boundaries(deflate, 4 * 1024 * 1024);
         if oracle.len() < 2 {
@@ -2432,8 +2471,8 @@ mod tests {
     fn test_decode_until_bit_respects_output_limit() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let max_output = 1000;
@@ -2454,8 +2493,8 @@ mod tests {
     fn test_decode_until_bit_stops_at_exact_boundary() {
         let data = make_compressible_data(4 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = get_oracle_boundaries(deflate, 512 * 1024);
@@ -2483,8 +2522,8 @@ mod tests {
     fn test_block_finder_candidates_are_valid_positions() {
         let data = make_compressible_data(4 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let finder = BlockFinder::new(deflate);
@@ -2504,8 +2543,8 @@ mod tests {
     fn test_block_finder_sorted_output() {
         let data = make_compressible_data(4 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let finder = BlockFinder::new(deflate);
@@ -2529,8 +2568,8 @@ mod tests {
         // On size mismatch, resolve_and_write must not write output.
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
         let oracle = get_oracle_boundaries(deflate, 4 * 1024 * 1024);
         if oracle.len() < 2 {
@@ -2554,8 +2593,8 @@ mod tests {
         // Verify all found chunks span a reasonable fraction of the stream.
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = find_chunk_boundaries(deflate, 4);
@@ -2587,8 +2626,8 @@ mod tests {
         // This test verifies the pipeline rejects invalid boundaries.
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = find_chunk_boundaries(deflate, 4);
@@ -2616,8 +2655,8 @@ mod tests {
         // causes each chunk to process the entire remaining stream.
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = find_chunk_boundaries(deflate, 4);
@@ -2703,8 +2742,8 @@ mod tests {
     fn test_oracle_pipeline_byte_exact() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = get_oracle_boundaries(deflate, 1024 * 1024);
@@ -2727,8 +2766,8 @@ mod tests {
     fn test_find_boundaries_deterministic() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let b1 = find_chunk_boundaries(deflate, 4);
@@ -2776,8 +2815,8 @@ mod tests {
         // Use random data which is hard for BlockFinder
         let data = make_random_data(8 * 1024 * 1024, 999);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = find_chunk_boundaries(deflate, 4);
@@ -2798,8 +2837,8 @@ mod tests {
     fn test_chunk_output_sizes_reasonable() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = find_chunk_boundaries(deflate, 4);
@@ -2832,8 +2871,8 @@ mod tests {
     fn test_found_boundaries_near_oracle() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let oracle = get_oracle_boundaries(deflate, 2 * 1024 * 1024);
@@ -2863,11 +2902,11 @@ mod tests {
 
     #[test]
     fn test_marker_encoding_distance_1() {
-        use crate::experiments::marker_decode::MARKER_BASE;
+        use crate::decompress::parallel::marker_decode::MARKER_BASE;
         let data = make_compressible_data(64 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = get_oracle_boundaries(deflate, 16 * 1024);
@@ -2900,7 +2939,7 @@ mod tests {
 
     #[test]
     fn test_marker_encoding_distance_max() {
-        use crate::experiments::marker_decode::MARKER_BASE;
+        use crate::decompress::parallel::marker_decode::MARKER_BASE;
         // MARKER_BASE + 32767 is the maximum marker (distance 32768, offset 32767)
         let max_marker = MARKER_BASE + (WINDOW_SIZE as u16 - 1);
         assert_eq!(max_marker, u16::MAX); // 32768 + 32767 = 65535
@@ -2908,7 +2947,7 @@ mod tests {
 
     #[test]
     fn test_marker_encoding_roundtrip() {
-        use crate::experiments::marker_decode::MARKER_BASE;
+        use crate::decompress::parallel::marker_decode::MARKER_BASE;
         let mut window = vec![0u8; WINDOW_SIZE];
         for (i, byte) in window.iter_mut().enumerate() {
             *byte = (i % 256) as u8;
@@ -2951,8 +2990,8 @@ mod tests {
         // Compress a small string and verify MarkerDecoder can decode it
         let data = b"hello world hello world hello world";
         let compressed = make_gzip_data(data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let mut decoder = MarkerDecoder::new(deflate, 0);
@@ -2966,8 +3005,8 @@ mod tests {
         // A very short deflate stream — decoder should handle EOF gracefully
         let data = b"x";
         let compressed = make_gzip_data(data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let mut decoder = MarkerDecoder::new(deflate, 0);
@@ -2981,8 +3020,8 @@ mod tests {
     fn test_bit_position_tracks_across_blocks() {
         let data = make_compressible_data(256 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let mut decoder = MarkerDecoder::new(deflate, 0);
@@ -3011,8 +3050,8 @@ mod tests {
     fn test_bit_position_starts_at_offset() {
         let data = make_compressible_data(64 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         // Start at bit offset 5
@@ -3030,8 +3069,8 @@ mod tests {
 
     fn assert_oracle_chain_convergence(label: &str, data: &[u8]) {
         let compressed = make_gzip_data(data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = get_oracle_boundaries(deflate, 512 * 1024);
@@ -3067,8 +3106,8 @@ mod tests {
 
     fn assert_oracle_chain_convergence_at_level(label: &str, data: &[u8], level: u32) {
         let compressed = make_gzip_at_level(data, level);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = get_oracle_boundaries(deflate, 512 * 1024);
@@ -3139,8 +3178,8 @@ mod tests {
         // Verify that try_decode_at rejects positions where >20% of output is markers
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         // Test at 200 random positions and verify any accepted has <20% markers
@@ -3173,8 +3212,8 @@ mod tests {
         // Verify try_decode_at rejects positions producing < min_output
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         // Test at a known non-boundary: exact middle of stream (unlikely to be a boundary)
@@ -3189,8 +3228,8 @@ mod tests {
     fn test_false_positive_detected_by_zero_markers() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         // Bit 0 is the actual stream start — inflate_bit accepts it correctly.
@@ -3205,8 +3244,8 @@ mod tests {
     fn test_false_positive_detected_by_chain_mismatch() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = find_chunk_boundaries(deflate, 4);
@@ -3243,8 +3282,8 @@ mod tests {
     fn test_bit_position_overshoot_means_false_positive() {
         let data = make_compressible_data(4 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let oracle = get_oracle_boundaries(deflate, 512 * 1024);
@@ -3277,8 +3316,8 @@ mod tests {
     fn test_false_positive_rate_under_1_percent() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let total_bits = deflate.len() * 8;
@@ -3313,8 +3352,8 @@ mod tests {
         // Verify that resolve_and_write with oracle boundaries produces correct output
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
         let boundaries = get_oracle_boundaries(deflate, 2 * 1024 * 1024);
         if boundaries.len() < 3 {
@@ -3390,12 +3429,12 @@ mod tests {
     fn test_parallel_output_byte_identical_to_consume_first() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let mut ref_output = vec![0u8; data.len() + 65536];
-        let ref_size = crate::experiments::consume_first_decode::inflate_consume_first(
+        let ref_size = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
             deflate,
             &mut ref_output,
         )
@@ -3418,8 +3457,8 @@ mod tests {
         // On error (size mismatch), no output should be written.
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
         let oracle = get_oracle_boundaries(deflate, 4 * 1024 * 1024);
         if oracle.len() < 2 {
@@ -3444,8 +3483,8 @@ mod tests {
     fn test_chunk_results_in_order() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = find_chunk_boundaries(deflate, 4);
@@ -3507,8 +3546,8 @@ mod tests {
         // If only boundary [0] is found, we can't parallelize
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = vec![0usize]; // Only the start boundary
@@ -3528,8 +3567,8 @@ mod tests {
         // by trying to decode with corrupted data
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let mut deflate = compressed[header_size..compressed.len() - 8].to_vec();
 
         let boundaries = find_chunk_boundaries(&deflate, 4);
@@ -3561,7 +3600,7 @@ mod tests {
         let compressed = encoder.finish().unwrap();
 
         // Verify we can parse the header and extract deflate data
-        let header_size = crate::experiments::marker_decode::skip_gzip_header(&compressed);
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed);
         assert!(header_size.is_ok(), "should parse standard gzip header");
     }
 
@@ -3571,7 +3610,7 @@ mod tests {
         let data = b"test";
         let compressed = make_gzip_data(data);
         assert!(compressed.len() >= 18, "minimum gzip is 18 bytes");
-        let header_size = crate::experiments::marker_decode::skip_gzip_header(&compressed);
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed);
         assert!(header_size.is_ok());
         assert_eq!(header_size.unwrap(), 10, "minimal header is 10 bytes");
     }
@@ -3581,8 +3620,8 @@ mod tests {
         // Very small data → single deflate block → can't split
         let data = b"hello";
         let compressed = make_gzip_data(data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = find_chunk_boundaries(deflate, 4);
@@ -3603,8 +3642,8 @@ mod tests {
         // Create data that forces stored blocks (incompressible random)
         let data = make_random_data(4 * 1024 * 1024, 12345);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         // Verify boundaries are found (block finder handles stored blocks)
@@ -3626,8 +3665,8 @@ mod tests {
         data.truncate(4 * 1024 * 1024);
 
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         // Verify oracle chain convergence still holds with max-distance refs
@@ -3660,8 +3699,8 @@ mod tests {
         // Adjacent boundaries → chunk has 0 compressed bits
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         // Create degenerate boundaries where two are at the same position
@@ -3739,7 +3778,8 @@ mod tests {
         ] {
             let compressed = make_gzip_data(&data);
             let header_size =
-                crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+                crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+                    .expect("header");
             let deflate = &compressed[header_size..compressed.len() - 8];
 
             let boundaries = get_oracle_boundaries(deflate, 512 * 1024);
@@ -3794,8 +3834,8 @@ mod tests {
         // are possible but should be rarer than early ones.
         let data = make_compressible_data(4 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = get_oracle_boundaries(deflate, 512 * 1024);
@@ -3838,8 +3878,8 @@ mod tests {
         // If one chunk is 10x another (excluding first/last), something is wrong.
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let boundaries = find_chunk_boundaries(deflate, 8);
@@ -3883,8 +3923,8 @@ mod tests {
     fn test_find_chunk_end_bit0_produces_valid_end() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let oracle = get_oracle_boundaries(deflate, 1024 * 1024);
@@ -3924,8 +3964,8 @@ mod tests {
     fn test_find_chunk_end_is_absolute_bit_position() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let oracle = get_oracle_boundaries(deflate, 1024 * 1024);
@@ -3950,8 +3990,8 @@ mod tests {
         // correct remaining output.
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let oracle = get_oracle_boundaries(deflate, 2 * 1024 * 1024);
@@ -3990,8 +4030,8 @@ mod tests {
     fn test_find_chunk_end_returns_none_past_end() {
         let data = make_compressible_data(1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let past_end_bit = deflate.len() * 8 + 100;
@@ -4008,8 +4048,8 @@ mod tests {
     fn test_decode_sequential_from_with_window() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let oracle = get_oracle_boundaries(deflate, 1024 * 1024);
@@ -4035,8 +4075,8 @@ mod tests {
     fn test_decode_sequential_from_empty_at_end() {
         let data = make_compressible_data(1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         // start_bit past the end: inflate_bit returns None → DecodeFailed.
@@ -4055,8 +4095,8 @@ mod tests {
     fn test_search_boundary_forward_returns_forward_only() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let total_bits = deflate.len() * 8;
@@ -4080,8 +4120,8 @@ mod tests {
     fn test_search_boundary_forward_result_passes_try_decode() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let total_bits = deflate.len() * 8;
@@ -4103,8 +4143,8 @@ mod tests {
     fn test_search_boundary_forward_finds_valid_boundary() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let total_bits = deflate.len() * 8;
@@ -4143,8 +4183,8 @@ mod tests {
     fn test_confirm_all_hits() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let oracle = get_oracle_boundaries(deflate, 2 * 1024 * 1024);
@@ -4188,8 +4228,8 @@ mod tests {
     fn test_confirm_all_misses() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         // All speculative chunks are None → all misses → full sequential decode
@@ -4271,8 +4311,8 @@ mod tests {
     fn test_speculation_hit_invariant() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let oracle = get_oracle_boundaries(deflate, 2 * 1024 * 1024);
@@ -4419,8 +4459,8 @@ mod tests {
     fn test_speculative_decode_parallel_chunk0_always_some() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let total_bits = deflate.len() * 8;
@@ -4440,8 +4480,8 @@ mod tests {
     fn test_speculative_decode_parallel_produces_correct_count() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         for num_chunks in [2, 4, 8] {
@@ -4489,8 +4529,8 @@ mod tests {
         // must decode everything sequentially and produce correct output.
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let isize_offset = compressed.len() - 4;
@@ -4580,8 +4620,8 @@ mod tests {
         // Window from sequential decode of chunk 1 must propagate to chunk 2.
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&compressed).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
+            .expect("valid header");
         let deflate = &compressed[header_size..compressed.len() - 8];
 
         let isize_offset = compressed.len() - 4;
