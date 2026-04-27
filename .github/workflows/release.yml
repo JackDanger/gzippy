@@ -462,10 +462,20 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Publish AUR package (gzippy-bin)
-  # Required secret: AUR_SSH_KEY — SSH private key registered on aur.archlinux.org
-  #   1. Generate: ssh-keygen -t ed25519 -C "releases@jackdanger.com" -f aur_key
-  #   2. Register the public key at https://aur.archlinux.org/account/edit
-  #   3. Add the private key as repo secret AUR_SSH_KEY
+  # Required secret: AUR_SSH_KEY — SSH PRIVATE key (NOT the public key from
+  # the AUR account page; the AUR account page only shows public keys for
+  # display).
+  #   1. Generate keypair:
+  #        ssh-keygen -t ed25519 -C "releases@jackdanger.com" -f aur_key -N ""
+  #      Produces aur_key (private) + aur_key.pub (public).
+  #   2. Register the PUBLIC half on AUR:
+  #        cat aur_key.pub  →  paste into https://aur.archlinux.org/account/edit
+  #   3. Store the PRIVATE half as a repo secret:
+  #        gh secret set AUR_SSH_KEY --repo JackDanger/gzippy < aur_key
+  #   4. Delete the local copies once both are in place.
+  #
+  # The "Set up SSH for AUR" step validates the secret is a private key and
+  # prints clear remediation if it isn't.
   # ---------------------------------------------------------------------------
   publish-aur:
     name: AUR / gzippy-bin
@@ -510,9 +520,18 @@ jobs:
           # ambiguous between bad-key and not-registered-on-AUR.
           if ! ssh-keygen -y -f ~/.ssh/aur > /dev/null 2>&1; then
             echo "::error::AUR_SSH_KEY cannot be parsed as an SSH private key."
-            echo "::error::Most common cause: secret was pasted without newlines"
-            echo "::error::or with CRLF line endings."
-            echo "::error::Re-add via: gh secret set AUR_SSH_KEY < /path/to/aur_key"
+            echo "::error::"
+            echo "::error::This secret needs the PRIVATE key, not the public key."
+            echo "::error::A keypair has two halves — they look like this:"
+            echo "::error::  - aur_key.pub  (PUBLIC, one line, starts 'ssh-ed25519 AAAA...')"
+            echo "::error::                   → goes on https://aur.archlinux.org/account/edit"
+            echo "::error::  - aur_key      (PRIVATE, multiple lines, wrapped in"
+            echo "::error::                   '-----BEGIN OPENSSH PRIVATE KEY-----')"
+            echo "::error::                   → goes here, in the AUR_SSH_KEY secret"
+            echo "::error::"
+            echo "::error::Other causes: pasted without newlines / with CRLF endings."
+            echo "::error::"
+            echo "::error::Fix:  gh secret set AUR_SSH_KEY --repo JackDanger/gzippy < /path/to/aur_key"
             exit 1
           fi
           echo "AUR SSH key OK: $(ssh-keygen -l -f ~/.ssh/aur)"
