@@ -1,17 +1,17 @@
 Package: gzippy
-Version: 0.1.7-1
+Version: 0.3.0-1
 Architecture: arm64
 Maintainer: Jack Danger <github@jackdanger.com>
-Installed-Size: 854
+Installed-Size: 931
 Depends: libc6 (>= 2.34), libgcc-s1 (>= 4.2)
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy_0.1.7-1_arm64.deb
-Size: 387308
-SHA256: 512f694fd1e7bdc2fb04b6abd2aea5ea34fcf897bd0fc5cb52be33897798a4d2
-SHA1: 4e4a533381a7a74a3684f103e2a3a8666cb34771
-MD5sum: eaeb9b827454212b1e52256c19e67bb9
+Filename: pool/main/g/gzippy/gzippy_0.3.0-1_arm64.deb
+Size: 409142
+SHA256: b618b835f4201a9530f74a7cac24b3febbf7bb857716858ac9bf04170d905238
+SHA1: 089598f46d28e8ea998c2c68d5bf50efcc83a038
+MD5sum: fe528d2f209bd0e6822bdabbc50b40b8
 Description: The fastest parallel gzip
  Gzippy is a high-performance parallel gzip implementation written in Rust.
  It beats gzip and pigz by leveraging multiple CPU cores, SIMD instructions,
@@ -27,19 +27,19 @@ Description: The fastest parallel gzip
 
 Package: gzippy-replace-gzip
 Source: gzippy
-Version: 0.1.7-1
+Version: 0.3.0-1
 Architecture: all
 Maintainer: Jack Danger <github@jackdanger.com>
 Installed-Size: 9
-Depends: gzippy (>= 0.1.7-1)
+Depends: gzippy (>= 0.3.0-1)
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.1.7-1_all.deb
-Size: 1878
-SHA256: 4949a14b01211f6b17d14851173d75613507870f09e4b866d5408533782bf620
-SHA1: 59c8921f61e6c6724b9317df3f4ed9d6185e8a56
-MD5sum: d9e1f94d63be3ac30ee42923cc9d230b
+Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.3.0-1_all.deb
+Size: 2122
+SHA256: 4edabe3521be2484e685abaed2b65416ad9e0f652a631477876ca8af20041204
+SHA1: d0b243aa0e731e9aa2724ac7d8e8783b56e43ff8
+MD5sum: 12046087112cca61f36fe5f8c686437a
 Description: Transitional package — gzippy now replaces gzip automatically
  This is a no-op transitional package. As of gzippy 0.1.6, installing the
  gzippy package automatically diverts /usr/bin/gzip, /usr/bin/gunzip, and

@@ -1,17 +1,17 @@
 Package: gzippy
-Version: 0.1.7-1
+Version: 0.3.0-1
 Architecture: amd64
 Maintainer: Jack Danger <github@jackdanger.com>
-Installed-Size: 977
+Installed-Size: 1016
 Depends: libc6 (>= 2.34), libgcc-s1 (>= 4.2)
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy_0.1.7-1_amd64.deb
-Size: 427858
-SHA256: 7c40f5ac4cf9385fe2aad530eddd0623c941d0e45d0b0ca8276d0571e468efac
-SHA1: 0ab74cd65e8937fb7ef040f5e6c054c78aa1df93
-MD5sum: b825fcf11ac3c56cdc87fcb848c2ad82
+Filename: pool/main/g/gzippy/gzippy_0.3.0-1_amd64.deb
+Size: 450024
+SHA256: 74f894e224d86d280188974427075eecd8f2953601a4adf4baddbfe9ab495d4e
+SHA1: 0c11ced5483c6ec08f31429dc025656f37dad581
+MD5sum: 2acda4c904adc7fd049b2653f7bf0093
 Description: The fastest parallel gzip
  Gzippy is a high-performance parallel gzip implementation written in Rust.
  It beats gzip and pigz by leveraging multiple CPU cores, SIMD instructions,
@@ -27,19 +27,19 @@ Description: The fastest parallel gzip
 
 Package: gzippy-replace-gzip
 Source: gzippy
-Version: 0.1.7-1
+Version: 0.3.0-1
 Architecture: all
 Maintainer: Jack Danger <github@jackdanger.com>
 Installed-Size: 9
-Depends: gzippy (>= 0.1.7-1)
+Depends: gzippy (>= 0.3.0-1)
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.1.7-1_all.deb
-Size: 1878
-SHA256: 4949a14b01211f6b17d14851173d75613507870f09e4b866d5408533782bf620
-SHA1: 59c8921f61e6c6724b9317df3f4ed9d6185e8a56
-MD5sum: d9e1f94d63be3ac30ee42923cc9d230b
+Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.3.0-1_all.deb
+Size: 2122
+SHA256: 4edabe3521be2484e685abaed2b65416ad9e0f652a631477876ca8af20041204
+SHA1: d0b243aa0e731e9aa2724ac7d8e8783b56e43ff8
+MD5sum: 12046087112cca61f36fe5f8c686437a
 Description: Transitional package — gzippy now replaces gzip automatically
  This is a no-op transitional package. As of gzippy 0.1.6, installing the
  gzippy package automatically diverts /usr/bin/gzip, /usr/bin/gunzip, and
