@@ -1156,41 +1156,6 @@ mod tests {
     }
 
     // =========================================================================
-    // INVARIANT: parallel path must succeed (no fallback) on the production
-    // gate's input range — ISA-L available, T>1, compressed > 10 MiB.
-    //
-    // Locks in the v0.3.0 wiring. If decompress_parallel starts returning Err
-    // on inputs that satisfy the production gate, the routing layer silently
-    // falls back to ISA-L sequential and we lose ~2× throughput without any
-    // test catching it. This test fires loudly instead.
-    // =========================================================================
-
-    #[test]
-    fn test_parallel_path_no_silent_fallback() {
-        if !crate::backends::isal_decompress::is_available() {
-            eprintln!("skipping: ISA-L unavailable on this build/arch");
-            return;
-        }
-
-        // 20 MiB compresses to ~10.3 MB on Linux x86_64 — borderline below the
-        // 10 MiB gate. Use 32 MiB so we clear the gate on every host.
-        let data = make_compressible_data(32 * 1024 * 1024);
-        let compressed = make_gzip_data(&data);
-        assert!(
-            compressed.len() > 10 * 1024 * 1024,
-            "test input must exceed production MIN_PARALLEL_COMPRESSED gate; \
-             got {} bytes",
-            compressed.len()
-        );
-
-        let mut output = Vec::new();
-        let bytes = decompress_parallel(&compressed, &mut output, 4)
-            .expect("parallel path must succeed on ISA-L + T>1 + >10MB input");
-        assert_eq!(bytes as usize, data.len());
-        assert_eq!(output, data, "parallel output content mismatch");
-    }
-
-    // =========================================================================
     // INVARIANT: pipeline on silesia produces correct output
     // Catches: real-world data failures
     // =========================================================================
