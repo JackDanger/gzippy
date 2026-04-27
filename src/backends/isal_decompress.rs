@@ -21,6 +21,10 @@ pub fn is_available() -> bool {
 pub fn decompress_gzip_stream<W: std::io::Write>(input: &[u8], writer: &mut W) -> Option<u64> {
     use isal::isal_sys::igzip_lib as isal_raw;
 
+    if input.is_empty() {
+        return None;
+    }
+
     let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
     unsafe { isal_raw::isal_inflate_init(&mut state) };
     state.crc_flag = isal_raw::IGZIP_GZIP;
@@ -30,7 +34,6 @@ pub fn decompress_gzip_stream<W: std::io::Write>(input: &[u8], writer: &mut W) -
 
     let mut out_buf = vec![0u8; 1024 * 1024];
     let mut total = 0u64;
-    let mut finished = false;
 
     loop {
         state.avail_out = out_buf.len() as u32;
@@ -50,17 +53,11 @@ pub fn decompress_gzip_stream<W: std::io::Write>(input: &[u8], writer: &mut W) -
         }
 
         if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
-            finished = true;
-            break;
+            return Some(total);
         }
         if written == 0 && state.avail_in == 0 {
-            break;
+            return None;
         }
-    }
-    if finished {
-        Some(total)
-    } else {
-        None
     }
 }
 
@@ -78,6 +75,10 @@ pub fn decompress_gzip_stream_threaded<W: std::io::Write + Send + 'static>(
     writer: W,
 ) -> Option<(u64, W)> {
     use isal::isal_sys::igzip_lib as isal_raw;
+
+    if input.is_empty() {
+        return None;
+    }
 
     let wa = crate::infra::io_thread::WriteAhead::new(writer, 4);
 
@@ -112,7 +113,7 @@ pub fn decompress_gzip_stream_threaded<W: std::io::Write + Send + 'static>(
             break;
         }
         if written == 0 && state.avail_in == 0 {
-            break;
+            return None;
         }
     }
 
@@ -196,6 +197,7 @@ pub fn scan_deflate_isal(
 
     let chunk_size: u32 = 256 * 1024;
 
+    let mut finished = false;
     loop {
         let remaining_out = output.len() - out_pos;
         if remaining_out == 0 {
@@ -231,11 +233,16 @@ pub fn scan_deflate_isal(
         }
 
         if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            finished = true;
             break;
         }
         if written == 0 && state.avail_in == 0 {
             break;
         }
+    }
+
+    if !finished {
+        return None;
     }
 
     Some(ScanResult {

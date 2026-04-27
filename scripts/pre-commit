@@ -4,6 +4,19 @@ set -euo pipefail
 
 changed_rs=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
 changed_yaml=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.github/.*\.ya?ml$' || true)
+changed_version=$(git diff --cached --name-only --diff-filter=ACM | grep -E '^(VERSION|Cargo\.toml|Formula/gzippy\.rb)$' || true)
+
+# Check version consistency if any version file changed
+if [ -n "$changed_version" ]; then
+    VERSION=$(cat VERSION 2>/dev/null || echo "")
+    CARGO_VERSION=$(grep "^version = " Cargo.toml | sed 's/.*"\(.*\)".*/\1/' 2>/dev/null || echo "")
+    FORMULA_VERSION=$(grep "version \"" Formula/gzippy.rb | sed 's/.*version "\(.*\)".*/\1/' 2>/dev/null || echo "")
+
+    if [ "$VERSION" != "$CARGO_VERSION" ] || [ "$VERSION" != "$FORMULA_VERSION" ]; then
+        echo "❌ Version mismatch: VERSION=$VERSION Cargo=$CARGO_VERSION Formula=$FORMULA_VERSION"
+        exit 1
+    fi
+fi
 
 # Only run checks relevant to what's staged
 if [ -n "$changed_yaml" ]; then

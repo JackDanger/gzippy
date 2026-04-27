@@ -368,3 +368,76 @@ jobs:
           || echo "GitHub Pages already configured"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Publish AUR package (gzippy-bin)
+  # Required secret: AUR_SSH_KEY — SSH private key registered on aur.archlinux.org
+  #   1. Generate: ssh-keygen -t ed25519 -C "releases@jackdanger.com" -f aur_key
+  #   2. Register the public key at https://aur.archlinux.org/account/edit
+  #   3. Add the private key as repo secret AUR_SSH_KEY
+  # ---------------------------------------------------------------------------
+  publish-aur:
+    name: AUR / gzippy-bin
+    runs-on: ubuntu-latest
+    needs: release
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*-linux-*
+          merge-multiple: true
+
+      - name: Set up SSH for AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          cat >> ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User aur
+          EOF
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+
+      - name: Update and push AUR package
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+
+          X86_SHA=$(cat gzippy-x86_64-unknown-linux-gnu.tar.gz.sha256 | awk '{print $1}')
+          ARM_SHA=$(cat gzippy-aarch64-unknown-linux-gnu.tar.gz.sha256 | awk '{print $1}')
+
+          bash scripts/update-aur.sh "$VERSION" "$X86_SHA" "$ARM_SHA"
+
+      - name: Smoke-test PKGBUILD (Docker)
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+
+          # Stamp version into a local copy and verify makepkg --verifysource passes
+          cp aur/gzippy-bin/PKGBUILD /tmp/PKGBUILD-test
+          sed -i "s/pkgver=.*/pkgver=$VERSION/" /tmp/PKGBUILD-test
+          sed -i "s|/vVERSION/|/v$VERSION/|g"   /tmp/PKGBUILD-test
+
+          X86_SHA=$(cat gzippy-x86_64-unknown-linux-gnu.tar.gz.sha256 | awk '{print $1}')
+          ARM_SHA=$(cat gzippy-aarch64-unknown-linux-gnu.tar.gz.sha256 | awk '{print $1}')
+          sed -i "s/sha256sums_x86_64=.*/sha256sums_x86_64=('$X86_SHA')/" /tmp/PKGBUILD-test
+          sed -i "s/sha256sums_aarch64=.*/sha256sums_aarch64=('$ARM_SHA')/" /tmp/PKGBUILD-test
+
+          docker run --rm \
+            -v /tmp/PKGBUILD-test:/pkg/PKGBUILD:ro \
+            -w /pkg \
+            archlinux:latest \
+            bash -c "
+              pacman -Sy --noconfirm base-devel 2>/dev/null
+              useradd -m builder
+              chown -R builder /pkg
+              su builder -c 'makepkg --verifysource --nodeps'
+            "
+          echo "PKGBUILD smoke test passed"

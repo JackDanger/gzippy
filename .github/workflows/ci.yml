@@ -909,3 +909,14 @@ jobs:
       - name: Run clippy
         run: |
           cargo clippy --release --features isal-compression -- -D warnings
+
+      - name: Check version consistency
+        run: |
+          VERSION=$(cat VERSION)
+          CARGO_VERSION=$(grep "^version = " Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          FORMULA_VERSION=$(grep "version \"" Formula/gzippy.rb | sed 's/.*version "\(.*\)".*/\1/')
+
+          echo "Checking versions: VERSION=$VERSION Cargo=$CARGO_VERSION Formula=$FORMULA_VERSION"
+          [ "$VERSION" = "$CARGO_VERSION" ] || { echo "VERSION ($VERSION) != Cargo.toml ($CARGO_VERSION)"; exit 1; }
+          [ "$VERSION" = "$FORMULA_VERSION" ] || { echo "VERSION ($VERSION) != Formula ($FORMULA_VERSION)"; exit 1; }
+          echo "✓ All versions match"
