@@ -1172,7 +1172,9 @@ mod tests {
             return;
         }
 
-        let data = make_compressible_data(20 * 1024 * 1024);
+        // 20 MiB compresses to ~10.3 MB on Linux x86_64 — borderline below the
+        // 10 MiB gate. Use 32 MiB so we clear the gate on every host.
+        let data = make_compressible_data(32 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
         assert!(
             compressed.len() > 10 * 1024 * 1024,
