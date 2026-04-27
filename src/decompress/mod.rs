@@ -7,9 +7,11 @@
 pub mod bgzf;
 pub mod combined_lut;
 pub mod format;
+pub mod inflate;
 pub mod inflate_tables;
 pub mod io;
 pub mod packed_lut;
+pub mod parallel;
 pub mod scan_inflate;
 pub mod simd_copy;
 pub mod simd_huffman;
@@ -182,7 +184,7 @@ pub(crate) fn decompress_single_member<W: Write>(
         && num_threads > 1
         && data.len() > MIN_PARALLEL_COMPRESSED
     {
-        match crate::experiments::parallel_single_member::decompress_parallel(
+        match crate::decompress::parallel::single_member::decompress_parallel(
             data,
             writer,
             num_threads,

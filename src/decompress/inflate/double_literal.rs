@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 #![allow(clippy::needless_range_loop)]
 
-use crate::experiments::libdeflate_entry::LitLenTable;
+use crate::decompress::inflate::libdeflate_entry::LitLenTable;
 
 /// Double-literal cache entry
 ///
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn test_double_lit_cache_build() {
         // Build fixed litlen table
-        let tables = crate::experiments::libdeflate_decode::get_fixed_tables();
+        let tables = crate::decompress::inflate::libdeflate_decode::get_fixed_tables();
         let cache = DoubleLitCache::build(&tables.0);
 
         // Debug: check a few entries
@@ -249,7 +249,7 @@ mod tests {
         let deflate = &compressed[start..end];
 
         // Build tables
-        let tables = crate::experiments::libdeflate_decode::get_fixed_tables();
+        let tables = crate::decompress::inflate::libdeflate_decode::get_fixed_tables();
         let double_cache = DoubleLitCache::build(&tables.0);
 
         // Benchmark: simulate decoding literals using double-literal cache

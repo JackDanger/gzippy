@@ -14,7 +14,7 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::needless_borrow)]
 
-use crate::experiments::libdeflate_entry::{DistTable, LitLenTable};
+use crate::decompress::inflate::libdeflate_entry::{DistTable, LitLenTable};
 
 /// Check if BMI2 is available at runtime
 #[cfg(target_arch = "x86_64")]
@@ -799,9 +799,9 @@ fn decode_huffman_double_lit(
     mut out_pos: usize,
     litlen_table: &LitLenTable,
     dist_table: &DistTable,
-    double_cache: &crate::experiments::double_literal::DoubleLitCache,
+    double_cache: &crate::decompress::inflate::double_literal::DoubleLitCache,
 ) -> Result<usize> {
-    use crate::experiments::double_literal::DOUBLE_LIT_BITS;
+    use crate::decompress::inflate::double_literal::DOUBLE_LIT_BITS;
 
     const FASTLOOP_MARGIN: usize = 274;
 
@@ -1186,7 +1186,8 @@ mod tests {
 
         // Build double-literal cache for fixed tables
         let tables = get_fixed_tables();
-        let _double_cache = crate::experiments::double_literal::DoubleLitCache::build(&tables.0);
+        let _double_cache =
+            crate::decompress::inflate::double_literal::DoubleLitCache::build(&tables.0);
 
         // Benchmark regular decode
         let iterations = 5;
@@ -1217,7 +1218,8 @@ mod tests {
         eprintln!("Ratio: {:.1}%", 100.0 * regular_throughput / lib_throughput);
         eprintln!(
             "Double-literal cache size: {} KB",
-            std::mem::size_of::<crate::experiments::double_literal::DoubleLitCache>() / 1024
+            std::mem::size_of::<crate::decompress::inflate::double_literal::DoubleLitCache>()
+                / 1024
         );
         eprintln!("================================\n");
     }

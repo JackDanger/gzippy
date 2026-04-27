@@ -17,16 +17,19 @@
 ### Decompression
 
 ```
-Input → decompression.rs: decompress_gzip_libdeflate
+Input → decompress::mod: decompress_gzip_libdeflate
   ├─ gzippy-parallel? ("GZ" subfield in FEXTRA)
   │     → bgzf::decompress_bgzf_parallel (libdeflate FFI, T1 or Tmax internally)
   ├─ Multi-member? (trailing gzip headers detected)
   │     T1  → decompress_multi_member_sequential (libdeflate, member-by-member)
   │     Tmax → bgzf::decompress_multi_member_parallel (libdeflate FFI)
   └─ Single-member?
-        x86_64 (ISA-L available) → isal_decompress::decompress_gzip_stream
-        any arch, data > 1GB (no ISA-L) → decompress_single_member_streaming (zlib-ng)
-        default → decompress_single_member_libdeflate
+        ISA-L + T>1 + compressed > 10 MiB
+            → parallel::single_member::decompress_parallel
+              (rapidgzip-style speculation + ISA-L inflatePrime; v0.3.0)
+        x86_64 (ISA-L available)        → isal_decompress::decompress_gzip_stream
+        any arch, data > 1 GiB (no ISA-L) → decompress_single_member_streaming (zlib-ng)
+        default                          → decompress_single_member_libdeflate
 ```
 
 ### Compression
@@ -43,17 +46,22 @@ T1, all other            → flate2 single-threaded
 routes them to `bgzf::decompress_bgzf_parallel`. `PipelinedGzEncoder` output is plain
 single-member — decompresses on the single-member path.
 
-## Experiments (not yet wired into production)
+## Optimization Branches
 
-- `parallel_single_member.rs` — speculative parallel for single-member files.
-  Measured at 88–148 MB/s vs 600–2000 MB/s sequential. **Not wired in.**
-- `speculative_parallel.rs` — RapidGzip-style u16 marker approach.
-  Not declared in `main.rs`; not compiled. Preserved for future experimentation.
+There is no `src/experiments/`. Every module on `main` is reachable from a
+production code path or is a test fixture / supportive script.
 
-To wire in an experiment: add it to `decompress_single_member` in `decompression.rs`
-behind a size gate, verify with `make route-check`, then run `make quick`.
+To prototype a new path: add the module under the relevant subsystem
+(`src/decompress/`, `src/compress/`, etc.), wire a feature-gated or size-gated
+call site in the routing table above, and add a strict correctness test (no
+silent fallback). When proven on cloud fleet, lift the gate. When abandoned,
+delete the module — `main` does not host dead code.
 
-## Score: 47W / 13L (Feb 21 2026, cloud fleet)
+Regression tests that lock in the parallel single-member wiring:
+`decompress::parallel::single_member::tests::test_parallel_path_no_silent_fallback`
+and `tests::routing::tests::test_single_member_routing_multithread`.
+
+## Score: 47W / 13L (Feb 21 2026, cloud fleet — predates v0.3.0 parallel SM)
 
 | Category | Losses | Gap | Actionability |
 |----------|--------|-----|---------------|
@@ -74,12 +82,15 @@ become all-marker forcing huge sequential re-decodes),
 two-pass scan-then-decode, large pre-allocations.
 
 **arm64 single-member**: currently falls through to libdeflate one-shot (fast enough).
-Streaming path only for files > 1GB. ISA-L is unavailable on arm64.
+Streaming path only for files > 1 GiB. ISA-L is unavailable on arm64; the parallel
+single-member path is gated on `isal_decompress::is_available()` so arm64 never
+takes it.
 
-**Parallel speculation guard** (future work): if `parallel_single_member` is ever wired in,
-it must be gated on `isal_decompress::is_available()` — x86_64 only. Speculative parallel
-on arm64 was 16× slower on low-redundancy data (block boundaries rare, most chunks become
-all-marker forcing huge sequential re-decodes).
+**v0.3.0 — parallel single-member**: ISA-L `inflatePrime` (rapidgzip's pattern from
+`isal.hpp`) re-decodes confirmed chunks at non-byte-aligned bit offsets at full
+ISA-L SIMD speed (~1500 MB/s/thread), replacing the prior pure-Rust marker decoder
+(22 MB/s/thread). Wired into `decompress::decompress_single_member` behind
+`isal_decompress::is_available() && num_threads > 1 && data.len() > 10 MiB`.
 
 ## Branch and PR Workflow
 
@@ -136,14 +147,18 @@ vs pigz for all four combos (T1/T4 × 1MB/10MB). Use this before ANY decompressi
 
 | File | Role |
 |------|------|
-| `src/decompression.rs` | Decompression entry, format detect, routing |
-| `src/bgzf.rs` | gzippy-parallel + multi-member parallel (~8400 lines, core engine) |
-| `src/isal_decompress.rs` | ISA-L streaming inflate (x86_64 production path) |
-| `src/libdeflate_ext.rs` | libdeflate FFI — gzip_decompress_ex (arm64 + fallback) |
-| `src/compression.rs` | Compression entry, routing |
-| `src/parallel_compress.rs` | ParallelGzEncoder — T>1 L0–L5, "GZ" multi-block output |
-| `src/pipelined_compress.rs` | PipelinedGzEncoder — T>1 L6–L9, single-member output |
-| `src/isal_compress.rs` | ISA-L compression (x86_64 T1 L0–L3) |
-| `src/parallel_single_member.rs` | EXPERIMENT: speculative parallel (not wired in, 88–148 MB/s) |
-| `src/speculative_parallel.rs` | EXPERIMENT: RapidGzip u16-marker approach (not in main.rs) |
-| `src/consume_first_decode.rs` | EXPERIMENT: pure Rust inflate (not production) |
+| `src/decompress/mod.rs` | Decompression entry, format detect, routing |
+| `src/decompress/bgzf.rs` | gzippy-parallel + multi-member parallel (core engine) |
+| `src/decompress/scan_inflate.rs` | Streaming scan-and-inflate path |
+| `src/decompress/parallel/single_member.rs` | v0.3.0 parallel SM — ISA-L `inflatePrime` |
+| `src/decompress/parallel/{block_finder,marker_decode,ultra_fast_inflate}.rs` | Speculation supporting primitives |
+| `src/decompress/inflate/consume_first_decode.rs` | Pure-Rust inflate (production helpers used by `bgzf`, `scan_inflate`) |
+| `src/decompress/inflate/{consume_first_table,jit_decode,libdeflate_decode,libdeflate_entry,specialized_decode,vector_huffman,double_literal,bmi2}.rs` | Huffman/inflate building blocks |
+| `src/decompress/{combined_lut,inflate_tables,packed_lut,simd_copy,simd_huffman,two_level_table}.rs` | SIMD + LUT primitives shared with bgzf |
+| `src/backends/isal_decompress.rs` | ISA-L streaming inflate (x86_64 production path) |
+| `src/backends/inflate_bit.rs` | Universal inflate-from-bit (ISA-L on x86_64, libz-ng elsewhere) |
+| `src/backends/libdeflate.rs` | libdeflate FFI — `gzip_decompress_ex` |
+| `src/compress/mod.rs` | Compression entry, routing |
+| `src/compress/parallel.rs` | ParallelGzEncoder — T>1 L0–L5, "GZ" multi-block output |
+| `src/compress/pipelined.rs` | PipelinedGzEncoder — T>1 L6–L9, single-member output |
+| `src/backends/isal_compress.rs` | ISA-L compression (x86_64 T1 L0–L3) |

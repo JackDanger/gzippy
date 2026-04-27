@@ -248,6 +248,55 @@ mod tests {
     }
 
     // =========================================================================
+    // Production routing: a single-member input large enough to clear the
+    // 10 MiB parallel-path gate must produce correct output via
+    // `decompress_single_member`. On x86_64 this exercises the parallel ISA-L
+    // `inflatePrime` path wired in at v0.3.0; on arm64 it exercises libdeflate.
+    // Either way, bytes must match.
+    // =========================================================================
+
+    #[test]
+    fn test_single_member_routing_multithread() {
+        // Use mostly-random data so it doesn't compress past the 10 MiB gate.
+        // Target: ~14 MiB compressed.
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "test input must exceed parallel-path 10 MiB gate (got {} bytes)",
+            compressed.len()
+        );
+
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        assert_eq!(
+            output, original,
+            "decompress_single_member(T=4) output mismatch — production routing broken"
+        );
+    }
+
+    /// 60% random / 40% short repetition — compresses to ~60% of original.
+    /// Sized to clear the 10 MiB parallel-path gate without being huge.
+    fn make_low_entropy_data(size: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(size);
+        let mut rng: u64 = 0xfeedface;
+        while data.len() < size {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if (rng >> 32) % 5 < 3 {
+                data.push((rng >> 16) as u8);
+            } else {
+                let byte = ((rng >> 24) % 26 + b'a' as u64) as u8;
+                let repeat = ((rng >> 40) % 8 + 2) as usize;
+                for _ in 0..repeat.min(size - data.len()) {
+                    data.push(byte);
+                }
+            }
+        }
+        data.truncate(size);
+        data
+    }
+
+    // =========================================================================
     // Layer 3: Output Identity — same output regardless of thread count
     // =========================================================================
 

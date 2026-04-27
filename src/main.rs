@@ -26,11 +26,6 @@ mod backends; // isal, isal_compress, isal_decompress, libdeflate
 // ── Threading infrastructure ──────────────────────────────────────────────────
 mod infra; // thread_pool, scheduler, io_thread
 
-// ── Experimental paths (not wired into production) ────────────────────────────
-// See CLAUDE.md "Experiments" section and CLAUDE.md score table before wiring in.
-// Current best: parallel_single_member at 88–148 MB/s vs 600–2000 MB/s sequential.
-mod experiments; // parallel_single_member, speculative_parallel, marker_decode, …
-
 // ── Test infrastructure ───────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests;

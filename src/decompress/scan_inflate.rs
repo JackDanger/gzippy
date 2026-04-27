@@ -9,7 +9,7 @@
 //! Current implementation uses a full output buffer for correctness.
 //! Future optimization: circular-buffer decode that fits in L1 cache.
 
-use crate::experiments::consume_first_decode::Bits;
+use crate::decompress::inflate::consume_first_decode::Bits;
 use std::io::{Error, ErrorKind, Result};
 
 pub const WINDOW_SIZE: usize = 32768;
@@ -93,21 +93,21 @@ pub fn scan_deflate(
 
         match btype {
             0 => {
-                out_pos = crate::experiments::consume_first_decode::decode_stored_pub(
+                out_pos = crate::decompress::inflate::consume_first_decode::decode_stored_pub(
                     &mut bits,
                     &mut output,
                     out_pos,
                 )?
             }
             1 => {
-                out_pos = crate::experiments::consume_first_decode::decode_fixed_pub(
+                out_pos = crate::decompress::inflate::consume_first_decode::decode_fixed_pub(
                     &mut bits,
                     &mut output,
                     out_pos,
                 )?
             }
             2 => {
-                out_pos = crate::experiments::consume_first_decode::decode_dynamic_pub(
+                out_pos = crate::decompress::inflate::consume_first_decode::decode_dynamic_pub(
                     &mut bits,
                     &mut output,
                     out_pos,
@@ -191,21 +191,21 @@ pub fn scan_deflate_fast(
         let old_out_pos = out_pos;
         match btype {
             0 => {
-                out_pos = crate::experiments::consume_first_decode::decode_stored_pub(
+                out_pos = crate::decompress::inflate::consume_first_decode::decode_stored_pub(
                     &mut bits,
                     &mut output,
                     out_pos,
                 )?
             }
             1 => {
-                out_pos = crate::experiments::consume_first_decode::decode_fixed_pub(
+                out_pos = crate::decompress::inflate::consume_first_decode::decode_fixed_pub(
                     &mut bits,
                     &mut output,
                     out_pos,
                 )?
             }
             2 => {
-                out_pos = crate::experiments::consume_first_decode::decode_dynamic_pub(
+                out_pos = crate::decompress::inflate::consume_first_decode::decode_dynamic_pub(
                     &mut bits,
                     &mut output,
                     out_pos,
@@ -258,7 +258,7 @@ mod tests {
 
         // Verify reference decoder works
         let mut ref_output = vec![0u8; original.len() + 1024];
-        let ref_size = crate::experiments::consume_first_decode::inflate_consume_first(
+        let ref_size = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
             &compressed,
             &mut ref_output,
         )
@@ -357,7 +357,7 @@ mod tests {
 
         // Verify windows match what a full decode produces
         let mut full_output = vec![0u8; original.len() + 1024];
-        let full_size = crate::experiments::consume_first_decode::inflate_consume_first(
+        let full_size = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
             &compressed,
             &mut full_output,
         )
@@ -392,8 +392,8 @@ mod tests {
             }
         };
 
-        let header_size =
-            crate::experiments::marker_decode::skip_gzip_header(&gz).expect("valid header");
+        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&gz)
+            .expect("valid header");
         let deflate = &gz[header_size..gz.len() - 8];
         let isize_val = u32::from_le_bytes([
             gz[gz.len() - 4],
@@ -405,7 +405,9 @@ mod tests {
         // Warmup
         let _ = scan_deflate_fast(deflate, isize_val / 8, isize_val);
         let mut out = vec![0u8; isize_val + 256 * 1024];
-        let _ = crate::experiments::consume_first_decode::inflate_consume_first(deflate, &mut out);
+        let _ = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
+            deflate, &mut out,
+        );
 
         // Measure scan_deflate_fast (5 trials)
         let mut scan_times = Vec::new();
@@ -420,9 +422,10 @@ mod tests {
         let mut seq_times = Vec::new();
         for _ in 0..5 {
             let t = std::time::Instant::now();
-            let sz =
-                crate::experiments::consume_first_decode::inflate_consume_first(deflate, &mut out)
-                    .unwrap();
+            let sz = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
+                deflate, &mut out,
+            )
+            .unwrap();
             seq_times.push(t.elapsed());
             assert_eq!(sz, isize_val);
         }

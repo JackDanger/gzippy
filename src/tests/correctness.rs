@@ -116,7 +116,7 @@ mod tests {
     }
 
     fn get_deflate_data(gz: &[u8]) -> &[u8] {
-        let header = crate::experiments::marker_decode::skip_gzip_header(gz).unwrap();
+        let header = crate::decompress::parallel::marker_decode::skip_gzip_header(gz).unwrap();
         &gz[header..gz.len() - 8]
     }
 
@@ -126,29 +126,32 @@ mod tests {
 
     #[test]
     fn test_header_too_short() {
-        assert!(crate::experiments::marker_decode::skip_gzip_header(&[0x1f, 0x8b]).is_err());
-        assert!(crate::experiments::marker_decode::skip_gzip_header(&[]).is_err());
-        assert!(crate::experiments::marker_decode::skip_gzip_header(&[0x1f]).is_err());
+        assert!(
+            crate::decompress::parallel::marker_decode::skip_gzip_header(&[0x1f, 0x8b]).is_err()
+        );
+        assert!(crate::decompress::parallel::marker_decode::skip_gzip_header(&[]).is_err());
+        assert!(crate::decompress::parallel::marker_decode::skip_gzip_header(&[0x1f]).is_err());
     }
 
     #[test]
     fn test_header_bad_magic() {
         let mut data = compress_single_member(b"hello");
         data[0] = 0x00;
-        assert!(crate::experiments::marker_decode::skip_gzip_header(&data).is_err());
+        assert!(crate::decompress::parallel::marker_decode::skip_gzip_header(&data).is_err());
     }
 
     #[test]
     fn test_header_bad_method() {
         let mut data = compress_single_member(b"hello");
         data[2] = 0x09; // method must be 8 (deflate)
-        assert!(crate::experiments::marker_decode::skip_gzip_header(&data).is_err());
+        assert!(crate::decompress::parallel::marker_decode::skip_gzip_header(&data).is_err());
     }
 
     #[test]
     fn test_header_minimal_size() {
         let data = compress_single_member(b"hello world");
-        let header_size = crate::experiments::marker_decode::skip_gzip_header(&data).unwrap();
+        let header_size =
+            crate::decompress::parallel::marker_decode::skip_gzip_header(&data).unwrap();
         assert!(header_size >= 10, "minimal header must be >= 10 bytes");
         assert!(header_size < data.len(), "header can't be the whole file");
     }
@@ -156,7 +159,8 @@ mod tests {
     #[test]
     fn test_header_fextra() {
         let bgzf = compress_bgzf(b"test data for fextra");
-        let header_size = crate::experiments::marker_decode::skip_gzip_header(&bgzf).unwrap();
+        let header_size =
+            crate::decompress::parallel::marker_decode::skip_gzip_header(&bgzf).unwrap();
         assert!(
             header_size > 10,
             "BGZF header with FEXTRA should be > 10 bytes, got {}",
@@ -176,7 +180,7 @@ mod tests {
         header.extend_from_slice(&[0, 0, 0, 0]); // CRC32
         header.extend_from_slice(&[0, 0, 0, 0]); // ISIZE
 
-        let size = crate::experiments::marker_decode::skip_gzip_header(&header).unwrap();
+        let size = crate::decompress::parallel::marker_decode::skip_gzip_header(&header).unwrap();
         assert_eq!(size, 10 + 9, "10 base + 'test.txt\\0' = 19");
     }
 
@@ -187,7 +191,7 @@ mod tests {
         header.extend_from_slice(&[0, 0, 0, 0, 0, 0xFF]); // MTIME + XFL + OS
         header.extend_from_slice(b"a comment\0");
         header.extend_from_slice(&[0x03, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]);
-        let size = crate::experiments::marker_decode::skip_gzip_header(&header).unwrap();
+        let size = crate::decompress::parallel::marker_decode::skip_gzip_header(&header).unwrap();
         assert_eq!(size, 10 + 10, "10 base + 'a comment\\0' = 20");
     }
 
@@ -352,9 +356,10 @@ mod tests {
         let gz = compress_single_member(b"");
         let deflate = get_deflate_data(&gz);
         let mut out = vec![0u8; 65536];
-        let size =
-            crate::experiments::consume_first_decode::inflate_consume_first(deflate, &mut out)
-                .unwrap();
+        let size = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
+            deflate, &mut out,
+        )
+        .unwrap();
         assert_eq!(size, 0);
     }
 
@@ -364,9 +369,10 @@ mod tests {
             let gz = compress_single_member(&[b]);
             let deflate = get_deflate_data(&gz);
             let mut out = vec![0u8; 65536];
-            let size =
-                crate::experiments::consume_first_decode::inflate_consume_first(deflate, &mut out)
-                    .unwrap();
+            let size = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
+                deflate, &mut out,
+            )
+            .unwrap();
             assert_eq!(&out[..size], &[b], "byte {}", b);
         }
     }
@@ -377,9 +383,10 @@ mod tests {
         let gz = compress_single_member(&data);
         let deflate = get_deflate_data(&gz);
         let mut out = vec![0u8; data.len() + 65536];
-        let size =
-            crate::experiments::consume_first_decode::inflate_consume_first(deflate, &mut out)
-                .unwrap();
+        let size = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
+            deflate, &mut out,
+        )
+        .unwrap();
         assert_eq!(&out[..size], &data[..]);
     }
 
@@ -389,9 +396,10 @@ mod tests {
         let gz = compress_single_member(&data);
         let deflate = get_deflate_data(&gz);
         let mut out = vec![0u8; data.len() + 65536];
-        let size =
-            crate::experiments::consume_first_decode::inflate_consume_first(deflate, &mut out)
-                .unwrap();
+        let size = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
+            deflate, &mut out,
+        )
+        .unwrap();
         assert_eq!(&out[..size], &data[..]);
     }
 
@@ -401,9 +409,10 @@ mod tests {
         let gz = compress_single_member(&data);
         let deflate = get_deflate_data(&gz);
         let mut out = vec![0u8; data.len() + 65536];
-        let size =
-            crate::experiments::consume_first_decode::inflate_consume_first(deflate, &mut out)
-                .unwrap();
+        let size = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
+            deflate, &mut out,
+        )
+        .unwrap();
         assert_eq!(&out[..size], &data[..]);
     }
 
@@ -413,9 +422,10 @@ mod tests {
         let gz = compress_single_member(&data);
         let deflate = get_deflate_data(&gz);
         let mut out = vec![0u8; data.len() + 65536];
-        let size =
-            crate::experiments::consume_first_decode::inflate_consume_first(deflate, &mut out)
-                .unwrap();
+        let size = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
+            deflate, &mut out,
+        )
+        .unwrap();
         assert_eq!(&out[..size], &data[..]);
     }
 
@@ -425,9 +435,10 @@ mod tests {
         let gz = compress_single_member(&data);
         let deflate = get_deflate_data(&gz);
         let mut out = vec![0u8; data.len() + 65536];
-        let size =
-            crate::experiments::consume_first_decode::inflate_consume_first(deflate, &mut out)
-                .unwrap();
+        let size = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
+            deflate, &mut out,
+        )
+        .unwrap();
         assert_eq!(&out[..size], &data[..]);
     }
 
@@ -468,7 +479,8 @@ mod tests {
 
     /// Helper: decode deflate data through marker_decode, return output bytes
     fn marker_decode_full(deflate: &[u8]) -> Vec<u8> {
-        let mut decoder = crate::experiments::marker_decode::MarkerDecoder::new(deflate, 0);
+        let mut decoder =
+            crate::decompress::parallel::marker_decode::MarkerDecoder::new(deflate, 0);
         match decoder.decode_until(usize::MAX) {
             Ok(_) => {}
             Err(e) => {
@@ -665,7 +677,8 @@ mod tests {
             let data = make_mixed(size);
             let gz = compress_single_member(&data);
             let deflate = get_deflate_data(&gz);
-            let mut decoder = crate::experiments::marker_decode::MarkerDecoder::new(deflate, 0);
+            let mut decoder =
+                crate::decompress::parallel::marker_decode::MarkerDecoder::new(deflate, 0);
             match decoder.decode_until(usize::MAX) {
                 Ok(_) => {
                     let out: Vec<u8> = decoder.output().iter().map(|&v| v as u8).collect();
@@ -702,7 +715,8 @@ mod tests {
             let data = make_mixed(size);
             let gz = compress_single_member(&data);
             let deflate = get_deflate_data(&gz);
-            let mut decoder = crate::experiments::marker_decode::MarkerDecoder::new(deflate, 0);
+            let mut decoder =
+                crate::decompress::parallel::marker_decode::MarkerDecoder::new(deflate, 0);
             match decoder.decode_until(usize::MAX) {
                 Ok(_) => {
                     let out: Vec<u8> = decoder.output().iter().map(|&v| v as u8).collect();
@@ -768,7 +782,8 @@ mod tests {
         ] {
             let gz = compress_single_member(&data);
             let deflate = get_deflate_data(&gz);
-            let mut decoder = crate::experiments::marker_decode::MarkerDecoder::new(deflate, 0);
+            let mut decoder =
+                crate::decompress::parallel::marker_decode::MarkerDecoder::new(deflate, 0);
             decoder.decode_until(usize::MAX).unwrap();
             assert_eq!(
                 decoder.marker_count(),
@@ -797,7 +812,7 @@ mod tests {
         let split_bit = cp.input_byte_pos * 8 - (cp.bitsleft as u8) as usize;
 
         // Chunk 0
-        let mut dec0 = crate::experiments::marker_decode::MarkerDecoder::new(deflate, 0);
+        let mut dec0 = crate::decompress::parallel::marker_decode::MarkerDecoder::new(deflate, 0);
         dec0.decode_until_bit(usize::MAX, split_bit).unwrap();
         assert_eq!(dec0.marker_count(), 0);
         let chunk0: Vec<u8> = dec0.output().iter().map(|&v| v as u8).collect();
@@ -805,18 +820,20 @@ mod tests {
         // Chunk 1
         let start_byte = split_bit / 8;
         let rel_bit = split_bit % 8;
-        let mut dec1 =
-            crate::experiments::marker_decode::MarkerDecoder::new(&deflate[start_byte..], rel_bit);
+        let mut dec1 = crate::decompress::parallel::marker_decode::MarkerDecoder::new(
+            &deflate[start_byte..],
+            rel_bit,
+        );
         dec1.decode_until(usize::MAX).unwrap();
 
         // Window from chunk 0's last 32KB
-        let ws = crate::experiments::marker_decode::WINDOW_SIZE;
+        let ws = crate::decompress::parallel::marker_decode::WINDOW_SIZE;
         let window_start = chunk0.len().saturating_sub(ws);
         let window = &chunk0[window_start..];
 
         // Resolve
         let mut chunk1_data = dec1.output().to_vec();
-        crate::experiments::marker_decode::replace_markers(&mut chunk1_data, window);
+        crate::decompress::parallel::marker_decode::replace_markers(&mut chunk1_data, window);
         let chunk1: Vec<u8> = chunk1_data.iter().map(|&v| v as u8).collect();
 
         let mut combined = chunk0;
@@ -933,9 +950,11 @@ mod tests {
 
         // consume_first (experimental pure-Rust)
         let mut cf_out = vec![0u8; data.len() + 65536];
-        let cf_size =
-            crate::experiments::consume_first_decode::inflate_consume_first(deflate, &mut cf_out)
-                .unwrap();
+        let cf_size = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
+            deflate,
+            &mut cf_out,
+        )
+        .unwrap();
         assert_eq!(&cf_out[..cf_size], data, "{}: consume_first", label);
 
         // inflate_into_pub (production BGZF inflate)
@@ -1097,9 +1116,10 @@ mod tests {
         let deflate = get_deflate_data(&gz);
         let mut out = vec![0u8; data.len() + 65536];
         let t = std::time::Instant::now();
-        let size =
-            crate::experiments::consume_first_decode::inflate_consume_first(deflate, &mut out)
-                .unwrap();
+        let size = crate::decompress::inflate::consume_first_decode::inflate_consume_first(
+            deflate, &mut out,
+        )
+        .unwrap();
         let mbps = size as f64 / t.elapsed().as_secs_f64() / 1e6;
         assert_eq!(&out[..size], &data[..]);
         assert!(mbps > 50.0, "consume_first: {:.0} MB/s too slow", mbps);

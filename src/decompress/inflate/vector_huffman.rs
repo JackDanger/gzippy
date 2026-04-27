@@ -186,7 +186,7 @@ impl VectorTable {
     /// Build a vector table from a libdeflate-style LitLenTable
     pub fn build_from_litlen(
         &mut self,
-        litlen: &crate::experiments::libdeflate_entry::LitLenTable,
+        litlen: &crate::decompress::inflate::libdeflate_entry::LitLenTable,
     ) {
         for i in 0..VECTOR_TABLE_SIZE {
             // Only literals with codeword bits <= 8 can fit in our 8-bit lookahead table.
@@ -661,12 +661,12 @@ pub fn decode_multi_literals(
 
 /// Decode fixed Huffman block with multi-literal optimization using Bits struct
 pub fn decode_fixed_multi_literal_bits(
-    bits: &mut crate::experiments::consume_first_decode::Bits,
+    bits: &mut crate::decompress::inflate::consume_first_decode::Bits,
     output: &mut [u8],
     mut out_pos: usize,
 ) -> std::io::Result<usize> {
     let table = get_fixed_vector_table();
-    let fixed_tables = crate::experiments::libdeflate_decode::get_fixed_tables();
+    let fixed_tables = crate::decompress::inflate::libdeflate_decode::get_fixed_tables();
 
     loop {
         // Ensure we have at least 32 bits available for multi-literal lookahead
@@ -756,7 +756,7 @@ pub fn decode_fixed_multi_literal_bits(
 
 /// Decode fixed Huffman block with multi-literal optimization
 pub fn decode_fixed_multi_literal(input: &[u8], output: &mut [u8]) -> std::io::Result<usize> {
-    let mut bits = crate::experiments::consume_first_decode::Bits::new(input);
+    let mut bits = crate::decompress::inflate::consume_first_decode::Bits::new(input);
     decode_fixed_multi_literal_bits(&mut bits, output, 0)
 }
 
