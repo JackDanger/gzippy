@@ -58,9 +58,11 @@ call site in the routing table above, and add a strict correctness test (no
 silent fallback). When `make ship` confirms the win, lift the gate. When
 abandoned, delete the module — `main` does not host dead code.
 
-Regression tests that lock in the parallel single-member wiring:
-`decompress::parallel::single_member::tests::test_parallel_path_no_silent_fallback`
-and `tests::routing::tests::test_single_member_routing_multithread`.
+Regression test that locks in the parallel single-member wiring:
+`tests::routing::tests::test_single_member_routing_multithread`. It runs
+`decompress_single_member(T=4)` on a 24 MiB input and asserts byte-perfect
+output — covering both \"parallel path takes the input\" and \"falls back
+correctly when speculation fails on adversarial chunks.\"
 
 ## Hard-Won Lessons
 
