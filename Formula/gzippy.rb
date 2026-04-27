@@ -7,22 +7,22 @@ class Gzippy < Formula
   on_macos do
     on_arm do
       url "https://github.com/JackDanger/gzippy/releases/download/v#{version}/gzippy-aarch64-apple-darwin.tar.gz"
-      sha256 "eec908f517cbda2250d0f84ca9af3b6fe9a8f61c323b08e6707bfee2c8647ed0" # AARCH64_APPLE_DARWIN
+      sha256 "0dcfe163f3c30806863aeb8bed47561f059af3e3b78d3e5ea1b7f0cde1169e0b" # AARCH64_APPLE_DARWIN
     end
     on_intel do
       url "https://github.com/JackDanger/gzippy/releases/download/v#{version}/gzippy-x86_64-apple-darwin.tar.gz"
-      sha256 "5e223e8180bbf230b781290489b8ec64b1d7e173f547b1a312a6dd37ef9dd945" # X86_64_APPLE_DARWIN
+      sha256 "2a119d2423a389051070794b56c5deb9170a7041e154910060f376da5b28cb18" # X86_64_APPLE_DARWIN
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/JackDanger/gzippy/releases/download/v#{version}/gzippy-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "8c9431612db7de6de3ae9ec501df5cfdafccc2d6e71910a176b9bc95d33652b0" # AARCH64_UNKNOWN_LINUX_GNU
+      sha256 "5df6dee3316aca9430313a7fe927537857650de2125f7a3eb05b4da065d118d6" # AARCH64_UNKNOWN_LINUX_GNU
     end
     on_intel do
       url "https://github.com/JackDanger/gzippy/releases/download/v#{version}/gzippy-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "cce4c3904f46feb529de518527058263d84b5db373eca798656d029b98d005f0" # X86_64_UNKNOWN_LINUX_GNU
+      sha256 "8a8025eaa35c90823b8bf1f995fd1d3adaa9252365517573303a200599cc970f" # X86_64_UNKNOWN_LINUX_GNU
     end
   end
 
