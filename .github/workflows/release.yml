@@ -478,14 +478,35 @@ jobs:
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
         run: |
           mkdir -p ~/.ssh
-          echo "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 700 ~/.ssh
+
+          # `printf '%s\n'` writes the secret exactly as stored and guarantees
+          # one trailing newline. `echo` is shell-implementation-dependent and
+          # has tripped up SSH key parsing in this workflow before.
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
+
           cat >> ~/.ssh/config <<'EOF'
           Host aur.archlinux.org
             IdentityFile ~/.ssh/aur
             User aur
           EOF
+          chmod 600 ~/.ssh/config
+
           ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+
+          # Validate the key parses *before* the first git operation tries to
+          # use it. Failing here gives a clear remediation message; failing
+          # later would surface as "Permission denied (publickey)" which is
+          # ambiguous between bad-key and not-registered-on-AUR.
+          if ! ssh-keygen -y -f ~/.ssh/aur > /dev/null 2>&1; then
+            echo "::error::AUR_SSH_KEY cannot be parsed as an SSH private key."
+            echo "::error::Most common cause: secret was pasted without newlines"
+            echo "::error::or with CRLF line endings."
+            echo "::error::Re-add via: gh secret set AUR_SSH_KEY < /path/to/aur_key"
+            exit 1
+          fi
+          echo "AUR SSH key OK: $(ssh-keygen -l -f ~/.ssh/aur)"
 
       - name: Update and push AUR package
         run: |
