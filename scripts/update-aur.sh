@@ -30,17 +30,29 @@ update_and_push() {
     sed -i "s/sha256sums_x86_64=.*/sha256sums_x86_64=('$X86_SHA')/" PKGBUILD
     sed -i "s/sha256sums_aarch64=.*/sha256sums_aarch64=('$ARM_SHA')/" PKGBUILD
 
-    # Generate .SRCINFO via Docker (works on any host)
+    # Generate .SRCINFO via Docker (works on any host).
+    # makepkg refuses to run as root, so we create an unprivileged "builder"
+    # user inside the container and run as that user. Pass the host UID/GID
+    # in so the container can chown files BACK before we exit — otherwise
+    # the host-side `git config` step that follows hits permission-denied
+    # on `.git/config` (it's owned by the container's builder UID, not the
+    # runner's user).
+    local host_uid host_gid
+    host_uid=$(id -u)
+    host_gid=$(id -g)
     docker run --rm \
         -v "$workdir":/pkg \
         -w /pkg \
+        -e HOST_UID="$host_uid" \
+        -e HOST_GID="$host_gid" \
         archlinux:latest \
-        bash -c "
+        bash -c '
             pacman -Sy --noconfirm base-devel 2>/dev/null
             useradd -m builder
             chown -R builder /pkg
-            su builder -c 'makepkg --printsrcinfo' > /pkg/.SRCINFO
-        "
+            su builder -c "makepkg --printsrcinfo" > /pkg/.SRCINFO
+            chown -R "$HOST_UID:$HOST_GID" /pkg
+        '
 
     git config user.email "gzippy@jackdanger.com"
     git config user.name "gzippy-bot"
