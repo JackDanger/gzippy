@@ -5,7 +5,6 @@
 
 mod bench;
 mod ci;
-mod cloud;
 mod diag;
 mod instrument;
 mod orient;
@@ -107,33 +106,6 @@ fn main() {
             let threads = find_flag(&args, "--threads");
             instrument::run(&args[2], threads.as_deref())
         }
-        "cloud" => {
-            if args.len() < 3 {
-                eprintln!("Usage: gzippy-dev cloud <bench|run|cleanup>");
-                std::process::exit(1);
-            }
-            match args[2].as_str() {
-                "bench" => cloud::bench(),
-                "run" => {
-                    if args.len() < 5 {
-                        eprintln!("Usage: gzippy-dev cloud run <x86|arm64> <command>");
-                        eprintln!();
-                        eprintln!("Examples:");
-                        eprintln!("  gzippy-dev cloud run x86 'cargo test --release bench_isal -- --nocapture'");
-                        eprintln!("  gzippy-dev cloud run arm64 'gzippy -d -p1 < /dev/shm/silesia-gzip.gz > /dev/null'");
-                        eprintln!("  gzippy-dev cloud run x86 'perf stat gzippy -1 -c -p1 < /dev/shm/software.archive > /dev/null'");
-                        std::process::exit(1);
-                    }
-                    let cmd = args[4..].join(" ");
-                    cloud::run_command(&args[3], &cmd)
-                }
-                "cleanup" => cloud::cleanup_all(),
-                _ => {
-                    eprintln!("Unknown cloud subcommand: {}", args[2]);
-                    std::process::exit(1);
-                }
-            }
-        }
         "diag" => {
             let diag_args = diag::DiagArgs {
                 direction: find_flag(&args, "--direction"),
@@ -193,11 +165,6 @@ SCORECARD:
   losses                       Show losses grouped by root cause with actions
   losses --explain             Annotate each loss with diagnostic data
 
-CLOUD (dedicated hardware, low jitter):
-  cloud bench                  Launch EC2 fleet, run full benchmarks, tear down
-  cloud run <arch> <cmd>       Launch one instance, run command, stream output, tear down
-  cloud cleanup                Delete any leaked cloud resources from prior runs
-
 DIAGNOSTICS:
   diag [FLAGS]                 Collect platform + ISA-L + timing diagnostics as JSON
   diag --direction compress    Compress-only diagnostics (ISA-L timing, dispatch check)
@@ -206,7 +173,7 @@ DIAGNOSTICS:
 
 BENCHMARK (one source of truth for all perf numbers):
   bench [FLAGS]                Run decompression benchmark (human output)
-  bench --json                 Same, but JSON to stdout (used by cloud fleet)
+  bench --json                 Same, but JSON to stdout
   bench ab <ref-a> <ref-b>     A/B comparison of two git refs
   path <file.gz>               Trace which decompression path a file takes
   instrument <file.gz>         Decompress with detailed timing breakdown
