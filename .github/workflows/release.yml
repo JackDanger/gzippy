@@ -369,8 +369,17 @@ jobs:
             PR_NUMBER="${PR_URL##*/}"
             echo "Created PR #${PR_NUMBER}: ${PR_URL}"
           fi
-          echo "Auto-merging PR #${PR_NUMBER}"
-          gh pr merge "$PR_NUMBER" --squash --auto
+          # `--auto` queues the merge to fire when checks pass — but it
+          # *requires* the PR to be in a non-mergeable state (pending checks /
+          # behind base / etc.). For a clean PR with no required checks,
+          # `--auto` errors with "Pull request is in clean status." Fall back
+          # to direct merge in that case.
+          echo "Merging PR #${PR_NUMBER}"
+          gh pr merge "$PR_NUMBER" --squash --auto 2>/tmp/merge-err \
+            || (grep -q 'clean status' /tmp/merge-err \
+                && echo "PR already mergeable; merging directly" \
+                && gh pr merge "$PR_NUMBER" --squash) \
+            || (cat /tmp/merge-err && exit 1)
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
