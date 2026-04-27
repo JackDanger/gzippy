@@ -9,6 +9,16 @@ APT_REPO="https://jackdanger.github.io/gzippy"
 info() { printf '%s\n' "$*"; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# `sudo` if we're not already root, nothing if we are. Containers and minimal
+# Debian images often run as root with no sudo installed at all.
+if [ "$(id -u)" -eq 0 ]; then
+    SUDO=""
+elif command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+else
+    die "this installer needs root or sudo (got neither)"
+fi
+
 install_macos() {
     if command -v brew &>/dev/null; then
         # Remove conflicting Homebrew gzip if present
@@ -56,14 +66,14 @@ install_macos_binary() {
     # so installing here shadows the system gzip without touching PATH.
     local dir=/usr/local/bin
     if [ ! -w "$dir" ]; then
-        info "Installing to $dir (requires sudo)..."
-        sudo mkdir -p "$dir"
-        sudo mv    "$tmp/gzippy" "$dir/gzippy"
-        sudo ln -sf gzippy "$dir/gzip"
-        sudo ln -sf gzippy "$dir/gunzip"
-        sudo ln -sf gzippy "$dir/zcat"
-        sudo ln -sf gzippy "$dir/gzcat"
-        sudo ln -sf gzippy "$dir/ungzippy"
+        info "Installing to $dir (escalating with $SUDO)..."
+        $SUDO mkdir -p "$dir"
+        $SUDO mv    "$tmp/gzippy" "$dir/gzippy"
+        $SUDO ln -sf gzippy "$dir/gzip"
+        $SUDO ln -sf gzippy "$dir/gunzip"
+        $SUDO ln -sf gzippy "$dir/zcat"
+        $SUDO ln -sf gzippy "$dir/gzcat"
+        $SUDO ln -sf gzippy "$dir/ungzippy"
     else
         mv    "$tmp/gzippy" "$dir/gzippy"
         ln -sf gzippy "$dir/gzip"
@@ -78,15 +88,15 @@ install_macos_binary() {
 }
 
 install_apt() {
-    command -v curl &>/dev/null || sudo apt-get install -y curl gpg
-    sudo mkdir -p /etc/apt/keyrings
+    command -v curl >/dev/null 2>&1 || $SUDO apt-get install -y curl gpg
+    $SUDO mkdir -p /etc/apt/keyrings
     curl -fsSL "$APT_REPO/gzippy-signing-key.asc" \
         | gpg --dearmor \
-        | sudo tee /etc/apt/keyrings/gzippy.gpg >/dev/null
+        | $SUDO tee /etc/apt/keyrings/gzippy.gpg >/dev/null
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/gzippy.gpg] $APT_REPO stable main" \
-        | sudo tee /etc/apt/sources.list.d/gzippy.list >/dev/null
-    sudo apt-get update -qq
-    sudo apt-get install -y gzippy
+        | $SUDO tee /etc/apt/sources.list.d/gzippy.list >/dev/null
+    $SUDO apt-get update -qq
+    $SUDO apt-get install -y gzippy
 }
 
 install_arch() {
