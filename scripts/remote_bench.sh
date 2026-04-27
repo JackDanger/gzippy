@@ -119,7 +119,7 @@ def bench(cmd, runs=$RUNS):
     return statistics.median(trimmed), statistics.stdev(trimmed) if len(trimmed) > 1 else 0
 
 # Compression benchmark
-pigz_med, pigz_std = bench('./pigz/pigz -${level} -p${threads} -c test_data/${file} > /tmp/pigz.gz')
+pigz_med, pigz_std = bench('./vendor/pigz/pigz -${level} -p${threads} -c test_data/${file} > /tmp/pigz.gz')
 gzippy_med, gzippy_std = bench('./target/release/gzippy -${level} -p${threads} -c test_data/${file} > /tmp/gzippy.gz')
 
 overhead = (gzippy_med / pigz_med - 1) * 100
@@ -138,7 +138,7 @@ print(f'Size: pigz={pigz_size:,} gzippy={gzippy_size:,} ({size_diff:+.2f}%)')
 
 # Decompression benchmark
 gzip_med, _ = bench('gzip -dc /tmp/gzippy.gz > /dev/null')
-pigz_dec, _ = bench('./pigz/pigz -dc /tmp/gzippy.gz > /dev/null')
+pigz_dec, _ = bench('./vendor/pigz/pigz -dc /tmp/gzippy.gz > /dev/null')
 gzippy_dec, _ = bench('./target/release/gzippy -d /tmp/gzippy.gz -c > /dev/null')
 
 print(f'Decompression (gzippy file):')

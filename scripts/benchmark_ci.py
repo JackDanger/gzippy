@@ -81,10 +81,10 @@ CONFIDENCE = 0.95  # Confidence level for statistical significance
 def find_tool(name: str) -> str:
     """Find a tool binary."""
     paths = {
-        "gzip": ["./gzip/gzip", shutil.which("gzip") or "gzip"],
-        "pigz": ["./pigz/pigz"],
-        "igzip": ["./isa-l/build/igzip"],
-        "zopfli": ["./zopfli/zopfli"],
+        "gzip": ["./vendor/gzip/gzip", shutil.which("gzip") or "gzip"],
+        "pigz": ["./vendor/pigz/pigz"],
+        "igzip": ["./vendor/isa-l/build/igzip"],
+        "zopfli": ["./vendor/zopfli/zopfli"],
         "gzippy": ["./target/release/gzippy"],
     }
     for path in paths.get(name, []):

@@ -8,12 +8,12 @@ dominate timing.
 
 Usage:
     cargo build --release
-    (cd pigz && make)          # one-time: build the bundled pigz
+    (cd vendor/pigz && make)   # one-time: build the bundled pigz
     python3 scripts/readme_benchmark.py
 
 Requirements:
     target/release/gzippy               — cargo build --release
-    pigz/pigz                           — (cd pigz && make)
+    vendor/pigz/pigz                    — (cd vendor/pigz && make)
     benchmark_data/silesia.tar          — 202 MB (in-repo fixture)
     benchmark_data/logs.txt             — 211 MB (in-repo fixture)
 
@@ -28,7 +28,7 @@ from pathlib import Path
 
 def find_repo_root() -> Path:
     """Walk up from CWD looking for Cargo.toml. Lets the script run from any
-    worktree (the main one holds target/release/gzippy and pigz/pigz)."""
+    worktree (the main one holds target/release/gzippy and vendor/pigz/pigz)."""
     for candidate in [Path.cwd(), *Path.cwd().resolve().parents, Path(__file__).resolve().parent.parent]:
         if (candidate / "Cargo.toml").exists() and (candidate / "target" / "release" / "gzippy").exists():
             return candidate
@@ -37,7 +37,7 @@ def find_repo_root() -> Path:
 
 ROOT = find_repo_root()
 GZIPPY = ROOT / "target" / "release" / "gzippy"
-PIGZ = ROOT / "pigz" / "pigz"
+PIGZ = ROOT / "vendor" / "pigz" / "pigz"
 APPLE_GZIP = Path("/usr/bin/gzip")
 
 INPUTS = [

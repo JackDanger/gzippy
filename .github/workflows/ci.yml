@@ -759,11 +759,11 @@ jobs:
           cargo build --release --features isal-compression
 
       - name: Build pigz
-        run: make -C pigz
+        run: make -C vendor/pigz
 
       - name: Build igzip
         run: |
-          cd isa-l
+          cd vendor/isa-l
           rm -rf build
           mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
@@ -806,8 +806,8 @@ jobs:
               for tool in gzip pigz igzip; do
                 case $tool in
                   gzip)   CMD="gzip -d" ;;
-                  pigz)   CMD="./pigz/unpigz" ;;
-                  igzip)  CMD="./isa-l/build/igzip -d" ;;
+                  pigz)   CMD="./vendor/pigz/unpigz" ;;
+                  igzip)  CMD="./vendor/isa-l/build/igzip -d" ;;
                 esac
 
                 $CMD < /tmp/gzippy_output.gz > /tmp/decompressed.bin 2>/dev/null
@@ -847,7 +847,7 @@ jobs:
 
             # Test pigz output
             for level in 1 6 9; do
-              ./pigz/pigz -$level -c "$INPUT" > /tmp/pigz_output.gz
+              ./vendor/pigz/pigz -$level -c "$INPUT" > /tmp/pigz_output.gz
               ./target/release/gzippy -d < /tmp/pigz_output.gz > /tmp/decompressed.bin
               if diff -q "$INPUT" /tmp/decompressed.bin > /dev/null 2>&1; then
                 echo "  ✓ gzippy can decompress pigz -$level output (byte-identical)"
@@ -859,7 +859,7 @@ jobs:
 
             # Test igzip output (only has levels 0-3)
             for level in 0 1 2 3; do
-              ./isa-l/build/igzip -$level -c "$INPUT" > /tmp/igzip_output.gz
+              ./vendor/isa-l/build/igzip -$level -c "$INPUT" > /tmp/igzip_output.gz
               ./target/release/gzippy -d < /tmp/igzip_output.gz > /tmp/decompressed.bin
               if diff -q "$INPUT" /tmp/decompressed.bin > /dev/null 2>&1; then
                 echo "  ✓ gzippy can decompress igzip -$level output (byte-identical)"

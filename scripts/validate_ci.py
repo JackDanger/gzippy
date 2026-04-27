@@ -38,8 +38,8 @@ SEED_FILE = "test_data/text-1MB.txt"
 def find_tool(name: str) -> str:
     """Find a tool binary."""
     paths = {
-        "gzip": ["./gzip/gzip", shutil.which("gzip") or "gzip"],
-        "pigz": ["./pigz/pigz"],
+        "gzip": ["./vendor/gzip/gzip", shutil.which("gzip") or "gzip"],
+        "pigz": ["./vendor/pigz/pigz"],
         "gzippy": ["./target/release/gzippy"],
         "ungzippy": ["./target/release/ungzippy"],
     }
