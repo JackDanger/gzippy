@@ -7,9 +7,9 @@
 ## Rules
 
 1. **ONE PRODUCTION PATH** — know exactly which function the CLI calls. Test that function.
-2. **RUN `make` FIRST** — before cloud fleet, before committing. `make` catches regressions in 30s.
-3. **BENCHMARK EVERYTHING** — cloud fleet is authoritative, local `make` is for iteration.
-4. **REVERT REGRESSIONS** — if `make` or cloud fleet shows a loss, revert immediately.
+2. **RUN `make` FIRST** — before `make ship`, before committing. `make` catches regressions in 30s.
+3. **BENCHMARK EVERYTHING** — `make ship` (homelab bench on `neurotic`) is authoritative; local `make` is for iteration.
+4. **REVERT REGRESSIONS** — if `make` or `make ship` shows a loss, revert immediately.
 5. **NEVER COMPROMISE PERFORMANCE** — clippy, style, readability: none justify slower code.
 
 ## Production Routing (Apr 2026)
@@ -35,10 +35,11 @@ Input → decompress::mod: decompress_gzip_libdeflate
 ### Compression
 
 ```
-T1, L0–L3, ISA-L available → isal_compress::compress_gzip_to_writer
-T>1, L6–L9               → pipelined_compress::PipelinedGzEncoder → single-member output
-T>1, L0–L5               → parallel_compress::ParallelGzEncoder  → "GZ" subfield multi-block
-T1, all other            → flate2 single-threaded
+T1 L0–L3, ISA-L available → backends::isal_compress::compress_gzip_{to_writer,stream_direct}
+T1 L1–L5                  → libdeflate one-shot (ratio probe) or flate2 streaming (zlib-ng)
+T1 L6–L9                  → flate2 streaming (zlib-ng)
+T>1 L6–L9                 → compress::pipelined::PipelinedGzEncoder → single-member output
+T>1 L0–L5                 → compress::parallel::ParallelGzEncoder  → "GZ" subfield multi-block
 ```
 
 **"GZ" subfield**: gzippy's own parallel format (not standard BGZF). Files produced by
@@ -54,21 +55,12 @@ production code path or is a test fixture / supportive script.
 To prototype a new path: add the module under the relevant subsystem
 (`src/decompress/`, `src/compress/`, etc.), wire a feature-gated or size-gated
 call site in the routing table above, and add a strict correctness test (no
-silent fallback). When proven on cloud fleet, lift the gate. When abandoned,
-delete the module — `main` does not host dead code.
+silent fallback). When `make ship` confirms the win, lift the gate. When
+abandoned, delete the module — `main` does not host dead code.
 
 Regression tests that lock in the parallel single-member wiring:
 `decompress::parallel::single_member::tests::test_parallel_path_no_silent_fallback`
 and `tests::routing::tests::test_single_member_routing_multithread`.
-
-## Score: 47W / 13L (Feb 21 2026, cloud fleet — predates v0.3.0 parallel SM)
-
-| Category | Losses | Gap | Actionability |
-|----------|--------|-----|---------------|
-| T1 decompress near-parity | 2 | <2% | Noise |
-| Tmax single-member parallel | 8 | -23% to -40% | Pipeline architecture |
-| L1 T1 compress vs igzip | 2 | -63% to -74% | AVX-512 assembly |
-| arm64 L1 Tmax compress | 1 | -3.3% | madvise or block tuning |
 
 ## Hard-Won Lessons
 
@@ -137,7 +129,7 @@ make
 cargo test --release
 
 # 5. Authoritative numbers — only after make passes
-source .env && make ship
+make ship   # SSH to neurotic homelab, runs gzippy-dev bench
 ```
 
 `make route-check` — generates 1MB+10MB test files and shows routing + timing

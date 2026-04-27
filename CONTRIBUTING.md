@@ -131,7 +131,7 @@ cargo clippy --fix --allow-staged --release --all-targets
 - [ ] `cargo fmt --check` passes
 - [ ] `cargo clippy --release --all-targets -- -D warnings` clean
 - [ ] `make` (or `make quick`) passes
-- [ ] No performance regression on cloud fleet (`make ship`)
+- [ ] `make ship` (homelab bench) shows no regression
 
 ## House rules
 
