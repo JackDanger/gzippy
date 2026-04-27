@@ -10,12 +10,12 @@
 #
 # Output paths (relative to repo root):
 #   gzippy:    target/release/gzippy
-#   pigz:      pigz/pigz, pigz/unpigz
-#   rapidgzip: rapidgzip/librapidarchive/build/src/tools/rapidgzip
-#   igzip:     isa-l/build/igzip
-#   zopfli:    zopfli/zopfli
-#   libdeflate: libdeflate/build/programs/libdeflate-gzip
-#   gzip:      gzip/gzip, gzip/gunzip
+#   pigz:      vendor/pigz/pigz, vendor/pigz/unpigz
+#   rapidgzip: vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip
+#   igzip:     vendor/isa-l/build/igzip
+#   zopfli:    vendor/zopfli/zopfli
+#   libdeflate: vendor/libdeflate/build/programs/libdeflate-gzip
+#   gzip:      vendor/gzip/gzip, vendor/gzip/gunzip
 # =============================================================================
 
 set -euo pipefail
@@ -100,10 +100,10 @@ fi
 # =============================================================================
 if $BUILD_PIGZ; then
     log_info "Building pigz..."
-    make -C pigz -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
-    
-    if [[ -f pigz/pigz && -f pigz/unpigz ]]; then
-        log_info "✓ pigz built: pigz/pigz, pigz/unpigz"
+    make -C vendor/pigz -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+
+    if [[ -f vendor/pigz/pigz && -f vendor/pigz/unpigz ]]; then
+        log_info "✓ pigz built: vendor/pigz/pigz, vendor/pigz/unpigz"
     else
         log_error "pigz build failed"
         exit 1
@@ -116,7 +116,7 @@ fi
 if $BUILD_RAPIDGZIP; then
     log_info "Building rapidgzip..."
     
-    cd "$REPO_ROOT/rapidgzip/librapidarchive"
+    cd "$REPO_ROOT/vendor/rapidgzip/librapidarchive"
     rm -rf build
     mkdir -p build
     cd build
@@ -128,7 +128,7 @@ if $BUILD_RAPIDGZIP; then
     cd "$REPO_ROOT"
     
     # The binary is at build/src/tools/rapidgzip (note: src/tools, not tools)
-    RAPIDGZIP_BIN="rapidgzip/librapidarchive/build/src/tools/rapidgzip"
+    RAPIDGZIP_BIN="vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip"
     if [[ -f "$RAPIDGZIP_BIN" ]]; then
         log_info "✓ rapidgzip built: $RAPIDGZIP_BIN"
         # Verify it runs
@@ -137,7 +137,7 @@ if $BUILD_RAPIDGZIP; then
         log_error "rapidgzip build failed - binary not found at $RAPIDGZIP_BIN"
         # Debug: show what exists
         log_info "Contents of build directory:"
-        find rapidgzip/librapidarchive/build -name "rapidgzip" -type f 2>/dev/null || true
+        find vendor/rapidgzip/librapidarchive/build -name "rapidgzip" -type f 2>/dev/null || true
         exit 1
     fi
 fi
@@ -148,7 +148,7 @@ fi
 if $BUILD_IGZIP; then
     log_info "Building igzip (ISA-L)..."
     
-    cd "$REPO_ROOT/isa-l"
+    cd "$REPO_ROOT/vendor/isa-l"
     rm -rf build
     mkdir -p build
     cd build
@@ -163,7 +163,7 @@ if $BUILD_IGZIP; then
     cd "$REPO_ROOT"
     
     # Binary is at build/igzip (not build/bin/igzip)
-    IGZIP_BIN="isa-l/build/igzip"
+    IGZIP_BIN="vendor/isa-l/build/igzip"
     if [[ -f "$IGZIP_BIN" ]]; then
         log_info "✓ igzip built: $IGZIP_BIN"
     else
@@ -176,10 +176,10 @@ fi
 # =============================================================================
 if $BUILD_ZOPFLI; then
     log_info "Building zopfli..."
-    make -C zopfli zopfli -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
-    
-    if [[ -f zopfli/zopfli ]]; then
-        log_info "✓ zopfli built: zopfli/zopfli"
+    make -C vendor/zopfli zopfli -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+
+    if [[ -f vendor/zopfli/zopfli ]]; then
+        log_info "✓ zopfli built: vendor/zopfli/zopfli"
     else
         log_error "zopfli build failed"
         exit 1
@@ -192,7 +192,7 @@ fi
 if $BUILD_LIBDEFLATE; then
     log_info "Building libdeflate..."
     
-    cd "$REPO_ROOT/libdeflate"
+    cd "$REPO_ROOT/vendor/libdeflate"
     rm -rf build
     mkdir -p build
     cd build
@@ -202,13 +202,13 @@ if $BUILD_LIBDEFLATE; then
     
     cd "$REPO_ROOT"
     
-    LIBDEFLATE_BIN="libdeflate/build/programs/libdeflate-gzip"
+    LIBDEFLATE_BIN="vendor/libdeflate/build/programs/libdeflate-gzip"
     if [[ -f "$LIBDEFLATE_BIN" ]]; then
         log_info "✓ libdeflate built: $LIBDEFLATE_BIN"
         "$LIBDEFLATE_BIN" -h 2>&1 | head -1 || true
     else
         log_error "libdeflate build failed - binary not found at $LIBDEFLATE_BIN"
-        find libdeflate/build -name "libdeflate*" -type f 2>/dev/null || true
+        find vendor/libdeflate/build -name "libdeflate*" -type f 2>/dev/null || true
         exit 1
     fi
 fi
@@ -219,7 +219,7 @@ fi
 if $BUILD_GZIP; then
     log_info "Building gzip..."
     
-    cd "$REPO_ROOT/gzip"
+    cd "$REPO_ROOT/vendor/gzip"
     
     # gzip uses autotools - check if we need to configure
     if [[ ! -f Makefile ]]; then
@@ -246,11 +246,11 @@ if $BUILD_GZIP; then
     
     cd "$REPO_ROOT"
     
-    if [[ -f gzip/gzip ]]; then
-        log_info "✓ gzip built: gzip/gzip"
+    if [[ -f vendor/gzip/gzip ]]; then
+        log_info "✓ gzip built: vendor/gzip/gzip"
         # Create gunzip symlink if missing
-        if [[ ! -f gzip/gunzip ]]; then
-            ln -sf gzip gzip/gunzip
+        if [[ ! -f vendor/gzip/gunzip ]]; then
+            ln -sf gzip vendor/gzip/gunzip
         fi
     else
         log_warn "gzip not built - may need system gzip instead"

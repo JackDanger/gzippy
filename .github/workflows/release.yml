@@ -432,7 +432,7 @@ jobs:
           done
 
           # Public key + install script for the web root
-          cp apt/gzippy-signing-key.asc apt-repo/gzippy-signing-key.asc
+          cp packaging/apt/gzippy-signing-key.asc apt-repo/gzippy-signing-key.asc
           cp scripts/install.sh apt-repo/install.sh
 
           # Stage for GitHub Pages (exclude reprepro internals)
@@ -546,7 +546,7 @@ jobs:
         run: |
 
           # Stamp version into a local copy and verify makepkg --verifysource passes
-          cp aur/gzippy-bin/PKGBUILD /tmp/PKGBUILD-test
+          cp packaging/aur/gzippy-bin/PKGBUILD /tmp/PKGBUILD-test
           sed -i "s/pkgver=.*/pkgver=$VERSION/" /tmp/PKGBUILD-test
           sed -i "s|/vVERSION/|/v$VERSION/|g"   /tmp/PKGBUILD-test
 

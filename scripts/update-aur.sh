@@ -18,7 +18,7 @@ update_and_push() {
 
     rm -rf "$workdir"
     git clone "ssh://aur@aur.archlinux.org/${pkgname}.git" "$workdir"
-    cp "$REPO_ROOT/aur/${pkgname}/PKGBUILD" "$workdir/PKGBUILD"
+    cp "$REPO_ROOT/packaging/aur/${pkgname}/PKGBUILD" "$workdir/PKGBUILD"
 
     cd "$workdir"
 
