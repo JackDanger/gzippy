@@ -93,6 +93,74 @@ fn install_git_hooks() {
     install_hook("scripts/pre-push", ".git/hooks/pre-push");
 }
 
+fn compile_zopfli() {
+    let src_dir = "vendor/zopfli/src/zopfli";
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
+    let out_path = std::path::Path::new(&out_dir);
+
+    let sources = [
+        "blocksplitter.c",
+        "cache.c",
+        "deflate.c",
+        "gzip_container.c",
+        "hash.c",
+        "katajainen.c",
+        "lz77.c",
+        "squeeze.c",
+        "tree.c",
+        "util.c",
+        "zlib_container.c",
+        "zopfli_lib.c",
+    ];
+
+    // Compile each file to .o
+    let mut obj_files = Vec::new();
+    for source in &sources {
+        let obj_file = out_path.join(format!("zopfli-{}.o", source.trim_end_matches(".c")));
+        let src_file = format!("{}/{}", src_dir, source);
+
+        let output = std::process::Command::new("clang")
+            .arg("-c")
+            .arg("-O3")
+            .arg("-fPIC")
+            .arg(format!("-I{}", src_dir))
+            .arg(&src_file)
+            .arg("-o")
+            .arg(&obj_file)
+            .output()
+            .unwrap_or_else(|_| panic!("Failed to compile {}", source));
+
+        if !output.status.success() {
+            panic!(
+                "Failed to compile {}: {}",
+                source,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        obj_files.push(obj_file);
+    }
+
+    // Create archive with libtool
+    let lib_file = out_path.join("libzopfli.a");
+    let mut libtool_cmd = std::process::Command::new("libtool");
+    libtool_cmd.arg("-static").arg("-o").arg(&lib_file);
+    for obj in &obj_files {
+        libtool_cmd.arg(obj);
+    }
+
+    let output = libtool_cmd.output().expect("Failed to run libtool");
+    if !output.status.success() {
+        panic!(
+            "Failed to create archive: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Link
+    println!("cargo:rustc-link-lib=static=zopfli");
+    println!("cargo:rustc-link-search={}", out_dir);
+}
+
 fn install_hook(src: &str, dst: &str) {
     let src = std::path::Path::new(src);
     let dst = std::path::Path::new(dst);
