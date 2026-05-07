@@ -17,15 +17,6 @@ fn main() {
     install_git_hooks();
 }
 
-fn install_git_hooks() {
-    let git = std::path::Path::new(".git");
-    if !git.is_dir() {
-        return; // missing or a file (git worktree)
-    }
-    install_hook("scripts/pre-commit", ".git/hooks/pre-commit");
-    install_hook("scripts/pre-push", ".git/hooks/pre-push");
-}
-
 fn compile_zopfli() {
     let src_dir = "vendor/zopfli/src/zopfli";
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
@@ -46,13 +37,14 @@ fn compile_zopfli() {
         "zopfli_lib.c",
     ];
 
-    // Compile each file to .o
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+
     let mut obj_files = Vec::new();
     for source in &sources {
         let obj_file = out_path.join(format!("zopfli-{}.o", source.trim_end_matches(".c")));
         let src_file = format!("{}/{}", src_dir, source);
 
-        let output = std::process::Command::new("clang")
+        let output = std::process::Command::new(&cc)
             .arg("-c")
             .arg("-O3")
             .arg("-fPIC")
@@ -73,15 +65,14 @@ fn compile_zopfli() {
         obj_files.push(obj_file);
     }
 
-    // Create archive with libtool
     let lib_file = out_path.join("libzopfli.a");
-    let mut libtool_cmd = std::process::Command::new("libtool");
-    libtool_cmd.arg("-static").arg("-o").arg(&lib_file);
+    let mut ar_cmd = std::process::Command::new("ar");
+    ar_cmd.arg("rcs").arg(&lib_file);
     for obj in &obj_files {
-        libtool_cmd.arg(obj);
+        ar_cmd.arg(obj);
     }
 
-    let output = libtool_cmd.output().expect("Failed to run libtool");
+    let output = ar_cmd.output().expect("Failed to run ar");
     if !output.status.success() {
         panic!(
             "Failed to create archive: {}",
@@ -89,9 +80,17 @@ fn compile_zopfli() {
         );
     }
 
-    // Link
     println!("cargo:rustc-link-lib=static=zopfli");
     println!("cargo:rustc-link-search={}", out_dir);
+}
+
+fn install_git_hooks() {
+    let git = std::path::Path::new(".git");
+    if !git.is_dir() {
+        return; // missing or a file (git worktree)
+    }
+    install_hook("scripts/pre-commit", ".git/hooks/pre-commit");
+    install_hook("scripts/pre-push", ".git/hooks/pre-push");
 }
 
 fn install_hook(src: &str, dst: &str) {
