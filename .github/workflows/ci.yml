@@ -130,10 +130,10 @@ jobs:
         run: ln -sf gzippy target/release/ungzippy
 
       - name: Build pigz
-        run: make -C pigz
+        run: make -C vendor/pigz
 
       - name: Build zopfli
-        run: make -C zopfli zopfli
+        run: make -C vendor/zopfli zopfli
 
       - name: Run validation matrix
         run: |
