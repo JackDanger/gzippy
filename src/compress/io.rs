@@ -193,7 +193,7 @@ pub fn compress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             )
             .map_err(|e| e.into())
         }
-    } else if use_mmap {
+    } else if use_mmap && !args.use_zopfli() {
         if args.verbosity >= 2 {
             eprintln!(
                 "gzippy: using mmap parallel backend with {} threads",

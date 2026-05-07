@@ -9,6 +9,7 @@ pub mod optimization;
 pub mod parallel;
 pub mod pipelined;
 pub mod simple;
+pub mod zopfli;
 
 use std::io::{Read, Write};
 
@@ -21,6 +22,7 @@ use crate::error::GzippyResult;
 /// Select the fastest available compression backend and drive it to completion.
 ///
 /// Routing (matches CLAUDE.md compression table):
+///   L11 / -F / -I / -J       → Zopfli (true zopfli compression)
 ///   T1 L0–L3 ISA-L available → ISA-L streaming
 ///   T1 L1–L5                 → libdeflate one-shot (ratio probe) or flate2 streaming
 ///   T1 L6–L9                 → flate2/zlib-ng streaming
@@ -32,6 +34,24 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
     opt_config: &OptimizationConfig,
     header_info: &GzipHeaderInfo,
 ) -> GzippyResult<u64> {
+    // Zopfli path: L11 or any zopfli tuning flag triggers true zopfli
+    if args.use_zopfli() {
+        if args.verbosity >= 2 {
+            eprintln!(
+                "gzippy: using zopfli compression ({} iterations)",
+                args.zopfli_iterations.unwrap_or(15)
+            );
+        }
+        let tuning = crate::backends::zopfli_compress::ZopfliTuning::from_args(args);
+        let mut encoder = crate::compress::zopfli::ZopfliGzEncoder::new(
+            opt_config.thread_count,
+            args.block_size,
+            tuning,
+        );
+        encoder.set_header_info(header_info.clone());
+        return encoder.compress(reader, writer).map_err(|e| e.into());
+    }
+
     if opt_config.thread_count == 1 && args.compression_level <= 9 {
         // ISA-L: T1 L0–L3 on x86_64 with AVX2
         if args.compression_level <= 3
