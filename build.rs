@@ -66,7 +66,12 @@ fn compile_zopfli() {
     }
 
     let lib_file = out_path.join("libzopfli.a");
-    let mut ar_cmd = std::process::Command::new("ar");
+    // Use macOS native ar on macOS to avoid GNU ar's incompatible archive format.
+    #[cfg(target_os = "macos")]
+    let ar_bin = "/usr/bin/ar";
+    #[cfg(not(target_os = "macos"))]
+    let ar_bin = "ar";
+    let mut ar_cmd = std::process::Command::new(ar_bin);
     ar_cmd.arg("rcs").arg(&lib_file);
     for obj in &obj_files {
         ar_cmd.arg(obj);
