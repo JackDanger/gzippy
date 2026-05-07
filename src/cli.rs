@@ -38,6 +38,13 @@ pub struct GzippyArgs {
     pub fast: bool,
     pub analyze: bool,
     pub analyze_full: bool,
+    pub build_index: bool,
+    pub seek: Option<u64>,
+    pub index_file: Option<String>,
+    pub index_interval: usize,
+    pub zopfli_iterations: Option<u32>,
+    pub zopfli_no_split: bool,
+    pub zopfli_split_max: Option<u32>,
 }
 
 impl Default for GzippyArgs {
@@ -77,6 +84,13 @@ impl Default for GzippyArgs {
             fast: false,
             analyze: false,
             analyze_full: false,
+            build_index: false,
+            seek: None,
+            index_file: None,
+            index_interval: 4 * 1024 * 1024, // 4 MB default
+            zopfli_iterations: None,
+            zopfli_no_split: false,
+            zopfli_split_max: None,
         }
     }
 }
@@ -184,16 +198,18 @@ impl GzippyArgs {
                         args.fast = true;
                         args.compression_level = 1;
                     }
-                    // Ultra compression: libdeflate L11 (near-zopfli at pigz speed)
+                    // Ultra compression: true zopfli (very slow)
                     "--ultra" => {
                         args.compression_level = 11;
                     }
-                    // Maximum compression: libdeflate L12 (closest to zopfli)
+                    // Maximum compression: libdeflate L12 (near-zopfli at reasonable speed)
                     "--max" => {
                         args.compression_level = 12;
                     }
+                    "--no-block-split" => args.zopfli_no_split = true,
                     "--analyze" => args.analyze = true,
                     "--full" => args.analyze_full = true,
+                    "--index" => args.build_index = true,
                     _ => {
                         // Handle options with values
                         if let Some(value) = arg.strip_prefix("--level=") {
@@ -213,12 +229,44 @@ impl GzippyArgs {
                             args.comment = Some(value.to_string());
                         } else if let Some(value) = arg.strip_prefix("--alias=") {
                             args.alias = Some(value.to_string());
+                        } else if let Some(value) = arg.strip_prefix("--seek=") {
+                            args.seek = Some(value.parse::<u64>().map_err(|_| {
+                                GzippyError::invalid_argument(format!(
+                                    "Invalid seek offset: {}",
+                                    value
+                                ))
+                            })?);
+                        } else if let Some(value) = arg.strip_prefix("--index-file=") {
+                            args.index_file = Some(value.to_string());
+                        } else if let Some(value) = arg.strip_prefix("--index-interval=") {
+                            args.index_interval = value.parse().map_err(|_| {
+                                GzippyError::invalid_argument(format!(
+                                    "Invalid index interval: {}",
+                                    value
+                                ))
+                            })?;
+                        } else if let Some(value) = arg.strip_prefix("--zopfli-iterations=") {
+                            args.zopfli_iterations = Some(value.parse().map_err(|_| {
+                                GzippyError::invalid_argument(format!(
+                                    "Invalid zopfli iterations: {}",
+                                    value
+                                ))
+                            })?);
+                        } else if let Some(value) = arg.strip_prefix("--block-split-max=") {
+                            args.zopfli_split_max = Some(value.parse().map_err(|_| {
+                                GzippyError::invalid_argument(format!(
+                                    "Invalid block split max: {}",
+                                    value
+                                ))
+                            })?);
                         } else if arg == "--level"
                             || arg == "--blocksize"
                             || arg == "--processes"
                             || arg == "--suffix"
                             || arg == "--comment"
                             || arg == "--alias"
+                            || arg == "--zopfli-iterations"
+                            || arg == "--block-split-max"
                         {
                             // These require the next argument
                             if i + 1 >= argv.len() {
@@ -246,6 +294,22 @@ impl GzippyArgs {
                                 "--suffix" => args.suffix = value.to_string(),
                                 "--comment" => args.comment = Some(value.to_string()),
                                 "--alias" => args.alias = Some(value.to_string()),
+                                "--zopfli-iterations" => {
+                                    args.zopfli_iterations = Some(value.parse().map_err(|_| {
+                                        GzippyError::invalid_argument(format!(
+                                            "Invalid zopfli iterations: {}",
+                                            value
+                                        ))
+                                    })?)
+                                }
+                                "--block-split-max" => {
+                                    args.zopfli_split_max = Some(value.parse().map_err(|_| {
+                                        GzippyError::invalid_argument(format!(
+                                            "Invalid block split max: {}",
+                                            value
+                                        ))
+                                    })?)
+                                }
                                 _ => unreachable!(),
                             }
                         } else {
@@ -318,7 +382,8 @@ impl GzippyArgs {
                             let level = chars[j] as u8 - b'0';
                             args.compression_level = level;
                         }
-                        'b' | 'p' | 'S' | 'C' | 'A' => {
+                        'I' => args.zopfli_no_split = true,
+                        'b' | 'p' | 'S' | 'C' | 'A' | 'F' | 'J' => {
                             // Save the option character before potentially modifying j
                             let opt_char = chars[j];
 
@@ -353,6 +418,22 @@ impl GzippyArgs {
                                 'S' => args.suffix = value,
                                 'C' => args.comment = Some(value),
                                 'A' => args.alias = Some(value),
+                                'F' => {
+                                    args.zopfli_iterations = Some(value.parse().map_err(|_| {
+                                        GzippyError::invalid_argument(format!(
+                                            "Invalid iterations: {}",
+                                            value
+                                        ))
+                                    })?)
+                                }
+                                'J' => {
+                                    args.zopfli_split_max = Some(value.parse().map_err(|_| {
+                                        GzippyError::invalid_argument(format!(
+                                            "Invalid block split max: {}",
+                                            value
+                                        ))
+                                    })?)
+                                }
                                 _ => unreachable!(),
                             }
                         }
@@ -389,6 +470,13 @@ impl GzippyArgs {
         }
 
         Ok(args)
+    }
+
+    pub fn use_zopfli(&self) -> bool {
+        self.compression_level == 11
+            || self.zopfli_iterations.is_some()
+            || self.zopfli_no_split
+            || self.zopfli_split_max.is_some()
     }
 }
 

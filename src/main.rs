@@ -14,6 +14,7 @@ mod analyze;
 mod cli;
 mod error;
 mod format;
+mod index_mode;
 mod utils;
 
 // ── Compression & decompression stacks ───────────────────────────────────────
@@ -112,6 +113,11 @@ fn run() -> Result<i32, GzippyError> {
 
     // --analyze short-circuits the normal compress/decompress flow.
     if let Some(code) = analyze::maybe_run(&args) {
+        return Ok(code);
+    }
+
+    // --index and --seek short-circuit the normal decompress flow.
+    if let Some(code) = index_mode::maybe_run(&args) {
         return Ok(code);
     }
 

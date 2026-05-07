@@ -33,13 +33,13 @@ CV_THRESHOLD = 0.05
 
 
 def find_gzip():
-    if os.path.isfile("./gzip/gzip") and os.access("./gzip/gzip", os.X_OK):
-        return "./gzip/gzip"
+    if os.path.isfile("./vendor/gzip/gzip") and os.access("./vendor/gzip/gzip", os.X_OK):
+        return "./vendor/gzip/gzip"
     return shutil.which("gzip") or "gzip"
 
 
 GZIP = find_gzip()
-PIGZ = "./pigz/pigz"
+PIGZ = "./vendor/pigz/pigz"
 GZIPPY = "./target/release/gzippy"
 UNGZIPPY = "./target/release/ungzippy"
 

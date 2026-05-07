@@ -29,14 +29,14 @@ from typing import List, Tuple, Dict
 import shutil
 
 def find_gzip():
-    if os.path.isfile("./gzip/gzip") and os.access("./gzip/gzip", os.X_OK):
-        return "./gzip/gzip"
+    if os.path.isfile("./vendor/gzip/gzip") and os.access("./vendor/gzip/gzip", os.X_OK):
+        return "./vendor/gzip/gzip"
     return shutil.which("gzip") or "gzip"
 
 GZIP = find_gzip()
-PIGZ = "./pigz/pigz"
-IGZIP = "./isa-l/build/igzip"
-ZOPFLI = "./zopfli/zopfli"
+PIGZ = "./vendor/pigz/pigz"
+IGZIP = "./vendor/isa-l/build/igzip"
+ZOPFLI = "./vendor/zopfli/zopfli"
 GZIPPY = "./target/release/gzippy"
 
 # Defaults

@@ -4,12 +4,12 @@
 # Quick tests (<30s) run with 'make' or 'make quick' - for AI tools and iteration
 # Full perf tests (10+ min) run with 'make perf-full' - for humans at release time
 
-# Build configuration - submodules are in ./gzip, ./pigz, ./isa-l, ./zopfli, and ./rapidgzip
-GZIP_DIR := ./gzip
-PIGZ_DIR := ./pigz
-ISAL_DIR := ./isa-l
-ZOPFLI_DIR := ./zopfli
-RAPIDGZIP_DIR := ./rapidgzip
+# Build configuration - submodules are in ./vendor/{gzip,pigz,isa-l,zopfli,rapidgzip,libdeflate}
+GZIP_DIR := ./vendor/gzip
+PIGZ_DIR := ./vendor/pigz
+ISAL_DIR := ./vendor/isa-l
+ZOPFLI_DIR := ./vendor/zopfli
+RAPIDGZIP_DIR := ./vendor/rapidgzip
 GZIPPY_DIR := .
 TEST_DATA_DIR := test_data
 RESULTS_DIR := test_results
@@ -187,7 +187,7 @@ ship: $(GZIPPY_BIN)
 	    esac; \
 	    [ -f "$$BD/$$DS-gzip.gz" ] || { echo "Creating $$BD/$$DS-gzip.gz..."; gzip -1 -c "$$RAW" > "$$BD/$$DS-gzip.gz"; }; \
 	    [ -f "$$BD/$$DS-bgzf.gz" ] || { echo "Creating $$BD/$$DS-bgzf.gz..."; $$BIN -1 -c "$$RAW" > "$$BD/$$DS-bgzf.gz"; }; \
-	    [ -f "$$BD/$$DS-pigz.gz" ] || { echo "Creating $$BD/$$DS-pigz.gz..."; pigz/pigz -1 -c "$$RAW" > "$$BD/$$DS-pigz.gz"; }; \
+	    [ -f "$$BD/$$DS-pigz.gz" ] || { echo "Creating $$BD/$$DS-pigz.gz..."; vendor/pigz/pigz -1 -c "$$RAW" > "$$BD/$$DS-pigz.gz"; }; \
 	  done; \
 	  echo "Archives: $$(ls $$BD/*-{gzip,bgzf,pigz}.gz 2>/dev/null | wc -l) files ready"'
 	@echo ""

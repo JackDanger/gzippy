@@ -31,9 +31,9 @@ from typing import Dict, List, Tuple, Optional
 
 # Tool paths (relative to repo root)
 GZIPPY = "./target/release/gzippy"
-PIGZ = "./pigz/pigz"
-RAPIDGZIP = "./rapidgzip/librapidarchive/build/src/tools/rapidgzip"
-ZOPFLI = "./zopfli/zopfli"
+PIGZ = "./vendor/pigz/pigz"
+RAPIDGZIP = "./vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip"
+ZOPFLI = "./vendor/zopfli/zopfli"
 GZIP = "gzip"
 
 # Silesia corpus URL
@@ -121,7 +121,7 @@ def benchmark_compress(tool: str, level: int, threads: int,
         bin_path = str(repo_root / "target/release/gzippy")
         cmd = [bin_path, f"-{level}", f"-p{threads}", "-c", str(input_file)]
     elif tool == "pigz":
-        bin_path = str(repo_root / "pigz/pigz")
+        bin_path = str(repo_root / "vendor/pigz/pigz")
         cmd = [bin_path, f"-{level}", f"-p", str(threads), "-c", str(input_file)]
     elif tool == "gzip":
         cmd = ["gzip", f"-{level}", "-c", str(input_file)]
@@ -158,12 +158,12 @@ def benchmark_decompress(tool: str, threads: int, input_file: Path,
             subprocess.run([bin_path, "-d", f"-p{threads}", "-c", str(input_file)],
                           stdout=subprocess.DEVNULL, check=True, stderr=subprocess.DEVNULL)
         elif tool == "pigz":
-            bin_path = str(repo_root / "pigz/pigz")
+            bin_path = str(repo_root / "vendor/pigz/pigz")
             subprocess.run([bin_path, "-d", "-p", str(threads), "-c", str(input_file)],
                           stdout=subprocess.DEVNULL, check=True, stderr=subprocess.DEVNULL)
         elif tool == "rapidgzip":
             # rapidgzip CLI: -d decompress, -P parallelism, -c stdout
-            bin_path = str(repo_root / "rapidgzip/librapidarchive/build/src/tools/rapidgzip")
+            bin_path = str(repo_root / "vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip")
             subprocess.run([bin_path, "-d", f"-P{threads}", "-c", str(input_file)],
                           stdout=subprocess.DEVNULL, check=True, stderr=subprocess.DEVNULL)
         elif tool == "gzip":

@@ -77,33 +77,33 @@ jobs:
           fi
 
           # Build pigz
-          make -C pigz
+          make -C vendor/pigz
 
           # Build igzip (static)
-          cd isa-l
+          cd vendor/isa-l
           rm -rf build && mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
           make -j$(nproc) igzip || echo "igzip build failed"
-          cd ../..
+          cd ../../..
 
           # Build rapidgzip
-          cd rapidgzip/librapidarchive
+          cd vendor/rapidgzip/librapidarchive
           rm -rf build && mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_ISAL=OFF
           make -j$(nproc) rapidgzip || echo "rapidgzip build failed"
-          cd ../../..
+          cd ../../../..
 
           # Build zopfli
-          make -C zopfli zopfli || echo "zopfli build failed"
+          make -C vendor/zopfli zopfli || echo "zopfli build failed"
 
       - name: Package binaries
         run: |
           mkdir -p binaries
           cp target/release/gzippy binaries/
-          cp pigz/pigz pigz/unpigz binaries/
-          cp isa-l/build/igzip binaries/ 2>/dev/null || echo "igzip not available"
-          cp rapidgzip/librapidarchive/build/src/tools/rapidgzip binaries/ 2>/dev/null || echo "rapidgzip not available"
-          cp zopfli/zopfli binaries/ 2>/dev/null || echo "zopfli not available"
+          cp vendor/pigz/pigz vendor/pigz/unpigz binaries/
+          cp vendor/isa-l/build/igzip binaries/ 2>/dev/null || echo "igzip not available"
+          cp vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip binaries/ 2>/dev/null || echo "rapidgzip not available"
+          cp vendor/zopfli/zopfli binaries/ 2>/dev/null || echo "zopfli not available"
           ls -la binaries/
 
       - uses: actions/upload-artifact@v7
