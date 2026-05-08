@@ -2,11 +2,25 @@
 
 ## Progress
 
-**Last completed: Step 28a-redux (parallel `find_minimum` 9-way, gated on `thread_budget`).** First payoff of the budget plumbing: alice `--ultra -p1` 240→202 ms (~16% faster), 1 MB `--ultra -p1` 1358→1324 ms (~2.5% faster); -p8 paths unchanged (budget=1 → serial branch); all output bytes byte-identical, verified via gunzip-roundtrip SHAs and matching sizes.
+**Last completed: post-port cleanup (commit `4eac60f`) + restored `vendor/zopfli` submodule for design reference (`6341d1c`).** The full optimization arc that preceded the cleanup landed Steps 29 → 29b → 28a-redux, plus a hardening of an unrelated bgzf test (`160d1e6`).
 
-**Status: port is complete + intra-block parallelism is now safe-by-contract.** `make ship` (the AUTHORITATIVE wall-clock check on the homelab) is the only remaining gate before Step 26 (PR).
+**Status: port is complete, two intra-block parallelism wins landed, post-cutover debt paid down.** Cumulative wall-clock on `--ultra -p1` (warm runs on this box, output bytes byte-identical across the chain):
+- alice (~151 KB): 405 ms (pre-29) → 380 ms (Step 29) → ~240 ms (Step 29b, hot cache) → ~202 ms (Step 28a-redux). ~50% faster end-to-end.
+- 1 MB text: 1358 ms (pre-29) → ~1340 ms (Step 29b) → ~1324 ms (Step 28a-redux). ~2.5% faster end-to-end.
+- `-p8` paths: byte-identical to the pre-optimization baseline (the `thread_budget` plumbing routes them through serial inner loops so they don't oversubscribe the outer pool).
+- C source kept available out-of-the-build via `git submodule update --init vendor/zopfli` for future side-by-side comparisons.
+
+`make ship` (the AUTHORITATIVE wall-clock check on the homelab) is the only remaining gate before Step 26 (PR).
 
 **Step 27 (batched bit writer) was prototyped and reverted:** zero measurable wall-clock improvement on `--ultra` workloads — the squeeze loop dominates by 10×, not bit emission. Code stayed as the literal C port for clarity.
+
+> **Reading order.** Everything above this banner is the current
+> reality of the codebase. Everything below is the *original* port
+> plan + the doctrine that drove it (preserved as a historical record
+> and as still-binding guidance for any future zopfli-pure work). The
+> step bodies were written when the work was prospective; cross-check
+> against the status table above before treating any "do this" wording
+> as a current instruction.
 
 | Step | Module | Status |
 |------|--------|--------|
@@ -112,6 +126,8 @@ src/backends/
 ```
 
 ## Strategy: oracle-driven port, leaf-first, **never** ship a regression
+
+*(Historical doctrine — applied from Step 0 through cutover at Step 21–23. The C FFI oracle was deleted at Step 23 and replaced with the pinned regression fixtures in `src/backends/zopfli_pure/tests.rs`; the byte-equality contract still holds, just against frozen blobs instead of a live FFI call. Preserved verbatim because the floating-point and verbatim-port rules below are still binding for any future change to `zopfli_pure`.)*
 
 Three iron rules:
 
@@ -221,6 +237,8 @@ port" section near the bottom of this file is where binding answers
 land. Common forks are pre-answered there — check it first.
 
 ### How tests reach the FFI oracle
+
+*(Historical — `oracle_tests.rs` was deleted at Step 23 along with the C FFI bridge. Current regression coverage is in `src/backends/zopfli_pure/tests.rs`, which pins six known-good outputs as hex blobs and roundtrips each through `flate2`. The corpus shape below is preserved as a reference for what the live oracle exercised.)*
 
 Add this helper to `src/backends/zopfli_pure/oracle_tests.rs` once at Step 0
 and reuse it from every later step:
@@ -1478,18 +1496,31 @@ Replace with a smaller permanent regression test in
 fixtures (committed as a hex blob), so a future regression here surfaces
 without needing the C library.
 
-## Step 24 — Drop the `vendor/zopfli` submodule
+## Step 24 — Unwire `vendor/zopfli` from the build (submodule kept for reference)
+
+> *Outcome: as executed, this step **kept** the submodule registered
+> in `.gitmodules` and pinned at `ccf9f05`. Only the build/CI/script
+> wiring was removed; the submodule itself stays so the C source
+> remains accessible for design comparison via
+> `git submodule update --init vendor/zopfli`. The original "rm -f"
+> recipe below was followed to the letter at first (commit `f9d3696`)
+> and later partially reverted by `6341d1c` to restore registration
+> only.*
+
+The original recipe (executed, then partially walked back — see outcome above):
 
 ```bash
-git submodule deinit -f vendor/zopfli
-git rm -f vendor/zopfli
-sed -i '' '/zopfli/,/url = .*zopfli.git/d' .gitmodules     # macOS sed
-git add .gitmodules
+# Build-side cleanup — these stay:
+#   Update Makefile to drop ZOPFLI_DIR, ZOPFLI_BIN, the zopfli build rule,
+#   and the `deps` mention of zopfli. Update CLAUDE.md if it references
+#   the vendored zopfli.
+#
+# Submodule deletion — DO NOT re-run; the submodule is intentionally kept:
+#   git submodule deinit -f vendor/zopfli
+#   git rm -f vendor/zopfli
+#   sed -i '' '/zopfli/,/url = .*zopfli.git/d' .gitmodules
+#   git add .gitmodules
 ```
-
-Update `Makefile` — drop the `ZOPFLI_DIR`, `ZOPFLI_BIN`, the `zopfli` build
-rule (line 78–80), and the `deps` mention of zopfli. Update `CLAUDE.md` if
-it references the vendored zopfli.
 
 ## Step 25 — Final integration
 
@@ -1536,7 +1567,18 @@ These steps only begin after Step 25 is green. Each one runs the full
 oracle-style **regression** test (the one written in Step 23) and `make
 ship`. Any regression in ratio = revert. Any regression in wall-clock = revert.
 
+> **Outcomes summary** (see status table at top for definitive state):
+> 27 prototyped + reverted (no measurable win); 29 + 29b + 28a-redux
+> all landed and bit-identical, with 28a-redux and 29 gated on
+> `ZopfliOptions.thread_budget` to avoid oversubscribing gzippy's outer
+> pool. 28 and 30 are still pending. The bodies below are the *original*
+> prescriptions — kept for context but cross-check against the table.
+
 ## Step 27 — Batched bit writer (the obvious 5-10% win)
+
+> *Outcome: prototyped, **reverted**. The squeeze loop dominates by ~10×
+> on `--ultra`, so bit-emission optimization showed zero measurable
+> wall-clock improvement. Code stayed as the literal C port.*
 
 Replace the per-bit `add_bits` / `add_huffman_bits` with a 64-bit
 accumulator that flushes 8 bytes at a time:
@@ -1591,6 +1633,15 @@ For each hotspot:
 - Revert the commit if ratio diverges or wall-clock fails to improve.
 
 ## Step 29 — Rayon-parallel block evaluation (long-tail win)
+
+> *Outcome: **landed**, but with `std::thread::scope` instead of rayon
+> (no new dep). Initial commit was unconditional and produced a probabilistic
+> result (~6% on alice, neutral-to-loss on saturated outer pools). Step
+> 29b followed up with `ZopfliOptions.thread_budget` so the inner pool
+> bounds itself against gzippy's outer pool — the binary "spawn vs serial"
+> contract is now safe regardless of caller-side parallelism. Step 28a
+> was revived under the same gate. See the status table for current
+> wall-clock numbers.*
 
 `ZopfliDeflatePart` evaluates each split block sequentially via
 `ZopfliLZ77Optimal`. Each block is independent — they share input bytes
