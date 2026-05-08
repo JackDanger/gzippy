@@ -14,6 +14,7 @@ pub mod lz77; // Steps 6-8 (built incrementally)
 pub mod squeeze; // Steps 10-12 (built incrementally)
 pub mod symbols; // Step 1
 pub mod tree; // Step 3
+pub mod zlib; // Step 17 (folded in from Step 20 — trivial port)
 
 /// Options used throughout the program. Mirrors C `ZopfliOptions`. Default
 /// matches `ZopfliInitOptions`.
@@ -39,6 +40,28 @@ impl Default for ZopfliOptions {
             blocksplittingmax: 15,
         }
     }
+}
+
+/// Output container format. Mirrors C `ZopfliFormat` from `zopfli.h`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZopfliFormat {
+    Gzip,
+    Zlib,
+    Deflate,
+}
+
+/// Top-level dispatcher: wraps `in_` in the requested container and
+/// returns the compressed bytes. Mirrors C `ZopfliCompress`.
+pub fn compress(options: &ZopfliOptions, format: ZopfliFormat, in_: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    match format {
+        ZopfliFormat::Gzip => gzip::gzip_compress(options, in_, &mut out),
+        ZopfliFormat::Zlib => zlib::zlib_compress(options, in_, &mut out),
+        ZopfliFormat::Deflate => {
+            deflate::deflate(options, 2, true, in_, 0, &mut out);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

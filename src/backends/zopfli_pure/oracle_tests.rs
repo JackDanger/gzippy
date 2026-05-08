@@ -279,6 +279,13 @@ extern "C" {
         out: *mut *mut c_uchar,
         outsize: *mut usize,
     );
+    fn ZopfliZlibCompress(
+        opts: *const FfiZopfliOptions,
+        in_: *const c_uchar,
+        insize: usize,
+        out: *mut *mut c_uchar,
+        outsize: *mut usize,
+    );
     fn free(ptr: *mut std::ffi::c_void);
 }
 
@@ -887,6 +894,69 @@ fn gzip_matches_ffi_thorough() {
         assert_eq!(rs.len(), ffi.len(), "{}: byte length", name);
         assert_eq!(rs, ffi, "{}: bytes", name);
     }
+}
+
+// ── Step 17: zlib + top-level dispatcher oracle ──────────────────────────────
+
+fn ffi_zlib(opts: &RsOpts, data: &[u8]) -> Vec<u8> {
+    unsafe {
+        let ffi_opts = rs_to_ffi_opts(opts);
+        let mut out: *mut c_uchar = std::ptr::null_mut();
+        let mut outsize: usize = 0;
+        ZopfliZlibCompress(&ffi_opts, data.as_ptr(), data.len(), &mut out, &mut outsize);
+        let bytes = if out.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(out, outsize).to_vec()
+        };
+        if !out.is_null() {
+            free(out as *mut std::ffi::c_void);
+        }
+        bytes
+    }
+}
+
+#[test]
+fn zlib_matches_ffi_byte_for_byte() {
+    use crate::backends::zopfli_pure::zlib::zlib_compress;
+    for (name, data) in corpus() {
+        if data.len() > 16_384 {
+            continue;
+        }
+        for &iters in &[1i32, 5] {
+            let opts = RsOpts {
+                numiterations: iters,
+                ..RsOpts::default()
+            };
+            let ffi = ffi_zlib(&opts, &data);
+            let mut rs = Vec::new();
+            zlib_compress(&opts, &data, &mut rs);
+            assert_eq!(rs, ffi, "{}: iters={}", name, iters);
+        }
+    }
+}
+
+#[test]
+fn compress_dispatcher_matches_format_specific_calls() {
+    use crate::backends::zopfli_pure::deflate::deflate;
+    use crate::backends::zopfli_pure::gzip::gzip_compress;
+    use crate::backends::zopfli_pure::zlib::zlib_compress;
+    use crate::backends::zopfli_pure::{compress, ZopfliFormat};
+
+    let opts = RsOpts::default();
+    let data = b"the quick brown fox jumps over the lazy dog".repeat(20);
+
+    let mut gz = Vec::new();
+    gzip_compress(&opts, &data, &mut gz);
+    assert_eq!(compress(&opts, ZopfliFormat::Gzip, &data), gz);
+
+    let mut zl = Vec::new();
+    zlib_compress(&opts, &data, &mut zl);
+    assert_eq!(compress(&opts, ZopfliFormat::Zlib, &data), zl);
+
+    let mut df = Vec::new();
+    deflate(&opts, 2, true, &data, 0, &mut df);
+    assert_eq!(compress(&opts, ZopfliFormat::Deflate, &data), df);
 }
 
 #[test]

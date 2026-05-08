@@ -2,7 +2,7 @@
 
 ## Progress
 
-**Last completed: Step 16 (gzip.rs — RFC 1952 wrapper + end-to-end FFI oracle)** — see commits below.
+**Last completed: Step 17 (mod.rs public surface — `ZopfliFormat` + `compress` dispatcher; folded in Step 20's zlib container)** — see commits below.
 
 | Step | Module | Status |
 |------|--------|--------|
@@ -23,7 +23,7 @@
 | 14 | `deflate.rs` Part A (`BitWriter`) | ✅ Done |
 | 15 | `deflate.rs` Part B (tree emission, block emission, deflate driver) | ✅ Done — byte-for-byte equality on full corpus incl. alice (151 KB), btype ∈ {0,1,2}, split on/off, iters ∈ {1,5} |
 | 16 | `gzip.rs` | ✅ Done — byte-for-byte equality on full corpus incl. alice |
-| 17 | `mod.rs` public surface | 🔲 Next |
+| 17 | `mod.rs` public surface (+ Step 20's `zlib.rs` folded in) | ✅ Done — `ZopfliFormat::{Gzip,Zlib,Deflate}` + dispatcher; both gzip & zlib byte-equal vs FFI |
 | 18 | Bridge/feature flag | 🔲 |
 | 19–25 | Integration, cutover, cleanup | 🔲 |
 | 26 | PR | 🔲 |
@@ -1402,12 +1402,11 @@ target/release/gzippy --level 11 <bigfile> | gunzip | cmp - <bigfile>
 If any test fails, **do not** continue to cutover. Diagnose against the FFI
 oracle by setting `GZIPPY_ZOPFLI_FFI=1` and rerunning.
 
-## Step 20 — Optional ZLIB container
+## Step 20 — Optional ZLIB container ✅ Folded into Step 17
 
-Port `zlib_container.c` (79 lines) → `zopfli_pure/zlib.rs`. Mostly
-boilerplate (Adler-32 + zlib header). Skip if `ZopfliFormat::Zlib` truly is
-unreachable in gzippy; otherwise port for completeness so the public API
-matches C.
+`zlib_container.c` was trivial enough (~30 LOC of real code) to port at
+the same time as the dispatcher in Step 17. `ZopfliFormat::Zlib` is
+fully implemented and byte-equal to `ZopfliZlibCompress`.
 
 ---
 
