@@ -29,7 +29,19 @@ fn split_cost(i: usize, lz77: &LZ77Store<'_>, start: usize, end: usize) -> f64 {
 /// Finds the `i` in `[start, end)` that minimises `f(i)`. For wide ranges
 /// (`>= 1024`) uses a 9-way recursive narrowing; for narrow ones, brute force.
 /// Returns `(arg_min, min)` so callers don't need an out-pointer.
-fn find_minimum<F: Fn(usize) -> f64>(f: F, start: usize, end: usize) -> (usize, f64) {
+///
+/// The 9 `f(p[i])` evaluations per narrowing iteration are independent, so
+/// we run them in parallel via `std::thread::scope` whenever
+/// `thread_budget != 1`. Budget `1` keeps the original serial loop (used
+/// when an outer pool is already saturating CPUs — see `ZopfliOptions`).
+/// Brute-force branch and the per-iteration argmin remain serial; both are
+/// trivial relative to one `f()` call.
+fn find_minimum<F: Fn(usize) -> f64 + Sync>(
+    f: F,
+    start: usize,
+    end: usize,
+    thread_budget: u32,
+) -> (usize, f64) {
     if end - start < 1024 {
         let mut best = ZOPFLI_LARGE_FLOAT;
         let mut result = start;
@@ -55,9 +67,27 @@ fn find_minimum<F: Fn(usize) -> f64>(f: F, start: usize, end: usize) -> (usize, 
             break;
         }
 
-        for i in 0..FIND_MINIMUM_NUM {
-            p[i] = start + (i + 1) * ((end - start) / (FIND_MINIMUM_NUM + 1));
-            vp[i] = f(p[i]);
+        for (i, slot) in p.iter_mut().enumerate() {
+            *slot = start + (i + 1) * ((end - start) / (FIND_MINIMUM_NUM + 1));
+        }
+        if thread_budget == 1 {
+            for i in 0..FIND_MINIMUM_NUM {
+                vp[i] = f(p[i]);
+            }
+        } else {
+            let f_ref = &f;
+            let p_snap = p;
+            let computed: [f64; FIND_MINIMUM_NUM] = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..FIND_MINIMUM_NUM)
+                    .map(|i| scope.spawn(move || f_ref(p_snap[i])))
+                    .collect();
+                let mut out = [0f64; FIND_MINIMUM_NUM];
+                for (i, h) in handles.into_iter().enumerate() {
+                    out[i] = h.join().unwrap();
+                }
+                out
+            });
+            vp = computed;
         }
         let mut besti = 0;
         let mut best = vp[0];
@@ -189,8 +219,12 @@ pub fn block_split_lz77(
         }
 
         debug_assert!(lstart < lend);
-        let (llpos, splitcost) =
-            find_minimum(|i| split_cost(i, lz77, lstart, lend), lstart + 1, lend);
+        let (llpos, splitcost) = find_minimum(
+            |i| split_cost(i, lz77, lstart, lend),
+            lstart + 1,
+            lend,
+            options.thread_budget,
+        );
 
         debug_assert!(llpos > lstart);
         debug_assert!(llpos < lend);
@@ -305,9 +339,23 @@ mod tests {
     fn find_minimum_brute_force_branch() {
         // < 1024 → brute-force scan, returns the global minimum.
         let f = |i: usize| ((i as f64) - 7.5).powi(2);
-        let (arg, _val) = find_minimum(f, 0, 16);
+        let (arg, _val) = find_minimum(f, 0, 16, 1);
         // 7 and 8 tie; brute force picks the *first* (smaller) index.
         assert_eq!(arg, 7);
+    }
+
+    #[test]
+    fn find_minimum_serial_and_parallel_agree() {
+        // ≥ 1024 → 9-way recursive narrowing. Same closure under
+        // budget=1 (serial path) and budget=0 (parallel path) must
+        // produce identical (arg, min). The function has many local
+        // minima; pick a smooth quadratic so the narrowing actually
+        // converges.
+        let f = |i: usize| ((i as f64) - 5_000.5).powi(2);
+        let (arg_serial, val_serial) = find_minimum(f, 0, 10_000, 1);
+        let (arg_parallel, val_parallel) = find_minimum(f, 0, 10_000, 0);
+        assert_eq!(arg_serial, arg_parallel);
+        assert_eq!(val_serial.to_bits(), val_parallel.to_bits());
     }
 
     #[test]

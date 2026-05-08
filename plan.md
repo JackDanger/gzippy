@@ -2,7 +2,7 @@
 
 ## Progress
 
-**Last completed: Step 29b (`thread_budget` plumbing — `ZopfliGzEncoder` → `ZopfliTuning` → `ZopfliOptions` → `deflate_part`).** Step 29's intra-block parallelism is now gated on the budget so it can't oversubscribe gzippy's outer pool.
+**Last completed: Step 28a-redux (parallel `find_minimum` 9-way, gated on `thread_budget`).** First payoff of the budget plumbing: alice `--ultra -p1` 240→202 ms (~16% faster), 1 MB `--ultra -p1` 1358→1324 ms (~2.5% faster); -p8 paths unchanged (budget=1 → serial branch); all output bytes byte-identical, verified via gunzip-roundtrip SHAs and matching sizes.
 
 **Status: port is complete + intra-block parallelism is now safe-by-contract.** `make ship` (the AUTHORITATIVE wall-clock check on the homelab) is the only remaining gate before Step 26 (PR).
 
@@ -38,7 +38,7 @@
 | 26 | PR | 🔲 Pending `make ship` |
 | 27 | Batched bit writer | ⏭ Skipped — zero measurable wall-clock impact (squeeze dominates) |
 | 28 | Bench-driven hotspots | 🔲 Pending flamegraph access |
-| 28a | Parallelize `find_minimum`'s 9-way evaluation | ⏭ Skipped — +12% on alice but **−5% on 1 MB text**; thread oversubscription with gzippy's outer pool is the root cause (see note below; Step 29b plumbing now unblocks safe retries) |
+| 28a | Parallelize `find_minimum`'s 9-way evaluation | ✅ Done (revived after Step 29b) — gated on `options.thread_budget`; alice `-p1` ~16% faster, 1 MB `-p1` ~2.5% faster, `-p8` paths unchanged (serial branch), all output bit-identical |
 | 29 | Parallel block evaluation | ✅ Done — alice `--ultra` 405→380 ms (~6% faster), bit-identical output |
 | 29b | `thread_budget` plumbing | ✅ Done — `ZopfliOptions.thread_budget` controls intra-block parallelism; `ZopfliGzEncoder::compress_parallel` sets it to `1` (serial) and `compress_single` leaves it `0` (unlimited). 1 MB T=1 ≈ 1340 ms, T=8 ≈ 270 ms (5× speedup); alice T=1 ≈ 240 ms — both bit-identical roundtrips, no regression vs Step 29 baseline. |
 | 30 | Adaptive iteration budget | 🔲 Optional |
