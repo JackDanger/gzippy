@@ -31,6 +31,11 @@
 - The entropy test allows 2 ULP diff (arm64 FP codegen vs Clang)
 - Pre-commit hook runs `cargo fmt`, `cargo check`, and `cargo clippy -D warnings` — fix before committing
 - All modules need `#![allow(dead_code)]` until they're referenced from later modules
+- **When you're unsure about a strategic decision, do not guess.** Add the
+  question as a `> **Open question (Step N):** …` blockquote inside the
+  relevant step section below. A larger advisor model reads the plan
+  out-of-band and answers in-place; resume implementation once the question
+  has been resolved (the blockquote is replaced with guidance).
 
 > **Reader profile.** This plan assumes you (the implementer) can write
 > idiomatic Rust and run `cargo`, but you have **not** read zopfli's source.
