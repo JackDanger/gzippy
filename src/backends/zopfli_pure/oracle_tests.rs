@@ -297,6 +297,108 @@ fn ffi_greedy_snapshot(opts: &RsOpts, data: &[u8]) -> GreedySnapshot {
     }
 }
 
+// ── Step 9: deflate_size oracle ──────────────────────────────────────────────
+
+extern "C" {
+    fn ZopfliCalculateBlockSize(
+        lz77: *const FfiLZ77Store,
+        lstart: usize,
+        lend: usize,
+        btype: c_int,
+    ) -> f64;
+    fn ZopfliCalculateBlockSizeAutoType(
+        lz77: *const FfiLZ77Store,
+        lstart: usize,
+        lend: usize,
+    ) -> f64;
+}
+
+/// Drives the FFI greedy parse, then runs both the FFI and the Rust
+/// `calculate_block_size{,_auto_type}` over the *same* C-side store. This
+/// keeps inputs identical so any divergence is squarely on Step 9.
+fn run_block_size_oracle(opts: &RsOpts, data: &[u8]) {
+    use crate::backends::zopfli_pure::deflate_size::{
+        calculate_block_size, calculate_block_size_auto_type,
+    };
+    use crate::backends::zopfli_pure::lz77::LZ77Store;
+
+    unsafe {
+        let ffi_opts = rs_to_ffi_opts(opts);
+
+        let mut store = std::mem::MaybeUninit::<FfiLZ77Store>::uninit();
+        ZopfliInitLZ77Store(data.as_ptr(), store.as_mut_ptr());
+        let mut store = store.assume_init();
+
+        let mut state = std::mem::MaybeUninit::<FfiBlockState>::uninit();
+        ZopfliInitBlockState(&ffi_opts, 0, data.len(), 1, state.as_mut_ptr());
+        let mut state = state.assume_init();
+
+        let mut hash = std::mem::MaybeUninit::<FfiHash>::uninit();
+        ZopfliAllocHash(ZOPFLI_WINDOW_SIZE, hash.as_mut_ptr());
+        let mut hash = hash.assume_init();
+        ZopfliResetHash(ZOPFLI_WINDOW_SIZE, &mut hash);
+
+        ZopfliLZ77Greedy(
+            &mut state,
+            data.as_ptr(),
+            0,
+            data.len(),
+            &mut store,
+            &mut hash,
+        );
+
+        let n = store.size;
+
+        // Build a Rust LZ77Store mirror by replaying the C fields.
+        let litlens = std::slice::from_raw_parts(store.litlens, n);
+        let dists = std::slice::from_raw_parts(store.dists, n);
+        let positions = std::slice::from_raw_parts(store.pos, n);
+
+        let mut rs_store = LZ77Store::new(data);
+        for i in 0..n {
+            rs_store.store_lit_len_dist(litlens[i], dists[i], positions[i]);
+        }
+
+        for &btype in &[0i32, 1, 2] {
+            let ffi_size = ZopfliCalculateBlockSize(&store, 0, n, btype);
+            let rs_size = calculate_block_size(&rs_store, 0, n, btype);
+            assert_eq!(
+                ffi_size.to_bits(),
+                rs_size.to_bits(),
+                "block size mismatch btype={} (ffi {} vs rs {})",
+                btype,
+                ffi_size,
+                rs_size
+            );
+        }
+        let ffi_auto = ZopfliCalculateBlockSizeAutoType(&store, 0, n);
+        let rs_auto = calculate_block_size_auto_type(&rs_store, 0, n);
+        assert_eq!(
+            ffi_auto.to_bits(),
+            rs_auto.to_bits(),
+            "auto-type block size mismatch (ffi {} vs rs {})",
+            ffi_auto,
+            rs_auto
+        );
+
+        ZopfliCleanLZ77Store(&mut store);
+        ZopfliCleanBlockState(&mut state);
+        ZopfliCleanHash(&mut hash);
+    }
+}
+
+#[test]
+fn block_size_matches_ffi() {
+    let opts = RsOpts::default();
+    for (name, data) in corpus() {
+        if data.is_empty() {
+            continue;
+        }
+        eprintln!("checking block_size on {}", name);
+        run_block_size_oracle(&opts, &data);
+    }
+}
+
 #[test]
 fn lz77_greedy_matches_ffi_byte_for_byte() {
     use crate::backends::zopfli_pure::hash::ZopfliHash;

@@ -2,7 +2,7 @@
 
 ## Progress
 
-**Last completed: Step 8 (lz77.rs Part C — greedy + FFI oracle)** — see commits below.
+**Last completed: Step 9 (deflate_size.rs)** — see commits below.
 
 | Step | Module | Status |
 |------|--------|--------|
@@ -15,8 +15,8 @@
 | 6 | `lz77.rs` Part A (`LZ77Store`, histogram) | ✅ Done |
 | 7 | `lz77.rs` Part B (`BlockState`, `find_longest_match`) | ✅ Done |
 | 8 | `lz77.rs` Part C (`lz77_greedy`, FFI oracle) | ✅ Done — byte-for-byte equality on whole corpus |
-| 9 | `deflate_size.rs` | 🔲 Next |
-| 10–12 | `squeeze.rs` Parts A–C | 🔲 |
+| 9 | `deflate_size.rs` | ✅ Done — bitwise f64 equality vs FFI for btype=0,1,2 + auto |
+| 10–12 | `squeeze.rs` Parts A–C | 🔲 Next |
 | 13 | `blocksplitter.rs` | 🔲 |
 | 14–15 | `deflate.rs` Parts A–B | 🔲 |
 | 16 | `gzip.rs` | 🔲 |
