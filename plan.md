@@ -2,7 +2,7 @@
 
 ## Progress
 
-**Last completed: Step 6 (lz77.rs Part A)** — see commits below.
+**Last completed: Step 8 (lz77.rs Part C — greedy + FFI oracle)** — see commits below.
 
 | Step | Module | Status |
 |------|--------|--------|
@@ -10,12 +10,12 @@
 | 1 | `symbols.rs` | ✅ Done |
 | 2 | `katajainen.rs` | ✅ Done |
 | 3 | `tree.rs` | ✅ Done (2 ULP diff on arm64, noted in oracle test) |
-| 4 | `hash.rs` | ✅ Done (self-consistency test only; oracle in Step 7) |
-| 5 | `cache.rs` | ✅ Done (round-trip property test; end-to-end in Step 7) |
-| 6 | `lz77.rs` Part A (`LZ77Store`, histogram) | ✅ Done (brute-force histogram test) |
-| 7 | `lz77.rs` Part B (`BlockState`, `find_longest_match`) | ✅ Done (brute-force test on small inputs) |
-| 8 | `lz77.rs` Part C (`lz77_greedy`, FFI oracle) | 🔲 Next |
-| 9 | `deflate_size.rs` | 🔲 |
+| 4 | `hash.rs` | ✅ Done (locked in by Step 8 oracle) |
+| 5 | `cache.rs` | ✅ Done (locked in by Step 8 oracle) |
+| 6 | `lz77.rs` Part A (`LZ77Store`, histogram) | ✅ Done |
+| 7 | `lz77.rs` Part B (`BlockState`, `find_longest_match`) | ✅ Done |
+| 8 | `lz77.rs` Part C (`lz77_greedy`, FFI oracle) | ✅ Done — byte-for-byte equality on whole corpus |
+| 9 | `deflate_size.rs` | 🔲 Next |
 | 10–12 | `squeeze.rs` Parts A–C | 🔲 |
 | 13 | `blocksplitter.rs` | 🔲 |
 | 14–15 | `deflate.rs` Parts A–B | 🔲 |

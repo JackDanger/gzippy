@@ -1,6 +1,7 @@
 //! Oracle tests: compare pure-Rust port against the C FFI.
 //! Deleted in cutover step.
 #![cfg(test)]
+#![allow(non_camel_case_types)]
 
 #[allow(dead_code)]
 pub fn corpus() -> Vec<(&'static str, Vec<u8>)> {
@@ -149,6 +150,180 @@ fn tree_lengths_to_symbols_match_ffi() {
         let mut got = vec![0u32; count.len()];
         lengths_to_symbols(&lengths, 15, &mut got);
         assert_eq!(got, exp, "count={:?}", count);
+    }
+}
+
+// ── Step 8: lz77_greedy end-to-end oracle ────────────────────────────────────
+
+use crate::backends::zopfli_pure::ZopfliOptions as RsOpts;
+use std::os::raw::{c_int, c_uchar};
+
+#[repr(C)]
+struct FfiZopfliOptions {
+    verbose: c_int,
+    verbose_more: c_int,
+    numiterations: c_int,
+    blocksplitting: c_int,
+    blocksplittinglast: c_int,
+    blocksplittingmax: c_int,
+}
+
+#[repr(C)]
+struct FfiLZ77Store {
+    litlens: *mut u16,
+    dists: *mut u16,
+    size: usize,
+    data: *const c_uchar,
+    pos: *mut usize,
+    ll_symbol: *mut u16,
+    d_symbol: *mut u16,
+    ll_counts: *mut usize,
+    d_counts: *mut usize,
+}
+
+#[repr(C)]
+struct FfiLongestMatchCache {
+    length: *mut u16,
+    dist: *mut u16,
+    sublen: *mut c_uchar,
+}
+
+#[repr(C)]
+struct FfiBlockState {
+    options: *const FfiZopfliOptions,
+    lmc: *mut FfiLongestMatchCache,
+    blockstart: usize,
+    blockend: usize,
+}
+
+#[repr(C)]
+struct FfiHash {
+    head: *mut c_int,
+    prev: *mut u16,
+    hashval: *mut c_int,
+    val: c_int,
+    head2: *mut c_int,
+    prev2: *mut u16,
+    hashval2: *mut c_int,
+    val2: c_int,
+    same: *mut u16,
+}
+
+extern "C" {
+    fn ZopfliInitLZ77Store(data: *const c_uchar, store: *mut FfiLZ77Store);
+    fn ZopfliCleanLZ77Store(store: *mut FfiLZ77Store);
+    fn ZopfliInitBlockState(
+        opts: *const FfiZopfliOptions,
+        start: usize,
+        end: usize,
+        add_lmc: c_int,
+        s: *mut FfiBlockState,
+    );
+    fn ZopfliCleanBlockState(s: *mut FfiBlockState);
+    fn ZopfliAllocHash(window: usize, h: *mut FfiHash);
+    fn ZopfliCleanHash(h: *mut FfiHash);
+    fn ZopfliResetHash(window: usize, h: *mut FfiHash);
+    fn ZopfliLZ77Greedy(
+        s: *mut FfiBlockState,
+        in_: *const c_uchar,
+        instart: usize,
+        inend: usize,
+        store: *mut FfiLZ77Store,
+        h: *mut FfiHash,
+    );
+}
+
+const ZOPFLI_WINDOW_SIZE: usize = 32_768;
+
+fn rs_to_ffi_opts(o: &RsOpts) -> FfiZopfliOptions {
+    FfiZopfliOptions {
+        verbose: o.verbose,
+        verbose_more: o.verbose_more,
+        numiterations: o.numiterations,
+        blocksplitting: o.blocksplitting,
+        blocksplittinglast: o.blocksplittinglast,
+        blocksplittingmax: o.blocksplittingmax,
+    }
+}
+
+struct GreedySnapshot {
+    litlens: Vec<u16>,
+    dists: Vec<u16>,
+    pos: Vec<usize>,
+    ll_symbol: Vec<u16>,
+    d_symbol: Vec<u16>,
+}
+
+fn ffi_greedy_snapshot(opts: &RsOpts, data: &[u8]) -> GreedySnapshot {
+    unsafe {
+        let ffi_opts = rs_to_ffi_opts(opts);
+
+        let mut store = std::mem::MaybeUninit::<FfiLZ77Store>::uninit();
+        ZopfliInitLZ77Store(data.as_ptr(), store.as_mut_ptr());
+        let mut store = store.assume_init();
+
+        let mut state = std::mem::MaybeUninit::<FfiBlockState>::uninit();
+        ZopfliInitBlockState(&ffi_opts, 0, data.len(), 1, state.as_mut_ptr());
+        let mut state = state.assume_init();
+
+        let mut hash = std::mem::MaybeUninit::<FfiHash>::uninit();
+        ZopfliAllocHash(ZOPFLI_WINDOW_SIZE, hash.as_mut_ptr());
+        let mut hash = hash.assume_init();
+        ZopfliResetHash(ZOPFLI_WINDOW_SIZE, &mut hash);
+
+        ZopfliLZ77Greedy(
+            &mut state,
+            data.as_ptr(),
+            0,
+            data.len(),
+            &mut store,
+            &mut hash,
+        );
+
+        let n = store.size;
+        let snap = GreedySnapshot {
+            litlens: std::slice::from_raw_parts(store.litlens, n).to_vec(),
+            dists: std::slice::from_raw_parts(store.dists, n).to_vec(),
+            pos: std::slice::from_raw_parts(store.pos, n).to_vec(),
+            ll_symbol: std::slice::from_raw_parts(store.ll_symbol, n).to_vec(),
+            d_symbol: std::slice::from_raw_parts(store.d_symbol, n).to_vec(),
+        };
+
+        ZopfliCleanLZ77Store(&mut store);
+        ZopfliCleanBlockState(&mut state);
+        ZopfliCleanHash(&mut hash);
+
+        snap
+    }
+}
+
+#[test]
+fn lz77_greedy_matches_ffi_byte_for_byte() {
+    use crate::backends::zopfli_pure::hash::ZopfliHash;
+    use crate::backends::zopfli_pure::lz77::{lz77_greedy, BlockState, LZ77Store};
+
+    let opts = RsOpts::default();
+    for (name, data) in corpus() {
+        if data.is_empty() {
+            // C path early-returns; trivially equal.
+            continue;
+        }
+        let ffi = ffi_greedy_snapshot(&opts, &data);
+
+        let mut store = LZ77Store::new(&data);
+        let mut state = BlockState::new(&opts, 0, data.len(), true);
+        let mut hash = ZopfliHash::new(ZOPFLI_WINDOW_SIZE);
+        lz77_greedy(&mut state, &data, 0, data.len(), &mut store, &mut hash);
+
+        assert_eq!(store.litlens, ffi.litlens, "litlens differ on {}", name);
+        assert_eq!(store.dists, ffi.dists, "dists differ on {}", name);
+        assert_eq!(store.pos, ffi.pos, "pos differ on {}", name);
+        assert_eq!(
+            store.ll_symbol, ffi.ll_symbol,
+            "ll_symbol differs on {}",
+            name
+        );
+        assert_eq!(store.d_symbol, ffi.d_symbol, "d_symbol differs on {}", name);
     }
 }
 

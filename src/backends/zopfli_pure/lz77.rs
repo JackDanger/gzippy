@@ -488,6 +488,115 @@ pub fn find_longest_match(
     debug_assert!(pos + *length as usize <= size);
 }
 
+// ── Step 8: greedy LZ77 + first end-to-end oracle ────────────────────────────
+
+#[inline]
+fn get_length_score(length: i32, distance: i32) -> i32 {
+    // Long distances cost a lot of extra bits; nudge the score down for them.
+    if distance > 1024 {
+        length - 1
+    } else {
+        length
+    }
+}
+
+/// Greedy LZ77 with lazy matching. Mirrors `ZopfliLZ77Greedy`.
+pub fn lz77_greedy(
+    s: &mut BlockState<'_>,
+    in_: &[u8],
+    instart: usize,
+    inend: usize,
+    store: &mut LZ77Store<'_>,
+    h: &mut ZopfliHash,
+) {
+    if instart == inend {
+        return;
+    }
+
+    let windowstart = instart.saturating_sub(ZOPFLI_WINDOW_SIZE);
+
+    h.reset(ZOPFLI_WINDOW_SIZE);
+    h.warmup(in_, windowstart, inend);
+    for i in windowstart..instart {
+        h.update(in_, i, inend);
+    }
+
+    let mut prev_length: u32 = 0;
+    let mut prev_match: u32 = 0;
+    let mut match_available = false;
+
+    let mut dummysublen = [0u16; 259];
+
+    let mut i = instart;
+    while i < inend {
+        h.update(in_, i, inend);
+
+        let mut leng: u16 = 0;
+        let mut dist: u16 = 0;
+        find_longest_match(
+            s,
+            h,
+            in_,
+            i,
+            inend,
+            ZOPFLI_MAX_MATCH,
+            Some(&mut dummysublen),
+            &mut dist,
+            &mut leng,
+        );
+        let lengthscore = get_length_score(leng as i32, dist as i32);
+
+        let prevlengthscore = get_length_score(prev_length as i32, prev_match as i32);
+        if match_available {
+            match_available = false;
+            if lengthscore > prevlengthscore + 1 {
+                store.store_lit_len_dist(in_[i - 1] as u16, 0, i - 1);
+                if lengthscore >= ZOPFLI_MIN_MATCH as i32 && (leng as usize) < ZOPFLI_MAX_MATCH {
+                    match_available = true;
+                    prev_length = leng as u32;
+                    prev_match = dist as u32;
+                    i += 1;
+                    continue;
+                }
+            } else {
+                let leng = prev_length as u16;
+                let dist = prev_match as u16;
+                verify_len_dist(in_, i - 1, dist, leng);
+                store.store_lit_len_dist(leng, dist, i - 1);
+                for _ in 2..leng as usize {
+                    debug_assert!(i < inend);
+                    i += 1;
+                    h.update(in_, i, inend);
+                }
+                i += 1;
+                continue;
+            }
+        } else if lengthscore >= ZOPFLI_MIN_MATCH as i32 && (leng as usize) < ZOPFLI_MAX_MATCH {
+            match_available = true;
+            prev_length = leng as u32;
+            prev_match = dist as u32;
+            i += 1;
+            continue;
+        }
+
+        // Add to output (no lazy hold).
+        let stored_leng = if lengthscore >= ZOPFLI_MIN_MATCH as i32 {
+            verify_len_dist(in_, i, dist, leng);
+            store.store_lit_len_dist(leng, dist, i);
+            leng
+        } else {
+            store.store_lit_len_dist(in_[i] as u16, 0, i);
+            1
+        };
+        for _ in 1..stored_leng as usize {
+            debug_assert!(i < inend);
+            i += 1;
+            h.update(in_, i, inend);
+        }
+        i += 1;
+    }
+}
+
 impl<'a> Clone for LZ77Store<'a> {
     fn clone(&self) -> Self {
         // Mirror C ZopfliCopyLZ77Store: histograms are sized to a multiple
