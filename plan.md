@@ -113,6 +113,85 @@ make                             # ~30s sanity (catches catastrophic regressions
 `make ship` (homelab perf) is **only** run after Step 28 and after every
 optimization step in Phase 4. Local `make` is the iteration signal.
 
+### When you must adapt the plan
+
+The plan codifies one shape per decision; reality will surface forks the
+plan didn't anticipate. The guiding principle: **deviate when the
+deviation makes correctness easier to verify; do not deviate when it
+just makes the code prettier.**
+
+The deviations below are **recommended** (an earlier executor of this
+plan discovered them; encode them as the default for future steps):
+
+- **One module per commit, even for trivial leaves.** Cleaner bisect at
+  Step 12 if a long-shot bug turns out to live in a Step-4 leaf. If you
+  finish two leaves in one sitting, stash one and commit the other alone.
+- **Pull `ZopfliOptions` up to `mod.rs` whenever it's first needed**
+  (in practice, Step 7's `BlockState`, not Step 17). Mark `#[repr(C)]`
+  from the start so post-cutover FFI sharing in benchmarks costs nothing.
+- **Prefer `Option<T>` over `add_x: bool` flag pairs.**
+  `BlockState { lmc: Option<LongestMatchCache>, ... }` and
+  `s.lmc.is_some()` reads exactly like the C `s->lmc != NULL`. Don't
+  carry the `add_lmc: bool` argument forward into the struct.
+- **Hash chain swap via accessor methods, not pointer aliasing.** The
+  C aliases `hhead = h->head2` mid-loop; in Rust expose
+  `h.head_for(use_hash2: bool) -> &[i32]`,
+  `h.prev_for(use_hash2)`, `h.hashval_for(use_hash2)` and swap a single
+  `bool`. Same generated code, dramatically clearer.
+- **Factor shared work between size-only and emit paths.** The RLE pass
+  used by `EncodeTree` (Step 9 size-only and Step 14 emit) should be
+  one helper returning `(rle, rle_bits, clcounts, hlit, hdist)` rather
+  than re-scanned twice. The trim-zero loop is part of that helper, not
+  duplicated at each call site.
+- **Use `u64::from_le_bytes` for the LZ77 8-byte fast compare**, not
+  unsafe pointer casts. Autovectorizes the same way; no `unsafe`.
+- **Verbatim-port C's signed-int decrement loops.** Example:
+  `optimize_huffman_for_rle` decrements `length` past zero — use `isize`,
+  not `usize`. Idiomatic restructuring fights the line-by-line audit.
+- **Manual `Clone` for `LZ77Store`** must truncate the histogram tails
+  to `NUM_LL * ceil_div(size, NUM_LL)` ll_counts and
+  `NUM_D * ceil_div(size, NUM_D)` d_counts. The C `ZopfliCopyLZ77Store`
+  allocates exactly that much; `derive(Clone)` would copy
+  capacity-padded scratch slots and silently change semantics. (This bug
+  surfaces only at Step 13's `block_split_lz77`, after several other
+  modules pass — easy to miss without the manual impl.)
+- **Oracle tests should replay FFI intermediate state into a Rust
+  struct, not build both sides from scratch.** When testing module N,
+  import the FFI's outputs from earlier modules rather than trusting
+  that the Rust port of module N-1 is bit-equivalent. Step 9's
+  block-size oracle, for instance, calls `ZopfliLZ77Greedy` on the C
+  side and copies the resulting `litlens`/`dists`/`pos` arrays into a
+  Rust `LZ77Store` — isolating Step 9 from any latent drift in Step 8.
+  This pattern generalizes; use it for every oracle from Step 9 onward.
+
+These deviations are **not** OK during the port:
+
+- Refactoring loop bodies into iterator chains. Defer to Phase 10.
+- Changing `f32` → `f64` (or vice versa) to "make types cleaner". The
+  f32 cost buffer in Step 11 and the f64 entropy in Step 3 are load-bearing.
+- Replacing the Marsaglia MWC with a "better" PRNG. Acceptance is
+  byte-identical output; that requires the same RNG sequence.
+- Adding `#[inline]` / `#[cold]` annotations during the port. Profile
+  first (Phase 10 / Step 28).
+- Combining adjacent steps into a single commit "to save a commit." The
+  per-step oracle test is the contract; collapsing it forfeits the
+  bisect signal.
+
+### Logging real ambiguities
+
+When the plan is silent or ambiguous on a real fork (the kind a small
+model can't decide unilaterally without risking drift), do **not** guess.
+Add a blockquote at the top of the relevant step:
+
+```markdown
+> **Open question (Step 11):** the plan says `Fn(u32, u32) -> f64` but
+> the C cost model takes a `void* context`. Trait or closure?
+```
+
+…and ask before deciding. The "Frequently asked questions during the
+port" section near the bottom of this file is where binding answers
+land. Common forks are pre-answered there — check it first.
+
 ### How tests reach the FFI oracle
 
 Add this helper to `src/backends/zopfli_pure/oracle_tests.rs` once at Step 0
@@ -605,12 +684,21 @@ fn lz77store_get_histogram_matches_brute() {
 
 **Source to port:** `vendor/zopfli/src/zopfli/lz77.c:219-542` and `lz77.h:86-129`.
 
+> **Note (cross-step):** `BlockState` needs `ZopfliOptions` here. Pull
+> the struct definition up to `zopfli_pure/mod.rs` now (mark
+> `#[repr(C)]`) rather than waiting for Step 17. See "When you must
+> adapt the plan" above. The hash chain accessors
+> (`h.head_for(use_hash2)`, `h.prev_for(use_hash2)`,
+> `h.hashval_for(use_hash2)`) likewise belong on `ZopfliHash` as added
+> here, even though Step 4 didn't list them — they're the cleanest way
+> to express the C pointer-alias swap inside `find_longest_match`.
+
 **Public API:**
 
 ```rust
 pub struct BlockState<'opt> {
     pub options:    &'opt ZopfliOptions,
-    pub lmc:        Option<LongestMatchCache>,
+    pub lmc:        Option<LongestMatchCache>,    // is_some() ⇔ C `s->lmc != NULL`
     pub blockstart: usize,
     pub blockend:   usize,
 }
@@ -762,8 +850,16 @@ pub fn get_dynamic_lengths(
 - The internal `EncodeTree` in C has a `size_only` flag (out is null). In
   Rust, split into two functions: `encode_tree_size(...) -> usize` (this
   module) and `encode_tree_emit(...)` (Step 14, in `deflate.rs`). They
-  share a private `build_rle_encoding(ll_lengths, d_lengths, use_16,
-  use_17, use_18) -> (Vec<u32>, Vec<u32>, [usize; 19], usize)` helper.
+  share a private helper:
+  ```rust
+  // pub(crate) so deflate.rs can reuse it
+  pub(crate) fn build_rle_encoding(
+      ll_lengths: &[u32; 288], d_lengths: &[u32; 32],
+      use_16: bool, use_17: bool, use_18: bool,
+  ) -> (Vec<u32>, Vec<u32>, [usize; 19], u32 /*hlit*/, u32 /*hdist*/);
+  ```
+  Returning `(clcounts, hlit, hdist)` alongside the rle pair means
+  Step 14's emit path doesn't re-trim trailing zeros or rescan the rle.
 - `CalculateBlockSymbolSize` has three variants in C — small / given-counts
   / general. Port all three; the 3× histogram threshold (`lstart +
   ZOPFLI_NUM_LL * 3 > lend`) is significant.
@@ -803,6 +899,11 @@ mis-port of the RLE-optimization heuristic.
 
 **Source to port:** `vendor/zopfli/src/zopfli/squeeze.c:32-198`.
 
+> **FAQ pointers (read before implementing):** see "Q (Step 10):
+> `add_weighted` — in-place or three-operand?" and "Q (Step 10): how
+> to validate `RanState` without an FFI oracle?" in the FAQ section
+> near the bottom of this file. Both are pre-answered.
+
 **Public API (mostly module-private, but typed):**
 
 ```rust
@@ -817,7 +918,10 @@ impl SymbolStats {
     pub fn new() -> Self;                           // all zero
     pub fn copy_from(&mut self, src: &Self);
     pub fn clear_freqs(&mut self);
-    pub fn add_weighted(&mut self, w1: f64, b: &Self, w2: f64);   // a = a*w1 + b*w2
+    /// In-place: self = self*w1 + other*w2. The C signature has a separate
+    /// `result` pointer, but `squeeze.c:509` is the **only** call site and
+    /// it always passes `result == stats1`. See FAQ for full audit.
+    pub fn add_weighted(&mut self, w1: f64, other: &Self, w2: f64);
     pub fn calculate_statistics(&mut self);                       // entropy
     pub fn from_store(store: &LZ77Store) -> Self;                 // == GetStatistics
 }
@@ -862,12 +966,24 @@ The big oracle test arrives in Step 12.
 
 **Source to port:** `vendor/zopfli/src/zopfli/squeeze.c:217-444`.
 
+> **FAQ pointers:** see "Q (Step 11): cost model dispatch — closure or
+> trait?" and "Q (Step 11): exact f32/f64 boundaries in the DP loop"
+> in the FAQ section. The trait is binding (`pub trait CostModel { fn
+> cost(&self, litlen: u32, dist: u32) -> f64; }`); the f32/f64
+> coercion ladder is binding verbatim.
+
 **Public API:**
 
 ```rust
-pub(crate) fn get_best_lengths<F: Fn(u32, u32) -> f64>(
+pub trait CostModel { fn cost(&self, litlen: u32, dist: u32) -> f64; }
+pub struct FixedCost;
+impl CostModel for FixedCost { /* delegates to cost_fixed */ }
+pub struct StatCost<'a>(pub &'a SymbolStats);
+impl CostModel for StatCost<'_> { /* delegates to cost_stat */ }
+
+pub(crate) fn get_best_lengths<C: CostModel>(
     s: &mut BlockState<'_>, in_: &[u8], instart: usize, inend: usize,
-    cost: F,
+    cost: &C,                    // borrow; caller owns SymbolStats / FixedCost
     length_array: &mut [u16],   // len blocksize + 1
     h: &mut ZopfliHash,
     costs: &mut [f32],          // len blocksize + 1
@@ -954,7 +1070,22 @@ pub fn lz77_optimal_fixed(
 - `costs` and `length_array` are scratch buffers; allocate once outside
   the loop.
 
-**Oracle test (the big one):**
+**Oracle test — split into two tiers (binding):**
+
+> **FAQ pointer:** see "Q (Step 12): squeeze oracle runtime budget"
+> in the FAQ section. The split below is binding; both tiers must be
+> green before Step 13. The thorough tier is what catches a 1-ULP
+> drift on real text — do not skip it.
+
+Tier 1: **fast oracle**, runs on every `cargo test --release` and in
+CI. Caps at 16 KB so the matrix (4 corpus inputs × 4 iteration counts)
+finishes in <60 seconds.
+
+Tier 2: **thorough oracle**, marked `#[ignore]`, runs the full corpus
+(including `alice.txt` and `zeros_64k`) at `numiterations = 1`. Run
+with `cargo test --release -- --ignored zopfli_pure` before merging
+this step **and** before Step 25. Add a Makefile target
+`zopfli-oracle-thorough` that wraps the invocation.
 
 ```rust
 extern "C" {
@@ -965,6 +1096,7 @@ extern "C" {
 
 #[test]
 fn lz77_optimal_matches_ffi_byte_for_byte() {
+    // Tier 1 — fast
     for (name, data) in corpus() {
         if data.len() < 64 || data.len() > 16_384 { continue; }   // keep test <60s
         for &iters in &[1, 2, 5, 15] {
@@ -988,6 +1120,26 @@ fn lz77_optimal_matches_ffi_byte_for_byte() {
         }
     }
 }
+
+#[test]
+#[ignore = "thorough; run via `cargo test --release -- --ignored zopfli_pure`"]
+fn lz77_optimal_matches_ffi_thorough() {
+    // Tier 2 — full corpus, single iteration. Catches FP drift on real text.
+    for (name, data) in corpus() {
+        if data.is_empty() { continue; }
+        let opts = build_options(1);
+        let ffi = run_ffi_optimal(&opts, &data);
+        let rs  = run_rs_optimal(&opts, &data);
+        assert_eq!(ffi, rs, "thorough: {} (len {})", name, data.len());
+    }
+}
+```
+
+Add a Makefile target near the existing perf rules:
+
+```make
+zopfli-oracle-thorough:
+\tcargo test --release -- --ignored zopfli_pure
 ```
 
 If this test fails, the bug is almost certainly:
@@ -1180,6 +1332,11 @@ pub fn gzip_compress(options: &ZopfliOptions, in_: &[u8]) -> Vec<u8>;
   output (OS = 3, not 255). Verify by oracling against the FFI.
 
 ## Step 17 — `mod.rs`: `ZopfliOptions`, `ZopfliFormat`, top-level dispatcher
+
+> **Note:** if you followed the recommendation in "When you must adapt
+> the plan", `ZopfliOptions` already lives in `mod.rs` (added at Step 7
+> for `BlockState`). This step then only adds `ZopfliFormat` and the
+> dispatcher; the struct definition stays where it is.
 
 **Public API mirrors C `zopfli.h`:**
 
@@ -1428,6 +1585,186 @@ iterations even after convergence. Add a converged-early bail-out: if the
 LZ77 store from iteration N is byte-identical to the store from iteration
 N-1, stop. Gate behind `--ultra` (so explicit `-F N` always honors N).
 Expected 5-15% wall-clock on real text, no ratio change.
+
+---
+
+# Frequently asked questions during the port
+
+These are real ambiguities the original plan did not pin. The answers
+below are **binding** — apply them as written. If you hit a fork the
+plan and FAQ both leave open, log it as
+`> **Open question (Step N):** …` at the top of that step and ask
+before deciding. Do not guess.
+
+## Q (Step 10): `add_weighted` — in-place or three-operand?
+
+The C signature is `(stats1, w1, stats2, w2, result)` with three operand
+slots. Audit the call sites: zopfli has **exactly one**, at
+`squeeze.c:509`:
+
+```c
+AddWeighedStatFreqs(&stats, 1.0, &laststats, 0.5, &stats);
+```
+
+`stats1 == result == &stats` everywhere it's invoked. The third
+destination is dead. The in-place signature is therefore behaviourally
+correct and the right shape for the port:
+
+```rust
+impl SymbolStats {
+    pub fn add_weighted(&mut self, w1: f64, other: &Self, w2: f64) {
+        for i in 0..ZOPFLI_NUM_LL {
+            self.litlens[i] = (self.litlens[i] as f64 * w1
+                              + other.litlens[i] as f64 * w2) as usize;
+        }
+        for i in 0..ZOPFLI_NUM_D {
+            self.dists[i] = (self.dists[i] as f64 * w1
+                            + other.dists[i] as f64 * w2) as usize;
+        }
+        self.litlens[256] = 1;     // end symbol; see squeeze.c:77
+    }
+}
+```
+
+(Rust `as usize` truncates toward zero; C `(size_t)` does the same on
+non-negative inputs, which these always are. Match guaranteed.)
+
+## Q (Step 10): how to validate `RanState` without an FFI oracle?
+
+The MWC RNG is `static` inside `squeeze.c` — not callable through the
+FFI. **Recommended**: implement `RanState`, run a one-shot debug binary
+once printing the first 16 outputs, paste the values into `squeeze.rs`
+as a `const FIRST_16: [u32; 16]`, commit. The unit test asserts equality.
+
+```rust
+#[cfg(test)]
+mod ranstate_tests {
+    use super::*;
+    // Generated once by hand from the published Marsaglia MWC formula
+    // with seeds (m_w=1, m_z=2). Locked in to localize future drift.
+    const FIRST_16: [u32; 16] = [
+        /* fill from a one-time `cargo run --release --bin ran_dump` */
+    ];
+    #[test]
+    fn ran_state_first_16() {
+        let mut r = RanState::new();
+        for &expected in &FIRST_16 { assert_eq!(r.next(), expected); }
+    }
+}
+```
+
+Acceptable fallback if the bin overhead feels heavy: skip this test and
+rely on Step 12's full squeeze oracle to catch drift transitively. If
+Step 12 fails *after* Step 10 lands, add the locked-output test then —
+but it's cheap to do up front and pays back in localized signal.
+
+## Q (Step 11): cost-model dispatch — closure or trait?
+
+**Use a trait.** Closures with captures (`|l, d| cost_stat(l, d, &stats)`)
+do monomorphize, but a trait makes the context explicit and keeps the
+inner DP loop readable.
+
+```rust
+pub trait CostModel {
+    fn cost(&self, litlen: u32, dist: u32) -> f64;
+}
+
+pub struct FixedCost;
+impl CostModel for FixedCost {
+    fn cost(&self, litlen: u32, dist: u32) -> f64 { cost_fixed(litlen, dist) }
+}
+
+pub struct StatCost<'a>(pub &'a SymbolStats);
+impl CostModel for StatCost<'_> {
+    fn cost(&self, litlen: u32, dist: u32) -> f64 { cost_stat(litlen, dist, self.0) }
+}
+
+pub fn get_best_lengths<C: CostModel>(
+    s: &mut BlockState<'_>, in_: &[u8], instart: usize, inend: usize,
+    cost: &C,                           // borrow; caller owns SymbolStats
+    length_array: &mut [u16],
+    h: &mut ZopfliHash,
+    costs: &mut [f32],
+) -> f64 { ... }
+```
+
+Each call site (`get_best_lengths(&FixedCost, ...)`,
+`get_best_lengths(&StatCost(&stats), ...)`) generates its own
+specialization with `cost.cost(...)` inlined — same machine code as the
+C indirect call, often better. The trait also keeps Step 12's
+`lz77_optimal_fixed` (uses `FixedCost`) and `lz77_optimal` (uses
+`StatCost`) trivially readable.
+
+## Q (Step 11): exact f32/f64 boundaries in the DP loop
+
+The C code is implicit (C promotes `float` to `double` automatically and
+narrows on store). Rust must be explicit. Pin **verbatim**:
+
+```rust
+// Outside the j loop:
+let mincost: f64 = cost_model_min_cost(cost);
+
+// Initialization (squeeze.c:243-245):
+costs[0] = 0.0;
+for c in &mut costs[1..=blocksize] { *c = ZOPFLI_LARGE_FLOAT as f32; }
+length_array[0] = 0;
+
+// Per-position j body:
+
+// Literal candidate (squeeze.c:277-284)
+if i + 1 <= inend {
+    let new_cost: f64 = cost.cost(in_[i] as u32, 0) + costs[j] as f64;
+    if new_cost < costs[j + 1] as f64 {
+        costs[j + 1] = new_cost as f32;     // explicit narrow
+        length_array[j + 1] = 1;
+    }
+}
+
+// Length candidates (squeeze.c:287-302)
+let mincostaddcostj: f64 = mincost + costs[j] as f64;
+let kend = (leng as usize).min(inend - i);
+for k in 3..=kend {
+    if (costs[j + k] as f64) <= mincostaddcostj { continue; }
+    let new_cost: f64 = cost.cost(k as u32, sublen[k] as u32) + costs[j] as f64;
+    if new_cost < (costs[j + k] as f64) {
+        costs[j + k] = new_cost as f32;     // explicit narrow
+        length_array[j + k] = k as u16;
+    }
+}
+```
+
+Two traps to avoid:
+
+1. **Don't compare `f32` to `f64` without explicit `as f64` on the f32**
+   side. Rust will reject the comparison; satisfying the compiler by
+   narrowing the f64 instead silently changes the algorithm.
+2. **`new_cost as f32` is the only narrowing.** Don't pre-narrow the
+   sum inside the cost computation. The C code does the entire sum in
+   double precision and narrows on store; mirror that exactly.
+
+## Q (Step 12): squeeze oracle runtime budget
+
+The fast oracle caps inputs at 16 KB and runs all `numiterations ∈ {1,
+2, 5, 15}` — finishes in <60 seconds, suitable for `cargo test
+--release` and CI. It misses `alice.txt` (~150 KB) and `zeros_64k`,
+which are exactly the inputs where a 1-ULP FP drift surfaces (real text
+has the most realistic histogram; long zero runs exercise the
+`SHORTCUT_LONG_REPETITIONS` branch).
+
+**Add a thorough oracle as a separate `#[ignore]`-gated test** that
+runs the full corpus at `numiterations = 1`. Even at 1 iteration,
+`alice.txt` produces a real squeeze pass; if Rust and FFI agree on it,
+multi-iteration agreement follows by induction (each iteration is a
+deterministic function of the previous histogram).
+
+Run order:
+- Per-step: `cargo test --release` (fast oracle only).
+- Before merging Step 12: `cargo test --release -- --ignored
+  zopfli_pure`.
+- Before Step 25 (cutover): same thorough invocation, plus `make ship`.
+
+The thorough invocation is wrapped as `make zopfli-oracle-thorough`
+(see Step 12's Makefile snippet).
 
 ---
 
