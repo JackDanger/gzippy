@@ -7,9 +7,12 @@
 
 #![allow(dead_code)]
 
-use super::lz77::LZ77Store;
+use super::hash::ZopfliHash;
+use super::lz77::{find_longest_match, verify_len_dist, BlockState, LZ77Store};
 use super::symbols::{
-    dist_extra_bits, dist_symbol, length_extra_bits, length_symbol, ZOPFLI_NUM_D, ZOPFLI_NUM_LL,
+    dist_extra_bits, dist_symbol, length_extra_bits, length_symbol, ZOPFLI_LARGE_FLOAT,
+    ZOPFLI_MAX_MATCH, ZOPFLI_MIN_MATCH, ZOPFLI_NUM_D, ZOPFLI_NUM_LL, ZOPFLI_WINDOW_MASK,
+    ZOPFLI_WINDOW_SIZE,
 };
 use super::tree::calculate_entropy;
 
@@ -211,8 +214,6 @@ const DSYMBOLS: [u32; 30] = [
 /// Mirrors C `GetCostModelMinCost` exactly: scan lengths with dist=1, scan
 /// dist symbols with length=3, then return `model(bestlength, bestdist)`.
 pub fn cost_model_min_cost<C: CostModel>(model: &C) -> f64 {
-    use super::symbols::ZOPFLI_LARGE_FLOAT;
-
     let mut bestlength: u32 = 0;
     let mut mincost = ZOPFLI_LARGE_FLOAT;
     for i in 3..259u32 {
@@ -234,6 +235,230 @@ pub fn cost_model_min_cost<C: CostModel>(model: &C) -> f64 {
     }
 
     model.cost(bestlength, bestdist)
+}
+
+// ── Step 11: get_best_lengths / trace_backwards / follow_path / optimal_run ──
+
+/// Forward DP pass. For every byte `j` in `[0, blocksize]`, `length_array[j]`
+/// is filled with the optimal length to reach byte `j` from a previous byte;
+/// `costs[j]` is the cost of that path under `model`. Returns the cost of the
+/// full path (`costs[blocksize]`).
+///
+/// **Floating-point widths are load-bearing.** `costs[]` is `f32`; cost-model
+/// returns are `f64`; comparisons promote the f32 to f64 with explicit `as
+/// f64` and stores narrow with explicit `as f32`. Pinned by the plan FAQ.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn get_best_lengths<C: CostModel>(
+    s: &mut BlockState<'_>,
+    in_: &[u8],
+    instart: usize,
+    inend: usize,
+    model: &C,
+    length_array: &mut [u16],
+    h: &mut ZopfliHash,
+    costs: &mut [f32],
+) -> f64 {
+    if instart == inend {
+        return 0.0;
+    }
+
+    let blocksize = inend - instart;
+    let windowstart = instart.saturating_sub(ZOPFLI_WINDOW_SIZE);
+
+    let mincost: f64 = cost_model_min_cost(model);
+
+    h.reset(ZOPFLI_WINDOW_SIZE);
+    h.warmup(in_, windowstart, inend);
+    for i in windowstart..instart {
+        h.update(in_, i, inend);
+    }
+
+    for c in &mut costs[1..=blocksize] {
+        *c = ZOPFLI_LARGE_FLOAT as f32;
+    }
+    costs[0] = 0.0;
+    length_array[0] = 0;
+
+    let mut sublen = [0u16; 259];
+    let mut i = instart;
+    while i < inend {
+        let mut j = i - instart;
+        h.update(in_, i, inend);
+
+        // ZOPFLI_SHORTCUT_LONG_REPETITIONS: skip ZOPFLI_MAX_MATCH bytes
+        // ahead when we're inside a long uniform run, both before and after
+        // the current position.
+        if h.same[i & ZOPFLI_WINDOW_MASK] as usize > ZOPFLI_MAX_MATCH * 2
+            && i > instart + ZOPFLI_MAX_MATCH + 1
+            && i + ZOPFLI_MAX_MATCH * 2 + 1 < inend
+            && h.same[(i - ZOPFLI_MAX_MATCH) & ZOPFLI_WINDOW_MASK] as usize > ZOPFLI_MAX_MATCH
+        {
+            let symbolcost: f64 = model.cost(ZOPFLI_MAX_MATCH as u32, 1);
+            for _ in 0..ZOPFLI_MAX_MATCH {
+                costs[j + ZOPFLI_MAX_MATCH] = (costs[j] as f64 + symbolcost) as f32;
+                length_array[j + ZOPFLI_MAX_MATCH] = ZOPFLI_MAX_MATCH as u16;
+                i += 1;
+                j += 1;
+                h.update(in_, i, inend);
+            }
+        }
+
+        let mut leng: u16 = 0;
+        let mut dist: u16 = 0;
+        find_longest_match(
+            s,
+            h,
+            in_,
+            i,
+            inend,
+            ZOPFLI_MAX_MATCH,
+            Some(&mut sublen),
+            &mut dist,
+            &mut leng,
+        );
+
+        // Literal candidate.
+        if i < inend {
+            let new_cost: f64 = model.cost(in_[i] as u32, 0) + costs[j] as f64;
+            debug_assert!(new_cost >= 0.0);
+            if new_cost < costs[j + 1] as f64 {
+                costs[j + 1] = new_cost as f32;
+                length_array[j + 1] = 1;
+            }
+        }
+
+        // Length candidates.
+        let kend = (leng as usize).min(inend - i);
+        let mincostaddcostj: f64 = mincost + costs[j] as f64;
+        for k in ZOPFLI_MIN_MATCH..=kend {
+            if (costs[j + k] as f64) <= mincostaddcostj {
+                continue;
+            }
+            let new_cost: f64 = model.cost(k as u32, sublen[k] as u32) + costs[j] as f64;
+            debug_assert!(new_cost >= 0.0);
+            if new_cost < costs[j + k] as f64 {
+                debug_assert!(k <= ZOPFLI_MAX_MATCH);
+                costs[j + k] = new_cost as f32;
+                length_array[j + k] = k as u16;
+            }
+        }
+
+        i += 1;
+    }
+
+    debug_assert!(costs[blocksize] >= 0.0);
+    costs[blocksize] as f64
+}
+
+/// Walks `length_array` from the end back to 0, recording the picked lengths,
+/// then mirrors them in place. Output buffer is `path`; the C version
+/// allocates and returns size, we just push.
+pub(crate) fn trace_backwards(size: usize, length_array: &[u16], path: &mut Vec<u16>) {
+    if size == 0 {
+        return;
+    }
+    let mut index = size;
+    loop {
+        let l = length_array[index];
+        path.push(l);
+        debug_assert!((l as usize) <= index);
+        debug_assert!((l as usize) <= ZOPFLI_MAX_MATCH);
+        debug_assert!(l != 0);
+        index -= l as usize;
+        if index == 0 {
+            break;
+        }
+    }
+    path.reverse();
+}
+
+/// Replays `path` against the input, populating `store` with literals and
+/// length/dist pairs; recovers each distance via a fresh `find_longest_match`
+/// call (cheap because the LMC is already populated from the forward pass).
+pub(crate) fn follow_path(
+    s: &mut BlockState<'_>,
+    in_: &[u8],
+    instart: usize,
+    inend: usize,
+    path: &[u16],
+    store: &mut LZ77Store<'_>,
+    h: &mut ZopfliHash,
+) {
+    if instart == inend {
+        return;
+    }
+
+    let windowstart = instart.saturating_sub(ZOPFLI_WINDOW_SIZE);
+
+    h.reset(ZOPFLI_WINDOW_SIZE);
+    h.warmup(in_, windowstart, inend);
+    for i in windowstart..instart {
+        h.update(in_, i, inend);
+    }
+
+    let mut pos = instart;
+    for &raw_length in path {
+        debug_assert!(pos < inend);
+
+        h.update(in_, pos, inend);
+
+        let length: u16 = if (raw_length as usize) >= ZOPFLI_MIN_MATCH {
+            // Recover the distance with the same window search; the assert
+            // matches the C code's sanity check that the longest match
+            // returned now is the same length we picked in the forward pass
+            // (or both fall under the 2-byte threshold).
+            let mut dist: u16 = 0;
+            let mut dummy_length: u16 = 0;
+            find_longest_match(
+                s,
+                h,
+                in_,
+                pos,
+                inend,
+                raw_length as usize,
+                None,
+                &mut dist,
+                &mut dummy_length,
+            );
+            debug_assert!(!(dummy_length != raw_length && raw_length > 2 && dummy_length > 2));
+            verify_len_dist(in_, pos, dist, raw_length);
+            store.store_lit_len_dist(raw_length, dist, pos);
+            raw_length
+        } else {
+            store.store_lit_len_dist(in_[pos] as u16, 0, pos);
+            1
+        };
+
+        debug_assert!(pos + length as usize <= inend);
+        for j in 1..length as usize {
+            h.update(in_, pos + j, inend);
+        }
+        pos += length as usize;
+    }
+}
+
+/// One squeeze iteration: forward DP → trace → follow. Returns the DP cost.
+/// The `path`, `length_array`, and `costs` scratch buffers are reused
+/// across iterations by the caller.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lz77_optimal_run<C: CostModel>(
+    s: &mut BlockState<'_>,
+    in_: &[u8],
+    instart: usize,
+    inend: usize,
+    path: &mut Vec<u16>,
+    length_array: &mut [u16],
+    model: &C,
+    store: &mut LZ77Store<'_>,
+    h: &mut ZopfliHash,
+    costs: &mut [f32],
+) -> f64 {
+    let cost = get_best_lengths(s, in_, instart, inend, model, length_array, h, costs);
+    path.clear();
+    trace_backwards(inend - instart, length_array, path);
+    follow_path(s, in_, instart, inend, path, store, h);
+    debug_assert!(cost < ZOPFLI_LARGE_FLOAT);
+    cost
 }
 
 #[cfg(test)]
