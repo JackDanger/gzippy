@@ -246,6 +246,23 @@ extern "C" {
         inend: usize,
         store: *mut FfiLZ77Store,
     );
+    fn ZopfliBlockSplitLZ77(
+        opts: *const FfiZopfliOptions,
+        lz77: *const FfiLZ77Store,
+        maxblocks: usize,
+        splitpoints: *mut *mut usize,
+        npoints: *mut usize,
+    );
+    fn ZopfliBlockSplit(
+        opts: *const FfiZopfliOptions,
+        in_: *const c_uchar,
+        instart: usize,
+        inend: usize,
+        maxblocks: usize,
+        splitpoints: *mut *mut usize,
+        npoints: *mut usize,
+    );
+    fn free(ptr: *mut std::ffi::c_void);
 }
 
 const ZOPFLI_WINDOW_SIZE: usize = 32_768;
@@ -572,6 +589,136 @@ fn lz77_optimal_matches_ffi_thorough() {
         let ffi = ffi_optimal_snapshot(&opts, &data, false);
         let rs = rs_optimal_snapshot(&opts, &data, false);
         assert_snapshots_eq(&format!("thorough {}", name), &ffi, &rs);
+    }
+}
+
+// ── Step 13: blocksplitter oracle ────────────────────────────────────────────
+
+/// Calls C `ZopfliBlockSplitLZ77` on a freshly-greedy-parsed copy of `data`
+/// and returns the LZ77-index split points it produced. Allocates and frees
+/// the C-side malloc'd output buffer cleanly.
+fn ffi_block_split_lz77(opts: &RsOpts, data: &[u8], maxblocks: usize) -> Vec<usize> {
+    unsafe {
+        let ffi_opts = rs_to_ffi_opts(opts);
+
+        // Build the LZ77 store via the C greedy parse — same input the Rust
+        // side uses (greedy is byte-equal per Step 8).
+        let mut store = std::mem::MaybeUninit::<FfiLZ77Store>::uninit();
+        ZopfliInitLZ77Store(data.as_ptr(), store.as_mut_ptr());
+        let mut store = store.assume_init();
+
+        let mut state = std::mem::MaybeUninit::<FfiBlockState>::uninit();
+        ZopfliInitBlockState(&ffi_opts, 0, data.len(), 0, state.as_mut_ptr());
+        let mut state = state.assume_init();
+
+        let mut hash = std::mem::MaybeUninit::<FfiHash>::uninit();
+        ZopfliAllocHash(ZOPFLI_WINDOW_SIZE, hash.as_mut_ptr());
+        let mut hash = hash.assume_init();
+        ZopfliResetHash(ZOPFLI_WINDOW_SIZE, &mut hash);
+
+        ZopfliLZ77Greedy(
+            &mut state,
+            data.as_ptr(),
+            0,
+            data.len(),
+            &mut store,
+            &mut hash,
+        );
+
+        let mut splitpoints: *mut usize = std::ptr::null_mut();
+        let mut npoints: usize = 0;
+        ZopfliBlockSplitLZ77(&ffi_opts, &store, maxblocks, &mut splitpoints, &mut npoints);
+
+        let out = if splitpoints.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(splitpoints, npoints).to_vec()
+        };
+        if !splitpoints.is_null() {
+            free(splitpoints as *mut std::ffi::c_void);
+        }
+
+        ZopfliCleanLZ77Store(&mut store);
+        ZopfliCleanBlockState(&mut state);
+        ZopfliCleanHash(&mut hash);
+
+        out
+    }
+}
+
+/// Calls C `ZopfliBlockSplit` and returns the byte-position split points.
+fn ffi_block_split(
+    opts: &RsOpts,
+    data: &[u8],
+    instart: usize,
+    inend: usize,
+    maxblocks: usize,
+) -> Vec<usize> {
+    unsafe {
+        let ffi_opts = rs_to_ffi_opts(opts);
+        let mut splitpoints: *mut usize = std::ptr::null_mut();
+        let mut npoints: usize = 0;
+        ZopfliBlockSplit(
+            &ffi_opts,
+            data.as_ptr(),
+            instart,
+            inend,
+            maxblocks,
+            &mut splitpoints,
+            &mut npoints,
+        );
+        let out = if splitpoints.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(splitpoints, npoints).to_vec()
+        };
+        if !splitpoints.is_null() {
+            free(splitpoints as *mut std::ffi::c_void);
+        }
+        out
+    }
+}
+
+#[test]
+fn block_split_lz77_matches_ffi() {
+    use crate::backends::zopfli_pure::blocksplitter::block_split_lz77;
+    use crate::backends::zopfli_pure::hash::ZopfliHash;
+    use crate::backends::zopfli_pure::lz77::{lz77_greedy, BlockState, LZ77Store};
+
+    let opts = RsOpts::default();
+    for (name, data) in corpus() {
+        if data.len() < 32 {
+            // FFI early-returns for size < 10; skip degenerates.
+            continue;
+        }
+        for &maxblocks in &[0usize, 1, 5, 15] {
+            // Build a Rust LZ77Store identical to the FFI's greedy parse.
+            let mut rs_store = LZ77Store::new(&data);
+            let mut state = BlockState::new(&opts, 0, data.len(), false);
+            let mut hash = ZopfliHash::new(ZOPFLI_WINDOW_SIZE);
+            lz77_greedy(&mut state, &data, 0, data.len(), &mut rs_store, &mut hash);
+
+            let ffi = ffi_block_split_lz77(&opts, &data, maxblocks);
+            let rs = block_split_lz77(&opts, &rs_store, maxblocks);
+            assert_eq!(rs, ffi, "{}: maxblocks={}", name, maxblocks);
+        }
+    }
+}
+
+#[test]
+fn block_split_matches_ffi() {
+    use crate::backends::zopfli_pure::blocksplitter::block_split;
+
+    let opts = RsOpts::default();
+    for (name, data) in corpus() {
+        if data.len() < 32 {
+            continue;
+        }
+        for &maxblocks in &[0usize, 1, 5] {
+            let ffi = ffi_block_split(&opts, &data, 0, data.len(), maxblocks);
+            let rs = block_split(&opts, &data, 0, data.len(), maxblocks);
+            assert_eq!(rs, ffi, "{}: maxblocks={}", name, maxblocks);
+        }
     }
 }
 

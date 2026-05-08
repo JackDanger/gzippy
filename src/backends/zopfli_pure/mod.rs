@@ -3,6 +3,7 @@
 
 #![allow(dead_code)]
 
+pub mod blocksplitter; // Step 13
 pub mod cache; // Step 5
 pub mod deflate_size; // Step 9
 pub mod hash; // Step 4
@@ -37,7 +38,6 @@ impl Default for ZopfliOptions {
         }
     }
 }
-// pub mod blocksplitter; // unlock at Step 13
 // pub mod deflate;       // unlock at Steps 14-15
 // pub mod gzip;          // unlock at Step 16
 
