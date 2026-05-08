@@ -2,7 +2,7 @@
 
 ## Progress
 
-**Last completed: Step 4 (hash.rs)** — see commits below.
+**Last completed: Step 5 (cache.rs)** — see commits below.
 
 | Step | Module | Status |
 |------|--------|--------|
@@ -11,7 +11,7 @@
 | 2 | `katajainen.rs` | ✅ Done |
 | 3 | `tree.rs` | ✅ Done (2 ULP diff on arm64, noted in oracle test) |
 | 4 | `hash.rs` | ✅ Done (self-consistency test only; oracle in Step 7) |
-| 5 | `cache.rs` | 🔲 Next |
+| 5 | `cache.rs` | ✅ Done (round-trip property test; end-to-end in Step 7) |
 | 6–8 | `lz77.rs` Parts A–C | 🔲 |
 | 9 | `deflate_size.rs` | 🔲 |
 | 10–12 | `squeeze.rs` Parts A–C | 🔲 |
