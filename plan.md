@@ -2,7 +2,9 @@
 
 ## Progress
 
-**Last completed: Step 24 (cutover — dropped `vendor/zopfli` submodule and removed it from Makefile, CI workflows, and benchmark scripts)** — see commits below.
+**Last completed: Step 25 (final integration — clean rebuild with no C zopfli compiler invoked, 672 tests pass, `make quick` green, L11/L12/iter-5 smoke roundtrips OK)** — see commits below.
+
+**Status: port is complete.** `make ship` (the AUTHORITATIVE wall-clock check on the homelab) is the only remaining gate; that requires SSH access I don't have from this environment, so the user should run it before merging Step 26.
 
 | Step | Module | Status |
 |------|--------|--------|
@@ -25,8 +27,13 @@
 | 16 | `gzip.rs` | ✅ Done — byte-for-byte equality on full corpus incl. alice |
 | 17 | `mod.rs` public surface (+ Step 20's `zlib.rs` folded in) | ✅ Done — `ZopfliFormat::{Gzip,Zlib,Deflate}` + dispatcher; both gzip & zlib byte-equal vs FFI |
 | 18 | Bridge/feature flag | ✅ Done — pure-Rust is the default; `GZIPPY_ZOPFLI_FFI` env var falls back to C; parity test in `zopfli_compress.rs` passes |
-| 19–25 | Integration, cutover, cleanup | 🔲 |
-| 26 | PR | 🔲 |
+| 19 | Full integration matrix | ✅ Done — cargo build, 672-test run, --ultra/-F/--level 11 smoke + FFI parity all green |
+| 21 | Strip FFI bridge from `zopfli_compress.rs` | ✅ Done — production code is pure Rust |
+| 22 | Strip C zopfli build from `build.rs` | ✅ Done — `cargo clean && cargo build` invokes no C compiler for zopfli |
+| 23 | Replace oracle harness with regression fixtures | ✅ Done — 6 pinned hex blobs + flate2 roundtrip in `zopfli_pure/tests.rs` |
+| 24 | Drop `vendor/zopfli` submodule | ✅ Done — removed from `.gitmodules`, Makefile, CI workflows, and bench scripts |
+| 25 | Final integration | ✅ Done locally; `make ship` (homelab L11 wall-clock) is the user's gate |
+| 26 | PR | 🔲 Next |
 | 27–30 | Optimization (post-cutover) | 🔲 |
 
 **Notes for next agent:**
