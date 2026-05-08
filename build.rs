@@ -66,18 +66,40 @@ fn compile_zopfli() {
     }
 
     let lib_file = out_path.join("libzopfli.a");
-    let mut ar_cmd = std::process::Command::new("ar");
-    ar_cmd.arg("rcs").arg(&lib_file);
-    for obj in &obj_files {
-        ar_cmd.arg(obj);
+
+    // Use libtool on macOS, ar on other systems
+    #[cfg(target_os = "macos")]
+    {
+        let mut ar_cmd = std::process::Command::new("libtool");
+        ar_cmd.arg("-static").arg("-o").arg(&lib_file);
+        for obj in &obj_files {
+            ar_cmd.arg(obj);
+        }
+
+        let output = ar_cmd.output().expect("Failed to run libtool");
+        if !output.status.success() {
+            panic!(
+                "Failed to create archive: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
-    let output = ar_cmd.output().expect("Failed to run ar");
-    if !output.status.success() {
-        panic!(
-            "Failed to create archive: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut ar_cmd = std::process::Command::new("ar");
+        ar_cmd.arg("rcs").arg(&lib_file);
+        for obj in &obj_files {
+            ar_cmd.arg(obj);
+        }
+
+        let output = ar_cmd.output().expect("Failed to run ar");
+        if !output.status.success() {
+            panic!(
+                "Failed to create archive: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     println!("cargo:rustc-link-lib=static=zopfli");

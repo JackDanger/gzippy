@@ -135,12 +135,16 @@ pub(crate) fn decompress_gzip_libdeflate<W: Write + Send>(
             Ok(bytes)
         }
         DecodePath::MultiMemberPar => {
-            let bytes = crate::decompress::bgzf::decompress_multi_member_parallel(
+            match crate::decompress::bgzf::decompress_multi_member_parallel(
                 data,
                 writer,
                 num_threads,
-            )?;
-            Ok(bytes)
+            ) {
+                Ok(bytes) => Ok(bytes),
+                // Parallel scan can fail on random/stored-block data with false gzip
+                // header sequences; sequential path handles all multi-member files.
+                Err(_) => decompress_multi_member_sequential(data, writer),
+            }
         }
         DecodePath::MultiMemberSeq => decompress_multi_member_sequential(data, writer),
         DecodePath::IsalSingle | DecodePath::StreamingSingle | DecodePath::LibdeflateSingle => {
@@ -162,9 +166,17 @@ pub(crate) fn decompress_gzip_to_vec(data: &[u8], num_threads: usize) -> GzippyR
         )?);
     }
     if num_threads > 1 && is_likely_multi_member(data) {
-        return Ok(
-            crate::decompress::bgzf::decompress_multi_member_parallel_to_vec(data, num_threads)?,
-        );
+        match crate::decompress::bgzf::decompress_multi_member_parallel_to_vec(data, num_threads) {
+            Ok(v) => return Ok(v),
+            // scan_member_boundaries_fast can fail on random/stored-block data where
+            // the compressed bytes contain false 0x1f 0x8b 0x08 sequences; fall back
+            // to the sequential path which handles all multi-member files correctly.
+            Err(_) => {
+                let mut out = Vec::new();
+                decompress_multi_member_sequential(data, &mut out)?;
+                return Ok(out);
+            }
+        }
     }
     let mut output = Vec::new();
     decompress_gzip_libdeflate(data, &mut output, num_threads)?;

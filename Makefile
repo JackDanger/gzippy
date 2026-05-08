@@ -176,18 +176,22 @@ ship: $(GZIPPY_BIN)
 	@echo "── Step 3/4: rebuild gzippy-dev on homelab ──"
 	@ssh -J neurotic root@10.30.0.199 'set -e; cd gzippy; \
 	  git fetch origin main; git checkout main; git reset --hard origin/main; \
+	  git submodule update --init vendor/zopfli 2>&1 | grep -v "^$$" || true; \
+	  cargo build --release 2>&1 | grep -E "Compiling|Finished|error" || true; \
 	  cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target \
 	    2>&1 | grep -E "Compiling|Finished|error" || true; \
 	  BD=benchmark_data; BIN=target/release/gzippy; \
+	  [ -f "$$BD/silesia.tar" ] || { [ -f "$$BD/silesia.tar.xz" ] && echo "Extracting silesia.tar..." && xz -dk "$$BD/silesia.tar.xz" -c > "$$BD/silesia.tar"; }; \
 	  for DS in silesia software logs; do \
 	    case $$DS in \
 	      silesia)  RAW=$$BD/silesia.tar;; \
 	      software) RAW=$$BD/software.archive;; \
 	      logs)     RAW=$$BD/logs.txt;; \
 	    esac; \
-	    [ -f "$$BD/$$DS-gzip.gz" ] || { echo "Creating $$BD/$$DS-gzip.gz..."; gzip -1 -c "$$RAW" > "$$BD/$$DS-gzip.gz"; }; \
-	    [ -f "$$BD/$$DS-bgzf.gz" ] || { echo "Creating $$BD/$$DS-bgzf.gz..."; $$BIN -1 -c "$$RAW" > "$$BD/$$DS-bgzf.gz"; }; \
-	    [ -f "$$BD/$$DS-pigz.gz" ] || { echo "Creating $$BD/$$DS-pigz.gz..."; vendor/pigz/pigz -1 -c "$$RAW" > "$$BD/$$DS-pigz.gz"; }; \
+	    [ -f "$$RAW" ] || { echo "Skipping $$DS ($$RAW not found)"; continue; }; \
+	    [ -s "$$BD/$$DS-gzip.gz" ] || { echo "Creating $$BD/$$DS-gzip.gz..."; gzip -1 -c "$$RAW" > "$$BD/$$DS-gzip.gz"; }; \
+	    [ -s "$$BD/$$DS-bgzf.gz" ] || { echo "Creating $$BD/$$DS-bgzf.gz..."; $$BIN -1 -c "$$RAW" > "$$BD/$$DS-bgzf.gz"; }; \
+	    [ -s "$$BD/$$DS-pigz.gz" ] || { PIGZ=$$([ -x vendor/pigz/pigz ] && echo vendor/pigz/pigz || echo pigz); echo "Creating $$BD/$$DS-pigz.gz..."; $$PIGZ -1 -c "$$RAW" > "$$BD/$$DS-pigz.gz"; }; \
 	  done; \
 	  echo "Archives: $$(ls $$BD/*-{gzip,bgzf,pigz}.gz 2>/dev/null | wc -l) files ready"'
 	@echo ""
