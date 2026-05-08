@@ -1,5 +1,6 @@
-//! Pure-Rust port of Google Zopfli. Built bottom-up; oracle-tested
-//! against the C FFI at `crate::backends::zopfli_compress` until cutover.
+//! Pure-Rust port of Google Zopfli. Originally built bottom-up and
+//! oracle-tested against the vendored C library; after the cutover the
+//! permanent regression test in `tests.rs` is the long-term guard.
 
 #![allow(dead_code)]
 
@@ -15,6 +16,9 @@ pub mod squeeze; // Steps 10-12 (built incrementally)
 pub mod symbols; // Step 1
 pub mod tree; // Step 3
 pub mod zlib; // Step 17 (folded in from Step 20 — trivial port)
+
+#[cfg(test)]
+mod tests; // Step 23 — permanent regression fixtures (replace oracle harness)
 
 /// Options used throughout the program. Mirrors C `ZopfliOptions`. Default
 /// matches `ZopfliInitOptions`.
@@ -63,6 +67,3 @@ pub fn compress(options: &ZopfliOptions, format: ZopfliFormat, in_: &[u8]) -> Ve
     }
     out
 }
-
-#[cfg(test)]
-mod oracle_tests;

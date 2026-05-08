@@ -29,18 +29,12 @@ SYSTEM_GZIP := $(shell which gzip)
 # Set APPLE_GZIP when it differs from GZIP_BIN so bench targets compare both
 APPLE_GZIP := $(if $(filter Darwin,$(shell uname)),/usr/bin/gzip,)
 
-.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship route-check zopfli-oracle-thorough
+.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship route-check
 
 # =============================================================================
 # Default target: quick benchmark for fast iteration (< 30 seconds)
 # =============================================================================
 all: quick
-
-# Run the zopfli_pure thorough oracle tier (Step 12 of plan.md). This pass
-# replays the full corpus including alice.txt at numiterations=1 to catch
-# floating-point drift that the fast oracle's 16 KB cap would miss.
-zopfli-oracle-thorough:
-	cargo test --release -- --ignored zopfli_pure
 
 # =============================================================================
 # Build targets

@@ -2,7 +2,7 @@
 
 ## Progress
 
-**Last completed: Step 21 (cutover — removed `extern "C"` block + `GZIPPY_ZOPFLI_FFI` env-var bridge from `backends::zopfli_compress`; production path is now pure Rust only)** — see commits below.
+**Last completed: Step 23 (cutover — replaced FFI oracle harness with permanent regression fixtures)** — see commits below.
 
 | Step | Module | Status |
 |------|--------|--------|
