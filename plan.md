@@ -1,5 +1,35 @@
 # Plan: Port Google Zopfli from C to pure Rust
 
+## Progress
+
+**Last completed: Step 3 (tree.rs)** — commit `ba56089` and following.
+
+| Step | Module | Status |
+|------|--------|--------|
+| 0 | Scaffold, oracle harness, alice.txt | ✅ Done |
+| 1 | `symbols.rs` | ✅ Done |
+| 2 | `katajainen.rs` | ✅ Done |
+| 3 | `tree.rs` | ✅ Done (2 ULP diff on arm64, noted in oracle test) |
+| 4 | `hash.rs` | 🔲 Next |
+| 5 | `cache.rs` | 🔲 |
+| 6–8 | `lz77.rs` Parts A–C | 🔲 |
+| 9 | `deflate_size.rs` | 🔲 |
+| 10–12 | `squeeze.rs` Parts A–C | 🔲 |
+| 13 | `blocksplitter.rs` | 🔲 |
+| 14–15 | `deflate.rs` Parts A–B | 🔲 |
+| 16 | `gzip.rs` | 🔲 |
+| 17 | `mod.rs` public surface | 🔲 |
+| 18 | Bridge/feature flag | 🔲 |
+| 19–25 | Integration, cutover, cleanup | 🔲 |
+| 26 | PR | 🔲 |
+| 27–30 | Optimization (post-cutover) | 🔲 |
+
+**Notes for next agent:**
+- `build.rs` was fixed to use `/usr/bin/ar` on macOS (GNU ar from Homebrew was incompatible)
+- The entropy test allows 2 ULP diff (arm64 FP codegen vs Clang)
+- Pre-commit hook runs `cargo fmt`, `cargo check`, and `cargo clippy -D warnings` — fix before committing
+- All modules need `#![allow(dead_code)]` until they're referenced from later modules
+
 > **Reader profile.** This plan assumes you (the implementer) can write
 > idiomatic Rust and run `cargo`, but you have **not** read zopfli's source.
 > Every step cites the exact C file and line range to port, the exact Rust

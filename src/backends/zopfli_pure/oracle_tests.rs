@@ -71,7 +71,7 @@ fn katajainen_matches_ffi() {
                 (Ok(()), Ok(exp)) => {
                     assert_eq!(got, exp, "freq={:?} maxbits={}", freq, mb);
                 }
-                (Err(()), Err(())) => {} // both agree it's an error
+                (Err(()), Err(())) => {}
                 (Ok(()), Err(())) => {
                     panic!(
                         "Rust succeeded but FFI failed: freq={:?} maxbits={}",
@@ -85,6 +85,101 @@ fn katajainen_matches_ffi() {
                     )
                 }
             }
+        }
+    }
+}
+
+// ── Step 3: tree oracle ─────────────────────────────────────────────────────
+
+extern "C" {
+    fn ZopfliCalculateBitLengths(count: *const usize, n: usize, maxbits: i32, bitlengths: *mut u32);
+    fn ZopfliLengthsToSymbols(lengths: *const u32, n: usize, maxbits: u32, symbols: *mut u32);
+    fn ZopfliCalculateEntropy(count: *const usize, n: usize, bitlengths: *mut f64);
+}
+
+fn ffi_bit_lengths(count: &[usize], maxbits: i32) -> Vec<u32> {
+    let mut bl = vec![0u32; count.len()];
+    unsafe { ZopfliCalculateBitLengths(count.as_ptr(), count.len(), maxbits, bl.as_mut_ptr()) };
+    bl
+}
+
+fn ffi_lengths_to_symbols(lengths: &[u32], maxbits: u32) -> Vec<u32> {
+    let mut syms = vec![0u32; lengths.len()];
+    unsafe { ZopfliLengthsToSymbols(lengths.as_ptr(), lengths.len(), maxbits, syms.as_mut_ptr()) };
+    syms
+}
+
+fn ffi_entropy(count: &[usize]) -> Vec<f64> {
+    let mut bl = vec![0.0f64; count.len()];
+    unsafe { ZopfliCalculateEntropy(count.as_ptr(), count.len(), bl.as_mut_ptr()) };
+    bl
+}
+
+#[test]
+fn tree_bitlengths_match_ffi() {
+    use crate::backends::zopfli_pure::tree::calculate_bit_lengths;
+    let tables: Vec<Vec<usize>> = vec![
+        vec![1, 1, 2, 3, 5, 8, 13, 21],
+        (0..288usize).map(|i| i * 7 % 17).collect(),
+        vec![1usize; 32],
+        vec![100, 200, 50, 300, 10],
+        vec![0, 0, 5, 0, 0],
+        vec![42],
+    ];
+    for count in &tables {
+        let exp = ffi_bit_lengths(count, 15);
+        let mut got = vec![0u32; count.len()];
+        calculate_bit_lengths(count, 15, &mut got);
+        assert_eq!(got, exp, "count={:?}", count);
+    }
+}
+
+#[test]
+fn tree_lengths_to_symbols_match_ffi() {
+    use crate::backends::zopfli_pure::tree::{calculate_bit_lengths, lengths_to_symbols};
+    let tables: Vec<Vec<usize>> = vec![
+        vec![1, 1, 2, 3, 5, 8, 13, 21],
+        (0..288usize).map(|i| i * 7 % 17).collect(),
+        vec![1usize; 32],
+    ];
+    for count in &tables {
+        let mut lengths = vec![0u32; count.len()];
+        calculate_bit_lengths(count, 15, &mut lengths);
+        let exp = ffi_lengths_to_symbols(&lengths, 15);
+        let mut got = vec![0u32; count.len()];
+        lengths_to_symbols(&lengths, 15, &mut got);
+        assert_eq!(got, exp, "count={:?}", count);
+    }
+}
+
+#[test]
+fn tree_entropy_match_ffi_exact() {
+    use crate::backends::zopfli_pure::tree::calculate_entropy;
+    let tables: Vec<Vec<usize>> = vec![
+        vec![1, 1, 2, 3, 5, 8, 13, 21],
+        (0..288usize).map(|i| i * 7 % 17).collect(),
+        vec![1usize; 32],
+        vec![0, 0, 5, 0, 3],
+        vec![100; 10],
+    ];
+    for count in &tables {
+        let exp = ffi_entropy(count);
+        let mut got = vec![0.0f64; count.len()];
+        calculate_entropy(count, &mut got);
+        for (i, (&g, &e)) in got.iter().zip(exp.iter()).enumerate() {
+            // Allow 2 ULP: on arm64 (Apple Silicon) Rust's codegen for
+            // log()*kInvLog2 differs by up to 2 ULP from Clang's output.
+            // This difference is too small to affect LZ77 path selection.
+            let diff = (g.to_bits() as i64 - e.to_bits() as i64).unsigned_abs();
+            assert!(
+                diff <= 2,
+                "entropy mismatch at index {} (got {}, exp {}, diff {} ULP); count={:?}",
+                i,
+                g,
+                e,
+                diff,
+                count
+            );
         }
     }
 }
