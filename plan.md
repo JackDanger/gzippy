@@ -13,8 +13,8 @@
 | 4 | `hash.rs` | ✅ Done (self-consistency test only; oracle in Step 7) |
 | 5 | `cache.rs` | ✅ Done (round-trip property test; end-to-end in Step 7) |
 | 6 | `lz77.rs` Part A (`LZ77Store`, histogram) | ✅ Done (brute-force histogram test) |
-| 7 | `lz77.rs` Part B (`BlockState`, `find_longest_match`) | 🔲 Next |
-| 8 | `lz77.rs` Part C (`lz77_greedy`, FFI oracle) | 🔲 |
+| 7 | `lz77.rs` Part B (`BlockState`, `find_longest_match`) | ✅ Done (brute-force test on small inputs) |
+| 8 | `lz77.rs` Part C (`lz77_greedy`, FFI oracle) | 🔲 Next |
 | 9 | `deflate_size.rs` | 🔲 |
 | 10–12 | `squeeze.rs` Parts A–C | 🔲 |
 | 13 | `blocksplitter.rs` | 🔲 |

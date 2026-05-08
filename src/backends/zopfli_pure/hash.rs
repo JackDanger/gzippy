@@ -71,6 +71,26 @@ impl ZopfliHash {
         }
     }
 
+    /// Selects either `prev` (primary hash chain) or `prev2` (secondary).
+    #[inline]
+    pub fn prev_for(&self, use_hash2: bool) -> &[u16] {
+        if use_hash2 {
+            &self.prev2
+        } else {
+            &self.prev
+        }
+    }
+
+    /// Selects either `hashval` (primary hash) or `hashval2` (secondary).
+    #[inline]
+    pub fn hashval_for(&self, use_hash2: bool) -> &[i32] {
+        if use_hash2 {
+            &self.hashval2
+        } else {
+            &self.hashval
+        }
+    }
+
     pub fn update(&mut self, array: &[u8], pos: usize, end: usize) {
         let hpos = pos & ZOPFLI_WINDOW_MASK;
 
