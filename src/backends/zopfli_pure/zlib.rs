@@ -1,10 +1,8 @@
 //! Zlib container: 2-byte CMF/FLG header + deflate payload + 4-byte
-//! big-endian Adler-32. Port of vendor/zopfli/src/zopfli/zlib_container.c.
+//! big-endian Adler-32. Port of Google Zopfli zlib_container.c.
 //!
 //! gzippy itself does not use the zlib format, but the C zopfli's public
 //! API exposes it; porting it here keeps `ZopfliFormat` complete.
-
-#![allow(dead_code)]
 
 use super::deflate::deflate;
 use super::ZopfliOptions;

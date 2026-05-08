@@ -1,7 +1,5 @@
 //! Block splitter: greedy bisection of an LZ77 stream into cheaper blocks.
-//! Port of vendor/zopfli/src/zopfli/blocksplitter.c.
-
-#![allow(dead_code)]
+//! Port of Google Zopfli blocksplitter.c.
 
 use super::deflate_size::calculate_block_size_auto_type;
 use super::hash::ZopfliHash;
@@ -300,19 +298,6 @@ pub fn block_split(
     byte_points
 }
 
-/// Fixed-stride splits at every `blocksize` bytes between `instart` and
-/// `inend`. The C version takes an unused `in` pointer; we drop it. Always
-/// includes `instart` itself as the first split point (matching C).
-pub fn block_split_simple(instart: usize, inend: usize, blocksize: usize) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut i = instart;
-    while i < inend {
-        out.push(i);
-        i += blocksize;
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,12 +367,5 @@ mod tests {
         // All starts done → None.
         let done3 = vec![1u8; 10];
         assert_eq!(find_largest_splittable_block(10, &done3, &splits), None);
-    }
-
-    #[test]
-    fn block_split_simple_strides() {
-        assert_eq!(block_split_simple(0, 100, 30), vec![0usize, 30, 60, 90]);
-        assert_eq!(block_split_simple(5, 5, 10), Vec::<usize>::new());
-        assert_eq!(block_split_simple(10, 25, 7), vec![10usize, 17, 24]);
     }
 }

@@ -1,8 +1,6 @@
 //! Block-size estimation, dynamic-tree size, RLE optimizer.
-//! Size-only half of vendor/zopfli/src/zopfli/deflate.c (lines 74-621).
+//! Size-only half of Google Zopfli deflate.c (lines 74-621).
 //! The bit-emitting half lives in `deflate.rs` (Step 14-15).
-
-#![allow(dead_code)]
 
 use super::lz77::LZ77Store;
 use super::symbols::{

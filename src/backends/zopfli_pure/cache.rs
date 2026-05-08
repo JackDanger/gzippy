@@ -1,7 +1,5 @@
 //! Longest-match cache used by `find_longest_match`.
-//! Port of vendor/zopfli/src/zopfli/cache.c
-
-#![allow(dead_code)]
+//! Port of Google Zopfli cache.c
 
 use super::symbols::ZOPFLI_CACHE_LENGTH;
 

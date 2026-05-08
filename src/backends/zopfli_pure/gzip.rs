@@ -1,7 +1,5 @@
 //! Gzip container: 10-byte header + deflate payload + 4-byte CRC32 + 4-byte
-//! ISIZE. Port of vendor/zopfli/src/zopfli/gzip_container.c (RFC 1952).
-
-#![allow(dead_code)]
+//! ISIZE. Port of Google Zopfli gzip_container.c (RFC 1952).
 
 use super::deflate::deflate;
 use super::ZopfliOptions;

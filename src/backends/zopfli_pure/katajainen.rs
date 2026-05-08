@@ -1,7 +1,5 @@
 //! Length-limited Huffman code lengths via bounded package-merge.
-//! Port of vendor/zopfli/src/zopfli/katajainen.c
-
-#![allow(dead_code)]
+//! Port of Google Zopfli katajainen.c
 
 #[derive(Clone, Copy)]
 struct Node {

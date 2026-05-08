@@ -1,10 +1,8 @@
 //! LZ77 store + block state + longest-match finder + greedy parse.
-//! Port of vendor/zopfli/src/zopfli/lz77.c
+//! Port of Google Zopfli lz77.c
 //!
 //! Built up across plan Steps 6 (LZ77Store + histogram), 7 (BlockState +
 //! find_longest_match), and 8 (lz77_greedy + end-to-end oracle).
-
-#![allow(dead_code)]
 
 use super::cache::LongestMatchCache;
 use super::hash::ZopfliHash;

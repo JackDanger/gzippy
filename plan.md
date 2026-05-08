@@ -54,16 +54,13 @@ earlier passes: `ZopfliOptions.thread_budget` is now set by
 deflate per CPU, and to `0` (unlimited) whenever the caller is
 single-threaded. `deflate_part` reads the budget and either runs the
 chunk loop serially in-thread or spawns one thread per chunk via
-`std::thread::scope`. Future intra-block parallelism work (e.g. a
-revived 28a) should likewise switch on `options.thread_budget` instead
-of unconditionally spawning.
-| 27–30 | Optimization (post-cutover) | 🔲 |
+`std::thread::scope`. The same gate revived Step 28a — see that row in
+the table above. Future intra-block parallelism work should likewise
+switch on `options.thread_budget` instead of unconditionally spawning.
 
 **Notes for next agent:**
-- `build.rs` was fixed to use `/usr/bin/ar` on macOS (GNU ar from Homebrew was incompatible)
 - The entropy test allows 2 ULP diff (arm64 FP codegen vs Clang)
 - Pre-commit hook runs `cargo fmt`, `cargo check`, and `cargo clippy -D warnings` — fix before committing
-- All modules need `#![allow(dead_code)]` until they're referenced from later modules
 - **When you're unsure about a strategic decision, do not guess.** Add the
   question as a `> **Open question (Step N):** …` blockquote inside the
   relevant step section below. A larger advisor model reads the plan
@@ -78,42 +75,38 @@ of unconditionally spawning.
 > reorder steps. The order is chosen so each step's oracle test depends only
 > on previously-finished modules.
 
-## Working environment
+## Working environment (historical, port complete)
 
-- Worktree branch already created — work directly here. PR target: `main`.
-- The C zopfli source is at `vendor/zopfli/src/zopfli/` (run
-  `git submodule update --init vendor/zopfli` if empty).
-- The C FFI lives at `src/backends/zopfli_compress.rs` (264 lines). It will
-  remain the **oracle** until Step 28 cuts over. **Do not delete it before
-  cutover.**
-- The CLI calls FFI through `compress_gzip(data, &tuning)` and
-  `compress_deflate(data, &tuning)` (see `src/compress/zopfli.rs:82` and
-  `:109`). Keep these signatures unchanged across the whole port.
+When this plan was first executed, the C zopfli source was vendored at
+`vendor/zopfli/src/zopfli/` and an FFI bridge at
+`src/backends/zopfli_compress.rs` served as the oracle. After Step 24 the
+submodule was removed; the C source is now consulted out-of-tree via
+`https://github.com/google/zopfli`. The CLI's call shape
+(`compress_gzip(data, &tuning)` / `compress_deflate(data, &tuning)`) is
+unchanged — gzippy still calls into `src/backends/zopfli_compress.rs`,
+which now thin-wraps the pure-Rust port instead of FFI.
 
-## Final architecture
+## Final architecture (current state)
 
 ```
 src/backends/
-  zopfli_compress.rs        # public surface (compress_gzip / compress_deflate / ZopfliTuning)
-                            # post-cutover: pure-Rust thin shim re-exporting from zopfli_pure
-  zopfli_pure/              # NEW, pure-Rust port (this plan creates it)
-    mod.rs                  # ZopfliOptions, ZopfliFormat, top-level Compress dispatcher
+  zopfli_compress.rs        # public surface: compress_gzip / compress_deflate / ZopfliTuning
+                            #   thin pure-Rust shim re-exporting from zopfli_pure
+  zopfli_pure/              # pure-Rust port (Google Zopfli equivalent)
+    mod.rs                  # ZopfliOptions, ZopfliFormat, top-level compress dispatcher
     symbols.rs              # length/dist symbol & extra-bit tables (port of symbols.h)
     katajainen.rs           # length-limited Huffman (port of katajainen.c)
     tree.rs                 # bitlength <-> symbol, entropy (port of tree.c)
     hash.rs                 # ZopfliHash (port of hash.c)
     cache.rs                # LongestMatchCache (port of cache.c)
     lz77.rs                 # LZ77Store, BlockState, FindLongestMatch, LZ77Greedy
-                            #   (port of lz77.c)
     deflate_size.rs         # block-size estimation, dynamic-tree size, RLE optimizer
-                            #   (size-only half of deflate.c)
     squeeze.rs              # SymbolStats, GetBestLengths, LZ77Optimal, LZ77OptimalFixed
-                            #   (port of squeeze.c)
-    blocksplitter.rs        # BlockSplitLZ77 / BlockSplit / FindMinimum (port of blocksplitter.c)
+    blocksplitter.rs        # BlockSplitLZ77 / BlockSplit / FindMinimum
     deflate.rs              # BitWriter, AddLZ77Block, AddDynamicTree, Deflate, DeflatePart
-                            #   (encoder half of deflate.c)
-    gzip.rs                 # gzip header + CRC32 + ISIZE wrapper (port of gzip_container.c)
-    oracle_tests.rs         # #[cfg(test)] equivalence harness vs the C FFI (deleted at end)
+    gzip.rs                 # gzip header + CRC32 + ISIZE wrapper
+    zlib.rs                 # zlib header + Adler-32 wrapper
+    tests.rs                # #[cfg(test)] regression fixtures (replaced the C-FFI oracle)
 ```
 
 ## Strategy: oracle-driven port, leaf-first, **never** ship a regression

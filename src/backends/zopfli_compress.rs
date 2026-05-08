@@ -63,7 +63,6 @@ fn tuning_to_options(tuning: &ZopfliTuning) -> ZopfliOptions {
         verbose_more: 0,
         numiterations: tuning.iterations as i32,
         blocksplitting: if tuning.block_splitting { 1 } else { 0 },
-        blocksplittinglast: 0,
         blocksplittingmax: tuning.block_splitting_max as i32,
         thread_budget: tuning.thread_budget,
     }

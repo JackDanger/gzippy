@@ -1,11 +1,9 @@
 //! Optimal LZ77 by dynamic programming + iterative re-statisticking.
-//! Port of vendor/zopfli/src/zopfli/squeeze.c.
+//! Port of Google Zopfli squeeze.c.
 //!
 //! Built across plan Steps 10 (`SymbolStats`, cost models, `RanState`),
 //! 11 (`get_best_lengths`, `trace_backwards`, `follow_path`), and
 //! 12 (`lz77_optimal`, `lz77_optimal_fixed`, end-to-end FFI oracle).
-
-#![allow(dead_code)]
 
 use super::deflate_size::calculate_block_size;
 use super::hash::ZopfliHash;
@@ -643,7 +641,6 @@ mod tests {
 
     #[test]
     fn cost_model_min_cost_fixed_is_finite() {
-        // sanity bound only — the full numeric oracle arrives in Step 12.
         let m = cost_model_min_cost(&FixedCost);
         assert!(m.is_finite());
         assert!(m > 0.0);

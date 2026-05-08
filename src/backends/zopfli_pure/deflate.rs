@@ -1,9 +1,7 @@
 //! DEFLATE encoder. Built across plan Steps 14 (`BitWriter`) and
 //! 15 (tree emission, block emission, deflate driver).
 //!
-//! Port of the bit-emitting half of vendor/zopfli/src/zopfli/deflate.c.
-
-#![allow(dead_code)]
+//! Port of the bit-emitting half of Google Zopfli deflate.c.
 
 use super::blocksplitter::block_split;
 use super::deflate_size::{
@@ -38,13 +36,6 @@ impl<'a> BitWriter<'a> {
     pub fn new(out: &'a mut Vec<u8>, bp: u8) -> Self {
         debug_assert!(bp < 8);
         Self { out, bp }
-    }
-
-    /// Returns the bit pointer (modular position of the next bit in the
-    /// last byte, in `[0, 7]`).
-    #[inline]
-    pub fn bp(&self) -> u8 {
-        self.bp
     }
 
     /// Append a single bit (0 or 1).

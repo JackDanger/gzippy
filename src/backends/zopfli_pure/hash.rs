@@ -1,7 +1,5 @@
 //! Rolling hash + same-byte run + dual hash for LZ77 longest-match.
-//! Port of vendor/zopfli/src/zopfli/hash.c
-
-#![allow(dead_code)]
+//! Port of Google Zopfli hash.c
 
 use super::symbols::{ZOPFLI_MIN_MATCH, ZOPFLI_WINDOW_MASK};
 

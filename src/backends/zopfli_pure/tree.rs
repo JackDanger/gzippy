@@ -1,7 +1,5 @@
 //! Bit-length / symbol conversion and entropy calculation.
-//! Port of vendor/zopfli/src/zopfli/tree.c
-
-#![allow(dead_code)]
+//! Port of Google Zopfli tree.c
 
 use super::katajainen::length_limited_code_lengths;
 

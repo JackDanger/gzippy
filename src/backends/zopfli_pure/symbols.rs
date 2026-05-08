@@ -1,8 +1,7 @@
 //! DEFLATE length/distance symbol and extra-bit tables.
-//! Port of vendor/zopfli/src/zopfli/symbols.h
+//! Port of Google Zopfli symbols.h
 
 // These constants and functions are used by modules unlocked in later steps.
-#![allow(dead_code)]
 
 pub const ZOPFLI_NUM_LL: usize = 288;
 pub const ZOPFLI_NUM_D: usize = 32;
