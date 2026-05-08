@@ -38,9 +38,27 @@
 | 26 | PR | 🔲 Pending `make ship` |
 | 27 | Batched bit writer | ⏭ Skipped — zero measurable wall-clock impact (squeeze dominates) |
 | 28 | Bench-driven hotspots | 🔲 Pending flamegraph access |
-| 28a | Parallelize `find_minimum`'s 9-way evaluation | ⏭ Skipped — +12% on alice but **−5% on 1 MB text** (thread-spawn overhead dominates for compressible inputs whose LZ77 stores are small); strict per-plan revert |
+| 28a | Parallelize `find_minimum`'s 9-way evaluation | ⏭ Skipped — +12% on alice but **−5% on 1 MB text**; thread oversubscription with gzippy's outer pool is the root cause (see note below) |
 | 29 | Parallel block evaluation | ✅ Done — alice `--ultra` 405→380 ms (~6% faster), bit-identical output |
 | 30 | Adaptive iteration budget | 🔲 Optional |
+
+**Profiling finding (1 MB `--ultra`, instrumented `deflate_part`):** of one
+master-block deflate call (~265 ms total), squeeze takes ~64%, initial
+split ~22%, resplit ~11%, emit ~0.5%. The emit phase is essentially
+free, so the "split decide-vs-emit refactor" idea is a non-starter. The
+real architectural blocker for further parallelism in `zopfli_pure` is
+**thread oversubscription with gzippy's outer parallel pool**: gzippy
+already spawns one thread per master block (default = CPU count), and
+my Step 29 / find_minimum-parallel attempts spawn additional threads
+inside each master block. On an 8-core box that's 8×N threads, all
+CPU-bound, contending for cores. Step 29 happens to win on alice (small
+file → outer pool only spawns ≤2 threads → headroom for inner spawns)
+and is ~neutral on 1 MB (outer pool saturates → my inner spawns just
+contend). To unlock further inner-block parallelism, the next attempt
+needs to **plumb gzippy's `opt_config.thread_count` into `deflate_part`
+and bound the inner pool to (budget / outer_active)**. Without that
+plumbing, every additional intra-block parallelism attempt regresses on
+the saturated workload — as 28a's data shows.
 | 27–30 | Optimization (post-cutover) | 🔲 |
 
 **Notes for next agent:**
