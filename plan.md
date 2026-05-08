@@ -2,7 +2,7 @@
 
 ## Progress
 
-**Last completed: Step 17 (mod.rs public surface — `ZopfliFormat` + `compress` dispatcher; folded in Step 20's zlib container)** — see commits below.
+**Last completed: Step 18 (bridge for `backends::zopfli_compress` — pure-Rust default with `GZIPPY_ZOPFLI_FFI` escape hatch)** — see commits below.
 
 | Step | Module | Status |
 |------|--------|--------|
@@ -24,7 +24,7 @@
 | 15 | `deflate.rs` Part B (tree emission, block emission, deflate driver) | ✅ Done — byte-for-byte equality on full corpus incl. alice (151 KB), btype ∈ {0,1,2}, split on/off, iters ∈ {1,5} |
 | 16 | `gzip.rs` | ✅ Done — byte-for-byte equality on full corpus incl. alice |
 | 17 | `mod.rs` public surface (+ Step 20's `zlib.rs` folded in) | ✅ Done — `ZopfliFormat::{Gzip,Zlib,Deflate}` + dispatcher; both gzip & zlib byte-equal vs FFI |
-| 18 | Bridge/feature flag | 🔲 |
+| 18 | Bridge/feature flag | ✅ Done — pure-Rust is the default; `GZIPPY_ZOPFLI_FFI` env var falls back to C; parity test in `zopfli_compress.rs` passes |
 | 19–25 | Integration, cutover, cleanup | 🔲 |
 | 26 | PR | 🔲 |
 | 27–30 | Optimization (post-cutover) | 🔲 |

@@ -67,17 +67,47 @@ impl ZopfliTuning {
     }
 }
 
-/// Compress data with zopfli in GZIP format
+/// Compress data with zopfli in GZIP format.
+///
+/// Defaults to the pure-Rust port at `crate::backends::zopfli_pure`.
+/// Set `GZIPPY_ZOPFLI_FFI=1` (or any value) to fall back to the C
+/// library — useful for last-mile diffing against the reference.
 pub fn compress_gzip(data: &[u8], tuning: &ZopfliTuning) -> Vec<u8> {
-    compress_internal(data, tuning, ZOPFLI_FORMAT_GZIP)
+    if use_ffi() {
+        compress_via_ffi(data, tuning, ZOPFLI_FORMAT_GZIP)
+    } else {
+        use crate::backends::zopfli_pure::{compress, ZopfliFormat};
+        compress(&tuning_to_pure_opts(tuning), ZopfliFormat::Gzip, data)
+    }
 }
 
-/// Compress data with zopfli in raw DEFLATE format (no gzip header/trailer)
+/// Compress data with zopfli in raw DEFLATE format (no gzip header/trailer).
+/// See [`compress_gzip`] for the FFI override.
 pub fn compress_deflate(data: &[u8], tuning: &ZopfliTuning) -> Vec<u8> {
-    compress_internal(data, tuning, ZOPFLI_FORMAT_DEFLATE)
+    if use_ffi() {
+        compress_via_ffi(data, tuning, ZOPFLI_FORMAT_DEFLATE)
+    } else {
+        use crate::backends::zopfli_pure::{compress, ZopfliFormat};
+        compress(&tuning_to_pure_opts(tuning), ZopfliFormat::Deflate, data)
+    }
 }
 
-fn compress_internal(data: &[u8], tuning: &ZopfliTuning, format: c_int) -> Vec<u8> {
+fn use_ffi() -> bool {
+    std::env::var_os("GZIPPY_ZOPFLI_FFI").is_some()
+}
+
+fn tuning_to_pure_opts(tuning: &ZopfliTuning) -> crate::backends::zopfli_pure::ZopfliOptions {
+    crate::backends::zopfli_pure::ZopfliOptions {
+        verbose: 0,
+        verbose_more: 0,
+        numiterations: tuning.iterations as i32,
+        blocksplitting: if tuning.block_splitting { 1 } else { 0 },
+        blocksplittinglast: 0,
+        blocksplittingmax: tuning.block_splitting_max as i32,
+    }
+}
+
+fn compress_via_ffi(data: &[u8], tuning: &ZopfliTuning, format: c_int) -> Vec<u8> {
     unsafe {
         let mut opts = ZopfliOptions {
             verbose: 0,
@@ -105,9 +135,7 @@ fn compress_internal(data: &[u8], tuning: &ZopfliTuning, format: c_int) -> Vec<u
             return Vec::new();
         }
 
-        // Copy C-allocated memory to Rust Vec
         let result = std::slice::from_raw_parts(out, outsize).to_vec();
-        // Free the C-allocated memory
         libc::free(out as *mut std::ffi::c_void);
         result
     }
@@ -138,5 +166,30 @@ mod tests {
         // DEFLATE format doesn't have magic bytes, just verify output exists
         assert!(!output.is_empty());
         assert!(output.len() < input.len() * 2); // Reasonable bound
+    }
+
+    /// The default (pure-Rust) and FFI paths must produce the same bytes.
+    /// Per the no-fallback policy, divergence here is a hard bug — the
+    /// pure port's oracles in `zopfli_pure` already prove byte-equality at
+    /// the `ZopfliCompress` boundary, so this is a thin smoke-check that
+    /// the bridge wires the same inputs through both paths.
+    #[test]
+    fn pure_and_ffi_paths_agree() {
+        let input = b"the quick brown fox jumps over the lazy dog\n".repeat(50);
+        let tuning = ZopfliTuning {
+            iterations: 5,
+            ..ZopfliTuning::default()
+        };
+
+        let pure = compress_gzip(&input, &tuning);
+        let ffi = compress_via_ffi(&input, &tuning, ZOPFLI_FORMAT_GZIP);
+        assert_eq!(pure, ffi, "gzip: pure-Rust must match FFI byte-for-byte");
+
+        let pure_d = compress_deflate(&input, &tuning);
+        let ffi_d = compress_via_ffi(&input, &tuning, ZOPFLI_FORMAT_DEFLATE);
+        assert_eq!(
+            pure_d, ffi_d,
+            "deflate: pure-Rust must match FFI byte-for-byte"
+        );
     }
 }
