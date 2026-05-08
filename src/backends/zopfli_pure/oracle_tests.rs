@@ -231,6 +231,21 @@ extern "C" {
         store: *mut FfiLZ77Store,
         h: *mut FfiHash,
     );
+    fn ZopfliLZ77Optimal(
+        s: *mut FfiBlockState,
+        in_: *const c_uchar,
+        instart: usize,
+        inend: usize,
+        numiterations: c_int,
+        store: *mut FfiLZ77Store,
+    );
+    fn ZopfliLZ77OptimalFixed(
+        s: *mut FfiBlockState,
+        in_: *const c_uchar,
+        instart: usize,
+        inend: usize,
+        store: *mut FfiLZ77Store,
+    );
 }
 
 const ZOPFLI_WINDOW_SIZE: usize = 32_768;
@@ -426,6 +441,137 @@ fn lz77_greedy_matches_ffi_byte_for_byte() {
             name
         );
         assert_eq!(store.d_symbol, ffi.d_symbol, "d_symbol differs on {}", name);
+    }
+}
+
+// ── Step 12: lz77_optimal end-to-end oracle (two tiers) ──────────────────────
+
+/// Drives the FFI `ZopfliLZ77Optimal{,Fixed}` and snapshots the resulting
+/// store fields for byte-for-byte comparison. `fixed=true` selects
+/// `ZopfliLZ77OptimalFixed` (no iteration count).
+fn ffi_optimal_snapshot(opts: &RsOpts, data: &[u8], fixed: bool) -> GreedySnapshot {
+    unsafe {
+        let ffi_opts = rs_to_ffi_opts(opts);
+
+        let mut store = std::mem::MaybeUninit::<FfiLZ77Store>::uninit();
+        ZopfliInitLZ77Store(data.as_ptr(), store.as_mut_ptr());
+        let mut store = store.assume_init();
+
+        let mut state = std::mem::MaybeUninit::<FfiBlockState>::uninit();
+        ZopfliInitBlockState(&ffi_opts, 0, data.len(), 1, state.as_mut_ptr());
+        let mut state = state.assume_init();
+
+        if fixed {
+            ZopfliLZ77OptimalFixed(&mut state, data.as_ptr(), 0, data.len(), &mut store);
+        } else {
+            ZopfliLZ77Optimal(
+                &mut state,
+                data.as_ptr(),
+                0,
+                data.len(),
+                opts.numiterations,
+                &mut store,
+            );
+        }
+
+        let n = store.size;
+        let snap = GreedySnapshot {
+            litlens: std::slice::from_raw_parts(store.litlens, n).to_vec(),
+            dists: std::slice::from_raw_parts(store.dists, n).to_vec(),
+            pos: std::slice::from_raw_parts(store.pos, n).to_vec(),
+            ll_symbol: std::slice::from_raw_parts(store.ll_symbol, n).to_vec(),
+            d_symbol: std::slice::from_raw_parts(store.d_symbol, n).to_vec(),
+        };
+
+        ZopfliCleanLZ77Store(&mut store);
+        ZopfliCleanBlockState(&mut state);
+
+        snap
+    }
+}
+
+fn rs_optimal_snapshot(opts: &RsOpts, data: &[u8], fixed: bool) -> GreedySnapshot {
+    use crate::backends::zopfli_pure::lz77::{BlockState, LZ77Store};
+    use crate::backends::zopfli_pure::squeeze::{lz77_optimal, lz77_optimal_fixed};
+
+    let mut store = LZ77Store::new(data);
+    let mut state = BlockState::new(opts, 0, data.len(), true);
+    if fixed {
+        lz77_optimal_fixed(&mut state, data, 0, data.len(), &mut store);
+    } else {
+        lz77_optimal(
+            &mut state,
+            data,
+            0,
+            data.len(),
+            opts.numiterations,
+            &mut store,
+        );
+    }
+
+    GreedySnapshot {
+        litlens: store.litlens.clone(),
+        dists: store.dists.clone(),
+        pos: store.pos.clone(),
+        ll_symbol: store.ll_symbol.clone(),
+        d_symbol: store.d_symbol.clone(),
+    }
+}
+
+fn assert_snapshots_eq(label: &str, ffi: &GreedySnapshot, rs: &GreedySnapshot) {
+    assert_eq!(rs.litlens.len(), ffi.litlens.len(), "{}: store size", label);
+    assert_eq!(rs.litlens, ffi.litlens, "{}: litlens", label);
+    assert_eq!(rs.dists, ffi.dists, "{}: dists", label);
+    assert_eq!(rs.pos, ffi.pos, "{}: pos", label);
+    assert_eq!(rs.ll_symbol, ffi.ll_symbol, "{}: ll_symbol", label);
+    assert_eq!(rs.d_symbol, ffi.d_symbol, "{}: d_symbol", label);
+}
+
+/// Tier 1 — fast oracle. Caps inputs at 16 KB so the {iters} matrix
+/// finishes in <60 seconds and runs on every `cargo test --release`.
+#[test]
+fn lz77_optimal_matches_ffi_byte_for_byte() {
+    for (name, data) in corpus() {
+        if data.len() < 32 || data.len() > 16_384 {
+            continue;
+        }
+        for &iters in &[1i32, 2, 5, 15] {
+            let opts = RsOpts {
+                numiterations: iters,
+                ..RsOpts::default()
+            };
+            eprintln!("optimal: {} iters={}", name, iters);
+            let ffi = ffi_optimal_snapshot(&opts, &data, false);
+            let rs = rs_optimal_snapshot(&opts, &data, false);
+            assert_snapshots_eq(&format!("{} iters={}", name, iters), &ffi, &rs);
+        }
+        // Fixed-tree single-shot: iteration count irrelevant.
+        let opts = RsOpts::default();
+        let ffi = ffi_optimal_snapshot(&opts, &data, true);
+        let rs = rs_optimal_snapshot(&opts, &data, true);
+        assert_snapshots_eq(&format!("{} fixed", name), &ffi, &rs);
+    }
+}
+
+/// Tier 2 — thorough oracle. Runs the full corpus (including alice and
+/// zeros_64k) at numiterations=1. Catches FP drift on real text without
+/// blowing the per-test budget. Run via
+/// `cargo test --release -- --ignored zopfli_pure`.
+#[test]
+#[ignore = "thorough; run via `cargo test --release -- --ignored zopfli_pure`"]
+fn lz77_optimal_matches_ffi_thorough() {
+    for (name, data) in corpus() {
+        if data.is_empty() {
+            continue;
+        }
+        let opts = RsOpts {
+            numiterations: 1,
+            ..RsOpts::default()
+        };
+        eprintln!("optimal-thorough: {} (len {})", name, data.len());
+        let ffi = ffi_optimal_snapshot(&opts, &data, false);
+        let rs = rs_optimal_snapshot(&opts, &data, false);
+        assert_snapshots_eq(&format!("thorough {}", name), &ffi, &rs);
     }
 }
 

@@ -2,7 +2,7 @@
 
 ## Progress
 
-**Last completed: Step 9 (deflate_size.rs)** — see commits below.
+**Last completed: Step 12 (squeeze.rs end-to-end FFI oracle, both tiers)** — see commits below.
 
 | Step | Module | Status |
 |------|--------|--------|
@@ -16,8 +16,10 @@
 | 7 | `lz77.rs` Part B (`BlockState`, `find_longest_match`) | ✅ Done |
 | 8 | `lz77.rs` Part C (`lz77_greedy`, FFI oracle) | ✅ Done — byte-for-byte equality on whole corpus |
 | 9 | `deflate_size.rs` | ✅ Done — bitwise f64 equality vs FFI for btype=0,1,2 + auto |
-| 10–12 | `squeeze.rs` Parts A–C | 🔲 Next |
-| 13 | `blocksplitter.rs` | 🔲 |
+| 10 | `squeeze.rs` Part A (`SymbolStats`, `RanState`, cost models) | ✅ Done |
+| 11 | `squeeze.rs` Part B (`get_best_lengths`, `trace_backwards`, `follow_path`) | ✅ Done |
+| 12 | `squeeze.rs` Part C (`lz77_optimal{,_fixed}`, FFI oracle) | ✅ Done — byte-for-byte equality on full corpus incl. alice (151 KB), iters ∈ {1,2,5,15} + fixed-tree |
+| 13 | `blocksplitter.rs` | 🔲 Next |
 | 14–15 | `deflate.rs` Parts A–B | 🔲 |
 | 16 | `gzip.rs` | 🔲 |
 | 17 | `mod.rs` public surface | 🔲 |

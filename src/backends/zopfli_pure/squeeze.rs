@@ -7,8 +7,9 @@
 
 #![allow(dead_code)]
 
+use super::deflate_size::calculate_block_size;
 use super::hash::ZopfliHash;
-use super::lz77::{find_longest_match, verify_len_dist, BlockState, LZ77Store};
+use super::lz77::{find_longest_match, lz77_greedy, verify_len_dist, BlockState, LZ77Store};
 use super::symbols::{
     dist_extra_bits, dist_symbol, length_extra_bits, length_symbol, ZOPFLI_LARGE_FLOAT,
     ZOPFLI_MAX_MATCH, ZOPFLI_MIN_MATCH, ZOPFLI_NUM_D, ZOPFLI_NUM_LL, ZOPFLI_WINDOW_MASK,
@@ -459,6 +460,121 @@ pub(crate) fn lz77_optimal_run<C: CostModel>(
     follow_path(s, in_, instart, inend, path, store, h);
     debug_assert!(cost < ZOPFLI_LARGE_FLOAT);
     cost
+}
+
+// ── Step 12: lz77_optimal / lz77_optimal_fixed ───────────────────────────────
+
+/// Multi-iteration optimal squeeze. Each iteration uses the previous run's
+/// histogram as the cost model; the cheapest run wins. Mirrors C
+/// `ZopfliLZ77Optimal` literally — including the magic numbers `i > 5`,
+/// the 1.0/0.5 weighted blend after the randomization kicks in, and the
+/// `lastrandomstep == -1` activation gate.
+pub fn lz77_optimal<'a>(
+    s: &mut BlockState<'_>,
+    in_: &'a [u8],
+    instart: usize,
+    inend: usize,
+    numiterations: i32,
+    store: &mut LZ77Store<'a>,
+) {
+    let blocksize = inend - instart;
+    let mut length_array = vec![0u16; blocksize + 1];
+    let mut costs = vec![0f32; blocksize + 1];
+    let mut path: Vec<u16> = Vec::new();
+
+    let mut currentstore = LZ77Store::new(in_);
+    let mut h = ZopfliHash::new(ZOPFLI_WINDOW_SIZE);
+
+    let mut beststats = SymbolStats::new();
+    let mut laststats = SymbolStats::new();
+
+    let mut bestcost = ZOPFLI_LARGE_FLOAT;
+    let mut lastcost: f64 = 0.0;
+    let mut ran_state = RanState::new();
+    let mut lastrandomstep: i32 = -1;
+
+    // Initial run: greedy parse → seed statistics.
+    lz77_greedy(s, in_, instart, inend, &mut currentstore, &mut h);
+    let mut stats = SymbolStats::from_store(&currentstore);
+
+    for i in 0..numiterations {
+        currentstore.reset();
+        let model = StatCost(&stats);
+        lz77_optimal_run(
+            s,
+            in_,
+            instart,
+            inend,
+            &mut path,
+            &mut length_array,
+            &model,
+            &mut currentstore,
+            &mut h,
+            &mut costs,
+        );
+        let cost = calculate_block_size(&currentstore, 0, currentstore.size(), 2);
+        if s.options.verbose_more != 0 || (s.options.verbose != 0 && cost < bestcost) {
+            eprintln!("Iteration {}: {} bit", i, cost as i64);
+        }
+        if cost < bestcost {
+            // Copy the run's output into the caller's store.
+            store.reset();
+            store.append_from(&currentstore);
+            beststats.copy_from(&stats);
+            bestcost = cost;
+        }
+        laststats.copy_from(&stats);
+        stats.clear_freqs();
+        stats = SymbolStats::from_store(&currentstore);
+        if lastrandomstep != -1 {
+            // Once randomness has kicked in, blend last + current to slow
+            // convergence but improve final ratio. C uses an in-place
+            // (`&stats, &laststats, &stats`) call; our `add_weighted` is
+            // already in-place per the FAQ.
+            stats.add_weighted(1.0, &laststats, 0.5);
+            stats.calculate_statistics();
+        }
+        if i > 5 && cost == lastcost {
+            stats.copy_from(&beststats);
+            ran_state.randomize_stat_freqs(&mut stats);
+            stats.calculate_statistics();
+            lastrandomstep = i;
+        }
+        lastcost = cost;
+    }
+}
+
+/// Single-shot squeeze under the fixed Huffman tree (btype=01). Mirrors
+/// `ZopfliLZ77OptimalFixed`. No iteration; the fixed tree is known so
+/// `FixedCost` is the optimal cost model.
+pub fn lz77_optimal_fixed<'a>(
+    s: &mut BlockState<'_>,
+    in_: &'a [u8],
+    instart: usize,
+    inend: usize,
+    store: &mut LZ77Store<'a>,
+) {
+    let blocksize = inend - instart;
+    let mut length_array = vec![0u16; blocksize + 1];
+    let mut costs = vec![0f32; blocksize + 1];
+    let mut path: Vec<u16> = Vec::new();
+    let mut h = ZopfliHash::new(ZOPFLI_WINDOW_SIZE);
+
+    s.blockstart = instart;
+    s.blockend = inend;
+
+    lz77_optimal_run(
+        s,
+        in_,
+        instart,
+        inend,
+        &mut path,
+        &mut length_array,
+        &FixedCost,
+        store,
+        &mut h,
+        &mut costs,
+    );
 }
 
 #[cfg(test)]
