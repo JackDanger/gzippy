@@ -38,6 +38,7 @@
 | 26 | PR | 🔲 Pending `make ship` |
 | 27 | Batched bit writer | ⏭ Skipped — zero measurable wall-clock impact (squeeze dominates) |
 | 28 | Bench-driven hotspots | 🔲 Pending flamegraph access |
+| 28a | Parallelize `find_minimum`'s 9-way evaluation | ⏭ Skipped — +12% on alice but **−5% on 1 MB text** (thread-spawn overhead dominates for compressible inputs whose LZ77 stores are small); strict per-plan revert |
 | 29 | Parallel block evaluation | ✅ Done — alice `--ultra` 405→380 ms (~6% faster), bit-identical output |
 | 30 | Adaptive iteration budget | 🔲 Optional |
 | 27–30 | Optimization (post-cutover) | 🔲 |
