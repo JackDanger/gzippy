@@ -17,6 +17,11 @@ pub struct ZopfliTuning {
     pub block_splitting: bool,
     /// Maximum blocks to split into (default 15; 0 = unlimited)
     pub block_splitting_max: u32,
+    /// Inner-loop thread budget for `deflate_part` (see
+    /// [`ZopfliOptions::thread_budget`]). `0` = unlimited (default; safe
+    /// when the caller is single-threaded), `1` = serial (safe when an
+    /// outer pool is already saturating CPUs).
+    pub thread_budget: u32,
 }
 
 impl Default for ZopfliTuning {
@@ -25,6 +30,7 @@ impl Default for ZopfliTuning {
             iterations: 15,
             block_splitting: true,
             block_splitting_max: 15,
+            thread_budget: 0,
         }
     }
 }
@@ -36,6 +42,7 @@ impl ZopfliTuning {
             iterations: args.zopfli_iterations.unwrap_or(15),
             block_splitting: !args.zopfli_no_split,
             block_splitting_max: args.zopfli_split_max.unwrap_or(15),
+            thread_budget: 0,
         }
     }
 }
@@ -58,6 +65,7 @@ fn tuning_to_options(tuning: &ZopfliTuning) -> ZopfliOptions {
         blocksplitting: if tuning.block_splitting { 1 } else { 0 },
         blocksplittinglast: 0,
         blocksplittingmax: tuning.block_splitting_max as i32,
+        thread_budget: tuning.thread_budget,
     }
 }
 

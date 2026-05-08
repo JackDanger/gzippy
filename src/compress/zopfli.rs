@@ -78,8 +78,12 @@ impl ZopfliGzEncoder {
 
     /// Single-threaded compression with full metadata preservation
     fn compress_single<W: Write>(&self, data: &[u8], mut writer: W) -> io::Result<()> {
-        // Compress to raw DEFLATE format
-        let deflate_data = compress_deflate(data, &self.tuning);
+        // Compress to raw DEFLATE format. `thread_budget = 0` lets the
+        // pure-Rust port use intra-block parallelism freely — there's no
+        // outer pool to contend with on this path.
+        let mut tuning = self.tuning.clone();
+        tuning.thread_budget = 0;
+        let deflate_data = compress_deflate(data, &tuning);
 
         // Write gzip header manually
         self.write_gzip_header(&mut writer)?;
@@ -98,7 +102,12 @@ impl ZopfliGzEncoder {
 
     /// Multi-threaded compression using parallel scheduler
     fn compress_parallel<W: Write + Send>(&self, data: &[u8], writer: W) -> io::Result<()> {
-        let tuning = self.tuning.clone();
+        // The scheduler already runs one zopfli compression per CPU; force
+        // the inner port to serial so we don't spawn N×N threads on an
+        // N-CPU box (the regression that killed the Step 28a experiment;
+        // see plan.md).
+        let mut tuning = self.tuning.clone();
+        tuning.thread_budget = 1;
         let _writer = compress_parallel_independent(
             data,
             self.block_size,

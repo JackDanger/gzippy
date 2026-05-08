@@ -20,10 +20,21 @@ pub mod zlib; // Step 17 (folded in from Step 20 — trivial port)
 #[cfg(test)]
 mod tests; // Step 23 — permanent regression fixtures (replace oracle harness)
 
-/// Options used throughout the program. Mirrors C `ZopfliOptions`. Default
-/// matches `ZopfliInitOptions`.
+/// Options used throughout the program. Mirrors C `ZopfliOptions`; the
+/// `#[repr(C)]` is now gone since the FFI cutover (Step 21 of plan.md)
+/// removed the only consumer of the layout. `thread_budget` is a
+/// Rust-only addition that bounds intra-block parallelism so we don't
+/// oversubscribe gzippy's outer thread pool — see Step 29 + the
+/// blocker note in plan.md.
+///
+/// `thread_budget == 0` means "unlimited" (one thread per block-split
+/// chunk; the canonical setup when the caller is single-threaded
+/// outside `deflate_part`). `thread_budget == 1` means "serial"
+/// (process chunks in-thread; the canonical setup when an outer pool
+/// is already running one `deflate_part` per CPU). Other values are
+/// reserved for a future hierarchical scheduler — currently treated as
+/// "unlimited" by the splitter loop.
 #[derive(Clone, Debug)]
-#[repr(C)]
 pub struct ZopfliOptions {
     pub verbose: i32,
     pub verbose_more: i32,
@@ -31,6 +42,7 @@ pub struct ZopfliOptions {
     pub blocksplitting: i32,
     pub blocksplittinglast: i32,
     pub blocksplittingmax: i32,
+    pub thread_budget: u32,
 }
 
 impl Default for ZopfliOptions {
@@ -42,6 +54,7 @@ impl Default for ZopfliOptions {
             blocksplitting: 1,
             blocksplittinglast: 0,
             blocksplittingmax: 15,
+            thread_budget: 0,
         }
     }
 }

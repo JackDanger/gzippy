@@ -505,15 +505,19 @@ pub fn deflate_part(
 
     let npoints = splitpoints_uncompressed.len();
 
-    // Step 29: parallel block evaluation. Each lz77_optimal call on
-    // [start..end] is independent (own BlockState, own LongestMatchCache,
-    // own LZ77Store; in_ is read-only). For typical --ultra workloads the
-    // squeeze loop dominates wall-clock by an order of magnitude over
-    // every other path, so parallelizing across blocks is the actual
-    // headline win the cutover unlocks. We use std::thread::scope to
-    // avoid taking a rayon dep — the result vector is collected in
-    // chunk-order so the downstream sequential merge stays deterministic
-    // and produces byte-identical output to the serial version.
+    // Step 29: parallel block evaluation, gated on `thread_budget` so it
+    // doesn't oversubscribe gzippy's outer pool (see plan.md note). Each
+    // lz77_optimal call on [start..end] is independent (own BlockState,
+    // LongestMatchCache, LZ77Store; in_ is read-only), so the parallel
+    // path is bit-identical to the serial one.
+    //
+    //   thread_budget == 1 → serial in-thread (right thing when an outer
+    //                        pool is already running one deflate_part per
+    //                        CPU, e.g. ZopfliGzEncoder::compress_parallel).
+    //   thread_budget != 1 → spawn one thread per chunk via
+    //                        std::thread::scope (right thing when the
+    //                        caller is single-threaded, e.g.
+    //                        ZopfliGzEncoder::compress_single).
     let mut chunks: Vec<(usize, usize)> = Vec::with_capacity(npoints + 1);
     for i in 0..=npoints {
         let start = if i == 0 {
@@ -529,20 +533,32 @@ pub fn deflate_part(
         chunks.push((start, end));
     }
 
-    let stores: Vec<LZ77Store<'_>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = chunks
+    let stores: Vec<LZ77Store<'_>> = if options.thread_budget == 1 {
+        chunks
             .iter()
             .map(|&(start, end)| {
-                scope.spawn(move || {
-                    let mut s = BlockState::new(options, start, end, true);
-                    let mut store = LZ77Store::new(in_);
-                    lz77_optimal(&mut s, in_, start, end, options.numiterations, &mut store);
-                    store
-                })
+                let mut s = BlockState::new(options, start, end, true);
+                let mut store = LZ77Store::new(in_);
+                lz77_optimal(&mut s, in_, start, end, options.numiterations, &mut store);
+                store
             })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+            .collect()
+    } else {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = chunks
+                .iter()
+                .map(|&(start, end)| {
+                    scope.spawn(move || {
+                        let mut s = BlockState::new(options, start, end, true);
+                        let mut store = LZ77Store::new(in_);
+                        lz77_optimal(&mut s, in_, start, end, options.numiterations, &mut store);
+                        store
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        })
+    };
 
     for (i, store) in stores.iter().enumerate() {
         totalcost += calculate_block_size(store, 0, store.size(), 2);
