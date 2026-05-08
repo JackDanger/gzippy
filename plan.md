@@ -33,7 +33,7 @@
 | 21 | Strip FFI bridge from `zopfli_compress.rs` | ✅ Done — production code is pure Rust |
 | 22 | Strip C zopfli build from `build.rs` | ✅ Done — `cargo clean && cargo build` invokes no C compiler for zopfli |
 | 23 | Replace oracle harness with regression fixtures | ✅ Done — 6 pinned hex blobs + flate2 roundtrip in `zopfli_pure/tests.rs` |
-| 24 | Drop `vendor/zopfli` submodule | ✅ Done — removed from `.gitmodules`, Makefile, CI workflows, and bench scripts |
+| 24 | Drop `vendor/zopfli` from the build | ✅ Done — Makefile, CI workflows, and bench scripts no longer build/copy/link the C zopfli; the submodule itself is **kept registered** in `.gitmodules` so the C source remains available for design comparison via `git submodule update --init vendor/zopfli` |
 | 25 | Final integration | ✅ Done locally; `make ship` (homelab L11 wall-clock) is the user's gate |
 | 26 | PR | 🔲 Pending `make ship` |
 | 27 | Batched bit writer | ⏭ Skipped — zero measurable wall-clock impact (squeeze dominates) |
@@ -75,16 +75,18 @@ switch on `options.thread_budget` instead of unconditionally spawning.
 > reorder steps. The order is chosen so each step's oracle test depends only
 > on previously-finished modules.
 
-## Working environment (historical, port complete)
+## Working environment (port complete, reference source kept)
 
-When this plan was first executed, the C zopfli source was vendored at
-`vendor/zopfli/src/zopfli/` and an FFI bridge at
-`src/backends/zopfli_compress.rs` served as the oracle. After Step 24 the
-submodule was removed; the C source is now consulted out-of-tree via
-`https://github.com/google/zopfli`. The CLI's call shape
-(`compress_gzip(data, &tuning)` / `compress_deflate(data, &tuning)`) is
-unchanged — gzippy still calls into `src/backends/zopfli_compress.rs`,
-which now thin-wraps the pure-Rust port instead of FFI.
+The C zopfli source is registered as a submodule at `vendor/zopfli` and
+pinned to `ccf9f05` (the commit it was at when the port was finalized).
+It is **not** built, linked, or shipped — the Makefile, CI workflows,
+and bench scripts were unwired from it in Step 24. It stays registered
+so future readers can run `git submodule update --init vendor/zopfli`
+and walk the C and Rust implementations side-by-side for design
+comparison. The FFI bridge in `src/backends/zopfli_compress.rs` is
+gone; that file now thin-wraps the pure-Rust port. The CLI's call
+shape (`compress_gzip(data, &tuning)` / `compress_deflate(data, &tuning)`)
+is unchanged.
 
 ## Final architecture (current state)
 
