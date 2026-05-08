@@ -2,7 +2,7 @@
 
 ## Progress
 
-**Last completed: Step 13 (blocksplitter.rs)** — see commits below.
+**Last completed: Step 15 (deflate.rs Part B — full encoder + end-to-end FFI oracle)** — see commits below.
 
 | Step | Module | Status |
 |------|--------|--------|
@@ -20,8 +20,9 @@
 | 11 | `squeeze.rs` Part B (`get_best_lengths`, `trace_backwards`, `follow_path`) | ✅ Done |
 | 12 | `squeeze.rs` Part C (`lz77_optimal{,_fixed}`, FFI oracle) | ✅ Done — byte-for-byte equality on full corpus incl. alice (151 KB), iters ∈ {1,2,5,15} + fixed-tree |
 | 13 | `blocksplitter.rs` | ✅ Done — split points match FFI on full corpus, maxblocks ∈ {0,1,5,15} |
-| 14–15 | `deflate.rs` Parts A–B | 🔲 Next |
-| 16 | `gzip.rs` | 🔲 |
+| 14 | `deflate.rs` Part A (`BitWriter`) | ✅ Done |
+| 15 | `deflate.rs` Part B (tree emission, block emission, deflate driver) | ✅ Done — byte-for-byte equality on full corpus incl. alice (151 KB), btype ∈ {0,1,2}, split on/off, iters ∈ {1,5} |
+| 16 | `gzip.rs` | 🔲 Next |
 | 17 | `mod.rs` public surface | 🔲 |
 | 18 | Bridge/feature flag | 🔲 |
 | 19–25 | Integration, cutover, cleanup | 🔲 |

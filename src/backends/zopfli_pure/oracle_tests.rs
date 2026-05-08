@@ -262,6 +262,16 @@ extern "C" {
         splitpoints: *mut *mut usize,
         npoints: *mut usize,
     );
+    fn ZopfliDeflate(
+        opts: *const FfiZopfliOptions,
+        btype: c_int,
+        final_: c_int,
+        in_: *const c_uchar,
+        insize: usize,
+        bp: *mut c_uchar,
+        out: *mut *mut c_uchar,
+        outsize: *mut usize,
+    );
     fn free(ptr: *mut std::ffi::c_void);
 }
 
@@ -719,6 +729,93 @@ fn block_split_matches_ffi() {
             let rs = block_split(&opts, &data, 0, data.len(), maxblocks);
             assert_eq!(rs, ffi, "{}: maxblocks={}", name, maxblocks);
         }
+    }
+}
+
+// ── Step 15: deflate end-to-end oracle ───────────────────────────────────────
+
+fn ffi_deflate(opts: &RsOpts, btype: i32, final_: bool, data: &[u8]) -> (Vec<u8>, u8) {
+    unsafe {
+        let ffi_opts = rs_to_ffi_opts(opts);
+        let mut bp: c_uchar = 0;
+        let mut out: *mut c_uchar = std::ptr::null_mut();
+        let mut outsize: usize = 0;
+        ZopfliDeflate(
+            &ffi_opts,
+            btype,
+            if final_ { 1 } else { 0 },
+            data.as_ptr(),
+            data.len(),
+            &mut bp,
+            &mut out,
+            &mut outsize,
+        );
+        let bytes = if out.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(out, outsize).to_vec()
+        };
+        if !out.is_null() {
+            free(out as *mut std::ffi::c_void);
+        }
+        (bytes, bp)
+    }
+}
+
+fn rs_deflate(opts: &RsOpts, btype: i32, final_: bool, data: &[u8]) -> (Vec<u8>, u8) {
+    use crate::backends::zopfli_pure::deflate::deflate;
+    let mut out: Vec<u8> = Vec::new();
+    let bp = deflate(opts, btype, final_, data, 0, &mut out);
+    (out, bp)
+}
+
+#[test]
+fn deflate_matches_ffi_byte_for_byte() {
+    // Cap inputs at 16 KB to keep the (corpus × iters × split) matrix
+    // tractable; the thorough tier covers larger inputs.
+    for (name, data) in corpus() {
+        if data.len() > 16_384 {
+            continue;
+        }
+        for &iters in &[1i32, 5] {
+            for &split in &[0i32, 1] {
+                for &btype in &[2i32, 1, 0] {
+                    let opts = RsOpts {
+                        numiterations: iters,
+                        blocksplitting: split,
+                        ..RsOpts::default()
+                    };
+                    let label = format!("{} iters={} split={} btype={}", name, iters, split, btype);
+                    let (ffi_bytes, ffi_bp) = ffi_deflate(&opts, btype, true, &data);
+                    let (rs_bytes, rs_bp) = rs_deflate(&opts, btype, true, &data);
+                    assert_eq!(rs_bp, ffi_bp, "{}: bp differs", label);
+                    assert_eq!(rs_bytes, ffi_bytes, "{}: bytes differ", label);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "thorough; run via `cargo test --release -- --ignored zopfli_pure`"]
+fn deflate_matches_ffi_thorough() {
+    // Full corpus at numiterations=1, btype=2, split on. This is the
+    // closest pre-cutover approximation to real `--ultra` output.
+    for (name, data) in corpus() {
+        if data.is_empty() {
+            continue;
+        }
+        let opts = RsOpts {
+            numiterations: 1,
+            blocksplitting: 1,
+            ..RsOpts::default()
+        };
+        eprintln!("deflate-thorough: {} (len {})", name, data.len());
+        let (ffi_bytes, ffi_bp) = ffi_deflate(&opts, 2, true, &data);
+        let (rs_bytes, rs_bp) = rs_deflate(&opts, 2, true, &data);
+        assert_eq!(rs_bp, ffi_bp, "{}: bp", name);
+        assert_eq!(rs_bytes.len(), ffi_bytes.len(), "{}: byte length", name);
+        assert_eq!(rs_bytes, ffi_bytes, "{}: bytes", name);
     }
 }
 

@@ -55,17 +55,23 @@ const CL_ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 
-/// Counts code-length symbols (and their extra-bit overhead) when RLE
-/// encoding the concatenated `(ll_lengths || d_lengths)` table with the
-/// optional 16/17/18 escape codes enabled per `use_16/17/18`. Returns a
-/// `(clcounts, hclen, hlit, hdist)` summary so the encoder side can reuse
-/// the pass to emit bits without recomputing.
-pub(super) fn rle_clcounts(
+/// Walks the concatenated `(ll_lengths || d_lengths)` table once, optionally
+/// recording the RLE-encoded `(symbol, extra_bits)` stream into the provided
+/// vectors, and returning the `(clcounts, hclen, hlit, hdist)` summary.
+///
+/// Pass `None` for `rle` and `rle_bits` to run in size-only mode (no
+/// allocations beyond the four scalar return values). The size-only path
+/// (Step 9 dynamic-tree cost loop) calls this with `None`; the emit path
+/// (Step 15 `add_dynamic_tree`) calls it with `Some` so the rle stream is
+/// available for `add_huffman_bits`.
+pub(super) fn build_rle(
     ll_lengths: &[u32; ZOPFLI_NUM_LL],
     d_lengths: &[u32; ZOPFLI_NUM_D],
     use_16: bool,
     use_17: bool,
     use_18: bool,
+    mut rle: Option<&mut Vec<u32>>,
+    mut rle_bits: Option<&mut Vec<u32>>,
 ) -> ([usize; 19], usize, usize, usize) {
     let mut clcounts = [0usize; 19];
 
@@ -88,6 +94,18 @@ pub(super) fn rle_clcounts(
         }
     };
 
+    let emit = |sym: u32,
+                bits: u32,
+                rle: &mut Option<&mut Vec<u32>>,
+                rle_bits: &mut Option<&mut Vec<u32>>| {
+        if let Some(v) = rle.as_deref_mut() {
+            v.push(sym);
+        }
+        if let Some(v) = rle_bits.as_deref_mut() {
+            v.push(bits);
+        }
+    };
+
     let mut i = 0usize;
     while i < lld_total {
         let symbol = symbol_at(i) as u8;
@@ -105,6 +123,7 @@ pub(super) fn rle_clcounts(
             if use_18 {
                 while count >= 11 {
                     let count2 = count.min(138);
+                    emit(18, (count2 - 11) as u32, &mut rle, &mut rle_bits);
                     clcounts[18] += 1;
                     count -= count2;
                 }
@@ -112,6 +131,7 @@ pub(super) fn rle_clcounts(
             if use_17 {
                 while count >= 3 {
                     let count2 = count.min(10);
+                    emit(17, (count2 - 3) as u32, &mut rle, &mut rle_bits);
                     clcounts[17] += 1;
                     count -= count2;
                 }
@@ -120,15 +140,20 @@ pub(super) fn rle_clcounts(
 
         if use_16 && count >= 4 {
             count -= 1;
+            emit(symbol as u32, 0, &mut rle, &mut rle_bits);
             clcounts[symbol as usize] += 1;
             while count >= 3 {
                 let count2 = count.min(6);
+                emit(16, (count2 - 3) as u32, &mut rle, &mut rle_bits);
                 clcounts[16] += 1;
                 count -= count2;
             }
         }
 
         clcounts[symbol as usize] += count;
+        for _ in 0..count {
+            emit(symbol as u32, 0, &mut rle, &mut rle_bits);
+        }
 
         i += 1;
     }
@@ -141,6 +166,9 @@ pub(super) fn rle_clcounts(
     (clcounts, hclen, hlit, hdist)
 }
 
+/// CL_ORDER constant is also used by the emit side.
+pub(super) const CL_ORDER_PUB: [usize; 19] = CL_ORDER;
+
 /// Size in bits of the dynamic-tree encoding for one (use_16, use_17, use_18)
 /// triple. Sums the rle-symbol bits, extra bits, and the fixed 14 + (hclen+4)*3
 /// header bits.
@@ -152,7 +180,7 @@ fn encode_tree_size(
     use_18: bool,
 ) -> usize {
     let (clcounts, hclen, _hlit, _hdist) =
-        rle_clcounts(ll_lengths, d_lengths, use_16, use_17, use_18);
+        build_rle(ll_lengths, d_lengths, use_16, use_17, use_18, None, None);
 
     let mut clcl = [0u32; 19];
     calculate_bit_lengths(&clcounts, 7, &mut clcl);
