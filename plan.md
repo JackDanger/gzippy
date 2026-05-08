@@ -2,7 +2,7 @@
 
 ## Progress
 
-**Last completed: Step 15 (deflate.rs Part B — full encoder + end-to-end FFI oracle)** — see commits below.
+**Last completed: Step 16 (gzip.rs — RFC 1952 wrapper + end-to-end FFI oracle)** — see commits below.
 
 | Step | Module | Status |
 |------|--------|--------|
@@ -22,8 +22,8 @@
 | 13 | `blocksplitter.rs` | ✅ Done — split points match FFI on full corpus, maxblocks ∈ {0,1,5,15} |
 | 14 | `deflate.rs` Part A (`BitWriter`) | ✅ Done |
 | 15 | `deflate.rs` Part B (tree emission, block emission, deflate driver) | ✅ Done — byte-for-byte equality on full corpus incl. alice (151 KB), btype ∈ {0,1,2}, split on/off, iters ∈ {1,5} |
-| 16 | `gzip.rs` | 🔲 Next |
-| 17 | `mod.rs` public surface | 🔲 |
+| 16 | `gzip.rs` | ✅ Done — byte-for-byte equality on full corpus incl. alice |
+| 17 | `mod.rs` public surface | 🔲 Next |
 | 18 | Bridge/feature flag | 🔲 |
 | 19–25 | Integration, cutover, cleanup | 🔲 |
 | 26 | PR | 🔲 |

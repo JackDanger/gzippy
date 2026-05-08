@@ -7,6 +7,7 @@ pub mod blocksplitter; // Step 13
 pub mod cache; // Step 5
 pub mod deflate; // Steps 14-15 (built incrementally)
 pub mod deflate_size; // Step 9
+pub mod gzip; // Step 16
 pub mod hash; // Step 4
 pub mod katajainen; // Step 2
 pub mod lz77; // Steps 6-8 (built incrementally)
@@ -39,7 +40,6 @@ impl Default for ZopfliOptions {
         }
     }
 }
-// pub mod gzip;          // unlock at Step 16
 
 #[cfg(test)]
 mod oracle_tests;

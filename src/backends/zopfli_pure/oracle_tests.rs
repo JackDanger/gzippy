@@ -272,6 +272,13 @@ extern "C" {
         out: *mut *mut c_uchar,
         outsize: *mut usize,
     );
+    fn ZopfliGzipCompress(
+        opts: *const FfiZopfliOptions,
+        in_: *const c_uchar,
+        insize: usize,
+        out: *mut *mut c_uchar,
+        outsize: *mut usize,
+    );
     fn free(ptr: *mut std::ffi::c_void);
 }
 
@@ -816,6 +823,69 @@ fn deflate_matches_ffi_thorough() {
         assert_eq!(rs_bp, ffi_bp, "{}: bp", name);
         assert_eq!(rs_bytes.len(), ffi_bytes.len(), "{}: byte length", name);
         assert_eq!(rs_bytes, ffi_bytes, "{}: bytes", name);
+    }
+}
+
+// ── Step 16: gzip end-to-end oracle ──────────────────────────────────────────
+
+fn ffi_gzip(opts: &RsOpts, data: &[u8]) -> Vec<u8> {
+    unsafe {
+        let ffi_opts = rs_to_ffi_opts(opts);
+        let mut out: *mut c_uchar = std::ptr::null_mut();
+        let mut outsize: usize = 0;
+        ZopfliGzipCompress(&ffi_opts, data.as_ptr(), data.len(), &mut out, &mut outsize);
+        let bytes = if out.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(out, outsize).to_vec()
+        };
+        if !out.is_null() {
+            free(out as *mut std::ffi::c_void);
+        }
+        bytes
+    }
+}
+
+#[test]
+fn gzip_matches_ffi_byte_for_byte() {
+    use crate::backends::zopfli_pure::gzip::gzip_compress;
+
+    for (name, data) in corpus() {
+        if data.len() > 16_384 {
+            continue;
+        }
+        for &iters in &[1i32, 5] {
+            let opts = RsOpts {
+                numiterations: iters,
+                ..RsOpts::default()
+            };
+            let ffi = ffi_gzip(&opts, &data);
+            let mut rs = Vec::new();
+            gzip_compress(&opts, &data, &mut rs);
+            assert_eq!(rs, ffi, "{}: iters={}", name, iters);
+        }
+    }
+}
+
+#[test]
+#[ignore = "thorough; run via `cargo test --release -- --ignored zopfli_pure`"]
+fn gzip_matches_ffi_thorough() {
+    use crate::backends::zopfli_pure::gzip::gzip_compress;
+
+    for (name, data) in corpus() {
+        if data.is_empty() {
+            continue;
+        }
+        let opts = RsOpts {
+            numiterations: 1,
+            ..RsOpts::default()
+        };
+        eprintln!("gzip-thorough: {} (len {})", name, data.len());
+        let ffi = ffi_gzip(&opts, &data);
+        let mut rs = Vec::new();
+        gzip_compress(&opts, &data, &mut rs);
+        assert_eq!(rs.len(), ffi.len(), "{}: byte length", name);
+        assert_eq!(rs, ffi, "{}: bytes", name);
     }
 }
 
