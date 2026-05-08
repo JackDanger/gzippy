@@ -2,7 +2,7 @@
 
 ## Progress
 
-**Last completed: Step 23 (cutover — replaced FFI oracle harness with permanent regression fixtures)** — see commits below.
+**Last completed: Step 22 (cutover — stripped vendored C zopfli build from `build.rs`; libdeflate + zlib-ng are the only remaining C deps)** — see commits below.
 
 | Step | Module | Status |
 |------|--------|--------|
