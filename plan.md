@@ -2,7 +2,7 @@
 
 ## Progress
 
-**Last completed: Step 5 (cache.rs)** — see commits below.
+**Last completed: Step 6 (lz77.rs Part A)** — see commits below.
 
 | Step | Module | Status |
 |------|--------|--------|
@@ -12,7 +12,9 @@
 | 3 | `tree.rs` | ✅ Done (2 ULP diff on arm64, noted in oracle test) |
 | 4 | `hash.rs` | ✅ Done (self-consistency test only; oracle in Step 7) |
 | 5 | `cache.rs` | ✅ Done (round-trip property test; end-to-end in Step 7) |
-| 6–8 | `lz77.rs` Parts A–C | 🔲 |
+| 6 | `lz77.rs` Part A (`LZ77Store`, histogram) | ✅ Done (brute-force histogram test) |
+| 7 | `lz77.rs` Part B (`BlockState`, `find_longest_match`) | 🔲 Next |
+| 8 | `lz77.rs` Part C (`lz77_greedy`, FFI oracle) | 🔲 |
 | 9 | `deflate_size.rs` | 🔲 |
 | 10–12 | `squeeze.rs` Parts A–C | 🔲 |
 | 13 | `blocksplitter.rs` | 🔲 |
