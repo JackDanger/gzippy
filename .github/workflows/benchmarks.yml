@@ -93,9 +93,6 @@ jobs:
           make -j$(nproc) rapidgzip || echo "rapidgzip build failed"
           cd ../../../..
 
-          # Build zopfli
-          make -C vendor/zopfli zopfli || echo "zopfli build failed"
-
       - name: Package binaries
         run: |
           mkdir -p binaries
@@ -103,7 +100,6 @@ jobs:
           cp vendor/pigz/pigz vendor/pigz/unpigz binaries/
           cp vendor/isa-l/build/igzip binaries/ 2>/dev/null || echo "igzip not available"
           cp vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip binaries/ 2>/dev/null || echo "rapidgzip not available"
-          cp vendor/zopfli/zopfli binaries/ 2>/dev/null || echo "zopfli not available"
           ls -la binaries/
 
       - uses: actions/upload-artifact@v7

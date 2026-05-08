@@ -33,7 +33,6 @@ from typing import Dict, List, Tuple, Optional
 GZIPPY = "./target/release/gzippy"
 PIGZ = "./vendor/pigz/pigz"
 RAPIDGZIP = "./vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip"
-ZOPFLI = "./vendor/zopfli/zopfli"
 GZIP = "gzip"
 
 # Silesia corpus URL

@@ -2,7 +2,7 @@
 
 ## Progress
 
-**Last completed: Step 22 (cutover — stripped vendored C zopfli build from `build.rs`; libdeflate + zlib-ng are the only remaining C deps)** — see commits below.
+**Last completed: Step 24 (cutover — dropped `vendor/zopfli` submodule and removed it from Makefile, CI workflows, and benchmark scripts)** — see commits below.
 
 | Step | Module | Status |
 |------|--------|--------|

@@ -84,7 +84,6 @@ def find_tool(name: str) -> str:
         "gzip": ["./vendor/gzip/gzip", shutil.which("gzip") or "gzip"],
         "pigz": ["./vendor/pigz/pigz"],
         "igzip": ["./vendor/isa-l/build/igzip"],
-        "zopfli": ["./vendor/zopfli/zopfli"],
         "gzippy": ["./target/release/gzippy"],
     }
     for path in paths.get(name, []):
@@ -262,10 +261,6 @@ def benchmark_compress(tool: str, level: int, threads: int,
         if threads > 1:
             cmd.append(f"-T{threads}")
         cmd.extend(["-c", input_file])
-    elif tool == "zopfli":
-        # zopfli uses iterations, not levels. Use fewer iterations for speed.
-        # Default is 15, we use 5 for benchmarks to keep runtime reasonable.
-        cmd = [bin_path, "--i5", "-c", input_file]
     elif tool == "gzippy" and level >= 10:
         # Ultra compression levels need --level flag
         cmd = [bin_path, f"--level", str(level), f"-p{threads}", "-c", input_file]
@@ -280,9 +275,7 @@ def benchmark_compress(tool: str, level: int, threads: int,
     if tool == "gzippy" and debug:
         env["GZIPPY_DEBUG"] = "1"
     
-    # zopfli is extremely slow - only run once to avoid delaying CI
-    # We don't need statistical significance for zopfli, just a reference point
-    actual_runs = 1 if tool == "zopfli" else runs
+    actual_runs = runs
     
     times = []
     for i in range(actual_runs):
@@ -456,13 +449,12 @@ def main():
         
         # Benchmark tools for comparison
         # - igzip only at L1-L3 (its max level is 3, so higher levels are noise)
-        # - zopfli only at L9 (it's very slow and only makes sense for max compression)
+        # - gzippy itself ports the zopfli algorithm at L11+; no separate
+        #   zopfli competitor binary is needed.
         comp_files = {}
         tools = ["gzip", "pigz", "gzippy"]
         if args.level <= 3:
             tools.insert(2, "igzip")  # Insert after pigz for consistent ordering
-        if args.level >= 9:
-            tools.append("zopfli")
         
         for tool in tools:
             out_file = tmpdir / f"test.{tool}.gz"

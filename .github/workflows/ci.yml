@@ -132,9 +132,6 @@ jobs:
       - name: Build pigz
         run: make -C vendor/pigz
 
-      - name: Build zopfli
-        run: make -C vendor/zopfli zopfli
-
       - name: Run validation matrix
         run: |
           CORES=$(nproc)

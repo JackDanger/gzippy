@@ -4,11 +4,10 @@
 # Quick tests (<30s) run with 'make' or 'make quick' - for AI tools and iteration
 # Full perf tests (10+ min) run with 'make perf-full' - for humans at release time
 
-# Build configuration - submodules are in ./vendor/{gzip,pigz,isa-l,zopfli,rapidgzip,libdeflate}
+# Build configuration - submodules are in ./vendor/{gzip,pigz,isa-l,rapidgzip,libdeflate}
 GZIP_DIR := ./vendor/gzip
 PIGZ_DIR := ./vendor/pigz
 ISAL_DIR := ./vendor/isa-l
-ZOPFLI_DIR := ./vendor/zopfli
 RAPIDGZIP_DIR := ./vendor/rapidgzip
 GZIPPY_DIR := .
 TEST_DATA_DIR := test_data
@@ -19,7 +18,6 @@ GZIPPY_BIN := $(GZIPPY_DIR)/target/release/gzippy
 UNGZIPPY_BIN := $(GZIPPY_DIR)/target/release/ungzippy
 PIGZ_BIN := $(PIGZ_DIR)/pigz
 IGZIP_BIN := $(ISAL_DIR)/build/igzip
-ZOPFLI_BIN := $(ZOPFLI_DIR)/zopfli
 RAPIDGZIP_BIN := $(RAPIDGZIP_DIR)/librapidarchive/build/src/tools/rapidgzip
 
 # Prefer source-built gzip; on macOS fall back to brew gzip then /usr/bin/gzip
@@ -42,10 +40,10 @@ all: quick
 
 build: $(GZIPPY_BIN) $(UNGZIPPY_BIN)
 
-deps: $(PIGZ_BIN) $(IGZIP_BIN) $(ZOPFLI_BIN) $(RAPIDGZIP_BIN)
+deps: $(PIGZ_BIN) $(IGZIP_BIN) $(RAPIDGZIP_BIN)
 	@# Try to build gzip, but don't fail if it doesn't work
 	@$(MAKE) $(GZIP_DIR)/gzip 2>/dev/null || true
-	@echo "✓ Dependencies ready (gzip, pigz, igzip, zopfli, rapidgzip)"
+	@echo "✓ Dependencies ready (gzip, pigz, igzip, rapidgzip)"
 
 $(GZIP_DIR)/gzip:
 	@if [ "$$(uname)" = "Darwin" ]; then \
@@ -73,11 +71,6 @@ $(IGZIP_BIN):
 	@mkdir -p $(ISAL_DIR)/build
 	@cd $(ISAL_DIR)/build && cmake .. >/dev/null 2>&1 && make -j4 igzip 2>&1 | grep -E "(Built|error)" || true
 	@echo "✓ Built igzip"
-
-$(ZOPFLI_BIN):
-	@echo "Building zopfli from source..."
-	@$(MAKE) -C $(ZOPFLI_DIR) zopfli 2>&1 | grep -E "(cc|g\+\+|error)" || true
-	@echo "✓ Built zopfli"
 
 $(RAPIDGZIP_BIN):
 	@echo "Building rapidgzip from source..."
@@ -303,7 +296,6 @@ bench-bin: $(GZIPPY_BIN) $(PIGZ_BIN) $(IGZIP_BIN)
 	@cp -f $(PIGZ_DIR)/unpigz $(BENCH_BIN_DIR)/ 2>/dev/null || true
 	@cp -f $(IGZIP_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
 	@cp -f $(RAPIDGZIP_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
-	@cp -f $(ZOPFLI_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
 	@cp -f $(GZIP_BIN) $(BENCH_BIN_DIR)/gzip 2>/dev/null || true
 ifneq ($(APPLE_GZIP),$(GZIP_BIN))
 ifneq ($(APPLE_GZIP),)

@@ -5,7 +5,7 @@
 # This script builds gzippy and all competitor tools used in CI benchmarks.
 # It's shared across multiple workflows to ensure consistency.
 #
-# Usage: ./scripts/build-tools.sh [--gzippy] [--pigz] [--rapidgzip] [--igzip] [--zopfli] [--libdeflate] [--gzip]
+# Usage: ./scripts/build-tools.sh [--gzippy] [--pigz] [--rapidgzip] [--igzip] [--libdeflate] [--gzip]
 #        ./scripts/build-tools.sh --all
 #
 # Output paths (relative to repo root):
@@ -13,7 +13,6 @@
 #   pigz:      vendor/pigz/pigz, vendor/pigz/unpigz
 #   rapidgzip: vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip
 #   igzip:     vendor/isa-l/build/igzip
-#   zopfli:    vendor/zopfli/zopfli
 #   libdeflate: vendor/libdeflate/build/programs/libdeflate-gzip
 #   gzip:      vendor/gzip/gzip, vendor/gzip/gunzip
 # =============================================================================
@@ -38,12 +37,11 @@ BUILD_GZIPPY=false
 BUILD_PIGZ=false
 BUILD_RAPIDGZIP=false
 BUILD_IGZIP=false
-BUILD_ZOPFLI=false
 BUILD_LIBDEFLATE=false
 BUILD_GZIP=false
 
 if [[ $# -eq 0 ]]; then
-    log_error "Usage: $0 [--gzippy] [--pigz] [--rapidgzip] [--igzip] [--zopfli] [--libdeflate] [--gzip] [--all]"
+    log_error "Usage: $0 [--gzippy] [--pigz] [--rapidgzip] [--igzip] [--libdeflate] [--gzip] [--all]"
     exit 1
 fi
 
@@ -53,7 +51,6 @@ for arg in "$@"; do
         --pigz) BUILD_PIGZ=true ;;
         --rapidgzip) BUILD_RAPIDGZIP=true ;;
         --igzip) BUILD_IGZIP=true ;;
-        --zopfli) BUILD_ZOPFLI=true ;;
         --libdeflate) BUILD_LIBDEFLATE=true ;;
         --gzip) BUILD_GZIP=true ;;
         --all)
@@ -61,7 +58,6 @@ for arg in "$@"; do
             BUILD_PIGZ=true
             BUILD_RAPIDGZIP=true
             BUILD_IGZIP=true
-            BUILD_ZOPFLI=true
             BUILD_LIBDEFLATE=true
             BUILD_GZIP=true
             ;;
@@ -168,21 +164,6 @@ if $BUILD_IGZIP; then
         log_info "✓ igzip built: $IGZIP_BIN"
     else
         log_warn "igzip not built - may be unavailable on this platform"
-    fi
-fi
-
-# =============================================================================
-# Build zopfli
-# =============================================================================
-if $BUILD_ZOPFLI; then
-    log_info "Building zopfli..."
-    make -C vendor/zopfli zopfli -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
-
-    if [[ -f vendor/zopfli/zopfli ]]; then
-        log_info "✓ zopfli built: vendor/zopfli/zopfli"
-    else
-        log_error "zopfli build failed"
-        exit 1
     fi
 fi
 

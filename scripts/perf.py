@@ -36,7 +36,6 @@ def find_gzip():
 GZIP = find_gzip()
 PIGZ = "./vendor/pigz/pigz"
 IGZIP = "./vendor/isa-l/build/igzip"
-ZOPFLI = "./vendor/zopfli/zopfli"
 GZIPPY = "./target/release/gzippy"
 
 # Defaults
@@ -112,7 +111,7 @@ def run_timed(cmd: List[str], stdin_file: str = None, stdout_file: str = None) -
 def benchmark_compress(tool: str, level: int, threads: int, 
                        input_file: str, output_file: str, runs: int) -> Tuple[float, float, int]:
     """Benchmark compression. Returns (median_time, stdev, output_size)."""
-    bin_path = {"gzip": GZIP, "pigz": PIGZ, "igzip": IGZIP, "zopfli": ZOPFLI, "gzippy": GZIPPY}[tool]
+    bin_path = {"gzip": GZIP, "pigz": PIGZ, "igzip": IGZIP, "gzippy": GZIPPY}[tool]
     
     # For L10-L12 benchmarks, compare other tools at their max level (9)
     effective_level = level if tool == "gzippy" else min(level, 9)
@@ -125,9 +124,6 @@ def benchmark_compress(tool: str, level: int, threads: int,
         if threads > 1:
             cmd.append(f"-T{threads}")
         cmd.extend(["-c", input_file])
-    elif tool == "zopfli":
-        # zopfli uses iterations, not levels. Use 5 iterations for speed.
-        cmd = [bin_path, "--i5", "-c", input_file]
     elif tool == "gzippy" and level >= 10:
         # Ultra compression levels need --level flag
         cmd = [bin_path, "--level", str(level), f"-p{threads}", "-c", input_file]
@@ -137,8 +133,7 @@ def benchmark_compress(tool: str, level: int, threads: int,
             cmd.append(f"-p{threads}")
         cmd.extend(["-c", input_file])
     
-    # zopfli is extremely slow - only run once to avoid delaying CI
-    actual_runs = 1 if tool == "zopfli" else runs
+    actual_runs = runs
     
     times = []
     for _ in range(actual_runs):
@@ -175,7 +170,7 @@ def benchmark_decompress(tool: str, input_file: str, output_file: str, runs: int
 
 def check_tools() -> bool:
     """Verify all tools exist."""
-    missing = [t for t in [GZIP, PIGZ, IGZIP, ZOPFLI, GZIPPY] if not os.path.isfile(t)]
+    missing = [t for t in [GZIP, PIGZ, IGZIP, GZIPPY] if not os.path.isfile(t)]
     if missing:
         print("Missing tools:")
         for t in missing:
@@ -221,10 +216,9 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                     comp_results = {}
                     comp_files = {}
                     
-                    # zopfli only at L9 (very slow, only for max compression)
+                    # gzippy itself ports the zopfli algorithm at L11+; no
+                    # separate zopfli competitor binary is needed.
                     tools = ["gzip", "pigz", "igzip", "gzippy"]
-                    if level >= 9:
-                        tools.append("zopfli")
                     
                     for tool in tools:
                         out_file = tmpdir / f"test.{tool}.l{level}.t{thread_count}.gz"

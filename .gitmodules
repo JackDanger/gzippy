@@ -8,9 +8,6 @@
 	path = vendor/isa-l
 	url = https://github.com/JackDanger/isa-l.git
 	branch = apple-arm64-fix
-[submodule "zopfli"]
-	path = vendor/zopfli
-	url = https://github.com/google/zopfli.git
 [submodule "rapidgzip"]
 	path = vendor/rapidgzip
 	url = https://github.com/mxmlnkn/rapidgzip.git
