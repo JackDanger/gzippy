@@ -5,6 +5,7 @@
 
 pub mod blocksplitter; // Step 13
 pub mod cache; // Step 5
+pub mod deflate; // Steps 14-15 (built incrementally)
 pub mod deflate_size; // Step 9
 pub mod hash; // Step 4
 pub mod katajainen; // Step 2
@@ -38,7 +39,6 @@ impl Default for ZopfliOptions {
         }
     }
 }
-// pub mod deflate;       // unlock at Steps 14-15
 // pub mod gzip;          // unlock at Step 16
 
 #[cfg(test)]
