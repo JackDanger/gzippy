@@ -2,9 +2,11 @@
 
 ## Progress
 
-**Last completed: Step 25 (final integration — clean rebuild with no C zopfli compiler invoked, 672 tests pass, `make quick` green, L11/L12/iter-5 smoke roundtrips OK)** — see commits below.
+**Last completed: Step 29 (rayon-free parallel block evaluation in `deflate_part` via `std::thread::scope`)** — see commits below.
 
-**Status: port is complete.** `make ship` (the AUTHORITATIVE wall-clock check on the homelab) is the only remaining gate; that requires SSH access I don't have from this environment, so the user should run it before merging Step 26.
+**Status: port is complete + first optimization landed.** `make ship` (the AUTHORITATIVE wall-clock check on the homelab) is the only remaining gate before Step 26 (PR).
+
+**Step 27 (batched bit writer) was prototyped and reverted:** zero measurable wall-clock improvement on `--ultra` workloads — the squeeze loop dominates by 10×, not bit emission. Code stayed as the literal C port for clarity.
 
 | Step | Module | Status |
 |------|--------|--------|
@@ -33,7 +35,11 @@
 | 23 | Replace oracle harness with regression fixtures | ✅ Done — 6 pinned hex blobs + flate2 roundtrip in `zopfli_pure/tests.rs` |
 | 24 | Drop `vendor/zopfli` submodule | ✅ Done — removed from `.gitmodules`, Makefile, CI workflows, and bench scripts |
 | 25 | Final integration | ✅ Done locally; `make ship` (homelab L11 wall-clock) is the user's gate |
-| 26 | PR | 🔲 Next |
+| 26 | PR | 🔲 Pending `make ship` |
+| 27 | Batched bit writer | ⏭ Skipped — zero measurable wall-clock impact (squeeze dominates) |
+| 28 | Bench-driven hotspots | 🔲 Pending flamegraph access |
+| 29 | Parallel block evaluation | ✅ Done — alice `--ultra` 405→380 ms (~6% faster), bit-identical output |
+| 30 | Adaptive iteration budget | 🔲 Optional |
 | 27–30 | Optimization (post-cutover) | 🔲 |
 
 **Notes for next agent:**

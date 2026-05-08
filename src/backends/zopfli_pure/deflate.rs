@@ -22,8 +22,10 @@ use super::ZopfliOptions;
 /// `(out, outsize, bp)` triple where `bp` is the bit pointer in `[0, 7]`;
 /// when `bp == 0` a fresh zero byte is appended before any bits land.
 ///
-/// First-port goal (Step 14): one bit per iteration, byte-identical to C.
-/// Phase-10 optimisation (Step 27) replaces this with a 64-bit accumulator.
+/// Note: a Step-27 prototype that wrote whole byte-fragments per
+/// iteration showed zero measurable wall-clock improvement on the
+/// `--ultra` workloads (the squeeze loop dominates, not bit emission),
+/// so we kept the literal one-bit-per-iteration C port.
 pub struct BitWriter<'a> {
     pub out: &'a mut Vec<u8>,
     pub bp: u8,
@@ -502,6 +504,17 @@ pub fn deflate_part(
     }
 
     let npoints = splitpoints_uncompressed.len();
+
+    // Step 29: parallel block evaluation. Each lz77_optimal call on
+    // [start..end] is independent (own BlockState, own LongestMatchCache,
+    // own LZ77Store; in_ is read-only). For typical --ultra workloads the
+    // squeeze loop dominates wall-clock by an order of magnitude over
+    // every other path, so parallelizing across blocks is the actual
+    // headline win the cutover unlocks. We use std::thread::scope to
+    // avoid taking a rayon dep — the result vector is collected in
+    // chunk-order so the downstream sequential merge stays deterministic
+    // and produces byte-identical output to the serial version.
+    let mut chunks: Vec<(usize, usize)> = Vec::with_capacity(npoints + 1);
     for i in 0..=npoints {
         let start = if i == 0 {
             instart
@@ -513,12 +526,27 @@ pub fn deflate_part(
         } else {
             splitpoints_uncompressed[i]
         };
-        let mut s = BlockState::new(options, start, end, true);
-        let mut store = LZ77Store::new(in_);
-        lz77_optimal(&mut s, in_, start, end, options.numiterations, &mut store);
-        totalcost += calculate_block_size(&store, 0, store.size(), 2);
+        chunks.push((start, end));
+    }
 
-        lz77.append_from(&store);
+    let stores: Vec<LZ77Store<'_>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .iter()
+            .map(|&(start, end)| {
+                scope.spawn(move || {
+                    let mut s = BlockState::new(options, start, end, true);
+                    let mut store = LZ77Store::new(in_);
+                    lz77_optimal(&mut s, in_, start, end, options.numiterations, &mut store);
+                    store
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    for (i, store) in stores.iter().enumerate() {
+        totalcost += calculate_block_size(store, 0, store.size(), 2);
+        lz77.append_from(store);
         if i < npoints {
             splitpoints.push(lz77.size());
         }
