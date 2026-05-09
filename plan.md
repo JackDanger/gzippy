@@ -464,14 +464,14 @@ before iteration 15.
    |-----|--------|
    | `cargo build` invokes no C compiler for production binary | ✅ |
    | `cargo test --release` 100% green | ✅ (673/673) |
-   | `make oracle-vs-c` green on x86_64 | (pending Phase 11.2) |
-   | `make oracle-vs-c` green on arm64 | (pending Phase 11.2 + 11.3) |
+   | `make oracle-vs-c` green on x86_64 | ✅ (Linux + macOS x86_64 in CI matrix; commit 382656d) |
+   | `make oracle-vs-c` green on arm64 | ✅ macOS arm64 local + Linux arm64 in CI; closes Phase 11.3 absent a CI surprise |
    | T=1 ratio bit-identical to C zopfli on full corpus | ✅ |
-   | T>1 ratio bit-identical to C zopfli on full corpus | (after Phase 11.1.A) |
+   | T>1 ratio bit-identical to C zopfli on full corpus | ✅ (Phase 11.1.A — `-pN > 1` now byte-equal to `-p1`, commit ef3b96f) |
    | T=1 wall-clock ≤ 1.1× C | ✅ (0.94× on 1 MB; 0.74× on alice) |
    | T>1 wall-clock ≤ 1.1× C | ⚠ regresses post-11.1.A (1× C); recovered by Phase 15 |
    | All tuning flags work (`-F`, `-I`, `-J`) | ✅ |
-   | `vendor/zopfli` not built for production | ✅ (built only for oracle) |
+   | `vendor/zopfli` not built for production | ✅ (built only under `--features oracle`) |
 
 ---
 
