@@ -8,6 +8,11 @@
 use crate::backends::zopfli_pure::{compress, ZopfliFormat, ZopfliOptions};
 use crate::cli::GzippyArgs;
 
+// Note: there's no `compress_gzip` wrapper here — `ZopfliGzEncoder` writes
+// its own gzip header/trailer and calls `compress_deflate` for the payload.
+// The `ZopfliFormat::Gzip` arm of the dispatcher is exercised by zopfli_pure's
+// regression fixtures and by the Phase 11.2 corpus oracle, both #[cfg(test)].
+
 /// Tuning parameters for zopfli compression
 #[derive(Clone, Debug)]
 pub struct ZopfliTuning {
@@ -47,11 +52,6 @@ impl ZopfliTuning {
     }
 }
 
-/// Compress data with zopfli in GZIP format.
-pub fn compress_gzip(data: &[u8], tuning: &ZopfliTuning) -> Vec<u8> {
-    compress(&tuning_to_options(tuning), ZopfliFormat::Gzip, data)
-}
-
 /// Compress data with zopfli in raw DEFLATE format (no gzip header/trailer).
 pub fn compress_deflate(data: &[u8], tuning: &ZopfliTuning) -> Vec<u8> {
     compress(&tuning_to_options(tuning), ZopfliFormat::Deflate, data)
@@ -71,18 +71,6 @@ fn tuning_to_options(tuning: &ZopfliTuning) -> ZopfliOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_compress_gzip_basic() {
-        let input = b"hello world";
-        let tuning = ZopfliTuning::default();
-        let output = compress_gzip(input, &tuning);
-
-        // Verify output is valid gzip (starts with magic bytes)
-        assert!(output.len() >= 18);
-        assert_eq!(output[0], 0x1f);
-        assert_eq!(output[1], 0x8b);
-    }
 
     #[test]
     fn test_compress_deflate_basic() {

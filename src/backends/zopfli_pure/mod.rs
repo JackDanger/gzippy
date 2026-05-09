@@ -45,11 +45,14 @@ impl Default for ZopfliOptions {
 }
 
 /// Output container format. Mirrors C `ZopfliFormat` from `zopfli.h`.
-/// `Zlib` isn't reached from gzippy proper — it stays in the dispatcher
-/// (and is exercised by `tests::fixture_alphabet_zlib_iter15`) so the
-/// crate still presents the full zopfli surface to other consumers.
+/// `Gzip` and `Zlib` aren't reached from gzippy proper — `ZopfliGzEncoder`
+/// writes its own gzip header and calls into the `Deflate` arm — but
+/// they stay in the dispatcher because (a) they're the public surface of
+/// `zopfli_pure` for any other consumer, and (b) the regression fixtures
+/// in `tests` and the Phase 11.2 corpus oracle use them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZopfliFormat {
+    #[allow(dead_code)]
     Gzip,
     #[allow(dead_code)]
     Zlib,

@@ -43,11 +43,11 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
             );
         }
         let tuning = crate::backends::zopfli_compress::ZopfliTuning::from_args(args);
-        let mut encoder = crate::compress::zopfli::ZopfliGzEncoder::new(
-            opt_config.thread_count,
-            args.block_size,
-            tuning,
-        );
+        // thread_count + block_size are intentionally not passed: the
+        // zopfli path is single-member by ratio mandate (plan.md
+        // Phase 11.1.A). Intra-block parallelism inside `deflate_part`
+        // still uses the machine.
+        let mut encoder = crate::compress::zopfli::ZopfliGzEncoder::new(tuning);
         encoder.set_header_info(header_info.clone());
         return encoder.compress(reader, writer).map_err(|e| e.into());
     }
