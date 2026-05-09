@@ -212,8 +212,19 @@ pub fn cost_stat(litlen: u32, dist: u32, stats: &SymbolStats) -> f64 {
 /// Trait the DP loop dispatches over. Per the plan's FAQ, generic
 /// monomorphization gives the same machine code as C's indirect call —
 /// usually better. `FixedCost` and `StatCost<'a>` are the only impls.
+///
+/// `literal_cost` is a Phase 12.2 specialization: the literal-candidate
+/// site in the DP loop hits this on every byte and only ever passes
+/// `dist=0`, so a dedicated method lets the optimizer skip the
+/// `if dist == 0` branch entirely. Default impl forwards to `cost`
+/// for any future model that doesn't bother specializing.
 pub trait CostModel {
     fn cost(&self, litlen: u32, dist: u32) -> f64;
+
+    #[inline]
+    fn literal_cost(&self, byte: u8) -> f64 {
+        self.cost(byte as u32, 0)
+    }
 }
 
 pub struct FixedCost;
@@ -222,6 +233,15 @@ impl CostModel for FixedCost {
     fn cost(&self, litlen: u32, dist: u32) -> f64 {
         cost_fixed(litlen, dist)
     }
+
+    #[inline]
+    fn literal_cost(&self, byte: u8) -> f64 {
+        if byte <= 143 {
+            8.0
+        } else {
+            9.0
+        }
+    }
 }
 
 pub struct StatCost<'a>(pub &'a SymbolStats);
@@ -229,6 +249,11 @@ impl CostModel for StatCost<'_> {
     #[inline]
     fn cost(&self, litlen: u32, dist: u32) -> f64 {
         cost_stat(litlen, dist, self.0)
+    }
+
+    #[inline]
+    fn literal_cost(&self, byte: u8) -> f64 {
+        self.0.ll_symbols[byte as usize]
     }
 }
 
@@ -348,7 +373,7 @@ pub(crate) fn get_best_lengths<C: CostModel>(
 
         // Literal candidate.
         if i < inend {
-            let new_cost: f64 = model.cost(in_[i] as u32, 0) + costs[j] as f64;
+            let new_cost: f64 = model.literal_cost(in_[i]) + costs[j] as f64;
             debug_assert!(new_cost >= 0.0);
             if new_cost < costs[j + 1] as f64 {
                 costs[j + 1] = new_cost as f32;
