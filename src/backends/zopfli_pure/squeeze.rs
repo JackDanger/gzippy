@@ -17,14 +17,27 @@ use super::tree::calculate_entropy;
 
 // ── SymbolStats ──────────────────────────────────────────────────────────────
 
+/// Length of `len_cost`: one entry per match length 3..=258.
+const LEN_COST_LEN: usize = ZOPFLI_MAX_MATCH - ZOPFLI_MIN_MATCH + 1;
+
 /// Per-symbol frequencies + entropy bit-lengths used as the squeeze cost model.
-/// Mirrors C `SymbolStats` field-for-field.
+/// Mirrors C `SymbolStats` field-for-field, plus a precomputed `len_cost`
+/// table hoisted out of the squeeze DP inner loop (plan.md Phase 12.1).
 #[derive(Clone)]
 pub struct SymbolStats {
     pub litlens: [usize; ZOPFLI_NUM_LL],
     pub dists: [usize; ZOPFLI_NUM_D],
     pub ll_symbols: [f64; ZOPFLI_NUM_LL],
     pub d_symbols: [f64; ZOPFLI_NUM_D],
+    /// `len_cost[k - ZOPFLI_MIN_MATCH] = length_extra_bits(k) +
+    /// ll_symbols[length_symbol(k)]` for `k` in 3..=258. **Lockstep
+    /// invariant:** any code that mutates `ll_symbols` must also call
+    /// `rebuild_len_cost`. The audit (plan.md §12.1) is binding: the
+    /// only writers are `calculate_statistics` and `copy_from`, and
+    /// both are updated below. `add_weighted` writes only `litlens` /
+    /// `dists` and is always followed by `calculate_statistics` at
+    /// the call site (squeeze.rs:533).
+    pub len_cost: [f64; LEN_COST_LEN],
 }
 
 impl Default for SymbolStats {
@@ -40,6 +53,7 @@ impl SymbolStats {
             dists: [0; ZOPFLI_NUM_D],
             ll_symbols: [0.0; ZOPFLI_NUM_LL],
             d_symbols: [0.0; ZOPFLI_NUM_D],
+            len_cost: [0.0; LEN_COST_LEN],
         }
     }
 
@@ -48,6 +62,8 @@ impl SymbolStats {
         self.dists = src.dists;
         self.ll_symbols = src.ll_symbols;
         self.d_symbols = src.d_symbols;
+        // Lockstep with ll_symbols.
+        self.len_cost = src.len_cost;
     }
 
     pub fn clear_freqs(&mut self) {
@@ -69,10 +85,22 @@ impl SymbolStats {
         self.litlens[256] = 1;
     }
 
-    /// Recomputes entropy bit-lengths from the current frequencies.
+    /// Recomputes entropy bit-lengths from the current frequencies and
+    /// rebuilds `len_cost` from the fresh `ll_symbols`.
     pub fn calculate_statistics(&mut self) {
         calculate_entropy(&self.litlens, &mut self.ll_symbols);
         calculate_entropy(&self.dists, &mut self.d_symbols);
+        self.rebuild_len_cost();
+    }
+
+    /// Refreshes `len_cost` from the current `ll_symbols`. Lockstep
+    /// helper for the invariant on the field.
+    fn rebuild_len_cost(&mut self) {
+        for k in ZOPFLI_MIN_MATCH..=ZOPFLI_MAX_MATCH {
+            let lsym = length_symbol(k as i32) as usize;
+            let lbits = length_extra_bits(k as i32) as f64;
+            self.len_cost[k - ZOPFLI_MIN_MATCH] = lbits + self.ll_symbols[lsym];
+        }
     }
 
     /// Histograms a freshly-built `LZ77Store` into a new `SymbolStats`,
@@ -167,15 +195,17 @@ pub fn cost_fixed(litlen: u32, dist: u32) -> f64 {
 }
 
 /// Cost of one (litlen, dist) pair under the dynamic statistical model.
+/// Match path uses `stats.len_cost` (precomputed `lbits + ll_symbols[lsym]`,
+/// plan.md Phase 12.1) so the inner DP loop drops two table lookups per
+/// iteration. Sum order changes vs C — the corpus oracle (Phase 11.2) is
+/// the contract that this reordering doesn't shift any decision by 1 ULP.
 pub fn cost_stat(litlen: u32, dist: u32, stats: &SymbolStats) -> f64 {
     if dist == 0 {
         stats.ll_symbols[litlen as usize]
     } else {
-        let lsym = length_symbol(litlen as i32) as usize;
-        let lbits = length_extra_bits(litlen as i32) as f64;
         let dsym = dist_symbol(dist as i32) as usize;
         let dbits = dist_extra_bits(dist as i32) as f64;
-        lbits + dbits + stats.ll_symbols[lsym] + stats.d_symbols[dsym]
+        dbits + stats.d_symbols[dsym] + stats.len_cost[(litlen - ZOPFLI_MIN_MATCH as u32) as usize]
     }
 }
 
