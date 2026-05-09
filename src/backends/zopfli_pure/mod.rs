@@ -17,6 +17,9 @@ pub mod zlib;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, feature = "oracle"))]
+mod oracle_tests;
+
 /// Compression knobs. The first five fields mirror Google Zopfli's
 /// `ZopfliOptions`; `thread_budget` is a Rust-only knob that bounds
 /// intra-block parallelism so callers with their own outer pool don't

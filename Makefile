@@ -27,7 +27,7 @@ SYSTEM_GZIP := $(shell which gzip)
 # Set APPLE_GZIP when it differs from GZIP_BIN so bench targets compare both
 APPLE_GZIP := $(if $(filter Darwin,$(shell uname)),/usr/bin/gzip,)
 
-.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship route-check
+.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship route-check oracle-vs-c
 
 # =============================================================================
 # Default target: quick benchmark for fast iteration (< 30 seconds)
@@ -190,6 +190,18 @@ ship: $(GZIPPY_BIN)
 	@echo ""
 	@echo ""
 	@echo "Done. Run 'ssh -J neurotic root@10.30.0.199 \"cd gzippy && ./target/release/gzippy-dev bench\"' to re-run benchmarks."
+
+# =============================================================================
+# Phase 11.2 corpus oracle: compares zopfli_pure's gzip output to the
+# vendored C zopfli library byte-for-byte across a fixed corpus and a
+# matrix of (numiterations, blocksplitting, maxblocks). The C library is
+# only built under the `oracle` feature; production binaries are
+# untouched. Run before merging any zopfli_pure change.
+# =============================================================================
+oracle-vs-c:
+	@git submodule update --init vendor/zopfli
+	@echo "── corpus oracle: zopfli_pure vs vendor/zopfli ──"
+	cargo test --release --features oracle corpus_gzip_output_matches_c_zopfli -- --include-ignored --nocapture
 
 # =============================================================================
 # AWS credentials for cloud fleet benchmarks (optional — cloud.rs auto-uses
@@ -543,6 +555,7 @@ help:
 		'The one command:' \
 		'  make ship         Tests + clippy + neurotic homelab benchmarks + scorecard' \
 		'                    (runs on ssh -J neurotic root@10.30.0.199)' \
+		'  make oracle-vs-c  Phase 11.2 corpus oracle: zopfli_pure vs vendor/zopfli' \
 		'' \
 		'Quick commands (for AI tools and iteration):' \
 		'  make              Build and run quick benchmark (< 30 seconds)' \
