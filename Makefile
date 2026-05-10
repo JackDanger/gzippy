@@ -27,7 +27,7 @@ SYSTEM_GZIP := $(shell which gzip)
 # Set APPLE_GZIP when it differs from GZIP_BIN so bench targets compare both
 APPLE_GZIP := $(if $(filter Darwin,$(shell uname)),/usr/bin/gzip,)
 
-.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship route-check oracle-vs-c
+.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship ship-local route-check oracle-vs-c
 
 # =============================================================================
 # Default target: quick benchmark for fast iteration (< 30 seconds)
@@ -147,49 +147,114 @@ route-check: $(GZIPPY_BIN) $(PIGZ_BIN)
 	@python3 scripts/route_check.py $(GZIPPY_BIN) $(PIGZ_BIN)
 
 # =============================================================================
-# Ship: tests + clippy + homelab benchmarks (the "are we good?" command)
+# Ship: the "are we good?" gate. Always tests the *current branch*.
 #
-# Runs the full correctness test suite, then runs benchmarks on neurotic homelab.
-# Fails fast if tests or clippy don't pass.
+# Runs the cheap local checks first, then expensive homelab bench last so
+# a fmt/test/clippy/oracle failure aborts in <60s instead of >20min.
+#
+# Step 1: refuse if working tree dirty / detached HEAD
+# Step 2: cargo fmt --check + test --release + clippy (default + oracle features)
+# Step 3: corpus oracle vs vendor C zopfli (66 byte-equality checks; L11 ratio gate)
+# Step 4: L11 head-to-head wall-clock + deflate equality vs C zopfli
+# Step 5: cross-tool roundtrip smoke (gzippy ↔ gzip/pigz/igzip when available)
+# Step 6: push current branch + homelab fetches THIS branch + bench
 #
 # Target: ssh -J neurotic root@10.30.0.199 (homelab intel i9-14000)
-# Time: ~20-30 minutes (tests: ~30s, benchmarks: ~20-25 min)
+# Time: ~25 minutes total (~30s through step 5; ~20-25 min on step 6)
+# Use `make ship-local` to run steps 1-5 only and skip the homelab.
 # =============================================================================
-ship: $(GZIPPY_BIN)
-	@echo "══════════════════════════════════════════════════════"
-	@echo "  SHIP: tests → clippy → neurotic homelab benchmarks"
-	@echo "══════════════════════════════════════════════════════"
-	@echo ""
-	@echo "── Step 1/4: cargo test ──"
-	@cargo test --release || (echo "TESTS FAILED — aborting ship" && exit 1)
-	@echo ""
-	@echo "── Step 2/4: cargo clippy ──"
-	@cargo clippy --all-targets -- -D warnings || (echo "CLIPPY FAILED — aborting ship" && exit 1)
-	@echo ""
-	@echo "── Step 3/4: rebuild gzippy-dev on homelab ──"
-	@ssh -J neurotic root@10.30.0.199 'set -e; cd gzippy; \
-	  git fetch origin main; git checkout main; git reset --hard origin/main; \
+ship: ship-precheck ship-local
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	echo ""; \
+	echo "── Step 6/6: push '$$BRANCH' + neurotic homelab benchmarks ──"; \
+	if ! git rev-parse origin/$$BRANCH >/dev/null 2>&1 \
+	    || [ -n "$$(git log origin/$$BRANCH..HEAD 2>/dev/null)" ]; then \
+	  echo "  pushing $$BRANCH to origin..."; \
+	  git push origin $$BRANCH || (echo "PUSH FAILED — aborting ship" && exit 1); \
+	else \
+	  echo "  origin/$$BRANCH already up to date"; \
+	fi; \
+	echo "  connecting to neurotic..."; \
+	ssh -J neurotic root@10.30.0.199 "set -e; cd gzippy; \
+	  echo '  fetching origin/$$BRANCH...'; \
+	  git fetch origin '$$BRANCH'; \
+	  git checkout -B '$$BRANCH' 'origin/$$BRANCH'; \
+	  git reset --hard 'origin/$$BRANCH'; \
+	  git submodule update --init --recursive 2>&1 | tail -3; \
+	  echo '  building gzippy + gzippy-dev from $$BRANCH...'; \
+	  cargo build --release 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
 	  cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target \
-	    2>&1 | grep -E "Compiling|Finished|error" || true; \
+	    2>&1 | grep -E 'Compiling gzippy-dev|Finished|error' || true; \
 	  BD=benchmark_data; BIN=target/release/gzippy; \
 	  for DS in silesia software logs; do \
-	    case $$DS in \
-	      silesia)  RAW=$$BD/silesia.tar;; \
-	      software) RAW=$$BD/software.archive;; \
-	      logs)     RAW=$$BD/logs.txt;; \
+	    case \$$DS in \
+	      silesia)  RAW=\$$BD/silesia.tar;; \
+	      software) RAW=\$$BD/software.archive;; \
+	      logs)     RAW=\$$BD/logs.txt;; \
 	    esac; \
-	    [ -f "$$BD/$$DS-gzip.gz" ] || { echo "Creating $$BD/$$DS-gzip.gz..."; gzip -1 -c "$$RAW" > "$$BD/$$DS-gzip.gz"; }; \
-	    [ -f "$$BD/$$DS-bgzf.gz" ] || { echo "Creating $$BD/$$DS-bgzf.gz..."; $$BIN -1 -c "$$RAW" > "$$BD/$$DS-bgzf.gz"; }; \
-	    [ -f "$$BD/$$DS-pigz.gz" ] || { echo "Creating $$BD/$$DS-pigz.gz..."; vendor/pigz/pigz -1 -c "$$RAW" > "$$BD/$$DS-pigz.gz"; }; \
+	    [ -f \"\$$BD/\$$DS-gzip.gz\" ] || { echo \"creating \$$BD/\$$DS-gzip.gz\"; gzip -1 -c \"\$$RAW\" > \"\$$BD/\$$DS-gzip.gz\"; }; \
+	    [ -f \"\$$BD/\$$DS-bgzf.gz\" ] || { echo \"creating \$$BD/\$$DS-bgzf.gz\"; \$$BIN -1 -c \"\$$RAW\" > \"\$$BD/\$$DS-bgzf.gz\"; }; \
+	    [ -f \"\$$BD/\$$DS-pigz.gz\" ] || { echo \"creating \$$BD/\$$DS-pigz.gz\"; vendor/pigz/pigz -1 -c \"\$$RAW\" > \"\$$BD/\$$DS-pigz.gz\"; }; \
 	  done; \
-	  echo "Archives: $$(ls $$BD/*-{gzip,bgzf,pigz}.gz 2>/dev/null | wc -l) files ready"'
+	  echo '  archives:' \$$(ls \$$BD/*-{gzip,bgzf,pigz}.gz 2>/dev/null | wc -l) 'files ready'; \
+	  echo ''; \
+	  echo '── running gzippy-dev bench ──'; \
+	  TMPDIR=/dev/shm ./target/release/gzippy-dev bench"
 	@echo ""
-	@echo "── Step 4/4: neurotic homelab benchmarks ──"
-	@echo "Connecting to neurotic (root@10.30.0.199)..."
-	ssh -J neurotic root@10.30.0.199 'cd gzippy && TMPDIR=/dev/shm ./target/release/gzippy-dev bench'
+	@echo "✓ ship complete on branch $$(git rev-parse --abbrev-ref HEAD)"
+
+# `ship-precheck`: dirty-tree refusal. Pulled out of `ship-local` so a
+# dirty tree fails in <1s instead of after 30s of local checks. Only
+# runs as a prereq of `ship` (which pushes); `ship-local` is permitted
+# to run on a dirty tree because nothing leaves the box.
+.PHONY: ship-precheck
+ship-precheck:
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	if [ "$$BRANCH" = "HEAD" ]; then echo "ERROR: detached HEAD; checkout a branch first" >&2; exit 1; fi; \
+	if [ -n "$$(git status --porcelain | grep -v '^?? vendor/zopfli')" ]; then \
+	  echo "ERROR: uncommitted changes — homelab needs to fetch a committed branch" >&2; \
+	  echo "       run 'git status' and commit (or stash) before 'make ship'" >&2; \
+	  echo "       (use 'make ship-local' to run local checks against a dirty tree)" >&2; \
+	  exit 1; \
+	fi
+	@echo "  ✓ branch=$$(git rev-parse --abbrev-ref HEAD), tree clean"
+
+# `ship-local`: steps 1-5 only. Use to validate locally without the
+# 20-minute homelab round-trip. Same checks as `ship`'s prefix; if this
+# is green, `ship` only adds the homelab decompression scoreboard.
+.PHONY: ship-local
+ship-local: $(GZIPPY_BIN)
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	if [ "$$BRANCH" = "HEAD" ]; then echo "ERROR: detached HEAD; checkout a branch first" >&2; exit 1; fi; \
+	echo "══════════════════════════════════════════════════════"; \
+	echo "  SHIP (local): branch=$$BRANCH"; \
+	echo "══════════════════════════════════════════════════════"
 	@echo ""
+	@echo "── Step 1/6: branch sanity ──"
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); echo "  branch: $$BRANCH"
+	@echo "  (working tree may be dirty; the dirty-tree check is in 'ship', not 'ship-local')"
 	@echo ""
-	@echo "Done. Run 'ssh -J neurotic root@10.30.0.199 \"cd gzippy && ./target/release/gzippy-dev bench\"' to re-run benchmarks."
+	@echo "── Step 2/6: cargo fmt + test + clippy (default + oracle features) ──"
+	@cargo fmt --check || (echo "FORMAT FAILED — run 'cargo fmt'" >&2 && exit 1)
+	@cargo test --release 2>&1 | tail -2 | (grep -q "0 failed" && echo "  ✓ cargo test --release") \
+	  || (echo "TESTS FAILED — see 'cargo test --release'" >&2 && exit 1)
+	@cargo clippy --release --all-targets -- -D warnings 2>&1 | tail -1 \
+	  | (grep -q "Finished" && echo "  ✓ cargo clippy (default features)") \
+	  || (echo "CLIPPY FAILED — see 'cargo clippy --release --all-targets -- -D warnings'" >&2 && exit 1)
+	@cargo clippy --release --features oracle -- -D warnings 2>&1 | tail -1 \
+	  | (grep -q "Finished" && echo "  ✓ cargo clippy (--features oracle)") \
+	  || (echo "CLIPPY FAILED (oracle features) — see 'cargo clippy --release --features oracle -- -D warnings'" >&2 && exit 1)
+	@echo ""
+	@echo "── Step 3/6: corpus oracle vs vendor C zopfli (L11 ratio gate) ──"
+	@$(MAKE) --no-print-directory oracle-vs-c 2>&1 | tail -3
+	@echo ""
+	@echo "── Step 4/6: L11 head-to-head wall-clock + deflate equality ──"
+	@bash scripts/ship_l11_headtohead.sh
+	@echo ""
+	@echo "── Step 5/6: cross-tool roundtrip smoke ──"
+	@bash scripts/ship_roundtrip_smoke.sh
+	@echo ""
+	@echo "✓ ship-local complete (steps 1-5 of 6 — homelab bench skipped)"
 
 # =============================================================================
 # Phase 11.2 corpus oracle: compares zopfli_pure's gzip output to the
@@ -553,8 +618,11 @@ help:
 		'======================================' \
 		'' \
 		'The one command:' \
-		'  make ship         Tests + clippy + neurotic homelab benchmarks + scorecard' \
-		'                    (runs on ssh -J neurotic root@10.30.0.199)' \
+		'  make ship         Full gate (uses CURRENT branch, not main):' \
+		'                    fmt + test + clippy + oracle + L11 head-to-head +' \
+		'                    cross-tool roundtrip + push branch + homelab bench.' \
+		'                    Fail-fast (~30s through local steps; ~25min total).' \
+		'  make ship-local   Same as `ship` but skips the homelab step (steps 1-5 only).' \
 		'  make oracle-vs-c  Phase 11.2 corpus oracle: zopfli_pure vs vendor/zopfli' \
 		'' \
 		'Quick commands (for AI tools and iteration):' \
