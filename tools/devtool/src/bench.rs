@@ -124,9 +124,8 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
     }
 
     let mut results: Vec<ToolResult> = Vec::new();
-    let tmp_dir = bench_tmp_dir();
-    let _ = std::fs::create_dir_all(&tmp_dir);
-    let output_file = tmp_dir.join("bench-output.bin");
+    let scratch = BenchScratch::new();
+    let output_file = scratch.path().join("bench-output.bin");
 
     // Decompression benchmarks
     if args.direction != BenchDirection::Compress {
@@ -295,7 +294,8 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
         }
     }
 
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // scratch dir is removed when `scratch` drops at end of scope.
+    drop(scratch);
 
     if args.json {
         output_json(&platform, &results);
@@ -343,9 +343,8 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
     );
 
     let mut results: Vec<ToolResult> = Vec::new();
-    let tmp_dir = bench_tmp_dir();
-    let _ = std::fs::create_dir_all(&tmp_dir);
-    let output_file = tmp_dir.join("bench-output.bin");
+    let scratch = BenchScratch::new();
+    let output_file = scratch.path().join("bench-output.bin");
 
     // Decompression benchmarks
     if args.direction != BenchDirection::Compress {
@@ -497,7 +496,7 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
         }
     }
 
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    drop(scratch);
     Ok((platform, results))
 }
 
@@ -975,6 +974,31 @@ fn bench_tmp_dir() -> PathBuf {
         PathBuf::from("/dev/shm").join(name)
     } else {
         std::env::temp_dir().join(name)
+    }
+}
+
+/// RAII wrapper around the bench scratch dir so it's removed even on
+/// early-return / panic. Without this the bench leaks ~200 MB per run
+/// in /dev/shm — concurrent runs eventually fill the tmpfs (and on
+/// /-pressured boxes can cascade into "ERR" rows for downstream
+/// scenarios). Created at every call site that owns a `bench_tmp_dir`.
+struct BenchScratch(PathBuf);
+
+impl BenchScratch {
+    fn new() -> Self {
+        let dir = bench_tmp_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for BenchScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

@@ -181,10 +181,28 @@ ship: ship-precheck ship-local
 	  git checkout -B '$$BRANCH' 'origin/$$BRANCH'; \
 	  git reset --hard 'origin/$$BRANCH'; \
 	  git submodule update --init --recursive 2>&1 | tail -3; \
-	  echo '  building gzippy + gzippy-dev from $$BRANCH...'; \
+	  echo ''; echo '  ── disk-space precheck ──'; \
+	  AVAIL_GB=\$$(df -BG . | tail -1 | awk '{gsub(/G/,\"\",\$$4); print \$$4}'); \
+	  echo \"  root fs: \$${AVAIL_GB} GB available\"; \
+	  if [ \"\$$AVAIL_GB\" -lt 5 ]; then \
+	    if [ -d /mnt/internal ] && [ -w /mnt/internal ]; then \
+	      ALT=/mnt/internal/gzippy-target; mkdir -p \"\$$ALT\"; \
+	      ALT_GB=\$$(df -BG \"\$$ALT\" | tail -1 | awk '{gsub(/G/,\"\",\$$4); print \$$4}'); \
+	      echo \"  root fs squeezed; relocating cargo target to \$$ALT (\$${ALT_GB} GB free) via symlink\"; \
+	      rm -rf target; ln -sfn \"\$$ALT\" target; \
+	    else \
+	      echo \"ERROR: root fs has only \$${AVAIL_GB} GB free; bench needs >=5 GB; aborting\" >&2; \
+	      echo \"       free space (e.g. 'cargo clean' in /root/hvac-pr*/) and re-run\" >&2; \
+	      exit 1; \
+	    fi; \
+	  fi; \
+	  rm -rf /dev/shm/gzippy-bench-* 2>/dev/null || true; \
+	  echo ''; echo '  ── building gzippy + gzippy-dev from $$BRANCH ──'; \
 	  cargo build --release 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
-	  cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target \
-	    2>&1 | grep -E 'Compiling gzippy-dev|Finished|error' || true; \
+	  cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target 2>&1 \
+	    | grep -E 'Compiling gzippy-dev|Finished|error' || true; \
+	  [ -x target/release/gzippy     ] || { echo 'ERROR: target/release/gzippy missing after build' >&2; exit 1; }; \
+	  [ -x target/release/gzippy-dev ] || { echo 'ERROR: target/release/gzippy-dev missing after build' >&2; exit 1; }; \
 	  BD=benchmark_data; BIN=target/release/gzippy; \
 	  for DS in silesia software logs; do \
 	    case \$$DS in \
@@ -196,10 +214,10 @@ ship: ship-precheck ship-local
 	    [ -f \"\$$BD/\$$DS-bgzf.gz\" ] || { echo \"creating \$$BD/\$$DS-bgzf.gz\"; \$$BIN -1 -c \"\$$RAW\" > \"\$$BD/\$$DS-bgzf.gz\"; }; \
 	    [ -f \"\$$BD/\$$DS-pigz.gz\" ] || { echo \"creating \$$BD/\$$DS-pigz.gz\"; vendor/pigz/pigz -1 -c \"\$$RAW\" > \"\$$BD/\$$DS-pigz.gz\"; }; \
 	  done; \
-	  echo '  archives:' \$$(ls \$$BD/*-{gzip,bgzf,pigz}.gz 2>/dev/null | wc -l) 'files ready'; \
-	  echo ''; \
-	  echo '── running gzippy-dev bench ──'; \
-	  TMPDIR=/dev/shm ./target/release/gzippy-dev bench"
+	  echo \"  archives: \$$(ls \$$BD/*-{gzip,bgzf,pigz}.gz 2>/dev/null | wc -l) files ready\"; \
+	  echo ''; echo '  ── running gzippy-dev bench ──'; \
+	  TMPDIR=/dev/shm ./target/release/gzippy-dev bench; \
+	  rm -rf /dev/shm/gzippy-bench-* 2>/dev/null || true"
 	@echo ""
 	@echo "✓ ship complete on branch $$(git rev-parse --abbrev-ref HEAD)"
 
