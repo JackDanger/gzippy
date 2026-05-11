@@ -204,15 +204,17 @@ ship: ship-precheck ship-local
 	  [ -x target/release/gzippy     ] || { echo 'ERROR: target/release/gzippy missing after build' >&2; exit 1; }; \
 	  [ -x target/release/gzippy-dev ] || { echo 'ERROR: target/release/gzippy-dev missing after build' >&2; exit 1; }; \
 	  BD=benchmark_data; BIN=target/release/gzippy; \
+	  [ -f \"\$$BD/silesia.tar\" ] || { [ -f \"\$$BD/silesia.tar.xz\" ] && echo 'extracting silesia.tar' && xz -dk \"\$$BD/silesia.tar.xz\" -c > \"\$$BD/silesia.tar\"; }; \
 	  for DS in silesia software logs; do \
 	    case \$$DS in \
 	      silesia)  RAW=\$$BD/silesia.tar;; \
 	      software) RAW=\$$BD/software.archive;; \
 	      logs)     RAW=\$$BD/logs.txt;; \
 	    esac; \
-	    [ -f \"\$$BD/\$$DS-gzip.gz\" ] || { echo \"creating \$$BD/\$$DS-gzip.gz\"; gzip -1 -c \"\$$RAW\" > \"\$$BD/\$$DS-gzip.gz\"; }; \
-	    [ -f \"\$$BD/\$$DS-bgzf.gz\" ] || { echo \"creating \$$BD/\$$DS-bgzf.gz\"; \$$BIN -1 -c \"\$$RAW\" > \"\$$BD/\$$DS-bgzf.gz\"; }; \
-	    [ -f \"\$$BD/\$$DS-pigz.gz\" ] || { echo \"creating \$$BD/\$$DS-pigz.gz\"; vendor/pigz/pigz -1 -c \"\$$RAW\" > \"\$$BD/\$$DS-pigz.gz\"; }; \
+	    [ -f \"\$$RAW\" ] || { echo \"skipping \$$DS (\$$RAW not found)\"; continue; }; \
+	    [ -s \"\$$BD/\$$DS-gzip.gz\" ] || { echo \"creating \$$BD/\$$DS-gzip.gz\"; gzip -1 -c \"\$$RAW\" > \"\$$BD/\$$DS-gzip.gz\"; }; \
+	    [ -s \"\$$BD/\$$DS-bgzf.gz\" ] || { echo \"creating \$$BD/\$$DS-bgzf.gz\"; \$$BIN -1 -c \"\$$RAW\" > \"\$$BD/\$$DS-bgzf.gz\"; }; \
+	    [ -s \"\$$BD/\$$DS-pigz.gz\" ] || { PIGZ=\$$([ -x vendor/pigz/pigz ] && echo vendor/pigz/pigz || echo pigz); echo \"creating \$$BD/\$$DS-pigz.gz\"; \$$PIGZ -1 -c \"\$$RAW\" > \"\$$BD/\$$DS-pigz.gz\"; }; \
 	  done; \
 	  echo \"  archives: \$$(ls \$$BD/*-{gzip,bgzf,pigz}.gz 2>/dev/null | wc -l) files ready\"; \
 	  echo ''; echo '  ── running gzippy-dev bench ──'; \

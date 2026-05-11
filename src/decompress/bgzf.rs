@@ -3059,14 +3059,25 @@ fn scan_member_boundaries_fast(data: &[u8]) -> Option<Vec<BgzfBlock>> {
         return None;
     }
 
+    let header_size = crate::decompress::format::parse_gzip_header_size(data).unwrap_or(10);
     let mut starts = vec![0usize];
-    let mut pos = 10; // skip past the first gzip header minimum
+    let mut pos = header_size + 1;
 
     while pos + 10 < data.len() {
         if data[pos] == 0x1f
             && data[pos + 1] == 0x8b
             && data[pos + 2] == 0x08
             && data[pos + 3] & 0xE0 == 0
+            // Validate preceding ISIZE field (same heuristic as is_likely_multi_member).
+            // Filters false positives from stored-block streams where raw bytes appear
+            // verbatim and can accidentally match the gzip magic sequence.
+            && pos >= 4
+            && {
+                let isize = u32::from_le_bytes([
+                    data[pos - 4], data[pos - 3], data[pos - 2], data[pos - 1],
+                ]);
+                isize > 0 && isize <= 1_073_741_824
+            }
         {
             starts.push(pos);
         }
