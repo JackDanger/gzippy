@@ -22,10 +22,11 @@ pub struct ZopfliTuning {
     pub block_splitting: bool,
     /// Maximum blocks to split into (default 15; 0 = unlimited)
     pub block_splitting_max: u32,
-    /// Inner-loop thread budget for `deflate_part` (see
-    /// [`ZopfliOptions::thread_budget`]). `0` = unlimited (default; safe
-    /// when the caller is single-threaded), `1` = serial (safe when an
-    /// outer pool is already saturating CPUs).
+    /// Inner-loop thread budget for `deflate_part`, derived from
+    /// `-p`/`--processes` (see [`ZopfliOptions::thread_budget`]).
+    /// `0` = unlimited (default; gzippy spawns one thread per block-split
+    /// chunk inside `deflate_part`). `1` = serial (honors `-p1`; everything
+    /// runs in the main thread).
     pub thread_budget: u32,
 }
 
@@ -41,13 +42,18 @@ impl Default for ZopfliTuning {
 }
 
 impl ZopfliTuning {
-    /// Create from CLI arguments
+    /// Create from CLI arguments. `args.processes` flows into
+    /// `thread_budget`: `-p1` → serial, anything else → unbounded
+    /// intra-block parallelism (the natural cap is the chunk count per
+    /// master block, typically 5-15). This makes `--ultra -p1` actually
+    /// honor the user's "use one CPU" request — see plan.md Phase 11
+    /// and Copilot review comments #1/#2/#4 on PR #83.
     pub fn from_args(args: &GzippyArgs) -> Self {
         Self {
             iterations: args.zopfli_iterations.unwrap_or(15),
             block_splitting: !args.zopfli_no_split,
             block_splitting_max: args.zopfli_split_max.unwrap_or(15),
-            thread_budget: 0,
+            thread_budget: if args.processes <= 1 { 1 } else { 0 },
         }
     }
 }

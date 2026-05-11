@@ -294,9 +294,7 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
         }
     }
 
-    // scratch dir is removed when `scratch` drops at end of scope.
-    drop(scratch);
-
+    // `scratch` removes its dir on Drop; end-of-function takes care of it.
     if args.json {
         output_json(&platform, &results);
     } else {
@@ -496,7 +494,7 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
         }
     }
 
-    drop(scratch);
+    // `scratch` removes its dir on Drop at function return.
     Ok((platform, results))
 }
 

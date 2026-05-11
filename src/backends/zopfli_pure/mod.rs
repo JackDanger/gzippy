@@ -20,10 +20,15 @@ mod tests;
 #[cfg(all(test, feature = "oracle"))]
 mod oracle_tests;
 
-/// Compression knobs. The first five fields mirror Google Zopfli's
-/// `ZopfliOptions`; `thread_budget` is a Rust-only knob that bounds
-/// intra-block parallelism so callers with their own outer pool don't
-/// oversubscribe (`1` = serial, anything else = one thread per chunk).
+/// Compression knobs. The first five fields mirror the *active* knobs in
+/// Google Zopfli's `ZopfliOptions`. The C struct also has a sixth field
+/// `blocksplittinglast` that the C upstream documents as "No longer used,
+/// left for compatibility"; we omit it deliberately — production code
+/// never reads it and the corpus-oracle FFI shim in `oracle_tests.rs`
+/// declares its own `#[repr(C)]` mirror that matches the full C layout.
+/// `thread_budget` is a Rust-only knob that bounds intra-block
+/// parallelism so callers with their own outer pool don't oversubscribe
+/// (`1` = serial, anything else = one thread per chunk).
 #[derive(Clone, Debug)]
 pub struct ZopfliOptions {
     pub verbose: i32,

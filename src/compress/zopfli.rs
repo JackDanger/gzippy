@@ -20,9 +20,10 @@ use std::path::Path;
 use crate::backends::zopfli_compress::{compress_deflate, ZopfliTuning};
 use crate::compress::parallel::GzipHeaderInfo;
 
-/// Zopfli-based gzip encoder. Always emits a single gzip member;
-/// `thread_count` is advisory only (informational, not used to slice
-/// input — see the module doc above).
+/// Zopfli-based gzip encoder. Always emits a single gzip member; the
+/// user's `-p`/`--processes` flag controls intra-block parallelism only
+/// (wired through `ZopfliTuning::thread_budget` — see that field's doc
+/// and the module doc above).
 pub struct ZopfliGzEncoder {
     tuning: ZopfliTuning,
     header_info: GzipHeaderInfo,
@@ -72,12 +73,12 @@ impl ZopfliGzEncoder {
     }
 
     /// Compress to a single-member gzip with full metadata preservation.
-    /// `thread_budget = 0` lets `deflate_part` use intra-block parallelism
-    /// freely — no outer pool exists to contend with on this path.
+    /// `tuning.thread_budget` flows through unchanged — set by
+    /// `ZopfliTuning::from_args` from `-p`/`--processes` (`-p1` → serial,
+    /// otherwise unbounded intra-block parallelism). Honoring the user's
+    /// CPU-cap request is Copilot review comment #4 on PR #83.
     fn compress_single<W: Write>(&self, data: &[u8], mut writer: W) -> io::Result<()> {
-        let mut tuning = self.tuning.clone();
-        tuning.thread_budget = 0;
-        let deflate_data = compress_deflate(data, &tuning);
+        let deflate_data = compress_deflate(data, &self.tuning);
 
         self.write_gzip_header(&mut writer)?;
         writer.write_all(&deflate_data)?;
