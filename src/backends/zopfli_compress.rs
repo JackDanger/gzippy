@@ -1,39 +1,17 @@
-//! Zopfli compression backend
+//! Zopfli compression backend.
 //!
-//! Provides FFI bindings to the vendored Google Zopfli C library for true zopfli compression.
-//! Zopfli achieves slightly better compression than libdeflate's exhaustive search
-//! at the cost of much longer runtime (suitable for L11).
+//! Thin tuning wrapper around the pure-Rust port at
+//! [`crate::backends::zopfli_pure`]. Zopfli achieves slightly better
+//! compression than libdeflate's exhaustive search at the cost of much
+//! longer runtime (suitable for L11).
 
+use crate::backends::zopfli_pure::{compress, ZopfliFormat, ZopfliOptions};
 use crate::cli::GzippyArgs;
-use std::ffi::c_int;
 
-const ZOPFLI_FORMAT_GZIP: c_int = 0;
-#[allow(dead_code)]
-const ZOPFLI_FORMAT_ZLIB: c_int = 1;
-const ZOPFLI_FORMAT_DEFLATE: c_int = 2;
-
-/// Zopfli compression options
-#[repr(C)]
-struct ZopfliOptions {
-    verbose: c_int,
-    verbose_more: c_int,
-    numiterations: c_int,
-    blocksplitting: c_int,
-    blocksplittinglast: c_int,
-    blocksplittingmax: c_int,
-}
-
-extern "C" {
-    fn ZopfliInitOptions(options: *mut ZopfliOptions);
-    fn ZopfliCompress(
-        options: *const ZopfliOptions,
-        output_type: c_int,
-        input: *const u8,
-        insize: usize,
-        output: *mut *mut u8,
-        outsize: *mut usize,
-    );
-}
+// Note: there's no `compress_gzip` wrapper here — `ZopfliGzEncoder` writes
+// its own gzip header/trailer and calls `compress_deflate` for the payload.
+// The `ZopfliFormat::Gzip` arm of the dispatcher is exercised by zopfli_pure's
+// regression fixtures and by the Phase 11.2 corpus oracle, both #[cfg(test)].
 
 /// Tuning parameters for zopfli compression
 #[derive(Clone, Debug)]
@@ -44,6 +22,12 @@ pub struct ZopfliTuning {
     pub block_splitting: bool,
     /// Maximum blocks to split into (default 15; 0 = unlimited)
     pub block_splitting_max: u32,
+    /// Inner-loop thread budget for `deflate_part`, derived from
+    /// `-p`/`--processes` (see [`ZopfliOptions::thread_budget`]).
+    /// `0` = unlimited (default; gzippy spawns one thread per block-split
+    /// chunk inside `deflate_part`). `1` = serial (honors `-p1`; everything
+    /// runs in the main thread).
+    pub thread_budget: u32,
 }
 
 impl Default for ZopfliTuning {
@@ -52,82 +36,47 @@ impl Default for ZopfliTuning {
             iterations: 15,
             block_splitting: true,
             block_splitting_max: 15,
+            thread_budget: 0,
         }
     }
 }
 
 impl ZopfliTuning {
-    /// Create from CLI arguments
+    /// Create from CLI arguments. `args.processes` flows into
+    /// `thread_budget`: `-p1` → serial, anything else → unbounded
+    /// intra-block parallelism (the natural cap is the chunk count per
+    /// master block, typically 5-15). This makes `--ultra -p1` actually
+    /// honor the user's "use one CPU" request — see plan.md Phase 11
+    /// and Copilot review comments #1/#2/#4 on PR #83.
     pub fn from_args(args: &GzippyArgs) -> Self {
         Self {
             iterations: args.zopfli_iterations.unwrap_or(15),
             block_splitting: !args.zopfli_no_split,
             block_splitting_max: args.zopfli_split_max.unwrap_or(15),
+            thread_budget: if args.processes <= 1 { 1 } else { 0 },
         }
     }
 }
 
-/// Compress data with zopfli in GZIP format
-pub fn compress_gzip(data: &[u8], tuning: &ZopfliTuning) -> Vec<u8> {
-    compress_internal(data, tuning, ZOPFLI_FORMAT_GZIP)
-}
-
-/// Compress data with zopfli in raw DEFLATE format (no gzip header/trailer)
+/// Compress data with zopfli in raw DEFLATE format (no gzip header/trailer).
 pub fn compress_deflate(data: &[u8], tuning: &ZopfliTuning) -> Vec<u8> {
-    compress_internal(data, tuning, ZOPFLI_FORMAT_DEFLATE)
+    compress(&tuning_to_options(tuning), ZopfliFormat::Deflate, data)
 }
 
-fn compress_internal(data: &[u8], tuning: &ZopfliTuning, format: c_int) -> Vec<u8> {
-    unsafe {
-        let mut opts = ZopfliOptions {
-            verbose: 0,
-            verbose_more: 0,
-            numiterations: tuning.iterations as c_int,
-            blocksplitting: if tuning.block_splitting { 1 } else { 0 },
-            blocksplittinglast: 0,
-            blocksplittingmax: tuning.block_splitting_max as c_int,
-        };
-        ZopfliInitOptions(&mut opts);
-
-        let mut out: *mut u8 = std::ptr::null_mut();
-        let mut outsize: usize = 0;
-
-        ZopfliCompress(
-            &opts,
-            format,
-            data.as_ptr(),
-            data.len(),
-            &mut out,
-            &mut outsize,
-        );
-
-        if out.is_null() {
-            return Vec::new();
-        }
-
-        // Copy C-allocated memory to Rust Vec
-        let result = std::slice::from_raw_parts(out, outsize).to_vec();
-        // Free the C-allocated memory
-        libc::free(out as *mut std::ffi::c_void);
-        result
+fn tuning_to_options(tuning: &ZopfliTuning) -> ZopfliOptions {
+    ZopfliOptions {
+        verbose: 0,
+        verbose_more: 0,
+        numiterations: tuning.iterations as i32,
+        blocksplitting: if tuning.block_splitting { 1 } else { 0 },
+        blocksplittingmax: tuning.block_splitting_max as i32,
+        thread_budget: tuning.thread_budget,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_compress_gzip_basic() {
-        let input = b"hello world";
-        let tuning = ZopfliTuning::default();
-        let output = compress_gzip(input, &tuning);
-
-        // Verify output is valid gzip (starts with magic bytes)
-        assert!(output.len() >= 18);
-        assert_eq!(output[0], 0x1f);
-        assert_eq!(output[1], 0x8b);
-    }
 
     #[test]
     fn test_compress_deflate_basic() {

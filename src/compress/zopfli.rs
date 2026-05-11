@@ -1,30 +1,37 @@
 //! Zopfli-based gzip encoder
 //!
-//! Supports both single-threaded and parallel compression:
-//! - T1: reads all data, uses DEFLATE format + manual gzip header for metadata preservation
-//! - T>1: splits into blocks, compresses each in parallel with gzip format
+//! **Single-member output, always.** The previous multi-member parallel
+//! path emitted one gzip member per CPU thread, each with its own
+//! Huffman tree; against the C zopfli binary that cost +2.0–2.3% on the
+//! corpus audit (plan.md Phase 11). Under the "ratio is sacred" rule
+//! that's a P0, so the L11 path now always produces a single member
+//! whose deflate payload is bit-identical to C zopfli's output.
+//!
+//! Multi-thread scaling on `--ultra` is reduced to *intra-block*
+//! parallelism (Step 29's `std::thread::scope` inside `deflate_part`,
+//! gated on `ZopfliOptions::thread_budget = 0`). Recovery of input-
+//! level parallelism without ratio loss is plan.md Phase 15
+//! (single-member parallel zopfli).
 
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use crate::backends::zopfli_compress::{compress_deflate, compress_gzip, ZopfliTuning};
+use crate::backends::zopfli_compress::{compress_deflate, ZopfliTuning};
 use crate::compress::parallel::GzipHeaderInfo;
-use crate::infra::scheduler::compress_parallel_independent;
 
-/// Zopfli-based parallel gzip encoder
+/// Zopfli-based gzip encoder. Always emits a single gzip member; the
+/// user's `-p`/`--processes` flag controls intra-block parallelism only
+/// (wired through `ZopfliTuning::thread_budget` — see that field's doc
+/// and the module doc above).
 pub struct ZopfliGzEncoder {
-    thread_count: usize,
-    block_size: usize,
     tuning: ZopfliTuning,
     header_info: GzipHeaderInfo,
 }
 
 impl ZopfliGzEncoder {
-    pub fn new(thread_count: usize, block_size: usize, tuning: ZopfliTuning) -> Self {
+    pub fn new(tuning: ZopfliTuning) -> Self {
         Self {
-            thread_count,
-            block_size,
             tuning,
             header_info: GzipHeaderInfo::default(),
         }
@@ -35,7 +42,7 @@ impl ZopfliGzEncoder {
     }
 
     /// Compress from a reader with zopfli
-    pub fn compress<R: Read, W: Write + Send>(&self, mut reader: R, writer: W) -> io::Result<u64> {
+    pub fn compress<R: Read, W: Write>(&self, mut reader: R, writer: W) -> io::Result<u64> {
         let mut data = Vec::new();
         let bytes_read = reader.read_to_end(&mut data)? as u64;
         self.compress_buffer(&data, writer)?;
@@ -44,11 +51,7 @@ impl ZopfliGzEncoder {
 
     /// Compress from a file with zopfli (uses mmap for large files)
     #[allow(dead_code)]
-    pub fn compress_file<P: AsRef<Path>, W: Write + Send>(
-        &self,
-        path: P,
-        writer: W,
-    ) -> io::Result<u64> {
+    pub fn compress_file<P: AsRef<Path>, W: Write>(&self, path: P, writer: W) -> io::Result<u64> {
         let file = File::open(path)?;
         let file_size = file.metadata()?.len();
 
@@ -60,55 +63,30 @@ impl ZopfliGzEncoder {
         Ok(data.len() as u64)
     }
 
-    /// Compress already-loaded data
-    fn compress_buffer<W: Write + Send>(&self, data: &[u8], writer: W) -> io::Result<()> {
+    /// Compress already-loaded data. Always emits a single gzip member
+    /// (see module doc for the ratio-correctness rationale).
+    fn compress_buffer<W: Write>(&self, data: &[u8], writer: W) -> io::Result<()> {
         if data.is_empty() {
-            // Write empty gzip file
             return self.write_empty_gzip(writer);
         }
-
-        if self.thread_count == 1 || data.len() <= self.block_size {
-            // Single-threaded: use DEFLATE format + manual gzip header for full metadata
-            self.compress_single(data, writer)
-        } else {
-            // Multi-threaded: split into blocks, compress each with gzip format
-            self.compress_parallel(data, writer)
-        }
+        self.compress_single(data, writer)
     }
 
-    /// Single-threaded compression with full metadata preservation
+    /// Compress to a single-member gzip with full metadata preservation.
+    /// `tuning.thread_budget` flows through unchanged — set by
+    /// `ZopfliTuning::from_args` from `-p`/`--processes` (`-p1` → serial,
+    /// otherwise unbounded intra-block parallelism). Honoring the user's
+    /// CPU-cap request is Copilot review comment #4 on PR #83.
     fn compress_single<W: Write>(&self, data: &[u8], mut writer: W) -> io::Result<()> {
-        // Compress to raw DEFLATE format
         let deflate_data = compress_deflate(data, &self.tuning);
 
-        // Write gzip header manually
         self.write_gzip_header(&mut writer)?;
-
-        // Write DEFLATE data
         writer.write_all(&deflate_data)?;
 
-        // Write CRC32 + ISIZE trailer
         let crc = crc32fast::hash(data);
         let size = data.len() as u32;
         writer.write_all(&crc.to_le_bytes())?;
         writer.write_all(&size.to_le_bytes())?;
-
-        Ok(())
-    }
-
-    /// Multi-threaded compression using parallel scheduler
-    fn compress_parallel<W: Write + Send>(&self, data: &[u8], writer: W) -> io::Result<()> {
-        let tuning = self.tuning.clone();
-        let _writer = compress_parallel_independent(
-            data,
-            self.block_size,
-            self.thread_count,
-            writer,
-            move |block, output| {
-                // Compress each block as complete gzip member
-                *output = compress_gzip(block, &tuning);
-            },
-        )?;
 
         Ok(())
     }
@@ -173,5 +151,52 @@ impl ZopfliGzEncoder {
         // ISIZE: 0
         writer.write_all(&[0, 0, 0, 0])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    /// Phase 11.1.A invariant: at L11 the output bytes must not depend
+    /// on the user's `-pN` choice. The encoder no longer takes a
+    /// thread_count, so the only way this could regress is by
+    /// re-introducing an input-level slicing path; the test pins that
+    /// closed.
+    #[test]
+    fn ultra_output_is_single_member_and_deterministic() {
+        let data = std::fs::read("test_data/alice.txt").expect("test_data/alice.txt missing");
+        let tuning = ZopfliTuning::default();
+
+        let encode = || {
+            let encoder = ZopfliGzEncoder::new(tuning.clone());
+            let mut out = Vec::new();
+            encoder
+                .compress(std::io::Cursor::new(&data), &mut out)
+                .unwrap();
+            out
+        };
+
+        // Same input, same tuning → byte-identical gzip output.
+        let a = encode();
+        let b = encode();
+        assert_eq!(a, b, "encoder is not deterministic");
+        assert_eq!(&a[0..2], &[0x1f, 0x8b], "missing gzip magic");
+
+        // Single-member: a single-member decoder must consume the entire
+        // stream and produce the original input. Multi-member output
+        // would either leave trailing bytes (subsequent members) or fail
+        // the round-trip, depending on the decoder; flate2's
+        // `GzDecoder` is single-member and lets us assert both.
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(a.as_slice())
+            .read_to_end(&mut decoded)
+            .expect("single-member gunzip");
+        assert_eq!(
+            decoded, data,
+            "single-member decode must yield the original input \
+             — multi-member output would short-decode (Phase 11.1.A)"
+        );
     }
 }

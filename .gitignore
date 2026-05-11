@@ -5,6 +5,7 @@ Cargo.lock
 # Test data (generated, not the seed)
 /test_data/*
 !/test_data/text-1MB.txt
+!/test_data/alice.txt
 /test_results/
 
 # Benchmark data - only track silesia corpus (47MB xz), rest generated on demand

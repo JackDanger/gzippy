@@ -80,7 +80,10 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
     }
 
     let datasets = discover_datasets(&data_dir, args.dataset.as_deref())?;
-    if datasets.is_empty() {
+    // The L11 micro-corpus (test_data/) lives in-repo and can carry the
+    // compression bench by itself, so we only error if neither is available.
+    let l11_available = l11_microcorpus_available(&repo_root);
+    if datasets.is_empty() && !l11_available {
         return Err(format!(
             "No benchmark datasets found in {}. Run: ./scripts/prepare_benchmark_data.sh",
             data_dir.display()
@@ -124,9 +127,8 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
     }
 
     let mut results: Vec<ToolResult> = Vec::new();
-    let tmp_dir = bench_tmp_dir();
-    let _ = std::fs::create_dir_all(&tmp_dir);
-    let output_file = tmp_dir.join("bench-output.bin");
+    let scratch = BenchScratch::new();
+    let output_file = scratch.path().join("bench-output.bin");
 
     // Decompression benchmarks
     if args.direction != BenchDirection::Compress {
@@ -295,8 +297,21 @@ pub fn run(args: &BenchArgs) -> Result<(), String> {
         }
     }
 
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // L11 (`--ultra` / zopfli) micro-corpus — committed test_data files so the
+    // homelab gets the same inputs ship_l11_headtohead.sh uses locally.
+    if args.direction != BenchDirection::Decompress {
+        bench_l11_microcorpus(
+            &repo_root,
+            &bin_dir,
+            &thread_configs,
+            &output_file,
+            args,
+            &platform,
+            &mut results,
+        );
+    }
 
+    // `scratch` removes its dir on Drop; end-of-function takes care of it.
     if args.json {
         output_json(&platform, &results);
     } else {
@@ -320,7 +335,8 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
     }
 
     let datasets = discover_datasets(&data_dir, args.dataset.as_deref())?;
-    if datasets.is_empty() {
+    let l11_available = l11_microcorpus_available(&repo_root);
+    if datasets.is_empty() && !l11_available {
         return Err(format!(
             "No benchmark datasets found in {}",
             data_dir.display()
@@ -343,9 +359,8 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
     );
 
     let mut results: Vec<ToolResult> = Vec::new();
-    let tmp_dir = bench_tmp_dir();
-    let _ = std::fs::create_dir_all(&tmp_dir);
-    let output_file = tmp_dir.join("bench-output.bin");
+    let scratch = BenchScratch::new();
+    let output_file = scratch.path().join("bench-output.bin");
 
     // Decompression benchmarks
     if args.direction != BenchDirection::Compress {
@@ -497,7 +512,20 @@ pub fn run_and_collect(args: &BenchArgs) -> Result<(String, Vec<ToolResult>), St
         }
     }
 
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // L11 micro-corpus (same rationale as run() above).
+    if args.direction != BenchDirection::Decompress {
+        bench_l11_microcorpus(
+            &repo_root,
+            &bin_dir,
+            &thread_configs,
+            &output_file,
+            args,
+            &platform,
+            &mut results,
+        );
+    }
+
+    // `scratch` removes its dir on Drop at function return.
     Ok((platform, results))
 }
 
@@ -604,6 +632,148 @@ fn time_decompress(
     Ok(start.elapsed().as_secs_f64())
 }
 
+// ─── L11 (`--ultra` / zopfli) micro-corpus ────────────────────────────────────
+//
+// The main loop runs L1/L6/L9 on the 200 MB silesia/software/logs datasets;
+// L11 at 200 MB takes minutes per trial, so it stays out of that loop. This
+// helper runs L11 on the small text corpus committed under `test_data/`
+// (alice.txt 151 KB, text-1MB.txt 1 MB) — same inputs as
+// `scripts/ship_l11_headtohead.sh` — so the homelab produces wall-clock
+// numbers comparable to that script's local output. Only gzippy runs here;
+// pigz/igzip/gzip cap at L9. Bytewise equality vs vendor C zopfli is checked
+// separately by `ship_l11_headtohead.sh`.
+
+const L11_MICROCORPUS: &[(&str, &str)] = &[
+    ("alice", "test_data/alice.txt"),
+    ("text-1MB", "test_data/text-1MB.txt"),
+];
+
+fn l11_microcorpus_available(repo_root: &Path) -> bool {
+    L11_MICROCORPUS
+        .iter()
+        .any(|(_, rel)| repo_root.join(rel).exists())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bench_l11_microcorpus(
+    repo_root: &Path,
+    bin_dir: &Option<PathBuf>,
+    thread_configs: &[(usize, &str)],
+    output_file: &Path,
+    args: &BenchArgs,
+    platform: &str,
+    results: &mut Vec<ToolResult>,
+) {
+    // Only gzippy participates; resolve its path the same way discover_compress_tools does.
+    let gzippy_path: Option<String> = {
+        let candidates = [
+            ("gzippy", &["target/release/gzippy", "bin/gzippy"][..]),
+        ];
+        candidates.iter().find_map(|(name, paths)| {
+            if let Some(bd) = bin_dir {
+                let p = bd.join(name);
+                if p.exists() && is_executable(&p) {
+                    return Some(p.to_string_lossy().to_string());
+                }
+            }
+            for rpath in *paths {
+                let p = repo_root.join(rpath);
+                if p.exists() && is_executable(&p) {
+                    return Some(p.to_string_lossy().to_string());
+                }
+            }
+            None
+        })
+    };
+    let Some(gzippy_bin) = gzippy_path else {
+        if !args.json {
+            eprintln!("  L11 micro-corpus: gzippy binary not found, skipping");
+        }
+        return;
+    };
+
+    if !args.json {
+        eprintln!("\n── Compression L11 (--ultra / zopfli) ──");
+    }
+
+    for (name, rel_path) in L11_MICROCORPUS {
+        let input = repo_root.join(rel_path);
+        if !input.exists() {
+            if !args.json {
+                eprintln!("  {name} L11  (skip: {rel_path} not found)");
+            }
+            continue;
+        }
+        let original_size = match std::fs::metadata(&input) {
+            Ok(m) => m.len(),
+            Err(_) => continue,
+        };
+
+        for &(threads, threads_label) in thread_configs {
+            if !args.json {
+                eprint!("  [{platform}] {name} L11 {threads_label}  ");
+                let _ = std::io::stderr().flush();
+            }
+
+            let result = benchmark_compress(
+                "gzippy",
+                &gzippy_bin,
+                &input,
+                original_size,
+                11,
+                threads,
+                output_file,
+                args.min_trials,
+                args.max_trials,
+                args.target_cv,
+            );
+
+            let tr = match result {
+                Ok((speed, cv, trials, ratio)) => {
+                    if !args.json {
+                        eprint!("gzippy:{speed:.2}MB/s({ratio:.3})");
+                        let _ = std::io::stderr().flush();
+                    }
+                    ToolResult {
+                        dataset: (*name).into(),
+                        archive: "L11".into(),
+                        threads: threads_label.to_string(),
+                        tool: "gzippy".into(),
+                        speed_mbps: speed,
+                        cv,
+                        trials,
+                        status: "pass".into(),
+                        error: None,
+                        direction: "compress".into(),
+                    }
+                }
+                Err(e) => {
+                    if !args.json {
+                        eprint!("gzippy:ERR");
+                        let _ = std::io::stderr().flush();
+                    }
+                    ToolResult {
+                        dataset: (*name).into(),
+                        archive: "L11".into(),
+                        threads: threads_label.to_string(),
+                        tool: "gzippy".into(),
+                        speed_mbps: 0.0,
+                        cv: 0.0,
+                        trials: 0,
+                        status: "fail".into(),
+                        error: Some(e),
+                        direction: "compress".into(),
+                    }
+                }
+            };
+            results.push(tr);
+            if !args.json {
+                eprintln!();
+            }
+        }
+    }
+}
+
 // ─── Compression benchmark engine ─────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -691,12 +861,19 @@ fn time_compress(
 }
 
 fn tool_compress_args(tool: &str, level: u32, threads: usize) -> Vec<String> {
+    // gzippy's short-flag parser caps at -9 (single digit); levels 10-12
+    // must come in via --level=N.
+    let level_flag = if level <= 9 {
+        format!("-{level}")
+    } else {
+        format!("--level={level}")
+    };
     match tool {
-        "gzippy" => vec![format!("-{level}"), "-c".into(), format!("-p{threads}")],
-        "pigz" => vec![format!("-{level}"), "-c".into(), format!("-p{threads}")],
-        "igzip" => vec![format!("-{level}"), "-c".into()],
-        "gzip" => vec![format!("-{level}"), "-c".into()],
-        _ => vec![format!("-{level}"), "-c".into()],
+        "gzippy" => vec![level_flag, "-c".into(), format!("-p{threads}")],
+        "pigz" => vec![level_flag, "-c".into(), format!("-p{threads}")],
+        "igzip" => vec![level_flag, "-c".into()],
+        "gzip" => vec![level_flag, "-c".into()],
+        _ => vec![level_flag, "-c".into()],
     }
 }
 
@@ -735,7 +912,10 @@ fn is_compress_single_threaded(tool: &str) -> bool {
 fn tool_supports_level(tool: &str, level: u32) -> bool {
     match tool {
         "igzip" => level == 1,
-        _ => true,
+        // pigz and gzip cap at 9. gzippy goes up to 12 (--ultra=11, --max=12).
+        "pigz" | "gzip" => level <= 9,
+        "gzippy" => level <= 12,
+        _ => level <= 9,
     }
 }
 
@@ -975,6 +1155,31 @@ fn bench_tmp_dir() -> PathBuf {
         PathBuf::from("/dev/shm").join(name)
     } else {
         std::env::temp_dir().join(name)
+    }
+}
+
+/// RAII wrapper around the bench scratch dir so it's removed even on
+/// early-return / panic. Without this the bench leaks ~200 MB per run
+/// in /dev/shm — concurrent runs eventually fill the tmpfs (and on
+/// /-pressured boxes can cascade into "ERR" rows for downstream
+/// scenarios). Created at every call site that owns a `bench_tmp_dir`.
+struct BenchScratch(PathBuf);
+
+impl BenchScratch {
+    fn new() -> Self {
+        let dir = bench_tmp_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for BenchScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

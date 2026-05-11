@@ -21,6 +21,11 @@ trace = []  # Enable decode tracing instrumentation
 profile = []  # Enable timing profiler (adds overhead, only use for profiling)
 debug_decode = []  # Log decode operations around DEBUG_POS (e.g., DEBUG_POS=124088477)
 counters = []     # Enable AtomicU64 hot-path counters in bgzf (always on in test builds)
+# Compile vendored C zopfli for the corpus oracle test that compares
+# zopfli_pure deflate output byte-for-byte against the C reference.
+# Only consumed by `cargo test --features oracle` (or `make oracle-vs-c`);
+# does not affect production binaries. See plan.md Phase 11.2.
+oracle = []
 
 [dependencies]
 # Compression: flate2 with zlib-ng for maximum performance

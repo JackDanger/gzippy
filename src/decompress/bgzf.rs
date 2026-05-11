@@ -7994,8 +7994,12 @@ mod optimization_tests {
 
         eprintln!("Original data: {} bytes", original.len());
 
-        // Write to temp file
+        // Write to temp file. Defensive: env::temp_dir() can resolve to a
+        // path that doesn't actually exist if TMPDIR is set to a stale
+        // value (e.g. a leftover `mktemp -d` from a previous shell), so
+        // ensure the directory exists before writing into it.
         let tmp_dir = std::env::temp_dir();
+        std::fs::create_dir_all(&tmp_dir).ok();
         let input_path = tmp_dir.join("gzip_test_input.bin");
         let compressed_path = tmp_dir.join("gzip_test_input.bin.gz");
 

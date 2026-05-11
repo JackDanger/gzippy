@@ -4,11 +4,10 @@
 # Quick tests (<30s) run with 'make' or 'make quick' - for AI tools and iteration
 # Full perf tests (10+ min) run with 'make perf-full' - for humans at release time
 
-# Build configuration - submodules are in ./vendor/{gzip,pigz,isa-l,zopfli,rapidgzip,libdeflate}
+# Build configuration - submodules are in ./vendor/{gzip,pigz,isa-l,rapidgzip,libdeflate}
 GZIP_DIR := ./vendor/gzip
 PIGZ_DIR := ./vendor/pigz
 ISAL_DIR := ./vendor/isa-l
-ZOPFLI_DIR := ./vendor/zopfli
 RAPIDGZIP_DIR := ./vendor/rapidgzip
 GZIPPY_DIR := .
 TEST_DATA_DIR := test_data
@@ -19,7 +18,6 @@ GZIPPY_BIN := $(GZIPPY_DIR)/target/release/gzippy
 UNGZIPPY_BIN := $(GZIPPY_DIR)/target/release/ungzippy
 PIGZ_BIN := $(PIGZ_DIR)/pigz
 IGZIP_BIN := $(ISAL_DIR)/build/igzip
-ZOPFLI_BIN := $(ZOPFLI_DIR)/zopfli
 RAPIDGZIP_BIN := $(RAPIDGZIP_DIR)/librapidarchive/build/src/tools/rapidgzip
 
 # Prefer source-built gzip; on macOS fall back to brew gzip then /usr/bin/gzip
@@ -29,7 +27,7 @@ SYSTEM_GZIP := $(shell which gzip)
 # Set APPLE_GZIP when it differs from GZIP_BIN so bench targets compare both
 APPLE_GZIP := $(if $(filter Darwin,$(shell uname)),/usr/bin/gzip,)
 
-.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship route-check
+.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship ship-local route-check oracle-vs-c
 
 # =============================================================================
 # Default target: quick benchmark for fast iteration (< 30 seconds)
@@ -42,10 +40,10 @@ all: quick
 
 build: $(GZIPPY_BIN) $(UNGZIPPY_BIN)
 
-deps: $(PIGZ_BIN) $(IGZIP_BIN) $(ZOPFLI_BIN) $(RAPIDGZIP_BIN)
+deps: $(PIGZ_BIN) $(IGZIP_BIN) $(RAPIDGZIP_BIN)
 	@# Try to build gzip, but don't fail if it doesn't work
 	@$(MAKE) $(GZIP_DIR)/gzip 2>/dev/null || true
-	@echo "✓ Dependencies ready (gzip, pigz, igzip, zopfli, rapidgzip)"
+	@echo "✓ Dependencies ready (gzip, pigz, igzip, rapidgzip)"
 
 $(GZIP_DIR)/gzip:
 	@if [ "$$(uname)" = "Darwin" ]; then \
@@ -73,11 +71,6 @@ $(IGZIP_BIN):
 	@mkdir -p $(ISAL_DIR)/build
 	@cd $(ISAL_DIR)/build && cmake .. >/dev/null 2>&1 && make -j4 igzip 2>&1 | grep -E "(Built|error)" || true
 	@echo "✓ Built igzip"
-
-$(ZOPFLI_BIN):
-	@echo "Building zopfli from source..."
-	@$(MAKE) -C $(ZOPFLI_DIR) zopfli 2>&1 | grep -E "(cc|g\+\+|error)" || true
-	@echo "✓ Built zopfli"
 
 $(RAPIDGZIP_BIN):
 	@echo "Building rapidgzip from source..."
@@ -154,53 +147,148 @@ route-check: $(GZIPPY_BIN) $(PIGZ_BIN)
 	@python3 scripts/route_check.py $(GZIPPY_BIN) $(PIGZ_BIN)
 
 # =============================================================================
-# Ship: tests + clippy + homelab benchmarks (the "are we good?" command)
+# Ship: the "are we good?" gate. Always tests the *current branch*.
 #
-# Runs the full correctness test suite, then runs benchmarks on neurotic homelab.
-# Fails fast if tests or clippy don't pass.
+# Runs the cheap local checks first, then expensive homelab bench last so
+# a fmt/test/clippy/oracle failure aborts in <60s instead of >20min.
+#
+# Step 1: refuse if working tree dirty / detached HEAD
+# Step 2: cargo fmt --check + test --release + clippy (default + oracle features)
+# Step 3: corpus oracle vs vendor C zopfli (66 byte-equality checks; L11 ratio gate)
+# Step 4: L11 head-to-head wall-clock + deflate equality vs C zopfli
+# Step 5: cross-tool roundtrip smoke (gzippy ↔ gzip/pigz/igzip when available)
+# Step 6: push current branch + homelab fetches THIS branch + bench
 #
 # Target: ssh -J neurotic root@10.30.0.199 (homelab intel i9-14000)
-# Time: ~20-30 minutes (tests: ~30s, benchmarks: ~20-25 min)
+# Time: ~25 minutes total (~30s through step 5; ~20-25 min on step 6)
+# Use `make ship-local` to run steps 1-5 only and skip the homelab.
 # =============================================================================
-ship: $(GZIPPY_BIN)
-	@echo "══════════════════════════════════════════════════════"
-	@echo "  SHIP: tests → clippy → neurotic homelab benchmarks"
-	@echo "══════════════════════════════════════════════════════"
-	@echo ""
-	@echo "── Step 1/4: cargo test ──"
-	@cargo test --release || (echo "TESTS FAILED — aborting ship" && exit 1)
-	@echo ""
-	@echo "── Step 2/4: cargo clippy ──"
-	@cargo clippy --all-targets -- -D warnings || (echo "CLIPPY FAILED — aborting ship" && exit 1)
-	@echo ""
-	@echo "── Step 3/4: rebuild gzippy-dev on homelab ──"
-	@ssh -J neurotic root@10.30.0.199 'set -e; cd gzippy; \
-	  git fetch origin main; git checkout main; git reset --hard origin/main; \
-	  git submodule update --init vendor/zopfli 2>&1 | grep -v "^$$" || true; \
-	  cargo build --release 2>&1 | grep -E "Compiling|Finished|error" || true; \
-	  cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target \
-	    2>&1 | grep -E "Compiling|Finished|error" || true; \
+ship: ship-precheck ship-local
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	echo ""; \
+	echo "── Step 6/6: push '$$BRANCH' + neurotic homelab benchmarks ──"; \
+	if ! git rev-parse origin/$$BRANCH >/dev/null 2>&1 \
+	    || [ -n "$$(git log origin/$$BRANCH..HEAD 2>/dev/null)" ]; then \
+	  echo "  pushing $$BRANCH to origin..."; \
+	  git push origin $$BRANCH || (echo "PUSH FAILED — aborting ship" && exit 1); \
+	else \
+	  echo "  origin/$$BRANCH already up to date"; \
+	fi; \
+	echo "  connecting to neurotic..."; \
+	ssh -J neurotic root@10.30.0.199 "set -e; cd gzippy; \
+	  echo '  fetching origin/$$BRANCH...'; \
+	  git fetch origin '$$BRANCH'; \
+	  git checkout -B '$$BRANCH' 'origin/$$BRANCH'; \
+	  git reset --hard 'origin/$$BRANCH'; \
+	  git submodule update --init --recursive 2>&1 | tail -3; \
+	  echo ''; echo '  ── disk-space precheck ──'; \
+	  AVAIL_GB=\$$(df -BG . | tail -1 | awk '{gsub(/G/,\"\",\$$4); print \$$4}'); \
+	  echo \"  root fs: \$${AVAIL_GB} GB available\"; \
+	  if [ \"\$$AVAIL_GB\" -lt 5 ]; then \
+	    if [ -d /mnt/internal ] && [ -w /mnt/internal ]; then \
+	      ALT=/mnt/internal/gzippy-target; mkdir -p \"\$$ALT\"; \
+	      ALT_GB=\$$(df -BG \"\$$ALT\" | tail -1 | awk '{gsub(/G/,\"\",\$$4); print \$$4}'); \
+	      echo \"  root fs squeezed; relocating cargo target to \$$ALT (\$${ALT_GB} GB free) via symlink\"; \
+	      rm -rf target; ln -sfn \"\$$ALT\" target; \
+	    else \
+	      echo \"ERROR: root fs has only \$${AVAIL_GB} GB free; bench needs >=5 GB; aborting\" >&2; \
+	      echo \"       free space (e.g. 'cargo clean' in /root/hvac-pr*/) and re-run\" >&2; \
+	      exit 1; \
+	    fi; \
+	  fi; \
+	  rm -rf /dev/shm/gzippy-bench-* 2>/dev/null || true; \
+	  echo ''; echo '  ── building gzippy + gzippy-dev from $$BRANCH ──'; \
+	  cargo build --release 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
+	  cargo build --release --manifest-path tools/devtool/Cargo.toml --target-dir target 2>&1 \
+	    | grep -E 'Compiling gzippy-dev|Finished|error' || true; \
+	  [ -x target/release/gzippy     ] || { echo 'ERROR: target/release/gzippy missing after build' >&2; exit 1; }; \
+	  [ -x target/release/gzippy-dev ] || { echo 'ERROR: target/release/gzippy-dev missing after build' >&2; exit 1; }; \
 	  BD=benchmark_data; BIN=target/release/gzippy; \
-	  [ -f "$$BD/silesia.tar" ] || { [ -f "$$BD/silesia.tar.xz" ] && echo "Extracting silesia.tar..." && xz -dk "$$BD/silesia.tar.xz" -c > "$$BD/silesia.tar"; }; \
+	  [ -f \"\$$BD/silesia.tar\" ] || { [ -f \"\$$BD/silesia.tar.xz\" ] && echo 'extracting silesia.tar' && xz -dk \"\$$BD/silesia.tar.xz\" -c > \"\$$BD/silesia.tar\"; }; \
 	  for DS in silesia software logs; do \
-	    case $$DS in \
-	      silesia)  RAW=$$BD/silesia.tar;; \
-	      software) RAW=$$BD/software.archive;; \
-	      logs)     RAW=$$BD/logs.txt;; \
+	    case \$$DS in \
+	      silesia)  RAW=\$$BD/silesia.tar;; \
+	      software) RAW=\$$BD/software.archive;; \
+	      logs)     RAW=\$$BD/logs.txt;; \
 	    esac; \
-	    [ -f "$$RAW" ] || { echo "Skipping $$DS ($$RAW not found)"; continue; }; \
-	    [ -s "$$BD/$$DS-gzip.gz" ] || { echo "Creating $$BD/$$DS-gzip.gz..."; gzip -1 -c "$$RAW" > "$$BD/$$DS-gzip.gz"; }; \
-	    [ -s "$$BD/$$DS-bgzf.gz" ] || { echo "Creating $$BD/$$DS-bgzf.gz..."; $$BIN -1 -c "$$RAW" > "$$BD/$$DS-bgzf.gz"; }; \
-	    [ -s "$$BD/$$DS-pigz.gz" ] || { PIGZ=$$([ -x vendor/pigz/pigz ] && echo vendor/pigz/pigz || echo pigz); echo "Creating $$BD/$$DS-pigz.gz..."; $$PIGZ -1 -c "$$RAW" > "$$BD/$$DS-pigz.gz"; }; \
+	    [ -f \"\$$RAW\" ] || { echo \"skipping \$$DS (\$$RAW not found)\"; continue; }; \
+	    [ -s \"\$$BD/\$$DS-gzip.gz\" ] || { echo \"creating \$$BD/\$$DS-gzip.gz\"; gzip -1 -c \"\$$RAW\" > \"\$$BD/\$$DS-gzip.gz\"; }; \
+	    [ -s \"\$$BD/\$$DS-bgzf.gz\" ] || { echo \"creating \$$BD/\$$DS-bgzf.gz\"; \$$BIN -1 -c \"\$$RAW\" > \"\$$BD/\$$DS-bgzf.gz\"; }; \
+	    [ -s \"\$$BD/\$$DS-pigz.gz\" ] || { PIGZ=\$$([ -x vendor/pigz/pigz ] && echo vendor/pigz/pigz || echo pigz); echo \"creating \$$BD/\$$DS-pigz.gz\"; \$$PIGZ -1 -c \"\$$RAW\" > \"\$$BD/\$$DS-pigz.gz\"; }; \
 	  done; \
-	  echo "Archives: $$(ls $$BD/*-{gzip,bgzf,pigz}.gz 2>/dev/null | wc -l) files ready"'
+	  echo \"  archives: \$$(ls \$$BD/*-{gzip,bgzf,pigz}.gz 2>/dev/null | wc -l) files ready\"; \
+	  echo ''; echo '  ── running gzippy-dev bench (--direction both: covers L1/6/9 + L11 micro-corpus) ──'; \
+	  TMPDIR=/dev/shm ./target/release/gzippy-dev bench --direction both; \
+	  echo ''; echo '  ── L11 head-to-head vs vendor C zopfli (homelab) ──'; \
+	  bash scripts/ship_l11_headtohead.sh; \
+	  rm -rf /dev/shm/gzippy-bench-* 2>/dev/null || true"
 	@echo ""
-	@echo "── Step 4/4: neurotic homelab benchmarks ──"
-	@echo "Connecting to neurotic (root@10.30.0.199)..."
-	ssh -J neurotic root@10.30.0.199 'cd gzippy && TMPDIR=/dev/shm ./target/release/gzippy-dev bench'
+	@echo "✓ ship complete on branch $$(git rev-parse --abbrev-ref HEAD)"
+
+# `ship-precheck`: dirty-tree refusal. Pulled out of `ship-local` so a
+# dirty tree fails in <1s instead of after 30s of local checks. Only
+# runs as a prereq of `ship` (which pushes); `ship-local` is permitted
+# to run on a dirty tree because nothing leaves the box.
+.PHONY: ship-precheck
+ship-precheck:
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	if [ "$$BRANCH" = "HEAD" ]; then echo "ERROR: detached HEAD; checkout a branch first" >&2; exit 1; fi; \
+	if [ -n "$$(git status --porcelain | grep -v '^?? vendor/zopfli')" ]; then \
+	  echo "ERROR: uncommitted changes — homelab needs to fetch a committed branch" >&2; \
+	  echo "       run 'git status' and commit (or stash) before 'make ship'" >&2; \
+	  echo "       (use 'make ship-local' to run local checks against a dirty tree)" >&2; \
+	  exit 1; \
+	fi
+	@echo "  ✓ branch=$$(git rev-parse --abbrev-ref HEAD), tree clean"
+
+# `ship-local`: steps 1-5 only. Use to validate locally without the
+# 20-minute homelab round-trip. Same checks as `ship`'s prefix; if this
+# is green, `ship` only adds the homelab decompression scoreboard.
+.PHONY: ship-local
+ship-local: $(GZIPPY_BIN)
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	if [ "$$BRANCH" = "HEAD" ]; then echo "ERROR: detached HEAD; checkout a branch first" >&2; exit 1; fi; \
+	echo "══════════════════════════════════════════════════════"; \
+	echo "  SHIP (local): branch=$$BRANCH"; \
+	echo "══════════════════════════════════════════════════════"
 	@echo ""
+	@echo "── Step 1/6: branch sanity ──"
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); echo "  branch: $$BRANCH"
+	@echo "  (working tree may be dirty; the dirty-tree check is in 'ship', not 'ship-local')"
 	@echo ""
-	@echo "Done. Run 'ssh -J neurotic root@10.30.0.199 \"cd gzippy && ./target/release/gzippy-dev bench\"' to re-run benchmarks."
+	@echo "── Step 2/6: cargo fmt + test + clippy (default + oracle features) ──"
+	@cargo fmt --check || (echo "FORMAT FAILED — run 'cargo fmt'" >&2 && exit 1)
+	@cargo test --release 2>&1 | tail -2 | (grep -q "0 failed" && echo "  ✓ cargo test --release") \
+	  || (echo "TESTS FAILED — see 'cargo test --release'" >&2 && exit 1)
+	@cargo clippy --release --all-targets -- -D warnings 2>&1 | tail -1 \
+	  | (grep -q "Finished" && echo "  ✓ cargo clippy (default features)") \
+	  || (echo "CLIPPY FAILED — see 'cargo clippy --release --all-targets -- -D warnings'" >&2 && exit 1)
+	@cargo clippy --release --features oracle -- -D warnings 2>&1 | tail -1 \
+	  | (grep -q "Finished" && echo "  ✓ cargo clippy (--features oracle)") \
+	  || (echo "CLIPPY FAILED (oracle features) — see 'cargo clippy --release --features oracle -- -D warnings'" >&2 && exit 1)
+	@echo ""
+	@echo "── Step 3/6: corpus oracle vs vendor C zopfli (L11 ratio gate) ──"
+	@$(MAKE) --no-print-directory oracle-vs-c 2>&1 | tail -3
+	@echo ""
+	@echo "── Step 4/6: L11 head-to-head wall-clock + deflate equality ──"
+	@bash scripts/ship_l11_headtohead.sh
+	@echo ""
+	@echo "── Step 5/6: cross-tool roundtrip smoke ──"
+	@bash scripts/ship_roundtrip_smoke.sh
+	@echo ""
+	@echo "✓ ship-local complete (steps 1-5 of 6 — homelab bench skipped)"
+
+# =============================================================================
+# Phase 11.2 corpus oracle: compares zopfli_pure's gzip output to the
+# vendored C zopfli library byte-for-byte across a fixed corpus and a
+# matrix of (numiterations, blocksplitting, maxblocks). The C library is
+# only built under the `oracle` feature; production binaries are
+# untouched. Run before merging any zopfli_pure change.
+# =============================================================================
+oracle-vs-c:
+	@git submodule update --init vendor/zopfli
+	@echo "── corpus oracle: zopfli_pure vs vendor/zopfli ──"
+	cargo test --release --features oracle corpus_gzip_output_matches_c_zopfli -- --include-ignored --nocapture
 
 # =============================================================================
 # AWS credentials for cloud fleet benchmarks (optional — cloud.rs auto-uses
@@ -307,7 +395,6 @@ bench-bin: $(GZIPPY_BIN) $(PIGZ_BIN) $(IGZIP_BIN)
 	@cp -f $(PIGZ_DIR)/unpigz $(BENCH_BIN_DIR)/ 2>/dev/null || true
 	@cp -f $(IGZIP_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
 	@cp -f $(RAPIDGZIP_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
-	@cp -f $(ZOPFLI_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
 	@cp -f $(GZIP_BIN) $(BENCH_BIN_DIR)/gzip 2>/dev/null || true
 ifneq ($(APPLE_GZIP),$(GZIP_BIN))
 ifneq ($(APPLE_GZIP),)
@@ -553,8 +640,12 @@ help:
 		'======================================' \
 		'' \
 		'The one command:' \
-		'  make ship         Tests + clippy + neurotic homelab benchmarks + scorecard' \
-		'                    (runs on ssh -J neurotic root@10.30.0.199)' \
+		'  make ship         Full gate (uses CURRENT branch, not main):' \
+		'                    fmt + test + clippy + oracle + L11 head-to-head +' \
+		'                    cross-tool roundtrip + push branch + homelab bench.' \
+		'                    Fail-fast (~30s through local steps; ~25min total).' \
+		'  make ship-local   Same as `ship` but skips the homelab step (steps 1-5 only).' \
+		'  make oracle-vs-c  Phase 11.2 corpus oracle: zopfli_pure vs vendor/zopfli' \
 		'' \
 		'Quick commands (for AI tools and iteration):' \
 		'  make              Build and run quick benchmark (< 30 seconds)' \

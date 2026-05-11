@@ -357,7 +357,13 @@ pub fn compress_stdin(args: &GzippyArgs) -> GzippyResult<i32> {
             content_type,
         );
         let compression_level = args.compression_level as u32;
-        if opt_config.thread_count > 1 {
+        // L11 / zopfli tuning flags: always route through compress_with_pipeline
+        // so the single-member zopfli encoder runs. The stdin+regular-file
+        // multi-thread path was historically bypassing this — ParallelGzEncoder
+        // would produce a "GZ" FEXTRA multi-member stream at L11, costing
+        // +2% ratio vs C zopfli. Plan.md Phase 11.1.A pinned this for
+        // compress_with_pipeline but didn't reach this branch.
+        if opt_config.thread_count > 1 && !args.use_zopfli() {
             if args.compression_level >= 6 && args.compression_level <= 9 {
                 let mut encoder = crate::compress::pipelined::PipelinedGzEncoder::new(
                     compression_level,
