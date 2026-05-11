@@ -64,42 +64,49 @@ run_one() {
   "$ZOPFLI" --i15 "$tmpdir/in" 2>/dev/null
   t_c_end=$(python3 -c 'import time; print(time.time())')
 
-  # gzippy --ultra -p1
+  # gzippy --ultra -p1 (file-arg path: routes through compress_to_file_or_stdout)
   t_p1_start=$(python3 -c 'import time; print(time.time())')
   "$GZIPPY" --ultra --processes 1 -c "$input" > "$tmpdir/p1.gz"
   t_p1_end=$(python3 -c 'import time; print(time.time())')
 
-  # gzippy --ultra -p8
+  # gzippy --ultra -p8 (file-arg path)
   t_p8_start=$(python3 -c 'import time; print(time.time())')
   "$GZIPPY" --ultra --processes 8 -c "$input" > "$tmpdir/p8.gz"
   t_p8_end=$(python3 -c 'import time; print(time.time())')
+
+  # gzippy --ultra -p8 via STDIN REDIRECT (routes through compress_stdin's
+  # mmap+multithread branch — historically bypassed compress_with_pipeline,
+  # producing "GZ" FEXTRA multi-member output at L11).
+  "$GZIPPY" --ultra --processes 8 -c < "$input" > "$tmpdir/p8_stdin.gz"
 
   local t_c t_p1 t_p8
   t_c=$(python3 -c "print(f'{$t_c_end - $t_c_start:.3f}')")
   t_p1=$(python3 -c "print(f'{$t_p1_end - $t_p1_start:.3f}')")
   t_p8=$(python3 -c "print(f'{$t_p8_end - $t_p8_start:.3f}')")
 
-  local c_def p1_def p8_def
+  local c_def p1_def p8_def p8_stdin_def
   c_def=$(strip_deflate "$tmpdir/in.gz" | wc -c | tr -d ' ')
   p1_def=$(strip_deflate "$tmpdir/p1.gz" | wc -c | tr -d ' ')
   p8_def=$(strip_deflate "$tmpdir/p8.gz" | wc -c | tr -d ' ')
+  p8_stdin_def=$(strip_deflate "$tmpdir/p8_stdin.gz" | wc -c | tr -d ' ')
 
   # Bytewise compare deflate payloads (the ratio gate).
-  local p1_match="✗" p8_match="✗"
+  local p1_match="✗" p8_match="✗" p8_stdin_match="✗"
   if cmp -s <(strip_deflate "$tmpdir/in.gz") <(strip_deflate "$tmpdir/p1.gz"); then p1_match="✓"; fi
   if cmp -s <(strip_deflate "$tmpdir/in.gz") <(strip_deflate "$tmpdir/p8.gz"); then p8_match="✓"; fi
+  if cmp -s <(strip_deflate "$tmpdir/in.gz") <(strip_deflate "$tmpdir/p8_stdin.gz"); then p8_stdin_match="✓"; fi
 
-  printf "  %-15s  %7d B  C %5ss  -p1 %5ss/%5dB %s  -p8 %5ss/%5dB %s\n" \
-    "$name" "$insize" "$t_c" "$t_p1" "$p1_def" "$p1_match" "$t_p8" "$p8_def" "$p8_match"
+  printf "  %-15s  %7d B  C %5ss  -p1 %5ss/%5dB %s  -p8 %5ss/%5dB %s  -p8<file %5dB %s\n" \
+    "$name" "$insize" "$t_c" "$t_p1" "$p1_def" "$p1_match" "$t_p8" "$p8_def" "$p8_match" "$p8_stdin_def" "$p8_stdin_match"
 
-  if [ "$p1_match" = "✗" ] || [ "$p8_match" = "✗" ]; then
+  if [ "$p1_match" = "✗" ] || [ "$p8_match" = "✗" ] || [ "$p8_stdin_match" = "✗" ]; then
     echo "    DEFLATE MISMATCH — gzippy is producing different bytes than C zopfli" >&2
     return 1
   fi
 }
 
-echo "  workload          input      C zopfli   gzippy -p1            gzippy -p8"
-echo "  ────────          ─────      ────────   ──────────            ──────────"
+echo "  workload          input      C zopfli   gzippy -p1            gzippy -p8           gzippy -p8 stdin"
+echo "  ────────          ─────      ────────   ──────────            ──────────           ────────────────"
 
 fail=0
 run_one "alice.txt"       "$ALICE"   || fail=1
@@ -112,4 +119,4 @@ if [ $fail -ne 0 ]; then
 fi
 
 echo ""
-echo "  ✓ L11 deflate byte-identical to C zopfli on both inputs (-p1 and -p8)"
+echo "  ✓ L11 deflate byte-identical to C zopfli on both inputs (-p1, -p8 file-arg, -p8 stdin)"

@@ -217,8 +217,10 @@ ship: ship-precheck ship-local
 	    [ -s \"\$$BD/\$$DS-pigz.gz\" ] || { PIGZ=\$$([ -x vendor/pigz/pigz ] && echo vendor/pigz/pigz || echo pigz); echo \"creating \$$BD/\$$DS-pigz.gz\"; \$$PIGZ -1 -c \"\$$RAW\" > \"\$$BD/\$$DS-pigz.gz\"; }; \
 	  done; \
 	  echo \"  archives: \$$(ls \$$BD/*-{gzip,bgzf,pigz}.gz 2>/dev/null | wc -l) files ready\"; \
-	  echo ''; echo '  ── running gzippy-dev bench ──'; \
-	  TMPDIR=/dev/shm ./target/release/gzippy-dev bench; \
+	  echo ''; echo '  ── running gzippy-dev bench (--direction both: covers L1/6/9 + L11 micro-corpus) ──'; \
+	  TMPDIR=/dev/shm ./target/release/gzippy-dev bench --direction both; \
+	  echo ''; echo '  ── L11 head-to-head vs vendor C zopfli (homelab) ──'; \
+	  bash scripts/ship_l11_headtohead.sh; \
 	  rm -rf /dev/shm/gzippy-bench-* 2>/dev/null || true"
 	@echo ""
 	@echo "✓ ship complete on branch $$(git rev-parse --abbrev-ref HEAD)"
