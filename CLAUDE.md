@@ -24,12 +24,14 @@ Input → decompress::mod: decompress_gzip_libdeflate
   │     T1  → decompress_multi_member_sequential (libdeflate, member-by-member)
   │     Tmax → bgzf::decompress_multi_member_parallel (libdeflate FFI)
   └─ Single-member?
-        ISA-L + T>1 + compressed > 10 MiB + physical_cores ≥ 4
+        ISA-L + T>1 + compressed > 10 MiB + physical_cores ≥ 8
             → parallel::single_member::decompress_parallel
               (v0.5.1 speculative-window two-pass; falls back via Err on
                search/speculation failure, never on partial-corrupt output;
-               4-core floor because total work is 2N and sequential ISA-L
-               wins outright below that)
+               8-core floor measured empirically: on a 4-core CI runner
+               sequential ISA-L 425 MB/s beats gzippy parallel 288 MB/s and
+               rapidgzip 330 MB/s; the algorithm's 2N compute work needs
+               ≥8 physical cores to outpace sequential)
         x86_64 (ISA-L available)        → isal_decompress::decompress_gzip_stream
         any arch, data > 1 GiB (no ISA-L) → decompress_single_member_streaming (zlib-ng)
         default                          → decompress_single_member_libdeflate

@@ -213,13 +213,15 @@ pub(crate) fn decompress_single_member<W: Write>(
     // parallel zlib-ng (4 × 600 = 2,400 MB/s).
     //
     // Physical-core floor: the algorithm's total compute work is 2N (phase 1
-    // empty-dict decode + phase 2 re-decode with speculative window). With
-    // < 4 physical cores, sequential ISA-L (425 MB/s on x86_64 ubuntu-latest)
-    // wins outright vs. 2N/T_physical wall. Above 4 cores parallel scales
-    // ~T_physical/2 and dominates. CI's 2-vCPU runners fall on the sequential
-    // side; the homelab and most workstations fall on the parallel side.
+    // empty-dict decode + phase 2 re-decode with speculative window). On a
+    // 4-physical-core CI runner, measured gzippy parallel at T=4 = 288 MB/s
+    // vs sequential ISA-L 425 MB/s — sequential wins outright. The 2N work +
+    // memory bandwidth contention at low core counts doesn't amortize. At
+    // 8+ physical cores the algorithm scales ~T_physical/2 and dominates.
+    // Setting the floor at 8 keeps gzippy on the faster sequential path
+    // for every hardware where measurement shows parallel loses.
     const MIN_PARALLEL_COMPRESSED: usize = 10 * 1024 * 1024;
-    const MIN_PHYSICAL_CORES_FOR_PARALLEL: usize = 4;
+    const MIN_PHYSICAL_CORES_FOR_PARALLEL: usize = 8;
     if crate::backends::isal_decompress::is_available()
         && num_threads > 1
         && data.len() > MIN_PARALLEL_COMPRESSED
