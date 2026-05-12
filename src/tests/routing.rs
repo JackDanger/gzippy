@@ -276,6 +276,65 @@ mod tests {
     }
 
     // =========================================================================
+    // Deletion-trap killer — the routing-assertion test from the v0.6 marker
+    // decoder premortem.
+    //
+    // Every prior marker-based attempt in this codebase has been deleted
+    // during cleanup because it lived outside the production CLI path. The
+    // only thing that prevents the next cleanup from doing the same is a
+    // test that fails when production routing *silently falls back* away
+    // from the marker pipeline. Output-equivalence tests don't catch that —
+    // gzippy will still produce correct output via the ISA-L sequential
+    // fallback even if the marker pipeline is gone.
+    //
+    // `MARKER_PIPELINE_RUNS` is a process-global counter incremented on
+    // every successful run of `parallel::single_member::decompress_parallel`.
+    // We snapshot it around a real CLI-shaped decode and assert it moved.
+    // On platforms where the parallel path is correctly gated off (arm64,
+    // non-ISA-L builds) the test is a no-op.
+    //
+    // See `docs/marker-decoder-plan.md` for the full rationale.
+    // =========================================================================
+    #[test]
+    fn test_marker_pipeline_actually_runs_on_x86_64_isal() {
+        use std::sync::atomic::Ordering;
+
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "fixture must exceed 10 MiB parallel gate (got {} bytes)",
+            compressed.len()
+        );
+
+        let before = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+            .load(Ordering::Relaxed);
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        assert_eq!(
+            output, original,
+            "output bytes wrong — but routing might also be broken; check the next assertion"
+        );
+        let after = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+            .load(Ordering::Relaxed);
+
+        // Only assert the counter moved on platforms where the parallel
+        // marker pipeline is the intended path. Elsewhere the routing
+        // correctly steers to libdeflate/zlib-ng and `after == before`.
+        #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+        assert!(
+            after > before,
+            "MARKER_PIPELINE_RUNS did not increment ({before} -> {after}); \
+             routing fell back silently. This is the failure mode that has \
+             caused every prior marker-decoder to be deleted as 'dead code.' \
+             Check that `decompress_single_member`'s parallel gate is \
+             reachable (ISA-L available, num_threads > 1, data > 10 MiB)."
+        );
+        #[cfg(not(all(target_arch = "x86_64", feature = "isal-compression")))]
+        let _ = (before, after); // suppress unused-vars on non-target platforms
+    }
+
+    // =========================================================================
     // Performance regression guard — the CI gap that masked v0.3.0.
     //
     // The single-member parallel path must not be SLOWER than the single-thread

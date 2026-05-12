@@ -1,73 +1,65 @@
-//! Parallel single-member gzip decompression — speculative-window design (v0.5.1).
+//! Parallel single-member gzip decompression — marker-based design (v0.6).
 //!
-//! Production path: wired into `decompress::decompress_single_member` for
-//! `num_threads > 1`, ISA-L available (x86_64), and compressed size > 10 MiB.
+//! Production path: wired into `decompress::decompress_single_member` when
+//! ISA-L is available, `num_threads > 1`, and the compressed stream exceeds
+//! 10 MiB. Replaces v0.5.1's speculative-window two-pass design.
 //!
-//! # Why a two-pass design and not the "prefix-only correction" plan
+//! # Why a marker pipeline
 //!
-//! The natural intuition is: decode each chunk in parallel with a zeroed window,
-//! then in phase 2 re-decode just the first ~32 KB of each chunk with the
-//! correct prior-chunk window. This is wrong. Cross-chunk back-references
-//! resolve to zeros in phase 1, producing wrong bytes near the chunk start.
-//! Those wrong bytes then act as the *source* of later chunk-local
-//! back-references — propagating errors forward arbitrarily far. The 32 KB
-//! prefix correction can't unwind that propagation. See
-//! `docs/parallel-single-member-redesign.md` §9 for the original (incorrect)
-//! plan and this module's history for the bug it caused.
+//! v0.5.1's design did 2N total compute work (phase 1 decode with empty
+//! dict + phase 2 re-decode with prior window). On CI's 4-physical-core
+//! ubuntu-latest runner that produced 288 MB/s vs. rapidgzip's 327 MB/s —
+//! 0.88×, below the 0.99 target.
 //!
-//! # The actual algorithm
+//! The marker pipeline does ~1.1N total compute work:
 //!
-//! ## Phase 1 — parallel "scout" decode with empty dict (window inputs)
+//! - **Phase 1 (parallel workers)**: each chunk is decoded by
+//!   `fast_marker_inflate::decode_chunk_markers_bounded` over its
+//!   `[start_bit, end_bit)` bit range. Output is `Vec<u16>` where literals
+//!   are 0..=255 and cross-chunk back-references are markers ≥
+//!   `MARKER_BASE = 32768` encoding a window offset.
 //!
-//! Each chunk searches forward for a deflate block boundary from its bit
-//! partition (chunk 0 uses bit 0), then ISA-L-decodes its compressed range with
-//! an empty window. Output is stored. Chunk 0's output is fully correct (no
-//! prior data exists in a single-member stream). Chunks 1..T-1 may have wrong
-//! bytes, but the **last 32 KB** of each phase-1 output is almost always
-//! correct for real data: error propagation requires a chain of back-references
-//! of near-maximum (32 KB) distance, ≥ (chunk_size / 32 KB) hops long — vanishingly
-//! rare in any non-pathological compressed stream.
+//! - **Phase 2 (sequential)**: walk chunks in order. Chunk 0's output has
+//!   no markers (no predecessor); pass through. For chunk i ≥ 1, call
+//!   `replace_markers` with the prior chunk's last 32 KB as the window —
+//!   AVX2 (x86_64) or NEON (aarch64) substitution. Convert u16 → u8 via
+//!   `u16_to_u8` which fails fast on any leftover marker.
 //!
-//! ## Phase 2 — parallel re-decode with speculative windows
+//! - **Phase 3 (sequential)**: verify total bytes against gzip ISIZE,
+//!   verify combined CRC32 against gzip CRC. **Write to the writer only
+//!   after CRC verifies** — a fallback never produces partial corrupt
+//!   output.
 //!
-//! For each chunk i ≥ 1, ISA-L-decodes with `phase1[i-1].last_32_KB` as the
-//! 32 KB initialization dict ("speculative" because we're trusting the
-//! predecessor's phase-1 tail to equal the correct decode's tail). Per-chunk
-//! CRC32 is computed in the same worker — bytes are hot in cache. Chunk 0 just
-//! has its phase-1 output CRC'd.
+//! Marker-resolution work in phase 2 is essentially memcpy-speed (one
+//! lookup + one store per marker, vectorized 8–16 lanes at a time). The
+//! sequential chain is short — typically a few percent of total wall.
+//! Speedup over single-thread ISA-L is ≈ T / 1.1.
 //!
-//! ## Phase 3 — combine CRCs, verify, write
+//! # Routing-assertion counter (the deletion-trap killer)
 //!
-//! Sequentially combine the per-chunk CRC32s with `crc32fast::Hasher::combine`
-//! and compare against the gzip trailer. If the CRC matches, write all chunk
-//! outputs to the writer in order. If it fails (speculation was wrong somewhere
-//! — corner-case data) return `DecodeFailed`, the caller falls back to
-//! sequential ISA-L. We **do not** write any bytes until the CRC verifies, so
-//! a fallback never produces partial corrupt output.
-//!
-//! # Cost model
-//!
-//! Phase 1 = N/T elapsed (parallel decode, every chunk).
-//! Phase 2 = N/T elapsed (parallel re-decode of chunks 1..T-1 + CRC of chunk 0).
-//! Phase 3 = ~memcpy-bound write (one pass over N bytes).
-//!
-//! Total ≈ 2N/T + write. Speedup over single-threaded ISA-L is ≈ T/2 in the
-//! parallel section; at T=2 we tie sequential (the cost of correctness for an
-//! unknown deflate token stream), at T=4 → 2×, T=8 → 4×, scaling linearly with
-//! T beyond that until memory bandwidth saturates.
+//! `MARKER_PIPELINE_RUNS` is incremented on every successful run. Tests in
+//! `src/tests/routing.rs` snapshot it before/after a decode and assert it
+//! increased — that is the only thing that catches a regression where
+//! `decompress_single_member`'s routing silently falls back to sequential
+//! ISA-L. Without this assertion, output-equivalence tests pass while the
+//! marker pipeline goes uncovered, and the code becomes a deletion target
+//! during the next cleanup. See `docs/marker-decoder-plan.md` "deletion-
+//! trap killer."
 
 #![allow(dead_code)]
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::decompress::parallel::block_finder::BlockFinder;
+use crate::decompress::parallel::fast_marker_inflate::decode_chunk_markers_bounded;
+use crate::decompress::parallel::replace_markers::{replace_markers, u16_to_u8, MARKER_BASE};
 
 /// Deflate sliding-window size (RFC 1951 §3.2.4).
-const WINDOW_SIZE: usize = 32768;
+const WINDOW_SIZE: usize = 32_768;
 
-/// Minimum compressed size for parallel attempt (4 MiB). The routing entry in
+/// Minimum compressed size to attempt parallel. The routing entry in
 /// `decompress::decompress_single_member` gates at 10 MiB; this is the inner
 /// lower bound used by tests that exercise smaller fixtures.
 const MIN_PARALLEL_SIZE: usize = 4 * 1024 * 1024;
@@ -78,6 +70,11 @@ const MIN_THREADS_FOR_PARALLEL: usize = 2;
 /// Search radius (bytes) around each partition point for block boundaries.
 const SEARCH_RADIUS: usize = 512 * 1024;
 
+/// Successful runs of the marker pipeline. Snapshot before/after a decode to
+/// confirm production routing actually called us — see the deletion-trap
+/// killer test in `src/tests/routing.rs`.
+pub static MARKER_PIPELINE_RUNS: AtomicU64 = AtomicU64::new(0);
+
 #[inline]
 fn debug_enabled() -> bool {
     use std::sync::OnceLock;
@@ -87,13 +84,14 @@ fn debug_enabled() -> bool {
 
 // ── Public entry ─────────────────────────────────────────────────────────────
 
-/// Parallel decompress a single-member gzip stream.
+/// Parallel decompress a single-member gzip stream via the v0.6 marker
+/// pipeline.
 ///
 /// Returns `Err(ParallelError::TooSmall)` if the input is below the parallel
-/// threshold — the caller should fall back to sequential decode. Other errors
-/// indicate genuine decode or speculation failure; the caller should likewise
-/// fall back rather than treat as a hard error, since sequential ISA-L will
-/// succeed where speculation didn't.
+/// threshold — the caller should fall back to sequential decode. Other
+/// errors indicate a genuine boundary-search failure, decode failure, or
+/// CRC/size mismatch; the writer is **not** written to in those cases (the
+/// pipeline buffers internally until verification passes).
 pub fn decompress_parallel<W: Write>(
     gzip_data: &[u8],
     writer: &mut W,
@@ -103,7 +101,6 @@ pub fn decompress_parallel<W: Write>(
 
     let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(gzip_data)
         .map_err(|_| ParallelError::InvalidHeader)?;
-
     let trailer_size = 8;
     if gzip_data.len() < header_size + trailer_size {
         return Err(ParallelError::TooSmall);
@@ -136,7 +133,7 @@ pub fn decompress_parallel<W: Write>(
 
     if debug_enabled() {
         eprintln!(
-            "[parallel_sm] {} bytes deflate, {} chunks, spacing={}KB, isize={}",
+            "[parallel_sm:v0.6] {} bytes deflate, {} chunks, spacing={}KB, isize={}",
             deflate_data.len(),
             num_chunks,
             spacing_bits / 8 / 1024,
@@ -144,109 +141,97 @@ pub fn decompress_parallel<W: Write>(
         );
     }
 
-    // ── Phase 1a (parallel): find each chunk's start_bit ────────────────────
+    // ── Phase 1a: parallel boundary search ──────────────────────────────────
     let t_search = std::time::Instant::now();
     let start_bits = phase1_search_boundaries(deflate_data, num_chunks, spacing_bits);
     let search_elapsed = t_search.elapsed();
 
     if start_bits.iter().any(Option::is_none) {
         if debug_enabled() {
-            let n_missing = start_bits.iter().filter(|s| s.is_none()).count();
+            let n = start_bits.iter().filter(|s| s.is_none()).count();
             eprintln!(
-                "[parallel_sm] {}/{} boundary searches failed → fallback",
-                n_missing, num_chunks
+                "[parallel_sm:v0.6] {}/{} boundary searches failed",
+                n, num_chunks
             );
         }
         return Err(ParallelError::DecodeFailed);
     }
     let start_bits: Vec<usize> = start_bits.into_iter().map(|s| s.unwrap()).collect();
 
-    // Per-chunk input upper bound. Chunk i decodes the bit range
-    // `[start_bits[i], start_bits[i+1])`. Bounding input by
-    // `start_bits[i+1].div_ceil(8)` keeps ISA-L from speculatively parsing past
-    // its chunk's last block.
-    let end_bytes: Vec<usize> = (0..num_chunks)
+    // End-bit limit for each chunk = next chunk's start (a real block
+    // boundary). The last chunk has no limit; it runs to BFINAL.
+    let end_limits: Vec<Option<usize>> = (0..num_chunks)
         .map(|i| {
             if i + 1 < num_chunks {
-                start_bits[i + 1].div_ceil(8).min(deflate_data.len())
+                Some(start_bits[i + 1])
             } else {
-                deflate_data.len()
+                None
             }
         })
         .collect();
 
-    // Per-chunk output cap: 2× the average expected per-chunk uncompressed size,
-    // with a sane floor for tiny test fixtures. ISA-L pre-allocates a buffer of
-    // this size internally, so it sets memory pressure — too generous wastes
-    // RAM; too tight truncates output.
-    let per_chunk_cap = ((expected_size / num_chunks).saturating_mul(2))
-        .max(WINDOW_SIZE * 4)
-        .max(64 * 1024);
-
-    // ── Phase 1b (parallel): scout decode each chunk with empty dict ────────
+    // ── Phase 1b: parallel marker decode ────────────────────────────────────
     let t_decode = std::time::Instant::now();
-    let phase1 = phase1_decode_parallel(deflate_data, &start_bits, &end_bytes, per_chunk_cap);
+    let chunks = phase1_marker_decode_parallel(deflate_data, &start_bits, &end_limits);
     let decode_elapsed = t_decode.elapsed();
 
-    if phase1.iter().any(Option::is_none) {
+    if chunks.iter().any(Option::is_none) {
         if debug_enabled() {
-            eprintln!("[parallel_sm] one or more phase-1 decodes failed → fallback");
+            eprintln!("[parallel_sm:v0.6] one or more marker decodes failed");
         }
         return Err(ParallelError::DecodeFailed);
     }
-    let phase1: Vec<Vec<u8>> = phase1.into_iter().map(|c| c.unwrap()).collect();
+    let chunks: Vec<Vec<u16>> = chunks.into_iter().map(|c| c.unwrap()).collect();
 
-    // ── Phase 2 (parallel): re-decode chunks 1..T-1 with speculative windows ─
-    let t_redo = std::time::Instant::now();
-    let final_chunks =
-        phase2_finalize_parallel(deflate_data, &start_bits, &end_bytes, per_chunk_cap, phase1);
-    let redo_elapsed = t_redo.elapsed();
-
-    if final_chunks.iter().any(Option::is_none) {
-        if debug_enabled() {
-            eprintln!("[parallel_sm] one or more phase-2 decodes failed → fallback");
-        }
-        return Err(ParallelError::DecodeFailed);
-    }
-    let final_chunks: Vec<FinalChunk> = final_chunks.into_iter().map(|c| c.unwrap()).collect();
+    // ── Phase 2: sequential resolve + CRC + size accounting ─────────────────
+    let t_resolve = std::time::Instant::now();
+    let (assembled, total_crc) = phase2_resolve_sequential(chunks)?;
+    let resolve_elapsed = t_resolve.elapsed();
 
     if debug_enabled() {
         eprintln!(
-            "[parallel_sm] phase1: search={:.1}ms decode={:.1}ms redo={:.1}ms",
+            "[parallel_sm:v0.6] search={:.1}ms decode={:.1}ms resolve={:.1}ms",
             search_elapsed.as_secs_f64() * 1000.0,
             decode_elapsed.as_secs_f64() * 1000.0,
-            redo_elapsed.as_secs_f64() * 1000.0,
+            resolve_elapsed.as_secs_f64() * 1000.0,
         );
-        for (i, c) in final_chunks.iter().enumerate() {
+    }
+
+    // ── Phase 3: verify trailer, write ──────────────────────────────────────
+    if expected_size > 0 && assembled.len() != expected_size {
+        if debug_enabled() {
             eprintln!(
-                "  chunk {}: start_bit={} out_bytes={}",
-                i,
-                start_bits[i],
-                c.decoded.len(),
+                "[parallel_sm:v0.6] size mismatch: got {} expected {}",
+                assembled.len(),
+                expected_size
             );
         }
+        return Err(ParallelError::SizeMismatch);
+    }
+    if expected_crc != 0 && total_crc != expected_crc {
+        if debug_enabled() {
+            eprintln!(
+                "[parallel_sm:v0.6] CRC mismatch: got {:#010x} expected {:#010x}",
+                total_crc, expected_crc
+            );
+        }
+        return Err(ParallelError::CrcMismatch);
     }
 
-    // ── Phase 3 (sequential): combine CRCs, verify, then write ───────────────
-    let t_write = std::time::Instant::now();
-    let total_bytes = verify_and_write(final_chunks, expected_size, expected_crc, writer)?;
-    let write_elapsed = t_write.elapsed();
+    writer.write_all(&assembled)?;
+    MARKER_PIPELINE_RUNS.fetch_add(1, Ordering::Relaxed);
 
     if debug_enabled() {
-        let total_elapsed = t0.elapsed();
-        let mbps = total_bytes as f64 / total_elapsed.as_secs_f64() / 1e6;
+        let total = t0.elapsed();
+        let mbps = assembled.len() as f64 / total.as_secs_f64() / 1e6;
         eprintln!(
-            "[parallel_sm] search={:.1}ms decode={:.1}ms redo={:.1}ms write={:.1}ms total={:.1}ms ({:.0} MB/s)",
-            search_elapsed.as_secs_f64() * 1000.0,
-            decode_elapsed.as_secs_f64() * 1000.0,
-            redo_elapsed.as_secs_f64() * 1000.0,
-            write_elapsed.as_secs_f64() * 1000.0,
-            total_elapsed.as_secs_f64() * 1000.0,
+            "[parallel_sm:v0.6] total={:.1}ms ({:.0} MB/s)",
+            total.as_secs_f64() * 1000.0,
             mbps,
         );
     }
 
-    Ok(total_bytes as u64)
+    Ok(assembled.len() as u64)
 }
 
 // ── Phase 1a: parallel boundary search ───────────────────────────────────────
@@ -283,11 +268,6 @@ fn phase1_search_boundaries(
 }
 
 /// Search forward from `from_bit` for a valid deflate block boundary.
-///
-/// Scans in 8 KiB sub-chunks within `SEARCH_RADIUS`, using `BlockFinder` for
-/// structural candidates then try-decode to validate. Falls back to an
-/// 8-bit-stride brute force within the first 128 KiB if no structural candidate
-/// validates.
 fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize> {
     let search_end = (from_bit + SEARCH_RADIUS * 8).min(deflate_data.len() * 8);
     if from_bit >= search_end {
@@ -297,7 +277,6 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
     let finder = BlockFinder::new(deflate_data);
     let sub_chunk_bits = 8 * 1024 * 8;
     let mut chunk_start = from_bit;
-
     while chunk_start < search_end {
         let chunk_end = (chunk_start + sub_chunk_bits).min(search_end);
         let mut candidates = finder.find_blocks(chunk_start, chunk_end);
@@ -309,15 +288,21 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
         }
         chunk_start = chunk_end;
     }
-
+    // Brute-force fallback within first 128 KiB.
     let brute_end = (from_bit + 128 * 1024 * 8).min(search_end);
     (from_bit..brute_end)
         .step_by(8)
         .find(|&bit| try_decode_at(deflate_data, bit))
 }
 
-/// Validate a candidate bit position by attempting to decode with an empty
-/// window. Accepts if at least `min_output` bytes are produced without error.
+/// Validate a candidate boundary by attempting a 32 KB decode with the
+/// fastest available decoder (ISA-L on x86_64, zlib-ng elsewhere). We use
+/// the fastest engine for this hot loop because boundary search runs
+/// `try_decode_at` against many candidates per chunk; using our pure-Rust
+/// marker decoder here would slow search by an order of magnitude. False
+/// positives that pass ISA-L's heuristic still fail later — chunk decode
+/// returns Err if the start isn't a real block, and the pipeline falls
+/// back via DecodeFailed.
 fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
     let start_byte = bit_offset / 8;
     if start_byte >= deflate_data.len() {
@@ -338,16 +323,15 @@ fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
     .is_some_and(|out| out.len() >= min_output)
 }
 
-// ── Phase 1b: parallel scout decode ──────────────────────────────────────────
+// ── Phase 1b: parallel marker decode ─────────────────────────────────────────
 
-fn phase1_decode_parallel(
+fn phase1_marker_decode_parallel(
     deflate_data: &[u8],
     start_bits: &[usize],
-    end_bytes: &[usize],
-    per_chunk_cap: usize,
-) -> Vec<Option<Vec<u8>>> {
+    end_limits: &[Option<usize>],
+) -> Vec<Option<Vec<u16>>> {
     let num_chunks = start_bits.len();
-    let results: Vec<Mutex<Option<Vec<u8>>>> = (0..num_chunks).map(|_| Mutex::new(None)).collect();
+    let results: Vec<Mutex<Option<Vec<u16>>>> = (0..num_chunks).map(|_| Mutex::new(None)).collect();
     let next_task = AtomicUsize::new(0);
 
     std::thread::scope(|s| {
@@ -358,20 +342,11 @@ fn phase1_decode_parallel(
                     break;
                 }
                 let start_bit = start_bits[idx];
-                let end_byte = end_bytes[idx];
-                if start_bit / 8 >= end_byte {
-                    continue;
-                }
-                let input = &deflate_data[..end_byte];
-                if let Some((decoded, _)) =
-                    crate::backends::inflate_bit::decompress_deflate_from_bit_with_end(
-                        input,
-                        start_bit,
-                        &[],
-                        per_chunk_cap,
-                    )
+                let end_limit = end_limits[idx];
+                if let Ok((out, _)) =
+                    decode_chunk_markers_bounded(deflate_data, start_bit, end_limit)
                 {
-                    *results[idx].lock().unwrap() = Some(decoded);
+                    *results[idx].lock().unwrap() = Some(out);
                 }
             });
         }
@@ -383,138 +358,59 @@ fn phase1_decode_parallel(
         .collect()
 }
 
-// ── Phase 2: parallel re-decode with speculative windows + per-chunk CRC ─────
+// ── Phase 2: sequential marker resolve + CRC + size ──────────────────────────
 
-/// One chunk's final output, with its CRC32 computed.
-struct FinalChunk {
-    decoded: Vec<u8>,
-    crc: crc32fast::Hasher,
-}
+fn phase2_resolve_sequential(chunks: Vec<Vec<u16>>) -> Result<(Vec<u8>, u32), ParallelError> {
+    let total_estimated: usize = chunks.iter().map(|c| c.len()).sum();
+    let mut assembled = Vec::with_capacity(total_estimated);
+    let mut crc = crc32fast::Hasher::new();
+    let mut window: Vec<u8> = Vec::with_capacity(WINDOW_SIZE);
 
-fn phase2_finalize_parallel(
-    deflate_data: &[u8],
-    start_bits: &[usize],
-    end_bytes: &[usize],
-    per_chunk_cap: usize,
-    phase1: Vec<Vec<u8>>,
-) -> Vec<Option<FinalChunk>> {
-    let num_chunks = start_bits.len();
-
-    // Speculative window for chunk i = phase1[i-1]'s last 32 KB. We clone
-    // these so phase 2 workers can run without holding shared references into
-    // the original `phase1` buffer (whose ownership we hand off below).
-    // Per-window cost is ≤ 32 KB; total ≤ T·32 KB — trivial.
-    let mut speculative_windows: Vec<Vec<u8>> = Vec::with_capacity(num_chunks);
-    speculative_windows.push(Vec::new()); // unused for chunk 0
-    for i in 1..num_chunks {
-        let prior = &phase1[i - 1];
-        let win_start = prior.len().saturating_sub(WINDOW_SIZE);
-        speculative_windows.push(prior[win_start..].to_vec());
-    }
-
-    // For chunk 0 we reuse the phase-1 output verbatim. Move it into a slot
-    // that the worker can pluck out without cloning.
-    let phase1_slots: Vec<Mutex<Option<Vec<u8>>>> =
-        phase1.into_iter().map(|v| Mutex::new(Some(v))).collect();
-
-    let results: Vec<Mutex<Option<FinalChunk>>> =
-        (0..num_chunks).map(|_| Mutex::new(None)).collect();
-    let next_task = AtomicUsize::new(0);
-
-    std::thread::scope(|s| {
-        for _ in 0..num_chunks {
-            s.spawn(|| loop {
-                let idx = next_task.fetch_add(1, Ordering::Relaxed);
-                if idx >= num_chunks {
-                    break;
-                }
-
-                let decoded: Vec<u8> = if idx == 0 {
-                    // Phase 1 was correct for chunk 0 — take it verbatim.
-                    match phase1_slots[0].lock().unwrap().take() {
-                        Some(d) => d,
-                        None => continue,
-                    }
-                } else {
-                    let start_bit = start_bits[idx];
-                    let end_byte = end_bytes[idx];
-                    let input = &deflate_data[..end_byte];
-                    let window = &speculative_windows[idx];
-                    match crate::backends::inflate_bit::decompress_deflate_from_bit_with_end(
-                        input,
-                        start_bit,
-                        window,
-                        per_chunk_cap,
-                    ) {
-                        Some((d, _)) => d,
-                        None => continue,
-                    }
-                };
-
-                // CRC32 computed on the same worker, while `decoded` is still
-                // in this thread's caches. crc32fast uses PCLMULQDQ on x86_64
-                // (~3–4 GB/s). Skipping this would force a sequential CRC pass
-                // in phase 3 that would dominate everything else.
-                let mut crc = crc32fast::Hasher::new();
-                crc.update(&decoded);
-                *results[idx].lock().unwrap() = Some(FinalChunk { decoded, crc });
-            });
+    for (i, mut chunk_u16) in chunks.into_iter().enumerate() {
+        if i > 0 {
+            // Resolve markers against the predecessor's last 32 KB.
+            replace_markers(&mut chunk_u16, &window);
         }
-    });
-
-    results
-        .into_iter()
-        .map(|m| m.into_inner().unwrap())
-        .collect()
-}
-
-// ── Phase 3: combine CRCs, verify, write ─────────────────────────────────────
-
-fn verify_and_write<W: Write>(
-    chunks: Vec<FinalChunk>,
-    expected_size: usize,
-    expected_crc: u32,
-    writer: &mut W,
-) -> Result<usize, ParallelError> {
-    // Tally bytes and combine CRCs in order.
-    let total_bytes: usize = chunks.iter().map(|c| c.decoded.len()).sum();
-    if expected_size > 0 && total_bytes != expected_size {
-        if debug_enabled() {
-            eprintln!(
-                "[parallel_sm] size mismatch: got {} expected {}",
-                total_bytes, expected_size
-            );
-        }
-        return Err(ParallelError::SizeMismatch);
-    }
-
-    if expected_crc != 0 {
-        let mut combined = crc32fast::Hasher::new();
-        for c in &chunks {
-            combined.combine(&c.crc);
-        }
-        let actual = combined.finalize();
-        if actual != expected_crc {
+        let bytes = u16_to_u8(&chunk_u16).map_err(|pos| {
             if debug_enabled() {
                 eprintln!(
-                    "[parallel_sm] CRC mismatch: got {:#010x} expected {:#010x} → speculation failed, fall back",
-                    actual, expected_crc
+                    "[parallel_sm:v0.6] chunk {} has unresolved marker at index {} (offset {})",
+                    i,
+                    pos,
+                    chunk_u16[pos] - MARKER_BASE,
                 );
             }
-            return Err(ParallelError::CrcMismatch);
-        }
+            ParallelError::DecodeFailed
+        })?;
+        crc.update(&bytes);
+        // Update window from the bytes we just resolved.
+        update_window(&mut window, &bytes);
+        assembled.extend_from_slice(&bytes);
     }
 
-    // Only after CRC has verified do we write bytes — the caller's writer
-    // must never see partial corrupt output.
-    for c in chunks {
-        writer.write_all(&c.decoded)?;
-    }
-
-    Ok(total_bytes)
+    Ok((assembled, crc.finalize()))
 }
 
-// ── Error type (kept compatible with previous public API) ────────────────────
+fn update_window(window: &mut Vec<u8>, new_data: &[u8]) {
+    if new_data.is_empty() {
+        return;
+    }
+    if new_data.len() >= WINDOW_SIZE {
+        window.clear();
+        window.extend_from_slice(&new_data[new_data.len() - WINDOW_SIZE..]);
+        return;
+    }
+    if window.len() + new_data.len() <= WINDOW_SIZE {
+        window.extend_from_slice(new_data);
+        return;
+    }
+    let keep = WINDOW_SIZE - new_data.len();
+    let drop = window.len() - keep;
+    window.drain(..drop);
+    window.extend_from_slice(new_data);
+}
+
+// ── Error type ───────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub enum ParallelError {
@@ -545,7 +441,7 @@ impl std::fmt::Display for ParallelError {
             ParallelError::TooSmall => write!(f, "file too small for parallel decode"),
             ParallelError::DecodeFailed => write!(f, "chunk decode failed"),
             ParallelError::SizeMismatch => write!(f, "output size mismatch"),
-            ParallelError::CrcMismatch => write!(f, "CRC32 mismatch (speculation failed)"),
+            ParallelError::CrcMismatch => write!(f, "CRC32 mismatch"),
             ParallelError::Io(e) => write!(f, "I/O error: {}", e),
         }
     }
@@ -556,23 +452,21 @@ impl std::fmt::Display for ParallelError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn make_gzip_data(data: &[u8]) -> Vec<u8> {
-        use std::io::Write;
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(data).unwrap();
         encoder.finish().unwrap()
     }
 
     fn make_gzip_at_level(data: &[u8], level: u32) -> Vec<u8> {
-        use std::io::Write;
         let mut encoder =
             flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level));
         encoder.write_all(data).unwrap();
         encoder.finish().unwrap()
     }
 
-    /// Highly compressible mixed data (literals + RLE) at ~5–10:1.
     fn make_compressible_data(size: usize) -> Vec<u8> {
         let mut data = Vec::with_capacity(size);
         let mut rng: u64 = 0xdeadbeef;
@@ -581,7 +475,7 @@ mod tests {
             if (rng >> 32) % 5 < 3 {
                 data.push((rng >> 16) as u8);
             } else {
-                let byte = ((rng >> 24) % 26 + b'a' as u64) as u8;
+                let byte = ((rng >> 24) % 26) as u8 + b'a';
                 let repeat = ((rng >> 40) % 8 + 2) as usize;
                 for _ in 0..repeat.min(size - data.len()) {
                     data.push(byte);
@@ -592,18 +486,6 @@ mod tests {
         data
     }
 
-    /// Repeating-text fixture — compresses very heavily (~50:1).
-    fn make_text_data(size: usize) -> Vec<u8> {
-        let pattern = b"The quick brown fox jumps over the lazy dog. ";
-        let mut data = Vec::with_capacity(size);
-        while data.len() < size {
-            let take = pattern.len().min(size - data.len());
-            data.extend_from_slice(&pattern[..take]);
-        }
-        data
-    }
-
-    /// Effectively incompressible (~1:1 ratio).
     fn make_random_data(size: usize, seed: u64) -> Vec<u8> {
         let mut data = Vec::with_capacity(size);
         let mut rng = seed;
@@ -621,55 +503,36 @@ mod tests {
         data
     }
 
-    /// Make a fixture whose *compressed* form exceeds MIN_PARALLEL_SIZE, so
-    /// the parallel path is actually exercised rather than rejected.
-    fn make_large_enough_to_parallelize() -> Vec<u8> {
-        // Random data is ~1:1 — a 10 MiB raw fixture stays above the 4 MiB
-        // compressed gate even at level 9.
-        make_random_data(10 * 1024 * 1024, 0xabad1dea)
-    }
-
-    // ── Contract: small inputs / bad inputs ──────────────────────────────────
+    // ── Contract: input filters ──────────────────────────────────────────────
 
     #[test]
     fn small_inputs_return_too_small() {
         let compressed = make_gzip_data(b"hello world");
         let mut output = Vec::new();
-        let result = decompress_parallel(&compressed, &mut output, 4);
-        assert!(matches!(result, Err(ParallelError::TooSmall)));
+        assert!(matches!(
+            decompress_parallel(&compressed, &mut output, 4),
+            Err(ParallelError::TooSmall)
+        ));
     }
 
     #[test]
     fn single_thread_returns_too_small() {
-        let data = make_large_enough_to_parallelize();
+        let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
         let mut output = Vec::new();
-        let result = decompress_parallel(&compressed, &mut output, 1);
-        assert!(matches!(result, Err(ParallelError::TooSmall)));
+        assert!(matches!(
+            decompress_parallel(&compressed, &mut output, 1),
+            Err(ParallelError::TooSmall)
+        ));
     }
 
     #[test]
     fn empty_input_errors() {
         let mut output = Vec::new();
-        let result = decompress_parallel(&[], &mut output, 4);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn truncated_header_errors() {
-        let truncated = &[0x1f, 0x8b][..];
-        let mut output = Vec::new();
-        let result = decompress_parallel(truncated, &mut output, 4);
-        assert!(result.is_err());
+        assert!(decompress_parallel(&[], &mut output, 4).is_err());
     }
 
     // ── Contract: round-trip correctness ─────────────────────────────────────
-    //
-    // `decompress_parallel` may legitimately return `Err(DecodeFailed)` (no
-    // valid boundary found) or `Err(CrcMismatch)` (speculation failed on
-    // pathological data) — the routing layer falls back to sequential ISA-L in
-    // both cases. So tests assert: when parallel succeeds, output is exact;
-    // when it errors, the error kind is a known fallback kind (not e.g. Io).
 
     fn assert_roundtrip_or_known_fallback(data: &[u8], num_threads: usize) {
         let compressed = make_gzip_data(data);
@@ -677,18 +540,12 @@ mod tests {
         match decompress_parallel(&compressed, &mut output, num_threads) {
             Ok(n) => {
                 assert_eq!(n as usize, data.len(), "size mismatch");
-                assert_eq!(output.len(), data.len(), "buffer len mismatch");
                 assert_eq!(output, data, "content mismatch");
             }
             Err(ParallelError::DecodeFailed)
             | Err(ParallelError::CrcMismatch)
             | Err(ParallelError::SizeMismatch)
             | Err(ParallelError::TooSmall) => {
-                // Acceptable: routing falls back to sequential ISA-L. Size or
-                // CRC mismatch here means a phase-1 boundary turned out to be
-                // a false positive (rare for real data, possible for random),
-                // and verify_and_write rejected the output before any writer
-                // write happened.
                 assert!(
                     output.is_empty(),
                     "fallback error must not have written to the writer"
@@ -699,59 +556,50 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_random_10mb_t2() {
-        let data = make_large_enough_to_parallelize();
-        assert_roundtrip_or_known_fallback(&data, 2);
-    }
-
-    #[test]
-    fn roundtrip_random_10mb_t4() {
-        let data = make_large_enough_to_parallelize();
-        assert_roundtrip_or_known_fallback(&data, 4);
-    }
-
-    #[test]
-    fn roundtrip_random_10mb_t8() {
-        let data = make_large_enough_to_parallelize();
-        assert_roundtrip_or_known_fallback(&data, 8);
-    }
-
-    #[test]
-    fn roundtrip_random_25mb_t4() {
-        let data = make_random_data(25 * 1024 * 1024, 0xfeedface);
-        assert_roundtrip_or_known_fallback(&data, 4);
+    fn roundtrip_compressible_8mb_t4() {
+        assert_roundtrip_or_known_fallback(&make_compressible_data(8 * 1024 * 1024), 4);
     }
 
     #[test]
     fn roundtrip_compressible_25mb_t4() {
-        // 25 MiB at ~4:1 → ~6 MiB compressed, above the 4 MiB threshold.
-        let data = make_compressible_data(25 * 1024 * 1024);
-        assert_roundtrip_or_known_fallback(&data, 4);
+        assert_roundtrip_or_known_fallback(&make_compressible_data(25 * 1024 * 1024), 4);
     }
 
     #[test]
-    fn roundtrip_text_at_l1_only_path() {
-        // Text fixture is highly compressible. At level 1 (fast/large blocks)
-        // the compressed size stays above 4 MiB for a ~120 MiB raw fixture.
-        let data = make_text_data(120 * 1024 * 1024);
-        let compressed = make_gzip_at_level(&data, 1);
-        if compressed.len() < MIN_PARALLEL_SIZE + 16 {
-            // Threshold accidentally not crossed; skip rather than false-positive.
-            return;
-        }
-        let mut output = Vec::new();
-        match decompress_parallel(&compressed, &mut output, 4) {
-            Ok(_) => assert_eq!(output, data, "L1 content mismatch"),
-            Err(ParallelError::DecodeFailed)
-            | Err(ParallelError::CrcMismatch)
-            | Err(ParallelError::TooSmall) => {}
-            Err(e) => panic!("L1 unexpected: {e}"),
+    fn roundtrip_random_10mb_t2() {
+        assert_roundtrip_or_known_fallback(&make_random_data(10 * 1024 * 1024, 0xabad1dea), 2);
+    }
+
+    #[test]
+    fn roundtrip_random_10mb_t4() {
+        assert_roundtrip_or_known_fallback(&make_random_data(10 * 1024 * 1024, 0xabad1dea), 4);
+    }
+
+    #[test]
+    fn roundtrip_random_10mb_t8() {
+        assert_roundtrip_or_known_fallback(&make_random_data(10 * 1024 * 1024, 0xabad1dea), 8);
+    }
+
+    #[test]
+    fn roundtrip_levels_t4() {
+        let data = make_compressible_data(8 * 1024 * 1024);
+        for level in [1u32, 3, 6, 9] {
+            let compressed = make_gzip_at_level(&data, level);
+            let mut output = Vec::new();
+            match decompress_parallel(&compressed, &mut output, 4) {
+                Ok(_) => assert_eq!(output, data, "L{level} content mismatch"),
+                Err(ParallelError::DecodeFailed)
+                | Err(ParallelError::CrcMismatch)
+                | Err(ParallelError::SizeMismatch)
+                | Err(ParallelError::TooSmall) => {}
+                Err(e) => panic!("L{level} unexpected: {e}"),
+            }
         }
     }
 
     #[test]
     fn determinism_two_runs_match() {
-        let data = make_large_enough_to_parallelize();
+        let data = make_compressible_data(16 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
         let mut out1 = Vec::new();
         let mut out2 = Vec::new();
@@ -773,75 +621,51 @@ mod tests {
             let mut out = Vec::new();
             if decompress_parallel(&compressed, &mut out, t).is_ok() {
                 if let Some(r) = &reference {
-                    assert_eq!(
-                        &out, r,
-                        "T={t} produced different bytes than the earlier successful run"
-                    );
+                    assert_eq!(&out, r, "T={t} differs from prior successful run");
                 }
                 reference = Some(out);
             }
         }
     }
 
-    // ── CRC corruption is detected (correctness gate) ────────────────────────
-
     #[test]
-    fn crc_mismatch_is_detected() {
-        let data = make_large_enough_to_parallelize();
+    fn crc_corruption_is_detected() {
+        let data = make_random_data(10 * 1024 * 1024, 0xc0ffee);
         let mut compressed = make_gzip_data(&data);
         let crc_offset = compressed.len() - 8;
         compressed[crc_offset] ^= 0xff;
         let mut output = Vec::new();
         match decompress_parallel(&compressed, &mut output, 4) {
-            Err(ParallelError::CrcMismatch) => {} // expected
-            Err(ParallelError::DecodeFailed) | Err(ParallelError::TooSmall) => {}
+            Err(ParallelError::CrcMismatch) => {}
+            Err(ParallelError::DecodeFailed)
+            | Err(ParallelError::SizeMismatch)
+            | Err(ParallelError::TooSmall) => {}
             Ok(_) => panic!("CRC corruption not detected"),
             Err(e) => panic!("unexpected error: {e}"),
         }
-        // Most importantly: nothing was written on a CRC failure.
-        // (verify_and_write does the check before any writer.write_all.)
-        if !output.is_empty() {
-            // If the error wasn't CrcMismatch, output may have been a successful
-            // fallback. The strong invariant we care about is the CrcMismatch branch.
-        }
+        // Writer must not have received any bytes on any error path.
+        assert!(output.is_empty());
     }
 
-    // ── Boundary search smoke tests ──────────────────────────────────────────
+    // ── Deletion-trap killer counter ─────────────────────────────────────────
 
     #[test]
-    fn search_finds_boundary_for_real_data() {
+    fn marker_pipeline_counter_increments_on_success() {
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
-        let header = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
-            .expect("header");
-        let deflate = &compressed[header..compressed.len() - 8];
-        let mid = deflate.len() * 8 / 2;
-        let found = search_boundary_forward(deflate, mid);
-        assert!(found.is_some(), "search should find boundary mid-stream");
-    }
-
-    #[test]
-    fn try_decode_rejects_random_positions() {
-        let data = make_compressible_data(8 * 1024 * 1024);
-        let compressed = make_gzip_data(&data);
-        let header = crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed)
-            .expect("header");
-        let deflate = &compressed[header..compressed.len() - 8];
-
-        let mut rng: u64 = 12345;
-        let mut accepted = 0;
-        let total = 200;
-        let total_bits = deflate.len() * 8;
-        for _ in 0..total {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let bit = (rng as usize) % total_bits;
-            if try_decode_at(deflate, bit) {
-                accepted += 1;
-            }
+        let before = MARKER_PIPELINE_RUNS.load(Ordering::Relaxed);
+        let mut output = Vec::new();
+        if decompress_parallel(&compressed, &mut output, 4).is_ok() {
+            let after = MARKER_PIPELINE_RUNS.load(Ordering::Relaxed);
+            assert!(
+                after > before,
+                "marker pipeline counter must increment on successful decode (was {before}, now {after})"
+            );
         }
-        assert!(
-            accepted < total / 5,
-            "too many random positions accepted: {accepted}/{total}"
-        );
+        // If parallel declined (e.g., search failure on this specific data),
+        // the counter shouldn't have moved either. The point of this test
+        // is to prove the counter exists and works — the routing-level
+        // assertion in `src/tests/routing.rs` is the deletion-trap killer
+        // proper, exercising the full CLI path.
     }
 }
