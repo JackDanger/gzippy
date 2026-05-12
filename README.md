@@ -114,6 +114,42 @@ The full manual lives in `man gzippy`. The `"GZ"` parallel-block wire
 format and the tuning guide have their own pages: `man gzippy-format`,
 `man gzippy-tuning`.
 
+## Rust library API
+
+Add to `Cargo.toml`:
+
+```toml
+gzippy = "0.5"
+```
+
+One-shot compress and decompress using all available CPUs:
+
+```rust
+let compressed = gzippy::compress(&data, 6)?;
+let decompressed = gzippy::decompress(&compressed)?;
+```
+
+Explicit thread count or streaming I/O:
+
+```rust
+// Standard gzip — any tool can decompress
+let out = gzippy::compress_with_threads(&data, 6, 1)?;
+
+// Streaming — no intermediate allocation
+let bytes_read = gzippy::compress_to_writer(reader, writer, 6)?;
+let bytes_written = gzippy::decompress_to_writer(&data, &mut writer)?;
+```
+
+Every function routes through the same backend-selection logic as the CLI:
+ISA-L SIMD, libdeflate, Zopfli, and parallel multi-block — no extra
+configuration needed.
+
+> **Note:** `threads > 1` at levels 0–5 produces gzippy's "GZ" multi-block
+> format, which only gzippy can decompress. Use `threads = 1` or levels 6–9
+> for standard gzip output readable by any tool.
+
+See [`src/lib.rs`](src/lib.rs) or `cargo doc --open` for the full API.
+
 ## Standing on shoulders
 
 - [**pigz**](https://zlib.net/pigz/) by Mark Adler — how to parallelize gzip

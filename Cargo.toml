@@ -1,12 +1,12 @@
 [package]
 name = "gzippy"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
-description = "The fastest parallel gzip. Drop-in replacement for gzip and pigz."
+description = "The fastest parallel gzip. Drop-in replacement for gzip and pigz, and a Rust library."
 license = "Zlib"
 repository = "https://github.com/jackdanger/gzippy"
 homepage = "https://github.com/jackdanger/gzippy"
-documentation = "https://github.com/jackdanger/gzippy#readme"
+documentation = "https://docs.rs/gzippy"
 readme = "README.md"
 keywords = ["gzip", "compression", "parallel", "pigz", "zlib"]
 categories = ["compression", "command-line-utilities"]
