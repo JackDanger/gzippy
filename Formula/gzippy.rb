@@ -1,7 +1,7 @@
 class Gzippy < Formula
   desc "Fastest parallel gzip — drop-in replacement for gzip and gunzip"
   homepage "https://github.com/JackDanger/gzippy"
-  version "0.5.0"
+  version "0.6.0"
   license "Zlib"
 
   on_macos do

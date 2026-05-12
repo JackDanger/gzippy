@@ -237,6 +237,21 @@ pub fn decompress_raw(data: &[u8]) -> GzippyResult<Vec<u8>> {
     decompress::decompress_raw_bytes(data)
 }
 
+/// Compress `data` as raw DEFLATE (no gzip wrapper). Used by 7zippy's Deflate
+/// coder and other formats that embed DEFLATE without the gzip envelope.
+///
+/// `level` is clamped to `0..=12`. Alias for [`compress_raw`].
+pub fn deflate_encode(data: &[u8], level: u8) -> GzippyResult<Vec<u8>> {
+    compress::compress_raw_bytes(data, level)
+}
+
+/// Decompress a raw DEFLATE byte slice.
+///
+/// Returns an error if `data` is not valid DEFLATE. Alias for [`decompress_raw`].
+pub fn deflate_decode(data: &[u8]) -> GzippyResult<Vec<u8>> {
+    decompress::decompress_raw_bytes(data)
+}
+
 // =============================================================================
 // Routing inspection
 // =============================================================================
