@@ -177,6 +177,7 @@ pub struct VectorTable {
 }
 
 impl VectorTable {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             table: Box::new([VectorEntry::default(); VECTOR_TABLE_SIZE]),

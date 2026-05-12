@@ -597,7 +597,7 @@ pub unsafe fn decode_8_gather(
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::missing_safety_doc)]
 pub unsafe fn decode_8_gather(
     _table: &GatherTable,
     _bit_positions: &[u64; 8],

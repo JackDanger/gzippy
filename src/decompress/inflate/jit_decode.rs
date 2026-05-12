@@ -436,6 +436,7 @@ pub struct DecoderCache {
 }
 
 impl DecoderCache {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             decoders: HashMap::new(),

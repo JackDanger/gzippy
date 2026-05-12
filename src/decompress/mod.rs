@@ -104,6 +104,24 @@ pub fn decompress_gzip_to_writer<W: Write + Send>(
 }
 
 // =============================================================================
+// Library API
+// =============================================================================
+
+/// Decompress gzip data with an explicit thread count.
+///
+/// Uses gzippy's full routing table (parallel bgzf, parallel multi-member,
+/// ISA-L single-member, libdeflate one-shot) based on the input and
+/// the requested thread count.
+#[allow(dead_code)] // called from lib.rs; unused in the binary
+pub fn decompress_bytes<W: Write + Send>(
+    data: &[u8],
+    writer: &mut W,
+    num_threads: usize,
+) -> GzippyResult<u64> {
+    decompress_gzip_libdeflate(data, writer, num_threads.max(1))
+}
+
+// =============================================================================
 // Core engine — all pub(crate) so tests can reach them directly
 // =============================================================================
 
