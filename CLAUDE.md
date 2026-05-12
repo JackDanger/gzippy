@@ -26,7 +26,8 @@ Input → decompress::mod: decompress_gzip_libdeflate
   └─ Single-member?
         ISA-L + T>1 + compressed > 10 MiB
             → parallel::single_member::decompress_parallel
-              (rapidgzip-style speculation + ISA-L inflatePrime; v0.3.0)
+              (v0.5.1 speculative-window two-pass; falls back via Err on
+               search/speculation failure, never on partial-corrupt output)
         x86_64 (ISA-L available)        → isal_decompress::decompress_gzip_stream
         any arch, data > 1 GiB (no ISA-L) → decompress_single_member_streaming (zlib-ng)
         default                          → decompress_single_member_libdeflate
@@ -58,11 +59,18 @@ call site in the routing table above, and add a strict correctness test (no
 silent fallback). When `make ship` confirms the win, lift the gate. When
 abandoned, delete the module — `main` does not host dead code.
 
-Regression test that locks in the parallel single-member wiring:
-`tests::routing::tests::test_single_member_routing_multithread`. It runs
-`decompress_single_member(T=4)` on a 24 MiB input and asserts byte-perfect
-output — covering both \"parallel path takes the input\" and \"falls back
-correctly when speculation fails on adversarial chunks.\"
+Two regression tests lock the parallel single-member wiring:
+
+1. `tests::routing::tests::test_single_member_routing_multithread` — runs
+   `decompress_single_member(T=4)` on a 24 MiB input and asserts byte-perfect
+   output. Covers "parallel path takes the input" and "falls back correctly
+   when speculation fails on adversarial chunks."
+
+2. `tests::routing::tests::test_single_member_parallel_not_slower_than_sequential`
+   — runs the same fixture at T=1 (sequential) and T=4 (parallel) and asserts
+   `parallel_elapsed < 1.3 × sequential_elapsed`. This is the local-CI guard
+   that would have caught the v0.3.0 regression (parallel was 1.75× slower
+   than sequential).
 
 ## Hard-Won Lessons
 
@@ -80,11 +88,33 @@ Streaming path only for files > 1 GiB. ISA-L is unavailable on arm64; the parall
 single-member path is gated on `isal_decompress::is_available()` so arm64 never
 takes it.
 
-**v0.3.0 — parallel single-member**: ISA-L `inflatePrime` (rapidgzip's pattern from
-`isal.hpp`) re-decodes confirmed chunks at non-byte-aligned bit offsets at full
-ISA-L SIMD speed (~1500 MB/s/thread), replacing the prior pure-Rust marker decoder
-(22 MB/s/thread). Wired into `decompress::decompress_single_member` behind
+**v0.5.1 — parallel single-member, speculative-window design** (May 2026): replaced
+the v0.3.0 "phase-2 redecodes everything sequentially" bug with a true two-pass
+parallel design. Phase 1 decodes each chunk with an empty dict in parallel
+(ISA-L, ~1500 MB/s/thread). Phase 2 re-decodes chunks 1..T-1 in parallel using
+each predecessor's phase-1 last 32 KB as a *speculative* dict — almost always
+correct on real data (error propagation requires ≥ chunk_size/32 KB consecutive
+near-max-distance back-references). Phase 3 combines per-chunk CRC32s (computed
+in phase 2 workers via `crc32fast::Hasher::combine`), verifies against the gzip
+trailer, then writes — so a failed speculation never produces partial output
+to the writer. Speedup ≈ T/2; ties sequential at T=2 (CI), scales to 4× at T=8.
+Wired into `decompress::decompress_single_member` behind
 `isal_decompress::is_available() && num_threads > 1 && data.len() > 10 MiB`.
+The old "32 KB prefix correction" plan (`docs/parallel-single-member-redesign.md`)
+was wrong: cross-chunk back-references resolve to zeros in phase 1, then propagate
+forward via chunk-local back-references arbitrarily far — the prefix correction
+can't unwind that. Test
+`tests::routing::tests::test_single_member_parallel_not_slower_than_sequential`
+catches regressions of the v0.3.0 class before push.
+
+**v0.3.0 — parallel single-member, BUGGY (superseded by v0.5.1)**: ISA-L
+`inflatePrime` re-decodes "confirmed chunks" at non-byte-aligned bit offsets.
+But phase 1 stored only `(start_bit, end_bit)` — the decoded bytes were
+discarded, and phase 2 ended up re-decoding the entire stream sequentially.
+Net result: 1.75× *slower* than sequential. The CI guards at the time were
+absolute (vs rapidgzip/pigz) without a "parallel ≥ sequential" floor, so the
+regression slipped through. Both the algorithm and the missing guard are fixed
+in v0.5.1.
 
 ## Branch and PR Workflow
 

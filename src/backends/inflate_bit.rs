@@ -17,7 +17,11 @@
 //! end_bit = start_bit + consumed = simplifies to the formula above regardless of bit_skip.
 
 /// Always true — zlib-ng is a static dep available on all platforms.
+///
+/// Currently no production call site gates on this (the universal entrypoints
+/// below always succeed). Retained for diagnostics / future routing.
 #[inline]
+#[allow(dead_code)]
 pub fn is_available() -> bool {
     true
 }

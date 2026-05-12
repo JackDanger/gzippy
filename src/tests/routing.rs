@@ -275,6 +275,75 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // Performance regression guard — the CI gap that masked v0.3.0.
+    //
+    // The single-member parallel path must not be SLOWER than the single-thread
+    // ISA-L baseline on the same input. v0.3.0–v0.5.0 had a buggy speculation
+    // design that re-decoded the entire stream sequentially in phase 2; the
+    // parallel path ran at ~1.75× the elapsed time of pure sequential. The CI
+    // benchmark thresholds at the time were absolute (vs. rapidgzip/pigz) and
+    // had been lowered specifically to let the regressed numbers pass.
+    //
+    // This test is run by every `cargo test` and so catches the same class of
+    // regression locally, before push. The CI benchmark in
+    // .github/workflows/benchmarks.yml provides the cross-tool comparison.
+    //
+    // Threshold: parallel must complete in ≤ 1.3× sequential elapsed time.
+    // On a true >=4-core machine, parallel should be ~2× faster than sequential
+    // (a ratio well below 1.0); on a 2-vCPU CI runner with T=4 (4 threads on 2
+    // cores), the algorithm's 2N total work runs in ~N/core elapsed and
+    // approximately matches sequential. The 1.3× ceiling allows ample noise
+    // headroom while still catching the v0.3.0-class 1.75× regression.
+    // =========================================================================
+    #[test]
+    fn test_single_member_parallel_not_slower_than_sequential() {
+        // Same fixture shape as the routing-correctness test above. Clears the
+        // 10 MiB parallel-path gate.
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "fixture must exceed 10 MiB parallel gate (got {} bytes)",
+            compressed.len()
+        );
+
+        // Helper: best of 3 runs, to dampen noise.
+        let bench = |threads: usize| -> std::time::Duration {
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..3 {
+                let mut sink = Vec::with_capacity(original.len());
+                let t = std::time::Instant::now();
+                crate::decompress::decompress_single_member(&compressed, &mut sink, threads)
+                    .expect("decompress");
+                let elapsed = t.elapsed();
+                assert_eq!(
+                    sink.len(),
+                    original.len(),
+                    "T={threads} produced wrong byte count"
+                );
+                best = best.min(elapsed);
+            }
+            best
+        };
+
+        let seq = bench(1);
+        let par = bench(4);
+
+        let ratio = par.as_secs_f64() / seq.as_secs_f64().max(1e-9);
+        let seq_mbps = (original.len() as f64) / seq.as_secs_f64() / 1e6;
+        let par_mbps = (original.len() as f64) / par.as_secs_f64() / 1e6;
+        eprintln!(
+            "single-member: sequential={seq_mbps:.0} MB/s  parallel(T=4)={par_mbps:.0} MB/s  ratio={ratio:.2}"
+        );
+
+        assert!(
+            ratio < 1.30,
+            "parallel single-member must not be > 1.3× slower than sequential: \
+             par={par:?} seq={seq:?} ratio={ratio:.2}"
+        );
+    }
+
     /// 60% random / 40% short repetition — compresses to ~60% of original.
     /// Sized to clear the 10 MiB parallel-path gate without being huge.
     fn make_low_entropy_data(size: usize) -> Vec<u8> {
