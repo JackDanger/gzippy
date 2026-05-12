@@ -109,7 +109,7 @@ def normalize_compression_result(data: dict, source_file: str) -> list:
                 "threads": r.get("threads", 1),
                 "time": r.get("median", r.get("time", 0)),
                 "size": r.get("output_size", 0),
-                "speed": r.get("speed", 0),
+                "speed": r.get("speed_mbps", r.get("speed", 0)),
                 "data_type": data_type,
                 "size_mb": data.get("size_mb", 0),
             })
@@ -122,7 +122,7 @@ def normalize_compression_result(data: dict, source_file: str) -> list:
                 "threads": data.get("threads", r.get("threads", 1)),
                 "time": r.get("median", r.get("time", 0)),
                 "size": r.get("output_size", r.get("size", 0)),
-                "speed": r.get("speed", 0),
+                "speed": r.get("speed_mbps", r.get("speed", 0)),
                 "data_type": data_type,
                 "size_mb": data.get("size_mb", 0),
             })
