@@ -1,8 +1,7 @@
 //! Compression engine — pure bytes-in / bytes-out dispatch.
 //!
-//! Entry points for the I/O layer are in `io`. This module only contains
-//! `compress_with_pipeline`, which selects and drives the best available
-//! backend for a given (level, threads) pair.
+//! Entry points for the I/O layer are in `io`. This module contains
+//! `compress_with_pipeline` (routing engine) and `compress_bytes` (library API).
 
 pub mod io;
 pub mod optimization;
@@ -169,4 +168,47 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
     }
     let optimizer = SimpleOptimizer::new(opt_config.clone()).with_header_info(header_info.clone());
     optimizer.compress(reader, writer).map_err(|e| e.into())
+}
+
+// =============================================================================
+// Library API
+// =============================================================================
+
+/// Compress data using gzippy's full routing table.
+///
+/// Selects the fastest backend for the given `level` (0–12) and `threads`:
+/// - T1 L0–3 + ISA-L  → ISA-L SIMD streaming
+/// - T1 L1–5          → libdeflate one-shot (ratio probe) or flate2/zlib-ng
+/// - T1 L6–9          → flate2/zlib-ng streaming
+/// - T>1 L0–5         → `ParallelGzEncoder` (gzippy "GZ" multi-block format)
+/// - T>1 L6–9         → `PipelinedGzEncoder` (single-member gzip-compatible)
+/// - L11              → Zopfli
+#[allow(dead_code)] // called from lib.rs; unused in the binary
+pub fn compress_bytes<R: Read, W: Write + Send>(
+    reader: R,
+    writer: W,
+    level: u8,
+    threads: usize,
+) -> GzippyResult<u64> {
+    use crate::compress::optimization::{ContentType, OptimizationConfig};
+
+    let level = level.clamp(0, 12);
+    let threads = threads.max(1);
+
+    let args = GzippyArgs {
+        compression_level: level,
+        // `processes` flows into ZopfliTuning::thread_budget for the L11 path;
+        // non-zopfli routing uses opt_config.thread_count instead.
+        processes: threads,
+        ..GzippyArgs::default()
+    };
+
+    // Large sentinel so OptimizationConfig::new treats this as a "big file" and
+    // enables parallel paths regardless of actual input length (unknown at call time).
+    const LARGE_FILE_SENTINEL: u64 = u64::MAX;
+    let opt_config =
+        OptimizationConfig::new(threads, LARGE_FILE_SENTINEL, level, ContentType::Binary);
+    let header_info = GzipHeaderInfo::default();
+
+    compress_with_pipeline(reader, writer, &args, &opt_config, &header_info)
 }

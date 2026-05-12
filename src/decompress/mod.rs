@@ -1,8 +1,9 @@
 //! Gzip decompression engine — pure bytes-in / bytes-out.
 //!
 //! Entry points for the I/O layer are in `io`. This module handles:
-//! classify → route → decompress. All functions are `pub(crate)` so tests
-//! can reach them directly.
+//! classify → route → decompress. `classify_gzip`, `decompress_bytes`, and
+//! `decompress_gzip_to_writer` are `pub` for use by the library API in
+//! `lib.rs`; all other functions are `pub(crate)`.
 
 pub mod bgzf;
 pub mod combined_lut;
@@ -101,6 +102,24 @@ pub fn decompress_gzip_to_writer<W: Write + Send>(
         .map(|p| p.get())
         .unwrap_or(4);
     decompress_gzip_libdeflate(data, writer, num_threads)
+}
+
+// =============================================================================
+// Library API
+// =============================================================================
+
+/// Decompress gzip data with an explicit thread count.
+///
+/// Uses gzippy's full routing table (parallel bgzf, parallel multi-member,
+/// ISA-L single-member, libdeflate one-shot) based on the input and
+/// the requested thread count.
+#[allow(dead_code)] // called from lib.rs; unused in the binary
+pub fn decompress_bytes<W: Write + Send>(
+    data: &[u8],
+    writer: &mut W,
+    num_threads: usize,
+) -> GzippyResult<u64> {
+    decompress_gzip_libdeflate(data, writer, num_threads.max(1))
 }
 
 // =============================================================================
