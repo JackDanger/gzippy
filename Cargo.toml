@@ -1,6 +1,6 @@
 [package]
 name = "gzippy"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "The fastest parallel gzip. Drop-in replacement for gzip and pigz."
 license = "Zlib"
@@ -12,6 +12,14 @@ keywords = ["gzip", "compression", "parallel", "pigz", "zlib"]
 categories = ["compression", "command-line-utilities"]
 authors = ["Jack Danger Canty"]
 build = "build.rs"
+
+[lib]
+name = "gzippy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gzippy"
+path = "src/main.rs"
 
 [features]
 default = []
