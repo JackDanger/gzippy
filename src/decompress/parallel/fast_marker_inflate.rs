@@ -216,7 +216,24 @@ fn reverse_bits(mut v: u32, n: u32) -> u32 {
 /// Returns `(output, end_bit_offset)` where `end_bit_offset` is the bit
 /// position just past the consumed stream (suitable for chaining).
 pub fn decode_chunk_markers(data: &[u8], start_bit_offset: usize) -> Result<(Vec<u16>, usize)> {
-    // Set up the bit buffer at the requested offset.
+    decode_chunk_markers_bounded(data, start_bit_offset, None)
+}
+
+/// Like `decode_chunk_markers` but also stops at a block boundary at or past
+/// `end_bit_limit` (if provided). Used by the parallel pipeline so worker N
+/// decodes only the range `[start_bits[N], start_bits[N+1])`. Without this
+/// bound, every worker would decode all the way to BFINAL and produce
+/// duplicate output.
+///
+/// The decoder always finishes the currently-in-progress block before
+/// stopping; it never stops mid-block. Therefore `end_bit_limit` must point
+/// at a real deflate block boundary — call sites get those from
+/// `search_boundary_forward` or `record_block_starts`.
+pub fn decode_chunk_markers_bounded(
+    data: &[u8],
+    start_bit_offset: usize,
+    end_bit_limit: Option<usize>,
+) -> Result<(Vec<u16>, usize)> {
     let byte_offset = start_bit_offset / 8;
     let bit_in_byte = (start_bit_offset % 8) as u32;
     if byte_offset >= data.len() {
@@ -232,7 +249,14 @@ pub fn decode_chunk_markers(data: &[u8], start_bit_offset: usize) -> Result<(Vec
 
     let mut output: Vec<u16> = Vec::with_capacity(data.len() * 4);
 
-    decode_loop(&mut bits, &mut output, byte_offset, bit_in_byte, None)?;
+    decode_loop(
+        &mut bits,
+        &mut output,
+        byte_offset,
+        bit_in_byte,
+        None,
+        end_bit_limit,
+    )?;
 
     // Compute end_bit_offset = byte_offset*8 + bit_in_byte + bits_consumed.
     // bits.pos is bytes pulled out of bits.data (which started at byte_offset),
@@ -260,23 +284,33 @@ fn decode_loop(
     base_byte: usize,
     base_bit_in_byte: u32,
     mut block_starts: Option<&mut Vec<usize>>,
+    end_bit_limit: Option<usize>,
 ) -> Result<()> {
     loop {
         if bits.available() < 3 {
             bits.refill();
         }
-        let bfinal = (bits.peek() & 1) != 0;
-        let btype = ((bits.peek() >> 1) & 3) as u32;
-        // Record the bit position of the start of THIS block (the header
-        // bit). This is suitable as a chunk start_bit_offset for a parallel
-        // decoder: passing it back into `decode_chunk_markers` will redo the
-        // same block (and subsequent ones).
+        // Absolute bit position at the start of this block (the header bit).
+        let bits_in_buf = bits.available() as usize;
+        let consumed = bits.pos.saturating_mul(8).saturating_sub(bits_in_buf);
+        let bit_pos = base_byte * 8 + base_bit_in_byte as usize + consumed;
+
         if let Some(starts) = block_starts.as_mut() {
-            let bits_in_buf = bits.available() as usize;
-            let consumed = bits.pos.saturating_mul(8).saturating_sub(bits_in_buf);
-            let bit_pos = base_byte * 8 + base_bit_in_byte as usize + consumed;
             starts.push(bit_pos);
         }
+
+        // Bounded-mode early exit: if a caller provided an `end_bit_limit`
+        // and we've reached it (exactly at a block boundary, since that's
+        // where we are right now), stop without consuming this block. The
+        // chunk that owns `end_bit_limit` will pick up here.
+        if let Some(limit) = end_bit_limit {
+            if bit_pos >= limit {
+                return Ok(());
+            }
+        }
+
+        let bfinal = (bits.peek() & 1) != 0;
+        let btype = ((bits.peek() >> 1) & 3) as u32;
         bits.consume(3);
 
         match btype {
@@ -303,7 +337,7 @@ pub(super) fn record_block_starts(data: &[u8]) -> Result<Vec<usize>> {
     let mut bits = Bits::new(data);
     let mut output = Vec::new();
     let mut starts = Vec::new();
-    decode_loop(&mut bits, &mut output, 0, 0, Some(&mut starts))?;
+    decode_loop(&mut bits, &mut output, 0, 0, Some(&mut starts), None)?;
     Ok(starts)
 }
 

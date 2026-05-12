@@ -24,14 +24,18 @@ Input → decompress::mod: decompress_gzip_libdeflate
   │     T1  → decompress_multi_member_sequential (libdeflate, member-by-member)
   │     Tmax → bgzf::decompress_multi_member_parallel (libdeflate FFI)
   └─ Single-member?
-        ISA-L + T>1 + compressed > 10 MiB + physical_cores ≥ 8
+        ISA-L + T>1 + compressed > 10 MiB
             → parallel::single_member::decompress_parallel
-              (v0.5.1 speculative-window two-pass; falls back via Err on
-               search/speculation failure, never on partial-corrupt output;
-               8-core floor measured empirically: on a 4-core CI runner
-               sequential ISA-L 425 MB/s beats gzippy parallel 288 MB/s and
-               rapidgzip 330 MB/s; the algorithm's 2N compute work needs
-               ≥8 physical cores to outpace sequential)
+              (v0.6 marker pipeline; ~1.1N total compute work, scales ~T
+               from T=2 upward. Phase 1 parallel workers run
+               fast_marker_inflate producing Vec<u16> with markers for
+               cross-chunk back-refs. Phase 2 sequential resolves markers
+               via SIMD replace_markers using each predecessor's last
+               32 KB as window, converts u16→u8. Phase 3 verifies CRC and
+               size against gzip trailer BEFORE writing — never partial
+               output on Err. Counter `MARKER_PIPELINE_RUNS` proves
+               production routing called us; see deletion-trap killer
+               test in src/tests/routing.rs)
         x86_64 (ISA-L available)        → isal_decompress::decompress_gzip_stream
         any arch, data > 1 GiB (no ISA-L) → decompress_single_member_streaming (zlib-ng)
         default                          → decompress_single_member_libdeflate
