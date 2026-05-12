@@ -1,17 +1,17 @@
 Package: gzippy
-Version: 0.3.1-1
+Version: 0.4.0-1
 Architecture: amd64
 Maintainer: Jack Danger <github@jackdanger.com>
-Installed-Size: 1016
+Installed-Size: 1175
 Depends: libc6 (>= 2.34), libgcc-s1 (>= 4.2)
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy_0.3.1-1_amd64.deb
-Size: 449784
-SHA256: a390f1391fe640d78f28b7a7ab03d77225c0df4c62c958d21f5d5b2e7f94be37
-SHA1: 7973ddfdd6b74c526ba8333aa4acd442a24db9a4
-MD5sum: 64f6404fa46514e88e78d10139396e5a
+Filename: pool/main/g/gzippy/gzippy_0.4.0-1_amd64.deb
+Size: 513526
+SHA256: 4ac161a185483e667ede85131835620f405cd21f8ba8a3f59dbb72dd9effc174
+SHA1: 75f0ebbf33bc0a2cf44fbf95b40e9921c581fb46
+MD5sum: cb5ec4ca0036b6520295b960db166689
 Description: The fastest parallel gzip
  Gzippy is a high-performance parallel gzip implementation written in Rust.
  It beats gzip and pigz by leveraging multiple CPU cores, SIMD instructions,
@@ -27,19 +27,19 @@ Description: The fastest parallel gzip
 
 Package: gzippy-replace-gzip
 Source: gzippy
-Version: 0.3.1-1
+Version: 0.4.0-1
 Architecture: all
 Maintainer: Jack Danger <github@jackdanger.com>
 Installed-Size: 9
-Depends: gzippy (>= 0.3.1-1)
+Depends: gzippy (>= 0.4.0-1)
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.3.1-1_all.deb
-Size: 2132
-SHA256: 66f73af68c59961301ab2abc8afa211dab6eb2db9d90347260f4f9577e5b5dd5
-SHA1: 6463c54ca74648fc8eb94637ae0c52a54ae699b0
-MD5sum: 3dd8eaa769b330fa7705bb7731300939
+Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.4.0-1_all.deb
+Size: 2124
+SHA256: 6f89cedab961900b470ca69a82d2b47903177e382cd14e8a78861b679a50edc8
+SHA1: e10168c950bfcb0ef050029e2405de346f78797f
+MD5sum: 1b4c29ca46dfb9b51eeeb2ac4bb792ac
 Description: Transitional package — gzippy now replaces gzip automatically
  This is a no-op transitional package. As of gzippy 0.1.6, installing the
  gzippy package automatically diverts /usr/bin/gzip, /usr/bin/gunzip, and
