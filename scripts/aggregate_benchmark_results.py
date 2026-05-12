@@ -68,13 +68,17 @@ def is_decompression_result(data: dict) -> bool:
     """Check if this looks like a decompression benchmark result."""
     if not isinstance(data, dict):
         return False
-    
-    # Has benchmarks array with source field
+
+    # benchmark_decompression.py output: archive_type at top level + results array
+    if "archive_type" in data and "results" in data:
+        return True
+
+    # Legacy format with benchmarks array
     if "benchmarks" in data:
         benchmarks = data["benchmarks"]
         if isinstance(benchmarks, list) and benchmarks:
             return "source" in benchmarks[0] and "speed_mbps" in benchmarks[0]
-    
+
     return False
 
 
@@ -133,11 +137,11 @@ def normalize_compression_result(data: dict, source_file: str) -> list:
 def normalize_decompression_result(data: dict, source_file: str) -> list:
     """
     Normalize a decompression result to a standard format.
-    
+
     Returns a list of individual benchmark results.
     """
     results = []
-    
+
     # Extract data_type from filename or path
     data_type = "unknown"
     source_lower = source_file.lower()
@@ -151,21 +155,31 @@ def normalize_decompression_result(data: dict, source_file: str) -> list:
         data_type = "text"
     elif "tarball" in source_lower:
         data_type = "tarball"
-    
-    for b in data.get("benchmarks", []):
+
+    # benchmark_decompression.py writes archive_type like "silesia-gzip".
+    # Extract the format portion ("gzip", "bgzf", "pigz") as source.
+    archive_type = data.get("archive_type", "")
+    inferred_source = archive_type.split("-")[-1] if "-" in archive_type else (archive_type or "unknown")
+
+    # Support both current format ("results") and legacy format ("benchmarks")
+    raw_results = data.get("results") or data.get("benchmarks") or []
+
+    for r in raw_results:
+        if not isinstance(r, dict) or "error" in r:
+            continue
         results.append({
-            "tool": b.get("tool", "unknown"),
-            "source": b.get("source", "unknown"),
-            "level": b.get("level", 0),
-            "threads": b.get("threads", 1),
-            "speed": b.get("speed_mbps", 0),
-            "time": b.get("mean_time", 0),
-            "trials": b.get("trials", 0),
-            "cv": b.get("cv", 0),
-            "status": b.get("status", "unknown"),
+            "tool": r.get("tool", "unknown"),
+            "source": r.get("source", inferred_source),
+            "level": r.get("level", 0),
+            "threads": r.get("threads", data.get("threads", 1)),
+            "speed": r.get("speed_mbps", r.get("speed", 0)),
+            "time": r.get("median", r.get("mean_time", r.get("time", 0))),
+            "trials": r.get("trials", 0),
+            "cv": r.get("cv", 0),
+            "status": r.get("status", "unknown"),
             "data_type": data_type,
         })
-    
+
     return results
 
 

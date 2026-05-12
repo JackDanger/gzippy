@@ -698,7 +698,11 @@ jobs:
         with:
           pattern: results-*-${{ matrix.platform }}-*
           path: results/
-          merge-multiple: true
+          # merge-multiple intentionally omitted: each artifact goes into its own
+          # subdirectory (results/<artifact-name>/), so compression.json and
+          # decompression.json from different jobs don't collide. aggregate_benchmark_results.py
+          # uses rglob to find all JSON files recursively, and infers data_type from the
+          # subdirectory name (which contains "silesia", "software", "logs", etc.).
 
       - name: Download single-member results
         if: matrix.platform == 'x86_64'
