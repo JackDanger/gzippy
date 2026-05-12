@@ -23,8 +23,8 @@
 //! | 1–3   | ISA-L SIMD (x86_64), libdeflate/zlib-ng (other) |
 //! | 4–5   | libdeflate one-shot |
 //! | 6–9   | zlib-ng streaming |
+//! | 10,12 | libdeflate ultra (near-zopfli ratio, reasonable speed) |
 //! | 11    | Zopfli (maximum ratio, very slow) |
-//! | 12    | libdeflate ultra (near-zopfli, reasonable speed) |
 //!
 //! Multi-threading (`compress_with_threads` with `threads > 1`) routes
 //! L0–5 through `ParallelGzEncoder` (gzippy "GZ" multi-block format) and
@@ -84,6 +84,11 @@ pub fn compress_with_threads(data: &[u8], level: u8, threads: usize) -> GzippyRe
 ///
 /// Automatically selects the best path: parallel bgzf, parallel multi-member,
 /// ISA-L single-member, or libdeflate one-shot.
+///
+/// **Non-gzip input:** if `data` does not start with the gzip magic bytes
+/// (`0x1f 0x8b`), returns `Ok(Vec::new())` rather than an error — consistent
+/// with CLI behavior when sniffing stdin. Check the return length if you need
+/// to distinguish "empty gzip" from "not gzip".
 pub fn decompress(data: &[u8]) -> GzippyResult<Vec<u8>> {
     let threads = std::thread::available_parallelism()
         .map(|p| p.get())
@@ -92,21 +97,42 @@ pub fn decompress(data: &[u8]) -> GzippyResult<Vec<u8>> {
 }
 
 /// Decompress a gzip stream with explicit thread count.
+///
+/// Set `threads = 1` for deterministic single-threaded output (useful in
+/// constrained or benchmark contexts).
+///
+/// **Non-gzip input:** returns `Ok(Vec::new())` — see [`decompress`].
 pub fn decompress_with_threads(data: &[u8], threads: usize) -> GzippyResult<Vec<u8>> {
     let mut out = Vec::new();
     decompress::decompress_bytes(data, &mut out, threads)?;
     Ok(out)
 }
 
-/// Decompress a gzip stream to an arbitrary writer.
+/// Decompress a gzip stream to an arbitrary writer using all available CPUs.
 ///
 /// Useful when you want to stream output directly to a file or network socket
-/// without an intermediate allocation.
+/// without an intermediate allocation. For explicit thread control, use
+/// [`decompress_to_writer_with_threads`].
 pub fn decompress_to_writer<W: std::io::Write + Send>(
     data: &[u8],
     writer: &mut W,
 ) -> GzippyResult<u64> {
-    decompress::decompress_gzip_to_writer(data, writer)
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+    decompress::decompress_bytes(data, writer, threads)
+}
+
+/// Decompress a gzip stream to an arbitrary writer with explicit thread count.
+///
+/// Mirrors [`decompress_with_threads`] for the writer API: set `threads = 1`
+/// for deterministic single-threaded decompression.
+pub fn decompress_to_writer_with_threads<W: std::io::Write + Send>(
+    data: &[u8],
+    writer: &mut W,
+    threads: usize,
+) -> GzippyResult<u64> {
+    decompress::decompress_bytes(data, writer, threads)
 }
 
 /// Return the [`DecodePath`] gzippy would choose for this input and thread count.

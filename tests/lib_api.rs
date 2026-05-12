@@ -103,6 +103,21 @@ fn decompress_to_writer_matches_vec_api() {
     assert_eq!(bytes, data.len() as u64);
 }
 
+#[test]
+fn decompress_to_writer_with_threads_t1_matches_vec_api() {
+    // Verifies that the writer API respects the explicit thread count (T1 here).
+    let data = make_text(64 * 1024);
+    let compressed = gzip_encode_with_flate2(&data, 6);
+
+    let via_vec = gzippy::decompress_with_threads(&compressed, 1).unwrap();
+
+    let mut via_writer = Vec::new();
+    let bytes = gzippy::decompress_to_writer_with_threads(&compressed, &mut via_writer, 1).unwrap();
+
+    assert_eq!(via_vec, via_writer);
+    assert_eq!(bytes, data.len() as u64);
+}
+
 // ── decompress_bytes with explicit thread counts ──────────────────────────────
 
 #[test]

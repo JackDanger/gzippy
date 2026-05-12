@@ -201,8 +201,11 @@ pub fn compress_bytes<R: Read, W: Write + Send>(
         ..GzippyArgs::default()
     };
 
-    // Use a large sentinel size so OptimizationConfig enables parallel paths normally.
-    let opt_config = OptimizationConfig::new(threads, u64::MAX, level, ContentType::Binary);
+    // Large sentinel so OptimizationConfig::new treats this as a "big file" and
+    // enables parallel paths regardless of actual input length (unknown at call time).
+    const LARGE_FILE_SENTINEL: u64 = u64::MAX;
+    let opt_config =
+        OptimizationConfig::new(threads, LARGE_FILE_SENTINEL, level, ContentType::Binary);
     let header_info = GzipHeaderInfo::default();
 
     compress_with_pipeline(reader, writer, &args, &opt_config, &header_info)
