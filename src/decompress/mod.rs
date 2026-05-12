@@ -1,8 +1,9 @@
 //! Gzip decompression engine — pure bytes-in / bytes-out.
 //!
 //! Entry points for the I/O layer are in `io`. This module handles:
-//! classify → route → decompress. All functions are `pub(crate)` so tests
-//! can reach them directly.
+//! classify → route → decompress. `classify_gzip`, `decompress_bytes`, and
+//! `decompress_gzip_to_writer` are `pub` for use by the library API in
+//! `lib.rs`; all other functions are `pub(crate)`.
 
 pub mod bgzf;
 pub mod combined_lut;
