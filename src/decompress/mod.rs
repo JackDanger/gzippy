@@ -208,13 +208,22 @@ pub(crate) fn decompress_single_member<W: Write>(
     writer: &mut W,
     num_threads: usize,
 ) -> GzippyResult<u64> {
-    // Parallel single-member path: speculative block-boundary search + ISA-L
-    // re-decode per confirmed chunk via inflatePrime. x86_64 + ISA-L only.
-    // Arm64: sequential libdeflate (~14,000 MB/s) beats parallel zlib-ng (4 × 600 = 2,400 MB/s).
+    // Parallel single-member path: speculative-window two-pass design (v0.5.1).
+    // x86_64 + ISA-L only. Arm64: sequential libdeflate (~14,000 MB/s) beats
+    // parallel zlib-ng (4 × 600 = 2,400 MB/s).
+    //
+    // Physical-core floor: the algorithm's total compute work is 2N (phase 1
+    // empty-dict decode + phase 2 re-decode with speculative window). With
+    // < 4 physical cores, sequential ISA-L (425 MB/s on x86_64 ubuntu-latest)
+    // wins outright vs. 2N/T_physical wall. Above 4 cores parallel scales
+    // ~T_physical/2 and dominates. CI's 2-vCPU runners fall on the sequential
+    // side; the homelab and most workstations fall on the parallel side.
     const MIN_PARALLEL_COMPRESSED: usize = 10 * 1024 * 1024;
+    const MIN_PHYSICAL_CORES_FOR_PARALLEL: usize = 4;
     if crate::backends::isal_decompress::is_available()
         && num_threads > 1
         && data.len() > MIN_PARALLEL_COMPRESSED
+        && num_cpus::get_physical() >= MIN_PHYSICAL_CORES_FOR_PARALLEL
     {
         match crate::decompress::parallel::single_member::decompress_parallel(
             data,
