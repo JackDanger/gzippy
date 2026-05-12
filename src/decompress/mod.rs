@@ -412,8 +412,8 @@ pub(crate) fn decompress_zlib_turbo<W: Write>(data: &[u8], writer: &mut W) -> Gz
 #[allow(dead_code)] // called from lib.rs; unused in the binary
 pub fn decompress_raw_bytes(data: &[u8]) -> GzippyResult<Vec<u8>> {
     let mut decompressor = libdeflater::Decompressor::new();
-    let mut estimate = (data.len() * 4).max(4096);
     const CAP: usize = 1 << 30; // 1 GiB
+    let mut estimate = data.len().saturating_mul(4).clamp(4096, CAP);
 
     loop {
         let mut out = vec![0u8; estimate];

@@ -2073,12 +2073,16 @@ mod tests {
 
     #[test]
     fn test_raw_deflate_no_gzip_framing() {
-        // Compressed bytes must NOT start with gzip magic 0x1f 0x8b
+        // A gzip decoder must reject raw-deflate output (no gzip header present).
         let data = b"no gzip framing expected here";
         let compressed = crate::compress::compress_raw_bytes(data, 6).unwrap();
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut gz_dec = GzDecoder::new(compressed.as_slice());
+        let mut out = Vec::new();
         assert!(
-            compressed.len() < 2 || !(compressed[0] == 0x1f && compressed[1] == 0x8b),
-            "compress_raw_bytes must not produce gzip-framed output"
+            gz_dec.read_to_end(&mut out).is_err(),
+            "compress_raw_bytes output should be rejected by a gzip decoder"
         );
     }
 

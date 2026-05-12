@@ -410,11 +410,14 @@ fn compress_raw_and_decompress_raw_roundtrip() {
 
 #[test]
 fn compress_raw_output_is_not_gzip() {
+    // A gzip decoder must reject raw-deflate output (no gzip header present).
     let data = make_text(1024);
     let compressed = gzippy::compress_raw(&data, 6).unwrap();
+    let mut gz_dec = flate2::read::GzDecoder::new(compressed.as_slice());
+    let mut out = Vec::new();
     assert!(
-        compressed.len() < 2 || !(compressed[0] == 0x1f && compressed[1] == 0x8b),
-        "compress_raw must not emit gzip magic bytes"
+        gz_dec.read_to_end(&mut out).is_err(),
+        "compress_raw output should be rejected by a gzip decoder"
     );
 }
 
