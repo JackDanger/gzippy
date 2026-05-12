@@ -266,6 +266,22 @@ jobs:
             data_type: logs
             level: 9
             threads: "max"
+          # x86_64 - L11 (ultra/zopfli: ratio guard vs gzip -9; T1 only, zopfli is single-threaded)
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: silesia
+            level: 11
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: software
+            level: 11
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: logs
+            level: 11
+            threads: "1"
           # ARM64 - full matrix (matches x86_64)
           - platform: arm64
             runner: ubuntu-24.04-arm
@@ -528,6 +544,72 @@ jobs:
           retention-days: 7
 
   # ============================================================================
+  # STAGE 4b: Single-member parallel decompression benchmark (x86_64 only)
+  # Tests the v0.3.0 ISA-L inflatePrime path on a standard single-member file.
+  # arm64 skipped: ISA-L unavailable, parallel single-member path is gated off.
+  # ============================================================================
+  single-member-benchmark:
+    name: Single-Member Decomp T${{ matrix.threads }} (x86_64)
+    runs-on: ubuntu-latest
+    needs: prepare-data
+    strategy:
+      fail-fast: false
+      matrix:
+        threads: ["1", "max"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries-x86_64
+          path: ./bin
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: benchmark-data
+          path: ./benchmark_data
+
+      - name: Setup
+        run: |
+          chmod +x ./bin/*
+          mkdir -p results
+
+          if [ "${{ matrix.threads }}" = "max" ]; then
+            echo "THREADS=$(nproc)" >> $GITHUB_ENV
+          else
+            echo "THREADS=${{ matrix.threads }}" >> $GITHUB_ENV
+          fi
+
+      - name: Verify data exists
+        run: |
+          ls -lh benchmark_data/
+          if [ ! -f "benchmark_data/silesia-large.gz" ]; then
+            echo "ERROR: benchmark_data/silesia-large.gz not found"
+            exit 1
+          fi
+          if [ ! -f "benchmark_data/silesia-large.bin" ]; then
+            echo "ERROR: benchmark_data/silesia-large.bin not found"
+            exit 1
+          fi
+          echo "Compressed: $(du -h benchmark_data/silesia-large.gz | cut -f1)"
+          echo "Original: $(du -h benchmark_data/silesia-large.bin | cut -f1)"
+
+      - name: Run single-member benchmark
+        run: |
+          python3 scripts/benchmark_single_member.py \
+            --binaries ./bin \
+            --compressed-file benchmark_data/silesia-large.gz \
+            --original-file benchmark_data/silesia-large.bin \
+            --threads $THREADS \
+            --output results/single-member-t${{ matrix.threads }}.json
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: single-member-results-x86_64-t${{ matrix.threads }}
+          path: results/
+          retention-days: 7
+
+  # ============================================================================
   # STAGE 5: Random data correctness check
   # ============================================================================
   random-data:
@@ -603,7 +685,7 @@ jobs:
   guards:
     name: Performance Guards (${{ matrix.platform }})
     runs-on: ubuntu-latest
-    needs: [compression-benchmark, decompression-benchmark, random-data]
+    needs: [compression-benchmark, decompression-benchmark, random-data, single-member-benchmark]
     if: always() && needs.compression-benchmark.result == 'success' && needs.decompression-benchmark.result == 'success'
     strategy:
       matrix:
@@ -617,6 +699,15 @@ jobs:
           pattern: results-*-${{ matrix.platform }}-*
           path: results/
           merge-multiple: true
+
+      - name: Download single-member results
+        if: matrix.platform == 'x86_64'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: single-member-results-x86_64-*
+          path: results-sm/
+          merge-multiple: true
+        continue-on-error: true
 
       - name: Collect system info
         run: |
@@ -641,17 +732,27 @@ jobs:
         id: guards
         continue-on-error: true
         run: |
+          SM_ARG=""
+          if [ "${{ matrix.platform }}" = "x86_64" ] && [ -d results-sm ]; then
+            SM_ARG="--single-member-dir results-sm"
+          fi
           python3 scripts/check_guards.py \
             --compression aggregated/compression.json \
             --decompression aggregated/decompression.json \
+            $SM_ARG \
             --output guards-report.json
 
       - name: Generate summary
         run: |
+          SM_ARG=""
+          if [ "${{ matrix.platform }}" = "x86_64" ] && [ -d results-sm ]; then
+            SM_ARG="--single-member-dir results-sm"
+          fi
           python3 scripts/generate_summary.py \
             --system results/system.json \
             --compression aggregated/compression.json \
             --decompression aggregated/decompression.json \
+            $SM_ARG \
             --output summary.md
 
           echo "## ${{ matrix.platform }} Performance" >> $GITHUB_STEP_SUMMARY
