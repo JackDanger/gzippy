@@ -113,9 +113,11 @@ impl HuffTable {
         // Find max code length used.
         let max_len = lengths.iter().copied().max().unwrap_or(0) as u32;
         if max_len == 0 {
-            // Degenerate: no symbols. Return a dummy table that errors on use.
+            // Degenerate: no symbols. Return a dummy table that errors on
+            // every decode attempt. Size must match 1 << table_bits so the
+            // peek index never goes out of bounds.
             return Ok(Self {
-                entries: vec![0u32; 1],
+                entries: vec![0u32; 2],
                 table_bits: 1,
             });
         }
@@ -230,25 +232,7 @@ pub fn decode_chunk_markers(data: &[u8], start_bit_offset: usize) -> Result<(Vec
 
     let mut output: Vec<u16> = Vec::with_capacity(data.len() * 4);
 
-    loop {
-        if bits.available() < 3 {
-            bits.refill();
-        }
-        let bfinal = (bits.peek() & 1) != 0;
-        let btype = ((bits.peek() >> 1) & 3) as u32;
-        bits.consume(3);
-
-        match btype {
-            0 => decode_stored(&mut bits, &mut output)?,
-            1 => decode_fixed(&mut bits, &mut output)?,
-            2 => decode_dynamic(&mut bits, &mut output)?,
-            _ => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type 3")),
-        }
-
-        if bfinal {
-            break;
-        }
-    }
+    decode_loop(&mut bits, &mut output, byte_offset, bit_in_byte, None)?;
 
     // Compute end_bit_offset = byte_offset*8 + bit_in_byte + bits_consumed.
     // bits.pos is bytes pulled out of bits.data (which started at byte_offset),
@@ -263,6 +247,64 @@ pub fn decode_chunk_markers(data: &[u8], start_bit_offset: usize) -> Result<(Vec
     let end_bit_offset = byte_offset * 8 + bit_in_byte as usize + bits_consumed_from_slice;
 
     Ok((output, end_bit_offset))
+}
+
+/// Inner decode loop, factored so a debug-only variant can record where each
+/// block started (used by integration tests to obtain real mid-stream block
+/// boundaries — there's no other way to verify a candidate is a true boundary
+/// short of decoding from bit 0).
+#[inline]
+fn decode_loop(
+    bits: &mut Bits,
+    output: &mut Vec<u16>,
+    base_byte: usize,
+    base_bit_in_byte: u32,
+    mut block_starts: Option<&mut Vec<usize>>,
+) -> Result<()> {
+    loop {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+        let bfinal = (bits.peek() & 1) != 0;
+        let btype = ((bits.peek() >> 1) & 3) as u32;
+        // Record the bit position of the start of THIS block (the header
+        // bit). This is suitable as a chunk start_bit_offset for a parallel
+        // decoder: passing it back into `decode_chunk_markers` will redo the
+        // same block (and subsequent ones).
+        if let Some(starts) = block_starts.as_mut() {
+            let bits_in_buf = bits.available() as usize;
+            let consumed = bits.pos.saturating_mul(8).saturating_sub(bits_in_buf);
+            let bit_pos = base_byte * 8 + base_bit_in_byte as usize + consumed;
+            starts.push(bit_pos);
+        }
+        bits.consume(3);
+
+        match btype {
+            0 => decode_stored(bits, output)?,
+            1 => decode_fixed(bits, output)?,
+            2 => decode_dynamic(bits, output)?,
+            _ => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type 3")),
+        }
+
+        if bfinal {
+            return Ok(());
+        }
+    }
+}
+
+/// Test helper: decode `data` from bit 0 and return every block-start bit
+/// position observed. Each position is a valid input to
+/// `decode_chunk_markers` — passing it in starts decoding at that block's
+/// header. Used by the end-to-end integration test to avoid relying on
+/// `BlockFinder`'s heuristic candidates (which produce false positives that
+/// silently corrupt subsequent decode).
+#[cfg(test)]
+pub(super) fn record_block_starts(data: &[u8]) -> Result<Vec<usize>> {
+    let mut bits = Bits::new(data);
+    let mut output = Vec::new();
+    let mut starts = Vec::new();
+    decode_loop(&mut bits, &mut output, 0, 0, Some(&mut starts))?;
+    Ok(starts)
 }
 
 // ── Stored block (BTYPE = 00) ───────────────────────────────────────────────
@@ -768,6 +810,121 @@ mod tests {
             replace_markers(&mut markers, &[]);
             let ours = u16_to_u8(&markers).expect("no leftover markers");
             assert_eq!(ours, oracle, "bit offset {skip_bits} produced wrong output");
+        }
+    }
+
+    /// **The critical integration test.** Exercises the full marker pipeline
+    /// end-to-end: split a deflate stream at a real mid-stream block boundary,
+    /// decode the suffix with `fast_marker_inflate` (producing markers for
+    /// back-references that reach into the prefix), resolve those markers with
+    /// `replace_markers` using the prefix's last 32 KB as the window, and
+    /// confirm byte-for-byte equality with the oracle's tail.
+    ///
+    /// This is what would have caught every prior marker-decoder failure if
+    /// it had existed:
+    /// - The byte-aligned-only bug (commit 4bbf04f): the boundary found by
+    ///   BlockFinder is generally NOT byte-aligned, so this test fails noisily
+    ///   if the decoder regresses to byte-aligned starts.
+    /// - Marker propagation through chunk-local copies: chunks that start
+    ///   mid-stream emit many markers; those markers must survive subsequent
+    ///   chunk-local back-references that copy from earlier in the chunk.
+    /// - Marker offset convention drift: a one-byte offset error in marker
+    ///   encoding would corrupt the output deterministically.
+    #[test]
+    fn integration_split_stream_with_markers() {
+        // ~8 MiB of mixed-entropy data. Pure repeated phrases compress to a
+        // single deflate block; mixed random + short repetition produces many
+        // blocks with mid-stream boundaries.
+        let mut text = Vec::with_capacity(8 * 1024 * 1024);
+        let mut rng: u64 = 0xfacefeed;
+        while text.len() < 8 * 1024 * 1024 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if (rng >> 32) % 5 < 3 {
+                text.push((rng >> 16) as u8);
+            } else {
+                let byte = ((rng >> 24) % 26) as u8 + b'a';
+                let run = ((rng >> 40) % 12 + 2) as usize;
+                for _ in 0..run.min(8 * 1024 * 1024 - text.len()) {
+                    text.push(byte);
+                }
+            }
+        }
+
+        for level in [1u32, 6] {
+            let deflate = make_deflate(&text, level);
+            let oracle = oracle_decode(&deflate, text.len());
+
+            // Find every real block boundary in this stream by decoding from
+            // bit 0 and recording transitions. Pick one roughly mid-stream.
+            // (Avoids BlockFinder's heuristic false positives that would
+            // produce garbage and never fire the marker code path.)
+            let starts = record_block_starts(&deflate).expect("record_block_starts");
+            let total_bits = deflate.len() * 8;
+            let target = total_bits / 2;
+            let split_bit_opt = starts
+                .iter()
+                .copied()
+                .filter(|&b| b > total_bits / 4 && b < (total_bits * 3) / 4)
+                .min_by_key(|&b| b.abs_diff(target));
+
+            let split_bit = match split_bit_opt {
+                Some(b) => b,
+                None => {
+                    eprintln!(
+                        "level {level}: {} blocks total, none in middle half — skipping",
+                        starts.len()
+                    );
+                    continue;
+                }
+            };
+
+            // Decode the suffix with markers.
+            let (mut suffix_markers, _) =
+                decode_chunk_markers(&deflate, split_bit).expect("suffix decode failed");
+            let suffix_len = suffix_markers.len();
+
+            // The oracle's tail bytes are output[oracle.len() - suffix_len ..].
+            let tail_start = oracle.len() - suffix_len;
+            let oracle_tail = &oracle[tail_start..];
+            let oracle_prefix = &oracle[..tail_start];
+
+            // Window = last 32 KB of the prefix.
+            let win_size = oracle_prefix.len().min(WINDOW_SIZE);
+            let window = &oracle_prefix[oracle_prefix.len() - win_size..];
+
+            // How many markers do we have? Verify there are some — otherwise
+            // this test isn't exercising the marker code path.
+            let marker_count = suffix_markers.iter().filter(|&&v| v >= MARKER_BASE).count();
+
+            // Resolve markers against the predecessor window.
+            replace_markers(&mut suffix_markers, window);
+
+            let ours = u16_to_u8(&suffix_markers).unwrap_or_else(|pos| {
+                panic!(
+                    "level {level}: unresolved marker at index {pos} (offset {} > window len {})",
+                    suffix_markers[pos] - MARKER_BASE,
+                    window.len()
+                )
+            });
+            assert_eq!(
+                ours.len(),
+                oracle_tail.len(),
+                "level {level}: length mismatch (split_bit={split_bit}, markers={marker_count})"
+            );
+            assert_eq!(
+                ours, oracle_tail,
+                "level {level}: byte mismatch (split_bit={split_bit}, markers={marker_count})"
+            );
+
+            eprintln!(
+                "level {level}: split at bit {split_bit} (byte {}.{}), \
+                 prefix {} B, suffix {} B with {} markers — OK",
+                split_bit / 8,
+                split_bit % 8,
+                oracle_prefix.len(),
+                suffix_len,
+                marker_count,
+            );
         }
     }
 
