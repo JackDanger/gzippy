@@ -213,6 +213,31 @@ pub fn decompress_to_writer_with_threads<W: std::io::Write + Send>(
 }
 
 // =============================================================================
+// Raw DEFLATE API (no gzip framing)
+// =============================================================================
+
+/// Compress `data` to raw DEFLATE (RFC 1951) at `level` — no gzip header or trailer.
+///
+/// `level` is clamped to `0..=12`. Uses the same backend hierarchy as [`compress`]:
+/// ISA-L SIMD on x86_64 for levels 0–3, then libdeflate one-shot for all levels.
+///
+/// Use this when the framing (CRC32, size) is handled by the caller, for example
+/// when embedding deflate streams in ZIP, 7z, or zlib containers.
+pub fn compress_raw(data: &[u8], level: u8) -> GzippyResult<Vec<u8>> {
+    compress::compress_raw_bytes(data, level)
+}
+
+/// Decompress a raw DEFLATE stream (RFC 1951) — no gzip header or trailer expected.
+///
+/// Uses libdeflate for speed, growing the output buffer as needed. Falls back to
+/// a flate2/zlib-ng streaming decoder if the output exceeds 1 GiB.
+///
+/// Returns an error if `data` is not valid DEFLATE.
+pub fn decompress_raw(data: &[u8]) -> GzippyResult<Vec<u8>> {
+    decompress::decompress_raw_bytes(data)
+}
+
+// =============================================================================
 // Routing inspection
 // =============================================================================
 

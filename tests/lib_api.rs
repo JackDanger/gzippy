@@ -394,3 +394,54 @@ fn decompress_truncated_gzip_errors() {
         "expected decompression error, got {result:?}"
     );
 }
+
+#[test]
+fn compress_raw_and_decompress_raw_roundtrip() {
+    let data = make_text(64 * 1024);
+    for level in [1u8, 6, 9] {
+        let compressed = gzippy::compress_raw(&data, level).unwrap();
+        let decompressed = gzippy::decompress_raw(&compressed).unwrap();
+        assert_eq!(
+            decompressed, data,
+            "raw deflate roundtrip failed at level {level}"
+        );
+    }
+}
+
+#[test]
+fn compress_raw_output_is_not_gzip() {
+    let data = make_text(1024);
+    let compressed = gzippy::compress_raw(&data, 6).unwrap();
+    assert!(
+        compressed.len() < 2 || !(compressed[0] == 0x1f && compressed[1] == 0x8b),
+        "compress_raw must not emit gzip magic bytes"
+    );
+}
+
+#[test]
+fn decompress_raw_bad_data_errors() {
+    let result = gzippy::decompress_raw(b"not valid deflate!!!!!");
+    assert!(
+        result.is_err(),
+        "expected error on invalid raw deflate input"
+    );
+}
+
+#[test]
+fn compress_raw_interops_with_flate2() {
+    let data = make_text(32 * 1024);
+
+    // gzippy compress, flate2 decompress
+    let compressed = gzippy::compress_raw(&data, 6).unwrap();
+    let mut dec = flate2::read::DeflateDecoder::new(compressed.as_slice());
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).unwrap();
+    assert_eq!(out, data);
+
+    // flate2 compress, gzippy decompress
+    let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
+    enc.write_all(&data).unwrap();
+    let flate2_compressed = enc.finish().unwrap();
+    let decompressed = gzippy::decompress_raw(&flate2_compressed).unwrap();
+    assert_eq!(decompressed, data);
+}
