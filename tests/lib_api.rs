@@ -1,10 +1,10 @@
 //! Integration tests for gzippy's public library API.
 //!
-//! Each test exercises a specific path in gzippy's routing table so regressions
+//! Each test pins a specific path in gzippy's routing table so regressions
 //! in individual backends surface as clearly-named failures.
 
 use gzippy::{DecodePath, GzippyError};
-use std::io::Write;
+use std::io::{Read, Write};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -19,7 +19,7 @@ fn make_text(n: usize) -> Vec<u8> {
 
 fn make_incompressible(n: usize) -> Vec<u8> {
     (0..n)
-        .map(|i| ((i * 6364136223846793005 + 1442695040888963407) >> 56) as u8)
+        .map(|i| ((i as u64 * 6364136223846793005 + 1442695040888963407) >> 56) as u8)
         .collect()
 }
 
@@ -39,7 +39,7 @@ fn multi_member_gzip(parts: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-// ── round-trip: compression levels 1–9, single-threaded ──────────────────────
+// ── single-threaded round-trip: all standard levels ──────────────────────────
 
 #[test]
 fn round_trip_levels_1_through_9_single_thread() {
@@ -53,11 +53,11 @@ fn round_trip_levels_1_through_9_single_thread() {
     }
 }
 
-// ── round-trip: multi-threaded (parallel paths) ───────────────────────────────
+// ── parallel round-trips ──────────────────────────────────────────────────────
 
 #[test]
 fn round_trip_parallel_low_levels() {
-    // T>1 L1-5 → ParallelGzEncoder (gzippy "GZ" multi-block)
+    // T>1 L1–5 → ParallelGzEncoder (gzippy "GZ" multi-block)
     let data = make_text(512 * 1024);
     for level in [1u8, 3, 5] {
         let compressed = gzippy::compress_with_threads(&data, level, 4)
@@ -73,7 +73,7 @@ fn round_trip_parallel_low_levels() {
 
 #[test]
 fn round_trip_parallel_high_levels() {
-    // T>1 L6-9 → PipelinedGzEncoder (single-member, gzip-compatible)
+    // T>1 L6–9 → PipelinedGzEncoder (single-member, gzip-compatible)
     let data = make_text(256 * 1024);
     for level in [6u8, 9] {
         let compressed = gzippy::compress_with_threads(&data, level, 4)
@@ -85,6 +85,54 @@ fn round_trip_parallel_high_levels() {
             "pipelined round-trip mismatch at L{level}"
         );
     }
+}
+
+// ── compress_to_writer / compress_to_writer_with_threads ─────────────────────
+
+#[test]
+fn compress_to_writer_round_trip() {
+    let data = make_text(128 * 1024);
+    let reader = std::io::Cursor::new(&data);
+
+    let mut compressed = Vec::new();
+    let consumed = gzippy::compress_to_writer(reader, &mut compressed, 6).unwrap();
+
+    assert_eq!(
+        consumed,
+        data.len() as u64,
+        "consumed bytes should match input length"
+    );
+    let decompressed = gzippy::decompress(&compressed).unwrap();
+    assert_eq!(decompressed, data);
+}
+
+#[test]
+fn compress_to_writer_with_threads_t1_produces_standard_gzip() {
+    // T=1 output must be a standard gzip stream (decompressible by flate2).
+    let data = make_text(64 * 1024);
+    let reader = std::io::Cursor::new(&data);
+
+    let mut compressed = Vec::new();
+    gzippy::compress_to_writer_with_threads(reader, &mut compressed, 6, 1).unwrap();
+
+    let mut dec = flate2::read::GzDecoder::new(compressed.as_slice());
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).unwrap();
+    assert_eq!(out, data);
+}
+
+#[test]
+fn compress_to_writer_with_threads_parallel_round_trip() {
+    let data = make_text(512 * 1024);
+    let reader = std::io::Cursor::new(&data);
+
+    let mut compressed = Vec::new();
+    gzippy::compress_to_writer_with_threads(reader, &mut compressed, 3, 4).unwrap();
+
+    // Parallel L3 → GzippyParallel format; decompressible by gzippy.
+    assert_eq!(gzippy::classify(&compressed, 4), DecodePath::GzippyParallel);
+    let decompressed = gzippy::decompress_with_threads(&compressed, 4).unwrap();
+    assert_eq!(decompressed, data);
 }
 
 // ── decompress_to_writer ──────────────────────────────────────────────────────
@@ -105,7 +153,6 @@ fn decompress_to_writer_matches_vec_api() {
 
 #[test]
 fn decompress_to_writer_with_threads_t1_matches_vec_api() {
-    // Verifies that the writer API respects the explicit thread count (T1 here).
     let data = make_text(64 * 1024);
     let compressed = gzip_encode_with_flate2(&data, 6);
 
@@ -118,7 +165,7 @@ fn decompress_to_writer_with_threads_t1_matches_vec_api() {
     assert_eq!(bytes, data.len() as u64);
 }
 
-// ── decompress_bytes with explicit thread counts ──────────────────────────────
+// ── thread count parity: Vec API matches writer API ───────────────────────────
 
 #[test]
 fn decompress_single_thread_matches_multi_thread() {
@@ -142,7 +189,6 @@ fn decompress_multi_member_stream() {
     ];
     let compressed = multi_member_gzip(parts);
 
-    // Ensure it's actually seen as multi-member
     let path = gzippy::classify(&compressed, 1);
     assert_eq!(
         path,
@@ -182,7 +228,7 @@ fn decompress_multi_member_parallel() {
 fn classify_single_member_t1() {
     let compressed = gzip_encode_with_flate2(&make_text(4096), 6);
     let path = gzippy::classify(&compressed, 1);
-    // On x86_64 with ISA-L: IsalSingle. Elsewhere: LibdeflateSingle.
+    // ISA-L on x86_64, LibdeflateSingle elsewhere.
     assert!(
         matches!(path, DecodePath::IsalSingle | DecodePath::LibdeflateSingle),
         "unexpected path {path:?} for T1 single-member"
@@ -193,7 +239,7 @@ fn classify_single_member_t1() {
 fn classify_single_member_t4() {
     let compressed = gzip_encode_with_flate2(&make_text(4096), 6);
     let path = gzippy::classify(&compressed, 4);
-    // Still single-member (no multi-block markers) even with T4
+    // Still single-member (no multi-block markers) even with T4.
     assert!(
         matches!(path, DecodePath::IsalSingle | DecodePath::LibdeflateSingle),
         "unexpected path {path:?} for T4 single-member"
@@ -209,15 +255,68 @@ fn classify_multi_member_t1_vs_t4() {
 
 #[test]
 fn classify_gzippy_parallel_format() {
-    // Parallel L1-5 with T>1 produces the gzippy "GZ" multi-block format.
     let data = make_text(512 * 1024);
     let compressed = gzippy::compress_with_threads(&data, 3, 4).unwrap();
     let path = gzippy::classify(&compressed, 4);
     assert_eq!(
         path,
         DecodePath::GzippyParallel,
-        "T>1 L3 output should be GzippyParallel format"
+        "T>1 L3 should produce gzippy GZ multi-block format"
     );
+}
+
+// ── format interop ────────────────────────────────────────────────────────────
+
+#[test]
+fn single_thread_output_decompresses_with_standard_tools() {
+    // T=1 always produces a standard gzip stream.
+    let data = make_text(32 * 1024);
+    let compressed = gzippy::compress_with_threads(&data, 6, 1).unwrap();
+
+    let mut dec = flate2::read::GzDecoder::new(compressed.as_slice());
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).unwrap();
+    assert_eq!(out, data);
+}
+
+#[test]
+fn pipelined_parallel_high_level_is_standard_gzip() {
+    // T>1 L6–9 → PipelinedGzEncoder → single-member → standard tools can read it.
+    let data = make_text(128 * 1024);
+    let compressed = gzippy::compress_with_threads(&data, 9, 4).unwrap();
+
+    let mut dec = flate2::read::GzDecoder::new(compressed.as_slice());
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).unwrap();
+    assert_eq!(out, data);
+}
+
+#[test]
+fn parallel_low_level_gz_format_not_readable_by_standard_tools() {
+    // T>1 L0–5 → ParallelGzEncoder → gzippy "GZ" multi-block format.
+    // Standard tools see the BGZF-style header and fail or produce wrong output.
+    let data = make_text(512 * 1024);
+    let compressed = gzippy::compress_with_threads(&data, 3, 4).unwrap();
+
+    // Confirm it is the gzippy format.
+    assert_eq!(gzippy::classify(&compressed, 1), DecodePath::GzippyParallel);
+
+    // flate2 GzDecoder will not produce the correct output for this format.
+    let mut dec = flate2::read::GzDecoder::new(compressed.as_slice());
+    let mut out = Vec::new();
+    let _ = dec.read_to_end(&mut out); // may error or produce partial output
+    assert_ne!(
+        out, data,
+        "gzippy GZ format should NOT be readable by standard flate2 GzDecoder"
+    );
+}
+
+#[test]
+fn standard_gzip_from_any_tool_decompresses_correctly() {
+    let data = make_text(32 * 1024);
+    let compressed = gzip_encode_with_flate2(&data, 6);
+    let decompressed = gzippy::decompress(&compressed).unwrap();
+    assert_eq!(decompressed, data);
 }
 
 // ── edge cases ────────────────────────────────────────────────────────────────
@@ -240,59 +339,50 @@ fn single_byte_round_trip() {
 #[test]
 fn incompressible_data_round_trips() {
     let data = make_incompressible(128 * 1024);
-    let compressed = gzippy::compress(&data, 1).unwrap();
+    let compressed = gzippy::compress_with_threads(&data, 1, 1).unwrap();
     let decompressed = gzippy::decompress(&compressed).unwrap();
     assert_eq!(decompressed, data);
 }
 
 #[test]
 fn level_clamping_does_not_panic() {
-    // Level 0 and 12 are valid; these should not error.
     let data = make_text(1024);
+    // Levels 0 and 12 are the extremes of the valid range.
     gzippy::compress_with_threads(&data, 0, 1).unwrap();
     gzippy::compress_with_threads(&data, 12, 1).unwrap();
 }
 
-// ── interoperability ──────────────────────────────────────────────────────────
-
 #[test]
-fn gzippy_output_decompresses_with_flate2() {
-    // Single-threaded output must be a valid standard gzip stream.
-    let data = make_text(32 * 1024);
-    let compressed = gzippy::compress_with_threads(&data, 6, 1).unwrap();
-
-    let mut dec = flate2::read::GzDecoder::new(compressed.as_slice());
-    let mut out = Vec::new();
-    std::io::Read::read_to_end(&mut dec, &mut out).unwrap();
-    assert_eq!(out, data);
-}
-
-#[test]
-fn flate2_output_decompresses_with_gzippy() {
-    // gzippy must handle standard gzip input produced by any tool.
-    let data = make_text(32 * 1024);
-    let compressed = gzip_encode_with_flate2(&data, 6);
+fn compress_to_writer_empty_input() {
+    let mut compressed = Vec::new();
+    let consumed =
+        gzippy::compress_to_writer(std::io::Cursor::new(b""), &mut compressed, 6).unwrap();
+    assert_eq!(consumed, 0);
     let decompressed = gzippy::decompress(&compressed).unwrap();
-    assert_eq!(decompressed, data);
+    assert!(decompressed.is_empty());
 }
 
 // ── error handling ────────────────────────────────────────────────────────────
 
 #[test]
-fn decompress_garbage_returns_ok_empty() {
-    // Non-gzip input (no 0x1f 0x8b header) returns 0 bytes rather than an error —
-    // consistent with how the CLI handles non-gzip stdin.
-    let result = gzippy::decompress(b"this is not gzip data");
-    assert!(result.is_ok());
-    assert!(result.unwrap().is_empty());
+fn decompress_non_gzip_returns_ok_empty() {
+    // Non-gzip magic → Ok(empty) for all decompress variants.
+    let garbage = b"this is not gzip data";
+    assert_eq!(gzippy::decompress(garbage).unwrap(), b"");
+    assert_eq!(gzippy::decompress_with_threads(garbage, 1).unwrap(), b"");
+
+    let mut out = Vec::new();
+    assert_eq!(gzippy::decompress_to_writer(garbage, &mut out).unwrap(), 0);
+    assert_eq!(
+        gzippy::decompress_to_writer_with_threads(garbage, &mut out, 1).unwrap(),
+        0
+    );
 }
 
 #[test]
 fn decompress_truncated_gzip_errors() {
-    // A valid-looking header but truncated body should be an error.
     let mut compressed = gzip_encode_with_flate2(&make_text(1024), 6);
-    let trunc_len = compressed.len() / 2;
-    compressed.truncate(trunc_len);
+    compressed.truncate(compressed.len() / 2);
     let result = gzippy::decompress(&compressed);
     assert!(
         matches!(

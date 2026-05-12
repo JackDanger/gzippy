@@ -197,6 +197,8 @@ pub fn compress_bytes<R: Read, W: Write + Send>(
 
     let args = GzippyArgs {
         compression_level: level,
+        // `processes` flows into ZopfliTuning::thread_budget for the L11 path;
+        // non-zopfli routing uses opt_config.thread_count instead.
         processes: threads,
         ..GzippyArgs::default()
     };
