@@ -23,11 +23,11 @@ fn main() {
     println!("cargo:rerun-if-changed=scripts/pre-push");
     install_git_hooks();
 
-    #[cfg(feature = "oracle")]
-    build_zopfli_oracle();
+    if std::env::var("CARGO_FEATURE_ORACLE").is_ok() {
+        build_zopfli_oracle();
+    }
 }
 
-#[cfg(feature = "oracle")]
 fn build_zopfli_oracle() {
     let dir = "vendor/zopfli/src/zopfli";
     if !std::path::Path::new(&format!("{}/zopfli.h", dir)).exists() {

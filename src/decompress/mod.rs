@@ -405,6 +405,41 @@ pub(crate) fn decompress_zlib_turbo<W: Write>(data: &[u8], writer: &mut W) -> Gz
     }
 }
 
+/// Decompress a raw DEFLATE stream (RFC 1951) — no gzip header or trailer.
+///
+/// Uses libdeflate with a growing output buffer, falling back to flate2/zlib-ng
+/// streaming when the output exceeds 1 GiB.
+#[allow(dead_code)] // called from lib.rs; unused in the binary
+pub fn decompress_raw_bytes(data: &[u8]) -> GzippyResult<Vec<u8>> {
+    let mut decompressor = libdeflater::Decompressor::new();
+    const CAP: usize = 1 << 30; // 1 GiB
+    let mut estimate = data.len().saturating_mul(4).clamp(4096, CAP);
+
+    loop {
+        let mut out = vec![0u8; estimate];
+        match decompressor.deflate_decompress(data, &mut out) {
+            Ok(n) => {
+                out.truncate(n);
+                return Ok(out);
+            }
+            Err(libdeflater::DecompressionError::InsufficientSpace) if estimate < CAP => {
+                estimate = (estimate * 2).min(CAP);
+            }
+            Err(libdeflater::DecompressionError::InsufficientSpace) => break,
+            Err(_) => return Err(GzippyError::decompression("invalid raw DEFLATE data")),
+        }
+    }
+
+    // Output exceeds 1 GiB — stream through flate2/zlib-ng
+    use flate2::read::DeflateDecoder;
+    use std::io::Read;
+    let mut dec = DeflateDecoder::new(data);
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out)
+        .map_err(|_| GzippyError::decompression("raw DEFLATE decompression failed"))?;
+    Ok(out)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
