@@ -594,6 +594,29 @@ jobs:
           echo "Compressed: $(du -h benchmark_data/silesia-large.gz | cut -f1)"
           echo "Original: $(du -h benchmark_data/silesia-large.bin | cut -f1)"
 
+      - name: Diagnostic — confirm marker pipeline runs on Silesia
+        # Transient: one-shot trace to verify the v0.6 marker pipeline is
+        # actually selected for the Silesia fixture (vs a silent fallback to
+        # sequential libdeflate that would still produce correct output but
+        # at sequential-libdeflate throughput ~= unpigz). The bench script
+        # ignores stderr, so this step runs gzippy directly with
+        # GZIPPY_DEBUG=1 and surfaces the chosen path in CI logs.
+        # Drop after PR #90 lands and the throughput target is confirmed.
+        run: |
+          set -o pipefail
+          GZIPPY_DEBUG=1 ./bin/gzippy -d -p${THREADS} \
+              < benchmark_data/silesia-large.gz \
+              > /dev/null 2> diag.log
+          echo "----- Routing trace (head) -----"
+          head -20 diag.log || true
+          echo "--------------------------------"
+          if grep -q "parallel single-member failed" diag.log; then
+            echo "::warning ::Marker pipeline fell back to sequential — bench numbers are misleading"
+          fi
+          if grep -q "parallel_sm:v0.6.*total=" diag.log; then
+            echo "::notice ::Marker pipeline ran end-to-end on Silesia"
+          fi
+
       - name: Run single-member benchmark
         run: |
           python3 scripts/benchmark_single_member.py \
