@@ -43,7 +43,7 @@ THRESHOLDS = {
     "decomp_vs_rapidgzip": 0.99,          # Must be >= 99% of rapidgzip
     "decomp_vs_igzip": 0.90,              # Must be >= 90% of igzip (hand-tuned asm)
 
-    # Single-member parallel decompression (v0.3.0 ISA-L inflatePrime path)
+    # Single-member parallel decompression (v0.6 marker pipeline)
     "single_member_vs_rapidgzip": 0.99,   # Must be within 1% of rapidgzip
     "single_member_vs_pigz": 1.0,         # Must beat unpigz
 }
@@ -301,7 +301,7 @@ def check_decompression_guards(results: list) -> tuple:
 
 def check_single_member_guards(results_dir: str) -> tuple:
     """
-    Check single-member parallel decompression guards (v0.3.0 ISA-L inflatePrime path).
+    Check single-member parallel decompression guards (v0.6 marker pipeline).
 
     Returns (passed: bool, report: list of dicts)
     """

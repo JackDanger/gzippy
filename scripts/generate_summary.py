@@ -220,9 +220,13 @@ def generate_single_member_section(single_member: list) -> list:
     if not single_member:
         return lines
 
-    lines.append("## ⚡ Single-Member Parallel Decompression (v0.3.0 ISA-L path)")
+    lines.append("## ⚡ Single-Member Parallel Decompression (v0.6 marker pipeline)")
     lines.append("")
-    lines.append("Standard gzip file (no natural block boundaries). Tests the ISA-L `inflatePrime` pipeline.")
+    lines.append(
+        "Standard gzip file (no natural block boundaries). Tests the marker-based "
+        "parallel path: per-chunk pure-Rust marker decode + SIMD `replace_markers` "
+        "resolve, ~1.1N total compute work."
+    )
     lines.append("")
     lines.append("| Threads | gzippy Speed | vs rapidgzip | vs unpigz |")
     lines.append("|---------|--------------|--------------|-----------|")

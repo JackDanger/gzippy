@@ -545,7 +545,9 @@ jobs:
 
   # ============================================================================
   # STAGE 4b: Single-member parallel decompression benchmark (x86_64 only)
-  # Tests the v0.3.0 ISA-L inflatePrime path on a standard single-member file.
+  # Tests the v0.6 marker pipeline on a standard single-member file:
+  # per-chunk pure-Rust marker decode + SIMD `replace_markers` resolve,
+  # ~1.1N total compute work, scales ~T from T=2 upward.
   # arm64 skipped: ISA-L unavailable, parallel single-member path is gated off.
   # ============================================================================
   single-member-benchmark:

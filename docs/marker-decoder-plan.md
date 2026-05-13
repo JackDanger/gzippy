@@ -26,7 +26,7 @@ defense that ships *together with* the code at risk.
 
 ## Rollout
 
-### PR #93 — `fast_marker_inflate.rs` (correctness only) — **OPEN**
+### Engine PR — `fast_marker_inflate.rs` (correctness only) — *landed*
 
 Chains off PR #90. Adds the marker-emitting deflate decoder; **does not** wire
 into production routing. Lands when CI is green on this PR's own tests.
@@ -54,9 +54,9 @@ into production routing. Lands when CI is green on this PR's own tests.
       rapidgzip target per thread; T=4 saturates memory bandwidth. (commit
       d3205ea, `#[ignore]` throughput_vs_oracle test)
 
-### PR #94 — wire pipeline into production, delete v0.5.1 + legacy MarkerDecoder
+### Wiring PR — wire pipeline into production, delete v0.5.1 + legacy MarkerDecoder
 
-Lands when PR #93 is merged. The hard part is mitigation C — *make the marker
+Lands after the engine PR. The hard part is mitigation C — *make the marker
 pipeline the only parallel single-member path so future cleanups can't delete
 it*. Concretely:
 
@@ -98,9 +98,9 @@ it*. Concretely:
 `single_member_vs_rapidgzip ≥ 0.99` on Silesia. The routing-assertion test
 is green. The full test suite is green.
 
-### PR #95 (optional) — SIMD inner-loop optimizations
+### SIMD inner-loop PR (optional) — performance polish
 
-Lands only when PR #94 is merged and **only if `make ship` on the homelab
+Lands only when the wiring PR is merged and **only if `make ship` on the homelab
 shows headroom**. The current decoder is unoptimized (no BMI2/AVX2 inner-loop
 tricks). At 1352 MB/s/thread it already comfortably wins on 4-core CI; on a
 16-physical-core homelab it may want a SIMD fast path.
@@ -114,6 +114,9 @@ tricks). At 1352 MB/s/thread it already comfortably wins on 4-core CI; on a
 
 - **2026-05-12**: u16 bandwidth penalty empirically retired (ratio 1.03 on
   arm64). No design pivot needed.
-- **2026-05-12**: PR #93 lands with 12 tests including 200-trial diff fuzz
+- **2026-05-12**: engine PR lands with 12 tests including 200-trial diff fuzz
   + mid-stream integration. Throughput 1352 MB/s/thread on arm64.
-- **TBD**: PR #94 ratio-vs-rapidgzip on CI to be measured. Target: ≥ 0.99.
+- **2026-05-13**: wiring PR's ratio-vs-rapidgzip on CI: 0.62× (Silesia).
+  Root cause: one chunk's search region is all BTYPE=01 fixed-Huffman, which
+  BlockFinder excludes by design. Tracked as a follow-up: enhance BlockFinder
+  with BTYPE=01 emission + cheap fixed-Huffman prefilter.
