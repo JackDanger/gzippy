@@ -344,21 +344,29 @@ fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
         return false;
     }
 
-    // Stage 2: strict marker-decoder validation, with thresholds chosen so
-    // a fake stored block (~1 in 65536 random positions where LEN = ~NLEN
-    // by chance) cannot satisfy them. We require at least 2 successfully
-    // decoded blocks AND ≥ 32 KiB cumulative output. The "two blocks"
-    // constraint is the load-bearing one — a single false-positive stored
-    // block can reach 65535 bytes; two consecutive false-positive blocks
-    // require an event of probability ~2^-32. (Premortem mitigation B7;
-    // failure mode "approved stored-block false-positive that produces 34
-    // KB then BFINAL=true".)
+    // Stage 2: strict marker-decoder validation. The load-bearing condition
+    // is `min_blocks=2` — a single coincidentally-valid stored block (~1 in
+    // 65536 random positions where LEN = ~NLEN) cannot fake a *second*
+    // consecutive valid block (~2^-32 joint probability). A small
+    // `min_output_bytes` floor (256 bytes) rules out the degenerate
+    // "fixed-Huffman block that immediately emits EOB → 0 bytes output ×
+    // 2" case where two blocks decoded but neither produced anything.
+    //
+    // Earlier versions required `min_output_bytes = 32 KiB`. That rejected
+    // *real* boundaries on Silesia in some chunks — about 1/4 chunks on
+    // CI's 4-thread split had no candidate within 512 KiB that satisfied
+    // the 32 KiB threshold, so `decompress_parallel` returned Err and
+    // routing silently fell back to sequential libdeflate (gzippy bench
+    // measured ~201 MB/s = unpigz-class, vs rapidgzip's 326). With
+    // `min_blocks=2` the false-positive class is still blocked, but
+    // real-world boundaries with short-output blocks (e.g. fixed Huffman
+    // emitting a short run) make it through.
     use crate::decompress::parallel::fast_marker_inflate::validate_boundary;
     validate_boundary(
         deflate_data,
         bit_offset,
         /*min_blocks=*/ 2,
-        /*min_output_bytes=*/ 32 * 1024,
+        /*min_output_bytes=*/ 256,
     )
     .is_ok()
 }
