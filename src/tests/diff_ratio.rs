@@ -75,6 +75,17 @@ mod tests {
 
     /// Single-member 1MB: gzippy vs libdeflate.
     /// Exercises the single-member decode path (ISA-L or libdeflate sequential).
+    ///
+    /// **Noise handling**: shared macOS x86_64 GitHub runners are noisy enough
+    /// that a single median-of-20 spikes past threshold under runner
+    /// contention (observed 2026-05-13: 3.89× ratio on one job, 1.x ratio on
+    /// the parallel job for the same commit). Use best-of-3 batches: run
+    /// three independent 20-sample batches, keep the lowest median of each
+    /// tool's batch. The minimum-of-medians is the "least-contended" run
+    /// and correctly reflects uncontended throughput — a real regression
+    /// (e.g., a deliberate sleep added to the gzippy path) raises every
+    /// batch's median, so the min-of-medians moves with it; transient CI
+    /// runner spikes affect at most one batch and are filtered out.
     #[test]
     fn diff_ratio_single_member_1mb() {
         let fixture = crate::tests::fixtures::text_1mb();
@@ -82,26 +93,42 @@ mod tests {
         let out_size = fixture.plain.len() + 1024;
         let mut ld_buf = vec![0u8; out_size];
 
-        let (gzippy_ns, libdeflate_ns) = measure_alternating(
-            20,
-            || {
-                let _ = crate::decompress::decompress_gzip_to_vec(data, 1).unwrap();
-            },
-            || {
-                let mut d = libdeflater::Decompressor::new();
-                let _ = d.gzip_decompress(data, &mut ld_buf);
-            },
-        );
+        // Three best-of batches of 20. We can't use the per-batch min
+        // because measure_alternating returns medians; instead, repeat the
+        // whole batch three times and take the min batch-median for each
+        // tool independently. Each batch warms up internally so cold-cache
+        // effects don't bias one batch over another.
+        let mut gzippy_batches = [0u64; 3];
+        let mut libdeflate_batches = [0u64; 3];
+        for batch in 0..3 {
+            let (g, l) = measure_alternating(
+                20,
+                || {
+                    let _ = crate::decompress::decompress_gzip_to_vec(data, 1).unwrap();
+                },
+                || {
+                    let mut d = libdeflater::Decompressor::new();
+                    let _ = d.gzip_decompress(data, &mut ld_buf);
+                },
+            );
+            gzippy_batches[batch] = g;
+            libdeflate_batches[batch] = l;
+        }
+        let gzippy_ns = *gzippy_batches.iter().min().unwrap();
+        let libdeflate_ns = *libdeflate_batches.iter().min().unwrap();
 
         let ratio = gzippy_ns as f64 / libdeflate_ns as f64;
         let threshold = read_threshold("max_ratio", 1.15);
 
         eprintln!(
-            "diff_ratio_single_member_1mb: gzippy={:.2}ms libdeflate={:.2}ms ratio={:.3} threshold={:.3}",
+            "diff_ratio_single_member_1mb: gzippy={:.2}ms libdeflate={:.2}ms ratio={:.3} threshold={:.3} \
+             (best-of-3 batch medians; gzippy batches: {:?}, libdeflate batches: {:?})",
             gzippy_ns as f64 / 1e6,
             libdeflate_ns as f64 / 1e6,
             ratio,
-            threshold
+            threshold,
+            gzippy_batches.map(|n| n as f64 / 1e6),
+            libdeflate_batches.map(|n| n as f64 / 1e6),
         );
 
         if std::env::var("RECORD_BASELINES").is_ok() {
