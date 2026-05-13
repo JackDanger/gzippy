@@ -553,6 +553,13 @@ jobs:
   single-member-benchmark:
     name: Single-Member Decomp T${{ matrix.threads }} (x86_64)
     runs-on: ubuntu-latest
+    # Bound the job at 8 minutes. Earlier today (2026-05-13) a runaway
+    # tier-3 boundary-search sweep ran for 34+ s per gzippy invocation
+    # before the runner sent SIGTERM; the cause was ambiguous because the
+    # signal looked like generic runner preemption. An explicit job-level
+    # timeout turns that class of regression into a clear "exceeded
+    # timeout" failure instead of "runner died, who knows why."
+    timeout-minutes: 8
     needs: prepare-data
     strategy:
       fail-fast: false
