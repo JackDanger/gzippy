@@ -357,17 +357,23 @@ pub fn decode_chunk_markers_bounded(
     // **lower** bound — chunks no longer over-allocate at startup based on
     // the whole-stream length.
 
-    // Compute end_bit_offset = byte_offset*8 + bit_in_byte + bits_consumed.
-    // bits.pos is bytes pulled out of bits.data (which started at byte_offset),
-    // bits.available() is leftover bits in bitbuf.
+    // Compute end_bit_offset. Same arithmetic as `decode_loop`'s bit_pos:
+    //
+    //   bits.pos*8 - bits.available()  is the number of bits consumed
+    //   since `Bits::new(&data[byte_offset..])` — *including* the
+    //   `bit_in_byte` bits dropped at startup. Don't add `bit_in_byte`
+    //   again or it double-counts. Same bug that bit `decode_loop` until
+    //   PR #90 fixed it (commit 80f4e85); the return-value path here was
+    //   missed in that fix and was hidden by the lack of a cross-chunk
+    //   consistency check until D4 surfaced it on the
+    //   end_to_end_low_entropy_24mb_t4_matches_oracle test.
+    let _ = bit_in_byte; // intentionally unused — see note above
     let consumed_bytes_from_slice = bits.pos;
     let bits_in_buf = bits.available();
-    // Total bits we've eaten from bits.data: consumed_bytes_from_slice*8 - bits_in_buf
-    // (i.e. we pulled this many bytes into the buffer but bits_in_buf are unconsumed).
     let bits_consumed_from_slice = consumed_bytes_from_slice
         .saturating_mul(8)
         .saturating_sub(bits_in_buf as usize);
-    let end_bit_offset = byte_offset * 8 + bit_in_byte as usize + bits_consumed_from_slice;
+    let end_bit_offset = byte_offset * 8 + bits_consumed_from_slice;
 
     Ok((output, end_bit_offset))
 }

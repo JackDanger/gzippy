@@ -194,7 +194,42 @@ pub fn decompress_parallel<W: Write>(
         }
         return Err(ParallelError::DecodeFailed);
     }
-    let chunks: Vec<Vec<u16>> = chunks.into_iter().map(|c| c.unwrap()).collect();
+    let chunks: Vec<ChunkResult> = chunks.into_iter().map(|c| c.unwrap()).collect();
+
+    // ── D4: Cross-chunk end_bit consistency check ──────────────────────────
+    //
+    // Phase 1a returned each chunk's start bit, treating it as a real block
+    // boundary. Phase 1b decoded each chunk's range producing both bytes
+    // AND the end bit position. The contract: chunk N's end_bit MUST equal
+    // chunk N+1's start_bit. If not, phase 1a picked at least one
+    // misaligned boundary and the assembled output would be wrong (double-
+    // covered or with gaps) — the same root cause as the BTYPE=01 false-
+    // positive class that observed earlier today. Reject loudly here so
+    // routing falls back to sequential rather than emitting corrupt output.
+    //
+    // Premortem mitigation D4 (Opus advisor review). The strict
+    // `bit_pos > limit` check inside `decode_loop` already catches the
+    // case where a chunk overruns; this is the symmetric check for the
+    // case where a chunk *under-runs* (stops short of the next chunk's
+    // start because the limit happened to land before its first real
+    // boundary inside the chunk's range).
+    for i in 0..num_chunks - 1 {
+        let chunk_end_bit = chunks[i].1;
+        let next_start_bit = start_bits[i + 1];
+        if chunk_end_bit != next_start_bit {
+            if debug_enabled() {
+                eprintln!(
+                    "[parallel_sm:v0.6] cross-chunk consistency failure: chunk {i} ended at \
+                     bit {chunk_end_bit} but chunk {} starts at bit {next_start_bit} (delta \
+                     {} bits). Phase 1a picked a misaligned boundary.",
+                    i + 1,
+                    next_start_bit as i64 - chunk_end_bit as i64,
+                );
+            }
+            return Err(ParallelError::DecodeFailed);
+        }
+    }
+    let chunks: Vec<Vec<u16>> = chunks.into_iter().map(|c| c.0).collect();
 
     // ── Phase 2: sequential resolve + CRC + size accounting ─────────────────
     let t_resolve = std::time::Instant::now();
@@ -411,14 +446,26 @@ fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
 }
 
 // ── Phase 1b: parallel marker decode ─────────────────────────────────────────
+//
+// Each chunk's decode produces both the marker stream AND its end bit
+// offset — the bit position just past the last block consumed. D4 (cross-
+// chunk consistency) verifies that chunk N's end_bit_offset equals chunk
+// N+1's start_bit; any mismatch means phase 1a picked a misaligned
+// boundary for one of them, and the pipeline must reject rather than
+// emit double-covered or partial output.
+
+/// Phase 1b chunk result: the marker output and the bit position just past
+/// the last decoded block. D4 (cross-chunk consistency) requires both.
+type ChunkResult = (Vec<u16>, usize);
 
 fn phase1_marker_decode_parallel(
     deflate_data: &[u8],
     start_bits: &[usize],
     end_limits: &[Option<usize>],
-) -> Vec<Option<Vec<u16>>> {
+) -> Vec<Option<ChunkResult>> {
     let num_chunks = start_bits.len();
-    let results: Vec<Mutex<Option<Vec<u16>>>> = (0..num_chunks).map(|_| Mutex::new(None)).collect();
+    let results: Vec<Mutex<Option<ChunkResult>>> =
+        (0..num_chunks).map(|_| Mutex::new(None)).collect();
     let next_task = AtomicUsize::new(0);
 
     std::thread::scope(|s| {
@@ -430,10 +477,10 @@ fn phase1_marker_decode_parallel(
                 }
                 let start_bit = start_bits[idx];
                 let end_limit = end_limits[idx];
-                if let Ok((out, _)) =
+                if let Ok((out, end_bit)) =
                     decode_chunk_markers_bounded(deflate_data, start_bit, end_limit)
                 {
-                    *results[idx].lock().unwrap() = Some(out);
+                    *results[idx].lock().unwrap() = Some((out, end_bit));
                 }
             });
         }
