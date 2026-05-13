@@ -615,20 +615,27 @@ fn phase1c_resolve_consistency(
             }
             start_bits[i + 1] = Some(chunk_end_bit);
 
-            // If the corrected start lands at/past the end of the deflate
-            // stream, chunk N+1 is naturally empty — chunk N already
-            // decoded everything up to BFINAL. This is normal when an
-            // upstream chunk overshoots its speculative range to absorb
-            // a trailing portion that another chunk was supposed to do.
-            // Treat as Ok with zero-length output.
+            // If the corrected start leaves less than one block-header
+            // (3 bits) of input remaining, the predecessor chunk already
+            // absorbed BFINAL and what's left is only byte-padding before
+            // the gzip trailer. Chunk N+1 is naturally empty. This is
+            // normal when an upstream chunk overshoots its speculative
+            // range to consume the BFINAL block that a downstream chunk
+            // was supposed to handle.
+            //
+            // Threshold: < 8 bits remaining. 3 bits is the minimum block
+            // header size (BFINAL + BTYPE), but the byte-padding between
+            // the last block's last symbol and the gzip trailer can be
+            // up to 7 bits. Using 8 covers the worst case.
             let total_bits = deflate_data.len() * 8;
-            if chunk_end_bit >= total_bits {
+            if total_bits.saturating_sub(chunk_end_bit) < 8 {
                 if debug_enabled() {
                     eprintln!(
-                        "[parallel_sm:v0.6] phase1c: chunk {} starts at/past EOF \
-                         (chunk_end_bit={chunk_end_bit} >= total_bits={total_bits}); \
-                         marking empty",
-                        i + 1
+                        "[parallel_sm:v0.6] phase1c: chunk {} starts at/near EOF \
+                         (chunk_end_bit={chunk_end_bit}, total_bits={total_bits}, \
+                         remaining={}); marking empty (predecessor consumed BFINAL)",
+                        i + 1,
+                        total_bits.saturating_sub(chunk_end_bit)
                     );
                 }
                 chunks[i + 1] = Some((Vec::new(), chunk_end_bit));
