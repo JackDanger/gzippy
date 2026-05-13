@@ -299,6 +299,15 @@ mod tests {
     fn test_marker_pipeline_actually_runs_on_x86_64_isal() {
         use std::sync::atomic::Ordering;
 
+        // Serialize against any other test that calls `decompress_parallel`
+        // concurrently — under `cargo test`'s default parallel execution,
+        // another increment between `before` and `after` would mask a real
+        // silent-fallback regression with a false-positive pass. (Copilot
+        // review on PR #94.)
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
         let original = make_low_entropy_data(24 * 1024 * 1024);
         let compressed = compress_single_member_gzip(&original);
         assert!(

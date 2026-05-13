@@ -14,7 +14,9 @@
 //! - If ratio < 0.3, the algorithm can't win on memory-bandwidth-limited
 //!   hardware and the design must change.
 //!
-//! Run with: `cargo bench --bench u16_output_cost`.
+//! Run with: `cargo run --release --example u16_output_cost`.
+//! (It's an `examples/` file, not a `benches/` harness — `cargo bench` won't
+//! find it. Copilot review on PR #93 caught the original instruction.)
 
 use std::time::Instant;
 

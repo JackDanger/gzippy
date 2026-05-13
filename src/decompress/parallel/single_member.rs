@@ -73,7 +73,20 @@ const SEARCH_RADIUS: usize = 512 * 1024;
 /// Successful runs of the marker pipeline. Snapshot before/after a decode to
 /// confirm production routing actually called us — see the deletion-trap
 /// killer test in `src/tests/routing.rs`.
-pub static MARKER_PIPELINE_RUNS: AtomicU64 = AtomicU64::new(0);
+///
+/// `pub(crate)` rather than `pub`: the counter is an internal diagnostic
+/// surface for routing-assertion tests, not part of the library API.
+/// Downstream crates have no reason to read it. (Copilot review on PR #94.)
+pub(crate) static MARKER_PIPELINE_RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// Mutex serializing the body of the deletion-trap killer routing test
+/// against any other test in the crate that calls `decompress_parallel`
+/// concurrently. Without this lock, `cargo test`'s default parallel
+/// execution can cause another test to bump `MARKER_PIPELINE_RUNS`
+/// between the killer test's before/after snapshots, masking a real
+/// silent-fallback regression with a false positive. (Copilot review on
+/// PR #94.)
+pub(crate) static MARKER_PIPELINE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[inline]
 fn debug_enabled() -> bool {
@@ -804,6 +817,14 @@ mod tests {
 
     #[test]
     fn marker_pipeline_counter_increments_on_success() {
+        // Same Mutex as the routing-level deletion-trap killer. Under
+        // `cargo test`'s default parallel execution, concurrent unit tests
+        // that call `decompress_parallel` would otherwise bump the counter
+        // between the before/after snapshots and mask a real regression.
+        let _guard = MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
         let data = make_compressible_data(8 * 1024 * 1024);
         let compressed = make_gzip_data(&data);
         let before = MARKER_PIPELINE_RUNS.load(Ordering::Relaxed);
