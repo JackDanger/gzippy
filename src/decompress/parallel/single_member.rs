@@ -277,12 +277,21 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
     let finder = BlockFinder::new(deflate_data);
     let sub_chunk_bits = 8 * 1024 * 8;
     let mut chunk_start = from_bit;
+    let mut total_candidates: usize = 0;
+    let mut isal_passes: usize = 0;
+    let mut marker_passes: usize = 0;
     while chunk_start < search_end {
         let chunk_end = (chunk_start + sub_chunk_bits).min(search_end);
         let mut candidates = finder.find_blocks(chunk_start, chunk_end);
         candidates.sort_by_key(|b| b.bit_offset);
         for candidate in &candidates {
-            if try_decode_at(deflate_data, candidate.bit_offset) {
+            total_candidates += 1;
+            if try_decode_at_traced(
+                deflate_data,
+                candidate.bit_offset,
+                &mut isal_passes,
+                &mut marker_passes,
+            ) {
                 return Some(candidate.bit_offset);
             }
         }
@@ -290,9 +299,78 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
     }
     // Brute-force fallback within first 128 KiB.
     let brute_end = (from_bit + 128 * 1024 * 8).min(search_end);
-    (from_bit..brute_end)
-        .step_by(8)
-        .find(|&bit| try_decode_at(deflate_data, bit))
+    let mut brute_isal_passes: usize = 0;
+    let mut brute_marker_passes: usize = 0;
+    let mut brute_total: usize = 0;
+    let res = (from_bit..brute_end).step_by(8).find(|&bit| {
+        brute_total += 1;
+        try_decode_at_traced(
+            deflate_data,
+            bit,
+            &mut brute_isal_passes,
+            &mut brute_marker_passes,
+        )
+    });
+    if res.is_none() && debug_enabled() {
+        eprintln!(
+            "[parallel_sm:v0.6] search from bit {} ({}.{}) failed: \
+             BlockFinder candidates={} (isal_ok={} marker_ok={}), \
+             brute candidates={} (isal_ok={} marker_ok={})",
+            from_bit,
+            from_bit / 8,
+            from_bit % 8,
+            total_candidates,
+            isal_passes,
+            marker_passes,
+            brute_total,
+            brute_isal_passes,
+            brute_marker_passes,
+        );
+    }
+    res
+}
+
+/// Diagnostic-only wrapper: same accept/reject decision as `try_decode_at` but
+/// also increments per-stage counters so `search_boundary_forward` can report
+/// the distribution of failures when a chunk's search returns None.
+fn try_decode_at_traced(
+    deflate_data: &[u8],
+    bit_offset: usize,
+    isal_passes: &mut usize,
+    marker_passes: &mut usize,
+) -> bool {
+    let start_byte = bit_offset / 8;
+    if start_byte >= deflate_data.len() {
+        return false;
+    }
+    let remaining = deflate_data.len() - start_byte;
+    let min_output = if remaining > 128 * 1024 {
+        32 * 1024
+    } else {
+        4 * 1024
+    };
+    let isal_ok = crate::backends::inflate_bit::decompress_deflate_from_bit(
+        deflate_data,
+        bit_offset,
+        &[],
+        min_output,
+    )
+    .is_some_and(|out| out.len() >= min_output);
+    if !isal_ok {
+        return false;
+    }
+    *isal_passes += 1;
+    let marker_ok = crate::decompress::parallel::fast_marker_inflate::validate_boundary(
+        deflate_data,
+        bit_offset,
+        2,
+        256,
+    )
+    .is_ok();
+    if marker_ok {
+        *marker_passes += 1;
+    }
+    marker_ok
 }
 
 /// Validate a candidate boundary in two stages — see premortem mitigation
