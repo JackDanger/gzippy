@@ -270,27 +270,44 @@ mod tests {
         let out_size = fixture.plain.len() + 1024;
         let mut ld_buf = vec![0u8; out_size];
 
-        let (gzippy_ns, libdeflate_ns) = measure_alternating(
-            10,
-            || {
-                let _ =
-                    crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(bgzf_data, 4).unwrap();
-            },
-            || {
-                let mut d = libdeflater::Decompressor::new();
-                let _ = d.gzip_decompress(single_data, &mut ld_buf);
-            },
-        );
+        // Best-of-3 batches of 10. Same noise-handling pattern as
+        // `diff_ratio_single_member_1mb` — shared macOS x86_64 GitHub
+        // runners spike single-shot timings past the threshold under
+        // contention. Repeat the median-of-10 measurement three times
+        // and take the minimum per tool; a real regression raises all
+        // three batches, a one-shot CI spike affects at most one.
+        let mut gzippy_batches = [0u64; 3];
+        let mut libdeflate_batches = [0u64; 3];
+        for batch in 0..3 {
+            let (g, l) = measure_alternating(
+                10,
+                || {
+                    let _ = crate::decompress::bgzf::decompress_bgzf_parallel_to_vec(bgzf_data, 4)
+                        .unwrap();
+                },
+                || {
+                    let mut d = libdeflater::Decompressor::new();
+                    let _ = d.gzip_decompress(single_data, &mut ld_buf);
+                },
+            );
+            gzippy_batches[batch] = g;
+            libdeflate_batches[batch] = l;
+        }
+        let gzippy_ns = *gzippy_batches.iter().min().unwrap();
+        let libdeflate_ns = *libdeflate_batches.iter().min().unwrap();
 
         let ratio = gzippy_ns as f64 / libdeflate_ns as f64;
         let threshold = read_threshold("max_ratio_bgzf_10mb", 3.5);
 
         eprintln!(
-            "diff_ratio_bgzf_10mb: gzippy_T4={:.2}ms libdeflate_T1={:.2}ms ratio={:.3} threshold={:.3}",
+            "diff_ratio_bgzf_10mb: gzippy_T4={:.2}ms libdeflate_T1={:.2}ms ratio={:.3} threshold={:.3} \
+             (best-of-3 batch medians; gzippy: {:?}, libdeflate: {:?})",
             gzippy_ns as f64 / 1e6,
             libdeflate_ns as f64 / 1e6,
             ratio,
-            threshold
+            threshold,
+            gzippy_batches.map(|n| n as f64 / 1e6),
+            libdeflate_batches.map(|n| n as f64 / 1e6),
         );
 
         if std::env::var("RECORD_BASELINES").is_ok() {
