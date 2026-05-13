@@ -415,8 +415,37 @@ fn decode_loop(
         // and we've reached it (exactly at a block boundary, since that's
         // where we are right now), stop without consuming this block. The
         // chunk that owns `end_bit_limit` will pick up here.
+        //
+        // **Exact-match contract** (premortem D3): `end_bit_limit` MUST
+        // be a real block boundary. The caller (phase 1a) is responsible
+        // for picking it. If it isn't — e.g. because tier-2 brute force
+        // returned a position that decoded 32 KB cleanly but wasn't
+        // actually a block start — we'd land here at a `bit_pos`
+        // STRICTLY past `limit` (because we naturally only check at
+        // real boundaries). Treat that as a contract violation: return
+        // an explicit error. Phase 1b's caller turns this into
+        // `ParallelError::DecodeFailed`, which the typed routing
+        // fallback surfaces.
+        //
+        // Why this matters: silent overshoot lets chunks N and N+1
+        // double-cover the same byte range (chunk N runs past a
+        // misaligned `limit` to the next real boundary; chunk N+1
+        // starts at the misaligned `limit` and decodes the same bytes
+        // independently). Result: 2-3× expected output size, observed
+        // earlier today as the 62 MB / 25 MB SizeMismatch on the
+        // BTYPE=01-heavy fixture.
         if let Some(limit) = end_bit_limit {
-            if bit_pos >= limit {
+            if bit_pos > limit {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "decode_chunk_markers_bounded: bit_pos {bit_pos} overshot \
+                         end_bit_limit {limit} — caller picked a misaligned limit \
+                         (not a real block boundary). See premortem F7."
+                    ),
+                ));
+            }
+            if bit_pos == limit {
                 return Ok(());
             }
         }
