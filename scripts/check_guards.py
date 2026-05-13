@@ -44,16 +44,30 @@ THRESHOLDS = {
     "decomp_vs_igzip": 0.90,              # Must be >= 90% of igzip (hand-tuned asm)
 
     # Single-member parallel decompression (v0.6 marker pipeline).
-    # Hardware-class-aware: pure-Rust marker decoder per-thread is slower
-    # than ISA-L per-thread, so on 2-physical-core CI hardware (4 logical
-    # CPUs) T=4 parallelism can't compensate. The 0.99 target assumes
-    # ≥4 physical cores (where parallel speedup compensates), unblocked
-    # universally by the SIMD inner-loop PR (premortem PR #95 plan).
-    # See `single_member_thresholds_for_cores()`.
-    "single_member_vs_rapidgzip_high_core": 0.99,
-    "single_member_vs_pigz_high_core": 1.0,
-    "single_member_vs_rapidgzip_low_core": 0.50,  # catches v0.3.0-class 1.75× regressions
-    "single_member_vs_pigz_low_core": 0.85,
+    #
+    # Two thresholds per peer, named for what they MEAN — not just which
+    # hardware they run on (Opus advisor feedback on PR #97):
+    #
+    #   *_goal:         the universal performance target. Tight bound.
+    #                   Applies on ≥4 physical cores (the design target),
+    #                   where parallel speedup compensates for the pure-Rust
+    #                   marker decoder per-thread gap vs ISA-L.
+    #
+    #   *_sanity_floor: NOT a goal — just "are we still in the right
+    #                   ballpark." A v0.3.0-class 1.75× algorithmic
+    #                   regression would push the ratio below this floor,
+    #                   so it catches catastrophic regressions on small-core
+    #                   hardware where the goal is structurally unreachable
+    #                   (2-physical-core CI cannot beat ISA-L sequential
+    #                   with a pure-Rust marker decoder, no matter how
+    #                   correct the parallel orchestration is).
+    #
+    # When PR #95's SIMD inner loop lands, the gap closes and *_goal
+    # applies universally — at that point delete the floors.
+    "single_member_vs_rapidgzip_goal": 0.99,
+    "single_member_vs_pigz_goal": 1.0,
+    "single_member_vs_rapidgzip_low_core_sanity_floor": 0.50,
+    "single_member_vs_pigz_low_core_sanity_floor": 0.85,
 }
 
 
@@ -309,23 +323,29 @@ def check_decompression_guards(results: list) -> tuple:
 
 def single_member_thresholds_for_cores() -> tuple:
     """
-    Pick the single-member rapidgzip and pigz thresholds based on the
+    Pick the single-member rapidgzip and unpigz thresholds based on the
     CI runner's CPU count. GitHub `ubuntu-latest` reports 4 logical CPUs
     on 2 physical cores; we treat `<=4` as the "low-core" class where
-    pure-Rust marker pipeline can't beat ISA-L per-thread (see premortem
-    F5 + G6). Above 4, the universal 0.99/1.0 target applies.
-    Returns `(vs_rapidgzip, vs_pigz)`.
+    the pure-Rust marker pipeline structurally cannot beat ISA-L
+    per-thread (see premortem F5 + G6).
+    Returns `(vs_rapidgzip, vs_unpigz, is_low_core_sanity_floor)`.
+    The third return value flags whether the threshold is a "real goal"
+    (False) or a "sanity floor below which we know something is broken"
+    (True) — the printed report distinguishes the two so future readers
+    of a green CI run don't mistake a floor-pass for a goal-pass.
     """
     import os
     is_low_core = (os.cpu_count() or 0) <= 4
     if is_low_core:
         return (
-            THRESHOLDS["single_member_vs_rapidgzip_low_core"],
-            THRESHOLDS["single_member_vs_pigz_low_core"],
+            THRESHOLDS["single_member_vs_rapidgzip_low_core_sanity_floor"],
+            THRESHOLDS["single_member_vs_pigz_low_core_sanity_floor"],
+            True,
         )
     return (
-        THRESHOLDS["single_member_vs_rapidgzip_high_core"],
-        THRESHOLDS["single_member_vs_pigz_high_core"],
+        THRESHOLDS["single_member_vs_rapidgzip_goal"],
+        THRESHOLDS["single_member_vs_pigz_goal"],
+        False,
     )
 
 
@@ -345,7 +365,8 @@ def check_single_member_guards(results_dir: str) -> tuple:
     if not results_path.exists():
         return True, []
 
-    rapidgzip_threshold, pigz_threshold = single_member_thresholds_for_cores()
+    rapidgzip_threshold, pigz_threshold, is_floor = single_member_thresholds_for_cores()
+    floor_suffix = " (SANITY FLOOR, not goal — see THRESHOLDS comment)" if is_floor else ""
 
     for json_file in sorted(results_path.glob("*.json")):
         try:
@@ -376,12 +397,13 @@ def check_single_member_guards(results_dir: str) -> tuple:
                 ratio = gzippy_speed / rapid_speed
                 passed = ratio >= rapidgzip_threshold
                 report.append({
-                    "name": f"Single-member T{threads} vs rapidgzip",
+                    "name": f"Single-member T{threads} vs rapidgzip{floor_suffix}",
                     "metric": "speed_vs_rapidgzip",
                     "gzippy": gzippy_speed,
                     "other": rapid_speed,
                     "ratio": ratio,
                     "threshold": rapidgzip_threshold,
+                    "is_sanity_floor": is_floor,
                     "passed": passed,
                 })
                 if not passed:
@@ -394,12 +416,13 @@ def check_single_member_guards(results_dir: str) -> tuple:
                 ratio = gzippy_speed / unpigz_speed
                 passed = ratio >= pigz_threshold
                 report.append({
-                    "name": f"Single-member T{threads} vs unpigz",
+                    "name": f"Single-member T{threads} vs unpigz{floor_suffix}",
                     "metric": "speed_vs_pigz",
                     "gzippy": gzippy_speed,
                     "other": unpigz_speed,
                     "ratio": ratio,
                     "threshold": pigz_threshold,
+                    "is_sanity_floor": is_floor,
                     "passed": passed,
                 })
                 if not passed:

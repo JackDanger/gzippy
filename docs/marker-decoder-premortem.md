@@ -88,7 +88,7 @@ silently falls back to sequential ISA-L. **Output tests pass.** Only the
 deletion-trap killer counter test catches that the marker pipeline didn't
 actually run.
 
-### F7. The "BTYPE=01-heavy region returns None" failure  (acknowledged shipping limitation, PR #90)
+### F7. The "BTYPE=01-heavy region returns None" failure  (PR #90 limitation; correctness fixed by G5 in PR #97, throughput still bounded by sequential ISA-L on adversarial inputs until PR #95)
 
 Some compressed regions of real-world input (observed on Silesia, plus a
 synthetic adversarial fixture in `routing.rs::make_btype01_heavy_data`)
@@ -154,13 +154,24 @@ table in section G below):
   re-decode chunk N+1. Each chunk re-decodes at most once. Wall-time
   deadline (2 s) bounds adversarial cases.
 
-The cross-chunk consistency correction is **the structural fix** for
-F7. PR #90's top-K + strictness-ramp design (proposed in an earlier
-revision of this document) was probabilistic and didn't converge on
-BTYPE=01-heavy inputs — Opus advisor review identified that as the
-wrong layer to defend. The correction sweep is induction-based: every
-decode that starts at a real boundary lands at a real boundary, so
-chunk N's end_bit is always trustworthy. PR #96 is the rewrite.
+The cross-chunk consistency correction is the **correctness fix** for
+F7, not a throughput fix. PR #90's top-K + strictness-ramp design
+(proposed in an earlier revision of this document) was probabilistic
+and didn't converge on BTYPE=01-heavy inputs — Opus advisor review
+identified that as the wrong layer to defend. The correction sweep
+is induction-based: every decode that starts at a real boundary
+lands at a real boundary, so chunk N's end_bit is always trustworthy.
+PR #96 is the rewrite.
+
+**Honest framing** (Opus advisor PR #97 review, 2026-05-13): G5
+guarantees correctness and graceful behaviour on BTYPE=01-heavy
+inputs, but it does NOT improve per-thread throughput. When phase 1a's
+speculative pick is wrong, chunk N+1's re-decode is sequential by
+construction. Worst case (every chunk's speculation lands on a
+non-boundary) is fully serial — throughput on those inputs is bounded
+by sequential ISA-L (or pure-Rust marker decoder, which is worse).
+The pipeline is *correct* on BTYPE=01-heavy regions, not faster on
+them. Per-thread throughput gains require PR #95 (SIMD inner loop).
 
 The test `test_marker_pipeline_runs_on_btype01_heavy_input` is now
 un-ignored (was `#[ignore]`'d in PR #90 pending this PR).
@@ -239,8 +250,8 @@ wrong output.
 | G2 (refined in PR #96) | Phase 1a returns speculative boundary picks. BTYPE=01 false positives slip past `validate_boundary`. | PR #90's design: `decompress_parallel` verifies `chunks[N].end_bit == start_bits[N+1]` and returns Err on mismatch. PR #96's design: still verifies, but on mismatch **corrects** `start_bits[N+1] = chunks[N].end_bit` and re-decodes chunk N+1 (see G5). G2 is now a passive check inside G5's loop, not a separate rejection path. |
 | G3 | Routing's `Err(_) ⇒ fall back silently` hides "marker pipeline tried and failed" inside the same path as "input too small for parallel." Production looks identical to libdeflate; CI sees a generic perf shortfall. | Typed routing fallback: `ParallelError::TooSmall` is the only error that falls through silently. Every other variant increments `MARKER_PIPELINE_BOUNDARY_MISSED` and prints `[gzippy] parallel single-member fell back to sequential: {e}` to stderr unconditionally. `debug_assert!` panics in debug builds. (PR #90 commit 751b450.) |
 | G4 | Bench reports "gzippy 0.62× rapidgzip" without distinguishing "ran slow" from "never ran." | Bench script (`scripts/benchmark_single_member.py`) captures gzippy stderr with `GZIPPY_DEBUG=1` and parses for the G3 routing-trace message. Fails CI with a specific actionable reason: "marker pipeline did not run end-to-end on this fixture (silent fallback to sequential libdeflate). Throughput numbers reflect libdeflate, not the parallel path." (PR #90 commit c0f4f6d, extended in 751b450.) |
-| G5 (PR #97) | Cross-chunk consistency correction. `phase1c_resolve_consistency` walks pairs (N, N+1) once forward. When `chunks[N].end_bit != start_bits[N+1]`, the latter was a false positive (BTYPE=01 most often). Correct `start_bits[N+1] = chunks[N].end_bit` (which is a real boundary by G1 invariant) and re-decode chunk N+1. Propagate forward. Each chunk re-decodes at most once. Bounded by 2 s wall-time deadline. `MARKER_PIPELINE_RETRY_ITERATIONS` counts corrections — `>0` on BTYPE=01-heavy inputs, 0 on healthy data. Also handles `start_bits[i] == None` (phase 1a no-candidate) by chain-decoding from `chunks[i-1].end_bit`, and `chunks[i] = None` at near-EOF (predecessor consumed BFINAL) by marking chunk i empty. |
-| G6 (PR #97) | The 0.99× rapidgzip Tmax bench threshold assumed ≥4 physical cores. CI's `ubuntu-latest` reports 2 physical / 4 logical CPUs; pure-Rust marker decoder per-thread (~50 MB/s) × 2 cores can't match ISA-L per-thread (~163 MB/s) × 2 cores even with perfect parallelism. Bench guard ratio is now split: `0.99` on `cpu_count() > 4` (universal goal); `0.50` on `cpu_count() <= 4` (catches v0.3.0-class 1.75× regressions). Universal `0.99` returns when the SIMD inner-loop PR lands. `scripts/check_guards.py::single_member_thresholds_for_cores()`. |
+| G5 (PR #97) | Cross-chunk consistency correction. `phase1c_resolve_consistency` walks pairs (N, N+1) once forward. When `chunks[N].end_bit != start_bits[N+1]`, the latter was a false positive (BTYPE=01 most often). Correct `start_bits[N+1] = chunks[N].end_bit` (which is a real boundary by G1 invariant) and re-decode chunk N+1. Propagate forward. Each chunk re-decodes at most once. Bounded by 2 s wall-time deadline. `MARKER_PIPELINE_RETRY_ITERATIONS` counts corrections — `>0` on BTYPE=01-heavy inputs, 0 on healthy data; `test_marker_pipeline_runs_on_btype01_heavy_input` asserts it incremented, locking in coverage of the chain-decode path. Also handles `start_bits[i] == None` (phase 1a no-candidate) by chain-decoding from `chunks[i-1].end_bit`, and `chunks[i] = None` at near-EOF (predecessor consumed BFINAL) by marking chunk i empty. **What G5 does NOT do**: improve per-thread throughput. Re-decode is serial; worst-case adversarial input degrades to sequential ISA-L speed. G5 is correctness + graceful fallback, not throughput. |
+| G6 (PR #97) | The 0.99× rapidgzip Tmax bench threshold assumed ≥4 physical cores. CI's `ubuntu-latest` reports 2 physical / 4 logical CPUs; pure-Rust marker decoder per-thread (~50 MB/s) × 2 cores can't match ISA-L per-thread (~163 MB/s) × 2 cores even with perfect parallelism. **Threshold split is named for what it MEANS** (Opus advisor PR #97 review of the D3 risk): `*_goal` (≥4 physical cores) — the universal "fastest gzip" target, 0.99/1.0. `*_low_core_sanity_floor` (`cpu_count() <= 4`) — explicitly **not** a goal; catches v0.3.0-class 1.75× algorithmic regressions on hardware where the goal is structurally unreachable without SIMD. The names in `scripts/check_guards.py::THRESHOLDS` make this distinction visible in any diff that touches them — lowering a `_goal` is a real change; the existence of a `_sanity_floor` is a known-limitation acknowledgment. Both go away when PR #95's SIMD inner loop closes the per-thread gap. Also: `test_single_member_parallel_not_slower_than_sequential` asserts `ratio < 1.5` on ≥4 cores and `ratio < 3.0` on <4 cores (rather than skipping the assertion) so catastrophic regressions on small-core hardware still go red. |
 
 ---
 

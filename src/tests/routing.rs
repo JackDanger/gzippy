@@ -353,17 +353,14 @@ mod tests {
     //
     // The v0.6 marker pipeline has no per-physical-core routing gate (the
     // earlier core floor was dropped — see `docs/marker-decoder-plan.md`).
-    // On ≥4-physical-core hardware parallel comfortably beats sequential.
-    // On < 4 physical cores (e.g. 2-core CI runners), parallel-at-T=4
-    // contends for the available cores AND pays thread-scope overhead
-    // that sequential at T=1 doesn't — ratios in the 1.5–2.0× range are
-    // structural, not bugs.
-    //
-    // The assertion threshold (`ratio < 1.5`) only fires on ≥ 4 physical
-    // cores so it catches the v0.3.0-class algorithmic regression
-    // (1.75×) without going red on 2-core CI hardware. On < 4 cores
-    // the test still runs both paths (the bench helper asserts byte
-    // count) and prints the ratio diagnostically.
+    // On ≥4-physical-core hardware parallel comfortably beats sequential
+    // (tight assertion: ratio < 1.5 catches v0.3.0-class 1.75× regression).
+    // On <4 physical cores (e.g. 2-core CI runners) parallel-at-T=4 pays
+    // Amdahl tax that sequential T=1 doesn't, so ratios in the 1.5–2.0×
+    // range are structural — but we still assert ratio < 3.0 there so a
+    // *catastrophic* regression (5×+) on small-core hardware doesn't slip
+    // through (Opus advisor feedback on PR #97: removing the assertion
+    // entirely lost regression protection on the most common CI class).
     // =========================================================================
     #[test]
     fn test_single_member_parallel_not_slower_than_sequential() {
@@ -408,25 +405,21 @@ mod tests {
              sequential={seq_mbps:.0} MB/s  parallel(T=4)={par_mbps:.0} MB/s  ratio={ratio:.2}"
         );
 
-        // The interesting assertion only fires on ≥4 physical cores. On
-        // 2-core CI runners the marker pipeline at T=4 contends for two
-        // physical cores and pays parallel-overhead Amdahl tax that
-        // sequential T=1 doesn't — ratio > 1.5 is structural, not a
-        // bug. The threshold of 1.5 targets the v0.3.0-class algorithmic
-        // regression (1.75× from wasted phase-1 work), not 2-core
-        // hardware contention.
-        //
-        // On < 4 physical cores, the test still runs both paths
-        // (correctness-checking the output byte count via the bench
-        // helper above) and prints the ratio diagnostically — it just
-        // doesn't fail.
-        if physical >= 4 {
-            assert!(
-                ratio < 1.5,
-                "parallel single-member must not be > 1.5× slower than sequential: \
-                 par={par:?} seq={seq:?} ratio={ratio:.2} physical_cores={physical}"
-            );
-        }
+        // Two-tier threshold (Opus advisor feedback on PR #97): on
+        // ≥4 physical cores the bar is tight (1.5×) — anything looser
+        // wouldn't catch the v0.3.0-class 1.75× algorithmic regression.
+        // On <4 physical cores keep a *relaxed* bar (3.0×) instead of
+        // disabling the assertion entirely, so a catastrophic regression
+        // on 2-core hardware (e.g. parallel path becomes 5× slower than
+        // sequential) is still caught. The structural 1.5–2.0× tax on
+        // 2-core CI is below 3.0×.
+        let threshold = if physical >= 4 { 1.5 } else { 3.0 };
+        assert!(
+            ratio < threshold,
+            "parallel single-member must not be > {threshold:.1}× slower than sequential \
+             on {physical}-physical-core hardware: \
+             par={par:?} seq={seq:?} ratio={ratio:.2}"
+        );
     }
 
     /// 60% random / 40% short repetition — compresses to ~60% of original.
@@ -523,27 +516,53 @@ mod tests {
             compressed.len()
         );
 
-        let before = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+        let before_runs = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
             .load(Ordering::Relaxed);
+        let before_retries =
+            crate::decompress::parallel::single_member::MARKER_PIPELINE_RETRY_ITERATIONS
+                .load(Ordering::Relaxed);
         let mut output = Vec::new();
         crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
         assert_eq!(output, original, "byte-perfect output");
-        let after = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+        let after_runs = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
             .load(Ordering::Relaxed);
+        let after_retries =
+            crate::decompress::parallel::single_member::MARKER_PIPELINE_RETRY_ITERATIONS
+                .load(Ordering::Relaxed);
 
         #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
-        assert!(
-            after > before,
-            "MARKER_PIPELINE_RUNS did not increment ({before} -> {after}) on \
-             BTYPE=01-heavy fixture — BlockFinder enhancement regressed or \
-             never landed. This is the second deletion-trap killer; the \
-             first one (low-entropy fixture) passes because BlockFinder \
-             finds BTYPE=10 candidates there. The point of THIS test is \
-             that real-world data sometimes has only BTYPE=01 boundaries \
-             in a chunk's search range."
-        );
+        {
+            assert!(
+                after_runs > before_runs,
+                "MARKER_PIPELINE_RUNS did not increment ({before_runs} -> {after_runs}) on \
+                 BTYPE=01-heavy fixture — BlockFinder enhancement regressed or \
+                 never landed. This is the second deletion-trap killer; the \
+                 first one (low-entropy fixture) passes because BlockFinder \
+                 finds BTYPE=10 candidates there. The point of THIS test is \
+                 that real-world data sometimes has only BTYPE=01 boundaries \
+                 in a chunk's search range."
+            );
+            // Sibling killer for G5 (Opus advisor PR #97 review): without
+            // this assertion, the test passes even when phase 1a happens
+            // to land on a real boundary by luck — i.e. when G5 is a
+            // no-op. The whole point of the BTYPE=01-heavy fixture is to
+            // *force* misaligned speculative starts so G5's chain-decode
+            // correction sweep has to fire. If a future change makes
+            // phase 1a always succeed on this fixture, the cross-chunk
+            // correction code path goes untested. This counter says "yes,
+            // at least one chunk needed correction" and locks in coverage.
+            assert!(
+                after_retries > before_retries,
+                "MARKER_PIPELINE_RETRY_ITERATIONS did not increment \
+                 ({before_retries} -> {after_retries}) on BTYPE=01-heavy fixture — \
+                 G5 cross-chunk correction code path is not being exercised \
+                 by the very fixture designed to force it. Either (a) phase 1a \
+                 got lucky on every chunk (regenerate fixture with more BTYPE=01 \
+                 density), or (b) phase 1c was bypassed by a routing change."
+            );
+        }
         #[cfg(not(all(target_arch = "x86_64", feature = "isal-compression")))]
-        let _ = (before, after);
+        let _ = (before_runs, after_runs, before_retries, after_retries);
     }
 
     // =========================================================================
