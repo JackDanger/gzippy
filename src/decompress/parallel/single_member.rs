@@ -181,24 +181,34 @@ pub fn decompress_parallel<W: Write>(
     }
 
     // ── Phase 1a: parallel speculative boundary search ──────────────────────
+    //
+    // Returns `Option<usize>` per chunk. A `None` means BlockFinder +
+    // byte-aligned brute force both failed to find a validated candidate
+    // within 512 KiB of the chunk's spacing-derived anchor — common in
+    // BTYPE=01-heavy regions where fixed-Huffman blocks have no header
+    // redundancy for `validate_boundary` to filter against. We do NOT
+    // reject here; phase 1c chain-decodes those chunks from the
+    // predecessor's confirmed end_bit. Chunk 0 must always succeed
+    // (anchored at bit 0); we still bail if it doesn't.
     let t_search = std::time::Instant::now();
     let mut start_bits_opt = phase1_search_boundaries(deflate_data, num_chunks, spacing_bits);
     let search_elapsed = t_search.elapsed();
 
-    if start_bits_opt.iter().any(Option::is_none) {
-        if debug_enabled() {
-            let n = start_bits_opt.iter().filter(|s| s.is_none()).count();
+    if start_bits_opt[0].is_none() {
+        // Should be impossible — chunk 0's "search" is hard-pinned to bit 0.
+        return Err(ParallelError::DecodeFailed);
+    }
+    if debug_enabled() {
+        let n = start_bits_opt.iter().filter(|s| s.is_none()).count();
+        if n > 0 {
             eprintln!(
-                "[parallel_sm:v0.6] {}/{} speculative boundary searches failed",
+                "[parallel_sm:v0.6] {}/{} speculative boundary searches failed; \
+                 phase 1c will chain-decode those chunks from predecessor end_bits",
                 n, num_chunks
             );
         }
-        return Err(ParallelError::DecodeFailed);
     }
-    let mut start_bits: Vec<usize> = start_bits_opt
-        .iter_mut()
-        .map(|s| s.take().unwrap())
-        .collect();
+    let mut start_bits: Vec<Option<usize>> = start_bits_opt.iter_mut().map(|s| s.take()).collect();
 
     // ── Phase 1b: parallel marker decode from speculative starts ────────────
     //
@@ -206,18 +216,22 @@ pub fn decompress_parallel<W: Write>(
     // admits some false positives on BTYPE=01 regions (no header redundancy
     // in fixed Huffman). After phase 1b, chunk N's *decoded* end_bit is
     // always a real block boundary (G1 invariant), so phase 1c uses it as
-    // chunk N+1's confirmed start.
+    // chunk N+1's confirmed start. Chunks with `None` start get a `None`
+    // decode result that phase 1c will fill in via chain-decode.
     let t_decode = std::time::Instant::now();
+    // end_limit[i] = start_bits[i+1] if both are Some; otherwise None and
+    // phase 1c applies the correction once chunk i decodes.
     let end_limits: Vec<Option<usize>> = (0..num_chunks)
         .map(|i| {
             if i + 1 < num_chunks {
-                Some(start_bits[i + 1])
+                start_bits[i + 1]
             } else {
                 None
             }
         })
         .collect();
-    let chunks_opt = phase1_marker_decode_parallel(deflate_data, &start_bits, &end_limits);
+    let chunks_opt =
+        phase1_marker_decode_parallel_with_optional_starts(deflate_data, &start_bits, &end_limits);
     let decode_elapsed = t_decode.elapsed();
     let mut chunks: Vec<Option<ChunkResult>> = chunks_opt;
 
@@ -477,9 +491,13 @@ fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
 /// the last decoded block. D4 (cross-chunk consistency) requires both.
 type ChunkResult = (Vec<u16>, usize);
 
-fn phase1_marker_decode_parallel(
+/// Decodes each chunk in parallel from its speculative start. Chunks whose
+/// `start_bits[i]` is `None` (phase 1a found no candidate) are skipped —
+/// their result stays `None` and phase 1c chain-decodes them from the
+/// predecessor's confirmed end_bit.
+fn phase1_marker_decode_parallel_with_optional_starts(
     deflate_data: &[u8],
-    start_bits: &[usize],
+    start_bits: &[Option<usize>],
     end_limits: &[Option<usize>],
 ) -> Vec<Option<ChunkResult>> {
     let num_chunks = start_bits.len();
@@ -494,7 +512,9 @@ fn phase1_marker_decode_parallel(
                 if idx >= num_chunks {
                     break;
                 }
-                let start_bit = start_bits[idx];
+                let Some(start_bit) = start_bits[idx] else {
+                    continue;
+                };
                 let end_limit = end_limits[idx];
                 if let Ok((out, end_bit)) =
                     decode_chunk_markers_bounded(deflate_data, start_bit, end_limit)
@@ -530,7 +550,7 @@ fn phase1_marker_decode_parallel(
 /// routing-layer fallback (G3/G4) surface the failure.
 fn phase1c_resolve_consistency(
     deflate_data: &[u8],
-    start_bits: &mut [usize],
+    start_bits: &mut [Option<usize>],
     chunks: &mut [Option<ChunkResult>],
     deadline: std::time::Instant,
 ) -> Result<(), ParallelError> {
@@ -538,39 +558,41 @@ fn phase1c_resolve_consistency(
     if num_chunks == 0 {
         return Ok(());
     }
-    if num_chunks == 1 {
-        return if chunks[0].is_some() {
-            Ok(())
-        } else {
-            Err(ParallelError::DecodeFailed)
-        };
+
+    // Chunk 0's start is bit 0 by construction; it must have decoded
+    // unless the gzip stream is malformed. Bail if not.
+    if chunks[0].is_none() {
+        if debug_enabled() {
+            eprintln!(
+                "[parallel_sm:v0.6] phase1c: chunks[0] is None — bit 0 isn't a valid \
+                 deflate start; gzip stream likely corrupt"
+            );
+        }
+        return Err(ParallelError::DecodeFailed);
     }
+
+    if num_chunks == 1 {
+        return Ok(());
+    }
+
     let mut i: usize = 0;
     while i < num_chunks - 1 {
-        // chunks[i] is None means phase 1b's decode failed — this only
-        // happens if chunk i's *start* (start_bits[i]) was a false
-        // positive. (G1 with `>=` semantics never errors on a real
-        // start; the only failure is when start_bits[i] decodes invalid
-        // Huffman within the block.) Chunk 0 cannot fail this way
-        // (start_bits[0] = 0 is real); for i > 0, if we hit this we
-        // can't propagate forward because we don't have chunks[i]'s
-        // end_bit. Return Err.
-        let (_, chunk_end_bit) = match &chunks[i] {
-            Some(c) => (&c.0, c.1),
-            None => {
-                if debug_enabled() {
-                    eprintln!(
-                        "[parallel_sm:v0.6] phase1c: chunks[{i}] is None — chunk's own start \
-                         was a false positive. Can't propagate forward."
-                    );
-                }
-                return Err(ParallelError::DecodeFailed);
-            }
-        };
-        let expected_next_start = start_bits[i + 1];
+        let chunk_end_bit = chunks[i]
+            .as_ref()
+            .expect("invariant: chunks[i] is Some by this point")
+            .1;
+        let next_start = start_bits[i + 1];
 
-        // The correction step.
-        if chunk_end_bit != expected_next_start {
+        // The correction step fires when:
+        //   - start_bits[i+1] is None (phase 1a found no candidate; chain-decode), OR
+        //   - start_bits[i+1] is Some but != chunks[i].end_bit (false-positive
+        //     pick; correct to the real boundary).
+        let needs_correction = match next_start {
+            None => true,
+            Some(s) => s != chunk_end_bit,
+        };
+
+        if needs_correction {
             if std::time::Instant::now() >= deadline {
                 if debug_enabled() {
                     eprintln!(
@@ -584,28 +606,27 @@ fn phase1c_resolve_consistency(
             MARKER_PIPELINE_RETRY_ITERATIONS.fetch_add(1, Ordering::Relaxed);
             if debug_enabled() {
                 eprintln!(
-                    "[parallel_sm:v0.6] phase1c: correcting chunk {} start from {expected_next_start} \
+                    "[parallel_sm:v0.6] phase1c: correcting chunk {} start from {:?} \
                      to chunk {}'s end_bit {chunk_end_bit}",
                     i + 1,
+                    next_start,
                     i
                 );
             }
-            start_bits[i + 1] = chunk_end_bit;
+            start_bits[i + 1] = Some(chunk_end_bit);
 
-            // Re-decode chunk N+1 from the corrected start. Use chunk N+2's
-            // *current* start_bits as the speculative limit (may itself be
-            // wrong; the next iteration will detect and correct).
+            // Re-decode chunk N+1 from the corrected (= real) start.
+            // Use chunk N+2's *current* speculative start as the
+            // end_limit when present; the next iteration corrects it
+            // if needed.
             let new_end_limit = if i + 2 < num_chunks {
-                Some(start_bits[i + 2])
+                start_bits[i + 2]
             } else {
                 None
             };
             match decode_chunk_markers_bounded(deflate_data, chunk_end_bit, new_end_limit) {
                 Ok(result) => chunks[i + 1] = Some(result),
                 Err(_) => {
-                    // Re-decode failed at a real boundary — should be
-                    // impossible by G1 invariant unless the deflate stream
-                    // itself is corrupt. Return Err.
                     if debug_enabled() {
                         eprintln!(
                             "[parallel_sm:v0.6] phase1c: re-decode of chunk {} from real \
