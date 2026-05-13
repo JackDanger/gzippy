@@ -219,6 +219,81 @@ pub fn decode_chunk_markers(data: &[u8], start_bit_offset: usize) -> Result<(Vec
     decode_chunk_markers_bounded(data, start_bit_offset, None)
 }
 
+/// Validate a candidate deflate-block boundary by trial-decoding enough of
+/// the stream to make false positives statistically impossible.
+///
+/// Returns `Ok(())` if the decoder runs cleanly until BOTH:
+/// - at least `min_blocks` block headers were decoded successfully, AND
+/// - cumulative output reached `min_output_bytes`.
+///
+/// Returns `Err` on the first malformed block (invalid Huffman table, bad
+/// length code, LEN/NLEN mismatch, etc.) OR if the stream ends before the
+/// thresholds are met without reaching BFINAL.
+///
+/// Why two thresholds: a single stored block can legitimately reach 65535
+/// bytes of output, so `min_output_bytes` alone could be satisfied by a
+/// false-positive "fake stored block" whose LEN/NLEN happens to be valid
+/// by chance (~1 / 65536). `min_blocks ≥ 2` forces the validator past
+/// that single fake block — the chance two consecutive false-positive
+/// blocks both validate is astronomically small.
+pub fn validate_boundary(
+    data: &[u8],
+    start_bit_offset: usize,
+    min_blocks: u32,
+    min_output_bytes: usize,
+) -> Result<()> {
+    let byte_offset = start_bit_offset / 8;
+    let bit_in_byte = (start_bit_offset % 8) as u32;
+    if byte_offset >= data.len() {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "start_bit_offset past end of data",
+        ));
+    }
+    let mut bits = Bits::new(&data[byte_offset..]);
+    if bit_in_byte > 0 {
+        bits.consume(bit_in_byte);
+    }
+    let mut output: Vec<u16> = Vec::with_capacity(min_output_bytes.next_power_of_two().max(4096));
+    let mut blocks_decoded = 0u32;
+    loop {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+        if blocks_decoded >= min_blocks && output.len() >= min_output_bytes {
+            return Ok(());
+        }
+        let bfinal = (bits.peek() & 1) != 0;
+        let btype = ((bits.peek() >> 1) & 3) as u32;
+        bits.consume(3);
+        match btype {
+            0 => decode_stored(&mut bits, &mut output)?,
+            1 => decode_fixed(&mut bits, &mut output)?,
+            2 => decode_dynamic(&mut bits, &mut output)?,
+            _ => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type 3")),
+        }
+        blocks_decoded += 1;
+        if bfinal {
+            // BFINAL terminated the stream. For a true mid-stream boundary
+            // we'd expect many more blocks ahead, not a stream that ends
+            // right here. Accepting BFINAL with too few blocks decoded is
+            // how the "fake stored block" false positive slipped through
+            // (one BFINAL=true stored block with a coincidentally valid
+            // LEN/NLEN at a random offset). Require the same thresholds
+            // as the non-BFINAL path. A real near-EOF boundary won't be
+            // picked by `search_boundary_forward` — chunk starts are
+            // spaced over the whole stream, not packed at the tail.
+            if blocks_decoded >= min_blocks && output.len() >= min_output_bytes {
+                return Ok(());
+            }
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "BFINAL before min_blocks/min_output thresholds",
+            ));
+        }
+    }
+}
+
 /// Like `decode_chunk_markers` but also stops at a block boundary at or past
 /// `end_bit_limit` (if provided). Used by the parallel pipeline so worker N
 /// decodes only the range `[start_bits[N], start_bits[N+1])`. Without this
@@ -282,7 +357,7 @@ fn decode_loop(
     bits: &mut Bits,
     output: &mut Vec<u16>,
     base_byte: usize,
-    base_bit_in_byte: u32,
+    _base_bit_in_byte: u32,
     mut block_starts: Option<&mut Vec<usize>>,
     end_bit_limit: Option<usize>,
 ) -> Result<()> {
@@ -290,10 +365,23 @@ fn decode_loop(
         if bits.available() < 3 {
             bits.refill();
         }
-        // Absolute bit position at the start of this block (the header bit).
+        // Absolute bit position at the start of this block.
+        //
+        // `bits.pos` is bytes pulled from the slice that starts at
+        // `base_byte`. `bits.available()` is the unconsumed bits sitting
+        // in the bit buffer. So `bits.pos*8 - available()` is exactly the
+        // number of bits we have consumed since `Bits::new(&data[base_byte..])`
+        // was called — and this *already includes* the `bit_in_byte` bits
+        // the caller consumed at the top of `decode_chunk_markers_bounded`
+        // to align to the start. Earlier versions added `base_bit_in_byte`
+        // again here, double-counting the alignment, which made
+        // non-byte-aligned starts report a bit position `bit_in_byte` bits
+        // ahead of reality. That broke `end_bit_limit` (chunk decode
+        // stopped early → `SizeMismatch`) and broke `try_decode_at`'s
+        // strict validation (early-exit before any block was decoded).
         let bits_in_buf = bits.available() as usize;
         let consumed = bits.pos.saturating_mul(8).saturating_sub(bits_in_buf);
-        let bit_pos = base_byte * 8 + base_bit_in_byte as usize + consumed;
+        let bit_pos = base_byte * 8 + consumed;
 
         if let Some(starts) = block_starts.as_mut() {
             starts.push(bit_pos);
@@ -582,6 +670,12 @@ fn decode_huffman_block(
 #[inline]
 fn emit_match(output: &mut Vec<u16>, distance: usize, length: usize) {
     let out_pos = output.len();
+    // Reserve once for the full match so neither marker pushes nor local
+    // copies trigger reallocation checks per element. Per-thread
+    // throughput on x86_64 CI is sensitive to this — Vec::push without a
+    // prior reserve dominates the bench on adversarial fixtures.
+    output.reserve(length);
+
     // Number of bytes of the match that fall before the start of `output`.
     // Those become markers.
     let marker_count = distance.saturating_sub(out_pos).min(length);
@@ -593,20 +687,42 @@ fn emit_match(output: &mut Vec<u16>, distance: usize, length: usize) {
         output.push(MARKER_BASE + offset as u16);
     }
     // Remaining bytes are chunk-local; source is `output[out_pos + i - distance]`
-    // for i ∈ marker_count..length. After the markers are pushed, out_pos has
-    // advanced by marker_count, so the local copy starts at position
-    // `out_pos + marker_count` in the output and reads from
-    // `(out_pos + marker_count) - distance`.
+    // for i ∈ marker_count..length. After the markers are pushed, the local
+    // copy starts at position `out_pos + marker_count` in the output and
+    // reads from `(out_pos + marker_count) - distance`.
     let local_count = length - marker_count;
-    if local_count > 0 {
-        // Element-by-element copy to correctly handle the RLE case (distance < length)
-        // where the destination overlaps the source. Markers carried in the source
-        // slice propagate unchanged because we copy u16, not u8.
-        let base_dst = out_pos + marker_count;
+    if local_count == 0 {
+        return;
+    }
+    let base_dst = out_pos + marker_count;
+    let src_start = base_dst - distance;
+    if distance >= local_count {
+        // Source and destination ranges do not overlap → bulk copy.
+        // SAFETY: capacity reserved above; src range fully exists in output
+        // (src_start + local_count = base_dst ≤ out_pos + length, and
+        // src_start ≥ 0 ensured by `base_dst ≥ distance` from the
+        // marker_count branch). copy_within handles overlap correctness;
+        // we hit the non-overlap branch so it stays a single memcpy.
+        unsafe {
+            let len_before = output.len();
+            let ptr = output.as_mut_ptr();
+            std::ptr::copy_nonoverlapping(ptr.add(src_start), ptr.add(len_before), local_count);
+            output.set_len(len_before + local_count);
+        }
+    } else {
+        // RLE case (distance < local_count): destination overlaps source.
+        // Must copy element-by-element so each new write becomes visible
+        // to the read pointer (e.g. distance=1 fills with repeated byte).
         for i in 0..local_count {
             let src = base_dst + i - distance;
-            let v = output[src];
-            output.push(v);
+            // SAFETY: src < base_dst + i ≤ output.len() once previous
+            // pushes land; reserve above gives us the capacity.
+            unsafe {
+                let v = *output.as_ptr().add(src);
+                let len = output.len();
+                output.as_mut_ptr().add(len).write(v);
+                output.set_len(len + 1);
+            }
         }
     }
 }
@@ -618,6 +734,63 @@ mod tests {
     use super::*;
     use crate::decompress::parallel::replace_markers::{replace_markers, u16_to_u8};
     use std::io::Write;
+
+    /// Premortem regression — full-pipeline equivalent of the production
+    /// failure observed on CI. Compress 24 MiB of low-entropy data with
+    /// flate2 default level 6 (matches `routing::test_marker_pipeline_*`'s
+    /// fixture), run `decompress_parallel(T=4)` directly, and assert
+    /// byte-identical output to the original. This exercises:
+    ///
+    /// 1. Boundary search → `try_decode_at` → `validate_boundary` rejecting
+    ///    false-positive stored-block candidates (the bug that returned 12.7
+    ///    MB instead of 24 MB output and caused the deletion-trap killer to
+    ///    fire on CI).
+    /// 2. `decode_chunk_markers_bounded` decoding the full range with
+    ///    non-byte-aligned starts (the bit-position arithmetic fix —
+    ///    previously `base_bit_in_byte` was double-counted, making chunk
+    ///    decode terminate early on bit-aligned starts).
+    ///
+    /// Sized identically to the routing fixture so a regression of either
+    /// failure surfaces here without requiring the x86_64 + ISA-L gate.
+    #[test]
+    fn end_to_end_low_entropy_24mb_t4_matches_oracle() {
+        // Same generator as `tests::routing::tests::make_low_entropy_data`.
+        let size = 24 * 1024 * 1024;
+        let mut original = Vec::with_capacity(size);
+        let mut rng: u64 = 0xfeedface;
+        while original.len() < size {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if (rng >> 32) % 5 < 3 {
+                original.push((rng >> 16) as u8);
+            } else {
+                let byte = ((rng >> 24) % 26 + b'a' as u64) as u8;
+                let repeat = ((rng >> 40) % 8 + 2) as usize;
+                for _ in 0..repeat.min(size - original.len()) {
+                    original.push(byte);
+                }
+            }
+        }
+        original.truncate(size);
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&original).expect("encode");
+        let compressed = encoder.finish().expect("finish encoder");
+        assert!(compressed.len() > 10 * 1024 * 1024);
+
+        let mut output = Vec::with_capacity(original.len());
+        crate::decompress::parallel::single_member::decompress_parallel(
+            &compressed,
+            &mut output,
+            4,
+        )
+        .expect("decompress_parallel must succeed; if this asserts the validator regressed");
+        assert_eq!(
+            output.len(),
+            original.len(),
+            "size mismatch — chunk decode probably terminated early at a false-positive boundary"
+        );
+        assert_eq!(output, original, "byte mismatch");
+    }
 
     /// Compress `data` into a raw deflate stream (no gzip wrapper).
     fn make_deflate(data: &[u8], level: u32) -> Vec<u8> {

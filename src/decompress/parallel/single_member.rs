@@ -344,13 +344,23 @@ fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
         return false;
     }
 
-    // Stage 2: strict marker-decoder validation, scoped to one block.
-    // `end_bit_limit = Some(bit_offset + 1)` tells the decoder to stop at
-    // the next block boundary at or past `bit_offset + 1`, which is
-    // exactly "after the first block." A real boundary decodes one block
-    // and returns Ok; a false positive returns Err somewhere mid-block.
-    use crate::decompress::parallel::fast_marker_inflate::decode_chunk_markers_bounded;
-    decode_chunk_markers_bounded(deflate_data, bit_offset, Some(bit_offset + 1)).is_ok()
+    // Stage 2: strict marker-decoder validation, with thresholds chosen so
+    // a fake stored block (~1 in 65536 random positions where LEN = ~NLEN
+    // by chance) cannot satisfy them. We require at least 2 successfully
+    // decoded blocks AND ≥ 32 KiB cumulative output. The "two blocks"
+    // constraint is the load-bearing one — a single false-positive stored
+    // block can reach 65535 bytes; two consecutive false-positive blocks
+    // require an event of probability ~2^-32. (Premortem mitigation B7;
+    // failure mode "approved stored-block false-positive that produces 34
+    // KB then BFINAL=true".)
+    use crate::decompress::parallel::fast_marker_inflate::validate_boundary;
+    validate_boundary(
+        deflate_data,
+        bit_offset,
+        /*min_blocks=*/ 2,
+        /*min_output_bytes=*/ 32 * 1024,
+    )
+    .is_ok()
 }
 
 // ── Phase 1b: parallel marker decode ─────────────────────────────────────────
