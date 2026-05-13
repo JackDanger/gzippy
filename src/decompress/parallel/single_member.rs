@@ -615,6 +615,27 @@ fn phase1c_resolve_consistency(
             }
             start_bits[i + 1] = Some(chunk_end_bit);
 
+            // If the corrected start lands at/past the end of the deflate
+            // stream, chunk N+1 is naturally empty — chunk N already
+            // decoded everything up to BFINAL. This is normal when an
+            // upstream chunk overshoots its speculative range to absorb
+            // a trailing portion that another chunk was supposed to do.
+            // Treat as Ok with zero-length output.
+            let total_bits = deflate_data.len() * 8;
+            if chunk_end_bit >= total_bits {
+                if debug_enabled() {
+                    eprintln!(
+                        "[parallel_sm:v0.6] phase1c: chunk {} starts at/past EOF \
+                         (chunk_end_bit={chunk_end_bit} >= total_bits={total_bits}); \
+                         marking empty",
+                        i + 1
+                    );
+                }
+                chunks[i + 1] = Some((Vec::new(), chunk_end_bit));
+                i += 1;
+                continue;
+            }
+
             // Re-decode chunk N+1 from the corrected (= real) start.
             // Use chunk N+2's *current* speculative start as the
             // end_limit when present; the next iteration corrects it
