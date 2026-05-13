@@ -109,7 +109,9 @@ which PR added what, the throughput measurements that justified the
 design, and the explicit decision log. If you are about to change anything
 here, update that document so future agents see the current state.
 
-The premortem that informed the design lives in PR #90 review comments
-(GitHub). The single most important insight: **prior attempts were deleted
-because they lived outside the production path**, not because they were
-algorithmically wrong. Keep this module wired in and tested, and it stays.
+The premortem that informed the design lives at
+`docs/marker-decoder-premortem.md` — checked into the repo so a future
+agent doesn't have to spelunk through PR comments. The single most
+important insight: **prior attempts were deleted because they lived
+outside the production path**, not because they were algorithmically
+wrong. Keep this module wired in and tested, and it stays.

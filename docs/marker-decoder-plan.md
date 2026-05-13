@@ -20,8 +20,9 @@ Prior marker attempts (b3bf6df, 4bbf04f predecessor) failed because:
 2. It crashed on non-byte-aligned chunk starts.
 3. It lived outside the production path and got cleanup-deleted.
 
-The premortem (see PR #90 comment thread) names each failure mode and the
-mitigation that lands together with the code that risks it.
+The premortem lives at `docs/marker-decoder-premortem.md`. It names every
+failure mode (F1–F6, plus the A/B/C/D/E mitigation catalogue) and the
+defense that ships *together with* the code at risk.
 
 ## Rollout
 
