@@ -291,21 +291,29 @@ fn phase1_search_boundaries(
 
 /// Search forward from `from_bit` for a valid deflate block boundary.
 ///
-/// Two tiers: BlockFinder heuristic candidates first, then byte-aligned
-/// brute force. Both call `try_decode_at` (ISA-L fast filter + strict
-/// marker-validator). A planned tier-3 bit-by-bit marker-validator sweep
-/// was attempted (commits b898a11/cc1cef6) but proved too slow on
-/// Silesia in CI even with a 200 ms wall-time budget — per-probe cost
-/// on random data routinely exceeds the per-iteration check granularity.
-/// When both tiers miss, return None and accept the silent fallback for
-/// that chunk; the deletion-trap killer test still asserts the marker
-/// pipeline runs on its own 24 MiB fixture.
+/// Three tiers:
+///
+/// 1. **BlockFinder heuristic candidates** (BTYPE=00 stored + BTYPE=10
+///    dynamic Huffman). Most real boundaries.
+/// 2. **Byte-aligned brute force** (first 128 KiB). Catches a few more.
+/// 3. **BTYPE=01 fixed-Huffman bit-sweep** (first 64 KiB, 200 ms budget).
+///    BlockFinder excludes BTYPE=01 by design — fixed Huffman has no
+///    header to validate cheaply enough at LUT-emission time. On Silesia
+///    at least one chunk's region had only BTYPE=01 boundaries; without
+///    tier 3 the pipeline silently fell back to sequential libdeflate.
+///
+/// Tier 3 uses a cheap pre-filter (`block_finder::validate_fixed_block_prefix`,
+/// ~50 ns/probe) before invoking the strict `try_decode_at`, so the bit-
+/// by-bit sweep stays well within the wall-time budget even on adversarial
+/// random data (an earlier version without the prefilter blew the CI
+/// runner's 8-minute job timeout — see PR #90 commits b898a11/cc1cef6).
 fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize> {
     let search_end = (from_bit + SEARCH_RADIUS * 8).min(deflate_data.len() * 8);
     if from_bit >= search_end {
         return None;
     }
 
+    // Tier 1: BlockFinder candidates.
     let finder = BlockFinder::new(deflate_data);
     let sub_chunk_bits = 8 * 1024 * 8;
     let mut chunk_start = from_bit;
@@ -320,11 +328,60 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
         }
         chunk_start = chunk_end;
     }
-    // Byte-aligned brute force fallback within first 128 KiB.
+
+    // Tier 2: byte-aligned brute force, first 128 KiB.
     let brute_end = (from_bit + 128 * 1024 * 8).min(search_end);
-    (from_bit..brute_end)
+    if let Some(b) = (from_bit..brute_end)
         .step_by(8)
         .find(|&bit| try_decode_at(deflate_data, bit))
+    {
+        return Some(b);
+    }
+
+    // Tier 3: BTYPE=01 fixed-Huffman bit-sweep, first 64 KiB,
+    // wall-time-budgeted. The prefilter rejects most random positions
+    // within ~50 ns by decoding two fixed-Huffman symbols and checking
+    // both decode validly; only positions that survive the prefilter
+    // pay the cost of `try_decode_at` (ISA-L + validate_boundary).
+    let sweep_end = (from_bit + 64 * 1024 * 8).min(search_end);
+    let sweep_start = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(200);
+    for bit in from_bit..sweep_end {
+        // Check the wall-clock budget every 4 KiB worth of probes. Even
+        // if a single probe were unusually slow, this caps the overshoot
+        // at a few extra calls — well short of the 8-minute CI timeout
+        // that an earlier unbounded sweep tripped.
+        if bit & 0xFFF == 0 && sweep_start.elapsed() > budget {
+            break;
+        }
+        let byte_idx = bit / 8;
+        if byte_idx + 1 >= deflate_data.len() {
+            break;
+        }
+        // Only investigate positions where the 3-bit header is
+        // BFINAL+BTYPE=01 (fixed Huffman). Saves the prefilter cost on
+        // ~3/4 of probed positions.
+        let bit_in_byte = bit % 8;
+        let two_bytes = deflate_data[byte_idx] as u16 | ((deflate_data[byte_idx + 1] as u16) << 8);
+        let header3 = (two_bytes >> bit_in_byte) & 0x7;
+        let btype = (header3 >> 1) & 3;
+        if btype != 1 {
+            continue;
+        }
+        // Cheap fixed-Huffman 2-symbol decode test. Rejects most false
+        // positives at the header-bits boundary. Passes are sent on to
+        // the strict `try_decode_at` check.
+        if !crate::decompress::parallel::block_finder::validate_fixed_block_prefix(
+            deflate_data,
+            bit + 3,
+        ) {
+            continue;
+        }
+        if try_decode_at(deflate_data, bit) {
+            return Some(bit);
+        }
+    }
+    None
 }
 
 /// Validate a candidate boundary in two stages — see premortem mitigation

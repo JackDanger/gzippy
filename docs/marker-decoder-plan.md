@@ -118,5 +118,11 @@ tricks). At 1352 MB/s/thread it already comfortably wins on 4-core CI; on a
   + mid-stream integration. Throughput 1352 MB/s/thread on arm64.
 - **2026-05-13**: wiring PR's ratio-vs-rapidgzip on CI: 0.62× (Silesia).
   Root cause: one chunk's search region is all BTYPE=01 fixed-Huffman, which
-  BlockFinder excludes by design. Tracked as a follow-up: enhance BlockFinder
-  with BTYPE=01 emission + cheap fixed-Huffman prefilter.
+  BlockFinder excludes by design.
+- **2026-05-13** (later): added tier-3 fixed-Huffman bit-sweep in
+  `single_member::search_boundary_forward` with a 64 KiB window and 200 ms
+  wall-time budget. Uses a 2-symbol fixed-Huffman prefilter
+  (`block_finder::validate_fixed_block_prefix`, ~50 ns/probe) before
+  invoking the strict `try_decode_at`. New deletion-trap killer
+  `test_marker_pipeline_runs_on_btype01_heavy_input` covers the class
+  going forward.

@@ -473,20 +473,14 @@ mod tests {
     /// Companion to `test_marker_pipeline_actually_runs_on_x86_64_isal` —
     /// same shape (decompress_single_member at T=4, counter snapshot), but
     /// against a fixture engineered to maximize fixed-Huffman (BTYPE=01)
-    /// block density. BlockFinder's heuristic excludes BTYPE=01 candidates
-    /// by design, so on this fixture the boundary-search currently returns
-    /// None for at least one chunk and routing silently falls back to
-    /// sequential libdeflate.
-    ///
-    /// **`#[ignore]` until the BlockFinder BTYPE=01 enhancement lands** —
-    /// see the "BlockFinder BTYPE=01 emission" follow-up in
-    /// `docs/marker-decoder-plan.md`. Without that enhancement this test
-    /// fails by construction (same root cause as the Silesia Tmax bench's
-    /// 0.62× rapidgzip ratio). Once the enhancement is in, remove the
-    /// `#[ignore]` and this becomes the second deletion-trap killer
-    /// covering the BTYPE=01-heavy input class.
+    /// block density. BlockFinder excludes BTYPE=01 candidates by design;
+    /// the tier-3 fixed-Huffman bit-sweep in
+    /// `single_member::search_boundary_forward` covers the gap. This test
+    /// is the second deletion-trap killer: if either the tier-3 sweep
+    /// regresses or BlockFinder's BTYPE=00/BTYPE=10 emission stops
+    /// catching the rare cases on this fixture, the counter won't move
+    /// and CI goes red with a specific message.
     #[test]
-    #[ignore = "blocked on BlockFinder BTYPE=01 enhancement (Red 1 in PR #90 plan)"]
     fn test_marker_pipeline_runs_on_btype01_heavy_input() {
         use std::sync::atomic::Ordering;
 
