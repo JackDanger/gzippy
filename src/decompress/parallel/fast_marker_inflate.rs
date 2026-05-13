@@ -322,7 +322,24 @@ pub fn decode_chunk_markers_bounded(
         bits.consume(bit_in_byte);
     }
 
-    let mut output: Vec<u16> = Vec::with_capacity(data.len() * 4);
+    // Capacity must scale with the bounded range, not all of `data`. Phase 1
+    // workers see the full deflate slice (potentially 100+ MB on Silesia)
+    // even though each only decodes ~25 MB of it; allocating 4 × data.len()
+    // per worker was ~1.3 GB/thread × 4 threads = 5 GB peak on Silesia, far
+    // beyond a CI runner's RAM budget. Bound by the worker's actual range:
+    //
+    //   if end_bit_limit provided: range = (end_bit - start_bit) / 8 bytes
+    //                              (× 4 worst-case expansion factor)
+    //   else (last chunk, runs to BFINAL): cap at remaining input × 4
+    //
+    // Per-thread overshoot caps at the chunk size, not the full stream.
+    // Copilot review on PR #94.
+    let range_bytes = match end_bit_limit {
+        Some(end) => end.saturating_sub(start_bit_offset).div_ceil(8),
+        None => data.len().saturating_sub(byte_offset),
+    };
+    let cap = range_bytes.saturating_mul(4).max(4096);
+    let mut output: Vec<u16> = Vec::with_capacity(cap);
 
     decode_loop(
         &mut bits,
@@ -332,6 +349,13 @@ pub fn decode_chunk_markers_bounded(
         None,
         end_bit_limit,
     )?;
+
+    // Capacity may grow during decode on highly compressible chunks (a single
+    // length-code with extras can expand 258× into output, so the 4× upper
+    // bound isn't airtight). Vec doubling handles that with O(N) amortized
+    // cost; the important property of the bounded initial capacity is the
+    // **lower** bound — chunks no longer over-allocate at startup based on
+    // the whole-stream length.
 
     // Compute end_bit_offset = byte_offset*8 + bit_in_byte + bits_consumed.
     // bits.pos is bytes pulled out of bits.data (which started at byte_offset),
