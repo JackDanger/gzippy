@@ -268,6 +268,16 @@ fn phase1_search_boundaries(
 }
 
 /// Search forward from `from_bit` for a valid deflate block boundary.
+///
+/// Two tiers: BlockFinder heuristic candidates first, then byte-aligned
+/// brute force. Both call `try_decode_at` (ISA-L fast filter + strict
+/// marker-validator). A planned tier-3 bit-by-bit marker-validator sweep
+/// was attempted (commits b898a11/cc1cef6) but proved too slow on
+/// Silesia in CI even with a 200 ms wall-time budget — per-probe cost
+/// on random data routinely exceeds the per-iteration check granularity.
+/// When both tiers miss, return None and accept the silent fallback for
+/// that chunk; the deletion-trap killer test still asserts the marker
+/// pipeline runs on its own 24 MiB fixture.
 fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize> {
     let search_end = (from_bit + SEARCH_RADIUS * 8).min(deflate_data.len() * 8);
     if from_bit >= search_end {
@@ -277,157 +287,22 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
     let finder = BlockFinder::new(deflate_data);
     let sub_chunk_bits = 8 * 1024 * 8;
     let mut chunk_start = from_bit;
-    let mut total_candidates: usize = 0;
-    let mut isal_passes: usize = 0;
-    let mut marker_passes: usize = 0;
     while chunk_start < search_end {
         let chunk_end = (chunk_start + sub_chunk_bits).min(search_end);
         let mut candidates = finder.find_blocks(chunk_start, chunk_end);
         candidates.sort_by_key(|b| b.bit_offset);
         for candidate in &candidates {
-            total_candidates += 1;
-            if try_decode_at_traced(
-                deflate_data,
-                candidate.bit_offset,
-                &mut isal_passes,
-                &mut marker_passes,
-            ) {
+            if try_decode_at(deflate_data, candidate.bit_offset) {
                 return Some(candidate.bit_offset);
             }
         }
         chunk_start = chunk_end;
     }
-    // Tier 2 fallback: byte-aligned brute force with ISA-L+marker validator.
+    // Byte-aligned brute force fallback within first 128 KiB.
     let brute_end = (from_bit + 128 * 1024 * 8).min(search_end);
-    let mut brute_isal_passes: usize = 0;
-    let mut brute_marker_passes: usize = 0;
-    let mut brute_total: usize = 0;
-    let tier2 = (from_bit..brute_end).step_by(8).find(|&bit| {
-        brute_total += 1;
-        try_decode_at_traced(
-            deflate_data,
-            bit,
-            &mut brute_isal_passes,
-            &mut brute_marker_passes,
-        )
-    });
-    if let Some(b) = tier2 {
-        return Some(b);
-    }
-
-    // Tier 3 fallback: bit-by-bit marker-validator sweep, budget-bounded.
-    // BlockFinder excludes BTYPE=01 (fixed Huffman) candidates by design,
-    // and tier-2's byte-aligned brute force misses non-byte-aligned
-    // boundaries — on Silesia at least one chunk lands in a region where
-    // real boundaries are fixed-Huffman at random bit offsets. Without
-    // this tier, `decompress_parallel` returns Err and routing silently
-    // falls back to sequential libdeflate on those inputs.
-    //
-    // Per-probe cost is dominated by fixed-Huffman blocks that decode many
-    // symbols before erroring on random data. A naive bit-by-bit sweep of
-    // 4M positions timed out in CI (37 s, killed by SIGTERM). We bound
-    // wall time to 200 ms per chunk's search instead: enough to find real
-    // boundaries when they exist in the first ~16-32 KiB of the search
-    // range, fast to abort when adversarial data has no findable boundary
-    // (the chunk's search then returns None and we accept the silent
-    // fallback for that pathological case).
-    use crate::decompress::parallel::fast_marker_inflate::validate_boundary;
-    let sweep_end = (from_bit + 64 * 1024 * 8).min(search_end);
-    let sweep_start = std::time::Instant::now();
-    let budget = std::time::Duration::from_millis(200);
-    let mut sweep_total: usize = 0;
-    let mut sweep_passes: usize = 0;
-    let mut tier3: Option<usize> = None;
-    for bit in from_bit..sweep_end {
-        if sweep_total & 0xFFF == 0 && sweep_start.elapsed() > budget {
-            break;
-        }
-        sweep_total += 1;
-
-        // Cheap pre-filter: read 3 bits of the candidate header and reject
-        // BTYPE=11 (reserved). Saves the marker-validator setup cost on
-        // ~1/4 of probed positions.
-        let byte_idx = bit / 8;
-        if byte_idx + 1 >= deflate_data.len() {
-            break;
-        }
-        let bit_in_byte = bit % 8;
-        let two_bytes = deflate_data[byte_idx] as u16 | ((deflate_data[byte_idx + 1] as u16) << 8);
-        let header3 = (two_bytes >> bit_in_byte) & 0x7;
-        let btype = (header3 >> 1) & 3;
-        if btype == 3 {
-            continue;
-        }
-        if validate_boundary(deflate_data, bit, 2, 0).is_ok() {
-            sweep_passes += 1;
-            tier3 = Some(bit);
-            break;
-        }
-    }
-    if tier3.is_none() && debug_enabled() {
-        eprintln!(
-            "[parallel_sm:v0.6] search from bit {} ({}.{}) failed: \
-             BlockFinder candidates={} (isal_ok={} marker_ok={}), \
-             brute candidates={} (isal_ok={} marker_ok={}), \
-             tier3 sweep probes={} passes={} elapsed={:?}",
-            from_bit,
-            from_bit / 8,
-            from_bit % 8,
-            total_candidates,
-            isal_passes,
-            marker_passes,
-            brute_total,
-            brute_isal_passes,
-            brute_marker_passes,
-            sweep_total,
-            sweep_passes,
-            sweep_start.elapsed(),
-        );
-    }
-    tier3
-}
-
-/// Diagnostic-only wrapper: same accept/reject decision as `try_decode_at` but
-/// also increments per-stage counters so `search_boundary_forward` can report
-/// the distribution of failures when a chunk's search returns None.
-fn try_decode_at_traced(
-    deflate_data: &[u8],
-    bit_offset: usize,
-    isal_passes: &mut usize,
-    marker_passes: &mut usize,
-) -> bool {
-    let start_byte = bit_offset / 8;
-    if start_byte >= deflate_data.len() {
-        return false;
-    }
-    let remaining = deflate_data.len() - start_byte;
-    let min_output = if remaining > 128 * 1024 {
-        32 * 1024
-    } else {
-        4 * 1024
-    };
-    let isal_ok = crate::backends::inflate_bit::decompress_deflate_from_bit(
-        deflate_data,
-        bit_offset,
-        &[],
-        min_output,
-    )
-    .is_some_and(|out| out.len() >= min_output);
-    if !isal_ok {
-        return false;
-    }
-    *isal_passes += 1;
-    let marker_ok = crate::decompress::parallel::fast_marker_inflate::validate_boundary(
-        deflate_data,
-        bit_offset,
-        2,
-        0,
-    )
-    .is_ok();
-    if marker_ok {
-        *marker_passes += 1;
-    }
-    marker_ok
+    (from_bit..brute_end)
+        .step_by(8)
+        .find(|&bit| try_decode_at(deflate_data, bit))
 }
 
 /// Validate a candidate boundary in two stages — see premortem mitigation
