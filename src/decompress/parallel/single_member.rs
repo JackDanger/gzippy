@@ -315,45 +315,61 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
         return Some(b);
     }
 
-    // Tier 3 fallback: bit-by-bit sweep with the marker validator only,
-    // bounded to a 64 KiB window. BlockFinder excludes BTYPE=01 (fixed
-    // Huffman) candidates by design — its precode-validation heuristic only
-    // emits BTYPE=00 (stored) and BTYPE=10 (dynamic). On Silesia, at least
-    // one chunk lands in a region where the real boundaries are all fixed
-    // Huffman, so BlockFinder finds 129 candidates but all are false
-    // positives. This sweep catches the fixed-Huffman boundaries by
-    // checking every bit position. The marker validator rejects non-
-    // boundaries fast (decode_fixed errors on first invalid length/distance
-    // code, typically within a few symbols), so the sweep is bounded in
-    // wall time even with 64 KiB × 8 = 512K bit positions to check.
+    // Tier 3 fallback: bit-by-bit marker-validator sweep, budget-bounded.
+    // BlockFinder excludes BTYPE=01 (fixed Huffman) candidates by design,
+    // and tier-2's byte-aligned brute force misses non-byte-aligned
+    // boundaries — on Silesia at least one chunk lands in a region where
+    // real boundaries are fixed-Huffman at random bit offsets. Without
+    // this tier, `decompress_parallel` returns Err and routing silently
+    // falls back to sequential libdeflate on those inputs.
+    //
+    // Per-probe cost is dominated by fixed-Huffman blocks that decode many
+    // symbols before erroring on random data. A naive bit-by-bit sweep of
+    // 4M positions timed out in CI (37 s, killed by SIGTERM). We bound
+    // wall time to 200 ms per chunk's search instead: enough to find real
+    // boundaries when they exist in the first ~16-32 KiB of the search
+    // range, fast to abort when adversarial data has no findable boundary
+    // (the chunk's search then returns None and we accept the silent
+    // fallback for that pathological case).
     use crate::decompress::parallel::fast_marker_inflate::validate_boundary;
     let sweep_end = (from_bit + 64 * 1024 * 8).min(search_end);
+    let sweep_start = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(200);
     let mut sweep_total: usize = 0;
-    let tier3 = (from_bit..sweep_end).find(|&bit| {
+    let mut sweep_passes: usize = 0;
+    let mut tier3: Option<usize> = None;
+    for bit in from_bit..sweep_end {
+        if sweep_total & 0xFFF == 0 && sweep_start.elapsed() > budget {
+            break;
+        }
         sweep_total += 1;
+
         // Cheap pre-filter: read 3 bits of the candidate header and reject
         // BTYPE=11 (reserved). Saves the marker-validator setup cost on
-        // 1/4 of probed positions.
+        // ~1/4 of probed positions.
         let byte_idx = bit / 8;
         if byte_idx + 1 >= deflate_data.len() {
-            return false;
+            break;
         }
         let bit_in_byte = bit % 8;
         let two_bytes = deflate_data[byte_idx] as u16 | ((deflate_data[byte_idx + 1] as u16) << 8);
         let header3 = (two_bytes >> bit_in_byte) & 0x7;
         let btype = (header3 >> 1) & 3;
         if btype == 3 {
-            return false;
+            continue;
         }
-        validate_boundary(deflate_data, bit, 2, 0).is_ok()
-    });
-
+        if validate_boundary(deflate_data, bit, 2, 0).is_ok() {
+            sweep_passes += 1;
+            tier3 = Some(bit);
+            break;
+        }
+    }
     if tier3.is_none() && debug_enabled() {
         eprintln!(
             "[parallel_sm:v0.6] search from bit {} ({}.{}) failed: \
              BlockFinder candidates={} (isal_ok={} marker_ok={}), \
              brute candidates={} (isal_ok={} marker_ok={}), \
-             tier3 sweep candidates={} (no marker-validator pass)",
+             tier3 sweep probes={} passes={} elapsed={:?}",
             from_bit,
             from_bit / 8,
             from_bit % 8,
@@ -364,6 +380,8 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
             brute_isal_passes,
             brute_marker_passes,
             sweep_total,
+            sweep_passes,
+            sweep_start.elapsed(),
         );
     }
     tier3
