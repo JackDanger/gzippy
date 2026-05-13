@@ -295,14 +295,31 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
         .find(|&bit| try_decode_at(deflate_data, bit))
 }
 
-/// Validate a candidate boundary by attempting a 32 KB decode with the
-/// fastest available decoder (ISA-L on x86_64, zlib-ng elsewhere). We use
-/// the fastest engine for this hot loop because boundary search runs
-/// `try_decode_at` against many candidates per chunk; using our pure-Rust
-/// marker decoder here would slow search by an order of magnitude. False
-/// positives that pass ISA-L's heuristic still fail later — chunk decode
-/// returns Err if the start isn't a real block, and the pipeline falls
-/// back via DecodeFailed.
+/// Validate a candidate boundary in two stages — see premortem mitigation
+/// B7 in `docs/marker-decoder-premortem.md`:
+///
+/// 1. **Fast filter** via ISA-L's `decompress_deflate_from_bit` (or zlib-ng
+///    on non-x86_64): does 32 KB decode succeed without error? ISA-L is
+///    permissive — it accepts some non-boundary positions that happen to
+///    decode plausible-looking bytes for 32 KB before diverging.
+/// 2. **Strict check** via our `fast_marker_inflate` on the same position,
+///    bounded to a single deflate block (`end_bit_limit = bit_offset + 1`
+///    stops the decoder at the next block boundary at or past `bit_offset`).
+///    A real boundary decodes one block cleanly; a false positive fails
+///    on Huffman table validation or a malformed length code somewhere in
+///    the first block.
+///
+/// Why both: with stage 1 alone, false positives passed through and the
+/// production marker decode later returned Err mid-block, causing routing
+/// to silently fall back to sequential ISA-L (failure mode F6). The
+/// deletion-trap killer test caught it. Stage 2 alone is correct but
+/// would run the slower pure-Rust decoder against every BlockFinder
+/// candidate.
+///
+/// Cost: stage 2 runs only when stage 1 approves. Stage 1 approval
+/// candidates are rare on real data (a few per chunk's search window).
+/// Each stage-2 run decodes one deflate block (~30 KB out / ~10 KB in)
+/// at ~200-300 MB/s — sub-millisecond per accepted candidate.
 fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
     let start_byte = bit_offset / 8;
     if start_byte >= deflate_data.len() {
@@ -314,13 +331,26 @@ fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
     } else {
         4 * 1024
     };
-    crate::backends::inflate_bit::decompress_deflate_from_bit(
+
+    // Stage 1: ISA-L (or zlib-ng) fast filter.
+    let isal_ok = crate::backends::inflate_bit::decompress_deflate_from_bit(
         deflate_data,
         bit_offset,
         &[],
         min_output,
     )
-    .is_some_and(|out| out.len() >= min_output)
+    .is_some_and(|out| out.len() >= min_output);
+    if !isal_ok {
+        return false;
+    }
+
+    // Stage 2: strict marker-decoder validation, scoped to one block.
+    // `end_bit_limit = Some(bit_offset + 1)` tells the decoder to stop at
+    // the next block boundary at or past `bit_offset + 1`, which is
+    // exactly "after the first block." A real boundary decodes one block
+    // and returns Ok; a false positive returns Err somewhere mid-block.
+    use crate::decompress::parallel::fast_marker_inflate::decode_chunk_markers_bounded;
+    decode_chunk_markers_bounded(deflate_data, bit_offset, Some(bit_offset + 1)).is_ok()
 }
 
 // ── Phase 1b: parallel marker decode ─────────────────────────────────────────
