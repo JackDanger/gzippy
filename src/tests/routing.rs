@@ -435,6 +435,96 @@ mod tests {
         data
     }
 
+    /// Mostly-random data designed to push zlib into fixed-Huffman block
+    /// emission at the lowest compression level. Each ~16 KB region has
+    /// frequent literal-only short bursts → many short blocks → zlib often
+    /// picks BTYPE=01 (fixed Huffman) over BTYPE=10 (dynamic, which has
+    /// per-block header overhead). This is the structural class of input
+    /// where BlockFinder's heuristic finds no candidates because it
+    /// excludes BTYPE=01 by design.
+    fn make_btype01_heavy_data(size: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(size);
+        let mut rng: u64 = 0xb0bd1ec0de;
+        while data.len() < size {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            // 95% literal random bytes, 5% short repetitions — discourages
+            // long matches, favors small blocks.
+            if (rng >> 32) % 100 < 95 {
+                data.push((rng >> 16) as u8);
+            } else {
+                let byte = (rng >> 24) as u8;
+                let repeat = ((rng >> 40) % 4 + 2) as usize;
+                for _ in 0..repeat.min(size - data.len()) {
+                    data.push(byte);
+                }
+            }
+        }
+        data.truncate(size);
+        data
+    }
+
+    /// gzip-encode at level 1 (fastest / most fixed-Huffman emissions).
+    fn compress_single_member_gzip_l1(data: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(1));
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Companion to `test_marker_pipeline_actually_runs_on_x86_64_isal` —
+    /// same shape (decompress_single_member at T=4, counter snapshot), but
+    /// against a fixture engineered to maximize fixed-Huffman (BTYPE=01)
+    /// block density. BlockFinder's heuristic excludes BTYPE=01 candidates
+    /// by design, so on this fixture the boundary-search currently returns
+    /// None for at least one chunk and routing silently falls back to
+    /// sequential libdeflate.
+    ///
+    /// **`#[ignore]` until the BlockFinder BTYPE=01 enhancement lands** —
+    /// see the "BlockFinder BTYPE=01 emission" follow-up in
+    /// `docs/marker-decoder-plan.md`. Without that enhancement this test
+    /// fails by construction (same root cause as the Silesia Tmax bench's
+    /// 0.62× rapidgzip ratio). Once the enhancement is in, remove the
+    /// `#[ignore]` and this becomes the second deletion-trap killer
+    /// covering the BTYPE=01-heavy input class.
+    #[test]
+    #[ignore = "blocked on BlockFinder BTYPE=01 enhancement (Red 1 in PR #90 plan)"]
+    fn test_marker_pipeline_runs_on_btype01_heavy_input() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let original = make_btype01_heavy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip_l1(&original);
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "fixture must exceed 10 MiB parallel gate (got {} bytes)",
+            compressed.len()
+        );
+
+        let before = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+            .load(Ordering::Relaxed);
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        assert_eq!(output, original, "byte-perfect output");
+        let after = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+            .load(Ordering::Relaxed);
+
+        #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+        assert!(
+            after > before,
+            "MARKER_PIPELINE_RUNS did not increment ({before} -> {after}) on \
+             BTYPE=01-heavy fixture — BlockFinder enhancement regressed or \
+             never landed. This is the second deletion-trap killer; the \
+             first one (low-entropy fixture) passes because BlockFinder \
+             finds BTYPE=10 candidates there. The point of THIS test is \
+             that real-world data sometimes has only BTYPE=01 boundaries \
+             in a chunk's search range."
+        );
+        #[cfg(not(all(target_arch = "x86_64", feature = "isal-compression")))]
+        let _ = (before, after);
+    }
+
     // =========================================================================
     // Layer 3: Output Identity — same output regardless of thread count
     // =========================================================================
