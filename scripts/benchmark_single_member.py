@@ -78,22 +78,53 @@ def benchmark_decompress(
     else:
         return {"error": f"unknown tool: {tool}"}
     
+    # Routing-trace audit (gzippy only). Without this, a silent fallback to
+    # sequential libdeflate looks identical to "marker pipeline ran but was
+    # slow" — both produce correct output at ~libdeflate throughput.
+    # Capture stderr from gzippy with GZIPPY_DEBUG=1 and parse for the
+    # marker-pipeline log line. We do this once before the timed runs so
+    # it doesn't affect the perf numbers.
+    routing_trace = None
+    if tool == "gzippy":
+        env = dict(os.environ)
+        env["GZIPPY_DEBUG"] = "1"
+        with open(compressed_file, 'rb') as fin:
+            trace_result = subprocess.run(
+                cmd, stdin=fin, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env,
+            )
+        stderr_text = trace_result.stderr.decode(errors="replace")
+        ran_marker = "[parallel_sm:v0.6]" in stderr_text and "total=" in stderr_text
+        fell_back = "parallel single-member failed" in stderr_text
+        routing_trace = {
+            "ran_marker_pipeline": ran_marker,
+            "fell_back_to_sequential": fell_back,
+            "stderr_head": stderr_text[:500],
+        }
+
     def run_decompress():
         with open(compressed_file, 'rb') as fin, open(output_file, 'wb') as fout:
             result = subprocess.run(cmd, stdin=fin, stdout=fout, stderr=subprocess.DEVNULL)
         return result.returncode == 0
-    
+
     # Warmup
     print(f"  {tool}: warming up...", end="", flush=True)
     if not run_decompress():
         print(" FAILED")
         return {"error": f"{tool} decompression failed on warmup", "tool": tool}
-    
+
     # Verify correctness
     import filecmp
     if not filecmp.cmp(original_file, output_file, shallow=False):
         print(" INCORRECT OUTPUT")
         return {"error": f"{tool} decompression produced incorrect output", "tool": tool, "status": "fail"}
+
+    # Surface the routing decision now that the warmup proved correctness.
+    # When marker pipeline fell back, the throughput number reflects
+    # libdeflate, not gzippy's parallel path — call that out explicitly so
+    # the guard report doesn't read like "marker pipeline is slow."
+    if tool == "gzippy" and threads > 1 and routing_trace is not None:
+        if routing_trace["fell_back_to_sequential"] or not routing_trace["ran_marker_pipeline"]:
+            print(" [SILENT FALLBACK: marker pipeline did not run end-to-end]", end="")
     
     # Benchmark
     times = []
@@ -138,6 +169,7 @@ def benchmark_decompress(
         "compressed_size": compressed_size,
         "ratio": compressed_size / original_size,
         "status": "pass",
+        "routing_trace": routing_trace,
     }
 
 
@@ -264,12 +296,26 @@ def main():
     rapidgzip = next((r for r in results["results"] if r["tool"] == "rapidgzip" and "error" not in r), None)
     unpigz = next((r for r in results["results"] if r["tool"] == "unpigz" and "error" not in r), None)
     
+    # Distinguish "marker pipeline ran but was slow" from "marker pipeline
+    # never ran (silent fallback to libdeflate)". Both produce the same
+    # throughput number; only the routing trace tells us which.
+    if gzippy and args.threads > 1:
+        trace = gzippy.get("routing_trace") or {}
+        if trace.get("fell_back_to_sequential") or not trace.get("ran_marker_pipeline"):
+            passed = False
+            reasons.append(
+                "marker pipeline did not run end-to-end on this fixture "
+                "(silent fallback to sequential libdeflate). Throughput "
+                "numbers reflect libdeflate, not the parallel path. "
+                "See routing_trace.stderr_head in the JSON output."
+            )
+
     if gzippy and rapidgzip:
         ratio = gzippy["speed_mbps"] / rapidgzip["speed_mbps"]
         if ratio < 0.99:  # Must be within 1% of rapidgzip
             passed = False
             reasons.append(f"gzippy {ratio:.2f}x rapidgzip (need ≥0.99)")
-    
+
     if gzippy and unpigz:
         ratio = gzippy["speed_mbps"] / unpigz["speed_mbps"]
         if ratio < 1.0:  # Must beat pigz
