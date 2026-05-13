@@ -297,12 +297,12 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
         }
         chunk_start = chunk_end;
     }
-    // Brute-force fallback within first 128 KiB.
+    // Tier 2 fallback: byte-aligned brute force with ISA-L+marker validator.
     let brute_end = (from_bit + 128 * 1024 * 8).min(search_end);
     let mut brute_isal_passes: usize = 0;
     let mut brute_marker_passes: usize = 0;
     let mut brute_total: usize = 0;
-    let res = (from_bit..brute_end).step_by(8).find(|&bit| {
+    let tier2 = (from_bit..brute_end).step_by(8).find(|&bit| {
         brute_total += 1;
         try_decode_at_traced(
             deflate_data,
@@ -311,11 +311,49 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
             &mut brute_marker_passes,
         )
     });
-    if res.is_none() && debug_enabled() {
+    if let Some(b) = tier2 {
+        return Some(b);
+    }
+
+    // Tier 3 fallback: bit-by-bit sweep with the marker validator only,
+    // bounded to a 64 KiB window. BlockFinder excludes BTYPE=01 (fixed
+    // Huffman) candidates by design — its precode-validation heuristic only
+    // emits BTYPE=00 (stored) and BTYPE=10 (dynamic). On Silesia, at least
+    // one chunk lands in a region where the real boundaries are all fixed
+    // Huffman, so BlockFinder finds 129 candidates but all are false
+    // positives. This sweep catches the fixed-Huffman boundaries by
+    // checking every bit position. The marker validator rejects non-
+    // boundaries fast (decode_fixed errors on first invalid length/distance
+    // code, typically within a few symbols), so the sweep is bounded in
+    // wall time even with 64 KiB × 8 = 512K bit positions to check.
+    use crate::decompress::parallel::fast_marker_inflate::validate_boundary;
+    let sweep_end = (from_bit + 64 * 1024 * 8).min(search_end);
+    let mut sweep_total: usize = 0;
+    let tier3 = (from_bit..sweep_end).find(|&bit| {
+        sweep_total += 1;
+        // Cheap pre-filter: read 3 bits of the candidate header and reject
+        // BTYPE=11 (reserved). Saves the marker-validator setup cost on
+        // 1/4 of probed positions.
+        let byte_idx = bit / 8;
+        if byte_idx + 1 >= deflate_data.len() {
+            return false;
+        }
+        let bit_in_byte = bit % 8;
+        let two_bytes = deflate_data[byte_idx] as u16 | ((deflate_data[byte_idx + 1] as u16) << 8);
+        let header3 = (two_bytes >> bit_in_byte) & 0x7;
+        let btype = (header3 >> 1) & 3;
+        if btype == 3 {
+            return false;
+        }
+        validate_boundary(deflate_data, bit, 2, 0).is_ok()
+    });
+
+    if tier3.is_none() && debug_enabled() {
         eprintln!(
             "[parallel_sm:v0.6] search from bit {} ({}.{}) failed: \
              BlockFinder candidates={} (isal_ok={} marker_ok={}), \
-             brute candidates={} (isal_ok={} marker_ok={})",
+             brute candidates={} (isal_ok={} marker_ok={}), \
+             tier3 sweep candidates={} (no marker-validator pass)",
             from_bit,
             from_bit / 8,
             from_bit % 8,
@@ -325,9 +363,10 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
             brute_total,
             brute_isal_passes,
             brute_marker_passes,
+            sweep_total,
         );
     }
-    res
+    tier3
 }
 
 /// Diagnostic-only wrapper: same accept/reject decision as `try_decode_at` but
