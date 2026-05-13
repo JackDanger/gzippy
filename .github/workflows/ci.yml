@@ -101,7 +101,7 @@ jobs:
         run: git submodule update --init vendor/zopfli
 
       - name: Corpus oracle vs vendor/zopfli
-        run: cargo test --release --features oracle corpus_gzip_output_matches_c_zopfli -- --include-ignored --nocapture
+        run: cargo test --release --features oracle --lib corpus_gzip_output_matches_c_zopfli -- --include-ignored --nocapture
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
