@@ -49,10 +49,12 @@
 
 #[test]
 fn fuzz_diff_against_oracle_comprehensive() {
-    // PR-branch / feature-branch path: env var unset → exit silently. Keeps
-    // PR CI fast and avoids surprising red builds for work-in-progress that
-    // hasn't touched the marker pipeline at all.
-    if std::env::var_os("GZIPPY_MAIN_FUZZ").is_none() {
+    // PR-branch / feature-branch path: env var unset OR empty → exit
+    // silently. The CI workflow sets GZIPPY_MAIN_FUZZ to '' (empty
+    // string, not unset) on non-main branches via GitHub Actions
+    // ternary syntax, so `var_os().is_none()` would let those through.
+    // Require the value to be exactly "1" to be conservative.
+    if std::env::var("GZIPPY_MAIN_FUZZ").ok().as_deref() != Some("1") {
         eprintln!(
             "fuzz_diff_against_oracle_comprehensive: skipped (set GZIPPY_MAIN_FUZZ=1 \
              to run; only fires on `push` to main in CI)"
