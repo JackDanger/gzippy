@@ -88,6 +88,18 @@ pub(crate) static MARKER_PIPELINE_RUNS: AtomicU64 = AtomicU64::new(0);
 /// PR #94.)
 pub(crate) static MARKER_PIPELINE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// Times the routing layer silently fell back to sequential libdeflate
+/// because `decompress_parallel` returned a non-routing error (D1, Opus
+/// advisor review). Distinct from "input was too small to bother"
+/// (`ParallelError::TooSmall`), which is expected and intended.
+///
+/// The bench harness in `scripts/benchmark_single_member.py` reads this
+/// counter (via gzippy's debug log) and hard-fails CI if it's non-zero —
+/// turning "marker pipeline silently fell back" from invisible (same
+/// throughput as libdeflate) into a specific actionable failure. See
+/// `docs/marker-decoder-premortem.md` F7 + D1.
+pub(crate) static MARKER_PIPELINE_BOUNDARY_MISSED: AtomicU64 = AtomicU64::new(0);
+
 #[inline]
 fn debug_enabled() -> bool {
     use std::sync::OnceLock;

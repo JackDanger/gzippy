@@ -94,7 +94,13 @@ def benchmark_decompress(
             )
         stderr_text = trace_result.stderr.decode(errors="replace")
         ran_marker = "[parallel_sm:v0.6]" in stderr_text and "total=" in stderr_text
-        fell_back = "parallel single-member failed" in stderr_text
+        # New: typed-routing message added in PR #90 for the BTYPE=01-heavy
+        # case (see premortem D1+D5). Older log strings retained for
+        # backward compatibility with older gzippy binaries on the path.
+        fell_back = (
+            "parallel single-member fell back" in stderr_text
+            or "parallel single-member failed" in stderr_text
+        )
         routing_trace = {
             "ran_marker_pipeline": ran_marker,
             "fell_back_to_sequential": fell_back,
