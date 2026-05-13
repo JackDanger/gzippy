@@ -109,6 +109,21 @@ jobs:
           name: gzippy-${{ matrix.os }}-${{ matrix.arch }}
           path: target/release/gzippy
 
+  build-gate:
+    name: build
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    steps:
+      - name: All builds passed
+        run: |
+          if [[ "${{ needs.build.result }}" == "success" ]]; then
+            echo "All platform builds passed"
+          else
+            echo "One or more builds failed or were cancelled"
+            exit 1
+          fi
+
   validate:
     name: Validate vs pigz/gzip
     runs-on: ubuntu-latest
