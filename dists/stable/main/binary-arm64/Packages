@@ -1,5 +1,5 @@
 Package: gzippy
-Version: 0.6.0-1
+Version: 0.7.0-1
 Architecture: arm64
 Maintainer: Jack Danger <github@jackdanger.com>
 Installed-Size: 1059
@@ -7,11 +7,11 @@ Depends: libc6 (>= 2.34), libgcc-s1 (>= 4.2)
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy_0.6.0-1_arm64.deb
-Size: 463632
-SHA256: 349d27336d5ef643cd9872ef59caef788d826f792c8ed35548d66af39b1fe3c9
-SHA1: ebdd9ec47ba74eb1f68efaa391d8c518ed8ff4f6
-MD5sum: 7576bcd6c5d8821ba76f6593df2de23f
+Filename: pool/main/g/gzippy/gzippy_0.7.0-1_arm64.deb
+Size: 463564
+SHA256: a3fc2ac3096578cd20b225e9d6712ff11cb22b4efe6aa16983243a506b64f2b8
+SHA1: 9a6b0fe464afb369731ccffb0b6668545fb83894
+MD5sum: b0d4ba971477bc727b2268fdd5ed4a63
 Description: The fastest parallel gzip
  Gzippy is a high-performance parallel gzip implementation written in Rust.
  It beats gzip and pigz by leveraging multiple CPU cores, SIMD instructions,
@@ -27,19 +27,19 @@ Description: The fastest parallel gzip
 
 Package: gzippy-replace-gzip
 Source: gzippy
-Version: 0.6.0-1
+Version: 0.7.0-1
 Architecture: all
 Maintainer: Jack Danger <github@jackdanger.com>
 Installed-Size: 9
-Depends: gzippy (>= 0.6.0-1)
+Depends: gzippy (>= 0.7.0-1)
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.6.0-1_all.deb
-Size: 2124
-SHA256: 10f3ca3a7e643c6c01681c0718400d6da8067a61b49bb596e0c49f95612eb5c7
-SHA1: 5c72ddd66b87213e0cc620f4783b906b26e55cf5
-MD5sum: 66cfd473bffb33f7a833c35aa1a90fc9
+Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.7.0-1_all.deb
+Size: 2128
+SHA256: 851abd35b6e7624b4568de31de4adfcc98598850631161023dce5418dabfc3c3
+SHA1: 525eeb478e485fbb3ef6452d1bb591dc2174ddb3
+MD5sum: f3262cdf4f010d923a5a64328733985a
 Description: Transitional package — gzippy now replaces gzip automatically
  This is a no-op transitional package. As of gzippy 0.1.6, installing the
  gzippy package automatically diverts /usr/bin/gzip, /usr/bin/gunzip, and
