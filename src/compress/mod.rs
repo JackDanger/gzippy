@@ -194,7 +194,7 @@ pub fn compress_raw_bytes(data: &[u8], level: u8) -> crate::error::GzippyResult<
     }
 
     // libdeflate one-shot for all levels
-    let lvl = libdeflater::CompressionLvl::new(level as i32).unwrap_or_default();
+    let lvl = libdeflater::CompressionLvl::new(level as i32).expect("level clamped to 0–12");
     let mut comp = libdeflater::Compressor::new(lvl);
     let bound = comp.deflate_compress_bound(data.len());
     let mut out = vec![0u8; bound];
