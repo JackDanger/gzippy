@@ -88,6 +88,75 @@ silently falls back to sequential ISA-L. **Output tests pass.** Only the
 deletion-trap killer counter test catches that the marker pipeline didn't
 actually run.
 
+### F7. The "BTYPE=01-heavy region returns None" failure  (acknowledged shipping limitation, PR #90)
+
+Some compressed regions of real-world input (observed on Silesia, plus a
+synthetic adversarial fixture in `routing.rs::make_btype01_heavy_data`)
+contain mostly fixed-Huffman blocks (BTYPE=01). RFC 1951 §3.2.6 makes
+the fixed-Huffman code maximally compact — every 9-bit code is used and
+the block has *no header redundancy* to validate. BlockFinder excludes
+BTYPE=01 candidates by design, and tier-2's byte-aligned brute force
+misses non-byte-aligned positions.
+
+Three attempts to add cheap BTYPE=01 boundary detection failed:
+
+1. **Emit BTYPE=01 candidates from BlockFinder** (PR #90 commit 86d35bc).
+   Candidate count exploded (~25% of bit positions pass the 3-bit
+   header check); `test_find_blocks_parallel_matches_sequential` slowed
+   from 0.5 s to 200 s due to O(N²) `.contains()` over millions of
+   candidates. Reverted.
+2. **Tier-3 bit-by-bit sweep with `validate_boundary(min_blocks=2)`**
+   (PR #90 commit b898a11). Local repro produced 62 MB output for 25 MB
+   expected — false-positive boundaries caused chunks to *double-cover*
+   the same byte range. Reverted.
+3. **Tier-3 with strict `validate_boundary(min_blocks=4, min_output=32KiB)`**
+   (PR #90 commit 86d35bc). Same double-coverage on the BTYPE=01-heavy
+   fixture. Reverted.
+
+Opus advisor review (PR #90 thread) named the structural issue: cheap
+per-position validation cannot reject all BTYPE=01 false positives
+because fixed Huffman has no header redundancy. Tightening
+`validate_boundary` thresholds is a probabilistic game that can't be
+won — random fixed-Huffman data routinely decodes 4+ blocks of
+valid-looking symbols by chance.
+
+Rapidgzip's source acknowledges the same limitation
+(`vendor/rapidgzip/librapidarchive/src/rapidgzip/GzipChunkFetcher.hpp`):
+*"when the deflate block finder failed to find any valid block inside the
+partition, e.g., because it only contains fixed Huffman blocks."*
+Their fix is **chain-decoding from a confirmed offset**, which serializes
+that one chunk but preserves correctness.
+
+**Mitigations shipped** (PR #90; full table in section G below):
+
+- **G1**: `decode_chunk_markers_bounded` errors if its `bit_pos`
+  overshoots `end_bit_limit`. Converts silent double-coverage into a
+  loud `DecodeFailed` pointing at the right layer.
+- **G2**: `decompress_parallel` verifies `chunks[N].end_bit ==
+  start_bits[N+1]` for every adjacent pair. Any mismatch returns Err.
+  This is *the* structural defense against false-positive boundaries:
+  bad picks no longer produce wrong output, they just produce Err.
+- **G3**: Routing-layer typed fallback. `ParallelError::TooSmall`
+  falls through silently (intended). Every other error increments
+  `MARKER_PIPELINE_BOUNDARY_MISSED` and prints `[gzippy] parallel
+  single-member fell back to sequential: {e}` to stderr unconditionally.
+  In debug builds, panics.
+- **G4**: Bench script reads the routing-trace stderr signal and
+  hard-fails CI with a specific message — "marker pipeline did not
+  run end-to-end" — instead of the ambiguous "0.62× rapidgzip".
+
+**The right fix** (follow-up PR, Opus advisor approach #2):
+*Cross-chunk consistency retry loop.* Phase 1a returns a top-K
+candidate list per chunk, not a single pick. Phase 1c (new): if
+`chunks[N].end_bit != start_bits[N+1]`, advance chunk N+1's start to
+its next candidate and re-decode just that chunk. Iterate (bounded
+retries). This catches BTYPE=01 false positives by *cross-validation*
+without trying to make per-position validation airtight.
+
+The test `test_marker_pipeline_runs_on_btype01_heavy_input` is
+`#[ignore]`'d with a comment naming the cross-chunk PR as the
+unblocker. When that PR lands, remove the `#[ignore]`.
+
 ---
 
 ## Failure-mode catalogue with structural mitigations
@@ -148,6 +217,21 @@ test routing"; it's a structural counter.
 | E2 | Optimization for x86_64 inner-loop regresses arm64 (zlib-ng fallback path) | The marker pipeline is gated on `isal_decompress::is_available()` which is x86_64-only. arm64 never takes the marker path. Regression test `test_arm64_falls_through_to_libdeflate` asserts this. |
 | E3 | Apple Silicon Mac numbers diverge from x86_64 CI in either direction and we can't reproduce | Both architectures are in CI matrix (`Build macos arm64` / `Build linux x86_64` / `Build linux arm64`); divergent failure surfaces on push. |
 
+### G. Boundary-detection consistency (added 2026-05-13 after Opus advisor review)
+
+The defenses for F7: per-position validators can't catch all
+BTYPE=01 false positives, so we add structural defenses one layer
+up — at the contract between phase 1a (boundary picks) and phase 1b
+(chunk decode) — so wrong picks fail loudly instead of producing
+wrong output.
+
+| Tag | Failure | Structural mitigation |
+|---|---|---|
+| G1 | `decode_chunk_markers_bounded` silently overshoots a misaligned `end_bit_limit` because the bounded-exit check is `>=`; chunk N runs past `limit` into chunk N+1's territory, producing double-coverage. | Exact-match contract: change the check to `bit_pos > limit ⇒ Err(...)` and `bit_pos == limit ⇒ Ok(())`. `fast_marker_inflate::decode_loop` enforces. (PR #90 commit 02381c4.) |
+| G2 | Phase 1a returns boundary picks that look valid to `try_decode_at` but aren't true block boundaries (BTYPE=01 false positives slip through `validate_boundary`). Chunks decode "successfully" but with wrong bytes. | Cross-chunk consistency: `decompress_parallel` verifies for every adjacent pair `(N, N+1)` that `chunks[N].end_bit_offset == start_bits[N+1]`. Any mismatch returns `Err(DecodeFailed)`. Wrong picks now produce Err, not wrong output. (PR #90 commit 13905bc.) |
+| G3 | Routing's `Err(_) ⇒ fall back silently` hides "marker pipeline tried and failed" inside the same path as "input too small for parallel." Production looks identical to libdeflate; CI sees a generic perf shortfall. | Typed routing fallback: `ParallelError::TooSmall` is the only error that falls through silently. Every other variant increments `MARKER_PIPELINE_BOUNDARY_MISSED` and prints `[gzippy] parallel single-member fell back to sequential: {e}` to stderr unconditionally. `debug_assert!` panics in debug builds. (PR #90 commit 751b450.) |
+| G4 | Bench reports "gzippy 0.62× rapidgzip" without distinguishing "ran slow" from "never ran." | Bench script (`scripts/benchmark_single_member.py`) captures gzippy stderr with `GZIPPY_DEBUG=1` and parses for the G3 routing-trace message. Fails CI with a specific actionable reason: "marker pipeline did not run end-to-end on this fixture (silent fallback to sequential libdeflate). Throughput numbers reflect libdeflate, not the parallel path." (PR #90 commit c0f4f6d, extended in 751b450.) |
+
 ---
 
 ## The decision log
@@ -170,6 +254,17 @@ Major design choices, with the reasoning that was current at decision time:
   guard: incrementing one atomic on the successful tail of every parallel
   decode is sub-nanosecond and ships in production. Anything else lets the
   counter rot. (`Relaxed` ordering; the test reads it with `Relaxed`.)
+- **2026-05-13** — accepted BTYPE=01-heavy regions fall back to
+  sequential libdeflate (F7). Three attempts to add a cheap BTYPE=01
+  validator all failed for the same structural reason: fixed Huffman
+  has no header redundancy. Opus advisor review (PR #90 thread)
+  recommended moving the defense from per-position validation to
+  cross-chunk consistency. Shipped G1–G4 in PR #90; the cross-chunk
+  retry loop (Opus approach #2) is the next PR. Rapidgzip's source
+  acknowledges the same limitation
+  (`vendor/rapidgzip/.../GzipChunkFetcher.hpp`) and chain-decodes in
+  that case — validation that we're not missing an obvious cheap
+  approach.
 
 ---
 
