@@ -430,6 +430,43 @@ fn decompress_raw_bad_data_errors() {
     );
 }
 
+// ── Deflate64 (ZIP method 9) ──────────────────────────────────────────────────
+
+// Build a stored Deflate64 block (BTYPE=00, same format as DEFLATE stored).
+fn make_deflate64_stored(data: &[u8]) -> Vec<u8> {
+    assert!(data.len() <= 65535);
+    let len = data.len() as u16;
+    let mut out = vec![0x01u8]; // BFINAL=1, BTYPE=00
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&(!len).to_le_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+#[test]
+fn decompress_deflate64_stored_block_round_trip() {
+    let data = b"hello, deflate64 world!";
+    let compressed = make_deflate64_stored(data);
+    let decompressed = gzippy::decompress_deflate64(&compressed).unwrap();
+    assert_eq!(decompressed.as_slice(), data.as_slice());
+}
+
+#[test]
+fn decompress_deflate64_to_writer_returns_byte_count() {
+    let data = b"hello, deflate64 writer variant!";
+    let compressed = make_deflate64_stored(data);
+    let mut out = Vec::new();
+    let n = gzippy::decompress_deflate64_to_writer(&compressed, &mut out).unwrap();
+    assert_eq!(n, data.len() as u64);
+    assert_eq!(out.as_slice(), data.as_slice());
+}
+
+#[test]
+fn decompress_deflate64_invalid_input_errors() {
+    let result = gzippy::decompress_deflate64(b"not valid deflate64!!!");
+    assert!(result.is_err(), "expected error on invalid Deflate64 input");
+}
+
 #[test]
 fn compress_raw_interops_with_flate2() {
     let data = make_text(32 * 1024);
