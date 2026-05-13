@@ -17,9 +17,9 @@ name: Benchmarks
 
 on:
   push:
-    branches: ["*"]
+    branches: ["**"]  # match slashed names like feat/foo too (single-* is just one segment)
   pull_request:
-    branches: ["*"]
+    branches: ["**"]
   workflow_dispatch:
 
 permissions:
