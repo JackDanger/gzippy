@@ -348,6 +348,7 @@ pub fn decode_chunk_markers_bounded(
         bit_in_byte,
         None,
         end_bit_limit,
+        None,
     )?;
 
     // Capacity may grow during decode on highly compressible chunks (a single
@@ -378,6 +379,189 @@ pub fn decode_chunk_markers_bounded(
     Ok((output, end_bit_offset))
 }
 
+/// Result from [`decode_chunk_bootstrap`]: a marker decoder run that exits
+/// early at the first block boundary where the trailing 32 KB of decoded
+/// output is provably marker-free, so the caller can hand off to ISA-L with
+/// that 32 KB as a `isal_inflate_set_dict` seed.
+///
+/// This mirrors rapidgzip's per-chunk worker design
+/// (`vendor/rapidgzip/.../GzipChunk.hpp:413-657`): the marker decoder runs
+/// only as a bootstrap until enough clean tail accumulates, then ISA-L
+/// decodes the remaining ~99% of the chunk. The previous design ran the
+/// marker decoder for the whole chunk and capped per-thread throughput at
+/// pure-Rust speed (~50 MB/s/thread vs ISA-L's ~163 MB/s/thread on x86_64
+/// CI). The handoff closes that gap.
+pub struct BootstrapResult {
+    /// u16 output covering bootstrap range. May contain markers in its
+    /// prefix; when `clean_window` is `Some`, the trailing 32 KB is
+    /// guaranteed marker-free.
+    pub markers: Vec<u16>,
+    /// Bit position just past the bootstrap's last fully-decoded block.
+    /// Always at a real deflate block boundary (G1 invariant), suitable
+    /// as `bit_offset` for [`crate::backends::isal_decompress::decompress_deflate_from_bit_with_end`].
+    pub end_bit_offset: usize,
+    /// 32 KB sliding window for ISA-L's `isal_inflate_set_dict`, present
+    /// only when the trailing 32 KB of `markers` is marker-free. When
+    /// `None`, the caller must NOT hand off to ISA-L — either the
+    /// bootstrap consumed the entire chunk before 32 KB of clean output
+    /// accumulated, or `end_bit_limit` was reached first. In that case
+    /// `markers` covers the whole chunk and phase-2 marker-resolve runs
+    /// over it as in the pre-handoff design.
+    pub clean_window: Option<Vec<u8>>,
+}
+
+/// Bootstrap-mode variant of [`decode_chunk_markers_bounded`]. Decodes
+/// until any of:
+///
+/// 1. **The trailing 32 KB of `markers` is marker-free at a block boundary.**
+///    Returns with `clean_window = Some(<that 32 KB cast to u8>)` and
+///    `end_bit_offset` pointing past the just-completed block. The caller
+///    seeds ISA-L's dict with `clean_window` and resumes decoding from
+///    `end_bit_offset`.
+/// 2. **`end_bit_limit` is reached** (caller's chunk boundary). Returns with
+///    `clean_window = None`; the caller treats this as the pre-handoff
+///    "whole chunk via marker decoder" path. Rare: only happens when the
+///    chunk is so small (<32 KB output) that the bootstrap never accumulates
+///    enough clean data.
+/// 3. **BFINAL is seen.** Same as (2) — last chunk near EOF.
+///
+/// Invariants:
+/// - On `Ok(_)`, `end_bit_offset` is a real deflate block boundary.
+/// - Capacity for `markers` is bounded by the bootstrap's actual output
+///   size (typically ~32 KB + one block's worth), not `4 × deflate_bytes`
+///   as the whole-chunk variant must allocate. Per-thread memory drops
+///   dramatically.
+pub fn decode_chunk_bootstrap(
+    data: &[u8],
+    start_bit_offset: usize,
+    end_bit_limit: Option<usize>,
+) -> Result<BootstrapResult> {
+    let byte_offset = start_bit_offset / 8;
+    let bit_in_byte = (start_bit_offset % 8) as u32;
+    if byte_offset >= data.len() {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "start_bit_offset past end of data",
+        ));
+    }
+    let mut bits = Bits::new(&data[byte_offset..]);
+    if bit_in_byte > 0 {
+        bits.consume(bit_in_byte);
+    }
+
+    // Bootstrap output is typically ~32 KB + one trailing block (up to
+    // ~64 KB for a single dynamic-Huffman block of literals, ~128 KB
+    // worst-case). Allocate generously enough to avoid early growth, but
+    // not so much that we re-introduce the 4× deflate_bytes-per-thread
+    // memory blowup the whole-chunk variant has.
+    let mut output: Vec<u16> = Vec::with_capacity(128 * 1024);
+    let mut handoff_at_boundary = false;
+
+    decode_loop(
+        &mut bits,
+        &mut output,
+        byte_offset,
+        bit_in_byte,
+        None,
+        end_bit_limit,
+        Some(&mut handoff_at_boundary),
+    )?;
+
+    let _ = bit_in_byte;
+    let consumed_bytes_from_slice = bits.pos;
+    let bits_in_buf = bits.available();
+    let bits_consumed_from_slice = consumed_bytes_from_slice
+        .saturating_mul(8)
+        .saturating_sub(bits_in_buf as usize);
+    let end_bit_offset = byte_offset * 8 + bits_consumed_from_slice;
+
+    let clean_window = if handoff_at_boundary && output.len() >= WINDOW_SIZE {
+        // Last 32 KB are guaranteed marker-free by the bootstrap-stop
+        // check at the top of decode_loop. Cast u16 → u8 for ISA-L.
+        let start = output.len() - WINDOW_SIZE;
+        let window: Vec<u8> = output[start..]
+            .iter()
+            .map(|&v| {
+                debug_assert!(v < MARKER_BASE, "bootstrap clean window contained marker");
+                v as u8
+            })
+            .collect();
+        Some(window)
+    } else {
+        None
+    };
+
+    Ok(BootstrapResult {
+        markers: output,
+        end_bit_offset,
+        clean_window,
+    })
+}
+
+/// Continuation variant of [`decode_chunk_markers_bounded`]: append to an
+/// existing output Vec instead of returning a fresh one. The caller's
+/// `output` is treated as already-decoded chunk data, so `emit_match`'s
+/// chunk-local copies and "D > P" marker test see the correct position.
+///
+/// Used by the slow path of [`crate::decompress::parallel::single_member`]
+/// when the ISA-L handoff isn't available (non-x86_64) or fails: the
+/// bootstrap accumulates ~32 KB of output, then we want the marker decoder
+/// to continue from the bootstrap's `end_bit_offset` and produce the rest
+/// of the chunk's u16 output. Calling the regular `decode_chunk_markers_bounded`
+/// for the continuation would produce **wrong markers** because its
+/// `emit_match` would see `out_pos = 0` and treat any back-reference that
+/// reaches into the bootstrap as a cross-chunk reference — corrupting the
+/// chunk's output. By appending to the bootstrap directly, the chunk-local
+/// logic keeps its meaning.
+///
+/// Returns the bit position just past the last decoded block (same as
+/// `decode_chunk_markers_bounded`).
+pub fn decode_chunk_markers_continuing(
+    data: &[u8],
+    start_bit_offset: usize,
+    end_bit_limit: Option<usize>,
+    output: &mut Vec<u16>,
+) -> Result<usize> {
+    let byte_offset = start_bit_offset / 8;
+    let bit_in_byte = (start_bit_offset % 8) as u32;
+    if byte_offset >= data.len() {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "start_bit_offset past end of data",
+        ));
+    }
+    let mut bits = Bits::new(&data[byte_offset..]);
+    if bit_in_byte > 0 {
+        bits.consume(bit_in_byte);
+    }
+
+    // Reserve based on the bounded range, same logic as
+    // `decode_chunk_markers_bounded`. The vec already holds bootstrap data.
+    let range_bytes = match end_bit_limit {
+        Some(end) => end.saturating_sub(start_bit_offset).div_ceil(8),
+        None => data.len().saturating_sub(byte_offset),
+    };
+    output.reserve(range_bytes.saturating_mul(4).max(4096));
+
+    decode_loop(
+        &mut bits,
+        output,
+        byte_offset,
+        bit_in_byte,
+        None,
+        end_bit_limit,
+        None,
+    )?;
+
+    let _ = bit_in_byte;
+    let consumed_bytes_from_slice = bits.pos;
+    let bits_in_buf = bits.available();
+    let bits_consumed_from_slice = consumed_bytes_from_slice
+        .saturating_mul(8)
+        .saturating_sub(bits_in_buf as usize);
+    Ok(byte_offset * 8 + bits_consumed_from_slice)
+}
+
 /// Inner decode loop, factored so a debug-only variant can record where each
 /// block started (used by integration tests to obtain real mid-stream block
 /// boundaries — there's no other way to verify a candidate is a true boundary
@@ -390,6 +574,7 @@ fn decode_loop(
     _base_bit_in_byte: u32,
     mut block_starts: Option<&mut Vec<usize>>,
     end_bit_limit: Option<usize>,
+    mut bootstrap_handoff: Option<&mut bool>,
 ) -> Result<()> {
     loop {
         if bits.available() < 3 {
@@ -443,6 +628,37 @@ fn decode_loop(
             }
         }
 
+        // Bootstrap-mode early exit: when the caller passed a flag for
+        // bootstrap handoff, check at every block boundary whether the
+        // trailing 32 KB of `output` is marker-free. If yes, we have a
+        // clean 32 KB window the caller can hand to ISA-L's
+        // `isal_inflate_set_dict` to decode the rest of the chunk at
+        // ISA-L speed instead of pure-Rust marker decoder speed.
+        //
+        // This mirrors rapidgzip's per-chunk worker
+        // (`vendor/rapidgzip/.../GzipChunk.hpp:521`,
+        // `cleanDataCount >= MAX_WINDOW_SIZE`). It is *the* difference
+        // that lets per-thread parity with sequential ISA-L hold on
+        // single-member parallel decode: the marker decoder bootstraps
+        // ≤32 KB per chunk, ISA-L handles the remaining ~99%.
+        //
+        // The scan is O(32 KB) per block boundary. Block boundaries
+        // happen every ~16-64 KB of input on typical L1-L6 streams, so
+        // total scan cost is O(N) with small constant — negligible
+        // compared to the decode itself, and irrelevant once the
+        // bootstrap exits (which happens within the first ~32-64 KB of
+        // output, not at every block of the whole chunk).
+        if let Some(ref mut handoff) = bootstrap_handoff {
+            if output.len() >= WINDOW_SIZE
+                && output[output.len() - WINDOW_SIZE..]
+                    .iter()
+                    .all(|&v| v < MARKER_BASE)
+            {
+                **handoff = true;
+                return Ok(());
+            }
+        }
+
         let bfinal = (bits.peek() & 1) != 0;
         let btype = ((bits.peek() >> 1) & 3) as u32;
         bits.consume(3);
@@ -471,7 +687,7 @@ pub(super) fn record_block_starts(data: &[u8]) -> Result<Vec<usize>> {
     let mut bits = Bits::new(data);
     let mut output = Vec::new();
     let mut starts = Vec::new();
-    decode_loop(&mut bits, &mut output, 0, 0, Some(&mut starts), None)?;
+    decode_loop(&mut bits, &mut output, 0, 0, Some(&mut starts), None, None)?;
     Ok(starts)
 }
 

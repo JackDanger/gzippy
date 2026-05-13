@@ -53,7 +53,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::decompress::parallel::block_finder::BlockFinder;
-use crate::decompress::parallel::fast_marker_inflate::decode_chunk_markers_bounded;
+use crate::decompress::parallel::fast_marker_inflate::{
+    decode_chunk_bootstrap, decode_chunk_markers_continuing, BootstrapResult,
+};
 use crate::decompress::parallel::replace_markers::{replace_markers, MARKER_BASE};
 
 /// Deflate sliding-window size (RFC 1951 §3.2.4).
@@ -230,8 +232,17 @@ pub fn decompress_parallel<W: Write>(
             }
         })
         .collect();
-    let chunks_opt =
-        phase1_marker_decode_parallel_with_optional_starts(deflate_data, &start_bits, &end_limits);
+    // Per-chunk decoded-output hint for the ISA-L bulk decode's
+    // initial buffer cap. ISIZE / num_chunks is the average; the last
+    // chunk may legitimately exceed it, so `decode_chunk_with_handoff`
+    // adds 50% headroom.
+    let per_chunk_output_hint = expected_size / num_chunks.max(1);
+    let chunks_opt = phase1_marker_decode_parallel_with_optional_starts(
+        deflate_data,
+        &start_bits,
+        &end_limits,
+        per_chunk_output_hint,
+    );
     let decode_elapsed = t_decode.elapsed();
     let mut chunks: Vec<Option<ChunkResult>> = chunks_opt;
 
@@ -249,11 +260,17 @@ pub fn decompress_parallel<W: Write>(
     // N+1's corrected start is therefore a real boundary; …).
     let t_retry = std::time::Instant::now();
     let retry_deadline = t_retry + std::time::Duration::from_millis(RETRY_WALL_DEADLINE_MS);
-    phase1c_resolve_consistency(deflate_data, &mut start_bits, &mut chunks, retry_deadline)?;
+    phase1c_resolve_consistency(
+        deflate_data,
+        &mut start_bits,
+        &mut chunks,
+        retry_deadline,
+        per_chunk_output_hint,
+    )?;
     let retry_elapsed = t_retry.elapsed();
-    let chunks: Vec<Vec<u16>> = chunks
+    let chunks: Vec<ChunkResult> = chunks
         .into_iter()
-        .map(|c| c.expect("phase 1c guarantees all chunks decoded").0)
+        .map(|c| c.expect("phase 1c guarantees all chunks decoded"))
         .collect();
 
     // ── Phase 2: sequential resolve + CRC + size accounting ─────────────────
@@ -487,18 +504,64 @@ fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
 // boundary for one of them, and the pipeline must reject rather than
 // emit double-covered or partial output.
 
-/// Phase 1b chunk result: the marker output and the bit position just past
-/// the last decoded block. D4 (cross-chunk consistency) requires both.
-type ChunkResult = (Vec<u16>, usize);
+/// Phase 1b chunk result.
+///
+/// `bootstrap`: u16 output from the pure-Rust marker decoder's bootstrap
+/// pass, covering the chunk's first ~32 KB of output (and any prefix
+/// markers for cross-chunk back-references). May be empty when ISA-L was
+/// not entered (last chunk with no clean tail or chunk-too-small fallback).
+///
+/// `isal_bytes`: real bytes produced by ISA-L after the bootstrap handed
+/// off. Empty when no handoff occurred (chunk decoded entirely by the
+/// marker decoder).
+///
+/// `end_bit_offset`: bit position just past the chunk's last decoded
+/// block. Always at a real deflate block boundary (G1 invariant — both
+/// the marker decoder's `decode_loop` and ISA-L's natural stopping
+/// points sit between blocks).
+///
+/// This shape mirrors rapidgzip's per-chunk worker (cleanData → ISA-L
+/// handoff at `vendor/rapidgzip/.../GzipChunk.hpp:521`): the marker
+/// decoder bootstraps ≤32 KB to establish a window dict, then ISA-L
+/// does the ~99% bulk of the chunk at full single-thread ISA-L speed.
+/// Without this handoff the per-thread decoder is structurally bounded
+/// to pure-Rust speed (~50 MB/s/thread vs. ISA-L's ~163 MB/s/thread on
+/// x86_64 CI), which prevents per-thread parity with sequential ISA-L
+/// no matter how good the parallel orchestration is.
+struct ChunkResult {
+    bootstrap: Vec<u16>,
+    isal_bytes: Vec<u8>,
+    end_bit_offset: usize,
+}
 
-/// Decodes each chunk in parallel from its speculative start. Chunks whose
-/// `start_bits[i]` is `None` (phase 1a found no candidate) are skipped —
-/// their result stays `None` and phase 1c chain-decodes them from the
-/// predecessor's confirmed end_bit.
+impl ChunkResult {
+    /// Total decoded byte count for this chunk (bootstrap u8 equivalent
+    /// + ISA-L bytes). Used by phase 2 to pre-size the output buffer.
+    fn decoded_len(&self) -> usize {
+        self.bootstrap.len() + self.isal_bytes.len()
+    }
+}
+
+/// Decodes each chunk in parallel from its speculative start. Each worker:
+///
+/// 1. Runs the marker decoder in **bootstrap mode** until 32 KB of clean
+///    (marker-free) tail accumulates at a deflate block boundary.
+/// 2. Hands off to ISA-L (seeded with that 32 KB as `isal_inflate_set_dict`)
+///    for the remaining ~99% of the chunk.
+///
+/// This is the cleanData → ISA-L handoff from rapidgzip's `GzipChunk.hpp`
+/// (per the Opus advisor review on PR #97). Without it, the per-thread
+/// pure-Rust marker decoder caps single-thread parity vs ISA-L at ~30%
+/// no matter how good the parallel orchestration is.
+///
+/// Chunks whose `start_bits[i]` is `None` (phase 1a found no candidate)
+/// are skipped — their result stays `None` and phase 1c chain-decodes
+/// them from the predecessor's confirmed `end_bit_offset`.
 fn phase1_marker_decode_parallel_with_optional_starts(
     deflate_data: &[u8],
     start_bits: &[Option<usize>],
     end_limits: &[Option<usize>],
+    per_chunk_output_hint: usize,
 ) -> Vec<Option<ChunkResult>> {
     let num_chunks = start_bits.len();
     let results: Vec<Mutex<Option<ChunkResult>>> =
@@ -516,10 +579,13 @@ fn phase1_marker_decode_parallel_with_optional_starts(
                     continue;
                 };
                 let end_limit = end_limits[idx];
-                if let Ok((out, end_bit)) =
-                    decode_chunk_markers_bounded(deflate_data, start_bit, end_limit)
-                {
-                    *results[idx].lock().unwrap() = Some((out, end_bit));
+                if let Ok(chunk) = decode_chunk_with_handoff(
+                    deflate_data,
+                    start_bit,
+                    end_limit,
+                    per_chunk_output_hint,
+                ) {
+                    *results[idx].lock().unwrap() = Some(chunk);
                 }
             });
         }
@@ -529,6 +595,137 @@ fn phase1_marker_decode_parallel_with_optional_starts(
         .into_iter()
         .map(|m| m.into_inner().unwrap())
         .collect()
+}
+
+/// Per-chunk worker body: marker-decoder bootstrap → ISA-L handoff.
+///
+/// Falls back to "marker decoder for the entire chunk" when (a) the chunk
+/// is too small to accumulate 32 KB of clean tail before reaching
+/// `end_bit_limit` / BFINAL, or (b) ISA-L is not available on this
+/// platform. Both fall-back cases return a `ChunkResult` with empty
+/// `isal_bytes` — phase 2 sees no difference.
+fn decode_chunk_with_handoff(
+    deflate_data: &[u8],
+    start_bit: usize,
+    end_bit_limit: Option<usize>,
+    per_chunk_output_hint: usize,
+) -> std::io::Result<ChunkResult> {
+    // Phase 1 of the worker: bootstrap. Decode the chunk's first ~32 KB
+    // with the marker decoder until the trailing 32 KB of output is
+    // marker-free. This window seeds ISA-L for the bulk decode.
+    let BootstrapResult {
+        markers: bootstrap_markers,
+        end_bit_offset: bootstrap_end_bit,
+        clean_window,
+    } = decode_chunk_bootstrap(deflate_data, start_bit, end_bit_limit)?;
+
+    // No clean window? Two reasons: (1) end_bit_limit reached before
+    // 32 KB clean tail accumulated (tiny chunk), or (2) BFINAL hit
+    // (last chunk smaller than 32 KB of output). Either way the
+    // bootstrap markers cover the chunk's intended range — phase 2
+    // resolves them as in the pre-handoff design.
+    let Some(dict) = clean_window else {
+        return Ok(ChunkResult {
+            bootstrap: bootstrap_markers,
+            isal_bytes: Vec::new(),
+            end_bit_offset: bootstrap_end_bit,
+        });
+    };
+
+    // Phase 2 of the worker: ISA-L bulk decode from `bootstrap_end_bit`,
+    // seeded with the 32 KB clean window as `isal_inflate_set_dict`.
+    // Pass a slice bounded by the chunk's speculative end so ISA-L
+    // cannot run past the next chunk's territory; on healthy data
+    // BlockFinder's pick is a real boundary and ISA-L stops there
+    // naturally. On a BTYPE=01 false-positive pick, ISA-L may stop
+    // short (or run on) — phase 1c then sees
+    // `chunks[N].end_bit != chunks[N+1].start` and corrects.
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    {
+        // Bound input to the chunk's envelope. Without the chunk
+        // boundary trim, ISA-L would decode all the way to BFINAL on
+        // every chunk — quadratic total work, defeating the parallel
+        // win.
+        let end_byte = match end_bit_limit {
+            Some(end) => (end.div_ceil(8)).min(deflate_data.len()),
+            None => deflate_data.len(),
+        };
+        let input = &deflate_data[..end_byte];
+
+        // Output cap: per-chunk expected size + 50% headroom. The hint
+        // comes from the caller (ISIZE / num_chunks); the last chunk
+        // may legitimately decode more than the average so the
+        // headroom matters.
+        let max_output = per_chunk_output_hint.saturating_mul(3) / 2;
+
+        match crate::backends::isal_decompress::decompress_deflate_from_bit_with_end(
+            input,
+            bootstrap_end_bit,
+            &dict,
+            max_output,
+        ) {
+            Some((isal_bytes, isal_end_bit)) => Ok(ChunkResult {
+                bootstrap: bootstrap_markers,
+                isal_bytes,
+                end_bit_offset: isal_end_bit,
+            }),
+            None => {
+                // ISA-L failed — most often because the speculative
+                // end_bit_limit cut mid-block. Fall back to finishing
+                // the chunk via the marker decoder. Slow path, rare
+                // on real data.
+                marker_finish_after_bootstrap(
+                    deflate_data,
+                    bootstrap_markers,
+                    bootstrap_end_bit,
+                    end_bit_limit,
+                )
+            }
+        }
+    }
+
+    // On non-x86_64 or without the ISA-L feature, the parallel single-
+    // member path is gated off at routing time. This branch should be
+    // unreachable in production but is kept for build correctness.
+    #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+    {
+        let _ = (dict, per_chunk_output_hint);
+        marker_finish_after_bootstrap(
+            deflate_data,
+            bootstrap_markers,
+            bootstrap_end_bit,
+            end_bit_limit,
+        )
+    }
+}
+
+/// Slow-path completion when the ISA-L handoff isn't available or fails:
+/// finish the chunk with the marker decoder, appending its output to the
+/// bootstrap. Used in fallback only; the production path should keep this
+/// rare.
+fn marker_finish_after_bootstrap(
+    deflate_data: &[u8],
+    mut bootstrap_markers: Vec<u16>,
+    bootstrap_end_bit: usize,
+    end_bit_limit: Option<usize>,
+) -> std::io::Result<ChunkResult> {
+    // Continue the marker decoder into the same Vec — `emit_match` must
+    // see the bootstrap output as part of `out_pos` so its chunk-local
+    // copies and "D > out_pos ⇒ marker" rule work correctly. Decoding
+    // the continuation into a fresh Vec and concatenating would emit
+    // markers for back-references that actually point into the
+    // bootstrap (false cross-chunk markers).
+    let end_bit = decode_chunk_markers_continuing(
+        deflate_data,
+        bootstrap_end_bit,
+        end_bit_limit,
+        &mut bootstrap_markers,
+    )?;
+    Ok(ChunkResult {
+        bootstrap: bootstrap_markers,
+        isal_bytes: Vec::new(),
+        end_bit_offset: end_bit,
+    })
 }
 
 // ── Phase 1c: cross-chunk consistency correction ─────────────────────────────
@@ -553,6 +750,7 @@ fn phase1c_resolve_consistency(
     start_bits: &mut [Option<usize>],
     chunks: &mut [Option<ChunkResult>],
     deadline: std::time::Instant,
+    per_chunk_output_hint: usize,
 ) -> Result<(), ParallelError> {
     let num_chunks = chunks.len();
     if num_chunks == 0 {
@@ -580,7 +778,7 @@ fn phase1c_resolve_consistency(
         let chunk_end_bit = chunks[i]
             .as_ref()
             .expect("invariant: chunks[i] is Some by this point")
-            .1;
+            .end_bit_offset;
         let next_start = start_bits[i + 1];
 
         // The correction step fires when:
@@ -638,7 +836,11 @@ fn phase1c_resolve_consistency(
                         total_bits.saturating_sub(chunk_end_bit)
                     );
                 }
-                chunks[i + 1] = Some((Vec::new(), chunk_end_bit));
+                chunks[i + 1] = Some(ChunkResult {
+                    bootstrap: Vec::new(),
+                    isal_bytes: Vec::new(),
+                    end_bit_offset: chunk_end_bit,
+                });
                 i += 1;
                 continue;
             }
@@ -646,13 +848,20 @@ fn phase1c_resolve_consistency(
             // Re-decode chunk N+1 from the corrected (= real) start.
             // Use chunk N+2's *current* speculative start as the
             // end_limit when present; the next iteration corrects it
-            // if needed.
+            // if needed. Use the same bootstrap-+-ISA-L handoff path
+            // as the parallel worker so corrected chunks also benefit
+            // from per-thread ISA-L throughput.
             let new_end_limit = if i + 2 < num_chunks {
                 start_bits[i + 2]
             } else {
                 None
             };
-            match decode_chunk_markers_bounded(deflate_data, chunk_end_bit, new_end_limit) {
+            match decode_chunk_with_handoff(
+                deflate_data,
+                chunk_end_bit,
+                new_end_limit,
+                per_chunk_output_hint,
+            ) {
                 Ok(result) => chunks[i + 1] = Some(result),
                 Err(_) => {
                     if debug_enabled() {
@@ -673,37 +882,45 @@ fn phase1c_resolve_consistency(
 
 // ── Phase 2: sequential marker resolve + CRC + size ──────────────────────────
 
-fn phase2_resolve_sequential(chunks: Vec<Vec<u16>>) -> Result<(Vec<u8>, u32), ParallelError> {
-    let total_estimated: usize = chunks.iter().map(|c| c.len()).sum();
+fn phase2_resolve_sequential(chunks: Vec<ChunkResult>) -> Result<(Vec<u8>, u32), ParallelError> {
+    let total_estimated: usize = chunks.iter().map(|c| c.decoded_len()).sum();
     let mut assembled: Vec<u8> = Vec::with_capacity(total_estimated);
     let mut crc = crc32fast::Hasher::new();
     let mut window: Vec<u8> = Vec::with_capacity(WINDOW_SIZE);
 
-    for (i, mut chunk_u16) in chunks.into_iter().enumerate() {
+    for (i, mut chunk) in chunks.into_iter().enumerate() {
+        let chunk_start = assembled.len();
+
+        // Bootstrap u16 prefix: may contain cross-chunk markers (only
+        // for chunks i > 0). Resolve them against the previous chunk's
+        // last 32 KB, then narrow u16 → u8 into `assembled`.
         if i > 0 {
             // In-place SIMD substitution; ~memory-bandwidth speed on AVX2/NEON.
-            replace_markers(&mut chunk_u16, &window);
+            replace_markers(&mut chunk.bootstrap, &window);
         }
-        // Fused u16→u8 narrow + append to `assembled` + early-error on any
-        // unresolved marker. This replaces three separate passes (u16_to_u8
-        // into a fresh Vec<u8>, crc.update on that Vec, assembled.extend_from
-        // _slice). Before fusion, on a Silesia-class 480 MB output the
-        // resolve phase was ~40% of wall time (~680 ms / 1700 ms total on
-        // arm64 Mac) because each step rewalks ~120 MB per chunk.
-        let chunk_start = assembled.len();
-        narrow_and_append(&mut assembled, &chunk_u16).map_err(|pos| {
+        narrow_and_append(&mut assembled, &chunk.bootstrap).map_err(|pos| {
             if debug_enabled() {
                 eprintln!(
-                    "[parallel_sm:v0.6] chunk {} unresolved marker at index {} (offset {})",
+                    "[parallel_sm:v0.6] chunk {} unresolved marker at bootstrap[{}] (offset {})",
                     i,
                     pos,
-                    chunk_u16[pos] - MARKER_BASE,
+                    chunk.bootstrap[pos] - MARKER_BASE,
                 );
             }
             ParallelError::DecodeFailed
         })?;
-        // CRC across the appended slice — single pass, no intermediate copy.
+
+        // ISA-L bytes (the bulk of the chunk on the handoff path): no
+        // markers possible — ISA-L was seeded with the resolved 32 KB
+        // window and emits real u8 directly. Append as-is.
+        assembled.extend_from_slice(&chunk.isal_bytes);
+
+        // CRC across both pieces in one pass — phase 1's structural
+        // win (bootstrap markers ≤32 KB per chunk; ISA-L bytes are the
+        // bulk) means this CRC pass is the only one that walks all
+        // chunk output bytes.
         crc.update(&assembled[chunk_start..]);
+
         // Update window from the last 32 KB now sitting in `assembled`.
         let tail_start = assembled.len().saturating_sub(WINDOW_SIZE);
         window.clear();
