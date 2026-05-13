@@ -435,28 +435,33 @@ mod tests {
         data
     }
 
-    /// Mostly-random data designed to push zlib into fixed-Huffman block
-    /// emission at the lowest compression level. Each ~16 KB region has
-    /// frequent literal-only short bursts → many short blocks → zlib often
-    /// picks BTYPE=01 (fixed Huffman) over BTYPE=10 (dynamic, which has
-    /// per-block header overhead). This is the structural class of input
-    /// where BlockFinder's heuristic finds no candidates because it
-    /// excludes BTYPE=01 by design.
+    /// Mixed-entropy data designed to push zlib L1 into emitting many short
+    /// blocks (a mix of BTYPE=00/01/10). Specifically: 70% random bytes
+    /// (uncompressible — short stored or stored-mixed blocks),
+    /// 30% short repeats from a small phrase set (compresses well — short
+    /// dynamic / fixed-Huffman blocks). At L1 with this entropy mix, zlib
+    /// emits many small blocks rather than one giant one; the resulting
+    /// compressed size is large enough (~12 MiB at 24 MiB original) to
+    /// clear the 10 MiB parallel gate.
+    ///
+    /// This is the failure class the cross-chunk consistency correction
+    /// sweep addresses: phase 1a's speculative pick lands near a block
+    /// boundary, but not always *at* one — without correction the
+    /// pipeline silently fell back to libdeflate.
     fn make_btype01_heavy_data(size: usize) -> Vec<u8> {
+        let phrases: &[&[u8]] = &[b"abc", b"foo bar ", b"the quick brown ", b"hello ", b"xyz "];
         let mut data = Vec::with_capacity(size);
         let mut rng: u64 = 0xb0bd1ec0de;
         while data.len() < size {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            // 95% literal random bytes, 5% short repetitions — discourages
-            // long matches, favors small blocks.
-            if (rng >> 32) % 100 < 95 {
+            if (rng >> 32) % 100 < 70 {
+                // Random byte.
                 data.push((rng >> 16) as u8);
             } else {
-                let byte = (rng >> 24) as u8;
-                let repeat = ((rng >> 40) % 4 + 2) as usize;
-                for _ in 0..repeat.min(size - data.len()) {
-                    data.push(byte);
-                }
+                // Short phrase repetition.
+                let phrase = phrases[(rng as usize) % phrases.len()];
+                let to_take = phrase.len().min(size - data.len());
+                data.extend_from_slice(&phrase[..to_take]);
             }
         }
         data.truncate(size);
@@ -473,19 +478,21 @@ mod tests {
     /// Companion to `test_marker_pipeline_actually_runs_on_x86_64_isal` —
     /// same shape (decompress_single_member at T=4, counter snapshot), but
     /// against a fixture engineered to maximize fixed-Huffman (BTYPE=01)
-    /// block density. BlockFinder excludes BTYPE=01 candidates by design.
+    /// block density. BlockFinder excludes BTYPE=01 candidates by design,
+    /// so phase 1a's speculative starts on this fixture often land on
+    /// non-boundary positions. The cross-chunk consistency correction in
+    /// `single_member::phase1c_resolve_consistency` (Opus advisor approach
+    /// #2, refined) handles this via the induction "chunk N's decoded
+    /// end_bit is always a real block boundary; correct chunk N+1's
+    /// start to chunks[N].end_bit and re-decode chunk N+1." No candidate
+    /// lists, no strictness ramp, no top-K — just forward propagation.
     ///
-    /// **`#[ignore]` until the cross-chunk consistency PR lands.** Per the
-    /// Opus advisor review documented in `docs/marker-decoder-premortem.md`
-    /// F7: cheap per-position validation of BTYPE=01 boundaries cannot
-    /// reject all false positives in isolation (fixed Huffman has no
-    /// header redundancy). The structural fix is cross-chunk consistency
-    /// (phase 1c: top-K candidates per chunk + retry until chunk N's
-    /// end_bit equals chunk N+1's start_bit). Tier-3 sweep attempts on
-    /// PR #90 produced double-coverage SizeMismatch and were reverted.
-    /// Remove the `#[ignore]` once the cross-chunk PR lands.
+    /// Second deletion-trap killer (BTYPE=01-heavy companion to the
+    /// BTYPE=00/10 routing test). On `cfg(target_arch = "x86_64",
+    /// feature = "isal-compression")` it asserts the pipeline ran
+    /// end-to-end. On arm64 the parallel path is gated off and the
+    /// counter check is a no-op.
     #[test]
-    #[ignore = "blocked on cross-chunk consistency PR — see premortem F7"]
     fn test_marker_pipeline_runs_on_btype01_heavy_input() {
         use std::sync::atomic::Ordering;
 

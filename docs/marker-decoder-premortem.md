@@ -127,35 +127,43 @@ partition, e.g., because it only contains fixed Huffman blocks."*
 Their fix is **chain-decoding from a confirmed offset**, which serializes
 that one chunk but preserves correctness.
 
-**Mitigations shipped** (PR #90; full table in section G below):
+**Mitigations shipped** (PR #90 originally, refined in PR #96; full
+table in section G below):
 
-- **G1**: `decode_chunk_markers_bounded` errors if its `bit_pos`
-  overshoots `end_bit_limit`. Converts silent double-coverage into a
-  loud `DecodeFailed` pointing at the right layer.
-- **G2**: `decompress_parallel` verifies `chunks[N].end_bit ==
-  start_bits[N+1]` for every adjacent pair. Any mismatch returns Err.
-  This is *the* structural defense against false-positive boundaries:
-  bad picks no longer produce wrong output, they just produce Err.
-- **G3**: Routing-layer typed fallback. `ParallelError::TooSmall`
+- **G1** (refined PR #96): `decode_chunk_markers_bounded` exits cleanly
+  at the first real block boundary at or past `end_bit_limit`. PR #90's
+  exact-match contract was too strict; the speculative-then-correct
+  pattern handles misaligned limits via phase 1c.
+- **G2** (refined PR #96): `decompress_parallel` no longer rejects on
+  mismatch — instead it *corrects* `start_bits[N+1]` to
+  `chunks[N].end_bit_offset` (which IS a real boundary by G1
+  invariant). Re-decodes chunk N+1 from the corrected start. The
+  induction (chunk 0 starts at a real boundary; decode lands at a real
+  boundary; correction propagates) makes the pipeline self-healing.
+- **G3** (PR #90): Routing-layer typed fallback. `ParallelError::TooSmall`
   falls through silently (intended). Every other error increments
   `MARKER_PIPELINE_BOUNDARY_MISSED` and prints `[gzippy] parallel
   single-member fell back to sequential: {e}` to stderr unconditionally.
   In debug builds, panics.
-- **G4**: Bench script reads the routing-trace stderr signal and
-  hard-fails CI with a specific message — "marker pipeline did not
+- **G4** (PR #90): Bench script reads the routing-trace stderr signal
+  and hard-fails CI with a specific message — "marker pipeline did not
   run end-to-end" — instead of the ambiguous "0.62× rapidgzip".
+- **G5** (PR #96): Cross-chunk consistency correction sweep in
+  `phase1c_resolve_consistency`. Single forward pass through pairs
+  (N, N+1); when chunks[N].end_bit != start_bits[N+1], correct and
+  re-decode chunk N+1. Each chunk re-decodes at most once. Wall-time
+  deadline (2 s) bounds adversarial cases.
 
-**The right fix** (follow-up PR, Opus advisor approach #2):
-*Cross-chunk consistency retry loop.* Phase 1a returns a top-K
-candidate list per chunk, not a single pick. Phase 1c (new): if
-`chunks[N].end_bit != start_bits[N+1]`, advance chunk N+1's start to
-its next candidate and re-decode just that chunk. Iterate (bounded
-retries). This catches BTYPE=01 false positives by *cross-validation*
-without trying to make per-position validation airtight.
+The cross-chunk consistency correction is **the structural fix** for
+F7. PR #90's top-K + strictness-ramp design (proposed in an earlier
+revision of this document) was probabilistic and didn't converge on
+BTYPE=01-heavy inputs — Opus advisor review identified that as the
+wrong layer to defend. The correction sweep is induction-based: every
+decode that starts at a real boundary lands at a real boundary, so
+chunk N's end_bit is always trustworthy. PR #96 is the rewrite.
 
-The test `test_marker_pipeline_runs_on_btype01_heavy_input` is
-`#[ignore]`'d with a comment naming the cross-chunk PR as the
-unblocker. When that PR lands, remove the `#[ignore]`.
+The test `test_marker_pipeline_runs_on_btype01_heavy_input` is now
+un-ignored (was `#[ignore]`'d in PR #90 pending this PR).
 
 ---
 
@@ -227,10 +235,11 @@ wrong output.
 
 | Tag | Failure | Structural mitigation |
 |---|---|---|
-| G1 | `decode_chunk_markers_bounded` silently overshoots a misaligned `end_bit_limit` because the bounded-exit check is `>=`; chunk N runs past `limit` into chunk N+1's territory, producing double-coverage. | Exact-match contract: change the check to `bit_pos > limit ⇒ Err(...)` and `bit_pos == limit ⇒ Ok(())`. `fast_marker_inflate::decode_loop` enforces. (PR #90 commit 02381c4.) |
-| G2 | Phase 1a returns boundary picks that look valid to `try_decode_at` but aren't true block boundaries (BTYPE=01 false positives slip through `validate_boundary`). Chunks decode "successfully" but with wrong bytes. | Cross-chunk consistency: `decompress_parallel` verifies for every adjacent pair `(N, N+1)` that `chunks[N].end_bit_offset == start_bits[N+1]`. Any mismatch returns `Err(DecodeFailed)`. Wrong picks now produce Err, not wrong output. (PR #90 commit 13905bc.) |
+| G1 (refined in PR #96) | Original concern: chunk N silently overshoots misaligned `end_bit_limit` into N+1's territory. PR #90 used an exact-match `==` contract that returned Err on `>`. **PR #96 reverts to `bit_pos >= limit ⇒ Ok(actual_end)`** — the actual decoded end may exceed the speculative limit and is the new ground truth (real boundary by induction). G5 (below) uses it to *correct* misaligned starts instead of rejecting. |
+| G2 (refined in PR #96) | Phase 1a returns speculative boundary picks. BTYPE=01 false positives slip past `validate_boundary`. | PR #90's design: `decompress_parallel` verifies `chunks[N].end_bit == start_bits[N+1]` and returns Err on mismatch. PR #96's design: still verifies, but on mismatch **corrects** `start_bits[N+1] = chunks[N].end_bit` and re-decodes chunk N+1 (see G5). G2 is now a passive check inside G5's loop, not a separate rejection path. |
 | G3 | Routing's `Err(_) ⇒ fall back silently` hides "marker pipeline tried and failed" inside the same path as "input too small for parallel." Production looks identical to libdeflate; CI sees a generic perf shortfall. | Typed routing fallback: `ParallelError::TooSmall` is the only error that falls through silently. Every other variant increments `MARKER_PIPELINE_BOUNDARY_MISSED` and prints `[gzippy] parallel single-member fell back to sequential: {e}` to stderr unconditionally. `debug_assert!` panics in debug builds. (PR #90 commit 751b450.) |
 | G4 | Bench reports "gzippy 0.62× rapidgzip" without distinguishing "ran slow" from "never ran." | Bench script (`scripts/benchmark_single_member.py`) captures gzippy stderr with `GZIPPY_DEBUG=1` and parses for the G3 routing-trace message. Fails CI with a specific actionable reason: "marker pipeline did not run end-to-end on this fixture (silent fallback to sequential libdeflate). Throughput numbers reflect libdeflate, not the parallel path." (PR #90 commit c0f4f6d, extended in 751b450.) |
+| G5 (PR #96) | Cross-chunk consistency correction. `phase1c_resolve_consistency` walks pairs (N, N+1) once forward. When `chunks[N].end_bit != start_bits[N+1]`, the latter was a false positive (BTYPE=01 most often). Correct `start_bits[N+1] = chunks[N].end_bit` (which is a real boundary by G1 invariant) and re-decode chunk N+1. Propagate forward. Each chunk re-decodes at most once. Bounded by 2 s wall-time deadline. `MARKER_PIPELINE_RETRY_ITERATIONS` counts corrections — `>0` on BTYPE=01-heavy inputs, 0 on healthy data. |
 
 ---
 
@@ -265,6 +274,17 @@ Major design choices, with the reasoning that was current at decision time:
   (`vendor/rapidgzip/.../GzipChunkFetcher.hpp`) and chain-decodes in
   that case — validation that we're not missing an obvious cheap
   approach.
+- **2026-05-13** — implemented G5 (cross-chunk consistency correction).
+  First attempt (top-K candidates per chunk with strictness-ramped
+  `validate_boundary`) was overcomplicated and didn't converge on
+  BTYPE=01 fixtures; reverted. Second design (forward correction
+  sweep, induction from chunk 0's real start) is **strictly simpler**
+  and structurally sound: chunk N's decoded end_bit is always a real
+  boundary, so correcting chunk N+1's start to chunks[N].end_bit makes
+  it a real boundary by construction. Each chunk re-decodes at most
+  once. Reverted G1 from PR #90's exact-match `==` to `>=` (the
+  original speculative contract) since G5 now does the correction work
+  G1's strict contract was trying to surface. PR #96 lands the change.
 
 ---
 

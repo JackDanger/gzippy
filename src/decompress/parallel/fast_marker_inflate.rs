@@ -417,41 +417,28 @@ fn decode_loop(
             starts.push(bit_pos);
         }
 
-        // Bounded-mode early exit: if a caller provided an `end_bit_limit`
-        // and we've reached it (exactly at a block boundary, since that's
-        // where we are right now), stop without consuming this block. The
-        // chunk that owns `end_bit_limit` will pick up here.
+        // Bounded-mode early exit: when `bit_pos >= end_bit_limit` AND
+        // we're at a real block boundary (which we always are at the top
+        // of this loop), stop. The actual end_bit returned to the caller
+        // may exceed `end_bit_limit` if the caller's limit fell inside a
+        // block — chunk decode then naturally lands on the next real
+        // boundary past the limit.
         //
-        // **Exact-match contract** (premortem D3): `end_bit_limit` MUST
-        // be a real block boundary. The caller (phase 1a) is responsible
-        // for picking it. If it isn't — e.g. because tier-2 brute force
-        // returned a position that decoded 32 KB cleanly but wasn't
-        // actually a block start — we'd land here at a `bit_pos`
-        // STRICTLY past `limit` (because we naturally only check at
-        // real boundaries). Treat that as a contract violation: return
-        // an explicit error. Phase 1b's caller turns this into
-        // `ParallelError::DecodeFailed`, which the typed routing
-        // fallback surfaces.
+        // This is the *speculative* contract: `end_bit_limit` is an
+        // advisory target, not a hard upper bound. The caller
+        // (`phase1c_resolve_consistency` in `single_member.rs`) uses
+        // chunk N's returned `end_bit_offset` as chunk N+1's confirmed
+        // start, correcting any speculative-start mismatch.
         //
-        // Why this matters: silent overshoot lets chunks N and N+1
-        // double-cover the same byte range (chunk N runs past a
-        // misaligned `limit` to the next real boundary; chunk N+1
-        // starts at the misaligned `limit` and decodes the same bytes
-        // independently). Result: 2-3× expected output size, observed
-        // earlier today as the 62 MB / 25 MB SizeMismatch on the
-        // BTYPE=01-heavy fixture.
+        // Earlier versions enforced an exact-match contract (PR #90
+        // commit 02381c4) that returned Err on overshoot. That made
+        // false-positive starts produce a hard failure that fell back
+        // to libdeflate. Opus advisor review showed the simpler answer
+        // is: chunk N's decode is trustworthy (induction from chunk 0's
+        // real start), so let its end_bit propagate forward as the
+        // ground truth. See premortem section G (G5 entry).
         if let Some(limit) = end_bit_limit {
-            if bit_pos > limit {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!(
-                        "decode_chunk_markers_bounded: bit_pos {bit_pos} overshot \
-                         end_bit_limit {limit} — caller picked a misaligned limit \
-                         (not a real block boundary). See premortem F7."
-                    ),
-                ));
-            }
-            if bit_pos == limit {
+            if bit_pos >= limit {
                 return Ok(());
             }
         }
