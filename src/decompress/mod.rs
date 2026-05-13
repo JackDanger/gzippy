@@ -7,6 +7,7 @@
 
 pub mod bgzf;
 pub mod combined_lut;
+pub mod deflate64;
 pub mod format;
 pub mod index;
 pub mod inflate;
