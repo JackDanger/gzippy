@@ -198,7 +198,16 @@ pub fn decompress_parallel<W: Write>(
     }
 
     // ── Phase 3: verify trailer, write ──────────────────────────────────────
-    if expected_size > 0 && assembled.len() != expected_size {
+    //
+    // Both ISIZE and CRC32 in the gzip trailer can legitimately be zero
+    // (ISIZE=0 for an empty input; CRC32=0 happens for specific byte
+    // sequences — the CRC of the empty stream is itself 0). Earlier
+    // versions guarded these with `!= 0` sentinels and silently accepted
+    // corrupted output for those streams. Verification is now
+    // unconditional: the trailer is always present (we slice it off
+    // `gzip_data` at the function entry), so both checks must always
+    // fire. (Premortem mitigation B5; Copilot review on PR #94.)
+    if assembled.len() != expected_size {
         if debug_enabled() {
             eprintln!(
                 "[parallel_sm:v0.6] size mismatch: got {} expected {}",
@@ -208,7 +217,7 @@ pub fn decompress_parallel<W: Write>(
         }
         return Err(ParallelError::SizeMismatch);
     }
-    if expected_crc != 0 && total_crc != expected_crc {
+    if total_crc != expected_crc {
         if debug_enabled() {
             eprintln!(
                 "[parallel_sm:v0.6] CRC mismatch: got {:#010x} expected {:#010x}",
@@ -730,6 +739,65 @@ mod tests {
         }
         // Writer must not have received any bytes on any error path.
         assert!(output.is_empty());
+    }
+
+    /// Premortem mitigation B5: trailer fields can legitimately be zero.
+    /// Earlier versions guarded the verification with `if expected_crc != 0`
+    /// and `if expected_size > 0` — silently accepting corrupted streams
+    /// whose trailer fields happened to be zero. This test mutates a real
+    /// stream's CRC field to zero and asserts the decoder rejects it (the
+    /// true CRC of any non-trivial 10+ MiB stream is overwhelmingly
+    /// non-zero, so trailer-CRC=0 means "trailer lies").
+    #[test]
+    fn crc_zero_trailer_is_verified() {
+        let data = make_random_data(10 * 1024 * 1024, 0xfacefeed);
+        let mut compressed = make_gzip_data(&data);
+        let crc_offset = compressed.len() - 8;
+        compressed[crc_offset..crc_offset + 4].copy_from_slice(&0u32.to_le_bytes());
+        let mut output = Vec::new();
+        match decompress_parallel(&compressed, &mut output, 4) {
+            Err(ParallelError::CrcMismatch) => {}
+            Err(ParallelError::DecodeFailed)
+            | Err(ParallelError::SizeMismatch)
+            | Err(ParallelError::TooSmall) => {}
+            Ok(_) => panic!(
+                "CRC=0 trailer not detected as corruption — the `expected_crc != 0` \
+                 sentinel guard is back. See Copilot review on PR #94."
+            ),
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+        assert!(
+            output.is_empty(),
+            "no bytes written on verification failure"
+        );
+    }
+
+    /// Same as above for ISIZE. A 10 MiB input has expected_size = 10 MiB
+    /// mod 2^32, which is non-zero; setting the trailer ISIZE field to 0
+    /// must be detected even though `expected_size == 0` was the previous
+    /// "skip the check" sentinel.
+    #[test]
+    fn isize_zero_trailer_is_verified() {
+        let data = make_random_data(10 * 1024 * 1024, 0xfeedbeef);
+        let mut compressed = make_gzip_data(&data);
+        let isize_offset = compressed.len() - 4;
+        compressed[isize_offset..isize_offset + 4].copy_from_slice(&0u32.to_le_bytes());
+        let mut output = Vec::new();
+        match decompress_parallel(&compressed, &mut output, 4) {
+            Err(ParallelError::SizeMismatch) => {}
+            Err(ParallelError::CrcMismatch)
+            | Err(ParallelError::DecodeFailed)
+            | Err(ParallelError::TooSmall) => {}
+            Ok(_) => panic!(
+                "ISIZE=0 trailer not detected as corruption — the `expected_size > 0` \
+                 sentinel guard is back. See Copilot review on PR #94."
+            ),
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+        assert!(
+            output.is_empty(),
+            "no bytes written on verification failure"
+        );
     }
 
     // ── Deletion-trap killer counter ─────────────────────────────────────────
