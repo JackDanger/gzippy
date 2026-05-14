@@ -945,124 +945,161 @@ fn phase1c_resolve_consistency(
         return Ok(());
     }
 
-    let mut i: usize = 0;
-    while i < num_chunks - 1 {
-        let chunk_end_bit = chunks[i]
-            .as_ref()
-            .expect("invariant: chunks[i] is Some by this point")
-            .end_bit_offset;
-        let next_start = start_bits[i + 1];
+    let total_bits = deflate_data.len() * 8;
 
-        // The correction step fires when:
-        //   - chunks[i+1] is None (phase 1b worker failed — e.g. the
-        //     bootstrap→ISA-L handoff returned Err for that chunk),
-        //     regardless of whether start_bits[i+1] looked OK; OR
-        //   - start_bits[i+1] is None (phase 1a found no candidate;
-        //     chain-decode from chunks[i].end_bit); OR
-        //   - start_bits[i+1] is Some but != chunks[i].end_bit
-        //     (false-positive pick; correct to the real boundary).
-        //
-        // The first case was the latent bug exposed by PR #97's
-        // handoff path: when start_bits[i+1] coincidentally equaled
-        // chunks[i].end_bit but chunks[i+1] was None (worker
-        // failure), the old logic skipped correction and the next
-        // iteration panicked on `.expect("invariant: chunks[i] is
-        // Some")`. Now any None chunk triggers chain-decode.
-        let needs_correction = chunks[i + 1].is_none()
-            || match next_start {
-                None => true,
-                Some(s) => s != chunk_end_bit,
+    // Wave-based parallel correction loop.
+    //
+    // Each wave identifies all chunks whose predecessor is already resolved
+    // (Some) but which themselves need correction (None, or wrong start_bit).
+    // Independent corrections within a wave are dispatched as parallel threads
+    // via `thread::scope` — a correction at index i and one at index j > i are
+    // independent whenever chunks[i-1] and chunks[j-1] are both already Some.
+    //
+    // On typical real data (few corrections) one wave handles everything.
+    // Consecutive failures (chunks i, i+1, i+2 all None) are still O(N)
+    // serial waves because each depends on its predecessor — unavoidable.
+    //
+    // Preconditions per wave:
+    //   - chunks[i] is Some ⟹ its start_bit is a real block boundary (G1)
+    //   - deadline enforces that adversarial inputs don't spin forever
+    loop {
+        // ── Read-only scan: classify corrections this wave ──────────────────
+        // Two categories:
+        //   near_eof_fills: predecessor already at/past EOF — mark empty now.
+        //   specs:          need a real re-decode; will run in parallel.
+        let mut near_eof_fills: Vec<(usize, usize)> = Vec::new();
+        let mut specs: Vec<(usize, usize, Option<usize>)> = Vec::new();
+
+        for i in 0..num_chunks - 1 {
+            let pred_end = match &chunks[i] {
+                Some(c) => c.end_bit_offset,
+                // Predecessor not yet resolved — its correction will appear in
+                // a later wave once this wave resolves chunks[i].
+                None => continue,
             };
 
-        if needs_correction {
-            if std::time::Instant::now() >= deadline {
-                if debug_enabled() {
-                    eprintln!(
-                        "[parallel_sm:v0.6] phase1c: wall-time deadline exceeded after \
-                         {} corrections",
-                        MARKER_PIPELINE_RETRY_ITERATIONS.load(Ordering::Relaxed)
-                    );
-                }
-                return Err(ParallelError::DecodeFailed);
-            }
-            MARKER_PIPELINE_RETRY_ITERATIONS.fetch_add(1, Ordering::Relaxed);
-            if debug_enabled() {
-                eprintln!(
-                    "[parallel_sm:v0.6] phase1c: correcting chunk {} start from {:?} \
-                     to chunk {}'s end_bit {chunk_end_bit}",
-                    i + 1,
-                    next_start,
-                    i
-                );
-            }
-            start_bits[i + 1] = Some(chunk_end_bit);
-
-            // If the corrected start leaves less than one block-header
-            // (3 bits) of input remaining, the predecessor chunk already
-            // absorbed BFINAL and what's left is only byte-padding before
-            // the gzip trailer. Chunk N+1 is naturally empty. This is
-            // normal when an upstream chunk overshoots its speculative
-            // range to consume the BFINAL block that a downstream chunk
-            // was supposed to handle.
-            //
-            // Threshold: < 8 bits remaining. 3 bits is the minimum block
-            // header size (BFINAL + BTYPE), but the byte-padding between
-            // the last block's last symbol and the gzip trailer can be
-            // up to 7 bits. Using 8 covers the worst case.
-            let total_bits = deflate_data.len() * 8;
-            if total_bits.saturating_sub(chunk_end_bit) < 8 {
-                if debug_enabled() {
-                    eprintln!(
-                        "[parallel_sm:v0.6] phase1c: chunk {} starts at/near EOF \
-                         (chunk_end_bit={chunk_end_bit}, total_bits={total_bits}, \
-                         remaining={}); marking empty (predecessor consumed BFINAL)",
-                        i + 1,
-                        total_bits.saturating_sub(chunk_end_bit)
-                    );
-                }
-                chunks[i + 1] = Some(ChunkResult {
-                    bootstrap: Vec::new(),
-                    isal_bytes: Vec::new(),
-                    isal_crc: crc32fast::Hasher::new(),
-                    end_bit_offset: chunk_end_bit,
-                });
-                i += 1;
+            // Correction needed when:
+            //   - chunks[i+1] is None (phase 1b worker failed), OR
+            //   - start_bits[i+1] is None/wrong (phase 1a false-positive or miss).
+            let needs = chunks[i + 1].is_none() || (start_bits[i + 1] != Some(pred_end));
+            if !needs {
                 continue;
             }
 
-            // Re-decode chunk N+1 from the corrected (= real) start.
-            // Use chunk N+2's *current* speculative start as the
-            // end_limit when present; the next iteration corrects it
-            // if needed. Use the same bootstrap-+-ISA-L handoff path
-            // as the parallel worker so corrected chunks also benefit
-            // from per-thread ISA-L throughput.
-            let new_end_limit = if i + 2 < num_chunks {
-                start_bits[i + 2]
+            if total_bits.saturating_sub(pred_end) < 8 {
+                // Predecessor consumed BFINAL; remaining bits are only
+                // byte-padding before the gzip trailer. No decode needed.
+                near_eof_fills.push((i + 1, pred_end));
             } else {
-                None
-            };
-            match decode_chunk_with_handoff(
-                deflate_data,
-                chunk_end_bit,
-                new_end_limit,
-                per_chunk_output_hint,
-                num_chunks,
-            ) {
-                Ok(result) => chunks[i + 1] = Some(result),
+                let end_limit = if i + 2 < num_chunks {
+                    start_bits[i + 2]
+                } else {
+                    None
+                };
+                specs.push((i + 1, pred_end, end_limit));
+            }
+        }
+
+        if near_eof_fills.is_empty() && specs.is_empty() {
+            break; // all chunks resolved
+        }
+
+        // ── Apply near-EOF fills (no decode, no deadline check needed) ──────
+        for (idx, pred_end) in near_eof_fills {
+            if debug_enabled() {
+                eprintln!(
+                    "[parallel_sm:v0.6] phase1c: chunk {idx} starts at/near EOF \
+                     (pred_end={pred_end}, total_bits={total_bits}, \
+                     remaining={}); marking empty",
+                    total_bits.saturating_sub(pred_end)
+                );
+            }
+            chunks[idx] = Some(ChunkResult {
+                bootstrap: Vec::new(),
+                isal_bytes: Vec::new(),
+                isal_crc: crc32fast::Hasher::new(),
+                end_bit_offset: pred_end,
+            });
+            start_bits[idx] = Some(pred_end);
+        }
+
+        if specs.is_empty() {
+            // Near-EOF fills may have unblocked more corrections —
+            // re-scan before checking the deadline.
+            continue;
+        }
+
+        if std::time::Instant::now() >= deadline {
+            if debug_enabled() {
+                eprintln!(
+                    "[parallel_sm:v0.6] phase1c: wall-time deadline exceeded after \
+                     {} corrections",
+                    MARKER_PIPELINE_RETRY_ITERATIONS.load(Ordering::Relaxed)
+                );
+            }
+            return Err(ParallelError::DecodeFailed);
+        }
+
+        MARKER_PIPELINE_RETRY_ITERATIONS.fetch_add(specs.len() as u64, Ordering::Relaxed);
+
+        if debug_enabled() {
+            for &(idx, start_bit, _) in &specs {
+                eprintln!(
+                    "[parallel_sm:v0.6] phase1c: correcting chunk {idx} start to {start_bit}"
+                );
+            }
+        }
+
+        // ── Parallel re-decode of all independent corrections this wave ─────
+        // `thread::scope` guarantees all threads join before we mutate
+        // `chunks`/`start_bits`. Each thread receives only Copy values
+        // (`start_bit`, `end_limit`, `per_chunk_output_hint`, `num_chunks`)
+        // plus an immutable shared borrow of `deflate_data`.
+        let results: Vec<(usize, usize, std::io::Result<ChunkResult>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = specs
+                .iter()
+                .map(|&(idx, start_bit, end_limit)| {
+                    s.spawn(move || {
+                        (
+                            idx,
+                            start_bit,
+                            decode_chunk_with_handoff(
+                                deflate_data,
+                                start_bit,
+                                end_limit,
+                                per_chunk_output_hint,
+                                num_chunks,
+                            ),
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("phase1c correction thread panicked"))
+                .collect()
+        });
+
+        // ── Commit results ───────────────────────────────────────────────────
+        for (idx, pred_end, result) in results {
+            match result {
+                Ok(chunk) => {
+                    start_bits[idx] = Some(pred_end);
+                    chunks[idx] = Some(chunk);
+                }
                 Err(_) => {
                     if debug_enabled() {
                         eprintln!(
-                            "[parallel_sm:v0.6] phase1c: re-decode of chunk {} from real \
-                             boundary {chunk_end_bit} failed; deflate stream likely corrupt",
-                            i + 1
+                            "[parallel_sm:v0.6] phase1c: re-decode of chunk {idx} from real \
+                             boundary {pred_end} failed; deflate stream likely corrupt"
                         );
                     }
                     return Err(ParallelError::DecodeFailed);
                 }
             }
         }
-        i += 1;
     }
+
     Ok(())
 }
 
@@ -1644,6 +1681,136 @@ mod tests {
         assert!(
             output.is_empty(),
             "no bytes written on verification failure"
+        );
+    }
+
+    // ── Phase 1c parallel correction ─────────────────────────────────────────
+
+    /// Verify that phase1c corrects two *non-consecutive* None chunks in a
+    /// single parallel wave rather than two sequential passes.
+    ///
+    /// Setup:
+    ///   - Decode a real 8 MiB gzip file at T=4 to get all four chunks.
+    ///   - Save chunks[0] and chunks[2] (already decoded from real boundaries).
+    ///   - Zero out chunks[1] and chunks[3], and corrupt their start_bits.
+    ///   - Call phase1c_resolve_consistency.
+    ///
+    /// Expected: since chunks[0] and chunks[2] are both Some, the first wave
+    /// identifies corrections for indexes 1 and 3 simultaneously (they are
+    /// independent: different predecessors).  RETRY_ITERATIONS must increase
+    /// by exactly 2 in one wave — the parallel path merged both into a single
+    /// `thread::scope`.  Both corrected chunks must have non-zero decoded data.
+    #[test]
+    fn phase1c_corrects_two_nonconsecutive_chunks_in_parallel() {
+        use crate::decompress::parallel::marker_decode::skip_gzip_header;
+        use std::time::{Duration, Instant};
+
+        let original = make_compressible_data(8 * 1024 * 1024);
+        let gzip = make_gzip_data(&original);
+
+        let header_size = skip_gzip_header(&gzip).expect("valid gzip header");
+        let deflate_data = &gzip[header_size..gzip.len() - 8];
+
+        let num_chunks = 4;
+        let per_chunk_hint = deflate_data.len() / num_chunks;
+        let total_bits = deflate_data.len() * 8;
+        let spacing = total_bits / num_chunks;
+
+        // Find real block boundaries near the spacing-derived anchor for each
+        // chunk using the same boundary search as phase 1a.
+        let mut start_bits: Vec<Option<usize>> = (0..num_chunks)
+            .map(|i| {
+                if i == 0 {
+                    Some(0)
+                } else {
+                    search_boundary_forward(deflate_data, i * spacing)
+                }
+            })
+            .collect();
+
+        // Decode chunks 0 and 2 from their (real) boundaries.
+        let end_limit_0 = start_bits[1];
+        let c0 = match decode_chunk_with_handoff(
+            deflate_data,
+            0,
+            end_limit_0,
+            per_chunk_hint,
+            num_chunks,
+        ) {
+            Ok(c) => c,
+            Err(_) => return, // ISA-L decode failed on this platform — skip
+        };
+        let start2 = match start_bits[2] {
+            Some(s) => s,
+            None => return, // phase 1a found no boundary for chunk 2 — skip
+        };
+        let end_limit_2 = start_bits[3];
+        let c2 = match decode_chunk_with_handoff(
+            deflate_data,
+            start2,
+            end_limit_2,
+            per_chunk_hint,
+            num_chunks,
+        ) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        // Build a chunks array with chunks[1] and chunks[3] missing.
+        // Give them wrong start_bits so phase1c knows they need correction.
+        let e0 = c0.end_bit_offset;
+        let e2 = c2.end_bit_offset;
+
+        let mut chunks: Vec<Option<ChunkResult>> = vec![
+            Some(c0),
+            None, // will be corrected from e0
+            Some(c2),
+            None, // will be corrected from e2
+        ];
+        // Corrupt starts for the None slots so `needs` fires for both.
+        start_bits[1] = Some(e0.wrapping_add(99)); // wrong — should be e0
+        start_bits[3] = Some(e2.wrapping_add(99)); // wrong — should be e2
+
+        let before = MARKER_PIPELINE_RETRY_ITERATIONS.load(Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        phase1c_resolve_consistency(
+            deflate_data,
+            &mut start_bits,
+            &mut chunks,
+            deadline,
+            per_chunk_hint,
+        )
+        .expect("phase1c must succeed on real deflate data with real start boundaries");
+
+        let after = MARKER_PIPELINE_RETRY_ITERATIONS.load(Ordering::Relaxed);
+
+        // Both corrections must have fired in one parallel wave.
+        assert_eq!(
+            after - before,
+            2,
+            "expected exactly 2 retry increments (one parallel wave); got {}",
+            after - before
+        );
+
+        // All four chunks must be resolved.
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.is_some(),
+                "chunk {i} must be Some after phase1c correction"
+            );
+        }
+
+        // Corrected chunks must have the right start bits.
+        assert_eq!(
+            start_bits[1],
+            Some(e0),
+            "chunk 1 start_bit must equal chunk 0 end_bit"
+        );
+        assert_eq!(
+            start_bits[3],
+            Some(e2),
+            "chunk 3 start_bit must equal chunk 2 end_bit"
         );
     }
 
