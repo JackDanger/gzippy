@@ -444,41 +444,45 @@ pub fn decompress_deflate_from_bit_with_end(
         }
     }
 
-    // Grow-on-demand output buffer. The earlier fixed-cap design
-    // (`vec![0u8; cap]` preallocated at line 449) silently truncated
-    // when the actual decoded size exceeded `cap`, producing
-    // `Some((truncated, mid_block_end_bit))` — the parallel single-
-    // member worker would then report a chunk's `end_bit` mid-block,
-    // phase 1c couldn't correct, and routing fell back silently to
-    // libdeflate. The Silesia x86_64 Tmax CI bench caught this as
-    // a 0.55× rapidgzip ratio with "marker pipeline did not run
-    // end-to-end" in the routing trace.
+    // Pre-allocate the output buffer at `cap` upfront. Earlier
+    // designs in this PR tried two approaches that both lost
+    // performance:
     //
-    // `max_output` is now the *cap*, not the allocation size: the
-    // buffer starts at `max_output.min(initial_chunk)` and doubles on
-    // demand up to `max_output`. The cap is still enforced (catches
-    // runaway-decode bugs and bounds memory), but a legitimate decode
-    // that exceeds the per-chunk size hint just allocates more memory
-    // instead of corrupting state.
-    const INITIAL_BUF: usize = 1024 * 1024;
+    //   - Fixed `cap` (vec![0u8; cap] preallocated) silently
+    //     truncated when a chunk exceeded the cap, producing a
+    //     mid-block `end_bit` and breaking phase 1c. Silesia CI
+    //     caught it at 0.55× rapidgzip via a "marker pipeline did
+    //     not run end-to-end" silent fallback.
+    //
+    //   - Grow-on-demand (Vec::resize doubling from 1 MiB) called
+    //     `realloc()` 7-8 times for a chunk decoding 100+ MB, with
+    //     each realloc copying the existing bytes to the new
+    //     allocation. The realloc memcpy cost dominated the bench
+    //     (~2.4 s for 503 MB at 4 chunks vs the ~340 ms ISA-L
+    //     should need).
+    //
+    // The right shape: allocate `cap` once upfront. On Linux, `vec!
+    // [0u8; cap]` uses calloc which mmap's anonymous zero pages
+    // *lazily* — physical memory is only consumed as ISA-L writes.
+    // A 2 GiB virtual allocation per worker costs nothing if the
+    // chunk only decodes 100 MB; only those 100 MB of pages are
+    // ever faulted in. No realloc, no copy, just one mmap and one
+    // free per worker.
+    //
+    // `max_output` is the cap. A bug-class runaway decode would
+    // still hit `out_pos == output.len()` and return None, but the
+    // normal case never grows or copies.
     const MAX_CAP: usize = 2 * 1024 * 1024 * 1024;
     let cap = max_output.clamp(256 * 1024, MAX_CAP);
-    let initial = cap.min(INITIAL_BUF);
-    let mut output = vec![0u8; initial];
+    let mut output = vec![0u8; cap];
     let mut out_pos = 0usize;
 
     loop {
         if out_pos == output.len() {
-            if output.len() >= cap {
-                // True cap reached — bail rather than allocate more.
-                // This means the caller's cap was wrong; surface it
-                // as a decode failure rather than a silent truncate.
-                return None;
-            }
-            // Double the buffer (bounded by cap). Resize zeroes the
-            // new bytes — ISA-L requires initialized output buffers.
-            let new_len = (output.len().saturating_mul(2)).min(cap);
-            output.resize(new_len, 0);
+            // True cap reached — bail rather than re-allocate. This
+            // means the caller's cap was wrong; surface it as a
+            // decode failure rather than a silent truncate.
+            return None;
         }
 
         let remaining = output.len() - out_pos;

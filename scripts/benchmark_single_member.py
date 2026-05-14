@@ -104,7 +104,11 @@ def benchmark_decompress(
         routing_trace = {
             "ran_marker_pipeline": ran_marker,
             "fell_back_to_sequential": fell_back,
-            "stderr_head": stderr_text[:500],
+            # Capture a larger window of stderr so the per-phase
+            # timing line ("[parallel_sm:v0.6] search=Xms decode=Yms
+            # retry=Zms resolve=Wms total=Tms ...") survives — that
+            # line is what tells us WHY the bench is slow.
+            "stderr_head": stderr_text[:4000],
         }
 
     def run_decompress():
