@@ -109,6 +109,89 @@ pub(crate) static MARKER_PIPELINE_BOUNDARY_MISSED: AtomicU64 = AtomicU64::new(0)
 /// thrashing — see `docs/marker-decoder-premortem.md` G5 mitigation.
 pub(crate) static MARKER_PIPELINE_RETRY_ITERATIONS: AtomicU64 = AtomicU64::new(0);
 
+/// Counters proving the rapidgzip-style optimizations are actually
+/// firing. The marker pipeline can SILENTLY DEGRADE in ways that don't
+/// produce wrong output but blow up the perf budget:
+///
+///   - Bootstrap never exits (no clean 32 KB tail found) → falls back
+///     to running the marker decoder for the whole chunk at pure-Rust
+///     speed (~50 MB/s/thread) instead of ~163 MB/s ISA-L per-thread.
+///     `HANDOFF_FIRED` distinguishes this from the fast path.
+///
+///   - Bootstrap accumulates far more than 32 KB before exiting because
+///     emit_match's chunk-local copy spreads markers forward through
+///     the output. `BOOTSTRAP_OUTPUT_BYTES` divided by chunk count
+///     should be near 32 KB; growth past 1-2 MB per chunk signals
+///     that markers are propagating too aggressively.
+///
+///   - ISA-L bulk decode never runs (`SLOW_PATH_USED`). On healthy
+///     fixtures every chunk except possibly the last should take the
+///     bulk path.
+///
+///   - Phase 1a's boundary search calls try_decode_at quadratically
+///     because BlockFinder emits too many candidates. `BOUNDARY_VALIDATIONS`
+///     should stay bounded per chunk; runaway counts indicate the
+///     `decompress_deflate_from_bit` MIN_CAP wasn't doing what we thought.
+///
+/// All counters are reset by tests via `reset_optimization_counters()`
+/// to avoid cross-test interference under cargo test's default parallel
+/// execution. Snapshot before/after a known decode and assert the
+/// expected delta — the absolute counter values are uninteresting.
+pub(crate) static HANDOFF_FIRED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SLOW_PATH_USED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static BOOTSTRAP_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static ISAL_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static BOUNDARY_VALIDATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the optimization counters at a point in time. Used by
+/// tests to take a before/after delta around a `decompress_parallel`
+/// call. The mutex-serialized killer-test pattern (see
+/// `MARKER_PIPELINE_TEST_LOCK`) ensures no other test's bumps land in
+/// the delta window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OptimizationCounters {
+    pub handoff_fired: u64,
+    pub slow_path_used: u64,
+    pub bootstrap_output_bytes: u64,
+    pub isal_output_bytes: u64,
+    pub boundary_validations: u64,
+    pub retry_iterations: u64,
+}
+
+impl OptimizationCounters {
+    pub fn snapshot() -> Self {
+        Self {
+            handoff_fired: HANDOFF_FIRED.load(Ordering::Relaxed),
+            slow_path_used: SLOW_PATH_USED.load(Ordering::Relaxed),
+            bootstrap_output_bytes: BOOTSTRAP_OUTPUT_BYTES.load(Ordering::Relaxed),
+            isal_output_bytes: ISAL_OUTPUT_BYTES.load(Ordering::Relaxed),
+            boundary_validations: BOUNDARY_VALIDATIONS.load(Ordering::Relaxed),
+            retry_iterations: MARKER_PIPELINE_RETRY_ITERATIONS.load(Ordering::Relaxed),
+        }
+    }
+
+    /// `self - other`, saturating per field — used to compute the
+    /// delta over a single decode call.
+    pub fn delta(&self, before: &Self) -> Self {
+        Self {
+            handoff_fired: self.handoff_fired.saturating_sub(before.handoff_fired),
+            slow_path_used: self.slow_path_used.saturating_sub(before.slow_path_used),
+            bootstrap_output_bytes: self
+                .bootstrap_output_bytes
+                .saturating_sub(before.bootstrap_output_bytes),
+            isal_output_bytes: self
+                .isal_output_bytes
+                .saturating_sub(before.isal_output_bytes),
+            boundary_validations: self
+                .boundary_validations
+                .saturating_sub(before.boundary_validations),
+            retry_iterations: self
+                .retry_iterations
+                .saturating_sub(before.retry_iterations),
+        }
+    }
+}
+
 /// Hard wall-time deadline for the cross-chunk correction sweep.
 /// Healthy data converges in <50 ms; the deadline bounds adversarial
 /// inputs (where every chunk decodes serially via the correction chain)
@@ -461,6 +544,7 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
 /// Each stage-2 run decodes one deflate block (~30 KB out / ~10 KB in)
 /// at ~200-300 MB/s — sub-millisecond per accepted candidate.
 fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
+    BOUNDARY_VALIDATIONS.fetch_add(1, Ordering::Relaxed);
     let start_byte = bit_offset / 8;
     if start_byte >= deflate_data.len() {
         return false;
@@ -538,6 +622,18 @@ fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
 struct ChunkResult {
     bootstrap: Vec<u16>,
     isal_bytes: Vec<u8>,
+    /// Precomputed CRC32 of `isal_bytes`. Phase 1 workers compute this
+    /// in parallel during the bulk decode so phase 2 doesn't have to
+    /// walk the entire output sequentially. Combined via
+    /// `crc32fast::Hasher::combine` in phase 2. The bootstrap markers
+    /// need to be resolved first (they may contain cross-chunk
+    /// markers from chunks > 0), so their CRC is still computed in
+    /// phase 2 — but bootstrap is ≤32 KB per chunk vs `isal_bytes`
+    /// which can be 100+ MB. Sequential CRC work drops from ~100 ms
+    /// to ~1-2 ms on Silesia. Mirrors rapidgzip's per-chunk CRC
+    /// computed during decode (`vendor/rapidgzip/.../GzipChunk.hpp`
+    /// uses ChunkData::append which CRCs as bytes are appended).
+    isal_crc: crc32fast::Hasher,
     end_bit_offset: usize,
 }
 
@@ -628,6 +724,10 @@ fn decode_chunk_with_handoff(
         clean_window,
     } = decode_chunk_bootstrap(deflate_data, start_bit, end_bit_limit)?;
 
+    // Track bootstrap output for the "is the handoff actually firing"
+    // assertion in tests::routing — see HANDOFF_FIRED rationale.
+    BOOTSTRAP_OUTPUT_BYTES.fetch_add(bootstrap_markers.len() as u64, Ordering::Relaxed);
+
     // No clean window? Two reasons: (1) end_bit_limit reached before
     // 32 KB clean tail accumulated (tiny chunk), or (2) BFINAL hit
     // (last chunk smaller than 32 KB of output). Either way the
@@ -637,6 +737,7 @@ fn decode_chunk_with_handoff(
         return Ok(ChunkResult {
             bootstrap: bootstrap_markers,
             isal_bytes: Vec::new(),
+            isal_crc: crc32fast::Hasher::new(),
             end_bit_offset: bootstrap_end_bit,
         });
     };
@@ -683,16 +784,32 @@ fn decode_chunk_with_handoff(
             &dict,
             max_output,
         ) {
-            Some((isal_bytes, isal_end_bit)) => Ok(ChunkResult {
-                bootstrap: bootstrap_markers,
-                isal_bytes,
-                end_bit_offset: isal_end_bit,
-            }),
+            Some((isal_bytes, isal_end_bit)) => {
+                HANDOFF_FIRED.fetch_add(1, Ordering::Relaxed);
+                ISAL_OUTPUT_BYTES.fetch_add(isal_bytes.len() as u64, Ordering::Relaxed);
+                // Compute the CRC32 of this chunk's ISA-L bytes IN
+                // THIS WORKER. Phase 2 will combine per-chunk CRCs
+                // via crc32fast::Hasher::combine instead of walking
+                // all 100+ MB of output sequentially. With 4 workers
+                // on 2 cores at ~5 GB/s CRC, this adds ~12-25 ms per
+                // worker (parallel) but removes ~100 ms of
+                // sequential CRC from phase 2. Net wall savings:
+                // ~75-100 ms on Silesia at T=4.
+                let mut isal_crc = crc32fast::Hasher::new();
+                isal_crc.update(&isal_bytes);
+                Ok(ChunkResult {
+                    bootstrap: bootstrap_markers,
+                    isal_bytes,
+                    isal_crc,
+                    end_bit_offset: isal_end_bit,
+                })
+            }
             None => {
                 // ISA-L failed — most often because the speculative
                 // end_bit_limit cut mid-block. Fall back to finishing
                 // the chunk via the marker decoder. Slow path, rare
                 // on real data.
+                SLOW_PATH_USED.fetch_add(1, Ordering::Relaxed);
                 marker_finish_after_bootstrap(
                     deflate_data,
                     bootstrap_markers,
@@ -709,6 +826,7 @@ fn decode_chunk_with_handoff(
     #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
     {
         let _ = (dict, per_chunk_output_hint, num_chunks_total);
+        SLOW_PATH_USED.fetch_add(1, Ordering::Relaxed);
         marker_finish_after_bootstrap(
             deflate_data,
             bootstrap_markers,
@@ -743,6 +861,9 @@ fn marker_finish_after_bootstrap(
     Ok(ChunkResult {
         bootstrap: bootstrap_markers,
         isal_bytes: Vec::new(),
+        // Slow path: no ISA-L bytes, so the per-chunk CRC is the
+        // identity. Phase 2 will CRC the resolved bootstrap.
+        isal_crc: crc32fast::Hasher::new(),
         end_bit_offset: end_bit,
     })
 }
@@ -870,6 +991,7 @@ fn phase1c_resolve_consistency(
                 chunks[i + 1] = Some(ChunkResult {
                     bootstrap: Vec::new(),
                     isal_bytes: Vec::new(),
+                    isal_crc: crc32fast::Hasher::new(),
                     end_bit_offset: chunk_end_bit,
                 });
                 i += 1;
@@ -917,12 +1039,10 @@ fn phase1c_resolve_consistency(
 fn phase2_resolve_sequential(chunks: Vec<ChunkResult>) -> Result<(Vec<u8>, u32), ParallelError> {
     let total_estimated: usize = chunks.iter().map(|c| c.decoded_len()).sum();
     let mut assembled: Vec<u8> = Vec::with_capacity(total_estimated);
-    let mut crc = crc32fast::Hasher::new();
+    let mut total_crc = crc32fast::Hasher::new();
     let mut window: Vec<u8> = Vec::with_capacity(WINDOW_SIZE);
 
     for (i, mut chunk) in chunks.into_iter().enumerate() {
-        let chunk_start = assembled.len();
-
         // Bootstrap u16 prefix: may contain cross-chunk markers (only
         // for chunks i > 0). Resolve them against the previous chunk's
         // last 32 KB, then narrow u16 → u8 into `assembled`.
@@ -930,6 +1050,7 @@ fn phase2_resolve_sequential(chunks: Vec<ChunkResult>) -> Result<(Vec<u8>, u32),
             // In-place SIMD substitution; ~memory-bandwidth speed on AVX2/NEON.
             replace_markers(&mut chunk.bootstrap, &window);
         }
+        let bootstrap_start = assembled.len();
         narrow_and_append(&mut assembled, &chunk.bootstrap).map_err(|pos| {
             if debug_enabled() {
                 eprintln!(
@@ -941,17 +1062,27 @@ fn phase2_resolve_sequential(chunks: Vec<ChunkResult>) -> Result<(Vec<u8>, u32),
             }
             ParallelError::DecodeFailed
         })?;
+        let bootstrap_end = assembled.len();
+
+        // CRC the (small) resolved bootstrap bytes sequentially — they
+        // weren't CRC'd in phase 1 because they may have contained
+        // markers that needed prev-chunk window resolution. Bootstrap
+        // size is bounded to ~32-128 KB per chunk so this walk is
+        // <1 ms.
+        let mut bootstrap_crc = crc32fast::Hasher::new();
+        bootstrap_crc.update(&assembled[bootstrap_start..bootstrap_end]);
+        total_crc.combine(&bootstrap_crc);
 
         // ISA-L bytes (the bulk of the chunk on the handoff path): no
         // markers possible — ISA-L was seeded with the resolved 32 KB
-        // window and emits real u8 directly. Append as-is.
+        // window and emits real u8 directly. Append as-is and combine
+        // the per-chunk CRC that phase 1's worker already computed in
+        // parallel. This is the structural win that lets phase 2 stay
+        // out of the critical path: instead of walking the 100+ MB of
+        // ISA-L output sequentially to CRC it, we just combine the
+        // precomputed Hasher from the worker.
         assembled.extend_from_slice(&chunk.isal_bytes);
-
-        // CRC across both pieces in one pass — phase 1's structural
-        // win (bootstrap markers ≤32 KB per chunk; ISA-L bytes are the
-        // bulk) means this CRC pass is the only one that walks all
-        // chunk output bytes.
-        crc.update(&assembled[chunk_start..]);
+        total_crc.combine(&chunk.isal_crc);
 
         // Update window from the last 32 KB now sitting in `assembled`.
         let tail_start = assembled.len().saturating_sub(WINDOW_SIZE);
@@ -959,7 +1090,7 @@ fn phase2_resolve_sequential(chunks: Vec<ChunkResult>) -> Result<(Vec<u8>, u32),
         window.extend_from_slice(&assembled[tail_start..]);
     }
 
-    Ok((assembled, crc.finalize()))
+    Ok((assembled, total_crc.finalize()))
 }
 
 /// Append `chunk_u16` to `out` as bytes (low 8 bits of each u16), failing
