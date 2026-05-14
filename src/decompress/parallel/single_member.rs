@@ -342,7 +342,11 @@ pub fn decompress_parallel<W: Write>(
     // real boundary; chunk N's decode lands at a real boundary; chunk
     // N+1's corrected start is therefore a real boundary; …).
     let t_retry = std::time::Instant::now();
-    let retry_deadline = t_retry + std::time::Duration::from_millis(RETRY_WALL_DEADLINE_MS);
+    // Scale deadline with compressed size so multi-GB files on slow hardware
+    // still get enough time for legitimate corrections. Floor = RETRY_WALL_DEADLINE_MS.
+    let data_mb = deflate_data.len() / (1024 * 1024);
+    let deadline_ms = RETRY_WALL_DEADLINE_MS.max(data_mb as u64 * 3);
+    let retry_deadline = t_retry + std::time::Duration::from_millis(deadline_ms);
     phase1c_resolve_consistency(
         deflate_data,
         &mut start_bits,
@@ -951,9 +955,15 @@ fn phase1c_resolve_consistency(
     // Consecutive failures (chunks i, i+1, i+2 all None) are still O(N)
     // serial waves because each depends on its predecessor — unavoidable.
     //
+    // `scan_start` tracks the lowest index that could still need correction.
+    // Once chunk i is stable (confirmed Some with correct start_bit), the scan
+    // never needs to revisit it. Without this cursor a pathological all-None
+    // phase-1a run would do O(N) scan work per wave for O(N) waves = O(N²).
+    //
     // Preconditions per wave:
     //   - chunks[i] is Some ⟹ its start_bit is a real block boundary (G1)
     //   - deadline enforces that adversarial inputs don't spin forever
+    let mut scan_start: usize = 0;
     loop {
         // ── Read-only scan: classify corrections this wave ──────────────────
         // Two categories:
@@ -961,8 +971,9 @@ fn phase1c_resolve_consistency(
         //   specs:          need a real re-decode; will run in parallel.
         let mut near_eof_fills: Vec<(usize, usize)> = Vec::new();
         let mut specs: Vec<(usize, usize, Option<usize>)> = Vec::new();
+        let mut new_scan_start = scan_start;
 
-        for i in 0..num_chunks - 1 {
+        for i in scan_start..num_chunks - 1 {
             let pred_end = match &chunks[i] {
                 Some(c) => c.end_bit_offset,
                 // Predecessor not yet resolved — its correction will appear in
@@ -975,6 +986,9 @@ fn phase1c_resolve_consistency(
             //   - start_bits[i+1] is None/wrong (phase 1a false-positive or miss).
             let needs = chunks[i + 1].is_none() || (start_bits[i + 1] != Some(pred_end));
             if !needs {
+                if new_scan_start == i {
+                    new_scan_start = i + 1;
+                }
                 continue;
             }
 
@@ -991,6 +1005,8 @@ fn phase1c_resolve_consistency(
                 specs.push((i + 1, pred_end, end_limit));
             }
         }
+
+        scan_start = new_scan_start;
 
         if near_eof_fills.is_empty() && specs.is_empty() {
             break; // all chunks resolved

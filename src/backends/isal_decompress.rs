@@ -475,7 +475,7 @@ pub fn decompress_deflate_from_bit_with_end(
     // Do not raise above u32::MAX without fixing the avail_out cast.
     const MAX_CAP: usize = 3 * 1024 * 1024 * 1024;
     let mut cap = max_output.min(MAX_CAP);
-    let mut output = Vec::with_capacity(cap);
+    let mut output: Vec<u8> = Vec::with_capacity(cap);
     #[allow(clippy::uninit_vec)]
     unsafe {
         output.set_len(cap)
@@ -516,11 +516,12 @@ pub fn decompress_deflate_from_bit_with_end(
         }
         out_pos += written;
 
-        if ret != 0 {
-            if out_pos == 0 {
-                return None;
-            }
-            break;
+        match ret {
+            0 => {}        // ISAL_DECOMP_OK: continue, check block_state below
+            1 => break,    // ISAL_END_INPUT: consumed all input, state valid
+            2 => continue, // ISAL_OUT_OVERFLOW: buffer full, grow on next iteration
+            _ => return None, // ISAL_INVALID_BLOCK (-1) or unknown: decode error;
+                            // end_bit unreliable — return None so caller falls back
         }
 
         if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
