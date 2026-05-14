@@ -1,5 +1,5 @@
 Package: gzippy
-Version: 0.7.0-1
+Version: 0.7.1-1
 Architecture: amd64
 Maintainer: Jack Danger <github@jackdanger.com>
 Installed-Size: 1175
@@ -7,11 +7,11 @@ Depends: libc6 (>= 2.34), libgcc-s1 (>= 4.2)
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy_0.7.0-1_amd64.deb
-Size: 513696
-SHA256: 20381f7da46b29bec6689bceaa8b5838f6e73119cf2bcd409718e343462b7b5c
-SHA1: 96fb5fe68f916fa62a83a814a4489abd96c390ce
-MD5sum: ebc30f5037f8225e2e8c588df5e8b853
+Filename: pool/main/g/gzippy/gzippy_0.7.1-1_amd64.deb
+Size: 513562
+SHA256: 0757e937c8e5f8963ed0d3e9ef522e39e4126ed1ed09353f5cc3807c51e56170
+SHA1: 7012ecb46d06aeadb31069d12a3eae7fcb677f2f
+MD5sum: 0b1d97dc31b074150bb6622cf3155990
 Description: The fastest parallel gzip
  Gzippy is a high-performance parallel gzip implementation written in Rust.
  It beats gzip and pigz by leveraging multiple CPU cores, SIMD instructions,
@@ -27,19 +27,19 @@ Description: The fastest parallel gzip
 
 Package: gzippy-replace-gzip
 Source: gzippy
-Version: 0.7.0-1
+Version: 0.7.1-1
 Architecture: all
 Maintainer: Jack Danger <github@jackdanger.com>
 Installed-Size: 9
-Depends: gzippy (>= 0.7.0-1)
+Depends: gzippy (>= 0.7.1-1)
 Homepage: https://github.com/jackdanger/gzippy
 Priority: optional
 Section: utils
-Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.7.0-1_all.deb
+Filename: pool/main/g/gzippy/gzippy-replace-gzip_0.7.1-1_all.deb
 Size: 2128
-SHA256: 851abd35b6e7624b4568de31de4adfcc98598850631161023dce5418dabfc3c3
-SHA1: 525eeb478e485fbb3ef6452d1bb591dc2174ddb3
-MD5sum: f3262cdf4f010d923a5a64328733985a
+SHA256: 93d92d1be0db435205abbdeb45cd308a9aeb09138f9aad696450790d2fd11f2c
+SHA1: 42b23ee15704c317c02d9c8b68874dcac2a5fcb9
+MD5sum: 8f546e3be1f3f3536dca74ee2c575e66
 Description: Transitional package — gzippy now replaces gzip automatically
  This is a no-op transitional package. As of gzippy 0.1.6, installing the
  gzippy package automatically diverts /usr/bin/gzip, /usr/bin/gunzip, and
