@@ -238,30 +238,43 @@ pub(crate) fn decompress_single_member<W: Write>(
                 // - `TooSmall` is an intended routing signal: the input is
                 //   below the parallel threshold; fall through to sequential
                 //   without complaint.
-                // - Everything else means the parallel pipeline tried and
-                //   failed: increment a counter so the bench harness can
-                //   surface "marker pipeline silently fell back" as a
-                //   distinct failure from "marker pipeline ran but was
-                //   slow" (D1). In debug builds, panic with the specific
-                //   error so failures don't get lost during development.
+                // - `CrcMismatch` / `SizeMismatch`: streaming write has
+                //   already sent bytes to the writer — falling back to
+                //   libdeflate would produce double or corrupted output.
+                //   Propagate as an I/O error immediately.
+                // - `DecodeFailed` / other: no bytes written (fails before
+                //   phase 2 write loop); safe to fall back to sequential.
                 use crate::decompress::parallel::single_member::ParallelError;
-                if !matches!(e, ParallelError::TooSmall) {
-                    crate::decompress::parallel::single_member::MARKER_PIPELINE_BOUNDARY_MISSED
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!(
-                        "[gzippy] parallel single-member fell back to sequential: {:?}",
-                        e
-                    );
-                    debug_assert!(
-                        false,
-                        "marker pipeline returned non-routing error {e:?}; routing fell back \
-                         to libdeflate. This indicates either a boundary-search failure \
-                         (e.g. BTYPE=01-heavy region; see premortem F7) or a real decode \
-                         bug. In release builds this falls back silently; in debug builds \
-                         it panics so the cause doesn't get lost."
-                    );
-                } else if crate::utils::debug_enabled() {
-                    eprintln!("[gzippy] parallel single-member declined (input below threshold)");
+                match e {
+                    ParallelError::TooSmall => {
+                        if crate::utils::debug_enabled() {
+                            eprintln!(
+                                "[gzippy] parallel single-member declined (input below threshold)"
+                            );
+                        }
+                    }
+                    ParallelError::CrcMismatch | ParallelError::SizeMismatch => {
+                        return Err(GzippyError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("gzip verification failed: {e}"),
+                        )));
+                    }
+                    _ => {
+                        crate::decompress::parallel::single_member::MARKER_PIPELINE_BOUNDARY_MISSED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!(
+                            "[gzippy] parallel single-member fell back to sequential: {:?}",
+                            e
+                        );
+                        debug_assert!(
+                            false,
+                            "marker pipeline returned non-routing error {e:?}; routing fell back \
+                             to libdeflate. This indicates either a boundary-search failure \
+                             (e.g. BTYPE=01-heavy region; see premortem F7) or a real decode \
+                             bug. In release builds this falls back silently; in debug builds \
+                             it panics so the cause doesn't get lost."
+                        );
+                    }
                 }
             }
         }

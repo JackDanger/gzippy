@@ -212,10 +212,14 @@ fn debug_enabled() -> bool {
 /// pipeline.
 ///
 /// Returns `Err(ParallelError::TooSmall)` if the input is below the parallel
-/// threshold — the caller should fall back to sequential decode. Other
-/// errors indicate a genuine boundary-search failure, decode failure, or
-/// CRC/size mismatch; the writer is **not** written to in those cases (the
-/// pipeline buffers internally until verification passes).
+/// threshold — the caller should fall back to sequential decode. Other errors
+/// indicate a boundary-search failure, decode failure, or CRC/size mismatch.
+///
+/// Streaming write trade-off: each chunk is written to the writer as its
+/// markers are resolved (overlapping I/O with computation). CRC+ISIZE
+/// verification happens after all chunks are written. On mismatch the caller
+/// receives `Err` but the writer may already contain partial bytes — same
+/// design as rapidgzip. `TooSmall` and `DecodeFailed` never write bytes.
 pub fn decompress_parallel<W: Write>(
     gzip_data: &[u8],
     writer: &mut W,
@@ -360,22 +364,27 @@ pub fn decompress_parallel<W: Write>(
         .map(|c| c.expect("phase 1c guarantees all chunks decoded"))
         .collect();
 
-    // ── Phase 2: sequential resolve markers + combine CRCs ───────────────────
+    // ── Phase 2 + streaming write: resolve markers → write → combine CRCs ───
     //
-    // The earlier design built a 503 MB `assembled: Vec<u8>` here via
-    // `extend_from_slice` from each chunk's bytes — that was a 50 ms
-    // memcpy on Silesia at T=4 that contributed to the 0.965× wall
-    // ratio vs rapidgzip after variance was already under control.
-    // The new shape: resolve bootstrap markers per chunk, narrow to
-    // per-chunk u8, combine pre-computed ISA-L CRCs. Phase 3 writes
-    // each chunk to the writer directly — no large `assembled` Vec.
+    // Each chunk is written to the writer immediately after its markers
+    // are resolved, overlapping I/O with resolution of subsequent chunks.
+    // This matches rapidgzip's per-chunk streaming design and eliminates
+    // the ~69 ms write serialization gap on Silesia-class inputs (503 MB
+    // written after 478 ms of compute in the deferred design).
+    //
+    // Trade-off: CRC+ISIZE verification now happens AFTER bytes are
+    // written. A mismatch means partial output is in the writer — the
+    // routing-layer fallback cannot cleanly retry via libdeflate. This
+    // is acceptable because: (a) gzip CRC mismatches indicate hardware
+    // errors or corrupt files rather than speculation failures, and
+    // (b) the routing layer already flags the error to the caller.
     let t_resolve = std::time::Instant::now();
-    let (resolved_chunks, total_crc, total_size) = phase2_resolve_and_combine_crcs(chunks)?;
+    let (total_crc, total_size) = phase2_resolve_write_combine(chunks, writer)?;
     let resolve_elapsed = t_resolve.elapsed();
 
     if debug_enabled() {
         eprintln!(
-            "[parallel_sm:v0.6] search={:.1}ms decode={:.1}ms retry={:.1}ms resolve={:.1}ms",
+            "[parallel_sm:v0.6] search={:.1}ms decode={:.1}ms retry={:.1}ms resolve+write={:.1}ms",
             search_elapsed.as_secs_f64() * 1000.0,
             decode_elapsed.as_secs_f64() * 1000.0,
             retry_elapsed.as_secs_f64() * 1000.0,
@@ -383,21 +392,13 @@ pub fn decompress_parallel<W: Write>(
         );
     }
 
-    // ── Phase 3: verify trailer, write ──────────────────────────────────────
+    // ── Phase 3: verify trailer ──────────────────────────────────────────────
     //
     // Both ISIZE and CRC32 in the gzip trailer can legitimately be zero
     // (ISIZE=0 for an empty input; CRC32=0 happens for specific byte
-    // sequences — the CRC of the empty stream is itself 0). Earlier
-    // versions guarded these with `!= 0` sentinels and silently accepted
-    // corrupted output for those streams. Verification is now
-    // unconditional: the trailer is always present (we slice it off
-    // `gzip_data` at the function entry), so both checks must always
-    // fire. (Premortem mitigation B5; Copilot review on PR #94.)
-    //
-    // CRC and size are verified BEFORE any byte is written to the
-    // writer. A failed verification returns Err with the writer
-    // untouched, so the routing-layer fallback can produce correct
-    // output via libdeflate without the caller seeing partial junk.
+    // sequences — the CRC of the empty stream is itself 0). Verification
+    // is unconditional: the trailer is always present (sliced off at
+    // function entry). (Premortem mitigation B5; Copilot review on PR #94.)
     if total_size != expected_size {
         if debug_enabled() {
             eprintln!(
@@ -417,15 +418,6 @@ pub fn decompress_parallel<W: Write>(
         return Err(ParallelError::CrcMismatch);
     }
 
-    // Verification passed — write each chunk to the writer in order.
-    // Eliminates the 503 MB `assembled` Vec that the earlier design
-    // built via `extend_from_slice`. BufWriter (the wrapping writer
-    // in the CLI path) chunks the syscall granularity at 1 MiB so
-    // per-chunk writes aren't fragmented into tiny syscalls.
-    for chunk in &resolved_chunks {
-        writer.write_all(&chunk.bootstrap_u8)?;
-        writer.write_all(&chunk.isal_bytes)?;
-    }
     MARKER_PIPELINE_RUNS.fetch_add(1, Ordering::Relaxed);
 
     if debug_enabled() {
@@ -1111,31 +1103,21 @@ fn phase1c_resolve_consistency(
     Ok(())
 }
 
-// ── Phase 2: sequential marker resolve + CRC + size ──────────────────────────
+// ── Phase 2 + streaming write: resolve markers, write, combine CRCs ──────────
 
-/// Per-chunk output after marker resolution: bootstrap u8 + ISA-L bytes.
-pub(crate) struct ResolvedChunk {
-    pub(crate) bootstrap_u8: Vec<u8>,
-    pub(crate) isal_bytes: Vec<u8>,
-}
-
-impl ResolvedChunk {
-    pub(crate) fn len(&self) -> usize {
-        self.bootstrap_u8.len() + self.isal_bytes.len()
-    }
-}
-
-/// Phase 2: resolve bootstrap markers per chunk, narrow u16 → u8,
-/// combine pre-computed ISA-L CRCs. Returns the per-chunk u8 streams
-/// (NOT a flattened Vec — phase 3 writes them to the writer directly,
-/// avoiding the 503 MB memcpy on Silesia-class inputs).
-fn phase2_resolve_and_combine_crcs(
+/// Phase 2 + streaming write: resolve bootstrap markers per chunk, write
+/// immediately to `writer`, combine pre-computed ISA-L CRCs. Returns
+/// `(combined_crc32, total_uncompressed_bytes)` after all chunks are
+/// written. CRC+ISIZE verification happens in the caller after this
+/// returns — partial bytes may already be written on mismatch (same
+/// trade-off as rapidgzip's per-chunk streaming design).
+fn phase2_resolve_write_combine<W: Write>(
     chunks: Vec<ChunkResult>,
-) -> Result<(Vec<ResolvedChunk>, u32, usize), ParallelError> {
+    writer: &mut W,
+) -> Result<(u32, usize), ParallelError> {
     let mut total_crc = crc32fast::Hasher::new();
     let mut window: Vec<u8> = Vec::with_capacity(WINDOW_SIZE);
     let mut total_size = 0usize;
-    let mut resolved: Vec<ResolvedChunk> = Vec::with_capacity(chunks.len());
 
     for (i, mut chunk) in chunks.into_iter().enumerate() {
         // Bootstrap u16 prefix: may contain cross-chunk markers (only
@@ -1173,13 +1155,17 @@ fn phase2_resolve_and_combine_crcs(
         update_window_from_chunk(&mut window, &bootstrap_u8, &chunk.isal_bytes);
 
         total_size += bootstrap_u8.len() + chunk.isal_bytes.len();
-        resolved.push(ResolvedChunk {
-            bootstrap_u8,
-            isal_bytes: chunk.isal_bytes,
-        });
+
+        // Stream each chunk's bytes to the writer immediately — the OS
+        // write path (via BufWriter) can proceed while the next chunk's
+        // markers are being resolved, overlapping I/O with computation.
+        writer.write_all(&bootstrap_u8).map_err(ParallelError::Io)?;
+        writer
+            .write_all(&chunk.isal_bytes)
+            .map_err(ParallelError::Io)?;
     }
 
-    Ok((resolved, total_crc.finalize(), total_size))
+    Ok((total_crc.finalize(), total_size))
 }
 
 /// Maintain a rolling 32 KB window of "last decoded bytes" for the
@@ -1567,8 +1553,9 @@ mod tests {
             Ok(_) => panic!("CRC corruption not detected"),
             Err(e) => panic!("unexpected error: {e}"),
         }
-        // Writer must not have received any bytes on any error path.
-        assert!(output.is_empty());
+        // Streaming design: bytes may be in the writer before CRC verification.
+        // The critical invariant is that Err IS returned — caller must not treat
+        // corrupted output as Ok.
     }
 
     /// Premortem mitigation B5: trailer fields can legitimately be zero.
@@ -1578,6 +1565,10 @@ mod tests {
     /// stream's CRC field to zero and asserts the decoder rejects it (the
     /// true CRC of any non-trivial 10+ MiB stream is overwhelmingly
     /// non-zero, so trailer-CRC=0 means "trailer lies").
+    ///
+    /// Note: the streaming write design writes per-chunk bytes before final
+    /// CRC verification (same trade-off as rapidgzip). The error is still
+    /// returned unconditionally — corruption is never silently accepted.
     #[test]
     fn crc_zero_trailer_is_verified() {
         let data = make_random_data(10 * 1024 * 1024, 0xfacefeed);
@@ -1596,16 +1587,15 @@ mod tests {
             ),
             Err(e) => panic!("unexpected error: {e}"),
         }
-        assert!(
-            output.is_empty(),
-            "no bytes written on verification failure"
-        );
     }
 
     /// Same as above for ISIZE. A 10 MiB input has expected_size = 10 MiB
     /// mod 2^32, which is non-zero; setting the trailer ISIZE field to 0
     /// must be detected even though `expected_size == 0` was the previous
     /// "skip the check" sentinel.
+    ///
+    /// Note: streaming write design — partial bytes may be in the writer,
+    /// but the error is always returned. See crc_zero_trailer_is_verified.
     #[test]
     fn isize_zero_trailer_is_verified() {
         let data = make_random_data(10 * 1024 * 1024, 0xfeedbeef);
@@ -1624,10 +1614,6 @@ mod tests {
             ),
             Err(e) => panic!("unexpected error: {e}"),
         }
-        assert!(
-            output.is_empty(),
-            "no bytes written on verification failure"
-        );
     }
 
     // ── Phase 1c parallel correction ─────────────────────────────────────────
@@ -1731,11 +1717,13 @@ mod tests {
 
         let after = MARKER_PIPELINE_RETRY_ITERATIONS.load(Ordering::Relaxed);
 
-        // Both corrections must have fired in one parallel wave.
-        assert_eq!(
-            after - before,
-            2,
-            "expected exactly 2 retry increments (one parallel wave); got {}",
+        // Both corrections must have fired (at least 2 increments: one per
+        // corrected chunk). The upper bound is intentionally loose — concurrent
+        // tests that call decompress_parallel also increment the shared global
+        // counter, so `after - before` may exceed 2 without indicating a bug.
+        assert!(
+            after - before >= 2,
+            "expected at least 2 retry increments (one per corrected chunk); got {}",
             after - before
         );
 
