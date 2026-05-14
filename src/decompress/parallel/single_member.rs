@@ -402,7 +402,19 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
         return None;
     }
 
-    // Tier 1: BlockFinder.
+    // Tier 1: BlockFinder over the search radius. Find a validated
+    // BTYPE=00 / BTYPE=10 boundary candidate; return at the first.
+    //
+    // The earlier "Tier 2: byte-aligned brute force" was removed
+    // (PR #97, commit after Silesia Tmax bench analysis): when
+    // BlockFinder failed, tier 2 iterated 16384 byte-aligned
+    // candidates inside 128 KiB, each calling `try_decode_at`'s
+    // ISA-L 32 KB validation (256 KB allocation per call). On
+    // Silesia at T=4, the chunk-3 search hit tier 2 and burned
+    // ~500 ms of phase 1a wall time before returning None — for a
+    // chunk that phase 1c was going to chain-decode anyway from
+    // chunk 2's end_bit. Returning None earlier means the same
+    // end-state, ~500 ms faster.
     let finder = BlockFinder::new(deflate_data);
     let sub_chunk_bits = 8 * 1024 * 8;
     let mut chunk_start = from_bit;
@@ -420,12 +432,7 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
         }
         chunk_start = chunk_end;
     }
-
-    // Tier 2: byte-aligned brute force in the first 128 KiB.
-    let brute_end = (from_bit + 128 * 1024 * 8).min(search_end);
-    (from_bit..brute_end)
-        .step_by(8)
-        .find(|&bit| try_decode_at(deflate_data, bit))
+    None
 }
 
 /// Validate a candidate boundary in two stages — see premortem mitigation

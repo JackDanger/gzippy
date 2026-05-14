@@ -332,8 +332,14 @@ pub fn decompress_deflate_from_bit(
         }
     }
 
+    // MIN cap of 32 KB: the principal caller is `try_decode_at` in
+    // the parallel boundary search, which validates with min_output
+    // = 32 KB. The earlier 256 KB MIN over-allocated by 8× per call;
+    // with the boundary search making ~100-1000 calls per chunk,
+    // the over-allocation showed up as a measurable phase 1a wall
+    // overhead on the Silesia Tmax bench.
     const MAX_CAP: usize = 512 * 1024 * 1024;
-    let cap = max_output.clamp(256 * 1024, MAX_CAP);
+    let cap = max_output.clamp(32 * 1024, MAX_CAP);
     let mut output = vec![0u8; cap];
     let mut out_pos = 0usize;
 
