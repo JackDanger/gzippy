@@ -612,7 +612,13 @@ jobs:
             --threads $THREADS \
             --output results/single-member-t${{ matrix.threads }}.json
 
+      # `if: always()` so a failing bench still uploads the JSON with
+      # routing_trace.stderr_head and per-phase timings — otherwise the
+      # only signal is the bench's stdout summary, which doesn't include
+      # the GZIPPY_DEBUG output needed to diagnose perf shortfalls
+      # (silent fallback vs slow marker pipeline vs chain-decode).
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
           name: single-member-results-x86_64-t${{ matrix.threads }}
           path: results/

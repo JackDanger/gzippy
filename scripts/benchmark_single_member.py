@@ -131,6 +131,13 @@ def benchmark_decompress(
     if tool == "gzippy" and threads > 1 and routing_trace is not None:
         if routing_trace["fell_back_to_sequential"] or not routing_trace["ran_marker_pipeline"]:
             print(" [SILENT FALLBACK: marker pipeline did not run end-to-end]", end="")
+        # Always print the GZIPPY_DEBUG stderr after the bench line on
+        # parallel runs — so a perf shortfall surfaces per-phase timing
+        # (search/decode/retry/resolve/total) without needing to
+        # download the JSON artifact.
+        head = routing_trace.get("stderr_head", "").strip()
+        if head:
+            print(f"\n      [GZIPPY_DEBUG]\n        " + head.replace("\n", "\n        "))
     
     # Benchmark
     times = []
