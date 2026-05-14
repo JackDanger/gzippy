@@ -505,11 +505,23 @@ pub fn decompress_deflate_from_bit_with_end(
     let mut output: Vec<u8> = Vec::with_capacity(initial_cap);
     // SAFETY: `initial_cap` was passed to with_capacity, so the
     // allocation is exactly that many bytes. We make `len() ==
-    // capacity()` to let ISA-L write into the full buffer. Bytes at
-    // indices ≥ out_pos remain uninitialized after this function
-    // returns — they are not read by anyone (truncate at the end and
-    // Vec<u8>::truncate is a no-op on dropped bytes since u8 has no
-    // Drop impl).
+    // capacity()` to let ISA-L write into the full buffer via raw
+    // pointer FFI. Bytes at indices ≥ out_pos remain uninitialized
+    // after this function returns — they are not read by anyone
+    // (`output.truncate(out_pos)` at the end shrinks `len` and
+    // Vec<u8>::truncate is a no-op on the dropped tail since u8
+    // has no Drop impl; the uninit memory is just freed with the
+    // allocation when `output` is dropped).
+    //
+    // Clippy's `uninit_vec` lint fires on this pattern but it's
+    // unsoundness-by-default for `Vec<T>` where T has a Drop
+    // impl or where any code could read past `len`. Neither
+    // condition applies here: u8 has no Drop, and the only
+    // reader is ISA-L's FFI which writes via `state.next_out`
+    // pointer-and-count, not via any Vec accessor. The lint is
+    // load-bearing as a safety net for naive callers but
+    // counterproductive for the FFI buffer pattern.
+    #[allow(clippy::uninit_vec)]
     unsafe {
         output.set_len(initial_cap);
     }
@@ -525,12 +537,13 @@ pub fn decompress_deflate_from_bit_with_end(
             }
             let new_len = output.len().saturating_mul(2).min(MAX_CAP);
             output.reserve_exact(new_len - output.len());
-            // SAFETY: same rationale as above. Reserve_exact ensures
-            // capacity ≥ new_len; set_len makes the new bytes
-            // claimable by ISA-L. The previously-written portion
-            // (0..out_pos) is preserved by Vec's growth logic
+            // SAFETY: same rationale as the initial allocation above.
+            // Reserve_exact ensures capacity ≥ new_len; set_len makes
+            // the new bytes claimable by ISA-L. The previously-written
+            // portion (0..out_pos) is preserved by Vec's growth logic
             // (allocator may realloc-copy or grow-in-place — either
             // way, our initialized bytes survive).
+            #[allow(clippy::uninit_vec)]
             unsafe {
                 output.set_len(new_len);
             }
