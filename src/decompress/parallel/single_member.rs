@@ -304,14 +304,44 @@ pub fn decompress_parallel<W: Write>(
     // chunk N+1's confirmed start. Chunks with `None` start get a `None`
     // decode result that phase 1c will fill in via chain-decode.
     let t_decode = std::time::Instant::now();
-    // end_limit[i] = start_bits[i+1] if both are Some; otherwise None and
-    // phase 1c applies the correction once chunk i decodes.
+    // end_limit[i] = start_bits[i+1] when found; otherwise use chunk
+    // (i+1)'s spacing anchor as a SOFT hint so chunk i doesn't decode
+    // all the way to BFINAL when its neighbor's boundary search failed.
+    //
+    // Without this fallback, a missing boundary at chunk N+1 forced
+    // chunk N to decode ALL remaining bytes (e.g., on Silesia at T=4
+    // with chunk 3's start = None, chunk 2 decoded chunks 2 + 3's
+    // content = ~240 MB while chunks 0, 1 did ~120 MB each — a 2×
+    // load imbalance that bottlenecked wall time on the over-decoding
+    // worker). The CI Tmax bench showed decode=426 ms despite ISA-L
+    // being able to do ~600 MB/s/core on this hardware — the imbalance
+    // was the dominant factor.
+    //
+    // The soft hint is byte-aligned to the spacing anchor. ISA-L runs
+    // until input bytes are exhausted at that point; its stateful
+    // `read_header_stateful` rolls back `read_in_length` on a partial
+    // header at end-of-input (see CRITICAL invariant in
+    // `decompress_deflate_from_bit_with_end`), so the reported
+    // `end_bit` lands on the LAST COMPLETED block boundary at or
+    // before the hint. Phase 1c picks up the next chunk from that
+    // real boundary.
+    //
+    // The hint can land mid-block; ISA-L stops cleanly at the previous
+    // real boundary. No correctness risk — the only behavioural change
+    // is balancing the per-worker workload.
     let end_limits: Vec<Option<usize>> = (0..num_chunks)
         .map(|i| {
-            if i + 1 < num_chunks {
-                start_bits[i + 1]
-            } else {
+            if i + 1 == num_chunks {
+                // Last chunk: decode to BFINAL.
                 None
+            } else if let Some(s) = start_bits[i + 1] {
+                // Neighbour found a boundary: use it as the hard limit.
+                Some(s)
+            } else {
+                // Neighbour's search failed: use spacing anchor as a
+                // soft hint. ISA-L stops at the last block boundary
+                // ≤ this position.
+                Some((i + 1) * spacing_bits)
             }
         })
         .collect();
