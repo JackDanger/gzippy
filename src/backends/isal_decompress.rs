@@ -482,27 +482,58 @@ pub fn decompress_deflate_from_bit_with_end(
     // theoretical max gzip ISIZE (it's a 32-bit field); we cap a
     // bit below at 3 GiB to keep `cap as u32` for ISA-L's
     // avail_out parameter unambiguously valid.
+    // Initial allocation = max_output (~2× the chunk's average
+    // decoded size). For typical chunks this is enough on the first
+    // pass and ISA-L never sees `avail_out == 0`. For outlier chunks
+    // (high compression ratio variance, e.g., Silesia chunks ranging
+    // 80-300 MB at T=4), the grow-on-demand path below doubles the
+    // buffer up to MAX_CAP. The realloc-copy cost only fires for
+    // chunks that genuinely need it; the common case stays one
+    // allocation.
+    //
+    // The earlier-iteration "allocate ISIZE upfront" approach
+    // caused 4 × 500 MB = 2 GiB virtual on Silesia at T=4, and
+    // every 4 KiB page minor-faulted on first ISA-L write — those
+    // faults serialize through `mmap_lock` on Linux, which is fine
+    // on a quiet runner but blows up the timing variance on a
+    // noisy CI runner (CV 14.94% vs rapidgzip's 1.72% on the same
+    // Silesia bench). Opus advisor flagged this as the dominant
+    // variance source for the run that dropped from 0.998× to
+    // 0.91× rapidgzip.
     const MAX_CAP: usize = 3 * 1024 * 1024 * 1024;
-    let cap = max_output.clamp(256 * 1024, MAX_CAP);
-    let mut output: Vec<u8> = Vec::with_capacity(cap);
-    // SAFETY: `cap` was passed to with_capacity, so the allocation
-    // is exactly `cap` bytes. We make `len() == cap` to let ISA-L
-    // write into the full buffer. Bytes at indices ≥ out_pos
-    // remain uninitialized after this function returns — and they
-    // are not read by anyone, because we `truncate(out_pos)` at
-    // the end and Vec<u8>::truncate is a no-op on the dropped
-    // bytes (u8 has no Drop impl).
+    let initial_cap = max_output.clamp(256 * 1024, MAX_CAP);
+    let mut output: Vec<u8> = Vec::with_capacity(initial_cap);
+    // SAFETY: `initial_cap` was passed to with_capacity, so the
+    // allocation is exactly that many bytes. We make `len() ==
+    // capacity()` to let ISA-L write into the full buffer. Bytes at
+    // indices ≥ out_pos remain uninitialized after this function
+    // returns — they are not read by anyone (truncate at the end and
+    // Vec<u8>::truncate is a no-op on dropped bytes since u8 has no
+    // Drop impl).
     unsafe {
-        output.set_len(cap);
+        output.set_len(initial_cap);
     }
     let mut out_pos = 0usize;
 
     loop {
         if out_pos == output.len() {
-            // True cap reached — bail rather than re-allocate. This
-            // means the caller's cap was wrong; surface it as a
-            // decode failure rather than a silent truncate.
-            return None;
+            // ISA-L filled the buffer but isn't done. Grow if we can.
+            if output.len() >= MAX_CAP {
+                // True cap reached — bail rather than allocate more.
+                // Surface as decode failure; routing falls back.
+                return None;
+            }
+            let new_len = output.len().saturating_mul(2).min(MAX_CAP);
+            output.reserve_exact(new_len - output.len());
+            // SAFETY: same rationale as above. Reserve_exact ensures
+            // capacity ≥ new_len; set_len makes the new bytes
+            // claimable by ISA-L. The previously-written portion
+            // (0..out_pos) is preserved by Vec's growth logic
+            // (allocator may realloc-copy or grow-in-place — either
+            // way, our initialized bytes survive).
+            unsafe {
+                output.set_len(new_len);
+            }
         }
 
         let remaining = output.len() - out_pos;

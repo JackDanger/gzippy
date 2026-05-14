@@ -762,21 +762,36 @@ fn decode_chunk_with_handoff(
         };
         let input = &deflate_data[..end_byte];
 
-        // Output cap: the whole-stream ISIZE (`per_chunk_output_hint *
-        // num_chunks` recovered from the routing path). A chunk can
-        // legitimately decode anywhere from 0 bytes (BTYPE=00 stored)
-        // up to the entire stream's remaining ISIZE — for Silesia at
-        // T=4, individual chunks decoded ~120 MB on average but some
-        // ranges compress 5-10× more than others. The earlier
-        // `hint * 3 / 2` cap silently truncated those chunks, the
-        // wrapper returned a mid-block end_bit, and phase 1c could
-        // not correct because the marker decoder can't bootstrap
-        // mid-block. CI saw it as a silent fallback to libdeflate
-        // at 0.55× rapidgzip. The new grow-on-demand wrapper
-        // (`backends::isal_decompress`) makes this cap a true upper
-        // bound, not the initial allocation — passing ISIZE doesn't
-        // cost 481 MB of preallocation per worker.
-        let max_output = per_chunk_output_hint.saturating_mul(num_chunks_total);
+        // Output cap: `per_chunk_output_hint * 2` — tight enough that
+        // typical per-worker physical RAM is ~2× the chunk's average
+        // decoded size, but loose enough to absorb the 5-10× ratio
+        // skew Silesia exhibits across chunks.
+        //
+        // Earlier sizing iterations on this PR taught the trade-off:
+        //
+        //   - `hint * 3/2` (~120-180 MB): silently truncated chunks
+        //     with above-average compression ratios; phase 1c could
+        //     not correct mid-block end_bits and CI saw silent
+        //     libdeflate fallback at 0.55× rapidgzip.
+        //
+        //   - `hint * num_chunks_total` (~ISIZE = ~500 MB): no
+        //     truncation, but 4 workers × 500 MB virtual = 2 GiB of
+        //     committed VA. ISA-L's writes minor-fault every 4 KiB
+        //     page on first touch, serializing through `mmap_lock`.
+        //     On a quiet runner this is fast; on a noisy CI runner
+        //     it blows up the timing variance (CV gzippy 14.94%
+        //     vs rapidgzip 1.72% on the same Silesia bench — Opus
+        //     advisor identified this as the dominant variance
+        //     source). Median moved against gzippy as a result.
+        //
+        // The `* 2` cap caps page-fault cost at ~2× the actual
+        // chunk size while still tolerating 2× chunk-size variance.
+        // For chunks that overshoot (rare), the wrapper's
+        // grow-on-demand path takes over — see
+        // `decompress_deflate_from_bit_with_end` in
+        // `src/backends/isal_decompress.rs`.
+        let max_output = per_chunk_output_hint.saturating_mul(2);
+        let _ = num_chunks_total; // retained in signature for fallback path below
 
         match crate::backends::isal_decompress::decompress_deflate_from_bit_with_end(
             input,

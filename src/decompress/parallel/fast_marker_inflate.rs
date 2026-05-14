@@ -476,13 +476,30 @@ pub fn decode_chunk_bootstrap(
     let end_bit_offset = byte_offset * 8 + bits_consumed_from_slice;
 
     let clean_window = if handoff_at_boundary && output.len() >= WINDOW_SIZE {
-        // Last 32 KB are guaranteed marker-free by the bootstrap-stop
-        // check at the top of decode_loop. Cast u16 → u8 for ISA-L.
+        // Last 32 KB MUST be marker-free here per the bootstrap-stop
+        // check at the top of decode_loop. Use `assert!` rather than
+        // `debug_assert!` — if the invariant is ever broken in
+        // release (e.g., a future refactor flips `handoff_at_boundary`
+        // incorrectly), `v as u8` would silently truncate marker
+        // values to garbage that ISA-L then uses as a dict, producing
+        // wrong output bytes whose CRC mismatch then triggers a
+        // silent libdeflate fallback. Asserting catches the bug
+        // before ISA-L sees the corrupted dict. Cost: 32 K branch
+        // predictions per chunk's bootstrap exit, negligible
+        // (~10 µs at modern branch-predictor throughput).
+        //
+        // Opus advisor on PR #97 flagged the `debug_assert!` version
+        // as a release-mode silent-corruption surface.
         let start = output.len() - WINDOW_SIZE;
         let window: Vec<u8> = output[start..]
             .iter()
             .map(|&v| {
-                debug_assert!(v < MARKER_BASE, "bootstrap clean window contained marker");
+                assert!(
+                    v < MARKER_BASE,
+                    "bootstrap clean window contained marker at offset {}; \
+                     bootstrap-stop invariant violated",
+                    v - MARKER_BASE
+                );
                 v as u8
             })
             .collect();

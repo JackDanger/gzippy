@@ -650,6 +650,18 @@ mod tests {
              slice OR the bootstrap clean_window was malformed. delta: {delta:?}",
             delta.slow_path_used
         );
+        // Opus advisor flagged that the existing tests didn't assert
+        // on these counters even though "healthy data" implies zero
+        // retries and zero silent boundary-misses. Without these, a
+        // regression where phase 1c re-decodes every chunk (because
+        // ISA-L silently disagrees with BlockFinder on healthy data)
+        // would pass the handoff_fired check but ruin perf.
+        assert_eq!(
+            delta.retry_iterations, 0,
+            "phase 1c retry fired {} times on healthy data — phase 1a or \
+             ISA-L is producing inconsistent end_bits. delta: {delta:?}",
+            delta.retry_iterations
+        );
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
