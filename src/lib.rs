@@ -274,6 +274,24 @@ pub fn decompress_deflate64_to_writer<W: std::io::Write>(
     decompress::deflate64::decompress_deflate64_to_writer(data, writer)
 }
 
+/// Compress `data` as a raw Deflate64 bitstream, returning `Vec<u8>`.
+///
+/// Produces a valid Deflate64 (ZIP method 9 / Enhanced Deflate) raw stream.
+/// No gzip or ZIP container is added.
+pub fn compress_deflate64(data: &[u8]) -> GzippyResult<Vec<u8>> {
+    compress::deflate64::compress_deflate64(data)
+}
+
+/// Compress `data` as a raw Deflate64 bitstream, writing to `writer`.
+///
+/// Returns the number of compressed bytes written.
+pub fn compress_deflate64_to_writer<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> GzippyResult<u64> {
+    compress::deflate64::compress_deflate64_to_writer(data, writer)
+}
+
 // =============================================================================
 // Routing inspection
 // =============================================================================

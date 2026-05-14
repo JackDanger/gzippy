@@ -485,3 +485,119 @@ fn compress_raw_interops_with_flate2() {
     let decompressed = gzippy::decompress_raw(&flate2_compressed).unwrap();
     assert_eq!(decompressed, data);
 }
+
+// ── Deflate64 encoder ─────────────────────────────────────────────────────────
+
+#[test]
+fn compress_deflate64_empty_roundtrip() {
+    let compressed = gzippy::compress_deflate64(b"").unwrap();
+    let decompressed = gzippy::decompress_deflate64(&compressed).unwrap();
+    assert_eq!(decompressed, b"");
+}
+
+#[test]
+fn compress_deflate64_single_byte_roundtrip() {
+    let compressed = gzippy::compress_deflate64(b"x").unwrap();
+    let decompressed = gzippy::decompress_deflate64(&compressed).unwrap();
+    assert_eq!(decompressed, b"x");
+}
+
+#[test]
+fn compress_deflate64_short_text_roundtrip() {
+    let input = b"hello, deflate64 encoder world!";
+    let compressed = gzippy::compress_deflate64(input).unwrap();
+    let decompressed = gzippy::decompress_deflate64(&compressed).unwrap();
+    assert_eq!(decompressed.as_slice(), input.as_slice());
+}
+
+#[test]
+fn compress_deflate64_repeating_byte_roundtrip() {
+    let input = vec![b'a'; 100_000];
+    let compressed = gzippy::compress_deflate64(&input).unwrap();
+    assert!(
+        compressed.len() < input.len() / 100,
+        "highly compressible input should compress to < 1% of source; got {} from {}",
+        compressed.len(),
+        input.len()
+    );
+    let decompressed = gzippy::decompress_deflate64(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn compress_deflate64_incompressible_roundtrip() {
+    let mut x = 0xdeadbeef_u32;
+    let input: Vec<u8> = (0..70_000)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 24) as u8
+        })
+        .collect();
+    let compressed = gzippy::compress_deflate64(&input).unwrap();
+    assert!(
+        compressed.len() >= input.len(),
+        "incompressible input should not shrink; got {} from {}",
+        compressed.len(),
+        input.len()
+    );
+    let decompressed = gzippy::decompress_deflate64(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn compress_deflate64_long_match_uses_code_285() {
+    // Second half is a copy of the first, forcing a match of length 5000 > 258
+    // which requires Deflate64 length code 285.
+    let half = vec![b'a'; 5_000];
+    let input: Vec<u8> = half.iter().chain(half.iter()).copied().collect();
+    let compressed = gzippy::compress_deflate64(&input).unwrap();
+    assert!(
+        compressed.len() < input.len() / 4,
+        "long repeating match should compress well; got {} from {}",
+        compressed.len(),
+        input.len()
+    );
+    let decompressed = gzippy::decompress_deflate64(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn compress_deflate64_long_distance_uses_codes_30_31() {
+    // Match at distance 50_000 falls in dist code 30 territory (base 32769).
+    let mut x = 0xdeadbeef_u32;
+    let prefix: Vec<u8> = (0..50_000)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 24) as u8
+        })
+        .collect();
+    let suffix = prefix[..1_000].to_vec();
+    let input: Vec<u8> = prefix.iter().chain(suffix.iter()).copied().collect();
+    let compressed = gzippy::compress_deflate64(&input).unwrap();
+    let decompressed = gzippy::decompress_deflate64(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
+
+#[test]
+fn compress_deflate64_to_writer_returns_byte_count() {
+    let input = b"hello, deflate64 writer variant!";
+    let mut output = Vec::new();
+    let n = gzippy::compress_deflate64_to_writer(input, &mut output).unwrap();
+    assert_eq!(n, output.len() as u64);
+    let decompressed = gzippy::decompress_deflate64(&output).unwrap();
+    assert_eq!(decompressed.as_slice(), input.as_slice());
+}
+
+#[test]
+fn compress_deflate64_large_random_roundtrip() {
+    let mut x = 0xdeadbeef_u32;
+    let input: Vec<u8> = (0..200_000)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 24) as u8
+        })
+        .collect();
+    let compressed = gzippy::compress_deflate64(&input).unwrap();
+    let decompressed = gzippy::decompress_deflate64(&compressed).unwrap();
+    assert_eq!(decompressed, input);
+}
