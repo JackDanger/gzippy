@@ -12,7 +12,18 @@ keywords = ["gzip", "compression", "parallel", "pigz", "zlib"]
 categories = ["compression", "command-line-utilities"]
 authors = ["Jack Danger Canty"]
 build = "build.rs"
-exclude = ["vendor/**", "packaging/**", "scripts/**", "benchmarks/**"]
+include = [
+    "src/**/*",
+    "tests/**/*",
+    "examples/**/*",
+    "build.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "CLAUDE.md",
+    "rust-toolchain.toml",
+]
 
 [lib]
 name = "gzippy"
