@@ -1,22 +1,29 @@
 # =============================================================================
-# Release: build binaries + .deb packages, publish GitHub release, update formula,
-#          rebuild apt repository on GitHub Pages (jackdanger.github.io/gzippy)
+# Release: build binaries + .deb packages, publish everywhere.
 # =============================================================================
 # Triggered by:
-#   - A push to main that modifies the top-level VERSION file.
-#     VERSION is the source of truth — bumping it kicks off a release to every
-#     channel (GitHub release, apt repo, Homebrew formula, AUR).
-#   - Manual workflow_dispatch with an optional version override (defaults to
-#     VERSION file). Use this to re-run a failed release for the same version.
+#   - A push to main that modifies VERSION. VERSION is the source of truth.
+#   - workflow_dispatch with an optional version override (re-run the same
+#     version after a partial failure).
 #
-# Produces:
-#   - gzippy-{target}.tar.gz for 4 platforms
-#   - gzippy_{version}_{arch}.deb for amd64 + arm64
-#   - Updated Formula/gzippy.rb + Cargo.toml committed to main
-#   - apt repo at https://jackdanger.github.io/gzippy (gh-pages branch)
-#   - AUR packages gzippy-bin + gzippy-replace-gzip
+# Publishes to: GitHub release, Homebrew formula (this repo), apt repo
+# (gh-pages), AUR (gzippy-bin + gzippy-replace-gzip), crates.io.
 #
-# Required secret: APT_SIGNING_KEY — armored GPG private key (from 1Password)
+# Design: every step is idempotent. Re-running the workflow for a version
+# that's already part-way published converges to a clean state. The SHA256s
+# baked into the Homebrew formula and AUR PKGBUILDs always come from the
+# **published release** — never from freshly-rebuilt artifacts — so re-runs
+# can't drift them out of sync with what users actually download.
+#
+# Required secrets:
+#   APT_SIGNING_KEY        GPG armored private key for the apt repo
+#   AUR_SSH_KEY            SSH private key registered on aur.archlinux.org
+#   CARGO_REGISTRY_TOKEN   crates.io API token (publish-new + publish-update)
+#   MACOS_CERT_P12         Developer ID Application cert (base64-encoded)
+#   MACOS_CERT_PASSWORD    Password for the cert
+#   NOTARYTOOL_APPLE_ID    Apple ID for notarization
+#   NOTARYTOOL_PASSWORD    App-specific password
+#   NOTARYTOOL_TEAM_ID     Apple Developer team ID
 # =============================================================================
 name: Release
 
@@ -27,7 +34,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version override (e.g. 0.3.1) — defaults to VERSION file'
+        description: 'Version override (e.g. 0.8.0) — defaults to VERSION file'
         required: false
 
 permissions:
@@ -36,8 +43,6 @@ permissions:
   id-token: write
   pull-requests: write
 
-# One release at a time per version. Don't cancel: a partial release is worse
-# than a delayed one.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -47,41 +52,61 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Single source of truth: VERSION file (or workflow_dispatch input).
-  # All downstream jobs read `version` and `tag` from this job's outputs —
-  # nothing else derives version from `github.ref_name` or other implicit state.
+  # Resolve the version once. All downstream jobs read this — no implicit
+  # derivation from github.ref_name or build artifacts.
   # ---------------------------------------------------------------------------
-  resolve-version:
-    name: Resolve version
+  prepare:
+    name: Prepare
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.v.outputs.version }}
-      tag:     ${{ steps.v.outputs.tag }}
+      version:        ${{ steps.v.outputs.version }}
+      tag:            ${{ steps.v.outputs.tag }}
+      release_exists: ${{ steps.check.outputs.exists }}
     steps:
       - uses: actions/checkout@v6
+
       - id: v
+        name: Resolve version
         run: |
           OVERRIDE="${{ github.event.inputs.version }}"
           if [ -n "$OVERRIDE" ]; then
             VERSION="${OVERRIDE#v}"
-            echo "Using workflow_dispatch override: $VERSION"
           else
             VERSION=$(tr -d '[:space:]' < VERSION)
-            echo "Read VERSION file: $VERSION"
           fi
           if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$'; then
-            echo "::error::VERSION '$VERSION' is not a valid semver"
+            echo "::error::VERSION '$VERSION' is not valid semver"
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION"    >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION (tag v$VERSION)"
+
+      - id: check
+        name: Ensure draft release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.v.outputs.version }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists"
+          else
+            # Create as draft upfront so parallel build jobs don't race on
+            # `gh release create`. Build jobs only `gh release upload --clobber`.
+            gh release create "$TAG" --draft --title "$TAG" \
+              --notes "Release $TAG (draft — assets uploading)"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Created draft release $TAG"
+          fi
 
   # ---------------------------------------------------------------------------
-  # Build native binaries for all 4 platforms
+  # Build native binaries for all 4 platforms.
+  # Skips upload if the asset is already on the release (idempotent re-run).
   # ---------------------------------------------------------------------------
   build-binary:
     name: Binary / ${{ matrix.target }}
-    needs: resolve-version
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -104,17 +129,36 @@ jobs:
             runner: ubuntu-latest
             apt_extras: cmake nasm autoconf automake libtool
             features: --features isal-compression
-
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG:     ${{ needs.prepare.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: true
 
+      # If the release already has this target's tarball, skip the whole build.
+      # Saves ~10 minutes per re-run.
+      - id: skip
+        name: Skip if tarball already on release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null \
+             | grep -qx "gzippy-${{ matrix.target }}.tar.gz"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Asset already present — skipping build"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.skip.outputs.skip == 'false'
         with:
           targets: ${{ matrix.cross_target }}
 
       - uses: actions/cache@v5
+        if: steps.skip.outputs.skip == 'false'
         with:
           path: |
             ~/.cargo/registry
@@ -122,28 +166,27 @@ jobs:
             target/
           key: release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install build deps (Linux)
-        if: runner.os == 'Linux' && matrix.apt_extras != ''
+      - name: Install Linux build deps
+        if: steps.skip.outputs.skip == 'false' && runner.os == 'Linux' && matrix.apt_extras != ''
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt_extras }}
 
       - name: Stamp version into Cargo.toml
-        env:
-          VERSION: ${{ needs.resolve-version.outputs.version }}
+        if: steps.skip.outputs.skip == 'false'
         run: |
           python3 -c "
           import re, os
-          version = os.environ['VERSION']
-          content = open('Cargo.toml').read()
-          content = re.sub(r'^version = \"[^\"]+\"', f'version = \"{version}\"', content, count=1, flags=re.M)
-          open('Cargo.toml', 'w').write(content)
-          print(f'Set Cargo.toml version to {version}')
+          v = os.environ['VERSION']
+          c = open('Cargo.toml').read()
+          c = re.sub(r'^version = \"[^\"]+\"', f'version = \"{v}\"', c, count=1, flags=re.M)
+          open('Cargo.toml', 'w').write(c)
           "
 
       - name: Build
+        if: steps.skip.outputs.skip == 'false'
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
 
       - name: Sign and notarize (macOS only)
-        if: runner.os == 'macOS'
+        if: steps.skip.outputs.skip == 'false' && runner.os == 'macOS'
         env:
           MACOS_CERT_P12:      ${{ secrets.MACOS_CERT_P12 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -152,8 +195,6 @@ jobs:
           NOTARYTOOL_TEAM_ID:  ${{ secrets.NOTARYTOOL_TEAM_ID }}
         run: |
           BINARY="target/${{ matrix.target }}/release/gzippy"
-
-          # Import Developer ID Application cert into a throw-away keychain
           echo "$MACOS_CERT_P12" | base64 --decode > /tmp/cert.p12
           security create-keychain -p "ci" ci.keychain
           security list-keychains -d user -s ci.keychain $(security list-keychains -d user | tr -d '"' | xargs)
@@ -163,15 +204,10 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k "ci" ci.keychain
           rm /tmp/cert.p12
 
-          # Sign with hardened runtime (required for notarization)
           codesign --sign "Developer ID Application: Jack Danger (LWLMGDKSM9)" \
-                   --options runtime \
-                   --timestamp \
-                   --force \
-                   "$BINARY"
+                   --options runtime --timestamp --force "$BINARY"
           codesign --verify --strict "$BINARY"
 
-          # Notarize
           ditto -c -k --keepParent "$BINARY" /tmp/gzippy-notarize.zip
           xcrun notarytool submit /tmp/gzippy-notarize.zip \
             --apple-id  "$NOTARYTOOL_APPLE_ID" \
@@ -181,25 +217,28 @@ jobs:
           rm /tmp/gzippy-notarize.zip
 
       - name: Package tarball + SHA256
+        if: steps.skip.outputs.skip == 'false'
         run: |
           TARBALL="gzippy-${{ matrix.target }}.tar.gz"
           tar -czf "$TARBALL" -C target/${{ matrix.target }}/release gzippy
           shasum -a 256 "$TARBALL" | awk '{print $1}' > "$TARBALL.sha256"
-          echo "Packaged $TARBALL ($(cat $TARBALL.sha256))"
 
-      - uses: actions/upload-artifact@v7
-        with:
-          name: binary-${{ matrix.target }}
-          path: |
-            gzippy-${{ matrix.target }}.tar.gz
-            gzippy-${{ matrix.target }}.tar.gz.sha256
+      - name: Upload to release
+        if: steps.skip.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TARBALL="gzippy-${{ matrix.target }}.tar.gz"
+          # prepare job created the draft; --clobber overwrites stale assets
+          # cleanly on re-runs.
+          gh release upload "$TAG" "$TARBALL" "$TARBALL.sha256" --clobber
 
   # ---------------------------------------------------------------------------
-  # Build Debian packages for amd64 + arm64
+  # Build Debian packages for amd64 + arm64.
   # ---------------------------------------------------------------------------
   build-deb:
     name: Deb / ${{ matrix.arch }}
-    needs: resolve-version
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -209,15 +248,32 @@ jobs:
             runner: ubuntu-latest
           - arch: arm64
             runner: ubuntu-24.04-arm
-
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG:     ${{ needs.prepare.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: true
 
+      - id: skip
+        name: Skip if deb already on release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DEB="gzippy_${VERSION}-1_${{ matrix.arch }}.deb"
+          if gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null \
+             | grep -qx "$DEB"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.skip.outputs.skip == 'false'
 
       - name: Install build deps
+        if: steps.skip.outputs.skip == 'false'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -225,181 +281,251 @@ jobs:
             zlib1g-dev cmake nasm autoconf automake libtool
 
       - name: Stamp version into debian/changelog
-        env:
-          VERSION: ${{ needs.resolve-version.outputs.version }}
-        run: |
-          DEB_VERSION="${VERSION}-1"
-          sed -i "1s/gzippy ([^)]*)/gzippy ($DEB_VERSION)/" debian/changelog
-          echo "debian/changelog version set to $DEB_VERSION"
+        if: steps.skip.outputs.skip == 'false'
+        run: sed -i "1s/gzippy ([^)]*)/gzippy (${VERSION}-1)/" debian/changelog
 
-      - name: Build Debian packages
+      - name: Build .deb
+        if: steps.skip.outputs.skip == 'false'
         run: dpkg-buildpackage -us -uc -b -d
 
       - name: Smoke test installation
+        if: steps.skip.outputs.skip == 'false'
         run: |
           sudo dpkg -i ../gzippy_*.deb
           echo "Hello gzippy" | gzippy -c | gzippy -d
           [ "$(readlink /usr/bin/gzip)" = "gzippy" ] || (echo "gzip not diverted"; exit 1)
-          echo "Test data" | gzip -c | gunzip -c
-          echo "✓ gzippy installed, gzip/gunzip/zcat diverted"
 
-      - name: Collect .deb files into workspace
-        run: cp ../*.deb ./
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: deb-${{ matrix.arch }}
-          path: "*.deb"
+      - name: Upload .debs to release
+        if: steps.skip.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp ../*.deb ./
+          gh release upload "$TAG" gzippy_*.deb --clobber
 
   # ---------------------------------------------------------------------------
-  # Publish: update formula, create GitHub release
+  # Publish everywhere. Single linear job — each step is idempotent and reads
+  # SHA256s from the published release (never from freshly-rebuilt artifacts)
+  # so the formula, AUR PKGBUILD, and apt repo all reference the bytes users
+  # actually download.
   # ---------------------------------------------------------------------------
-  release:
+  publish:
     name: Publish
     runs-on: ubuntu-latest
-    needs: [resolve-version, build-binary, build-deb]
+    needs: [prepare, build-binary, build-deb]
     env:
-      VERSION:     ${{ needs.resolve-version.outputs.version }}
-      RELEASE_TAG: ${{ needs.resolve-version.outputs.tag }}
-
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG:     ${{ needs.prepare.outputs.tag }}
+      RELEASE_BASE: https://github.com/JackDanger/gzippy/releases/download/${{ needs.prepare.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
         with:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0  # need full history to inspect/create tags
+          fetch-depth: 0
+          submodules: true
 
-      - uses: actions/download-artifact@v8
-        with:
-          path: dist
-
-      # Ensure a git tag exists for this release. Idempotent: if the tag is
-      # already present (re-running a workflow_dispatch for the same version),
-      # leave it alone. Otherwise create it at main HEAD and push it.
-      - name: Ensure tag ${{ env.RELEASE_TAG }} exists
+      # ---- Ensure tag exists at main HEAD -----------------------------------
+      - name: Ensure tag exists
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git rev-parse --verify "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "Tag ${RELEASE_TAG} already exists locally"
-          elif git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "Tag ${RELEASE_TAG} already exists on origin; fetching"
-            git fetch origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already on origin"
           else
-            echo "Creating tag ${RELEASE_TAG} at main HEAD ($(git rev-parse HEAD))"
-            git tag -a "${RELEASE_TAG}" -m "Release ${RELEASE_TAG}"
-            git push origin "${RELEASE_TAG}"
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
           fi
 
-      - name: Update Formula/gzippy.rb
+      # ---- Finalize release (flip from draft → published) -------------------
+      - name: Finalize release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python3 - <<'PYEOF'
-          import os, re
+          # build-binary / build-deb jobs created a draft release and uploaded
+          # assets to it. Mark it as non-draft now that all assets are present.
+          if gh release view "$TAG" --json isDraft --jq '.isDraft' | grep -qx true; then
+            gh release edit "$TAG" --draft=false
+            echo "Release $TAG finalized (no longer a draft)"
+          else
+            echo "Release $TAG already published"
+          fi
 
-          version = os.environ['VERSION']
-          formula = open('Formula/gzippy.rb').read()
-
-          # Update version string
-          formula = re.sub(r'version "[^"]+"', f'version "{version}"', formula, count=1)
-
-          # Update each sha256 sentinel: sha256 "..." # TARGET_KEY
-          targets = {
-              'AARCH64_APPLE_DARWIN':    'aarch64-apple-darwin',
-              'X86_64_APPLE_DARWIN':     'x86_64-apple-darwin',
-              'AARCH64_UNKNOWN_LINUX_GNU': 'aarch64-unknown-linux-gnu',
-              'X86_64_UNKNOWN_LINUX_GNU':  'x86_64-unknown-linux-gnu',
+      # ---- Read SHA256s from the published release --------------------------
+      # Single source of truth. These are the bytes users actually download —
+      # so anything we stamp downstream (formula, PKGBUILD) is automatically
+      # consistent with reality.
+      - id: shas
+        name: Fetch SHA256s from release
+        run: |
+          fetch_sha() {
+            curl -fsSL --retry 5 --retry-delay 3 \
+              "${RELEASE_BASE}/gzippy-$1.tar.gz.sha256" | awk '{print $1}'
           }
-          for key, target in targets.items():
-              tarball_path = f'dist/binary-{target}/gzippy-{target}.tar.gz.sha256'
-              sha = open(tarball_path).read().strip()
-              formula = re.sub(
-                  rf'sha256 "[0-9a-f]+" # {key}',
-                  f'sha256 "{sha}" # {key}',
-                  formula,
-              )
+          {
+            echo "aarch64_apple_darwin=$(fetch_sha aarch64-apple-darwin)"
+            echo "x86_64_apple_darwin=$(fetch_sha x86_64-apple-darwin)"
+            echo "aarch64_unknown_linux_gnu=$(fetch_sha aarch64-unknown-linux-gnu)"
+            echo "x86_64_unknown_linux_gnu=$(fetch_sha x86_64-unknown-linux-gnu)"
+          } >> "$GITHUB_OUTPUT"
 
+      # ---- Update Formula/gzippy.rb + Cargo.toml in workspace ---------------
+      - name: Stamp formula and Cargo.toml
+        run: |
+          python3 - <<PYEOF
+          import re
+          version = "${{ env.VERSION }}"
+          shas = {
+              'AARCH64_APPLE_DARWIN':      "${{ steps.shas.outputs.aarch64_apple_darwin }}",
+              'X86_64_APPLE_DARWIN':       "${{ steps.shas.outputs.x86_64_apple_darwin }}",
+              'AARCH64_UNKNOWN_LINUX_GNU': "${{ steps.shas.outputs.aarch64_unknown_linux_gnu }}",
+              'X86_64_UNKNOWN_LINUX_GNU':  "${{ steps.shas.outputs.x86_64_unknown_linux_gnu }}",
+          }
+          formula = open('Formula/gzippy.rb').read()
+          formula = re.sub(r'version "[^"]+"', f'version "{version}"', formula, count=1)
+          for key, sha in shas.items():
+              formula = re.sub(rf'sha256 "[0-9a-f]+" # {key}',
+                               f'sha256 "{sha}" # {key}', formula)
           open('Formula/gzippy.rb', 'w').write(formula)
 
-          cargo_toml = open('Cargo.toml').read()
-          cargo_toml = re.sub(r'^version = "[^"]+"', f'version = "{version}"', cargo_toml, count=1, flags=re.M)
-          open('Cargo.toml', 'w').write(cargo_toml)
-
-          print(f'Updated formula and Cargo.toml to v{version}')
+          cargo = open('Cargo.toml').read()
+          cargo = re.sub(r'^version = "[^"]+"', f'version = "{version}"', cargo, count=1, flags=re.M)
+          open('Cargo.toml', 'w').write(cargo)
           PYEOF
 
-      - name: Commit updated formula via PR
+      # ---- Sync formula via PR (idempotent + zombie-PR-free) ----------------
+      - name: Sync formula update via PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/gzippy.rb Cargo.toml
+
+          # If main already has the right state, skip the PR dance entirely.
+          # This is the cheap path on re-runs.
           if git diff --cached --quiet; then
-            echo "Formula and Cargo.toml already match; no PR needed"
+            echo "Formula and Cargo.toml already at v${VERSION} — no PR needed"
             exit 0
           fi
 
           BRANCH="release/formula-${VERSION}"
 
-          # `checkout -B` (re)creates the branch at the current HEAD even if
-          # one with that name already exists locally. Combined with
-          # `push --force-with-lease`, this overwrites a stale remote branch
-          # left by a previous failed run while still refusing to clobber
-          # commits we don't know about (the lease).
+          # Close any stale PRs for this version. The legacy workflow piled up
+          # three PRs for v0.7.1 (#100 merged, #102 closed, #105 stuck open)
+          # because each re-run created another one. Pre-emptive close keeps
+          # the PR list clean.
+          STALE=$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[].number')
+          for n in $STALE; do
+            echo "Closing stale formula PR #$n"
+            gh pr close "$n" --comment "Superseded by current release run."
+          done
+
           git checkout -B "$BRANCH"
-          git commit -m "chore: update formula and version to v${VERSION} [skip ci]"
+          git commit -m "chore: update formula and Cargo.toml to v${VERSION} [skip ci]"
           git push --force-with-lease origin "$BRANCH"
 
-          # If a PR for this branch is already open (prior failed run got far
-          # enough to create one), reuse it. Otherwise open a fresh PR.
-          EXISTING=$(gh pr list \
-            --head "$BRANCH" --base main --state open \
-            --json number --jq '.[0].number // empty')
-          if [ -n "$EXISTING" ]; then
-            echo "Reusing existing PR #${EXISTING} on branch ${BRANCH}"
-            PR_NUMBER="$EXISTING"
-          else
-            PR_URL=$(gh pr create \
-              --title "chore: update formula to v${VERSION}" \
-              --body  "Automated formula and Cargo.toml update for v${VERSION}." \
-              --base  main \
-              --head  "$BRANCH")
-            PR_NUMBER="${PR_URL##*/}"
-            echo "Created PR #${PR_NUMBER}: ${PR_URL}"
-          fi
-          # `--auto` queues the merge to fire when checks pass — but it
-          # *requires* the PR to be in a non-mergeable state (pending checks /
-          # behind base / etc.). For a clean PR with no required checks,
-          # `--auto` errors with "Pull request is in clean status." Fall back
-          # to direct merge in that case.
-          echo "Merging PR #${PR_NUMBER}"
-          gh pr merge "$PR_NUMBER" --squash --auto 2>/tmp/merge-err \
-            || (grep -q 'clean status' /tmp/merge-err \
-                && echo "PR already mergeable; merging directly" \
-                && gh pr merge "$PR_NUMBER" --squash) \
-            || (cat /tmp/merge-err && exit 1)
+          PR_URL=$(gh pr create \
+            --title "chore: update formula to v${VERSION}" \
+            --body  "Automated formula + Cargo.toml update for v${VERSION}. SHA256s come from the published release at ${RELEASE_BASE}." \
+            --base  main --head "$BRANCH")
+          PR_NUMBER="${PR_URL##*/}"
+          echo "Opened PR #${PR_NUMBER}: ${PR_URL}"
 
-      - name: Create GitHub release
+          # Try auto-merge (waits for checks); fall back to direct merge if the
+          # PR is already mergeable with no pending checks.
+          if ! gh pr merge "$PR_NUMBER" --squash --auto 2>/tmp/merge-err; then
+            if grep -q 'clean status' /tmp/merge-err; then
+              echo "Auto-merge unavailable (no pending checks); merging directly"
+              gh pr merge "$PR_NUMBER" --squash
+            else
+              cat /tmp/merge-err
+              exit 1
+            fi
+          fi
+
+      # ---- Publish to crates.io (idempotent + retry) ------------------------
+      - name: Publish to crates.io
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "Release ${RELEASE_TAG} already exists — skipping creation"
-          else
-            gh release create "${RELEASE_TAG}" \
-              --generate-notes \
-              dist/binary-*/gzippy-*.tar.gz \
-              dist/binary-*/gzippy-*.tar.gz.sha256 \
-              dist/deb-amd64/*.deb \
-              dist/deb-arm64/gzippy_*_arm64.deb
-            echo "Created release ${RELEASE_TAG}"
+          # Skip if this version is already on crates.io. cargo publish has no
+          # --if-not-exists flag, so we check the API directly.
+          PUBLISHED=$(curl -fsSL "https://crates.io/api/v1/crates/gzippy/versions" \
+            | python3 -c "import json,sys; print('\n'.join(v['num'] for v in json.load(sys.stdin)['versions']))")
+          if echo "$PUBLISHED" | grep -qx "$VERSION"; then
+            echo "gzippy v${VERSION} already on crates.io — skipping"
+            exit 0
           fi
 
-      # -----------------------------------------------------------------------
-      # Rebuild apt repository and deploy to GitHub Pages
-      # -----------------------------------------------------------------------
+          # The formula-sync step above may have just landed a Cargo.toml bump
+          # on main; pull it so cargo publishes the right version.
+          git fetch origin main
+          git checkout origin/main -- Cargo.toml || true
+
+          sudo apt-get update && sudo apt-get install -y cmake
+
+          # Retry on transient network errors (HTTP/2 STREAM_CLOSED observed
+          # against crates.io; usually clears within 1–2 attempts).
+          for attempt in 1 2 3; do
+            if cargo publish --allow-dirty --no-verify --token "$CARGO_REGISTRY_TOKEN"; then
+              echo "Published gzippy v${VERSION} to crates.io (attempt $attempt)"
+              exit 0
+            fi
+            echo "cargo publish attempt $attempt failed; retrying in 15s..."
+            sleep 15
+          done
+          echo "::error::cargo publish failed after 3 attempts"
+          exit 1
+
+      # ---- Publish AUR packages --------------------------------------------
+      - name: Set up SSH for AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          cat >> ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User aur
+          EOF
+          chmod 600 ~/.ssh/config
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          if ! ssh-keygen -y -f ~/.ssh/aur > /dev/null 2>&1; then
+            echo "::error::AUR_SSH_KEY is not a valid SSH private key. See workflow header."
+            exit 1
+          fi
+
+      - name: Push AUR packages
+        run: |
+          X86=${{ steps.shas.outputs.x86_64_unknown_linux_gnu }}
+          ARM=${{ steps.shas.outputs.aarch64_unknown_linux_gnu }}
+          bash scripts/update-aur.sh "$VERSION" "$X86" "$ARM"
+
+      - name: Smoke-test PKGBUILD (Docker)
+        run: |
+          X86=${{ steps.shas.outputs.x86_64_unknown_linux_gnu }}
+          ARM=${{ steps.shas.outputs.aarch64_unknown_linux_gnu }}
+
+          mkdir -p /tmp/pkgbuild-dir
+          cp packaging/aur/gzippy-bin/PKGBUILD /tmp/pkgbuild-dir/PKGBUILD
+          sed -i "s/pkgver=.*/pkgver=$VERSION/"                  /tmp/pkgbuild-dir/PKGBUILD
+          sed -i "s|/vVERSION/|/v$VERSION/|g"                    /tmp/pkgbuild-dir/PKGBUILD
+          sed -i "s/sha256sums_x86_64=.*/sha256sums_x86_64=('$X86')/"   /tmp/pkgbuild-dir/PKGBUILD
+          sed -i "s/sha256sums_aarch64=.*/sha256sums_aarch64=('$ARM')/" /tmp/pkgbuild-dir/PKGBUILD
+
+          docker run --rm -v /tmp/pkgbuild-dir:/pkg -w /pkg archlinux:latest bash -c "
+            pacman -Sy --noconfirm base-devel 2>/dev/null
+            useradd -m builder
+            chown -R builder /pkg
+            su builder -c 'makepkg --verifysource --nodeps'
+          "
+
+      # ---- Build + deploy apt repo to gh-pages ------------------------------
       - name: Install reprepro
         run: sudo apt-get install -y reprepro
 
@@ -413,12 +539,18 @@ jobs:
           echo "${KEY_FPR}:6:" | gpg --import-ownertrust
           echo "KEY_FPR=$KEY_FPR" >> "$GITHUB_ENV"
 
-      - name: Build apt repository
+      - name: Download .debs from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          gh release download "$TAG" --pattern '*.deb' --dir dist
+
+      - name: Build apt repo
         run: |
           DEB_VERSION="${VERSION}-1"
           mkdir -p apt-repo/conf
-
-          cat > apt-repo/conf/distributions << EOF
+          cat > apt-repo/conf/distributions <<EOF
           Origin: gzippy
           Label: gzippy
           Codename: stable
@@ -428,18 +560,13 @@ jobs:
           SignWith: ${KEY_FPR}
           EOF
 
-          for deb in \
-            dist/deb-amd64/gzippy_${DEB_VERSION}_amd64.deb \
-            dist/deb-amd64/gzippy-replace-gzip_${DEB_VERSION}_all.deb \
-            dist/deb-arm64/gzippy_${DEB_VERSION}_arm64.deb; do
+          for deb in dist/*.deb; do
             reprepro -b apt-repo includedeb stable "$deb"
           done
 
-          # Public key + install script for the web root
           cp packaging/apt/gzippy-signing-key.asc apt-repo/gzippy-signing-key.asc
           cp scripts/install.sh apt-repo/install.sh
 
-          # Stage for GitHub Pages (exclude reprepro internals)
           mkdir -p apt-publish
           cp -r apt-repo/dists apt-repo/pool apt-publish/
           cp apt-repo/gzippy-signing-key.asc apt-repo/install.sh apt-publish/
@@ -452,167 +579,14 @@ jobs:
           publish_dir: apt-publish
           user_name: 'github-actions[bot]'
           user_email: 'github-actions[bot]@users.noreply.github.com'
-          commit_message: 'chore: apt repo ${{ env.RELEASE_TAG }} [skip ci]'
+          commit_message: 'chore: apt repo ${{ env.TAG }} [skip ci]'
 
       - name: Enable GitHub Pages (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh api --method POST "repos/$GITHUB_REPOSITORY/pages" \
             --field 'source[branch]=gh-pages' --field 'source[path]=/' 2>/dev/null \
           || gh api --method PUT "repos/$GITHUB_REPOSITORY/pages" \
             --field 'source[branch]=gh-pages' --field 'source[path]=/' 2>/dev/null \
           || echo "GitHub Pages already configured"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ---------------------------------------------------------------------------
-  # Publish AUR package (gzippy-bin)
-  # Required secret: AUR_SSH_KEY — SSH PRIVATE key (NOT the public key from
-  # the AUR account page; the AUR account page only shows public keys for
-  # display).
-  #   1. Generate keypair:
-  #        ssh-keygen -t ed25519 -C "releases@jackdanger.com" -f aur_key -N ""
-  #      Produces aur_key (private) + aur_key.pub (public).
-  #   2. Register the PUBLIC half on AUR:
-  #        cat aur_key.pub  →  paste into https://aur.archlinux.org/account/edit
-  #   3. Store the PRIVATE half as a repo secret:
-  #        gh secret set AUR_SSH_KEY --repo JackDanger/gzippy < aur_key
-  #   4. Delete the local copies once both are in place.
-  #
-  # The "Set up SSH for AUR" step validates the secret is a private key and
-  # prints clear remediation if it isn't.
-  # ---------------------------------------------------------------------------
-  publish-aur:
-    name: AUR / gzippy-bin
-    runs-on: ubuntu-latest
-    needs: [resolve-version, release]
-    env:
-      VERSION: ${{ needs.resolve-version.outputs.version }}
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Set up SSH for AUR
-        env:
-          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
-        run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-
-          # `printf '%s\n'` writes the secret exactly as stored and guarantees
-          # one trailing newline. `echo` is shell-implementation-dependent and
-          # has tripped up SSH key parsing in this workflow before.
-          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
-          chmod 600 ~/.ssh/aur
-
-          cat >> ~/.ssh/config <<'EOF'
-          Host aur.archlinux.org
-            IdentityFile ~/.ssh/aur
-            User aur
-          EOF
-          chmod 600 ~/.ssh/config
-
-          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
-
-          # Validate the key parses *before* the first git operation tries to
-          # use it. Failing here gives a clear remediation message; failing
-          # later would surface as "Permission denied (publickey)" which is
-          # ambiguous between bad-key and not-registered-on-AUR.
-          if ! ssh-keygen -y -f ~/.ssh/aur > /dev/null 2>&1; then
-            echo "::error::AUR_SSH_KEY cannot be parsed as an SSH private key."
-            echo "::error::"
-            echo "::error::This secret needs the PRIVATE key, not the public key."
-            echo "::error::A keypair has two halves — they look like this:"
-            echo "::error::  - aur_key.pub  (PUBLIC, one line, starts 'ssh-ed25519 AAAA...')"
-            echo "::error::                   → goes on https://aur.archlinux.org/account/edit"
-            echo "::error::  - aur_key      (PRIVATE, multiple lines, wrapped in"
-            echo "::error::                   '-----BEGIN OPENSSH PRIVATE KEY-----')"
-            echo "::error::                   → goes here, in the AUR_SSH_KEY secret"
-            echo "::error::"
-            echo "::error::Other causes: pasted without newlines / with CRLF endings."
-            echo "::error::"
-            echo "::error::Fix:  gh secret set AUR_SSH_KEY --repo JackDanger/gzippy < /path/to/aur_key"
-            exit 1
-          fi
-          echo "AUR SSH key OK: $(ssh-keygen -l -f ~/.ssh/aur)"
-
-      - name: Update and push AUR package
-        run: |
-          # Use sha256s from the published release — not the current build artifacts.
-          # On re-runs the build produces new binaries, but the GitHub release assets
-          # are already set (immutable). makepkg --verifysource downloads from the
-          # release URL, so the hashes must match what's actually there.
-          BASE="https://github.com/JackDanger/gzippy/releases/download/v${VERSION}"
-          X86_SHA=$(curl -fsSL "${BASE}/gzippy-x86_64-unknown-linux-gnu.tar.gz.sha256" | awk '{print $1}')
-          ARM_SHA=$(curl -fsSL "${BASE}/gzippy-aarch64-unknown-linux-gnu.tar.gz.sha256" | awk '{print $1}')
-          bash scripts/update-aur.sh "$VERSION" "$X86_SHA" "$ARM_SHA"
-
-      - name: Smoke-test PKGBUILD (Docker)
-        run: |
-          BASE="https://github.com/JackDanger/gzippy/releases/download/v${VERSION}"
-          X86_SHA=$(curl -fsSL "${BASE}/gzippy-x86_64-unknown-linux-gnu.tar.gz.sha256" | awk '{print $1}')
-          ARM_SHA=$(curl -fsSL "${BASE}/gzippy-aarch64-unknown-linux-gnu.tar.gz.sha256" | awk '{print $1}')
-
-          # Stamp version and sha256s into a local copy
-          cp packaging/aur/gzippy-bin/PKGBUILD /tmp/PKGBUILD-test
-          sed -i "s/pkgver=.*/pkgver=$VERSION/" /tmp/PKGBUILD-test
-          sed -i "s|/vVERSION/|/v$VERSION/|g"   /tmp/PKGBUILD-test
-          sed -i "s/sha256sums_x86_64=.*/sha256sums_x86_64=('$X86_SHA')/" /tmp/PKGBUILD-test
-          sed -i "s/sha256sums_aarch64=.*/sha256sums_aarch64=('$ARM_SHA')/" /tmp/PKGBUILD-test
-
-          # Copy into a writable directory so makepkg can chown it inside Docker
-          mkdir -p /tmp/pkgbuild-dir
-          cp /tmp/PKGBUILD-test /tmp/pkgbuild-dir/PKGBUILD
-
-          docker run --rm \
-            -v /tmp/pkgbuild-dir:/pkg \
-            -w /pkg \
-            archlinux:latest \
-            bash -c "
-              pacman -Sy --noconfirm base-devel 2>/dev/null
-              useradd -m builder
-              chown -R builder /pkg
-              su builder -c 'makepkg --verifysource --nodeps'
-            "
-          echo "PKGBUILD smoke test passed"
-
-  # ---------------------------------------------------------------------------
-  # Publish to crates.io
-  # Required secret: CARGO_REGISTRY_TOKEN — API token from crates.io
-  #   1. Log in at https://crates.io and go to Account Settings → API Tokens
-  #   2. Create a token with "publish-new" + "publish-update" scopes
-  #   3. gh secret set CARGO_REGISTRY_TOKEN --repo JackDanger/gzippy
-  # ---------------------------------------------------------------------------
-  publish-crates:
-    name: Publish to crates.io
-    runs-on: ubuntu-latest
-    needs: [resolve-version, build-binary]
-    env:
-      VERSION: ${{ needs.resolve-version.outputs.version }}
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y cmake
-
-      - name: Stamp version into Cargo.toml
-        run: |
-          python3 -c "
-          import re, os
-          version = os.environ['VERSION']
-          content = open('Cargo.toml').read()
-          content = re.sub(r'^version = \"[^\"]+\"', f'version = \"{version}\"', content, count=1, flags=re.M)
-          open('Cargo.toml', 'w').write(content)
-          print(f'Set Cargo.toml version to {version}')
-          "
-
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        # --allow-dirty: Cargo.toml was stamped above without a commit
-        # --no-verify: compilation already verified in build-binary job
-        run: cargo publish --allow-dirty --no-verify --token "$CARGO_REGISTRY_TOKEN"
