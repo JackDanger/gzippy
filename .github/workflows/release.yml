@@ -491,11 +491,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: binary-*-linux-*
-          merge-multiple: true
-
       - name: Set up SSH for AUR
         env:
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
@@ -542,25 +537,34 @@ jobs:
 
       - name: Update and push AUR package
         run: |
-          X86_SHA=$(cat gzippy-x86_64-unknown-linux-gnu.tar.gz.sha256 | awk '{print $1}')
-          ARM_SHA=$(cat gzippy-aarch64-unknown-linux-gnu.tar.gz.sha256 | awk '{print $1}')
+          # Use sha256s from the published release — not the current build artifacts.
+          # On re-runs the build produces new binaries, but the GitHub release assets
+          # are already set (immutable). makepkg --verifysource downloads from the
+          # release URL, so the hashes must match what's actually there.
+          BASE="https://github.com/JackDanger/gzippy/releases/download/v${VERSION}"
+          X86_SHA=$(curl -fsSL "${BASE}/gzippy-x86_64-unknown-linux-gnu.tar.gz.sha256" | awk '{print $1}')
+          ARM_SHA=$(curl -fsSL "${BASE}/gzippy-aarch64-unknown-linux-gnu.tar.gz.sha256" | awk '{print $1}')
           bash scripts/update-aur.sh "$VERSION" "$X86_SHA" "$ARM_SHA"
 
       - name: Smoke-test PKGBUILD (Docker)
         run: |
+          BASE="https://github.com/JackDanger/gzippy/releases/download/v${VERSION}"
+          X86_SHA=$(curl -fsSL "${BASE}/gzippy-x86_64-unknown-linux-gnu.tar.gz.sha256" | awk '{print $1}')
+          ARM_SHA=$(curl -fsSL "${BASE}/gzippy-aarch64-unknown-linux-gnu.tar.gz.sha256" | awk '{print $1}')
 
-          # Stamp version into a local copy and verify makepkg --verifysource passes
+          # Stamp version and sha256s into a local copy
           cp packaging/aur/gzippy-bin/PKGBUILD /tmp/PKGBUILD-test
           sed -i "s/pkgver=.*/pkgver=$VERSION/" /tmp/PKGBUILD-test
           sed -i "s|/vVERSION/|/v$VERSION/|g"   /tmp/PKGBUILD-test
-
-          X86_SHA=$(cat gzippy-x86_64-unknown-linux-gnu.tar.gz.sha256 | awk '{print $1}')
-          ARM_SHA=$(cat gzippy-aarch64-unknown-linux-gnu.tar.gz.sha256 | awk '{print $1}')
           sed -i "s/sha256sums_x86_64=.*/sha256sums_x86_64=('$X86_SHA')/" /tmp/PKGBUILD-test
           sed -i "s/sha256sums_aarch64=.*/sha256sums_aarch64=('$ARM_SHA')/" /tmp/PKGBUILD-test
 
+          # Copy into a writable directory so makepkg can chown it inside Docker
+          mkdir -p /tmp/pkgbuild-dir
+          cp /tmp/PKGBUILD-test /tmp/pkgbuild-dir/PKGBUILD
+
           docker run --rm \
-            -v /tmp/PKGBUILD-test:/pkg/PKGBUILD:ro \
+            -v /tmp/pkgbuild-dir:/pkg \
             -w /pkg \
             archlinux:latest \
             bash -c "
