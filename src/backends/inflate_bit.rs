@@ -17,7 +17,11 @@
 //! end_bit = start_bit + consumed = simplifies to the formula above regardless of bit_skip.
 
 /// Always true — zlib-ng is a static dep available on all platforms.
+///
+/// Currently no production call site gates on this (the universal entrypoints
+/// below always succeed). Retained for diagnostics / future routing.
 #[inline]
+#[allow(dead_code)]
 pub fn is_available() -> bool {
     true
 }
@@ -43,8 +47,9 @@ pub fn decompress_deflate_from_bit_with_end(
     dict: &[u8],
     max_output: usize,
 ) -> Option<(Vec<u8>, usize)> {
+    let mut crc = crc32fast::Hasher::new();
     crate::backends::isal_decompress::decompress_deflate_from_bit_with_end(
-        data, bit_offset, dict, max_output,
+        data, bit_offset, dict, max_output, &mut crc,
     )
 }
 

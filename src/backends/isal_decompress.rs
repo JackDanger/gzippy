@@ -332,8 +332,14 @@ pub fn decompress_deflate_from_bit(
         }
     }
 
+    // MIN cap of 32 KB: the principal caller is `try_decode_at` in
+    // the parallel boundary search, which validates with min_output
+    // = 32 KB. The earlier 256 KB MIN over-allocated by 8× per call;
+    // with the boundary search making ~100-1000 calls per chunk,
+    // the over-allocation showed up as a measurable phase 1a wall
+    // overhead on the Silesia Tmax bench.
     const MAX_CAP: usize = 512 * 1024 * 1024;
-    let cap = max_output.clamp(256 * 1024, MAX_CAP);
+    let cap = max_output.clamp(32 * 1024, MAX_CAP);
     let mut output = vec![0u8; cap];
     let mut out_pos = 0usize;
 
@@ -394,6 +400,20 @@ pub fn decompress_deflate_from_bit(
 ///
 /// Tip: pass `data` as `&full_data[..until_byte]` to limit ISA-L's input consumption.
 /// The end_bit is still in `full_data` coordinates since both slices share the same layout.
+///
+/// `crc` is updated over the decoded output before returning.
+///
+/// Output is returned as a single `Vec<u8>` allocated with `with_capacity + set_len`
+/// (no zero-fill). One VMA per chunk: eliminates the ~1300 mmap/munmap calls that
+/// the 128 KiB segment approach caused (128 KiB == Linux glibc's M_MMAP_THRESHOLD,
+/// so every alloc_segment call went through mmap, and ~3900 concurrent mmap/munmap
+/// pairs serialised through the per-mm mmap_lock, inflating decode from ~83 ms to
+/// ~1374 ms on Silesia at T=4).
+///
+/// CRITICAL invariant: uses stateful `isal_inflate`, not `isal_inflate_stateless`.
+/// The stateful entry rolls back `read_in_length` on END_INPUT so that the reported
+/// end_bit lands precisely at the last completed block boundary. Do not refactor to
+/// the stateless entry without preserving this semantics.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 #[allow(dead_code)]
 pub fn decompress_deflate_from_bit_with_end(
@@ -401,6 +421,7 @@ pub fn decompress_deflate_from_bit_with_end(
     bit_offset: usize,
     dict: &[u8],
     max_output: usize,
+    crc: &mut crc32fast::Hasher,
 ) -> Option<(Vec<u8>, usize)> {
     use isal::isal_sys::igzip_lib as isal_raw;
 
@@ -444,22 +465,53 @@ pub fn decompress_deflate_from_bit_with_end(
         }
     }
 
-    const MAX_CAP: usize = 512 * 1024 * 1024;
-    let cap = max_output.clamp(256 * 1024, MAX_CAP);
-    let mut output = vec![0u8; cap];
-    let mut out_pos = 0usize;
+    // Single uninit allocation sized to max_output. `with_capacity + set_len`
+    // avoids zero-filling (calloc on macOS eagerly touches every page; on Linux
+    // pages are lazily faulted as ISA-L writes, but with one VMA instead of
+    // ~1300, the kernel doesn't have to acquire mmap_lock for each one).
+    // MAX_CAP = 3 GiB keeps `remaining as u32` valid for ISA-L's avail_out.
+    // Do not raise above u32::MAX without fixing the avail_out cast.
+    const MAX_CAP: usize = 3 * 1024 * 1024 * 1024;
+    let mut cap = max_output.min(MAX_CAP);
+    let mut output = Vec::with_capacity(cap);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(cap)
+    };
+    let mut out_pos: usize = 0;
 
     loop {
         let remaining = cap - out_pos;
         if remaining == 0 {
-            break;
+            // Buffer full: try to grow (handles chunks that decompress to
+            // more than 2× the per-chunk hint — e.g., a highly compressible
+            // chunk in a Silesia-class file with uneven per-member ratios).
+            let new_cap = (cap * 2).min(MAX_CAP);
+            if new_cap <= cap {
+                // Already at MAX_CAP; fall back to marker decoder.
+                return None;
+            }
+            // set_len to out_pos so reserve_exact sees the "used" prefix,
+            // then extend uninit tail to new_cap.
+            unsafe { output.set_len(out_pos) };
+            output.reserve_exact(new_cap - cap);
+            #[allow(clippy::uninit_vec)]
+            unsafe {
+                output.set_len(new_cap)
+            };
+            cap = new_cap;
+            continue;
         }
-
         state.avail_out = remaining as u32;
         state.next_out = unsafe { output.as_mut_ptr().add(out_pos) };
 
         let ret = unsafe { isal_raw::isal_inflate(&mut state) };
         let written = remaining - state.avail_out as usize;
+
+        // CRC while hot: data just written by ISA-L is still in L1/L2 cache.
+        if written > 0 {
+            crc.update(&output[out_pos..out_pos + written]);
+        }
         out_pos += written;
 
         if ret != 0 {
@@ -480,13 +532,11 @@ pub fn decompress_deflate_from_bit_with_end(
     if out_pos == 0 {
         return None;
     }
+
     output.truncate(out_pos);
 
-    // end_bit formula (valid for both bit_skip=0 and bit_skip>0):
-    //   All bits available = pre_loaded + avail_in_bytes * 8
-    //   Bits remaining     = final_avail_in * 8 + final_read_in_length
-    //   Bits consumed      = available - remaining
-    //   end_bit            = start_bit + bits_consumed = data.len()*8 - final_avail_in*8 - final_read_in_length
+    // end_bit = data.len()*8 - avail_in*8 - read_in_length
+    // (see function doc for derivation; stateful isal_inflate invariant).
     let end_bit =
         data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
 
@@ -500,6 +550,7 @@ pub fn decompress_deflate_from_bit_with_end(
     _bit_offset: usize,
     _dict: &[u8],
     _max_output: usize,
+    _crc: &mut crc32fast::Hasher,
 ) -> Option<(Vec<u8>, usize)> {
     None
 }
@@ -927,6 +978,46 @@ mod tests {
             bit_offset % 8 != 0,
             "confirmed boundary must be non-byte-aligned: bit={}",
             bit_offset
+        );
+    }
+
+    /// Verify that the CRC accumulated inside the ISA-L loop equals the CRC
+    /// computed in a separate pass over the returned bytes. This guards the
+    /// "CRC-while-hot" invariant: if the inline update missed any written
+    /// bytes (off-by-one in the slice window, wrong iteration count, etc.),
+    /// the two CRCs diverge and the test catches it before it silently
+    /// produces a wrong combined-CRC in phase 2.
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_inline_crc_matches_postprocess() {
+        use super::*;
+        use std::io::Write;
+
+        let original: Vec<u8> = (0u8..=255).cycle().take(200_000).collect();
+
+        // Produce a raw DEFLATE stream (no gzip wrapper) via flate2.
+        let mut deflate_enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        deflate_enc.write_all(&original).unwrap();
+        let deflated = deflate_enc.finish().unwrap();
+
+        let mut inline_crc = crc32fast::Hasher::new();
+        let (segments, _end_bit) = decompress_deflate_from_bit_with_end(
+            &deflated,
+            0,
+            &[],
+            original.len() * 2,
+            &mut inline_crc,
+        )
+        .expect("ISA-L decode must succeed on valid DEFLATE");
+
+        assert_eq!(segments, original, "decoded bytes must match original");
+
+        let postprocess_crc = crc32fast::hash(&segments);
+        assert_eq!(
+            inline_crc.finalize(),
+            postprocess_crc,
+            "inline CRC must equal post-process CRC over the same bytes"
         );
     }
 }

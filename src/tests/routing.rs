@@ -275,6 +275,334 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // Deletion-trap killer — the routing-assertion test from the v0.6 marker
+    // decoder premortem.
+    //
+    // Every prior marker-based attempt in this codebase has been deleted
+    // during cleanup because it lived outside the production CLI path. The
+    // only thing that prevents the next cleanup from doing the same is a
+    // test that fails when production routing *silently falls back* away
+    // from the marker pipeline. Output-equivalence tests don't catch that —
+    // gzippy will still produce correct output via the ISA-L sequential
+    // fallback even if the marker pipeline is gone.
+    //
+    // `MARKER_PIPELINE_RUNS` is a process-global counter incremented on
+    // every successful run of `parallel::single_member::decompress_parallel`.
+    // We snapshot it around a real CLI-shaped decode and assert it moved.
+    // On platforms where the parallel path is correctly gated off (arm64,
+    // non-ISA-L builds) the test is a no-op.
+    //
+    // See `docs/marker-decoder-plan.md` for the full rationale.
+    // =========================================================================
+    #[test]
+    fn test_marker_pipeline_actually_runs_on_x86_64_isal() {
+        use std::sync::atomic::Ordering;
+
+        // Serialize against any other test that calls `decompress_parallel`
+        // concurrently — under `cargo test`'s default parallel execution,
+        // another increment between `before` and `after` would mask a real
+        // silent-fallback regression with a false-positive pass. (Copilot
+        // review on PR #94.)
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "fixture must exceed 10 MiB parallel gate (got {} bytes)",
+            compressed.len()
+        );
+
+        let before = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+            .load(Ordering::Relaxed);
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        assert_eq!(
+            output, original,
+            "output bytes wrong — but routing might also be broken; check the next assertion"
+        );
+        let after = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+            .load(Ordering::Relaxed);
+
+        // Only assert the counter moved on platforms where the parallel
+        // marker pipeline is the intended path. Elsewhere the routing
+        // correctly steers to libdeflate/zlib-ng and `after == before`.
+        #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+        assert!(
+            after > before,
+            "MARKER_PIPELINE_RUNS did not increment ({before} -> {after}); \
+             routing fell back silently. This is the failure mode that has \
+             caused every prior marker-decoder to be deleted as 'dead code.' \
+             Check that `decompress_single_member`'s parallel gate is \
+             reachable (ISA-L available, num_threads > 1, data > 10 MiB)."
+        );
+        #[cfg(not(all(target_arch = "x86_64", feature = "isal-compression")))]
+        let _ = (before, after); // suppress unused-vars on non-target platforms
+    }
+
+    // =========================================================================
+    // Performance regression guard — the CI gap that masked v0.3.0.
+    //
+    // The single-member parallel path must not be SLOWER than the single-thread
+    // ISA-L baseline on the same input.
+    // =========================================================================
+    #[test]
+    fn test_single_member_parallel_not_slower_than_sequential() {
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "fixture must exceed 10 MiB parallel gate (got {} bytes)",
+            compressed.len()
+        );
+
+        let bench = |threads: usize| -> std::time::Duration {
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..3 {
+                let mut sink = Vec::with_capacity(original.len());
+                let t = std::time::Instant::now();
+                crate::decompress::decompress_single_member(&compressed, &mut sink, threads)
+                    .expect("decompress");
+                let elapsed = t.elapsed();
+                assert_eq!(
+                    sink.len(),
+                    original.len(),
+                    "T={threads} produced wrong byte count"
+                );
+                best = best.min(elapsed);
+            }
+            best
+        };
+
+        let seq = bench(1);
+        let par = bench(4);
+
+        let ratio = par.as_secs_f64() / seq.as_secs_f64().max(1e-9);
+        let seq_mbps = (original.len() as f64) / seq.as_secs_f64() / 1e6;
+        let par_mbps = (original.len() as f64) / par.as_secs_f64() / 1e6;
+        let physical = num_cpus::get_physical();
+        eprintln!(
+            "single-member ({physical} physical cores): \
+             sequential={seq_mbps:.0} MB/s  parallel(T=4)={par_mbps:.0} MB/s  ratio={ratio:.2}"
+        );
+
+        let threshold = if physical >= 4 { 1.5 } else { 3.0 };
+        assert!(
+            ratio < threshold,
+            "parallel single-member must not be > {threshold:.1}× slower than sequential \
+             on {physical}-physical-core hardware: \
+             par={par:?} seq={seq:?} ratio={ratio:.2}"
+        );
+    }
+
+    /// Mixed-entropy data designed to push zlib L1 into emitting many short
+    /// blocks (a mix of BTYPE=00/01/10). Specifically: 70% random bytes
+    /// (uncompressible — short stored or stored-mixed blocks),
+    /// 30% short repeats from a small phrase set (compresses well — short
+    /// dynamic / fixed-Huffman blocks). At L1 with this entropy mix, zlib
+    /// emits many small blocks rather than one giant one; the resulting
+    /// compressed size is large enough (~12 MiB at 24 MiB original) to
+    /// clear the 10 MiB parallel gate.
+    fn make_btype01_heavy_data(size: usize) -> Vec<u8> {
+        let phrases: &[&[u8]] = &[b"abc", b"foo bar ", b"the quick brown ", b"hello ", b"xyz "];
+        let mut data = Vec::with_capacity(size);
+        let mut rng: u64 = 0xb0bd1ec0de;
+        while data.len() < size {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if (rng >> 32) % 100 < 70 {
+                data.push((rng >> 16) as u8);
+            } else {
+                let phrase = phrases[(rng as usize) % phrases.len()];
+                let to_take = phrase.len().min(size - data.len());
+                data.extend_from_slice(&phrase[..to_take]);
+            }
+        }
+        data.truncate(size);
+        data
+    }
+
+    /// gzip-encode at level 1 (fastest / most fixed-Huffman emissions).
+    fn compress_single_member_gzip_l1(data: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(1));
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Second deletion-trap killer: BTYPE=01-heavy data. BlockFinder excludes
+    /// BTYPE=01 candidates; phase 1c's correction sweep handles misaligned starts.
+    #[test]
+    fn test_marker_pipeline_runs_on_btype01_heavy_input() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let original = make_btype01_heavy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip_l1(&original);
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "fixture must exceed 10 MiB parallel gate (got {} bytes)",
+            compressed.len()
+        );
+
+        let before_runs = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+            .load(Ordering::Relaxed);
+        let before_retries =
+            crate::decompress::parallel::single_member::MARKER_PIPELINE_RETRY_ITERATIONS
+                .load(Ordering::Relaxed);
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        assert_eq!(output, original, "byte-perfect output");
+        let after_runs = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+            .load(Ordering::Relaxed);
+        let after_retries =
+            crate::decompress::parallel::single_member::MARKER_PIPELINE_RETRY_ITERATIONS
+                .load(Ordering::Relaxed);
+
+        #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+        {
+            assert!(
+                after_runs > before_runs,
+                "MARKER_PIPELINE_RUNS did not increment ({before_runs} -> {after_runs}) on \
+                 BTYPE=01-heavy fixture — BlockFinder enhancement regressed or \
+                 never landed."
+            );
+            assert!(
+                after_retries > before_retries,
+                "MARKER_PIPELINE_RETRY_ITERATIONS did not increment \
+                 ({before_retries} -> {after_retries}) on BTYPE=01-heavy fixture — \
+                 G5 cross-chunk correction code path is not being exercised."
+            );
+        }
+        #[cfg(not(all(target_arch = "x86_64", feature = "isal-compression")))]
+        let _ = (before_runs, after_runs, before_retries, after_retries);
+    }
+
+    // =========================================================================
+    // Optimization counter assertions — lock in rapidgzip-style optimizations.
+    // =========================================================================
+
+    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    #[test]
+    fn test_isal_handoff_fires_on_every_chunk_healthy_data() {
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+        assert!(compressed.len() > 10 * 1024 * 1024);
+
+        let before = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        let after = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
+        assert_eq!(output, original, "byte-perfect output");
+
+        let delta = after.delta(&before);
+
+        assert!(
+            delta.handoff_fired >= 3,
+            "expected ≥3 of 4 chunks to take the bootstrap→ISA-L handoff path, \
+             got {} — bootstrap may be running for the whole chunk. delta: {delta:?}",
+            delta.handoff_fired
+        );
+        assert_eq!(
+            delta.slow_path_used, 0,
+            "no worker should hit marker_finish_after_bootstrap on healthy data; \
+             {} did. delta: {delta:?}",
+            delta.slow_path_used
+        );
+        assert_eq!(
+            delta.retry_iterations, 0,
+            "phase 1c retry fired {} times on healthy data. delta: {delta:?}",
+            delta.retry_iterations
+        );
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    #[test]
+    fn test_bootstrap_bounded_to_clean_window_size() {
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+
+        let before = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        let after = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
+
+        let delta = after.delta(&before);
+        let bootstrap_kb = delta.bootstrap_output_bytes / 1024;
+        let total_output_kb = (output.len() / 1024) as u64;
+        assert!(
+            delta.bootstrap_output_bytes < 2 * 1024 * 1024,
+            "bootstrap output {bootstrap_kb} KiB exceeds 2 MiB across 4 chunks — \
+             markers are propagating and never clearing the trailing 32 KB. \
+             delta: {delta:?}, output: {total_output_kb} KiB"
+        );
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    #[test]
+    fn test_isal_produces_bulk_of_output() {
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+
+        let before = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        let after = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
+
+        let delta = after.delta(&before);
+        let total_output = output.len() as u64;
+
+        let isal_share = (delta.isal_output_bytes as f64) / (total_output as f64);
+        assert!(
+            isal_share >= 0.85,
+            "ISA-L produced only {:.2}% of output ({} of {} bytes) — \
+             bootstrap is running for too much of each chunk. delta: {delta:?}",
+            isal_share * 100.0,
+            delta.isal_output_bytes,
+            total_output
+        );
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    #[test]
+    fn test_phase1a_validation_count_stays_bounded() {
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+
+        let before = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        let after = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
+
+        let delta = after.delta(&before);
+        assert!(
+            delta.boundary_validations < 1000,
+            "phase 1a issued {} try_decode_at calls across 4 chunks — \
+             expected < 1000 on healthy data. delta: {delta:?}",
+            delta.boundary_validations
+        );
+    }
+
     /// 60% random / 40% short repetition — compresses to ~60% of original.
     /// Sized to clear the 10 MiB parallel-path gate without being huge.
     fn make_low_entropy_data(size: usize) -> Vec<u8> {

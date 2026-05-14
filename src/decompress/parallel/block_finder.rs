@@ -42,8 +42,17 @@ const LUT_SIZE: usize = 1 << LUT_BITS;
 // ============================================================================
 
 /// Check if bits could be a valid deflate block start (stored or dynamic).
-/// Accepts bfinal=0 or bfinal=1. Fixed Huffman (btype=1) is excluded because
-/// there is no header to validate and 50% of random positions would match.
+/// Accepts bfinal=0 or bfinal=1. BTYPE=01 (fixed Huffman) is excluded
+/// because the 3-bit header alone matches ~25% of random positions —
+/// emitting that many candidates pollutes the result list and makes
+/// downstream consumers slow.
+///
+/// BTYPE=01 boundary detection lives instead in
+/// `single_member::search_boundary_forward` as a separate tier that
+/// runs only when the other tiers find nothing. That keeps BlockFinder
+/// fast for the common path (where boundaries are BTYPE=00 / BTYPE=10)
+/// and avoids the candidate explosion observed in
+/// `test_find_blocks_parallel_matches_sequential`.
 #[inline]
 fn is_valid_candidate_13(bits: u32) -> bool {
     let btype = (bits >> 1) & 3;
@@ -56,7 +65,7 @@ fn is_valid_candidate_13(bits: u32) -> bool {
             let hdist = (bits >> 8) & 31;
             hlit <= 29 && hdist <= 29
         }
-        _ => false, // btype=1 (fixed) has no header to validate; btype=3 is reserved
+        _ => false, // btype=1 (fixed) emitted by a separate tier; btype=3 reserved
     }
 }
 
@@ -283,6 +292,197 @@ pub struct BlockBoundary {
 }
 
 // ============================================================================
+// Fixed-Huffman prefilter (BTYPE=01)
+// ============================================================================
+//
+// BlockFinder originally excluded BTYPE=01 candidates entirely on the
+// theory that "fixed Huffman has no header to validate." That left a
+// class of real boundaries invisible to the heuristic — on Silesia at
+// least one chunk's search region had only fixed-Huffman boundaries,
+// and `decompress_parallel` silently fell back to sequential libdeflate
+// (CI bench reported 0.62× rapidgzip; the deletion-trap killer test on
+// the routing test fixture didn't catch this because that fixture has
+// BTYPE=10 boundaries).
+//
+// We can validate BTYPE=01 candidates cheaply by decoding a handful of
+// fixed-Huffman symbols and checking each is well-formed:
+//
+//   - All four symbols decode without falling off the alphabet (no
+//     "code length 0" entry hit).
+//   - No symbol is 286 or 287 (unused per RFC 1951 §3.2.6).
+//   - The first symbol is *not* `END_OF_BLOCK` (256) — a real fixed-
+//     Huffman block produces at least one byte before EOB.
+//   - For length codes (symbols 257..=285), the following distance
+//     code is in 0..=29 (codes 30/31 are reserved).
+//
+// Per-probe cost: 4× 9-bit table lookup + a couple of range checks =
+// well under 100 ns. The table is a single `[u16; 512]` built once.
+
+/// Entry layout: low 9 bits = symbol, top 4 bits = code length (7/8/9).
+/// 0 = invalid (no canonical code matches this 9-bit pattern's prefix).
+type FixedLitlenEntry = u16;
+
+/// 9-bit reverse-bits LUT → (symbol, code_len) for the deflate fixed
+/// Huffman litlen table. Indexed by `peek(9) & 0x1FF` — the LSB-first
+/// bits as they come out of the bit buffer; we encode the bit-reversal
+/// into the table itself.
+fn fixed_litlen_lut() -> &'static [FixedLitlenEntry; 512] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[FixedLitlenEntry; 512]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut table = [0u16; 512];
+        // Per RFC 1951 §3.2.6:
+        //   codes  0..=23  (7 bits) -> symbols 256..=279
+        //   codes 48..=191 (8 bits) -> symbols   0..=143
+        //   codes 192..=199 (8 bits) -> symbols 280..=287
+        //   codes 400..=511 (9 bits) -> symbols 144..=255
+        let mut emit = |code: u32, code_len: u8, sym: u16| {
+            // The stream is LSB-first. Canonical Huffman codes are read
+            // MSB-first into the code value. So we reverse the
+            // `code_len` low bits of `code` to get the bit pattern that
+            // appears in the bit buffer.
+            let reversed = reverse_low_bits(code, code_len);
+            let entry = (sym & 0x1FF) | ((code_len as u16) << 12);
+            let stride = 1u32 << code_len;
+            let mut idx = reversed;
+            while idx < 512 {
+                table[idx as usize] = entry;
+                idx += stride;
+            }
+        };
+        for code in 0..=23 {
+            emit(code, 7, (256 + code) as u16);
+        }
+        for code in 48..=191 {
+            emit(code, 8, (code - 48) as u16);
+        }
+        for code in 192..=199 {
+            emit(code, 8, (280 + (code - 192)) as u16);
+        }
+        for code in 400..=511 {
+            emit(code, 9, (144 + (code - 400)) as u16);
+        }
+        table
+    })
+}
+
+/// 5-bit reverse-bits LUT → distance symbol. Codes 0..=29 are valid;
+/// 30 and 31 are reserved (entry remains 0xFFFF as "invalid").
+fn fixed_dist_lut() -> &'static [u16; 32] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[u16; 32]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut table = [0xFFFFu16; 32];
+        for code in 0u32..=29 {
+            let reversed = reverse_low_bits(code, 5);
+            table[reversed as usize] = code as u16;
+        }
+        table
+    })
+}
+
+#[inline(always)]
+fn reverse_low_bits(mut v: u32, n: u8) -> u32 {
+    let mut r = 0u32;
+    for _ in 0..n {
+        r = (r << 1) | (v & 1);
+        v >>= 1;
+    }
+    r
+}
+
+/// Decode the first two fixed-Huffman symbols at `bit_offset` and accept
+/// the position only if both are well-formed (valid litlen alphabet
+/// entries, not the unused 286/287 codes, first symbol not EOB).
+///
+/// This is the cheap prefilter; the strict check is `validate_boundary`
+/// in `fast_marker_inflate`, run by `try_decode_at` on every accepted
+/// candidate. The job here is to *eliminate most false positives* —
+/// catching all of them is `validate_boundary`'s job. Two symbols is the
+/// sweet spot: enough to reject ~95% of random positions (each random
+/// 9-bit pattern has ~256/512 chance of mapping to a valid symbol; two
+/// in a row is ~25%, and the EOB/unused-symbol checks knock that down
+/// further), without paying for distance-code validation.
+///
+/// Earlier versions decoded 4 symbols and validated distance codes too.
+/// On a 2 MiB random fixture that ran for 3+ minutes — `find_blocks`
+/// invokes the prefilter on every BTYPE=01 candidate (about 1/4 of all
+/// bit positions), so per-probe cost dominates. The 2-symbol prefilter
+/// here runs ~50 ns per call.
+pub(crate) fn validate_fixed_block_prefix(data: &[u8], bit_offset: usize) -> bool {
+    let litlen_lut = fixed_litlen_lut();
+    let mut bit = bit_offset;
+
+    // First symbol: must not be EOB (real fixed-Huffman blocks rarely
+    // emit EOB as their first symbol; rejecting it loses a tiny fraction
+    // of real boundaries and rejects many false positives).
+    let Some(window) = peek_bits_at(data, bit, 9) else {
+        return false;
+    };
+    let entry = litlen_lut[(window & 0x1FF) as usize];
+    let sym = entry & 0x1FF;
+    let code_len = (entry >> 12) & 0xF;
+    if code_len == 0 || sym == 256 || sym >= 286 {
+        return false;
+    }
+    bit += code_len as usize;
+    // For length codes, skip past the bits we know come next so the
+    // second symbol's peek lands on the right bit. We don't validate
+    // those extras / distance codes — that's `validate_boundary`'s job.
+    if sym >= 257 {
+        let lidx = (sym - 257) as usize;
+        const LENGTH_EXTRA_BITS: [u8; 29] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+        ];
+        const DIST_EXTRA_BITS: [u8; 30] = [
+            0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12,
+            12, 13, 13,
+        ];
+        if lidx >= LENGTH_EXTRA_BITS.len() {
+            return false;
+        }
+        bit += LENGTH_EXTRA_BITS[lidx] as usize;
+        // 5-bit distance code; check valid (codes 30/31 are reserved).
+        let Some(dist_window) = peek_bits_at(data, bit, 5) else {
+            return false;
+        };
+        let dist_sym = fixed_dist_lut()[(dist_window & 0x1F) as usize];
+        if dist_sym == 0xFFFF {
+            return false;
+        }
+        bit += 5 + DIST_EXTRA_BITS[dist_sym as usize] as usize;
+    }
+
+    // Second symbol.
+    let Some(window) = peek_bits_at(data, bit, 9) else {
+        return false;
+    };
+    let entry = litlen_lut[(window & 0x1FF) as usize];
+    let sym = entry & 0x1FF;
+    let code_len = (entry >> 12) & 0xF;
+    code_len != 0 && sym < 286
+}
+
+/// Peek `n` bits starting at absolute bit offset `bit` in `data`
+/// (LSB-first within bytes). Returns `None` if the read would overrun
+/// `data`. `n` must be ≤ 16.
+#[inline]
+fn peek_bits_at(data: &[u8], bit: usize, n: u8) -> Option<u32> {
+    debug_assert!(n <= 16);
+    let byte_idx = bit / 8;
+    let bit_in_byte = (bit % 8) as u32;
+    // Need to read up to 3 bytes to get 16+7 = 23 bits' worth.
+    if byte_idx + 2 >= data.len() {
+        // Tail of stream — be conservative and bail.
+        return None;
+    }
+    let combined = (data[byte_idx] as u32)
+        | ((data[byte_idx + 1] as u32) << 8)
+        | ((data[byte_idx + 2] as u32) << 16);
+    Some((combined >> bit_in_byte) & ((1u32 << n) - 1))
+}
+
+// ============================================================================
 // Block Finder
 // ============================================================================
 
@@ -345,8 +545,9 @@ impl<'a> BlockFinder<'a> {
                     bit_offset += 1;
                 }
                 1 => {
-                    // Fixed Huffman has no header to validate — skip.
-                    // (Covered by nearby dynamic/stored block boundaries.)
+                    // Fixed Huffman — not emitted here. BTYPE=01 boundary
+                    // detection lives in `single_member::search_boundary_forward`
+                    // as a separate tier with its own cheap prefilter.
                     reader.skip(1);
                     bit_offset += 1;
                 }
@@ -715,7 +916,10 @@ mod tests {
         // Valid: BTYPE=00 (stored), BFINAL=1
         assert_eq!(lut[0b001], 0);
 
-        // Invalid: BTYPE=01 (fixed) — excluded from candidate search
+        // Invalid: BTYPE=01 (fixed) — excluded from candidate search at
+        // the BlockFinder level. Detection lives in
+        // `single_member::search_boundary_forward` as a dedicated tier
+        // that runs only when the other tiers find nothing.
         assert!(lut[0b010] > 0);
         assert!(lut[0b011] > 0);
 

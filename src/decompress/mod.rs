@@ -209,9 +209,12 @@ pub(crate) fn decompress_single_member<W: Write>(
     writer: &mut W,
     num_threads: usize,
 ) -> GzippyResult<u64> {
-    // Parallel single-member path: speculative block-boundary search + ISA-L
-    // re-decode per confirmed chunk via inflatePrime. x86_64 + ISA-L only.
-    // Arm64: sequential libdeflate (~14,000 MB/s) beats parallel zlib-ng (4 × 600 = 2,400 MB/s).
+    // Parallel single-member path: marker-based design (v0.6). Total compute
+    // work is ~1.1N (phase 1 decode + cheap marker resolve), scaling ~T over
+    // single-thread ISA-L from T=2 upward. The previous v0.5.1 design did 2N
+    // and needed an 8-physical-core floor to win; the marker pipeline has no
+    // such floor. x86_64 + ISA-L only — arm64 has libdeflate at ~14 GB/s in
+    // one-shot mode which the marker pipeline can't outrun.
     const MIN_PARALLEL_COMPRESSED: usize = 10 * 1024 * 1024;
     if crate::backends::isal_decompress::is_available()
         && num_threads > 1
@@ -226,9 +229,40 @@ pub(crate) fn decompress_single_member<W: Write>(
                 writer.flush()?;
                 return Ok(n);
             }
-            Err(_) => {
-                if crate::utils::debug_enabled() {
-                    eprintln!("[gzippy] parallel single-member failed, falling back to sequential");
+            Err(e) => {
+                // **Typed routing fallback** (D5, Opus advisor review). The
+                // generic `Err(_) => fall back silently` was the deletion-
+                // trap pattern: BTYPE=01-heavy regions where boundary search
+                // returns None look identical to "too small to bother" at
+                // this layer, so silent fallback hides real regressions.
+                //
+                // - `TooSmall` is an intended routing signal: the input is
+                //   below the parallel threshold; fall through to sequential
+                //   without complaint.
+                // - Everything else means the parallel pipeline tried and
+                //   failed: increment a counter so the bench harness can
+                //   surface "marker pipeline silently fell back" as a
+                //   distinct failure from "marker pipeline ran but was
+                //   slow" (D1). In debug builds, panic with the specific
+                //   error so failures don't get lost during development.
+                use crate::decompress::parallel::single_member::ParallelError;
+                if !matches!(e, ParallelError::TooSmall) {
+                    crate::decompress::parallel::single_member::MARKER_PIPELINE_BOUNDARY_MISSED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "[gzippy] parallel single-member fell back to sequential: {:?}",
+                        e
+                    );
+                    debug_assert!(
+                        false,
+                        "marker pipeline returned non-routing error {e:?}; routing fell back \
+                         to libdeflate. This indicates either a boundary-search failure \
+                         (e.g. BTYPE=01-heavy region; see premortem F7) or a real decode \
+                         bug. In release builds this falls back silently; in debug builds \
+                         it panics so the cause doesn't get lost."
+                    );
+                } else if crate::utils::debug_enabled() {
+                    eprintln!("[gzippy] parallel single-member declined (input below threshold)");
                 }
             }
         }
