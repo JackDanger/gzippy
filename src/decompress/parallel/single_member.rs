@@ -794,13 +794,25 @@ fn phase1c_resolve_consistency(
         let next_start = start_bits[i + 1];
 
         // The correction step fires when:
-        //   - start_bits[i+1] is None (phase 1a found no candidate; chain-decode), OR
-        //   - start_bits[i+1] is Some but != chunks[i].end_bit (false-positive
-        //     pick; correct to the real boundary).
-        let needs_correction = match next_start {
-            None => true,
-            Some(s) => s != chunk_end_bit,
-        };
+        //   - chunks[i+1] is None (phase 1b worker failed — e.g. the
+        //     bootstrap→ISA-L handoff returned Err for that chunk),
+        //     regardless of whether start_bits[i+1] looked OK; OR
+        //   - start_bits[i+1] is None (phase 1a found no candidate;
+        //     chain-decode from chunks[i].end_bit); OR
+        //   - start_bits[i+1] is Some but != chunks[i].end_bit
+        //     (false-positive pick; correct to the real boundary).
+        //
+        // The first case was the latent bug exposed by PR #97's
+        // handoff path: when start_bits[i+1] coincidentally equaled
+        // chunks[i].end_bit but chunks[i+1] was None (worker
+        // failure), the old logic skipped correction and the next
+        // iteration panicked on `.expect("invariant: chunks[i] is
+        // Some")`. Now any None chunk triggers chain-decode.
+        let needs_correction = chunks[i + 1].is_none()
+            || match next_start {
+                None => true,
+                Some(s) => s != chunk_end_bit,
+            };
 
         if needs_correction {
             if std::time::Instant::now() >= deadline {
