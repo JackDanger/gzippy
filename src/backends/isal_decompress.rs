@@ -450,37 +450,51 @@ pub fn decompress_deflate_from_bit_with_end(
         }
     }
 
-    // Pre-allocate the output buffer at `cap` upfront. Earlier
-    // designs in this PR tried two approaches that both lost
-    // performance:
+    // Pre-allocate the output buffer at `cap` upfront — but use
+    // `with_capacity` + `set_len`, NOT `vec![0u8; cap]`, so the
+    // buffer's bytes are uninitialized rather than zero-filled.
     //
-    //   - Fixed `cap` (vec![0u8; cap] preallocated) silently
-    //     truncated when a chunk exceeded the cap, producing a
-    //     mid-block `end_bit` and breaking phase 1c. Silesia CI
-    //     caught it at 0.55× rapidgzip via a "marker pipeline did
-    //     not run end-to-end" silent fallback.
+    // The earlier designs in this PR both lost performance:
+    //
+    //   - Fixed `cap` via `vec![0u8; cap]` preallocated. On Linux,
+    //     `vec![0u8; N]` uses calloc which mmap's anonymous zero
+    //     pages *lazily* — physical memory is only consumed as
+    //     ISA-L writes. On macOS x86_64, however, calloc eagerly
+    //     touches every page, making a 2 GiB allocation take
+    //     hundreds of ms per worker. Opus advisor review on PR #97
+    //     flagged this as a portability surprise.
     //
     //   - Grow-on-demand (Vec::resize doubling from 1 MiB) called
-    //     `realloc()` 7-8 times for a chunk decoding 100+ MB, with
-    //     each realloc copying the existing bytes to the new
-    //     allocation. The realloc memcpy cost dominated the bench
-    //     (~2.4 s for 503 MB at 4 chunks vs the ~340 ms ISA-L
-    //     should need).
+    //     realloc() 7-8 times for a 100+ MB chunk, each copying
+    //     the existing bytes to the new allocation. The realloc
+    //     memcpy cost dominated the Silesia bench.
     //
-    // The right shape: allocate `cap` once upfront. On Linux, `vec!
-    // [0u8; cap]` uses calloc which mmap's anonymous zero pages
-    // *lazily* — physical memory is only consumed as ISA-L writes.
-    // A 2 GiB virtual allocation per worker costs nothing if the
-    // chunk only decodes 100 MB; only those 100 MB of pages are
-    // ever faulted in. No realloc, no copy, just one mmap and one
-    // free per worker.
+    // Using `Vec::with_capacity(cap)` + `unsafe { set_len(cap) }`
+    // is portable: it allocates without zeroing on either platform.
+    // ISA-L writes to the buffer; we track how many bytes it wrote
+    // via `out_pos` and `truncate(out_pos)` at the end. Bytes past
+    // `out_pos` are never read (Vec<u8>::truncate doesn't drop
+    // u8s, and we never index past `out_pos`). No UB.
     //
     // `max_output` is the cap. A bug-class runaway decode would
     // still hit `out_pos == output.len()` and return None, but the
-    // normal case never grows or copies.
-    const MAX_CAP: usize = 2 * 1024 * 1024 * 1024;
+    // normal case never grows or copies. The 4 GiB MAX is the
+    // theoretical max gzip ISIZE (it's a 32-bit field); we cap a
+    // bit below at 3 GiB to keep `cap as u32` for ISA-L's
+    // avail_out parameter unambiguously valid.
+    const MAX_CAP: usize = 3 * 1024 * 1024 * 1024;
     let cap = max_output.clamp(256 * 1024, MAX_CAP);
-    let mut output = vec![0u8; cap];
+    let mut output: Vec<u8> = Vec::with_capacity(cap);
+    // SAFETY: `cap` was passed to with_capacity, so the allocation
+    // is exactly `cap` bytes. We make `len() == cap` to let ISA-L
+    // write into the full buffer. Bytes at indices ≥ out_pos
+    // remain uninitialized after this function returns — and they
+    // are not read by anyone, because we `truncate(out_pos)` at
+    // the end and Vec<u8>::truncate is a no-op on the dropped
+    // bytes (u8 has no Drop impl).
+    unsafe {
+        output.set_len(cap);
+    }
     let mut out_pos = 0usize;
 
     loop {
