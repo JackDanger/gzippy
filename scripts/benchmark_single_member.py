@@ -316,38 +316,23 @@ def main():
                 "See routing_trace.stderr_head in the JSON output."
             )
 
-    # Two-tier thresholds. See premortem F5 + G6 and Opus advisor PR #97
-    # review: the pure-Rust marker decoder per-thread throughput on
-    # x86_64 CI is ~50 MB/s (vs ISA-L's ~163 MB/s). On a 2-physical-core
-    # runner with 4 logical CPUs, T=4 parallelism cannot compensate for
-    # the per-thread gap, so ratio is structurally bounded ~0.5×.
-    #
-    #   - GOAL (≥4 physical cores): vs rapidgzip ≥ 0.99, vs unpigz ≥ 1.0
-    #     — the universal "fastest gzip" target.
-    #   - SANITY FLOOR (≤4 logical CPUs): vs rapidgzip ≥ 0.50,
-    #     vs unpigz ≥ 0.85 — NOT a goal; just catches v0.3.0-class 1.75×
-    #     algorithmic regressions on small-core hardware where the goal
-    #     is unreachable without SIMD.
-    #
-    # When PR #95's SIMD inner loop lands, delete the sanity floor and
-    # apply the goal universally.
-    is_low_core_floor = (os.cpu_count() or 0) <= 4
-    if is_low_core_floor:
-        rapidgzip_threshold = 0.50  # SANITY FLOOR, not goal
-        unpigz_threshold = 0.85     # SANITY FLOOR, not goal
-        threshold_kind = "sanity floor (≤4 logical CPUs; not the design goal)"
-    else:
-        rapidgzip_threshold = 0.99  # GOAL — universal design target
-        unpigz_threshold = 1.0      # GOAL — universal design target
-        threshold_kind = "goal (≥4 physical cores design target)"
+    # Universal goals — no hardware-class split. The bootstrap→ISA-L
+    # handoff in `decode_chunk_with_handoff` matches rapidgzip's
+    # per-chunk design (`vendor/rapidgzip/.../GzipChunk.hpp:413-657`):
+    # the marker decoder bootstraps ≤32 KB per chunk, then ISA-L
+    # handles the bulk at full single-thread ISA-L speed. There's no
+    # structural per-thread gap to compensate for. If a runner can't
+    # hit these ratios, the implementation has a regression, not the
+    # threshold a hardware excuse.
+    rapidgzip_threshold = 0.99
+    unpigz_threshold = 1.0
     if gzippy and rapidgzip:
         ratio = gzippy["speed_mbps"] / rapidgzip["speed_mbps"]
         if ratio < rapidgzip_threshold:
             passed = False
             reasons.append(
-                f"gzippy {ratio:.2f}x rapidgzip — below {threshold_kind} "
-                f"of ≥{rapidgzip_threshold:.2f} on {os.cpu_count()}-logical-CPU "
-                f"hardware; universal goal is ≥0.99 (needs SIMD inner loop, PR #95)"
+                f"gzippy {ratio:.2f}x rapidgzip — below universal goal "
+                f"of ≥{rapidgzip_threshold:.2f}"
             )
 
     if gzippy and unpigz:
@@ -355,9 +340,8 @@ def main():
         if ratio < unpigz_threshold:
             passed = False
             reasons.append(
-                f"gzippy {ratio:.2f}x unpigz — below {threshold_kind} "
-                f"of ≥{unpigz_threshold:.2f} on {os.cpu_count()}-logical-CPU "
-                f"hardware; universal goal is ≥1.0"
+                f"gzippy {ratio:.2f}x unpigz — below universal goal "
+                f"of ≥{unpigz_threshold:.2f}"
             )
     
     results["passed"] = passed
