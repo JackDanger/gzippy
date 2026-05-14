@@ -460,7 +460,7 @@ pub fn decompress_deflate_from_bit_with_end(
     // runaway-decode bugs and bounds memory), but a legitimate decode
     // that exceeds the per-chunk size hint just allocates more memory
     // instead of corrupting state.
-    const INITIAL_BUF: usize = 1 * 1024 * 1024;
+    const INITIAL_BUF: usize = 1024 * 1024;
     const MAX_CAP: usize = 2 * 1024 * 1024 * 1024;
     let cap = max_output.clamp(256 * 1024, MAX_CAP);
     let initial = cap.min(INITIAL_BUF);
