@@ -473,7 +473,7 @@ pub fn decompress_deflate_from_bit_with_end(
     // Do not raise above u32::MAX without fixing the avail_out cast.
     const MAX_CAP: usize = 3 * 1024 * 1024 * 1024;
     let mut cap = max_output.min(MAX_CAP);
-    let mut output = Vec::with_capacity(cap);
+    let mut output: Vec<u8> = Vec::with_capacity(cap);
     #[allow(clippy::uninit_vec)]
     unsafe {
         output.set_len(cap)
