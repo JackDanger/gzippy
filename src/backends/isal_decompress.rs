@@ -400,6 +400,9 @@ pub fn decompress_deflate_from_bit(
 ///
 /// Tip: pass `data` as `&full_data[..until_byte]` to limit ISA-L's input consumption.
 /// The end_bit is still in `full_data` coordinates since both slices share the same layout.
+///
+/// `crc` is updated incrementally as each write lands — callers get the CRC for free
+/// while the data is still L1/L2-hot, eliminating a separate cold-memory CRC pass.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 #[allow(dead_code)]
 pub fn decompress_deflate_from_bit_with_end(
@@ -407,6 +410,7 @@ pub fn decompress_deflate_from_bit_with_end(
     bit_offset: usize,
     dict: &[u8],
     max_output: usize,
+    crc: &mut crc32fast::Hasher,
 ) -> Option<(Vec<u8>, usize)> {
     use isal::isal_sys::igzip_lib as isal_raw;
 
@@ -555,6 +559,11 @@ pub fn decompress_deflate_from_bit_with_end(
 
         let ret = unsafe { isal_raw::isal_inflate(&mut state) };
         let written = remaining - state.avail_out as usize;
+        if written > 0 {
+            // CRC while bytes are still L1/L2-hot — eliminates a separate
+            // cold-memory walk over the full output after ISA-L returns.
+            crc.update(&output[out_pos..out_pos + written]);
+        }
         out_pos += written;
 
         if ret != 0 {
@@ -1032,6 +1041,46 @@ mod tests {
             bit_offset % 8 != 0,
             "confirmed boundary must be non-byte-aligned: bit={}",
             bit_offset
+        );
+    }
+
+    /// Verify that the CRC accumulated inside the ISA-L loop equals the CRC
+    /// computed in a separate pass over the returned bytes. This guards the
+    /// "CRC-while-hot" invariant: if the inline update missed any written
+    /// bytes (off-by-one in the slice window, wrong iteration count, etc.),
+    /// the two CRCs diverge and the test catches it before it silently
+    /// produces a wrong combined-CRC in phase 2.
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_inline_crc_matches_postprocess() {
+        use super::*;
+        use std::io::Write;
+
+        let original: Vec<u8> = (0u8..=255).cycle().take(200_000).collect();
+
+        // Produce a raw DEFLATE stream (no gzip wrapper) via flate2.
+        let mut deflate_enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        deflate_enc.write_all(&original).unwrap();
+        let deflated = deflate_enc.finish().unwrap();
+
+        let mut inline_crc = crc32fast::Hasher::new();
+        let (output, _end_bit) = decompress_deflate_from_bit_with_end(
+            &deflated,
+            0,
+            &[],
+            original.len() * 2,
+            &mut inline_crc,
+        )
+        .expect("ISA-L decode must succeed on valid DEFLATE");
+
+        assert_eq!(output, original, "decoded bytes must match original");
+
+        let postprocess_crc = crc32fast::hash(&output);
+        assert_eq!(
+            inline_crc.finalize(),
+            postprocess_crc,
+            "inline CRC must equal post-process CRC over the same bytes"
         );
     }
 }

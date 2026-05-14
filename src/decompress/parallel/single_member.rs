@@ -813,25 +813,20 @@ fn decode_chunk_with_handoff(
         let max_output = per_chunk_output_hint.saturating_mul(2);
         let _ = num_chunks_total; // retained in signature for fallback path below
 
+        // CRC is computed inside the ISA-L loop as each write lands
+        // (data is still L1/L2-hot). This replaces the earlier post-decode
+        // cold-memory walk over the full isal_bytes Vec.
+        let mut isal_crc = crc32fast::Hasher::new();
         match crate::backends::isal_decompress::decompress_deflate_from_bit_with_end(
             input,
             bootstrap_end_bit,
             &dict,
             max_output,
+            &mut isal_crc,
         ) {
             Some((isal_bytes, isal_end_bit)) => {
                 HANDOFF_FIRED.fetch_add(1, Ordering::Relaxed);
                 ISAL_OUTPUT_BYTES.fetch_add(isal_bytes.len() as u64, Ordering::Relaxed);
-                // Compute the CRC32 of this chunk's ISA-L bytes IN
-                // THIS WORKER. Phase 2 will combine per-chunk CRCs
-                // via crc32fast::Hasher::combine instead of walking
-                // all 100+ MB of output sequentially. With 4 workers
-                // on 2 cores at ~5 GB/s CRC, this adds ~12-25 ms per
-                // worker (parallel) but removes ~100 ms of
-                // sequential CRC from phase 2. Net wall savings:
-                // ~75-100 ms on Silesia at T=4.
-                let mut isal_crc = crc32fast::Hasher::new();
-                isal_crc.update(&isal_bytes);
                 Ok(ChunkResult {
                     bootstrap: bootstrap_markers,
                     isal_bytes,
