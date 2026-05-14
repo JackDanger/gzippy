@@ -584,6 +584,7 @@ fn phase1_marker_decode_parallel_with_optional_starts(
                     start_bit,
                     end_limit,
                     per_chunk_output_hint,
+                    num_chunks,
                 ) {
                     *results[idx].lock().unwrap() = Some(chunk);
                 }
@@ -609,6 +610,7 @@ fn decode_chunk_with_handoff(
     start_bit: usize,
     end_bit_limit: Option<usize>,
     per_chunk_output_hint: usize,
+    num_chunks_total: usize,
 ) -> std::io::Result<ChunkResult> {
     // Phase 1 of the worker: bootstrap. Decode the chunk's first ~32 KB
     // with the marker decoder until the trailing 32 KB of output is
@@ -652,11 +654,21 @@ fn decode_chunk_with_handoff(
         };
         let input = &deflate_data[..end_byte];
 
-        // Output cap: per-chunk expected size + 50% headroom. The hint
-        // comes from the caller (ISIZE / num_chunks); the last chunk
-        // may legitimately decode more than the average so the
-        // headroom matters.
-        let max_output = per_chunk_output_hint.saturating_mul(3) / 2;
+        // Output cap: the whole-stream ISIZE (`per_chunk_output_hint *
+        // num_chunks` recovered from the routing path). A chunk can
+        // legitimately decode anywhere from 0 bytes (BTYPE=00 stored)
+        // up to the entire stream's remaining ISIZE — for Silesia at
+        // T=4, individual chunks decoded ~120 MB on average but some
+        // ranges compress 5-10× more than others. The earlier
+        // `hint * 3 / 2` cap silently truncated those chunks, the
+        // wrapper returned a mid-block end_bit, and phase 1c could
+        // not correct because the marker decoder can't bootstrap
+        // mid-block. CI saw it as a silent fallback to libdeflate
+        // at 0.55× rapidgzip. The new grow-on-demand wrapper
+        // (`backends::isal_decompress`) makes this cap a true upper
+        // bound, not the initial allocation — passing ISIZE doesn't
+        // cost 481 MB of preallocation per worker.
+        let max_output = per_chunk_output_hint.saturating_mul(num_chunks_total);
 
         match crate::backends::isal_decompress::decompress_deflate_from_bit_with_end(
             input,
@@ -689,7 +701,7 @@ fn decode_chunk_with_handoff(
     // unreachable in production but is kept for build correctness.
     #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
     {
-        let _ = (dict, per_chunk_output_hint);
+        let _ = (dict, per_chunk_output_hint, num_chunks_total);
         marker_finish_after_bootstrap(
             deflate_data,
             bootstrap_markers,
@@ -861,6 +873,7 @@ fn phase1c_resolve_consistency(
                 chunk_end_bit,
                 new_end_limit,
                 per_chunk_output_hint,
+                num_chunks,
             ) {
                 Ok(result) => chunks[i + 1] = Some(result),
                 Err(_) => {

@@ -444,17 +444,44 @@ pub fn decompress_deflate_from_bit_with_end(
         }
     }
 
-    const MAX_CAP: usize = 512 * 1024 * 1024;
+    // Grow-on-demand output buffer. The earlier fixed-cap design
+    // (`vec![0u8; cap]` preallocated at line 449) silently truncated
+    // when the actual decoded size exceeded `cap`, producing
+    // `Some((truncated, mid_block_end_bit))` — the parallel single-
+    // member worker would then report a chunk's `end_bit` mid-block,
+    // phase 1c couldn't correct, and routing fell back silently to
+    // libdeflate. The Silesia x86_64 Tmax CI bench caught this as
+    // a 0.55× rapidgzip ratio with "marker pipeline did not run
+    // end-to-end" in the routing trace.
+    //
+    // `max_output` is now the *cap*, not the allocation size: the
+    // buffer starts at `max_output.min(initial_chunk)` and doubles on
+    // demand up to `max_output`. The cap is still enforced (catches
+    // runaway-decode bugs and bounds memory), but a legitimate decode
+    // that exceeds the per-chunk size hint just allocates more memory
+    // instead of corrupting state.
+    const INITIAL_BUF: usize = 1 * 1024 * 1024;
+    const MAX_CAP: usize = 2 * 1024 * 1024 * 1024;
     let cap = max_output.clamp(256 * 1024, MAX_CAP);
-    let mut output = vec![0u8; cap];
+    let initial = cap.min(INITIAL_BUF);
+    let mut output = vec![0u8; initial];
     let mut out_pos = 0usize;
 
     loop {
-        let remaining = cap - out_pos;
-        if remaining == 0 {
-            break;
+        if out_pos == output.len() {
+            if output.len() >= cap {
+                // True cap reached — bail rather than allocate more.
+                // This means the caller's cap was wrong; surface it
+                // as a decode failure rather than a silent truncate.
+                return None;
+            }
+            // Double the buffer (bounded by cap). Resize zeroes the
+            // new bytes — ISA-L requires initialized output buffers.
+            let new_len = (output.len().saturating_mul(2)).min(cap);
+            output.resize(new_len, 0);
         }
 
+        let remaining = output.len() - out_pos;
         state.avail_out = remaining as u32;
         state.next_out = unsafe { output.as_mut_ptr().add(out_pos) };
 
@@ -487,6 +514,16 @@ pub fn decompress_deflate_from_bit_with_end(
     //   Bits remaining     = final_avail_in * 8 + final_read_in_length
     //   Bits consumed      = available - remaining
     //   end_bit            = start_bit + bits_consumed = data.len()*8 - final_avail_in*8 - final_read_in_length
+    //
+    // CRITICAL invariant (Opus advisor on PR #97): this formula
+    // assumes the *stateful* `isal_inflate` was called, not
+    // `isal_inflate_stateless`. The stateful entry's
+    // `read_header_stateful` rolls back `read_in_length` to its
+    // pre-attempt value on END_INPUT, so when ISA-L stalls mid-next-
+    // header at a chunk boundary the reported end_bit lands precisely
+    // at the last completed block boundary. Switching to
+    // `isal_inflate_stateless` silently breaks non-byte-aligned end
+    // points. Do not refactor without preserving stateful semantics.
     let end_bit =
         data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
 
