@@ -48,11 +48,9 @@ pub fn decompress_deflate_from_bit_with_end(
     max_output: usize,
 ) -> Option<(Vec<u8>, usize)> {
     let mut crc = crc32fast::Hasher::new();
-    let (segs, end_bit) = crate::backends::isal_decompress::decompress_deflate_from_bit_with_end(
+    crate::backends::isal_decompress::decompress_deflate_from_bit_with_end(
         data, bit_offset, dict, max_output, &mut crc,
-    )?;
-    let flat: Vec<u8> = segs.into_iter().flatten().collect();
-    Some((flat, end_bit))
+    )
 }
 
 // ── zlib-ng path (all platforms, primary on arm64) ───────────────────────────

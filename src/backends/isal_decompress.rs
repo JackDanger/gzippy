@@ -392,21 +392,6 @@ pub fn decompress_deflate_from_bit(
 
 /// Allocate an uninitialised `Vec<u8>` of exactly `size` bytes.
 ///
-/// Using `with_capacity` + `set_len` avoids both zero-filling (which on
-/// macOS eagerly touches every page via calloc) and realloc-memcpy chains.
-/// ISA-L writes into the returned buffer via raw pointer; we track written
-/// bytes separately and truncate before handing the segment to the caller.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-#[inline]
-fn alloc_segment(size: usize) -> Vec<u8> {
-    let mut v = Vec::with_capacity(size);
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        v.set_len(size)
-    };
-    v
-}
-
 /// Same as `decompress_deflate_from_bit` but also returns the end bit position.
 ///
 /// The end bit is derived from ISA-L's post-decode state:
@@ -418,18 +403,19 @@ fn alloc_segment(size: usize) -> Vec<u8> {
 /// Tip: pass `data` as `&full_data[..until_byte]` to limit ISA-L's input consumption.
 /// The end_bit is still in `full_data` coordinates since both slices share the same layout.
 ///
-/// `crc` is updated incrementally as each write lands — callers get the CRC for free
-/// while the data is still L1/L2-hot, eliminating a separate cold-memory CRC pass.
+/// `crc` is updated over the decoded output before returning.
 ///
-/// Output is returned as a `Vec<Vec<u8>>` of 128 KiB segments rather than a single
-/// contiguous allocation. Each segment is allocated and filled before the next is
-/// started, so:
-///   - No large virtual mapping that causes a first-touch page-fault storm on the CI
-///     runner (the earlier 100 MB per-chunk Vec caused 400 MB VA × 4 workers on
-///     Silesia at T=4, serialising through `mmap_lock`).
-///   - Each 128 KiB write is CRC'd while still in L2, composing with the inline-CRC
-///     change above.
-///   - No realloc-memcpy: segments are pushed directly into the result Vec.
+/// Output is returned as a single `Vec<u8>` allocated with `with_capacity + set_len`
+/// (no zero-fill). One VMA per chunk: eliminates the ~1300 mmap/munmap calls that
+/// the 128 KiB segment approach caused (128 KiB == Linux glibc's M_MMAP_THRESHOLD,
+/// so every alloc_segment call went through mmap, and ~3900 concurrent mmap/munmap
+/// pairs serialised through the per-mm mmap_lock, inflating decode from ~83 ms to
+/// ~1374 ms on Silesia at T=4).
+///
+/// CRITICAL invariant: uses stateful `isal_inflate`, not `isal_inflate_stateless`.
+/// The stateful entry rolls back `read_in_length` on END_INPUT so that the reported
+/// end_bit lands precisely at the last completed block boundary. Do not refactor to
+/// the stateless entry without preserving this semantics.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 #[allow(dead_code)]
 pub fn decompress_deflate_from_bit_with_end(
@@ -438,7 +424,7 @@ pub fn decompress_deflate_from_bit_with_end(
     dict: &[u8],
     max_output: usize,
     crc: &mut crc32fast::Hasher,
-) -> Option<(Vec<Vec<u8>>, usize)> {
+) -> Option<(Vec<u8>, usize)> {
     use isal::isal_sys::igzip_lib as isal_raw;
 
     let byte_idx = bit_offset / 8;
@@ -481,90 +467,57 @@ pub fn decompress_deflate_from_bit_with_end(
         }
     }
 
-    // Pre-allocate the output buffer at `cap` upfront — but use
-    // `with_capacity` + `set_len`, NOT `vec![0u8; cap]`, so the
-    // buffer's bytes are uninitialized rather than zero-filled.
-    //
-    // The earlier designs in this PR both lost performance:
-    //
-    //   - Fixed `cap` via `vec![0u8; cap]` preallocated. On Linux,
-    //     `vec![0u8; N]` uses calloc which mmap's anonymous zero
-    //     pages *lazily* — physical memory is only consumed as
-    //     ISA-L writes. On macOS x86_64, however, calloc eagerly
-    //     touches every page, making a 2 GiB allocation take
-    //     hundreds of ms per worker. Opus advisor review on PR #97
-    //     flagged this as a portability surprise.
-    //
-    //   - Grow-on-demand (Vec::resize doubling from 1 MiB) called
-    //     realloc() 7-8 times for a 100+ MB chunk, each copying
-    //     the existing bytes to the new allocation. The realloc
-    //     memcpy cost dominated the Silesia bench.
-    //
-    // Using `Vec::with_capacity(cap)` + `unsafe { set_len(cap) }`
-    // is portable: it allocates without zeroing on either platform.
-    // ISA-L writes to the buffer; we track how many bytes it wrote
-    // via `out_pos` and `truncate(out_pos)` at the end. Bytes past
-    // `out_pos` are never read (Vec<u8>::truncate doesn't drop
-    // u8s, and we never index past `out_pos`). No UB.
-    //
-    // `max_output` is the cap. A bug-class runaway decode would
-    // still hit `out_pos == output.len()` and return None, but the
-    // normal case never grows or copies. The 4 GiB MAX is the
-    // theoretical max gzip ISIZE (it's a 32-bit field); we cap a
-    // bit below at 3 GiB to keep `cap as u32` for ISA-L's
-    // avail_out parameter unambiguously valid.
-    // Initial allocation = max_output (~2× the chunk's average
-    // decoded size). For typical chunks this is enough on the first
-    // pass and ISA-L never sees `avail_out == 0`. For outlier chunks
-    // (high compression ratio variance, e.g., Silesia chunks ranging
-    // 80-300 MB at T=4), the grow-on-demand path below doubles the
-    // buffer up to MAX_CAP. The realloc-copy cost only fires for
-    // chunks that genuinely need it; the common case stays one
-    // allocation.
-    //
-    // The earlier-iteration "allocate ISIZE upfront" approach
-    // caused 4 × 500 MB = 2 GiB virtual on Silesia at T=4, and
-    // every 4 KiB page minor-faulted on first ISA-L write — those
-    // faults serialize through `mmap_lock` on Linux, which is fine
-    // on a quiet runner but blows up the timing variance on a
-    // noisy CI runner (CV 14.94% vs rapidgzip's 1.72% on the same
-    // Silesia bench). Opus advisor flagged this as the dominant
-    // variance source for the run that dropped from 0.998× to
-    // 0.91× rapidgzip.
-    // 128 KiB segments: each allocation is small enough to be L2-resident
-    // when ISA-L writes into it, so the CRC update (below) runs on hot data.
-    // No single large VA mapping → no first-touch page-fault storm.
-    const SEGMENT_SIZE: usize = 128 * 1024;
-    let mut segments: Vec<Vec<u8>> = Vec::new();
-    let mut total_output: usize = 0;
-
-    // Allocate the first segment.
-    let mut seg = alloc_segment(SEGMENT_SIZE);
-    let mut seg_pos: usize = 0;
+    // Single uninit allocation sized to max_output. `with_capacity + set_len`
+    // avoids zero-filling (calloc on macOS eagerly touches every page; on Linux
+    // pages are lazily faulted as ISA-L writes, but with one VMA instead of
+    // ~1300, the kernel doesn't have to acquire mmap_lock for each one).
+    // MAX_CAP = 3 GiB keeps `remaining as u32` valid for ISA-L's avail_out.
+    // Do not raise above u32::MAX without fixing the avail_out cast.
+    const MAX_CAP: usize = 3 * 1024 * 1024 * 1024;
+    let mut cap = max_output.min(MAX_CAP);
+    let mut output = Vec::with_capacity(cap);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(cap)
+    };
+    let mut out_pos: usize = 0;
 
     loop {
-        if seg_pos == SEGMENT_SIZE {
-            // Segment full: CRC while hot, save it, start a new one.
-            crc.update(&seg);
-            segments.push(seg);
-            total_output += SEGMENT_SIZE;
-            if total_output >= max_output {
+        let remaining = cap - out_pos;
+        if remaining == 0 {
+            // Buffer full: try to grow (handles chunks that decompress to
+            // more than 2× the per-chunk hint — e.g., a highly compressible
+            // chunk in a Silesia-class file with uneven per-member ratios).
+            let new_cap = (cap * 2).min(MAX_CAP);
+            if new_cap <= cap {
+                // Already at MAX_CAP; fall back to marker decoder.
                 return None;
             }
-            seg = alloc_segment(SEGMENT_SIZE);
-            seg_pos = 0;
+            // set_len to out_pos so reserve_exact sees the "used" prefix,
+            // then extend uninit tail to new_cap.
+            unsafe { output.set_len(out_pos) };
+            output.reserve_exact(new_cap - cap);
+            #[allow(clippy::uninit_vec)]
+            unsafe {
+                output.set_len(new_cap)
+            };
+            cap = new_cap;
+            continue;
         }
-
-        let remaining = SEGMENT_SIZE - seg_pos;
         state.avail_out = remaining as u32;
-        state.next_out = unsafe { seg.as_mut_ptr().add(seg_pos) };
+        state.next_out = unsafe { output.as_mut_ptr().add(out_pos) };
 
         let ret = unsafe { isal_raw::isal_inflate(&mut state) };
         let written = remaining - state.avail_out as usize;
-        seg_pos += written;
+
+        // CRC while hot: data just written by ISA-L is still in L1/L2 cache.
+        if written > 0 {
+            crc.update(&output[out_pos..out_pos + written]);
+        }
+        out_pos += written;
 
         if ret != 0 {
-            if total_output == 0 && seg_pos == 0 {
+            if out_pos == 0 {
                 return None;
             }
             break;
@@ -578,38 +531,18 @@ pub fn decompress_deflate_from_bit_with_end(
         }
     }
 
-    if total_output == 0 && seg_pos == 0 {
+    if out_pos == 0 {
         return None;
     }
 
-    // Finalize the last (partial) segment.
-    unsafe { seg.set_len(seg_pos) };
-    if seg_pos > 0 {
-        crc.update(&seg);
-    }
-    segments.push(seg);
-    total_output += seg_pos;
+    output.truncate(out_pos);
 
-    // end_bit formula (valid for both bit_skip=0 and bit_skip>0):
-    //   All bits available = pre_loaded + avail_in_bytes * 8
-    //   Bits remaining     = final_avail_in * 8 + final_read_in_length
-    //   Bits consumed      = available - remaining
-    //   end_bit            = start_bit + bits_consumed = data.len()*8 - final_avail_in*8 - final_read_in_length
-    //
-    // CRITICAL invariant (Opus advisor on PR #97): this formula
-    // assumes the *stateful* `isal_inflate` was called, not
-    // `isal_inflate_stateless`. The stateful entry's
-    // `read_header_stateful` rolls back `read_in_length` to its
-    // pre-attempt value on END_INPUT, so when ISA-L stalls mid-next-
-    // header at a chunk boundary the reported end_bit lands precisely
-    // at the last completed block boundary. Switching to
-    // `isal_inflate_stateless` silently breaks non-byte-aligned end
-    // points. Do not refactor without preserving stateful semantics.
+    // end_bit = data.len()*8 - avail_in*8 - read_in_length
+    // (see function doc for derivation; stateful isal_inflate invariant).
     let end_bit =
         data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
 
-    let _ = total_output; // tracked during loop; segments carry the truth
-    Some((segments, end_bit))
+    Some((output, end_bit))
 }
 
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
@@ -619,6 +552,7 @@ pub fn decompress_deflate_from_bit_with_end(
     _bit_offset: usize,
     _dict: &[u8],
     _max_output: usize,
+    _crc: &mut crc32fast::Hasher,
 ) -> Option<(Vec<u8>, usize)> {
     None
 }
@@ -1079,10 +1013,9 @@ mod tests {
         )
         .expect("ISA-L decode must succeed on valid DEFLATE");
 
-        let output: Vec<u8> = segments.into_iter().flatten().collect();
-        assert_eq!(output, original, "decoded bytes must match original");
+        assert_eq!(segments, original, "decoded bytes must match original");
 
-        let postprocess_crc = crc32fast::hash(&output);
+        let postprocess_crc = crc32fast::hash(&segments);
         assert_eq!(
             inline_crc.finalize(),
             postprocess_crc,

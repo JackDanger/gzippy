@@ -420,9 +420,7 @@ pub fn decompress_parallel<W: Write>(
     // per-chunk writes aren't fragmented into tiny syscalls.
     for chunk in &resolved_chunks {
         writer.write_all(&chunk.bootstrap_u8)?;
-        for seg in &chunk.isal_bytes {
-            writer.write_all(seg)?;
-        }
+        writer.write_all(&chunk.isal_bytes)?;
     }
     MARKER_PIPELINE_RUNS.fetch_add(1, Ordering::Relaxed);
 
@@ -625,8 +623,7 @@ fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
 /// not entered (last chunk with no clean tail or chunk-too-small fallback).
 ///
 /// `isal_bytes`: real bytes produced by ISA-L after the bootstrap handed
-/// off, stored as 128 KiB segments (see `alloc_segment` in
-/// `isal_decompress.rs`). Empty Vec when no handoff occurred (chunk
+/// off. Single contiguous Vec. Empty when no handoff occurred (chunk
 /// decoded entirely by the marker decoder).
 ///
 /// `end_bit_offset`: bit position just past the chunk's last decoded
@@ -644,25 +641,21 @@ fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
 /// no matter how good the parallel orchestration is.
 struct ChunkResult {
     bootstrap: Vec<u16>,
-    /// 128 KiB segments from the ISA-L bulk decode. Segmented to avoid
-    /// a single large VA mapping that causes a first-touch page-fault
-    /// storm on CI (the earlier monolithic Vec caused 400 MB VA × 4
-    /// workers on Silesia at T=4, serialising through `mmap_lock` and
-    /// blowing up timing variance — Opus advisor review on PR #97).
-    isal_bytes: Vec<Vec<u8>>,
-    /// Precomputed CRC32 of `isal_bytes` segments, computed inline
-    /// inside the ISA-L loop (see `decompress_deflate_from_bit_with_end`).
-    /// Combined via `crc32fast::Hasher::combine` in phase 2. Sequential
-    /// CRC work drops from ~100 ms to ~1-2 ms on Silesia at T=4.
+    /// Bulk decoded bytes from ISA-L. Single contiguous allocation; no
+    /// segmentation — the earlier 128 KiB segment design caused ~3900
+    /// mmap/munmap pairs (segment size == M_MMAP_THRESHOLD) serialising
+    /// through mmap_lock at T=4.
+    isal_bytes: Vec<u8>,
+    /// Precomputed CRC32 of `isal_bytes`, computed inline inside ISA-L
+    /// (data is L1/L2-hot). Combined via `crc32fast::Hasher::combine`
+    /// in phase 2; sequential CRC work drops from ~100 ms to ~1-2 ms.
     isal_crc: crc32fast::Hasher,
     end_bit_offset: usize,
 }
 
 impl ChunkResult {
-    /// Total decoded byte count for this chunk (bootstrap u8 equivalent
-    /// + ISA-L segment bytes). Used by phase 2 to pre-size the output buffer.
     fn decoded_len(&self) -> usize {
-        self.bootstrap.len() + self.isal_bytes.iter().map(|s| s.len()).sum::<usize>()
+        self.bootstrap.len() + self.isal_bytes.len()
     }
 }
 
@@ -825,13 +818,12 @@ fn decode_chunk_with_handoff(
             max_output,
             &mut isal_crc,
         ) {
-            Some((isal_segs, isal_end_bit)) => {
+            Some((isal_bytes, isal_end_bit)) => {
                 HANDOFF_FIRED.fetch_add(1, Ordering::Relaxed);
-                let seg_total: usize = isal_segs.iter().map(|s| s.len()).sum();
-                ISAL_OUTPUT_BYTES.fetch_add(seg_total as u64, Ordering::Relaxed);
+                ISAL_OUTPUT_BYTES.fetch_add(isal_bytes.len() as u64, Ordering::Relaxed);
                 Ok(ChunkResult {
                     bootstrap: bootstrap_markers,
-                    isal_bytes: isal_segs,
+                    isal_bytes,
                     isal_crc,
                     end_bit_offset: isal_end_bit,
                 })
@@ -1105,19 +1097,15 @@ fn phase1c_resolve_consistency(
 
 // ── Phase 2: sequential marker resolve + CRC + size ──────────────────────────
 
-/// Per-chunk output after marker resolution: bootstrap u8 (small,
-/// typically 32-512 KB) + isal segments (bulk, 100+ MB split into
-/// 128 KiB pieces). Replaces the single 503 MB `assembled: Vec<u8>`
-/// the previous phase 2 built via extend_from_slice — the earlier
-/// shape forced a ~50 ms memcpy on Silesia at T=4.
+/// Per-chunk output after marker resolution: bootstrap u8 + ISA-L bytes.
 pub(crate) struct ResolvedChunk {
     pub(crate) bootstrap_u8: Vec<u8>,
-    pub(crate) isal_bytes: Vec<Vec<u8>>,
+    pub(crate) isal_bytes: Vec<u8>,
 }
 
 impl ResolvedChunk {
     pub(crate) fn len(&self) -> usize {
-        self.bootstrap_u8.len() + self.isal_bytes.iter().map(|s| s.len()).sum::<usize>()
+        self.bootstrap_u8.len() + self.isal_bytes.len()
     }
 }
 
@@ -1166,13 +1154,9 @@ fn phase2_resolve_and_combine_crcs(
         total_crc.combine(&bootstrap_crc);
         total_crc.combine(&chunk.isal_crc);
 
-        // Update window from the last 32 KB of this chunk's
-        // (bootstrap_u8 ++ isal_bytes) without materializing the
-        // concatenation. Direct unit tests for the four cases of this
-        // function live in `tests` at the bottom of this file.
         update_window_from_chunk(&mut window, &bootstrap_u8, &chunk.isal_bytes);
 
-        total_size += bootstrap_u8.len() + chunk.isal_bytes.iter().map(|s| s.len()).sum::<usize>();
+        total_size += bootstrap_u8.len() + chunk.isal_bytes.len();
         resolved.push(ResolvedChunk {
             bootstrap_u8,
             isal_bytes: chunk.isal_bytes,
@@ -1184,66 +1168,34 @@ fn phase2_resolve_and_combine_crcs(
 
 /// Maintain a rolling 32 KB window of "last decoded bytes" for the
 /// next chunk's marker resolution. Slides this chunk's
-/// (bootstrap_u8 ++ isal_segments) into the window without materializing
-/// the full concatenation. See unit tests at the bottom of this file.
-///
-/// `isal_segments` is the segment list from `decompress_deflate_from_bit_with_end`.
-/// Since each full segment is 128 KiB ≥ WINDOW_SIZE (32 KiB), the common
-/// case where isal_total ≥ WINDOW_SIZE needs at most two segments to
-/// assemble the window tail.
+/// (bootstrap_u8 ++ isal_bytes) into the window. See unit tests at
+/// the bottom of this file.
 pub(crate) fn update_window_from_chunk(
     window: &mut Vec<u8>,
     bootstrap_u8: &[u8],
-    isal_segments: &[Vec<u8>],
+    isal_bytes: &[u8],
 ) {
-    let isal_total: usize = isal_segments.iter().map(|s| s.len()).sum();
-    let total = bootstrap_u8.len() + isal_total;
+    let total = bootstrap_u8.len() + isal_bytes.len();
 
-    if isal_total >= WINDOW_SIZE {
-        // Common case: ISA-L bytes alone cover the whole window.
-        // Since SEGMENT_SIZE (128 KiB) > WINDOW_SIZE (32 KiB), the
-        // last segment is always ≥ WINDOW_SIZE unless it's the partial
-        // final segment of a very small ISA-L output. At most two
-        // segments are needed.
+    if isal_bytes.len() >= WINDOW_SIZE {
         window.clear();
-        let last = isal_segments.last().unwrap();
-        if last.len() >= WINDOW_SIZE {
-            window.extend_from_slice(&last[last.len() - WINDOW_SIZE..]);
-        } else {
-            // Partial last segment: borrow the tail of the penultimate.
-            let need_from_prev = WINDOW_SIZE - last.len();
-            if let Some(prev) = isal_segments.get(isal_segments.len().wrapping_sub(2)) {
-                let start = prev.len().saturating_sub(need_from_prev);
-                window.extend_from_slice(&prev[start..]);
-            }
-            window.extend_from_slice(last);
-        }
+        window.extend_from_slice(&isal_bytes[isal_bytes.len() - WINDOW_SIZE..]);
     } else if total >= WINDOW_SIZE {
-        // Straddle: bootstrap_u8 + isal_total covers ≥ 32 KB.
-        let isal_needed = isal_total;
-        let bootstrap_tail_len = WINDOW_SIZE - isal_needed;
+        let bootstrap_tail_len = WINDOW_SIZE - isal_bytes.len();
         let bootstrap_tail_start = bootstrap_u8.len() - bootstrap_tail_len;
         window.clear();
         window.extend_from_slice(&bootstrap_u8[bootstrap_tail_start..]);
-        for seg in isal_segments {
-            window.extend_from_slice(seg);
-        }
+        window.extend_from_slice(isal_bytes);
     } else if total == 0 {
-        // Empty chunk (phase 1c marked it empty near EOF). Keep the
-        // previous window unchanged — next chunk inherits whatever
-        // the predecessor had.
+        // Empty chunk near EOF — keep previous window unchanged.
     } else {
-        // Chunk smaller than window. Slide: keep the prev window's
-        // last (WINDOW_SIZE - total) bytes, append this chunk's bytes.
         let keep_from_prev = WINDOW_SIZE.saturating_sub(total);
         if window.len() > keep_from_prev {
             let drop = window.len() - keep_from_prev;
             window.drain(..drop);
         }
         window.extend_from_slice(bootstrap_u8);
-        for seg in isal_segments {
-            window.extend_from_slice(seg);
-        }
+        window.extend_from_slice(isal_bytes);
     }
 }
 
@@ -1344,33 +1296,26 @@ mod tests {
 
     #[test]
     fn update_window_isal_geq_window_takes_isal_tail() {
-        // Common case: ISA-L bytes alone ≥ WINDOW_SIZE.
         let mut window = vec![0u8; 0];
         let bootstrap = vec![0xAA; 100];
         let mut isal = vec![0xBB; WINDOW_SIZE + 1000];
         for (i, b) in isal.iter_mut().enumerate() {
             *b = (i % 256) as u8;
         }
-        let isal_segs = vec![isal.clone()];
-        update_window_from_chunk(&mut window, &bootstrap, &isal_segs);
+        update_window_from_chunk(&mut window, &bootstrap, &isal);
         assert_eq!(window.len(), WINDOW_SIZE);
-        // Window is the last WINDOW_SIZE bytes of isal.
         assert_eq!(window, &isal[isal.len() - WINDOW_SIZE..]);
     }
 
     #[test]
     fn update_window_straddle_takes_bootstrap_tail_plus_isal() {
-        // bootstrap.len() = 20K, isal.len() = 16K → total = 36K
-        // (> WINDOW_SIZE). Window = last 16K of bootstrap + all isal.
-        let mut window = vec![0u8; WINDOW_SIZE]; // prev window
+        // bootstrap=20K, isal=16K → total=36K > WINDOW_SIZE.
+        let mut window = vec![0u8; WINDOW_SIZE];
         window.fill(0xCC);
         let bootstrap: Vec<u8> = (0..20_000).map(|i| (i % 256) as u8).collect();
         let isal: Vec<u8> = (0..16_000).map(|i| ((i + 100) % 256) as u8).collect();
-        let isal_segs = vec![isal.clone()];
-        update_window_from_chunk(&mut window, &bootstrap, &isal_segs);
+        update_window_from_chunk(&mut window, &bootstrap, &isal);
         assert_eq!(window.len(), WINDOW_SIZE);
-        // Last (WINDOW_SIZE - 16000) = 16768 bytes of bootstrap come
-        // first, then all 16000 isal bytes.
         let bootstrap_tail_start = bootstrap.len() - (WINDOW_SIZE - 16_000);
         assert_eq!(
             &window[..(WINDOW_SIZE - 16_000)],
@@ -1381,8 +1326,6 @@ mod tests {
 
     #[test]
     fn update_window_empty_chunk_preserves_prev_window() {
-        // Empty chunk (phase 1c marks chunk i empty when predecessor
-        // consumed BFINAL). Window should not change.
         let mut window: Vec<u8> = (0..WINDOW_SIZE).map(|i| (i % 256) as u8).collect();
         let before = window.clone();
         update_window_from_chunk(&mut window, &[], &[]);
@@ -1391,41 +1334,28 @@ mod tests {
 
     #[test]
     fn update_window_smaller_than_window_slides() {
-        // bootstrap + isal = 1000 + 500 = 1500 bytes (< WINDOW_SIZE).
-        // Window starts at full 32 KB; should drop 1500 bytes from
-        // the front and append (bootstrap_u8 ++ isal_bytes).
+        // bootstrap+isal = 1000+500 = 1500 bytes < WINDOW_SIZE.
         let prev_window: Vec<u8> = (0..WINDOW_SIZE).map(|i| (i % 256) as u8).collect();
         let mut window = prev_window.clone();
         let bootstrap: Vec<u8> = (0..1000).map(|i| (i % 256) as u8 ^ 0xFF).collect();
         let isal: Vec<u8> = (0..500).map(|i| (i % 256) as u8 ^ 0xAA).collect();
-        let isal_segs = vec![isal.clone()];
-        update_window_from_chunk(&mut window, &bootstrap, &isal_segs);
+        update_window_from_chunk(&mut window, &bootstrap, &isal);
         assert_eq!(window.len(), WINDOW_SIZE);
-        // First (WINDOW_SIZE - 1500) bytes are the prev window's
-        // tail (i.e., prev_window[1500..]).
         assert_eq!(&window[..(WINDOW_SIZE - 1500)], &prev_window[1500..]);
-        // Next 1000 bytes are bootstrap.
         let bootstrap_offset = WINDOW_SIZE - 1500;
         assert_eq!(
             &window[bootstrap_offset..bootstrap_offset + 1000],
             bootstrap.as_slice()
         );
-        // Last 500 bytes are isal.
         assert_eq!(&window[bootstrap_offset + 1000..], isal.as_slice());
     }
 
     #[test]
     fn update_window_smaller_than_window_with_smaller_prev() {
-        // Prev window has < WINDOW_SIZE bytes (e.g., we're early in
-        // the stream). Adding small chunk should grow the window
-        // toward WINDOW_SIZE but not exceed it.
         let mut window: Vec<u8> = vec![0xAA; 10_000];
         let bootstrap: Vec<u8> = vec![0xBB; 5_000];
         let isal: Vec<u8> = vec![0xCC; 3_000];
-        let isal_segs = vec![isal.clone()];
-        update_window_from_chunk(&mut window, &bootstrap, &isal_segs);
-        // 10K + 5K + 3K = 18K total; all fits in window, nothing
-        // dropped because 18K < WINDOW_SIZE.
+        update_window_from_chunk(&mut window, &bootstrap, &isal);
         assert_eq!(window.len(), 10_000 + 5_000 + 3_000);
         assert_eq!(&window[..10_000], &vec![0xAA; 10_000][..]);
         assert_eq!(&window[10_000..15_000], &vec![0xBB; 5_000][..]);
