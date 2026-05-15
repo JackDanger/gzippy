@@ -1,109 +1,116 @@
 # Marker Decoder Performance Roadmap
 
-Produced by Opus analysis (2026-05-15). Recommendations in estimated impact order.
+Produced by Opus analysis (2026-05-15), then checked against the worktree and
+`vendor/rapidgzip` on disk.
 
-## A — O(1) clean-window scan (biggest win, smallest patch)
+## Reality Check
 
-**Problem**: At every block boundary, bootstrap walks 32,768 u16s with
-`.all(|v| v < MARKER_BASE)`. On L6 deflate (~50 blocks per chunk before
-handoff) that's 50 × 32 KB = ~6 MB of u16 memory traffic per worker.
-A second redundant 32 KB scan happens in `decode_chunk_bootstrap` when
-converting the clean tail to `Vec<u8>` for ISA-L dict.
+gzippy's `fast_marker_inflate` is not the older "decode the whole chunk as
+markers" path anymore. `decode_chunk_bootstrap` stops at the first block boundary
+whose trailing 32 KiB is marker-free, then `single_member` hands the rest of the
+chunk to ISA-L/zlib-ng via `inflatePrime`. That makes pure-Rust marker decode a
+bootstrap cost, not the whole per-chunk cost.
 
-**Fix**: Track `clean_count: usize` incrementally:
-- In `emit_match` marker-emission branch: `clean_count = 0` when `marker_count > 0`.
-- Literal pushes: `clean_count += 1`.
-- Chunk-local memcpy (non-overlapping): if source range lies entirely within trailing
-  `clean_count` bytes → `clean_count += local_count`. Otherwise scan only the copied
-  range (≤ 258 bytes) and update.
-- Block boundary check: `if clean_count >= WINDOW_SIZE && output.len() >= WINDOW_SIZE`.
+rapidgzip has the same shape, but with two important differences:
 
-Also remove the second scan in `decode_chunk_bootstrap` (the assert-and-cast walk).
-Once `clean_count` is the invariant source, the assert is dead code.
+- `GzipChunk.hpp` uses `cleanDataCount >= MAX_WINDOW_SIZE` to hand off to ISA-L,
+  and `deflate::Block` maintains `m_distanceToLastMarkerByte` while decoding.
+- `DecodedData` stores marked and clean data separately. Once enough clean data
+  exists, it appends `uint8_t` buffers directly instead of keeping every byte in
+  a `uint16_t` vector.
 
-rapidgzip equivalent: `m_distanceToLastMarkerByte` counter in `deflate::Block`.
+The old priority order overstated clean-window scan cost. The scan still exists
+in gzippy, but only during bootstrap and only until handoff. The hotter remaining
+gap is table construction and decode-table shape inside that bootstrap.
 
-**Impact**: Removes O(N_blocks × 32 KB) u16 traffic. ~4 ms saved per worker on a
-24 MB L6 Silesia chunk at T=4.
+## A — Replace `fast_marker_inflate::HuffTable`
 
-## B — Reuse `ConsumeFirstTable` instead of fresh 128 KB single-level tables
+**Problem**: Every dynamic block builds three local single-level tables. The
+lit/len and distance tables can grow to 32,768 `u32` entries each, so a bootstrap
+that crosses several dynamic blocks burns time on allocation, zero-fill, and a
+large lookup footprint.
 
-**Problem**: Every dynamic block calls `HuffTable::build` three times. Each build
-allocates `vec![0u32; 32768]` (128 KB zero-fill, ~10 µs), then writes entries.
-~1.25 ms per chunk for table construction alone (50 blocks × 25 µs). The 128 KB
-working set pollutes L2/L3 cache.
+**Reality**: gzippy already has `ConsumeFirstTable` plus `CachedTablePair`, but it
+is not wired into `fast_marker_inflate`. rapidgzip's default non-ISA-L path uses
+`HuffmanCodingShortBitsCached`, not the larger multi-cached decoder; the
+multi-cached variant exists but is compile-gated. With ISA-L enabled, rapidgzip
+uses `HuffmanCodingISAL` for lit/len decoding.
 
-**Fix**: `src/decompress/inflate/consume_first_table.rs::ConsumeFirstTable` is the
-production multi-level table (~4 KB primary, subtable arena). Refactor
-`fast_marker_inflate::HuffTable` to use `ConsumeFirstTable` (or delete it and call
-`ConsumeFirstTable` directly). The marker decoder needs identical primitive —
-"decode one symbol, consume code-length bits."
+**Fix**: First add a marker-specific table wrapper that reuses the compact
+consume-first table layout without touching production u8 decode. Keep the local
+`HuffTable` API (`decode(&mut Bits) -> symbol`) until benchmarks prove the table
+swap is a win. Then consider the existing cache only if repeated dynamic headers
+show up in profiles; a global `Mutex<HashMap<...>>` can easily cost more than it
+saves in parallel workers.
 
-Bonus: `CachedTablePair` at line 526 of `consume_first_table.rs` caches litlen +
-distance pairs to avoid rebuilding on identical dynamic block headers — plug in.
+## B — Track Clean Tail Incrementally
 
-**Impact**: ~9× smaller primary table stays L1-resident. Table build ~2-3 µs/block
-(vs ~25 µs). Decode throughput +20-40% from cache residency alone.
+**Problem**: `decode_loop` checks
+`output[output.len() - WINDOW_SIZE..].iter().all(|&v| v < MARKER_BASE)` at every
+bootstrap block boundary. `decode_chunk_bootstrap` then walks the same 32 KiB
+again to assert and cast the clean window to `Vec<u8>`.
 
-## C — Multi-symbol Huffman decode (rapidgzip's multi-cached trick)
+**Reality**: This is not `N_blocks_per_chunk * 32 KiB`; it is only
+`N_blocks_until_handoff * 32 KiB`. Still, rapidgzip avoids this by carrying
+clean-byte state (`m_distanceToLastMarkerByte` / `cleanDataCount`).
 
-**Problem**: `decode_huffman_block` does one `litlen.decode` per output byte.
-For ASCII text (7-8 bit codes) that's one full peek+lookup+consume per byte.
+**Fix**: Add a `clean_tail: usize` to the bootstrap decode state:
 
-**Fix**: Widen primary table entries to carry a "stride" field (how many literals this
-entry produces, packed into the data field). Hot loop becomes
-`for (; count > 0; count--, sym >>= 8)` — 2-4 bytes per Huffman lookup on
-ASCII-heavy data.
+- Literal push: increment.
+- Marker emission: reset to zero.
+- Non-overlapping local copy: increment if the copied source range is entirely
+  within the trailing clean tail, otherwise scan just the copied range.
+- Overlapping copy: preserve correctness first; update incrementally only for
+  the trivial clean source case, otherwise scan the emitted match.
 
-Alternative (simpler): template-parameterise `decode_block_consume_first` from
-`consume_first_decode.rs` on u8 vs u16+markers. One Huffman inner loop, generic emit.
+Keep the release assertion for the ISA-L dict handoff, but feed the `Vec<u8>`
+conversion from the same known-clean suffix so there is one checked walk, not two.
 
-**Impact**: 1.5-2× on ASCII/log/FASTQ. Smaller gains on binary data (bootstraps fast).
+## C — Split Bootstrap Storage Like rapidgzip
 
-## D — Pre-build fixed-Huffman tables with ConsumeFirstTable format
+**Problem**: gzippy's bootstrap output is a single `Vec<u16>` until handoff. Once
+the suffix is known clean, the handoff window is copied to `Vec<u8>`, and the
+remaining marker prefix still goes through later marker replacement and `u16_to_u8`.
 
-Already cached via `OnceLock<HuffTable>`. Switching to `ConsumeFirstTable` shrinks
-statics from 128 KB to ~4 KB, improves icache density. Free if B is done first.
+**Reality**: rapidgzip keeps `dataWithMarkers` and `data` as separate buffers.
+That lets clean bytes stay byte-wide and keeps marker replacement scoped to the
+prefix that can actually contain markers.
 
-## E — Encapsulate the bit-position formula (correctness, not perf)
+**Fix**: Do not refactor the whole pipeline yet. Add an internal
+`BootstrapResult { marked_prefix, clean_window }` shape only after A and B are
+measured. This is a larger memory-layout change and should be driven by profiles
+showing `u16_to_u8`, marker replacement, or allocation pressure still visible.
 
-`bits.pos*8 - bits.available()` appears at four sites. One was a double-count bug
-(PR #90); another in `decode_stored` (rewind `pos` by buffered bytes before zeroing).
-Add `bits.consumed_bits(base_byte) -> usize` method to eliminate the class.
+## D — Encapsulate Bit Positions
 
-rapidgzip equivalent: `bitReader->tell()`.
+`bits.pos * 8 - bits.available()` still appears in multiple places and the file
+documents prior double-count bugs around that formula. Add one helper on `Bits`
+or a small local helper in `fast_marker_inflate` before doing more retry or
+handoff work. rapidgzip's equivalent is `bitReader.tell()`.
 
-## F — Skip second u16→u8 copy for clean window
+## E — Small Local Cleanups
 
-When `clean_window = Some(...)`, code allocates 32 KB `Vec<u8>` and walks trailing
-32 KB of `output` byte-by-byte. Use a reused thread-local 32 KB scratch or expose
-a packed-u8 view of the u16 slice. No allocation, same ISA-L dict input.
+These are worthwhile only after the table and clean-tail work is measured:
 
-## G — RLE fast path for distance==1
+- Prebuild fixed tables in the same compact format if A lands.
+- Add a distance-1 RLE fast path in `emit_match`; rapidgzip's unmarked path uses
+  `memset`, but the marker path still has to preserve marker propagation.
+- Reuse storage for `lens: Vec<u8>` in `decode_dynamic` if allocation shows up in
+  profiling.
+- Reuse a 32 KiB dict scratch if clean-window allocation remains visible.
 
-byte-by-byte loop in `emit_match`'s overlap branch: 258 sequential read-write cycles
-for a max-length RLE match. Add:
-```rust
-if distance == 1 && out_pos > 0 && local_count > 0 {
-    let fill = output[out_pos + marker_count - 1];
-    output.resize(out_pos + marker_count + local_count, fill);
-}
-```
+## Recommended Sequence
 
-## H — Thread-local arena for `lens: Vec<u8>` in `decode_dynamic`
+1. **A first**: table shape is the largest mismatch with rapidgzip's actual hot
+   decoder and is easy to benchmark in isolation.
+2. **B second**: small, correctness-sensitive, and aligned with rapidgzip's clean
+   tail tracking, but no longer the biggest expected win.
+3. **D with B or immediately after**: it reduces risk before more retry/handoff
+   changes.
+4. **C only if profiles still show marker-prefix conversion cost**.
+5. **E as measured follow-ups**, not as one bundle.
 
-Allocates `vec![0u8; total]` once per dynamic block (~316 bytes, 50×4 workers = 200
-small allocs). Replace with 320-byte `ArrayVec` or reused `Vec` cleared between blocks.
-
----
-
-## Recommended sequence
-
-1. **A** first — ≤50 lines, highest impact, verifiable against existing fuzz/oracle tests.
-2. **B** second — aligns marker decoder with production u8 decoder's table format.
-3. **C** after A+B confirm wins on `make ship`.
-4. **E, G, H** as cleanup bundles.
-5. **F** if profiling shows u16→u8 walk still visible after A/B/C.
-
-Acceptance: > 50 MB/s/thread; A+B+C together should double that against L6 text,
-putting per-thread parity with sequential ISA-L within reach.
+Acceptance: keep the existing routing and correctness tests passing, then compare
+`HANDOFF_FIRED`, `SLOW_PATH_USED`, per-chunk bootstrap bytes, and end-to-end
+single-member Tmax throughput before and after each step. Do not rely on a marker
+microbenchmark alone; the production win is handoff speed plus retry behavior.
