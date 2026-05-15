@@ -1155,6 +1155,22 @@ fn phase1c_resolve_consistency(
                 None => continue,
             };
 
+            // Guard: chunk i's own start must be confirmed correct before we use
+            // its end_bit to seed chunk i+1. A phase1a false-positive can give
+            // chunk i a wrong start_bit (so its end_bit is also wrong). Using
+            // that wrong end_bit to decode chunk i+1 propagates the error.
+            // If chunk i-1 is None (not yet resolved) we also skip — chunk i
+            // might be wrong and will be corrected in a future wave.
+            if i > 0 {
+                let start_ok = match &chunks[i - 1] {
+                    Some(pred_of_i) => start_bits[i] == Some(pred_of_i.end_bit_offset),
+                    None => false,
+                };
+                if !start_ok {
+                    continue;
+                }
+            }
+
             // Correction needed when:
             //   - chunks[i+1] is None (phase 1b worker failed), OR
             //   - start_bits[i+1] is None/wrong (phase 1a false-positive or miss).
