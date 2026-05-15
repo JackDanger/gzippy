@@ -68,10 +68,15 @@ jobs:
         name: Resolve version
         run: |
           OVERRIDE="${{ github.event.inputs.version }}"
+          FILE_VERSION=$(tr -d '[:space:]' < VERSION)
           if [ -n "$OVERRIDE" ]; then
             VERSION="${OVERRIDE#v}"
+            if [ "$VERSION" != "$FILE_VERSION" ]; then
+              echo "::error::workflow_dispatch version '$VERSION' does not match VERSION file '$FILE_VERSION'. Bump VERSION on main first, or omit the override."
+              exit 1
+            fi
           else
-            VERSION=$(tr -d '[:space:]' < VERSION)
+            VERSION="$FILE_VERSION"
           fi
           if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$'; then
             echo "::error::VERSION '$VERSION' is not valid semver"
@@ -411,7 +416,6 @@ jobs:
               'X86_64_UNKNOWN_LINUX_GNU':  "${{ steps.shas.outputs.x86_64_unknown_linux_gnu }}",
           }
           formula = open('Formula/gzippy.rb').read()
-          formula = re.sub(r'version "[^"]+"', f'version "{version}"', formula, count=1)
           for key, sha in shas.items():
               formula = re.sub(rf'sha256 "[0-9a-f]+" # {key}',
                                f'sha256 "{sha}" # {key}', formula)
