@@ -27,7 +27,7 @@ SYSTEM_GZIP := $(shell which gzip)
 # Set APPLE_GZIP when it differs from GZIP_BIN so bench targets compare both
 APPLE_GZIP := $(if $(filter Darwin,$(shell uname)),/usr/bin/gzip,)
 
-.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship ship-local route-check oracle-vs-c
+.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship ship-local route-check oracle-vs-c bench-sm
 
 # =============================================================================
 # Default target: quick benchmark for fast iteration (< 30 seconds)
@@ -224,6 +224,66 @@ ship: ship-precheck ship-local
 	  rm -rf /dev/shm/gzippy-bench-* 2>/dev/null || true"
 	@echo ""
 	@echo "✓ ship complete on branch $$(git rev-parse --abbrev-ref HEAD)"
+
+# =============================================================================
+# bench-sm: single-member x86_64 Tmax gzippy vs rapidgzip on neurotic.
+#
+# Skips all local quality gates (fmt/test/clippy/oracle). Pushes the current
+# branch, SSHs to neurotic, builds gzippy + rapidgzip, runs
+# scripts/benchmark_single_member.py against silesia.tar compressed at -9.
+# Use this for tight iteration on the parallel single-member path without
+# the 20-minute full ship round-trip.
+#
+# Time: ~3-5 minutes (build ~1 min, bench ~2-3 min for 10 trials).
+# =============================================================================
+bench-sm: ship-precheck
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	echo ""; \
+	echo "── bench-sm: x86_64 Tmax single-member  gzippy vs rapidgzip ──"; \
+	if ! git rev-parse origin/$$BRANCH >/dev/null 2>&1 \
+	    || [ -n "$$(git log origin/$$BRANCH..HEAD 2>/dev/null)" ]; then \
+	  echo "  pushing $$BRANCH to origin..."; \
+	  git push origin $$BRANCH || (echo "PUSH FAILED — aborting bench-sm" >&2 && exit 1); \
+	else \
+	  echo "  origin/$$BRANCH already up to date"; \
+	fi; \
+	echo "  connecting to neurotic..."; \
+	ssh -J neurotic root@10.30.0.199 "set -e; cd gzippy; \
+	  echo '  fetching origin/$$BRANCH...'; \
+	  git fetch origin '$$BRANCH'; \
+	  git checkout -B '$$BRANCH' 'origin/$$BRANCH'; \
+	  git reset --hard 'origin/$$BRANCH'; \
+	  echo '  building gzippy...'; \
+	  cargo build --release 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
+	  RAPIDGZIP=vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip; \
+	  if [ ! -x \"\$$RAPIDGZIP\" ]; then \
+	    echo '  building rapidgzip (first time only)...'; \
+	    cd vendor/rapidgzip && git submodule update --init --recursive >/dev/null 2>&1 || true; \
+	    mkdir -p librapidarchive/build; \
+	    cd librapidarchive/build && cmake .. -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1; \
+	    make -j\$$(nproc) rapidgzip 2>&1 | grep -E 'Linking|Built|error' || true; \
+	    cd /root/gzippy; \
+	  fi; \
+	  BD=benchmark_data; \
+	  [ -f \"\$$BD/silesia.tar\" ] || { [ -f \"\$$BD/silesia.tar.xz\" ] && xz -dk \"\$$BD/silesia.tar.xz\" -c > \"\$$BD/silesia.tar\"; }; \
+	  SM=\$$BD/silesia-gzip9.gz; \
+	  [ -s \"\$$SM\" ] || { echo '  compressing silesia.tar at gzip -9 (one-time, ~30s)...'; gzip -9 -c \"\$$BD/silesia.tar\" > \"\$$SM\"; }; \
+	  BDIR=/tmp/bench-sm-bin; mkdir -p \"\$$BDIR\"; \
+	  cp target/release/gzippy \"\$$BDIR/\"; \
+	  cp \"\$$RAPIDGZIP\" \"\$$BDIR/\" 2>/dev/null || true; \
+	  [ -x vendor/pigz/unpigz ] && cp vendor/pigz/unpigz \"\$$BDIR/\" || true; \
+	  THREADS=\$$(nproc); \
+	  echo ''; \
+	  python3 scripts/benchmark_single_member.py \
+	    --binaries \"\$$BDIR\" \
+	    --compressed-file \"\$$SM\" \
+	    --original-file \"\$$BD/silesia.tar\" \
+	    --threads \"\$$THREADS\" \
+	    --output /tmp/bench-sm-result.json; \
+	  echo ''; \
+	  echo 'Full JSON: /tmp/bench-sm-result.json'"
+	@echo ""
+	@echo "✓ bench-sm complete on branch $$(git rev-parse --abbrev-ref HEAD)"
 
 # `ship-precheck`: dirty-tree refusal. Pulled out of `ship-local` so a
 # dirty tree fails in <1s instead of after 30s of local checks. Only
