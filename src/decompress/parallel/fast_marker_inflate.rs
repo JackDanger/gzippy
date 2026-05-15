@@ -52,6 +52,7 @@
 use std::io::{Error, ErrorKind, Result};
 
 use crate::decompress::inflate::consume_first_decode::Bits;
+use crate::decompress::inflate::consume_first_table::{CFEntry, ConsumeFirstTable, CF_TABLE_BITS};
 use crate::decompress::parallel::replace_markers::MARKER_BASE;
 
 /// Maximum deflate back-reference distance per RFC 1951 §3.2.5.
@@ -87,119 +88,42 @@ const CL_ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 
-// ── Canonical Huffman table ─────────────────────────────────────────────────
+// ── Huffman decode helpers (ConsumeFirstTable wrapper) ──────────────────────
 
-/// Maximum bits we ever look up from the bit buffer at once.
-const MAX_TABLE_BITS: u32 = 15;
-
-/// Single-level lookup table. For 15-bit codes, table size is 32768 entries —
-/// that's 128 KB at 4 bytes each. Built once per block, costs ~25 µs per block.
-/// Far simpler than libdeflate's multi-level scheme; can be tightened later.
-///
-/// Entry layout (little-endian):
-/// - bits 0..=15 : decoded symbol
-/// - bits 16..=23: code length in bits (1..=15). 0 = invalid.
-#[derive(Clone)]
-struct HuffTable {
-    entries: Vec<u32>,
-    table_bits: u32,
-}
-
-impl HuffTable {
-    /// Build a canonical Huffman table from code lengths.
-    ///
-    /// `lengths[i]` is the bit length assigned to symbol `i`; 0 means absent.
-    fn build(lengths: &[u8]) -> Result<Self> {
-        // Find max code length used.
-        let max_len = lengths.iter().copied().max().unwrap_or(0) as u32;
-        if max_len == 0 {
-            // Degenerate: no symbols. Return a dummy table that errors on
-            // every decode attempt. Size must match 1 << table_bits so the
-            // peek index never goes out of bounds.
-            return Ok(Self {
-                entries: vec![0u32; 2],
-                table_bits: 1,
-            });
-        }
-        if max_len > MAX_TABLE_BITS {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("Huffman code length {max_len} exceeds {MAX_TABLE_BITS}"),
-            ));
-        }
-        let table_bits = max_len;
-        let table_size = 1usize << table_bits;
-        let mut entries = vec![0u32; table_size];
-
-        // RFC 1951 §3.2.2 canonical Huffman: count codes of each length, then
-        // assign codes in symbol order.
-        let mut bl_count = [0u32; 16];
-        for &len in lengths {
-            if len > 0 {
-                bl_count[len as usize] += 1;
-            }
-        }
-        let mut next_code = [0u32; 16];
-        let mut code = 0u32;
-        for len in 1..=max_len {
-            code = (code + bl_count[(len - 1) as usize]) << 1;
-            next_code[len as usize] = code;
-        }
-
-        // For each symbol, compute its (bit-reversed) code and fill every
-        // table entry whose low `len` bits equal that code. (The bit buffer
-        // delivers bits LSB-first, so codes go in reversed.)
-        for (sym, &len) in lengths.iter().enumerate() {
-            if len == 0 {
-                continue;
-            }
-            let len = len as u32;
-            let code = next_code[len as usize];
-            next_code[len as usize] += 1;
-
-            let reversed = reverse_bits(code, len);
-            let entry = (sym as u32) | (len << 16);
-            // Stride = 1 << len. Fill `2^(table_bits - len)` entries.
-            let stride = 1usize << len;
-            let mut idx = reversed as usize;
-            while idx < table_size {
-                entries[idx] = entry;
-                idx += stride;
-            }
-        }
-
-        Ok(Self {
-            entries,
-            table_bits,
-        })
+/// Decode one symbol from `bits` using a ConsumeFirstTable.
+/// Returns the raw symbol (0–255 literal, 256 EOB, 257–285 length for litlen;
+/// 0–29 distance for distance tables).
+#[inline(always)]
+fn decode_cf(table: &ConsumeFirstTable, bits: &mut Bits) -> Result<u32> {
+    if bits.available() < CF_TABLE_BITS as u32 {
+        bits.refill();
     }
-
-    /// Look up a code, consuming its bits from `bits`. Returns the symbol.
-    #[inline(always)]
-    fn decode(&self, bits: &mut Bits) -> Result<u32> {
-        if bits.available() < self.table_bits {
+    let entry = table.lookup_main(bits.peek());
+    if entry.is_subtable() {
+        bits.consume(entry.bits()); // consumes CF_TABLE_BITS (= 11)
+        let extra = entry.subtable_extra_bits() as u32;
+        if extra > 0 && bits.available() < extra {
             bits.refill();
         }
-        let peek = (bits.peek() & ((1u64 << self.table_bits) - 1)) as usize;
-        let entry = self.entries[peek];
-        let code_len = (entry >> 16) & 0xFF;
-        if code_len == 0 {
-            return Err(Error::new(ErrorKind::InvalidData, "Invalid Huffman code"));
-        }
-        bits.consume(code_len);
-        Ok(entry & 0xFFFF)
+        let sub_entry = table.lookup_sub(entry, bits.peek());
+        bits.consume(sub_entry.bits());
+        return cf_entry_to_sym(sub_entry);
     }
+    bits.consume(entry.bits());
+    cf_entry_to_sym(entry)
 }
 
 #[inline(always)]
-fn reverse_bits(mut v: u32, n: u32) -> u32 {
-    // Tiny enough that we don't bother with a precomputed table.
-    let mut r = 0u32;
-    for _ in 0..n {
-        r = (r << 1) | (v & 1);
-        v >>= 1;
+fn cf_entry_to_sym(entry: CFEntry) -> Result<u32> {
+    if entry.is_literal() {
+        Ok(entry.symbol() as u32)
+    } else if entry.is_eob() {
+        Ok(256)
+    } else if entry.is_length() {
+        Ok(entry.symbol() as u32)
+    } else {
+        Err(Error::new(ErrorKind::InvalidData, "invalid Huffman code"))
     }
-    r
 }
 
 // ── Public entry ────────────────────────────────────────────────────────────
@@ -761,24 +685,25 @@ fn decode_stored(bits: &mut Bits, output: &mut Vec<u16>) -> Result<()> {
 
 // ── Fixed Huffman block (BTYPE = 01) ────────────────────────────────────────
 
-fn fixed_litlen_table() -> &'static HuffTable {
+fn fixed_litlen_table() -> &'static ConsumeFirstTable {
     use std::sync::OnceLock;
-    static T: OnceLock<HuffTable> = OnceLock::new();
+    static T: OnceLock<ConsumeFirstTable> = OnceLock::new();
     T.get_or_init(|| {
-        // RFC 1951 §3.2.6 fixed Huffman code lengths.
         let mut lens = vec![0u8; 288];
         lens[0..144].fill(8);
         lens[144..256].fill(9);
         lens[256..280].fill(7);
         lens[280..288].fill(8);
-        HuffTable::build(&lens).expect("fixed litlen table builds")
+        ConsumeFirstTable::build(&lens).expect("fixed litlen table builds")
     })
 }
 
-fn fixed_dist_table() -> &'static HuffTable {
+fn fixed_dist_table() -> &'static ConsumeFirstTable {
     use std::sync::OnceLock;
-    static T: OnceLock<HuffTable> = OnceLock::new();
-    T.get_or_init(|| HuffTable::build(&[5u8; 30]).expect("fixed dist table builds"))
+    static T: OnceLock<ConsumeFirstTable> = OnceLock::new();
+    T.get_or_init(|| {
+        ConsumeFirstTable::build_distance(&[5u8; 30]).expect("fixed dist table builds")
+    })
 }
 
 fn decode_fixed(bits: &mut Bits, output: &mut Vec<u16>) -> Result<()> {
@@ -815,14 +740,14 @@ fn decode_dynamic(bits: &mut Bits, output: &mut Vec<u16>) -> Result<()> {
         cl_lens[cl_idx] = (bits.peek() & 0x7) as u8;
         bits.consume(3);
     }
-    let cl_table = HuffTable::build(&cl_lens)?;
+    let cl_table = ConsumeFirstTable::build(&cl_lens)?;
 
     // Read HLIT + HDIST code lengths using the code-length code.
     let total = hlit + hdist;
     let mut lens = vec![0u8; total];
     let mut i = 0;
     while i < total {
-        let sym = cl_table.decode(bits)?;
+        let sym = decode_cf(&cl_table, bits)?;
         match sym {
             0..=15 => {
                 lens[i] = sym as u8;
@@ -875,8 +800,8 @@ fn decode_dynamic(bits: &mut Bits, output: &mut Vec<u16>) -> Result<()> {
         }
     }
 
-    let litlen_table = HuffTable::build(&lens[..hlit])?;
-    let dist_table = HuffTable::build(&lens[hlit..])?;
+    let litlen_table = ConsumeFirstTable::build(&lens[..hlit])?;
+    let dist_table = ConsumeFirstTable::build_distance(&lens[hlit..])?;
 
     decode_huffman_block(bits, output, &litlen_table, &dist_table)
 }
@@ -887,11 +812,11 @@ fn decode_dynamic(bits: &mut Bits, output: &mut Vec<u16>) -> Result<()> {
 fn decode_huffman_block(
     bits: &mut Bits,
     output: &mut Vec<u16>,
-    litlen: &HuffTable,
-    dist: &HuffTable,
+    litlen: &ConsumeFirstTable,
+    dist: &ConsumeFirstTable,
 ) -> Result<()> {
     loop {
-        let sym = litlen.decode(bits)?;
+        let sym = decode_cf(litlen, bits)?;
         if sym < 256 {
             // Literal.
             output.push(sym as u16);
@@ -922,7 +847,7 @@ fn decode_huffman_block(
                 LENGTH_BASE[lidx] + extra_val
             } as usize;
 
-            let dsym = dist.decode(bits)? as usize;
+            let dsym = decode_cf(dist, bits)? as usize;
             if dsym >= DISTANCE_BASE.len() {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
