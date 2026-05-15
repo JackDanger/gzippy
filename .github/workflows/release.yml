@@ -449,7 +449,7 @@ jobs:
           fi
 
           git checkout -B "$BRANCH"
-          git commit -m "chore: update formula and Cargo.toml to v${VERSION} [skip ci]"
+          git commit -m "chore: update formula and Cargo.toml to v${VERSION}"
           git push --force-with-lease origin "$BRANCH"
 
           PR_URL=$(gh pr create \
@@ -459,17 +459,8 @@ jobs:
           PR_NUMBER="${PR_URL##*/}"
           echo "Opened PR #${PR_NUMBER}: ${PR_URL}"
 
-          # Try auto-merge (waits for checks); fall back to direct merge if the
-          # PR is already mergeable with no pending checks.
-          if ! gh pr merge "$PR_NUMBER" --squash --auto 2>/tmp/merge-err; then
-            if grep -q 'clean status' /tmp/merge-err; then
-              echo "Auto-merge unavailable (no pending checks); merging directly"
-              gh pr merge "$PR_NUMBER" --squash
-            else
-              cat /tmp/merge-err
-              exit 1
-            fi
-          fi
+          # Enable auto-merge — GitHub fires the merge once CI passes.
+          gh pr merge "$PR_NUMBER" --squash --auto
 
       # ---- Publish to crates.io (idempotent + retry) ------------------------
       # The formula-sync step above merges its PR with `--auto`, which queues
