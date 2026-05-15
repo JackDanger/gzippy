@@ -333,6 +333,49 @@ pub fn decompress_parallel<W: Write>(
     let decode_elapsed = t_decode.elapsed();
     let mut chunks: Vec<Option<ChunkResult>> = chunks_opt;
 
+    if debug_enabled() {
+        // Per-chunk breakdown: elapsed, bootstrap size, ISA-L size, total.
+        // Skew in elapsed reveals load imbalance; skew in sizes reveals
+        // uneven boundary placement. High CV in the benchmark usually comes
+        // from one chunk taking significantly longer than the others.
+        eprintln!("[parallel_sm:v0.6] per-chunk phase1b breakdown:");
+        for (i, chunk) in chunks.iter().enumerate() {
+            match chunk {
+                Some(c) => {
+                    let boot_kb = c.bootstrap.len() / 2 / 1024; // u16→u8, then →KB
+                    let isal_kb = c.isal_bytes.len() / 1024;
+                    let total_kb = c.bootstrap.len() / 2 / 1024 + isal_kb;
+                    eprintln!(
+                        "  chunk {:2}: {:4}ms  boot={:4}KB  isal={:6}KB  total={:6}KB",
+                        i,
+                        c.worker_elapsed.as_millis(),
+                        boot_kb,
+                        isal_kb,
+                        total_kb,
+                    );
+                }
+                None => {
+                    eprintln!("  chunk {:2}: (boundary not found — phase1c will fill)", i);
+                }
+            }
+        }
+        // Imbalance ratio: longest / shortest non-empty worker.
+        let elapsed_ms: Vec<u128> = chunks
+            .iter()
+            .filter_map(|c| c.as_ref())
+            .filter(|c| c.worker_elapsed.as_millis() > 0)
+            .map(|c| c.worker_elapsed.as_millis())
+            .collect();
+        if elapsed_ms.len() >= 2 {
+            let max_ms = *elapsed_ms.iter().max().unwrap();
+            let min_ms = *elapsed_ms.iter().min().unwrap();
+            eprintln!(
+                "  imbalance: max/min = {:.2}x  (max={max_ms}ms min={min_ms}ms)",
+                max_ms as f64 / min_ms.max(1) as f64
+            );
+        }
+    }
+
     // ── Phase 1c: cross-chunk consistency correction ────────────────────────
     //
     // Walk pairs (N, N+1). When chunks[N].end_bit != start_bits[N+1], the
@@ -647,6 +690,10 @@ struct ChunkResult {
     /// in phase 2; sequential CRC work drops from ~100 ms to ~1-2 ms.
     isal_crc: crc32fast::Hasher,
     end_bit_offset: usize,
+    /// Wall time the worker spent on this chunk (bootstrap + ISA-L).
+    /// Logged per-chunk in debug mode so load imbalance across workers
+    /// is visible without attaching a profiler.
+    worker_elapsed: std::time::Duration,
 }
 
 impl ChunkResult {
@@ -725,6 +772,7 @@ fn decode_chunk_with_handoff(
     per_chunk_output_hint: usize,
     num_chunks_total: usize,
 ) -> std::io::Result<ChunkResult> {
+    let t_worker = std::time::Instant::now();
     // Phase 1 of the worker: bootstrap. Decode the chunk's first ~32 KB
     // with the marker decoder until the trailing 32 KB of output is
     // marker-free. This window seeds ISA-L for the bulk decode.
@@ -749,6 +797,7 @@ fn decode_chunk_with_handoff(
             isal_bytes: Vec::new(),
             isal_crc: crc32fast::Hasher::new(),
             end_bit_offset: bootstrap_end_bit,
+            worker_elapsed: t_worker.elapsed(),
         });
     };
 
@@ -822,6 +871,7 @@ fn decode_chunk_with_handoff(
                     isal_bytes,
                     isal_crc,
                     end_bit_offset: isal_end_bit,
+                    worker_elapsed: t_worker.elapsed(),
                 })
             }
             None => {
@@ -836,6 +886,10 @@ fn decode_chunk_with_handoff(
                     bootstrap_end_bit,
                     end_bit_limit,
                 )
+                .map(|mut c| {
+                    c.worker_elapsed = t_worker.elapsed();
+                    c
+                })
             }
         }
     }
@@ -853,6 +907,10 @@ fn decode_chunk_with_handoff(
             bootstrap_end_bit,
             end_bit_limit,
         )
+        .map(|mut c| {
+            c.worker_elapsed = t_worker.elapsed();
+            c
+        })
     }
 }
 
@@ -885,6 +943,7 @@ fn marker_finish_after_bootstrap(
         // identity. Phase 2 will CRC the resolved bootstrap.
         isal_crc: crc32fast::Hasher::new(),
         end_bit_offset: end_bit,
+        worker_elapsed: std::time::Duration::ZERO,
     })
 }
 
@@ -1019,6 +1078,7 @@ fn phase1c_resolve_consistency(
                 isal_bytes: Vec::new(),
                 isal_crc: crc32fast::Hasher::new(),
                 end_bit_offset: pred_end,
+                worker_elapsed: std::time::Duration::ZERO,
             });
             start_bits[idx] = Some(pred_end);
         }

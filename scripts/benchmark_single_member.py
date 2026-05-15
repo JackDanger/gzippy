@@ -108,8 +108,20 @@ def benchmark_decompress(
             # timing line ("[parallel_sm:v0.6] search=Xms decode=Yms
             # retry=Zms resolve=Wms total=Tms ...") survives — that
             # line is what tells us WHY the bench is slow.
-            "stderr_head": stderr_text[:4000],
+            "stderr_head": stderr_text[:8000],
         }
+
+    # rapidgzip verbose stats: chunk count, pool efficiency, decode times.
+    # Run with --verbose once (not during timed runs) to capture internal
+    # BlockFetcher statistics that explain the parallelism structure.
+    rapidgzip_verbose = None
+    if tool == "rapidgzip":
+        verbose_cmd = [bin_path, "-d", "-P", str(threads), "--verbose"]
+        with open(compressed_file, 'rb') as fin:
+            vr = subprocess.run(
+                verbose_cmd, stdin=fin, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+        rapidgzip_verbose = vr.stderr.decode(errors="replace")
 
     def run_decompress():
         with open(compressed_file, 'rb') as fin, open(output_file, 'wb') as fout:
@@ -142,18 +154,31 @@ def benchmark_decompress(
         head = routing_trace.get("stderr_head", "").strip()
         if head:
             print(f"\n      [GZIPPY_DEBUG]\n        " + head.replace("\n", "\n        "))
+
+    # Print rapidgzip's internal statistics (chunk count, pool efficiency).
+    if tool == "rapidgzip" and rapidgzip_verbose:
+        key_lines = [
+            line.strip() for line in rapidgzip_verbose.splitlines()
+            if any(k in line for k in [
+                "Parallelization", "Total Fetched", "Prefetched", "On-demand",
+                "decodeBlock", "futureWait", "Total Real Decode", "Theoretical Optimal",
+                "Pool Efficiency", "Spent", "Decompressed",
+            ])
+        ]
+        if key_lines:
+            print(f"\n      [rapidgzip --verbose]\n        " + "\n        ".join(key_lines))
     
     # Benchmark
     times = []
     converged = False
-    
+
     for trial in range(MAX_TRIALS):
         start = time.perf_counter()
         if not run_decompress():
             return {"error": f"{tool} decompression failed on trial {trial}", "tool": tool}
         elapsed = time.perf_counter() - start
         times.append(elapsed)
-        
+
         if len(times) >= MIN_TRIALS:
             mean = statistics.mean(times)
             stdev = statistics.stdev(times)
@@ -161,14 +186,44 @@ def benchmark_decompress(
             if cv < TARGET_CV:
                 converged = True
                 break
-    
+
     median = statistics.median(times)
     mean = statistics.mean(times)
     stdev = statistics.stdev(times) if len(times) > 1 else 0
     cv = stdev / mean if mean > 0 else 0
     speed = original_size / median / 1_000_000
-    
+
+    # Per-trial raw times so variance spikes are visible.
+    raw_s = "  ".join(f"{t:.3f}s" for t in times)
+    times_sorted = sorted(times)
+    p10 = times_sorted[len(times_sorted) // 10] if len(times_sorted) > 1 else times_sorted[0]
+    p90 = times_sorted[int(len(times_sorted) * 0.9)] if len(times_sorted) > 1 else times_sorted[-1]
+    fastest = original_size / min(times) / 1_000_000
+    slowest = original_size / max(times) / 1_000_000
+
     print(f" {speed:.1f} MB/s ({len(times)} trials, CV={cv:.2%})")
+    print(f"    raw: {raw_s}")
+    print(f"    p10={fastest:.0f} MB/s  p50={speed:.0f} MB/s  p90={slowest:.0f} MB/s  "
+          f"(min={min(times):.3f}s  max={max(times):.3f}s)")
+
+    # For gzippy: capture one timed trial with GZIPPY_DEBUG to get per-chunk
+    # breakdown without distorting the benchmark times above.
+    per_chunk_debug = None
+    if tool == "gzippy":
+        env = dict(os.environ)
+        env["GZIPPY_DEBUG"] = "1"
+        with open(compressed_file, 'rb') as fin:
+            dbg = subprocess.run(
+                cmd, stdin=fin, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env,
+            )
+        per_chunk_debug = dbg.stderr.decode(errors="replace")
+        # Print per-chunk breakdown lines (not the full warmup trace again).
+        chunk_lines = [l for l in per_chunk_debug.splitlines()
+                       if "chunk " in l or "imbalance" in l or "per-chunk" in l]
+        if chunk_lines:
+            print("    per-chunk phase1b breakdown:")
+            for line in chunk_lines:
+                print(f"      {line.strip()}")
     
     return {
         "tool": tool,
@@ -182,11 +237,15 @@ def benchmark_decompress(
         "trials": len(times),
         "converged": converged,
         "speed_mbps": speed,
+        "fastest_mbps": fastest,
+        "slowest_mbps": slowest,
         "original_size": original_size,
         "compressed_size": compressed_size,
         "ratio": compressed_size / original_size,
         "status": "pass",
         "routing_trace": routing_trace,
+        "per_chunk_debug": per_chunk_debug,
+        "rapidgzip_verbose": rapidgzip_verbose,
     }
 
 
