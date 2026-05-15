@@ -266,8 +266,14 @@ bench-sm: ship-precheck
 	  fi; \
 	  BD=benchmark_data; \
 	  [ -f \"\$$BD/silesia.tar\" ] || { [ -f \"\$$BD/silesia.tar.xz\" ] && xz -dk \"\$$BD/silesia.tar.xz\" -c > \"\$$BD/silesia.tar\"; }; \
-	  SM=\$$BD/silesia-gzip9.gz; \
-	  [ -s \"\$$SM\" ] || { echo '  compressing silesia.tar at gzip -9 (one-time, ~30s)...'; gzip -9 -c \"\$$BD/silesia.tar\" > \"\$$SM\"; }; \
+	  SL=\$$BD/silesia-large.bin; \
+	  SLG=\$$BD/silesia-large.gz; \
+	  [ -s \"\$$SL\" ] || { \
+	    echo '  building silesia-large.bin (~500MB, one-time)...'; \
+	    cat \"\$$BD/silesia.tar\" \"\$$BD/silesia.tar\" > \"\$$SL\"; \
+	    head -c \$$((76 * 1024 * 1024)) \"\$$BD/silesia.tar\" >> \"\$$SL\"; \
+	  }; \
+	  [ -s \"\$$SLG\" ] || { echo '  compressing silesia-large.bin at gzip -9 (one-time, ~60s)...'; gzip -9 -c \"\$$SL\" > \"\$$SLG\"; }; \
 	  BDIR=/tmp/bench-sm-bin; mkdir -p \"\$$BDIR\"; \
 	  cp target/release/gzippy \"\$$BDIR/\"; \
 	  cp \"\$$RAPIDGZIP\" \"\$$BDIR/\" 2>/dev/null || true; \
@@ -276,8 +282,8 @@ bench-sm: ship-precheck
 	  echo ''; \
 	  python3 scripts/benchmark_single_member.py \
 	    --binaries \"\$$BDIR\" \
-	    --compressed-file \"\$$SM\" \
-	    --original-file \"\$$BD/silesia.tar\" \
+	    --compressed-file \"\$$SLG\" \
+	    --original-file \"\$$SL\" \
 	    --threads \"\$$THREADS\" \
 	    --output /tmp/bench-sm-result.json; \
 	  echo ''; \
