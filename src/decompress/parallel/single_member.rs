@@ -65,6 +65,10 @@ const WINDOW_SIZE: usize = 32_768;
 /// `decompress::decompress_single_member` gates at 10 MiB; this is the inner
 /// lower bound used by tests that exercise smaller fixtures.
 const MIN_PARALLEL_SIZE: usize = 4 * 1024 * 1024;
+/// Target compressed bytes per chunk. More chunks than threads allows
+/// work-stealing to balance decode time across workers even when block
+/// boundaries are unevenly spaced. 4 MB matches rapidgzip's default.
+const TARGET_COMPRESSED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Minimum threads to attempt parallel decode.
 const MIN_THREADS_FOR_PARALLEL: usize = 2;
@@ -255,15 +259,21 @@ pub fn decompress_parallel<W: Write>(
         gzip_data[isize_offset + 3],
     ]) as usize;
 
-    let num_chunks = num_threads;
+    // More chunks than threads lets work-stealing rebalance when block
+    // boundaries are unevenly spaced (e.g. gzip -9 on heterogeneous data).
+    // Workers are capped at num_threads; extra tasks queue up for idle threads.
+    let num_chunks = (deflate_data.len() / TARGET_COMPRESSED_CHUNK_BYTES)
+        .max(num_threads)
+        .max(1);
     let total_bits = deflate_data.len() * 8;
     let spacing_bits = total_bits / num_chunks;
 
     if debug_enabled() {
         eprintln!(
-            "[parallel_sm:v0.6] {} bytes deflate, {} chunks, spacing={}KB, isize={}",
+            "[parallel_sm:v0.6] {} bytes deflate, {} chunks ({} workers), spacing={}KB, isize={}",
             deflate_data.len(),
             num_chunks,
+            num_threads,
             spacing_bits / 8 / 1024,
             expected_size
         );
@@ -280,7 +290,8 @@ pub fn decompress_parallel<W: Write>(
     // predecessor's confirmed end_bit. Chunk 0 must always succeed
     // (anchored at bit 0); we still bail if it doesn't.
     let t_search = std::time::Instant::now();
-    let mut start_bits_opt = phase1_search_boundaries(deflate_data, num_chunks, spacing_bits);
+    let mut start_bits_opt =
+        phase1_search_boundaries(deflate_data, num_chunks, spacing_bits, num_threads);
     let search_elapsed = t_search.elapsed();
 
     if start_bits_opt[0].is_none() {
@@ -329,6 +340,7 @@ pub fn decompress_parallel<W: Write>(
         &start_bits,
         &end_limits,
         per_chunk_output_hint,
+        num_threads,
     );
     let decode_elapsed = t_decode.elapsed();
     let mut chunks: Vec<Option<ChunkResult>> = chunks_opt;
@@ -497,12 +509,13 @@ fn phase1_search_boundaries(
     deflate_data: &[u8],
     num_chunks: usize,
     spacing_bits: usize,
+    num_workers: usize,
 ) -> Vec<Option<usize>> {
     let results: Vec<Mutex<Option<usize>>> = (0..num_chunks).map(|_| Mutex::new(None)).collect();
     let next_task = AtomicUsize::new(0);
 
     std::thread::scope(|s| {
-        for _ in 0..num_chunks {
+        for _ in 0..num_workers {
             s.spawn(|| loop {
                 let idx = next_task.fetch_add(1, Ordering::Relaxed);
                 if idx >= num_chunks {
@@ -722,6 +735,7 @@ fn phase1_marker_decode_parallel_with_optional_starts(
     start_bits: &[Option<usize>],
     end_limits: &[Option<usize>],
     per_chunk_output_hint: usize,
+    num_workers: usize,
 ) -> Vec<Option<ChunkResult>> {
     let num_chunks = start_bits.len();
     let results: Vec<Mutex<Option<ChunkResult>>> =
@@ -729,7 +743,7 @@ fn phase1_marker_decode_parallel_with_optional_starts(
     let next_task = AtomicUsize::new(0);
 
     std::thread::scope(|s| {
-        for _ in 0..num_chunks {
+        for _ in 0..num_workers {
             s.spawn(|| loop {
                 let idx = next_task.fetch_add(1, Ordering::Relaxed);
                 if idx >= num_chunks {
