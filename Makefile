@@ -253,8 +253,8 @@ bench-sm: ship-precheck
 	  git fetch origin '$$BRANCH'; \
 	  git checkout -B '$$BRANCH' 'origin/$$BRANCH'; \
 	  git reset --hard 'origin/$$BRANCH'; \
-	  echo '  building gzippy...'; \
-	  cargo build --release 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
+	  echo '  building gzippy (--features isal-compression)...'; \
+	  cargo build --release --features isal-compression 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
 	  RAPIDGZIP=vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip; \
 	  if [ ! -x \"\$$RAPIDGZIP\" ]; then \
 	    echo '  building rapidgzip (first time only)...'; \
