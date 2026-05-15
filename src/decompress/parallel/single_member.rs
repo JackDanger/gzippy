@@ -1212,11 +1212,11 @@ fn phase1c_resolve_consistency(
                     start_bits[idx] = Some(pred_end);
                     chunks[idx] = Some(chunk);
                 }
-                Err(_) => {
+                Err(e) => {
                     if debug_enabled() {
                         eprintln!(
                             "[parallel_sm:v0.6] phase1c: re-decode of chunk {idx} from real \
-                             boundary {pred_end} failed; deflate stream likely corrupt"
+                             boundary {pred_end} failed: {e}; deflate stream likely corrupt"
                         );
                     }
                     return Err(ParallelError::DecodeFailed);
