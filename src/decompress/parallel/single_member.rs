@@ -1187,11 +1187,11 @@ fn phase1c_resolve_consistency(
                 // byte-padding before the gzip trailer. No decode needed.
                 near_eof_fills.push((i + 1, pred_end));
             } else {
-                let end_limit = if i + 2 < num_chunks {
-                    start_bits[i + 2]
-                } else {
-                    None
-                };
+                // Use the nearest subsequent phase1a-confirmed boundary as the
+                // stop hint. `start_bits[i+2]` is None when consecutive chunks
+                // all failed phase1a; in that case search further ahead so the
+                // decode doesn't run all the way to BFINAL.
+                let end_limit = (i + 2..num_chunks).find_map(|j| start_bits[j]);
                 specs.push((i + 1, pred_end, end_limit));
             }
         }
