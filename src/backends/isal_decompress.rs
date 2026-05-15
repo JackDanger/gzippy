@@ -517,8 +517,23 @@ pub fn decompress_deflate_from_bit_with_end(
         out_pos += written;
 
         match ret {
-            0 => {}        // ISAL_DECOMP_OK: continue, check block_state below
-            1 => break,    // ISAL_END_INPUT: consumed all input, state valid
+            0 => {} // ISAL_DECOMP_OK: continue, check block_state below
+            1 => {
+                // ISAL_END_INPUT: consumed all input. Only return a valid
+                // end_bit when at a real block boundary (ISAL_BLOCK_NEW_HDR).
+                // Mid-block truncation (ISAL_BLOCK_CODED, _HDR, _TYPE0) means
+                // `end_bit` would be non-boundary — return None so the caller
+                // falls back to the marker decoder, which always exits at a
+                // real block boundary past `end_bit_limit`.
+                let bs = state.block_state;
+                let at_boundary = bs == isal_raw::isal_block_state_ISAL_BLOCK_NEW_HDR
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_INPUT_DONE
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_FINISH;
+                if !at_boundary {
+                    return None;
+                }
+                break;
+            }
             2 => continue, // ISAL_OUT_OVERFLOW: buffer full, grow on next iteration
             _ => return None, // ISAL_INVALID_BLOCK (-1) or unknown: decode error;
                             // end_bit unreliable — return None so caller falls back

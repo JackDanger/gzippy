@@ -319,12 +319,24 @@ pub fn decompress_parallel<W: Write>(
     // chunk N+1's confirmed start. Chunks with `None` start get a `None`
     // decode result that phase 1c will fill in via chain-decode.
     let t_decode = std::time::Instant::now();
-    // end_limit[i] = start_bits[i+1] if both are Some; otherwise None and
-    // phase 1c applies the correction once chunk i decodes.
+    // end_limit[i] is chunk i's upper decode bound (exclusive bit offset).
+    //
+    // Preferred: start_bits[i+1] — the speculative real block boundary.
+    // Fallback: the anchor bit (i+1)*spacing_bits — used when the search
+    // failed (start_bits[i+1] = None). Even though it's not a real block
+    // boundary, it caps chunk i's decode so chunk i doesn't run to BFINAL
+    // and consume the rest of the stream. Phase 1c chains from chunk i's
+    // actual end_bit to re-decode chunk i+1 from the correct start.
+    //
+    // Without the fallback, a `None` upper bound lets chunk 0 decode the
+    // entire stream (~490 MB on silesia-large) whenever chunk 1's search
+    // fails — imbalance 26× and the parallel pipeline effectively degrades
+    // to sequential. The anchor cap keeps each chunk bounded to ~1× the
+    // target output size regardless of how many boundary searches fail.
     let end_limits: Vec<Option<usize>> = (0..num_chunks)
         .map(|i| {
             if i + 1 < num_chunks {
-                start_bits[i + 1]
+                start_bits[i + 1].or(Some((i + 1) * spacing_bits))
             } else {
                 None
             }
