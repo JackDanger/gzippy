@@ -1214,9 +1214,17 @@ fn phase1c_resolve_consistency(
                 }
                 Err(e) => {
                     if debug_enabled() {
+                        let is_valid =
+                            crate::decompress::parallel::fast_marker_inflate::validate_boundary(
+                                deflate_data,
+                                pred_end,
+                                1,
+                                1,
+                            )
+                            .is_ok();
                         eprintln!(
-                            "[parallel_sm:v0.6] phase1c: re-decode of chunk {idx} from real \
-                             boundary {pred_end} failed: {e}; deflate stream likely corrupt"
+                            "[parallel_sm:v0.6] phase1c: re-decode of chunk {idx} from \
+                             {pred_end} failed: {e}; validate_boundary({pred_end})={is_valid}"
                         );
                     }
                     return Err(ParallelError::DecodeFailed);
