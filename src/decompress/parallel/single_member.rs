@@ -347,12 +347,28 @@ pub fn decompress_parallel<W: Write>(
     // chunk may legitimately exceed it, so `decode_chunk_with_handoff`
     // adds 50% headroom.
     let per_chunk_output_hint = expected_size / num_chunks.max(1);
+    // ISA-L is only safe when the chunk's end_limit is a real block boundary.
+    // Anchor-based end_limits (where start_bits[i+1] was None) truncate the
+    // input at an arbitrary byte boundary; ISA-L at ISAL_END_INPUT returns
+    // ISAL_BLOCK_NEW_HDR which looks like a valid boundary but isn't one the
+    // marker decoder can continue from in phase1c. The marker decoder always
+    // stops at a real block boundary past end_bit_limit, so it's safe for all.
+    let use_isal_for_chunk: Vec<bool> = (0..num_chunks)
+        .map(|i| {
+            if i + 1 < num_chunks {
+                start_bits[i + 1].is_some()
+            } else {
+                true // last chunk: end_limit is None, ISA-L decodes to BFINAL
+            }
+        })
+        .collect();
     let chunks_opt = phase1_marker_decode_parallel_with_optional_starts(
         deflate_data,
         &start_bits,
         &end_limits,
         per_chunk_output_hint,
         num_threads,
+        &use_isal_for_chunk,
     );
     let decode_elapsed = t_decode.elapsed();
     let mut chunks: Vec<Option<ChunkResult>> = chunks_opt;
@@ -748,6 +764,7 @@ fn phase1_marker_decode_parallel_with_optional_starts(
     end_limits: &[Option<usize>],
     per_chunk_output_hint: usize,
     num_workers: usize,
+    use_isal_for_chunk: &[bool],
 ) -> Vec<Option<ChunkResult>> {
     let num_chunks = start_bits.len();
     let results: Vec<Mutex<Option<ChunkResult>>> =
@@ -765,12 +782,14 @@ fn phase1_marker_decode_parallel_with_optional_starts(
                     continue;
                 };
                 let end_limit = end_limits[idx];
+                let force_slow_path = !use_isal_for_chunk[idx];
                 if let Ok(chunk) = decode_chunk_with_handoff(
                     deflate_data,
                     start_bit,
                     end_limit,
                     per_chunk_output_hint,
                     num_chunks,
+                    force_slow_path,
                 ) {
                     *results[idx].lock().unwrap() = Some(chunk);
                 }
@@ -797,6 +816,7 @@ fn decode_chunk_with_handoff(
     end_bit_limit: Option<usize>,
     per_chunk_output_hint: usize,
     num_chunks_total: usize,
+    force_slow_path: bool,
 ) -> std::io::Result<ChunkResult> {
     let t_worker = std::time::Instant::now();
     // Phase 1 of the worker: bootstrap. Decode the chunk's first ~32 KB
@@ -829,14 +849,27 @@ fn decode_chunk_with_handoff(
 
     // Phase 2 of the worker: ISA-L bulk decode from `bootstrap_end_bit`,
     // seeded with the 32 KB clean window as `isal_inflate_set_dict`.
-    // Pass a slice bounded by the chunk's speculative end so ISA-L
-    // cannot run past the next chunk's territory; on healthy data
-    // BlockFinder's pick is a real boundary and ISA-L stops there
-    // naturally. On a BTYPE=01 false-positive pick, ISA-L may stop
-    // short (or run on) — phase 1c then sees
-    // `chunks[N].end_bit != chunks[N+1].start` and corrects.
+    // Skipped when `force_slow_path` is set — used for anchor-based
+    // end_limits (no real speculative boundary) where ISA-L's truncated
+    // input would produce a non-boundary end_bit, violating the G1
+    // invariant used by phase 1c. The marker decoder always stops at a
+    // real block boundary past end_bit_limit (see decode_loop contract).
     #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
     {
+        if force_slow_path {
+            let _ = (per_chunk_output_hint, num_chunks_total);
+            SLOW_PATH_USED.fetch_add(1, Ordering::Relaxed);
+            return marker_finish_after_bootstrap(
+                deflate_data,
+                bootstrap_markers,
+                bootstrap_end_bit,
+                end_bit_limit,
+            )
+            .map(|mut c| {
+                c.worker_elapsed = t_worker.elapsed();
+                c
+            });
+        }
         // Bound input to the chunk's envelope. Without the chunk
         // boundary trim, ISA-L would decode all the way to BFINAL on
         // every chunk — quadratic total work, defeating the parallel
@@ -925,7 +958,12 @@ fn decode_chunk_with_handoff(
     // unreachable in production but is kept for build correctness.
     #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
     {
-        let _ = (dict, per_chunk_output_hint, num_chunks_total);
+        let _ = (
+            dict,
+            per_chunk_output_hint,
+            num_chunks_total,
+            force_slow_path,
+        );
         SLOW_PATH_USED.fetch_add(1, Ordering::Relaxed);
         marker_finish_after_bootstrap(
             deflate_data,
@@ -1155,6 +1193,7 @@ fn phase1c_resolve_consistency(
                                 end_limit,
                                 per_chunk_output_hint,
                                 num_chunks,
+                                false,
                             ),
                         )
                     })
@@ -1754,6 +1793,7 @@ mod tests {
             end_limit_0,
             per_chunk_hint,
             num_chunks,
+            false,
         ) {
             Ok(c) => c,
             Err(_) => return, // ISA-L decode failed on this platform — skip
@@ -1769,6 +1809,7 @@ mod tests {
             end_limit_2,
             per_chunk_hint,
             num_chunks,
+            false,
         ) {
             Ok(c) => c,
             Err(_) => return,
