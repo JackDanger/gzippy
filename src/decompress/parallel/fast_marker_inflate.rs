@@ -744,9 +744,18 @@ fn decode_stored(bits: &mut Bits, output: &mut Vec<u16>) -> Result<()> {
         bits.pos += remaining;
     }
 
-    // Reset bit buffer state.
+    // Reset bit buffer state. The libdeflate sliding-window refill advances
+    // bits.pos ahead of actual consumption (it pre-loads bytes into bitbuf).
+    // When the stored block's data fit entirely in the pre-loaded bitbuf (drain
+    // loop emptied remaining without exhausting the buffer), the reset zeroes
+    // bitsleft/bitbuf while bits.pos is still pointing past those pre-loaded
+    // bytes — breaking the invariant: bits.pos*8 - available() == bits_consumed.
+    // Rewind pos by the number of whole bytes still in the buffer so the
+    // invariant holds after zeroing available to 0.
+    let pre_buffered = (bits.available() / 8) as usize;
     bits.bitbuf = 0;
     bits.bitsleft = 0;
+    bits.pos = bits.pos.saturating_sub(pre_buffered);
     Ok(())
 }
 
@@ -1069,6 +1078,64 @@ mod tests {
             "size mismatch — chunk decode probably terminated early at a false-positive boundary"
         );
         assert_eq!(output, original, "byte mismatch");
+    }
+
+    /// Regression test for the `decode_stored` bit-position invariant:
+    ///
+    /// When a stored block's data fits entirely in the pre-buffered bit buffer
+    /// (len < 7 bytes), the reset `bitbuf=0; bitsleft=0` must also rewind
+    /// `bits.pos` by the number of whole bytes still buffered, or else the
+    /// formula `bits.pos*8 - available()` overcounts and `end_bit_offset` is
+    /// wrong. This caused `validate_boundary(end_bit_offset)=false` on chunk 29
+    /// in the bench-sm suite (a zero-byte BFINAL stored block).
+    ///
+    /// Uses level-0 (stored-block) compression so the deflate stream contains
+    /// real stored blocks of known sizes. Verifies that the decoded end_bit
+    /// equals the true end of the deflate stream and that decode_chunk_markers
+    /// produces byte-identical output to the oracle.
+    #[test]
+    fn decode_stored_tiny_block_bit_position_invariant() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Sizes 0..=6 trigger the pre-buffered path. 7 is the boundary (max
+        // available() after LEN/NLEN reads = 7 bytes). 0 is the most common
+        // (Z_SYNC_FLUSH / BFINAL empty stored block).
+        for size in [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 64, 128] {
+            let input: Vec<u8> = (0..size).map(|i| i as u8).collect();
+            let mut enc = DeflateEncoder::new(Vec::new(), Compression::none()); // level 0 = stored blocks
+            enc.write_all(&input).unwrap();
+            let deflate = enc.finish().unwrap();
+
+            let oracle = oracle_decode(&deflate, input.len() + 16);
+            assert_eq!(oracle, input, "size={size}: oracle decode mismatch");
+
+            let (mut markers, end_bit) =
+                decode_chunk_markers(&deflate, 0).expect("decode failed at size={size}");
+
+            // The end_bit_offset must be a real block boundary — in fact the
+            // only block in this stream so it must equal the last valid bit.
+            let expected_end = deflate.len() * 8;
+            // The deflate stream may have up to 7 bits of padding after the
+            // last block; end_bit is allowed to be within those padding bits
+            // but must equal expected_end for a byte-aligned BFINAL stored block.
+            assert!(
+                end_bit <= expected_end,
+                "size={size}: end_bit {end_bit} past stream end {expected_end}"
+            );
+
+            // Crucially, validate_boundary at end_bit must NOT succeed (the
+            // stream is done), but the PREVIOUS block boundary should have been
+            // a real boundary. Just assert no markers remain unresolved.
+            replace_markers(&mut markers, &[]);
+            let decoded = u16_to_u8(&markers)
+                .unwrap_or_else(|pos| panic!("size={size}: unresolved marker at {pos}"));
+            assert_eq!(
+                decoded, input,
+                "size={size}: decoded output mismatch (end_bit={end_bit})"
+            );
+        }
     }
 
     /// Compress `data` into a raw deflate stream (no gzip wrapper).

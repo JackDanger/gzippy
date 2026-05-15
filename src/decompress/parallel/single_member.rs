@@ -385,13 +385,30 @@ pub fn decompress_parallel<W: Write>(
                     let boot_kb = c.bootstrap.len() / 2 / 1024; // u16→u8, then →KB
                     let isal_kb = c.isal_bytes.len() / 1024;
                     let total_kb = c.bootstrap.len() / 2 / 1024 + isal_kb;
+                    // G1 invariant: every phase1b result must land at a real block
+                    // boundary. debug_assert catches regressions in decode primitives
+                    // (e.g. decode_stored bit-position bug) at chunk granularity
+                    // rather than 10 chunks later in phase1c.
+                    debug_assert!(
+                        crate::decompress::parallel::fast_marker_inflate::validate_boundary(
+                            deflate_data,
+                            c.end_bit_offset,
+                            1,
+                            1,
+                        )
+                        .is_ok(),
+                        "G1 invariant: chunk {} end_bit_offset {} is not a real block boundary",
+                        i,
+                        c.end_bit_offset,
+                    );
                     eprintln!(
-                        "  chunk {:2}: {:4}ms  boot={:4}KB  isal={:6}KB  total={:6}KB",
+                        "  chunk {:2}: {:4}ms  boot={:4}KB  isal={:6}KB  total={:6}KB  end_bit={}",
                         i,
                         c.worker_elapsed.as_millis(),
                         boot_kb,
                         isal_kb,
                         total_kb,
+                        c.end_bit_offset,
                     );
                 }
                 None => {
@@ -446,6 +463,32 @@ pub fn decompress_parallel<W: Write>(
         .into_iter()
         .map(|c| c.expect("phase 1c guarantees all chunks decoded"))
         .collect();
+
+    // G1 assertion after phase1c: every chunk's end_bit_offset must be a real
+    // deflate block boundary. This catches decode primitive bugs (like the
+    // decode_stored invariant break) that phase1c may have propagated forward.
+    #[cfg(debug_assertions)]
+    for (i, chunk) in chunks.iter().enumerate() {
+        debug_assert!(
+            crate::decompress::parallel::fast_marker_inflate::validate_boundary(
+                deflate_data,
+                chunk.end_bit_offset,
+                1,
+                1,
+            )
+            .is_ok()
+                || {
+                    // The last chunk's end_bit_offset may be past BFINAL with
+                    // only zero-padding bits remaining — validate_boundary will
+                    // fail there because there are no more blocks to decode.
+                    // Accept only if we're within 1 byte of the stream end.
+                    i + 1 == chunks.len() && total_bits.saturating_sub(chunk.end_bit_offset) < 8
+                },
+            "G1 invariant after phase1c: chunk {} end_bit_offset {} is not a real block boundary",
+            i,
+            chunk.end_bit_offset,
+        );
+    }
 
     // ── Phase 2 + streaming write: resolve markers → write → combine CRCs ───
     //
@@ -833,11 +876,27 @@ fn decode_chunk_with_handoff(
     BOOTSTRAP_OUTPUT_BYTES.fetch_add(bootstrap_markers.len() as u64, Ordering::Relaxed);
 
     // No clean window? Two reasons: (1) end_bit_limit reached before
-    // 32 KB clean tail accumulated (tiny chunk), or (2) BFINAL hit
-    // (last chunk smaller than 32 KB of output). Either way the
-    // bootstrap markers cover the chunk's intended range — phase 2
-    // resolves them as in the pre-handoff design.
+    // 32 KB clean tail accumulated (tiny/anchor chunk), or (2) BFINAL hit.
+    // For force_slow_path chunks (anchor-based end_bit_limit, no ISA-L),
+    // fall through to marker_finish_after_bootstrap so the full chunk range
+    // is decoded and end_bit_offset reflects a real boundary past the anchor.
+    // For normal ISA-L chunks, bootstrap markers cover the chunk's intended
+    // range — phase 2 resolves them as in the pre-handoff design.
     let Some(dict) = clean_window else {
+        #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+        if force_slow_path {
+            SLOW_PATH_USED.fetch_add(1, Ordering::Relaxed);
+            return marker_finish_after_bootstrap(
+                deflate_data,
+                bootstrap_markers,
+                bootstrap_end_bit,
+                end_bit_limit,
+            )
+            .map(|mut c| {
+                c.worker_elapsed = t_worker.elapsed();
+                c
+            });
+        }
         return Ok(ChunkResult {
             bootstrap: bootstrap_markers,
             isal_bytes: Vec::new(),
@@ -1214,17 +1273,9 @@ fn phase1c_resolve_consistency(
                 }
                 Err(e) => {
                     if debug_enabled() {
-                        let is_valid =
-                            crate::decompress::parallel::fast_marker_inflate::validate_boundary(
-                                deflate_data,
-                                pred_end,
-                                1,
-                                1,
-                            )
-                            .is_ok();
                         eprintln!(
                             "[parallel_sm:v0.6] phase1c: re-decode of chunk {idx} from \
-                             {pred_end} failed: {e}; validate_boundary({pred_end})={is_valid}"
+                             {pred_end} failed: {e}"
                         );
                     }
                     return Err(ParallelError::DecodeFailed);
