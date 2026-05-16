@@ -401,14 +401,27 @@ pub fn decompress_parallel<W: Write>(
                         i,
                         c.end_bit_offset,
                     );
+                    // Annotate whether end_limit was a confirmed phase1a
+                    // boundary or an anchor fallback (start_bits[i+1]=None).
+                    let end_limit_kind = if i + 1 < chunks.len() {
+                        if start_bits[i + 1].is_some() {
+                            "real"
+                        } else {
+                            "anchor"
+                        }
+                    } else {
+                        "none(last)"
+                    };
                     eprintln!(
-                        "  chunk {:2}: {:4}ms  boot={:4}KB  isal={:6}KB  total={:6}KB  end_bit={}",
+                        "  chunk {:2}: {:4}ms  boot={:4}KB  isal={:6}KB  \
+                         total={:6}KB  end_bit={}  limit={}",
                         i,
                         c.worker_elapsed.as_millis(),
                         boot_kb,
                         isal_kb,
                         total_kb,
                         c.end_bit_offset,
+                        end_limit_kind,
                     );
                 }
                 None => {
@@ -869,20 +882,45 @@ fn decode_chunk_with_handoff(
         markers: bootstrap_markers,
         end_bit_offset: bootstrap_end_bit,
         clean_window,
+        bfinal_hit,
     } = decode_chunk_bootstrap(deflate_data, start_bit, end_bit_limit)?;
 
     // Track bootstrap output for the "is the handoff actually firing"
     // assertion in tests::routing — see HANDOFF_FIRED rationale.
     BOOTSTRAP_OUTPUT_BYTES.fetch_add(bootstrap_markers.len() as u64, Ordering::Relaxed);
 
-    // No clean window? Two reasons: (1) end_bit_limit reached before
-    // 32 KB clean tail accumulated (tiny/anchor chunk), or (2) BFINAL hit.
-    // For force_slow_path chunks (anchor-based end_bit_limit, no ISA-L),
-    // fall through to marker_finish_after_bootstrap so the full chunk range
-    // is decoded and end_bit_offset reflects a real boundary past the anchor.
-    // For normal ISA-L chunks, bootstrap markers cover the chunk's intended
-    // range — phase 2 resolves them as in the pre-handoff design.
+    // No clean window? Three reasons:
+    //   (a) end_bit_limit reached before 32 KB clean tail accumulated.
+    //   (b) BFINAL was hit before accumulating a clean 32 KB window.
+    //   (c) BFINAL was hit with a clean window but output < WINDOW_SIZE.
+    //
+    // Case (b)/(c) with bfinal_hit=true: calling marker_finish_after_bootstrap
+    // would attempt to decode past BFINAL, reading gzip trailer bytes or
+    // unrelated stream data as deflate blocks. This produces an invalid
+    // end_bit that breaks phase 1c's G1 invariant (observed as "Stored
+    // LEN/NLEN mismatch" on the successor's re-decode). Returning Err here
+    // discards the result; phase 1b stores None for this chunk, and phase 1c
+    // re-decodes it from its predecessor's confirmed end_bit — correct behavior.
     let Some(dict) = clean_window else {
+        if bfinal_hit {
+            if debug_enabled() {
+                eprintln!(
+                    "[parallel_sm:v0.6] chunk start={start_bit}: BFINAL hit at {bootstrap_end_bit} \
+                     before end_limit={end_bit_limit:?} ({output_kb} KB output) — discarding, \
+                     phase1c will re-derive from predecessor",
+                    output_kb = bootstrap_markers.len() / 2 / 1024,
+                );
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "BFINAL in bootstrap before chunk boundary — result discarded",
+            ));
+        }
+        // Case (a): end_bit_limit was reached before clean window.
+        // The force_slow_path branch below (anchor-based chunks) continues
+        // with the marker decoder to decode the rest of the chunk range.
+        // Without force_slow_path (ISA-L enabled), return the bootstrap
+        // result directly — the chunk may be tiny or high-entropy.
         #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
         if force_slow_path {
             SLOW_PATH_USED.fetch_add(1, Ordering::Relaxed);
@@ -1138,6 +1176,7 @@ fn phase1c_resolve_consistency(
     //   - chunks[i] is Some ⟹ its start_bit is a real block boundary (G1)
     //   - deadline enforces that adversarial inputs don't spin forever
     let mut scan_start: usize = 0;
+    let mut wave_num: u32 = 0;
     loop {
         // ── Read-only scan: classify corrections this wave ──────────────────
         // Two categories:
@@ -1242,12 +1281,22 @@ fn phase1c_resolve_consistency(
         MARKER_PIPELINE_RETRY_ITERATIONS.fetch_add(specs.len() as u64, Ordering::Relaxed);
 
         if debug_enabled() {
-            for &(idx, start_bit, _) in &specs {
+            for &(idx, start_bit, end_limit) in &specs {
                 eprintln!(
-                    "[parallel_sm:v0.6] phase1c: correcting chunk {idx} start to {start_bit}"
+                    "[parallel_sm:v0.6] phase1c wave {wave_num}: correcting chunk {idx} \
+                     start={start_bit} end_limit={end_limit:?} \
+                     range_mb={:.1}",
+                    end_limit
+                        .map(|e| e.saturating_sub(start_bit) as f64 / 8.0 / 1e6)
+                        .unwrap_or(0.0)
                 );
             }
         }
+        let t_wave = if debug_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         // ── Parallel re-decode of all independent corrections this wave ─────
         // `thread::scope` guarantees all threads join before we mutate
@@ -1279,6 +1328,17 @@ fn phase1c_resolve_consistency(
                 .map(|h| h.join().expect("phase1c correction thread panicked"))
                 .collect()
         });
+
+        if debug_enabled() {
+            if let Some(t) = t_wave {
+                eprintln!(
+                    "[parallel_sm:v0.6] phase1c wave {wave_num}: {n} corrections in {ms:.1}ms",
+                    n = specs.len(),
+                    ms = t.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+        }
+        wave_num += 1;
 
         // ── Commit results ───────────────────────────────────────────────────
         for (idx, pred_end, result) in results {

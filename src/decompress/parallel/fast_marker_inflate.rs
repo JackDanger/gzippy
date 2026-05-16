@@ -332,6 +332,13 @@ pub struct BootstrapResult {
     /// `markers` covers the whole chunk and phase-2 marker-resolve runs
     /// over it as in the pre-handoff design.
     pub clean_window: Option<Vec<u8>>,
+    /// True when the bootstrap exited because it decoded a BFINAL=1 block
+    /// before accumulating a clean 32 KB window AND before reaching
+    /// `end_bit_limit`. This distinguishes a genuine stream-end from an
+    /// anchor-cap stop, and signals that `end_bit_offset` may be at a
+    /// real BFINAL block boundary that is NOT a valid starting point for
+    /// the next chunk (no deflate data follows BFINAL).
+    pub bfinal_hit: bool,
 }
 
 /// Bootstrap-mode variant of [`decode_chunk_markers_bounded`]. Decodes
@@ -399,6 +406,14 @@ pub fn decode_chunk_bootstrap(
         .saturating_sub(bits_in_buf as usize);
     let end_bit_offset = byte_offset * 8 + bits_consumed_from_slice;
 
+    // bfinal_hit: bootstrap stopped before end_bit_limit (or last chunk with
+    // None limit) because it decoded a BFINAL=1 block. Distinguished from
+    // end_bit_limit stop by comparing end_bit_offset to the limit.
+    let bfinal_hit = !handoff_at_boundary
+        && end_bit_limit
+            .map(|limit| end_bit_offset < limit)
+            .unwrap_or(false);
+
     let clean_window = if handoff_at_boundary && output.len() >= WINDOW_SIZE {
         // Last 32 KB MUST be marker-free here per the bootstrap-stop
         // check at the top of decode_loop. Use `assert!` rather than
@@ -436,6 +451,7 @@ pub fn decode_chunk_bootstrap(
         markers: output,
         end_bit_offset,
         clean_window,
+        bfinal_hit,
     })
 }
 
