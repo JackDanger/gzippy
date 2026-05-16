@@ -1496,12 +1496,16 @@ fn phase1c_resolve_consistency(
         let mut specs: Vec<CorrectionDecode> = Vec::new();
         let mut new_scan_start = scan_start;
 
-        for i in scan_start..num_chunks - 1 {
+        let mut i = scan_start;
+        while i < num_chunks - 1 {
             let pred_end = match &chunks[i] {
                 Some(c) => c.end_bit_offset,
                 // Predecessor not yet resolved — its correction will appear in
                 // a later wave once this wave resolves chunks[i].
-                None => continue,
+                None => {
+                    i += 1;
+                    continue;
+                }
             };
 
             // Guard: chunk i's own start must be confirmed correct before we use
@@ -1518,6 +1522,7 @@ fn phase1c_resolve_consistency(
                     None => false,
                 };
                 if !start_ok {
+                    i += 1;
                     continue;
                 }
             }
@@ -1531,25 +1536,51 @@ fn phase1c_resolve_consistency(
                 if new_scan_start == i {
                     new_scan_start = i + 1;
                 }
+                i += 1;
                 continue;
             }
 
-            if total_bits.saturating_sub(pred_end) < 8 {
-                // Predecessor consumed BFINAL; remaining bits are only
-                // byte-padding before the gzip trailer. No decode needed.
-                empty_fills.push(EmptyChunkFill::new(i + 1, ChunkStart::from_bits(pred_end)));
-            } else {
+            let fill_start = ChunkStart::from_bits(pred_end);
+            let mut fill_run_to = i;
+            let mut should_fill = total_bits.saturating_sub(pred_end) < 8;
+            if !should_fill {
                 let stop = correction_decode_stop(i + 1, start_bits);
-                if stop
+                should_fill = stop
                     .hint_bits()
-                    .is_some_and(|stop_bits| pred_end >= stop_bits)
-                {
-                    empty_fills.push(EmptyChunkFill::new(i + 1, ChunkStart::from_bits(pred_end)));
+                    .is_some_and(|stop_bits| pred_end >= stop_bits);
+                if !should_fill {
+                    let plan = ChunkDecodePlan::new(fill_start, stop);
+                    specs.push(CorrectionDecode::new(i + 1, plan));
+                    i += 1;
                     continue;
                 }
-                let plan = ChunkDecodePlan::new(ChunkStart::from_bits(pred_end), stop);
-                specs.push(CorrectionDecode::new(i + 1, plan));
             }
+
+            // A predecessor that already reached/passed the next verified
+            // boundary subsumes every following phantom chunk in the same run.
+            // Collapse the whole empty tail now instead of draining it one
+            // wave at a time.
+            empty_fills.push(EmptyChunkFill::new(i + 1, fill_start));
+            let mut j = i + 1;
+            while j < num_chunks - 1 {
+                let next_needs = chunks[j + 1].is_none() || (start_bits[j + 1] != Some(fill_start));
+                if !next_needs {
+                    break;
+                }
+                let next_stop = correction_decode_stop(j + 1, start_bits);
+                if total_bits.saturating_sub(pred_end) < 8
+                    || next_stop
+                        .hint_bits()
+                        .is_some_and(|stop_bits| pred_end >= stop_bits)
+                {
+                    empty_fills.push(EmptyChunkFill::new(j + 1, fill_start));
+                    fill_run_to = j + 1;
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+            i = fill_run_to + 1;
         }
 
         scan_start = new_scan_start;
