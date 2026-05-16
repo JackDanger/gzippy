@@ -903,21 +903,10 @@ fn chunk_partition_end_bits(
 fn chunk_decode_stop(
     idx: usize,
     start_bits: &[Option<ChunkStart>],
-    spacing_bits: usize,
-    total_bits: usize,
+    _spacing_bits: usize,
+    _total_bits: usize,
 ) -> ChunkDecodeStop {
-    if idx + 1 >= start_bits.len() {
-        ChunkDecodeStop::UntilEnd
-    } else if let Some(next_start) = start_bits[idx + 1] {
-        ChunkDecodeStop::Verified(next_start.to_end_limit())
-    } else {
-        ChunkDecodeStop::Approximate(ApproximateChunkEnd(chunk_partition_end_bits(
-            idx,
-            spacing_bits,
-            total_bits,
-            start_bits.len(),
-        )))
-    }
+    correction_decode_stop(idx, start_bits)
 }
 
 #[inline]
@@ -2455,13 +2444,13 @@ mod tests {
 
         assert_eq!(
             chunk_decode_stop(11, &start_bits, spacing_bits, total_bits),
-            ChunkDecodeStop::Approximate(ApproximateChunkEnd(12 * spacing_bits)),
-            "chunk 11 must stop at its own partition instead of chunk 17's boundary",
+            ChunkDecodeStop::Verified(ChunkStart::from_bits(17 * spacing_bits).to_end_limit()),
+            "chunk 11 should still stop at the next downstream verified boundary",
         );
         assert_eq!(
             chunk_decode_stop(27, &start_bits, spacing_bits, total_bits),
-            ChunkDecodeStop::Approximate(ApproximateChunkEnd(28 * spacing_bits)),
-            "chunk 27 must stop at its own partition instead of chunk 33's boundary",
+            ChunkDecodeStop::Verified(ChunkStart::from_bits(33 * spacing_bits).to_end_limit()),
+            "chunk 27 should still stop at the next downstream verified boundary",
         );
 
         let mut chunks: Vec<Option<ChunkResult>> = (0..num_chunks)
