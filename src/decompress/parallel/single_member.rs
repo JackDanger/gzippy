@@ -1274,12 +1274,19 @@ fn normalize_isal_end_bit(
     end_bit_limit: Option<ChunkEndLimit>,
     isal_end_bit: usize,
 ) -> Option<RealBlockBoundary> {
+    const ISA_L_END_BIT_SNAP_TOLERANCE_BITS: usize = 64;
+
     if isal_end_bit < start_bit.bits() {
         return None;
     }
 
     match end_bit_limit {
-        Some(limit) if isal_end_bit == limit.bits() => Some(limit.boundary()),
+        Some(limit)
+            if isal_end_bit >= limit.bits()
+                && isal_end_bit - limit.bits() <= ISA_L_END_BIT_SNAP_TOLERANCE_BITS =>
+        {
+            Some(limit.boundary())
+        }
         Some(_) => None,
         None => Some(RealBlockBoundary(isal_end_bit)),
     }
@@ -2440,7 +2447,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_isal_end_bit_requires_exact_verified_limit() {
+    fn normalize_isal_end_bit_snaps_small_verified_overshoot() {
         let start = ChunkStart::from_bits(128);
         let limit = ChunkStart::from_bits(512).to_end_limit();
 
@@ -2448,7 +2455,15 @@ mod tests {
             normalize_isal_end_bit(start, Some(limit), 512),
             Some(limit.boundary())
         );
-        assert_eq!(normalize_isal_end_bit(start, Some(limit), 513), None);
+        assert_eq!(
+            normalize_isal_end_bit(start, Some(limit), 513),
+            Some(limit.boundary())
+        );
+        assert_eq!(
+            normalize_isal_end_bit(start, Some(limit), 512 + 64),
+            Some(limit.boundary())
+        );
+        assert_eq!(normalize_isal_end_bit(start, Some(limit), 512 + 65), None);
         assert_eq!(normalize_isal_end_bit(start, Some(limit), 500), None);
         assert_eq!(
             normalize_isal_end_bit(start, None, 700),
@@ -2459,7 +2474,7 @@ mod tests {
 
     #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
     #[test]
-    fn decode_chunk_with_handoff_canonicalizes_to_verified_end_limit() {
+    fn decode_chunk_with_handoff_snaps_to_verified_end_limit() {
         use crate::decompress::parallel::marker_decode::skip_gzip_header;
 
         let original = make_compressible_data(4 * 1024 * 1024);
@@ -2488,7 +2503,7 @@ mod tests {
         assert_eq!(
             chunk.end_bit_offset,
             end_limit.bits(),
-            "ISA-L worker must return the verified downstream boundary exactly"
+            "ISA-L worker must snap small ISA-L end-bit overshoots to the verified downstream boundary"
         );
     }
 
