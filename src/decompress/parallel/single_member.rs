@@ -189,11 +189,19 @@ struct BoundarySlot {
 
 #[derive(Debug)]
 struct BoundaryRegistry {
+    anchors: Vec<usize>,
     slots: Vec<BoundarySlot>,
 }
 
 impl BoundaryRegistry {
-    fn from_speculative_starts(speculative_starts: Vec<Option<ChunkStart>>) -> Self {
+    fn from_speculative_starts(
+        speculative_starts: Vec<Option<ChunkStart>>,
+        spacing_bits: usize,
+        total_bits: usize,
+    ) -> Self {
+        let anchors = (0..speculative_starts.len())
+            .map(|idx| (idx * spacing_bits).min(total_bits))
+            .collect();
         let mut slots: Vec<BoundarySlot> = speculative_starts
             .into_iter()
             .map(|start| BoundarySlot {
@@ -204,7 +212,7 @@ impl BoundaryRegistry {
         if let Some(first) = slots.first_mut() {
             first.confirmed = Some(ChunkStart::from_bits(0));
         }
-        Self { slots }
+        Self { anchors, slots }
     }
 
     #[inline]
@@ -253,6 +261,32 @@ impl BoundaryRegistry {
 
     fn confirm_next_start_from_end(&mut self, idx: usize, end: RealBlockBoundary) {
         self.confirm_start(idx + 1, ChunkStart(end));
+    }
+
+    fn promote_discovered_boundaries(
+        &mut self,
+        source_partition: usize,
+        discovered_boundaries: &[RealBlockBoundary],
+    ) {
+        if discovered_boundaries.is_empty() {
+            return;
+        }
+        let mut boundary_idx = 0usize;
+        for idx in source_partition + 1..self.len() {
+            if self.confirmed_start(idx).is_some() {
+                continue;
+            }
+            let anchor = self.anchors[idx];
+            while boundary_idx < discovered_boundaries.len()
+                && discovered_boundaries[boundary_idx].bits() < anchor
+            {
+                boundary_idx += 1;
+            }
+            let Some(boundary) = discovered_boundaries.get(boundary_idx).copied() else {
+                break;
+            };
+            self.confirm_start(idx, ChunkStart(boundary));
+        }
     }
 
     fn confirmed_starts(&self) -> Vec<Option<ChunkStart>> {
@@ -492,7 +526,8 @@ pub fn decompress_parallel<W: Write>(
             );
         }
     }
-    let mut boundaries = BoundaryRegistry::from_speculative_starts(start_bits_opt);
+    let mut boundaries =
+        BoundaryRegistry::from_speculative_starts(start_bits_opt, spacing_bits, total_bits);
 
     // ── Phase 1b: parallel marker decode from speculative starts ────────────
     //
@@ -1049,6 +1084,7 @@ struct CandidateChunk {
     requested_partition: usize,
     discovered_start: ChunkStart,
     discovered_end: RealBlockBoundary,
+    discovered_boundaries: Vec<RealBlockBoundary>,
     chunk: ChunkResult,
 }
 
@@ -1115,6 +1151,7 @@ impl PartitionRegistry {
                     requested_partition: idx,
                     discovered_start: start_bits[idx].unwrap_or(ChunkStart::from_bits(0)),
                     discovered_end: RealBlockBoundary(chunk.end_bit_offset),
+                    discovered_boundaries: Vec::new(),
                     chunk,
                 }),
                 None => PartitionState::NoDecode,
@@ -1619,10 +1656,25 @@ fn decode_chunk_inexact(
                 let split_at = bootstrap_markers.len().saturating_sub(dict.len());
                 let mut bootstrap = bootstrap_markers;
                 bootstrap.truncate(split_at);
+                let discovered_boundaries =
+                    crate::decompress::parallel::fast_marker_inflate::record_block_starts_bounded(
+                        deflate_data,
+                        start_bit.bits(),
+                        Some(verified_end_bit.bits()),
+                    )
+                    .map(|starts| {
+                        starts
+                            .into_iter()
+                            .skip(1)
+                            .map(RealBlockBoundary)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 WorkerOutcome::Candidate(CandidateChunk {
                     requested_partition,
                     discovered_start: start_bit,
                     discovered_end: verified_end_bit,
+                    discovered_boundaries,
                     chunk: ChunkResult {
                         bootstrap,
                         bootstrap_clean: dict,
@@ -1902,9 +1954,13 @@ fn reconcile_partitions(
 
         let end_limit = boundaries.exact_end_limit_for(idx);
         let candidate = partitions.take_speculative(idx);
-        let authoritative = match candidate {
+        let (authoritative, discovered_boundaries) = match candidate {
             Some(candidate) if candidate.discovered_start == expected_start => {
-                AuthoritativeChunk::from_candidate(candidate)
+                let discovered_boundaries = candidate.discovered_boundaries.clone();
+                (
+                    AuthoritativeChunk::from_candidate(candidate),
+                    Some(discovered_boundaries),
+                )
             }
             Some(candidate) => {
                 if debug_enabled() {
@@ -1917,6 +1973,20 @@ fn reconcile_partitions(
                         candidate.discovered_end.bits(),
                     );
                 }
+                (
+                    exact_or_empty_authoritative(
+                        deflate_data,
+                        idx,
+                        expected_start,
+                        end_limit,
+                        deadline,
+                        per_chunk_output_hint,
+                        partitions.len(),
+                    )?,
+                    None,
+                )
+            }
+            None => (
                 exact_or_empty_authoritative(
                     deflate_data,
                     idx,
@@ -1925,17 +1995,9 @@ fn reconcile_partitions(
                     deadline,
                     per_chunk_output_hint,
                     partitions.len(),
-                )?
-            }
-            None => exact_or_empty_authoritative(
-                deflate_data,
-                idx,
-                expected_start,
-                end_limit,
-                deadline,
-                per_chunk_output_hint,
-                partitions.len(),
-            )?,
+                )?,
+                None,
+            ),
         };
 
         if end_limit.is_none() && authoritative.chunk.decoded_len() == 0 {
@@ -1954,6 +2016,9 @@ fn reconcile_partitions(
             PartitionState::NoDecode | PartitionState::Speculative(_) => unreachable!(),
         };
         boundaries.confirm_start(idx, expected_start);
+        if let Some(discovered_boundaries) = discovered_boundaries.as_deref() {
+            boundaries.promote_discovered_boundaries(idx, discovered_boundaries);
+        }
         boundaries.confirm_next_start_from_end(idx, end);
     }
 
@@ -1971,7 +2036,9 @@ fn phase1c_resolve_consistency(
     per_chunk_output_hint: usize,
     _spacing_bits: usize,
 ) -> Result<(), ParallelError> {
-    let mut boundaries = BoundaryRegistry::from_speculative_starts(start_bits.to_vec());
+    let total_bits = deflate_data.len() * 8;
+    let mut boundaries =
+        BoundaryRegistry::from_speculative_starts(start_bits.to_vec(), _spacing_bits, total_bits);
     let mut partitions = PartitionRegistry::from_legacy_chunks(start_bits, chunks);
     reconcile_partitions(
         deflate_data,

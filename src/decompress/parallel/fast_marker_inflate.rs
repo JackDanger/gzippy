@@ -346,6 +346,41 @@ pub fn decode_chunk_markers_bounded(
     Ok((output, end_bit_offset))
 }
 
+/// Decode a bounded range while recording every deflate block-start bit position
+/// encountered. The first entry is always `start_bit_offset`.
+pub fn record_block_starts_bounded(
+    data: &[u8],
+    start_bit_offset: usize,
+    end_bit_limit: Option<usize>,
+) -> Result<Vec<usize>> {
+    let byte_offset = start_bit_offset / 8;
+    let bit_in_byte = (start_bit_offset % 8) as u32;
+    if byte_offset >= data.len() {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "start_bit_offset past end of data",
+        ));
+    }
+
+    let mut bits = Bits::new(&data[byte_offset..]);
+    if bit_in_byte > 0 {
+        bits.consume(bit_in_byte);
+    }
+
+    let mut output = Vec::new();
+    let mut starts = Vec::new();
+    decode_loop(
+        &mut bits,
+        &mut output,
+        byte_offset,
+        bit_in_byte,
+        Some(&mut starts),
+        end_bit_limit,
+        None,
+    )?;
+    Ok(starts)
+}
+
 /// Result from [`decode_chunk_bootstrap`]: a marker decoder run that exits
 /// early at the first block boundary where the trailing 32 KB of decoded
 /// output is provably marker-free, so the caller can hand off to ISA-L with
