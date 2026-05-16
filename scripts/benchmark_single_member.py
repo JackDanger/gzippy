@@ -124,12 +124,17 @@ def benchmark_decompress(
         rapidgzip_verbose = vr.stderr.decode(errors="replace")
 
     def run_decompress(capture_stderr: bool = False):
+        env = None
+        if capture_stderr and tool == "gzippy":
+            env = dict(os.environ)
+            env["GZIPPY_DEBUG"] = "1"
         with open(compressed_file, 'rb') as fin, open(output_file, 'wb') as fout:
             result = subprocess.run(
                 cmd,
                 stdin=fin,
                 stdout=fout,
                 stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL,
+                env=env,
             )
         stderr_text = ""
         if capture_stderr and result.stderr is not None:
@@ -141,6 +146,11 @@ def benchmark_decompress(
     ok, warmup_stderr = run_decompress(capture_stderr=True)
     if not ok:
         print(" FAILED")
+        if tool == "gzippy" and routing_trace is not None:
+            head = routing_trace.get("stderr_head", "").strip()
+            if head:
+                print("      [preflight GZIPPY_DEBUG]")
+                print("        " + head[:12000].replace("\n", "\n        "))
         if warmup_stderr.strip():
             print("      [warmup stderr]")
             print("        " + warmup_stderr[:12000].strip().replace("\n", "\n        "))
