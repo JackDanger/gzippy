@@ -887,6 +887,18 @@ fn decode_chunk_with_handoff(
     // assertion in tests::routing — see HANDOFF_FIRED rationale.
     BOOTSTRAP_OUTPUT_BYTES.fetch_add(bootstrap_markers.len() as u64, Ordering::Relaxed);
 
+    // Diagnostic: log all bootstrap outcomes so we can trace why a chunk
+    // becomes Some vs None in phase1b. bfinal_hit=true should → Err → None.
+    if debug_enabled() {
+        eprintln!(
+            "[bootstrap] start={start_bit} end_limit={end_bit_limit:?} \
+             end_bit={bootstrap_end_bit} bfinal_hit={bfinal_hit} \
+             window={} output_bytes={}",
+            clean_window.is_some(),
+            bootstrap_markers.len() / 2,
+        );
+    }
+
     // No clean window? Three reasons:
     //   (a) end_bit_limit reached before 32 KB clean tail accumulated.
     //   (b) BFINAL was hit before accumulating a clean 32 KB window.
