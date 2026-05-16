@@ -470,3 +470,203 @@ The strongest corrected thesis is:
 > The bug is that speculative failure is rescued inside the worker instead of surfaced as an explicit candidate/retry decision under dispatcher control.
 
 That is the part I would recommend carrying forward.
+
+---
+
+## 5. What I actually implemented after writing this
+
+Since writing the analysis above, I went ahead and implemented the structural
+rewrite in `src/decompress/parallel/single_member.rs`.
+
+Committed milestones:
+
+- `db61cae` — `refactor(parallel-sm): move reconcile ownership to registries`
+- `499e590` — `docs(parallel-sm): add opus review feedback artifact`
+
+### 5.1 Structural changes I made
+
+I changed the code so that speculative state and authoritative state are no
+longer the same thing.
+
+Concretely:
+
+- added `WorkerOutcome`, `CandidateChunk`, and `AuthoritativeChunk`
+- split worker seams into:
+  - `decode_chunk_inexact_legacy`
+  - `decode_chunk_exact_legacy`
+  - with `decode_chunk_with_handoff_legacy` retained underneath as the old worker body
+- added `BoundaryRegistry` to hold:
+  - speculative starts
+  - confirmed starts
+- added `PartitionRegistry` / `PartitionState` to hold:
+  - `NoDecode`
+  - `Speculative`
+  - `Decoded`
+  - `Subsumed`
+  - `EmptyTail`
+- replaced the old internal `phase1c` repair logic with dispatcher-owned
+  ordered reconciliation in `reconcile_partitions`
+- kept `phase1c_resolve_consistency` as a compatibility wrapper for tests, but
+  it now routes through the registry/reconcile model rather than the old
+  wave-based in-place correction logic
+- changed phase 2 so it consumes `AuthoritativeChunk` values rather than a raw
+  `Vec<ChunkResult>`
+
+### 5.2 Verification I ran
+
+These all passed on the rewritten structure:
+
+- `cargo build --release --features isal-compression`
+- `cargo test --release single_member`
+- `cargo test --release test_single_member_routing_multithread`
+- `cargo test --release`
+- `make`
+
+`cargo clippy --all-targets --all-features -- -D warnings` did not fully pass,
+but the remaining failures were pre-existing and outside this rewrite:
+
+- `src/decompress/inflate/consume_first_decode.rs`
+- `src/backends/isal_compress.rs`
+
+I fixed the one clippy issue introduced by my own new code.
+
+---
+
+## 6. What `make bench-sm` taught me
+
+I ran `make bench-sm` on the committed branch after committing both the code and
+ this doc.
+
+Headline result:
+
+- `gzippy`: `1187.6 MB/s`
+- `rapidgzip`: `1466.9 MB/s`
+- `unpigz`: `350.0 MB/s`
+
+Relative:
+
+- gzippy vs rapidgzip: `0.81x`
+- gzippy vs unpigz: `3.39x`
+
+The run completed successfully and then failed the perf gate because the repo’s
+goal is `>= 0.99x rapidgzip`.
+
+### 6.1 What I think the run means
+
+The rewrite appears to have improved structure, but not the dominant
+throughput bottleneck.
+
+The most important observations from the log:
+
+- `14/38 speculative boundary searches failed`
+- many partitions were not independently decoded and were later marked
+  `subsumed`
+- several successful phase-1b chunks swallowed very large output ranges
+  instead of staying near an even partition size
+- the reconcile log was dominated by:
+  - `reconcile: chunk X subsumed at ...`
+  rather than a large number of exact re-decodes
+
+That strongly suggests the new dispatcher-owned architecture is behaving
+structurally as intended, but it is not yet attacking the main speed limiter.
+
+### 6.2 The strongest performance signal in the log
+
+The real issue still looks like weak speculative boundary recall causing poor
+work distribution.
+
+Examples from the logged phase-1b breakdown:
+
+- chunk 11 total: ~68 MB
+- chunk 22 total: ~45 MB
+- chunk 24 total: ~31 MB
+- chunk 27 total: ~68 MB
+
+Those oversized chunks imply:
+
+- uneven parallel work
+- long-tail worker imbalance
+- too many later partitions doing no useful independent work
+
+That fits the `14/38` failed searches and the large number of `subsumed`
+partitions.
+
+### 6.3 Secondary signal
+
+Some chunks still have very large bootstrap output before ISA-L takes over, and
+at least one chunk reported `isal=0KB`.
+
+That does not yet prove a correctness bug, but it does suggest we are still
+spending too much of the hot path in bootstrap/marker territory for some
+regions instead of getting a consistently small bootstrap followed by large
+bulk ISA-L work.
+
+---
+
+## 7. What I think Opus should review next
+
+If Opus is reviewing the actual code now, I think the most useful review
+questions are:
+
+### 7.1 Is the new architecture directionally correct?
+
+Specifically:
+
+- is `BoundaryRegistry` the right owner for speculative vs confirmed starts?
+- is `PartitionRegistry` the right owner for speculative vs authoritative chunk
+  state?
+- is the ordered dispatcher-owned `reconcile_partitions` loop closer to the
+  real rapidgzip separation of concerns than the old array-wide `phase1c`
+  repair model?
+
+### 7.2 Did I accidentally preserve too much of the old semantics?
+
+Because I kept `phase1c_resolve_consistency` as a compatibility wrapper and kept
+the old worker body as `*_legacy`, Opus should inspect whether I only changed
+ownership shape or whether I inadvertently carried forward old assumptions that
+should now be deleted.
+
+In particular:
+
+- should `phase1c_resolve_consistency` now be deleted entirely after test
+  replacement?
+- should more of the `legacy` seams be renamed or removed now that the new
+  registries exist?
+- should the test suite be rewritten to target registry/reconcile seams
+  directly instead of compatibility wrappers?
+
+### 7.3 What should we optimize next?
+
+My current view is that the next serious performance work should target
+boundary recall and partition balance, not further reconciliation cleanup.
+
+The most likely next areas:
+
+1. Improve phase-1a speculative boundary recall so fewer partitions become
+   `NoDecode` / `subsumed`.
+2. Add instrumentation for:
+   - swallowed bytes per accepted chunk
+   - accepted vs subsumed partition count
+   - exact-refetch count
+   - bootstrap bytes before ISA-L handoff
+   - chunks with `isal=0KB`
+3. Re-examine whether the current “nearest downstream verified boundary”
+   stopping strategy is causing oversized accepted chunks that defeat parallel
+   balance.
+4. Decide whether chunk 0 and other large accepted chunks need a more explicit
+   bounded first-pass contract instead of “decode until the next downstream
+   verified start or end”.
+
+### 7.4 My own current thesis after the run
+
+I now think:
+
+> The structural rewrite was worth doing because it made ownership and proof
+> obligations clearer, but the benchmark says the dominant problem is still
+> phase-1a miss rate and oversized accepted ranges, not reconcile overhead.
+
+So if Opus is looking for the next best move, I would ask it to review:
+
+- whether the new registry/dispatcher structure is the right permanent shape
+- and then focus performance criticism on boundary-finding recall and partition
+  balance rather than on phase-2/reconcile micro-structure
