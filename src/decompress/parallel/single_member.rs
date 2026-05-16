@@ -164,14 +164,14 @@ impl ChunkDecodeStop {
 
     #[inline]
     fn use_isal(self) -> bool {
-        matches!(self, Self::Verified(_) | Self::UntilEnd)
+        true
     }
 
     #[inline]
     fn label(self) -> &'static str {
         match self {
             Self::Verified(_) => "real",
-            Self::Approximate(_) => "anchor",
+            Self::Approximate(_) => "approx",
             Self::UntilEnd => "none(last)",
         }
     }
@@ -1162,8 +1162,8 @@ fn decode_chunk_with_handoff(
         // boundary trim, ISA-L would decode all the way to BFINAL on
         // every chunk — quadratic total work, defeating the parallel
         // win.
-        let end_byte = match exact_end_limit {
-            Some(end) => (end.bits().div_ceil(8)).min(deflate_data.len()),
+        let end_byte = match stop_hint_bits {
+            Some(end_bits) => (end_bits.div_ceil(8)).min(deflate_data.len()),
             None => deflate_data.len(),
         };
         let input = &deflate_data[..end_byte];
@@ -1212,7 +1212,7 @@ fn decode_chunk_with_handoff(
         ) {
             Some((isal_bytes, isal_end_bit)) => {
                 let Some(verified_end_bit) =
-                    normalize_isal_end_bit(start_bit, exact_end_limit, isal_end_bit)
+                    normalize_isal_end_bit(deflate_data, start_bit, stop, isal_end_bit)
                 else {
                     if debug_enabled() {
                         eprintln!(
@@ -1344,8 +1344,9 @@ fn marker_finish_after_bootstrap(
 }
 
 fn normalize_isal_end_bit(
+    deflate_data: &[u8],
     start_bit: ChunkStart,
-    end_bit_limit: Option<ChunkEndLimit>,
+    stop: ChunkDecodeStop,
     isal_end_bit: usize,
 ) -> Option<RealBlockBoundary> {
     const ISA_L_END_BIT_SNAP_TOLERANCE_BITS: usize = 64;
@@ -1354,15 +1355,34 @@ fn normalize_isal_end_bit(
         return None;
     }
 
-    match end_bit_limit {
-        Some(limit)
+    match stop {
+        ChunkDecodeStop::Approximate(limit) => {
+            let limit_bits = limit.bits();
+            if isal_end_bit > limit_bits + ISA_L_END_BIT_SNAP_TOLERANCE_BITS {
+                return None;
+            }
+            if crate::decompress::parallel::fast_marker_inflate::validate_boundary(
+                deflate_data,
+                isal_end_bit,
+                1,
+                1,
+                false,
+            )
+            .is_ok()
+            {
+                Some(RealBlockBoundary(isal_end_bit))
+            } else {
+                None
+            }
+        }
+        ChunkDecodeStop::Verified(limit)
             if isal_end_bit >= limit.bits()
                 && isal_end_bit - limit.bits() <= ISA_L_END_BIT_SNAP_TOLERANCE_BITS =>
         {
             Some(limit.boundary())
         }
-        Some(_) => None,
-        None => Some(RealBlockBoundary(isal_end_bit)),
+        ChunkDecodeStop::Verified(_) => None,
+        ChunkDecodeStop::UntilEnd => Some(RealBlockBoundary(isal_end_bit)),
     }
 }
 
@@ -2704,28 +2724,48 @@ mod tests {
 
     #[test]
     fn normalize_isal_end_bit_snaps_small_verified_overshoot() {
+        let deflate_data: &[u8] = &[];
         let start = ChunkStart::from_bits(128);
         let limit = ChunkStart::from_bits(512).to_end_limit();
 
         assert_eq!(
-            normalize_isal_end_bit(start, Some(limit), 512),
+            normalize_isal_end_bit(deflate_data, start, ChunkDecodeStop::Verified(limit), 512),
             Some(limit.boundary())
         );
         assert_eq!(
-            normalize_isal_end_bit(start, Some(limit), 513),
+            normalize_isal_end_bit(deflate_data, start, ChunkDecodeStop::Verified(limit), 513),
             Some(limit.boundary())
         );
         assert_eq!(
-            normalize_isal_end_bit(start, Some(limit), 512 + 64),
+            normalize_isal_end_bit(
+                deflate_data,
+                start,
+                ChunkDecodeStop::Verified(limit),
+                512 + 64,
+            ),
             Some(limit.boundary())
         );
-        assert_eq!(normalize_isal_end_bit(start, Some(limit), 512 + 65), None);
-        assert_eq!(normalize_isal_end_bit(start, Some(limit), 500), None);
         assert_eq!(
-            normalize_isal_end_bit(start, None, 700),
+            normalize_isal_end_bit(
+                deflate_data,
+                start,
+                ChunkDecodeStop::Verified(limit),
+                512 + 65,
+            ),
+            None
+        );
+        assert_eq!(
+            normalize_isal_end_bit(deflate_data, start, ChunkDecodeStop::Verified(limit), 500),
+            None
+        );
+        assert_eq!(
+            normalize_isal_end_bit(deflate_data, start, ChunkDecodeStop::UntilEnd, 700),
             Some(RealBlockBoundary(700))
         );
-        assert_eq!(normalize_isal_end_bit(start, None, 64), None);
+        assert_eq!(
+            normalize_isal_end_bit(deflate_data, start, ChunkDecodeStop::UntilEnd, 64),
+            None
+        );
     }
 
     #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
