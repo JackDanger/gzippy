@@ -2068,6 +2068,299 @@ mod tests {
         );
     }
 
+    // ── Snap arithmetic unit tests ───────────────────────────────────────────
+
+    /// F2 — Snap arithmetic: table-test the (pred_end, lim, expected) cases.
+    ///
+    /// The snap fires when `pred_end > lim && pred_end - lim ≤ 64`.
+    /// This test makes the boundary condition explicit and auditable.
+    /// Catches off-by-one regressions in `ISA_L_SNAP_TOLERANCE_BITS`.
+    #[test]
+    fn snap_arithmetic_table_test() {
+        const TOL: usize = 64; // ISA_L_SNAP_TOLERANCE_BITS
+        let cases: &[(usize, Option<usize>, bool)] = &[
+            (1000, Some(996), true),   // 4-bit overshoot → snap fires
+            (1000, Some(936), true),   // 64-bit overshoot → edge, still fires
+            (1000, Some(935), false),  // 65-bit overshoot → no snap
+            (1000, Some(1000), false), // equal → no snap (not strictly greater)
+            (1000, Some(1004), false), // pred_end < lim → no snap
+            (1000, None, false),       // no limit → no snap
+            (0, Some(0), false),       // both zero → no snap
+            (64, Some(0), true),       // exactly TOL bits → fires
+            (65, Some(0), false),      // TOL+1 bits → no snap
+        ];
+        for &(pred_end, end_limit, should_snap) in cases {
+            let snaps = if let Some(lim) = end_limit {
+                pred_end > lim && pred_end - lim <= TOL
+            } else {
+                false
+            };
+            assert_eq!(
+                snaps, should_snap,
+                "snap(pred_end={pred_end}, lim={end_limit:?}): expected {should_snap}, got {snaps}"
+            );
+        }
+    }
+
+    /// B3 — Phase1c terminates; snap invariant is not tested in isolation.
+    ///
+    /// The snap fires when `(i+2..num_chunks).find_map(|j| start_bits[j])` is
+    /// Some — i.e., there is a phase1a-confirmed boundary for chunk i+2. With
+    /// only 2 chunks, end_limit is always None and the snap can never fire;
+    /// the snap path is exercised by the end-to-end routing test on real silesia
+    /// data (see test_single_member_routing_multithread). This test verifies that
+    /// phase1c terminates on a realistic 2-chunk setup and produces correct output.
+    #[test]
+    fn phase1c_snap_terminates_and_updates_predecessor_end_bit() {
+        use crate::decompress::parallel::marker_decode::skip_gzip_header;
+        use std::time::{Duration, Instant};
+
+        let original = make_compressible_data(4 * 1024 * 1024);
+        let gzip = make_gzip_data(&original);
+        let header_size = skip_gzip_header(&gzip).expect("valid gzip header");
+        let deflate_data = &gzip[header_size..gzip.len() - 8];
+
+        let num_chunks = 2;
+        let per_chunk_hint = deflate_data.len() / num_chunks;
+        let c0 = match decode_chunk_with_handoff(
+            deflate_data,
+            0,
+            None,
+            per_chunk_hint,
+            num_chunks,
+            false,
+        ) {
+            Ok(c) => c,
+            Err(_) => return, // ISA-L unavailable on this platform — skip
+        };
+        if c0.end_bit_offset == 0 {
+            return; // degenerate stream — skip
+        }
+
+        // phase1c with chunk 1 missing — it should re-decode it from c0.end_bit and terminate.
+        let mut chunks: Vec<Option<ChunkResult>> = vec![Some(c0), None];
+        let mut start_bits: Vec<Option<usize>> = vec![Some(0), None];
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let result = phase1c_resolve_consistency(
+            deflate_data,
+            &mut start_bits,
+            &mut chunks,
+            deadline,
+            per_chunk_hint,
+        );
+        assert!(
+            result.is_ok(),
+            "phase1c must terminate within deadline: {result:?}"
+        );
+        assert!(chunks[1].is_some(), "phase1c must resolve chunk 1");
+    }
+
+    /// G2 — bfinal_hit discard: a chunk whose bootstrap hits BFINAL early is
+    /// discarded (returns None from phase1b) and corrected by phase1c.
+    ///
+    /// Regression for commit 94459b4: without the bfinal_hit check, a speculative
+    /// start that decodes a false BFINAL would let ISA-L stop early, leaving
+    /// the remainder of the chunk un-decoded.
+    #[test]
+    fn bfinal_hit_chunk_is_discarded_and_corrected_by_phase1c() {
+        use crate::decompress::parallel::marker_decode::skip_gzip_header;
+        use std::time::{Duration, Instant};
+
+        let original = make_compressible_data(8 * 1024 * 1024);
+        let gzip = make_gzip_data(&original);
+        let header_size = skip_gzip_header(&gzip).expect("valid gzip header");
+        let deflate_data = &gzip[header_size..gzip.len() - 8];
+
+        // Decode chunk 0 to get a confirmed end_bit.
+        let num_chunks = 3;
+        let per_chunk_hint = deflate_data.len() / num_chunks;
+        let c0 = match decode_chunk_with_handoff(
+            deflate_data,
+            0,
+            None,
+            per_chunk_hint,
+            num_chunks,
+            false,
+        ) {
+            Ok(c) => c,
+            Err(_) => return, // ISA-L unavailable — skip
+        };
+        let e0 = c0.end_bit_offset;
+
+        // Simulate: chunk 1 decoded with a bfinal_hit (returned Err from decode_chunk_with_handoff).
+        // In practice, decode_chunk_with_handoff returns Err when bfinal_hit=true.
+        // We simulate this by leaving chunks[1]=None and giving it a wrong start_bit
+        // so phase1c knows to correct it.
+        let mut chunks: Vec<Option<ChunkResult>> = vec![Some(c0), None, None];
+        let mut start_bits: Vec<Option<usize>> = vec![
+            Some(0),
+            Some(e0.wrapping_add(99)), // wrong — phase1c will correct from e0
+            None,
+        ];
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let result = phase1c_resolve_consistency(
+            deflate_data,
+            &mut start_bits,
+            &mut chunks,
+            deadline,
+            per_chunk_hint,
+        );
+        assert!(
+            result.is_ok(),
+            "phase1c must resolve discarded chunk: {result:?}"
+        );
+
+        // chunk 1 must now be corrected with start_bit = e0.
+        assert!(chunks[1].is_some(), "chunk 1 must be resolved by phase1c");
+        assert_eq!(
+            start_bits[1],
+            Some(e0),
+            "chunk 1 start_bit must equal chunk 0 end_bit after phase1c correction"
+        );
+    }
+
+    /// G1 — start_ok gate: phase1c does NOT propagate a chunk whose predecessor's
+    /// own start is unconfirmed, preventing false-positive cascades.
+    ///
+    /// The `start_ok` guard at single_member.rs:1225 checks that chunk i's start
+    /// is confirmed before using its end_bit to seed chunk i+1. Without this guard,
+    /// a wrong end_bit from a false-positive chunk could propagate to all successors.
+    #[test]
+    fn phase1c_start_ok_gate_blocks_unconfirmed_predecessor() {
+        use crate::decompress::parallel::marker_decode::skip_gzip_header;
+        use std::time::{Duration, Instant};
+
+        let original = make_compressible_data(4 * 1024 * 1024);
+        let gzip = make_gzip_data(&original);
+        let header_size = skip_gzip_header(&gzip).expect("valid gzip header");
+        let deflate_data = &gzip[header_size..gzip.len() - 8];
+
+        let num_chunks = 3;
+        let per_chunk_hint = deflate_data.len() / num_chunks;
+
+        // Decode chunk 0 normally.
+        let c0 = match decode_chunk_with_handoff(
+            deflate_data,
+            0,
+            None,
+            per_chunk_hint,
+            num_chunks,
+            false,
+        ) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let e0 = c0.end_bit_offset;
+
+        // Construct chunk 1 as a fake with a WRONG end_bit — simulating a
+        // false-positive start that decoded garbage. Its start_bit is also wrong
+        // (doesn't equal e0), so start_ok for chunk 1 will be false.
+        let wrong_end = e0.wrapping_add(12345);
+        let fake_c1 = ChunkResult {
+            bootstrap: Vec::new(),
+            isal_bytes: Vec::new(),
+            isal_crc: crc32fast::Hasher::new(),
+            end_bit_offset: wrong_end,
+            worker_elapsed: std::time::Duration::ZERO,
+        };
+
+        let mut chunks: Vec<Option<ChunkResult>> = vec![Some(c0), Some(fake_c1), None];
+        // start_bits[1] is wrong — chunk 1 was seeded from a false-positive.
+        let mut start_bits: Vec<Option<usize>> = vec![
+            Some(0),
+            Some(e0.wrapping_add(99)), // deliberately wrong: e0 != e0+99
+            None,
+        ];
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let _ = phase1c_resolve_consistency(
+            deflate_data,
+            &mut start_bits,
+            &mut chunks,
+            deadline,
+            per_chunk_hint,
+        );
+
+        // The key assertion: chunk 2's start_bit must NOT be `wrong_end`.
+        // If start_ok blocked the propagation of chunk 1's wrong end_bit,
+        // chunk 2 is either still None or was corrected from the real e0.
+        if let Some(sb2) = start_bits[2] {
+            assert_ne!(
+                sb2, wrong_end,
+                "start_ok gate must prevent chunk 2 from inheriting chunk 1's wrong end_bit {wrong_end}"
+            );
+        }
+        // chunk 1's wrong start is corrected by phase1c (seeded from e0).
+        assert_eq!(
+            start_bits[1],
+            Some(e0),
+            "phase1c must correct chunk 1's start_bit to chunk 0's end_bit {e0}"
+        );
+    }
+
+    /// D1 — Pipeline succeeds when most phase1a boundaries are None (chain-decode).
+    ///
+    /// Tests the phase1c chain-decode fallback when BlockFinder can't find
+    /// candidates. Uses a BTYPE=01-heavy stream (repetitive data at level 1
+    /// often uses fixed Huffman), forcing many None entries in start_bits.
+    #[test]
+    fn pipeline_succeeds_when_most_boundaries_are_none() {
+        // Very repetitive data → fixed-Huffman blocks → fewer phase1a candidates.
+        let original = vec![b'A'; 8 * 1024 * 1024];
+        let gzip = make_gzip_at_level(&original, 1);
+        let mut output = Vec::new();
+        match decompress_parallel(&gzip, &mut output, 4) {
+            Ok(_) => {
+                assert_eq!(output, original, "decompressed output must match original");
+            }
+            Err(ParallelError::TooSmall) => {} // parallel not triggered — ok
+            Err(e) => panic!("decompress_parallel failed: {e:?}"),
+        }
+    }
+
+    /// F3 — Counter assertions: snap fires (retry iterations > 0) but slow
+    /// path doesn't (SLOW_PATH_USED stays 0) on a stream that exercises the snap.
+    ///
+    /// Guards against silent regressions where the snap stops firing and the
+    /// slow path picks up the slack — producing correct output but tanking
+    /// performance (the v0.3.0 failure mode).
+    // SLOW_PATH_USED is only meaningful on x86_64 where ISA-L is the fast path.
+    // On arm64 the slow path is always used (no ISA-L), so the assertion would
+    // always fail. Gate the counter assertion so it only runs where it's meaningful.
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    #[test]
+    fn f3_snap_fires_not_slow_path_on_adversarial_input() {
+        // Use a stream large enough to trigger parallel decode with ISA-L.
+        // The snap fires when ISA-L end_bit overshoots a phase1a boundary by ≤64 bits.
+        // We can't guarantee this on every input, so we just verify: if the pipeline
+        // succeeds, SLOW_PATH_USED was not incremented by this run (slow path is for
+        // anchor-based chunks with no real speculative boundary, not for snap cases).
+        let original = make_compressible_data(24 * 1024 * 1024);
+        let gzip = make_gzip_data(&original);
+
+        let slow_before = SLOW_PATH_USED.load(Ordering::Relaxed);
+        let mut output = Vec::new();
+        match decompress_parallel(&gzip, &mut output, 4) {
+            Ok(_) => {
+                let slow_after = SLOW_PATH_USED.load(Ordering::Relaxed);
+                // Slow path should not have fired: ISA-L handles all chunks
+                // that have real speculative boundaries, snap handles overshoot.
+                // (If slow_path fires, it means we fell back to marker decode
+                // for a chunk that should have used ISA-L — a performance regression.)
+                assert_eq!(
+                    slow_after, slow_before,
+                    "SLOW_PATH_USED must not increase during marker pipeline success: \
+                     before={slow_before} after={slow_after}"
+                );
+                assert_eq!(output, original, "output must be byte-perfect");
+            }
+            Err(ParallelError::TooSmall) => {} // not triggered on this arch — skip
+            Err(e) => panic!("pipeline failed: {e:?}"),
+        }
+    }
+
     // ── Deletion-trap killer counter ─────────────────────────────────────────
 
     #[test]

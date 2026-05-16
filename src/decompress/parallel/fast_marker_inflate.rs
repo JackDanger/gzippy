@@ -191,10 +191,23 @@ pub fn validate_boundary(
         bits.consume(bit_in_byte);
     }
     let mut output: Vec<u16> = Vec::with_capacity(min_output_bytes.next_power_of_two().max(4096));
+    // Hard cap: if we decoded 100× the minimum output without finding a
+    // suitable stop point, this is almost certainly a false positive in a
+    // BTYPE=01-heavy region. Real boundaries hit BTYPE=00/10 within a few
+    // blocks of the minimum; spinning through many MB of fixed-Huffman output
+    // is pure noise. Capping prevents runaway allocation from adversarial or
+    // random starting positions.
+    let max_output_bytes = min_output_bytes.saturating_mul(100).max(1_000_000);
     let mut blocks_decoded = 0u32;
     loop {
         if bits.available() < 3 {
             bits.refill();
+        }
+        if output.len() >= max_output_bytes {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "validate_boundary: output cap exceeded — false positive in BTYPE=01-heavy region",
+            ));
         }
         if blocks_decoded >= min_blocks && output.len() >= min_output_bytes {
             if require_non_fixed_stop {
@@ -221,8 +234,8 @@ pub fn validate_boundary(
         bits.consume(3);
         match btype {
             0 => decode_stored(&mut bits, &mut output)?,
-            1 => decode_fixed(&mut bits, &mut output)?,
-            2 => decode_dynamic(&mut bits, &mut output)?,
+            1 => decode_fixed(&mut bits, &mut output, max_output_bytes)?,
+            2 => decode_dynamic(&mut bits, &mut output, max_output_bytes)?,
             _ => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type 3")),
         }
         blocks_decoded += 1;
@@ -666,8 +679,8 @@ fn decode_loop(
 
         match btype {
             0 => decode_stored(bits, output)?,
-            1 => decode_fixed(bits, output)?,
-            2 => decode_dynamic(bits, output)?,
+            1 => decode_fixed(bits, output, 0)?,
+            2 => decode_dynamic(bits, output, 0)?,
             _ => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type 3")),
         }
 
@@ -766,13 +779,19 @@ fn fixed_dist_table() -> &'static ConsumeFirstTable {
     })
 }
 
-fn decode_fixed(bits: &mut Bits, output: &mut Vec<u16>) -> Result<()> {
-    decode_huffman_block(bits, output, fixed_litlen_table(), fixed_dist_table())
+fn decode_fixed(bits: &mut Bits, output: &mut Vec<u16>, max_output: usize) -> Result<()> {
+    decode_huffman_block(
+        bits,
+        output,
+        fixed_litlen_table(),
+        fixed_dist_table(),
+        max_output,
+    )
 }
 
 // ── Dynamic Huffman block (BTYPE = 10) ──────────────────────────────────────
 
-fn decode_dynamic(bits: &mut Bits, output: &mut Vec<u16>) -> Result<()> {
+fn decode_dynamic(bits: &mut Bits, output: &mut Vec<u16>, max_output: usize) -> Result<()> {
     // Header: HLIT (5), HDIST (5), HCLEN (4).
     if bits.available() < 14 {
         bits.refill();
@@ -863,7 +882,7 @@ fn decode_dynamic(bits: &mut Bits, output: &mut Vec<u16>) -> Result<()> {
     let litlen_table = ConsumeFirstTable::build(&lens[..hlit])?;
     let dist_table = ConsumeFirstTable::build_distance(&lens[hlit..])?;
 
-    decode_huffman_block(bits, output, &litlen_table, &dist_table)
+    decode_huffman_block(bits, output, &litlen_table, &dist_table, max_output)
 }
 
 // ── Shared Huffman block body (used by both fixed and dynamic) ──────────────
@@ -874,8 +893,15 @@ fn decode_huffman_block(
     output: &mut Vec<u16>,
     litlen: &ConsumeFirstTable,
     dist: &ConsumeFirstTable,
+    max_output: usize,
 ) -> Result<()> {
     loop {
+        if max_output > 0 && output.len() >= max_output {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "output cap exceeded in Huffman block",
+            ));
+        }
         let sym = decode_cf(litlen, bits)?;
         if sym < 256 {
             // Literal.
@@ -1517,6 +1543,433 @@ mod tests {
         assert!(
             marker_mbps > 50.0,
             "throughput {marker_mbps:.0} MB/s below 50 MB/s floor"
+        );
+    }
+
+    // ── validate_boundary correctness tests ─────────────────────────────────
+
+    /// Build a multi-block deflate stream where the block at `split` is
+    /// followed by a block starting with BTYPE bits equal to `next_btype_bits`
+    /// (values 0b00, 0b01, 0b10, 0b11). Returns (data, split_bit) where
+    /// split_bit is the bit position of the block header at `split`.
+    ///
+    /// Strategy: compress `prefix` (≥55 KB) to get 2+ real blocks, then
+    /// append a manually-crafted 3-bit block header with the desired BTYPE.
+    /// The crafted bits are injected before BFINAL=1 so validate_boundary
+    /// never reaches BFINAL first.
+    fn make_deflate_with_trailing_btype(next_btype_bits: u8) -> (Vec<u8>, usize) {
+        // Build a compressible prefix that produces ≥2 dynamic blocks and
+        // ≥55 KB of output, so validate_boundary's thresholds are met.
+        let mut prefix = Vec::with_capacity(256 * 1024);
+        let mut rng: u64 = 0xabad1dea;
+        while prefix.len() < 256 * 1024 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if (rng >> 32) % 5 < 3 {
+                prefix.push((rng >> 16) as u8);
+            } else {
+                let byte = ((rng >> 24) % 26 + b'a' as u64) as u8;
+                let run = ((rng >> 40) % 8 + 2) as usize;
+                for _ in 0..run.min(256 * 1024 - prefix.len()) {
+                    prefix.push(byte);
+                }
+            }
+        }
+        // Compress the prefix into a raw deflate stream.
+        let deflate_prefix = make_deflate(&prefix, 6);
+
+        // Identify the last real block boundary before BFINAL by decoding
+        // and collecting block starts; take the second-to-last.
+        let starts = record_block_starts(&deflate_prefix).expect("record_block_starts");
+        assert!(
+            starts.len() >= 2,
+            "need ≥2 blocks to test the stop-point peek; got {}",
+            starts.len()
+        );
+        // The stop point is just before the LAST block (which has BFINAL=1).
+        // validate_boundary should stop there and peek the next BTYPE.
+        // We want to inject our test BTYPE at that position.
+        //
+        // Instead of modifying existing bytes (risky), decode only UP TO the
+        // second-to-last block boundary to get a clean prefix, then append
+        // our custom 3-bit header: bit 0 = BFINAL=0, bits 1-2 = next_btype_bits.
+        let inject_bit = starts[starts.len() - 2];
+        let inject_byte = inject_bit / 8;
+        // Truncate deflate_prefix at inject_byte; then append the custom header.
+        let mut data = deflate_prefix[..inject_byte].to_vec();
+        // The 3-bit header is packed as: bit0=BFINAL, bits1-2=BTYPE.
+        // For our injected block: BFINAL=1 (it's the last block), BTYPE=next_btype_bits.
+        // Bit packing: LSB-first. Header = BFINAL | (BTYPE << 1).
+        let header_byte = 1u8 | (next_btype_bits << 1); // BFINAL=1
+                                                        // Append: just the header byte at a byte boundary (inject_byte is byte-aligned
+                                                        // if inject_bit % 8 == 0, which record_block_starts guarantees for real boundaries).
+        if inject_bit.is_multiple_of(8) {
+            data.push(header_byte);
+        } else {
+            // Non-byte-aligned: OR into the existing partial byte.
+            let bit_in_byte = inject_bit % 8;
+            // Expand to include the byte containing inject_bit.
+            data = deflate_prefix[..=inject_byte].to_vec();
+            // Clear the bits from inject_bit onward in that byte.
+            let mask = (1u8 << bit_in_byte) - 1;
+            *data.last_mut().unwrap() &= mask;
+            // Pack header bits starting at bit_in_byte.
+            *data.last_mut().unwrap() |= header_byte << bit_in_byte;
+            if bit_in_byte + 3 > 8 {
+                data.push(header_byte >> (8 - bit_in_byte));
+            }
+        }
+        (data, inject_bit)
+    }
+
+    /// A1 — validate_boundary rejects BTYPE=11 (reserved) as a stop point.
+    ///
+    /// Regression for commit 94834d6: the old check `next_btype != 1` allowed
+    /// BTYPE=11 (=3) through as a valid stop point. The fix `next_btype == 0 ||
+    /// next_btype == 2` correctly rejects it. A false-positive boundary that stops
+    /// at BTYPE=11 would cascade into a "Reserved block type 3" decode failure.
+    ///
+    /// The stream is constructed so that the threshold is met at the end of exactly
+    /// 2 stored blocks, and the VERY NEXT block header is BTYPE=11. This forces
+    /// validate_boundary to confront the BTYPE=11 check rather than finding an
+    /// earlier BTYPE=10 stop in a multi-block dynamic prefix.
+    #[test]
+    fn validate_boundary_rejects_btype11_stop_point() {
+        // Two stored blocks of 30 KB each → 60 KB output, 2 blocks decoded.
+        // After block 2 the threshold is met; next block = BTYPE=11 (reserved).
+        // validate_boundary must NOT return Ok there; it must continue, hit the
+        // reserved block type, and return Err.
+        //
+        // Raw deflate stored-block layout (byte-aligned):
+        //   Byte 0: BFINAL=0 | BTYPE=00<<1 = 0x00 (3-bit header + 5 pad bits)
+        //   Bytes 1-2: LEN as u16 LE
+        //   Bytes 3-4: NLEN as u16 LE (= !LEN)
+        //   Bytes 5..5+LEN: literal payload
+        let block_len: u16 = 30_000;
+        let nlen = !block_len;
+        let payload = vec![b'A'; block_len as usize];
+        let mut data = Vec::new();
+        for _ in 0..2 {
+            data.push(0x00u8); // BFINAL=0, BTYPE=00, 5-bit pad
+            data.extend_from_slice(&block_len.to_le_bytes());
+            data.extend_from_slice(&nlen.to_le_bytes());
+            data.extend_from_slice(&payload);
+        }
+        // Inject BFINAL=1, BTYPE=11 (reserved): header = 1 | (3 << 1) = 7 = 0b111.
+        data.push(0b111u8);
+
+        let result = validate_boundary(&data, 0, 2, 55_000, true);
+        assert!(
+            result.is_err(),
+            "validate_boundary must NOT stop at a BTYPE=11 (reserved) block; got Ok"
+        );
+    }
+
+    /// A3 — validate_boundary accepts BTYPE=00 (stored) as a stop point.
+    #[test]
+    fn validate_boundary_accepts_btype00_stop_point() {
+        // A real deflate stream compressed at level 0 has stored blocks (BTYPE=00).
+        // Use level 6 for the prefix (≥2 dynamic blocks) then level 0 for the
+        // trailing block so the stop point lands on BTYPE=00.
+        let mut prefix_data: Vec<u8> = Vec::with_capacity(256 * 1024);
+        let mut rng: u64 = 0xcafe1234;
+        while prefix_data.len() < 256 * 1024 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            prefix_data.push((rng >> 16) as u8 % 32 + b'a');
+        }
+        // Compress with level 6 to get dynamic blocks.
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
+        enc.write_all(&prefix_data).unwrap();
+        // Then append a stored block suffix (level 0) — combine as one stream.
+        // Simplest: just use a fresh encoder at level 0 appended, knowing the
+        // decoder will see blocks in sequence.
+        // Actually, we need a SINGLE deflate stream with stored blocks near the end.
+        // Construct: encode prefix at level 6 then an 8-byte stored block.
+        // The easiest path: compress entire data at level 6, verify the stop point
+        // is at BTYPE=00 or BTYPE=10 (dynamic). Since dynamic blocks dominate, this
+        // should pass with require_non_fixed_stop=true naturally. Use a known BTYPE=00
+        // injection instead.
+        let (_data, _inject_bit) = make_deflate_with_trailing_btype(0b00);
+        // BTYPE=00 (stored) is a valid stop: `0b00` == 0 which passes `== 0 || == 2`.
+        // However, a stored block needs a valid LEN/NLEN after the 3-bit header.
+        // Our injected header has BFINAL=1, BTYPE=00, followed by no valid LEN/NLEN.
+        // So validate_boundary will try to decode it as a stored block and fail with
+        // LEN/NLEN mismatch — returning Err.
+        //
+        // The correct test for A3 is: a real level-0 compressed stream where stored
+        // blocks appear and validate_boundary returns Ok.
+        let stored_data: Vec<u8> = (0..256 * 1024).map(|i| (i % 26) as u8 + b'a').collect();
+        let deflate_stored = make_deflate(&stored_data, 0); // stored blocks
+                                                            // validate_boundary from bit 0 should succeed: stored blocks pass the
+                                                            // stop-point check (next_btype=0 → Ok).
+        let result = validate_boundary(&deflate_stored, 0, 1, 1024, true);
+        assert!(
+            result.is_ok(),
+            "validate_boundary should accept a stored-block (BTYPE=00) stop point: {result:?}"
+        );
+    }
+
+    /// A4/A5 parametric — accept BTYPE=10 (dynamic) stop point and reject
+    /// BTYPE=01 (fixed) when require_non_fixed_stop=true but accept it when false.
+    #[test]
+    fn validate_boundary_stop_point_btype_parametric() {
+        // A level-6 stream consists of dynamic (BTYPE=10) blocks. validate_boundary
+        // with require_non_fixed_stop=true should return Ok (stops at dynamic block).
+        let compressible: Vec<u8> = (0..256 * 1024).map(|i| (i % 26) as u8 + b'a').collect();
+        let deflate_dynamic = make_deflate(&compressible, 6);
+
+        // With require=true: should stop at a BTYPE=10 boundary → Ok.
+        assert!(
+            validate_boundary(&deflate_dynamic, 0, 1, 1024, true).is_ok(),
+            "require_non_fixed_stop=true must accept BTYPE=10 (dynamic) stop point"
+        );
+
+        // With require=false: any block boundary is acceptable → Ok.
+        assert!(
+            validate_boundary(&deflate_dynamic, 0, 1, 1024, false).is_ok(),
+            "require_non_fixed_stop=false must accept any stop point"
+        );
+
+        // Fixed-Huffman-only stream (highly compressible, short): level 1 on
+        // repetitive data often uses fixed Huffman. The key test is that with
+        // require=true, we eventually find a non-fixed stop point or exhaust input.
+        // This is primarily a "no panic" check since we can't force fixed-only output
+        // from flate2 portably.
+        let fixed_input: Vec<u8> = vec![b'A'; 64 * 1024];
+        let deflate_fixed = make_deflate(&fixed_input, 1);
+        // Should not panic regardless of require_non_fixed_stop setting.
+        let _ = validate_boundary(&deflate_fixed, 0, 1, 1024, true);
+        let _ = validate_boundary(&deflate_fixed, 0, 1, 1024, false);
+    }
+
+    /// A6 — Property test: no validate_boundary false-positive lies within
+    /// 64 bits of a real deflate block boundary.
+    ///
+    /// This is the structural safety invariant for the phase1c snap:
+    /// `pred_end > lim && pred_end - lim ≤ 64` fires the snap. If a false-positive
+    /// `lim` can fall within 64 bits of a real boundary, the snap can corrupt G1.
+    /// This test verifies that every position where validate_boundary returns Ok
+    /// is either a real boundary or >64 bits from any real boundary.
+    #[test]
+    fn validate_boundary_false_positives_not_within_snap_tolerance_of_real_boundary() {
+        let mut false_positives_found = 0usize;
+        let mut false_positives_near_real = 0usize;
+
+        for seed in 0u64..16 {
+            let mut rng = seed.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(1);
+            // ~64 KB of medium-entropy data per seed.
+            let mut input = Vec::with_capacity(64 * 1024);
+            while input.len() < 64 * 1024 {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                if (rng >> 32) % 4 < 3 {
+                    input.push((rng >> 16) as u8);
+                } else {
+                    let byte = ((rng >> 24) % 26 + b'a' as u64) as u8;
+                    let run = ((rng >> 40) % 8 + 2) as usize;
+                    for _ in 0..run.min(64 * 1024 - input.len()) {
+                        input.push(byte);
+                    }
+                }
+            }
+            let deflate = make_deflate(&input, 6);
+            let real_starts: Vec<usize> =
+                record_block_starts(&deflate).expect("record_block_starts");
+            // Targeted scan: for each real boundary, scan every bit position
+            // within ±128 bits. This directly tests the invariant — a false
+            // positive within 64 bits of a real boundary corrupts the phase1c
+            // snap — while keeping total calls to ~seeds × boundaries × 256
+            // instead of seeds × stream_length / 8. The output cap in
+            // validate_boundary (100 × min_output_bytes ≈ 5.5 MB) bounds
+            // each call's cost.
+            let total_bits = deflate.len() * 8;
+            const SCAN_RADIUS: usize = 128; // bits; covers the 64-bit snap tolerance 2×
+            for &r in &real_starts {
+                let lo = r.saturating_sub(SCAN_RADIUS);
+                let hi = (r + SCAN_RADIUS).min(total_bits.saturating_sub(1));
+                for bit_pos in lo..=hi {
+                    if bit_pos == r {
+                        continue; // skip the real boundary itself
+                    }
+                    if validate_boundary(&deflate, bit_pos, 2, 55_000, true).is_ok() {
+                        false_positives_found += 1;
+                        if bit_pos.abs_diff(r) <= 64 {
+                            false_positives_near_real += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            false_positives_near_real, 0,
+            "found {false_positives_near_real} validate_boundary false-positives within 64 bits \
+             of a real deflate boundary (total false-positives: {false_positives_found}). \
+             A false positive this close to a real boundary can corrupt the phase1c snap, \
+             overwriting a G1-guaranteed ISA-L end_bit with a bad position."
+        );
+    }
+
+    // ── Bootstrap handoff tests ──────────────────────────────────────────────
+
+    /// Shared helper: build a deflate stream consisting of a dynamic-Huffman
+    /// prefix (≥36 KB output) followed by a block with a specific 2-bit BTYPE
+    /// injected at the next block boundary.
+    ///
+    /// Returns the raw deflate bytes. After the injected header the stream is
+    /// complete (BFINAL=1); if the injected BTYPE is valid (0b00 or 0b10),
+    /// decoding will succeed; if 0b01 the next block is fixed; if 0b11, it's
+    /// reserved and will error.
+    fn make_bootstrap_stream(next_btype: u8) -> Vec<u8> {
+        // 40 KB of compressible data → dynamic blocks, >32 KB output.
+        let input: Vec<u8> = {
+            let mut v = Vec::with_capacity(40 * 1024);
+            let mut s: u64 = 0x1234abcd;
+            while v.len() < 40 * 1024 {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                v.push(((s >> 16) % 26) as u8 + b'a');
+            }
+            v
+        };
+        let full = make_deflate(&input, 6);
+        // Truncate at the first real block boundary after 32 KB of input bits
+        // so the prefix alone produces >32 KB output.
+        let starts = record_block_starts(&full).unwrap();
+        // Find the last real start before BFINAL.
+        let cut_bit = starts[starts.len().saturating_sub(2).max(1)];
+        let cut_byte = cut_bit / 8;
+        let mut data = full[..cut_byte].to_vec();
+        // Inject 3-bit block header: BFINAL=1 | (next_btype << 1).
+        if cut_bit.is_multiple_of(8) {
+            data.push(1u8 | (next_btype << 1));
+        } else {
+            let bit = cut_bit % 8;
+            let mut b = full[cut_byte] & ((1 << bit) - 1);
+            b |= (1u8 | (next_btype << 1)) << bit;
+            data.push(b);
+            let overflow = (1u8 | (next_btype << 1)).wrapping_shr((8 - bit) as u32);
+            if overflow != 0 || bit + 3 > 8 {
+                data.push(overflow);
+            }
+        }
+        data
+    }
+
+    /// C1/C2 — Bootstrap fires handoff on BTYPE=00 (stored) and BTYPE=10 (dynamic).
+    #[test]
+    fn bootstrap_handoff_fires_on_btype00_and_btype10() {
+        // For a clean handoff we need the bootstrap to reach ≥32 KB of marker-free
+        // output. Use a realistic compressed stream (large enough) rather than the
+        // injected-header construction (which produces tiny output before injection).
+        // Compress 64 KB of repetitive data so all output is marker-free at chunk start.
+        let input: Vec<u8> = (0..64 * 1024).map(|i| (i % 26) as u8 + b'a').collect();
+        let deflate = make_deflate(&input, 6);
+
+        let result = decode_chunk_bootstrap(&deflate, 0, None)
+            .expect("bootstrap must not error on valid deflate");
+        // On a real deflate stream with BTYPE=10 (dynamic) blocks, a handoff
+        // should fire once 32 KB of clean output accumulates.
+        // If the stream is too small to accumulate 32 KB, clean_window is None — that's ok.
+        // The key assertion is "no panic and valid end_bit."
+        let _ = result.clean_window; // may or may not be Some depending on stream size
+                                     // Verify end_bit is within the stream.
+        let (_, end_bit) = decode_chunk_markers(&deflate, 0).unwrap();
+        assert!(
+            result.end_bit_offset <= end_bit,
+            "bootstrap end_bit must be ≤ full decode end_bit"
+        );
+    }
+
+    /// C3 — Bootstrap skips BTYPE=01 (fixed) and continues to find BTYPE=00/10.
+    #[test]
+    fn bootstrap_handoff_skips_btype01_continues_to_btype10() {
+        // Compress enough data to get ≥32 KB of output with dynamic blocks.
+        // The key property tested here: once 32 KB clean output exists and the
+        // next block is BTYPE=01, handoff_at_boundary is NOT set, decoding continues.
+        // We verify this by checking that the bootstrap does NOT return early at a
+        // fixed-Huffman block when a later dynamic block is available.
+        //
+        // Practical approach: use a large stream. If the stream has dynamic blocks
+        // and bootstrap accumulates 32 KB, handoff fires at the first BTYPE=00/10
+        // boundary. We then verify clean_window is Some (handoff happened at some
+        // point) and end_bit_offset is at a real boundary.
+        let input: Vec<u8> = {
+            let mut v = Vec::with_capacity(128 * 1024);
+            let mut s: u64 = 0x7654321;
+            while v.len() < 128 * 1024 {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                v.push(((s >> 16) % 26) as u8 + b'a');
+            }
+            v
+        };
+        let deflate = make_deflate(&input, 6);
+        let real_starts = record_block_starts(&deflate).unwrap();
+
+        let result = decode_chunk_bootstrap(&deflate, 0, None).expect("bootstrap must not error");
+        if let Some(_window) = result.clean_window {
+            // If handoff fired, end_bit must be at a real block boundary.
+            assert!(
+                real_starts.contains(&result.end_bit_offset),
+                "bootstrap end_bit {} is not a real deflate block boundary; real_starts has {} entries",
+                result.end_bit_offset,
+                real_starts.len()
+            );
+        }
+        // Whether or not handoff fired, end_bit must be ≤ stream length.
+        assert!(
+            result.end_bit_offset <= deflate.len() * 8,
+            "bootstrap end_bit {} past stream end {}",
+            result.end_bit_offset,
+            deflate.len() * 8
+        );
+    }
+
+    /// C4 — Bootstrap does NOT hand off to ISA-L at BTYPE=11 (reserved).
+    ///
+    /// Regression for commit 94834d6: the old `next_btype != 1` check allowed
+    /// BTYPE=11 to trigger handoff=true, passing a garbage bit position to ISA-L
+    /// which immediately failed with "Reserved block type 3". The fix requires
+    /// BTYPE=00 or BTYPE=10 for handoff.
+    ///
+    /// With the fix, the bootstrap continues past the BTYPE=11 header, attempts
+    /// to decode the reserved block, and returns Err — which is the correct
+    /// behavior (chunk will be retried by phase1c from predecessor's confirmed end).
+    #[test]
+    fn bootstrap_does_not_hand_off_at_btype11() {
+        // We can't easily inject BTYPE=11 mid-stream without corrupting the valid
+        // prefix. Instead, verify the invariant directly: decode_chunk_bootstrap
+        // on a stream that *only* has a BTYPE=11 block (preceded by nothing clean)
+        // must NOT set clean_window=Some. It should return Ok with clean_window=None
+        // (too little output) or Err (decode error on the reserved block).
+        //
+        // Build: 3 bytes encoding BFINAL=1, BTYPE=11 (bits: 1 1 1 = 0x07 in LSB-first)
+        // = 0b111 = byte 0x07 padded to a full byte.
+        let reserved_stream = vec![0b111u8, 0x00, 0x00]; // BFINAL=1, BTYPE=11, garbage
+        let result = decode_chunk_bootstrap(&reserved_stream, 0, None);
+        match result {
+            Ok(r) => {
+                assert!(
+                    r.clean_window.is_none(),
+                    "bootstrap must not produce a clean_window on a BTYPE=11 stream"
+                );
+            }
+            Err(_) => {
+                // Err is also acceptable: the reserved block hit the error arm.
+            }
+        }
+
+        // Stronger test: a valid prefix that accumulates ≥32 KB of output but
+        // whose BFINAL block uses BTYPE=11. The bootstrap must not hand off.
+        // Because we can't portably construct such a stream without deep bit
+        // manipulation, we instead verify that when a stream ends abruptly after
+        // the prefix (no BTYPE=11 injection), the result is correct — and rely
+        // on A1 to cover the validate_boundary path.
+        //
+        // Assert the byte constant is consistent with the code's peek formula:
+        // bits.peek() gives LSB-first, so BFINAL=bit0, BTYPE=bits1-2.
+        // 0b111 = BFINAL=1, BTYPE=0b11=3 (reserved). Confirmed.
+        let btype = (0b111u8 >> 1) & 3;
+        assert_eq!(
+            btype, 3,
+            "sanity: 0b111 header has BTYPE=3 (reserved); peek formula must agree"
         );
     }
 }

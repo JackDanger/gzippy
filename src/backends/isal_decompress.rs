@@ -1059,4 +1059,84 @@ mod tests {
             "inline CRC must equal post-process CRC over the same bytes"
         );
     }
+
+    /// E1 — ISA-L end_bit is always a real deflate block boundary.
+    ///
+    /// `decompress_deflate_from_bit_with_end` promises that when it returns
+    /// `Some((bytes, end_bit))`, `end_bit` is at `ISAL_BLOCK_NEW_HDR |
+    /// ISAL_BLOCK_INPUT_DONE | ISAL_BLOCK_FINISH` — a genuine deflate block
+    /// boundary per ISA-L's state machine. This test verifies that invariant
+    /// by comparing against `record_block_starts` (a pure-Rust decoder that
+    /// collects every real block-start bit by decoding from bit 0).
+    ///
+    /// If ISA-L's end_bit formula (`data.len()*8 - avail_in*8 -
+    /// read_in_length`) ever produces a position that is NOT in
+    /// `record_block_starts`, the phase1c snap could corrupt the G1 invariant
+    /// by snapping a real ISA-L boundary to a fake `lim`.
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_isal_end_bit_is_always_real_deflate_boundary() {
+        use super::*;
+        use crate::decompress::parallel::fast_marker_inflate::record_block_starts;
+        use std::collections::HashSet;
+        use std::io::Write;
+
+        if !is_available() {
+            return;
+        }
+
+        let mut rng: u64 = 0xb0undary;
+        for seed in 0u64..8 {
+            rng = seed.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(1);
+            // ~128 KB of mixed-entropy data.
+            let mut input = Vec::with_capacity(128 * 1024);
+            while input.len() < 128 * 1024 {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                if (rng >> 32) % 4 < 3 {
+                    input.push((rng >> 16) as u8);
+                } else {
+                    let byte = ((rng >> 24) % 26) as u8 + b'a';
+                    let run = ((rng >> 40) % 8 + 2) as usize;
+                    for _ in 0..run.min(128 * 1024 - input.len()) {
+                        input.push(byte);
+                    }
+                }
+            }
+            let mut enc =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
+            enc.write_all(&input).unwrap();
+            let deflate = enc.finish().unwrap();
+
+            let real_starts: HashSet<usize> = record_block_starts(&deflate)
+                .expect("record_block_starts must succeed on valid deflate")
+                .into_iter()
+                .collect();
+
+            // Try starting ISA-L from each real block boundary and verify the
+            // returned end_bit is also a real block boundary.
+            for &start_bit in &real_starts {
+                if start_bit == 0 {
+                    continue; // bit 0 is always real; skip trivial case
+                }
+                let dict: &[u8] = &[];
+                let max_output = input.len() * 2;
+                let mut crc = crc32fast::Hasher::new();
+                let result = decompress_deflate_from_bit_with_end(
+                    &deflate, start_bit, dict, max_output, &mut crc,
+                );
+                let Some((_bytes, end_bit)) = result else {
+                    // ISA-L returned None — could be truncated input or a block
+                    // that overflows max_output. Not an E1 violation.
+                    continue;
+                };
+                assert!(
+                    real_starts.contains(&end_bit),
+                    "seed={seed}: ISA-L end_bit={end_bit} starting from start_bit={start_bit} \
+                     is not in record_block_starts (has {} real starts). \
+                     ISA-L end_bit formula may have a ≥1-bit overshoot on this stream.",
+                    real_starts.len()
+                );
+            }
+        }
+    }
 }
