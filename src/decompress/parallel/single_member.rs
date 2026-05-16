@@ -711,13 +711,19 @@ fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
     } else {
         4 * 1024
     };
+    // Use 4× the min_output as the ISA-L cap so that a false boundary whose
+    // BFINAL block produces just-over-min_output bytes (e.g. 34 KB against a
+    // 32 KB min) still triggers the premature-BFINAL guard in
+    // `decompress_deflate_from_bit`. With a 32 KB cap the guard never fires
+    // because the output cap is hit before the BFINAL block is reached.
+    let stage1_cap = min_output * 4;
 
     // Stage 1: ISA-L (or zlib-ng) fast filter.
     let isal_ok = crate::backends::inflate_bit::decompress_deflate_from_bit(
         deflate_data,
         bit_offset,
         &[],
-        min_output,
+        stage1_cap,
     )
     .is_some_and(|out| out.len() >= min_output);
     if !isal_ok {
