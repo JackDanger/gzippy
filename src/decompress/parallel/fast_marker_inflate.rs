@@ -232,10 +232,11 @@ pub fn validate_boundary(
         let bfinal = (bits.peek() & 1) != 0;
         let btype = ((bits.peek() >> 1) & 3) as u32;
         bits.consume(3);
+        let mut clean_tail = None;
         match btype {
-            0 => decode_stored(&mut bits, &mut output)?,
-            1 => decode_fixed(&mut bits, &mut output, max_output_bytes)?,
-            2 => decode_dynamic(&mut bits, &mut output, max_output_bytes)?,
+            0 => decode_stored(&mut bits, &mut output, &mut clean_tail)?,
+            1 => decode_fixed(&mut bits, &mut output, max_output_bytes, &mut clean_tail)?,
+            2 => decode_dynamic(&mut bits, &mut output, max_output_bytes, &mut clean_tail)?,
             _ => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type 3")),
         }
         blocks_decoded += 1;
@@ -381,6 +382,58 @@ pub struct BootstrapResult {
     /// real BFINAL block boundary that is NOT a valid starting point for
     /// the next chunk (no deflate data follows BFINAL).
     pub bfinal_hit: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CleanTailTracker {
+    trailing_clean_bytes: usize,
+}
+
+impl CleanTailTracker {
+    #[inline]
+    fn from_output(output: &[u16]) -> Self {
+        Self {
+            trailing_clean_bytes: output
+                .iter()
+                .rev()
+                .take_while(|&&v| v < MARKER_BASE)
+                .count()
+                .min(WINDOW_SIZE),
+        }
+    }
+
+    #[inline]
+    fn ready_for_handoff(self) -> bool {
+        self.trailing_clean_bytes >= WINDOW_SIZE
+    }
+
+    #[inline]
+    fn observe_value(&mut self, value: u16) {
+        if value < MARKER_BASE {
+            self.trailing_clean_bytes = (self.trailing_clean_bytes + 1).min(WINDOW_SIZE);
+        } else {
+            self.trailing_clean_bytes = 0;
+        }
+    }
+
+    #[inline]
+    fn observe_slice(&mut self, values: &[u16]) {
+        if values.is_empty() {
+            return;
+        }
+        let trailing_clean = values
+            .iter()
+            .rev()
+            .take_while(|&&v| v < MARKER_BASE)
+            .count()
+            .min(WINDOW_SIZE);
+        if trailing_clean == values.len() {
+            self.trailing_clean_bytes =
+                (self.trailing_clean_bytes + trailing_clean).min(WINDOW_SIZE);
+        } else {
+            self.trailing_clean_bytes = trailing_clean;
+        }
+    }
 }
 
 /// Bootstrap-mode variant of [`decode_chunk_markers_bounded`]. Decodes
@@ -575,6 +628,9 @@ fn decode_loop(
     end_bit_limit: Option<usize>,
     mut bootstrap_handoff: Option<&mut bool>,
 ) -> Result<()> {
+    let mut clean_tail = bootstrap_handoff
+        .as_ref()
+        .map(|_| CleanTailTracker::from_output(output));
     loop {
         if bits.available() < 3 {
             bits.refill();
@@ -648,10 +704,9 @@ fn decode_loop(
         // bootstrap exits (which happens within the first ~32-64 KB of
         // output, not at every block of the whole chunk).
         if let Some(ref mut handoff) = bootstrap_handoff {
-            if output.len() >= WINDOW_SIZE
-                && output[output.len() - WINDOW_SIZE..]
-                    .iter()
-                    .all(|&v| v < MARKER_BASE)
+            if clean_tail
+                .as_ref()
+                .is_some_and(|tracker| tracker.ready_for_handoff())
             {
                 // Peek the next block's BTYPE before handing off to ISA-L.
                 // Refuse to stop at BTYPE=01 (fixed Huffman): a false-positive
@@ -678,9 +733,9 @@ fn decode_loop(
         bits.consume(3);
 
         match btype {
-            0 => decode_stored(bits, output)?,
-            1 => decode_fixed(bits, output, 0)?,
-            2 => decode_dynamic(bits, output, 0)?,
+            0 => decode_stored(bits, output, &mut clean_tail)?,
+            1 => decode_fixed(bits, output, 0, &mut clean_tail)?,
+            2 => decode_dynamic(bits, output, 0, &mut clean_tail)?,
             _ => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type 3")),
         }
 
@@ -707,7 +762,11 @@ pub(super) fn record_block_starts(data: &[u8]) -> Result<Vec<usize>> {
 
 // ── Stored block (BTYPE = 00) ───────────────────────────────────────────────
 
-fn decode_stored(bits: &mut Bits, output: &mut Vec<u16>) -> Result<()> {
+fn decode_stored(
+    bits: &mut Bits,
+    output: &mut Vec<u16>,
+    clean_tail: &mut Option<CleanTailTracker>,
+) -> Result<()> {
     bits.align_to_byte();
     let len = bits.read_u16();
     let nlen = bits.read_u16();
@@ -721,7 +780,11 @@ fn decode_stored(bits: &mut Bits, output: &mut Vec<u16>) -> Result<()> {
 
     // Drain any whole bytes still in the bit buffer.
     while remaining > 0 && bits.available() >= 8 {
-        output.push((bits.bitbuf & 0xFF) as u16);
+        let value = (bits.bitbuf & 0xFF) as u16;
+        output.push(value);
+        if let Some(tracker) = clean_tail.as_mut() {
+            tracker.observe_value(value);
+        }
         bits.consume(8);
         remaining -= 1;
     }
@@ -734,9 +797,13 @@ fn decode_stored(bits: &mut Bits, output: &mut Vec<u16>) -> Result<()> {
                 "Truncated stored block",
             ));
         }
+        let start = output.len();
         output.reserve(remaining);
         for &b in &bits.data[bits.pos..bits.pos + remaining] {
             output.push(b as u16);
+        }
+        if let Some(tracker) = clean_tail.as_mut() {
+            tracker.observe_slice(&output[start..]);
         }
         bits.pos += remaining;
     }
@@ -779,19 +846,30 @@ fn fixed_dist_table() -> &'static ConsumeFirstTable {
     })
 }
 
-fn decode_fixed(bits: &mut Bits, output: &mut Vec<u16>, max_output: usize) -> Result<()> {
+fn decode_fixed(
+    bits: &mut Bits,
+    output: &mut Vec<u16>,
+    max_output: usize,
+    clean_tail: &mut Option<CleanTailTracker>,
+) -> Result<()> {
     decode_huffman_block(
         bits,
         output,
         fixed_litlen_table(),
         fixed_dist_table(),
         max_output,
+        clean_tail,
     )
 }
 
 // ── Dynamic Huffman block (BTYPE = 10) ──────────────────────────────────────
 
-fn decode_dynamic(bits: &mut Bits, output: &mut Vec<u16>, max_output: usize) -> Result<()> {
+fn decode_dynamic(
+    bits: &mut Bits,
+    output: &mut Vec<u16>,
+    max_output: usize,
+    clean_tail: &mut Option<CleanTailTracker>,
+) -> Result<()> {
     // Header: HLIT (5), HDIST (5), HCLEN (4).
     if bits.available() < 14 {
         bits.refill();
@@ -882,7 +960,14 @@ fn decode_dynamic(bits: &mut Bits, output: &mut Vec<u16>, max_output: usize) -> 
     let litlen_table = ConsumeFirstTable::build(&lens[..hlit])?;
     let dist_table = ConsumeFirstTable::build_distance(&lens[hlit..])?;
 
-    decode_huffman_block(bits, output, &litlen_table, &dist_table, max_output)
+    decode_huffman_block(
+        bits,
+        output,
+        &litlen_table,
+        &dist_table,
+        max_output,
+        clean_tail,
+    )
 }
 
 // ── Shared Huffman block body (used by both fixed and dynamic) ──────────────
@@ -894,6 +979,7 @@ fn decode_huffman_block(
     litlen: &ConsumeFirstTable,
     dist: &ConsumeFirstTable,
     max_output: usize,
+    clean_tail: &mut Option<CleanTailTracker>,
 ) -> Result<()> {
     loop {
         if max_output > 0 && output.len() >= max_output {
@@ -905,7 +991,11 @@ fn decode_huffman_block(
         let sym = decode_cf(litlen, bits)?;
         if sym < 256 {
             // Literal.
-            output.push(sym as u16);
+            let value = sym as u16;
+            output.push(value);
+            if let Some(tracker) = clean_tail.as_mut() {
+                tracker.observe_value(value);
+            }
         } else if sym == 256 {
             // End of block.
             return Ok(());
@@ -958,7 +1048,7 @@ fn decode_huffman_block(
             if distance == 0 || distance > WINDOW_SIZE {
                 return Err(Error::new(ErrorKind::InvalidData, "Invalid distance"));
             }
-            emit_match(output, distance, length);
+            emit_match(output, distance, length, clean_tail);
         }
     }
 }
@@ -967,7 +1057,12 @@ fn decode_huffman_block(
 /// from the current end of `output`. Splits between markers (cross-chunk
 /// portion) and chunk-local copies (within-chunk portion).
 #[inline]
-fn emit_match(output: &mut Vec<u16>, distance: usize, length: usize) {
+fn emit_match(
+    output: &mut Vec<u16>,
+    distance: usize,
+    length: usize,
+    clean_tail: &mut Option<CleanTailTracker>,
+) {
     let out_pos = output.len();
     // Reserve once for the full match so neither marker pushes nor local
     // copies trigger reallocation checks per element. Per-thread
@@ -991,6 +1086,9 @@ fn emit_match(output: &mut Vec<u16>, distance: usize, length: usize) {
     // reads from `(out_pos + marker_count) - distance`.
     let local_count = length - marker_count;
     if local_count == 0 {
+        if let Some(tracker) = clean_tail.as_mut() {
+            tracker.observe_slice(&output[out_pos..]);
+        }
         return;
     }
     let base_dst = out_pos + marker_count;
@@ -1023,6 +1121,9 @@ fn emit_match(output: &mut Vec<u16>, distance: usize, length: usize) {
                 output.set_len(len + 1);
             }
         }
+    }
+    if let Some(tracker) = clean_tail.as_mut() {
+        tracker.observe_slice(&output[out_pos..]);
     }
 }
 
@@ -1305,8 +1406,8 @@ mod tests {
         // Hand-built scenario: chunk has no own bytes yet (out_pos=0), and a
         // back-ref of distance D, length L. All bytes are markers.
         let mut output: Vec<u16> = Vec::new();
-        emit_match(&mut output, 4, 3); // distance 4, length 3, out_pos 0
-                                       // Markers should be MARKER_BASE + 3, +2, +1 (offsets going down).
+        emit_match(&mut output, 4, 3, &mut None); // distance 4, length 3, out_pos 0
+                                                  // Markers should be MARKER_BASE + 3, +2, +1 (offsets going down).
         assert_eq!(
             output,
             vec![MARKER_BASE + 3, MARKER_BASE + 2, MARKER_BASE + 1]
@@ -1318,7 +1419,7 @@ mod tests {
         // out_pos=2 (we already emitted two markers), distance=5 (cross-chunk),
         // length=8 → first 3 bytes are markers, next 5 are chunk-local copies.
         let mut output: Vec<u16> = vec![MARKER_BASE + 10, MARKER_BASE + 9];
-        emit_match(&mut output, 5, 8);
+        emit_match(&mut output, 5, 8, &mut None);
         // First 3 emitted: markers at offsets 2, 1, 0 (= MARKER_BASE+2, +1, +0).
         // Then chunk-local copies starting at output[5]: src = output[5-5..]
         // = the two existing markers (offsets 10, 9) plus the three we just emitted.
@@ -1343,8 +1444,46 @@ mod tests {
         // The classic RLE pattern: distance=1 means "repeat last byte length times."
         // Chunk-local copy with overlap must use element-by-element to match deflate semantics.
         let mut output: Vec<u16> = vec![b'X' as u16];
-        emit_match(&mut output, 1, 5);
+        emit_match(&mut output, 1, 5, &mut None);
         assert_eq!(output, vec![b'X' as u16; 6]);
+    }
+
+    #[test]
+    fn clean_tail_tracker_counts_literal_suffix_incrementally() {
+        let mut tracker = CleanTailTracker::default();
+        tracker.observe_slice(&vec![b'a' as u16; WINDOW_SIZE]);
+        assert!(tracker.ready_for_handoff());
+
+        tracker.observe_value(MARKER_BASE + 3);
+        assert!(!tracker.ready_for_handoff());
+
+        tracker.observe_slice(&vec![b'b' as u16; WINDOW_SIZE]);
+        assert!(tracker.ready_for_handoff());
+    }
+
+    #[test]
+    fn clean_tail_tracker_resets_and_recovers_through_match_output() {
+        let mut tracker = Some(CleanTailTracker {
+            trailing_clean_bytes: WINDOW_SIZE - 4,
+        });
+        let mut output = vec![b'Q' as u16; 8];
+
+        emit_match(&mut output, 16, 6, &mut tracker);
+        assert_eq!(
+            tracker.expect("tracker present").trailing_clean_bytes,
+            0,
+            "cross-chunk markers must reset the clean tail"
+        );
+
+        let mut tracker = Some(CleanTailTracker {
+            trailing_clean_bytes: WINDOW_SIZE - 4,
+        });
+        let mut output = vec![b'R' as u16; 8];
+        emit_match(&mut output, 1, 8, &mut tracker);
+        assert!(
+            tracker.expect("tracker present").ready_for_handoff(),
+            "literal-only match output must extend the clean tail to the handoff threshold"
+        );
     }
 
     /// Premortem mitigation B6 — chunk boundaries from `search_boundary_forward`
