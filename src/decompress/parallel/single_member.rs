@@ -75,6 +75,10 @@ const MIN_THREADS_FOR_PARALLEL: usize = 2;
 
 /// Search radius (bytes) around each partition point for block boundaries.
 const SEARCH_RADIUS: usize = 512 * 1024;
+/// Extra compressed-input margin for approximate partition stops so ISA-L can
+/// reach the next real block boundary instead of stopping at the raw partition
+/// cut.
+const APPROX_STOP_INPUT_MARGIN_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RealBlockBoundary(usize);
@@ -1170,9 +1174,15 @@ fn decode_chunk_with_handoff(
         // boundary trim, ISA-L would decode all the way to BFINAL on
         // every chunk — quadratic total work, defeating the parallel
         // win.
-        let end_byte = match stop_hint_bits {
-            Some(end_bits) => (end_bits.div_ceil(8)).min(deflate_data.len()),
-            None => deflate_data.len(),
+        let end_byte = match stop {
+            ChunkDecodeStop::Approximate(limit) => ((limit
+                .bits()
+                .saturating_add(APPROX_STOP_INPUT_MARGIN_BYTES * 8))
+            .div_ceil(8))
+            .min(deflate_data.len()),
+            _ => stop_hint_bits
+                .map(|end_bits| (end_bits.div_ceil(8)).min(deflate_data.len()))
+                .unwrap_or(deflate_data.len()),
         };
         let input = &deflate_data[..end_byte];
 
@@ -1366,12 +1376,14 @@ fn normalize_isal_end_bit(
     match stop {
         ChunkDecodeStop::Approximate(limit) => {
             let limit_bits = limit.bits();
-            if isal_end_bit > limit_bits + ISA_L_END_BIT_SNAP_TOLERANCE_BITS {
+            let max_approx_end =
+                limit_bits.saturating_add(APPROX_STOP_INPUT_MARGIN_BYTES.saturating_mul(8));
+            if isal_end_bit > max_approx_end {
                 if debug_enabled() {
                     eprintln!(
                         "[parallel_sm:v0.6] approximate stop reject: start={} end_bit={} \
-                         limit={} reason=overshoot",
-                        start_bit, isal_end_bit, limit_bits,
+                         limit={} max_end={} reason=overshoot",
+                        start_bit, isal_end_bit, limit_bits, max_approx_end,
                     );
                 }
                 return None;
@@ -1388,8 +1400,8 @@ fn normalize_isal_end_bit(
                 if debug_enabled() {
                     eprintln!(
                         "[parallel_sm:v0.6] approximate stop accept: start={} end_bit={} \
-                         limit={} reason=validated-boundary",
-                        start_bit, isal_end_bit, limit_bits,
+                         limit={} max_end={} reason=validated-boundary",
+                        start_bit, isal_end_bit, limit_bits, max_approx_end,
                     );
                 }
                 Some(RealBlockBoundary(isal_end_bit))
@@ -1397,8 +1409,8 @@ fn normalize_isal_end_bit(
                 if debug_enabled() {
                     eprintln!(
                         "[parallel_sm:v0.6] approximate stop reject: start={} end_bit={} \
-                         limit={} reason=not-a-boundary",
-                        start_bit, isal_end_bit, limit_bits,
+                         limit={} max_end={} reason=not-a-boundary",
+                        start_bit, isal_end_bit, limit_bits, max_approx_end,
                     );
                 }
                 None
