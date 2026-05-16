@@ -1233,7 +1233,7 @@ fn phase1_marker_decode_parallel(
                 };
                 let stop = boundaries.speculative_stop_for(idx);
                 let force_slow_path = !stop.use_isal();
-                let outcome = decode_chunk_inexact_legacy(
+                let outcome = decode_chunk_inexact(
                     deflate_data,
                     idx,
                     start_bit,
@@ -1517,8 +1517,153 @@ fn decode_chunk_with_handoff_legacy(
     }
 }
 
-/// Transitional inexact worker seam. For now this simply wraps the legacy
-/// worker and reports either a speculative candidate or `NoDecode`.
+/// Inexact worker seam used by phase 1b. Unlike the legacy helper below, this
+/// path must not rescue itself by finishing the chunk with the marker decoder;
+/// any failure to establish a clean ISA-L handoff is surfaced as `NoDecode` so
+/// the dispatcher can decide whether to discard, refetch exactly, or materialize
+/// an empty partition.
+fn decode_chunk_inexact(
+    deflate_data: &[u8],
+    requested_partition: usize,
+    start_bit: ChunkStart,
+    stop: ChunkDecodeStop,
+    per_chunk_output_hint: usize,
+    num_chunks_total: usize,
+    force_slow_path: bool,
+) -> WorkerOutcome {
+    let t_worker = std::time::Instant::now();
+    let stop_hint_bits = stop.hint_bits();
+    let BootstrapResult {
+        markers: bootstrap_markers,
+        end_bit_offset: bootstrap_end_bit,
+        clean_window,
+        bfinal_hit,
+    } = match decode_chunk_bootstrap(deflate_data, start_bit.bits(), stop_hint_bits) {
+        Ok(result) => result,
+        Err(_) => return WorkerOutcome::NoDecode,
+    };
+
+    BOOTSTRAP_OUTPUT_BYTES.fetch_add(bootstrap_markers.len() as u64, Ordering::Relaxed);
+
+    if debug_enabled() {
+        eprintln!(
+            "[bootstrap] start={start_bit} stop={stop:?} \
+             end_bit={bootstrap_end_bit} bfinal_hit={bfinal_hit} \
+             window={} output_bytes={}",
+            clean_window.is_some(),
+            bootstrap_markers.len(),
+        );
+    }
+
+    let Some(dict) = clean_window else {
+        if debug_enabled() {
+            eprintln!(
+                "[parallel_sm:v0.6] chunk start={start_bit}: inexact worker returning NoDecode \
+                 (bootstrap_end_bit={} bfinal_hit={} stop={stop:?})",
+                bootstrap_end_bit, bfinal_hit
+            );
+        }
+        return WorkerOutcome::NoDecode;
+    };
+
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    {
+        if force_slow_path {
+            let _ = (per_chunk_output_hint, num_chunks_total);
+            if debug_enabled() {
+                eprintln!(
+                    "[parallel_sm:v0.6] chunk start={start_bit}: inexact worker returning NoDecode \
+                     because force_slow_path was requested"
+                );
+            }
+            return WorkerOutcome::NoDecode;
+        }
+
+        let end_byte = match stop {
+            ChunkDecodeStop::Approximate(limit) => ((limit
+                .bits()
+                .saturating_add(APPROX_STOP_INPUT_MARGIN_BYTES * 8))
+            .div_ceil(8))
+            .min(deflate_data.len()),
+            _ => stop_hint_bits
+                .map(|end_bits| (end_bits.div_ceil(8)).min(deflate_data.len()))
+                .unwrap_or(deflate_data.len()),
+        };
+        let input = &deflate_data[..end_byte];
+        let max_output = per_chunk_output_hint.saturating_mul(2);
+        let _ = num_chunks_total;
+
+        let mut isal_crc = crc32fast::Hasher::new();
+        match crate::backends::isal_decompress::decompress_deflate_from_bit_with_end(
+            input,
+            bootstrap_end_bit,
+            &dict,
+            max_output,
+            &mut isal_crc,
+        ) {
+            Some((isal_bytes, isal_end_bit)) => {
+                let Some(verified_end_bit) =
+                    normalize_isal_end_bit(deflate_data, start_bit, stop, isal_end_bit)
+                else {
+                    if debug_enabled() {
+                        eprintln!(
+                            "[parallel_sm:v0.6] chunk start={start_bit}: inexact worker returning NoDecode \
+                             after rejecting ISA-L end_bit={} for stop={stop:?}",
+                            isal_end_bit
+                        );
+                    }
+                    return WorkerOutcome::NoDecode;
+                };
+                HANDOFF_FIRED.fetch_add(1, Ordering::Relaxed);
+                ISAL_OUTPUT_BYTES.fetch_add(isal_bytes.len() as u64, Ordering::Relaxed);
+                let split_at = bootstrap_markers.len().saturating_sub(dict.len());
+                let mut bootstrap = bootstrap_markers;
+                bootstrap.truncate(split_at);
+                WorkerOutcome::Candidate(CandidateChunk {
+                    requested_partition,
+                    discovered_start: start_bit,
+                    discovered_end: verified_end_bit,
+                    chunk: ChunkResult {
+                        bootstrap,
+                        bootstrap_clean: dict,
+                        isal_bytes,
+                        isal_crc,
+                        end_bit_offset: verified_end_bit.bits(),
+                        worker_elapsed: t_worker.elapsed(),
+                    },
+                })
+            }
+            None => {
+                if debug_enabled() {
+                    eprintln!(
+                        "[parallel_sm:v0.6] chunk start={start_bit}: inexact worker returning NoDecode \
+                         after ISA-L failed"
+                    );
+                }
+                WorkerOutcome::NoDecode
+            }
+        }
+    }
+
+    #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+    {
+        let _ = (
+            deflate_data,
+            requested_partition,
+            start_bit,
+            stop,
+            per_chunk_output_hint,
+            num_chunks_total,
+            force_slow_path,
+            dict,
+            bootstrap_end_bit,
+            bootstrap_markers,
+            t_worker,
+        );
+        WorkerOutcome::NoDecode
+    }
+}
+
 fn decode_chunk_inexact_legacy(
     deflate_data: &[u8],
     requested_partition: usize,
@@ -1528,22 +1673,15 @@ fn decode_chunk_inexact_legacy(
     num_chunks_total: usize,
     force_slow_path: bool,
 ) -> WorkerOutcome {
-    match decode_chunk_with_handoff_legacy(
+    decode_chunk_inexact(
         deflate_data,
+        requested_partition,
         start_bit,
         stop,
         per_chunk_output_hint,
         num_chunks_total,
         force_slow_path,
-    ) {
-        Ok(chunk) => WorkerOutcome::Candidate(CandidateChunk {
-            requested_partition,
-            discovered_start: start_bit,
-            discovered_end: RealBlockBoundary(chunk.end_bit_offset),
-            chunk,
-        }),
-        Err(_) => WorkerOutcome::NoDecode,
-    }
+    )
 }
 
 /// Transitional exact worker seam. The authoritative start/end contract is not
