@@ -916,6 +916,14 @@ fn chunk_decode_stop(
     }
 }
 
+#[inline]
+fn correction_decode_stop(idx: usize, start_bits: &[Option<ChunkStart>]) -> ChunkDecodeStop {
+    match (idx + 1..start_bits.len()).find_map(|j| start_bits[j].map(ChunkStart::to_end_limit)) {
+        Some(limit) => ChunkDecodeStop::Verified(limit),
+        None => ChunkDecodeStop::UntilEnd,
+    }
+}
+
 // ── Phase 1b: parallel marker decode ─────────────────────────────────────────
 //
 // Each chunk's decode produces both the marker stream AND its end bit
@@ -1430,7 +1438,7 @@ fn phase1c_resolve_consistency(
     chunks: &mut [Option<ChunkResult>],
     deadline: std::time::Instant,
     per_chunk_output_hint: usize,
-    spacing_bits: usize,
+    _spacing_bits: usize,
 ) -> Result<(), ParallelError> {
     let num_chunks = chunks.len();
     if num_chunks == 0 {
@@ -1530,7 +1538,7 @@ fn phase1c_resolve_consistency(
                 // byte-padding before the gzip trailer. No decode needed.
                 empty_fills.push(EmptyChunkFill::new(i + 1, ChunkStart::from_bits(pred_end)));
             } else {
-                let stop = chunk_decode_stop(i + 1, start_bits, spacing_bits, total_bits);
+                let stop = correction_decode_stop(i + 1, start_bits);
                 if stop
                     .hint_bits()
                     .is_some_and(|stop_bits| pred_end >= stop_bits)
