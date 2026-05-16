@@ -470,7 +470,7 @@ pub fn decompress_parallel<W: Write>(
         for (i, chunk) in chunks.iter().enumerate() {
             match chunk {
                 Some(c) => {
-                    let boot_kb = c.bootstrap.len() / 1024;
+                    let boot_kb = (c.bootstrap.len() + c.bootstrap_clean.len()) / 1024;
                     let isal_kb = c.isal_bytes.len() / 1024;
                     let total_kb = boot_kb + isal_kb;
                     // G1 invariant: every phase1b result must land at a real block
@@ -875,6 +875,9 @@ fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
 /// no matter how good the parallel orchestration is.
 struct ChunkResult {
     bootstrap: Vec<u16>,
+    /// Trailing bootstrap bytes already proven marker-free and stored as
+    /// real bytes so phase 2 doesn't keep them in the wider u16 form.
+    bootstrap_clean: Vec<u8>,
     /// Bulk decoded bytes from ISA-L. Single contiguous allocation; no
     /// segmentation — the earlier 128 KiB segment design caused ~3900
     /// mmap/munmap pairs (segment size == M_MMAP_THRESHOLD) serialising
@@ -893,7 +896,7 @@ struct ChunkResult {
 
 impl ChunkResult {
     fn decoded_len(&self) -> usize {
-        self.bootstrap.len() + self.isal_bytes.len()
+        self.bootstrap.len() + self.bootstrap_clean.len() + self.isal_bytes.len()
     }
 }
 
@@ -1050,6 +1053,7 @@ fn decode_chunk_with_handoff(
         }
         return Ok(ChunkResult {
             bootstrap: bootstrap_markers,
+            bootstrap_clean: Vec::new(),
             isal_bytes: Vec::new(),
             isal_crc: crc32fast::Hasher::new(),
             end_bit_offset: bootstrap_end_bit,
@@ -1157,8 +1161,12 @@ fn decode_chunk_with_handoff(
                 };
                 HANDOFF_FIRED.fetch_add(1, Ordering::Relaxed);
                 ISAL_OUTPUT_BYTES.fetch_add(isal_bytes.len() as u64, Ordering::Relaxed);
+                let split_at = bootstrap_markers.len().saturating_sub(dict.len());
+                let mut bootstrap = bootstrap_markers;
+                bootstrap.truncate(split_at);
                 Ok(ChunkResult {
-                    bootstrap: bootstrap_markers,
+                    bootstrap,
+                    bootstrap_clean: dict,
                     isal_bytes,
                     isal_crc,
                     end_bit_offset: verified_end_bit.bits(),
@@ -1251,6 +1259,7 @@ fn marker_finish_after_bootstrap(
     )?;
     Ok(ChunkResult {
         bootstrap: bootstrap_markers,
+        bootstrap_clean: Vec::new(),
         isal_bytes: Vec::new(),
         // Slow path: no ISA-L bytes, so the per-chunk CRC is the
         // identity. Phase 2 will CRC the resolved bootstrap.
@@ -1426,6 +1435,7 @@ fn phase1c_resolve_consistency(
             }
             chunks[idx] = Some(ChunkResult {
                 bootstrap: Vec::new(),
+                bootstrap_clean: Vec::new(),
                 isal_bytes: Vec::new(),
                 isal_crc: crc32fast::Hasher::new(),
                 end_bit_offset: pred_end,
@@ -1571,7 +1581,8 @@ fn phase2_resolve_write_combine<W: Write>(
         }
         // Narrow u16 → u8 into a per-chunk Vec. Each chunk's bootstrap
         // is bounded to ~32-512 KB so the allocation cost is negligible.
-        let mut bootstrap_u8: Vec<u8> = Vec::with_capacity(chunk.bootstrap.len());
+        let mut bootstrap_u8: Vec<u8> =
+            Vec::with_capacity(chunk.bootstrap.len() + chunk.bootstrap_clean.len());
         narrow_and_append(&mut bootstrap_u8, &chunk.bootstrap).map_err(|pos| {
             if debug_enabled() {
                 eprintln!(
@@ -1583,9 +1594,11 @@ fn phase2_resolve_write_combine<W: Write>(
             }
             ParallelError::DecodeFailed
         })?;
+        bootstrap_u8.extend_from_slice(&chunk.bootstrap_clean);
         // Free the u16 buffer eagerly — it's 2× the size of bootstrap_u8
         // and we don't need it anymore.
         chunk.bootstrap = Vec::new();
+        chunk.bootstrap_clean = Vec::new();
 
         // CRC the (small) resolved bootstrap bytes sequentially; the
         // ISA-L bytes' CRC was computed by phase 1 worker in parallel.
@@ -2384,6 +2397,7 @@ mod tests {
         let wrong_end = e0.wrapping_add(12345);
         let fake_c1 = ChunkResult {
             bootstrap: Vec::new(),
+            bootstrap_clean: Vec::new(),
             isal_bytes: Vec::new(),
             isal_crc: crc32fast::Hasher::new(),
             end_bit_offset: wrong_end,
