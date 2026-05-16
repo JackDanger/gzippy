@@ -1199,10 +1199,13 @@ fn phase1c_resolve_consistency(
     loop {
         // ── Read-only scan: classify corrections this wave ──────────────────
         // Two categories:
-        //   near_eof_fills: predecessor already at/past EOF — mark empty now.
-        //   specs:          need a real re-decode; will run in parallel.
+        //   near_eof_fills:    predecessor already at/past EOF — mark empty now.
+        //   specs:             need a real re-decode; will run in parallel.
+        //   predecessor_snaps: ISA-L overshot by ≤64 bits; update predecessor's
+        //                      end_bit_offset so the snap doesn't re-fire every wave.
         let mut near_eof_fills: Vec<(usize, usize)> = Vec::new();
         let mut specs: Vec<(usize, usize, Option<usize>)> = Vec::new();
+        let mut predecessor_snaps: Vec<(usize, usize)> = Vec::new();
         let mut new_scan_start = scan_start;
 
         for i in scan_start..num_chunks - 1 {
@@ -1263,6 +1266,14 @@ fn phase1c_resolve_consistency(
                 const ISA_L_SNAP_TOLERANCE_BITS: usize = 64;
                 if let Some(lim) = end_limit {
                     if pred_end > lim && pred_end - lim <= ISA_L_SNAP_TOLERANCE_BITS {
+                        // Snap ISA-L's overshot end_bit to the phase1a-confirmed
+                        // boundary. Two steps are needed:
+                        //   1. predecessor_snaps: fix chunks[i].end_bit_offset = lim
+                        //      so the scan doesn't re-trigger this snap every wave
+                        //      (chunks[i].end_bit_offset ≠ start_bits[i+1] would
+                        //       cause `needs=true` forever — infinite loop).
+                        //   2. near_eof_fills: mark chunk i+1 resolved at lim.
+                        predecessor_snaps.push((i, lim));
                         near_eof_fills.push((i + 1, lim));
                         continue;
                     }
@@ -1274,8 +1285,18 @@ fn phase1c_resolve_consistency(
 
         scan_start = new_scan_start;
 
-        if near_eof_fills.is_empty() && specs.is_empty() {
+        if near_eof_fills.is_empty() && specs.is_empty() && predecessor_snaps.is_empty() {
             break; // all chunks resolved
+        }
+
+        // ── Apply predecessor snaps: fix ISA-L end_bit rounding in-place ────
+        // Must happen before near_eof_fills so the snapped end_bit_offset
+        // propagates correctly to successor chunks' start_ok checks.
+        for (idx, lim) in predecessor_snaps {
+            if let Some(c) = chunks[idx].as_mut() {
+                c.end_bit_offset = lim;
+            }
+            // start_bits[idx+1] is set by near_eof_fills below — no need here.
         }
 
         // ── Apply near-EOF fills (no decode, no deadline check needed) ──────
