@@ -120,6 +120,11 @@ impl ChunkEndLimit {
     fn bits(self) -> usize {
         self.0.bits()
     }
+
+    #[inline]
+    fn boundary(self) -> RealBlockBoundary {
+        self.0
+    }
 }
 
 /// Successful runs of the marker pipeline. Snapshot before/after a decode to
@@ -1093,13 +1098,35 @@ fn decode_chunk_with_handoff(
             &mut isal_crc,
         ) {
             Some((isal_bytes, isal_end_bit)) => {
+                let Some(verified_end_bit) =
+                    normalize_isal_end_bit(start_bit, end_bit_limit, isal_end_bit)
+                else {
+                    if debug_enabled() {
+                        eprintln!(
+                            "[parallel_sm:v0.6] chunk start={start_bit}: rejecting ISA-L end_bit={} \
+                             for verified end_limit={end_bit_limit:?}",
+                            isal_end_bit
+                        );
+                    }
+                    SLOW_PATH_USED.fetch_add(1, Ordering::Relaxed);
+                    return marker_finish_after_bootstrap(
+                        deflate_data,
+                        bootstrap_markers,
+                        bootstrap_end_bit,
+                        end_bit_limit.map(ChunkEndLimit::bits),
+                    )
+                    .map(|mut c| {
+                        c.worker_elapsed = t_worker.elapsed();
+                        c
+                    });
+                };
                 HANDOFF_FIRED.fetch_add(1, Ordering::Relaxed);
                 ISAL_OUTPUT_BYTES.fetch_add(isal_bytes.len() as u64, Ordering::Relaxed);
                 Ok(ChunkResult {
                     bootstrap: bootstrap_markers,
                     isal_bytes,
                     isal_crc,
-                    end_bit_offset: isal_end_bit,
+                    end_bit_offset: verified_end_bit.bits(),
                     worker_elapsed: t_worker.elapsed(),
                 })
             }
@@ -1181,6 +1208,22 @@ fn marker_finish_after_bootstrap(
     })
 }
 
+fn normalize_isal_end_bit(
+    start_bit: ChunkStart,
+    end_bit_limit: Option<ChunkEndLimit>,
+    isal_end_bit: usize,
+) -> Option<RealBlockBoundary> {
+    if isal_end_bit < start_bit.bits() {
+        return None;
+    }
+
+    match end_bit_limit {
+        Some(limit) if isal_end_bit == limit.bits() => Some(limit.boundary()),
+        Some(_) => None,
+        None => Some(RealBlockBoundary(isal_end_bit)),
+    }
+}
+
 // ── Phase 1c: cross-chunk consistency correction ─────────────────────────────
 
 /// Walk pairs (N, N+1) once forward and correct chunk N+1's start when chunk N's
@@ -1253,13 +1296,10 @@ fn phase1c_resolve_consistency(
     loop {
         // ── Read-only scan: classify corrections this wave ──────────────────
         // Two categories:
-        //   near_eof_fills:    predecessor already at/past EOF — mark empty now.
-        //   specs:             need a real re-decode; will run in parallel.
-        //   predecessor_snaps: ISA-L overshot by ≤64 bits; update predecessor's
-        //                      end_bit_offset so the snap doesn't re-fire every wave.
+        //   near_eof_fills: predecessor already at/past EOF — mark empty now.
+        //   specs:          need a real re-decode; will run in parallel.
         let mut near_eof_fills: Vec<(usize, usize)> = Vec::new();
         let mut specs: Vec<(usize, ChunkStart, Option<ChunkEndLimit>)> = Vec::new();
-        let mut predecessor_snaps: Vec<(usize, usize)> = Vec::new();
         let mut new_scan_start = scan_start;
 
         for i in scan_start..num_chunks - 1 {
@@ -1312,49 +1352,14 @@ fn phase1c_resolve_consistency(
                 let end_limit =
                     (i + 2..num_chunks).find_map(|j| start_bits[j].map(ChunkStart::to_end_limit));
 
-                // ISA-L's end_bit formula (`data.len()*8 - avail_in*8 -
-                // read_in_length`) can overshoot the true block boundary by up
-                // to read_in_length bits (ISA-L's internal bit buffer, ≤ 64
-                // bits). When pred_end slightly exceeds the phase1a-confirmed
-                // end_limit (i.e., ISA-L reported the boundary a few bits
-                // late), snap to end_limit — a validated real boundary — rather
-                // than propagating the ISA-L rounding error. Decoding from a
-                // position 1-64 bits PAST the true boundary hits garbage
-                // (observed: "Reserved block type 3" after a 3-bit overshoot).
-                const ISA_L_SNAP_TOLERANCE_BITS: usize = 64;
-                if let Some(lim) = end_limit {
-                    if pred_end > lim.bits() && pred_end - lim.bits() <= ISA_L_SNAP_TOLERANCE_BITS {
-                        // Snap ISA-L's overshot end_bit to the phase1a-confirmed
-                        // boundary. Two steps are needed:
-                        //   1. predecessor_snaps: fix chunks[i].end_bit_offset = lim
-                        //      so the scan doesn't re-trigger this snap every wave
-                        //      (chunks[i].end_bit_offset ≠ start_bits[i+1] would
-                        //       cause `needs=true` forever — infinite loop).
-                        //   2. near_eof_fills: mark chunk i+1 resolved at lim.
-                        predecessor_snaps.push((i, lim.bits()));
-                        near_eof_fills.push((i + 1, lim.bits()));
-                        continue;
-                    }
-                }
-
                 specs.push((i + 1, ChunkStart::from_bits(pred_end), end_limit));
             }
         }
 
         scan_start = new_scan_start;
 
-        if near_eof_fills.is_empty() && specs.is_empty() && predecessor_snaps.is_empty() {
+        if near_eof_fills.is_empty() && specs.is_empty() {
             break; // all chunks resolved
-        }
-
-        // ── Apply predecessor snaps: fix ISA-L end_bit rounding in-place ────
-        // Must happen before near_eof_fills so the snapped end_bit_offset
-        // propagates correctly to successor chunks' start_ok checks.
-        for (idx, lim) in predecessor_snaps {
-            if let Some(c) = chunks[idx].as_mut() {
-                c.end_bit_offset = lim;
-            }
-            // start_bits[idx+1] is set by near_eof_fills below — no need here.
         }
 
         // ── Apply near-EOF fills (no decode, no deadline check needed) ──────
@@ -2357,6 +2362,59 @@ mod tests {
             start_bits[1],
             Some(ChunkStart::from_bits(e0)),
             "phase1c must correct chunk 1's start_bit to chunk 0's end_bit {e0}"
+        );
+    }
+
+    #[test]
+    fn normalize_isal_end_bit_requires_exact_verified_limit() {
+        let start = ChunkStart::from_bits(128);
+        let limit = ChunkStart::from_bits(512).to_end_limit();
+
+        assert_eq!(
+            normalize_isal_end_bit(start, Some(limit), 512),
+            Some(limit.boundary())
+        );
+        assert_eq!(normalize_isal_end_bit(start, Some(limit), 513), None);
+        assert_eq!(normalize_isal_end_bit(start, Some(limit), 500), None);
+        assert_eq!(
+            normalize_isal_end_bit(start, None, 700),
+            Some(RealBlockBoundary(700))
+        );
+        assert_eq!(normalize_isal_end_bit(start, None, 64), None);
+    }
+
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    #[test]
+    fn decode_chunk_with_handoff_canonicalizes_to_verified_end_limit() {
+        use crate::decompress::parallel::marker_decode::skip_gzip_header;
+
+        let original = make_compressible_data(4 * 1024 * 1024);
+        let gzip = make_gzip_data(&original);
+        let header_size = skip_gzip_header(&gzip).expect("valid gzip header");
+        let deflate_data = &gzip[header_size..gzip.len() - 8];
+
+        let num_chunks = 3;
+        let spacing = deflate_data.len() * 8 / num_chunks;
+        let start_bits = phase1_search_boundaries(deflate_data, num_chunks, spacing, 1);
+        let end_limit = start_bits[1]
+            .map(ChunkStart::to_end_limit)
+            .expect("phase1a should find the next chunk boundary");
+
+        let per_chunk_hint = deflate_data.len() / num_chunks;
+        let chunk = decode_chunk_with_handoff(
+            deflate_data,
+            ChunkStart::from_bits(0),
+            Some(end_limit),
+            per_chunk_hint,
+            num_chunks,
+            false,
+        )
+        .expect("worker decode should succeed");
+
+        assert_eq!(
+            chunk.end_bit_offset,
+            end_limit.bits(),
+            "ISA-L worker must return the verified downstream boundary exactly"
         );
     }
 
