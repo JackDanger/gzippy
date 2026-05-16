@@ -123,15 +123,27 @@ def benchmark_decompress(
             )
         rapidgzip_verbose = vr.stderr.decode(errors="replace")
 
-    def run_decompress():
+    def run_decompress(capture_stderr: bool = False):
         with open(compressed_file, 'rb') as fin, open(output_file, 'wb') as fout:
-            result = subprocess.run(cmd, stdin=fin, stdout=fout, stderr=subprocess.DEVNULL)
-        return result.returncode == 0
+            result = subprocess.run(
+                cmd,
+                stdin=fin,
+                stdout=fout,
+                stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL,
+            )
+        stderr_text = ""
+        if capture_stderr and result.stderr is not None:
+            stderr_text = result.stderr.decode(errors="replace")
+        return result.returncode == 0, stderr_text
 
     # Warmup
     print(f"  {tool}: warming up...", end="", flush=True)
-    if not run_decompress():
+    ok, warmup_stderr = run_decompress(capture_stderr=True)
+    if not ok:
         print(" FAILED")
+        if warmup_stderr.strip():
+            print("      [warmup stderr]")
+            print("        " + warmup_stderr[:12000].strip().replace("\n", "\n        "))
         return {"error": f"{tool} decompression failed on warmup", "tool": tool}
 
     # Verify correctness
@@ -174,7 +186,11 @@ def benchmark_decompress(
 
     for trial in range(MAX_TRIALS):
         start = time.perf_counter()
-        if not run_decompress():
+        ok, trial_stderr = run_decompress(capture_stderr=(tool == "gzippy"))
+        if not ok:
+            if trial_stderr.strip():
+                print("    [trial stderr]")
+                print("      " + trial_stderr[:12000].strip().replace("\n", "\n      "))
             return {"error": f"{tool} decompression failed on trial {trial}", "tool": tool}
         elapsed = time.perf_counter() - start
         times.append(elapsed)

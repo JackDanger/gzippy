@@ -1359,6 +1359,13 @@ fn normalize_isal_end_bit(
         ChunkDecodeStop::Approximate(limit) => {
             let limit_bits = limit.bits();
             if isal_end_bit > limit_bits + ISA_L_END_BIT_SNAP_TOLERANCE_BITS {
+                if debug_enabled() {
+                    eprintln!(
+                        "[parallel_sm:v0.6] approximate stop reject: start={} end_bit={} \
+                         limit={} reason=overshoot",
+                        start_bit, isal_end_bit, limit_bits,
+                    );
+                }
                 return None;
             }
             if crate::decompress::parallel::fast_marker_inflate::validate_boundary(
@@ -1370,8 +1377,22 @@ fn normalize_isal_end_bit(
             )
             .is_ok()
             {
+                if debug_enabled() {
+                    eprintln!(
+                        "[parallel_sm:v0.6] approximate stop accept: start={} end_bit={} \
+                         limit={} reason=validated-boundary",
+                        start_bit, isal_end_bit, limit_bits,
+                    );
+                }
                 Some(RealBlockBoundary(isal_end_bit))
             } else {
+                if debug_enabled() {
+                    eprintln!(
+                        "[parallel_sm:v0.6] approximate stop reject: start={} end_bit={} \
+                         limit={} reason=not-a-boundary",
+                        start_bit, isal_end_bit, limit_bits,
+                    );
+                }
                 None
             }
         }
