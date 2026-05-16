@@ -76,6 +76,52 @@ const MIN_THREADS_FOR_PARALLEL: usize = 2;
 /// Search radius (bytes) around each partition point for block boundaries.
 const SEARCH_RADIUS: usize = 512 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RealBlockBoundary(usize);
+
+impl RealBlockBoundary {
+    #[inline]
+    fn bits(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChunkStart(RealBlockBoundary);
+
+impl ChunkStart {
+    #[inline]
+    fn from_bits(bits: usize) -> Self {
+        Self(RealBlockBoundary(bits))
+    }
+
+    #[inline]
+    fn bits(self) -> usize {
+        self.0.bits()
+    }
+
+    #[inline]
+    fn to_end_limit(self) -> ChunkEndLimit {
+        ChunkEndLimit(self.0)
+    }
+}
+
+impl std::fmt::Display for ChunkStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.bits())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChunkEndLimit(RealBlockBoundary);
+
+impl ChunkEndLimit {
+    #[inline]
+    fn bits(self) -> usize {
+        self.0.bits()
+    }
+}
+
 /// Successful runs of the marker pipeline. Snapshot before/after a decode to
 /// confirm production routing actually called us — see the deletion-trap
 /// killer test in `src/tests/routing.rs`.
@@ -308,7 +354,8 @@ pub fn decompress_parallel<W: Write>(
             );
         }
     }
-    let mut start_bits: Vec<Option<usize>> = start_bits_opt.iter_mut().map(|s| s.take()).collect();
+    let mut start_bits: Vec<Option<ChunkStart>> =
+        start_bits_opt.iter_mut().map(|s| s.take()).collect();
 
     // ── Phase 1b: parallel marker decode from speculative starts ────────────
     //
@@ -340,12 +387,14 @@ pub fn decompress_parallel<W: Write>(
     // (e.g. chunk 11 covering chunks 12-16: ~30ms ISA-L vs ~68ms marker).
     // Phase 1c still has k serial waves for the missed chunks, but each
     // wave is ISA-L-fast rather than anchor-marker-slow.
-    let end_limits: Vec<Option<usize>> = (0..num_chunks)
+    let end_limits: Vec<Option<ChunkEndLimit>> = (0..num_chunks)
         .map(|i| {
             if i + 1 < num_chunks {
                 // Nearest downstream confirmed boundary: start_bits[i+1]
                 // first, then scan forward for the nearest Some.
-                start_bits[i + 1].or_else(|| (i + 2..num_chunks).find_map(|j| start_bits[j]))
+                start_bits[i + 1].map(ChunkStart::to_end_limit).or_else(|| {
+                    (i + 2..num_chunks).find_map(|j| start_bits[j].map(ChunkStart::to_end_limit))
+                })
             } else {
                 None // last chunk: ISA-L decodes to BFINAL
             }
@@ -594,8 +643,9 @@ fn phase1_search_boundaries(
     num_chunks: usize,
     spacing_bits: usize,
     num_workers: usize,
-) -> Vec<Option<usize>> {
-    let results: Vec<Mutex<Option<usize>>> = (0..num_chunks).map(|_| Mutex::new(None)).collect();
+) -> Vec<Option<ChunkStart>> {
+    let results: Vec<Mutex<Option<ChunkStart>>> =
+        (0..num_chunks).map(|_| Mutex::new(None)).collect();
     let next_task = AtomicUsize::new(0);
 
     std::thread::scope(|s| {
@@ -606,7 +656,7 @@ fn phase1_search_boundaries(
                     break;
                 }
                 let pick = if idx == 0 {
-                    Some(0)
+                    Some(ChunkStart::from_bits(0))
                 } else {
                     let from_bit = idx * spacing_bits;
                     search_boundary_forward(deflate_data, from_bit)
@@ -635,7 +685,7 @@ fn phase1_search_boundaries(
 /// 1. **BlockFinder heuristic candidates** (BTYPE=00 stored + BTYPE=10
 ///    dynamic Huffman).
 /// 2. **Byte-aligned brute force** (first 128 KiB).
-fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize> {
+fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<ChunkStart> {
     let search_end = (from_bit + SEARCH_RADIUS * 8).min(deflate_data.len() * 8);
     if from_bit >= search_end {
         return None;
@@ -666,7 +716,7 @@ fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<usize
                 continue;
             }
             if try_decode_at(deflate_data, c.bit_offset) {
-                return Some(c.bit_offset);
+                return Some(ChunkStart::from_bits(c.bit_offset));
             }
         }
         chunk_start = chunk_end;
@@ -823,8 +873,8 @@ impl ChunkResult {
 /// them from the predecessor's confirmed `end_bit_offset`.
 fn phase1_marker_decode_parallel_with_optional_starts(
     deflate_data: &[u8],
-    start_bits: &[Option<usize>],
-    end_limits: &[Option<usize>],
+    start_bits: &[Option<ChunkStart>],
+    end_limits: &[Option<ChunkEndLimit>],
     per_chunk_output_hint: usize,
     num_workers: usize,
     use_isal_for_chunk: &[bool],
@@ -875,8 +925,8 @@ fn phase1_marker_decode_parallel_with_optional_starts(
 /// `isal_bytes` — phase 2 sees no difference.
 fn decode_chunk_with_handoff(
     deflate_data: &[u8],
-    start_bit: usize,
-    end_bit_limit: Option<usize>,
+    start_bit: ChunkStart,
+    end_bit_limit: Option<ChunkEndLimit>,
     per_chunk_output_hint: usize,
     num_chunks_total: usize,
     force_slow_path: bool,
@@ -890,7 +940,11 @@ fn decode_chunk_with_handoff(
         end_bit_offset: bootstrap_end_bit,
         clean_window,
         bfinal_hit,
-    } = decode_chunk_bootstrap(deflate_data, start_bit, end_bit_limit)?;
+    } = decode_chunk_bootstrap(
+        deflate_data,
+        start_bit.bits(),
+        end_bit_limit.map(ChunkEndLimit::bits),
+    )?;
 
     // Track bootstrap output for the "is the handoff actually firing"
     // assertion in tests::routing — see HANDOFF_FIRED rationale.
@@ -947,7 +1001,7 @@ fn decode_chunk_with_handoff(
                 deflate_data,
                 bootstrap_markers,
                 bootstrap_end_bit,
-                end_bit_limit,
+                end_bit_limit.map(ChunkEndLimit::bits),
             )
             .map(|mut c| {
                 c.worker_elapsed = t_worker.elapsed();
@@ -979,7 +1033,7 @@ fn decode_chunk_with_handoff(
                 deflate_data,
                 bootstrap_markers,
                 bootstrap_end_bit,
-                end_bit_limit,
+                end_bit_limit.map(ChunkEndLimit::bits),
             )
             .map(|mut c| {
                 c.worker_elapsed = t_worker.elapsed();
@@ -991,7 +1045,7 @@ fn decode_chunk_with_handoff(
         // every chunk — quadratic total work, defeating the parallel
         // win.
         let end_byte = match end_bit_limit {
-            Some(end) => (end.div_ceil(8)).min(deflate_data.len()),
+            Some(end) => (end.bits().div_ceil(8)).min(deflate_data.len()),
             None => deflate_data.len(),
         };
         let input = &deflate_data[..end_byte];
@@ -1059,7 +1113,7 @@ fn decode_chunk_with_handoff(
                     deflate_data,
                     bootstrap_markers,
                     bootstrap_end_bit,
-                    end_bit_limit,
+                    end_bit_limit.map(ChunkEndLimit::bits),
                 )
                 .map(|mut c| {
                     c.worker_elapsed = t_worker.elapsed();
@@ -1085,7 +1139,7 @@ fn decode_chunk_with_handoff(
             deflate_data,
             bootstrap_markers,
             bootstrap_end_bit,
-            end_bit_limit,
+            end_bit_limit.map(ChunkEndLimit::bits),
         )
         .map(|mut c| {
             c.worker_elapsed = t_worker.elapsed();
@@ -1146,7 +1200,7 @@ fn marker_finish_after_bootstrap(
 /// routing-layer fallback (G3/G4) surface the failure.
 fn phase1c_resolve_consistency(
     deflate_data: &[u8],
-    start_bits: &mut [Option<usize>],
+    start_bits: &mut [Option<ChunkStart>],
     chunks: &mut [Option<ChunkResult>],
     deadline: std::time::Instant,
     per_chunk_output_hint: usize,
@@ -1204,7 +1258,7 @@ fn phase1c_resolve_consistency(
         //   predecessor_snaps: ISA-L overshot by ≤64 bits; update predecessor's
         //                      end_bit_offset so the snap doesn't re-fire every wave.
         let mut near_eof_fills: Vec<(usize, usize)> = Vec::new();
-        let mut specs: Vec<(usize, usize, Option<usize>)> = Vec::new();
+        let mut specs: Vec<(usize, ChunkStart, Option<ChunkEndLimit>)> = Vec::new();
         let mut predecessor_snaps: Vec<(usize, usize)> = Vec::new();
         let mut new_scan_start = scan_start;
 
@@ -1224,7 +1278,9 @@ fn phase1c_resolve_consistency(
             // might be wrong and will be corrected in a future wave.
             if i > 0 {
                 let start_ok = match &chunks[i - 1] {
-                    Some(pred_of_i) => start_bits[i] == Some(pred_of_i.end_bit_offset),
+                    Some(pred_of_i) => {
+                        start_bits[i] == Some(ChunkStart::from_bits(pred_of_i.end_bit_offset))
+                    }
                     None => false,
                 };
                 if !start_ok {
@@ -1235,7 +1291,8 @@ fn phase1c_resolve_consistency(
             // Correction needed when:
             //   - chunks[i+1] is None (phase 1b worker failed), OR
             //   - start_bits[i+1] is None/wrong (phase 1a false-positive or miss).
-            let needs = chunks[i + 1].is_none() || (start_bits[i + 1] != Some(pred_end));
+            let needs = chunks[i + 1].is_none()
+                || (start_bits[i + 1] != Some(ChunkStart::from_bits(pred_end)));
             if !needs {
                 if new_scan_start == i {
                     new_scan_start = i + 1;
@@ -1252,7 +1309,8 @@ fn phase1c_resolve_consistency(
                 // stop hint. `start_bits[i+2]` is None when consecutive chunks
                 // all failed phase1a; in that case search further ahead so the
                 // decode doesn't run all the way to BFINAL.
-                let end_limit = (i + 2..num_chunks).find_map(|j| start_bits[j]);
+                let end_limit =
+                    (i + 2..num_chunks).find_map(|j| start_bits[j].map(ChunkStart::to_end_limit));
 
                 // ISA-L's end_bit formula (`data.len()*8 - avail_in*8 -
                 // read_in_length`) can overshoot the true block boundary by up
@@ -1265,7 +1323,7 @@ fn phase1c_resolve_consistency(
                 // (observed: "Reserved block type 3" after a 3-bit overshoot).
                 const ISA_L_SNAP_TOLERANCE_BITS: usize = 64;
                 if let Some(lim) = end_limit {
-                    if pred_end > lim && pred_end - lim <= ISA_L_SNAP_TOLERANCE_BITS {
+                    if pred_end > lim.bits() && pred_end - lim.bits() <= ISA_L_SNAP_TOLERANCE_BITS {
                         // Snap ISA-L's overshot end_bit to the phase1a-confirmed
                         // boundary. Two steps are needed:
                         //   1. predecessor_snaps: fix chunks[i].end_bit_offset = lim
@@ -1273,13 +1331,13 @@ fn phase1c_resolve_consistency(
                         //      (chunks[i].end_bit_offset ≠ start_bits[i+1] would
                         //       cause `needs=true` forever — infinite loop).
                         //   2. near_eof_fills: mark chunk i+1 resolved at lim.
-                        predecessor_snaps.push((i, lim));
-                        near_eof_fills.push((i + 1, lim));
+                        predecessor_snaps.push((i, lim.bits()));
+                        near_eof_fills.push((i + 1, lim.bits()));
                         continue;
                     }
                 }
 
-                specs.push((i + 1, pred_end, end_limit));
+                specs.push((i + 1, ChunkStart::from_bits(pred_end), end_limit));
             }
         }
 
@@ -1316,7 +1374,7 @@ fn phase1c_resolve_consistency(
                 end_bit_offset: pred_end,
                 worker_elapsed: std::time::Duration::ZERO,
             });
-            start_bits[idx] = Some(pred_end);
+            start_bits[idx] = Some(ChunkStart::from_bits(pred_end));
         }
 
         if specs.is_empty() {
@@ -1345,7 +1403,7 @@ fn phase1c_resolve_consistency(
                      start={start_bit} end_limit={end_limit:?} \
                      range_mb={:.1}",
                     end_limit
-                        .map(|e| e.saturating_sub(start_bit) as f64 / 8.0 / 1e6)
+                        .map(|e| e.bits().saturating_sub(start_bit.bits()) as f64 / 8.0 / 1e6)
                         .unwrap_or(0.0)
                 );
             }
@@ -1361,31 +1419,32 @@ fn phase1c_resolve_consistency(
         // `chunks`/`start_bits`. Each thread receives only Copy values
         // (`start_bit`, `end_limit`, `per_chunk_output_hint`, `num_chunks`)
         // plus an immutable shared borrow of `deflate_data`.
-        let results: Vec<(usize, usize, std::io::Result<ChunkResult>)> = std::thread::scope(|s| {
-            let handles: Vec<_> = specs
-                .iter()
-                .map(|&(idx, start_bit, end_limit)| {
-                    s.spawn(move || {
-                        (
-                            idx,
-                            start_bit,
-                            decode_chunk_with_handoff(
-                                deflate_data,
+        let results: Vec<(usize, ChunkStart, std::io::Result<ChunkResult>)> =
+            std::thread::scope(|s| {
+                let handles: Vec<_> = specs
+                    .iter()
+                    .map(|&(idx, start_bit, end_limit)| {
+                        s.spawn(move || {
+                            (
+                                idx,
                                 start_bit,
-                                end_limit,
-                                per_chunk_output_hint,
-                                num_chunks,
-                                false,
-                            ),
-                        )
+                                decode_chunk_with_handoff(
+                                    deflate_data,
+                                    start_bit,
+                                    end_limit,
+                                    per_chunk_output_hint,
+                                    num_chunks,
+                                    false,
+                                ),
+                            )
+                        })
                     })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("phase1c correction thread panicked"))
-                .collect()
-        });
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("phase1c correction thread panicked"))
+                    .collect()
+            });
 
         if debug_enabled() {
             if let Some(t) = t_wave {
@@ -1968,10 +2027,10 @@ mod tests {
 
         // Find real block boundaries near the spacing-derived anchor for each
         // chunk using the same boundary search as phase 1a.
-        let mut start_bits: Vec<Option<usize>> = (0..num_chunks)
+        let mut start_bits: Vec<Option<ChunkStart>> = (0..num_chunks)
             .map(|i| {
                 if i == 0 {
-                    Some(0)
+                    Some(ChunkStart::from_bits(0))
                 } else {
                     search_boundary_forward(deflate_data, i * spacing)
                 }
@@ -1979,10 +2038,10 @@ mod tests {
             .collect();
 
         // Decode chunks 0 and 2 from their (real) boundaries.
-        let end_limit_0 = start_bits[1];
+        let end_limit_0 = start_bits[1].map(ChunkStart::to_end_limit);
         let c0 = match decode_chunk_with_handoff(
             deflate_data,
-            0,
+            ChunkStart::from_bits(0),
             end_limit_0,
             per_chunk_hint,
             num_chunks,
@@ -1995,7 +2054,7 @@ mod tests {
             Some(s) => s,
             None => return, // phase 1a found no boundary for chunk 2 — skip
         };
-        let end_limit_2 = start_bits[3];
+        let end_limit_2 = start_bits[3].map(ChunkStart::to_end_limit);
         let c2 = match decode_chunk_with_handoff(
             deflate_data,
             start2,
@@ -2020,8 +2079,8 @@ mod tests {
             None, // will be corrected from e2
         ];
         // Corrupt starts for the None slots so `needs` fires for both.
-        start_bits[1] = Some(e0.wrapping_add(99)); // wrong — should be e0
-        start_bits[3] = Some(e2.wrapping_add(99)); // wrong — should be e2
+        start_bits[1] = Some(ChunkStart::from_bits(e0.wrapping_add(99))); // wrong — should be e0
+        start_bits[3] = Some(ChunkStart::from_bits(e2.wrapping_add(99))); // wrong — should be e2
 
         let before = MARKER_PIPELINE_RETRY_ITERATIONS.load(Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -2058,12 +2117,12 @@ mod tests {
         // Corrected chunks must have the right start bits.
         assert_eq!(
             start_bits[1],
-            Some(e0),
+            Some(ChunkStart::from_bits(e0)),
             "chunk 1 start_bit must equal chunk 0 end_bit"
         );
         assert_eq!(
             start_bits[3],
-            Some(e2),
+            Some(ChunkStart::from_bits(e2)),
             "chunk 3 start_bit must equal chunk 2 end_bit"
         );
     }
@@ -2124,7 +2183,7 @@ mod tests {
         let per_chunk_hint = deflate_data.len() / num_chunks;
         let c0 = match decode_chunk_with_handoff(
             deflate_data,
-            0,
+            ChunkStart::from_bits(0),
             None,
             per_chunk_hint,
             num_chunks,
@@ -2139,7 +2198,7 @@ mod tests {
 
         // phase1c with chunk 1 missing — it should re-decode it from c0.end_bit and terminate.
         let mut chunks: Vec<Option<ChunkResult>> = vec![Some(c0), None];
-        let mut start_bits: Vec<Option<usize>> = vec![Some(0), None];
+        let mut start_bits: Vec<Option<ChunkStart>> = vec![Some(ChunkStart::from_bits(0)), None];
 
         let deadline = Instant::now() + Duration::from_secs(30);
         let result = phase1c_resolve_consistency(
@@ -2177,7 +2236,7 @@ mod tests {
         let per_chunk_hint = deflate_data.len() / num_chunks;
         let c0 = match decode_chunk_with_handoff(
             deflate_data,
-            0,
+            ChunkStart::from_bits(0),
             None,
             per_chunk_hint,
             num_chunks,
@@ -2193,9 +2252,9 @@ mod tests {
         // We simulate this by leaving chunks[1]=None and giving it a wrong start_bit
         // so phase1c knows to correct it.
         let mut chunks: Vec<Option<ChunkResult>> = vec![Some(c0), None, None];
-        let mut start_bits: Vec<Option<usize>> = vec![
-            Some(0),
-            Some(e0.wrapping_add(99)), // wrong — phase1c will correct from e0
+        let mut start_bits: Vec<Option<ChunkStart>> = vec![
+            Some(ChunkStart::from_bits(0)),
+            Some(ChunkStart::from_bits(e0.wrapping_add(99))), // wrong — phase1c will correct from e0
             None,
         ];
 
@@ -2216,7 +2275,7 @@ mod tests {
         assert!(chunks[1].is_some(), "chunk 1 must be resolved by phase1c");
         assert_eq!(
             start_bits[1],
-            Some(e0),
+            Some(ChunkStart::from_bits(e0)),
             "chunk 1 start_bit must equal chunk 0 end_bit after phase1c correction"
         );
     }
@@ -2243,7 +2302,7 @@ mod tests {
         // Decode chunk 0 normally.
         let c0 = match decode_chunk_with_handoff(
             deflate_data,
-            0,
+            ChunkStart::from_bits(0),
             None,
             per_chunk_hint,
             num_chunks,
@@ -2268,9 +2327,9 @@ mod tests {
 
         let mut chunks: Vec<Option<ChunkResult>> = vec![Some(c0), Some(fake_c1), None];
         // start_bits[1] is wrong — chunk 1 was seeded from a false-positive.
-        let mut start_bits: Vec<Option<usize>> = vec![
-            Some(0),
-            Some(e0.wrapping_add(99)), // deliberately wrong: e0 != e0+99
+        let mut start_bits: Vec<Option<ChunkStart>> = vec![
+            Some(ChunkStart::from_bits(0)),
+            Some(ChunkStart::from_bits(e0.wrapping_add(99))), // deliberately wrong: e0 != e0+99
             None,
         ];
 
@@ -2288,14 +2347,15 @@ mod tests {
         // chunk 2 is either still None or was corrected from the real e0.
         if let Some(sb2) = start_bits[2] {
             assert_ne!(
-                sb2, wrong_end,
+                sb2.bits(),
+                wrong_end,
                 "start_ok gate must prevent chunk 2 from inheriting chunk 1's wrong end_bit {wrong_end}"
             );
         }
         // chunk 1's wrong start is corrected by phase1c (seeded from e0).
         assert_eq!(
             start_bits[1],
-            Some(e0),
+            Some(ChunkStart::from_bits(e0)),
             "phase1c must correct chunk 1's start_bit to chunk 0's end_bit {e0}"
         );
     }
