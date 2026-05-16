@@ -321,24 +321,33 @@ pub fn decompress_parallel<W: Write>(
     let t_decode = std::time::Instant::now();
     // end_limit[i] is chunk i's upper decode bound (exclusive bit offset).
     //
-    // Preferred: start_bits[i+1] — the speculative real block boundary.
-    // Fallback: the anchor bit (i+1)*spacing_bits — used when the search
-    // failed (start_bits[i+1] = None). Even though it's not a real block
-    // boundary, it caps chunk i's decode so chunk i doesn't run to BFINAL
-    // and consume the rest of the stream. Phase 1c chains from chunk i's
-    // actual end_bit to re-decode chunk i+1 from the correct start.
+    // P0 fix: use the nearest downstream confirmed phase1a boundary instead
+    // of an anchor (i+1)*spacing_bits). The anchor was never a real deflate
+    // block boundary, so ISA-L had to be disabled for those chunks (forcing
+    // pure-Rust marker decode at ~50 MB/s vs ISA-L's ~1500 MB/s).
     //
-    // Without the fallback, a `None` upper bound lets chunk 0 decode the
-    // entire stream (~490 MB on silesia-large) whenever chunk 1's search
-    // fails — imbalance 26× and the parallel pipeline effectively degrades
-    // to sequential. The anchor cap keeps each chunk bounded to ~1× the
-    // target output size regardless of how many boundary searches fail.
+    // With find_map: end_limits[i] is always either None (last chunk,
+    // ISA-L decodes to BFINAL) or a real phase1a-confirmed block boundary.
+    // ISA-L can safely stop at a real boundary — it decodes to the first
+    // ISAL_BLOCK_NEW_HDR state at or before end_limit, which is a real
+    // block start. The bfinal_hit guard in decode_chunk_with_handoff
+    // handles the rare case where a speculative start decodes a false BFINAL
+    // before reaching end_limit.
+    //
+    // Trade-off: when k consecutive chunks miss phase1a (all None), chunk
+    // i decodes up to k extra chunks' worth of data in phase1b. At ISA-L
+    // speed this is still much faster than the old anchor+marker approach
+    // (e.g. chunk 11 covering chunks 12-16: ~30ms ISA-L vs ~68ms marker).
+    // Phase 1c still has k serial waves for the missed chunks, but each
+    // wave is ISA-L-fast rather than anchor-marker-slow.
     let end_limits: Vec<Option<usize>> = (0..num_chunks)
         .map(|i| {
             if i + 1 < num_chunks {
-                start_bits[i + 1].or(Some((i + 1) * spacing_bits))
+                // Nearest downstream confirmed boundary: start_bits[i+1]
+                // first, then scan forward for the nearest Some.
+                start_bits[i + 1].or_else(|| (i + 2..num_chunks).find_map(|j| start_bits[j]))
             } else {
-                None
+                None // last chunk: ISA-L decodes to BFINAL
             }
         })
         .collect();
@@ -347,21 +356,10 @@ pub fn decompress_parallel<W: Write>(
     // chunk may legitimately exceed it, so `decode_chunk_with_handoff`
     // adds 50% headroom.
     let per_chunk_output_hint = expected_size / num_chunks.max(1);
-    // ISA-L is only safe when the chunk's end_limit is a real block boundary.
-    // Anchor-based end_limits (where start_bits[i+1] was None) truncate the
-    // input at an arbitrary byte boundary; ISA-L at ISAL_END_INPUT returns
-    // ISAL_BLOCK_NEW_HDR which looks like a valid boundary but isn't one the
-    // marker decoder can continue from in phase1c. The marker decoder always
-    // stops at a real block boundary past end_bit_limit, so it's safe for all.
-    let use_isal_for_chunk: Vec<bool> = (0..num_chunks)
-        .map(|i| {
-            if i + 1 < num_chunks {
-                start_bits[i + 1].is_some()
-            } else {
-                true // last chunk: end_limit is None, ISA-L decodes to BFINAL
-            }
-        })
-        .collect();
+    // All end_limits are now None or a real deflate block boundary (no
+    // anchors). ISA-L is safe for every chunk — it stops at the nearest
+    // real boundary within the chunk's range and returns its bit position.
+    let use_isal_for_chunk: Vec<bool> = vec![true; num_chunks];
     let chunks_opt = phase1_marker_decode_parallel_with_optional_starts(
         deflate_data,
         &start_bits,
