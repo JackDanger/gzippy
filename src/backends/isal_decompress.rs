@@ -365,6 +365,16 @@ pub fn decompress_deflate_from_bit(
         }
 
         if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            // Same premature-BFINAL guard as decompress_deflate_from_bit_with_end:
+            // if significant compressed input remains after BFINAL, this position
+            // is a false boundary, not a real stream end. Return None so callers
+            // (primarily try_decode_at's stage-1 filter) reject the candidate.
+            // A genuine stream end leaves at most 7 padding bits + ISA-L lookahead
+            // (≤8 bytes); more than 8 bytes means BFINAL fired mid-stream.
+            let bits_remaining = state.avail_in as usize * 8 + state.read_in_length.max(0) as usize;
+            if bits_remaining > 64 {
+                return None;
+            }
             break;
         }
         if written == 0 && state.avail_in == 0 {
