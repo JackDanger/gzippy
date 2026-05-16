@@ -380,9 +380,9 @@ pub fn decompress_parallel<W: Write>(
         for (i, chunk) in chunks.iter().enumerate() {
             match chunk {
                 Some(c) => {
-                    let boot_kb = c.bootstrap.len() / 2 / 1024; // u16→u8, then →KB
+                    let boot_kb = c.bootstrap.len() / 1024;
                     let isal_kb = c.isal_bytes.len() / 1024;
-                    let total_kb = c.bootstrap.len() / 2 / 1024 + isal_kb;
+                    let total_kb = boot_kb + isal_kb;
                     // G1 invariant: every phase1b result must land at a real block
                     // boundary. debug_assert catches regressions in decode primitives
                     // (e.g. decode_stored bit-position bug) at chunk granularity
@@ -393,6 +393,7 @@ pub fn decompress_parallel<W: Write>(
                             c.end_bit_offset,
                             1,
                             1,
+                            false,
                         )
                         .is_ok(),
                         "G1 invariant: chunk {} end_bit_offset {} is not a real block boundary",
@@ -486,6 +487,7 @@ pub fn decompress_parallel<W: Write>(
                 chunk.end_bit_offset,
                 1,
                 1,
+                false,
             )
             .is_ok()
                 || {
@@ -722,20 +724,21 @@ fn try_decode_at(deflate_data: &[u8], bit_offset: usize) -> bool {
         return false;
     }
 
-    // Stage 2: marker-decoder validation, `min_blocks=2`. A single
-    // coincidentally-valid stored block (~1/65536 chance) cannot fake a
-    // second consecutive valid block — joint probability ~2^-32 against
-    // structured-header (BTYPE=00/10) false positives. BTYPE=01
-    // false positives DO get through here (fixed Huffman has no header
-    // redundancy), but the speculative-pick + phase-1c correction
-    // contract handles those: chunk N's decoded end_bit propagates
-    // forward as chunk N+1's confirmed start.
+    // Stage 2: marker-decoder validation, `min_blocks=2`,
+    // `require_non_fixed_stop=true`. A single coincidentally-valid stored
+    // block (~1/65536 chance) cannot fake a second consecutive valid block.
+    // `require_non_fixed_stop` additionally refuses stop points where the
+    // next block is BTYPE=01 (fixed Huffman has no header redundancy —
+    // any bit sequence decodes as BTYPE=01, so a BTYPE=01-heavy region
+    // trivially passes without this guard). Matches rapidgzip
+    // GzipChunk.hpp:552.
     use crate::decompress::parallel::fast_marker_inflate::validate_boundary;
     validate_boundary(
         deflate_data,
         bit_offset,
         /*min_blocks=*/ 2,
         /*min_output_bytes=*/ 0,
+        /*require_non_fixed_stop=*/ true,
     )
     .is_ok()
 }
@@ -895,7 +898,7 @@ fn decode_chunk_with_handoff(
              end_bit={bootstrap_end_bit} bfinal_hit={bfinal_hit} \
              window={} output_bytes={}",
             clean_window.is_some(),
-            bootstrap_markers.len() / 2,
+            bootstrap_markers.len(),
         );
     }
 
@@ -918,7 +921,7 @@ fn decode_chunk_with_handoff(
                     "[parallel_sm:v0.6] chunk start={start_bit}: BFINAL hit at {bootstrap_end_bit} \
                      before end_limit={end_bit_limit:?} ({output_kb} KB output) — discarding, \
                      phase1c will re-derive from predecessor",
-                    output_kb = bootstrap_markers.len() / 2 / 1024,
+                    output_kb = bootstrap_markers.len() / 1024,
                 );
             }
             return Err(std::io::Error::new(

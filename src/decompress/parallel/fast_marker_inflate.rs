@@ -160,11 +160,23 @@ pub fn decode_chunk_markers(data: &[u8], start_bit_offset: usize) -> Result<(Vec
 /// by chance (~1 / 65536). `min_blocks ≥ 2` forces the validator past
 /// that single fake block — the chance two consecutive false-positive
 /// blocks both validate is astronomically small.
+///
+/// `require_non_fixed_stop`: when true, the non-BFINAL exit additionally
+/// peeks the next block's BTYPE and refuses to stop if it is BTYPE=01
+/// (fixed Huffman). Fixed-Huffman blocks have no header redundancy — any
+/// bit sequence decodes as a valid BTYPE=01 block — so stopping there
+/// admits false positives in BTYPE=01-heavy regions. Require BTYPE=00
+/// (stored) or BTYPE=10 (dynamic) at the stop point, which have
+/// structured headers that provide genuine entropy. Mirrors rapidgzip
+/// GzipChunk.hpp:552. Set true in boundary-discovery callers
+/// (`try_decode_at`); false in G1 invariant checks where the bit IS
+/// already known to be a real boundary.
 pub fn validate_boundary(
     data: &[u8],
     start_bit_offset: usize,
     min_blocks: u32,
     min_output_bytes: usize,
+    require_non_fixed_stop: bool,
 ) -> Result<()> {
     let byte_offset = start_bit_offset / 8;
     let bit_in_byte = (start_bit_offset % 8) as u32;
@@ -185,7 +197,21 @@ pub fn validate_boundary(
             bits.refill();
         }
         if blocks_decoded >= min_blocks && output.len() >= min_output_bytes {
-            return Ok(());
+            if require_non_fixed_stop {
+                // Peek the upcoming block's BTYPE. Reject BTYPE=01 (fixed
+                // Huffman) as a stop point — any bit sequence decodes as
+                // BTYPE=01 so false positives in BTYPE=01-heavy regions
+                // trivially pass. BTYPE=00/10 have structured headers that
+                // provide real entropy, making accidental matches rare.
+                let next_btype = (bits.peek() >> 1) & 3;
+                if next_btype != 1 {
+                    return Ok(());
+                }
+                // Upcoming block is BTYPE=01: keep decoding to find a
+                // stop point with a BTYPE=00/10 next block.
+            } else {
+                return Ok(());
+            }
         }
         let bfinal = (bits.peek() & 1) != 0;
         let btype = ((bits.peek() >> 1) & 3) as u32;
@@ -611,8 +637,21 @@ fn decode_loop(
                     .iter()
                     .all(|&v| v < MARKER_BASE)
             {
-                **handoff = true;
-                return Ok(());
+                // Peek the next block's BTYPE before handing off to ISA-L.
+                // Refuse to stop at BTYPE=01 (fixed Huffman): a false-positive
+                // start can produce clean output through a stored block then
+                // land at a BTYPE=01-heavy region — handing ISA-L a wrong dict
+                // and a BTYPE=01 start produces garbage with no CRC warning.
+                // Require BTYPE=00/10 so the handoff point has genuine entropy.
+                if bits.available() < 3 {
+                    bits.refill();
+                }
+                let next_btype = (bits.peek() >> 1) & 3;
+                if next_btype != 1 {
+                    **handoff = true;
+                    return Ok(());
+                }
+                // Next block is BTYPE=01: keep bootstrapping.
             }
         }
 
