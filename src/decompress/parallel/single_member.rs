@@ -1151,7 +1151,7 @@ fn decode_chunk_with_handoff(
                 deflate_data,
                 bootstrap_markers,
                 bootstrap_end_bit,
-                end_bit_limit.map(ChunkEndLimit::bits),
+                stop_hint_bits,
             )
             .map(|mut c| {
                 c.worker_elapsed = t_worker.elapsed();
