@@ -182,51 +182,81 @@ impl ChunkDecodeStop {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ChunkDecodePlan {
-    start: ChunkStart,
-    stop: ChunkDecodeStop,
+struct BoundarySlot {
+    speculative: Option<ChunkStart>,
+    confirmed: Option<ChunkStart>,
 }
 
-impl ChunkDecodePlan {
-    #[inline]
-    fn new(start: ChunkStart, stop: ChunkDecodeStop) -> Self {
-        Self { start, stop }
+#[derive(Debug)]
+struct BoundaryRegistry {
+    slots: Vec<BoundarySlot>,
+}
+
+impl BoundaryRegistry {
+    fn from_speculative_starts(speculative_starts: Vec<Option<ChunkStart>>) -> Self {
+        let mut slots: Vec<BoundarySlot> = speculative_starts
+            .into_iter()
+            .map(|start| BoundarySlot {
+                speculative: start,
+                confirmed: None,
+            })
+            .collect();
+        if let Some(first) = slots.first_mut() {
+            first.confirmed = Some(ChunkStart::from_bits(0));
+        }
+        Self { slots }
     }
 
     #[inline]
-    fn start(self) -> ChunkStart {
-        self.start
+    fn len(&self) -> usize {
+        self.slots.len()
     }
 
     #[inline]
-    fn stop(self) -> ChunkDecodeStop {
-        self.stop
+    fn speculative_start(&self, idx: usize) -> Option<ChunkStart> {
+        self.slots.get(idx).and_then(|slot| slot.speculative)
     }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct EmptyChunkFill {
-    idx: usize,
-    start: ChunkStart,
-}
-
-impl EmptyChunkFill {
     #[inline]
-    fn new(idx: usize, start: ChunkStart) -> Self {
-        Self { idx, start }
+    fn confirmed_start(&self, idx: usize) -> Option<ChunkStart> {
+        self.slots.get(idx).and_then(|slot| slot.confirmed)
     }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CorrectionDecode {
-    idx: usize,
-    plan: ChunkDecodePlan,
-}
-
-impl CorrectionDecode {
     #[inline]
-    fn new(idx: usize, plan: ChunkDecodePlan) -> Self {
-        Self { idx, plan }
+    fn effective_start(&self, idx: usize) -> Option<ChunkStart> {
+        self.confirmed_start(idx)
+            .or_else(|| self.speculative_start(idx))
+    }
+
+    fn speculative_starts(&self) -> Vec<Option<ChunkStart>> {
+        self.slots.iter().map(|slot| slot.speculative).collect()
+    }
+
+    fn speculative_stop_for(&self, idx: usize) -> ChunkDecodeStop {
+        match (idx + 1..self.len())
+            .find_map(|j| self.effective_start(j).map(ChunkStart::to_end_limit))
+        {
+            Some(limit) => ChunkDecodeStop::Verified(limit),
+            None => ChunkDecodeStop::UntilEnd,
+        }
+    }
+
+    fn exact_end_limit_for(&self, idx: usize) -> Option<ChunkEndLimit> {
+        (idx + 1..self.len()).find_map(|j| self.effective_start(j).map(ChunkStart::to_end_limit))
+    }
+
+    fn confirm_start(&mut self, idx: usize, start: ChunkStart) {
+        if let Some(slot) = self.slots.get_mut(idx) {
+            slot.confirmed = Some(start);
+        }
+    }
+
+    fn confirm_next_start_from_end(&mut self, idx: usize, end: RealBlockBoundary) {
+        self.confirm_start(idx + 1, ChunkStart(end));
+    }
+
+    fn confirmed_starts(&self) -> Vec<Option<ChunkStart>> {
+        self.slots.iter().map(|slot| slot.confirmed).collect()
     }
 }
 
@@ -444,7 +474,7 @@ pub fn decompress_parallel<W: Write>(
     // predecessor's confirmed end_bit. Chunk 0 must always succeed
     // (anchored at bit 0); we still bail if it doesn't.
     let t_search = std::time::Instant::now();
-    let mut start_bits_opt =
+    let start_bits_opt =
         phase1_search_boundaries(deflate_data, num_chunks, spacing_bits, num_threads);
     let search_elapsed = t_search.elapsed();
 
@@ -462,8 +492,7 @@ pub fn decompress_parallel<W: Write>(
             );
         }
     }
-    let mut start_bits: Vec<Option<ChunkStart>> =
-        start_bits_opt.iter_mut().map(|s| s.take()).collect();
+    let mut boundaries = BoundaryRegistry::from_speculative_starts(start_bits_opt);
 
     // ── Phase 1b: parallel marker decode from speculative starts ────────────
     //
@@ -495,23 +524,19 @@ pub fn decompress_parallel<W: Write>(
     // (e.g. chunk 11 covering chunks 12-16: ~30ms ISA-L vs ~68ms marker).
     // Phase 1c still has k serial waves for the missed chunks, but each
     // wave is ISA-L-fast rather than anchor-marker-slow.
-    let decode_stops: Vec<ChunkDecodeStop> = (0..num_chunks)
-        .map(|i| chunk_decode_stop(i, &start_bits, spacing_bits, total_bits))
-        .collect();
     // Per-chunk decoded-output hint for the ISA-L bulk decode's
     // initial buffer cap. ISIZE / num_chunks is the average; the last
     // chunk may legitimately exceed it, so `decode_chunk_with_handoff`
     // adds 50% headroom.
     let per_chunk_output_hint = expected_size / num_chunks.max(1);
-    let chunks_opt = phase1_marker_decode_parallel_with_optional_starts(
+    let speculative_outcomes = phase1_marker_decode_parallel(
         deflate_data,
-        &start_bits,
-        &decode_stops,
+        &boundaries,
         per_chunk_output_hint,
         num_threads,
     );
     let decode_elapsed = t_decode.elapsed();
-    let mut chunks: Vec<Option<ChunkResult>> = chunks_opt;
+    let mut partitions = PartitionRegistry::from_worker_outcomes(speculative_outcomes);
 
     if debug_enabled() {
         // Per-chunk breakdown: elapsed, bootstrap size, ISA-L size, total.
@@ -519,9 +544,10 @@ pub fn decompress_parallel<W: Write>(
         // uneven boundary placement. High CV in the benchmark usually comes
         // from one chunk taking significantly longer than the others.
         eprintln!("[parallel_sm:v0.6] per-chunk phase1b breakdown:");
-        for (i, chunk) in chunks.iter().enumerate() {
-            match chunk {
-                Some(c) => {
+        for (i, partition) in partitions.partitions.iter().enumerate() {
+            match partition {
+                PartitionState::Speculative(candidate) => {
+                    let c = &candidate.chunk;
                     let boot_kb = (c.bootstrap.len() + c.bootstrap_clean.len()) / 1024;
                     let isal_kb = c.isal_bytes.len() / 1024;
                     let total_kb = boot_kb + isal_kb;
@@ -544,7 +570,7 @@ pub fn decompress_parallel<W: Write>(
                     );
                     // Annotate whether end_limit was a confirmed phase1a
                     // boundary or an anchor fallback (start_bits[i+1]=None).
-                    let end_limit_kind = decode_stops[i].label();
+                    let end_limit_kind = boundaries.speculative_stop_for(i).label();
                     eprintln!(
                         "  chunk {:2}: {:4}ms  boot={:4}KB  isal={:6}KB  \
                          total={:6}KB  end_bit={}  limit={}",
@@ -557,15 +583,25 @@ pub fn decompress_parallel<W: Write>(
                         end_limit_kind,
                     );
                 }
-                None => {
+                PartitionState::NoDecode => {
                     eprintln!("  chunk {:2}: (boundary not found — phase1c will fill)", i);
                 }
+                PartitionState::Decoded(_)
+                | PartitionState::Subsumed { .. }
+                | PartitionState::EmptyTail { .. } => unreachable!(),
             }
         }
         // Imbalance ratio: longest / shortest non-empty worker.
-        let elapsed_ms: Vec<u128> = chunks
+        let elapsed_ms: Vec<u128> = partitions
+            .partitions
             .iter()
-            .filter_map(|c| c.as_ref())
+            .filter_map(|partition| match partition {
+                PartitionState::Speculative(candidate) => Some(&candidate.chunk),
+                PartitionState::NoDecode
+                | PartitionState::Decoded(_)
+                | PartitionState::Subsumed { .. }
+                | PartitionState::EmptyTail { .. } => None,
+            })
             .filter(|c| c.worker_elapsed.as_millis() > 0)
             .map(|c| c.worker_elapsed.as_millis())
             .collect();
@@ -597,19 +633,15 @@ pub fn decompress_parallel<W: Write>(
     let data_mb = deflate_data.len() / (1024 * 1024);
     let deadline_ms = RETRY_WALL_DEADLINE_MS.max(data_mb as u64 * 3);
     let retry_deadline = t_retry + std::time::Duration::from_millis(deadline_ms);
-    phase1c_resolve_consistency(
+    reconcile_partitions(
         deflate_data,
-        &mut start_bits,
-        &mut chunks,
+        &mut boundaries,
+        &mut partitions,
         retry_deadline,
         per_chunk_output_hint,
-        spacing_bits,
     )?;
     let retry_elapsed = t_retry.elapsed();
-    let chunks: Vec<ChunkResult> = chunks
-        .into_iter()
-        .map(|c| c.expect("phase 1c guarantees all chunks decoded"))
-        .collect();
+    let chunks = partitions.into_authoritative_chunks();
 
     // G1 assertion after phase1c: every chunk's end_bit_offset must be a real
     // deflate block boundary. This catches decode primitive bugs (like the
@@ -619,7 +651,7 @@ pub fn decompress_parallel<W: Write>(
         debug_assert!(
             crate::decompress::parallel::fast_marker_inflate::validate_boundary(
                 deflate_data,
-                chunk.end_bit_offset,
+                chunk.end.bits(),
                 1,
                 1,
                 false,
@@ -630,11 +662,11 @@ pub fn decompress_parallel<W: Write>(
                     // only zero-padding bits remaining — validate_boundary will
                     // fail there because there are no more blocks to decode.
                     // Accept only if we're within 1 byte of the stream end.
-                    i + 1 == chunks.len() && total_bits.saturating_sub(chunk.end_bit_offset) < 8
+                    i + 1 == chunks.len() && total_bits.saturating_sub(chunk.end.bits()) < 8
                 },
             "G1 invariant after phase1c: chunk {} end_bit_offset {} is not a real block boundary",
             i,
-            chunk.end_bit_offset,
+            chunk.end.bits(),
         );
     }
 
@@ -950,6 +982,7 @@ fn correction_decode_stop(idx: usize, start_bits: &[Option<ChunkStart>]) -> Chun
 /// to pure-Rust speed (~50 MB/s/thread vs. ISA-L's ~163 MB/s/thread on
 /// x86_64 CI), which prevents per-thread parity with sequential ISA-L
 /// no matter how good the parallel orchestration is.
+#[derive(Debug)]
 struct ChunkResult {
     bootstrap: Vec<u16>,
     /// Trailing bootstrap bytes already proven marker-free and stored as
@@ -977,6 +1010,179 @@ impl ChunkResult {
     }
 }
 
+fn empty_chunk_result(end_bit_offset: usize) -> ChunkResult {
+    ChunkResult {
+        bootstrap: Vec::new(),
+        bootstrap_clean: Vec::new(),
+        isal_bytes: Vec::new(),
+        isal_crc: crc32fast::Hasher::new(),
+        end_bit_offset,
+        worker_elapsed: std::time::Duration::ZERO,
+    }
+}
+
+/// Transitional worker contract for the dispatcher-owned retry architecture.
+///
+/// Commit 1 keeps the legacy worker implementation underneath these types so the
+/// current pipeline behavior stays unchanged while later commits replace the
+/// rescue-path control flow.
+#[derive(Debug)]
+enum WorkerOutcome {
+    NoDecode,
+    Candidate(CandidateChunk),
+}
+
+#[derive(Debug)]
+struct CandidateChunk {
+    requested_partition: usize,
+    discovered_start: ChunkStart,
+    discovered_end: RealBlockBoundary,
+    chunk: ChunkResult,
+}
+
+#[derive(Debug)]
+struct AuthoritativeChunk {
+    start: ChunkStart,
+    end: RealBlockBoundary,
+    chunk: ChunkResult,
+}
+
+impl AuthoritativeChunk {
+    fn from_candidate(candidate: CandidateChunk) -> Self {
+        Self {
+            start: candidate.discovered_start,
+            end: candidate.discovered_end,
+            chunk: candidate.chunk,
+        }
+    }
+
+    fn empty(start: ChunkStart) -> Self {
+        Self {
+            start,
+            end: RealBlockBoundary(start.bits()),
+            chunk: empty_chunk_result(start.bits()),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PartitionState {
+    NoDecode,
+    Speculative(CandidateChunk),
+    Decoded(AuthoritativeChunk),
+    Subsumed { start: ChunkStart },
+    EmptyTail { start: ChunkStart },
+}
+
+#[derive(Debug)]
+struct PartitionRegistry {
+    partitions: Vec<PartitionState>,
+}
+
+impl PartitionRegistry {
+    fn from_worker_outcomes(outcomes: Vec<WorkerOutcome>) -> Self {
+        let partitions = outcomes
+            .into_iter()
+            .map(|outcome| match outcome {
+                WorkerOutcome::NoDecode => PartitionState::NoDecode,
+                WorkerOutcome::Candidate(candidate) => PartitionState::Speculative(candidate),
+            })
+            .collect();
+        Self { partitions }
+    }
+
+    fn from_legacy_chunks(
+        start_bits: &[Option<ChunkStart>],
+        chunks: &mut [Option<ChunkResult>],
+    ) -> Self {
+        let partitions = chunks
+            .iter_mut()
+            .enumerate()
+            .map(|(idx, chunk)| match chunk.take() {
+                Some(chunk) => PartitionState::Speculative(CandidateChunk {
+                    requested_partition: idx,
+                    discovered_start: start_bits[idx].unwrap_or(ChunkStart::from_bits(0)),
+                    discovered_end: RealBlockBoundary(chunk.end_bit_offset),
+                    chunk,
+                }),
+                None => PartitionState::NoDecode,
+            })
+            .collect();
+        Self { partitions }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.partitions.len()
+    }
+
+    fn take_speculative(&mut self, idx: usize) -> Option<CandidateChunk> {
+        let slot = self.partitions.get_mut(idx)?;
+        let mut taken = PartitionState::NoDecode;
+        std::mem::swap(slot, &mut taken);
+        match taken {
+            PartitionState::Speculative(candidate) => Some(candidate),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    }
+
+    fn set_decoded(&mut self, idx: usize, chunk: AuthoritativeChunk) {
+        self.partitions[idx] = PartitionState::Decoded(chunk);
+    }
+
+    fn set_subsumed(&mut self, idx: usize, start: ChunkStart) {
+        self.partitions[idx] = PartitionState::Subsumed { start };
+    }
+
+    fn set_empty_tail(&mut self, idx: usize, start: ChunkStart) {
+        self.partitions[idx] = PartitionState::EmptyTail { start };
+    }
+
+    fn into_authoritative_chunks(self) -> Vec<AuthoritativeChunk> {
+        self.partitions
+            .into_iter()
+            .map(|partition| match partition {
+                PartitionState::Decoded(chunk) => chunk,
+                PartitionState::Subsumed { start } | PartitionState::EmptyTail { start } => {
+                    AuthoritativeChunk::empty(start)
+                }
+                PartitionState::NoDecode | PartitionState::Speculative(_) => {
+                    panic!("reconcile must resolve every partition before phase 2")
+                }
+            })
+            .collect()
+    }
+
+    fn write_back_legacy(
+        self,
+        start_bits: &mut [Option<ChunkStart>],
+        chunks: &mut [Option<ChunkResult>],
+    ) {
+        for ((start_slot, chunk_slot), partition) in start_bits
+            .iter_mut()
+            .zip(chunks.iter_mut())
+            .zip(self.partitions)
+        {
+            match partition {
+                PartitionState::Decoded(authoritative) => {
+                    *start_slot = Some(authoritative.start);
+                    *chunk_slot = Some(authoritative.chunk);
+                }
+                PartitionState::Subsumed { start } | PartitionState::EmptyTail { start } => {
+                    *start_slot = Some(start);
+                    *chunk_slot = Some(empty_chunk_result(start.bits()));
+                }
+                PartitionState::NoDecode | PartitionState::Speculative(_) => {
+                    *chunk_slot = None;
+                }
+            }
+        }
+    }
+}
+
 /// Decodes each chunk in parallel from its speculative start. Each worker:
 ///
 /// 1. Runs the marker decoder in **bootstrap mode** until 32 KB of clean
@@ -989,19 +1195,18 @@ impl ChunkResult {
 /// pure-Rust marker decoder caps single-thread parity vs ISA-L at ~30%
 /// no matter how good the parallel orchestration is.
 ///
-/// Chunks whose `start_bits[i]` is `None` (phase 1a found no candidate)
-/// are skipped — their result stays `None` and phase 1c chain-decodes
-/// them from the predecessor's confirmed `end_bit_offset`.
-fn phase1_marker_decode_parallel_with_optional_starts(
+/// Chunks whose speculative start is `None` are skipped. The dispatcher will
+/// later derive their exact start from the preceding authoritative partition.
+fn phase1_marker_decode_parallel(
     deflate_data: &[u8],
-    start_bits: &[Option<ChunkStart>],
-    decode_stops: &[ChunkDecodeStop],
+    boundaries: &BoundaryRegistry,
     per_chunk_output_hint: usize,
     num_workers: usize,
-) -> Vec<Option<ChunkResult>> {
-    let num_chunks = start_bits.len();
-    let results: Vec<Mutex<Option<ChunkResult>>> =
-        (0..num_chunks).map(|_| Mutex::new(None)).collect();
+) -> Vec<WorkerOutcome> {
+    let num_chunks = boundaries.len();
+    let results: Vec<Mutex<WorkerOutcome>> = (0..num_chunks)
+        .map(|_| Mutex::new(WorkerOutcome::NoDecode))
+        .collect();
     let next_task = AtomicUsize::new(0);
 
     std::thread::scope(|s| {
@@ -1011,20 +1216,21 @@ fn phase1_marker_decode_parallel_with_optional_starts(
                 if idx >= num_chunks {
                     break;
                 }
-                let Some(start_bit) = start_bits[idx] else {
+                let Some(start_bit) = boundaries.speculative_start(idx) else {
                     continue;
                 };
-                let plan = ChunkDecodePlan::new(start_bit, decode_stops[idx]);
-                let force_slow_path = !decode_stops[idx].use_isal();
-                if let Ok(chunk) = decode_chunk_plan(
+                let stop = boundaries.speculative_stop_for(idx);
+                let force_slow_path = !stop.use_isal();
+                let outcome = decode_chunk_inexact_legacy(
                     deflate_data,
-                    plan,
+                    idx,
+                    start_bit,
+                    stop,
                     per_chunk_output_hint,
                     num_chunks,
                     force_slow_path,
-                ) {
-                    *results[idx].lock().unwrap() = Some(chunk);
-                }
+                );
+                *results[idx].lock().unwrap() = outcome;
             });
         }
     });
@@ -1042,7 +1248,7 @@ fn phase1_marker_decode_parallel_with_optional_starts(
 /// `end_bit_limit` / BFINAL, or (b) ISA-L is not available on this
 /// platform. Both fall-back cases return a `ChunkResult` with empty
 /// `isal_bytes` — phase 2 sees no difference.
-fn decode_chunk_with_handoff(
+fn decode_chunk_with_handoff_legacy(
     deflate_data: &[u8],
     start_bit: ChunkStart,
     stop: ChunkDecodeStop,
@@ -1299,21 +1505,59 @@ fn decode_chunk_with_handoff(
     }
 }
 
-fn decode_chunk_plan(
+/// Transitional inexact worker seam. For now this simply wraps the legacy
+/// worker and reports either a speculative candidate or `NoDecode`.
+fn decode_chunk_inexact_legacy(
     deflate_data: &[u8],
-    plan: ChunkDecodePlan,
+    requested_partition: usize,
+    start_bit: ChunkStart,
+    stop: ChunkDecodeStop,
     per_chunk_output_hint: usize,
     num_chunks_total: usize,
     force_slow_path: bool,
-) -> std::io::Result<ChunkResult> {
-    decode_chunk_with_handoff(
+) -> WorkerOutcome {
+    match decode_chunk_with_handoff_legacy(
         deflate_data,
-        plan.start(),
-        plan.stop(),
+        start_bit,
+        stop,
         per_chunk_output_hint,
         num_chunks_total,
         force_slow_path,
+    ) {
+        Ok(chunk) => WorkerOutcome::Candidate(CandidateChunk {
+            requested_partition,
+            discovered_start: start_bit,
+            discovered_end: RealBlockBoundary(chunk.end_bit_offset),
+            chunk,
+        }),
+        Err(_) => WorkerOutcome::NoDecode,
+    }
+}
+
+/// Transitional exact worker seam. The authoritative start/end contract is not
+/// enforced yet; Commit 1 only provides the type-checked target shape that
+/// later commits will make strict.
+fn decode_chunk_exact_legacy(
+    deflate_data: &[u8],
+    start_bit: ChunkStart,
+    end_limit: Option<ChunkEndLimit>,
+    per_chunk_output_hint: usize,
+    num_chunks_total: usize,
+) -> std::io::Result<AuthoritativeChunk> {
+    let stop = end_limit.map_or(ChunkDecodeStop::UntilEnd, ChunkDecodeStop::Verified);
+    decode_chunk_with_handoff_legacy(
+        deflate_data,
+        start_bit,
+        stop,
+        per_chunk_output_hint,
+        num_chunks_total,
+        false,
     )
+    .map(|chunk| AuthoritativeChunk {
+        start: start_bit,
+        end: RealBlockBoundary(chunk.end_bit_offset),
+        chunk,
+    })
 }
 
 /// Slow-path completion when the ISA-L handoff isn't available or fails:
@@ -1416,23 +1660,159 @@ fn normalize_isal_end_bit(
     }
 }
 
-// ── Phase 1c: cross-chunk consistency correction ─────────────────────────────
+// ── Reconcile: dispatcher-owned boundary acceptance / retry ──────────────────
 
-/// Walk pairs (N, N+1) once forward and correct chunk N+1's start when chunk N's
-/// decoded `end_bit` doesn't match it. Re-decode chunk N+1 from the
-/// corrected start; propagate forward.
-///
-/// The induction: chunk 0 starts at bit 0 (a real boundary). Each
-/// decode that starts at a real boundary lands at a real boundary
-/// (G1 invariant — `decode_loop` only exits between blocks). So
-/// chunks[N].end_bit is *always* a real block boundary, regardless
-/// of how speculative `end_bit_limit` was set. Correcting chunk N+1's
-/// start to chunks[N].end_bit therefore makes chunk N+1's start a
-/// real boundary by construction.
-///
-/// Wall-time deadline bounds adversarial cases where many chunks need
-/// correction. On exhaustion: return `Err(DecodeFailed)` and let the
-/// routing-layer fallback (G3/G4) surface the failure.
+fn exact_or_empty_authoritative(
+    deflate_data: &[u8],
+    idx: usize,
+    start: ChunkStart,
+    end_limit: Option<ChunkEndLimit>,
+    deadline: std::time::Instant,
+    per_chunk_output_hint: usize,
+    num_chunks: usize,
+) -> Result<AuthoritativeChunk, ParallelError> {
+    let total_bits = deflate_data.len() * 8;
+    if end_limit.is_none() && total_bits.saturating_sub(start.bits()) < 8 {
+        if debug_enabled() {
+            eprintln!(
+                "[parallel_sm:v0.6] reconcile: chunk {} is empty tail at {}",
+                idx,
+                start.bits()
+            );
+        }
+        return Ok(AuthoritativeChunk::empty(start));
+    }
+    if end_limit.is_some_and(|limit| start.bits() >= limit.bits()) {
+        if debug_enabled() {
+            eprintln!(
+                "[parallel_sm:v0.6] reconcile: chunk {} subsumed at {}",
+                idx,
+                start.bits()
+            );
+        }
+        return Ok(AuthoritativeChunk::empty(start));
+    }
+    if std::time::Instant::now() >= deadline {
+        if debug_enabled() {
+            eprintln!(
+                "[parallel_sm:v0.6] reconcile: wall-time deadline exceeded after {} retries",
+                MARKER_PIPELINE_RETRY_ITERATIONS.load(Ordering::Relaxed)
+            );
+        }
+        return Err(ParallelError::DecodeFailed);
+    }
+
+    MARKER_PIPELINE_RETRY_ITERATIONS.fetch_add(1, Ordering::Relaxed);
+    if debug_enabled() {
+        eprintln!(
+            "[parallel_sm:v0.6] reconcile: exact decode chunk {} start={} stop={:?}",
+            idx, start, end_limit
+        );
+    }
+
+    decode_chunk_exact_legacy(
+        deflate_data,
+        start,
+        end_limit,
+        per_chunk_output_hint,
+        num_chunks,
+    )
+    .map_err(|e| {
+        if debug_enabled() {
+            eprintln!(
+                "[parallel_sm:v0.6] reconcile: exact decode of chunk {} from {} failed: {e}",
+                idx, start
+            );
+        }
+        ParallelError::DecodeFailed
+    })
+}
+
+fn reconcile_partitions(
+    deflate_data: &[u8],
+    boundaries: &mut BoundaryRegistry,
+    partitions: &mut PartitionRegistry,
+    deadline: std::time::Instant,
+    per_chunk_output_hint: usize,
+) -> Result<(), ParallelError> {
+    if partitions.len() == 0 {
+        return Ok(());
+    }
+
+    for idx in 0..partitions.len() {
+        let expected_start = boundaries.confirmed_start(idx).ok_or_else(|| {
+            if debug_enabled() {
+                eprintln!(
+                    "[parallel_sm:v0.6] reconcile: partition {} has no confirmed start",
+                    idx
+                );
+            }
+            ParallelError::DecodeFailed
+        })?;
+
+        let end_limit = boundaries.exact_end_limit_for(idx);
+        let candidate = partitions.take_speculative(idx);
+        let authoritative = match candidate {
+            Some(candidate) if candidate.discovered_start == expected_start => {
+                AuthoritativeChunk::from_candidate(candidate)
+            }
+            Some(candidate) => {
+                if debug_enabled() {
+                    eprintln!(
+                        "[parallel_sm:v0.6] reconcile: discard speculative chunk {} \
+                         start={} expected_start={} end={}",
+                        idx,
+                        candidate.discovered_start.bits(),
+                        expected_start.bits(),
+                        candidate.discovered_end.bits(),
+                    );
+                }
+                exact_or_empty_authoritative(
+                    deflate_data,
+                    idx,
+                    expected_start,
+                    end_limit,
+                    deadline,
+                    per_chunk_output_hint,
+                    partitions.len(),
+                )?
+            }
+            None => exact_or_empty_authoritative(
+                deflate_data,
+                idx,
+                expected_start,
+                end_limit,
+                deadline,
+                per_chunk_output_hint,
+                partitions.len(),
+            )?,
+        };
+
+        if end_limit.is_none() && authoritative.chunk.decoded_len() == 0 {
+            partitions.set_empty_tail(idx, authoritative.start);
+        } else if end_limit.is_some_and(|limit| authoritative.start.bits() >= limit.bits()) {
+            partitions.set_subsumed(idx, authoritative.start);
+        } else {
+            partitions.set_decoded(idx, authoritative);
+        }
+
+        let end = match &partitions.partitions[idx] {
+            PartitionState::Decoded(chunk) => chunk.end,
+            PartitionState::Subsumed { start } | PartitionState::EmptyTail { start } => {
+                RealBlockBoundary(start.bits())
+            }
+            PartitionState::NoDecode | PartitionState::Speculative(_) => unreachable!(),
+        };
+        boundaries.confirm_start(idx, expected_start);
+        boundaries.confirm_next_start_from_end(idx, end);
+    }
+
+    Ok(())
+}
+
+/// Compatibility wrapper for the legacy test surface. Internally this now uses
+/// dispatcher-owned reconcile state rather than mutating speculative starts and
+/// decoded chunks in place.
 fn phase1c_resolve_consistency(
     deflate_data: &[u8],
     start_bits: &mut [Option<ChunkStart>],
@@ -1441,282 +1821,16 @@ fn phase1c_resolve_consistency(
     per_chunk_output_hint: usize,
     _spacing_bits: usize,
 ) -> Result<(), ParallelError> {
-    let num_chunks = chunks.len();
-    if num_chunks == 0 {
-        return Ok(());
-    }
-
-    // Chunk 0's start is bit 0 by construction; it must have decoded
-    // unless the gzip stream is malformed. Bail if not.
-    if chunks[0].is_none() {
-        if debug_enabled() {
-            eprintln!(
-                "[parallel_sm:v0.6] phase1c: chunks[0] is None — bit 0 isn't a valid \
-                 deflate start; gzip stream likely corrupt"
-            );
-        }
-        return Err(ParallelError::DecodeFailed);
-    }
-
-    if num_chunks == 1 {
-        return Ok(());
-    }
-
-    let total_bits = deflate_data.len() * 8;
-
-    // Wave-based parallel correction loop.
-    //
-    // Each wave identifies all chunks whose predecessor is already resolved
-    // (Some) but which themselves need correction (None, or wrong start_bit).
-    // Independent corrections within a wave are dispatched as parallel threads
-    // via `thread::scope` — a correction at index i and one at index j > i are
-    // independent whenever chunks[i-1] and chunks[j-1] are both already Some.
-    //
-    // On typical real data (few corrections) one wave handles everything.
-    // Consecutive failures (chunks i, i+1, i+2 all None) are still O(N)
-    // serial waves because each depends on its predecessor — unavoidable.
-    //
-    // `scan_start` tracks the lowest index that could still need correction.
-    // Once chunk i is stable (confirmed Some with correct start_bit), the scan
-    // never needs to revisit it. Without this cursor a pathological all-None
-    // phase-1a run would do O(N) scan work per wave for O(N) waves = O(N²).
-    //
-    // Preconditions per wave:
-    //   - chunks[i] is Some ⟹ its start_bit is a real block boundary (G1)
-    //   - deadline enforces that adversarial inputs don't spin forever
-    let mut scan_start: usize = 0;
-    let mut wave_num: u32 = 0;
-    loop {
-        // ── Read-only scan: classify corrections this wave ──────────────────
-        // Two categories:
-        //   empty_fills: predecessor already reached/passed the next verified
-        //                boundary (or EOF) — materialize an empty chunk now.
-        //   specs:       need a real re-decode; will run in parallel.
-        let mut empty_fills: Vec<EmptyChunkFill> = Vec::new();
-        let mut specs: Vec<CorrectionDecode> = Vec::new();
-        let mut new_scan_start = scan_start;
-
-        let mut i = scan_start;
-        while i < num_chunks - 1 {
-            let pred_end = match &chunks[i] {
-                Some(c) => c.end_bit_offset,
-                // Predecessor not yet resolved — its correction will appear in
-                // a later wave once this wave resolves chunks[i].
-                None => {
-                    i += 1;
-                    continue;
-                }
-            };
-
-            // Guard: chunk i's own start must be confirmed correct before we use
-            // its end_bit to seed chunk i+1. A phase1a false-positive can give
-            // chunk i a wrong start_bit (so its end_bit is also wrong). Using
-            // that wrong end_bit to decode chunk i+1 propagates the error.
-            // If chunk i-1 is None (not yet resolved) we also skip — chunk i
-            // might be wrong and will be corrected in a future wave.
-            if i > 0 {
-                let start_ok = match &chunks[i - 1] {
-                    Some(pred_of_i) => {
-                        start_bits[i] == Some(ChunkStart::from_bits(pred_of_i.end_bit_offset))
-                    }
-                    None => false,
-                };
-                if !start_ok {
-                    i += 1;
-                    continue;
-                }
-            }
-
-            // Correction needed when:
-            //   - chunks[i+1] is None (phase 1b worker failed), OR
-            //   - start_bits[i+1] is None/wrong (phase 1a false-positive or miss).
-            let needs = chunks[i + 1].is_none()
-                || (start_bits[i + 1] != Some(ChunkStart::from_bits(pred_end)));
-            if !needs {
-                if new_scan_start == i {
-                    new_scan_start = i + 1;
-                }
-                i += 1;
-                continue;
-            }
-
-            let fill_start = ChunkStart::from_bits(pred_end);
-            let mut fill_run_to = i;
-            let mut should_fill = total_bits.saturating_sub(pred_end) < 8;
-            if !should_fill {
-                let stop = correction_decode_stop(i + 1, start_bits);
-                should_fill = stop
-                    .hint_bits()
-                    .is_some_and(|stop_bits| pred_end >= stop_bits);
-                if !should_fill {
-                    let plan = ChunkDecodePlan::new(fill_start, stop);
-                    specs.push(CorrectionDecode::new(i + 1, plan));
-                    i += 1;
-                    continue;
-                }
-            }
-
-            // A predecessor that already reached/passed the next verified
-            // boundary subsumes every following phantom chunk in the same run.
-            // Collapse the whole empty tail now instead of draining it one
-            // wave at a time.
-            empty_fills.push(EmptyChunkFill::new(i + 1, fill_start));
-            let mut j = i + 1;
-            while j < num_chunks - 1 {
-                let next_needs = chunks[j + 1].is_none() || (start_bits[j + 1] != Some(fill_start));
-                if !next_needs {
-                    break;
-                }
-                let next_stop = correction_decode_stop(j + 1, start_bits);
-                if total_bits.saturating_sub(pred_end) < 8
-                    || next_stop
-                        .hint_bits()
-                        .is_some_and(|stop_bits| pred_end >= stop_bits)
-                {
-                    empty_fills.push(EmptyChunkFill::new(j + 1, fill_start));
-                    fill_run_to = j + 1;
-                    j += 1;
-                    continue;
-                }
-                break;
-            }
-            i = fill_run_to + 1;
-        }
-
-        scan_start = new_scan_start;
-
-        if empty_fills.is_empty() && specs.is_empty() {
-            break; // all chunks resolved
-        }
-
-        // ── Apply immediate empty fills (no decode, no deadline check needed) ─
-        for fill in empty_fills {
-            if debug_enabled() {
-                eprintln!(
-                    "[parallel_sm:v0.6] phase1c: chunk {} is empty \
-                     (pred_end={}, total_bits={total_bits}, remaining={}); \
-                     marking empty",
-                    fill.idx,
-                    fill.start.bits(),
-                    total_bits.saturating_sub(fill.start.bits())
-                );
-            }
-            chunks[fill.idx] = Some(ChunkResult {
-                bootstrap: Vec::new(),
-                bootstrap_clean: Vec::new(),
-                isal_bytes: Vec::new(),
-                isal_crc: crc32fast::Hasher::new(),
-                end_bit_offset: fill.start.bits(),
-                worker_elapsed: std::time::Duration::ZERO,
-            });
-            start_bits[fill.idx] = Some(fill.start);
-        }
-
-        if specs.is_empty() {
-            // Empty fills may have unblocked more corrections —
-            // re-scan before checking the deadline.
-            continue;
-        }
-
-        if std::time::Instant::now() >= deadline {
-            if debug_enabled() {
-                eprintln!(
-                    "[parallel_sm:v0.6] phase1c: wall-time deadline exceeded after \
-                     {} corrections",
-                    MARKER_PIPELINE_RETRY_ITERATIONS.load(Ordering::Relaxed)
-                );
-            }
-            return Err(ParallelError::DecodeFailed);
-        }
-
-        MARKER_PIPELINE_RETRY_ITERATIONS.fetch_add(specs.len() as u64, Ordering::Relaxed);
-
-        if debug_enabled() {
-            for spec in &specs {
-                eprintln!(
-                    "[parallel_sm:v0.6] phase1c wave {wave_num}: correcting chunk {} \
-                     start={} stop={:?} \
-                     range_mb={:.1}",
-                    spec.idx,
-                    spec.plan.start(),
-                    spec.plan.stop(),
-                    spec.plan
-                        .stop()
-                        .hint_bits()
-                        .map(|e| e.saturating_sub(spec.plan.start().bits()) as f64 / 8.0 / 1e6)
-                        .unwrap_or(0.0)
-                );
-            }
-        }
-        let t_wave = if debug_enabled() {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
-        // ── Parallel re-decode of all independent corrections this wave ─────
-        // `thread::scope` guarantees all threads join before we mutate
-        // `chunks`/`start_bits`. Each thread receives only Copy values
-        // (`start_bit`, `end_limit`, `per_chunk_output_hint`, `num_chunks`)
-        // plus an immutable shared borrow of `deflate_data`.
-        let results: Vec<(CorrectionDecode, std::io::Result<ChunkResult>)> =
-            std::thread::scope(|s| {
-                let handles: Vec<_> = specs
-                    .iter()
-                    .map(|&spec| {
-                        s.spawn(move || {
-                            (
-                                spec,
-                                decode_chunk_plan(
-                                    deflate_data,
-                                    spec.plan,
-                                    per_chunk_output_hint,
-                                    num_chunks,
-                                    !spec.plan.stop().use_isal(),
-                                ),
-                            )
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().expect("phase1c correction thread panicked"))
-                    .collect()
-            });
-
-        if debug_enabled() {
-            if let Some(t) = t_wave {
-                eprintln!(
-                    "[parallel_sm:v0.6] phase1c wave {wave_num}: {n} corrections in {ms:.1}ms",
-                    n = specs.len(),
-                    ms = t.elapsed().as_secs_f64() * 1000.0,
-                );
-            }
-        }
-        wave_num += 1;
-
-        // ── Commit results ───────────────────────────────────────────────────
-        for (spec, result) in results {
-            match result {
-                Ok(chunk) => {
-                    start_bits[spec.idx] = Some(spec.plan.start());
-                    chunks[spec.idx] = Some(chunk);
-                }
-                Err(e) => {
-                    if debug_enabled() {
-                        eprintln!(
-                            "[parallel_sm:v0.6] phase1c: re-decode of chunk {} from \
-                             {} failed: {e}",
-                            spec.idx,
-                            spec.plan.start()
-                        );
-                    }
-                    return Err(ParallelError::DecodeFailed);
-                }
-            }
-        }
-    }
-
+    let mut boundaries = BoundaryRegistry::from_speculative_starts(start_bits.to_vec());
+    let mut partitions = PartitionRegistry::from_legacy_chunks(start_bits, chunks);
+    reconcile_partitions(
+        deflate_data,
+        &mut boundaries,
+        &mut partitions,
+        deadline,
+        per_chunk_output_hint,
+    )?;
+    partitions.write_back_legacy(start_bits, chunks);
     Ok(())
 }
 
@@ -1729,14 +1843,15 @@ fn phase1c_resolve_consistency(
 /// returns — partial bytes may already be written on mismatch (same
 /// trade-off as rapidgzip's per-chunk streaming design).
 fn phase2_resolve_write_combine<W: Write>(
-    chunks: Vec<ChunkResult>,
+    chunks: Vec<AuthoritativeChunk>,
     writer: &mut W,
 ) -> Result<(u32, usize), ParallelError> {
     let mut total_crc = crc32fast::Hasher::new();
     let mut window: Vec<u8> = Vec::with_capacity(WINDOW_SIZE);
     let mut total_size = 0usize;
 
-    for (i, mut chunk) in chunks.into_iter().enumerate() {
+    for (i, authoritative) in chunks.into_iter().enumerate() {
+        let mut chunk = authoritative.chunk;
         // Bootstrap u16 prefix: may contain cross-chunk markers (only
         // for chunks i > 0). Resolve them against the previous chunk's
         // last 32 KB.
@@ -2282,7 +2397,7 @@ mod tests {
 
         // Decode chunks 0 and 2 from their (real) boundaries.
         let end_limit_0 = start_bits[1].map(ChunkStart::to_end_limit);
-        let c0 = match decode_chunk_with_handoff(
+        let c0 = match decode_chunk_with_handoff_legacy(
             deflate_data,
             ChunkStart::from_bits(0),
             end_limit_0.map_or(ChunkDecodeStop::UntilEnd, ChunkDecodeStop::Verified),
@@ -2298,7 +2413,7 @@ mod tests {
             None => return, // phase 1a found no boundary for chunk 2 — skip
         };
         let end_limit_2 = start_bits[3].map(ChunkStart::to_end_limit);
-        let c2 = match decode_chunk_with_handoff(
+        let c2 = match decode_chunk_with_handoff_legacy(
             deflate_data,
             start2,
             end_limit_2.map_or(ChunkDecodeStop::UntilEnd, ChunkDecodeStop::Verified),
@@ -2600,7 +2715,7 @@ mod tests {
 
         let num_chunks = 2;
         let per_chunk_hint = deflate_data.len() / num_chunks;
-        let c0 = match decode_chunk_with_handoff(
+        let c0 = match decode_chunk_with_handoff_legacy(
             deflate_data,
             ChunkStart::from_bits(0),
             ChunkDecodeStop::UntilEnd,
@@ -2654,7 +2769,7 @@ mod tests {
         // Decode chunk 0 to get a confirmed end_bit.
         let num_chunks = 3;
         let per_chunk_hint = deflate_data.len() / num_chunks;
-        let c0 = match decode_chunk_with_handoff(
+        let c0 = match decode_chunk_with_handoff_legacy(
             deflate_data,
             ChunkStart::from_bits(0),
             ChunkDecodeStop::UntilEnd,
@@ -2721,7 +2836,7 @@ mod tests {
         let per_chunk_hint = deflate_data.len() / num_chunks;
 
         // Decode chunk 0 normally.
-        let c0 = match decode_chunk_with_handoff(
+        let c0 = match decode_chunk_with_handoff_legacy(
             deflate_data,
             ChunkStart::from_bits(0),
             ChunkDecodeStop::UntilEnd,
@@ -2847,7 +2962,7 @@ mod tests {
             .expect("phase1a should find the next chunk boundary");
 
         let per_chunk_hint = deflate_data.len() / num_chunks;
-        let chunk = decode_chunk_with_handoff(
+        let chunk = decode_chunk_with_handoff_legacy(
             deflate_data,
             ChunkStart::from_bits(0),
             ChunkDecodeStop::Verified(end_limit),
@@ -2862,6 +2977,97 @@ mod tests {
             end_limit.bits(),
             "ISA-L worker must snap small ISA-L end-bit overshoots to the verified downstream boundary"
         );
+    }
+
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    #[test]
+    fn decode_chunk_inexact_legacy_returns_candidate_on_success() {
+        use crate::decompress::parallel::marker_decode::skip_gzip_header;
+
+        let original = make_compressible_data(4 * 1024 * 1024);
+        let gzip = make_gzip_data(&original);
+        let header_size = skip_gzip_header(&gzip).expect("valid gzip header");
+        let deflate_data = &gzip[header_size..gzip.len() - 8];
+
+        let num_chunks = 3;
+        let spacing = deflate_data.len() * 8 / num_chunks;
+        let start_bits = phase1_search_boundaries(deflate_data, num_chunks, spacing, 1);
+        let start_bit = start_bits[0].expect("chunk 0 start is pinned to bit 0");
+        let stop = ChunkDecodeStop::Verified(
+            start_bits[1]
+                .map(ChunkStart::to_end_limit)
+                .expect("phase1a should find next boundary"),
+        );
+
+        let outcome = decode_chunk_inexact_legacy(
+            deflate_data,
+            0,
+            start_bit,
+            stop,
+            deflate_data.len() / num_chunks,
+            num_chunks,
+            false,
+        );
+
+        match outcome {
+            WorkerOutcome::Candidate(candidate) => {
+                assert_eq!(candidate.requested_partition, 0);
+                assert_eq!(candidate.discovered_start, start_bit);
+                assert_eq!(
+                    candidate.discovered_end.bits(),
+                    candidate.chunk.end_bit_offset
+                );
+            }
+            WorkerOutcome::NoDecode => {
+                panic!("expected candidate outcome for valid speculative start")
+            }
+        }
+    }
+
+    #[test]
+    fn decode_chunk_inexact_legacy_returns_no_decode_on_error() {
+        let deflate_data = [0u8; 8];
+        let outcome = decode_chunk_inexact_legacy(
+            &deflate_data,
+            7,
+            ChunkStart::from_bits(deflate_data.len() * 8 + 8),
+            ChunkDecodeStop::UntilEnd,
+            1024,
+            1,
+            false,
+        );
+        assert!(matches!(outcome, WorkerOutcome::NoDecode));
+    }
+
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    #[test]
+    fn decode_chunk_exact_legacy_returns_authoritative_chunk() {
+        use crate::decompress::parallel::marker_decode::skip_gzip_header;
+
+        let original = make_compressible_data(4 * 1024 * 1024);
+        let gzip = make_gzip_data(&original);
+        let header_size = skip_gzip_header(&gzip).expect("valid gzip header");
+        let deflate_data = &gzip[header_size..gzip.len() - 8];
+
+        let num_chunks = 3;
+        let spacing = deflate_data.len() * 8 / num_chunks;
+        let start_bits = phase1_search_boundaries(deflate_data, num_chunks, spacing, 1);
+        let start_bit = start_bits[0].expect("chunk 0 start is pinned to bit 0");
+        let end_limit = start_bits[1]
+            .map(ChunkStart::to_end_limit)
+            .expect("phase1a should find next boundary");
+
+        let chunk = decode_chunk_exact_legacy(
+            deflate_data,
+            start_bit,
+            Some(end_limit),
+            deflate_data.len() / num_chunks,
+            num_chunks,
+        )
+        .expect("exact legacy seam should wrap successful worker decode");
+
+        assert_eq!(chunk.start, start_bit);
+        assert_eq!(chunk.end.bits(), chunk.chunk.end_bit_offset);
     }
 
     /// D1 — Pipeline succeeds when most phase1a boundaries are None (chain-decode).
