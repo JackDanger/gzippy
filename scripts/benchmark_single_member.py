@@ -244,8 +244,14 @@ def benchmark_decompress(
             )
         per_chunk_debug = dbg.stderr.decode(errors="replace")
         # Print per-chunk breakdown lines (not the full warmup trace again).
-        chunk_lines = [l for l in per_chunk_debug.splitlines()
-                       if "chunk " in l or "imbalance" in l or "per-chunk" in l]
+        chunk_lines = [
+            l
+            for l in per_chunk_debug.splitlines()
+            if "chunk " in l
+            or "imbalance" in l
+            or "per-chunk" in l
+            or "[parallel_sm:v0.6] counters" in l
+        ]
         if chunk_lines:
             print("    per-chunk phase1b breakdown:")
             for line in chunk_lines:

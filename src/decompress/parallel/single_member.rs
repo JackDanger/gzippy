@@ -734,6 +734,18 @@ pub fn decompress_parallel<W: Write>(
             total.as_secs_f64() * 1000.0,
             mbps,
         );
+        let counters = OptimizationCounters::snapshot();
+        eprintln!(
+            "[parallel_sm:v0.6] counters handoff_fired={} slow_path_used={} \
+             bootstrap_output_bytes={} isal_output_bytes={} \
+             boundary_validations={} retry_iterations={}",
+            counters.handoff_fired,
+            counters.slow_path_used,
+            counters.bootstrap_output_bytes,
+            counters.isal_output_bytes,
+            counters.boundary_validations,
+            counters.retry_iterations,
+        );
     }
 
     Ok(total_size as u64)
