@@ -204,11 +204,14 @@ pub fn validate_boundary(
                 // trivially pass. BTYPE=00/10 have structured headers that
                 // provide real entropy, making accidental matches rare.
                 let next_btype = (bits.peek() >> 1) & 3;
-                if next_btype != 1 {
+                if next_btype == 0 || next_btype == 2 {
                     return Ok(());
                 }
-                // Upcoming block is BTYPE=01: keep decoding to find a
-                // stop point with a BTYPE=00/10 next block.
+                // Upcoming block is BTYPE=01 (fixed Huffman) or BTYPE=11
+                // (reserved/invalid): keep decoding. BTYPE=01 has no header
+                // redundancy — any bit sequence decodes as valid. BTYPE=11
+                // never appears in valid deflate; stopping there means this
+                // is a false positive. Both require us to continue.
             } else {
                 return Ok(());
             }
@@ -647,11 +650,13 @@ fn decode_loop(
                     bits.refill();
                 }
                 let next_btype = (bits.peek() >> 1) & 3;
-                if next_btype != 1 {
+                if next_btype == 0 || next_btype == 2 {
                     **handoff = true;
                     return Ok(());
                 }
-                // Next block is BTYPE=01: keep bootstrapping.
+                // Next block is BTYPE=01 (fixed Huffman) or BTYPE=11
+                // (reserved/invalid): keep bootstrapping. ISA-L can fail on
+                // fixed-Huffman false positives and always fails on BTYPE=11.
             }
         }
 
