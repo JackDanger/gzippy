@@ -1250,6 +1250,24 @@ fn phase1c_resolve_consistency(
                 // all failed phase1a; in that case search further ahead so the
                 // decode doesn't run all the way to BFINAL.
                 let end_limit = (i + 2..num_chunks).find_map(|j| start_bits[j]);
+
+                // ISA-L's end_bit formula (`data.len()*8 - avail_in*8 -
+                // read_in_length`) can overshoot the true block boundary by up
+                // to read_in_length bits (ISA-L's internal bit buffer, ≤ 64
+                // bits). When pred_end slightly exceeds the phase1a-confirmed
+                // end_limit (i.e., ISA-L reported the boundary a few bits
+                // late), snap to end_limit — a validated real boundary — rather
+                // than propagating the ISA-L rounding error. Decoding from a
+                // position 1-64 bits PAST the true boundary hits garbage
+                // (observed: "Reserved block type 3" after a 3-bit overshoot).
+                const ISA_L_SNAP_TOLERANCE_BITS: usize = 64;
+                if let Some(lim) = end_limit {
+                    if pred_end > lim && pred_end - lim <= ISA_L_SNAP_TOLERANCE_BITS {
+                        near_eof_fills.push((i + 1, lim));
+                        continue;
+                    }
+                }
+
                 specs.push((i + 1, pred_end, end_limit));
             }
         }
