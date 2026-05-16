@@ -229,52 +229,8 @@ pub(crate) fn decompress_single_member<W: Write>(
                 return Ok(n);
             }
             Err(e) => {
-                // **Typed routing fallback** (D5, Opus advisor review). The
-                // generic `Err(_) => fall back silently` was the deletion-
-                // trap pattern: BTYPE=01-heavy regions where boundary search
-                // returns None look identical to "too small to bother" at
-                // this layer, so silent fallback hides real regressions.
-                //
-                // - `TooSmall` is an intended routing signal: the input is
-                //   below the parallel threshold; fall through to sequential
-                //   without complaint.
-                // - `CrcMismatch` / `SizeMismatch`: streaming write has
-                //   already sent bytes to the writer — falling back to
-                //   libdeflate would produce double or corrupted output.
-                //   Propagate as an I/O error immediately.
-                // - `DecodeFailed` / other: no bytes written (fails before
-                //   phase 2 write loop); safe to fall back to sequential.
-                use crate::decompress::parallel::single_member::ParallelError;
-                match e {
-                    ParallelError::TooSmall => {
-                        if crate::utils::debug_enabled() {
-                            eprintln!(
-                                "[gzippy] parallel single-member declined (input below threshold)"
-                            );
-                        }
-                    }
-                    ParallelError::CrcMismatch | ParallelError::SizeMismatch => {
-                        return Err(GzippyError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("gzip verification failed: {e}"),
-                        )));
-                    }
-                    _ => {
-                        crate::decompress::parallel::single_member::MARKER_PIPELINE_BOUNDARY_MISSED
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        eprintln!(
-                            "[gzippy] parallel single-member fell back to sequential: {:?}",
-                            e
-                        );
-                        debug_assert!(
-                            false,
-                            "marker pipeline returned non-routing error {e:?}; routing fell back \
-                             to libdeflate. This indicates either a boundary-search failure \
-                             (e.g. BTYPE=01-heavy region; see premortem F7) or a real decode \
-                             bug. In release builds this falls back silently; in debug builds \
-                             it panics so the cause doesn't get lost."
-                        );
-                    }
+                if let Some(err) = map_parallel_single_member_error(e) {
+                    return Err(err);
                 }
             }
         }
@@ -300,6 +256,33 @@ pub(crate) fn decompress_single_member<W: Write>(
         return decompress_single_member_streaming(data, writer);
     }
     decompress_single_member_libdeflate(data, writer)
+}
+
+fn map_parallel_single_member_error(
+    e: crate::decompress::parallel::single_member::ParallelError,
+) -> Option<GzippyError> {
+    use crate::decompress::parallel::single_member::ParallelError;
+
+    match e {
+        ParallelError::TooSmall => {
+            if crate::utils::debug_enabled() {
+                eprintln!("[gzippy] parallel single-member declined (input below threshold)");
+            }
+            None
+        }
+        ParallelError::Io(io) => Some(GzippyError::Io(io)),
+        other => {
+            if crate::utils::debug_enabled() {
+                eprintln!(
+                    "[gzippy] parallel single-member failed with non-routing error: {:?}",
+                    other
+                );
+            }
+            Some(GzippyError::decompression(format!(
+                "parallel single-member failed: {other}"
+            )))
+        }
+    }
 }
 
 /// Streaming single-member decompress via flate2/zlib-ng. Fixed 1MB buffer —
@@ -462,6 +445,34 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::Write;
+
+    #[test]
+    fn test_parallel_single_member_only_too_small_is_routing() {
+        use crate::decompress::parallel::single_member::ParallelError;
+
+        assert!(map_parallel_single_member_error(ParallelError::TooSmall).is_none());
+
+        let decode_failed = map_parallel_single_member_error(ParallelError::DecodeFailed)
+            .expect("DecodeFailed must propagate");
+        assert!(
+            matches!(decode_failed, GzippyError::Decompression(_)),
+            "DecodeFailed must not silently route to sequential"
+        );
+
+        let crc_failed = map_parallel_single_member_error(ParallelError::CrcMismatch)
+            .expect("CrcMismatch must propagate");
+        assert!(
+            matches!(crc_failed, GzippyError::Decompression(_)),
+            "CrcMismatch must not silently route to sequential"
+        );
+
+        let size_failed = map_parallel_single_member_error(ParallelError::SizeMismatch)
+            .expect("SizeMismatch must propagate");
+        assert!(
+            matches!(size_failed, GzippyError::Decompression(_)),
+            "SizeMismatch must not silently route to sequential"
+        );
+    }
 
     #[test]
     fn test_decompress_multi_member_file() {
