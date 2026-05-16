@@ -127,6 +127,42 @@ impl ChunkEndLimit {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VerifiedChunkRange {
+    start: ChunkStart,
+    end_limit: Option<ChunkEndLimit>,
+}
+
+impl VerifiedChunkRange {
+    #[inline]
+    fn new(start: ChunkStart, end_limit: Option<ChunkEndLimit>) -> Self {
+        Self { start, end_limit }
+    }
+
+    #[inline]
+    fn start(self) -> ChunkStart {
+        self.start
+    }
+
+    #[inline]
+    fn end_limit(self) -> Option<ChunkEndLimit> {
+        self.end_limit
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CorrectionSpec {
+    idx: usize,
+    range: VerifiedChunkRange,
+}
+
+impl CorrectionSpec {
+    #[inline]
+    fn new(idx: usize, range: VerifiedChunkRange) -> Self {
+        Self { idx, range }
+    }
+}
+
 /// Successful runs of the marker pipeline. Snapshot before/after a decode to
 /// confirm production routing actually called us — see the deletion-trap
 /// killer test in `src/tests/routing.rs`.
@@ -899,12 +935,11 @@ fn phase1_marker_decode_parallel_with_optional_starts(
                 let Some(start_bit) = start_bits[idx] else {
                     continue;
                 };
-                let end_limit = end_limits[idx];
+                let range = VerifiedChunkRange::new(start_bit, end_limits[idx]);
                 let force_slow_path = !use_isal_for_chunk[idx];
-                if let Ok(chunk) = decode_chunk_with_handoff(
+                if let Ok(chunk) = decode_verified_range(
                     deflate_data,
-                    start_bit,
-                    end_limit,
+                    range,
                     per_chunk_output_hint,
                     num_chunks,
                     force_slow_path,
@@ -1175,6 +1210,23 @@ fn decode_chunk_with_handoff(
     }
 }
 
+fn decode_verified_range(
+    deflate_data: &[u8],
+    range: VerifiedChunkRange,
+    per_chunk_output_hint: usize,
+    num_chunks_total: usize,
+    force_slow_path: bool,
+) -> std::io::Result<ChunkResult> {
+    decode_chunk_with_handoff(
+        deflate_data,
+        range.start(),
+        range.end_limit(),
+        per_chunk_output_hint,
+        num_chunks_total,
+        force_slow_path,
+    )
+}
+
 /// Slow-path completion when the ISA-L handoff isn't available or fails:
 /// finish the chunk with the marker decoder, appending its output to the
 /// bootstrap. Used in fallback only; the production path should keep this
@@ -1299,7 +1351,7 @@ fn phase1c_resolve_consistency(
         //   near_eof_fills: predecessor already at/past EOF — mark empty now.
         //   specs:          need a real re-decode; will run in parallel.
         let mut near_eof_fills: Vec<(usize, usize)> = Vec::new();
-        let mut specs: Vec<(usize, ChunkStart, Option<ChunkEndLimit>)> = Vec::new();
+        let mut specs: Vec<CorrectionSpec> = Vec::new();
         let mut new_scan_start = scan_start;
 
         for i in scan_start..num_chunks - 1 {
@@ -1351,8 +1403,8 @@ fn phase1c_resolve_consistency(
                 // decode doesn't run all the way to BFINAL.
                 let end_limit =
                     (i + 2..num_chunks).find_map(|j| start_bits[j].map(ChunkStart::to_end_limit));
-
-                specs.push((i + 1, ChunkStart::from_bits(pred_end), end_limit));
+                let range = VerifiedChunkRange::new(ChunkStart::from_bits(pred_end), end_limit);
+                specs.push(CorrectionSpec::new(i + 1, range));
             }
         }
 
@@ -1402,13 +1454,21 @@ fn phase1c_resolve_consistency(
         MARKER_PIPELINE_RETRY_ITERATIONS.fetch_add(specs.len() as u64, Ordering::Relaxed);
 
         if debug_enabled() {
-            for &(idx, start_bit, end_limit) in &specs {
+            for spec in &specs {
                 eprintln!(
-                    "[parallel_sm:v0.6] phase1c wave {wave_num}: correcting chunk {idx} \
-                     start={start_bit} end_limit={end_limit:?} \
+                    "[parallel_sm:v0.6] phase1c wave {wave_num}: correcting chunk {} \
+                     start={} end_limit={:?} \
                      range_mb={:.1}",
-                    end_limit
-                        .map(|e| e.bits().saturating_sub(start_bit.bits()) as f64 / 8.0 / 1e6)
+                    spec.idx,
+                    spec.range.start(),
+                    spec.range.end_limit(),
+                    spec.range
+                        .end_limit()
+                        .map(
+                            |e| e.bits().saturating_sub(spec.range.start().bits()) as f64
+                                / 8.0
+                                / 1e6
+                        )
                         .unwrap_or(0.0)
                 );
             }
@@ -1424,19 +1484,17 @@ fn phase1c_resolve_consistency(
         // `chunks`/`start_bits`. Each thread receives only Copy values
         // (`start_bit`, `end_limit`, `per_chunk_output_hint`, `num_chunks`)
         // plus an immutable shared borrow of `deflate_data`.
-        let results: Vec<(usize, ChunkStart, std::io::Result<ChunkResult>)> =
+        let results: Vec<(CorrectionSpec, std::io::Result<ChunkResult>)> =
             std::thread::scope(|s| {
                 let handles: Vec<_> = specs
                     .iter()
-                    .map(|&(idx, start_bit, end_limit)| {
+                    .map(|&spec| {
                         s.spawn(move || {
                             (
-                                idx,
-                                start_bit,
-                                decode_chunk_with_handoff(
+                                spec,
+                                decode_verified_range(
                                     deflate_data,
-                                    start_bit,
-                                    end_limit,
+                                    spec.range,
                                     per_chunk_output_hint,
                                     num_chunks,
                                     false,
@@ -1463,17 +1521,19 @@ fn phase1c_resolve_consistency(
         wave_num += 1;
 
         // ── Commit results ───────────────────────────────────────────────────
-        for (idx, pred_end, result) in results {
+        for (spec, result) in results {
             match result {
                 Ok(chunk) => {
-                    start_bits[idx] = Some(pred_end);
-                    chunks[idx] = Some(chunk);
+                    start_bits[spec.idx] = Some(spec.range.start());
+                    chunks[spec.idx] = Some(chunk);
                 }
                 Err(e) => {
                     if debug_enabled() {
                         eprintln!(
-                            "[parallel_sm:v0.6] phase1c: re-decode of chunk {idx} from \
-                             {pred_end} failed: {e}"
+                            "[parallel_sm:v0.6] phase1c: re-decode of chunk {} from \
+                             {} failed: {e}",
+                            spec.idx,
+                            spec.range.start()
                         );
                     }
                     return Err(ParallelError::DecodeFailed);
