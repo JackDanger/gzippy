@@ -277,8 +277,12 @@ fn worker_loop(
                     &label,
                     "fast_path_start",
                     &format!(
-                        r#""partition_idx":{},"start_bit":{},"until_bit":{},"authoritative":{}"#,
-                        job.partition_idx, job.start_bit, job.until_bit, job.authoritative,
+                        r#""partition_idx":{},"start_bit":{},"until_bit":{},"authoritative":{},"rss_kib":{}"#,
+                        job.partition_idx,
+                        job.start_bit,
+                        job.until_bit,
+                        job.authoritative,
+                        trace::rss_kib(),
                     ),
                 );
                 let r = decode_chunk_with_window(
@@ -295,8 +299,11 @@ fn worker_loop(
                     &label,
                     "slow_path_start",
                     &format!(
-                        r#""partition_idx":{},"start_bit":{},"until_bit":{}"#,
-                        job.partition_idx, job.start_bit, job.until_bit,
+                        r#""partition_idx":{},"start_bit":{},"until_bit":{},"rss_kib":{}"#,
+                        job.partition_idx,
+                        job.start_bit,
+                        job.until_bit,
+                        trace::rss_kib(),
                     ),
                 );
                 let r = finish_decode_chunk_with_inexact_offset(
@@ -571,8 +578,10 @@ fn consumer_loop<W: std::io::Write>(
             "consumer",
             "consume_done",
             &format!(
-                r#""partition_idx":{idx},"end_bit":{expected_start},"decoded":{}"#,
-                chunk.decoded_size()
+                r#""partition_idx":{idx},"end_bit":{expected_start},"decoded":{},"rss_kib":{},"speculative_in_flight":{}"#,
+                chunk.decoded_size(),
+                trace::rss_kib(),
+                speculative_rx.iter().filter(|r| r.is_some()).count(),
             ),
         );
         next_to_consume += 1;

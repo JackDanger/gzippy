@@ -92,6 +92,31 @@ pub fn worker_label(idx: usize) -> String {
     format!("worker-{idx}")
 }
 
+/// Read process RSS in KiB from /proc/self/status (Linux only).
+/// Returns 0 on non-Linux or read failure. Used to embed memory
+/// numbers in trace events so post-hoc analysis can correlate
+/// memory pressure with specific dispatcher actions.
+pub fn rss_kib() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    return rest
+                        .trim()
+                        .trim_end_matches(" kB")
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
+                }
+            }
+        }
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    0
+}
+
 /// Minimal JSON string escape — only what we emit (escape `"`, `\`, and
 /// control bytes by collapsing them). Sufficient for `format!("{e:?}")`
 /// output of Rust error types which can include embedded quotes from
