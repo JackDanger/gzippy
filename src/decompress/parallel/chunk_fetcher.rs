@@ -36,6 +36,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::decompress::parallel::chunk_data::{ChunkConfiguration, ChunkData};
 use crate::decompress::parallel::gzip_chunk::ChunkDecodeError;
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+use crate::decompress::parallel::trace;
 use crate::decompress::parallel::window_map::WindowMap;
 
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
@@ -198,11 +200,25 @@ impl<'a> GzipChunkFetcher<'a> {
                             break;
                         }
                         let seed = partition_offsets[idx];
+                        let label = trace::boundary_label(idx);
+                        let t0 = std::time::Instant::now();
                         let boundary = if seed >= total_bits {
                             None
                         } else {
                             Self::find_first_valid_boundary(input, seed)
                         };
+                        let dur_us = t0.elapsed().as_micros();
+                        trace::emit(
+                            &label,
+                            "boundary_done",
+                            &format!(
+                                r#""partition_idx":{idx},"seed_bit":{seed},"found_bit":{},"duration_us":{dur_us}"#,
+                                match boundary {
+                                    Some(b) => format!("{b}"),
+                                    None => "null".to_string(),
+                                }
+                            ),
+                        );
                         *results[idx].lock().unwrap() = Some(boundary);
                     });
                 }
@@ -243,17 +259,28 @@ impl<'a> GzipChunkFetcher<'a> {
                     if idx >= n {
                         break;
                     }
+                    let label = trace::worker_label(idx);
                     let Some(start) = boundaries[idx] else {
-                        continue; // no boundary found; slot stays None
+                        trace::emit(
+                            &label,
+                            "speculative_skip",
+                            &format!(r#""partition_idx":{idx},"reason":"no_boundary""#),
+                        );
+                        continue;
                     };
-                    // The until_bits for this chunk is the NEXT chunk's
-                    // start (a real boundary), or total_bits for the
-                    // last chunk.
                     let until = boundaries
                         .iter()
                         .skip(idx + 1)
                         .find_map(|b| *b)
                         .unwrap_or(total_bits);
+                    let t0 = std::time::Instant::now();
+                    trace::emit(
+                        &label,
+                        "speculative_start",
+                        &format!(
+                            r#""partition_idx":{idx},"start_bit":{start},"until_bit":{until}"#
+                        ),
+                    );
                     let result = finish_decode_chunk_with_inexact_offset(
                         input,
                         start,
@@ -261,24 +288,28 @@ impl<'a> GzipChunkFetcher<'a> {
                         &[],
                         configuration,
                     );
-                    if std::env::var("GZIPPY_DEBUG").is_ok() {
-                        match &result {
-                            Ok(c) => eprintln!(
-                                "[parallel_sm] chunk[{}] OK: start={} until={} end={} decoded={} markers={} clean={} preemptive={}",
-                                idx,
-                                start,
-                                until,
+                    let dur_us = t0.elapsed().as_micros();
+                    match &result {
+                        Ok(c) => trace::emit(
+                            &label,
+                            "speculative_ok",
+                            &format!(
+                                r#""partition_idx":{idx},"start_bit":{start},"end_bit":{},"decoded":{},"markers":{},"clean":{},"preemptive":{},"duration_us":{dur_us}"#,
                                 c.encoded_offset_bits + c.encoded_size_bits,
                                 c.decoded_size(),
                                 c.data_with_markers.len(),
                                 c.data.len(),
                                 c.stopped_preemptively,
                             ),
-                            Err(e) => eprintln!(
-                                "[parallel_sm] chunk[{}] ERR: start={} until={} err={:?}",
-                                idx, start, until, e
+                        ),
+                        Err(e) => trace::emit(
+                            &label,
+                            "speculative_err",
+                            &format!(
+                                r#""partition_idx":{idx},"start_bit":{start},"until_bit":{until},"err":"{:?}","duration_us":{dur_us}"#,
+                                e
                             ),
-                        }
+                        ),
                     }
                     *chunk_slots[idx].lock().unwrap() = Some(result);
                 });
@@ -298,13 +329,42 @@ impl<'a> GzipChunkFetcher<'a> {
             .find(|&&seed| seed > expected_start)
             .copied()
             .unwrap_or(total_bits);
-        let chunk = finish_decode_chunk_with_inexact_offset(
+        let t0 = std::time::Instant::now();
+        trace::emit(
+            "consumer",
+            "redispatch_start",
+            &format!(
+                r#""partition_idx":{idx},"expected_start":{expected_start},"until_bit":{until}"#
+            ),
+        );
+        let result = finish_decode_chunk_with_inexact_offset(
             self.input,
             expected_start,
             until,
             &[],
             self.configuration,
-        )?;
+        );
+        let dur_us = t0.elapsed().as_micros();
+        match &result {
+            Ok(c) => trace::emit(
+                "consumer",
+                "redispatch_ok",
+                &format!(
+                    r#""partition_idx":{idx},"expected_start":{expected_start},"end_bit":{},"decoded":{},"duration_us":{dur_us}"#,
+                    c.encoded_offset_bits + c.encoded_size_bits,
+                    c.decoded_size(),
+                ),
+            ),
+            Err(e) => trace::emit(
+                "consumer",
+                "redispatch_err",
+                &format!(
+                    r#""partition_idx":{idx},"expected_start":{expected_start},"err":"{:?}","duration_us":{dur_us}"#,
+                    e
+                ),
+            ),
+        }
+        let chunk = result?;
         Ok(chunk)
     }
 
@@ -345,23 +405,35 @@ impl<'a> GzipChunkFetcher<'a> {
             // re-dispatch synchronously from the authoritative position.
             let expected_start = self.last_consumed_end_bits;
             let chunk = match speculative {
-                Some(c) if c.encoded_offset_bits == expected_start => c,
+                Some(c) if c.encoded_offset_bits == expected_start => {
+                    trace::emit(
+                        "consumer",
+                        "speculative_accept",
+                        &format!(
+                            r#""partition_idx":{idx},"start_bit":{},"end_bit":{}"#,
+                            c.encoded_offset_bits,
+                            c.encoded_offset_bits + c.encoded_size_bits
+                        ),
+                    );
+                    c
+                }
                 Some(c) => {
-                    if std::env::var("GZIPPY_DEBUG").is_ok() {
-                        eprintln!(
-                            "[parallel_sm] chunk[{}] speculative start={} != expected={}; re-dispatching",
-                            idx, c.encoded_offset_bits, expected_start
-                        );
-                    }
+                    trace::emit(
+                        "consumer",
+                        "speculative_mismatch",
+                        &format!(
+                            r#""partition_idx":{idx},"speculative_start":{},"expected_start":{expected_start}"#,
+                            c.encoded_offset_bits
+                        ),
+                    );
                     self.redispatch_chunk(idx, expected_start)?
                 }
                 None => {
-                    if std::env::var("GZIPPY_DEBUG").is_ok() {
-                        eprintln!(
-                            "[parallel_sm] chunk[{}] no speculative result; re-dispatching from expected_start={}",
-                            idx, expected_start
-                        );
-                    }
+                    trace::emit(
+                        "consumer",
+                        "speculative_missing",
+                        &format!(r#""partition_idx":{idx},"expected_start":{expected_start}"#),
+                    );
                     self.redispatch_chunk(idx, expected_start)?
                 }
             };
@@ -379,7 +451,17 @@ impl<'a> GzipChunkFetcher<'a> {
             let chunk_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
 
             let mut chunk = chunk;
+            let aw_t0 = std::time::Instant::now();
+            let marker_count = chunk.data_with_markers.len();
             apply_window(&mut chunk, &window[..]);
+            trace::emit(
+                "consumer",
+                "apply_window_done",
+                &format!(
+                    r#""partition_idx":{idx},"marker_bytes":{marker_count},"duration_us":{}"#,
+                    aw_t0.elapsed().as_micros()
+                ),
+            );
 
             // Extract this chunk's last 32 KiB as the successor's window.
             let mut next_window = [0u8; 32768];
@@ -411,6 +493,14 @@ impl<'a> GzipChunkFetcher<'a> {
             }
             self.window_map.insert(chunk_end, Arc::new(next_window));
             self.last_consumed_end_bits = chunk_end;
+            trace::emit(
+                "consumer",
+                "consume_done",
+                &format!(
+                    r#""partition_idx":{idx},"end_bit":{chunk_end},"decoded":{}"#,
+                    chunk.decoded_size()
+                ),
+            );
             return Ok(chunk);
         }
     }
