@@ -389,84 +389,90 @@ fn consumer_loop<W: std::io::Write>(
     total_crc: &mut crc32fast::Hasher,
     total_size: &mut usize,
 ) -> Result<(), FetchError> {
-    let _ = (input, partition_offsets, pool_size);
+    let _ = (input, configuration);
 
-    // Pure depth-2 authoritative chain. No speculative pre-scan.
+    // Partition-seed-keyed speculative prefetch (port of rapidgzip's
+    // BlockFetcher::get / GzipChunkFetcher::processNextChunk).
     //
-    //   - pending_auth[0] is submitted at start_bit = 0 right away.
-    //   - On consume of chunk N, we know chunk N's actual end = the next
-    //     chunk's authoritative start. Submit pending_auth[N+1] before
-    //     processing chunk N's bytes so the worker decodes in parallel
-    //     with consume work (apply_window / write / window insert).
-    //   - When chunk N+1's iteration starts, pending_auth[N+1] is
-    //     usually already done. Wait, accept, consume.
+    // Each partition idx has a speculative job in flight, dispatched at
+    // partition_offsets[idx] (NOT at predecessor's actual end). The
+    // worker tries to decode at the seed, then iterates BlockFinder
+    // candidates within 512 KiB until one succeeds. The returned chunk
+    // carries:
+    //   encoded_offset_bits = partition_offsets[idx]   (requested seed)
+    //   max_encoded_offset_bits = actual candidate bit-position used.
     //
-    // Workers handle the "no real block at start_bit" case INSIDE the
-    // worker by iterating BlockFinder candidates within 512 KiB
-    // (mirrors rapidgzip's tryToDecode at GzipChunk.hpp:712-741). The
-    // returned chunk has encoded_offset_bits = requested start; the
-    // actual successful candidate is recorded in max_encoded_offset_bits.
-    let mut pending_auth: Vec<Option<mpsc::Receiver<Result<ChunkData, ChunkDecodeError>>>> =
+    // Consumer at expected_start checks the speculative result:
+    //   matches_encoded_offset(expected_start)
+    //     ⇔ seed ≤ expected_start ≤ actual_candidate
+    //     AND decoded_offset_for(expected_start).is_some()
+    //     ⇔ there's a subchunk boundary at expected_start.
+    // On hit, we trim trim_bytes and consume. On miss, we re-dispatch
+    // an AUTHORITATIVE job at expected_start (worker fast-paths because
+    // the predecessor's window is in the WindowMap), and discard the
+    // speculative.
+    //
+    // We keep `prefetch_count = 2 * pool_size` speculatives in flight at
+    // all times (matches rapidgzip's PREFETCH_COUNT default).
+    let prefetch_count = (pool_size * 2).max(1);
+
+    let mut spec: Vec<Option<mpsc::Receiver<Result<ChunkData, ChunkDecodeError>>>> =
         (0..n_partitions).map(|_| None).collect();
 
-    let mut submit_auth =
-        |idx: usize,
-         start: usize,
-         pending: &mut Vec<Option<mpsc::Receiver<Result<ChunkData, ChunkDecodeError>>>>|
-         -> Result<(), FetchError> {
-            if idx >= n_partitions || pending[idx].is_some() {
-                return Ok(());
-            }
-            let until = partition_offsets
-                .iter()
-                .skip(idx + 1)
-                .find(|&&s| s > start)
-                .copied()
-                .unwrap_or(total_bits);
-            let (tx, rx) = mpsc::channel();
-            trace::emit(
-                "consumer",
-                "authoritative_prefetch",
-                &format!(r#""partition_idx":{idx},"start_bit":{start},"until_bit":{until}"#),
-            );
-            job_tx
-                .send(DecodeJob {
-                    partition_idx: idx,
-                    start_bit: start,
-                    until_bit: until,
-                    authoritative: true,
-                    reply: tx,
-                })
-                .expect("worker pool dropped");
-            pending[idx] = Some(rx);
-            Ok(())
-        };
+    let until_for = |idx: usize| -> usize {
+        partition_offsets
+            .get(idx + 1)
+            .copied()
+            .unwrap_or(total_bits)
+    };
 
-    // Initial dispatch: chunk 0 at bit 0.
-    submit_auth(0, 0, &mut pending_auth)?;
-
-    let mut expected_start: usize = 0;
-    let mut next_to_consume: usize = 0;
-
-    while next_to_consume < n_partitions {
-        let rx = match pending_auth[next_to_consume].take() {
-            Some(rx) => rx,
-            None => {
-                // Should only happen if we never submitted; submit now.
-                submit_auth(next_to_consume, expected_start, &mut pending_auth)?;
-                pending_auth[next_to_consume]
-                    .take()
-                    .expect("just submitted")
-            }
+    let submit_job = |idx: usize,
+                      start: usize,
+                      until: usize,
+                      authoritative: bool|
+     -> mpsc::Receiver<Result<ChunkData, ChunkDecodeError>> {
+        let (tx, rx) = mpsc::channel();
+        let event = if authoritative {
+            "authoritative_prefetch"
+        } else {
+            "speculative_prefetch"
         };
         trace::emit(
             "consumer",
-            "authoritative_prefetch_wait",
-            &format!(r#""partition_idx":{next_to_consume},"expected_start":{expected_start}"#),
+            event,
+            &format!(r#""partition_idx":{idx},"start_bit":{start},"until_bit":{until}"#),
         );
-        let chunk = match rx.recv() {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => return Err(FetchError::Decode(e)),
+        job_tx
+            .send(DecodeJob {
+                partition_idx: idx,
+                start_bit: start,
+                until_bit: until,
+                authoritative,
+                reply: tx,
+            })
+            .expect("worker pool dropped");
+        rx
+    };
+
+    // Submit chunk 0 authoritative (start is known: bit 0). Also pre-fill
+    // up to prefetch_count speculatives starting at partition 1.
+    spec[0] = Some(submit_job(0, 0, until_for(0), true));
+    for i in 1..(1 + prefetch_count).min(n_partitions) {
+        spec[i] = Some(submit_job(i, partition_offsets[i], until_for(i), false));
+    }
+
+    let mut expected_start: usize = 0;
+    let mut next_spec_to_dispatch: usize = (1 + prefetch_count).min(n_partitions);
+
+    for idx in 0..n_partitions {
+        let rx = spec[idx].take().expect("spec slot was filled");
+        trace::emit(
+            "consumer",
+            "speculative_wait",
+            &format!(r#""partition_idx":{idx},"expected_start":{expected_start}"#),
+        );
+        let spec_result = match rx.recv() {
+            Ok(r) => r,
             Err(_) => {
                 return Err(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
                     requested: expected_start,
@@ -475,14 +481,83 @@ fn consumer_loop<W: std::io::Write>(
             }
         };
 
-        // Workers return chunk.encoded_offset_bits = the REQUESTED start.
-        // For range matching: matches_encoded_offset(expected_start) is
-        // always true here because we requested expected_start.
-        // decoded_offset_for(expected_start) returns Some(0) for the
-        // exact-match case (encoded_offset == expected_start) which is
-        // the rapidgzip authoritative pattern.
+        // Hit test: speculative chunk must (a) decode successfully,
+        // (b) cover expected_start, (c) have a subchunk boundary at
+        // expected_start (so decoded_offset_for resolves). Chunk 0 is
+        // authoritative (submitted with start = 0); for it, a hit is
+        // guaranteed if Ok.
+        let hit_chunk: Option<ChunkData> = match spec_result {
+            Ok(c) => {
+                if c.matches_encoded_offset(expected_start)
+                    && c.decoded_offset_for(expected_start).is_some()
+                {
+                    trace::emit(
+                        "consumer",
+                        "speculative_hit",
+                        &format!(
+                            r#""partition_idx":{idx},"expected_start":{expected_start},"seed":{},"actual":{}"#,
+                            c.encoded_offset_bits, c.max_encoded_offset_bits,
+                        ),
+                    );
+                    Some(c)
+                } else {
+                    trace::emit(
+                        "consumer",
+                        "speculative_miss",
+                        &format!(
+                            r#""partition_idx":{idx},"expected_start":{expected_start},"seed":{},"actual":{}"#,
+                            c.encoded_offset_bits, c.max_encoded_offset_bits,
+                        ),
+                    );
+                    None
+                }
+            }
+            Err(e) => {
+                // Chunk 0 was dispatched authoritative; if it fails the
+                // input is invalid. Speculative chunks may fail on
+                // phantom boundaries — fall through to authoritative.
+                if idx == 0 {
+                    return Err(FetchError::Decode(e));
+                }
+                trace::emit(
+                    "consumer",
+                    "speculative_err",
+                    &format!(
+                        r#""partition_idx":{idx},"expected_start":{expected_start},"err":"{}""#,
+                        trace::esc(&format!("{e:?}")),
+                    ),
+                );
+                None
+            }
+        };
+
+        let chunk = match hit_chunk {
+            Some(c) => c,
+            None => {
+                // Re-dispatch authoritative at expected_start. Worker
+                // will fast-path because predecessor's window is in
+                // the WindowMap (just inserted after consume of N-1).
+                let until = partition_offsets
+                    .iter()
+                    .skip(idx + 1)
+                    .find(|&&s| s > expected_start)
+                    .copied()
+                    .unwrap_or(total_bits);
+                let auth_rx = submit_job(idx, expected_start, until, true);
+                match auth_rx.recv() {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => return Err(FetchError::Decode(e)),
+                    Err(_) => {
+                        return Err(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+                            requested: expected_start,
+                            actual: 0,
+                        }));
+                    }
+                }
+            }
+        };
+
         let trim_bytes = chunk.decoded_offset_for(expected_start).unwrap_or(0);
-        let idx = next_to_consume;
 
         // Process the chunk: apply_window if markers; write bytes;
         // combine CRC; publish tail window.
@@ -554,13 +629,17 @@ fn consumer_loop<W: std::io::Write>(
                 trace::rss_kib(),
             ),
         );
-        next_to_consume += 1;
 
-        // Depth-2 prefetch: submit chunk N+1's authoritative NOW so
-        // its decode overlaps with consume work for the chunk we just
-        // wrote.
-        if next_to_consume < n_partitions {
-            submit_auth(next_to_consume, expected_start, &mut pending_auth)?;
+        // Refill the speculative pipeline: keep prefetch_count chunks
+        // outstanding ahead of the consumer.
+        if next_spec_to_dispatch < n_partitions {
+            spec[next_spec_to_dispatch] = Some(submit_job(
+                next_spec_to_dispatch,
+                partition_offsets[next_spec_to_dispatch],
+                until_for(next_spec_to_dispatch),
+                false,
+            ));
+            next_spec_to_dispatch += 1;
         }
     }
 
