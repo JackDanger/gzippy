@@ -121,35 +121,45 @@ it submits re-decode to the **thread pool** (`BaseType::get`), not inline.
 
 ---
 
-## 3. Gap matrix — current status
+## 3. Gap matrix — current status (HEAD `ab98aca`)
+
+Rewrite landed: shared WindowMap, persistent worker pool with prefetch,
+fast/slow worker paths, async authoritative re-dispatch, bfinal=1
+filter, chunked CRC prepend, v0.6 deletion. Status table:
 
 Classifications: **CORRECTNESS** wrong-output if not closed; **PERFORMANCE** correct but slow; **STRUCTURAL** affects shape only.
 
 | ID | Gap | Class | rapidgzip ref | gzippy ref | Status | Impact |
 |----|-----|-------|---------------|------------|--------|--------|
-| G1 | No async prefetch / pipelined dispatcher. Both passes run to completion before consumer reads chunk 0. | PERF / CRIT | BlockFetcher.hpp L314 (1ms poll + prefetchNewBlocks) | chunk_fetcher.rs `dispatch_all_blocking` L170 | **OPEN** | DOMINANT — dispatcher and consumer can't overlap; consumer-side re-dispatch is single-threaded. |
-| G2 | Synchronous re-dispatch on consumer thread when speculative boundary mismatches. | PERF / CRIT | GzipChunkFetcher.hpp L591-687 `getBlock` re-submits to pool | chunk_fetcher.rs `redispatch_chunk` L292 (inline) | **OPEN** | ~33/39 chunks re-dispatched serially per recent trace. |
-| G3 | Block-finder admits more false positives than rapidgzip's. | PERF | DynamicHuffman.hpp L47-49 bfinal=1 filter + L243-245 EOB check | block_finder.rs `is_valid_candidate_13` L57-70 (no bfinal filter — see decision log #1) | **OPEN** | Attempted bfinal filter (`fbfff82`) caused OOM, reverted (`0df6c1a`). Needs investigation. |
-| G4 | `validate_boundary` did a 32 KiB marker decode per candidate. | PERF | DynamicHuffman.hpp L257-263 (no trial decode) | chunk_fetcher.rs `find_first_boundary_candidate` L132-146 | **CLOSED** (`58d56ee`) | Was 50s aggregated CPU; now 2.9s. Single biggest win so far. |
-| G5 | Per-chunk 80 MiB output buffer allocation. | PERF / HIGH | GzipChunk.hpp L213 persistent 128 KiB buffer | gzip_chunk.rs L218-223 `Vec::with_capacity(max_decoded_chunk_size)` | **OPEN** | 38 chunks × 80 MiB; allocator pressure across 16 threads. |
-| G6 | Every chunk uses pure-Rust marker bootstrap before ISA-L. | PERF / HIGH | GzipChunk.hpp L432-444 (skip bootstrap when initialWindow known) | gzip_chunk.rs L142 `decode_chunk_bootstrap` (always) | **OPEN** | Worker per-chunk fixed cost ~30ms even when window IS known. |
-| G7 | `WindowMap` is consumer-only, not shared across workers. | STRUCTURAL → PERF | WindowMap.hpp L19 `mutable std::mutex` | window_map.rs L19-22 no mutex | **OPEN** | Precludes G6's fix — workers can't read predecessor's window. |
-| G8 | `IsalInflateWrapper` bypassed by production path. | STRUCTURAL | isal.hpp L253-385 full wrapper | gzip_chunk.rs L176-301 raw bindings | **OPEN** | Less granular stop control than rapidgzip. |
-| G9 | CRC built by re-narrowing u16→u8 instead of prepend on u8 view. | PERF / LOW | ChunkData.hpp L325 `CRC32Calculator::prepend` | apply_window.rs L52-55 | **OPEN** | Modest. |
-| G10 | "Next partition seed" used as `until_bits` in redispatch is a fixed grid, not a confirmed boundary. | STRUCTURAL | uses confirmed boundaries | chunk_fetcher.rs L324-330 | **OPEN** | Contributes to G2 mismatch rate. |
-| G11 | `std::thread::scope` spawns N threads per call (twice). | PERF / LOW | persistent ThreadPool (BlockFetcher.hpp L186) | chunk_fetcher.rs L190+ | **OPEN** | < 5ms per call. |
-| G12 | Chunks have subchunks recorded but consumer treats whole chunk as one. | PERF | rapidgzip splits + windows per subchunk | chunk_data.rs has Subchunk but consumer doesn't use it | **OPEN** | Larger blocking time during `apply_window`. |
-| G13 | Chunk i>0 always has `data_with_markers` prefix that must be resolved. | OK (inefficient) | rapidgzip clean-only when window known | follows from G6+G7 | **OPEN** | Closes when G6+G7 close. |
+| G1 | No async prefetch / pipelined dispatcher. | PERF / CRIT | BlockFetcher.hpp L314 | chunk_fetcher.rs `consumer_loop` prefetch_window + worker pool | **CLOSED** (`ab98aca`) | Pending bench verification. |
+| G2 | Synchronous re-dispatch on consumer thread. | PERF / CRIT | GzipChunkFetcher.hpp L591-687 | chunk_fetcher.rs `authoritative_dispatch` submits to pool | **CLOSED** (`ab98aca`) | Pending bench verification. |
+| G3 | Block-finder accepts bfinal=1 candidates. | PERF | DynamicHuffman.hpp L47-49 | block_finder.rs `is_valid_candidate_13` bfinal filter | **CLOSED** (`a889e78`) | Safe now: rejections route through async pool, not the synchronous chain that OOMed in `fbfff82`. |
+| G4 | `validate_boundary` did a 32 KiB marker decode per candidate. | PERF | DynamicHuffman.hpp L257-263 | chunk_fetcher.rs `find_first_boundary_candidate` (removed; now inline in `compute_speculative_boundaries`) | **CLOSED** (`58d56ee`) | Was 50s aggregated CPU; now 2.9s. |
+| G5 | Per-chunk 80 MiB output buffer allocation. | PERF / HIGH | GzipChunk.hpp L213 persistent 128 KiB | gzip_chunk.rs slow-path retains 80 MiB cap; fast path uses 128 KiB per `read_stream` iter | **PARTIAL** | Fast-path closes G5. Slow path (chunk 0 + cold misses) still allocates large; revisit if measurement shows it matters. |
+| G6 | Every chunk uses pure-Rust marker bootstrap. | PERF / HIGH | GzipChunk.hpp L432-444 | gzip_chunk.rs `decode_chunk_with_window` (fast path) | **CLOSED** (`ac06755`) | Workers take fast path when WindowMap has predecessor window. |
+| G7 | `WindowMap` consumer-only. | STRUCTURAL → PERF | WindowMap.hpp L19 mutex | window_map.rs `Arc<(Mutex<BTreeMap>, Condvar)>` | **CLOSED** (`ac06755`) | Shared across worker pool + consumer. |
+| G8 | `IsalInflateWrapper` bypassed. | STRUCTURAL | isal.hpp L253-385 | gzip_chunk.rs `decode_chunk_with_window` uses wrapper | **CLOSED** (`ac06755`) | Fast path uses wrapper. Slow path still uses raw bindings (kept; works). |
+| G9 | CRC built by re-narrowing u16→u8. | PERF / LOW | ChunkData.hpp L325 | apply_window.rs 4 KiB stack chunks | **CLOSED** (`a889e78`) | Minor improvement. |
+| G10 | `until_bits` in redispatch is a fixed grid. | STRUCTURAL | rapidgzip uses confirmed boundaries | chunk_fetcher.rs `authoritative_dispatch` uses next partition seed | **CLOSED** (`ab98aca`) | Range-match acceptance via `matches_encoded_offset` makes exact alignment optional. |
+| G11 | `std::thread::scope` spawns N threads per call. | PERF / LOW | persistent ThreadPool | chunk_fetcher.rs scope persists across all decode work in one `drive()` call | **CLOSED** (`ab98aca`) | Per-call instead of per-decode. |
+| G12 | Subchunk-level emission not used. | PERF | rapidgzip splits per subchunk | unchanged; chunks still emitted as whole units | **OPEN** | Would let consumer yield earlier bytes. Defer until measurement shows it matters. |
+| G13 | Chunk i>0 always has data_with_markers prefix. | follows G6+G7 | rapidgzip clean-only when window known | closes via fast-path adoption | **CLOSED** (`ac06755`) | Fast path emits clean bytes only. |
 
 ### Decision log
 
 1. **Bfinal=1 filter caused OOM** (commit `fbfff82` reverted by `0df6c1a`).
-   Rejecting bfinal=1 candidates made `find_first_candidate` scan further
-   on average; consequence not yet traced. **Next step**: re-instrument
-   to see whether (a) the scan reaches the 8 MiB radius and returns None
-   more often (raising re-dispatch count), or (b) the chunk-decoder
-   accepts a different candidate that decodes a much larger range.
-   Verify with `GZIPPY_LOG_FILE=...` + `scripts/parallel_sm_log_summary.py`.
+   Root cause now understood: rejecting bfinal=1 raised the rate of
+   "no candidate found" → consumer's synchronous redispatch chain
+   processed every chunk inline, each allocating a fresh 80 MiB output
+   buffer. The new chunk_fetcher routes rejections through the async
+   pool instead, so the same filter is now safe. Re-landed in `a889e78`.
+
+2. **One-piece rewrite over staged commits** (`ab98aca`). After the
+   first attempt to land changes phase-by-phase (G4 closed alone moved
+   bench from 0.08× → 0.19×, then G3-alone OOMed), the next attempt
+   was a single coherent rewrite that closes G1, G2, G6, G7, G8, G10,
+   G11 together — none of them are useful in isolation. The seams
+   between partial fixes were the problem.
 
 ---
 
