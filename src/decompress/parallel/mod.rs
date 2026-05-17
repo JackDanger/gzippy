@@ -33,6 +33,7 @@ pub mod gzip_format;
 pub mod inflate_wrapper;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub mod isal_huffman;
+pub mod prefetcher;
 pub mod replace_markers;
 pub mod single_member;
 pub mod statistics;
