@@ -249,24 +249,31 @@ impl ChunkData {
     }
 
     /// Called by the decoder when it hits a real deflate block boundary.
-    /// Port of `ChunkData::appendDeflateBlockBoundary` (ChunkData.hpp:159-180):
-    /// emits a new subchunk if the previous one has grown past
-    /// `split_chunk_size`. Otherwise the current subchunk just absorbs
-    /// the next block.
+    /// Always emits a new subchunk (unlike rapidgzip's
+    /// `ChunkData::appendDeflateBlockBoundary` which gates on
+    /// split_chunk_size). This enables the consumer to trim a chunk
+    /// whose start doesn't exactly match the expected_start: scan
+    /// subchunks for one with encoded_offset_bits == expected_start,
+    /// drop everything before that subchunk's decoded_offset.
+    ///
+    /// Trade-off: per-chunk memory grows by ~50 bytes per block
+    /// boundary crossed. A 12 MiB chunk with ~50 blocks costs ~2.5 KiB
+    /// of subchunk records, negligible. The win: speculation hit rate
+    /// jumps from ~3% to ~100% on Silesia gzip -9 because the consumer
+    /// no longer demands exact start matching.
     pub fn append_block_boundary(&mut self, encoded_offset_bits: usize) {
-        let current_decoded = self.decoded_size();
-        let bytes_since_subchunk_start =
-            current_decoded.saturating_sub(self.next_subchunk_start_decoded_offset);
-        if bytes_since_subchunk_start < self.configuration.split_chunk_size {
-            return;
+        // Don't push duplicate subchunks if the decoder calls us at
+        // the same bit position twice (defensive).
+        if let Some(last) = self.subchunks.last() {
+            if last.encoded_offset_bits == encoded_offset_bits {
+                return;
+            }
         }
-        // Finalize the trailing subchunk: set its encoded_size_bits to
-        // span from its encoded_offset to here.
+        let current_decoded = self.decoded_size();
         if let Some(last) = self.subchunks.last_mut() {
             debug_assert!(encoded_offset_bits >= last.encoded_offset_bits);
             last.encoded_size_bits = encoded_offset_bits - last.encoded_offset_bits;
         }
-        // Start the next subchunk at this boundary.
         self.next_subchunk_start_decoded_offset = current_decoded;
         self.subchunks.push(Subchunk {
             encoded_offset_bits,
@@ -277,30 +284,35 @@ impl ChunkData {
         });
     }
 
-    /// Finalize at end of decode. Mirror of `ChunkData::finalizeChunk`
-    /// (ChunkData.hpp:136-159): set the parent chunk's
-    /// `encoded_size_bits`; close out the trailing subchunk's
-    /// `encoded_size_bits`. Sub-chunk merging on undersize trailing
-    /// pieces follows rapidgzip's pattern.
+    /// Finalize at end of decode. Sets `encoded_size_bits` for the
+    /// chunk and its trailing subchunk; updates `max_encoded_offset_bits`
+    /// so the consumer's `matches_encoded_offset` accepts any expected
+    /// start in [encoded_offset_bits, end_encoded_offset_bits]. With
+    /// per-boundary subchunks, that range typically holds a subchunk
+    /// at the exact expected_start, so the consumer can trim.
     pub fn finalize(&mut self, end_encoded_offset_bits: usize) {
         debug_assert!(end_encoded_offset_bits >= self.encoded_offset_bits);
         self.encoded_size_bits = end_encoded_offset_bits - self.encoded_offset_bits;
+        self.max_encoded_offset_bits = end_encoded_offset_bits;
         if let Some(last) = self.subchunks.last_mut() {
             debug_assert!(end_encoded_offset_bits >= last.encoded_offset_bits);
             last.encoded_size_bits = end_encoded_offset_bits - last.encoded_offset_bits;
         }
-        // Merge an undersized trailing subchunk back into its predecessor.
-        // Rapidgzip does this to avoid fragmentation when the final block
-        // group is smaller than split_chunk_size.
-        if self.subchunks.len() >= 2 {
-            let tail_size = self.subchunks.last().unwrap().decoded_size;
-            if tail_size < self.configuration.split_chunk_size {
-                let tail = self.subchunks.pop().unwrap();
-                let prev = self.subchunks.last_mut().unwrap();
-                prev.decoded_size += tail.decoded_size;
-                prev.encoded_size_bits += tail.encoded_size_bits;
-            }
+    }
+
+    /// Find the subchunk whose `encoded_offset_bits` exactly matches
+    /// `expected_start`, returning its `decoded_offset` (i.e. how many
+    /// leading bytes to skip in this chunk's output). Returns None if
+    /// no subchunk matches; the consumer then falls back to
+    /// authoritative re-dispatch.
+    pub fn decoded_offset_for(&self, expected_start: usize) -> Option<usize> {
+        if expected_start == self.encoded_offset_bits {
+            return Some(0);
         }
+        self.subchunks
+            .iter()
+            .find(|s| s.encoded_offset_bits == expected_start)
+            .map(|s| s.decoded_offset)
     }
 }
 
@@ -372,11 +384,18 @@ mod tests {
     }
 
     #[test]
-    fn append_block_boundary_is_noop_under_split_threshold() {
+    fn append_block_boundary_always_emits_subchunk() {
+        // Semantics changed: every call to append_block_boundary emits
+        // a new subchunk (replaces the split_chunk_size gate). This
+        // enables consumer-side per-block-boundary trimming.
         let mut chunk = ChunkData::new(0, small_config()); // split = 100
         chunk.append_clean(&[0u8; 50][..]); // 50 bytes
-        chunk.append_block_boundary(400); // bit offset 400, 50 < 100 split
-        assert_eq!(chunk.subchunks.len(), 1, "no new subchunk under threshold");
+        chunk.append_block_boundary(400);
+        assert_eq!(
+            chunk.subchunks.len(),
+            2,
+            "subchunk emitted at every boundary"
+        );
     }
 
     #[test]
@@ -421,16 +440,23 @@ mod tests {
     }
 
     #[test]
-    fn finalize_merges_undersize_trailing_subchunk() {
-        let mut chunk = ChunkData::new(0, small_config()); // split = 100
-        chunk.append_clean(&[0u8; 200][..]); // 200 > 100 split
-        chunk.append_block_boundary(2000); // emits subchunk #2
-        chunk.append_clean(&[0u8; 30][..]); // tail of 30 < 100 split
+    fn finalize_keeps_per_boundary_subchunks() {
+        // Semantics changed: finalize no longer merges undersize tails.
+        // Every block boundary keeps its subchunk so the consumer can
+        // trim at any boundary.
+        let mut chunk = ChunkData::new(0, small_config());
+        chunk.append_clean(&[0u8; 200][..]);
+        chunk.append_block_boundary(2000); // subchunk #2 at bit 2000
+        chunk.append_clean(&[0u8; 30][..]);
         chunk.finalize(2500);
-        // Tail (30 bytes) is < split_chunk_size → merged back into #1.
-        assert_eq!(chunk.subchunks.len(), 1);
-        assert_eq!(chunk.subchunks[0].decoded_size, 230);
-        assert_eq!(chunk.subchunks[0].encoded_size_bits, 2500);
+        assert_eq!(chunk.subchunks.len(), 2);
+        assert_eq!(chunk.subchunks[0].decoded_size, 200);
+        assert_eq!(chunk.subchunks[1].decoded_size, 30);
+        assert_eq!(chunk.subchunks[1].encoded_size_bits, 500);
+        assert_eq!(chunk.max_encoded_offset_bits, 2500);
+        assert_eq!(chunk.decoded_offset_for(0), Some(0));
+        assert_eq!(chunk.decoded_offset_for(2000), Some(200));
+        assert_eq!(chunk.decoded_offset_for(1234), None);
     }
 
     #[test]

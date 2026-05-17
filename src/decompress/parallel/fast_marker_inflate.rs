@@ -1162,8 +1162,11 @@ mod tests {
     ///    decode terminate early on bit-aligned starts).
     ///
     /// Sized identically to the routing fixture so a regression of either
-    /// failure surfaces here without requiring the x86_64 + ISA-L gate.
+    /// failure surfaces here. Gated on the production target since the
+    /// rapidgzip-port path lives behind x86_64 + ISA-L; on other targets
+    /// decompress_parallel correctly returns TooSmall.
     #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
     fn end_to_end_low_entropy_24mb_t4_matches_oracle() {
         // Same generator as `tests::routing::tests::make_low_entropy_data`.
         let size = 24 * 1024 * 1024;

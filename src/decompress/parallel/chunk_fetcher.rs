@@ -432,31 +432,45 @@ fn consumer_loop<W: std::io::Write>(
     let mut next_to_consume: usize = 0;
 
     while next_to_consume < n_partitions {
-        // Try to find a speculative result that matches expected_start.
-        // Scan partitions in order from next_to_consume forward; first
-        // match wins. If found, drain it.
-        let mut chosen: Option<(usize, ChunkData)> = None;
+        // Try to find a speculative result that contains expected_start
+        // within its range AND has a subchunk at expected_start (so we
+        // can trim cleanly to start there). Scan partitions forward;
+        // first match wins.
+        let mut chosen: Option<(usize, ChunkData, usize)> = None; // (idx, chunk, trim_bytes)
         for i in next_to_consume..n_partitions {
             if let Some(rx_ref) = speculative_rx[i].as_ref() {
-                // Non-blocking poll: only accept results that are
-                // already ready AND match. Skip in-flight chunks.
                 match rx_ref.try_recv() {
                     Ok(Ok(c)) if c.matches_encoded_offset(expected_start) => {
-                        let _ = speculative_rx[i].take();
-                        chosen = Some((i, c));
-                        break;
+                        if let Some(trim) = c.decoded_offset_for(expected_start) {
+                            let _ = speculative_rx[i].take();
+                            chosen = Some((i, c, trim));
+                            break;
+                        } else {
+                            let _ = speculative_rx[i].take();
+                            trace::emit(
+                                "consumer",
+                                "speculative_no_subchunk",
+                                &format!(
+                                    r#""partition_idx":{i},"expected_start":{expected_start},"chunk_start":{},"chunk_end":{}"#,
+                                    c.encoded_offset_bits,
+                                    c.encoded_offset_bits + c.encoded_size_bits,
+                                ),
+                            );
+                        }
                     }
-                    Ok(Ok(_c)) => {
-                        // Speculative result didn't match; discard.
+                    Ok(Ok(c)) => {
                         let _ = speculative_rx[i].take();
                         trace::emit(
                             "consumer",
                             "speculative_discard",
-                            &format!(r#""partition_idx":{i},"expected_start":{expected_start}"#),
+                            &format!(
+                                r#""partition_idx":{i},"expected_start":{expected_start},"chunk_start":{},"chunk_end":{}"#,
+                                c.encoded_offset_bits,
+                                c.encoded_offset_bits + c.encoded_size_bits,
+                            ),
                         );
                     }
                     Ok(Err(e)) => {
-                        // Speculative result errored; discard.
                         let _ = speculative_rx[i].take();
                         trace::emit(
                             "consumer",
@@ -467,50 +481,52 @@ fn consumer_loop<W: std::io::Write>(
                             ),
                         );
                     }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        // Still in flight; can't decide yet. Don't
-                        // wait — keep scanning, then if nothing
-                        // matches, block-wait on the i==next_to_consume
-                        // slot below.
-                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => {
                         let _ = speculative_rx[i].take();
                     }
                 }
             }
             if i == next_to_consume + prefetch_window {
-                // Don't scan too far ahead; results for partitions much
-                // further out are unlikely to be ready.
                 break;
             }
         }
 
-        let (idx, chunk) = match chosen {
+        let (idx, chunk, trim_bytes) = match chosen {
             Some(c) => c,
             None => {
-                // Nothing matched in the prefetch cache. Either we have
-                // a speculative result at next_to_consume that's still
-                // in flight (block-wait on it), or none. Block-wait on
-                // next_to_consume if present; otherwise dispatch
-                // authoritative.
-                if let Some(rx) = speculative_rx[next_to_consume].take() {
+                // Nothing matched. Block-wait on next_to_consume's
+                // speculative if it's still in flight; on miss, submit
+                // an authoritative dispatch to the pool.
+                let (idx, chunk) = if let Some(rx) = speculative_rx[next_to_consume].take() {
                     match rx.recv() {
                         Ok(Ok(c)) if c.matches_encoded_offset(expected_start) => {
-                            (next_to_consume, c)
+                            if let Some(_trim) = c.decoded_offset_for(expected_start) {
+                                // Can trim — accept.
+                                (next_to_consume, c)
+                            } else {
+                                authoritative_dispatch(
+                                    input,
+                                    next_to_consume,
+                                    expected_start,
+                                    partition_offsets,
+                                    total_bits,
+                                    job_tx,
+                                    window_map,
+                                    configuration,
+                                )?
+                            }
                         }
-                        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
-                            // Speculative miss → authoritative dispatch.
-                            authoritative_dispatch(
-                                input,
-                                next_to_consume,
-                                expected_start,
-                                partition_offsets,
-                                total_bits,
-                                job_tx,
-                                window_map,
-                                configuration,
-                            )?
-                        }
+                        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => authoritative_dispatch(
+                            input,
+                            next_to_consume,
+                            expected_start,
+                            partition_offsets,
+                            total_bits,
+                            job_tx,
+                            window_map,
+                            configuration,
+                        )?,
                     }
                 } else {
                     authoritative_dispatch(
@@ -523,7 +539,9 @@ fn consumer_loop<W: std::io::Write>(
                         window_map,
                         configuration,
                     )?
-                }
+                };
+                let trim = chunk.decoded_offset_for(expected_start).unwrap_or(0);
+                (idx, chunk, trim)
             }
         };
 
@@ -557,30 +575,45 @@ fn consumer_loop<W: std::io::Write>(
             }
         }
 
-        // Write bytes in stream order.
+        // Write bytes in stream order, skipping the first `trim_bytes`
+        // bytes (which belong to the predecessor's range). Re-CRC the
+        // written slice so the final CRC matches the gzip trailer.
+        let mut written_crc = crc32fast::Hasher::new();
+        let mut remaining_skip = trim_bytes;
         if !chunk.data_with_markers.is_empty() {
-            let mut narrowed: Vec<u8> = Vec::with_capacity(chunk.data_with_markers.len());
-            for v in &chunk.data_with_markers {
-                narrowed.push(*v as u8);
+            let dwm_len = chunk.data_with_markers.len();
+            let skip_in_dwm = remaining_skip.min(dwm_len);
+            remaining_skip -= skip_in_dwm;
+            if skip_in_dwm < dwm_len {
+                let mut narrowed: Vec<u8> = Vec::with_capacity(dwm_len - skip_in_dwm);
+                for v in &chunk.data_with_markers[skip_in_dwm..] {
+                    narrowed.push(*v as u8);
+                }
+                written_crc.update(&narrowed);
+                writer
+                    .write_all(&narrowed)
+                    .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+                *total_size += narrowed.len();
             }
-            writer
-                .write_all(&narrowed)
-                .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-            *total_size += narrowed.len();
         }
         if !chunk.data.is_empty() {
-            writer
-                .write_all(&chunk.data)
-                .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-            *total_size += chunk.data.len();
+            let skip_in_data = remaining_skip.min(chunk.data.len());
+            if skip_in_data < chunk.data.len() {
+                let slice = &chunk.data[skip_in_data..];
+                written_crc.update(slice);
+                writer
+                    .write_all(slice)
+                    .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+                *total_size += slice.len();
+            }
         }
-        total_crc.combine(&chunk.crc);
+        total_crc.combine(&written_crc);
         expected_start = chunk.encoded_offset_bits + chunk.encoded_size_bits;
         trace::emit(
             "consumer",
             "consume_done",
             &format!(
-                r#""partition_idx":{idx},"end_bit":{expected_start},"decoded":{},"rss_kib":{},"speculative_in_flight":{}"#,
+                r#""partition_idx":{idx},"end_bit":{expected_start},"decoded":{},"trim_bytes":{trim_bytes},"rss_kib":{},"speculative_in_flight":{}"#,
                 chunk.decoded_size(),
                 trace::rss_kib(),
                 speculative_rx.iter().filter(|r| r.is_some()).count(),
