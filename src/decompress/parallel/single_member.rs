@@ -457,9 +457,12 @@ fn decompress_parallel_via_fetcher<W: Write>(
     let mut total_crc = crc32fast::Hasher::new();
     let mut total_size: usize = 0;
     while fetcher.has_more() {
-        let chunk = fetcher
-            .get_next_chunk()
-            .map_err(|_| ParallelError::DecodeFailed)?;
+        let chunk = fetcher.get_next_chunk().map_err(|e| {
+            if debug_enabled() {
+                eprintln!("[parallel_sm:rapidgzip] fetcher error: {e:?}");
+            }
+            ParallelError::DecodeFailed
+        })?;
         // After apply_window in the fetcher, every value in
         // data_with_markers is < 256 (a literal byte). Narrow + write
         // both segments in stream order.

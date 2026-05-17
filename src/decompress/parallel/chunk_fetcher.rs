@@ -222,6 +222,25 @@ impl<'a> GzipChunkFetcher<'a> {
                         &[],
                         configuration,
                     );
+                    if std::env::var("GZIPPY_DEBUG").is_ok() {
+                        match &result {
+                            Ok(c) => eprintln!(
+                                "[parallel_sm] chunk[{}] OK: seed={} boundary={} until={} end={} decoded={} markers={} clean={}",
+                                idx,
+                                seed,
+                                boundary,
+                                until,
+                                c.encoded_offset_bits + c.encoded_size_bits,
+                                c.decoded_size(),
+                                c.data_with_markers.len(),
+                                c.data.len(),
+                            ),
+                            Err(e) => eprintln!(
+                                "[parallel_sm] chunk[{}] ERR: seed={} boundary={} until={} err={:?}",
+                                idx, seed, boundary, until, e
+                            ),
+                        }
+                    }
                     *chunk_slots[idx].lock().unwrap() = Some(result);
                 });
             }
