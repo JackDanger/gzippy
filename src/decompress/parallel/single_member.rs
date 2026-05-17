@@ -952,45 +952,63 @@ pub(crate) fn decode_chunk_for_fetcher(
 ) -> Option<crate::decompress::parallel::chunk_data::ChunkData> {
     use crate::decompress::parallel::chunk_data::ChunkData;
 
-    // For chunks not anchored at bit 0, iterate BlockFinder candidates
-    // and trial-decode each via decode_chunk_inexact. First successful
-    // decode wins. v0.6's decode_chunk_inexact only succeeds if start
-    // is a REAL deflate boundary; iterating candidates lets us reject
-    // false positives. This is rapidgzip's decodeChunkWithRapidgzip
-    // pattern: trust a candidate; let the deflate decoder reject
-    // false positives via its own error path.
+    // Two-stage candidate selection:
+    //  1. cheap validate_boundary (32 KB ISA-L + 1-block strict marker
+    //     check). Filters most false positives without allocating per-
+    //     candidate decode buffers.
+    //  2. full decode_chunk_inexact for the single validated winner.
+    //
+    // This bounds memory: each candidate uses ~64 KB during validation,
+    // not 8 MiB per trial. Mirrors rapidgzip's validate-then-commit
+    // (see GzipChunk.hpp's BlockFinder candidate-then-decode flow).
     let _ = until_bit;
     let stop = ChunkDecodeStop::UntilEnd;
-    let candidates: Vec<usize> = if start_bit == 0 {
-        vec![0]
+    let validated_start: usize = if start_bit == 0 {
+        0
     } else {
         let finder = crate::decompress::parallel::block_finder::BlockFinder::new(deflate_data);
         let scan_end_bits = (start_bit + 8 * 1024 * 1024 * 8).min(deflate_data.len() * 8);
         let blocks = finder.find_blocks(start_bit, scan_end_bits);
-        blocks
-            .into_iter()
-            .filter(|b| b.bit_offset >= start_bit)
-            .map(|b| b.bit_offset)
-            .collect()
-    };
-    let mut cand: Option<CandidateChunk> = None;
-    for candidate_bit in &candidates {
-        let start = ChunkStart::from_bits(*candidate_bit);
-        let outcome = decode_chunk_inexact(
-            deflate_data,
-            usize::MAX,
-            start,
-            stop,
-            per_chunk_output_hint,
-            num_chunks_total,
-            false,
-        );
-        if let WorkerOutcome::Candidate(c) = outcome {
-            cand = Some(c);
-            break;
+        let mut winner: Option<usize> = None;
+        for b in blocks.iter() {
+            if b.bit_offset < start_bit {
+                continue;
+            }
+            // min_blocks=1 (not 2): single-block validation is enough on
+            // gzip -9 where blocks can be larger than the validation
+            // window. min_output_bytes=32 KiB.
+            if crate::decompress::parallel::fast_marker_inflate::validate_boundary(
+                deflate_data,
+                b.bit_offset,
+                1,
+                32 * 1024,
+                false,
+            )
+            .is_ok()
+            {
+                winner = Some(b.bit_offset);
+                break;
+            }
         }
-    }
-    let cand = cand?;
+        match winner {
+            Some(b) => b,
+            None => return None,
+        }
+    };
+    let start = ChunkStart::from_bits(validated_start);
+    let outcome = decode_chunk_inexact(
+        deflate_data,
+        usize::MAX,
+        start,
+        stop,
+        per_chunk_output_hint,
+        num_chunks_total,
+        false,
+    );
+    let cand = match outcome {
+        WorkerOutcome::Candidate(c) => c,
+        WorkerOutcome::NoDecode => return None,
+    };
     let mut chunk = ChunkData::new(cand.discovered_start.bits(), configuration);
     // data_with_markers = the marker bootstrap (u16 with cross-chunk
     // back-refs as markers). data = bootstrap_clean (u8 tail of
