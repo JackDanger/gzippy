@@ -68,6 +68,28 @@ Silesia gzip -9 (162 MB → 503 MB, T=16, neurotic homelab x86_64):
 | `88b84a4` | 383 | 0.19× | + literal `nextDeflateCandidate` LUT (regressed, fixed below) |
 | `7458880` | 344 | 0.25× | + 15-bit LUT |
 | `84883ae` | 675 | 0.45× | + BitReader refills before peek(57); hit rate 62→82% |
+| `75f5f52` | 716 | 0.40× | + skip-direct, always iterate via find_blocks; hit 90% |
+
+## Remaining bottleneck: bootstrap throughput
+
+Per-chunk breakdown on Silesia gzip -9 (T=16, 38 slow-path chunks):
+- median slow-path decode: 108 ms
+- median markers (pure-Rust marker-decode): 1.1 MB output
+- median clean (ISA-L bulk): 8.6 MB output
+- **9 chunks (24%) do EVERYTHING via bootstrap** (clean=0): never accumulate
+  a marker-free trailing 32 KiB, so handoff never triggers.
+- Pool utilization: 51% (= 4.5 sec CPU / 16 / 0.55 sec wall).
+
+Effective per-thread bootstrap throughput: ~14 MB/s output. Rapidgzip's
+deflate::Block is ~113 MB/s (= 1800 MB/s ÷ 16 if all chunks bootstrapped).
+The 8× gap is the next phase of the port: speed up `fast_marker_inflate`
+or replace with a deflate::Block-equivalent decoder.
+
+Rapidgzip's handoff condition is `cleanDataCount >= MAX_WINDOW_SIZE`
+(total clean ≥ 32 KiB), NOT "trailing 32 KiB is clean" like ours. On
+markers in last 32 KiB at handoff, getLastWindow throws via MapMarkers
+(empty previousWindow); tryToDecode catches and tries next candidate.
+Porting this exactly would let us hand off earlier in marginal cases.
 
 rapidgzip ground truth (`--verbose`):
 - Pool Efficiency 77%.
