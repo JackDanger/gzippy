@@ -78,7 +78,7 @@ pub struct DecodedSymbol {
 /// Heap-allocated to keep the 19 KB table off the stack; reused
 /// across blocks via thread-local storage in `with_thread_local`.
 pub struct IsalLitLenCode {
-    table: Box<inflate_huff_code_large>,
+    pub table: Box<inflate_huff_code_large>,
     lit_and_dist_huff: Box<[huff_code; LIT_LEN_ELEMS as usize]>,
     code_list: Box<[u32; (LIT_LEN_ELEMS as usize) + 2]>,
     valid: bool,
