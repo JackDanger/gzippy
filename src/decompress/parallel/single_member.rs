@@ -952,28 +952,45 @@ pub(crate) fn decode_chunk_for_fetcher(
 ) -> Option<crate::decompress::parallel::chunk_data::ChunkData> {
     use crate::decompress::parallel::chunk_data::ChunkData;
 
-    let start = ChunkStart::from_bits(start_bit);
-    // UntilEnd: decoder runs to BFINAL or max_decoded_chunk_size cap.
-    // Workers may decode past their partition range; the consumer's
-    // overlap reconciliation in GzipChunkFetcher::get_next_chunk
-    // drops later chunks whose range is shadowed. This is rapidgzip's
-    // pattern: speculative work can overlap, consumer dedups via the
-    // BlockMap insertion-sort.
+    // For chunks not anchored at bit 0, iterate BlockFinder candidates
+    // and trial-decode each via decode_chunk_inexact. First successful
+    // decode wins. v0.6's decode_chunk_inexact only succeeds if start
+    // is a REAL deflate boundary; iterating candidates lets us reject
+    // false positives. This is rapidgzip's decodeChunkWithRapidgzip
+    // pattern: trust a candidate; let the deflate decoder reject
+    // false positives via its own error path.
     let _ = until_bit;
     let stop = ChunkDecodeStop::UntilEnd;
-    let outcome = decode_chunk_inexact(
-        deflate_data,
-        usize::MAX,
-        start,
-        stop,
-        per_chunk_output_hint,
-        num_chunks_total,
-        false,
-    );
-    let cand = match outcome {
-        WorkerOutcome::Candidate(c) => c,
-        WorkerOutcome::NoDecode => return None,
+    let candidates: Vec<usize> = if start_bit == 0 {
+        vec![0]
+    } else {
+        let finder = crate::decompress::parallel::block_finder::BlockFinder::new(deflate_data);
+        let scan_end_bits = (start_bit + 8 * 1024 * 1024 * 8).min(deflate_data.len() * 8);
+        let blocks = finder.find_blocks(start_bit, scan_end_bits);
+        blocks
+            .into_iter()
+            .filter(|b| b.bit_offset >= start_bit)
+            .map(|b| b.bit_offset)
+            .collect()
     };
+    let mut cand: Option<CandidateChunk> = None;
+    for candidate_bit in &candidates {
+        let start = ChunkStart::from_bits(*candidate_bit);
+        let outcome = decode_chunk_inexact(
+            deflate_data,
+            usize::MAX,
+            start,
+            stop,
+            per_chunk_output_hint,
+            num_chunks_total,
+            false,
+        );
+        if let WorkerOutcome::Candidate(c) = outcome {
+            cand = Some(c);
+            break;
+        }
+    }
+    let cand = cand?;
     let mut chunk = ChunkData::new(cand.discovered_start.bits(), configuration);
     // data_with_markers = the marker bootstrap (u16 with cross-chunk
     // back-refs as markers). data = bootstrap_clean (u8 tail of
