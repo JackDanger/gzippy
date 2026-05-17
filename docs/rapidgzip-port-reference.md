@@ -209,27 +209,48 @@ predecessor's natural decode." Their 97% cache hit rate from
 hitting the prefetch cache, not from speculative starts aligning
 with natural-decode endpoints.
 
-### Next gaps (real ones, post-measurement)
+### Next attempt: depth-2 authoritative pipelining
 
-The architecture's ceiling at 0.17× rapidgzip comes from the
-serialized authoritative chain. Two viable paths to break it:
+Acceptance criteria (before/after `make bench-sm` on neurotic):
+- Byte-correct on Silesia gzip -9 (no regression).
+- gzippy MB/s ≥ 600 (~2× current 340).
+- Trace shows ≥1 chunk where chunk N+1's authoritative was already
+  in flight when chunk N consumed (new event: `authoritative_prefetch`).
 
-1. **Authoritative pipelining.** Consumer dispatches K authoritative
-   decodes in flight using predicted expected_starts; pool processes
-   them in parallel. Predictions can come from speculative chunk
-   ends — wrong predictions are re-dispatched. Even at 50% prediction
-   miss rate, K=4 cuts wall time by ~3×. Bench target: 700–900 MB/s.
+Change scope (single commit):
+- In `consumer_loop`, after a successful consume of chunk N, submit
+  chunk N+1's authoritative with expected_start = chunk N's
+  actual_end (just computed). Store its receiver in
+  `pending_auth[N+1]`.
+- When the loop advances to consume chunk N+1, check pending_auth
+  first. If present, wait on that receiver. Else fall through to the
+  existing speculative-then-authoritative logic.
+- This is a "look-ahead by 1" prefetch: while the consumer applies
+  window / writes bytes / inserts windowmap for chunk N (~5–10ms),
+  chunk N+1's worker is already decoding (~20ms fast path). Pipeline
+  depth = 2.
 
-2. **Single-pass natural-boundary scan.** Run the pure-Rust marker
-   decoder serially over the whole input once to enumerate every
-   real block boundary. Use those as authoritative starts for
-   parallel decode. Cost: ~3 seconds CPU on Silesia, but it
-   parallelizes (decoders run while scanner is still ahead). Bench
-   target: 1200+ MB/s if the scan can overlap with decodes.
+Expected mechanism:
+- consume[N] + decode[N+1] overlap.
+- Without pipelining: each chunk takes (consume_time + decode_time).
+- With pipelining: each chunk takes max(consume_time, decode_time).
+- Decode dominates (~20ms vs consume ~5ms) → ~25% wall saving.
 
-Both require structural changes; neither is a single-commit fix.
-Don't act until the next measurement-driven plan with concrete
-acceptance criteria is in this doc.
+What this does NOT close:
+- Speculative-mismatch rate stays at ~37/39 (the architectural ceiling).
+- Authoritative chain is still serial (one in-flight authoritative,
+  not many). Depth > 2 would require predictions, which we measured
+  at ~21% accuracy.
+
+If this doesn't hit ≥600 MB/s, the next attempt is:
+- Run a single-threaded marker-decoder scan ONCE upfront to enumerate
+  every natural block boundary. Use as authoritative starts for full
+  parallel decode. Cost: ~3s CPU scan, possibly overlapped with
+  decode. Bench target conditional on scan/decode overlap.
+
+Discipline: capture before-trace, implement, capture after-trace,
+compare authoritative_submit + new authoritative_prefetch counts,
+verify bench-sm number. Update this doc with results.
 
 ---
 

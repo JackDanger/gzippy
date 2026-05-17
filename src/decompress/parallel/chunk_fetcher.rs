@@ -430,6 +430,17 @@ fn consumer_loop<W: std::io::Write>(
 
     let mut expected_start: usize = 0;
     let mut next_to_consume: usize = 0;
+    // Authoritative prefetch: when the consumer finishes chunk N and
+    // knows expected_start[N+1] = N's actual end, it submits chunk
+    // N+1's authoritative dispatch IMMEDIATELY, so the worker decodes
+    // (~20 ms fast path) in parallel with the consumer's
+    // apply_window/write/insert work on chunk N (~5–10 ms). The next
+    // iteration picks up the in-flight result instead of submitting
+    // fresh and blocking. Pipeline depth = 2 over the authoritative
+    // chain. See docs/rapidgzip-port-reference.md decision log #4
+    // for why deeper pipelines don't help (21% prediction accuracy).
+    let mut pending_auth: Vec<Option<mpsc::Receiver<Result<ChunkData, ChunkDecodeError>>>> =
+        (0..n_partitions).map(|_| None).collect();
 
     while next_to_consume < n_partitions {
         // Try to find a speculative result that contains expected_start
@@ -495,14 +506,40 @@ fn consumer_loop<W: std::io::Write>(
         let (idx, chunk, trim_bytes) = match chosen {
             Some(c) => c,
             None => {
-                // Nothing matched. Block-wait on next_to_consume's
-                // speculative if it's still in flight; on miss, submit
-                // an authoritative dispatch to the pool.
-                let (idx, chunk) = if let Some(rx) = speculative_rx[next_to_consume].take() {
+                // First check the in-flight authoritative prefetch (if
+                // we eagerly submitted one after consuming chunk N-1).
+                // This is the pipelining win: while we were processing
+                // chunk N-1, the pool was decoding chunk N.
+                let (idx, chunk) = if let Some(rx) = pending_auth[next_to_consume].take() {
+                    trace::emit(
+                        "consumer",
+                        "authoritative_prefetch_wait",
+                        &format!(r#""partition_idx":{next_to_consume}"#),
+                    );
+                    match rx.recv() {
+                        Ok(Ok(c)) if c.encoded_offset_bits == expected_start => {
+                            (next_to_consume, c)
+                        }
+                        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+                            // Prefetch result is stale (expected_start
+                            // moved? shouldn't happen since we computed
+                            // it from chunk N-1's actual_end). Fall back.
+                            authoritative_dispatch(
+                                input,
+                                next_to_consume,
+                                expected_start,
+                                partition_offsets,
+                                total_bits,
+                                job_tx,
+                                window_map,
+                                configuration,
+                            )?
+                        }
+                    }
+                } else if let Some(rx) = speculative_rx[next_to_consume].take() {
                     match rx.recv() {
                         Ok(Ok(c)) if c.matches_encoded_offset(expected_start) => {
                             if let Some(_trim) = c.decoded_offset_for(expected_start) {
-                                // Can trim — accept.
                                 (next_to_consume, c)
                             } else {
                                 authoritative_dispatch(
@@ -621,8 +658,50 @@ fn consumer_loop<W: std::io::Write>(
         );
         next_to_consume += 1;
 
-        // Refill prefetch pipeline.
+        // Refill speculative prefetch pipeline.
         dispatch(&mut next_to_dispatch, &mut speculative_rx);
+
+        // Authoritative prefetch: submit chunk N+1's authoritative
+        // NOW so its decode overlaps with consume of chunk N. We know
+        // expected_start[N+1] (= chunk N's actual end). Skip if a
+        // matching speculative result is already in hand (consumer
+        // will pick it up next iteration); only prefetch when we know
+        // the speculative won't match.
+        if next_to_consume < n_partitions && pending_auth[next_to_consume].is_none() {
+            let spec_matches = speculative_rx[next_to_consume].as_ref().is_some_and(|_rx| {
+                // We can't try_recv non-destructively, so guess by
+                // checking the speculative boundary. If it equals
+                // expected_start, the speculative will likely match
+                // and we skip the prefetch.
+                speculative_boundaries[next_to_consume] == Some(expected_start)
+            });
+            if !spec_matches {
+                let until = partition_offsets
+                    .iter()
+                    .skip(next_to_consume + 1)
+                    .find(|&&s| s > expected_start)
+                    .copied()
+                    .unwrap_or(total_bits);
+                let (tx, rx) = mpsc::channel();
+                trace::emit(
+                    "consumer",
+                    "authoritative_prefetch",
+                    &format!(
+                        r#""partition_idx":{next_to_consume},"start_bit":{expected_start},"until_bit":{until}"#
+                    ),
+                );
+                job_tx
+                    .send(DecodeJob {
+                        partition_idx: next_to_consume,
+                        start_bit: expected_start,
+                        until_bit: until,
+                        authoritative: true,
+                        reply: tx,
+                    })
+                    .expect("worker pool dropped");
+                pending_auth[next_to_consume] = Some(rx);
+            }
+        }
     }
 
     Ok(())
