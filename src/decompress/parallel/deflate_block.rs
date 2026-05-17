@@ -95,7 +95,15 @@ impl From<BlockError> for io::Error {
 /// concrete inner-loop methods (`read`, `read_internal_compressed`,
 /// `read_internal_uncompressed`, `append_to_window`, `resolve_back_ref`)
 /// land in subsequent commits to keep individual changes reviewable.
-#[derive(Debug)]
+///
+/// **Huffman tables are held as fields and REUSED across blocks** —
+/// rebuilt in-place by `read_internal_compressed` via
+/// `IsalLitLenCode::rebuild_from` / `IsalDistCode::rebuild_from`. Mirror
+/// of rapidgzip's `Block<>::m_literalHC` + `m_distanceHC` members
+/// (deflate.hpp:920-925) which are persistent for the same reason: a
+/// per-block 19 KiB ISA-L table allocation dominates the critical path
+/// on small dynamic blocks. See `HuffmanCodingISAL.hpp:21-26` for the
+/// reference table layout.
 pub struct Block {
     at_end_of_block: bool,
     at_end_of_file: bool,
@@ -126,6 +134,32 @@ pub struct Block {
     /// Tracked back-references (debug instrumentation).
     pub backreferences: Vec<Backreference>,
     track_backreferences: bool,
+    /// Reusable ISA-L lit/len decode table — allocated once in
+    /// `Block::new`, rebuilt in place at the start of each compressed
+    /// block. Mirror of `HuffmanCodingISAL` member storage in
+    /// `vendor/rapidgzip/.../huffman/HuffmanCodingISAL.hpp:185-188`.
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    isal_litlen: crate::decompress::parallel::isal_huffman::IsalLitLenCode,
+    /// Reusable ISA-L distance decode table — same reuse contract as
+    /// `isal_litlen`. Mirror of `HuffmanCodingDistanceISAL`.
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    isal_dist: crate::decompress::parallel::isal_huffman::IsalDistCode,
+}
+
+impl std::fmt::Debug for Block {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Block")
+            .field("at_end_of_block", &self.at_end_of_block)
+            .field("at_end_of_file", &self.at_end_of_file)
+            .field("is_last_block", &self.is_last_block)
+            .field("compression_type", &self.compression_type)
+            .field("padding", &self.padding)
+            .field("uncompressed_size", &self.uncompressed_size)
+            .field("decoded_bytes", &self.decoded_bytes)
+            .field("literal_code_count", &self.literal_code_count)
+            .field("distance_code_count", &self.distance_code_count)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Block {
@@ -151,6 +185,10 @@ impl Block {
             distance_code_count: 0,
             backreferences: Vec::new(),
             track_backreferences: false,
+            #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+            isal_litlen: crate::decompress::parallel::isal_huffman::IsalLitLenCode::new_empty(),
+            #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+            isal_dist: crate::decompress::parallel::isal_huffman::IsalDistCode::new_empty(),
         }
     }
 
@@ -396,15 +434,128 @@ impl Block {
     /// resolve immediately by copying from `output`.
     ///
     /// On hitting END_OF_BLOCK (symbol 256), sets `at_end_of_block`.
+    ///
+    /// **On x86_64 + isal-compression**, the lit/len + distance decode
+    /// tables live as fields on `Block` (`isal_litlen`, `isal_dist`) and
+    /// are rebuilt **in place** at the start of each block. This mirrors
+    /// rapidgzip's `Block<>` members of type `HuffmanCodingISAL`
+    /// (vendor/.../gzip/deflate.hpp:920-925) — the persistent-storage +
+    /// in-place rebuild contract is what makes per-block bootstrap
+    /// affordable. Earlier code allocated a 32 K-entry canonical-Huffman
+    /// table per block (~50 MB/s); switching to the ISA-L LUT pushes
+    /// header decode towards rapidgzip's ~340 MB/s/thread.
+    ///
+    /// Other platforms fall back to the canonical-Huffman implementation
+    /// (only used by unit tests on those archs; the parallel-SM
+    /// production path is x86_64+isal-only).
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
     pub fn read_internal_compressed(
         &mut self,
         bits: &mut Bits,
         output: &mut Vec<u16>,
         n_max_to_decode: usize,
     ) -> Result<usize, BlockError> {
-        // Build per-block lit/len + distance decode tables. For Dynamic,
-        // they come from self.literal_cl + distance_code_count. For
-        // Fixed, RFC 1951 §3.2.6 specifies static lengths.
+        // Build the lit/len + distance code-length slices in scratch
+        // arrays we DON'T allocate per-call — they live on `Block`'s
+        // literal_cl Vec (already pre-sized) and the fixed-Huffman lookup
+        // returns &'static slices. Then rebuild the persistent ISA-L
+        // tables in place from those lengths.
+        let (litlen_lens, dist_lens): (&[u8], &[u8]) = match self.compression_type {
+            CompressionType::DynamicHuffman => {
+                let split = self.literal_code_count;
+                let end = split + self.distance_code_count;
+                let (lit, rest) = self.literal_cl[..end].split_at(split);
+                (lit, rest)
+            }
+            CompressionType::FixedHuffman => (
+                FIXED_LITLEN_LENGTHS_286.as_slice(),
+                FIXED_DIST_LENGTHS_30.as_slice(),
+            ),
+            _ => return Err(BlockError::InvalidCompression),
+        };
+
+        if !self.isal_litlen.rebuild_from(litlen_lens) {
+            return Err(BlockError::InvalidCodeLengths);
+        }
+        if !self.isal_dist.rebuild_from(dist_lens) {
+            return Err(BlockError::InvalidCodeLengths);
+        }
+
+        const INVALID_SYMBOL: u32 = 0x1FFF;
+        let start_len = output.len();
+        let mut emitted: usize = 0;
+        while emitted < n_max_to_decode {
+            // Decode one lit/len symbol via the ISA-L LUT — short-code
+            // fast path (12-bit lookup) handles ~98% of symbols on real
+            // data (HuffmanCodingISAL.hpp:139-151).
+            let decoded = self.isal_litlen.decode(bits);
+            if decoded.bit_count == 0 || decoded.symbol == INVALID_SYMBOL {
+                return Err(BlockError::InvalidHuffmanCode);
+            }
+            // IsalLitLenCode::decode mutates only the bit buffer's
+            // internal peek state via seekAfterPeek-like semantics;
+            // for our Bits API we consume explicitly here.
+            // Wait: actually IsalLitLenCode::decode does NOT consume
+            // bits (the port returns bit_count for the caller to handle,
+            // matching rapidgzip's seekAfterPeek pattern from
+            // HuffmanCodingISAL.hpp:143). Consume here.
+            bits.consume(decoded.bit_count);
+            let sym = decoded.symbol;
+
+            if sym < 256 {
+                output.push(sym as u16);
+                emitted += 1;
+                continue;
+            }
+            if sym == END_OF_BLOCK_SYMBOL as u32 {
+                self.at_end_of_block = true;
+                self.decoded_bytes += emitted;
+                return Ok(emitted);
+            }
+            if sym > 285 {
+                return Err(BlockError::InvalidHuffmanCode);
+            }
+            // Length code: read extra bits and resolve the length.
+            let lidx = (sym - 257) as usize;
+            let length = read_length_extra(bits, lidx)?;
+            // Distance: decode symbol + extra bits via ISA-L LUT.
+            let (dsym, dbit) = self
+                .isal_dist
+                .decode(bits)
+                .ok_or(BlockError::InvalidHuffmanCode)?;
+            bits.consume(dbit);
+            if dsym as usize >= DISTANCE_BASE.len() {
+                return Err(BlockError::InvalidHuffmanCode);
+            }
+            let distance = read_distance_extra(bits, dsym as usize)?;
+            if distance == 0 || distance > MAX_WINDOW_SIZE {
+                return Err(BlockError::ExceededWindowRange);
+            }
+            let out_pos = output.len() - start_len + self.decoded_bytes_at_block_start;
+            emit_backref(output, distance, length, out_pos)?;
+            emitted += length;
+            if self.track_backreferences {
+                self.backreferences.push(Backreference {
+                    distance: distance as u16,
+                    length: length as u16,
+                });
+            }
+        }
+        self.decoded_bytes += emitted;
+        Ok(emitted)
+    }
+
+    /// Canonical-Huffman fallback for non-x86_64 / no-ISA-L builds.
+    /// Used only by tests on other arches; the production single-member
+    /// parallel path is x86_64+isal-only. Logic identical to the ISA-L
+    /// path above.
+    #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+    pub fn read_internal_compressed(
+        &mut self,
+        bits: &mut Bits,
+        output: &mut Vec<u16>,
+        n_max_to_decode: usize,
+    ) -> Result<usize, BlockError> {
         let (litlen_lens, dist_lens) = match self.compression_type {
             CompressionType::DynamicHuffman => {
                 let lit = self.literal_cl[..self.literal_code_count].to_vec();
@@ -424,7 +575,6 @@ impl Block {
         let start_len = output.len();
         let mut emitted: usize = 0;
         while emitted < n_max_to_decode {
-            // Decode one lit/len symbol.
             let (sym, bit_count) = decode_canonical(&litlen_table, 15, bits)?;
             bits.consume(bit_count);
 
@@ -441,10 +591,8 @@ impl Block {
             if sym > 285 {
                 return Err(BlockError::InvalidHuffmanCode);
             }
-            // Length code: read extra bits and resolve the length.
             let lidx = (sym - 257) as usize;
             let length = read_length_extra(bits, lidx)?;
-            // Distance: decode symbol + extra bits.
             let (dsym, dbit) = decode_canonical(&dist_table, 15, bits)?;
             bits.consume(dbit);
             if dsym as usize >= DISTANCE_BASE.len() {
@@ -454,9 +602,6 @@ impl Block {
             if distance == 0 || distance > MAX_WINDOW_SIZE {
                 return Err(BlockError::ExceededWindowRange);
             }
-            // Emit the back-ref. If distance > current in-block position,
-            // the missing bytes become MapMarkers indices (= rapidgzip
-            // resolveBackreference's behavior when window is empty).
             let out_pos = output.len() - start_len + self.decoded_bytes_at_block_start;
             emit_backref(output, distance, length, out_pos)?;
             emitted += length;
@@ -471,6 +616,37 @@ impl Block {
         Ok(emitted)
     }
 }
+
+/// RFC 1951 §3.2.6 fixed-Huffman lit/len code lengths, truncated to 286
+/// symbols (ISA-L's LIT_LEN ceiling). Symbols 286–287 in the full table
+/// are unused in real streams. Returned as a `'static` slice so the
+/// caller doesn't allocate per block.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+static FIXED_LITLEN_LENGTHS_286: [u8; 286] = {
+    let mut lens = [0u8; 286];
+    let mut i = 0;
+    while i < 144 {
+        lens[i] = 8;
+        i += 1;
+    }
+    while i < 256 {
+        lens[i] = 9;
+        i += 1;
+    }
+    while i < 280 {
+        lens[i] = 7;
+        i += 1;
+    }
+    while i < 286 {
+        lens[i] = 8;
+        i += 1;
+    }
+    lens
+};
+
+/// RFC 1951 §3.2.6 fixed-Huffman distance code lengths (all 5).
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+static FIXED_DIST_LENGTHS_30: [u8; 30] = [5u8; 30];
 
 // ── Length / distance extra-bits tables (RFC 1951 §3.2.5) ──────────────────
 
