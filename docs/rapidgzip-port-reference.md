@@ -161,6 +161,33 @@ Classifications: **CORRECTNESS** wrong-output if not closed; **PERFORMANCE** cor
    G11 together — none of them are useful in isolation. The seams
    between partial fixes were the problem.
 
+3. **Slow-path bootstrap hang** (`d78bf9d` trace, fixed in `ff47485`).
+   First post-rewrite run on Silesia OOMed at byte 161755235 after
+   producing 11 chunks. RSS-instrumented trace showed worker-26
+   started slow_path at bit 872417560 and never emitted decode_err
+   for 24s. Root cause measured (not guessed): `fast_marker_inflate::
+   decode_loop` was passing `max_output=0` ("no limit") to
+   `decode_fixed` / `decode_dynamic`, so a phantom-boundary block whose
+   Huffman codes happened to validate would emit unbounded garbage
+   symbols. Fix: cap per-block output at 256 MiB. Bench: 205 → 340 MB/s.
+
+   Process lesson: the trace instrumentation (rss_kib + per-event
+   timestamps + per-partition lookups) made the cause findable in two
+   trace captures. Without it, this would have been hours of guessing.
+
+### Next gaps (post-rewrite)
+
+The biggest remaining lever is the speculative-mismatch rate. Current
+trace shows 38/39 chunks hit `authoritative_submit` after speculative
+discards — the consumer is then bottlenecked on serial authoritative
+dispatches even though the fast path is available. Closing this
+needs either (a) a strict BlockFinder so speculative starts almost
+always match (rapidgzip's approach), or (b) a way for the consumer to
+overlap multiple authoritative dispatches with its own apply_window
+work. The dictionary of relevant gaps moves to a `Gaps for follow-on
+work` section once measurement confirms the bottleneck. Don't act
+until traces from `ff47485` are captured + summarized.
+
 ---
 
 ## 4. Measurement infrastructure
@@ -211,7 +238,7 @@ scripts/parallel_sm_log_grep.sh /tmp/sm-current.log partition_idx=12
 | pre-port (v0.6) | ~270 | ~0.18× | Old marker pipeline (different perf characteristics) |
 | `6ac952c` | 120 | 0.08× | Initial cutover; everything sequential through re-dispatch |
 | `58d56ee` | 205 | 0.19× | Dropped validate_boundary; boundary search 50s → 2.9s CPU |
-| `0df6c1a` | (TBD) | (TBD) | Reverted bfinal=1 filter (caused OOM) |
+| `ff47485` | 340 | 0.17× | One-piece rewrite: shared WindowMap + worker pool + fast/slow paths + bfinal filter + bootstrap per-block cap. Correct ✓; rapidgzip variance is high (1080-2000 MB/s across runs). |
 
 Rapidgzip on same fixture: ~1500 MB/s.
 Goal: ≥0.99× rapidgzip.
