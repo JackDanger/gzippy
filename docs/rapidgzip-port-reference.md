@@ -252,9 +252,24 @@ workers sharing a single `Mutex<mpsc::Receiver<DecodeJob>>`
 (L129-130). `consumer_loop` keeps a `Vec<Option<Receiver>>` of in-flight
 speculative jobs per partition (L422-423), pre-fills `pool_size * 2`
 speculatives (L463-465), drains in order. On miss, re-dispatches
-authoritative at the predecessor's actual end (L573). **No `BlockMap`,
-no `Prefetcher`, no `Cache`, no `BlockFetcher`** — even though
-faithful ports of all four exist in the same module.
+authoritative at the predecessor's actual end (L573).
+
+**Partial-port status (May 2026, post commit `306c1e7`)**: `BlockFetcher`
++ `BlockMap` ARE wired. The consumer calls `block_fetcher.record_fetch`,
+`get_if_available`, `record_on_demand_fetch`, `record_prefetch_cache_*`
+and `append_subchunks_to_block_map(block_map, &chunk)` at
+`chunk_fetcher.rs:784`. What's still divergent: rapidgzip's `BlockFetcher::get`
+is the SYNCHRONOUS dispatch primitive (submits to internal `ThreadPool`,
+blocks on `std::future` until done) — gzippy's `BlockFetcher::get_if_available`
+is pure cache lookup, with the actual dispatch handled by the worker-pool +
+mpsc reply channel in `drive`/`consumer_loop`. Swapping to the rapidgzip
+single-call `get(blockOffset)` shape would require collapsing the
+spec-ring into BlockFetcher itself — deferred until the ring's perf
+contribution is measured.
+
+`Prefetcher` and `Cache` (LRU) remain unused — gzippy's `BlockFetcher`
+embeds simpler `Cache` + `PrefetchCache` of its own (`block_fetcher.rs`
+L31-49), and the spec-ring fills the `Prefetcher` role.
 
 ### B6. Block finder partitioning
 
@@ -384,54 +399,80 @@ catch case 1 or case 3.
 
 ## C. Missing pieces (rapidgzip has, gzippy doesn't)
 
-1. **`HuffmanCodingDoubleLiteralCached`** — multi-symbol pure-C++ decoder.
-2. **`HuffmanCodingShortBitsCached*` family** — fallback Huffman decoders.
-3. **`deflate::Block<>` driving production decode** — the port exists
-   in `deflate_block.rs` but no production caller invokes it.
-   `fast_marker_inflate.rs` (a from-scratch decoder) runs instead.
-4. **`deflate::Block::setInitialWindow`** — way to resume decode of a
-   chunk with a known 32 KiB window so bytes come out literal instead
-   of as markers. Not in `deflate_block.rs` and not in
-   `fast_marker_inflate.rs`.
-5. **`getLastWindow({})` raising on markers** — rapidgzip's mechanism
+Status legend: ✅ DONE · 🟡 PARTIAL · ❌ NOT STARTED · ⏭ DEFERRED-by-design
+
+1. ❌ **`HuffmanCodingDoubleLiteralCached`** — multi-symbol pure-C++ decoder.
+2. ❌ **`HuffmanCodingShortBitsCached*` family** — fallback Huffman decoders.
+3. 🟡 **`deflate::Block<>` driving production decode** — the port exists
+   in `deflate_block.rs` and is wired into the SLOW PATH bootstrap
+   (`gzip_chunk.rs::bootstrap_with_deflate_block`, post commit `d973907`).
+   The FAST PATH still uses ISA-L's `set_dict` rather than
+   `deflate::Block` seeded via `setInitialWindow` — that swap is a
+   deeper refactor, deferred.
+4. ✅ **`deflate::Block::setInitialWindow`** — landed as
+   `deflate_block::Block::set_initial_window` (commit `0417e98`,
+   May 2026). API is callable; fast-path wiring deferred (see #3).
+5. ⏭ **`getLastWindow({})` raising on markers** — rapidgzip's mechanism
    to detect "trailing 32 KiB straddles markers, can't hand off yet."
-   gzippy substitutes `CleanTailTracker`.
-6. **`BlockFetcher` wired into the production driver** — the port
-   exists in `block_fetcher.rs` but `chunk_fetcher.rs::drive` does not
-   use it. Adapter cost: see §H.
-7. **`GzipBlockFinder` (the partitioner class)** — no port file at
-   all; `drive` uses a static partition.
-8. **`BlockMap` wired into the production driver** — port exists in
-   `block_map.rs` but consumer never inserts into it.
-9. **`IndexFileFormat`** — seekable index export. Optional.
-10. **Parallel marker post-processing** — gzippy's consumer is the only
+   gzippy substitutes `CleanTailTracker`. Documented in §B3; functionally
+   equivalent; will not be re-ported.
+6. 🟡 **`BlockFetcher` wired into the production driver** — wired post
+   commit `306c1e7`. Consumer calls `record_fetch`, `get_if_available`,
+   `record_on_demand_fetch`, `record_prefetch_cache_*`. `BlockFetcher::get`
+   (synchronous dispatch primitive) is NOT — see §B5 for the deviation.
+7. ❌ **`GzipBlockFinder` (the partitioner class)** — no port file at
+   all; `drive` uses a static partition. Required for true
+   `BlockFetcher::get` parity.
+8. ✅ **`BlockMap` wired into the production driver** —
+   `append_subchunks_to_block_map(block_map, &chunk)` at
+   `chunk_fetcher.rs:784`, post commit `306c1e7`.
+9. ❌ **`IndexFileFormat`** — seekable index export. Optional.
+10. ❌ **Parallel marker post-processing** — gzippy's consumer is the only
     thread that calls `apply_window`. Rapidgzip's thread pool resolves
     markers for multiple chunks in parallel via `queueChunkForPostProcessing`.
-11. **Per-subchunk window publishing into a `BlockMap`-indexed lookup**
-    — the windows are populated (`populate_subchunk_windows` in prod)
-    and inserted into `WindowMap` at `chunk_fetcher.rs:631-637`, but
-    without a BlockMap they cannot be looked up by decoded offset.
-12. **Window sparsity / window compression in the live path** —
+11. ✅ **Per-subchunk window publishing into a `BlockMap`-indexed lookup**
+    — `populate_subchunk_windows` runs in prod (chunk_fetcher.rs:752),
+    windows are inserted into `WindowMap` at chunk_fetcher.rs:769-776,
+    and the BlockMap insertion is at chunk_fetcher.rs:784. The lookup
+    chain is now closed.
+12. ❌ **Window sparsity / window compression in the live path** —
     `CompressedVector` is unused.
-13. **`Footer` + multi-stream loop in `worker_loop`** — the types
-    exist, the wrapper methods exist, but no caller loops on
-    `END_OF_STREAM` inside the worker.
-14. **`gzip/format.hpp::determineFileTypeAndOffset`** — gzippy detects
+13. ✅ **`Footer` + multi-stream loop in `worker_loop`** — landed in
+    `gzip_chunk.rs::decode_chunk_with_window` outer-loop reset cycle
+    (L259-302), post commit `306c1e7`.
+14. ⏭ **`gzip/format.hpp::determineFileTypeAndOffset`** — gzippy detects
     BGZF / multi-member at routing layer
     (`decompress/mod.rs::classify_gzip`), not via a unified detector
-    inside the parallel SM module.
-15. **Statistics & `--verbose` output** — `FetcherStatistics` exists
-    but is never populated.
-16. **`NoBlockInRange` exception** — gzippy returns a generic
+    inside the parallel SM module. Functionally equivalent; routing-layer
+    placement is a gzippy-specific organizational choice.
+15. ❌ **Statistics & `--verbose` output** — `FetcherStatistics` is now
+    populated by `chunk_fetcher.rs` (record_get, record_prefetch, etc.)
+    but never exported/printed at the end of a run.
+16. ⏭ **`NoBlockInRange` exception** — gzippy returns a generic
     `ExactStopMissed` and handles re-dispatch through `consumer_loop`.
-17. **`finalizeChunk` subchunk merge** — gzippy never merges small
-    trailing subchunks.
-18. **`ChunkData::split` and the dedup-on-decoded-offset behavior** —
-    no port file.
-19. **`appendSubchunksToIndexes` cascade** — `block_map::append_subchunks_to_block_map`
-    exists (L205-213) but the live consumer doesn't call it.
-20. **Direct-try-at-guessed-offset on the slow path** — deleted in
+    Naming-only deviation.
+17. ⏭ **`finalizeChunk` subchunk merge** — rapidgzip has NO explicit
+    "merge" method; the merge semantic is implicit in `split(spacing)`
+    partitioning. See #18 for the deferral rationale.
+18. ⏭ **`ChunkData::split` in production** — `chunk_data.rs::split` IS
+    ported (L361-474). NOT called from production: gzippy's consumer
+    uses `decoded_offset_for(expected_start)` to find an exact-encoded
+    subchunk for speculative-trim. If `finalize` called `split(spacing)`,
+    real block boundaries that don't fall on the spacing grid would be
+    lost from `subchunks` and the speculation hit rate would collapse.
+    Documented in §B2 as a behavioral deviation that gzippy
+    intentionally retains for the speculative-trim path.
+19. ✅ **`appendSubchunksToIndexes` cascade** —
+    `block_map::append_subchunks_to_block_map` called at
+    `chunk_fetcher.rs:784`. Rapidgzip's version ALSO calls
+    `m_blockFinder->insert(...)` and maintains `m_unsplitBlocks` —
+    those depend on #7 (`GzipBlockFinder`), so still pending.
+20. ⏭ **Direct-try-at-guessed-offset on the slow path** — deleted in
     gzippy because the marker bootstrap is too lenient (B10).
+    Documented deviation, not a regression.
+21. ✅ **`appendDeflateBlockBoundary` (encoded, decoded) dedup** —
+    landed in commit `4612252` (May 2026). Was encoded-only; now
+    matches rapidgzip's pair-dedup semantic.
 
 ---
 
