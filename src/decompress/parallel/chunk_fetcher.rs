@@ -286,6 +286,28 @@ impl<'a> GzipChunkFetcher<'a> {
         });
     }
 
+    /// Synchronously decode a single chunk from `expected_start` to
+    /// the next partition's seed (or EOF). Used when the speculative
+    /// worker's boundary didn't match the predecessor's actual end_bit.
+    fn redispatch_chunk(&self, idx: usize, expected_start: usize) -> Result<ChunkData, FetchError> {
+        let total_bits = self.input.len() * 8;
+        let until = self
+            .partition_offsets
+            .iter()
+            .skip(idx + 1)
+            .find(|&&seed| seed > expected_start)
+            .copied()
+            .unwrap_or(total_bits);
+        let chunk = finish_decode_chunk_with_inexact_offset(
+            self.input,
+            expected_start,
+            until,
+            &[],
+            self.configuration,
+        )?;
+        Ok(chunk)
+    }
+
     pub fn get_next_chunk(&mut self) -> Result<ChunkData, FetchError> {
         if !self.dispatched {
             self.dispatch_all_blocking();
@@ -298,47 +320,63 @@ impl<'a> GzipChunkFetcher<'a> {
             let slot = self.chunk_slots[idx].lock().unwrap().take();
             self.next_consumer_index += 1;
 
-            let chunk = match slot {
-                Some(Ok(c)) => c,
-                Some(Err(e)) => return Err(FetchError::Decode(e)),
-                None => continue, // boundary search failed; benign skip
+            let speculative = match slot {
+                Some(Ok(c)) => Some(c),
+                Some(Err(e)) => {
+                    if std::env::var("GZIPPY_DEBUG").is_ok() {
+                        eprintln!(
+                            "[parallel_sm] chunk[{}] speculative decode failed; will re-dispatch from expected_start={}. err={:?}",
+                            idx, self.last_consumed_end_bits, e
+                        );
+                    }
+                    None
+                }
+                None => None,
             };
 
-            let chunk_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-            if chunk_end <= self.last_consumed_end_bits {
-                // Entirely shadowed by predecessor's overshoot.
-                continue;
-            }
-            if chunk.encoded_offset_bits < self.last_consumed_end_bits {
-                // Partial overlap: predecessor already supplied the
-                // overlapped bytes. Subchunk-level trimming is a
-                // follow-up — for now we drop the whole chunk. (Rare in
-                // practice: the marker bootstrap exits at the first
-                // block boundary past 32 KiB clean tail, and ISA-L
-                // stops at the first non-fixed boundary past until_bits.)
-                if std::env::var("GZIPPY_DEBUG").is_ok() {
-                    eprintln!(
-                        "[parallel_sm] chunk[{}] partial overlap: start {} < last_end {} — dropping",
-                        idx, chunk.encoded_offset_bits, self.last_consumed_end_bits
-                    );
+            // Authoritative start: chunk N+1 MUST start where chunk N
+            // ended (in compressed-bit coordinates). The speculative
+            // worker found a boundary near the partition seed via
+            // BlockFinder + validate_boundary, but those boundaries can
+            // be phantoms (positions that look valid in isolation but
+            // aren't on the natural decode path from the actual
+            // predecessor end). If the speculative start matches our
+            // expected position, accept the speculative result; if not,
+            // re-dispatch synchronously from the authoritative position.
+            let expected_start = self.last_consumed_end_bits;
+            let chunk = match speculative {
+                Some(c) if c.encoded_offset_bits == expected_start => c,
+                Some(c) => {
+                    if std::env::var("GZIPPY_DEBUG").is_ok() {
+                        eprintln!(
+                            "[parallel_sm] chunk[{}] speculative start={} != expected={}; re-dispatching",
+                            idx, c.encoded_offset_bits, expected_start
+                        );
+                    }
+                    self.redispatch_chunk(idx, expected_start)?
                 }
-                continue;
-            }
+                None => {
+                    if std::env::var("GZIPPY_DEBUG").is_ok() {
+                        eprintln!(
+                            "[parallel_sm] chunk[{}] no speculative result; re-dispatching from expected_start={}",
+                            idx, expected_start
+                        );
+                    }
+                    self.redispatch_chunk(idx, expected_start)?
+                }
+            };
 
             // Look up this chunk's seed window. Chunk 0 was pre-seeded
             // with the empty window in `new`; subsequent chunks were
             // seeded by the previous successful consume below.
             let chunk_start = chunk.encoded_offset_bits;
             let Some(window) = self.window_map.get(chunk_start) else {
-                // We dropped a predecessor (boundary-search failure or
-                // shadow). No window available; resolving markers here
-                // would corrupt the output, so return an error to make
-                // the routing layer fall back to libdeflate.
                 return Err(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
                     requested: chunk_start,
                     actual: self.last_consumed_end_bits,
                 }));
             };
+            let chunk_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
 
             let mut chunk = chunk;
             apply_window(&mut chunk, &window[..]);
