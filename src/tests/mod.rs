@@ -16,5 +16,4 @@ pub mod golden;
 pub mod hot_path;
 pub mod index;
 pub mod inflate_oracle;
-pub mod pipeline;
 pub mod routing;

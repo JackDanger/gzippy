@@ -43,7 +43,7 @@ mod tests {
     impl InflateOracle {
         fn from_gzip(gzip_data: &[u8]) -> Self {
             let header_size =
-                crate::decompress::parallel::marker_decode::skip_gzip_header(gzip_data)
+                crate::decompress::parallel::single_member::skip_gzip_header(gzip_data)
                     .expect("valid gzip header");
             let deflate_data = &gzip_data[header_size..gzip_data.len() - 8];
 
@@ -596,7 +596,7 @@ mod tests {
         for (name, gen) in patterns {
             let data = gen();
             let gz = compress_gzip(&data);
-            let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&gz)
+            let header_size = crate::decompress::parallel::single_member::skip_gzip_header(&gz)
                 .expect("valid header");
             let deflate = &gz[header_size..gz.len() - 8];
 

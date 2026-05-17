@@ -3354,7 +3354,7 @@ pub fn decompress_single_member_parallel<W: Write>(
     }
 
     // Parse gzip header
-    let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(data)?;
+    let header_size = crate::decompress::parallel::single_member::skip_gzip_header(data)?;
     let deflate_data = &data[header_size..data.len().saturating_sub(8)];
 
     // === FIRST PASS: Sequential decode to collect chunk boundaries and windows ===
@@ -5210,7 +5210,7 @@ mod optimization_tests {
         let compressed = encoder.finish().unwrap();
 
         let header_size =
-            crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed).unwrap();
+            crate::decompress::parallel::single_member::skip_gzip_header(&compressed).unwrap();
         let deflate_data = &compressed[header_size..compressed.len() - 8];
 
         let mut output = vec![0u8; original.len() + 1024];
@@ -5333,7 +5333,7 @@ mod optimization_tests {
         let compressed = encoder.finish().unwrap();
 
         let header_size =
-            crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed).unwrap();
+            crate::decompress::parallel::single_member::skip_gzip_header(&compressed).unwrap();
         let deflate_data = &compressed[header_size..compressed.len() - 8];
 
         let mut output = vec![0u8; original.len() + 1024];
@@ -5378,7 +5378,7 @@ mod optimization_tests {
         let compressed = encoder.finish().unwrap();
 
         let header_size =
-            crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed).unwrap();
+            crate::decompress::parallel::single_member::skip_gzip_header(&compressed).unwrap();
         let deflate_data = &compressed[header_size..compressed.len() - 8];
 
         // Warm up
@@ -5435,7 +5435,7 @@ mod optimization_tests {
         let compressed = encoder.finish().unwrap();
 
         let header_size =
-            crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed).unwrap();
+            crate::decompress::parallel::single_member::skip_gzip_header(&compressed).unwrap();
         let deflate_data = &compressed[header_size..compressed.len() - 8];
 
         let mut output = vec![0u8; original.len() + 1024];
@@ -5480,7 +5480,7 @@ mod optimization_tests {
         let compressed = encoder.finish().unwrap();
 
         let header_size =
-            crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed).unwrap();
+            crate::decompress::parallel::single_member::skip_gzip_header(&compressed).unwrap();
         let deflate_data = &compressed[header_size..compressed.len() - 8];
 
         let mut output = vec![0u8; original.len() + 1024];
@@ -5531,7 +5531,7 @@ mod optimization_tests {
         let compressed = encoder.finish().unwrap();
 
         let header_size =
-            crate::decompress::parallel::marker_decode::skip_gzip_header(&compressed).unwrap();
+            crate::decompress::parallel::single_member::skip_gzip_header(&compressed).unwrap();
         let deflate_data = &compressed[header_size..compressed.len() - 8];
 
         let mut output = vec![0u8; original.len() + 1024];
@@ -6594,7 +6594,7 @@ mod optimization_tests {
 
         // Decompress with our gzip preallocated function
         let mut our_out = Vec::new();
-        let our_size = crate::decompress::parallel::ultra_fast_inflate::inflate_gzip_preallocated(
+        let our_size = crate::decompress::ultra_fast_inflate::inflate_gzip_preallocated(
             &compressed,
             &mut our_out,
         )
@@ -7278,7 +7278,7 @@ mod optimization_tests {
 
         // Decompress with our function
         let mut our_out = Vec::new();
-        let result = crate::decompress::parallel::ultra_fast_inflate::inflate_gzip_preallocated(
+        let result = crate::decompress::ultra_fast_inflate::inflate_gzip_preallocated(
             &full_data,
             &mut our_out,
         );
@@ -7568,7 +7568,7 @@ mod optimization_tests {
         };
 
         // Extract deflate data (skip gzip header)
-        let header_size = match crate::decompress::parallel::marker_decode::skip_gzip_header(&data)
+        let header_size = match crate::decompress::parallel::single_member::skip_gzip_header(&data)
         {
             Ok(n) => n,
             Err(_) => {

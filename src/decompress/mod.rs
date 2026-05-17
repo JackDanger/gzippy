@@ -18,6 +18,7 @@ pub mod scan_inflate;
 pub mod simd_copy;
 pub mod simd_huffman;
 pub mod two_level_table;
+pub mod ultra_fast_inflate;
 
 use std::io::Write;
 

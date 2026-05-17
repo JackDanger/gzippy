@@ -53,6 +53,57 @@ fn debug_enabled() -> bool {
     *DEBUG.get_or_init(|| std::env::var("GZIPPY_DEBUG").is_ok())
 }
 
+/// Parse the gzip header and return the byte offset where the deflate
+/// stream starts. Rapidgzip parses the header inside `decodeChunk`'s
+/// gzip-format dispatch; we do it once at the driver level and pass
+/// the raw deflate slice to the fetcher.
+pub(crate) fn skip_gzip_header(data: &[u8]) -> io::Result<usize> {
+    if data.len() < 10 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Data too short for gzip header",
+        ));
+    }
+    if data[0] != 0x1f || data[1] != 0x8b || data[2] != 0x08 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid gzip magic",
+        ));
+    }
+    let flags = data[3];
+    let mut offset = 10;
+    // FEXTRA
+    if flags & 0x04 != 0 {
+        if offset + 2 > data.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid header"));
+        }
+        let xlen = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2 + xlen;
+    }
+    // FNAME
+    if flags & 0x08 != 0 {
+        while offset < data.len() && data[offset] != 0 {
+            offset += 1;
+        }
+        offset += 1;
+    }
+    // FCOMMENT
+    if flags & 0x10 != 0 {
+        while offset < data.len() && data[offset] != 0 {
+            offset += 1;
+        }
+        offset += 1;
+    }
+    // FHCRC
+    if flags & 0x02 != 0 {
+        offset += 2;
+    }
+    if offset > data.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid header"));
+    }
+    Ok(offset)
+}
+
 pub fn decompress_parallel<W: Write>(
     gzip_data: &[u8],
     writer: &mut W,
@@ -60,8 +111,7 @@ pub fn decompress_parallel<W: Write>(
 ) -> Result<u64, ParallelError> {
     let t0 = std::time::Instant::now();
 
-    let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(gzip_data)
-        .map_err(|_| ParallelError::InvalidHeader)?;
+    let header_size = skip_gzip_header(gzip_data).map_err(|_| ParallelError::InvalidHeader)?;
     let trailer_size = 8;
     if gzip_data.len() < header_size + trailer_size {
         return Err(ParallelError::TooSmall);
