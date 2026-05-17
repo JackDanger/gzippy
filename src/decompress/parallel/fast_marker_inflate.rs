@@ -717,6 +717,20 @@ fn decode_loop(
                 **handoff = true;
                 return Ok(());
             }
+            // Bootstrap output cap: if we've decoded >1 MB and STILL haven't
+            // accumulated a clean 32 KiB tail, this chunk's data has
+            // marker propagation that won't stop. Abort so caller can try
+            // next BlockFinder candidate or fall back to authoritative
+            // re-dispatch (worker with predecessor's actual window via
+            // ISA-L fast path is ~24x faster than running 12 MB through
+            // the pure-Rust marker decoder).
+            const BOOTSTRAP_OUTPUT_CAP: usize = 1024 * 1024;
+            if output.len() >= BOOTSTRAP_OUTPUT_CAP {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "bootstrap output cap exceeded without handoff",
+                ));
+            }
         }
 
         let bfinal = (bits.peek() & 1) != 0;
