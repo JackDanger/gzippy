@@ -1556,7 +1556,18 @@ pub mod bindings {
         #[doc = "!< Temporary buffer containing data from the\n!< input stream"]
         pub tmp_in_buffer: [u8; 328usize],
         pub tmp_out_buffer: [u8; 65824usize],
+        /* Stopping-point extension. Must match the patched C header. */
+        pub points_to_stop_at: ::std::os::raw::c_uint,
+        pub stopped_at: ::std::os::raw::c_uint,
+        pub tmp_out_stopped_at: ::std::os::raw::c_uint,
+        pub btype: u8,
     }
+    pub const ISAL_STOPPING_POINT_NONE: ::std::os::raw::c_uint = 0;
+    pub const ISAL_STOPPING_POINT_END_OF_STREAM_HEADER: ::std::os::raw::c_uint = 1;
+    pub const ISAL_STOPPING_POINT_END_OF_STREAM: ::std::os::raw::c_uint = 2;
+    pub const ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER: ::std::os::raw::c_uint = 4;
+    pub const ISAL_STOPPING_POINT_END_OF_BLOCK: ::std::os::raw::c_uint = 8;
+    pub const ISAL_STOPPING_POINT_ALL: ::std::os::raw::c_uint = 0xFFFFFFFFu32;
     #[repr(C)]
     #[derive(Copy, Clone)]
     pub union inflate_state__bindgen_ty_1 {
@@ -1616,9 +1627,11 @@ pub mod bindings {
     fn bindgen_test_layout_inflate_state() {
         const UNINIT: ::std::mem::MaybeUninit<inflate_state> = ::std::mem::MaybeUninit::uninit();
         let ptr = UNINIT.as_ptr();
+        // Patched ISA-L: original 87368 + 16 bytes for the four stopping-point
+        // fields (3 × c_uint + 1 × u8 + 3 bytes padding to alignment 4).
         assert_eq!(
             ::std::mem::size_of::<inflate_state>(),
-            87368usize,
+            87384usize,
             concat!("Size of: ", stringify!(inflate_state))
         );
         assert_eq!(
