@@ -133,7 +133,7 @@ pub fn decompress_parallel<W: Write>(
             let total = t0.elapsed();
             let mbps = total_size as f64 / total.as_secs_f64() / 1e6;
             eprintln!(
-                "[parallel_sm] total={:.1}ms isize={} ({:.0} MB/s)",
+                "[parallel_sm:v0.6] total={:.1}ms isize={} ({:.0} MB/s)",
                 total.as_secs_f64() * 1000.0,
                 expected_size,
                 mbps,
