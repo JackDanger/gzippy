@@ -24,6 +24,7 @@
 //! - `inflate_wrapper` — patched-ISA-L wrapper used by the fast path
 //!   and the post-bootstrap bulk decode.
 
+pub mod affinity_helpers;
 pub mod apply_window;
 pub mod atomic_mutex;
 pub mod block_fetcher;
