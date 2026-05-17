@@ -33,5 +33,6 @@ pub mod inflate_wrapper;
 pub mod isal_huffman;
 pub mod replace_markers;
 pub mod single_member;
+pub mod statistics;
 pub mod trace;
 pub mod window_map;

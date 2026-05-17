@@ -284,6 +284,121 @@ impl ChunkData {
         }
     }
 
+    /// Literal port of `ChunkData::split(spacing)`
+    /// (vendor/.../ChunkData.hpp:632-741). Partitions decoded data into
+    /// approximately-equal-sized subchunks of `spacing` bytes each by
+    /// choosing the recorded block boundary closest to each ideal
+    /// split point.
+    ///
+    /// Returns a fresh `Vec<Subchunk>` (does NOT mutate `self.subchunks`).
+    /// Caller can swap them in via `setSubchunks` (rapidgzip's
+    /// ChunkData.hpp:408-412 — represented here as direct field write
+    /// `chunk.subchunks = chunk.split(spacing)`).
+    ///
+    /// Panics if `spacing == 0` (mirrors rapidgzip's
+    /// `std::invalid_argument`).
+    pub fn split(&self, spacing: usize) -> Vec<Subchunk> {
+        if spacing == 0 {
+            panic!("ChunkData::split: spacing must be > 0");
+        }
+        let encoded_end_offset_bits = self.encoded_offset_bits + self.encoded_size_bits;
+        let decoded_size = self.decoded_size();
+        if self.encoded_size_bits == 0 && decoded_size == 0 {
+            return Vec::new();
+        }
+
+        let n_blocks = (decoded_size as f64 / spacing as f64).round() as usize;
+        let whole_chunk = Subchunk {
+            encoded_offset_bits: self.encoded_offset_bits,
+            decoded_offset: 0,
+            encoded_size_bits: self.encoded_size_bits,
+            decoded_size,
+            window: None,
+        };
+        if n_blocks <= 1 || self.subchunks.is_empty() {
+            return vec![whole_chunk];
+        }
+
+        let perfect_spacing = decoded_size as f64 / n_blocks as f64;
+        let mut result: Vec<Subchunk> = Vec::with_capacity(n_blocks + 1);
+        let mut last_boundary_enc = self.encoded_offset_bits;
+        let mut last_boundary_dec: usize = 0;
+
+        // Treat each `subchunk`'s (encoded_offset_bits, decoded_offset)
+        // pair as a candidate block boundary. The first subchunk's
+        // boundary is the chunk start (already represented by
+        // `last_boundary_*`); subsequent subchunks are the real
+        // candidates.
+        let boundaries: Vec<(usize, usize)> = self
+            .subchunks
+            .iter()
+            .map(|s| (s.encoded_offset_bits, s.decoded_offset))
+            .collect();
+
+        for i_subchunk in 1..n_blocks {
+            let perfect_decompressed_offset = (i_subchunk as f64 * perfect_spacing) as usize;
+            let mut closest_idx = 0usize;
+            let mut closest_diff = usize::MAX;
+            for (idx, &(_, dec)) in boundaries.iter().enumerate() {
+                let diff = dec.abs_diff(perfect_decompressed_offset);
+                if diff < closest_diff {
+                    closest_diff = diff;
+                    closest_idx = idx;
+                }
+            }
+            // Skip over duplicate decoded_offsets (pigz empty blocks),
+            // taking the LAST boundary with the same decoded_offset.
+            while closest_idx + 1 < boundaries.len()
+                && boundaries[closest_idx].1 == boundaries[closest_idx + 1].1
+            {
+                closest_idx += 1;
+            }
+            let (closest_enc, closest_dec) = boundaries[closest_idx];
+            if closest_dec <= last_boundary_dec {
+                continue;
+            }
+            if closest_enc <= last_boundary_enc {
+                panic!(
+                    "ChunkData::split: encoded offset must strictly increase with decoded offset"
+                );
+            }
+            let decoded_offset = result
+                .last()
+                .map(|s| s.decoded_offset + s.decoded_size)
+                .unwrap_or(0);
+            result.push(Subchunk {
+                encoded_offset_bits: last_boundary_enc,
+                decoded_offset,
+                encoded_size_bits: closest_enc - last_boundary_enc,
+                decoded_size: closest_dec - last_boundary_dec,
+                window: None,
+            });
+            last_boundary_enc = closest_enc;
+            last_boundary_dec = closest_dec;
+        }
+
+        // Tail subchunk from last boundary to chunk end.
+        if last_boundary_dec < decoded_size || result.is_empty() {
+            let decoded_offset = result
+                .last()
+                .map(|s| s.decoded_offset + s.decoded_size)
+                .unwrap_or(0);
+            result.push(Subchunk {
+                encoded_offset_bits: last_boundary_enc,
+                decoded_offset,
+                encoded_size_bits: encoded_end_offset_bits - last_boundary_enc,
+                decoded_size: decoded_size - last_boundary_dec,
+                window: None,
+            });
+        } else if last_boundary_dec == decoded_size {
+            if let Some(last) = result.last_mut() {
+                last.encoded_size_bits = encoded_end_offset_bits - last.encoded_offset_bits;
+            }
+        }
+
+        result
+    }
+
     /// Migrate the marker-free trailing portion of `data_with_markers`
     /// into the front of `data`. Mirror of rapidgzip's
     /// `DecodedData::cleanUnmarkedData` (vendor/.../DecodedData.hpp:492-516).
@@ -544,6 +659,36 @@ mod tests {
         assert_eq!(sc.decoded_offset, 0);
         assert_eq!(sc.decoded_size, 0);
         assert!(sc.window.is_none());
+    }
+
+    #[test]
+    fn split_returns_single_subchunk_when_spacing_exceeds_decoded() {
+        let mut chunk = ChunkData::new(0, small_config());
+        chunk.append_clean(&[0u8; 100]);
+        chunk.finalize(400);
+        // spacing = 1000, decoded = 100, n_blocks = round(0.1) = 0 → 0
+        let parts = chunk.split(1000);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].decoded_size, 100);
+    }
+
+    #[test]
+    fn split_partitions_into_approximately_equal_subchunks() {
+        let mut chunk = ChunkData::new(0, small_config());
+        // Emit a chunk with multiple block boundaries at known decoded offsets.
+        chunk.append_clean(&[0u8; 100]);
+        chunk.append_block_boundary(800);
+        chunk.append_clean(&[0u8; 100]);
+        chunk.append_block_boundary(1600);
+        chunk.append_clean(&[0u8; 100]);
+        chunk.append_block_boundary(2400);
+        chunk.append_clean(&[0u8; 100]);
+        chunk.finalize(3200);
+        // Total decoded = 400 bytes, spacing = 100 → n_blocks = 4
+        let parts = chunk.split(100);
+        assert!(!parts.is_empty());
+        let total_decoded: usize = parts.iter().map(|s| s.decoded_size).sum();
+        assert_eq!(total_decoded, 400);
     }
 
     #[test]
