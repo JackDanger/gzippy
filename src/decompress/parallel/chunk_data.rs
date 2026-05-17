@@ -563,6 +563,18 @@ impl ChunkData {
             debug_assert!(end_encoded_offset_bits >= last.encoded_offset_bits);
             last.encoded_size_bits = end_encoded_offset_bits - last.encoded_offset_bits;
         }
+        // append_block_boundary may have emitted a trailing subchunk at the
+        // chunk-end position (e.g. multi-stream END_OF_STREAM right at chunk
+        // end). Such a subchunk has zero encoded and decoded size and would
+        // duplicate the next chunk's first subchunk in the BlockMap.
+        while self.subchunks.len() > 1 {
+            let last = self.subchunks.last().unwrap();
+            if last.encoded_size_bits == 0 && last.decoded_size == 0 {
+                self.subchunks.pop();
+            } else {
+                break;
+            }
+        }
         // Mirrors rapidgzip's ChunkData::finalize calling cleanUnmarkedData
         // (vendor/.../ChunkData.hpp ~422). Cuts down apply_window's work
         // by moving any marker-free trailing region into `data`.
