@@ -408,6 +408,95 @@ fn debug_enabled() -> bool {
 /// verification happens after all chunks are written. On mismatch the caller
 /// receives `Err` but the writer may already contain partial bytes — same
 /// design as rapidgzip. `TooSmall` and `DecodeFailed` never write bytes.
+/// Rapidgzip-port-design.md step 8: drive decompression via the new
+/// GzipChunkFetcher (chunk_fetcher.rs). Gated behind
+/// `GZIPPY_USE_RAPIDGZIP_PATH=1` env var so existing tests + bench-sm
+/// runs continue to exercise the v0.6 pipeline; bench-sm can compare
+/// the two by setting the env var.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+fn decompress_parallel_via_fetcher<W: Write>(
+    gzip_data: &[u8],
+    writer: &mut W,
+    num_threads: usize,
+    t0: std::time::Instant,
+) -> Result<u64, ParallelError> {
+    use crate::decompress::parallel::chunk_data::ChunkConfiguration;
+    use crate::decompress::parallel::chunk_fetcher::GzipChunkFetcher;
+
+    let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(gzip_data)
+        .map_err(|_| ParallelError::InvalidHeader)?;
+    let trailer_size = 8;
+    if gzip_data.len() < header_size + trailer_size {
+        return Err(ParallelError::TooSmall);
+    }
+    let deflate_data = &gzip_data[header_size..gzip_data.len() - trailer_size];
+
+    let crc_offset = gzip_data.len() - 8;
+    let expected_crc = u32::from_le_bytes([
+        gzip_data[crc_offset],
+        gzip_data[crc_offset + 1],
+        gzip_data[crc_offset + 2],
+        gzip_data[crc_offset + 3],
+    ]);
+    let isize_offset = gzip_data.len() - 4;
+    let expected_size = u32::from_le_bytes([
+        gzip_data[isize_offset],
+        gzip_data[isize_offset + 1],
+        gzip_data[isize_offset + 2],
+        gzip_data[isize_offset + 3],
+    ]) as usize;
+
+    let chunk_size_bytes = 4 * 1024 * 1024;
+    let configuration = ChunkConfiguration {
+        split_chunk_size: chunk_size_bytes,
+        max_decoded_chunk_size: 20 * chunk_size_bytes,
+        crc32_enabled: true,
+    };
+    let mut fetcher = GzipChunkFetcher::new(deflate_data, num_threads, configuration);
+
+    let mut total_crc = crc32fast::Hasher::new();
+    let mut total_size: usize = 0;
+    while fetcher.has_more() {
+        let chunk = fetcher
+            .get_next_chunk()
+            .map_err(|_| ParallelError::DecodeFailed)?;
+        // After apply_window in the fetcher, every value in
+        // data_with_markers is < 256 (a literal byte). Narrow + write
+        // both segments in stream order.
+        if !chunk.data_with_markers.is_empty() {
+            let mut narrowed: Vec<u8> = Vec::with_capacity(chunk.data_with_markers.len());
+            for v in &chunk.data_with_markers {
+                narrowed.push(*v as u8);
+            }
+            writer.write_all(&narrowed).map_err(ParallelError::Io)?;
+            total_size += narrowed.len();
+        }
+        if !chunk.data.is_empty() {
+            writer.write_all(&chunk.data).map_err(ParallelError::Io)?;
+            total_size += chunk.data.len();
+        }
+        total_crc.combine(&chunk.crc);
+    }
+
+    if total_size != expected_size {
+        return Err(ParallelError::SizeMismatch);
+    }
+    if total_crc.clone().finalize() != expected_crc {
+        return Err(ParallelError::CrcMismatch);
+    }
+
+    MARKER_PIPELINE_RUNS.fetch_add(1, Ordering::Relaxed);
+    if debug_enabled() {
+        let total = t0.elapsed();
+        eprintln!(
+            "[parallel_sm:rapidgzip] total={:.1}ms isize={}",
+            total.as_secs_f64() * 1000.0,
+            expected_size
+        );
+    }
+    Ok(total_size as u64)
+}
+
 pub fn decompress_parallel<W: Write>(
     gzip_data: &[u8],
     writer: &mut W,
@@ -426,6 +515,17 @@ pub fn decompress_parallel<W: Write>(
     if deflate_data.len() < MIN_PARALLEL_SIZE || num_threads < MIN_THREADS_FOR_PARALLEL {
         return Err(ParallelError::TooSmall);
     }
+
+    // Step 8 of the rapidgzip port (rapidgzip-port-design.md): when
+    // GZIPPY_USE_RAPIDGZIP_PATH=1, route through the new
+    // GzipChunkFetcher pipeline instead of the v0.6 marker pipeline.
+    // Lets `make bench-sm` A/B compare the two implementations on
+    // identical input before the v0.6 scaffolding is deleted in step 9.
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    if std::env::var("GZIPPY_USE_RAPIDGZIP_PATH").is_ok() {
+        return decompress_parallel_via_fetcher(gzip_data, writer, num_threads, t0);
+    }
+    let _ = t0;
 
     // Trailer: gzip stores CRC32 then ISIZE (little-endian) in the last 8 bytes.
     let crc_offset = gzip_data.len() - 8;
