@@ -2236,7 +2236,7 @@ isal_inflate_stateless(struct inflate_state *state)
 }
 
 int
-isal_inflate(struct inflate_state *state)
+isal_inflate(struct inflate_state * const state)
 {
 
         uint8_t *start_out = state->next_out;
@@ -2244,9 +2244,31 @@ isal_inflate(struct inflate_state *state)
         uint32_t copy_size = 0;
         int32_t shift_size = 0;
         int ret = 0;
-        /* Stopping-point extension: reset per-call status so the caller
-         * gets a fresh reading from this invocation only. */
+
         state->stopped_at = ISAL_STOPPING_POINT_NONE;
+
+        /* First, copy from the internal output buffer before setting stopped_at to the real stopping point. */
+        if (state->tmp_out_stopped_at != ISAL_STOPPING_POINT_NONE) {
+                /* Copy data from tmp_out buffer into out_buffer */
+                uint32_t copy_size = state->tmp_out_valid - state->tmp_out_processed;
+                if (copy_size > state->avail_out)
+                        copy_size = state->avail_out;
+
+                memcpy(state->next_out,
+                       &state->tmp_out_buffer[state->tmp_out_processed], copy_size);
+
+                state->tmp_out_processed += copy_size;
+                state->avail_out -= copy_size;
+                state->next_out += copy_size;
+
+                state->total_out += copy_size;
+
+                if (state->tmp_out_valid == state->tmp_out_processed) {
+                        state->stopped_at = state->tmp_out_stopped_at;
+                        state->tmp_out_stopped_at = ISAL_STOPPING_POINT_NONE;
+                }
+                return ISAL_DECOMP_OK;
+        }
 
         if (!state->wrapper_flag && state->crc_flag == IGZIP_GZIP) {
                 struct isal_gzip_header gz_hdr;
@@ -2257,6 +2279,12 @@ isal_inflate(struct inflate_state *state)
                         return ret;
                 else if (ret > 0)
                         return ISAL_DECOMP_OK;
+
+                if ((ret == 0) && (state->points_to_stop_at & ISAL_STOPPING_POINT_END_OF_STREAM_HEADER)) {
+                        state->stopped_at = ISAL_STOPPING_POINT_END_OF_STREAM_HEADER;
+                        return ISAL_DECOMP_OK;
+                }
+
         } else if (!state->wrapper_flag && state->crc_flag == IGZIP_ZLIB) {
                 struct isal_zlib_header z_hdr;
 
@@ -2270,6 +2298,11 @@ isal_inflate(struct inflate_state *state)
                 if (z_hdr.dict_flag) {
                         state->dict_id = z_hdr.dict_id;
                         return ISAL_NEED_DICT;
+                }
+
+                if ((ret == 0) && (state->points_to_stop_at & ISAL_STOPPING_POINT_END_OF_STREAM_HEADER)) {
+                        state->stopped_at = ISAL_STOPPING_POINT_END_OF_STREAM_HEADER;
+                        return ISAL_DECOMP_OK;
                 }
         } else if (state->block_state == ISAL_CHECKSUM_CHECK) {
                 switch (state->crc_flag) {
@@ -2286,57 +2319,92 @@ isal_inflate(struct inflate_state *state)
                 return (ret > 0) ? ISAL_DECOMP_OK : ret;
         }
 
+    /* This is used to implement the stopping point feature. In order to exist the complex loop,
+     * it simply saves off all input buffer values to feign having run out of input data.
+     * Before returning, the buffers are then restored. */
+        int read_buffer_has_been_saved = 0;
+        uint8_t *next_in = NULL;
+        uint64_t read_in = 0;
+        uint32_t avail_in = 0;
+        int32_t read_in_length = 0;
+        int16_t tmp_in_size = 0;
+        uint8_t tmp_in_buffer[ISAL_DEF_MAX_HDR_SIZE];
+
+    /* These are used to determine whether a call made progress to decide whether a stopping point
+     * request needs to be executed. */
+        int32_t old_read_in_length = 0;
+        uint32_t old_avail_in = 0;
+        int made_progress = 0;
+
         if (state->block_state != ISAL_BLOCK_FINISH) {
                 state->total_out += state->tmp_out_valid - state->tmp_out_processed;
                 /* If space in tmp_out buffer, decompress into the tmp_out_buffer */
                 if (state->tmp_out_valid < 2 * ISAL_DEF_HIST_SIZE) {
                         /* Setup to start decoding into temp buffer */
                         state->next_out = &state->tmp_out_buffer[state->tmp_out_valid];
-                        state->avail_out = sizeof(state->tmp_out_buffer) - ISAL_LOOK_AHEAD -
-                                           state->tmp_out_valid;
+                        state->avail_out =
+                            sizeof(state->tmp_out_buffer) - ISAL_LOOK_AHEAD -
+                            state->tmp_out_valid;
 
                         if ((int32_t) state->avail_out < 0)
                                 state->avail_out = 0;
 
                         /* Decode into internal buffer until exit */
                         while (state->block_state != ISAL_BLOCK_INPUT_DONE) {
-                                if (state->block_state == ISAL_BLOCK_NEW_HDR ||
-                                    state->block_state == ISAL_BLOCK_HDR) {
-                                        ret = read_header_stateful(state);
+                                if (state->block_state == ISAL_BLOCK_NEW_HDR
+                                    || state->block_state == ISAL_BLOCK_HDR) {
+                                        old_read_in_length = state->read_in_length;
+                                        old_avail_in = state->avail_in;
 
-                                        if (ret)
-                                                break;
-                                        /* Stopping-point extension: caller requested a stop
-                                         * after every block header. The header has been parsed;
-                                         * state->btype reflects the just-parsed block type. */
-                                        if (state->points_to_stop_at &
-                                            ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER) {
-                                                state->stopped_at =
-                                                    ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER;
+                                        /* Will also return 0 if it hasn't read anything, it seems. */
+                                        ret = read_header_stateful(state);
+                                        made_progress = (old_read_in_length != state->read_in_length) || (old_avail_in != state->avail_in);
+                                        if (made_progress && (ret == 0)
+                                                && (state->points_to_stop_at & ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER)) {
+                                                state->stopped_at = ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER;
                                                 break;
                                         }
+                                        if (ret)
+                                                break;
                                 }
 
+                                old_read_in_length = state->read_in_length;
+                                old_avail_in = state->avail_in;
+                                int is_empty_literal_block = 0;
+
                                 if (state->block_state == ISAL_BLOCK_TYPE0) {
+                                        is_empty_literal_block = state->type0_block_len == 0;
                                         ret = decode_literal_block(state);
                                 } else {
                                         uint8_t *tmp = state->tmp_out_buffer;
                                         ret = decode_huffman_code_block_stateless(state, tmp);
                                 }
 
-                                if (ret)
-                                        break;
-                                /* Stopping-point extension: caller requested a stop after
-                                 * every block body finishes. The decode just transitioned
-                                 * the state machine to NEW_HDR (next block) or INPUT_DONE
-                                 * (after BFINAL=1). */
-                                if ((state->block_state == ISAL_BLOCK_NEW_HDR ||
-                                     state->block_state == ISAL_BLOCK_INPUT_DONE) &&
-                                    (state->points_to_stop_at &
-                                     ISAL_STOPPING_POINT_END_OF_BLOCK)) {
+                                made_progress = is_empty_literal_block
+                                                || (old_read_in_length != state->read_in_length)
+                                                || (old_avail_in != state->avail_in);
+                                if (made_progress && (ret == 0) && (state->points_to_stop_at & ISAL_STOPPING_POINT_END_OF_BLOCK)) {
                                         state->stopped_at = ISAL_STOPPING_POINT_END_OF_BLOCK;
                                         break;
                                 }
+
+                                if (ret)
+                                        break;
+                        }
+
+                        if (!read_buffer_has_been_saved && (state->stopped_at != ISAL_STOPPING_POINT_NONE)) {
+                                read_buffer_has_been_saved = 1;
+
+                                next_in        = state->next_in;
+                                read_in        = state->read_in;
+                                avail_in       = state->avail_in;
+                                read_in_length = state->read_in_length;
+                                tmp_in_size    = state->tmp_in_size;
+                                memcpy(tmp_in_buffer, state->tmp_in_buffer, sizeof(tmp_in_buffer));
+
+                                state->avail_in = 0;
+                                state->read_in_length = 0;
+                                state->tmp_in_size = 0;
                         }
 
                         /* Copy valid data from internal buffer into out_buffer */
@@ -2383,41 +2451,81 @@ isal_inflate(struct inflate_state *state)
                         state->total_out -= state->tmp_out_valid - state->tmp_out_processed;
                         if (state->crc_flag)
                                 update_checksum(state, start_out, state->next_out - start_out);
-                        return ret;
+                        goto stop_inflate_and_return;
                 }
 
-                /* If all data from tmp_out buffer has been processed, start
-                 * decompressing into the out buffer */
-                if (state->tmp_out_processed == state->tmp_out_valid) {
+                /**
+                 * If all data from tmp_out buffer has been processed, start decompressing into the out buffer.
+                 * Check that the input has not been cleared because of a stopping point because for some reason,
+                 * this might lead to read_header_stateful being called with avail_in == 0, tmp_in_size == 0, and
+                 * readin_in_length == 0. And even so, it will overwrite bfinal and probably other members with bogus
+                 * values because it does not check for an empty input buffer for some reason.
+                 * @verbatim
+                 * [IsalInflateWrapper] call isal_inflate at offset: 5546687
+                 *   isal_inflate
+                 *     decode_huffman_code_block_stateless
+                 *     empty out inputs
+                 *     read_header_stateful 2 avail_in 0, read_in_length: 0, tmp_in_size: 0, final: 0
+                 *         returned with: avail_in 0, read_in_length: 0, tmp_in_size: 0, final: 1, ret: 1
+                 *     -> now at offset: 5551066
+                 * @endverbatim
+                 * As tested on random-dna.gz
+                 */
+                if ((state->tmp_out_processed == state->tmp_out_valid) && !read_buffer_has_been_saved) {
                         while (state->block_state != ISAL_BLOCK_INPUT_DONE) {
-                                if (state->block_state == ISAL_BLOCK_NEW_HDR ||
-                                    state->block_state == ISAL_BLOCK_HDR) {
+                                if (state->block_state == ISAL_BLOCK_NEW_HDR
+                                    || state->block_state == ISAL_BLOCK_HDR) {
+                                        old_read_in_length = state->read_in_length;
+                                        old_avail_in = state->avail_in;
+
                                         ret = read_header_stateful(state);
                                         if (ret)
                                                 break;
-                                        /* Stopping-point extension. */
-                                        if (state->points_to_stop_at &
-                                            ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER) {
-                                                state->stopped_at =
-                                                    ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER;
+
+                                        made_progress = (old_read_in_length != state->read_in_length) || (old_avail_in != state->avail_in);
+                                        if (made_progress && (ret == 0)
+                                                && (state->points_to_stop_at & ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER)) {
+                                                state->stopped_at = ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER;
                                                 break;
                                         }
                                 }
 
-                                if (state->block_state == ISAL_BLOCK_TYPE0)
+                                old_read_in_length = state->read_in_length;
+                                old_avail_in = state->avail_in;
+                                int is_empty_literal_block = 0;
+
+                                if (state->block_state == ISAL_BLOCK_TYPE0) {
+                                        is_empty_literal_block = state->type0_block_len == 0;
                                         ret = decode_literal_block(state);
-                                else
+                                } else {
                                         ret = decode_huffman_code_block_stateless(state, start_out);
-                                if (ret)
-                                        break;
-                                /* Stopping-point extension. */
-                                if ((state->block_state == ISAL_BLOCK_NEW_HDR ||
-                                     state->block_state == ISAL_BLOCK_INPUT_DONE) &&
-                                    (state->points_to_stop_at &
-                                     ISAL_STOPPING_POINT_END_OF_BLOCK)) {
+                                }
+
+                                made_progress = is_empty_literal_block
+                                                || (old_read_in_length != state->read_in_length)
+                                                || (old_avail_in != state->avail_in);
+                                if (made_progress && (ret == 0) && (state->points_to_stop_at & ISAL_STOPPING_POINT_END_OF_BLOCK)) {
                                         state->stopped_at = ISAL_STOPPING_POINT_END_OF_BLOCK;
                                         break;
                                 }
+
+                                if (ret)
+                                        break;
+                        }
+
+                        if (!read_buffer_has_been_saved && (state->stopped_at != ISAL_STOPPING_POINT_NONE)) {
+                                read_buffer_has_been_saved = 1;
+
+                                next_in        = state->next_in;
+                                read_in        = state->read_in;
+                                avail_in       = state->avail_in;
+                                read_in_length = state->read_in_length;
+                                tmp_in_size    = state->tmp_in_size;
+                                memcpy(tmp_in_buffer, state->tmp_in_buffer, sizeof(tmp_in_buffer));
+
+                                state->avail_in = 0;
+                                state->read_in_length = 0;
+                                state->tmp_in_size = 0;
                         }
                 }
 
@@ -2472,6 +2580,12 @@ isal_inflate(struct inflate_state *state)
                         return ret;
                 }
 
+                if (ret == ISAL_INVALID_LOOKBACK || ret == ISAL_INVALID_BLOCK
+                    || ret == ISAL_INVALID_SYMBOL) {
+                        state->total_out -= state->tmp_out_valid - state->tmp_out_processed;
+                        goto stop_inflate_and_return;
+                }
+
                 if (state->block_state == ISAL_BLOCK_INPUT_DONE &&
                     state->tmp_out_valid == state->tmp_out_processed) {
                         state->block_state = ISAL_BLOCK_FINISH;
@@ -2495,6 +2609,22 @@ isal_inflate(struct inflate_state *state)
                 }
 
                 state->total_out -= state->tmp_out_valid - state->tmp_out_processed;
+        }
+
+stop_inflate_and_return:
+
+        if (read_buffer_has_been_saved) {
+                state->next_in        = next_in;
+                state->read_in        = read_in;
+                state->avail_in       = avail_in;
+                state->read_in_length = read_in_length;
+                state->tmp_in_size    = tmp_in_size;
+                memcpy(state->tmp_in_buffer, tmp_in_buffer, sizeof(tmp_in_buffer));
+        }
+
+        if ((state->stopped_at != ISAL_STOPPING_POINT_NONE) && (state->tmp_out_valid != state->tmp_out_processed)) {
+                state->tmp_out_stopped_at = state->stopped_at;
+                state->stopped_at = ISAL_STOPPING_POINT_NONE;
         }
 
         return (ret > 0) ? ISAL_DECOMP_OK : ret;
