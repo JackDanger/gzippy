@@ -284,6 +284,57 @@ impl ChunkData {
         }
     }
 
+    /// Populate the `window` field of every subchunk with the 32 KiB
+    /// window required to resume decode at that subchunk's start.
+    /// Must be called AFTER `apply_window` resolves markers — the
+    /// per-subchunk windows are derived from the chunk's own resolved
+    /// output prefixed by the predecessor's tail window.
+    ///
+    /// Literal port of the window-emplacement step in rapidgzip's
+    /// `appendSubchunksToIndexes` cascade
+    /// (vendor/.../GzipChunkFetcher.hpp:560-580): for each subchunk's
+    /// `decodedOffset`, the window is the 32 KiB immediately preceding
+    /// that offset in the concatenated `predecessor_window ++ data_with_markers ++ data`.
+    pub fn populate_subchunk_windows(&mut self, predecessor_window: &[u8]) {
+        const W: usize = 32768;
+        debug_assert_eq!(predecessor_window.len(), W);
+        debug_assert!(
+            self.data_with_markers.iter().all(|v| *v < MARKER_BASE),
+            "populate_subchunk_windows requires apply_window already ran"
+        );
+
+        for sc in self.subchunks.iter_mut() {
+            // Build window for offset `sc.decoded_offset`. Source bytes
+            // come from (predecessor_window | data_with_markers | data),
+            // taking the last 32 KiB before `sc.decoded_offset`.
+            let mut window = [0u8; W];
+            // Total bytes available before sc.decoded_offset is
+            // predecessor_window.len() (=W) + sc.decoded_offset.
+            let needed_start = (W + sc.decoded_offset).saturating_sub(W);
+            // needed_start = sc.decoded_offset (since predecessor adds W).
+            // Position within the concatenated source:
+            //   [0, W)               → predecessor_window[i]
+            //   [W, W + dwm_len)     → data_with_markers[i - W] as u8
+            //   [W + dwm_len, end)   → data[i - W - dwm_len]
+            let dwm_len = self.data_with_markers.len();
+            for (i, slot) in window.iter_mut().enumerate() {
+                let abs = needed_start + i;
+                *slot = if abs < W {
+                    predecessor_window[abs]
+                } else if abs - W < dwm_len {
+                    self.data_with_markers[abs - W] as u8
+                } else {
+                    let data_idx = abs - W - dwm_len;
+                    // For subchunks beyond data.len(), pad with zeros
+                    // (shouldn't happen for well-formed chunks since
+                    // sc.decoded_offset ≤ decoded_size).
+                    self.data.get(data_idx).copied().unwrap_or(0)
+                };
+            }
+            sc.window = Some(Arc::new(window));
+        }
+    }
+
     /// Literal port of `ChunkData::appendFooter`
     /// (vendor/rapidgzip/.../ChunkData.hpp:472-489). Records that a gzip
     /// stream ended at `end_bit_offset` (= byte position immediately

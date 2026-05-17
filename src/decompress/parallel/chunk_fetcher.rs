@@ -608,6 +608,10 @@ fn consumer_loop<W: std::io::Write>(
             let aw_t0 = std::time::Instant::now();
             let marker_count = chunk.data_with_markers.len();
             apply_window(&mut chunk, &window[..]);
+            // Literal port of `appendSubchunksToIndexes` window
+            // emplacement (vendor/.../GzipChunkFetcher.hpp:560-580):
+            // each subchunk gets its 32 KiB resume-window populated.
+            chunk.populate_subchunk_windows(&window[..]);
             trace::emit(
                 "consumer",
                 "apply_window_done",
@@ -619,6 +623,18 @@ fn consumer_loop<W: std::io::Write>(
             if let Some(tail) = chunk.last_32kib_window() {
                 let end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
                 window_map.insert(end_bit, Arc::new(tail));
+            }
+            // Publish per-subchunk windows so future workers waiting on
+            // an intermediate subchunk's bit position can fast-path.
+            // Mirrors rapidgzip's per-subchunk WindowMap emplacement
+            // (GzipChunkFetcher.hpp:572-580).
+            for sc in &chunk.subchunks {
+                if let Some(ref w) = sc.window {
+                    let sc_end_bit = sc.encoded_offset_bits + sc.encoded_size_bits;
+                    if sc_end_bit > sc.encoded_offset_bits {
+                        window_map.insert(sc_end_bit, w.clone());
+                    }
+                }
             }
         }
 
