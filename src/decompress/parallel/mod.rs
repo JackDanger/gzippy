@@ -20,6 +20,7 @@
 //! - `ultra_fast_inflate` — pre-allocated full-buffer inflate helper used by
 //!   `marker_decode` and a handful of bgzf benches.
 
+pub mod apply_window;
 pub mod block_finder;
 pub mod chunk_data;
 pub mod fast_marker_inflate;
