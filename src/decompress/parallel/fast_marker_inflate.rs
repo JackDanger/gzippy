@@ -968,9 +968,28 @@ fn decode_dynamic(
         }
     }
 
-    let litlen_table = ConsumeFirstTable::build(&lens[..hlit])?;
     let dist_table = ConsumeFirstTable::build_distance(&lens[hlit..])?;
 
+    // Try ISA-L's fast Huffman decoder for lit/len when available
+    // (x86_64 + isal-compression). Mirrors rapidgzip's HuffmanCodingISAL
+    // path; ~24x faster per symbol than our pure-Rust ConsumeFirstTable.
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    {
+        if let Some(litlen_isal) =
+            crate::decompress::parallel::isal_huffman::IsalLitLenCode::from_lengths(&lens[..hlit])
+        {
+            return decode_huffman_block_isal(
+                bits,
+                output,
+                &litlen_isal,
+                &dist_table,
+                max_output,
+                clean_tail,
+            );
+        }
+    }
+
+    let litlen_table = ConsumeFirstTable::build(&lens[..hlit])?;
     decode_huffman_block(
         bits,
         output,
@@ -979,6 +998,90 @@ fn decode_dynamic(
         max_output,
         clean_tail,
     )
+}
+
+/// Parallel of `decode_huffman_block` but using ISA-L's literal/length
+/// table for the hot Huffman lookup. Distance still uses ConsumeFirstTable
+/// (small fraction of cost).
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+fn decode_huffman_block_isal(
+    bits: &mut Bits,
+    output: &mut Vec<u16>,
+    litlen: &crate::decompress::parallel::isal_huffman::IsalLitLenCode,
+    dist: &ConsumeFirstTable,
+    max_output: usize,
+    clean_tail: &mut Option<CleanTailTracker>,
+) -> Result<()> {
+    loop {
+        if max_output > 0 && output.len() >= max_output {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "output cap exceeded in Huffman block",
+            ));
+        }
+        let ds = litlen.decode(bits);
+        if ds.bit_count == 0 || ds.symbol == 0x1FFF {
+            return Err(Error::new(ErrorKind::InvalidData, "Invalid lit/len code"));
+        }
+        bits.consume(ds.bit_count);
+        let sym = ds.symbol;
+        if sym < 256 {
+            let value = sym as u16;
+            output.push(value);
+            if let Some(tracker) = clean_tail.as_mut() {
+                tracker.observe_value(value);
+            }
+        } else if sym == 256 {
+            return Ok(());
+        } else {
+            let lidx = (sym - 257) as usize;
+            if lidx >= LENGTH_BASE.len() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Length code out of range",
+                ));
+            }
+            let length = {
+                let extra = LENGTH_EXTRA[lidx] as u32;
+                if extra > 0 && bits.available() < extra {
+                    bits.refill();
+                }
+                let extra_val = if extra > 0 {
+                    let v = (bits.peek() & ((1u64 << extra) - 1)) as u16;
+                    bits.consume(extra);
+                    v
+                } else {
+                    0
+                };
+                LENGTH_BASE[lidx] + extra_val
+            } as usize;
+            let dsym = decode_cf(dist, bits)? as usize;
+            if dsym >= DISTANCE_BASE.len() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Distance code out of range",
+                ));
+            }
+            let distance = {
+                let extra = DISTANCE_EXTRA[dsym] as u32;
+                if extra > 0 && bits.available() < extra {
+                    bits.refill();
+                }
+                let extra_val = if extra > 0 {
+                    let v = (bits.peek() & ((1u64 << extra) - 1)) as u32;
+                    bits.consume(extra);
+                    v
+                } else {
+                    0
+                };
+                DISTANCE_BASE[dsym] as u32 + extra_val
+            } as usize;
+            if distance == 0 || distance > WINDOW_SIZE {
+                return Err(Error::new(ErrorKind::InvalidData, "Invalid distance"));
+            }
+            emit_match(output, distance, length, clean_tail);
+        }
+    }
 }
 
 // ── Shared Huffman block body (used by both fixed and dynamic) ──────────────

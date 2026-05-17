@@ -166,7 +166,7 @@ impl IsalLitLenCode {
     #[inline]
     pub fn decode(&self, bits: &mut Bits) -> DecodedSymbol {
         const INVALID_SYMBOL: u32 = 0x1FFF;
-        if bits.bitsleft < 32 {
+        if bits.available() < 32 {
             bits.refill();
         }
         let next_bits = bits.peek();
