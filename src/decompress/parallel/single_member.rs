@@ -801,7 +801,26 @@ fn phase1_search_boundaries(
                     Some(ChunkStart::from_bits(0))
                 } else {
                     let from_bit = idx * spacing_bits;
-                    search_boundary_forward(deflate_data, from_bit)
+                    // Two-stage search: try the cheap 512 KiB radius first,
+                    // then fall back to a wider radius up to half the chunk
+                    // spacing. This recovers BTYPE=10 boundaries in regions
+                    // where the nearest dynamic-Huffman header is more than
+                    // 512 KiB past the partition anchor. Cost on hits: zero
+                    // (returns from the cheap search). Cost on misses: one
+                    // extra pass over up to spacing/2 bytes of LUT scan
+                    // plus per-candidate try_decode_at, bounded.
+                    search_boundary_forward(deflate_data, from_bit).or_else(|| {
+                        let extended_radius_bits = (spacing_bits / 2).max(SEARCH_RADIUS * 8);
+                        if extended_radius_bits > SEARCH_RADIUS * 8 {
+                            search_boundary_forward_extended(
+                                deflate_data,
+                                from_bit,
+                                extended_radius_bits,
+                            )
+                        } else {
+                            None
+                        }
+                    })
                 };
                 *results[idx].lock().unwrap() = pick;
             });
@@ -828,24 +847,22 @@ fn phase1_search_boundaries(
 ///    dynamic Huffman).
 /// 2. **Byte-aligned brute force** (first 128 KiB).
 fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<ChunkStart> {
-    let search_end = (from_bit + SEARCH_RADIUS * 8).min(deflate_data.len() * 8);
+    search_boundary_forward_extended(deflate_data, from_bit, SEARCH_RADIUS * 8)
+}
+
+/// Same as [`search_boundary_forward`] but with an explicit bit-radius cap.
+/// Used by phase 1a to extend the search past the default 512 KiB when no
+/// candidate is found, capped at half the chunk spacing so two adjacent
+/// chunks' extended searches cannot overlap.
+fn search_boundary_forward_extended(
+    deflate_data: &[u8],
+    from_bit: usize,
+    radius_bits: usize,
+) -> Option<ChunkStart> {
+    let search_end = (from_bit + radius_bits).min(deflate_data.len() * 8);
     if from_bit >= search_end {
         return None;
     }
-
-    // Tier 1: BlockFinder over the search radius. Find a validated
-    // BTYPE=00 / BTYPE=10 boundary candidate; return at the first.
-    //
-    // The earlier "Tier 2: byte-aligned brute force" was removed
-    // (PR #97, commit after Silesia Tmax bench analysis): when
-    // BlockFinder failed, tier 2 iterated 16384 byte-aligned
-    // candidates inside 128 KiB, each calling `try_decode_at`'s
-    // ISA-L 32 KB validation (256 KB allocation per call). On
-    // Silesia at T=4, the chunk-3 search hit tier 2 and burned
-    // ~500 ms of phase 1a wall time before returning None — for a
-    // chunk that phase 1c was going to chain-decode anyway from
-    // chunk 2's end_bit. Returning None earlier means the same
-    // end-state, ~500 ms faster.
     let finder = BlockFinder::new(deflate_data);
     let sub_chunk_bits = 8 * 1024 * 8;
     let mut chunk_start = from_bit;
