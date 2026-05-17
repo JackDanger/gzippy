@@ -384,51 +384,33 @@ pub struct BootstrapResult {
     pub bfinal_hit: bool,
 }
 
-/// Tracks both the TOTAL clean (= non-marker) byte count and the
-/// trailing-clean-bytes count.
-///
-/// Rapidgzip's bootstrap (`vendor/.../chunkdecoding/GzipChunk.hpp:521`)
-/// handoffs to ISA-L when `cleanDataCount >= MAX_WINDOW_SIZE` (= total
-/// clean ≥ 32 KiB), NOT when the last 32 KiB is contiguously clean.
-/// Their `getLastWindow({})` then THROWS via MapMarkers when markers
-/// remain in the trailing 32 KiB — `tryToDecode` catches and tries the
-/// next candidate. We mirror that: handoff on total ≥ 32 KiB; if
-/// trailing has markers, the chunk decode fails and `decode_or_iterate`
-/// picks the next candidate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct CleanTailTracker {
     trailing_clean_bytes: usize,
-    total_clean_bytes: usize,
 }
 
 impl CleanTailTracker {
     #[inline]
     fn from_output(output: &[u16]) -> Self {
-        let total_clean = output.iter().filter(|&&v| v < MARKER_BASE).count();
-        let trailing = output
-            .iter()
-            .rev()
-            .take_while(|&&v| v < MARKER_BASE)
-            .count()
-            .min(WINDOW_SIZE);
         Self {
-            trailing_clean_bytes: trailing,
-            total_clean_bytes: total_clean,
+            trailing_clean_bytes: output
+                .iter()
+                .rev()
+                .take_while(|&&v| v < MARKER_BASE)
+                .count()
+                .min(WINDOW_SIZE),
         }
     }
 
-    /// Mirrors rapidgzip's `cleanDataCount >= MAX_WINDOW_SIZE`
-    /// (GzipChunk.hpp:521).
     #[inline]
     fn ready_for_handoff(self) -> bool {
-        self.total_clean_bytes >= WINDOW_SIZE
+        self.trailing_clean_bytes >= WINDOW_SIZE
     }
 
     #[inline]
     fn observe_value(&mut self, value: u16) {
         if value < MARKER_BASE {
             self.trailing_clean_bytes = (self.trailing_clean_bytes + 1).min(WINDOW_SIZE);
-            self.total_clean_bytes = self.total_clean_bytes.saturating_add(1);
         } else {
             self.trailing_clean_bytes = 0;
         }
@@ -439,9 +421,6 @@ impl CleanTailTracker {
         if values.is_empty() {
             return;
         }
-        // Update total_clean_bytes by counting non-markers in slice.
-        let clean_in_slice = values.iter().filter(|&&v| v < MARKER_BASE).count();
-        self.total_clean_bytes = self.total_clean_bytes.saturating_add(clean_in_slice);
         let trailing_clean = values
             .iter()
             .rev()
@@ -530,26 +509,35 @@ pub fn decode_chunk_bootstrap(
             .map(|limit| end_bit_offset < limit)
             .unwrap_or(false);
 
-    // With rapidgzip's cleanDataCount handoff, the trailing 32 KiB MAY
-    // contain markers even though total_clean ≥ 32 KiB. Mirror rapidgzip's
-    // `getLastWindow({})` behavior: if any marker in trailing 32 KiB,
-    // return None (caller treats as failure → iterate next candidate).
     let clean_window = if handoff_at_boundary && output.len() >= WINDOW_SIZE {
+        // Last 32 KB MUST be marker-free here per the bootstrap-stop
+        // check at the top of decode_loop. Use `assert!` rather than
+        // `debug_assert!` — if the invariant is ever broken in
+        // release (e.g., a future refactor flips `handoff_at_boundary`
+        // incorrectly), `v as u8` would silently truncate marker
+        // values to garbage that ISA-L then uses as a dict, producing
+        // wrong output bytes whose CRC mismatch then triggers a
+        // silent libdeflate fallback. Asserting catches the bug
+        // before ISA-L sees the corrupted dict. Cost: 32 K branch
+        // predictions per chunk's bootstrap exit, negligible
+        // (~10 µs at modern branch-predictor throughput).
+        //
+        // Opus advisor on PR #97 flagged the `debug_assert!` version
+        // as a release-mode silent-corruption surface.
         let start = output.len() - WINDOW_SIZE;
-        let mut window: Vec<u8> = Vec::with_capacity(WINDOW_SIZE);
-        let mut had_marker = false;
-        for &v in &output[start..] {
-            if v >= MARKER_BASE {
-                had_marker = true;
-                break;
-            }
-            window.push(v as u8);
-        }
-        if had_marker {
-            None
-        } else {
-            Some(window)
-        }
+        let window: Vec<u8> = output[start..]
+            .iter()
+            .map(|&v| {
+                assert!(
+                    v < MARKER_BASE,
+                    "bootstrap clean window contained marker at offset {}; \
+                     bootstrap-stop invariant violated",
+                    v - MARKER_BASE
+                );
+                v as u8
+            })
+            .collect();
+        Some(window)
     } else {
         None
     };
@@ -1564,12 +1552,8 @@ mod tests {
         tracker.observe_slice(&vec![b'a' as u16; WINDOW_SIZE]);
         assert!(tracker.ready_for_handoff());
 
-        // With rapidgzip's cleanDataCount semantics, observing a single
-        // marker does NOT make us not-ready — total_clean stays above
-        // WINDOW_SIZE. The trailing-marker case is detected at
-        // window-build time in decode_chunk_bootstrap instead.
         tracker.observe_value(MARKER_BASE + 3);
-        assert!(tracker.ready_for_handoff());
+        assert!(!tracker.ready_for_handoff());
 
         tracker.observe_slice(&vec![b'b' as u16; WINDOW_SIZE]);
         assert!(tracker.ready_for_handoff());
@@ -1578,7 +1562,6 @@ mod tests {
     #[test]
     fn clean_tail_tracker_resets_and_recovers_through_match_output() {
         let mut tracker = Some(CleanTailTracker {
-            total_clean_bytes: WINDOW_SIZE - 4,
             trailing_clean_bytes: WINDOW_SIZE - 4,
         });
         let mut output = vec![b'Q' as u16; 8];
@@ -1591,7 +1574,6 @@ mod tests {
         );
 
         let mut tracker = Some(CleanTailTracker {
-            total_clean_bytes: WINDOW_SIZE - 4,
             trailing_clean_bytes: WINDOW_SIZE - 4,
         });
         let mut output = vec![b'R' as u16; 8];
