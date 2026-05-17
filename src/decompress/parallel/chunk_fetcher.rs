@@ -152,53 +152,29 @@ impl<'a> GzipChunkFetcher<'a> {
                     if partition_start >= total_bits {
                         break;
                     }
-                    // For chunk 0, start at bit 0 (always a real boundary).
-                    // For others, iterate candidates from BlockFinder and
-                    // trial-decode each. ISA-L's INVALID_BLOCK / INVALID_
-                    // LOOKBACK errors reject false positives. First
-                    // candidate that yields a successful decode wins.
-                    // This is rapidgzip's decodeChunkWithRapidgzip pattern.
-                    let success: Option<ChunkData> = if idx == 0 {
-                        finish_decode_chunk_with_inexact_offset(
-                            input, 0, end, &[], configuration,
-                        )
-                        .ok()
-                    } else {
-                        let finder =
-                            crate::decompress::parallel::block_finder::BlockFinder::new(input);
-                        // Scan up to 8 MiB compressed for candidates.
-                        let scan_end_bits =
-                            (partition_start + 8 * 1024 * 1024 * 8).min(input.len() * 8);
-                        let candidates = finder.find_blocks(partition_start, scan_end_bits);
-                        let candidate_count = candidates.len();
-                        let mut tried = 0usize;
-                        let mut result: Option<ChunkData> = None;
-                        for c in &candidates {
-                            if c.bit_offset < partition_start {
-                                continue;
-                            }
-                            tried += 1;
-                            if let Ok(chunk) = finish_decode_chunk_with_inexact_offset(
-                                input,
-                                c.bit_offset,
-                                end,
-                                &[], // empty window — speculative
-                                configuration,
-                            ) {
-                                result = Some(chunk);
-                                break;
-                            }
-                        }
-                        if result.is_none() && std::env::var("GZIPPY_DEBUG").is_ok() {
-                            eprintln!(
-                                "[parallel_sm:rapidgzip] chunk[{}] no candidate decoded: \
-                                 partition_start={} candidates={} tried={} (BlockFinder yielded \
-                                 candidates but all failed trial-decode)",
-                                idx, partition_start, candidate_count, tried
-                            );
-                        }
-                        result
-                    };
+                    // Use v0.6's proven bootstrap-then-ISA-L decoder via
+                    // decode_chunk_for_fetcher. The fundamental issue
+                    // with the prior direct-ISA-L speculative path:
+                    // ISA-L doesn't emit markers, so cross-chunk back-
+                    // references silently produce zero bytes. The
+                    // bootstrap pattern decodes the chunk-leading
+                    // portion with the marker decoder (which DOES emit
+                    // markers), then hands off to ISA-L once a 32 KiB
+                    // clean tail is in hand. apply_window on the
+                    // consumer side resolves the markers. This is
+                    // rapidgzip's pattern (their decoder bootstraps
+                    // with pure-deflate emitting markers, then hands
+                    // off to their patched ISA-L for the bulk).
+                    let per_chunk_hint = configuration.split_chunk_size;
+                    let success: Option<ChunkData> =
+                        crate::decompress::parallel::single_member::decode_chunk_for_fetcher(
+                            input,
+                            partition_start,
+                            end,
+                            per_chunk_hint,
+                            n,
+                            configuration,
+                        );
                     match success {
                         Some(chunk) => {
                             *chunk_slots[idx].lock().unwrap() = Some(chunk);

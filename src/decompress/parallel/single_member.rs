@@ -935,6 +935,76 @@ fn phase1_search_boundaries(
 /// 1. **BlockFinder heuristic candidates** (BTYPE=00 stored + BTYPE=10
 ///    dynamic Huffman).
 /// 2. **Byte-aligned brute force** (first 128 KiB).
+/// Adapter for the new chunk_fetcher: invokes v0.6's bootstrap-then-
+/// ISA-L `decode_chunk_inexact` and converts the result into the
+/// rapidgzip-shape ChunkData. This matches the structural pattern
+/// rapidgzip uses (bootstrap with marker decoder, hand off to ISA-L
+/// after 32 KiB clean tail accumulates) which is what makes
+/// speculative parallel decode correct on cross-chunk back-references.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+pub(crate) fn decode_chunk_for_fetcher(
+    deflate_data: &[u8],
+    start_bit: usize,
+    until_bit: usize,
+    per_chunk_output_hint: usize,
+    num_chunks_total: usize,
+    configuration: crate::decompress::parallel::chunk_data::ChunkConfiguration,
+) -> Option<crate::decompress::parallel::chunk_data::ChunkData> {
+    use crate::decompress::parallel::chunk_data::ChunkData;
+
+    let start = ChunkStart::from_bits(start_bit);
+    let stop = ChunkDecodeStop::Verified(ChunkEndLimit(RealBlockBoundary(until_bit)));
+    let outcome = decode_chunk_inexact(
+        deflate_data,
+        usize::MAX,
+        start,
+        stop,
+        per_chunk_output_hint,
+        num_chunks_total,
+        false,
+    );
+    let cand = match outcome {
+        WorkerOutcome::Candidate(c) => c,
+        WorkerOutcome::NoDecode => return None,
+    };
+    let mut chunk = ChunkData::new(cand.discovered_start.bits(), configuration);
+    // data_with_markers = the marker bootstrap (u16 with cross-chunk
+    // back-refs as markers). data = bootstrap_clean (u8 tail of
+    // bootstrap with no markers) ++ isal_bytes (clean ISA-L decode
+    // using bootstrap_clean as dict). All in stream order.
+    chunk.data_with_markers = cand.chunk.bootstrap;
+    chunk.data.extend_from_slice(&cand.chunk.bootstrap_clean);
+    chunk.data.extend_from_slice(&cand.chunk.isal_bytes);
+    // CRC for the clean part (data segment) was computed during ISA-L
+    // decode in v0.6 (isal_crc). apply_window will prepend the CRC of
+    // resolved markers later.
+    chunk.crc = cand.chunk.isal_crc.clone();
+    // Also CRC bootstrap_clean (it's NOT in isal_crc because v0.6
+    // computes isal_crc only over isal_bytes).
+    {
+        let mut bc_crc = crc32fast::Hasher::new();
+        bc_crc.update(&cand.chunk.bootstrap_clean);
+        let mut combined = bc_crc;
+        combined.combine(&chunk.crc);
+        chunk.crc = combined;
+    }
+    let end_bit = cand.discovered_end.bits();
+    chunk.finalize(end_bit);
+    // Push a single subchunk covering the whole chunk; rapidgzip's
+    // finer-grained subchunks aren't needed for our consumer model.
+    chunk.subchunks.clear();
+    chunk
+        .subchunks
+        .push(crate::decompress::parallel::chunk_data::Subchunk {
+            encoded_offset_bits: cand.discovered_start.bits(),
+            encoded_size_bits: end_bit - cand.discovered_start.bits(),
+            decoded_offset: 0,
+            decoded_size: chunk.decoded_size(),
+            window: None,
+        });
+    Some(chunk)
+}
+
 // Re-export of search_boundary_forward as a stable bit-offset API.
 // Used by the new GzipChunkFetcher (chunk_fetcher.rs) until a faithful
 // rapidgzip BlockFinder.hpp port lands. Searches a wider radius than
