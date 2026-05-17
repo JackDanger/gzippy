@@ -103,7 +103,17 @@ pub struct Footer {
 /// `DecodedData` base it inherits from. The two-segment layout
 /// (`data_with_markers` then `data`) matches rapidgzip's
 /// `DecodedData::dataWithMarkers` + `DecodedData::data`.
-#[derive(Debug)]
+///
+/// `Clone` is derived to mirror rapidgzip's `std::shared_ptr<ChunkData>`
+/// semantics: when the consumer pulls a cached chunk and wants to
+/// mutate it (apply_window, set_encoded_offset, populate subchunk
+/// windows), it can clone the cached entry. In rapidgzip this is
+/// implicit via shared_ptr (mutation through the pointer aliases the
+/// cached copy); in Rust we make it explicit by cloning so the cache
+/// entry and the consumer's working copy don't alias mutably. The
+/// underlying `crc32fast::Hasher` is itself `Clone` (it serializes its
+/// rolling state), so this is structurally cheap.
+#[derive(Debug, Clone)]
 pub struct ChunkData {
     pub encoded_offset_bits: usize,
     /// Upper bound on the encoded offset this chunk could "match" if

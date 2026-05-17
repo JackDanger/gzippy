@@ -90,6 +90,53 @@ where
             || self.prefetch_cache.lock().unwrap().test(block_offset)
     }
 
+    /// Synchronous dispatch primitive — literal port of rapidgzip's
+    /// `BlockFetcher::get(blockOffset, blockIndex, getPartitionOffset)`
+    /// at vendor/.../core/BlockFetcher.hpp:245-329.
+    ///
+    /// Returns the block data for `block_offset`. On cache or
+    /// prefetch-cache hit, returns immediately (mirror of
+    /// BlockFetcher.hpp:302-309). On miss, invokes `dispatch` to
+    /// produce the value, on success inserts into the main cache and
+    /// returns the value (mirror of BlockFetcher.hpp:317-328); on error
+    /// the cache is left untouched and the error is propagated.
+    /// Rapidgzip raises a C++ exception in the error path
+    /// (BlockFetcher.hpp:656-661) — we use a typed Result.
+    ///
+    /// `Value` is typically `Arc<ChunkData>` for the production
+    /// pipeline, matching rapidgzip's `std::shared_ptr<ChunkData>` at
+    /// BlockFetcher.hpp:46. The Arc semantics are identical: cache and
+    /// caller share the same allocation; consumer-side mutation goes
+    /// through `Arc::make_mut` or a deliberate `.clone()` per the
+    /// rapidgzip shared_ptr-aliasing model.
+    ///
+    /// **Threading-model deviation (§B5)**: rapidgzip submits a future
+    /// to its internal `ThreadPool` (BlockFetcher.hpp:580) and waits on
+    /// `std::future::get`. gzippy's `dispatch` closure is the unit of
+    /// work — the caller is responsible for arranging actual parallelism
+    /// (e.g. by having `dispatch` `submit_job(...).recv()` into the
+    /// mpsc worker pool from `chunk_fetcher::drive`). The CALLER pattern
+    /// is the same: one call returns the resolved data. Underlying
+    /// thread-pool unification is deferred (see
+    /// `docs/rapidgzip-port-reference.md` §B5).
+    pub fn get<F, E>(&self, block_offset: Key, dispatch: F) -> Result<Value, E>
+    where
+        F: FnOnce() -> Result<Value, E>,
+    {
+        // BlockFetcher.hpp:263 — getFromCaches (prefetch-cache promote,
+        // then main cache lookup). `get_if_available` already records
+        // hit stats and promotes prefetched entries into the main cache.
+        if let Some(v) = self.get_if_available(&block_offset) {
+            return Ok(v);
+        }
+        // BlockFetcher.hpp:274-277 — submit on-demand and block.
+        self.record_on_demand_fetch();
+        let value = dispatch()?;
+        // BlockFetcher.hpp:320 — insertIntoCache after future resolves.
+        self.insert(block_offset.clone(), value.clone());
+        Ok(value)
+    }
+
     /// Pure cache lookup (no fetch). Checks prefetch cache first; on
     /// hit, MOVES the entry into the main cache (mirrors rapidgzip's
     /// `takeFromPrefetchQueue` pattern at BlockFetcher.hpp:385-410 —
@@ -302,6 +349,92 @@ mod tests {
         assert!(snap.prefetch_count >= 1);
         assert!(snap.prefetch_cache_hits >= 1);
         assert!(snap.gets >= 1);
+    }
+
+    #[test]
+    fn get_returns_cached_value_without_dispatch() {
+        let bf = new_fetcher();
+        bf.insert(700, "cached".into());
+        let mut dispatched = false;
+        let v = bf
+            .get(700, || -> Result<String, ()> {
+                dispatched = true;
+                Ok("dispatched".into())
+            })
+            .unwrap();
+        assert_eq!(v, "cached");
+        assert!(!dispatched, "dispatch should not run on cache hit");
+    }
+
+    #[test]
+    fn get_invokes_dispatch_on_miss_and_caches_result() {
+        let bf = new_fetcher();
+        let v = bf
+            .get(800, || -> Result<String, ()> { Ok("from-dispatch".into()) })
+            .unwrap();
+        assert_eq!(v, "from-dispatch");
+        // Mirror of rapidgzip BlockFetcher.hpp:320 (`insertIntoCache`
+        // after dispatch): the freshly-dispatched value is now in the
+        // main cache. A subsequent `get` for the same key must short-
+        // circuit without invoking the dispatch closure.
+        let mut dispatched_again = false;
+        let v2 = bf
+            .get(800, || -> Result<String, ()> {
+                dispatched_again = true;
+                Ok("re-dispatched".into())
+            })
+            .unwrap();
+        assert_eq!(v2, "from-dispatch");
+        assert!(
+            !dispatched_again,
+            "second get must hit cache, not re-dispatch — mirror of \
+             rapidgzip's insertIntoCache at BlockFetcher.hpp:320"
+        );
+    }
+
+    #[test]
+    fn get_promotes_prefetched_value_on_hit() {
+        let bf = new_fetcher();
+        bf.insert_prefetched(900, "prefetched".into());
+        let mut dispatched = false;
+        let v = bf
+            .get(900, || -> Result<String, ()> {
+                dispatched = true;
+                Ok("should-not-run".into())
+            })
+            .unwrap();
+        assert_eq!(v, "prefetched");
+        assert!(!dispatched);
+        // After get, prefetched entry has been promoted to main cache.
+        assert_eq!(bf.cache_size(), 1);
+    }
+
+    #[test]
+    fn get_records_on_demand_fetch_on_miss() {
+        let bf = new_fetcher();
+        let before = bf.statistics.base.snapshot().on_demand_fetch_count;
+        let _v = bf
+            .get(1000, || -> Result<String, ()> { Ok("x".into()) })
+            .unwrap();
+        let after = bf.statistics.base.snapshot().on_demand_fetch_count;
+        assert!(after > before);
+    }
+
+    #[test]
+    fn get_propagates_dispatch_error_without_caching() {
+        let bf = new_fetcher();
+        let err = bf
+            .get(1100, || -> Result<String, &'static str> { Err("boom") })
+            .unwrap_err();
+        assert_eq!(err, "boom");
+        // Error must NOT be cached: a second get with a successful
+        // dispatch should run it.
+        let ok = bf
+            .get(1100, || -> Result<String, &'static str> {
+                Ok("recovered".into())
+            })
+            .unwrap();
+        assert_eq!(ok, "recovered");
     }
 
     #[test]

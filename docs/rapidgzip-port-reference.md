@@ -254,29 +254,59 @@ speculative jobs per partition (L422-423), pre-fills `pool_size * 2`
 speculatives (L463-465), drains in order. On miss, re-dispatches
 authoritative at the predecessor's actual end (L573).
 
-**Partial-port status (May 2026, post commit `306c1e7`)**: `BlockFetcher`
-+ `BlockMap` ARE wired. The consumer calls `block_fetcher.record_fetch`,
-`get_if_available`, `record_on_demand_fetch`, `record_prefetch_cache_*`
-and `append_subchunks_to_block_map(block_map, &chunk)` at
-`chunk_fetcher.rs:784`. What's still divergent: rapidgzip's `BlockFetcher::get`
-is the SYNCHRONOUS dispatch primitive (submits to internal `ThreadPool`,
-blocks on `std::future` until done) — gzippy's `BlockFetcher::get_if_available`
-is pure cache lookup, with the actual dispatch handled by the worker-pool +
-mpsc reply channel in `drive`/`consumer_loop`. Swapping to the rapidgzip
-single-call `get(blockOffset)` shape would require collapsing the
-spec-ring into BlockFetcher itself — deferred until the ring's perf
-contribution is measured.
+**Partial-port status (May 2026, post commit `306c1e7` and successor
+`feat/cross-chunk-retry`)**: `BlockFetcher` + `BlockMap` +
+`GzipBlockFinder` all wired. The consumer calls
+`block_fetcher.record_fetch`, `get_if_available`,
+`record_on_demand_fetch`, `record_prefetch_cache_*`,
+`block_fetcher.get` (synchronous dispatch primitive — closure submits
+to mpsc worker pool, blocks on reply, returns resolved chunk; on
+miss, caches `Arc<ChunkData>` under the block offset exactly as
+rapidgzip's `insertIntoCache` at BlockFetcher.hpp:320), and
+`append_subchunks_to_block_map(block_map, &chunk)` +
+`block_finder.insert(subchunk_end)` per subchunk at
+`chunk_fetcher.rs::consumer_loop`.
+
+`ChunkData` is `Clone` (chunk_data.rs:106), so the cache-aliased
+`Arc<ChunkData>` returned by `get` follows rapidgzip's
+`shared_ptr<ChunkData>` aliasing model: consumer obtains an owned
+mutation copy via `Arc::try_unwrap` (sole holder) or `(*arc).clone()`
+(cache also holds it). The `crc32fast::Hasher` embedded in
+`ChunkData` is itself `Clone` (serializes its rolling state).
+
+What's still divergent (deferred):
+1. **Thread pool unification.** Rapidgzip uses `BS::thread_pool` +
+   `std::future`; gzippy keeps `std::thread::scope` + mpsc. The
+   closure passed to `block_fetcher.get` does the
+   `submit_job(...).recv()` dance to integrate. Caller-side API shape
+   is identical (single synchronous call returns resolved `ChunkData`);
+   the threading idiom is the deviation.
+2. **Spec-ring vs BlockFetcher-internal prefetch.** Rapidgzip's
+   `BlockFetcher::get` triggers `prefetchNewBlocks` during the wait on
+   the on-demand task (BlockFetcher.hpp:297-299, 314-316), overlapping
+   prefetches with the blocking dispatch. Gzippy maintains a separate
+   `spec[]` ring of `mpsc::Receiver`s in `consumer_loop`, pre-filled
+   to `pool_size * 2` ahead of the consumer. Function: equivalent.
+   Shape: the spec-ring is a caller-side mechanism, not internal to
+   BlockFetcher. Unifying these is a follow-up atomic task.
 
 `Prefetcher` and `Cache` (LRU) remain unused — gzippy's `BlockFetcher`
 embeds simpler `Cache` + `PrefetchCache` of its own (`block_fetcher.rs`
-L31-49), and the spec-ring fills the `Prefetcher` role.
+L31-49), and the spec-ring fills the `Prefetcher` role until #2 above
+is addressed.
 
 ### B6. Block finder partitioning
 
-Static partition by `TARGET_COMPRESSED_CHUNK_BYTES * 8` in
-`drive`'s `partition_offsets` (`chunk_fetcher.rs:120-123`). No
-`GzipBlockFinder` instance; no `insert(actual_end)`; consumer never
-informs the partitioner that chunk N actually ended at bit X.
+Wired (May 2026, branch `feat/cross-chunk-retry`):
+`GzipBlockFinder` in `gzip_block_finder.rs` is constructed in
+`chunk_fetcher::drive` with the first confirmed offset (`0`) and
+spacing = `configuration.split_chunk_size`. Consumer queries
+`block_finder.get(idx)` for partition seeds (literal port of
+GzipChunkFetcher.hpp:318), and post-process calls
+`block_finder.insert(subchunk_end)` per subchunk (literal port of
+GzipChunkFetcher.hpp:374). The partitioner-feedback loop is closed:
+later partitions' seeds reflect earlier partitions' actual ends.
+`block_finder.finalize()` runs at end of `drive`.
 
 ### B7. Block-finder validation strictness
 
@@ -416,13 +446,26 @@ Status legend: ✅ DONE · 🟡 PARTIAL · ❌ NOT STARTED · ⏭ DEFERRED-by-de
    to detect "trailing 32 KiB straddles markers, can't hand off yet."
    gzippy substitutes `CleanTailTracker`. Documented in §B3; functionally
    equivalent; will not be re-ported.
-6. 🟡 **`BlockFetcher` wired into the production driver** — wired post
-   commit `306c1e7`. Consumer calls `record_fetch`, `get_if_available`,
-   `record_on_demand_fetch`, `record_prefetch_cache_*`. `BlockFetcher::get`
-   (synchronous dispatch primitive) is NOT — see §B5 for the deviation.
-7. ❌ **`GzipBlockFinder` (the partitioner class)** — no port file at
-   all; `drive` uses a static partition. Required for true
-   `BlockFetcher::get` parity.
+6. ✅ **`BlockFetcher` wired into the production driver** — cache /
+   prefetch wiring landed at `306c1e7`. `BlockFetcher::get`
+   (synchronous dispatch primitive, BlockFetcher.hpp:245-329) ported in
+   `block_fetcher.rs::get` and consumed by `chunk_fetcher::drive` for
+   authoritative re-dispatch (deletion-trap counter
+   `BLOCK_FETCHER_GET_CALLS_OBSERVED` proves wiring). Threading-pool
+   unification is the §B5 deviation — closure runs on the existing
+   mpsc worker pool; caller pattern (one synchronous call returns
+   resolved data) is the literal port. Insert-on-miss is the caller's
+   responsibility because `ChunkData` is not `Clone` — semantic-equivalent
+   deviation documented in the method.
+7. ✅ **`GzipBlockFinder` (the partitioner class)** — port file at
+   `gzip_block_finder.rs`. Wired into `chunk_fetcher::drive`: workers
+   call `block_finder.insert(actual_end)` per subchunk (literal port of
+   GzipChunkFetcher.hpp:374); consumer queries `block_finder.get(idx)`
+   for partition seeds and `get(idx+1)` for `until_bit`
+   (literal port of GzipChunkFetcher.hpp:318 + BlockFetcher.hpp:479).
+   `block_finder.finalize()` called at end of `drive` (mirror of
+   GzipChunkFetcher.hpp:325). Deletion-trap counter
+   `GZIP_BLOCK_FINDER_INSERTS_OBSERVED` proves the insert wiring.
 8. ✅ **`BlockMap` wired into the production driver** —
    `append_subchunks_to_block_map(block_map, &chunk)` at
    `chunk_fetcher.rs:784`, post commit `306c1e7`.
@@ -464,9 +507,10 @@ Status legend: ✅ DONE · 🟡 PARTIAL · ❌ NOT STARTED · ⏭ DEFERRED-by-de
     intentionally retains for the speculative-trim path.
 19. ✅ **`appendSubchunksToIndexes` cascade** —
     `block_map::append_subchunks_to_block_map` called at
-    `chunk_fetcher.rs:784`. Rapidgzip's version ALSO calls
-    `m_blockFinder->insert(...)` and maintains `m_unsplitBlocks` —
-    those depend on #7 (`GzipBlockFinder`), so still pending.
+    `chunk_fetcher.rs:784`, followed by
+    `block_finder.insert(subchunk_end)` per subchunk (literal port of
+    GzipChunkFetcher.hpp:374). `m_unsplitBlocks` map is still pending
+    (only consulted on backward-seek replay; unused on streaming).
 20. ⏭ **Direct-try-at-guessed-offset on the slow path** — deleted in
     gzippy because the marker bootstrap is too lenient (B10).
     Documented deviation, not a regression.

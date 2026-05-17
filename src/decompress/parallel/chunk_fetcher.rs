@@ -69,6 +69,8 @@ use crate::decompress::parallel::block_finder::BlockFinder;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::block_map::{append_subchunks_to_block_map, BlockMap};
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+use crate::decompress::parallel::gzip_block_finder::{GetReturnCode, GzipBlockFinder};
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::gzip_chunk::{
     decode_chunk_with_window, finish_decode_chunk_with_inexact_offset,
 };
@@ -96,6 +98,27 @@ pub enum FetchError {
 /// in the same spirit as `MARKER_PIPELINE_RUNS`).
 #[cfg(any(test, debug_assertions))]
 pub static BLOCK_FETCHER_GETS_OBSERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only observability: number of times the production `drive` path
+/// called `GzipBlockFinder::insert(actual_end)` after a chunk
+/// completed. Deletion-trap for the partitioner-feedback wiring; if a
+/// refactor "forgets" to call insert, this counter stays flat and
+/// `test_gzip_block_finder_in_drive` fails. Mirror of rapidgzip's
+/// `m_blockFinder->insert(subchunk.encodedOffset + subchunk.encodedSize)`
+/// at vendor/.../GzipChunkFetcher.hpp:374.
+#[cfg(any(test, debug_assertions))]
+pub static GZIP_BLOCK_FINDER_INSERTS_OBSERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only observability: number of times the production `drive` path
+/// invoked the `BlockFetcher::get` synchronous dispatch primitive.
+/// Deletion-trap for the rapidgzip `BlockFetcher::get(blockOffset)` port
+/// — see BlockFetcher.hpp:245-329. If a refactor reverts the consumer
+/// back to the spec-ring + reply-channel dispatch without going through
+/// `BlockFetcher::get`, this counter stays flat.
+#[cfg(any(test, debug_assertions))]
+pub static BLOCK_FETCHER_GET_CALLS_OBSERVED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 impl From<ChunkDecodeError> for FetchError {
@@ -163,7 +186,24 @@ pub fn drive<W: std::io::Write>(
     let chunk_size_bits = configuration.split_chunk_size * 8;
     let total_bits = input.len() * 8;
     let n_partitions = total_bits.div_ceil(chunk_size_bits).max(1);
-    let partition_offsets: Vec<usize> = (0..n_partitions).map(|i| i * chunk_size_bits).collect();
+
+    // ── Partitioner: `GzipBlockFinder` ──────────────────────────────
+    // Literal port of rapidgzip's partitioning model. The block finder
+    // is constructed with the first confirmed offset (`0` for a
+    // single-member stream — the deflate body starts at bit 0 of the
+    // raw deflate stream we receive) and the spacing in bytes equal to
+    // the chunk size. Workers do not consult it; the consumer queries
+    // `get(idx)` for the seed of partition `idx` and `get(idx+1)` for
+    // its `until_bit`. After each chunk completes the consumer calls
+    // `insert(actual_end)` to promote that boundary from a guess to a
+    // confirmed offset — mirror of
+    // vendor/rapidgzip/.../GzipChunkFetcher.hpp:374
+    // (`m_blockFinder->insert(subchunk.encodedOffset + subchunk.encodedSize)`).
+    let block_finder_par = Arc::new(GzipBlockFinder::new(
+        /* first_block_offset_in_bits = */ 0,
+        /* spacing_in_bytes = */ configuration.split_chunk_size,
+        /* file_size_in_bits = */ Some(total_bits),
+    ));
 
     let window_map = WindowMap::new();
     // Chunk 0's input window is empty by definition (start of stream).
@@ -217,7 +257,7 @@ pub fn drive<W: std::io::Write>(
             input,
             writer,
             n_partitions,
-            &partition_offsets,
+            &block_finder_par,
             total_bits,
             &job_tx,
             &window_map,
@@ -236,8 +276,11 @@ pub fn drive<W: std::io::Write>(
     result?;
 
     // Finalize the BlockMap and stats (rapidgzip GzipChunkFetcher.hpp:324:
-    // `m_blockMap->finalize();` after EOF).
+    // `m_blockMap->finalize();` after EOF). Mirror of
+    // GzipChunkFetcher.hpp:325 + 407: finalize both the block map AND the
+    // block finder once the input has been fully consumed.
     block_map.finalize();
+    block_finder_par.finalize();
     block_fetcher
         .statistics
         .base
@@ -480,7 +523,7 @@ fn consumer_loop<W: std::io::Write>(
     input: &[u8],
     writer: &mut W,
     n_partitions: usize,
-    partition_offsets: &[usize],
+    block_finder: &GzipBlockFinder,
     total_bits: usize,
     job_tx: &mpsc::Sender<DecodeJob>,
     window_map: &WindowMap,
@@ -492,6 +535,23 @@ fn consumer_loop<W: std::io::Write>(
     total_size: &mut usize,
 ) -> Result<(), FetchError> {
     let _ = (input, configuration);
+
+    // Helper: query the GzipBlockFinder for partition `idx`'s seed.
+    // Mirror of rapidgzip's `m_blockFinder->get(blockIndex)` pattern at
+    // vendor/.../GzipChunkFetcher.hpp:318. The block finder returns the
+    // confirmed offset when `idx` is known (after a predecessor's
+    // `insert(actual_end)`), or a spacing-aligned guess when not.
+    let seed_for = |idx: usize| -> usize {
+        match block_finder.get(idx) {
+            (Some(offset), GetReturnCode::Success) => offset,
+            // Past-EOF / failure: clamp to file size so `until_for` is
+            // monotonic. The consumer will hit this on the final
+            // partition's `until_for(n - 1) = get(n)` query.
+            (Some(offset), GetReturnCode::Failure) => offset,
+            (None, _) => total_bits,
+        }
+    };
+    let until_for = |idx: usize| -> usize { seed_for(idx + 1).min(total_bits) };
 
     // Port of `rapidgzip::GzipChunkFetcher::processNextChunk`
     // (GzipChunkFetcher.hpp:311-362). Iterates the BlockMap in
@@ -521,15 +581,20 @@ fn consumer_loop<W: std::io::Write>(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(pool_size * 2);
 
-    let mut spec: Vec<Option<mpsc::Receiver<Result<ChunkData, ChunkDecodeError>>>> =
-        (0..n_partitions).map(|_| None).collect();
-
-    let until_for = |idx: usize| -> usize {
-        partition_offsets
-            .get(idx + 1)
-            .copied()
-            .unwrap_or(total_bits)
-    };
+    /// Tracks one outstanding speculative job. We carry the seed that
+    /// was active at dispatch time so the cache key remains stable
+    /// across subsequent `block_finder.insert(...)` calls that would
+    /// otherwise shift `seed_for(idx)` (see
+    /// vendor/.../GzipBlockFinder.hpp:30-32: "block confirmation
+    /// effectively invalidates previous indexes"). Mirror of
+    /// rapidgzip's keeping the original `blockOffset` (not blockIndex)
+    /// as the BlockFetcher cache key across the get/insert cycle —
+    /// vendor/.../GzipChunkFetcher.hpp:267 + 596.
+    struct SpecSlot {
+        rx: mpsc::Receiver<Result<ChunkData, ChunkDecodeError>>,
+        dispatched_seed: usize,
+    }
+    let mut spec: Vec<Option<SpecSlot>> = (0..n_partitions).map(|_| None).collect();
 
     let submit_job = |idx: usize,
                       start: usize,
@@ -567,16 +632,23 @@ fn consumer_loop<W: std::io::Write>(
     };
 
     // Submit chunk 0 authoritative (start is known: bit 0). Also pre-fill
-    // up to prefetch_count speculatives starting at partition 1.
-    spec[0] = Some(submit_job(0, 0, until_for(0), true, 0));
+    // up to prefetch_count speculatives starting at partition 1. The
+    // seed for each partition comes from `GzipBlockFinder::get(idx)` —
+    // a confirmed offset when one of idx's predecessors has finished
+    // and called `insert(actual_end)`, or a spacing-aligned guess
+    // otherwise. Mirror of rapidgzip's
+    // GzipChunkFetcher.hpp:318 (`m_blockFinder->get(...)`) +
+    // BlockFetcher.hpp:479 (prefetch-time `get(blockIndexToPrefetch, 0)`).
+    spec[0] = Some(SpecSlot {
+        rx: submit_job(0, 0, until_for(0), true, 0),
+        dispatched_seed: 0,
+    });
     for i in 1..(1 + prefetch_count).min(n_partitions) {
-        spec[i] = Some(submit_job(
-            i,
-            partition_offsets[i],
-            until_for(i),
-            false,
-            partition_offsets[i],
-        ));
+        let seed = seed_for(i);
+        spec[i] = Some(SpecSlot {
+            rx: submit_job(i, seed, until_for(i), false, seed),
+            dispatched_seed: seed,
+        });
     }
 
     let mut expected_start: usize = 0;
@@ -586,26 +658,27 @@ fn consumer_loop<W: std::io::Write>(
         // Update FetchingStrategy (rapidgzip BlockFetcher.hpp:280-282).
         block_fetcher.record_fetch(idx);
 
-        // First, see if the chunk is already resolved in either cache.
-        // For speculative jobs the worker inserts into the prefetch
-        // cache and stats are recorded there. We track the cache hit
-        // for completeness — currently the streaming consumer always
-        // waits on the per-job channel (clone-cost of ChunkData is too
-        // high to redundantly stash a full copy in the cache).
-        let cache_key_for_partition = if idx == 0 { 0 } else { partition_offsets[idx] };
+        // Take the in-flight slot (if any) so we can use its
+        // dispatched_seed as the stable cache key — see SpecSlot's
+        // comment about block-confirmation invalidating indexes
+        // (vendor/.../GzipBlockFinder.hpp:30-32).
+        let slot = spec[idx].take();
+        let cache_key_for_partition = match &slot {
+            Some(s) => s.dispatched_seed,
+            None if idx == 0 => 0,
+            None => seed_for(idx),
+        };
+
+        // Speculative cache probe (rapidgzip BlockFetcher::get
+        // path at vendor/.../core/BlockFetcher.hpp:263-264).
         let _ = block_fetcher.get_if_available(&cache_key_for_partition);
 
         // If speculation is disabled (prefetch_count = 0) or this slot
         // wasn't pre-filled, dispatch authoritative on demand.
-        let rx = match spec[idx].take() {
-            Some(rx) => rx,
+        let rx = match slot {
+            Some(s) => s.rx,
             None => {
-                let until = partition_offsets
-                    .iter()
-                    .skip(idx + 1)
-                    .find(|&&s| s > expected_start)
-                    .copied()
-                    .unwrap_or(total_bits);
+                let until = until_for(idx).max(expected_start);
                 submit_job(idx, expected_start, until, true, expected_start)
             }
         };
@@ -696,29 +769,63 @@ fn consumer_loop<W: std::io::Write>(
             }
         };
 
-        let chunk = match hit_chunk {
+        let chunk: ChunkData = match hit_chunk {
             Some(c) => c,
             None => {
                 // Re-dispatch authoritative at expected_start. Worker
                 // will fast-path because predecessor's window is in
                 // the WindowMap (just inserted after consume of N-1).
-                let until = partition_offsets
-                    .iter()
-                    .skip(idx + 1)
-                    .find(|&&s| s > expected_start)
-                    .copied()
-                    .unwrap_or(total_bits);
-                let auth_rx = submit_job(idx, expected_start, until, true, expected_start);
-                match auth_rx.recv() {
-                    Ok(Ok(c)) => c,
-                    Ok(Err(e)) => return Err(FetchError::Decode(e)),
-                    Err(_) => {
-                        return Err(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
-                            requested: expected_start,
-                            actual: 0,
-                        }));
-                    }
-                }
+                //
+                // We route this through `BlockFetcher::get` to mirror
+                // rapidgzip's synchronous dispatch primitive at
+                // vendor/.../core/BlockFetcher.hpp:245-329. The closure
+                // submits the authoritative job to the mpsc worker pool
+                // and blocks on the reply — semantically identical to
+                // rapidgzip's `m_threadPool.submit(...) + future::get`
+                // at BlockFetcher.hpp:573-588. The threading-pool
+                // unification is the §B5 deviation; the consumer-side
+                // call shape is the literal port.
+                let until = until_for(idx).max(expected_start);
+                // Use `BlockFetcher::get` as the synchronous dispatch
+                // primitive (BlockFetcher.hpp:245-329). The closure
+                // submits the authoritative job to the mpsc worker pool
+                // and blocks on the reply. On miss, `get` caches the
+                // resulting `Arc<ChunkData>` under `expected_start`
+                // (literal port of BlockFetcher.hpp:320 `insertIntoCache`).
+                // The returned Arc aliases the cached entry — exactly
+                // rapidgzip's `shared_ptr<ChunkData>` semantics at
+                // BlockFetcher.hpp:245.
+                let auth_result: Result<Arc<ChunkData>, ChunkDecodeError> = block_fetcher.get(
+                    expected_start,
+                    || -> Result<Arc<ChunkData>, ChunkDecodeError> {
+                        #[cfg(any(test, debug_assertions))]
+                        BLOCK_FETCHER_GET_CALLS_OBSERVED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let rx = submit_job(idx, expected_start, until, true, expected_start);
+                        match rx.recv() {
+                            Ok(Ok(c)) => Ok(Arc::new(c)),
+                            Ok(Err(e)) => Err(e),
+                            Err(_) => Err(ChunkDecodeError::ExactStopMissed {
+                                requested: expected_start,
+                                actual: 0,
+                            }),
+                        }
+                    },
+                );
+                let auth_arc = match auth_result {
+                    Ok(a) => a,
+                    Err(e) => return Err(FetchError::Decode(e)),
+                };
+                // Take ownership via Arc::try_unwrap when we hold the
+                // only ref (typical: cache evicted/sequential clear);
+                // otherwise clone the inner ChunkData. This mirrors
+                // rapidgzip's pattern of mutating through the
+                // shared_ptr — in Rust the safe equivalent is
+                // copy-on-write when the cache still aliases it.
+                // ChunkData is Clone (see chunk_data.rs), so clone-on-
+                // shared is structurally cheap and faithful to the
+                // rapidgzip aliasing semantics.
+                Arc::try_unwrap(auth_arc).unwrap_or_else(|arc| (*arc).clone())
             }
         };
 
@@ -783,6 +890,35 @@ fn consumer_loop<W: std::io::Write>(
         // maintaining it preserves rapidgzip's semantics.
         append_subchunks_to_block_map(block_map, &chunk);
 
+        // Promote each subchunk's end position to a confirmed offset in
+        // the partitioner. Literal port of
+        // vendor/rapidgzip/.../GzipChunkFetcher.hpp:374
+        // (`m_blockFinder->insert(subchunk.encodedOffset + subchunk.encodedSize)`).
+        // The next partition's `get(idx+1)` query will now return this
+        // confirmed boundary instead of a spacing-aligned guess —
+        // closing the partitioner-feedback loop that the static-vec
+        // approach lacked. `insert(past_eof)` is a documented no-op
+        // (GzipBlockFinder.hpp:228-231), so the final subchunk's end is
+        // safely absorbed.
+        if chunk.subchunks.is_empty() {
+            // Whole-chunk insert when there are no recorded subchunks
+            // (rapidgzip always emits at least one; gzippy's empty-vec
+            // case is defensive — the chunk's reported total is the
+            // single boundary).
+            let actual_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+            block_finder.insert(actual_end);
+            #[cfg(any(test, debug_assertions))]
+            GZIP_BLOCK_FINDER_INSERTS_OBSERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            for sc in &chunk.subchunks {
+                let actual_end = sc.encoded_offset_bits + sc.encoded_size_bits;
+                block_finder.insert(actual_end);
+                #[cfg(any(test, debug_assertions))]
+                GZIP_BLOCK_FINDER_INSERTS_OBSERVED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
         // Write bytes, skipping `trim_bytes` leading bytes that belong
         // to the predecessor's range.
         let mut written_crc = crc32fast::Hasher::new();
@@ -842,15 +978,23 @@ fn consumer_loop<W: std::io::Write>(
         block_fetcher.insert(cache_key_for_partition, Arc::new(chunk));
 
         // Refill the speculative pipeline: keep prefetch_count chunks
-        // outstanding ahead of the consumer.
+        // outstanding ahead of the consumer. The seed is queried from
+        // GzipBlockFinder NOW (post-insert), so it reflects the latest
+        // confirmed boundaries — mirror of rapidgzip's prefetch loop
+        // in vendor/.../core/BlockFetcher.hpp:474-562 which calls
+        // `m_blockFinder->get(blockIndexToPrefetch, ...)` per iteration.
         if next_spec_to_dispatch < n_partitions {
-            spec[next_spec_to_dispatch] = Some(submit_job(
-                next_spec_to_dispatch,
-                partition_offsets[next_spec_to_dispatch],
-                until_for(next_spec_to_dispatch),
-                false,
-                partition_offsets[next_spec_to_dispatch],
-            ));
+            let seed = seed_for(next_spec_to_dispatch);
+            spec[next_spec_to_dispatch] = Some(SpecSlot {
+                rx: submit_job(
+                    next_spec_to_dispatch,
+                    seed,
+                    until_for(next_spec_to_dispatch),
+                    false,
+                    seed,
+                ),
+                dispatched_seed: seed,
+            });
             next_spec_to_dispatch += 1;
         }
     }
@@ -914,6 +1058,84 @@ mod tests {
         let (_crc, size) = drive(&deflate, &mut out, 8, cfg).expect("drive");
         assert_eq!(size, payload.len());
         assert_eq!(out, payload);
+    }
+
+    /// Deletion-trap killer for the `GzipBlockFinder` partitioner-feedback
+    /// wiring (rapidgzip GzipChunkFetcher.hpp:374). Asserts the
+    /// production `drive` path called `block_finder.insert(actual_end)`
+    /// at least once during a successful run. Pre-port, the static
+    /// `partition_offsets: Vec<usize>` vec never fed back; this counter
+    /// would have stayed at zero. Post-port, every processed chunk's
+    /// subchunks bump it.
+    #[test]
+    fn test_gzip_block_finder_in_drive() {
+        use std::sync::atomic::Ordering;
+        let payload = b"abcdefghij".repeat(200_000);
+        let deflate = make_deflate(&payload, 6);
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 512 * 1024,
+            max_decoded_chunk_size: 20 * 512 * 1024,
+            crc32_enabled: true,
+        };
+        let before = GZIP_BLOCK_FINDER_INSERTS_OBSERVED.load(Ordering::Relaxed);
+        let mut out = Vec::new();
+        let (_crc, size) = drive(&deflate, &mut out, 4, cfg).expect("drive");
+        assert_eq!(size, payload.len());
+        let after = GZIP_BLOCK_FINDER_INSERTS_OBSERVED.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "GzipBlockFinder::insert was not invoked during drive \
+             (before={before}, after={after}). The partitioner-feedback \
+             wiring regressed — consumer is no longer informing the \
+             block finder of actual chunk ends. Mirror of rapidgzip \
+             GzipChunkFetcher.hpp:374."
+        );
+    }
+
+    /// Process-global lock to serialize tests that mutate the
+    /// `GZIPPY_PREFETCH` env var (which `consumer_loop` reads to
+    /// control speculation depth). Without this guard, parallel
+    /// `cargo test` execution would race other tests calling `drive`.
+    static PREFETCH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Deletion-trap killer for the `BlockFetcher::get` synchronous
+    /// dispatch primitive (rapidgzip BlockFetcher.hpp:245-329).
+    /// Speculative-miss chunks re-dispatch via `block_fetcher.get`,
+    /// which bumps `BLOCK_FETCHER_GET_CALLS_OBSERVED`. We force at
+    /// least one miss by setting `prefetch_count = 0` so chunk 1+
+    /// always re-dispatches authoritative — and that authoritative
+    /// path now flows through `block_fetcher.get`.
+    #[test]
+    fn test_block_fetcher_get_in_drive() {
+        use std::sync::atomic::Ordering;
+        // Disable speculation so the consumer always falls through to
+        // the authoritative `block_fetcher.get` re-dispatch path.
+        let _env_guard = PREFETCH_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("GZIPPY_PREFETCH", "0");
+
+        let payload = b"abcdefghij".repeat(200_000);
+        let deflate = make_deflate(&payload, 6);
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 512 * 1024,
+            max_decoded_chunk_size: 20 * 512 * 1024,
+            crc32_enabled: true,
+        };
+
+        let before = BLOCK_FETCHER_GET_CALLS_OBSERVED.load(Ordering::Relaxed);
+        let mut out = Vec::new();
+        let drive_result = drive(&deflate, &mut out, 4, cfg);
+        std::env::remove_var("GZIPPY_PREFETCH");
+        let (_crc, size) = drive_result.expect("drive");
+        assert_eq!(size, payload.len());
+        let after = BLOCK_FETCHER_GET_CALLS_OBSERVED.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "BlockFetcher::get was not invoked during drive \
+             (before={before}, after={after}). The synchronous-dispatch \
+             primitive port regressed — authoritative re-dispatch is no \
+             longer flowing through `block_fetcher.get`. Mirror of \
+             rapidgzip BlockFetcher.hpp:245-329."
+        );
     }
 
     /// Spec §I "Tests required (new)" #4: assert that the production

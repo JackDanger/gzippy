@@ -11,18 +11,19 @@
 //!
 //! # Why this exists
 //!
-//! Today gzippy's `chunk_fetcher.rs::drive` uses a STATIC partition by
-//! `TARGET_COMPRESSED_CHUNK_BYTES * 8` (chunk_fetcher.rs:120-123) with
-//! no feedback when chunk N actually ends at bit X. Rapidgzip's
-//! `BlockFetcher::get(blockIndex)` consults this partitioner; when a
-//! worker completes, `appendSubchunksToIndexes` calls
-//! `m_blockFinder->insert(actualEnd)` so the next-block index promotes
-//! from a guess to a confirmed offset. Without this class, gzippy
-//! cannot do the same.
+//! Rapidgzip's `BlockFetcher::get(blockIndex)` consults this
+//! partitioner; when a worker completes, `appendSubchunksToIndexes`
+//! calls `m_blockFinder->insert(actualEnd)` so the next-block index
+//! promotes from a guess to a confirmed offset. Pre-port, gzippy's
+//! `chunk_fetcher.rs::drive` used a STATIC partition by
+//! `TARGET_COMPRESSED_CHUNK_BYTES * 8` with no feedback when chunk N
+//! actually ends at bit X.
 //!
-//! This module lands the API faithfully. Wiring into `drive` is a
-//! separate change (would replace the `partition_offsets: Vec<usize>`
-//! field).
+//! Wired into `chunk_fetcher::drive` post commit on
+//! `feat/cross-chunk-retry`: consumer queries `get(idx)` for partition
+//! seeds and calls `insert(actual_end)` per subchunk. The deletion-trap
+//! counter `chunk_fetcher::GZIP_BLOCK_FINDER_INSERTS_OBSERVED` proves
+//! the wiring at runtime.
 
 #![allow(dead_code)]
 
