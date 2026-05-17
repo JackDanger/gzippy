@@ -24,6 +24,7 @@ pub mod apply_window;
 pub mod block_finder;
 pub mod chunk_data;
 pub mod fast_marker_inflate;
+pub mod gzip_chunk;
 pub mod inflate_wrapper;
 pub mod marker_decode;
 pub mod replace_markers;
