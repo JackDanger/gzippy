@@ -1000,8 +1000,10 @@ fn decode_dynamic(
 
 /// Parallel of `decode_huffman_block` but using ISA-L's literal/length
 /// table for the hot Huffman lookup. Distance still uses ConsumeFirstTable
-/// (small fraction of cost).
+/// (small fraction of cost). Inlines the table lookup to avoid
+/// function-call overhead per symbol.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[inline(always)]
 fn decode_huffman_block_isal(
     bits: &mut Bits,
     output: &mut Vec<u16>,
@@ -1010,6 +1012,17 @@ fn decode_huffman_block_isal(
     max_output: usize,
     clean_tail: &mut Option<CleanTailTracker>,
 ) -> Result<()> {
+    // Cache the table pointer outside the hot loop so the compiler can
+    // optimize. Mirrors rapidgzip's call site (deflate.hpp inner block
+    // read loop) where the table is a class member, hoisted by C++.
+    let short_lut = &litlen.table.short_code_lookup;
+    let long_lut = &litlen.table.long_code_lookup;
+    const LARGE_FLAG_BIT: u32 = 1u32 << 25;
+    const LARGE_SHORT_SYM_MASK: u32 = (1u32 << 25) - 1;
+    const LARGE_LONG_SYM_MASK: u32 = (1u32 << 10) - 1;
+    const LARGE_SHORT_CODE_LEN_OFFSET: u32 = 28;
+    const LARGE_SHORT_MAX_LEN_OFFSET: u32 = 26;
+    const LARGE_LONG_CODE_LEN_OFFSET: u32 = 10;
     loop {
         if max_output > 0 && output.len() >= max_output {
             return Err(Error::new(
@@ -1017,12 +1030,31 @@ fn decode_huffman_block_isal(
                 "output cap exceeded in Huffman block",
             ));
         }
-        let ds = litlen.decode(bits);
-        if ds.bit_count == 0 || ds.symbol == 0x1FFF {
+        if bits.available() < 32 {
+            bits.refill();
+        }
+        let next_bits = bits.peek();
+        let next_12 = (next_bits & 0xFFF) as usize;
+        let mut next_sym = short_lut[next_12];
+        let (sym, bit_count) = if (next_sym & LARGE_FLAG_BIT) == 0 {
+            (
+                next_sym & LARGE_SHORT_SYM_MASK,
+                next_sym >> LARGE_SHORT_CODE_LEN_OFFSET,
+            )
+        } else {
+            let long_max_len = next_sym >> LARGE_SHORT_MAX_LEN_OFFSET;
+            let used_bits = next_bits & ((1u64 << long_max_len) - 1);
+            let long_idx = ((next_sym & LARGE_SHORT_SYM_MASK) + (used_bits >> 12) as u32) as usize;
+            next_sym = long_lut[long_idx] as u32;
+            (
+                next_sym & LARGE_LONG_SYM_MASK,
+                next_sym >> LARGE_LONG_CODE_LEN_OFFSET,
+            )
+        };
+        if bit_count == 0 {
             return Err(Error::new(ErrorKind::InvalidData, "Invalid lit/len code"));
         }
-        bits.consume(ds.bit_count);
-        let sym = ds.symbol;
+        bits.consume(bit_count);
         if sym < 256 {
             let value = sym as u16;
             output.push(value);
