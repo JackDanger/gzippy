@@ -92,3 +92,10 @@ strip = true          # Remove symbols for smaller binary
 # (commented out for portable binaries - uncomment for max local perf)
 # [build]
 # rustflags = ["-C", "target-cpu=native"]
+
+# Vendored ISA-L. This is the upstream 0.5.3 base; the next commit will
+# layer rapidgzip's stopping-point patch on top of igzip_inflate.c so the
+# parallel single-member worker can record block boundaries in-band during
+# decode (the precondition for breaking the oversized-chunk imbalance).
+[patch.crates-io]
+isal-sys = { path = "crates/isal-sys-patched" }
