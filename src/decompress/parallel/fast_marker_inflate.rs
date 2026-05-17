@@ -1307,12 +1307,15 @@ fn emit_match(
     // Number of bytes of the match that fall before the start of `output`.
     // Those become markers.
     let marker_count = distance.saturating_sub(out_pos).min(length);
-    // Emit markers. For each i ∈ 0..marker_count, the source position in the
-    // predecessor window (counting back from its last byte = offset 0) is
-    // `(distance - out_pos - 1) - i`. Decreases by 1 each step.
+    // Emit markers per rapidgzip's `MapMarkers` semantics: each marker
+    // u16 value directly indexes into a 32-KiB window from the OLDEST
+    // byte. For chunk position p = (out_pos + i), the source byte is
+    // window[WINDOW_SIZE - distance + p]. So marker[i] = MARKER_BASE
+    // + (WINDOW_SIZE - distance + out_pos + i), increasing by 1 each
+    // step. Mirrors rapidgzip MarkerReplacement.hpp:24-42.
     for i in 0..marker_count {
-        let offset = (distance - out_pos - 1) - i;
-        output.push(MARKER_BASE + offset as u16);
+        let idx = WINDOW_SIZE + out_pos + i - distance;
+        output.push(MARKER_BASE + idx as u16);
     }
     // Remaining bytes are chunk-local; source is `output[out_pos + i - distance]`
     // for i ∈ marker_count..length. After the markers are pushed, the local
@@ -1640,14 +1643,17 @@ mod tests {
 
     #[test]
     fn cross_chunk_backref_emits_correct_markers() {
-        // Hand-built scenario: chunk has no own bytes yet (out_pos=0), and a
-        // back-ref of distance D, length L. All bytes are markers.
+        // MapMarkers encoding: marker[i] = MARKER_BASE + (WINDOW_SIZE - distance + out_pos + i).
         let mut output: Vec<u16> = Vec::new();
         emit_match(&mut output, 4, 3, &mut None); // distance 4, length 3, out_pos 0
-                                                  // Markers should be MARKER_BASE + 3, +2, +1 (offsets going down).
+        let base = (WINDOW_SIZE - 4) as u16;
         assert_eq!(
             output,
-            vec![MARKER_BASE + 3, MARKER_BASE + 2, MARKER_BASE + 1]
+            vec![
+                MARKER_BASE + base,
+                MARKER_BASE + base + 1,
+                MARKER_BASE + base + 2
+            ]
         );
     }
 
@@ -1657,21 +1663,20 @@ mod tests {
         // length=8 → first 3 bytes are markers, next 5 are chunk-local copies.
         let mut output: Vec<u16> = vec![MARKER_BASE + 10, MARKER_BASE + 9];
         emit_match(&mut output, 5, 8, &mut None);
-        // First 3 emitted: markers at offsets 2, 1, 0 (= MARKER_BASE+2, +1, +0).
-        // Then chunk-local copies starting at output[5]: src = output[5-5..]
-        // = the two existing markers (offsets 10, 9) plus the three we just emitted.
+        // marker[i] = MARKER_BASE + (WINDOW_SIZE - 5 + 2 + i) for i in 0..3.
+        let m_base = (WINDOW_SIZE - 5 + 2) as u16;
         let expected = vec![
-            MARKER_BASE + 10, // index 0 (pre-existing)
-            MARKER_BASE + 9,  // index 1 (pre-existing)
-            MARKER_BASE + 2,  // index 2 — marker
-            MARKER_BASE + 1,  // index 3 — marker
-            MARKER_BASE,      // index 4 — marker (offset 0)
+            MARKER_BASE + 10,         // index 0 (pre-existing)
+            MARKER_BASE + 9,          // index 1 (pre-existing)
+            MARKER_BASE + m_base,     // index 2 — marker (i=0)
+            MARKER_BASE + m_base + 1, // index 3 — marker (i=1)
+            MARKER_BASE + m_base + 2, // index 4 — marker (i=2)
             // chunk-local from here. src for index 5 = output[5 - 5] = MARKER_BASE+10
-            MARKER_BASE + 10, // index 5
-            MARKER_BASE + 9,  // index 6 ← src output[6-5]=output[1]=MARKER_BASE+9
-            MARKER_BASE + 2,  // index 7 ← src output[7-5]=output[2]=MARKER_BASE+2
-            MARKER_BASE + 1,  // index 8 ← src output[8-5]=output[3]=MARKER_BASE+1
-            MARKER_BASE,      // index 9 ← src output[9-5]=output[4]=MARKER_BASE
+            MARKER_BASE + 10,         // index 5
+            MARKER_BASE + 9,          // index 6 ← src output[1]
+            MARKER_BASE + m_base,     // index 7 ← src output[2]
+            MARKER_BASE + m_base + 1, // index 8 ← src output[3]
+            MARKER_BASE + m_base + 2, // index 9 ← src output[4]
         ];
         assert_eq!(output, expected);
     }

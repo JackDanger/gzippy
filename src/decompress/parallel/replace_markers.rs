@@ -1,22 +1,19 @@
 //! SIMD-accelerated marker replacement.
 //!
-//! Phase 2 of the marker-based parallel single-member decoder: walk a chunk's
-//! `Vec<u16>` output, replace each marker (value ≥ 32768) with the corresponding
-//! byte from the predecessor chunk's last 32 KB window. Bytes already in
-//! 0..=255 are left untouched.
-//!
-//! Marker encoding (matches the convention in `marker_decode.rs`):
+//! Literal port of rapidgzip's `MapMarkers` semantics
+//! (vendor/rapidgzip/.../MarkerReplacement.hpp:24-42):
 //! ```text
-//!   marker_value = 32768 + offset
-//!   resolved_byte = window[window.len() - 1 - offset]
+//!   marker_value <= 255      → literal byte
+//!   marker_value >= 32768    → window[marker_value - MARKER_BASE]   (index from OLDEST byte)
+//!   256 <= marker_value < 32768 → invalid (rapidgzip throws)
 //! ```
-//! So offset = 0 → last byte of window (most recently emitted), offset increases
-//! going backward. The deflate max back-reference distance is 32768, so offset
-//! fits in 15 bits and `marker_value` always has the high bit set.
+//! The window is a fixed 32 KiB buffer; shorter predecessor windows must
+//! be padded with leading zeros by the caller (matches rapidgzip's
+//! `DecodedData::getWindowAt` prefill at DecodedData.hpp:418-432).
 //!
-//! This file is the resurrected SIMD body from the deleted
-//! `src/hyper_parallel.rs` (commit `3eba641^`). Repurposed unchanged for the
-//! v0.5.x marker pipeline.
+//! Switched from the old "offset from newest byte" encoding to align with
+//! rapidgzip's `MapMarkers` so any downstream rapidgzip code that depends
+//! on marker semantics ports byte-for-byte.
 
 #![allow(dead_code)]
 
@@ -51,7 +48,7 @@ fn replace_markers_scalar(data: &mut [u16], window: &[u8]) {
         if *val >= MARKER_BASE {
             let offset = (*val - MARKER_BASE) as usize;
             if offset < window.len() {
-                *val = window[window.len() - 1 - offset] as u16;
+                *val = window[offset] as u16;
             }
         }
     }
@@ -89,7 +86,7 @@ unsafe fn replace_markers_avx2(data: &mut [u16], window: &[u8]) {
                 if val >= MARKER_BASE {
                     let offset = (val - MARKER_BASE) as usize;
                     if offset < window.len() {
-                        data[i + j] = window[window.len() - 1 - offset] as u16;
+                        data[i + j] = window[offset] as u16;
                     }
                 }
             }
@@ -102,7 +99,7 @@ unsafe fn replace_markers_avx2(data: &mut [u16], window: &[u8]) {
         if *val >= MARKER_BASE {
             let offset = (*val - MARKER_BASE) as usize;
             if offset < window.len() {
-                *val = window[window.len() - 1 - offset] as u16;
+                *val = window[offset] as u16;
             }
         }
     }
@@ -136,7 +133,7 @@ fn replace_markers_neon(data: &mut [u16], window: &[u8]) {
                     if val >= MARKER_BASE {
                         let offset = (val - MARKER_BASE) as usize;
                         if offset < window.len() {
-                            data[i + j] = window[window.len() - 1 - offset] as u16;
+                            data[i + j] = window[offset] as u16;
                         }
                     }
                 }
@@ -149,7 +146,7 @@ fn replace_markers_neon(data: &mut [u16], window: &[u8]) {
         if *val >= MARKER_BASE {
             let offset = (*val - MARKER_BASE) as usize;
             if offset < window.len() {
-                *val = window[window.len() - 1 - offset] as u16;
+                *val = window[offset] as u16;
             }
         }
     }
@@ -174,11 +171,13 @@ mod tests {
         let mut data = vec![b'a' as u16, MARKER_BASE, MARKER_BASE + 1, b'd' as u16];
         let window = b"xy";
         replace_markers(&mut data, window);
-        // offset 0 → window[1] = 'y'
-        // offset 1 → window[0] = 'x'
+        // MapMarkers semantics: marker_value - MARKER_BASE indexes into
+        // window from the oldest byte.
+        // marker 0 → window[0] = 'x'
+        // marker 1 → window[1] = 'y'
         assert_eq!(
             data,
-            vec![b'a' as u16, b'y' as u16, b'x' as u16, b'd' as u16]
+            vec![b'a' as u16, b'x' as u16, b'y' as u16, b'd' as u16]
         );
     }
 
@@ -206,8 +205,8 @@ mod tests {
         let mut data: Vec<u16> = (0..7u16).map(|i| MARKER_BASE + i).collect();
         let window = b"abcdefghij";
         replace_markers(&mut data, window);
-        // offset 0..6 → window[9..3] = j,i,h,g,f,e,d
-        let expected: Vec<u16> = b"jihgfed".iter().map(|&b| b as u16).collect();
+        // MapMarkers: marker i → window[i] for i = 0..6 → a,b,c,d,e,f,g
+        let expected: Vec<u16> = b"abcdefg".iter().map(|&b| b as u16).collect();
         assert_eq!(data, expected);
     }
 
@@ -225,8 +224,8 @@ mod tests {
         replace_markers(&mut data, &window);
         for (i, &v) in data.iter().enumerate() {
             if i % 7 == 0 {
-                let offset = i % 10;
-                assert_eq!(v, window[window.len() - 1 - offset] as u16);
+                let idx = i % 10;
+                assert_eq!(v, window[idx] as u16);
             } else {
                 assert_eq!(v, b'.' as u16);
             }

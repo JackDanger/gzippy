@@ -90,10 +90,9 @@ mod tests {
     #[test]
     fn apply_window_resolves_back_references_to_window_bytes() {
         let mut chunk = ChunkData::new(0, config());
-        // 5 literals (0..5) followed by 3 markers pointing at distances
-        // 0, 1, 2 from the END of the window (i.e., window's last 3 bytes
-        // in reverse). MARKER_BASE = 32768; distance is `v - MARKER_BASE`,
-        // and replace_markers indexes from `window[window.len() - 1 - distance]`.
+        // 5 literals (0..5) followed by 3 markers. MapMarkers semantics:
+        // marker value (post-MARKER_BASE subtraction) is a direct index
+        // into the 32-KiB window from the OLDEST byte.
         let markers: Vec<u16> = vec![0, 1, 2, 3, 4, MARKER_BASE, MARKER_BASE + 1, MARKER_BASE + 2];
         chunk.append_markered(&markers);
 
@@ -105,10 +104,10 @@ mod tests {
         for i in 0..5 {
             assert_eq!(chunk.data_with_markers[i], i as u16);
         }
-        // Marker 0 → window[32767], marker 1 → window[32766], marker 2 → window[32765].
-        assert_eq!(chunk.data_with_markers[5] as u8, window[32767]);
-        assert_eq!(chunk.data_with_markers[6] as u8, window[32766]);
-        assert_eq!(chunk.data_with_markers[7] as u8, window[32765]);
+        // Marker 0 → window[0], marker 1 → window[1], marker 2 → window[2].
+        assert_eq!(chunk.data_with_markers[5] as u8, window[0]);
+        assert_eq!(chunk.data_with_markers[6] as u8, window[1]);
+        assert_eq!(chunk.data_with_markers[7] as u8, window[2]);
     }
 
     #[test]

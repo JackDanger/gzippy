@@ -95,8 +95,9 @@ pub struct ChunkData {
     pub max_encoded_offset_bits: usize,
     pub encoded_size_bits: usize,
     /// Marker-tagged prefix. Each u16 < MARKER_BASE is a literal byte
-    /// (`v as u8`); values ≥ MARKER_BASE encode a cross-chunk back-
-    /// reference of distance `v - MARKER_BASE` into the predecessor's
+    /// (`v as u8`); values ≥ MARKER_BASE are direct indices into the
+    /// predecessor's 32 KiB window from the OLDEST byte (mirrors
+    /// rapidgzip MapMarkers: window[v - MARKER_BASE]). Cross-chunk
     /// last 32 KiB window. `apply_window` (next module) resolves these
     /// in place against a known window.
     pub data_with_markers: Vec<u16>,
