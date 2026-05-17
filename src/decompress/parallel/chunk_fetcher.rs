@@ -16,31 +16,37 @@
 //!
 //! The vendor uses `BS::thread_pool` + `std::future` for dispatch. Our
 //! port keeps the existing std::thread + mpsc worker pool — equivalent
-//! semantics, simpler dependencies. Each pool worker is the per-block
-//! "decodeBlock" job; its result is both sent on a per-job reply channel
-//! AND inserted into `BlockFetcher` (prefetch cache for speculative
-//! jobs, main cache for authoritative). The consumer's
-//! `processNextChunk` body:
+//! semantics, simpler dependencies. The consumer's `processNextChunk`
+//! body (literal port of GzipChunkFetcher.hpp:311-362):
 //!
-//!   1. Compute the next chunk's expected encoded bit offset (the
-//!      predecessor's actual end, or `partition_offsets[0] = 0` for
-//!      chunk 0). Record the access through
-//!      [`BlockFetcher::record_fetch`] so [`FetchNextAdaptive`] tracks
-//!      the sequential pattern.
-//!   2. Consult [`BlockFetcher::get_if_available`]: cache hit (the
-//!      common path on hot partitions) returns the prefetched chunk
-//!      with `record_prefetch_cache_hit` already counted.
-//!   3. Miss → wait on the per-partition reply channel (speculative
-//!      job's result is en route). If the speculative chunk's start
-//!      doesn't match expected (`matches_encoded_offset` +
-//!      `decoded_offset_for`), submit an authoritative re-decode at
-//!      `expected_start`, counted via
-//!      [`BlockFetcher::record_on_demand_fetch`].
+//!   1. Query the next encoded bit offset from
+//!      [`GzipBlockFinder::get`] (literal port of
+//!      GzipChunkFetcher.hpp:318 `m_blockFinder->get(...)`). Record
+//!      the access through [`BlockFetcher::record_fetch`] so
+//!      [`FetchNextAdaptive`] tracks the sequential pattern.
+//!   2. Call [`BlockFetcher::get`] (literal port of
+//!      BlockFetcher.hpp:245-329). The dispatch closure encapsulates:
+//!      (a) drain the speculatively-prefetched `SpecSlot` if present,
+//!      (b) validate the hit (matches `expected_start` + has a
+//!      subchunk boundary at it), (c) on miss/failure, submit
+//!      authoritative at `expected_start` to the mpsc worker pool and
+//!      wait on the reply. On cache hit `get` returns the cached
+//!      `Arc<ChunkData>` directly (literal port of
+//!      BlockFetcher.hpp:302-309); on miss it caches the dispatch
+//!      result under the offset (literal port of
+//!      BlockFetcher.hpp:320 `insertIntoCache`).
+//!   3. `chunkData->setEncodedOffset(*nextBlockOffset)` (mirror of
+//!      GzipChunkFetcher.hpp:349) — done inside the dispatch closure
+//!      when the speculative seed differs from `expected_start`.
 //!   4. Resolve markers via [`apply_window`]; push subchunks into
 //!      [`block_map::append_subchunks_to_block_map`]; populate the
 //!      [`WindowMap`] per the rapidgzip
 //!      `appendSubchunksToIndexes` cascade (GzipChunkFetcher.hpp:430-458).
-//!   5. Write decoded bytes, combine CRC32, move on.
+//!   5. `m_blockFinder->insert(subchunk_end)` per subchunk (literal
+//!      port of GzipChunkFetcher.hpp:374) — closes the partitioner-
+//!      feedback loop so subsequent `get(idx)` queries return
+//!      confirmed offsets.
+//!   6. Write decoded bytes, combine CRC32, move on.
 //!
 //! Multi-stream gzip is handled inside the per-chunk decode loop via
 //! [`IsalInflateWrapper::read_footer_at_current`] +
@@ -669,165 +675,144 @@ fn consumer_loop<W: std::io::Write>(
             None => seed_for(idx),
         };
 
-        // Speculative cache probe (rapidgzip BlockFetcher::get
-        // path at vendor/.../core/BlockFetcher.hpp:263-264).
-        let _ = block_fetcher.get_if_available(&cache_key_for_partition);
+        // ALL chunk acquisition flows through `block_fetcher.get`
+        // (rapidgzip BlockFetcher::get at
+        // vendor/rapidgzip/.../core/BlockFetcher.hpp:245-329). The
+        // dispatch closure encapsulates: (a) drain the speculative
+        // slot if pre-filled, (b) validate the hit (matches expected
+        // start + has a subchunk boundary), (c) on miss/failure
+        // re-dispatch authoritative at `expected_start`. This makes
+        // the consumer's call shape a literal port of
+        // `processNextChunk`'s single-call `getBlock`/`BaseType::get`
+        // pattern at GzipChunkFetcher.hpp:293 + 654.
+        let until = until_for(idx).max(expected_start);
+        let auth_result: Result<Arc<ChunkData>, ChunkDecodeError> = block_fetcher.get(
+            expected_start,
+            || -> Result<Arc<ChunkData>, ChunkDecodeError> {
+                #[cfg(any(test, debug_assertions))]
+                BLOCK_FETCHER_GET_CALLS_OBSERVED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // If speculation is disabled (prefetch_count = 0) or this slot
-        // wasn't pre-filled, dispatch authoritative on demand.
-        let rx = match slot {
-            Some(s) => s.rx,
-            None => {
-                let until = until_for(idx).max(expected_start);
-                submit_job(idx, expected_start, until, true, expected_start)
-            }
-        };
-        trace::emit(
-            "consumer",
-            "speculative_wait",
-            &format!(r#""partition_idx":{idx},"expected_start":{expected_start}"#),
-        );
-        let spec_result = match rx.recv() {
-            Ok(r) => r,
-            Err(_) => {
-                return Err(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
-                    requested: expected_start,
-                    actual: 0,
-                }));
-            }
-        };
-        // The corresponding speculative prefetch (if any) is now done.
-        // Mark it complete in the in-flight tracker.
-        if idx != 0 {
-            block_fetcher.note_prefetch_completed(&cache_key_for_partition);
-        }
-
-        // Hit test: speculative chunk must (a) decode successfully,
-        // (b) cover expected_start, (c) have a subchunk boundary at
-        // expected_start (so decoded_offset_for resolves). Chunk 0 is
-        // authoritative (submitted with start = 0); for it, a hit is
-        // guaranteed if Ok.
-        let hit_chunk: Option<ChunkData> = match spec_result {
-            Ok(mut c) => {
-                if c.matches_encoded_offset(expected_start)
-                    && c.decoded_offset_for(expected_start).is_some()
-                {
-                    trace::emit(
-                        "consumer",
-                        "speculative_hit",
-                        &format!(
-                            r#""partition_idx":{idx},"expected_start":{expected_start},"seed":{},"actual":{}"#,
-                            c.encoded_offset_bits, c.max_encoded_offset_bits,
-                        ),
-                    );
-                    block_fetcher
-                        .statistics
-                        .base
-                        .record_prefetch_cache_hit(true);
-                    // Literal port: rapidgzip's processNextChunk calls
-                    // setEncodedOffset(actual_offset) after the chunk
-                    // resolves to collapse the [encoded, max] range to
-                    // the exact start. No-op for chunks where encoded
-                    // == max == expected_start, but preserves the
-                    // rapidgzip semantic for future range-matching
-                    // candidates (stored-block range offsets per
-                    // Uncompressed.hpp's pair return).
-                    if c.encoded_offset_bits != expected_start {
-                        c.set_encoded_offset(expected_start);
-                    }
-                    Some(c)
-                } else {
-                    trace::emit(
-                        "consumer",
-                        "speculative_miss",
-                        &format!(
-                            r#""partition_idx":{idx},"expected_start":{expected_start},"seed":{},"actual":{}"#,
-                            c.encoded_offset_bits, c.max_encoded_offset_bits,
-                        ),
-                    );
-                    block_fetcher.statistics.base.record_prefetch_cache_miss();
-                    None
-                }
-            }
-            Err(e) => {
-                // Chunk 0 was dispatched authoritative; if it fails the
-                // input is invalid. Speculative chunks may fail on
-                // phantom boundaries — fall through to authoritative.
-                if idx == 0 {
-                    return Err(FetchError::Decode(e));
-                }
-                trace::emit(
-                    "consumer",
-                    "speculative_err",
-                    &format!(
-                        r#""partition_idx":{idx},"expected_start":{expected_start},"err":"{}""#,
-                        trace::esc(&format!("{e:?}")),
-                    ),
-                );
-                block_fetcher.statistics.base.record_prefetch_cache_miss();
-                None
-            }
-        };
-
-        let chunk: ChunkData = match hit_chunk {
-            Some(c) => c,
-            None => {
-                // Re-dispatch authoritative at expected_start. Worker
-                // will fast-path because predecessor's window is in
-                // the WindowMap (just inserted after consume of N-1).
-                //
-                // We route this through `BlockFetcher::get` to mirror
-                // rapidgzip's synchronous dispatch primitive at
-                // vendor/.../core/BlockFetcher.hpp:245-329. The closure
-                // submits the authoritative job to the mpsc worker pool
-                // and blocks on the reply — semantically identical to
-                // rapidgzip's `m_threadPool.submit(...) + future::get`
-                // at BlockFetcher.hpp:573-588. The threading-pool
-                // unification is the §B5 deviation; the consumer-side
-                // call shape is the literal port.
-                let until = until_for(idx).max(expected_start);
-                // Use `BlockFetcher::get` as the synchronous dispatch
-                // primitive (BlockFetcher.hpp:245-329). The closure
-                // submits the authoritative job to the mpsc worker pool
-                // and blocks on the reply. On miss, `get` caches the
-                // resulting `Arc<ChunkData>` under `expected_start`
-                // (literal port of BlockFetcher.hpp:320 `insertIntoCache`).
-                // The returned Arc aliases the cached entry — exactly
-                // rapidgzip's `shared_ptr<ChunkData>` semantics at
-                // BlockFetcher.hpp:245.
-                let auth_result: Result<Arc<ChunkData>, ChunkDecodeError> = block_fetcher.get(
-                    expected_start,
-                    || -> Result<Arc<ChunkData>, ChunkDecodeError> {
-                        #[cfg(any(test, debug_assertions))]
-                        BLOCK_FETCHER_GET_CALLS_OBSERVED
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let rx = submit_job(idx, expected_start, until, true, expected_start);
-                        match rx.recv() {
-                            Ok(Ok(c)) => Ok(Arc::new(c)),
-                            Ok(Err(e)) => Err(e),
-                            Err(_) => Err(ChunkDecodeError::ExactStopMissed {
-                                requested: expected_start,
-                                actual: 0,
-                            }),
+                // Step 1: drain the pre-filled speculative slot (if
+                // any) — equivalent to rapidgzip's
+                // `takeFromPrefetchQueue` at BlockFetcher.hpp:385-410.
+                let speculative_chunk: Option<ChunkData> = match slot {
+                    Some(s) => {
+                        trace::emit(
+                            "consumer",
+                            "speculative_wait",
+                            &format!(
+                                r#""partition_idx":{idx},"expected_start":{expected_start}"#
+                            ),
+                        );
+                        let spec_result = match s.rx.recv() {
+                            Ok(r) => r,
+                            Err(_) => {
+                                return Err(ChunkDecodeError::ExactStopMissed {
+                                    requested: expected_start,
+                                    actual: 0,
+                                });
+                            }
+                        };
+                        if idx != 0 {
+                            block_fetcher.note_prefetch_completed(&cache_key_for_partition);
                         }
-                    },
-                );
-                let auth_arc = match auth_result {
-                    Ok(a) => a,
-                    Err(e) => return Err(FetchError::Decode(e)),
+                        match spec_result {
+                            Ok(mut c) => {
+                                // Validate the speculative hit: must
+                                // cover expected_start AND have a
+                                // subchunk boundary there.
+                                if c.matches_encoded_offset(expected_start)
+                                    && c.decoded_offset_for(expected_start).is_some()
+                                {
+                                    trace::emit(
+                                        "consumer",
+                                        "speculative_hit",
+                                        &format!(
+                                            r#""partition_idx":{idx},"expected_start":{expected_start},"seed":{},"actual":{}"#,
+                                            c.encoded_offset_bits,
+                                            c.max_encoded_offset_bits,
+                                        ),
+                                    );
+                                    block_fetcher
+                                        .statistics
+                                        .base
+                                        .record_prefetch_cache_hit(true);
+                                    // Mirror of rapidgzip
+                                    // GzipChunkFetcher.hpp:349
+                                    // `chunkData->setEncodedOffset(*nextBlockOffset)`.
+                                    if c.encoded_offset_bits != expected_start {
+                                        c.set_encoded_offset(expected_start);
+                                    }
+                                    Some(c)
+                                } else {
+                                    trace::emit(
+                                        "consumer",
+                                        "speculative_miss",
+                                        &format!(
+                                            r#""partition_idx":{idx},"expected_start":{expected_start},"seed":{},"actual":{}"#,
+                                            c.encoded_offset_bits,
+                                            c.max_encoded_offset_bits,
+                                        ),
+                                    );
+                                    block_fetcher.statistics.base.record_prefetch_cache_miss();
+                                    None
+                                }
+                            }
+                            Err(e) => {
+                                // Chunk 0 is authoritative: failure is
+                                // a hard error per
+                                // GzipChunkFetcher.hpp:656-661.
+                                if idx == 0 {
+                                    return Err(e);
+                                }
+                                trace::emit(
+                                    "consumer",
+                                    "speculative_err",
+                                    &format!(
+                                        r#""partition_idx":{idx},"expected_start":{expected_start},"err":"{}""#,
+                                        trace::esc(&format!("{e:?}")),
+                                    ),
+                                );
+                                block_fetcher.statistics.base.record_prefetch_cache_miss();
+                                None
+                            }
+                        }
+                    }
+                    None => None,
                 };
-                // Take ownership via Arc::try_unwrap when we hold the
-                // only ref (typical: cache evicted/sequential clear);
-                // otherwise clone the inner ChunkData. This mirrors
-                // rapidgzip's pattern of mutating through the
-                // shared_ptr — in Rust the safe equivalent is
-                // copy-on-write when the cache still aliases it.
-                // ChunkData is Clone (see chunk_data.rs), so clone-on-
-                // shared is structurally cheap and faithful to the
-                // rapidgzip aliasing semantics.
-                Arc::try_unwrap(auth_arc).unwrap_or_else(|arc| (*arc).clone())
-            }
+
+                // Step 2: on speculative hit, return the validated
+                // chunk. On miss (or no slot pre-filled), dispatch
+                // authoritative — mirror of
+                // GzipChunkFetcher.hpp:654 (`BaseType::get(blockOffset,
+                // blockIndex, getPartitionOffsetFromOffset)`).
+                if let Some(c) = speculative_chunk {
+                    return Ok(Arc::new(c));
+                }
+                let rx = submit_job(idx, expected_start, until, true, expected_start);
+                match rx.recv() {
+                    Ok(Ok(c)) => Ok(Arc::new(c)),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(ChunkDecodeError::ExactStopMissed {
+                        requested: expected_start,
+                        actual: 0,
+                    }),
+                }
+            },
+        );
+        let auth_arc = match auth_result {
+            Ok(a) => a,
+            Err(e) => return Err(FetchError::Decode(e)),
         };
+        // Take ownership via Arc::try_unwrap when we hold the only
+        // ref; otherwise clone the inner ChunkData. This mirrors
+        // rapidgzip's pattern of mutating through the shared_ptr —
+        // in Rust the safe equivalent is copy-on-write when the cache
+        // still aliases it. ChunkData is Clone (chunk_data.rs:106), so
+        // clone-on-shared is structurally cheap and faithful to the
+        // rapidgzip aliasing semantics at GzipChunkFetcher.hpp:329.
+        let chunk: ChunkData = Arc::try_unwrap(auth_arc).unwrap_or_else(|arc| (*arc).clone());
 
         let trim_bytes = chunk.decoded_offset_for(expected_start).unwrap_or(0);
 

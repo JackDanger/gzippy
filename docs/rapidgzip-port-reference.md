@@ -274,6 +274,13 @@ mutation copy via `Arc::try_unwrap` (sole holder) or `(*arc).clone()`
 (cache also holds it). The `crc32fast::Hasher` embedded in
 `ChunkData` is itself `Clone` (serializes its rolling state).
 
+All chunk acquisition flows through `block_fetcher.get(expected_start,
+dispatch)` — the dispatch closure first drains a pre-filled
+`SpecSlot` (validates the speculative hit), and only on miss submits
+authoritative to the worker pool. This matches rapidgzip's
+`processNextChunk` single-call shape at GzipChunkFetcher.hpp:293
+(`getBlock` → `BaseType::get`).
+
 What's still divergent (deferred):
 1. **Thread pool unification.** Rapidgzip uses `BS::thread_pool` +
    `std::future`; gzippy keeps `std::thread::scope` + mpsc. The
@@ -281,14 +288,16 @@ What's still divergent (deferred):
    `submit_job(...).recv()` dance to integrate. Caller-side API shape
    is identical (single synchronous call returns resolved `ChunkData`);
    the threading idiom is the deviation.
-2. **Spec-ring vs BlockFetcher-internal prefetch.** Rapidgzip's
+2. **Spec-ring pre-fill is caller-managed.** Rapidgzip's
    `BlockFetcher::get` triggers `prefetchNewBlocks` during the wait on
    the on-demand task (BlockFetcher.hpp:297-299, 314-316), overlapping
-   prefetches with the blocking dispatch. Gzippy maintains a separate
-   `spec[]` ring of `mpsc::Receiver`s in `consumer_loop`, pre-filled
-   to `pool_size * 2` ahead of the consumer. Function: equivalent.
-   Shape: the spec-ring is a caller-side mechanism, not internal to
-   BlockFetcher. Unifying these is a follow-up atomic task.
+   prefetches with the blocking dispatch. Gzippy maintains the
+   `SpecSlot` pre-fill ring in `consumer_loop` (pre-filled to
+   `pool_size * 2` ahead of the consumer; refilled after each
+   processed chunk). The DRAIN of a slot is inside the
+   `block_fetcher.get` dispatch closure (the speculative-hit branch);
+   the PRE-FILL is still caller-side. Function: equivalent. Shape:
+   pre-fill orchestration is the remaining deviation.
 
 `Prefetcher` and `Cache` (LRU) remain unused — gzippy's `BlockFetcher`
 embeds simpler `Cache` + `PrefetchCache` of its own (`block_fetcher.rs`
