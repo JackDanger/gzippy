@@ -41,72 +41,71 @@ const LUT_SIZE: usize = 1 << LUT_BITS;
 // 13-bit LUT for block candidate detection
 // ============================================================================
 
-/// Check if bits could be a valid deflate block start (stored or dynamic).
-/// Accepts bfinal=0 or bfinal=1. BTYPE=01 (fixed Huffman) is excluded
-/// because the 3-bit header alone matches ~25% of random positions —
-/// emitting that many candidates pollutes the result list and makes
-/// downstream consumers slow.
+/// Literal port of rapidgzip's `isDeflateCandidate<bitCount>`
+/// (vendor/rapidgzip/.../blockfinder/DynamicHuffman.hpp:39-79).
 ///
-/// BTYPE=01 boundary detection lives instead in
-/// `single_member::search_boundary_forward` as a separate tier that
-/// runs only when the other tiers find nothing. That keeps BlockFinder
-/// fast for the common path (where boundaries are BTYPE=00 / BTYPE=10)
-/// and avoids the candidate explosion observed in
-/// `test_find_blocks_parallel_matches_sequential`.
+/// Conservative: only checks the bits that are KNOWN (i.e. the lowest
+/// `bit_count` bits of the input). At smaller `bit_count` fewer fields
+/// are inspected — never rejects based on bits the caller doesn't know.
+///
+/// Filters applied (each gated on having enough bits):
+///   bit 0       = bfinal, must be 0
+///   bits 1-2    = btype, must be 0b10 (dynamic Huffman only)
+///   bits 3-7    = HLIT, ≤ 29
+///   bits 8-12   = HDIST, ≤ 29
 #[inline]
-fn is_valid_candidate_13(bits: u32) -> bool {
-    // Literal port of rapidgzip's `isDeflateCandidate<13>` at
-    // vendor/rapidgzip/.../blockfinder/DynamicHuffman.hpp:39-79.
-    //
-    // Filters:
-    //   bit 0       = bfinal, must be 0 (skip final blocks)
-    //   bits 1-2    = btype, must be 0b10 (dynamic Huffman ONLY).
-    //                 Stored blocks (BTYPE=00) are NOT emitted here —
-    //                 rapidgzip uses a separate seekToNonFinalUncompressedDeflateBlock
-    //                 for those. Mixing dynamic + stored candidates lets
-    //                 stored phantoms beat dynamic naturals at find_first_candidate.
-    //   bits 3-7    = HLIT (5 bits), value+257 must be ≤ 286 → HLIT ≤ 29
-    //   bits 8-12   = HDIST (5 bits), value+1 must be ≤ 30 → HDIST ≤ 29
-    //
-    // The full lit/dist Huffman validation happens later in
-    // validate_huffman_codes (called by find_blocks for accepted
-    // candidates), matching rapidgzip's seekToNonFinalDynamicDeflateBlock
-    // post-LUT validation.
-    let bfinal = bits & 1;
-    if bfinal == 1 {
+fn is_deflate_candidate_n(bits: u32, bit_count: u8) -> bool {
+    if bit_count == 0 {
         return false;
     }
-    let btype = (bits >> 1) & 3;
-    if btype != 2 {
-        return false;
+    let is_last_block = (bits & 1) != 0;
+    let mut matches = !is_last_block;
+    if bit_count <= 1 {
+        return matches;
     }
-    let hlit = (bits >> 3) & 31;
-    let hdist = (bits >> 8) & 31;
-    hlit <= 29 && hdist <= 29
+    let compression_type = (bits >> 1) & 0b11;
+    matches &= (compression_type & 1) == 0;
+    if bit_count <= 2 {
+        return matches;
+    }
+    matches &= compression_type == 0b10;
+    if bit_count < 1 + 2 + 5 {
+        return matches;
+    }
+    let code_count = (bits >> 3) & 0b11111;
+    matches &= code_count <= 29;
+    if bit_count < 1 + 2 + 5 + 5 {
+        return matches;
+    }
+    let distance_code_count = (bits >> 8) & 0b11111;
+    matches &= distance_code_count <= 29;
+    matches
 }
 
-/// Generate the LUT at runtime (called once via lazy_static pattern)
+/// Literal port of rapidgzip's `nextDeflateCandidate<bitCount>`
+/// (DynamicHuffman.hpp:82-98). Recursively shifts right by 1, decreasing
+/// the trusted-bit-count, until isDeflateCandidate returns true or
+/// bit_count hits 0.
+#[inline]
+fn next_deflate_candidate(bits: u32, bit_count: u8) -> u8 {
+    if is_deflate_candidate_n(bits, bit_count) {
+        return 0;
+    }
+    if bit_count == 0 {
+        return 0;
+    }
+    1 + next_deflate_candidate(bits >> 1, bit_count - 1)
+}
+
+/// Generate the 13-bit NEXT_DYNAMIC_DEFLATE_CANDIDATE_LUT.
+/// Literal port of `NEXT_DYNAMIC_DEFLATE_CANDIDATE_LUT` (DynamicHuffman.hpp:113-124),
+/// minus the negative-encoding for lut[i] == 0 case (we don't use that
+/// branch yet; just store the positive skip).
 fn generate_deflate_lut() -> Vec<i8> {
     let mut lut = vec![0i8; LUT_SIZE];
-
     for i in 0..LUT_SIZE {
-        // Simple approach: check if valid, skip 1 if not
-        if is_valid_candidate_13(i as u32) {
-            lut[i] = 0; // Valid candidate
-        } else {
-            // Skip forward until we find a potentially valid position
-            let mut skip = 1i8;
-            for s in 1..13 {
-                if is_valid_candidate_13((i >> s) as u32) {
-                    skip = s as i8;
-                    break;
-                }
-                skip = (s + 1) as i8;
-            }
-            lut[i] = skip.min(13);
-        }
+        lut[i] = next_deflate_candidate(i as u32, LUT_BITS as u8) as i8;
     }
-
     lut
 }
 
