@@ -284,6 +284,80 @@ impl ChunkData {
         }
     }
 
+    /// Move a whole owned decoded-byte buffer into `data`. Literal port
+    /// of `ChunkData::append(deflate::DecodedVector&&)`
+    /// (vendor/.../ChunkData.hpp:209-224). CRC32s the whole slice once
+    /// and updates statistics — does NOT touch subchunks (rapidgzip
+    /// updates `subchunks.back().decodedSize` inside the inner
+    /// `readStream` loop per call, before this method runs; see
+    /// GzipChunk.hpp:321 vs 379). Callers using the outer/inner pattern
+    /// must call `note_inner_decoded_bytes` per inner inflate call and
+    /// then `append_owned_buffer` once per outer iteration.
+    ///
+    /// If `self.data` is empty we use `Vec::append` so the buffer's
+    /// allocation is moved in rather than copied — matching C++'s
+    /// `std::move` semantics. When `data` already holds bytes we fall
+    /// back to `extend_from_slice` (a single contiguous Vec is required
+    /// by downstream consumers).
+    pub fn append_owned_buffer(&mut self, mut buffer: Vec<u8>) {
+        if self.configuration.crc32_enabled {
+            if let Some(last_crc) = self.crc32s.last_mut() {
+                last_crc.update(&buffer);
+            }
+        }
+        self.statistics.non_marker_count += buffer.len() as u64;
+        if self.data.is_empty() {
+            // Zero-copy move of the owned allocation, mirroring
+            // BaseType::append(std::move(toAppend)).
+            self.data = std::mem::take(&mut buffer);
+        } else {
+            self.data.extend_from_slice(&buffer);
+        }
+    }
+
+    /// Mirror of `subchunks.back().decodedSize += nBytesReadPerCall`
+    /// (vendor/.../chunkdecoding/GzipChunk.hpp:321). Used by the
+    /// outer/inner buffer pattern: each inner inflate call writes some
+    /// bytes into the outer buffer; we credit them to the current
+    /// subchunk immediately so block-boundary subchunks emitted mid-
+    /// buffer carry accurate sizes, even though the buffer's bytes
+    /// aren't yet appended to `data` (that happens once per outer iter
+    /// via `append_owned_buffer`).
+    pub fn note_inner_decoded_bytes(&mut self, n_bytes: usize) {
+        if let Some(last) = self.subchunks.last_mut() {
+            last.decoded_size += n_bytes;
+        }
+    }
+
+    /// Variant of `append_block_boundary` that takes an explicit
+    /// `decoded_offset` rather than deriving it from
+    /// `self.decoded_size()`. Used in the outer/inner buffer pattern
+    /// where the running decoded total (alreadyDecoded + nBytesRead in
+    /// rapidgzip terms) is more accurate than `data.len()` mid-buffer.
+    ///
+    /// Mirror of `chunk.appendDeflateBlockBoundary(encodedOffset, decodedOffset)`
+    /// at vendor/.../ChunkData.hpp:455-467 — the C++ signature takes
+    /// decoded_offset explicitly.
+    pub fn append_block_boundary_at(&mut self, encoded_offset_bits: usize, decoded_offset: usize) {
+        if let Some(last) = self.subchunks.last() {
+            if last.encoded_offset_bits == encoded_offset_bits {
+                return;
+            }
+        }
+        if let Some(last) = self.subchunks.last_mut() {
+            debug_assert!(encoded_offset_bits >= last.encoded_offset_bits);
+            last.encoded_size_bits = encoded_offset_bits - last.encoded_offset_bits;
+        }
+        self.next_subchunk_start_decoded_offset = decoded_offset;
+        self.subchunks.push(Subchunk {
+            encoded_offset_bits,
+            encoded_size_bits: 0,
+            decoded_offset,
+            decoded_size: 0,
+            window: None,
+        });
+    }
+
     /// Literal port of `ChunkData::split(spacing)`
     /// (vendor/.../ChunkData.hpp:632-741). Partitions decoded data into
     /// approximately-equal-sized subchunks of `spacing` bytes each by

@@ -113,7 +113,6 @@ pub fn decode_chunk_with_window(
     );
 
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
-    let mut buf = vec![0u8; ALLOCATION_CHUNK_SIZE];
     let mut stopping_point_reached = false;
     let mut last_end_bit = encoded_offset_bits;
     // Track the position of the last END_OF_BLOCK (= start of the next
@@ -130,95 +129,185 @@ pub fn decode_chunk_with_window(
     // serialization on authoritative re-dispatches.
     let mut last_eob_pos = encoded_offset_bits;
 
-    while !stopping_point_reached {
-        let r = wrapper.read_stream(&mut buf)?;
-        if r.bytes_written > 0 {
-            chunk.append_clean(&buf[..r.bytes_written]);
-        }
-        last_end_bit = r.bit_position;
-        if r.finished {
-            // If `finished` fired without an END_OF_STREAM stop event,
-            // this is the BFINAL block of the only (or final) stream
-            // in this chunk's range — exit normally.
-            break;
-        }
-        match r.stopped_at {
-            sp if sp == StoppingPoints::END_OF_STREAM => {
-                // The deflate body of this gzip stream is done. Read
-                // the 8-byte gzip footer at the current cursor (mirror
-                // of rapidgzip's IsalInflateWrapper::readFooter call in
-                // its multi-stream loop). Record into ChunkData via
-                // append_footer; that opens a fresh CRC hasher for any
-                // subsequent stream's bytes (ChunkData.hpp:472-489).
-                let (crc32, isize_field) = wrapper.read_footer_at_current()?;
-                let footer_end_bits = wrapper.tell_compressed();
-                chunk.append_footer(crc32, isize_field, footer_end_bits);
+    // OUTER/INNER buffer pattern — literal port of rapidgzip's
+    // `finishDecodeChunkWithInexactOffset`
+    // (vendor/.../chunkdecoding/GzipChunk.hpp:309-390):
+    //
+    //   while ( !stoppingPointReached ) {
+    //       DecodedVector buffer( ALLOCATION_CHUNK_SIZE );   // L310
+    //       size_t nBytesRead = 0;
+    //       while ( nBytesRead < buffer.size() && !footer && !stoppingPointReached ) {
+    //           tie( perCall, footer ) = readStream(...);    // L318
+    //           nBytesRead += perCall;
+    //           subchunks.back().decodedSize += perCall;     // L321
+    //           // ... stopping-point + isBlockStart logic ...
+    //       }
+    //       alreadyDecoded += nBytesRead;
+    //       buffer.resize( nBytesRead );
+    //       result.append( std::move( buffer ) );            // L379
+    //       if ( footer ) { result.appendFooter(...); }      // L380-384
+    //   }
+    //
+    // The buffer is fresh per OUTER iter (so we can move it into
+    // ChunkData zero-copy on the first outer iter), inner ISA-L calls
+    // fill it, subchunk decoded sizes update PER INNER call, and the
+    // whole buffer is committed once per outer iter.
+    let mut already_decoded: usize = 0;
 
-                // If more bytes remain, parse the next gzip header and
-                // reset the wrapper for the next stream. If no more
-                // bytes (this was the last stream in our range),
-                // we're done.
-                let remaining = wrapper.remaining_input();
-                if remaining.is_empty() {
-                    last_end_bit = footer_end_bits;
-                    stopping_point_reached = true;
+    while !stopping_point_reached {
+        let mut buffer = vec![0u8; ALLOCATION_CHUNK_SIZE];
+        let mut n_bytes_read: usize = 0;
+        // Cached state of the last inner call so the outer can decide
+        // whether to break the OUTER loop (mirrors rapidgzip checking
+        // `( stoppedAt() == NONE ) && ( nBytesReadPerCall == 0 ) && !footer`
+        // at GzipChunk.hpp:386-389).
+        let mut last_per_call: usize = 0;
+        let mut last_stopped_at = StoppingPoints::NONE;
+        let mut last_finished = false;
+        // True when END_OF_STREAM fired mid-outer-iter and we need the
+        // outer iter to drive the multi-stream reset after committing
+        // the buffer (gzippy-specific because our wrapper doesn't
+        // return footers from read_stream).
+        let mut end_of_stream_hit = false;
+
+        while n_bytes_read < buffer.len() && !stopping_point_reached {
+            // Inner inflate call writes into the still-unfilled tail of
+            // `buffer`, mirroring rapidgzip's
+            // `inflateWrapper.readStream( buffer.data() + nBytesRead,
+            //                             buffer.size() - nBytesRead )`
+            // at GzipChunk.hpp:318-319.
+            let r = wrapper.read_stream(&mut buffer[n_bytes_read..])?;
+            last_per_call = r.bytes_written;
+            n_bytes_read += last_per_call;
+            chunk.note_inner_decoded_bytes(last_per_call); // GzipChunk.hpp:321
+
+            last_stopped_at = r.stopped_at;
+            last_finished = r.finished;
+            last_end_bit = r.bit_position;
+
+            if r.finished {
+                // BFINAL of the (last) stream in our range — exit both
+                // loops via the OUTER check below.
+                break;
+            }
+
+            match r.stopped_at {
+                sp if sp == StoppingPoints::END_OF_STREAM => {
+                    // Footer handling needs the buffer's bytes already
+                    // committed (CRC32 is per-stream, and append_footer
+                    // opens a fresh hasher). Break out of inner; outer
+                    // commits the buffer, then drives multi-stream
+                    // reset. Matches rapidgzip's outer-loop footer
+                    // handling at GzipChunk.hpp:380-384.
+                    end_of_stream_hit = true;
                     break;
                 }
-                let (_hdr, hdr_size) = crate::decompress::parallel::gzip_format::read_header(
-                    remaining,
-                )
+                sp if sp == StoppingPoints::END_OF_STREAM_HEADER => {
+                    // isBlockStart=true (GzipChunk.hpp:330-332). Push
+                    // new subchunk at (encoded=r.bit_position,
+                    // decoded=alreadyDecoded + nBytesRead) — line 365.
+                    chunk.append_block_boundary_at(r.bit_position, already_decoded + n_bytes_read);
+                }
+                sp if sp == StoppingPoints::END_OF_BLOCK => {
+                    if !wrapper.is_final_block() {
+                        // isBlockStart = !isFinalBlock (GzipChunk.hpp:334-336).
+                        chunk.append_block_boundary_at(
+                            r.bit_position,
+                            already_decoded + n_bytes_read,
+                        );
+                        last_eob_pos = r.bit_position;
+                    }
+                }
+                sp if sp == StoppingPoints::END_OF_BLOCK_HEADER => {
+                    let not_final = !wrapper.is_final_block();
+                    let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
+                    if last_eob_pos >= until_bits && not_final && not_fixed {
+                        // Stop at the pre-header position so next chunk
+                        // can resume cleanly. Mirrors GzipChunk.hpp:339-345
+                        // (`stoppingPointReached = true`).
+                        last_end_bit = last_eob_pos;
+                        stopping_point_reached = true;
+                    }
+                }
+                sp if sp == StoppingPoints::NONE => {
+                    if last_per_call == 0 {
+                        // Mirrors GzipChunk.hpp:347-351.
+                        stopping_point_reached = true;
+                    }
+                }
+                _ => {}
+            }
+
+            if already_decoded + n_bytes_read >= configuration.max_decoded_chunk_size {
+                // Mirrors GzipChunk.hpp:368-372 — `alreadyDecoded >= max...`.
+                // We use the running counters rather than
+                // `chunk.decoded_size()` because the buffer's in-flight
+                // bytes haven't been moved into `chunk.data` yet
+                // (that happens at the OUTER iter end).
+                chunk.stopped_preemptively = true;
+                stopping_point_reached = true;
+            }
+        }
+
+        // OUTER iter end — commit the buffer once. Mirrors GzipChunk.hpp:376-379.
+        already_decoded += n_bytes_read;
+        buffer.truncate(n_bytes_read);
+        if !buffer.is_empty() {
+            chunk.append_owned_buffer(buffer);
+        }
+
+        if end_of_stream_hit {
+            // Multi-stream reset. The deflate body of this gzip stream
+            // is done. Read the 8-byte footer at the current cursor
+            // (mirror of rapidgzip's IsalInflateWrapper::readFooter
+            // call in its multi-stream loop). Record into ChunkData via
+            // append_footer; that opens a fresh CRC hasher for any
+            // subsequent stream's bytes (ChunkData.hpp:472-489).
+            let (crc32, isize_field) = wrapper.read_footer_at_current()?;
+            let footer_end_bits = wrapper.tell_compressed();
+            chunk.append_footer(crc32, isize_field, footer_end_bits);
+
+            // If more bytes remain, parse the next gzip header and
+            // reset the wrapper for the next stream. If no more bytes
+            // (this was the last stream in our range), we're done.
+            let remaining = wrapper.remaining_input();
+            if remaining.is_empty() {
+                last_end_bit = footer_end_bits;
+                break;
+            }
+            let (_hdr, hdr_size) = crate::decompress::parallel::gzip_format::read_header(remaining)
                 .map_err(|e| {
                     ChunkDecodeError::BootstrapFailed(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("multi-stream gzip header at bit {footer_end_bits}: {e}"),
                     ))
                 })?;
-                wrapper.advance_input(hdr_size);
-                wrapper.reset_for_next_stream();
-                // Re-arm the stopping points (reset cleared them) and
-                // re-seed the dict — the next stream is independent so
-                // an empty window is the correct seed.
-                wrapper.set_stopping_points(
-                    StoppingPoints::END_OF_BLOCK
-                        | StoppingPoints::END_OF_BLOCK_HEADER
-                        | StoppingPoints::END_OF_STREAM_HEADER
-                        | StoppingPoints::END_OF_STREAM,
-                );
-                wrapper.set_window(&[])?;
-                last_end_bit = wrapper.tell_compressed();
-                last_eob_pos = last_end_bit;
-                // Record the stream-boundary as a subchunk break point.
-                chunk.append_block_boundary(last_end_bit);
-            }
-            sp if sp == StoppingPoints::END_OF_STREAM_HEADER => {
-                chunk.append_block_boundary(r.bit_position);
-            }
-            sp if sp == StoppingPoints::END_OF_BLOCK => {
-                if !wrapper.is_final_block() {
-                    chunk.append_block_boundary(r.bit_position);
-                    last_eob_pos = r.bit_position;
-                }
-            }
-            sp if sp == StoppingPoints::END_OF_BLOCK_HEADER => {
-                let not_final = !wrapper.is_final_block();
-                let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
-                if last_eob_pos >= until_bits && not_final && not_fixed {
-                    // Stop at the pre-header position so next chunk
-                    // can resume cleanly.
-                    last_end_bit = last_eob_pos;
-                    stopping_point_reached = true;
-                }
-            }
-            sp if sp == StoppingPoints::NONE => {
-                if r.bytes_written == 0 {
-                    stopping_point_reached = true;
-                }
-            }
-            _ => {}
+            wrapper.advance_input(hdr_size);
+            wrapper.reset_for_next_stream();
+            // Re-arm the stopping points (reset cleared them) and
+            // re-seed the dict — the next stream is independent so an
+            // empty window is the correct seed.
+            wrapper.set_stopping_points(
+                StoppingPoints::END_OF_BLOCK
+                    | StoppingPoints::END_OF_BLOCK_HEADER
+                    | StoppingPoints::END_OF_STREAM_HEADER
+                    | StoppingPoints::END_OF_STREAM,
+            );
+            wrapper.set_window(&[])?;
+            last_end_bit = wrapper.tell_compressed();
+            last_eob_pos = last_end_bit;
+            // Record the stream-boundary as a subchunk break point.
+            chunk.append_block_boundary_at(last_end_bit, already_decoded);
+            continue;
         }
-        if chunk.decoded_size() >= configuration.max_decoded_chunk_size {
-            chunk.stopped_preemptively = true;
-            stopping_point_reached = true;
+
+        if last_finished {
+            break;
+        }
+        // Mirrors GzipChunk.hpp:386-389: if last call hit no stopping
+        // point AND wrote zero bytes AND no footer fired, we're done.
+        if last_stopped_at == StoppingPoints::NONE && last_per_call == 0 {
+            break;
         }
     }
 
