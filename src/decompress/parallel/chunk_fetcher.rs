@@ -70,6 +70,12 @@ pub struct GzipChunkFetcher<'a> {
     window_map: WindowMap,
     /// Index of the next chunk the consumer will see.
     next_consumer_index: usize,
+    /// Confirmed end (compressed-bit offset) of the most recently
+    /// consumed chunk. Drives the overlap-reconciliation skip loop in
+    /// `get_next_chunk`: chunk slots whose end is at-or-before this
+    /// offset are silently skipped (rapidgzip BlockMap insertion-sort
+    /// behavior — shadowed speculative work).
+    last_consumed_end_bits: usize,
     /// True once the thread scope has been entered + workers
     /// dispatched. We can't easily re-enter `std::thread::scope`, so
     /// for this first port we dispatch all workers eagerly at first
@@ -98,6 +104,7 @@ impl<'a> GzipChunkFetcher<'a> {
             chunk_slots: Arc::new(chunk_slots),
             window_map,
             next_consumer_index: 0,
+            last_consumed_end_bits: 0,
             dispatched: false,
         }
     }
@@ -219,25 +226,55 @@ impl<'a> GzipChunkFetcher<'a> {
         if !self.dispatched {
             self.dispatch_all_blocking();
         }
-        if self.next_consumer_index >= self.partition_offsets.len() {
-            return Err(FetchError::MissingWindow {
-                encoded_offset_bits: usize::MAX,
-            });
-        }
-        let idx = self.next_consumer_index;
-        let mut chunk = self.chunk_slots[idx].lock().unwrap().take().ok_or_else(|| {
-            if std::env::var("GZIPPY_DEBUG").is_ok() {
-                eprintln!(
-                    "[parallel_sm:rapidgzip] chunk[{}] slot was None at consumer (partition_offset={}); \
-                     worker either failed to find boundary or decode errored",
-                    idx, self.partition_offsets[idx]
-                );
+        // Overlap reconciliation: workers can overlap when one decodes
+        // past its partition boundary. The consumer drops chunks whose
+        // entire range falls inside the previously consumed range, and
+        // also drops chunks with partial overlap (they'd duplicate
+        // bytes if concatenated). Mirrors rapidgzip's BlockMap
+        // insertion-sort.
+        let (mut chunk, _idx) = loop {
+            if self.next_consumer_index >= self.partition_offsets.len() {
+                return Err(FetchError::MissingWindow {
+                    encoded_offset_bits: usize::MAX,
+                });
             }
-            FetchError::Decode(ChunkDecodeError::ExactStopMissed {
-                requested: idx,
-                actual: 0,
-            })
-        })?;
+            let idx = self.next_consumer_index;
+            let slot = self.chunk_slots[idx].lock().unwrap().take();
+            let Some(chunk) = slot else {
+                if std::env::var("GZIPPY_DEBUG").is_ok() {
+                    eprintln!(
+                        "[parallel_sm:rapidgzip] chunk[{}] slot was None (partition_offset={})",
+                        idx, self.partition_offsets[idx]
+                    );
+                }
+                return Err(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+                    requested: idx,
+                    actual: 0,
+                }));
+            };
+            let chunk_end_bits = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+            if chunk_end_bits <= self.last_consumed_end_bits {
+                // Entirely shadowed. Skip.
+                self.next_consumer_index += 1;
+                continue;
+            }
+            if chunk.encoded_offset_bits < self.last_consumed_end_bits {
+                // Partial overlap. Drop; the simpler form here matches
+                // rapidgzip's on-demand re-dispatch via dropping +
+                // moving on. (TODO: trim subchunks to recover the
+                // non-overlapped tail.)
+                if std::env::var("GZIPPY_DEBUG").is_ok() {
+                    eprintln!(
+                        "[parallel_sm:rapidgzip] chunk[{}] partial overlap (start {} < last_end {}); dropping",
+                        idx, chunk.encoded_offset_bits, self.last_consumed_end_bits
+                    );
+                }
+                self.next_consumer_index += 1;
+                continue;
+            }
+            self.last_consumed_end_bits = chunk_end_bits;
+            break (chunk, idx);
+        };
 
         // Look up the window for this chunk's start. Chunk 0 gets the
         // pre-seeded empty window; chunks 1..N get whatever the
