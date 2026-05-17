@@ -661,46 +661,54 @@ fn consumer_loop<W: std::io::Write>(
         // Refill speculative prefetch pipeline.
         dispatch(&mut next_to_dispatch, &mut speculative_rx);
 
-        // Authoritative prefetch: submit chunk N+1's authoritative
-        // NOW so its decode overlaps with consume of chunk N. We know
-        // expected_start[N+1] (= chunk N's actual end). Skip if a
-        // matching speculative result is already in hand (consumer
-        // will pick it up next iteration); only prefetch when we know
-        // the speculative won't match.
-        if next_to_consume < n_partitions && pending_auth[next_to_consume].is_none() {
-            let spec_matches = speculative_rx[next_to_consume].as_ref().is_some_and(|_rx| {
-                // We can't try_recv non-destructively, so guess by
-                // checking the speculative boundary. If it equals
-                // expected_start, the speculative will likely match
-                // and we skip the prefetch.
-                speculative_boundaries[next_to_consume] == Some(expected_start)
-            });
-            if !spec_matches {
-                let until = partition_offsets
-                    .iter()
-                    .skip(next_to_consume + 1)
-                    .find(|&&s| s > expected_start)
-                    .copied()
-                    .unwrap_or(total_bits);
-                let (tx, rx) = mpsc::channel();
-                trace::emit(
-                    "consumer",
-                    "authoritative_prefetch",
-                    &format!(
-                        r#""partition_idx":{next_to_consume},"start_bit":{expected_start},"until_bit":{until}"#
-                    ),
-                );
-                job_tx
-                    .send(DecodeJob {
-                        partition_idx: next_to_consume,
-                        start_bit: expected_start,
-                        until_bit: until,
-                        authoritative: true,
-                        reply: tx,
-                    })
-                    .expect("worker pool dropped");
-                pending_auth[next_to_consume] = Some(rx);
+        // Authoritative prefetch chain. Up to PREFETCH_DEPTH dispatches
+        // in flight at any time. The first uses the known expected_start
+        // (= chunk N's actual end); deeper slots use BlockFinder
+        // candidates as predictions. Wrong predictions are detected at
+        // consume time (encoded_offset != expected_start) and the
+        // fall-through path submits a fresh authoritative. Pool can
+        // handle parallel wasted work; consumer's serial chain shrinks
+        // when predictions are right.
+        const PREFETCH_DEPTH: usize = 3;
+        for offset in 0..PREFETCH_DEPTH {
+            let pi = next_to_consume + offset;
+            if pi >= n_partitions {
+                break;
             }
+            if pending_auth[pi].is_some() {
+                continue;
+            }
+            let predicted_start = if offset == 0 {
+                expected_start
+            } else if let Some(b) = speculative_boundaries[pi] {
+                b
+            } else {
+                continue;
+            };
+            let until = partition_offsets
+                .iter()
+                .skip(pi + 1)
+                .find(|&&s| s > predicted_start)
+                .copied()
+                .unwrap_or(total_bits);
+            let (tx, rx) = mpsc::channel();
+            trace::emit(
+                "consumer",
+                "authoritative_prefetch",
+                &format!(
+                    r#""partition_idx":{pi},"start_bit":{predicted_start},"until_bit":{until},"depth":{offset}"#
+                ),
+            );
+            job_tx
+                .send(DecodeJob {
+                    partition_idx: pi,
+                    start_bit: predicted_start,
+                    until_bit: until,
+                    authoritative: true,
+                    reply: tx,
+                })
+                .expect("worker pool dropped");
+            pending_auth[pi] = Some(rx);
         }
     }
 
