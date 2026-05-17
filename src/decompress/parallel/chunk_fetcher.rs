@@ -503,7 +503,7 @@ fn consumer_loop<W: std::io::Write>(
         // authoritative (submitted with start = 0); for it, a hit is
         // guaranteed if Ok.
         let hit_chunk: Option<ChunkData> = match spec_result {
-            Ok(c) => {
+            Ok(mut c) => {
                 if c.matches_encoded_offset(expected_start)
                     && c.decoded_offset_for(expected_start).is_some()
                 {
@@ -515,6 +515,17 @@ fn consumer_loop<W: std::io::Write>(
                             c.encoded_offset_bits, c.max_encoded_offset_bits,
                         ),
                     );
+                    // Literal port: rapidgzip's processNextChunk calls
+                    // setEncodedOffset(actual_offset) after the chunk
+                    // resolves to collapse the [encoded, max] range to
+                    // the exact start. No-op for chunks where encoded
+                    // == max == expected_start, but preserves the
+                    // rapidgzip semantic for future range-matching
+                    // candidates (stored-block range offsets per
+                    // Uncompressed.hpp's pair return).
+                    if c.encoded_offset_bits != expected_start {
+                        c.set_encoded_offset(expected_start);
+                    }
                     Some(c)
                 } else {
                     trace::emit(

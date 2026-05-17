@@ -301,6 +301,52 @@ impl ChunkData {
         }
     }
 
+    /// Literal port of `ChunkData::setEncodedOffset`
+    /// (vendor/rapidgzip/.../ChunkData.hpp:601-629). After a chunk
+    /// completes, the consumer calls this with the REAL start offset
+    /// (predecessor's actual end) to re-anchor the chunk from its
+    /// speculative-seed start. Collapses the [encoded, max] match range
+    /// to a single point.
+    ///
+    /// Panics if `offset` is not in `[encoded_offset_bits, max_encoded_offset_bits]`
+    /// — rapidgzip throws `std::invalid_argument` in the same condition.
+    /// In our codepath this method is currently exercised only on hits
+    /// where `encoded == max == offset` (a no-op re-anchor), but keeping
+    /// the full range semantics enables future-stored-block range
+    /// candidate hits per rapidgzip's `Uncompressed.hpp` finder pair.
+    pub fn set_encoded_offset(&mut self, offset: usize) {
+        debug_assert!(
+            self.matches_encoded_offset(offset),
+            "set_encoded_offset called with offset {} outside range [{}, {}]",
+            offset,
+            self.encoded_offset_bits,
+            self.max_encoded_offset_bits,
+        );
+        let end_offset = self.encoded_offset_bits + self.encoded_size_bits;
+        debug_assert!(
+            end_offset >= offset,
+            "chunk end {} is before requested start {}",
+            end_offset,
+            offset,
+        );
+        self.encoded_size_bits = end_offset - offset;
+        self.encoded_offset_bits = offset;
+        self.max_encoded_offset_bits = offset;
+        // Adjust first subchunk: its encoded_offset becomes the new
+        // chunk start, and its encoded_size spans to the next subchunk
+        // (or to the chunk end if there's only one subchunk).
+        if !self.subchunks.is_empty() {
+            let next_offset = if self.subchunks.len() >= 2 {
+                self.subchunks[1].encoded_offset_bits
+            } else {
+                end_offset
+            };
+            let first = &mut self.subchunks[0];
+            first.encoded_offset_bits = offset;
+            first.encoded_size_bits = next_offset.saturating_sub(offset);
+        }
+    }
+
     /// Find the subchunk whose `encoded_offset_bits` exactly matches
     /// `expected_start`, returning its `decoded_offset` (i.e. how many
     /// leading bytes to skip in this chunk's output). Returns None if
@@ -345,6 +391,42 @@ mod tests {
         assert_eq!(sc.decoded_offset, 0);
         assert_eq!(sc.decoded_size, 0);
         assert!(sc.window.is_none());
+    }
+
+    #[test]
+    fn set_encoded_offset_re_anchors_chunk_and_first_subchunk() {
+        // Build a chunk with two subchunks: first at bit 100, second at bit 200,
+        // chunk end at bit 300. max = 150 (range [100,150]).
+        let mut chunk = ChunkData::new(100, small_config());
+        chunk.append_block_boundary(200);
+        chunk.finalize(300);
+        // Pretend the decoder set max via tryToDecode iteration; rapidgzip
+        // chunks created from a stored-block range have max > encoded.
+        chunk.max_encoded_offset_bits = 150;
+
+        // Re-anchor to 130 (within [100, 150]).
+        chunk.set_encoded_offset(130);
+
+        assert_eq!(chunk.encoded_offset_bits, 130);
+        assert_eq!(chunk.max_encoded_offset_bits, 130);
+        assert_eq!(chunk.encoded_size_bits, 300 - 130);
+        assert_eq!(chunk.subchunks[0].encoded_offset_bits, 130);
+        assert_eq!(chunk.subchunks[0].encoded_size_bits, 200 - 130);
+        // Second subchunk unchanged.
+        assert_eq!(chunk.subchunks[1].encoded_offset_bits, 200);
+    }
+
+    #[test]
+    fn set_encoded_offset_single_subchunk_extends_to_chunk_end() {
+        let mut chunk = ChunkData::new(0, small_config());
+        chunk.finalize(500);
+        chunk.max_encoded_offset_bits = 100;
+
+        chunk.set_encoded_offset(50);
+
+        assert_eq!(chunk.encoded_offset_bits, 50);
+        assert_eq!(chunk.subchunks[0].encoded_offset_bits, 50);
+        assert_eq!(chunk.subchunks[0].encoded_size_bits, 500 - 50);
     }
 
     #[test]
