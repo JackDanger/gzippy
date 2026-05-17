@@ -137,17 +137,34 @@ impl<'a> GzipChunkFetcher<'a> {
                     if idx >= n {
                         break;
                     }
-                    let start = partition_offsets[idx];
+                    let partition_start = partition_offsets[idx];
                     let end = partition_offsets
                         .get(idx + 1)
                         .copied()
                         .unwrap_or(total_bits);
-                    if start >= total_bits {
+                    if partition_start >= total_bits {
                         break;
                     }
+                    // Workers seek to a real deflate block boundary
+                    // at-or-after the partition offset before decoding.
+                    // Rapidgzip uses its own BlockFinder for this; we
+                    // re-use gzippy's existing block-search primitive
+                    // until a faithful BlockFinder.hpp port lands.
+                    // Chunk 0 always starts at bit 0.
+                    let real_start = if idx == 0 {
+                        0
+                    } else {
+                        match crate::decompress::parallel::single_member::find_real_boundary_for_fetcher(
+                            input,
+                            partition_start,
+                        ) {
+                            Some(b) => b,
+                            None => continue, // no boundary; slot stays None
+                        }
+                    };
                     let result = finish_decode_chunk_with_inexact_offset(
                         input,
-                        start,
+                        real_start,
                         end,
                         &[], // empty window — speculative
                         configuration,

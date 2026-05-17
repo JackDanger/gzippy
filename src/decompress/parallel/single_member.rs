@@ -935,6 +935,17 @@ fn phase1_search_boundaries(
 /// 1. **BlockFinder heuristic candidates** (BTYPE=00 stored + BTYPE=10
 ///    dynamic Huffman).
 /// 2. **Byte-aligned brute force** (first 128 KiB).
+// Re-export of search_boundary_forward as a stable bit-offset API.
+// Used by the new GzipChunkFetcher (chunk_fetcher.rs) until a faithful
+// rapidgzip BlockFinder.hpp port lands. Returns the bit offset of the
+// first real deflate block boundary at or after `from_bit`, or None.
+pub(crate) fn find_real_boundary_for_fetcher(
+    deflate_data: &[u8],
+    from_bit: usize,
+) -> Option<usize> {
+    search_boundary_forward(deflate_data, from_bit).map(|cs| cs.bits())
+}
+
 fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<ChunkStart> {
     let search_end = (from_bit + SEARCH_RADIUS * 8).min(deflate_data.len() * 8);
     if from_bit >= search_end {
