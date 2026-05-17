@@ -175,6 +175,14 @@ impl<'a> IsalInflateWrapper<'a> {
         StoppingPoints(self.state.stopped_at)
     }
 
+    /// Clear the patched-ISA-L `stopped_at` flag so the next
+    /// `read_stream` call advances past the stop instead of re-reporting
+    /// it. Mirror of rapidgzip's `IsalInflateWrapper::readStream`
+    /// pattern (isal.hpp), which resets the field at entry.
+    pub fn clear_stop(&mut self) {
+        self.state.stopped_at = 0;
+    }
+
     pub fn is_final_block(&self) -> bool {
         self.state.bfinal != 0
     }

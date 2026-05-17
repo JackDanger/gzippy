@@ -516,15 +516,15 @@ pub fn decompress_parallel<W: Write>(
         return Err(ParallelError::TooSmall);
     }
 
-    // Step 8 of the rapidgzip port (rapidgzip-port-design.md): when
-    // GZIPPY_USE_RAPIDGZIP_PATH=1, route through the new
-    // GzipChunkFetcher pipeline instead of the v0.6 marker pipeline.
-    // Lets `make bench-sm` A/B compare the two implementations on
-    // identical input before the v0.6 scaffolding is deleted in step 9.
+    // Rapidgzip-port: the GzipChunkFetcher pipeline is the production
+    // parallel single-member decoder. v0.6 marker-pipeline code below
+    // is no longer reachable from production routing and will be
+    // deleted in a follow-up commit.
     #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-    if std::env::var("GZIPPY_USE_RAPIDGZIP_PATH").is_ok() {
+    {
         return decompress_parallel_via_fetcher(gzip_data, writer, num_threads, t0);
     }
+    #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
     let _ = t0;
 
     // Trailer: gzip stores CRC32 then ISIZE (little-endian) in the last 8 bytes.
