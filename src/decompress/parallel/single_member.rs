@@ -54,54 +54,12 @@ fn debug_enabled() -> bool {
 }
 
 /// Parse the gzip header and return the byte offset where the deflate
-/// stream starts. Rapidgzip parses the header inside `decodeChunk`'s
-/// gzip-format dispatch; we do it once at the driver level and pass
-/// the raw deflate slice to the fetcher.
+/// stream starts. Thin wrapper over `gzip_format::read_header`
+/// (literal port of `rapidgzip::gzip::readHeader`); drops the parsed
+/// `Header` since the driver currently doesn't need it. Multi-stream
+/// support reads subsequent headers via `gzip_format::read_header` too.
 pub(crate) fn skip_gzip_header(data: &[u8]) -> io::Result<usize> {
-    if data.len() < 10 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Data too short for gzip header",
-        ));
-    }
-    if data[0] != 0x1f || data[1] != 0x8b || data[2] != 0x08 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Invalid gzip magic",
-        ));
-    }
-    let flags = data[3];
-    let mut offset = 10;
-    // FEXTRA
-    if flags & 0x04 != 0 {
-        if offset + 2 > data.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid header"));
-        }
-        let xlen = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-        offset += 2 + xlen;
-    }
-    // FNAME
-    if flags & 0x08 != 0 {
-        while offset < data.len() && data[offset] != 0 {
-            offset += 1;
-        }
-        offset += 1;
-    }
-    // FCOMMENT
-    if flags & 0x10 != 0 {
-        while offset < data.len() && data[offset] != 0 {
-            offset += 1;
-        }
-        offset += 1;
-    }
-    // FHCRC
-    if flags & 0x02 != 0 {
-        offset += 2;
-    }
-    if offset > data.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid header"));
-    }
-    Ok(offset)
+    crate::decompress::parallel::gzip_format::read_header(data).map(|(_h, off)| off)
 }
 
 pub fn decompress_parallel<W: Write>(

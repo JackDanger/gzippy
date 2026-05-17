@@ -26,6 +26,7 @@ pub mod chunk_data;
 pub mod chunk_fetcher;
 pub mod fast_marker_inflate;
 pub mod gzip_chunk;
+pub mod gzip_format;
 pub mod inflate_wrapper;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub mod isal_huffman;
