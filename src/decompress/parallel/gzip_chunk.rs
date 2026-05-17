@@ -178,6 +178,17 @@ pub fn finish_decode_chunk_with_inexact_offset(
     let mut wrapper = IsalInflateWrapper::new(input, bootstrap.end_bit_offset)?;
     wrapper.set_window(&clean_window)?;
     wrapper.set_stopping_points(StoppingPoints::END_OF_BLOCK | StoppingPoints::END_OF_BLOCK_HEADER);
+    if std::env::var("GZIPPY_DEBUG_ISAL").is_ok() {
+        eprintln!(
+            "  [isal] pre-loop: points_to_stop_at={} stopped_at={} tmp_out_stopped_at={} block_state={} bit={} until={}",
+            wrapper.debug_points_to_stop_at(),
+            wrapper.debug_stopped_at_raw(),
+            wrapper.debug_tmp_out_stopped_at(),
+            wrapper.debug_block_state(),
+            wrapper.tell_compressed(),
+            until_bits,
+        );
+    }
 
     let mut buf = vec![0u8; ALLOCATION_CHUNK_SIZE];
     let debug_isal = std::env::var("GZIPPY_DEBUG_ISAL").is_ok();

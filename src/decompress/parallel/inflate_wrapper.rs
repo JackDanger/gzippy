@@ -183,6 +183,19 @@ impl<'a> IsalInflateWrapper<'a> {
         self.state.stopped_at = 0;
     }
 
+    pub fn debug_points_to_stop_at(&self) -> u32 {
+        self.state.points_to_stop_at
+    }
+    pub fn debug_stopped_at_raw(&self) -> u32 {
+        self.state.stopped_at
+    }
+    pub fn debug_tmp_out_stopped_at(&self) -> u32 {
+        self.state.tmp_out_stopped_at
+    }
+    pub fn debug_block_state(&self) -> u32 {
+        self.state.block_state
+    }
+
     pub fn is_final_block(&self) -> bool {
         self.state.bfinal != 0
     }
