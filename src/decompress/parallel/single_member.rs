@@ -2200,13 +2200,137 @@ fn resolve_chunk_markers(
     Ok((bootstrap_u8, bootstrap_crc))
 }
 
+/// Pre-compute input windows for every chunk without resolving markers.
+/// Returns `Some(windows)` when window propagation is determinable purely
+/// from chunk `isal_bytes` (the common case: every non-empty chunk has
+/// ≥32 KiB of ISA-L output). Returns `None` when at least one chunk's
+/// output is smaller than the window and its successor's input window
+/// would depend on the resolved bootstrap — in which case the caller
+/// falls back to the sequential phase 2 path that walks chunks in order
+/// and threads the rolling window through marker resolution.
+fn try_precompute_input_windows(chunks: &[AuthoritativeChunk]) -> Option<Vec<Vec<u8>>> {
+    let n = chunks.len();
+    let mut windows: Vec<Vec<u8>> = Vec::with_capacity(n);
+    let mut running: Vec<u8> = Vec::with_capacity(WINDOW_SIZE);
+    for chunk in chunks.iter() {
+        windows.push(running.clone());
+        let c = &chunk.chunk;
+        if c.isal_bytes.len() >= WINDOW_SIZE {
+            running.clear();
+            running.extend_from_slice(&c.isal_bytes[c.isal_bytes.len() - WINDOW_SIZE..]);
+        } else if c.bootstrap.is_empty() && c.bootstrap_clean.is_empty() && c.isal_bytes.is_empty()
+        {
+            // Empty chunk (Subsumed / EmptyTail): window unchanged.
+        } else {
+            // Successor's window depends on this chunk's resolved bootstrap
+            // bytes, which we don't have yet. Sequential phase 2 required.
+            return None;
+        }
+    }
+    Some(windows)
+}
+
 /// Phase 2 + streaming write: resolve bootstrap markers per chunk, write
 /// immediately to `writer`, combine pre-computed ISA-L CRCs. Returns
 /// `(combined_crc32, total_uncompressed_bytes)` after all chunks are
 /// written. CRC+ISIZE verification happens in the caller after this
 /// returns — partial bytes may already be written on mismatch (same
 /// trade-off as rapidgzip's per-chunk streaming design).
+///
+/// Two paths:
+///   - **Parallel**: when input windows for all chunks are determinable
+///     purely from ISA-L output (common case), marker resolution +
+///     bootstrap-bytes CRC happen in a worker pool. Mirrors rapidgzip's
+///     `applyWindow` post-processing pattern.
+///   - **Sequential**: when any chunk's successor window requires the
+///     resolved bootstrap (rare: chunk with <32 KiB ISA-L output and
+///     non-empty bootstrap), fall back to chunk-by-chunk resolution
+///     threading the rolling window through.
 fn phase2_resolve_write_combine<W: Write>(
+    chunks: Vec<AuthoritativeChunk>,
+    writer: &mut W,
+) -> Result<(u32, usize), ParallelError> {
+    if let Some(input_windows) = try_precompute_input_windows(&chunks) {
+        return phase2_resolve_parallel(chunks, input_windows, writer);
+    }
+    phase2_resolve_sequential(chunks, writer)
+}
+
+/// Parallel phase 2: workers resolve markers + CRC bootstrap bytes against
+/// the pre-computed input window for their chunk. Main thread writes
+/// outputs in chunk order and combines CRCs sequentially.
+fn phase2_resolve_parallel<W: Write>(
+    chunks: Vec<AuthoritativeChunk>,
+    input_windows: Vec<Vec<u8>>,
+    writer: &mut W,
+) -> Result<(u32, usize), ParallelError> {
+    let n = chunks.len();
+    debug_assert_eq!(input_windows.len(), n);
+    if n == 0 {
+        return Ok((0, 0));
+    }
+
+    let num_workers = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(4)
+        .min(n);
+
+    // Wrap chunks in per-index Mutexes so workers can take ownership of
+    // the bootstrap data via std::mem::take. The other AuthoritativeChunk
+    // fields stay accessible for the sequential write/combine pass.
+    let chunks: Vec<Mutex<AuthoritativeChunk>> = chunks.into_iter().map(Mutex::new).collect();
+    type ResolveResult = Result<(Vec<u8>, crc32fast::Hasher), ParallelError>;
+    let results: Vec<Mutex<Option<ResolveResult>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let next_task = AtomicUsize::new(0);
+
+    std::thread::scope(|s| {
+        for _ in 0..num_workers {
+            let chunks_ref = &chunks;
+            let windows_ref = &input_windows;
+            let results_ref = &results;
+            let next_ref = &next_task;
+            s.spawn(move || loop {
+                let i = next_ref.fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let mut chunk = chunks_ref[i].lock().unwrap();
+                let mut bootstrap = std::mem::take(&mut chunk.chunk.bootstrap);
+                let bootstrap_clean = std::mem::take(&mut chunk.chunk.bootstrap_clean);
+                drop(chunk);
+                let result =
+                    resolve_chunk_markers(i, &mut bootstrap, &bootstrap_clean, &windows_ref[i]);
+                *results_ref[i].lock().unwrap() = Some(result);
+            });
+        }
+    });
+
+    // Sequential merge: in order, take each chunk + its resolution result,
+    // combine CRCs, write output bytes to the writer.
+    let mut total_crc = crc32fast::Hasher::new();
+    let mut total_size = 0usize;
+    for (i, chunk_mutex) in chunks.into_iter().enumerate() {
+        let chunk = chunk_mutex.into_inner().unwrap().chunk;
+        let result = results[i]
+            .lock()
+            .unwrap()
+            .take()
+            .expect("worker must have produced a result for every chunk index");
+        let (bootstrap_u8, bootstrap_crc) = result?;
+        total_crc.combine(&bootstrap_crc);
+        total_crc.combine(&chunk.isal_crc);
+        total_size += bootstrap_u8.len() + chunk.isal_bytes.len();
+        writer.write_all(&bootstrap_u8).map_err(ParallelError::Io)?;
+        writer
+            .write_all(&chunk.isal_bytes)
+            .map_err(ParallelError::Io)?;
+    }
+
+    Ok((total_crc.finalize(), total_size))
+}
+
+/// Sequential phase 2 (fallback when input windows cannot be pre-computed).
+fn phase2_resolve_sequential<W: Write>(
     chunks: Vec<AuthoritativeChunk>,
     writer: &mut W,
 ) -> Result<(u32, usize), ParallelError> {
