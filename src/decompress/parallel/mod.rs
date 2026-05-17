@@ -28,6 +28,7 @@ pub mod cache;
 pub mod chunk_data;
 pub mod chunk_fetcher;
 pub mod compressed_vector;
+pub mod deflate_block;
 pub mod fast_marker_inflate;
 pub mod gzip_chunk;
 pub mod gzip_format;
