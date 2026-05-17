@@ -160,14 +160,17 @@ impl<'a> GzipChunkFetcher<'a> {
                         let finder =
                             crate::decompress::parallel::block_finder::BlockFinder::new(input);
                         // Scan up to 8 MiB compressed for candidates.
-                        let scan_end_bits = (partition_start + 8 * 1024 * 1024 * 8)
-                            .min(input.len() * 8);
+                        let scan_end_bits =
+                            (partition_start + 8 * 1024 * 1024 * 8).min(input.len() * 8);
                         let candidates = finder.find_blocks(partition_start, scan_end_bits);
+                        let candidate_count = candidates.len();
+                        let mut tried = 0usize;
                         let mut result: Option<ChunkData> = None;
                         for c in &candidates {
                             if c.bit_offset < partition_start {
                                 continue;
                             }
+                            tried += 1;
                             if let Ok(chunk) = finish_decode_chunk_with_inexact_offset(
                                 input,
                                 c.bit_offset,
@@ -178,6 +181,14 @@ impl<'a> GzipChunkFetcher<'a> {
                                 result = Some(chunk);
                                 break;
                             }
+                        }
+                        if result.is_none() && std::env::var("GZIPPY_DEBUG").is_ok() {
+                            eprintln!(
+                                "[parallel_sm:rapidgzip] chunk[{}] no candidate decoded: \
+                                 partition_start={} candidates={} tried={} (BlockFinder yielded \
+                                 candidates but all failed trial-decode)",
+                                idx, partition_start, candidate_count, tried
+                            );
                         }
                         result
                     };
