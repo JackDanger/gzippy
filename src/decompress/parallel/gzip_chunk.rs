@@ -177,42 +177,27 @@ pub fn finish_decode_chunk_with_inexact_offset(
     //     can decode hundreds of MB) can't run unbounded.
     let mut wrapper = IsalInflateWrapper::new(input, bootstrap.end_bit_offset)?;
     wrapper.set_window(&clean_window)?;
-    wrapper.set_stopping_points(StoppingPoints::END_OF_BLOCK | StoppingPoints::END_OF_BLOCK_HEADER);
-    if std::env::var("GZIPPY_DEBUG_ISAL").is_ok() {
-        eprintln!(
-            "  [isal] pre-loop: points_to_stop_at={} stopped_at={} tmp_out_stopped_at={} block_state={} bit={} until={}",
-            wrapper.debug_points_to_stop_at(),
-            wrapper.debug_stopped_at_raw(),
-            wrapper.debug_tmp_out_stopped_at(),
-            wrapper.debug_block_state(),
-            wrapper.tell_compressed(),
-            until_bits,
-        );
-    }
-
-    let mut buf = vec![0u8; ALLOCATION_CHUNK_SIZE];
+    // We do NOT rely on patched-ISA-L stopping-point machinery here.
+    // Empirically (Silesia gzip -9) END_OF_BLOCK and END_OF_BLOCK_HEADER
+    // don't fire when set_dict has been called and the decoder is
+    // started mid-stream — `stopped_at` stays NONE for hundreds of
+    // iterations across many real block boundaries. Instead we drive
+    // the decode with a small per-call output buffer and poll
+    // `block_state` (ISAL_BLOCK_NEW_HDR == between blocks) after each
+    // call, stopping at the first inter-block point past until_bits.
+    // Small buf size gives us many polling opportunities per chunk.
+    const POLL_BUF_SIZE: usize = 4 * 1024;
+    let mut buf = vec![0u8; POLL_BUF_SIZE];
     let debug_isal = std::env::var("GZIPPY_DEBUG_ISAL").is_ok();
     let mut iter = 0usize;
-    let mut stops_eob = 0usize;
-    let mut stops_eobh = 0usize;
-    let mut stops_other = 0usize;
+    let mut boundary_polls = 0usize;
     loop {
         let r = wrapper.read_stream(&mut buf)?;
         if r.bytes_written > 0 {
             chunk.append_clean(&buf[..r.bytes_written]);
         }
         iter += 1;
-        if debug_isal && iter <= 100 {
-            eprintln!(
-                "  [isal] iter={} wrote={} stopped_at={:?} bit={} until={} finished={}",
-                iter, r.bytes_written, r.stopped_at, r.bit_position, until_bits, r.finished
-            );
-        }
 
-        // Per-iteration max guard. Single huge blocks can produce
-        // hundreds of MB across many read_stream calls before any
-        // stopping point fires; without this check the chunk would
-        // run unbounded.
         if chunk.decoded_size() >= configuration.max_decoded_chunk_size {
             chunk.stopped_preemptively = true;
             break;
@@ -220,45 +205,29 @@ pub fn finish_decode_chunk_with_inexact_offset(
         if r.finished {
             break;
         }
-        if r.stopped_at == StoppingPoints::END_OF_BLOCK {
-            stops_eob += 1;
-            let next_block_off = wrapper.tell_compressed();
-            // Position is at the START of the next block (or BFINAL
-            // padding). Stop if we've crossed the partition's until.
-            if next_block_off >= until_bits {
-                break;
-            }
-            wrapper.clear_stop();
-            continue;
-        }
-        if r.stopped_at == StoppingPoints::END_OF_BLOCK_HEADER {
-            stops_eobh += 1;
-            let next_block_off = wrapper.tell_compressed();
-            let not_final = !wrapper.is_final_block();
-            let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
-            chunk.append_block_boundary(next_block_off);
-            if next_block_off >= until_bits && not_final && not_fixed {
-                break;
-            }
-            wrapper.clear_stop();
-            continue;
-        }
-        if r.stopped_at != StoppingPoints::NONE {
-            stops_other += 1;
-        }
-        if r.bytes_written == 0 {
-            // Decoder produced nothing and didn't stop at a requested
-            // point → input exhausted or finished mid-block.
+        if r.bytes_written == 0 && r.stopped_at == StoppingPoints::NONE {
+            // No progress and no stop event: input exhausted or
+            // decoder finished mid-block (BFINAL preceded EOF).
             break;
+        }
+
+        // Block-state poll: ISAL_BLOCK_NEW_HDR (0) means we're
+        // between blocks at a real deflate boundary. Stop if we've
+        // crossed `until_bits`.
+        if wrapper.debug_block_state() == 0 {
+            boundary_polls += 1;
+            let next_block_off = wrapper.tell_compressed();
+            if next_block_off >= until_bits {
+                chunk.append_block_boundary(next_block_off);
+                break;
+            }
         }
     }
     if debug_isal {
         eprintln!(
-            "  [isal] done iter={} eob={} eobh={} other_stops={} bit={} decoded={}",
+            "  [isal] done iter={} boundary_polls={} bit={} decoded={}",
             iter,
-            stops_eob,
-            stops_eobh,
-            stops_other,
+            boundary_polls,
             wrapper.tell_compressed(),
             chunk.decoded_size()
         );
