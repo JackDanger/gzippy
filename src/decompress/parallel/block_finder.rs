@@ -723,6 +723,11 @@ impl<'a> BlockFinder<'a> {
                     let hclen = ((header >> 13) & 15) as u8;
 
                     if hlit > 29 || hdist > 29 {
+                        crate::decompress::parallel::trace::emit(
+                            "block-finder",
+                            "reject_hlit_hdist",
+                            &format!(r#""bit_offset":{bit_offset},"hlit":{hlit},"hdist":{hdist}"#),
+                        );
                         reader.skip(1);
                         bit_offset += 1;
                         continue;
@@ -739,6 +744,11 @@ impl<'a> BlockFinder<'a> {
                     let precode_bits = reader.read(precode_bit_count as u8);
 
                     if !validate_precode(precode_count, precode_bits) {
+                        crate::decompress::parallel::trace::emit(
+                            "block-finder",
+                            "reject_precode_leafsum",
+                            &format!(r#""bit_offset":{bit_offset}"#),
+                        );
                         reader.seek_to_bit(bit_offset + 1);
                         bit_offset += 1;
                         continue;
@@ -761,7 +771,21 @@ impl<'a> BlockFinder<'a> {
                                 hdist,
                                 hclen,
                             });
+                        } else {
+                            crate::decompress::parallel::trace::emit(
+                                "block-finder",
+                                "reject_huffman_codes",
+                                &format!(
+                                    r#""bit_offset":{bit_offset},"hlit":{hlit},"hdist":{hdist},"hclen":{hclen}"#
+                                ),
+                            );
                         }
+                    } else {
+                        crate::decompress::parallel::trace::emit(
+                            "block-finder",
+                            "reject_parse_precode",
+                            &format!(r#""bit_offset":{bit_offset}"#),
+                        );
                     }
 
                     reader.seek_to_bit(bit_offset + 1);
