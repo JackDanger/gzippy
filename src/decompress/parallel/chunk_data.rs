@@ -284,6 +284,49 @@ impl ChunkData {
         }
     }
 
+    /// Migrate the marker-free trailing portion of `data_with_markers`
+    /// into the front of `data`. Mirror of rapidgzip's
+    /// `DecodedData::cleanUnmarkedData` (vendor/.../DecodedData.hpp:492-516).
+    ///
+    /// After this call, `data_with_markers` ends with an actual marker
+    /// (or is empty), so `apply_window` does the minimum work. Bytes
+    /// migrated to `data` are CRC'd now (since they weren't CRC'd at
+    /// `append_markered` time) and the result is combined with the
+    /// existing `crc32s[0]` so the running CRC still covers the
+    /// in-order output.
+    pub fn clean_unmarked_data(&mut self) {
+        let split_at = match self
+            .data_with_markers
+            .iter()
+            .rposition(|&v| v >= MARKER_BASE)
+        {
+            Some(last_marker_pos) => last_marker_pos + 1,
+            None => 0,
+        };
+        if split_at >= self.data_with_markers.len() {
+            return;
+        }
+        let clean_tail: Vec<u8> = self.data_with_markers[split_at..]
+            .iter()
+            .map(|&v| v as u8)
+            .collect();
+        // CRC the migrated bytes now (they were NOT CRC'd at append_markered
+        // time). Result must reflect the in-order output, which is
+        // [data_with_markers_remaining | clean_tail | original_data]
+        // after this method. crc32s[0] currently covers original_data.
+        // New crc32s[0] should cover (clean_tail | original_data).
+        if self.configuration.crc32_enabled && !self.crc32s.is_empty() {
+            let mut migrated_crc = crc32fast::Hasher::new();
+            migrated_crc.update(&clean_tail);
+            migrated_crc.combine(&self.crc32s[0]);
+            self.crc32s[0] = migrated_crc;
+        }
+        self.data_with_markers.truncate(split_at);
+        let mut new_data = clean_tail;
+        new_data.append(&mut self.data);
+        self.data = new_data;
+    }
+
     /// Populate the `window` field of every subchunk with the 32 KiB
     /// window required to resume decode at that subchunk's start.
     /// Must be called AFTER `apply_window` resolves markers — the
@@ -405,6 +448,10 @@ impl ChunkData {
             debug_assert!(end_encoded_offset_bits >= last.encoded_offset_bits);
             last.encoded_size_bits = end_encoded_offset_bits - last.encoded_offset_bits;
         }
+        // Mirrors rapidgzip's ChunkData::finalize calling cleanUnmarkedData
+        // (vendor/.../ChunkData.hpp ~422). Cuts down apply_window's work
+        // by moving any marker-free trailing region into `data`.
+        self.clean_unmarked_data();
     }
 
     /// Literal port of `ChunkData::setEncodedOffset`
