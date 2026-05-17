@@ -224,49 +224,23 @@ impl IsalLitLenCode {
     }
 }
 
-/// Cache of the last-built IsalLitLenCode keyed by code_lengths bytes.
-/// Per advisor diagnosis: the 19 KB table rebuild per block is L1-cache-
-/// thrashing; consecutive blocks in real data (Silesia gzip -9 especially)
-/// frequently share identical code lengths, so caching the table avoids
-/// the rebuild + zeroing cost entirely.
-struct CachedLitLen {
-    table: IsalLitLenCode,
-    cached_lengths: Vec<u8>,
-}
-
-impl CachedLitLen {
-    fn new() -> Self {
-        Self {
-            table: IsalLitLenCode::new_empty(),
-            cached_lengths: Vec::new(),
-        }
-    }
-}
-
 thread_local! {
-    static THREAD_LITLEN_TABLE: std::cell::RefCell<CachedLitLen> =
-        std::cell::RefCell::new(CachedLitLen::new());
+    static THREAD_LITLEN_TABLE: std::cell::RefCell<IsalLitLenCode> =
+        std::cell::RefCell::new(IsalLitLenCode::new_empty());
 }
 
-/// Run `f` with a thread-local IsalLitLenCode for these code lengths.
-/// If the cached table's lengths match, skip the rebuild entirely
-/// (advisor's recommendation — Silesia gzip -9 has many consecutive
-/// blocks with identical Huffman codes, so cache hit rate is high).
+/// Run `f` with a thread-local IsalLitLenCode rebuilt from `code_lengths`.
+/// Avoids per-call allocation of the 19 KB table.
 pub fn with_thread_litlen<R>(
     code_lengths: &[u8],
     f: impl FnOnce(&IsalLitLenCode) -> R,
 ) -> Option<R> {
     THREAD_LITLEN_TABLE.with(|cell| {
-        let mut c = cell.borrow_mut();
-        if c.cached_lengths.as_slice() != code_lengths {
-            if !c.table.rebuild_from(code_lengths) {
-                c.cached_lengths.clear();
-                return None;
-            }
-            c.cached_lengths.clear();
-            c.cached_lengths.extend_from_slice(code_lengths);
+        let mut t = cell.borrow_mut();
+        if !t.rebuild_from(code_lengths) {
+            return None;
         }
-        Some(f(&c.table))
+        Some(f(&t))
     })
 }
 
