@@ -22,6 +22,7 @@
 
 pub mod apply_window;
 pub mod block_finder;
+pub mod block_map;
 pub mod chunk_data;
 pub mod chunk_fetcher;
 pub mod fast_marker_inflate;
