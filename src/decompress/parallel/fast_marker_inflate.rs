@@ -708,23 +708,14 @@ fn decode_loop(
                 .as_ref()
                 .is_some_and(|tracker| tracker.ready_for_handoff())
             {
-                // Peek the next block's BTYPE before handing off to ISA-L.
-                // Refuse to stop at BTYPE=01 (fixed Huffman): a false-positive
-                // start can produce clean output through a stored block then
-                // land at a BTYPE=01-heavy region — handing ISA-L a wrong dict
-                // and a BTYPE=01 start produces garbage with no CRC warning.
-                // Require BTYPE=00/10 so the handoff point has genuine entropy.
-                if bits.available() < 3 {
-                    bits.refill();
-                }
-                let next_btype = (bits.peek() >> 1) & 3;
-                if next_btype == 0 || next_btype == 2 {
-                    **handoff = true;
-                    return Ok(());
-                }
-                // Next block is BTYPE=01 (fixed Huffman) or BTYPE=11
-                // (reserved/invalid): keep bootstrapping. ISA-L can fail on
-                // fixed-Huffman false positives and always fails on BTYPE=11.
+                // Rapidgzip hands off unconditionally when cleanDataCount
+                // >= MAX_WINDOW_SIZE (GzipChunk.hpp:521). We previously
+                // gated on next_btype ∈ {0, 2} as defense against
+                // false-positive start positions, but this point is
+                // post-decode of a real block (EOB just fired), so the
+                // next header is a real one regardless of its btype.
+                **handoff = true;
+                return Ok(());
             }
         }
 
