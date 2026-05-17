@@ -175,18 +175,61 @@ Classifications: **CORRECTNESS** wrong-output if not closed; **PERFORMANCE** cor
    timestamps + per-partition lookups) made the cause findable in two
    trace captures. Without it, this would have been hours of guessing.
 
-### Next gaps (post-rewrite)
+### Decision log entry #4 — phantom boundaries are fundamental
 
-The biggest remaining lever is the speculative-mismatch rate. Current
-trace shows 38/39 chunks hit `authoritative_submit` after speculative
-discards — the consumer is then bottlenecked on serial authoritative
-dispatches even though the fast path is available. Closing this
-needs either (a) a strict BlockFinder so speculative starts almost
-always match (rapidgzip's approach), or (b) a way for the consumer to
-overlap multiple authoritative dispatches with its own apply_window
-work. The dictionary of relevant gaps moves to a `Gaps for follow-on
-work` section once measurement confirms the bottleneck. Don't act
-until traces from `ff47485` are captured + summarized.
+After two more rounds of measurement (HEAD `4263f00` non-fixed-only
+stop + pre-header reporting; HEAD `685fee8` per-block subchunks +
+range-match trim; HEAD `7bb1dd6` per-subchunk window inserts), the
+authoritative-dispatch rate stayed at 38/39. Measured diagnosis:
+
+- Speculative chunk N's `encoded_offset_bits` (= BlockFinder candidate
+  at-or-past partition_seed[N]) and the predecessor's `actual_end`
+  (= where chunk N-1's worker stopped) DIFFER by median 28 Kbit
+  (3.5 KB), max 357 Kbit (44 KB). 100% within 64 KiB.
+- Both are valid non-fixed dynamic-Huffman block starts per the
+  precode + lit/dist Huffman validation in `block_finder.rs::
+  validate_huffman_codes`.
+- They differ because they're block starts ON DIFFERENT DECODE
+  PATHS through the same compressed stream. BlockFinder finds
+  the first position past the seed that LOOKS like a valid block
+  header. Predecessor's natural decode goes through a specific
+  block sequence determined by where its decode started.
+- Per-block subchunks + range-match trim don't help because
+  speculative-chunk subchunks are at speculative-decode positions,
+  not at natural-decode positions.
+- Per-block window inserts don't help for the same reason.
+
+Rapidgzip's identical precode validation (verified at
+`vendor/rapidgzip/.../blockfinder/precodecheck/CountAllocatedLeaves.hpp`)
+should produce the same candidates. Their reported "1 false positive"
+on this fixture has to mean something different — probably "1
+candidate that didn't decode", not "1 candidate that mismatched
+predecessor's natural decode." Their 97% cache hit rate from
+`--verbose` likely comes from sequential consumer-driven dispatch
+hitting the prefetch cache, not from speculative starts aligning
+with natural-decode endpoints.
+
+### Next gaps (real ones, post-measurement)
+
+The architecture's ceiling at 0.17× rapidgzip comes from the
+serialized authoritative chain. Two viable paths to break it:
+
+1. **Authoritative pipelining.** Consumer dispatches K authoritative
+   decodes in flight using predicted expected_starts; pool processes
+   them in parallel. Predictions can come from speculative chunk
+   ends — wrong predictions are re-dispatched. Even at 50% prediction
+   miss rate, K=4 cuts wall time by ~3×. Bench target: 700–900 MB/s.
+
+2. **Single-pass natural-boundary scan.** Run the pure-Rust marker
+   decoder serially over the whole input once to enumerate every
+   real block boundary. Use those as authoritative starts for
+   parallel decode. Cost: ~3 seconds CPU on Silesia, but it
+   parallelizes (decoders run while scanner is still ahead). Bench
+   target: 1200+ MB/s if the scan can overlap with decodes.
+
+Both require structural changes; neither is a single-commit fix.
+Don't act until the next measurement-driven plan with concrete
+acceptance criteria is in this doc.
 
 ---
 
@@ -239,6 +282,10 @@ scripts/parallel_sm_log_grep.sh /tmp/sm-current.log partition_idx=12
 | `6ac952c` | 120 | 0.08× | Initial cutover; everything sequential through re-dispatch |
 | `58d56ee` | 205 | 0.19× | Dropped validate_boundary; boundary search 50s → 2.9s CPU |
 | `ff47485` | 340 | 0.17× | One-piece rewrite: shared WindowMap + worker pool + fast/slow paths + bfinal filter + bootstrap per-block cap. Correct ✓; rapidgzip variance is high (1080-2000 MB/s across runs). |
+| `4263f00` | 320 | 0.16× | Tried non-fixed-only stop with pre-header end_bit reporting. Mismatch rate unchanged (37/39). |
+| `685fee8` | 340 | 0.17× | Added per-block subchunks + range-match consumer trimming. Trim path never fires (speculative subchunks aren't on natural decode path). |
+| `7bb1dd6` (reverted) | 290 | 0.14× | Per-block window inserts. Net loss — overhead without hits. |
+| `44047f2` | (≈340) | (≈0.17×) | Revert to baseline post-rewrite. |
 
 Rapidgzip on same fixture: ~1500 MB/s.
 Goal: ≥0.99× rapidgzip.
