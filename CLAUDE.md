@@ -80,6 +80,18 @@ Two regression tests lock the parallel single-member wiring:
    that would have caught the v0.3.0 regression (parallel was 1.75× slower
    than sequential).
 
+## Active port: rapidgzip → gzippy parallel single-member
+
+**Before changing anything in `src/decompress/parallel/`, read
+`docs/rapidgzip-port-reference.md`.** That file is the living ground
+truth: rapidgzip architecture with C++ line citations, gzippy current
+state, gap matrix (G1..G13) with status, trace event catalog, and a
+pre-commit judgment-call checklist. If a change appears to "work" but
+contradicts the reference, the change is suspect.
+
+Capture a trace with `GZIPPY_LOG_FILE=/tmp/sm.log` and analyze via
+`scripts/parallel_sm_log_summary.py` before claiming a perf change worked.
+
 ## Hard-Won Lessons
 
 **What works**: mmap stdin for multi-threaded (zero-copy, +44%), BufWriter for
