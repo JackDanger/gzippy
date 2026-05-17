@@ -486,20 +486,9 @@ mod tests {
     /// Companion to `test_marker_pipeline_actually_runs_on_x86_64_isal` —
     /// same shape (decompress_single_member at T=4, counter snapshot), but
     /// against a fixture engineered to maximize fixed-Huffman (BTYPE=01)
-    /// block density. BlockFinder excludes BTYPE=01 candidates by design,
-    /// so phase 1a's speculative starts on this fixture often land on
-    /// non-boundary positions. The cross-chunk consistency correction in
-    /// `single_member::phase1c_resolve_consistency` (Opus advisor approach
-    /// #2, refined) handles this via the induction "chunk N's decoded
-    /// end_bit is always a real block boundary; correct chunk N+1's
-    /// start to chunks[N].end_bit and re-decode chunk N+1." No candidate
-    /// lists, no strictness ramp, no top-K — just forward propagation.
-    ///
-    /// Second deletion-trap killer (BTYPE=01-heavy companion to the
-    /// BTYPE=00/10 routing test). On `cfg(target_arch = "x86_64",
-    /// feature = "isal-compression")` it asserts the pipeline ran
-    /// end-to-end. On arm64 the parallel path is gated off and the
-    /// counter check is a no-op.
+    /// block density. The rapidgzip-port path handles this via
+    /// authoritative re-dispatch when the speculative start mismatches
+    /// (see `chunk_fetcher::authoritative_dispatch`).
     #[test]
     fn test_marker_pipeline_runs_on_btype01_heavy_input() {
         use std::sync::atomic::Ordering;
@@ -518,290 +507,37 @@ mod tests {
 
         let before_runs = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
             .load(Ordering::Relaxed);
-        let before_retries =
-            crate::decompress::parallel::single_member::MARKER_PIPELINE_RETRY_ITERATIONS
-                .load(Ordering::Relaxed);
         let mut output = Vec::new();
         crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
         assert_eq!(output, original, "byte-perfect output");
         let after_runs = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
             .load(Ordering::Relaxed);
-        let after_retries =
-            crate::decompress::parallel::single_member::MARKER_PIPELINE_RETRY_ITERATIONS
-                .load(Ordering::Relaxed);
 
         #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
-        {
-            assert!(
-                after_runs > before_runs,
-                "MARKER_PIPELINE_RUNS did not increment ({before_runs} -> {after_runs}) on \
-                 BTYPE=01-heavy fixture — BlockFinder enhancement regressed or \
-                 never landed. This is the second deletion-trap killer; the \
-                 first one (low-entropy fixture) passes because BlockFinder \
-                 finds BTYPE=10 candidates there. The point of THIS test is \
-                 that real-world data sometimes has only BTYPE=01 boundaries \
-                 in a chunk's search range."
-            );
-            // Sibling killer for G5 (Opus advisor PR #97 review): without
-            // this assertion, the test passes even when phase 1a happens
-            // to land on a real boundary by luck — i.e. when G5 is a
-            // no-op. The whole point of the BTYPE=01-heavy fixture is to
-            // *force* misaligned speculative starts so G5's chain-decode
-            // correction sweep has to fire. If a future change makes
-            // phase 1a always succeed on this fixture, the cross-chunk
-            // correction code path goes untested. This counter says "yes,
-            // at least one chunk needed correction" and locks in coverage.
-            assert!(
-                after_retries > before_retries,
-                "MARKER_PIPELINE_RETRY_ITERATIONS did not increment \
-                 ({before_retries} -> {after_retries}) on BTYPE=01-heavy fixture — \
-                 G5 cross-chunk correction code path is not being exercised \
-                 by the very fixture designed to force it. Either (a) phase 1a \
-                 got lucky on every chunk (regenerate fixture with more BTYPE=01 \
-                 density), or (b) phase 1c was bypassed by a routing change."
-            );
-        }
+        assert!(
+            after_runs > before_runs,
+            "MARKER_PIPELINE_RUNS did not increment ({before_runs} -> {after_runs}) on \
+             BTYPE=01-heavy fixture — parallel path silently fell back to \
+             sequential libdeflate."
+        );
         #[cfg(not(all(target_arch = "x86_64", feature = "isal-compression")))]
-        let _ = (before_runs, after_runs, before_retries, after_retries);
+        let _ = (before_runs, after_runs);
     }
 
     // =========================================================================
-    // Optimization counter assertions — lock in rapidgzip-style optimizations.
-    //
-    // The marker pipeline can SILENTLY degrade in ways that still produce
-    // byte-perfect output but trash the perf budget. Output-equivalence
-    // tests don't catch them; only counter-snapshot tests do.
-    //
-    // The structural optimizations we mirror from rapidgzip
-    // (`vendor/rapidgzip/.../GzipChunk.hpp:413-657`) are:
-    //
-    //   1. Per-chunk cleanData → ISA-L handoff. Each worker decodes a
-    //      ~32 KB bootstrap with the marker decoder, then hands off to
-    //      ISA-L with `isal_inflate_set_dict`. Without the handoff, a
-    //      worker decodes the entire chunk at pure-Rust speed
-    //      (~50 MB/s/thread) instead of ISA-L speed (~163 MB/s/thread).
-    //      Test: `test_isal_handoff_fires_on_every_chunk_healthy_data`.
-    //
-    //   2. Bootstrap is bounded (~32 KB per chunk, NOT the full chunk).
-    //      `BOOTSTRAP_OUTPUT_BYTES / num_workers` should be 32-128 KB
-    //      typically. A chunk where the bootstrap accumulates MB of
-    //      output means markers are propagating too aggressively through
-    //      chunk-local copies, or the exit condition is broken.
-    //      Test: `test_bootstrap_bounded_to_clean_window_size`.
-    //
-    //   3. ISA-L produces the bulk of output bytes. On healthy data,
-    //      `ISAL_OUTPUT_BYTES / total_output_bytes` should be ≥ 0.99.
-    //      If it's lower, workers are falling through to
-    //      `marker_finish_after_bootstrap` (slow path).
-    //      Test: `test_isal_produces_at_least_99_percent_of_output`.
-    //
-    //   4. Phase 1a boundary search is sub-quadratic. `BOUNDARY_VALIDATIONS`
-    //      grows linearly with `num_chunks`, not quadratically with
-    //      `SEARCH_RADIUS * num_chunks`. The tier-2 byte-aligned brute
-    //      force was removed because it issued 16384 validation calls
-    //      per failed chunk; we now cap at BlockFinder's candidate count.
-    //      Test: `test_phase1a_validation_count_stays_bounded`.
-    //
-    // All four tests share the `MARKER_PIPELINE_TEST_LOCK` mutex so
-    // their counter snapshots don't race with each other or with the
-    // existing routing-killer tests. They are gated to
-    // `cfg(target_arch = "x86_64", feature = "isal-compression")`
-    // because the optimizations themselves only fire on that target;
-    // arm64 routes to the libdeflate single-thread path which doesn't
-    // exercise this code.
+    // Optimization counter tests previously lived here (OptimizationCounters
+    // snapshots for v0.6 phase-1 internals). The rapidgzip-port replaces the
+    // phase-based pipeline with the chunk_fetcher prefetch loop + worker
+    // pool; the relevant per-event observability is now in
+    // `src/decompress/parallel/trace.rs` (GZIPPY_LOG_FILE=path).
     // =========================================================================
 
-    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
-    #[test]
-    fn test_isal_handoff_fires_on_every_chunk_healthy_data() {
-        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-
-        let original = make_low_entropy_data(24 * 1024 * 1024);
-        let compressed = compress_single_member_gzip(&original);
-        assert!(compressed.len() > 10 * 1024 * 1024);
-
-        let before = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
-        let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
-        let after = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
-        assert_eq!(output, original, "byte-perfect output");
-
-        let delta = after.delta(&before);
-
-        // On 24 MiB healthy low-entropy data at T=4, BlockFinder finds
-        // boundaries for all 4 chunks. Each chunk's bootstrap should
-        // exit on the first block boundary past 32 KB clean tail, then
-        // hand off to ISA-L. The LAST chunk might decode less than
-        // 32 KB of bootstrap output and fall through (no handoff), so
-        // we assert ≥ 3 (the first 3 chunks definitely hand off).
-        assert!(
-            delta.handoff_fired >= 3,
-            "expected ≥3 of 4 chunks to take the bootstrap→ISA-L handoff path, \
-             got {} — bootstrap may be running for the whole chunk instead of \
-             exiting at 32 KB clean tail. counters delta: {delta:?}",
-            delta.handoff_fired
-        );
-        assert_eq!(
-            delta.slow_path_used, 0,
-            "no worker should hit marker_finish_after_bootstrap on healthy data; \
-             {} did — ISA-L was unexpectedly rejecting the speculative input \
-             slice OR the bootstrap clean_window was malformed. delta: {delta:?}",
-            delta.slow_path_used
-        );
-        // Opus advisor flagged that the existing tests didn't assert
-        // on these counters even though "healthy data" implies zero
-        // retries and zero silent boundary-misses. Without these, a
-        // regression where phase 1c re-decodes every chunk (because
-        // ISA-L silently disagrees with BlockFinder on healthy data)
-        // would pass the handoff_fired check but ruin perf.
-        assert_eq!(
-            delta.retry_iterations, 0,
-            "phase 1c retry fired {} times on healthy data — phase 1a or \
-             ISA-L is producing inconsistent end_bits. delta: {delta:?}",
-            delta.retry_iterations
-        );
-    }
-
-    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
-    #[test]
-    fn test_bootstrap_bounded_to_clean_window_size() {
-        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-
-        let original = make_low_entropy_data(24 * 1024 * 1024);
-        let compressed = compress_single_member_gzip(&original);
-
-        let before = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
-        let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
-        let after = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
-
-        let delta = after.delta(&before);
-
-        // Per-chunk bootstrap output budget: in the absence of marker
-        // propagation pathology, bootstrap exits within 1-3 deflate
-        // blocks of accumulating 32 KB clean tail. At flate2 default
-        // L6 on low-entropy data, blocks are ~32-64 KB. The bound:
-        // 32 KB (one block of buildup) + 256 KB (one outlier block
-        // post-threshold) = 288 KB per chunk × 4 = 1.15 MB total.
-        //
-        // We use 2 MB as the alarm threshold — slack for compressor
-        // variability but tight enough that "bootstrap decodes the
-        // whole chunk" (which would be ~6 MB output / chunk × 4 = 24 MB)
-        // immediately fails this test.
-        //
-        // If this test ever red-lines, the most likely cause is
-        // `emit_match`'s chunk-local copy spreading markers forward
-        // through the trailing 32 KB indefinitely. The fix is in
-        // `decode_chunk_bootstrap`'s exit condition — see
-        // `fast_marker_inflate.rs:651-660`.
-        let bootstrap_kb = delta.bootstrap_output_bytes / 1024;
-        let total_output_kb = (output.len() / 1024) as u64;
-        assert!(
-            delta.bootstrap_output_bytes < 2 * 1024 * 1024,
-            "bootstrap output {bootstrap_kb} KiB exceeds 2 MiB across 4 chunks — \
-             markers are propagating through chunk-local copies and never \
-             clearing the trailing 32 KB. delta: {delta:?}, output: {total_output_kb} KiB"
-        );
-    }
-
-    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
-    #[test]
-    fn test_isal_produces_bulk_of_output() {
-        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-
-        let original = make_low_entropy_data(24 * 1024 * 1024);
-        let compressed = compress_single_member_gzip(&original);
-
-        let before = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
-        let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
-        let after = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
-
-        let delta = after.delta(&before);
-        let total_output = output.len() as u64;
-
-        // ISA-L should produce the bulk of output bytes; the
-        // bootstrap markers + slow-path fallback should be a small
-        // share. This is the structural reason gzippy can match
-        // rapidgzip's per-thread throughput — most of the work
-        // happens in ISA-L's hand-tuned asm inner loop, not the
-        // pure-Rust marker decoder.
-        //
-        // Threshold is 85% (was initially 99% — too tight). For a
-        // 24 MiB fixture at T=4, each chunk is 6 MiB. The bootstrap
-        // exits at the first block boundary after 32 KB of clean
-        // tail; with L6 deflate's ~64-256 KB block sizes on mixed
-        // entropy data, the bootstrap can decode 200-500 KB before
-        // exiting (5-8% of a 6 MiB chunk). On Silesia-class inputs
-        // (120 MB chunks at T=4) the same absolute bootstrap is
-        // 0.3-0.5% so the ISA-L share lands at 99.5%+. We don't
-        // run a Silesia-sized fixture in unit tests; the 85% bar
-        // here catches the catastrophic regression ("bootstrap
-        // runs for the whole chunk → ISA-L share ~ 0%") on the
-        // 24 MiB fixture without false-positiving on the legitimate
-        // small-chunk overhead.
-        //
-        // CI measured 92.71% on this fixture pre-relax (delta:
-        // bootstrap=1.8 MB, isal=23.3 MB, total=24 MB at T=4).
-        let isal_share = (delta.isal_output_bytes as f64) / (total_output as f64);
-        assert!(
-            isal_share >= 0.85,
-            "ISA-L produced only {:.2}% of output ({} of {} bytes) — \
-             bootstrap is running for too much of each chunk, OR the \
-             slow path is firing. delta: {delta:?}",
-            isal_share * 100.0,
-            delta.isal_output_bytes,
-            total_output
-        );
-    }
-
-    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
-    #[test]
-    fn test_phase1a_validation_count_stays_bounded() {
-        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-
-        let original = make_low_entropy_data(24 * 1024 * 1024);
-        let compressed = compress_single_member_gzip(&original);
-
-        let before = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
-        let mut output = Vec::new();
-        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
-        let after = crate::decompress::parallel::single_member::OptimizationCounters::snapshot();
-
-        let delta = after.delta(&before);
-
-        // BlockFinder emits a bounded number of candidates per chunk
-        // (a few per 32 KB block × a 512 KiB search radius = at most
-        // a few hundred). With early-exit on first valid candidate,
-        // the actual call count per chunk is typically 1-3 — the
-        // first BlockFinder candidate after the chunk anchor usually
-        // validates.
-        //
-        // 1000 total validations across 4 chunks is the upper bound
-        // for healthy data. Higher means BlockFinder is emitting too
-        // many candidates OR our validators are rejecting real
-        // boundaries (e.g., the lowered MIN_CAP broke validation).
-        //
-        // The pre-`5a68ad9` design with tier-2 brute force could
-        // issue 16384+ calls on a failed chunk; this test would have
-        // caught that as a regression on the failed-chunk path.
-        assert!(
-            delta.boundary_validations < 1000,
-            "phase 1a issued {} try_decode_at calls across 4 chunks — \
-             expected < 1000 on healthy data. BlockFinder may be \
-             emitting too many candidates, OR validation is rejecting \
-             real boundaries forcing more probes. delta: {delta:?}",
-            delta.boundary_validations
-        );
-    }
+    // The four OptimizationCounters-based tests (test_isal_handoff_fires_*,
+    // test_bootstrap_bounded_*, test_isal_produces_bulk_*, test_phase1a_*)
+    // were deleted with the rapidgzip-port. Their assertions probed v0.6
+    // internal counters that no longer exist; the relevant per-event
+    // observability is now in `src/decompress/parallel/trace.rs`
+    // (GZIPPY_LOG_FILE=path → scripts/parallel_sm_log_summary.py).
 
     // =========================================================================
     // Layer 3: Output Identity — same output regardless of thread count

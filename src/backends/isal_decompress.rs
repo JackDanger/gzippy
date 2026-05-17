@@ -587,6 +587,7 @@ pub fn decompress_deflate_from_bit_with_end(
 /// ends), and the output-byte-offset where the just-finished block's last
 /// byte sits in the chunk's output buffer.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct BlockBoundary {
     pub bit_offset: usize,
     pub output_offset: usize,
