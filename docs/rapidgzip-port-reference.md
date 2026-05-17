@@ -73,6 +73,7 @@ Silesia gzip -9 (162 MB → 503 MB, T=16, neurotic homelab x86_64):
 | `a22e305` | 700 | 0.38× | (cleanDataCount handoff tried + reverted — needs decoder amortization) |
 | `7919d8a` | 708 | 0.38× | + remove BTYPE filter at handoff (matches rapidgzip literally) |
 | `432e883` | 708 | 0.38× | (cap bootstrap output tried + reverted — wasted speculative work) |
+| `e32cf94` | 560 | 0.28× | full deflate::Block hot loop ported (IsalLitLenCode + IsalDistCode); per-block ISA-L table rebuild dominates L1 cache (4% cache hit rate on Silesia per-chunk reuse) — literal port now lives in production despite measured perf cost |
 
 ## Why the 2.5× gap persists
 
