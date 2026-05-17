@@ -7,6 +7,31 @@
 > today (the marker pipeline plus an ad-hoc fetcher) versus what sits
 > next to it as reference code (the new rapidgzip-shaped ports).
 
+## CUTOVER POLICY (May 2026, user directive)
+
+The goal until the rapidgzip port is structurally complete is **faithful
+correctness, not performance**. Intermediate states will be slower than
+steady state. That is expected and accepted.
+
+**Rules for the cutover period:**
+
+- **DO NOT revert perf regressions.** Ship every faithful port commit
+  even when `make bench-sm` shows a perf loss. Performance is optimized
+  LATER, after the structural port is complete.
+- **PORT, DON'T INNOVATE.** Every change in `src/decompress/parallel/`
+  must mirror a specific rapidgzip C++ region. Cite `vendor/.../file:line`
+  in code comments AND commit messages. If no rapidgzip counterpart
+  exists, do not write the code. Crossbeam-channel, custom thread pools,
+  unique algorithms: all out of scope during the cutover.
+- **CORRECTNESS still matters.** Output bytes, CRC32, ISIZE must always
+  verify. Tests under `src/tests/routing.rs` must stay green.
+- **NO FALLBACKS.** Failure is `Err(GzippyError::Decompression(_))`.
+  No silent libdeflate or ISA-L retries.
+
+Done when an Opus advisor agrees the implementation matches rapidgzip
+in structure and calculation. Then — and only then — does performance
+optimization start.
+
 Citations are `file:line` against:
 
 - gzippy: `src/decompress/parallel/*.rs`, `src/decompress/mod.rs`,
