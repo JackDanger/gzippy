@@ -41,19 +41,22 @@ pub fn apply_window(chunk: &mut ChunkData, window: &[u8]) {
     // chunk.crc so it covers (resolved_markers ++ data) in order,
     // compute CRC of the resolved bytes and combine BEFORE chunk.crc.
     //
-    // crc32fast::Hasher::combine appends, so we build a fresh hasher
-    // over the resolved bytes then combine the existing chunk.crc (which
-    // covers `data`) into it. The result is then assigned back.
+    // The post-resolve `data_with_markers` is guaranteed (by the
+    // debug_assert above) to hold only values < 256 (i.e. valid u8
+    // values stored in the low byte of a u16). We hash the bytes in
+    // 4 KiB stack chunks to avoid a 0.5×len allocation on large chunks.
     if chunk.configuration.crc32_enabled {
         let mut resolved_crc = crc32fast::Hasher::new();
-        // Cast u16 → u8. Safe because the debug_assert above guarantees
-        // every value is < 256. We use a per-chunk scratch buffer to
-        // avoid allocating one byte at a time.
-        let mut buf: Vec<u8> = Vec::with_capacity(chunk.data_with_markers.len());
-        for v in &chunk.data_with_markers {
-            buf.push(*v as u8);
+        let mut scratch = [0u8; 4096];
+        let mut i = 0;
+        while i < chunk.data_with_markers.len() {
+            let n = scratch.len().min(chunk.data_with_markers.len() - i);
+            for (k, v) in chunk.data_with_markers[i..i + n].iter().enumerate() {
+                scratch[k] = *v as u8;
+            }
+            resolved_crc.update(&scratch[..n]);
+            i += n;
         }
-        resolved_crc.update(&buf);
         resolved_crc.combine(&chunk.crc);
         chunk.crc = resolved_crc;
     }

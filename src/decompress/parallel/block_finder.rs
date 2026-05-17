@@ -55,6 +55,20 @@ const LUT_SIZE: usize = 1 << LUT_BITS;
 /// `test_find_blocks_parallel_matches_sequential`.
 #[inline]
 fn is_valid_candidate_13(bits: u32) -> bool {
+    // Reject bfinal=1 — final blocks aren't useful chunk split points
+    // (no successor chunk to start there). Mirror of rapidgzip's
+    // blockfinder/DynamicHuffman.hpp:47-49 filter.
+    //
+    // This was tried in isolation (commit fbfff82) and OOM-killed gzippy
+    // because the synchronous redispatch path couldn't keep up with the
+    // increased "no candidate found" rate — each redispatch allocated a
+    // fresh 80 MiB output buffer, and the consumer-thread serial chain
+    // ballooned memory. Safe to enable now because the new chunk_fetcher
+    // routes rejections through the async thread pool instead.
+    let bfinal = bits & 1;
+    if bfinal == 1 {
+        return false;
+    }
     let btype = (bits >> 1) & 3;
 
     match btype {
@@ -931,8 +945,8 @@ mod tests {
 
         // Valid: BTYPE=00 (stored), BFINAL=0
         assert_eq!(lut[0b000], 0);
-        // Valid: BTYPE=00 (stored), BFINAL=1
-        assert_eq!(lut[0b001], 0);
+        // Invalid: BTYPE=00 (stored), BFINAL=1 — bfinal filter rejects.
+        assert!(lut[0b001] > 0);
 
         // Invalid: BTYPE=01 (fixed) — excluded from candidate search at
         // the BlockFinder level. Detection lives in
@@ -945,9 +959,9 @@ mod tests {
         let valid = 0b00000_00000_10_0u32;
         assert_eq!(lut[valid as usize], 0);
 
-        // Valid: BTYPE=10 (dynamic), BFINAL=1, HLIT=0, HDIST=0
-        let valid_final = 0b00000_00000_10_1u32;
-        assert_eq!(lut[valid_final as usize], 0);
+        // Invalid: BTYPE=10 (dynamic), BFINAL=1 — bfinal filter rejects.
+        let final_dyn = 0b00000_00000_10_1u32;
+        assert!(lut[final_dyn as usize] > 0);
     }
 
     #[test]
