@@ -1574,11 +1574,24 @@ fn decode_chunk_with_handoff_legacy(
     }
 }
 
-/// Inexact worker seam used by phase 1b. Unlike the legacy helper below, this
-/// path must not rescue itself by finishing the chunk with the marker decoder;
-/// any failure to establish a clean ISA-L handoff is surfaced as `NoDecode` so
-/// the dispatcher can decide whether to discard, refetch exactly, or materialize
-/// an empty partition.
+/// Inexact worker seam used by phase 1b.
+///
+/// Two structurally distinct outcomes, both deterministic by precondition:
+///
+/// 1. **Marker-only candidate** — when ISA-L cannot run (no clean 32 KB window
+///    accumulated during bootstrap, or non-x86_64, or `force_slow_path`),
+///    bootstrap covers the entire chunk and ends at a real block boundary
+///    ≥ `end_bit_limit`. The returned `Candidate` carries marker output that
+///    phase 2 will resolve. This is the *canonical* path for chunks whose
+///    structure prevents ISA-L's dict precondition; it is not a rescue.
+///
+/// 2. **ISA-L candidate** — when bootstrap accumulated a clean window AND
+///    ISA-L is available, hand off to ISA-L. If ISA-L overshoots its verified
+///    end limit or returns failure, return `NoDecode` so the dispatcher can
+///    decide. This worker **never** rescues a failed ISA-L attempt with the
+///    marker decoder; that is what `SLOW_PATH_USED` counts (it should stay
+///    zero on healthy x86_64 data — any nonzero value is a refused rescue
+///    the dispatcher will retry via [`decode_chunk_exact`]).
 fn decode_chunk_inexact(
     deflate_data: &[u8],
     requested_partition: usize,
@@ -1612,28 +1625,40 @@ fn decode_chunk_inexact(
         );
     }
 
-    let Some(dict) = clean_window else {
-        if debug_enabled() {
-            eprintln!(
-                "[parallel_sm:v0.6] chunk start={start_bit}: inexact worker returning NoDecode \
-                 (bootstrap_end_bit={} bfinal_hit={} stop={stop:?})",
-                bootstrap_end_bit, bfinal_hit
+    // Path 1 — marker-only candidate (precondition path, not a rescue).
+    // Bootstrap stops at the first clean-tail block boundary it can find;
+    // when that succeeded the dict is available. When it didn't, bootstrap
+    // stopped at end_bit_limit/BFINAL without a clean window, and we
+    // continue the marker decoder to end_bit_limit so the output covers the
+    // entire chunk.
+    let dict = match clean_window {
+        Some(d) => d,
+        None => {
+            return marker_only_candidate(
+                requested_partition,
+                start_bit,
+                bootstrap_markers,
+                bootstrap_end_bit,
+                stop_hint_bits,
+                t_worker,
+                deflate_data,
             );
         }
-        return WorkerOutcome::NoDecode;
     };
 
     #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
     {
         if force_slow_path {
             let _ = (per_chunk_output_hint, num_chunks_total);
-            if debug_enabled() {
-                eprintln!(
-                    "[parallel_sm:v0.6] chunk start={start_bit}: inexact worker returning NoDecode \
-                     because force_slow_path was requested"
-                );
-            }
-            return WorkerOutcome::NoDecode;
+            return marker_only_candidate(
+                requested_partition,
+                start_bit,
+                bootstrap_markers,
+                bootstrap_end_bit,
+                stop_hint_bits,
+                t_worker,
+                deflate_data,
+            );
         }
 
         let end_byte = match stop {
@@ -1662,6 +1687,13 @@ fn decode_chunk_inexact(
                 let Some(verified_end_bit) =
                     normalize_isal_end_bit(deflate_data, start_bit, stop, isal_end_bit)
                 else {
+                    // ISA-L was attempted, succeeded, but overshot the
+                    // verified end beyond the snap tolerance. We refuse to
+                    // rescue with the marker decoder; surface as NoDecode so
+                    // the dispatcher can discard and exact-retry. SLOW_PATH_USED
+                    // counts these refused-rescue events — it must stay at 0
+                    // on healthy production data.
+                    SLOW_PATH_USED.fetch_add(1, Ordering::Relaxed);
                     if debug_enabled() {
                         eprintln!(
                             "[parallel_sm:v0.6] chunk start={start_bit}: inexact worker returning NoDecode \
@@ -1691,6 +1723,11 @@ fn decode_chunk_inexact(
                 })
             }
             None => {
+                // ISA-L was attempted and returned failure. Refuse to rescue
+                // with the marker decoder; surface as NoDecode for the
+                // dispatcher to discard + exact-retry. See SLOW_PATH_USED
+                // comment above for the meaning of this counter.
+                SLOW_PATH_USED.fetch_add(1, Ordering::Relaxed);
                 if debug_enabled() {
                     eprintln!(
                         "[parallel_sm:v0.6] chunk start={start_bit}: inexact worker returning NoDecode \
@@ -1705,20 +1742,64 @@ fn decode_chunk_inexact(
     #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
     {
         let _ = (
-            deflate_data,
-            requested_partition,
-            start_bit,
             stop,
             per_chunk_output_hint,
             num_chunks_total,
             force_slow_path,
             dict,
-            bootstrap_end_bit,
-            bootstrap_markers,
-            t_worker,
         );
-        WorkerOutcome::NoDecode
+        marker_only_candidate(
+            requested_partition,
+            start_bit,
+            bootstrap_markers,
+            bootstrap_end_bit,
+            stop_hint_bits,
+            t_worker,
+            deflate_data,
+        )
     }
+}
+
+/// Marker-only candidate constructor for chunks whose precondition for the
+/// ISA-L handoff is not met (no 32 KB clean window accumulated during
+/// bootstrap, or non-x86_64, or `force_slow_path`). Bootstrap stops at the
+/// first clean-tail block boundary or at end_bit_limit; this helper extends
+/// it to end_bit_limit via the marker decoder so the chunk's output is
+/// complete. Returns a `Candidate` with marker-only output (phase 2 resolves
+/// against the predecessor's window).
+///
+/// This is *not* a rescue path. It is the canonical decoder for chunks the
+/// bootstrap→ISA-L design cannot accelerate; the marker decoder is the only
+/// correct deflate decoder available without a dict. `SLOW_PATH_USED`
+/// remains an "ISA-L rescue refused" counter and is *not* incremented here.
+fn marker_only_candidate(
+    requested_partition: usize,
+    start_bit: ChunkStart,
+    bootstrap_markers: Vec<u16>,
+    bootstrap_end_bit: usize,
+    end_bit_limit: Option<usize>,
+    t_worker: std::time::Instant,
+    deflate_data: &[u8],
+) -> WorkerOutcome {
+    let chunk = match marker_finish_after_bootstrap(
+        deflate_data,
+        bootstrap_markers,
+        bootstrap_end_bit,
+        end_bit_limit,
+    ) {
+        Ok(c) => c,
+        Err(_) => return WorkerOutcome::NoDecode,
+    };
+    let end_bit = chunk.end_bit_offset;
+    WorkerOutcome::Candidate(CandidateChunk {
+        requested_partition,
+        discovered_start: start_bit,
+        discovered_end: RealBlockBoundary(end_bit),
+        chunk: ChunkResult {
+            worker_elapsed: t_worker.elapsed(),
+            ..chunk
+        },
+    })
 }
 
 fn decode_chunk_inexact_legacy(
@@ -1741,31 +1822,59 @@ fn decode_chunk_inexact_legacy(
     )
 }
 
-/// Transitional exact worker seam. The authoritative start/end contract is not
-/// enforced yet; Commit 1 only provides the type-checked target shape that
-/// later commits will make strict.
-fn decode_chunk_exact_legacy(
+/// Exact worker contract. Caller guarantees `start_bit` is a verified real
+/// deflate block boundary (from the BoundaryRegistry). Returns
+/// `Err(ExactStopFailed)` only when the inexact worker returned `NoDecode`
+/// — i.e. when ISA-L was attempted, succeeded with a clean dict, but the
+/// resulting end overshot the verified end-limit beyond the snap tolerance
+/// (or ISA-L itself failed). The marker-only path always produces a
+/// `Candidate`, so chunks whose structure prevents ISA-L still succeed via
+/// this entry. The dispatcher converts the error into `ParallelError::DecodeFailed`
+/// which the routing layer handles by falling back to libdeflate sequential.
+fn decode_chunk_exact(
     deflate_data: &[u8],
     start_bit: ChunkStart,
     end_limit: Option<ChunkEndLimit>,
     per_chunk_output_hint: usize,
     num_chunks_total: usize,
-) -> std::io::Result<AuthoritativeChunk> {
+) -> Result<AuthoritativeChunk, ExactStopFailed> {
     let stop = end_limit.map_or(ChunkDecodeStop::UntilEnd, ChunkDecodeStop::Verified);
-    decode_chunk_with_handoff_legacy(
+    match decode_chunk_inexact(
         deflate_data,
+        usize::MAX,
         start_bit,
         stop,
         per_chunk_output_hint,
         num_chunks_total,
         false,
-    )
-    .map(|chunk| AuthoritativeChunk {
-        start: start_bit,
-        end: RealBlockBoundary(chunk.end_bit_offset),
-        chunk,
-    })
+    ) {
+        WorkerOutcome::Candidate(candidate) => Ok(AuthoritativeChunk::from_candidate(candidate)),
+        WorkerOutcome::NoDecode => {
+            if debug_enabled() {
+                eprintln!(
+                    "[parallel_sm:v0.6] exact: inexact worker returned NoDecode start={} end_limit={:?}",
+                    start_bit.bits(),
+                    end_limit
+                );
+            }
+            Err(ExactStopFailed)
+        }
+    }
 }
+
+/// Returned by [`decode_chunk_exact`] when the worker cannot produce an
+/// authoritative chunk matching its verified-start / verified-end contract.
+/// The dispatcher converts this into [`ParallelError::DecodeFailed`].
+#[derive(Debug)]
+struct ExactStopFailed;
+
+impl std::fmt::Display for ExactStopFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("exact-stop worker failed: ISA-L was attempted and refused rescue")
+    }
+}
+
+impl std::error::Error for ExactStopFailed {}
 
 /// Slow-path completion when the ISA-L handoff isn't available or fails:
 /// finish the chunk with the marker decoder, appending its output to the
@@ -1917,7 +2026,7 @@ fn exact_or_empty_authoritative(
         );
     }
 
-    decode_chunk_exact_legacy(
+    decode_chunk_exact(
         deflate_data,
         start,
         end_limit,
