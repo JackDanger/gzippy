@@ -71,6 +71,97 @@ impl From<std::io::Error> for ChunkDecodeError {
 /// rapidgzip's `ALLOCATION_CHUNK_SIZE` (GzipChunk.hpp uses 128 KiB).
 const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 
+/// Fast-path chunk decoder used by workers when the predecessor's 32 KiB
+/// window is available in the shared WindowMap. Skips the marker-decoder
+/// bootstrap entirely: seeds the patched-ISA-L wrapper with the known
+/// dict, sets the rapidgzip stopping-points, decodes to the first
+/// non-fixed END_OF_BLOCK_HEADER at-or-past `until_bits`. The returned
+/// chunk has only clean bytes (no markers), and `apply_window` is a
+/// no-op on it.
+///
+/// Mirror of `rapidgzip::GzipChunk::finishDecodeChunkWithInexactOffset`
+/// (vendor/rapidgzip/.../chunkdecoding/GzipChunk.hpp:280-410) when
+/// `initialWindow` is known.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+pub fn decode_chunk_with_window(
+    input: &[u8],
+    encoded_offset_bits: usize,
+    until_bits: usize,
+    initial_window: &[u8; 32768],
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    let t_decode = std::time::Instant::now();
+    let mut wrapper = IsalInflateWrapper::new(input, encoded_offset_bits)?;
+    wrapper.set_window(&initial_window[..])?;
+    wrapper.set_stopping_points(
+        StoppingPoints::END_OF_BLOCK
+            | StoppingPoints::END_OF_BLOCK_HEADER
+            | StoppingPoints::END_OF_STREAM_HEADER,
+    );
+
+    let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
+    let mut buf = vec![0u8; ALLOCATION_CHUNK_SIZE];
+    let mut stopping_point_reached = false;
+    let mut last_end_bit = encoded_offset_bits;
+
+    while !stopping_point_reached {
+        let r = wrapper.read_stream(&mut buf)?;
+        if r.bytes_written > 0 {
+            chunk.append_clean(&buf[..r.bytes_written]);
+        }
+        last_end_bit = r.bit_position;
+        if r.finished {
+            break;
+        }
+        match r.stopped_at {
+            sp if sp == StoppingPoints::END_OF_STREAM_HEADER => {
+                chunk.append_block_boundary(r.bit_position);
+            }
+            sp if sp == StoppingPoints::END_OF_BLOCK => {
+                if !wrapper.is_final_block() {
+                    chunk.append_block_boundary(r.bit_position);
+                }
+                if r.bit_position >= until_bits {
+                    stopping_point_reached = true;
+                }
+            }
+            sp if sp == StoppingPoints::END_OF_BLOCK_HEADER => {
+                let not_final = !wrapper.is_final_block();
+                let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
+                chunk.append_block_boundary(r.bit_position);
+                if r.bit_position >= until_bits && not_final && not_fixed {
+                    stopping_point_reached = true;
+                }
+            }
+            sp if sp == StoppingPoints::NONE => {
+                if r.bytes_written == 0 {
+                    stopping_point_reached = true;
+                }
+            }
+            _ => {}
+        }
+        if chunk.decoded_size() >= configuration.max_decoded_chunk_size {
+            chunk.stopped_preemptively = true;
+            stopping_point_reached = true;
+        }
+    }
+
+    chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+    chunk.finalize(last_end_bit);
+    Ok(chunk)
+}
+
+#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+pub fn decode_chunk_with_window(
+    _input: &[u8],
+    _encoded_offset_bits: usize,
+    _until_bits: usize,
+    _initial_window: &[u8; 32768],
+    _configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    Err(ChunkDecodeError::UnsupportedPlatform)
+}
+
 /// Exact-stop decode for chunk 0 (empty initial window) or test fixtures
 /// where the caller has a verified exact end offset. Mirror of
 /// `decodeChunkWithInflateWrapper` (GzipChunk.hpp:190-268).

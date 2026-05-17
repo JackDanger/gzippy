@@ -85,6 +85,14 @@ impl Default for ChunkConfiguration {
 #[derive(Debug)]
 pub struct ChunkData {
     pub encoded_offset_bits: usize,
+    /// Upper bound on the encoded offset this chunk could "match" if
+    /// the consumer asks for a slightly different start. Equals
+    /// `encoded_offset_bits` for a chunk that decoded from an exact
+    /// position; can be larger if the chunk's worker is willing to
+    /// stand in for any expected start in [encoded_offset_bits,
+    /// max_encoded_offset_bits]. Mirror of rapidgzip's
+    /// `ChunkData::maxEncodedOffsetInBits` (ChunkData.hpp:546-549).
+    pub max_encoded_offset_bits: usize,
     pub encoded_size_bits: usize,
     /// Marker-tagged prefix. Each u16 < MARKER_BASE is a literal byte
     /// (`v as u8`); values ≥ MARKER_BASE encode a cross-chunk back-
@@ -134,6 +142,7 @@ impl ChunkData {
         };
         Self {
             encoded_offset_bits,
+            max_encoded_offset_bits: encoded_offset_bits,
             encoded_size_bits: 0,
             data_with_markers: Vec::new(),
             data: Vec::new(),
@@ -143,6 +152,57 @@ impl ChunkData {
             statistics: ChunkStatistics::default(),
             configuration,
             next_subchunk_start_decoded_offset: 0,
+        }
+    }
+
+    /// Whether `expected_start` falls within this chunk's acceptable
+    /// start range. Mirror of `rapidgzip::ChunkData::matchesEncodedOffset`
+    /// (ChunkData.hpp:396-403). Used by the consumer to accept
+    /// speculative chunks whose start is in tolerance rather than
+    /// exactly equal to the predecessor's actual end.
+    pub fn matches_encoded_offset(&self, expected_start: usize) -> bool {
+        self.encoded_offset_bits <= expected_start && expected_start <= self.max_encoded_offset_bits
+    }
+
+    /// Extract the trailing 32 KiB of decoded output as a window
+    /// suitable for seeding the next chunk's decoder. Returns None if
+    /// the trailing 32 KiB contains any markers (i.e. would corrupt
+    /// the successor's dict). For fast-path chunks (data_with_markers
+    /// is empty) and chunks whose ISA-L bulk segment is at least
+    /// 32 KiB, this always returns Some.
+    pub fn last_32kib_window(&self) -> Option<[u8; 32768]> {
+        const W: usize = 32768;
+        let total = self.decoded_size();
+        if total == 0 {
+            return None;
+        }
+        let mut out = [0u8; W];
+        if self.data.len() >= W {
+            out.copy_from_slice(&self.data[self.data.len() - W..]);
+            Some(out)
+        } else if total >= W {
+            // Tail straddles markers + clean. Markers in the trailing
+            // W bytes mean we can't build a clean window without
+            // apply_window resolving them first; caller has to wait.
+            let from_data = self.data.len();
+            let from_markers = W - from_data;
+            let m_start = self.data_with_markers.len() - from_markers;
+            for v in &self.data_with_markers[m_start..] {
+                if *v >= crate::decompress::parallel::replace_markers::MARKER_BASE {
+                    return None;
+                }
+            }
+            for (i, v) in self.data_with_markers[m_start..].iter().enumerate() {
+                out[i] = *v as u8;
+            }
+            out[from_markers..].copy_from_slice(&self.data);
+            Some(out)
+        } else {
+            // Less than W bytes total. We don't try to combine with the
+            // predecessor's window here; the consumer can do that if it
+            // needs to. Return None to signal "no clean tail-window
+            // available standalone."
+            None
         }
     }
 

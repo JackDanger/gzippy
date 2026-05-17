@@ -1,59 +1,103 @@
-//! Port of `rapidgzip::WindowMap` (WindowMap.hpp). Stores propagated
-//! 32-KiB windows keyed by the compressed-bit-offset they're meant to
-//! seed. Append-only; insertions must be in strictly increasing key
-//! order (matches rapidgzip's BlockMap invariant).
+//! Shared, thread-safe port of `rapidgzip::WindowMap` (WindowMap.hpp).
+//! Stores propagated 32-KiB windows keyed by the compressed-bit offset
+//! they're meant to seed. Workers AND the consumer share one handle.
 //!
-//! Used by the chunk fetcher (next module): as chunks complete in
-//! order, the main thread extracts the last 32 KiB of each chunk's
-//! output and inserts it under the chunk's `encoded_offset_bits +
-//! encoded_size_bits` key. Workers reading from `WindowMap::get(offset)`
-//! for the next chunk wait until the value appears.
-//
-// Allowed dead_code: step 6 of rapidgzip-port-design.md migration;
-// consumed by chunk_fetcher.rs in step 7.
+//! Workers may call `get_or_wait(start_bit, timeout)` to check whether
+//! the predecessor chunk's tail has been published (enabling the fast
+//! path in [`crate::decompress::parallel::gzip_chunk::decode_chunk_with_window`]).
+//! On insert, all waiters are notified.
+//!
+//! Mirror of rapidgzip's `mutable std::mutex` + `std::condition_variable`
+//! pattern. Used the BTreeMap structure so `get_lower_bound` / range
+//! queries are available for future enhancements (currently only `get`
+//! is used).
+
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
-#[derive(Default)]
+pub type Window = Arc<[u8; 32768]>;
+
+struct Inner {
+    entries: BTreeMap<usize, Window>,
+}
+
+/// Thread-safe handle to the underlying map. Cheaply clonable; all
+/// clones share state. Mirror of rapidgzip's `std::shared_ptr<WindowMap>`.
+#[derive(Clone)]
 pub struct WindowMap {
-    entries: BTreeMap<usize, Arc<[u8; 32768]>>,
+    state: Arc<(Mutex<Inner>, Condvar)>,
 }
 
 impl WindowMap {
     pub fn new() -> Self {
         Self {
-            entries: BTreeMap::new(),
+            state: Arc::new((
+                Mutex::new(Inner {
+                    entries: BTreeMap::new(),
+                }),
+                Condvar::new(),
+            )),
         }
     }
 
-    pub fn get(&self, encoded_offset_bits: usize) -> Option<Arc<[u8; 32768]>> {
-        self.entries.get(&encoded_offset_bits).cloned()
+    /// Non-blocking lookup. Returns the window keyed at `encoded_offset_bits`
+    /// if present, else None.
+    pub fn get(&self, encoded_offset_bits: usize) -> Option<Window> {
+        let (lock, _cvar) = &*self.state;
+        let inner = lock.lock().unwrap();
+        inner.entries.get(&encoded_offset_bits).cloned()
     }
 
-    /// Insert a window keyed at `encoded_offset_bits`. Must be strictly
-    /// greater than any previously inserted key. Mirror of rapidgzip's
-    /// `BlockMap::push` invariant (BlockMap.hpp:99-106).
-    pub fn insert(&mut self, encoded_offset_bits: usize, window: Arc<[u8; 32768]>) {
-        debug_assert!(
-            self.entries
-                .keys()
-                .next_back()
-                .is_none_or(|last| *last < encoded_offset_bits),
-            "WindowMap insertion must be strictly increasing (last={:?}, new={})",
-            self.entries.keys().next_back(),
-            encoded_offset_bits
-        );
-        self.entries.insert(encoded_offset_bits, window);
+    /// Block until the window keyed at `encoded_offset_bits` is inserted
+    /// or `timeout` elapses. Returns the window on success, None on
+    /// timeout. Mirror of rapidgzip's `WindowMap::get` with a wait.
+    pub fn get_or_wait(&self, encoded_offset_bits: usize, timeout: Duration) -> Option<Window> {
+        let (lock, cvar) = &*self.state;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut inner = lock.lock().unwrap();
+        loop {
+            if let Some(w) = inner.entries.get(&encoded_offset_bits) {
+                return Some(w.clone());
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline - now;
+            let (i, _wait) = cvar.wait_timeout(inner, remaining).unwrap();
+            inner = i;
+        }
+    }
+
+    /// Insert a window keyed at `encoded_offset_bits`. Wakes all waiters.
+    /// Idempotent: if a window already exists for the key, the existing
+    /// value is preserved (workers and consumer can race to insert the
+    /// same end_bit window; the first wins; debug_assert in release
+    /// builds is too aggressive for races).
+    pub fn insert(&self, encoded_offset_bits: usize, window: Window) {
+        let (lock, cvar) = &*self.state;
+        let mut inner = lock.lock().unwrap();
+        inner.entries.entry(encoded_offset_bits).or_insert(window);
+        cvar.notify_all();
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        let (lock, _cvar) = &*self.state;
+        let inner = lock.lock().unwrap();
+        inner.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
+    }
+}
+
+impl Default for WindowMap {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -63,7 +107,7 @@ impl WindowMap {
 mod tests {
     use super::*;
 
-    fn window_of(value: u8) -> Arc<[u8; 32768]> {
+    fn window_of(value: u8) -> Window {
         Arc::new([value; 32768])
     }
 
@@ -77,7 +121,7 @@ mod tests {
 
     #[test]
     fn insert_and_get_round_trips() {
-        let mut m = WindowMap::new();
+        let m = WindowMap::new();
         m.insert(0, window_of(0xAA));
         m.insert(1024, window_of(0xBB));
         m.insert(2048, window_of(0xCC));
@@ -88,20 +132,41 @@ mod tests {
     }
 
     #[test]
-    fn get_returns_arc_clone() {
-        let mut m = WindowMap::new();
-        let w = window_of(0x42);
-        m.insert(100, w.clone());
-        let retrieved = m.get(100).unwrap();
-        assert!(Arc::ptr_eq(&w, &retrieved));
+    fn handle_is_shared_across_clones() {
+        let m1 = WindowMap::new();
+        let m2 = m1.clone();
+        m1.insert(100, window_of(0x42));
+        assert_eq!(m2.get(100).unwrap()[0], 0x42);
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "strictly increasing")]
-    fn insert_out_of_order_panics_in_debug() {
-        let mut m = WindowMap::new();
-        m.insert(2048, window_of(0));
-        m.insert(1024, window_of(0)); // smaller — invariant violation
+    fn get_or_wait_times_out_when_absent() {
+        let m = WindowMap::new();
+        let t0 = std::time::Instant::now();
+        let result = m.get_or_wait(99, Duration::from_millis(50));
+        assert!(result.is_none());
+        assert!(t0.elapsed() >= Duration::from_millis(40));
+    }
+
+    #[test]
+    fn get_or_wait_wakes_on_insert() {
+        let m = WindowMap::new();
+        let m2 = m.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            m2.insert(7, window_of(0xEE));
+        });
+        let result = m.get_or_wait(7, Duration::from_millis(500));
+        handle.join().unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()[0], 0xEE);
+    }
+
+    #[test]
+    fn duplicate_insert_keeps_first() {
+        let m = WindowMap::new();
+        m.insert(50, window_of(0x01));
+        m.insert(50, window_of(0x02));
+        assert_eq!(m.get(50).unwrap()[0], 0x01);
     }
 }
