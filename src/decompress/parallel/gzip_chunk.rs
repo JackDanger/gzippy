@@ -165,77 +165,97 @@ pub fn finish_decode_chunk_with_inexact_offset(
     }
 
     // Phase 2 — ISA-L bulk decode from the bootstrap's block boundary
-    // with the clean 32 KiB tail as dict. Stops at:
-    //   - any END_OF_BLOCK whose successor is at-or-past until_bits
-    //     (chunks naturally bounded by the requested partition end),
-    //   - any END_OF_BLOCK_HEADER on a non-FIXED block past until_bits
-    //     (records a high-quality subchunk boundary for downstream),
-    //   - BFINAL,
-    //   - the `max_decoded_chunk_size` per-iteration guard. This last
-    //     fires regardless of stop type so a single huge dynamic-
-    //     Huffman block (common on Silesia gzip -9, where one block
-    //     can decode hundreds of MB) can't run unbounded.
+    // with the clean 32 KiB tail as dict. Direct port of
+    // rapidgzip's `finishDecodeChunkWithInexactOffset`
+    // (vendor/rapidgzip/.../GzipChunk.hpp:280-410). Key invariants:
+    //   - set_window (dict) → set_stopping_points → loop. Both
+    //     configuration calls happen BEFORE the first read_stream.
+    //     Without the stop request, ISA-L's `points_to_stop_at` is
+    //     zero and `stopped_at` is never written; the loop's break
+    //     conditions can't see boundaries.
+    //   - Per-iter buffer is 128 KiB (rapidgzip ALLOCATION_CHUNK_SIZE).
+    //     A small buffer causes ISA-L to return via OUT_OVERFLOW
+    //     before any stop fires.
+    //   - Chunk-end is decided by inspecting `stopped_at` after each
+    //     read_stream return.
     let mut wrapper = IsalInflateWrapper::new(input, bootstrap.end_bit_offset)?;
     wrapper.set_window(&clean_window)?;
-    // We do NOT rely on patched-ISA-L stopping-point machinery here.
-    // Empirically (Silesia gzip -9) END_OF_BLOCK and END_OF_BLOCK_HEADER
-    // don't fire when set_dict has been called and the decoder is
-    // started mid-stream — `stopped_at` stays NONE for hundreds of
-    // iterations across many real block boundaries. Instead we drive
-    // the decode with a small per-call output buffer and poll
-    // `block_state` (ISAL_BLOCK_NEW_HDR == between blocks) after each
-    // call, stopping at the first inter-block point past until_bits.
-    // Small buf size gives us many polling opportunities per chunk.
-    const POLL_BUF_SIZE: usize = 4 * 1024;
-    let mut buf = vec![0u8; POLL_BUF_SIZE];
+    wrapper.set_stopping_points(
+        StoppingPoints::END_OF_BLOCK
+            | StoppingPoints::END_OF_BLOCK_HEADER
+            | StoppingPoints::END_OF_STREAM_HEADER,
+    );
+
     let debug_isal = std::env::var("GZIPPY_DEBUG_ISAL").is_ok();
     let mut iter = 0usize;
-    let mut boundary_polls = 0usize;
-    loop {
+    let mut stops_eob = 0usize;
+    let mut stops_eobh = 0usize;
+    let mut stopping_point_reached = false;
+    let mut last_end_bit = bootstrap.end_bit_offset;
+    while !stopping_point_reached {
+        let mut buf = vec![0u8; ALLOCATION_CHUNK_SIZE];
         let r = wrapper.read_stream(&mut buf)?;
+        iter += 1;
         if r.bytes_written > 0 {
             chunk.append_clean(&buf[..r.bytes_written]);
         }
-        iter += 1;
+        last_end_bit = r.bit_position;
 
-        if chunk.decoded_size() >= configuration.max_decoded_chunk_size {
-            chunk.stopped_preemptively = true;
-            break;
-        }
         if r.finished {
             break;
         }
-        if r.bytes_written == 0 && r.stopped_at == StoppingPoints::NONE {
-            // No progress and no stop event: input exhausted or
-            // decoder finished mid-block (BFINAL preceded EOF).
-            break;
+
+        // Stop dispatch — direct port of GzipChunk.hpp:328-373.
+        match r.stopped_at {
+            sp if sp == StoppingPoints::END_OF_STREAM_HEADER => {
+                chunk.append_block_boundary(r.bit_position);
+            }
+            sp if sp == StoppingPoints::END_OF_BLOCK => {
+                stops_eob += 1;
+                if !wrapper.is_final_block() {
+                    chunk.append_block_boundary(r.bit_position);
+                }
+                if r.bit_position >= until_bits {
+                    stopping_point_reached = true;
+                }
+            }
+            sp if sp == StoppingPoints::END_OF_BLOCK_HEADER => {
+                stops_eobh += 1;
+                let not_final = !wrapper.is_final_block();
+                let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
+                chunk.append_block_boundary(r.bit_position);
+                if r.bit_position >= until_bits && not_final && not_fixed {
+                    stopping_point_reached = true;
+                }
+            }
+            sp if sp == StoppingPoints::NONE => {
+                if r.bytes_written == 0 {
+                    // No progress and no stop: input exhausted or
+                    // ISA-L can't continue. Done.
+                    stopping_point_reached = true;
+                }
+            }
+            _ => {}
         }
 
-        // Block-state poll: ISAL_BLOCK_NEW_HDR (0) means we're
-        // between blocks at a real deflate boundary. Stop if we've
-        // crossed `until_bits`.
-        if wrapper.debug_block_state() == 0 {
-            boundary_polls += 1;
-            let next_block_off = wrapper.tell_compressed();
-            if next_block_off >= until_bits {
-                chunk.append_block_boundary(next_block_off);
-                break;
-            }
+        if chunk.decoded_size() >= configuration.max_decoded_chunk_size {
+            chunk.stopped_preemptively = true;
+            stopping_point_reached = true;
         }
     }
     if debug_isal {
         eprintln!(
-            "  [isal] done iter={} boundary_polls={} bit={} decoded={}",
+            "  [isal] done iter={} eob={} eobh={} bit={} decoded={}",
             iter,
-            boundary_polls,
-            wrapper.tell_compressed(),
+            stops_eob,
+            stops_eobh,
+            last_end_bit,
             chunk.decoded_size()
         );
     }
 
     chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
-    let actual_end = wrapper.tell_compressed();
-    chunk.finalize(actual_end);
+    chunk.finalize(last_end_bit);
     Ok(chunk)
 }
 

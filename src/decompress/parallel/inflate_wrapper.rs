@@ -231,49 +231,82 @@ impl<'a> IsalInflateWrapper<'a> {
             - self.state.read_in_length.max(0) as usize
     }
 
-    /// Pump bytes into `output`. Returns when:
-    ///   - output is full
+    /// Pump bytes into `output` until any of:
+    ///   - output buffer is full
     ///   - a requested stopping point fires
     ///   - input is exhausted
     ///   - BFINAL block has been fully consumed
     ///
-    /// Mirror of `IsalInflateWrapper::readStream` (isal.hpp:65-67 +
-    /// the body further down in the same file). Single-call equivalent:
-    /// not multi-stream; caller drives the loop for chunk-spanning
-    /// behavior.
+    /// Mirror of `rapidgzip::IsalInflateWrapper::readStream`
+    /// (vendor/rapidgzip/.../gzip/isal.hpp:253-385). The critical
+    /// behavior — verified against the rapidgzip source and confirmed
+    /// by empirical Silesia debug logs — is that this MUST call
+    /// `isal_inflate` repeatedly inside one invocation, breaking only
+    /// on stop/finish/no-progress, AND it MUST reset `state.stopped_at`
+    /// at entry. A single-call read_stream cannot deliver stops: a
+    /// small `avail_out` causes ISA-L to return via OUT_OVERFLOW long
+    /// before it gets to set `stopped_at`.
     pub fn read_stream(&mut self, output: &mut [u8]) -> Result<ReadStreamResult, InflateError> {
         let original_len = output.len();
-        let original_stopped_at = self.state.stopped_at;
-        let _ = original_stopped_at;
-        self.state.avail_out = original_len as u32;
         self.state.next_out = output.as_mut_ptr();
+        self.state.avail_out = original_len as u32;
+        // Reset stopped_at at entry (rapidgzip isal.hpp:261). Without
+        // this, a stop value left over from a previous call would
+        // short-circuit our break-on-stop check on the very first
+        // iteration of the loop below.
+        self.state.stopped_at = 0;
 
-        let ret = unsafe { isal_raw::isal_inflate(&mut self.state) };
+        let mut finished;
+        loop {
+            let prev_avail_in = self.state.avail_in;
+            let prev_read_in_length = self.state.read_in_length;
+            let prev_avail_out = self.state.avail_out;
+
+            let ret = unsafe { isal_raw::isal_inflate(&mut self.state) };
+
+            finished = self.state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH;
+
+            match ret {
+                0 | 1 => {}
+                -1 => return Err(InflateError::InvalidBlock),
+                -2 => return Err(InflateError::InvalidSymbol),
+                -3 => return Err(InflateError::InvalidLookback),
+                other => return Err(InflateError::Internal(other)),
+            }
+
+            // Break conditions (matching rapidgzip's inner loop):
+            //   1. A requested stop fired.
+            //   2. Stream finished (BFINAL fully processed).
+            //   3. Output buffer is full.
+            //   4. No progress (avoids infinite loop when ISA-L can't
+            //      make progress — e.g. input exhausted mid-block).
+            if self.state.stopped_at != 0 {
+                break;
+            }
+            if finished {
+                break;
+            }
+            if self.state.avail_out == 0 {
+                break;
+            }
+            let made_progress = self.state.avail_in != prev_avail_in
+                || self.state.read_in_length != prev_read_in_length
+                || self.state.avail_out != prev_avail_out;
+            if !made_progress {
+                break;
+            }
+        }
+
         let bytes_written = original_len - self.state.avail_out as usize;
         let bit_position = self.tell_compressed();
-
         let stopped_at = StoppingPoints(self.state.stopped_at);
-        let finished = self.state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH;
 
-        match ret {
-            0 | 1 => {
-                // 0 = ISAL_DECOMP_OK, 1 = ISAL_END_INPUT.
-                Ok(ReadStreamResult {
-                    bytes_written,
-                    stopped_at,
-                    bit_position,
-                    finished,
-                })
-            }
-            // Patched ISA-L returns these error codes (igzip_lib.h):
-            //   -1 = ISAL_INVALID_BLOCK
-            //   -2 = ISAL_INVALID_SYMBOL
-            //   -3 = ISAL_INVALID_LOOKBACK
-            -1 => Err(InflateError::InvalidBlock),
-            -2 => Err(InflateError::InvalidSymbol),
-            -3 => Err(InflateError::InvalidLookback),
-            other => Err(InflateError::Internal(other)),
-        }
+        Ok(ReadStreamResult {
+            bytes_written,
+            stopped_at,
+            bit_position,
+            finished,
+        })
     }
 }
 
