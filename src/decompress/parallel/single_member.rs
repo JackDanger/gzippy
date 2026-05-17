@@ -953,7 +953,14 @@ pub(crate) fn decode_chunk_for_fetcher(
     use crate::decompress::parallel::chunk_data::ChunkData;
 
     let start = ChunkStart::from_bits(start_bit);
-    let stop = ChunkDecodeStop::Verified(ChunkEndLimit(RealBlockBoundary(until_bit)));
+    // UntilEnd: decoder runs to BFINAL or max_decoded_chunk_size cap.
+    // Workers may decode past their partition range; the consumer's
+    // overlap reconciliation in GzipChunkFetcher::get_next_chunk
+    // drops later chunks whose range is shadowed. This is rapidgzip's
+    // pattern: speculative work can overlap, consumer dedups via the
+    // BlockMap insertion-sort.
+    let _ = until_bit;
+    let stop = ChunkDecodeStop::UntilEnd;
     let outcome = decode_chunk_inexact(
         deflate_data,
         usize::MAX,
