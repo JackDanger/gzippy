@@ -252,9 +252,13 @@ impl<'a> IsalInflateWrapper<'a> {
                     finished,
                 })
             }
-            -7 => Err(InflateError::InvalidBlock),
-            -8 => Err(InflateError::InvalidLookback),
-            -9 => Err(InflateError::InvalidSymbol),
+            // Patched ISA-L returns these error codes (igzip_lib.h):
+            //   -1 = ISAL_INVALID_BLOCK
+            //   -2 = ISAL_INVALID_SYMBOL
+            //   -3 = ISAL_INVALID_LOOKBACK
+            -1 => Err(InflateError::InvalidBlock),
+            -2 => Err(InflateError::InvalidSymbol),
+            -3 => Err(InflateError::InvalidLookback),
             other => Err(InflateError::Internal(other)),
         }
     }

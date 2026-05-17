@@ -165,13 +165,19 @@ pub fn finish_decode_chunk_with_inexact_offset(
     }
 
     // Phase 2 — ISA-L bulk decode from the bootstrap's block boundary
-    // with the clean 32 KiB tail as dict. Stops at the next deflate
-    // block boundary at-or-past `until_bits` (preferring non-FIXED
-    // boundaries so the next chunk has somewhere to land), or BFINAL,
-    // or `max_decoded_chunk_size`.
+    // with the clean 32 KiB tail as dict. Stops at:
+    //   - any END_OF_BLOCK whose successor is at-or-past until_bits
+    //     (chunks naturally bounded by the requested partition end),
+    //   - any END_OF_BLOCK_HEADER on a non-FIXED block past until_bits
+    //     (records a high-quality subchunk boundary for downstream),
+    //   - BFINAL,
+    //   - the `max_decoded_chunk_size` per-iteration guard. This last
+    //     fires regardless of stop type so a single huge dynamic-
+    //     Huffman block (common on Silesia gzip -9, where one block
+    //     can decode hundreds of MB) can't run unbounded.
     let mut wrapper = IsalInflateWrapper::new(input, bootstrap.end_bit_offset)?;
     wrapper.set_window(&clean_window)?;
-    wrapper.set_stopping_points(StoppingPoints::END_OF_BLOCK_HEADER);
+    wrapper.set_stopping_points(StoppingPoints::END_OF_BLOCK | StoppingPoints::END_OF_BLOCK_HEADER);
 
     let mut buf = vec![0u8; ALLOCATION_CHUNK_SIZE];
     loop {
@@ -180,30 +186,35 @@ pub fn finish_decode_chunk_with_inexact_offset(
             chunk.append_clean(&buf[..r.bytes_written]);
         }
 
+        // Per-iteration max guard. Single huge blocks can produce
+        // hundreds of MB across many read_stream calls before any
+        // stopping point fires; without this check the chunk would
+        // run unbounded.
+        if chunk.decoded_size() >= configuration.max_decoded_chunk_size {
+            chunk.stopped_preemptively = true;
+            break;
+        }
         if r.finished {
             break;
         }
+        if r.stopped_at == StoppingPoints::END_OF_BLOCK {
+            let next_block_off = wrapper.tell_compressed();
+            // Position is at the START of the next block (or BFINAL
+            // padding). Stop if we've crossed the partition's until.
+            if next_block_off >= until_bits {
+                break;
+            }
+            wrapper.clear_stop();
+            continue;
+        }
         if r.stopped_at == StoppingPoints::END_OF_BLOCK_HEADER {
-            // We're at the START of the next block. tell_compressed
-            // reports the position immediately past the just-consumed
-            // header — that's the candidate chunk-end / subchunk-start.
             let next_block_off = wrapper.tell_compressed();
             let not_final = !wrapper.is_final_block();
             let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
-
             chunk.append_block_boundary(next_block_off);
-            if chunk.decoded_size() >= configuration.max_decoded_chunk_size {
-                chunk.stopped_preemptively = true;
-                break;
-            }
-            // Stop the chunk if we crossed `until_bits` at a non-fixed,
-            // non-final boundary. Fixed-Huffman boundaries are too
-            // easy to land on by accident; the next chunk's worker
-            // would be unable to validate them cheaply.
             if next_block_off >= until_bits && not_final && not_fixed {
                 break;
             }
-            // Otherwise advance: clear the stop flag and continue.
             wrapper.clear_stop();
             continue;
         }
