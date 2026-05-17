@@ -959,8 +959,33 @@ fn decode_dynamic(
         }
     }
 
-    let dist_table = ConsumeFirstTable::build_distance(&lens[hlit..])?;
+    // Literal port of deflate::Block + HuffmanCodingISAL + HuffmanCodingDistanceISAL:
+    // both lit/len and distance go through ISA-L tables, decoded via
+    // the inline hot loop in `decode_dynamic_block_full_isal`. Thread-
+    // local tables persist across blocks for per-chunk reuse (rapidgzip
+    // pattern: Block instance is reused across blocks in a chunk).
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    {
+        let isal_result = crate::decompress::parallel::isal_huffman::with_thread_litlen_dist(
+            &lens[..hlit],
+            &lens[hlit..],
+            |litlen_isal, dist_isal| {
+                decode_dynamic_block_full_isal(
+                    bits,
+                    output,
+                    litlen_isal,
+                    dist_isal,
+                    max_output,
+                    clean_tail,
+                )
+            },
+        );
+        if let Some(r) = isal_result {
+            return r;
+        }
+    }
 
+    let dist_table = ConsumeFirstTable::build_distance(&lens[hlit..])?;
     let litlen_table = ConsumeFirstTable::build(&lens[..hlit])?;
     decode_huffman_block(
         bits,
@@ -976,6 +1001,7 @@ fn decode_dynamic(
 /// table for the hot Huffman lookup. Distance still uses ConsumeFirstTable
 /// (small fraction of cost).
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)]
 fn decode_huffman_block_isal(
     bits: &mut Bits,
     output: &mut Vec<u16>,
@@ -1028,6 +1054,128 @@ fn decode_huffman_block_isal(
                 LENGTH_BASE[lidx] + extra_val
             } as usize;
             let dsym = decode_cf(dist, bits)? as usize;
+            if dsym >= DISTANCE_BASE.len() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Distance code out of range",
+                ));
+            }
+            let distance = {
+                let extra = DISTANCE_EXTRA[dsym] as u32;
+                if extra > 0 && bits.available() < extra {
+                    bits.refill();
+                }
+                let extra_val = if extra > 0 {
+                    let v = (bits.peek() & ((1u64 << extra) - 1)) as u32;
+                    bits.consume(extra);
+                    v
+                } else {
+                    0
+                };
+                DISTANCE_BASE[dsym] as u32 + extra_val
+            } as usize;
+            if distance == 0 || distance > WINDOW_SIZE {
+                return Err(Error::new(ErrorKind::InvalidData, "Invalid distance"));
+            }
+            emit_match(output, distance, length, clean_tail);
+        }
+    }
+}
+
+/// **Literal port** of `deflate::Block<>::readInternalCompressed` from
+/// `vendor/rapidgzip/.../gzip/deflate.hpp:1514-1582`. Uses ISA-L's
+/// fast tables for BOTH lit/len and distance Huffman decoding. The hot
+/// loop mirrors rapidgzip's structure: decode lit/len, branch on
+/// literal/eob/match, decode length-extras, decode distance via
+/// IsalDistCode, decode distance-extras, emit.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[inline(always)]
+fn decode_dynamic_block_full_isal(
+    bits: &mut Bits,
+    output: &mut Vec<u16>,
+    litlen: &crate::decompress::parallel::isal_huffman::IsalLitLenCode,
+    dist: &crate::decompress::parallel::isal_huffman::IsalDistCode,
+    max_output: usize,
+    clean_tail: &mut Option<CleanTailTracker>,
+) -> Result<()> {
+    let short_lut = &litlen.table.short_code_lookup;
+    let long_lut = &litlen.table.long_code_lookup;
+    const LARGE_FLAG_BIT: u32 = 1u32 << 25;
+    const LARGE_SHORT_SYM_MASK: u32 = (1u32 << 25) - 1;
+    const LARGE_LONG_SYM_MASK: u32 = (1u32 << 10) - 1;
+    const LARGE_SHORT_CODE_LEN_OFFSET: u32 = 28;
+    const LARGE_SHORT_MAX_LEN_OFFSET: u32 = 26;
+    const LARGE_LONG_CODE_LEN_OFFSET: u32 = 10;
+    loop {
+        if max_output > 0 && output.len() >= max_output {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "output cap exceeded in Huffman block",
+            ));
+        }
+        if bits.available() < 32 {
+            bits.refill();
+        }
+        let next_bits = bits.peek();
+        let next_12 = (next_bits & 0xFFF) as usize;
+        let mut next_sym = short_lut[next_12];
+        let (sym, bit_count) = if (next_sym & LARGE_FLAG_BIT) == 0 {
+            (
+                next_sym & LARGE_SHORT_SYM_MASK,
+                next_sym >> LARGE_SHORT_CODE_LEN_OFFSET,
+            )
+        } else {
+            let long_max_len = next_sym >> LARGE_SHORT_MAX_LEN_OFFSET;
+            let used_bits = next_bits & ((1u64 << long_max_len) - 1);
+            let long_idx = ((next_sym & LARGE_SHORT_SYM_MASK) + (used_bits >> 12) as u32) as usize;
+            next_sym = long_lut[long_idx] as u32;
+            (
+                next_sym & LARGE_LONG_SYM_MASK,
+                next_sym >> LARGE_LONG_CODE_LEN_OFFSET,
+            )
+        };
+        if bit_count == 0 {
+            return Err(Error::new(ErrorKind::InvalidData, "Invalid lit/len code"));
+        }
+        bits.consume(bit_count);
+        if sym < 256 {
+            let value = sym as u16;
+            output.push(value);
+            if let Some(tracker) = clean_tail.as_mut() {
+                tracker.observe_value(value);
+            }
+        } else if sym == 256 {
+            return Ok(());
+        } else {
+            let lidx = (sym - 257) as usize;
+            if lidx >= LENGTH_BASE.len() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Length code out of range",
+                ));
+            }
+            let length = {
+                let extra = LENGTH_EXTRA[lidx] as u32;
+                if extra > 0 && bits.available() < extra {
+                    bits.refill();
+                }
+                let extra_val = if extra > 0 {
+                    let v = (bits.peek() & ((1u64 << extra) - 1)) as u16;
+                    bits.consume(extra);
+                    v
+                } else {
+                    0
+                };
+                LENGTH_BASE[lidx] + extra_val
+            } as usize;
+            let (dsym, dist_bits) = match dist.decode(bits) {
+                Some(v) => v,
+                None => {
+                    return Err(Error::new(ErrorKind::InvalidData, "Invalid distance code"));
+                }
+            };
+            bits.consume(dist_bits);
+            let dsym = dsym as usize;
             if dsym >= DISTANCE_BASE.len() {
                 return Err(Error::new(
                     ErrorKind::InvalidData,

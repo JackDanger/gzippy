@@ -26,9 +26,10 @@
 #![cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 
 use crate::decompress::inflate::consume_first_decode::Bits;
-use isal::isal_sys::igzip_lib::inflate_huff_code_large;
+use isal::isal_sys::igzip_lib::{inflate_huff_code_large, inflate_huff_code_small};
 use isal::isal_sys::isal_internals::{
-    huff_code, make_inflate_huff_code_lit_len, set_and_expand_lit_len_huffcode,
+    huff_code, make_inflate_huff_code_dist, make_inflate_huff_code_lit_len,
+    set_and_expand_lit_len_huffcode, set_codes,
 };
 
 /// ISAL_DEF_LIT_LEN_SYMBOLS (igzip_lib.h). The number of literal/length
@@ -224,9 +225,121 @@ impl IsalLitLenCode {
     }
 }
 
+// ── Distance Huffman (port of HuffmanCodingDistanceISAL.hpp) ────────────────
+
+/// ISAL_DEF_DIST_SYMBOLS (igzip_lib.h) = 30.
+pub const DIST_LEN: u32 = 30;
+
+const ISAL_DECODE_SHORT_BITS: u32 = 10;
+const SMALL_SHORT_SYM_LEN: u32 = 9;
+const SMALL_SHORT_SYM_MASK: u32 = (1u32 << SMALL_SHORT_SYM_LEN) - 1;
+const SMALL_SHORT_CODE_LEN_OFFSET: u32 = 11;
+const SMALL_LONG_CODE_LEN_OFFSET: u32 = 10;
+const SMALL_FLAG_BIT: u32 = 1u32 << 10;
+const DIST_SYM_MASK: u32 = (1u32 << 5) - 1;
+
+/// Rust port of rapidgzip's `HuffmanCodingDistanceISAL`
+/// (`vendor/rapidgzip/.../huffman/HuffmanCodingDistanceISAL.hpp`).
+pub struct IsalDistCode {
+    pub table: Box<inflate_huff_code_small>,
+    dist_huff: Box<[huff_code; LIT_LEN_ELEMS as usize]>,
+    valid: bool,
+}
+
+impl IsalDistCode {
+    pub fn new_empty() -> Self {
+        Self {
+            table: Box::new(inflate_huff_code_small {
+                short_code_lookup: [0u16; 1024],
+                long_code_lookup: [0u16; 80],
+            }),
+            dist_huff: Box::new([huff_code::default(); LIT_LEN_ELEMS as usize]),
+            valid: false,
+        }
+    }
+
+    /// Literal port of `HuffmanCodingDistanceISAL::initializeFromLengths`.
+    pub fn rebuild_from(&mut self, code_lengths: &[u8]) -> bool {
+        self.valid = false;
+        if code_lengths.len() > LIT_LEN as usize {
+            return false;
+        }
+        for h in self.dist_huff.iter_mut() {
+            h.code_and_length = 0;
+        }
+        let mut dist_count: [u16; 16] = [0; 16];
+        for (i, &length) in code_lengths.iter().enumerate() {
+            if length as usize >= 16 {
+                return false;
+            }
+            dist_count[length as usize] += 1;
+            self.dist_huff[i].code_and_length = (length as u32) << 24;
+        }
+        let rc = unsafe {
+            set_codes(
+                self.dist_huff.as_mut_ptr(),
+                LIT_LEN as i32,
+                dist_count.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return false;
+        }
+        unsafe {
+            make_inflate_huff_code_dist(
+                self.table.as_mut(),
+                self.dist_huff.as_mut_ptr(),
+                DIST_LEN,
+                dist_count.as_ptr(),
+                DIST_LEN,
+            );
+        }
+        self.valid = true;
+        true
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    /// Literal port of `HuffmanCodingDistanceISAL::decode`. Returns
+    /// `Some((symbol, bit_count))` or `None` on invalid code.
+    #[inline]
+    pub fn decode(&self, bits: &mut Bits) -> Option<(u32, u32)> {
+        if bits.available() < 32 {
+            bits.refill();
+        }
+        let next_bits = bits.peek();
+        let next_10 = (next_bits & ((1u64 << ISAL_DECODE_SHORT_BITS) - 1)) as usize;
+        let mut next_sym = self.table.short_code_lookup[next_10] as u32;
+        let bit_count;
+        if (next_sym & SMALL_FLAG_BIT) == 0 {
+            bit_count = next_sym >> SMALL_SHORT_CODE_LEN_OFFSET;
+        } else {
+            let bit_len = (next_sym - SMALL_FLAG_BIT) >> SMALL_SHORT_CODE_LEN_OFFSET;
+            let long_next_bits = if bit_len <= 32 {
+                next_bits & ((1u64 << bit_len) - 1)
+            } else {
+                next_bits
+            };
+            let long_idx = ((next_sym & SMALL_SHORT_SYM_MASK)
+                + ((long_next_bits >> ISAL_DECODE_SHORT_BITS) as u32))
+                as usize;
+            next_sym = self.table.long_code_lookup[long_idx] as u32;
+            bit_count = next_sym >> SMALL_LONG_CODE_LEN_OFFSET;
+        }
+        if bit_count == 0 {
+            return None;
+        }
+        Some((next_sym & DIST_SYM_MASK, bit_count))
+    }
+}
+
 thread_local! {
     static THREAD_LITLEN_TABLE: std::cell::RefCell<IsalLitLenCode> =
         std::cell::RefCell::new(IsalLitLenCode::new_empty());
+    static THREAD_DIST_TABLE: std::cell::RefCell<IsalDistCode> =
+        std::cell::RefCell::new(IsalDistCode::new_empty());
 }
 
 /// Run `f` with a thread-local IsalLitLenCode rebuilt from `code_lengths`.
@@ -241,6 +354,27 @@ pub fn with_thread_litlen<R>(
             return None;
         }
         Some(f(&t))
+    })
+}
+
+/// Run `f` with both lit/len and distance thread-local tables rebuilt.
+pub fn with_thread_litlen_dist<R>(
+    litlen_lengths: &[u8],
+    dist_lengths: &[u8],
+    f: impl FnOnce(&IsalLitLenCode, &IsalDistCode) -> R,
+) -> Option<R> {
+    THREAD_LITLEN_TABLE.with(|ll_cell| {
+        THREAD_DIST_TABLE.with(|d_cell| {
+            let mut ll = ll_cell.borrow_mut();
+            let mut d = d_cell.borrow_mut();
+            if !ll.rebuild_from(litlen_lengths) {
+                return None;
+            }
+            if !d.rebuild_from(dist_lengths) {
+                return None;
+            }
+            Some(f(&ll, &d))
+        })
     })
 }
 
