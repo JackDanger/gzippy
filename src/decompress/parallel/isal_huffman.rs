@@ -252,6 +252,10 @@ thread_local! {
 /// If the cached table's lengths match, skip the rebuild entirely
 /// (advisor's recommendation — Silesia gzip -9 has many consecutive
 /// blocks with identical Huffman codes, so cache hit rate is high).
+use std::sync::atomic::{AtomicU64, Ordering};
+pub static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
 pub fn with_thread_litlen<R>(
     code_lengths: &[u8],
     f: impl FnOnce(&IsalLitLenCode) -> R,
@@ -259,12 +263,15 @@ pub fn with_thread_litlen<R>(
     THREAD_LITLEN_TABLE.with(|cell| {
         let mut c = cell.borrow_mut();
         if c.cached_lengths.as_slice() != code_lengths {
+            CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
             if !c.table.rebuild_from(code_lengths) {
                 c.cached_lengths.clear();
                 return None;
             }
             c.cached_lengths.clear();
             c.cached_lengths.extend_from_slice(code_lengths);
+        } else {
+            CACHE_HITS.fetch_add(1, Ordering::Relaxed);
         }
         Some(f(&c.table))
     })

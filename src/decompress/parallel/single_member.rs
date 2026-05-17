@@ -168,6 +168,20 @@ pub fn decompress_parallel<W: Write>(
         }
 
         MARKER_PIPELINE_RUNS.fetch_add(1, Ordering::Relaxed);
+        // tmp: cache stats
+        let hits = crate::decompress::parallel::isal_huffman::CACHE_HITS.load(Ordering::Relaxed);
+        let misses =
+            crate::decompress::parallel::isal_huffman::CACHE_MISSES.load(Ordering::Relaxed);
+        eprintln!(
+            "[isal_huff_cache] hits={} misses={} hit_rate={:.1}%",
+            hits,
+            misses,
+            if hits + misses > 0 {
+                hits as f64 * 100.0 / (hits + misses) as f64
+            } else {
+                0.0
+            }
+        );
         if debug_enabled() {
             let total = t0.elapsed();
             let mbps = total_size as f64 / total.as_secs_f64() / 1e6;
