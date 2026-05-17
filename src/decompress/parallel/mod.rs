@@ -23,6 +23,7 @@
 pub mod apply_window;
 pub mod block_finder;
 pub mod block_map;
+pub mod cache;
 pub mod chunk_data;
 pub mod chunk_fetcher;
 pub mod compressed_vector;
