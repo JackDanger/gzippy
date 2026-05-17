@@ -126,10 +126,6 @@ pub fn drive<W: std::io::Write>(
     // Chunk 0's input window is empty by definition (start of stream).
     window_map.insert(0, Arc::new([0u8; 32768]));
 
-    // Pre-compute speculative boundaries for every partition in parallel.
-    // No trial decode (rapidgzip principle): just the BlockFinder candidate.
-    let speculative_boundaries = compute_speculative_boundaries(input, &partition_offsets);
-
     let (job_tx, job_rx) = mpsc::channel::<DecodeJob>();
     let job_rx = Arc::new(std::sync::Mutex::new(job_rx));
 
@@ -137,6 +133,15 @@ pub fn drive<W: std::io::Write>(
     let mut total_size: usize = 0;
 
     let pool_size = parallelization.max(1);
+
+    // The pre-scan was deleted. Workers receive jobs at partition
+    // offsets directly; they try to decode AT the partition offset
+    // first (cheap if it happens to be a real block boundary), then
+    // iterate BlockFinder candidates INSIDE the worker if not. This
+    // matches rapidgzip's decodeChunk + tryToDecode pattern at
+    // vendor/rapidgzip/.../chunkdecoding/GzipChunk.hpp:712-741.
+    let _ = total_bits;
+    let _ = partition_offsets;
 
     let result = std::thread::scope(|s| -> Result<(), FetchError> {
         // Spawn worker pool.
@@ -147,14 +152,11 @@ pub fn drive<W: std::io::Write>(
             s.spawn(move || worker_loop(input, job_rx, window_map, configuration));
         }
 
-        // Consumer loop. Submits speculative jobs, drains in order,
-        // re-dispatches on mismatch, writes bytes, propagates windows.
         consumer_loop(
             input,
             writer,
             n_partitions,
             &partition_offsets,
-            &speculative_boundaries,
             total_bits,
             &job_tx,
             &window_map,
@@ -174,67 +176,73 @@ pub fn drive<W: std::io::Write>(
     Ok((crc, total_size))
 }
 
+/// Try to decode at `start_bit` directly; if that fails, iterate
+/// BlockFinder candidates in [start_bit, start_bit + 512 KiB] until
+/// one succeeds. Returns a chunk whose `encoded_offset_bits` is the
+/// requested `start_bit` (matches the cache key) but whose
+/// `max_encoded_offset_bits` is the actual candidate used.
+/// Mirror of rapidgzip's tryToDecode + candidate iteration at
+/// vendor/rapidgzip/.../GzipChunk.hpp:712-841.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-fn compute_speculative_boundaries(input: &[u8], partition_offsets: &[usize]) -> Vec<Option<usize>> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    let n = partition_offsets.len();
-    let total_bits = input.len() * 8;
-    let results: Vec<std::sync::Mutex<Option<Option<usize>>>> =
-        (0..n).map(|_| std::sync::Mutex::new(None)).collect();
-    let next_task = AtomicUsize::new(0);
-
-    std::thread::scope(|s| {
-        let workers = num_cpus_for_boundary_scan().min(n);
-        for _ in 0..workers {
-            let results = &results;
-            let next_task = &next_task;
-            s.spawn(move || loop {
-                let idx = next_task.fetch_add(1, Ordering::Relaxed);
-                if idx >= n {
-                    break;
-                }
-                let seed = partition_offsets[idx];
-                let label = trace::boundary_label(idx);
-                let t0 = std::time::Instant::now();
-                let boundary = if seed >= total_bits {
-                    None
-                } else if seed == 0 {
-                    Some(0)
-                } else {
-                    BlockFinder::new(input).find_first_candidate(
-                        seed,
-                        (BOUNDARY_SEARCH_RADIUS_BYTES * 8).min(total_bits - seed),
-                    )
-                };
-                let dur_us = t0.elapsed().as_micros();
-                trace::emit(
-                    &label,
-                    "boundary_done",
-                    &format!(
-                        r#""partition_idx":{idx},"seed_bit":{seed},"found_bit":{},"duration_us":{dur_us}"#,
-                        match boundary {
-                            Some(b) => format!("{b}"),
-                            None => "null".to_string(),
-                        }
-                    ),
-                );
-                *results[idx].lock().unwrap() = Some(boundary);
-            });
+fn decode_or_iterate(
+    input: &[u8],
+    start_bit: usize,
+    until_bit: usize,
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    // Step 1: try the requested offset directly.
+    if let Ok(mut c) =
+        finish_decode_chunk_with_inexact_offset(input, start_bit, until_bit, &[], configuration)
+    {
+        // Worker decoded successfully at start_bit. Record the requested
+        // position as encoded_offset (so the cache key matches consumer
+        // expectations) and max_encoded_offset = the actual decoded
+        // start (= start_bit, since direct succeeded).
+        c.max_encoded_offset_bits = c.encoded_offset_bits;
+        return Ok(c);
+    }
+    // Step 2: iterate candidates inside the worker. 512 KiB matches
+    // rapidgzip's per-chunk scan budget.
+    let finder = BlockFinder::new(input);
+    let scan_end = (start_bit + 512 * 1024 * 8).min(input.len() * 8);
+    let candidates = finder.find_blocks(start_bit, scan_end);
+    let mut last_err: Option<ChunkDecodeError> = None;
+    for candidate in candidates {
+        if candidate.bit_offset <= start_bit {
+            continue;
         }
-    });
-
-    results
-        .into_iter()
-        .map(|m| m.into_inner().unwrap().flatten())
-        .collect()
-}
-
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-fn num_cpus_for_boundary_scan() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+        match finish_decode_chunk_with_inexact_offset(
+            input,
+            candidate.bit_offset,
+            until_bit,
+            &[],
+            configuration,
+        ) {
+            Ok(mut c) => {
+                // Adopt rapidgzip's semantic: encoded_offset = requested,
+                // max_encoded_offset = actual candidate used.
+                let actual = c.encoded_offset_bits;
+                c.encoded_offset_bits = start_bit;
+                c.max_encoded_offset_bits = actual;
+                // encoded_size_bits is relative to encoded_offset_bits.
+                // Decoder set it relative to `actual`; adjust so the
+                // chunk reports its total span from the requested start.
+                c.encoded_size_bits += actual - start_bit;
+                // Subchunks were recorded with absolute encoded_offset_bits
+                // — those are still valid (consumer's decoded_offset_for
+                // looks up by absolute bit position).
+                return Ok(c);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        }
+    }
+    Err(last_err.unwrap_or(ChunkDecodeError::ExactStopMissed {
+        requested: start_bit,
+        actual: scan_end,
+    }))
 }
 
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
@@ -308,13 +316,13 @@ fn worker_loop(
                         trace::rss_kib(),
                     ),
                 );
-                let r = finish_decode_chunk_with_inexact_offset(
-                    input,
-                    job.start_bit,
-                    job.until_bit,
-                    &[],
-                    configuration,
-                );
+                // Try direct at start_bit first (rapidgzip's tryToDecode
+                // at GzipChunk.hpp:739). If it fails, iterate BlockFinder
+                // candidates inside the worker, up to a 512 KiB scan.
+                // The returned chunk reports encoded_offset_bits =
+                // job.start_bit (the requested position) and
+                // max_encoded_offset_bits = the actual candidate used.
+                let r = decode_or_iterate(input, job.start_bit, job.until_bit, configuration);
                 (r, "slow")
             }
         };
@@ -373,7 +381,6 @@ fn consumer_loop<W: std::io::Write>(
     writer: &mut W,
     n_partitions: usize,
     partition_offsets: &[usize],
-    speculative_boundaries: &[Option<usize>],
     total_bits: usize,
     job_tx: &mpsc::Sender<DecodeJob>,
     window_map: &WindowMap,
@@ -382,209 +389,103 @@ fn consumer_loop<W: std::io::Write>(
     total_crc: &mut crc32fast::Hasher,
     total_size: &mut usize,
 ) -> Result<(), FetchError> {
-    // Per-partition speculative receivers. Each partition's worker
-    // sends its result here when done. Authoritative re-dispatch
-    // creates fresh oneshot channels.
-    let mut speculative_rx: Vec<Option<mpsc::Receiver<Result<ChunkData, ChunkDecodeError>>>> =
-        (0..n_partitions).map(|_| None).collect();
+    let _ = (input, partition_offsets, pool_size);
 
-    // Prefetch target: keep at most 2*pool_size speculative jobs in
-    // flight ahead of the consumer.
-    let prefetch_window = (pool_size * 2).max(2);
-    let mut next_to_dispatch = 0usize;
-
-    let mut dispatch = |next_to_dispatch: &mut usize,
-                        speculative_rx: &mut Vec<
-        Option<mpsc::Receiver<Result<ChunkData, ChunkDecodeError>>>,
-    >| {
-        while *next_to_dispatch < n_partitions
-            && speculative_rx.iter().filter(|r| r.is_some()).count() < prefetch_window
-        {
-            let i = *next_to_dispatch;
-            *next_to_dispatch += 1;
-            let Some(start) = speculative_boundaries[i] else {
-                continue;
-            };
-            let until = partition_offsets.get(i + 1).copied().unwrap_or(total_bits);
-            let (tx, rx) = mpsc::channel();
-            trace::emit(
-                "dispatcher",
-                "speculative_submit",
-                &format!(r#""partition_idx":{i},"start_bit":{start},"until_bit":{until}"#),
-            );
-            job_tx
-                .send(DecodeJob {
-                    partition_idx: i,
-                    start_bit: start,
-                    until_bit: until,
-                    authoritative: false,
-                    reply: tx,
-                })
-                .expect("worker pool dropped");
-            speculative_rx[i] = Some(rx);
-        }
-    };
-
-    // Initial prefetch fill.
-    dispatch(&mut next_to_dispatch, &mut speculative_rx);
-
-    let mut expected_start: usize = 0;
-    let mut next_to_consume: usize = 0;
-    // Authoritative prefetch: when the consumer finishes chunk N and
-    // knows expected_start[N+1] = N's actual end, it submits chunk
-    // N+1's authoritative dispatch IMMEDIATELY, so the worker decodes
-    // (~20 ms fast path) in parallel with the consumer's
-    // apply_window/write/insert work on chunk N (~5–10 ms). The next
-    // iteration picks up the in-flight result instead of submitting
-    // fresh and blocking. Pipeline depth = 2 over the authoritative
-    // chain. See docs/rapidgzip-port-reference.md decision log #4
-    // for why deeper pipelines don't help (21% prediction accuracy).
+    // Pure depth-2 authoritative chain. No speculative pre-scan.
+    //
+    //   - pending_auth[0] is submitted at start_bit = 0 right away.
+    //   - On consume of chunk N, we know chunk N's actual end = the next
+    //     chunk's authoritative start. Submit pending_auth[N+1] before
+    //     processing chunk N's bytes so the worker decodes in parallel
+    //     with consume work (apply_window / write / window insert).
+    //   - When chunk N+1's iteration starts, pending_auth[N+1] is
+    //     usually already done. Wait, accept, consume.
+    //
+    // Workers handle the "no real block at start_bit" case INSIDE the
+    // worker by iterating BlockFinder candidates within 512 KiB
+    // (mirrors rapidgzip's tryToDecode at GzipChunk.hpp:712-741). The
+    // returned chunk has encoded_offset_bits = requested start; the
+    // actual successful candidate is recorded in max_encoded_offset_bits.
     let mut pending_auth: Vec<Option<mpsc::Receiver<Result<ChunkData, ChunkDecodeError>>>> =
         (0..n_partitions).map(|_| None).collect();
 
-    while next_to_consume < n_partitions {
-        // Try to find a speculative result that contains expected_start
-        // within its range AND has a subchunk at expected_start (so we
-        // can trim cleanly to start there). Scan partitions forward;
-        // first match wins.
-        let mut chosen: Option<(usize, ChunkData, usize)> = None; // (idx, chunk, trim_bytes)
-        for i in next_to_consume..n_partitions {
-            if let Some(rx_ref) = speculative_rx[i].as_ref() {
-                match rx_ref.try_recv() {
-                    Ok(Ok(c)) if c.matches_encoded_offset(expected_start) => {
-                        if let Some(trim) = c.decoded_offset_for(expected_start) {
-                            let _ = speculative_rx[i].take();
-                            chosen = Some((i, c, trim));
-                            break;
-                        } else {
-                            let _ = speculative_rx[i].take();
-                            trace::emit(
-                                "consumer",
-                                "speculative_no_subchunk",
-                                &format!(
-                                    r#""partition_idx":{i},"expected_start":{expected_start},"chunk_start":{},"chunk_end":{}"#,
-                                    c.encoded_offset_bits,
-                                    c.encoded_offset_bits + c.encoded_size_bits,
-                                ),
-                            );
-                        }
-                    }
-                    Ok(Ok(c)) => {
-                        let _ = speculative_rx[i].take();
-                        trace::emit(
-                            "consumer",
-                            "speculative_discard",
-                            &format!(
-                                r#""partition_idx":{i},"expected_start":{expected_start},"chunk_start":{},"chunk_end":{}"#,
-                                c.encoded_offset_bits,
-                                c.encoded_offset_bits + c.encoded_size_bits,
-                            ),
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        let _ = speculative_rx[i].take();
-                        trace::emit(
-                            "consumer",
-                            "speculative_err_discard",
-                            &format!(
-                                r#""partition_idx":{i},"err":"{}""#,
-                                trace::esc(&format!("{e:?}"))
-                            ),
-                        );
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        let _ = speculative_rx[i].take();
-                    }
-                }
+    let mut submit_auth =
+        |idx: usize,
+         start: usize,
+         pending: &mut Vec<Option<mpsc::Receiver<Result<ChunkData, ChunkDecodeError>>>>|
+         -> Result<(), FetchError> {
+            if idx >= n_partitions || pending[idx].is_some() {
+                return Ok(());
             }
-            if i == next_to_consume + prefetch_window {
-                break;
-            }
-        }
+            let until = partition_offsets
+                .iter()
+                .skip(idx + 1)
+                .find(|&&s| s > start)
+                .copied()
+                .unwrap_or(total_bits);
+            let (tx, rx) = mpsc::channel();
+            trace::emit(
+                "consumer",
+                "authoritative_prefetch",
+                &format!(r#""partition_idx":{idx},"start_bit":{start},"until_bit":{until}"#),
+            );
+            job_tx
+                .send(DecodeJob {
+                    partition_idx: idx,
+                    start_bit: start,
+                    until_bit: until,
+                    authoritative: true,
+                    reply: tx,
+                })
+                .expect("worker pool dropped");
+            pending[idx] = Some(rx);
+            Ok(())
+        };
 
-        let (idx, chunk, trim_bytes) = match chosen {
-            Some(c) => c,
+    // Initial dispatch: chunk 0 at bit 0.
+    submit_auth(0, 0, &mut pending_auth)?;
+
+    let mut expected_start: usize = 0;
+    let mut next_to_consume: usize = 0;
+
+    while next_to_consume < n_partitions {
+        let rx = match pending_auth[next_to_consume].take() {
+            Some(rx) => rx,
             None => {
-                // First check the in-flight authoritative prefetch (if
-                // we eagerly submitted one after consuming chunk N-1).
-                // This is the pipelining win: while we were processing
-                // chunk N-1, the pool was decoding chunk N.
-                let (idx, chunk) = if let Some(rx) = pending_auth[next_to_consume].take() {
-                    trace::emit(
-                        "consumer",
-                        "authoritative_prefetch_wait",
-                        &format!(r#""partition_idx":{next_to_consume}"#),
-                    );
-                    match rx.recv() {
-                        Ok(Ok(c)) if c.encoded_offset_bits == expected_start => {
-                            (next_to_consume, c)
-                        }
-                        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
-                            // Prefetch result is stale (expected_start
-                            // moved? shouldn't happen since we computed
-                            // it from chunk N-1's actual_end). Fall back.
-                            authoritative_dispatch(
-                                input,
-                                next_to_consume,
-                                expected_start,
-                                partition_offsets,
-                                total_bits,
-                                job_tx,
-                                window_map,
-                                configuration,
-                            )?
-                        }
-                    }
-                } else if let Some(rx) = speculative_rx[next_to_consume].take() {
-                    match rx.recv() {
-                        Ok(Ok(c)) if c.matches_encoded_offset(expected_start) => {
-                            if let Some(_trim) = c.decoded_offset_for(expected_start) {
-                                (next_to_consume, c)
-                            } else {
-                                authoritative_dispatch(
-                                    input,
-                                    next_to_consume,
-                                    expected_start,
-                                    partition_offsets,
-                                    total_bits,
-                                    job_tx,
-                                    window_map,
-                                    configuration,
-                                )?
-                            }
-                        }
-                        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => authoritative_dispatch(
-                            input,
-                            next_to_consume,
-                            expected_start,
-                            partition_offsets,
-                            total_bits,
-                            job_tx,
-                            window_map,
-                            configuration,
-                        )?,
-                    }
-                } else {
-                    authoritative_dispatch(
-                        input,
-                        next_to_consume,
-                        expected_start,
-                        partition_offsets,
-                        total_bits,
-                        job_tx,
-                        window_map,
-                        configuration,
-                    )?
-                };
-                let trim = chunk.decoded_offset_for(expected_start).unwrap_or(0);
-                (idx, chunk, trim)
+                // Should only happen if we never submitted; submit now.
+                submit_auth(next_to_consume, expected_start, &mut pending_auth)?;
+                pending_auth[next_to_consume]
+                    .take()
+                    .expect("just submitted")
+            }
+        };
+        trace::emit(
+            "consumer",
+            "authoritative_prefetch_wait",
+            &format!(r#""partition_idx":{next_to_consume},"expected_start":{expected_start}"#),
+        );
+        let chunk = match rx.recv() {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return Err(FetchError::Decode(e)),
+            Err(_) => {
+                return Err(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+                    requested: expected_start,
+                    actual: 0,
+                }));
             }
         };
 
-        // Process the chosen chunk: apply_window if slow-path produced
-        // markers; write bytes; combine CRC; update expected_start;
-        // publish tail window if not already published.
+        // Workers return chunk.encoded_offset_bits = the REQUESTED start.
+        // For range matching: matches_encoded_offset(expected_start) is
+        // always true here because we requested expected_start.
+        // decoded_offset_for(expected_start) returns Some(0) for the
+        // exact-match case (encoded_offset == expected_start) which is
+        // the rapidgzip authoritative pattern.
+        let trim_bytes = chunk.decoded_offset_for(expected_start).unwrap_or(0);
+        let idx = next_to_consume;
+
+        // Process the chunk: apply_window if markers; write bytes;
+        // combine CRC; publish tail window.
         let mut chunk = chunk;
         if !chunk.data_with_markers.is_empty() {
             let chunk_start = chunk.encoded_offset_bits;
@@ -605,16 +506,14 @@ fn consumer_loop<W: std::io::Write>(
                     aw_t0.elapsed().as_micros()
                 ),
             );
-            // Publish tail now that markers are resolved.
             if let Some(tail) = chunk.last_32kib_window() {
                 let end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
                 window_map.insert(end_bit, Arc::new(tail));
             }
         }
 
-        // Write bytes in stream order, skipping the first `trim_bytes`
-        // bytes (which belong to the predecessor's range). Re-CRC the
-        // written slice so the final CRC matches the gzip trailer.
+        // Write bytes, skipping `trim_bytes` leading bytes that belong
+        // to the predecessor's range.
         let mut written_crc = crc32fast::Hasher::new();
         let mut remaining_skip = trim_bytes;
         if !chunk.data_with_markers.is_empty() {
@@ -650,100 +549,22 @@ fn consumer_loop<W: std::io::Write>(
             "consumer",
             "consume_done",
             &format!(
-                r#""partition_idx":{idx},"end_bit":{expected_start},"decoded":{},"trim_bytes":{trim_bytes},"rss_kib":{},"speculative_in_flight":{}"#,
+                r#""partition_idx":{idx},"end_bit":{expected_start},"decoded":{},"trim_bytes":{trim_bytes},"rss_kib":{}"#,
                 chunk.decoded_size(),
                 trace::rss_kib(),
-                speculative_rx.iter().filter(|r| r.is_some()).count(),
             ),
         );
         next_to_consume += 1;
 
-        // Refill speculative prefetch pipeline.
-        dispatch(&mut next_to_dispatch, &mut speculative_rx);
-
-        // Authoritative prefetch: submit chunk N+1's authoritative
-        // NOW so its decode overlaps with consume of chunk N. We know
-        // expected_start[N+1] (= chunk N's actual end). Skip if a
-        // matching speculative result is already in hand (consumer
-        // will pick it up next iteration); only prefetch when we know
-        // the speculative won't match.
-        if next_to_consume < n_partitions && pending_auth[next_to_consume].is_none() {
-            let spec_matches = speculative_rx[next_to_consume].as_ref().is_some_and(|_rx| {
-                // We can't try_recv non-destructively, so guess by
-                // checking the speculative boundary. If it equals
-                // expected_start, the speculative will likely match
-                // and we skip the prefetch.
-                speculative_boundaries[next_to_consume] == Some(expected_start)
-            });
-            if !spec_matches {
-                let until = partition_offsets
-                    .iter()
-                    .skip(next_to_consume + 1)
-                    .find(|&&s| s > expected_start)
-                    .copied()
-                    .unwrap_or(total_bits);
-                let (tx, rx) = mpsc::channel();
-                trace::emit(
-                    "consumer",
-                    "authoritative_prefetch",
-                    &format!(
-                        r#""partition_idx":{next_to_consume},"start_bit":{expected_start},"until_bit":{until}"#
-                    ),
-                );
-                job_tx
-                    .send(DecodeJob {
-                        partition_idx: next_to_consume,
-                        start_bit: expected_start,
-                        until_bit: until,
-                        authoritative: true,
-                        reply: tx,
-                    })
-                    .expect("worker pool dropped");
-                pending_auth[next_to_consume] = Some(rx);
-            }
+        // Depth-2 prefetch: submit chunk N+1's authoritative NOW so
+        // its decode overlaps with consume work for the chunk we just
+        // wrote.
+        if next_to_consume < n_partitions {
+            submit_auth(next_to_consume, expected_start, &mut pending_auth)?;
         }
     }
 
     Ok(())
-}
-
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-#[allow(clippy::too_many_arguments)]
-fn authoritative_dispatch(
-    _input: &[u8],
-    partition_idx: usize,
-    expected_start: usize,
-    partition_offsets: &[usize],
-    total_bits: usize,
-    job_tx: &mpsc::Sender<DecodeJob>,
-    _window_map: &WindowMap,
-    _configuration: ChunkConfiguration,
-) -> Result<(usize, ChunkData), FetchError> {
-    let until = partition_offsets
-        .iter()
-        .skip(partition_idx + 1)
-        .find(|&&seed| seed > expected_start)
-        .copied()
-        .unwrap_or(total_bits);
-    let (tx, rx) = mpsc::channel();
-    trace::emit(
-        "consumer",
-        "authoritative_submit",
-        &format!(
-            r#""partition_idx":{partition_idx},"expected_start":{expected_start},"until_bit":{until}"#
-        ),
-    );
-    job_tx
-        .send(DecodeJob {
-            partition_idx,
-            start_bit: expected_start,
-            until_bit: until,
-            authoritative: true,
-            reply: tx,
-        })
-        .expect("worker pool dropped");
-    let chunk = rx.recv().expect("worker dropped reply")?;
-    Ok((partition_idx, chunk))
 }
 
 // Non-x86_64 / non-isal stub.

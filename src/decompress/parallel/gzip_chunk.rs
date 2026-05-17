@@ -323,15 +323,15 @@ pub fn finish_decode_chunk_with_inexact_offset(
         ));
     }
 
-    // Single pre-allocated buffer, capped at max_decoded_chunk_size so
-    // a runaway chunk can't OOM. v0.6 uses up to 3 GiB; we use the
-    // configured cap (80 MiB at 4 MiB split * 20 multiplier).
+    // Output buffer grows dynamically up to max_decoded_chunk_size.
+    // Earlier versions pre-allocated + set_len(80 MiB) per worker,
+    // which committed 16 × 80 = 1.28 GiB resident under T=16 — a
+    // per-worker fixed cost regardless of how much each chunk
+    // actually decoded. Now we grow the Vec on demand via ISA-L
+    // 128 KiB chunks (ALLOCATION_CHUNK_SIZE), so workers' resident
+    // memory matches their actual output size.
     let cap = configuration.max_decoded_chunk_size;
-    let mut output: Vec<u8> = Vec::with_capacity(cap);
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        output.set_len(cap)
-    };
+    let mut output: Vec<u8> = Vec::with_capacity(ALLOCATION_CHUNK_SIZE.min(cap));
     let mut out_pos: usize = 0;
     let debug_isal = std::env::var("GZIPPY_DEBUG_ISAL").is_ok();
     let mut iter = 0usize;
@@ -357,11 +357,18 @@ pub fn finish_decode_chunk_with_inexact_offset(
     }
 
     loop {
-        let remaining = cap - out_pos;
-        if remaining == 0 {
+        if out_pos >= cap {
             chunk.stopped_preemptively = true;
             break;
         }
+        // Grow output buffer by ALLOCATION_CHUNK_SIZE if needed. We
+        // never reserve more than `cap` total. Each iteration tells
+        // ISA-L it has up to ALLOCATION_CHUNK_SIZE bytes of room.
+        let want = ALLOCATION_CHUNK_SIZE.min(cap - out_pos);
+        if output.len() < out_pos + want {
+            output.resize(out_pos + want, 0);
+        }
+        let remaining = want;
         state.avail_out = remaining as u32;
         state.next_out = unsafe { output.as_mut_ptr().add(out_pos) };
 
