@@ -55,32 +55,34 @@ const LUT_SIZE: usize = 1 << LUT_BITS;
 /// `test_find_blocks_parallel_matches_sequential`.
 #[inline]
 fn is_valid_candidate_13(bits: u32) -> bool {
-    // Reject bfinal=1 — final blocks aren't useful chunk split points
-    // (no successor chunk to start there). Mirror of rapidgzip's
-    // blockfinder/DynamicHuffman.hpp:47-49 filter.
+    // Literal port of rapidgzip's `isDeflateCandidate<13>` at
+    // vendor/rapidgzip/.../blockfinder/DynamicHuffman.hpp:39-79.
     //
-    // This was tried in isolation (commit fbfff82) and OOM-killed gzippy
-    // because the synchronous redispatch path couldn't keep up with the
-    // increased "no candidate found" rate — each redispatch allocated a
-    // fresh 80 MiB output buffer, and the consumer-thread serial chain
-    // ballooned memory. Safe to enable now because the new chunk_fetcher
-    // routes rejections through the async thread pool instead.
+    // Filters:
+    //   bit 0       = bfinal, must be 0 (skip final blocks)
+    //   bits 1-2    = btype, must be 0b10 (dynamic Huffman ONLY).
+    //                 Stored blocks (BTYPE=00) are NOT emitted here —
+    //                 rapidgzip uses a separate seekToNonFinalUncompressedDeflateBlock
+    //                 for those. Mixing dynamic + stored candidates lets
+    //                 stored phantoms beat dynamic naturals at find_first_candidate.
+    //   bits 3-7    = HLIT (5 bits), value+257 must be ≤ 286 → HLIT ≤ 29
+    //   bits 8-12   = HDIST (5 bits), value+1 must be ≤ 30 → HDIST ≤ 29
+    //
+    // The full lit/dist Huffman validation happens later in
+    // validate_huffman_codes (called by find_blocks for accepted
+    // candidates), matching rapidgzip's seekToNonFinalDynamicDeflateBlock
+    // post-LUT validation.
     let bfinal = bits & 1;
     if bfinal == 1 {
         return false;
     }
     let btype = (bits >> 1) & 3;
-
-    match btype {
-        0 => true, // stored block — validated by len/~len
-        2 => {
-            // dynamic Huffman — check HLIT <= 29 and HDIST <= 29
-            let hlit = (bits >> 3) & 31;
-            let hdist = (bits >> 8) & 31;
-            hlit <= 29 && hdist <= 29
-        }
-        _ => false, // btype=1 (fixed) emitted by a separate tier; btype=3 reserved
+    if btype != 2 {
+        return false;
     }
+    let hlit = (bits >> 3) & 31;
+    let hdist = (bits >> 8) & 31;
+    hlit <= 29 && hdist <= 29
 }
 
 /// Generate the LUT at runtime (called once via lazy_static pattern)
@@ -943,9 +945,10 @@ mod tests {
         // Invalid: BTYPE=11, BFINAL=1
         assert!(lut[0b111] > 0);
 
-        // Valid: BTYPE=00 (stored), BFINAL=0
-        assert_eq!(lut[0b000], 0);
-        // Invalid: BTYPE=00 (stored), BFINAL=1 — bfinal filter rejects.
+        // Invalid: BTYPE=00 (stored) — not emitted by this BlockFinder.
+        // Rapidgzip's seekToNonFinalDynamicDeflateBlock is dynamic-only;
+        // a separate seekToNonFinalUncompressedDeflateBlock handles stored.
+        assert!(lut[0b000] > 0);
         assert!(lut[0b001] > 0);
 
         // Invalid: BTYPE=01 (fixed) — excluded from candidate search at
