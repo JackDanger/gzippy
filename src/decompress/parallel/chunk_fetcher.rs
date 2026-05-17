@@ -15,13 +15,8 @@
 //! ordered by encoded bit offset. This module mirrors that composition.
 //!
 //! The vendor uses `BS::thread_pool` + `std::future` for dispatch. Our
-//! port keeps the existing std::thread worker pool but distributes
-//! jobs via a lock-free `crossbeam_channel::unbounded` MPMC queue
-//! (mirroring rapidgzip's ThreadPool which lets each worker pull from
-//! a shared queue without serializing — vendor/.../core/ThreadPool.hpp).
-//! The earlier `Arc<Mutex<mpsc::Receiver>>` design forced all workers
-//! to serialize on a single lock per `recv()`, leaving N-1 of N workers
-//! stalled on `.lock()` whenever the queue was non-empty. Each pool worker is the per-block
+//! port keeps the existing std::thread + mpsc worker pool — equivalent
+//! semantics, simpler dependencies. Each pool worker is the per-block
 //! "decodeBlock" job; its result is both sent on a per-job reply channel
 //! AND inserted into `BlockFetcher` (prefetch cache for speculative
 //! jobs, main cache for authoritative). The consumer's
@@ -83,8 +78,6 @@ use crate::decompress::parallel::prefetcher::FetchNextAdaptive;
 use crate::decompress::parallel::trace;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::window_map::WindowMap;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-use crossbeam_channel as cbc;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use std::sync::mpsc;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
@@ -197,12 +190,8 @@ pub fn drive<W: std::io::Write>(
         ));
     let block_map = Arc::new(BlockMap::new());
 
-    // Lock-free MPMC job queue. Each worker holds its own clone of the
-    // Receiver and calls `recv()` directly — no `Mutex` serialization
-    // around the channel. Mirror of rapidgzip's ThreadPool which lets
-    // each worker pull from a shared deque without a global lock
-    // (vendor/.../core/ThreadPool.hpp).
-    let (job_tx, job_rx) = cbc::unbounded::<DecodeJob>();
+    let (job_tx, job_rx) = mpsc::channel::<DecodeJob>();
+    let job_rx = Arc::new(std::sync::Mutex::new(job_rx));
 
     let mut total_crc = crc32fast::Hasher::new();
     let mut total_size: usize = 0;
@@ -210,7 +199,7 @@ pub fn drive<W: std::io::Write>(
     let result = std::thread::scope(|s| -> Result<(), FetchError> {
         // Spawn worker pool.
         for _ in 0..pool_size {
-            let job_rx = job_rx.clone();
+            let job_rx = Arc::clone(&job_rx);
             let window_map = window_map.clone();
             let block_fetcher = Arc::clone(&block_fetcher);
             let configuration = configuration;
@@ -223,13 +212,6 @@ pub fn drive<W: std::io::Write>(
                 worker_loop(input, job_rx, window_map, bf, configuration)
             });
         }
-        // Drop the parent thread's receiver clone so it doesn't keep
-        // the queue alive past the consumer. crossbeam
-        // `Receiver::recv()` returns `Err` only when ALL senders are
-        // dropped AND the queue is empty — the consumer dropping
-        // `job_tx` at scope exit cleanly signals worker shutdown after
-        // every queued job is drained.
-        drop(job_rx);
 
         consumer_loop(
             input,
@@ -335,21 +317,20 @@ fn decode_or_iterate(
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 fn worker_loop(
     input: &[u8],
-    job_rx: cbc::Receiver<DecodeJob>,
+    job_rx: Arc<std::sync::Mutex<mpsc::Receiver<DecodeJob>>>,
     window_map: WindowMap,
     block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive>,
     configuration: ChunkConfiguration,
 ) {
     loop {
-        // Lock-free recv on a cloned MPMC Receiver. Multiple workers
-        // dequeue concurrently without serialization — replacing the
-        // old `Arc<Mutex<mpsc::Receiver>>` design where exactly one
-        // worker could be waiting on `recv()` at a time while N-1
-        // others stalled on `.lock()`. Returns Err only when ALL
-        // senders are dropped AND the queue is empty (clean shutdown).
-        let job = match job_rx.recv() {
-            Ok(j) => j,
-            Err(_) => return,
+        // Pull one job. Mutex serializes only the recv() — the actual
+        // decode runs in parallel across workers.
+        let job = {
+            let rx = job_rx.lock().unwrap();
+            match rx.recv() {
+                Ok(j) => j,
+                Err(_) => return, // sender dropped → shutdown
+            }
         };
 
         let label = trace::worker_label(job.partition_idx);
@@ -501,7 +482,7 @@ fn consumer_loop<W: std::io::Write>(
     n_partitions: usize,
     partition_offsets: &[usize],
     total_bits: usize,
-    job_tx: &cbc::Sender<DecodeJob>,
+    job_tx: &mpsc::Sender<DecodeJob>,
     window_map: &WindowMap,
     block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive>,
     block_map: &BlockMap,
