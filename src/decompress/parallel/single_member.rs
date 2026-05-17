@@ -1061,13 +1061,6 @@ struct CandidateChunk {
     requested_partition: usize,
     discovered_start: ChunkStart,
     discovered_end: RealBlockBoundary,
-    /// Real deflate block boundaries the worker crossed during decode, in
-    /// strictly increasing bit-offset order. The last entry equals
-    /// `discovered_end`. Recorded in-band by the patched-ISA-L stopping-point
-    /// mechanism (`decompress_deflate_from_bit_with_boundaries`); empty when
-    /// the worker took the marker-only path or when the chunk produced no
-    /// ISA-L output.
-    discovered_boundaries: Vec<RealBlockBoundary>,
     chunk: ChunkResult,
 }
 
@@ -1134,7 +1127,6 @@ impl PartitionRegistry {
                     requested_partition: idx,
                     discovered_start: start_bits[idx].unwrap_or(ChunkStart::from_bits(0)),
                     discovered_end: RealBlockBoundary(chunk.end_bit_offset),
-                    discovered_boundaries: Vec::new(),
                     chunk,
                 }),
                 None => PartitionState::NoDecode,
@@ -1682,14 +1674,14 @@ fn decode_chunk_inexact(
         let _ = num_chunks_total;
 
         let mut isal_crc = crc32fast::Hasher::new();
-        match crate::backends::isal_decompress::decompress_deflate_from_bit_with_boundaries(
+        match crate::backends::isal_decompress::decompress_deflate_from_bit_with_end(
             input,
             bootstrap_end_bit,
             &dict,
             max_output,
             &mut isal_crc,
         ) {
-            Some((isal_bytes, isal_end_bit, raw_boundaries)) => {
+            Some((isal_bytes, isal_end_bit)) => {
                 let Some(verified_end_bit) =
                     normalize_isal_end_bit(deflate_data, start_bit, stop, isal_end_bit)
                 else {
@@ -1714,18 +1706,10 @@ fn decode_chunk_inexact(
                 let split_at = bootstrap_markers.len().saturating_sub(dict.len());
                 let mut bootstrap = bootstrap_markers;
                 bootstrap.truncate(split_at);
-                // Wrap raw boundary bit-offsets in the verified type. The
-                // patched ISA-L only sets `stopped_at = END_OF_BLOCK` at real
-                // deflate block boundaries (see
-                // `stopping_point_boundaries_match_oracle`), so every entry
-                // here is a real block boundary.
-                let discovered_boundaries: Vec<RealBlockBoundary> =
-                    raw_boundaries.into_iter().map(RealBlockBoundary).collect();
                 WorkerOutcome::Candidate(CandidateChunk {
                     requested_partition,
                     discovered_start: start_bit,
                     discovered_end: verified_end_bit,
-                    discovered_boundaries,
                     chunk: ChunkResult {
                         bootstrap,
                         bootstrap_clean: dict,
@@ -1809,11 +1793,6 @@ fn marker_only_candidate(
         requested_partition,
         discovered_start: start_bit,
         discovered_end: RealBlockBoundary(end_bit),
-        // Marker-only path doesn't record per-block bit-offsets in-band
-        // (the pure-Rust decoder returns a single end offset). Leave empty;
-        // the dispatcher's boundary-promotion logic must be a no-op when
-        // boundaries are empty.
-        discovered_boundaries: Vec::new(),
         chunk: ChunkResult {
             worker_elapsed: t_worker.elapsed(),
             ..chunk
