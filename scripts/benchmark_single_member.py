@@ -251,6 +251,9 @@ def benchmark_decompress(
             or "imbalance" in l
             or "per-chunk" in l
             or "[parallel_sm:v0.6] counters" in l
+            or "[parallel_sm:v0.6] search=" in l
+            or "[parallel_sm:v0.6] partition_outcomes" in l
+            or "[parallel_sm:v0.6] swallowed" in l
         ]
         if chunk_lines:
             print("    per-chunk phase1b breakdown:")

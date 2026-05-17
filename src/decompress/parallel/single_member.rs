@@ -641,6 +641,18 @@ pub fn decompress_parallel<W: Write>(
         per_chunk_output_hint,
     )?;
     let retry_elapsed = t_retry.elapsed();
+    if debug_enabled() {
+        let (decoded, subsumed, empty_tail, no_decode, speculative) = partitions.outcome_counts();
+        let swallowed = partitions.swallowed_bytes();
+        eprintln!(
+            "[parallel_sm:v0.6] partition_outcomes decoded={} subsumed={} empty_tail={} no_decode={} speculative={} total={}",
+            decoded, subsumed, empty_tail, no_decode, speculative, partitions.len()
+        );
+        eprintln!(
+            "[parallel_sm:v0.6] swallowed_bytes={} (sum of subsumed-partition byte ranges decoded by predecessors)",
+            swallowed
+        );
+    }
     let chunks = partitions.into_authoritative_chunks();
 
     // G1 assertion after phase1c: every chunk's end_bit_offset must be a real
@@ -1151,6 +1163,51 @@ impl PartitionRegistry {
 
     fn set_empty_tail(&mut self, idx: usize, start: ChunkStart) {
         self.partitions[idx] = PartitionState::EmptyTail { start };
+    }
+
+    /// Counts of each terminal partition state after reconcile.
+    /// `(decoded, subsumed, empty_tail, no_decode, speculative)`.
+    fn outcome_counts(&self) -> (usize, usize, usize, usize, usize) {
+        let mut counts = (0usize, 0usize, 0usize, 0usize, 0usize);
+        for partition in &self.partitions {
+            match partition {
+                PartitionState::Decoded(_) => counts.0 += 1,
+                PartitionState::Subsumed { .. } => counts.1 += 1,
+                PartitionState::EmptyTail { .. } => counts.2 += 1,
+                PartitionState::NoDecode => counts.3 += 1,
+                PartitionState::Speculative(_) => counts.4 += 1,
+            }
+        }
+        counts
+    }
+
+    /// Bytes swallowed by Decoded partitions whose output extends past their
+    /// own partition's notional end. For consecutive Subsumed/EmptyTail
+    /// partitions after a Decoded one, sum the Decoded chunk's `decoded_len`
+    /// beyond the size that would have been expected if each partition decoded
+    /// independently. Approximates how much work would parallelize away if
+    /// in-band boundary discovery were exact.
+    fn swallowed_bytes(&self) -> u64 {
+        let mut swallowed = 0u64;
+        let mut iter = self.partitions.iter().peekable();
+        while let Some(p) = iter.next() {
+            if let PartitionState::Decoded(chunk) = p {
+                let mut subsumed_run = 0usize;
+                while matches!(
+                    iter.peek(),
+                    Some(PartitionState::Subsumed { .. } | PartitionState::EmptyTail { .. })
+                ) {
+                    subsumed_run += 1;
+                    iter.next();
+                }
+                if subsumed_run > 0 {
+                    let total = chunk.chunk.decoded_len() as u64;
+                    let per_partition = total / (subsumed_run as u64 + 1);
+                    swallowed += per_partition * subsumed_run as u64;
+                }
+            }
+        }
+        swallowed
     }
 
     fn into_authoritative_chunks(self) -> Vec<AuthoritativeChunk> {
