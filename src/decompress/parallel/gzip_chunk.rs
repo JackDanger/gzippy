@@ -254,13 +254,26 @@ pub fn finish_decode_chunk_with_inexact_offset(
         chunk.append_markered(&bootstrap.markers);
     }
 
-    // Whenever the marker bootstrap reached a block boundary at-or-past
-    // until_bits (rare on chunks > 32 KiB), or BFINAL fired, or no clean
-    // window accumulated — we're done. The chunk is marker-only.
+    // Per rapidgzip's flow (GzipChunk.hpp:521-525), the bootstrap
+    // hands off as soon as total_clean ≥ 32 KiB. `getLastWindow({})`
+    // throws when trailing 32 KiB contains markers; `tryToDecode`
+    // catches and tries the next candidate. We mirror that here:
+    // bootstrap returns clean_window=None on marker-in-trailing,
+    // and we error so `decode_or_iterate` iterates.
     let Some(clean_window) = bootstrap.clean_window else {
-        chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
-        chunk.finalize(bootstrap.end_bit_offset);
-        return Ok(chunk);
+        // If bfinal hit OR we reached until_bits, this is a legitimate
+        // bootstrap-only chunk — return Ok with marker payload.
+        if bootstrap.bfinal_hit || bootstrap.end_bit_offset >= until_bits {
+            chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+            chunk.finalize(bootstrap.end_bit_offset);
+            return Ok(chunk);
+        }
+        // Otherwise: handoff was requested (total_clean ≥ 32 KiB) but
+        // trailing has markers. Fail so iteration can try next candidate.
+        return Err(ChunkDecodeError::ExactStopMissed {
+            requested: encoded_offset_bits,
+            actual: bootstrap.end_bit_offset,
+        });
     };
     if bootstrap.bfinal_hit || bootstrap.end_bit_offset >= until_bits {
         chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
