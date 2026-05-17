@@ -69,6 +69,41 @@ Silesia gzip -9 (162 MB → 503 MB, T=16, neurotic homelab x86_64):
 | `7458880` | 344 | 0.25× | + 15-bit LUT |
 | `84883ae` | 675 | 0.45× | + BitReader refills before peek(57); hit rate 62→82% |
 | `75f5f52` | 716 | 0.40× | + skip-direct, always iterate via find_blocks; hit 90% |
+| `185d572` | 721 | 0.39× | (post HuffmanCodingISAL FFI infra) revert wiring; perf restored |
+| `a22e305` | 700 | 0.38× | (cleanDataCount handoff tried + reverted — needs decoder amortization) |
+
+## Infrastructure landed for next iteration (commits 6b9d754, 1d19f21)
+
+- `crates/isal-sys-patched/src/lib.rs` `isal_internals` module exposes
+  `set_and_expand_lit_len_huffcode` + `make_inflate_huff_code_lit_len`
+  + `huff_code` struct via direct FFI (matching the patch rapidgzip
+  applies to vendored ISA-L).
+- `src/decompress/parallel/isal_huffman.rs` `IsalLitLenCode` — Rust
+  port of `HuffmanCodingISAL.hpp` (table build via FFI, decode via
+  short_code_lookup/long_code_lookup tables). Thread-local instance
+  for per-thread allocation amortization.
+
+### Why integrating it didn't yield perf yet
+
+Wiring `IsalLitLenCode` into `decode_dynamic` regressed perf (0.40× →
+0.28×) because `make_inflate_huff_code_lit_len` is called per dynamic
+block (~7000 blocks across all chunks on Silesia). Rapidgzip avoids
+this cost by bootstrap-handing-off after just 1–2 blocks
+(`cleanDataCount >= MAX_WINDOW_SIZE`), then running ISA-L bulk with
+its own internal tables (no per-block Rust builds).
+
+Porting that handoff (`a22e305`) alone regresses too, because chunks
+that previously bootstrap-completed-as-marker-only now error →
+speculation miss → consumer falls into serial authoritative chain.
+
+The fix needs ALL THREE TOGETHER:
+1. `IsalLitLenCode` in the bootstrap (fast per-symbol decode).
+2. `cleanDataCount` handoff (stop bootstrap after ~1–2 blocks).
+3. Worker recovery path when handoff window has markers (per
+   rapidgzip's `tryToDecode` catch + iterate to next candidate AND
+   fall back to bootstrap-to-completion on exhaustion).
+
+This is task #23's next concrete piece.
 
 ## Remaining bottleneck: bootstrap throughput
 
