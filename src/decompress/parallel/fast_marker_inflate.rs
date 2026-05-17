@@ -961,6 +961,32 @@ fn decode_dynamic(
 
     let dist_table = ConsumeFirstTable::build_distance(&lens[hlit..])?;
 
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    {
+        // Literal-port use of rapidgzip's HuffmanCodingISAL for lit/len
+        // decoding. Thread-local IsalLitLenCode amortizes the 19 KB table
+        // allocation; per-block ISA-L rebuild via FFI is the unavoidable
+        // cost of using ISA-L's fast short_code_lookup / long_code_lookup
+        // tables. Matches what rapidgzip does in deflate::Block when
+        // LIBRAPIDARCHIVE_WITH_ISAL is enabled (deflate.hpp:39).
+        let isal_result = crate::decompress::parallel::isal_huffman::with_thread_litlen(
+            &lens[..hlit],
+            |litlen_isal| {
+                decode_huffman_block_isal(
+                    bits,
+                    output,
+                    litlen_isal,
+                    &dist_table,
+                    max_output,
+                    clean_tail,
+                )
+            },
+        );
+        if let Some(r) = isal_result {
+            return r;
+        }
+    }
+
     let litlen_table = ConsumeFirstTable::build(&lens[..hlit])?;
     decode_huffman_block(
         bits,
