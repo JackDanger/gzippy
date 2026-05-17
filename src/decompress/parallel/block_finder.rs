@@ -529,13 +529,140 @@ impl<'a> BlockFinder<'a> {
             .map(|b| b.bit_offset)
     }
 
+    /// Literal port of rapidgzip's `seekToNonFinalUncompressedDeflateBlock`
+    /// (vendor/rapidgzip/.../blockfinder/Uncompressed.hpp:21-95).
+    /// Scans byte boundaries for the LEN/~LEN coincidence pattern, then
+    /// validates the 3-bit deflate header preceding the byte boundary.
+    /// Returns all detected stored-block candidates (one per match), each
+    /// emitted at the EARLIEST valid bit offset (rapidgzip's offset.first,
+    /// matching the next-block boundary the predecessor would land on).
+    ///
+    /// `start_bit` and `end_bit` are bit positions into `self.data`.
+    fn find_uncompressed_blocks(&self, start_bit: usize, end_bit: usize) -> Vec<BlockBoundary> {
+        const DEFLATE_MAGIC_BIT_COUNT: usize = 3;
+        const BYTE_SIZE: usize = 8;
+        const MAX_PRECEDING_BITS: usize = DEFLATE_MAGIC_BIT_COUNT + (BYTE_SIZE - 1); // 10
+        let data = self.data;
+        let n = data.len();
+        let mut out = Vec::new();
+
+        // Mirror of rapidgzip's `untilOffsetSizeMember`: where the LEN word
+        // can live. We have at most 4 bytes of LEN + NLEN.
+        let until_byte_for_size = end_bit.div_ceil(BYTE_SIZE).min(n.saturating_sub(4));
+
+        // Mirror of `startOffsetByte`: align to next byte AFTER the 3-bit
+        // header (so the LEN field is byte-aligned). Floor at byte 1 so
+        // we have at least one byte of preceding bits to inspect.
+        let start_byte = ((start_bit + DEFLATE_MAGIC_BIT_COUNT).div_ceil(BYTE_SIZE)).max(1);
+        if start_byte >= until_byte_for_size {
+            return out;
+        }
+
+        // Walk byte boundaries, reading LEN(2) | NLEN(2) and checking
+        // len == ~nlen. Equivalent to rapidgzip's sliding 32-bit window;
+        // we just re-read each iteration (cheap on x86_64).
+        for byte_off in start_byte..until_byte_for_size {
+            // LEN ^ ~NLEN == 0  ⇔  (size ^ (size >> 16)) & 0xFFFF == 0xFFFF
+            let size = u32::from_le_bytes([
+                data[byte_off],
+                data[byte_off + 1],
+                data[byte_off + 2],
+                data[byte_off + 3],
+            ]);
+            if ((size ^ (size >> 16)) & 0xFFFF) != 0xFFFF {
+                continue;
+            }
+
+            let byte_bit = byte_off * BYTE_SIZE;
+            // Read MAX_PRECEDING_BITS BEFORE the byte boundary. Rapidgzip
+            // seeks back and peeks 10 bits; we just construct from bytes.
+            // Bit ordering: LSB-first across bytes, so the bit at position
+            // (byte_bit - 1) is the MSB of byte (byte_off - 1)'s LSB-first
+            // numbering — i.e., bit 7 of data[byte_off - 1].
+            //
+            // Following rapidgzip's convention: bit indices in preBits
+            // are numbered such that index 0 is the OLDEST bit
+            // (byte_bit - MAX_PRECEDING_BITS) and index MAX_PRECEDING_BITS-1
+            // is the NEWEST (byte_bit - 1). Build by reading the bytes
+            // covering [byte_bit - MAX_PRECEDING_BITS, byte_bit).
+            let first_pre_bit = match byte_bit.checked_sub(MAX_PRECEDING_BITS) {
+                Some(v) => v,
+                None => continue,
+            };
+            let first_pre_byte = first_pre_bit / BYTE_SIZE;
+            let shift = first_pre_bit % BYTE_SIZE;
+            // Need 2 bytes (16 bits) to extract up to 10 bits starting at
+            // first_pre_bit. previous_bits is laid out so that bit 0 is
+            // the oldest, bit (MAX_PRECEDING_BITS-1) is the newest.
+            let raw = (data[first_pre_byte] as u32) | ((data[first_pre_byte + 1] as u32) << 8);
+            let preceding_bits = (raw >> shift) & ((1u32 << MAX_PRECEDING_BITS) - 1);
+
+            // The 3 magic bits (bfinal=0, btype=00) must be at the TOP of
+            // preceding_bits (the newest bits, closest to byte_bit).
+            // MAGIC_BITS_MASK = 0b111 << (MAX_PRECEDING_BITS - 3) = 0b111 << 7.
+            const MAGIC_BITS_MASK: u32 = 0b111u32 << (MAX_PRECEDING_BITS - DEFLATE_MAGIC_BIT_COUNT);
+            if (preceding_bits & MAGIC_BITS_MASK) != 0 {
+                continue;
+            }
+
+            // Count trailing zeros in the padding region (bits 0..7 of
+            // preceding_bits, going from bit MAX_PRECEDING_BITS-4 downward).
+            // trailingZeros starts at DEFLATE_MAGIC_BIT_COUNT and grows
+            // for each preceding zero padding bit. Mirror of rapidgzip's
+            // for-loop at Uncompressed.hpp:77-82.
+            let mut trailing_zeros = DEFLATE_MAGIC_BIT_COUNT;
+            for j in (trailing_zeros + 1)..=MAX_PRECEDING_BITS {
+                if (preceding_bits & (1u32 << (MAX_PRECEDING_BITS - j))) != 0 {
+                    break;
+                }
+                trailing_zeros = j;
+            }
+
+            // The earliest valid start: byte_bit - trailing_zeros.
+            // Must be ≥ start_bit and < end_bit.
+            let earliest = match byte_bit.checked_sub(trailing_zeros) {
+                Some(v) => v,
+                None => continue,
+            };
+            let latest = byte_bit - DEFLATE_MAGIC_BIT_COUNT;
+            if earliest >= start_bit && latest < end_bit {
+                // Validate data fits: aligned_byte + 4 + len ≤ n.
+                let len = (size & 0xFFFF) as usize;
+                if len == 0 || byte_off + 4 + len > n {
+                    continue;
+                }
+                out.push(BlockBoundary {
+                    bit_offset: earliest,
+                    valid: true,
+                    hlit: 0,
+                    hdist: 0,
+                    hclen: 0,
+                });
+            }
+        }
+        out
+    }
+
     /// Find all valid deflate block starts in a range.
     ///
-    /// Searches for all block types (stored, fixed, dynamic).
-    /// Uses multi-level fail-fast validation for dynamic blocks;
-    /// stored blocks are validated by len/~len; fixed blocks are
-    /// accepted as candidates for trial decode.
+    /// Searches dynamic (via LUT + Huffman validation) AND uncompressed
+    /// (via byte-boundary LEN/~LEN scan) candidates, merging results in
+    /// ascending bit-offset order. Mirrors rapidgzip's alternating
+    /// dynamic + uncompressed search in `GzipChunk::tryToDecode`
+    /// (vendor/rapidgzip/.../chunkdecoding/GzipChunk.hpp:803-846).
     pub fn find_blocks(&self, start_bit: usize, end_bit: usize) -> Vec<BlockBoundary> {
+        let mut dynamic = self.find_dynamic_blocks(start_bit, end_bit);
+        let uncompressed = self.find_uncompressed_blocks(start_bit, end_bit);
+        dynamic.extend(uncompressed);
+        dynamic.sort_by_key(|b| b.bit_offset);
+        dynamic
+    }
+
+    /// Dynamic-Huffman block finder. Direct port of rapidgzip's
+    /// `seekToNonFinalDynamicDeflateBlock` (DynamicHuffman.hpp:168+).
+    /// Was inlined into find_blocks; extracted so find_blocks can also
+    /// run the uncompressed pass and merge results.
+    fn find_dynamic_blocks(&self, start_bit: usize, end_bit: usize) -> Vec<BlockBoundary> {
         let mut blocks = Vec::new();
         let mut reader = BitReader::new(self.data);
         reader.seek_to_bit(start_bit);
