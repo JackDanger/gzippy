@@ -5,24 +5,27 @@
 //! parallel fetcher (chunk_fetcher.rs) calls per worker. It assumes
 //! `encoded_offset_bits` points at a REAL deflate block boundary (the
 //! caller — usually [`crate::decompress::parallel::block_finder::BlockFinder`]
-//! plus [`crate::decompress::parallel::fast_marker_inflate::validate_boundary`]
 //! — is responsible for that). From there it follows rapidgzip's
-//! pattern verbatim:
+//! pattern verbatim
+//! (vendor/.../chunkdecoding/GzipChunk.hpp::decodeChunkWithRapidgzip,
+//! L413-L657):
 //!
-//!   1. **Bootstrap with the marker decoder** — pure-Rust
-//!      [`fast_marker_inflate::decode_chunk_bootstrap`] decodes until a
-//!      32 KiB clean tail accumulates at a deflate block boundary (or
-//!      BFINAL fires, or `until_bits` is reached). The output is
-//!      `Vec<u16>` with markers ≥ MARKER_BASE encoding cross-chunk
-//!      back-references the consumer will resolve via `apply_window`.
+//!   1. **Bootstrap with [`deflate_block::Block`]** — the rapidgzip-
+//!      faithful port of `vendor/.../gzip/deflate.hpp`'s
+//!      `deflate::Block<>`. The decoder consumes deflate blocks
+//!      one-at-a-time, emitting `Vec<u16>` where values < MARKER_BASE
+//!      are literal bytes and values ≥ MARKER_BASE are MapMarkers
+//!      cross-chunk back-references the consumer resolves via
+//!      `apply_window`. We track cumulative *clean* (non-marker) bytes;
+//!      when that reaches `MAX_WINDOW_SIZE` (32 KiB), bootstrap exits at
+//!      the next block boundary so phase 2 can take over.
 //!
-//!   2. **Hand off to patched ISA-L** — when the bootstrap returns a
-//!      `clean_window`, construct an [`IsalInflateWrapper`] at the
-//!      bootstrap's end-bit-offset, seed its 32 KiB dict with
-//!      `clean_window`, and request `END_OF_BLOCK_HEADER` stops so we
-//!      know when to terminate the chunk at a real boundary at-or-past
-//!      `until_bits`. ISA-L delivers ~163 MB/s/thread vs the marker
-//!      decoder's ~50 MB/s.
+//!   2. **Hand off to patched ISA-L** — when the bootstrap accumulated
+//!      a clean 32 KiB tail, seed ISA-L with that as a dict and resume
+//!      decoding from the bootstrap's end-bit-offset. ISA-L delivers
+//!      ~163 MB/s/thread vs the Rust deflate decoder's ~50 MB/s.
+//!      Mirrors rapidgzip's `cleanDataCount >= MAX_WINDOW_SIZE` branch
+//!      at GzipChunk.hpp:520-525.
 //!
 //!   3. **Subchunk boundaries** are recorded by both phases via
 //!      `ChunkData::append_block_boundary`; the chunk emits a new
@@ -240,23 +243,30 @@ pub fn finish_decode_chunk_with_inexact_offset(
 ) -> Result<ChunkData, ChunkDecodeError> {
     let t_decode = std::time::Instant::now();
 
-    // Phase 1 — marker-decoder bootstrap. Runs at ~50 MB/s/thread but
-    // only for the chunk's leading ~32 KiB + one block: enough to
-    // accumulate a clean 32 KiB tail for ISA-L's dict.
-    let bootstrap = crate::decompress::parallel::fast_marker_inflate::decode_chunk_bootstrap(
-        input,
-        encoded_offset_bits,
-        Some(until_bits),
-    )?;
+    // Phase 1 — bootstrap with deflate_block::Block, the rapidgzip-
+    // faithful port of vendor/.../gzip/deflate.hpp's deflate::Block<>.
+    // Decodes deflate blocks one-by-one until any of:
+    //   (a) cumulative clean (non-marker) bytes reach MAX_WINDOW_SIZE
+    //       AND the next block header is past `until_bits` is not yet
+    //       required — phase 2 (ISA-L) can take over;
+    //   (b) BFINAL block is decoded (single-member tail);
+    //   (c) we're at a non-fixed-Huffman block boundary at-or-past
+    //       `until_bits` (chunk's end condition).
+    //
+    // Mirrors GzipChunk.hpp::decodeChunkWithRapidgzip's main loop
+    // (vendor/.../chunkdecoding/GzipChunk.hpp:468-654), in particular
+    // the `cleanDataCount >= deflate::MAX_WINDOW_SIZE` handoff at
+    // L520-525.
+    let bootstrap = bootstrap_with_deflate_block(input, encoded_offset_bits, until_bits)?;
 
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
     if !bootstrap.markers.is_empty() {
         chunk.append_markered(&bootstrap.markers);
     }
 
-    // Whenever the marker bootstrap reached a block boundary at-or-past
-    // until_bits (rare on chunks > 32 KiB), or BFINAL fired, or no clean
-    // window accumulated — we're done. The chunk is marker-only.
+    // Whenever the bootstrap reached a block boundary at-or-past
+    // until_bits (rare on chunks > 32 KiB), or BFINAL fired, or no
+    // clean window accumulated — we're done. The chunk is marker-only.
     let Some(clean_window) = bootstrap.clean_window else {
         chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
         chunk.finalize(bootstrap.end_bit_offset);
@@ -459,6 +469,218 @@ pub fn finish_decode_chunk_with_inexact_offset(
     chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
     chunk.finalize(final_bit_pos);
     Ok(chunk)
+}
+
+/// Result of one bootstrap pass over deflate blocks via
+/// [`deflate_block::Block`]. Mirrors the early-exit contract of
+/// rapidgzip's `decodeChunkWithRapidgzip` main loop
+/// (vendor/.../chunkdecoding/GzipChunk.hpp:468-654).
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+struct DeflateBootstrap {
+    /// u16 output spanning every block decoded in this bootstrap pass.
+    /// Values < MARKER_BASE are literal bytes; values ≥ MARKER_BASE are
+    /// MapMarkers cross-chunk back-references (consumer resolves via
+    /// `apply_window`).
+    markers: Vec<u16>,
+    /// Bit position immediately after the last fully-decoded block.
+    /// Always at a real deflate block boundary, suitable as a resume
+    /// point for ISA-L's `isal_inflate_set_dict` + decode.
+    end_bit_offset: usize,
+    /// Last 32 KiB of clean (non-marker) output, present only when the
+    /// bootstrap saw ≥ MAX_WINDOW_SIZE cumulative clean bytes ending at
+    /// a block boundary (rapidgzip's `cleanDataCount >= MAX_WINDOW_SIZE`
+    /// at GzipChunk.hpp:521). When `None`, phase 2 cannot run because we
+    /// have no clean dict — either BFINAL fired first, `until_bits` was
+    /// reached, or no block produced enough clean data.
+    clean_window: Option<Vec<u8>>,
+    /// True when the bootstrap exited because it decoded a BFINAL=1
+    /// block. Single-stream tail; no further deflate data follows.
+    bfinal_hit: bool,
+}
+
+/// Phase 1 bootstrap: drive [`deflate_block::Block`] block-by-block from
+/// `start_bit_offset` until any of (a) cumulative clean bytes reach
+/// MAX_WINDOW_SIZE at a block boundary, (b) BFINAL fires, or (c) we're
+/// at a non-fixed block boundary at-or-past `until_bits`.
+///
+/// Mirror of the `while ( true )` loop in
+/// `decodeChunkWithRapidgzip` (GzipChunk.hpp:468-654), restricted to the
+/// single-member case (no multi-stream loop) and with the handoff
+/// triggered exclusively by `cleanDataCount` (GzipChunk.hpp:520-525).
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+fn bootstrap_with_deflate_block(
+    data: &[u8],
+    start_bit_offset: usize,
+    until_bits: usize,
+) -> Result<DeflateBootstrap, ChunkDecodeError> {
+    use crate::decompress::inflate::consume_first_decode::Bits;
+    use crate::decompress::parallel::deflate_block::{Block, CompressionType, MAX_WINDOW_SIZE};
+    use crate::decompress::parallel::replace_markers::MARKER_BASE;
+
+    let byte_offset = start_bit_offset / 8;
+    let bit_in_byte = (start_bit_offset % 8) as u32;
+    if byte_offset >= data.len() {
+        return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "start_bit_offset past end of data",
+        )));
+    }
+    let mut bits = Bits::new(&data[byte_offset..]);
+    if bit_in_byte > 0 {
+        bits.consume(bit_in_byte);
+    }
+
+    // Bootstrap output: typically ~32 KiB + one trailing block, up to
+    // ~128 KiB worst case for a single dense dynamic block. Pre-reserve
+    // generously to avoid early growth without re-introducing the
+    // 4× deflate_bytes-per-thread blowup the whole-chunk variant had.
+    let mut output: Vec<u16> = Vec::with_capacity(128 * 1024);
+    let mut block = Block::new();
+
+    // Tracks trailing CLEAN-byte run length. When it reaches
+    // MAX_WINDOW_SIZE AT a block boundary, the next 32 KiB of `output`
+    // forms a clean dict for ISA-L. Cumulative count saturates at
+    // MAX_WINDOW_SIZE (we only need the latest 32 KiB).
+    let mut trailing_clean: usize = 0;
+    // True once `trailing_clean >= MAX_WINDOW_SIZE` AND the most recent
+    // block has just finished (so the next bit position is a real block
+    // header start that ISA-L can resume from).
+    let mut clean_handoff_armed: bool;
+    let mut bfinal_hit = false;
+    // `end_bit_offset` always points just past the last completed block.
+    let mut end_bit_offset = absolute_bit_pos(byte_offset, &bits);
+
+    loop {
+        // Snapshot the bit position BEFORE reading this block's header.
+        // This is what the next chunk's worker resumes from when this
+        // chunk hands off to ISA-L (or when this block becomes BFINAL).
+        let next_block_offset = absolute_bit_pos(byte_offset, &bits);
+
+        // Handoff check (rapidgzip GzipChunk.hpp:520-525): if we have a
+        // clean 32 KiB tail AND we're at a real block boundary, stop
+        // bootstrap and let phase 2 run. We do this BEFORE reading the
+        // next header so `end_bit_offset` is at a clean boundary.
+        clean_handoff_armed = trailing_clean >= MAX_WINDOW_SIZE;
+        if clean_handoff_armed {
+            end_bit_offset = next_block_offset;
+            break;
+        }
+
+        // Read this block's header. `treat_last_block_as_error = false`
+        // (we WANT to see BFINAL so we can stop).
+        match block.read_header(&mut bits, false) {
+            Ok(()) => {}
+            Err(e) => {
+                return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("deflate header at bit {next_block_offset}: {e:?}"),
+                )));
+            }
+        }
+
+        // Preemptive stop condition (rapidgzip GzipChunk.hpp:550-555):
+        // if this block's header sits at-or-past until_bits AND it is
+        // non-fixed AND not BFINAL, stop here so the chunk ends on a
+        // boundary the successor's BlockFinder can re-find.
+        let is_fixed = block.compression_type() == CompressionType::FixedHuffman;
+        if next_block_offset >= until_bits && !block.is_last_block() && !is_fixed {
+            // We've already advanced `bits` past this header. Rewind
+            // logically by reporting `end_bit_offset = next_block_offset`
+            // — the successor will re-parse the same header.
+            end_bit_offset = next_block_offset;
+            break;
+        }
+
+        // Decode the block's body, one read() call at a time, until
+        // EOB. `n_max_to_decode = usize::MAX` matches rapidgzip's
+        // `std::numeric_limits<size_t>::max()` at GzipChunk.hpp:568.
+        let before_len = output.len();
+        while !block.eob() {
+            let _ = block
+                .read(&mut bits, &mut output, usize::MAX)
+                .map_err(|e| {
+                    ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("deflate body at bit {next_block_offset}: {e:?}"),
+                    ))
+                })?;
+        }
+
+        // Block fully decoded. Update trailing_clean from the bytes
+        // just produced. Markers (≥ MARKER_BASE) reset the run; clean
+        // bytes extend it (saturating at MAX_WINDOW_SIZE).
+        let block_slice = &output[before_len..];
+        if !block_slice.is_empty() {
+            let trailing_this_block = block_slice
+                .iter()
+                .rev()
+                .take_while(|&&v| v < MARKER_BASE)
+                .count();
+            if trailing_this_block == block_slice.len() {
+                // Entire block was clean — extend the prior run.
+                trailing_clean = (trailing_clean + trailing_this_block).min(MAX_WINDOW_SIZE);
+            } else {
+                // A marker appeared mid-block; the trailing clean run
+                // restarts from after that last marker.
+                trailing_clean = trailing_this_block.min(MAX_WINDOW_SIZE);
+            }
+        }
+
+        end_bit_offset = absolute_bit_pos(byte_offset, &bits);
+
+        if block.is_last_block() {
+            bfinal_hit = true;
+            break;
+        }
+    }
+
+    // Build the clean dict if we have one.
+    let clean_window = if clean_handoff_armed && output.len() >= MAX_WINDOW_SIZE {
+        let start = output.len() - MAX_WINDOW_SIZE;
+        // Invariant: the trailing MAX_WINDOW_SIZE values of `output` are
+        // < MARKER_BASE (clean). Assert this — corruption here would
+        // seed ISA-L with garbage and produce a wrong-CRC chunk.
+        let window: Vec<u8> = output[start..]
+            .iter()
+            .map(|&v| {
+                assert!(
+                    v < MARKER_BASE,
+                    "bootstrap clean window contained marker at offset {}; \
+                     trailing_clean tracker broken",
+                    v.saturating_sub(MARKER_BASE)
+                );
+                v as u8
+            })
+            .collect();
+        Some(window)
+    } else {
+        None
+    };
+
+    Ok(DeflateBootstrap {
+        markers: output,
+        end_bit_offset,
+        clean_window,
+        bfinal_hit,
+    })
+}
+
+/// Compute the absolute bit position within `data` given that `bits`
+/// was constructed from `&data[byte_offset..]`. The Bits buffer
+/// pre-loads bytes from its slice, so the actual consumed-from-slice
+/// count is `bits.pos * 8 - bits.available()`.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[inline]
+fn absolute_bit_pos(
+    byte_offset: usize,
+    bits: &crate::decompress::inflate::consume_first_decode::Bits,
+) -> usize {
+    let consumed_bytes_from_slice = bits.pos;
+    let bits_in_buf = bits.available();
+    let bits_consumed_from_slice = consumed_bytes_from_slice
+        .saturating_mul(8)
+        .saturating_sub(bits_in_buf as usize);
+    byte_offset * 8 + bits_consumed_from_slice
 }
 
 // Stubs for non-x86_64 / no-feature builds.

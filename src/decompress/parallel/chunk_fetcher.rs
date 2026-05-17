@@ -273,8 +273,9 @@ fn worker_loop(
             window_map.get_or_wait(job.start_bit, Duration::from_secs(60))
         } else {
             // Speculative job: short wait. If miss, take slow path
-            // with the empty window. Slow path is bounded (see
-            // decode_chunk_bootstrap end_bit_limit) so a phantom
+            // with the empty window. Slow path is bounded (the
+            // deflate_block::Block bootstrap stops at the first non-
+            // fixed block boundary at-or-past until_bits) so a phantom
             // boundary returns Err quickly rather than hanging.
             window_map.get_or_wait(job.start_bit, WINDOW_WAIT_TIMEOUT)
         };

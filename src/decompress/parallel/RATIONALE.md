@@ -14,14 +14,18 @@ stream). The CLI `-p N` flag selects parallelism here.
 
 ## Why it is structured the way it is
 
-The current design is the **v0.6 marker pipeline**:
+The current design is the **rapidgzip-faithful marker pipeline**:
 
-1. `fast_marker_inflate::decode_chunk_markers_bounded` — pure-Rust deflate
-   decoder, parallelizable, emits `Vec<u16>` with markers (`≥ MARKER_BASE`)
-   for back-references that reach into the preceding chunk's 32 KB window.
+1. `deflate_block::Block` — rapidgzip-faithful port of
+   `vendor/.../gzip/deflate.hpp`'s `deflate::Block<>`. Drives the bootstrap
+   phase of `gzip_chunk::finish_decode_chunk_with_inexact_offset`,
+   emitting `Vec<u16>` where literals are `< MARKER_BASE` and cross-chunk
+   back-references are MapMarkers indices (`≥ MARKER_BASE`).
 2. `replace_markers::replace_markers` — SIMD-vectorized marker resolution
-   (AVX2 / NEON / scalar) that runs sequentially across chunks, using each
-   chunk's last 32 KB as the window for the next.
+   (AVX2 / NEON / scalar) with MapMarkers semantics (`MARKER_BASE = 32768`,
+   index from the OLDEST window byte) — matches
+   `vendor/.../MarkerReplacement.hpp::MapMarkers`. Runs sequentially across
+   chunks, using each chunk's last 32 KB as the window for the next.
 3. `single_member::phase2_resolve_sequential` — drives phase 2, converts
    each chunk u16→u8, accumulates output, computes CRC32 incrementally.
 4. `single_member::decompress_parallel` — verifies CRC + ISIZE against the
@@ -84,9 +88,9 @@ equivalent assertion.** They are not redundant with output tests.
 |---|---|---|
 | `parallel::single_member::decompress_parallel` | Production entry | This IS the parallel single-member path. |
 | `parallel::single_member::MARKER_PIPELINE_RUNS` | Routing-assertion counter | The deletion-trap killer. |
-| `parallel::fast_marker_inflate::decode_chunk_markers_bounded` | Marker decode | Phase 1 of the pipeline. |
-| `parallel::fast_marker_inflate::record_block_starts` | Truth-source for block boundaries | Test-only but used by the integration test. |
-| `parallel::replace_markers::replace_markers` + `MARKER_BASE` + `u16_to_u8` | Phase 2 | SIMD resolution. |
+| `parallel::deflate_block::Block` (read_header + read) | Marker-emitting deflate decoder | Phase 1 of the pipeline, rapidgzip-faithful port of `vendor/.../gzip/deflate.hpp`. |
+| `parallel::deflate_block::record_block_starts` | Truth-source for block boundaries | Test-only but used by the ISA-L stopping-point invariant tests. |
+| `parallel::replace_markers::replace_markers` + `MARKER_BASE` + `u16_to_u8` | Phase 2 | SIMD resolution with MapMarkers semantics. |
 | `tests::routing::test_marker_pipeline_actually_runs_on_x86_64_isal` | The killer test | See above. |
 | `tests::routing::test_single_member_parallel_not_slower_than_sequential` | v0.3.0-class regression guard | Catches the 1.75× regression at PR time. |
 
@@ -95,11 +99,10 @@ equivalent assertion.** They are not redundant with output tests.
 `parallel::marker_decode::MarkerDecoder` (the legacy ~22 MB/s pure-Rust
 decoder) is no longer used by production. It currently exists only because
 test fixtures in `src/tests/correctness.rs` reference it. A follow-up PR
-should either (a) retarget those tests at `fast_marker_inflate` or (b)
-delete them as redundant with `fast_marker_inflate`'s 200-trial
-differential fuzz against `inflate_consume_first`. Then delete
-`MarkerDecoder` and most of `marker_decode.rs`, keeping only
-`skip_gzip_header` (which is used by both `fast_marker_inflate` and
+should either (a) retarget those tests at `deflate_block::Block` or (b)
+delete them as redundant with the differential fuzz against
+`inflate_consume_first`. Then delete `MarkerDecoder` and most of
+`marker_decode.rs`, keeping only `skip_gzip_header` (which is used by
 `single_member`).
 
 ## Where the plan lives

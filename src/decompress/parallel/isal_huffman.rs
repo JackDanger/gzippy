@@ -7,10 +7,10 @@
 //! ISA-L's table-lookup speed (~340 MB/s/thread) instead of our pure-Rust
 //! `ConsumeFirstTable` (~14 MB/s/thread).
 //!
-//! Used by the parallel single-member bootstrap inside
-//! `fast_marker_inflate` to accelerate the dominant cost (Huffman decode
-//! of literal/length symbols). Distance codes still use the existing
-//! pure-Rust path — they're a small fraction of decode work.
+//! Ported alongside the rest of `vendor/.../gzip/deflate.hpp` (see
+//! `deflate_block`) so the bootstrap decoder's Huffman lookups can run
+//! at ISA-L's table-lookup speed when wired in. Distance codes still use
+//! the existing pure-Rust path — they're a small fraction of decode work.
 //!
 //! Architecture notes for the literal port:
 //! - `LIT_LEN_ELEMS = LIT_LEN + 228` = 514 (matches ISA-L's internal

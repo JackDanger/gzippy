@@ -5,20 +5,24 @@
 //! `num_threads > 1`, the compressed stream exceeds 10 MiB, and the host has
 //! enough physical cores for the algorithm's 2N compute work to amortize.
 //!
-//! - `single_member` — v0.5.1 speculative-window two-pass design (production).
+//! - `single_member` — speculative-window two-pass design (production).
 //! - `block_finder` — deflate block-boundary scanner (precode + Huffman validation).
-//! - `marker_decode` — legacy pure-Rust marker decoder (~22 MB/s). Used only
-//!   for `skip_gzip_header` today; the rest of the marker pipeline below
-//!   supersedes it. Slated for deletion once the v0.6 marker pipeline lands
-//!   in production routing.
 //! - `replace_markers` — SIMD-accelerated marker resolution (AVX2 on x86_64,
-//!   NEON on aarch64). Phase 2 of the v0.6 marker pipeline.
-//! - `fast_marker_inflate` — pure-Rust marker-emitting deflate decoder.
-//!   Phase 1 of the v0.6 marker pipeline. Tens of × faster than the legacy
-//!   `marker_decode::MarkerDecoder` because it uses a 64-bit bit buffer and
-//!   canonical-Huffman lookup tables instead of bit-by-bit reads.
-//! - `ultra_fast_inflate` — pre-allocated full-buffer inflate helper used by
-//!   `marker_decode` and a handful of bgzf benches.
+//!   NEON on aarch64). Phase 2 of the marker pipeline; resolves cross-chunk
+//!   back-references using MapMarkers semantics (`MARKER_BASE = 32768`,
+//!   index from the OLDEST window byte) — see
+//!   `vendor/rapidgzip/.../MarkerReplacement.hpp::MapMarkers`.
+//! - `deflate_block` — rapidgzip-faithful port of `deflate::Block<>`
+//!   (`vendor/rapidgzip/.../gzip/deflate.hpp`). Drives the bootstrap
+//!   phase of the parallel single-member pipeline in
+//!   `gzip_chunk::finish_decode_chunk_with_inexact_offset`: decodes
+//!   deflate blocks one-by-one emitting MapMarkers cross-chunk
+//!   back-references until ≥32 KiB of clean output accumulates, then
+//!   hands off to patched ISA-L for the bulk decode.
+//! - `gzip_chunk` — chunk-level decoder entry points (fast path with
+//!   known dict, slow path that bootstraps via `deflate_block`).
+//! - `inflate_wrapper` — patched-ISA-L wrapper used by the fast path
+//!   and the post-bootstrap bulk decode.
 
 pub mod apply_window;
 pub mod block_fetcher;
@@ -29,7 +33,6 @@ pub mod chunk_data;
 pub mod chunk_fetcher;
 pub mod compressed_vector;
 pub mod deflate_block;
-pub mod fast_marker_inflate;
 pub mod gzip_chunk;
 pub mod gzip_format;
 pub mod inflate_wrapper;

@@ -811,6 +811,47 @@ fn reverse_bits(mut v: u16, n: u8) -> u16 {
     r
 }
 
+/// Test helper: decode the deflate stream in `data` from bit 0,
+/// returning every block-start bit position observed. Each position is
+/// a valid starting bit for resuming decode at the start of that
+/// block's header.
+///
+/// Used by `backends::isal_decompress` invariant tests to oracle-check
+/// ISA-L's `end_bit` values against an independently-derived set of
+/// real block boundaries. Implemented by driving `Block::read_header`
+/// + `Block::read` block-by-block until BFINAL.
+#[cfg(test)]
+pub fn record_block_starts(data: &[u8]) -> std::io::Result<Vec<usize>> {
+    use crate::decompress::inflate::consume_first_decode::Bits;
+    let mut bits = Bits::new(data);
+    let mut output: Vec<u16> = Vec::with_capacity(data.len().saturating_mul(4));
+    let mut block = Block::new();
+    let mut starts = Vec::new();
+    loop {
+        // Snapshot bit position at the start of this block's header.
+        let consumed_bytes = bits.pos;
+        let bits_in_buf = bits.available();
+        let abs_bit = consumed_bytes
+            .saturating_mul(8)
+            .saturating_sub(bits_in_buf as usize);
+        starts.push(abs_bit);
+
+        block
+            .read_header(&mut bits, false)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
+        while !block.eob() {
+            block
+                .read(&mut bits, &mut output, usize::MAX)
+                .map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
+                })?;
+        }
+        if block.is_last_block() {
+            return Ok(starts);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
