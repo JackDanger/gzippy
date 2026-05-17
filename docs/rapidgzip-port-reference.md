@@ -105,6 +105,48 @@ Atomically landing these three is the remaining work. Each was
 attempted in isolation this session and reverted (commits ff56db2,
 d08239c, df48369) because each in isolation regresses perf.
 
+## Opus advisor diagnostic (commit b5ecdf5 attempt)
+
+Opus advisor reviewed why IsalLitLenCode integration consistently
+regresses (USER time drops, WALL time rises, pool util drops 22% → 8%).
+**Root cause: L1 cache thrash from rebuilding the 19 KB
+`inflate_huff_code_large` table per dynamic block**.
+
+- Silesia gzip -9 has many small blocks (~few-KB output each).
+- Per-block table build (`set_and_expand_lit_len_huffcode` +
+  `make_inflate_huff_code_lit_len`) writes ~19 KB.
+- 16 threads × thread-local 19 KB tables × per-block rebuild = constant
+  L1 eviction storm.
+- USER time drops because cache-miss stalls don't count as CPU work;
+  WALL rises because threads stall on memory.
+
+Cache-by-code-lengths fix (commit b5ecdf5): measured **4% hit rate**.
+Silesia gzip -9 blocks have unique code lengths — depth-1 cache is
+useless. Deeper LRU may help marginally but won't close the gap.
+
+## Real fix (per advisor)
+
+**Port rapidgzip's full `deflate::Block`** (~2000 lines, file
+`vendor/rapidgzip/librapidarchive/src/rapidgzip/gzip/deflate.hpp`).
+Their inner loop:
+- Pre-loads bit-buffer refills
+- Decodes 2 symbols at a time when both have short codes
+  (HuffmanCodingDoubleLiteralCached)
+- Uses ISA-L's distance table too (HuffmanCodingDistanceISAL)
+- Reuses huffman objects across consecutive same-code-length blocks
+  via internal hash
+
+The per-block-rebuild model (what we have) is the wrong SHAPE for
+the data. Closing the 2.5× gap requires the per-block-decoder model
+match rapidgzip's structure end-to-end, not piecemeal optimization
+of the current shape.
+
+Alternative if `deflate::Block` port is too costly: investigate
+whether ISA-L exposes a "decode one block stopping at EOB" API that
+manages its own tables internally. If so, that's the same code path
+ISA-L's `isal_inflate` uses for normal decode (just terminated at EOB
+boundaries). This sidesteps the per-block table rebuild entirely.
+
 ## Infrastructure landed for next iteration (commits 6b9d754, 1d19f21)
 
 - `crates/isal-sys-patched/src/lib.rs` `isal_internals` module exposes
