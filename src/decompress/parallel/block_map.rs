@@ -194,6 +194,27 @@ impl BlockMap {
     }
 }
 
+/// Insert every subchunk in `chunk` into `block_map` in stream order.
+/// Mirror of the per-subchunk push loop inside rapidgzip's
+/// `GzipChunkFetcher::appendSubchunksToIndexes`
+/// (GzipChunkFetcher.hpp:371-375).
+///
+/// The chunk must already be finalized (so each subchunk's
+/// `encoded_size_bits` is computed). Pushes happen in `subchunks`
+/// order to satisfy BlockMap's monotonic-increasing-offset contract.
+pub fn append_subchunks_to_block_map(
+    block_map: &BlockMap,
+    chunk: &crate::decompress::parallel::chunk_data::ChunkData,
+) {
+    for sc in &chunk.subchunks {
+        block_map.push(
+            sc.encoded_offset_bits,
+            sc.encoded_size_bits,
+            sc.decoded_size,
+        );
+    }
+}
+
 fn get_locked(g: &Inner, idx: usize) -> BlockInfo {
     let (enc, dec) = g.block_to_data_offsets[idx];
     let mut info = BlockInfo {
@@ -256,6 +277,30 @@ mod tests {
         let info = m.get_encoded_offset(800).unwrap();
         assert_eq!(info.block_index, 1);
         assert_eq!(info.decoded_offset_in_bytes, 1000);
+    }
+
+    #[test]
+    fn append_subchunks_to_block_map_pushes_in_order() {
+        use crate::decompress::parallel::chunk_data::{ChunkConfiguration, ChunkData};
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 100,
+            max_decoded_chunk_size: 10_000,
+            crc32_enabled: true,
+        };
+        let mut chunk = ChunkData::new(0, cfg);
+        chunk.append_clean(&[0u8; 50]);
+        chunk.append_block_boundary(400);
+        chunk.append_clean(&[0u8; 50]);
+        chunk.finalize(800);
+        let m = BlockMap::new();
+        append_subchunks_to_block_map(&m, &chunk);
+        // Two subchunks pushed. data_block_count = 2 minus any EOS (none here).
+        assert_eq!(m.data_block_count(), 2);
+        // First subchunk decoded_offset = 0; second's offset = 50.
+        let first = m.get_encoded_offset(0).unwrap();
+        assert_eq!(first.decoded_offset_in_bytes, 0);
+        let second = m.get_encoded_offset(400).unwrap();
+        assert_eq!(second.decoded_offset_in_bytes, 50);
     }
 
     #[test]
