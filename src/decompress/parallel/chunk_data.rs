@@ -338,10 +338,31 @@ impl ChunkData {
     /// Mirror of `chunk.appendDeflateBlockBoundary(encodedOffset, decodedOffset)`
     /// at vendor/.../ChunkData.hpp:455-467 — the C++ signature takes
     /// decoded_offset explicitly.
-    pub fn append_block_boundary_at(&mut self, encoded_offset_bits: usize, decoded_offset: usize) {
+    ///
+    /// Returns `true` if a new boundary was appended, `false` if it was
+    /// a duplicate of the last (matches the C++ bool return). Dedup
+    /// criterion mirrors rapidgzip: the (encodedOffset, decodedOffset)
+    /// pair must differ from the last boundary, NOT just the encoded
+    /// offset — a stored-block plus dynamic-block pair can land at the
+    /// same encoded bit position with different decoded offsets (and
+    /// vice versa for empty dynamic blocks at the same decoded pos), so
+    /// dedupping on encoded-only loses information.
+    pub fn append_block_boundary_at(
+        &mut self,
+        encoded_offset_bits: usize,
+        decoded_offset: usize,
+    ) -> bool {
+        // Rapidgzip's appendDeflateBlockBoundary at ChunkData.hpp:459-461:
+        //   blockBoundaries.empty()
+        //   || back().encodedOffset != encodedOffset
+        //   || back().decodedOffset != decodedOffset
+        // We translate that against the LAST subchunk (gzippy's subchunks
+        // play the role of rapidgzip's blockBoundaries — see B2).
         if let Some(last) = self.subchunks.last() {
-            if last.encoded_offset_bits == encoded_offset_bits {
-                return;
+            if last.encoded_offset_bits == encoded_offset_bits
+                && last.decoded_offset == decoded_offset
+            {
+                return false;
             }
         }
         if let Some(last) = self.subchunks.last_mut() {
@@ -356,6 +377,7 @@ impl ChunkData {
             decoded_size: 0,
             window: None,
         });
+        true
     }
 
     /// Literal port of `ChunkData::split(spacing)`
@@ -600,27 +622,13 @@ impl ChunkData {
     /// of subchunk records, negligible. The win: speculation hit rate
     /// jumps from ~3% to ~100% on Silesia gzip -9 because the consumer
     /// no longer demands exact start matching.
-    pub fn append_block_boundary(&mut self, encoded_offset_bits: usize) {
-        // Don't push duplicate subchunks if the decoder calls us at
-        // the same bit position twice (defensive).
-        if let Some(last) = self.subchunks.last() {
-            if last.encoded_offset_bits == encoded_offset_bits {
-                return;
-            }
-        }
+    pub fn append_block_boundary(&mut self, encoded_offset_bits: usize) -> bool {
+        // Derive decoded_offset from current data size (caller wasn't
+        // forced to supply it). Forward to append_block_boundary_at,
+        // which carries the (encoded, decoded) dedup semantic from
+        // rapidgzip's appendDeflateBlockBoundary (ChunkData.hpp:455-467).
         let current_decoded = self.decoded_size();
-        if let Some(last) = self.subchunks.last_mut() {
-            debug_assert!(encoded_offset_bits >= last.encoded_offset_bits);
-            last.encoded_size_bits = encoded_offset_bits - last.encoded_offset_bits;
-        }
-        self.next_subchunk_start_decoded_offset = current_decoded;
-        self.subchunks.push(Subchunk {
-            encoded_offset_bits,
-            encoded_size_bits: 0,
-            decoded_offset: current_decoded,
-            decoded_size: 0,
-            window: None,
-        });
+        self.append_block_boundary_at(encoded_offset_bits, current_decoded)
     }
 
     /// Finalize at end of decode. Sets `encoded_size_bits` for the
