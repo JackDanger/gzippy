@@ -1625,42 +1625,40 @@ fn decode_chunk_inexact(
         );
     }
 
-    // Path 1 — marker-only candidate (precondition path, not a rescue).
-    // Bootstrap stops at the first clean-tail block boundary it can find;
-    // when that succeeded the dict is available. When it didn't, bootstrap
-    // stopped at end_bit_limit/BFINAL without a clean window, and we
-    // continue the marker decoder to end_bit_limit so the output covers the
-    // entire chunk.
-    let dict = match clean_window {
-        Some(d) => d,
-        None => {
-            return marker_only_candidate(
-                requested_partition,
-                start_bit,
-                bootstrap_markers,
-                bootstrap_end_bit,
-                stop_hint_bits,
-                t_worker,
-                deflate_data,
-            );
-        }
-    };
+    // Dispatch: two decoders, chosen by a single precondition. Not a
+    // fallback chain — both branches are canonical for their input class.
+    //
+    //   isal_capable = clean 32 KiB window from bootstrap
+    //                AND ISA-L is available (x86_64 + feature)
+    //                AND caller did not force slow path
+    //
+    // True  → ISA-L handoff produces the bulk of output at full ISA-L
+    //         throughput. The only correct decoder when ISA-L's dict
+    //         precondition is met.
+    // False → Marker decoder decodes the entire chunk; phase 2 resolves
+    //         markers against the predecessor's window. The only correct
+    //         decoder when ISA-L cannot run (no dict, or no ISA-L).
+    let isal_capable = clean_window.is_some()
+        && cfg!(all(feature = "isal-compression", target_arch = "x86_64"))
+        && !force_slow_path;
+
+    if !isal_capable {
+        let _ = (per_chunk_output_hint, num_chunks_total);
+        return marker_only_candidate(
+            requested_partition,
+            start_bit,
+            bootstrap_markers,
+            bootstrap_end_bit,
+            stop_hint_bits,
+            t_worker,
+            deflate_data,
+        );
+    }
+    // SAFETY: `isal_capable` true ⇒ `clean_window.is_some()` ⇒ unwrap safe.
+    let dict = clean_window.unwrap();
 
     #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
     {
-        if force_slow_path {
-            let _ = (per_chunk_output_hint, num_chunks_total);
-            return marker_only_candidate(
-                requested_partition,
-                start_bit,
-                bootstrap_markers,
-                bootstrap_end_bit,
-                stop_hint_bits,
-                t_worker,
-                deflate_data,
-            );
-        }
-
         let end_byte = match stop {
             ChunkDecodeStop::Approximate(limit) => ((limit
                 .bits()
