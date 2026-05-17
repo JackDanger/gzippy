@@ -444,6 +444,16 @@ pub fn finish_decode_chunk_with_inexact_offset(
 
         let ret = unsafe { isal_raw::isal_inflate(&mut state) };
         let written = remaining - state.avail_out as usize;
+        // Append bytes BEFORE handling any stopping point. append_block_boundary
+        // closes the current subchunk and opens a new one; the bytes ISA-L
+        // just produced belong to the OLD subchunk (the one that just ended
+        // at bit_pos). If we deferred the append until after the loop, every
+        // intermediate subchunk would record decoded_size=0 and the final
+        // subchunk would absorb the entire chunk — which corrupts the
+        // BlockMap with zero-width decoded ranges.
+        if written > 0 {
+            chunk.append_clean(&output[out_pos..out_pos + written]);
+        }
         out_pos += written;
         iter += 1;
 
@@ -511,9 +521,8 @@ pub fn finish_decode_chunk_with_inexact_offset(
     // block ending at last_eob_pos, so chunk.data is correct as-is.
     let final_bit_pos = chunk_end_override.unwrap_or(isal_pos);
 
-    if out_pos > 0 {
-        chunk.append_clean(&output[..out_pos]);
-    }
+    // Bytes have already been appended per loop iteration above so each
+    // subchunk records its own slice's decoded_size. No trailing dump.
 
     if debug_isal {
         eprintln!(
