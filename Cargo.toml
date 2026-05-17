@@ -73,6 +73,15 @@ memchr = "2.7"
 core_affinity = "0.8"
 libc = "0.2"
 
+# Lock-free MPMC channel for the parallel single-member worker pool.
+# std::sync::mpsc requires wrapping the Receiver in a Mutex for multi-
+# consumer use, and `recv()` blocks while the lock is held — so only one
+# worker can be waiting on jobs at a time, stalling the rest of the
+# pool. crossbeam_channel::unbounded is lock-free MPMC, mirroring the
+# rapidgzip ThreadPool model (vendor/.../core/ThreadPool.hpp) where each
+# worker pulls from a shared queue without serializing on a mutex.
+crossbeam-channel = "0.5"
+
 [build-dependencies]
 cc = "1"
 
