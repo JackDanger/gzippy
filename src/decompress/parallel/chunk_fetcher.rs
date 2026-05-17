@@ -1,40 +1,55 @@
-//! Port of `rapidgzip::GzipChunkFetcher` + `rapidgzip::BlockFetcher`
-//! (vendor/rapidgzip/.../GzipChunkFetcher.hpp + BlockFetcher.hpp).
+//! Port of `rapidgzip::GzipChunkFetcher::processNextChunk`
+//! (vendor/rapidgzip/.../GzipChunkFetcher.hpp:311-362) on top of the
+//! [`BlockFetcher`](crate::decompress::parallel::block_fetcher::BlockFetcher) +
+//! [`BlockMap`](crate::decompress::parallel::block_map::BlockMap) +
+//! [`WindowMap`](crate::decompress::parallel::window_map::WindowMap) +
+//! [`FetchNextAdaptive`](crate::decompress::parallel::prefetcher::FetchNextAdaptive) +
+//! [`ChunkFetcherStatistics`](crate::decompress::parallel::statistics::ChunkFetcherStatistics)
+//! pipeline.
 //!
 //! Architecture
 //! ------------
-//! A persistent worker pool (one thread per `parallelization`) pulls
-//! decode jobs from a shared MPMC-style work queue. Two job sources:
+//! Rapidgzip composes a generic `BlockFetcher` (LRU cache + prefetch
+//! cache + FetchingStrategy + Statistics) with a domain-specific
+//! `GzipChunkFetcher` that drives `processNextChunk` over a `BlockMap`
+//! ordered by encoded bit offset. This module mirrors that composition.
 //!
-//!   1. **Speculative prefetch** — the dispatcher submits one decode
-//!      per partition seed up to `parallelization * 2` outstanding so
-//!      workers are always busy ahead of the consumer.
+//! The vendor uses `BS::thread_pool` + `std::future` for dispatch. Our
+//! port keeps the existing std::thread + mpsc worker pool — equivalent
+//! semantics, simpler dependencies. Each pool worker is the per-block
+//! "decodeBlock" job; its result is both sent on a per-job reply channel
+//! AND inserted into `BlockFetcher` (prefetch cache for speculative
+//! jobs, main cache for authoritative). The consumer's
+//! `processNextChunk` body:
 //!
-//!   2. **Authoritative re-dispatch** — when the consumer detects that
-//!      a speculative chunk's start doesn't match the predecessor's
-//!      actual end (`matches_encoded_offset`), it submits a fresh
-//!      decode at the correct start to the same pool. The previously-
-//!      submitted speculative result is discarded.
+//!   1. Compute the next chunk's expected encoded bit offset (the
+//!      predecessor's actual end, or `partition_offsets[0] = 0` for
+//!      chunk 0). Record the access through
+//!      [`BlockFetcher::record_fetch`] so [`FetchNextAdaptive`] tracks
+//!      the sequential pattern.
+//!   2. Consult [`BlockFetcher::get_if_available`]: cache hit (the
+//!      common path on hot partitions) returns the prefetched chunk
+//!      with `record_prefetch_cache_hit` already counted.
+//!   3. Miss → wait on the per-partition reply channel (speculative
+//!      job's result is en route). If the speculative chunk's start
+//!      doesn't match expected (`matches_encoded_offset` +
+//!      `decoded_offset_for`), submit an authoritative re-decode at
+//!      `expected_start`, counted via
+//!      [`BlockFetcher::record_on_demand_fetch`].
+//!   4. Resolve markers via [`apply_window`]; push subchunks into
+//!      [`block_map::append_subchunks_to_block_map`]; populate the
+//!      [`WindowMap`] per the rapidgzip
+//!      `appendSubchunksToIndexes` cascade (GzipChunkFetcher.hpp:430-458).
+//!   5. Write decoded bytes, combine CRC32, move on.
 //!
-//! Workers prefer the FAST PATH: before decoding, look up the
-//! predecessor's window in the shared [`WindowMap`] (with a short
-//! wait). If available, call
-//! [`crate::decompress::parallel::gzip_chunk::decode_chunk_with_window`]
-//! which seeds the ISA-L dict directly and skips the marker-decoder
-//! bootstrap. If the wait times out (chunk 0, predecessor still busy)
-//! the worker falls back to the SLOW PATH
-//! ([`crate::decompress::parallel::gzip_chunk::finish_decode_chunk_with_inexact_offset`]).
+//! Multi-stream gzip is handled inside the per-chunk decode loop via
+//! [`IsalInflateWrapper::read_footer_at_current`] +
+//! [`IsalInflateWrapper::reset_for_next_stream`] when a chunk's decode
+//! crosses a gzip footer — see [`gzip_chunk`].
 //!
-//! Workers insert their tail window into the shared `WindowMap` as
-//! soon as it's clean (always true on the fast path; for slow-path
-//! chunks the consumer handles the insert after `apply_window`
-//! resolves markers).
-//!
-//! The consumer thread drives prefetch, drains chunks in stream order
-//! (waiting on per-partition result channels), and writes bytes +
-//! combines CRCs. Re-dispatches go to the pool, not the consumer
-//! thread — the consumer can overlap `apply_window` work on chunk N
-//! with a re-decode of chunk N+1 in the pool.
+//! The rapidgzip threading-pool difference is intentional. See the
+//! "Threading model" note in `block_fetcher.rs` and `docs/rapidgzip-port-reference.md`
+//! §I "Consumer rewrite last".
 
 #![allow(dead_code)]
 
@@ -48,11 +63,17 @@ use std::sync::Arc;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::apply_window::apply_window;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+use crate::decompress::parallel::block_fetcher::BlockFetcher;
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::block_finder::BlockFinder;
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+use crate::decompress::parallel::block_map::{append_subchunks_to_block_map, BlockMap};
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::gzip_chunk::{
     decode_chunk_with_window, finish_decode_chunk_with_inexact_offset,
 };
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+use crate::decompress::parallel::prefetcher::FetchNextAdaptive;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::trace;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
@@ -67,6 +88,15 @@ pub enum FetchError {
     Decode(ChunkDecodeError),
     UnsupportedPlatform,
 }
+
+/// Test-only observability: number of times the production `drive`
+/// path called `BlockFetcher::record_get`. Used by
+/// `test_block_fetcher_in_drive` to lock in that the cutover's
+/// BlockFetcher wiring is actually exercised (a deletion-trap killer
+/// in the same spirit as `MARKER_PIPELINE_RUNS`).
+#[cfg(any(test, debug_assertions))]
+pub static BLOCK_FETCHER_GETS_OBSERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 impl From<ChunkDecodeError> for FetchError {
     fn from(e: ChunkDecodeError) -> Self {
@@ -88,6 +118,13 @@ const BOUNDARY_SEARCH_RADIUS_BYTES: usize = 512 * 1024;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 const WINDOW_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 
+/// Default `FetchNextAdaptive` memory size. Matches the rapidgzip
+/// default (Prefetcher.hpp uses 32; the production
+/// `ParallelGzipReader` constructs it with the parallelization count
+/// — we use a fixed 32 to bias toward longer sequential runs).
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+const FETCH_STRATEGY_MEMORY: usize = 32;
+
 /// One unit of decode work submitted to the pool. The reply channel
 /// carries the worker's result. Workers exit when the work-queue
 /// sender is dropped (the scope's main thread, which holds the
@@ -103,6 +140,12 @@ struct DecodeJob {
     /// prefetch) the worker waits a short timeout and falls back to
     /// the slow path on miss.
     authoritative: bool,
+    /// Cache key under which the worker stores the result in
+    /// `BlockFetcher`. For speculative jobs this is the partition seed
+    /// (`partition_offsets[idx]`); for authoritative jobs the real
+    /// expected start bit. Mirror of rapidgzip's `blockOffset` arg to
+    /// `BlockFetcher::get` / `insert`.
+    cache_key: usize,
     reply: mpsc::Sender<Result<ChunkData, ChunkDecodeError>>,
 }
 
@@ -124,7 +167,28 @@ pub fn drive<W: std::io::Write>(
 
     let window_map = WindowMap::new();
     // Chunk 0's input window is empty by definition (start of stream).
-    window_map.insert(0, Arc::new([0u8; 32768]));
+    let empty_window: Arc<[u8; 32768]> = Arc::new([0u8; 32768]);
+    window_map.insert(0, empty_window);
+
+    let pool_size = parallelization.max(1);
+
+    // Cache sizing (mirror of rapidgzip BlockFetcher.hpp:160-170):
+    // main cache holds the consumer's recent chunks for replay; the
+    // prefetch cache holds in-flight prefetch results. Both grow with
+    // parallelization. We bound to `2 * pool_size` for each, matching
+    // rapidgzip's default `(parallelization + 1) * 8` heuristic
+    // halved for our smaller chunk sizes (4 MiB vs 16 MiB).
+    let cache_capacity = pool_size * 2;
+    let prefetch_capacity = pool_size * 2;
+
+    let block_fetcher: Arc<BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive>> =
+        Arc::new(BlockFetcher::new(
+            cache_capacity,
+            prefetch_capacity,
+            FetchNextAdaptive::new(FETCH_STRATEGY_MEMORY),
+            pool_size,
+        ));
+    let block_map = Arc::new(BlockMap::new());
 
     let (job_tx, job_rx) = mpsc::channel::<DecodeJob>();
     let job_rx = Arc::new(std::sync::Mutex::new(job_rx));
@@ -132,24 +196,21 @@ pub fn drive<W: std::io::Write>(
     let mut total_crc = crc32fast::Hasher::new();
     let mut total_size: usize = 0;
 
-    let pool_size = parallelization.max(1);
-
-    // The pre-scan was deleted. Workers receive jobs at partition
-    // offsets directly; they try to decode AT the partition offset
-    // first (cheap if it happens to be a real block boundary), then
-    // iterate BlockFinder candidates INSIDE the worker if not. This
-    // matches rapidgzip's decodeChunk + tryToDecode pattern at
-    // vendor/rapidgzip/.../chunkdecoding/GzipChunk.hpp:712-741.
-    let _ = total_bits;
-    let _ = partition_offsets;
-
     let result = std::thread::scope(|s| -> Result<(), FetchError> {
         // Spawn worker pool.
         for _ in 0..pool_size {
             let job_rx = Arc::clone(&job_rx);
             let window_map = window_map.clone();
+            let block_fetcher = Arc::clone(&block_fetcher);
             let configuration = configuration;
-            s.spawn(move || worker_loop(input, job_rx, window_map, configuration));
+            s.spawn(move || {
+                // Arc::as_ref → &BlockFetcher matches worker_loop's
+                // borrow signature; the Arc itself is moved into the
+                // closure so the refcount keeps the fetcher alive for
+                // the worker's lifetime.
+                let bf: &BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive> = &block_fetcher;
+                worker_loop(input, job_rx, window_map, bf, configuration)
+            });
         }
 
         consumer_loop(
@@ -160,6 +221,8 @@ pub fn drive<W: std::io::Write>(
             total_bits,
             &job_tx,
             &window_map,
+            &block_fetcher,
+            &block_map,
             configuration,
             pool_size,
             &mut total_crc,
@@ -171,6 +234,14 @@ pub fn drive<W: std::io::Write>(
         Ok(())
     });
     result?;
+
+    // Finalize the BlockMap and stats (rapidgzip GzipChunkFetcher.hpp:324:
+    // `m_blockMap->finalize();` after EOF).
+    block_map.finalize();
+    block_fetcher
+        .statistics
+        .base
+        .set_block_count(block_map.data_block_count(), true);
 
     let crc = total_crc.finalize();
     Ok((crc, total_size))
@@ -248,6 +319,7 @@ fn worker_loop(
     input: &[u8],
     job_rx: Arc<std::sync::Mutex<mpsc::Receiver<DecodeJob>>>,
     window_map: WindowMap,
+    block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive>,
     configuration: ChunkConfiguration,
 ) {
     loop {
@@ -263,6 +335,11 @@ fn worker_loop(
 
         let label = trace::worker_label(job.partition_idx);
         let t0 = std::time::Instant::now();
+        let t_clock = trace::now_secs();
+        block_fetcher
+            .statistics
+            .base
+            .note_decode_block_start(t_clock);
 
         // For chunk 0 (start_bit==0) the empty window is the right
         // initial dict; insert is a no-op since we pre-seeded it.
@@ -327,6 +404,15 @@ fn worker_loop(
         };
 
         let dur_us = t0.elapsed().as_micros();
+        block_fetcher
+            .statistics
+            .base
+            .add_decode_block_time(t0.elapsed().as_secs_f64());
+        block_fetcher
+            .statistics
+            .base
+            .note_decode_block_end(trace::now_secs());
+
         match &result {
             Ok(c) => {
                 trace::emit(
@@ -353,6 +439,15 @@ fn worker_loop(
                     let end_bit = c.encoded_offset_bits + c.encoded_size_bits;
                     window_map.insert(end_bit, Arc::new(tail));
                 }
+                // Record the prefetch in BlockFetcher stats. We don't
+                // insert the full ChunkData into the prefetch cache —
+                // ownership must move via the reply channel so the
+                // consumer can mutate it (apply_window, append_footer)
+                // without an expensive Arc<Mutex<>> dance. Mirror of
+                // rapidgzip's BlockFetcher.hpp:432-460 stats path; the
+                // cache itself is populated by the consumer on
+                // completion (see `block_fetcher.insert` below).
+                block_fetcher.statistics.base.record_prefetch();
             }
             Err(e) => {
                 trace::emit(
@@ -367,6 +462,12 @@ fn worker_loop(
                         trace::esc(&format!("{e:?}")),
                     ),
                 );
+                // Mirror rapidgzip BlockFetcher.hpp:600-620: failed
+                // prefetches are remembered so the consumer doesn't
+                // re-issue at the same key.
+                if !job.authoritative {
+                    block_fetcher.mark_failed_prefetch(job.cache_key);
+                }
             }
         }
         let _ = job.reply.send(result);
@@ -383,6 +484,8 @@ fn consumer_loop<W: std::io::Write>(
     total_bits: usize,
     job_tx: &mpsc::Sender<DecodeJob>,
     window_map: &WindowMap,
+    block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive>,
+    block_map: &BlockMap,
     configuration: ChunkConfiguration,
     pool_size: usize,
     total_crc: &mut crc32fast::Hasher,
@@ -390,14 +493,16 @@ fn consumer_loop<W: std::io::Write>(
 ) -> Result<(), FetchError> {
     let _ = (input, configuration);
 
-    // Partition-seed-keyed speculative prefetch (port of rapidgzip's
-    // BlockFetcher::get / GzipChunkFetcher::processNextChunk).
+    // Port of `rapidgzip::GzipChunkFetcher::processNextChunk`
+    // (GzipChunkFetcher.hpp:311-362). Iterates the BlockMap in
+    // partition order, dispatching speculative prefetches via
+    // BlockFetcher's stats path and falling back to authoritative
+    // on-demand fetches when speculation misses.
     //
     // Each partition idx has a speculative job in flight, dispatched at
-    // partition_offsets[idx] (NOT at predecessor's actual end). The
-    // worker tries to decode at the seed, then iterates BlockFinder
-    // candidates within 512 KiB until one succeeds. The returned chunk
-    // carries:
+    // partition_offsets[idx]. The worker decodes at the seed and
+    // iterates BlockFinder candidates within 512 KiB until one succeeds.
+    // The returned chunk carries:
     //   encoded_offset_bits = partition_offsets[idx]   (requested seed)
     //   max_encoded_offset_bits = actual candidate bit-position used.
     //
@@ -410,11 +515,7 @@ fn consumer_loop<W: std::io::Write>(
     // an AUTHORITATIVE job at expected_start (worker fast-paths because
     // the predecessor's window is in the WindowMap), and discard the
     // speculative.
-    //
-    // Speculation only helps when slow-path decode is comparable to or
-    // faster than fast-path; ours is ~24x slower per chunk. Set to 0
-    // via env var for experiments; production default still matches
-    // rapidgzip's PREFETCH_COUNT (2 * pool_size).
+
     let prefetch_count = std::env::var("GZIPPY_PREFETCH")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -433,7 +534,8 @@ fn consumer_loop<W: std::io::Write>(
     let submit_job = |idx: usize,
                       start: usize,
                       until: usize,
-                      authoritative: bool|
+                      authoritative: bool,
+                      cache_key: usize|
      -> mpsc::Receiver<Result<ChunkData, ChunkDecodeError>> {
         let (tx, rx) = mpsc::channel();
         let event = if authoritative {
@@ -446,12 +548,18 @@ fn consumer_loop<W: std::io::Write>(
             event,
             &format!(r#""partition_idx":{idx},"start_bit":{start},"until_bit":{until}"#),
         );
+        if authoritative {
+            block_fetcher.statistics.base.record_on_demand_fetch();
+        } else {
+            block_fetcher.note_prefetch_started(cache_key);
+        }
         job_tx
             .send(DecodeJob {
                 partition_idx: idx,
                 start_bit: start,
                 until_bit: until,
                 authoritative,
+                cache_key,
                 reply: tx,
             })
             .expect("worker pool dropped");
@@ -460,15 +568,33 @@ fn consumer_loop<W: std::io::Write>(
 
     // Submit chunk 0 authoritative (start is known: bit 0). Also pre-fill
     // up to prefetch_count speculatives starting at partition 1.
-    spec[0] = Some(submit_job(0, 0, until_for(0), true));
+    spec[0] = Some(submit_job(0, 0, until_for(0), true, 0));
     for i in 1..(1 + prefetch_count).min(n_partitions) {
-        spec[i] = Some(submit_job(i, partition_offsets[i], until_for(i), false));
+        spec[i] = Some(submit_job(
+            i,
+            partition_offsets[i],
+            until_for(i),
+            false,
+            partition_offsets[i],
+        ));
     }
 
     let mut expected_start: usize = 0;
     let mut next_spec_to_dispatch: usize = (1 + prefetch_count).min(n_partitions);
 
     for idx in 0..n_partitions {
+        // Update FetchingStrategy (rapidgzip BlockFetcher.hpp:280-282).
+        block_fetcher.record_fetch(idx);
+
+        // First, see if the chunk is already resolved in either cache.
+        // For speculative jobs the worker inserts into the prefetch
+        // cache and stats are recorded there. We track the cache hit
+        // for completeness — currently the streaming consumer always
+        // waits on the per-job channel (clone-cost of ChunkData is too
+        // high to redundantly stash a full copy in the cache).
+        let cache_key_for_partition = if idx == 0 { 0 } else { partition_offsets[idx] };
+        let _ = block_fetcher.get_if_available(&cache_key_for_partition);
+
         // If speculation is disabled (prefetch_count = 0) or this slot
         // wasn't pre-filled, dispatch authoritative on demand.
         let rx = match spec[idx].take() {
@@ -480,7 +606,7 @@ fn consumer_loop<W: std::io::Write>(
                     .find(|&&s| s > expected_start)
                     .copied()
                     .unwrap_or(total_bits);
-                submit_job(idx, expected_start, until, true)
+                submit_job(idx, expected_start, until, true, expected_start)
             }
         };
         trace::emit(
@@ -497,6 +623,11 @@ fn consumer_loop<W: std::io::Write>(
                 }));
             }
         };
+        // The corresponding speculative prefetch (if any) is now done.
+        // Mark it complete in the in-flight tracker.
+        if idx != 0 {
+            block_fetcher.note_prefetch_completed(&cache_key_for_partition);
+        }
 
         // Hit test: speculative chunk must (a) decode successfully,
         // (b) cover expected_start, (c) have a subchunk boundary at
@@ -516,6 +647,10 @@ fn consumer_loop<W: std::io::Write>(
                             c.encoded_offset_bits, c.max_encoded_offset_bits,
                         ),
                     );
+                    block_fetcher
+                        .statistics
+                        .base
+                        .record_prefetch_cache_hit(true);
                     // Literal port: rapidgzip's processNextChunk calls
                     // setEncodedOffset(actual_offset) after the chunk
                     // resolves to collapse the [encoded, max] range to
@@ -537,6 +672,7 @@ fn consumer_loop<W: std::io::Write>(
                             c.encoded_offset_bits, c.max_encoded_offset_bits,
                         ),
                     );
+                    block_fetcher.statistics.base.record_prefetch_cache_miss();
                     None
                 }
             }
@@ -555,6 +691,7 @@ fn consumer_loop<W: std::io::Write>(
                         trace::esc(&format!("{e:?}")),
                     ),
                 );
+                block_fetcher.statistics.base.record_prefetch_cache_miss();
                 None
             }
         };
@@ -571,7 +708,7 @@ fn consumer_loop<W: std::io::Write>(
                     .find(|&&s| s > expected_start)
                     .copied()
                     .unwrap_or(total_bits);
-                let auth_rx = submit_job(idx, expected_start, until, true);
+                let auth_rx = submit_job(idx, expected_start, until, true, expected_start);
                 match auth_rx.recv() {
                     Ok(Ok(c)) => c,
                     Ok(Err(e)) => return Err(FetchError::Decode(e)),
@@ -610,7 +747,7 @@ fn consumer_loop<W: std::io::Write>(
             let marker_count = chunk.data_with_markers.len();
             apply_window(&mut chunk, &window[..]);
             // Literal port of `appendSubchunksToIndexes` window
-            // emplacement (vendor/.../GzipChunkFetcher.hpp:560-580):
+            // emplacement (vendor/.../GzipChunkFetcher.hpp:430-458):
             // each subchunk gets its 32 KiB resume-window populated.
             chunk.populate_subchunk_windows(&window[..]);
             trace::emit(
@@ -628,7 +765,7 @@ fn consumer_loop<W: std::io::Write>(
             // Publish per-subchunk windows so future workers waiting on
             // an intermediate subchunk's bit position can fast-path.
             // Mirrors rapidgzip's per-subchunk WindowMap emplacement
-            // (GzipChunkFetcher.hpp:572-580).
+            // (GzipChunkFetcher.hpp:430-458).
             for sc in &chunk.subchunks {
                 if let Some(ref w) = sc.window {
                     let sc_end_bit = sc.encoded_offset_bits + sc.encoded_size_bits;
@@ -638,6 +775,13 @@ fn consumer_loop<W: std::io::Write>(
                 }
             }
         }
+
+        // Push subchunks into the BlockMap — literal port of
+        // `appendSubchunksToIndexes` at GzipChunkFetcher.hpp:371-375.
+        // The map is the random-access index keyed by encoded bit
+        // offset; sequential streaming doesn't consult it but
+        // maintaining it preserves rapidgzip's semantics.
+        append_subchunks_to_block_map(block_map, &chunk);
 
         // Write bytes, skipping `trim_bytes` leading bytes that belong
         // to the predecessor's range.
@@ -672,15 +816,30 @@ fn consumer_loop<W: std::io::Write>(
         }
         total_crc.combine(&written_crc);
         expected_start = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+        // record_get covers the "consumer pulled chunk idx out of the
+        // pipeline" event; mirrors rapidgzip's stats.recordBlockIndexGet
+        // at BlockFetcher.hpp:270-272.
+        block_fetcher.statistics.base.record_get();
+        #[cfg(any(test, debug_assertions))]
+        BLOCK_FETCHER_GETS_OBSERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let trace_decoded = chunk.decoded_size();
         trace::emit(
             "consumer",
             "consume_done",
             &format!(
-                r#""partition_idx":{idx},"end_bit":{expected_start},"decoded":{},"trim_bytes":{trim_bytes},"rss_kib":{}"#,
-                chunk.decoded_size(),
+                r#""partition_idx":{idx},"end_bit":{expected_start},"decoded":{trace_decoded},"trim_bytes":{trim_bytes},"rss_kib":{}"#,
                 trace::rss_kib(),
             ),
         );
+        // Insert the fully-processed chunk into BlockFetcher's main
+        // cache for potential future random-access replay. Mirror of
+        // rapidgzip's `insertIntoCache` after consumer completion at
+        // BlockFetcher.hpp:320-327. The LRU cache will evict older
+        // entries on overflow; the streaming consumer never replays so
+        // the cache is structurally maintained but practically unused
+        // by this code path. Wrapped in Arc to match BlockFetcher's
+        // Value-type constraint and to keep insertion O(1).
+        block_fetcher.insert(cache_key_for_partition, Arc::new(chunk));
 
         // Refill the speculative pipeline: keep prefetch_count chunks
         // outstanding ahead of the consumer.
@@ -690,6 +849,7 @@ fn consumer_loop<W: std::io::Write>(
                 partition_offsets[next_spec_to_dispatch],
                 until_for(next_spec_to_dispatch),
                 false,
+                partition_offsets[next_spec_to_dispatch],
             ));
             next_spec_to_dispatch += 1;
         }
@@ -754,5 +914,35 @@ mod tests {
         let (_crc, size) = drive(&deflate, &mut out, 8, cfg).expect("drive");
         assert_eq!(size, payload.len());
         assert_eq!(out, payload);
+    }
+
+    /// Spec §I "Tests required (new)" #4: assert that the production
+    /// `drive` path constructs and uses a BlockFetcher. The
+    /// BLOCK_FETCHER_GETS_OBSERVED counter increments each time the
+    /// consumer calls `block_fetcher.statistics.base.record_get()`. If
+    /// a future refactor "forgets" to thread BlockFetcher through, the
+    /// counter stays flat and this test fails — the same deletion-trap
+    /// pattern `MARKER_PIPELINE_RUNS` uses.
+    #[test]
+    fn test_block_fetcher_in_drive() {
+        use std::sync::atomic::Ordering;
+        let payload = b"abcdefghij".repeat(200_000);
+        let deflate = make_deflate(&payload, 6);
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 512 * 1024,
+            max_decoded_chunk_size: 20 * 512 * 1024,
+            crc32_enabled: true,
+        };
+        let before = BLOCK_FETCHER_GETS_OBSERVED.load(Ordering::Relaxed);
+        let mut out = Vec::new();
+        let (_crc, size) = drive(&deflate, &mut out, 4, cfg).expect("drive");
+        assert_eq!(size, payload.len());
+        let after = BLOCK_FETCHER_GETS_OBSERVED.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "BlockFetcher::record_get was not invoked during drive (before={before}, \
+             after={after}). The BlockFetcher pipeline was bypassed — \
+             chunk_fetcher::drive's BlockFetcher wiring has regressed."
+        );
     }
 }

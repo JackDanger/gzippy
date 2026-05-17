@@ -141,3 +141,16 @@ pub fn esc(s: &str) -> String {
 pub fn boundary_label(idx: usize) -> String {
     format!("boundary-{idx}")
 }
+
+/// Monotonic seconds since the trace epoch (process start when trace
+/// was first initialized; falls back to a per-call `Instant::now()` if
+/// tracing is disabled — value is still useful for relative
+/// difference within the same call site).
+///
+/// Used by `ChunkFetcherStatistics::note_decode_block_start` /
+/// `note_decode_block_end` to compute pool efficiency.
+pub fn now_secs() -> f64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    epoch.elapsed().as_secs_f64()
+}

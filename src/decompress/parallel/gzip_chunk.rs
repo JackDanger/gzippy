@@ -96,10 +96,20 @@ pub fn decode_chunk_with_window(
     let t_decode = std::time::Instant::now();
     let mut wrapper = IsalInflateWrapper::new(input, encoded_offset_bits)?;
     wrapper.set_window(&initial_window[..])?;
+    // END_OF_STREAM fires when the deflate stream's BFINAL block has
+    // been fully decoded and the bit reader has byte-aligned to the
+    // footer. We listen for it so multi-stream gzip is handled inline:
+    // after the footer is consumed (via read_footer_at_current) and the
+    // next gzip header parsed (via gzip_format::read_header), the
+    // wrapper is reset for the next stream and decoding continues.
+    // Mirror of rapidgzip's multi-stream loop in
+    // `decodeChunkWithRapidgzip` (chunkdecoding/GzipChunk.hpp:468-654)
+    // restricted to chunks driven by the fast path.
     wrapper.set_stopping_points(
         StoppingPoints::END_OF_BLOCK
             | StoppingPoints::END_OF_BLOCK_HEADER
-            | StoppingPoints::END_OF_STREAM_HEADER,
+            | StoppingPoints::END_OF_STREAM_HEADER
+            | StoppingPoints::END_OF_STREAM,
     );
 
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
@@ -127,9 +137,59 @@ pub fn decode_chunk_with_window(
         }
         last_end_bit = r.bit_position;
         if r.finished {
+            // If `finished` fired without an END_OF_STREAM stop event,
+            // this is the BFINAL block of the only (or final) stream
+            // in this chunk's range — exit normally.
             break;
         }
         match r.stopped_at {
+            sp if sp == StoppingPoints::END_OF_STREAM => {
+                // The deflate body of this gzip stream is done. Read
+                // the 8-byte gzip footer at the current cursor (mirror
+                // of rapidgzip's IsalInflateWrapper::readFooter call in
+                // its multi-stream loop). Record into ChunkData via
+                // append_footer; that opens a fresh CRC hasher for any
+                // subsequent stream's bytes (ChunkData.hpp:472-489).
+                let (crc32, isize_field) = wrapper.read_footer_at_current()?;
+                let footer_end_bits = wrapper.tell_compressed();
+                chunk.append_footer(crc32, isize_field, footer_end_bits);
+
+                // If more bytes remain, parse the next gzip header and
+                // reset the wrapper for the next stream. If no more
+                // bytes (this was the last stream in our range),
+                // we're done.
+                let remaining = wrapper.remaining_input();
+                if remaining.is_empty() {
+                    last_end_bit = footer_end_bits;
+                    stopping_point_reached = true;
+                    break;
+                }
+                let (_hdr, hdr_size) = crate::decompress::parallel::gzip_format::read_header(
+                    remaining,
+                )
+                .map_err(|e| {
+                    ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("multi-stream gzip header at bit {footer_end_bits}: {e}"),
+                    ))
+                })?;
+                wrapper.advance_input(hdr_size);
+                wrapper.reset_for_next_stream();
+                // Re-arm the stopping points (reset cleared them) and
+                // re-seed the dict — the next stream is independent so
+                // an empty window is the correct seed.
+                wrapper.set_stopping_points(
+                    StoppingPoints::END_OF_BLOCK
+                        | StoppingPoints::END_OF_BLOCK_HEADER
+                        | StoppingPoints::END_OF_STREAM_HEADER
+                        | StoppingPoints::END_OF_STREAM,
+                );
+                wrapper.set_window(&[])?;
+                last_end_bit = wrapper.tell_compressed();
+                last_eob_pos = last_end_bit;
+                // Record the stream-boundary as a subchunk break point.
+                chunk.append_block_boundary(last_end_bit);
+            }
             sp if sp == StoppingPoints::END_OF_STREAM_HEADER => {
                 chunk.append_block_boundary(r.bit_position);
             }

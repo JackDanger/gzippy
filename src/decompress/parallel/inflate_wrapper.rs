@@ -283,6 +283,43 @@ impl<'a> IsalInflateWrapper<'a> {
         self.state.stopped_at = 0;
     }
 
+    /// Bytes remaining in the input from the decoder's current
+    /// cursor position. Used by the multi-stream loop in
+    /// `gzip_chunk` to parse the next gzip header via
+    /// `gzip_format::read_header`. Length is `avail_in` (bytes still
+    /// staged for ISA-L); the bit-buffer's leftover bits are
+    /// discarded — at END_OF_STREAM ISA-L aligns to a byte
+    /// boundary, so `read_in_length` is 0 at that point.
+    pub fn remaining_input(&self) -> &'a [u8] {
+        if self.state.avail_in == 0 {
+            return &[];
+        }
+        let len = self.state.avail_in as usize;
+        // Safety: `next_in` was constructed from `self.input`'s pointer
+        // and advanced by ISA-L only by amounts it reported via
+        // `avail_in`. The lifetime is the same as `self.input` (and
+        // hence `'a`). `len` is exactly `avail_in`.
+        unsafe { std::slice::from_raw_parts(self.state.next_in, len) }
+    }
+
+    /// Advance the decoder's input cursor by `n` bytes. Used by the
+    /// multi-stream Footer loop after `gzip_format::read_header` parses
+    /// the next gzip header from `remaining_input()` — the wrapper's
+    /// own cursor must then skip past the parsed header bytes so a
+    /// subsequent `read_stream` resumes at the new deflate body.
+    /// No-op if `n` exceeds the remaining input (mirrors ISA-L's
+    /// behavior: avail_in saturates at 0).
+    pub fn advance_input(&mut self, n: usize) {
+        let n = n.min(self.state.avail_in as usize);
+        if n == 0 {
+            return;
+        }
+        unsafe {
+            self.state.next_in = self.state.next_in.add(n);
+        }
+        self.state.avail_in -= n as u32;
+    }
+
     /// Returns true iff the current decode has hit a stream end
     /// (END_OF_STREAM) and not yet been advanced. Caller uses this to
     /// decide whether to read footer + next header before resuming.
