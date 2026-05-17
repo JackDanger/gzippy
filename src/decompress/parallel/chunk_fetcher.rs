@@ -410,9 +410,14 @@ fn consumer_loop<W: std::io::Write>(
     // the predecessor's window is in the WindowMap), and discard the
     // speculative.
     //
-    // We keep `prefetch_count = 2 * pool_size` speculatives in flight at
-    // all times (matches rapidgzip's PREFETCH_COUNT default).
-    let prefetch_count = (pool_size * 2).max(1);
+    // Speculation only helps when slow-path decode is comparable to or
+    // faster than fast-path; ours is ~24x slower per chunk. Set to 0
+    // via env var for experiments; production default still matches
+    // rapidgzip's PREFETCH_COUNT (2 * pool_size).
+    let prefetch_count = std::env::var("GZIPPY_PREFETCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(pool_size * 2);
 
     let mut spec: Vec<Option<mpsc::Receiver<Result<ChunkData, ChunkDecodeError>>>> =
         (0..n_partitions).map(|_| None).collect();
@@ -463,7 +468,20 @@ fn consumer_loop<W: std::io::Write>(
     let mut next_spec_to_dispatch: usize = (1 + prefetch_count).min(n_partitions);
 
     for idx in 0..n_partitions {
-        let rx = spec[idx].take().expect("spec slot was filled");
+        // If speculation is disabled (prefetch_count = 0) or this slot
+        // wasn't pre-filled, dispatch authoritative on demand.
+        let rx = match spec[idx].take() {
+            Some(rx) => rx,
+            None => {
+                let until = partition_offsets
+                    .iter()
+                    .skip(idx + 1)
+                    .find(|&&s| s > expected_start)
+                    .copied()
+                    .unwrap_or(total_bits);
+                submit_job(idx, expected_start, until, true)
+            }
+        };
         trace::emit(
             "consumer",
             "speculative_wait",
