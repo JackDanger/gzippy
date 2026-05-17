@@ -25,6 +25,7 @@
 //!   and the post-bootstrap bulk decode.
 
 pub mod affinity_helpers;
+pub mod aligned_allocator;
 pub mod apply_window;
 pub mod atomic_mutex;
 pub mod block_fetcher;
