@@ -190,25 +190,23 @@ fn decode_or_iterate(
     until_bit: usize,
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    // Step 1: try the requested offset directly.
-    if let Ok(mut c) =
-        finish_decode_chunk_with_inexact_offset(input, start_bit, until_bit, &[], configuration)
-    {
-        // Worker decoded successfully at start_bit. Record the requested
-        // position as encoded_offset (so the cache key matches consumer
-        // expectations) and max_encoded_offset = the actual decoded
-        // start (= start_bit, since direct succeeded).
-        c.max_encoded_offset_bits = c.encoded_offset_bits;
-        return Ok(c);
-    }
-    // Step 2: iterate candidates inside the worker. 512 KiB matches
-    // rapidgzip's per-chunk scan budget.
+    // Direct port of rapidgzip's tryToDecode + alternating BlockFinder
+    // search (GzipChunk.hpp:712-846). We DON'T try direct decode at
+    // start_bit blindly — our finish_decode_chunk_with_inexact_offset's
+    // marker bootstrap is too lenient with malformed headers (false
+    // "success" on random bits produces a tiny chunk that misses
+    // expected_start downstream). Instead, run BlockFinder to get
+    // validated candidates (find_blocks does Kraft-precode +
+    // Huffman-code validation matching rapidgzip's
+    // seekToNonFinalDynamicDeflateBlock), iterate them — including a
+    // candidate AT start_bit if find_blocks emits one — and accept the
+    // first that try-decodes cleanly.
     let finder = BlockFinder::new(input);
     let scan_end = (start_bit + 512 * 1024 * 8).min(input.len() * 8);
     let candidates = finder.find_blocks(start_bit, scan_end);
     let mut last_err: Option<ChunkDecodeError> = None;
     for candidate in candidates {
-        if candidate.bit_offset <= start_bit {
+        if candidate.bit_offset < start_bit {
             continue;
         }
         match finish_decode_chunk_with_inexact_offset(
