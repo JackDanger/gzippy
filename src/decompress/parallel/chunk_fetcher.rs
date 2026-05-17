@@ -145,39 +145,51 @@ impl<'a> GzipChunkFetcher<'a> {
                     if partition_start >= total_bits {
                         break;
                     }
-                    // Use the real BlockFinder (block_finder.rs) directly,
-                    // not the v0.6 search_boundary_forward + validate_boundary
-                    // path. Per advisor: validate_boundary(min_blocks=2)
-                    // rejects valid single candidates on gzip -9. Trust
-                    // a single candidate; let ISA-L reject false positives.
-                    let real_start = if idx == 0 {
-                        0
+                    // For chunk 0, start at bit 0 (always a real boundary).
+                    // For others, iterate candidates from BlockFinder and
+                    // trial-decode each. ISA-L's INVALID_BLOCK / INVALID_
+                    // LOOKBACK errors reject false positives. First
+                    // candidate that yields a successful decode wins.
+                    // This is rapidgzip's decodeChunkWithRapidgzip pattern.
+                    let success: Option<ChunkData> = if idx == 0 {
+                        finish_decode_chunk_with_inexact_offset(
+                            input, 0, end, &[], configuration,
+                        )
+                        .ok()
                     } else {
                         let finder =
                             crate::decompress::parallel::block_finder::BlockFinder::new(input);
-                        // Scan a wide window; gzip -9 has sparse boundaries.
-                        let scan_radius = 8 * 1024 * 1024 * 8;
-                        match finder.find_first_candidate(partition_start, scan_radius) {
-                            Some(b) => b,
-                            None => continue, // no candidate; slot stays None
+                        // Scan up to 8 MiB compressed for candidates.
+                        let scan_end_bits = (partition_start + 8 * 1024 * 1024 * 8)
+                            .min(input.len() * 8);
+                        let candidates = finder.find_blocks(partition_start, scan_end_bits);
+                        let mut result: Option<ChunkData> = None;
+                        for c in &candidates {
+                            if c.bit_offset < partition_start {
+                                continue;
+                            }
+                            if let Ok(chunk) = finish_decode_chunk_with_inexact_offset(
+                                input,
+                                c.bit_offset,
+                                end,
+                                &[], // empty window — speculative
+                                configuration,
+                            ) {
+                                result = Some(chunk);
+                                break;
+                            }
                         }
+                        result
                     };
-                    let result = finish_decode_chunk_with_inexact_offset(
-                        input,
-                        real_start,
-                        end,
-                        &[], // empty window — speculative
-                        configuration,
-                    );
-                    match result {
-                        Ok(chunk) => {
+                    match success {
+                        Some(chunk) => {
                             *chunk_slots[idx].lock().unwrap() = Some(chunk);
                         }
-                        Err(e) => {
+                        None => {
                             if std::env::var("GZIPPY_DEBUG").is_ok() {
                                 eprintln!(
-                                    "[parallel_sm:rapidgzip] chunk[{}] worker failed: real_start={} until={} err={:?}",
-                                    idx, real_start, end, e
+                                    "[parallel_sm:rapidgzip] chunk[{}] no candidate decoded: partition_start={} until={}",
+                                    idx, partition_start, end
                                 );
                             }
                         }
