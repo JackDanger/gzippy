@@ -972,33 +972,25 @@ fn decode_dynamic(
 
     // Try ISA-L's fast Huffman decoder for lit/len when available
     // (x86_64 + isal-compression). Mirrors rapidgzip's HuffmanCodingISAL
-    // path; ~24x faster per symbol than our pure-Rust ConsumeFirstTable.
+    // path. Thread-local IsalLitLenCode avoids per-block 19 KB
+    // allocations.
     #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
     {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static ISAL_BUILT: AtomicU64 = AtomicU64::new(0);
-        static ISAL_FALLBACK: AtomicU64 = AtomicU64::new(0);
-        if let Some(litlen_isal) =
-            crate::decompress::parallel::isal_huffman::IsalLitLenCode::from_lengths(&lens[..hlit])
-        {
-            let n = ISAL_BUILT.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 1000 == 0 {
-                eprintln!(
-                    "[isal_huff] built={} fallback={}",
-                    n,
-                    ISAL_FALLBACK.load(Ordering::Relaxed)
-                );
-            }
-            return decode_huffman_block_isal(
-                bits,
-                output,
-                &litlen_isal,
-                &dist_table,
-                max_output,
-                clean_tail,
-            );
-        } else {
-            ISAL_FALLBACK.fetch_add(1, Ordering::Relaxed);
+        let isal_result = crate::decompress::parallel::isal_huffman::with_thread_litlen(
+            &lens[..hlit],
+            |litlen_isal| {
+                decode_huffman_block_isal(
+                    bits,
+                    output,
+                    litlen_isal,
+                    &dist_table,
+                    max_output,
+                    clean_tail,
+                )
+            },
+        );
+        if let Some(r) = isal_result {
+            return r;
         }
     }
 

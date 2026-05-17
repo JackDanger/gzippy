@@ -74,33 +74,59 @@ pub struct DecodedSymbol {
 
 /// Wrapper around ISA-L's `inflate_huff_code_large` table. Built once
 /// per dynamic-Huffman block from the precode-resolved code lengths.
+/// Heap-allocated to keep the 19 KB table off the stack; reused
+/// across blocks via thread-local storage in `with_thread_local`.
 pub struct IsalLitLenCode {
     table: Box<inflate_huff_code_large>,
+    lit_and_dist_huff: Box<[huff_code; LIT_LEN_ELEMS as usize]>,
+    code_list: Box<[u32; (LIT_LEN_ELEMS as usize) + 2]>,
     valid: bool,
 }
 
 impl IsalLitLenCode {
-    /// Build the table from a slice of code lengths (one per lit/len
-    /// symbol). `code_lengths.len()` is typically 257 + HLIT (the number
-    /// of lit/len codes encoded in the dynamic block header).
     pub fn from_lengths(code_lengths: &[u8]) -> Option<Self> {
+        let mut c = Self::new_empty();
+        if c.rebuild_from(code_lengths) {
+            Some(c)
+        } else {
+            None
+        }
+    }
+
+    pub fn new_empty() -> Self {
+        Self {
+            table: Box::new(inflate_huff_code_large {
+                short_code_lookup: [0u32; 4096],
+                long_code_lookup: [0u16; 1264],
+            }),
+            lit_and_dist_huff: Box::new([huff_code::default(); LIT_LEN_ELEMS as usize]),
+            code_list: Box::new([0u32; (LIT_LEN_ELEMS as usize) + 2]),
+            valid: false,
+        }
+    }
+
+    /// Rebuild the table from a slice of code lengths IN-PLACE — reuses
+    /// the table/buffer allocations from this struct. Returns true on
+    /// success; on failure, `is_valid()` returns false.
+    pub fn rebuild_from(&mut self, code_lengths: &[u8]) -> bool {
+        self.valid = false;
         if code_lengths.len() > LIT_LEN as usize {
-            return None;
+            return false;
         }
 
-        let mut lit_and_dist_huff: Vec<huff_code> =
-            vec![huff_code::default(); LIT_LEN_ELEMS as usize];
+        // Reset scratch buffers we mutate.
+        for h in self.lit_and_dist_huff.iter_mut() {
+            h.code_and_length = 0;
+        }
         let mut lit_count: [u16; MAX_LIT_LEN_COUNT] = [0; MAX_LIT_LEN_COUNT];
         let mut lit_expand_count: [u16; MAX_LIT_LEN_COUNT] = [0; MAX_LIT_LEN_COUNT];
 
         for (i, &length) in code_lengths.iter().enumerate() {
             if (length as usize) >= MAX_LIT_LEN_COUNT {
-                return None;
+                return false;
             }
             lit_count[length as usize] += 1;
-            // write_huff_code: code=0, length=length encoded in top byte.
-            // huff_code.code_and_length: low 24 bits = code+extra, top 8 = length.
-            lit_and_dist_huff[i].code_and_length = (length as u32) << 24;
+            self.lit_and_dist_huff[i].code_and_length = (length as u32) << 24;
             if length != 0 && i >= 264 {
                 let extra_count = LEN_EXTRA_BIT_COUNT[i - 257] as usize;
                 lit_expand_count[length as usize] =
@@ -113,44 +139,31 @@ impl IsalLitLenCode {
             }
         }
 
-        // ISA-L's set_and_expand_lit_len_huffcode + make_inflate_huff_code_lit_len.
-        // code_list is sized LIT_LEN_ELEMS + 2 per rapidgzip's port comment.
-        let mut code_list: Vec<u32> = vec![0; (LIT_LEN_ELEMS as usize) + 2];
-
-        // SAFETY: We pass correctly-sized buffers to ISA-L. lit_and_dist_huff
-        // is LIT_LEN_ELEMS = 514 entries; lit_count and lit_expand_count are
-        // MAX_LIT_LEN_COUNT = 23 entries each; code_list is LIT_LEN_ELEMS+2.
-        // table_length passed = LIT_LEN = 286 (matches rapidgzip's call).
         let rc = unsafe {
             set_and_expand_lit_len_huffcode(
-                lit_and_dist_huff.as_mut_ptr(),
+                self.lit_and_dist_huff.as_mut_ptr(),
                 LIT_LEN,
                 lit_count.as_mut_ptr(),
                 lit_expand_count.as_mut_ptr(),
-                code_list.as_mut_ptr(),
+                self.code_list.as_mut_ptr(),
             )
         };
         if rc != 0 {
-            return None;
+            return false;
         }
-
-        let mut table: Box<inflate_huff_code_large> = Box::new(inflate_huff_code_large {
-            short_code_lookup: [0u32; 4096],
-            long_code_lookup: [0u16; 1264],
-        });
 
         unsafe {
             make_inflate_huff_code_lit_len(
-                table.as_mut(),
-                lit_and_dist_huff.as_mut_ptr(),
+                self.table.as_mut(),
+                self.lit_and_dist_huff.as_mut_ptr(),
                 LIT_LEN_ELEMS,
                 lit_count.as_ptr(),
-                code_list.as_mut_ptr(),
-                0, // multisym = 0
+                self.code_list.as_mut_ptr(),
+                0,
             );
         }
-
-        Some(Self { table, valid: true })
+        self.valid = true;
+        true
     }
 
     /// Decode the next symbol from `bits`. Returns the symbol value
@@ -209,6 +222,26 @@ impl IsalLitLenCode {
     pub fn is_valid(&self) -> bool {
         self.valid
     }
+}
+
+thread_local! {
+    static THREAD_LITLEN_TABLE: std::cell::RefCell<IsalLitLenCode> =
+        std::cell::RefCell::new(IsalLitLenCode::new_empty());
+}
+
+/// Run `f` with a thread-local IsalLitLenCode rebuilt from `code_lengths`.
+/// Avoids per-call allocation of the 19 KB table.
+pub fn with_thread_litlen<R>(
+    code_lengths: &[u8],
+    f: impl FnOnce(&IsalLitLenCode) -> R,
+) -> Option<R> {
+    THREAD_LITLEN_TABLE.with(|cell| {
+        let mut t = cell.borrow_mut();
+        if !t.rebuild_from(code_lengths) {
+            return None;
+        }
+        Some(f(&t))
+    })
 }
 
 #[cfg(test)]
