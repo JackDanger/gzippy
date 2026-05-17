@@ -495,6 +495,24 @@ impl<'a> BlockFinder<'a> {
         Self { data }
     }
 
+    /// Find the first plausible block-header candidate at or after
+    /// `from_bit`, scanning up to `scan_radius_bits` ahead. Returns the
+    /// raw bit offset of the candidate (no `validate_boundary` filter;
+    /// caller is expected to trial-decode and trust ISA-L's verdict).
+    /// Mirrors what rapidgzip does in `decodeChunkWithRapidgzip` — it
+    /// trusts a single candidate and lets the deflate decoder reject
+    /// false positives via its own error path.
+    pub fn find_first_candidate(&self, from_bit: usize, scan_radius_bits: usize) -> Option<usize> {
+        let end_bit = from_bit
+            .saturating_add(scan_radius_bits)
+            .min(self.data.len() * 8);
+        let candidates = self.find_blocks(from_bit, end_bit);
+        candidates
+            .into_iter()
+            .find(|b| b.bit_offset >= from_bit)
+            .map(|b| b.bit_offset)
+    }
+
     /// Find all valid deflate block starts in a range.
     ///
     /// Searches for all block types (stored, fixed, dynamic).

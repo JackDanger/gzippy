@@ -937,13 +937,33 @@ fn phase1_search_boundaries(
 /// 2. **Byte-aligned brute force** (first 128 KiB).
 // Re-export of search_boundary_forward as a stable bit-offset API.
 // Used by the new GzipChunkFetcher (chunk_fetcher.rs) until a faithful
-// rapidgzip BlockFinder.hpp port lands. Returns the bit offset of the
-// first real deflate block boundary at or after `from_bit`, or None.
+// rapidgzip BlockFinder.hpp port lands. Searches a wider radius than
+// the v0.6 path so Silesia-gzip-9-class inputs (where 512 KiB windows
+// can contain zero validator-accepted candidates) reliably find a
+// boundary. Returns the bit offset of the first real deflate block
+// boundary at or after `from_bit`, or None.
 pub(crate) fn find_real_boundary_for_fetcher(
     deflate_data: &[u8],
     from_bit: usize,
 ) -> Option<usize> {
-    search_boundary_forward(deflate_data, from_bit).map(|cs| cs.bits())
+    // Try the cheap 512 KiB search first.
+    if let Some(cs) = search_boundary_forward(deflate_data, from_bit) {
+        return Some(cs.bits());
+    }
+    // Fall back to a much wider scan — up to 8 MiB so a sparse-boundary
+    // region (BTYPE=01-heavy) can still surface at least one candidate.
+    // search_boundary_forward only searches SEARCH_RADIUS=512 KiB; reach
+    // further by iterating its window forward.
+    let max_extra = 8 * 1024 * 1024 * 8;
+    let mut cursor = from_bit + SEARCH_RADIUS * 8;
+    let limit = (from_bit + max_extra).min(deflate_data.len() * 8);
+    while cursor < limit {
+        if let Some(cs) = search_boundary_forward(deflate_data, cursor) {
+            return Some(cs.bits());
+        }
+        cursor += SEARCH_RADIUS * 8;
+    }
+    None
 }
 
 fn search_boundary_forward(deflate_data: &[u8], from_bit: usize) -> Option<ChunkStart> {

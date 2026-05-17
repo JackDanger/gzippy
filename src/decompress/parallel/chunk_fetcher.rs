@@ -145,21 +145,21 @@ impl<'a> GzipChunkFetcher<'a> {
                     if partition_start >= total_bits {
                         break;
                     }
-                    // Workers seek to a real deflate block boundary
-                    // at-or-after the partition offset before decoding.
-                    // Rapidgzip uses its own BlockFinder for this; we
-                    // re-use gzippy's existing block-search primitive
-                    // until a faithful BlockFinder.hpp port lands.
-                    // Chunk 0 always starts at bit 0.
+                    // Use the real BlockFinder (block_finder.rs) directly,
+                    // not the v0.6 search_boundary_forward + validate_boundary
+                    // path. Per advisor: validate_boundary(min_blocks=2)
+                    // rejects valid single candidates on gzip -9. Trust
+                    // a single candidate; let ISA-L reject false positives.
                     let real_start = if idx == 0 {
                         0
                     } else {
-                        match crate::decompress::parallel::single_member::find_real_boundary_for_fetcher(
-                            input,
-                            partition_start,
-                        ) {
+                        let finder =
+                            crate::decompress::parallel::block_finder::BlockFinder::new(input);
+                        // Scan a wide window; gzip -9 has sparse boundaries.
+                        let scan_radius = 8 * 1024 * 1024 * 8;
+                        match finder.find_first_candidate(partition_start, scan_radius) {
                             Some(b) => b,
-                            None => continue, // no boundary; slot stays None
+                            None => continue, // no candidate; slot stays None
                         }
                     };
                     let result = finish_decode_chunk_with_inexact_offset(
