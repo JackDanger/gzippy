@@ -333,6 +333,343 @@ impl Block {
         }
         Ok(())
     }
+
+    /// Public entry point — literal port of `Block::read`
+    /// (deflate.hpp:1192-1300). Decodes up to `n_max_to_decode` bytes
+    /// of the CURRENT block's payload, appending u16 values into
+    /// `output`. Dynamic/Fixed Huffman bodies are decoded in a
+    /// follow-up commit (Step 7c); this slice handles the uncompressed
+    /// case end-to-end.
+    pub fn read(
+        &mut self,
+        bits: &mut Bits,
+        output: &mut Vec<u16>,
+        n_max_to_decode: usize,
+    ) -> Result<usize, BlockError> {
+        if self.eob() {
+            return Ok(0);
+        }
+        match self.compression_type {
+            CompressionType::Reserved => Err(BlockError::InvalidCompression),
+            CompressionType::Uncompressed => {
+                self.read_internal_uncompressed(bits, output, n_max_to_decode)
+            }
+            CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {
+                self.read_internal_compressed(bits, output, n_max_to_decode)
+            }
+        }
+    }
+
+    /// Literal port of `Block::readInternalUncompressed` semantics
+    /// (deflate.hpp:1212-1278): consume `uncompressed_size` bytes from
+    /// the bit stream (which are byte-aligned per the deflate spec)
+    /// and emit them as literal u16 values into `output`. Caps at
+    /// `n_max_to_decode`; sets `at_end_of_block` when the full payload
+    /// is consumed.
+    pub fn read_internal_uncompressed(
+        &mut self,
+        bits: &mut Bits,
+        output: &mut Vec<u16>,
+        n_max_to_decode: usize,
+    ) -> Result<usize, BlockError> {
+        let to_read = self.uncompressed_size.min(n_max_to_decode);
+        for _ in 0..to_read {
+            ensure_bits(bits, 8)?;
+            let byte = (bits.peek() & 0xFF) as u16;
+            bits.consume(8);
+            output.push(byte);
+        }
+        self.uncompressed_size -= to_read;
+        self.decoded_bytes += to_read;
+        if self.uncompressed_size == 0 {
+            self.at_end_of_block = true;
+        }
+        Ok(to_read)
+    }
+
+    /// Literal port of `Block::readInternalCompressed`
+    /// (deflate.hpp:1510-1582). Decodes one Huffman-coded block body
+    /// (Fixed or Dynamic) using the already-populated `literal_cl` /
+    /// `distance_code_count` from `read_header`. Emits literals as u16
+    /// values < 256; emits cross-chunk back-refs via the MapMarkers
+    /// encoding from `replace_markers::MARKER_BASE`; in-chunk back-refs
+    /// resolve immediately by copying from `output`.
+    ///
+    /// On hitting END_OF_BLOCK (symbol 256), sets `at_end_of_block`.
+    pub fn read_internal_compressed(
+        &mut self,
+        bits: &mut Bits,
+        output: &mut Vec<u16>,
+        n_max_to_decode: usize,
+    ) -> Result<usize, BlockError> {
+        // Build per-block lit/len + distance decode tables. For Dynamic,
+        // they come from self.literal_cl + distance_code_count. For
+        // Fixed, RFC 1951 §3.2.6 specifies static lengths.
+        let (litlen_lens, dist_lens) = match self.compression_type {
+            CompressionType::DynamicHuffman => {
+                let lit = self.literal_cl[..self.literal_code_count].to_vec();
+                let dist = self.literal_cl
+                    [self.literal_code_count..self.literal_code_count + self.distance_code_count]
+                    .to_vec();
+                (lit, dist)
+            }
+            CompressionType::FixedHuffman => fixed_huffman_code_lengths(),
+            _ => return Err(BlockError::InvalidCompression),
+        };
+
+        let litlen_table =
+            build_canonical_table::<MAX_LITERAL_OR_LENGTH_SYMBOLS>(&litlen_lens, 15)?;
+        let dist_table = build_canonical_table::<MAX_DISTANCE_SYMBOL_COUNT>(&dist_lens, 15)?;
+
+        let start_len = output.len();
+        let mut emitted: usize = 0;
+        while emitted < n_max_to_decode {
+            // Decode one lit/len symbol.
+            let (sym, bit_count) = decode_canonical(&litlen_table, 15, bits)?;
+            bits.consume(bit_count);
+
+            if sym < 256 {
+                output.push(sym);
+                emitted += 1;
+                continue;
+            }
+            if sym == END_OF_BLOCK_SYMBOL {
+                self.at_end_of_block = true;
+                self.decoded_bytes += emitted;
+                return Ok(emitted);
+            }
+            if sym > 285 {
+                return Err(BlockError::InvalidHuffmanCode);
+            }
+            // Length code: read extra bits and resolve the length.
+            let lidx = (sym - 257) as usize;
+            let length = read_length_extra(bits, lidx)?;
+            // Distance: decode symbol + extra bits.
+            let (dsym, dbit) = decode_canonical(&dist_table, 15, bits)?;
+            bits.consume(dbit);
+            if dsym as usize >= DISTANCE_BASE.len() {
+                return Err(BlockError::InvalidHuffmanCode);
+            }
+            let distance = read_distance_extra(bits, dsym as usize)?;
+            if distance == 0 || distance > MAX_WINDOW_SIZE {
+                return Err(BlockError::ExceededWindowRange);
+            }
+            // Emit the back-ref. If distance > current in-block position,
+            // the missing bytes become MapMarkers indices (= rapidgzip
+            // resolveBackreference's behavior when window is empty).
+            let out_pos = output.len() - start_len + self.decoded_bytes_at_block_start;
+            emit_backref(output, distance, length, out_pos)?;
+            emitted += length;
+            if self.track_backreferences {
+                self.backreferences.push(Backreference {
+                    distance: distance as u16,
+                    length: length as u16,
+                });
+            }
+        }
+        self.decoded_bytes += emitted;
+        Ok(emitted)
+    }
+}
+
+// ── Length / distance extra-bits tables (RFC 1951 §3.2.5) ──────────────────
+
+pub const LENGTH_BASE: [u16; 29] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
+];
+
+pub const LENGTH_EXTRA: [u8; 29] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+];
+
+pub const DISTANCE_BASE: [u16; 30] = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+];
+
+pub const DISTANCE_EXTRA: [u8; 30] = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
+];
+
+fn read_length_extra(bits: &mut Bits, lidx: usize) -> Result<usize, BlockError> {
+    let extra = LENGTH_EXTRA[lidx] as u32;
+    if extra > 0 {
+        ensure_bits(bits, extra)?;
+    }
+    let extra_val = if extra > 0 {
+        let v = (bits.peek() & ((1u64 << extra) - 1)) as u16;
+        bits.consume(extra);
+        v
+    } else {
+        0
+    };
+    Ok((LENGTH_BASE[lidx] + extra_val) as usize)
+}
+
+fn read_distance_extra(bits: &mut Bits, dsym: usize) -> Result<usize, BlockError> {
+    let extra = DISTANCE_EXTRA[dsym] as u32;
+    if extra > 0 {
+        ensure_bits(bits, extra)?;
+    }
+    let extra_val = if extra > 0 {
+        let v = (bits.peek() & ((1u64 << extra) - 1)) as u32;
+        bits.consume(extra);
+        v
+    } else {
+        0
+    };
+    Ok(DISTANCE_BASE[dsym] as usize + extra_val as usize)
+}
+
+/// RFC 1951 §3.2.6 fixed Huffman code lengths.
+fn fixed_huffman_code_lengths() -> (Vec<u8>, Vec<u8>) {
+    let mut lit = vec![0u8; 288];
+    for v in &mut lit[0..144] {
+        *v = 8;
+    }
+    for v in &mut lit[144..256] {
+        *v = 9;
+    }
+    for v in &mut lit[256..280] {
+        *v = 7;
+    }
+    for v in &mut lit[280..288] {
+        *v = 8;
+    }
+    let dist = vec![5u8; 30];
+    (lit, dist)
+}
+
+/// Build a canonical-Huffman decode table. Returns a table of size
+/// `1 << max_bits` where each entry packs `(symbol << 5) | length`,
+/// with length=0 meaning no valid code at that bit pattern.
+///
+/// `MAX_SYMBOLS` is a compile-time bound for the symbol alphabet
+/// size. `max_bits` is the longest code length expected (15 for
+/// deflate lit/len + distance).
+fn build_canonical_table<const MAX_SYMBOLS: usize>(
+    code_lengths: &[u8],
+    max_bits: u8,
+) -> Result<Vec<u32>, BlockError> {
+    let mut bl_count = [0u32; 16];
+    for &len in code_lengths.iter() {
+        if len > max_bits {
+            return Err(BlockError::InvalidCodeLengths);
+        }
+        if len > 0 {
+            bl_count[len as usize] += 1;
+        }
+    }
+    // Kraft check.
+    let mut code = 0u32;
+    let mut next_code = [0u32; 16];
+    for b in 1..=max_bits as usize {
+        code = (code + bl_count[b - 1]) << 1;
+        if code > (1u32 << b) {
+            return Err(BlockError::InvalidCodeLengths);
+        }
+        next_code[b] = code;
+    }
+    let table_size = 1usize << max_bits;
+    let mut table = vec![0u32; table_size];
+    for (sym, &len) in code_lengths.iter().enumerate() {
+        if len == 0 || sym >= MAX_SYMBOLS {
+            continue;
+        }
+        let canonical = next_code[len as usize];
+        next_code[len as usize] += 1;
+        let reversed = reverse_bits_u32(canonical, len);
+        let entry = ((sym as u32) << 5) | (len as u32);
+        let step = 1usize << len;
+        let mut idx = reversed as usize;
+        while idx < table_size {
+            table[idx] = entry;
+            idx += step;
+        }
+    }
+    Ok(table)
+}
+
+fn reverse_bits_u32(mut v: u32, n: u8) -> u32 {
+    let mut r = 0u32;
+    for _ in 0..n {
+        r = (r << 1) | (v & 1);
+        v >>= 1;
+    }
+    r
+}
+
+fn decode_canonical(
+    table: &[u32],
+    max_bits: u8,
+    bits: &mut Bits,
+) -> Result<(u16, u32), BlockError> {
+    // Refill opportunistically. Don't error on insufficient bits —
+    // the actual decoded symbol's code length might be short enough
+    // that the remaining buffer suffices. We only error if the chosen
+    // code length exceeds what's available.
+    if bits.available() < max_bits as u32 {
+        bits.refill();
+    }
+    let mask = (1u64 << max_bits) - 1;
+    let peek = (bits.peek() & mask) as usize;
+    let entry = table[peek];
+    let length = entry & 0x1F;
+    let symbol = (entry >> 5) as u16;
+    if length == 0 {
+        return Err(BlockError::InvalidHuffmanCode);
+    }
+    if bits.available() < length {
+        return Err(BlockError::EndOfFile);
+    }
+    Ok((symbol, length))
+}
+
+/// Emit a deflate back-reference of `(distance, length)` at the
+/// current end of `output`. Bytes whose back-reference reaches before
+/// the chunk start become MapMarkers indices (`MARKER_BASE +
+/// (MAX_WINDOW_SIZE - distance + out_pos_in_chunk + i)`); the
+/// remainder are chunk-local copies.
+///
+/// `out_pos` is the decoded-byte position WITHIN THE CHUNK at the
+/// start of this back-ref's emission window. For a fresh Block this
+/// equals `output.len()`; for multi-block per-chunk use the caller
+/// passes the running chunk-relative position.
+fn emit_backref(
+    output: &mut Vec<u16>,
+    distance: usize,
+    length: usize,
+    out_pos: usize,
+) -> Result<(), BlockError> {
+    use crate::decompress::parallel::replace_markers::MARKER_BASE;
+    output.reserve(length);
+    let marker_count = distance.saturating_sub(out_pos).min(length);
+    for i in 0..marker_count {
+        let idx = MAX_WINDOW_SIZE + out_pos + i - distance;
+        output.push(MARKER_BASE + idx as u16);
+    }
+    let local_count = length - marker_count;
+    if local_count == 0 {
+        return Ok(());
+    }
+    let base_dst = output.len();
+    if distance >= local_count {
+        // Source and destination ranges do not overlap.
+        let src_start = base_dst - distance;
+        let snapshot: Vec<u16> = output[src_start..src_start + local_count].to_vec();
+        output.extend_from_slice(&snapshot);
+    } else {
+        // Overlap case (e.g. distance=1 RLE): copy one element at a
+        // time so prior writes feed subsequent reads.
+        for i in 0..local_count {
+            let src = base_dst + i - distance;
+            let v = output[src];
+            output.push(v);
+        }
+    }
+    Ok(())
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -546,6 +883,73 @@ mod tests {
         assert_eq!(reverse_bits(0b1011, 4), 0b1101);
         assert_eq!(reverse_bits(0b1, 1), 0b1);
         assert_eq!(reverse_bits(0b0001, 4), 0b1000);
+    }
+
+    #[test]
+    fn read_uncompressed_payload_emits_literal_bytes() {
+        // BFINAL=0, BTYPE=00, pad=0, LEN=4, NLEN=0xFFFB, then "test".
+        let mut bytes = vec![0b0000_0000u8];
+        bytes.extend_from_slice(&[0x04, 0x00, 0xFB, 0xFF]);
+        bytes.extend_from_slice(b"test");
+        let mut bits = make_bits(&bytes);
+        let mut b = Block::new();
+        b.read_header(&mut bits, false).unwrap();
+        let mut output: Vec<u16> = Vec::new();
+        let n = b.read(&mut bits, &mut output, 1024).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(
+            output,
+            vec![b't' as u16, b'e' as u16, b's' as u16, b't' as u16]
+        );
+        assert!(b.eob());
+    }
+
+    #[test]
+    fn read_round_trips_a_compressed_block() {
+        // Both Fixed and Dynamic Huffman bodies should round-trip
+        // byte-identical. flate2 picks the encoding based on payload
+        // entropy; we test both via large + small payloads.
+        for payload in &[
+            b"a".repeat(2048),
+            b"the quick brown fox jumps over the lazy dog. ".repeat(40),
+        ] {
+            use flate2::write::DeflateEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(payload).unwrap();
+            let deflate_bytes = enc.finish().unwrap();
+            let mut bits = make_bits(&deflate_bytes);
+            let mut b = Block::new();
+            b.read_header(&mut bits, false).unwrap();
+            assert!(
+                matches!(
+                    b.compression_type(),
+                    CompressionType::FixedHuffman | CompressionType::DynamicHuffman
+                ),
+                "expected compressed block, got {:?}",
+                b.compression_type()
+            );
+            let mut output: Vec<u16> = Vec::new();
+            let r = b.read(&mut bits, &mut output, payload.len() * 2);
+            assert!(
+                b.eob(),
+                "decoder should reach end-of-block; read returned {:?}, output.len()={}, payload.len()={}",
+                r,
+                output.len(),
+                payload.len(),
+            );
+            // For single-block flate2 output every back-ref is in-block,
+            // so no markers expected.
+            let resolved: Vec<u8> = output
+                .iter()
+                .map(|&v| {
+                    assert!(v < 256, "in-block back-refs only; v={v:#x}");
+                    v as u8
+                })
+                .collect();
+            assert_eq!(resolved, *payload);
+        }
     }
 
     #[test]
