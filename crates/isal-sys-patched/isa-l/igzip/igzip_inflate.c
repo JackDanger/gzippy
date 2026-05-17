@@ -1409,6 +1409,8 @@ read_header(struct inflate_state *state)
 
         state->bfinal = inflate_in_read_bits(state, 1);
         btype = inflate_in_read_bits(state, 2);
+        /* Stopping-point extension: record block type for the caller. */
+        state->btype = (uint8_t) btype;
 
         if (state->read_in_length < 0)
                 ret = ISAL_END_INPUT;
@@ -1742,6 +1744,11 @@ isal_inflate_init(struct inflate_state *state)
         state->tmp_in_size = 0;
         state->tmp_out_processed = 0;
         state->tmp_out_valid = 0;
+        /* Stopping-point extension. */
+        state->points_to_stop_at = ISAL_STOPPING_POINT_NONE;
+        state->stopped_at = ISAL_STOPPING_POINT_NONE;
+        state->tmp_out_stopped_at = ISAL_STOPPING_POINT_NONE;
+        state->btype = 0xFF;
 }
 
 void
@@ -1762,6 +1769,10 @@ isal_inflate_reset(struct inflate_state *state)
         state->wrapper_flag = 0;
         state->tmp_in_size = 0;
         state->tmp_out_processed = 0;
+        /* Stopping-point extension. */
+        state->stopped_at = ISAL_STOPPING_POINT_NONE;
+        state->tmp_out_stopped_at = ISAL_STOPPING_POINT_NONE;
+        state->btype = 0xFF;
         state->tmp_out_valid = 0;
 }
 
@@ -2233,6 +2244,9 @@ isal_inflate(struct inflate_state *state)
         uint32_t copy_size = 0;
         int32_t shift_size = 0;
         int ret = 0;
+        /* Stopping-point extension: reset per-call status so the caller
+         * gets a fresh reading from this invocation only. */
+        state->stopped_at = ISAL_STOPPING_POINT_NONE;
 
         if (!state->wrapper_flag && state->crc_flag == IGZIP_GZIP) {
                 struct isal_gzip_header gz_hdr;
@@ -2292,6 +2306,15 @@ isal_inflate(struct inflate_state *state)
 
                                         if (ret)
                                                 break;
+                                        /* Stopping-point extension: caller requested a stop
+                                         * after every block header. The header has been parsed;
+                                         * state->btype reflects the just-parsed block type. */
+                                        if (state->points_to_stop_at &
+                                            ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER) {
+                                                state->stopped_at =
+                                                    ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER;
+                                                break;
+                                        }
                                 }
 
                                 if (state->block_state == ISAL_BLOCK_TYPE0) {
@@ -2303,6 +2326,17 @@ isal_inflate(struct inflate_state *state)
 
                                 if (ret)
                                         break;
+                                /* Stopping-point extension: caller requested a stop after
+                                 * every block body finishes. The decode just transitioned
+                                 * the state machine to NEW_HDR (next block) or INPUT_DONE
+                                 * (after BFINAL=1). */
+                                if ((state->block_state == ISAL_BLOCK_NEW_HDR ||
+                                     state->block_state == ISAL_BLOCK_INPUT_DONE) &&
+                                    (state->points_to_stop_at &
+                                     ISAL_STOPPING_POINT_END_OF_BLOCK)) {
+                                        state->stopped_at = ISAL_STOPPING_POINT_END_OF_BLOCK;
+                                        break;
+                                }
                         }
 
                         /* Copy valid data from internal buffer into out_buffer */
@@ -2361,6 +2395,13 @@ isal_inflate(struct inflate_state *state)
                                         ret = read_header_stateful(state);
                                         if (ret)
                                                 break;
+                                        /* Stopping-point extension. */
+                                        if (state->points_to_stop_at &
+                                            ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER) {
+                                                state->stopped_at =
+                                                    ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER;
+                                                break;
+                                        }
                                 }
 
                                 if (state->block_state == ISAL_BLOCK_TYPE0)
@@ -2369,6 +2410,14 @@ isal_inflate(struct inflate_state *state)
                                         ret = decode_huffman_code_block_stateless(state, start_out);
                                 if (ret)
                                         break;
+                                /* Stopping-point extension. */
+                                if ((state->block_state == ISAL_BLOCK_NEW_HDR ||
+                                     state->block_state == ISAL_BLOCK_INPUT_DONE) &&
+                                    (state->points_to_stop_at &
+                                     ISAL_STOPPING_POINT_END_OF_BLOCK)) {
+                                        state->stopped_at = ISAL_STOPPING_POINT_END_OF_BLOCK;
+                                        break;
+                                }
                         }
                 }
 
