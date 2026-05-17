@@ -346,26 +346,6 @@ fn worker_loop(
                     let end_bit = c.encoded_offset_bits + c.encoded_size_bits;
                     window_map.insert(end_bit, Arc::new(tail));
                 }
-                // ALSO publish per-subchunk windows when we have at
-                // least 32 KiB of clean data preceding the subchunk's
-                // boundary. This lets successor workers fast-path on
-                // BlockFinder candidates that fall WITHIN this chunk's
-                // decode range, as long as our natural decode crossed
-                // that exact bit position. Each insert is a 32 KiB
-                // memcpy from chunk.data into a fresh Arc. Per-chunk
-                // cost: ~50 subchunks × 32 KiB = 1.6 MiB memcpy. Fast.
-                if c.data_with_markers.is_empty() {
-                    for sub in c.subchunks.iter().skip(1) {
-                        // Decoded offset is byte position relative to chunk
-                        // start. Need 32768 bytes preceding it in chunk.data.
-                        if sub.decoded_offset >= 32768 && sub.decoded_offset <= c.data.len() {
-                            let window_start = sub.decoded_offset - 32768;
-                            let mut win = [0u8; 32768];
-                            win.copy_from_slice(&c.data[window_start..sub.decoded_offset]);
-                            window_map.insert(sub.encoded_offset_bits, Arc::new(win));
-                        }
-                    }
-                }
             }
             Err(e) => {
                 trace::emit(
