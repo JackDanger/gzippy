@@ -129,41 +129,27 @@ impl<'a> GzipChunkFetcher<'a> {
         self.next_consumer_index < self.partition_offsets.len()
     }
 
-    /// Try candidate deflate block boundaries past `from_bit` in order
-    /// until one decodes successfully. Mirror of rapidgzip's
-    /// `tryToDecode` (GzipChunk.hpp:712-734): validation IS full decode,
-    /// not a separate cheap check. A boundary's "validity" is decided
-    /// by whether `finish_decode_chunk_with_inexact_offset` accepts it.
+    /// Find the first valid deflate block boundary at-or-past `from_bit`.
+    /// Returns the bit offset, or None if no valid boundary is found
+    /// within `BOUNDARY_SEARCH_RADIUS_BYTES`.
     ///
-    /// Partition 0 (from_bit = 0) returns immediately — bit 0 of the
-    /// stripped deflate stream is a real boundary by construction.
-    /// Each candidate gets a cheap one-block sanity check
-    /// (`validate_boundary(min_blocks=1, 32 KiB)`) to reject the worst
-    /// false positives without invoking the full chunk decoder, but
-    /// the chunk decode is still the authoritative test.
-    fn decode_at_first_valid_boundary(
-        input: &[u8],
-        from_bit: usize,
-        until: usize,
-        configuration: ChunkConfiguration,
-    ) -> Result<ChunkData, ChunkDecodeError> {
+    /// Validation = the one-block marker-decoder check; the full chunk
+    /// decode happens separately so this stays cheap during the
+    /// pre-decode boundary-discovery pass.
+    fn find_first_valid_boundary(input: &[u8], from_bit: usize) -> Option<usize> {
         if from_bit == 0 {
-            return finish_decode_chunk_with_inexact_offset(input, 0, until, &[], configuration);
+            return Some(0);
         }
         let finder = BlockFinder::new(input);
         let mut cursor = from_bit;
         let absolute_limit = input.len() * 8;
         let window_bits = BOUNDARY_SEARCH_RADIUS_BYTES * 8;
-        let mut last_error: Option<ChunkDecodeError> = None;
         while cursor < absolute_limit {
             let window_end = (cursor + window_bits).min(absolute_limit);
             for candidate in finder.find_blocks(cursor, window_end) {
                 if candidate.bit_offset < cursor {
                     continue;
                 }
-                // Cheap reject of obvious false positives. Skip
-                // candidates where one-block marker decode fails or
-                // hits a reserved-block-type tail.
                 if validate_boundary(
                     input,
                     candidate.bit_offset,
@@ -171,36 +157,14 @@ impl<'a> GzipChunkFetcher<'a> {
                     BOUNDARY_VALIDATE_MIN_BYTES,
                     false,
                 )
-                .is_err()
+                .is_ok()
                 {
-                    continue;
-                }
-                match finish_decode_chunk_with_inexact_offset(
-                    input,
-                    candidate.bit_offset,
-                    until,
-                    &[],
-                    configuration,
-                ) {
-                    Ok(chunk) => return Ok(chunk),
-                    Err(e) => {
-                        if std::env::var("GZIPPY_DEBUG").is_ok() {
-                            eprintln!(
-                                "[parallel_sm] candidate boundary {} failed; trying next. err={:?}",
-                                candidate.bit_offset, e
-                            );
-                        }
-                        last_error = Some(e);
-                        continue;
-                    }
+                    return Some(candidate.bit_offset);
                 }
             }
             cursor = window_end;
         }
-        Err(last_error.unwrap_or(ChunkDecodeError::ExactStopMissed {
-            requested: from_bit,
-            actual: cursor,
-        }))
+        None
     }
 
     fn dispatch_all_blocking(&mut self) {
@@ -215,41 +179,95 @@ impl<'a> GzipChunkFetcher<'a> {
         let configuration = self.configuration;
         let partition_offsets = &self.partition_offsets;
         let chunk_slots = Arc::clone(&self.chunk_slots);
-        let next_task = AtomicUsize::new(0);
 
+        // Pass A — boundary discovery. Each partition's seed gets
+        // resolved to a real deflate block boundary at-or-past that
+        // seed. Parallel; cheap (validate_boundary is ~32 KiB decode).
+        let boundaries: Vec<Option<usize>> = {
+            let next_task = AtomicUsize::new(0);
+            let results: Vec<Mutex<Option<Option<usize>>>> =
+                (0..n).map(|_| Mutex::new(None)).collect();
+            std::thread::scope(|s| {
+                let workers = self.parallelization.max(1).min(n);
+                for _ in 0..workers {
+                    let results = &results;
+                    let next_task = &next_task;
+                    s.spawn(move || loop {
+                        let idx = next_task.fetch_add(1, Ordering::Relaxed);
+                        if idx >= n {
+                            break;
+                        }
+                        let seed = partition_offsets[idx];
+                        let boundary = if seed >= total_bits {
+                            None
+                        } else {
+                            Self::find_first_valid_boundary(input, seed)
+                        };
+                        *results[idx].lock().unwrap() = Some(boundary);
+                    });
+                }
+            });
+            results
+                .into_iter()
+                .map(|m| m.into_inner().unwrap().flatten())
+                .collect()
+        };
+
+        if std::env::var("GZIPPY_DEBUG").is_ok() {
+            for (i, b) in boundaries.iter().enumerate() {
+                eprintln!(
+                    "[parallel_sm] boundary[{}]: seed={} -> {:?}",
+                    i, partition_offsets[i], b
+                );
+            }
+        }
+
+        // Pass B — decode each chunk i from boundaries[i] to the
+        // first downstream boundary (boundaries[i+1] if present, else
+        // total_bits). The crucial property: chunk i's until_bits is
+        // the start of chunk i+1, so chunk i's decoder stops at the
+        // first block boundary at-or-past chunk i+1's start. Since
+        // chunk i+1's start IS a real block boundary, the decoder
+        // typically stops exactly there, making chunk i's end_bit ==
+        // chunk i+1's start_bit. That's what makes WindowMap key
+        // lookups in the consumer match.
+        let next_task = AtomicUsize::new(0);
         std::thread::scope(|s| {
             let workers = self.parallelization.max(1).min(n);
             for _ in 0..workers {
                 let chunk_slots = Arc::clone(&chunk_slots);
                 let next_task = &next_task;
+                let boundaries = &boundaries;
                 s.spawn(move || loop {
                     let idx = next_task.fetch_add(1, Ordering::Relaxed);
                     if idx >= n {
                         break;
                     }
-                    let seed = partition_offsets[idx];
-                    if seed >= total_bits {
-                        break;
-                    }
-                    // Until limit: the next partition's seed, or EOF.
-                    let until = partition_offsets
-                        .get(idx + 1)
-                        .copied()
+                    let Some(start) = boundaries[idx] else {
+                        continue; // no boundary found; slot stays None
+                    };
+                    // The until_bits for this chunk is the NEXT chunk's
+                    // start (a real boundary), or total_bits for the
+                    // last chunk.
+                    let until = boundaries
+                        .iter()
+                        .skip(idx + 1)
+                        .find_map(|b| *b)
                         .unwrap_or(total_bits);
-                    let result = Self::decode_at_first_valid_boundary(
+                    let result = finish_decode_chunk_with_inexact_offset(
                         input,
-                        seed,
+                        start,
                         until,
+                        &[],
                         configuration,
                     );
                     if std::env::var("GZIPPY_DEBUG").is_ok() {
                         match &result {
                             Ok(c) => eprintln!(
-                                "[parallel_sm] chunk[{}] OK: seed={} until={} start={} end={} decoded={} markers={} clean={} preemptive={}",
+                                "[parallel_sm] chunk[{}] OK: start={} until={} end={} decoded={} markers={} clean={} preemptive={}",
                                 idx,
-                                seed,
+                                start,
                                 until,
-                                c.encoded_offset_bits,
                                 c.encoded_offset_bits + c.encoded_size_bits,
                                 c.decoded_size(),
                                 c.data_with_markers.len(),
@@ -257,8 +275,8 @@ impl<'a> GzipChunkFetcher<'a> {
                                 c.stopped_preemptively,
                             ),
                             Err(e) => eprintln!(
-                                "[parallel_sm] chunk[{}] ERR: seed={} until={} err={:?}",
-                                idx, seed, until, e
+                                "[parallel_sm] chunk[{}] ERR: start={} until={} err={:?}",
+                                idx, start, until, e
                             ),
                         }
                     }
