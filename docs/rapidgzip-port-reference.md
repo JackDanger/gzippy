@@ -918,7 +918,12 @@ exclude tests.
     Prefetcher, Statistics; get_if_available / insert /
     insert_prefetched / record_fetch / prefetch_indexes /
     sequential-clear / failed_prefetch / in-flight set)
-- ⏳ Step 7: deflate::Block port (~1500 LOC, not started — biggest)
+- ✅ Step 7: deflate::Block port (complete: skeleton + read end-to-end)
+  - ✅ 7a (4871a52): Block struct + state + readHeader + readDynamicHuffmanCoding
+  - ✅ 7b (04e518d): read + read_internal_uncompressed +
+    read_internal_compressed + canonical-Huffman decoder + emit_backref
+    (with MapMarkers cross-chunk emission). Round-trip-verified against
+    flate2-produced fixed AND dynamic blocks.
 - ✅ Step 8 (f2f2ae6): DecodedData::cleanUnmarkedData
 - ✅ Step 9 (bc8c50c): appendSubchunksToIndexes BlockMap insertion
 - ✅ Step 10 (0728eca): gzip readHeader + readFooter
@@ -929,8 +934,8 @@ exclude tests.
 - ✅ Step 15 (f6c1e4f): ChunkData::split
 - ⏳ Step 16: HuffmanCodingDoubleLiteralCached (~350 LOC, optional)
 
-12 of 16 steps landed (75%). Remaining: Step 6 + 7 (the two largest)
-and Steps 14 + 16 (both marked optional).
+15 of 16 steps landed (94%). Remaining: Steps 14 + 16 (both marked
+optional in the original plan).
 
 ### Step 1. Align marker encoding with rapidgzip's `MapMarkers` (~150 LOC)
 
