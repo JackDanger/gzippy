@@ -263,11 +263,13 @@ fn worker_loop(
         let window = if job.start_bit == 0 {
             window_map.get(0)
         } else if job.authoritative {
-            // Consumer guarantees the predecessor's window is in the
-            // map at start_bit. Wait however long it takes.
+            // Consumer guarantees predecessor's window is in the map.
             window_map.get_or_wait(job.start_bit, Duration::from_secs(60))
         } else {
-            // Speculative: short wait, then fall back to slow path.
+            // Speculative job: short wait. If miss, take slow path
+            // with the empty window. Slow path is bounded (see
+            // decode_chunk_bootstrap end_bit_limit) so a phantom
+            // boundary returns Err quickly rather than hanging.
             window_map.get_or_wait(job.start_bit, WINDOW_WAIT_TIMEOUT)
         };
 

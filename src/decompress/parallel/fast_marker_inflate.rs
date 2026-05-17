@@ -732,10 +732,21 @@ fn decode_loop(
         let btype = ((bits.peek() >> 1) & 3) as u32;
         bits.consume(3);
 
+        // Per-block output cap. Without this, a malformed block on a
+        // phantom boundary (BlockFinder false positive) can drive
+        // decode_dynamic / decode_fixed into a tight loop emitting
+        // gigabytes of garbage symbols before hitting EOF — proven by
+        // trace at HEAD `d78bf9d` where worker-26 hung on bit
+        // 872417560 and never returned. 256 MiB is generous enough
+        // that no legitimate single deflate block exceeds it
+        // (deflate's spec caps a single block's match-length output
+        // implicitly through bit-stream input limits, but a malformed
+        // header can synthesize huge runs from garbage codes).
+        const MAX_PER_BLOCK_OUTPUT: usize = 256 * 1024 * 1024;
         match btype {
             0 => decode_stored(bits, output, &mut clean_tail)?,
-            1 => decode_fixed(bits, output, 0, &mut clean_tail)?,
-            2 => decode_dynamic(bits, output, 0, &mut clean_tail)?,
+            1 => decode_fixed(bits, output, MAX_PER_BLOCK_OUTPUT, &mut clean_tail)?,
+            2 => decode_dynamic(bits, output, MAX_PER_BLOCK_OUTPUT, &mut clean_tail)?,
             _ => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type 3")),
         }
 
