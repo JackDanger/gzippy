@@ -602,16 +602,23 @@ impl ChunkData {
         self.max_encoded_offset_bits = offset;
         // Adjust first subchunk: its encoded_offset becomes the new
         // chunk start, and its encoded_size spans to the next subchunk
-        // (or to the chunk end if there's only one subchunk).
+        // (or to the chunk end if there's only one subchunk). If the new
+        // offset coincides with subchunks[1].encoded_offset_bits, the
+        // collapsed first subchunk has zero encoded_size and would
+        // duplicate subchunks[1]'s key in the BlockMap — drop it instead.
         if !self.subchunks.is_empty() {
             let next_offset = if self.subchunks.len() >= 2 {
                 self.subchunks[1].encoded_offset_bits
             } else {
                 end_offset
             };
-            let first = &mut self.subchunks[0];
-            first.encoded_offset_bits = offset;
-            first.encoded_size_bits = next_offset.saturating_sub(offset);
+            if self.subchunks.len() >= 2 && offset == next_offset {
+                self.subchunks.remove(0);
+            } else {
+                let first = &mut self.subchunks[0];
+                first.encoded_offset_bits = offset;
+                first.encoded_size_bits = next_offset.saturating_sub(offset);
+            }
         }
     }
 
@@ -725,6 +732,31 @@ mod tests {
         assert_eq!(chunk.encoded_offset_bits, 50);
         assert_eq!(chunk.subchunks[0].encoded_offset_bits, 50);
         assert_eq!(chunk.subchunks[0].encoded_size_bits, 500 - 50);
+    }
+
+    #[test]
+    fn set_encoded_offset_drops_collapsed_first_subchunk() {
+        // Speculative chunk decoded with seed=100, found block boundary at
+        // bit 400 → subchunks[0]=(enc=100, size=300), subchunks[1]=(enc=400, ...).
+        // If the consumer re-anchors to offset=400 (matching the second
+        // boundary exactly), the first subchunk would collapse to zero
+        // encoded_size and duplicate subchunks[1]'s key in the BlockMap.
+        let mut chunk = ChunkData::new(100, small_config());
+        chunk.append_clean(&[0u8; 50]);
+        chunk.append_block_boundary(400);
+        chunk.append_clean(&[0u8; 50]);
+        chunk.finalize(700);
+        // Stretch the speculative match range so set_encoded_offset(400) is valid.
+        chunk.max_encoded_offset_bits = 500;
+        assert_eq!(chunk.subchunks.len(), 2);
+
+        chunk.set_encoded_offset(400);
+
+        assert_eq!(chunk.encoded_offset_bits, 400);
+        // The collapsed first subchunk must be gone — otherwise the
+        // BlockMap push will panic on duplicate offset.
+        assert_eq!(chunk.subchunks.len(), 1);
+        assert_eq!(chunk.subchunks[0].encoded_offset_bits, 400);
     }
 
     #[test]
