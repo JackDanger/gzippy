@@ -30,3 +30,4 @@ pub mod marker_decode;
 pub mod replace_markers;
 pub mod single_member;
 pub mod ultra_fast_inflate;
+pub mod window_map;
