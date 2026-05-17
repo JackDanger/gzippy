@@ -1,6 +1,6 @@
 # rapidgzip → gzippy parallel single-member port: one-page reference
 
-Last verified against HEAD `ed0fee7`. If the code below disagrees with
+Last verified against HEAD `1e21b1e`. If the code below disagrees with
 what `grep` finds, the code wins — update this file.
 
 ## What lives where
@@ -62,6 +62,7 @@ Silesia gzip -9 (162 MB → 503 MB, T=16, neurotic homelab x86_64):
 | HEAD | gzippy MB/s | vs rapidgzip | notes |
 |------|-------------|--------------|-------|
 | `ed0fee7` | 574 | 0.30× | clean depth-2 chain, all non-rapidgzip code deleted |
+| `1e21b1e` | 602 | 0.33× | BlockFinder dynamic-only (matches rapidgzip), +5% |
 
 rapidgzip ground truth (`--verbose`):
 - Pool Efficiency 77%.
