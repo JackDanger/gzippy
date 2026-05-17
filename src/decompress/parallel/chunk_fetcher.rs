@@ -561,13 +561,21 @@ fn consumer_loop<W: std::io::Write>(
 
         // Process the chunk: apply_window if markers; write bytes;
         // combine CRC; publish tail window.
+        //
+        // Window lookup is keyed by the ACTUAL decode start
+        // (max_encoded_offset_bits), not the requested seed
+        // (encoded_offset_bits). For speculative chunks these differ:
+        // data corresponds to compressed range [actual, end] and the
+        // markers in the leading region are back-refs into bytes ending
+        // at compressed position `actual`. Predecessor publishes its
+        // tail at its actual_end, which on a hit equals our `actual`.
         let mut chunk = chunk;
         if !chunk.data_with_markers.is_empty() {
-            let chunk_start = chunk.encoded_offset_bits;
+            let window_key = chunk.max_encoded_offset_bits;
             let window = window_map
-                .get_or_wait(chunk_start, Duration::from_secs(60))
+                .get_or_wait(window_key, Duration::from_secs(60))
                 .ok_or(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
-                    requested: chunk_start,
+                    requested: window_key,
                     actual: expected_start,
                 }))?;
             let aw_t0 = std::time::Instant::now();
