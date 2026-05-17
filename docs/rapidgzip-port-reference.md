@@ -63,6 +63,11 @@ Silesia gzip -9 (162 MB → 503 MB, T=16, neurotic homelab x86_64):
 |------|-------------|--------------|-------|
 | `ed0fee7` | 574 | 0.30× | clean depth-2 chain, all non-rapidgzip code deleted |
 | `1e21b1e` | 602 | 0.33× | BlockFinder dynamic-only (matches rapidgzip), +5% |
+| `7994675` | 645 | 0.35× | partition-seed-keyed speculation (rapidgzip BlockFetcher) |
+| `9672baf` | 628 | 0.34× | + ported `seekToNonFinalUncompressedDeflateBlock` |
+| `88b84a4` | 383 | 0.19× | + literal `nextDeflateCandidate` LUT (regressed, fixed below) |
+| `7458880` | 344 | 0.25× | + 15-bit LUT |
+| `84883ae` | 675 | 0.45× | + BitReader refills before peek(57); hit rate 62→82% |
 
 rapidgzip ground truth (`--verbose`):
 - Pool Efficiency 77%.
