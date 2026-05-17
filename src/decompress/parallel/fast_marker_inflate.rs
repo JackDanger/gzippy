@@ -975,9 +975,20 @@ fn decode_dynamic(
     // path; ~24x faster per symbol than our pure-Rust ConsumeFirstTable.
     #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
     {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ISAL_BUILT: AtomicU64 = AtomicU64::new(0);
+        static ISAL_FALLBACK: AtomicU64 = AtomicU64::new(0);
         if let Some(litlen_isal) =
             crate::decompress::parallel::isal_huffman::IsalLitLenCode::from_lengths(&lens[..hlit])
         {
+            let n = ISAL_BUILT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 1000 == 0 {
+                eprintln!(
+                    "[isal_huff] built={} fallback={}",
+                    n,
+                    ISAL_FALLBACK.load(Ordering::Relaxed)
+                );
+            }
             return decode_huffman_block_isal(
                 bits,
                 output,
@@ -986,6 +997,8 @@ fn decode_dynamic(
                 max_output,
                 clean_tail,
             );
+        } else {
+            ISAL_FALLBACK.fetch_add(1, Ordering::Relaxed);
         }
     }
 
