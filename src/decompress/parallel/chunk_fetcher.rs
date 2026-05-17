@@ -169,8 +169,18 @@ impl<'a> GzipChunkFetcher<'a> {
                         &[], // empty window — speculative
                         configuration,
                     );
-                    if let Ok(chunk) = result {
-                        *chunk_slots[idx].lock().unwrap() = Some(chunk);
+                    match result {
+                        Ok(chunk) => {
+                            *chunk_slots[idx].lock().unwrap() = Some(chunk);
+                        }
+                        Err(e) => {
+                            if std::env::var("GZIPPY_DEBUG").is_ok() {
+                                eprintln!(
+                                    "[parallel_sm:rapidgzip] chunk[{}] worker failed: real_start={} until={} err={:?}",
+                                    idx, real_start, end, e
+                                );
+                            }
+                        }
                     }
                 });
             }
