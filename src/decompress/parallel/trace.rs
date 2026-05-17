@@ -92,6 +92,26 @@ pub fn worker_label(idx: usize) -> String {
     format!("worker-{idx}")
 }
 
+/// Minimal JSON string escape — only what we emit (escape `"`, `\`, and
+/// control bytes by collapsing them). Sufficient for `format!("{e:?}")`
+/// output of Rust error types which can include embedded quotes from
+/// the Debug derivation.
+pub fn esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str(r#"\""#),
+            '\\' => out.push_str(r"\\"),
+            '\n' => out.push_str(r"\n"),
+            '\r' => out.push_str(r"\r"),
+            '\t' => out.push_str(r"\t"),
+            c if (c as u32) < 0x20 => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Helper for the common "thread = boundary-N" pattern.
 pub fn boundary_label(idx: usize) -> String {
     format!("boundary-{idx}")

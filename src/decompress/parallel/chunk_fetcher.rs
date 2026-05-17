@@ -45,8 +45,6 @@ use crate::decompress::parallel::apply_window::apply_window;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::block_finder::BlockFinder;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-use crate::decompress::parallel::fast_marker_inflate::validate_boundary;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::gzip_chunk::finish_decode_chunk_with_inexact_offset;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -64,19 +62,11 @@ impl From<ChunkDecodeError> for FetchError {
     }
 }
 
-/// How far past a partition seed we'll search for a real deflate block
-/// boundary before giving up on that partition. 8 MiB matches the v0.6
-/// `find_real_boundary_for_fetcher` fallback radius — large enough for
-/// gzip -9's worst-case sparse-boundary regions, small enough to bound
-/// per-worker setup cost.
+/// How far past a partition seed we'll search for a deflate block
+/// boundary candidate. Rapidgzip uses 512 KiB
+/// (vendor/rapidgzip/.../chunkdecoding/GzipChunk.hpp tryToDecode scan).
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-const BOUNDARY_SEARCH_RADIUS_BYTES: usize = 8 * 1024 * 1024;
-
-/// Per-partition validation: how many bytes the marker decoder must
-/// successfully decode from a candidate boundary before we trust it.
-/// 32 KiB matches v0.6's `decode_chunk_for_fetcher` setting.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-const BOUNDARY_VALIDATE_MIN_BYTES: usize = 32 * 1024;
+const BOUNDARY_SEARCH_RADIUS_BYTES: usize = 512 * 1024;
 
 type ChunkSlot = Mutex<Option<Result<ChunkData, ChunkDecodeError>>>;
 
@@ -131,42 +121,22 @@ impl<'a> GzipChunkFetcher<'a> {
         self.next_consumer_index < self.partition_offsets.len()
     }
 
-    /// Find the first valid deflate block boundary at-or-past `from_bit`.
-    /// Returns the bit offset, or None if no valid boundary is found
-    /// within `BOUNDARY_SEARCH_RADIUS_BYTES`.
-    ///
-    /// Validation = the one-block marker-decoder check; the full chunk
-    /// decode happens separately so this stays cheap during the
-    /// pre-decode boundary-discovery pass.
-    fn find_first_valid_boundary(input: &[u8], from_bit: usize) -> Option<usize> {
+    /// Find the first BlockFinder candidate at-or-past `from_bit`.
+    /// Does NOT validate via trial decode — the chunk decoder itself is
+    /// the authoritative test (matches rapidgzip's `tryToDecode` pattern
+    /// at vendor/rapidgzip/.../GzipChunk.hpp L712-734 which catches
+    /// decode exceptions and advances). Validation-by-trial-decode in
+    /// the old `validate_boundary` was costing ~50s of CPU
+    /// (1.3s median per partition × 16 cores) and excluded BTYPE=01
+    /// boundaries unnecessarily.
+    fn find_first_boundary_candidate(input: &[u8], from_bit: usize) -> Option<usize> {
         if from_bit == 0 {
             return Some(0);
         }
         let finder = BlockFinder::new(input);
-        let mut cursor = from_bit;
         let absolute_limit = input.len() * 8;
-        let window_bits = BOUNDARY_SEARCH_RADIUS_BYTES * 8;
-        while cursor < absolute_limit {
-            let window_end = (cursor + window_bits).min(absolute_limit);
-            for candidate in finder.find_blocks(cursor, window_end) {
-                if candidate.bit_offset < cursor {
-                    continue;
-                }
-                if validate_boundary(
-                    input,
-                    candidate.bit_offset,
-                    1,
-                    BOUNDARY_VALIDATE_MIN_BYTES,
-                    false,
-                )
-                .is_ok()
-                {
-                    return Some(candidate.bit_offset);
-                }
-            }
-            cursor = window_end;
-        }
-        None
+        let scan_end = (from_bit + BOUNDARY_SEARCH_RADIUS_BYTES * 8).min(absolute_limit);
+        finder.find_first_candidate(from_bit, scan_end - from_bit)
     }
 
     fn dispatch_all_blocking(&mut self) {
@@ -205,7 +175,7 @@ impl<'a> GzipChunkFetcher<'a> {
                         let boundary = if seed >= total_bits {
                             None
                         } else {
-                            Self::find_first_valid_boundary(input, seed)
+                            Self::find_first_boundary_candidate(input, seed)
                         };
                         let dur_us = t0.elapsed().as_micros();
                         trace::emit(
@@ -306,8 +276,8 @@ impl<'a> GzipChunkFetcher<'a> {
                             &label,
                             "speculative_err",
                             &format!(
-                                r#""partition_idx":{idx},"start_bit":{start},"until_bit":{until},"err":"{:?}","duration_us":{dur_us}"#,
-                                e
+                                r#""partition_idx":{idx},"start_bit":{start},"until_bit":{until},"err":"{}","duration_us":{dur_us}"#,
+                                trace::esc(&format!("{e:?}"))
                             ),
                         ),
                     }
@@ -359,8 +329,8 @@ impl<'a> GzipChunkFetcher<'a> {
                 "consumer",
                 "redispatch_err",
                 &format!(
-                    r#""partition_idx":{idx},"expected_start":{expected_start},"err":"{:?}","duration_us":{dur_us}"#,
-                    e
+                    r#""partition_idx":{idx},"expected_start":{expected_start},"err":"{}","duration_us":{dur_us}"#,
+                    trace::esc(&format!("{e:?}"))
                 ),
             ),
         }
