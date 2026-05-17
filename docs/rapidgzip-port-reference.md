@@ -71,6 +71,39 @@ Silesia gzip -9 (162 MB → 503 MB, T=16, neurotic homelab x86_64):
 | `75f5f52` | 716 | 0.40× | + skip-direct, always iterate via find_blocks; hit 90% |
 | `185d572` | 721 | 0.39× | (post HuffmanCodingISAL FFI infra) revert wiring; perf restored |
 | `a22e305` | 700 | 0.38× | (cleanDataCount handoff tried + reverted — needs decoder amortization) |
+| `7919d8a` | 708 | 0.38× | + remove BTYPE filter at handoff (matches rapidgzip literally) |
+| `432e883` | 708 | 0.38× | (cap bootstrap output tried + reverted — wasted speculative work) |
+
+## Why the 2.5× gap persists
+
+This branch has ALL the literal-port pieces of rapidgzip's discrete
+algorithms (block finder, candidate iteration, consumer pattern, LUT
+generator, BitReader). What's missing is the **integrated marker
+decoder + ISA-L handoff loop**.
+
+The hard chunks (9/38 on Silesia gzip -9) decode 12 MB output via
+pure-Rust marker decoder because trailing-clean never accumulates
+(marker propagation through back-refs). Rapidgzip handles these by
+handing off at `cleanDataCount >= MAX_WINDOW_SIZE` (total clean,
+not trailing), then having `getLastWindow({})` throw if the window
+has markers, then having `tryToDecode` catch and try the next
+BlockFinder candidate.
+
+For our architecture, the recovery-on-throw path triggers a
+speculation-miss cascade: the consumer falls back to authoritative
+re-dispatch (serial chain), which is slower than running the full
+bootstrap in parallel. The fix needs ALL THREE TOGETHER:
+
+1. `IsalLitLenCode` decoder (ported; needs per-chunk amortization).
+2. `cleanDataCount` handoff (ported; reverted because of cascade).
+3. Recovery path that DOESN'T cascade speculation misses
+   (e.g., return marker-only chunk on marker-tail rather than error,
+   accepting some bootstrap work that doesn't hand off but doesn't
+   force serial auth chain).
+
+Atomically landing these three is the remaining work. Each was
+attempted in isolation this session and reverted (commits ff56db2,
+d08239c, df48369) because each in isolation regresses perf.
 
 ## Infrastructure landed for next iteration (commits 6b9d754, 1d19f21)
 
