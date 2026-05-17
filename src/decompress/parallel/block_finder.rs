@@ -34,7 +34,12 @@ const PRECODE_ALPHABET: [usize; 19] = [
 const END_OF_BLOCK_SYMBOL: usize = 256;
 
 /// LUT size in bits (use 13 bits to keep compile time reasonable)
-const LUT_BITS: usize = 13;
+// Matches rapidgzip's OPTIMAL_NEXT_DEFLATE_LUT_SIZE = 15
+// (vendor/rapidgzip/.../blockfinder/DynamicHuffman.hpp:145). With 15 bits
+// the LUT can fully verify bfinal(1)+btype(2)+hlit(5)+hdist(5) = 13 bits,
+// dramatically reducing false-positive candidates compared to the 13-bit
+// LUT (which can only partially verify hlit/hdist).
+const LUT_BITS: usize = 15;
 const LUT_SIZE: usize = 1 << LUT_BITS;
 
 // ============================================================================
