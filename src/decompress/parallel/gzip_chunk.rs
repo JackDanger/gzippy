@@ -165,97 +165,148 @@ pub fn finish_decode_chunk_with_inexact_offset(
     }
 
     // Phase 2 — ISA-L bulk decode from the bootstrap's block boundary
-    // with the clean 32 KiB tail as dict. Direct port of
-    // rapidgzip's `finishDecodeChunkWithInexactOffset`
-    // (vendor/rapidgzip/.../GzipChunk.hpp:280-410). Key invariants:
-    //   - set_window (dict) → set_stopping_points → loop. Both
-    //     configuration calls happen BEFORE the first read_stream.
-    //     Without the stop request, ISA-L's `points_to_stop_at` is
-    //     zero and `stopped_at` is never written; the loop's break
-    //     conditions can't see boundaries.
-    //   - Per-iter buffer is 128 KiB (rapidgzip ALLOCATION_CHUNK_SIZE).
-    //     A small buffer causes ISA-L to return via OUT_OVERFLOW
-    //     before any stop fires.
-    //   - Chunk-end is decided by inspecting `stopped_at` after each
-    //     read_stream return.
-    let mut wrapper = IsalInflateWrapper::new(input, bootstrap.end_bit_offset)?;
-    wrapper.set_window(&clean_window)?;
-    wrapper.set_stopping_points(
-        StoppingPoints::END_OF_BLOCK
-            | StoppingPoints::END_OF_BLOCK_HEADER
-            | StoppingPoints::END_OF_STREAM_HEADER,
-    );
+    // with the clean 32 KiB tail as dict. Direct port of the working
+    // v0.6 pattern (backends/isal_decompress.rs::
+    // decompress_deflate_from_bit_with_boundaries), which is proven to
+    // fire ISA-L END_OF_BLOCK stops correctly. Uses raw isal-sys bindings
+    // rather than IsalInflateWrapper to keep the exact known-good shape:
+    // points_to_stop_at set BEFORE set_dict, one isal_inflate call per
+    // iteration against a pre-allocated buffer big enough that
+    // OUT_OVERFLOW won't preempt the stop check.
+    use isal::isal_sys::igzip_lib as isal_raw;
 
+    let bit_offset = bootstrap.end_bit_offset;
+    let byte_idx = bit_offset / 8;
+    let bit_skip = bit_offset % 8;
+    if byte_idx >= input.len() {
+        return Err(ChunkDecodeError::InflateFailed(
+            crate::decompress::parallel::inflate_wrapper::InflateError::StartBitPastEnd,
+        ));
+    }
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::ISAL_DEFLATE;
+    // points_to_stop_at BEFORE set_dict matches v0.6's working order.
+    state.points_to_stop_at = isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK;
+
+    if bit_skip > 0 {
+        state.read_in = (input[byte_idx] as u64) >> bit_skip;
+        state.read_in_length = (8 - bit_skip) as i32;
+        state.next_in = unsafe { input.as_ptr().add(byte_idx + 1) as *mut u8 };
+        state.avail_in = (input.len() - byte_idx - 1) as u32;
+    } else {
+        state.next_in = unsafe { input.as_ptr().add(byte_idx) as *mut u8 };
+        state.avail_in = (input.len() - byte_idx) as u32;
+    }
+
+    let ret_dict = unsafe {
+        isal_raw::isal_inflate_set_dict(
+            &mut state,
+            clean_window.as_ptr() as *mut u8,
+            clean_window.len() as u32,
+        )
+    };
+    if ret_dict != 0 {
+        return Err(ChunkDecodeError::InflateFailed(
+            crate::decompress::parallel::inflate_wrapper::InflateError::SetDictFailed,
+        ));
+    }
+
+    // Single pre-allocated buffer, capped at max_decoded_chunk_size so
+    // a runaway chunk can't OOM. v0.6 uses up to 3 GiB; we use the
+    // configured cap (80 MiB at 4 MiB split * 20 multiplier).
+    let cap = configuration.max_decoded_chunk_size;
+    let mut output: Vec<u8> = Vec::with_capacity(cap);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(cap)
+    };
+    let mut out_pos: usize = 0;
     let debug_isal = std::env::var("GZIPPY_DEBUG_ISAL").is_ok();
     let mut iter = 0usize;
     let mut stops_eob = 0usize;
-    let mut stops_eobh = 0usize;
-    let mut stopping_point_reached = false;
-    let mut last_end_bit = bootstrap.end_bit_offset;
-    while !stopping_point_reached {
-        let mut buf = vec![0u8; ALLOCATION_CHUNK_SIZE];
-        let r = wrapper.read_stream(&mut buf)?;
-        iter += 1;
-        if r.bytes_written > 0 {
-            chunk.append_clean(&buf[..r.bytes_written]);
-        }
-        last_end_bit = r.bit_position;
 
-        if r.finished {
+    loop {
+        let remaining = cap - out_pos;
+        if remaining == 0 {
+            chunk.stopped_preemptively = true;
             break;
         }
+        state.avail_out = remaining as u32;
+        state.next_out = unsafe { output.as_mut_ptr().add(out_pos) };
 
-        // Stop dispatch — direct port of GzipChunk.hpp:328-373.
-        match r.stopped_at {
-            sp if sp == StoppingPoints::END_OF_STREAM_HEADER => {
-                chunk.append_block_boundary(r.bit_position);
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        let written = remaining - state.avail_out as usize;
+        out_pos += written;
+        iter += 1;
+
+        match ret {
+            0 | 1 => {} // OK or END_INPUT — continue
+            -1 => {
+                return Err(ChunkDecodeError::InflateFailed(
+                    crate::decompress::parallel::inflate_wrapper::InflateError::InvalidBlock,
+                ));
             }
-            sp if sp == StoppingPoints::END_OF_BLOCK => {
-                stops_eob += 1;
-                if !wrapper.is_final_block() {
-                    chunk.append_block_boundary(r.bit_position);
-                }
-                if r.bit_position >= until_bits {
-                    stopping_point_reached = true;
-                }
+            -2 => {
+                return Err(ChunkDecodeError::InflateFailed(
+                    crate::decompress::parallel::inflate_wrapper::InflateError::InvalidSymbol,
+                ));
             }
-            sp if sp == StoppingPoints::END_OF_BLOCK_HEADER => {
-                stops_eobh += 1;
-                let not_final = !wrapper.is_final_block();
-                let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
-                chunk.append_block_boundary(r.bit_position);
-                if r.bit_position >= until_bits && not_final && not_fixed {
-                    stopping_point_reached = true;
-                }
+            -3 => {
+                return Err(ChunkDecodeError::InflateFailed(
+                    crate::decompress::parallel::inflate_wrapper::InflateError::InvalidLookback,
+                ));
             }
-            sp if sp == StoppingPoints::NONE => {
-                if r.bytes_written == 0 {
-                    // No progress and no stop: input exhausted or
-                    // ISA-L can't continue. Done.
-                    stopping_point_reached = true;
-                }
+            other => {
+                return Err(ChunkDecodeError::InflateFailed(
+                    crate::decompress::parallel::inflate_wrapper::InflateError::Internal(other),
+                ));
             }
-            _ => {}
         }
 
-        if chunk.decoded_size() >= configuration.max_decoded_chunk_size {
+        let bit_pos =
+            input.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+
+        if state.stopped_at == isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK {
+            stops_eob += 1;
+            chunk.append_block_boundary(bit_pos);
+            if bit_pos >= until_bits {
+                break;
+            }
+            state.stopped_at = isal_raw::ISAL_STOPPING_POINT_NONE;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            break;
+        }
+        if written == 0 && state.avail_in == 0 && state.stopped_at == 0 {
+            break;
+        }
+        if out_pos >= cap {
             chunk.stopped_preemptively = true;
-            stopping_point_reached = true;
+            break;
         }
     }
+
+    let final_bit_pos =
+        input.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+
+    if out_pos > 0 {
+        chunk.append_clean(&output[..out_pos]);
+    }
+
     if debug_isal {
         eprintln!(
-            "  [isal] done iter={} eob={} eobh={} bit={} decoded={}",
+            "  [isal] done iter={} eob={} bit={} decoded={}",
             iter,
             stops_eob,
-            stops_eobh,
-            last_end_bit,
+            final_bit_pos,
             chunk.decoded_size()
         );
     }
 
     chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
-    chunk.finalize(last_end_bit);
+    chunk.finalize(final_bit_pos);
     Ok(chunk)
 }
 
