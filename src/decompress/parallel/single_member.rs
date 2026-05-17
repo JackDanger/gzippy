@@ -1,8 +1,10 @@
 //! Parallel single-member gzip decompression — rapidgzip-shaped port.
 //!
-//! Production path on x86_64 + ISA-L when num_threads > 1 and the
-//! compressed stream exceeds 10 MiB. Routing lives in
-//! [`crate::decompress::decompress_single_member`].
+//! Production path on x86_64 + ISA-L when the classifier returns
+//! [`crate::decompress::DecodePath::IsalParallelSM`] (num_threads > 1
+//! and compressed size > `MIN_PARALLEL_COMPRESSED`). Routing lives in
+//! [`crate::decompress::classify_gzip`]; this module never makes its
+//! own routing decisions — every error variant is terminal.
 //!
 //! This module is a thin driver. It parses the gzip header and trailer,
 //! delegates to [`crate::decompress::parallel::chunk_fetcher::drive`]
@@ -16,9 +18,10 @@
 //!
 //! Streaming-write trade-off: bytes flow to the writer as each chunk
 //! resolves, so a CRC/ISIZE mismatch at the end leaves partial output
-//! behind. The routing layer treats CRC failures as terminal (corruption,
-//! not dispatch failure); legitimate dispatch failures are mapped to
-//! [`ParallelError::TooSmall`] before any bytes are written.
+//! behind. The routing layer treats CRC failures as terminal corruption.
+//! There is **no fallback**: if `decompress_parallel` returns Err the
+//! caller surfaces it; the silent libdeflate retry that used to follow
+//! has been removed.
 
 #![allow(dead_code)]
 
@@ -72,12 +75,16 @@ pub fn decompress_parallel<W: Write>(
     let header_size = skip_gzip_header(gzip_data).map_err(|_| ParallelError::InvalidHeader)?;
     let trailer_size = 8;
     if gzip_data.len() < header_size + trailer_size {
-        return Err(ParallelError::TooSmall);
+        return Err(ParallelError::InvalidGzipFormat);
     }
     let deflate_data = &gzip_data[header_size..gzip_data.len() - trailer_size];
 
+    // The classifier (`crate::decompress::classify_gzip`) is the only
+    // gate on parallel-eligibility. If we got here on input below the
+    // working minimum it's a routing bug, not a fallback opportunity —
+    // surface it as a hard error. There is no silent retry.
     if deflate_data.len() < MIN_PARALLEL_SIZE || num_threads < MIN_THREADS_FOR_PARALLEL {
-        return Err(ParallelError::TooSmall);
+        return Err(ParallelError::InvalidGzipFormat);
     }
 
     // Trailer: gzip stores CRC32 then ISIZE (little-endian) in the last
@@ -141,19 +148,38 @@ pub fn decompress_parallel<W: Write>(
     #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
     {
         let _ = (deflate_data, writer, expected_crc, expected_size, t0);
-        Err(ParallelError::TooSmall)
+        Err(ParallelError::UnsupportedPlatform)
     }
 }
 
 // ── Error type ───────────────────────────────────────────────────────────────
 
+/// Every variant is terminal — the classifier filters
+/// parallel-eligibility upstream, so reaching this module with bad
+/// inputs is a routing bug surfaced as a hard error rather than a
+/// silent fallback opportunity.
 #[derive(Debug)]
 pub enum ParallelError {
+    /// Bytes don't start with a valid gzip header (FHCRC/FNAME/etc.
+    /// fields malformed or truncated).
     InvalidHeader,
-    TooSmall,
+    /// Header parses but the byte range available to the worker pool
+    /// is too short for the parallel pipeline's invariants (e.g. the
+    /// classifier sent a stream below `MIN_PARALLEL_SIZE`). Treat as
+    /// a routing bug — the dispatcher must have classified this as
+    /// `IsalSingle`, not `IsalParallelSM`.
+    InvalidGzipFormat,
+    /// One or more chunk decodes failed inside the worker pool.
     DecodeFailed,
+    /// Output size doesn't match the gzip ISIZE trailer — corruption.
     SizeMismatch,
+    /// CRC32 doesn't match the gzip CRC trailer — corruption.
     CrcMismatch,
+    /// Build doesn't support the parallel pipeline on this platform
+    /// (no x86_64 + ISA-L). The classifier never routes here on
+    /// unsupported builds; this exists only as the cfg-stubbed body's
+    /// guaranteed error path.
+    UnsupportedPlatform,
     Io(io::Error),
 }
 
@@ -163,20 +189,19 @@ impl From<io::Error> for ParallelError {
     }
 }
 
-impl ParallelError {
-    pub fn is_routing(&self) -> bool {
-        matches!(self, ParallelError::TooSmall)
-    }
-}
-
 impl std::fmt::Display for ParallelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ParallelError::InvalidHeader => write!(f, "invalid gzip header"),
-            ParallelError::TooSmall => write!(f, "file too small for parallel decode"),
+            ParallelError::InvalidGzipFormat => {
+                write!(f, "input below parallel SM minimum (routing bug)")
+            }
             ParallelError::DecodeFailed => write!(f, "chunk decode failed"),
             ParallelError::SizeMismatch => write!(f, "output size mismatch"),
             ParallelError::CrcMismatch => write!(f, "CRC32 mismatch"),
+            ParallelError::UnsupportedPlatform => {
+                write!(f, "parallel SM unsupported on this build")
+            }
             ParallelError::Io(e) => write!(f, "I/O error: {}", e),
         }
     }
@@ -189,26 +214,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn small_input_returns_too_small() {
+    fn small_input_returns_hard_error() {
         let small = [0u8; 100];
         let mut out = Vec::new();
         let err = decompress_parallel(&small, &mut out, 4).unwrap_err();
+        // Either InvalidHeader (no gzip magic) or InvalidGzipFormat
+        // (too short for a deflate body). Both are terminal —
+        // `TooSmall` is gone.
         assert!(matches!(
             err,
-            ParallelError::TooSmall | ParallelError::InvalidHeader
+            ParallelError::InvalidGzipFormat | ParallelError::InvalidHeader
         ));
     }
 
     #[test]
-    fn single_thread_returns_too_small() {
-        // Construct a minimal-but-valid gzip stream of "hello world" so the
-        // header check succeeds.
+    fn single_thread_returns_hard_error() {
+        // Construct a valid 5 MiB gzip and pass num_threads=1. The
+        // classifier would never send this here in production (it'd
+        // pick IsalSingle), but a direct caller does; we surface a
+        // hard error rather than silently routing past.
         use std::io::Write as _;
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
         enc.write_all(&vec![0u8; 5_000_000]).unwrap();
         let gz = enc.finish().unwrap();
         let mut out = Vec::new();
         let err = decompress_parallel(&gz, &mut out, 1).unwrap_err();
-        assert!(matches!(err, ParallelError::TooSmall));
+        assert!(matches!(err, ParallelError::InvalidGzipFormat));
     }
 }

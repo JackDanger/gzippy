@@ -657,12 +657,16 @@ mod tests {
         use crate::decompress::{classify_gzip, DecodePath};
         let oracle = FileOracle::new(512 * 1024);
         let path = classify_gzip(&oracle.single_member_gz, 4);
-        // Single-member must route to one of the three single-member paths.
-        // The exact path depends on whether ISA-L is available on this machine.
+        // Single-member must route to one of the four single-member paths.
+        // The exact path depends on whether ISA-L is available on this machine
+        // and whether the input clears the parallel-SM size gate.
         assert!(
             matches!(
                 path,
-                DecodePath::IsalSingle | DecodePath::StreamingSingle | DecodePath::LibdeflateSingle
+                DecodePath::IsalParallelSM
+                    | DecodePath::IsalSingle
+                    | DecodePath::StreamingSingle
+                    | DecodePath::LibdeflateSingle
             ),
             "single-member should classify as a single-member path, got {:?}",
             path

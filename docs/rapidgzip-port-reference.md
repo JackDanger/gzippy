@@ -1,23 +1,63 @@
-# rapidgzip → gzippy parallel single-member: structural gap analysis
+# rapidgzip → gzippy parallel single-member: structural reference
 
-This document is the structural reference for the rapidgzip → gzippy port of
-the parallel single-member decoder. Performance is intentionally ignored.
-The goal of this file is: **for every component on either side, identify its
-counterpart and characterize what differs structurally.**
+> **Status at the head of branch `feat/cross-chunk-retry`.** Reset of the
+> previous reference; the prior "Step 1..16 closure plan" is gone — most
+> of those steps landed as *port files* but were never wired into the
+> production decode path. This doc reflects what is actually executed
+> today (the marker pipeline plus an ad-hoc fetcher) versus what sits
+> next to it as reference code (the new rapidgzip-shaped ports).
 
-All citations are `file:line` against:
+Citations are `file:line` against:
 
-- gzippy: `src/decompress/parallel/*.rs` on branch `feat/cross-chunk-retry`.
+- gzippy: `src/decompress/parallel/*.rs`, `src/decompress/mod.rs`,
+  `src/tests/routing.rs`, `src/backends/{libdeflate,isal_decompress}.rs`
 - rapidgzip: `vendor/rapidgzip/librapidarchive/src/rapidgzip/*.hpp` and
-  `vendor/rapidgzip/librapidarchive/src/core/*.hpp`.
+  `vendor/rapidgzip/librapidarchive/src/core/*.hpp`
 
-Status legend used in the component map:
+Status legend:
 
-- **Faithful**: semantics + control flow match modulo language idioms; can
-  be re-derived from rapidgzip by translating Rust back to C++.
-- **Deviated**: deliberate semantic difference (documented per item below).
-- **Missing**: rapidgzip has it; gzippy does not.
-- **Extra**: gzippy has it; rapidgzip does not.
+- **Faithful** — semantics + control flow match modulo language idioms.
+- **Deviated** — deliberate semantic difference (documented per item).
+- **Missing** — rapidgzip has it; gzippy does not.
+- **Extra** — gzippy has it; rapidgzip does not.
+- **Unused** — gzippy has a faithful (or close) port file, but no
+  production code path calls it. Tests do.
+
+---
+
+## 0. TL;DR — what runs in production today
+
+`src/decompress/mod.rs:207-260` — `decompress_single_member` routes to
+the parallel path only when **all** of:
+
+1. `crate::backends::isal_decompress::is_available()` is true (x86_64
+   + `isal-compression` feature)
+2. `num_threads > 1`
+3. `data.len() > 10 MiB`
+
+When that gate passes, control enters
+`src/decompress/parallel/single_member.rs::decompress_parallel`
+which calls `chunk_fetcher::drive`
+(`src/decompress/parallel/chunk_fetcher.rs:114-177`). `drive` spawns a
+mpsc-based worker pool, statically partitions the input by
+`TARGET_COMPRESSED_CHUNK_BYTES` (4 MiB), and runs `worker_loop` +
+`consumer_loop`. Workers either take the FAST PATH
+(`decode_chunk_with_window` — ISA-L with a known dict) or the SLOW PATH
+(`decode_or_iterate` → `finish_decode_chunk_with_inexact_offset`, which
+delegates the actual decode to
+`fast_marker_inflate.rs::decode_chunk_bootstrap` — our **non-rapidgzip**
+marker decoder).
+
+Everything else under `src/decompress/parallel/` — `block_fetcher.rs`,
+`block_map.rs`, `cache.rs`, `prefetcher.rs`, `statistics.rs`,
+`compressed_vector.rs`, `deflate_block.rs`, `gzip_format.rs` (except
+its `read_header` thin call) — is **unused by the production path**.
+They are reference ports next to the live code.
+
+The libdeflate fallback at `src/decompress/mod.rs:240-259` fires
+silently when (i) the parallel gate doesn't trigger, or (ii) the
+parallel path returns `ParallelError::TooSmall`. This is the violation
+of the no-fallback invariant. See §F.
 
 ---
 
@@ -25,79 +65,81 @@ Status legend used in the component map:
 
 | rapidgzip file / class | Rust counterpart | Status |
 |------------------------|------------------|--------|
-| `chunkdecoding/GzipChunk.hpp` — `GzipChunk<T>::decodeChunk` (entry, L661–L852) | `parallel/gzip_chunk.rs` + `parallel/chunk_fetcher.rs::decode_or_iterate` | Deviated |
-| `GzipChunk::decodeChunkWithInflateWrapper` (L190–L268) | `gzip_chunk.rs::decode_chunk_with_inflate_wrapper` (L182–L219) | Faithful (subset) |
-| `GzipChunk::decodeChunkWithRapidgzip` (L413–L657) | (no full counterpart) — partial behavior in `fast_marker_inflate::decode_chunk_bootstrap` + `gzip_chunk::finish_decode_chunk_with_inexact_offset` | Deviated |
-| `GzipChunk::finishDecodeChunkWithInexactOffset` (L280–L410) | `gzip_chunk.rs::finish_decode_chunk_with_inexact_offset` (L234–L462) + `decode_chunk_with_window` (L86–L165) | Deviated |
-| `GzipChunk::tryToDecode` lambda (L712–L734) | `chunk_fetcher.rs::decode_or_iterate` (L187–L244) | Deviated |
-| `GzipChunk::appendDeflateBlockBoundary` (L161–L183) | `chunk_data.rs::ChunkData::append_block_boundary` (L264–L285) | Deviated (no split gating) |
-| `GzipChunk::startNewSubchunk` (L46–L58) | `chunk_data.rs::ChunkData::new` first-subchunk init (L135–L156) | Faithful |
-| `GzipChunk::finalizeChunk` (L135–L159) | `chunk_data.rs::ChunkData::finalize` (L293–L301) | Deviated (no subchunk merge, no window finalization) |
-| `GzipChunk::finalizeWindowForLastSubchunk` (L99–L133) | (none) | Missing |
-| `GzipChunk::determineUsedWindowSymbolsForLastSubchunk` (L60–L97) | (none) | Missing |
-| `GzipChunkFetcher.hpp` — `GzipChunkFetcher<T,S>::get` (L206–L225) | `chunk_fetcher.rs::drive` + `consumer_loop` (L114–L671) | Deviated |
-| `GzipChunkFetcher::processNextChunk` (L311–L362) | `chunk_fetcher.rs::consumer_loop` inner per-iteration body | Deviated |
-| `GzipChunkFetcher::decodeBlock` (override, L692–L729) | `chunk_fetcher.rs::worker_loop` (L246–L373) | Deviated |
-| `GzipChunkFetcher::waitForReplacedMarkers` (L478–L518) | `consumer_loop` apply_window block (L596–L612) | Deviated (sync, single chunk) |
-| `GzipChunkFetcher::queueChunkForPostProcessing` (L553–L583) | (inlined into `consumer_loop`) | Deviated |
-| `GzipChunkFetcher::appendSubchunksToIndexes` (L364–L465) | (none) | Missing |
-| `GzipChunkFetcher::Statistics` (L55–L75) | `chunk_data.rs::ChunkStatistics` | Deviated (smaller surface) |
-| `core/BlockFetcher.hpp` — `BlockFetcher<F,D,S>` cache + prefetch (L41–end) | inlined `spec[]` ring + `submit_job` in `chunk_fetcher.rs::consumer_loop` (L422–L668) | Deviated |
-| `BlockFetcher::Statistics` (L53–L155) | (none) | Missing |
-| `core/Cache.hpp`, `core/Prefetcher.hpp`, `core/ThreadPool.hpp` | `std::thread::scope` + `std::sync::mpsc` ad hoc | Deviated |
-| `GzipBlockFinder.hpp` — `GzipBlockFinder` partitioning + `get`/`insert`/`finalize` (L34–end) | (uniform partition by `TARGET_COMPRESSED_CHUNK_BYTES` in `chunk_fetcher.rs::drive` L120–L123) | Deviated (no on-line confirmation) |
-| `blockfinder/DynamicHuffman.hpp` — `seekToNonFinalDynamicDeflateBlock` (L166–L298) | `block_finder.rs::BlockFinder::find_dynamic_blocks` (L686–L795) | Faithful (with deviations) |
-| `blockfinder/DynamicHuffman.hpp` — LUT generator + `nextDeflateCandidate` (L39–L154) | `block_finder.rs::is_deflate_candidate_n` / `next_deflate_candidate` / `generate_deflate_lut` (L62–L123) | Faithful |
-| `blockfinder/precodecheck/CountAllocatedLeaves.hpp` — `checkPrecode` (L95–L213) | `block_finder.rs::validate_precode` (L164–L216) | Deviated (different LUT layout) |
-| `blockfinder/Uncompressed.hpp` — `seekToNonFinalUncompressedDeflateBlock` (L21–L95) | `block_finder.rs::BlockFinder::find_uncompressed_blocks` (L562–L665) | Faithful |
-| `blockfinder/Bgzf.hpp` | (none; gzippy's `gzippy-parallel` "GZ" format handled elsewhere in `decompress/bgzf.rs`) | Missing (in parallel SM) |
-| `huffman/HuffmanCodingISAL.hpp` — lit/len wrapper (L21–L188) | `isal_huffman.rs::IsalLitLenCode` (L80–L226) | Faithful |
-| `huffman/HuffmanCodingDistanceISAL.hpp` — distance wrapper (L20–L124) | `isal_huffman.rs::IsalDistCode` (L243–L336) | Faithful |
-| `huffman/HuffmanCodingDoubleLiteralCached.hpp` — multi-symbol decoder | (none; gated off in rapidgzip anyway when ISA-L is present) | Missing |
-| `huffman/HuffmanCodingReversedBitsCached*.hpp` (precode / fixed Huffman) | `block_finder.rs::build_huffman_table` (L956–L997) | Deviated (only used by block finder, not by decoder hot loop) |
-| `huffman/HuffmanCodingShortBitsCached*.hpp` | (none; not used by gzippy's decoder path) | Missing |
-| `MarkerReplacement.hpp` — `MapMarkers<FULL_WINDOW>` + `replaceMarkerBytes` (L15–L60) | `replace_markers.rs::replace_markers{,_avx2,_neon,_scalar}` (L30–L156) | Deviated (different encoding) |
-| `WindowMap.hpp` — `WindowMap` mutex-protected `std::map`, no condvar (L19–end) | `window_map.rs::WindowMap` (BTreeMap + mutex + **condvar**, no compression) (L23–L96) | Deviated |
-| `ChunkData.hpp` — `ChunkData` (L88–L573) | `chunk_data.rs::ChunkData` (L86–L317) | Deviated (smaller surface; subchunk semantics differ) |
-| `ChunkData::Configuration` (L97–L113) | `chunk_data.rs::ChunkConfiguration` (L55–L79) | Deviated (fields trimmed) |
-| `ChunkData::Subchunk` (L115–L145) | `chunk_data.rs::Subchunk` (L29–L37) | Deviated (no `newlineCount`, `usedWindowSymbols`) |
-| `ChunkData::Statistics` (L147–L180) | `chunk_data.rs::ChunkStatistics` (L43–L50) | Deviated (smaller) |
-| `ChunkData::applyWindow` (L246–L394) | `apply_window.rs::apply_window` (L17–L65) | Deviated (single window only, no per-subchunk windowing, no compression, no sparsity) |
-| `ChunkData::appendDeflateBlockBoundary` (L455–L467) | `chunk_data.rs::ChunkData::append_block_boundary` (L264–L285) | Deviated (always emits subchunk) |
-| `ChunkData::matchesEncodedOffset` (L396–L403) | `chunk_data.rs::ChunkData::matches_encoded_offset` (L163–L165) | Faithful |
-| `ChunkData::setEncodedOffset` (L601–L629) | (none; consumer handles trimming via `decoded_offset_for`) | Missing |
-| `ChunkData::split` (L632–L754) | (none — `append_block_boundary` emits subchunks on-line) | Missing (semantically replaced) |
-| `ChunkData::getWindowAt` / `getLastWindow` (DecodedData L394–L488) | `chunk_data.rs::ChunkData::last_32kib_window` (L173–L207) | Deviated (returns `Option<[u8;32768]>`, no `MapMarkers` integration; throws-via-None instead of exception) |
-| `ChunkData::cleanUnmarkedData` (DecodedData L491–L516) | (none; two-segment layout enforced by `append_markered` vs `append_clean`) | Missing |
-| `ChunkData::appendFooter` / `footers` / `crc32s` vector (L472–L489, L559–L561) | (none — single per-chunk `crc32fast::Hasher`, no `Footer` type) | Missing |
-| `CompressedVector.hpp` | (none — windows stored uncompressed as `Arc<[u8;32768]>`) | Missing |
-| `DecodedData.hpp` — base class with two-vec layout, `Iterator`, `append`, `applyWindow`, `getLastWindow`, `cleanUnmarkedData` | folded into `chunk_data.rs::ChunkData` (no inheritance) | Deviated |
+| `chunkdecoding/GzipChunk.hpp` — `GzipChunk<T>::decodeChunk` (entry, L660–L852) | `parallel/gzip_chunk.rs` + `parallel/chunk_fetcher.rs::decode_or_iterate` (L187-244) | Deviated (used in prod) |
+| `GzipChunk::decodeChunkWithInflateWrapper` (L190-L268) | `gzip_chunk.rs::decode_chunk_with_inflate_wrapper` (L182-219) | Faithful subset; **no production caller** |
+| `GzipChunk::decodeChunkWithRapidgzip` (L413-L657) | (no full counterpart) — partial behavior in `fast_marker_inflate::decode_chunk_bootstrap` + `gzip_chunk::finish_decode_chunk_with_inexact_offset` | Deviated (used in prod via marker bootstrap, not via `deflate::Block`) |
+| `GzipChunk::finishDecodeChunkWithInexactOffset` (L280-L410) | `gzip_chunk.rs::finish_decode_chunk_with_inexact_offset` (L234-462) + `decode_chunk_with_window` (L86-165) | Deviated (used in prod) |
+| `GzipChunk::tryToDecode` lambda (L712-L734) | `chunk_fetcher.rs::decode_or_iterate` (L187-244) | Deviated; direct-try-at-start deleted (B10) |
+| `GzipChunk::appendDeflateBlockBoundary` (L161-L183) | `chunk_data.rs::ChunkData::append_block_boundary` (L264-285) | Deviated (no split-size gating) |
+| `GzipChunk::startNewSubchunk` (L46-L58) | `chunk_data.rs::ChunkData::new` first-subchunk init (L135-156) | Faithful |
+| `GzipChunk::finalizeChunk` (L135-L159) | `chunk_data.rs::ChunkData::finalize` (L293-301) | Deviated (no merge, no window finalization) |
+| `GzipChunk::finalizeWindowForLastSubchunk` (L99-L133) | (none) | Missing |
+| `GzipChunk::determineUsedWindowSymbolsForLastSubchunk` (L60-L97) | (none) | Missing |
+| `GzipChunkFetcher.hpp` — `GzipChunkFetcher<T,S>::get` (L206-L225) | `chunk_fetcher.rs::drive` + `consumer_loop` (L114-698) | Deviated (used in prod) |
+| `GzipChunkFetcher::processNextChunk` (L311-L362) | `chunk_fetcher.rs::consumer_loop` inner per-iteration body (L470-695) | Deviated (used in prod, no BlockFetcher) |
+| `GzipChunkFetcher::decodeBlock` override (L692-L729) | `chunk_fetcher.rs::worker_loop` (L246-373) | Deviated (used in prod) |
+| `GzipChunkFetcher::waitForReplacedMarkers` (L478-L518) | `consumer_loop` synchronous `apply_window` block (L596-639) | Deviated (single-threaded, single chunk) |
+| `GzipChunkFetcher::queueChunkForPostProcessing` (L553-L583) | (inlined synchronously into `consumer_loop`) | Deviated |
+| `GzipChunkFetcher::appendSubchunksToIndexes` (L364-L465) | `block_map::append_subchunks_to_block_map` (L205-213) | **Unused** in prod; only test calls it |
+| `GzipChunkFetcher::Statistics` (L55-L75) | `statistics::FetcherStatistics` (L131-300+) | **Unused** in prod |
+| `core/BlockFetcher.hpp` — `BlockFetcher<F,D,S>` (L41-end) | `parallel/block_fetcher.rs::BlockFetcher` (L35-235) | **Unused** in prod (drive() uses ad-hoc mpsc + spec[] ring instead, L422-668) |
+| `BlockFetcher::Statistics` (L53-L155) | `statistics::ChunkFetcherStatistics` (composed from cache stats + FetcherStatistics) | **Unused** in prod |
+| `core/Cache.hpp` — `Cache<K,V,Strategy>` | `parallel/cache.rs::Cache` + `LeastRecentlyUsed` (L39-219) | **Unused** in prod |
+| `core/Prefetcher.hpp` — `FetchingStrategy`/`FetchNextFixed`/`FetchNextAdaptive` | `parallel/prefetcher.rs::FetchingStrategy` + `FetchNextFixed`/`FetchNextAdaptive` (L1-282) | **Unused** in prod |
+| `core/ThreadPool.hpp` | `std::thread::scope` + `std::sync::mpsc` in `chunk_fetcher.rs` | Deviated (no `ThreadPool` abstraction) |
+| `GzipBlockFinder.hpp` — partitioning + `get`/`insert`/`finalize` (L34-end) | (uniform static partition in `chunk_fetcher.rs::drive` L120-123) | Deviated (no GzipBlockFinder class at all) |
+| `blockfinder/DynamicHuffman.hpp` — `seekToNonFinalDynamicDeflateBlock` (L166-298) | `block_finder.rs::BlockFinder::find_dynamic_blocks` (L686-795) | Faithful (with deviations B7) |
+| `blockfinder/DynamicHuffman.hpp` — LUT generator + `nextDeflateCandidate` (L39-154) | `block_finder.rs::is_deflate_candidate_n` / `next_deflate_candidate` / `generate_deflate_lut` (L62-123) | Faithful |
+| `blockfinder/precodecheck/CountAllocatedLeaves.hpp` — `checkPrecode` (L95-213) | `block_finder.rs::validate_precode` (L164-216) | Deviated (different LUT layout) |
+| `blockfinder/Uncompressed.hpp` — `seekToNonFinalUncompressedDeflateBlock` (L21-95) | `block_finder.rs::BlockFinder::find_uncompressed_blocks` (L562-665) | Faithful |
+| `blockfinder/Bgzf.hpp` | (handled outside the parallel SM module in `decompress/bgzf.rs`) | Out of scope here |
+| `huffman/HuffmanCodingISAL.hpp` — lit/len wrapper (L21-188) | `isal_huffman.rs::IsalLitLenCode` (L80-226) | Faithful |
+| `huffman/HuffmanCodingDistanceISAL.hpp` — distance wrapper (L20-124) | `isal_huffman.rs::IsalDistCode` (L243-336) | Faithful |
+| `huffman/HuffmanCodingDoubleLiteralCached.hpp` | (none) | Missing |
+| `huffman/HuffmanCodingReversedBitsCached*.hpp` | `block_finder.rs::build_huffman_table` (L956-997) | Deviated (block-finder only; not in decoder hot loop) |
+| `huffman/HuffmanCodingShortBitsCached*.hpp` | (none) | Missing |
+| `MarkerReplacement.hpp` — `MapMarkers<FULL_WINDOW>` (L15-60) | `replace_markers.rs::replace_markers{,_avx2,_neon,_scalar}` (L30-156) | Deviated (different encoding — B1) |
+| `WindowMap.hpp` (L19-end) | `window_map.rs::WindowMap` (L23-96) | Deviated (BTreeMap+Condvar, no compression) |
+| `ChunkData.hpp` — `ChunkData` (L88-573) | `chunk_data.rs::ChunkData` (L86-317) | Deviated (smaller surface) |
+| `ChunkData::Configuration` (L97-113) | `chunk_data.rs::ChunkConfiguration` (L55-79) | Deviated (fewer fields) |
+| `ChunkData::Subchunk` (L115-145) | `chunk_data.rs::Subchunk` (L29-37) | Deviated (no `newlineCount`, `usedWindowSymbols`) |
+| `ChunkData::Statistics` (L147-180) | `chunk_data.rs::ChunkStatistics` (L43-50) | Deviated (smaller) |
+| `ChunkData::applyWindow` (L246-394) | `apply_window.rs::apply_window` (L17-65) | Deviated (no per-subchunk windowing, no compression) |
+| `ChunkData::appendDeflateBlockBoundary` (L455-467) | `chunk_data.rs::append_block_boundary` (L264-285) | Deviated |
+| `ChunkData::matchesEncodedOffset` (L396-403) | `chunk_data.rs::matches_encoded_offset` (L163-165) | Faithful |
+| `ChunkData::setEncodedOffset` (L601-629) | `chunk_data.rs::set_encoded_offset` (used by consumer `consumer_loop` L527) | Faithful (recent landing) |
+| `ChunkData::split` (L632-754) | (none — `append_block_boundary` emits subchunks inline) | Missing semantically |
+| `ChunkData::getWindowAt` / `getLastWindow` (DecodedData L394-488) | `chunk_data.rs::last_32kib_window` (L173-207) | Deviated (returns `Option`, no MapMarkers) |
+| `ChunkData::cleanUnmarkedData` (DecodedData L491-516) | `chunk_data.rs::clean_unmarked_data` (port landed; **unused** in prod path) | Unused |
+| `ChunkData::appendFooter` / `footers` / `crc32s` (L472-489, L559-561) | `chunk_data.rs::Footer` + `crc32s: Vec<crc32fast::Hasher>` (struct fields landed; **single-stream only** in prod) | Deviated + partially unused |
+| `CompressedVector.hpp` | `parallel/compressed_vector.rs::CompressedVector` (L39-219) | **Unused** in prod (WindowMap holds `Arc<[u8;32768]>`) |
+| `DecodedData.hpp` — base class | folded into `chunk_data.rs::ChunkData` | Deviated |
 | `DecodedDataView.hpp` | (none) | Missing |
-| `gzip/isal.hpp` — `IsalInflateWrapper` (L26–L212) | `inflate_wrapper.rs::IsalInflateWrapper` (L102–L311) | Deviated (no gzip header parsing, no `Footer`, no multi-stream) |
-| `gzip/isal.hpp` — `readGzipFooter`, `readZlibFooter`, `readDeflateFooter`, `readHeader`, `readIsalHeader` (L429–L560) | (none) | Missing |
-| `gzip/isal.hpp` — `inflateWithIsal`, `compressWithIsal` (L587–L689) | other backends in `src/backends/`, not part of parallel SM | (out of scope) |
-| `gzip/deflate.hpp` — `deflate::Block<>` (L513–L2005) | `fast_marker_inflate.rs` (entire file) | Deviated (separate code, not a port; uses ISA-L huffman wrapper for hot loop) |
-| `gzip/deflate.hpp` — `deflate::Block::readHeader` / `readDynamicHuffmanCoding` | `fast_marker_inflate::decode_dynamic` (L869–L998) | Deviated (own implementation) |
-| `gzip/deflate.hpp` — `deflate::Block::read` + `readInternalCompressed` (the hot loop) | `fast_marker_inflate::decode_dynamic_block_full_isal` (L1093+) | Deviated (own loop) |
-| `gzip/deflate.hpp` — `deflate::Block::setInitialWindow` | (none — gzippy hands window to ISA-L via `IsalInflateWrapper::set_window` only) | Missing |
-| `gzip/deflate.hpp` — circular 64 KiB window buffer (`m_window16`, `PreDecodedBuffer`) | (none — `fast_marker_inflate` keeps decoded chunk in a single growing `Vec<u16>`) | Missing/Different |
-| `gzip/deflate.hpp` — `BlockStatistics` (L456–L503) | (none — counters folded into `ChunkStatistics`) | Missing |
-| `gzip/format.hpp` — `determineFileTypeAndOffset` (L17–L58) | `single_member.rs::skip_gzip_header` (L60–L105) | Deviated (gzip only, no zlib / bzip2 / deflate / BGZF detection) |
-| `gzip/definitions.hpp` — `CompressionType`, `StoppingPoint`, `BlockBoundary`, `MAX_WINDOW_SIZE`, etc. | `inflate_wrapper.rs::DeflateCompressionType`, `StoppingPoints`; constants scattered (e.g. `WINDOW_SIZE` in `fast_marker_inflate.rs:59`) | Deviated (names) |
-| `gzip/gzip.hpp` — `readHeader`, `readFooter`, `Footer` | (none in parallel SM; `single_member.rs` reads trailer inline at L127–L141) | Missing |
-| `gzip/GzipReader.hpp` | (none) | Missing (out of scope: parallel SM only) |
-| `gzip/GzipAnalyzer.hpp` | (none) | Missing (out of scope) |
-| `ParallelGzipReader.hpp` | (driver lives in `decompress/mod.rs` + `single_member.rs`; not a port of this class) | Deviated |
-| `IndexFileFormat.hpp` (index export) | (none) | Missing |
+| `gzip/isal.hpp` — `IsalInflateWrapper` (L26-212) | `inflate_wrapper.rs::IsalInflateWrapper` (L102-311) | Deviated (B4) |
+| `gzip/isal.hpp` — `readGzipFooter`/`readZlibFooter`/`readDeflateFooter`/`readHeader`/`readIsalHeader` (L429-560) | `inflate_wrapper.rs::read_footer_at_current` + `reset_for_next_stream` (L243-287) + `gzip_format::read_header` (L47+) | Partially ported; **multi-stream loop not wired** into worker |
+| `gzip/deflate.hpp` — `deflate::Block<>` (L513-2005) | `parallel/deflate_block.rs::Block` (L98-495) | **Unused** in prod (production calls `fast_marker_inflate.rs` for the bootstrap instead) |
+| `gzip/deflate.hpp` — `deflate::Block::readHeader` / `readDynamicHuffmanCoding` (L579, L587) | `deflate_block.rs::read_header` (L224) + `read_dynamic_huffman_coding` (L296) | Faithful; **unused** in prod |
+| `gzip/deflate.hpp` — `deflate::Block::read` + `read_internal_compressed` (L1514-1582) | `deflate_block.rs::read` (L343) + `read_internal_compressed` (L399) | Faithful; **unused** in prod |
+| `gzip/deflate.hpp` — `deflate::Block::setInitialWindow` (L607) | (none — gzippy uses `IsalInflateWrapper::set_window` directly) | Missing |
+| `gzip/deflate.hpp` — circular `m_window16` (2×32 KiB u16 buffer) | (none — `fast_marker_inflate` grows a single `Vec<u16>`) | Missing |
+| `gzip/deflate.hpp` — `BlockStatistics` (L456-503) | (none) | Missing |
+| `gzip/format.hpp` — `determineFileTypeAndOffset` (L17-58) | (none; `gzip_format::read_header` does gzip only) | Missing |
+| `gzip/definitions.hpp` — `CompressionType`, `StoppingPoint`, `BlockBoundary`, `MAX_WINDOW_SIZE` | `inflate_wrapper.rs::DeflateCompressionType`, `StoppingPoints`; constants scattered | Deviated (names) |
+| `gzip/gzip.hpp` — `readHeader`, `readFooter`, `Footer` | `gzip_format.rs::{read_header, read_footer, Header, Footer}` (L23-end) | Faithful (read_header used by `skip_gzip_header`; read_footer **unused**) |
+| `gzip/GzipReader.hpp` | (none) | Out of scope |
+| `gzip/GzipAnalyzer.hpp` | (none) | Out of scope |
+| `ParallelGzipReader.hpp` | (driver fragmented across `decompress/mod.rs` + `single_member.rs`; not a port) | Deviated |
+| `IndexFileFormat.hpp` | (none) | Missing |
 | `chunkdecoding/Bzip2Chunk.hpp` | (none) | Missing (gzippy is gzip-only) |
-| `chunkdecoding/DecompressionError.hpp` — `NoBlockInRange` | `gzip_chunk.rs::ChunkDecodeError` (L51–L56) | Deviated (single enum, no `NoBlockInRange` semantics) |
-| (none in rapidgzip) | `parallel/trace.rs` — JSON-lines structured trace under `GZIPPY_LOG_FILE` | Extra |
-| (none in rapidgzip) | `parallel/fast_marker_inflate.rs::decode_chunk_bootstrap` (bootstrap-handoff mode) | Extra |
-| (none in rapidgzip) | `parallel/fast_marker_inflate.rs::validate_boundary` (start-position probe) | Extra |
-| (none in rapidgzip) | `parallel/replace_markers.rs::{replace_markers_avx2, replace_markers_neon}` | Extra |
-| (none in rapidgzip) | `parallel/block_finder.rs::validate_fixed_block_prefix` (fixed-Huffman prefilter) | Extra |
-| (none in rapidgzip) | `parallel/block_finder.rs::find_blocks_parallel` (multi-threaded block finder) | Extra |
-| (none in rapidgzip) | `parallel/single_member.rs::MARKER_PIPELINE_RUNS` + `MARKER_PIPELINE_TEST_LOCK` (routing telemetry) | Extra |
+| `chunkdecoding/DecompressionError.hpp` — `NoBlockInRange` | `gzip_chunk.rs::ChunkDecodeError` (L51-68) | Deviated |
+| (none in rapidgzip) | `parallel/trace.rs` — JSON-lines structured trace | Extra |
+| (none in rapidgzip) | `fast_marker_inflate.rs` — entire 2356-line marker decoder | **Extra (production)** |
+| (none in rapidgzip) | `fast_marker_inflate::validate_boundary` | Extra |
+| (none in rapidgzip) | `replace_markers_avx2` / `replace_markers_neon` | Extra |
+| (none in rapidgzip) | `block_finder::validate_fixed_block_prefix` | Extra |
+| (none in rapidgzip) | `block_finder::find_blocks_parallel` | Extra |
+| (none in rapidgzip) | `single_member::MARKER_PIPELINE_RUNS` / `MARKER_PIPELINE_TEST_LOCK` | Extra (test infra) |
+| (none in rapidgzip) | `decompress::mod.rs::map_parallel_single_member_error` (L262-287) | Extra (the fallback wire) |
 
 ---
 
@@ -105,1032 +147,985 @@ Status legend used in the component map:
 
 ### B1. Marker encoding (`MapMarkers` vs `replace_markers`)
 
-**rapidgzip** (`MarkerReplacement.hpp:15–46`, `DecodedData.hpp:305–391`)
+**rapidgzip** (`MarkerReplacement.hpp:15-46`, `DecodedData.hpp:305-391`):
+`v <= 0xFF` → literal. `v < MAX_WINDOW_SIZE` (and > 0xFF) → throws.
+`v >= MAX_WINDOW_SIZE` → `window[v - MAX_WINDOW_SIZE]` (index from
+**oldest** byte).
 
-- `MapMarkers<FULL_WINDOW>::operator()(uint16_t)` returns the literal byte when
-  `value <= 0xFF`, **throws** `std::invalid_argument` on `value < MAX_WINDOW_SIZE`
-  (a 2-byte code that lies in the "ambiguous" range), and indexes
-  `m_window[value - MAX_WINDOW_SIZE]` for `value >= MAX_WINDOW_SIZE`.
-- Encoding: index `0` → `window[0]` (i.e. the **oldest** byte of the window).
-- `DecodedData::applyWindow` walks `dataWithMarkers` chunk-by-chunk and either
-  uses an embedded `MapMarkers` (small chunks) or a precomputed `fullWindow`
-  array `[0..256, then window]` for chunks ≥ 128 KiB (fused literal+marker
-  table lookup).
+**gzippy** (`replace_markers.rs:24,49-58`): `MARKER_BASE = 32768`. `v <
+32768` is treated as literal. `v >= 32768` → `window[window.len() - 1 -
+(v - 32768)]` (index from **newest** byte).
 
-**gzippy** (`src/decompress/parallel/replace_markers.rs:7–58`)
+**Impact**: high — incompatible with any rapidgzip code that uses
+`MapMarkers`. Earlier docs claimed Step 1 "flipped encoding to
+MapMarkers" but the file at HEAD still has the newest-byte-indexed
+encoding. Anything ported that depends on `MapMarkers` (e.g. our
+unused `deflate_block::read_internal_compressed` calling
+`emit_backref` — `deflate_block.rs:640-675`) uses a different marker
+convention than `replace_markers.rs`. Two incompatible marker codes
+live in the same crate.
 
-- `MARKER_BASE = 32768`. Values `< MARKER_BASE` are literals
-  (`*val as u8` directly).
-- Values `>= MARKER_BASE` are markers: `offset = val - MARKER_BASE`,
-  `byte = window[window.len() - 1 - offset]` — i.e. index `0` → **newest** byte
-  of the window. **This is the opposite end of the window from rapidgzip.**
-- Out-of-range markers are silently left unresolved (the CRC check catches
-  it at the trailer). Rapidgzip throws and the caller catches.
+### B2. `appendDeflateBlockBoundary` semantics
 
-**Correctness impact**: high. The bootstrap decoder
-(`fast_marker_inflate::emit_match`) and the resolver
-(`replace_markers::replace_markers`) are paired and self-consistent, but the
-encoding is incompatible with rapidgzip's `MapMarkers`. Porting any
-rapidgzip code that depends on `MapMarkers` semantics (e.g. `getWindowAt`
-or `getLastWindow`) cannot be done bit-for-bit without flipping our
-encoding to match rapidgzip first.
+rapidgzip (`ChunkData.hpp:455-467`, `GzipChunk.hpp:161-183`) dedups on
+`(encodedOffset, decodedOffset)` and gates new-subchunk creation on
+`splitChunkSize`. `ChunkData::split` partitions the boundary list after
+the fact.
 
-### B2. `ChunkData::appendDeflateBlockBoundary` semantics
+gzippy (`chunk_data.rs::append_block_boundary` L264-285) dedups on
+encoded_offset only and **always** pushes a new subchunk. No
+`ChunkData::split`. Consumer locates subchunks via `decoded_offset_for`
+at L308-316.
 
-**rapidgzip** (`ChunkData.hpp:455–467`, `GzipChunk.hpp:161–183`):
+**Impact**: behaviourally fine for single-pass write; gzippy keeps more
+subchunks than rapidgzip. Missing rapidgzip's "merge small trailing
+subchunk" semantic.
 
-- `appendDeflateBlockBoundary` is idempotent (dedup on `(encodedOffset,
-  decodedOffset)`).
-- It updates a flat `blockBoundaries` vector; subchunks are **synthesized
-  later** in `ChunkData::split` (`ChunkData.hpp:632–754`) by partitioning
-  the boundary list to evenly cover `decodedSize / spacing`.
-- `GzipChunk::appendDeflateBlockBoundary` adds a wrapper that **also**
-  finalizes the trailing subchunk and starts a new one **only when**
-  `subchunks.back().decodedSize >= configuration.splitChunkSize`.
+### B3. `applyWindow`
 
-**gzippy** (`chunk_data.rs::append_block_boundary`, L264–L285):
+rapidgzip (`ChunkData.hpp:246-394`) flips `dataWithMarkers` into
+`reusedDataBuffers`, walks subchunks computing per-subchunk windows via
+`getWindowAt`, stores them as `SharedWindow` (CompressedVector),
+optionally counts newlines, and updates the first `crc32s` entry.
 
-- Dedups on encoded_offset only.
-- **Always** pushes a new subchunk — no split-size gating. Comment at L259–L263:
-  "Trade-off: per-chunk memory grows by ~50 bytes per block boundary
-  crossed."
-- `ChunkData::split` does not exist; subchunks are emitted on-line and the
-  consumer uses `decoded_offset_for` to find the trim point.
+gzippy (`apply_window.rs:17-65`) calls `replace_markers` in place on
+`data_with_markers` (left as `Vec<u16>` whose values are all `<= 255`
+after the resolve), updates `chunk.crc` by streaming 4 KiB scratch
+chunks. Per-subchunk windows are populated via
+`chunk_data::populate_subchunk_windows` (called from
+`chunk_fetcher.rs:614`) but stored uncompressed.
 
-**Correctness impact**: none (consumer sums correctly). Behavioural impact:
-gzippy keeps many more subchunks; consumer can match at any boundary.
-Porting `split` faithfully would also require porting `setEncodedOffset`
-and the boundary deduplication semantics.
-
-### B3. `ChunkData::applyWindow`
-
-**rapidgzip** (`ChunkData.hpp:246–394`):
-
-- Inherits and calls `DecodedData::applyWindow(window)` which (a) flips
-  `dataWithMarkers` into `reusedDataBuffers` and (b) inserts `VectorView`s
-  into the head of `data`, so the chunk's iteration order is preserved.
-- Then loops over every **subchunk**, computing the *per-subchunk* window
-  via `getWindowAt(window, decodedOffsetInBlock)` and storing it
-  compressed (`SharedWindow`) on `subchunk.window`.
-- Also walks subchunks to count `newlineCount` if `configuration.newlineCharacter`
-  is set.
-- Updates `crc32s.front()` by prepending a fresh `CRC32Calculator` covering
-  the bytes that were resolved out of `dataWithMarkers` (and any bytes
-  cleaned out by `cleanUnmarkedData` in `finalize`).
-
-**gzippy** (`apply_window.rs:17–65`):
-
-- Calls `replace_markers(&mut chunk.data_with_markers, window)` in place,
-  leaving `data_with_markers` as `Vec<u16>` whose values are all `<= 255`
-  (verified by `debug_assert`).
-- Updates `chunk.crc` by computing the CRC of the resolved bytes in 4 KiB
-  scratch chunks (no `Vec<u8>` allocation) and calling
-  `resolved_crc.combine(&chunk.crc)`.
-- Does **not** touch subchunks, does **not** compute per-subchunk windows,
-  does **not** compute newline counts, does **not** convert
-  `data_with_markers` into `data` (consumer reads it as `u16 as u8` later).
-
-**Correctness impact**: none for our single-pass write-and-discard usage.
-Functional gap: any caller that needs per-subchunk windows for indexing
-or random access is unsupported.
+**Impact**: behaviourally fine for our single-pass write. The
+per-subchunk window populate is wired in production (good); the
+compressed-vector storage path is not (CompressedVector is unused).
 
 ### B4. `IsalInflateWrapper::readStream`
 
-**rapidgzip** (`gzip/isal.hpp:253–385`):
+rapidgzip (`gzip/isal.hpp:253-385`) handles `END_OF_STREAM` and
+emits `END_OF_STREAM_HEADER`, returns `pair<size_t,
+optional<Footer>>`, refills its buffer 128 KiB at a time from a
+`BitReader`, and throws on negative ISA-L returns with a hex dump.
 
-- Multi-loop internal iteration; resets `stopped_at` at entry; refills
-  buffer 128 KiB at a time from a `BitReader`; handles gzip footer / next
-  header in-line when stream ends; returns `pair<size_t, optional<Footer>>`.
-- Handles `m_needToReadHeader` flag and emits `END_OF_STREAM_HEADER` stop
-  when configured.
-- Throws on negative ISA-L errors with a verbose message (file offset,
-  bit position, set-window state, hex dump of first 128 bytes).
-
-**gzippy** (`inflate_wrapper.rs:249–311`):
-
-- Multi-loop internal iteration; resets `stopped_at` at entry. **No
-  buffer refill**: assumes the entire input slice is materialized in
-  memory and seen by ISA-L through `state.next_in` / `state.avail_in`
-  set at construction.
-- Returns `ReadStreamResult { bytes_written, stopped_at, bit_position,
-  finished }`. **No `Footer` return**; multi-member handling is out of
-  scope.
-- Negative ISA-L returns become `InflateError::{InvalidBlock, InvalidSymbol,
-  InvalidLookback, Internal(other)}` — no diagnostic context.
-
-**Correctness impact**: none for parallel SM (single member, raw deflate
-only). Functional gap: cannot decode multi-member gzip; cannot resume from
-mid-stream with a BitReader.
+gzippy (`inflate_wrapper.rs:249-310`) assumes the entire slice is in
+memory (no buffer refill), returns `ReadStreamResult { bytes_written,
+stopped_at, bit_position, finished }` with **no Footer**. The
+`read_footer_at_current` (L243-272) and `reset_for_next_stream`
+(L277-287) methods exist (Step 11 landed) but **`worker_loop` does not
+loop on multi-stream input**. Single-stream only in practice.
 
 ### B5. Consumer / fetcher architecture
 
-**rapidgzip** (`GzipChunkFetcher.hpp:311–362` + `core/BlockFetcher.hpp`):
+rapidgzip (`GzipChunkFetcher.hpp:311-362` + `core/BlockFetcher.hpp`):
+`processNextChunk` consults `GzipBlockFinder` for the next offset,
+calls `BlockFetcher::get(partitionOffset, blockIndex)` to pull from
+`Cache`, await a prefetch via `takeFromPrefetchQueue` (L385-410), or
+trigger a fresh `decodeBlock`. `Prefetcher` strategy decides which
+indexes to prefetch. `Cache` is LRU. `ThreadPool` runs the futures.
 
-- `processNextChunk()` is the orchestrator: it asks `GzipBlockFinder` for
-  the next block offset (which may be a known-exact or a partition guess),
-  calls `BlockFetcher::get(partitionOffset, blockIndex)` to either pull
-  from cache, wait on a prefetched future, or trigger a fresh decode.
-- `BlockFetcher` (in `core`) owns: a `Cache` (LRU of completed chunks),
-  a `prefetchCache`, a `Prefetcher` (fetching strategy that predicts
-  the next N block indexes from access pattern), and a `ThreadPool` that
-  runs `decodeBlock(blockOffset, nextBlockOffset)` jobs.
-- A chunk decoded at a guessed partition offset has `matchesEncodedOffset`
-  invariant tested by `processNextChunk`; if the offset is outside the
-  range, the consumer re-`get(blockOffset)` — that's an authoritative
-  decode at the exact offset.
-- Marker post-processing is enqueued via `submitTaskWithHighPriority` so
-  multiple chunks can have their markers resolved in parallel
-  (`waitForReplacedMarkers` + `queuePrefetchedChunkPostProcessing`).
-- After a chunk resolves, `appendSubchunksToIndexes` updates `m_blockMap`
-  (output offset → encoded offset), `m_blockFinder` (insert exact next
-  offset), `m_unsplitBlocks`, and the `WindowMap` (per-subchunk).
-
-**gzippy** (`chunk_fetcher.rs:114–671`):
-
-- `drive()` spawns `pool_size` worker threads sharing a single MPSC
-  receiver wrapped in a `Mutex` (work queue).
-- `consumer_loop()`: maintains `spec[0..n_partitions]: Vec<Option<Receiver>>`,
-  pre-submits `prefetch_count` speculative jobs (default `2 * pool_size`),
-  drains each partition in order. On speculative miss
-  (`matches_encoded_offset` fails OR `decoded_offset_for` is None),
-  re-dispatches an authoritative job at the consumer's `expected_start`
-  and discards the speculative result.
-- `apply_window` is called **synchronously** by the consumer thread for
-  the in-order chunk — no parallel marker post-processing.
-- No `BlockMap`, no `Prefetcher`, no `Cache`, no `ThreadPool` abstraction,
-  no per-subchunk indexing.
-
-**Correctness impact**: none. Functional gap: random-access seeks
-unsupported; only sequential decode works. Multi-chunk parallel
-marker-resolve unsupported.
+gzippy (`chunk_fetcher.rs:114-698`): `drive` spawns a fixed pool of
+workers sharing a single `Mutex<mpsc::Receiver<DecodeJob>>`
+(L129-130). `consumer_loop` keeps a `Vec<Option<Receiver>>` of in-flight
+speculative jobs per partition (L422-423), pre-fills `pool_size * 2`
+speculatives (L463-465), drains in order. On miss, re-dispatches
+authoritative at the predecessor's actual end (L573). **No `BlockMap`,
+no `Prefetcher`, no `Cache`, no `BlockFetcher`** — even though
+faithful ports of all four exist in the same module.
 
 ### B6. Block finder partitioning
 
-**rapidgzip** (`GzipBlockFinder.hpp:34–end`):
-
-- `GzipBlockFinder` is stateful. Constructor calls
-  `determineFileTypeAndOffset` to find the very first block.
-- It hands out **partition offsets** (`spacingInBits * idx`) as guesses
-  for indexes past the last confirmed boundary.
-- `insert(blockOffset)` is called by `appendSubchunksToIndexes` with the
-  **actual** end-of-chunk offset, so subsequent `get` calls return exact
-  offsets — partition guesses are only used until a real offset is known.
-- File-type detection covers GZIP, BGZF (uses `blockfinder::Bgzf`), ZLIB,
-  BZIP2, DEFLATE.
-
-**gzippy** (`chunk_fetcher.rs::drive`, L120–L123):
-
-- Fully static partitioning: `partition_offsets[i] = i * split_chunk_size *
-  8`, computed once in `drive()`. No on-line confirmation; the consumer
-  never tells the partitioner that chunk N actually ended at bit X.
-- Speculative dispatch uses `partition_offsets[idx]` directly; on miss,
-  the consumer re-dispatches authoritative at the **predecessor's actual
-  end** (`expected_start`).
-
-**Correctness impact**: none (the iteration converges via re-dispatch).
-Functional gap: no `m_blockMap` or `m_blockFinder` indexes, no support
-for resuming an index, no BGZF or ZLIB or BZIP2.
+Static partition by `TARGET_COMPRESSED_CHUNK_BYTES * 8` in
+`drive`'s `partition_offsets` (`chunk_fetcher.rs:120-123`). No
+`GzipBlockFinder` instance; no `insert(actual_end)`; consumer never
+informs the partitioner that chunk N actually ended at bit X.
 
 ### B7. Block-finder validation strictness
 
-**rapidgzip** (`blockfinder/DynamicHuffman.hpp:166–298`):
-
-- Maintains two bit buffers (`bitBufferForLUT` of `OPTIMAL_NEXT_DEFLATE_LUT_SIZE=15`
-  bits, `bitBufferPrecodeBits` of 61 bits) so the LUT skip and the precode check
-  can share state without re-reading.
-- LUT entries are signed `int8_t`: positive = guaranteed skip to next
-  candidate, negative magnitude = skip but partial-verify needed
-  (`nextDeflateCandidate` at one bit fewer was 0).
-- On positive candidate: calls `checkPrecode(next4Bits, next57Bits)`
-  (`CountAllocatedLeaves::checkPrecode`). If passes, builds a
-  `PrecodeHuffmanCoding` (`HuffmanCodingReversedBitsCachedCompressed`) and
-  decodes the lit+dist code lengths via
-  `readDistanceAndLiteralCodeLengths`. EOB-must-be-nonzero is checked, then
-  `checkHuffmanCodeLengths<MAX_CODE_LENGTH>` on both lit and dist arrays.
-
-**gzippy** (`block_finder.rs:686–795`):
-
-- Single `BitReader` (no shadow buffers); manual re-seek on each candidate
-  (`reader.seek_to_bit(bit_offset + 1)` after rejection).
-- LUT entries are unsigned-`i8`: `0` = candidate, positive = skip; the
-  negative-sign branch of rapidgzip's encoding is dropped (comment at
-  L107–L115: "minus the negative-encoding for lut[i] == 0 case").
-- Precode check uses an own `validate_precode` (L164–L216) and an own
-  `parse_precode` + `validate_huffman_codes` flow that **fully decodes**
-  the lit/dist code lengths and **fully runs** the precode + Kraft checks.
-  Acceptance is the same; the LUT layout for leaf counting differs.
-
-**Correctness impact**: should be equivalent (both reject the same
-bitstreams). LUT semantics differ; the negative-encoding path is missing
-and would matter only for boundary candidates that the 15-bit LUT
-partially-but-not-fully rejects — for those, rapidgzip can still derive
-a useful skip count from one bit fewer.
+rapidgzip maintains two bit buffers (LUT-sized + 61-bit) and a signed
+`int8_t` LUT (negative magnitude = partial verify needed). gzippy
+(`block_finder.rs:686-795`) uses a single `BitReader`, an `i8` LUT with
+no negative-encoding branch, and re-seeks on each candidate. Same
+acceptance criteria, different LUT.
 
 ### B8. BTYPE handling in block finder
 
-**rapidgzip** `seekToNonFinalDynamicDeflateBlock` only emits **dynamic**
-candidates. The `seekToNonFinalUncompressedDeflateBlock` separately emits
-**uncompressed** candidates. Fixed Huffman (`BTYPE=01`) is intentionally
-not found because the header has no redundancy. Caller alternates between
-the two finders inside `decodeChunk` (`GzipChunk.hpp:803–846`).
+rapidgzip emits dynamic OR uncompressed candidates only (fixed Huffman
+has no header redundancy). gzippy
+(`block_finder.rs:449-501,674-680`) ALSO has a
+`validate_fixed_block_prefix` prefilter that emits BTYPE=01
+candidates. The decoder hot path
+(`fast_marker_inflate::validate_boundary`) rejects them via
+`require_non_fixed_stop`.
 
-**gzippy** `BlockFinder::find_blocks` (L674–L680) calls both finders and
-merges results — same architecture as rapidgzip's alternating loop, but
-done in one shot. Additionally, `validate_fixed_block_prefix` (L449–L501)
-exists as a **separate cheap prefilter for BTYPE=01**, which rapidgzip
-does not have. The decoder hot path (`fast_marker_inflate::validate_boundary`)
-also rejects BTYPE=01 stops by default
-(`fast_marker_inflate.rs:174–262` `require_non_fixed_stop`).
+### B9. `finishDecodeChunkWithInexactOffset` END_OF_BLOCK_HEADER guard
 
-**Correctness impact**: none. Behavioral: gzippy emits more candidates
-(including BTYPE=01 in some paths); rapidgzip is strictly dynamic-or-uncompressed.
-
-### B9. `finishDecodeChunkWithInexactOffset` non-fixed stop guard
-
-**rapidgzip** (`GzipChunk.hpp:338–345`):
-
-```
-case StoppingPoint::END_OF_BLOCK_HEADER:
-    if ( ( ( nextBlockOffset >= untilOffset )
-           && !inflateWrapper.isFinalBlock()
-           && ( inflateWrapper.compressionType() != FIXED_HUFFMAN ) )
-         || ( nextBlockOffset == untilOffset ) ) {
-        stoppingPointReached = true;
-    }
-```
-
-**gzippy** (`gzip_chunk.rs:139–148` for `decode_chunk_with_window`, and
-`gzip_chunk.rs:412–422` for `finish_decode_chunk_with_inexact_offset`):
-
-```
-} else if state.stopped_at == ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER {
-    let not_final = state.bfinal == 0;
-    let not_fixed = state.btype != 1;
-    if last_eob_pos >= until_bits && not_final && not_fixed {
-        chunk_end_override = Some(last_eob_pos);
-        break;
-    }
-    ...
-}
-```
-
-**Difference**: rapidgzip stops at `bit_position` (post-header). gzippy
-stops at `last_eob_pos` (pre-header, i.e. the previous END_OF_BLOCK
-boundary). gzippy's variant exists because its consumer wants the next
-chunk's worker to resume *at the start of a new block's header*; rapidgzip
-internally seeks back to the boundary later (the `BitReader` is mutable).
-
-Also: rapidgzip's `nextBlockOffset` is the **last END_OF_BLOCK boundary**
-tracked inside the loop (via `inflateWrapper.tellCompressed()` when
-`isBlockStart`); gzippy tracks the same value as `last_eob_pos`. Logic
-is equivalent.
-
-Also: rapidgzip's `|| (nextBlockOffset == untilOffset)` clause (which
-allows stopping exactly at `untilOffset` even at a final or fixed-Huffman
-block boundary) is **missing** in gzippy. In practice this rarely fires
-because partitions are speculative.
+rapidgzip stops at `bit_position` (post-header). gzippy
+(`gzip_chunk.rs:139-148,412-422`) stops at `last_eob_pos` (pre-header,
+i.e. the previous END_OF_BLOCK boundary). Logically equivalent;
+gzippy's variant is so the next chunk's worker resumes at the start of
+a new block header.
 
 ### B10. `decode_or_iterate` vs `decodeChunkWithRapidgzip` direct-try
 
-**rapidgzip** (`GzipChunk.hpp:736–741`):
+rapidgzip (`GzipChunk.hpp:736-741`) attempts a direct decode at the
+guessed `blockOffset` first, then iterates BlockFinder candidates.
+gzippy (`chunk_fetcher.rs:194-203`) deletes the direct-try-at-start
+entirely — the comment explains that our marker bootstrap is too
+lenient on malformed headers and false-positives silently.
 
-```
-if ( auto result = tryToDecode( { blockOffset, blockOffset } ); result ) {
-    return *std::move( result );
-}
-```
+### B11. Chunk handoff to ISA-L
 
-A direct decode at the guessed `blockOffset` is attempted **first**, before
-the BlockFinder iteration begins. Rapidgzip then iterates dynamic + uncompressed
-candidates in 8 KiB chunks up to 512 KiB.
-
-**gzippy** (`chunk_fetcher.rs:187–244`):
-
-The direct-try-at-start is **deleted** (comment L194–L203 explains: our
-bootstrap is too lenient about malformed headers and produced silent
-false positives). Instead we go straight to `BlockFinder::find_blocks`
-candidates within 512 KiB.
-
-**Correctness impact**: rapidgzip's first guess is essentially free; the
-deflate decoder's own validation catches false positives. Gzippy is
-stricter and slower-to-first-byte but more robust against bootstrap
-false positives.
-
-### B11. Chunk handoff to ISA-L (`cleanDataCount >= MAX_WINDOW_SIZE`)
-
-**rapidgzip** (`GzipChunk.hpp:520–526`):
-
-Inside `decodeChunkWithRapidgzip` the per-chunk `cleanDataCount` is summed
-across all decoded blocks. When `cleanDataCount >= deflate::MAX_WINDOW_SIZE`
-(32 KiB), control jumps to `finishDecodeChunkWithInexactOffset` (the
-ISA-L fast path), seeding the wrapper with `result.getLastWindow({})` (the
-chunk's own last 32 KiB).
-
-If `getLastWindow({})` is called and the window still contains marker
-bytes (because the trailing 32 KiB straddles markers), `MapMarkers`
-**throws** inside the iteration; `tryToDecode` catches the exception and
-moves to the next BlockFinder candidate.
-
-**gzippy** (`fast_marker_inflate.rs::decode_chunk_bootstrap`, L460–L551,
-and `gzip_chunk.rs::finish_decode_chunk_with_inexact_offset`, L240–L268):
-
-Uses a `CleanTailTracker` that tracks only the **trailing** clean bytes
-(rapidgzip uses cumulative `cleanDataCount`). Handoff happens when
-`tracker.trailing_clean_bytes >= WINDOW_SIZE` AT a block boundary; the
-last 32 KiB is then cast to `Vec<u8>` (with `assert!(v < MARKER_BASE)`)
-and used as the ISA-L dict.
-
-When no such window accumulates, the chunk returns marker-only
-(`clean_window = None`) and the entire output is `data_with_markers`;
-`apply_window` runs over the whole chunk in the consumer.
-
-**Correctness impact**: none in isolation. Behavioural: rapidgzip's
-"cumulative clean" handoff fires earlier (any 32 KiB of clean output,
-not necessarily contiguous at the tail), so a wider variety of streams
-get the ISA-L bulk path. Gzippy's "trailing 32 KiB clean" requirement
-is stricter and forces marker-only chunks more often.
+rapidgzip (`GzipChunk.hpp:520-526`) tracks cumulative `cleanDataCount`
+and hands off to ISA-L when it crosses `MAX_WINDOW_SIZE`. gzippy
+(`fast_marker_inflate::decode_chunk_bootstrap` L460-551,
+`gzip_chunk::finish_decode_chunk_with_inexact_offset` L240-268) uses a
+`CleanTailTracker` that only counts the **trailing** clean bytes.
+Stricter; produces more marker-only chunks.
 
 ### B12. `WindowMap` blocking and storage
 
-**rapidgzip** (`WindowMap.hpp:19–186`):
-
-- `std::map<size_t, SharedWindow>` protected by `std::mutex`; **no condvar**.
-- Insertions try `emplace_hint(end())` first (O(1) for ordered inserts).
-- Windows are **`CompressedVector`** (`emplace(offset, window, compressionType)`),
-  saving memory at the cost of decompress-on-access.
-- Supports `operator==`, `releaseUpTo(offset)`, exposes `data()` for
-  external lock acquisition.
-
-**gzippy** (`window_map.rs:23–96`):
-
-- `BTreeMap<usize, Arc<[u8; 32768]>>` protected by `Mutex` **and a `Condvar`**.
-- `get_or_wait(offset, timeout)` blocks until the window appears or the
-  deadline expires. Used by workers to wait for the predecessor's window.
-- Windows are uncompressed `Arc<[u8; 32768]>` (constant 32 KiB).
-- No `releaseUpTo`; entries live for the duration of `drive()`.
-
-**Correctness impact**: none. Behavioural: gzippy's condvar enables a
-"fast path" worker (`worker_loop:269–280`) that blocks until the
-predecessor's window is published. Rapidgzip's consumer is the
-synchronization point instead.
+rapidgzip: `std::map<size_t, SharedWindow>` + `std::mutex`, **no
+condvar**; windows are `CompressedVector`. gzippy
+(`window_map.rs:23-96`): `BTreeMap<usize, Arc<[u8;32768]>>` + `Mutex`
++ `Condvar` (workers block on `get_or_wait`). Windows uncompressed.
 
 ### B13. Worker decode pathways
 
-**rapidgzip** has effectively **one** worker entry: `decodeBlock` (the
-override), which routes through `GzipChunk<T>::decodeChunk`. That function
-internally picks between three modes based on whether `initialWindow`
-exists and whether `untilOffsetIsExact`:
-
-1. `(initialWindow, untilOffsetIsExact)` → `decodeChunkWithInflateWrapper`
-   (ISA-L, exact stop).
-2. `(initialWindow, !exact)` → `decodeChunkWithRapidgzip` (which internally
-   delegates immediately to `finishDecodeChunkWithInexactOffset` if ISA-L
-   is enabled).
-3. `(no window, ...)` → `decodeChunkWithRapidgzip` calls `tryToDecode` at
-   the guessed offset, then iterates BlockFinder candidates.
-
-**gzippy** has **two** worker code paths chosen by `worker_loop` based on
-whether `window_map.get_or_wait` returns Some/None:
-
-1. Fast path (window known) → `decode_chunk_with_window` (ISA-L only,
-   inexact stop). Equivalent to rapidgzip case 2.
-2. Slow path (no window) → `decode_or_iterate` →
-   `finish_decode_chunk_with_inexact_offset` per candidate.
-   Equivalent to rapidgzip case 3 but with two structural differences:
-   - The marker bootstrap (`fast_marker_inflate::decode_chunk_bootstrap`)
-     is a separate Rust decoder, not a `deflate::Block` call.
-   - The direct-try-at-guessed-offset step is deleted (see B10).
-
-The "exact stop" variant (rapidgzip case 1) is exposed in
-`gzip_chunk.rs::decode_chunk_with_inflate_wrapper` (L182–L219) but
-**no production call site uses it** — only the tests. The driver
-always treats partition offsets as inexact.
+rapidgzip has one entry: `decodeBlock` → `decodeChunk` → 3 internal
+modes depending on (initialWindow, untilOffsetIsExact). gzippy has two
+worker paths selected by `WindowMap::get_or_wait`
+(`chunk_fetcher.rs:269-326`): fast (window known →
+`decode_chunk_with_window`) vs slow (no window →
+`decode_or_iterate` → marker bootstrap). The exact-stop
+`decode_chunk_with_inflate_wrapper` (L182-219 of gzip_chunk.rs) is
+**not called from production**.
 
 ### B14. Authoritative re-dispatch / `setEncodedOffset`
 
-**rapidgzip**: after a chunk completes, `processNextChunk` calls
-`chunkData->setEncodedOffset(*nextBlockOffset)` to **correct** the chunk's
-`encodedOffsetInBits` from the speculative guess to the real offset. The
-chunk's `setEncodedOffset` (`ChunkData.hpp:601–629`) re-anchors the
-`encodedOffsetInBits` and trims the first subchunk's
-`encodedOffset`/`encodedSize` accordingly.
-
-**gzippy**: never corrects the chunk after the fact. Instead, on mismatch
-(`!c.matches_encoded_offset(expected_start) || c.decoded_offset_for(expected_start).is_none()`),
-the consumer **discards** the speculative chunk and submits an
-authoritative job at `expected_start` (`chunk_fetcher.rs:550–574`). On a
-**hit**, the consumer uses `decoded_offset_for(expected_start)` to compute
-`trim_bytes` and skips that many leading bytes from `data_with_markers`
-or `data` (`chunk_fetcher.rs:576–644`).
-
-**Correctness impact**: none. Behavioural: gzippy may re-decode chunks
-whose start happens to be near (but not exactly) the partition seed.
-Rapidgzip avoids that re-decode by trusting `matchesEncodedOffset`'s
-range check.
+rapidgzip's `processNextChunk` calls `chunkData->setEncodedOffset(...)`
+to re-anchor the chunk to the real offset after decode. gzippy now
+calls `chunk.set_encoded_offset(expected_start)`
+(`chunk_fetcher.rs:526-528`) on speculative hits where `encoded !=
+expected`; on **miss** gzippy discards the chunk and re-dispatches
+authoritative (`chunk_fetcher.rs:561-583`). Rapidgzip's setEncodedOffset
+trims the leading subchunk; gzippy's `set_encoded_offset` does
+something similar (see `chunk_data.rs::set_encoded_offset` for
+specifics).
 
 ### B15. Per-chunk Footer / multi-stream support
 
-**rapidgzip**: `ChunkData` carries `std::vector<Footer> footers` and a
-`std::vector<CRC32Calculator> crc32s` (one per stream segment). The
-`appendFooter` machinery (`ChunkData.hpp:472–489`) is invoked when the
-inflater hits an `END_OF_STREAM` stopping point. `decodeChunkWithRapidgzip`
-loops over potentially multiple gzip streams per chunk
-(`GzipChunk.hpp:468–654`).
+rapidgzip threads a `std::vector<Footer> footers` + `std::vector<CRC32Calculator>
+crc32s` through ChunkData and loops over multiple streams per chunk in
+`decodeChunkWithRapidgzip`. gzippy's `chunk_data::ChunkData` carries
+`Vec<Footer>` and `Vec<crc32fast::Hasher>` since Step 2 landed, BUT the
+production driver (`single_member.rs:65-140`) reads the trailer
+**inline at the end of `decompress_parallel`**, assumes single-stream,
+and would not handle a multi-member input through this path. (Routing
+in `decompress/mod.rs:76-82` sends multi-member to a different code path
+entirely.)
 
-**gzippy**: single per-chunk `crc32fast::Hasher`. No `Footer` type, no
-multi-stream support. The driver assumes the input is exactly one gzip
-stream and strips the trailer at `single_member.rs:127–141`.
+### B16. **Silent libdeflate fallback (THE invariant violation)**
 
-**Correctness impact**: cannot decode multi-stream gzips through the
-parallel SM path. (Routing in `decompress/mod.rs` sends multi-member
-input elsewhere.) Functional gap.
+rapidgzip has **no fallback**. If a chunk decode fails, it throws.
+
+gzippy's routing layer (`decompress/mod.rs:207-260`) falls back through
+three escape hatches:
+
+1. **Gate-bypass fallback** — if the parallel gate at L218-222 fails
+   (no ISA-L, T==1, or data ≤ 10 MiB), control never enters the
+   parallel path. Drops to L240+ (ISA-L sequential) or L259
+   (libdeflate). Falls through silently.
+2. **Routing-failure fallback** — if `decompress_parallel` returns
+   `ParallelError::TooSmall`, `map_parallel_single_member_error`
+   (L262-287) returns `None`, which causes the outer match in
+   `decompress_single_member` to **continue past the parallel
+   attempt** to the ISA-L sequential / libdeflate fallback at L240+.
+3. **ISA-L-stream fallback** — `isal_decompress::decompress_gzip_stream`
+   at L241 silently moves to `decompress_single_member_libdeflate` at
+   L259 if it returns None.
+
+The fallback fires **silently** in case 1 and case 3. Case 2 emits a
+debug log if `GZIPPY_DEBUG=1` (L270). The bench script captures
+stderr and prints `[SILENT FALLBACK: marker pipeline did not run
+end-to-end]`
+(`scripts/benchmark_single_member.py:171,418-419`), which is how the
+user discovered this.
+
+The deletion-trap killer test
+(`src/tests/routing.rs:298-344`) catches case 2 because it asserts
+`MARKER_PIPELINE_RUNS` incremented after a decode. It does **not**
+catch case 1 or case 3.
 
 ---
 
 ## C. Missing pieces (rapidgzip has, gzippy doesn't)
 
-1. **`HuffmanCodingDoubleLiteralCached`** (`huffman/HuffmanCodingDoubleLiteralCached.hpp`):
-   multi-symbol pure-C++ decoder. rapidgzip uses it only when ISA-L is
-   unavailable; we don't have a fallback that does multi-symbol decode at
-   all.
-
-2. **`HuffmanCodingShortBitsCached*` family** (4 variants): rapidgzip's
-   fallback Huffman decoders when ISA-L is off. Gzippy uses
-   `ConsumeFirstTable` (from `inflate/consume_first_table.rs`) for both
-   precode and lit/dist in the non-ISAL slow path.
-
-3. **`deflate::Block<>` (`gzip/deflate.hpp:513–end`)**: the ~1500-line
-   class encapsulating a single block decode. Has `m_window16` (the
-   2×32 KiB circular pre-decode buffer that holds u16s when the initial
-   window is unknown — exactly the "markers in band" mechanism), `read`
-   that decodes up to `nMaxToDecode` bytes, `setInitialWindow` to seed
-   the dict, `eob()` / `eos()` / `eof()` block-state queries,
-   `BlockStatistics` counters, `Backreference` tracking. Gzippy's
-   `fast_marker_inflate.rs` is a separate implementation of similar
-   functionality but **not** a port — it lacks the circular window, the
-   marker convention is different (B1), the public API is procedural
-   rather than stateful, and many features (BFINAL multi-stream loop,
-   block-statistics, backreference recording) are absent.
-
-4. **`setInitialWindow(window)`** on the deflate block decoder
-   (`deflate.hpp:606`): allows resuming decode of a chunk with an
-   already-known 32 KiB window so that the chunk emits real bytes
-   directly instead of markers. Gzippy's marker decoder cannot be seeded
-   with a window — when a window is known, gzippy hands off to ISA-L
-   via `IsalInflateWrapper::set_window` (in `decode_chunk_with_window`).
-
-5. **`getLastWindow({})` raising on markers** (`DecodedData.hpp:394–488`
-   via `MapMarkers::operator()`): the mechanism rapidgzip uses to detect
-   "trailing 32 KiB has markers, can't hand off yet" — `MapMarkers` throws,
-   `tryToDecode` catches, the iterator moves to the next candidate.
-   Gzippy substitutes a `CleanTailTracker` check that returns
-   `clean_window: None` without throwing; the chunk is then marker-only
-   and the entire decoder bootstrap runs.
-
-6. **`BlockFetcher` with `Cache` + `Prefetcher` + `ThreadPool`**
-   (`core/BlockFetcher.hpp`). Gzippy has ad-hoc `mpsc::channel` +
-   `spec[]` ring + `std::thread::scope`. Functional consequences:
-   - No LRU cache; speculative chunks are dropped after one consumer
-     pass.
-   - No fetching strategy (linear access pattern only).
-   - No splitting of chunks into cache entries.
-   - No retry / backoff / waiting on block finder.
-
-7. **`GzipBlockFinder` (the partitioner)**
-   (`GzipBlockFinder.hpp`). Gzippy's static partition table can't be
-   updated mid-decode and can't take advantage of known exact boundaries
-   after the first chunk completes.
-
-8. **`BlockMap` (output-offset → encoded-offset index)**. Required for
-   any random-access seek operation. Gzippy doesn't index decoded output
-   at all.
-
-9. **`IndexFileFormat`**: rapidgzip can export a seekable index that
-   another process can use to start decoding at any block. Gzippy can't.
-
-10. **Parallel marker post-processing**
-    (`GzipChunkFetcher::queueChunkForPostProcessing` +
-    `waitForReplacedMarkers`): rapidgzip can resolve markers on multiple
-    chunks in parallel using the thread pool. Gzippy's consumer is the
-    only thread that calls `apply_window`.
-
-11. **Per-subchunk window** (`ChunkData::Subchunk::window`,
-    `appendSubchunksToIndexes` L429–L458): rapidgzip stores a window at
-    every subchunk boundary so seeks can land mid-chunk. Gzippy stores
-    only the chunk-end window in the WindowMap.
-
-12. **Window sparsity / window compression**
-    (`ChunkData::windowCompressionType`, `CompressedVector`, the
-    `determineUsedWindowSymbolsForLastSubchunk` flow): rapidgzip can
-    detect that many bytes of a window are never referenced and replaces
-    them with zeros before compressing the window. Gzippy stores raw
-    32 KiB.
-
-13. **`Footer`, `appendFooter`, `crc32s` vector, multi-stream support**
-    (see B15).
-
-14. **File-format detection** (`gzip/format.hpp::determineFileTypeAndOffset`):
-    GZIP, BGZF, ZLIB, BZIP2, DEFLATE. Gzippy's `skip_gzip_header` handles
-    GZIP only (BGZF detection lives elsewhere in `decompress/bgzf.rs`).
-
-15. **Footer reading in `IsalInflateWrapper`**
-    (`gzip/isal.hpp:429–470`, `readGzipFooter`/`readZlibFooter`/
-    `readDeflateFooter`): gzippy's wrapper exits at the deflate stream
-    end without consuming a footer.
-
-16. **Statistics + `--verbose` profile output**
-    (`GzipChunkFetcher.hpp:114–197`, `BlockFetcher::Statistics`):
-    cache hit rate, prefetch efficiency, decode duration per stage, pool
-    efficiency, false positive count, etc. Gzippy has only the JSON
-    trace (`trace.rs`), which is unstructured for aggregation.
-
-17. **`NoBlockInRange` exception** (`chunkdecoding/DecompressionError.hpp`):
-    distinct error type that drives `GzipChunkFetcher::getBlock` to retry
-    with the exact offset. Gzippy returns the generic
-    `ChunkDecodeError::ExactStopMissed` and the consumer handles
-    re-dispatch through a different path.
-
-18. **`finalizeChunk` subchunk merge** (`GzipChunk.hpp:142–153`): when
-    the trailing subchunk is smaller than `minimumSplitChunkSize()`
-    (= `splitChunkSize / 4`), rapidgzip merges it back into its
-    predecessor. Gzippy never merges.
-
-19. **`ChunkData::split` and `setEncodedOffset`** (see B2, B14).
-
-20. **`appendSubchunksToIndexes` cascade**: after a chunk resolves,
-    rapidgzip writes per-subchunk into `BlockMap`, `BlockFinder`
-    (`insert`), `WindowMap`, `m_unsplitBlocks`, and runs all
-    `indexFirstSeenChunkCallbacks`. Gzippy writes one window into
-    `WindowMap` and discards the chunk.
+1. **`HuffmanCodingDoubleLiteralCached`** — multi-symbol pure-C++ decoder.
+2. **`HuffmanCodingShortBitsCached*` family** — fallback Huffman decoders.
+3. **`deflate::Block<>` driving production decode** — the port exists
+   in `deflate_block.rs` but no production caller invokes it.
+   `fast_marker_inflate.rs` (a from-scratch decoder) runs instead.
+4. **`deflate::Block::setInitialWindow`** — way to resume decode of a
+   chunk with a known 32 KiB window so bytes come out literal instead
+   of as markers. Not in `deflate_block.rs` and not in
+   `fast_marker_inflate.rs`.
+5. **`getLastWindow({})` raising on markers** — rapidgzip's mechanism
+   to detect "trailing 32 KiB straddles markers, can't hand off yet."
+   gzippy substitutes `CleanTailTracker`.
+6. **`BlockFetcher` wired into the production driver** — the port
+   exists in `block_fetcher.rs` but `chunk_fetcher.rs::drive` does not
+   use it. Adapter cost: see §H.
+7. **`GzipBlockFinder` (the partitioner class)** — no port file at
+   all; `drive` uses a static partition.
+8. **`BlockMap` wired into the production driver** — port exists in
+   `block_map.rs` but consumer never inserts into it.
+9. **`IndexFileFormat`** — seekable index export. Optional.
+10. **Parallel marker post-processing** — gzippy's consumer is the only
+    thread that calls `apply_window`. Rapidgzip's thread pool resolves
+    markers for multiple chunks in parallel via `queueChunkForPostProcessing`.
+11. **Per-subchunk window publishing into a `BlockMap`-indexed lookup**
+    — the windows are populated (`populate_subchunk_windows` in prod)
+    and inserted into `WindowMap` at `chunk_fetcher.rs:631-637`, but
+    without a BlockMap they cannot be looked up by decoded offset.
+12. **Window sparsity / window compression in the live path** —
+    `CompressedVector` is unused.
+13. **`Footer` + multi-stream loop in `worker_loop`** — the types
+    exist, the wrapper methods exist, but no caller loops on
+    `END_OF_STREAM` inside the worker.
+14. **`gzip/format.hpp::determineFileTypeAndOffset`** — gzippy detects
+    BGZF / multi-member at routing layer
+    (`decompress/mod.rs::classify_gzip`), not via a unified detector
+    inside the parallel SM module.
+15. **Statistics & `--verbose` output** — `FetcherStatistics` exists
+    but is never populated.
+16. **`NoBlockInRange` exception** — gzippy returns a generic
+    `ExactStopMissed` and handles re-dispatch through `consumer_loop`.
+17. **`finalizeChunk` subchunk merge** — gzippy never merges small
+    trailing subchunks.
+18. **`ChunkData::split` and the dedup-on-decoded-offset behavior** —
+    no port file.
+19. **`appendSubchunksToIndexes` cascade** — `block_map::append_subchunks_to_block_map`
+    exists (L205-213) but the live consumer doesn't call it.
+20. **Direct-try-at-guessed-offset on the slow path** — deleted in
+    gzippy because the marker bootstrap is too lenient (B10).
 
 ---
 
 ## D. Extra pieces (gzippy has, rapidgzip doesn't)
 
-1. **`fast_marker_inflate.rs`** is a from-scratch Rust marker decoder.
-   It is **not** a port of `deflate::Block<>`; it shares the abstract
-   idea of emitting "markers" for out-of-window back-references, but the
-   marker encoding (B1), the storage (single `Vec<u16>` rather than a
-   circular `m_window16`), the public API (procedural functions, not a
-   stateful block class), and the bootstrap-handoff strategy
-   (`CleanTailTracker`) are all original. Production decoders should
-   eventually replace this with a `deflate::Block` port if a faithful
-   port is desired.
-
-2. **`fast_marker_inflate::validate_boundary`** (L174–L262): a
-   trial-decode probe that confirms a candidate bit offset by decoding
-   at least `min_blocks` blocks and `min_output_bytes` bytes without
-   error. Rapidgzip doesn't validate up-front; it instead lets the
-   decoder fail naturally (`tryToDecode`'s catch). The probe exists in
-   gzippy because the marker bootstrap is unreliable on false positives
-   (over-emits garbage).
-
-3. **`fast_marker_inflate::decode_chunk_bootstrap`** + `BootstrapResult`
-   (L460–L551): the explicit "decode until 32 KiB clean tail at a block
-   boundary, then return so the caller can hand off to ISA-L" return
-   contract. Rapidgzip's equivalent is the `cleanDataCount` heuristic
-   wired inside `decodeChunkWithRapidgzip` and the `getLastWindow({})`
-   throw-on-marker control flow — there is no separate function for it.
-
-4. **`replace_markers_avx2` and `replace_markers_neon`**: SIMD
-   marker-resolution kernels. Rapidgzip's `MapMarkers` is scalar (with a
-   fused `fullWindow` table for the large-chunk branch but no SIMD).
-
-5. **`block_finder::validate_fixed_block_prefix`** (L449–L501): a
-   ~50 ns prefilter that decodes the first 2 fixed-Huffman symbols and
-   rejects obviously-bad starts. Rapidgzip has no equivalent (it
-   doesn't emit fixed-Huffman candidates).
-
-6. **`block_finder::find_blocks_parallel`** (L1029–L1081): runs the
-   block finder across N threads on disjoint slices. Rapidgzip's
-   `seekToNonFinalDynamicDeflateBlock` is invoked single-threaded from
-   the worker.
-
-7. **`parallel/trace.rs`** (L1–L143): JSON-lines structured tracing,
-   keyed by `GZIPPY_LOG_FILE`. Rapidgzip prints aggregate statistics
-   on `~GzipChunkFetcher()` (when `m_showProfileOnDestruction`) but
-   has no per-event log.
-
-8. **`MARKER_PIPELINE_RUNS` + `MARKER_PIPELINE_TEST_LOCK`**
-   (`single_member.rs:41–47`): test-only routing telemetry to catch
-   silent fallback to libdeflate. Rapidgzip-specific concern: the C++
-   code has no "fall back to a different decoder" logic, so doesn't
-   need this.
-
-9. **`WindowMap::get_or_wait`** with `Condvar`: rapidgzip's `WindowMap`
-   has no blocking variant; the consumer thread is the only reader, and
-   it is the producer too.
-
+1. **`fast_marker_inflate.rs`** — 2356-line from-scratch marker
+   decoder. Production-critical (drives every slow-path bootstrap).
+   Marker encoding does not match `MapMarkers` (B1). Public API is
+   procedural rather than stateful.
+2. **`fast_marker_inflate::validate_boundary`** — trial-decode probe
+   that confirms a candidate by decoding ≥ min_blocks before
+   committing. Exists because the bootstrap is unreliable on false
+   positives.
+3. **`fast_marker_inflate::decode_chunk_bootstrap` + `BootstrapResult`**
+   — explicit "decode until 32 KiB clean tail, then hand off to ISA-L"
+   contract. Substitute for rapidgzip's cleanDataCount heuristic +
+   getLastWindow throw flow.
+4. **`replace_markers_avx2` and `replace_markers_neon`** — SIMD
+   marker resolution. Rapidgzip's MapMarkers is scalar.
+5. **`block_finder::validate_fixed_block_prefix`** — ~50 ns prefilter
+   for fixed-Huffman candidates.
+6. **`block_finder::find_blocks_parallel`** — multi-thread block
+   finder.
+7. **`parallel/trace.rs`** — JSON-lines per-event trace under
+   `GZIPPY_LOG_FILE`.
+8. **`MARKER_PIPELINE_RUNS` + `MARKER_PIPELINE_TEST_LOCK`** — test
+   counter to catch silent fallback. Catches case 2 of §F only.
+9. **`WindowMap::get_or_wait` with Condvar** — workers block on
+   predecessor's window. Rapidgzip's WindowMap has no condvar.
 10. **`ChunkDecodeError::ExactStopMissed { requested, actual }`** —
-    explicit "wrapper stopped at the wrong bit position" variant.
-    Rapidgzip throws a `runtime_error` with a string.
-
-11. **The `gzippy-parallel` "GZ" FEXTRA path** (out of scope here;
-    lives in `decompress/bgzf.rs`) is a gzippy-only format.
-
-12. **Routing-layer fallback** (`decompress/mod.rs` not shown here):
-    when the parallel SM path returns `ParallelError::TooSmall` or
-    `ParallelError::DecodeFailed`, the caller silently falls back to
-    libdeflate / multi-member / scan-inflate. Rapidgzip has no such
-    fallback; it commits to the parallel path.
+    explicit variant.
+11. **The `gzippy-parallel` "GZ" FEXTRA path** (in `decompress/bgzf.rs`,
+    out of scope).
+12. **Routing-layer fallback to libdeflate** (`decompress/mod.rs`
+    L240-260). The thing this branch must kill.
+13. **Reference ports of rapidgzip primitives sitting next to live
+    code** — `block_fetcher.rs`, `block_map.rs`, `cache.rs`,
+    `prefetcher.rs`, `statistics.rs`, `compressed_vector.rs`,
+    `deflate_block.rs`. ~3600 LOC of unused code (see §E counts).
 
 ---
 
 ## E. Per-file deep dive
 
-### `src/decompress/parallel/single_member.rs` (256 lines)
+### `src/decompress/parallel/single_member.rs` (215 lines)
 
 | Item | Lines | Origin |
 |------|-------|--------|
-| `MIN_PARALLEL_SIZE = 4 MiB`, `TARGET_COMPRESSED_CHUNK_BYTES = 4 MiB` | L31–L33 | gzippy-original (rapidgzip uses 4 MiB as `splitChunkSize` per `GzipChunkFetcher.hpp:706`) |
-| `MARKER_PIPELINE_RUNS` / `MARKER_PIPELINE_TEST_LOCK` | L41–L47 | gzippy-original (test infrastructure) |
-| `skip_gzip_header` | L60–L105 | gzippy-original; rapidgzip uses `gzip::readHeader` in `gzip/gzip.hpp` |
-| `decompress_parallel` driver | L107–L188 | gzippy-original (rapidgzip has `ParallelGzipReader` for the same role) |
-| Trailer parsing (CRC + ISIZE) | L127–L141 | gzippy-original |
-| `ParallelError` enum | L192–L225 | gzippy-original |
+| `MIN_PARALLEL_SIZE = 4 MiB`, `MIN_THREADS_FOR_PARALLEL = 2`, `TARGET_COMPRESSED_CHUNK_BYTES = 4 MiB` | L31-33 | gzippy-original; rapidgzip uses 4 MiB as `splitChunkSize` per `GzipChunkFetcher.hpp:706` |
+| `MARKER_PIPELINE_RUNS` / `MARKER_PIPELINE_TEST_LOCK` | L41-47 | gzippy-original (test instrumentation) |
+| `skip_gzip_header` | L61-63 | Thin wrapper around `gzip_format::read_header` |
+| `decompress_parallel` driver | L65-146 | gzippy-original (rapidgzip has `ParallelGzipReader` for the same role) |
+| Trailer parsing (CRC + ISIZE) | L83-98 | gzippy-original — assumes single stream |
+| `ParallelError` enum | L150-183 | gzippy-original |
 
-### `src/decompress/parallel/chunk_fetcher.rs` (730 lines)
+### `src/decompress/parallel/chunk_fetcher.rs` (758 lines)
 
 | Item | Lines | Origin |
 |------|-------|--------|
-| `DecodeJob` struct + worker pool | L96–L172 | gzippy-original (no equivalent struct in rapidgzip's `ThreadPool`) |
-| `BOUNDARY_SEARCH_RADIUS_BYTES = 512 KiB` | L80–L81 | port of `512_Ki * BYTE_SIZE` cap in `GzipChunk.hpp:811` |
-| `WINDOW_WAIT_TIMEOUT = 50ms` | L88–L89 | gzippy-original (rapidgzip blocks indefinitely on prefetch futures) |
-| `drive()` (driver entry) | L114–L177 | gzippy-original |
-| `decode_or_iterate` | L187–L244 | port of `tryToDecode` + the BlockFinder loop in `GzipChunk.hpp:712–852`, **minus** the direct-try-at-start (see B10) |
-| `worker_loop` | L246–L373 | gzippy-original architecture; fast/slow split via `WindowMap::get_or_wait` is not present in rapidgzip |
-| `consumer_loop` speculative ring | L375–L671 | port of `GzipChunkFetcher::processNextChunk` + parts of `BlockFetcher::get` |
-| Authoritative re-dispatch | L550–L574 | port of the `if (!chunkData || !matchesEncodedOffset(...))` retry in `GzipChunkFetcher::getBlock:646–662` |
-| Synchronous `apply_window` | L596–L612 | deviation from `queueChunkForPostProcessing` (B5) |
-| Output write + CRC combine | L614–L645 | gzippy-original (rapidgzip uses `writeAll` / `vmsplice` in `ChunkData.hpp:794–825`) |
+| `DecodeJob` + mpsc work queue | L95-130 | gzippy-original (no `ThreadPool` abstraction) |
+| `BOUNDARY_SEARCH_RADIUS_BYTES = 512 KiB` | L80-81 | port of cap in `GzipChunk.hpp:811` |
+| `WINDOW_WAIT_TIMEOUT = 50ms` | L88-89 | gzippy-original |
+| `drive()` | L114-177 | gzippy-original |
+| `decode_or_iterate` | L187-244 | port of `tryToDecode` + BlockFinder loop, **minus** direct-try-at-start |
+| `worker_loop` | L246-373 | gzippy-original fast/slow split via `WindowMap::get_or_wait` |
+| `consumer_loop` speculative ring | L375-698 | port of `processNextChunk` + parts of `BlockFetcher::get`, **but using ad-hoc spec[] instead of BlockFetcher** |
+| `set_encoded_offset` call on hit | L527 | port of rapidgzip's setEncodedOffset (B14) |
+| Authoritative re-dispatch | L561-583 | port of getBlock retry in `GzipChunkFetcher.hpp:646-662` |
+| Synchronous `apply_window` + populate_subchunk_windows + WindowMap insert | L596-639 | deviation from `queueChunkForPostProcessing` |
+| Output write + CRC combine | L641-682 | gzippy-original |
 
 ### `src/decompress/parallel/gzip_chunk.rs` (588 lines)
 
 | Item | Lines | Origin |
 |------|-------|--------|
-| `ChunkDecodeError` | L51–L68 | gzippy-original; rapidgzip throws |
-| `ALLOCATION_CHUNK_SIZE = 128 KiB` | L72 | port of `ChunkData.hpp:65` |
-| `decode_chunk_with_window` (fast path) | L86–L165 | port of `finishDecodeChunkWithInexactOffset` `GzipChunk.hpp:280–410` when window is known; deviates per B9 |
-| `decode_chunk_with_inflate_wrapper` (exact stop) | L182–L219 | faithful port of `decodeChunkWithInflateWrapper` `GzipChunk.hpp:190–268` (subset: no decoded-size check, no `Footer`) |
-| `finish_decode_chunk_with_inexact_offset` (slow path) | L234–L462 | port of the `decodeChunkWithRapidgzip` + `finishDecodeChunkWithInexactOffset` combination, with the bootstrap done in `fast_marker_inflate::decode_chunk_bootstrap` rather than `deflate::Block`. Uses raw `isal_sys` directly instead of `IsalInflateWrapper` — comment at L276–L281 explains why (preserves exact known-good shape). |
+| `ChunkDecodeError` | L51-68 | gzippy-original; rapidgzip throws |
+| `decode_chunk_with_window` (fast path) | L86-165 | port of `finishDecodeChunkWithInexactOffset` when window is known |
+| `decode_chunk_with_inflate_wrapper` (exact stop) | L182-219 | faithful port — **NOT CALLED IN PROD** |
+| `finish_decode_chunk_with_inexact_offset` (slow path) | L234-462 | port of `decodeChunkWithRapidgzip` + `finishDecodeChunkWithInexactOffset` combination; uses `fast_marker_inflate::decode_chunk_bootstrap` instead of `deflate::Block` |
 
-### `src/decompress/parallel/chunk_data.rs` (474 lines)
+### `src/decompress/parallel/chunk_data.rs` (855 lines)
 
 | Item | Lines | Origin |
 |------|-------|--------|
-| `Subchunk` | L29–L37 | port of `ChunkData::Subchunk` `ChunkData.hpp:115–145` (no `newlineCount`, `usedWindowSymbols`) |
-| `ChunkStatistics` | L43–L50 | port of `ChunkData::Statistics` `ChunkData.hpp:147–180` (reduced to 6 fields) |
-| `ChunkConfiguration` | L55–L79 | port of `ChunkData::Configuration` `ChunkData.hpp:97–113` (no `fileType`, `windowCompressionType`, `windowSparsity`, `newlineCharacter`) |
-| `ChunkData` struct | L86–L128 | port of `ChunkData` + `DecodedData` flattened |
-| `matches_encoded_offset` | L163–L165 | faithful port of `ChunkData::matchesEncodedOffset` L396–L403 |
-| `last_32kib_window` | L173–L207 | port of `DecodedData::getLastWindow` L394–L488 with deviations: returns `Option<[u8;32768]>` instead of throwing; doesn't use `MapMarkers`; doesn't combine with `previousWindow` |
-| `append_markered` / `append_clean` | L222–L249 | port of `DecodedData::append(MarkerVector)` and `append(DecodedDataView)` (L109–L290) |
-| `append_block_boundary` (always emits subchunk) | L264–L285 | deviates from `appendDeflateBlockBoundary` (B2) |
-| `finalize` | L293–L301 | port of `ChunkData::finalize` L417–L449 (no `cleanUnmarkedData`, no `split`, no subchunk merge) |
-| `decoded_offset_for` | L308–L316 | gzippy-original (rapidgzip uses `BlockMap::findDataOffset` for the analogous lookup) |
+| `Subchunk` | L29-37 | port of `ChunkData::Subchunk` |
+| `ChunkStatistics` | L43-50 | port of `ChunkData::Statistics` |
+| `ChunkConfiguration` | L55-79 | port of `ChunkData::Configuration` |
+| `ChunkData` | L86-128 | port of `ChunkData` + `DecodedData` flattened |
+| `matches_encoded_offset` | L163-165 | faithful port |
+| `last_32kib_window` | L173-207 | port of `getLastWindow` (returns `Option`, no MapMarkers) |
+| `append_markered` / `append_clean` | L222-249 | port of `DecodedData::append` variants |
+| `append_block_boundary` | L264-285 | deviates from `appendDeflateBlockBoundary` (B2) |
+| `finalize` | L293-301 | port of `ChunkData::finalize` (no `cleanUnmarkedData`, no `split`, no merge) |
+| `decoded_offset_for` | L308-316 | gzippy-original (rapidgzip uses `BlockMap::findDataOffset`) |
+| `set_encoded_offset` (Step 4) | (later lines) | port of `ChunkData::setEncodedOffset` |
+| `populate_subchunk_windows` (Step 3) | (later lines) | port of subchunk-window emplacement in `appendSubchunksToIndexes` |
+| `clean_unmarked_data` (Step 8) | (later lines) | port — **not called in prod** |
 
-### `src/decompress/parallel/apply_window.rs` (164 lines)
+### `src/decompress/parallel/apply_window.rs` (159 lines)
 
-Implements `chunk_data.rs::apply_window`. Single-window only; see B3. Faithful
-to the *idea* of `DecodedData::applyWindow` but does not invoke `MapMarkers`
-and does not handle per-subchunk windows.
+Marker-resolve in place via `replace_markers`. Updates `chunk.crc` from
+scratch 4 KiB chunks. No per-subchunk windowing in this function — that
+moved to `populate_subchunk_windows` called separately by the consumer.
 
 ### `src/decompress/parallel/window_map.rs` (172 lines)
 
-Single-class file. The class is structurally close to rapidgzip's `WindowMap`
-(`std::map<size_t, SharedWindow>` ⇔ `BTreeMap<usize, Arc<[u8;32768]>>`) but
-adds a `Condvar` and `get_or_wait`. See B12. Missing `releaseUpTo`,
-`operator==`, `data()` lock-export, `CompressedVector`.
+`BTreeMap<usize, Arc<[u8;32768]>>` + Mutex + Condvar. `get_or_wait`
+blocks until window appears or timeout. Missing `releaseUpTo`,
+`operator==`, `data()` export, `CompressedVector` storage.
 
 ### `src/decompress/parallel/block_finder.rs` (1318 lines)
 
 | Item | Lines | Origin |
 |------|-------|--------|
-| `LUT_BITS = 15` | L42 | port of `OPTIMAL_NEXT_DEFLATE_LUT_SIZE = 15` (`DynamicHuffman.hpp:145`) |
-| `is_deflate_candidate_n` | L62–L88 | faithful port of `isDeflateCandidate<bitCount>` (`DynamicHuffman.hpp:39–79`) |
-| `next_deflate_candidate` | L95–L103 | faithful port of `nextDeflateCandidate<bitCount>` (`DynamicHuffman.hpp:85–98`) |
-| `generate_deflate_lut` | L109–L115 | deviates from `NEXT_DYNAMIC_DEFLATE_CANDIDATE_LUT` (`DynamicHuffman.hpp:113–124`): missing negative-encoding branch (see B7) |
-| `validate_precode` | L164–L216 | gzippy-original implementation; `CountAllocatedLeaves::checkPrecode` uses a 4-precode-at-a-time 4 KiB LUT, gzippy uses a 4-precode 12-bit LUT differently laid out |
-| `BitReader` | L222–L311 | gzippy-original |
-| `BlockBoundary` | L317–L329 | port of `BlockBoundary` (`gzip/definitions.hpp:121–131`) with extra fields (`valid`, `hlit`, `hdist`, `hclen`) |
-| `validate_fixed_block_prefix` | L449–L501 | **Extra** — no rapidgzip counterpart |
-| `find_uncompressed_blocks` | L562–L665 | faithful port of `seekToNonFinalUncompressedDeflateBlock` (`Uncompressed.hpp:21–95`) |
-| `find_dynamic_blocks` | L686–L795 | port of `seekToNonFinalDynamicDeflateBlock` (`DynamicHuffman.hpp:166–298`); uses different bit reader; LUT signedness differs |
-| `parse_precode` + `is_valid_huffman_lengths` + `validate_huffman_codes` | L818–L948 | own implementation matching the same checks rapidgzip runs inline (precode → readDistanceAndLiteralCodeLengths → `checkHuffmanCodeLengths`) |
-| `find_blocks_parallel` | L1029–L1081 | **Extra** |
+| `LUT_BITS = 15` | L42 | port of `OPTIMAL_NEXT_DEFLATE_LUT_SIZE = 15` |
+| `is_deflate_candidate_n` | L62-88 | faithful port |
+| `next_deflate_candidate` | L95-103 | faithful port |
+| `generate_deflate_lut` | L109-115 | deviates from rapidgzip's signed-LUT encoding (B7) |
+| `validate_precode` | L164-216 | gzippy-original LUT layout (4-precode-at-a-time differs) |
+| `BitReader` | L222-311 | gzippy-original |
+| `BlockBoundary` | L317-329 | port with extra fields |
+| `validate_fixed_block_prefix` | L449-501 | **Extra** |
+| `find_uncompressed_blocks` | L562-665 | faithful port |
+| `find_dynamic_blocks` | L686-795 | port with bitreader/LUT diffs |
+| `parse_precode` / `is_valid_huffman_lengths` / `validate_huffman_codes` | L818-948 | own impl matching same checks |
+| `find_blocks_parallel` | L1029-1081 | **Extra** |
 
-### `src/decompress/parallel/inflate_wrapper.rs` (430 lines)
+### `src/decompress/parallel/inflate_wrapper.rs` (489 lines)
 
 | Item | Lines | Origin |
 |------|-------|--------|
-| `StoppingPoints` | L33–L60 | port of `StoppingPoint` enum (`gzip/definitions.hpp:92–100`) — values match (1, 2, 4, 8) |
-| `ReadStreamResult` | L62–L77 | gzippy-original (rapidgzip returns `pair<size_t, optional<Footer>>`) |
-| `DeflateCompressionType` | L80–L86 | port of `CompressionType` enum (`gzip/definitions.hpp:61–67`) |
-| `InflateError` | L88–L97 | gzippy-original (rapidgzip throws) |
-| `IsalInflateWrapper::new` | L116–L139 | port of `IsalInflateWrapper` ctor + `initStream` (`isal.hpp:32–43, 215–225`); deviates by not handling `BitReader` — assumes direct slice ownership |
-| `set_window` | L145–L163 | port of `setWindow` (`isal.hpp:52–59`) — defaults to all-zero on empty |
-| `set_stopping_points` / `stopped_at` / `is_final_block` / `btype` | L170–L215 | faithful port of `setStoppingPoints` / `stoppedAt` / `isFinalBlock` / `compressionType` (`isal.hpp:75–109`) |
-| `tell_compressed` | L222–L232 | port of `tellCompressed` (`isal.hpp:69–74`) but computed directly from `avail_in`/`read_in_length` instead of subtracting from the `BitReader`'s tell |
-| `read_stream` | L249–L310 | port of `readStream` (`isal.hpp:253–385`) with: no refillBuffer (entire input is one slice), no `Footer` handling, no header re-reading, no `setStartWithHeader`, no diagnostic dump on error |
+| `StoppingPoints` | L33-60 | port of `StoppingPoint` enum |
+| `ReadStreamResult` | L62-77 | gzippy-original (rapidgzip returns `pair<size_t, optional<Footer>>`) |
+| `DeflateCompressionType` | L82-86 | port |
+| `InflateError` | L89-97 | gzippy-original (rapidgzip throws) |
+| `IsalInflateWrapper::new` | L116-139 | port of ctor + `initStream` |
+| `set_window` | L145-163 | port of `setWindow` |
+| `set_stopping_points` etc. | L170-215 | port |
+| `tell_compressed` | L222-232 | port |
+| `read_stream` | L249-310 | port of `readStream`, **no footer/multi-stream**, no diagnostic dump |
+| `read_footer_at_current` | L243-272 | port of `readGzipFooter` — Step 11, **unused in worker_loop** |
+| `reset_for_next_stream` | L277-287 | port, **unused in worker_loop** |
 
 ### `src/decompress/parallel/isal_huffman.rs` (412 lines)
 
-| Item | Lines | Origin |
-|------|-------|--------|
-| `LIT_LEN_ELEMS = 514`, `MAX_LIT_LEN_COUNT = 23` | L41–L44 | port of constants in `HuffmanCodingISAL.hpp:24–28` |
-| `LEN_EXTRA_BIT_COUNT` table | L62–L64 | port of `len_extra_bit_count` (`HuffmanCodingISAL.hpp:30–35`) |
-| `IsalLitLenCode` struct + `from_lengths` + `rebuild_from` | L80–L168 | port of `HuffmanCodingISAL::initializeFromLengths` (`HuffmanCodingISAL.hpp:38–74`); allocations heap-boxed (rapidgzip stack-allocates `std::array<huff_code, 514>` since it lives in a `Block`) |
-| `IsalLitLenCode::decode` | L181–L221 | faithful port of `HuffmanCodingISAL::decode` (`HuffmanCodingISAL.hpp:94–183`) — bit layout constants match |
-| `IsalDistCode` + `rebuild_from` + `decode` | L243–L336 | faithful port of `HuffmanCodingDistanceISAL` (`HuffmanCodingDistanceISAL.hpp:20–118`) |
-| `with_thread_litlen` / `with_thread_litlen_dist` | L347–L379 | gzippy-original (thread-local table reuse). Rapidgzip's equivalent is the `deflate::Block` instance which is heap-allocated once and reused across blocks. |
+Faithful port of `HuffmanCodingISAL` (L80-226) and
+`HuffmanCodingDistanceISAL` (L243-336). `with_thread_litlen` and
+`with_thread_litlen_dist` are gzippy-original (thread-local reuse) —
+rapidgzip stack-allocates these inside `deflate::Block`.
 
-### `src/decompress/parallel/fast_marker_inflate.rs` (2351 lines)
+### `src/decompress/parallel/fast_marker_inflate.rs` (2356 lines)
 
-This file is **not a port of `deflate::Block<>`**, and the file's
-module-doc says so explicitly (`L36–L48`: "Reuse: Bit buffer borrowed
-from `consume_first_decode::Bits`. Canonical Huffman table build is
-implemented locally"). It is a gzippy-original implementation of the
-same abstract idea (marker-emitting deflate decode), with a separate
-encoding (B1) and a separate API.
-
-Components:
+**Not a port of `deflate::Block<>`.** A from-scratch implementation
+of the same abstract idea (marker-emitting deflate decode) with
+gzippy's own marker encoding (B1) and a procedural API. Production-
+critical for the slow-path bootstrap.
 
 | Item | Lines | Origin |
 |------|-------|--------|
-| `LENGTH_BASE` / `LENGTH_EXTRA` / `DISTANCE_BASE` / `DISTANCE_EXTRA` / `CL_ORDER` | L68–L89 | port of RFC 1951 tables (also at `gzip/RFCTables.hpp` in rapidgzip) |
-| `decode_chunk_markers` | L142–L143 | gzippy-original entry |
-| `validate_boundary` | L174–L262 | **Extra** (B7, D2) |
-| `decode_chunk_markers_bounded` | L274–L347 | gzippy-original (rapidgzip's `decodeChunkWithRapidgzip` uses `untilOffset` for the same role) |
-| `decode_chunk_bootstrap` + `BootstrapResult` | L361–L551 | **Extra** (D3); semantically replaces rapidgzip's `cleanDataCount` + `getLastWindow({})` flow |
-| `CleanTailTracker` | L387–L437 | gzippy-original; substitute for rapidgzip's cumulative `cleanDataCount` |
-| `decode_chunk_markers_continuing` | L571–L615 | **Extra** (used by the slow path when ISA-L handoff fails) |
-| `decode_loop` | L622–L748 | gzippy-original (rapidgzip's analogue is `decodeChunkWithRapidgzip`'s while loop) |
-| `decode_stored` / `decode_fixed` / `decode_dynamic` | L767–L998 | own implementations of RFC 1951 §3.2.4 / §3.2.6 / §3.2.7; rapidgzip's are in `deflate::Block::readInternalUncompressed`, the inlined fixed-Huffman path, and `readDynamicHuffmanCoding` |
-| `decode_huffman_block_isal` | L1005–L1083 | port of `deflate::Block::readInternalCompressed` (`deflate.hpp:1514–1582`) using `IsalLitLenCode` for lit/len and our `ConsumeFirstTable` for distance |
-| `decode_dynamic_block_full_isal` | L1093+ | **literal port** of the same inner loop using ISA-L for both lit/len and distance (matches `HuffmanCodingISAL` + `HuffmanCodingDistanceISAL` paired use in rapidgzip) |
-| `decode_huffman_block` | L1207–L1293 | pure-Rust fallback when ISA-L is unavailable |
+| RFC 1951 tables | L68-89 | port of `gzip/RFCTables.hpp` |
+| `validate_boundary` | L174-262 | **Extra** |
+| `decode_chunk_markers_bounded` | L274-347 | gzippy-original |
+| `decode_chunk_bootstrap` + `BootstrapResult` | L361-551 | **Extra** |
+| `CleanTailTracker` | L387-437 | gzippy-original substitute for rapidgzip's `cleanDataCount` |
+| `decode_chunk_markers_continuing` | L571-615 | **Extra** |
+| `decode_loop` | L622-748 | gzippy-original |
+| `decode_stored` / `decode_fixed` / `decode_dynamic` | L767-998 | own implementations of RFC 1951 §3.2.4/§3.2.6/§3.2.7 |
+| `decode_huffman_block_isal` | L1005-1083 | port of `Block::readInternalCompressed` using ISAL Huffman + ConsumeFirstTable distance |
+| `decode_dynamic_block_full_isal` | L1093+ | port using ISA-L for both lit/len and distance |
+| `decode_huffman_block` | L1207-1293 | pure-Rust fallback |
 | `emit_match` | L1294+ | gzippy-original; implements the marker convention from B1 |
 
-### `src/decompress/parallel/replace_markers.rs` (250 lines)
+### `src/decompress/parallel/replace_markers.rs` (249 lines)
 
 | Item | Lines | Origin |
 |------|-------|--------|
 | `MARKER_BASE = 32768` | L24 | gzippy-original encoding (B1) |
-| `replace_markers` dispatcher | L30–L46 | gzippy-original |
-| `replace_markers_scalar` | L49–L58 | logical equivalent of `MapMarkers<true>::operator()` but with the opposite-end encoding (B1) |
-| `replace_markers_avx2` | L62–L109 | **Extra** (D4) |
-| `replace_markers_neon` | L112–L156 | **Extra** (D4) |
-| `u16_to_u8` | L161–L166 | gzippy-original |
+| `replace_markers` dispatcher | L30-46 | gzippy-original |
+| `replace_markers_scalar` | L49-58 | newest-byte-indexed (differs from `MapMarkers`) |
+| `replace_markers_avx2` | L62-109 | **Extra** |
+| `replace_markers_neon` | L112-156 | **Extra** |
+| `u16_to_u8` | L161-166 | gzippy-original |
 
 ### `src/decompress/parallel/trace.rs` (143 lines)
 
-Entirely gzippy-original. Rapidgzip has aggregate statistics in
-`~GzipChunkFetcher`, no per-event trace.
+Entirely gzippy-original. JSON-lines event log keyed off `GZIPPY_LOG_FILE`.
+
+### `src/decompress/parallel/block_fetcher.rs` (323 lines) — UNUSED
+
+Literal port of `core/BlockFetcher.hpp:41-688`. `BlockFetcher`
+composes `Cache` + `Cache` (prefetch) + `FetchingStrategy` +
+`ChunkFetcherStatistics`. Public surface: `test`, `get_if_available`,
+`insert`, `insert_prefetched`, `record_on_demand_fetch`,
+`note_prefetch_started`/`completed`, `mark_failed_prefetch`,
+`is_failed_prefetch`, `record_fetch`, `prefetch_indexes`,
+`last_fetched`, `clear_cache`/`clear_prefetch_cache`,
+`cache_statistics`. **No production caller.** Tests live in this file
+(L240-320).
+
+### `src/decompress/parallel/block_map.rs` (317 lines) — UNUSED
+
+Literal port of `core/BlockMap.hpp`. `BlockMap::push`,
+`find_data_offset`, `get_encoded_offset`. Helper
+`append_subchunks_to_block_map(map, chunk)` (L205-213) wraps the
+rapidgzip cascade. **Not called by the production consumer.**
+
+### `src/decompress/parallel/cache.rs` (289 lines) — UNUSED
+
+LRU `Cache<K,V,Strategy>` + `LeastRecentlyUsed` + `CacheStatistics`.
+Faithful to `core/Cache.hpp`. Tests in-file.
+
+### `src/decompress/parallel/prefetcher.rs` (283 lines) — UNUSED
+
+`FetchingStrategy` trait + `FetchNextFixed` + `FetchNextAdaptive`.
+Faithful to `core/Prefetcher.hpp`.
+
+### `src/decompress/parallel/statistics.rs` (350 lines) — UNUSED
+
+`FetcherStatsSnapshot`, `FetcherStatistics`,
+`ChunkFetcherStatistics` (aggregates fetcher + cache stats). Faithful
+to `BlockFetcher::Statistics` + `GzipChunkFetcher::Statistics`. Never
+populated.
+
+### `src/decompress/parallel/compressed_vector.rs` (219 lines) — UNUSED
+
+`CompressedVector` with `CompressionType::{None, Zlib, Gzip,
+Deflate}`. Faithful to `CompressedVector.hpp`. `WindowMap` still holds
+uncompressed `Arc<[u8;32768]>`.
+
+### `src/decompress/parallel/deflate_block.rs` (964 lines) — UNUSED
+
+Faithful port of `deflate::Block` skeleton, `read_header`,
+`read_dynamic_huffman_coding`, `read`, `read_internal_uncompressed`,
+`read_internal_compressed`, canonical Huffman decoder, `emit_backref`
+with marker emission. Round-trip-verified against flate2-produced
+blocks (tests L818+). **No production caller invokes it** — the entire
+slow-path bootstrap goes through `fast_marker_inflate.rs` instead. The
+marker encoding `emit_backref` uses (per L640-675) does not match
+`replace_markers.rs::MARKER_BASE` semantics (B1) — so even if wired,
+markers from `deflate_block` would be resolved incorrectly by the
+current `replace_markers`.
+
+### `src/decompress/parallel/gzip_format.rs` (260 lines)
+
+Port of `gzip/gzip.hpp` header + footer parsing.
+`read_header` is called from `single_member::skip_gzip_header`
+(used in prod). `read_footer` is **not called from prod** — the
+inline trailer parse at `single_member.rs:85-98` reads raw bytes.
 
 ### `crates/isal-sys-patched/`
 
-Vendored ISA-L with rapidgzip-style patches that expose
-`isal_internals::{huff_code, make_inflate_huff_code_lit_len,
-set_and_expand_lit_len_huffcode, make_inflate_huff_code_dist, set_codes}`
-through FFI. These are the same internal ISA-L functions that rapidgzip
-includes via its own `<igzip_lib.h>` patches (see `gzip/isal.hpp` and
-`huffman/HuffmanCodingISAL.hpp` for the `HuffmanCodingISAL.hpp` direct
-calls). Faithful to rapidgzip's patched-ISA-L approach.
+Vendored ISA-L with rapidgzip-style patches exposing
+`isal_internals::{huff_code, make_inflate_huff_code_lit_len, ...}`
+through FFI — matches rapidgzip's `<igzip_lib.h>` patches.
 
 ---
 
-## F. Closure plan
+## F. The libdeflate-fallback surface
 
-The plan below is in **priority order** for restoring structural fidelity
-to rapidgzip. Each step is sized to land as one PR. Per-step LOC estimates
-exclude tests.
+This is the invariant violation. Every fallback that bypasses or
+silently abandons the parallel marker pipeline.
 
-**Status snapshot** (after the structural-gap-closure session):
-- ✅ Step 1 (e335a28): marker encoding flipped to MapMarkers
-- ✅ Step 2 (78ba3d8): Footer + crc32s vector
-- ✅ Step 3 (d3ae688): per-subchunk window emplacement
-- ✅ Step 4 (08e5224): ChunkData::setEncodedOffset
-- ✅ Step 5 (c808396): BlockMap
-- ✅ Step 6: BlockFetcher cache + Prefetcher (~600 LOC, complete)
-  - ✅ 6a (45cb6db): Cache + LeastRecentlyUsed + CacheStatistics
-  - ✅ 6b (b3bf3dc): FetchingStrategy + FetchNextFixed + FetchNextAdaptive
-  - ✅ 6c (d57cd0a): BlockFetcher orchestration (composes Cache,
-    Prefetcher, Statistics; get_if_available / insert /
-    insert_prefetched / record_fetch / prefetch_indexes /
-    sequential-clear / failed_prefetch / in-flight set)
-- ✅ Step 7: deflate::Block port (complete: skeleton + read end-to-end)
-  - ✅ 7a (4871a52): Block struct + state + readHeader + readDynamicHuffmanCoding
-  - ✅ 7b (04e518d): read + read_internal_uncompressed +
-    read_internal_compressed + canonical-Huffman decoder + emit_backref
-    (with MapMarkers cross-chunk emission). Round-trip-verified against
-    flate2-produced fixed AND dynamic blocks.
-- ✅ Step 8 (f2f2ae6): DecodedData::cleanUnmarkedData
-- ✅ Step 9 (bc8c50c): appendSubchunksToIndexes BlockMap insertion
-- ✅ Step 10 (0728eca): gzip readHeader + readFooter
-- ✅ Step 11 (9f5b291): IsalInflateWrapper footer + multi-stream methods
-- ✅ Step 12 (f6c1e4f): fetcher statistics
-- ✅ Step 13 (87fba04): CompressedVector
-- ⏳ Step 14: IndexFileFormat (~400 LOC, optional)
-- ✅ Step 15 (f6c1e4f): ChunkData::split
-- ⏳ Step 16: HuffmanCodingDoubleLiteralCached (~350 LOC, optional)
+### F1. Gate-bypass — `decompress/mod.rs:218-222`
 
-15 of 16 steps landed (94%). Remaining: Steps 14 + 16 (both marked
-optional in the original plan).
+```
+if crate::backends::isal_decompress::is_available()
+    && num_threads > 1
+    && data.len() > MIN_PARALLEL_COMPRESSED   // 10 MiB
+{
+```
 
-### Step 1. Align marker encoding with rapidgzip's `MapMarkers` (~150 LOC)
+If the gate is false (no ISA-L, T==1, or compressed ≤ 10 MiB), the
+parallel path is never entered and control falls through to
+`isal_decompress::decompress_gzip_stream` (L241) or
+`decompress_single_member_libdeflate` (L259). **No log, no error, no
+counter.** This is the case the bench warning catches because no
+`MARKER_PIPELINE_RUNS` increment happens.
 
-**Why**: B1 / D4. The current encoding (`MARKER_BASE + offset`, indexing
-from the **newest** byte) is incompatible with any directly-ported
-rapidgzip code that uses `MapMarkers`. Until this flips,
-`getLastWindow({})`, `applyWindow`'s per-subchunk path,
-`cleanUnmarkedData`, and many other rapidgzip primitives cannot be
-ported without manual re-derivation.
+**Violation**: the user's directive is that failure must be explicit.
+Today, "gate didn't fire" is indistinguishable from "ran and succeeded
+via libdeflate". The benchmark numbers reflect libdeflate, not the
+parallel path, and there is nothing in-process that flags it.
 
-Change:
+### F2. `ParallelError::TooSmall` re-fallback — `decompress/mod.rs:232-237,262-273`
 
-- In `replace_markers.rs`, change the encoding so a u16 value `v`:
-  - `v <= 255` → literal byte `v as u8`.
-  - `v >= 32768` → `window[v - 32768]` (i.e. index from **oldest** byte).
-  - `256 <= v < 32768` → invalid (rapidgzip throws; gzippy can debug_assert).
-- In `fast_marker_inflate::emit_match` (L1294+), update the marker
-  emission to use the new encoding. Pure rewrite of one function.
-- Update SIMD kernels in `replace_markers.rs` (the indexing changes:
-  `window[offset]` instead of `window[window.len() - 1 - offset]`).
-- Update tests in `replace_markers.rs`, `apply_window.rs`,
-  `fast_marker_inflate.rs`.
+```rust
+Err(e) => {
+    if let Some(err) = map_parallel_single_member_error(e) {
+        return Err(err);
+    }
+    // map returned None → falls through to libdeflate
+}
+```
 
-After this, future steps can re-use the `MapMarkers` semantics directly.
+`map_parallel_single_member_error` returns `None` for `TooSmall`,
+which means the parallel-path call **silently continues** to the
+sequential block at L240-259. The `TooSmall` error is emitted by
+`decompress_parallel` at `single_member.rs:75,80` whenever the
+deflate region or thread count don't meet the parallel preconditions.
+Inside the production path this should be impossible because the
+outer gate already checked size and thread count — but the safety net
+exists and the wire forwards to libdeflate.
 
-### Step 2. Port `gzip::Footer`, multi-stream loop, `appendFooter`, `crc32s` vector (~250 LOC)
+**Violation**: same as F1. Soft-routing decision, not a hard error.
 
-**Why**: B15 / C13. Required for multi-member input through the parallel
-SM path. Touches:
+### F3. ISA-L sequential → libdeflate — `decompress/mod.rs:240-252`
 
-- New `chunk_data.rs::Footer` struct mirroring `gzip::Footer` (crc32 +
-  uncompressedSize + blockBoundary).
-- `chunk_data.rs::ChunkData`: replace single `crc: crc32fast::Hasher`
-  with `crc32s: Vec<crc32fast::Hasher>` and a `footers: Vec<Footer>`.
-- `apply_window.rs::apply_window`: use only `crc32s.front()` for the
-  marker-resolved CRC.
-- `chunk_fetcher.rs::consumer_loop`: combine all `crc32s` from each
-  chunk into the driver's total CRC.
-- `gzip_chunk.rs::finish_decode_chunk_with_inexact_offset`: detect
-  `END_OF_STREAM`, read footer, append, restart on the next header
-  (mirrors `GzipChunk.hpp:602–653`).
-- `single_member.rs::decompress_parallel`: stop assuming a single
-  trailer.
+```rust
+if crate::backends::isal_decompress::is_available() {
+    if let Some(bytes) = crate::backends::isal_decompress::decompress_gzip_stream(...) {
+        ...
+        return Ok(bytes);
+    }
+    // ISA-L returned None → falls through to libdeflate
+}
+```
 
-### Step 3. Port `ChunkData::Subchunk::window` + `appendSubchunksToIndexes` window emplacement (~150 LOC)
+`isal_decompress::decompress_gzip_stream` returning `None`
+(decompression failed for any reason) silently moves to libdeflate at
+L259. Emits a debug eprintln only.
 
-**Why**: C11. Required for any random-access seek and for
-`finalizeWindowForLastSubchunk`. Touches `chunk_data.rs`, `apply_window.rs`
-(populate per-subchunk windows from the resolved chunk output), and
-`chunk_fetcher.rs::consumer_loop` (publish each subchunk window into
-`WindowMap`).
+**Violation**: same pattern. Implicit failover masks bugs.
 
-### Step 4. Port `ChunkData::setEncodedOffset` and re-anchor speculative chunks (~80 LOC)
+### F4. `decompress_gzip_to_vec` parallel multi-member fallback — `decompress/mod.rs:188-200`
 
-**Why**: B14. After this, the consumer can accept a chunk whose
-`encoded_offset_bits` was a partition seed and correct it to the real
-offset post-decode, instead of always re-dispatching authoritatively.
-Touches `chunk_data.rs` (new method) and `chunk_fetcher.rs::consumer_loop`
-(call `chunk.set_encoded_offset(expected_start)` on speculative hits and
-recompute `trim_bytes` as the difference, not by subchunk lookup).
+```rust
+Err(_) => {
+    let mut out = Vec::new();
+    decompress_multi_member_sequential(data, &mut out)?;
+    ...
+}
+```
 
-### Step 5. Port `BlockMap` (output-offset → encoded-offset) and `GzipBlockFinder` (~400 LOC)
+If `decompress_multi_member_parallel_to_vec` errors, it silently falls
+back to the sequential multi-member path. Different code path (not the
+single-member parallel SM path under review), but same anti-pattern.
 
-**Why**: C7, C8. Required for any future random-access seek path and
-for a faithful `GzipChunkFetcher::processNextChunk`. Two new files:
+### F5. `decompress_gzip_libdeflate` `MultiMemberPar` failover — `decompress/mod.rs:162-167`
 
-- `parallel/block_map.rs` — port of `core/BlockMap.hpp`.
-- `parallel/gzip_block_finder.rs` — port of `GzipBlockFinder.hpp`
-  partitioning + `insert`/`get`/`finalize`.
+Same pattern as F4 for the writer-output multi-member case.
 
-Replace `chunk_fetcher.rs::drive`'s static partition table with a
-`GzipBlockFinder` instance and an `insert(actual_end)` call after each
-chunk resolves.
+### Summary
 
-### Step 6. Port `BlockFetcher` cache + `Prefetcher` strategy (~600 LOC)
+Production paths under `decompress::decompress_single_member` that
+must die per the no-fallback invariant: **F1, F2, F3**. Multi-member
+fallbacks (F4, F5) are out of scope for the parallel-single-member
+cutover but follow the same anti-pattern and should be addressed
+similarly later.
 
-**Why**: C6. Replace the ad hoc `spec[]` + `mpsc::channel` ring with a
-proper `Cache<size_t, Arc<ChunkData>>` + `Prefetcher<FetchingStrategy>` +
-`ThreadPool`. Three new files in `parallel/`:
-
-- `parallel/cache.rs` — LRU cache.
-- `parallel/prefetcher.rs` — fetching strategy (sequential first).
-- `parallel/block_fetcher.rs` — the dispatch class wiring cache, prefetcher,
-  thread pool, and `decodeBlock`.
-
-Replace `chunk_fetcher.rs::consumer_loop` with a port of
-`GzipChunkFetcher::processNextChunk` that calls
-`BlockFetcher::get(partitionOffset, blockIndex)`.
-
-### Step 7. Replace `fast_marker_inflate.rs` with a port of `deflate::Block<>` (~1500 LOC, largest)
-
-**Why**: D1 / C3, C4. Establishes the same shape rapidgzip has for its
-non-ISAL bootstrap. The current `fast_marker_inflate` would be deleted
-(or kept for the non-x86_64 path). Touches:
-
-- New `parallel/deflate_block.rs` — port of `deflate::Block<>` with
-  `m_window16` (2×32 KiB circular buffer of u16), `setInitialWindow`,
-  `read`, `eob`/`eos`/`eof`, `readDynamicHuffmanCoding`, etc.
-- Update `gzip_chunk.rs::finish_decode_chunk_with_inexact_offset` to
-  drive a `deflate::Block` instance over multiple blocks rather than
-  calling `decode_chunk_bootstrap`.
-
-Pre-req: Step 1 (marker encoding).
-
-### Step 8. Port `DecodedData::cleanUnmarkedData` and `getLastWindow` (~120 LOC)
-
-**Why**: C5. Once Step 1 is done, port these directly from
-`DecodedData.hpp:394–516` so `ChunkData` matches rapidgzip's
-"during-finalize cleanup + window extraction" semantics. The
-`getLastWindow({})` flow with `MapMarkers` exception is what powers
-rapidgzip's "trailing 32 KiB has markers, retry" recovery — port it
-to enable that recovery in gzippy too.
-
-### Step 9. Port `appendSubchunksToIndexes` cascade and parallel marker post-processing (~250 LOC)
-
-**Why**: C10, C20. After this, marker resolution can happen on multiple
-chunks in parallel through the thread pool, and per-subchunk indexes
-are populated. Touches `parallel/block_fetcher.rs` (`waitForReplacedMarkers`,
-`queuePrefetchedChunkPostProcessing`, `queueChunkForPostProcessing`)
-and the new `BlockMap` / `WindowMap` integration.
-
-### Step 10. Port `gzip::readHeader`/`readFooter`, file-type detection (~200 LOC)
-
-**Why**: C14. Move gzip header / trailer parsing into a `gzip/` module
-that mirrors `vendor/rapidgzip/.../gzip/gzip.hpp`. Replace
-`single_member.rs::skip_gzip_header` and the inline trailer parse.
-Add `parallel/format.rs` mirroring `gzip/format.hpp`.
-
-### Step 11. Port `IsalInflateWrapper` footer reading + multi-stream + header re-reading (~150 LOC)
-
-**Why**: C15. Extends `inflate_wrapper.rs::IsalInflateWrapper` with
-`m_need_to_read_header`, `read_header`, `read_footer`, and
-`END_OF_STREAM` / `END_OF_STREAM_HEADER` stop emission. Folds together
-with Step 2's `Footer` type.
-
-### Step 12. Port `BlockFetcher::Statistics` and `GzipChunkFetcher::Statistics` (~200 LOC)
-
-**Why**: C16. Replace `parallel/trace.rs` (or keep it alongside) with
-aggregated counters that mirror rapidgzip's `--verbose` output. Exposes
-cache hit rate, prefetch efficiency, false-positive count, decode
-duration per stage, pool efficiency.
-
-### Step 13. Port `CompressedVector` and window compression (~250 LOC)
-
-**Why**: C12. Add per-window compression with `CompressionType::ZLIB`
-default for highly-compressible chunks (per rapidgzip's heuristic at
-`ChunkData.hpp:200–207`). Touches `parallel/window_map.rs` (windows
-become `Arc<CompressedVector>` instead of `Arc<[u8;32768]>`),
-`apply_window.rs` (decompress on lookup), and a new
-`parallel/compressed_vector.rs`.
-
-### Step 14. Port `IndexFileFormat` (~400 LOC, optional)
-
-**Why**: C9. Once Steps 5 (BlockMap) and 11 (windows) are done, this is
-mostly serialization. Provides a future seekable-index export feature.
-
-### Step 15. Port `ChunkData::split` and `setEncodedOffset` (~200 LOC)
-
-**Why**: C19, B2. After Steps 3, 4, 5 land, replace
-`append_block_boundary`'s "always emit subchunk" with rapidgzip's
-boundary-list + post-decode `split` flow. This restores the merge-small-trailing-subchunk
-behavior (B2).
-
-### Step 16. Port `HuffmanCodingDoubleLiteralCached` for the non-ISA-L path (~350 LOC, optional)
-
-**Why**: C1. Restores the multi-symbol decode capability when
-`isal-compression` feature is off (arm64 builds). Currently
-`fast_marker_inflate` uses single-symbol `ConsumeFirstTable` only.
+The right answer in every case: convert silent fallback into a hard
+`Err(GzippyError::Decompression(_))` and let the caller decide. The
+parallel pipeline either runs and verifies CRC + ISIZE, or it
+returns an error. No third path.
 
 ---
 
-## G. Cross-cutting notes
+## G. The bench / test routing-trap
 
-- gzippy's parallel SM path **never** participates in multi-stream gzip
-  decoding. Multi-member input is routed elsewhere
-  (`decompress::decompress_gzip_libdeflate` → multi-member parallel path)
-  before reaching `decompress_parallel`. Steps 2, 10, 11 above would
-  unify these paths.
+### Tests that exist
 
-- gzippy treats CRC32 / ISIZE mismatch at the trailer as terminal
-  corruption, never falling back to libdeflate
-  (`single_member.rs:18–21` doc comment). Rapidgzip throws and the
-  outer driver decides.
+`src/tests/routing.rs` has:
+
+- **`test_marker_pipeline_actually_runs_on_x86_64_isal`** (L298-344)
+  — snapshots `MARKER_PIPELINE_RUNS` around a
+  `decompress_single_member(T=4)` call on a 24 MiB low-entropy
+  fixture. Asserts counter incremented.
+  **Catches F2.** Does NOT catch F1 (gate bypass — fixture is
+  engineered to clear the gate). Does NOT catch F3 (ISA-L did not
+  fail on the fixture).
+- **`test_marker_pipeline_runs_on_btype01_heavy_input`** (L492-525)
+  — same shape against a BTYPE=01-heavy fixture. Same coverage as
+  above.
+- **`test_single_member_routing_multithread`** (L259-276) — asserts
+  byte-correctness of decompress at T=4, no counter check.
+  **Does not detect silent fallback** (libdeflate produces the same
+  bytes).
+- **`test_single_member_parallel_not_slower_than_sequential`** (L365-423)
+  — best-of-3 wall-clock. Two-tier threshold (1.5× on ≥4 physical
+  cores, 3.0× on <4). Would CATCH F1 implicitly on a small enough
+  fixture that hits the gate, because it gates by size and thread
+  count just like prod.
+
+### Test that the user wants
+
+A test that fires on **every** silent fallback path:
+
+> "When `decompress_single_member` is called with conditions that
+> SHOULD route to the parallel path (per the documented routing
+> table), the parallel path actually runs end-to-end, AND any failure
+> is a hard error visible to the caller."
+
+This test must:
+1. Construct an input that satisfies the gate.
+2. Snapshot `MARKER_PIPELINE_RUNS`.
+3. Run `decompress_single_member`.
+4. Assert (counter increased) **AND** (no error).
+5. Repeat for a deliberately-broken input and assert the error is
+   `GzippyError::Decompression(_)`, not silently `Ok(...)` from
+   libdeflate.
+
+Step 5 is the missing rung. It would have caught the silent fallback
+the day the gate logic was added.
+
+---
+
+## H. The unused-port inventory (sober count)
+
+Lines of "rapidgzip ports that no production code calls":
+
+| File | Lines | Production caller |
+|------|-------|-------------------|
+| `block_fetcher.rs` | 323 | none |
+| `block_map.rs` | 317 | none |
+| `cache.rs` | 289 | none |
+| `prefetcher.rs` | 283 | none |
+| `statistics.rs` | 350 | none |
+| `compressed_vector.rs` | 219 | none |
+| `deflate_block.rs` | 964 | none |
+| `gzip_format.rs::read_footer` (~50 lines) | ~50 | none |
+| `inflate_wrapper.rs::read_footer_at_current` / `reset_for_next_stream` (~40 lines) | ~40 | none |
+| `chunk_data.rs::clean_unmarked_data` + `set_encoded_offset` (~80 lines) | ~80 | `set_encoded_offset` IS called from `chunk_fetcher.rs:527`; `clean_unmarked_data` is unused |
+| `gzip_chunk.rs::decode_chunk_with_inflate_wrapper` (38 lines) | 38 | none (tests only) |
+
+**Total unused port code: ~2900 LOC.** Living next to ~2900 LOC of
+production code (`fast_marker_inflate.rs` + `chunk_fetcher.rs` body +
+`gzip_chunk.rs::finish_decode_chunk_with_inexact_offset`) that
+implements the same functionality with different shape and a
+silent-fallback safety net underneath.
+
+---
+
+## I. Single-commit cutover plan
+
+The user's directive: **one commit, no phases, no half-measures.**
+This section is the implementation spec.
+
+### Goal
+
+After this commit:
+
+- `decompress_single_member` routes single-stream gzip (>some
+  minimum) to the rapidgzip-shaped parallel path **only**. No
+  ISA-L-stream fallback, no libdeflate fallback. Failure = hard error.
+- `fast_marker_inflate.rs` is deleted. The bootstrap is `deflate_block.rs`.
+- `chunk_fetcher.rs::drive`'s ad-hoc spec[] + mpsc ring is deleted.
+  Dispatch goes through `block_fetcher.rs` + `block_map.rs` +
+  `prefetcher.rs` + `cache.rs` + `statistics.rs`.
+- `worker_loop` reads gzip headers + footers via
+  `IsalInflateWrapper::read_footer_at_current` +
+  `reset_for_next_stream` (the multi-stream Footer loop, Step 11
+  wired).
+- Window storage in `WindowMap` is `Arc<CompressedVector>`.
+- Marker encoding flipped to match `MapMarkers`
+  (`replace_markers.rs::MARKER_BASE` = `MAX_WINDOW_SIZE` = 32768,
+  indexing from **oldest** byte; SIMD kernels updated).
+- `chunk_data::clean_unmarked_data` runs in `finalize`.
+- Chunk re-anchoring uses `ChunkData::split` + `set_encoded_offset`
+  semantics on the consumer.
+- Header bracketing is `gzip_format::read_header` /
+  `read_footer`. No raw trailer slicing in `single_member.rs`.
+- A new test fails if libdeflate is invoked from the SM path
+  for any reason.
+
+### Files deleted
+
+- `src/decompress/parallel/fast_marker_inflate.rs` (2356 lines)
+- `src/decompress/parallel/inflate_wrapper.rs` `// no buffer refill`
+  variant of `read_stream` if a BitReader-backed variant lands —
+  otherwise unchanged but bound into the multi-stream loop.
+
+### Files rewritten
+
+- `src/decompress/mod.rs` — `decompress_single_member` becomes a
+  single dispatch: classify → parallel-SM. Remove the ISA-L stream
+  branch (L240-252) and the libdeflate branch (L259) **from
+  single-member**. Remove `map_parallel_single_member_error`
+  (L262-287); propagate the error directly. Streaming `>1 GiB`
+  branch stays only for non-x86_64 (where ISA-L is absent) as a
+  documented Tmax=1 path — that decision still belongs to the
+  classifier, not to a silent fallback in the body.
+- `src/decompress/parallel/single_member.rs` —
+  `decompress_parallel` reads header via `gzip_format::read_header`
+  (already does), but stops slicing the trailer inline; instead
+  passes the whole gzip input to `chunk_fetcher::drive`, which
+  reads footer(s) via the inflate wrapper. Remove `ParallelError::TooSmall`
+  as a non-error variant; replace with the actual reason (`InvalidGzipFormat`,
+  `InputTooShortForGzip`, etc.).
+- `src/decompress/parallel/chunk_fetcher.rs` — `drive`
+  constructs `BlockMap`, `BlockFetcher<usize, Arc<ChunkData>,
+  FetchNextAdaptive>`, `WindowMap`, `ChunkFetcherStatistics`.
+  Replace `consumer_loop`'s `spec: Vec<Option<Receiver>>` with
+  `BlockFetcher::get_if_available` / `record_fetch` /
+  `prefetch_indexes` flow. `worker_loop` invokes `BlockFetcher::insert_prefetched`
+  on completion; `consumer_loop` calls `BlockFetcher::insert` for
+  on-demand fetches.
+- `src/decompress/parallel/gzip_chunk.rs` —
+  `finish_decode_chunk_with_inexact_offset` replaces the
+  `fast_marker_inflate::decode_chunk_bootstrap` call site with a
+  `deflate_block::Block` instance: instantiate, `read_header`,
+  `read` in a loop driving a 2×32 KiB `m_window16`-equivalent
+  circular buffer (port the buffer if not already in
+  `deflate_block.rs`). On hand-off threshold (32 KiB cumulative
+  clean output via the rapidgzip cleanDataCount rule), seed
+  `IsalInflateWrapper::set_window` and continue with ISA-L.
+- `src/decompress/parallel/replace_markers.rs` — flip
+  `MARKER_BASE` to `32768` matching MapMarkers, change indexing
+  to `window[v - MARKER_BASE]` (oldest byte), update AVX2 + NEON
+  kernels, update `fast_marker_inflate::emit_match` (but
+  `fast_marker_inflate.rs` is being deleted, so update
+  `deflate_block::emit_backref` instead).
+- `src/decompress/parallel/window_map.rs` — `Arc<[u8;32768]>` →
+  `Arc<CompressedVector>`. `get_or_wait` decompresses on
+  retrieval. Default compression type: `CompressionType::Zlib`
+  (rapidgzip default).
+- `src/decompress/parallel/chunk_data.rs` — call
+  `clean_unmarked_data` from `finalize`. Use `split` semantics for
+  subchunk emission rather than always-push.
+- `src/decompress/parallel/inflate_wrapper.rs` — wire
+  `read_footer_at_current` + `reset_for_next_stream` into the
+  `read_stream` multi-stream loop (or expose them so
+  `worker_loop` can drive the loop). Stream end produces an
+  `Option<Footer>` per stream, accumulated into the chunk.
+
+### New wiring
+
+- `chunk_fetcher::drive` constructs:
+  ```
+  let stats = ChunkFetcherStatistics::new(pool_size);
+  let strategy = FetchNextAdaptive::new(64);
+  let fetcher: BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive> =
+      BlockFetcher::new(cache_capacity, prefetch_capacity, strategy, pool_size);
+  let block_map = BlockMap::new();
+  let window_map = WindowMap::new();
+  ```
+- The consumer loop becomes a port of
+  `GzipChunkFetcher::processNextChunk`
+  (`vendor/.../GzipChunkFetcher.hpp:311-362`): consult
+  `BlockMap::get_block_info(decoded_offset)` (random-access not
+  needed yet, but the structure is in place), or use
+  `partition_offsets[idx]` for the next prefetch; ask
+  `BlockFetcher::get_if_available(block_offset)`; if miss,
+  dispatch on-demand; on completion insert via
+  `BlockFetcher::insert`, push subchunks via
+  `block_map::append_subchunks_to_block_map`, publish per-subchunk
+  windows into `WindowMap` (already wired).
+
+### Integration order within the commit
+
+The implementer should write the commit in this order so they can
+unit-test as they go, but **everything ships in one commit**:
+
+1. **State machine first** — flip marker encoding in `replace_markers.rs`
+   (and AVX2 + NEON kernels), update `deflate_block::emit_backref` to
+   match. Verify `deflate_block.rs`'s in-file tests still pass.
+2. **Decoder loop next** — port the missing pieces of `deflate::Block`
+   (`setInitialWindow`, the `m_window16` circular buffer if missing,
+   block-level statistics shells). Update `gzip_chunk::finish_decode_chunk_with_inexact_offset`
+   to drive `deflate_block::Block` through a multi-block loop with
+   cumulative-clean handoff to `IsalInflateWrapper::set_window`. Add
+   the `set_initial_window` path so once we have ≥ 32 KiB clean
+   output, future blocks emit real bytes (not markers).
+3. **Multi-stream Footer** — wire `IsalInflateWrapper::read_footer_at_current`
+   + `reset_for_next_stream` into the wrapper's `read_stream` (or into
+   `gzip_chunk`'s decode functions). On END_OF_STREAM, accumulate
+   footer to `ChunkData::footers`, push a fresh CRC32 to
+   `ChunkData::crc32s`, call `gzip_format::read_header` on the next
+   bytes, continue.
+4. **Consumer rewrite last** — gut `chunk_fetcher::consumer_loop` and
+   replace with the `BlockFetcher`-backed flow. Wire `BlockMap::push`
+   via `append_subchunks_to_block_map`. Wrap windows in
+   `Arc<CompressedVector>` end-to-end (`window_map`, the publish
+   sites in `worker_loop` L353 and `consumer_loop` L625 / L631).
+   Delete `fast_marker_inflate.rs`. Delete the
+   `chunk_fetcher.rs::decode_or_iterate` BlockFinder loop (it stays
+   inside `BlockFetcher::get`'s on-demand path now).
+5. **Routing cleanup** — in `decompress::decompress_single_member`,
+   delete L240-260 entirely. Replace with:
+   ```rust
+   // Sole single-member path. The parallel pipeline runs and verifies
+   // CRC/ISIZE — or returns an error. No fallback.
+   parallel::single_member::decompress_parallel(data, writer, num_threads)
+       .map_err(|e| GzippyError::decompression(format!("parallel SM: {e}")))
+   ```
+   Delete `map_parallel_single_member_error`. Delete
+   `ParallelError::TooSmall` (or repurpose to "input not single-member
+   gzip" — but that case is unreachable here because
+   `classify_gzip` already filtered).
+6. **Tests added** — see next section.
+
+### Tests the cutover must keep passing (existing)
+
+These tests currently exist and must remain green after the cutover:
+
+- `src/tests/routing.rs::test_file_oracle_roundtrip` (L110)
+- `src/tests/routing.rs::test_detect_bgzf` (L138)
+- `src/tests/routing.rs::test_detect_multi_member` (L157)
+- `src/tests/routing.rs::test_bgzf_path_correctness` (L178)
+- `src/tests/routing.rs::test_multi_member_path_correctness` (L201)
+- `src/tests/routing.rs::test_single_member_path_correctness` (L231)
+- `src/tests/routing.rs::test_single_member_routing_multithread` (L258)
+- `src/tests/routing.rs::test_marker_pipeline_actually_runs_on_x86_64_isal` (L298)
+- `src/tests/routing.rs::test_single_member_parallel_not_slower_than_sequential` (L365)
+- `src/tests/routing.rs::test_marker_pipeline_runs_on_btype01_heavy_input` (L492)
+- `src/tests/routing.rs::test_bgzf_thread_independence` (L546)
+- `src/tests/routing.rs::test_cross_format_output_identity` (L579)
+- `src/tests/routing.rs::test_classify_*` (L622-670)
+- `src/decompress/mod.rs::tests::test_parallel_single_member_only_too_small_is_routing` (L450)
+  — this test must be deleted or rewritten since `TooSmall` no
+  longer flows through `map_parallel_single_member_error` (that
+  function is being deleted).
+- `src/decompress/mod.rs::tests::test_decompress_multi_member_file` (L478)
+- `src/decompress/parallel/single_member.rs::tests::*` (L191-213) —
+  the `single_thread_returns_too_small` test must be updated since
+  the gate decision moves to the routing layer.
+- `src/decompress/parallel/chunk_fetcher.rs::tests::drive_round_trips_2mb_level6` (L726)
+- `src/decompress/parallel/chunk_fetcher.rs::tests::drive_round_trips_8mb_level9` (L741)
+- All in-file tests for `block_finder.rs`, `block_fetcher.rs`,
+  `block_map.rs`, `cache.rs`, `prefetcher.rs`, `chunk_data.rs`,
+  `deflate_block.rs`, `compressed_vector.rs`, `gzip_format.rs`,
+  `inflate_wrapper.rs`, `replace_markers.rs` (post-encoding-flip).
+
+### Tests required (new)
+
+1. **`test_no_libdeflate_fallback_ever_fires_from_sm_path`** — a
+   test-only `AtomicU64` counter wrapping calls to
+   `decompress_single_member_libdeflate` and
+   `isal_decompress::decompress_gzip_stream` from the SM path.
+   Snapshot before / after a series of single-member decodes that
+   should route to parallel. Assert delta == 0. After the cutover,
+   the only way for the counter to increment from the SM path is a
+   bug.
+
+2. **`test_parallel_sm_propagates_errors_not_fallbacks`** —
+   construct a single-member gzip whose CRC trailer is wrong.
+   Assert `decompress_single_member` returns
+   `Err(GzippyError::Decompression(_))`. Today, depending on which
+   variant of corruption, gzippy might silently libdeflate-decode
+   (which detects CRC) and return Err — but it might also produce
+   inconsistent output. Lock it down.
+
+3. **`test_parallel_sm_routes_below_10mib`** — after the cutover,
+   the 10 MiB gate at L221 either stays (justified by perf) or
+   leaves (no gate). If it stays, write a test for an 8 MiB
+   compressed gzip that asserts a specific known-routing decision
+   — either it goes parallel anyway, or it goes through the
+   single-thread variant of the parallel pipeline (T=1). Document
+   the choice; don't keep "below 10 MiB → libdeflate" as a
+   silent fork.
+
+4. **`test_block_fetcher_in_drive`** — assert the production
+   `drive` path constructs and uses a `BlockFetcher`. Smoke test
+   that `ChunkFetcherStatistics::record_get` was called at least
+   once after a decode.
+
+5. **`test_window_map_uses_compressed_vector`** — type-level: the
+   `WindowMap` field type is `Arc<CompressedVector>` not
+   `Arc<[u8;32768]>`. Compile-time fence.
+
+6. **`test_multi_stream_in_parallel_sm`** — feed a multi-member gzip
+   directly to the parallel SM path (bypass routing) and assert
+   byte-correct output. Today this can't work; after the cutover
+   the multi-stream Footer loop should handle it.
+
+### Acceptance
+
+The cutover is complete when:
+
+- `make` is green.
+- `make ship` shows non-trivial throughput on
+  `single-member-large.gz` and the bench script does NOT emit the
+  `[SILENT FALLBACK]` warning.
+- `MARKER_PIPELINE_RUNS` (or a renamed `PARALLEL_SM_RUNS`) is the
+  ONLY way `decompress_single_member` produces output on
+  parallel-eligible input.
+- `fast_marker_inflate.rs` is gone from `git ls-files`.
+- The unused-port LOC tally in §H drops to zero on
+  `cache.rs` / `block_fetcher.rs` / `block_map.rs` / `prefetcher.rs`
+  / `statistics.rs` / `compressed_vector.rs` / `deflate_block.rs`.
+
+### Pre-commit judgment-call checklist
+
+Before the implementer commits:
+
+- [ ] No file in `src/decompress/parallel/` is `pub mod`-exported but
+      uncalled.
+- [ ] `grep -rn 'libdeflate' src/decompress/parallel/` returns only
+      doc comments, never code paths.
+- [ ] `decompress_single_member` body has no `if-let-Some-else-fall-through`
+      pattern.
+- [ ] No `Err(_) => decompress_*` arms.
+- [ ] All new tests above are present and green.
+- [ ] `GZIPPY_DEBUG=1 gzippy -d -c large.gz > /dev/null` shows
+      `path=IsalSingle` or the new equivalent, and the per-chunk
+      trace lines fire.
+
+---
+
+## J. Cross-cutting notes
+
+- Multi-member gzip currently bypasses the parallel SM module
+  entirely via `classify_gzip` → `MultiMemberPar`/`MultiMemberSeq`
+  (`decompress/mod.rs:76-82`). After Footer-loop wiring lands in the
+  cutover, the parallel SM path *could* handle multi-member —
+  consolidating the routes is a follow-up, NOT part of this
+  one-commit cutover. The cutover only owns the single-member path.
+
+- CRC32 / ISIZE mismatch at the trailer remains terminal corruption.
+  The cutover does not change that; it only removes the silent
+  libdeflate retry above the trailer-check level.
+
+- Streaming-write trade-off: bytes flow to the writer as each chunk
+  resolves, so a late CRC/ISIZE mismatch leaves partial bytes
+  written. This is documented at `single_member.rs:17-21`. Out of
+  scope for the cutover; the rapidgzip parent path has the same
+  property.
+
+- The `block_finder.rs` deviations (B7, B8) are not part of the
+  cutover. They predate it and don't affect the
+  `BlockFetcher`/`BlockMap` wiring.
 
 - Naming: rapidgzip uses `encodedOffsetInBits` / `decodedOffsetInBytes`;
-  gzippy uses `encoded_offset_bits` / `decoded_offset`. Pure style.
-
-- Bit-position arithmetic: both sides compute "absolute bit position"
-  the same way (`input_len * 8 - avail_in * 8 - read_in_length`), but
-  rapidgzip routes this through `BitReader::tell()` while gzippy
-  computes it manually inside `IsalInflateWrapper::tell_compressed` and
-  inside `finish_decode_chunk_with_inexact_offset`. No semantic
-  difference.
-
-- Test policy: every Rust file in `parallel/` has unit tests, and the
-  whole pipeline is covered by `src/tests/routing.rs` (the
-  "deletion-trap killer test"). Rapidgzip's tests live separately
-  under `vendor/rapidgzip/tests/`; we do not run them.
+  gzippy uses `encoded_offset_bits` / `decoded_offset`. Style only.

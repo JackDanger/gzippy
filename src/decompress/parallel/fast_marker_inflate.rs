@@ -1390,7 +1390,8 @@ mod tests {
     /// Sized identically to the routing fixture so a regression of either
     /// failure surfaces here. Gated on the production target since the
     /// rapidgzip-port path lives behind x86_64 + ISA-L; on other targets
-    /// decompress_parallel correctly returns TooSmall.
+    /// the classifier routes to `LibdeflateSingle`/`IsalSingle` instead
+    /// and `decompress_parallel` is never called.
     #[test]
     #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
     fn end_to_end_low_entropy_24mb_t4_matches_oracle() {
