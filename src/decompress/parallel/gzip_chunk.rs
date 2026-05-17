@@ -180,10 +180,22 @@ pub fn finish_decode_chunk_with_inexact_offset(
     wrapper.set_stopping_points(StoppingPoints::END_OF_BLOCK | StoppingPoints::END_OF_BLOCK_HEADER);
 
     let mut buf = vec![0u8; ALLOCATION_CHUNK_SIZE];
+    let debug_isal = std::env::var("GZIPPY_DEBUG_ISAL").is_ok();
+    let mut iter = 0usize;
+    let mut stops_eob = 0usize;
+    let mut stops_eobh = 0usize;
+    let mut stops_other = 0usize;
     loop {
         let r = wrapper.read_stream(&mut buf)?;
         if r.bytes_written > 0 {
             chunk.append_clean(&buf[..r.bytes_written]);
+        }
+        iter += 1;
+        if debug_isal && iter <= 100 {
+            eprintln!(
+                "  [isal] iter={} wrote={} stopped_at={:?} bit={} until={} finished={}",
+                iter, r.bytes_written, r.stopped_at, r.bit_position, until_bits, r.finished
+            );
         }
 
         // Per-iteration max guard. Single huge blocks can produce
@@ -198,6 +210,7 @@ pub fn finish_decode_chunk_with_inexact_offset(
             break;
         }
         if r.stopped_at == StoppingPoints::END_OF_BLOCK {
+            stops_eob += 1;
             let next_block_off = wrapper.tell_compressed();
             // Position is at the START of the next block (or BFINAL
             // padding). Stop if we've crossed the partition's until.
@@ -208,6 +221,7 @@ pub fn finish_decode_chunk_with_inexact_offset(
             continue;
         }
         if r.stopped_at == StoppingPoints::END_OF_BLOCK_HEADER {
+            stops_eobh += 1;
             let next_block_off = wrapper.tell_compressed();
             let not_final = !wrapper.is_final_block();
             let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
@@ -218,11 +232,25 @@ pub fn finish_decode_chunk_with_inexact_offset(
             wrapper.clear_stop();
             continue;
         }
+        if r.stopped_at != StoppingPoints::NONE {
+            stops_other += 1;
+        }
         if r.bytes_written == 0 {
             // Decoder produced nothing and didn't stop at a requested
             // point → input exhausted or finished mid-block.
             break;
         }
+    }
+    if debug_isal {
+        eprintln!(
+            "  [isal] done iter={} eob={} eobh={} other_stops={} bit={} decoded={}",
+            iter,
+            stops_eob,
+            stops_eobh,
+            stops_other,
+            wrapper.tell_compressed(),
+            chunk.decoded_size()
+        );
     }
 
     chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
