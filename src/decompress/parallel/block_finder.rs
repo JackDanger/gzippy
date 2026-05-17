@@ -261,9 +261,21 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// Peek up to `n` bits. Caller must ensure `bits_available >= n` —
+    /// use `peek_refilled` for the safe variant.
     #[inline]
     pub fn peek(&self, n: u8) -> u64 {
         self.bit_buf & ((1u64 << n) - 1)
+    }
+
+    /// Refill if needed, then peek. Use for reads larger than the
+    /// refill watermark (e.g. 57-bit precode reads).
+    #[inline]
+    pub fn peek_refilled(&mut self, n: u8) -> u64 {
+        if self.bits_available < n {
+            self.refill();
+        }
+        self.peek(n)
     }
 
     #[inline]
@@ -275,8 +287,13 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// Read up to `n` bits, refilling first if necessary. Safe for
+    /// any n ≤ 57.
     #[inline]
     pub fn read(&mut self, n: u8) -> u64 {
+        if self.bits_available < n {
+            self.refill();
+        }
         let val = self.peek(n);
         self.skip(n);
         val
@@ -723,11 +740,6 @@ impl<'a> BlockFinder<'a> {
                     let hclen = ((header >> 13) & 15) as u8;
 
                     if hlit > 29 || hdist > 29 {
-                        crate::decompress::parallel::trace::emit(
-                            "block-finder",
-                            "reject_hlit_hdist",
-                            &format!(r#""bit_offset":{bit_offset},"hlit":{hlit},"hdist":{hdist}"#),
-                        );
                         reader.skip(1);
                         bit_offset += 1;
                         continue;
@@ -744,11 +756,6 @@ impl<'a> BlockFinder<'a> {
                     let precode_bits = reader.read(precode_bit_count as u8);
 
                     if !validate_precode(precode_count, precode_bits) {
-                        crate::decompress::parallel::trace::emit(
-                            "block-finder",
-                            "reject_precode_leafsum",
-                            &format!(r#""bit_offset":{bit_offset}"#),
-                        );
                         reader.seek_to_bit(bit_offset + 1);
                         bit_offset += 1;
                         continue;
@@ -771,21 +778,7 @@ impl<'a> BlockFinder<'a> {
                                 hdist,
                                 hclen,
                             });
-                        } else {
-                            crate::decompress::parallel::trace::emit(
-                                "block-finder",
-                                "reject_huffman_codes",
-                                &format!(
-                                    r#""bit_offset":{bit_offset},"hlit":{hlit},"hdist":{hdist},"hclen":{hclen}"#
-                                ),
-                            );
                         }
-                    } else {
-                        crate::decompress::parallel::trace::emit(
-                            "block-finder",
-                            "reject_parse_precode",
-                            &format!(r#""bit_offset":{bit_offset}"#),
-                        );
                     }
 
                     reader.seek_to_bit(bit_offset + 1);

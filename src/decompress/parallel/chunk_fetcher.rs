@@ -206,25 +206,7 @@ fn decode_or_iterate(
     let finder = BlockFinder::new(input);
     let scan_end = (start_bit + 512 * 1024 * 8).min(input.len() * 8);
     let candidates = finder.find_blocks(start_bit, scan_end);
-    trace::emit(
-        "candidates",
-        "find_blocks_result",
-        &format!(
-            r#""start_bit":{start_bit},"scan_end":{scan_end},"count":{}"#,
-            candidates.len()
-        ),
-    );
     let mut last_err: Option<ChunkDecodeError> = None;
-    for candidate in &candidates {
-        trace::emit(
-            "candidates",
-            "candidate_offer",
-            &format!(
-                r#""start_bit":{start_bit},"candidate":{}"#,
-                candidate.bit_offset
-            ),
-        );
-    }
     for candidate in candidates {
         if candidate.bit_offset <= start_bit {
             continue;
