@@ -905,6 +905,27 @@ The plan below is in **priority order** for restoring structural fidelity
 to rapidgzip. Each step is sized to land as one PR. Per-step LOC estimates
 exclude tests.
 
+**Status snapshot** (after the structural-gap-closure session):
+- ✅ Step 1 (e335a28): marker encoding flipped to MapMarkers
+- ✅ Step 2 (78ba3d8): Footer + crc32s vector
+- ✅ Step 3 (d3ae688): per-subchunk window emplacement
+- ✅ Step 4 (08e5224): ChunkData::setEncodedOffset
+- ✅ Step 5 (c808396): BlockMap
+- ⏳ Step 6: BlockFetcher cache + Prefetcher (~600 LOC, not started)
+- ⏳ Step 7: deflate::Block port (~1500 LOC, not started — biggest)
+- ✅ Step 8 (f2f2ae6): DecodedData::cleanUnmarkedData
+- ✅ Step 9 (bc8c50c): appendSubchunksToIndexes BlockMap insertion
+- ✅ Step 10 (0728eca): gzip readHeader + readFooter
+- ✅ Step 11 (9f5b291): IsalInflateWrapper footer + multi-stream methods
+- ✅ Step 12 (f6c1e4f): fetcher statistics
+- ✅ Step 13 (87fba04): CompressedVector
+- ⏳ Step 14: IndexFileFormat (~400 LOC, optional)
+- ✅ Step 15 (f6c1e4f): ChunkData::split
+- ⏳ Step 16: HuffmanCodingDoubleLiteralCached (~350 LOC, optional)
+
+12 of 16 steps landed (75%). Remaining: Step 6 + 7 (the two largest)
+and Steps 14 + 16 (both marked optional).
+
 ### Step 1. Align marker encoding with rapidgzip's `MapMarkers` (~150 LOC)
 
 **Why**: B1 / D4. The current encoding (`MARKER_BASE + offset`, indexing
