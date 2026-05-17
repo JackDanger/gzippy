@@ -9,6 +9,20 @@
 
 ## CUTOVER POLICY (May 2026, user directive)
 
+**SCOPE: ALL OF RAPIDGZIP, not just parallel single-member.** The goal is
+to port every primitive, decoder, format, block finder, huffman variant,
+reader, index, and analyzer from `vendor/rapidgzip/librapidarchive/` into
+gzippy with vendor file:line citations. See CLAUDE.md "Cutover Goal" for
+the full inventory (gzip + BGZF + BZIP2 + ZLIB + raw DEFLATE; ThreadPool,
+ParallelGzipReader, IndexFileFormat, GzipAnalyzer; all blockfinders; all
+Huffman variants; all core primitives).
+
+This doc focused on the parallel single-member path because that was the
+first cutover area. As ports of BZIP2, ZLIB, IndexFileFormat, ParallelGzipReader,
+ThreadPool, blockfinders, and remaining Huffman variants land, this doc
+should grow to cover them too (per-area component map, deviations, missing
+pieces, extra pieces).
+
 The goal until the rapidgzip port is structurally complete is **faithful
 correctness, not performance**. Intermediate states will be slower than
 steady state. That is expected and accepted.
@@ -18,19 +32,19 @@ steady state. That is expected and accepted.
 - **DO NOT revert perf regressions.** Ship every faithful port commit
   even when `make bench-sm` shows a perf loss. Performance is optimized
   LATER, after the structural port is complete.
-- **PORT, DON'T INNOVATE.** Every change in `src/decompress/parallel/`
-  must mirror a specific rapidgzip C++ region. Cite `vendor/.../file:line`
-  in code comments AND commit messages. If no rapidgzip counterpart
-  exists, do not write the code. Crossbeam-channel, custom thread pools,
-  unique algorithms: all out of scope during the cutover.
+- **PORT, DON'T INNOVATE.** Every change must mirror a specific rapidgzip
+  C++ region. Cite `vendor/.../file:line` in code comments AND commit
+  messages. If no rapidgzip counterpart exists, do not write the code.
+  Crossbeam-channel, custom thread pools, unique algorithms: all out of
+  scope during the cutover.
 - **CORRECTNESS still matters.** Output bytes, CRC32, ISIZE must always
   verify. Tests under `src/tests/routing.rs` must stay green.
 - **NO FALLBACKS.** Failure is `Err(GzippyError::Decompression(_))`.
   No silent libdeflate or ISA-L retries.
 
-Done when an Opus advisor agrees the implementation matches rapidgzip
-in structure and calculation. Then — and only then — does performance
-optimization start.
+Done when an Opus advisor agrees gzippy structurally and calculationally
+matches the FULL rapidgzip surface (not a subset). Then — and only then —
+does performance optimization start.
 
 Citations are `file:line` against:
 

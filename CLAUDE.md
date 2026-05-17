@@ -4,6 +4,35 @@
 
 **gzippy aims to be the fastest gzip implementation ever created.**
 
+## Cutover Goal (May 2026)
+
+**Port all of rapidgzip into Rust, faithfully.** Not just the parallel single-
+member path. The goal is **every primitive, decoder, format, block finder,
+huffman variant, reader, index, and analyzer in `vendor/rapidgzip/librapidarchive/`
+ported into gzippy with vendor file:line citations.** That includes:
+
+- **Formats**: gzip, BGZF, BZIP2, ZLIB, raw DEFLATE — every codec rapidgzip
+  supports.
+- **Decoders**: `chunkdecoding/GzipChunk`, `chunkdecoding/Bzip2Chunk`,
+  `gzip/GzipReader`, `gzip/GzipAnalyzer`, `gzip/InflateWrapper`, `gzip/isal`,
+  `gzip/zlib`.
+- **Block finders**: `blockfinder/Bgzf`, `blockfinder/DynamicHuffman`,
+  `blockfinder/Uncompressed`, `blockfinder/PigzStringView`,
+  `blockfinder/precodecheck/CountAllocatedLeaves`.
+- **Huffman variants**: `HuffmanCodingDoubleLiteralCached`, `HuffmanCodingISAL`,
+  `HuffmanCodingReversedBitsCached*`, `HuffmanCodingShortBitsMultiCached*`,
+  `HuffmanCodingDistanceISAL`.
+- **Core primitives**: `ThreadPool` (the real one), `BitStringFinder`,
+  `ParallelBitStringFinder`, `StreamedResults`, `SimpleRunLengthEncoding`,
+  `AtomicMutex`, `AffinityHelpers`, `AlignedAllocator`, `FasterVector`,
+  `FileRanges`, `JoiningThread`, etc.
+- **High-level**: `ParallelGzipReader`, `IndexFileFormat`, `rapidgzip.hpp`
+  public API surface.
+
+Done when an Opus advisor agrees gzippy structurally and calculationally
+matches the FULL rapidgzip surface (not a subset). Performance optimization
+happens after that.
+
 ## Rules
 
 1. **ONE PRODUCTION PATH** — know exactly which function the CLI calls. Test that function.
