@@ -21,6 +21,7 @@
 //!   `marker_decode` and a handful of bgzf benches.
 
 pub mod apply_window;
+pub mod block_fetcher;
 pub mod block_finder;
 pub mod block_map;
 pub mod cache;
