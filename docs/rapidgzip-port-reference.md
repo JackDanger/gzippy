@@ -911,12 +911,13 @@ exclude tests.
 - ✅ Step 3 (d3ae688): per-subchunk window emplacement
 - ✅ Step 4 (08e5224): ChunkData::setEncodedOffset
 - ✅ Step 5 (c808396): BlockMap
-- ◐ Step 6: BlockFetcher cache + Prefetcher (~600 LOC, partial)
+- ✅ Step 6: BlockFetcher cache + Prefetcher (~600 LOC, complete)
   - ✅ 6a (45cb6db): Cache + LeastRecentlyUsed + CacheStatistics
   - ✅ 6b (b3bf3dc): FetchingStrategy + FetchNextFixed + FetchNextAdaptive
-  - ⏳ 6c: BlockFetcher orchestration (cache + prefetch_cache + strategy
-    + statistics integration, including unsplit_blocks remap, thread
-    pool, get/getIfAvailable APIs)
+  - ✅ 6c (d57cd0a): BlockFetcher orchestration (composes Cache,
+    Prefetcher, Statistics; get_if_available / insert /
+    insert_prefetched / record_fetch / prefetch_indexes /
+    sequential-clear / failed_prefetch / in-flight set)
 - ⏳ Step 7: deflate::Block port (~1500 LOC, not started — biggest)
 - ✅ Step 8 (f2f2ae6): DecodedData::cleanUnmarkedData
 - ✅ Step 9 (bc8c50c): appendSubchunksToIndexes BlockMap insertion
