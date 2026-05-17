@@ -192,14 +192,19 @@ impl<'a> GzipChunkFetcher<'a> {
             });
         }
         let idx = self.next_consumer_index;
-        let mut chunk = self.chunk_slots[idx]
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
-                requested: 0,
+        let mut chunk = self.chunk_slots[idx].lock().unwrap().take().ok_or_else(|| {
+            if std::env::var("GZIPPY_DEBUG").is_ok() {
+                eprintln!(
+                    "[parallel_sm:rapidgzip] chunk[{}] slot was None at consumer (partition_offset={}); \
+                     worker either failed to find boundary or decode errored",
+                    idx, self.partition_offsets[idx]
+                );
+            }
+            FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+                requested: idx,
                 actual: 0,
-            }))?;
+            })
+        })?;
 
         // Look up the window for this chunk's start. Chunk 0 gets the
         // pre-seeded empty window; chunks 1..N get whatever the
