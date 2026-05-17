@@ -231,6 +231,65 @@ impl<'a> IsalInflateWrapper<'a> {
             - self.state.read_in_length.max(0) as usize
     }
 
+    /// Read the 8-byte gzip footer at the current decoder position
+    /// (assumed to be at end-of-stream, byte-aligned). Advances ISA-L's
+    /// input cursor past the footer. Returns `(crc32, isize)`.
+    ///
+    /// Mirror of rapidgzip's `IsalInflateWrapper::readFooter`
+    /// (gzip/isal.hpp), which is called by the rapidgzip chunk worker
+    /// when an `END_OF_STREAM` stop fires. The footer fields are then
+    /// validated against the chunk's running CRC32 + decoded-byte count
+    /// and recorded on the chunk via `ChunkData::appendFooter`.
+    pub fn read_footer_at_current(&mut self) -> Result<(u32, u32), InflateError> {
+        // ISA-L always aligns to a byte boundary at END_OF_STREAM. We
+        // pull 8 bytes from next_in. If the bit buffer has leftover
+        // bits, advance via inflate_in_read_bits (but at END_OF_STREAM
+        // the wrapper guarantees bit-alignment so read_in_length is 0).
+        if self.state.read_in_length > 0 {
+            // Drain bits to align (mirrors rapidgzip's readFooter which
+            // reads the padding bits before the footer).
+            let bits_to_drain = self.state.read_in_length as u32 % 8;
+            if bits_to_drain > 0 {
+                self.state.read_in >>= bits_to_drain;
+                self.state.read_in_length -= bits_to_drain as i32;
+            }
+        }
+        if self.state.avail_in < 8 {
+            return Err(InflateError::Internal(-1));
+        }
+        let p = self.state.next_in;
+        let bytes: [u8; 8] = unsafe { std::ptr::read_unaligned(p as *const [u8; 8]) };
+        let crc32 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let isize_field = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        unsafe {
+            self.state.next_in = p.add(8);
+        }
+        self.state.avail_in -= 8;
+        Ok((crc32, isize_field))
+    }
+
+    /// Reset the wrapper's internal state to begin decoding a fresh
+    /// gzip stream from the current input position. Mirror of rapidgzip's
+    /// `IsalInflateWrapper::setNeedToReadHeader` + subsequent `readHeader`
+    /// (gzip/isal.hpp). The caller must have already advanced past the
+    /// previous stream's footer (via `read_footer_at_current`) and the
+    /// next gzip header (via `gzip_format::read_header`).
+    pub fn reset_for_next_stream(&mut self) {
+        unsafe { isal_raw::isal_inflate_init(&mut self.state) };
+        // Preserve cursor position (next_in/avail_in were advanced by
+        // the footer + header reads); reset only the decode state.
+        self.state.crc_flag = isal_raw::ISAL_DEFLATE;
+        self.state.points_to_stop_at = 0;
+        self.state.stopped_at = 0;
+    }
+
+    /// Returns true iff the current decode has hit a stream end
+    /// (END_OF_STREAM) and not yet been advanced. Caller uses this to
+    /// decide whether to read footer + next header before resuming.
+    pub fn at_end_of_stream(&self) -> bool {
+        self.stopped_at() == StoppingPoints::END_OF_STREAM
+    }
+
     /// Pump bytes into `output` until any of:
     ///   - output buffer is full
     ///   - a requested stopping point fires
