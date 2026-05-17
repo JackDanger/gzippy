@@ -78,6 +78,27 @@ impl Default for ChunkConfiguration {
     }
 }
 
+/// Per-stream gzip footer (the 8 bytes after the final deflate block
+/// of a gzip stream). Port of `rapidgzip::gzip::Footer`
+/// (vendor/rapidgzip/.../gzip/gzip.hpp:151-155) wrapped with rapidgzip's
+/// outer `rapidgzip::Footer` (gzip.hpp:420-448) which records the
+/// associated block boundary. We only record the gzip CRC32 + ISIZE +
+/// the boundary at footer-end (post-footer file offset).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Footer {
+    /// Gzip footer CRC32 (last 8 bytes, little-endian: CRC32 then ISIZE).
+    pub crc32: u32,
+    /// Gzip footer ISIZE field, low 32 bits of uncompressed stream size.
+    pub uncompressed_size: u32,
+    /// Bit offset in the compressed stream where this footer's stream ends
+    /// (footer-end). For a multi-stream input, the next gzip header starts
+    /// at this position.
+    pub end_bit_offset: usize,
+    /// Decoded byte offset within the chunk where this stream's bytes
+    /// end. Used to delimit which CRC32 in `crc32s` covers which bytes.
+    pub decoded_end_offset: usize,
+}
+
 /// Port of `rapidgzip::ChunkData` (ChunkData.hpp:80-400) + the
 /// `DecodedData` base it inherits from. The two-segment layout
 /// (`data_with_markers` then `data`) matches rapidgzip's
@@ -111,9 +132,18 @@ pub struct ChunkData {
     /// decoder hits a boundary AND `decoded_size >= split_chunk_size`
     /// since the last subchunk.
     pub subchunks: Vec<Subchunk>,
-    /// Per-chunk CRC. Combined into the gzip-trailer CRC32 in chunk
-    /// order at end of decode.
-    pub crc: crc32fast::Hasher,
+    /// One CRC32 hasher per gzip stream this chunk spans. For a
+    /// single-stream chunk (the common case) this is a single-element
+    /// vector. Rapidgzip allocates a new entry when an `END_OF_STREAM`
+    /// stopping point fires mid-chunk (`ChunkData.hpp:228-243`). The
+    /// first entry covers `data_with_markers ++ data[0..footers[0].decoded_end_offset]`
+    /// (after `apply_window`); subsequent entries cover the bytes between
+    /// consecutive footers.
+    pub crc32s: Vec<crc32fast::Hasher>,
+    /// Footers detected in this chunk, one per gzip stream that ended
+    /// inside the chunk's compressed range. Mirror of rapidgzip's
+    /// `ChunkData::footers` (ChunkData.hpp:472-489 `appendFooter`).
+    pub footers: Vec<Footer>,
     /// True iff the inexact decoder hit `max_decoded_chunk_size`
     /// before reaching the requested `until_bits`. Tells the
     /// dispatcher this chunk needs a successor starting at
@@ -148,7 +178,8 @@ impl ChunkData {
             data_with_markers: Vec::new(),
             data: Vec::new(),
             subchunks: vec![first_subchunk],
-            crc: crc32fast::Hasher::new(),
+            crc32s: vec![crc32fast::Hasher::new()],
+            footers: Vec::new(),
             stopped_preemptively: false,
             statistics: ChunkStatistics::default(),
             configuration,
@@ -237,16 +268,40 @@ impl ChunkData {
 
     /// Append clean (already-resolved) output bytes. Mirror of
     /// `ChunkData::append(DecodedDataView)` for the non-marker branch.
-    /// CRC32'd immediately if enabled.
+    /// CRC32'd immediately if enabled. The CRC always feeds the most
+    /// recent stream's hasher (`crc32s.last_mut()`); cross-stream byte
+    /// runs are split by `append_footer`.
     pub fn append_clean(&mut self, bytes: &[u8]) {
         if self.configuration.crc32_enabled {
-            self.crc.update(bytes);
+            if let Some(last_crc) = self.crc32s.last_mut() {
+                last_crc.update(bytes);
+            }
         }
         self.statistics.non_marker_count += bytes.len() as u64;
         self.data.extend_from_slice(bytes);
         if let Some(last) = self.subchunks.last_mut() {
             last.decoded_size += bytes.len();
         }
+    }
+
+    /// Literal port of `ChunkData::appendFooter`
+    /// (vendor/rapidgzip/.../ChunkData.hpp:472-489). Records that a gzip
+    /// stream ended at `end_bit_offset` (= byte position immediately
+    /// after the 8-byte footer) AND the chunk's current decoded-byte
+    /// position is the boundary. Starts a fresh CRC hasher for the next
+    /// stream's bytes (mirrors rapidgzip allocating a new
+    /// `CRC32Calculator` in its `crc32s` vector).
+    pub fn append_footer(&mut self, crc32: u32, uncompressed_size: u32, end_bit_offset: usize) {
+        self.footers.push(Footer {
+            crc32,
+            uncompressed_size,
+            end_bit_offset,
+            decoded_end_offset: self.decoded_size(),
+        });
+        // Open a fresh hasher for the next stream's bytes. If no more
+        // bytes follow, the trailing empty hasher's CRC == 0 and the
+        // consumer's combine treats it as a no-op.
+        self.crc32s.push(crc32fast::Hasher::new());
     }
 
     /// Called by the decoder when it hits a real deflate block boundary.
@@ -462,7 +517,7 @@ mod tests {
         // CRC of "hello world" — non-zero, deterministic.
         let mut expected = crc32fast::Hasher::new();
         expected.update(b"hello world");
-        assert_eq!(chunk.crc.clone().finalize(), expected.finalize());
+        assert_eq!(chunk.crc32s[0].clone().finalize(), expected.finalize());
         assert_eq!(chunk.subchunks[0].decoded_size, 11);
     }
 
@@ -552,6 +607,6 @@ mod tests {
         let mut chunk = ChunkData::new(0, cfg);
         chunk.append_clean(b"hello world");
         // CRC unchanged from identity.
-        assert_eq!(chunk.crc.clone().finalize(), 0);
+        assert_eq!(chunk.crc32s[0].clone().finalize(), 0);
     }
 }

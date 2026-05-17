@@ -37,15 +37,11 @@ pub fn apply_window(chunk: &mut ChunkData, window: &[u8]) {
     );
 
     // CRC accounting: data_with_markers' resolved bytes precede `data`
-    // in the output stream. data was CRC'd at append time. To rebuild
-    // chunk.crc so it covers (resolved_markers ++ data) in order,
-    // compute CRC of the resolved bytes and combine BEFORE chunk.crc.
-    //
-    // The post-resolve `data_with_markers` is guaranteed (by the
-    // debug_assert above) to hold only values < 256 (i.e. valid u8
-    // values stored in the low byte of a u16). We hash the bytes in
-    // 4 KiB stack chunks to avoid a 0.5×len allocation on large chunks.
-    if chunk.configuration.crc32_enabled {
+    // in the output stream. data was CRC'd at append time. Per rapidgzip
+    // (ChunkData.hpp:432: "data with markers ought not cross footer
+    // boundaries"), markers belong entirely to the FIRST stream, so we
+    // prepend the resolved-markers CRC into crc32s[0].
+    if chunk.configuration.crc32_enabled && !chunk.crc32s.is_empty() {
         let mut resolved_crc = crc32fast::Hasher::new();
         let mut scratch = [0u8; 4096];
         let mut i = 0;
@@ -57,8 +53,8 @@ pub fn apply_window(chunk: &mut ChunkData, window: &[u8]) {
             resolved_crc.update(&scratch[..n]);
             i += n;
         }
-        resolved_crc.combine(&chunk.crc);
-        chunk.crc = resolved_crc;
+        resolved_crc.combine(&chunk.crc32s[0]);
+        chunk.crc32s[0] = resolved_crc;
     }
 
     chunk.statistics.apply_window_duration_ns += t0.elapsed().as_nanos() as u64;
@@ -114,13 +110,13 @@ mod tests {
     fn apply_window_is_noop_when_no_markers() {
         let mut chunk = ChunkData::new(0, config());
         chunk.append_clean(b"hello world");
-        let original_crc = chunk.crc.clone().finalize();
+        let original_crc = chunk.crc32s[0].clone().finalize();
         let window = make_window(|i| (i % 251) as u8);
         apply_window(&mut chunk, &window);
         // No mutation: data_with_markers is empty, data unchanged, CRC unchanged.
         assert!(chunk.data_with_markers.is_empty());
         assert_eq!(chunk.data, b"hello world");
-        assert_eq!(chunk.crc.clone().finalize(), original_crc);
+        assert_eq!(chunk.crc32s[0].clone().finalize(), original_crc);
     }
 
     #[test]
@@ -141,7 +137,7 @@ mod tests {
         expected_bytes.extend_from_slice(&chunk.data);
         let mut expected_crc = crc32fast::Hasher::new();
         expected_crc.update(&expected_bytes);
-        assert_eq!(chunk.crc.clone().finalize(), expected_crc.finalize());
+        assert_eq!(chunk.crc32s[0].clone().finalize(), expected_crc.finalize());
     }
 
     #[test]
@@ -156,7 +152,7 @@ mod tests {
         let window = make_window(|_i| 0xAB);
         apply_window(&mut chunk, &window);
         // CRC stays at identity (never updated).
-        assert_eq!(chunk.crc.clone().finalize(), 0);
+        assert_eq!(chunk.crc32s[0].clone().finalize(), 0);
         // But markers still resolved.
         assert_eq!(chunk.data_with_markers[2] as u8, 0xAB);
     }
