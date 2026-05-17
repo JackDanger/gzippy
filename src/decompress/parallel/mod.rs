@@ -43,5 +43,6 @@ pub mod prefetcher;
 pub mod replace_markers;
 pub mod single_member;
 pub mod statistics;
+pub mod thread_pool;
 pub mod trace;
 pub mod window_map;
