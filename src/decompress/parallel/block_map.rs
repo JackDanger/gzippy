@@ -107,7 +107,26 @@ impl BlockMap {
             Ok(i) => {
                 let match_decoded = g.block_to_data_offsets[i].1;
                 if i + 1 >= g.block_to_data_offsets.len() {
-                    panic!("BlockMap: duplicate offset is the most-recent — should have appended");
+                    let tail: Vec<(usize, usize)> = g
+                        .block_to_data_offsets
+                        .iter()
+                        .rev()
+                        .take(6)
+                        .rev()
+                        .copied()
+                        .collect();
+                    panic!(
+                        "BlockMap: duplicate offset is the most-recent — should have appended.\n  \
+                         push(encoded={}, encoded_size={}, decoded_size={})\n  \
+                         last_block_encoded_size={} last_block_decoded_size={}\n  \
+                         tail entries (enc, dec): {:?}",
+                        encoded_block_offset,
+                        encoded_size,
+                        decoded_size,
+                        g.last_block_encoded_size,
+                        g.last_block_decoded_size,
+                        tail,
+                    );
                 }
                 let next_decoded = g.block_to_data_offsets[i + 1].1;
                 let implied = next_decoded - match_decoded;
