@@ -956,13 +956,15 @@ pub(crate) fn decode_chunk_for_fetcher(
     //  1. cheap validate_boundary (32 KB ISA-L + 1-block strict marker
     //     check). Filters most false positives without allocating per-
     //     candidate decode buffers.
-    //  2. full decode_chunk_inexact for the single validated winner.
+    //  2. full decode_chunk_inexact for the single validated winner,
+    //     bounded by ChunkDecodeStop::Approximate(until_bit) so each
+    //     worker stops near its partition boundary instead of running
+    //     to BFINAL (which would OOM at 16 parallel workers).
     //
-    // This bounds memory: each candidate uses ~64 KB during validation,
-    // not 8 MiB per trial. Mirrors rapidgzip's validate-then-commit
-    // (see GzipChunk.hpp's BlockFinder candidate-then-decode flow).
-    let _ = until_bit;
-    let stop = ChunkDecodeStop::UntilEnd;
+    // Approximate has a 64 KiB margin: ISA-L can over- or undershoot
+    // the limit by that much and still be accepted, as long as the
+    // landing position validates as a real deflate boundary.
+    let stop = ChunkDecodeStop::Approximate(ChunkEndLimit(RealBlockBoundary(until_bit)));
     let validated_start: usize = if start_bit == 0 {
         0
     } else {
