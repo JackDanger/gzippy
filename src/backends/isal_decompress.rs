@@ -582,24 +582,15 @@ pub fn decompress_deflate_from_bit_with_end(
     Some((output, end_bit))
 }
 
-/// A real deflate block boundary observed during decode: the compressed
-/// bit-offset where the next block's header starts (or where the stream
-/// ends), and the output-byte-offset where the just-finished block's last
-/// byte sits in the chunk's output buffer.
-#[derive(Debug, Clone, Copy)]
-pub struct BlockBoundary {
-    pub bit_offset: usize,
-    pub output_offset: usize,
-}
-
 /// Same shape as [`decompress_deflate_from_bit_with_end`], but additionally
 /// records every deflate block boundary the decoder crossed. Uses the patched
 /// ISA-L's `ISAL_STOPPING_POINT_END_OF_BLOCK` mechanism: the inflate state
 /// machine pauses after each block body finishes, the caller records the
-/// current bit position + output offset, then resumes. Returns
-/// `(output, end_bit, boundaries)` where each `BlockBoundary` records both
-/// the compressed bit position and the output byte position at the moment
-/// the just-finished block ended.
+/// current bit position, then resumes. Returns
+/// `(output, end_bit, boundaries)` where `boundaries[i]` is the bit position
+/// of a real deflate block boundary inside the decoded range. The first
+/// boundary recorded is the position AFTER the first block (not the chunk
+/// start); the last boundary equals `end_bit` (end of the last block).
 ///
 /// Provability: the patched ISA-L sets `state.stopped_at = END_OF_BLOCK`
 /// only inside its own inflate loop after `decode_huffman_code_block_stateless`
@@ -616,7 +607,7 @@ pub fn decompress_deflate_from_bit_with_boundaries(
     dict: &[u8],
     max_output: usize,
     crc: &mut crc32fast::Hasher,
-) -> Option<(Vec<u8>, usize, Vec<BlockBoundary>)> {
+) -> Option<(Vec<u8>, usize, Vec<usize>)> {
     use isal::isal_sys::igzip_lib as isal_raw;
 
     let byte_idx = bit_offset / 8;
@@ -672,7 +663,7 @@ pub fn decompress_deflate_from_bit_with_boundaries(
         output.set_len(cap)
     };
     let mut out_pos: usize = 0;
-    let mut boundaries: Vec<BlockBoundary> = Vec::new();
+    let mut boundaries: Vec<usize> = Vec::new();
 
     loop {
         let remaining = cap - out_pos;
@@ -725,13 +716,7 @@ pub fn decompress_deflate_from_bit_with_boundaries(
         if state.stopped_at == isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK {
             let bit_pos =
                 data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
-            // out_pos is the byte position just past the last byte the
-            // just-finished block emitted (i.e. the start of where the
-            // next block's output will be written).
-            boundaries.push(BlockBoundary {
-                bit_offset: bit_pos,
-                output_offset: out_pos,
-            });
+            boundaries.push(bit_pos);
             // Clear so the next isal_inflate call doesn't see a stale value
             // before its own reset-at-entry runs (defense in depth).
             state.stopped_at = isal_raw::ISAL_STOPPING_POINT_NONE;
@@ -769,7 +754,7 @@ pub fn decompress_deflate_from_bit_with_boundaries(
     _dict: &[u8],
     _max_output: usize,
     _crc: &mut crc32fast::Hasher,
-) -> Option<(Vec<u8>, usize, Vec<BlockBoundary>)> {
+) -> Option<(Vec<u8>, usize, Vec<usize>)> {
     None
 }
 
@@ -1382,61 +1367,31 @@ mod tests {
             assert_eq!(bytes.len(), input.len(), "seed={seed}: output size");
             assert_eq!(bytes, input, "seed={seed}: output bytes");
 
-            // Every recorded boundary must be a real one and its output_offset
-            // must be in (0, bytes.len()].
-            for b in &recorded {
+            // Every recorded boundary must be a real one.
+            for &b in &recorded {
                 assert!(
-                    real_starts.contains(&b.bit_offset),
-                    "seed={seed}: recorded boundary bit={} is not a real block start \
+                    real_starts.contains(&b),
+                    "seed={seed}: recorded boundary {b} is not a real block start \
                      (real_starts has {} entries)",
-                    b.bit_offset,
                     real_starts.len()
                 );
-                assert!(
-                    b.output_offset > 0 && b.output_offset <= bytes.len(),
-                    "seed={seed}: boundary output_offset {} out of range (bytes.len()={})",
-                    b.output_offset,
-                    bytes.len()
-                );
             }
 
-            // Boundaries must be strictly increasing in both bit_offset and
-            // output_offset (every block emits at least 1 byte except the
-            // final empty BFINAL block, which we don't generate here).
-            for pair in recorded.windows(2) {
-                assert!(
-                    pair[0].bit_offset < pair[1].bit_offset,
-                    "seed={seed}: bit_offset not monotonic"
-                );
-                assert!(
-                    pair[0].output_offset <= pair[1].output_offset,
-                    "seed={seed}: output_offset not monotonic"
-                );
-            }
-
-            // The last recorded boundary must equal end_bit and end at bytes.len().
-            let last = recorded.last().copied().unwrap_or(BlockBoundary {
-                bit_offset: end_bit,
-                output_offset: bytes.len(),
-            });
+            // The last recorded boundary must equal end_bit.
             assert_eq!(
-                last.bit_offset, end_bit,
-                "seed={seed}: last boundary bit_offset must equal end_bit"
-            );
-            assert_eq!(
-                last.output_offset,
-                bytes.len(),
-                "seed={seed}: last boundary output_offset must equal bytes.len()"
+                *recorded.last().unwrap_or(&end_bit),
+                end_bit,
+                "seed={seed}: last recorded boundary must equal end_bit"
             );
 
             // No real block boundary inside (0, end_bit] should be missed.
-            let recorded_bits: HashSet<usize> = recorded.iter().map(|b| b.bit_offset).collect();
+            // record_block_starts emits the chunk-start (bit 0) too; exclude it.
             for &real in real_starts.iter() {
                 if real == 0 || real > end_bit {
                     continue;
                 }
                 assert!(
-                    recorded_bits.contains(&real),
+                    recorded.contains(&real),
                     "seed={seed}: real block boundary {real} was not recorded by ISA-L \
                      (recorded {} boundaries)",
                     recorded.len()

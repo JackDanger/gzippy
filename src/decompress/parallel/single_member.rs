@@ -654,14 +654,6 @@ pub fn decompress_parallel<W: Write>(
         );
     }
     let chunks = partitions.into_authoritative_chunks();
-    let chunks = redistribute_oversized_chunks(chunks);
-    if debug_enabled() {
-        eprintln!(
-            "[parallel_sm:v0.6] after_redistribute chunks={} (split oversized accepted chunks at \
-             ISA-L-discovered block boundaries to reclaim parallelism from subsumed partitions)",
-            chunks.len()
-        );
-    }
 
     // G1 assertion after phase1c: every chunk's end_bit_offset must be a real
     // deflate block boundary. This catches decode primitive bugs (like the
@@ -1070,13 +1062,12 @@ struct CandidateChunk {
     discovered_start: ChunkStart,
     discovered_end: RealBlockBoundary,
     /// Real deflate block boundaries the worker crossed during decode, in
-    /// strictly increasing bit-offset order. Each entry carries both the
-    /// compressed bit position AND the byte position inside `chunk.isal_bytes`
-    /// where the block ended, so the dispatcher can split the worker's
-    /// output at any boundary without re-decoding. The last entry's
-    /// `bit_offset` equals `discovered_end`. Empty when the worker took the
-    /// marker-only path.
-    discovered_boundaries: Vec<crate::backends::isal_decompress::BlockBoundary>,
+    /// strictly increasing bit-offset order. The last entry equals
+    /// `discovered_end`. Recorded in-band by the patched-ISA-L stopping-point
+    /// mechanism (`decompress_deflate_from_bit_with_boundaries`); empty when
+    /// the worker took the marker-only path or when the chunk produced no
+    /// ISA-L output.
+    discovered_boundaries: Vec<RealBlockBoundary>,
     chunk: ChunkResult,
 }
 
@@ -1084,11 +1075,6 @@ struct CandidateChunk {
 struct AuthoritativeChunk {
     start: ChunkStart,
     end: RealBlockBoundary,
-    /// Block boundaries inside `chunk.isal_bytes` (with output_offset
-    /// pointing into the ISA-L decoded bytes). Used by
-    /// [`redistribute_oversized_chunks`] after reconcile to split a chunk
-    /// that swallowed downstream partitions back into smaller pieces.
-    boundaries: Vec<crate::backends::isal_decompress::BlockBoundary>,
     chunk: ChunkResult,
 }
 
@@ -1097,7 +1083,6 @@ impl AuthoritativeChunk {
         Self {
             start: candidate.discovered_start,
             end: candidate.discovered_end,
-            boundaries: candidate.discovered_boundaries,
             chunk: candidate.chunk,
         }
     }
@@ -1106,7 +1091,6 @@ impl AuthoritativeChunk {
         Self {
             start,
             end: RealBlockBoundary(start.bits()),
-            boundaries: Vec::new(),
             chunk: empty_chunk_result(start.bits()),
         }
     }
@@ -1730,11 +1714,13 @@ fn decode_chunk_inexact(
                 let split_at = bootstrap_markers.len().saturating_sub(dict.len());
                 let mut bootstrap = bootstrap_markers;
                 bootstrap.truncate(split_at);
-                // Patched ISA-L sets stopped_at = END_OF_BLOCK only at real
-                // deflate block boundaries (see oracle test), so every entry
-                // is a verified boundary plus the output offset at which the
-                // just-finished block ended.
-                let discovered_boundaries = raw_boundaries;
+                // Wrap raw boundary bit-offsets in the verified type. The
+                // patched ISA-L only sets `stopped_at = END_OF_BLOCK` at real
+                // deflate block boundaries (see
+                // `stopping_point_boundaries_match_oracle`), so every entry
+                // here is a real block boundary.
+                let discovered_boundaries: Vec<RealBlockBoundary> =
+                    raw_boundaries.into_iter().map(RealBlockBoundary).collect();
                 WorkerOutcome::Candidate(CandidateChunk {
                     requested_partition,
                     discovered_start: start_bit,
@@ -2075,243 +2061,6 @@ fn exact_or_empty_authoritative(
         }
         ParallelError::DecodeFailed
     })
-}
-
-/// After reconcile, recover parallelism from oversized accepted chunks by
-/// splitting their ISA-L output at boundaries the worker recorded in-band.
-///
-/// When phase 1a returned `None` for a run of partitions, those partitions
-/// have no speculative starts; reconcile assigns them `expected_start` equal
-/// to the predecessor's actual end_bit. If the predecessor decoded past
-/// several partitions' notional ranges (a "swallow"), the consecutive
-/// successors get marked Subsumed/EmptyTail and contribute no parallelism.
-///
-/// The patched-ISA-L stopping-point machinery makes those swallowed bytes
-/// independently splittable: each `BlockBoundary` in the predecessor's
-/// `boundaries` carries both a compressed bit-offset and an output byte
-/// offset. We split the predecessor's `isal_bytes` at chosen boundaries to
-/// produce K+1 contiguous pieces, where K is the number of consecutive
-/// Subsumed/EmptyTail followers. Each piece replaces one slot in the chunk
-/// vector — the original chunk shrinks, and each subsumed slot now carries
-/// real bytes.
-///
-/// CRC accounting: the original chunk's `isal_crc` covers the full
-/// (now-split) output range. We attach it to the first piece and leave the
-/// rest with the identity hasher; phase 2's `total_crc.combine(&chunk.isal_crc)`
-/// over chunks in order then produces the same total CRC as the unsplit
-/// version. This is sound because CRC32-combine is associative and the
-/// bytes are written to the output in the same order regardless of how
-/// they're grouped into chunks.
-///
-/// Window propagation: each piece's `isal_bytes` is a contiguous slice of
-/// the original (≥32 KiB for non-trivial pieces), so `phase2`'s
-/// `try_precompute_input_windows` still succeeds along the split.
-fn redistribute_oversized_chunks(chunks: Vec<AuthoritativeChunk>) -> Vec<AuthoritativeChunk> {
-    let n = chunks.len();
-    if n <= 1 {
-        return chunks;
-    }
-    let mut slots: Vec<Option<AuthoritativeChunk>> = chunks.into_iter().map(Some).collect();
-    let mut result: Vec<AuthoritativeChunk> = Vec::with_capacity(n);
-    let mut i = 0;
-    while i < n {
-        // Count consecutive "empty subsumed" slots after i (the slots that
-        // currently carry no decoded data because their predecessor
-        // swallowed them).
-        let mut k = 0usize;
-        while i + 1 + k < n {
-            match slots[i + 1 + k].as_ref() {
-                Some(next) if is_empty_passthrough(next) => k += 1,
-                _ => break,
-            }
-        }
-
-        let main = slots[i].take().expect("slot must be Some at index i");
-        if k == 0 || !main.is_splittable() {
-            // Nothing to redistribute. Take this slot as-is.
-            result.push(main);
-            i += 1;
-            continue;
-        }
-
-        // Drain the K following empty slots so we can replace them.
-        for j in 1..=k {
-            slots[i + j].take();
-        }
-        let pieces = split_authoritative_chunk(main, k);
-        debug_assert_eq!(pieces.len(), k + 1);
-        result.extend(pieces);
-        i += 1 + k;
-    }
-    result
-}
-
-/// A slot is "empty passthrough" when it carries no decoded data and no
-/// discovered boundaries — produced by [`AuthoritativeChunk::empty`] for
-/// Subsumed and EmptyTail partitions.
-#[inline]
-fn is_empty_passthrough(chunk: &AuthoritativeChunk) -> bool {
-    chunk.chunk.isal_bytes.is_empty()
-        && chunk.chunk.bootstrap.is_empty()
-        && chunk.chunk.bootstrap_clean.is_empty()
-        && chunk.boundaries.is_empty()
-}
-
-impl AuthoritativeChunk {
-    /// True when the chunk has non-empty ISA-L output AND at least one
-    /// recorded internal block boundary that can serve as a split point.
-    /// Marker-only chunks (bootstrap-only, no isal_bytes) are not
-    /// splittable here because the marker pipeline doesn't record per-block
-    /// output offsets.
-    fn is_splittable(&self) -> bool {
-        !self.chunk.isal_bytes.is_empty() && !self.boundaries.is_empty()
-    }
-}
-
-/// Split a single AuthoritativeChunk into K+1 contiguous pieces using the
-/// chunk's recorded `boundaries`. Pieces are picked to be roughly equal in
-/// output byte size by selecting boundary indices at evenly-spaced
-/// positions in the boundary list. See `redistribute_oversized_chunks` for
-/// the CRC and window-propagation correctness argument.
-fn split_authoritative_chunk(main: AuthoritativeChunk, k: usize) -> Vec<AuthoritativeChunk> {
-    debug_assert!(k >= 1);
-    let boundaries = &main.boundaries;
-    let m = boundaries.len();
-    // Pick K split indices into `boundaries`. We want indices
-    // boundaries[i_1], boundaries[i_2], ... boundaries[i_K] with
-    // 0 ≤ i_1 < i_2 < ... < i_K < m, evenly spaced. If we have fewer
-    // boundaries than needed split points (m < K), we can only produce
-    // up to m+1 pieces; cap K at m-1 so the LAST piece always extends to
-    // main.end (we exclude the final boundary which equals main.end).
-    let usable_boundaries = m.saturating_sub(1); // exclude the boundary equal to end
-    let k_actual = k.min(usable_boundaries);
-    if k_actual == 0 {
-        // Not enough internal boundaries to split. Return main + k empties.
-        let mut out = Vec::with_capacity(1 + k);
-        out.push(empty_replacing(&main));
-        out[0] = main;
-        for _ in 0..k {
-            // The next pieces must use real ChunkStart values; the original
-            // empty AuthoritativeChunk we replaced had start=that partition's
-            // expected start. We've lost that info. Use the main chunk's end
-            // for now — phase 2 will treat them as empty so the actual start
-            // bit doesn't matter for output.
-            out.push(empty_replacing(&out[0]));
-        }
-        return out;
-    }
-
-    // Pick split boundary indices: evenly spaced from 1 to usable_boundaries
-    // inclusive. With k_actual = K and usable = M-1, target j*(M-1)/(K+1)
-    // for j in 1..=K.
-    let split_idx: Vec<usize> = (1..=k_actual)
-        .map(|j| ((j as u64) * (usable_boundaries as u64) / (k_actual as u64 + 1)) as usize)
-        .collect();
-
-    let AuthoritativeChunk {
-        start: main_start,
-        end: main_end,
-        boundaries: main_boundaries,
-        chunk: main_chunk,
-    } = main;
-    let ChunkResult {
-        bootstrap,
-        bootstrap_clean,
-        isal_bytes,
-        isal_crc,
-        end_bit_offset: _,
-        worker_elapsed,
-    } = main_chunk;
-
-    let mut pieces: Vec<AuthoritativeChunk> = Vec::with_capacity(k_actual + 1);
-    let mut byte_cursor = 0usize;
-    let mut prev_end = main_start;
-    // Split isal_bytes into k_actual+1 contiguous Vecs via split_off.
-    let mut remaining = isal_bytes;
-    for (piece_idx, &split_at_idx) in split_idx.iter().enumerate() {
-        let boundary = main_boundaries[split_at_idx];
-        let take_len = boundary.output_offset - byte_cursor;
-        // remaining.split_off(take_len): remaining keeps [..take_len], returns [take_len..]
-        let mut piece_bytes = remaining;
-        let next_remaining = piece_bytes.split_off(take_len);
-        remaining = next_remaining;
-        byte_cursor = boundary.output_offset;
-        let piece_end = RealBlockBoundary(boundary.bit_offset);
-        // The first piece carries the original chunk's bootstrap +
-        // bootstrap_clean + isal_crc. Subsequent pieces have empty
-        // bootstrap and identity CRC.
-        let (piece_bootstrap, piece_clean, piece_crc) = if piece_idx == 0 {
-            (
-                std::mem::take(&mut bootstrap_carry(&mut Some(bootstrap.clone()))),
-                std::mem::take(&mut bootstrap_clean_carry(&mut Some(
-                    bootstrap_clean.clone(),
-                ))),
-                isal_crc_take(&mut Some(isal_crc.clone())),
-            )
-        } else {
-            (Vec::new(), Vec::new(), crc32fast::Hasher::new())
-        };
-        let piece = AuthoritativeChunk {
-            start: prev_end,
-            end: piece_end,
-            boundaries: Vec::new(),
-            chunk: ChunkResult {
-                bootstrap: piece_bootstrap,
-                bootstrap_clean: piece_clean,
-                isal_bytes: piece_bytes,
-                isal_crc: piece_crc,
-                end_bit_offset: boundary.bit_offset,
-                worker_elapsed: if piece_idx == 0 {
-                    worker_elapsed
-                } else {
-                    std::time::Duration::ZERO
-                },
-            },
-        };
-        pieces.push(piece);
-        prev_end = ChunkStart(piece_end);
-    }
-    // Final piece: takes whatever is left, ends at main_end.
-    let final_piece = AuthoritativeChunk {
-        start: prev_end,
-        end: main_end,
-        boundaries: Vec::new(),
-        chunk: ChunkResult {
-            bootstrap: Vec::new(),
-            bootstrap_clean: Vec::new(),
-            isal_bytes: remaining,
-            isal_crc: crc32fast::Hasher::new(),
-            end_bit_offset: main_end.bits(),
-            worker_elapsed: std::time::Duration::ZERO,
-        },
-    };
-    pieces.push(final_piece);
-    // If k > k_actual, pad with empties at main_end so the slot count matches.
-    for _ in k_actual..k {
-        pieces.push(AuthoritativeChunk::empty(ChunkStart(main_end)));
-    }
-    pieces
-}
-
-// These helpers are workarounds to satisfy the borrow checker while moving
-// the original chunk's owned fields into only the first piece.
-#[inline]
-fn bootstrap_carry(slot: &mut Option<Vec<u16>>) -> Vec<u16> {
-    slot.take().unwrap_or_default()
-}
-#[inline]
-fn bootstrap_clean_carry(slot: &mut Option<Vec<u8>>) -> Vec<u8> {
-    slot.take().unwrap_or_default()
-}
-#[inline]
-fn isal_crc_take(slot: &mut Option<crc32fast::Hasher>) -> crc32fast::Hasher {
-    slot.take().unwrap_or_default()
-}
-/// Construct an empty-passthrough chunk with the same start coordinates
-/// as `peer`. Used as the "no split possible" pad when there aren't enough
-/// internal boundaries.
-fn empty_replacing(peer: &AuthoritativeChunk) -> AuthoritativeChunk {
-    AuthoritativeChunk::empty(ChunkStart(peer.end))
 }
 
 fn reconcile_partitions(
