@@ -25,6 +25,7 @@
 //!   and the post-bootstrap bulk decode.
 
 pub mod apply_window;
+pub mod atomic_mutex;
 pub mod block_fetcher;
 pub mod block_finder;
 pub mod block_map;
@@ -39,6 +40,7 @@ pub mod gzip_format;
 pub mod inflate_wrapper;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub mod isal_huffman;
+pub mod joining_thread;
 pub mod prefetcher;
 pub mod replace_markers;
 pub mod single_member;
