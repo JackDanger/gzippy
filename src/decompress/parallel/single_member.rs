@@ -2167,6 +2167,39 @@ fn phase1c_resolve_consistency(
 
 // ── Phase 2 + streaming write: resolve markers, write, combine CRCs ──────────
 
+/// Resolve one chunk's bootstrap markers into u8 bytes and CRC them. Runs
+/// in a worker thread; takes the input window (predecessor's last 32 KiB)
+/// by reference. Pure function — no shared state. The returned tuple is
+/// the resolved bootstrap bytes (markers replaced + narrowed to u8) plus
+/// a CRC32 hasher over those bytes.
+fn resolve_chunk_markers(
+    chunk_idx: usize,
+    bootstrap: &mut [u16],
+    bootstrap_clean: &[u8],
+    input_window: &[u8],
+) -> Result<(Vec<u8>, crc32fast::Hasher), ParallelError> {
+    if chunk_idx > 0 {
+        // In-place SIMD substitution; ~memory-bandwidth speed on AVX2/NEON.
+        replace_markers(bootstrap, input_window);
+    }
+    let mut bootstrap_u8: Vec<u8> = Vec::with_capacity(bootstrap.len() + bootstrap_clean.len());
+    narrow_and_append(&mut bootstrap_u8, bootstrap).map_err(|pos| {
+        if debug_enabled() {
+            eprintln!(
+                "[parallel_sm:v0.6] chunk {} unresolved marker at bootstrap[{}] (offset {})",
+                chunk_idx,
+                pos,
+                bootstrap[pos] - MARKER_BASE,
+            );
+        }
+        ParallelError::DecodeFailed
+    })?;
+    bootstrap_u8.extend_from_slice(bootstrap_clean);
+    let mut bootstrap_crc = crc32fast::Hasher::new();
+    bootstrap_crc.update(&bootstrap_u8);
+    Ok((bootstrap_u8, bootstrap_crc))
+}
+
 /// Phase 2 + streaming write: resolve bootstrap markers per chunk, write
 /// immediately to `writer`, combine pre-computed ISA-L CRCs. Returns
 /// `(combined_crc32, total_uncompressed_bytes)` after all chunks are
@@ -2183,38 +2216,12 @@ fn phase2_resolve_write_combine<W: Write>(
 
     for (i, authoritative) in chunks.into_iter().enumerate() {
         let mut chunk = authoritative.chunk;
-        // Bootstrap u16 prefix: may contain cross-chunk markers (only
-        // for chunks i > 0). Resolve them against the previous chunk's
-        // last 32 KB.
-        if i > 0 {
-            // In-place SIMD substitution; ~memory-bandwidth speed on AVX2/NEON.
-            replace_markers(&mut chunk.bootstrap, &window);
-        }
-        // Narrow u16 → u8 into a per-chunk Vec. Each chunk's bootstrap
-        // is bounded to ~32-512 KB so the allocation cost is negligible.
-        let mut bootstrap_u8: Vec<u8> =
-            Vec::with_capacity(chunk.bootstrap.len() + chunk.bootstrap_clean.len());
-        narrow_and_append(&mut bootstrap_u8, &chunk.bootstrap).map_err(|pos| {
-            if debug_enabled() {
-                eprintln!(
-                    "[parallel_sm:v0.6] chunk {} unresolved marker at bootstrap[{}] (offset {})",
-                    i,
-                    pos,
-                    chunk.bootstrap[pos] - MARKER_BASE,
-                );
-            }
-            ParallelError::DecodeFailed
-        })?;
-        bootstrap_u8.extend_from_slice(&chunk.bootstrap_clean);
-        // Free the u16 buffer eagerly — it's 2× the size of bootstrap_u8
-        // and we don't need it anymore.
+        let (bootstrap_u8, bootstrap_crc) =
+            resolve_chunk_markers(i, &mut chunk.bootstrap, &chunk.bootstrap_clean, &window)?;
+        // Free the u16 buffer eagerly — it's 2× the size of bootstrap_u8.
         chunk.bootstrap = Vec::new();
         chunk.bootstrap_clean = Vec::new();
 
-        // CRC the (small) resolved bootstrap bytes sequentially; the
-        // ISA-L bytes' CRC was computed by phase 1 worker in parallel.
-        let mut bootstrap_crc = crc32fast::Hasher::new();
-        bootstrap_crc.update(&bootstrap_u8);
         total_crc.combine(&bootstrap_crc);
         total_crc.combine(&chunk.isal_crc);
 
