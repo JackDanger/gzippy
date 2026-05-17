@@ -964,7 +964,7 @@ pub(crate) fn decode_chunk_for_fetcher(
     // Approximate has a 64 KiB margin: ISA-L can over- or undershoot
     // the limit by that much and still be accepted, as long as the
     // landing position validates as a real deflate boundary.
-    let stop = ChunkDecodeStop::Approximate(ChunkEndLimit(RealBlockBoundary(until_bit)));
+    let stop = ChunkDecodeStop::Approximate(ApproximateChunkEnd(until_bit));
     let validated_start: usize = if start_bit == 0 {
         0
     } else {
