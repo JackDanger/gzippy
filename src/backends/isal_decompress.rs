@@ -582,6 +582,182 @@ pub fn decompress_deflate_from_bit_with_end(
     Some((output, end_bit))
 }
 
+/// Same shape as [`decompress_deflate_from_bit_with_end`], but additionally
+/// records every deflate block boundary the decoder crossed. Uses the patched
+/// ISA-L's `ISAL_STOPPING_POINT_END_OF_BLOCK` mechanism: the inflate state
+/// machine pauses after each block body finishes, the caller records the
+/// current bit position, then resumes. Returns
+/// `(output, end_bit, boundaries)` where `boundaries[i]` is the bit position
+/// of a real deflate block boundary inside the decoded range. The first
+/// boundary recorded is the position AFTER the first block (not the chunk
+/// start); the last boundary equals `end_bit` (end of the last block).
+///
+/// Provability: the patched ISA-L sets `state.stopped_at = END_OF_BLOCK`
+/// only inside its own inflate loop after `decode_huffman_code_block_stateless`
+/// or `decode_literal_block` returns and `block_state` is `NEW_HDR` or
+/// `INPUT_DONE`. Every transition to those states corresponds to the end of a
+/// real deflate block, so every recorded boundary is real. No boundaries are
+/// missed: the loop continues until `block_state == ISAL_BLOCK_FINISH` or
+/// END_INPUT, observing every transition along the way.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)]
+pub fn decompress_deflate_from_bit_with_boundaries(
+    data: &[u8],
+    bit_offset: usize,
+    dict: &[u8],
+    max_output: usize,
+    crc: &mut crc32fast::Hasher,
+) -> Option<(Vec<u8>, usize, Vec<usize>)> {
+    use isal::isal_sys::igzip_lib as isal_raw;
+
+    let byte_idx = bit_offset / 8;
+    let bit_skip = bit_offset % 8;
+
+    if byte_idx >= data.len() {
+        return None;
+    }
+
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::ISAL_DEFLATE;
+    // Request a pause after every full block body so the caller can record
+    // block-boundary bit positions in-band during decode. This is the
+    // gzippy/rapidgzip extension to ISA-L — without the patched ISA-L the
+    // field doesn't exist; with it, this opt-in is the only behavior change.
+    state.points_to_stop_at = isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK;
+
+    if bit_skip > 0 {
+        state.read_in = (data[byte_idx] as u64) >> bit_skip;
+        state.read_in_length = (8 - bit_skip) as i32;
+        state.next_in = unsafe { data.as_ptr().add(byte_idx + 1) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx - 1) as u32;
+    } else {
+        state.next_in = unsafe { data.as_ptr().add(byte_idx) as *mut u8 };
+        state.avail_in = (data.len() - byte_idx) as u32;
+    }
+
+    static ZERO_WINDOW: [u8; 32768] = [0u8; 32768];
+    let window = if dict.is_empty() {
+        &ZERO_WINDOW[..]
+    } else {
+        dict
+    };
+    {
+        let ret = unsafe {
+            isal_raw::isal_inflate_set_dict(
+                &mut state,
+                window.as_ptr() as *mut u8,
+                window.len() as u32,
+            )
+        };
+        if ret != 0 {
+            return None;
+        }
+    }
+
+    const MAX_CAP: usize = 3 * 1024 * 1024 * 1024;
+    let mut cap = max_output.min(MAX_CAP);
+    let mut output: Vec<u8> = Vec::with_capacity(cap);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(cap)
+    };
+    let mut out_pos: usize = 0;
+    let mut boundaries: Vec<usize> = Vec::new();
+
+    loop {
+        let remaining = cap - out_pos;
+        if remaining == 0 {
+            let new_cap = (cap * 2).min(MAX_CAP);
+            if new_cap <= cap {
+                return None;
+            }
+            unsafe { output.set_len(out_pos) };
+            output.reserve_exact(new_cap - cap);
+            #[allow(clippy::uninit_vec)]
+            unsafe {
+                output.set_len(new_cap)
+            };
+            cap = new_cap;
+            continue;
+        }
+        state.avail_out = remaining as u32;
+        state.next_out = unsafe { output.as_mut_ptr().add(out_pos) };
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        let written = remaining - state.avail_out as usize;
+
+        if written > 0 {
+            crc.update(&output[out_pos..out_pos + written]);
+        }
+        out_pos += written;
+
+        match ret {
+            0 => {}
+            1 => {
+                let bs = state.block_state;
+                let at_boundary = bs == isal_raw::isal_block_state_ISAL_BLOCK_NEW_HDR
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_INPUT_DONE
+                    || bs == isal_raw::isal_block_state_ISAL_BLOCK_FINISH;
+                if !at_boundary {
+                    return None;
+                }
+                break;
+            }
+            2 => continue,
+            _ => return None,
+        }
+
+        // Record block boundary if ISA-L stopped at one. Compute bit
+        // position from state: total_consumed_bits = data.len()*8 -
+        // avail_in*8 - read_in_length. The position is past the just-
+        // finished block, i.e. the start of the next block's header (or
+        // end-of-stream).
+        if state.stopped_at == isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK {
+            let bit_pos =
+                data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+            boundaries.push(bit_pos);
+            // Clear so the next isal_inflate call doesn't see a stale value
+            // before its own reset-at-entry runs (defense in depth).
+            state.stopped_at = isal_raw::ISAL_STOPPING_POINT_NONE;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            let bits_remaining = state.avail_in as usize * 8 + state.read_in_length.max(0) as usize;
+            if bits_remaining > 64 {
+                return None;
+            }
+            break;
+        }
+        if written == 0 && state.avail_in == 0 && state.stopped_at == 0 {
+            break;
+        }
+    }
+
+    if out_pos == 0 {
+        return None;
+    }
+
+    output.truncate(out_pos);
+
+    let end_bit =
+        data.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+
+    Some((output, end_bit, boundaries))
+}
+
+#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[allow(dead_code)]
+pub fn decompress_deflate_from_bit_with_boundaries(
+    _data: &[u8],
+    _bit_offset: usize,
+    _dict: &[u8],
+    _max_output: usize,
+    _crc: &mut crc32fast::Hasher,
+) -> Option<(Vec<u8>, usize, Vec<usize>)> {
+    None
+}
+
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
 #[allow(dead_code)]
 pub fn decompress_deflate_from_bit_with_end(
@@ -1135,6 +1311,90 @@ mod tests {
                      is not in record_block_starts (has {} real starts). \
                      ISA-L end_bit formula may have a ≥1-bit overshoot on this stream.",
                     real_starts.len()
+                );
+            }
+        }
+    }
+
+    /// Patched-ISA-L stopping-point invariant: every boundary the
+    /// `with_boundaries` function records during decode must match an
+    /// independently-derived real deflate block boundary, and the set of
+    /// recorded boundaries must equal the set of internal block starts
+    /// crossed during decode (minus the chunk-start itself). No boundaries
+    /// missed, none fabricated.
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn stopping_point_boundaries_match_oracle() {
+        use crate::decompress::parallel::fast_marker_inflate::record_block_starts;
+        use std::collections::HashSet;
+        use std::io::Write;
+
+        for seed in 0..5u64 {
+            // Mix of literals and runs — produces enough output for several
+            // dynamic-Huffman blocks at level 6.
+            let mut input: Vec<u8> = Vec::with_capacity(256 * 1024);
+            let mut rng = 0xc0ffee_u64.wrapping_mul(seed | 1);
+            while input.len() < 256 * 1024 {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                if (rng >> 32) % 4 < 3 {
+                    input.push((rng >> 16) as u8);
+                } else {
+                    let byte = ((rng >> 24) % 26) as u8 + b'a';
+                    let run = ((rng >> 40) % 8 + 2) as usize;
+                    for _ in 0..run.min(256 * 1024 - input.len()) {
+                        input.push(byte);
+                    }
+                }
+            }
+            let mut enc =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
+            enc.write_all(&input).unwrap();
+            let deflate = enc.finish().unwrap();
+
+            let real_starts: HashSet<usize> = record_block_starts(&deflate)
+                .expect("record_block_starts must succeed on valid deflate")
+                .into_iter()
+                .collect();
+
+            let dict: &[u8] = &[];
+            let max_output = input.len() * 2;
+            let mut crc = crc32fast::Hasher::new();
+            let (bytes, end_bit, recorded) = decompress_deflate_from_bit_with_boundaries(
+                &deflate, 0, dict, max_output, &mut crc,
+            )
+            .expect("ISA-L decode from bit 0 must succeed");
+
+            assert_eq!(bytes.len(), input.len(), "seed={seed}: output size");
+            assert_eq!(bytes, input, "seed={seed}: output bytes");
+
+            // Every recorded boundary must be a real one.
+            for &b in &recorded {
+                assert!(
+                    real_starts.contains(&b),
+                    "seed={seed}: recorded boundary {b} is not a real block start \
+                     (real_starts has {} entries)",
+                    real_starts.len()
+                );
+            }
+
+            // The last recorded boundary must equal end_bit.
+            assert_eq!(
+                *recorded.last().unwrap_or(&end_bit),
+                end_bit,
+                "seed={seed}: last recorded boundary must equal end_bit"
+            );
+
+            // No real block boundary inside (0, end_bit] should be missed.
+            // record_block_starts emits the chunk-start (bit 0) too; exclude it.
+            for &real in real_starts.iter() {
+                if real == 0 || real > end_bit {
+                    continue;
+                }
+                assert!(
+                    recorded.contains(&real),
+                    "seed={seed}: real block boundary {real} was not recorded by ISA-L \
+                     (recorded {} boundaries)",
+                    recorded.len()
                 );
             }
         }
