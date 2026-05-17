@@ -225,6 +225,18 @@ pub fn finish_decode_chunk_with_inexact_offset(
     let debug_isal = std::env::var("GZIPPY_DEBUG_ISAL").is_ok();
     let mut iter = 0usize;
     let mut stops_eob = 0usize;
+    if debug_isal {
+        eprintln!(
+            "  [isal] pre-loop: pts={} stopped={} tmpstop={} bstate={} avail_in={} read_in_len={} cap={}",
+            state.points_to_stop_at,
+            state.stopped_at,
+            state.tmp_out_stopped_at,
+            state.block_state,
+            state.avail_in,
+            state.read_in_length,
+            cap,
+        );
+    }
 
     loop {
         let remaining = cap - out_pos;
