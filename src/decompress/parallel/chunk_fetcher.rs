@@ -853,46 +853,29 @@ fn consumer_loop<W: std::io::Write>(
         // The two defensive guards in `block_map.rs` (subchunk-skip
         // + most-recent-dup tolerance) masked the panic but not the
         // miscount — the canonical fix is to terminate, as vendor does.
-        if chunk.encoded_size_bits == 0 {
-            trace::emit(
-                "consumer",
-                "eof_terminate",
-                &format!(
-                    r#""partition_idx":{idx},"expected_start":{expected_start},"total_size":{}"#,
-                    *total_size,
-                ),
+        if std::env::var("GZIPPY_DEBUG").is_ok() && idx < 8 {
+            eprintln!(
+                "[diag] idx={idx} chunk.enc_off={} chunk.enc_size={} max_enc_off={} chunk.dec_size={} dwm_len={} data_len={} expected_start={expected_start} subchunks_len={} stopped_pre={}",
+                chunk.encoded_offset_bits,
+                chunk.encoded_size_bits,
+                chunk.max_encoded_offset_bits,
+                chunk.decoded_size(),
+                chunk.data_with_markers.len(),
+                chunk.data.len(),
+                chunk.subchunks.len(),
+                chunk.stopped_preemptively,
             );
-            if std::env::var("GZIPPY_DEBUG").is_ok() {
-                eprintln!(
-                    "[diag] eof_terminate idx={idx} expected_start={expected_start} total_size={} n_partitions={n_partitions}",
-                    *total_size,
-                );
-            }
-            break;
         }
 
-        let trim_bytes = chunk.decoded_offset_for(expected_start).unwrap_or(0);
-        if std::env::var("GZIPPY_DEBUG").is_ok() && idx < 5 {
+        // DIAGNOSTIC: temporarily disabled EOF break to observe downstream chunks
+        if chunk.encoded_size_bits == 0 && std::env::var("GZIPPY_DEBUG").is_ok() {
             eprintln!(
-                "[diag] idx={idx} chunk.enc_off={} chunk.enc_size={} chunk.dec_size={} dwm_len={} data_len={} trim={trim_bytes} expected_start={expected_start}",
-                chunk.encoded_offset_bits,
-                chunk.encoded_size_bits,
-                chunk.decoded_size(),
-                chunk.data_with_markers.len(),
-                chunk.data.len(),
-            );
-        }
-        if std::env::var("GZIPPY_DEBUG").is_ok() && idx >= n_partitions.saturating_sub(3) {
-            eprintln!(
-                "[diag] LATE idx={idx} chunk.enc_off={} chunk.enc_size={} chunk.dec_size={} dwm_len={} data_len={} trim={trim_bytes} expected_start={expected_start} total_size={}",
-                chunk.encoded_offset_bits,
-                chunk.encoded_size_bits,
-                chunk.decoded_size(),
-                chunk.data_with_markers.len(),
-                chunk.data.len(),
+                "[diag] would-eof-break idx={idx} expected_start={expected_start} total_size={}",
                 *total_size,
             );
         }
+
+        let trim_bytes = chunk.decoded_offset_for(expected_start).unwrap_or(0);
 
         // Process the chunk: apply_window if markers; write bytes;
         // combine CRC; publish tail window.
