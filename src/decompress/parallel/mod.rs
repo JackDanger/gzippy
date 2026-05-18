@@ -51,6 +51,7 @@ pub mod inflate_wrapper;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub mod isal_huffman;
 pub mod joining_thread;
+pub mod precode;
 pub mod prefetcher;
 pub mod replace_markers;
 pub mod rfc_tables;
