@@ -6,32 +6,41 @@
 
 ## Cutover Goal (May 2026)
 
-**Port all of rapidgzip into Rust, faithfully.** Not just the parallel single-
-member path. The goal is **every primitive, decoder, format, block finder,
-huffman variant, reader, index, and analyzer in `vendor/rapidgzip/librapidarchive/`
+**Port the rapidgzip algorithmic core into Rust, faithfully — but ONLY for
+formats GNU gzip supports.** We want rapidgzip's *speed*, not its *format
+breadth*. GNU gzip handles gzip-family streams (single-member, multi-member,
+BGZF — all valid gzip). BZIP2 and ZLIB are NOT gzip and are out of scope.
+
+The goal is **every gzip-relevant primitive, decoder, block finder, huffman
+variant, reader, index, and analyzer in `vendor/rapidgzip/librapidarchive/`
 ported into gzippy with vendor file:line citations.** That includes:
 
-- **Formats**: gzip, BGZF, BZIP2, ZLIB, raw DEFLATE — every codec rapidgzip
-  supports.
-- **Decoders**: `chunkdecoding/GzipChunk`, `chunkdecoding/Bzip2Chunk`,
-  `gzip/GzipReader`, `gzip/GzipAnalyzer`, `gzip/InflateWrapper`, `gzip/isal`,
-  `gzip/zlib`.
+- **Formats** (IN SCOPE): gzip single-member, multi-member gzip, BGZF, raw
+  DEFLATE (as the inner codec).
+- **Formats** (OUT OF SCOPE — not part of GNU gzip): BZIP2 (`Bzip2Chunk.hpp`,
+  `indexed_bzip2/bzip2.hpp`), ZLIB stream format (`gzip/zlib.hpp`). A small
+  ZLIB-format header parser landed (commit `db19347`) as a side-effect of the
+  port pass; keep it for now since it's harmless, but no Bzip2 or Zlib
+  decoder is in scope.
+- **Decoders** (gzip-only): `chunkdecoding/GzipChunk`, `gzip/GzipReader`,
+  `gzip/GzipAnalyzer`, `gzip/InflateWrapper`, `gzip/isal`. NOT
+  `chunkdecoding/Bzip2Chunk`.
 - **Block finders**: `blockfinder/Bgzf`, `blockfinder/DynamicHuffman`,
   `blockfinder/Uncompressed`, `blockfinder/PigzStringView`,
-  `blockfinder/precodecheck/CountAllocatedLeaves`.
+  `blockfinder/precodecheck/CountAllocatedLeaves` (all gzip-family).
 - **Huffman variants**: `HuffmanCodingDoubleLiteralCached`, `HuffmanCodingISAL`,
   `HuffmanCodingReversedBitsCached*`, `HuffmanCodingShortBitsMultiCached*`,
-  `HuffmanCodingDistanceISAL`.
+  `HuffmanCodingDistanceISAL` (gzip Deflate decoders).
 - **Core primitives**: `ThreadPool` (the real one), `BitStringFinder`,
   `ParallelBitStringFinder`, `StreamedResults`, `SimpleRunLengthEncoding`,
   `AtomicMutex`, `AffinityHelpers`, `AlignedAllocator`, `FasterVector`,
   `FileRanges`, `JoiningThread`, etc.
-- **High-level**: `ParallelGzipReader`, `IndexFileFormat`, `rapidgzip.hpp`
-  public API surface.
+- **High-level**: `ParallelGzipReader`, `IndexFileFormat` (seekable indexes
+  for gzip), gzip-relevant `rapidgzip.hpp` public API surface.
 
 Done when an Opus advisor agrees gzippy structurally and calculationally
-matches the FULL rapidgzip surface (not a subset). Performance optimization
-happens after that.
+matches the gzip-relevant surface of rapidgzip (not the BZIP2/ZLIB-decoder
+surface). Performance optimization happens after that.
 
 ## Rules
 

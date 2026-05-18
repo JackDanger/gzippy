@@ -9,13 +9,19 @@
 
 ## CUTOVER POLICY (May 2026, user directive)
 
-**SCOPE: ALL OF RAPIDGZIP, not just parallel single-member.** The goal is
-to port every primitive, decoder, format, block finder, huffman variant,
-reader, index, and analyzer from `vendor/rapidgzip/librapidarchive/` into
-gzippy with vendor file:line citations. See CLAUDE.md "Cutover Goal" for
-the full inventory (gzip + BGZF + BZIP2 + ZLIB + raw DEFLATE; ThreadPool,
-ParallelGzipReader, IndexFileFormat, GzipAnalyzer; all blockfinders; all
-Huffman variants; all core primitives).
+**SCOPE: ALL GZIP-RELEVANT RAPIDGZIP, not just parallel single-member.** The
+goal is rapidgzip's *algorithmic speed* for gzip-family streams (gzip,
+multi-member gzip, BGZF), not rapidgzip's *format breadth* (BZIP2, ZLIB —
+out of scope per user 2026-05-17). GNU gzip supports gzip-family only;
+gzippy mirrors that scope. Port every gzip-relevant primitive, decoder,
+block finder, huffman variant, reader, index, and analyzer from
+`vendor/rapidgzip/librapidarchive/` into gzippy with vendor file:line
+citations. See CLAUDE.md "Cutover Goal" for the full inventory.
+
+**Explicitly OUT OF SCOPE:** `chunkdecoding/Bzip2Chunk.hpp`,
+`indexed_bzip2/bzip2.hpp` (BZIP2 decoder), `gzip/zlib.hpp`'s
+`ZlibInflateWrapper` (the format header parsed at `zlib_format.rs` landed
+incidentally and is harmless to keep).
 
 This doc focused on the parallel single-member path because that was the
 first cutover area. As ports of BZIP2, ZLIB, IndexFileFormat, ParallelGzipReader,
