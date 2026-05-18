@@ -107,6 +107,14 @@ impl BlockMap {
             Ok(i) => {
                 let match_decoded = g.block_to_data_offsets[i].1;
                 if i + 1 >= g.block_to_data_offsets.len() {
+                    // The duplicate is the most-recent entry. If the new push
+                    // carries no new decoded bytes, it's a phantom re-push from
+                    // a chunk that decoded zero bytes (e.g. an immediate
+                    // END_OF_STREAM at the chunk boundary). Treat as no-op
+                    // rather than corrupting the index.
+                    if decoded_size == 0 {
+                        return match_decoded;
+                    }
                     let tail: Vec<(usize, usize)> = g
                         .block_to_data_offsets
                         .iter()
