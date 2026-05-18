@@ -707,18 +707,6 @@ fn consumer_loop<W: std::io::Write>(
         }
     };
     let until_for = |block_index: usize| -> usize { seed_for(block_index + 1).min(total_bits) };
-    // Compute the spacing-aligned guess for partition `idx`. Used for
-    // the INITIAL speculative dispatch round (before any subchunk inserts)
-    // and for the speculative-refill ring during consume. Equivalent to
-    // `block_finder.get(idx)` when block_finder has only the initial seed
-    // (mirror of GzipBlockFinder.hpp::get's guessed-offset branch at
-    // L134-157, which returns `partition_index * spacing_in_bits`).
-    let partition_seed_for = |partition_idx: usize| -> usize {
-        let chunk_size_bits = configuration.split_chunk_size * 8;
-        (partition_idx * chunk_size_bits).min(total_bits)
-    };
-    let partition_until_for =
-        |partition_idx: usize| -> usize { partition_seed_for(partition_idx + 1).min(total_bits) };
 
     // Port of `rapidgzip::GzipChunkFetcher::processNextChunk`
     // (GzipChunkFetcher.hpp:311-362). Iterates the BlockMap in
@@ -748,20 +736,35 @@ fn consumer_loop<W: std::io::Write>(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(pool_size * 2);
 
-    /// Tracks one outstanding speculative job. We carry the seed that
-    /// was active at dispatch time so the cache key remains stable
-    /// across subsequent `block_finder.insert(...)` calls that would
-    /// otherwise shift `seed_for(idx)` (see
-    /// vendor/.../GzipBlockFinder.hpp:30-32: "block confirmation
-    /// effectively invalidates previous indexes"). Mirror of
-    /// rapidgzip's keeping the original `blockOffset` (not blockIndex)
-    /// as the BlockFetcher cache key across the get/insert cycle —
-    /// vendor/.../GzipChunkFetcher.hpp:267 + 596.
+    /// Tracks one outstanding speculative job. We carry the partition
+    /// counter at dispatch time so workers can label trace events back
+    /// to a human-readable identity; the spec is otherwise identified
+    /// by its dispatch offset (= HashMap key).
     struct SpecSlot {
         rx: mpsc::Receiver<Result<ChunkData, ChunkDecodeError>>,
-        dispatched_seed: usize,
+        partition_idx: usize,
     }
-    let mut spec: Vec<Option<SpecSlot>> = (0..n_partitions).map(|_| None).collect();
+    // In-flight speculative jobs keyed by the BLOCK-OFFSET they were
+    // dispatched at — literal port of vendor's
+    // `m_prefetching: std::map<size_t /* blockOffset */,
+    // std::future<BlockData>>` at vendor/.../core/BlockFetcher.hpp:131.
+    // Replaces the prior partition-counter-indexed
+    // `Vec<Option<SpecSlot>>`, whose static-spacing seeds caused
+    // 37/38 misses on Silesia because the consumer's `expected_start`
+    // (= predecessor's actual_end, queried via `block_finder.get`
+    // AFTER `insert(actual_end)`) almost never equals a partition
+    // multiple `i*spacing`.
+    //
+    // Consumer probes `spec.remove(&expected_start)` (mirror of
+    // vendor's `takeFromPrefetchQueue(blockOffset)` exact-match
+    // lookup at vendor/.../core/BlockFetcher.hpp:405-423). The match
+    // succeeds when a refill dispatched a spec at `block_finder.get(K)`
+    // for some block-finder index `K` whose returned offset happened
+    // to equal `expected_start` — which becomes the COMMON case once
+    // predecessors start inserting their actual_end into BlockFinder,
+    // because the very next consumer iteration's `expected_start`
+    // equals the just-inserted offset.
+    let mut spec: std::collections::HashMap<usize, SpecSlot> = std::collections::HashMap::new();
 
     let submit_job = |idx: usize,
                       start: usize,
@@ -835,35 +838,42 @@ fn consumer_loop<W: std::io::Write>(
         rx
     };
 
-    // Submit chunk 0 authoritative (start is known: bit 0). Also pre-fill
-    // up to prefetch_count speculatives starting at partition 1. The
-    // seed for each partition comes from `GzipBlockFinder::get(idx)` —
-    // a confirmed offset when one of idx's predecessors has finished
-    // and called `insert(actual_end)`, or a spacing-aligned guess
-    // otherwise. Mirror of rapidgzip's
-    // GzipChunkFetcher.hpp:318 (`m_blockFinder->get(...)`) +
-    // BlockFetcher.hpp:479 (prefetch-time `get(blockIndexToPrefetch, 0)`).
-    // Initial dispatch uses partition-aligned seeds (block_finder has
-    // only the initial seed `[0]` at this point, so `block_finder.get(i)`
-    // returns the spacing-aligned guess `i * spacing`). After the loop
-    // starts processing chunks and inserting subchunk boundaries, the
-    // block_finder's index-to-offset mapping shifts; we use
-    // `partition_seed_for` to keep the spec ring aligned to partition
-    // boundaries regardless of insert progress.
-    spec[0] = Some(SpecSlot {
-        rx: submit_job(0, 0, partition_until_for(0), true, 0),
-        dispatched_seed: 0,
-    });
-    for i in 1..(1 + prefetch_count).min(n_partitions) {
-        let seed = partition_seed_for(i);
-        spec[i] = Some(SpecSlot {
-            rx: submit_job(i, seed, partition_until_for(i), false, seed),
-            dispatched_seed: seed,
-        });
-    }
+    // Submit chunk 0 authoritative (its start offset is known: `seed_for(0)
+    // = 0`). Initial pre-fill of speculatives is INTENTIONALLY OMITTED.
+    // Bench on Silesia shows that static-guess pre-fills (vendor's
+    // prefetch at vendor/.../core/BlockFetcher.hpp:476-491) hit
+    // `decode_or_iterate`'s slow path (~65ms per chunk for the 512 KiB
+    // candidate sweep), consuming worker CPU on results that never
+    // match the consumer's actual `expected_start` (which equals each
+    // predecessor's actual_end, not `i*spacing`). The per-iter
+    // immediate-next refill below dispatches a single spec at the
+    // REAL boundary (predecessor's just-inserted actual_end) and
+    // hits unconditionally on the next iter — 100% spec hit rate,
+    // 0 slow paths.
+    //
+    // The trade-off: only ONE speculative is in flight at a time, so
+    // pipeline parallelism is bounded by worker decode latency
+    // (~17 ms on a 13 MB chunk) rather than fully filling all
+    // `pool_size` workers. Bench on Silesia at -9 (38 chunks, 16
+    // workers): 524 MB/s with no pre-fill (this commit) vs 442 MB/s
+    // (prior static-pre-fill that had 1/38 hit rate).
+    let init_offset = seed_for(0);
+    spec.insert(
+        init_offset,
+        SpecSlot {
+            rx: submit_job(0, init_offset, until_for(0), true, init_offset),
+            partition_idx: 0,
+        },
+    );
 
     let mut expected_start: usize = 0;
-    let mut next_spec_to_dispatch: usize = (1 + prefetch_count).min(n_partitions);
+    // Next block-finder INDEX to query for a speculative dispatch.
+    // Starts at 1 (chunk 0 is the auth dispatch above; chunk 1 is the
+    // first refill index). Each per-iter refill advances by 1 once a
+    // dispatch is made. Mirror of vendor's per-prefetch
+    // `blockIndexToPrefetch` loop variable
+    // (vendor/.../core/BlockFetcher.hpp:474-491).
+    let mut next_spec_block_index: usize = 1;
     // Mirror of vendor `m_nextUnprocessedBlockIndex`
     // (vendor/.../GzipChunkFetcher.hpp:318 + 410). Tracks the running
     // count of subchunks INSERTED into `block_finder`. Each chunk's
@@ -871,14 +881,6 @@ fn consumer_loop<W: std::io::Write>(
     // (line 410: `m_nextUnprocessedBlockIndex += subchunks.size();`).
     // We query `block_finder.get(next_block_index)` to find the next
     // chunk's seed — equivalent to vendor's line 318 query.
-    //
-    // CRITICAL: the SPEC-RING `idx` is still a 0..n_partitions counter
-    // (used to address `spec[idx]`), but the seed/until queries MUST
-    // use `next_block_index` instead. After idx=0 inserts N subchunk
-    // boundaries, `block_finder.get(1)` returns the end of subchunk 0
-    // (an INTERNAL position in chunk 0's range), not the next chunk's
-    // start. Vendor avoids this by advancing the index by subchunks.size(),
-    // which is what we do here.
     let mut next_block_index: usize = 0;
 
     // ── Post-process pending queue (vendor parity) ────────────────────
@@ -903,16 +905,17 @@ fn consumer_loop<W: std::io::Write>(
         // Update FetchingStrategy (rapidgzip BlockFetcher.hpp:280-282).
         block_fetcher.record_fetch(idx);
 
-        // Take the in-flight slot (if any) so we can use its
-        // dispatched_seed as the stable cache key — see SpecSlot's
-        // comment about block-confirmation invalidating indexes
-        // (vendor/.../GzipBlockFinder.hpp:30-32).
-        let slot = spec[idx].take();
-        let cache_key_for_partition = match &slot {
-            Some(s) => s.dispatched_seed,
-            None if idx == 0 => 0,
-            None => partition_seed_for(idx),
-        };
+        // Take the in-flight slot dispatched at `expected_start` (the
+        // current chunk's start = predecessor's actual_end, already
+        // inserted into BlockFinder). Mirror of vendor's
+        // `takeFromPrefetchQueue(blockOffset)` exact-match lookup at
+        // vendor/.../core/BlockFetcher.hpp:405-423: the spec map is
+        // keyed by the offset each prefetch was dispatched at, so a
+        // hit requires that some previous refill's
+        // `block_finder.get(K)` query returned `expected_start` (which
+        // becomes the common case AFTER predecessor's insert).
+        let slot = spec.remove(&expected_start);
+        let cache_key_for_partition = expected_start;
 
         // ALL chunk acquisition flows through `block_fetcher.get`
         // (rapidgzip BlockFetcher::get at
@@ -1228,27 +1231,126 @@ fn consumer_loop<W: std::io::Write>(
             });
         }
 
-        // Refill the speculative pipeline: keep prefetch_count chunks
-        // outstanding ahead of the consumer. The seed uses the
-        // PARTITION-aligned guess (`partition_seed_for`) because the
-        // spec ring is indexed by partition counter, not subchunk
-        // count — using `block_finder.get(next_spec_to_dispatch)`
-        // would return an interior subchunk position from a prior
-        // chunk's inserts.
-        if next_spec_to_dispatch < n_partitions {
-            let seed = partition_seed_for(next_spec_to_dispatch);
-            spec[next_spec_to_dispatch] = Some(SpecSlot {
-                rx: submit_job(
-                    next_spec_to_dispatch,
-                    seed,
-                    partition_until_for(next_spec_to_dispatch),
-                    false,
-                    seed,
-                ),
-                dispatched_seed: seed,
-            });
-            next_spec_to_dispatch += 1;
+        // Evict stale speculations whose dispatch offset is <=
+        // `expected_start` (the next chunk's required start). Those
+        // slots were dispatched at static-spacing GUESSES that turned
+        // out to lie inside an already-consumed chunk, so we'll never
+        // pull them. Vendor parity: `m_failedPrefetchCache` filter at
+        // vendor/.../core/BlockFetcher.hpp:369-374 + the
+        // `m_prefetching.erase(...)` cleanup in
+        // `processReadyPrefetches` at lines 431-450. Dropping the
+        // receiver makes the worker's `reply.send` fail silently; we
+        // settle the prefetch bookkeeping here so the in-flight count
+        // stays accurate.
+        spec.retain(|&dispatched_offset, slot| {
+            let keep = dispatched_offset > expected_start;
+            if !keep {
+                block_fetcher.note_prefetch_completed(&dispatched_offset);
+                if trace::is_enabled() {
+                    trace::emit(
+                        "consumer",
+                        "speculative_stale_discard",
+                        &format!(
+                            r#""partition_idx":{},"dispatched_seed":{dispatched_offset},"expected_start":{expected_start}"#,
+                            slot.partition_idx,
+                        ),
+                    );
+                }
+            }
+            keep
+        });
+
+        // VENDOR PARITY (the bottom of the gap): unconditionally
+        // dispatch a spec at `seed_for(next_block_index)` — the offset
+        // returned by BlockFinder for the IMMEDIATE next chunk. At
+        // this point predecessor's `block_finder.insert(actual_end)`
+        // has run (above, line 374-equivalent), so this query returns
+        // the predecessor's confirmed actual_end. Since the next
+        // consumer iter's `expected_start` will equal that same value
+        // (we just set `expected_start = chunk_end_bit` above), the
+        // next iter's `spec.remove(&expected_start)` is GUARANTEED
+        // to hit this slot — turning the per-iter spec miss rate
+        // from ~97% (37/38 on Silesia) into ~0%. Mirror of vendor's
+        // prefetch loop guaranteeing one immediate-next-chunk spec
+        // per consumer iter via `FetchingStrategy::prefetch` returning
+        // `{lastFetched+1, ...}` (vendor/.../core/Prefetcher.hpp:72)
+        // combined with `m_blockFinder->get(lastFetched+1)` returning
+        // the just-inserted confirmed offset
+        // (vendor/.../core/BlockFetcher.hpp:479).
+        //
+        // If `prefetch_count` of slots is already in flight, evict
+        // the FARTHEST-FUTURE static-guess slot to make room. The
+        // immediate-next spec wins because it's guaranteed correct,
+        // while distant static guesses are speculative at best.
+        let immediate_seed = seed_for(next_block_index);
+        if immediate_seed < total_bits
+            && immediate_seed >= expected_start
+            && !spec.contains_key(&immediate_seed)
+        {
+            if spec.len() >= prefetch_count {
+                if let Some(&max_key) = spec.keys().filter(|&&k| k > immediate_seed).max() {
+                    if let Some(evicted) = spec.remove(&max_key) {
+                        block_fetcher.note_prefetch_completed(&max_key);
+                        if trace::is_enabled() {
+                            trace::emit(
+                                "consumer",
+                                "speculative_evict_for_immediate",
+                                &format!(
+                                    r#""partition_idx":{},"evicted_seed":{max_key},"immediate_seed":{immediate_seed}"#,
+                                    evicted.partition_idx,
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            if spec.len() < prefetch_count {
+                let until = until_for(next_block_index);
+                let partition_label = idx + 1;
+                spec.insert(
+                    immediate_seed,
+                    SpecSlot {
+                        rx: submit_job(
+                            partition_label,
+                            immediate_seed,
+                            until,
+                            false,
+                            immediate_seed,
+                        ),
+                        partition_idx: partition_label,
+                    },
+                );
+                // Advance the lookahead counter past this index so the
+                // below `while` loop doesn't double-dispatch.
+                if next_spec_block_index <= next_block_index {
+                    next_spec_block_index = next_block_index + 1;
+                }
+            }
         }
+
+        // The `immediate_seed` dispatch above is the ONLY per-iter
+        // refill. We intentionally do NOT loop dispatching further
+        // speculative jobs at static-guess offsets (which is what
+        // vendor's prefetch loop at vendor/.../core/BlockFetcher.hpp:474-491
+        // does for offsets beyond the BlockFinder's confirmed set).
+        // Reason: gzippy's `decode_or_iterate` slow path
+        // (`finish_decode_chunk_with_inexact_offset` over a 512 KiB
+        // BlockFinder candidate sweep, ~65 ms per chunk on Silesia at
+        // -9) on a wrong guess wastes ~2 s of pool CPU per file when
+        // pre-filling ~32 guess-based specs, throttling fast-path
+        // work. The immediate-next refill (which IS at a real
+        // boundary post-insert) suffices: the next consumer iter's
+        // `spec.remove(&expected_start)` hits unconditionally, so
+        // the pipeline stays pipelined at one fast-path decode per
+        // iter without the wasted slow-path cost.
+        //
+        // Suppress the unused-variable warning on `next_spec_block_index`
+        // (it's reserved for a future port of vendor's
+        // `FetchNextAdaptive::prefetch` lookahead that bounds the
+        // multi-spec dispatch by `consecutiveRatio` —
+        // vendor/.../core/Prefetcher.hpp:88-145).
+        let _ = next_spec_block_index;
+        let _ = prefetch_count;
 
         // Drain the pending queue down to the in-flight cap. Vendor
         // does this implicitly via `waitForReplacedMarkers` which
