@@ -155,7 +155,25 @@ pub fn decode_chunk_with_window(
     let mut already_decoded: usize = 0;
 
     while !stopping_point_reached {
-        let mut buffer = vec![0u8; ALLOCATION_CHUNK_SIZE];
+        // Vendor parity: `deflate::DecodedVector buffer(ALLOCATION_CHUNK_SIZE)`
+        // at vendor/.../chunkdecoding/GzipChunk.hpp:310 allocates a fresh
+        // `FasterVector<uint8_t>` of the requested size WITHOUT
+        // zero-initializing (vendor/.../core/FasterVector.hpp:172-176 — the
+        // `initialValue` arg defaults to `std::nullopt`, so `resize` skips
+        // `std::fill`). gzippy's previous `vec![0u8; N]` zero-filled 128 KiB
+        // per outer iter, multiplied across ~32 outer iters per 4 MiB chunk
+        // ≈ 4 MiB of avoidable memset per chunk per worker. The same
+        // `with_capacity + set_len` pattern is used elsewhere in this
+        // codebase (see `src/backends/isal_decompress.rs:488-492`). All
+        // bytes consumed downstream (the `buffer.truncate(n_bytes_read)` +
+        // `chunk.append_owned_buffer(buffer)` calls at lines 254-256) are
+        // bytes that ISA-L wrote into via `read_stream`, so no uninitialized
+        // memory is ever observed.
+        let mut buffer: Vec<u8> = Vec::with_capacity(ALLOCATION_CHUNK_SIZE);
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            buffer.set_len(ALLOCATION_CHUNK_SIZE)
+        };
         let mut n_bytes_read: usize = 0;
         // Cached state of the last inner call so the outer can decide
         // whether to break the OUTER loop (mirrors rapidgzip checking
