@@ -1,5 +1,357 @@
 # rapidgzip → gzippy parallel single-member: structural reference
 
+## AUDIT (2026-05-17): cognitive bias review + real gap analysis
+
+> This section is an external second-opinion review by an Opus advisor
+> after ~60 commits on `feat/cross-chunk-retry` failed to close the
+> Silesia gap (gzippy 489 MB/s vs rapidgzip 1077–1374 MB/s, i.e.
+> 0.36–0.45×). The user's words: *"you've run afoul of the same bias
+> that has gotten you wedged a bunch of times in the past, where you
+> hyper-focus on one thing and then you actually just back yourself
+> into a shitty new architecture rather than keeping an eye on the
+> actual goal architecture… one correct, complete implementation, which
+> is a direct port, not an invention, of an existing bit of code that
+> is right there on disk."*  The user is correct. This audit names the
+> biases, the real (still-present) architectural deviations, and a
+> straight-line plan that stops inventing and starts copying.
+
+### A1. Behavioral / cognitive-bias findings
+
+**Bias #1 — "Port files" as a substitute for porting the architecture.**
+Between `87cbc54` and `53f1a0f` we landed ~30 commits whose subject
+lines start with `port(parallel):` — `ThreadPool`, `BlockFetcher`,
+`BlockMap`, `Cache`, `Prefetcher`, `Statistics`, `CompressedVector`,
+`deflate::Block`, every Huffman variant. Per §H of this doc the
+**total unused-port LOC is ~2900**. The production path
+(`chunk_fetcher::drive`, `consumer_loop`, `fast_marker_inflate.rs`,
+`gzip_chunk::finish_decode_chunk_with_inexact_offset`) was barely
+touched while these files accumulated alongside it. The mental model
+that produced each commit was "this file looks like vendor's, so the
+port is progressing." The execution model is that none of these files
+are on the hot path. We have a museum of rapidgzip headers and a
+gzippy-shaped engine that the museum decorates.
+
+Evidence: `block_fetcher.rs`, `block_map.rs`, `cache.rs`,
+`prefetcher.rs`, `statistics.rs`, `compressed_vector.rs`,
+`deflate_block.rs` — all marked **Unused in prod** in §A. Commits
+`306c1e7` and `422da1f` claim to "wire BlockFetcher pipeline into
+chunk_fetcher::drive" but the diff shows `block_fetcher.get` invoked
+as a synchronous wrapper around our pre-existing `mpsc` worker pool
+plus our pre-existing `spec` HashMap (chunk_fetcher.rs:767, 944) —
+the BlockFetcher is decoration, not dispatch.
+
+**Bias #2 — Defensive patches over root-cause fixes.** Two consecutive
+commits (`f902c06`, `9f76440`) were merged within hours of each other
+and BOTH later reverted in this branch's history because they were
+*defensive skips* in `BlockMap::push` and
+`append_subchunks_to_block_map` to "tolerate phantom zero-size
+subchunks." The root cause was upstream: the consumer was advancing
+`expected_start` before EOF termination (fixed in `d089aa9` —
+"terminate consumer on EOF (vendor parity)") and `next_block_index`
+was tracking partition count instead of subchunk count (fixed in
+`435184b` — "track block index by subchunk count (vendor parity)").
+The commit-message body for `9f76440` literally describes its own
+patch as moving "the failure from panic to gzip ISIZE mismatch" —
+i.e. the author noticed the patch was wrong while writing the message
+and shipped it anyway. The vendor parity fix in `d089aa9` made both
+defensive patches unnecessary.
+
+Evidence: `git log --oneline -80` shows `d089aa9 fix(parallel-sm):
+terminate consumer on EOF (vendor parity)` followed shortly by
+`435184b fix(parallel-sm): track block index by subchunk count
+(vendor parity)`. If those two fixes had been the FIRST response
+("the vendor does X, what does X look like?"), `f902c06` and
+`9f76440` would never have been written.
+
+**Bias #3 — Confirmation bias on "advisor signed off" / "vendor
+parity" branding.** Subject lines like `port(parallel-sm): align
+append_block_boundary dedup with rapidgzip` (`4612252`) and `feat:
+Step 7b — port deflate::Block read + readInternalCompressed`
+(`04e518d`) read as victories but the deliverables were file-local:
+the function bodies match vendor C++ but the CALL SITES still go to
+gzippy-original code. `deflate_block.rs::read` is faithful to
+`deflate::Block::read` (§A row "Faithful; unused in prod") and the
+production slow path runs `fast_marker_inflate::decode_chunk_bootstrap`
+(2356 lines of gzippy-original code). The "advisor signed off"
+pattern from previous sessions reinforces this — a sub-agent reports
+"faithful port landed, tests green" and the chain continues, but the
+production routing never moves to the new port.
+
+Evidence: §A rows for `deflate::Block<>`, `Cache`, `Prefetcher`,
+`BlockFetcher`, `Statistics`, `CompressedVector` all marked
+**Unused** alongside Faithful or Deviated. The doc itself records
+the divergence; we kept landing port commits anyway.
+
+**Bias #4 — Local hill-climbing without a global view.** Commits like
+`ec9bee7` (key spec ring by blockOffset, refill at real boundaries),
+`194ddf8` (split apply_window onto worker pool), `77b2f1c` (bulk-copy
+subchunk windows), `8970f71` (drop zero-init from inner-loop
+scratch), `d0ec938` (gate trace::rss_kib syscalls behind is_enabled)
+are each individually defensible perf knobs that nibble the gap. None
+of them changes the fact that the consumer is a 700-line
+`consumer_loop` with a hand-rolled HashMap-keyed `spec` ring while
+vendor is a 50-line `processNextChunk` that just calls
+`BlockFetcher::get`. We have spent weeks tuning the wrong engine.
+
+**Bias #5 — Implementer chains producing N commits with no coherent
+diff against vendor.** 373 commits in 14 days. The history shows
+clusters: 25-30 "port(parallel): land X primitive" commits that built
+the museum, followed by 15-20 "perf(parallel-sm): ..." commits trying
+to make our pre-existing architecture catch up, followed by ~10
+revert commits ("Revert: perf(...): cap bootstrap output at 1 MB
+without handoff"; "Revert: feat(parallel-sm): wire IsalLitLenCode
+into bootstrap"). Each implementer ran in isolation and shipped a
+locally-coherent change. No one held the question "does our consumer
+match `processNextChunk`?" the whole time. The CUTOVER POLICY in this
+very doc ("PORT, DON'T INNOVATE … crossbeam-channel, custom thread
+pools, unique algorithms: all out of scope") was authored on
+2026-05-?? and we have since shipped `7aba6db perf(parallel-sm):
+lock-free job dispatch via crossbeam-channel` (immediately reverted
+in `5bd16b9`) and the current `consumer_loop`-with-`HashMap<usize,
+SpecSlot>` ad-hoc ring (which IS the kind of "custom" the policy
+forbade). The policy is correct; we are not following it.
+
+### A2. Real architectural gap (what is still actually different)
+
+Walk both production sequences side by side, classify each step.
+
+#### Vendor production hot path
+
+1. **Top-level driver**:
+   `ParallelGzipReader<ChunkFetcher>::read(...)` →
+   `processNextChunk()` (vendor `GzipChunkFetcher.hpp:311-362`).
+   ~50 lines. Each iteration:
+   a. `m_blockFinder->get(m_nextUnprocessedBlockIndex)` — get next
+      block offset.
+   b. `getBlock(*nextBlockOffset, m_nextUnprocessedBlockIndex)` →
+      `BaseType::get(...)` (= `BlockFetcher::get`, `core/BlockFetcher.hpp:245-329`).
+      This is THE work primitive: it consults caches, dispatches an
+      on-demand task via `ThreadPool` if needed, runs
+      `prefetchNewBlocks` during the wait, returns a
+      `shared_ptr<ChunkData>`.
+   c. `m_windowMap->get(*nextBlockOffset)->decompress()` — get
+      predecessor's window from a `CompressedVector`-backed map.
+   d. `postProcessChunk(...)` → `waitForReplacedMarkers(...)` → if
+      not enqueued, `queueChunkForPostProcessing(...)` →
+      `submitTaskWithHighPriority(applyWindow)` on the SAME
+      `ThreadPool`. Marker resolution runs on workers, not consumer.
+   e. `chunkData->setEncodedOffset(*nextBlockOffset)` — re-anchor.
+   f. `appendSubchunksToIndexes(...)` — push into `BlockMap`,
+      `BlockFinder::insert`, emplace per-subchunk windows.
+   g. Return chunk. Caller does the write.
+2. **Single decode primitive**: `decodeBlock(blockOffset,
+   nextBlockOffset) const override` (vendor `GzipChunkFetcher.hpp:692-729`).
+   Calls `decodeChunk(...)` (vendor `GzipChunk.hpp:660-852`). Inside,
+   `decodeChunkWithRapidgzip` instantiates a `deflate::Block<true>`
+   (i.e. enableAnalysis=true), seeds it with `setInitialWindow` from
+   the previous chunk's last 32 KiB if available (else starts in
+   marker mode), reads blocks one at a time. When cumulative
+   `cleanDataCount` ≥ `MAX_WINDOW_SIZE`, hands off to
+   `IsalInflateWrapper` via `setWindow`.
+3. **Caches + prefetch**: `Cache<K,V,LeastRecentlyUsed>` for main +
+   prefetch; `FetchNextAdaptive` strategy.
+4. **Threading**: `BS::thread_pool` + `std::future<BlockData>`.
+   Tasks: decode tasks and `applyWindow` tasks share the same pool.
+
+#### Gzippy production hot path (what runs at `feat/cross-chunk-retry` HEAD)
+
+1. **Top-level driver**: `decompress_single_member` →
+   `parallel::single_member::decompress_parallel` →
+   `chunk_fetcher::drive` (1661-line file). `drive` spawns a
+   `std::thread::scope` worker pool sharing a
+   `Mutex<mpsc::Receiver<Job>>`. The consumer is
+   `consumer_loop`, ~700 lines (chunk_fetcher.rs:670-1373).
+2. **Consumer**: hand-rolled HashMap-keyed `spec: HashMap<usize,
+   SpecSlot>` ring (chunk_fetcher.rs:767) with an `expected_start`
+   walk, an `auth_result = block_fetcher.get(expected_start, ||
+   {...spec drain... or submit_job...})` synchronous wrapper
+   (chunk_fetcher.rs:944-1066). The closure inside `block_fetcher.get`
+   is gzippy-original logic; the call is decoration so a deletion-
+   trap counter (`BLOCK_FETCHER_GET_CALLS_OBSERVED`) can fire.
+3. **Decode primitive**: `worker_loop` (chunk_fetcher.rs:487-667)
+   branches on `window_map.get_or_wait` into FAST PATH
+   (`decode_chunk_with_window`, ISA-L with known dict) or SLOW PATH
+   (`decode_or_iterate` → `finish_decode_chunk_with_inexact_offset`
+   → `fast_marker_inflate::decode_chunk_bootstrap`, 2356 lines of
+   gzippy-original code, NOT `deflate::Block`).
+4. **Caches**: `BlockFetcher` IS constructed (chunk_fetcher.rs:274)
+   but its main cache and prefetch cache are only inserted into for
+   bookkeeping (chunk_fetcher.rs:1492). Reads from the cache happen
+   only inside `block_fetcher.get`'s wrapper closure, which we
+   control. The vendor's `getFromCaches` → `takeFromPrefetchQueue` →
+   `m_cache.get(blockOffset)` chain is not the dispatch primitive
+   here; the spec HashMap is.
+5. **Post-process**: `queueChunkForPostProcessing` → `submit_post_process`
+   on the SAME mpsc pool (chunk_fetcher.rs:814-839). This part is
+   actually parallel and matches vendor in structure since `194ddf8`.
+6. **Threading**: `std::thread::scope` + `mpsc::channel` + per-job
+   `mpsc::channel` reply.
+
+#### Architectural deviation matrix
+
+| Step | Vendor | Gzippy | Class |
+|------|--------|--------|-------|
+| Top-level read | `ParallelGzipReader::read` → `processNextChunk` (~50 LOC) | `decompress_parallel` → `drive` → `consumer_loop` (~700 LOC) | **Architectural deviation** |
+| Block lookup | `m_blockFinder->get(idx)` | `seed_for(block_index)` wrapping `block_finder.get(idx)` | Faithful |
+| Dispatch | `BlockFetcher::get(blockOffset, blockIndex, partitionOffsetFn)` (`core/BlockFetcher.hpp:245-329`) | `block_fetcher.get(expected_start, closure)` where the closure is `spec.remove(&expected_start)`-or-`submit_job(...).recv()` (chunk_fetcher.rs:944-1066) | **Architectural deviation** — wrapper around our ring, not the BlockFetcher dispatch |
+| Threading | `BS::thread_pool` + `std::future<BlockData>` | `std::thread::scope` + `Mutex<mpsc::Receiver<Job>>` + per-job `mpsc::channel` reply | **Architectural deviation** (deferred in §B5; never closed) |
+| Prefetch queue | `m_prefetching: std::map<size_t, std::future<BlockData>>` (BlockFetcher.hpp:131) advanced in `prefetchNewBlocks` during the future wait | `spec: HashMap<usize, SpecSlot>` (chunk_fetcher.rs:767) advanced once per consumer iter at `seed_for(next_block_index)` (chunk_fetcher.rs:1285-1329) | **Architectural deviation** — we explicitly chose ONE immediate-next-seed per iter; vendor fills `parallelization` prefetches via `FetchingStrategy::prefetch` |
+| Cache | `Cache<K,V,LRU>` + LRU eviction (`core/Cache.hpp`) | `BlockFetcher`'s internal `Cache` + `PrefetchCache` (block_fetcher.rs:31-49); inserts happen but reads do not drive dispatch | **Architectural deviation** — cache exists; routing doesn't query it |
+| Decode core (slow path) | `deflate::Block<true>` (vendor `gzip/deflate.hpp:513-2005`) seeded by `setInitialWindow`, marker mode→clean handoff via `cleanDataCount` | `fast_marker_inflate::decode_chunk_bootstrap` (2356 LOC, gzippy-original) + `CleanTailTracker` heuristic | **Architectural deviation** — `deflate_block.rs` is the faithful port and is **NOT CALLED** |
+| Marker encoding | `MapMarkers` (oldest-byte-indexed, `MarkerReplacement.hpp:15-46`) | `MARKER_BASE=32768`, newest-byte-indexed (`replace_markers.rs:24,49-58`) | **Architectural deviation** (B1; documented since the doc was first written) |
+| Window storage | `Cache<size_t, SharedWindow>` where `SharedWindow = CompressedVector` | `BTreeMap<usize, Arc<[u8;32768]>>` + `Mutex` + `Condvar` (`window_map.rs:23-96`) | **Architectural deviation** (B12) + Extra (Condvar) |
+| Post-process | `submitTaskWithHighPriority([chunkData, window]() { chunkData->applyWindow(...); })` on the shared pool | `submit_post_process(...)` on the same mpsc pool | **Faithful** (since `194ddf8`, May 2026) |
+| Re-anchor on speculative miss | `chunkData->setEncodedOffset(*nextBlockOffset)` inside `processNextChunk` always | `chunk.set_encoded_offset(expected_start)` inside the spec-hit branch of `block_fetcher.get`'s closure (chunk_fetcher.rs:1004) | Cosmetic deviation |
+| EOF | `if ( chunkData->encodedSizeInBits == 0 ) { m_blockMap->finalize(); m_blockFinder->finalize(); return {}; }` | `if chunk.encoded_size_bits == 0 { break; }` then `block_map.finalize()` / `block_finder_par.finalize()` after `drive` returns | Cosmetic deviation |
+| Routing layer fallback | None — vendor throws | None at HEAD — the routing-layer fallback was already removed in `decompress_single_member_for` (mod.rs:281-294). | **Faithful** (rare bright spot) |
+| Multi-stream gzip | `decodeChunkWithRapidgzip` loops over streams within a chunk via `readGzipFooter` / `readHeader` | `gzip_chunk::decode_chunk_with_window` was updated for the multi-stream loop (Step 13 ✅) but `decompress_parallel` reads the trailer inline assuming single-member (single_member.rs:95-99) | Mixed: decoder loop faithful; driver assumes single-member |
+| Direct-try-at-guessed-offset | `tryToDecode` first attempts decode at `blockOffset` (GzipChunk.hpp:736-741) | Deleted (decode_or_iterate iterates BlockFinder candidates only) | Architectural deviation (B10), deliberate |
+| `appendDeflateBlockBoundary` semantics | `(encoded, decoded)` dedup + `splitChunkSize` gate (ChunkData.hpp:455-467) | `(encoded)` dedup only, always push new subchunk (chunk_data.rs:264-285) — partially fixed in `4612252`; split-size gate still missing | Architectural deviation (B2) |
+
+#### The single observation that explains the perf gap
+
+Vendor's `processNextChunk` body is ~50 lines because EVERY non-trivial
+operation is a method call into a primitive that vendor wrote ONCE.
+The consumer is a coordination layer over a few well-tested
+algorithms. Gzippy's `consumer_loop` is 700 lines because it
+**reimplements those algorithms inline** as it goes:
+
+- vendor's `BlockFetcher::get` does prefetch-during-wait, cache
+  lookup, future timeout polling, on-demand submission, insert-into-
+  cache on completion, statistics — all in 84 lines. Gzippy's
+  `consumer_loop` does each of these AS INLINE LOGIC inside the
+  closure passed to `block_fetcher.get` — which is itself a
+  one-shot wrapper that calls the closure (block_fetcher.rs `get`
+  method). The vendor's primitive is bypassed.
+- vendor's `deflate::Block<true>` IS the decoder loop. Gzippy
+  ported it as `deflate_block.rs` (964 lines, faithful, tests pass)
+  AND wrote `fast_marker_inflate.rs` (2356 lines, gzippy-original,
+  in production). Two decoders, the wrong one wired.
+- vendor's `Cache<K,V,LRU>` IS the chunk store. Gzippy ported it as
+  `cache.rs` (289 lines, faithful, tests pass) AND has an in-flight
+  `spec` HashMap that does the equivalent job for the one queue that
+  matters. Cache is unused.
+
+The user is right. We have one correct, complete implementation on
+disk: vendor's. We did not port it. We built a parallel structure
+next to it.
+
+### A3. Straight-line plan (stop hill-climbing; start copying)
+
+The remaining work is NOT a sequence of perf knobs. It is a single
+structural cutover that replaces `chunk_fetcher::drive` /
+`consumer_loop` / `worker_loop` / `fast_marker_inflate` with a literal
+port of `ParallelGzipReader::read` + `processNextChunk` +
+`decodeBlock`. The doc's §I "Single-commit cutover plan" got the spec
+right; we have been ignoring it. Below is the straight-line action
+list. NO sub-agent should be allowed to ship a change that isn't on
+this list, and NO "perf" commit is acceptable until step 9.
+
+1. **Delete the consumer's spec ring.** Remove `spec:
+   HashMap<usize, SpecSlot>` (chunk_fetcher.rs:767) and every line
+   that touches it. Remove the inline drain logic in the
+   `block_fetcher.get` closure (chunk_fetcher.rs:944-1066). The
+   `submit_job` helper goes too. The 700-line `consumer_loop` shrinks
+   to ~80 lines: a loop that calls `block_fetcher.get(blockOffset,
+   blockIndex, partitionOffsetFn)`, gets back an `Arc<ChunkData>`,
+   does `postProcessChunk` + `setEncodedOffset` +
+   `appendSubchunksToIndexes`, hands the chunk to the writer.
+
+2. **Make `BlockFetcher::get` the dispatch primitive.** Inside
+   `block_fetcher.rs`, port the body of `core/BlockFetcher.hpp:245-329`
+   literally: `getFromCaches` → `takeFromPrefetchQueue` → submit
+   on-demand task if needed → `prefetchNewBlocks` during the wait →
+   `insertIntoCache` on completion. This means BlockFetcher OWNS the
+   thread pool (or holds a reference to it), the prefetch map, and
+   the decision logic. Stop calling it from a closure as if it were
+   passive.
+
+3. **Replace `std::thread::scope + Mutex<mpsc::Receiver<Job>>` with a
+   real `ThreadPool`.** Wire `parallel/thread_pool.rs` (already
+   ported, `87cbc54`) and the `JoiningThread` / `AtomicMutex`
+   primitives to provide `submit_task(F) -> Future<R>`. BlockFetcher
+   submits to this pool. PostProcess submits to this pool. No mpsc
+   channels in the production path. This eliminates the `spec`
+   HashMap as a category — futures live in `m_prefetching` keyed by
+   `blockOffset`, exactly mirroring vendor.
+
+4. **Stop calling `fast_marker_inflate`. Wire `deflate_block.rs`
+   into `finish_decode_chunk_with_inexact_offset`.** Replace the
+   `decode_chunk_bootstrap` call in
+   `gzip_chunk::finish_decode_chunk_with_inexact_offset`
+   (gzip_chunk.rs:234-462) with a `deflate_block::Block` driven in
+   the same loop shape as `decodeChunkWithRapidgzip`
+   (GzipChunk.hpp:413-657): instantiate Block, `read_header`, `read`
+   in a loop, hand off to `IsalInflateWrapper::set_window` when
+   `cleanDataCount >= MAX_WINDOW_SIZE`. Then **delete
+   `fast_marker_inflate.rs` and `replace_markers.rs`'s newest-byte
+   encoding** — flip `MARKER_BASE` to oldest-byte-indexed (B1) and
+   delete the 2356 lines of gzippy-original marker code.
+
+5. **Replace `WindowMap` with `Arc<CompressedVector>`-valued
+   storage.** Remove the Condvar (`window_map.rs:23-96`). The
+   `BlockFetcher::get` flow already waits via the future returned by
+   `submit_task` — workers don't need to block on a Condvar because
+   they will be SCHEDULED with the predecessor's window in hand by
+   the consumer (vendor pattern). Use `CompressedVector` for storage.
+
+6. **Drive `Prefetcher` and `Cache` from `BlockFetcher`.** They're
+   already ported (`prefetcher.rs`, `cache.rs`). Plug them into
+   `block_fetcher.rs::get` per the vendor body. Stop wrapping the
+   cache as a passive bookkeeping store outside the dispatch.
+
+7. **Move multi-stream loop into the driver, not the chunk decoder.**
+   `decompress_parallel` (single_member.rs:68-148) currently reads
+   the trailer inline assuming single-member; the chunk decoder
+   handles the loop. Vendor handles multi-stream end-to-end via
+   `processNextChunk` returning chunks across stream boundaries. Port
+   that shape: `decompress_parallel` calls
+   `parallel_gzip_reader::read(...)` which loops `processNextChunk`
+   until EOF — the function that returns the running CRC and total
+   size, not the wrapper that calls a 700-line `drive`.
+
+8. **Delete deletion-trap counters that exist only to prove `port(...)`
+   commits "wired" something.** `BLOCK_FETCHER_GETS_OBSERVED`,
+   `BLOCK_FETCHER_GET_CALLS_OBSERVED`,
+   `GZIP_BLOCK_FINDER_INSERTS_OBSERVED`,
+   `MARKER_PIPELINE_RUNS` (chunk_fetcher.rs:107-130, single_member.rs:44).
+   They mask "is it wired?" with "is a counter incrementing?". Once
+   the architecture is the port, the counters are noise. The single
+   no-fallback test (`test_marker_pipeline_actually_runs_on_x86_64_isal`)
+   becomes a `path == DecodePath::IsalParallelSM` assertion at the
+   routing layer.
+
+9. **THEN measure.** After steps 1-8, `make ship` runs against the
+   structural port and compares to vendor on the same hardware. If
+   there is still a gap, it is a TUNING gap (cache sizes, prefetch
+   depth, thread count) and the perf optimization work begins — with
+   an architecture that matches vendor's, so each tuning change is a
+   parameter sweep, not a rewrite. **No perf commit is acceptable
+   before step 9 completes.**
+
+10. **Pre-commit invariant for future work.** Add a
+    `scripts/diff_against_vendor.sh` that prints the LOC ratio of
+    `src/decompress/parallel/{chunk_fetcher,single_member,gzip_chunk}.rs`
+    vs `vendor/.../GzipChunkFetcher.hpp + ParallelGzipReader.hpp +
+    GzipChunk.hpp`. If gzippy's production-hot LOC exceeds 1.5×
+    vendor's, the structural port has regressed.
+
+### A4. Sanity checks before any of this lands
+
+- This audit does NOT delete the existing prior §0–§J content below.
+  That content is the working state map; the audit adds intent on top.
+- The §I "Single-commit cutover plan" further down was already
+  correct. Steps 1–10 above are an ordering + commitment to it. If a
+  future audit finds §I contradicts the steps above, §I is
+  authoritative for spec; the steps above are authoritative for the
+  user-imposed "stop hill-climbing" tone.
+- The single test that prevents future regression of THIS audit's
+  recommendation: `scripts/diff_against_vendor.sh` invoked from
+  `make` and asserting the LOC ratio. Code review can rubber-stamp;
+  the ratio cannot.
+
+---
+
 > **Status at the head of branch `feat/cross-chunk-retry`.** Reset of the
 > previous reference; the prior "Step 1..16 closure plan" is gone — most
 > of those steps landed as *port files* but were never wired into the

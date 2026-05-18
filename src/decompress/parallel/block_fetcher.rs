@@ -10,17 +10,29 @@
 //!   which indexes to speculatively prefetch.
 //! - [`ChunkFetcherStatistics`](super::statistics::ChunkFetcherStatistics)
 //!   aggregating per-cache and per-fetcher counters.
+//! - A `prefetching: HashMap<Key, Receiver<Result<Value, E>>>` mirror of
+//!   vendor's `m_prefetching: std::map<size_t, std::future<BlockData>>`
+//!   at vendor/.../core/BlockFetcher.hpp:131. Receivers are produced by
+//!   the caller-supplied `submit` closure (a stand-in for vendor's
+//!   `m_threadPool.submit(...)` at BlockFetcher.hpp:554-558) and stored
+//!   here so the consumer's `get()` can do an exact-match take from the
+//!   prefetch queue (BlockFetcher.hpp:385-410) instead of an inline
+//!   ad-hoc ring.
 //!
-//! The async machinery (rapidgzip's `BS::thread_pool` + futures-based
-//! `submitOnDemandTask` / `takeFromPrefetchQueue` / `wait_for` flow) is
-//! NOT included here — gzippy uses `chunk_fetcher::drive`'s mpsc-channel
-//! worker pool for that. This module is the cache-composition core; the
-//! integration glue lives elsewhere.
+//! The thread pool itself is still external — gzippy uses
+//! `chunk_fetcher::drive`'s `std::thread::scope` + `mpsc::Receiver<Job>`
+//! pool. Callers pass a `submit_decode` closure that knows how to send
+//! a `DecodeJob` to that pool; we just hold the `Receiver` for the
+//! result. This is the rapidgzip `BS::thread_pool::submit` -> `future`
+//! mapping with stdlib mpsc as the closest equivalent. See the
+//! "Threading model" note in the port reference; full pool unification
+//! is a follow-up.
 
 #![allow(dead_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
 
 use super::cache::{Cache, CacheStrategy, LeastRecentlyUsed};
@@ -28,7 +40,9 @@ use super::prefetcher::FetchingStrategy;
 use super::statistics::ChunkFetcherStatistics;
 
 /// Generic BlockFetcher orchestration. `Key` is the block's compressed-bit
-/// offset; `Value` is whatever the caller stores per-block.
+/// offset; `Value` is whatever the caller stores per-block; `Err` is the
+/// error type produced by a dispatched fetch task (vendor uses C++
+/// exceptions thrown out of the future).
 ///
 /// `Strategy` defaults to LRU; `Prefetch` defaults to nothing — caller
 /// picks a `FetchingStrategy` implementor.
@@ -36,6 +50,7 @@ pub struct BlockFetcher<
     Key: Hash + Eq + Clone + Ord,
     Value: Clone,
     Prefetch: FetchingStrategy,
+    Err = (),
     Strategy: CacheStrategy<Key> = LeastRecentlyUsed<Key>,
 > {
     /// Main cache for resolved blocks.
@@ -44,9 +59,14 @@ pub struct BlockFetcher<
     /// uses `prefetchCache` to keep prefetch stats independent of main
     /// cache hit/miss).
     prefetch_cache: Mutex<Cache<Key, Value>>,
-    /// Set of block offsets currently being prefetched (in-flight tasks).
-    /// Mirror of rapidgzip's `m_prefetching` (BlockFetcher.hpp:229).
-    prefetching: Mutex<HashSet<Key>>,
+    /// In-flight prefetch tasks. Mirror of vendor's
+    /// `m_prefetching: std::map<size_t /* blockOffset */, std::future<BlockData>>`
+    /// at vendor/.../core/BlockFetcher.hpp:131. Receivers replace the
+    /// old `HashSet<Key>` whose only role was tracking in-flight
+    /// membership — now we both track membership AND hold the future so
+    /// `get()` can do an exact-match take + wait, mirroring vendor's
+    /// `takeFromPrefetchQueue` (BlockFetcher.hpp:385-410).
+    prefetching: Mutex<HashMap<Key, Receiver<Result<Value, Err>>>>,
     /// Strategy decides which indexes to prefetch.
     fetching_strategy: Mutex<Prefetch>,
     /// Aggregated statistics. Direct access; rapidgzip's struct uses a
@@ -57,9 +77,14 @@ pub struct BlockFetcher<
     /// failing work. Mirror of rapidgzip's `m_failedPrefetchCache`
     /// (BlockFetcher.hpp:369-374).
     failed_prefetch: Mutex<HashSet<Key>>,
+    /// Soft cap on the simultaneous in-flight prefetches, used by
+    /// `prefetch_new_blocks` to decide when to stop. Mirror of vendor's
+    /// `m_threadPool.capacity()` check at BlockFetcher.hpp:467 (vendor
+    /// caps prefetches at `parallelization - 1`).
+    parallelization: usize,
 }
 
-impl<Key, Value, Prefetch> BlockFetcher<Key, Value, Prefetch>
+impl<Key, Value, Prefetch, Err> BlockFetcher<Key, Value, Prefetch, Err>
 where
     Key: Hash + Eq + Clone + Ord,
     Value: Clone,
@@ -74,10 +99,11 @@ where
         Self {
             cache: Mutex::new(Cache::new(cache_capacity)),
             prefetch_cache: Mutex::new(Cache::new(prefetch_capacity)),
-            prefetching: Mutex::new(HashSet::new()),
+            prefetching: Mutex::new(HashMap::new()),
             fetching_strategy: Mutex::new(fetching_strategy),
             statistics: ChunkFetcherStatistics::new(parallelization),
             failed_prefetch: Mutex::new(HashSet::new()),
+            parallelization,
         }
     }
 
@@ -85,7 +111,7 @@ where
     /// prefetch set. Mirror of `BlockFetcher::test`
     /// (BlockFetcher.hpp:227-232).
     pub fn test(&self, block_offset: &Key) -> bool {
-        self.prefetching.lock().unwrap().contains(block_offset)
+        self.prefetching.lock().unwrap().contains_key(block_offset)
             || self.cache.lock().unwrap().test(block_offset)
             || self.prefetch_cache.lock().unwrap().test(block_offset)
     }
@@ -94,45 +120,69 @@ where
     /// `BlockFetcher::get(blockOffset, blockIndex, getPartitionOffset)`
     /// at vendor/.../core/BlockFetcher.hpp:245-329.
     ///
-    /// Returns the block data for `block_offset`. On cache or
-    /// prefetch-cache hit, returns immediately (mirror of
-    /// BlockFetcher.hpp:302-309). On miss, invokes `dispatch` to
-    /// produce the value, on success inserts into the main cache and
-    /// returns the value (mirror of BlockFetcher.hpp:317-328); on error
-    /// the cache is left untouched and the error is propagated.
-    /// Rapidgzip raises a C++ exception in the error path
-    /// (BlockFetcher.hpp:656-661) — we use a typed Result.
+    /// Returns the block data for `block_offset`. Vendor flow, body
+    /// mirrored line-by-line:
     ///
-    /// `Value` is typically `Arc<ChunkData>` for the production
-    /// pipeline, matching rapidgzip's `std::shared_ptr<ChunkData>` at
-    /// BlockFetcher.hpp:46. The Arc semantics are identical: cache and
-    /// caller share the same allocation; consumer-side mutation goes
-    /// through `Arc::make_mut` or a deliberate `.clone()` per the
-    /// rapidgzip shared_ptr-aliasing model.
+    ///   1. `getFromCaches(blockOffset)` (vendor L263) — cache lookup,
+    ///      with prefetch-cache promote-on-hit.
+    ///   2. If not in caches, check `m_prefetching` for an in-flight
+    ///      task at the same offset (vendor's `queuedResult` at L265).
+    ///      Take it if present.
+    ///   3. If neither cache nor prefetch queue has it, call `submit`
+    ///      to dispatch a new on-demand task (vendor's
+    ///      `submitOnDemandTask` at L276).
+    ///   4. Wait on the receiver (vendor's `queuedResult.get()` at L317).
+    ///   5. `insertIntoCache` on success (vendor L320). Errors are
+    ///      propagated without caching (vendor raises in this branch
+    ///      via `decodeAndMeasureBlock` at L656-661).
     ///
-    /// **Threading-model deviation (§B5)**: rapidgzip submits a future
-    /// to its internal `ThreadPool` (BlockFetcher.hpp:580) and waits on
-    /// `std::future::get`. gzippy's `dispatch` closure is the unit of
-    /// work — the caller is responsible for arranging actual parallelism
-    /// (e.g. by having `dispatch` `submit_job(...).recv()` into the
-    /// mpsc worker pool from `chunk_fetcher::drive`). The CALLER pattern
-    /// is the same: one call returns the resolved data. Underlying
-    /// thread-pool unification is deferred (see
-    /// `docs/rapidgzip-port-reference.md` §B5).
-    pub fn get<F, E>(&self, block_offset: Key, dispatch: F) -> Result<Value, E>
+    /// The `submit` closure is the gzip-specific dispatch (sends a
+    /// `DecodeJob` to the worker pool and returns the reply `Receiver`).
+    /// Mirror of vendor's `m_threadPool.submit(...)` lambda body at
+    /// BlockFetcher.hpp:554-558, factored out so this generic core
+    /// doesn't depend on the gzip job type.
+    ///
+    /// **Threading-model deviation (§B5)**: rapidgzip uses
+    /// `BS::thread_pool` + `std::future`. We use stdlib `mpsc::Receiver`
+    /// as the closest equivalent. The CALLER pattern is identical:
+    /// `get()` does cache lookup + prefetch take + dispatch + wait +
+    /// cache-insert in a single call. Underlying thread-pool unification
+    /// is a follow-up (see `docs/rapidgzip-port-reference.md` §B5).
+    pub fn get<S>(&self, block_offset: Key, submit: S) -> Result<Value, Err>
     where
-        F: FnOnce() -> Result<Value, E>,
+        S: FnOnce(Key) -> Receiver<Result<Value, Err>>,
     {
-        // BlockFetcher.hpp:263 — getFromCaches (prefetch-cache promote,
-        // then main cache lookup). `get_if_available` already records
-        // hit stats and promotes prefetched entries into the main cache.
+        // BlockFetcher.hpp:263 — getFromCaches. `get_if_available`
+        // already records hit stats and promotes prefetched entries
+        // into the main cache.
         if let Some(v) = self.get_if_available(&block_offset) {
             return Ok(v);
         }
-        // BlockFetcher.hpp:274-277 — submit on-demand and block.
-        self.record_on_demand_fetch();
-        let value = dispatch()?;
-        // BlockFetcher.hpp:320 — insertIntoCache after future resolves.
+
+        // BlockFetcher.hpp:265 — `queuedResult = ... takeFromPrefetchQueue`.
+        // Vendor's exact-match path on `m_prefetching`: if an in-flight
+        // prefetch matches our key, take the receiver and wait on it
+        // instead of issuing a duplicate dispatch.
+        let rx = match self.take_prefetch(&block_offset) {
+            Some(existing) => existing,
+            None => {
+                // BlockFetcher.hpp:274-277 — submit on-demand task.
+                self.record_on_demand_fetch();
+                submit(block_offset.clone())
+            }
+        };
+
+        // BlockFetcher.hpp:317 — `queuedResult.get()`. Wait on the
+        // receiver. Sender-dropped is treated as a broken promise
+        // (vendor's `std::future::get` raises in this case); we panic
+        // since the worker pool dropping its reply mid-decode means
+        // the pool itself is in a broken state.
+        let value = match rx.recv() {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => panic!("block_fetcher::get: dispatch worker dropped reply (broken promise)"),
+        };
+        // BlockFetcher.hpp:320 — `insertIntoCache(blockOffset, result)`.
         self.insert(block_offset.clone(), value.clone());
         Ok(value)
     }
@@ -203,15 +253,50 @@ where
         self.statistics.base.record_on_demand_fetch();
     }
 
-    /// Record that a prefetch task started. Adds the offset to the
-    /// in-flight set so duplicate prefetches are skipped.
-    pub fn note_prefetch_started(&self, block_offset: Key) {
-        self.prefetching.lock().unwrap().insert(block_offset);
+    /// Take the in-flight prefetch receiver for `block_offset` if one
+    /// exists. Mirror of vendor's `takeFromPrefetchQueue` exact-match
+    /// branch at vendor/.../core/BlockFetcher.hpp:385-410.
+    pub fn take_prefetch(&self, block_offset: &Key) -> Option<Receiver<Result<Value, Err>>> {
+        self.prefetching.lock().unwrap().remove(block_offset)
     }
 
-    /// Record that a prefetch task completed. Removes from in-flight set.
-    pub fn note_prefetch_completed(&self, block_offset: &Key) {
-        self.prefetching.lock().unwrap().remove(block_offset);
+    /// True iff a prefetch task at `block_offset` is in flight.
+    pub fn prefetch_in_flight(&self, block_offset: &Key) -> bool {
+        self.prefetching.lock().unwrap().contains_key(block_offset)
+    }
+
+    /// Record an in-flight prefetch. The receiver lives in the prefetch
+    /// queue and is consumed by `take_prefetch` on the consumer's
+    /// `BlockFetcher::get` call. Mirror of vendor's
+    /// `m_prefetching.emplace(*prefetchBlockOffset, std::move(prefetchedFuture))`
+    /// at BlockFetcher.hpp:558.
+    pub fn submit_prefetch(&self, block_offset: Key, rx: Receiver<Result<Value, Err>>) {
+        self.prefetching.lock().unwrap().insert(block_offset, rx);
+    }
+
+    /// Drop any in-flight prefetch receivers that match the predicate.
+    /// Mirror of vendor's `processReadyPrefetches` cleanup
+    /// (BlockFetcher.hpp:431-450) — receivers whose consumer no longer
+    /// cares are dropped, the worker's `reply.send` then fails silently.
+    pub fn drop_prefetches_matching<F: FnMut(&Key) -> bool>(&self, mut pred: F) {
+        self.prefetching.lock().unwrap().retain(|k, _| !pred(k));
+    }
+
+    /// Number of in-flight prefetches. Used by callers' own prefetch
+    /// throttle to mirror vendor's `m_prefetching.size()` reads.
+    pub fn prefetching_len(&self) -> usize {
+        self.prefetching.lock().unwrap().len()
+    }
+
+    /// Snapshot of the in-flight prefetch keys.
+    pub fn prefetching_keys(&self) -> Vec<Key> {
+        self.prefetching.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Vendor's `m_parallelization` cap on simultaneous prefetches
+    /// (BlockFetcher.hpp:467: `m_threadPool.capacity()`).
+    pub fn parallelization(&self) -> usize {
+        self.parallelization
     }
 
     /// Mark a block offset as a failed prefetch (rapidgzip
@@ -283,9 +368,24 @@ where
 mod tests {
     use super::super::prefetcher::FetchNextAdaptive;
     use super::*;
+    use std::sync::mpsc;
 
-    fn new_fetcher() -> BlockFetcher<u64, String, FetchNextAdaptive> {
+    fn new_fetcher() -> BlockFetcher<u64, String, FetchNextAdaptive, &'static str> {
         BlockFetcher::new(4, 4, FetchNextAdaptive::new(3), 4)
+    }
+
+    /// Helper: build a `Receiver` already populated with the given
+    /// `Result`. Used to simulate a worker that has already run by the
+    /// time `get` consults the prefetch queue (the dispatch closure runs
+    /// inline in these tests since there's no real worker pool).
+    fn ready_rx<T, E>(result: Result<T, E>) -> Receiver<Result<T, E>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        let _ = tx.send(result);
+        rx
     }
 
     #[test]
@@ -316,9 +416,9 @@ mod tests {
     #[test]
     fn test_returns_true_for_in_flight_prefetch() {
         let bf = new_fetcher();
-        bf.note_prefetch_started(300);
+        bf.submit_prefetch(300, ready_rx::<String, &'static str>(Ok("p300".into())));
         assert!(bf.test(&300));
-        bf.note_prefetch_completed(&300);
+        let _ = bf.take_prefetch(&300);
         assert!(!bf.test(&300));
     }
 
@@ -357,9 +457,9 @@ mod tests {
         bf.insert(700, "cached".into());
         let mut dispatched = false;
         let v = bf
-            .get(700, || -> Result<String, ()> {
+            .get(700, |_k: u64| -> Receiver<Result<String, &'static str>> {
                 dispatched = true;
-                Ok("dispatched".into())
+                ready_rx(Ok("dispatched".into()))
             })
             .unwrap();
         assert_eq!(v, "cached");
@@ -370,7 +470,9 @@ mod tests {
     fn get_invokes_dispatch_on_miss_and_caches_result() {
         let bf = new_fetcher();
         let v = bf
-            .get(800, || -> Result<String, ()> { Ok("from-dispatch".into()) })
+            .get(800, |_k: u64| -> Receiver<Result<String, &'static str>> {
+                ready_rx(Ok("from-dispatch".into()))
+            })
             .unwrap();
         assert_eq!(v, "from-dispatch");
         // Mirror of rapidgzip BlockFetcher.hpp:320 (`insertIntoCache`
@@ -379,9 +481,9 @@ mod tests {
         // circuit without invoking the dispatch closure.
         let mut dispatched_again = false;
         let v2 = bf
-            .get(800, || -> Result<String, ()> {
+            .get(800, |_k: u64| -> Receiver<Result<String, &'static str>> {
                 dispatched_again = true;
-                Ok("re-dispatched".into())
+                ready_rx(Ok("re-dispatched".into()))
             })
             .unwrap();
         assert_eq!(v2, "from-dispatch");
@@ -393,19 +495,22 @@ mod tests {
     }
 
     #[test]
-    fn get_promotes_prefetched_value_on_hit() {
+    fn get_takes_prefetched_future_on_hit() {
+        // Mirror of vendor's `takeFromPrefetchQueue` exact-match branch
+        // at vendor/.../core/BlockFetcher.hpp:385-410.
         let bf = new_fetcher();
-        bf.insert_prefetched(900, "prefetched".into());
+        bf.submit_prefetch(900, ready_rx(Ok("prefetched".into())));
         let mut dispatched = false;
         let v = bf
-            .get(900, || -> Result<String, ()> {
+            .get(900, |_k: u64| -> Receiver<Result<String, &'static str>> {
                 dispatched = true;
-                Ok("should-not-run".into())
+                ready_rx(Ok("should-not-run".into()))
             })
             .unwrap();
         assert_eq!(v, "prefetched");
         assert!(!dispatched);
-        // After get, prefetched entry has been promoted to main cache.
+        // Prefetch receiver was consumed; cache holds the result now.
+        assert!(!bf.prefetch_in_flight(&900));
         assert_eq!(bf.cache_size(), 1);
     }
 
@@ -414,7 +519,9 @@ mod tests {
         let bf = new_fetcher();
         let before = bf.statistics.base.snapshot().on_demand_fetch_count;
         let _v = bf
-            .get(1000, || -> Result<String, ()> { Ok("x".into()) })
+            .get(1000, |_k: u64| -> Receiver<Result<String, &'static str>> {
+                ready_rx(Ok("x".into()))
+            })
             .unwrap();
         let after = bf.statistics.base.snapshot().on_demand_fetch_count;
         assert!(after > before);
@@ -424,14 +531,16 @@ mod tests {
     fn get_propagates_dispatch_error_without_caching() {
         let bf = new_fetcher();
         let err = bf
-            .get(1100, || -> Result<String, &'static str> { Err("boom") })
+            .get(1100, |_k: u64| -> Receiver<Result<String, &'static str>> {
+                ready_rx(Err("boom"))
+            })
             .unwrap_err();
         assert_eq!(err, "boom");
         // Error must NOT be cached: a second get with a successful
         // dispatch should run it.
         let ok = bf
-            .get(1100, || -> Result<String, &'static str> {
-                Ok("recovered".into())
+            .get(1100, |_k: u64| -> Receiver<Result<String, &'static str>> {
+                ready_rx(Ok("recovered".into()))
             })
             .unwrap();
         assert_eq!(ok, "recovered");

@@ -21,9 +21,12 @@
 //!
 //! Wired into `chunk_fetcher::drive` post commit on
 //! `feat/cross-chunk-retry`: consumer queries `get(idx)` for partition
-//! seeds and calls `insert(actual_end)` per subchunk. The deletion-trap
-//! counter `chunk_fetcher::GZIP_BLOCK_FINDER_INSERTS_OBSERVED` proves
-//! the wiring at runtime.
+//! seeds and calls `insert(actual_end)` per subchunk. Mirror of vendor's
+//! `m_blockFinder->get(...)` + `m_blockFinder->insert(...)` cascade in
+//! `GzipChunkFetcher::processNextChunk`
+//! (vendor/.../GzipChunkFetcher.hpp:318 + 374). The structural
+//! cutover (2026-05-17) replaces the prior deletion-trap counter with
+//! a vendor-shaped call site — see `chunk_fetcher::consumer_loop`.
 
 #![allow(dead_code)]
 
