@@ -880,14 +880,13 @@ fn run_post_process_task(
 /// consumer is no longer waiting on a worker that's grinding through 67
 /// doomed trial decodes.
 ///
-/// The 8 KiB scan window matches vendor's `CHUNK_SIZE` (GzipChunk.hpp:804).
-/// Tightening from 512 KiB to 8 KiB further reduces `find_blocks` cost
-/// per call without sacrificing recall: real boundaries on dense data
-/// (gzip -9 ≈ 64 KiB blocks ⇒ partition spans always intersect a
-/// boundary within 64 KiB) fit comfortably; on sparser data we surface
-/// the same `ExactStopMissed` error the consumer treats as
-/// "fall back to on-demand at the real offset", which is also
-/// vendor-faithful (GzipChunkFetcher.hpp:646-654).
+/// Vendor parity (GzipChunk.hpp:803-846): scan in 8 KiB CHUNK_SIZE
+/// increments but keep iterating until 512 KiB total or until a valid
+/// boundary is found. Real gzip -9 boundaries on silesia typically sit
+/// 8-150 KiB past the partition seed, so a SINGLE 8 KiB pass misses
+/// the boundary on ~80% of partitions (observed via decode_err trace);
+/// the outer 512 KiB cap matches vendor's `chunkBegin - blockOffset >=
+/// 512_Ki * BYTE_SIZE` break at GzipChunk.hpp:811.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 fn decode_or_iterate(
     input: &[u8],
@@ -895,17 +894,30 @@ fn decode_or_iterate(
     until_bit: usize,
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
+    const CHUNK_SIZE_BITS: usize = 8 * 1024 * 8;
+    const MAX_SCAN_BITS: usize = 512 * 1024 * 8;
     let finder = BlockFinder::new(input);
-    let scan_end = (start_bit + 8 * 1024 * 8).min(input.len() * 8);
-    let candidates = finder.find_blocks(start_bit, scan_end);
-    let first = candidates
-        .into_iter()
-        .find(|c| c.bit_offset >= start_bit)
-        .ok_or(ChunkDecodeError::ExactStopMissed {
-            requested: start_bit,
-            actual: scan_end,
-        })?;
-    finish_decode_chunk_with_inexact_offset(input, first.bit_offset, until_bit, &[], configuration)
+    let input_bits = input.len() * 8;
+    let max_end = (start_bit + MAX_SCAN_BITS).min(input_bits);
+    let mut chunk_begin = start_bit;
+    while chunk_begin < max_end {
+        let chunk_end = (chunk_begin + CHUNK_SIZE_BITS).min(max_end);
+        let candidates = finder.find_blocks(chunk_begin, chunk_end);
+        if let Some(first) = candidates.into_iter().find(|c| c.bit_offset >= chunk_begin) {
+            return finish_decode_chunk_with_inexact_offset(
+                input,
+                first.bit_offset,
+                until_bit,
+                &[],
+                configuration,
+            );
+        }
+        chunk_begin = chunk_end;
+    }
+    Err(ChunkDecodeError::ExactStopMissed {
+        requested: start_bit,
+        actual: max_end,
+    })
 }
 
 // ── Pending-write queue (order-preserved output) ─────────────────────────

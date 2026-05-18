@@ -577,6 +577,26 @@ impl Block {
         output: &mut Vec<u16>,
         n_max_to_decode: usize,
     ) -> Result<usize, BlockError> {
+        // FIXED Huffman blocks don't take the ISA-L path. Vendor uses
+        // `HuffmanCodingReversedBitsCached` (a canonical decoder) for
+        // FixedHuffmanCoding at deflate.hpp:195-196, not
+        // `HuffmanCodingISAL`. The reason: ISA-L's
+        // `set_and_expand_lit_len_huffcode` (igzip_inflate.c:285-383)
+        // builds an INCOMPLETE-tree LUT when given the truncated
+        // 286-symbol fixed table — the RFC 1951 fixed-Huffman tree has
+        // 288 symbols (codes 286-287 with length 8) whose Kraft
+        // contribution is required for table completeness, and ISA-L's
+        // `count[8] -= 2` correction at igzip_inflate.c:326-327 fires
+        // only when table_length > LIT_LEN. The wrapper hardcodes
+        // table_length = LIT_LEN = 286, so the correction never runs.
+        // Result: LUT entries for some short codes return bit_count=0
+        // → InvalidHuffmanCode mid-decode on fixed-Huffman blocks.
+        // Dispatch fixed blocks to the canonical fallback path which
+        // handles the full 288-symbol table correctly.
+        if self.compression_type == CompressionType::FixedHuffman {
+            return self.read_internal_compressed_canonical(bits, output, n_max_to_decode);
+        }
+
         // Build the lit/len + distance code-length slices in scratch
         // arrays we DON'T allocate per-call — they live on `Block`'s
         // literal_cl Vec (already pre-sized) and the fixed-Huffman lookup
@@ -589,10 +609,6 @@ impl Block {
                 let (lit, rest) = self.literal_cl[..end].split_at(split);
                 (lit, rest)
             }
-            CompressionType::FixedHuffman => (
-                FIXED_LITLEN_LENGTHS_286.as_slice(),
-                FIXED_DIST_LENGTHS_30.as_slice(),
-            ),
             _ => return Err(BlockError::InvalidCompression),
         };
 
@@ -733,10 +749,12 @@ impl Block {
         Ok(emitted)
     }
 
-    /// Canonical-Huffman fallback for non-x86_64 / no-ISA-L builds.
-    /// Used only by tests on other arches; the production single-member
-    /// parallel path is x86_64+isal-only. Logic identical to the ISA-L
-    /// path above.
+    /// Canonical-Huffman decode path. On non-x86_64 / no-ISA-L builds
+    /// this is the only decoder. On x86_64+ISA-L it is invoked from
+    /// `read_internal_compressed` for FIXED Huffman blocks (vendor uses
+    /// `HuffmanCodingReversedBitsCached` there — see the dispatch
+    /// comment in the ISA-L branch) — dynamic blocks take the
+    /// `IsalLitLenCode` multi-symbol fast path.
     ///
     /// Decodes via the ported `HuffmanCodingSymbolsPerLength` (vendor
     /// `vendor/.../huffman/HuffmanCodingSymbolsPerLength.hpp:97-124` —
@@ -745,8 +763,7 @@ impl Block {
     /// in-tree `build_canonical_table` / `decode_canonical` helpers and
     /// gives the new ports production correctness coverage on the
     /// non-x86_64 path (tests in this file exercise both branches).
-    #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
-    pub fn read_internal_compressed(
+    pub fn read_internal_compressed_canonical(
         &mut self,
         bits: &mut Bits,
         output: &mut Vec<u16>,
@@ -842,6 +859,20 @@ impl Block {
         }
         self.decoded_bytes += emitted;
         Ok(emitted)
+    }
+
+    /// Non-ISA-L entry point — dispatches everything to the canonical
+    /// decoder. On x86_64+ISA-L `read_internal_compressed` above
+    /// dispatches DYNAMIC to the ISA-L LUT and FIXED to the canonical
+    /// path; elsewhere both go through the canonical path.
+    #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+    pub fn read_internal_compressed(
+        &mut self,
+        bits: &mut Bits,
+        output: &mut Vec<u16>,
+        n_max_to_decode: usize,
+    ) -> Result<usize, BlockError> {
+        self.read_internal_compressed_canonical(bits, output, n_max_to_decode)
     }
 }
 
