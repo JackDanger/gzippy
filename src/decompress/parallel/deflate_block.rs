@@ -661,10 +661,22 @@ impl Block {
             // sym_count ∈ {1, 2, 3}; we extract each via `sym >>= 8`
             // and emit until either we run out or hit a non-literal
             // last symbol (EOB or length code).
+            //
+            // Bit layout of `sym` (vendor igzip_inflate.c:455-525):
+            //   - Singleton: bits 0..24 = sym1 (0..512).
+            //   - Pair:      bits 0..7 = sym1 (literal byte),
+            //                bits 8..15 = sym2 (literal byte).
+            //   - Triple:    +bits 16..23 = sym3 (literal byte).
+            // When sym_count > 1, the low 16 bits of `sym` contain TWO
+            // packed bytes (current + next). We push only the LOW byte
+            // — vendor's `static_cast<uint8_t>(code)` at deflate.hpp:1620.
             loop {
                 let code = (sym & 0xFFFF) as u16;
                 if code <= 255 || sym_count > 1 {
-                    output.push(code);
+                    // Cast to u8 first to strip the next-symbol byte
+                    // when sym_count > 1; for sym_count == 1 with
+                    // code <= 255 the cast is a no-op.
+                    output.push((code & 0xFF) as u16);
                     emitted += 1;
                     sym_count -= 1;
                     if sym_count == 0 {
