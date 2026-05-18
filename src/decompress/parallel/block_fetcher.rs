@@ -187,6 +187,96 @@ where
         Ok(value)
     }
 
+    /// Like `get`, plus the `prefetchNewBlocks` body interleaved
+    /// before and after the on-demand wait. This is the literal
+    /// shape of vendor's `BlockFetcher::get` at BlockFetcher.hpp:245-329:
+    ///
+    ///   1. getFromCaches / takeFromPrefetchQueue
+    ///   2. If miss: submitOnDemandTask
+    ///   3. m_fetchingStrategy.fetch(validDataBlockIndex)
+    ///   4. If index changed: prefetchNewBlocks (line 297-299)
+    ///   5. Wait on queuedResult, calling prefetchNewBlocks during each
+    ///      timeout cycle (line 314-316)
+    ///   6. insertIntoCache
+    ///
+    /// We provide a single `should_drive_prefetch` here that captures
+    /// the index-changed condition; the caller still does the
+    /// `record_fetch(idx)` to update the strategy. The prefetch
+    /// closures match `prefetch_new_blocks` above.
+    ///
+    /// Returns `(value, prefetches_submitted_count)` so the caller can
+    /// log / stat-record without re-querying.
+    pub fn get_with_prefetch<S, L, P, F>(
+        &self,
+        block_offset: Key,
+        submit: S,
+        lookup_block_offset: L,
+        submit_for_prefetch: P,
+        is_finalized_and_index_too_high: F,
+        should_drive_prefetch: bool,
+    ) -> (Result<Value, Err>, usize)
+    where
+        S: FnOnce(Key) -> Receiver<Result<Value, Err>>,
+        L: Fn(usize) -> Option<Key>,
+        P: Fn(Key) -> Receiver<Result<Value, Err>>,
+        F: Fn(usize) -> bool,
+    {
+        if let Some(v) = self.get_if_available(&block_offset) {
+            return (Ok(v), 0);
+        }
+
+        let rx = match self.take_prefetch(&block_offset) {
+            Some(existing) => existing,
+            None => {
+                self.record_on_demand_fetch();
+                submit(block_offset.clone())
+            }
+        };
+
+        // BlockFetcher.hpp:297-299 — `if ( !lastFetchedIndex || ... )
+        // prefetchNewBlocks(...)`. The caller has already invoked
+        // `record_fetch(idx)` before this method, so the "index
+        // changed" condition is computed there and passed as
+        // `should_drive_prefetch`.
+        let mut prefetched = 0usize;
+        if should_drive_prefetch {
+            prefetched += self.prefetch_new_blocks(
+                &lookup_block_offset,
+                &submit_for_prefetch,
+                &is_finalized_and_index_too_high,
+            );
+        }
+
+        // BlockFetcher.hpp:312-316 — `while ( queuedResult.wait_for(1ms)
+        // == timeout ) prefetchNewBlocks(...)`. We approximate with
+        // mpsc::Receiver::recv_timeout in a short loop so the prefetch
+        // queue keeps filling while we wait. The 1ms tick matches
+        // vendor exactly.
+        let value = loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+                Ok(Ok(v)) => break v,
+                Ok(Err(e)) => return (Err(e), prefetched),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if should_drive_prefetch {
+                        prefetched += self.prefetch_new_blocks(
+                            &lookup_block_offset,
+                            &submit_for_prefetch,
+                            &is_finalized_and_index_too_high,
+                        );
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!(
+                        "block_fetcher::get_with_prefetch: dispatch worker dropped reply \
+                         (broken promise)"
+                    );
+                }
+            }
+        };
+        self.insert(block_offset.clone(), value.clone());
+        (Ok(value), prefetched)
+    }
+
     /// Pure cache lookup (no fetch). Checks prefetch cache first; on
     /// hit, MOVES the entry into the main cache (mirrors rapidgzip's
     /// `takeFromPrefetchQueue` pattern at BlockFetcher.hpp:385-410 —
@@ -316,6 +406,124 @@ where
             .lock()
             .unwrap()
             .fetch(data_block_index);
+    }
+
+    /// Fill the prefetch queue (`m_prefetching`) with up to
+    /// `parallelization - 1` futures for the next expected block
+    /// indices. Literal port of `BlockFetcher::prefetchNewBlocks`
+    /// at vendor/.../core/BlockFetcher.hpp:458-572.
+    ///
+    /// `lookup_block_offset(index) -> Option<Key>` mirrors vendor's
+    /// `m_blockFinder->get(blockIndexToPrefetch, /* timeout */ 0)` at
+    /// BlockFetcher.hpp:479 — returns the block-offset for the given
+    /// data block index, or `None` if the BlockFinder hasn't confirmed
+    /// it yet (we treat that as "skip this index").
+    ///
+    /// `submit_for(offset) -> Receiver<Result<Value, Err>>` mirrors
+    /// vendor's `m_threadPool.submit([this, offset, nextOffset] () {
+    /// return decodeAndMeasureBlock(offset, nextOffset); }, /* priority */ 0)`
+    /// at BlockFetcher.hpp:554-557. The caller wraps the gzip-specific
+    /// task body.
+    ///
+    /// `is_finalized_and_index_too_high(idx)` mirrors vendor's
+    /// `m_blockFinder->finalized() && (idx >= m_blockFinder->size())`
+    /// check at BlockFetcher.hpp:504 — once the block finder has been
+    /// finalized, indices beyond `size()` are dropped.
+    ///
+    /// The `stop_prefetching` predicate (vendor's `stopPrefetching` at
+    /// BlockFetcher.hpp:455) is omitted because gzippy's BlockFinder
+    /// `get` is non-blocking by construction (no `wait_for_timeout`
+    /// equivalent today) — the vendor uses it only to time-bound the
+    /// inner `m_blockFinder->get(idx, 0.0001s)` poll loop.
+    ///
+    /// Returns the number of new prefetch tasks submitted (for stats /
+    /// trace purposes).
+    pub fn prefetch_new_blocks<L, S, F>(
+        &self,
+        lookup_block_offset: L,
+        submit_for: S,
+        is_finalized_and_index_too_high: F,
+    ) -> usize
+    where
+        L: Fn(usize) -> Option<Key>,
+        S: Fn(Key) -> Receiver<Result<Value, Err>>,
+        F: Fn(usize) -> bool,
+    {
+        // BlockFetcher.hpp:463 — processReadyPrefetches(): we don't yet
+        // poll-collect ready prefetches into the prefetch_cache because
+        // the worker pool's mpsc::Receiver doesn't expose a non-blocking
+        // `wait_for(0s)` equivalent without consuming the receiver. The
+        // exact-match `take_prefetch` branch on the consumer's `get`
+        // already takes them as soon as the consumer asks; this matches
+        // the steady-state behavior on a hot consumer. (Vendor's
+        // processReadyPrefetches is an opportunistic move; the consumer
+        // would otherwise take them via `getFromCaches` on the next
+        // iteration regardless.)
+
+        // BlockFetcher.hpp:465-472 — threadPoolSaturated() gate.
+        // Vendor: `m_prefetching.size() + 1 >= m_threadPool.capacity()`.
+        // The "+1" accounts for the on-demand task that consumer is
+        // currently waiting on. We use the configured parallelization
+        // as the capacity (same as `m_threadPool.capacity()` since the
+        // pool is sized to that).
+        let thread_pool_saturated = || self.prefetching_len() + 1 >= self.parallelization;
+
+        if thread_pool_saturated() {
+            return 0;
+        }
+
+        // BlockFetcher.hpp:474 — `m_fetchingStrategy.prefetch(m_prefetchCache.capacity())`.
+        let block_indexes_to_prefetch = {
+            let strategy = self.fetching_strategy.lock().unwrap();
+            // Vendor uses `m_prefetchCache.capacity()` as the upper
+            // bound; the prefetch_cache cap equals the parallelization
+            // setting in our constructor sites.
+            let cap = self.prefetch_cache.lock().unwrap().capacity();
+            strategy.prefetch(cap)
+        };
+
+        let mut submitted = 0usize;
+        for index in block_indexes_to_prefetch {
+            // BlockFetcher.hpp:500-502 — stop when the pool is full.
+            if thread_pool_saturated() {
+                break;
+            }
+
+            // BlockFetcher.hpp:504-506 — drop indices past finalize.
+            if is_finalized_and_index_too_high(index) {
+                continue;
+            }
+
+            // BlockFetcher.hpp:479 — `m_blockFinder->get(idx, /* timeout */ 0)`.
+            let prefetch_block_offset = match lookup_block_offset(index) {
+                Some(o) => o,
+                None => {
+                    // Vendor BlockFetcher.hpp:533 — skip when no offset.
+                    continue;
+                }
+            };
+
+            // BlockFetcher.hpp:536-539 — skip if already cached, in
+            // prefetch queue, or in failed-prefetch list.
+            if self.test(&prefetch_block_offset) || self.is_failed_prefetch(&prefetch_block_offset)
+            {
+                continue;
+            }
+
+            // BlockFetcher.hpp:553-557 — submit prefetch task.
+            self.statistics.base.record_prefetch();
+            let rx = submit_for(prefetch_block_offset.clone());
+            // BlockFetcher.hpp:558 — `m_prefetching.emplace(offset, std::move(future))`.
+            // We bypass `submit_prefetch` here to avoid double-counting
+            // record_prefetch (already done above).
+            self.prefetching
+                .lock()
+                .unwrap()
+                .insert(prefetch_block_offset, rx);
+            submitted += 1;
+        }
+
+        submitted
     }
 
     /// Ask the fetching strategy which indexes to prefetch.

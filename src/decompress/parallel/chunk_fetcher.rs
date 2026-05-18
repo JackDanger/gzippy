@@ -350,7 +350,16 @@ fn consumer_loop<W: std::io::Write>(
         // `submitOnDemandTask` (BlockFetcher.hpp:600). It sends a
         // `DecodeJob` and returns the reply receiver — `BlockFetcher::get`
         // does the wait + cache-insert internally.
+        // Vendor BlockFetcher.hpp:279-280 — `lastFetchedIndex` snapshot
+        // + `m_fetchingStrategy.fetch(idx)`. Captured BEFORE the call so
+        // the prefetch trigger predicate at line 297 ("index changed")
+        // is well-defined.
+        let last_fetched_before = block_fetcher.last_fetched();
         block_fetcher.record_fetch(next_unprocessed_block_index);
+        let should_drive_prefetch = last_fetched_before
+            .map(|li| li != next_unprocessed_block_index)
+            .unwrap_or(true);
+
         let until_bit = until_bit_for(
             block_finder,
             next_unprocessed_block_index,
@@ -364,11 +373,68 @@ fn consumer_loop<W: std::io::Write>(
             authoritative: true,
             partition_idx: partition_idx_for_trace,
         };
-        let chunk_arc_result: Result<Arc<ChunkData>, ChunkDecodeError> = block_fetcher.get(
+
+        // The submit_for_prefetch closure mirrors vendor's
+        // `m_threadPool.submit([this, offset, nextOffset] () {
+        //     return decodeAndMeasureBlock(offset, nextOffset); }, 0)`
+        // at BlockFetcher.hpp:554-557, with `nextOffset` derived from
+        // the prefetched block's index+1.
+        let prefetch_submit =
+            |offset: usize| -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
+                let prefetch_until_bit = until_bit_for(
+                    block_finder,
+                    // Best-effort index reverse-map: we use the
+                    // already-validated `next_block_offset` as the floor
+                    // since the actual block-index for `offset` may not
+                    // be exactly retrievable without a bisection. The
+                    // worker tolerates an overestimate via its internal
+                    // EOF check (read until the next finder boundary).
+                    next_unprocessed_block_index + 1,
+                    total_bits,
+                    offset,
+                );
+                let prefetch_params = DecodeParams {
+                    start_bit: offset,
+                    until_bit: prefetch_until_bit,
+                    // Prefetch tasks may race ahead of the consumer; the
+                    // worker waits a short window for the predecessor's
+                    // tail and falls back to the slow path on miss.
+                    authoritative: false,
+                    partition_idx: usize::MAX, // trace marker for "prefetch"
+                };
+                submit_decode_to_pool(
+                    thread_pool,
+                    input,
+                    prefetch_params,
+                    window_map,
+                    configuration,
+                )
+            };
+
+        // `lookup_block_offset` mirrors vendor's `m_blockFinder->get(idx, 0)`
+        // at BlockFetcher.hpp:479 — non-blocking lookup, returns the
+        // confirmed block offset for `idx` if known.
+        let lookup_block_offset = |idx: usize| -> Option<usize> {
+            match block_finder.get(idx) {
+                (Some(offset), GetReturnCode::Success) => Some(offset),
+                _ => None,
+            }
+        };
+        // `is_finalized_and_index_too_high` mirrors vendor's
+        // BlockFetcher.hpp:504 `if ( m_blockFinder->finalized() &&
+        // ( blockIndexToPrefetch >= m_blockFinder->size() ) )`.
+        let is_finalized_too_high =
+            |idx: usize| -> bool { block_finder.finalized() && idx >= block_finder.size() };
+
+        let (chunk_arc_result, _prefetched) = block_fetcher.get_with_prefetch(
             next_block_offset,
             |_key: usize| -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
                 submit_decode_to_pool(thread_pool, input, params, window_map, configuration)
             },
+            lookup_block_offset,
+            prefetch_submit,
+            is_finalized_too_high,
+            should_drive_prefetch,
         );
         let chunk_arc = chunk_arc_result.map_err(FetchError::Decode)?;
         // Take ownership when we hold the only Arc; otherwise clone the
