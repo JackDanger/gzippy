@@ -830,6 +830,49 @@ fn run_post_process_task(
 /// pre-port era because the prefetch queue's key mismatch caused every
 /// prefetched chunk to be silently discarded. With the two-key lookup
 /// in place the lie surfaces; drop it to match vendor exactly.
+/// Slow-path decoder for prefetched chunks whose predecessor window is
+/// not yet published. Mirror of vendor's `tryToDecode` cascade at
+/// vendor/.../chunkdecoding/GzipChunk.hpp:712-846.
+///
+/// **Vendor parity** — the cascade at GzipChunk.hpp:803-846 walks 8 KiB
+/// sub-chunks (`CHUNK_SIZE = 8_Ki * BYTE_SIZE`, line 804), calls
+/// `findNextDynamic`/`findNextUncompressed` ONCE per sub-chunk to get
+/// the next candidate, calls `tryToDecode(offset)`, and on success
+/// returns immediately (line 837-841). The pre-2026-05-17 gzippy
+/// equivalent enumerated ALL candidates in a 512 KiB window via
+/// `find_blocks`, then trial-decoded EVERY candidate even after the
+/// first failure — a layering on top of vendor's cascade, not a port of
+/// it.
+///
+/// **Investigation finding (trace silesia-large.gz @ gzip -9, 16T)**:
+/// `find_blocks` returns 55-137 candidates per 512 KiB window. The
+/// first candidate IS the real next-block boundary (typical Δ from
+/// partition_offset = 12-150 KiB). EVERY candidate, including the real
+/// one, fails trial-decode with `InvalidHuffmanCode` — a marker-decoder
+/// bug we haven't isolated. With 67 attempts × 200 µs per false-positive
+/// trial decode, each failed prefetch burns ~14 ms of worker time. With
+/// 15-38 such prefetches per silesia decode, that's 200-500 ms of pure
+/// waste, half the total wall time.
+///
+/// Until the bootstrap marker decoder is fixed, restrict iteration to
+/// the first candidate — vendor's `tryToDecode` returns on first success
+/// at GzipChunk.hpp:837-841, and we have no evidence that retry past
+/// the first candidate ever salvages a real-world prefetch (the
+/// production tracer showed zero `iterate_ok` events across 15 failed
+/// prefetches). Restricting to one trial cuts per-failed-prefetch cost
+/// from ~14 ms to ~200 µs, freeing workers to take on-demand work the
+/// consumer dispatches. Effective parallelism climbs as soon as the
+/// consumer is no longer waiting on a worker that's grinding through 67
+/// doomed trial decodes.
+///
+/// The 8 KiB scan window matches vendor's `CHUNK_SIZE` (GzipChunk.hpp:804).
+/// Tightening from 512 KiB to 8 KiB further reduces `find_blocks` cost
+/// per call without sacrificing recall: real boundaries on dense data
+/// (gzip -9 ≈ 64 KiB blocks ⇒ partition spans always intersect a
+/// boundary within 64 KiB) fit comfortably; on sparser data we surface
+/// the same `ExactStopMissed` error the consumer treats as
+/// "fall back to on-demand at the real offset", which is also
+/// vendor-faithful (GzipChunkFetcher.hpp:646-654).
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 fn decode_or_iterate(
     input: &[u8],
@@ -838,38 +881,16 @@ fn decode_or_iterate(
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
     let finder = BlockFinder::new(input);
-    let scan_end = (start_bit + 512 * 1024 * 8).min(input.len() * 8);
+    let scan_end = (start_bit + 8 * 1024 * 8).min(input.len() * 8);
     let candidates = finder.find_blocks(start_bit, scan_end);
-    let mut last_err: Option<ChunkDecodeError> = None;
-    for candidate in candidates {
-        if candidate.bit_offset < start_bit {
-            continue;
-        }
-        match finish_decode_chunk_with_inexact_offset(
-            input,
-            candidate.bit_offset,
-            until_bit,
-            &[],
-            configuration,
-        ) {
-            // Vendor parity: chunk.encoded_offset_bits already equals
-            // `candidate.bit_offset` after `finish_decode_chunk_with_inexact_offset`,
-            // mirroring vendor's `result.encodedOffsetInBits = offset.first`
-            // at GzipChunk.hpp:721 with `first == second == candidate`.
-            // Return as-is so the consumer's `matchesEncodedOffset`
-            // gate (GzipChunkFetcher.hpp:647) makes a meaningful
-            // accept/reject decision.
-            Ok(c) => return Ok(c),
-            Err(e) => {
-                last_err = Some(e);
-                continue;
-            }
-        }
-    }
-    Err(last_err.unwrap_or(ChunkDecodeError::ExactStopMissed {
-        requested: start_bit,
-        actual: scan_end,
-    }))
+    let first = candidates
+        .into_iter()
+        .find(|c| c.bit_offset >= start_bit)
+        .ok_or(ChunkDecodeError::ExactStopMissed {
+            requested: start_bit,
+            actual: scan_end,
+        })?;
+    finish_decode_chunk_with_inexact_offset(input, first.bit_offset, until_bit, &[], configuration)
 }
 
 // ── Pending-write queue (order-preserved output) ─────────────────────────
