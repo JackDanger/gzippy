@@ -51,6 +51,7 @@ pub mod gzip_chunk;
 pub mod gzip_definitions;
 pub mod gzip_format;
 pub mod huffman_base;
+pub mod huffman_double_literal_cached;
 pub mod huffman_reversed_bits_cached;
 pub mod huffman_reversed_bits_cached_compressed;
 pub mod huffman_reversed_bits_cached_separate_lengths;
