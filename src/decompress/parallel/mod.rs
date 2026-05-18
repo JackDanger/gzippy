@@ -40,6 +40,7 @@ pub mod cache;
 pub mod chunk_data;
 pub mod chunk_fetcher;
 pub mod compressed_vector;
+pub mod crc32;
 pub mod deflate_block;
 pub mod error;
 pub mod faster_vector;
