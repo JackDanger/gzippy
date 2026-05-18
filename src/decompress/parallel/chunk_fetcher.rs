@@ -303,6 +303,11 @@ pub fn drive<W: std::io::Write>(
         .set_block_count(block_map.data_block_count(), true);
 
     let crc = total_crc.crc32();
+    if std::env::var("GZIPPY_DEBUG").is_ok() {
+        eprintln!(
+            "[diag] drive done: total_size={total_size} crc={crc:08x} n_partitions={n_partitions} total_bits={total_bits}"
+        );
+    }
     Ok((crc, total_size))
 }
 
@@ -857,10 +862,37 @@ fn consumer_loop<W: std::io::Write>(
                     *total_size,
                 ),
             );
+            if std::env::var("GZIPPY_DEBUG").is_ok() {
+                eprintln!(
+                    "[diag] eof_terminate idx={idx} expected_start={expected_start} total_size={} n_partitions={n_partitions}",
+                    *total_size,
+                );
+            }
             break;
         }
 
         let trim_bytes = chunk.decoded_offset_for(expected_start).unwrap_or(0);
+        if std::env::var("GZIPPY_DEBUG").is_ok() && idx < 5 {
+            eprintln!(
+                "[diag] idx={idx} chunk.enc_off={} chunk.enc_size={} chunk.dec_size={} dwm_len={} data_len={} trim={trim_bytes} expected_start={expected_start}",
+                chunk.encoded_offset_bits,
+                chunk.encoded_size_bits,
+                chunk.decoded_size(),
+                chunk.data_with_markers.len(),
+                chunk.data.len(),
+            );
+        }
+        if std::env::var("GZIPPY_DEBUG").is_ok() && idx >= n_partitions.saturating_sub(3) {
+            eprintln!(
+                "[diag] LATE idx={idx} chunk.enc_off={} chunk.enc_size={} chunk.dec_size={} dwm_len={} data_len={} trim={trim_bytes} expected_start={expected_start} total_size={}",
+                chunk.encoded_offset_bits,
+                chunk.encoded_size_bits,
+                chunk.decoded_size(),
+                chunk.data_with_markers.len(),
+                chunk.data.len(),
+                *total_size,
+            );
+        }
 
         // Process the chunk: apply_window if markers; write bytes;
         // combine CRC; publish tail window.
