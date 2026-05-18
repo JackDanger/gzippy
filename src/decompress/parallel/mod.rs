@@ -49,6 +49,7 @@ pub mod deflate_block;
 pub mod error;
 pub mod faster_vector;
 pub mod file_type;
+pub mod gzip_analyzer;
 pub mod gzip_block_finder;
 pub mod gzip_chunk;
 pub mod gzip_definitions;
