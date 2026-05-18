@@ -219,8 +219,10 @@ def main():
         tmpdir = Path(tmpdir)
 
         for tool_name, bin_path in decomp_tools:
-            # Skip multi-threaded benchmark for single-threaded tools
-            if tool_name in ("gzip", "igzip") and args.threads > 1:
+            # gzip can't parallelise; skip it in multi-threaded runs (pigz covers that comparison).
+            # igzip is also single-threaded but runs in every job so guards can assert
+            # that gzippy at T>1 beats igzip at T1.
+            if tool_name == "gzip" and args.threads > 1:
                 continue
 
             out_file = str(tmpdir / f"out-{tool_name}.bin")
