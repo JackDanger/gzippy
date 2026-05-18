@@ -522,7 +522,22 @@ fn consumer_loop<W: std::io::Write>(
             while !pending.is_empty() {
                 drain_one_pending(&mut pending, writer, total_crc, total_size, block_fetcher)?;
             }
-            let window_key = chunk.max_encoded_offset_bits;
+            // Vendor `GzipChunkFetcher.hpp:334` —
+            //   `auto sharedLastWindow = m_windowMap->get( *nextBlockOffset );`
+            // Always look up the predecessor's window at the consumer's
+            // expected start (`next_block_offset`), NOT at the chunk's
+            // post-finalize `max_encoded_offset_bits`. The two coincide
+            // ONLY after `set_encoded_offset(next_block_offset)` re-
+            // anchors max → next_block_offset; in the "chunk's encoded
+            // offset already matches next_block_offset" branch above
+            // (line 487-489) we SKIP set_encoded_offset, and max stays
+            // at the post-finalize chunk-end value. Looking it up there
+            // would land on the position THIS chunk's own apply_window
+            // will publish, not the predecessor's — guaranteed miss.
+            // Pre-fix: this branch was unreachable because bootstrap
+            // always failed; once the marker decoder works, every
+            // partition-aligned slow-path chunk took the wrong key.
+            let window_key = next_block_offset;
             let window = window_map.get(window_key).ok_or(FetchError::Decode(
                 ChunkDecodeError::ExactStopMissed {
                     requested: window_key,
