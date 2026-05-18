@@ -2,26 +2,27 @@
 //! Stores propagated 32-KiB windows keyed by the compressed-bit offset
 //! they're meant to seed. Workers AND the consumer share one handle.
 //!
-//! Workers may call `get_or_wait(start_bit, timeout)` to check whether
-//! the predecessor chunk's tail has been published (enabling the fast
-//! path in [`crate::decompress::parallel::gzip_chunk::decode_chunk_with_window`]).
-//! On insert, all waiters are notified.
+//! Audit step 5 (2026-05-17) — removed the `Condvar` that workers
+//! formerly waited on via `get_or_wait`. Vendor's `WindowMap`
+//! (vendor/rapidgzip/.../WindowMap.hpp:19-186) is a plain
+//! `std::map<size_t, SharedWindow>` guarded by `mutable std::mutex` —
+//! NO `condition_variable`, NO `wait`. Workers don't block on the
+//! WindowMap because the `BlockFetcher::get` dispatch model
+//! (BlockFetcher.hpp:245-329) waits on the per-block future, which
+//! guarantees the predecessor's decode (and its tail-window emplace)
+//! has finished before the consumer pulls the next chunk.
 //!
 //! Windows are stored as `Arc<CompressedVector>` (Zlib by default,
 //! matching rapidgzip's WindowMap default). Decompression happens
-//! lazily on `get`/`get_or_wait` and yields a fresh owned 32 KiB
-//! buffer so callers see the same `Arc<[u8; 32768]>` shape they always
-//! have. The compressed storage gives ~3-10× memory savings on the
-//! highly-redundant tail windows typical of real workloads.
-//!
-//! Mirror of rapidgzip's `mutable std::mutex` + `std::condition_variable`
-//! pattern. BTreeMap is used so future range queries are cheap.
+//! lazily on `get` and yields a fresh owned 32 KiB buffer so callers
+//! see the same `Arc<[u8; 32768]>` shape they always have. The
+//! compressed storage gives ~3-10× memory savings on the highly-
+//! redundant tail windows typical of real workloads.
 
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use crate::decompress::parallel::compressed_vector::{CompressedVector, CompressionType};
 
@@ -40,21 +41,21 @@ struct Inner {
 
 /// Thread-safe handle to the underlying map. Cheaply clonable; all
 /// clones share state. Mirror of rapidgzip's `std::shared_ptr<WindowMap>`.
+///
+/// Locking matches vendor (WindowMap.hpp:172 `mutable std::mutex
+/// m_mutex`): one `Mutex` around the `BTreeMap`, no `Condvar`.
 #[derive(Clone)]
 pub struct WindowMap {
-    state: Arc<(Mutex<Inner>, Condvar)>,
+    state: Arc<Mutex<Inner>>,
     compression: CompressionType,
 }
 
 impl WindowMap {
     pub fn new() -> Self {
         Self {
-            state: Arc::new((
-                Mutex::new(Inner {
-                    entries: BTreeMap::new(),
-                }),
-                Condvar::new(),
-            )),
+            state: Arc::new(Mutex::new(Inner {
+                entries: BTreeMap::new(),
+            })),
             compression: DEFAULT_WINDOW_COMPRESSION,
         }
     }
@@ -64,12 +65,9 @@ impl WindowMap {
     /// uses `new()` with `DEFAULT_WINDOW_COMPRESSION`.
     pub fn with_compression(compression: CompressionType) -> Self {
         Self {
-            state: Arc::new((
-                Mutex::new(Inner {
-                    entries: BTreeMap::new(),
-                }),
-                Condvar::new(),
-            )),
+            state: Arc::new(Mutex::new(Inner {
+                entries: BTreeMap::new(),
+            })),
             compression,
         }
     }
@@ -82,64 +80,38 @@ impl WindowMap {
 
     /// Non-blocking lookup. Returns a freshly decompressed 32 KiB
     /// window keyed at `encoded_offset_bits` if present, else None.
+    /// Mirror of vendor's `WindowMap::get` (WindowMap.hpp:79-90).
     pub fn get(&self, encoded_offset_bits: usize) -> Option<Window> {
-        let (lock, _cvar) = &*self.state;
-        let cv = {
-            let inner = lock.lock().unwrap();
-            inner.entries.get(&encoded_offset_bits).cloned()
-        };
+        let inner = self.state.lock().unwrap();
+        let cv = inner.entries.get(&encoded_offset_bits).cloned();
+        drop(inner);
         cv.map(|cv| decompress_to_window(&cv))
-    }
-
-    /// Block until the window keyed at `encoded_offset_bits` is inserted
-    /// or `timeout` elapses. Returns the decompressed 32 KiB window on
-    /// success, None on timeout. Mirror of rapidgzip's
-    /// `WindowMap::get` with a wait.
-    pub fn get_or_wait(&self, encoded_offset_bits: usize, timeout: Duration) -> Option<Window> {
-        let (lock, cvar) = &*self.state;
-        let deadline = std::time::Instant::now() + timeout;
-        let mut inner = lock.lock().unwrap();
-        loop {
-            if let Some(cv) = inner.entries.get(&encoded_offset_bits).cloned() {
-                drop(inner);
-                return Some(decompress_to_window(&cv));
-            }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return None;
-            }
-            let remaining = deadline - now;
-            let (i, _wait) = cvar.wait_timeout(inner, remaining).unwrap();
-            inner = i;
-        }
     }
 
     /// Insert a window keyed at `encoded_offset_bits`. The 32 KiB
     /// buffer is compressed with this map's strategy on insertion.
-    /// Wakes all waiters. Idempotent: if a window already exists for
-    /// the key, the existing value is preserved (workers and consumer
-    /// can race to insert the same end_bit window; the first wins).
+    /// Idempotent: if a window already exists for the key, the
+    /// existing value is preserved (workers and consumer can race to
+    /// insert the same end_bit window; the first wins). Mirror of
+    /// `WindowMap::emplace` (WindowMap.hpp:39-46).
     pub fn insert(&self, encoded_offset_bits: usize, window: Window) {
         let cv = Arc::new(CompressedVector::from_bytes(&window[..], self.compression));
         self.insert_compressed(encoded_offset_bits, cv);
     }
 
     /// Insert an already-compressed window. Cheap path for upstream
-    /// callers that hold an `Arc<CompressedVector>` already.
+    /// callers that hold an `Arc<CompressedVector>` already. Mirror
+    /// of `WindowMap::emplaceShared` (WindowMap.hpp:47-77).
     pub fn insert_compressed(&self, encoded_offset_bits: usize, compressed: Arc<CompressedVector>) {
-        let (lock, cvar) = &*self.state;
-        let mut inner = lock.lock().unwrap();
+        let mut inner = self.state.lock().unwrap();
         inner
             .entries
             .entry(encoded_offset_bits)
             .or_insert(compressed);
-        cvar.notify_all();
     }
 
     pub fn len(&self) -> usize {
-        let (lock, _cvar) = &*self.state;
-        let inner = lock.lock().unwrap();
-        inner.entries.len()
+        self.state.lock().unwrap().entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -211,24 +183,27 @@ mod tests {
     }
 
     #[test]
-    fn get_or_wait_times_out_when_absent() {
+    fn get_returns_none_when_absent() {
         let m = WindowMap::new();
-        let t0 = std::time::Instant::now();
-        let result = m.get_or_wait(99, Duration::from_millis(50));
-        assert!(result.is_none());
-        assert!(t0.elapsed() >= Duration::from_millis(40));
+        assert!(m.get(99).is_none());
     }
 
     #[test]
-    fn get_or_wait_wakes_on_insert() {
+    fn cross_thread_insert_is_visible() {
+        // Vendor's WindowMap has no Condvar — callers are responsible
+        // for ordering insert-then-get via higher-level synchronization
+        // (per BlockFetcher::get's per-block future). This test mirrors
+        // that: spawn an insert, join, then assert the value is
+        // visible on the main thread. Replaces the prior
+        // `get_or_wait_wakes_on_insert` test which exercised the
+        // Condvar code path that no longer exists.
         let m = WindowMap::new();
         let m2 = m.clone();
         let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
             m2.insert(7, window_of(0xEE));
         });
-        let result = m.get_or_wait(7, Duration::from_millis(500));
         handle.join().unwrap();
+        let result = m.get(7);
         assert!(result.is_some());
         assert_eq!(result.unwrap()[0], 0xEE);
     }

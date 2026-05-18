@@ -85,8 +85,6 @@ use crate::decompress::parallel::trace;
 use crate::decompress::parallel::window_map::WindowMap;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use std::sync::mpsc;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-use std::time::Duration;
 
 #[derive(Debug)]
 pub enum FetchError {
@@ -99,14 +97,6 @@ impl From<ChunkDecodeError> for FetchError {
         FetchError::Decode(e)
     }
 }
-
-/// How long a worker will block waiting for the predecessor's window
-/// before falling back to the slow path. Short enough that chunk-0
-/// (which never has a predecessor) doesn't waste time; long enough
-/// that the predecessor's decode plus apply_window can land for the
-/// common case.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-const WINDOW_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Default `FetchNextAdaptive` memory size (vendor Prefetcher.hpp uses
 /// per-instance values from ParallelGzipReader; 32 biases toward longer
@@ -469,15 +459,29 @@ fn consumer_loop<W: std::io::Write>(
             // published the tail window via `last_32kib_window()`.
             predecessor_window_for_postprocess = None;
         } else {
-            // Vendor lines 334 + 558-574: pull the predecessor's window
-            // and compute the tail window on the consumer thread.
+            // Vendor `waitForReplacedMarkers` (GzipChunkFetcher.hpp:478-518)
+            // blocks until the predecessor's marker-replace future
+            // completes — guaranteeing the predecessor's tail window is
+            // emplaced in the WindowMap before we ask for it. Our
+            // equivalent is to drain `pending` (which holds in-flight
+            // post-process receivers) until empty, ensuring all earlier
+            // chunks' post-processes have inserted their tail windows.
+            //
+            // This is the audit-step-5 invariant: WindowMap no longer
+            // exposes a `get_or_wait`/Condvar — callers MUST hold
+            // higher-level ordering. Mirror of vendor WindowMap.hpp:19-186
+            // (no condition_variable; the BlockFetcher dispatch model
+            // serializes window emplacement).
+            while !pending.is_empty() {
+                drain_one_pending(&mut pending, writer, total_crc, total_size, block_fetcher)?;
+            }
             let window_key = chunk.max_encoded_offset_bits;
-            let window = window_map
-                .get_or_wait(window_key, Duration::from_secs(60))
-                .ok_or(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+            let window = window_map.get(window_key).ok_or(FetchError::Decode(
+                ChunkDecodeError::ExactStopMissed {
                     requested: window_key,
                     actual: next_block_offset,
-                }))?;
+                },
+            ))?;
             let tail = chunk.get_last_window(&window[..]);
             window_map.insert(chunk_end_bit, Arc::new(tail));
             predecessor_window_for_postprocess = Some(window);
@@ -644,16 +648,18 @@ fn run_decode_task(
     let label = trace::worker_label(params.partition_idx);
     let t0 = std::time::Instant::now();
 
-    // Try to acquire the predecessor's window. The consumer guarantees
-    // it for authoritative dispatches (vendor: post_process always
-    // emplaces the tail BEFORE the next worker can be unblocked); for
-    // speculative dispatches we wait a short timeout.
+    // Audit step 5: WindowMap is now Condvar-free (vendor
+    // WindowMap.hpp:19-186 has no condition_variable). Workers do
+    // NON-blocking `get`: if the predecessor's tail has been
+    // published, take the fast path; otherwise fall through to the
+    // slow path (decode with markers, consumer's post-process
+    // resolves them). This is the vendor model — workers never block
+    // on the WindowMap; the dispatch order from `BlockFetcher::get`
+    // and the post-process queue do the synchronization.
     let window = if params.start_bit == 0 {
         Some(Arc::new([0u8; 32768]))
-    } else if params.authoritative {
-        window_map.get_or_wait(params.start_bit, Duration::from_secs(60))
     } else {
-        window_map.get_or_wait(params.start_bit, WINDOW_WAIT_TIMEOUT)
+        window_map.get(params.start_bit)
     };
 
     let chunk_result = match window {
