@@ -17,8 +17,12 @@
 //!   buffer sizing for lit/len + expansion entries).
 //! - `MAX_LIT_LEN_COUNT = MAX_LIT_LEN_CODE_LEN + 2` = 23 (one slot per
 //!   possible code length 0..=21, plus a guard).
-//! - `multisym = 0` matches rapidgzip's call — no multi-symbol decode
-//!   compression (each decode returns a single symbol).
+//! - `multisym = 0` matches rapidgzip's call (HuffmanCodingISAL.hpp:71).
+//!   In ISA-L's headers this is `TRIPLE_SYM_FLAG`
+//!   (vendor/.../external/isa-l/igzip/igzip_inflate.c:88), enabling
+//!   triple-symbol packing in the short-code LUT. Each decode can
+//!   therefore return 1, 2, or 3 packed literal symbols; consumers
+//!   must drive the `symbolCount` unpack loop (vendor deflate.hpp:1612).
 //! - Decode constants are bit-packed into the LUT entries the same way
 //!   ISA-L lays them out; see `Self::decode` for the exact layout.
 
@@ -63,9 +67,12 @@ const LEN_EXTRA_BIT_COUNT: [u8; 32] = [
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0, 0, 0, 0,
 ];
 
-/// Decoded result. `sym_count` mirrors rapidgzip's multisym field; with
-/// `multisym = 0` at build time, sym_count is always 1 — kept here for
-/// fidelity with the reference implementation.
+/// Decoded result. With ISA-L's `multisym = 0 = TRIPLE_SYM_FLAG` set
+/// at table-build time (see module docs), `sym_count` ∈ {1, 2, 3} —
+/// a single 12-bit short-code lookup can return up to three packed
+/// literal symbols at bit offsets 0/8/16 of `symbol`. Callers must
+/// unpack via the `for ( ; symbolCount > 0; symbolCount--, symbol >>= 8U )`
+/// loop (vendor/.../gzip/deflate.hpp:1612-1623).
 #[derive(Copy, Clone, Debug)]
 pub struct DecodedSymbol {
     pub symbol: u32,

@@ -603,64 +603,118 @@ impl Block {
             return Err(BlockError::InvalidCodeLengths);
         }
 
+        // Literal port of vendor's `readInternalCompressedMultiCached`
+        // (vendor/.../gzip/deflate.hpp:1585-1666). Critical protocol notes
+        // vs. the canonical-Huffman path:
+        //
+        // 1. **Multi-symbol packing.** ISA-L's `make_inflate_huff_code_lit_len`
+        //    is called with `multisym = 0 = TRIPLE_SYM_FLAG`
+        //    (vendor/.../external/isa-l/igzip/igzip_inflate.c:88, used at
+        //    HuffmanCodingISAL.hpp:71). A single 12-bit lookup can return
+        //    UP TO THREE literal symbols packed at bit offsets 0/8/16,
+        //    with `sym_count` ∈ {1, 2, 3}. The decode loop must extract
+        //    each via `symbol >>= 8` (vendor deflate.hpp:1612-1623).
+        //    Treating sym_count as always-1 (the prior bug) drops the
+        //    2nd/3rd packed bytes and desyncs the output.
+        //
+        // 2. **Length values are pre-expanded — no RFC extra-bit reads.**
+        //    `set_and_expand_lit_len_huffcode` expands each length code
+        //    (257..285) into 2^extra_bits separate table entries, each
+        //    with the FULL length value baked in as `symbol = 254 + length`
+        //    (igzip_inflate.c:359-372). The table's `bit_count` already
+        //    consumes BOTH the Huffman code AND the length-extra bits.
+        //    Vendor extracts length directly via `symbol - 254U`
+        //    (deflate.hpp:1642). Calling `read_length_extra` on top of
+        //    the LUT's bit consumption (the prior bug) reads garbage
+        //    bits and desyncs the stream — the first cross-chunk back-
+        //    reference then fires `InvalidHuffmanCode` on the next
+        //    lit/len lookup.
+        //
+        // 3. **Length-code symbols can be up to MAX_LIT_LEN_SYM = 512**,
+        //    not 285. The expansion pushes them into [257, ~512].
+        //    Rejecting `sym > 285` (the prior bug) errors on legitimate
+        //    high-length back-references.
+        //
+        // 4. **EOB check applies only to single-symbol entries**
+        //    (sym_count == 1) — a packed pair/triple cannot end in EOB
+        //    because pair/triple encoding skips when `sym >= 256`
+        //    (igzip_inflate.c:473-476). Vendor expresses this as the
+        //    `code <= 255 || sym_count > 1 → literal` branch at
+        //    deflate.hpp:1615.
         const INVALID_SYMBOL: u32 = 0x1FFF;
+        const MAX_LIT_LEN_SYM: u32 = 512;
         let start_len = output.len();
         let mut emitted: usize = 0;
         while emitted < n_max_to_decode {
-            // Decode one lit/len symbol via the ISA-L LUT — short-code
-            // fast path (12-bit lookup) handles ~98% of symbols on real
-            // data (HuffmanCodingISAL.hpp:139-151).
             let decoded = self.isal_litlen.decode(bits);
             if decoded.bit_count == 0 || decoded.symbol == INVALID_SYMBOL {
                 return Err(BlockError::InvalidHuffmanCode);
             }
-            // IsalLitLenCode::decode mutates only the bit buffer's
-            // internal peek state via seekAfterPeek-like semantics;
-            // for our Bits API we consume explicitly here.
-            // Wait: actually IsalLitLenCode::decode does NOT consume
-            // bits (the port returns bit_count for the caller to handle,
-            // matching rapidgzip's seekAfterPeek pattern from
-            // HuffmanCodingISAL.hpp:143). Consume here.
+            // Consume the LUT-reported bit count (covers Huffman code +
+            // any baked-in length-extra bits). Vendor's `seekAfterPeek`
+            // at HuffmanCodingISAL.hpp:143 is equivalent.
             bits.consume(decoded.bit_count);
-            let sym = decoded.symbol;
+            let mut sym = decoded.symbol;
+            let mut sym_count = decoded.sym_count;
 
-            if sym < 256 {
-                output.push(sym as u16);
-                emitted += 1;
-                continue;
-            }
-            if sym == END_OF_BLOCK_SYMBOL as u32 {
-                self.at_end_of_block = true;
-                self.decoded_bytes += emitted;
-                return Ok(emitted);
-            }
-            if sym > 285 {
-                return Err(BlockError::InvalidHuffmanCode);
-            }
-            // Length code: read extra bits and resolve the length.
-            let lidx = (sym - 257) as usize;
-            let length = read_length_extra(bits, lidx)?;
-            // Distance: decode symbol + extra bits via ISA-L LUT.
-            let (dsym, dbit) = self
-                .isal_dist
-                .decode(bits)
-                .ok_or(BlockError::InvalidHuffmanCode)?;
-            bits.consume(dbit);
-            if dsym as usize >= DISTANCE_BASE.len() {
-                return Err(BlockError::InvalidHuffmanCode);
-            }
-            let distance = read_distance_extra(bits, dsym as usize)?;
-            if distance == 0 || distance > MAX_WINDOW_SIZE {
-                return Err(BlockError::ExceededWindowRange);
-            }
-            let out_pos = output.len() - start_len + self.decoded_bytes_at_block_start;
-            emit_backref(output, distance, length, out_pos)?;
-            emitted += length;
-            if self.track_backreferences {
-                self.backreferences.push(Backreference {
-                    distance: distance as u16,
-                    length: length as u16,
-                });
+            // Multi-symbol unpack loop — vendor deflate.hpp:1612-1661.
+            // sym_count ∈ {1, 2, 3}; we extract each via `sym >>= 8`
+            // and emit until either we run out or hit a non-literal
+            // last symbol (EOB or length code).
+            loop {
+                let code = (sym & 0xFFFF) as u16;
+                if code <= 255 || sym_count > 1 {
+                    output.push(code);
+                    emitted += 1;
+                    sym_count -= 1;
+                    if sym_count == 0 {
+                        break;
+                    }
+                    sym >>= 8;
+                    continue;
+                }
+                // sym_count == 1 here. Either EOB, length code, or
+                // (defensively) an out-of-range symbol.
+                if code == END_OF_BLOCK_SYMBOL {
+                    self.at_end_of_block = true;
+                    self.decoded_bytes += emitted;
+                    return Ok(emitted);
+                }
+                if (code as u32) > MAX_LIT_LEN_SYM {
+                    return Err(BlockError::InvalidHuffmanCode);
+                }
+                // ISA-L expanded length: symbol = 254 + length (vendor
+                // deflate.hpp:1642). No `read_length_extra` — extra bits
+                // are baked into the LUT entry the prior `decode` call
+                // already consumed.
+                let length = (code as usize).wrapping_sub(254);
+                if length == 0 {
+                    // Defensive: vendor treats length=0 as a no-op
+                    // (deflate.hpp:1643 wraps backref in `if length != 0`).
+                    break;
+                }
+                let (dsym, dbit) = self
+                    .isal_dist
+                    .decode(bits)
+                    .ok_or(BlockError::InvalidHuffmanCode)?;
+                bits.consume(dbit);
+                if dsym as usize >= DISTANCE_BASE.len() {
+                    return Err(BlockError::InvalidHuffmanCode);
+                }
+                let distance = read_distance_extra(bits, dsym as usize)?;
+                if distance == 0 || distance > MAX_WINDOW_SIZE {
+                    return Err(BlockError::ExceededWindowRange);
+                }
+                let out_pos = output.len() - start_len + self.decoded_bytes_at_block_start;
+                emit_backref(output, distance, length, out_pos)?;
+                emitted += length;
+                if self.track_backreferences {
+                    self.backreferences.push(Backreference {
+                        distance: distance as u16,
+                        length: length as u16,
+                    });
+                }
+                break;
             }
         }
         self.decoded_bytes += emitted;
@@ -1453,5 +1507,92 @@ mod tests {
             );
             assert_eq!(v as u8, payload[i]);
         }
+    }
+
+    /// Reproduces the production bug: bootstrapping `Block` at REAL
+    /// deflate block boundaries past bit 0 (chunk N > 0 in production)
+    /// must succeed. The marker-decoder bootstrap was failing with
+    /// `InvalidHuffmanCode` on real silesia chunks, killing parallel
+    /// throughput (every prefetch failed → effective T=2 → 0.24× rapidgzip).
+    ///
+    /// This test compiles on ALL archs (uses pure-Rust canonical-Huffman
+    /// fallback on non-x86_64) so the bug is caught locally during dev,
+    /// not just on the bench server. If the canonical and ISA-L LUT paths
+    /// share the bug, both fail here. If only ISA-L diverges, the test
+    /// passes on arm64 and the bug shows on x86_64 only.
+    #[test]
+    fn block_decode_succeeds_at_every_real_block_boundary() {
+        use crate::decompress::inflate::consume_first_decode::Bits;
+        use flate2::{write::DeflateEncoder, Compression};
+        use std::io::Write;
+
+        // Varied data that flate2 splits into multiple dynamic blocks.
+        let mut payload = Vec::with_capacity(2 * 1024 * 1024);
+        for i in 0u32..(2 * 1024 * 1024 / 4) {
+            payload.extend_from_slice(&i.to_le_bytes());
+        }
+        payload.extend(
+            b"the quick brown fox jumps over the lazy dog. "
+                .repeat(2000)
+                .iter(),
+        );
+
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::new(6));
+        enc.write_all(&payload).unwrap();
+        let deflate = enc.finish().unwrap();
+
+        let starts =
+            super::record_block_starts(&deflate).expect("oracle should walk the stream cleanly");
+        let non_zero_starts: Vec<usize> = starts.into_iter().filter(|&b| b > 0).collect();
+        assert!(
+            non_zero_starts.len() >= 3,
+            "fixture should produce ≥4 deflate blocks, got {}",
+            non_zero_starts.len()
+        );
+
+        let mut failures = Vec::new();
+        for &start_bit in &non_zero_starts {
+            // Reproduce bootstrap_with_deflate_block's setup verbatim:
+            // construct Bits at the start-byte offset, consume the
+            // bit-in-byte, then run Block::read_header + Block::read
+            // until EOB or BFINAL or 32 KiB clean tail.
+            let byte_offset = start_bit / 8;
+            let bit_in_byte = (start_bit % 8) as u32;
+            let mut bits = Bits::new(&deflate[byte_offset..]);
+            if bit_in_byte > 0 {
+                bits.consume(bit_in_byte);
+            }
+            let mut output: Vec<u16> = Vec::with_capacity(64 * 1024);
+            let mut block = Block::new();
+            // Decode at most ONE block from this boundary: that's enough
+            // to prove header + body decode at this offset.
+            let header_res = block.read_header(&mut bits, false);
+            if let Err(e) = header_res {
+                failures.push((start_bit, format!("header: {e:?}")));
+                continue;
+            }
+            let mut body_err = None;
+            while !block.eob() {
+                match block.read(&mut bits, &mut output, usize::MAX) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        body_err = Some(format!("body: {e:?}"));
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = body_err {
+                failures.push((start_bit, e));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Block decode failed at {}/{} real block boundaries — this is THE \
+             parallel-SM throughput blocker. First 3: {:?}",
+            failures.len(),
+            non_zero_starts.len(),
+            &failures[..failures.len().min(3)],
+        );
     }
 }

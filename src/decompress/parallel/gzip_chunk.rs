@@ -983,4 +983,75 @@ mod tests {
             "chunk should stop at a block boundary partway, not at EOF"
         );
     }
+
+    /// Reproduces the production bug: bootstrap_with_deflate_block must
+    /// succeed at REAL deflate block boundaries past bit 0 (chunk N > 0
+    /// in production). The fast path with the proper window succeeds at
+    /// these same offsets; bootstrap (no window, marker mode) was failing
+    /// with `InvalidHuffmanCode` on real silesia chunks, killing parallel
+    /// throughput (every prefetch failed → effective T=2 → 0.24× rapidgzip).
+    ///
+    /// Uses `record_block_starts` (the test oracle) to find real boundaries
+    /// of a multi-block deflate stream, then calls bootstrap from each one
+    /// and asserts it doesn't error before reaching either BFINAL or
+    /// until_bits.
+    #[test]
+    fn bootstrap_succeeds_at_every_real_block_boundary() {
+        use crate::decompress::parallel::deflate_block::record_block_starts;
+
+        // Use varied data that flate2 will split into multiple dynamic-
+        // Huffman blocks. ~2 MB ensures we hit 32+ block boundaries past
+        // bit 0.
+        let mut payload = Vec::with_capacity(2 * 1024 * 1024);
+        for i in 0u32..(2 * 1024 * 1024 / 4) {
+            // Mix of patterns to defeat fixed-Huffman, force dynamic
+            // blocks with realistic literal/distance distributions.
+            payload.extend_from_slice(&i.to_le_bytes());
+        }
+        // Salt with a long-repeat region to exercise long back-refs.
+        payload.extend(
+            b"the quick brown fox jumps over the lazy dog. "
+                .repeat(2000)
+                .iter(),
+        );
+        let deflate = make_deflate(&payload);
+
+        let starts = record_block_starts(&deflate).expect("oracle must walk the stream cleanly");
+        // Skip bit-0 start (already covered by the "from_bit_0" test); we
+        // care about boundaries the production decoder lands on for
+        // chunk N > 0.
+        let non_zero_starts: Vec<usize> = starts.into_iter().filter(|&b| b > 0).collect();
+        assert!(
+            non_zero_starts.len() >= 3,
+            "fixture should produce ≥4 deflate blocks, got {} non-zero boundaries",
+            non_zero_starts.len()
+        );
+
+        let until_bits = deflate.len() * 8;
+        let mut failures: Vec<(usize, String)> = Vec::new();
+        for &start_bit in &non_zero_starts {
+            let cfg = ChunkConfiguration {
+                split_chunk_size: 256 * 1024,
+                max_decoded_chunk_size: 20 * 256 * 1024,
+                crc32_enabled: false,
+            };
+            // until_bits = full stream end so bootstrap runs to clean
+            // handoff (or BFINAL on last blocks); failures here are the
+            // bug we're chasing.
+            match finish_decode_chunk_with_inexact_offset(&deflate, start_bit, until_bits, &[], cfg)
+            {
+                Ok(_) => {}
+                Err(e) => failures.push((start_bit, format!("{e:?}"))),
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "bootstrap failed at {}/{} real block boundaries; \
+             this is THE blocker for parallel-SM throughput. First 3 failures: {:?}",
+            failures.len(),
+            non_zero_starts.len(),
+            &failures[..failures.len().min(3)],
+        );
+    }
 }
