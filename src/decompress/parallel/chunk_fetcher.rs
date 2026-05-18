@@ -507,19 +507,29 @@ fn consumer_loop<W: std::io::Write>(
             predecessor_window_for_postprocess = None;
         } else {
             // Vendor `waitForReplacedMarkers` (GzipChunkFetcher.hpp:478-518)
-            // blocks until the predecessor's marker-replace future
-            // completes — guaranteeing the predecessor's tail window is
-            // emplaced in the WindowMap before we ask for it. Our
-            // equivalent is to drain `pending` (which holds in-flight
-            // post-process receivers) until empty, ensuring all earlier
-            // chunks' post-processes have inserted their tail windows.
+            // blocks until the PREDECESSOR'S marker-replace future
+            // completes — JUST the predecessor's, not all in-flight
+            // chunks. Vendor lookup is `m_windowMap->get(*nextBlockOffset)`,
+            // a blocking call that waits on the predecessor's
+            // future-via-WindowMap-condvar; once it returns, downstream
+            // (later) chunks' post-processes can keep running in the
+            // worker pool without the consumer waiting on them.
             //
-            // This is the audit-step-5 invariant: WindowMap no longer
-            // exposes a `get_or_wait`/Condvar — callers MUST hold
-            // higher-level ordering. Mirror of vendor WindowMap.hpp:19-186
-            // (no condition_variable; the BlockFetcher dispatch model
-            // serializes window emplacement).
-            while !pending.is_empty() {
+            // Our equivalent is to drain `pending` UNTIL the predecessor's
+            // window appears at `next_block_offset`. The post-process queue
+            // is FIFO, so draining from the front advances earliest-first;
+            // a drain stops as soon as the consumer can move forward.
+            // Pre-fix used `while !pending.is_empty()` — that drained ALL
+            // queued post-processes per consumer iter, serializing the
+            // whole pipeline (slow-path chunks effectively single-threaded
+            // through the consumer). Now we drain only what's needed.
+            while window_map.get(next_block_offset).is_none() {
+                if pending.is_empty() {
+                    // No post-process can produce the missing window —
+                    // bubble the same error vendor would (a logic_error
+                    // about a missing predecessor window).
+                    break;
+                }
                 drain_one_pending(&mut pending, writer, total_crc, total_size, block_fetcher)?;
             }
             // Vendor `GzipChunkFetcher.hpp:334` —
