@@ -585,34 +585,74 @@ impl ChunkData {
             "populate_subchunk_windows requires apply_window already ran"
         );
 
+        // Pre-materialize `data_with_markers` as bytes (markers are all
+        // resolved, debug_assert above guarantees v < MARKER_BASE so the
+        // `as u8` is lossless). One allocation up front avoids paying
+        // O(W) per-byte u16→u8 conversion inside the per-subchunk loop.
+        // For the typical chunk this is at most a few hundred KiB and
+        // happens once instead of N_subchunks × W times.
+        let dwm_bytes: Vec<u8> = self.data_with_markers.iter().map(|v| *v as u8).collect();
+        let dwm_len = dwm_bytes.len();
+
         for sc in self.subchunks.iter_mut() {
             // Build window for offset `sc.decoded_offset`. Source bytes
-            // come from (predecessor_window | data_with_markers | data),
-            // taking the last 32 KiB before `sc.decoded_offset`.
+            // come from (predecessor_window | dwm_bytes | data), taking
+            // the last 32 KiB before `sc.decoded_offset` — i.e., from
+            // absolute index `sc.decoded_offset` (in the concatenated
+            // source after `predecessor_window`) over `W` bytes.
+            //
+            // Vendor parity: `DecodedData::getWindowAt`
+            // (vendor/.../DecodedData.hpp:401-490) walks the same
+            // (previousWindow | dataWithMarkers chunks | data chunks)
+            // concatenation. Vendor's C++ loops over per-chunk inner
+            // segments because DecodedData stores both `data` and
+            // `dataWithMarkers` as `std::vector<FasterVector<...>>`
+            // (lists of contiguous buffers). gzippy's single-Vec layout
+            // for both fields lets us replace vendor's element loops
+            // with three `copy_from_slice` calls — same total work as
+            // the C++, just expressed as bulk memcpys the compiler can
+            // forward to SSE/AVX `mov`s instead of the previous
+            // per-byte `match abs { … }` chain.
             let mut window = [0u8; W];
-            // Total bytes available before sc.decoded_offset is
-            // predecessor_window.len() (=W) + sc.decoded_offset.
-            let needed_start = (W + sc.decoded_offset).saturating_sub(W);
-            // needed_start = sc.decoded_offset (since predecessor adds W).
-            // Position within the concatenated source:
-            //   [0, W)               → predecessor_window[i]
-            //   [W, W + dwm_len)     → data_with_markers[i - W] as u8
-            //   [W + dwm_len, end)   → data[i - W - dwm_len]
-            let dwm_len = self.data_with_markers.len();
-            for (i, slot) in window.iter_mut().enumerate() {
-                let abs = needed_start + i;
-                *slot = if abs < W {
-                    predecessor_window[abs]
-                } else if abs - W < dwm_len {
-                    self.data_with_markers[abs - W] as u8
-                } else {
-                    let data_idx = abs - W - dwm_len;
-                    // For subchunks beyond data.len(), pad with zeros
-                    // (shouldn't happen for well-formed chunks since
-                    // sc.decoded_offset ≤ decoded_size).
-                    self.data.get(data_idx).copied().unwrap_or(0)
-                };
+            let needed_start = sc.decoded_offset; // see ascii diagram above
+            let mut written: usize = 0;
+
+            // Segment 1: bytes from `predecessor_window[needed_start..W]`.
+            if needed_start < W {
+                let take = W - needed_start;
+                let take = take.min(W - written);
+                window[written..written + take]
+                    .copy_from_slice(&predecessor_window[needed_start..needed_start + take]);
+                written += take;
             }
+
+            // Segment 2: bytes from `dwm_bytes`.
+            if written < W {
+                let abs = needed_start + written;
+                let dwm_offset = abs.saturating_sub(W);
+                if dwm_offset < dwm_len {
+                    let take = (dwm_len - dwm_offset).min(W - written);
+                    window[written..written + take]
+                        .copy_from_slice(&dwm_bytes[dwm_offset..dwm_offset + take]);
+                    written += take;
+                }
+            }
+
+            // Segment 3: bytes from `data`.
+            if written < W {
+                let abs = needed_start + written;
+                let data_offset = abs.saturating_sub(W + dwm_len);
+                if data_offset < self.data.len() {
+                    let take = (self.data.len() - data_offset).min(W - written);
+                    window[written..written + take]
+                        .copy_from_slice(&self.data[data_offset..data_offset + take]);
+                    written += take;
+                }
+            }
+            // Trailing bytes (if subchunk extends past `data.len()`) stay
+            // zero — matches the previous `unwrap_or(0)` fallback.
+            let _ = written;
+
             sc.window = Some(Arc::new(window));
         }
     }
