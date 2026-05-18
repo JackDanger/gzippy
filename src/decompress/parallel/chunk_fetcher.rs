@@ -14,31 +14,41 @@
 //! BlockFetcher.hpp:245-329) and the consumer is ~80 lines of
 //! processNextChunk-shaped orchestration.
 //!
+//! Step 3 (2026-05-17): the `std::thread::scope + Mutex<mpsc::Receiver<Job>>`
+//! worker pool is replaced by the literal port of `rapidgzip::ThreadPool`
+//! (`thread_pool.rs`, vendor/.../core/ThreadPool.hpp:33-248). Decode
+//! tasks AND post-process tasks both submit through the same
+//! `ThreadPool::submit(closure, priority)` returning a `Future<R>`
+//! (mirror of `std::future<BlockData>` at BlockFetcher.hpp:686). The
+//! submit closure inside `BlockFetcher::get` unwraps the `Future` into
+//! its underlying `mpsc::Receiver` (via `Future::into_receiver`) so the
+//! `BlockFetcher`'s in-flight prefetch map can stash it.
+//!
 //! Mapping (vendor → gzippy):
 //!
 //! - `m_blockMap` → `BlockMap` (block_map.rs).
 //! - `m_blockFinder` → `GzipBlockFinder` (gzip_block_finder.rs).
 //! - `m_windowMap` → `WindowMap` (window_map.rs).
-//! - `m_threadPool` → `std::thread::scope` + `mpsc::Sender<Job>` shared
-//!   between consumer and workers. Workers pull `Job` from the queue;
-//!   the consumer submits `DecodeJob`s via `submit_decode_job`. Each
-//!   job carries its own reply `Sender<Result<ChunkData, _>>`, so the
-//!   `Receiver` returned to `BlockFetcher::get` plays the role of
-//!   `std::future<BlockData>` at BlockFetcher.hpp:131.
+//! - `m_threadPool` → `ThreadPool` (thread_pool.rs, literal port of
+//!   vendor/.../core/ThreadPool.hpp:33-248). One pool, shared across
+//!   decode and post-process submissions, mirroring vendor's
+//!   `m_threadPool` at BlockFetcher.hpp:686.
 //! - `m_prefetching: std::map<size_t, std::future<BlockData>>` → lives
 //!   inside `BlockFetcher` now (`block_fetcher.rs`'s
 //!   `prefetching: HashMap<Key, Receiver<Result<Value, Err>>>`).
 //! - `m_cache` → `BlockFetcher::cache`.
 //! - `submitOnDemandTask` / `decodeAndMeasureBlock` → the `submit`
-//!   closure passed to `BlockFetcher::get`, which sends a `DecodeJob`
-//!   and returns the reply `Receiver`. Mirror of BlockFetcher.hpp:554-558.
+//!   closure passed to `BlockFetcher::get`, which calls
+//!   `thread_pool.submit(run_decode_job, /* priority */ 0)` and returns
+//!   the future's receiver. Mirror of BlockFetcher.hpp:554-558.
 //! - `decodeBlock` / `decodeChunk` / `decodeChunkWithRapidgzip` →
 //!   `gzip_chunk::decode_chunk_with_window` (fast path) +
 //!   `decode_or_iterate` (slow path: tryToDecode + BlockFinder
 //!   iteration per GzipChunk.hpp:712-846).
 //! - `postProcessChunk` / `applyWindow` → `apply_window` +
-//!   `populate_subchunk_windows`, dispatched on the same pool via a
-//!   `PostProcessJob`. Vendor parity at GzipChunkFetcher.hpp:553-583.
+//!   `populate_subchunk_windows`, dispatched on the SAME pool via
+//!   `thread_pool.submit(run_post_process_job, /* priority */ -1)`
+//!   (vendor's `submitTaskWithHighPriority` at BlockFetcher.hpp:606-611).
 
 #![allow(dead_code)]
 
@@ -67,6 +77,8 @@ use crate::decompress::parallel::gzip_chunk::{
 };
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::prefetcher::FetchNextAdaptive;
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+use crate::decompress::parallel::thread_pool::{ThreadPinning, ThreadPool};
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::trace;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
@@ -102,16 +114,17 @@ const WINDOW_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 const FETCH_STRATEGY_MEMORY: usize = 32;
 
-// ── Worker pool job types ────────────────────────────────────────────────
+// ── Worker pool job parameters ───────────────────────────────────────────
 
-/// One unit of decode work submitted to the pool. Mirror of vendor's
-/// `decodeAndMeasureBlock` task lambda body
-/// (vendor/.../core/BlockFetcher.hpp:555-558).
+/// Static descriptor for a single decode task — replaces the prior
+/// `DecodeJob` struct now that dispatch goes through
+/// `ThreadPool::submit(closure, priority)` directly (no enum-tagged
+/// work channel). Mirror of the arguments captured by vendor's
+/// `decodeAndMeasureBlock` task lambda body at
+/// vendor/.../core/BlockFetcher.hpp:555-558.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-struct DecodeJob {
-    /// Cache key under which the worker stores the result. Mirror of
-    /// vendor's `blockOffset` arg threaded through `submitOnDemandTask`.
-    cache_key: usize,
+#[derive(Clone, Copy)]
+struct DecodeParams {
     /// Bit offset where this chunk's decode starts.
     start_bit: usize,
     /// Approximate bit offset where the chunk should stop (the next
@@ -122,37 +135,55 @@ struct DecodeJob {
     /// window is published in the WindowMap by the time the worker
     /// runs. Used to pick fast vs slow path at the worker.
     authoritative: bool,
-    /// Reply channel — playing the role of vendor's
-    /// `std::future<BlockData>` (BlockFetcher.hpp:131). Wraps the
-    /// decoded chunk in an `Arc` to mirror vendor's
-    /// `std::shared_ptr<BlockData>` aliasing model
-    /// (BlockFetcher.hpp:46).
-    reply: mpsc::Sender<Result<Arc<ChunkData>, ChunkDecodeError>>,
     /// For trace labelling only.
     partition_idx: usize,
 }
 
-/// One unit of post-processing work submitted to the pool. Mirror of
-/// the lambda enqueued at `GzipChunkFetcher::queueChunkForPostProcessing`
-/// (vendor/.../GzipChunkFetcher.hpp:579-582), which calls
-/// `chunkData->applyWindow( *window, chunkData->windowCompressionType() )`.
+/// `Send`-able wrapper around a raw pointer + length to the
+/// deflate-stream input buffer. The buffer is owned by the caller of
+/// `chunk_fetcher::drive` and the `ThreadPool` is stopped (joining all
+/// workers) before `drive` returns, so no `InputSlice` ever outlives
+/// the buffer it points into.
+///
+/// Why raw pointers: `ThreadPool::submit` requires `F: Send + 'static`
+/// (mirror of `std::future`'s value semantics — captured state must be
+/// owned or `'static`-borrowed). Vendor's C++ ignores lifetimes;
+/// rapidgzip simply captures `this` and assumes the `BlockFetcher`
+/// outlives the futures. We encode the same invariant explicitly.
+///
+/// Mirror of the `BlockFetcher`'s implicit "captured by reference"
+/// pattern in `submitOnDemandTask` and the lambda at BlockFetcher.hpp:554
+/// (`[this, ...] () { return decodeAndMeasureBlock(...); }`).
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-struct PostProcessJob {
-    partition_idx: usize,
-    chunk: ChunkData,
-    predecessor_window: Arc<[u8; 32768]>,
-    window_map: WindowMap,
-    reply: mpsc::Sender<ChunkData>,
+#[derive(Clone, Copy)]
+struct InputSlice {
+    ptr: *const u8,
+    len: usize,
 }
 
-/// Job variant on the unified work channel. Workers receive `Job` and
-/// dispatch on the variant. Vendor's `submitTask` and
-/// `submitTaskWithHighPriority` both target `BS::thread_pool`; we keep
-/// that 1:1.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-enum Job {
-    Decode(DecodeJob),
-    PostProcess(PostProcessJob),
+unsafe impl Send for InputSlice {}
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+unsafe impl Sync for InputSlice {}
+
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+impl InputSlice {
+    /// SAFETY: caller must guarantee the slice outlives every
+    /// `InputSlice` derived from it. `drive` enforces this by holding
+    /// the `ThreadPool` (and dropping it, joining all workers) before
+    /// returning.
+    unsafe fn from_slice(bytes: &[u8]) -> Self {
+        Self {
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+        }
+    }
+
+    /// SAFETY: caller must hold the `drive` lifetime invariant — i.e.
+    /// the original slice is still valid for reads.
+    unsafe fn as_slice(self) -> &'static [u8] {
+        std::slice::from_raw_parts(self.ptr, self.len)
+    }
 }
 
 // ── Public driver entry point ─────────────────────────────────────────────
@@ -203,47 +234,51 @@ pub fn drive<W: std::io::Write>(
         pool_size,
     ));
 
+    // ── m_threadPool (vendor BlockFetcher.hpp:686) ──────────────────
+    // The single thread pool that backs both decode and post-process
+    // submissions, mirroring vendor's single `BS::thread_pool` shared
+    // through `submit` + `submitTaskWithHighPriority`. `Arc` so the
+    // submit closure inside `BlockFetcher::get` (cloned per call) can
+    // hold a reference for `ThreadPool::submit`.
+    let thread_pool = Arc::new(ThreadPool::new(pool_size, ThreadPinning::new()));
+
     // Running CRC + size accumulators. Mirror of vendor's
     // `m_crc32Calculator` + `m_totalDecompressedSize` updates inside
     // ParallelGzipReader::read.
     let mut total_crc = CRC32Calculator::new();
     let mut total_size: usize = 0;
 
-    // Unified worker pool. Job channel is the only synchronization
-    // primitive between consumer and workers.
-    let (job_tx, job_rx) = mpsc::channel::<Job>();
-    let job_rx = Arc::new(std::sync::Mutex::new(job_rx));
+    // SAFETY: `input_view` is consumed only by closures submitted to
+    // `thread_pool`. `consumer_loop` returns only after every
+    // submitted decode/post-process future has been awaited (via
+    // `BlockFetcher::get`'s `rx.recv()` and `drain_one_pending`). We
+    // additionally `thread_pool.stop()` below to join any prefetch
+    // tasks still spawned. Therefore no closure holding `input_view`
+    // can outlive the borrowed `input` slice.
+    let input_view = unsafe { InputSlice::from_slice(input) };
 
-    let result = std::thread::scope(|s| -> Result<(), FetchError> {
-        for _ in 0..pool_size {
-            let job_rx = Arc::clone(&job_rx);
-            let window_map = window_map.clone();
-            let configuration = configuration;
-            s.spawn(move || {
-                worker_loop(input, job_rx, window_map, configuration);
-            });
-        }
+    let consumer_result = consumer_loop(
+        input_view,
+        writer,
+        total_bits,
+        &block_finder,
+        &block_fetcher,
+        &block_map,
+        &window_map,
+        &thread_pool,
+        pool_size,
+        configuration,
+        &mut total_crc,
+        &mut total_size,
+    );
 
-        consumer_loop(
-            input,
-            writer,
-            total_bits,
-            &block_finder,
-            &block_fetcher,
-            &block_map,
-            &window_map,
-            &job_tx,
-            pool_size,
-            configuration,
-            &mut total_crc,
-            &mut total_size,
-        )?;
+    // Stop the pool BEFORE returning so any straggler prefetch tasks
+    // are joined and `InputSlice` is no longer reachable. Mirror of
+    // vendor's `stopThreadPool()` at BlockFetcher.hpp:600-604, called
+    // from `~GzipChunkFetcher` before member destruction (line 686).
+    thread_pool.stop();
 
-        // Drop our job_tx clone so workers exit when their queue empties.
-        drop(job_tx);
-        Ok(())
-    });
-    result?;
+    consumer_result?;
 
     // Vendor parity: `m_blockMap->finalize()` + `m_blockFinder->finalize()`
     // at the end of `processNextChunk`'s EOF branch
@@ -270,16 +305,16 @@ pub fn drive<W: std::io::Write>(
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
 fn consumer_loop<W: std::io::Write>(
-    _input: &[u8],
+    input: InputSlice,
     writer: &mut W,
     total_bits: usize,
     block_finder: &GzipBlockFinder,
     block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive, ChunkDecodeError>>,
     block_map: &BlockMap,
     window_map: &WindowMap,
-    job_tx: &mpsc::Sender<Job>,
+    thread_pool: &Arc<ThreadPool>,
     pool_size: usize,
-    _configuration: ChunkConfiguration,
+    configuration: ChunkConfiguration,
     total_crc: &mut CRC32Calculator,
     total_size: &mut usize,
 ) -> Result<(), FetchError> {
@@ -322,23 +357,17 @@ fn consumer_loop<W: std::io::Write>(
             total_bits,
             next_block_offset,
         );
-        let next_block_offset_for_submit = next_block_offset;
-        let until_bit_for_submit = until_bit;
         let partition_idx_for_trace = next_unprocessed_block_index;
+        let params = DecodeParams {
+            start_bit: next_block_offset,
+            until_bit,
+            authoritative: true,
+            partition_idx: partition_idx_for_trace,
+        };
         let chunk_arc_result: Result<Arc<ChunkData>, ChunkDecodeError> = block_fetcher.get(
             next_block_offset,
-            |key: usize| -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
-                submit_decode_job(
-                    job_tx,
-                    DecodeJob {
-                        cache_key: key,
-                        start_bit: next_block_offset_for_submit,
-                        until_bit: until_bit_for_submit,
-                        authoritative: true,
-                        reply: mpsc::channel().0, // overwritten below
-                        partition_idx: partition_idx_for_trace,
-                    },
-                )
+            |_key: usize| -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
+                submit_decode_to_pool(thread_pool, input, params, window_map, configuration)
             },
         );
         let chunk_arc = chunk_arc_result.map_err(FetchError::Decode)?;
@@ -411,15 +440,12 @@ fn consumer_loop<W: std::io::Write>(
         // queue as immediately-ready for ordered write.
         match predecessor_window_for_postprocess {
             Some(window) => {
-                let rx = submit_post_process_job(
-                    job_tx,
-                    PostProcessJob {
-                        partition_idx: partition_idx_for_trace,
-                        chunk,
-                        predecessor_window: window,
-                        window_map: window_map.clone(),
-                        reply: mpsc::channel().0, // overwritten below
-                    },
+                let rx = submit_post_process_to_pool(
+                    thread_pool,
+                    chunk,
+                    window,
+                    window_map.clone(),
+                    partition_idx_for_trace,
                 );
                 pending.push_back(PendingWrite::Async {
                     idx: partition_idx_for_trace,
@@ -472,116 +498,112 @@ fn until_bit_for(
     }
 }
 
-/// Send a `DecodeJob` to the worker pool, returning the reply receiver.
-/// Mirror of vendor's `submitOnDemandTask(blockOffset, nextBlockOffset)`
-/// at BlockFetcher.hpp:600 — both arrange for an asynchronous decode
-/// whose `std::future<BlockData>` the caller waits on.
+/// Submit a decode task to the `ThreadPool`, returning the
+/// `mpsc::Receiver` that `BlockFetcher::get` will wait on. Mirror of
+/// vendor's `submitOnDemandTask(blockOffset, nextBlockOffset)` at
+/// BlockFetcher.hpp:573-589 — both arrange for an asynchronous decode
+/// whose `std::future<BlockData>` the caller waits on. Vendor calls
+/// `m_threadPool.submit([this, ...] () { return decodeAndMeasureBlock(...); }, 0)`;
+/// we mirror that with `thread_pool.submit(run_decode_task, /* priority */ 0)`.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-fn submit_decode_job(
-    job_tx: &mpsc::Sender<Job>,
-    template: DecodeJob,
+fn submit_decode_to_pool(
+    thread_pool: &Arc<ThreadPool>,
+    input: InputSlice,
+    params: DecodeParams,
+    window_map: &WindowMap,
+    configuration: ChunkConfiguration,
 ) -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
-    let (tx, rx) = mpsc::channel();
-    let job = DecodeJob {
-        reply: tx,
-        ..template
-    };
     if trace::is_enabled() {
         trace::emit(
             "consumer",
             "submit_decode",
             &format!(
-                r#""partition_idx":{},"cache_key":{},"start_bit":{},"until_bit":{},"authoritative":{}"#,
-                job.partition_idx, job.cache_key, job.start_bit, job.until_bit, job.authoritative,
+                r#""partition_idx":{},"start_bit":{},"until_bit":{},"authoritative":{}"#,
+                params.partition_idx, params.start_bit, params.until_bit, params.authoritative,
             ),
         );
     }
-    job_tx.send(Job::Decode(job)).expect("worker pool dropped");
-    rx
+    let window_map = window_map.clone();
+    let future = thread_pool.submit(
+        move || run_decode_task(input, params, &window_map, configuration),
+        /* priority */ 0,
+    );
+    future.into_receiver()
 }
 
-/// Send a `PostProcessJob` to the worker pool, returning the reply
-/// receiver. Mirror of vendor's `submitTaskWithHighPriority(applyWindow)`
-/// at GzipChunkFetcher.hpp:579.
+/// Submit a post-process task to the `ThreadPool`, returning the
+/// `mpsc::Receiver` that the consumer's pending-write queue will wait
+/// on. Mirror of vendor's `submitTaskWithHighPriority(applyWindow)` at
+/// GzipChunkFetcher.hpp:579 (which forwards to
+/// `m_threadPool.submit(task, /* priority */ -1)` at
+/// BlockFetcher.hpp:606-611).
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-fn submit_post_process_job(
-    job_tx: &mpsc::Sender<Job>,
-    template: PostProcessJob,
+fn submit_post_process_to_pool(
+    thread_pool: &Arc<ThreadPool>,
+    chunk: ChunkData,
+    predecessor_window: Arc<[u8; 32768]>,
+    window_map: WindowMap,
+    partition_idx: usize,
 ) -> mpsc::Receiver<ChunkData> {
-    let (tx, rx) = mpsc::channel();
-    let job = PostProcessJob {
-        reply: tx,
-        ..template
-    };
     if trace::is_enabled() {
         trace::emit(
             "consumer",
             "submit_post_process",
-            &format!(r#""partition_idx":{}"#, job.partition_idx),
+            &format!(r#""partition_idx":{}"#, partition_idx),
         );
     }
-    job_tx
-        .send(Job::PostProcess(job))
-        .expect("worker pool dropped");
-    rx
+    let future = thread_pool.submit(
+        move || run_post_process_task(chunk, predecessor_window, window_map),
+        /* priority */ -1,
+    );
+    future.into_receiver()
 }
 
-// ── Worker loop ──────────────────────────────────────────────────────────
-
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-fn worker_loop(
-    input: &[u8],
-    job_rx: Arc<std::sync::Mutex<mpsc::Receiver<Job>>>,
-    window_map: WindowMap,
-    configuration: ChunkConfiguration,
-) {
-    loop {
-        let job = {
-            let rx = job_rx.lock().unwrap();
-            match rx.recv() {
-                Ok(j) => j,
-                Err(_) => return, // sender dropped → shutdown
-            }
-        };
-
-        match job {
-            Job::Decode(d) => run_decode_job(input, d, &window_map, configuration),
-            Job::PostProcess(p) => run_post_process_job(p),
-        }
-    }
-}
-
-/// Worker-side execution of a `DecodeJob`. Mirror of vendor's
+/// Pool-side execution of a decode task. Mirror of vendor's
 /// `decodeBlock(blockOffset, nextBlockOffset)`
 /// (GzipChunkFetcher.hpp:692-729) — picks the fast path
 /// (`decodeChunkWithIsal` / `decode_chunk_with_window`) when the
 /// initial window is known, else the slow path
 /// (`decodeChunkWithRapidgzip` / `decode_or_iterate`).
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-fn run_decode_job(
-    input: &[u8],
-    job: DecodeJob,
+fn run_decode_task(
+    input: InputSlice,
+    params: DecodeParams,
     window_map: &WindowMap,
     configuration: ChunkConfiguration,
-) {
-    let label = trace::worker_label(job.partition_idx);
+) -> Result<Arc<ChunkData>, ChunkDecodeError> {
+    // SAFETY: `drive`'s contract — input outlives the thread pool.
+    let input_bytes: &[u8] = unsafe { input.as_slice() };
+
+    let label = trace::worker_label(params.partition_idx);
     let t0 = std::time::Instant::now();
 
     // Try to acquire the predecessor's window. The consumer guarantees
     // it for authoritative dispatches (vendor: post_process always
     // emplaces the tail BEFORE the next worker can be unblocked); for
     // speculative dispatches we wait a short timeout.
-    let window = if job.start_bit == 0 {
+    let window = if params.start_bit == 0 {
         Some(Arc::new([0u8; 32768]))
-    } else if job.authoritative {
-        window_map.get_or_wait(job.start_bit, Duration::from_secs(60))
+    } else if params.authoritative {
+        window_map.get_or_wait(params.start_bit, Duration::from_secs(60))
     } else {
-        window_map.get_or_wait(job.start_bit, WINDOW_WAIT_TIMEOUT)
+        window_map.get_or_wait(params.start_bit, WINDOW_WAIT_TIMEOUT)
     };
 
     let chunk_result = match window {
-        Some(w) => decode_chunk_with_window(input, job.start_bit, job.until_bit, &w, configuration),
-        None => decode_or_iterate(input, job.start_bit, job.until_bit, configuration),
+        Some(w) => decode_chunk_with_window(
+            input_bytes,
+            params.start_bit,
+            params.until_bit,
+            &w,
+            configuration,
+        ),
+        None => decode_or_iterate(
+            input_bytes,
+            params.start_bit,
+            params.until_bit,
+            configuration,
+        ),
     };
 
     // Publish tail window if cleanly available — workers can usually
@@ -601,7 +623,7 @@ fn run_decode_job(
 
     if trace::is_enabled() {
         let dur_us = t0.elapsed().as_micros();
-        let path = if window_map.get(job.start_bit).is_some() {
+        let path = if window_map.get(params.start_bit).is_some() {
             "fast"
         } else {
             "slow"
@@ -612,9 +634,9 @@ fn run_decode_job(
                 "decode_ok",
                 &format!(
                     r#""partition_idx":{},"path":"{}","start_bit":{},"end_bit":{},"decoded":{},"duration_us":{dur_us}"#,
-                    job.partition_idx,
+                    params.partition_idx,
                     path,
-                    job.start_bit,
+                    params.start_bit,
                     c.encoded_offset_bits + c.encoded_size_bits,
                     c.decoded_size(),
                 ),
@@ -624,39 +646,42 @@ fn run_decode_job(
                 "decode_err",
                 &format!(
                     r#""partition_idx":{},"path":"{}","start_bit":{},"until_bit":{},"err":"{}","duration_us":{dur_us}"#,
-                    job.partition_idx,
+                    params.partition_idx,
                     path,
-                    job.start_bit,
-                    job.until_bit,
+                    params.start_bit,
+                    params.until_bit,
                     trace::esc(&format!("{e:?}")),
                 ),
             ),
         }
     }
 
-    let _ = job.reply.send(result);
+    result
 }
 
-/// Worker-side execution of a `PostProcessJob`. Mirror of the lambda
+/// Pool-side execution of a post-process task. Mirror of the lambda
 /// body at `GzipChunkFetcher::queueChunkForPostProcessing`
 /// (vendor/.../GzipChunkFetcher.hpp:579-582).
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-fn run_post_process_job(mut job: PostProcessJob) {
-    apply_window(&mut job.chunk, &job.predecessor_window[..]);
-    job.chunk
-        .populate_subchunk_windows(&job.predecessor_window[..]);
+fn run_post_process_task(
+    mut chunk: ChunkData,
+    predecessor_window: Arc<[u8; 32768]>,
+    window_map: WindowMap,
+) -> ChunkData {
+    apply_window(&mut chunk, &predecessor_window[..]);
+    chunk.populate_subchunk_windows(&predecessor_window[..]);
 
     // Per-subchunk window publication (vendor GzipChunkFetcher.hpp:430-458).
-    for sc in &job.chunk.subchunks {
+    for sc in &chunk.subchunks {
         if let Some(ref w) = sc.window {
             let sc_end_bit = sc.encoded_offset_bits + sc.encoded_size_bits;
             if sc_end_bit > sc.encoded_offset_bits {
-                job.window_map.insert(sc_end_bit, w.clone());
+                window_map.insert(sc_end_bit, w.clone());
             }
         }
     }
 
-    let _ = job.reply.send(job.chunk);
+    chunk
 }
 
 // ── Slow-path decoder (tryToDecode + BlockFinder iteration) ──────────────

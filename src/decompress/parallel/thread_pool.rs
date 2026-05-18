@@ -89,6 +89,19 @@ impl<T> Future<T> {
     pub fn wait(self) -> Result<T, FutureError> {
         self.rx.recv().map_err(|_| FutureError::Cancelled)
     }
+
+    /// Consume the future and return its underlying `mpsc::Receiver`.
+    ///
+    /// Mirror of the `std::move(future)` pattern used by rapidgzip at
+    /// BlockFetcher.hpp:558 to stash a `std::future<BlockData>` inside
+    /// `m_prefetching`. The `BlockFetcher` port stores
+    /// `Receiver<Result<Value, Err>>` in `m_prefetching`, and the
+    /// submit-closure must yield exactly that shape. This accessor lets
+    /// the closure unwrap a `Future<R>` into the channel that the
+    /// `BlockFetcher::get` wait loop will then `recv()` on.
+    pub fn into_receiver(self) -> mpsc::Receiver<T> {
+        self.rx
+    }
 }
 
 /// Errors observable on a [`Future`].
@@ -131,6 +144,16 @@ struct PoolShared {
 
 /// `ThreadPool` proper. Literal port of the rapidgzip class
 /// (ThreadPool.hpp:33-248).
+///
+/// All mutating methods (`submit`, `stop`) take `&self` — interior
+/// mutability via `Mutex` mirrors the C++ pattern at ThreadPool.hpp
+/// where `submit` and `stop` are non-const but `m_threadPool` is
+/// declared as a non-const member callable from multiple threads
+/// (BlockFetcher.hpp:686 `ThreadPool m_threadPool`, with `submit`
+/// invoked from `BlockFetcher::get`'s thread and worker threads
+/// running `prefetchNewBlocks` concurrently). The Rust mapping
+/// requires explicit `Mutex` around the parts that the C++ implicit
+/// non-const-but-shared semantics covered.
 pub struct ThreadPool {
     /// `m_threadCount` (ThreadPool.hpp:233). Const after construction.
     thread_count: usize,
@@ -151,8 +174,12 @@ pub struct ThreadPool {
     /// `m_pingWorkers` (ThreadPool.hpp:241).
     ping_workers: Arc<Condvar>,
     /// `m_threads` (ThreadPool.hpp:247). `JoiningThread` becomes a
-    /// `JoinHandle` we explicitly join in `stop()`.
-    threads: Vec<JoinHandle<()>>,
+    /// `JoinHandle` we explicitly join in `stop()`. Wrapped in `Mutex`
+    /// so the `&self`-callable `submit` can push freshly spawned
+    /// handles. (Vendor's `m_threads` is plain `vector` because C++
+    /// permits push_back from a non-const method called via
+    /// `m_threadPool.submit` even when m_threadPool is shared.)
+    threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl ThreadPool {
@@ -172,7 +199,7 @@ impl ThreadPool {
                 running: true,
             })),
             ping_workers: Arc::new(Condvar::new()),
-            threads: Vec::with_capacity(thread_count),
+            threads: Mutex::new(Vec::with_capacity(thread_count)),
         }
     }
 
@@ -186,6 +213,15 @@ impl ThreadPool {
     /// `size_t capacity() const` (ThreadPool.hpp:166-170).
     pub fn capacity(&self) -> usize {
         self.thread_count
+    }
+
+    /// Number of worker threads currently spawned. Mirror of
+    /// `m_threads.size()` (ThreadPool.hpp:247) for diagnostic /
+    /// test-only reads. Vendor has no public accessor; we expose this
+    /// to support the on-demand-spawn unit test that asserts
+    /// `m_threads.size() == N` after submitting N blocking tasks.
+    pub fn spawned_threads(&self) -> usize {
+        self.threads.lock().unwrap().len()
     }
 
     /// `size_t unprocessedTasksCount(std::optional<int> priority = {}) const`
@@ -216,7 +252,7 @@ impl ThreadPool {
     /// 4. Spawn a worker if room and no idle workers
     ///    (ThreadPool.hpp:157-159).
     /// 5. `m_pingWorkers.notify_one()` (ThreadPool.hpp:161).
-    pub fn submit<F, T>(&mut self, task: F, priority: i32) -> Future<T>
+    pub fn submit<F, T>(&self, task: F, priority: i32) -> Future<T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
@@ -250,13 +286,11 @@ impl ThreadPool {
                 .push_back(packaged);
 
             // (m_threads.size() < m_threadCount) && (m_idleThreadCount == 0)
-            // (ThreadPool.hpp:157). We capture the decision here under
-            // the lock — the actual spawn must happen with `&mut self`
-            // outside the borrow, but `m_idleThreadCount` cannot
-            // decrease while the mutex is held (workers only decrement
-            // it after reacquiring the same mutex post-wait), so the
-            // decision remains valid across the unlock-then-spawn.
-            should_spawn = self.threads.len() < self.thread_count
+            // (ThreadPool.hpp:157). Vendor reads `m_threads.size()`
+            // under `m_mutex`; we do the same here via a short scoped
+            // lock on the threads vec.
+            let current_threads = self.threads.lock().unwrap().len();
+            should_spawn = current_threads < self.thread_count
                 && self.idle_thread_count.load(Ordering::Acquire) == 0;
 
             // m_pingWorkers.notify_one() (ThreadPool.hpp:161). The C++
@@ -279,7 +313,7 @@ impl ThreadPool {
     /// 2. `m_threads.clear()` (ThreadPool.hpp:131) — the
     ///    `JoiningThread` destructor joins each worker. We join
     ///    explicitly.
-    pub fn stop(&mut self) {
+    pub fn stop(&self) {
         {
             let mut shared = self.shared.lock().expect("ThreadPool mutex poisoned");
             shared.running = false;
@@ -287,7 +321,8 @@ impl ThreadPool {
             self.ping_workers.notify_all();
         }
 
-        for handle in self.threads.drain(..) {
+        let handles: Vec<_> = self.threads.lock().unwrap().drain(..).collect();
+        for handle in handles {
             // `JoiningThread::~JoiningThread` joins unconditionally
             // (JoiningThread.hpp:33-37). Ignore poisoned worker panics
             // here — surfacing them would require a richer return type
@@ -304,8 +339,9 @@ impl ThreadPool {
     ///
     /// Precondition: caller holds `self.shared` lock (mirrors the
     /// rapidgzip private-method invariant at ThreadPool.hpp:186-187).
-    fn spawn_thread(&mut self) {
-        let index = self.threads.len();
+    fn spawn_thread(&self) {
+        let mut threads = self.threads.lock().unwrap();
+        let index = threads.len();
         let shared = Arc::clone(&self.shared);
         let cv = Arc::clone(&self.ping_workers);
         let idle = Arc::clone(&self.idle_thread_count);
@@ -315,14 +351,14 @@ impl ThreadPool {
         let handle = thread::spawn(move || {
             worker_main(index, shared, cv, idle, running, pin);
         });
-        self.threads.push(handle);
+        threads.push(handle);
     }
 }
 
 impl Drop for ThreadPool {
     /// `~ThreadPool() { stop(); }` (ThreadPool.hpp:110-113).
     fn drop(&mut self) {
-        if !self.threads.is_empty() {
+        if !self.threads.lock().unwrap().is_empty() {
             self.stop();
         }
     }
@@ -422,7 +458,7 @@ mod tests {
 
     #[test]
     fn submit_and_collect_result() {
-        let mut pool = ThreadPool::new(2, ThreadPinning::new());
+        let pool = ThreadPool::new(2, ThreadPinning::new());
         let f = pool.submit(|| 7_i32 + 35, 0);
         assert_eq!(f.wait().unwrap(), 42);
     }
@@ -437,18 +473,18 @@ mod tests {
     fn zero_threads_runs_inline_deferred() {
         // ThreadPool.hpp:147-149 `if (m_threadCount == 0)
         // return std::async(std::launch::deferred, ...)`.
-        let mut pool = ThreadPool::new(0, ThreadPinning::new());
+        let pool = ThreadPool::new(0, ThreadPinning::new());
         let f = pool.submit(|| String::from("inline"), 0);
         assert_eq!(f.wait().unwrap(), "inline");
         // No worker threads were spawned.
-        assert_eq!(pool.threads.len(), 0);
+        assert_eq!(pool.spawned_threads(), 0);
     }
 
     #[test]
     fn unprocessed_tasks_count_filters_by_priority() {
         // Hold up the pool with one blocker so the priority queue actually
         // backs up: a single worker can only drain one task at a time.
-        let mut pool = ThreadPool::new(1, ThreadPinning::new());
+        let pool = ThreadPool::new(1, ThreadPinning::new());
         let barrier = Arc::new(Barrier::new(2));
         let b = Arc::clone(&barrier);
         let blocker = pool.submit(move || b.wait(), -5);
@@ -484,7 +520,7 @@ mod tests {
         // Submitting N independent tasks that all wait on a barrier of
         // size N+1 forces N worker spawns.
         let n = 3_usize;
-        let mut pool = ThreadPool::new(n, ThreadPinning::new());
+        let pool = ThreadPool::new(n, ThreadPinning::new());
         let barrier = Arc::new(Barrier::new(n + 1));
         let mut futures = Vec::new();
         for _ in 0..n {
@@ -494,12 +530,12 @@ mod tests {
         // All workers must be blocked on the barrier before we release them.
         // Wait until exactly `n` threads have been spawned.
         for _ in 0..200 {
-            if pool.threads.len() == n {
+            if pool.spawned_threads() == n {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(pool.threads.len(), n);
+        assert_eq!(pool.spawned_threads(), n);
         barrier.wait();
         for f in futures {
             f.wait().unwrap();
@@ -511,7 +547,7 @@ mod tests {
         // BTreeMap iterates ascending — std::map does the same — so
         // priority=-1 runs before priority=10. Mirror of the
         // std::find_if traversal at ThreadPool.hpp:213-214.
-        let mut pool = ThreadPool::new(1, ThreadPinning::new());
+        let pool = ThreadPool::new(1, ThreadPinning::new());
 
         // Block the worker so we control queue ordering.
         let block = Arc::new(Barrier::new(2));
@@ -538,7 +574,7 @@ mod tests {
 
     #[test]
     fn many_tasks_complete() {
-        let mut pool = ThreadPool::new(4, ThreadPinning::new());
+        let pool = ThreadPool::new(4, ThreadPinning::new());
         let counter = Arc::new(AtomicU32::new(0));
         let mut futures = Vec::new();
         for _ in 0..256 {
@@ -582,7 +618,7 @@ mod tests {
         let done = Arc::new(AtomicU32::new(0));
         let mut futures = Vec::new();
         {
-            let mut pool = ThreadPool::new(2, ThreadPinning::new());
+            let pool = ThreadPool::new(2, ThreadPinning::new());
             for _ in 0..16 {
                 let d = Arc::clone(&done);
                 futures.push(pool.submit(move || d.fetch_add(1, Ordering::AcqRel), 0));
