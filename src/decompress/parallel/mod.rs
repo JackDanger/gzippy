@@ -28,6 +28,7 @@ pub mod affinity_helpers;
 pub mod aligned_allocator;
 pub mod apply_window;
 pub mod atomic_mutex;
+pub mod bit_manipulation;
 pub mod bit_string_finder;
 pub mod block_fetcher;
 pub mod block_finder;
