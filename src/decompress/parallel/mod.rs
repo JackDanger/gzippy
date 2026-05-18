@@ -45,6 +45,7 @@ pub mod error;
 pub mod faster_vector;
 pub mod gzip_block_finder;
 pub mod gzip_chunk;
+pub mod gzip_definitions;
 pub mod gzip_format;
 pub mod inflate_wrapper;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
