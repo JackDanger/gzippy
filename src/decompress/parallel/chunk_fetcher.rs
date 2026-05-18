@@ -369,37 +369,37 @@ fn consumer_loop<W: std::io::Write>(
         //     return decodeAndMeasureBlock(offset, nextOffset); }, 0)`
         // at BlockFetcher.hpp:554-557, with `nextOffset` derived from
         // the prefetched block's index+1.
-        let prefetch_submit =
-            |offset: usize| -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
-                let prefetch_until_bit = until_bit_for(
-                    block_finder,
-                    // Best-effort index reverse-map: we use the
-                    // already-validated `next_block_offset` as the floor
-                    // since the actual block-index for `offset` may not
-                    // be exactly retrievable without a bisection. The
-                    // worker tolerates an overestimate via its internal
-                    // EOF check (read until the next finder boundary).
-                    next_unprocessed_block_index + 1,
-                    total_bits,
-                    offset,
-                );
-                let prefetch_params = DecodeParams {
-                    start_bit: offset,
-                    until_bit: prefetch_until_bit,
-                    // Prefetch tasks may race ahead of the consumer; the
-                    // worker waits a short window for the predecessor's
-                    // tail and falls back to the slow path on miss.
-                    authoritative: false,
-                    partition_idx: usize::MAX, // trace marker for "prefetch"
-                };
-                submit_decode_to_pool(
-                    thread_pool,
-                    input,
-                    prefetch_params,
-                    window_map,
-                    configuration,
-                )
+        // Mirror of vendor's `decodeAndMeasureBlock(offset, nextOffset)`
+        // capture at BlockFetcher.hpp:555-557 — the prefetched
+        // `next_offset` is computed by `prefetch_new_blocks` from the
+        // prefetched index + 1 (BlockFetcher.hpp:519-520) and passed in.
+        // Critical: `next_offset` is the worker's stop hint; using
+        // anything derived from `next_unprocessed_block_index` here
+        // (the consumer's index, NOT the prefetched index) produced an
+        // until_bit equal to `start_bit` for every prefetch past the
+        // first one, causing the worker to immediately exit with an
+        // empty chunk.
+        let prefetch_submit = |offset: usize,
+                               next_offset: usize|
+         -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
+            let prefetch_until_bit = next_offset.max(offset);
+            let prefetch_params = DecodeParams {
+                start_bit: offset,
+                until_bit: prefetch_until_bit,
+                // Prefetch tasks may race ahead of the consumer; the
+                // worker waits a short window for the predecessor's
+                // tail and falls back to the slow path on miss.
+                authoritative: false,
+                partition_idx: usize::MAX, // trace marker for "prefetch"
             };
+            submit_decode_to_pool(
+                thread_pool,
+                input,
+                prefetch_params,
+                window_map,
+                configuration,
+            )
+        };
 
         // `lookup_block_offset` mirrors vendor's `m_blockFinder->get(idx, 0)`
         // at BlockFetcher.hpp:479 — non-blocking lookup, returns the
@@ -415,18 +415,65 @@ fn consumer_loop<W: std::io::Write>(
         // ( blockIndexToPrefetch >= m_blockFinder->size() ) )`.
         let is_finalized_too_high =
             |idx: usize| -> bool { block_finder.finalized() && idx >= block_finder.size() };
+        // `partition_offset_for` mirrors vendor's
+        // `getPartitionOffsetFromOffset` lambda at
+        // GzipChunkFetcher.hpp:595-596:
+        //   `[this] ( auto offset ) {
+        //        return m_blockFinder->partitionOffsetContainingOffset(offset); }`.
+        // Flows into BlockFetcher::prefetchNewBlocks at
+        // BlockFetcher.hpp:486-489 / 537-538 for the double-key check.
+        let partition_offset_for =
+            |offset: &usize| -> usize { block_finder.partition_offset_containing_offset(*offset) };
 
-        let (chunk_arc_result, _prefetched) = block_fetcher.get_with_prefetch(
-            next_block_offset,
-            |_key: usize| -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
-                submit_decode_to_pool(thread_pool, input, params, window_map, configuration)
-            },
-            lookup_block_offset,
-            prefetch_submit,
-            is_finalized_too_high,
-            should_drive_prefetch,
-        );
-        let chunk_arc = chunk_arc_result.map_err(FetchError::Decode)?;
+        // Vendor `GzipChunkFetcher::getBlock` at
+        // vendor/.../rapidgzip/GzipChunkFetcher.hpp:591-687 — FIRST try
+        // the cache/prefetch lookup keyed by partition offset (where the
+        // prefetch was submitted, since `m_blockFinder->get(idx)` returns
+        // the partition-aligned guess for not-yet-confirmed indexes —
+        // see GzipBlockFinder.hpp:134-157). If that succeeds AND the
+        // returned chunk's accepted range contains the real offset
+        // (`matchesEncodedOffset` at ChunkData.hpp:397, the same check
+        // vendor uses at GzipChunkFetcher.hpp:647), the prefetched chunk
+        // is reused. Otherwise we fall through to a full `get` at the
+        // real offset, dispatching an on-demand task (matching vendor's
+        // `BaseType::get(blockOffset, blockIndex, ...)` at
+        // GzipChunkFetcher.hpp:654).
+        let partition_offset = partition_offset_for(&next_block_offset);
+        let mut chunk_arc_from_partition: Option<Arc<ChunkData>> = None;
+        if partition_offset != next_block_offset {
+            if let Some(Ok(arc)) = block_fetcher.try_take_prefetched(&partition_offset) {
+                // Vendor GzipChunkFetcher.hpp:646-648 — accept the chunk
+                // only if `matchesEncodedOffset(blockOffset)`. If not,
+                // discard and dispatch on-demand at the real offset.
+                if arc.matches_encoded_offset(next_block_offset) {
+                    chunk_arc_from_partition = Some(arc);
+                }
+                // If !matches, the Arc is dropped here (vendor "throws
+                // away" the partition-keyed result and re-issues at real
+                // offset below — line 654). Same for Some(Err(...)) —
+                // vendor's `catch ( const NoBlockInRange& )` at
+                // GzipChunkFetcher.hpp:604-609 silently discards
+                // prefetch failures.
+            }
+        }
+
+        let chunk_arc = match chunk_arc_from_partition {
+            Some(arc) => arc,
+            None => {
+                let (chunk_arc_result, _prefetched) = block_fetcher.get_with_prefetch(
+                    next_block_offset,
+                    |_key: usize| -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
+                        submit_decode_to_pool(thread_pool, input, params, window_map, configuration)
+                    },
+                    lookup_block_offset,
+                    prefetch_submit,
+                    is_finalized_too_high,
+                    partition_offset_for,
+                    should_drive_prefetch,
+                );
+                chunk_arc_result.map_err(FetchError::Decode)?
+            }
+        };
         // Take ownership when we hold the only Arc; otherwise clone the
         // inner ChunkData. Mirror of rapidgzip's shared_ptr aliasing at
         // GzipChunkFetcher.hpp:329.
@@ -762,6 +809,27 @@ fn run_post_process_task(
 /// BlockFinder candidates in [start_bit, start_bit + 512 KiB] until
 /// one succeeds. Mirror of rapidgzip's `tryToDecode` + candidate
 /// iteration at vendor/.../GzipChunk.hpp:712-841.
+///
+/// The returned chunk's `encoded_offset_bits` is the REAL candidate
+/// position the decode ran from — not a fabricated `start_bit`. Vendor
+/// invariant (GzipChunk.hpp:716-722): `bitReader.seekTo(offset.second)`
+/// then `result.encodedOffsetInBits = offset.first`, with `first ==
+/// second` for compressed blocks. The two-key consumer wrapper at
+/// `GzipChunkFetcher::getBlock` (GzipChunkFetcher.hpp:646-654) uses
+/// `matchesEncodedOffset` to detect when a speculatively-prefetched
+/// chunk landed on a different valid boundary than the real one, and
+/// falls back to an on-demand decode at the real offset.
+///
+/// Previously this function fabricated `encoded_offset_bits = start_bit`
+/// and stored `max_encoded_offset_bits = actual`, claiming the chunk
+/// spanned `[start_bit, actual + size]`. But the decoded bytes ONLY
+/// covered `[actual, actual + size]`, so consumers that took the chunk
+/// at face value (after the partition-keyed cache lookup landed) would
+/// emit wrong output — bytes `[start_bit, actual)` were missing from the
+/// payload but counted in the metadata. The lie was harmless in the
+/// pre-port era because the prefetch queue's key mismatch caused every
+/// prefetched chunk to be silently discarded. With the two-key lookup
+/// in place the lie surfaces; drop it to match vendor exactly.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 fn decode_or_iterate(
     input: &[u8],
@@ -784,13 +852,14 @@ fn decode_or_iterate(
             &[],
             configuration,
         ) {
-            Ok(mut c) => {
-                let actual = c.encoded_offset_bits;
-                c.encoded_offset_bits = start_bit;
-                c.max_encoded_offset_bits = actual;
-                c.encoded_size_bits += actual - start_bit;
-                return Ok(c);
-            }
+            // Vendor parity: chunk.encoded_offset_bits already equals
+            // `candidate.bit_offset` after `finish_decode_chunk_with_inexact_offset`,
+            // mirroring vendor's `result.encodedOffsetInBits = offset.first`
+            // at GzipChunk.hpp:721 with `first == second == candidate`.
+            // Return as-is so the consumer's `matchesEncodedOffset`
+            // gate (GzipChunkFetcher.hpp:647) makes a meaningful
+            // accept/reject decision.
+            Ok(c) => return Ok(c),
             Err(e) => {
                 last_err = Some(e);
                 continue;
@@ -945,5 +1014,30 @@ mod tests {
         let (_crc, size) = drive(&deflate, &mut out, 8, cfg).expect("drive");
         assert_eq!(size, payload.len());
         assert_eq!(out, payload);
+    }
+
+    /// Regression for the silesia-large.gz failure caught by `make
+    /// bench-sm`: 4 MiB-compressed chunks crossing partition boundaries
+    /// surface the two-key cache lookup bug. Uses production
+    /// split_chunk_size and an input long enough to span multiple
+    /// chunks.
+    #[test]
+    fn drive_round_trips_60mb_level9_prod_split() {
+        // ~60 MB payload at -9 compresses to ~40 MB → ~10 chunks at the
+        // production 4 MiB spacing. Enough to exercise multiple iter +
+        // partition crossings without exploding test runtime.
+        let payload = b"the quick brown fox jumps over the lazy dog ".repeat(1_500_000);
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(9));
+        enc.write_all(&payload).unwrap();
+        let deflate = enc.finish().unwrap();
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 4 * 1024 * 1024,
+            max_decoded_chunk_size: 20 * 4 * 1024 * 1024,
+            crc32_enabled: true,
+        };
+        let mut out = Vec::new();
+        let (_crc, size) = drive(&deflate, &mut out, 8, cfg).expect("drive");
+        assert_eq!(size, payload.len(), "size mismatch (suggests early break)");
+        assert_eq!(out, payload, "byte mismatch");
     }
 }

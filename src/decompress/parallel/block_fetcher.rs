@@ -187,6 +187,53 @@ where
         Ok(value)
     }
 
+    /// Try to satisfy `block_offset` from caches or the in-flight
+    /// prefetch queue WITHOUT issuing an on-demand submit. Returns
+    /// `Some(Ok(value))` on cache hit, `Some(Ok(value))` after waiting
+    /// on a matched prefetch receiver, `Some(Err(e))` if the matched
+    /// prefetch task errored, or `None` if neither cache nor prefetch
+    /// queue had anything to serve.
+    ///
+    /// Mirror of vendor's `BaseType::test(partitionOffset) &&
+    /// BaseType::get(partitionOffset, ...)` pattern inside
+    /// `GzipChunkFetcher::getBlock` at
+    /// vendor/.../rapidgzip/GzipChunkFetcher.hpp:600-609. Vendor uses
+    /// this to first try the prefetched future keyed under the partition
+    /// offset (where prefetch was submitted) before falling back to
+    /// dispatching a fresh on-demand task at the real `blockOffset`.
+    ///
+    /// On success, the value is inserted into the main cache under the
+    /// original `block_offset` (the partition offset) — matching vendor's
+    /// `BaseType::get(partitionOffset, ...)` at
+    /// GzipChunkFetcher.hpp:602, whose `insertIntoCache(blockOffset, ...)`
+    /// at BlockFetcher.hpp:320 keys under the SAME argument it was called
+    /// with (i.e. partitionOffset). The consumer is responsible for
+    /// running `matchesEncodedOffset(realOffset)` and falling back to
+    /// `BaseType::get(realOffset, ...)` on mismatch
+    /// (GzipChunkFetcher.hpp:646-654). Re-keying under the real offset
+    /// here would pollute the cache: a wrong-range chunk would short-
+    /// circuit the next `get_if_available(realOffset)` check.
+    pub fn try_take_prefetched(&self, block_offset: &Key) -> Option<Result<Value, Err>> {
+        if let Some(v) = self.get_if_available(block_offset) {
+            return Some(Ok(v));
+        }
+        let rx = self.take_prefetch(block_offset)?;
+        // Vendor `queuedResult.get()` at BlockFetcher.hpp:317. A
+        // matched prefetch is in flight — wait on it. Dropping is a
+        // broken-promise panic, same as `get()`.
+        match rx.recv() {
+            Ok(Ok(v)) => {
+                self.insert(block_offset.clone(), v.clone());
+                Some(Ok(v))
+            }
+            Ok(Err(e)) => Some(Err(e)),
+            Err(_) => panic!(
+                "block_fetcher::try_take_prefetched: dispatch worker dropped reply \
+                 (broken promise)"
+            ),
+        }
+    }
+
     /// Like `get`, plus the `prefetchNewBlocks` body interleaved
     /// before and after the on-demand wait. This is the literal
     /// shape of vendor's `BlockFetcher::get` at BlockFetcher.hpp:245-329:
@@ -204,22 +251,33 @@ where
     /// `record_fetch(idx)` to update the strategy. The prefetch
     /// closures match `prefetch_new_blocks` above.
     ///
+    /// `partition_offset_for` mirrors vendor's `getPartitionOffsetFromOffset`
+    /// parameter (BlockFetcher.hpp:240-248). It is consulted in
+    /// `prefetch_new_blocks` to double-key the prefetch map under both
+    /// real and partition offsets (BlockFetcher.hpp:485-489), matching
+    /// vendor exactly.
+    ///
     /// Returns `(value, prefetches_submitted_count)` so the caller can
     /// log / stat-record without re-querying.
-    pub fn get_with_prefetch<S, L, P, F>(
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_with_prefetch<S, L, P, F, PO>(
         &self,
         block_offset: Key,
         submit: S,
         lookup_block_offset: L,
         submit_for_prefetch: P,
         is_finalized_and_index_too_high: F,
+        partition_offset_for: PO,
         should_drive_prefetch: bool,
     ) -> (Result<Value, Err>, usize)
     where
         S: FnOnce(Key) -> Receiver<Result<Value, Err>>,
         L: Fn(usize) -> Option<Key>,
-        P: Fn(Key) -> Receiver<Result<Value, Err>>,
+        // Vendor's prefetch task captures both offset and nextOffset
+        // (BlockFetcher.hpp:555-557). See `prefetch_new_blocks`.
+        P: Fn(Key, Key) -> Receiver<Result<Value, Err>>,
         F: Fn(usize) -> bool,
+        PO: Fn(&Key) -> Key,
     {
         if let Some(v) = self.get_if_available(&block_offset) {
             return (Ok(v), 0);
@@ -244,6 +302,7 @@ where
                 &lookup_block_offset,
                 &submit_for_prefetch,
                 &is_finalized_and_index_too_high,
+                &partition_offset_for,
             );
         }
 
@@ -262,6 +321,7 @@ where
                             &lookup_block_offset,
                             &submit_for_prefetch,
                             &is_finalized_and_index_too_high,
+                            &partition_offset_for,
                         );
                     }
                 }
@@ -438,16 +498,22 @@ where
     ///
     /// Returns the number of new prefetch tasks submitted (for stats /
     /// trace purposes).
-    pub fn prefetch_new_blocks<L, S, F>(
+    pub fn prefetch_new_blocks<L, S, F, PO>(
         &self,
         lookup_block_offset: L,
         submit_for: S,
         is_finalized_and_index_too_high: F,
+        partition_offset_for: PO,
     ) -> usize
     where
         L: Fn(usize) -> Option<Key>,
-        S: Fn(Key) -> Receiver<Result<Value, Err>>,
+        // Mirror of vendor's `decodeAndMeasureBlock(offset, nextOffset)`
+        // capture at BlockFetcher.hpp:555-557 — both the prefetched
+        // block's offset AND the next block's offset are captured in
+        // the worker task closure so the worker knows where to stop.
+        S: Fn(Key, Key) -> Receiver<Result<Value, Err>>,
         F: Fn(usize) -> bool,
+        PO: Fn(&Key) -> Key,
     {
         // BlockFetcher.hpp:463 — processReadyPrefetches(): we don't yet
         // poll-collect ready prefetches into the prefetch_cache because
@@ -504,15 +570,30 @@ where
             };
 
             // BlockFetcher.hpp:536-539 — skip if already cached, in
-            // prefetch queue, or in failed-prefetch list.
+            // prefetch queue, or in failed-prefetch list. Vendor also
+            // checks `isInCacheOrQueue(getPartitionOffsetFromOffset(*prefetchBlockOffset))`
+            // at line 537-538 to avoid double-submitting a prefetch
+            // that was already submitted under its partition offset.
             if self.test(&prefetch_block_offset) || self.is_failed_prefetch(&prefetch_block_offset)
             {
                 continue;
             }
+            let partition_offset = partition_offset_for(&prefetch_block_offset);
+            if partition_offset != prefetch_block_offset && self.test(&partition_offset) {
+                continue;
+            }
+
+            // BlockFetcher.hpp:519-520 — `m_blockFinder->get(idx + 1, ...)`
+            // to compute nextOffset (the worker's stop hint).
+            // BlockFetcher.hpp:535 — drop if nextOffset is missing.
+            let next_prefetch_block_offset = match lookup_block_offset(index + 1) {
+                Some(o) => o,
+                None => continue,
+            };
 
             // BlockFetcher.hpp:553-557 — submit prefetch task.
             self.statistics.base.record_prefetch();
-            let rx = submit_for(prefetch_block_offset.clone());
+            let rx = submit_for(prefetch_block_offset.clone(), next_prefetch_block_offset);
             // BlockFetcher.hpp:558 — `m_prefetching.emplace(offset, std::move(future))`.
             // We bypass `submit_prefetch` here to avoid double-counting
             // record_prefetch (already done above).
