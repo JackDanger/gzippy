@@ -130,6 +130,63 @@ impl<'a> LsbBitReader for super::block_finder::BitReader<'a> {
     }
 }
 
+// --- Adapter for `consume_first_decode::Bits` -----------------------------
+//
+// `deflate_block::Block` drives a `Bits` (the in-tree libdeflate-style bit
+// reader) for both header parsing and the canonical-Huffman fallback. To
+// let the ported `HuffmanCodingSymbolsPerLength::decode` (and any future
+// variant) consume the same bit reader rather than requiring a separate
+// `BitReader`, we expose `Bits` through `LsbBitReader`. The conversion is
+// 1:1 — peek/consume/refill semantics match the vendor's
+// `gzip::BitReader::peek<N>` + `seekAfterPeek` pattern
+// (vendor/.../filereader/BitReader.hpp:222-289). EOF is signalled via the
+// reader's `available()` count rather than an exception (matches the
+// vendor's intent — `EndOfFileReached` thrown when bits are unavailable).
+
+impl<'a> LsbBitReader for super::super::inflate::consume_first_decode::Bits<'a> {
+    #[inline]
+    fn read(&mut self, num_bits: u8) -> Result<u64, BitReaderError> {
+        if num_bits == 0 {
+            return Ok(0);
+        }
+        // Refill if needed (mirrors gzip::BitReader::read's implicit
+        // refill at BitReader.hpp:196-198).
+        if self.available() < num_bits as u32 {
+            self.refill();
+            if self.available() < num_bits as u32 {
+                return Err(BitReaderError::Eof);
+            }
+        }
+        let mask = super::bit_manipulation::n_lowest_bits_set(num_bits);
+        let v = super::super::inflate::consume_first_decode::Bits::peek(self) & mask;
+        self.consume(num_bits as u32);
+        Ok(v)
+    }
+
+    #[inline]
+    fn peek(&mut self, num_bits: u8) -> Result<u64, BitReaderError> {
+        if num_bits == 0 {
+            return Ok(0);
+        }
+        if self.available() < num_bits as u32 {
+            self.refill();
+            if self.available() < num_bits as u32 {
+                return Err(BitReaderError::Eof);
+            }
+        }
+        let mask = super::bit_manipulation::n_lowest_bits_set(num_bits);
+        Ok(super::super::inflate::consume_first_decode::Bits::peek(self) & mask)
+    }
+
+    #[inline]
+    fn seek_after_peek(&mut self, num_bits: u8) {
+        // Vendor: `BitReader::seekAfterPeek(bit_count_t)` advances the
+        // peek cursor by num_bits without re-checking buffer length —
+        // caller is required to have peeked that many bits already.
+        self.consume(num_bits as u32);
+    }
+}
+
 // ============================================================================
 // HuffmanCodingBase (HuffmanCodingBase.hpp:16-213)
 // ============================================================================

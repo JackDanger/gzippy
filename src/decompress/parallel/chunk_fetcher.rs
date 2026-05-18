@@ -75,6 +75,8 @@ use crate::decompress::parallel::block_finder::BlockFinder;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::block_map::{append_subchunks_to_block_map, BlockMap};
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+use crate::decompress::parallel::crc32::CRC32Calculator;
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::gzip_block_finder::{GetReturnCode, GzipBlockFinder};
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::gzip_chunk::{
@@ -239,7 +241,15 @@ pub fn drive<W: std::io::Write>(
     let (job_tx, job_rx) = mpsc::channel::<DecodeJob>();
     let job_rx = Arc::new(std::sync::Mutex::new(job_rx));
 
-    let mut total_crc = crc32fast::Hasher::new();
+    // Mirror of `m_crc32Calculator` (GzipChunkFetcher.hpp:309) — the
+    // running stream CRC, accumulated across chunks via append() so the
+    // gzip footer verification at the end of stream goes through the
+    // ported `CRC32Calculator::verify` surface
+    // (vendor/.../gzip/crc32.hpp:308-319). The polynomial combine in
+    // append() / prepend() goes through `combine_crc32`
+    // (crc32.hpp:214-258) rather than `crc32fast::Hasher::combine` so the
+    // new ports drive production behavior.
+    let mut total_crc = CRC32Calculator::new();
     let mut total_size: usize = 0;
 
     let result = std::thread::scope(|s| -> Result<(), FetchError> {
@@ -292,7 +302,7 @@ pub fn drive<W: std::io::Write>(
         .base
         .set_block_count(block_map.data_block_count(), true);
 
-    let crc = total_crc.finalize();
+    let crc = total_crc.crc32();
     Ok((crc, total_size))
 }
 
@@ -537,7 +547,7 @@ fn consumer_loop<W: std::io::Write>(
     block_map: &BlockMap,
     configuration: ChunkConfiguration,
     pool_size: usize,
-    total_crc: &mut crc32fast::Hasher,
+    total_crc: &mut CRC32Calculator,
     total_size: &mut usize,
 ) -> Result<(), FetchError> {
     let _ = (input, configuration);
@@ -905,8 +915,12 @@ fn consumer_loop<W: std::io::Write>(
         }
 
         // Write bytes, skipping `trim_bytes` leading bytes that belong
-        // to the predecessor's range.
-        let mut written_crc = crc32fast::Hasher::new();
+        // to the predecessor's range. Per-chunk CRC accumulates via the
+        // ported `CRC32Calculator::update` (crc32.hpp:296-303); the
+        // total-stream CRC is then advanced by `append`-ing it (mirror
+        // of `m_crc32Calculator.append( chunkCalculator )` at
+        // vendor/.../GzipChunkFetcher.hpp:340).
+        let mut written_crc = CRC32Calculator::new();
         let mut remaining_skip = trim_bytes;
         if !chunk.data_with_markers.is_empty() {
             let dwm_len = chunk.data_with_markers.len();
@@ -935,7 +949,11 @@ fn consumer_loop<W: std::io::Write>(
                 *total_size += slice.len();
             }
         }
-        total_crc.combine(&written_crc);
+        // Mirror of `m_crc32Calculator.append( chunkCalculator )`
+        // (vendor/.../GzipChunkFetcher.hpp:340). Internally this runs
+        // through `combine_crc32` (crc32.hpp:214-258), the ported
+        // polynomial multiply.
+        total_crc.append(&written_crc);
         expected_start = chunk.encoded_offset_bits + chunk.encoded_size_bits;
         // record_get covers the "consumer pulled chunk idx out of the
         // pipeline" event; mirrors rapidgzip's stats.recordBlockIndexGet

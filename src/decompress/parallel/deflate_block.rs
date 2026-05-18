@@ -13,6 +13,12 @@
 use std::io;
 
 use crate::decompress::inflate::consume_first_decode::Bits;
+// Vendor primitive: `nLowestBitsSet<T>(uint8_t)`
+// (vendor/.../core/BitManipulation.hpp:60-73). Used here to construct
+// extra-bits masks for length/distance/uncompressed-padding reads, so
+// the production deflate header parser drives the ported primitive
+// rather than an inline `(1 << n) - 1`.
+use crate::decompress::parallel::bit_manipulation::n_lowest_bits_set;
 
 // ── Constants (from rapidgzip definitions.hpp) ──────────────────────────────
 
@@ -418,7 +424,10 @@ impl Block {
             // Need to consume bits up to the next byte boundary. Since
             // `bits` is bit-oriented, drain the low bits of the buffer.
             ensure_bits(bits, bits_to_drain)?;
-            let pad = (bits.peek() & ((1u64 << bits_to_drain) - 1)) as u8;
+            // Mirror of vendor `BitReader::read<N>()` masking
+            // (BitReader.hpp:194-209) via the ported
+            // `n_lowest_bits_set` (BitManipulation.hpp:60-73).
+            let pad = (bits.peek() & n_lowest_bits_set(bits_to_drain as u8)) as u8;
             bits.consume(bits_to_drain);
             self.padding = pad;
             if pad != 0 {
@@ -662,6 +671,14 @@ impl Block {
     /// Used only by tests on other arches; the production single-member
     /// parallel path is x86_64+isal-only. Logic identical to the ISA-L
     /// path above.
+    ///
+    /// Decodes via the ported `HuffmanCodingSymbolsPerLength` (vendor
+    /// `vendor/.../huffman/HuffmanCodingSymbolsPerLength.hpp:97-124` —
+    /// `decode<BitReader>`), driven by the `LsbBitReader` adapter that
+    /// `huffman_base.rs` provides for `Bits`. This replaces the prior
+    /// in-tree `build_canonical_table` / `decode_canonical` helpers and
+    /// gives the new ports production correctness coverage on the
+    /// non-x86_64 path (tests in this file exercise both branches).
     #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
     pub fn read_internal_compressed(
         &mut self,
@@ -669,6 +686,8 @@ impl Block {
         output: &mut Vec<u16>,
         n_max_to_decode: usize,
     ) -> Result<usize, BlockError> {
+        use crate::decompress::parallel::huffman_symbols_per_length::HuffmanCodingSymbolsPerLength;
+
         let (litlen_lens, dist_lens) = match self.compression_type {
             CompressionType::DynamicHuffman => {
                 let lit = self.literal_cl[..self.literal_code_count].to_vec();
@@ -681,15 +700,44 @@ impl Block {
             _ => return Err(BlockError::InvalidCompression),
         };
 
-        let litlen_table =
-            build_canonical_table::<MAX_LITERAL_OR_LENGTH_SYMBOLS>(&litlen_lens, 15)?;
-        let dist_table = build_canonical_table::<MAX_DISTANCE_SYMBOL_COUNT>(&dist_lens, 15)?;
+        // Mirror of `Block::initializeHuffmanCoding` (vendor
+        // gzip/deflate.hpp:1112-1156) which instantiates two
+        // `HuffmanCodingISAL`-style decoders. On the non-x86_64 fallback
+        // we use the ported `HuffmanCodingSymbolsPerLength` — the base
+        // canonical decoder rapidgzip's faster variants derive from
+        // (vendor HuffmanCodingSymbolsPerLength.hpp:30-142).
+        // Match vendor `LiteralOrLengthHuffmanCoding`'s
+        // `MAX_LITERAL_OR_LENGTH_SYMBOLS + 2 = 288` instantiation
+        // (vendor/.../gzip/deflate.hpp:196). The `+ 2` accommodates the
+        // RFC 1951 fixed-Huffman tree which sets lengths for the
+        // reserved symbols 286-287; dynamic-block instantiations cap
+        // `literalCodeCount` at 286 so they fit too.
+        let mut litlen_hc: HuffmanCodingSymbolsPerLength<{ MAX_LITERAL_OR_LENGTH_SYMBOLS + 2 }> =
+            HuffmanCodingSymbolsPerLength::new();
+        let err = litlen_hc.initialize_from_lengths(&litlen_lens, true);
+        if err != super::error::Error::None {
+            return Err(BlockError::InvalidCodeLengths);
+        }
+        let mut dist_hc: HuffmanCodingSymbolsPerLength<MAX_DISTANCE_SYMBOL_COUNT> =
+            HuffmanCodingSymbolsPerLength::new();
+        // Distance codes can be sub-optimal (single-code trees etc.);
+        // disable the strict optimality check to match the vendor's
+        // `Block::readDistanceAndLiteralCodings` path which accepts
+        // such trees (deflate.hpp:1085-1090).
+        let err = dist_hc.initialize_from_lengths(&dist_lens, false);
+        if err != super::error::Error::None {
+            return Err(BlockError::InvalidCodeLengths);
+        }
 
         let start_len = output.len();
         let mut emitted: usize = 0;
         while emitted < n_max_to_decode {
-            let (sym, bit_count) = decode_canonical(&litlen_table, 15, bits)?;
-            bits.consume(bit_count);
+            // Mirror of `m_literalHC.decode( bitReader )` at
+            // vendor/.../gzip/deflate.hpp:1551 — the canonical decode
+            // returns None on a stream-level error (EOF or invalid code).
+            let sym = litlen_hc
+                .decode(bits)
+                .ok_or(BlockError::InvalidHuffmanCode)?;
 
             if sym < 256 {
                 output.push(sym);
@@ -706,9 +754,10 @@ impl Block {
             }
             let lidx = (sym - 257) as usize;
             let length = read_length_extra(bits, lidx)?;
-            let (dsym, dbit) = decode_canonical(&dist_table, 15, bits)?;
-            bits.consume(dbit);
-            if dsym as usize >= DISTANCE_BASE.len() {
+            // Mirror of `m_distanceHC.decode( bitReader )` at
+            // deflate.hpp:1565.
+            let dsym = dist_hc.decode(bits).ok_or(BlockError::InvalidHuffmanCode)?;
+            if (dsym as usize) >= DISTANCE_BASE.len() {
                 return Err(BlockError::InvalidHuffmanCode);
             }
             let distance = read_distance_extra(bits, dsym as usize)?;
@@ -788,7 +837,9 @@ fn read_length_extra(bits: &mut Bits, lidx: usize) -> Result<usize, BlockError> 
         ensure_bits(bits, extra)?;
     }
     let extra_val = if extra > 0 {
-        let v = (bits.peek() & ((1u64 << extra) - 1)) as u16;
+        // Mask via ported `n_lowest_bits_set` (vendor
+        // BitManipulation.hpp:60-73) rather than an inline shift.
+        let v = (bits.peek() & n_lowest_bits_set(extra as u8)) as u16;
         bits.consume(extra);
         v
     } else {
@@ -803,7 +854,9 @@ fn read_distance_extra(bits: &mut Bits, dsym: usize) -> Result<usize, BlockError
         ensure_bits(bits, extra)?;
     }
     let extra_val = if extra > 0 {
-        let v = (bits.peek() & ((1u64 << extra) - 1)) as u32;
+        // Mask via ported `n_lowest_bits_set` (vendor
+        // BitManipulation.hpp:60-73) rather than an inline shift.
+        let v = (bits.peek() & n_lowest_bits_set(extra as u8)) as u32;
         bits.consume(extra);
         v
     } else {
@@ -812,9 +865,15 @@ fn read_distance_extra(bits: &mut Bits, dsym: usize) -> Result<usize, BlockError
     Ok(DISTANCE_BASE[dsym] as usize + extra_val as usize)
 }
 
-/// RFC 1951 §3.2.6 fixed Huffman code lengths.
+/// RFC 1951 §3.2.6 fixed Huffman code lengths. Full 288-entry literal
+/// alphabet (symbols 286-287 are reserved/illegal but get code lengths
+/// per the RFC table; the Kraft sum requires their inclusion).
+///
+/// Matches vendor `LiteralOrLengthHuffmanCoding`'s
+/// `MAX_LITERAL_OR_LENGTH_SYMBOLS + 2 = 288` sizing
+/// (vendor/.../gzip/deflate.hpp:196).
 fn fixed_huffman_code_lengths() -> (Vec<u8>, Vec<u8>) {
-    let mut lit = vec![0u8; 288];
+    let mut lit = vec![0u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2];
     for v in &mut lit[0..144] {
         *v = 8;
     }
@@ -824,10 +883,10 @@ fn fixed_huffman_code_lengths() -> (Vec<u8>, Vec<u8>) {
     for v in &mut lit[256..280] {
         *v = 7;
     }
-    for v in &mut lit[280..288] {
+    for v in &mut lit[280..MAX_LITERAL_OR_LENGTH_SYMBOLS + 2] {
         *v = 8;
     }
-    let dist = vec![5u8; 30];
+    let dist = vec![5u8; MAX_DISTANCE_SYMBOL_COUNT];
     (lit, dist)
 }
 
