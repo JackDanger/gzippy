@@ -145,6 +145,11 @@ pub fn combine_crc32(crc1: u32, crc2: u32, byte_stream_length: u64) -> u32 {
 /// through our `combine_crc32` because `crc32fast::Hasher::combine`
 /// builds a fresh Hasher per call — for chunked CRC pipelines, a
 /// constant-time polynomial combine is preferred.
+///
+/// `Clone` + `Debug` mirror what `ChunkData` requires of every field
+/// in its `std::vector<CRC32Calculator>` (ChunkData.hpp:561). The
+/// inner `crc32fast::Hasher` implements both, so the derive is cheap.
+#[derive(Debug, Clone)]
 pub struct CRC32Calculator {
     hasher: Hasher,
     stream_size_in_bytes: u64,

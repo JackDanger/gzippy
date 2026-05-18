@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 
+use crate::decompress::parallel::crc32::CRC32Calculator;
 pub use crate::decompress::parallel::replace_markers::MARKER_BASE;
 
 /// One deflate-block-aligned slice of a chunk's decoded output.
@@ -142,14 +143,22 @@ pub struct ChunkData {
     /// decoder hits a boundary AND `decoded_size >= split_chunk_size`
     /// since the last subchunk.
     pub subchunks: Vec<Subchunk>,
-    /// One CRC32 hasher per gzip stream this chunk spans. For a
+    /// One CRC32 calculator per gzip stream this chunk spans. For a
     /// single-stream chunk (the common case) this is a single-element
     /// vector. Rapidgzip allocates a new entry when an `END_OF_STREAM`
     /// stopping point fires mid-chunk (`ChunkData.hpp:228-243`). The
     /// first entry covers `data_with_markers ++ data[0..footers[0].decoded_end_offset]`
     /// (after `apply_window`); subsequent entries cover the bytes between
     /// consecutive footers.
-    pub crc32s: Vec<crc32fast::Hasher>,
+    ///
+    /// Mirror of `std::vector<CRC32Calculator> crc32s` at
+    /// vendor/rapidgzip/librapidarchive/src/rapidgzip/ChunkData.hpp:561.
+    /// Routed through the ported `CRC32Calculator` so the polynomial
+    /// combine (`append` / `prepend`) goes through the ported
+    /// `combine_crc32` (gzip/crc32.hpp:214-258) — the same code path
+    /// the consumer's `total_crc.append(&written_crc)` uses
+    /// (GzipChunkFetcher.hpp:340).
+    pub crc32s: Vec<CRC32Calculator>,
     /// Footers detected in this chunk, one per gzip stream that ended
     /// inside the chunk's compressed range. Mirror of rapidgzip's
     /// `ChunkData::footers` (ChunkData.hpp:472-489 `appendFooter`).
@@ -188,7 +197,9 @@ impl ChunkData {
             data_with_markers: Vec::new(),
             data: Vec::new(),
             subchunks: vec![first_subchunk],
-            crc32s: vec![crc32fast::Hasher::new()],
+            // Mirror of ChunkData.hpp:561 default-init:
+            // `std::vector<CRC32Calculator>( 1 )`.
+            crc32s: vec![CRC32Calculator::new()],
             footers: Vec::new(),
             stopped_preemptively: false,
             statistics: ChunkStatistics::default(),
@@ -536,11 +547,18 @@ impl ChunkData {
         // [data_with_markers_remaining | clean_tail | original_data]
         // after this method. crc32s[0] currently covers original_data.
         // New crc32s[0] should cover (clean_tail | original_data).
+        //
+        // Mirror of vendor's `crc32s.front().prepend( crc32 )` after
+        // `cleanUnmarkedData` in `ChunkData::finalize`
+        // (vendor/rapidgzip/.../ChunkData.hpp:426-435): build a fresh
+        // CRC32Calculator over the cleaned bytes and `prepend` it onto
+        // the existing front calculator — so the front now covers
+        // (clean_tail ++ original_data). Goes through the ported
+        // `combine_crc32` polynomial multiply.
         if self.configuration.crc32_enabled && !self.crc32s.is_empty() {
-            let mut migrated_crc = crc32fast::Hasher::new();
+            let mut migrated_crc = CRC32Calculator::new();
             migrated_crc.update(&clean_tail);
-            migrated_crc.combine(&self.crc32s[0]);
-            self.crc32s[0] = migrated_crc;
+            self.crc32s[0].prepend(&migrated_crc);
         }
         self.data_with_markers.truncate(split_at);
         let mut new_data = clean_tail;
@@ -613,10 +631,11 @@ impl ChunkData {
             end_bit_offset,
             decoded_end_offset: self.decoded_size(),
         });
-        // Open a fresh hasher for the next stream's bytes. If no more
-        // bytes follow, the trailing empty hasher's CRC == 0 and the
-        // consumer's combine treats it as a no-op.
-        self.crc32s.push(crc32fast::Hasher::new());
+        // Open a fresh calculator for the next stream's bytes. If no
+        // more bytes follow, the trailing empty calculator's CRC == 0
+        // and the consumer's combine treats it as a no-op. Mirror of
+        // vendor's `crc32s.emplace_back()` at ChunkData.hpp:478.
+        self.crc32s.push(CRC32Calculator::new());
     }
 
     /// Called by the decoder when it hits a real deflate block boundary.
@@ -896,7 +915,7 @@ mod tests {
         // CRC of "hello world" — non-zero, deterministic.
         let mut expected = crc32fast::Hasher::new();
         expected.update(b"hello world");
-        assert_eq!(chunk.crc32s[0].clone().finalize(), expected.finalize());
+        assert_eq!(chunk.crc32s[0].crc32(), expected.finalize());
         assert_eq!(chunk.subchunks[0].decoded_size, 11);
     }
 
@@ -986,6 +1005,6 @@ mod tests {
         let mut chunk = ChunkData::new(0, cfg);
         chunk.append_clean(b"hello world");
         // CRC unchanged from identity.
-        assert_eq!(chunk.crc32s[0].clone().finalize(), 0);
+        assert_eq!(chunk.crc32s[0].crc32(), 0);
     }
 }
