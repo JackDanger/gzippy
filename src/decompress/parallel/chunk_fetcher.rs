@@ -418,18 +418,27 @@ fn worker_loop(
 
         let (result, path) = match window {
             Some(w) => {
-                trace::emit(
-                    &label,
-                    "fast_path_start",
-                    &format!(
-                        r#""partition_idx":{},"start_bit":{},"until_bit":{},"authoritative":{},"rss_kib":{}"#,
-                        job.partition_idx,
-                        job.start_bit,
-                        job.until_bit,
-                        job.authoritative,
-                        trace::rss_kib(),
-                    ),
-                );
+                // Gate format!/rss_kib() behind is_enabled() — the vendor
+                // has no equivalent per-worker syscall/string-format on the
+                // hot path. `rss_kib()` reads and parses
+                // `/proc/self/status` on every call, which we evaluate
+                // eagerly before `emit` short-circuits. Skipping the
+                // string-formatting and the syscall when tracing is OFF
+                // makes the worker entry as cheap as the vendor's.
+                if trace::is_enabled() {
+                    trace::emit(
+                        &label,
+                        "fast_path_start",
+                        &format!(
+                            r#""partition_idx":{},"start_bit":{},"until_bit":{},"authoritative":{},"rss_kib":{}"#,
+                            job.partition_idx,
+                            job.start_bit,
+                            job.until_bit,
+                            job.authoritative,
+                            trace::rss_kib(),
+                        ),
+                    );
+                }
                 let r = decode_chunk_with_window(
                     input,
                     job.start_bit,
@@ -440,17 +449,19 @@ fn worker_loop(
                 (r, "fast")
             }
             None => {
-                trace::emit(
-                    &label,
-                    "slow_path_start",
-                    &format!(
-                        r#""partition_idx":{},"start_bit":{},"until_bit":{},"rss_kib":{}"#,
-                        job.partition_idx,
-                        job.start_bit,
-                        job.until_bit,
-                        trace::rss_kib(),
-                    ),
-                );
+                if trace::is_enabled() {
+                    trace::emit(
+                        &label,
+                        "slow_path_start",
+                        &format!(
+                            r#""partition_idx":{},"start_bit":{},"until_bit":{},"rss_kib":{}"#,
+                            job.partition_idx,
+                            job.start_bit,
+                            job.until_bit,
+                            trace::rss_kib(),
+                        ),
+                    );
+                }
                 // Try direct at start_bit first (rapidgzip's tryToDecode
                 // at GzipChunk.hpp:739). If it fails, iterate BlockFinder
                 // candidates inside the worker, up to a 512 KiB scan.
@@ -474,21 +485,23 @@ fn worker_loop(
 
         match &result {
             Ok(c) => {
-                trace::emit(
-                    &label,
-                    "decode_ok",
-                    &format!(
-                        r#""partition_idx":{},"path":"{}","start_bit":{},"end_bit":{},"decoded":{},"markers":{},"clean":{},"preemptive":{},"duration_us":{dur_us}"#,
-                        job.partition_idx,
-                        path,
-                        job.start_bit,
-                        c.encoded_offset_bits + c.encoded_size_bits,
-                        c.decoded_size(),
-                        c.data_with_markers.len(),
-                        c.data.len(),
-                        c.stopped_preemptively,
-                    ),
-                );
+                if trace::is_enabled() {
+                    trace::emit(
+                        &label,
+                        "decode_ok",
+                        &format!(
+                            r#""partition_idx":{},"path":"{}","start_bit":{},"end_bit":{},"decoded":{},"markers":{},"clean":{},"preemptive":{},"duration_us":{dur_us}"#,
+                            job.partition_idx,
+                            path,
+                            job.start_bit,
+                            c.encoded_offset_bits + c.encoded_size_bits,
+                            c.decoded_size(),
+                            c.data_with_markers.len(),
+                            c.data.len(),
+                            c.stopped_preemptively,
+                        ),
+                    );
+                }
                 // Publish tail window if we can do it without waiting
                 // for apply_window. Fast-path chunks always can. Slow-
                 // path chunks whose trailing 32 KiB is in the clean
@@ -509,18 +522,20 @@ fn worker_loop(
                 block_fetcher.statistics.base.record_prefetch();
             }
             Err(e) => {
-                trace::emit(
-                    &label,
-                    "decode_err",
-                    &format!(
-                        r#""partition_idx":{},"path":"{}","start_bit":{},"until_bit":{},"err":"{}","duration_us":{dur_us}"#,
-                        job.partition_idx,
-                        path,
-                        job.start_bit,
-                        job.until_bit,
-                        trace::esc(&format!("{e:?}")),
-                    ),
-                );
+                if trace::is_enabled() {
+                    trace::emit(
+                        &label,
+                        "decode_err",
+                        &format!(
+                            r#""partition_idx":{},"path":"{}","start_bit":{},"until_bit":{},"err":"{}","duration_us":{dur_us}"#,
+                            job.partition_idx,
+                            path,
+                            job.start_bit,
+                            job.until_bit,
+                            trace::esc(&format!("{e:?}")),
+                        ),
+                    );
+                }
                 // Mirror rapidgzip BlockFetcher.hpp:600-620: failed
                 // prefetches are remembered so the consumer doesn't
                 // re-issue at the same key.
@@ -637,16 +652,18 @@ fn consumer_loop<W: std::io::Write>(
                       cache_key: usize|
      -> mpsc::Receiver<Result<ChunkData, ChunkDecodeError>> {
         let (tx, rx) = mpsc::channel();
-        let event = if authoritative {
-            "authoritative_prefetch"
-        } else {
-            "speculative_prefetch"
-        };
-        trace::emit(
-            "consumer",
-            event,
-            &format!(r#""partition_idx":{idx},"start_bit":{start},"until_bit":{until}"#),
-        );
+        if trace::is_enabled() {
+            let event = if authoritative {
+                "authoritative_prefetch"
+            } else {
+                "speculative_prefetch"
+            };
+            trace::emit(
+                "consumer",
+                event,
+                &format!(r#""partition_idx":{idx},"start_bit":{start},"until_bit":{until}"#),
+            );
+        }
         if authoritative {
             block_fetcher.statistics.base.record_on_demand_fetch();
         } else {
@@ -762,13 +779,15 @@ fn consumer_loop<W: std::io::Write>(
                 // `takeFromPrefetchQueue` at BlockFetcher.hpp:385-410.
                 let speculative_chunk: Option<ChunkData> = match slot {
                     Some(s) => {
-                        trace::emit(
-                            "consumer",
-                            "speculative_wait",
-                            &format!(
-                                r#""partition_idx":{idx},"expected_start":{expected_start}"#
-                            ),
-                        );
+                        if trace::is_enabled() {
+                            trace::emit(
+                                "consumer",
+                                "speculative_wait",
+                                &format!(
+                                    r#""partition_idx":{idx},"expected_start":{expected_start}"#
+                                ),
+                            );
+                        }
                         let spec_result = match s.rx.recv() {
                             Ok(r) => r,
                             Err(_) => {
@@ -789,15 +808,17 @@ fn consumer_loop<W: std::io::Write>(
                                 if c.matches_encoded_offset(expected_start)
                                     && c.decoded_offset_for(expected_start).is_some()
                                 {
-                                    trace::emit(
-                                        "consumer",
-                                        "speculative_hit",
-                                        &format!(
-                                            r#""partition_idx":{idx},"expected_start":{expected_start},"seed":{},"actual":{}"#,
-                                            c.encoded_offset_bits,
-                                            c.max_encoded_offset_bits,
-                                        ),
-                                    );
+                                    if trace::is_enabled() {
+                                        trace::emit(
+                                            "consumer",
+                                            "speculative_hit",
+                                            &format!(
+                                                r#""partition_idx":{idx},"expected_start":{expected_start},"seed":{},"actual":{}"#,
+                                                c.encoded_offset_bits,
+                                                c.max_encoded_offset_bits,
+                                            ),
+                                        );
+                                    }
                                     block_fetcher
                                         .statistics
                                         .base
@@ -810,15 +831,17 @@ fn consumer_loop<W: std::io::Write>(
                                     }
                                     Some(c)
                                 } else {
-                                    trace::emit(
-                                        "consumer",
-                                        "speculative_miss",
-                                        &format!(
-                                            r#""partition_idx":{idx},"expected_start":{expected_start},"seed":{},"actual":{}"#,
-                                            c.encoded_offset_bits,
-                                            c.max_encoded_offset_bits,
-                                        ),
-                                    );
+                                    if trace::is_enabled() {
+                                        trace::emit(
+                                            "consumer",
+                                            "speculative_miss",
+                                            &format!(
+                                                r#""partition_idx":{idx},"expected_start":{expected_start},"seed":{},"actual":{}"#,
+                                                c.encoded_offset_bits,
+                                                c.max_encoded_offset_bits,
+                                            ),
+                                        );
+                                    }
                                     block_fetcher.statistics.base.record_prefetch_cache_miss();
                                     None
                                 }
@@ -830,14 +853,16 @@ fn consumer_loop<W: std::io::Write>(
                                 if idx == 0 {
                                     return Err(e);
                                 }
-                                trace::emit(
-                                    "consumer",
-                                    "speculative_err",
-                                    &format!(
-                                        r#""partition_idx":{idx},"expected_start":{expected_start},"err":"{}""#,
-                                        trace::esc(&format!("{e:?}")),
-                                    ),
-                                );
+                                if trace::is_enabled() {
+                                    trace::emit(
+                                        "consumer",
+                                        "speculative_err",
+                                        &format!(
+                                            r#""partition_idx":{idx},"expected_start":{expected_start},"err":"{}""#,
+                                            trace::esc(&format!("{e:?}")),
+                                        ),
+                                    );
+                                }
                                 block_fetcher.statistics.base.record_prefetch_cache_miss();
                                 None
                             }
@@ -892,14 +917,16 @@ fn consumer_loop<W: std::io::Write>(
         // decoded zero compressed bits at `expected_start` — the
         // deflate stream has ended.
         if chunk.encoded_size_bits == 0 {
-            trace::emit(
-                "consumer",
-                "eof_terminate",
-                &format!(
-                    r#""partition_idx":{idx},"expected_start":{expected_start},"total_size":{}"#,
-                    *total_size,
-                ),
-            );
+            if trace::is_enabled() {
+                trace::emit(
+                    "consumer",
+                    "eof_terminate",
+                    &format!(
+                        r#""partition_idx":{idx},"expected_start":{expected_start},"total_size":{}"#,
+                        *total_size,
+                    ),
+                );
+            }
             break;
         }
 
@@ -924,21 +951,28 @@ fn consumer_loop<W: std::io::Write>(
                     requested: window_key,
                     actual: expected_start,
                 }))?;
-            let aw_t0 = std::time::Instant::now();
+            let trace_on = trace::is_enabled();
+            let aw_t0 = if trace_on {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let marker_count = chunk.data_with_markers.len();
             apply_window(&mut chunk, &window[..]);
             // Literal port of `appendSubchunksToIndexes` window
             // emplacement (vendor/.../GzipChunkFetcher.hpp:430-458):
             // each subchunk gets its 32 KiB resume-window populated.
             chunk.populate_subchunk_windows(&window[..]);
-            trace::emit(
-                "consumer",
-                "apply_window_done",
-                &format!(
-                    r#""partition_idx":{idx},"marker_bytes":{marker_count},"duration_us":{}"#,
-                    aw_t0.elapsed().as_micros()
-                ),
-            );
+            if let Some(t0) = aw_t0 {
+                trace::emit(
+                    "consumer",
+                    "apply_window_done",
+                    &format!(
+                        r#""partition_idx":{idx},"marker_bytes":{marker_count},"duration_us":{}"#,
+                        t0.elapsed().as_micros()
+                    ),
+                );
+            }
             if let Some(tail) = chunk.last_32kib_window() {
                 let end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
                 window_map.insert(end_bit, Arc::new(tail));
@@ -1040,15 +1074,17 @@ fn consumer_loop<W: std::io::Write>(
         block_fetcher.statistics.base.record_get();
         #[cfg(any(test, debug_assertions))]
         BLOCK_FETCHER_GETS_OBSERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let trace_decoded = chunk.decoded_size();
-        trace::emit(
-            "consumer",
-            "consume_done",
-            &format!(
-                r#""partition_idx":{idx},"end_bit":{expected_start},"decoded":{trace_decoded},"trim_bytes":{trim_bytes},"rss_kib":{}"#,
-                trace::rss_kib(),
-            ),
-        );
+        if trace::is_enabled() {
+            let trace_decoded = chunk.decoded_size();
+            trace::emit(
+                "consumer",
+                "consume_done",
+                &format!(
+                    r#""partition_idx":{idx},"end_bit":{expected_start},"decoded":{trace_decoded},"trim_bytes":{trim_bytes},"rss_kib":{}"#,
+                    trace::rss_kib(),
+                ),
+            );
+        }
         // Insert the fully-processed chunk into BlockFetcher's main
         // cache for potential future random-access replay. Mirror of
         // rapidgzip's `insertIntoCache` after consumer completion at
