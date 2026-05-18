@@ -566,6 +566,130 @@ impl ChunkData {
         self.data = new_data;
     }
 
+    /// Resolve the trailing 32 KiB of this chunk's decoded output —
+    /// the "tail window" required to seed the successor chunk's
+    /// decoder. Mirrors `rapidgzip::deflate::DecodedData::getLastWindow`
+    /// (vendor/.../DecodedData.hpp:394-398), which forwards to
+    /// `getWindowAt(previousWindow, size())` (DecodedData.hpp:401-490).
+    ///
+    /// Unlike `apply_window` + `populate_subchunk_windows`, this only
+    /// touches the LAST 32 KiB of the concatenated
+    /// `(previousWindow | dataWithMarkers | data)` view, then maps any
+    /// markers in that tail through `MapMarkers` (MarkerReplacement.hpp:15-46).
+    /// Cost is O(W) regardless of chunk size — designed to run
+    /// synchronously on the consumer thread so the tail window can be
+    /// published to the `WindowMap` BEFORE the (much slower) full
+    /// `applyWindow` task is queued. This mirrors the consumer's
+    /// critical-path split at
+    /// `GzipChunkFetcher::queueChunkForPostProcessing`
+    /// (vendor/.../GzipChunkFetcher.hpp:553-583), where line 572 calls
+    /// `chunkData->getLastWindow( *previousWindow )` on the consumer
+    /// thread and line 579 enqueues the actual `applyWindow` to the
+    /// thread pool via `submitTaskWithHighPriority`.
+    ///
+    /// `predecessor_window` must be exactly 32 KiB. (The vendor allows
+    /// shorter previousWindow at start-of-stream — represented in
+    /// gzippy by chunk 0's all-zero `[u8; 32768]` seed in
+    /// `chunk_fetcher::drive` — so we keep the same width invariant
+    /// here and let the caller pad with zeros.)
+    pub fn get_last_window(&self, predecessor_window: &[u8]) -> [u8; 32768] {
+        const W: usize = 32768;
+        debug_assert_eq!(
+            predecessor_window.len(),
+            W,
+            "get_last_window requires a full 32 KiB predecessor window \
+             (vendor DecodedData.hpp:402: `DecodedVector window( MAX_WINDOW_SIZE )`)"
+        );
+
+        // Direct port of `getWindowAt(previousWindow, skipBytes = size())`
+        // (vendor/.../DecodedData.hpp:401-490). We want the last W bytes
+        // of the concatenated view (predecessor_window | dataWithMarkers | data),
+        // so `skip_bytes == decoded_size()`. The vendor's two-arm copy
+        // (prefilled-from-previousWindow then copyFromDataWithMarkers
+        // then data) collapses for `skip_bytes == size()` into:
+        //   - if decoded_size < W: take the trailing (W - decoded_size)
+        //     bytes of predecessor_window into the head of the window,
+        //     then ALL of dataWithMarkers (mapped) and data into the tail.
+        //   - else: take only the last W bytes of (dataWithMarkers | data),
+        //     mapping any marker we land on through MapMarkers.
+        let dwm_len = self.data_with_markers.len();
+        let data_len = self.data.len();
+        let total = dwm_len + data_len;
+
+        let mut window = [0u8; W];
+
+        if total >= W {
+            // Last W bytes are entirely inside (dataWithMarkers | data).
+            // Compute absolute start `s` in [0, total) such that s + W = total.
+            // Then translate to per-segment offsets.
+            //
+            // Vendor parity: DecodedData.hpp:439:
+            //   `offset = skipBytes - remainingBytes;`
+            // where `skipBytes == size()` and `remainingBytes == W` here,
+            // so `offset = total - W`. The subsequent loops walk
+            // dataWithMarkers then data with that initial offset
+            // (vendor lines 445-485).
+            let mut offset = total - W; // start within (dwm | data)
+            let mut written: usize = 0;
+
+            // Segment 1: from dataWithMarkers, mapping markers.
+            // Vendor DecodedData.hpp:445-469 (`copyFromDataWithMarkers`).
+            // The C++ has separate FULL_WINDOW true/false specializations
+            // (lines 465-469) for whether previousWindow itself is full
+            // 32 KiB — we always pass a full window so the FULL_WINDOW=true
+            // branch applies (vendor MarkerReplacement.hpp:15-46 dispatch
+            // skips the bounds-check on `value - MAX_WINDOW_SIZE`).
+            if offset < dwm_len {
+                let take = (dwm_len - offset).min(W - written);
+                for i in 0..take {
+                    let v = self.data_with_markers[offset + i];
+                    // MapMarkers semantics (vendor MarkerReplacement.hpp:24-42):
+                    //   value <= 0xFF → literal byte
+                    //   value >= MAX_WINDOW_SIZE → predecessor_window[v - MAX_WINDOW_SIZE]
+                    //   else (0x100..MAX_WINDOW_SIZE) → invalid
+                    window[written + i] = if v >= MARKER_BASE {
+                        predecessor_window[(v - MARKER_BASE) as usize]
+                    } else {
+                        v as u8
+                    };
+                }
+                written += take;
+                offset = 0;
+            } else {
+                offset -= dwm_len;
+            }
+
+            // Segment 2: from data (already clean bytes).
+            // Vendor DecodedData.hpp:471-485.
+            if written < W && offset < data_len {
+                let take = (data_len - offset).min(W - written);
+                window[written..written + take].copy_from_slice(&self.data[offset..offset + take]);
+                written += take;
+            }
+            debug_assert_eq!(written, W, "get_last_window underran the tail buffer");
+        } else {
+            // total < W: window head comes from predecessor_window's tail.
+            // Vendor DecodedData.hpp:411-434 (`if ( skipBytes < MAX_WINDOW_SIZE )`).
+            let from_prev = W - total;
+            window[..from_prev].copy_from_slice(&predecessor_window[total..]);
+            let mut written = from_prev;
+
+            // Then ALL of dataWithMarkers, mapped through MapMarkers.
+            for v in &self.data_with_markers {
+                window[written] = if *v >= MARKER_BASE {
+                    predecessor_window[(*v - MARKER_BASE) as usize]
+                } else {
+                    *v as u8
+                };
+                written += 1;
+            }
+            // Then ALL of data.
+            window[written..written + data_len].copy_from_slice(&self.data);
+        }
+
+        window
+    }
+
     /// Populate the `window` field of every subchunk with the 32 KiB
     /// window required to resume decode at that subchunk's start.
     /// Must be called AFTER `apply_window` resolves markers — the
@@ -1033,6 +1157,86 @@ mod tests {
         assert_eq!(chunk.decoded_offset_for(0), Some(0));
         assert_eq!(chunk.decoded_offset_for(2000), Some(200));
         assert_eq!(chunk.decoded_offset_for(1234), None);
+    }
+
+    #[test]
+    fn get_last_window_matches_apply_window_tail_when_total_exceeds_w() {
+        // Sanity: get_last_window must produce the same trailing 32 KiB
+        // as running apply_window + reading the last 32 KiB of the
+        // resolved (dwm | data). This is the property
+        // populate_subchunk_windows + apply_window jointly rely on; if
+        // get_last_window disagreed, the successor chunk's dict would
+        // diverge from rapidgzip.
+        const W: usize = 32768;
+        let mut prev = [0u8; W];
+        for (i, b) in prev.iter_mut().enumerate() {
+            *b = (i & 0xff) as u8;
+        }
+
+        let mut chunk_a = ChunkData::new(0, small_config());
+        // ~40 KiB total so trailing 32 KiB sits inside (dwm | data).
+        // 8 KiB of markers (some literal, some back-refs into prev),
+        // then 32 KiB of clean bytes.
+        let mut markers: Vec<u16> = Vec::with_capacity(8192);
+        for i in 0..8192 {
+            if i % 3 == 0 {
+                markers.push(MARKER_BASE + (i as u16 % 1024));
+            } else {
+                markers.push((i & 0xff) as u16);
+            }
+        }
+        chunk_a.append_markered(&markers);
+        let mut clean = vec![0u8; W];
+        for (i, b) in clean.iter_mut().enumerate() {
+            *b = ((i.wrapping_mul(31)) & 0xff) as u8;
+        }
+        chunk_a.append_clean(&clean);
+
+        // Reference: apply_window + take last 32 KiB.
+        let mut chunk_b = chunk_a.clone();
+        crate::decompress::parallel::apply_window::apply_window(&mut chunk_b, &prev);
+        let mut reference = [0u8; W];
+        // total > W so reference is the last W bytes of (dwm | data).
+        let dwm_b_len = chunk_b.data_with_markers.len();
+        let total_b = dwm_b_len + chunk_b.data.len();
+        let start = total_b - W;
+        let mut written = 0;
+        if start < dwm_b_len {
+            let take = (dwm_b_len - start).min(W);
+            for (i, slot) in reference.iter_mut().enumerate().take(take) {
+                *slot = chunk_b.data_with_markers[start + i] as u8;
+            }
+            written += take;
+            reference[written..].copy_from_slice(&chunk_b.data[..W - written]);
+        } else {
+            let off = start - dwm_b_len;
+            reference.copy_from_slice(&chunk_b.data[off..off + W]);
+        }
+
+        let tail = chunk_a.get_last_window(&prev);
+        assert_eq!(&tail[..], &reference[..]);
+    }
+
+    #[test]
+    fn get_last_window_handles_total_smaller_than_w() {
+        // total < W → window head is `predecessor_window`'s tail.
+        // Mirror of vendor DecodedData.hpp:411-434.
+        const W: usize = 32768;
+        let mut prev = [0u8; W];
+        for (i, b) in prev.iter_mut().enumerate() {
+            *b = (i & 0xff) as u8;
+        }
+
+        let mut chunk = ChunkData::new(0, small_config());
+        // 100 bytes of clean output → total = 100 < W.
+        let clean = vec![0xABu8; 100];
+        chunk.append_clean(&clean);
+
+        let tail = chunk.get_last_window(&prev);
+        // Head: prev[100..] should occupy window[..W-100].
+        assert_eq!(&tail[..W - 100], &prev[100..]);
+        // Tail: all 0xAB.
+        assert!(tail[W - 100..].iter().all(|b| *b == 0xAB));
     }
 
     #[test]

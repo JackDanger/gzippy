@@ -180,6 +180,48 @@ struct DecodeJob {
     reply: mpsc::Sender<Result<ChunkData, ChunkDecodeError>>,
 }
 
+/// One unit of post-processing work submitted to the pool. Mirror of
+/// rapidgzip's lambda enqueued via `submitTaskWithHighPriority` at
+/// `GzipChunkFetcher::queueChunkForPostProcessing`
+/// (vendor/.../GzipChunkFetcher.hpp:577-583), which calls
+/// `chunkData->applyWindow( *window, chunkData->windowCompressionType() )`.
+/// Our task additionally calls `populate_subchunk_windows` (the gzippy
+/// equivalent of vendor's per-subchunk window emplacement at
+/// GzipChunkFetcher.hpp:430-458, which vendor also produces inside the
+/// applyWindow path via `chunkData->getWindowAt(...)`).
+///
+/// The tail window has ALREADY been computed via
+/// `ChunkData::get_last_window` and inserted into the `WindowMap` on
+/// the consumer thread BEFORE this job is enqueued — vendor parity at
+/// GzipChunkFetcher.hpp:558-575 (the `m_windowMap->emplace(...)` calls
+/// at lines 570 + 572-573 run before the `submitTaskWithHighPriority`
+/// at line 579).
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+struct PostProcessJob {
+    partition_idx: usize,
+    chunk: ChunkData,
+    predecessor_window: Arc<[u8; 32768]>,
+    /// Window map the job will use to publish per-subchunk windows
+    /// AFTER `populate_subchunk_windows` runs. Mirror of vendor's
+    /// per-subchunk emplacement at
+    /// `appendSubchunksToIndexes` (GzipChunkFetcher.hpp:430-458). The
+    /// tail window has already been published on the consumer thread
+    /// via `get_last_window`; this only emplaces interior subchunk
+    /// resume-windows.
+    window_map: WindowMap,
+    reply: mpsc::Sender<ChunkData>,
+}
+
+/// Job variant on the unified work channel. Workers receive `Job`,
+/// dispatch on the variant. One pool, two work classes — vendor's
+/// `submitTask` / `submitTaskWithHighPriority` collapse to the same
+/// `BS::thread_pool` instance, so we keep that 1:1.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+enum Job {
+    Decode(DecodeJob),
+    PostProcess(PostProcessJob),
+}
+
 /// Public driver function. Replaces the old `GzipChunkFetcher` struct
 /// API with a single entry point: decompress the entire raw deflate
 /// stream, writing output bytes to `writer`, and returning the per-
@@ -238,7 +280,7 @@ pub fn drive<W: std::io::Write>(
         ));
     let block_map = Arc::new(BlockMap::new());
 
-    let (job_tx, job_rx) = mpsc::channel::<DecodeJob>();
+    let (job_tx, job_rx) = mpsc::channel::<Job>();
     let job_rx = Arc::new(std::sync::Mutex::new(job_rx));
 
     // Mirror of `m_crc32Calculator` (GzipChunkFetcher.hpp:309) — the
@@ -373,22 +415,98 @@ fn decode_or_iterate(
     }))
 }
 
+/// Worker-side execution of a `PostProcessJob`. Mirror of the lambda
+/// body at `GzipChunkFetcher::queueChunkForPostProcessing`
+/// (vendor/.../GzipChunkFetcher.hpp:579-582):
+///
+///     this->submitTaskWithHighPriority(
+///         [chunkData, window = std::move( previousWindow )] () {
+///             chunkData->applyWindow( *window, chunkData->windowCompressionType() );
+///         } )
+///
+/// Runs `apply_window` (resolves cross-chunk markers + folds resolved
+/// bytes' CRC into the chunk's per-stream calculator), then
+/// `populate_subchunk_windows` (per-subchunk 32 KiB resume windows),
+/// then ships the processed chunk back to the consumer via `reply`.
+/// All output-write + stream-CRC combine work stays on the consumer
+/// thread because both are order-dependent.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+fn run_post_process_job(mut job: PostProcessJob) {
+    let trace_on = trace::is_enabled();
+    let t0 = if trace_on {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let marker_count = job.chunk.data_with_markers.len();
+
+    // Vendor parity: `chunkData->applyWindow(*window, ...)` at
+    // vendor/.../GzipChunkFetcher.hpp:581.
+    apply_window(&mut job.chunk, &job.predecessor_window[..]);
+    // Per-subchunk windows are derived from the chunk's own resolved
+    // output prefixed by the predecessor's tail. Vendor produces these
+    // either inside `applyWindow` (vendor ChunkData.hpp:333-366) via
+    // `getWindowAt(window, decodedOffsetInBlock)` or, for skipped
+    // subchunks, in `appendSubchunksToIndexes`
+    // (GzipChunkFetcher.hpp:443-446 `getWindowAt(lastWindow, ...)`).
+    // gzippy collapses both into one explicit call here so the consumer
+    // never touches markers.
+    job.chunk
+        .populate_subchunk_windows(&job.predecessor_window[..]);
+
+    // Per-subchunk windows: publish so future workers waiting on an
+    // intermediate subchunk's bit position can fast-path. Mirror of
+    // rapidgzip's per-subchunk WindowMap emplacement
+    // (GzipChunkFetcher.hpp:430-458). The TAIL window has already been
+    // published by the consumer thread via `get_last_window` BEFORE
+    // this job was enqueued (vendor lines 558-575).
+    for sc in &job.chunk.subchunks {
+        if let Some(ref w) = sc.window {
+            let sc_end_bit = sc.encoded_offset_bits + sc.encoded_size_bits;
+            if sc_end_bit > sc.encoded_offset_bits {
+                job.window_map.insert(sc_end_bit, w.clone());
+            }
+        }
+    }
+
+    if let Some(t) = t0 {
+        trace::emit(
+            "postprocess",
+            "apply_window_done",
+            &format!(
+                r#""partition_idx":{},"marker_bytes":{marker_count},"duration_us":{}"#,
+                job.partition_idx,
+                t.elapsed().as_micros()
+            ),
+        );
+    }
+    let _ = job.reply.send(job.chunk);
+}
+
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 fn worker_loop(
     input: &[u8],
-    job_rx: Arc<std::sync::Mutex<mpsc::Receiver<DecodeJob>>>,
+    job_rx: Arc<std::sync::Mutex<mpsc::Receiver<Job>>>,
     window_map: WindowMap,
     block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive>,
     configuration: ChunkConfiguration,
 ) {
     loop {
         // Pull one job. Mutex serializes only the recv() — the actual
-        // decode runs in parallel across workers.
+        // decode/post-process runs in parallel across workers.
         let job = {
             let rx = job_rx.lock().unwrap();
             match rx.recv() {
                 Ok(j) => j,
                 Err(_) => return, // sender dropped → shutdown
+            }
+        };
+
+        let job = match job {
+            Job::Decode(d) => d,
+            Job::PostProcess(p) => {
+                run_post_process_job(p);
+                continue;
             }
         };
 
@@ -670,14 +788,49 @@ fn consumer_loop<W: std::io::Write>(
             block_fetcher.note_prefetch_started(cache_key);
         }
         job_tx
-            .send(DecodeJob {
+            .send(Job::Decode(DecodeJob {
                 partition_idx: idx,
                 start_bit: start,
                 until_bit: until,
                 authoritative,
                 cache_key,
                 reply: tx,
-            })
+            }))
+            .expect("worker pool dropped");
+        rx
+    };
+
+    // ── Post-process job dispatch (vendor parity) ──────────────────────
+    // Mirror of `queueChunkForPostProcessing`
+    // (vendor/.../GzipChunkFetcher.hpp:553-583). The caller MUST have
+    // already inserted the chunk's TAIL window into the WindowMap via
+    // `ChunkData::get_last_window` (vendor lines 558-575) BEFORE
+    // calling this helper — that is the critical-path step that lets
+    // downstream chunk workers unblock while this chunk's apply_window
+    // is still queued.
+    let submit_post_process = |idx: usize,
+                               chunk: ChunkData,
+                               predecessor_window: Arc<[u8; 32768]>|
+     -> mpsc::Receiver<ChunkData> {
+        let (tx, rx) = mpsc::channel();
+        if trace::is_enabled() {
+            trace::emit(
+                "consumer",
+                "post_process_dispatch",
+                &format!(
+                    r#""partition_idx":{idx},"markers":{}"#,
+                    chunk.data_with_markers.len(),
+                ),
+            );
+        }
+        job_tx
+            .send(Job::PostProcess(PostProcessJob {
+                partition_idx: idx,
+                chunk,
+                predecessor_window,
+                window_map: window_map.clone(),
+                reply: tx,
+            }))
             .expect("worker pool dropped");
         rx
     };
@@ -727,6 +880,24 @@ fn consumer_loop<W: std::io::Write>(
     // start. Vendor avoids this by advancing the index by subchunks.size(),
     // which is what we do here.
     let mut next_block_index: usize = 0;
+
+    // ── Post-process pending queue (vendor parity) ────────────────────
+    //
+    // `pending` holds chunks awaiting their write-to-output step. Order
+    // is encoded order (push_back on dispatch, pop_front on drain).
+    // `post_process_inflight_cap` bounds how many post-process jobs are
+    // allowed to be in flight simultaneously — anything beyond that
+    // forces a drain on the oldest. We size it to `pool_size` so the
+    // entire worker pool can be saturated with apply_window tasks while
+    // the consumer is still acquiring downstream decoded chunks. Mirror
+    // of vendor's `m_markersBeingReplaced` map +
+    // `waitForReplacedMarkers` driving behavior
+    // (vendor/.../GzipChunkFetcher.hpp:267-518), where the same pool
+    // accepts both decode tasks and `applyWindow` tasks and the
+    // consumer's wait is implicit through the per-chunk future.
+    let mut pending: std::collections::VecDeque<PendingWrite> =
+        std::collections::VecDeque::with_capacity(pool_size * 2);
+    let post_process_inflight_cap = pool_size;
 
     for idx in 0..n_partitions {
         // Update FetchingStrategy (rapidgzip BlockFetcher.hpp:280-282).
@@ -932,8 +1103,22 @@ fn consumer_loop<W: std::io::Write>(
 
         let trim_bytes = chunk.decoded_offset_for(expected_start).unwrap_or(0);
 
-        // Process the chunk: apply_window if markers; write bytes;
-        // combine CRC; publish tail window.
+        // ── Vendor-parity tail-window publication (critical path) ─────
+        //
+        // Mirror of rapidgzip's `getLastWindow` + `WindowMap::emplace`
+        // pair at `GzipChunkFetcher::queueChunkForPostProcessing`
+        // (vendor/.../GzipChunkFetcher.hpp:553-575). The tail window is
+        // computed synchronously on the consumer thread (O(W) work) so
+        // that the successor chunk's worker — which may already be
+        // running speculatively — can unblock IMMEDIATELY, BEFORE this
+        // chunk's full `applyWindow` runs on a worker thread (vendor
+        // line 579: `submitTaskWithHighPriority(... applyWindow ...)`).
+        //
+        // Without this split, `applyWindow` ran synchronously on the
+        // consumer thread and serialised the entire pipeline behind the
+        // O(N) marker resolution + per-subchunk window population. The
+        // bench-sm gap from rapidgzip (442 MB/s vs 1349 MB/s) was
+        // dominated by this serialisation.
         //
         // Window lookup is keyed by the ACTUAL decode start
         // (max_encoded_offset_bits), not the requested seed
@@ -942,7 +1127,8 @@ fn consumer_loop<W: std::io::Write>(
         // markers in the leading region are back-refs into bytes ending
         // at compressed position `actual`. Predecessor publishes its
         // tail at its actual_end, which on a hit equals our `actual`.
-        let mut chunk = chunk;
+        let chunk_end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+        let predecessor_window: Option<Arc<[u8; 32768]>>;
         if !chunk.data_with_markers.is_empty() {
             let window_key = chunk.max_encoded_offset_bits;
             let window = window_map
@@ -951,70 +1137,32 @@ fn consumer_loop<W: std::io::Write>(
                     requested: window_key,
                     actual: expected_start,
                 }))?;
-            let trace_on = trace::is_enabled();
-            let aw_t0 = if trace_on {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            let marker_count = chunk.data_with_markers.len();
-            apply_window(&mut chunk, &window[..]);
-            // Literal port of `appendSubchunksToIndexes` window
-            // emplacement (vendor/.../GzipChunkFetcher.hpp:430-458):
-            // each subchunk gets its 32 KiB resume-window populated.
-            chunk.populate_subchunk_windows(&window[..]);
-            if let Some(t0) = aw_t0 {
-                trace::emit(
-                    "consumer",
-                    "apply_window_done",
-                    &format!(
-                        r#""partition_idx":{idx},"marker_bytes":{marker_count},"duration_us":{}"#,
-                        t0.elapsed().as_micros()
-                    ),
-                );
-            }
-            if let Some(tail) = chunk.last_32kib_window() {
-                let end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-                window_map.insert(end_bit, Arc::new(tail));
-            }
-            // Publish per-subchunk windows so future workers waiting on
-            // an intermediate subchunk's bit position can fast-path.
-            // Mirrors rapidgzip's per-subchunk WindowMap emplacement
-            // (GzipChunkFetcher.hpp:430-458).
-            for sc in &chunk.subchunks {
-                if let Some(ref w) = sc.window {
-                    let sc_end_bit = sc.encoded_offset_bits + sc.encoded_size_bits;
-                    if sc_end_bit > sc.encoded_offset_bits {
-                        window_map.insert(sc_end_bit, w.clone());
-                    }
-                }
-            }
+            // Vendor parity: lines 558-574 — if the chunk's tail position
+            // (`windowOffset`) is not already in the map, compute it via
+            // `getLastWindow(*previousWindow)` and emplace it (with
+            // `CompressionType::NONE` — vendor doesn't compress the
+            // critical-path window). We always emplace because the
+            // worker's `last_32kib_window()` shortcut only fires for the
+            // all-clean case (which doesn't enter this branch).
+            let tail = chunk.get_last_window(&window[..]);
+            window_map.insert(chunk_end_bit, Arc::new(tail));
+            predecessor_window = Some(window);
+        } else {
+            // No markers → tail already published by the decode worker
+            // via `last_32kib_window()` (workers do this before sending
+            // their reply, see `worker_loop`'s `Ok(c)` branch).
+            predecessor_window = None;
         }
 
-        // Push subchunks into the BlockMap — literal port of
-        // `appendSubchunksToIndexes` at GzipChunkFetcher.hpp:371-375.
-        // The map is the random-access index keyed by encoded bit
-        // offset; sequential streaming doesn't consult it but
-        // maintaining it preserves rapidgzip's semantics.
+        // Bookkeeping that does NOT depend on apply_window. Push
+        // subchunks into the BlockMap (literal port of
+        // `appendSubchunksToIndexes` at GzipChunkFetcher.hpp:371-375)
+        // and promote subchunk-end positions to confirmed offsets in
+        // the partitioner (literal port of vendor line 374,
+        // `m_blockFinder->insert(...)`).
         append_subchunks_to_block_map(block_map, &chunk);
-
-        // Promote each subchunk's end position to a confirmed offset in
-        // the partitioner. Literal port of
-        // vendor/rapidgzip/.../GzipChunkFetcher.hpp:374
-        // (`m_blockFinder->insert(subchunk.encodedOffset + subchunk.encodedSize)`).
-        // The next partition's `get(idx+1)` query will now return this
-        // confirmed boundary instead of a spacing-aligned guess —
-        // closing the partitioner-feedback loop that the static-vec
-        // approach lacked. `insert(past_eof)` is a documented no-op
-        // (GzipBlockFinder.hpp:228-231), so the final subchunk's end is
-        // safely absorbed.
         if chunk.subchunks.is_empty() {
-            // Whole-chunk insert when there are no recorded subchunks
-            // (rapidgzip always emits at least one; gzippy's empty-vec
-            // case is defensive — the chunk's reported total is the
-            // single boundary).
-            let actual_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-            block_finder.insert(actual_end);
+            block_finder.insert(chunk_end_bit);
             #[cfg(any(test, debug_assertions))]
             GZIP_BLOCK_FINDER_INSERTS_OBSERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else {
@@ -1027,91 +1175,58 @@ fn consumer_loop<W: std::io::Write>(
             }
         }
 
-        // Write bytes, skipping `trim_bytes` leading bytes that belong
-        // to the predecessor's range. Per-chunk CRC accumulates via the
-        // ported `CRC32Calculator::update` (crc32.hpp:296-303); the
-        // total-stream CRC is then advanced by `append`-ing it (mirror
-        // of `m_crc32Calculator.append( chunkCalculator )` at
-        // vendor/.../GzipChunkFetcher.hpp:340).
-        let mut written_crc = CRC32Calculator::new();
-        let mut remaining_skip = trim_bytes;
-        if !chunk.data_with_markers.is_empty() {
-            let dwm_len = chunk.data_with_markers.len();
-            let skip_in_dwm = remaining_skip.min(dwm_len);
-            remaining_skip -= skip_in_dwm;
-            if skip_in_dwm < dwm_len {
-                let mut narrowed: Vec<u8> = Vec::with_capacity(dwm_len - skip_in_dwm);
-                for v in &chunk.data_with_markers[skip_in_dwm..] {
-                    narrowed.push(*v as u8);
-                }
-                written_crc.update(&narrowed);
-                writer
-                    .write_all(&narrowed)
-                    .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-                *total_size += narrowed.len();
-            }
-        }
-        if !chunk.data.is_empty() {
-            let skip_in_data = remaining_skip.min(chunk.data.len());
-            if skip_in_data < chunk.data.len() {
-                let slice = &chunk.data[skip_in_data..];
-                written_crc.update(slice);
-                writer
-                    .write_all(slice)
-                    .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-                *total_size += slice.len();
-            }
-        }
-        // Mirror of `m_crc32Calculator.append( chunkCalculator )`
-        // (vendor/.../GzipChunkFetcher.hpp:340). Internally this runs
-        // through `combine_crc32` (crc32.hpp:214-258), the ported
-        // polynomial multiply.
-        total_crc.append(&written_crc);
-        expected_start = chunk.encoded_offset_bits + chunk.encoded_size_bits;
         // record_get covers the "consumer pulled chunk idx out of the
         // pipeline" event; mirrors rapidgzip's stats.recordBlockIndexGet
         // at BlockFetcher.hpp:270-272.
         block_fetcher.statistics.base.record_get();
         #[cfg(any(test, debug_assertions))]
         BLOCK_FETCHER_GETS_OBSERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if trace::is_enabled() {
-            let trace_decoded = chunk.decoded_size();
-            trace::emit(
-                "consumer",
-                "consume_done",
-                &format!(
-                    r#""partition_idx":{idx},"end_bit":{expected_start},"decoded":{trace_decoded},"trim_bytes":{trim_bytes},"rss_kib":{}"#,
-                    trace::rss_kib(),
-                ),
-            );
-        }
-        // Insert the fully-processed chunk into BlockFetcher's main
-        // cache for potential future random-access replay. Mirror of
-        // rapidgzip's `insertIntoCache` after consumer completion at
-        // BlockFetcher.hpp:320-327. The LRU cache will evict older
-        // entries on overflow; the streaming consumer never replays so
-        // the cache is structurally maintained but practically unused
-        // by this code path. Wrapped in Arc to match BlockFetcher's
-        // Value-type constraint and to keep insertion O(1).
-        // Capture subchunk count BEFORE moving `chunk` into the cache.
-        // Mirror of vendor line 410 — see comment below the move.
+
+        // Capture subchunk count + decoded size BEFORE moving the chunk
+        // into the post-process job (or directly into the cache for the
+        // no-marker branch).
         let inserted = if chunk.subchunks.is_empty() {
             1
         } else {
             chunk.subchunks.len()
         };
-        block_fetcher.insert(cache_key_for_partition, Arc::new(chunk));
 
-        // Advance vendor's `m_nextUnprocessedBlockIndex` by the number
-        // of subchunks this chunk inserted into the BlockFinder. Mirror
-        // of vendor line 410:
-        //   `m_nextUnprocessedBlockIndex += subchunks.size();`
-        // (vendor/.../GzipChunkFetcher.hpp:410). This keeps subsequent
-        // `seed_for(next_block_index)` queries aligned with the next
-        // CHUNK's start (not the next SUBCHUNK), so the worker's
-        // `until` hint and the consumer's seed lookup both point at
-        // chunk boundaries rather than mid-chunk subchunk positions.
+        expected_start = chunk_end_bit;
         next_block_index += inserted;
+
+        // ── Pending-write queue: post-process dispatch + ordered drain ─
+        //
+        // Mirror of vendor's `m_markersBeingReplaced` map +
+        // `waitForReplacedMarkers` (vendor/.../GzipChunkFetcher.hpp:478-518).
+        // The consumer submits an `applyWindow` task per chunk and
+        // stashes its future; output writes (which are order-dependent)
+        // pull futures in encoded order. While the head of the queue
+        // is being processed, downstream chunks' post-process jobs run
+        // in parallel on the same pool.
+        if let Some(predecessor_window) = predecessor_window {
+            // Marker case: submit post-process job. Job will run
+            // apply_window + populate_subchunk_windows + emplace
+            // per-subchunk windows.
+            let rx = submit_post_process(idx, chunk, predecessor_window);
+            pending.push_back(PendingWrite::Async {
+                idx,
+                rx,
+                trim_bytes,
+                cache_key: cache_key_for_partition,
+            });
+        } else {
+            // Clean case: chunk has no markers, no apply_window needed,
+            // no per-subchunk windows to populate (markers are already
+            // resolved by the decode worker). Queue it as immediately
+            // ready so writes stay in encoded order vs any in-flight
+            // marker post-processes ahead of it.
+            pending.push_back(PendingWrite::Ready {
+                idx,
+                chunk,
+                trim_bytes,
+                cache_key: cache_key_for_partition,
+            });
+        }
 
         // Refill the speculative pipeline: keep prefetch_count chunks
         // outstanding ahead of the consumer. The seed uses the
@@ -1134,8 +1249,145 @@ fn consumer_loop<W: std::io::Write>(
             });
             next_spec_to_dispatch += 1;
         }
+
+        // Drain the pending queue down to the in-flight cap. Vendor
+        // does this implicitly via `waitForReplacedMarkers` which
+        // blocks on the current chunk's future; we make it explicit so
+        // up to `post_process_inflight_cap` apply_windows can overlap
+        // with each other AND with the decode pipeline. When the cap is
+        // exceeded, drain the oldest entries (in encoded order — that's
+        // how `pending` is ordered by construction).
+        while pending.len() > post_process_inflight_cap {
+            drain_one_pending(&mut pending, writer, total_crc, total_size, block_fetcher)?;
+        }
     }
 
+    // Final drain: flush remaining post-processes in order.
+    while !pending.is_empty() {
+        drain_one_pending(&mut pending, writer, total_crc, total_size, block_fetcher)?;
+    }
+
+    Ok(())
+}
+
+/// Items waiting to be written. Order is encoded order (partition
+/// idx ascending). `Ready` is a no-op chunk (no markers, no post-
+/// process needed); `Async` carries a receiver for the result of a
+/// post-process job currently in-flight on a worker.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+enum PendingWrite {
+    Ready {
+        idx: usize,
+        chunk: ChunkData,
+        trim_bytes: usize,
+        cache_key: usize,
+    },
+    Async {
+        idx: usize,
+        rx: mpsc::Receiver<ChunkData>,
+        trim_bytes: usize,
+        cache_key: usize,
+    },
+}
+
+/// Pull the head of the pending FIFO, wait on its post-process if
+/// needed, then write its bytes + advance the stream CRC. Mirror of
+/// the tail of `GzipChunkFetcher::waitForReplacedMarkers` + write loop
+/// at vendor lines 516 + 333-342 (the consumer's per-chunk write step
+/// after `markerReplaceFuture->second.get()`).
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+fn drain_one_pending<W: std::io::Write>(
+    pending: &mut std::collections::VecDeque<PendingWrite>,
+    writer: &mut W,
+    total_crc: &mut CRC32Calculator,
+    total_size: &mut usize,
+    block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive>,
+) -> Result<(), FetchError> {
+    let head = match pending.pop_front() {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+    let (idx, chunk, trim_bytes, cache_key) = match head {
+        PendingWrite::Ready {
+            idx,
+            chunk,
+            trim_bytes,
+            cache_key,
+        } => (idx, chunk, trim_bytes, cache_key),
+        PendingWrite::Async {
+            idx,
+            rx,
+            trim_bytes,
+            cache_key,
+        } => {
+            // Mirror of vendor line 516:
+            // `markerReplaceFuture->second.get();` — block on the
+            // queued apply_window task. By the time we get here, this
+            // chunk's post-process job has typically completed in
+            // parallel with later chunks' jobs.
+            let chunk = rx.recv().map_err(|_| {
+                FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+                    requested: idx,
+                    actual: 0,
+                })
+            })?;
+            (idx, chunk, trim_bytes, cache_key)
+        }
+    };
+
+    // Write bytes, skipping `trim_bytes` leading bytes that belong to
+    // the predecessor's range. Per-chunk CRC accumulates via the
+    // ported `CRC32Calculator::update` (crc32.hpp:296-303); the total-
+    // stream CRC is then advanced by `append`-ing it (mirror of
+    // `m_crc32Calculator.append( chunkCalculator )` at
+    // vendor/.../GzipChunkFetcher.hpp:340).
+    let mut written_crc = CRC32Calculator::new();
+    let mut remaining_skip = trim_bytes;
+    if !chunk.data_with_markers.is_empty() {
+        let dwm_len = chunk.data_with_markers.len();
+        let skip_in_dwm = remaining_skip.min(dwm_len);
+        remaining_skip -= skip_in_dwm;
+        if skip_in_dwm < dwm_len {
+            let mut narrowed: Vec<u8> = Vec::with_capacity(dwm_len - skip_in_dwm);
+            for v in &chunk.data_with_markers[skip_in_dwm..] {
+                narrowed.push(*v as u8);
+            }
+            written_crc.update(&narrowed);
+            writer
+                .write_all(&narrowed)
+                .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+            *total_size += narrowed.len();
+        }
+    }
+    if !chunk.data.is_empty() {
+        let skip_in_data = remaining_skip.min(chunk.data.len());
+        if skip_in_data < chunk.data.len() {
+            let slice = &chunk.data[skip_in_data..];
+            written_crc.update(slice);
+            writer
+                .write_all(slice)
+                .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+            *total_size += slice.len();
+        }
+    }
+    total_crc.append(&written_crc);
+
+    if trace::is_enabled() {
+        trace::emit(
+            "consumer",
+            "consume_done",
+            &format!(
+                r#""partition_idx":{idx},"decoded":{},"trim_bytes":{trim_bytes},"rss_kib":{}"#,
+                chunk.decoded_size(),
+                trace::rss_kib(),
+            ),
+        );
+    }
+    // Insert the fully-processed chunk into BlockFetcher's main cache
+    // for potential future random-access replay. Mirror of rapidgzip's
+    // `insertIntoCache` after consumer completion at
+    // BlockFetcher.hpp:320-327.
+    block_fetcher.insert(cache_key, Arc::new(chunk));
     Ok(())
 }
 
