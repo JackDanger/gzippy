@@ -34,6 +34,7 @@ pub mod block_fetcher;
 pub mod block_finder;
 pub mod block_map;
 pub mod blockfinder_bgzf;
+pub mod blockfinder_dynamic_huffman;
 pub mod blockfinder_interface;
 pub mod blockfinder_pigz;
 pub mod blockfinder_precode_check;
