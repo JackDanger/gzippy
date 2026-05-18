@@ -41,6 +41,7 @@ pub mod chunk_data;
 pub mod chunk_fetcher;
 pub mod compressed_vector;
 pub mod deflate_block;
+pub mod error;
 pub mod faster_vector;
 pub mod gzip_block_finder;
 pub mod gzip_chunk;
