@@ -53,6 +53,7 @@ pub mod isal_huffman;
 pub mod joining_thread;
 pub mod prefetcher;
 pub mod replace_markers;
+pub mod rfc_tables;
 pub mod single_member;
 pub mod statistics;
 pub mod streamed_results;
