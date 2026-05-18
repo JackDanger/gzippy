@@ -70,6 +70,7 @@ pub mod inflate_wrapper;
 pub mod isal_huffman;
 pub mod joining_thread;
 pub mod parallel_bit_string_finder;
+pub mod parallel_gzip_reader;
 pub mod precode;
 pub mod prefetcher;
 pub mod replace_markers;
