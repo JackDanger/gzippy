@@ -37,6 +37,7 @@ pub mod blockfinder_bgzf;
 pub mod blockfinder_interface;
 pub mod blockfinder_pigz;
 pub mod blockfinder_precode_check;
+pub mod blockfinder_uncompressed;
 pub mod cache;
 pub mod chunk_data;
 pub mod chunk_fetcher;
