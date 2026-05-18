@@ -72,78 +72,67 @@ pub fn decompress_parallel<W: Write>(
 ) -> Result<u64, ParallelError> {
     let t0 = std::time::Instant::now();
 
+    // Routing-eligibility gate — classifier upstream guarantees these
+    // bounds; reaching this point with bad inputs is a routing bug
+    // surfaced as a hard error. There is no silent retry.
     let header_size = skip_gzip_header(gzip_data).map_err(|_| ParallelError::InvalidHeader)?;
     let trailer_size = 8;
     if gzip_data.len() < header_size + trailer_size {
         return Err(ParallelError::InvalidGzipFormat);
     }
-    let deflate_data = &gzip_data[header_size..gzip_data.len() - trailer_size];
-
-    // The classifier (`crate::decompress::classify_gzip`) is the only
-    // gate on parallel-eligibility. If we got here on input below the
-    // working minimum it's a routing bug, not a fallback opportunity —
-    // surface it as a hard error. There is no silent retry.
-    if deflate_data.len() < MIN_PARALLEL_SIZE || num_threads < MIN_THREADS_FOR_PARALLEL {
+    let deflate_data_len = gzip_data.len().saturating_sub(header_size + trailer_size);
+    if deflate_data_len < MIN_PARALLEL_SIZE || num_threads < MIN_THREADS_FOR_PARALLEL {
         return Err(ParallelError::InvalidGzipFormat);
     }
 
-    // Trailer parsing via the rapidgzip-port `gzip_format::read_footer`
-    // (vendor/.../gzip/gzip.hpp:295-306) replaces the inline byte slicing
-    // that used to live here. The footer is at `gzip_data.len() - 8`
-    // for single-member streams; multi-stream support reads further
-    // footers in-line during decode via IsalInflateWrapper::read_footer_at_current.
-    let footer = crate::decompress::parallel::gzip_format::read_footer(
-        gzip_data,
-        gzip_data.len() - trailer_size,
-    )
-    .map_err(|_| ParallelError::InvalidGzipFormat)?;
-    let expected_crc = footer.crc32;
-    let expected_size = footer.uncompressed_size as usize;
-
     #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
     {
-        use crate::decompress::parallel::chunk_data::ChunkConfiguration;
-        use crate::decompress::parallel::chunk_fetcher;
-
-        let configuration = ChunkConfiguration {
-            split_chunk_size: TARGET_COMPRESSED_CHUNK_BYTES,
-            max_decoded_chunk_size: 20 * TARGET_COMPRESSED_CHUNK_BYTES,
-            crc32_enabled: true,
+        use crate::decompress::parallel::parallel_gzip_reader::{
+            read_parallel_sm, ReadParallelSmError,
         };
 
-        let (total_crc, total_size) =
-            chunk_fetcher::drive(deflate_data, writer, num_threads, configuration).map_err(
-                |e| {
-                    if debug_enabled() {
-                        eprintln!("[parallel_sm] fetcher error: {e:?}");
-                    }
-                    ParallelError::DecodeFailed
-                },
-            )?;
-
-        if total_size != expected_size {
-            return Err(ParallelError::SizeMismatch);
-        }
-        if total_crc != expected_crc {
-            return Err(ParallelError::CrcMismatch);
-        }
+        // Audit step 7 — driver moves into `parallel_gzip_reader::read_parallel_sm`.
+        // `single_member::decompress_parallel` is now a thin classifier-
+        // routed wrapper: it owns the routing-eligibility gate and the
+        // `MARKER_PIPELINE_RUNS` counter; the trailer parsing + CRC /
+        // ISIZE verification + chunk_fetcher::drive orchestration all
+        // live in the new driver (mirror of vendor's
+        // `ParallelGzipReader::read` at ParallelGzipReader.hpp:553-646).
+        let result = read_parallel_sm(
+            gzip_data,
+            writer,
+            num_threads,
+            TARGET_COMPRESSED_CHUNK_BYTES,
+        )
+        .map_err(|e| {
+            if debug_enabled() {
+                eprintln!("[parallel_sm] driver error: {e}");
+            }
+            match e {
+                ReadParallelSmError::InvalidHeader => ParallelError::InvalidHeader,
+                ReadParallelSmError::InvalidFormat => ParallelError::InvalidGzipFormat,
+                ReadParallelSmError::DecodeFailed(_) => ParallelError::DecodeFailed,
+                ReadParallelSmError::SizeMismatch { .. } => ParallelError::SizeMismatch,
+                ReadParallelSmError::CrcMismatch { .. } => ParallelError::CrcMismatch,
+            }
+        })?;
 
         MARKER_PIPELINE_RUNS.fetch_add(1, Ordering::Relaxed);
         if debug_enabled() {
             let total = t0.elapsed();
-            let mbps = total_size as f64 / total.as_secs_f64() / 1e6;
+            let mbps = result.total_size as f64 / total.as_secs_f64() / 1e6;
             eprintln!(
                 "[parallel_sm:v0.6] total={:.1}ms isize={} ({:.0} MB/s)",
                 total.as_secs_f64() * 1000.0,
-                expected_size,
+                result.total_size,
                 mbps,
             );
         }
-        return Ok(total_size as u64);
+        Ok(result.total_size as u64)
     }
     #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
     {
-        let _ = (deflate_data, writer, expected_crc, expected_size, t0);
+        let _ = (writer, t0, deflate_data_len);
         Err(ParallelError::UnsupportedPlatform)
     }
 }

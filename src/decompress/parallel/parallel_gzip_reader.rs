@@ -315,6 +315,133 @@ impl<'a> ParallelGzipReader<'a> {
     }
 }
 
+// ── Standalone read driver (parallel single-member entry) ────────────────
+
+/// Standalone driver function — the rapidgzip-faithful entry point for
+/// parallel single-member decompression. Mirror of
+/// `ParallelGzipReader::read` (vendor/.../ParallelGzipReader.hpp:553-646)
+/// reduced to the single-member case: parse gzip header, run
+/// `chunk_fetcher::drive`, parse the trailer, verify CRC32 + ISIZE.
+///
+/// Audit step 7 — owns the trailer handling (formerly inlined in
+/// `single_member::decompress_parallel` at lines 95-99). `single_member`
+/// is now a thin classifier-routed wrapper around this function.
+///
+/// Multi-stream handling: `chunk_fetcher::drive` propagates the
+/// stream-trailer footers up via `ChunkData::footers` /
+/// `ChunkData::crc32s` (vendor's per-chunk footer / crc list at
+/// ChunkData.hpp:171-180). For the single-member case the final
+/// chunk's last footer matches the inline gzip trailer at bytes
+/// `len - 8`; this driver currently relies on the inline-trailer
+/// shortcut for verification. A future commit will switch to the
+/// vendor `processCRC32` flow (ParallelGzipReader.hpp:1453-1503) that
+/// verifies each per-stream footer as chunks land.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+pub fn read_parallel_sm<W: Write>(
+    gzip_data: &[u8],
+    writer: &mut W,
+    parallelization: usize,
+    target_compressed_chunk_bytes: usize,
+) -> Result<ReadResult, ReadParallelSmError> {
+    use crate::decompress::parallel::chunk_data::ChunkConfiguration;
+    use crate::decompress::parallel::chunk_fetcher;
+    use crate::decompress::parallel::gzip_format;
+
+    // Mirror of `ParallelGzipReader::read`'s gzip-header parse path
+    // (ParallelGzipReader.hpp:702-810 → `m_blockFinder` construction at
+    // 280-290 reads `readHeader` via the underlying file reader). We
+    // collapse that to a single `read_header` call because the gzippy
+    // pipeline operates on the full in-memory buffer.
+    let (_hdr, header_size) =
+        gzip_format::read_header(gzip_data).map_err(|_| ReadParallelSmError::InvalidHeader)?;
+    let trailer_size = 8;
+    if gzip_data.len() < header_size + trailer_size {
+        return Err(ReadParallelSmError::InvalidFormat);
+    }
+    let deflate_data = &gzip_data[header_size..gzip_data.len() - trailer_size];
+
+    // Inline trailer (single-member shortcut). Vendor reads per-stream
+    // footers inside `processCRC32` (ParallelGzipReader.hpp:1453-1503)
+    // as each ChunkData lands. Audit-step-7 follow-up will replace this
+    // with the chunkData-driven verification.
+    let footer = gzip_format::read_footer(gzip_data, gzip_data.len() - trailer_size)
+        .map_err(|_| ReadParallelSmError::InvalidFormat)?;
+    let expected_crc = footer.crc32;
+    let expected_size = footer.uncompressed_size as usize;
+
+    let configuration = ChunkConfiguration {
+        split_chunk_size: target_compressed_chunk_bytes,
+        max_decoded_chunk_size: 20 * target_compressed_chunk_bytes,
+        crc32_enabled: true,
+    };
+
+    let (total_crc, total_size) =
+        chunk_fetcher::drive(deflate_data, writer, parallelization, configuration)
+            .map_err(|e| ReadParallelSmError::DecodeFailed(format!("{e:?}")))?;
+
+    if total_size != expected_size {
+        return Err(ReadParallelSmError::SizeMismatch {
+            expected: expected_size,
+            actual: total_size,
+        });
+    }
+    if total_crc != expected_crc {
+        return Err(ReadParallelSmError::CrcMismatch {
+            expected: expected_crc,
+            actual: total_crc,
+        });
+    }
+
+    Ok(ReadResult {
+        total_crc,
+        total_size,
+    })
+}
+
+/// Successful return from [`read_parallel_sm`]. Mirror of the (size,
+/// CRC) accumulator pair that vendor's `ParallelGzipReader::read`
+/// maintains in `m_currentPosition` + `m_crc32` (ParallelGzipReader.hpp:1543).
+#[derive(Debug, Clone, Copy)]
+pub struct ReadResult {
+    pub total_crc: u32,
+    pub total_size: usize,
+}
+
+/// Errors from [`read_parallel_sm`]. Mirror of the few `throw`s in
+/// vendor's `ParallelGzipReader::read`
+/// (e.g. ParallelGzipReader.hpp:567 closed-stream, :608-609
+/// block-doesn't-contain-offset). All variants are terminal —
+/// classifier upstream guarantees parallel-eligibility.
+#[derive(Debug)]
+pub enum ReadParallelSmError {
+    InvalidHeader,
+    InvalidFormat,
+    DecodeFailed(String),
+    SizeMismatch { expected: usize, actual: usize },
+    CrcMismatch { expected: u32, actual: u32 },
+}
+
+impl std::fmt::Display for ReadParallelSmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadParallelSmError::InvalidHeader => write!(f, "invalid gzip header"),
+            ReadParallelSmError::InvalidFormat => write!(f, "input below parallel SM minimum"),
+            ReadParallelSmError::DecodeFailed(s) => write!(f, "chunk decode failed: {s}"),
+            ReadParallelSmError::SizeMismatch { expected, actual } => {
+                write!(f, "output size mismatch: expected {expected}, got {actual}")
+            }
+            ReadParallelSmError::CrcMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "CRC32 mismatch: expected {expected:08x}, got {actual:08x}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReadParallelSmError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
