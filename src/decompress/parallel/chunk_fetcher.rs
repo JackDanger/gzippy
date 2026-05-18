@@ -865,6 +865,30 @@ fn consumer_loop<W: std::io::Write>(
                 chunk.subchunks.len(),
                 chunk.stopped_preemptively,
             );
+            if let Some(first) = chunk.subchunks.first() {
+                eprintln!(
+                    "  [diag]   subchunks.first: enc_off={} enc_size={} dec_off={} dec_size={}",
+                    first.encoded_offset_bits,
+                    first.encoded_size_bits,
+                    first.decoded_offset,
+                    first.decoded_size,
+                );
+            }
+            if chunk.subchunks.len() >= 2 {
+                let last = chunk.subchunks.last().unwrap();
+                let second_last = &chunk.subchunks[chunk.subchunks.len() - 2];
+                eprintln!(
+                    "  [diag]   subchunks.second_last: enc_off={} enc_size={} dec_off={} dec_size={}",
+                    second_last.encoded_offset_bits, second_last.encoded_size_bits, second_last.decoded_offset, second_last.decoded_size,
+                );
+                eprintln!(
+                    "  [diag]   subchunks.last: enc_off={} enc_size={} dec_off={} dec_size={}",
+                    last.encoded_offset_bits,
+                    last.encoded_size_bits,
+                    last.decoded_offset,
+                    last.decoded_size,
+                );
+            }
         }
 
         // DIAGNOSTIC: temporarily disabled EOF break to observe downstream chunks
