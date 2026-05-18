@@ -303,11 +303,6 @@ pub fn drive<W: std::io::Write>(
         .set_block_count(block_map.data_block_count(), true);
 
     let crc = total_crc.crc32();
-    if std::env::var("GZIPPY_DEBUG").is_ok() {
-        eprintln!(
-            "[diag] drive done: total_size={total_size} crc={crc:08x} n_partitions={n_partitions} total_bits={total_bits}"
-        );
-    }
     Ok((crc, total_size))
 }
 
@@ -562,8 +557,14 @@ fn consumer_loop<W: std::io::Write>(
     // vendor/.../GzipChunkFetcher.hpp:318. The block finder returns the
     // confirmed offset when `idx` is known (after a predecessor's
     // `insert(actual_end)`), or a spacing-aligned guess when not.
-    let seed_for = |idx: usize| -> usize {
-        match block_finder.get(idx) {
+    //
+    // IMPORTANT: this helper takes the BLOCK INDEX (vendor's
+    // `m_nextUnprocessedBlockIndex`), which after subchunk inserts is
+    // NOT the same as the partition counter `idx` in the consumer loop.
+    // Use `seed_for(next_block_index)` at the call site; see
+    // `next_block_index` initialization in `consumer_loop`.
+    let seed_for = |block_index: usize| -> usize {
+        match block_finder.get(block_index) {
             (Some(offset), GetReturnCode::Success) => offset,
             // Past-EOF / failure: clamp to file size so `until_for` is
             // monotonic. The consumer will hit this on the final
@@ -572,7 +573,19 @@ fn consumer_loop<W: std::io::Write>(
             (None, _) => total_bits,
         }
     };
-    let until_for = |idx: usize| -> usize { seed_for(idx + 1).min(total_bits) };
+    let until_for = |block_index: usize| -> usize { seed_for(block_index + 1).min(total_bits) };
+    // Compute the spacing-aligned guess for partition `idx`. Used for
+    // the INITIAL speculative dispatch round (before any subchunk inserts)
+    // and for the speculative-refill ring during consume. Equivalent to
+    // `block_finder.get(idx)` when block_finder has only the initial seed
+    // (mirror of GzipBlockFinder.hpp::get's guessed-offset branch at
+    // L134-157, which returns `partition_index * spacing_in_bits`).
+    let partition_seed_for = |partition_idx: usize| -> usize {
+        let chunk_size_bits = configuration.split_chunk_size * 8;
+        (partition_idx * chunk_size_bits).min(total_bits)
+    };
+    let partition_until_for =
+        |partition_idx: usize| -> usize { partition_seed_for(partition_idx + 1).min(total_bits) };
 
     // Port of `rapidgzip::GzipChunkFetcher::processNextChunk`
     // (GzipChunkFetcher.hpp:311-362). Iterates the BlockMap in
@@ -660,20 +673,43 @@ fn consumer_loop<W: std::io::Write>(
     // otherwise. Mirror of rapidgzip's
     // GzipChunkFetcher.hpp:318 (`m_blockFinder->get(...)`) +
     // BlockFetcher.hpp:479 (prefetch-time `get(blockIndexToPrefetch, 0)`).
+    // Initial dispatch uses partition-aligned seeds (block_finder has
+    // only the initial seed `[0]` at this point, so `block_finder.get(i)`
+    // returns the spacing-aligned guess `i * spacing`). After the loop
+    // starts processing chunks and inserting subchunk boundaries, the
+    // block_finder's index-to-offset mapping shifts; we use
+    // `partition_seed_for` to keep the spec ring aligned to partition
+    // boundaries regardless of insert progress.
     spec[0] = Some(SpecSlot {
-        rx: submit_job(0, 0, until_for(0), true, 0),
+        rx: submit_job(0, 0, partition_until_for(0), true, 0),
         dispatched_seed: 0,
     });
     for i in 1..(1 + prefetch_count).min(n_partitions) {
-        let seed = seed_for(i);
+        let seed = partition_seed_for(i);
         spec[i] = Some(SpecSlot {
-            rx: submit_job(i, seed, until_for(i), false, seed),
+            rx: submit_job(i, seed, partition_until_for(i), false, seed),
             dispatched_seed: seed,
         });
     }
 
     let mut expected_start: usize = 0;
     let mut next_spec_to_dispatch: usize = (1 + prefetch_count).min(n_partitions);
+    // Mirror of vendor `m_nextUnprocessedBlockIndex`
+    // (vendor/.../GzipChunkFetcher.hpp:318 + 410). Tracks the running
+    // count of subchunks INSERTED into `block_finder`. Each chunk's
+    // subchunks bump this by `chunk.subchunks.len()` after processing
+    // (line 410: `m_nextUnprocessedBlockIndex += subchunks.size();`).
+    // We query `block_finder.get(next_block_index)` to find the next
+    // chunk's seed — equivalent to vendor's line 318 query.
+    //
+    // CRITICAL: the SPEC-RING `idx` is still a 0..n_partitions counter
+    // (used to address `spec[idx]`), but the seed/until queries MUST
+    // use `next_block_index` instead. After idx=0 inserts N subchunk
+    // boundaries, `block_finder.get(1)` returns the end of subchunk 0
+    // (an INTERNAL position in chunk 0's range), not the next chunk's
+    // start. Vendor avoids this by advancing the index by subchunks.size(),
+    // which is what we do here.
+    let mut next_block_index: usize = 0;
 
     for idx in 0..n_partitions {
         // Update FetchingStrategy (rapidgzip BlockFetcher.hpp:280-282).
@@ -687,7 +723,7 @@ fn consumer_loop<W: std::io::Write>(
         let cache_key_for_partition = match &slot {
             Some(s) => s.dispatched_seed,
             None if idx == 0 => 0,
-            None => seed_for(idx),
+            None => partition_seed_for(idx),
         };
 
         // ALL chunk acquisition flows through `block_fetcher.get`
@@ -700,7 +736,20 @@ fn consumer_loop<W: std::io::Write>(
         // the consumer's call shape a literal port of
         // `processNextChunk`'s single-call `getBlock`/`BaseType::get`
         // pattern at GzipChunkFetcher.hpp:293 + 654.
-        let until = until_for(idx).max(expected_start);
+        //
+        // The `until` hint for the worker MUST come from the SUBCHUNK-
+        // indexed BlockFinder via `next_block_index`, NOT from the
+        // partition counter `idx`. Mirror of vendor's
+        // `BlockFetcher::get` which computes
+        // `nextBlockOffset = m_blockFinder->get(validDataBlockIndex + 1)`
+        // (vendor/.../core/BlockFetcher.hpp:268). After predecessors
+        // insert subchunk boundaries, `block_finder.get(idx + 1)` would
+        // return an INTERIOR position from a prior chunk's subchunks
+        // (because `idx` indexes into block_offsets, not partitions).
+        // Using `next_block_index + 1` skips past the predecessor's
+        // subchunks correctly and yields the NEXT chunk's seed (or a
+        // spacing-aligned guess if not yet confirmed).
+        let until = until_for(next_block_index).max(expected_start);
         let auth_result: Result<Arc<ChunkData>, ChunkDecodeError> = block_fetcher.get(
             expected_start,
             || -> Result<Arc<ChunkData>, ChunkDecodeError> {
@@ -841,62 +890,17 @@ fn consumer_loop<W: std::io::Write>(
         //
         // Reaching this with `encoded_size_bits == 0` means the worker
         // decoded zero compressed bits at `expected_start` — the
-        // deflate stream has ended. We must STOP the consumer loop
-        // here. Continuing would (a) re-dispatch fresh decodes at the
-        // same `expected_start` forever (n_partitions is a static
-        // upper bound that doesn't shrink when EOF arrives early) and
-        // (b) cause the next chunk's first subchunk to collide with
-        // the previous chunk's last subchunk at the same encoded
-        // offset, corrupting bytes accounting (manifests as a gzip
-        // ISIZE mismatch on Silesia).
-        //
-        // The two defensive guards in `block_map.rs` (subchunk-skip
-        // + most-recent-dup tolerance) masked the panic but not the
-        // miscount — the canonical fix is to terminate, as vendor does.
-        if std::env::var("GZIPPY_DEBUG").is_ok() && idx < 8 {
-            eprintln!(
-                "[diag] idx={idx} chunk.enc_off={} chunk.enc_size={} max_enc_off={} chunk.dec_size={} dwm_len={} data_len={} expected_start={expected_start} subchunks_len={} stopped_pre={}",
-                chunk.encoded_offset_bits,
-                chunk.encoded_size_bits,
-                chunk.max_encoded_offset_bits,
-                chunk.decoded_size(),
-                chunk.data_with_markers.len(),
-                chunk.data.len(),
-                chunk.subchunks.len(),
-                chunk.stopped_preemptively,
+        // deflate stream has ended.
+        if chunk.encoded_size_bits == 0 {
+            trace::emit(
+                "consumer",
+                "eof_terminate",
+                &format!(
+                    r#""partition_idx":{idx},"expected_start":{expected_start},"total_size":{}"#,
+                    *total_size,
+                ),
             );
-            if let Some(first) = chunk.subchunks.first() {
-                eprintln!(
-                    "  [diag]   subchunks.first: enc_off={} enc_size={} dec_off={} dec_size={}",
-                    first.encoded_offset_bits,
-                    first.encoded_size_bits,
-                    first.decoded_offset,
-                    first.decoded_size,
-                );
-            }
-            if chunk.subchunks.len() >= 2 {
-                let last = chunk.subchunks.last().unwrap();
-                let second_last = &chunk.subchunks[chunk.subchunks.len() - 2];
-                eprintln!(
-                    "  [diag]   subchunks.second_last: enc_off={} enc_size={} dec_off={} dec_size={}",
-                    second_last.encoded_offset_bits, second_last.encoded_size_bits, second_last.decoded_offset, second_last.decoded_size,
-                );
-                eprintln!(
-                    "  [diag]   subchunks.last: enc_off={} enc_size={} dec_off={} dec_size={}",
-                    last.encoded_offset_bits,
-                    last.encoded_size_bits,
-                    last.decoded_offset,
-                    last.decoded_size,
-                );
-            }
-        }
-
-        // DIAGNOSTIC: temporarily disabled EOF break to observe downstream chunks
-        if chunk.encoded_size_bits == 0 && std::env::var("GZIPPY_DEBUG").is_ok() {
-            eprintln!(
-                "[diag] would-eof-break idx={idx} expected_start={expected_start} total_size={}",
-                *total_size,
-            );
+            break;
         }
 
         let trim_bytes = chunk.decoded_offset_for(expected_start).unwrap_or(0);
@@ -1055,19 +1059,36 @@ fn consumer_loop<W: std::io::Write>(
         // Value-type constraint and to keep insertion O(1).
         block_fetcher.insert(cache_key_for_partition, Arc::new(chunk));
 
+        // Advance vendor's `m_nextUnprocessedBlockIndex` by the number
+        // of subchunks this chunk inserted into the BlockFinder. Mirror
+        // of vendor line 410:
+        //   `m_nextUnprocessedBlockIndex += subchunks.size();`
+        // (vendor/.../GzipChunkFetcher.hpp:410). This keeps subsequent
+        // `seed_for(next_block_index)` queries aligned with the next
+        // CHUNK's start (not the next SUBCHUNK), so the worker's
+        // `until` hint and the consumer's seed lookup both point at
+        // chunk boundaries rather than mid-chunk subchunk positions.
+        let inserted = if chunk.subchunks.is_empty() {
+            1
+        } else {
+            chunk.subchunks.len()
+        };
+        next_block_index += inserted;
+
         // Refill the speculative pipeline: keep prefetch_count chunks
-        // outstanding ahead of the consumer. The seed is queried from
-        // GzipBlockFinder NOW (post-insert), so it reflects the latest
-        // confirmed boundaries — mirror of rapidgzip's prefetch loop
-        // in vendor/.../core/BlockFetcher.hpp:474-562 which calls
-        // `m_blockFinder->get(blockIndexToPrefetch, ...)` per iteration.
+        // outstanding ahead of the consumer. The seed uses the
+        // PARTITION-aligned guess (`partition_seed_for`) because the
+        // spec ring is indexed by partition counter, not subchunk
+        // count — using `block_finder.get(next_spec_to_dispatch)`
+        // would return an interior subchunk position from a prior
+        // chunk's inserts.
         if next_spec_to_dispatch < n_partitions {
-            let seed = seed_for(next_spec_to_dispatch);
+            let seed = partition_seed_for(next_spec_to_dispatch);
             spec[next_spec_to_dispatch] = Some(SpecSlot {
                 rx: submit_job(
                     next_spec_to_dispatch,
                     seed,
-                    until_for(next_spec_to_dispatch),
+                    partition_until_for(next_spec_to_dispatch),
                     false,
                     seed,
                 ),
