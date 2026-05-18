@@ -47,10 +47,11 @@ surface). Performance optimization happens after that.
 1. **ONE PRODUCTION PATH** — know exactly which function the CLI calls. Test that function.
 2. **RUN `make` FIRST** — before `make ship`, before committing. `make` catches regressions in 30s.
 3. **BENCHMARK EVERYTHING** — `make ship` (homelab bench on `neurotic`) is authoritative; local `make` is for iteration.
-4. **DURING THE RAPIDGZIP CUTOVER: DO NOT REVERT PERF REGRESSIONS.** The goal until the port is complete is a faithful, correct, line-for-line port of rapidgzip. Intermediate states will be slower than steady state — that is expected. Ship every faithful port commit even when bench-sm shows a perf loss. Performance is optimized LATER, after the structural port is complete and an Opus advisor confirms the implementation matches rapidgzip in structure and calculation. (Steady-state rule, post-cutover: do not regress.)
-5. **NEVER COMPROMISE CORRECTNESS** — output bytes, CRC32, ISIZE must always verify. Performance can wait; correctness cannot.
-6. **NO FALLBACKS** — failure is an explicit `Err(GzippyError::Decompression(_))`. No silent libdeflate or ISA-L retries from the SM body. `decompress_single_member` either succeeds via the parallel pipeline or returns an error.
-7. **PORT, DON'T INNOVATE** — every change in `src/decompress/parallel/` must mirror a specific rapidgzip C++ region. Cite `vendor/.../file:line` in code comments AND commit messages. If no rapidgzip counterpart exists, do not write the code.
+4. **NEVER COMPROMISE CORRECTNESS** — output bytes, CRC32, ISIZE must always verify.
+5. **NO FALLBACKS** — failure is an explicit `Err(GzippyError::Decompression(_))`. No silent libdeflate or ISA-L retries from the SM body. `decompress_single_member` either succeeds via the parallel pipeline or returns an error.
+6. **THE GOAL IS SPEED, NOT FIDELITY.** gzippy aims to be the fastest gzip implementation ever created. Rapidgzip is the current reference for parallel decompression because its architecture is the fastest known — port it as a *means*. Where gzippy's own SIMD inflate primitives (in `src/decompress/inflate/`, `src/decompress/{combined_lut,packed_lut,simd_huffman,vector_huffman,two_level_table}.rs`, `src/backends/inflate_bit.rs`) beat rapidgzip's inner inflate, use them. The deliverable is throughput, not vendor parity.
+
+(Removed 2026-05-17 per `docs/codex-meta-audit.md` §3: the prior Rule #4 — "DO NOT REVERT PERF REGRESSIONS DURING CUTOVER" — and Rule #7 — "PORT, DON'T INNOVATE" — were self-invented loophole rules that codified permission and discarded constraint. Rule #4 let perf regressions ship behind a "cutover" label that grew to 75+ commits. Rule #7 forbade reusing gzippy's existing SIMD inflate assets — exactly the assets that could let gzippy *beat* rapidgzip instead of tie it.)
 
 ## Production Routing (Apr 2026)
 
