@@ -592,13 +592,11 @@ jobs:
           diff /tmp/random.bin /tmp/random.out
           echo "✓ gzippy roundtrip OK"
 
-          # Verify gzip compatibility (single-threaded only — gzip can't parallelise;
-          # if gzippy beats pigz at T>1 it already proves compatibility)
-          if [ "$THREADS" = "1" ]; then
-            gzip -d < /tmp/random.gz > /tmp/random.gzip.out
-            diff /tmp/random.bin /tmp/random.gzip.out
-            echo "✓ gzip can decompress gzippy output"
-          fi
+          # Verify gzip format compatibility — always run regardless of thread count.
+          # Performance (beating pigz) does not prove format correctness.
+          gzip -d < /tmp/random.gz > /tmp/random.gzip.out
+          diff /tmp/random.bin /tmp/random.gzip.out
+          echo "✓ gzip can decompress gzippy output"
 
   # ============================================================================
   # STAGE 6: Performance guards and summary (per platform)

@@ -227,7 +227,7 @@ def check_decompression_guards(results: list) -> tuple:
                 threshold = THRESHOLDS[threshold_key]
                 passed = ratio >= threshold
                 report.append({
-                    "name": f"Decompress {source} T{threads} {data_type} vs igzip",
+                    "name": f"Decompress {source} T{threads} {data_type} vs igzip(T1)",
                     "metric": "speed_vs_igzip",
                     "gzippy": gzippy_speed,
                     "other": igzip_speed,
