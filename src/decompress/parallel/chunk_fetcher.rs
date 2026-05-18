@@ -674,7 +674,7 @@ fn consumer_loop<W: std::io::Write>(
     n_partitions: usize,
     block_finder: &GzipBlockFinder,
     total_bits: usize,
-    job_tx: &mpsc::Sender<DecodeJob>,
+    job_tx: &mpsc::Sender<Job>,
     window_map: &WindowMap,
     block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive>,
     block_map: &BlockMap,
