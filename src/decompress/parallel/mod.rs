@@ -62,6 +62,7 @@ pub mod huffman_reversed_codes_per_length;
 pub mod huffman_short_bits_cached_deflate;
 pub mod huffman_short_bits_multi_cached;
 pub mod huffman_symbols_per_length;
+pub mod index_file_format;
 pub mod inflate_wrapper;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub mod isal_huffman;
