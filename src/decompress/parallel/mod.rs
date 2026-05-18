@@ -57,3 +57,4 @@ pub mod streamed_results;
 pub mod thread_pool;
 pub mod trace;
 pub mod window_map;
+pub mod zlib_format;
