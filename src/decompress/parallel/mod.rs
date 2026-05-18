@@ -50,6 +50,8 @@ pub mod gzip_block_finder;
 pub mod gzip_chunk;
 pub mod gzip_definitions;
 pub mod gzip_format;
+pub mod huffman_base;
+pub mod huffman_symbols_per_length;
 pub mod inflate_wrapper;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub mod isal_huffman;
