@@ -1057,6 +1057,13 @@ fn consumer_loop<W: std::io::Write>(
         // the cache is structurally maintained but practically unused
         // by this code path. Wrapped in Arc to match BlockFetcher's
         // Value-type constraint and to keep insertion O(1).
+        // Capture subchunk count BEFORE moving `chunk` into the cache.
+        // Mirror of vendor line 410 — see comment below the move.
+        let inserted = if chunk.subchunks.is_empty() {
+            1
+        } else {
+            chunk.subchunks.len()
+        };
         block_fetcher.insert(cache_key_for_partition, Arc::new(chunk));
 
         // Advance vendor's `m_nextUnprocessedBlockIndex` by the number
@@ -1068,11 +1075,6 @@ fn consumer_loop<W: std::io::Write>(
         // CHUNK's start (not the next SUBCHUNK), so the worker's
         // `until` hint and the consumer's seed lookup both point at
         // chunk boundaries rather than mid-chunk subchunk positions.
-        let inserted = if chunk.subchunks.is_empty() {
-            1
-        } else {
-            chunk.subchunks.len()
-        };
         next_block_index += inserted;
 
         // Refill the speculative pipeline: keep prefetch_count chunks
