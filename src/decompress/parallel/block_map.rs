@@ -107,14 +107,6 @@ impl BlockMap {
             Ok(i) => {
                 let match_decoded = g.block_to_data_offsets[i].1;
                 if i + 1 >= g.block_to_data_offsets.len() {
-                    // The duplicate is the most-recent entry. If the new push
-                    // carries no new decoded bytes, it's a phantom re-push from
-                    // a chunk that decoded zero bytes (e.g. an immediate
-                    // END_OF_STREAM at the chunk boundary). Treat as no-op
-                    // rather than corrupting the index.
-                    if decoded_size == 0 {
-                        return match_decoded;
-                    }
                     let tail: Vec<(usize, usize)> = g
                         .block_to_data_offsets
                         .iter()
@@ -234,14 +226,6 @@ pub fn append_subchunks_to_block_map(
     chunk: &crate::decompress::parallel::chunk_data::ChunkData,
 ) {
     for sc in &chunk.subchunks {
-        // A subchunk with no encoded extent AND no decoded bytes is a
-        // phantom (e.g. a chunk that decoded straight into END_OF_STREAM
-        // with no clean output). It carries no index information and would
-        // collide with the next chunk's first subchunk at the same
-        // encoded offset.
-        if sc.encoded_size_bits == 0 && sc.decoded_size == 0 {
-            continue;
-        }
         block_map.push(
             sc.encoded_offset_bits,
             sc.encoded_size_bits,

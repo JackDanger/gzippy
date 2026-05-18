@@ -824,6 +824,42 @@ fn consumer_loop<W: std::io::Write>(
         // rapidgzip aliasing semantics at GzipChunkFetcher.hpp:329.
         let chunk: ChunkData = Arc::try_unwrap(auth_arc).unwrap_or_else(|arc| (*arc).clone());
 
+        // Mirror of vendor `GzipChunkFetcher::processNextChunk`
+        // (vendor/.../GzipChunkFetcher.hpp:350-355):
+        //
+        //   /* Should only happen when encountering EOF during decodeBlock call. */
+        //   if ( chunkData->encodedSizeInBits == 0 ) {
+        //       m_blockMap->finalize();
+        //       m_blockFinder->finalize();
+        //       return {};
+        //   }
+        //
+        // Reaching this with `encoded_size_bits == 0` means the worker
+        // decoded zero compressed bits at `expected_start` — the
+        // deflate stream has ended. We must STOP the consumer loop
+        // here. Continuing would (a) re-dispatch fresh decodes at the
+        // same `expected_start` forever (n_partitions is a static
+        // upper bound that doesn't shrink when EOF arrives early) and
+        // (b) cause the next chunk's first subchunk to collide with
+        // the previous chunk's last subchunk at the same encoded
+        // offset, corrupting bytes accounting (manifests as a gzip
+        // ISIZE mismatch on Silesia).
+        //
+        // The two defensive guards in `block_map.rs` (subchunk-skip
+        // + most-recent-dup tolerance) masked the panic but not the
+        // miscount — the canonical fix is to terminate, as vendor does.
+        if chunk.encoded_size_bits == 0 {
+            trace::emit(
+                "consumer",
+                "eof_terminate",
+                &format!(
+                    r#""partition_idx":{idx},"expected_start":{expected_start},"total_size":{}"#,
+                    *total_size,
+                ),
+            );
+            break;
+        }
+
         let trim_bytes = chunk.decoded_offset_for(expected_start).unwrap_or(0);
 
         // Process the chunk: apply_window if markers; write bytes;
