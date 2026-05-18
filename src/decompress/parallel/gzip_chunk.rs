@@ -154,9 +154,19 @@ pub fn decode_chunk_with_window(
     // whole buffer is committed once per outer iter.
     let mut already_decoded: usize = 0;
 
+    let dbg = std::env::var("GZIPPY_DEBUG").is_ok()
+        && encoded_offset_bits >= 33_000_000
+        && encoded_offset_bits <= 34_000_000;
+    let mut outer_iter = 0usize;
     while !stopping_point_reached {
         let mut buffer = vec![0u8; ALLOCATION_CHUNK_SIZE];
         let mut n_bytes_read: usize = 0;
+        outer_iter += 1;
+        if dbg {
+            eprintln!(
+                "[gc-diag] outer iter {outer_iter}: last_end_bit={last_end_bit} last_eob_pos={last_eob_pos}"
+            );
+        }
         // Cached state of the last inner call so the outer can decide
         // whether to break the OUTER loop (mirrors rapidgzip checking
         // `( stoppedAt() == NONE ) && ( nBytesReadPerCall == 0 ) && !footer`
@@ -170,6 +180,7 @@ pub fn decode_chunk_with_window(
         // return footers from read_stream).
         let mut end_of_stream_hit = false;
 
+        let mut inner_iter = 0usize;
         while n_bytes_read < buffer.len() && !stopping_point_reached {
             // Inner inflate call writes into the still-unfilled tail of
             // `buffer`, mirroring rapidgzip's
@@ -177,6 +188,7 @@ pub fn decode_chunk_with_window(
             //                             buffer.size() - nBytesRead )`
             // at GzipChunk.hpp:318-319.
             let r = wrapper.read_stream(&mut buffer[n_bytes_read..])?;
+            inner_iter += 1;
             last_per_call = r.bytes_written;
             n_bytes_read += last_per_call;
             chunk.note_inner_decoded_bytes(last_per_call); // GzipChunk.hpp:321
@@ -184,6 +196,12 @@ pub fn decode_chunk_with_window(
             last_stopped_at = r.stopped_at;
             last_finished = r.finished;
             last_end_bit = r.bit_position;
+            if dbg && inner_iter <= 5 {
+                eprintln!(
+                    "[gc-diag]   inner iter {inner_iter}: bytes_written={} stopped_at={:?} finished={} bit_pos={}",
+                    r.bytes_written, r.stopped_at, r.finished, r.bit_position,
+                );
+            }
 
             if r.finished {
                 // BFINAL of the (last) stream in our range — exit both
@@ -312,6 +330,19 @@ pub fn decode_chunk_with_window(
     }
 
     chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+    if std::env::var("GZIPPY_DEBUG").is_ok()
+        && encoded_offset_bits >= 33_000_000
+        && encoded_offset_bits <= 34_000_000
+    {
+        eprintln!(
+            "[gc-diag] decode_chunk_with_window done enc_off={} last_end_bit={} until_bits={} dec_size={} subchunks={}",
+            encoded_offset_bits,
+            last_end_bit,
+            until_bits,
+            chunk.decoded_size(),
+            chunk.subchunks.len(),
+        );
+    }
     chunk.finalize(last_end_bit);
     Ok(chunk)
 }
