@@ -344,6 +344,48 @@ mod tests {
     }
 
     // =========================================================================
+    // m_unsplitBlocks emplacement reaches production
+    //
+    // Vendor `GzipChunkFetcher.hpp:393` populates `m_unsplitBlocks` inside
+    // `appendSubchunksToIndexes` for every chunk that produced 2+ subchunks.
+    // gzippy ports the emplace side as scaffolding for the seekable-reader
+    // path (no production read site exists yet). Without a deletion-trap,
+    // the emplace branch could rot silently as "dead code." This test runs
+    // a single decode large enough to force multiple subchunks per chunk
+    // and asserts the counter moved.
+    // =========================================================================
+    #[test]
+    fn test_unsplit_blocks_emplaces_on_multi_subchunk_decode() {
+        use std::sync::atomic::Ordering;
+
+        // 24 MiB low-entropy fixture compresses to >10 MiB so the parallel
+        // gate fires. With the default split_chunk_size of 4 MiB and ~24
+        // MiB decompressed per chunk-partition, multi-subchunk chunks are
+        // the common case (vendor's "chunk size > spacing" path).
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+
+        let before = crate::decompress::parallel::chunk_fetcher::UNSPLIT_BLOCKS_EMPLACED
+            .load(Ordering::Relaxed);
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        assert_eq!(output, original);
+        let after = crate::decompress::parallel::chunk_fetcher::UNSPLIT_BLOCKS_EMPLACED
+            .load(Ordering::Relaxed);
+
+        #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+        assert!(
+            after > before,
+            "UNSPLIT_BLOCKS_EMPLACED did not increment ({before} -> {after}); \
+             the m_unsplitBlocks emplace branch at chunk_fetcher.rs (mirror of \
+             GzipChunkFetcher.hpp:393) is unreachable. This catches the same \
+             silent-fallback failure class as the marker-pipeline deletion trap."
+        );
+        #[cfg(not(all(target_arch = "x86_64", feature = "isal-compression")))]
+        let _ = (before, after);
+    }
+
+    // =========================================================================
     // Performance regression guard — the CI gap that masked v0.3.0.
     //
     // The single-member parallel path must not be SLOWER than the single-thread

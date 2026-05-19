@@ -105,6 +105,43 @@ fn materialize_window(w: &Window) -> Cow<'_, [u8]> {
     }
 }
 
+/// Reverse-lookup map: subchunk encoded-bit offset → cache key of the
+/// parent chunk that produced it. Mirror of vendor's
+/// `m_unsplitBlocks: std::unordered_map<size_t, size_t>` declared at
+/// `GzipChunkFetcher.hpp:781` and populated inside
+/// `appendSubchunksToIndexes` (`:380-396`). When a chunk decodes into
+/// multiple subchunks, each subchunk's offset is recorded so that a
+/// random-access read for an internal subchunk offset can resolve to
+/// the parent chunk in cache (vendor's `getIndexedChunk` query at
+/// `:264-289`). Single-pass single-member streaming never queries
+/// this; it is scaffolding for the seekable-reader path
+/// (`parallel_gzip_reader.rs`).
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+pub type UnsplitBlocks = Arc<std::sync::Mutex<std::collections::HashMap<usize, usize>>>;
+
+/// Construct a fresh, empty `UnsplitBlocks`. Mirror of the default
+/// construction of `m_unsplitBlocks` as a `GzipChunkFetcher` member.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+fn new_unsplit_blocks() -> UnsplitBlocks {
+    Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Deletion-trap counter incremented every time an entry is emplaced
+/// into the `unsplit_blocks` map. Process-global; tests snapshot
+/// before/after a multi-subchunk decode to prove the vendor
+/// `appendSubchunksToIndexes` emplace site (`GzipChunkFetcher.hpp:393`)
+/// has a live caller. Without this, the emplace branch could rot
+/// silently (no production read site exists yet — it's scaffolding
+/// for the seekable-reader path).
+///
+/// Not cfg-gated: the static must be addressable from tests on every
+/// build configuration. The actual increment site IS cfg-gated to the
+/// production path (x86_64 + isal-compression); on other targets the
+/// counter stays at 0 and tests skip the assertion (mirror of the
+/// MARKER_PIPELINE_RUNS pattern at single_member.rs:44).
+pub static UNSPLIT_BLOCKS_EMPLACED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug)]
 pub enum FetchError {
     Decode(ChunkDecodeError),
@@ -251,6 +288,17 @@ pub fn drive<W: std::io::Write>(
         pool_size,
     ));
 
+    // ── m_unsplitBlocks (vendor GzipChunkFetcher.hpp:781) ───────────
+    // Subchunk-offset → parent-chunk-key reverse map; populated when a
+    // chunk decodes into multiple subchunks (vendor :380-396) and
+    // queried on random-access reads (vendor :264-289). Single-pass
+    // streaming never queries this; the map is scaffolding for the
+    // future seekable-reader path. Vendor's GzipChunkFetcher is single-
+    // threaded so vendor uses a bare `std::unordered_map`; gzippy
+    // wraps in `Arc<Mutex<...>>` so the future seek consumer (which
+    // may live on a different thread) can share the handle.
+    let unsplit_blocks = new_unsplit_blocks();
+
     // ── m_threadPool (vendor BlockFetcher.hpp:686) ──────────────────
     // The single thread pool that backs both decode and post-process
     // submissions, mirroring vendor's single `BS::thread_pool` shared
@@ -282,6 +330,7 @@ pub fn drive<W: std::io::Write>(
         &block_fetcher,
         &block_map,
         &window_map,
+        &unsplit_blocks,
         &thread_pool,
         pool_size,
         configuration,
@@ -329,6 +378,7 @@ fn consumer_loop<W: std::io::Write>(
     block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive, ChunkDecodeError>>,
     block_map: &BlockMap,
     window_map: &WindowMap,
+    unsplit_blocks: &UnsplitBlocks,
     thread_pool: &Arc<ThreadPool>,
     pool_size: usize,
     configuration: ChunkConfiguration,
@@ -613,6 +663,35 @@ fn consumer_loop<W: std::io::Write>(
                 block_finder.insert(sc.encoded_offset_bits + sc.encoded_size_bits);
             }
         }
+
+        // Vendor `appendSubchunksToIndexes` continued
+        // (GzipChunkFetcher.hpp:380-396): when a chunk produced multiple
+        // subchunks, record each *internal* subchunk's offset → parent
+        // chunk cache-key in `m_unsplitBlocks`. The seek consumer
+        // (`getIndexedChunk` at `:264-289`) consults this map to
+        // resolve a request for an internal subchunk offset back to
+        // its parent chunk in cache. Single-pass streaming never
+        // hits this lookup; the emplace is structural scaffolding for
+        // the seekable-reader path. `next_block_offset` is the cache
+        // key the parent chunk was retrieved under (vendor's
+        // `lookupKey` at `:387-389`).
+        if chunk.subchunks.len() > 1 {
+            let chunk_offset = chunk.encoded_offset_bits;
+            let lookup_key = next_block_offset;
+            let mut unsplit = unsplit_blocks.lock().unwrap();
+            for sc in &chunk.subchunks {
+                if sc.encoded_offset_bits != chunk_offset {
+                    // Vendor uses `emplace` (insert-if-absent — does
+                    // not overwrite). Match that semantic.
+                    use std::collections::hash_map::Entry;
+                    if let Entry::Vacant(v) = unsplit.entry(sc.encoded_offset_bits) {
+                        v.insert(lookup_key);
+                        UNSPLIT_BLOCKS_EMPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
         // Vendor GzipChunkFetcher.hpp:359 — `m_statistics.merge(*chunkData)`.
         block_fetcher.statistics.base.record_get();
 
