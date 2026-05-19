@@ -670,8 +670,29 @@ mod tests {
     #[test]
     #[ignore = "x86_64+isal-compression parallel-SM corrupts on FNAME-headered gzip — see issue"]
     fn test_parallel_sm_handles_fname_header() {
-        // Need > 10 MiB compressed to hit the parallel-SM gate.
-        let original = make_low_entropy_data(24 * 1024 * 1024);
+        // Bug reproducer (neurotic 2026-05-19): on real gzip(1)-CLI
+        // output (which adds a FNAME field), gzippy's parallel-SM path
+        // produces non-deterministically WRONG bytes at T≥9 on 16-core
+        // x86_64+ISA-L hosts. T=1..8 decode correctly. The corruption
+        // is deterministic per-run but the wrong bytes differ across
+        // T values, suggesting a race in chunk-ordering or window
+        // propagation at high worker counts.
+        //
+        // Bench fixtures (`bench_all_formats.py` produces fixtures via
+        // gzippy compression, no FNAME) decode correctly across the
+        // matrix; that's why CI never caught this.
+        //
+        // Reproducer conditions (empirically):
+        //   - file uses gzip(1)'s FNAME header
+        //   - compressed size large enough that >40 parallel chunks fire
+        //   - T >= 9
+        //
+        // This test approximates those conditions and DOES fail on
+        // x86_64+isal-compression. Currently `#[ignore]`d so the
+        // suite stays green until the race is fixed. Run with
+        // `cargo test ... --features isal-compression test_parallel_sm_handles_fname_header
+        //   -- --ignored --nocapture`.
+        let original = make_low_entropy_data(200 * 1024 * 1024);
         let deflate = raw_deflate_level(&original, 6);
         let fixture = wrap_gzip_with_fname(&deflate, &original, "silesia-large.bin");
         assert!(
@@ -680,21 +701,22 @@ mod tests {
             fixture.len()
         );
 
-        let mut output = Vec::with_capacity(original.len());
-        crate::decompress::decompress_single_member(&fixture, &mut output, 4).unwrap();
+        // Use T = num_cpus (or 16, whichever is smaller — neurotic has
+        // 16 physical, smaller machines might not reproduce the race).
+        let threads = num_cpus::get().clamp(9, 16);
 
-        // The defect: output diverges from `original` on the
-        // parallel-SM path. When this assertion starts passing, the
-        // bug is fixed; remove the #[ignore].
+        let mut output = Vec::with_capacity(original.len());
+        crate::decompress::decompress_single_member(&fixture, &mut output, threads).unwrap();
+
         assert_eq!(
             output.len(),
             original.len(),
-            "decoded length mismatch on FNAME-headered fixture"
+            "decoded length mismatch on FNAME-headered fixture (threads={threads})"
         );
         assert_eq!(
             crc32fast::hash(&output),
             crc32fast::hash(&original),
-            "decoded bytes diverge from original on FNAME-headered fixture"
+            "decoded bytes diverge from original on FNAME-headered fixture (threads={threads})"
         );
     }
 
