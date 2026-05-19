@@ -896,12 +896,18 @@ Status legend: ✅ DONE · 🟡 PARTIAL · ❌ NOT STARTED · ⏭ DEFERRED-by-de
     lost from `subchunks` and the speculation hit rate would collapse.
     Documented in §B2 as a behavioral deviation that gzippy
     intentionally retains for the speculative-trim path.
-19. ✅ **`appendSubchunksToIndexes` cascade** —
-    `block_map::append_subchunks_to_block_map` called at
-    `chunk_fetcher.rs:784`, followed by
-    `block_finder.insert(subchunk_end)` per subchunk (literal port of
-    GzipChunkFetcher.hpp:374). `m_unsplitBlocks` map is still pending
-    (only consulted on backward-seek replay; unused on streaming).
+19. ✅ **`appendSubchunksToIndexes` cascade** — fully closed in
+    commit `4e27c1c`. `block_map::append_subchunks_to_block_map` at
+    `chunk_fetcher.rs:608`, `block_finder.insert(subchunk_end)` per
+    subchunk (literal port of GzipChunkFetcher.hpp:374), and
+    `unsplit_blocks` emplacement (literal port of
+    GzipChunkFetcher.hpp:380-396 via `UnsplitBlocks` type at
+    `chunk_fetcher.rs:120`). Insert site is scaffolding for the
+    seekable-reader query path (`parallel_gzip_reader.rs` —
+    `getIndexedChunk` analog); a deletion-trap counter
+    `UNSPLIT_BLOCKS_EMPLACED` plus
+    `test_unsplit_blocks_emplaces_on_multi_subchunk_decode` gate the
+    insertion site against silent rot.
 20. ⏭ **Direct-try-at-guessed-offset on the slow path** — deleted in
     gzippy because the marker bootstrap is too lenient (B10).
     Documented deviation, not a regression.
