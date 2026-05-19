@@ -593,8 +593,12 @@ chunks. Per-subchunk windows are populated via
 `chunk_fetcher.rs:614`) but stored uncompressed.
 
 **Impact**: behaviourally fine for our single-pass write. The
-per-subchunk window populate is wired in production (good); the
-compressed-vector storage path is not (CompressedVector is unused).
+per-subchunk window populate is wired in production (good). Per-window
+CompressedVector storage is now wired via `WindowMap` (commit
+`17fd9b2`); single-member production uses `CompressionType::None`
+since each window is consumed once. The `Window = Arc<[u8; 32768]>`
+type signature on `WindowMap::get` is the remaining structural
+divergence (task #79).
 
 ### B4. `IsalInflateWrapper::readStream`
 
@@ -671,10 +675,13 @@ What's still divergent (deferred):
    the PRE-FILL is still caller-side. Function: equivalent. Shape:
    pre-fill orchestration is the remaining deviation.
 
-`Prefetcher` and `Cache` (LRU) remain unused — gzippy's `BlockFetcher`
-embeds simpler `Cache` + `PrefetchCache` of its own (`block_fetcher.rs`
-L31-49), and the spec-ring fills the `Prefetcher` role until #2 above
-is addressed.
+`Cache` (LRU from `cache.rs`) and `FetchingStrategy` (from
+`prefetcher.rs`) are now consumed by `BlockFetcher` directly
+(`block_fetcher.rs:38-39` imports `Cache`, `CacheStrategy`,
+`LeastRecentlyUsed`, `FetchingStrategy`); the prefetch dispatcher
+plugged in at `chunk_fetcher.rs:229` is `FetchNextAdaptive`. The
+spec-ring lives alongside (consumer-side pre-fill) until the prefetch
+trigger is moved inside `BlockFetcher::get` per #2.
 
 ### B6. Block finder partitioning
 
@@ -840,9 +847,16 @@ Status legend: ✅ DONE · 🟡 PARTIAL · ❌ NOT STARTED · ⏭ DEFERRED-by-de
    `append_subchunks_to_block_map(block_map, &chunk)` at
    `chunk_fetcher.rs:784`, post commit `306c1e7`.
 9. ❌ **`IndexFileFormat`** — seekable index export. Optional.
-10. ❌ **Parallel marker post-processing** — gzippy's consumer is the only
-    thread that calls `apply_window`. Rapidgzip's thread pool resolves
-    markers for multiple chunks in parallel via `queueChunkForPostProcessing`.
+10. ✅ **Parallel marker post-processing** — the consumer submits each
+    chunk's marker resolution to the thread pool via
+    `submit_post_process_to_pool` (`chunk_fetcher.rs:598`,
+    `run_post_process_task` at `:823`). Mirror of vendor's
+    `queueChunkForPostProcessing` (GzipChunkFetcher.hpp:579-582). The
+    consumer drains FIFO via `drain_one_pending`. Open subitem: vendor
+    submits with priority -1 (`submitTaskWithHighPriority` at
+    BlockFetcher.hpp:606-611); gzippy's `ThreadPool::submit` has no
+    priority queue, so the apply-window task competes equally with
+    decode tasks. Documented behavioral deviation.
 11. ✅ **Per-subchunk window publishing into a `BlockMap`-indexed lookup**
     — `populate_subchunk_windows` runs in prod (chunk_fetcher.rs:752),
     windows are inserted into `WindowMap` at chunk_fetcher.rs:769-776,
