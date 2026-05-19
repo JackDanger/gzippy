@@ -721,137 +721,137 @@ fn bootstrap_with_deflate_block(
     // generously to avoid early growth.
     let mut output: Vec<u16> = Vec::with_capacity(128 * 1024);
     BOOTSTRAP_BLOCK.with(|cell_block| {
-    let mut block = cell_block.borrow_mut();
-    block.reset(None, None);
-    let block = &mut *block;
-    let output = &mut output;
+        let mut block = cell_block.borrow_mut();
+        block.reset(None, None);
+        let block = &mut *block;
+        let output = &mut output;
 
-    // Tracks trailing CLEAN-byte run length. When it reaches
-    // MAX_WINDOW_SIZE AT a block boundary, the next 32 KiB of `output`
-    // forms a clean dict for ISA-L. Cumulative count saturates at
-    // MAX_WINDOW_SIZE (we only need the latest 32 KiB).
-    let mut trailing_clean: usize = 0;
-    // True once `trailing_clean >= MAX_WINDOW_SIZE` AND the most recent
-    // block has just finished (so the next bit position is a real block
-    // header start that ISA-L can resume from).
-    let mut clean_handoff_armed: bool;
-    let mut bfinal_hit = false;
-    // `end_bit_offset` always points just past the last completed block.
-    let mut end_bit_offset = absolute_bit_pos(byte_offset, &bits);
+        // Tracks trailing CLEAN-byte run length. When it reaches
+        // MAX_WINDOW_SIZE AT a block boundary, the next 32 KiB of `output`
+        // forms a clean dict for ISA-L. Cumulative count saturates at
+        // MAX_WINDOW_SIZE (we only need the latest 32 KiB).
+        let mut trailing_clean: usize = 0;
+        // True once `trailing_clean >= MAX_WINDOW_SIZE` AND the most recent
+        // block has just finished (so the next bit position is a real block
+        // header start that ISA-L can resume from).
+        let mut clean_handoff_armed: bool;
+        let mut bfinal_hit = false;
+        // `end_bit_offset` always points just past the last completed block.
+        let mut end_bit_offset = absolute_bit_pos(byte_offset, &bits);
 
-    loop {
-        // Snapshot the bit position BEFORE reading this block's header.
-        // This is what the next chunk's worker resumes from when this
-        // chunk hands off to ISA-L (or when this block becomes BFINAL).
-        let next_block_offset = absolute_bit_pos(byte_offset, &bits);
+        loop {
+            // Snapshot the bit position BEFORE reading this block's header.
+            // This is what the next chunk's worker resumes from when this
+            // chunk hands off to ISA-L (or when this block becomes BFINAL).
+            let next_block_offset = absolute_bit_pos(byte_offset, &bits);
 
-        // Handoff check (rapidgzip GzipChunk.hpp:520-525): if we have a
-        // clean 32 KiB tail AND we're at a real block boundary, stop
-        // bootstrap and let phase 2 run. We do this BEFORE reading the
-        // next header so `end_bit_offset` is at a clean boundary.
-        clean_handoff_armed = trailing_clean >= MAX_WINDOW_SIZE;
-        if clean_handoff_armed {
-            end_bit_offset = next_block_offset;
-            break;
-        }
-
-        // Read this block's header. `treat_last_block_as_error = false`
-        // (we WANT to see BFINAL so we can stop).
-        match block.read_header(&mut bits, false) {
-            Ok(()) => {}
-            Err(e) => {
-                return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("deflate header at bit {next_block_offset}: {e:?}"),
-                )));
+            // Handoff check (rapidgzip GzipChunk.hpp:520-525): if we have a
+            // clean 32 KiB tail AND we're at a real block boundary, stop
+            // bootstrap and let phase 2 run. We do this BEFORE reading the
+            // next header so `end_bit_offset` is at a clean boundary.
+            clean_handoff_armed = trailing_clean >= MAX_WINDOW_SIZE;
+            if clean_handoff_armed {
+                end_bit_offset = next_block_offset;
+                break;
             }
-        }
 
-        // Preemptive stop condition (rapidgzip GzipChunk.hpp:550-555):
-        // if this block's header sits at-or-past until_bits AND it is
-        // non-fixed AND not BFINAL, stop here so the chunk ends on a
-        // boundary the successor's BlockFinder can re-find.
-        let is_fixed = block.compression_type() == CompressionType::FixedHuffman;
-        if next_block_offset >= until_bits && !block.is_last_block() && !is_fixed {
-            // We've already advanced `bits` past this header. Rewind
-            // logically by reporting `end_bit_offset = next_block_offset`
-            // — the successor will re-parse the same header.
-            end_bit_offset = next_block_offset;
-            break;
-        }
-
-        // Decode the block's body, one read() call at a time, until
-        // EOB. `n_max_to_decode = usize::MAX` matches rapidgzip's
-        // `std::numeric_limits<size_t>::max()` at GzipChunk.hpp:568.
-        let before_len = output.len();
-        while !block.eob() {
-            let _ = block
-                .read(&mut bits, &mut *output, usize::MAX)
-                .map_err(|e| {
-                    ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+            // Read this block's header. `treat_last_block_as_error = false`
+            // (we WANT to see BFINAL so we can stop).
+            match block.read_header(&mut bits, false) {
+                Ok(()) => {}
+                Err(e) => {
+                    return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("deflate body at bit {next_block_offset}: {e:?}"),
-                    ))
-                })?;
-        }
+                        format!("deflate header at bit {next_block_offset}: {e:?}"),
+                    )));
+                }
+            }
 
-        // Block fully decoded. Update trailing_clean from the bytes
-        // just produced. Markers (≥ MARKER_BASE) reset the run; clean
-        // bytes extend it (saturating at MAX_WINDOW_SIZE).
-        let block_slice = &output[before_len..];
-        if !block_slice.is_empty() {
-            let trailing_this_block = block_slice
-                .iter()
-                .rev()
-                .take_while(|&&v| v < MARKER_BASE)
-                .count();
-            if trailing_this_block == block_slice.len() {
-                // Entire block was clean — extend the prior run.
-                trailing_clean = (trailing_clean + trailing_this_block).min(MAX_WINDOW_SIZE);
-            } else {
-                // A marker appeared mid-block; the trailing clean run
-                // restarts from after that last marker.
-                trailing_clean = trailing_this_block.min(MAX_WINDOW_SIZE);
+            // Preemptive stop condition (rapidgzip GzipChunk.hpp:550-555):
+            // if this block's header sits at-or-past until_bits AND it is
+            // non-fixed AND not BFINAL, stop here so the chunk ends on a
+            // boundary the successor's BlockFinder can re-find.
+            let is_fixed = block.compression_type() == CompressionType::FixedHuffman;
+            if next_block_offset >= until_bits && !block.is_last_block() && !is_fixed {
+                // We've already advanced `bits` past this header. Rewind
+                // logically by reporting `end_bit_offset = next_block_offset`
+                // — the successor will re-parse the same header.
+                end_bit_offset = next_block_offset;
+                break;
+            }
+
+            // Decode the block's body, one read() call at a time, until
+            // EOB. `n_max_to_decode = usize::MAX` matches rapidgzip's
+            // `std::numeric_limits<size_t>::max()` at GzipChunk.hpp:568.
+            let before_len = output.len();
+            while !block.eob() {
+                let _ = block
+                    .read(&mut bits, &mut *output, usize::MAX)
+                    .map_err(|e| {
+                        ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("deflate body at bit {next_block_offset}: {e:?}"),
+                        ))
+                    })?;
+            }
+
+            // Block fully decoded. Update trailing_clean from the bytes
+            // just produced. Markers (≥ MARKER_BASE) reset the run; clean
+            // bytes extend it (saturating at MAX_WINDOW_SIZE).
+            let block_slice = &output[before_len..];
+            if !block_slice.is_empty() {
+                let trailing_this_block = block_slice
+                    .iter()
+                    .rev()
+                    .take_while(|&&v| v < MARKER_BASE)
+                    .count();
+                if trailing_this_block == block_slice.len() {
+                    // Entire block was clean — extend the prior run.
+                    trailing_clean = (trailing_clean + trailing_this_block).min(MAX_WINDOW_SIZE);
+                } else {
+                    // A marker appeared mid-block; the trailing clean run
+                    // restarts from after that last marker.
+                    trailing_clean = trailing_this_block.min(MAX_WINDOW_SIZE);
+                }
+            }
+
+            end_bit_offset = absolute_bit_pos(byte_offset, &bits);
+
+            if block.is_last_block() {
+                bfinal_hit = true;
+                break;
             }
         }
 
-        end_bit_offset = absolute_bit_pos(byte_offset, &bits);
-
-        if block.is_last_block() {
-            bfinal_hit = true;
-            break;
-        }
-    }
-
-    // Build the clean dict if we have one.
-    let clean_window = if clean_handoff_armed && output.len() >= MAX_WINDOW_SIZE {
-        let start = output.len() - MAX_WINDOW_SIZE;
-        // Invariant: the trailing MAX_WINDOW_SIZE values of `output` are
-        // < MARKER_BASE (clean). Assert this — corruption here would
-        // seed ISA-L with garbage and produce a wrong-CRC chunk.
-        let window: Vec<u8> = output[start..]
-            .iter()
-            .map(|&v| {
-                assert!(
-                    v < MARKER_BASE,
-                    "bootstrap clean window contained marker at offset {}; \
+        // Build the clean dict if we have one.
+        let clean_window = if clean_handoff_armed && output.len() >= MAX_WINDOW_SIZE {
+            let start = output.len() - MAX_WINDOW_SIZE;
+            // Invariant: the trailing MAX_WINDOW_SIZE values of `output` are
+            // < MARKER_BASE (clean). Assert this — corruption here would
+            // seed ISA-L with garbage and produce a wrong-CRC chunk.
+            let window: Vec<u8> = output[start..]
+                .iter()
+                .map(|&v| {
+                    assert!(
+                        v < MARKER_BASE,
+                        "bootstrap clean window contained marker at offset {}; \
                      trailing_clean tracker broken",
-                    v.saturating_sub(MARKER_BASE)
-                );
-                v as u8
-            })
-            .collect();
-        Some(window)
-    } else {
-        None
-    };
+                        v.saturating_sub(MARKER_BASE)
+                    );
+                    v as u8
+                })
+                .collect();
+            Some(window)
+        } else {
+            None
+        };
 
-    Ok(DeflateBootstrap {
-        markers: std::mem::take(output),
-        end_bit_offset,
-        clean_window,
-        bfinal_hit,
-    })
+        Ok(DeflateBootstrap {
+            markers: std::mem::take(output),
+            end_bit_offset,
+            clean_window,
+            bfinal_hit,
+        })
     }) // BOOTSTRAP_BLOCK.with closure
 }
 

@@ -1529,11 +1529,7 @@ unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
         let src_fits = src_phys + length <= RING_SIZE;
         let dst_fits = dst_phys + length <= RING_SIZE;
         if src_fits && dst_fits {
-            std::ptr::copy_nonoverlapping(
-                ring_ptr.add(src_phys),
-                ring_ptr.add(dst_phys),
-                length,
-            );
+            std::ptr::copy_nonoverlapping(ring_ptr.add(src_phys), ring_ptr.add(dst_phys), length);
         } else {
             // Wrap-straddle non-overlap fallback (rare boundary case).
             for i in 0..length {
@@ -2261,7 +2257,11 @@ mod tests {
                 MAX_WINDOW_SIZE + i
             );
         }
-        assert_eq!(pos, MAX_WINDOW_SIZE + 100, "pos should have advanced by length=100");
+        assert_eq!(
+            pos,
+            MAX_WINDOW_SIZE + 100,
+            "pos should have advanced by length=100"
+        );
     }
 
     /// Companion to the test above: BEFORE the switch fires (chunk
@@ -2305,6 +2305,9 @@ mod tests {
         }
         // Counter: we emitted 50 markers in a row → distance to
         // last marker is 0 (the last byte written was a marker).
-        assert_eq!(distance_marker, 0, "every byte was a marker; counter should be 0");
+        assert_eq!(
+            distance_marker, 0,
+            "every byte was a marker; counter should be 0"
+        );
     }
 }
