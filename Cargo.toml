@@ -45,7 +45,7 @@ oracle = []
 # faults / 1.7s sys time on neurotic's 8 GB / 69 MB-free host;
 # perf-stat 2026-05-19). mimalloc is the most-maintained stable-Rust
 # crate with the same per-thread-arena property as rpmalloc.
-mimalloc = { version = "0.1", default-features = false }
+mimalloc = "0.1"
 
 # Compression: flate2 with zlib-ng for maximum performance
 # zlib-ng is a modernized fork with SIMD optimizations (2-3x faster)
