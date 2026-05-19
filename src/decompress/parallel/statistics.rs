@@ -121,6 +121,31 @@ impl fmt::Display for FetcherStatsSnapshot {
             "    Thread Pool Utilization:\n        Total Real Decode Duration    : {:.6} s\n        Theoretical Optimal Duration  : {:.6} s\n        Pool Efficiency (Fill Factor) : {:.2} %",
             decode_duration, optimal, self.pool_efficiency() * 100.0
         )?;
+        // Cache stats — mirror of vendor's BlockFetcher.hpp:97-118
+        // (the section vendor labels "Prefetch Cache" + "Cache Hit
+        // Rate" + "Useless Prefetches"). Populated by the prefetch-
+        // miss + cache-unused-entry counters (commit ef15b4a).
+        writeln!(
+            f,
+            "    Prefetch Cache:\n        Hits                          : {}\n        Misses                        : {}\n        Unused Entries                : {}",
+            self.prefetch_cache_hits, self.prefetch_cache_misses, self.prefetch_cache_unused_entries
+        )?;
+        let total_fetches = self.prefetch_count + self.on_demand_fetch_count;
+        let cache_hit_rate = if total_fetches > 0 {
+            self.prefetch_cache_hits as f64 / total_fetches as f64 * 100.0
+        } else {
+            0.0
+        };
+        let useless_prefetches = if self.prefetch_count > 0 {
+            self.prefetch_cache_unused_entries as f64 / self.prefetch_count as f64 * 100.0
+        } else {
+            0.0
+        };
+        writeln!(
+            f,
+            "    Cache Hit Rate                    : {:.2} %\n    Useless Prefetches                : {:.2} %",
+            cache_hit_rate, useless_prefetches
+        )?;
         Ok(())
     }
 }
