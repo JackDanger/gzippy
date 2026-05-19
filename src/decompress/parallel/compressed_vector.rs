@@ -89,6 +89,14 @@ impl CompressedVector {
         self.data.clone()
     }
 
+    /// Borrow the stored bytes. For `CompressionType::None` these are
+    /// the verbatim source bytes; for other types they are the
+    /// compressed payload. Used by `WindowMap::get`'s None-fast-path to
+    /// skip the `decompress()` Vec clone.
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
     pub fn compressed_size(&self) -> usize {
         self.data.len()
     }

@@ -529,7 +529,14 @@ fn consumer_loop<W: std::io::Write>(
             // queued post-processes per consumer iter, serializing the
             // whole pipeline (slow-path chunks effectively single-threaded
             // through the consumer). Now we drain only what's needed.
-            while window_map.get(next_block_offset).is_none() {
+            // Presence-only spin: each iteration only needs to know
+            // whether the predecessor's window has been published.
+            // Vendor's `WindowMap::get` (WindowMap.hpp:79-90) returns
+            // `shared_ptr<const CompressedVector>` — zero alloc on
+            // miss — so a presence check is free. Gzippy's `get`
+            // currently still allocates `Arc<[u8; 32768]>` on hit;
+            // `contains` skips that path entirely.
+            while !window_map.contains(next_block_offset) {
                 if pending.is_empty() {
                     // No post-process can produce the missing window —
                     // bubble the same error vendor would (a logic_error
@@ -773,7 +780,7 @@ fn run_decode_task(
 
     if trace::is_enabled() {
         let dur_us = t0.elapsed().as_micros();
-        let path = if window_map.get(params.start_bit).is_some() {
+        let path = if window_map.contains(params.start_bit) {
             "fast"
         } else {
             "slow"

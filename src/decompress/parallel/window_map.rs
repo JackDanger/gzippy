@@ -117,6 +117,21 @@ impl WindowMap {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Presence-only lookup. Returns true without materializing the
+    /// 32 KiB window — for callers that only need to test whether a
+    /// predecessor's tail has been published. Vendor's `WindowMap::get`
+    /// already returns a `shared_ptr<const Window>` (zero alloc); our
+    /// `get` allocates `Arc<[u8; 32768]>` and decompresses, so a
+    /// presence test via `get(..).is_some()` does ~32 KiB of waste per
+    /// hit. This API skips that.
+    pub fn contains(&self, encoded_offset_bits: usize) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(&encoded_offset_bits)
+    }
 }
 
 impl Default for WindowMap {
@@ -129,9 +144,22 @@ impl Default for WindowMap {
 /// the stored payload is shorter than 32 KiB (chunk-0 window) the
 /// trailing bytes are zero — matching rapidgzip's behavior of seeding
 /// the inflate dictionary with whatever is available.
+///
+/// Fast path for `CompressionType::None`: copy stored bytes directly
+/// into the output buffer. The general path allocates one Vec via
+/// `cv.decompress()` then copies into the buffer — two allocations +
+/// two copies per get for uncompressed windows. Hot path on single-
+/// pass single-member decode where every chunk gets a window from
+/// here.
 fn decompress_to_window(cv: &CompressedVector) -> Window {
-    let bytes = cv.decompress();
     let mut buf = [0u8; 32768];
+    if cv.compression_type() == CompressionType::None {
+        let src = cv.raw_bytes();
+        let n = src.len().min(buf.len());
+        buf[..n].copy_from_slice(&src[..n]);
+        return Arc::new(buf);
+    }
+    let bytes = cv.decompress();
     let n = bytes.len().min(buf.len());
     buf[..n].copy_from_slice(&bytes[..n]);
     Arc::new(buf)
@@ -206,6 +234,15 @@ mod tests {
         let result = m.get(7);
         assert!(result.is_some());
         assert_eq!(result.unwrap()[0], 0xEE);
+    }
+
+    #[test]
+    fn contains_is_zero_alloc_presence_check() {
+        let m = WindowMap::new();
+        assert!(!m.contains(42));
+        m.insert(42, window_of(0x37));
+        assert!(m.contains(42));
+        assert!(!m.contains(43));
     }
 
     #[test]
