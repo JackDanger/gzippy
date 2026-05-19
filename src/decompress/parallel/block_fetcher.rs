@@ -377,6 +377,11 @@ where
     /// `takeFromPrefetchQueue` pattern at BlockFetcher.hpp:385-410 —
     /// "take" semantically removes from prefetch queue).
     pub fn get_if_available(&self, block_offset: &Key) -> Option<Value> {
+        // Vendor BlockFetcher.hpp:280 — `processReadyPrefetches()` is
+        // called first thing in `get`. Drains completed prefetches
+        // from the in-flight map into the prefetch_cache so the
+        // cache lookup below has a chance of hitting.
+        self.process_ready_prefetches();
         // Try the prefetch cache first.
         {
             let mut pc = self.prefetch_cache.lock().unwrap();
@@ -682,6 +687,53 @@ where
 
     pub fn clear_cache(&self) {
         self.cache.lock().unwrap().clear();
+    }
+
+    /// Vendor's `processReadyPrefetches` (BlockFetcher.hpp:463) ported.
+    /// Polls every in-flight prefetch receiver non-blockingly via
+    /// `try_recv`; for each that has a ready value, moves it from the
+    /// `prefetching` map into the `prefetch_cache`. After this call,
+    /// `get_if_available` can return ready prefetches via the
+    /// prefetch-cache fast path without blocking.
+    ///
+    /// Before this method existed, gzippy's prefetch results stayed in
+    /// the `prefetching: HashMap<Key, Receiver>` map until the
+    /// consumer called `try_take_prefetched` (which blocked on
+    /// `recv()` even if the result was ready) and then inserted
+    /// directly into the MAIN cache. The prefetch_cache was always
+    /// empty → `Cache Hit Rate` in --verbose always reported 0%. The
+    /// underlying chunk was still usable but the stats were
+    /// misleading.
+    pub fn process_ready_prefetches(&self) -> usize {
+        let mut moved = 0usize;
+        let mut prefetching = self.prefetching.lock().unwrap();
+        let keys: Vec<Key> = prefetching.keys().cloned().collect();
+        for key in keys {
+            if let Some(rx) = prefetching.get(&key) {
+                match rx.try_recv() {
+                    Ok(Ok(value)) => {
+                        prefetching.remove(&key);
+                        // Insert into prefetch cache.
+                        drop(prefetching);
+                        self.prefetch_cache.lock().unwrap().insert(key, value);
+                        prefetching = self.prefetching.lock().unwrap();
+                        moved += 1;
+                    }
+                    Ok(Err(_)) => {
+                        // Worker reported failure; drop the receiver
+                        // and let downstream re-dispatch on-demand.
+                        prefetching.remove(&key);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => { /* still in flight */ }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Worker pool dropped the sender without
+                        // replying — treat as failure.
+                        prefetching.remove(&key);
+                    }
+                }
+            }
+        }
+        moved
     }
 
     pub fn clear_prefetch_cache(&self) {
