@@ -399,7 +399,14 @@ pub fn decode_chunk_with_inflate_wrapper(
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    let mut wrapper = IsalInflateWrapper::new(input, encoded_offset_bits)?;
+    // Vendor `decodeChunkWithInflateWrapper` (GzipChunk.hpp:206) constructs
+    // the wrapper with `exactUntilOffset` as the cap. That cap is enforced
+    // by `refillBuffer` at isal.hpp:231,240,248. Mirror it: use
+    // `with_until_bits` so the wrapper PHYSICALLY cannot read past
+    // `exact_until_bits`. The post-condition assertion at line 424 is
+    // now structurally backed by the cap, not just a runtime check.
+    let mut wrapper =
+        IsalInflateWrapper::with_until_bits(input, encoded_offset_bits, exact_until_bits)?;
     wrapper.set_window(initial_window)?;
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
     let t_decode = std::time::Instant::now();

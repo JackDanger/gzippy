@@ -136,9 +136,19 @@ pub struct IsalInflateWrapper<'a> {
     /// matching vendor's pattern at isal.hpp:228-250 where every
     /// bit-reader read happens inside the refill.
     bit_reader_tell: usize,
-    /// Vendor `m_buffer` (isal.hpp:207). Heap-boxed to keep stack
-    /// frames small for the worker threads.
-    buffer: Box<[u8; STAGING_BUFFER_BYTES]>,
+    /// Vendor `m_buffer` (isal.hpp:207): `std::array<char, 128_Ki>`
+    /// stored INLINE in the wrapper struct. We mirror that exactly:
+    /// no heap allocation per wrapper construction, no extra allocator
+    /// frame in the flamegraph that vendor doesn't have.
+    ///
+    /// The struct is ~128 KiB. Workers construct one per chunk, hold
+    /// it on the stack inside `decode_chunk_with_window` etc. — that
+    /// is vendor's pattern (the `IsalInflateWrapper` object lives in
+    /// `decodeChunkWithInflateWrapper`'s stack frame at GzipChunk.hpp:206).
+    /// If a future call site has a frame-size problem, that caller
+    /// can `Box::new(IsalInflateWrapper::with_until_bits(...))`; the
+    /// wrapper itself stays inline.
+    buffer: [u8; STAGING_BUFFER_BYTES],
 }
 
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
@@ -180,13 +190,17 @@ impl<'a> IsalInflateWrapper<'a> {
         state.avail_in = 0;
         state.read_in = 0;
         state.read_in_length = 0;
+        // Inline buffer: matches vendor's `std::array<char, 128_Ki>`
+        // stack-stored layout (isal.hpp:207). ~128 KiB stack frame per
+        // wrapper, same as vendor. `refill_buffer` overwrites these
+        // bytes before ISA-L reads them.
         Ok(Self {
             state,
             input,
             encoded_start_offset_bits: bit_offset,
             encoded_until_bits: capped_until,
             bit_reader_tell: bit_offset,
-            buffer: Box::new([0u8; STAGING_BUFFER_BYTES]),
+            buffer: [0u8; STAGING_BUFFER_BYTES],
         })
     }
 
