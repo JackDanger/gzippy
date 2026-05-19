@@ -1086,16 +1086,43 @@ fn run_decode_task(
         )
     };
 
-    // Publish tail window if cleanly available — workers can usually
-    // do this without waiting for apply_window. Mirror of vendor's
-    // optimisation at GzipChunkFetcher.hpp:573-575 (`getLastWindow`
-    // shortcut when the chunk has no markers).
-    if let Ok(ref c) = chunk_result {
-        if let Some(tail) = c.last_32kib_window() {
-            let end_bit = c.encoded_offset_bits + c.encoded_size_bits;
-            window_map.insert_bytes(end_bit, &tail);
-        }
-    }
+    // **DO NOT pre-emptively publish the worker's tail to window_map.**
+    //
+    // Earlier code published `c.last_32kib_window()` at
+    // `c.encoded_offset_bits + c.encoded_size_bits` here — claimed to
+    // mirror vendor's `getLastWindow` shortcut. But that key is the
+    // chunk's actual_end (the first non-fixed EOB ≥ until_bit), NOT a
+    // confirmed block boundary chosen by the consumer.
+    //
+    // When multiple speculative prefetches run concurrently (T≥9 on the
+    // 16-core neurotic bench), two workers can independently overshoot
+    // to the SAME actual_end bit position from DIFFERENT start_bits.
+    // They each compute different "last 32 KiB" bytes (different prefix
+    // history) and publish to window_map at the same key. WindowMap
+    // uses overwrite semantics (84d2ad6 — vendor's `insert_or_assign`),
+    // so the later publisher wins. Whichever wins, the OTHER chunk's
+    // successor sees the wrong window and decodes wrong bytes.
+    //
+    // Repro: gzip(1)-CLI output (`/tmp/gzipcli-large.gz`, 162 MiB) at
+    // T=9..16 produces non-deterministic wrong bytes in the last
+    // ~80 KiB of decoded output. Trace shows the corruption fires in
+    // the LAST fast-path chunk that consumes a clobbered predecessor
+    // window. Bench fixtures (`bench_all_formats.py`, gzippy-compressed,
+    // different block layout) don't trigger the race so this slipped
+    // through.
+    //
+    // Vendor pattern (GzipChunkFetcher.hpp:430-458): window publication
+    // happens in `postProcessChunk` per SUBCHUNK at confirmed block
+    // boundaries the consumer has accepted. gzippy's run_post_process_task
+    // (chunk_fetcher.rs:1163-1188) already does this — `for sc in
+    // &chunk.subchunks { window_map.insert_bytes(sc_end_bit, &w[..]); }`.
+    // That is the authoritative publish path; the worker-side
+    // pre-emptive publish was an optimization that violated the
+    // single-publisher-per-key invariant.
+    //
+    // Removing the pre-emptive publish means fast-path chunks must
+    // wait one round-trip longer for their window. That's a perf hit
+    // but correctness comes first per CLAUDE.md Rule 4.
 
     // Wrap in Arc to match BlockFetcher's `Value = Arc<ChunkData>`
     // (vendor's `std::shared_ptr<BlockData>` at BlockFetcher.hpp:46).
