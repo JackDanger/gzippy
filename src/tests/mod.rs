@@ -17,3 +17,4 @@ pub mod hot_path;
 pub mod index;
 pub mod inflate_oracle;
 pub mod routing;
+pub mod trace_parity;
