@@ -119,6 +119,22 @@ that must also handle the case where `until_bits` isn't a real EOB
 need a fallback mechanism). Risk: high if rushed; bounded if done
 carefully with a 24 MB-fixture regression test.
 
+**Followup landed (commit `ff01e44`)** — added
+`PREFETCH_REJECT_BY_GUARD` counter, reported in `--verbose`. The 22-
+of-37 on-demand rate observed in this session combined two failure
+modes (prefetch-not-ready vs guard-rejected); the new counter
+separates them. On the next bench run, the ratio of guard-rejects to
+cache-misses tells which fix actually closes the gap:
+
+  - If guard-rejects dominate → wrapper avail_in cap + chain
+    invariant is the right fix (multi-file, high regression risk).
+  - If cache-misses dominate without guard-rejects → the perf gap
+    is a scheduling/utilization problem; the wrapper cap won't help.
+
+Without this counter the prior session's "advisor 13 says it's the
+finalize divergence" conclusion couldn't be falsified against the
+alternative scheduling hypothesis.
+
 ### Speculative-trim teardown (per audit 11 Q1)
 
 gzippy's per-block subchunk emission (1127 vs vendor's 388) is
