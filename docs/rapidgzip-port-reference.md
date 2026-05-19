@@ -881,9 +881,17 @@ Status legend: ✅ DONE · 🟡 PARTIAL · ❌ NOT STARTED · ⏭ DEFERRED-by-de
     (`decompress/mod.rs::classify_gzip`), not via a unified detector
     inside the parallel SM module. Functionally equivalent; routing-layer
     placement is a gzippy-specific organizational choice.
-15. ❌ **Statistics & `--verbose` output** — `FetcherStatistics` is now
-    populated by `chunk_fetcher.rs` (record_get, record_prefetch, etc.)
-    but never exported/printed at the end of a run.
+15. ✅ **Statistics & `--verbose` output** — landed in commits
+    `52b398a` (--verbose plumbing + initial dump), `bfee46e` (worker-side
+    decodeBlock timing), `8c05901` (consumer-side get + future_wait
+    timing), `ef15b4a` (prefetch-cache-miss + cache-unused-entry
+    counters), `9a3c164` (processReadyPrefetches populates
+    prefetch_cache), `8e77404` (Prefetch Cache / Hit Rate / Useless
+    Prefetches Display fields). gzippy now mirrors vendor's
+    GzipChunkFetcher.hpp:124-198 + BlockFetcher.hpp:73-124 dump
+    structure. Direct gzippy-vs-vendor comparison enabled (audit 13
+    used this to identify the chunk-finalize divergence). Deletion-trap
+    via process-global counters tested in routing tests.
 16. ⏭ **`NoBlockInRange` exception** — gzippy returns a generic
     `ExactStopMissed` and handles re-dispatch through `consumer_loop`.
     Naming-only deviation.
