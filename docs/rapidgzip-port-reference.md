@@ -747,12 +747,11 @@ the 2026-05-18 commits:
   `decompress_to_window`.
 - `84d2ad6` overwrite semantic on `insert` (was first-wins, vendor
   uses `insert_or_assign`).
-
-Remaining divergence: gzippy's `WindowMap::get` still returns
-`Arc<[u8; 32768]>` (one alloc + memcpy) while vendor returns
-`shared_ptr<const CompressedVector>` (zero alloc). Full type port to
-`pub type Window = Arc<CompressedVector>` is filed as task #79
-(multi-file refactor through post-process worker signatures).
+- `ba6540a` `pub type Window = Arc<CompressedVector>` — matches
+  vendor `SharedWindow = shared_ptr<const CompressedVector>`
+  exactly. `get()` returns the shared pointer directly (zero alloc);
+  callers materialize bytes via the new `materialize_window` helper
+  (`Cow<[u8]>`, zero-alloc borrow for None compression).
 
 ### B13. Worker decode pathways
 
@@ -862,15 +861,16 @@ Status legend: ✅ DONE · 🟡 PARTIAL · ❌ NOT STARTED · ⏭ DEFERRED-by-de
     windows are inserted into `WindowMap` at chunk_fetcher.rs:769-776,
     and the BlockMap insertion is at chunk_fetcher.rs:784. The lookup
     chain is now closed.
-12. 🟡 **Window sparsity / window compression in the live path** —
-    `CompressedVector` is now the backing store inside `WindowMap`
-    (commit `17fd9b2`, refined in `7c524da`). Single-member
-    production uses `CompressionType::None` (chunk_fetcher.rs:208) to
-    avoid compress/decompress overhead on the single-pass path. The
-    Zlib-default path lives on `parallel_gzip_reader.rs:184`
-    (seekable reader) where windows accumulate. Full type port to
-    `pub type Window = Arc<CompressedVector>` (task #79) is the next
-    step.
+12. ✅ **Window sparsity / window compression in the live path** —
+    `CompressedVector` backs `WindowMap`'s entries (commit `17fd9b2`)
+    and `pub type Window = Arc<CompressedVector>` matches vendor's
+    `SharedWindow` type exactly (commit `ba6540a`). `WindowMap::get`
+    returns a zero-alloc shared pointer; consumers materialize bytes
+    via `materialize_window` (`Cow<[u8]>`). Single-member production
+    uses `CompressionType::None` (chunk_fetcher.rs:208) to avoid
+    compress/decompress overhead on the single-pass path. The
+    Zlib-default lives on `parallel_gzip_reader.rs:184` (seekable
+    reader) where windows accumulate.
 13. ✅ **`Footer` + multi-stream loop in `worker_loop`** — landed in
     `gzip_chunk.rs::decode_chunk_with_window` outer-loop reset cycle
     (L259-302), post commit `306c1e7`.
