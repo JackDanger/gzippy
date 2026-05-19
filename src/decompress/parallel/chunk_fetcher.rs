@@ -748,8 +748,11 @@ fn consumer_loop<W: std::io::Write>(
         // the post-process worker (run_post_process_task) when needed.
         let predecessor_window_for_postprocess: Option<Window>;
         if chunk.data_with_markers.is_empty() {
-            // No markers → apply_window is a no-op. Worker has already
-            // published the tail window via `last_32kib_window()`.
+            // No markers → apply_window is a no-op. Publish the successor
+            // window here on the consumer (single publisher, no worker race).
+            if let Some(tail) = chunk.last_32kib_window() {
+                window_map.insert_bytes(chunk_end_bit, &tail);
+            }
             predecessor_window_for_postprocess = None;
         } else {
             // Vendor `waitForReplacedMarkers` (GzipChunkFetcher.hpp:478-518)
@@ -898,6 +901,7 @@ fn consumer_loop<W: std::io::Write>(
                 });
             }
             None => {
+                // Fast-path chunk: window already published at chunk_end_bit above.
                 pending.push_back(PendingWrite::Ready {
                     idx: partition_idx_for_trace,
                     chunk,
@@ -1086,16 +1090,9 @@ fn run_decode_task(
         )
     };
 
-    // Publish tail window if cleanly available — workers can usually
-    // do this without waiting for apply_window. Mirror of vendor's
-    // optimisation at GzipChunkFetcher.hpp:573-575 (`getLastWindow`
-    // shortcut when the chunk has no markers).
-    if let Ok(ref c) = chunk_result {
-        if let Some(tail) = c.last_32kib_window() {
-            let end_bit = c.encoded_offset_bits + c.encoded_size_bits;
-            window_map.insert_bytes(end_bit, &tail);
-        }
-    }
+    // Workers must NOT publish to WindowMap (vendor: only consumer/
+    // post-process in appendSubchunksToIndexes / queueChunkForPostProcessing).
+    // Consumer publishes fast-path windows after decode (see `None` arm below).
 
     // Wrap in Arc to match BlockFetcher's `Value = Arc<ChunkData>`
     // (vendor's `std::shared_ptr<BlockData>` at BlockFetcher.hpp:46).
@@ -1287,6 +1284,22 @@ fn decode_or_iterate(
     until_bit: usize,
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
+    // Vendor GzipChunk.hpp:736-741 — `tryToDecode({ blockOffset, blockOffset })`
+    // before the expensive block-finder cascade.
+    match finish_decode_chunk_with_inexact_offset(input, start_bit, until_bit, &[], configuration) {
+        Ok(mut chunk) => {
+            SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let encoded_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+            chunk.encoded_offset_bits = start_bit;
+            chunk.max_encoded_offset_bits = start_bit;
+            chunk.encoded_size_bits = encoded_end.saturating_sub(start_bit);
+            return Ok(chunk);
+        }
+        Err(_) => {
+            SLOW_PATH_FIRST_CANDIDATE_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     const CHUNK_SIZE_BITS: usize = 8 * 1024 * 8;
     const MAX_SCAN_BITS: usize = 512 * 1024 * 8;
     let finder = BlockFinder::new(input);
