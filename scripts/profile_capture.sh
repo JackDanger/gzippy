@@ -77,7 +77,7 @@ capture_tool() {
     if [[ "$UNAME" == "Linux" ]]; then
         local perf_data="$OUT_DIR/$tool_label.perf.data"
         local folded="$OUT_DIR/$tool_label.folded"
-        perf record -F 999 -g --call-graph=dwarf -o "$perf_data" -- \
+        perf record -F 999 -g --call-graph=fp -o "$perf_data" -- \
             bash -c "for i in \$(seq $ITERATIONS); do $bin $args >/dev/null; done"
         # stackcollapse-perf.pl is the canonical Brendan Gregg tool. Try the
         # FlameGraph repo path first, then PATH, then fall back to inferno.
@@ -106,7 +106,7 @@ GZIPPY_OUT=$(capture_tool gzippy    "$GZIPPY"    "")
 RAPIDGZIP_ARGS_OVERRIDE="-d -c -P $THREADS"
 echo "── rapidgzip: capturing $ITERATIONS iterations ──" >&2
 if [[ "$UNAME" == "Linux" ]]; then
-    perf record -F 999 -g --call-graph=dwarf -o "$OUT_DIR/rapidgzip.perf.data" -- \
+    perf record -F 999 -g --call-graph=fp -o "$OUT_DIR/rapidgzip.perf.data" -- \
         bash -c "for i in \$(seq $ITERATIONS); do $RAPIDGZIP $RAPIDGZIP_ARGS_OVERRIDE \"$COMPRESSED\" >/dev/null; done"
     RAPIDGZIP_OUT="$OUT_DIR/rapidgzip.folded"
     if command -v stackcollapse-perf.pl >/dev/null 2>&1; then
