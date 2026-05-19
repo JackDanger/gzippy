@@ -24,7 +24,36 @@ pub const MARKER_BASE: u16 = 32768;
 /// are left as-is. Markers whose offset would read past the start of `window`
 /// (shouldn't happen for a well-formed deflate stream + 32 KB window) are left
 /// at their marker value — phase 3 will detect this via CRC mismatch.
+///
+/// **Vendor's branchless LUT path** (`DecodedData.hpp:314-338`): for
+/// large marker buffers (≥ 128 KiB), vendor builds a 64 KiB lookup
+/// table where slots `[0..256)` are iota-initialized (identity for
+/// literals), `[256..32768)` are zero (unused range — well-formed
+/// streams never produce these values), and `[32768..65536)` hold
+/// the window bytes. The hot loop becomes `target[i] =
+/// fullWindow[chunk[i]]` — a single branchless load per element.
+///
+/// The threshold matters: building the 64 KiB LUT costs ~64 KiB of
+/// stack zeroing + a 32 KiB window copy ≈ 96 KiB written. For tiny
+/// marker buffers, the per-element branch is cheaper than building
+/// the LUT. Vendor's 128 KiB threshold is empirical.
+///
+/// Falls back to the per-element branch path for small markers (and
+/// is the only path on hosts without runtime AVX2 detection or with
+/// the lookup-table size budget exceeded — currently 64 KiB on stack
+/// is always available).
 pub fn replace_markers(data: &mut [u16], window: &[u8]) {
+    // Vendor's threshold (`DecodedData.hpp:315`): `markerCount >= 128_Ki`.
+    // gzippy's `dataWithMarkers` is u16, so a u16 element count of
+    // 128 KiB corresponds to 256 KiB of bytes; we use the element
+    // count directly (matches vendor's `markerCount` semantic which
+    // is element count of the `Vec<uint16_t>` markers).
+    const LUT_THRESHOLD_ELEMENTS: usize = 128 * 1024;
+    if data.len() >= LUT_THRESHOLD_ELEMENTS && window.len() == 32768 {
+        replace_markers_lut(data, window);
+        return;
+    }
+
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
@@ -40,6 +69,48 @@ pub fn replace_markers(data: &mut [u16], window: &[u8]) {
     }
     #[allow(unreachable_code)]
     replace_markers_scalar(data, window);
+}
+
+/// Branchless lookup-table marker replacement. Literal port of
+/// vendor's `DecodedData::applyWindow` body at
+/// `DecodedData.hpp:316-337`. Builds a 64 KiB stack-allocated LUT
+/// where:
+///   - `lut[0..256]` = identity (`0u8..=255u8`) — literal bytes pass
+///     through unchanged.
+///   - `lut[256..32768]` = 0 — unused range; well-formed streams
+///     never produce these values.
+///   - `lut[32768..65536]` = `window[0..32768]` — markers (with
+///     `MARKER_BASE` offset already encoded in the high bit).
+///
+/// Hot loop: `data[i] = lut[data[i] as usize] as u16` — one load,
+/// zero branches. Auto-vectorizable.
+///
+/// Requires `window.len() == 32768`. Caller's responsibility (the
+/// `replace_markers` dispatcher checks).
+fn replace_markers_lut(data: &mut [u16], window: &[u8]) {
+    debug_assert_eq!(
+        window.len(),
+        32768,
+        "vendor LUT path requires 32 KiB window"
+    );
+    let mut lut = [0u8; 65536];
+    // [0..256): iota — literal byte passthrough.
+    for (i, slot) in lut[0..256].iter_mut().enumerate() {
+        *slot = i as u8;
+    }
+    // [256..32768): zero (already initialized to 0).
+    // [32768..65536): the predecessor window.
+    lut[MARKER_BASE as usize..MARKER_BASE as usize + 32768].copy_from_slice(window);
+
+    // Hot loop. Vendor's comment at DecodedData.hpp:327-331 explicitly
+    // avoids `std::transform` because out-of-order execution could
+    // overwrite slots before they're read — but for our in-place u16
+    // mutation, the read of `data[i]` happens before the write, so
+    // out-of-order is safe. We use a tight indexed loop to give LLVM
+    // the freedom to auto-vectorize.
+    for val in data.iter_mut() {
+        *val = lut[*val as usize] as u16;
+    }
 }
 
 #[inline]
