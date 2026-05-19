@@ -142,6 +142,18 @@ fn new_unsplit_blocks() -> UnsplitBlocks {
 pub static UNSPLIT_BLOCKS_EMPLACED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Counter incremented every time `lookup_next_block_offset` accepts a
+/// `GetReturnCode::Failure` with offset == `file_size_in_bits` as a
+/// valid worker stop hint (mirror of vendor's BlockFetcher.hpp:533-535
+/// asymmetry). Without this asymmetry, the LAST prefetch in any file
+/// was always skipped because the `idx+1` lookup returned Failure even
+/// though the offset value was usable. On the 3-partition 221 MB
+/// fixture this expands prefetch dispatch from 1→3 chunks in parallel.
+///
+/// Not cfg-gated for the same reason as UNSPLIT_BLOCKS_EMPLACED.
+pub static PREFETCH_NEXT_FILESIZE_ACCEPT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug)]
 pub enum FetchError {
     Decode(ChunkDecodeError),
@@ -480,10 +492,30 @@ fn consumer_loop<W: std::io::Write>(
 
         // `lookup_block_offset` mirrors vendor's `m_blockFinder->get(idx, 0)`
         // at BlockFetcher.hpp:479 — non-blocking lookup, returns the
-        // confirmed block offset for `idx` if known.
+        // confirmed block offset for `idx` if known. SUCCESS-only:
+        // the current-index lookup vendor uses at
+        // BlockFetcher.hpp:533 rejects Failure outright.
         let lookup_block_offset = |idx: usize| -> Option<usize> {
             match block_finder.get(idx) {
                 (Some(offset), GetReturnCode::Success) => Some(offset),
+                _ => None,
+            }
+        };
+        // `lookup_next_block_offset` — for the WORKER'S STOP HINT
+        // (the `idx+1` lookup at BlockFetcher.hpp:535). Vendor accepts
+        // `file_size_in_bits` as a valid stop hint for the LAST
+        // chunk's prefetch. Without this asymmetry, the loop at
+        // `prefetch_new_blocks` line 589 skips the last prefetch in
+        // any file, leaving 1 prefetch dispatched instead of 3 on
+        // the 221 MB / 3-partition fixture (bench-2026-05-18).
+        let lookup_next_block_offset = |idx: usize| -> Option<usize> {
+            match block_finder.get(idx) {
+                (Some(offset), GetReturnCode::Success) => Some(offset),
+                (Some(offset), GetReturnCode::Failure) if offset == total_bits => {
+                    PREFETCH_NEXT_FILESIZE_ACCEPT
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(offset)
+                }
                 _ => None,
             }
         };
@@ -570,6 +602,7 @@ fn consumer_loop<W: std::io::Write>(
                         submit_decode_to_pool(thread_pool, input, params, window_map, configuration)
                     },
                     lookup_block_offset,
+                    lookup_next_block_offset,
                     prefetch_submit,
                     is_finalized_too_high,
                     partition_offset_for,

@@ -260,11 +260,12 @@ where
     /// Returns `(value, prefetches_submitted_count)` so the caller can
     /// log / stat-record without re-querying.
     #[allow(clippy::too_many_arguments)]
-    pub fn get_with_prefetch<S, L, P, F, PO>(
+    pub fn get_with_prefetch<S, L, LN, P, F, PO>(
         &self,
         block_offset: Key,
         submit: S,
         lookup_block_offset: L,
+        lookup_next_block_offset: LN,
         submit_for_prefetch: P,
         is_finalized_and_index_too_high: F,
         partition_offset_for: PO,
@@ -273,6 +274,10 @@ where
     where
         S: FnOnce(Key) -> Receiver<Result<Value, Err>>,
         L: Fn(usize) -> Option<Key>,
+        // `lookup_next_block_offset` — see `prefetch_new_blocks` doc.
+        // Permits `file_size_in_bits` for the last chunk's stop hint
+        // (vendor BlockFetcher.hpp:533-535 asymmetry).
+        LN: Fn(usize) -> Option<Key>,
         // Vendor's prefetch task captures both offset and nextOffset
         // (BlockFetcher.hpp:555-557). See `prefetch_new_blocks`.
         P: Fn(Key, Key) -> Receiver<Result<Value, Err>>,
@@ -300,6 +305,7 @@ where
         if should_drive_prefetch {
             prefetched += self.prefetch_new_blocks(
                 &lookup_block_offset,
+                &lookup_next_block_offset,
                 &submit_for_prefetch,
                 &is_finalized_and_index_too_high,
                 &partition_offset_for,
@@ -319,6 +325,7 @@ where
                     if should_drive_prefetch {
                         prefetched += self.prefetch_new_blocks(
                             &lookup_block_offset,
+                            &lookup_next_block_offset,
                             &submit_for_prefetch,
                             &is_finalized_and_index_too_high,
                             &partition_offset_for,
@@ -498,15 +505,28 @@ where
     ///
     /// Returns the number of new prefetch tasks submitted (for stats /
     /// trace purposes).
-    pub fn prefetch_new_blocks<L, S, F, PO>(
+    pub fn prefetch_new_blocks<L, LN, S, F, PO>(
         &self,
         lookup_block_offset: L,
+        lookup_next_block_offset: LN,
         submit_for: S,
         is_finalized_and_index_too_high: F,
         partition_offset_for: PO,
     ) -> usize
     where
         L: Fn(usize) -> Option<Key>,
+        // Vendor BlockFetcher.hpp:533-535 differentiates between the
+        // CURRENT index's offset lookup (SUCCESS-only — failure means
+        // skip) and the NEXT index's offset lookup (the worker's stop
+        // hint, which may be `file_size_in_bits` for the last chunk).
+        // gzippy's prior single-`lookup_block_offset` collapsed both
+        // behind the SUCCESS-only check, so the LAST prefetch in a
+        // file was always skipped because `lookup(last_idx + 1)`
+        // returned `GetReturnCode::Failure` even though the offset
+        // value (`file_size_in_bits`) was a perfectly usable stop hint.
+        // Asymmetric split lets `lookup_next_block_offset` accept the
+        // file-size sentinel.
+        LN: Fn(usize) -> Option<Key>,
         // Mirror of vendor's `decodeAndMeasureBlock(offset, nextOffset)`
         // capture at BlockFetcher.hpp:555-557 — both the prefetched
         // block's offset AND the next block's offset are captured in
@@ -586,7 +606,12 @@ where
             // BlockFetcher.hpp:519-520 — `m_blockFinder->get(idx + 1, ...)`
             // to compute nextOffset (the worker's stop hint).
             // BlockFetcher.hpp:535 — drop if nextOffset is missing.
-            let next_prefetch_block_offset = match lookup_block_offset(index + 1) {
+            //
+            // Uses `lookup_next_block_offset` (NOT `lookup_block_offset`)
+            // because vendor accepts `file_size_in_bits` here as the
+            // stop hint for the last chunk in the file. The current-
+            // index lookup above remains SUCCESS-only.
+            let next_prefetch_block_offset = match lookup_next_block_offset(index + 1) {
                 Some(o) => o,
                 None => continue,
             };

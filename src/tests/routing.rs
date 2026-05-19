@@ -386,6 +386,49 @@ mod tests {
     }
 
     // =========================================================================
+    // Prefetch dispatch reaches the last-chunk stop hint
+    //
+    // Vendor BlockFetcher.hpp:533-535 accepts `file_size_in_bits` as the
+    // worker's `nextOffset` for the LAST prefetch in a file. Without
+    // this asymmetric lookup, gzippy's `lookup_block_offset(idx+1)`
+    // returned `None` on `GetReturnCode::Failure` and the prefetch loop
+    // skipped the last chunk — observed on the 221 MB / 3-partition
+    // fixture (bench-2026-05-18). This trap asserts the new
+    // `lookup_next_block_offset` accepts the file-size sentinel during
+    // a real parallel SM decode.
+    // =========================================================================
+    #[test]
+    fn test_prefetch_next_filesize_accept_fires() {
+        use std::sync::atomic::Ordering;
+
+        // Same fixture shape as test_unsplit_blocks_emplaces — guarantees
+        // multiple partitions so prefetch_new_blocks iterates at least
+        // through the last-block's idx+1 lookup.
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+
+        let before = crate::decompress::parallel::chunk_fetcher::PREFETCH_NEXT_FILESIZE_ACCEPT
+            .load(Ordering::Relaxed);
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        assert_eq!(output, original);
+        let after = crate::decompress::parallel::chunk_fetcher::PREFETCH_NEXT_FILESIZE_ACCEPT
+            .load(Ordering::Relaxed);
+
+        #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+        assert!(
+            after > before,
+            "PREFETCH_NEXT_FILESIZE_ACCEPT did not increment ({before} -> {after}); \
+             the asymmetric lookup_next_block_offset at chunk_fetcher.rs (mirror of \
+             vendor BlockFetcher.hpp:533-535) is unreachable. Without this asymmetry, \
+             the last prefetch in any file is skipped — visible on the 3-partition \
+             fixture as a 1.24-CPU serial bottleneck on a 16-core machine."
+        );
+        #[cfg(not(all(target_arch = "x86_64", feature = "isal-compression")))]
+        let _ = (before, after);
+    }
+
+    // =========================================================================
     // Performance regression guard — the CI gap that masked v0.3.0.
     //
     // The single-member parallel path must not be SLOWER than the single-thread
