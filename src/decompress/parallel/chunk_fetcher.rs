@@ -672,12 +672,28 @@ fn consumer_loop<W: std::io::Write>(
         // resolve a request for an internal subchunk offset back to
         // its parent chunk in cache. Single-pass streaming never
         // hits this lookup; the emplace is structural scaffolding for
-        // the seekable-reader path. `next_block_offset` is the cache
-        // key the parent chunk was retrieved under (vendor's
-        // `lookupKey` at `:387-389`).
+        // the seekable-reader path.
         if chunk.subchunks.len() > 1 {
+            // Vendor `:384-389` — `lookupKey` is the cache key under
+            // which the parent chunk is findable, which can be EITHER
+            // the chunk's actual encoded offset OR the partition
+            // offset, depending on which one the cache holds:
+            //   if !test(chunkOffset) && test(partitionOffset):
+            //       partitionOffset
+            //   else:
+            //       chunkOffset
+            // The prefetch-take path inserts under the partition
+            // offset, so a chunk that came off the prefetch queue at a
+            // speculative partition seed has its parent keyed under
+            // partitionOffset, not its actual chunkOffset.
             let chunk_offset = chunk.encoded_offset_bits;
-            let lookup_key = next_block_offset;
+            let partition_offset = block_finder.partition_offset_containing_offset(chunk_offset);
+            let lookup_key =
+                if !block_fetcher.test(&chunk_offset) && block_fetcher.test(&partition_offset) {
+                    partition_offset
+                } else {
+                    chunk_offset
+                };
             let mut unsplit = unsplit_blocks.lock().unwrap();
             for sc in &chunk.subchunks {
                 if sc.encoded_offset_bits != chunk_offset {
