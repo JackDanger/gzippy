@@ -732,12 +732,20 @@ and hands off to ISA-L when it crosses `MAX_WINDOW_SIZE`. gzippy
 `CleanTailTracker` that only counts the **trailing** clean bytes.
 Stricter; produces more marker-only chunks.
 
-### B12. `WindowMap` blocking and storage
+### B12. `WindowMap` blocking and storage — RESOLVED (2026-05-17 / 2026-05-18)
 
-rapidgzip: `std::map<size_t, SharedWindow>` + `std::mutex`, **no
-condvar**; windows are `CompressedVector`. gzippy
-(`window_map.rs:23-96`): `BTreeMap<usize, Arc<[u8;32768]>>` + `Mutex`
-+ `Condvar` (workers block on `get_or_wait`). Windows uncompressed.
+Closed by audit step 5 (Condvar removed; vendor has no condvar) and
+the 2026-05-18 commits:
+- `7c524da` zero-alloc presence check (`contains`) + None-fast
+  `decompress_to_window`.
+- `84d2ad6` overwrite semantic on `insert` (was first-wins, vendor
+  uses `insert_or_assign`).
+
+Remaining divergence: gzippy's `WindowMap::get` still returns
+`Arc<[u8; 32768]>` (one alloc + memcpy) while vendor returns
+`shared_ptr<const CompressedVector>` (zero alloc). Full type port to
+`pub type Window = Arc<CompressedVector>` is filed as task #79
+(multi-file refactor through post-process worker signatures).
 
 ### B13. Worker decode pathways
 
@@ -774,37 +782,18 @@ and would not handle a multi-member input through this path. (Routing
 in `decompress/mod.rs:76-82` sends multi-member to a different code path
 entirely.)
 
-### B16. **Silent libdeflate fallback (THE invariant violation)**
+### B16. **Silent libdeflate fallback** — RESOLVED
 
-rapidgzip has **no fallback**. If a chunk decode fails, it throws.
-
-gzippy's routing layer (`decompress/mod.rs:207-260`) falls back through
-three escape hatches:
-
-1. **Gate-bypass fallback** — if the parallel gate at L218-222 fails
-   (no ISA-L, T==1, or data ≤ 10 MiB), control never enters the
-   parallel path. Drops to L240+ (ISA-L sequential) or L259
-   (libdeflate). Falls through silently.
-2. **Routing-failure fallback** — if `decompress_parallel` returns
-   `ParallelError::TooSmall`, `map_parallel_single_member_error`
-   (L262-287) returns `None`, which causes the outer match in
-   `decompress_single_member` to **continue past the parallel
-   attempt** to the ISA-L sequential / libdeflate fallback at L240+.
-3. **ISA-L-stream fallback** — `isal_decompress::decompress_gzip_stream`
-   at L241 silently moves to `decompress_single_member_libdeflate` at
-   L259 if it returns None.
-
-The fallback fires **silently** in case 1 and case 3. Case 2 emits a
-debug log if `GZIPPY_DEBUG=1` (L270). The bench script captures
-stderr and prints `[SILENT FALLBACK: marker pipeline did not run
-end-to-end]`
-(`scripts/benchmark_single_member.py:171,418-419`), which is how the
-user discovered this.
-
-The deletion-trap killer test
-(`src/tests/routing.rs:298-344`) catches case 2 because it asserts
-`MARKER_PIPELINE_RUNS` incremented after a decode. It does **not**
-catch case 1 or case 3.
+`decompress_single_member` (`src/decompress/mod.rs:230-294`) is now a
+pure dispatcher: it classifies once and hands off to exactly one
+backend. Each backend either succeeds or returns
+`Err(GzippyError::Decompression(_))`. The function-level doc reads
+"**No fallback.**" The deletion-trap killer test
+`test_marker_pipeline_actually_runs_on_x86_64_isal`
+(`src/tests/routing.rs`) continues to gate the parallel path's
+invocation. `LIBDEFLATE_SM_CALLS` and `ISAL_STREAM_SM_CALLS`
+counters (mod.rs:262, 270) provide test-only fences confirming
+the routing decision matched the gate.
 
 ---
 
@@ -859,8 +848,15 @@ Status legend: ✅ DONE · 🟡 PARTIAL · ❌ NOT STARTED · ⏭ DEFERRED-by-de
     windows are inserted into `WindowMap` at chunk_fetcher.rs:769-776,
     and the BlockMap insertion is at chunk_fetcher.rs:784. The lookup
     chain is now closed.
-12. ❌ **Window sparsity / window compression in the live path** —
-    `CompressedVector` is unused.
+12. 🟡 **Window sparsity / window compression in the live path** —
+    `CompressedVector` is now the backing store inside `WindowMap`
+    (commit `17fd9b2`, refined in `7c524da`). Single-member
+    production uses `CompressionType::None` (chunk_fetcher.rs:208) to
+    avoid compress/decompress overhead on the single-pass path. The
+    Zlib-default path lives on `parallel_gzip_reader.rs:184`
+    (seekable reader) where windows accumulate. Full type port to
+    `pub type Window = Arc<CompressedVector>` (task #79) is the next
+    step.
 13. ✅ **`Footer` + multi-stream loop in `worker_loop`** — landed in
     `gzip_chunk.rs::decode_chunk_with_window` outer-loop reset cycle
     (L259-302), post commit `306c1e7`.
@@ -925,18 +921,27 @@ Status legend: ✅ DONE · 🟡 PARTIAL · ❌ NOT STARTED · ⏭ DEFERRED-by-de
    `GZIPPY_LOG_FILE`.
 8. **`MARKER_PIPELINE_RUNS` + `MARKER_PIPELINE_TEST_LOCK`** — test
    counter to catch silent fallback. Catches case 2 of §F only.
-9. **`WindowMap::get_or_wait` with Condvar** — workers block on
-   predecessor's window. Rapidgzip's WindowMap has no condvar.
+9. ~~`WindowMap::get_or_wait` with Condvar~~ — REMOVED (audit
+   step 5, 2026-05-17). gzippy's `WindowMap` is now plain `Mutex` +
+   `BTreeMap`, vendor-faithful. Workers do non-blocking `get`;
+   ordering is enforced by the per-block future dispatch from
+   `BlockFetcher::get`.
 10. **`ChunkDecodeError::ExactStopMissed { requested, actual }`** —
     explicit variant.
 11. **The `gzippy-parallel` "GZ" FEXTRA path** (in `decompress/bgzf.rs`,
     out of scope).
-12. **Routing-layer fallback to libdeflate** (`decompress/mod.rs`
-    L240-260). The thing this branch must kill.
-13. **Reference ports of rapidgzip primitives sitting next to live
-    code** — `block_fetcher.rs`, `block_map.rs`, `cache.rs`,
-    `prefetcher.rs`, `statistics.rs`, `compressed_vector.rs`,
-    `deflate_block.rs`. ~3600 LOC of unused code (see §E counts).
+12. ~~Routing-layer fallback to libdeflate~~ — REMOVED.
+    `decompress_single_member` (mod.rs:230) is now a pure dispatcher
+    with explicit "No fallback" contract. See B16.
+13. ~~Reference ports of rapidgzip primitives sitting next to live
+    code~~ — REWIRED (2026-05-18). `block_fetcher`, `block_map`,
+    `cache`, `prefetcher`, `statistics`, `compressed_vector`,
+    `deflate_block` are all now reachable from the production
+    consumer (see §E per-file status). The remaining genuinely
+    unwired modules are the in-scope vendor-port surface
+    (`huffman_reversed_*`, `huffman_double_literal_cached`,
+    `huffman_short_bits_*`, `index_file_format`) — kept per
+    CLAUDE.md "Active port" scope listing.
 
 ---
 
@@ -1085,60 +1090,56 @@ critical for the slow-path bootstrap.
 
 Entirely gzippy-original. JSON-lines event log keyed off `GZIPPY_LOG_FILE`.
 
-### `src/decompress/parallel/block_fetcher.rs` (323 lines) — UNUSED
+### `src/decompress/parallel/block_fetcher.rs` (323 lines) — **WIRED** (post 2026-05-18)
 
-Literal port of `core/BlockFetcher.hpp:41-688`. `BlockFetcher`
-composes `Cache` + `Cache` (prefetch) + `FetchingStrategy` +
-`ChunkFetcherStatistics`. Public surface: `test`, `get_if_available`,
-`insert`, `insert_prefetched`, `record_on_demand_fetch`,
-`note_prefetch_started`/`completed`, `mark_failed_prefetch`,
-`is_failed_prefetch`, `record_fetch`, `prefetch_indexes`,
-`last_fetched`, `clear_cache`/`clear_prefetch_cache`,
-`cache_statistics`. **No production caller.** Tests live in this file
-(L240-320).
+Literal port of `core/BlockFetcher.hpp:41-688`. Used by
+`chunk_fetcher.rs:225` as `Arc<BlockFetcher<usize, Arc<ChunkData>,
+FetchNextAdaptive, ChunkDecodeError>>` to back the consumer-side
+cache + prefetch dispatch.
 
-### `src/decompress/parallel/block_map.rs` (317 lines) — UNUSED
+### `src/decompress/parallel/block_map.rs` (317 lines) — **WIRED** (post 2026-05-18)
 
-Literal port of `core/BlockMap.hpp`. `BlockMap::push`,
-`find_data_offset`, `get_encoded_offset`. Helper
-`append_subchunks_to_block_map(map, chunk)` (L205-213) wraps the
-rapidgzip cascade. **Not called by the production consumer.**
+`append_subchunks_to_block_map(map, chunk)` is called inside the
+consumer loop at `chunk_fetcher.rs:579` after each chunk's
+post-process completes. Mirrors `GzipChunkFetcher.hpp:373` (push per
+subchunk into the block map).
 
-### `src/decompress/parallel/cache.rs` (289 lines) — UNUSED
+### `src/decompress/parallel/cache.rs` (289 lines) — **WIRED** (via block_fetcher)
 
 LRU `Cache<K,V,Strategy>` + `LeastRecentlyUsed` + `CacheStatistics`.
-Faithful to `core/Cache.hpp`. Tests in-file.
+Reachable from production via `BlockFetcher::new` composing the
+main + prefetch caches.
 
-### `src/decompress/parallel/prefetcher.rs` (283 lines) — UNUSED
+### `src/decompress/parallel/prefetcher.rs` (283 lines) — **WIRED** (via block_fetcher)
 
-`FetchingStrategy` trait + `FetchNextFixed` + `FetchNextAdaptive`.
-Faithful to `core/Prefetcher.hpp`.
+`FetchNextAdaptive` is the strategy plugged into `BlockFetcher` at
+`chunk_fetcher.rs:229`. Faithful to `core/Prefetcher.hpp`.
 
-### `src/decompress/parallel/statistics.rs` (350 lines) — UNUSED
+### `src/decompress/parallel/statistics.rs` (350 lines) — **WIRED** (record-only)
 
-`FetcherStatsSnapshot`, `FetcherStatistics`,
-`ChunkFetcherStatistics` (aggregates fetcher + cache stats). Faithful
-to `BlockFetcher::Statistics` + `GzipChunkFetcher::Statistics`. Never
-populated.
+`ChunkFetcherStatistics` lives on `BlockFetcher` and is updated from
+the consumer (e.g. `chunk_fetcher.rs:588` `record_get`). Not yet
+exported via `--verbose` output — open task (C15).
 
-### `src/decompress/parallel/compressed_vector.rs` (219 lines) — UNUSED
+### `src/decompress/parallel/compressed_vector.rs` (227 lines) — **WIRED** (post 2026-05-18)
 
-`CompressedVector` with `CompressionType::{None, Zlib, Gzip,
-Deflate}`. Faithful to `CompressedVector.hpp`. `WindowMap` still holds
-uncompressed `Arc<[u8;32768]>`.
+`CompressedVector` now backs `WindowMap`'s entry storage
+(`window_map.rs:39`). Single-member production uses
+`CompressionType::None` (`chunk_fetcher.rs:208-210`) for the
+single-pass case where compression is pure overhead. `raw_bytes()`
+accessor (added in commit `7c524da`) lets `WindowMap::get` skip the
+`decompress()` Vec clone on the None path.
 
-### `src/decompress/parallel/deflate_block.rs` (964 lines) — UNUSED
+### `src/decompress/parallel/deflate_block.rs` (~2400 lines, post-consolidation) — **WIRED** (slow-path bootstrap)
 
-Faithful port of `deflate::Block` skeleton, `read_header`,
-`read_dynamic_huffman_coding`, `read`, `read_internal_uncompressed`,
-`read_internal_compressed`, canonical Huffman decoder, `emit_backref`
-with marker emission. Round-trip-verified against flate2-produced
-blocks (tests L818+). **No production caller invokes it** — the entire
-slow-path bootstrap goes through `fast_marker_inflate.rs` instead. The
-marker encoding `emit_backref` uses (per L640-675) does not match
-`replace_markers.rs::MARKER_BASE` semantics (B1) — so even if wired,
-markers from `deflate_block` would be resolved incorrectly by the
-current `replace_markers`.
+Faithful port of `deflate::Block` with the full vendor ring buffer
+(marker pre-init, contains_marker_bytes flag, mid-decode mode switch,
+const-generic split, AVX2 narrow path, emit_backref via copy_within,
+RLE memset fast path). Wired into `gzip_chunk.rs::
+bootstrap_with_deflate_block` via a thread-local recycled `Block`
+(commit `17fd9b2`). The fast path (chunk with predecessor window) still
+uses ISA-L set_dict (substitution of a faster primitive per CLAUDE.md
+Rule 6).
 
 ### `src/decompress/parallel/gzip_format.rs` (260 lines)
 
