@@ -519,7 +519,7 @@ mod tests {
     fn test_no_libdeflate_fallback_ever_fires_from_sm_path() {
         // Build an input above MIN_PARALLEL_COMPRESSED so the classifier
         // returns IsalParallelSM.
-        let original: Vec<u8> = (0..(24 * 1024 * 1024))
+        let original: Vec<u8> = (0u32..(24 * 1024 * 1024))
             .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
             .collect();
         let mut compressed = Vec::new();
@@ -556,7 +556,7 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
     #[test]
     fn test_parallel_sm_propagates_errors_not_fallbacks() {
-        let original: Vec<u8> = (0..(24 * 1024 * 1024))
+        let original: Vec<u8> = (0u32..(24 * 1024 * 1024))
             .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
             .collect();
         let mut compressed = Vec::new();

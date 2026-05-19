@@ -1341,6 +1341,7 @@ mod tests {
     #[test]
     #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
     fn stopping_point_boundaries_match_oracle() {
+        use super::*;
         use crate::decompress::parallel::deflate_block::record_block_starts;
         use std::collections::HashSet;
         use std::io::Write;
