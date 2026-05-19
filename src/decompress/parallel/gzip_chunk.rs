@@ -337,6 +337,42 @@ pub fn decode_chunk_with_window(
     }
 
     chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+    // VENDOR DIVERGENCE (documented 2026-05-19, audit 13): vendor
+    // finalizes at `exactUntilOffset` (GzipChunk.hpp:265) — the
+    // consumer's requested upper bound, NOT the worker's actual stop.
+    // Vendor's IsalInflateWrapper caps `avail_in` at the byte for
+    // `m_encodedUntilOffset` (gzip/isal.hpp:231,240,248) so the worker
+    // genuinely stops at that bit position; the assertion at
+    // GzipChunk.hpp:252-263 throws if `tellCompressed() !=
+    // exactUntilOffset`. Vendor's chain invariant therefore holds:
+    // chunk_N.encoded_end == until_bits_of_N == partition_seed ==
+    // chunk_{N+1}.encoded_offset, so `matchesEncodedOffset` returns
+    // true for prefetched chunks and the prefetch is consumed.
+    //
+    // gzippy's wrapper does NOT cap `avail_in` (inflate_wrapper.rs:116
+    // takes input but no until_bit). Worker reads past until_bits to
+    // the next EOB ≥ until_bits. last_end_bit > until_bits. Finalizing
+    // at last_end_bit means block_finder.insert publishes that value,
+    // and the consumer's next_block_offset is > the partition seed
+    // under which the prefetch was dispatched. matchesEncodedOffset
+    // returns FALSE (max == partition_seed < next_block_offset) →
+    // prefetch rejected → on-demand fresh decode.
+    //
+    // Result (measured via --verbose 2026-05-19): 22 of 37 fetches
+    // are on-demand vs vendor's 1 of 21. Pool Efficiency 27.9% vs
+    // 64.2%. Decoded CPU 2.19s vs 0.527s (4× more — every rejected
+    // prefetch is wasted work).
+    //
+    // FIX (deferred): port the wrapper's `m_encodedUntilOffset` cap
+    // into `IsalInflateWrapper::refill_buffer` (gzippy doesn't have
+    // refill today — wrapper sets avail_in once in `new`). Then
+    // finalize at until_bits is consistent with the worker's actual
+    // stop and the chain invariant holds. Multi-file change requiring
+    // careful correctness validation (vendor's assertion at
+    // GzipChunk.hpp:252-263 throws when until_bits isn't a real EOB —
+    // for gzippy's partition guesses, that would mean reverting to
+    // fallback decoding which we don't yet implement). Filed for
+    // future autonomous session.
     chunk.finalize(last_end_bit);
     Ok(chunk)
 }
