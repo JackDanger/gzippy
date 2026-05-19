@@ -1277,7 +1277,7 @@ mod tests {
             return;
         }
 
-        let mut rng: u64 = 0xb0undary;
+        let mut rng: u64 = 0xb0_b0_b0_b0_de_ad_be_ef;
         for seed in 0u64..8 {
             rng = seed.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(1);
             // ~128 KB of mixed-entropy data.
