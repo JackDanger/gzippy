@@ -5,19 +5,32 @@
 //! consumes raw deflate bits.
 //!
 //! Surface mirrors rapidgzip's class for the parts we use:
-//!   - new(input, bit_offset): construct + seek to start bit (incl.
-//!     inflatePrime for non-byte-aligned starts).
+//!   - new(input, bit_offset): construct + seek to start bit.
+//!   - with_until_bits(input, bit_offset, until_bits): mirror of
+//!     vendor's `IsalInflateWrapper(BitReader, untilOffset)` ctor at
+//!     `gzip/isal.hpp:32-44`. The `until_bits` value caps how far the
+//!     refillBuffer step is allowed to advance the bit reader — i.e.
+//!     ISA-L physically cannot read input past this bit position.
 //!   - set_window(&[u8]): set the decoder's 32-KiB dictionary.
 //!   - set_stopping_points(StoppingPoints): request the patched ISA-L
-//!     to pause on END_OF_BLOCK / END_OF_BLOCK_HEADER / END_OF_STREAM*
-//!     events.
+//!     to pause on END_OF_BLOCK / END_OF_BLOCK_HEADER / END_OF_STREAM*.
 //!   - read_stream(output): pump bytes into `output`, returning when
 //!     the buffer is full, a stop point fires, or decode finishes.
-//!   - stopped_at() -> StoppingPoints, is_final_block() -> bool,
-//!     btype() -> Option<DeflateCompressionType>, tell_compressed() -> usize.
+//!   - stopped_at(), is_final_block(), btype(), tell_compressed().
 //!
-//! Out of scope: gzip/zlib header parsing (caller's responsibility),
-//! multi-stream footer accumulation (multi-member uses a different path).
+//! Class shape (matches vendor isal.hpp:198-212 field-for-field where
+//! Rust permits):
+//!   - `input` is the underlying bytes (vendor stores a `BitReader`,
+//!     which is conceptually a `(slice, bit_cursor)` pair).
+//!   - `bit_reader_tell` is the vendor `m_bitReader.tell()` value.
+//!   - `encoded_start_offset_bits`, `encoded_until_bits` mirror
+//!     `m_encodedStartOffset`, `m_encodedUntilOffset`.
+//!   - `buffer` is the 128 KiB staging area `m_buffer` at isal.hpp:207.
+//!     Vendor's comment there: "Loading the whole encoded data
+//!     (multiple MiB) into memory first and then decoding it in one go
+//!     is 4x slower than processing it in chunks of 128 KiB!"
+//!   - `refill_buffer()` is the literal port of `refillBuffer()` at
+//!     isal.hpp:228-250.
 //
 // Allowed dead_code: this module is part of step 4 of the
 // rapidgzip-port-design.md migration; consumed by gzip_chunk.rs in
@@ -27,6 +40,9 @@
 
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use isal::isal_sys::igzip_lib as isal_raw;
+
+/// Vendor `m_buffer` capacity at `gzip/isal.hpp:207` (`std::array<char, 128_Ki>`).
+const STAGING_BUFFER_BYTES: usize = 128 * 1024;
 
 /// Bit-flag set matching the patched ISA-L's `ISAL_STOPPING_POINT_*`
 /// constants. Port of `rapidgzip::StoppingPoint` in gzip/isal.hpp.
@@ -98,43 +114,79 @@ pub enum InflateError {
 
 /// Wraps a patched-ISA-L `inflate_state`. Consumes raw deflate bits
 /// from a slice of compressed input. Lifetime tied to the input slice.
+///
+/// **Class shape mirrors vendor `IsalInflateWrapper` (isal.hpp:198-212):**
+/// the wrapper owns a 128 KiB staging buffer that ISA-L sees via
+/// `next_in`/`avail_in`; the bit reader (`input` + `bit_reader_tell`)
+/// is the canonical "where in the input are we" cursor, and
+/// `refill_buffer` is what bridges the two.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub struct IsalInflateWrapper<'a> {
     state: isal_raw::inflate_state,
+    /// Underlying compressed input. Vendor's `m_bitReader` wraps the
+    /// equivalent file/slice; gzippy holds the slice directly +
+    /// `bit_reader_tell` as the bit cursor.
     input: &'a [u8],
-    /// The compressed-stream bit offset where decoding originally
-    /// started. `tell_compressed` returns this plus bits consumed.
+    /// Vendor `m_encodedStartOffset` (isal.hpp:200).
     encoded_start_offset_bits: usize,
+    /// Vendor `m_encodedUntilOffset` (isal.hpp:201). The cap that
+    /// `refill_buffer` will not advance past.
+    encoded_until_bits: usize,
+    /// Vendor `m_bitReader.tell()`. Advances ONLY in `refill_buffer`,
+    /// matching vendor's pattern at isal.hpp:228-250 where every
+    /// bit-reader read happens inside the refill.
+    bit_reader_tell: usize,
+    /// Vendor `m_buffer` (isal.hpp:207). Heap-boxed to keep stack
+    /// frames small for the worker threads.
+    buffer: Box<[u8; STAGING_BUFFER_BYTES]>,
 }
 
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 impl<'a> IsalInflateWrapper<'a> {
-    /// Construct + seek the decoder to `bit_offset` within `input`.
-    /// `bit_offset` may be non-byte-aligned; the leading partial byte
-    /// is loaded into ISA-L's bit buffer via inflatePrime-equivalent
-    /// init. Returns Err if `bit_offset` is past the end of input.
+    /// Convenience constructor: `until_bits = input.len() * 8` (no cap
+    /// beyond the slice end). Existing call sites that don't know a
+    /// real chunk-end offset use this.
     pub fn new(input: &'a [u8], bit_offset: usize) -> Result<Self, InflateError> {
+        Self::with_until_bits(input, bit_offset, input.len() * 8)
+    }
+
+    /// Construct + seek the decoder to `bit_offset`, capping the reader
+    /// at `until_bits`. Mirror of vendor constructor
+    /// `IsalInflateWrapper(BitReader&&, untilOffset)` at
+    /// `gzip/isal.hpp:32-44`. The cap is enforced inside `refill_buffer`
+    /// — the wrapper physically cannot read input bytes past
+    /// `byte_floor(until_bits / 8)`. Returns Err if `bit_offset` is
+    /// past the end of input.
+    pub fn with_until_bits(
+        input: &'a [u8],
+        bit_offset: usize,
+        until_bits: usize,
+    ) -> Result<Self, InflateError> {
         let byte_idx = bit_offset / 8;
-        let bit_skip = bit_offset % 8;
         if byte_idx >= input.len() {
             return Err(InflateError::StartBitPastEnd);
         }
+        // Vendor caps `m_encodedUntilOffset` at `min(untilOffset, file_size_in_bits)`
+        // (isal.hpp:37-41); mirror that exactly.
+        let capped_until = until_bits.min(input.len() * 8);
         let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+        // Vendor `initStream()` (isal.hpp:215-225): isal_inflate_init,
+        // crc_flag = ISAL_DEFLATE, next_in/avail_in/read_in/read_in_length
+        // = 0. No input is staged here — refill_buffer does that on the
+        // first read_stream iteration.
         unsafe { isal_raw::isal_inflate_init(&mut state) };
         state.crc_flag = isal_raw::ISAL_DEFLATE;
-        if bit_skip > 0 {
-            state.read_in = (input[byte_idx] as u64) >> bit_skip;
-            state.read_in_length = (8 - bit_skip) as i32;
-            state.next_in = unsafe { input.as_ptr().add(byte_idx + 1) as *mut u8 };
-            state.avail_in = (input.len() - byte_idx - 1) as u32;
-        } else {
-            state.next_in = unsafe { input.as_ptr().add(byte_idx) as *mut u8 };
-            state.avail_in = (input.len() - byte_idx) as u32;
-        }
+        state.next_in = std::ptr::null_mut();
+        state.avail_in = 0;
+        state.read_in = 0;
+        state.read_in_length = 0;
         Ok(Self {
             state,
             input,
             encoded_start_offset_bits: bit_offset,
+            encoded_until_bits: capped_until,
+            bit_reader_tell: bit_offset,
+            buffer: Box::new([0u8; STAGING_BUFFER_BYTES]),
         })
     }
 
@@ -163,10 +215,8 @@ impl<'a> IsalInflateWrapper<'a> {
     }
 
     /// Request the patched ISA-L to pause when any of the given events
-    /// fire. Setting NONE disables stopping; the decoder runs to the
-    /// next natural pause (output buffer full / input exhausted /
-    /// BFINAL). Mirror of `IsalInflateWrapper::setStoppingPoints`
-    /// (isal.hpp:76-79).
+    /// fire. Setting NONE disables stopping. Mirror of
+    /// `IsalInflateWrapper::setStoppingPoints` (isal.hpp:76-79).
     pub fn set_stopping_points(&mut self, points: StoppingPoints) {
         self.state.points_to_stop_at = points.0;
     }
@@ -175,10 +225,8 @@ impl<'a> IsalInflateWrapper<'a> {
         StoppingPoints(self.state.stopped_at)
     }
 
-    /// Clear the patched-ISA-L `stopped_at` flag so the next
-    /// `read_stream` call advances past the stop instead of re-reporting
-    /// it. Mirror of rapidgzip's `IsalInflateWrapper::readStream`
-    /// pattern (isal.hpp), which resets the field at entry.
+    /// Clear `stopped_at` so the next `read_stream` advances past the
+    /// stop instead of re-reporting it.
     pub fn clear_stop(&mut self) {
         self.state.stopped_at = 0;
     }
@@ -215,145 +263,260 @@ impl<'a> IsalInflateWrapper<'a> {
     }
 
     /// Compressed-stream bit position. Mirror of
-    /// `IsalInflateWrapper::tellCompressed` (isal.hpp:69-74).
-    /// Computed as `input.len()*8 - avail_in*8 - read_in_length`,
-    /// adjusted for the start offset so the returned value is in the
-    /// caller's bit coordinate system.
-    pub fn tell_compressed(&self) -> usize {
-        // Bits consumed since wrapper construction. The original input
-        // window started at byte_idx + (maybe-loaded-partial-byte).
-        // We compute the absolute bit position in the input slice
-        // using ISA-L's exposed avail_in/read_in_length the same way
-        // decompress_deflate_from_bit_with_end does:
-        //   absolute = input.len()*8 - avail_in*8 - read_in_length
-        self.input.len() * 8
-            - self.state.avail_in as usize * 8
-            - self.state.read_in_length.max(0) as usize
-    }
-
-    /// Read the 8-byte gzip footer at the current decoder position
-    /// (assumed to be at end-of-stream, byte-aligned). Advances ISA-L's
-    /// input cursor past the footer. Returns `(crc32, isize)`.
+    /// `IsalInflateWrapper::tellCompressed` (isal.hpp:69-74):
     ///
-    /// Mirror of rapidgzip's `IsalInflateWrapper::readFooter`
-    /// (gzip/isal.hpp), which is called by the rapidgzip chunk worker
-    /// when an `END_OF_STREAM` stop fires. The footer fields are then
-    /// validated against the chunk's running CRC32 + decoded-byte count
-    /// and recorded on the chunk via `ChunkData::appendFooter`.
-    pub fn read_footer_at_current(&mut self) -> Result<(u32, u32), InflateError> {
-        // ISA-L always aligns to a byte boundary at END_OF_STREAM. We
-        // pull 8 bytes from next_in. If the bit buffer has leftover
-        // bits, advance via inflate_in_read_bits (but at END_OF_STREAM
-        // the wrapper guarantees bit-alignment so read_in_length is 0).
-        if self.state.read_in_length > 0 {
-            // Drain bits to align (mirrors rapidgzip's readFooter which
-            // reads the padding bits before the footer).
-            let bits_to_drain = self.state.read_in_length as u32 % 8;
-            if bits_to_drain > 0 {
-                self.state.read_in >>= bits_to_drain;
-                self.state.read_in_length -= bits_to_drain as i32;
+    ///     m_bitReader.tell() - m_stream.avail_in * BYTE_SIZE
+    ///                        - m_stream.read_in_length
+    pub fn tell_compressed(&self) -> usize {
+        self.bit_reader_tell
+            .saturating_sub(self.state.avail_in as usize * 8)
+            .saturating_sub(self.state.read_in_length.max(0) as usize)
+    }
+
+    /// Literal port of `IsalInflateWrapper::refillBuffer`
+    /// (vendor/.../gzip/isal.hpp:228-250). Stages up to 128 KiB of
+    /// input bytes into `self.buffer` so ISA-L's `isal_inflate` has
+    /// `next_in`/`avail_in` to consume on the next call. Caps strictly
+    /// at `encoded_until_bits` — once `bit_reader_tell` reaches the
+    /// cap, this is a no-op and ISA-L will eventually return because
+    /// it has nothing more to read.
+    fn refill_buffer(&mut self) {
+        // Vendor isal.hpp:231 — guard.
+        if self.state.avail_in > 0 || self.bit_reader_tell >= self.encoded_until_bits {
+            return;
+        }
+
+        // Vendor isal.hpp:235-239 — first refill when start is not
+        // byte-aligned. Prime the partial leading byte into ISA-L's
+        // bit buffer (read_in / read_in_length), advance bit reader to
+        // next byte boundary, fall through to byte-aligned load.
+        let tell_mod = self.bit_reader_tell % 8;
+        if tell_mod != 0 {
+            let n_bits_to_prime = (8 - tell_mod) as u32;
+            let byte_idx = self.bit_reader_tell / 8;
+            // `with_until_bits` checked byte_idx < input.len() at
+            // construction; tell only advances within
+            // [start, encoded_until_bits], also bounded.
+            debug_assert!(byte_idx < self.input.len());
+            let byte = self.input[byte_idx];
+            let value = ((byte as u64) >> tell_mod) & ((1u64 << n_bits_to_prime) - 1);
+            // Append into read_in at the existing read_in_length offset.
+            self.state.read_in |= value << self.state.read_in_length;
+            self.state.read_in_length += n_bits_to_prime as i32;
+            self.bit_reader_tell += n_bits_to_prime as usize;
+            debug_assert!(self.bit_reader_tell.is_multiple_of(8));
+            // Vendor falls through to the byte-aligned load when more
+            // bytes remain.
+        }
+
+        // Vendor isal.hpp:240-244 — last refill where < 8 bits remain.
+        let remaining_bits = self.encoded_until_bits - self.bit_reader_tell;
+        if remaining_bits < 8 {
+            if remaining_bits > 0 {
+                let byte_idx = self.bit_reader_tell / 8;
+                debug_assert!(byte_idx < self.input.len());
+                let byte = self.input[byte_idx];
+                let mask = (1u64 << remaining_bits) - 1;
+                let value = (byte as u64) & mask;
+                self.state.read_in |= value << self.state.read_in_length;
+                self.state.read_in_length += remaining_bits as i32;
+                self.bit_reader_tell += remaining_bits;
             }
+            return;
         }
-        if self.state.avail_in < 8 {
-            return Err(InflateError::Internal(-1));
-        }
-        let p = self.state.next_in;
-        let bytes: [u8; 8] = unsafe { std::ptr::read_unaligned(p as *const [u8; 8]) };
-        let crc32 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let isize_field = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        unsafe {
-            self.state.next_in = p.add(8);
-        }
-        self.state.avail_in -= 8;
-        Ok((crc32, isize_field))
-    }
 
-    /// Reset the wrapper's internal state to begin decoding a fresh
-    /// gzip stream from the current input position. Mirror of rapidgzip's
-    /// `IsalInflateWrapper::setNeedToReadHeader` + subsequent `readHeader`
-    /// (gzip/isal.hpp). The caller must have already advanced past the
-    /// previous stream's footer (via `read_footer_at_current`) and the
-    /// next gzip header (via `gzip_format::read_header`).
-    pub fn reset_for_next_stream(&mut self) {
-        unsafe { isal_raw::isal_inflate_init(&mut self.state) };
-        // Preserve cursor position (next_in/avail_in were advanced by
-        // the footer + header reads); reset only the decode state.
-        self.state.crc_flag = isal_raw::ISAL_DEFLATE;
-        self.state.points_to_stop_at = 0;
-        self.state.stopped_at = 0;
-    }
-
-    /// Bytes remaining in the input from the decoder's current
-    /// cursor position. Used by the multi-stream loop in
-    /// `gzip_chunk` to parse the next gzip header via
-    /// `gzip_format::read_header`. Length is `avail_in` (bytes still
-    /// staged for ISA-L); the bit-buffer's leftover bits are
-    /// discarded — at END_OF_STREAM ISA-L aligns to a byte
-    /// boundary, so `read_in_length` is 0 at that point.
-    pub fn remaining_input(&self) -> &'a [u8] {
-        if self.state.avail_in == 0 {
-            return &[];
-        }
-        let len = self.state.avail_in as usize;
-        // Safety: `next_in` was constructed from `self.input`'s pointer
-        // and advanced by ISA-L only by amounts it reported via
-        // `avail_in`. The lifetime is the same as `self.input` (and
-        // hence `'a`). `len` is exactly `avail_in`.
-        unsafe { std::slice::from_raw_parts(self.state.next_in, len) }
-    }
-
-    /// Advance the decoder's input cursor by `n` bytes. Used by the
-    /// multi-stream Footer loop after `gzip_format::read_header` parses
-    /// the next gzip header from `remaining_input()` — the wrapper's
-    /// own cursor must then skip past the parsed header bytes so a
-    /// subsequent `read_stream` resumes at the new deflate body.
-    /// No-op if `n` exceeds the remaining input (mirrors ISA-L's
-    /// behavior: avail_in saturates at 0).
-    pub fn advance_input(&mut self, n: usize) {
-        let n = n.min(self.state.avail_in as usize);
+        // Vendor isal.hpp:246-249 — byte-aligned bulk load.
+        let byte_idx = self.bit_reader_tell / 8;
+        let max_bytes_by_cap = (self.encoded_until_bits - self.bit_reader_tell) / 8;
+        let max_bytes_by_input = self.input.len().saturating_sub(byte_idx);
+        let n = max_bytes_by_cap
+            .min(max_bytes_by_input)
+            .min(self.buffer.len());
         if n == 0 {
             return;
         }
-        unsafe {
-            self.state.next_in = self.state.next_in.add(n);
+        self.buffer[..n].copy_from_slice(&self.input[byte_idx..byte_idx + n]);
+        self.state.next_in = self.buffer.as_mut_ptr();
+        self.state.avail_in = n as u32;
+        self.bit_reader_tell += n * 8;
+    }
+
+    /// Read the 8-byte gzip footer at the current decoder position
+    /// (assumed to be at end-of-stream, byte-aligned). Advances the
+    /// decoder's cursor past the footer. Returns `(crc32, isize)`.
+    ///
+    /// Vendor equivalent: `IsalInflateWrapper::readGzipFooter`
+    /// (gzip/isal.hpp:429-450). Vendor uses `readBytes<8>()`
+    /// (isal.hpp:388-426) which pulls from the bit buffer, then from
+    /// the staging buffer, refilling as needed.
+    pub fn read_footer_at_current(&mut self) -> Result<(u32, u32), InflateError> {
+        let mut footer = [0u8; 8];
+        self.read_bytes(&mut footer)?;
+        let crc32 = u32::from_le_bytes([footer[0], footer[1], footer[2], footer[3]]);
+        let isize_field = u32::from_le_bytes([footer[4], footer[5], footer[6], footer[7]]);
+        Ok((crc32, isize_field))
+    }
+
+    /// Pull `out.len()` bytes from the wrapper, draining the ISA-L bit
+    /// buffer first, then the staging buffer, refilling as needed.
+    /// Mirror of vendor `readBytes<SIZE>()` (isal.hpp:388-426).
+    fn read_bytes(&mut self, out: &mut [u8]) -> Result<(), InflateError> {
+        // Vendor isal.hpp:392-394 — align the bit buffer to a byte boundary
+        // (`read_in_length %= BYTE_SIZE` semantics: drop sub-byte remainder).
+        let remaining_bits = (self.state.read_in_length % 8).max(0) as u32;
+        if remaining_bits > 0 {
+            self.state.read_in >>= remaining_bits;
+            self.state.read_in_length -= remaining_bits as i32;
         }
-        self.state.avail_in -= n as u32;
+
+        let mut written = 0usize;
+        while written < out.len() {
+            // Vendor isal.hpp:399-406 — drain whole bytes from the
+            // bit buffer first.
+            if self.state.read_in_length >= 8 {
+                out[written] = (self.state.read_in & 0xFF) as u8;
+                self.state.read_in >>= 8;
+                self.state.read_in_length -= 8;
+                written += 1;
+                continue;
+            }
+
+            // Vendor isal.hpp:407-411 — then drain avail_in.
+            let need = out.len() - written;
+            if self.state.avail_in as usize >= need {
+                // Safety: next_in is either null (avail_in==0, handled
+                // above) or points into our staging buffer with at
+                // least `avail_in` valid bytes.
+                let src =
+                    unsafe { std::slice::from_raw_parts(self.state.next_in as *const u8, need) };
+                out[written..written + need].copy_from_slice(src);
+                self.state.avail_in -= need as u32;
+                unsafe {
+                    self.state.next_in = self.state.next_in.add(need);
+                }
+                written += need;
+                continue;
+            }
+
+            // Vendor isal.hpp:412-421 — partial drain + refill.
+            if self.state.avail_in > 0 {
+                let n = self.state.avail_in as usize;
+                let src = unsafe { std::slice::from_raw_parts(self.state.next_in as *const u8, n) };
+                out[written..written + n].copy_from_slice(src);
+                written += n;
+                self.state.avail_in = 0;
+            }
+            self.refill_buffer();
+            if self.state.avail_in == 0 && self.state.read_in_length < 8 {
+                // Vendor throws EndOfFileReached; map to internal error.
+                return Err(InflateError::Internal(-1));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reset the wrapper's internal state to begin decoding a fresh
+    /// gzip stream from the current input position. Mirror of
+    /// `IsalInflateWrapper::setNeedToReadHeader` + subsequent
+    /// `readHeader` paths. Preserves `bit_reader_tell` and any pending
+    /// bit-buffer state; only resets the ISA-L decode state.
+    pub fn reset_for_next_stream(&mut self) {
+        // Snapshot the bit-buffer and input-staging state since
+        // `isal_inflate_init` zeroes the whole struct.
+        let read_in = self.state.read_in;
+        let read_in_length = self.state.read_in_length;
+        let next_in = self.state.next_in;
+        let avail_in = self.state.avail_in;
+        unsafe { isal_raw::isal_inflate_init(&mut self.state) };
+        self.state.crc_flag = isal_raw::ISAL_DEFLATE;
+        self.state.points_to_stop_at = 0;
+        self.state.stopped_at = 0;
+        self.state.read_in = read_in;
+        self.state.read_in_length = read_in_length;
+        self.state.next_in = next_in;
+        self.state.avail_in = avail_in;
+    }
+
+    /// Bytes remaining in the input from the decoder's current
+    /// position. Used by the multi-stream loop to parse the next
+    /// gzip header. After END_OF_STREAM, ISA-L is byte-aligned and
+    /// `tell_compressed()` is the position right after the deflate
+    /// body — i.e. the start of the footer.
+    pub fn remaining_input(&self) -> &'a [u8] {
+        let byte_pos = self.tell_compressed() / 8;
+        if byte_pos >= self.input.len() {
+            return &[];
+        }
+        &self.input[byte_pos..]
+    }
+
+    /// Advance the decoder's input cursor by `n` bytes. Used by the
+    /// multi-stream loop after `gzip_format::read_header` parses the
+    /// next gzip header — the wrapper's cursor must then skip past
+    /// the parsed header bytes so a subsequent `read_stream` resumes
+    /// at the new deflate body.
+    ///
+    /// Updates `bit_reader_tell` directly + clears the ISA-L
+    /// avail_in/read_in_length since they're stale w.r.t. the new
+    /// position. The next `read_stream` call's first `refill_buffer`
+    /// will repopulate from the input slice at the new cursor.
+    pub fn advance_input(&mut self, n: usize) {
+        let bits = n.saturating_mul(8);
+        // Effective compressed position right now:
+        let cur = self.tell_compressed();
+        let target = (cur + bits).min(self.encoded_until_bits);
+        // Discard whatever staged input we have; refill_buffer will
+        // re-load from `target` on demand.
+        self.state.avail_in = 0;
+        self.state.read_in = 0;
+        self.state.read_in_length = 0;
+        self.state.next_in = std::ptr::null_mut();
+        self.bit_reader_tell = target;
+        // Allow advance_input to grow the cap when the caller pushes
+        // past the previously-known until offset. This matches vendor
+        // multi-stream behavior: the next-stream header isn't part of
+        // the just-finished stream's `untilOffset`.
+        if self.bit_reader_tell > self.encoded_until_bits {
+            self.encoded_until_bits = self.input.len() * 8;
+        }
     }
 
     /// Returns true iff the current decode has hit a stream end
-    /// (END_OF_STREAM) and not yet been advanced. Caller uses this to
-    /// decide whether to read footer + next header before resuming.
+    /// (END_OF_STREAM) and not yet been advanced.
     pub fn at_end_of_stream(&self) -> bool {
         self.stopped_at() == StoppingPoints::END_OF_STREAM
+    }
+
+    /// The currently-effective cap. Updated only by callers via
+    /// `set_encoded_until_bits` or by `advance_input` widening past
+    /// the original cap. Exposed for tests and diagnostics; mirrors
+    /// vendor `m_encodedUntilOffset` field at isal.hpp:201.
+    pub fn encoded_until_bits(&self) -> usize {
+        self.encoded_until_bits
     }
 
     /// Pump bytes into `output` until any of:
     ///   - output buffer is full
     ///   - a requested stopping point fires
-    ///   - input is exhausted
+    ///   - input is exhausted (refill returns nothing AND avail_in == 0)
     ///   - BFINAL block has been fully consumed
     ///
     /// Mirror of `rapidgzip::IsalInflateWrapper::readStream`
-    /// (vendor/rapidgzip/.../gzip/isal.hpp:253-385). The critical
-    /// behavior — verified against the rapidgzip source and confirmed
-    /// by empirical Silesia debug logs — is that this MUST call
-    /// `isal_inflate` repeatedly inside one invocation, breaking only
-    /// on stop/finish/no-progress, AND it MUST reset `state.stopped_at`
-    /// at entry. A single-call read_stream cannot deliver stops: a
-    /// small `avail_out` causes ISA-L to return via OUT_OVERFLOW long
-    /// before it gets to set `stopped_at`.
+    /// (vendor/.../gzip/isal.hpp:253-385). The inner loop calls
+    /// `refill_buffer()` at the top to mirror the vendor pattern at
+    /// isal.hpp:277, AND it resets `state.stopped_at` at entry
+    /// (isal.hpp:261).
     pub fn read_stream(&mut self, output: &mut [u8]) -> Result<ReadStreamResult, InflateError> {
         let original_len = output.len();
         self.state.next_out = output.as_mut_ptr();
         self.state.avail_out = original_len as u32;
-        // Reset stopped_at at entry (rapidgzip isal.hpp:261). Without
-        // this, a stop value left over from a previous call would
-        // short-circuit our break-on-stop check on the very first
-        // iteration of the loop below.
         self.state.stopped_at = 0;
 
         let mut finished;
         loop {
+            // Mirror of vendor refillBuffer() call at isal.hpp:277.
+            self.refill_buffer();
+
             let prev_avail_in = self.state.avail_in;
             let prev_read_in_length = self.state.read_in_length;
             let prev_avail_out = self.state.avail_out;
@@ -370,12 +533,6 @@ impl<'a> IsalInflateWrapper<'a> {
                 other => return Err(InflateError::Internal(other)),
             }
 
-            // Break conditions (matching rapidgzip's inner loop):
-            //   1. A requested stop fired.
-            //   2. Stream finished (BFINAL fully processed).
-            //   3. Output buffer is full.
-            //   4. No progress (avoids infinite loop when ISA-L can't
-            //      make progress — e.g. input exhausted mid-block).
             if self.state.stopped_at != 0 {
                 break;
             }
@@ -389,18 +546,16 @@ impl<'a> IsalInflateWrapper<'a> {
                 || self.state.read_in_length != prev_read_in_length
                 || self.state.avail_out != prev_avail_out;
             if !made_progress {
+                // Input genuinely exhausted: refill staged nothing AND
+                // ISA-L produced nothing AND bit buffer didn't move.
                 break;
             }
         }
 
-        let bytes_written = original_len - self.state.avail_out as usize;
-        let bit_position = self.tell_compressed();
-        let stopped_at = StoppingPoints(self.state.stopped_at);
-
         Ok(ReadStreamResult {
-            bytes_written,
-            stopped_at,
-            bit_position,
+            bytes_written: original_len - self.state.avail_out as usize,
+            stopped_at: StoppingPoints(self.state.stopped_at),
+            bit_position: self.tell_compressed(),
             finished,
         })
     }
@@ -416,6 +571,13 @@ pub struct IsalInflateWrapper<'a> {
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
 impl<'a> IsalInflateWrapper<'a> {
     pub fn new(_input: &'a [u8], _bit_offset: usize) -> Result<Self, InflateError> {
+        Err(InflateError::UnsupportedPlatform)
+    }
+    pub fn with_until_bits(
+        _input: &'a [u8],
+        _bit_offset: usize,
+        _until_bits: usize,
+    ) -> Result<Self, InflateError> {
         Err(InflateError::UnsupportedPlatform)
     }
 }
@@ -460,7 +622,7 @@ mod tests {
 
     #[test]
     fn stopping_at_end_of_block_records_a_bit_position() {
-        let payload = vec![b'x'; 200_000]; // forces multiple deflate blocks at L6
+        let payload = vec![b'x'; 200_000];
         let deflate = make_deflate(&payload);
         let mut wrapper = IsalInflateWrapper::new(&deflate, 0).expect("init");
         wrapper.set_window(&[]).expect("set_window");
@@ -491,7 +653,6 @@ mod tests {
         }
         output.truncate(total);
         assert_eq!(output, payload);
-        // Should have hit at least one END_OF_BLOCK along the way.
         assert!(boundary_count >= 1);
     }
 
@@ -509,8 +670,6 @@ mod tests {
                 .expect("read_stream");
             total += r.bytes_written;
             if r.finished {
-                // tell_compressed should be within a byte of total deflate bits
-                // (deflate streams end with bit padding to next byte boundary).
                 let final_bit_pos = wrapper.tell_compressed();
                 assert!(final_bit_pos <= deflate.len() * 8);
                 assert!(final_bit_pos + 8 >= deflate.len() * 8);
@@ -522,5 +681,122 @@ mod tests {
         }
         output.truncate(total);
         assert_eq!(output, payload);
+    }
+
+    /// Structural-port correctness test for `with_until_bits` + the
+    /// refill cap. Decodes the same deflate stream three times, each
+    /// time with `until_bits` set just past a known block boundary,
+    /// and asserts:
+    ///   - `tell_compressed()` at decode end equals `until_bits` (the
+    ///     cap is enforced exactly).
+    ///   - The output bytes equal the libdeflate one-shot decode
+    ///     truncated to the same byte count.
+    ///
+    /// This test exists because before the port, no `with_until_bits`
+    /// existed. After the port, it gates regressions in the refill
+    /// cap: any drift in the cap accounting makes `tell_compressed`
+    /// drift from `until_bits`.
+    #[test]
+    fn with_until_bits_stops_exactly_at_cap() {
+        // Build a payload large enough to span multiple deflate blocks
+        // at L6 with diverse content (so block boundaries aren't all
+        // at the same fixed-Huffman pattern position).
+        let mut payload = Vec::with_capacity(512 * 1024);
+        for i in 0..(512 * 1024) {
+            payload.push((i as u8).wrapping_mul(31).wrapping_add(7));
+        }
+        let deflate = make_deflate(&payload);
+
+        // Enumerate end-of-block positions by decoding once with
+        // END_OF_BLOCK stops and recording bit_position at each stop.
+        let mut block_ends: Vec<usize> = Vec::new();
+        {
+            let mut probe = IsalInflateWrapper::new(&deflate, 0).expect("probe init");
+            probe.set_window(&[]).expect("probe set_window");
+            probe.set_stopping_points(StoppingPoints::END_OF_BLOCK);
+            let mut buf = vec![0u8; payload.len() + 1024];
+            let mut total = 0usize;
+            loop {
+                let r = probe.read_stream(&mut buf[total..]).expect("probe read");
+                total += r.bytes_written;
+                if r.stopped_at == StoppingPoints::END_OF_BLOCK {
+                    block_ends.push(r.bit_position);
+                    if r.finished {
+                        break;
+                    }
+                    continue;
+                }
+                if r.finished || r.bytes_written == 0 {
+                    break;
+                }
+            }
+        }
+        assert!(
+            block_ends.len() >= 2,
+            "fixture should produce multiple deflate blocks; got {}",
+            block_ends.len()
+        );
+
+        // Pick three boundaries: first, middle, last-but-one.
+        let idx_choices = [0usize, block_ends.len() / 2, block_ends.len() - 1];
+        for &i in &idx_choices {
+            let until = block_ends[i];
+            let mut w = IsalInflateWrapper::with_until_bits(&deflate, 0, until)
+                .expect("with_until_bits init");
+            w.set_window(&[]).expect("set_window");
+            let mut buf = vec![0u8; payload.len() + 1024];
+            let mut total = 0usize;
+            loop {
+                let r = w.read_stream(&mut buf[total..]).expect("read_stream");
+                total += r.bytes_written;
+                if r.finished || r.bytes_written == 0 {
+                    break;
+                }
+            }
+            buf.truncate(total);
+
+            // The cap was set to a real EOB position, so vendor's
+            // structural invariant is that tell_compressed() == until
+            // at decode end (`gzip/isal.hpp` chain invariant). gzippy
+            // post-port: the same.
+            assert_eq!(
+                w.tell_compressed(),
+                until,
+                "tell_compressed must equal until_bits for cap at EOB #{i} ({until})",
+            );
+
+            // Output bytes must match libdeflate one-shot truncated to
+            // the same byte count. We compare against a sequential
+            // decode that goes the full distance and truncate.
+            let reference = {
+                let mut d = flate2::Decompress::new(false);
+                let mut out = vec![0u8; payload.len()];
+                d.decompress(&deflate, &mut out, flate2::FlushDecompress::Finish)
+                    .expect("flate2 ref decode");
+                out.truncate(d.total_out() as usize);
+                out
+            };
+            assert_eq!(
+                buf,
+                reference[..buf.len()],
+                "output bytes must match reference[..{}] for cap at EOB #{i} ({until})",
+                buf.len()
+            );
+        }
+    }
+
+    /// Cap of `0` (start_bit == until_bits) decodes nothing and reports
+    /// tell_compressed == 0. Edge case for the refill-loop entry guard
+    /// at vendor isal.hpp:231.
+    #[test]
+    fn with_until_bits_zero_cap_decodes_nothing() {
+        let payload = b"abcdefg".repeat(1000);
+        let deflate = make_deflate(&payload);
+        let mut w = IsalInflateWrapper::with_until_bits(&deflate, 0, 0).expect("init");
+        w.set_window(&[]).expect("set_window");
+        let mut buf = vec![0u8; 4096];
+        let r = w.read_stream(&mut buf).expect("read_stream");
+        assert_eq!(r.bytes_written, 0);
+        assert_eq!(w.tell_compressed(), 0);
     }
 }
