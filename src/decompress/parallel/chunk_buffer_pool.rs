@@ -70,6 +70,7 @@ static U16_POOL: Mutex<Vec<Vec<u16>>> = Mutex::new(Vec::new());
 pub fn take_u8(min_capacity: usize) -> Vec<u8> {
     if let Ok(mut pool) = U8_POOL.lock() {
         if let Some(mut v) = pool.pop() {
+            TAKE_U8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             v.clear();
             if v.capacity() < min_capacity {
                 v.reserve(min_capacity - v.capacity());
@@ -77,6 +78,7 @@ pub fn take_u8(min_capacity: usize) -> Vec<u8> {
             return v;
         }
     }
+    TAKE_U8_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Vec::with_capacity(min_capacity)
 }
 
@@ -84,6 +86,7 @@ pub fn take_u8(min_capacity: usize) -> Vec<u8> {
 pub fn take_u16(min_capacity: usize) -> Vec<u16> {
     if let Ok(mut pool) = U16_POOL.lock() {
         if let Some(mut v) = pool.pop() {
+            TAKE_U16_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             v.clear();
             if v.capacity() < min_capacity {
                 v.reserve(min_capacity - v.capacity());
@@ -91,6 +94,7 @@ pub fn take_u16(min_capacity: usize) -> Vec<u16> {
             return v;
         }
     }
+    TAKE_U16_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Vec::with_capacity(min_capacity)
 }
 
@@ -100,6 +104,7 @@ pub fn return_u8(mut v: Vec<u8>) {
     if v.capacity() == 0 {
         return;
     }
+    RETURN_U8_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut pool) = U8_POOL.lock() {
         if pool.len() < MAX_POOLED {
             v.clear();
@@ -113,6 +118,7 @@ pub fn return_u16(mut v: Vec<u16>) {
     if v.capacity() == 0 {
         return;
     }
+    RETURN_U16_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut pool) = U16_POOL.lock() {
         if pool.len() < MAX_POOLED {
             v.clear();
@@ -129,6 +135,9 @@ pub fn return_u16(mut v: Vec<u16>) {
 pub static TAKE_U8_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static TAKE_U8_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RETURN_U8_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static TAKE_U16_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static TAKE_U16_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static RETURN_U16_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // Unit tests intentionally omitted: the pool is a process-global LIFO
 // that other tests (via `ChunkData::new`) concurrently take/return

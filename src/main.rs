@@ -3,6 +3,29 @@
 //! A drop-in replacement for gzip that uses multiple processors for compression.
 //! Inspired by [pigz](https://zlib.net/pigz/) by Mark Adler.
 
+/// Per-thread arena allocator. Vendor's analog at
+/// `vendor/.../core/FasterVector.hpp:38-64` plugs rpmalloc's
+/// thread-local arena into the `Vec<uint8_t>` allocations that back
+/// each chunk's decoded output. Without arena recycling, glibc faults
+/// every fresh page on each chunk decode (measured 317K page-faults +
+/// 1.7s sys time on a memory-pressured host — perf-stat 2026-05-19,
+/// neurotic, 8 GB RAM / 69 MB MemFree).
+///
+/// `mimalloc` is the most-maintained stable-Rust crate with the same
+/// per-thread-arena property as rpmalloc. Setting it as the global
+/// allocator affects every `Box` / `Vec` / `String` in the binary,
+/// not just the chunk buffers — but that's a feature here: the
+/// post-process worker, the writer's I/O buffers, and the marker
+/// inflate state all benefit from the same per-thread recycling.
+///
+/// Gated on `not(test)` because the test binary has its own
+/// `CountingAllocator` in `src/tests/alloc_counter.rs` (used to
+/// catch unexpected allocations). Only one global_allocator may be
+/// active per binary.
+#[cfg(not(test))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::env;
 use std::path::Path;
 use std::process;
