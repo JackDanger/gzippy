@@ -369,6 +369,14 @@ pub fn drive<W: std::io::Write>(
         .base
         .set_block_count(block_map.data_block_count(), true);
 
+    // Drain the prefetch cache before stats dump. Any entries still
+    // sitting in the prefetch cache at end-of-decode were dispatched
+    // but never consumed by the consumer — mirror of vendor's
+    // destructor path at BlockFetcher.hpp:199-201 which counts those
+    // as `cache_unused_entry`. The drain wires `record_cache_unused_entry`
+    // once per remaining entry so the --verbose dump reports them.
+    block_fetcher.clear_prefetch_cache();
+
     // --verbose stats dump. Mirror of vendor's destructor print at
     // GzipChunkFetcher.hpp:124-198 + BlockFetcher.hpp:73-124. Triggered
     // by GZIPPY_VERBOSE env var (matches the existing GZIPPY_DEBUG

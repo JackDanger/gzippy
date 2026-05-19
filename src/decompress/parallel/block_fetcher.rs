@@ -401,7 +401,14 @@ where
                 self.statistics.base.record_get();
                 Some(v)
             }
-            None => None,
+            None => {
+                // Vendor BlockFetcher.hpp:263-277 — `getFromCaches`
+                // returns no cached value; the on-demand path will
+                // dispatch a fresh decode. Records the miss for stats
+                // visibility (cache hit rate = hits / (hits + misses)).
+                self.statistics.base.record_prefetch_cache_miss();
+                None
+            }
         }
     }
 
@@ -678,7 +685,17 @@ where
     }
 
     pub fn clear_prefetch_cache(&self) {
-        self.prefetch_cache.lock().unwrap().clear();
+        let mut pc = self.prefetch_cache.lock().unwrap();
+        // Vendor BlockFetcher.hpp:199-201 — entries still in the
+        // prefetch cache at destruction time are "never used"
+        // (`get_if_available` removes promoted entries on hit), so
+        // each remaining one counts as a cache_unused_entry. Mirrors
+        // the LRU eviction-callback path vendor uses.
+        let unused = pc.size();
+        for _ in 0..unused {
+            self.statistics.base.record_cache_unused_entry();
+        }
+        pc.clear();
     }
 
     /// Lock + snapshot both caches' statistics + the chunk-extra
@@ -734,6 +751,37 @@ mod tests {
     fn get_if_available_returns_none_when_empty() {
         let bf = new_fetcher();
         assert_eq!(bf.get_if_available(&100), None);
+    }
+
+    #[test]
+    fn get_if_available_records_cache_miss() {
+        // Vendor BlockFetcher.hpp:263-277: when getFromCaches returns
+        // no cached value, the miss is recorded for cache-hit-rate
+        // visibility in --verbose. Asserts `record_prefetch_cache_miss`
+        // is wired at the `None` arm of `get_if_available`.
+        let bf = new_fetcher();
+        let _ = bf.get_if_available(&42);
+        let _ = bf.get_if_available(&99);
+        let snap = bf.statistics.base.snapshot();
+        assert_eq!(snap.prefetch_cache_misses, 2);
+    }
+
+    #[test]
+    fn clear_prefetch_cache_counts_unused_entries() {
+        // Vendor BlockFetcher.hpp:199-201: entries left in the prefetch
+        // cache at destruction count as `record_cache_unused_entry`.
+        // Asserts `clear_prefetch_cache` drains and counts.
+        let bf = new_fetcher();
+        bf.insert_prefetched(100, "pre-100".into());
+        bf.insert_prefetched(200, "pre-200".into());
+        bf.insert_prefetched(300, "pre-300".into());
+        // Promote one (simulates the consumer using it).
+        let _ = bf.get_if_available(&200);
+        assert_eq!(bf.prefetch_cache_size(), 2);
+        bf.clear_prefetch_cache();
+        let snap = bf.statistics.base.snapshot();
+        assert_eq!(snap.prefetch_cache_unused_entries, 2);
+        assert_eq!(bf.prefetch_cache_size(), 0);
     }
 
     #[test]
