@@ -189,13 +189,21 @@ impl ChunkData {
     /// bit offset. The first subchunk is pre-allocated at offset 0 with
     /// zero size, mirroring rapidgzip's `startNewSubchunk` pattern
     /// (GzipChunk.hpp:47-58 init).
+    ///
+    /// Pulls the underlying Vecs from `chunk_buffer_pool` (mirror of
+    /// vendor's per-thread rpmalloc arena recycling
+    /// `FasterVector<uint8_t>` allocations — `core/FasterVector.hpp:
+    /// 120-128`). On pool miss, `chunk_buffer_pool::take_*` falls
+    /// back to a fresh `Vec::with_capacity(cap)`. On chunk drop, the
+    /// `Drop` impl returns the Vecs to the pool.
     pub fn new(encoded_offset_bits: usize, configuration: ChunkConfiguration) -> Self {
+        use crate::decompress::parallel::chunk_buffer_pool;
         let cap = configuration.max_decoded_chunk_size;
         Self::new_with_buffers(
             encoded_offset_bits,
             configuration,
-            Vec::with_capacity(cap),
-            Vec::with_capacity(cap),
+            chunk_buffer_pool::take_u16(cap),
+            chunk_buffer_pool::take_u8(cap),
         )
     }
 
@@ -1024,6 +1032,25 @@ impl ChunkData {
             .iter()
             .find(|s| s.encoded_offset_bits == expected_start)
             .map(|s| s.decoded_offset)
+    }
+}
+
+/// Return `data` and `data_with_markers` to the shared
+/// `chunk_buffer_pool` so the next worker on any thread can reuse
+/// the already-faulted pages. Mirror of vendor's rpmalloc
+/// auto-recycle for `FasterVector<uint8_t>` allocations
+/// (`core/FasterVector.hpp:120-128`).
+///
+/// `Clone` is derived: clones produce independent Vecs, each
+/// returning to the pool on its own drop. Cross-thread safe: pool
+/// is a `static Mutex<Vec<...>>`.
+impl Drop for ChunkData {
+    fn drop(&mut self) {
+        use crate::decompress::parallel::chunk_buffer_pool;
+        let data = std::mem::take(&mut self.data);
+        let dwm = std::mem::take(&mut self.data_with_markers);
+        chunk_buffer_pool::return_u8(data);
+        chunk_buffer_pool::return_u16(dwm);
     }
 }
 

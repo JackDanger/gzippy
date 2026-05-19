@@ -40,6 +40,7 @@ pub mod blockfinder_pigz;
 pub mod blockfinder_precode_check;
 pub mod blockfinder_uncompressed;
 pub mod cache;
+pub mod chunk_buffer_pool;
 pub mod chunk_data;
 pub mod chunk_fetcher;
 pub mod compressed_vector;
