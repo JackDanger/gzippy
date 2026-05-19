@@ -534,6 +534,7 @@ fn consumer_loop<W: std::io::Write>(
                 input,
                 prefetch_params,
                 window_map,
+                block_fetcher,
                 configuration,
             )
         };
@@ -647,7 +648,14 @@ fn consumer_loop<W: std::io::Write>(
                 let (chunk_arc_result, _prefetched) = block_fetcher.get_with_prefetch(
                     next_block_offset,
                     |_key: usize| -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
-                        submit_decode_to_pool(thread_pool, input, params, window_map, configuration)
+                        submit_decode_to_pool(
+                            thread_pool,
+                            input,
+                            params,
+                            window_map,
+                            block_fetcher,
+                            configuration,
+                        )
                     },
                     lookup_block_offset,
                     lookup_next_block_offset,
@@ -898,6 +906,7 @@ fn submit_decode_to_pool(
     input: InputSlice,
     params: DecodeParams,
     window_map: &WindowMap,
+    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive, ChunkDecodeError>>,
     configuration: ChunkConfiguration,
 ) -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
     if trace::is_enabled() {
@@ -911,8 +920,9 @@ fn submit_decode_to_pool(
         );
     }
     let window_map = window_map.clone();
+    let block_fetcher = block_fetcher.clone();
     let future = thread_pool.submit(
-        move || run_decode_task(input, params, &window_map, configuration),
+        move || run_decode_task(input, params, &window_map, &block_fetcher, configuration),
         /* priority */ 0,
     );
     future.into_receiver()
@@ -957,6 +967,7 @@ fn run_decode_task(
     input: InputSlice,
     params: DecodeParams,
     window_map: &WindowMap,
+    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive, ChunkDecodeError>>,
     configuration: ChunkConfiguration,
 ) -> Result<Arc<ChunkData>, ChunkDecodeError> {
     // SAFETY: `drive`'s contract — input outlives the thread pool.
@@ -964,6 +975,20 @@ fn run_decode_task(
 
     let label = trace::worker_label(params.partition_idx);
     let t0 = std::time::Instant::now();
+
+    // Vendor's `decodeAndMeasureBlock` (BlockFetcher.hpp:649-672):
+    // record decode start timestamp, decode wall time, decode end
+    // timestamp. Drives the `Pool Efficiency` stat printed by
+    // --verbose at end-of-decode. Without this, all four timer
+    // entries in the stats dump are 0.0.
+    let task_start_secs = std::time::UNIX_EPOCH
+        .elapsed()
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    block_fetcher
+        .statistics
+        .base
+        .note_decode_block_start(task_start_secs);
 
     // Audit step 5: WindowMap is now Condvar-free (vendor
     // WindowMap.hpp:19-186 has no condition_variable). Workers do
@@ -1061,6 +1086,23 @@ fn run_decode_task(
             ),
         }
     }
+
+    // Vendor's `decodeAndMeasureBlock` (BlockFetcher.hpp:660-672)
+    // accumulates the decode wall time per task and records the end
+    // timestamp.
+    let decode_elapsed = t0.elapsed().as_secs_f64();
+    block_fetcher
+        .statistics
+        .base
+        .add_decode_block_time(decode_elapsed);
+    let task_end_secs = std::time::UNIX_EPOCH
+        .elapsed()
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    block_fetcher
+        .statistics
+        .base
+        .note_decode_block_end(task_end_secs);
 
     result
 }
