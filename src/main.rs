@@ -11,12 +11,12 @@
 /// 1.7s sys time on a memory-pressured host — perf-stat 2026-05-19,
 /// neurotic, 8 GB RAM / 69 MB MemFree).
 ///
-/// `mimalloc` is the most-maintained stable-Rust crate with the same
-/// per-thread-arena property as rpmalloc. Setting it as the global
-/// allocator affects every `Box` / `Vec` / `String` in the binary,
-/// not just the chunk buffers — but that's a feature here: the
-/// post-process worker, the writer's I/O buffers, and the marker
-/// inflate state all benefit from the same per-thread recycling.
+/// `jemalloc` (via `tikv-jemallocator`) keeps freed pages in per-thread
+/// arenas without aggressively returning them to the OS — closer to
+/// vendor's rpmalloc semantics than mimalloc on memory-pressured hosts.
+/// Tried mimalloc first per advisor recommendation; sys time went from
+/// 1.7s → 5.5s on the 221 MB SM fixture (mimalloc aggressively releases
+/// pages via madvise on idle, opposite of what we want here).
 ///
 /// Gated on `not(test)` because the test binary has its own
 /// `CountingAllocator` in `src/tests/alloc_counter.rs` (used to
@@ -24,7 +24,7 @@
 /// active per binary.
 #[cfg(not(test))]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::env;
 use std::path::Path;
