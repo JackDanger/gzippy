@@ -6,16 +6,20 @@ every proposed change, measure fully after every change, and make
 decisions autonomously. Doubt everything you find until you cannot
 disprove it."
 
-## Bench result (20-trial median, neurotic, 221 MB logs.txt)
+## Bench result (final, 20-trial median, neurotic, 221 MB logs.txt, HEAD = 1b7c5af)
 
-| Format | gzippy | rapidgzip | ratio | vs session start |
-|---|---|---|---|---|
-| Single-member | 570 MB/s | 1168 MB/s | 0.49× | unchanged (0.48× at start) |
-| Multi-member | 2452 MB/s | 1665 MB/s | **1.48×** | unchanged |
-| BGZF | 2336 MB/s | 2629 MB/s | 0.90× | slight regression in noise |
-| gzippy-parallel | 519 MB/s | — | — | unchanged |
+| Format | gzippy | rapidgzip | ratio |
+|---|---|---|---|
+| Single-member | 534 MB/s | 1124 MB/s | 0.48× |
+| Multi-member | 2379 MB/s | 1547 MB/s | **1.54×** |
+| BGZF | 2223 MB/s | 2373 MB/s | 0.94× |
+| gzippy-parallel | 506 MB/s | — | — |
 
-All 4 formats decode byte-perfect (20/20 trials each).
+All 4 formats decode byte-perfect (20/20 trials each). Ratios stable
+across the session within bench noise.
+
+**42 commits since session base (commit `17fd9b2`).** 816 lib tests
+pass. Production binary verified byte-perfect on neurotic at HEAD.
 
 ## What was attempted and shipped
 
@@ -73,6 +77,36 @@ before landing. Reverts when the advisor was right.
   (`FasterVector.hpp:38-42`), not global. Stable Rust has no per-Vec
   allocator parameter. Reverted; documented the path forward
   (mmap+MAP_POPULATE alternative).
+
+## Faithful-port checkpoint
+
+Most §B "concrete deviations" and §C "missing pieces" in
+`docs/rapidgzip-port-reference.md` are now ✅ DONE or ⏭ DEFERRED
+by-design. Per the doc's gap matrix:
+
+- §B12 (WindowMap blocking/storage) — DONE
+- §B3 (applyWindow) — DONE this session
+- §B16 (silent libdeflate fallback) — DONE (resolved earlier)
+- §C8 (BlockMap wiring) — DONE
+- §C10 (parallel marker post-processing) — DONE
+- §C11 (per-subchunk window publishing) — DONE
+- §C13 (Footer + multi-stream loop) — DONE
+- §C15 (--verbose statistics) — DONE this session (6 commits)
+- §C19 (appendSubchunksToIndexes + unsplit_blocks) — DONE
+- §B6 / §B14 / §B15 — DONE
+
+Remaining items are either:
+- ⏭ Documented intentional divergences (§B7 different LUT shape,
+  §B8 extra fixed-Huffman prefilter, §B10 direct-try deletion,
+  §C16-18 split semantics, §C20 direct-try-at-guessed-offset)
+- 🟡 / ❌ Out-of-scope-for-overnight: §A3 §I cutover (multi-PR
+  structural rewrite that replaces `chunk_fetcher::drive` /
+  `consumer_loop` / `worker_loop` / `fast_marker_inflate` with a
+  literal port of `ParallelGzipReader::read`). The doc's §A3 plan
+  has 9 sequential steps; steps 2-3-6-7-8 are now DONE; steps
+  1/4/5/9 (delete spec ring, stop calling fast_marker_inflate,
+  unify the wrapper avail_in cap with chain invariant) are the
+  next-session block.
 
 ## What's identified but deferred
 
