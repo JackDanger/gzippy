@@ -595,10 +595,11 @@ chunks. Per-subchunk windows are populated via
 **Impact**: behaviourally fine for our single-pass write. The
 per-subchunk window populate is wired in production (good). Per-window
 CompressedVector storage is now wired via `WindowMap` (commit
-`17fd9b2`); single-member production uses `CompressionType::None`
-since each window is consumed once. The `Window = Arc<[u8; 32768]>`
-type signature on `WindowMap::get` is the remaining structural
-divergence (task #79).
+`17fd9b2`). The `Window` type signature was migrated to
+`Arc<CompressedVector>` at commit `ba6540a` — closes the
+WindowMap::get divergence. Branchless 64 KiB LUT for marker
+resolution landed at commit `ec55351` mirroring
+`DecodedData.hpp:314-338`. **§B3 status: ✅ fully ported.**
 
 ### B4. `IsalInflateWrapper::readStream`
 
