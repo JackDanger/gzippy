@@ -3,28 +3,26 @@
 //! A drop-in replacement for gzip that uses multiple processors for compression.
 //! Inspired by [pigz](https://zlib.net/pigz/) by Mark Adler.
 
-/// Per-thread arena allocator. Vendor's analog at
-/// `vendor/.../core/FasterVector.hpp:38-64` plugs rpmalloc's
-/// thread-local arena into the `Vec<uint8_t>` allocations that back
-/// each chunk's decoded output. Without arena recycling, glibc faults
-/// every fresh page on each chunk decode (measured 317K page-faults +
-/// 1.7s sys time on a memory-pressured host — perf-stat 2026-05-19,
-/// neurotic, 8 GB RAM / 69 MB MemFree).
-///
-/// `jemalloc` (via `tikv-jemallocator`) keeps freed pages in per-thread
-/// arenas without aggressively returning them to the OS — closer to
-/// vendor's rpmalloc semantics than mimalloc on memory-pressured hosts.
-/// Tried mimalloc first per advisor recommendation; sys time went from
-/// 1.7s → 5.5s on the 221 MB SM fixture (mimalloc aggressively releases
-/// pages via madvise on idle, opposite of what we want here).
-///
-/// Gated on `not(test)` because the test binary has its own
-/// `CountingAllocator` in `src/tests/alloc_counter.rs` (used to
-/// catch unexpected allocations). Only one global_allocator may be
-/// active per binary.
-#[cfg(not(test))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+// Global allocator: system default (glibc on Linux).
+//
+// History note (2026-05-19): tried mimalloc and jemalloc as global
+// allocators to mirror vendor's rpmalloc (`core/FasterVector.hpp:38-64`).
+// mimalloc: wall 0.94s → 1.78s (sys 1.7s → 8.4s) — aggressive page
+// release via madvise hurt on memory-pressured host.
+// jemalloc: SM throughput 560 → 462 MB/s at 20-trial median (CPUs
+// utilized jumped to 5.9 but throughput dropped — fighting itself).
+//
+// Per vendor's actual usage: `FasterVector.hpp:38-42` "rpmalloc as a
+// custom allocator in the few places we know to be performance-critical",
+// NOT global. Vendor's rpnew.h global override is explicitly avoided
+// per `ChunkData.hpp:24` ("memory slab reuse issues in rpmalloc").
+//
+// Conclusion: global allocator swap is not the right tool. The right
+// port of vendor's pattern would be a per-`Vec` allocator on the
+// `Vec<u8>` and `Vec<u16>` inside ChunkData, which stable Rust does
+// not support without unstable `Allocator` API. Alternative paths:
+// (a) explicit mmap + MAP_POPULATE for chunk buffers; (b) larger
+// chunk_buffer_pool cap so warm Vecs always available.
 
 use std::env;
 use std::path::Path;
