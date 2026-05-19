@@ -155,6 +155,20 @@ fn run() -> Result<i32, GzippyError> {
         || program_name == "zcat"
         || program_name == "gzcat";
 
+    // --verbose flows to the parallel-SM driver via env var (matches
+    // the GZIPPY_DEBUG plumbing pattern). Drains FetcherStatistics +
+    // ChunkFetcherStatistics + the deletion-trap counters to stderr at
+    // end-of-decode. Mirror of vendor's `args.verbose` →
+    // `setStatisticsEnabled(true)` at tools/rapidgzip.cpp:164.
+    if args.verbose {
+        // SAFETY: single-threaded at this point (worker pool not yet
+        // spawned). The decompression entry points read this env var
+        // exactly once on startup.
+        unsafe {
+            std::env::set_var("GZIPPY_VERBOSE", "1");
+        }
+    }
+
     // zcat/gzcat imply decompress-to-stdout
     let stdout_mode = args.stdout || program_name == "zcat" || program_name == "gzcat";
 

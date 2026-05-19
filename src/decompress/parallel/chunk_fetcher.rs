@@ -369,6 +369,54 @@ pub fn drive<W: std::io::Write>(
         .base
         .set_block_count(block_map.data_block_count(), true);
 
+    // --verbose stats dump. Mirror of vendor's destructor print at
+    // GzipChunkFetcher.hpp:124-198 + BlockFetcher.hpp:73-124. Triggered
+    // by GZIPPY_VERBOSE env var (matches the existing GZIPPY_DEBUG
+    // pattern at single_member.rs::debug_enabled). The CLI sets this
+    // when --verbose is passed; tests and other internal callers
+    // ignore it.
+    if std::env::var("GZIPPY_VERBOSE").is_ok() {
+        let snap = block_fetcher.statistics.base.snapshot();
+        let extra = block_fetcher.statistics.extra_snapshot();
+        eprintln!("[gzippy --verbose] BlockFetcher statistics:");
+        eprintln!("{}", snap);
+        eprintln!("  Preemptive stops: {}", extra.preemptive_stop_count);
+        eprintln!(
+            "  Time queuing post-processing: {:.6} s",
+            extra.queue_post_processing_duration
+        );
+        // Per-counter hot-path observations relevant to this branch's
+        // optimization work. Mirror of vendor's --verbose details
+        // adapted for gzippy-specific counters added this session.
+        use std::sync::atomic::Ordering;
+        eprintln!(
+            "  Adjusted chunk size applied: {}",
+            crate::decompress::parallel::single_member::ADJUSTED_CHUNK_SIZE_APPLIED
+                .load(Ordering::Relaxed)
+        );
+        eprintln!(
+            "  Prefetch next-offset filesize-accepts: {}",
+            PREFETCH_NEXT_FILESIZE_ACCEPT.load(Ordering::Relaxed)
+        );
+        eprintln!(
+            "  Unsplit blocks emplaced: {}",
+            UNSPLIT_BLOCKS_EMPLACED.load(Ordering::Relaxed)
+        );
+        use crate::decompress::parallel::chunk_buffer_pool::*;
+        eprintln!(
+            "  Buffer pool u8: hits={} misses={} returns={}",
+            TAKE_U8_HITS.load(Ordering::Relaxed),
+            TAKE_U8_MISSES.load(Ordering::Relaxed),
+            RETURN_U8_CALLS.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "  Buffer pool u16: hits={} misses={} returns={}",
+            TAKE_U16_HITS.load(Ordering::Relaxed),
+            TAKE_U16_MISSES.load(Ordering::Relaxed),
+            RETURN_U16_CALLS.load(Ordering::Relaxed),
+        );
+    }
+
     Ok((total_crc.crc32(), total_size))
 }
 
