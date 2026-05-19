@@ -15,14 +15,15 @@
 //! - `deflate_block` — rapidgzip-faithful port of `deflate::Block<>`
 //!   (`vendor/rapidgzip/.../gzip/deflate.hpp`). Drives the bootstrap
 //!   phase of the parallel single-member pipeline in
-//!   `gzip_chunk::finish_decode_chunk_with_inexact_offset`: decodes
+//!   `gzip_chunk::decode_chunk_marker_bootstrap_then_isal`: decodes
 //!   deflate blocks one-by-one emitting MapMarkers cross-chunk
 //!   back-references until ≥32 KiB of clean output accumulates, then
 //!   hands off to patched ISA-L for the bulk decode.
-//! - `gzip_chunk` — chunk-level decoder entry points (fast path with
-//!   known dict, slow path that bootstraps via `deflate_block`).
-//! - `inflate_wrapper` — patched-ISA-L wrapper used by the fast path
-//!   and the post-bootstrap bulk decode.
+//! - `gzip_chunk` — three named decoders: `decode_chunk_isal_inexact`
+//!   (production), `decode_chunk_isal_exact_until` (BGZF exact stop),
+//!   `decode_chunk_marker_bootstrap_then_isal` (tests).
+//! - `inflate_wrapper` — patched ISA-L; `with_until_bits` only for
+//!   exact-stop decodes, never for speculative single-member.
 
 pub mod affinity_helpers;
 pub mod aligned_allocator;

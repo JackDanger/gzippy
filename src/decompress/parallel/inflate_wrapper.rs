@@ -142,7 +142,7 @@ pub struct IsalInflateWrapper<'a> {
     /// frame in the flamegraph that vendor doesn't have.
     ///
     /// The struct is ~128 KiB. Workers construct one per chunk, hold
-    /// it on the stack inside `decode_chunk_with_window` etc. — that
+    /// it on the stack inside `decode_chunk_isal_inexact` etc. — that
     /// is vendor's pattern (the `IsalInflateWrapper` object lives in
     /// `decodeChunkWithInflateWrapper`'s stack frame at GzipChunk.hpp:206).
     /// If a future call site has a frame-size problem, that caller

@@ -117,14 +117,14 @@ pub struct Footer {
 #[derive(Debug, Clone)]
 pub struct ChunkData {
     pub encoded_offset_bits: usize,
-    /// Upper bound on the encoded offset this chunk could "match" if
-    /// the consumer asks for a slightly different start. Equals
-    /// `encoded_offset_bits` for a chunk that decoded from an exact
-    /// position; can be larger if the chunk's worker is willing to
-    /// stand in for any expected start in [encoded_offset_bits,
-    /// max_encoded_offset_bits]. Mirror of rapidgzip's
-    /// `ChunkData::maxEncodedOffsetInBits` (ChunkData.hpp:546-549).
-    pub max_encoded_offset_bits: usize,
+    /// Highest **start** offset this chunk can satisfy via
+    /// `matches_encoded_offset` / `set_encoded_offset` — NOT the
+    /// chunk's compressed end. Speculative prefetches set this to the
+    /// real block boundary (`offset.second` in vendor) while
+    /// `encoded_offset_bits` stays at the partition seed
+    /// (`offset.first`). Decoded bytes begin at `max_acceptable_start_bit`.
+    /// Mirror of `ChunkData::maxEncodedOffsetInBits` (ChunkData.hpp:546).
+    pub max_acceptable_start_bit: usize,
     pub encoded_size_bits: usize,
     /// Marker-tagged prefix. Each u16 < MARKER_BASE is a literal byte
     /// (`v as u8`); values ≥ MARKER_BASE are direct indices into the
@@ -245,7 +245,7 @@ impl ChunkData {
         };
         Self {
             encoded_offset_bits,
-            max_encoded_offset_bits: encoded_offset_bits,
+            max_acceptable_start_bit: encoded_offset_bits,
             encoded_size_bits: 0,
             data_with_markers,
             data,
@@ -268,7 +268,8 @@ impl ChunkData {
     /// speculative chunks whose start is in tolerance rather than
     /// exactly equal to the predecessor's actual end.
     pub fn matches_encoded_offset(&self, expected_start: usize) -> bool {
-        self.encoded_offset_bits <= expected_start && expected_start <= self.max_encoded_offset_bits
+        self.encoded_offset_bits <= expected_start
+            && expected_start <= self.max_acceptable_start_bit
     }
 
     /// Extract the trailing 32 KiB of decoded output as a window
@@ -363,7 +364,7 @@ impl ChunkData {
     /// DIRECTLY into `self.data` (e.g. ISA-L's `next_out` pointed at
     /// `data.as_mut_ptr().add(prev_len)` and produced `written` bytes
     /// there). Saves the `extend_from_slice` memcpy that
-    /// `decode_chunk_with_window`'s tight loop was paying on every
+    /// `decode_chunk_isal_inexact`'s tight loop was paying on every
     /// `isal_inflate` call — accounted for ~10% of decode wall time
     /// per `docs/runs/run-20260518-085124-perf/`.
     ///
@@ -944,7 +945,7 @@ impl ChunkData {
 
     /// Finalize at end of decode. Sets `encoded_size_bits` for the
     /// chunk and its trailing subchunk. **Does NOT touch
-    /// `max_encoded_offset_bits`** — vendor's pattern is that the
+    /// `max_acceptable_start_bit`** — vendor's pattern is that the
     /// worker sets max at decode time (`offset.second` per
     /// `GzipChunk.hpp:722`: where the boundary was actually found),
     /// and finalize leaves it alone. For fast-path decodes with a
@@ -988,7 +989,7 @@ impl ChunkData {
     /// speculative-seed start. Collapses the [encoded, max] match range
     /// to a single point.
     ///
-    /// Panics if `offset` is not in `[encoded_offset_bits, max_encoded_offset_bits]`
+    /// Panics if `offset` is not in `[encoded_offset_bits, max_acceptable_start_bit]`
     /// — rapidgzip throws `std::invalid_argument` in the same condition.
     /// In our codepath this method is currently exercised only on hits
     /// where `encoded == max == offset` (a no-op re-anchor), but keeping
@@ -1000,7 +1001,7 @@ impl ChunkData {
             "set_encoded_offset called with offset {} outside range [{}, {}]",
             offset,
             self.encoded_offset_bits,
-            self.max_encoded_offset_bits,
+            self.max_acceptable_start_bit,
         );
         let end_offset = self.encoded_offset_bits + self.encoded_size_bits;
         debug_assert!(
@@ -1011,7 +1012,7 @@ impl ChunkData {
         );
         self.encoded_size_bits = end_offset - offset;
         self.encoded_offset_bits = offset;
-        self.max_encoded_offset_bits = offset;
+        self.max_acceptable_start_bit = offset;
         // Adjust first subchunk: its encoded_offset becomes the new
         // chunk start, and its encoded_size spans to the next subchunk
         // (or to the chunk end if there's only one subchunk). If the new
@@ -1138,13 +1139,13 @@ mod tests {
         chunk.finalize(300);
         // Pretend the decoder set max via tryToDecode iteration; rapidgzip
         // chunks created from a stored-block range have max > encoded.
-        chunk.max_encoded_offset_bits = 150;
+        chunk.max_acceptable_start_bit = 150;
 
         // Re-anchor to 130 (within [100, 150]).
         chunk.set_encoded_offset(130);
 
         assert_eq!(chunk.encoded_offset_bits, 130);
-        assert_eq!(chunk.max_encoded_offset_bits, 130);
+        assert_eq!(chunk.max_acceptable_start_bit, 130);
         assert_eq!(chunk.encoded_size_bits, 300 - 130);
         assert_eq!(chunk.subchunks[0].encoded_offset_bits, 130);
         assert_eq!(chunk.subchunks[0].encoded_size_bits, 200 - 130);
@@ -1156,7 +1157,7 @@ mod tests {
     fn set_encoded_offset_single_subchunk_extends_to_chunk_end() {
         let mut chunk = ChunkData::new(0, small_config());
         chunk.finalize(500);
-        chunk.max_encoded_offset_bits = 100;
+        chunk.max_acceptable_start_bit = 100;
 
         chunk.set_encoded_offset(50);
 
@@ -1178,7 +1179,7 @@ mod tests {
         chunk.append_clean(&[0u8; 50]);
         chunk.finalize(700);
         // Stretch the speculative match range so set_encoded_offset(400) is valid.
-        chunk.max_encoded_offset_bits = 500;
+        chunk.max_acceptable_start_bit = 500;
         assert_eq!(chunk.subchunks.len(), 2);
 
         chunk.set_encoded_offset(400);
@@ -1297,11 +1298,11 @@ mod tests {
         assert_eq!(chunk.subchunks[0].decoded_size, 200);
         assert_eq!(chunk.subchunks[1].decoded_size, 30);
         assert_eq!(chunk.subchunks[1].encoded_size_bits, 500);
-        // max_encoded_offset_bits stays at construction-time value (0)
+        // max_acceptable_start_bit stays at construction-time value (0)
         // — vendor's pattern: max is set by the worker (offset.second
         // per GzipChunk.hpp:722), not by finalize. For fast-path
         // chunks max == encoded_offset_bits (exact-match semantics).
-        assert_eq!(chunk.max_encoded_offset_bits, 0);
+        assert_eq!(chunk.max_acceptable_start_bit, 0);
         assert_eq!(chunk.decoded_offset_for(0), Some(0));
         assert_eq!(chunk.decoded_offset_for(2000), Some(200));
         assert_eq!(chunk.decoded_offset_for(1234), None);

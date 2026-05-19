@@ -326,7 +326,7 @@ mod tests {
     /// directly to the parallel SM path. The classifier routes
     /// multi-member to bgzf, so this test bypasses routing and calls
     /// `decompress_parallel` directly. After the cutover, the
-    /// multi-stream Footer loop in `gzip_chunk::decode_chunk_with_window`
+    /// multi-stream Footer loop in `gzip_chunk::decode_chunk_isal_inexact`
     /// reads each per-stream gzip footer via
     /// `IsalInflateWrapper::read_footer_at_current`, calls
     /// `reset_for_next_stream`, and parses the next gzip header via

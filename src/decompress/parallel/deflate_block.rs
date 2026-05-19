@@ -407,7 +407,7 @@ impl Block {
     /// resolve to literal bytes rather than `MapMarkers`. This is the API
     /// rapidgzip uses for chunk N > 0 on its fast path
     /// (chunkdecoding/GzipChunk.hpp:190-268, `decodeChunkWithInflateWrapper`
-    /// — the analog of our `decode_chunk_with_window`).
+    /// — the analog of our `decode_chunk_isal_inexact`).
     ///
     /// **Storage model.** Mirrors rapidgzip's: `Block` owns a 64 KiB
     /// internal ring (`output_ring`, the analog of vendor's

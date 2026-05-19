@@ -1,45 +1,16 @@
-//! Port of the chunk-level decoder entry points in
-//! `rapidgzip::GzipChunk` (chunkdecoding/GzipChunk.hpp).
+//! Chunk-level deflate decoders — three separate entry points.
 //!
-//! `finish_decode_chunk_with_inexact_offset` is the workhorse the
-//! parallel fetcher (chunk_fetcher.rs) calls per worker. It assumes
-//! `encoded_offset_bits` points at a REAL deflate block boundary (the
-//! caller — usually [`crate::decompress::parallel::block_finder::BlockFinder`]
-//! — is responsible for that). From there it follows rapidgzip's
-//! pattern verbatim
-//! (vendor/.../chunkdecoding/GzipChunk.hpp::decodeChunkWithRapidgzip,
-//! L413-L657):
+//! Vendor picks via `untilOffsetIsExact` (`GzipChunk.hpp:669-709`). Do
+//! not apply exact-stop byte caps to speculative single-member work.
 //!
-//!   1. **Bootstrap with [`deflate_block::Block`]** — the rapidgzip-
-//!      faithful port of `vendor/.../gzip/deflate.hpp`'s
-//!      `deflate::Block<>`. The decoder consumes deflate blocks
-//!      one-at-a-time, emitting `Vec<u16>` where values < MARKER_BASE
-//!      are literal bytes and values ≥ MARKER_BASE are MapMarkers
-//!      cross-chunk back-references the consumer resolves via
-//!      `apply_window`. We track cumulative *clean* (non-marker) bytes;
-//!      when that reaches `MAX_WINDOW_SIZE` (32 KiB), bootstrap exits at
-//!      the next block boundary so phase 2 can take over.
+//! | Function | When | `until_bit` | Reader cap |
+//! |----------|------|-------------|------------|
+//! | [`decode_chunk_isal_inexact`] | Known dict and/or SM speculative | inexact boundary hint | **none** |
+//! | [`decode_chunk_isal_exact_until`] | BGZF / BlockMap exact end | must equal stop | `with_until_bits` |
+//! | [`decode_chunk_marker_bootstrap_then_isal`] | Unit tests / oracle | inexact | marker bootstrap then ISA-L |
 //!
-//!   2. **Hand off to patched ISA-L** — when the bootstrap accumulated
-//!      a clean 32 KiB tail, seed ISA-L with that as a dict and resume
-//!      decoding from the bootstrap's end-bit-offset. ISA-L delivers
-//!      ~163 MB/s/thread vs the Rust deflate decoder's ~50 MB/s.
-//!      Mirrors rapidgzip's `cleanDataCount >= MAX_WINDOW_SIZE` branch
-//!      at GzipChunk.hpp:520-525.
-//!
-//!   3. **Subchunk boundaries** are recorded by both phases via
-//!      `ChunkData::append_block_boundary`; the chunk emits a new
-//!      subchunk whenever accumulated `decoded_size` crosses
-//!      `split_chunk_size`.
-//!
-//!   4. **Finalize** at the ISA-L wrapper's final `tell_compressed()`.
-//!      Stream-trailer / multi-stream handling is the caller's
-//!      responsibility (single-member only).
-//!
-//! `decode_chunk_with_inflate_wrapper` is a sibling for chunk 0 / single-
-//! chunk decode where the predecessor window is known to be empty and
-//! the exact end offset is the stream length — used by the unit tests
-//! to oracle-check the bootstrap path against pure ISA-L.
+//! Production `chunk_fetcher` calls **inexact** on-demand and
+//! `speculative_decode_find_boundary` (empty dict) for prefetches.
 
 #![allow(dead_code)]
 
@@ -74,19 +45,13 @@ impl From<std::io::Error> for ChunkDecodeError {
 /// rapidgzip's `ALLOCATION_CHUNK_SIZE` (GzipChunk.hpp uses 128 KiB).
 const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 
-/// Fast-path chunk decoder used by workers when the predecessor's 32 KiB
-/// window is available in the shared WindowMap. Skips the marker-decoder
-/// bootstrap entirely: seeds the patched-ISA-L wrapper with the known
-/// dict, sets the rapidgzip stopping-points, decodes to the first
-/// non-fixed END_OF_BLOCK_HEADER at-or-past `until_bits`. The returned
-/// chunk has only clean bytes (no markers), and `apply_window` is a
-/// no-op on it.
-///
-/// Mirror of `rapidgzip::GzipChunk::finishDecodeChunkWithInexactOffset`
-/// (vendor/rapidgzip/.../chunkdecoding/GzipChunk.hpp:280-410) when
-/// `initialWindow` is known.
+/// **Inexact** ISA-L decode (vendor `finishDecodeChunkWithInexactOffset`
+/// when `initialWindow` is set, OR `decodeChunkWithRapidgzip` when it
+/// is not). `until_bits` is only a stop hint — the wrapper has **no**
+/// byte-level cap. Empty `initial_window` emits markers for unknown
+/// back-refs (speculative prefetch); a known dict yields clean bytes.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-pub fn decode_chunk_with_window(
+pub fn decode_chunk_isal_inexact(
     input: &[u8],
     encoded_offset_bits: usize,
     until_bits: usize,
@@ -378,7 +343,7 @@ pub fn decode_chunk_with_window(
 }
 
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
-pub fn decode_chunk_with_window(
+pub fn decode_chunk_isal_inexact(
     _input: &[u8],
     _encoded_offset_bits: usize,
     _until_bits: usize,
@@ -388,11 +353,11 @@ pub fn decode_chunk_with_window(
     Err(ChunkDecodeError::UnsupportedPlatform)
 }
 
-/// Exact-stop decode for chunk 0 (empty initial window) or test fixtures
-/// where the caller has a verified exact end offset. Mirror of
-/// `decodeChunkWithInflateWrapper` (GzipChunk.hpp:190-268).
+/// **Exact** ISA-L decode — vendor `decodeChunkWithInflateWrapper` when
+/// `untilOffsetIsExact == true` (BGZF / BlockMap). `with_until_bits`
+/// prevents reading past `exact_until_bits`. Not used for speculative SM.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-pub fn decode_chunk_with_inflate_wrapper(
+pub fn decode_chunk_isal_exact_until(
     input: &[u8],
     encoded_offset_bits: usize,
     exact_until_bits: usize,
@@ -438,11 +403,9 @@ pub fn decode_chunk_with_inflate_wrapper(
     Ok(chunk)
 }
 
-/// Decode a chunk seeded at a REAL deflate block boundary with an
-/// initially-unknown (empty) predecessor window. Uses the marker
-/// decoder for the bootstrap phase (so cross-chunk back-references are
-/// tagged as markers), then hands off to patched ISA-L for the bulk
-/// decode once a 32 KiB clean tail is in hand.
+/// Marker-bootstrap then ISA-L — **tests / oracle only**; production
+/// prefetches use `decode_chunk_isal_inexact` with an empty dict instead.
+/// Requires a real deflate block boundary at `encoded_offset_bits`.
 ///
 /// Returns a `ChunkData` whose `data_with_markers` covers the bootstrap
 /// prefix (still containing markers; resolved by `apply_window` in the
@@ -451,7 +414,7 @@ pub fn decode_chunk_with_inflate_wrapper(
 /// `until_bits`, or at BFINAL, or when accumulated `decoded_size`
 /// crosses `max_decoded_chunk_size`.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-pub fn finish_decode_chunk_with_inexact_offset(
+pub fn decode_chunk_marker_bootstrap_then_isal(
     input: &[u8],
     encoded_offset_bits: usize,
     until_bits: usize,
@@ -566,7 +529,7 @@ pub fn finish_decode_chunk_with_inexact_offset(
     // Track the position of the last END_OF_BLOCK (= start of next
     // block's header). When END_OF_BLOCK_HEADER fires with a non-fixed
     // btype past until_bits, stop at last_eob_pos (pre-header
-    // position) so successor can resume cleanly. See decode_chunk_with_window
+    // position) so successor can resume cleanly. See decode_chunk_isal_inexact
     // for the same logic in the fast path.
     let mut last_eob_pos = bit_offset;
     let mut chunk_end_override: Option<usize> = None;
@@ -925,7 +888,7 @@ fn absolute_bit_pos(
 
 // Stubs for non-x86_64 / no-feature builds.
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
-pub fn decode_chunk_with_inflate_wrapper(
+pub fn decode_chunk_isal_exact_until(
     _input: &[u8],
     _encoded_offset_bits: usize,
     _exact_until_bits: usize,
@@ -936,7 +899,7 @@ pub fn decode_chunk_with_inflate_wrapper(
 }
 
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
-pub fn finish_decode_chunk_with_inexact_offset(
+pub fn decode_chunk_marker_bootstrap_then_isal(
     _input: &[u8],
     _encoded_offset_bits: usize,
     _until_bits: usize,
@@ -980,7 +943,7 @@ mod tests {
         };
         let until_bits = deflate.len() * 8;
         let chunk =
-            finish_decode_chunk_with_inexact_offset(&deflate, 0, until_bits, &[], cfg).unwrap();
+            decode_chunk_marker_bootstrap_then_isal(&deflate, 0, until_bits, &[], cfg).unwrap();
         let output = flatten(&chunk);
         assert_eq!(output.len(), payload.len());
         assert_eq!(output, payload);
@@ -997,7 +960,7 @@ mod tests {
         };
         let until_bits = deflate.len() * 8;
         let chunk =
-            finish_decode_chunk_with_inexact_offset(&deflate, 0, until_bits, &[], cfg).unwrap();
+            decode_chunk_marker_bootstrap_then_isal(&deflate, 0, until_bits, &[], cfg).unwrap();
         assert!(
             chunk.subchunks.len() >= 1,
             "expected ≥1 subchunk, got {}",
@@ -1008,12 +971,12 @@ mod tests {
     }
 
     #[test]
-    fn decode_chunk_with_inflate_wrapper_exact_stop_succeeds() {
+    fn decode_chunk_isal_exact_until_exact_stop_succeeds() {
         let payload = b"hello world".repeat(10_000);
         let deflate = make_deflate(&payload);
         let cfg = ChunkConfiguration::default();
         let exact_until = deflate.len() * 8;
-        let chunk = decode_chunk_with_inflate_wrapper(&deflate, 0, exact_until, &[], cfg).unwrap();
+        let chunk = decode_chunk_isal_exact_until(&deflate, 0, exact_until, &[], cfg).unwrap();
         assert_eq!(chunk.decoded_size(), payload.len());
         assert_eq!(chunk.data, payload);
     }
@@ -1030,7 +993,7 @@ mod tests {
         // Stop partway through the stream.
         let until_bits = deflate.len() * 8 / 2;
         let chunk =
-            finish_decode_chunk_with_inexact_offset(&deflate, 0, until_bits, &[], cfg).unwrap();
+            decode_chunk_marker_bootstrap_then_isal(&deflate, 0, until_bits, &[], cfg).unwrap();
         // Chunk's encoded range should at least reach until_bits (within
         // one block's worth of overshoot is expected and valid).
         let chunk_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
@@ -1102,7 +1065,7 @@ mod tests {
             // until_bits = full stream end so bootstrap runs to clean
             // handoff (or BFINAL on last blocks); failures here are the
             // bug we're chasing.
-            match finish_decode_chunk_with_inexact_offset(&deflate, start_bit, until_bits, &[], cfg)
+            match decode_chunk_marker_bootstrap_then_isal(&deflate, start_bit, until_bits, &[], cfg)
             {
                 Ok(_) => {}
                 Err(e) => failures.push((start_bit, format!("{e:?}"))),

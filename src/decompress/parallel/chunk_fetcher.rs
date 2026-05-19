@@ -41,10 +41,12 @@
 //!   closure passed to `BlockFetcher::get`, which calls
 //!   `thread_pool.submit(run_decode_job, /* priority */ 0)` and returns
 //!   the future's receiver. Mirror of BlockFetcher.hpp:554-558.
-//! - `decodeBlock` / `decodeChunk` / `decodeChunkWithRapidgzip` →
-//!   `gzip_chunk::decode_chunk_with_window` (fast path) +
-//!   `decode_or_iterate` (slow path: tryToDecode + BlockFinder
-//!   iteration per GzipChunk.hpp:712-846).
+//! - Worker decode dispatch (pick ONE — do not mix exact/inexact semantics):
+//!   | Situation | Function | Vendor analogue | `until_bit` meaning |
+//!   |-----------|----------|-----------------|---------------------|
+//!   | Predecessor window known (or chunk 0) | `decode_chunk_isal_inexact` | `finishDecodeChunkWithInexactOffset` + dict | inexact stop hint, **no** byte cap |
+//!   | Confirmed exact end (BGZF / BlockMap) | `decode_chunk_isal_exact_until` | `decodeChunkWithInflateWrapper` | hard stop, `with_until_bits` cap |
+//!   | Prefetch, no window yet | `speculative_decode_find_boundary` | `tryToDecode` + finder cascade | inexact; sets `[encoded, max_acceptable_start_bit]` metadata |
 //! - `postProcessChunk` / `applyWindow` → `apply_window` +
 //!   `populate_subchunk_windows`, dispatched on the SAME pool via
 //!   `thread_pool.submit(run_post_process_job, /* priority */ -1)`
@@ -74,9 +76,7 @@ use crate::decompress::parallel::crc32::CRC32Calculator;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::gzip_block_finder::{GetReturnCode, GzipBlockFinder};
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-use crate::decompress::parallel::gzip_chunk::{
-    decode_chunk_with_window, finish_decode_chunk_with_inexact_offset,
-};
+use crate::decompress::parallel::gzip_chunk::decode_chunk_isal_inexact;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::prefetcher::FetchNextAdaptive;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
@@ -185,14 +185,15 @@ const FETCH_STRATEGY_MEMORY: usize = 32;
 struct DecodeParams {
     /// Bit offset where this chunk's decode starts.
     start_bit: usize,
-    /// Approximate bit offset where the chunk should stop (the next
-    /// chunk's `nextBlockOffset` from `m_blockFinder->get(idx+1)`,
-    /// vendor BlockFetcher.hpp:268).
+    /// Inexact stop hint: first deflate block boundary at-or-past this
+    /// bit (vendor `untilOffset` when `untilOffsetIsExact == false`).
+    /// NOT a hard byte cap on the ISA-L reader — see
+    /// `decode_chunk_isal_inexact` vs `decode_chunk_isal_exact_until`.
     until_bit: usize,
-    /// True iff the caller has guaranteed the predecessor's 32 KiB
-    /// window is published in the WindowMap by the time the worker
-    /// runs. Used to pick fast vs slow path at the worker.
-    authoritative: bool,
+    /// True for partition-aligned prefetches that may run before the
+    /// predecessor window is published (speculative path). False for
+    /// on-demand decodes at a confirmed `block_finder` offset.
+    is_speculative_prefetch: bool,
     /// For trace labelling only.
     partition_idx: usize,
 }
@@ -529,7 +530,7 @@ fn consumer_loop<W: std::io::Write>(
         let params = DecodeParams {
             start_bit: next_block_offset,
             until_bit,
-            authoritative: true,
+            is_speculative_prefetch: false,
             partition_idx: partition_idx_for_trace,
         };
 
@@ -555,10 +556,7 @@ fn consumer_loop<W: std::io::Write>(
             let prefetch_params = DecodeParams {
                 start_bit: offset,
                 until_bit: prefetch_until_bit,
-                // Prefetch tasks may race ahead of the consumer; the
-                // worker waits a short window for the predecessor's
-                // tail and falls back to the slow path on miss.
-                authoritative: false,
+                is_speculative_prefetch: true,
                 partition_idx: usize::MAX, // trace marker for "prefetch"
             };
             submit_decode_to_pool(
@@ -639,7 +637,7 @@ fn consumer_loop<W: std::io::Write>(
                 // **gzippy-specific safety guard** — the speculative
                 // slow path now publishes vendor-faithful metadata
                 // (`encoded_offset = offset.first`, `max =
-                // offset.second`, decode_or_iterate above). Vendor
+                // offset.second`, speculative_decode_find_boundary above). Vendor
                 // safely uses a `matchesEncodedOffset` range hit
                 // because chunk_N.actual_end == chunk_{N+1}.offset.second
                 // by construction (chain invariant — fast-path
@@ -652,7 +650,7 @@ fn consumer_loop<W: std::io::Write>(
                 //
                 // Restrict the trim to the ONE boundary case that is
                 // safe without the chain invariant:
-                //   - blockOffset == max_encoded_offset_bits → no
+                //   - blockOffset == max_acceptable_start_bit → no
                 //     trim needed because chunk's data starts AT
                 //     `max` (slow path's offset.second). Writing
                 //     chunk.data wholesale emits bytes for
@@ -667,8 +665,13 @@ fn consumer_loop<W: std::io::Write>(
                 // be safe in the common case (encoded == max after
                 // slow path validated at the partition seed) but
                 // unsafe in the general case. Keep only `max`.
-                let exact_match = arc.max_encoded_offset_bits == next_block_offset;
-                if arc.matches_encoded_offset(next_block_offset) && exact_match {
+                // Speculative chunks may claim a start RANGE
+                // [encoded_offset_bits, max_acceptable_start_bit] but
+                // decoded bytes only exist from max onward. Safe reuse
+                // requires the consumer's confirmed start == max (vendor
+                // chain: chunk_N.end == chunk_{N+1}.start at max).
+                let handoff_at_decode_start = arc.max_acceptable_start_bit == next_block_offset;
+                if arc.matches_encoded_offset(next_block_offset) && handoff_at_decode_start {
                     chunk_arc_from_partition = Some(arc);
                 } else {
                     // Diagnostic counter (added 2026-05-19): a prefetch
@@ -725,7 +728,7 @@ fn consumer_loop<W: std::io::Write>(
         //   `chunkData->setEncodedOffset(*nextBlockOffset);`
         // Adjusts encoded_offset_bits to the consumer-requested seed
         // (matters when a speculative worker decoded at an earlier
-        // candidate inside [next_block_offset, max_encoded_offset_bits]).
+        // candidate inside [next_block_offset, max_acceptable_start_bit]).
         if chunk.encoded_offset_bits != next_block_offset {
             chunk.set_encoded_offset(next_block_offset);
         }
@@ -792,7 +795,7 @@ fn consumer_loop<W: std::io::Write>(
             //   `auto sharedLastWindow = m_windowMap->get( *nextBlockOffset );`
             // Always look up the predecessor's window at the consumer's
             // expected start (`next_block_offset`), NOT at the chunk's
-            // post-finalize `max_encoded_offset_bits`. The two coincide
+            // post-finalize `max_acceptable_start_bit`. The two coincide
             // ONLY after `set_encoded_offset(next_block_offset)` re-
             // anchors max → next_block_offset; in the "chunk's encoded
             // offset already matches next_block_offset" branch above
@@ -967,8 +970,11 @@ fn submit_decode_to_pool(
             "consumer",
             "submit_decode",
             &format!(
-                r#""partition_idx":{},"start_bit":{},"until_bit":{},"authoritative":{}"#,
-                params.partition_idx, params.start_bit, params.until_bit, params.authoritative,
+                r#""partition_idx":{},"start_bit":{},"until_bit":{},"is_speculative_prefetch":{}"#,
+                params.partition_idx,
+                params.start_bit,
+                params.until_bit,
+                params.is_speculative_prefetch,
             ),
         );
     }
@@ -1009,12 +1015,10 @@ fn submit_post_process_to_pool(
     future.into_receiver()
 }
 
-/// Pool-side execution of a decode task. Mirror of vendor's
-/// `decodeBlock(blockOffset, nextBlockOffset)`
-/// (GzipChunkFetcher.hpp:692-729) — picks the fast path
-/// (`decodeChunkWithIsal` / `decode_chunk_with_window`) when the
-/// initial window is known, else the slow path
-/// (`decodeChunkWithRapidgzip` / `decode_or_iterate`).
+/// Pool-side execution of a decode task (vendor `decodeBlock`,
+/// GzipChunkFetcher.hpp:692-729). Routes to `decode_chunk_isal_inexact`
+/// when the predecessor window is published, else
+/// `speculative_decode_find_boundary` (empty dict, markers allowed).
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 fn run_decode_task(
     input: InputSlice,
@@ -1046,14 +1050,14 @@ fn run_decode_task(
     // Audit step 5: WindowMap is now Condvar-free (vendor
     // WindowMap.hpp:19-186 has no condition_variable). Workers do
     // NON-blocking `get`: if the predecessor's tail has been
-    // published, take the fast path; otherwise fall through to the
-    // slow path (decode with markers, consumer's post-process
+    // published, use inexact ISA-L; otherwise speculative boundary
+    // search (decode with markers, consumer's post-process
     // resolves them). This is the vendor model — workers never block
     // on the WindowMap; the dispatch order from `BlockFetcher::get`
     // and the post-process queue do the synchronization.
     // Chunk-0 special case: predecessor window is the zero sentinel.
     // Hold the materialized bytes on the stack so the
-    // `decode_chunk_with_window` slice borrow is valid for the call's
+    // `decode_chunk_isal_inexact` slice borrow is valid for the call's
     // duration without going through WindowMap. Non-chunk-0 worker
     // gets the predecessor window via `window_map.get` (zero-alloc
     // Arc clone) and materializes bytes via `materialize_window`.
@@ -1065,7 +1069,7 @@ fn run_decode_task(
     };
 
     let chunk_result = if params.start_bit == 0 {
-        decode_chunk_with_window(
+        decode_chunk_isal_inexact(
             input_bytes,
             params.start_bit,
             params.until_bit,
@@ -1074,7 +1078,7 @@ fn run_decode_task(
         )
     } else if let Some(w) = window.as_ref() {
         let bytes = materialize_window(w);
-        decode_chunk_with_window(
+        decode_chunk_isal_inexact(
             input_bytes,
             params.start_bit,
             params.until_bit,
@@ -1082,7 +1086,7 @@ fn run_decode_task(
             configuration,
         )
     } else {
-        decode_or_iterate(
+        speculative_decode_find_boundary(
             input_bytes,
             params.start_bit,
             params.until_bit,
@@ -1203,7 +1207,7 @@ fn run_post_process_task(
 /// falls back to an on-demand decode at the real offset.
 ///
 /// Previously this function fabricated `encoded_offset_bits = start_bit`
-/// and stored `max_encoded_offset_bits = actual`, claiming the chunk
+/// and stored `max_acceptable_start_bit = actual`, claiming the chunk
 /// spanned `[start_bit, actual + size]`. But the decoded bytes ONLY
 /// covered `[actual, actual + size]`, so consumers that took the chunk
 /// at face value (after the partition-keyed cache lookup landed) would
@@ -1236,16 +1240,11 @@ fn run_post_process_task(
 /// 15-38 such prefetches per silesia decode, that's 200-500 ms of pure
 /// waste, half the total wall time.
 ///
-/// Until the bootstrap marker decoder is fixed, restrict iteration to
-/// the first candidate — vendor's `tryToDecode` returns on first success
-/// at GzipChunk.hpp:837-841, and we have no evidence that retry past
-/// the first candidate ever salvages a real-world prefetch (the
-/// production tracer showed zero `iterate_ok` events across 15 failed
-/// prefetches). Restricting to one trial cuts per-failed-prefetch cost
-/// from ~14 ms to ~200 µs, freeing workers to take on-demand work the
-/// consumer dispatches. Effective parallelism climbs as soon as the
-/// consumer is no longer waiting on a worker that's grinding through 67
-/// doomed trial decodes.
+/// Slow-path trial decode now uses `decode_chunk_isal_inexact` (patched
+/// ISA-L, empty dict) instead of the deflate_block bootstrap that was
+/// failing with `InvalidHuffmanCode` at real boundaries. We still walk
+/// every candidate in each 8 KiB sub-window and return on first success
+/// (vendor GzipChunk.hpp:837-841).
 ///
 /// Vendor parity (GzipChunk.hpp:803-846): scan in 8 KiB CHUNK_SIZE
 /// increments but keep iterating until 512 KiB total or until a valid
@@ -1256,7 +1255,7 @@ fn run_post_process_task(
 /// 512_Ki * BYTE_SIZE` break at GzipChunk.hpp:811.
 /// Diagnostic counters for slow-path candidate iteration. Advisor 12
 /// asked: of the 22 on-demand fallbacks observed in --verbose stats,
-/// how many are caused by `decode_or_iterate` returning Err vs the
+/// how many are caused by `speculative_decode_find_boundary` returning Err vs the
 /// consumer-side `matches_encoded_offset` check rejecting? These
 /// counters let a single GZIPPY_VERBOSE decode answer the question
 /// without needing trace parsing.
@@ -1269,7 +1268,7 @@ pub static SLOW_PATH_FIRST_CANDIDATE_FAIL: std::sync::atomic::AtomicU64 =
 
 /// Bumps once per consumer iter where the partition-keyed
 /// `try_take_prefetched` returned a chunk but the safety guard
-/// rejected it (mismatch between `chunk.max_encoded_offset_bits` and
+/// rejected it (mismatch between `chunk.max_acceptable_start_bit` and
 /// consumer-requested `next_block_offset`). Separating this from
 /// `prefetch_cache_miss` (which counts "prefetch absent") was advisor
 /// 14's question: of the on-demand fetches counted in --verbose, how
@@ -1277,8 +1276,42 @@ pub static SLOW_PATH_FIRST_CANDIDATE_FAIL: std::sync::atomic::AtomicU64 =
 pub static PREFETCH_REJECT_BY_GUARD: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Speculative slow-path decode without a predecessor window. Uses
+/// `decode_chunk_isal_inexact` with an empty dict (markers for unknown
+/// back-refs) instead of `decode_chunk_marker_bootstrap_then_isal`'s
+/// deflate_block bootstrap, which was failing with `InvalidHuffmanCode`
+/// at real block boundaries on gzip -9 silesia and burning worker time.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-fn decode_or_iterate(
+fn try_speculative_decode_candidate(
+    input: &[u8],
+    decode_start: usize,
+    partition_seed: usize,
+    until_bit: usize,
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    let mut chunk = decode_chunk_isal_inexact(input, decode_start, until_bit, &[], configuration)?;
+    // Vendor tryToDecode metadata (GzipChunk.hpp:716-722): encoded =
+    // partition seed, max = actual decode start.
+    if partition_seed < decode_start {
+        let encoded_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+        let first_sc_upper = chunk
+            .subchunks
+            .get(1)
+            .map(|sc| sc.encoded_offset_bits)
+            .unwrap_or(encoded_end);
+        chunk.encoded_offset_bits = partition_seed;
+        chunk.encoded_size_bits = encoded_end - partition_seed;
+        chunk.max_acceptable_start_bit = decode_start;
+        if let Some(first_sc) = chunk.subchunks.first_mut() {
+            first_sc.encoded_offset_bits = partition_seed;
+            first_sc.encoded_size_bits = first_sc_upper - partition_seed;
+        }
+    }
+    Ok(chunk)
+}
+
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+fn speculative_decode_find_boundary(
     input: &[u8],
     start_bit: usize,
     until_bit: usize,
@@ -1286,13 +1319,9 @@ fn decode_or_iterate(
 ) -> Result<ChunkData, ChunkDecodeError> {
     // Vendor GzipChunk.hpp:736-741 — `tryToDecode({ blockOffset, blockOffset })`
     // before the expensive block-finder cascade.
-    match finish_decode_chunk_with_inexact_offset(input, start_bit, until_bit, &[], configuration) {
-        Ok(mut chunk) => {
+    match try_speculative_decode_candidate(input, start_bit, start_bit, until_bit, configuration) {
+        Ok(chunk) => {
             SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let encoded_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-            chunk.encoded_offset_bits = start_bit;
-            chunk.max_encoded_offset_bits = start_bit;
-            chunk.encoded_size_bits = encoded_end.saturating_sub(start_bit);
             return Ok(chunk);
         }
         Err(_) => {
@@ -1309,82 +1338,26 @@ fn decode_or_iterate(
     while chunk_begin < max_end {
         let chunk_end = (chunk_begin + CHUNK_SIZE_BITS).min(max_end);
         let candidates = finder.find_blocks(chunk_begin, chunk_end);
-        if let Some(first) = candidates.into_iter().find(|c| c.bit_offset >= chunk_begin) {
-            let result = finish_decode_chunk_with_inexact_offset(
+        for cand in candidates
+            .into_iter()
+            .filter(|c| c.bit_offset >= chunk_begin && c.bit_offset < chunk_end)
+        {
+            match try_speculative_decode_candidate(
                 input,
-                first.bit_offset,
+                cand.bit_offset,
+                start_bit,
                 until_bit,
-                &[],
                 configuration,
-            );
-            // Advisor 12 instrumentation: classify the result. If the
-            // first candidate fails, the consumer falls through to
-            // on-demand dispatch — explains the 22-of-37 on-demand
-            // count observed in --verbose stats.
-            match &result {
-                Ok(_) => {
-                    SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ) {
+                Ok(chunk) => {
+                    SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(chunk);
                 }
-                Err(_) => SLOW_PATH_FIRST_CANDIDATE_FAIL
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            };
-            let mut chunk = result?;
-            // Vendor-faithful metadata for speculative chunks
-            // (GzipChunk.hpp:716-722):
-            //
-            //     bitReader.seekTo( offset.second );  // actual boundary
-            //     auto result = decodeChunkWithRapidgzip(...);
-            //     result.encodedOffsetInBits = offset.first;     // partition seed (claimed start)
-            //     result.maxEncodedOffsetInBits = offset.second; // actual boundary (upper bound)
-            //     result.encodedSizeInBits = result.encodedEndOffsetInBits - result.encodedOffsetInBits;
-            //
-            // Enables vendor's `matchesEncodedOffset` to return TRUE
-            // for any `blockOffset` in `[offset.first, offset.second]`,
-            // so a speculative prefetch dispatched at the partition
-            // seed can be accepted for slightly-offset consumer
-            // requests via `setEncodedOffset` trim.
-            //
-            // Previously gzippy dropped this fabrication (per
-            // chunk_fetcher.rs comment block above) because the
-            // chunk's data starts at offset.second, not offset.first
-            // — there are no decoded bytes for bits
-            // `[offset.first, offset.second)`. Vendor's invariant that
-            // chunk_N.actual_end == chunk_{N+1}.offset.second prevents
-            // the consumer from ever requesting a blockOffset inside
-            // that gap. gzippy doesn't enforce the chain invariant yet,
-            // so we re-introduce vendor's metadata BUT enforce a
-            // conservative consumer-side check: the speculative-trim
-            // path only fires when `blockOffset == max_encoded_offset_bits`
-            // (perfect handoff, no trim needed) or `blockOffset ==
-            // encoded_offset_bits` (exact-match at the partition seed).
-            // See chunk_fetcher.rs::consumer_loop's `try_take_prefetched`
-            // success branch.
-            if start_bit < first.bit_offset {
-                let encoded_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-                // Capture the upper bound of the first subchunk BEFORE
-                // we mutate it. Mirror of vendor's
-                // `ChunkData::setEncodedOffset` line 624-627:
-                //
-                //     const auto nextSubchunk = std::next(m_subchunks.begin());
-                //     const auto nextOffset = nextSubchunk == m_subchunks.end()
-                //                             ? encodedEndOffsetInBits
-                //                             : nextSubchunk->encodedOffset;
-                //     m_subchunks.front().encodedOffset = offset;
-                //     m_subchunks.front().encodedSize = nextOffset - offset;
-                let first_sc_upper = chunk
-                    .subchunks
-                    .get(1)
-                    .map(|sc| sc.encoded_offset_bits)
-                    .unwrap_or(encoded_end);
-                chunk.encoded_offset_bits = start_bit;
-                chunk.encoded_size_bits = encoded_end - start_bit;
-                chunk.max_encoded_offset_bits = first.bit_offset;
-                if let Some(first_sc) = chunk.subchunks.first_mut() {
-                    first_sc.encoded_offset_bits = start_bit;
-                    first_sc.encoded_size_bits = first_sc_upper - start_bit;
+                Err(_) => {
+                    SLOW_PATH_FIRST_CANDIDATE_FAIL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            return Ok(chunk);
         }
         chunk_begin = chunk_end;
     }
