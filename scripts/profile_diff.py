@@ -204,18 +204,37 @@ BANDS: list[tuple[str, list[re.Pattern]]] = [
         "unresolved",
         [
             # inferno-collapse-perf emits "..@N.end" for samples whose
-            # stack walk failed past frame N. Track them as a band so we
-            # see how much of the profile is unsamplable due to missing
-            # frame pointers / DWARF.
-            re.compile(r"^\.\.@\d+\.end$"),
-            re.compile(r"^\[unknown\]$"),
+            # stack walk failed past frame N. The pattern lives mid-stack
+            # (e.g. `bash;[ld-linux];..@37.end;asm_exc_page_fault`), not
+            # at line start, so the regex must match SUBSTRING — no `^`
+            # anchor. Previous revision used `^\.\.@\d+\.end$` which
+            # silently classified all unresolved samples as "other".
+            re.compile(r"\.\.@\d+\.end"),
+            re.compile(r"\[unknown\]"),
         ],
     ),
 ]
 
 
 def classify(stack_line: str) -> str:
-    """Return the first band whose patterns match anywhere in the stack line."""
+    """Return the band best describing this sample's hot frame.
+
+    Strategy: match the LEAF frame first (where the CPU was at sample
+    time). If the leaf matches no band, scan the rest of the stack —
+    catches cases like `[libc.so.6]` leaves over a `gzippy::` caller.
+
+    This avoids the bug where a mid-stack `..@N.end` (inferno
+    unresolved-frame marker) absorbs samples whose actual cost is a
+    kernel page-fault deeper in the stack. With "leaf wins" the page-
+    fault frames at the bottom correctly classify into kernel_pagefault.
+    """
+    # Folded format: `frame_root;...;frame_leaf`. rsplit gives [..., leaf].
+    leaf = stack_line.rsplit(";", 1)[-1]
+    for band, patterns in BANDS:
+        for p in patterns:
+            if p.search(leaf):
+                return band
+    # Leaf didn't match — scan the whole stack as a fallback.
     for band, patterns in BANDS:
         for p in patterns:
             if p.search(stack_line):

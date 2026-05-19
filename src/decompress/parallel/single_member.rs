@@ -153,38 +153,14 @@ pub fn decompress_parallel<W: Write>(
             ADJUSTED_CHUNK_SIZE_APPLIED.fetch_add(1, Ordering::Relaxed);
         }
 
-        // **Pre-warm intentionally NOT called for CLI invocations.**
-        //
-        // First prototype called `chunk_buffer_pool::prewarm(N+2,
-        // chunk_size*4)` to serialize page-fault cost onto the consumer
-        // thread before workers spawn. Measured on neurotic x86_64
-        // silesia-large at T=16, 20 trials:
-        //
-        //   without prewarm: 666 MB/s SM throughput (0.44× vendor)
-        //   with prewarm:    329 MB/s            (0.26× vendor)
-        //
-        // The bench creates a fresh process per trial; pre-warming
-        // ~864 MiB on the consumer thread (u8 + u16 pools × chunk_size*4
-        // × N+2 buffers × 1+2 bytes) adds ~170 ms of pure overhead to a
-        // ~750 ms decode. Total work increases.
-        //
-        // Vendor's per-process advantage isn't pre-warming; it's
-        // rpmalloc handling `mmap` differently — large pre-mapped
-        // arenas parcel out warm pages without page-faulting per
-        // allocation. Stable Rust can't easily port rpmalloc's
-        // allocator semantics. Future options if this band needs to
-        // close:
-        //   - Daemon-mode CLI (single process, many decodes): prewarm
-        //     fires once and amortizes across files.
-        //   - Custom `Allocator` parameter on `Vec` when allocator_api
-        //     stabilizes — wrap rpmalloc-rs as a per-Vec allocator.
-        //   - `mmap(MAP_POPULATE)` for the largest buffers via memmap2.
-        //
-        // The `prewarm` function in chunk_buffer_pool stays available
-        // for daemon-mode callers; only the CLI dispatch leaves it
-        // unfired. The 50% regression was caught by 20-trial bench;
-        // the comment + this empty branch document why future ports
-        // should not re-introduce the call without daemon-mode wiring.
+        // No pool pre-warm here. A prior experiment touched pool pages
+        // on the consumer thread before workers spawn; 20-trial bench
+        // on neurotic measured a -50% SM regression because every fresh
+        // CLI process paid the pre-touch cost without amortization. The
+        // page-fault gap vs vendor (40% gzippy vs 17% rapidgzip) needs a
+        // real per-Vec allocator (allocator-api2 + rpmalloc-rs) or
+        // daemon-mode CLI to close; not a pre-touch loop. See module
+        // docs at `chunk_buffer_pool.rs:57-77`.
         let result = read_parallel_sm(gzip_data, writer, num_threads, chunk_size).map_err(|e| {
             if debug_enabled() {
                 eprintln!("[parallel_sm] driver error: {e}");
