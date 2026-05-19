@@ -692,6 +692,16 @@ fn bootstrap_with_deflate_block(
     use crate::decompress::inflate::consume_first_decode::Bits;
     use crate::decompress::parallel::deflate_block::{Block, CompressionType, MAX_WINDOW_SIZE};
     use crate::decompress::parallel::replace_markers::MARKER_BASE;
+    use std::cell::RefCell;
+
+    // Per-thread Block recycling. Block::new() allocates a 128 KiB
+    // ring + initializes the marker zone (64 KiB writes). Doing that
+    // per chunk was a measured ~4 pp of CPU in `clear_page_erms` on
+    // silesia. Per-thread reuse amortizes the cost to once-per-worker.
+    // `Block::reset` re-primes marker zone but skips the alloc.
+    thread_local! {
+        static BOOTSTRAP_BLOCK: RefCell<Block> = RefCell::new(Block::new());
+    }
 
     let byte_offset = start_bit_offset / 8;
     let bit_in_byte = (start_bit_offset % 8) as u32;
@@ -708,10 +718,13 @@ fn bootstrap_with_deflate_block(
 
     // Bootstrap output: typically ~32 KiB + one trailing block, up to
     // ~128 KiB worst case for a single dense dynamic block. Pre-reserve
-    // generously to avoid early growth without re-introducing the
-    // 4× deflate_bytes-per-thread blowup the whole-chunk variant had.
+    // generously to avoid early growth.
     let mut output: Vec<u16> = Vec::with_capacity(128 * 1024);
-    let mut block = Block::new();
+    BOOTSTRAP_BLOCK.with(|cell_block| {
+    let mut block = cell_block.borrow_mut();
+    block.reset(None, None);
+    let block = &mut *block;
+    let output = &mut output;
 
     // Tracks trailing CLEAN-byte run length. When it reaches
     // MAX_WINDOW_SIZE AT a block boundary, the next 32 KiB of `output`
@@ -773,7 +786,7 @@ fn bootstrap_with_deflate_block(
         let before_len = output.len();
         while !block.eob() {
             let _ = block
-                .read(&mut bits, &mut output, usize::MAX)
+                .read(&mut bits, &mut *output, usize::MAX)
                 .map_err(|e| {
                     ChunkDecodeError::BootstrapFailed(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -834,11 +847,12 @@ fn bootstrap_with_deflate_block(
     };
 
     Ok(DeflateBootstrap {
-        markers: output,
+        markers: std::mem::take(output),
         end_bit_offset,
         clean_window,
         bfinal_hit,
     })
+    }) // BOOTSTRAP_BLOCK.with closure
 }
 
 /// Compute the absolute bit position within `data` given that `bits`

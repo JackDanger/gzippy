@@ -15,9 +15,16 @@
 //! consumer's stream-level `total_crc.append(...)` takes.
 
 use crate::decompress::parallel::chunk_data::{ChunkData, MARKER_BASE};
-use crate::decompress::parallel::crc32::CRC32Calculator;
 use crate::decompress::parallel::replace_markers::replace_markers;
 
+/// Resolve markers in place. CRC accounting is the CALLER's
+/// responsibility — the per-chunk perf trace 2026-05-18 showed
+/// `apply_window`'s prior scalar 4 KiB narrow + CRC loop was ~80 ms
+/// (~30% of consumer wall), AND the consumer was about to do an
+/// AVX2 narrow over the same bytes for the output write. Moved the
+/// CRC out so it runs once over the already-narrowed `scratch_resolved`
+/// buffer in the consumer (one fewer narrow pass, SIMD CRC32 via
+/// `crc32fast::hash` over a contiguous slice).
 #[allow(dead_code)]
 pub fn apply_window(chunk: &mut ChunkData, window: &[u8]) {
     if chunk.data_with_markers.is_empty() {
@@ -27,8 +34,6 @@ pub fn apply_window(chunk: &mut ChunkData, window: &[u8]) {
         window.len() == 32768,
         "rapidgzip semantics require a 32 KiB window for applyWindow"
     );
-
-    let t0 = std::time::Instant::now();
 
     // Resolve markers in place. After this call, every value in
     // `data_with_markers` is < 256 (a literal byte).
@@ -40,35 +45,6 @@ pub fn apply_window(chunk: &mut ChunkData, window: &[u8]) {
         chunk.data_with_markers.iter().all(|v| *v < MARKER_BASE),
         "apply_window left unresolved markers in data_with_markers"
     );
-
-    // CRC accounting: data_with_markers' resolved bytes precede `data`
-    // in the output stream. data was CRC'd at append time. Per rapidgzip
-    // (ChunkData.hpp:432: "data with markers ought not cross footer
-    // boundaries"), markers belong entirely to the FIRST stream, so we
-    // prepend the resolved-markers CRC into crc32s[0].
-    //
-    // Literal mirror of the post-applyWindow block in
-    // vendor/rapidgzip/.../ChunkData.hpp:310-325: build a fresh
-    // `CRC32Calculator` over the resolved bytes, then call
-    // `crc32s.front().prepend( crc32 )`. The `prepend` routes through
-    // the ported `combine_crc32` polynomial multiply
-    // (gzip/crc32.hpp:214-258).
-    if chunk.configuration.crc32_enabled && !chunk.crc32s.is_empty() {
-        let mut resolved_crc = CRC32Calculator::new();
-        let mut scratch = [0u8; 4096];
-        let mut i = 0;
-        while i < chunk.data_with_markers.len() {
-            let n = scratch.len().min(chunk.data_with_markers.len() - i);
-            for (k, v) in chunk.data_with_markers[i..i + n].iter().enumerate() {
-                scratch[k] = *v as u8;
-            }
-            resolved_crc.update(&scratch[..n]);
-            i += n;
-        }
-        chunk.crc32s[0].prepend(&resolved_crc);
-    }
-
-    chunk.statistics.apply_window_duration_ns += t0.elapsed().as_nanos() as u64;
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────────
@@ -131,7 +107,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_window_crc_matches_concatenated_bytes() {
+    fn apply_window_resolves_markers_for_concatenated_byte_stream() {
         let mut chunk = ChunkData::new(0, config());
         // Mix of markers (resolved against window) and clean bytes.
         chunk.append_markered(&[0u16, 1, 2, MARKER_BASE, MARKER_BASE + 5]);
@@ -140,31 +116,27 @@ mod tests {
         let window = make_window(|i| (i % 251) as u8);
         apply_window(&mut chunk, &window);
 
-        // Construct the expected ordered byte stream and CRC it directly.
-        let mut expected_bytes = Vec::new();
-        for v in &chunk.data_with_markers {
-            expected_bytes.push(*v as u8);
-        }
-        expected_bytes.extend_from_slice(&chunk.data);
-        let mut expected_crc = crc32fast::Hasher::new();
-        expected_crc.update(&expected_bytes);
-        assert_eq!(chunk.crc32s[0].crc32(), expected_crc.finalize());
+        // After resolution every data_with_markers entry is < 256.
+        assert!(chunk.data_with_markers.iter().all(|v| *v < MARKER_BASE));
+        // Markers map to window bytes 0 and 5.
+        assert_eq!(chunk.data_with_markers[3] as u8, window[0]);
+        assert_eq!(chunk.data_with_markers[4] as u8, window[5]);
+        // (CRC accounting moved to the consumer — verified by the
+        // routing-level round-trip tests in tests/routing.rs and the
+        // full bench's `output size mismatch` / md5 check.)
     }
 
     #[test]
-    fn apply_window_skips_crc_when_disabled() {
-        let cfg = ChunkConfiguration {
-            split_chunk_size: 100,
-            max_decoded_chunk_size: 10_000,
-            crc32_enabled: false,
-        };
-        let mut chunk = ChunkData::new(0, cfg);
+    fn apply_window_does_not_touch_crc() {
+        // Apply_window no longer mutates crc32s — the consumer's
+        // post-narrow CRC pass owns that responsibility.
+        let mut chunk = ChunkData::new(0, config());
         chunk.append_markered(&[0u16, 1, MARKER_BASE]);
+        let crc_before = chunk.crc32s[0].crc32();
         let window = make_window(|_i| 0xAB);
         apply_window(&mut chunk, &window);
-        // CRC stays at identity (never updated).
-        assert_eq!(chunk.crc32s[0].crc32(), 0);
-        // But markers still resolved.
+        assert_eq!(chunk.crc32s[0].crc32(), crc_before);
+        // Markers still resolved.
         assert_eq!(chunk.data_with_markers[2] as u8, 0xAB);
     }
 }

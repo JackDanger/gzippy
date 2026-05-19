@@ -201,7 +201,13 @@ pub fn drive<W: std::io::Write>(
     ));
 
     // ── m_windowMap (vendor GzipChunkFetcher.hpp:285) ───────────────
-    let window_map = WindowMap::new();
+    // CompressionType::None: vendor defaults to Zlib for the seekable-
+    // reader where windows accumulate (memory pressure matters). For
+    // single-pass single-member decode each window is published and
+    // consumed once; compress/decompress overhead is pure waste.
+    let window_map = WindowMap::with_compression(
+        crate::decompress::parallel::compressed_vector::CompressionType::None,
+    );
     // Chunk 0's input window is empty by definition (start of stream).
     let empty_window: Arc<[u8; 32768]> = Arc::new([0u8; 32768]);
     window_map.insert(0, empty_window);

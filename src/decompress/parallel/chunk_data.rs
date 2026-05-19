@@ -137,6 +137,13 @@ pub struct ChunkData {
     /// window (set via IsalInflateWrapper::set_window) so no markers
     /// were emitted. CRC32'd at append time.
     pub data: Vec<u8>,
+    /// True if `apply_window` has already been run on this chunk —
+    /// either on the worker thread before send (when the predecessor's
+    /// window was published in time) or by an earlier consumer pass.
+    /// Consumer skips its own `apply_window` call when set, saving
+    /// the redundant scan of `data_with_markers`. Mirror of vendor's
+    /// `m_markersResolved` flag pattern at ChunkData.hpp.
+    pub markers_resolved: bool,
     /// Real deflate block boundaries the decoder crossed during decode.
     /// Indexed into the combined `(data_with_markers ++ data)` stream.
     /// Per rapidgzip's pattern, an entry is appended whenever the
@@ -183,6 +190,29 @@ impl ChunkData {
     /// zero size, mirroring rapidgzip's `startNewSubchunk` pattern
     /// (GzipChunk.hpp:47-58 init).
     pub fn new(encoded_offset_bits: usize, configuration: ChunkConfiguration) -> Self {
+        let cap = configuration.max_decoded_chunk_size;
+        Self::new_with_buffers(
+            encoded_offset_bits,
+            configuration,
+            Vec::with_capacity(cap),
+            Vec::with_capacity(cap),
+        )
+    }
+
+    /// Like [`Self::new`] but consumes caller-provided Vecs. Workers
+    /// pool these across chunks via the parallel-drive recycle path —
+    /// reuses capacity AND already-committed pages so the per-chunk
+    /// page-zero cost drops to one-time-per-worker rather than one-time-
+    /// per-chunk. Caller must pass Vecs with `len() == 0` (the
+    /// caller-side recycler does this by calling `.clear()`).
+    pub fn new_with_buffers(
+        encoded_offset_bits: usize,
+        configuration: ChunkConfiguration,
+        data_with_markers: Vec<u16>,
+        data: Vec<u8>,
+    ) -> Self {
+        debug_assert!(data_with_markers.is_empty());
+        debug_assert!(data.is_empty());
         let first_subchunk = Subchunk {
             encoded_offset_bits,
             encoded_size_bits: 0,
@@ -194,8 +224,9 @@ impl ChunkData {
             encoded_offset_bits,
             max_encoded_offset_bits: encoded_offset_bits,
             encoded_size_bits: 0,
-            data_with_markers: Vec::new(),
-            data: Vec::new(),
+            data_with_markers,
+            data,
+            markers_resolved: false,
             subchunks: vec![first_subchunk],
             // Mirror of ChunkData.hpp:561 default-init:
             // `std::vector<CRC32Calculator>( 1 )`.
@@ -302,6 +333,45 @@ impl ChunkData {
         self.data.extend_from_slice(bytes);
         if let Some(last) = self.subchunks.last_mut() {
             last.decoded_size += bytes.len();
+        }
+    }
+
+    /// In-place sibling of `append_clean` for callers that wrote bytes
+    /// DIRECTLY into `self.data` (e.g. ISA-L's `next_out` pointed at
+    /// `data.as_mut_ptr().add(prev_len)` and produced `written` bytes
+    /// there). Saves the `extend_from_slice` memcpy that
+    /// `decode_chunk_with_window`'s tight loop was paying on every
+    /// `isal_inflate` call — accounted for ~10% of decode wall time
+    /// per `docs/runs/run-20260518-085124-perf/`.
+    ///
+    /// The caller is responsible for:
+    /// - Reserving capacity in `self.data` BEFORE writing.
+    /// - Calling `self.data.set_len(prev_len + written)` after writing
+    ///   so subsequent CRC reads see the bytes (this method does it for
+    ///   you if `extend_len` is true).
+    ///
+    /// Safety contract: bytes in `self.data[prev_len..prev_len+written]`
+    /// must be fully initialized at the moment of this call.
+    pub fn note_clean_bytes_written_in_place(
+        &mut self,
+        prev_len: usize,
+        written: usize,
+        extend_len: bool,
+    ) {
+        if written == 0 {
+            return;
+        }
+        if extend_len {
+            unsafe { self.data.set_len(prev_len + written) };
+        }
+        if self.configuration.crc32_enabled {
+            if let Some(last_crc) = self.crc32s.last_mut() {
+                last_crc.update(&self.data[prev_len..prev_len + written]);
+            }
+        }
+        self.statistics.non_marker_count += written as u64;
+        if let Some(last) = self.subchunks.last_mut() {
+            last.decoded_size += written;
         }
     }
 
@@ -538,32 +608,57 @@ impl ChunkData {
         if split_at >= self.data_with_markers.len() {
             return;
         }
-        let clean_tail: Vec<u8> = self.data_with_markers[split_at..]
-            .iter()
-            .map(|&v| v as u8)
-            .collect();
-        // CRC the migrated bytes now (they were NOT CRC'd at append_markered
-        // time). Result must reflect the in-order output, which is
-        // [data_with_markers_remaining | clean_tail | original_data]
-        // after this method. crc32s[0] currently covers original_data.
-        // New crc32s[0] should cover (clean_tail | original_data).
-        //
-        // Mirror of vendor's `crc32s.front().prepend( crc32 )` after
+        let prefix_len = self.data_with_markers.len() - split_at;
+        let existing_len = self.data.len();
+        let new_len = existing_len + prefix_len;
+
+        // Reuse self.data's pre-faulted allocation (worker scratch
+        // from parallel_drive::drive_two_pass; cap ==
+        // max_decoded_chunk_size). `reserve` is a no-op when cap
+        // already covers — the typical case. Avoids the page-fault
+        // churn the prior implementation caused on its fresh
+        // `Vec<u8>` allocation (perf flamegraph 2026-05-18: this
+        // function drove ~8% of total CPU via `clear_page_erms`).
+        self.data.reserve(prefix_len);
+        // SAFETY: the bytes in [0, new_len) are fully initialized
+        // before any read by (a) `copy_within` reading from the
+        // old self.data range [0, existing_len) which contains
+        // ISA-L-written bytes, and (b) the narrowing loop writing
+        // u8s into [0, prefix_len). No code reads uninit.
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            self.data.set_len(new_len);
+        }
+        // Shift the ISA-L bulk right by prefix_len so the front
+        // prefix_len slots are free for the narrowed clean tail.
+        // `copy_within` is a single memmove — well-vectorized in
+        // libc on x86_64.
+        if existing_len > 0 {
+            self.data.copy_within(0..existing_len, prefix_len);
+        }
+        // Narrow u16 -> u8 directly into the front of self.data.
+        // All values in [split_at..] are < 256 by the rposition
+        // search above (last >= MARKER_BASE element ends at split_at).
+        for (i, &v) in self.data_with_markers[split_at..].iter().enumerate() {
+            self.data[i] = v as u8;
+        }
+
+        // CRC the migrated bytes (they were NOT CRC'd at
+        // append_markered time). Result must reflect the in-order
+        // output. crc32s[0] currently covers original_data; after
+        // this it covers (clean_tail | original_data). Mirror of
+        // vendor's `crc32s.front().prepend( crc32 )` after
         // `cleanUnmarkedData` in `ChunkData::finalize`
-        // (vendor/rapidgzip/.../ChunkData.hpp:426-435): build a fresh
-        // CRC32Calculator over the cleaned bytes and `prepend` it onto
-        // the existing front calculator — so the front now covers
-        // (clean_tail ++ original_data). Goes through the ported
-        // `combine_crc32` polynomial multiply.
+        // (vendor/rapidgzip/.../ChunkData.hpp:426-435). Source slice
+        // is the just-narrowed bytes already at self.data[..prefix_len]
+        // — no second narrow pass, no scratch Vec.
         if self.configuration.crc32_enabled && !self.crc32s.is_empty() {
             let mut migrated_crc = CRC32Calculator::new();
-            migrated_crc.update(&clean_tail);
+            migrated_crc.update(&self.data[..prefix_len]);
             self.crc32s[0].prepend(&migrated_crc);
         }
+
         self.data_with_markers.truncate(split_at);
-        let mut new_data = clean_tail;
-        new_data.append(&mut self.data);
-        self.data = new_data;
     }
 
     /// Resolve the trailing 32 KiB of this chunk's decoded output —

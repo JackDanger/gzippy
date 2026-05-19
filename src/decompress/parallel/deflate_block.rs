@@ -110,6 +110,39 @@ impl From<BlockError> for io::Error {
 /// per-block 19 KiB ISA-L table allocation dominates the critical path
 /// on small dynamic blocks. See `HuffmanCodingISAL.hpp:21-26` for the
 /// reference table layout.
+/// Ring buffer size in u16 elements. Mirror of vendor's
+/// `PreDecodedBuffer = std::array<uint16_t, 2 * MAX_WINDOW_SIZE>`
+/// (vendor/.../gzip/deflate.hpp:805). 2× the window so back-refs
+/// can always reach `MAX_WINDOW_SIZE` bytes back without wraparound
+/// concerns within a single read() call.
+pub const RING_SIZE: usize = 2 * MAX_WINDOW_SIZE;
+
+/// Initialize the ring's marker zone — the upper half (slots
+/// `MAX_WINDOW_SIZE..RING_SIZE`) holds pre-computed marker values
+/// `MAX_WINDOW_SIZE..RING_SIZE`. Mirror of vendor's
+/// `initializeMarkedWindowBuffer` at deflate.hpp:875-888.
+///
+/// When a cross-chunk back-ref at chunk position `p` with
+/// distance `d > p+i` fires, it reads from
+/// `ring[(p + i - d + RING_SIZE) % RING_SIZE]` which lands in the
+/// marker zone (slot `RING_SIZE - (d - p - i)`). The pre-initialized
+/// value at that slot equals the slot index, which by construction
+/// IS the correct marker value:
+///   marker_value = MARKER_BASE + (MAX_WINDOW_SIZE + p + i - d)
+///                = 32768 + (32768 + p + i - d)
+///                = 65536 + p + i - d
+///                = ring slot index
+/// So `emit_backref_ring`'s single `memcpy` produces correct
+/// markers for the cross-chunk portion AND correct decoded bytes
+/// for the in-chunk portion of a single back-ref — no explicit
+/// `marker_count` loop required.
+#[inline]
+fn init_marker_zone(ring: &mut [u16; RING_SIZE]) {
+    for i in 0..MAX_WINDOW_SIZE {
+        ring[MAX_WINDOW_SIZE + i] = (MAX_WINDOW_SIZE + i) as u16;
+    }
+}
+
 pub struct Block {
     at_end_of_block: bool,
     at_end_of_file: bool,
@@ -125,6 +158,56 @@ pub struct Block {
     decoded_bytes: usize,
     /// `m_decodedBytes` snapshot at the start of the current block.
     decoded_bytes_at_block_start: usize,
+    /// Fixed-size ring buffer for decoder output, mirror of vendor's
+    /// `alignas(64) PreDecodedBuffer m_window16`
+    /// (vendor/.../gzip/deflate.hpp:805,926). All hot-path writes
+    /// (literals, markers, back-ref copies) land here first; bytes
+    /// are drained to the caller's `Vec<u16>` at the end of each
+    /// `Block::read()` call.
+    ///
+    /// Box-allocated to keep stack pressure low (vendor comment at
+    /// deflate.hpp:802: "128 KiB is quite a lot of stack pressure.
+    /// It actually leads to stack overflows on MacOS when creating
+    /// multiple Block objects in the function call hierarchy").
+    output_ring: Box<[u16; RING_SIZE]>,
+    /// Logical write position into `output_ring`. Indexed via
+    /// `% RING_SIZE` for physical slot access. Never wraps in
+    /// realistic chunk sizes (usize is plenty).
+    /// Mirror of vendor's `m_windowPosition` (deflate.hpp:933).
+    ring_pos: usize,
+    /// Logical position up to which `output_ring`'s bytes have been
+    /// drained to the caller-supplied output `Vec<u16>`. After
+    /// `drain_to`, equals `ring_pos`. Tracks the "slot reuse safety"
+    /// invariant: positions in `[ring_drained .. ring_pos)` must not
+    /// be overwritten before being drained.
+    ring_drained: usize,
+    /// Counter tracking how many CLEAN bytes have been written since
+    /// the last marker emission. Mirror of vendor's
+    /// `m_distanceToLastMarkerByte` (deflate.hpp:933).
+    ///
+    /// Incremented per literal write (when `contains_marker_bytes`).
+    /// After a back-ref, recomputed via a backward scan through the
+    /// just-written `length` bytes — if a marker is found at offset
+    /// `k` from the end, counter = k; otherwise counter += length
+    /// (vendor's pattern at deflate.hpp:1379-1389).
+    ///
+    /// Used to trigger the mid-decode mode switch: once the counter
+    /// reaches `MAX_WINDOW_SIZE` AND equals `decoded_bytes`
+    /// (or reaches full `RING_SIZE`), `contains_marker_bytes` flips
+    /// to `false` and the marker-maintenance overhead disappears for
+    /// the remainder of the chunk (vendor at deflate.hpp:1282-1289).
+    distance_to_last_marker_byte: usize,
+    /// True while back-refs may produce markers (the chunk has
+    /// either not yet accumulated 32 KiB of clean output, or has
+    /// not yet exhausted the marker zone). Mirror of vendor's
+    /// `m_containsMarkerBytes` (deflate.hpp:936).
+    ///
+    /// Flipped to `false` by the mid-decode mode switch in
+    /// `Block::read` after each `read_internal_*` call. After the
+    /// switch, literal writes skip the counter increment and
+    /// `emit_backref_ring` skips the backward scan — pure ALU + store
+    /// in the hot loop, matching vendor's clean-decode path.
+    contains_marker_bytes: bool,
     /// Code lengths for the precode alphabet (P), populated by
     /// `read_dynamic_huffman_coding`.
     pub precode_cl: [u8; MAX_PRECODE_COUNT],
@@ -176,6 +259,16 @@ impl Default for Block {
 
 impl Block {
     pub fn new() -> Self {
+        // Allocate the ring on the heap directly. The marker zone
+        // (upper half) is initialized to the per-vendor marker
+        // pattern so cross-chunk back-refs produce correct markers
+        // via plain memcpy (no explicit marker_count loop needed in
+        // `emit_backref_ring`).
+        let mut ring: Box<[u16; RING_SIZE]> = vec![0u16; RING_SIZE]
+            .into_boxed_slice()
+            .try_into()
+            .expect("RING_SIZE fits Box<[u16; RING_SIZE]>");
+        init_marker_zone(&mut ring);
         Self {
             at_end_of_block: false,
             at_end_of_file: false,
@@ -191,6 +284,11 @@ impl Block {
             distance_code_count: 0,
             backreferences: Vec::new(),
             track_backreferences: false,
+            output_ring: ring,
+            ring_pos: 0,
+            ring_drained: 0,
+            distance_to_last_marker_byte: 0,
+            contains_marker_bytes: true,
             #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
             isal_litlen: crate::decompress::parallel::isal_huffman::IsalLitLenCode::new_empty(),
             #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
@@ -231,6 +329,14 @@ impl Block {
     pub fn track_backreferences(&self) -> bool {
         self.track_backreferences
     }
+    /// True while back-refs may produce markers (pre mid-decode
+    /// switch). Flipped to false by `pub fn read` once the chunk has
+    /// accumulated 32 KiB of consecutive clean output AND the chunk
+    /// hasn't emitted any markers yet, OR the entire ring is clean.
+    /// Mirror of vendor's `m_containsMarkerBytes` accessor.
+    pub fn contains_marker_bytes(&self) -> bool {
+        self.contains_marker_bytes
+    }
 
     /// Reset to a fresh state (rapidgzip's `Block::reset`, deflate.hpp:670-697).
     /// Mirrors the C++ method's semantics: zeros out the state-machine
@@ -256,6 +362,19 @@ impl Block {
         self.literal_code_count = 0;
         self.distance_code_count = 0;
         self.backreferences.clear();
+        // Reset ring tracking and re-prime the marker zone. The
+        // chunk we just finished may have overwritten the marker
+        // zone (any decode crossing logical position 32768
+        // wraps writes into ring[32768..65536]); a fresh chunk
+        // needs the pre-init pattern restored so cross-chunk
+        // back-refs in the new chunk's prefix produce correct
+        // markers. Cost: 64 KiB write per chunk-recycle, well
+        // amortized vs. allocating a fresh Block per chunk.
+        self.ring_pos = 0;
+        self.ring_drained = 0;
+        self.distance_to_last_marker_byte = 0;
+        self.contains_marker_bytes = true;
+        init_marker_zone(&mut self.output_ring);
 
         // rapidgzip's `reset` ends with: `if (initialWindow) setInitialWindow(*initialWindow);`
         // (deflate.hpp:692-696). We mirror that contract — when both an
@@ -273,6 +392,11 @@ impl Block {
                 window,
                 &mut self.decoded_bytes,
                 &mut self.decoded_bytes_at_block_start,
+                &mut self.output_ring,
+                &mut self.ring_pos,
+                &mut self.ring_drained,
+                &mut self.distance_to_last_marker_byte,
+                &mut self.contains_marker_bytes,
             );
         }
     }
@@ -285,21 +409,21 @@ impl Block {
     /// (chunkdecoding/GzipChunk.hpp:190-268, `decodeChunkWithInflateWrapper`
     /// — the analog of our `decode_chunk_with_window`).
     ///
-    /// **Storage model difference vs. C++.** rapidgzip's `Block` owns its
-    /// own 64 KiB internal window (`m_window` / `m_window16`); calling
-    /// `setInitialWindow` writes into that buffer and flips the
-    /// `m_containsMarkerBytes` flag to false. gzippy's `Block` is
-    /// stateless wrt the window — back-references resolve via lookback into
-    /// the caller-owned `output: Vec<u16>` (see `emit_backref`,
-    /// deflate_block.rs:816-849). The equivalent translation is to
-    /// PREPEND the window bytes into `output` and advance the
-    /// `decoded_bytes_at_block_start` counter so `emit_backref`'s
-    /// marker-vs-lookback split sees a 32 KiB pre-existing prefix.
-    /// Mathematically equivalent: when `out_pos >= 32768` and
-    /// `distance <= 32768`, `marker_count = distance.saturating_sub(out_pos) = 0`
-    /// — every back-reference resolves to a literal source byte at
-    /// `output[output.len() - distance]`, identical to what rapidgzip's
-    /// `getWindow()`-backed back-reference path produces.
+    /// **Storage model.** Mirrors rapidgzip's: `Block` owns a 64 KiB
+    /// internal ring (`output_ring`, the analog of vendor's
+    /// `m_window16`); `setInitialWindow` writes the predecessor bytes
+    /// into the ring's first slots and advances `ring_pos` /
+    /// `ring_drained` / `decoded_bytes` so that subsequent back-refs
+    /// resolve from the ring (via `emit_backref_ring`) rather than
+    /// emitting markers. The caller's `output: Vec<u16>` receives
+    /// ONLY decoded bytes from subsequent `read()` calls — the seed
+    /// itself is not drained.
+    ///
+    /// When `out_pos >= 32768` and `distance <= 32768`,
+    /// `marker_count = distance.saturating_sub(out_pos) = 0` —
+    /// every back-reference resolves to a literal source byte in
+    /// the ring at `ring_pos - distance`, identical to what
+    /// rapidgzip's `getWindow()`-backed back-reference path produces.
     ///
     /// # Errors
     /// Returns `BlockError::ExceededWindowRange` if `initial_window.len() > MAX_WINDOW_SIZE`
@@ -320,6 +444,11 @@ impl Block {
             initial_window,
             &mut self.decoded_bytes,
             &mut self.decoded_bytes_at_block_start,
+            &mut self.output_ring,
+            &mut self.ring_pos,
+            &mut self.ring_drained,
+            &mut self.distance_to_last_marker_byte,
+            &mut self.contains_marker_bytes,
         )
     }
 
@@ -327,11 +456,18 @@ impl Block {
     /// can re-use it without taking `&mut self` twice (the public method
     /// takes `&mut self` whereas `reset` holds fields-by-ref via
     /// destructuring inside `reset`).
+    #[allow(clippy::too_many_arguments)] // splits self-borrow for reset() reuse
+    #[allow(clippy::ptr_arg)] // public API takes &mut Vec for symmetry with read()
     fn set_initial_window_impl(
         output: &mut Vec<u16>,
         initial_window: &[u8],
         decoded_bytes: &mut usize,
         decoded_bytes_at_block_start: &mut usize,
+        output_ring: &mut [u16; RING_SIZE],
+        ring_pos: &mut usize,
+        ring_drained: &mut usize,
+        distance_to_last_marker_byte: &mut usize,
+        contains_marker_bytes: &mut bool,
     ) -> Result<(), BlockError> {
         // Rapidgzip's deflate.hpp:1751 guards on the `m_decodedBytes == 0 &&
         // m_windowPosition == 0` invariant — the API is only valid before
@@ -342,28 +478,78 @@ impl Block {
         if initial_window.len() > MAX_WINDOW_SIZE {
             return Err(BlockError::ExceededWindowRange);
         }
-        // Empty window: rapidgzip leaves the block in marker-emitting mode
-        // (m_containsMarkerBytes stays true). We mirror this — no output
-        // mutation, no counter advance.
+        // Empty window: rapidgzip leaves the block in marker-emitting
+        // mode (m_containsMarkerBytes stays true). We mirror this — no
+        // ring/output mutation, no counter advance. Back-refs from the
+        // first block will emit explicit MARKER values via emit_backref.
         if initial_window.is_empty() {
             return Ok(());
         }
-        // Prepend the window bytes as u16 literals. Each value is < 256
-        // and so is automatically distinguishable from a MARKER_BASE
-        // marker in `emit_backref`'s `marker_count` arithmetic. Mirrors
-        // the `std::memcpy(window.data(), initialWindow.data(), ...)` at
-        // deflate.hpp:1753.
-        output.reserve(initial_window.len());
-        for &b in initial_window {
-            output.push(b as u16);
+        // Seed the RING with the initial window. Subsequent back-refs
+        // resolve via the ring (emit_backref_ring), so the window must
+        // land there — not in the caller's output Vec. Mirror of
+        // vendor's `std::memcpy(window.data(), initialWindow.data(), ...)`
+        // at deflate.hpp:1753 (window = m_window16 in the marker case,
+        // m_window in the clean case; we have a single ring buffer
+        // serving both since our markers are explicit values rather
+        // than ring-initialization bits).
+        //
+        // After this, ring_pos = initial_window.len() (so subsequent
+        // writes append AFTER the seed) and ring_drained = ring_pos (the
+        // seed itself is NOT drained to output — back-refs into it
+        // resolve to clean bytes which the consumer emits as part of the
+        // chunk's first block's decode).
+        for (i, &b) in initial_window.iter().enumerate() {
+            output_ring[i] = b as u16;
         }
+        *ring_pos = initial_window.len();
+        *ring_drained = initial_window.len();
         // Mirror m_windowPosition = m_decodedBytes = initialWindow.size()
-        // (deflate.hpp:1754-1755). In gzippy these collapse into the
-        // single `decoded_bytes` counter because back-references look up
-        // in `output` (a linear buffer) rather than a ring window.
+        // (deflate.hpp:1754-1755).
         *decoded_bytes = initial_window.len();
         *decoded_bytes_at_block_start = initial_window.len();
+        // Seeded window means we have predecessor bytes — no markers
+        // ever need to be emitted (every back-ref with distance ≤
+        // window.len() resolves to a literal source byte). Flip the
+        // flag now so the entire chunk runs marker-free, saving the
+        // per-literal counter update and per-back-ref backward scan.
+        // Mirror of vendor's `m_containsMarkerBytes = false` at
+        // deflate.hpp:1759 after a pre-decode setInitialWindow.
+        *contains_marker_bytes = false;
+        *distance_to_last_marker_byte = initial_window.len();
         Ok(())
+    }
+
+    /// Drain newly-written ring slots `[ring_drained .. ring_pos)` to
+    /// the caller's output Vec via `extend_from_slice`. Handles the
+    /// wrap-around case where the live region straddles the ring's
+    /// physical end. Idempotent: a no-op when nothing new has been
+    /// written since the last drain.
+    ///
+    /// Must be called before the gap `ring_pos - ring_drained` exceeds
+    /// `RING_SIZE - MAX_WINDOW_SIZE` (otherwise the oldest undrained
+    /// data gets overwritten by new writes; the lookback contract
+    /// guarantees no read past `MAX_WINDOW_SIZE` bytes ago, so the
+    /// preserved-history requirement is `MAX_WINDOW_SIZE` slots
+    /// behind `ring_pos`).
+    fn drain_to_output(&mut self, output: &mut Vec<u16>) {
+        let new_bytes = self.ring_pos - self.ring_drained;
+        if new_bytes == 0 {
+            return;
+        }
+        let start_idx = self.ring_drained % RING_SIZE;
+        let end_idx_excl = (self.ring_drained + new_bytes) % RING_SIZE;
+        if start_idx + new_bytes <= RING_SIZE {
+            // Contiguous slice — covers both the non-wrap case and
+            // the exactly-fills-to-end case (end_idx_excl == 0).
+            output.extend_from_slice(&self.output_ring[start_idx..start_idx + new_bytes]);
+        } else {
+            // Wraps: first part `[start_idx..RING_SIZE)`, second part
+            // `[0..end_idx_excl)`.
+            output.extend_from_slice(&self.output_ring[start_idx..]);
+            output.extend_from_slice(&self.output_ring[..end_idx_excl]);
+        }
+        self.ring_drained = self.ring_pos;
     }
 
     // ── Header parser (deflate.hpp:964-1156) ────────────────────────────────
@@ -509,15 +695,42 @@ impl Block {
         if self.eob() {
             return Ok(0);
         }
-        match self.compression_type {
+        let result = match self.compression_type {
             CompressionType::Reserved => Err(BlockError::InvalidCompression),
-            CompressionType::Uncompressed => {
-                self.read_internal_uncompressed(bits, output, n_max_to_decode)
-            }
+            CompressionType::Uncompressed => self.read_internal_uncompressed(bits, n_max_to_decode),
             CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {
-                self.read_internal_compressed(bits, output, n_max_to_decode)
+                self.read_internal_compressed(bits, n_max_to_decode)
             }
+        };
+        // Mid-decode mode switch — mirror of vendor's check at
+        // deflate.hpp:1282-1289. Once the decoded prefix is fully
+        // clean (no markers anywhere reachable via back-ref), flip
+        // `contains_marker_bytes` to false. Subsequent literals and
+        // back-refs skip the marker-counter maintenance, matching
+        // vendor's clean-decode performance path.
+        //
+        // Two trigger conditions:
+        //   1. Counter reaches `RING_SIZE` — the entire ring has
+        //      been overwritten by clean bytes since the last
+        //      marker, including the original pre-init marker zone.
+        //   2. Counter reaches `MAX_WINDOW_SIZE` AND equals
+        //      `decoded_bytes` — the chunk has only emitted clean
+        //      bytes so far, and 32 KiB of those are consecutive.
+        //      The latter is the typical bootstrap-from-empty case
+        //      (chunk has no marker emissions at all).
+        if self.contains_marker_bytes
+            && (self.distance_to_last_marker_byte >= RING_SIZE
+                || (self.distance_to_last_marker_byte >= MAX_WINDOW_SIZE
+                    && self.distance_to_last_marker_byte == self.decoded_bytes))
+        {
+            self.contains_marker_bytes = false;
         }
+        // Always drain — even on Err, any bytes already written should
+        // be visible to the caller for inspection. The ring's
+        // `ring_drained` watermark advances accordingly so subsequent
+        // calls don't re-emit the same data.
+        self.drain_to_output(output);
+        result
     }
 
     /// Literal port of `Block::readInternalUncompressed` semantics
@@ -529,22 +742,57 @@ impl Block {
     pub fn read_internal_uncompressed(
         &mut self,
         bits: &mut Bits,
-        output: &mut Vec<u16>,
         n_max_to_decode: usize,
     ) -> Result<usize, BlockError> {
+        // Stored blocks have no back-refs and no markers — every output
+        // is a pure literal byte. We still write to the ring so the
+        // public `read()` wrapper's drain emits these bytes in order
+        // alongside compressed-block output.
+        //
+        // Uncompressed blocks are bounded at 65535 bytes (deflate
+        // spec §3.2.4) which is one slot less than RING_SIZE; with at
+        // most one drain at the end, no mid-call overflow check is
+        // needed even at n_max_to_decode = usize::MAX.
         let to_read = self.uncompressed_size.min(n_max_to_decode);
+        let ring_ptr = self.output_ring.as_mut_ptr();
+        let mut pos = self.ring_pos;
+        let mut read_count: usize = 0;
+        // Pre-bind to keep error-path state-flush symmetric with the
+        // compressed paths' commit! pattern (writes that survived
+        // the per-iter ensure_bits get committed).
         for _ in 0..to_read {
-            ensure_bits(bits, 8)?;
+            if let Err(e) = ensure_bits(bits, 8) {
+                self.ring_pos = pos;
+                self.uncompressed_size -= read_count;
+                self.decoded_bytes += read_count;
+                if self.contains_marker_bytes {
+                    self.distance_to_last_marker_byte += read_count;
+                }
+                return Err(e);
+            }
             let byte = (bits.peek() & 0xFF) as u16;
             bits.consume(8);
-            output.push(byte);
+            // SAFETY: pos % RING_SIZE in 0..RING_SIZE, ring_ptr valid.
+            unsafe {
+                ring_ptr.add(pos % RING_SIZE).write(byte);
+            }
+            pos += 1;
+            read_count += 1;
         }
-        self.uncompressed_size -= to_read;
-        self.decoded_bytes += to_read;
+        self.ring_pos = pos;
+        self.uncompressed_size -= read_count;
+        self.decoded_bytes += read_count;
+        // Stored blocks emit only literals — always increment the
+        // marker-counter when we're still in marker mode. Mirror of
+        // vendor's appendToWindow loop at deflate.hpp:1311-1322 for
+        // the byte-write path.
+        if self.contains_marker_bytes {
+            self.distance_to_last_marker_byte += read_count;
+        }
         if self.uncompressed_size == 0 {
             self.at_end_of_block = true;
         }
-        Ok(to_read)
+        Ok(read_count)
     }
 
     /// Literal port of `Block::readInternalCompressed`
@@ -570,11 +818,29 @@ impl Block {
     /// Other platforms fall back to the canonical-Huffman implementation
     /// (only used by unit tests on those archs; the parallel-SM
     /// production path is x86_64+isal-only).
+    /// Public entry — runtime-dispatches to the const-generic
+    /// specialization based on `contains_marker_bytes`. Both
+    /// specializations exist at compile time; the optimizer
+    /// dead-strips marker-maintenance code in the `false` variant.
+    /// Mirror of vendor's `if constexpr (containsMarkerBytes)`
+    /// pattern at deflate.hpp:1311, 1379, 1652.
     #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
     pub fn read_internal_compressed(
         &mut self,
         bits: &mut Bits,
-        output: &mut Vec<u16>,
+        n_max_to_decode: usize,
+    ) -> Result<usize, BlockError> {
+        if self.contains_marker_bytes {
+            self.read_internal_compressed_specialized::<true>(bits, n_max_to_decode)
+        } else {
+            self.read_internal_compressed_specialized::<false>(bits, n_max_to_decode)
+        }
+    }
+
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn read_internal_compressed_specialized<const CONTAINS_MARKERS: bool>(
+        &mut self,
+        bits: &mut Bits,
         n_max_to_decode: usize,
     ) -> Result<usize, BlockError> {
         // FIXED Huffman blocks don't take the ISA-L path. Vendor uses
@@ -594,7 +860,10 @@ impl Block {
         // Dispatch fixed blocks to the canonical fallback path which
         // handles the full 288-symbol table correctly.
         if self.compression_type == CompressionType::FixedHuffman {
-            return self.read_internal_compressed_canonical(bits, output, n_max_to_decode);
+            return self.read_internal_compressed_canonical_specialized::<CONTAINS_MARKERS>(
+                bits,
+                n_max_to_decode,
+            );
         }
 
         // Build the lit/len + distance code-length slices in scratch
@@ -659,12 +928,56 @@ impl Block {
         //    deflate.hpp:1615.
         const INVALID_SYMBOL: u32 = 0x1FFF;
         const MAX_LIT_LEN_SYM: u32 = 512;
-        let start_len = output.len();
+        const MAX_RUN_LENGTH: usize = 258;
+
+        // Cap n_max_to_decode to ring capacity minus one max back-ref
+        // length so a single call cannot overflow the ring. Mirror of
+        // vendor's `nMaxToDecode = std::min(nMaxToDecode, window.size()
+        // - MAX_RUN_LENGTH)` at gzip/deflate.hpp:1602. Without this,
+        // chunks with high-marker-density blocks (typical for highly
+        // compressible inputs in silesia at gzip -9) produce > 64 KiB
+        // per call; writes wrap, overwrite undrained data, drain
+        // double-counts in the wrap branch, and the decoded output
+        // ends up both wrong-bytes and short of the gzip-trailer
+        // ISIZE. Bootstrap's caller already loops on eob(), so the
+        // returned `< n_max_to_decode` triggers another read() call.
+        let n_max_to_decode = n_max_to_decode.min(RING_SIZE - MAX_RUN_LENGTH);
+
+        // All hot-path writes land in the ring buffer (vendor's
+        // `m_window16` equivalent). `pos` is the LOGICAL write
+        // position (never wraps); physical slot is `pos % RING_SIZE`.
+        //
+        // SAFETY: `ring_ptr` is derived from `&mut self.output_ring`
+        // (a fixed `[u16; RING_SIZE]` heap allocation); valid for all
+        // physical indices in [0, RING_SIZE). Every write below
+        // indexes via `pos % RING_SIZE`. There is no aliasing of this
+        // pointer elsewhere in this function.
+        let ring_ptr = self.output_ring.as_mut_ptr();
+        let mut pos = self.ring_pos;
         let mut emitted: usize = 0;
+        // Local copy of the marker counter — pulled into a register
+        // for the hot loop. Written back to self on commit. With
+        // `CONTAINS_MARKERS = false`, the increments and the
+        // backward-scan branch are entirely dead code (compiler
+        // const-folds the `if CONTAINS_MARKERS` checks). This is
+        // the perf-meaningful effect of the const generic split:
+        // marker-mode-only paperwork stops being paid at all on
+        // chunks that have already switched to clean mode.
+        let mut distance_marker = self.distance_to_last_marker_byte;
+
+        macro_rules! commit {
+            ($result:expr) => {{
+                self.ring_pos = pos;
+                self.decoded_bytes += emitted;
+                self.distance_to_last_marker_byte = distance_marker;
+                return $result;
+            }};
+        }
+
         while emitted < n_max_to_decode {
             let decoded = self.isal_litlen.decode(bits);
             if decoded.bit_count == 0 || decoded.symbol == INVALID_SYMBOL {
-                return Err(BlockError::InvalidHuffmanCode);
+                commit!(Err(BlockError::InvalidHuffmanCode));
             }
             // Consume the LUT-reported bit count (covers Huffman code +
             // any baked-in length-extra bits). Vendor's `seekAfterPeek`
@@ -674,26 +987,25 @@ impl Block {
             let mut sym_count = decoded.sym_count;
 
             // Multi-symbol unpack loop — vendor deflate.hpp:1612-1661.
-            // sym_count ∈ {1, 2, 3}; we extract each via `sym >>= 8`
-            // and emit until either we run out or hit a non-literal
-            // last symbol (EOB or length code).
-            //
-            // Bit layout of `sym` (vendor igzip_inflate.c:455-525):
-            //   - Singleton: bits 0..24 = sym1 (0..512).
-            //   - Pair:      bits 0..7 = sym1 (literal byte),
-            //                bits 8..15 = sym2 (literal byte).
-            //   - Triple:    +bits 16..23 = sym3 (literal byte).
-            // When sym_count > 1, the low 16 bits of `sym` contain TWO
-            // packed bytes (current + next). We push only the LOW byte
-            // — vendor's `static_cast<uint8_t>(code)` at deflate.hpp:1620.
             loop {
                 let code = (sym & 0xFFFF) as u16;
                 if code <= 255 || sym_count > 1 {
-                    // Cast to u8 first to strip the next-symbol byte
-                    // when sym_count > 1; for sym_count == 1 with
-                    // code <= 255 the cast is a no-op.
-                    output.push((code & 0xFF) as u16);
+                    // SAFETY: see ring_ptr SAFETY note above.
+                    unsafe {
+                        ring_ptr.add(pos % RING_SIZE).write((code & 0xFF) as u16);
+                    }
+                    pos += 1;
                     emitted += 1;
+                    // Vendor's appendToWindow updates m_distanceToLastMarkerByte
+                    // per literal (deflate.hpp:1311-1322): increment on
+                    // clean bytes (literals always satisfy < 256), reset
+                    // on marker writes. Markers in our path arrive
+                    // exclusively via emit_backref_ring; literal writes
+                    // here always increment. Const-folded out entirely
+                    // when CONTAINS_MARKERS = false.
+                    if CONTAINS_MARKERS {
+                        distance_marker += 1;
+                    }
                     sym_count -= 1;
                     if sym_count == 0 {
                         break;
@@ -705,36 +1017,50 @@ impl Block {
                 // (defensively) an out-of-range symbol.
                 if code == END_OF_BLOCK_SYMBOL {
                     self.at_end_of_block = true;
-                    self.decoded_bytes += emitted;
-                    return Ok(emitted);
+                    commit!(Ok(emitted));
                 }
                 if (code as u32) > MAX_LIT_LEN_SYM {
-                    return Err(BlockError::InvalidHuffmanCode);
+                    commit!(Err(BlockError::InvalidHuffmanCode));
                 }
-                // ISA-L expanded length: symbol = 254 + length (vendor
-                // deflate.hpp:1642). No `read_length_extra` — extra bits
-                // are baked into the LUT entry the prior `decode` call
-                // already consumed.
                 let length = (code as usize).wrapping_sub(254);
                 if length == 0 {
-                    // Defensive: vendor treats length=0 as a no-op
-                    // (deflate.hpp:1643 wraps backref in `if length != 0`).
                     break;
                 }
-                let (dsym, dbit) = self
-                    .isal_dist
-                    .decode(bits)
-                    .ok_or(BlockError::InvalidHuffmanCode)?;
+                let (dsym, dbit) = match self.isal_dist.decode(bits) {
+                    Some(d) => d,
+                    None => commit!(Err(BlockError::InvalidHuffmanCode)),
+                };
                 bits.consume(dbit);
                 if dsym as usize >= DISTANCE_BASE.len() {
-                    return Err(BlockError::InvalidHuffmanCode);
+                    commit!(Err(BlockError::InvalidHuffmanCode));
                 }
-                let distance = read_distance_extra(bits, dsym as usize)?;
+                let distance = match read_distance_extra(bits, dsym as usize) {
+                    Ok(d) => d,
+                    Err(e) => commit!(Err(e)),
+                };
                 if distance == 0 || distance > MAX_WINDOW_SIZE {
-                    return Err(BlockError::ExceededWindowRange);
+                    commit!(Err(BlockError::ExceededWindowRange));
                 }
-                let out_pos = output.len() - start_len + self.decoded_bytes_at_block_start;
-                emit_backref(output, distance, length, out_pos)?;
+                // Clean-mode distance check — mirror of vendor's
+                // `!containsMarkerBytes && distance > m_decodedBytes
+                // + nBytesRead` at deflate.hpp:1652-1655. Whole
+                // branch const-folded away when CONTAINS_MARKERS=true.
+                if !CONTAINS_MARKERS && distance > self.decoded_bytes + emitted {
+                    commit!(Err(BlockError::ExceededWindowRange));
+                }
+                // SAFETY: ring_ptr valid; pos + length writes within
+                // ring capacity (RING_SIZE = 2 * MAX_WINDOW_SIZE);
+                // n_max_to_decode is capped above so pos cannot
+                // overflow the ring's preserved-history window.
+                unsafe {
+                    emit_backref_ring::<CONTAINS_MARKERS>(
+                        ring_ptr,
+                        &mut pos,
+                        distance,
+                        length,
+                        &mut distance_marker,
+                    );
+                }
                 emitted += length;
                 if self.track_backreferences {
                     self.backreferences.push(Backreference {
@@ -745,7 +1071,9 @@ impl Block {
                 break;
             }
         }
+        self.ring_pos = pos;
         self.decoded_bytes += emitted;
+        self.distance_to_last_marker_byte = distance_marker;
         Ok(emitted)
     }
 
@@ -763,10 +1091,23 @@ impl Block {
     /// in-tree `build_canonical_table` / `decode_canonical` helpers and
     /// gives the new ports production correctness coverage on the
     /// non-x86_64 path (tests in this file exercise both branches).
+    /// Public entry — runtime-dispatches to const-generic specialization
+    /// (see ISA-L sibling).
     pub fn read_internal_compressed_canonical(
         &mut self,
         bits: &mut Bits,
-        output: &mut Vec<u16>,
+        n_max_to_decode: usize,
+    ) -> Result<usize, BlockError> {
+        if self.contains_marker_bytes {
+            self.read_internal_compressed_canonical_specialized::<true>(bits, n_max_to_decode)
+        } else {
+            self.read_internal_compressed_canonical_specialized::<false>(bits, n_max_to_decode)
+        }
+    }
+
+    fn read_internal_compressed_canonical_specialized<const CONTAINS_MARKERS: bool>(
+        &mut self,
+        bits: &mut Bits,
         n_max_to_decode: usize,
     ) -> Result<usize, BlockError> {
         use crate::decompress::parallel::huffman_symbols_per_length::HuffmanCodingSymbolsPerLength;
@@ -812,43 +1153,88 @@ impl Block {
             return Err(BlockError::InvalidCodeLengths);
         }
 
-        let start_len = output.len();
+        // Cap n_max_to_decode to ring capacity minus one max back-ref
+        // length — see ISA-L path for full rationale (mirror of vendor
+        // gzip/deflate.hpp:1602).
+        const MAX_RUN_LENGTH: usize = 258;
+        let n_max_to_decode = n_max_to_decode.min(RING_SIZE - MAX_RUN_LENGTH);
+
+        // Ring writes — same model as the ISA-L path. SAFETY as
+        // documented at `read_internal_compressed`.
+        let ring_ptr = self.output_ring.as_mut_ptr();
+        let mut pos = self.ring_pos;
         let mut emitted: usize = 0;
+        let mut distance_marker = self.distance_to_last_marker_byte;
+
+        macro_rules! commit {
+            ($result:expr) => {{
+                self.ring_pos = pos;
+                self.decoded_bytes += emitted;
+                self.distance_to_last_marker_byte = distance_marker;
+                return $result;
+            }};
+        }
+
         while emitted < n_max_to_decode {
-            // Mirror of `m_literalHC.decode( bitReader )` at
-            // vendor/.../gzip/deflate.hpp:1551 — the canonical decode
-            // returns None on a stream-level error (EOF or invalid code).
-            let sym = litlen_hc
-                .decode(bits)
-                .ok_or(BlockError::InvalidHuffmanCode)?;
+            let sym = match litlen_hc.decode(bits) {
+                Some(s) => s,
+                None => commit!(Err(BlockError::InvalidHuffmanCode)),
+            };
 
             if sym < 256 {
-                output.push(sym);
+                // SAFETY: ring_ptr valid; pos % RING_SIZE in bounds.
+                unsafe {
+                    ring_ptr.add(pos % RING_SIZE).write(sym);
+                }
+                pos += 1;
                 emitted += 1;
+                if CONTAINS_MARKERS {
+                    distance_marker += 1;
+                }
                 continue;
             }
             if sym == END_OF_BLOCK_SYMBOL {
                 self.at_end_of_block = true;
-                self.decoded_bytes += emitted;
-                return Ok(emitted);
+                commit!(Ok(emitted));
             }
             if sym > 285 {
-                return Err(BlockError::InvalidHuffmanCode);
+                commit!(Err(BlockError::InvalidHuffmanCode));
             }
             let lidx = (sym - 257) as usize;
-            let length = read_length_extra(bits, lidx)?;
-            // Mirror of `m_distanceHC.decode( bitReader )` at
-            // deflate.hpp:1565.
-            let dsym = dist_hc.decode(bits).ok_or(BlockError::InvalidHuffmanCode)?;
+            let length = match read_length_extra(bits, lidx) {
+                Ok(l) => l,
+                Err(e) => commit!(Err(e)),
+            };
+            let dsym = match dist_hc.decode(bits) {
+                Some(d) => d,
+                None => commit!(Err(BlockError::InvalidHuffmanCode)),
+            };
             if (dsym as usize) >= DISTANCE_BASE.len() {
-                return Err(BlockError::InvalidHuffmanCode);
+                commit!(Err(BlockError::InvalidHuffmanCode));
             }
-            let distance = read_distance_extra(bits, dsym as usize)?;
+            let distance = match read_distance_extra(bits, dsym as usize) {
+                Ok(d) => d,
+                Err(e) => commit!(Err(e)),
+            };
             if distance == 0 || distance > MAX_WINDOW_SIZE {
-                return Err(BlockError::ExceededWindowRange);
+                commit!(Err(BlockError::ExceededWindowRange));
             }
-            let out_pos = output.len() - start_len + self.decoded_bytes_at_block_start;
-            emit_backref(output, distance, length, out_pos)?;
+            // Clean-mode distance check — see ISA-L path for rationale
+            // (mirror of vendor deflate.hpp:1652-1655). Const-folded.
+            if !CONTAINS_MARKERS && distance > self.decoded_bytes + emitted {
+                commit!(Err(BlockError::ExceededWindowRange));
+            }
+            // SAFETY: same as ISA-L path. emit_backref_ring updates
+            // pos in place.
+            unsafe {
+                emit_backref_ring::<CONTAINS_MARKERS>(
+                    ring_ptr,
+                    &mut pos,
+                    distance,
+                    length,
+                    &mut distance_marker,
+                );
+            }
             emitted += length;
             if self.track_backreferences {
                 self.backreferences.push(Backreference {
@@ -857,7 +1243,9 @@ impl Block {
                 });
             }
         }
+        self.ring_pos = pos;
         self.decoded_bytes += emitted;
+        self.distance_to_last_marker_byte = distance_marker;
         Ok(emitted)
     }
 
@@ -869,10 +1257,9 @@ impl Block {
     pub fn read_internal_compressed(
         &mut self,
         bits: &mut Bits,
-        output: &mut Vec<u16>,
         n_max_to_decode: usize,
     ) -> Result<usize, BlockError> {
-        self.read_internal_compressed_canonical(bits, output, n_max_to_decode)
+        self.read_internal_compressed_canonical(bits, n_max_to_decode)
     }
 }
 
@@ -1082,39 +1469,132 @@ fn decode_canonical(
 /// start of this back-ref's emission window. For a fresh Block this
 /// equals `output.len()`; for multi-block per-chunk use the caller
 /// passes the running chunk-relative position.
-fn emit_backref(
-    output: &mut Vec<u16>,
+/// Ring-buffer back-reference emit. Mirror of vendor's
+/// `resolveBackreference` (vendor/.../gzip/deflate.hpp:1349-1410):
+/// non-overlap is a single `memcpy`, RLE (distance=1) is a tight
+/// repeat, general overlap is sequential element copy.
+///
+/// **No explicit marker emission.** The ring's upper half is
+/// pre-initialized to marker values (see `init_marker_zone`), so a
+/// back-ref reading from a slot in `[MAX_WINDOW_SIZE..RING_SIZE)`
+/// retrieves the correct `MARKER_BASE + idx` value automatically.
+/// One `memcpy` handles BOTH the cross-chunk marker portion AND
+/// the in-chunk literal portion of a single back-ref — exactly
+/// vendor's design.
+///
+/// When `CONTAINS_MARKERS` is true, the function additionally scans
+/// the just-written `length` bytes backward to update
+/// `*distance_marker` per vendor's pattern at
+/// deflate.hpp:1379-1389: if a marker is found at offset `k` from
+/// the end, `distance_marker` = k; otherwise `distance_marker += length`.
+/// When `CONTAINS_MARKERS` is false (const generic), the scan is
+/// dead-stripped by the compiler (mirror of vendor's
+/// `if constexpr ( containsMarkerBytes )` at deflate.hpp:1379).
+///
+/// # Safety
+/// Caller must ensure:
+///   * `ring_ptr` is a valid `*mut u16` pointing at a fixed
+///     `[u16; RING_SIZE]` allocation; valid for reads and writes at
+///     every index in `[0, RING_SIZE)`.
+///   * `*pos % RING_SIZE` is a valid physical slot.
+///   * The slot at `(*pos - distance) % RING_SIZE` for `distance <=
+///     MAX_WINDOW_SIZE` still holds the byte (or pre-init marker)
+///     logically written at position `*pos - distance` (i.e. the
+///     lookback range has not been overwritten by wrap — guaranteed
+///     by per-call drain semantics in `Block::read` and the
+///     `n_max_to_decode <= RING_SIZE - MAX_RUN_LENGTH` cap).
+///   * No aliasing other `*mut` derived from the same ring exists.
+///
+/// On return `*pos` is incremented by exactly `length`, and (when
+/// `CONTAINS_MARKERS`) `*distance_marker` reflects the post-copy
+/// distance to the nearest marker in the ring.
+#[inline]
+unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
+    ring_ptr: *mut u16,
+    pos: &mut usize,
     distance: usize,
     length: usize,
-    out_pos: usize,
-) -> Result<(), BlockError> {
-    use crate::decompress::parallel::replace_markers::MARKER_BASE;
-    output.reserve(length);
-    let marker_count = distance.saturating_sub(out_pos).min(length);
-    for i in 0..marker_count {
-        let idx = MAX_WINDOW_SIZE + out_pos + i - distance;
-        output.push(MARKER_BASE + idx as u16);
-    }
-    let local_count = length - marker_count;
-    if local_count == 0 {
-        return Ok(());
-    }
-    let base_dst = output.len();
-    if distance >= local_count {
-        // Source and destination ranges do not overlap.
-        let src_start = base_dst - distance;
-        let snapshot: Vec<u16> = output[src_start..src_start + local_count].to_vec();
-        output.extend_from_slice(&snapshot);
-    } else {
-        // Overlap case (e.g. distance=1 RLE): copy one element at a
-        // time so prior writes feed subsequent reads.
-        for i in 0..local_count {
-            let src = base_dst + i - distance;
-            let v = output[src];
-            output.push(v);
+    distance_marker: &mut usize,
+) {
+    // Physical source / destination slots. Source range may straddle
+    // the ring's physical end in the wrap case; we handle that
+    // explicitly below.
+    let src_phys = (*pos + RING_SIZE - distance) % RING_SIZE;
+    let dst_phys = *pos % RING_SIZE;
+
+    if distance >= length {
+        // Non-overlap path. Single `memcpy`-equivalent. Vendor:
+        // `std::memcpy(&window[m_windowPosition], &window[offset],
+        // length * 2)` at deflate.hpp:1376.
+        let src_fits = src_phys + length <= RING_SIZE;
+        let dst_fits = dst_phys + length <= RING_SIZE;
+        if src_fits && dst_fits {
+            std::ptr::copy_nonoverlapping(
+                ring_ptr.add(src_phys),
+                ring_ptr.add(dst_phys),
+                length,
+            );
+        } else {
+            // Wrap-straddle non-overlap fallback (rare boundary case).
+            for i in 0..length {
+                let v = *ring_ptr.add((src_phys + i) % RING_SIZE);
+                ring_ptr.add((dst_phys + i) % RING_SIZE).write(v);
+            }
         }
+        *pos += length;
+    } else if distance == 1 {
+        // RLE: repeat the last element. Vendor's clean-mode path
+        // (`!containsMarkerBytes && nToCopyPerRepeat == 1`) at
+        // deflate.hpp:1393-1398 uses `std::memset` — a SIMD
+        // broadcast. The marker-mode path falls through to the
+        // general overlap loop. We mirror both:
+        //   * `!CONTAINS_MARKERS && dst fits without wrap` →
+        //     `slice::fill` (Rust's idiomatic memset, lowers to
+        //     `vpbroadcastw` + aligned-store on AVX2).
+        //   * Otherwise (marker mode, OR clean-mode wrap-straddle)
+        //     → element-by-element loop with `% RING_SIZE`.
+        let v = *ring_ptr.add((*pos + RING_SIZE - 1) % RING_SIZE);
+        if !CONTAINS_MARKERS && dst_phys + length <= RING_SIZE {
+            let dst = std::slice::from_raw_parts_mut(ring_ptr.add(dst_phys), length);
+            dst.fill(v);
+        } else {
+            for i in 0..length {
+                ring_ptr.add((dst_phys + i) % RING_SIZE).write(v);
+            }
+        }
+        *pos += length;
+    } else {
+        // General overlap (1 < distance < length). Sequential
+        // element copy — earlier writes feed later reads, matching
+        // deflate's run-length semantics. Wrap-safe via the per-
+        // element modulo.
+        for i in 0..length {
+            let v = *ring_ptr.add((src_phys + i) % RING_SIZE);
+            ring_ptr.add((dst_phys + i) % RING_SIZE).write(v);
+        }
+        *pos += length;
     }
-    Ok(())
+
+    // Counter recompute — vendor's pattern at deflate.hpp:1379-1389.
+    // Compile-time-eliminated when CONTAINS_MARKERS = false (post-
+    // switch clean path); the entire scan + counter update is dead
+    // code the compiler strips.
+    if CONTAINS_MARKERS {
+        // Scan backward through the just-written `length` bytes for
+        // any marker (value >= MARKER_BASE = MAX_WINDOW_SIZE). The
+        // earliest marker from the end determines the new counter
+        // value; if none, counter += length.
+        let mut k = 0usize;
+        while k < length {
+            let v = *ring_ptr.add((*pos - 1 - k) % RING_SIZE);
+            if v >= MAX_WINDOW_SIZE as u16 {
+                *distance_marker = k;
+                return;
+            }
+            k += 1;
+        }
+        *distance_marker += length;
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -1527,23 +2007,23 @@ mod tests {
         let mut output: Vec<u16> = Vec::new();
         let window: Vec<u8> = (0..100).map(|i| (i % 256) as u8).collect();
         b.set_initial_window(&mut output, &window).unwrap();
-        assert_eq!(output.len(), 100);
-        // Window bytes are preserved verbatim.
-        for (i, &v) in output.iter().enumerate() {
-            assert_eq!(v, (i % 256) as u16);
-        }
+        // Vendor-equivalent semantics: set_initial_window seeds the
+        // Block's internal RING (mirror of m_window16). The caller's
+        // output Vec receives ONLY decoded bytes from subsequent
+        // read() calls — the window prefix lives in the ring and is
+        // never drained.
+        assert_eq!(output.len(), 0);
 
         let mut bits = make_bits(&deflate_bytes);
         b.read_header(&mut bits, false).unwrap();
         let _ = b.read(&mut bits, &mut output, payload.len() * 2);
         assert!(b.eob());
 
-        // The chunk-decoded portion sits after the window prefix:
-        // output[100..] should equal the round-tripped payload, with NO
-        // markers (since distances <= window prefix + decoded < length
-        // would always saturate marker_count to 0 — see emit_backref).
-        assert_eq!(output.len(), 100 + payload.len());
-        for (i, &v) in output[100..].iter().enumerate() {
+        // output[..] = the decoded payload, with NO markers (since
+        // distances <= window prefix + decoded < length saturate
+        // marker_count to 0 in emit_backref_ring).
+        assert_eq!(output.len(), payload.len());
+        for (i, &v) in output.iter().enumerate() {
             assert!(
                 v < 256,
                 "seeded chunk must not emit markers; v={v:#x} at offset {i}"
@@ -1637,5 +2117,194 @@ mod tests {
             non_zero_starts.len(),
             &failures[..failures.len().min(3)],
         );
+    }
+
+    // ── Ring-buffer correctness tests (advisor-flagged scenarios) ────────────
+    //
+    // These tests pin down the ring buffer + marker pre-init contract
+    // explicitly, so any future regression is caught by `cargo test`
+    // rather than requiring perf-level inspection of decoded bytes.
+
+    /// The marker zone (upper half of the ring) holds pre-computed
+    /// values that EQUAL their own slot index. A back-ref reading
+    /// from a slot in this zone therefore pulls a value that, by
+    /// construction, IS the correct cross-chunk marker for the
+    /// (chunk_position, distance) pair that produced the source slot.
+    ///
+    /// Verifies vendor's `initializeMarkedWindowBuffer` pre-init
+    /// trick at deflate.hpp:875-888 is correctly implemented.
+    #[test]
+    fn ring_marker_zone_pre_init_values_match_slot_indices() {
+        let block = Block::new();
+        for slot in MAX_WINDOW_SIZE..RING_SIZE {
+            assert_eq!(
+                block.output_ring[slot] as usize, slot,
+                "pre-init: ring[{slot}] should equal {slot}, got {}",
+                block.output_ring[slot]
+            );
+        }
+        // Lower half is zero (no pre-init needed; decoder writes here
+        // from the start).
+        for slot in 0..MAX_WINDOW_SIZE {
+            assert_eq!(
+                block.output_ring[slot], 0,
+                "pre-init: ring[{slot}] (lower half) should be 0"
+            );
+        }
+    }
+
+    /// For EVERY cross-chunk back-ref scenario `(out_pos, distance)`
+    /// where `distance > out_pos` (back-ref reaches before chunk
+    /// start), the source slot `(out_pos - distance + RING_SIZE) %
+    /// RING_SIZE` holds a pre-init value that EQUALS the marker
+    /// value our convention expects. A single `memcpy` from this
+    /// slot therefore produces the right marker — no explicit
+    /// `marker_count` loop required.
+    ///
+    /// Marker convention: byte `i` of a back-ref at chunk position
+    /// `p` with distance `d`, where `d > p+i`, has expected value
+    /// `MARKER_BASE + (MAX_WINDOW_SIZE + p + i - d)`.
+    #[test]
+    fn pre_init_values_match_marker_convention_for_all_cross_chunk_backrefs() {
+        use crate::decompress::parallel::replace_markers::MARKER_BASE;
+        let block = Block::new();
+        // Sample p and d across the full range, including the
+        // boundary cases (d == MAX_WINDOW_SIZE, p == 0,
+        // p == MAX_WINDOW_SIZE - 1).
+        for &p in &[0, 1, 100, 1000, 16384, MAX_WINDOW_SIZE - 1] {
+            for &d in &[p + 1, p + 100, MAX_WINDOW_SIZE / 2, MAX_WINDOW_SIZE] {
+                if d <= p {
+                    continue; // not a cross-chunk back-ref
+                }
+                // First byte of the back-ref (i = 0).
+                let src_slot = (p + RING_SIZE - d) % RING_SIZE;
+                let expected_marker = MARKER_BASE as usize + (MAX_WINDOW_SIZE + p) - d;
+                assert_eq!(
+                    block.output_ring[src_slot] as usize, expected_marker,
+                    "p={p} d={d}: ring[{src_slot}] = {} but marker convention says {expected_marker}",
+                    block.output_ring[src_slot]
+                );
+            }
+        }
+    }
+
+    /// This is the SCENARIO THE ADVISOR FLAGGED.
+    ///
+    /// State: `ring_pos = MAX_WINDOW_SIZE` (32768 pure literals
+    /// decoded), the mid-decode switch has just fired
+    /// (`contains_marker_bytes = false`), and the next back-ref
+    /// arrives with `distance = MAX_WINDOW_SIZE` (= 32768).
+    ///
+    /// Advisor's claim: source slot lands at index 32768 (the start
+    /// of the marker zone), so the back-ref's `copy_nonoverlapping`
+    /// pulls marker value `32768` into the output where a clean
+    /// literal is expected.
+    ///
+    /// Truth (verified by this test): source slot is
+    /// `(32768 + RING_SIZE - 32768) % RING_SIZE = 65536 % 65536 = 0`
+    /// — the FIRST decoded literal (lower half of ring). Output is
+    /// the original literal, not a marker. The pre-init zone is
+    /// UNREACHABLE once `ring_pos >= MAX_WINDOW_SIZE` because every
+    /// back-ref source `(ring_pos - distance) % RING_SIZE` for
+    /// `distance ≤ MAX_WINDOW_SIZE` lies in `[0, ring_pos) ⊂ [0,
+    /// RING_SIZE)` and was overwritten by literal decode.
+    #[test]
+    fn post_switch_max_distance_backref_reads_clean_lower_half_not_marker_zone() {
+        let mut block = Block::new();
+        // Simulate the state described in the advisor's concern:
+        // 32 KiB of distinct literal bytes have been decoded into
+        // the lower half of the ring, and the mid-decode switch
+        // condition is satisfied.
+        for i in 0..MAX_WINDOW_SIZE {
+            block.output_ring[i] = (i & 0xFF) as u16; // distinct (mod 256) literal
+        }
+        block.ring_pos = MAX_WINDOW_SIZE;
+        block.ring_drained = MAX_WINDOW_SIZE;
+        block.decoded_bytes = MAX_WINDOW_SIZE;
+        block.distance_to_last_marker_byte = MAX_WINDOW_SIZE;
+        block.contains_marker_bytes = false;
+
+        // Now invoke emit_backref_ring directly with distance =
+        // MAX_WINDOW_SIZE, length = 100. This mirrors the back-ref
+        // the advisor said would corrupt output.
+        let ring_ptr = block.output_ring.as_mut_ptr();
+        let mut pos = block.ring_pos;
+        let mut distance_marker = block.distance_to_last_marker_byte;
+        unsafe {
+            emit_backref_ring::<false>(
+                ring_ptr,
+                &mut pos,
+                MAX_WINDOW_SIZE, // distance
+                100,             // length
+                &mut distance_marker,
+            );
+        }
+
+        // After the call: positions [32768, 32868) in the ring
+        // hold the copied bytes. They should equal ring[0..100]
+        // (the original literals), NOT marker values from the
+        // pre-init zone.
+        for i in 0..100 {
+            let written = block.output_ring[MAX_WINDOW_SIZE + i];
+            let expected = (i & 0xFF) as u16; // matches the literal we wrote at ring[i]
+            assert_eq!(
+                written, expected,
+                "back-ref at distance=MAX_WINDOW_SIZE wrote {written:#x} at ring[{}] but expected literal {expected:#x} — \
+                 this would mean the advisor's bug claim is real",
+                MAX_WINDOW_SIZE + i
+            );
+            // And critically: the written value MUST NOT be a
+            // marker value (>= MARKER_BASE = MAX_WINDOW_SIZE).
+            assert!(
+                (written as usize) < MAX_WINDOW_SIZE,
+                "back-ref pulled MARKER VALUE {written:#x} into clean-mode output at ring[{}]",
+                MAX_WINDOW_SIZE + i
+            );
+        }
+        assert_eq!(pos, MAX_WINDOW_SIZE + 100, "pos should have advanced by length=100");
+    }
+
+    /// Companion to the test above: BEFORE the switch fires (chunk
+    /// start, no prior decode), a back-ref with `distance > out_pos`
+    /// MUST produce correct marker values via the pre-init pull.
+    ///
+    /// This verifies the pre-init scheme works as intended for the
+    /// case it IS designed to serve.
+    #[test]
+    fn pre_switch_cross_chunk_backref_produces_correct_markers() {
+        use crate::decompress::parallel::replace_markers::MARKER_BASE;
+        let mut block = Block::new();
+        // Initial state: chunk just started, nothing decoded yet.
+        // contains_marker_bytes = true (default from new()).
+        let ring_ptr = block.output_ring.as_mut_ptr();
+        let mut pos: usize = 0;
+        let mut distance_marker: usize = 0;
+
+        // Back-ref: distance = 100, length = 50, at chunk position
+        // 0. Since distance > out_pos (= 0), ALL 50 bytes should be
+        // cross-chunk markers.
+        unsafe {
+            emit_backref_ring::<true>(
+                ring_ptr,
+                &mut pos,
+                100, // distance
+                50,  // length
+                &mut distance_marker,
+            );
+        }
+
+        // Check each emitted byte is the correct marker per our
+        // convention: MARKER_BASE + (MAX_WINDOW_SIZE + 0 + i - 100).
+        for i in 0..50 {
+            let written = block.output_ring[i];
+            let expected = MARKER_BASE as usize + MAX_WINDOW_SIZE + i - 100;
+            assert_eq!(
+                written as usize, expected,
+                "back-ref byte {i}: ring[{i}] = {written:#x} but marker convention says {expected:#x}"
+            );
+        }
+        // Counter: we emitted 50 markers in a row → distance to
+        // last marker is 0 (the last byte written was a marker).
+        assert_eq!(distance_marker, 0, "every byte was a marker; counter should be 0");
     }
 }
