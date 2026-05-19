@@ -317,4 +317,61 @@ mod tests {
         let data: Vec<u16> = b"hello".iter().map(|&b| b as u16).collect();
         assert_eq!(u16_to_u8(&data).unwrap(), b"hello".to_vec());
     }
+
+    /// Vendor-faithfulness gate for the LUT path
+    /// (`DecodedData.hpp:314-338`). Exercises the ≥ 128 KiB threshold
+    /// that triggers `replace_markers_lut` and asserts byte-equivalent
+    /// output against the scalar reference path. Previously NO test
+    /// hit the LUT branch — flagged by advisor #10 after commit
+    /// ec55351 landed.
+    #[test]
+    fn lut_path_matches_scalar_above_threshold() {
+        // 200K-element buffer: well over the 128 KiB threshold.
+        const N: usize = 200_000;
+        // Deterministic mixed marker / literal pattern. Use a PRNG-shaped
+        // sequence to hit both literal and marker values across the
+        // full marker offset range [0, 32767].
+        let mut input = Vec::with_capacity(N);
+        let mut x: u32 = 0x9E37_79B9; // golden-ratio seed
+        for i in 0..N {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            // 70% markers, 30% literals — typical compressed-text mix
+            if x % 10 < 7 {
+                input.push(MARKER_BASE + ((x >> 8) % 32768) as u16);
+            } else {
+                input.push((i % 256) as u16);
+            }
+        }
+        let window: Vec<u8> = (0..32768).map(|i| (i * 37 + 13) as u8).collect();
+
+        // Run the scalar path for ground truth.
+        let mut scalar_out = input.clone();
+        replace_markers_scalar(&mut scalar_out, &window);
+
+        // Run the dispatching `replace_markers` — should pick the LUT path.
+        let mut lut_out = input.clone();
+        replace_markers(&mut lut_out, &window);
+
+        // Byte-equivalent on the LOW BYTE of each u16 (the only byte
+        // production code reads via `*v as u8` narrow). The LUT path
+        // writes the FULL u16 with high byte = 0; the scalar path
+        // leaves the high byte at whatever the input had — so they
+        // can differ in high byte for slots that stayed literal.
+        // We assert the low-byte equivalence which is what matters.
+        assert_eq!(scalar_out.len(), lut_out.len());
+        for (i, (s, l)) in scalar_out.iter().zip(lut_out.iter()).enumerate() {
+            assert_eq!(
+                *s as u8, *l as u8,
+                "scalar/lut diverge at index {}: scalar=0x{:04x} lut=0x{:04x}",
+                i, s, l
+            );
+            // After replacement, no value above MARKER_BASE should remain
+            // (window covers the full 32 KiB → every marker resolves).
+            assert!(
+                *l < MARKER_BASE,
+                "unresolved marker in LUT output at {i}: 0x{:04x}",
+                l
+            );
+        }
+    }
 }
