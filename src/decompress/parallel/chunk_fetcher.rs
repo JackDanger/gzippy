@@ -637,17 +637,24 @@ fn consumer_loop<W: std::io::Write>(
                 // actually starts → missing decoded bytes for
                 // `[blockOffset, max)` → output corruption.
                 //
-                // Restrict the trim to the two boundary cases that
-                // are safe without the chain invariant:
-                //   - blockOffset == encoded_offset_bits → no trim,
-                //     chunk's data starts exactly here (chunk was
-                //     decoded at offset.first, e.g. partition seed is
-                //     a valid block boundary that wasn't overshot)
+                // Restrict the trim to the ONE boundary case that is
+                // safe without the chain invariant:
                 //   - blockOffset == max_encoded_offset_bits → no
-                //     trim, chunk's data starts exactly here (the
-                //     slow path's offset.second handoff)
-                let exact_match = arc.encoded_offset_bits == next_block_offset
-                    || arc.max_encoded_offset_bits == next_block_offset;
+                //     trim needed because chunk's data starts AT
+                //     `max` (slow path's offset.second). Writing
+                //     chunk.data wholesale emits bytes for
+                //     [max, end] = [blockOffset, end] exactly.
+                //
+                // Dropped the alternate clause `blockOffset ==
+                // encoded_offset_bits` (audit 13 reflection): when
+                // `encoded != max`, the chunk's data still starts at
+                // `max`, so a blockOffset matching `encoded` means
+                // bytes for [encoded, max) are missing from the
+                // chunk — output corruption. The clause happened to
+                // be safe in the common case (encoded == max after
+                // slow path validated at the partition seed) but
+                // unsafe in the general case. Keep only `max`.
+                let exact_match = arc.max_encoded_offset_bits == next_block_offset;
                 if arc.matches_encoded_offset(next_block_offset) && exact_match {
                     chunk_arc_from_partition = Some(arc);
                 }
