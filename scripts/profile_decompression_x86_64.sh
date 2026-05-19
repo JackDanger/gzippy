@@ -80,8 +80,20 @@ echo
 echo "--- decode sweep ---"
 printf '%-5s %-34s %s\n' "T" "md5" "result"
 FAIL=0
+ERR_SEEN=""
 for T in $THREAD_SWEEP; do
-    H=$(./target/release/gzippy -d -c -p "$T" "$FIX" 2>/dev/null | md5sum | cut -d' ' -f1)
+    # Decode to a file. `|| rc=$?` keeps `set -e` from aborting the
+    # whole sweep on a hard decode error — we want every T's result.
+    rc=0
+    ./target/release/gzippy -d -c -p "$T" "$FIX" \
+        > /tmp/profx86-out 2>/tmp/profx86-err-"$T" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        printf '%-5s %-34s %s\n' "$T" "(decode error rc=$rc)" "ERROR"
+        FAIL=1
+        ERR_SEEN="$ERR_SEEN $T"
+        continue
+    fi
+    H=$(md5sum < /tmp/profx86-out | cut -d' ' -f1)
     if [ "$H" = "$REF" ]; then
         printf '%-5s %-34s %s\n' "$T" "$H" "ok"
     else
@@ -90,6 +102,15 @@ for T in $THREAD_SWEEP; do
     fi
 done
 echo
+
+# Surface the stderr of the first errored thread count, if any —
+# the failure message is the fastest pointer to the cause.
+if [ -n "$ERR_SEEN" ]; then
+    FIRST_ERR=$(echo "$ERR_SEEN" | awk '{print $1}')
+    echo "--- stderr from first ERROR (T=$FIRST_ERR) ---"
+    cat /tmp/profx86-err-"$FIRST_ERR" || true
+    echo
+fi
 
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: PASS — every thread count decodes byte-perfect"
