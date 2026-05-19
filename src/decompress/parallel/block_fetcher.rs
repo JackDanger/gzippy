@@ -284,7 +284,20 @@ where
         F: Fn(usize) -> bool,
         PO: Fn(&Key) -> Key,
     {
+        // Vendor's `BlockFetcher::get` timing at BlockFetcher.hpp:280-322:
+        //   tGetStart = now();                            // line 280
+        //   ... wait on future ...
+        //   tFutureGetStart = now();                      // line 311
+        //   queuedResult.wait_for(1ms)*                   // line 314
+        //   futureGetDuration = duration(tFutureGetStart);
+        //   m_statistics.futureWaitTotalTime += futureGetDuration;  // line 324
+        //   m_statistics.getTotalTime += duration(tGetStart);       // line 325
+        let t_get_start = std::time::Instant::now();
+
         if let Some(v) = self.get_if_available(&block_offset) {
+            self.statistics
+                .base
+                .add_get_time(t_get_start.elapsed().as_secs_f64());
             return (Ok(v), 0);
         }
 
@@ -317,10 +330,19 @@ where
         // mpsc::Receiver::recv_timeout in a short loop so the prefetch
         // queue keeps filling while we wait. The 1ms tick matches
         // vendor exactly.
+        let t_future_wait_start = std::time::Instant::now();
         let value = loop {
             match rx.recv_timeout(std::time::Duration::from_millis(1)) {
                 Ok(Ok(v)) => break v,
-                Ok(Err(e)) => return (Err(e), prefetched),
+                Ok(Err(e)) => {
+                    self.statistics
+                        .base
+                        .add_future_wait_time(t_future_wait_start.elapsed().as_secs_f64());
+                    self.statistics
+                        .base
+                        .add_get_time(t_get_start.elapsed().as_secs_f64());
+                    return (Err(e), prefetched);
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if should_drive_prefetch {
                         prefetched += self.prefetch_new_blocks(
@@ -340,7 +362,13 @@ where
                 }
             }
         };
+        self.statistics
+            .base
+            .add_future_wait_time(t_future_wait_start.elapsed().as_secs_f64());
         self.insert(block_offset.clone(), value.clone());
+        self.statistics
+            .base
+            .add_get_time(t_get_start.elapsed().as_secs_f64());
         (Ok(value), prefetched)
     }
 
