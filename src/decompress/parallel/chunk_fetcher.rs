@@ -434,6 +434,19 @@ pub fn drive<W: std::io::Write>(
             SLOW_PATH_FIRST_CANDIDATE_FAIL.load(Ordering::Relaxed),
             SLOW_PATH_NO_CANDIDATE.load(Ordering::Relaxed),
         );
+        // Advisor 14 instrumentation: per-fetch rejection cause.
+        // PREFETCH_REJECT_BY_GUARD bumps when a prefetched chunk arrived
+        // at the consumer but the safety guard rejected it (chain
+        // invariant broken — chunk.max != next_block_offset). A high
+        // count vs the cache-miss count would mean closing the chain
+        // (wrapper avail_in cap + paired metadata fix) is needed.
+        // A LOW count (≈ 0) would mean the on-demand fetches are
+        // overwhelmingly "prefetch wasn't ready in time" (scheduling),
+        // and the perf gap is a worker-utilization problem instead.
+        eprintln!(
+            "  Prefetch guard-rejects: {}",
+            PREFETCH_REJECT_BY_GUARD.load(Ordering::Relaxed),
+        );
     }
 
     Ok((total_crc.crc32(), total_size))
@@ -657,6 +670,16 @@ fn consumer_loop<W: std::io::Write>(
                 let exact_match = arc.max_encoded_offset_bits == next_block_offset;
                 if arc.matches_encoded_offset(next_block_offset) && exact_match {
                     chunk_arc_from_partition = Some(arc);
+                } else {
+                    // Diagnostic counter (added 2026-05-19): a prefetch
+                    // arrived at the consumer (matches the partition
+                    // lookup) but the safety guard rejected it. Bumps
+                    // mean "chain invariant broken for this fetch."
+                    // Distinguishes from "prefetch never arrived"
+                    // (try_take_prefetched returned None), which is
+                    // counted by `prefetch_cache_miss` and means a
+                    // scheduling/timing miss, not a metadata mismatch.
+                    PREFETCH_REJECT_BY_GUARD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 // If !matches OR the safety guard rejected, the Arc
                 // is dropped here (vendor "throws away" the
@@ -1245,6 +1268,16 @@ pub static SLOW_PATH_NO_CANDIDATE: std::sync::atomic::AtomicU64 =
 pub static SLOW_PATH_FIRST_CANDIDATE_OK: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static SLOW_PATH_FIRST_CANDIDATE_FAIL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bumps once per consumer iter where the partition-keyed
+/// `try_take_prefetched` returned a chunk but the safety guard
+/// rejected it (mismatch between `chunk.max_encoded_offset_bits` and
+/// consumer-requested `next_block_offset`). Separating this from
+/// `prefetch_cache_miss` (which counts "prefetch absent") was advisor
+/// 14's question: of the on-demand fetches counted in --verbose, how
+/// many are guard-rejects vs cache-misses? Different fixes apply.
+pub static PREFETCH_REJECT_BY_GUARD: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
