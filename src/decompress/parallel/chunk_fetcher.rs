@@ -68,6 +68,8 @@ use crate::decompress::parallel::block_finder::BlockFinder;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::block_map::{append_subchunks_to_block_map, BlockMap};
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+use crate::decompress::parallel::compressed_vector::CompressionType;
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::crc32::CRC32Calculator;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::gzip_block_finder::{GetReturnCode, GzipBlockFinder};
@@ -82,9 +84,26 @@ use crate::decompress::parallel::thread_pool::{ThreadPinning, ThreadPool};
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::trace;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-use crate::decompress::parallel::window_map::WindowMap;
+use crate::decompress::parallel::window_map::{Window, WindowMap};
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+use std::borrow::Cow;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use std::sync::mpsc;
+
+/// Materialize a `Window`'s raw bytes. Mirror of vendor's
+/// `sharedLastWindow->decompress()` call at
+/// GzipChunkFetcher.hpp:341. For `CompressionType::None` (the
+/// single-pass single-member production case) this is a zero-alloc
+/// slice borrow into the existing `CompressedVector`. For Zlib
+/// (seekable-reader path) it allocates a fresh `Vec<u8>`.
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+fn materialize_window(w: &Window) -> Cow<'_, [u8]> {
+    if w.compression_type() == CompressionType::None {
+        Cow::Borrowed(w.raw_bytes())
+    } else {
+        Cow::Owned(w.decompress())
+    }
+}
 
 #[derive(Debug)]
 pub enum FetchError {
@@ -209,8 +228,10 @@ pub fn drive<W: std::io::Write>(
         crate::decompress::parallel::compressed_vector::CompressionType::None,
     );
     // Chunk 0's input window is empty by definition (start of stream).
-    let empty_window: Arc<[u8; 32768]> = Arc::new([0u8; 32768]);
-    window_map.insert(0, empty_window);
+    // Vendor pattern: insert an empty / zero window so subsequent
+    // get(0) lookups return a valid SharedWindow rather than nullptr.
+    let zero_window = [0u8; 32768];
+    window_map.insert_bytes(0, &zero_window);
 
     // ── m_blockMap (vendor GzipChunkFetcher.hpp:284) ────────────────
     let block_map = Arc::new(BlockMap::new());
@@ -506,7 +527,11 @@ fn consumer_loop<W: std::io::Write>(
         // consumer thread BEFORE handing off to the worker pool) is what
         // unblocks the next chunk's worker without serializing on this
         // chunk's apply_window. We mirror exactly:
-        let predecessor_window_for_postprocess: Option<Arc<[u8; 32768]>>;
+        // `Window = Arc<CompressedVector>` — vendor's
+        // `SharedWindow = shared_ptr<const CompressedVector>`
+        // (WindowMap.hpp:24). Materialization to raw bytes happens on
+        // the post-process worker (run_post_process_task) when needed.
+        let predecessor_window_for_postprocess: Option<Window>;
         if chunk.data_with_markers.is_empty() {
             // No markers → apply_window is a no-op. Worker has already
             // published the tail window via `last_32kib_window()`.
@@ -567,8 +592,12 @@ fn consumer_loop<W: std::io::Write>(
                     actual: next_block_offset,
                 },
             ))?;
-            let tail = chunk.get_last_window(&window[..]);
-            window_map.insert(chunk_end_bit, Arc::new(tail));
+            // Vendor `GzipChunkFetcher.hpp:341`: `sharedLastWindow->
+            // decompress()` materializes the bytes once. For
+            // CompressionType::None this is a zero-alloc slice borrow.
+            let window_bytes = materialize_window(&window);
+            let tail = chunk.get_last_window(&window_bytes);
+            window_map.insert_bytes(chunk_end_bit, &tail);
             predecessor_window_for_postprocess = Some(window);
         }
 
@@ -696,7 +725,7 @@ fn submit_decode_to_pool(
 fn submit_post_process_to_pool(
     thread_pool: &Arc<ThreadPool>,
     chunk: ChunkData,
-    predecessor_window: Arc<[u8; 32768]>,
+    predecessor_window: Window,
     window_map: WindowMap,
     partition_idx: usize,
 ) -> mpsc::Receiver<ChunkData> {
@@ -741,26 +770,43 @@ fn run_decode_task(
     // resolves them). This is the vendor model — workers never block
     // on the WindowMap; the dispatch order from `BlockFetcher::get`
     // and the post-process queue do the synchronization.
-    let window = if params.start_bit == 0 {
-        Some(Arc::new([0u8; 32768]))
+    // Chunk-0 special case: predecessor window is the zero sentinel.
+    // Hold the materialized bytes on the stack so the
+    // `decode_chunk_with_window` slice borrow is valid for the call's
+    // duration without going through WindowMap. Non-chunk-0 worker
+    // gets the predecessor window via `window_map.get` (zero-alloc
+    // Arc clone) and materializes bytes via `materialize_window`.
+    let zero_window: [u8; 32768] = [0u8; 32768];
+    let window: Option<Window> = if params.start_bit == 0 {
+        None
     } else {
         window_map.get(params.start_bit)
     };
 
-    let chunk_result = match window {
-        Some(w) => decode_chunk_with_window(
+    let chunk_result = if params.start_bit == 0 {
+        decode_chunk_with_window(
             input_bytes,
             params.start_bit,
             params.until_bit,
-            &w,
+            &zero_window[..],
             configuration,
-        ),
-        None => decode_or_iterate(
+        )
+    } else if let Some(w) = window.as_ref() {
+        let bytes = materialize_window(w);
+        decode_chunk_with_window(
+            input_bytes,
+            params.start_bit,
+            params.until_bit,
+            &bytes,
+            configuration,
+        )
+    } else {
+        decode_or_iterate(
             input_bytes,
             params.start_bit,
             params.until_bit,
             configuration,
-        ),
+        )
     };
 
     // Publish tail window if cleanly available — workers can usually
@@ -770,7 +816,7 @@ fn run_decode_task(
     if let Ok(ref c) = chunk_result {
         if let Some(tail) = c.last_32kib_window() {
             let end_bit = c.encoded_offset_bits + c.encoded_size_bits;
-            window_map.insert(end_bit, Arc::new(tail));
+            window_map.insert_bytes(end_bit, &tail);
         }
     }
 
@@ -822,18 +868,25 @@ fn run_decode_task(
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 fn run_post_process_task(
     mut chunk: ChunkData,
-    predecessor_window: Arc<[u8; 32768]>,
+    predecessor_window: Window,
     window_map: WindowMap,
 ) -> ChunkData {
-    apply_window(&mut chunk, &predecessor_window[..]);
-    chunk.populate_subchunk_windows(&predecessor_window[..]);
+    // Vendor `GzipChunkFetcher.hpp:341`: materialize the predecessor
+    // window once per chunk via `sharedLastWindow->decompress()` and
+    // pass by `const &` to `postProcessChunk` and
+    // `appendSubchunksToIndexes` (lines 343 + 357). gzippy's
+    // `materialize_window` returns `Cow<[u8]>` — borrowed slice for
+    // `CompressionType::None` (zero alloc) and owned Vec for Zlib.
+    let bytes = materialize_window(&predecessor_window);
+    apply_window(&mut chunk, &bytes);
+    chunk.populate_subchunk_windows(&bytes);
 
     // Per-subchunk window publication (vendor GzipChunkFetcher.hpp:430-458).
     for sc in &chunk.subchunks {
         if let Some(ref w) = sc.window {
             let sc_end_bit = sc.encoded_offset_bits + sc.encoded_size_bits;
             if sc_end_bit > sc.encoded_offset_bits {
-                window_map.insert(sc_end_bit, w.clone());
+                window_map.insert_bytes(sc_end_bit, &w[..]);
             }
         }
     }

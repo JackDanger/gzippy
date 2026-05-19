@@ -90,12 +90,12 @@ pub fn decode_chunk_with_window(
     input: &[u8],
     encoded_offset_bits: usize,
     until_bits: usize,
-    initial_window: &[u8; 32768],
+    initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
     let t_decode = std::time::Instant::now();
     let mut wrapper = IsalInflateWrapper::new(input, encoded_offset_bits)?;
-    wrapper.set_window(&initial_window[..])?;
+    wrapper.set_window(initial_window)?;
     // END_OF_STREAM fires when the deflate stream's BFINAL block has
     // been fully decoded and the bit reader has byte-aligned to the
     // footer. We listen for it so multi-stream gzip is handled inline:
@@ -339,7 +339,7 @@ pub fn decode_chunk_with_window(
     _input: &[u8],
     _encoded_offset_bits: usize,
     _until_bits: usize,
-    _initial_window: &[u8; 32768],
+    _initial_window: &[u8],
     _configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
     Err(ChunkDecodeError::UnsupportedPlatform)
