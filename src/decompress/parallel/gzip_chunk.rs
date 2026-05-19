@@ -256,15 +256,22 @@ pub fn decode_chunk_with_window(
                 _ => {}
             }
 
-            if already_decoded + n_bytes_read >= configuration.max_decoded_chunk_size {
-                // Mirrors GzipChunk.hpp:368-372 — `alreadyDecoded >= max...`.
-                // We use the running counters rather than
-                // `chunk.decoded_size()` because the buffer's in-flight
-                // bytes haven't been moved into `chunk.data` yet
-                // (that happens at the OUTER iter end).
-                chunk.stopped_preemptively = true;
-                stopping_point_reached = true;
-            }
+            // NOTE — vendor's `decodeChunkWithInflateWrapper`
+            // (GzipChunk.hpp:192-268) does NOT check
+            // maxDecompressedChunkSize. The fast path is bounded only
+            // by `exactUntilOffset` (the next chunk's start). The
+            // `alreadyDecoded >= max...` preempt vendor has is at
+            // GzipChunk.hpp:368-372 inside
+            // `finishDecodeChunkWithInexactOffset` (the slow/
+            // speculative path), not here. gzippy previously also
+            // preempted in the fast path, but that left the ISA-L
+            // wrapper mid-block (no real EOB boundary at the stop
+            // position), so the successor chunk's worker could not
+            // resume from `last_end_bit`. Producing wrong output on
+            // any single-member input whose decompressed size
+            // exceeded max_decoded_chunk_size (= 20× split_chunk_size
+            // = 80 MiB by default). Removing the preempt matches
+            // vendor and unblocks large-file decode.
         }
 
         // OUTER iter end — commit the buffer once. Mirrors GzipChunk.hpp:376-379.
