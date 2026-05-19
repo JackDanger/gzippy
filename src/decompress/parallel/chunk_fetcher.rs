@@ -415,6 +415,17 @@ pub fn drive<W: std::io::Write>(
             TAKE_U16_MISSES.load(Ordering::Relaxed),
             RETURN_U16_CALLS.load(Ordering::Relaxed),
         );
+        // Advisor 12 instrumentation: slow-path candidate iteration.
+        // SLOW_PATH_FIRST_CANDIDATE_OK + SLOW_PATH_FIRST_CANDIDATE_FAIL +
+        // SLOW_PATH_NO_CANDIDATE should sum to the slow-path call count.
+        // A high FAIL count vs OK proves the marker decoder rejects
+        // candidates that vendor accepts (advisor 11 Q2 hypothesis).
+        eprintln!(
+            "  Slow-path decode: ok={} fail={} no_candidate={}",
+            SLOW_PATH_FIRST_CANDIDATE_OK.load(Ordering::Relaxed),
+            SLOW_PATH_FIRST_CANDIDATE_FAIL.load(Ordering::Relaxed),
+            SLOW_PATH_NO_CANDIDATE.load(Ordering::Relaxed),
+        );
     }
 
     Ok((total_crc.crc32(), total_size))
@@ -1208,6 +1219,19 @@ fn run_post_process_task(
 /// the boundary on ~80% of partitions (observed via decode_err trace);
 /// the outer 512 KiB cap matches vendor's `chunkBegin - blockOffset >=
 /// 512_Ki * BYTE_SIZE` break at GzipChunk.hpp:811.
+/// Diagnostic counters for slow-path candidate iteration. Advisor 12
+/// asked: of the 22 on-demand fallbacks observed in --verbose stats,
+/// how many are caused by `decode_or_iterate` returning Err vs the
+/// consumer-side `matches_encoded_offset` check rejecting? These
+/// counters let a single GZIPPY_VERBOSE decode answer the question
+/// without needing trace parsing.
+pub static SLOW_PATH_NO_CANDIDATE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SLOW_PATH_FIRST_CANDIDATE_OK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SLOW_PATH_FIRST_CANDIDATE_FAIL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 fn decode_or_iterate(
     input: &[u8],
@@ -1225,13 +1249,25 @@ fn decode_or_iterate(
         let chunk_end = (chunk_begin + CHUNK_SIZE_BITS).min(max_end);
         let candidates = finder.find_blocks(chunk_begin, chunk_end);
         if let Some(first) = candidates.into_iter().find(|c| c.bit_offset >= chunk_begin) {
-            let mut chunk = finish_decode_chunk_with_inexact_offset(
+            let result = finish_decode_chunk_with_inexact_offset(
                 input,
                 first.bit_offset,
                 until_bit,
                 &[],
                 configuration,
-            )?;
+            );
+            // Advisor 12 instrumentation: classify the result. If the
+            // first candidate fails, the consumer falls through to
+            // on-demand dispatch — explains the 22-of-37 on-demand
+            // count observed in --verbose stats.
+            match &result {
+                Ok(_) => {
+                    SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                }
+                Err(_) => SLOW_PATH_FIRST_CANDIDATE_FAIL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            };
+            let mut chunk = result?;
             // Vendor-faithful metadata for speculative chunks
             // (GzipChunk.hpp:716-722):
             //
@@ -1291,6 +1327,7 @@ fn decode_or_iterate(
         }
         chunk_begin = chunk_end;
     }
+    SLOW_PATH_NO_CANDIDATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Err(ChunkDecodeError::ExactStopMissed {
         requested: start_bit,
         actual: max_end,
