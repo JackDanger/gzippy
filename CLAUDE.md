@@ -161,10 +161,9 @@ trailer, then writes — so a failed speculation never produces partial output
 to the writer. Speedup ≈ T/2; ties sequential at T=2 (CI), scales to 4× at T=8.
 Wired into `decompress::decompress_single_member` behind
 `isal_decompress::is_available() && num_threads > 1 && data.len() > 10 MiB`.
-The old "32 KB prefix correction" plan (`docs/parallel-single-member-redesign.md`)
-was wrong: cross-chunk back-references resolve to zeros in phase 1, then propagate
-forward via chunk-local back-references arbitrarily far — the prefix correction
-can't unwind that. Test
+The old "32 KB prefix correction" plan was wrong: cross-chunk back-references
+resolve to zeros in phase 1, then propagate forward via chunk-local back-
+references arbitrarily far — the prefix correction can't unwind that. Test
 `tests::routing::tests::test_single_member_parallel_not_slower_than_sequential`
 catches regressions of the v0.3.0 class before push.
 

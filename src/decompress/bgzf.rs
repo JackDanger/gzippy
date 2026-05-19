@@ -1409,7 +1409,7 @@ fn decode_huffman_consume_first(
     }
 }
 
-/// Turbo decode loop with ALL Phase 1 optimizations from OPTIMIZATION_ROADMAP.md
+/// Turbo decode loop with the full set of inflate-inner-loop optimizations.
 ///
 /// Phase 1 optimizations implemented:
 /// 1. bitsleft -= entry (full u32 subtract, no masking)
