@@ -920,15 +920,22 @@ impl ChunkData {
     }
 
     /// Finalize at end of decode. Sets `encoded_size_bits` for the
-    /// chunk and its trailing subchunk; updates `max_encoded_offset_bits`
-    /// so the consumer's `matches_encoded_offset` accepts any expected
-    /// start in [encoded_offset_bits, end_encoded_offset_bits]. With
-    /// per-boundary subchunks, that range typically holds a subchunk
-    /// at the exact expected_start, so the consumer can trim.
+    /// chunk and its trailing subchunk. **Does NOT touch
+    /// `max_encoded_offset_bits`** — vendor's pattern is that the
+    /// worker sets max at decode time (`offset.second` per
+    /// `GzipChunk.hpp:722`: where the boundary was actually found),
+    /// and finalize leaves it alone. For fast-path decodes with a
+    /// known predecessor window, `offset.first == offset.second ==
+    /// encoded_offset_bits`, so max stays at encoded_offset_bits
+    /// (exact-match semantics in `matches_encoded_offset`). Setting
+    /// max to `end_encoded_offset_bits` here was the bug that made
+    /// `try_take_prefetched(partition_offset)` return a chunk whose
+    /// range INCLUDED the next chunk's start, causing the consumer
+    /// to re-use the predecessor chunk and `set_encoded_offset` to
+    /// zero out `encoded_size_bits` → premature EOF break.
     pub fn finalize(&mut self, end_encoded_offset_bits: usize) {
         debug_assert!(end_encoded_offset_bits >= self.encoded_offset_bits);
         self.encoded_size_bits = end_encoded_offset_bits - self.encoded_offset_bits;
-        self.max_encoded_offset_bits = end_encoded_offset_bits;
         if let Some(last) = self.subchunks.last_mut() {
             debug_assert!(end_encoded_offset_bits >= last.encoded_offset_bits);
             last.encoded_size_bits = end_encoded_offset_bits - last.encoded_offset_bits;
@@ -1248,7 +1255,11 @@ mod tests {
         assert_eq!(chunk.subchunks[0].decoded_size, 200);
         assert_eq!(chunk.subchunks[1].decoded_size, 30);
         assert_eq!(chunk.subchunks[1].encoded_size_bits, 500);
-        assert_eq!(chunk.max_encoded_offset_bits, 2500);
+        // max_encoded_offset_bits stays at construction-time value (0)
+        // — vendor's pattern: max is set by the worker (offset.second
+        // per GzipChunk.hpp:722), not by finalize. For fast-path
+        // chunks max == encoded_offset_bits (exact-match semantics).
+        assert_eq!(chunk.max_encoded_offset_bits, 0);
         assert_eq!(chunk.decoded_offset_for(0), Some(0));
         assert_eq!(chunk.decoded_offset_for(2000), Some(200));
         assert_eq!(chunk.decoded_offset_for(1234), None);
