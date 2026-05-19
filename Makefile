@@ -27,7 +27,7 @@ SYSTEM_GZIP := $(shell which gzip)
 # Set APPLE_GZIP when it differs from GZIP_BIN so bench targets compare both
 APPLE_GZIP := $(if $(filter Darwin,$(shell uname)),/usr/bin/gzip,)
 
-.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship ship-local route-check oracle-vs-c bench-sm
+.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship ship-local route-check oracle-vs-c bench-sm profile-decompression-x86_64
 
 # =============================================================================
 # Default target: quick benchmark for fast iteration (< 30 seconds)
@@ -145,6 +145,21 @@ quick-wallclock: $(GZIPPY_BIN) $(UNGZIPPY_BIN) $(PIGZ_BIN) deps
 # =============================================================================
 route-check: $(GZIPPY_BIN) $(PIGZ_BIN)
 	@python3 scripts/route_check.py $(GZIPPY_BIN) $(PIGZ_BIN)
+
+# =============================================================================
+# profile-decompression-x86_64: fastest x86_64 decompression CORRECTNESS check.
+#
+# Builds the current branch on the homelab x86_64 box, makes one gzip(1)-CLI
+# fixture, decodes it at a sweep of thread counts, and FAILS if any thread
+# count produces wrong bytes. ~35s. This is the check that catches the
+# parallel-SM T>=9 corruption that arm64 dev machines cannot see.
+#
+# All SSH / build / fixture complexity lives in the script; this target is
+# a one-liner so a user or LLM can run it and read PASS/FAIL on stdout.
+#   Override remote: GZIPPY_REMOTE_SSH='-J jump root@host' make profile-decompression-x86_64
+# =============================================================================
+profile-decompression-x86_64:
+	@bash scripts/profile_decompression_x86_64.sh
 
 # =============================================================================
 # Ship: the "are we good?" gate. Always tests the *current branch*.
