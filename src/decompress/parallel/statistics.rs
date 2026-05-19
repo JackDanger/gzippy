@@ -363,6 +363,58 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_display_mirrors_vendor_verbose_sections() {
+        // Lock in vendor-parity for the full Display output. Regression
+        // catcher for the --verbose port (commits 52b398a..8e77404).
+        // If a future commit drops or renames any of these sections,
+        // gzippy's --verbose stops being directly comparable to
+        // rapidgzip --verbose — which advisor passes rely on for
+        // cross-tool diagnosis (used to find the chunk-size mismatch
+        // and chunk-finalize divergence this session).
+        let s = FetcherStatistics::new(16);
+        s.record_prefetch();
+        s.record_prefetch();
+        s.record_on_demand_fetch();
+        s.record_prefetch_cache_hit(true);
+        s.record_prefetch_cache_miss();
+        s.record_cache_unused_entry();
+        s.set_block_count(42, true);
+        s.note_decode_block_start(0.0);
+        s.note_decode_block_end(0.5);
+        s.add_decode_block_time(3.0);
+        s.add_future_wait_time(0.1);
+        s.add_get_time(0.15);
+        let printed = format!("{}", s.snapshot());
+        // vendor BlockFetcher.hpp:73-124 sections.
+        for needle in [
+            "Total Existing",
+            "Total Fetched",
+            "Prefetched",
+            "Fetched On-demand",
+            "Prefetch Stall by BlockFinder",
+            "Time spent in:",
+            "decodeBlock",
+            "std::future::get",
+            "get ",
+            "Thread Pool Utilization:",
+            "Total Real Decode Duration",
+            "Theoretical Optimal Duration",
+            "Pool Efficiency (Fill Factor)",
+            "Prefetch Cache:",
+            "Hits",
+            "Misses",
+            "Unused Entries",
+            "Cache Hit Rate",
+            "Useless Prefetches",
+        ] {
+            assert!(
+                printed.contains(needle),
+                "vendor-verbose Display missing section: '{needle}'\n=== printed ===\n{printed}",
+            );
+        }
+    }
+
+    #[test]
     fn chunk_extra_counts_preemptive_stops() {
         let s = ChunkFetcherStatistics::new(4);
         s.record_preemptive_stop();
