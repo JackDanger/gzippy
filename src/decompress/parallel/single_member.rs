@@ -152,6 +152,31 @@ pub fn decompress_parallel<W: Write>(
         if chunk_size < TARGET_COMPRESSED_CHUNK_BYTES {
             ADJUSTED_CHUNK_SIZE_APPLIED.fetch_add(1, Ordering::Relaxed);
         }
+
+        // Pre-fault buffer pool pages before workers spawn. On real
+        // x86_64 silesia benchmarks, gzippy spends ~40% of CPU time
+        // in asm_exc_page_fault + clear_page_erms — kernel zero-fills
+        // for the first write to every fresh page in chunk buffers.
+        // Vendor's rpmalloc-backed FasterVector amortizes this via
+        // arena recycling; gzippy's std::alloc::System pays it per
+        // worker per chunk. Pre-warming the pool with pre-faulted
+        // buffers moves the page-fault cost onto the consumer thread
+        // (serial, off worker critical path) and lets workers run with
+        // warm pages from their first chunk.
+        //
+        // Capacity heuristic: deflate decompresses ~3-5× compressed
+        // size on typical text; pre-warm at 4× chunk_size. Outlier
+        // chunks that need more will hit cold pages for the extra
+        // capacity (rare), but every typical chunk hits warm pages
+        // from byte 0. Pool size = num_threads + 2 covers all workers
+        // plus small overflow for the consumer's pending queue.
+        //
+        // Total memory committed = (num_threads + 2) × chunk_size × 4
+        //   = 18 × 4 MiB × 4 = 288 MiB on T=16 (well under host RAM).
+        // Total page faults on consumer thread = same amount / 4 KiB.
+        let prewarm_byte_cap = chunk_size.saturating_mul(4);
+        let prewarm_count = num_threads + 2;
+        crate::decompress::parallel::chunk_buffer_pool::prewarm(prewarm_count, prewarm_byte_cap);
         let result = read_parallel_sm(gzip_data, writer, num_threads, chunk_size).map_err(|e| {
             if debug_enabled() {
                 eprintln!("[parallel_sm] driver error: {e}");

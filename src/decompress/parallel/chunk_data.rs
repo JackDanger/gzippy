@@ -199,10 +199,25 @@ impl ChunkData {
     pub fn new(encoded_offset_bits: usize, configuration: ChunkConfiguration) -> Self {
         use crate::decompress::parallel::chunk_buffer_pool;
         let cap = configuration.max_decoded_chunk_size;
+        // `data_with_markers` is allocated lazily — the fast path
+        // (window known) never emits markers, so paying for the
+        // capacity reservation up front is wasted address space AND
+        // wasted page commits if the worker writes anywhere into it
+        // (e.g. `Vec::truncate` does not, but a later `extend` would).
+        // Slow-path workers call `append_markered` which grows the
+        // Vec from zero on demand; the pool's `take_u16` returns
+        // recycled Vecs at that point so growth is amortized.
+        //
+        // Vendor parity: `ChunkData::data_with_markers` is a
+        // FasterVector<uint16_t> that's default-constructed (empty)
+        // and only grown when the marker pipeline emits markers
+        // (ChunkData.hpp uses `subchunks.back().data.push_back(...)`).
+        // Allocating max-size up front was a gzippy-specific
+        // pre-emptive sizing that defied the vendor pattern.
         Self::new_with_buffers(
             encoded_offset_bits,
             configuration,
-            chunk_buffer_pool::take_u16(cap),
+            chunk_buffer_pool::take_u16(0),
             chunk_buffer_pool::take_u8(cap),
         )
     }

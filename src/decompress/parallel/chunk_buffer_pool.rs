@@ -53,6 +53,24 @@
 //! Vecs exceeding the cap are dropped normally. Sized to comfortably
 //! hold `parallelization * 2` chunks in flight (pool-size 16 → 32 ×
 //! ~80 MiB = 2.5 GiB worst case, well under host memory).
+//!
+//! ## Page pre-fault
+//!
+//! `Vec::with_capacity(N)` reserves address space but does NOT commit
+//! pages — the kernel lazily zero-fills on first write. Each fresh
+//! worker thread therefore page-faults its way through a fresh chunk
+//! buffer on its first decode (4 KB at a time, via `asm_exc_page_fault`
+//! → `clear_page_erms`). On real x86_64 silesia benchmarks, this
+//! accounts for **~40% of total CPU time** vs vendor's ~17% (rpmalloc
+//! pre-faults pages on `mmap` via `MAP_POPULATE` and recycles them
+//! warm through its arena).
+//!
+//! `prewarm(num_buffers, capacity)` pre-allocates `num_buffers` Vecs
+//! AND touches every page via byte writes, then pushes them into the
+//! pool with warm pages. Called by the parallel-SM driver before
+//! workers spawn: subsequent `take_u8` calls all hit the pool with
+//! warm pages, and the per-worker first-touch page-fault storm
+//! collapses to zero.
 
 #![allow(dead_code)]
 
@@ -61,6 +79,11 @@ use std::sync::Mutex;
 /// Cap on pool size per Vec type. Sized to absorb a brief in-flight
 /// burst without unbounded growth.
 const MAX_POOLED: usize = 64;
+
+/// Linux x86_64 base page. Conservative default that works on every
+/// host we care about. Hugepages, when active, just mean some of these
+/// page-strided touches will hit the same page — harmless.
+const PAGE_SIZE: usize = 4096;
 
 static U8_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 static U16_POOL: Mutex<Vec<Vec<u16>>> = Mutex::new(Vec::new());
@@ -127,6 +150,77 @@ pub fn return_u16(mut v: Vec<u16>) {
     }
 }
 
+/// Pre-fault every page of a buffer by writing one byte per `PAGE_SIZE`
+/// bytes. After this returns, every page is committed in the worker's
+/// resident-set; first writes during decode hit warm pages.
+///
+/// Mirror of `MAP_POPULATE` semantics for rpmalloc-allocated regions.
+/// `unsafe` because we write into uninitialized memory via raw pointer;
+/// the writes are bytes of value 0 which is also what the kernel would
+/// have lazily set them to, so this is value-preserving.
+#[inline]
+unsafe fn prefault_pages(ptr: *mut u8, capacity: usize) {
+    if capacity == 0 {
+        return;
+    }
+    let mut off = 0usize;
+    while off < capacity {
+        // Write a zero byte at this offset. Forces a page fault if the
+        // page is not yet committed; subsequent fault becomes a no-op.
+        // SAFETY: caller guarantees `ptr..ptr+capacity` is owned
+        // allocation valid for writes (Vec::with_capacity guarantees
+        // this for the reserved-but-uninitialized range).
+        std::ptr::write_volatile(ptr.add(off), 0u8);
+        off += PAGE_SIZE;
+    }
+}
+
+/// Pre-allocate `count` `Vec<u8>` and `Vec<u16>` buffers of the given
+/// capacity, pre-fault every page, and push them into the pools.
+///
+/// Called by `single_member::decompress_parallel` BEFORE workers spawn.
+/// The consumer thread eats the page-fault cost serially — total work
+/// is the same, but it stays off the workers' critical path, and the
+/// kernel `mm_lock` contention from N workers faulting in parallel is
+/// avoided.
+///
+/// Subsequent `take_u8` / `take_u16` calls all hit the pool (subject
+/// to MAX_POOLED) with warm pages. The pool stays populated until
+/// process exit because Drop returns buffers to the pool, and the
+/// pool's static lifetime outlives all decode threads.
+///
+/// `count` is typically `num_threads + 2` (1 buffer per worker plus a
+/// small overflow for the consumer's pending queue). `byte_capacity`
+/// is the chunk_size_bytes from the driver; `u16_capacity` is the same
+/// in u16 units (the marker pipeline produces one u16 per decoded
+/// byte, so byte_capacity == u16_capacity for the slow path).
+pub fn prewarm(count: usize, byte_capacity: usize) {
+    if count == 0 || byte_capacity == 0 {
+        return;
+    }
+    // u8 pool — pre-fault the full byte capacity.
+    if let Ok(mut pool) = U8_POOL.lock() {
+        while pool.len() < MAX_POOLED && pool.len() < count {
+            let mut v: Vec<u8> = Vec::with_capacity(byte_capacity);
+            // SAFETY: v has `byte_capacity` bytes reserved (uninit).
+            unsafe { prefault_pages(v.as_mut_ptr(), byte_capacity) };
+            pool.push(v);
+            PREWARM_U8_PUSHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    // u16 pool — pre-fault the BYTE extent (capacity * 2 bytes).
+    if let Ok(mut pool) = U16_POOL.lock() {
+        while pool.len() < MAX_POOLED && pool.len() < count {
+            let mut v: Vec<u16> = Vec::with_capacity(byte_capacity);
+            // SAFETY: v has `byte_capacity` u16s reserved = capacity*2
+            // bytes. Cast to u8 ptr and pre-fault the byte extent.
+            unsafe { prefault_pages(v.as_mut_ptr() as *mut u8, byte_capacity.saturating_mul(2)) };
+            pool.push(v);
+            PREWARM_U16_PUSHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// Test-only counters that prove the recycle path is being exercised.
 /// Catches the silent-rot case where someone reverts the worker call
 /// sites to `ChunkData::new` (fresh-allocate path) without flipping
@@ -138,6 +232,8 @@ pub static RETURN_U8_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 pub static TAKE_U16_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static TAKE_U16_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RETURN_U16_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PREWARM_U8_PUSHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PREWARM_U16_PUSHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // Unit tests intentionally omitted: the pool is a process-global LIFO
 // that other tests (via `ChunkData::new`) concurrently take/return

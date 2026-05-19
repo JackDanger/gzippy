@@ -609,6 +609,95 @@ mod tests {
         let _ = (before_runs, after_runs);
     }
 
+    /// Wrap raw deflate bytes in a gzip frame that includes the FNAME
+    /// header field (the optional filename string that `gzip(1)` always
+    /// adds and that `flate2`'s default GzEncoder omits). The
+    /// parallel-SM path's gzip-header parser must skip FNAME correctly
+    /// to land on the deflate body at the right bit offset.
+    ///
+    /// Header layout (RFC 1952):
+    ///   1F 8B          magic
+    ///   08             CM = deflate
+    ///   08             FLG with FNAME bit set
+    ///   4 bytes        MTIME (zero)
+    ///   00             XFL
+    ///   03             OS = Unix
+    ///   <name>\0       null-terminated filename
+    ///   <deflate>
+    ///   4 bytes        CRC32 (little-endian)
+    ///   4 bytes        ISIZE (little-endian, mod 2^32)
+    fn wrap_gzip_with_fname(deflate_body: &[u8], original: &[u8], filename: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(deflate_body.len() + filename.len() + 32);
+        out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x08, 0, 0, 0, 0, 0, 0x03]);
+        out.extend_from_slice(filename.as_bytes());
+        out.push(0);
+        out.extend_from_slice(deflate_body);
+        let crc = crc32fast::hash(original);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(original.len() as u32).to_le_bytes());
+        out
+    }
+
+    /// Raw-deflate the input via flate2 (without gzip framing).
+    fn raw_deflate_level(data: &[u8], level: u32) -> Vec<u8> {
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// **Regression test for the FNAME-header corruption surfaced on
+    /// 2026-05-19 via neurotic decode of `benchmark_data/silesia-large.gz`.**
+    ///
+    /// gzip(1) CLI adds a FNAME field to every archive (the filename of
+    /// the source). gzippy's parallel-SM path on x86_64+ISA-L
+    /// decompresses these files to wrong bytes. On the silesia fixture:
+    ///   gunzip md5: c070ed8438c2be5a1e99d6b8b980c047
+    ///   gzippy md5: 497cde98ecb8a34d407f44510442cd13
+    ///
+    /// The bug predates the 2026-05-19 wrapper port — bisected to at
+    /// least `78195ce` (before the IsalInflateWrapper refill change).
+    /// Likely cause: the parallel-SM header-skip + start-bit calculation
+    /// doesn't account for FNAME-extended headers correctly, so chunk 0
+    /// starts at the wrong bit offset.
+    ///
+    /// This test is x86_64+isal-compression gated (the parallel-SM path
+    /// is the failing path; other routes decode correctly). It is
+    /// currently EXPECTED TO FAIL on x86_64+isal-compression and is
+    /// marked `#[ignore]` so the suite remains green until the fix
+    /// lands. Run with `cargo test ... -- --ignored` to surface the
+    /// failure.
+    #[test]
+    #[ignore = "x86_64+isal-compression parallel-SM corrupts on FNAME-headered gzip — see issue"]
+    fn test_parallel_sm_handles_fname_header() {
+        // Need > 10 MiB compressed to hit the parallel-SM gate.
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let deflate = raw_deflate_level(&original, 6);
+        let fixture = wrap_gzip_with_fname(&deflate, &original, "silesia-large.bin");
+        assert!(
+            fixture.len() > 10 * 1024 * 1024,
+            "fixture must exceed 10 MiB parallel gate (got {} bytes)",
+            fixture.len()
+        );
+
+        let mut output = Vec::with_capacity(original.len());
+        crate::decompress::decompress_single_member(&fixture, &mut output, 4).unwrap();
+
+        // The defect: output diverges from `original` on the
+        // parallel-SM path. When this assertion starts passing, the
+        // bug is fixed; remove the #[ignore].
+        assert_eq!(
+            output.len(),
+            original.len(),
+            "decoded length mismatch on FNAME-headered fixture"
+        );
+        assert_eq!(
+            crc32fast::hash(&output),
+            crc32fast::hash(&original),
+            "decoded bytes diverge from original on FNAME-headered fixture"
+        );
+    }
+
     // =========================================================================
     // Optimization counter tests previously lived here (OptimizationCounters
     // snapshots for v0.6 phase-1 internals). The rapidgzip-port replaces the
