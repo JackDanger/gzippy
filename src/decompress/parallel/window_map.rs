@@ -90,24 +90,31 @@ impl WindowMap {
 
     /// Insert a window keyed at `encoded_offset_bits`. The 32 KiB
     /// buffer is compressed with this map's strategy on insertion.
-    /// Idempotent: if a window already exists for the key, the
-    /// existing value is preserved (workers and consumer can race to
-    /// insert the same end_bit window; the first wins). Mirror of
-    /// `WindowMap::emplace` (WindowMap.hpp:39-46).
+    /// **Overwriting semantics** — if a window already exists for the
+    /// key, the new value replaces it. Mirror of vendor's
+    /// `WindowMap::emplaceShared` (WindowMap.hpp:65-76), which uses
+    /// `std::map::insert_or_assign`: "Simply overwrite windows if
+    /// they do exist already... overwriting non-compressed windows
+    /// with asynchronically compressed and made-sparse windows."
+    ///
+    /// In gzippy this collision is real: the worker publishes the
+    /// chunk's clean tail at `end_bit` (chunk_fetcher.rs:773) and the
+    /// phase-2 post-process worker later publishes a per-subchunk
+    /// window at the same key (chunk_fetcher.rs:836). Vendor's pattern
+    /// is that the phase-2 (post-processed) version wins because it
+    /// reflects the post-processed / sparsified state.
     pub fn insert(&self, encoded_offset_bits: usize, window: Window) {
         let cv = Arc::new(CompressedVector::from_bytes(&window[..], self.compression));
         self.insert_compressed(encoded_offset_bits, cv);
     }
 
     /// Insert an already-compressed window. Cheap path for upstream
-    /// callers that hold an `Arc<CompressedVector>` already. Mirror
-    /// of `WindowMap::emplaceShared` (WindowMap.hpp:47-77).
+    /// callers that hold an `Arc<CompressedVector>` already. Overwrite
+    /// semantics — see `insert`. Mirror of `WindowMap::emplaceShared`
+    /// (WindowMap.hpp:47-77).
     pub fn insert_compressed(&self, encoded_offset_bits: usize, compressed: Arc<CompressedVector>) {
         let mut inner = self.state.lock().unwrap();
-        inner
-            .entries
-            .entry(encoded_offset_bits)
-            .or_insert(compressed);
+        inner.entries.insert(encoded_offset_bits, compressed);
     }
 
     pub fn len(&self) -> usize {
@@ -246,11 +253,17 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_insert_keeps_first() {
+    fn duplicate_insert_overwrites_existing() {
+        // Vendor WindowMap.hpp:75 uses `std::map::insert_or_assign`
+        // explicitly so that phase-2 sparsified/compressed windows
+        // replace the worker's earlier placeholder. Test locks in
+        // the overwrite semantic. Previously this test asserted
+        // first-wins (a divergence from vendor); the production
+        // collision is real at chunk_fetcher.rs:773 vs :836.
         let m = WindowMap::new();
         m.insert(50, window_of(0x01));
         m.insert(50, window_of(0x02));
-        assert_eq!(m.get(50).unwrap()[0], 0x01);
+        assert_eq!(m.get(50).unwrap()[0], 0x02);
     }
 
     #[test]
