@@ -848,14 +848,16 @@ Status legend: ✅ DONE · 🟡 PARTIAL · ❌ NOT STARTED · ⏭ DEFERRED-by-de
 9. ❌ **`IndexFileFormat`** — seekable index export. Optional.
 10. ✅ **Parallel marker post-processing** — the consumer submits each
     chunk's marker resolution to the thread pool via
-    `submit_post_process_to_pool` (`chunk_fetcher.rs:598`,
-    `run_post_process_task` at `:823`). Mirror of vendor's
+    `submit_post_process_to_pool` (`chunk_fetcher.rs:836`,
+    `run_post_process_task` at `:870`). Mirror of vendor's
     `queueChunkForPostProcessing` (GzipChunkFetcher.hpp:579-582). The
-    consumer drains FIFO via `drain_one_pending`. Open subitem: vendor
-    submits with priority -1 (`submitTaskWithHighPriority` at
-    BlockFetcher.hpp:606-611); gzippy's `ThreadPool::submit` has no
-    priority queue, so the apply-window task competes equally with
-    decode tasks. Documented behavioral deviation.
+    consumer drains FIFO via `drain_one_pending`. **Priority -1**:
+    `thread_pool.submit(..., /* priority */ -1)` (chunk_fetcher.rs:836)
+    matches vendor's `submitTaskWithHighPriority` semantic exactly via
+    gzippy's `ThreadPool` priority queue (`thread_pool.rs:138`'s
+    `BTreeMap<i32, VecDeque<Task>>`, mirror of vendor's
+    `std::map<int, deque<...>>` at ThreadPool.hpp:237). Test
+    `lower_priority_runs_first` (`thread_pool.rs:546`) locks this in.
 11. ✅ **Per-subchunk window publishing into a `BlockMap`-indexed lookup**
     — `populate_subchunk_windows` runs in prod (chunk_fetcher.rs:752),
     windows are inserted into `WindowMap` at chunk_fetcher.rs:769-776,
