@@ -61,17 +61,40 @@ BANDS: list[tuple[str, list[re.Pattern]]] = [
     (
         "isal_inflate",
         [
+            # ISA-L's actual leaf functions seen on neurotic perf runs.
+            re.compile(r"\bloop_block\b", re.IGNORECASE),
+            re.compile(r"\bdecode_len_dist\b", re.IGNORECASE),
+            re.compile(r"\bdecode_huffman_code_block\b", re.IGNORECASE),
+            re.compile(r"\bmake_inflate_huff_code_lit_len\b", re.IGNORECASE),
+            re.compile(r"\blarge_byte_copy\b", re.IGNORECASE),
+            re.compile(r"\bdeflate_decompress_bmi2\b", re.IGNORECASE),
             re.compile(r"isal_inflate", re.IGNORECASE),
             re.compile(r"decode_huffman", re.IGNORECASE),
             re.compile(r"\bdecode_lz77_block\b", re.IGNORECASE),
+            # rapidgzip's own pure-C++ deflate decoder is the rapidgzip
+            # equivalent of "the inner inflate engine" — counted here so
+            # the band represents "time spent in the inner inflate engine"
+            # regardless of whether the engine is ISA-L's asm or vendor's
+            # template code.
+            re.compile(r"deflate::Block<.*>::read", re.IGNORECASE),
+            re.compile(r"deflate::Block.*::readInternal", re.IGNORECASE),
         ],
     ),
     (
-        "memcpy_refill",
+        "kernel_pagefault",
         [
-            re.compile(r"\b(?:__)?(?:memcpy|memmove|bcopy)\b", re.IGNORECASE),
-            re.compile(r"refillBuffer|refill_buffer", re.IGNORECASE),
-            re.compile(r"copy_nonoverlapping", re.IGNORECASE),
+            # 24% of gzippy time on silesia is in fresh-page allocation
+            # via the page-fault handler, vs ~4% in rapidgzip. This is
+            # the rpmalloc-vs-system-allocator divergence vendor has.
+            re.compile(r"asm_exc_page_fault|exc_page_fault", re.IGNORECASE),
+            re.compile(r"do_user_addr_fault|do_anonymous_page", re.IGNORECASE),
+            re.compile(r"handle_mm_fault|__handle_mm_fault", re.IGNORECASE),
+            re.compile(r"clear_page_erms|clear_page_orig", re.IGNORECASE),
+            re.compile(r"alloc_pages|__alloc_(?:frozen_)?pages|get_page_from_freelist", re.IGNORECASE),
+            re.compile(r"vma_alloc_folio|vma_alloc_anon_folio", re.IGNORECASE),
+            re.compile(r"do_wp_page|do_fault\b", re.IGNORECASE),
+            re.compile(r"__rmqueue_pcplist|free_unref_page", re.IGNORECASE),
+            re.compile(r"unmap_(?:page_range|vmas|single_vma)|__pmd_alloc|__pte_alloc", re.IGNORECASE),
         ],
     ),
     (
@@ -80,14 +103,28 @@ BANDS: list[tuple[str, list[re.Pattern]]] = [
             re.compile(r"_int_(?:malloc|free|realloc)", re.IGNORECASE),
             re.compile(r"tcache_(?:get|put)", re.IGNORECASE),
             re.compile(r"\b(?:malloc|free|calloc|realloc)\b", re.IGNORECASE),
-            re.compile(r"alloc::raw_vec|alloc::alloc|Box::new", re.IGNORECASE),
+            re.compile(r"alloc::raw_vec|alloc::alloc|Box::new|Box::from", re.IGNORECASE),
             re.compile(r"je_malloc|rp_malloc|mi_malloc", re.IGNORECASE),
             re.compile(r"sys_alloc|posix_memalign", re.IGNORECASE),
+            re.compile(r"kmem_cache_alloc|kmalloc_caches|__kmem_cache_alloc", re.IGNORECASE),
+        ],
+    ),
+    (
+        "memcpy_refill",
+        [
+            re.compile(r"\b(?:__)?(?:memcpy|memmove|bcopy)(?:_avx)?\b", re.IGNORECASE),
+            re.compile(r"refillBuffer|refill_buffer", re.IGNORECASE),
+            re.compile(r"copy_nonoverlapping", re.IGNORECASE),
+            re.compile(r"_copy_to_iter|copy_user_enhanced", re.IGNORECASE),
         ],
     ),
     (
         "marker_apply",
         [
+            # Vendor `DecodedData::applyWindow` is the marker-resolution
+            # hot loop. gzippy's equivalent is `replace_markers` / the
+            # `apply_window` driver. Both go here.
+            re.compile(r"DecodedData::applyWindow", re.IGNORECASE),
             re.compile(r"apply_window|replace_markers|MapMarkers", re.IGNORECASE),
             re.compile(r"data_with_markers", re.IGNORECASE),
         ],
@@ -103,7 +140,9 @@ BANDS: list[tuple[str, list[re.Pattern]]] = [
     (
         "crc32",
         [
-            re.compile(r"\bcrc32\b", re.IGNORECASE),
+            re.compile(r"crc32fast::specialized::pclmulqdq", re.IGNORECASE),
+            re.compile(r"crc32_gzip_refl_by8|crc32_x86_vpclmulqdq", re.IGNORECASE),
+            re.compile(r"\bcrc32\b|crc32_pclmul", re.IGNORECASE),
             re.compile(r"CRC32Calculator", re.IGNORECASE),
         ],
     ),
@@ -115,6 +154,7 @@ BANDS: list[tuple[str, list[re.Pattern]]] = [
             re.compile(r"parker|park_timeout|unpark", re.IGNORECASE),
             re.compile(r"condvar|cv_wait|cv_signal", re.IGNORECASE),
             re.compile(r"crossbeam|mpsc", re.IGNORECASE),
+            re.compile(r"futex_(?:wait|wake)|do_futex", re.IGNORECASE),
         ],
     ),
     (
@@ -122,6 +162,8 @@ BANDS: list[tuple[str, list[re.Pattern]]] = [
         [
             re.compile(r"BitReader|bit_reader", re.IGNORECASE),
             re.compile(r"inflatePrime|inflate_prime", re.IGNORECASE),
+            # vendor's peek/read helpers are the bit-reader hot path
+            re.compile(r"::peek2?\b|::read<unsigned long>", re.IGNORECASE),
         ],
     ),
     (
@@ -131,8 +173,12 @@ BANDS: list[tuple[str, list[re.Pattern]]] = [
             re.compile(r"ParallelGzipReader|parallel_gzip_reader", re.IGNORECASE),
             re.compile(r"decodeChunkWithRapidgzip|decode_chunk_with_window", re.IGNORECASE),
             re.compile(r"decodeChunkWithInflateWrapper|decode_chunk_with_inflate_wrapper", re.IGNORECASE),
+            re.compile(r"finish_decode_chunk_with_inexact_offset", re.IGNORECASE),
+            re.compile(r"submit_decode_to_pool|submit_post_process_to_pool", re.IGNORECASE),
             re.compile(r"BlockFetcher|block_fetcher", re.IGNORECASE),
             re.compile(r"WindowMap|window_map", re.IGNORECASE),
+            re.compile(r"gzippy::decompress::parallel::", re.IGNORECASE),
+            re.compile(r"gzippy::decompress::io::|gzippy::decompress::format", re.IGNORECASE),
         ],
     ),
     (
@@ -141,6 +187,28 @@ BANDS: list[tuple[str, list[re.Pattern]]] = [
             re.compile(r"\b(?:__)?(?:read|pread|lseek|fstat|open|close)\b", re.IGNORECASE),
             re.compile(r"\bmmap\b|\bmunmap\b", re.IGNORECASE),
             re.compile(r"std::fs::|std::io::|BufReader|BufWriter", re.IGNORECASE),
+            re.compile(r"vfs_(?:read|write)|filemap_map_pages|do_filp_open", re.IGNORECASE),
+        ],
+    ),
+    (
+        "scan_detect",
+        [
+            # gzippy's multi-member/BGZF detection scan via memchr — runs
+            # at startup over the whole compressed input. Visible at
+            # ~3% of total on silesia.
+            re.compile(r"memchr::arch::|memchr::memchr", re.IGNORECASE),
+            re.compile(r"is_likely_multi_member|has_bgzf_markers", re.IGNORECASE),
+        ],
+    ),
+    (
+        "unresolved",
+        [
+            # inferno-collapse-perf emits "..@N.end" for samples whose
+            # stack walk failed past frame N. Track them as a band so we
+            # see how much of the profile is unsamplable due to missing
+            # frame pointers / DWARF.
+            re.compile(r"^\.\.@\d+\.end$"),
+            re.compile(r"^\[unknown\]$"),
         ],
     ),
 ]
