@@ -522,12 +522,39 @@ fn consumer_loop<W: std::io::Write>(
                 // Vendor GzipChunkFetcher.hpp:646-648 — accept the chunk
                 // only if `matchesEncodedOffset(blockOffset)`. If not,
                 // discard and dispatch on-demand at the real offset.
-                if arc.matches_encoded_offset(next_block_offset) {
+                //
+                // **gzippy-specific safety guard** — the speculative
+                // slow path now publishes vendor-faithful metadata
+                // (`encoded_offset = offset.first`, `max =
+                // offset.second`, decode_or_iterate above). Vendor
+                // safely uses a `matchesEncodedOffset` range hit
+                // because chunk_N.actual_end == chunk_{N+1}.offset.second
+                // by construction (chain invariant — fast-path
+                // exactUntilOffset = prefetch's offset.second). gzippy
+                // doesn't yet enforce that chain, so a `blockOffset`
+                // strictly inside (encoded_offset, max) would shift
+                // the chunk's claimed range past where its data
+                // actually starts → missing decoded bytes for
+                // `[blockOffset, max)` → output corruption.
+                //
+                // Restrict the trim to the two boundary cases that
+                // are safe without the chain invariant:
+                //   - blockOffset == encoded_offset_bits → no trim,
+                //     chunk's data starts exactly here (chunk was
+                //     decoded at offset.first, e.g. partition seed is
+                //     a valid block boundary that wasn't overshot)
+                //   - blockOffset == max_encoded_offset_bits → no
+                //     trim, chunk's data starts exactly here (the
+                //     slow path's offset.second handoff)
+                let exact_match = arc.encoded_offset_bits == next_block_offset
+                    || arc.max_encoded_offset_bits == next_block_offset;
+                if arc.matches_encoded_offset(next_block_offset) && exact_match {
                     chunk_arc_from_partition = Some(arc);
                 }
-                // If !matches, the Arc is dropped here (vendor "throws
-                // away" the partition-keyed result and re-issues at real
-                // offset below — line 654). Same for Some(Err(...)) —
+                // If !matches OR the safety guard rejected, the Arc
+                // is dropped here (vendor "throws away" the
+                // partition-keyed result and re-issues at real offset
+                // below — line 654). Same for Some(Err(...)) —
                 // vendor's `catch ( const NoBlockInRange& )` at
                 // GzipChunkFetcher.hpp:604-609 silently discards
                 // prefetch failures.
@@ -1075,13 +1102,69 @@ fn decode_or_iterate(
         let chunk_end = (chunk_begin + CHUNK_SIZE_BITS).min(max_end);
         let candidates = finder.find_blocks(chunk_begin, chunk_end);
         if let Some(first) = candidates.into_iter().find(|c| c.bit_offset >= chunk_begin) {
-            return finish_decode_chunk_with_inexact_offset(
+            let mut chunk = finish_decode_chunk_with_inexact_offset(
                 input,
                 first.bit_offset,
                 until_bit,
                 &[],
                 configuration,
-            );
+            )?;
+            // Vendor-faithful metadata for speculative chunks
+            // (GzipChunk.hpp:716-722):
+            //
+            //     bitReader.seekTo( offset.second );  // actual boundary
+            //     auto result = decodeChunkWithRapidgzip(...);
+            //     result.encodedOffsetInBits = offset.first;     // partition seed (claimed start)
+            //     result.maxEncodedOffsetInBits = offset.second; // actual boundary (upper bound)
+            //     result.encodedSizeInBits = result.encodedEndOffsetInBits - result.encodedOffsetInBits;
+            //
+            // Enables vendor's `matchesEncodedOffset` to return TRUE
+            // for any `blockOffset` in `[offset.first, offset.second]`,
+            // so a speculative prefetch dispatched at the partition
+            // seed can be accepted for slightly-offset consumer
+            // requests via `setEncodedOffset` trim.
+            //
+            // Previously gzippy dropped this fabrication (per
+            // chunk_fetcher.rs comment block above) because the
+            // chunk's data starts at offset.second, not offset.first
+            // — there are no decoded bytes for bits
+            // `[offset.first, offset.second)`. Vendor's invariant that
+            // chunk_N.actual_end == chunk_{N+1}.offset.second prevents
+            // the consumer from ever requesting a blockOffset inside
+            // that gap. gzippy doesn't enforce the chain invariant yet,
+            // so we re-introduce vendor's metadata BUT enforce a
+            // conservative consumer-side check: the speculative-trim
+            // path only fires when `blockOffset == max_encoded_offset_bits`
+            // (perfect handoff, no trim needed) or `blockOffset ==
+            // encoded_offset_bits` (exact-match at the partition seed).
+            // See chunk_fetcher.rs::consumer_loop's `try_take_prefetched`
+            // success branch.
+            if start_bit < first.bit_offset {
+                let encoded_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+                // Capture the upper bound of the first subchunk BEFORE
+                // we mutate it. Mirror of vendor's
+                // `ChunkData::setEncodedOffset` line 624-627:
+                //
+                //     const auto nextSubchunk = std::next(m_subchunks.begin());
+                //     const auto nextOffset = nextSubchunk == m_subchunks.end()
+                //                             ? encodedEndOffsetInBits
+                //                             : nextSubchunk->encodedOffset;
+                //     m_subchunks.front().encodedOffset = offset;
+                //     m_subchunks.front().encodedSize = nextOffset - offset;
+                let first_sc_upper = chunk
+                    .subchunks
+                    .get(1)
+                    .map(|sc| sc.encoded_offset_bits)
+                    .unwrap_or(encoded_end);
+                chunk.encoded_offset_bits = start_bit;
+                chunk.encoded_size_bits = encoded_end - start_bit;
+                chunk.max_encoded_offset_bits = first.bit_offset;
+                if let Some(first_sc) = chunk.subchunks.first_mut() {
+                    first_sc.encoded_offset_bits = start_bit;
+                    first_sc.encoded_size_bits = first_sc_upper - start_bit;
+                }
+            }
+            return Ok(chunk);
         }
         chunk_begin = chunk_end;
     }
