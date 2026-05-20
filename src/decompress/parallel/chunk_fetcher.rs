@@ -1595,6 +1595,31 @@ mod tests {
         );
     }
 
+    /// Regression for neurotic `make profile-decompression-x86_64` (64 MiB
+    /// silesia → gzip -9, T=2). Skipped when benchmark_data is absent.
+    #[test]
+    fn drive_silesia_head_gzip9_t2() {
+        let path = std::path::Path::new("benchmark_data/silesia-large.bin");
+        if !path.exists() {
+            return;
+        }
+        let raw = std::fs::read(path).expect("read silesia");
+        let head_len = (64 * 1024 * 1024).min(raw.len());
+        let head = &raw[..head_len];
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(9));
+        enc.write_all(head).expect("compress");
+        let deflate = enc.finish().expect("finish");
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 4 * 1024 * 1024,
+            max_decoded_chunk_size: 20 * 4 * 1024 * 1024,
+            crc32_enabled: true,
+        };
+        let mut out = Vec::new();
+        let (_crc, size) = drive(&deflate, &mut out, 2, cfg).expect("drive silesia T=2");
+        assert_eq!(size, head.len());
+        assert_eq!(out, head);
+    }
+
     #[test]
     fn drive_round_trips_60mb_level9_prod_split() {
         // ~60 MB payload at -9 compresses to ~40 MB → ~10 chunks at the
