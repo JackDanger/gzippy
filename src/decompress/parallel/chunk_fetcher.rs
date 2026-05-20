@@ -1599,8 +1599,8 @@ mod tests {
     /// silesia → **gzip(1) -9 -c**, T=2). Skipped when benchmark_data is absent.
     #[test]
     fn drive_silesia_head_gzip9_t2() {
-        use crate::decompress::parallel::gzip_format;
         use crate::decompress::parallel::sm_driver::read_parallel_sm;
+        use std::io::Read;
 
         let path = std::path::Path::new("benchmark_data/silesia-large.bin");
         if !path.exists() {
@@ -1617,8 +1617,13 @@ mod tests {
             .spawn()
             .expect("spawn gzip");
         std::io::Write::write_all(child.stdin.as_mut().expect("stdin"), head).expect("write");
-        let gz =
-            std::io::read_to_end(child.stdout.as_mut().expect("stdout")).expect("read gzip stdout");
+        let mut gz = Vec::new();
+        child
+            .stdout
+            .as_mut()
+            .expect("stdout")
+            .read_to_end(&mut gz)
+            .expect("read gzip stdout");
         let _ = child.wait();
 
         let chunk_size = 4 * 1024 * 1024;
