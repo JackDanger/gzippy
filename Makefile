@@ -27,7 +27,8 @@ SYSTEM_GZIP := $(shell which gzip)
 # Set APPLE_GZIP when it differs from GZIP_BIN so bench targets compare both
 APPLE_GZIP := $(if $(filter Darwin,$(shell uname)),/usr/bin/gzip,)
 
-.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship ship-local route-check oracle-vs-c bench-sm profile-decompression-x86_64
+.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship ship-local route-check oracle-vs-c bench-sm \
+	profile-single-member-decompression-x86_64 profile-single-member-decompression-arm64 profile-decompression-x86_64
 
 # =============================================================================
 # Default target: quick benchmark for fast iteration (< 30 seconds)
@@ -147,19 +148,17 @@ route-check: $(GZIPPY_BIN) $(PIGZ_BIN)
 	@python3 scripts/route_check.py $(GZIPPY_BIN) $(PIGZ_BIN)
 
 # =============================================================================
-# profile-decompression-x86_64: fastest x86_64 decompression CORRECTNESS check.
-#
-# Builds the current branch on the homelab x86_64 box, makes one gzip(1)-CLI
-# fixture, decodes it at a sweep of thread counts, and FAILS if any thread
-# count produces wrong bytes. ~35s. On FAIL the script reruns one decode with
-# GZIPPY_DEBUG=1 and prints `[parallel_sm] driver error: …` (FetchError detail).
-#
-# All SSH / build / fixture complexity lives in the script; this target is
-# a one-liner so a user or LLM can run it and read PASS/FAIL on stdout.
-#   Override remote: GZIPPY_REMOTE_SSH='-J jump root@host' make profile-decompression-x86_64
+# Single-member decompression profiling (correctness gate + CPU/alloc artifacts)
 # =============================================================================
-profile-decompression-x86_64:
-	@bash scripts/profile_decompression_x86_64.sh
+profile-single-member-decompression-x86_64:
+	@chmod +x scripts/profile_single_member_decompression_x86_64.sh
+	@bash scripts/profile_single_member_decompression_x86_64.sh
+
+profile-single-member-decompression-arm64:
+	@chmod +x scripts/profile_single_member_decompression_arm64.sh
+	@bash scripts/profile_single_member_decompression_arm64.sh
+
+profile-decompression-x86_64: profile-single-member-decompression-x86_64
 
 # =============================================================================
 # Ship: the "are we good?" gate. Always tests the *current branch*.
@@ -732,7 +731,9 @@ help:
 		'  make              Build and run quick benchmark (< 30 seconds)' \
 		'  make quick        Same as above' \
 		'  make route-check  Show decompression routing + timing for T1/T4 x 1MB/10MB' \
-		'  make profile-decompression-x86_64  Homelab x86 parallel-SM correctness (~35s)' \
+		'  make profile-single-member-decompression-x86_64  Homelab: SM decode + perf' \
+		'  make profile-single-member-decompression-arm64   Local M1: SM libdeflate + samply' \
+		'  make profile-decompression-x86_64              Alias for x86_64 target above' \
 		'  make build        Build gzippy and ungzippy' \
 		'  make deps         Build gzip and pigz from submodules' \
 		'  make validate     Run validation suite (adaptive 3-17 trials)' \
