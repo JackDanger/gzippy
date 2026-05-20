@@ -18,7 +18,7 @@ Byte-perfect decode of GNU `gzip -9` single-member fixtures on x86 at
 |------|--------|
 | **Prefetch empty-dict bug** (`4909ac7`) | **Fixed** — `da84760` / `471a743` restore `decode_chunk_marker_bootstrap_then_isal`; `isal_huffman` wired in `mod.rs` |
 | **T=1, T=2** on profile fixture | **Reliable PASS** (fresh x86 build) |
-| **T≥3** on same fixture | **Flaky FAIL** — `parallel SM: CRC32 mismatch` (~33% pass at T=4) |
+| **T≥3** on same fixture | **PASS** (2026-05-20: consumer-only publish + `with_until_bits`; profile 10×/T) |
 | **Window publish race** | **Open** — same root cause as earlier “Bug A” / “Bug C” labels |
 | **“Consumer-only publish”** (`35ed3fb` / `c31d50f`) | **Did not green profile** — see Phase 2; workers were narrowed but post-process still publishes on the pool |
 
