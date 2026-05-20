@@ -1596,9 +1596,12 @@ mod tests {
     }
 
     /// Regression for neurotic `make profile-decompression-x86_64` (64 MiB
-    /// silesia → gzip -9, T=2). Skipped when benchmark_data is absent.
+    /// silesia → **gzip(1) -9 -c**, T=2). Skipped when benchmark_data is absent.
     #[test]
     fn drive_silesia_head_gzip9_t2() {
+        use crate::decompress::parallel::gzip_format;
+        use crate::decompress::parallel::sm_driver::read_parallel_sm;
+
         let path = std::path::Path::new("benchmark_data/silesia-large.bin");
         if !path.exists() {
             return;
@@ -1606,17 +1609,22 @@ mod tests {
         let raw = std::fs::read(path).expect("read silesia");
         let head_len = (64 * 1024 * 1024).min(raw.len());
         let head = &raw[..head_len];
-        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(9));
-        enc.write_all(head).expect("compress");
-        let deflate = enc.finish().expect("finish");
-        let cfg = ChunkConfiguration {
-            split_chunk_size: 4 * 1024 * 1024,
-            max_decoded_chunk_size: 20 * 4 * 1024 * 1024,
-            crc32_enabled: true,
-        };
+
+        let mut child = std::process::Command::new("gzip")
+            .args(["-9", "-c", "-n"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn gzip");
+        std::io::Write::write_all(child.stdin.as_mut().expect("stdin"), head).expect("write");
+        let gz =
+            std::io::read_to_end(child.stdout.as_mut().expect("stdout")).expect("read gzip stdout");
+        let _ = child.wait();
+
+        let chunk_size = 4 * 1024 * 1024;
         let mut out = Vec::new();
-        let (_crc, size) = drive(&deflate, &mut out, 2, cfg).expect("drive silesia T=2");
-        assert_eq!(size, head.len());
+        let result = read_parallel_sm(&gz, &mut out, 2, chunk_size);
+        assert_eq!(result.expect("read_parallel_sm T=2").total_size, head.len());
         assert_eq!(out, head);
     }
 
