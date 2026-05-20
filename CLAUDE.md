@@ -72,9 +72,13 @@ Input → decompress::mod: decompress_gzip_libdeflate
                fast_marker_inflate producing Vec<u16> with markers for
                cross-chunk back-refs. Phase 2 sequential resolves markers
                via SIMD replace_markers using each predecessor's last
-               32 KB as window, converts u16→u8. Phase 3 verifies CRC and
-               size against gzip trailer BEFORE writing — never partial
-               output on Err. Counter `MARKER_PIPELINE_RUNS` proves
+               32 KB as window, converts u16→u8. Output STREAMS: bytes
+               flow to the writer as each chunk resolves; CRC32 + ISIZE
+               are verified against the gzip trailer AFTER the final
+               chunk is written, so a mismatch is a terminal Err with
+               partial output already on the writer (same as gzip(1) —
+               for file output `io::decompress_file` then deletes the
+               dest file). Counter `MARKER_PIPELINE_RUNS` proves
                production routing called us; see deletion-trap killer
                test in src/tests/routing.rs)
         x86_64 (ISA-L available)        → isal_decompress::decompress_gzip_stream
@@ -156,9 +160,10 @@ parallel design. Phase 1 decodes each chunk with an empty dict in parallel
 each predecessor's phase-1 last 32 KB as a *speculative* dict — almost always
 correct on real data (error propagation requires ≥ chunk_size/32 KB consecutive
 near-max-distance back-references). Phase 3 combines per-chunk CRC32s (computed
-in phase 2 workers via `crc32fast::Hasher::combine`), verifies against the gzip
-trailer, then writes — so a failed speculation never produces partial output
-to the writer. Speedup ≈ T/2; ties sequential at T=2 (CI), scales to 4× at T=8.
+in phase 2 workers via `crc32fast::Hasher::combine`) and verifies them against
+the gzip trailer; output streams to the writer as chunks resolve, so a CRC/ISIZE
+mismatch is a terminal Err with partial output already emitted. Speedup ≈ T/2;
+ties sequential at T=2 (CI), scales to 4× at T=8.
 Wired into `decompress::decompress_single_member` behind
 `isal_decompress::is_available() && num_threads > 1 && data.len() > 10 MiB`.
 The old "32 KB prefix correction" plan was wrong: cross-chunk back-references
