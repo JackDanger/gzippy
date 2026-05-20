@@ -783,7 +783,12 @@ fn consumer_loop<W: std::io::Write>(
             // miss — so a presence check is free. Gzippy's `get`
             // currently still allocates `Arc<[u8; 32768]>` on hit;
             // `contains` skips that path entirely.
-            while !window_map.contains(next_block_offset) {
+            // Vendor `waitForReplacedMarkers` (GzipChunkFetcher.hpp:544):
+            // `m_windowMap->get(chunkData->encodedOffsetInBits)` — the
+            // chunk's own start offset, which equals the predecessor's
+            // published tail key when the chain is correct.
+            let window_key = chunk.encoded_offset_bits;
+            while !window_map.contains(window_key) {
                 if pending.is_empty() {
                     // No post-process can produce the missing window —
                     // bubble the same error vendor would (a logic_error
@@ -801,20 +806,9 @@ fn consumer_loop<W: std::io::Write>(
             }
             // Vendor `GzipChunkFetcher.hpp:334` —
             //   `auto sharedLastWindow = m_windowMap->get( *nextBlockOffset );`
-            // Always look up the predecessor's window at the consumer's
-            // expected start (`next_block_offset`), NOT at the chunk's
-            // post-finalize `max_acceptable_start_bit`. The two coincide
-            // ONLY after `set_encoded_offset(next_block_offset)` re-
-            // anchors max → next_block_offset; in the "chunk's encoded
-            // offset already matches next_block_offset" branch above
-            // (line 487-489) we SKIP set_encoded_offset, and max stays
-            // at the post-finalize chunk-end value. Looking it up there
-            // would land on the position THIS chunk's own apply_window
-            // will publish, not the predecessor's — guaranteed miss.
-            // Pre-fix: this branch was unreachable because bootstrap
-            // always failed; once the marker decoder works, every
-            // partition-aligned slow-path chunk took the wrong key.
-            let window_key = next_block_offset;
+            // in `processNextChunk` uses the consumer's next block seed;
+            // the marker-replace wait above uses `encodedOffsetInBits`
+            // per `waitForReplacedMarkers` (line 544).
             let window = window_map.get(window_key).ok_or(FetchError::Decode(
                 ChunkDecodeError::ExactStopMissed {
                     requested: window_key,
