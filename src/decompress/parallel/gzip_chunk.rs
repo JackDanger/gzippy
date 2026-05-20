@@ -70,8 +70,9 @@ fn decode_chunk_isal_inexact_raw(
         | isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER
         | isal_raw::ISAL_STOPPING_POINT_END_OF_STREAM;
 
-    let until_bits = until_bits.min(input.len() * 8);
-    let max_bits = until_bits.saturating_sub(bit_offset);
+    let stop_hint = until_bits.min(input.len() * 8);
+    let read_cap = input.len() * 8;
+    let max_bits = read_cap.saturating_sub(bit_offset);
     if bit_skip > 0 {
         state.read_in = (input[byte_idx] as u64) >> bit_skip;
         state.read_in_length = (8 - bit_skip) as i32;
@@ -164,7 +165,7 @@ fn decode_chunk_isal_inexact_raw(
         } else if state.stopped_at == isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER {
             let not_final = state.bfinal == 0;
             let not_fixed = state.btype != 1;
-            if last_eob_pos >= until_bits && not_final && not_fixed {
+            if last_eob_pos >= stop_hint && not_final && not_fixed {
                 chunk_end_override = Some(last_eob_pos);
                 break;
             }
@@ -198,15 +199,147 @@ pub fn decode_chunk_isal_inexact(
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    // Fast-path cross-chunk handoffs use one decoder implementation so the
-    // predecessor tail window matches how the successor primes ISA-L.
-    decode_chunk_isal_inexact_raw(
-        input,
-        encoded_offset_bits,
-        until_bits,
-        initial_window,
-        configuration,
-    )
+    let t_decode = std::time::Instant::now();
+    // `until_bits` is an inexact stop *hint* (vendor `untilOffset`), not a hard
+    // read cap. Capping `refill_buffer` at a partition guess stops mid-block
+    // (e.g. silesia gzip-9 at 33554427 vs hint 33554432 → InvalidBlock on resume).
+    let read_cap = input.len() * 8;
+    let mut wrapper = IsalInflateWrapper::with_until_bits(input, encoded_offset_bits, read_cap)?;
+    wrapper.set_window(initial_window)?;
+    wrapper.set_stopping_points(
+        StoppingPoints::END_OF_BLOCK
+            | StoppingPoints::END_OF_BLOCK_HEADER
+            | StoppingPoints::END_OF_STREAM_HEADER
+            | StoppingPoints::END_OF_STREAM,
+    );
+
+    let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
+    let mut stopping_point_reached = false;
+    let mut last_end_bit = encoded_offset_bits;
+    let mut last_eob_pos = encoded_offset_bits;
+    let mut already_decoded: usize = 0;
+
+    while !stopping_point_reached {
+        let mut buffer: Vec<u8> = Vec::with_capacity(ALLOCATION_CHUNK_SIZE);
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            buffer.set_len(ALLOCATION_CHUNK_SIZE)
+        };
+        let mut n_bytes_read: usize = 0;
+        let mut last_per_call: usize = 0;
+        let mut last_stopped_at = StoppingPoints::NONE;
+        let mut last_finished = false;
+        let mut end_of_stream_hit = false;
+
+        while n_bytes_read < buffer.len() && !stopping_point_reached {
+            let r = wrapper.read_stream(&mut buffer[n_bytes_read..])?;
+            last_per_call = r.bytes_written;
+            n_bytes_read += last_per_call;
+            chunk.note_inner_decoded_bytes(last_per_call);
+
+            last_stopped_at = r.stopped_at;
+            last_finished = r.finished;
+            last_end_bit = r.bit_position;
+
+            if r.finished {
+                break;
+            }
+
+            match r.stopped_at {
+                sp if sp == StoppingPoints::END_OF_STREAM => {
+                    end_of_stream_hit = true;
+                    break;
+                }
+                sp if sp == StoppingPoints::END_OF_STREAM_HEADER => {
+                    chunk.append_block_boundary_at(r.bit_position, already_decoded + n_bytes_read);
+                }
+                sp if sp == StoppingPoints::END_OF_BLOCK => {
+                    if !wrapper.is_final_block() {
+                        chunk.append_block_boundary_at(
+                            r.bit_position,
+                            already_decoded + n_bytes_read,
+                        );
+                        last_eob_pos = r.bit_position;
+                    }
+                }
+                sp if sp == StoppingPoints::END_OF_BLOCK_HEADER => {
+                    let not_final = !wrapper.is_final_block();
+                    let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
+                    if last_eob_pos >= until_bits && not_final && not_fixed {
+                        last_end_bit = last_eob_pos;
+                        stopping_point_reached = true;
+                    }
+                }
+                sp if sp == StoppingPoints::NONE => {
+                    if last_per_call == 0 {
+                        stopping_point_reached = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        already_decoded += n_bytes_read;
+        buffer.truncate(n_bytes_read);
+        if !buffer.is_empty() {
+            chunk.append_owned_buffer(buffer);
+        }
+
+        if end_of_stream_hit {
+            let (crc32, isize_field) = wrapper.read_footer_at_current()?;
+            let footer_end_bits = wrapper.tell_compressed();
+            chunk.append_footer(crc32, isize_field, footer_end_bits);
+
+            let remaining = wrapper.remaining_input();
+            if remaining.is_empty() {
+                last_end_bit = footer_end_bits;
+                break;
+            }
+            let (_hdr, hdr_size) = crate::decompress::parallel::gzip_format::read_header(remaining)
+                .map_err(|e| {
+                    ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("multi-stream gzip header at bit {footer_end_bits}: {e}"),
+                    ))
+                })?;
+            wrapper.advance_input(hdr_size);
+            wrapper.reset_for_next_stream();
+            wrapper.set_stopping_points(
+                StoppingPoints::END_OF_BLOCK
+                    | StoppingPoints::END_OF_BLOCK_HEADER
+                    | StoppingPoints::END_OF_STREAM_HEADER
+                    | StoppingPoints::END_OF_STREAM,
+            );
+            wrapper.set_window(&[])?;
+            last_end_bit = wrapper.tell_compressed();
+            last_eob_pos = last_end_bit;
+            chunk.append_block_boundary_at(last_end_bit, already_decoded);
+            continue;
+        }
+
+        if last_finished {
+            break;
+        }
+        if last_stopped_at == StoppingPoints::NONE && last_per_call == 0 {
+            break;
+        }
+    }
+
+    chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+    // When the reader hits `until_bits` (refill cap) without an inexact
+    // stop, `tell_compressed()` can land mid-block. Successor chunks must
+    // resume at the last END_OF_BLOCK position (pre-header), not the cap.
+    let final_bit = if stopping_point_reached {
+        last_end_bit
+    } else if last_eob_pos > encoded_offset_bits {
+        // Hit the until read cap without an inexact header-stop — finalize at
+        // the last pre-header EOB, never at a mid-block bit cursor.
+        last_eob_pos
+    } else {
+        wrapper.tell_compressed()
+    };
+    chunk.finalize(final_bit);
+    Ok(chunk)
 }
 
 /// Marker-bootstrap then ISA-L for speculative prefetch (no predecessor window).
@@ -295,8 +428,9 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     state.points_to_stop_at = isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK
         | isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER;
 
-    let until_bits = until_bits.min(input.len() * 8);
-    let max_bits = until_bits.saturating_sub(bit_offset);
+    let stop_hint = until_bits.min(input.len() * 8);
+    let read_cap = input.len() * 8;
+    let max_bits = read_cap.saturating_sub(bit_offset);
     if bit_skip > 0 {
         state.read_in = (input[byte_idx] as u64) >> bit_skip;
         state.read_in_length = (8 - bit_skip) as i32;
@@ -428,7 +562,7 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
             // last_eob_pos. btype tells us its type.
             let not_final = state.bfinal == 0;
             let not_fixed = state.btype != 1;
-            if last_eob_pos >= until_bits && not_final && not_fixed {
+            if last_eob_pos >= stop_hint && not_final && not_fixed {
                 chunk_end_override = Some(last_eob_pos);
                 break;
             }
@@ -771,5 +905,81 @@ mod tests {
         assert!(chunk.decoded_size() < payload.len());
         let chunk_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
         assert!(chunk_end >= until_bits);
+    }
+
+    /// Neurotic profile fixture: gzip(1) -9 on 64 MiB silesia head. Chunk 0
+    /// stops at a non-byte-aligned bit; chunk 1 must resume with the published
+    /// 32 KiB window. Fails with `InvalidBlock` when handoff is wrong.
+    #[test]
+    fn cross_chunk_resume_silesia_gzip9_chunk0_handoff() {
+        use std::io::Read;
+
+        let gz = if std::path::Path::new("/tmp/silesia64.gz").exists() {
+            std::fs::read("/tmp/silesia64.gz").expect("read cached gzip")
+        } else {
+            let path = std::path::Path::new("benchmark_data/silesia-large.bin");
+            if !path.exists() {
+                return;
+            }
+            let raw = std::fs::read(path).expect("read silesia");
+            let head_len = (64 * 1024 * 1024).min(raw.len());
+            let head = &raw[..head_len];
+            let mut child = std::process::Command::new("gzip")
+                .args(["-9", "-c", "-n"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn gzip");
+            std::io::Write::write_all(child.stdin.as_mut().expect("stdin"), head).expect("write");
+            let mut gz = Vec::new();
+            child
+                .stdout
+                .as_mut()
+                .expect("stdout")
+                .read_to_end(&mut gz)
+                .expect("read gzip stdout");
+            let _ = child.wait();
+            gz
+        };
+        let head_len = {
+            let (_hdr, hdr_len) =
+                crate::decompress::parallel::gzip_format::read_header(&gz).expect("gzip hdr");
+            let footer = crate::decompress::parallel::gzip_format::read_footer(&gz, gz.len() - 8)
+                .expect("footer");
+            footer.uncompressed_size as usize
+        };
+
+        let (_hdr, hdr_len) =
+            crate::decompress::parallel::gzip_format::read_header(&gz).expect("gzip hdr");
+        let deflate = &gz[hdr_len..gz.len() - 8];
+
+        let spacing_bits = 4 * 1024 * 1024 * 8;
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 4 * 1024 * 1024,
+            max_decoded_chunk_size: 20 * 4 * 1024 * 1024,
+            crc32_enabled: false,
+        };
+        let zero = [0u8; 32768];
+        let chunk0 =
+            decode_chunk_isal_inexact(&deflate, 0, spacing_bits, &zero, cfg).expect("chunk0");
+        let resume_at = chunk0.encoded_offset_bits + chunk0.encoded_size_bits;
+        assert!(
+            resume_at > 0 && resume_at % 8 != 0,
+            "expected non-zero non-byte-aligned handoff, got {resume_at}"
+        );
+        let tail = chunk0
+            .last_32kib_window()
+            .unwrap_or_else(|| chunk0.get_last_window(&zero));
+
+        crate::backends::inflate_bit::decompress_deflate_from_bit(
+            deflate, resume_at, &tail, head_len,
+        )
+        .unwrap_or_else(|| {
+            panic!("resume at chunk0 end bit {resume_at} must succeed");
+        });
+        let chunk1 =
+            decode_chunk_isal_inexact(deflate, resume_at, resume_at + spacing_bits, &tail, cfg)
+                .expect("chunk1 at chunk0 end");
+        assert!(!chunk1.is_empty());
     }
 }

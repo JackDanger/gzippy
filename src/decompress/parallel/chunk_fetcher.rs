@@ -754,7 +754,9 @@ fn consumer_loop<W: std::io::Write>(
             // alone, which ignores the predecessor chain at stream start.
             if let Some(pred) = window_map.get(chunk.encoded_offset_bits) {
                 let bytes = materialize_window(&pred);
-                let tail = chunk.get_last_window(&bytes);
+                let tail = chunk
+                    .last_32kib_window()
+                    .unwrap_or_else(|| chunk.get_last_window(&bytes));
                 window_map.insert_bytes_with_compression(
                     chunk_end_bit,
                     &tail,
