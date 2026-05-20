@@ -26,19 +26,21 @@
 #   GZIPPY_REMOTE_DIR    repo dir there  default: gzippy
 #   GZIPPY_FIXTURE_MB    raw fixture MiB default: 64
 #   GZIPPY_THREAD_SWEEP  thread counts   default: "1 2 4 8 9 12 16"
+#   GZIPPY_PROFILE_TRIALS decode runs per T (default 10; catches flaky races)
 set -euo pipefail
 
 REMOTE_SSH="${GZIPPY_REMOTE_SSH:--J neurotic root@10.30.0.199}"
 REMOTE_DIR="${GZIPPY_REMOTE_DIR:-gzippy}"
 FIXTURE_MB="${GZIPPY_FIXTURE_MB:-64}"
 THREAD_SWEEP="${GZIPPY_THREAD_SWEEP:-1 2 4 8 9 12 16}"
+PROFILE_TRIALS="${GZIPPY_PROFILE_TRIALS:-10}"
 
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
 echo "=== profile-decompression-x86_64 (fast correctness check) ==="
 echo "branch:   $BRANCH"
 echo "remote:   ssh ${REMOTE_SSH}"
-echo "fixture:  ${FIXTURE_MB} MiB raw  →  gzip -9  →  decode at T={${THREAD_SWEEP}}"
+echo "fixture:  ${FIXTURE_MB} MiB raw  →  gzip -9  →  decode at T={${THREAD_SWEEP}} (${PROFILE_TRIALS} trials/T)"
 echo
 
 echo "--- push $BRANCH so the remote builds exactly local HEAD ---"
@@ -52,7 +54,7 @@ echo
 # The remote half. Single-quoted heredoc — nothing expands locally;
 # the three values it needs arrive as exported env vars on the ssh line.
 ssh ${REMOTE_SSH} \
-    "BRANCH='${BRANCH}' REMOTE_DIR='${REMOTE_DIR}' FIXTURE_MB='${FIXTURE_MB}' THREAD_SWEEP='${THREAD_SWEEP}' bash -s" \
+    "BRANCH='${BRANCH}' REMOTE_DIR='${REMOTE_DIR}' FIXTURE_MB='${FIXTURE_MB}' THREAD_SWEEP='${THREAD_SWEEP}' PROFILE_TRIALS='${PROFILE_TRIALS}' bash -s" \
 <<'REMOTE'
 set -euo pipefail
 cd "$REMOTE_DIR"
@@ -61,10 +63,15 @@ echo "--- sync + build ---"
 git fetch origin "$BRANCH" --quiet
 git reset --hard "origin/$BRANCH" --quiet
 echo "HEAD: $(git rev-parse --short HEAD)  $(git log -1 --format=%s)"
+BUILD_LOG=/tmp/profx86-build.log
 RUSTFLAGS='-C debuginfo=1 -C strip=none -C force-frame-pointers=yes' \
-    cargo build --release --features isal-compression 2>&1 \
-    | grep -E 'Compiling gzippy |Finished|^error' || true
-test -x target/release/gzippy || { echo "BUILD FAILED"; exit 1; }
+    cargo build --release --features isal-compression >"$BUILD_LOG" 2>&1 || {
+    echo "BUILD FAILED"
+    grep -E '^error' "$BUILD_LOG" || tail -20 "$BUILD_LOG"
+    exit 1
+}
+grep -E 'Compiling gzippy |Finished' "$BUILD_LOG" || true
+test -x target/release/gzippy || { echo "BUILD FAILED: no binary"; exit 1; }
 echo
 
 echo "--- fixture (gzip(1) CLI output) ---"
@@ -77,28 +84,36 @@ echo "raw $(stat -c%s "$SRC") bytes  →  gz $(stat -c%s "$FIX") bytes"
 echo "reference md5: $REF"
 echo
 
-echo "--- decode sweep ---"
-printf '%-5s %-34s %s\n' "T" "md5" "result"
+echo "--- decode sweep (${PROFILE_TRIALS} trials per T) ---"
+printf '%-5s %-8s %-34s %s\n' "T" "trial" "md5" "result"
 FAIL=0
 ERR_SEEN=""
 for T in $THREAD_SWEEP; do
-    # Decode to a file. `|| rc=$?` keeps `set -e` from aborting the
-    # whole sweep on a hard decode error — we want every T's result.
-    rc=0
-    ./target/release/gzippy -d -c -p "$T" "$FIX" \
-        > /tmp/profx86-out 2>/tmp/profx86-err-"$T" || rc=$?
-    if [ "$rc" -ne 0 ]; then
-        printf '%-5s %-34s %s\n' "$T" "(decode error rc=$rc)" "ERROR"
+    T_FAIL=0
+    for trial in $(seq 1 "$PROFILE_TRIALS"); do
+        rc=0
+        ./target/release/gzippy -d -c -p "$T" "$FIX" \
+            > /tmp/profx86-out 2>/tmp/profx86-err-"$T"-"$trial" || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            printf '%-5s %-8s %-34s %s\n' "$T" "$trial" "(decode error rc=$rc)" "ERROR"
+            T_FAIL=1
+            ERR_SEEN="$ERR_SEEN $T"
+            continue
+        fi
+        H=$(md5sum < /tmp/profx86-out | cut -d' ' -f1)
+        if [ "$H" = "$REF" ]; then
+            printf '%-5s %-8s %-34s %s\n' "$T" "$trial" "$H" "ok"
+        else
+            printf '%-5s %-8s %-34s %s\n' "$T" "$trial" "$H" "WRONG"
+            T_FAIL=1
+            ERR_SEEN="$ERR_SEEN $T"
+        fi
+    done
+    if [ "$T_FAIL" -ne 0 ]; then
         FAIL=1
-        ERR_SEEN="$ERR_SEEN $T"
-        continue
-    fi
-    H=$(md5sum < /tmp/profx86-out | cut -d' ' -f1)
-    if [ "$H" = "$REF" ]; then
-        printf '%-5s %-34s %s\n' "$T" "$H" "ok"
+        printf '%-5s %-8s %-34s %s\n' "$T" "—" "—" "FAIL (${PROFILE_TRIALS} trials)"
     else
-        printf '%-5s %-34s %s\n' "$T" "$H" "WRONG"
-        FAIL=1
+        printf '%-5s %-8s %-34s %s\n' "$T" "—" "—" "PASS (${PROFILE_TRIALS}/${PROFILE_TRIALS})"
     fi
 done
 echo
@@ -108,7 +123,7 @@ echo
 if [ -n "$ERR_SEEN" ]; then
     FIRST_ERR=$(echo "$ERR_SEEN" | awk '{print $1}')
     echo "--- stderr from first ERROR (T=$FIRST_ERR) ---"
-    cat /tmp/profx86-err-"$FIRST_ERR" || true
+    cat /tmp/profx86-err-"$FIRST_ERR"-1 || true
     echo
 fi
 

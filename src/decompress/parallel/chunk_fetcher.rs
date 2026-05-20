@@ -43,10 +43,10 @@
 //!   the future's receiver. Mirror of BlockFetcher.hpp:554-558.
 //! - Worker decode: `decode_chunk_isal_inexact` (window known or chunk 0) or
 //!   `speculative_decode_find_boundary` → marker bootstrap (prefetch, no window).
-//! - `postProcessChunk` / `applyWindow` → `apply_window` +
-//!   `populate_subchunk_windows`, dispatched on the SAME pool via
-//!   `thread_pool.submit(run_post_process_job, /* priority */ -1)`
-//!   (vendor's `submitTaskWithHighPriority` at BlockFetcher.hpp:606-611).
+//! - `postProcessChunk` / `applyWindow` → `apply_window` on the pool
+//!   (priority −1). **WindowMap publishes stay on the consumer** (vendor
+//!   orchestrator thread): tail before post-process, subchunk windows
+//!   after `apply_window` completes (`appendSubchunksToIndexes`).
 
 #![allow(dead_code)]
 
@@ -744,14 +744,18 @@ fn consumer_loop<W: std::io::Write>(
         // chunk's apply_window. We mirror exactly:
         // `Window = Arc<CompressedVector>` — vendor's
         // `SharedWindow = shared_ptr<const CompressedVector>`
-        // (WindowMap.hpp:24). Materialization to raw bytes happens on
-        // the post-process worker (run_post_process_task) when needed.
+        // (WindowMap.hpp:24). Subchunk windows are published on the
+        // consumer in `drain_one_pending` after post-process returns.
         let predecessor_window_for_postprocess: Option<Window>;
         if chunk.data_with_markers.is_empty() {
             // No markers → apply_window is a no-op. Publish successor window
-            // on the consumer only (vendor post-process model; no worker race).
+            // on the consumer only (vendor queueChunkForPostProcessing:558-575).
             if let Some(tail) = chunk.last_32kib_window() {
-                window_map.insert_bytes(chunk_end_bit, &tail);
+                window_map.insert_bytes_with_compression(
+                    chunk_end_bit,
+                    &tail,
+                    CompressionType::None,
+                );
             }
             predecessor_window_for_postprocess = None;
         } else {
@@ -786,7 +790,14 @@ fn consumer_loop<W: std::io::Write>(
                     // about a missing predecessor window).
                     break;
                 }
-                drain_one_pending(&mut pending, writer, total_crc, total_size, block_fetcher)?;
+                drain_one_pending(
+                    &mut pending,
+                    &window_map,
+                    writer,
+                    total_crc,
+                    total_size,
+                    block_fetcher,
+                )?;
             }
             // Vendor `GzipChunkFetcher.hpp:334` —
             //   `auto sharedLastWindow = m_windowMap->get( *nextBlockOffset );`
@@ -815,7 +826,7 @@ fn consumer_loop<W: std::io::Write>(
             // CompressionType::None this is a zero-alloc slice borrow.
             let window_bytes = materialize_window(&window);
             let tail = chunk.get_last_window(&window_bytes);
-            window_map.insert_bytes(chunk_end_bit, &tail);
+            window_map.insert_bytes_with_compression(chunk_end_bit, &tail, CompressionType::None);
             predecessor_window_for_postprocess = Some(window);
         }
 
@@ -891,7 +902,6 @@ fn consumer_loop<W: std::io::Write>(
                     thread_pool,
                     chunk,
                     window,
-                    window_map.clone(),
                     partition_idx_for_trace,
                 );
                 pending.push_back(PendingWrite::Async {
@@ -914,13 +924,27 @@ fn consumer_loop<W: std::io::Write>(
         // `waitForReplacedMarkers` (GzipChunkFetcher.hpp:478-518) does
         // this implicitly by blocking on the per-chunk future.
         while pending.len() > post_process_inflight_cap {
-            drain_one_pending(&mut pending, writer, total_crc, total_size, block_fetcher)?;
+            drain_one_pending(
+                &mut pending,
+                &window_map,
+                writer,
+                total_crc,
+                total_size,
+                block_fetcher,
+            )?;
         }
     }
 
     // Final drain — flush remaining post-processes in encoded order.
     while !pending.is_empty() {
-        drain_one_pending(&mut pending, writer, total_crc, total_size, block_fetcher)?;
+        drain_one_pending(
+            &mut pending,
+            &window_map,
+            writer,
+            total_crc,
+            total_size,
+            block_fetcher,
+        )?;
     }
 
     Ok(())
@@ -994,7 +1018,6 @@ fn submit_post_process_to_pool(
     thread_pool: &Arc<ThreadPool>,
     chunk: ChunkData,
     predecessor_window: Window,
-    window_map: WindowMap,
     partition_idx: usize,
 ) -> mpsc::Receiver<ChunkData> {
     if trace::is_enabled() {
@@ -1005,7 +1028,7 @@ fn submit_post_process_to_pool(
         );
     }
     let future = thread_pool.submit(
-        move || run_post_process_task(chunk, predecessor_window, window_map),
+        move || run_post_process_task(chunk, predecessor_window),
         /* priority */ -1,
     );
     future.into_receiver()
@@ -1185,32 +1208,36 @@ fn run_decode_task(
 /// body at `GzipChunkFetcher::queueChunkForPostProcessing`
 /// (vendor/.../GzipChunkFetcher.hpp:579-582).
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-fn run_post_process_task(
-    mut chunk: ChunkData,
-    predecessor_window: Window,
-    window_map: WindowMap,
-) -> ChunkData {
-    // Vendor `GzipChunkFetcher.hpp:341`: materialize the predecessor
-    // window once per chunk via `sharedLastWindow->decompress()` and
-    // pass by `const &` to `postProcessChunk` and
-    // `appendSubchunksToIndexes` (lines 343 + 357). gzippy's
-    // `materialize_window` returns `Cow<[u8]>` — borrowed slice for
-    // `CompressionType::None` (zero alloc) and owned Vec for Zlib.
+fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> ChunkData {
+    // Vendor lambda at GzipChunkFetcher.hpp:579-582 — `applyWindow` only.
+    // WindowMap writes happen on the consumer (`publish_subchunk_windows`).
     let bytes = materialize_window(&predecessor_window);
     apply_window(&mut chunk, &bytes);
     chunk.populate_subchunk_windows(&bytes);
+    chunk
+}
 
-    // Per-subchunk window publication (vendor GzipChunkFetcher.hpp:430-458).
+/// Consumer-thread publication of per-subchunk tail windows. Mirror of
+/// vendor `appendSubchunksToIndexes` (GzipChunkFetcher.hpp:429-458).
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+fn publish_subchunk_windows(window_map: &WindowMap, chunk: &ChunkData) {
     for sc in &chunk.subchunks {
-        if let Some(ref w) = sc.window {
-            let sc_end_bit = sc.encoded_offset_bits + sc.encoded_size_bits;
-            if sc_end_bit > sc.encoded_offset_bits {
-                window_map.insert_bytes(sc_end_bit, &w[..]);
-            }
+        let sc_end_bit = sc.encoded_offset_bits + sc.encoded_size_bits;
+        if sc_end_bit <= sc.encoded_offset_bits {
+            continue;
+        }
+        let Some(w) = sc.window.as_ref() else {
+            continue;
+        };
+        let existing = window_map.get(sc_end_bit);
+        let may_insert = match existing {
+            None => true,
+            Some(ex) => !ex.is_empty(),
+        };
+        if may_insert {
+            window_map.insert_bytes(sc_end_bit, &w[..]);
         }
     }
-
-    chunk
 }
 
 // ── Slow-path decoder (tryToDecode + BlockFinder iteration) ──────────────
@@ -1406,6 +1433,7 @@ enum PendingWrite {
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 fn drain_one_pending<W: std::io::Write>(
     pending: &mut std::collections::VecDeque<PendingWrite>,
+    window_map: &WindowMap,
     writer: &mut W,
     total_crc: &mut CRC32Calculator,
     total_size: &mut usize,
@@ -1431,6 +1459,9 @@ fn drain_one_pending<W: std::io::Write>(
             (idx, chunk, cache_key)
         }
     };
+
+    // Vendor `appendSubchunksToIndexes` window emplace — orchestrator only.
+    publish_subchunk_windows(window_map, &chunk);
 
     // Mirror of vendor's per-chunk write loop (GzipChunkFetcher.hpp:333-342).
     let mut written_crc = CRC32Calculator::new();

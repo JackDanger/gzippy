@@ -137,12 +137,9 @@ impl WindowMap {
     /// windows with asynchronically compressed and made-sparse
     /// windows."
     ///
-    /// In gzippy this collision is real: the worker publishes the
-    /// chunk's clean tail at `end_bit` (chunk_fetcher.rs:773) and the
-    /// phase-2 post-process worker later publishes a per-subchunk
-    /// window at the same key (chunk_fetcher.rs:836). Vendor's
-    /// pattern is that the phase-2 (post-processed) version wins
-    /// because it reflects the post-processed / sparsified state.
+    /// Overwrites are intentional when the consumer publishes a
+    /// subchunk window after the critical-path tail (vendor
+    /// `appendSubchunksToIndexes`, GzipChunkFetcher.hpp:429-458).
     pub fn insert(&self, encoded_offset_bits: usize, window: Window) {
         self.state
             .lock()
@@ -158,15 +155,26 @@ impl WindowMap {
     /// (WindowMap.hpp:39-46), which is one line:
     /// `emplaceShared(offset, make_shared<Window>(window, type))`.
     pub fn insert_bytes(&self, encoded_offset_bits: usize, bytes: &[u8]) {
+        self.insert_bytes_with_compression(encoded_offset_bits, bytes, self.compression);
+    }
+
+    /// Mirror of vendor `WindowMap::emplace(offset, window, compressionType)`.
+    pub fn insert_bytes_with_compression(
+        &self,
+        encoded_offset_bits: usize,
+        bytes: &[u8],
+        compression: CompressionType,
+    ) {
         if wintrace_enabled() {
             eprintln!(
-                "[WIN] insert key={:>12}  len={} fp={}",
+                "[WIN] insert key={:>12}  len={} fp={} comp={}",
                 encoded_offset_bits,
                 bytes.len(),
-                wfp(bytes)
+                wfp(bytes),
+                compression.as_str()
             );
         }
-        let cv = Arc::new(CompressedVector::from_bytes(bytes, self.compression));
+        let cv = Arc::new(CompressedVector::from_bytes(bytes, compression));
         self.insert(encoded_offset_bits, cv);
     }
 
