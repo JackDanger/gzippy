@@ -5,8 +5,8 @@
 //! - [`decode_chunk_marker_bootstrap_then_isal`] — speculative prefetch when
 //!   no window yet: marker bootstrap for cross-chunk refs, then ISA-L bulk.
 //!
-//! `until_bits` is an inexact stop hint; the ISA-L wrapper does **not**
-//! byte-cap input on the inexact path.
+//! `until_bits` caps how far ISA-L may read (`IsalInflateWrapper::with_until_bits`
+//! / `refill_buffer`), matching vendor `m_encodedUntilOffset`.
 
 #![allow(dead_code)]
 
@@ -51,7 +51,7 @@ pub fn decode_chunk_isal_inexact(
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
     let t_decode = std::time::Instant::now();
-    let mut wrapper = IsalInflateWrapper::new(input, encoded_offset_bits)?;
+    let mut wrapper = IsalInflateWrapper::with_until_bits(input, encoded_offset_bits, until_bits)?;
     wrapper.set_window(initial_window)?;
     // END_OF_STREAM fires when the deflate stream's BFINAL block has
     // been fully decoded and the bit reader has byte-aligned to the
@@ -294,43 +294,15 @@ pub fn decode_chunk_isal_inexact(
     }
 
     chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
-    // VENDOR DIVERGENCE (documented 2026-05-19, audit 13): vendor
-    // finalizes at `exactUntilOffset` (GzipChunk.hpp:265) — the
-    // consumer's requested upper bound, NOT the worker's actual stop.
-    // Vendor's IsalInflateWrapper caps `avail_in` at the byte for
-    // `m_encodedUntilOffset` (gzip/isal.hpp:231,240,248) so the worker
-    // genuinely stops at that bit position; the assertion at
-    // GzipChunk.hpp:252-263 throws if `tellCompressed() !=
-    // exactUntilOffset`. Vendor's chain invariant therefore holds:
-    // chunk_N.encoded_end == until_bits_of_N == partition_seed ==
-    // chunk_{N+1}.encoded_offset, so `matchesEncodedOffset` returns
-    // true for prefetched chunks and the prefetch is consumed.
-    //
-    // gzippy's wrapper does NOT cap `avail_in` (inflate_wrapper.rs:116
-    // takes input but no until_bit). Worker reads past until_bits to
-    // the next EOB ≥ until_bits. last_end_bit > until_bits. Finalizing
-    // at last_end_bit means block_finder.insert publishes that value,
-    // and the consumer's next_block_offset is > the partition seed
-    // under which the prefetch was dispatched. matchesEncodedOffset
-    // returns FALSE (max == partition_seed < next_block_offset) →
-    // prefetch rejected → on-demand fresh decode.
-    //
-    // Result (measured via --verbose 2026-05-19): 22 of 37 fetches
-    // are on-demand vs vendor's 1 of 21. Pool Efficiency 27.9% vs
-    // 64.2%. Decoded CPU 2.19s vs 0.527s (4× more — every rejected
-    // prefetch is wasted work).
-    //
-    // FIX (deferred): port the wrapper's `m_encodedUntilOffset` cap
-    // into `IsalInflateWrapper::refill_buffer` (gzippy doesn't have
-    // refill today — wrapper sets avail_in once in `new`). Then
-    // finalize at until_bits is consistent with the worker's actual
-    // stop and the chain invariant holds. Multi-file change requiring
-    // careful correctness validation (vendor's assertion at
-    // GzipChunk.hpp:252-263 throws when until_bits isn't a real EOB —
-    // for gzippy's partition guesses, that would mean reverting to
-    // fallback decoding which we don't yet implement). Filed for
-    // future autonomous session.
-    chunk.finalize(last_end_bit);
+    // Wrapper caps at `until_bits` (vendor `m_encodedUntilOffset`). When the
+    // inexact stop fired at a non-fixed boundary, `last_end_bit` is the
+    // pre-header EOB position; otherwise use the decoder cursor.
+    let final_bit = if stopping_point_reached {
+        last_end_bit
+    } else {
+        wrapper.tell_compressed().min(until_bits)
+    };
+    chunk.finalize(final_bit);
     Ok(chunk)
 }
 
@@ -420,14 +392,23 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     state.points_to_stop_at = isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK
         | isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER;
 
+    let until_bits = until_bits.min(input.len() * 8);
+    let max_bits = until_bits.saturating_sub(bit_offset);
     if bit_skip > 0 {
         state.read_in = (input[byte_idx] as u64) >> bit_skip;
         state.read_in_length = (8 - bit_skip) as i32;
         state.next_in = unsafe { input.as_ptr().add(byte_idx + 1) as *mut u8 };
-        state.avail_in = (input.len() - byte_idx - 1) as u32;
+        let consumed = (8 - bit_skip) as usize;
+        let max_bytes = if max_bits > consumed {
+            (max_bits - consumed) / 8
+        } else {
+            0
+        };
+        state.avail_in = max_bytes.min(input.len() - byte_idx - 1) as u32;
     } else {
         state.next_in = unsafe { input.as_ptr().add(byte_idx) as *mut u8 };
-        state.avail_in = (input.len() - byte_idx) as u32;
+        let max_bytes = max_bits / 8;
+        state.avail_in = max_bytes.min(input.len() - byte_idx) as u32;
     }
 
     let ret_dict = unsafe {

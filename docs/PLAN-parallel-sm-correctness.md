@@ -131,7 +131,7 @@ Do not tune throughput on a corrupt pipeline.
 
 | Priority | Work |
 |----------|------|
-| P0 | `m_encodedUntilOffset` / `until_bits` cap in `IsalInflateWrapper::refill_buffer` |
+| P0 | `with_until_bits` wired in fast + slow ISA-L decode (wrapper `refill_buffer` cap) |
 | P1 | `bench-sm` vs rapidgzip (silesia, T=1, T=16) |
 | P2 | `GZIPPY_LOG_FILE` + timeline (consumer wait vs worker idle) |
 | P3 | Prefetch hit rate (block finder + partition seed) |
