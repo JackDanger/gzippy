@@ -190,6 +190,20 @@ impl<'a> IsalInflateWrapper<'a> {
         state.avail_in = 0;
         state.read_in = 0;
         state.read_in_length = 0;
+        // Prime the partial leading byte before any `set_dict` call.
+        // Matches `isal_decompress::decompress_deflate_from_bit` and vendor
+        // `refillBuffer` on first refill (isal.hpp:235-239) — must happen
+        // before `isal_inflate_set_dict` or cross-chunk resume at non-byte-
+        // aligned boundaries returns ISAL_INVALID_BLOCK.
+        let tell_mod = bit_offset % 8;
+        let mut bit_reader_tell = bit_offset;
+        if tell_mod != 0 {
+            let bit_skip = tell_mod;
+            let byte = input[byte_idx];
+            state.read_in = (byte as u64) >> bit_skip;
+            state.read_in_length = (8 - bit_skip) as i32;
+            bit_reader_tell = bit_offset + (8 - bit_skip);
+        }
         // Inline buffer: matches vendor's `std::array<char, 128_Ki>`
         // stack-stored layout (isal.hpp:207). ~128 KiB stack frame per
         // wrapper, same as vendor. `refill_buffer` overwrites these
@@ -199,7 +213,7 @@ impl<'a> IsalInflateWrapper<'a> {
             input,
             encoded_start_offset_bits: bit_offset,
             encoded_until_bits: capped_until,
-            bit_reader_tell: bit_offset,
+            bit_reader_tell,
             buffer: [0u8; STAGING_BUFFER_BYTES],
         })
     }
@@ -306,21 +320,17 @@ impl<'a> IsalInflateWrapper<'a> {
         // next byte boundary, fall through to byte-aligned load.
         let tell_mod = self.bit_reader_tell % 8;
         if tell_mod != 0 {
+            // Non-byte-aligned tell after construction should only happen
+            // when `with_until_bits` did not prime (legacy `new()` path).
             let n_bits_to_prime = (8 - tell_mod) as u32;
             let byte_idx = self.bit_reader_tell / 8;
-            // `with_until_bits` checked byte_idx < input.len() at
-            // construction; tell only advances within
-            // [start, encoded_until_bits], also bounded.
             debug_assert!(byte_idx < self.input.len());
             let byte = self.input[byte_idx];
-            let value = ((byte as u64) >> tell_mod) & ((1u64 << n_bits_to_prime) - 1);
-            // Append into read_in at the existing read_in_length offset.
+            let value = (byte as u64) >> tell_mod;
             self.state.read_in |= value << self.state.read_in_length;
             self.state.read_in_length += n_bits_to_prime as i32;
             self.bit_reader_tell += n_bits_to_prime as usize;
             debug_assert!(self.bit_reader_tell.is_multiple_of(8));
-            // Vendor falls through to the byte-aligned load when more
-            // bytes remain.
         }
 
         // Vendor isal.hpp:240-244 — last refill where < 8 bits remain.
@@ -802,6 +812,87 @@ mod tests {
     /// Cap of `0` (start_bit == until_bits) decodes nothing and reports
     /// tell_compressed == 0. Edge case for the refill-loop entry guard
     /// at vendor isal.hpp:231.
+    #[test]
+    /// Cross-chunk resume: decode to a non-byte-aligned boundary, take the
+    /// last 32 KiB as dict, resume with `with_until_bits` + `set_window`.
+    #[test]
+    fn with_until_bits_resume_non_byte_aligned_with_dict() {
+        let payload = vec![b'x'; 400_000];
+        let deflate = make_deflate(&payload);
+
+        let mut block_ends: Vec<usize> = Vec::new();
+        {
+            let mut probe = IsalInflateWrapper::new(&deflate, 0).expect("probe");
+            probe.set_window(&[]).expect("set_window");
+            probe.set_stopping_points(StoppingPoints::END_OF_BLOCK);
+            let mut buf = vec![0u8; payload.len() + 1024];
+            let mut total = 0usize;
+            loop {
+                let r = probe.read_stream(&mut buf[total..]).expect("read");
+                total += r.bytes_written;
+                if r.stopped_at == StoppingPoints::END_OF_BLOCK {
+                    block_ends.push(r.bit_position);
+                    if r.finished {
+                        break;
+                    }
+                    continue;
+                }
+                if r.finished || r.bytes_written == 0 {
+                    break;
+                }
+            }
+        }
+        let resume_at = block_ends
+            .iter()
+            .copied()
+            .find(|p| *p % 8 != 0)
+            .unwrap_or_else(|| block_ends[block_ends.len() / 2]);
+
+        let mut first = IsalInflateWrapper::with_until_bits(&deflate, 0, resume_at).expect("init");
+        first.set_window(&[]).expect("set_window");
+        let mut out1 = vec![0u8; payload.len()];
+        let mut n1 = 0usize;
+        loop {
+            let r = first.read_stream(&mut out1[n1..]).expect("read");
+            n1 += r.bytes_written;
+            if r.bytes_written == 0 {
+                break;
+            }
+        }
+        out1.truncate(n1);
+        assert_eq!(first.tell_compressed(), resume_at);
+
+        let window_start = n1.saturating_sub(32768);
+        let window = &out1[window_start..n1];
+
+        let mut second =
+            IsalInflateWrapper::with_until_bits(&deflate, resume_at, deflate.len() * 8)
+                .expect("resume init");
+        second.set_window(window).expect("set_window");
+        let mut out2 = vec![0u8; payload.len()];
+        let mut n2 = 0usize;
+        loop {
+            let r = second.read_stream(&mut out2[n2..]).expect("read");
+            n2 += r.bytes_written;
+            if r.finished || r.bytes_written == 0 {
+                break;
+            }
+        }
+        out2.truncate(n2);
+
+        let mut full = out1;
+        full.extend_from_slice(&out2);
+        let reference = {
+            let mut d = flate2::Decompress::new(false);
+            let mut out = vec![0u8; payload.len()];
+            d.decompress(&deflate, &mut out, flate2::FlushDecompress::Finish)
+                .expect("flate2");
+            out.truncate(d.total_out() as usize);
+            out
+        };
+        assert_eq!(full, reference);
+    }
+
     #[test]
     fn with_until_bits_zero_cap_decodes_nothing() {
         let payload = b"abcdefg".repeat(1000);
