@@ -1,7 +1,8 @@
 //! Parallel single-member decompression (production path).
 //!
 //! Entry: [`single_member::decompress_parallel`] → [`sm_driver::read_parallel_sm`]
-//! → [`chunk_fetcher::drive`] → [`gzip_chunk::decode_chunk_isal_inexact`].
+//! → [`chunk_fetcher::drive`] → [`gzip_chunk::decode_chunk_isal_inexact`]
+//! or [`gzip_chunk::decode_chunk_marker_bootstrap_then_isal`] (prefetch).
 
 pub mod apply_window;
 pub mod bit_manipulation;
@@ -14,9 +15,15 @@ pub mod chunk_data;
 pub mod chunk_fetcher;
 pub mod compressed_vector;
 pub mod crc32;
+// Bootstrap-only (speculative prefetch): marker emit via `deflate_block::Block`.
+pub mod deflate_block;
+pub mod error;
 pub mod gzip_block_finder;
 pub mod gzip_chunk;
+pub mod gzip_definitions;
 pub mod gzip_format;
+pub mod huffman_base;
+pub mod huffman_symbols_per_length;
 pub mod inflate_wrapper;
 pub mod prefetcher;
 pub mod replace_markers;

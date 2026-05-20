@@ -42,7 +42,7 @@
 //!   `thread_pool.submit(run_decode_job, /* priority */ 0)` and returns
 //!   the future's receiver. Mirror of BlockFetcher.hpp:554-558.
 //! - Worker decode: `decode_chunk_isal_inexact` (window known or chunk 0) or
-//!   `speculative_decode_find_boundary` (prefetch, empty dict).
+//!   `speculative_decode_find_boundary` → marker bootstrap (prefetch, no window).
 //! - `postProcessChunk` / `applyWindow` → `apply_window` +
 //!   `populate_subchunk_windows`, dispatched on the SAME pool via
 //!   `thread_pool.submit(run_post_process_job, /* priority */ -1)`
@@ -72,7 +72,9 @@ use crate::decompress::parallel::crc32::CRC32Calculator;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::gzip_block_finder::{GetReturnCode, GzipBlockFinder};
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-use crate::decompress::parallel::gzip_chunk::decode_chunk_isal_inexact;
+use crate::decompress::parallel::gzip_chunk::{
+    decode_chunk_isal_inexact, decode_chunk_marker_bootstrap_then_isal,
+};
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::prefetcher::FetchNextAdaptive;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
@@ -1009,7 +1011,7 @@ fn submit_post_process_to_pool(
 /// Pool-side execution of a decode task (vendor `decodeBlock`,
 /// GzipChunkFetcher.hpp:692-729). Routes to `decode_chunk_isal_inexact`
 /// when the predecessor window is published, else
-/// `speculative_decode_find_boundary` (empty dict, markers allowed).
+/// `speculative_decode_find_boundary` (marker bootstrap when no window).
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 fn run_decode_task(
     input: InputSlice,
@@ -1238,8 +1240,8 @@ fn run_post_process_task(
 /// 15-38 such prefetches per silesia decode, that's 200-500 ms of pure
 /// waste, half the total wall time.
 ///
-/// Slow-path trial decode uses `decode_chunk_isal_inexact` (patched ISA-L,
-/// empty dict). We still walk
+/// Slow-path trial decode uses marker bootstrap (`decode_chunk_marker_bootstrap_then_isal`).
+/// We still walk
 /// every candidate in each 8 KiB sub-window and return on first success
 /// (vendor GzipChunk.hpp:837-841).
 ///
@@ -1273,11 +1275,9 @@ pub static SLOW_PATH_FIRST_CANDIDATE_FAIL: std::sync::atomic::AtomicU64 =
 pub static PREFETCH_REJECT_BY_GUARD: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Speculative slow-path decode without a predecessor window. Uses
-/// `decode_chunk_isal_inexact` with an empty dict (markers for unknown
-/// back-refs). Replaced the old marker-bootstrap path that failed with
-/// `InvalidHuffmanCode`
-/// at real block boundaries on gzip -9 silesia and burning worker time.
+/// Speculative slow-path decode without a predecessor window. Must use
+/// marker bootstrap — plain ISA-L with an empty dict resolves unknown
+/// back-refs against zeros and corrupts output (Bug B, commit 4909ac7).
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 fn try_speculative_decode_candidate(
     input: &[u8],
@@ -1286,7 +1286,13 @@ fn try_speculative_decode_candidate(
     until_bit: usize,
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    let mut chunk = decode_chunk_isal_inexact(input, decode_start, until_bit, &[], configuration)?;
+    let mut chunk = decode_chunk_marker_bootstrap_then_isal(
+        input,
+        decode_start,
+        until_bit,
+        &[],
+        configuration,
+    )?;
     // Vendor tryToDecode metadata (GzipChunk.hpp:716-722): encoded =
     // partition seed, max = actual decode start.
     if partition_seed < decode_start {
