@@ -41,6 +41,154 @@ impl From<std::io::Error> for ChunkDecodeError {
 /// rapidgzip's `ALLOCATION_CHUNK_SIZE` (GzipChunk.hpp uses 128 KiB).
 const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 
+/// Raw isal-sys decode with stopping points — used when the fast path
+/// starts at a non-byte-aligned bit offset (IsalInflateWrapper cross-chunk
+/// resume is unreliable on real data despite matching unit tests).
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+fn decode_chunk_isal_inexact_raw(
+    input: &[u8],
+    bit_offset: usize,
+    until_bits: usize,
+    dict: &[u8],
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    use isal::isal_sys::igzip_lib as isal_raw;
+
+    let t_decode = std::time::Instant::now();
+    let mut chunk = ChunkData::new(bit_offset, configuration);
+    let byte_idx = bit_offset / 8;
+    let bit_skip = bit_offset % 8;
+    if byte_idx >= input.len() {
+        return Err(ChunkDecodeError::InflateFailed(
+            crate::decompress::parallel::inflate_wrapper::InflateError::StartBitPastEnd,
+        ));
+    }
+    let mut state: isal_raw::inflate_state = unsafe { std::mem::zeroed() };
+    unsafe { isal_raw::isal_inflate_init(&mut state) };
+    state.crc_flag = isal_raw::ISAL_DEFLATE;
+    state.points_to_stop_at = isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK
+        | isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER
+        | isal_raw::ISAL_STOPPING_POINT_END_OF_STREAM;
+
+    let until_bits = until_bits.min(input.len() * 8);
+    let max_bits = until_bits.saturating_sub(bit_offset);
+    if bit_skip > 0 {
+        state.read_in = (input[byte_idx] as u64) >> bit_skip;
+        state.read_in_length = (8 - bit_skip) as i32;
+        state.next_in = unsafe { input.as_ptr().add(byte_idx + 1) as *mut u8 };
+        let consumed = (8 - bit_skip) as usize;
+        let max_bytes = if max_bits > consumed {
+            (max_bits - consumed) / 8
+        } else {
+            0
+        };
+        state.avail_in = max_bytes.min(input.len() - byte_idx - 1) as u32;
+    } else {
+        state.next_in = unsafe { input.as_ptr().add(byte_idx) as *mut u8 };
+        let max_bytes = max_bits / 8;
+        state.avail_in = max_bytes.min(input.len() - byte_idx) as u32;
+    }
+
+    static ZERO_WINDOW: [u8; 32768] = [0u8; 32768];
+    let dict = if dict.is_empty() {
+        &ZERO_WINDOW[..]
+    } else {
+        dict
+    };
+    let ret_dict = unsafe {
+        isal_raw::isal_inflate_set_dict(&mut state, dict.as_ptr() as *mut u8, dict.len() as u32)
+    };
+    if ret_dict != 0 {
+        return Err(ChunkDecodeError::InflateFailed(
+            crate::decompress::parallel::inflate_wrapper::InflateError::SetDictFailed,
+        ));
+    }
+
+    let cap = configuration.max_decoded_chunk_size;
+    let mut output: Vec<u8> = Vec::with_capacity(ALLOCATION_CHUNK_SIZE.min(cap));
+    let mut out_pos: usize = 0;
+    let mut last_eob_pos = bit_offset;
+    let mut chunk_end_override: Option<usize> = None;
+
+    loop {
+        if out_pos >= cap {
+            chunk.stopped_preemptively = true;
+            break;
+        }
+        let want = ALLOCATION_CHUNK_SIZE.min(cap - out_pos);
+        if output.len() < out_pos + want {
+            output.resize(out_pos + want, 0);
+        }
+        let remaining = want;
+        state.avail_out = remaining as u32;
+        state.next_out = unsafe { output.as_mut_ptr().add(out_pos) };
+
+        let ret = unsafe { isal_raw::isal_inflate(&mut state) };
+        let written = remaining - state.avail_out as usize;
+        if written > 0 {
+            chunk.append_clean(&output[out_pos..out_pos + written]);
+        }
+        out_pos += written;
+
+        match ret {
+            0 | 1 => {}
+            -1 => {
+                return Err(ChunkDecodeError::InflateFailed(
+                    crate::decompress::parallel::inflate_wrapper::InflateError::InvalidBlock,
+                ));
+            }
+            -2 => {
+                return Err(ChunkDecodeError::InflateFailed(
+                    crate::decompress::parallel::inflate_wrapper::InflateError::InvalidSymbol,
+                ));
+            }
+            -3 => {
+                return Err(ChunkDecodeError::InflateFailed(
+                    crate::decompress::parallel::inflate_wrapper::InflateError::InvalidLookback,
+                ));
+            }
+            other => {
+                return Err(ChunkDecodeError::InflateFailed(
+                    crate::decompress::parallel::inflate_wrapper::InflateError::Internal(other),
+                ));
+            }
+        }
+
+        let bit_pos =
+            input.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+
+        if state.stopped_at == isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK {
+            chunk.append_block_boundary(bit_pos);
+            last_eob_pos = bit_pos;
+            state.stopped_at = isal_raw::ISAL_STOPPING_POINT_NONE;
+        } else if state.stopped_at == isal_raw::ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER {
+            let not_final = state.bfinal == 0;
+            let not_fixed = state.btype != 1;
+            if last_eob_pos >= until_bits && not_final && not_fixed {
+                chunk_end_override = Some(last_eob_pos);
+                break;
+            }
+            state.stopped_at = isal_raw::ISAL_STOPPING_POINT_NONE;
+        } else if state.stopped_at == isal_raw::ISAL_STOPPING_POINT_END_OF_STREAM {
+            break;
+        }
+
+        if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            break;
+        }
+        if written == 0 && state.avail_in == 0 && state.stopped_at == 0 {
+            break;
+        }
+    }
+
+    let isal_pos =
+        input.len() * 8 - state.avail_in as usize * 8 - state.read_in_length.max(0) as usize;
+    let final_bit_pos = chunk_end_override.unwrap_or(isal_pos);
+    chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+    chunk.finalize(final_bit_pos);
+    Ok(chunk)
+}
+
 /// **Inexact** ISA-L decode when the predecessor window is known.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub fn decode_chunk_isal_inexact(
@@ -50,6 +198,15 @@ pub fn decode_chunk_isal_inexact(
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
+    if encoded_offset_bits % 8 != 0 {
+        return decode_chunk_isal_inexact_raw(
+            input,
+            encoded_offset_bits,
+            until_bits,
+            initial_window,
+            configuration,
+        );
+    }
     let t_decode = std::time::Instant::now();
     let mut wrapper = IsalInflateWrapper::with_until_bits(input, encoded_offset_bits, until_bits)?;
     wrapper.set_window(initial_window)?;

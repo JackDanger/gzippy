@@ -750,7 +750,11 @@ fn consumer_loop<W: std::io::Write>(
         if chunk.data_with_markers.is_empty() {
             // No markers → apply_window is a no-op. Publish successor window
             // on the consumer only (vendor queueChunkForPostProcessing:558-575).
-            if let Some(tail) = chunk.last_32kib_window() {
+            // Mirror vendor `getLastWindow(*previousWindow)` — not `last_32kib`
+            // alone, which ignores the predecessor chain at stream start.
+            if let Some(pred) = window_map.get(chunk.encoded_offset_bits) {
+                let bytes = materialize_window(&pred);
+                let tail = chunk.get_last_window(&bytes);
                 window_map.insert_bytes_with_compression(
                     chunk_end_bit,
                     &tail,
