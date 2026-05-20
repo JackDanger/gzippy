@@ -35,6 +35,27 @@ use crate::decompress::parallel::compressed_vector::{CompressedVector, Compressi
 /// shared_ptr<const CompressedVector>` (WindowMap.hpp:24).
 pub type Window = Arc<CompressedVector>;
 
+/// TEMPORARY diagnostic — enabled by `GZIPPY_WINTRACE=1`. Traces every
+/// WindowMap insert/get with a content fingerprint so a wrong/missing
+/// window under T≥3 (Bug C) can be read directly instead of guessed.
+/// Remove once Bug C is fixed.
+pub fn wintrace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("GZIPPY_WINTRACE").is_ok())
+}
+
+/// FNV-1a 64-bit content fingerprint. Two windows with the same `fp`
+/// are byte-identical; different `fp` = different bytes.
+pub fn wfp(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
 /// The compression strategy used for in-map window storage. Matches
 /// rapidgzip's default `WindowMap` strategy (Zlib).
 pub const DEFAULT_WINDOW_COMPRESSION: CompressionType = CompressionType::Zlib;
@@ -86,12 +107,25 @@ impl WindowMap {
     /// allocation** on hit — only an `Arc` ref-count bump. Mirror of
     /// vendor's `WindowMap::get` (WindowMap.hpp:79-90).
     pub fn get(&self, encoded_offset_bits: usize) -> Option<Window> {
-        self.state
+        let r = self
+            .state
             .lock()
             .unwrap()
             .entries
             .get(&encoded_offset_bits)
-            .cloned()
+            .cloned();
+        if wintrace_enabled() {
+            match &r {
+                Some(w) => eprintln!(
+                    "[WIN] get    key={:>12}  HIT  len={} fp={}",
+                    encoded_offset_bits,
+                    w.raw_bytes().len(),
+                    wfp(w.raw_bytes())
+                ),
+                None => eprintln!("[WIN] get    key={:>12}  MISS", encoded_offset_bits),
+            }
+        }
+        r
     }
 
     /// Insert a pre-built `CompressedVector` keyed at
@@ -124,6 +158,14 @@ impl WindowMap {
     /// (WindowMap.hpp:39-46), which is one line:
     /// `emplaceShared(offset, make_shared<Window>(window, type))`.
     pub fn insert_bytes(&self, encoded_offset_bits: usize, bytes: &[u8]) {
+        if wintrace_enabled() {
+            eprintln!(
+                "[WIN] insert key={:>12}  len={} fp={}",
+                encoded_offset_bits,
+                bytes.len(),
+                wfp(bytes)
+            );
+        }
         let cv = Arc::new(CompressedVector::from_bytes(bytes, self.compression));
         self.insert(encoded_offset_bits, cv);
     }

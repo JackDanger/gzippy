@@ -1093,6 +1093,35 @@ fn run_decode_task(
     // Workers must not publish to WindowMap — consumer publishes fast-path
     // windows after decode (see consumer_loop marker-free branch).
 
+    // TEMPORARY Bug-C diagnostic (GZIPPY_WINTRACE=1): which decode mode
+    // each chunk took, and the encoded range it actually produced.
+    if crate::decompress::parallel::window_map::wintrace_enabled() {
+        let path = if params.start_bit == 0 {
+            "chunk0"
+        } else if window.is_some() {
+            "fast-window"
+        } else {
+            "slow-spec"
+        };
+        match &chunk_result {
+            Ok(c) => eprintln!(
+                "[WIN] decode start={:>12} until={:>12} spec={} path={:<11} \
+                 -> enc=[{}, {}) markers={}",
+                params.start_bit,
+                params.until_bit,
+                params.is_speculative_prefetch,
+                path,
+                c.encoded_offset_bits,
+                c.encoded_offset_bits + c.encoded_size_bits,
+                !c.data_with_markers.is_empty(),
+            ),
+            Err(e) => eprintln!(
+                "[WIN] decode start={:>12} path={:<11} -> ERR {:?}",
+                params.start_bit, path, e
+            ),
+        }
+    }
+
     // Wrap in Arc to match BlockFetcher's `Value = Arc<ChunkData>`
     // (vendor's `std::shared_ptr<BlockData>` at BlockFetcher.hpp:46).
     let result = chunk_result.map(Arc::new);
