@@ -19,7 +19,11 @@
 #      thread count disagrees
 #
 # Total runtime ~35s (build dominates). Output is a plain table on
-# stdout ending in `RESULT: PASS` or `RESULT: FAIL`.
+# stdout ending in `RESULT: PASS` or `RESULT: FAIL`. On ERROR, reruns
+# one decode with GZIPPY_DEBUG=1 so `[parallel_sm] driver error: …`
+# shows the inner `FetchError` (e.g. `InflateFailed(InvalidBlock)`).
+# The CLI also prints `chunk decode failed: …` once that detail is wired
+# through `ParallelError::DecodeFailed`.
 #
 # Config (override via env):
 #   GZIPPY_REMOTE_SSH    ssh target      default: -J neurotic root@10.30.0.199
@@ -118,12 +122,17 @@ for T in $THREAD_SWEEP; do
 done
 echo
 
-# Surface the stderr of the first errored thread count, if any —
-# the failure message is the fastest pointer to the cause.
+# On failure: plain stderr from the first failing trial, then a dedicated
+# GZIPPY_DEBUG=1 decode (driver logs FetchError detail before CLI maps it).
 if [ -n "$ERR_SEEN" ]; then
     FIRST_ERR=$(echo "$ERR_SEEN" | awk '{print $1}')
-    echo "--- stderr from first ERROR (T=$FIRST_ERR) ---"
+    echo "--- stderr from first ERROR trial (T=$FIRST_ERR, trial=1, no GZIPPY_DEBUG) ---"
     cat /tmp/profx86-err-"$FIRST_ERR"-1 || true
+    echo
+    echo "--- diagnostic decode (GZIPPY_DEBUG=1, T=$FIRST_ERR, one shot) ---"
+    GZIPPY_DEBUG=1 ./target/release/gzippy -d -c -p "$FIRST_ERR" "$FIX" \
+        > /dev/null 2>/tmp/profx86-diag.err || true
+    cat /tmp/profx86-diag.err || true
     echo
 fi
 
@@ -131,7 +140,7 @@ if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: PASS — every thread count decodes byte-perfect"
     exit 0
 else
-    echo "RESULT: FAIL — parallel-SM corruption present at the WRONG rows above"
+    echo "RESULT: FAIL — see ERROR / WRONG rows above (diagnostic stderr if ERROR)"
     exit 1
 fi
 REMOTE

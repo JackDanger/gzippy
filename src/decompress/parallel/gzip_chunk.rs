@@ -196,17 +196,25 @@ pub fn decode_chunk_isal_inexact(
                 sp if sp == StoppingPoints::END_OF_BLOCK_HEADER => {
                     let not_final = !wrapper.is_final_block();
                     let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
-                    if last_eob_pos >= until_bits && not_final && not_fixed {
-                        // Stop at the pre-header position so next chunk
-                        // can resume cleanly. Mirrors GzipChunk.hpp:339-345
-                        // (`stoppingPointReached = true`).
+                    // Vendor GzipChunk.hpp:338-344 — uses nextBlockOffset (the
+                    // block-start bit from the preceding END_OF_BLOCK), not
+                    // tell() after the header. Also stops when
+                    // `nextBlockOffset == untilOffset` even for fixed blocks.
+                    if (last_eob_pos >= until_bits && not_final && not_fixed)
+                        || last_eob_pos == until_bits
+                    {
                         last_end_bit = last_eob_pos;
                         stopping_point_reached = true;
                     }
                 }
                 sp if sp == StoppingPoints::NONE => {
                     if last_per_call == 0 {
-                        // Mirrors GzipChunk.hpp:347-351.
+                        // Mirrors GzipChunk.hpp:347-351. When the until cap
+                        // fires before a header stop, snap to the last real
+                        // block boundary instead of a mid-header tell().
+                        if last_eob_pos > encoded_offset_bits {
+                            last_end_bit = last_eob_pos;
+                        }
                         stopping_point_reached = true;
                     }
                 }
@@ -299,6 +307,8 @@ pub fn decode_chunk_isal_inexact(
     // pre-header EOB position; otherwise use the decoder cursor.
     let final_bit = if stopping_point_reached {
         last_end_bit
+    } else if last_eob_pos > encoded_offset_bits {
+        last_eob_pos
     } else {
         wrapper.tell_compressed().min(until_bits)
     };

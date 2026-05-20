@@ -166,7 +166,7 @@ pub fn decompress_parallel<W: Write>(
             match e {
                 ReadParallelSmError::InvalidHeader => ParallelError::InvalidHeader,
                 ReadParallelSmError::InvalidFormat => ParallelError::InvalidGzipFormat,
-                ReadParallelSmError::DecodeFailed(_) => ParallelError::DecodeFailed,
+                ReadParallelSmError::DecodeFailed(detail) => ParallelError::DecodeFailed(detail),
                 ReadParallelSmError::SizeMismatch { .. } => ParallelError::SizeMismatch,
                 ReadParallelSmError::CrcMismatch { .. } => ParallelError::CrcMismatch,
             }
@@ -210,7 +210,9 @@ pub enum ParallelError {
     /// `IsalSingle`, not `IsalParallelSM`.
     InvalidGzipFormat,
     /// One or more chunk decodes failed inside the worker pool.
-    DecodeFailed,
+    /// Carries `sm_driver` / `chunk_fetcher` `Debug` detail (e.g.
+    /// `Decode(InflateFailed(InvalidBlock))`).
+    DecodeFailed(String),
     /// Output size doesn't match the gzip ISIZE trailer — corruption.
     SizeMismatch,
     /// CRC32 doesn't match the gzip CRC trailer — corruption.
@@ -236,7 +238,7 @@ impl std::fmt::Display for ParallelError {
             ParallelError::InvalidGzipFormat => {
                 write!(f, "input below parallel SM minimum (routing bug)")
             }
-            ParallelError::DecodeFailed => write!(f, "chunk decode failed"),
+            ParallelError::DecodeFailed(detail) => write!(f, "chunk decode failed: {detail}"),
             ParallelError::SizeMismatch => write!(f, "output size mismatch"),
             ParallelError::CrcMismatch => write!(f, "CRC32 mismatch"),
             ParallelError::UnsupportedPlatform => {

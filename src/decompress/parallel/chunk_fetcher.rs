@@ -952,8 +952,14 @@ fn consumer_loop<W: std::io::Write>(
 
 /// Compute the `until_bit` hint for the worker. Mirror of vendor's
 /// `nextBlockOffset = m_blockFinder->get(validDataBlockIndex + 1)` at
-/// BlockFetcher.hpp:268. Falls back to `total_bits` if the block
-/// finder doesn't have the next offset (end of stream).
+/// BlockFetcher.hpp:268, with one gzippy guard for the confirmed-offset
+/// / partition-guess interaction:
+///
+/// After chunk N finishes at a *confirmed* boundary B, `insert(B)` makes
+/// `get(N+1)` return B, but `get(N+2)` may still be the old partition
+/// guess P = B + spacing (e.g. only 5 bits past B on a 4 MiB spacing).
+/// Using P as `until` caps the next worker to a handful of bits → ISA-L
+/// `InvalidBlock`. Skip hints that are not meaningfully past `floor`.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 fn until_bit_for(
     block_finder: &GzipBlockFinder,
@@ -961,12 +967,24 @@ fn until_bit_for(
     total_bits: usize,
     floor: usize,
 ) -> usize {
-    match block_finder.get(block_index + 1) {
-        (Some(offset), GetReturnCode::Success) | (Some(offset), GetReturnCode::Failure) => {
-            offset.max(floor)
+    let spacing = block_finder.spacing_in_bits();
+    let min_gap = spacing.max(8);
+
+    for delta in 1..=8 {
+        let candidate = match block_finder.get(block_index + delta) {
+            (Some(offset), GetReturnCode::Success) | (Some(offset), GetReturnCode::Failure) => {
+                offset.max(floor)
+            }
+            _ => return total_bits,
+        };
+        if candidate > floor && candidate.saturating_sub(floor) >= min_gap {
+            return candidate.min(total_bits);
         }
-        _ => total_bits,
+        if candidate >= total_bits {
+            return total_bits;
+        }
     }
+    total_bits
 }
 
 /// Submit a decode task to the `ThreadPool`, returning the
@@ -1563,6 +1581,22 @@ mod tests {
     /// surface the two-key cache lookup bug. Uses production
     /// split_chunk_size and an input long enough to span multiple
     /// chunks.
+    #[test]
+    fn until_bit_for_skips_partition_guess_immediately_after_confirmed_end() {
+        let spacing_bytes = 4 * 1024 * 1024;
+        let spacing_bits = spacing_bytes * 8;
+        let total_bits = spacing_bits * 10;
+        let finder = GzipBlockFinder::new(0, spacing_bytes, Some(total_bits));
+        // Chunk 0 confirmed end one byte into the next partition slot.
+        let confirmed_end = spacing_bits - 5;
+        finder.insert(confirmed_end);
+        let until = super::until_bit_for(&finder, 1, total_bits, confirmed_end);
+        assert!(
+            until.saturating_sub(confirmed_end) >= spacing_bits,
+            "until {until} must skip stale get(idx+1) guess {spacing_bits} (only 5b past end)"
+        );
+    }
+
     #[test]
     fn drive_round_trips_60mb_level9_prod_split() {
         // ~60 MB payload at -9 compresses to ~40 MB → ~10 chunks at the

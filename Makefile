@@ -151,8 +151,8 @@ route-check: $(GZIPPY_BIN) $(PIGZ_BIN)
 #
 # Builds the current branch on the homelab x86_64 box, makes one gzip(1)-CLI
 # fixture, decodes it at a sweep of thread counts, and FAILS if any thread
-# count produces wrong bytes. ~35s. This is the check that catches the
-# parallel-SM T>=9 corruption that arm64 dev machines cannot see.
+# count produces wrong bytes. ~35s. On FAIL the script reruns one decode with
+# GZIPPY_DEBUG=1 and prints `[parallel_sm] driver error: …` (FetchError detail).
 #
 # All SSH / build / fixture complexity lives in the script; this target is
 # a one-liner so a user or LLM can run it and read PASS/FAIL on stdout.
@@ -732,6 +732,7 @@ help:
 		'  make              Build and run quick benchmark (< 30 seconds)' \
 		'  make quick        Same as above' \
 		'  make route-check  Show decompression routing + timing for T1/T4 x 1MB/10MB' \
+		'  make profile-decompression-x86_64  Homelab x86 parallel-SM correctness (~35s)' \
 		'  make build        Build gzippy and ungzippy' \
 		'  make deps         Build gzip and pigz from submodules' \
 		'  make validate     Run validation suite (adaptive 3-17 trials)' \
