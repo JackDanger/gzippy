@@ -314,7 +314,7 @@ bench-sm: ship-precheck
 ship-precheck:
 	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
 	if [ "$$BRANCH" = "HEAD" ]; then echo "ERROR: detached HEAD; checkout a branch first" >&2; exit 1; fi; \
-	if [ -n "$$(git status --porcelain | grep -v '^?? vendor/zopfli')" ]; then \
+	if [ -n "$$(git status --porcelain | grep -v 'vendor/zopfli')" ]; then \
 	  echo "ERROR: uncommitted changes — homelab needs to fetch a committed branch" >&2; \
 	  echo "       run 'git status' and commit (or stash) before 'make ship'" >&2; \
 	  echo "       (use 'make ship-local' to run local checks against a dirty tree)" >&2; \
