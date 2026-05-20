@@ -1,5 +1,10 @@
 # v0.6 Marker-Based Parallel Single-Member Decompressor — Plan
 
+> **Historical (May 2026):** Describes the v0.6 marker-pipeline rollout.
+> Production parallel SM now uses ISA-L inexact decode (`gzip_chunk::decode_chunk_isal_inexact`,
+> `inflate_wrapper`). `fast_marker_inflate` and related museum modules were removed;
+> recover from git history if needed.
+
 This document tracks the multi-PR rollout of the v0.6 marker pipeline that
 replaces v0.5.1's speculative-window two-pass design. It exists per premortem
 mitigation D2: a checked-in milestone document means slippage shows up here,
@@ -26,7 +31,7 @@ defense that ships *together with* the code at risk.
 
 ## Rollout
 
-### Engine PR — `fast_marker_inflate.rs` (correctness only) — *landed*
+### Engine PR — marker bootstrap (`fast_marker_inflate`, removed May 2026) — *landed, superseded*
 
 Chains off PR #90. Adds the marker-emitting deflate decoder; **does not** wire
 into production routing. Lands when CI is green on this PR's own tests.

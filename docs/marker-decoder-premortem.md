@@ -1,5 +1,9 @@
 # Premortem — v0.6 Marker-Based Parallel Single-Member Decompressor
 
+> **Historical (May 2026):** Premortem for the v0.6 marker pipeline. Production SM
+> now uses ISA-L inexact chunk decode; `fast_marker_inflate` and museum modules
+> were removed. Fuzz/risk items below refer to paths that may no longer exist.
+>
 > A premortem is written **before** the work, listing every plausible way it
 > can fail and the mitigation that ships *together with* the code at risk.
 > If a mitigation requires future discipline, it doesn't count — only
@@ -193,7 +197,7 @@ PR as the risk; this document is the index, not the implementation.
 | Tag | Failure | Structural mitigation |
 |---|---|---|
 | A1 | `Vec<u16>` output bandwidth bottleneck (2× store width) makes per-thread throughput sub-ISA-L | **Synthetic bench checked in: `examples/u16_output_cost.rs`.** Measured ratio 1.03 on arm64. Decision is data-justified, not vibes. Result recorded in `docs/marker-decoder-plan.md`. |
-| A2 | Pure-Rust Huffman decode at < ISA-L speed loses on T=2 | **`#[ignore]` throughput test `throughput_vs_oracle`** in `fast_marker_inflate.rs` compares against `inflate_consume_first` (production u8 decoder). Acceptance: ≥ ISA-L/2 per thread so T=2 ties sequential, T=3 wins. Failed measurement on x86_64 is what triggers PR #95 (SIMD inner loop) — see F2 / A6 below. |
+| A2 | Pure-Rust Huffman decode at < ISA-L speed loses on T=2 | **`#[ignore]` throughput test `throughput_vs_oracle`** in the removed `fast_marker_inflate` module compares against `inflate_consume_first` (production u8 decoder). Acceptance: ≥ ISA-L/2 per thread so T=2 ties sequential, T=3 wins. Failed measurement on x86_64 is what triggers PR #95 (SIMD inner loop) — see F2 / A6 below. |
 | A3 | Phase-1 chunk-Vec growth via `push` causes capacity-doubling reallocations on hot path | `decode_chunk_markers_bounded` pre-allocates `Vec<u16>` to `4 × deflate_bytes` (matches deflate's worst-case expansion). One reallocation worst case, zero in steady state. |
 | A4 | Boundary search hits adversarial inputs and probes O(N) candidates per chunk | `try_decode_at` is *only* called by `search_boundary_forward` over a bounded window per chunk (`chunk_size / 2`); search is O(window) not O(N). Window bound is asserted in unit tests. |
 | A5 | The sequential `replace_markers` phase becomes Amdahl-bottleneck at high T | `replace_markers_avx2` runs at memory bandwidth (~12 GB/s). For inputs we care about it's a few ms total. **Bench `examples/replace_markers_throughput.rs`** (PR #95) measures it; if it ever becomes Amdahl-relevant we pipeline phase 1+2 per-chunk. Not needed today. |
@@ -204,7 +208,7 @@ PR as the risk; this document is the index, not the implementation.
 | Tag | Failure | Structural mitigation |
 |---|---|---|
 | B1 | Marker emitted for back-ref that actually lands inside the chunk (false marker → wrong byte after resolve) | `emit_match` checks `dist > already_emitted_in_chunk` — only then does it emit `MARKER_BASE + (dist - already_emitted_in_chunk)`. Unit-tested with fixture distances spanning the boundary. |
-| B2 | Chunk-local copy reads from chunk output that *contains* unresolved markers (and the copy doesn't recursively mark) | When emit_match copies inside the chunk, the bytes copied may be markers themselves; `replace_markers` resolves them in-place when phase 2 runs (markers are `u16` values, the copy preserves them). Fuzz test in `fast_marker_inflate.rs` covers this path with 200 random trials. |
+| B2 | Chunk-local copy reads from chunk output that *contains* unresolved markers (and the copy doesn't recursively mark) | When emit_match copies inside the chunk, the bytes copied may be markers themselves; `replace_markers` resolves them in-place when phase 2 runs (markers are `u16` values, the copy preserves them). Fuzz test in the removed `fast_marker_inflate` module covers this path with 200 random trials. |
 | B3 | Cross-chunk back-ref distance > 32 KiB (impossible per RFC 1951, but who knows) silently produces garbage | `emit_match` asserts `1 ≤ dist ≤ 32_768` per RFC 1951; a violating stream produces an explicit error, never wrong output. |
 | B4 | `replace_markers` u16→u8 conversion silently truncates leftover markers from phase-1-failed chunks | `u16_to_u8` fails fast with an explicit error if any `u16 ≥ MARKER_BASE` survives the resolve pass. Tested with synthetic input. |
 | B5 | CRC32 verification skipped when expected CRC == 0 (Copilot caught this in PR #90 review) | `verify_and_write` always checks CRC and ISIZE. No `if expected_crc != 0` guard. Test: a fixture whose CRC32 truncates to zero is in `correctness.rs`. |

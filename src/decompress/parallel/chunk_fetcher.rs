@@ -41,12 +41,8 @@
 //!   closure passed to `BlockFetcher::get`, which calls
 //!   `thread_pool.submit(run_decode_job, /* priority */ 0)` and returns
 //!   the future's receiver. Mirror of BlockFetcher.hpp:554-558.
-//! - Worker decode dispatch (pick ONE — do not mix exact/inexact semantics):
-//!   | Situation | Function | Vendor analogue | `until_bit` meaning |
-//!   |-----------|----------|-----------------|---------------------|
-//!   | Predecessor window known (or chunk 0) | `decode_chunk_isal_inexact` | `finishDecodeChunkWithInexactOffset` + dict | inexact stop hint, **no** byte cap |
-//!   | Confirmed exact end (BGZF / BlockMap) | `decode_chunk_isal_exact_until` | `decodeChunkWithInflateWrapper` | hard stop, `with_until_bits` cap |
-//!   | Prefetch, no window yet | `speculative_decode_find_boundary` | `tryToDecode` + finder cascade | inexact; sets `[encoded, max_acceptable_start_bit]` metadata |
+//! - Worker decode: `decode_chunk_isal_inexact` (window known or chunk 0) or
+//!   `speculative_decode_find_boundary` (prefetch, empty dict).
 //! - `postProcessChunk` / `applyWindow` → `apply_window` +
 //!   `populate_subchunk_windows`, dispatched on the SAME pool via
 //!   `thread_pool.submit(run_post_process_job, /* priority */ -1)`
@@ -115,7 +111,7 @@ fn materialize_window(w: &Window) -> Cow<'_, [u8]> {
 /// the parent chunk in cache (vendor's `getIndexedChunk` query at
 /// `:264-289`). Single-pass single-member streaming never queries
 /// this; it is scaffolding for the seekable-reader path
-/// (`parallel_gzip_reader.rs`).
+/// (`sm_driver.rs`).
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub type UnsplitBlocks = Arc<std::sync::Mutex<std::collections::HashMap<usize, usize>>>;
 
@@ -187,8 +183,7 @@ struct DecodeParams {
     start_bit: usize,
     /// Inexact stop hint: first deflate block boundary at-or-past this
     /// bit (vendor `untilOffset` when `untilOffsetIsExact == false`).
-    /// NOT a hard byte cap on the ISA-L reader — see
-    /// `decode_chunk_isal_inexact` vs `decode_chunk_isal_exact_until`.
+    /// NOT a hard byte cap on the ISA-L reader — see `decode_chunk_isal_inexact`.
     until_bit: usize,
     /// True for partition-aligned prefetches that may run before the
     /// predecessor window is published (speculative path). False for
@@ -1240,9 +1235,8 @@ fn run_post_process_task(
 /// 15-38 such prefetches per silesia decode, that's 200-500 ms of pure
 /// waste, half the total wall time.
 ///
-/// Slow-path trial decode now uses `decode_chunk_isal_inexact` (patched
-/// ISA-L, empty dict) instead of the deflate_block bootstrap that was
-/// failing with `InvalidHuffmanCode` at real boundaries. We still walk
+/// Slow-path trial decode uses `decode_chunk_isal_inexact` (patched ISA-L,
+/// empty dict). We still walk
 /// every candidate in each 8 KiB sub-window and return on first success
 /// (vendor GzipChunk.hpp:837-841).
 ///
@@ -1278,8 +1272,8 @@ pub static PREFETCH_REJECT_BY_GUARD: std::sync::atomic::AtomicU64 =
 
 /// Speculative slow-path decode without a predecessor window. Uses
 /// `decode_chunk_isal_inexact` with an empty dict (markers for unknown
-/// back-refs) instead of `decode_chunk_marker_bootstrap_then_isal`'s
-/// deflate_block bootstrap, which was failing with `InvalidHuffmanCode`
+/// back-refs). Replaced the old marker-bootstrap path that failed with
+/// `InvalidHuffmanCode`
 /// at real block boundaries on gzip -9 silesia and burning worker time.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 fn try_speculative_decode_candidate(

@@ -1,5 +1,8 @@
 # Marker Decoder Performance Roadmap
 
+> **Historical (May 2026):** Targets `fast_marker_inflate`, which is no longer in the
+> tree. Production SM prefetch/on-demand decode uses `decode_chunk_isal_inexact`.
+
 Produced by Opus analysis (2026-05-15), then checked against the worktree and
 `vendor/rapidgzip` on disk.
 

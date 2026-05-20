@@ -136,11 +136,9 @@ pub fn decompress_parallel<W: Write>(
 
     #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
     {
-        use crate::decompress::parallel::parallel_gzip_reader::{
-            read_parallel_sm, ReadParallelSmError,
-        };
+        use crate::decompress::parallel::sm_driver::{read_parallel_sm, ReadParallelSmError};
 
-        // Audit step 7 — driver moves into `parallel_gzip_reader::read_parallel_sm`.
+        // Production driver: `sm_driver::read_parallel_sm` → `chunk_fetcher::drive`.
         // `single_member::decompress_parallel` is now a thin classifier-
         // routed wrapper: it owns the routing-eligibility gate and the
         // `MARKER_PIPELINE_RUNS` counter; the trailer parsing + CRC /

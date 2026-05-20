@@ -432,10 +432,10 @@ fn reverse_low_bits(mut v: u32, n: u8) -> u32 {
 /// the position only if both are well-formed (valid litlen alphabet
 /// entries, not the unused 286/287 codes, first symbol not EOB).
 ///
-/// This is the cheap prefilter; the strict check is the worker's full
-/// `deflate_block::Block` trial-decode, which surfaces any malformed
-/// block as `BlockError`. The job here is to *eliminate most false
-/// positives* — catching all of them is the trial-decode's job. Two
+/// This is the cheap prefilter; the strict check is the worker's
+/// `decode_chunk_isal_inexact` trial-decode at the candidate offset.
+/// The job here is to *eliminate most false positives* — catching all
+/// of them is the trial-decode's job. Two
 /// symbols is the
 /// sweet spot: enough to reject ~95% of random positions (each random
 /// 9-bit pattern has ~256/512 chance of mapping to a valid symbol; two
@@ -466,8 +466,7 @@ pub(crate) fn validate_fixed_block_prefix(data: &[u8], bit_offset: usize) -> boo
     bit += code_len as usize;
     // For length codes, skip past the bits we know come next so the
     // second symbol's peek lands on the right bit. We don't validate
-    // those extras / distance codes — that's the worker's
-    // `deflate_block::Block` trial-decode's job.
+    // those extras / distance codes — that's the worker trial-decode's job.
     if sym >= 257 {
         let lidx = (sym - 257) as usize;
         const LENGTH_EXTRA_BITS: [u8; 29] = [
@@ -537,8 +536,7 @@ impl<'a> BlockFinder<'a> {
     /// Find the first plausible block-header candidate at or after
     /// `from_bit`, scanning up to `scan_radius_bits` ahead. Returns the
     /// raw bit offset of the candidate (no full trial-decode here;
-    /// caller is expected to trial-decode via `deflate_block::Block`
-    /// and trust ISA-L's verdict).
+    /// caller trial-decodes via `decode_chunk_isal_inexact`).
     /// Mirrors what rapidgzip does in `decodeChunkWithRapidgzip` — it
     /// trusts a single candidate and lets the deflate decoder reject
     /// false positives via its own error path.

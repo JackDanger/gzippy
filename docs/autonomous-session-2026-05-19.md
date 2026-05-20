@@ -100,13 +100,10 @@ Remaining items are either:
   §B8 extra fixed-Huffman prefilter, §B10 direct-try deletion,
   §C16-18 split semantics, §C20 direct-try-at-guessed-offset)
 - 🟡 / ❌ Out-of-scope-for-overnight: §A3 §I cutover (multi-PR
-  structural rewrite that replaces `chunk_fetcher::drive` /
-  `consumer_loop` / `worker_loop` / `fast_marker_inflate` with a
-  literal port of `ParallelGzipReader::read`). The doc's §A3 plan
-  has 9 sequential steps; steps 2-3-6-7-8 are now DONE; steps
-  1/4/5/9 (delete spec ring, stop calling fast_marker_inflate,
-  unify the wrapper avail_in cap with chain invariant) are the
-  next-session block.
+  structural rewrite). **Update (May 2026):** unwired museum modules
+  (`fast_marker_inflate`, `deflate_block`, `parallel_gzip_reader`, …)
+  were deleted; production is `sm_driver` → `chunk_fetcher::drive` →
+  `decode_chunk_isal_inexact`. See `docs/rapidgzip-port-reference.md`.
 
 ## What's identified but deferred
 

@@ -1,6 +1,6 @@
 //! Main-branch-only comprehensive fuzz harness for the v0.6 marker pipeline.
 //!
-//! # Why this lives here, not in `src/decompress/parallel/deflate_block.rs`
+//! # Why this lives here, not under `src/decompress/parallel/`
 //!
 //! The unit-test module already has `fuzz_diff_against_oracle` with 200 trials
 //! that catches generic decoder regressions. This file is a deliberately
@@ -36,9 +36,9 @@
 //!   `u16_to_u8`.
 //! - **B5**: CRC=0 and ISIZE=0 trailers always verify (regression-tested
 //!   in `single_member::tests` today; widen to randomized fixtures).
-//! - **B7**: false-positive boundary that ISA-L accepts but a full
-//!   `deflate_block::Block` trial-decode rejects — synthesize an
-//!   adversarial bit-stream and confirm rejection.
+//! - **B7**: false-positive boundary that ISA-L accepts but an inexact
+//!   chunk trial-decode rejects — synthesize an adversarial bit-stream
+//!   and confirm rejection.
 //! - **C1**: `MARKER_PIPELINE_RUNS` increments on every successful run
 //!   (already covered by routing tests at fixed fixtures; widen here
 //!   across randomized inputs that should all take the parallel path).

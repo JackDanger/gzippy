@@ -1,5 +1,12 @@
 # Rapidgzip-in-Rust Port: Full Design
 
+> **Status (May 2026):** The unwired rapidgzip port files (“museum”) were deleted.
+> Production SM decode is `sm_driver::read_parallel_sm` → `chunk_fetcher::drive` →
+> `gzip_chunk::decode_chunk_isal_inexact` (ISA-L via `inflate_wrapper`). Modules
+> such as `fast_marker_inflate`, `deflate_block`, and `parallel_gzip_reader` no
+> longer exist — see git history. The spec below is kept for type/layout reference;
+> the **Files** tables are outdated.
+
 This is the complete design of the rewrite. Every type, every function
 signature, every piece of data flow, and every concurrency interaction is
 specified before any of it gets implemented. Per the user directive: hold
@@ -25,41 +32,25 @@ ISA-L-stopping-point patch we already vendored at `crates/isal-sys-patched/`.
 All citations of the form `[path:lines]` are to the vendored rapidgzip
 source at `vendor/rapidgzip/librapidarchive/src/rapidgzip/`.
 
-## Files (final state)
+## Files (as of May 2026 — production tree)
 
-### New
+### Kept (hot path)
 
-| Path | Purpose | Approx LOC |
-|---|---|---|
-| `src/decompress/parallel/chunk_data.rs` | `ChunkData`, `Subchunk`, `ChunkStatistics`, `ChunkConfiguration` | 200 |
-| `src/decompress/parallel/inflate_wrapper.rs` | `IsalInflateWrapper` — stateful streaming inflate with stopping points (port of `gzip/isal.hpp`) | 350 |
-| `src/decompress/parallel/gzip_chunk.rs` | `decode_chunk_with_inflate_wrapper` + `finish_decode_chunk_with_inexact_offset` (port of `chunkdecoding/GzipChunk.hpp`) | 400 |
-| `src/decompress/parallel/window_map.rs` | `WindowMap` — propagated window storage keyed by encoded bit offset | 80 |
-| `src/decompress/parallel/chunk_fetcher.rs` | `GzipChunkFetcher` — prefetcher + on-demand fetch + window propagation orchestration (port of `GzipChunkFetcher.hpp` + `BlockFetcher.hpp`) | 500 |
-| `src/decompress/parallel/apply_window.rs` | `apply_window` — resolve `data_with_markers` against a known window (re-uses existing `replace_markers` SIMD kernel) | 100 |
-
-### Modified
-
-| Path | Change |
+| Path | Role |
 |---|---|
-| `src/decompress/parallel/single_member.rs` | Rewrite `decompress_parallel` to use `GzipChunkFetcher`. Delete v0.6 scaffolding. Drops from ~3300 lines to ~300. |
-| `src/decompress/parallel/mod.rs` | Wire new modules; remove deleted ones. |
-| `src/decompress/parallel/fast_marker_inflate.rs` | Keep only the parts used by oracle tests / `skip_gzip_header`. |
-| `src/decompress/mod.rs` | Routing unchanged; new path is drop-in. |
+| `sm_driver.rs` | Gzip envelope + CRC/ISIZE verify; calls `chunk_fetcher::drive` |
+| `chunk_fetcher.rs` | Consumer/worker orchestration, prefetch, window propagation |
+| `gzip_chunk.rs` | `decode_chunk_isal_inexact` — ISA-L chunk decode (speculative + on-demand) |
+| `inflate_wrapper.rs` | `IsalInflateWrapper` — patched ISA-L stopping points |
+| `chunk_data.rs`, `window_map.rs`, `apply_window.rs`, `replace_markers.rs` | Chunk model + marker resolution |
+| `block_finder.rs`, `block_fetcher.rs`, `block_map.rs` | Boundary candidates + block map |
+| `single_member.rs` | Router entry `decompress_parallel` |
 
-### Deleted
+### Removed (museum — recover via git)
 
-- `src/decompress/parallel/block_finder.rs` — rapidgzip's blockfinder is internal to its chunk worker (`GzipChunk::seekToNonFinalDynamicDeflateBlock`); we don't need a separate Rust port because the patched ISA-L's stopping points already discover boundaries during decode.
-- `src/decompress/parallel/ultra_fast_inflate.rs` — gzippy-specific bootstrap helper; no rapidgzip analogue.
-- Most of `src/decompress/parallel/fast_marker_inflate.rs` — bootstrap + marker decoder loop; kept only `skip_gzip_header` and the oracle helpers.
-- Inside `single_member.rs`:
-  - `PartitionRegistry`, `BoundaryRegistry`, `WorkerOutcome`, `CandidateChunk`, `AuthoritativeChunk`, `PartitionState`
-  - `reconcile_partitions`, `redistribute_oversized_chunks`, `split_authoritative_chunk`
-  - `try_precompute_input_windows`, `phase2_resolve_parallel`, `phase2_resolve_sequential`
-  - `marker_only_candidate`, `decode_chunk_inexact`, `decode_chunk_exact`, `decode_chunk_with_handoff_legacy`, `marker_finish_after_bootstrap`
-  - `phase1_search_boundaries`, `search_boundary_forward`, `search_boundary_forward_extended`, `try_decode_at`
-  - All `HANDOFF_FIRED`, `SLOW_PATH_USED`, `BOOTSTRAP_OUTPUT_BYTES`, `ISAL_OUTPUT_BYTES`, `BOUNDARY_VALIDATIONS`, `MARKER_PIPELINE_RETRY_ITERATIONS` counters
-  - `phase1c_resolve_consistency` (and its compatibility wrapper)
+Unwired rapidgzip ports deleted to reduce confusion: `deflate_block`, `parallel_gzip_reader`,
+`fast_marker_inflate`, Huffman table variants, split `blockfinder_*`, `gzip_reader`,
+`gzip_analyzer`, `index_file_format`, and ~20 similar files.
 
 ## Type system (complete)
 
@@ -236,7 +227,7 @@ pub fn decode_chunk_with_inflate_wrapper(
 /// subchunks at boundaries when `decoded_size >= split_chunk_size`.
 /// Sets `stopped_preemptively` if `max_decoded_chunk_size` was hit
 /// before reaching `until_bits`.
-pub fn finish_decode_chunk_with_inexact_offset(
+pub fn decode_chunk_isal_inexact(
     wrapper: &mut IsalInflateWrapper,
     until_bits: usize,
     initial_window: &[u8],
@@ -398,7 +389,7 @@ decompress_parallel(deflate_data, writer, T=16)
   │     │     ├─► IF cache miss OR mismatch:
   │     │     │     dispatch worker for current_offset (on-demand)
   │     │     │     spawn workers for next prefetch slots up to cache capacity
-  │     │     │     workers run finish_decode_chunk_with_inexact_offset(...)
+  │     │     │     workers run decode_chunk_isal_inexact(...)
   │     │     │     each worker produces a ChunkData with subchunks
   │     │     │
   │     │     ├─► WAIT for current chunk's worker (with timeout-based prefetch poking)
@@ -421,7 +412,7 @@ decompress_parallel(deflate_data, writer, T=16)
 
 - **One scoped thread pool** of size T. Workers blocked on a work queue
   fed by the fetcher.
-- **Worker tasks**: `finish_decode_chunk_with_inexact_offset` (most
+- **Worker tasks**: `decode_chunk_isal_inexact` (most
   common) or `decode_chunk_with_inflate_wrapper` (rare, on exact retry).
   Produce ChunkData. No shared mutable state.
 - **Apply-window tasks**: dispatched after window_map.get() succeeds.
@@ -463,7 +454,7 @@ Each new module gets its own unit tests. Key end-to-end tests:
    window); `data` MUST equal expected bytes; `subchunks` must
    match `record_block_starts` boundaries inside the range.
 
-4. **`finish_decode_chunk_with_inexact_offset` oracle**: decode
+4. **`decode_chunk_isal_inexact` oracle**: decode
    from bit 0 with empty window. Resulting ChunkData's
    `data_with_markers` may be non-empty (cross-chunk back-refs are
    zeros from empty window). After `apply_window` with the right

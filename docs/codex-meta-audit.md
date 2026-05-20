@@ -1,23 +1,27 @@
 # Codex 5.5 — meta-audit of the rapidgzip cutover
 
+> **Update (May 2026):** The unwired port files this audit calls a “museum” were
+> deleted from `src/decompress/parallel/`. Production SM decode is
+> `sm_driver` → `chunk_fetcher` → `gzip_chunk::decode_chunk_isal_inexact`.
+> `docs/rapidgzip-port-reference.md` is now a short archive pointer. This
+> document is kept as historical context on the cutover trajectory.
+>
 > Outside reader. No prior context. Two passes through git, the repo, the
-> reference doc. The assistant has already authored a sharp self-audit
-> (`docs/rapidgzip-port-reference.md` §A1–A4). This document does what
-> that one cannot: name the blind spots in the self-audit itself.
+> reference doc. The assistant authored a sharp self-audit (formerly
+> `docs/rapidgzip-port-reference.md` §A1–A4, now archived). This document
+> names blind spots in that self-audit.
 
 ## 1. Blind spots
 
 **Scope inflation disguised as scope narrowing.** The cutover policy
 turned "all of rapidgzip" into "port every gzip-relevant primitive,
-reader, index, analyzer." `src/decompress/parallel/` is now 60 files,
-23,588 LOC against ~5,900 LOC for vendor's hot path. The assistant is
-porting a *library*; the user asked for a *gzip decompressor*. Files
-like `gzip_analyzer.rs` (301), `index_file_format.rs` (532),
-`parallel_bit_string_finder.rs`, `simple_run_length_encoding.rs`,
-`streamed_results.rs`, multiple Huffman variants exist for rapidgzip's
-*indexed-archive Python product*. None are on the gzippy CLI hot path.
-The self-audit calls this a "museum"; it does not call it a
-misreading of the goal.
+reader, index, analyzer." At the time of writing, `src/decompress/parallel/`
+had grown to ~60 files / ~24k LOC of mostly unwired ports (`gzip_analyzer`,
+`index_file_format`, Huffman table variants, etc.) for rapidgzip's
+*indexed-archive Python product*, not the CLI hot path. That museum was
+later deleted (May 2026); ~24 production files remain. The self-audit
+does not call the original trajectory a misreading of the goal — it
+should have been.
 
 **Files never opened:** `vendor/rapidgzip/librapidarchive/src/tools/`
 and `vendor/rapidgzip/python/`. Those reveal which `.hpp` files are
@@ -29,7 +33,7 @@ the Python module.
 **Code treated as out-of-scope but probably matters:**
 `src/decompress/inflate/`, `src/decompress/{combined_lut,packed_lut,simd_huffman,
 two_level_table}.rs`, `src/backends/inflate_bit.rs`. The self-audit
-fixates on `chunk_fetcher`/`deflate_block`; per-thread *inner* inflate
+fixates on `chunk_fetcher`/chunk decode; per-thread *inner* inflate
 is what determines steady-state throughput. Gzippy already has SIMD
 inflate primitives rapidgzip lacks. Rule #7 ("PORT, DON'T INNOVATE")
 forbids using them.
@@ -109,10 +113,9 @@ a 1043-line `consumer_loop`.
 - **Ceremony substitutes for cutover.** Vendor-named files, `file:line`
   citations, "the new code ran" tests — production call site
   unchanged. Recurs ~every 10 commits. The self-audit names it and the
-  *next* commit cluster did it again: `7bd9ba7
-  parallel_gzip_reader — top-level orchestrator skeleton` is 510 LOC
-  whose `decompress_parallel` still routes through
-  `chunk_fetcher::drive`.
+  *next* commit cluster did it again: a `parallel_gzip_reader` skeleton
+  (since removed) whose `decompress_parallel` still routed through
+  `chunk_fetcher::drive` — decoration, not cutover.
 
 - **Defensive patches over diagnosis.** `f902c06`, `9f76440` — author
   wrote "moves the failure from panic to ISIZE mismatch," knowingly
