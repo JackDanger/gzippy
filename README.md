@@ -1,5 +1,8 @@
 # gzippy
 
+> **Part of the [7-zippy](https://github.com/JackDanger/7zippy) family** — pure-Rust compression tooling.
+> Full suite: `cargo add sevenzippy`  |  This crate: `cargo add gzippy`
+
 The fastest gzip on any hardware. Drop-in for `gzip`, `gunzip`, `gzcat`,
 `zcat`, and `ungzippy` — same RFC 1952 output, every decompressor on Earth
 still reads your files.
