@@ -1,6 +1,8 @@
---- /tmp/isal-sys-upstream/isal-sys-0.5.3+496255c/isa-l/igzip/igzip_inflate.c	2006-07-23 18:21:28
-+++ /Users/jackdanger/www/gzippy/.claude/worktrees/agent-a4547d0323279f0d3/crates/isal-sys-patched/isa-l/igzip/igzip_inflate.c	2026-05-20 20:20:40
-@@ -246,7 +246,7 @@
+diff --git a/igzip/igzip_inflate.c b/igzip/igzip_inflate.c
+index ec788ab..c2f0a17 100644
+--- a/igzip/igzip_inflate.c
++++ b/igzip/igzip_inflate.c
+@@ -246,7 +246,7 @@ static void inline write_huff_code(struct huff_code *huff_code, uint32_t code, u
          huff_code->code_and_length = code | length << 24;
  }
  
@@ -9,7 +11,7 @@
  {
          uint32_t max, code, length;
          uint32_t next_code[MAX_HUFF_TREE_DEPTH + 1];
-@@ -278,9 +278,9 @@
+@@ -278,9 +278,9 @@ static int inline set_codes(struct huff_code *huff_code_table, int table_length,
          return 0;
  }
  
@@ -22,7 +24,7 @@
  {
          int len_sym, len_size, extra_count, extra;
          uint32_t count_total, count_tmp;
-@@ -383,7 +383,7 @@
+@@ -383,7 +383,7 @@ static int inline index_to_sym(int index) { return (index != 513) ? index : 512;
  /* Sets result to the inflate_huff_code corresponding to the huffcode defined by
   * the lengths in huff_code_table,where count is a histogram of the appearance
   * of each code length */
@@ -31,7 +33,7 @@
  make_inflate_huff_code_lit_len(struct inflate_huff_code_large *result,
                                 struct huff_code *huff_code_table, uint32_t table_length,
                                 uint16_t *count_total, uint32_t *code_list, uint32_t multisym)
-@@ -598,7 +598,7 @@
+@@ -598,7 +598,7 @@ make_inflate_huff_code_lit_len(struct inflate_huff_code_large *result,
          }
  }
  
@@ -40,7 +42,25 @@
                                                 struct huff_code *huff_code_table,
                                                 uint32_t table_length, uint16_t *count,
                                                 uint32_t max_symbol)
-@@ -1409,6 +1409,8 @@
+@@ -1022,7 +1022,7 @@ static void inline decode_next_lit_len(uint32_t *next_lits, uint32_t *sym_count,
+         /* next_sym is a possible symbol decoded from next_bits. If bit 15 is 0,
+          * next_code is a symbol. Bits 9:0 represent the symbol, and bits 14:10
+          * represent the length of that symbols huffman code. If next_sym is not
+-         * a symbol, it provides a hint of where the large symbols containin
++         * a symbol, it provides a hint of where the large symbols containing
+          * this code are located. Note the hint is at largest the location the
+          * first actual symbol in the long code list.*/
+         next_sym = huff_code->short_code_lookup[next_bits];
+@@ -1076,7 +1076,7 @@ static uint16_t inline decode_next_dist(struct inflate_state *state,
+         /* next_sym is a possible symbol decoded from next_bits. If bit 15 is 0,
+          * next_code is a symbol. Bits 9:0 represent the symbol, and bits 14:10
+          * represent the length of that symbols huffman code. If next_sym is not
+-         * a symbol, it provides a hint of where the large symbols containin
++         * a symbol, it provides a hint of where the large symbols containing
+          * this code are located. Note the hint is at largest the location the
+          * first actual symbol in the long code list.*/
+         next_sym = huff_code->short_code_lookup[next_bits];
+@@ -1409,6 +1409,8 @@ read_header(struct inflate_state *state)
  
          state->bfinal = inflate_in_read_bits(state, 1);
          btype = inflate_in_read_bits(state, 2);
@@ -49,7 +69,7 @@
  
          if (state->read_in_length < 0)
                  ret = ISAL_END_INPUT;
-@@ -1742,6 +1744,11 @@
+@@ -1742,6 +1744,11 @@ isal_inflate_init(struct inflate_state *state)
          state->tmp_in_size = 0;
          state->tmp_out_processed = 0;
          state->tmp_out_valid = 0;
@@ -61,7 +81,7 @@
  }
  
  void
-@@ -1762,6 +1769,10 @@
+@@ -1762,6 +1769,10 @@ isal_inflate_reset(struct inflate_state *state)
          state->wrapper_flag = 0;
          state->tmp_in_size = 0;
          state->tmp_out_processed = 0;
@@ -72,7 +92,16 @@
          state->tmp_out_valid = 0;
  }
  
-@@ -2225,7 +2236,7 @@
+@@ -2145,7 +2156,7 @@ isal_inflate_set_dict(struct inflate_state *state, uint8_t *dict, uint32_t dict_
+ int
+ isal_inflate_stateless(struct inflate_state *state)
+ {
+-        uint32_t ret = 0;
++        int ret = 0;
+         uint8_t *start_out = state->next_out;
+ 
+         state->read_in = 0;
+@@ -2225,7 +2236,7 @@ isal_inflate_stateless(struct inflate_state *state)
  }
  
  int
@@ -81,7 +110,7 @@
  {
  
          uint8_t *start_out = state->next_out;
-@@ -2234,6 +2245,31 @@
+@@ -2234,6 +2245,31 @@ isal_inflate(struct inflate_state *state)
          int32_t shift_size = 0;
          int ret = 0;
  
@@ -113,7 +142,7 @@
          if (!state->wrapper_flag && state->crc_flag == IGZIP_GZIP) {
                  struct isal_gzip_header gz_hdr;
  
-@@ -2243,6 +2279,12 @@
+@@ -2243,6 +2279,12 @@ isal_inflate(struct inflate_state *state)
                          return ret;
                  else if (ret > 0)
                          return ISAL_DECOMP_OK;
@@ -126,7 +155,7 @@
          } else if (!state->wrapper_flag && state->crc_flag == IGZIP_ZLIB) {
                  struct isal_zlib_header z_hdr;
  
-@@ -2257,6 +2299,11 @@
+@@ -2257,6 +2299,11 @@ isal_inflate(struct inflate_state *state)
                          state->dict_id = z_hdr.dict_id;
                          return ISAL_NEED_DICT;
                  }
@@ -138,7 +167,7 @@
          } else if (state->block_state == ISAL_CHECKSUM_CHECK) {
                  switch (state->crc_flag) {
                  case ISAL_ZLIB:
-@@ -2272,39 +2319,94 @@
+@@ -2272,39 +2319,94 @@ isal_inflate(struct inflate_state *state)
                  return (ret > 0) ? ISAL_DECOMP_OK : ret;
          }
  
@@ -238,7 +267,7 @@
                          /* Copy valid data from internal buffer into out_buffer */
                          if (state->write_overflow_len != 0) {
                                  store_le_u32(state->next_out, state->write_overflow_lits);
-@@ -2349,27 +2451,82 @@
+@@ -2349,27 +2451,82 @@ isal_inflate(struct inflate_state *state)
                          state->total_out -= state->tmp_out_valid - state->tmp_out_processed;
                          if (state->crc_flag)
                                  update_checksum(state, start_out, state->next_out - start_out);
@@ -329,7 +358,7 @@
                  }
  
                  if (state->crc_flag)
-@@ -2423,6 +2580,12 @@
+@@ -2423,6 +2580,12 @@ isal_inflate(struct inflate_state *state)
                          return ret;
                  }
  
@@ -342,7 +371,7 @@
                  if (state->block_state == ISAL_BLOCK_INPUT_DONE &&
                      state->tmp_out_valid == state->tmp_out_processed) {
                          state->block_state = ISAL_BLOCK_FINISH;
-@@ -2448,5 +2611,21 @@
+@@ -2448,5 +2611,21 @@ isal_inflate(struct inflate_state *state)
                  state->total_out -= state->tmp_out_valid - state->tmp_out_processed;
          }
  

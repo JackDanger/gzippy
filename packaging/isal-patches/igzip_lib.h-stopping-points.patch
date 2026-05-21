@@ -1,6 +1,8 @@
---- /tmp/isal-sys-upstream/isal-sys-0.5.3+496255c/isa-l/include/igzip_lib.h	2006-07-23 18:21:28
-+++ /Users/jackdanger/www/gzippy/.claude/worktrees/agent-a4547d0323279f0d3/crates/isal-sys-patched/isa-l/include/igzip_lib.h	2026-05-20 20:20:40
-@@ -229,6 +229,22 @@
+diff --git a/include/igzip_lib.h b/include/igzip_lib.h
+index ee9b72a..7146594 100644
+--- a/include/igzip_lib.h
++++ b/include/igzip_lib.h
+@@ -229,6 +229,22 @@ enum isal_block_state {
          ISAL_CHECKSUM_CHECK,
  };
  
@@ -23,7 +25,7 @@
  /* Inflate Flags */
  #define ISAL_DEFLATE         0 /* Default */
  #define ISAL_GZIP            1
-@@ -543,6 +559,13 @@
+@@ -543,6 +559,13 @@ struct inflate_state {
          uint8_t tmp_out_buffer[2 * ISAL_DEF_HIST_SIZE +
                                 ISAL_LOOK_AHEAD]; //!< Temporary buffer containing data from the
                                                   //!< output stream

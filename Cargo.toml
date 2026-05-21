@@ -116,6 +116,7 @@ strip = true          # Remove symbols for smaller binary
 # rustflags = ["-C", "target-cpu=native"]
 
 # Patched isal-sys from vendor/isal-rs (JackDanger/isal-rs branch
-# gzippy-stopping-points). C source from vendor/isa-l. See packaging/isal-patches/.
+# gzippy-stopping-points). C source via ISAL_SOURCE=vendor/isa-l (.cargo/config.toml).
+# See packaging/isal-patches/.
 [patch.crates-io]
 isal-sys = { path = "vendor/isal-rs/isal-sys" }

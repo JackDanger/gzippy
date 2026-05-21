@@ -58,7 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: true  # Only direct submodules (pigz), not recursive (gzip has problematic gnulib)
+          submodules: true  # vendor/isa-l, vendor/isal-rs, pigz, … (not recursive — gzip gnulib)
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
