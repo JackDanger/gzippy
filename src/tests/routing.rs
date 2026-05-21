@@ -609,6 +609,41 @@ mod tests {
         let _ = (before_runs, after_runs);
     }
 
+    /// Mirrors benchmarks.yml `random-data` (10 MiB urandom, L9 T4 compress,
+    /// parallel SM decompress). Reproduces CI's `ExactStopMissed` at the 10 MiB
+    /// partition when fixed-Huffman tail blocks were skipped by BlockFinder.
+    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    #[test]
+    fn test_random_10mb_pipelined_l9_roundtrip_parallel_sm() {
+        use crate::compress::pipelined::PipelinedGzEncoder;
+        use std::io::Cursor;
+
+        let mut original = vec![0u8; 10 * 1024 * 1024];
+        let mut state = 0xc0ffeeu64;
+        for b in &mut original {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (state >> 32) as u8;
+        }
+
+        let encoder = PipelinedGzEncoder::new(9, 4);
+        let mut compressed = Vec::new();
+        encoder
+            .compress(Cursor::new(&original), &mut compressed)
+            .unwrap();
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "fixture must exceed 10 MiB parallel gate (got {} bytes)",
+            compressed.len()
+        );
+
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        assert_eq!(
+            output, original,
+            "byte-perfect roundtrip on CI-shaped fixture"
+        );
+    }
+
     #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
     mod fname_header_parallel_sm {
         use super::*;

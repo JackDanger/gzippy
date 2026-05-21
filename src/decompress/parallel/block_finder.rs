@@ -728,9 +728,20 @@ impl<'a> BlockFinder<'a> {
                     bit_offset += 1;
                 }
                 1 => {
-                    // Fixed Huffman — not emitted here. BTYPE=01 boundary
-                    // detection lives in `single_member::search_boundary_forward`
-                    // as a separate tier with its own cheap prefilter.
+                    // Fixed Huffman — emit as candidate when the cheap
+                    // 2-symbol prefilter passes (pipelined zlib-ng / L9
+                    // streams often end with a short fixed block in the
+                    // tail partition; skipping these caused ExactStopMissed
+                    // on CI's 10 MiB random roundtrip).
+                    if validate_fixed_block_prefix(self.data, bit_offset) {
+                        blocks.push(BlockBoundary {
+                            bit_offset,
+                            valid: true,
+                            hlit: 0,
+                            hdist: 0,
+                            hclen: 0,
+                        });
+                    }
                     reader.skip(1);
                     bit_offset += 1;
                 }
@@ -1100,10 +1111,8 @@ mod tests {
         assert!(lut[0b000] > 0);
         assert!(lut[0b001] > 0);
 
-        // Invalid: BTYPE=01 (fixed) — excluded from candidate search at
-        // the BlockFinder level. Detection lives in
-        // `single_member::search_boundary_forward` as a dedicated tier
-        // that runs only when the other tiers find nothing.
+        // Invalid: BTYPE=01 (fixed) — skipped by the dynamic LUT but
+        // emitted when validate_fixed_block_prefix passes in the scan loop.
         assert!(lut[0b010] > 0);
         assert!(lut[0b011] > 0);
 
@@ -1314,6 +1323,45 @@ mod tests {
             sequential.len(),
             parallel.len(),
             "T1: parallel must match sequential"
+        );
+    }
+
+    /// Mirrors benchmarks.yml random-data: 10 MiB incompressible input,
+    /// L9 pipelined compress. The tail partition (from 10 MiB bit offset)
+    /// often contains only fixed-Huffman blocks — skipping BTYPE=01 caused
+    /// `ExactStopMissed` in parallel SM slow-path boundary search.
+    #[test]
+    fn test_find_blocks_finds_fixed_huffman_in_tail_partition() {
+        use crate::compress::pipelined::PipelinedGzEncoder;
+        use std::io::Cursor;
+
+        let mut original = vec![0u8; 10 * 1024 * 1024];
+        let mut state = 0x12345678u64;
+        for b in &mut original {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (state >> 32) as u8;
+        }
+
+        let encoder = PipelinedGzEncoder::new(9, 4);
+        let mut compressed = Vec::new();
+        encoder
+            .compress(Cursor::new(&original), &mut compressed)
+            .unwrap();
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "fixture must exceed 10 MiB parallel gate (got {} bytes)",
+            compressed.len()
+        );
+
+        let header_size =
+            crate::decompress::format::parse_gzip_header_size(&compressed).unwrap_or(10);
+        let deflate = &compressed[header_size..compressed.len() - 8];
+        let partition_bit = 10 * 1024 * 1024 * 8;
+        let finder = BlockFinder::new(deflate);
+        let candidates = finder.find_blocks(partition_bit, deflate.len() * 8);
+        assert!(
+            !candidates.is_empty(),
+            "tail partition starting at 10 MiB must expose at least one block boundary"
         );
     }
 }
