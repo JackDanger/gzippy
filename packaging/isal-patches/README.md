@@ -20,6 +20,10 @@ embed its own isa-l tree.
 git submodule update --init vendor/isa-l vendor/isal-rs
 ```
 
+**Before pushing gzippy** after bumping either submodule pointer, push the fork
+branch first (`vendor/isa-l` → JackDanger/isa-l, `vendor/isal-rs` → JackDanger/isal-rs).
+`scripts/pre-push` runs `scripts/verify_submodule_remotes.sh` to catch missing commits.
+
 Crates.io releases strip `[patch.crates-io]`; release binaries must be built from a
 full git checkout with both submodules initialized.
 
