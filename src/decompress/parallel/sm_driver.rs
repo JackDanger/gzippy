@@ -58,10 +58,11 @@ pub fn read_parallel_sm<W: std::io::Write>(
     })
 }
 
-#[cfg_attr(
-    not(all(feature = "isal-compression", target_arch = "x86_64")),
-    allow(dead_code)
-)]
+// `total_crc` is verified against the trailer inside `read_parallel_sm`; the
+// field is kept on the result for completeness even though the current caller
+// reads only `total_size`. The allow is unconditional: non-x86 builds never
+// construct `ReadResult`, and x86 builds construct it but read only the size.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct ReadResult {
     pub total_crc: u32,
