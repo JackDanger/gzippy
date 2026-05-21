@@ -411,7 +411,7 @@ jobs:
             --level ${{ matrix.level }} \
             --threads $THREADS \
             --content-type ${{ matrix.data_type }} \
-            --output results/compression.json
+            --output results/compress-${{ matrix.data_type }}-l${{ matrix.level }}-t${{ matrix.threads }}.json
 
       - uses: actions/upload-artifact@v7
         with:
@@ -519,7 +519,7 @@ jobs:
             --original-file "$ORIGINAL_FILE" \
             --threads $THREADS \
             --archive-type ${{ matrix.archive_type }} \
-            --output results/decompression.json
+            --output results/decompress-${{ matrix.archive_type }}-t${{ matrix.threads }}.json
 
       - uses: actions/upload-artifact@v7
         with:
@@ -592,7 +592,8 @@ jobs:
           diff /tmp/random.bin /tmp/random.out
           echo "✓ gzippy roundtrip OK"
 
-          # Verify gzip compatibility
+          # Verify gzip format compatibility — always run regardless of thread count.
+          # Performance (beating pigz) does not prove format correctness.
           gzip -d < /tmp/random.gz > /tmp/random.gzip.out
           diff /tmp/random.bin /tmp/random.gzip.out
           echo "✓ gzip can decompress gzippy output"
@@ -639,7 +640,6 @@ jobs:
 
       - name: Check performance guards
         id: guards
-        continue-on-error: true
         run: |
           python3 scripts/check_guards.py \
             --compression aggregated/compression.json \

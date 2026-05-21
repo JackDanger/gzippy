@@ -50,17 +50,20 @@ def is_compression_result(data: dict) -> bool:
     """Check if this looks like a compression benchmark result."""
     if not isinstance(data, dict):
         return False
-    
-    # benchmark_ci.py outputs have these fields
-    if "level" in data and "threads" in data and "size_mb" in data:
-        return True
-    
-    # Or has 'results' list with compression data
-    if "results" in data:
+
+    # benchmark_compression.py / benchmark_ci.py
+    if "archive_type" in data:
+        return False
+    if "level" in data and "threads" in data and "results" in data:
         results = data["results"]
         if isinstance(results, list) and results:
-            return "level" in results[0] and "output_size" in results[0]
-    
+            first = results[0]
+            return isinstance(first, dict) and (
+                "output_size" in first or first.get("operation") == "compress"
+            )
+    if "level" in data and "threads" in data and "size_mb" in data:
+        return True
+
     return False
 
 
@@ -68,13 +71,22 @@ def is_decompression_result(data: dict) -> bool:
     """Check if this looks like a decompression benchmark result."""
     if not isinstance(data, dict):
         return False
-    
-    # Has benchmarks array with source field
+
+    # benchmark_decompression.py
+    if "archive_type" in data and "results" in data:
+        results = data["results"]
+        if isinstance(results, list) and results:
+            first = results[0]
+            return isinstance(first, dict) and (
+                "speed_mbps" in first or first.get("operation") == "decompress"
+            )
+
+    # Legacy format
     if "benchmarks" in data:
         benchmarks = data["benchmarks"]
         if isinstance(benchmarks, list) and benchmarks:
             return "source" in benchmarks[0] and "speed_mbps" in benchmarks[0]
-    
+
     return False
 
 
@@ -100,16 +112,28 @@ def normalize_compression_result(data: dict, source_file: str) -> list:
     elif "tarball" in source_lower:
         data_type = "tarball"
     
-    # Handle benchmark_ci.py output format
+    if data.get("content_type"):
+        data_type = data["content_type"]
+
+    level = data.get("level", 0)
+    threads = data.get("threads", 1)
+
+    # benchmark_compression.py / benchmark_ci.py
     if "results" in data:
         for r in data.get("results", []):
+            if "error" in r:
+                continue
+            speed = r.get("speed_mbps", r.get("speed", 0))
+            output_size = r.get("output_size", r.get("size", 0))
             results.append({
                 "tool": r.get("tool", "unknown"),
-                "level": r.get("level", 0),
-                "threads": r.get("threads", 1),
+                "level": r.get("level", level),
+                "threads": r.get("threads", threads),
                 "time": r.get("median", r.get("time", 0)),
-                "size": r.get("output_size", 0),
-                "speed": r.get("speed", 0),
+                "size": output_size,
+                "output_size": output_size,
+                "speed": speed,
+                "speed_mbps": speed,
                 "data_type": data_type,
                 "size_mb": data.get("size_mb", 0),
             })
@@ -152,20 +176,31 @@ def normalize_decompression_result(data: dict, source_file: str) -> list:
     elif "tarball" in source_lower:
         data_type = "tarball"
     
-    for b in data.get("benchmarks", []):
+    archive_type = data.get("archive_type", "unknown")
+    if archive_type != "unknown":
+        data_type = archive_type.split("-", 1)[0]
+    threads = data.get("threads", 1)
+
+    entries = data.get("results", data.get("benchmarks", []))
+    for b in entries:
+        if isinstance(b, dict) and "error" in b:
+            continue
+        source = b.get("archive_type", b.get("source", archive_type))
+        speed = b.get("speed_mbps", b.get("speed", 0))
         results.append({
             "tool": b.get("tool", "unknown"),
-            "source": b.get("source", "unknown"),
+            "source": source,
             "level": b.get("level", 0),
-            "threads": b.get("threads", 1),
-            "speed": b.get("speed_mbps", 0),
-            "time": b.get("mean_time", 0),
+            "threads": b.get("threads", threads),
+            "speed": speed,
+            "speed_mbps": speed,
+            "time": b.get("mean", b.get("mean_time", b.get("median", 0))),
             "trials": b.get("trials", 0),
             "cv": b.get("cv", 0),
             "status": b.get("status", "unknown"),
             "data_type": data_type,
         })
-    
+
     return results
 
 
@@ -270,7 +305,11 @@ def main():
     with open(decompression_file, 'w') as f:
         json.dump(decompression, f, indent=2)
     print(f"Wrote {len(decompression)} decompression results to {decompression_file}")
-    
+
+    if not compression and not decompression:
+        print("ERROR: no benchmark results parsed")
+        return 1
+
     return 0
 
 
