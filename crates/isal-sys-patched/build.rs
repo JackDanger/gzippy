@@ -12,12 +12,31 @@ fn main() {
     let target = std::env::var("TARGET").unwrap();
     let out_dir = PathBuf::from(&std::env::var("OUT_DIR").unwrap());
 
+    // Prefer the gzippy vendor submodule (JackDanger/isa-l branch
+    // gzippy-stopping-points). Fall back to the bundled copy for standalone
+    // isal-sys checkouts (crates.io publish strips [patch.crates-io]).
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vendor_isal = manifest_dir.join("../../vendor/isa-l");
+    let bundled_isal = manifest_dir.join("isa-l");
+    let source_isal = if vendor_isal.join("include/igzip_lib.h").exists() {
+        println!("cargo:rerun-if-changed={}", vendor_isal.join("include/igzip_lib.h").display());
+        println!("cargo:rerun-if-changed={}", vendor_isal.join("igzip/igzip_inflate.c").display());
+        vendor_isal
+    } else if bundled_isal.join("include/igzip_lib.h").exists() {
+        bundled_isal
+    } else {
+        panic!(
+            "ISA-L source not found — run `git submodule update --init vendor/isa-l` \
+             from the gzippy repo root"
+        );
+    };
+
     // Copy isa-l source into out; not allow to modify things outside of out dir
     let src_dir = out_dir.join("isa-l");
     if src_dir.exists() {
         std::fs::remove_dir_all(&src_dir).unwrap(); // maybe from a previous build
     }
-    copy_dir::copy_dir("isa-l", &src_dir).unwrap();
+    copy_dir::copy_dir(&source_isal, &src_dir).unwrap();
 
     let install_path = std::env::var("ISAL_INSTALL_PREFIX")
         .map(|p| PathBuf::from(&p).clone())

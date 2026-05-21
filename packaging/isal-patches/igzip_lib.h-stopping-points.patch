@@ -1,0 +1,39 @@
+--- /tmp/isal-sys-upstream/isal-sys-0.5.3+496255c/isa-l/include/igzip_lib.h	2006-07-23 18:21:28
++++ /Users/jackdanger/www/gzippy/.claude/worktrees/agent-a4547d0323279f0d3/crates/isal-sys-patched/isa-l/include/igzip_lib.h	2026-05-20 20:20:40
+@@ -229,6 +229,22 @@
+         ISAL_CHECKSUM_CHECK,
+ };
+ 
++/* Stopping-point extension (gzippy / rapidgzip patch).
++ * Lets the inflate state machine pause at deflate block events so the
++ * caller can record block boundaries in-band during decode. Without this,
++ * isal_inflate may transition through ISAL_BLOCK_NEW_HDR within a single
++ * call and the caller never observes the boundary. Bitfield so multiple
++ * events can be requested simultaneously. */
++enum isal_stopping_point
++{
++        ISAL_STOPPING_POINT_NONE                 = 0,
++        ISAL_STOPPING_POINT_END_OF_STREAM_HEADER = 1U << 0U,
++        ISAL_STOPPING_POINT_END_OF_STREAM        = 1U << 1U,
++        ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER  = 1U << 2U,
++        ISAL_STOPPING_POINT_END_OF_BLOCK         = 1U << 3U,
++        ISAL_STOPPING_POINT_ALL                  = 0xFFFFFFFFU,
++};
++
+ /* Inflate Flags */
+ #define ISAL_DEFLATE         0 /* Default */
+ #define ISAL_GZIP            1
+@@ -543,6 +559,13 @@
+         uint8_t tmp_out_buffer[2 * ISAL_DEF_HIST_SIZE +
+                                ISAL_LOOK_AHEAD]; //!< Temporary buffer containing data from the
+                                                  //!< output stream
++
++        /* Stopping-point extension (gzippy / rapidgzip patch). */
++        enum isal_stopping_point points_to_stop_at;
++        enum isal_stopping_point stopped_at;
++        enum isal_stopping_point tmp_out_stopped_at;
++        /* Only meaningful when stopped_at == ISAL_STOPPING_POINT_END_OF_BLOCK_HEADER. */
++        uint8_t btype;
+ };
+ 
+ /******************************************************************************/

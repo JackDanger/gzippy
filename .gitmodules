@@ -7,7 +7,7 @@
 [submodule "isa-l"]
 	path = vendor/isa-l
 	url = https://github.com/JackDanger/isa-l.git
-	branch = apple-arm64-fix
+	branch = gzippy-stopping-points
 [submodule "rapidgzip"]
 	path = vendor/rapidgzip
 	url = https://github.com/mxmlnkn/rapidgzip.git
