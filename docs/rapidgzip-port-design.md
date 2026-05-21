@@ -18,7 +18,7 @@ any of it until the entire thing is reasoned about.
 Replace gzippy's v0.6 marker-pipeline + reconcile + splitter design with
 a port of rapidgzip's parallel-decode architecture. End state: gzippy's
 parallel single-member path is structurally rapidgzip with the
-ISA-L-stopping-point patch we already vendored at `crates/isal-sys-patched/`.
+ISA-L-stopping-point patch we vendor at `vendor/isa-l` + `vendor/isal-rs/isal-sys`.
 
 ## Non-goals
 

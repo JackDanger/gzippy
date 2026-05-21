@@ -17,3 +17,7 @@
 [submodule "zopfli"]
 	path = vendor/zopfli
 	url = https://github.com/google/zopfli.git
+[submodule "isal-rs"]
+	path = vendor/isal-rs
+	url = https://github.com/JackDanger/isal-rs.git
+	branch = gzippy-stopping-points

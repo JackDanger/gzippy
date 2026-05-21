@@ -109,13 +109,28 @@ jobs:
         run: git submodule update --init vendor/zopfli
 
       - name: Corpus oracle vs vendor/zopfli
-        run: cargo test --release --features oracle corpus_gzip_output_matches_c_zopfli -- --include-ignored --nocapture
+        run: cargo test --release --features oracle --lib corpus_gzip_output_matches_c_zopfli -- --include-ignored --nocapture
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
           name: gzippy-${{ matrix.os }}-${{ matrix.arch }}
           path: target/release/gzippy
+
+  build-gate:
+    name: build
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    steps:
+      - name: All builds passed
+        run: |
+          if [[ "${{ needs.build.result }}" == "success" ]]; then
+            echo "All platform builds passed"
+          else
+            echo "One or more builds failed or were cancelled"
+            exit 1
+          fi
 
   validate:
     name: Validate vs pigz/gzip

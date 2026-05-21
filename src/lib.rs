@@ -220,6 +220,86 @@ pub fn decompress_to_writer_with_threads<W: std::io::Write + Send>(
 }
 
 // =============================================================================
+// Raw DEFLATE API (no gzip framing)
+// =============================================================================
+
+/// Compress `data` to raw DEFLATE (RFC 1951) at `level` — no gzip header or trailer.
+///
+/// `level` is clamped to `0..=12`. Uses the same backend hierarchy as [`compress`]:
+/// ISA-L SIMD on x86_64 for levels 0–3, then libdeflate one-shot for all levels.
+///
+/// Use this when the framing (CRC32, size) is handled by the caller, for example
+/// when embedding deflate streams in ZIP, 7z, or zlib containers.
+pub fn compress_raw(data: &[u8], level: u8) -> GzippyResult<Vec<u8>> {
+    compress::compress_raw_bytes(data, level)
+}
+
+/// Decompress a raw DEFLATE stream (RFC 1951) — no gzip header or trailer expected.
+///
+/// Uses libdeflate for speed, growing the output buffer as needed. Falls back to
+/// a flate2/zlib-ng streaming decoder if the output exceeds 1 GiB.
+///
+/// Returns an error if `data` is not valid DEFLATE.
+pub fn decompress_raw(data: &[u8]) -> GzippyResult<Vec<u8>> {
+    decompress::decompress_raw_bytes(data)
+}
+
+/// Alias for [`compress_raw`] — used by 7zippy's Deflate coder.
+pub use self::compress_raw as deflate_encode;
+
+/// Alias for [`decompress_raw`].
+pub use self::decompress_raw as deflate_decode;
+
+// =============================================================================
+// Deflate64 API (ZIP method 9 / Enhanced Deflate)
+// =============================================================================
+
+/// Decompress a raw Deflate64 stream (ZIP method 9 / Enhanced Deflate).
+///
+/// Deflate64 extends standard DEFLATE with a 64 KB sliding window,
+/// length codes up to 65 538 bytes, and distance codes up to 65 536 bytes.
+/// It is used as compression method 9 in ZIP archives.
+///
+/// `data` must be a raw Deflate64 bitstream — no ZIP local-file header,
+/// no gzip framing.  Returns the decompressed bytes.
+///
+/// Returns an error if `data` is not valid Deflate64.
+pub fn decompress_deflate64(data: &[u8]) -> GzippyResult<Vec<u8>> {
+    decompress::deflate64::decompress_deflate64(data)
+}
+
+/// Decompress a raw Deflate64 stream into `writer`.
+///
+/// Streaming variant of [`decompress_deflate64`] — avoids the intermediate
+/// allocation when the caller already has a [`Write`] target.
+///
+/// Returns the number of decompressed bytes written.
+pub fn decompress_deflate64_to_writer<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> GzippyResult<u64> {
+    decompress::deflate64::decompress_deflate64_to_writer(data, writer)
+}
+
+/// Compress `data` as a raw Deflate64 bitstream, returning `Vec<u8>`.
+///
+/// Produces a valid Deflate64 (ZIP method 9 / Enhanced Deflate) raw stream.
+/// No gzip or ZIP container is added.
+pub fn compress_deflate64(data: &[u8]) -> GzippyResult<Vec<u8>> {
+    compress::deflate64::compress_deflate64(data)
+}
+
+/// Compress `data` as a raw Deflate64 bitstream, writing to `writer`.
+///
+/// Returns the number of compressed bytes written.
+pub fn compress_deflate64_to_writer<W: std::io::Write>(
+    data: &[u8],
+    writer: &mut W,
+) -> GzippyResult<u64> {
+    compress::deflate64::compress_deflate64_to_writer(data, writer)
+}
+
+// =============================================================================
 // Routing inspection
 // =============================================================================
 

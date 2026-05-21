@@ -1,6 +1,6 @@
 [package]
 name = "gzippy"
-version = "0.5.0"
+version = "0.8.0"
 edition = "2021"
 description = "The fastest parallel gzip. Drop-in replacement for gzip and pigz, and a Rust library."
 license = "Zlib"
@@ -12,6 +12,18 @@ keywords = ["gzip", "compression", "parallel", "pigz", "zlib"]
 categories = ["compression", "command-line-utilities"]
 authors = ["Jack Danger Canty"]
 build = "build.rs"
+include = [
+    "src/**/*",
+    "tests/**/*",
+    "examples/**/*",
+    "build.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "CLAUDE.md",
+    "rust-toolchain.toml",
+]
 
 [lib]
 name = "gzippy"
@@ -103,7 +115,7 @@ strip = true          # Remove symbols for smaller binary
 # [build]
 # rustflags = ["-C", "target-cpu=native"]
 
-# Vendored ISA-L Rust crate patch. C source comes from vendor/isa-l submodule
-# (JackDanger/isa-l branch gzippy-stopping-points). See packaging/isal-patches/.
+# Patched isal-sys from vendor/isal-rs (JackDanger/isal-rs branch
+# gzippy-stopping-points). C source from vendor/isa-l. See packaging/isal-patches/.
 [patch.crates-io]
-isal-sys = { path = "crates/isal-sys-patched" }
+isal-sys = { path = "vendor/isal-rs/isal-sys" }

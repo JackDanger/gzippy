@@ -1581,4 +1581,101 @@ mod tests {
             "L6 block size should be 64KB regardless of threads"
         );
     }
+
+    // =========================================================================
+    // Raw DEFLATE API
+    // =========================================================================
+
+    fn raw_roundtrip(data: &[u8], level: u8) {
+        let compressed = crate::compress::compress_raw_bytes(data, level).unwrap();
+        let decompressed = crate::decompress::decompress_raw_bytes(&compressed).unwrap();
+        assert_eq!(
+            decompressed, data,
+            "raw deflate roundtrip failed at level {level}"
+        );
+    }
+
+    #[test]
+    fn test_raw_deflate_roundtrip_empty() {
+        raw_roundtrip(b"", 6);
+    }
+
+    #[test]
+    fn test_raw_deflate_roundtrip_tiny() {
+        raw_roundtrip(b"hello, world!", 1);
+        raw_roundtrip(b"hello, world!", 6);
+        raw_roundtrip(b"hello, world!", 9);
+    }
+
+    #[test]
+    fn test_raw_deflate_roundtrip_all_levels() {
+        let data = make_mixed(64 * 1024);
+        for level in 0..=9 {
+            raw_roundtrip(&data, level);
+        }
+    }
+
+    #[test]
+    fn test_raw_deflate_roundtrip_random() {
+        let data = make_random_seeded(128 * 1024, 0xdeadbeef);
+        raw_roundtrip(&data, 6);
+    }
+
+    #[test]
+    fn test_raw_deflate_roundtrip_zeros() {
+        let data = make_zeros(256 * 1024);
+        raw_roundtrip(&data, 6);
+    }
+
+    #[test]
+    fn test_raw_deflate_no_gzip_framing() {
+        // A gzip decoder must reject raw-deflate output (no gzip header present).
+        let data = b"no gzip framing expected here";
+        let compressed = crate::compress::compress_raw_bytes(data, 6).unwrap();
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut gz_dec = GzDecoder::new(compressed.as_slice());
+        let mut out = Vec::new();
+        assert!(
+            gz_dec.read_to_end(&mut out).is_err(),
+            "compress_raw_bytes output should be rejected by a gzip decoder"
+        );
+    }
+
+    #[test]
+    fn test_raw_deflate_bad_data_returns_error() {
+        let garbage = b"this is not deflate data at all!!!!!";
+        assert!(
+            crate::decompress::decompress_raw_bytes(garbage).is_err(),
+            "decompress_raw_bytes must error on invalid input"
+        );
+    }
+
+    #[test]
+    fn test_raw_deflate_interop_with_flate2() {
+        // Compress with flate2 DeflateEncoder, decompress with gzippy decompress_raw_bytes
+        use flate2::write::DeflateEncoder;
+        use std::io::Write;
+        let data = make_sequential(32 * 1024);
+        let mut enc = DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
+        enc.write_all(&data).unwrap();
+        let compressed = enc.finish().unwrap();
+        let decompressed = crate::decompress::decompress_raw_bytes(&compressed).unwrap();
+        assert_eq!(
+            decompressed, data,
+            "should decompress flate2-produced raw deflate"
+        );
+
+        // And the reverse: compress with gzippy, decompress with flate2
+        use flate2::read::DeflateDecoder;
+        use std::io::Read;
+        let gzippy_compressed = crate::compress::compress_raw_bytes(&data, 6).unwrap();
+        let mut dec = DeflateDecoder::new(gzippy_compressed.as_slice());
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(
+            out, data,
+            "flate2 should decompress gzippy raw deflate output"
+        );
+    }
 }

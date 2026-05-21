@@ -42,6 +42,7 @@ THRESHOLDS = {
     "decomp_vs_gzip": 1.0,                # Must be faster than gzip
     "decomp_vs_rapidgzip": 0.99,          # Must be >= 99% of rapidgzip
     "decomp_vs_igzip": 0.90,              # Must be >= 90% of igzip (hand-tuned asm)
+    "decomp_vs_igzip_multi": 1.0,         # Must beat igzip at T>1 (parallelism should win)
 
     # Single-member parallel decompression (v0.6 marker pipeline +
     # cleanData→ISA-L handoff per chunk, matching rapidgzip's
@@ -284,25 +285,28 @@ def check_decompression_guards(results: list) -> tuple:
                 if not passed:
                     all_passed = False
         
-        # vs igzip (single-threaded only)
-        if threads == 1:
-            igzip = tools.get("igzip")
-            if igzip:
-                igzip_speed = igzip.get("speed_mbps", igzip.get("speed", 0))
-                if igzip_speed > 0:
-                    ratio = gzippy_speed / igzip_speed
-                    passed = ratio >= THRESHOLDS["decomp_vs_igzip"]
-                    report.append({
-                        "name": f"Decompress {source} T1 {data_type} vs igzip",
-                        "metric": "speed_vs_igzip",
-                        "gzippy": gzippy_speed,
-                        "other": igzip_speed,
-                        "ratio": ratio,
-                        "threshold": THRESHOLDS["decomp_vs_igzip"],
-                        "passed": passed,
-                    })
-                    if not passed:
-                        all_passed = False
+        # vs igzip — always present since benchmark_decompression.py runs igzip in every job.
+        # At T1: allow up to 10% deficit (igzip is hand-tuned asm).
+        # At T>1: must beat igzip outright — parallelism should give us the edge.
+        igzip = tools.get("igzip")
+        if igzip:
+            igzip_speed = igzip.get("speed_mbps", igzip.get("speed", 0))
+            if igzip_speed > 0:
+                ratio = gzippy_speed / igzip_speed
+                threshold_key = "decomp_vs_igzip" if threads == 1 else "decomp_vs_igzip_multi"
+                threshold = THRESHOLDS[threshold_key]
+                passed = ratio >= threshold
+                report.append({
+                    "name": f"Decompress {source} T{threads} {data_type} vs igzip(T1)",
+                    "metric": "speed_vs_igzip",
+                    "gzippy": gzippy_speed,
+                    "other": igzip_speed,
+                    "ratio": ratio,
+                    "threshold": threshold,
+                    "passed": passed,
+                })
+                if not passed:
+                    all_passed = False
     
     return all_passed, report
 
@@ -448,6 +452,16 @@ def main():
     all_guards = comp_report + decomp_report + sm_report
     total = len(all_guards)
     passed_count = sum(1 for g in all_guards if g["passed"])
+
+    if compression and not comp_report:
+        print("ERROR: compression results present but no compression guards ran")
+        all_passed = False
+    if decompression and not decomp_report:
+        print("ERROR: decompression results present but no decompression guards ran")
+        all_passed = False
+    if total == 0 and (compression or decompression):
+        print("ERROR: benchmark data loaded but zero guards evaluated")
+        all_passed = False
 
     print(f"\n{'='*50}")
     print(f"{'✅ ALL GUARDS PASSED' if all_passed else '❌ SOME GUARDS FAILED'}")

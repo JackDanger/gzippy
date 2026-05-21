@@ -1,8 +1,8 @@
 # ISA-L patches for gzippy parallel single-member decode
 
-These patches are applied on `vendor/isa-l` branch `gzippy-stopping-points`
-(JackDanger/isa-l). They are derived from rapidgzip's stopping-point extension
-to ISA-L inflate.
+C patches live on `vendor/isa-l` branch `gzippy-stopping-points` (JackDanger/isa-l).
+Rust bindings live on `vendor/isal-rs` branch `gzippy-stopping-points` (JackDanger/isal-rs),
+crate `isal-sys`, patched via `[patch.crates-io]` in the root `Cargo.toml`.
 
 | Patch | Files |
 |-------|-------|
@@ -12,5 +12,6 @@ to ISA-L inflate.
 Diff base for the `.patch` files: crates.io `isal-sys` 0.5.3+496255c bundled tree.
 The same hunks apply cleanly onto current `vendor/isa-l` (apple-arm64-fix base).
 
-Rust bindings (`crates/isal-sys-patched/src/igzip_lib.rs`) must match the patched
-header; `inflate_state` size is 87384 bytes (verified via C `sizeof`).
+Rust deltas (in `vendor/isal-rs/isal-sys/`): `build.rs`, `wrapper.h`, `src/lib.rs`
+(`isal_internals`), `src/igzip_lib.rs` (stopping-point fields; `inflate_state` size
+87384 bytes, verified via C `sizeof`).

@@ -3,6 +3,7 @@
 //! Entry points for the I/O layer are in `io`. This module contains
 //! `compress_with_pipeline` (routing engine) and `compress_bytes` (library API).
 
+pub mod deflate64;
 pub mod io;
 pub mod optimization;
 pub mod parallel;
@@ -173,6 +174,37 @@ pub(crate) fn compress_with_pipeline<R: Read, W: Write + Send>(
 // =============================================================================
 // Library API
 // =============================================================================
+
+/// Compress `data` to raw DEFLATE (RFC 1951) at `level` — no gzip framing.
+///
+/// Routes to ISA-L SIMD on x86_64 for levels 0–3, then libdeflate one-shot.
+/// `level` is clamped to `0..=12`.
+#[allow(dead_code)] // called from lib.rs; unused in the binary
+pub fn compress_raw_bytes(data: &[u8], level: u8) -> crate::error::GzippyResult<Vec<u8>> {
+    use crate::error::GzippyError;
+
+    let level = level.clamp(0, 12);
+
+    // ISA-L: fastest on x86_64 for levels 0–3
+    if level <= 3 && crate::backends::isal_compress::is_available() {
+        if let Some(compressed) =
+            crate::backends::isal_compress::compress_deflate(data, level as u32)
+        {
+            return Ok(compressed);
+        }
+    }
+
+    // libdeflate one-shot for all levels
+    let lvl = libdeflater::CompressionLvl::new(level as i32).expect("level clamped to 0–12");
+    let mut comp = libdeflater::Compressor::new(lvl);
+    let bound = comp.deflate_compress_bound(data.len());
+    let mut out = vec![0u8; bound];
+    let n = comp
+        .deflate_compress(data, &mut out)
+        .map_err(|_| GzippyError::compression("raw DEFLATE compression failed"))?;
+    out.truncate(n);
+    Ok(out)
+}
 
 /// Compress data using gzippy's full routing table.
 ///
