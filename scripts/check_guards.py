@@ -278,7 +278,17 @@ def main():
     # Summary
     total = len(comp_report) + len(decomp_report)
     passed_count = sum(1 for g in comp_report + decomp_report if g["passed"])
-    
+
+    if compression and not comp_report:
+        print("ERROR: compression results present but no compression guards ran")
+        all_passed = False
+    if decompression and not decomp_report:
+        print("ERROR: decompression results present but no decompression guards ran")
+        all_passed = False
+    if total == 0 and (compression or decompression):
+        print("ERROR: benchmark data loaded but zero guards evaluated")
+        all_passed = False
+
     print(f"\n{'='*50}")
     print(f"{'✅ ALL GUARDS PASSED' if all_passed else '❌ SOME GUARDS FAILED'}")
     print(f"Passed: {passed_count}/{total}")
