@@ -486,6 +486,7 @@ fn consumer_loop<W: std::io::Write>(
     // caller loops in `ParallelGzipReader::read`. We inline that loop
     // here so the local-state mutation (post-process queue + writer +
     // CRC) stays simple.
+    #[allow(clippy::while_let_loop)] // faithful port of vendor processNextChunk loop
     loop {
         // Vendor GzipChunkFetcher.hpp:318 — `m_blockFinder->get(m_nextUnprocessedBlockIndex)`.
         let next_block_offset = match block_finder.get(next_unprocessed_block_index) {
@@ -746,6 +747,7 @@ fn consumer_loop<W: std::io::Write>(
         // `SharedWindow = shared_ptr<const CompressedVector>`
         // (WindowMap.hpp:24). Subchunk windows are published on the
         // consumer in `drain_one_pending` after post-process returns.
+        #[allow(clippy::needless_late_init)] // assigned in two long branches below
         let predecessor_window_for_postprocess: Option<Window>;
         if chunk.data_with_markers.is_empty() {
             // No markers → apply_window is a no-op. Publish successor window
@@ -803,7 +805,7 @@ fn consumer_loop<W: std::io::Write>(
                 }
                 drain_one_pending(
                     &mut pending,
-                    &window_map,
+                    window_map,
                     writer,
                     total_crc,
                     total_size,
@@ -926,7 +928,7 @@ fn consumer_loop<W: std::io::Write>(
         while pending.len() > post_process_inflight_cap {
             drain_one_pending(
                 &mut pending,
-                &window_map,
+                window_map,
                 writer,
                 total_crc,
                 total_size,
@@ -939,7 +941,7 @@ fn consumer_loop<W: std::io::Write>(
     while !pending.is_empty() {
         drain_one_pending(
             &mut pending,
-            &window_map,
+            window_map,
             writer,
             total_crc,
             total_size,
@@ -1431,6 +1433,7 @@ fn speculative_decode_find_boundary(
 // ── Pending-write queue (order-preserved output) ─────────────────────────
 
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(clippy::large_enum_variant)] // boxing ChunkData would add an alloc on the per-chunk write path
 enum PendingWrite {
     Ready {
         idx: usize,

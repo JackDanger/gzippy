@@ -77,7 +77,7 @@ fn decode_chunk_isal_inexact_raw(
         state.read_in = (input[byte_idx] as u64) >> bit_skip;
         state.read_in_length = (8 - bit_skip) as i32;
         state.next_in = unsafe { input.as_ptr().add(byte_idx + 1) as *mut u8 };
-        let consumed = (8 - bit_skip) as usize;
+        let consumed = 8 - bit_skip;
         let max_bytes = if max_bits > consumed {
             (max_bits - consumed) / 8
         } else {
@@ -253,14 +253,9 @@ pub fn decode_chunk_isal_inexact(
                 sp if sp == StoppingPoints::END_OF_STREAM_HEADER => {
                     chunk.append_block_boundary_at(r.bit_position, already_decoded + n_bytes_read);
                 }
-                sp if sp == StoppingPoints::END_OF_BLOCK => {
-                    if !wrapper.is_final_block() {
-                        chunk.append_block_boundary_at(
-                            r.bit_position,
-                            already_decoded + n_bytes_read,
-                        );
-                        last_eob_pos = r.bit_position;
-                    }
+                sp if sp == StoppingPoints::END_OF_BLOCK && !wrapper.is_final_block() => {
+                    chunk.append_block_boundary_at(r.bit_position, already_decoded + n_bytes_read);
+                    last_eob_pos = r.bit_position;
                 }
                 sp if sp == StoppingPoints::END_OF_BLOCK_HEADER => {
                     let not_final = !wrapper.is_final_block();
@@ -270,10 +265,8 @@ pub fn decode_chunk_isal_inexact(
                         stopping_point_reached = true;
                     }
                 }
-                sp if sp == StoppingPoints::NONE => {
-                    if last_per_call == 0 {
-                        stopping_point_reached = true;
-                    }
+                sp if sp == StoppingPoints::NONE && last_per_call == 0 => {
+                    stopping_point_reached = true;
                 }
                 _ => {}
             }
@@ -435,7 +428,7 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
         state.read_in = (input[byte_idx] as u64) >> bit_skip;
         state.read_in_length = (8 - bit_skip) as i32;
         state.next_in = unsafe { input.as_ptr().add(byte_idx + 1) as *mut u8 };
-        let consumed = (8 - bit_skip) as usize;
+        let consumed = 8 - bit_skip;
         let max_bytes = if max_bits > consumed {
             (max_bits - consumed) / 8
         } else {
@@ -698,7 +691,9 @@ fn bootstrap_with_deflate_block(
         let mut clean_handoff_armed: bool;
         let mut bfinal_hit = false;
         // `end_bit_offset` always points just past the last completed block.
-        let mut end_bit_offset = absolute_bit_pos(byte_offset, &bits);
+        // Always assigned before the post-loop read (every `break` is
+        // preceded by an assignment), so no initializer is needed.
+        let mut end_bit_offset;
 
         loop {
             // Snapshot the bit position BEFORE reading this block's header.

@@ -992,7 +992,7 @@ impl Block {
                 if code <= 255 || sym_count > 1 {
                     // SAFETY: see ring_ptr SAFETY note above.
                     unsafe {
-                        ring_ptr.add(pos % RING_SIZE).write((code & 0xFF) as u16);
+                        ring_ptr.add(pos % RING_SIZE).write(code & 0xFF);
                     }
                     pos += 1;
                     emitted += 1;

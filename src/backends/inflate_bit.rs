@@ -29,6 +29,7 @@ pub fn is_available() -> bool {
 // ── ISA-L path (x86_64 only) ─────────────────────────────────────────────────
 
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)] // retained for diagnostics / future routing (see module docs)
 pub fn decompress_deflate_from_bit(
     data: &[u8],
     bit_offset: usize,

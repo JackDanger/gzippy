@@ -275,6 +275,7 @@ pub fn scan_deflate_isal(
 /// `max_output` caps the output size — use `chunk.data.len()` from the
 /// speculative decoder to reproduce exactly the right number of bytes.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)] // retained for diagnostics / future routing
 pub fn decompress_deflate_from_bit(
     data: &[u8],
     bit_offset: usize,
