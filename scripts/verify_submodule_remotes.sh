@@ -13,6 +13,13 @@ submodule_name_for_path() {
         awk -v p="$path" '$2 == p { sub(/^submodule\./, "", $1); sub(/\.path$/, "", $1); print $1; exit }'
 }
 
+remote_has_commit() {
+    local url=$1
+    local sha=$2
+    # `git ls-remote URL SHA` treats SHA as a ref name, not a commit id.
+    git ls-remote "$url" | awk -v want="$sha" '$1 == want { found=1 } END { exit !found }'
+}
+
 check_path() {
     local path=$1
     local sha submodule_name url
@@ -23,7 +30,7 @@ check_path() {
     submodule_name=$(submodule_name_for_path "$path")
     url=$(git config -f .gitmodules --get "submodule.${submodule_name}.url")
 
-    if git ls-remote "$url" "$sha" | grep -q .; then
+    if remote_has_commit "$url" "$sha"; then
         return 0
     fi
 
