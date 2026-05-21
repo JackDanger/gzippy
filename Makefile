@@ -27,7 +27,8 @@ SYSTEM_GZIP := $(shell which gzip)
 # Set APPLE_GZIP when it differs from GZIP_BIN so bench targets compare both
 APPLE_GZIP := $(if $(filter Darwin,$(shell uname)),/usr/bin/gzip,)
 
-.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship ship-local route-check oracle-vs-c
+.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship ship-local route-check oracle-vs-c bench-sm \
+	profile-single-member-decompression-x86_64 profile-single-member-decompression-arm64 profile-decompression-x86_64
 
 # =============================================================================
 # Default target: quick benchmark for fast iteration (< 30 seconds)
@@ -147,6 +148,19 @@ route-check: $(GZIPPY_BIN) $(PIGZ_BIN)
 	@python3 scripts/route_check.py $(GZIPPY_BIN) $(PIGZ_BIN)
 
 # =============================================================================
+# Single-member decompression profiling (correctness gate + CPU/alloc artifacts)
+# =============================================================================
+profile-single-member-decompression-x86_64:
+	@chmod +x scripts/profile_single_member_decompression_x86_64.sh
+	@bash scripts/profile_single_member_decompression_x86_64.sh
+
+profile-single-member-decompression-arm64:
+	@chmod +x scripts/profile_single_member_decompression_arm64.sh
+	@bash scripts/profile_single_member_decompression_arm64.sh
+
+profile-decompression-x86_64: profile-single-member-decompression-x86_64
+
+# =============================================================================
 # Ship: the "are we good?" gate. Always tests the *current branch*.
 #
 # Runs the cheap local checks first, then expensive homelab bench last so
@@ -225,6 +239,72 @@ ship: ship-precheck ship-local
 	@echo ""
 	@echo "✓ ship complete on branch $$(git rev-parse --abbrev-ref HEAD)"
 
+# =============================================================================
+# bench-sm: single-member x86_64 Tmax gzippy vs rapidgzip on neurotic.
+#
+# Skips all local quality gates (fmt/test/clippy/oracle). Pushes the current
+# branch, SSHs to neurotic, builds gzippy + rapidgzip, runs
+# scripts/benchmark_single_member.py against silesia.tar compressed at -9.
+# Use this for tight iteration on the parallel single-member path without
+# the 20-minute full ship round-trip.
+#
+# Time: ~3-5 minutes (build ~1 min, bench ~2-3 min for 10 trials).
+# =============================================================================
+bench-sm: ship-precheck
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	echo ""; \
+	echo "── bench-sm: x86_64 Tmax single-member  gzippy vs rapidgzip ──"; \
+	if ! git rev-parse origin/$$BRANCH >/dev/null 2>&1 \
+	    || [ -n "$$(git log origin/$$BRANCH..HEAD 2>/dev/null)" ]; then \
+	  echo "  pushing $$BRANCH to origin..."; \
+	  git push origin $$BRANCH || (echo "PUSH FAILED — aborting bench-sm" >&2 && exit 1); \
+	else \
+	  echo "  origin/$$BRANCH already up to date"; \
+	fi; \
+	echo "  connecting to neurotic..."; \
+	ssh -J neurotic root@10.30.0.199 "set -e; cd gzippy; \
+	  echo '  fetching origin/$$BRANCH...'; \
+	  git fetch origin '$$BRANCH'; \
+	  git checkout -B '$$BRANCH' 'origin/$$BRANCH'; \
+	  git reset --hard 'origin/$$BRANCH'; \
+	  echo '  building gzippy (--features isal-compression)...'; \
+	  cargo build --release --features isal-compression 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
+	  RAPIDGZIP=vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip; \
+	  if [ ! -x \"\$$RAPIDGZIP\" ]; then \
+	    echo '  building rapidgzip (first time only)...'; \
+	    cd vendor/rapidgzip && git submodule update --init --recursive >/dev/null 2>&1 || true; \
+	    mkdir -p librapidarchive/build; \
+	    cd librapidarchive/build && cmake .. -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1; \
+	    make -j\$$(nproc) rapidgzip 2>&1 | grep -E 'Linking|Built|error' || true; \
+	    cd /root/gzippy; \
+	  fi; \
+	  BD=benchmark_data; \
+	  [ -f \"\$$BD/silesia.tar\" ] || { [ -f \"\$$BD/silesia.tar.xz\" ] && xz -dk \"\$$BD/silesia.tar.xz\" -c > \"\$$BD/silesia.tar\"; }; \
+	  SL=\$$BD/silesia-large.bin; \
+	  SLG=\$$BD/silesia-large.gz; \
+	  [ -s \"\$$SL\" ] || { \
+	    echo '  building silesia-large.bin (~500MB, one-time)...'; \
+	    cat \"\$$BD/silesia.tar\" \"\$$BD/silesia.tar\" > \"\$$SL\"; \
+	    head -c \$$((76 * 1024 * 1024)) \"\$$BD/silesia.tar\" >> \"\$$SL\"; \
+	  }; \
+	  [ -s \"\$$SLG\" ] || { echo '  compressing silesia-large.bin at gzip -9 (one-time, ~60s)...'; gzip -9 -c \"\$$SL\" > \"\$$SLG\"; }; \
+	  BDIR=/tmp/bench-sm-bin; mkdir -p \"\$$BDIR\"; \
+	  cp target/release/gzippy \"\$$BDIR/\"; \
+	  cp \"\$$RAPIDGZIP\" \"\$$BDIR/\" 2>/dev/null || true; \
+	  [ -x vendor/pigz/unpigz ] && cp vendor/pigz/unpigz \"\$$BDIR/\" || true; \
+	  THREADS=\$$(nproc); \
+	  echo ''; \
+	  python3 scripts/benchmark_single_member.py \
+	    --binaries \"\$$BDIR\" \
+	    --compressed-file \"\$$SLG\" \
+	    --original-file \"\$$SL\" \
+	    --threads \"\$$THREADS\" \
+	    --output /tmp/bench-sm-result.json; \
+	  echo ''; \
+	  echo 'Full JSON: /tmp/bench-sm-result.json'"
+	@echo ""
+	@echo "✓ bench-sm complete on branch $$(git rev-parse --abbrev-ref HEAD)"
+
 # `ship-precheck`: dirty-tree refusal. Pulled out of `ship-local` so a
 # dirty tree fails in <1s instead of after 30s of local checks. Only
 # runs as a prereq of `ship` (which pushes); `ship-local` is permitted
@@ -233,7 +313,7 @@ ship: ship-precheck ship-local
 ship-precheck:
 	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
 	if [ "$$BRANCH" = "HEAD" ]; then echo "ERROR: detached HEAD; checkout a branch first" >&2; exit 1; fi; \
-	if [ -n "$$(git status --porcelain | grep -v '^?? vendor/zopfli')" ]; then \
+	if [ -n "$$(git status --porcelain | grep -v 'vendor/zopfli')" ]; then \
 	  echo "ERROR: uncommitted changes — homelab needs to fetch a committed branch" >&2; \
 	  echo "       run 'git status' and commit (or stash) before 'make ship'" >&2; \
 	  echo "       (use 'make ship-local' to run local checks against a dirty tree)" >&2; \
@@ -651,6 +731,9 @@ help:
 		'  make              Build and run quick benchmark (< 30 seconds)' \
 		'  make quick        Same as above' \
 		'  make route-check  Show decompression routing + timing for T1/T4 x 1MB/10MB' \
+		'  make profile-single-member-decompression-x86_64  Homelab: SM decode + perf' \
+		'  make profile-single-member-decompression-arm64   Local M1: SM libdeflate + samply' \
+		'  make profile-decompression-x86_64              Alias for x86_64 target above' \
 		'  make build        Build gzippy and ungzippy' \
 		'  make deps         Build gzip and pigz from submodules' \
 		'  make validate     Run validation suite (adaptive 3-17 trials)' \

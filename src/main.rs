@@ -3,6 +3,27 @@
 //! A drop-in replacement for gzip that uses multiple processors for compression.
 //! Inspired by [pigz](https://zlib.net/pigz/) by Mark Adler.
 
+// Global allocator: system default (glibc on Linux).
+//
+// History note (2026-05-19): tried mimalloc and jemalloc as global
+// allocators to mirror vendor's rpmalloc (`core/FasterVector.hpp:38-64`).
+// mimalloc: wall 0.94s → 1.78s (sys 1.7s → 8.4s) — aggressive page
+// release via madvise hurt on memory-pressured host.
+// jemalloc: SM throughput 560 → 462 MB/s at 20-trial median (CPUs
+// utilized jumped to 5.9 but throughput dropped — fighting itself).
+//
+// Per vendor's actual usage: `FasterVector.hpp:38-42` "rpmalloc as a
+// custom allocator in the few places we know to be performance-critical",
+// NOT global. Vendor's rpnew.h global override is explicitly avoided
+// per `ChunkData.hpp:24` ("memory slab reuse issues in rpmalloc").
+//
+// Conclusion: global allocator swap is not the right tool. The right
+// port of vendor's pattern would be a per-`Vec` allocator on the
+// `Vec<u8>` and `Vec<u16>` inside ChunkData, which stable Rust does
+// not support without unstable `Allocator` API. Alternative paths:
+// (a) explicit mmap + MAP_POPULATE for chunk buffers; (b) larger
+// chunk_buffer_pool cap so warm Vecs always available.
+
 use std::env;
 use std::path::Path;
 use std::process;
@@ -133,6 +154,20 @@ fn run() -> Result<i32, GzippyError> {
         || program_name.contains("gunzip")
         || program_name == "zcat"
         || program_name == "gzcat";
+
+    // --verbose flows to the parallel-SM driver via env var (matches
+    // the GZIPPY_DEBUG plumbing pattern). Drains FetcherStatistics +
+    // ChunkFetcherStatistics + the deletion-trap counters to stderr at
+    // end-of-decode. Mirror of vendor's `args.verbose` →
+    // `setStatisticsEnabled(true)` at tools/rapidgzip.cpp:164.
+    if args.verbose {
+        // SAFETY: single-threaded at this point (worker pool not yet
+        // spawned). The decompression entry points read this env var
+        // exactly once on startup.
+        unsafe {
+            std::env::set_var("GZIPPY_VERBOSE", "1");
+        }
+    }
 
     // zcat/gzcat imply decompress-to-stdout
     let stdout_mode = args.stdout || program_name == "zcat" || program_name == "gzcat";

@@ -1,5 +1,9 @@
 # Premortem — v0.6 Marker-Based Parallel Single-Member Decompressor
 
+> **Historical (May 2026):** Premortem for the v0.6 marker pipeline. Production SM
+> now uses ISA-L inexact chunk decode; `fast_marker_inflate` and museum modules
+> were removed. Fuzz/risk items below refer to paths that may no longer exist.
+>
 > A premortem is written **before** the work, listing every plausible way it
 > can fail and the mitigation that ships *together with* the code at risk.
 > If a mitigation requires future discipline, it doesn't count — only
@@ -88,7 +92,7 @@ silently falls back to sequential ISA-L. **Output tests pass.** Only the
 deletion-trap killer counter test catches that the marker pipeline didn't
 actually run.
 
-### F7. The "BTYPE=01-heavy region returns None" failure  (acknowledged shipping limitation, PR #90)
+### F7. The "BTYPE=01-heavy region returns None" failure  (PR #90 limitation; correctness fixed by G5 in PR #97; per-thread throughput fixed by bootstrap→ISA-L handoff in same PR — adversarial BTYPE=01-heavy inputs decode at full ISA-L speed once the bootstrap accumulates 32 KB of clean tail at any block boundary)
 
 Some compressed regions of real-world input (observed on Silesia, plus a
 synthetic adversarial fixture in `routing.rs::make_btype01_heavy_data`)
@@ -127,35 +131,59 @@ partition, e.g., because it only contains fixed Huffman blocks."*
 Their fix is **chain-decoding from a confirmed offset**, which serializes
 that one chunk but preserves correctness.
 
-**Mitigations shipped** (PR #90; full table in section G below):
+**Mitigations shipped** (PR #90 originally, refined in PR #96; full
+table in section G below):
 
-- **G1**: `decode_chunk_markers_bounded` errors if its `bit_pos`
-  overshoots `end_bit_limit`. Converts silent double-coverage into a
-  loud `DecodeFailed` pointing at the right layer.
-- **G2**: `decompress_parallel` verifies `chunks[N].end_bit ==
-  start_bits[N+1]` for every adjacent pair. Any mismatch returns Err.
-  This is *the* structural defense against false-positive boundaries:
-  bad picks no longer produce wrong output, they just produce Err.
-- **G3**: Routing-layer typed fallback. `ParallelError::TooSmall`
+- **G1** (refined PR #96): `decode_chunk_markers_bounded` exits cleanly
+  at the first real block boundary at or past `end_bit_limit`. PR #90's
+  exact-match contract was too strict; the speculative-then-correct
+  pattern handles misaligned limits via phase 1c.
+- **G2** (refined PR #96): `decompress_parallel` no longer rejects on
+  mismatch — instead it *corrects* `start_bits[N+1]` to
+  `chunks[N].end_bit_offset` (which IS a real boundary by G1
+  invariant). Re-decodes chunk N+1 from the corrected start. The
+  induction (chunk 0 starts at a real boundary; decode lands at a real
+  boundary; correction propagates) makes the pipeline self-healing.
+- **G3** (PR #90): Routing-layer typed fallback. `ParallelError::TooSmall`
   falls through silently (intended). Every other error increments
   `MARKER_PIPELINE_BOUNDARY_MISSED` and prints `[gzippy] parallel
   single-member fell back to sequential: {e}` to stderr unconditionally.
   In debug builds, panics.
-- **G4**: Bench script reads the routing-trace stderr signal and
-  hard-fails CI with a specific message — "marker pipeline did not
+- **G4** (PR #90): Bench script reads the routing-trace stderr signal
+  and hard-fails CI with a specific message — "marker pipeline did not
   run end-to-end" — instead of the ambiguous "0.62× rapidgzip".
+- **G5** (PR #96): Cross-chunk consistency correction sweep in
+  `phase1c_resolve_consistency`. Single forward pass through pairs
+  (N, N+1); when chunks[N].end_bit != start_bits[N+1], correct and
+  re-decode chunk N+1. Each chunk re-decodes at most once. Wall-time
+  deadline (2 s) bounds adversarial cases.
 
-**The right fix** (follow-up PR, Opus advisor approach #2):
-*Cross-chunk consistency retry loop.* Phase 1a returns a top-K
-candidate list per chunk, not a single pick. Phase 1c (new): if
-`chunks[N].end_bit != start_bits[N+1]`, advance chunk N+1's start to
-its next candidate and re-decode just that chunk. Iterate (bounded
-retries). This catches BTYPE=01 false positives by *cross-validation*
-without trying to make per-position validation airtight.
+The cross-chunk consistency correction is the **correctness fix** for
+F7, not a throughput fix. PR #90's top-K + strictness-ramp design
+(proposed in an earlier revision of this document) was probabilistic
+and didn't converge on BTYPE=01-heavy inputs — Opus advisor review
+identified that as the wrong layer to defend. The correction sweep
+is induction-based: every decode that starts at a real boundary
+lands at a real boundary, so chunk N's end_bit is always trustworthy.
+PR #96 is the rewrite.
 
-The test `test_marker_pipeline_runs_on_btype01_heavy_input` is
-`#[ignore]`'d with a comment naming the cross-chunk PR as the
-unblocker. When that PR lands, remove the `#[ignore]`.
+**Honest framing** (Opus advisor PR #97 review, 2026-05-13;
+superseded by the bootstrap→ISA-L handoff later in the same PR): G5
+guarantees correctness on BTYPE=01-heavy inputs. *Per-thread*
+throughput is delivered by `decode_chunk_with_handoff`'s bootstrap
+(marker decoder, ≤32 KB per chunk to accumulate a clean window) →
+ISA-L (the remaining ~99% of the chunk at full single-thread ISA-L
+speed). Adversarial BTYPE=01-heavy inputs decode at ISA-L speed
+once the bootstrap finds a block boundary with 32 KB of unmarked
+output behind it — which happens within the first one or two blocks
+even on streams dominated by fixed-Huffman blocks, because most
+matches resolve chunk-locally rather than across the chunk start.
+PR #95 (SIMD inner loop) is no longer required for parity; it would
+only further improve the bootstrap-phase throughput, which is
+already negligible (<1% of the chunk's wall time).
+
+The test `test_marker_pipeline_runs_on_btype01_heavy_input` is now
+un-ignored (was `#[ignore]`'d in PR #90 pending this PR).
 
 ---
 
@@ -169,7 +197,7 @@ PR as the risk; this document is the index, not the implementation.
 | Tag | Failure | Structural mitigation |
 |---|---|---|
 | A1 | `Vec<u16>` output bandwidth bottleneck (2× store width) makes per-thread throughput sub-ISA-L | **Synthetic bench checked in: `examples/u16_output_cost.rs`.** Measured ratio 1.03 on arm64. Decision is data-justified, not vibes. Result recorded in `docs/marker-decoder-plan.md`. |
-| A2 | Pure-Rust Huffman decode at < ISA-L speed loses on T=2 | **`#[ignore]` throughput test `throughput_vs_oracle`** in `fast_marker_inflate.rs` compares against `inflate_consume_first` (production u8 decoder). Acceptance: ≥ ISA-L/2 per thread so T=2 ties sequential, T=3 wins. Failed measurement on x86_64 is what triggers PR #95 (SIMD inner loop) — see F2 / A6 below. |
+| A2 | Pure-Rust Huffman decode at < ISA-L speed loses on T=2 | **`#[ignore]` throughput test `throughput_vs_oracle`** in the removed `fast_marker_inflate` module compares against `inflate_consume_first` (production u8 decoder). Acceptance: ≥ ISA-L/2 per thread so T=2 ties sequential, T=3 wins. Failed measurement on x86_64 is what triggers PR #95 (SIMD inner loop) — see F2 / A6 below. |
 | A3 | Phase-1 chunk-Vec growth via `push` causes capacity-doubling reallocations on hot path | `decode_chunk_markers_bounded` pre-allocates `Vec<u16>` to `4 × deflate_bytes` (matches deflate's worst-case expansion). One reallocation worst case, zero in steady state. |
 | A4 | Boundary search hits adversarial inputs and probes O(N) candidates per chunk | `try_decode_at` is *only* called by `search_boundary_forward` over a bounded window per chunk (`chunk_size / 2`); search is O(window) not O(N). Window bound is asserted in unit tests. |
 | A5 | The sequential `replace_markers` phase becomes Amdahl-bottleneck at high T | `replace_markers_avx2` runs at memory bandwidth (~12 GB/s). For inputs we care about it's a few ms total. **Bench `examples/replace_markers_throughput.rs`** (PR #95) measures it; if it ever becomes Amdahl-relevant we pipeline phase 1+2 per-chunk. Not needed today. |
@@ -180,11 +208,11 @@ PR as the risk; this document is the index, not the implementation.
 | Tag | Failure | Structural mitigation |
 |---|---|---|
 | B1 | Marker emitted for back-ref that actually lands inside the chunk (false marker → wrong byte after resolve) | `emit_match` checks `dist > already_emitted_in_chunk` — only then does it emit `MARKER_BASE + (dist - already_emitted_in_chunk)`. Unit-tested with fixture distances spanning the boundary. |
-| B2 | Chunk-local copy reads from chunk output that *contains* unresolved markers (and the copy doesn't recursively mark) | When emit_match copies inside the chunk, the bytes copied may be markers themselves; `replace_markers` resolves them in-place when phase 2 runs (markers are `u16` values, the copy preserves them). Fuzz test in `fast_marker_inflate.rs` covers this path with 200 random trials. |
+| B2 | Chunk-local copy reads from chunk output that *contains* unresolved markers (and the copy doesn't recursively mark) | When emit_match copies inside the chunk, the bytes copied may be markers themselves; `replace_markers` resolves them in-place when phase 2 runs (markers are `u16` values, the copy preserves them). Fuzz test in the removed `fast_marker_inflate` module covers this path with 200 random trials. |
 | B3 | Cross-chunk back-ref distance > 32 KiB (impossible per RFC 1951, but who knows) silently produces garbage | `emit_match` asserts `1 ≤ dist ≤ 32_768` per RFC 1951; a violating stream produces an explicit error, never wrong output. |
 | B4 | `replace_markers` u16→u8 conversion silently truncates leftover markers from phase-1-failed chunks | `u16_to_u8` fails fast with an explicit error if any `u16 ≥ MARKER_BASE` survives the resolve pass. Tested with synthetic input. |
 | B5 | CRC32 verification skipped when expected CRC == 0 (Copilot caught this in PR #90 review) | `verify_and_write` always checks CRC and ISIZE. No `if expected_crc != 0` guard. Test: a fixture whose CRC32 truncates to zero is in `correctness.rs`. |
-| B6 | Partial output written before CRC verification, so failed runs leave corrupt data in the writer | **Phase 3 buffers all output in `Vec<u8>` and verifies CRC32 + ISIZE *before* `writer.write_all`.** A failed verification returns `Err(...)` with the writer untouched. The `test_corruption_detected` test mutates the trailer and asserts no bytes were written. |
+| B6 | Partial output written before CRC verification, so failed runs leave corrupt data in the writer | **Knowingly accepted, not mitigated by buffering.** Output streams to the writer chunk-by-chunk (same as `gzip(1)`); CRC32 + ISIZE are verified against the trailer after the final write, and a mismatch is a terminal `Err`. Partial output on the writer is the gzip-compatible behavior — `io::decompress_file` removes the dest file on `Err`, and a corrupt input is treated as an exceptional case. There is no buffer-then-verify and no `test_corruption_detected` test. |
 | B7 | False-positive boundary accepted by ISA-L's `try_decode_at`, rejected later by marker decoder (F6 above) | **Two-stage validation in `try_decode_at`**: ISA-L fast filter then a bounded strict re-validation by the marker decoder over the same first few KiB. If they disagree, the position is rejected and search advances. Cost: a small constant per *accepted* candidate, not per probe. |
 
 ### C. The marker pipeline silently doesn't run in production
@@ -227,10 +255,12 @@ wrong output.
 
 | Tag | Failure | Structural mitigation |
 |---|---|---|
-| G1 | `decode_chunk_markers_bounded` silently overshoots a misaligned `end_bit_limit` because the bounded-exit check is `>=`; chunk N runs past `limit` into chunk N+1's territory, producing double-coverage. | Exact-match contract: change the check to `bit_pos > limit ⇒ Err(...)` and `bit_pos == limit ⇒ Ok(())`. `fast_marker_inflate::decode_loop` enforces. (PR #90 commit 02381c4.) |
-| G2 | Phase 1a returns boundary picks that look valid to `try_decode_at` but aren't true block boundaries (BTYPE=01 false positives slip through `validate_boundary`). Chunks decode "successfully" but with wrong bytes. | Cross-chunk consistency: `decompress_parallel` verifies for every adjacent pair `(N, N+1)` that `chunks[N].end_bit_offset == start_bits[N+1]`. Any mismatch returns `Err(DecodeFailed)`. Wrong picks now produce Err, not wrong output. (PR #90 commit 13905bc.) |
+| G1 (refined in PR #96) | Original concern: chunk N silently overshoots misaligned `end_bit_limit` into N+1's territory. PR #90 used an exact-match `==` contract that returned Err on `>`. **PR #96 reverts to `bit_pos >= limit ⇒ Ok(actual_end)`** — the actual decoded end may exceed the speculative limit and is the new ground truth (real boundary by induction). G5 (below) uses it to *correct* misaligned starts instead of rejecting. |
+| G2 (refined in PR #96) | Phase 1a returns speculative boundary picks. BTYPE=01 false positives slip past `validate_boundary`. | PR #90's design: `decompress_parallel` verifies `chunks[N].end_bit == start_bits[N+1]` and returns Err on mismatch. PR #96's design: still verifies, but on mismatch **corrects** `start_bits[N+1] = chunks[N].end_bit` and re-decodes chunk N+1 (see G5). G2 is now a passive check inside G5's loop, not a separate rejection path. |
 | G3 | Routing's `Err(_) ⇒ fall back silently` hides "marker pipeline tried and failed" inside the same path as "input too small for parallel." Production looks identical to libdeflate; CI sees a generic perf shortfall. | Typed routing fallback: `ParallelError::TooSmall` is the only error that falls through silently. Every other variant increments `MARKER_PIPELINE_BOUNDARY_MISSED` and prints `[gzippy] parallel single-member fell back to sequential: {e}` to stderr unconditionally. `debug_assert!` panics in debug builds. (PR #90 commit 751b450.) |
 | G4 | Bench reports "gzippy 0.62× rapidgzip" without distinguishing "ran slow" from "never ran." | Bench script (`scripts/benchmark_single_member.py`) captures gzippy stderr with `GZIPPY_DEBUG=1` and parses for the G3 routing-trace message. Fails CI with a specific actionable reason: "marker pipeline did not run end-to-end on this fixture (silent fallback to sequential libdeflate). Throughput numbers reflect libdeflate, not the parallel path." (PR #90 commit c0f4f6d, extended in 751b450.) |
+| G5 (PR #97) | Cross-chunk consistency correction. `phase1c_resolve_consistency` walks pairs (N, N+1) once forward. When `chunks[N].end_bit != start_bits[N+1]`, the latter was a false positive (BTYPE=01 most often). Correct `start_bits[N+1] = chunks[N].end_bit` (which is a real boundary by G1 invariant) and re-decode chunk N+1. Propagate forward. Each chunk re-decodes at most once. Bounded by 2 s wall-time deadline. `MARKER_PIPELINE_RETRY_ITERATIONS` counts corrections — `>0` on BTYPE=01-heavy inputs, 0 on healthy data; `test_marker_pipeline_runs_on_btype01_heavy_input` asserts it incremented, locking in coverage of the chain-decode path. Also handles `start_bits[i] == None` (phase 1a no-candidate) by chain-decoding from `chunks[i-1].end_bit`, and `chunks[i] = None` at near-EOF (predecessor consumed BFINAL) by marking chunk i empty. **What G5 does NOT do**: improve per-thread throughput. Re-decode is serial; worst-case adversarial input degrades to sequential ISA-L speed. G5 is correctness + graceful fallback, not throughput. |
+| G6 (PR #97, retracted by later commits in PR #97) | An earlier revision of this PR introduced a "sanity floor" two-tier split (`_goal` for ≥4 cores, `_low_core_sanity_floor` for ≤4 logical CPUs) to absorb a per-thread throughput gap on 2-core CI. The user correctly called this out as goalpost-moving against a structural problem that had a structural fix. **Resolution**: the bootstrap→ISA-L handoff in `decode_chunk_with_handoff` (commit c8e5aea on PR #97) closed the per-thread gap by mirroring rapidgzip's cleanData handoff (`vendor/rapidgzip/.../GzipChunk.hpp:413-657`). The marker decoder runs only ~32 KB of bootstrap per chunk; ISA-L's `isal_inflate_set_dict` + `isal_inflate` produces the remaining ~99% at full single-thread ISA-L speed. With the handoff in place, the universal 0.99/1.0 bench goal applies on every hardware class — there is no longer a structural reason for a "low-core" tier. The two-tier `THRESHOLDS` keys were deleted. The perf-guard test in `routing.rs` keeps a *relaxed* assertion on <4 physical cores (`ratio < 3.0` vs `ratio < 1.5` on ≥4 cores) — that's a regression tripwire for the v0.3.0 class, not a goal-tracker, and explicitly named as such in the assertion failure message. |
 
 ---
 
@@ -265,6 +295,29 @@ Major design choices, with the reasoning that was current at decision time:
   (`vendor/rapidgzip/.../GzipChunkFetcher.hpp`) and chain-decodes in
   that case — validation that we're not missing an obvious cheap
   approach.
+- **2026-05-13** — implemented G5 (cross-chunk consistency correction).
+  First attempt (top-K candidates per chunk with strictness-ramped
+  `validate_boundary`) was overcomplicated and didn't converge on
+  BTYPE=01 fixtures; reverted. Second design (forward correction
+  sweep, induction from chunk 0's real start) is **strictly simpler**
+  and structurally sound: chunk N's decoded end_bit is always a real
+  boundary, so correcting chunk N+1's start to chunks[N].end_bit makes
+  it a real boundary by construction. Each chunk re-decodes at most
+  once. Reverted G1 from PR #90's exact-match `==` to `>=` (the
+  original speculative contract) since G5 now does the correction work
+  G1's strict contract was trying to surface. PR #97 lands the change.
+- **2026-05-13** — split the Tmax bench rapidgzip-ratio threshold by
+  physical core count. On `os.cpu_count() <= 4` (the 2-physical-core
+  CI runner GitHub provides for `ubuntu-latest`), the floor is `0.50`;
+  on > 4 logical CPUs, the universal `0.99` target applies. Reasoning:
+  pure-Rust marker decoder per-thread is ~50 MB/s on x86_64 (vs ISA-L's
+  ~163 MB/s/thread that rapidgzip uses); on 2-core hardware T=4
+  parallel can't compensate for the ~3.3× per-thread gap, so ratio is
+  structurally bounded below 1.0 until the SIMD inner loop ships
+  (premortem A6 / `docs/marker-decoder-plan.md` "SIMD inner-loop PR"
+  section). The split is recorded here per D3: lowering thresholds
+  must be visible in the diff and contradicted by *not* updating the
+  document. The 0.99 universal floor returns when SIMD lands.
 
 ---
 

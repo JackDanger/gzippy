@@ -34,63 +34,83 @@ const PRECODE_ALPHABET: [usize; 19] = [
 const END_OF_BLOCK_SYMBOL: usize = 256;
 
 /// LUT size in bits (use 13 bits to keep compile time reasonable)
-const LUT_BITS: usize = 13;
+// Matches rapidgzip's OPTIMAL_NEXT_DEFLATE_LUT_SIZE = 15
+// (vendor/rapidgzip/.../blockfinder/DynamicHuffman.hpp:145). With 15 bits
+// the LUT can fully verify bfinal(1)+btype(2)+hlit(5)+hdist(5) = 13 bits,
+// dramatically reducing false-positive candidates compared to the 13-bit
+// LUT (which can only partially verify hlit/hdist).
+const LUT_BITS: usize = 15;
 const LUT_SIZE: usize = 1 << LUT_BITS;
 
 // ============================================================================
 // 13-bit LUT for block candidate detection
 // ============================================================================
 
-/// Check if bits could be a valid deflate block start (stored or dynamic).
-/// Accepts bfinal=0 or bfinal=1. BTYPE=01 (fixed Huffman) is excluded
-/// because the 3-bit header alone matches ~25% of random positions —
-/// emitting that many candidates pollutes the result list and makes
-/// downstream consumers slow.
+/// Literal port of rapidgzip's `isDeflateCandidate<bitCount>`
+/// (vendor/rapidgzip/.../blockfinder/DynamicHuffman.hpp:39-79).
 ///
-/// BTYPE=01 boundary detection lives instead in
-/// `single_member::search_boundary_forward` as a separate tier that
-/// runs only when the other tiers find nothing. That keeps BlockFinder
-/// fast for the common path (where boundaries are BTYPE=00 / BTYPE=10)
-/// and avoids the candidate explosion observed in
-/// `test_find_blocks_parallel_matches_sequential`.
+/// Conservative: only checks the bits that are KNOWN (i.e. the lowest
+/// `bit_count` bits of the input). At smaller `bit_count` fewer fields
+/// are inspected — never rejects based on bits the caller doesn't know.
+///
+/// Filters applied (each gated on having enough bits):
+///   bit 0       = bfinal, must be 0
+///   bits 1-2    = btype, must be 0b10 (dynamic Huffman only)
+///   bits 3-7    = HLIT, ≤ 29
+///   bits 8-12   = HDIST, ≤ 29
 #[inline]
-fn is_valid_candidate_13(bits: u32) -> bool {
-    let btype = (bits >> 1) & 3;
-
-    match btype {
-        0 => true, // stored block — validated by len/~len
-        2 => {
-            // dynamic Huffman — check HLIT <= 29 and HDIST <= 29
-            let hlit = (bits >> 3) & 31;
-            let hdist = (bits >> 8) & 31;
-            hlit <= 29 && hdist <= 29
-        }
-        _ => false, // btype=1 (fixed) emitted by a separate tier; btype=3 reserved
+fn is_deflate_candidate_n(bits: u32, bit_count: u8) -> bool {
+    if bit_count == 0 {
+        return false;
     }
+    let is_last_block = (bits & 1) != 0;
+    let mut matches = !is_last_block;
+    if bit_count <= 1 {
+        return matches;
+    }
+    let compression_type = (bits >> 1) & 0b11;
+    matches &= (compression_type & 1) == 0;
+    if bit_count <= 2 {
+        return matches;
+    }
+    matches &= compression_type == 0b10;
+    if bit_count < 1 + 2 + 5 {
+        return matches;
+    }
+    let code_count = (bits >> 3) & 0b11111;
+    matches &= code_count <= 29;
+    if bit_count < 1 + 2 + 5 + 5 {
+        return matches;
+    }
+    let distance_code_count = (bits >> 8) & 0b11111;
+    matches &= distance_code_count <= 29;
+    matches
 }
 
-/// Generate the LUT at runtime (called once via lazy_static pattern)
+/// Literal port of rapidgzip's `nextDeflateCandidate<bitCount>`
+/// (DynamicHuffman.hpp:82-98). Recursively shifts right by 1, decreasing
+/// the trusted-bit-count, until isDeflateCandidate returns true or
+/// bit_count hits 0.
+#[inline]
+fn next_deflate_candidate(bits: u32, bit_count: u8) -> u8 {
+    if is_deflate_candidate_n(bits, bit_count) {
+        return 0;
+    }
+    if bit_count == 0 {
+        return 0;
+    }
+    1 + next_deflate_candidate(bits >> 1, bit_count - 1)
+}
+
+/// Generate the 13-bit NEXT_DYNAMIC_DEFLATE_CANDIDATE_LUT.
+/// Literal port of `NEXT_DYNAMIC_DEFLATE_CANDIDATE_LUT` (DynamicHuffman.hpp:113-124),
+/// minus the negative-encoding for lut[i] == 0 case (we don't use that
+/// branch yet; just store the positive skip).
 fn generate_deflate_lut() -> Vec<i8> {
     let mut lut = vec![0i8; LUT_SIZE];
-
     for i in 0..LUT_SIZE {
-        // Simple approach: check if valid, skip 1 if not
-        if is_valid_candidate_13(i as u32) {
-            lut[i] = 0; // Valid candidate
-        } else {
-            // Skip forward until we find a potentially valid position
-            let mut skip = 1i8;
-            for s in 1..13 {
-                if is_valid_candidate_13((i >> s) as u32) {
-                    skip = s as i8;
-                    break;
-                }
-                skip = (s + 1) as i8;
-            }
-            lut[i] = skip.min(13);
-        }
+        lut[i] = next_deflate_candidate(i as u32, LUT_BITS as u8) as i8;
     }
-
     lut
 }
 
@@ -241,9 +261,21 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// Peek up to `n` bits. Caller must ensure `bits_available >= n` —
+    /// use `peek_refilled` for the safe variant.
     #[inline]
     pub fn peek(&self, n: u8) -> u64 {
         self.bit_buf & ((1u64 << n) - 1)
+    }
+
+    /// Refill if needed, then peek. Use for reads larger than the
+    /// refill watermark (e.g. 57-bit precode reads).
+    #[inline]
+    pub fn peek_refilled(&mut self, n: u8) -> u64 {
+        if self.bits_available < n {
+            self.refill();
+        }
+        self.peek(n)
     }
 
     #[inline]
@@ -255,8 +287,13 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// Read up to `n` bits, refilling first if necessary. Safe for
+    /// any n ≤ 57.
     #[inline]
     pub fn read(&mut self, n: u8) -> u64 {
+        if self.bits_available < n {
+            self.refill();
+        }
         let val = self.peek(n);
         self.skip(n);
         val
@@ -395,10 +432,11 @@ fn reverse_low_bits(mut v: u32, n: u8) -> u32 {
 /// the position only if both are well-formed (valid litlen alphabet
 /// entries, not the unused 286/287 codes, first symbol not EOB).
 ///
-/// This is the cheap prefilter; the strict check is `validate_boundary`
-/// in `fast_marker_inflate`, run by `try_decode_at` on every accepted
-/// candidate. The job here is to *eliminate most false positives* —
-/// catching all of them is `validate_boundary`'s job. Two symbols is the
+/// This is the cheap prefilter; the strict check is the worker's
+/// `decode_chunk_isal_inexact` trial-decode at the candidate offset.
+/// The job here is to *eliminate most false positives* — catching all
+/// of them is the trial-decode's job. Two
+/// symbols is the
 /// sweet spot: enough to reject ~95% of random positions (each random
 /// 9-bit pattern has ~256/512 chance of mapping to a valid symbol; two
 /// in a row is ~25%, and the EOB/unused-symbol checks knock that down
@@ -428,7 +466,7 @@ pub(crate) fn validate_fixed_block_prefix(data: &[u8], bit_offset: usize) -> boo
     bit += code_len as usize;
     // For length codes, skip past the bits we know come next so the
     // second symbol's peek lands on the right bit. We don't validate
-    // those extras / distance codes — that's `validate_boundary`'s job.
+    // those extras / distance codes — that's the worker trial-decode's job.
     if sym >= 257 {
         let lidx = (sym - 257) as usize;
         const LENGTH_EXTRA_BITS: [u8; 29] = [
@@ -495,13 +533,158 @@ impl<'a> BlockFinder<'a> {
         Self { data }
     }
 
+    /// Find the first plausible block-header candidate at or after
+    /// `from_bit`, scanning up to `scan_radius_bits` ahead. Returns the
+    /// raw bit offset of the candidate (no full trial-decode here;
+    /// caller trial-decodes via `decode_chunk_isal_inexact`).
+    /// Mirrors what rapidgzip does in `decodeChunkWithRapidgzip` — it
+    /// trusts a single candidate and lets the deflate decoder reject
+    /// false positives via its own error path.
+    pub fn find_first_candidate(&self, from_bit: usize, scan_radius_bits: usize) -> Option<usize> {
+        let end_bit = from_bit
+            .saturating_add(scan_radius_bits)
+            .min(self.data.len() * 8);
+        let candidates = self.find_blocks(from_bit, end_bit);
+        candidates
+            .into_iter()
+            .find(|b| b.bit_offset >= from_bit)
+            .map(|b| b.bit_offset)
+    }
+
+    /// Literal port of rapidgzip's `seekToNonFinalUncompressedDeflateBlock`
+    /// (vendor/rapidgzip/.../blockfinder/Uncompressed.hpp:21-95).
+    /// Scans byte boundaries for the LEN/~LEN coincidence pattern, then
+    /// validates the 3-bit deflate header preceding the byte boundary.
+    /// Returns all detected stored-block candidates (one per match), each
+    /// emitted at the EARLIEST valid bit offset (rapidgzip's offset.first,
+    /// matching the next-block boundary the predecessor would land on).
+    ///
+    /// `start_bit` and `end_bit` are bit positions into `self.data`.
+    fn find_uncompressed_blocks(&self, start_bit: usize, end_bit: usize) -> Vec<BlockBoundary> {
+        const DEFLATE_MAGIC_BIT_COUNT: usize = 3;
+        const BYTE_SIZE: usize = 8;
+        const MAX_PRECEDING_BITS: usize = DEFLATE_MAGIC_BIT_COUNT + (BYTE_SIZE - 1); // 10
+        let data = self.data;
+        let n = data.len();
+        let mut out = Vec::new();
+
+        // Mirror of rapidgzip's `untilOffsetSizeMember`: where the LEN word
+        // can live. We have at most 4 bytes of LEN + NLEN.
+        let until_byte_for_size = end_bit.div_ceil(BYTE_SIZE).min(n.saturating_sub(4));
+
+        // Mirror of `startOffsetByte`: align to next byte AFTER the 3-bit
+        // header (so the LEN field is byte-aligned). Floor at byte 1 so
+        // we have at least one byte of preceding bits to inspect.
+        let start_byte = ((start_bit + DEFLATE_MAGIC_BIT_COUNT).div_ceil(BYTE_SIZE)).max(1);
+        if start_byte >= until_byte_for_size {
+            return out;
+        }
+
+        // Walk byte boundaries, reading LEN(2) | NLEN(2) and checking
+        // len == ~nlen. Equivalent to rapidgzip's sliding 32-bit window;
+        // we just re-read each iteration (cheap on x86_64).
+        for byte_off in start_byte..until_byte_for_size {
+            // LEN ^ ~NLEN == 0  ⇔  (size ^ (size >> 16)) & 0xFFFF == 0xFFFF
+            let size = u32::from_le_bytes([
+                data[byte_off],
+                data[byte_off + 1],
+                data[byte_off + 2],
+                data[byte_off + 3],
+            ]);
+            if ((size ^ (size >> 16)) & 0xFFFF) != 0xFFFF {
+                continue;
+            }
+
+            let byte_bit = byte_off * BYTE_SIZE;
+            // Read MAX_PRECEDING_BITS BEFORE the byte boundary. Rapidgzip
+            // seeks back and peeks 10 bits; we just construct from bytes.
+            // Bit ordering: LSB-first across bytes, so the bit at position
+            // (byte_bit - 1) is the MSB of byte (byte_off - 1)'s LSB-first
+            // numbering — i.e., bit 7 of data[byte_off - 1].
+            //
+            // Following rapidgzip's convention: bit indices in preBits
+            // are numbered such that index 0 is the OLDEST bit
+            // (byte_bit - MAX_PRECEDING_BITS) and index MAX_PRECEDING_BITS-1
+            // is the NEWEST (byte_bit - 1). Build by reading the bytes
+            // covering [byte_bit - MAX_PRECEDING_BITS, byte_bit).
+            let first_pre_bit = match byte_bit.checked_sub(MAX_PRECEDING_BITS) {
+                Some(v) => v,
+                None => continue,
+            };
+            let first_pre_byte = first_pre_bit / BYTE_SIZE;
+            let shift = first_pre_bit % BYTE_SIZE;
+            // Need 2 bytes (16 bits) to extract up to 10 bits starting at
+            // first_pre_bit. previous_bits is laid out so that bit 0 is
+            // the oldest, bit (MAX_PRECEDING_BITS-1) is the newest.
+            let raw = (data[first_pre_byte] as u32) | ((data[first_pre_byte + 1] as u32) << 8);
+            let preceding_bits = (raw >> shift) & ((1u32 << MAX_PRECEDING_BITS) - 1);
+
+            // The 3 magic bits (bfinal=0, btype=00) must be at the TOP of
+            // preceding_bits (the newest bits, closest to byte_bit).
+            // MAGIC_BITS_MASK = 0b111 << (MAX_PRECEDING_BITS - 3) = 0b111 << 7.
+            const MAGIC_BITS_MASK: u32 = 0b111u32 << (MAX_PRECEDING_BITS - DEFLATE_MAGIC_BIT_COUNT);
+            if (preceding_bits & MAGIC_BITS_MASK) != 0 {
+                continue;
+            }
+
+            // Count trailing zeros in the padding region (bits 0..7 of
+            // preceding_bits, going from bit MAX_PRECEDING_BITS-4 downward).
+            // trailingZeros starts at DEFLATE_MAGIC_BIT_COUNT and grows
+            // for each preceding zero padding bit. Mirror of rapidgzip's
+            // for-loop at Uncompressed.hpp:77-82.
+            let mut trailing_zeros = DEFLATE_MAGIC_BIT_COUNT;
+            for j in (trailing_zeros + 1)..=MAX_PRECEDING_BITS {
+                if (preceding_bits & (1u32 << (MAX_PRECEDING_BITS - j))) != 0 {
+                    break;
+                }
+                trailing_zeros = j;
+            }
+
+            // The earliest valid start: byte_bit - trailing_zeros.
+            // Must be ≥ start_bit and < end_bit.
+            let earliest = match byte_bit.checked_sub(trailing_zeros) {
+                Some(v) => v,
+                None => continue,
+            };
+            let latest = byte_bit - DEFLATE_MAGIC_BIT_COUNT;
+            if earliest >= start_bit && latest < end_bit {
+                // Validate data fits: aligned_byte + 4 + len ≤ n.
+                let len = (size & 0xFFFF) as usize;
+                if len == 0 || byte_off + 4 + len > n {
+                    continue;
+                }
+                out.push(BlockBoundary {
+                    bit_offset: earliest,
+                    valid: true,
+                    hlit: 0,
+                    hdist: 0,
+                    hclen: 0,
+                });
+            }
+        }
+        out
+    }
+
     /// Find all valid deflate block starts in a range.
     ///
-    /// Searches for all block types (stored, fixed, dynamic).
-    /// Uses multi-level fail-fast validation for dynamic blocks;
-    /// stored blocks are validated by len/~len; fixed blocks are
-    /// accepted as candidates for trial decode.
+    /// Searches dynamic (via LUT + Huffman validation) AND uncompressed
+    /// (via byte-boundary LEN/~LEN scan) candidates, merging results in
+    /// ascending bit-offset order. Mirrors rapidgzip's alternating
+    /// dynamic + uncompressed search in `GzipChunk::tryToDecode`
+    /// (vendor/rapidgzip/.../chunkdecoding/GzipChunk.hpp:803-846).
     pub fn find_blocks(&self, start_bit: usize, end_bit: usize) -> Vec<BlockBoundary> {
+        let mut dynamic = self.find_dynamic_blocks(start_bit, end_bit);
+        let uncompressed = self.find_uncompressed_blocks(start_bit, end_bit);
+        dynamic.extend(uncompressed);
+        dynamic.sort_by_key(|b| b.bit_offset);
+        dynamic
+    }
+
+    /// Dynamic-Huffman block finder. Direct port of rapidgzip's
+    /// `seekToNonFinalDynamicDeflateBlock` (DynamicHuffman.hpp:168+).
+    /// Was inlined into find_blocks; extracted so find_blocks can also
+    /// run the uncompressed pass and merge results.
+    fn find_dynamic_blocks(&self, start_bit: usize, end_bit: usize) -> Vec<BlockBoundary> {
         let mut blocks = Vec::new();
         let mut reader = BitReader::new(self.data);
         reader.seek_to_bit(start_bit);
@@ -911,10 +1094,11 @@ mod tests {
         // Invalid: BTYPE=11, BFINAL=1
         assert!(lut[0b111] > 0);
 
-        // Valid: BTYPE=00 (stored), BFINAL=0
-        assert_eq!(lut[0b000], 0);
-        // Valid: BTYPE=00 (stored), BFINAL=1
-        assert_eq!(lut[0b001], 0);
+        // Invalid: BTYPE=00 (stored) — not emitted by this BlockFinder.
+        // Rapidgzip's seekToNonFinalDynamicDeflateBlock is dynamic-only;
+        // a separate seekToNonFinalUncompressedDeflateBlock handles stored.
+        assert!(lut[0b000] > 0);
+        assert!(lut[0b001] > 0);
 
         // Invalid: BTYPE=01 (fixed) — excluded from candidate search at
         // the BlockFinder level. Detection lives in
@@ -927,9 +1111,9 @@ mod tests {
         let valid = 0b00000_00000_10_0u32;
         assert_eq!(lut[valid as usize], 0);
 
-        // Valid: BTYPE=10 (dynamic), BFINAL=1, HLIT=0, HDIST=0
-        let valid_final = 0b00000_00000_10_1u32;
-        assert_eq!(lut[valid_final as usize], 0);
+        // Invalid: BTYPE=10 (dynamic), BFINAL=1 — bfinal filter rejects.
+        let final_dyn = 0b00000_00000_10_1u32;
+        assert!(lut[final_dyn as usize] > 0);
     }
 
     #[test]
@@ -958,7 +1142,7 @@ mod tests {
             enc.finish().unwrap();
         }
 
-        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&gz)
+        let header_size = crate::decompress::parallel::single_member::skip_gzip_header(&gz)
             .expect("valid header");
         let deflate = &gz[header_size..gz.len() - 8];
 
@@ -1080,7 +1264,7 @@ mod tests {
             enc.finish().unwrap();
         }
 
-        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&gz)
+        let header_size = crate::decompress::parallel::single_member::skip_gzip_header(&gz)
             .expect("valid header");
         let deflate = &gz[header_size..gz.len() - 8];
 

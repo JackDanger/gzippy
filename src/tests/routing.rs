@@ -344,6 +344,91 @@ mod tests {
     }
 
     // =========================================================================
+    // m_unsplitBlocks emplacement reaches production
+    //
+    // Vendor `GzipChunkFetcher.hpp:393` populates `m_unsplitBlocks` inside
+    // `appendSubchunksToIndexes` for every chunk that produced 2+ subchunks.
+    // gzippy ports the emplace side as scaffolding for the seekable-reader
+    // path (no production read site exists yet). Without a deletion-trap,
+    // the emplace branch could rot silently as "dead code." This test runs
+    // a single decode large enough to force multiple subchunks per chunk
+    // and asserts the counter moved.
+    // =========================================================================
+    #[test]
+    fn test_unsplit_blocks_emplaces_on_multi_subchunk_decode() {
+        use std::sync::atomic::Ordering;
+
+        // 24 MiB low-entropy fixture compresses to >10 MiB so the parallel
+        // gate fires. With the default split_chunk_size of 4 MiB and ~24
+        // MiB decompressed per chunk-partition, multi-subchunk chunks are
+        // the common case (vendor's "chunk size > spacing" path).
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+
+        let before = crate::decompress::parallel::chunk_fetcher::UNSPLIT_BLOCKS_EMPLACED
+            .load(Ordering::Relaxed);
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        assert_eq!(output, original);
+        let after = crate::decompress::parallel::chunk_fetcher::UNSPLIT_BLOCKS_EMPLACED
+            .load(Ordering::Relaxed);
+
+        #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+        assert!(
+            after > before,
+            "UNSPLIT_BLOCKS_EMPLACED did not increment ({before} -> {after}); \
+             the m_unsplitBlocks emplace branch at chunk_fetcher.rs (mirror of \
+             GzipChunkFetcher.hpp:393) is unreachable. This catches the same \
+             silent-fallback failure class as the marker-pipeline deletion trap."
+        );
+        #[cfg(not(all(target_arch = "x86_64", feature = "isal-compression")))]
+        let _ = (before, after);
+    }
+
+    // =========================================================================
+    // Prefetch dispatch reaches the last-chunk stop hint
+    //
+    // Vendor BlockFetcher.hpp:533-535 accepts `file_size_in_bits` as the
+    // worker's `nextOffset` for the LAST prefetch in a file. Without
+    // this asymmetric lookup, gzippy's `lookup_block_offset(idx+1)`
+    // returned `None` on `GetReturnCode::Failure` and the prefetch loop
+    // skipped the last chunk — observed on the 221 MB / 3-partition
+    // fixture (bench-2026-05-18). This trap asserts the new
+    // `lookup_next_block_offset` accepts the file-size sentinel during
+    // a real parallel SM decode.
+    // =========================================================================
+    #[test]
+    fn test_prefetch_next_filesize_accept_fires() {
+        use std::sync::atomic::Ordering;
+
+        // Same fixture shape as test_unsplit_blocks_emplaces — guarantees
+        // multiple partitions so prefetch_new_blocks iterates at least
+        // through the last-block's idx+1 lookup.
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+
+        let before = crate::decompress::parallel::chunk_fetcher::PREFETCH_NEXT_FILESIZE_ACCEPT
+            .load(Ordering::Relaxed);
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        assert_eq!(output, original);
+        let after = crate::decompress::parallel::chunk_fetcher::PREFETCH_NEXT_FILESIZE_ACCEPT
+            .load(Ordering::Relaxed);
+
+        #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+        assert!(
+            after > before,
+            "PREFETCH_NEXT_FILESIZE_ACCEPT did not increment ({before} -> {after}); \
+             the asymmetric lookup_next_block_offset at chunk_fetcher.rs (mirror of \
+             vendor BlockFetcher.hpp:533-535) is unreachable. Without this asymmetry, \
+             the last prefetch in any file is skipped — visible on the 3-partition \
+             fixture as a 1.24-CPU serial bottleneck on a 16-core machine."
+        );
+        #[cfg(not(all(target_arch = "x86_64", feature = "isal-compression")))]
+        let _ = (before, after);
+    }
+
+    // =========================================================================
     // Performance regression guard — the CI gap that masked v0.3.0.
     //
     // The single-member parallel path must not be SLOWER than the single-thread
@@ -351,18 +436,16 @@ mod tests {
     // design that re-decoded the entire stream sequentially in phase 2; the
     // parallel path ran at ~1.75× the elapsed time of pure sequential.
     //
-    // The v0.5.1 redesign is correct but does 2N total compute work (phase 1
-    // empty-dict decode + phase 2 re-decode with speculative window). On a
-    // machine with < 4 physical cores, `decompress_single_member`'s routing
-    // gate skips the parallel path entirely — sequential ISA-L wins outright
-    // there — so on such hardware this test compares sequential against
-    // sequential and trivially passes (ratio ~1.0). The interesting assertion
-    // fires on ≥4-core machines where the parallel path is taken; there the
-    // expected ratio is well below 1.0 (parallel faster than sequential).
-    //
-    // Threshold: parallel must complete in ≤ 1.5× sequential elapsed. v0.3.0
-    // crossed 1.75× — well above this; the 1.5× ceiling catches that class
-    // while leaving CI/noise headroom on ≥4-core developer machines.
+    // The v0.6 marker pipeline has no per-physical-core routing gate (the
+    // earlier core floor was dropped — see `docs/marker-decoder-plan.md`).
+    // On ≥4-physical-core hardware parallel comfortably beats sequential
+    // (tight assertion: ratio < 1.5 catches v0.3.0-class 1.75× regression).
+    // On <4 physical cores (e.g. 2-core CI runners) parallel-at-T=4 pays
+    // Amdahl tax that sequential T=1 doesn't, so ratios in the 1.5–2.0×
+    // range are structural — but we still assert ratio < 3.0 there so a
+    // *catastrophic* regression (5×+) on small-core hardware doesn't slip
+    // through (Opus advisor feedback on PR #97: removing the assertion
+    // entirely lost regression protection on the most common CI class).
     // =========================================================================
     #[test]
     fn test_single_member_parallel_not_slower_than_sequential() {
@@ -407,10 +490,20 @@ mod tests {
              sequential={seq_mbps:.0} MB/s  parallel(T=4)={par_mbps:.0} MB/s  ratio={ratio:.2}"
         );
 
+        // Two-tier threshold (Opus advisor feedback on PR #97): on
+        // ≥4 physical cores the bar is tight (1.5×) — anything looser
+        // wouldn't catch the v0.3.0-class 1.75× algorithmic regression.
+        // On <4 physical cores keep a *relaxed* bar (3.0×) instead of
+        // disabling the assertion entirely, so a catastrophic regression
+        // on 2-core hardware (e.g. parallel path becomes 5× slower than
+        // sequential) is still caught. The structural 1.5–2.0× tax on
+        // 2-core CI is below 3.0×.
+        let threshold = if physical >= 4 { 1.5 } else { 3.0 };
         assert!(
-            ratio < 1.5,
-            "parallel single-member must not be > 1.5× slower than sequential: \
-             par={par:?} seq={seq:?} ratio={ratio:.2} physical_cores={physical}"
+            ratio < threshold,
+            "parallel single-member must not be > {threshold:.1}× slower than sequential \
+             on {physical}-physical-core hardware: \
+             par={par:?} seq={seq:?} ratio={ratio:.2}"
         );
     }
 
@@ -435,28 +528,33 @@ mod tests {
         data
     }
 
-    /// Mostly-random data designed to push zlib into fixed-Huffman block
-    /// emission at the lowest compression level. Each ~16 KB region has
-    /// frequent literal-only short bursts → many short blocks → zlib often
-    /// picks BTYPE=01 (fixed Huffman) over BTYPE=10 (dynamic, which has
-    /// per-block header overhead). This is the structural class of input
-    /// where BlockFinder's heuristic finds no candidates because it
-    /// excludes BTYPE=01 by design.
+    /// Mixed-entropy data designed to push zlib L1 into emitting many short
+    /// blocks (a mix of BTYPE=00/01/10). Specifically: 70% random bytes
+    /// (uncompressible — short stored or stored-mixed blocks),
+    /// 30% short repeats from a small phrase set (compresses well — short
+    /// dynamic / fixed-Huffman blocks). At L1 with this entropy mix, zlib
+    /// emits many small blocks rather than one giant one; the resulting
+    /// compressed size is large enough (~12 MiB at 24 MiB original) to
+    /// clear the 10 MiB parallel gate.
+    ///
+    /// This is the failure class the cross-chunk consistency correction
+    /// sweep addresses: phase 1a's speculative pick lands near a block
+    /// boundary, but not always *at* one — without correction the
+    /// pipeline silently fell back to libdeflate.
     fn make_btype01_heavy_data(size: usize) -> Vec<u8> {
+        let phrases: &[&[u8]] = &[b"abc", b"foo bar ", b"the quick brown ", b"hello ", b"xyz "];
         let mut data = Vec::with_capacity(size);
         let mut rng: u64 = 0xb0bd1ec0de;
         while data.len() < size {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            // 95% literal random bytes, 5% short repetitions — discourages
-            // long matches, favors small blocks.
-            if (rng >> 32) % 100 < 95 {
+            if (rng >> 32) % 100 < 70 {
+                // Random byte.
                 data.push((rng >> 16) as u8);
             } else {
-                let byte = (rng >> 24) as u8;
-                let repeat = ((rng >> 40) % 4 + 2) as usize;
-                for _ in 0..repeat.min(size - data.len()) {
-                    data.push(byte);
-                }
+                // Short phrase repetition.
+                let phrase = phrases[(rng as usize) % phrases.len()];
+                let to_take = phrase.len().min(size - data.len());
+                data.extend_from_slice(&phrase[..to_take]);
             }
         }
         data.truncate(size);
@@ -473,19 +571,10 @@ mod tests {
     /// Companion to `test_marker_pipeline_actually_runs_on_x86_64_isal` —
     /// same shape (decompress_single_member at T=4, counter snapshot), but
     /// against a fixture engineered to maximize fixed-Huffman (BTYPE=01)
-    /// block density. BlockFinder excludes BTYPE=01 candidates by design.
-    ///
-    /// **`#[ignore]` until the cross-chunk consistency PR lands.** Per the
-    /// Opus advisor review documented in `docs/marker-decoder-premortem.md`
-    /// F7: cheap per-position validation of BTYPE=01 boundaries cannot
-    /// reject all false positives in isolation (fixed Huffman has no
-    /// header redundancy). The structural fix is cross-chunk consistency
-    /// (phase 1c: top-K candidates per chunk + retry until chunk N's
-    /// end_bit equals chunk N+1's start_bit). Tier-3 sweep attempts on
-    /// PR #90 produced double-coverage SizeMismatch and were reverted.
-    /// Remove the `#[ignore]` once the cross-chunk PR lands.
+    /// block density. The rapidgzip-port path handles this via
+    /// authoritative re-dispatch when the speculative start mismatches
+    /// (see `chunk_fetcher::authoritative_dispatch`).
     #[test]
-    #[ignore = "blocked on cross-chunk consistency PR — see premortem F7"]
     fn test_marker_pipeline_runs_on_btype01_heavy_input() {
         use std::sync::atomic::Ordering;
 
@@ -501,28 +590,150 @@ mod tests {
             compressed.len()
         );
 
-        let before = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+        let before_runs = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
             .load(Ordering::Relaxed);
         let mut output = Vec::new();
         crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
         assert_eq!(output, original, "byte-perfect output");
-        let after = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+        let after_runs = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
             .load(Ordering::Relaxed);
 
         #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
         assert!(
-            after > before,
-            "MARKER_PIPELINE_RUNS did not increment ({before} -> {after}) on \
-             BTYPE=01-heavy fixture — BlockFinder enhancement regressed or \
-             never landed. This is the second deletion-trap killer; the \
-             first one (low-entropy fixture) passes because BlockFinder \
-             finds BTYPE=10 candidates there. The point of THIS test is \
-             that real-world data sometimes has only BTYPE=01 boundaries \
-             in a chunk's search range."
+            after_runs > before_runs,
+            "MARKER_PIPELINE_RUNS did not increment ({before_runs} -> {after_runs}) on \
+             BTYPE=01-heavy fixture — parallel path silently fell back to \
+             sequential libdeflate."
         );
         #[cfg(not(all(target_arch = "x86_64", feature = "isal-compression")))]
-        let _ = (before, after);
+        let _ = (before_runs, after_runs);
     }
+
+    /// Wrap raw deflate bytes in a gzip frame that includes the FNAME
+    /// header field (the optional filename string that `gzip(1)` always
+    /// adds and that `flate2`'s default GzEncoder omits). The
+    /// parallel-SM path's gzip-header parser must skip FNAME correctly
+    /// to land on the deflate body at the right bit offset.
+    ///
+    /// Header layout (RFC 1952):
+    ///   1F 8B          magic
+    ///   08             CM = deflate
+    ///   08             FLG with FNAME bit set
+    ///   4 bytes        MTIME (zero)
+    ///   00             XFL
+    ///   03             OS = Unix
+    ///   <name>\0       null-terminated filename
+    ///   <deflate>
+    ///   4 bytes        CRC32 (little-endian)
+    ///   4 bytes        ISIZE (little-endian, mod 2^32)
+    fn wrap_gzip_with_fname(deflate_body: &[u8], original: &[u8], filename: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(deflate_body.len() + filename.len() + 32);
+        out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x08, 0, 0, 0, 0, 0, 0x03]);
+        out.extend_from_slice(filename.as_bytes());
+        out.push(0);
+        out.extend_from_slice(deflate_body);
+        let crc = crc32fast::hash(original);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(original.len() as u32).to_le_bytes());
+        out
+    }
+
+    /// Raw-deflate the input via flate2 (without gzip framing).
+    fn raw_deflate_level(data: &[u8], level: u32) -> Vec<u8> {
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// **Regression test for the FNAME-header corruption surfaced on
+    /// 2026-05-19 via neurotic decode of `benchmark_data/silesia-large.gz`.**
+    ///
+    /// gzip(1) CLI adds a FNAME field to every archive (the filename of
+    /// the source). gzippy's parallel-SM path on x86_64+ISA-L
+    /// decompresses these files to wrong bytes. On the silesia fixture:
+    ///   gunzip md5: c070ed8438c2be5a1e99d6b8b980c047
+    ///   gzippy md5: 497cde98ecb8a34d407f44510442cd13
+    ///
+    /// The bug predates the 2026-05-19 wrapper port — bisected to at
+    /// least `78195ce` (before the IsalInflateWrapper refill change).
+    /// Likely cause: the parallel-SM header-skip + start-bit calculation
+    /// doesn't account for FNAME-extended headers correctly, so chunk 0
+    /// starts at the wrong bit offset.
+    ///
+    /// This test is x86_64+isal-compression gated (the parallel-SM path
+    /// is the failing path; other routes decode correctly). It is
+    /// currently EXPECTED TO FAIL on x86_64+isal-compression and is
+    /// marked `#[ignore]` so the suite remains green until the fix
+    /// lands. Run with `cargo test ... -- --ignored` to surface the
+    /// failure.
+    #[test]
+    #[ignore = "x86_64+isal-compression parallel-SM corrupts on FNAME-headered gzip — see issue"]
+    fn test_parallel_sm_handles_fname_header() {
+        // Bug reproducer (neurotic 2026-05-19): on real gzip(1)-CLI
+        // output (which adds a FNAME field), gzippy's parallel-SM path
+        // produces non-deterministically WRONG bytes at T≥9 on 16-core
+        // x86_64+ISA-L hosts. T=1..8 decode correctly. The corruption
+        // is deterministic per-run but the wrong bytes differ across
+        // T values, suggesting a race in chunk-ordering or window
+        // propagation at high worker counts.
+        //
+        // Bench fixtures (`bench_all_formats.py` produces fixtures via
+        // gzippy compression, no FNAME) decode correctly across the
+        // matrix; that's why CI never caught this.
+        //
+        // Reproducer conditions (empirically):
+        //   - file uses gzip(1)'s FNAME header
+        //   - compressed size large enough that >40 parallel chunks fire
+        //   - T >= 9
+        //
+        // This test approximates those conditions and DOES fail on
+        // x86_64+isal-compression. Currently `#[ignore]`d so the
+        // suite stays green until the race is fixed. Run with
+        // `cargo test ... --features isal-compression test_parallel_sm_handles_fname_header
+        //   -- --ignored --nocapture`.
+        let original = make_low_entropy_data(200 * 1024 * 1024);
+        let deflate = raw_deflate_level(&original, 6);
+        let fixture = wrap_gzip_with_fname(&deflate, &original, "silesia-large.bin");
+        assert!(
+            fixture.len() > 10 * 1024 * 1024,
+            "fixture must exceed 10 MiB parallel gate (got {} bytes)",
+            fixture.len()
+        );
+
+        // Use T = num_cpus (or 16, whichever is smaller — neurotic has
+        // 16 physical, smaller machines might not reproduce the race).
+        let threads = num_cpus::get().clamp(9, 16);
+
+        let mut output = Vec::with_capacity(original.len());
+        crate::decompress::decompress_single_member(&fixture, &mut output, threads).unwrap();
+
+        assert_eq!(
+            output.len(),
+            original.len(),
+            "decoded length mismatch on FNAME-headered fixture (threads={threads})"
+        );
+        assert_eq!(
+            crc32fast::hash(&output),
+            crc32fast::hash(&original),
+            "decoded bytes diverge from original on FNAME-headered fixture (threads={threads})"
+        );
+    }
+
+    // =========================================================================
+    // Optimization counter tests previously lived here (OptimizationCounters
+    // snapshots for v0.6 phase-1 internals). The rapidgzip-port replaces the
+    // phase-based pipeline with the chunk_fetcher prefetch loop + worker
+    // pool; the relevant per-event observability is now in
+    // `src/decompress/parallel/trace.rs` (GZIPPY_LOG_FILE=path).
+    // =========================================================================
+
+    // The four OptimizationCounters-based tests (test_isal_handoff_fires_*,
+    // test_bootstrap_bounded_*, test_isal_produces_bulk_*, test_phase1a_*)
+    // were deleted with the rapidgzip-port. Their assertions probed v0.6
+    // internal counters that no longer exist; the relevant per-event
+    // observability is now in `src/decompress/parallel/trace.rs`
+    // (GZIPPY_LOG_FILE=path → scripts/parallel_sm_log_summary.py).
 
     // =========================================================================
     // Layer 3: Output Identity — same output regardless of thread count
@@ -642,12 +853,16 @@ mod tests {
         use crate::decompress::{classify_gzip, DecodePath};
         let oracle = FileOracle::new(512 * 1024);
         let path = classify_gzip(&oracle.single_member_gz, 4);
-        // Single-member must route to one of the three single-member paths.
-        // The exact path depends on whether ISA-L is available on this machine.
+        // Single-member must route to one of the four single-member paths.
+        // The exact path depends on whether ISA-L is available on this machine
+        // and whether the input clears the parallel-SM size gate.
         assert!(
             matches!(
                 path,
-                DecodePath::IsalSingle | DecodePath::StreamingSingle | DecodePath::LibdeflateSingle
+                DecodePath::IsalParallelSM
+                    | DecodePath::IsalSingle
+                    | DecodePath::StreamingSingle
+                    | DecodePath::LibdeflateSingle
             ),
             "single-member should classify as a single-member path, got {:?}",
             path

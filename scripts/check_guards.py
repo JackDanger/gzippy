@@ -43,9 +43,17 @@ THRESHOLDS = {
     "decomp_vs_rapidgzip": 0.99,          # Must be >= 99% of rapidgzip
     "decomp_vs_igzip": 0.90,              # Must be >= 90% of igzip (hand-tuned asm)
 
-    # Single-member parallel decompression (v0.6 marker pipeline)
-    "single_member_vs_rapidgzip": 0.99,   # Must be within 1% of rapidgzip
-    "single_member_vs_pigz": 1.0,         # Must beat unpigz
+    # Single-member parallel decompression (v0.6 marker pipeline +
+    # cleanData→ISA-L handoff per chunk, matching rapidgzip's
+    # `GzipChunk.hpp` design). One universal goal per peer — the
+    # earlier `_low_core_sanity_floor` tiers were goalpost-moving
+    # against a structural per-thread gap that's now closed by the
+    # bootstrap→ISA-L handoff (the marker decoder runs ≤32 KB per
+    # chunk; ISA-L handles ~99% of the bytes at full single-thread
+    # ISA-L speed). If CI's 2-core class can't hit these, the
+    # implementation is wrong — fix it, don't lower the bar.
+    "single_member_vs_rapidgzip": 0.99,
+    "single_member_vs_pigz": 1.0,
 }
 
 
@@ -299,6 +307,21 @@ def check_decompression_guards(results: list) -> tuple:
     return all_passed, report
 
 
+def single_member_thresholds() -> tuple:
+    """
+    Universal single-member decomp goals — same on every hardware class.
+    Returns `(vs_rapidgzip, vs_unpigz)`. The bootstrap→ISA-L handoff
+    means per-thread throughput now matches sequential ISA-L on any
+    hardware where ISA-L is available; there's no structural reason
+    to relax these on 2-core CI. If a runner can't hit them, the
+    implementation is wrong, not the bar.
+    """
+    return (
+        THRESHOLDS["single_member_vs_rapidgzip"],
+        THRESHOLDS["single_member_vs_pigz"],
+    )
+
+
 def check_single_member_guards(results_dir: str) -> tuple:
     """
     Check single-member parallel decompression guards (v0.6 marker pipeline).
@@ -314,6 +337,8 @@ def check_single_member_guards(results_dir: str) -> tuple:
     results_path = Path(results_dir)
     if not results_path.exists():
         return True, []
+
+    rapidgzip_threshold, pigz_threshold = single_member_thresholds()
 
     for json_file in sorted(results_path.glob("*.json")):
         try:
@@ -342,14 +367,14 @@ def check_single_member_guards(results_dir: str) -> tuple:
             rapid_speed = rapidgzip.get("speed_mbps", 0)
             if rapid_speed > 0:
                 ratio = gzippy_speed / rapid_speed
-                passed = ratio >= THRESHOLDS["single_member_vs_rapidgzip"]
+                passed = ratio >= rapidgzip_threshold
                 report.append({
                     "name": f"Single-member T{threads} vs rapidgzip",
                     "metric": "speed_vs_rapidgzip",
                     "gzippy": gzippy_speed,
                     "other": rapid_speed,
                     "ratio": ratio,
-                    "threshold": THRESHOLDS["single_member_vs_rapidgzip"],
+                    "threshold": rapidgzip_threshold,
                     "passed": passed,
                 })
                 if not passed:
@@ -360,14 +385,14 @@ def check_single_member_guards(results_dir: str) -> tuple:
             unpigz_speed = unpigz.get("speed_mbps", 0)
             if unpigz_speed > 0:
                 ratio = gzippy_speed / unpigz_speed
-                passed = ratio >= THRESHOLDS["single_member_vs_pigz"]
+                passed = ratio >= pigz_threshold
                 report.append({
                     "name": f"Single-member T{threads} vs unpigz",
                     "metric": "speed_vs_pigz",
                     "gzippy": gzippy_speed,
                     "other": unpigz_speed,
                     "ratio": ratio,
-                    "threshold": THRESHOLDS["single_member_vs_pigz"],
+                    "threshold": pigz_threshold,
                     "passed": passed,
                 })
                 if not passed:

@@ -392,7 +392,7 @@ mod tests {
             }
         };
 
-        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&gz)
+        let header_size = crate::decompress::parallel::single_member::skip_gzip_header(&gz)
             .expect("valid header");
         let deflate = &gz[header_size..gz.len() - 8];
         let isize_val = u32::from_le_bytes([

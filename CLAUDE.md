@@ -4,13 +4,54 @@
 
 **gzippy aims to be the fastest gzip implementation ever created.**
 
+## Cutover Goal (May 2026)
+
+**Port the rapidgzip algorithmic core into Rust, faithfully — but ONLY for
+formats GNU gzip supports.** We want rapidgzip's *speed*, not its *format
+breadth*. GNU gzip handles gzip-family streams (single-member, multi-member,
+BGZF — all valid gzip). BZIP2 and ZLIB are NOT gzip and are out of scope.
+
+The goal is **every gzip-relevant primitive, decoder, block finder, huffman
+variant, reader, index, and analyzer in `vendor/rapidgzip/librapidarchive/`
+ported into gzippy with vendor file:line citations.** That includes:
+
+- **Formats** (IN SCOPE): gzip single-member, multi-member gzip, BGZF, raw
+  DEFLATE (as the inner codec).
+- **Formats** (OUT OF SCOPE — not part of GNU gzip): BZIP2 (`Bzip2Chunk.hpp`,
+  `indexed_bzip2/bzip2.hpp`), ZLIB stream format (`gzip/zlib.hpp`). A small
+  ZLIB-format header parser landed (commit `db19347`) as a side-effect of the
+  port pass; keep it for now since it's harmless, but no Bzip2 or Zlib
+  decoder is in scope.
+- **Decoders** (gzip-only): `chunkdecoding/GzipChunk`, `gzip/GzipReader`,
+  `gzip/GzipAnalyzer`, `gzip/InflateWrapper`, `gzip/isal`. NOT
+  `chunkdecoding/Bzip2Chunk`.
+- **Block finders**: `blockfinder/Bgzf`, `blockfinder/DynamicHuffman`,
+  `blockfinder/Uncompressed`, `blockfinder/PigzStringView`,
+  `blockfinder/precodecheck/CountAllocatedLeaves` (all gzip-family).
+- **Huffman variants**: `HuffmanCodingDoubleLiteralCached`, `HuffmanCodingISAL`,
+  `HuffmanCodingReversedBitsCached*`, `HuffmanCodingShortBitsMultiCached*`,
+  `HuffmanCodingDistanceISAL` (gzip Deflate decoders).
+- **Core primitives**: `ThreadPool` (the real one), `BitStringFinder`,
+  `ParallelBitStringFinder`, `StreamedResults`, `SimpleRunLengthEncoding`,
+  `AtomicMutex`, `AffinityHelpers`, `AlignedAllocator`, `FasterVector`,
+  `FileRanges`, `JoiningThread`, etc.
+- **High-level**: `ParallelGzipReader`, `IndexFileFormat` (seekable indexes
+  for gzip), gzip-relevant `rapidgzip.hpp` public API surface.
+
+Done when an Opus advisor agrees gzippy structurally and calculationally
+matches the gzip-relevant surface of rapidgzip (not the BZIP2/ZLIB-decoder
+surface). Performance optimization happens after that.
+
 ## Rules
 
 1. **ONE PRODUCTION PATH** — know exactly which function the CLI calls. Test that function.
 2. **RUN `make` FIRST** — before `make ship`, before committing. `make` catches regressions in 30s.
 3. **BENCHMARK EVERYTHING** — `make ship` (homelab bench on `neurotic`) is authoritative; local `make` is for iteration.
-4. **REVERT REGRESSIONS** — if `make` or `make ship` shows a loss, revert immediately.
-5. **NEVER COMPROMISE PERFORMANCE** — clippy, style, readability: none justify slower code.
+4. **NEVER COMPROMISE CORRECTNESS** — output bytes, CRC32, ISIZE must always verify.
+5. **NO FALLBACKS** — failure is an explicit `Err(GzippyError::Decompression(_))`. No silent libdeflate or ISA-L retries from the SM body. `decompress_single_member` either succeeds via the parallel pipeline or returns an error.
+6. **THE GOAL IS SPEED, NOT FIDELITY.** gzippy aims to be the fastest gzip implementation ever created. Rapidgzip is the current reference for parallel decompression because its architecture is the fastest known — port it as a *means*. Where gzippy's own SIMD inflate primitives (in `src/decompress/inflate/`, `src/decompress/{combined_lut,packed_lut,simd_huffman,vector_huffman,two_level_table}.rs`, `src/backends/inflate_bit.rs`) beat rapidgzip's inner inflate, use them. The deliverable is throughput, not vendor parity.
+
+(Removed 2026-05-17 per `docs/codex-meta-audit.md` §3: the prior Rule #4 — "DO NOT REVERT PERF REGRESSIONS DURING CUTOVER" — and Rule #7 — "PORT, DON'T INNOVATE" — were self-invented loophole rules that codified permission and discarded constraint. Rule #4 let perf regressions ship behind a "cutover" label that grew to 75+ commits. Rule #7 forbade reusing gzippy's existing SIMD inflate assets — exactly the assets that could let gzippy *beat* rapidgzip instead of tie it.)
 
 ## Production Routing (Apr 2026)
 
@@ -31,9 +72,13 @@ Input → decompress::mod: decompress_gzip_libdeflate
                fast_marker_inflate producing Vec<u16> with markers for
                cross-chunk back-refs. Phase 2 sequential resolves markers
                via SIMD replace_markers using each predecessor's last
-               32 KB as window, converts u16→u8. Phase 3 verifies CRC and
-               size against gzip trailer BEFORE writing — never partial
-               output on Err. Counter `MARKER_PIPELINE_RUNS` proves
+               32 KB as window, converts u16→u8. Output STREAMS: bytes
+               flow to the writer as each chunk resolves; CRC32 + ISIZE
+               are verified against the gzip trailer AFTER the final
+               chunk is written, so a mismatch is a terminal Err with
+               partial output already on the writer (same as gzip(1) —
+               for file output `io::decompress_file` then deletes the
+               dest file). Counter `MARKER_PIPELINE_RUNS` proves
                production routing called us; see deletion-trap killer
                test in src/tests/routing.rs)
         x86_64 (ISA-L available)        → isal_decompress::decompress_gzip_stream
@@ -80,6 +125,18 @@ Two regression tests lock the parallel single-member wiring:
    that would have caught the v0.3.0 regression (parallel was 1.75× slower
    than sequential).
 
+## Active port: rapidgzip → gzippy parallel single-member
+
+**Before changing anything in `src/decompress/parallel/`, read
+`docs/rapidgzip-port-reference.md`.** That file is the living ground
+truth: rapidgzip architecture with C++ line citations, gzippy current
+state, gap matrix (G1..G13) with status, trace event catalog, and a
+pre-commit judgment-call checklist. If a change appears to "work" but
+contradicts the reference, the change is suspect.
+
+Capture a trace with `GZIPPY_LOG_FILE=/tmp/sm.log` and analyze via
+`scripts/parallel_sm_log_summary.py` before claiming a perf change worked.
+
 ## Hard-Won Lessons
 
 **What works**: mmap stdin for multi-threaded (zero-copy, +44%), BufWriter for
@@ -103,15 +160,15 @@ parallel design. Phase 1 decodes each chunk with an empty dict in parallel
 each predecessor's phase-1 last 32 KB as a *speculative* dict — almost always
 correct on real data (error propagation requires ≥ chunk_size/32 KB consecutive
 near-max-distance back-references). Phase 3 combines per-chunk CRC32s (computed
-in phase 2 workers via `crc32fast::Hasher::combine`), verifies against the gzip
-trailer, then writes — so a failed speculation never produces partial output
-to the writer. Speedup ≈ T/2; ties sequential at T=2 (CI), scales to 4× at T=8.
+in phase 2 workers via `crc32fast::Hasher::combine`) and verifies them against
+the gzip trailer; output streams to the writer as chunks resolve, so a CRC/ISIZE
+mismatch is a terminal Err with partial output already emitted. Speedup ≈ T/2;
+ties sequential at T=2 (CI), scales to 4× at T=8.
 Wired into `decompress::decompress_single_member` behind
 `isal_decompress::is_available() && num_threads > 1 && data.len() > 10 MiB`.
-The old "32 KB prefix correction" plan (`docs/parallel-single-member-redesign.md`)
-was wrong: cross-chunk back-references resolve to zeros in phase 1, then propagate
-forward via chunk-local back-references arbitrarily far — the prefix correction
-can't unwind that. Test
+The old "32 KB prefix correction" plan was wrong: cross-chunk back-references
+resolve to zeros in phase 1, then propagate forward via chunk-local back-
+references arbitrarily far — the prefix correction can't unwind that. Test
 `tests::routing::tests::test_single_member_parallel_not_slower_than_sequential`
 catches regressions of the v0.3.0 class before push.
 

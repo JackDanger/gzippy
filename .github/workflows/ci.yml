@@ -937,9 +937,16 @@ jobs:
         run: |
           VERSION=$(cat VERSION)
           CARGO_VERSION=$(grep "^version = " Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          FORMULA_VERSION=$(grep "version \"" Formula/gzippy.rb | sed 's/.*version "\(.*\)".*/\1/')
 
-          echo "Checking versions: VERSION=$VERSION Cargo=$CARGO_VERSION Formula=$FORMULA_VERSION"
+          echo "Checking versions: VERSION=$VERSION Cargo=$CARGO_VERSION"
           [ "$VERSION" = "$CARGO_VERSION" ] || { echo "VERSION ($VERSION) != Cargo.toml ($CARGO_VERSION)"; exit 1; }
-          [ "$VERSION" = "$FORMULA_VERSION" ] || { echo "VERSION ($VERSION) != Formula ($FORMULA_VERSION)"; exit 1; }
+
+          # Formula may use a dynamic read (version File.read(...)) or a static string.
+          # Dynamic read is always consistent with VERSION by construction; skip comparison.
+          if grep -q 'version File.read' Formula/gzippy.rb; then
+            echo "Formula uses dynamic VERSION read — always consistent with VERSION file"
+          else
+            FORMULA_VERSION=$(grep "version \"" Formula/gzippy.rb | sed 's/.*version "\(.*\)".*/\1/')
+            [ "$VERSION" = "$FORMULA_VERSION" ] || { echo "VERSION ($VERSION) != Formula ($FORMULA_VERSION)"; exit 1; }
+          fi
           echo "✓ All versions match"

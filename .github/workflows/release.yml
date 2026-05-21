@@ -566,3 +566,45 @@ jobs:
               su builder -c 'makepkg --verifysource --nodeps'
             "
           echo "PKGBUILD smoke test passed"
+
+  # ---------------------------------------------------------------------------
+  # Publish to crates.io
+  # Required secret: CARGO_REGISTRY_TOKEN — API token from crates.io
+  #   1. Log in at https://crates.io and go to Account Settings → API Tokens
+  #   2. Create a token with "publish-new" + "publish-update" scopes
+  #   3. gh secret set CARGO_REGISTRY_TOKEN --repo JackDanger/gzippy
+  # ---------------------------------------------------------------------------
+  publish-crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: [resolve-version, release]
+    env:
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: Stamp version into Cargo.toml
+        run: |
+          python3 -c "
+          import re, os
+          version = os.environ['VERSION']
+          content = open('Cargo.toml').read()
+          content = re.sub(r'^version = \"[^\"]+\"', f'version = \"{version}\"', content, count=1, flags=re.M)
+          open('Cargo.toml', 'w').write(content)
+          print(f'Set Cargo.toml version to {version}')
+          "
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # --allow-dirty: Cargo.toml was stamped above without a commit
+        # --no-verify: compilation already verified in build-binary job
+        run: cargo publish --allow-dirty --no-verify --token "$CARGO_REGISTRY_TOKEN"
