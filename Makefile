@@ -152,6 +152,12 @@ profile-single-member-decompression-arm64:
 
 profile-decompression-x86_64: profile-single-member-decompression-x86_64
 
+# Remote homelab box (Intel i9-14000), reached via an SSH jump host. This
+# is the only place the isal-compression / parallel single-member path
+# builds and runs — local arm64 macOS cannot. Used by `ship`, `bench-sm`,
+# and `test-x86_64`.
+NEUROTIC_SSH := ssh -J neurotic root@10.30.0.199
+
 # =============================================================================
 # Ship: the "are we good?" gate. Always tests the *current branch*.
 #
@@ -165,7 +171,7 @@ profile-decompression-x86_64: profile-single-member-decompression-x86_64
 # Step 5: cross-tool roundtrip smoke (gzippy ↔ gzip/pigz/igzip when available)
 # Step 6: push current branch + homelab fetches THIS branch + bench
 #
-# Target: ssh -J neurotic root@10.30.0.199 (homelab intel i9-14000)
+# Target: $(NEUROTIC_SSH) (homelab intel i9-14000)
 # Time: ~25 minutes total (~30s through step 5; ~20-25 min on step 6)
 # Use `make ship-local` to run steps 1-5 only and skip the homelab.
 # =============================================================================
@@ -181,7 +187,7 @@ ship: ship-precheck ship-local
 	  echo "  origin/$$BRANCH already up to date"; \
 	fi; \
 	echo "  connecting to neurotic..."; \
-	ssh -J neurotic root@10.30.0.199 "set -e; cd gzippy; \
+	$(NEUROTIC_SSH) "set -e; cd gzippy; \
 	  echo '  fetching origin/$$BRANCH...'; \
 	  git fetch origin '$$BRANCH'; \
 	  git checkout -B '$$BRANCH' 'origin/$$BRANCH'; \
@@ -254,7 +260,7 @@ bench-sm: ship-precheck
 	  echo "  origin/$$BRANCH already up to date"; \
 	fi; \
 	echo "  connecting to neurotic..."; \
-	ssh -J neurotic root@10.30.0.199 "set -e; cd gzippy; \
+	$(NEUROTIC_SSH) "set -e; cd gzippy; \
 	  echo '  fetching origin/$$BRANCH...'; \
 	  git fetch origin '$$BRANCH'; \
 	  git checkout -B '$$BRANCH' 'origin/$$BRANCH'; \
@@ -296,6 +302,31 @@ bench-sm: ship-precheck
 	  echo 'Full JSON: /tmp/bench-sm-result.json'"
 	@echo ""
 	@echo "✓ bench-sm complete on branch $$(git rev-parse --abbrev-ref HEAD)"
+
+# =============================================================================
+# test-x86_64: run the test suite with --features isal-compression on the
+# homelab box. The parallel single-member decode path (ISA-L) is x86_64 +
+# Linux only — it does not build on local arm64 macOS, so this is the only
+# way to verify it. Pushes the current branch, hard-syncs the homelab
+# checkout, then runs `cargo test`. ~3-5 min.
+# =============================================================================
+.PHONY: test-x86_64
+test-x86_64: ship-precheck
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	echo ""; \
+	echo "── test-x86_64: cargo test --features isal-compression on neurotic ──"; \
+	echo "  pushing $$BRANCH to origin..."; \
+	git push origin $$BRANCH || (echo "PUSH FAILED — aborting" >&2 && exit 1); \
+	echo "  connecting to neurotic..."; \
+	$(NEUROTIC_SSH) "set -e; cd gzippy; \
+	  git fetch origin '$$BRANCH'; \
+	  git checkout -B '$$BRANCH' 'origin/$$BRANCH'; \
+	  git reset --hard 'origin/$$BRANCH'; \
+	  git submodule update --init --recursive 2>&1 | tail -3; \
+	  echo '  building + testing (--features isal-compression)...'; \
+	  cargo test --release --features isal-compression"
+	@echo ""
+	@echo "✓ test-x86_64 passed on branch $$(git rev-parse --abbrev-ref HEAD)"
 
 # `ship-precheck`: dirty-tree refusal. Pulled out of `ship-local` so a
 # dirty tree fails in <1s instead of after 30s of local checks. Only
@@ -717,6 +748,8 @@ help:
 		'                    cross-tool roundtrip + push branch + homelab bench.' \
 		'                    Fail-fast (~30s through local steps; ~25min total).' \
 		'  make ship-local   Same as `ship` but skips the homelab step (steps 1-5 only).' \
+		'  make test-x86_64  cargo test --features isal-compression on the homelab box' \
+		'                    (the x86_64-only parallel single-member path).' \
 		'  make oracle-vs-c  Phase 11.2 corpus oracle: zopfli_pure vs vendor/zopfli' \
 		'' \
 		'Quick commands (for AI tools and iteration):' \
