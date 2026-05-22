@@ -41,7 +41,7 @@
 //!   closure passed to `BlockFetcher::get`, which calls
 //!   `thread_pool.submit(run_decode_job, /* priority */ 0)` and returns
 //!   the future's receiver. Mirror of BlockFetcher.hpp:554-558.
-//! - Worker decode: `decode_chunk_isal_inexact` (window known or chunk 0) or
+//! - Worker decode: `decode_chunk_isal` (window known or chunk 0) or
 //!   `speculative_decode_find_boundary` → marker bootstrap (prefetch, no window).
 //! - `postProcessChunk` / `applyWindow` → `apply_window` on the pool
 //!   (priority −1). **WindowMap publishes stay on the consumer** (vendor
@@ -73,7 +73,7 @@ use crate::decompress::parallel::crc32::CRC32Calculator;
 use crate::decompress::parallel::gzip_block_finder::{GetReturnCode, GzipBlockFinder};
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::gzip_chunk::{
-    decode_chunk_isal_inexact, decode_chunk_marker_bootstrap_then_isal,
+    decode_chunk_isal, decode_chunk_marker_bootstrap_then_isal,
 };
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::prefetcher::FetchNextAdaptive;
@@ -185,8 +185,8 @@ struct DecodeParams {
     start_bit: usize,
     /// Inexact stop hint: first deflate block boundary at-or-past this
     /// bit (vendor `untilOffset` when `untilOffsetIsExact == false`).
-    /// NOT a hard byte cap on the ISA-L reader — see `decode_chunk_isal_inexact`.
-    until_bit: usize,
+    /// NOT a hard byte cap on the ISA-L reader — see `decode_chunk_isal`.
+    stop_hint_bit: usize,
     /// True for partition-aligned prefetches that may run before the
     /// predecessor window is published (speculative path). False for
     /// on-demand decodes at a confirmed `block_finder` offset.
@@ -539,7 +539,7 @@ fn consumer_loop<W: std::io::Write>(
             .map(|li| li != next_unprocessed_block_index)
             .unwrap_or(true);
 
-        let until_bit = until_bit_for(
+        let stop_hint_bit = stop_hint_bit_for(
             block_finder,
             next_unprocessed_block_index,
             total_bits,
@@ -548,7 +548,7 @@ fn consumer_loop<W: std::io::Write>(
         let partition_idx_for_trace = next_unprocessed_block_index;
         let params = DecodeParams {
             start_bit: decode_start,
-            until_bit,
+            stop_hint_bit,
             is_speculative_prefetch: false,
             partition_idx: partition_idx_for_trace,
         };
@@ -565,16 +565,16 @@ fn consumer_loop<W: std::io::Write>(
         // Critical: `next_offset` is the worker's stop hint; using
         // anything derived from `next_unprocessed_block_index` here
         // (the consumer's index, NOT the prefetched index) produced an
-        // until_bit equal to `start_bit` for every prefetch past the
+        // stop_hint_bit equal to `start_bit` for every prefetch past the
         // first one, causing the worker to immediately exit with an
         // empty chunk.
         let prefetch_submit = |offset: usize,
                                next_offset: usize|
          -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
-            let prefetch_until_bit = next_offset.max(offset);
+            let prefetch_stop_hint_bit = next_offset.max(offset);
             let prefetch_params = DecodeParams {
                 start_bit: offset,
-                until_bit: prefetch_until_bit,
+                stop_hint_bit: prefetch_stop_hint_bit,
                 is_speculative_prefetch: true,
                 partition_idx: usize::MAX, // trace marker for "prefetch"
             };
@@ -966,7 +966,7 @@ fn consumer_loop<W: std::io::Write>(
     Ok(())
 }
 
-/// Compute the `until_bit` hint for the worker. Mirror of vendor's
+/// Compute the `stop_hint_bit` hint for the worker. Mirror of vendor's
 /// `nextBlockOffset = m_blockFinder->get(validDataBlockIndex + 1)` at
 /// BlockFetcher.hpp:268, with one gzippy guard for the confirmed-offset
 /// / partition-guess interaction:
@@ -977,7 +977,7 @@ fn consumer_loop<W: std::io::Write>(
 /// Using P as `until` caps the next worker to a handful of bits → ISA-L
 /// `InvalidBlock`. Skip hints that are not meaningfully past `floor`.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-fn until_bit_for(
+fn stop_hint_bit_for(
     block_finder: &GzipBlockFinder,
     block_index: usize,
     total_bits: usize,
@@ -1027,10 +1027,10 @@ fn submit_decode_to_pool(
             "consumer",
             "submit_decode",
             &format!(
-                r#""partition_idx":{},"start_bit":{},"until_bit":{},"is_speculative_prefetch":{}"#,
+                r#""partition_idx":{},"start_bit":{},"stop_hint_bit":{},"is_speculative_prefetch":{}"#,
                 params.partition_idx,
                 params.start_bit,
-                params.until_bit,
+                params.stop_hint_bit,
                 params.is_speculative_prefetch,
             ),
         );
@@ -1072,7 +1072,7 @@ fn submit_post_process_to_pool(
 }
 
 /// Pool-side execution of a decode task (vendor `decodeBlock`,
-/// GzipChunkFetcher.hpp:692-729). Routes to `decode_chunk_isal_inexact`
+/// GzipChunkFetcher.hpp:692-729). Routes to `decode_chunk_isal`
 /// when the predecessor window is published, else
 /// `speculative_decode_find_boundary` (marker bootstrap when no window).
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
@@ -1113,7 +1113,7 @@ fn run_decode_task(
     // and the post-process queue do the synchronization.
     // Chunk-0 special case: predecessor window is the zero sentinel.
     // Hold the materialized bytes on the stack so the
-    // `decode_chunk_isal_inexact` slice borrow is valid for the call's
+    // `decode_chunk_isal` slice borrow is valid for the call's
     // duration without going through WindowMap. Non-chunk-0 worker
     // gets the predecessor window via `window_map.get` (zero-alloc
     // Arc clone) and materializes bytes via `materialize_window`.
@@ -1125,19 +1125,19 @@ fn run_decode_task(
     };
 
     let chunk_result = if params.start_bit == 0 {
-        decode_chunk_isal_inexact(
+        decode_chunk_isal(
             input_bytes,
             params.start_bit,
-            params.until_bit,
+            params.stop_hint_bit,
             &zero_window[..],
             configuration,
         )
     } else if let Some(w) = window.as_ref() {
         let bytes = materialize_window(w);
-        decode_chunk_isal_inexact(
+        decode_chunk_isal(
             input_bytes,
             params.start_bit,
-            params.until_bit,
+            params.stop_hint_bit,
             &bytes,
             configuration,
         )
@@ -1145,7 +1145,7 @@ fn run_decode_task(
         speculative_decode_find_boundary(
             input_bytes,
             params.start_bit,
-            params.until_bit,
+            params.stop_hint_bit,
             configuration,
         )
     };
@@ -1168,7 +1168,7 @@ fn run_decode_task(
                 "[WIN] decode start={:>12} until={:>12} spec={} path={:<11} \
                  -> enc=[{}, {}) markers={}",
                 params.start_bit,
-                params.until_bit,
+                params.stop_hint_bit,
                 params.is_speculative_prefetch,
                 path,
                 c.encoded_offset_bits,
@@ -1210,11 +1210,11 @@ fn run_decode_task(
                 &label,
                 "decode_err",
                 &format!(
-                    r#""partition_idx":{},"path":"{}","start_bit":{},"until_bit":{},"err":"{}","duration_us":{dur_us}"#,
+                    r#""partition_idx":{},"path":"{}","start_bit":{},"stop_hint_bit":{},"err":"{}","duration_us":{dur_us}"#,
                     params.partition_idx,
                     path,
                     params.start_bit,
-                    params.until_bit,
+                    params.stop_hint_bit,
                     trace::esc(&format!("{e:?}")),
                 ),
             ),
@@ -1371,13 +1371,13 @@ fn try_speculative_decode_candidate(
     input: &[u8],
     decode_start: usize,
     partition_seed: usize,
-    until_bit: usize,
+    stop_hint_bit: usize,
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
     let mut chunk = decode_chunk_marker_bootstrap_then_isal(
         input,
         decode_start,
-        until_bit,
+        stop_hint_bit,
         &[],
         configuration,
     )?;
@@ -1405,7 +1405,7 @@ fn try_speculative_decode_candidate(
 fn speculative_decode_find_boundary(
     input: &[u8],
     start_bit: usize,
-    until_bit: usize,
+    stop_hint_bit: usize,
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
     const CHUNK_SIZE_BITS: usize = 8 * 1024 * 8;
@@ -1422,7 +1422,7 @@ fn speculative_decode_find_boundary(
     // Vendor `tryToDecode` (GzipChunk.hpp:712-841) attempts the partition
     // seed itself before walking BlockFinder candidates.
     if let Ok(chunk) =
-        try_speculative_decode_candidate(input, start_bit, start_bit, until_bit, configuration)
+        try_speculative_decode_candidate(input, start_bit, start_bit, stop_hint_bit, configuration)
     {
         SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(chunk);
@@ -1440,7 +1440,7 @@ fn speculative_decode_find_boundary(
                 input,
                 cand.bit_offset,
                 start_bit,
-                until_bit,
+                stop_hint_bit,
                 configuration,
             ) {
                 Ok(chunk) => {
@@ -1466,9 +1466,13 @@ fn speculative_decode_find_boundary(
         let tail_start_byte = start_bit / 8;
         for byte_off in tail_start_byte..input.len() {
             let bit = byte_off * 8;
-            if let Ok(chunk) =
-                try_speculative_decode_candidate(input, bit, start_bit, until_bit, configuration)
-            {
+            if let Ok(chunk) = try_speculative_decode_candidate(
+                input,
+                bit,
+                start_bit,
+                stop_hint_bit,
+                configuration,
+            ) {
                 SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(chunk);
             }
@@ -1638,7 +1642,7 @@ mod tests {
     /// split_chunk_size and an input long enough to span multiple
     /// chunks.
     #[test]
-    fn until_bit_for_skips_partition_guess_immediately_after_confirmed_end() {
+    fn stop_hint_bit_for_skips_partition_guess_immediately_after_confirmed_end() {
         let spacing_bytes = 4 * 1024 * 1024;
         let spacing_bits = spacing_bytes * 8;
         let total_bits = spacing_bits * 10;
@@ -1646,7 +1650,7 @@ mod tests {
         // Chunk 0 confirmed end one byte into the next partition slot.
         let confirmed_end = spacing_bits - 5;
         finder.insert(confirmed_end);
-        let until = super::until_bit_for(&finder, 1, total_bits, confirmed_end);
+        let until = super::stop_hint_bit_for(&finder, 1, total_bits, confirmed_end);
         assert!(
             until.saturating_sub(confirmed_end) >= spacing_bits,
             "until {until} must skip stale get(idx+1) guess {spacing_bits} (only 5b past end)"

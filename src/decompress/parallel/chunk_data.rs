@@ -171,7 +171,7 @@ pub struct ChunkData {
     /// `ChunkData::footers` (ChunkData.hpp:472-489 `appendFooter`).
     pub footers: Vec<Footer>,
     /// True iff the inexact decoder hit `max_decoded_chunk_size`
-    /// before reaching the requested `until_bits`. Tells the
+    /// before reaching the requested `stop_hint_bits`. Tells the
     /// dispatcher this chunk needs a successor starting at
     /// `encoded_offset_bits + encoded_size_bits`.
     pub stopped_preemptively: bool,
@@ -364,7 +364,7 @@ impl ChunkData {
     /// DIRECTLY into `self.data` (e.g. ISA-L's `next_out` pointed at
     /// `data.as_mut_ptr().add(prev_len)` and produced `written` bytes
     /// there). Saves the `extend_from_slice` memcpy that
-    /// `decode_chunk_isal_inexact`'s tight loop was paying on every
+    /// `decode_chunk_isal`'s tight loop was paying on every
     /// `isal_inflate` call — accounted for ~10% of decode wall time
     /// per `docs/runs/run-20260518-085124-perf/`.
     ///

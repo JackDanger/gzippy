@@ -1,7 +1,7 @@
 //! Parallel single-member decompression (production path).
 //!
 //! Entry: [`single_member::decompress_parallel`] → [`sm_driver::read_parallel_sm`]
-//! → [`chunk_fetcher::drive`] → [`gzip_chunk::decode_chunk_isal_inexact`]
+//! → [`chunk_fetcher::drive`] → [`gzip_chunk::decode_chunk_isal`]
 //! or [`gzip_chunk::decode_chunk_marker_bootstrap_then_isal`] (prefetch).
 
 pub mod apply_window;

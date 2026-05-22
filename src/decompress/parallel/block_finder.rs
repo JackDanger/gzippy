@@ -433,7 +433,7 @@ fn reverse_low_bits(mut v: u32, n: u8) -> u32 {
 /// entries, not the unused 286/287 codes, first symbol not EOB).
 ///
 /// This is the cheap prefilter; the strict check is the worker's
-/// `decode_chunk_isal_inexact` trial-decode at the candidate offset.
+/// `decode_chunk_isal` trial-decode at the candidate offset.
 /// The job here is to *eliminate most false positives* — catching all
 /// of them is the trial-decode's job. Two
 /// symbols is the
@@ -536,7 +536,7 @@ impl<'a> BlockFinder<'a> {
     /// Find the first plausible block-header candidate at or after
     /// `from_bit`, scanning up to `scan_radius_bits` ahead. Returns the
     /// raw bit offset of the candidate (no full trial-decode here;
-    /// caller trial-decodes via `decode_chunk_isal_inexact`).
+    /// caller trial-decodes via `decode_chunk_isal`).
     /// Mirrors what rapidgzip does in `decodeChunkWithRapidgzip` — it
     /// trusts a single candidate and lets the deflate decoder reject
     /// false positives via its own error path.

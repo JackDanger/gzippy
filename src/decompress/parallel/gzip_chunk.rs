@@ -1,12 +1,12 @@
 //! Per-chunk deflate decode for parallel single-member.
 //!
-//! - [`decode_chunk_isal_inexact`] — on-demand decode when the predecessor
+//! - [`decode_chunk_isal`] — on-demand decode when the predecessor
 //!   window is known (or chunk 0 with a zero dict). Clean bytes only.
 //! - [`decode_chunk_marker_bootstrap_then_isal`] — speculative prefetch when
 //!   no window yet: marker bootstrap for cross-chunk refs, then ISA-L bulk.
 //!
-//! `until_bits` caps how far ISA-L may read (`IsalInflateWrapper::with_until_bits`
-//! / `refill_buffer`), matching vendor `m_encodedUntilOffset`.
+//! `stop_hint_bits` is an inexact stop hint (vendor `untilOffset`): the
+//! decoder runs to the first block boundary at-or-past it, then stops.
 
 #![allow(dead_code)]
 
@@ -41,37 +41,37 @@ impl From<std::io::Error> for ChunkDecodeError {
 /// rapidgzip's `ALLOCATION_CHUNK_SIZE` (GzipChunk.hpp uses 128 KiB).
 const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 
-/// **Inexact** ISA-L decode when the predecessor window is known.
+/// ISA-L decode of one chunk when the predecessor window is known.
 ///
-/// Production always uses [`IsalInflateWrapper`] (lazy refill, multi-stream
-/// footer loop, BTYPE=01 header stops). Raw isal-sys is test-only.
+/// Stops at the first block boundary at-or-past `stop_hint_bits` (an
+/// inexact hint — the decoder may overshoot), or at end-of-stream.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-pub fn decode_chunk_isal_inexact(
+pub fn decode_chunk_isal(
     input: &[u8],
     encoded_offset_bits: usize,
-    until_bits: usize,
+    stop_hint_bits: usize,
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    decode_chunk_isal_inexact_wrapper(
+    decode_chunk_isal_impl(
         input,
         encoded_offset_bits,
-        until_bits,
+        stop_hint_bits,
         initial_window,
         configuration,
     )
 }
 
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-fn decode_chunk_isal_inexact_wrapper(
+fn decode_chunk_isal_impl(
     input: &[u8],
     encoded_offset_bits: usize,
-    until_bits: usize,
+    stop_hint_bits: usize,
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
     let t_decode = std::time::Instant::now();
-    // `until_bits` is an inexact stop *hint* (vendor `untilOffset`), not a hard
+    // `stop_hint_bits` is an inexact stop *hint* (vendor `untilOffset`), not a hard
     // read cap. Capping `refill_buffer` at a partition guess stops mid-block
     // (e.g. silesia gzip-9 at 33554427 vs hint 33554432 → InvalidBlock on resume).
     let read_cap = input.len() * 8;
@@ -143,7 +143,7 @@ fn decode_chunk_isal_inexact_wrapper(
                     chunk.append_block_boundary_at(r.bit_position, decode_base + n_bytes_read);
                     last_eob_pos = r.bit_position;
                     last_eob_decoded_bytes = decode_base + n_bytes_read;
-                    if last_eob_pos >= until_bits {
+                    if last_eob_pos >= stop_hint_bits {
                         // Do not keep filling this buffer from the next block
                         // before HEADER/NONE handling — finalize at pre-header EOB.
                         last_end_bit = last_eob_pos;
@@ -153,15 +153,15 @@ fn decode_chunk_isal_inexact_wrapper(
                 sp if sp == StoppingPoints::END_OF_BLOCK_HEADER => {
                     let not_final = !wrapper.is_final_block();
                     let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
-                    if last_eob_pos >= until_bits && not_final && not_fixed {
+                    if last_eob_pos >= stop_hint_bits && not_final && not_fixed {
                         last_end_bit = last_eob_pos;
                         stopping_point_reached = true;
                     }
                 }
                 sp if sp == StoppingPoints::NONE && last_per_call == 0 => {
                     // ISA-L can return 0 bytes between block boundaries.
-                    // Do not end the chunk early while still before `until_bits`.
-                    if last_eob_pos >= until_bits {
+                    // Do not end the chunk early while still before `stop_hint_bits`.
+                    if last_eob_pos >= stop_hint_bits {
                         last_end_bit = last_eob_pos;
                         stopping_point_reached = true;
                     }
@@ -225,7 +225,7 @@ fn decode_chunk_isal_inexact_wrapper(
             break;
         }
         if last_stopped_at == StoppingPoints::NONE && last_per_call == 0 {
-            if last_eob_pos >= until_bits {
+            if last_eob_pos >= stop_hint_bits {
                 last_end_bit = last_eob_pos;
                 break;
             }
@@ -234,9 +234,9 @@ fn decode_chunk_isal_inexact_wrapper(
     }
 
     chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
-    // When the reader hits `until_bits` (refill cap) without an inexact
+    // When the reader runs past `stop_hint_bits` without an inexact
     // stop, `tell_compressed()` can land mid-block. Successor chunks must
-    // resume at the last END_OF_BLOCK position (pre-header), not the cap.
+    // resume at the last END_OF_BLOCK position (pre-header), not mid-block.
     let final_bit = if stopping_point_reached || reached_stream_end {
         last_end_bit
     } else if last_eob_pos > encoded_offset_bits {
@@ -257,13 +257,13 @@ fn decode_chunk_isal_inexact_wrapper(
 /// prefix (still containing markers; resolved by `apply_window` in the
 /// consumer) and whose `data` covers the ISA-L bulk (already clean).
 /// The chunk stops at the next deflate block boundary at-or-past
-/// `until_bits`, or at BFINAL, or when accumulated `decoded_size`
+/// `stop_hint_bits`, or at BFINAL, or when accumulated `decoded_size`
 /// crosses `max_decoded_chunk_size`.
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub fn decode_chunk_marker_bootstrap_then_isal(
     input: &[u8],
     encoded_offset_bits: usize,
-    until_bits: usize,
+    stop_hint_bits: usize,
     _initial_window_unused: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
@@ -273,17 +273,17 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     // faithful port of vendor/.../gzip/deflate.hpp's deflate::Block<>.
     // Decodes deflate blocks one-by-one until any of:
     //   (a) cumulative clean (non-marker) bytes reach MAX_WINDOW_SIZE
-    //       AND the next block header is past `until_bits` is not yet
+    //       AND the next block header is past `stop_hint_bits` is not yet
     //       required — phase 2 (ISA-L) can take over;
     //   (b) BFINAL block is decoded (single-member tail);
     //   (c) we're at a non-fixed-Huffman block boundary at-or-past
-    //       `until_bits` (chunk's end condition).
+    //       `stop_hint_bits` (chunk's end condition).
     //
     // Mirrors GzipChunk.hpp::decodeChunkWithRapidgzip's main loop
     // (vendor/.../chunkdecoding/GzipChunk.hpp:468-654), in particular
     // the `cleanDataCount >= deflate::MAX_WINDOW_SIZE` handoff at
     // L520-525.
-    let bootstrap = bootstrap_with_deflate_block(input, encoded_offset_bits, until_bits)?;
+    let bootstrap = bootstrap_with_deflate_block(input, encoded_offset_bits, stop_hint_bits)?;
 
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
     if !bootstrap.markers.is_empty() {
@@ -291,14 +291,14 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     }
 
     // Whenever the bootstrap reached a block boundary at-or-past
-    // until_bits (rare on chunks > 32 KiB), or BFINAL fired, or no
+    // stop_hint_bits (rare on chunks > 32 KiB), or BFINAL fired, or no
     // clean window accumulated — we're done. The chunk is marker-only.
     let Some(clean_window) = bootstrap.clean_window else {
         chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
         chunk.finalize(bootstrap.end_bit_offset);
         return Ok(chunk);
     };
-    if bootstrap.bfinal_hit || bootstrap.end_bit_offset >= until_bits {
+    if bootstrap.bfinal_hit || bootstrap.end_bit_offset >= stop_hint_bits {
         chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
         chunk.finalize(bootstrap.end_bit_offset);
         return Ok(chunk);
@@ -308,10 +308,10 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     // with the clean 32 KiB tail as dict. Uses the same production
     // `IsalInflateWrapper` path as on-demand decode.
     let bit_offset = bootstrap.end_bit_offset;
-    let tail = decode_chunk_isal_inexact_wrapper(
+    let tail = decode_chunk_isal_impl(
         input,
         bit_offset,
-        until_bits,
+        stop_hint_bits,
         &clean_window,
         configuration,
     )?;
@@ -363,7 +363,7 @@ struct DeflateBootstrap {
     /// bootstrap saw ≥ MAX_WINDOW_SIZE cumulative clean bytes ending at
     /// a block boundary (rapidgzip's `cleanDataCount >= MAX_WINDOW_SIZE`
     /// at GzipChunk.hpp:521). When `None`, phase 2 cannot run because we
-    /// have no clean dict — either BFINAL fired first, `until_bits` was
+    /// have no clean dict — either BFINAL fired first, `stop_hint_bits` was
     /// reached, or no block produced enough clean data.
     clean_window: Option<Vec<u8>>,
     /// True when the bootstrap exited because it decoded a BFINAL=1
@@ -374,7 +374,7 @@ struct DeflateBootstrap {
 /// Phase 1 bootstrap: drive [`deflate_block::Block`] block-by-block from
 /// `start_bit_offset` until any of (a) cumulative clean bytes reach
 /// MAX_WINDOW_SIZE at a block boundary, (b) BFINAL fires, or (c) we're
-/// at a non-fixed block boundary at-or-past `until_bits`.
+/// at a non-fixed block boundary at-or-past `stop_hint_bits`.
 ///
 /// Mirror of the `while ( true )` loop in
 /// `decodeChunkWithRapidgzip` (GzipChunk.hpp:468-654), restricted to the
@@ -384,7 +384,7 @@ struct DeflateBootstrap {
 fn bootstrap_with_deflate_block(
     data: &[u8],
     start_bit_offset: usize,
-    until_bits: usize,
+    stop_hint_bits: usize,
 ) -> Result<DeflateBootstrap, ChunkDecodeError> {
     use crate::decompress::inflate::consume_first_decode::Bits;
     use crate::decompress::parallel::deflate_block::{Block, MAX_WINDOW_SIZE};
@@ -467,10 +467,10 @@ fn bootstrap_with_deflate_block(
             }
 
             // Preemptive stop condition (rapidgzip GzipChunk.hpp:550-555):
-            // if this block's header sits at-or-past until_bits AND it is
+            // if this block's header sits at-or-past stop_hint_bits AND it is
             // non-fixed AND not BFINAL, stop here so the chunk ends on a
             // boundary the successor's BlockFinder can re-find.
-            if next_block_offset >= until_bits && !block.is_last_block() {
+            if next_block_offset >= stop_hint_bits && !block.is_last_block() {
                 // We've already advanced `bits` past this header. Rewind
                 // logically by reporting `end_bit_offset = next_block_offset`
                 // — the successor will re-parse the same header.
@@ -575,7 +575,7 @@ fn absolute_bit_pos(
 pub fn decode_chunk_marker_bootstrap_then_isal(
     _input: &[u8],
     _encoded_offset_bits: usize,
-    _until_bits: usize,
+    _stop_hint_bits: usize,
     _initial_window: &[u8],
     _configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
@@ -583,10 +583,10 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
 }
 
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
-pub fn decode_chunk_isal_inexact(
+pub fn decode_chunk_isal(
     _input: &[u8],
     _encoded_offset_bits: usize,
-    _until_bits: usize,
+    _stop_hint_bits: usize,
     _initial_window: &[u8],
     _configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
@@ -667,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_chunk_isal_inexact_from_bit_0_matches_payload() {
+    fn decode_chunk_isal_from_bit_0_matches_payload() {
         let payload = b"abcdefghij".repeat(200_000);
         let deflate = make_deflate(&payload);
         let cfg = ChunkConfiguration {
@@ -675,13 +675,13 @@ mod tests {
             max_decoded_chunk_size: 20 * 512 * 1024,
             crc32_enabled: true,
         };
-        let until_bits = deflate.len() * 8;
-        let chunk = decode_chunk_isal_inexact(&deflate, 0, until_bits, &[], cfg).unwrap();
+        let stop_hint_bits = deflate.len() * 8;
+        let chunk = decode_chunk_isal(&deflate, 0, stop_hint_bits, &[], cfg).unwrap();
         assert_eq!(flatten(&chunk), payload);
     }
 
     #[test]
-    fn decode_chunk_isal_inexact_stops_before_eof_when_until_bits_set() {
+    fn decode_chunk_isal_stops_before_eof_when_stop_hint_bits_set() {
         let payload: Vec<u8> = (0u32..500_000)
             .map(|i| (i.wrapping_mul(31) as u8).wrapping_add(7))
             .collect();
@@ -691,11 +691,11 @@ mod tests {
             max_decoded_chunk_size: 20 * 256 * 1024,
             crc32_enabled: false,
         };
-        let until_bits = deflate.len() * 8 / 2;
-        let chunk = decode_chunk_isal_inexact(&deflate, 0, until_bits, &[], cfg).unwrap();
+        let stop_hint_bits = deflate.len() * 8 / 2;
+        let chunk = decode_chunk_isal(&deflate, 0, stop_hint_bits, &[], cfg).unwrap();
         assert!(chunk.decoded_size() < payload.len());
         let chunk_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-        assert!(chunk_end >= until_bits);
+        assert!(chunk_end >= stop_hint_bits);
     }
 
     /// Neurotic profile fixture: gzip(1) -9 on 64 MiB silesia head. Chunk 0
@@ -751,8 +751,7 @@ mod tests {
             crc32_enabled: false,
         };
         let zero = [0u8; 32768];
-        let chunk0 =
-            decode_chunk_isal_inexact(&deflate, 0, spacing_bits, &zero, cfg).expect("chunk0");
+        let chunk0 = decode_chunk_isal(&deflate, 0, spacing_bits, &zero, cfg).expect("chunk0");
         let resume_at = chunk0.encoded_offset_bits + chunk0.encoded_size_bits;
         assert!(
             resume_at > 0 && resume_at % 8 != 0,
@@ -768,9 +767,8 @@ mod tests {
         .unwrap_or_else(|| {
             panic!("resume at chunk0 end bit {resume_at} must succeed");
         });
-        let chunk1 =
-            decode_chunk_isal_inexact(deflate, resume_at, resume_at + spacing_bits, &tail, cfg)
-                .expect("chunk1 at chunk0 end");
+        let chunk1 = decode_chunk_isal(deflate, resume_at, resume_at + spacing_bits, &tail, cfg)
+            .expect("chunk1 at chunk0 end");
         assert!(!chunk1.is_empty());
     }
 }
