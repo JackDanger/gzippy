@@ -323,8 +323,8 @@ bench-sm: ship-precheck
 # single-member decode path (ISA-L) is gated on x86_64 + the
 # isal-compression feature and does not build on local arm64 macOS. This
 # pushes the branch, hard-syncs the homelab checkout, and runs the
-# `parallel` + `routing` tests — the subset that exercises that path; the
-# rest of the suite is arch-independent and runs locally. Hard-capped by
+# `routing` oracle — the suite that exercises that path end-to-end; the
+# rest of the tests are arch-independent and run locally. Hard-capped by
 # `timeout` (TEST_X86_TIMEOUT); typically ~8-12 min.
 # =============================================================================
 .PHONY: test-x86_64
@@ -337,9 +337,9 @@ test-x86_64: ship-precheck
 	echo "  connecting to neurotic..."; \
 	timeout $(TEST_X86_TIMEOUT) $(NEUROTIC_SSH) "set -e; cd gzippy; \
 	  $(NEUROTIC_SYNC); \
-	  git submodule update --init --recursive 2>&1 | tail -3; \
+	  git submodule update --init vendor/isa-l vendor/isal-rs 2>&1 | tail -3; \
 	  echo '  building + testing the x86_64-gated path...'; \
-	  cargo test --release --features isal-compression parallel routing"
+	  cargo test --release --features isal-compression routing"
 	@echo ""
 	@echo "✓ test-x86_64 passed on branch $$(git rev-parse --abbrev-ref HEAD)"
 
