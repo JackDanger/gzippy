@@ -2,7 +2,7 @@
 # off_cpu_profile.sh — capture off-CPU flamegraph showing where threads
 # are SLEEPING (lock waits, channel recvs, page-fault stalls).
 #
-# Per docs/PARALLEL_PROFILING_PLAN.md §3: a normal perf record samples
+# Context: a normal perf record samples
 # the running thread at 999 Hz and misses where threads are BLOCKED.
 # When parallel scaling falls off, the threads aren't computing — they're
 # waiting. Off-CPU profiling captures the waits as their own flame
@@ -17,7 +17,7 @@
 #       --gzippy    target/release/gzippy \
 #       --threads   16 \
 #       [--rapidgzip vendor/.../rapidgzip]   # if set, also profiles vendor for comparison
-#       [--out-dir docs/runs/offcpu-TIMESTAMP]
+#       [--out-dir target/tooling/offcpu-TIMESTAMP]
 #
 # Outputs:
 #   $OUT_DIR/gzippy.offcpu.svg     (flame graph: sleeping time)
@@ -65,7 +65,7 @@ done
   echo "ERROR: --compressed and --gzippy required" >&2
   exit 2
 }
-[[ -n "$OUT_DIR" ]] || OUT_DIR="docs/runs/offcpu-$(date +%Y%m%d-%H%M%S)"
+[[ -n "$OUT_DIR" ]] || OUT_DIR="target/tooling/offcpu-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT_DIR"
 
 # Pick a flamegraph tool. inferno preferred (Rust port, no Perl).

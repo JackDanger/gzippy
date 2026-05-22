@@ -51,8 +51,6 @@ surface). Performance optimization happens after that.
 5. **NO FALLBACKS** — failure is an explicit `Err(GzippyError::Decompression(_))`. No silent libdeflate or ISA-L retries from the SM body. `decompress_single_member` either succeeds via the parallel pipeline or returns an error.
 6. **THE GOAL IS SPEED, NOT FIDELITY.** gzippy aims to be the fastest gzip implementation ever created. Rapidgzip is the current reference for parallel decompression because its architecture is the fastest known — port it as a *means*. Where gzippy's own SIMD inflate primitives (in `src/decompress/inflate/`, `src/decompress/{combined_lut,packed_lut,simd_huffman,vector_huffman,two_level_table}.rs`, `src/backends/inflate_bit.rs`) beat rapidgzip's inner inflate, use them. The deliverable is throughput, not vendor parity.
 
-(Removed 2026-05-17 per `docs/codex-meta-audit.md` §3: the prior Rule #4 — "DO NOT REVERT PERF REGRESSIONS DURING CUTOVER" — and Rule #7 — "PORT, DON'T INNOVATE" — were self-invented loophole rules that codified permission and discarded constraint. Rule #4 let perf regressions ship behind a "cutover" label that grew to 75+ commits. Rule #7 forbade reusing gzippy's existing SIMD inflate assets — exactly the assets that could let gzippy *beat* rapidgzip instead of tie it.)
-
 ## Production Routing (Apr 2026)
 
 ### Decompression
@@ -67,20 +65,16 @@ Input → decompress::mod: decompress_gzip_libdeflate
   └─ Single-member?
         ISA-L + T>1 + compressed > 10 MiB
             → parallel::single_member::decompress_parallel
-              (v0.6 marker pipeline; ~1.1N total compute work, scales ~T
-               from T=2 upward. Phase 1 parallel workers run
-               fast_marker_inflate producing Vec<u16> with markers for
-               cross-chunk back-refs. Phase 2 sequential resolves markers
-               via SIMD replace_markers using each predecessor's last
-               32 KB as window, converts u16→u8. Output STREAMS: bytes
-               flow to the writer as each chunk resolves; CRC32 + ISIZE
-               are verified against the gzip trailer AFTER the final
-               chunk is written, so a mismatch is a terminal Err with
-               partial output already on the writer (same as gzip(1) —
-               for file output `io::decompress_file` then deletes the
-               dest file). Counter `MARKER_PIPELINE_RUNS` proves
-               production routing called us; see deletion-trap killer
-               test in src/tests/routing.rs)
+              (parallel chunk pipeline — see `src/decompress/parallel/`.
+               Output STREAMS: bytes flow to the writer as each chunk
+               resolves; CRC32 + ISIZE are verified against the gzip
+               trailer AFTER the final chunk is written, so a mismatch
+               is a terminal Err with partial output already on the
+               writer — same as gzip(1); for file output
+               `io::decompress_file` then deletes the dest file.
+               Counter `MARKER_PIPELINE_RUNS` proves production routing
+               called us; see the deletion-trap test in
+               src/tests/routing.rs)
         x86_64 (ISA-L available)        → isal_decompress::decompress_gzip_stream
         any arch, data > 1 GiB (no ISA-L) → decompress_single_member_streaming (zlib-ng)
         default                          → decompress_single_member_libdeflate
@@ -121,18 +115,17 @@ Two regression tests lock the parallel single-member wiring:
 
 2. `tests::routing::tests::test_single_member_parallel_not_slower_than_sequential`
    — runs the same fixture at T=1 (sequential) and T=4 (parallel) and asserts
-   `parallel_elapsed < 1.3 × sequential_elapsed`. This is the local-CI guard
-   that would have caught the v0.3.0 regression (parallel was 1.75× slower
-   than sequential).
+   `parallel_elapsed` stays within a small multiple of `sequential_elapsed`.
+   This is the local-CI guard against a parallel-slower-than-sequential
+   regression.
 
 ## Active port: rapidgzip → gzippy parallel single-member
 
-**Before changing anything in `src/decompress/parallel/`, read
-`docs/rapidgzip-port-reference.md`.** That file is the living ground
-truth: rapidgzip architecture with C++ line citations, gzippy current
-state, gap matrix (G1..G13) with status, trace event catalog, and a
-pre-commit judgment-call checklist. If a change appears to "work" but
-contradicts the reference, the change is suspect.
+The parallel single-member path under `src/decompress/parallel/` is an
+in-progress port of rapidgzip's chunked-decode architecture. Vendor
+source is in `vendor/rapidgzip/librapidarchive/`; port modules cite
+vendor `file:line` in their doc comments — treat those citations as the
+reference when a change appears to "work" but looks structurally off.
 
 Capture a trace with `GZIPPY_LOG_FILE=/tmp/sm.log` and analyze via
 `scripts/parallel_sm_log_summary.py` before claiming a perf change worked.
@@ -152,34 +145,6 @@ two-pass scan-then-decode, large pre-allocations.
 Streaming path only for files > 1 GiB. ISA-L is unavailable on arm64; the parallel
 single-member path is gated on `isal_decompress::is_available()` so arm64 never
 takes it.
-
-**v0.5.1 — parallel single-member, speculative-window design** (May 2026): replaced
-the v0.3.0 "phase-2 redecodes everything sequentially" bug with a true two-pass
-parallel design. Phase 1 decodes each chunk with an empty dict in parallel
-(ISA-L, ~1500 MB/s/thread). Phase 2 re-decodes chunks 1..T-1 in parallel using
-each predecessor's phase-1 last 32 KB as a *speculative* dict — almost always
-correct on real data (error propagation requires ≥ chunk_size/32 KB consecutive
-near-max-distance back-references). Phase 3 combines per-chunk CRC32s (computed
-in phase 2 workers via `crc32fast::Hasher::combine`) and verifies them against
-the gzip trailer; output streams to the writer as chunks resolve, so a CRC/ISIZE
-mismatch is a terminal Err with partial output already emitted. Speedup ≈ T/2;
-ties sequential at T=2 (CI), scales to 4× at T=8.
-Wired into `decompress::decompress_single_member` behind
-`isal_decompress::is_available() && num_threads > 1 && data.len() > 10 MiB`.
-The old "32 KB prefix correction" plan was wrong: cross-chunk back-references
-resolve to zeros in phase 1, then propagate forward via chunk-local back-
-references arbitrarily far — the prefix correction can't unwind that. Test
-`tests::routing::tests::test_single_member_parallel_not_slower_than_sequential`
-catches regressions of the v0.3.0 class before push.
-
-**v0.3.0 — parallel single-member, BUGGY (superseded by v0.5.1)**: ISA-L
-`inflatePrime` re-decodes "confirmed chunks" at non-byte-aligned bit offsets.
-But phase 1 stored only `(start_bit, end_bit)` — the decoded bytes were
-discarded, and phase 2 ended up re-decoding the entire stream sequentially.
-Net result: 1.75× *slower* than sequential. The CI guards at the time were
-absolute (vs rapidgzip/pigz) without a "parallel ≥ sequential" floor, so the
-regression slipped through. Both the algorithm and the missing guard are fixed
-in v0.5.1.
 
 ## Branch and PR Workflow
 
@@ -239,7 +204,7 @@ vs pigz for all four combos (T1/T4 × 1MB/10MB). Use this before ANY decompressi
 | `src/decompress/mod.rs` | Decompression entry, format detect, routing |
 | `src/decompress/bgzf.rs` | gzippy-parallel + multi-member parallel (core engine) |
 | `src/decompress/scan_inflate.rs` | Streaming scan-and-inflate path |
-| `src/decompress/parallel/single_member.rs` | v0.3.0 parallel SM — ISA-L `inflatePrime` |
+| `src/decompress/parallel/single_member.rs` | Parallel single-member decode — entry point |
 | `src/decompress/parallel/{block_finder,marker_decode,ultra_fast_inflate}.rs` | Speculation supporting primitives |
 | `src/decompress/inflate/consume_first_decode.rs` | Pure-Rust inflate (production helpers used by `bgzf`, `scan_inflate`) |
 | `src/decompress/inflate/{consume_first_table,jit_decode,libdeflate_decode,libdeflate_entry,specialized_decode,vector_huffman,double_literal,bmi2}.rs` | Huffman/inflate building blocks |

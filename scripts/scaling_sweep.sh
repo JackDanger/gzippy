@@ -2,7 +2,7 @@
 # scaling_sweep.sh — bench gzippy + rapidgzip across T=1,2,4,8,16 to
 # locate the parallel-scaling cliff.
 #
-# Per docs/PARALLEL_PROFILING_PLAN.md §2: the user observed gzippy
+# Context: the user observed gzippy
 # beats rapidgzip at T=1 but loses at T=16. This script measures
 # the speedup-per-thread to identify where gzippy's efficiency
 # diverges from vendor's.
@@ -51,7 +51,7 @@ done
   echo "ERROR: --compressed --original --gzippy --rapidgzip all required" >&2
   exit 2
 }
-[[ -n "$OUT_DIR" ]] || OUT_DIR="docs/runs/scaling-$(date +%Y%m%d-%H%M%S)"
+[[ -n "$OUT_DIR" ]] || OUT_DIR="target/tooling/scaling-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT_DIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -147,7 +147,7 @@ for t, gz, rg in rows:
     print(f"- T={t}: gzippy efficiency={eff_gz:.3f}, rapidgzip efficiency={eff_rg:.3f}, gap={eff_gz - eff_rg:+.3f}")
 worst = min(deltas, key=lambda r: r[3])
 print(f"\n**Cliff at T={worst[0]}** (efficiency gap {worst[3]:+.3f}). "
-      f"See \`docs/runs/scaling-*/T-{worst[0]}/timeline.md\` for the per-thread Gantt.")
+      f"See \`target/tooling/scaling-*/T-{worst[0]}/timeline.md\` for the per-thread Gantt.")
 EOF
 
 echo "" >&2
