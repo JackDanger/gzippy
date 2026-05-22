@@ -185,13 +185,14 @@ fn decode_chunk_isal_impl(
                         stopping_point_reached = true;
                     }
                 }
-                sp if sp == StoppingPoints::NONE && last_per_call == 0 => {
+                sp if sp == StoppingPoints::NONE
+                    && last_per_call == 0
+                    && last_eob_pos >= stop_hint_bits =>
+                {
                     // ISA-L can return 0 bytes between block boundaries.
                     // Do not end the chunk early while still before `stop_hint_bits`.
-                    if last_eob_pos >= stop_hint_bits {
-                        last_end_bit = last_eob_pos;
-                        stopping_point_reached = true;
-                    }
+                    last_end_bit = last_eob_pos;
+                    stopping_point_reached = true;
                 }
                 _ => {}
             }
@@ -199,14 +200,10 @@ fn decode_chunk_isal_impl(
 
         let mut append_len = n_bytes_read;
         if stopping_point_reached {
-            append_len = if last_eob_decoded_bytes > decode_base {
-                last_eob_decoded_bytes - decode_base
-            } else {
-                // Stopped on NONE+0 / HEADER after the prior END_OF_BLOCK was
-                // already appended in a previous outer iteration — do not
-                // emit bytes from the next block read into this buffer.
-                0
-            };
+            // Stopped on NONE+0 / HEADER after the prior END_OF_BLOCK was
+            // already appended in a previous outer iteration — do not
+            // emit bytes from the next block read into this buffer.
+            append_len = last_eob_decoded_bytes.saturating_sub(decode_base);
         }
         buffer.truncate(append_len);
         if !buffer.is_empty() {
