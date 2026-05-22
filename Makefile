@@ -27,6 +27,19 @@ SYSTEM_GZIP := $(shell which gzip)
 # Set APPLE_GZIP when it differs from GZIP_BIN so bench targets compare both
 APPLE_GZIP := $(if $(filter Darwin,$(shell uname)),/usr/bin/gzip,)
 
+# Time budgets (seconds). Each nontrivial target wraps its work in
+# `timeout` so a hang or runaway build fails the target instead of
+# blocking forever. The number is the expectation: blowing the budget is
+# a regression to investigate, not a knob to bump.
+#   QUICK    — local quick-check stage, typically <30s
+#   BENCH_SM — neurotic: build + single-member benchmark
+#   TEST_X86 — neurotic: build + the x86_64-gated test subset
+#   SHIP     — neurotic: build + gzippy-dev bench + L11 head-to-head
+QUICK_TIMEOUT    := 300
+BENCH_SM_TIMEOUT := 1200
+TEST_X86_TIMEOUT := 1500
+SHIP_TIMEOUT     := 2700
+
 .PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship ship-local route-check oracle-vs-c bench-sm \
 	profile-single-member-decompression-x86_64 profile-single-member-decompression-arm64 profile-decompression-x86_64
 
@@ -106,14 +119,14 @@ FORCE:
 quick: $(GZIPPY_BIN)
 	@echo "══ make quick ══════════════════════════════════════════"
 	@echo "── Stage 1: correctness + routing smoke ────────────────"
-	@cargo test --release correctness 2>&1 | tail -3
-	@cargo test --release routing 2>&1 | tail -3
+	@timeout $(QUICK_TIMEOUT) cargo test --release correctness 2>&1 | tail -3
+	@timeout $(QUICK_TIMEOUT) cargo test --release routing 2>&1 | tail -3
 	@echo "── Stage 2: allocation budget ──────────────────────────"
-	@cargo test --release alloc_budget 2>&1 | tail -3
+	@timeout $(QUICK_TIMEOUT) cargo test --release alloc_budget 2>&1 | tail -3
 	@echo "── Stage 3: differential ratio vs libdeflate ───────────"
-	@cargo test --release diff_ratio 2>&1 | tail -3
+	@timeout $(QUICK_TIMEOUT) cargo test --release diff_ratio 2>&1 | tail -3
 	@echo "── Stage 4: hot-path hit rates ─────────────────────────"
-	@cargo test --release hot_path 2>&1 | tail -3
+	@timeout $(QUICK_TIMEOUT) cargo test --release hot_path 2>&1 | tail -3
 	@echo "════════════════════════════════════════════════════════"
 	@echo "✓ make quick passed"
 
@@ -156,7 +169,7 @@ profile-decompression-x86_64: profile-single-member-decompression-x86_64
 # is the only place the isal-compression / parallel single-member path
 # builds and runs — local arm64 macOS cannot. Used by `ship`, `bench-sm`,
 # and `test-x86_64`.
-NEUROTIC_SSH := ssh -J neurotic root@10.30.0.199
+NEUROTIC_SSH := ssh -o ConnectTimeout=15 -J neurotic root@10.30.0.199
 
 # Shell snippet (run on neurotic) that hard-syncs the /root/gzippy checkout
 # to origin/$BRANCH — $BRANCH must be set in the calling recipe's shell.
@@ -193,7 +206,7 @@ ship: ship-precheck ship-local
 	  echo "  origin/$$BRANCH already up to date"; \
 	fi; \
 	echo "  connecting to neurotic..."; \
-	$(NEUROTIC_SSH) "set -e; cd gzippy; \
+	timeout $(SHIP_TIMEOUT) $(NEUROTIC_SSH) "set -e; cd gzippy; \
 	  echo '  fetching origin/$$BRANCH...'; \
 	  $(NEUROTIC_SYNC); \
 	  git submodule update --init --recursive 2>&1 | tail -3; \
@@ -264,7 +277,7 @@ bench-sm: ship-precheck
 	  echo "  origin/$$BRANCH already up to date"; \
 	fi; \
 	echo "  connecting to neurotic..."; \
-	$(NEUROTIC_SSH) "set -e; cd gzippy; \
+	timeout $(BENCH_SM_TIMEOUT) $(NEUROTIC_SSH) "set -e; cd gzippy; \
 	  echo '  fetching origin/$$BRANCH...'; \
 	  $(NEUROTIC_SYNC); \
 	  echo '  building gzippy (--features isal-compression)...'; \
@@ -306,11 +319,13 @@ bench-sm: ship-precheck
 	@echo "✓ bench-sm complete on branch $$(git rev-parse --abbrev-ref HEAD)"
 
 # =============================================================================
-# test-x86_64: run the test suite with --features isal-compression on the
-# homelab box. The parallel single-member decode path (ISA-L) is x86_64 +
-# Linux only — it does not build on local arm64 macOS, so this is the only
-# way to verify it. Pushes the current branch, hard-syncs the homelab
-# checkout, then runs `cargo test`. ~3-5 min.
+# test-x86_64: verify the x86_64-only code on the homelab box. The parallel
+# single-member decode path (ISA-L) is gated on x86_64 + the
+# isal-compression feature and does not build on local arm64 macOS. This
+# pushes the branch, hard-syncs the homelab checkout, and runs the
+# `parallel` + `routing` tests — the subset that exercises that path; the
+# rest of the suite is arch-independent and runs locally. Hard-capped by
+# `timeout` (TEST_X86_TIMEOUT); typically ~8-12 min.
 # =============================================================================
 .PHONY: test-x86_64
 test-x86_64: ship-precheck
@@ -320,11 +335,11 @@ test-x86_64: ship-precheck
 	echo "  pushing $$BRANCH to origin..."; \
 	git push origin $$BRANCH || (echo "PUSH FAILED — aborting" >&2 && exit 1); \
 	echo "  connecting to neurotic..."; \
-	$(NEUROTIC_SSH) "set -e; cd gzippy; \
+	timeout $(TEST_X86_TIMEOUT) $(NEUROTIC_SSH) "set -e; cd gzippy; \
 	  $(NEUROTIC_SYNC); \
 	  git submodule update --init --recursive 2>&1 | tail -3; \
-	  echo '  building + testing (--features isal-compression)...'; \
-	  cargo test --release --features isal-compression"
+	  echo '  building + testing the x86_64-gated path...'; \
+	  cargo test --release --features isal-compression parallel routing"
 	@echo ""
 	@echo "✓ test-x86_64 passed on branch $$(git rev-parse --abbrev-ref HEAD)"
 
