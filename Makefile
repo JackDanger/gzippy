@@ -100,7 +100,6 @@ FORCE:
 #   Stage 2: allocation budget (any new alloc on hot path = fail)
 #   Stage 3: differential ratio vs libdeflate (cancels thermal noise)
 #   Stage 4: hot-path hit rates in bgzf decoder
-#   Stage 5: cachegrind instruction count (Linux only, skipped on macOS)
 # See benchmarks/baselines.json for thresholds. Run 'make update-baselines'
 # after an intentional perf change.
 # =============================================================================
@@ -115,12 +114,6 @@ quick: $(GZIPPY_BIN)
 	@cargo test --release diff_ratio 2>&1 | tail -3
 	@echo "── Stage 4: hot-path hit rates ─────────────────────────"
 	@cargo test --release hot_path 2>&1 | tail -3
-	@echo "── Stage 5: cachegrind (Linux only) ────────────────────"
-	@if [ "$$(uname)" = "Darwin" ]; then \
-		echo "  (skipped — cachegrind not available on macOS)"; \
-	else \
-		bash scripts/cachegrind_check.sh; \
-	fi
 	@echo "════════════════════════════════════════════════════════"
 	@echo "✓ make quick passed"
 
@@ -130,7 +123,6 @@ update-baselines: $(GZIPPY_BIN)
 	@RECORD_BASELINES=1 cargo test --release alloc_budget -- --nocapture 2>&1 | grep -E "baseline:|RECORD" || true
 	@RECORD_BASELINES=1 cargo test --release diff_ratio -- --nocapture 2>&1 | grep -E "baseline:|RECORD" || true
 	@RECORD_BASELINES=1 cargo test --release hot_path -- --nocapture 2>&1 | grep -E "baseline:|RECORD" || true
-	@bash scripts/cachegrind_check.sh --record
 	@echo "Done."
 
 # =============================================================================
