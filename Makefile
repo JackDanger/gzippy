@@ -119,14 +119,14 @@ FORCE:
 quick: $(GZIPPY_BIN)
 	@echo "══ make quick ══════════════════════════════════════════"
 	@echo "── Stage 1: correctness + routing smoke ────────────────"
-	@timeout $(QUICK_TIMEOUT) cargo test --release correctness 2>&1 | tail -3
-	@timeout $(QUICK_TIMEOUT) cargo test --release routing 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release correctness 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release routing 2>&1 | tail -3
 	@echo "── Stage 2: allocation budget ──────────────────────────"
-	@timeout $(QUICK_TIMEOUT) cargo test --release alloc_budget 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release alloc_budget 2>&1 | tail -3
 	@echo "── Stage 3: differential ratio vs libdeflate ───────────"
-	@timeout $(QUICK_TIMEOUT) cargo test --release diff_ratio 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release diff_ratio 2>&1 | tail -3
 	@echo "── Stage 4: hot-path hit rates ─────────────────────────"
-	@timeout $(QUICK_TIMEOUT) cargo test --release hot_path 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release hot_path 2>&1 | tail -3
 	@echo "════════════════════════════════════════════════════════"
 	@echo "✓ make quick passed"
 
