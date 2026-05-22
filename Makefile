@@ -158,6 +158,12 @@ profile-decompression-x86_64: profile-single-member-decompression-x86_64
 # and `test-x86_64`.
 NEUROTIC_SSH := ssh -J neurotic root@10.30.0.199
 
+# Shell snippet (run on neurotic) that hard-syncs the /root/gzippy checkout
+# to origin/$BRANCH — $BRANCH must be set in the calling recipe's shell.
+# The safe.directory exception is required because the checkout is not
+# owned by the ssh user (git refuses "dubious ownership" repos otherwise).
+NEUROTIC_SYNC := git config --global --add safe.directory /root/gzippy; git fetch origin '$$BRANCH'; git checkout -B '$$BRANCH' 'origin/$$BRANCH'; git reset --hard 'origin/$$BRANCH'
+
 # =============================================================================
 # Ship: the "are we good?" gate. Always tests the *current branch*.
 #
@@ -189,9 +195,7 @@ ship: ship-precheck ship-local
 	echo "  connecting to neurotic..."; \
 	$(NEUROTIC_SSH) "set -e; cd gzippy; \
 	  echo '  fetching origin/$$BRANCH...'; \
-	  git fetch origin '$$BRANCH'; \
-	  git checkout -B '$$BRANCH' 'origin/$$BRANCH'; \
-	  git reset --hard 'origin/$$BRANCH'; \
+	  $(NEUROTIC_SYNC); \
 	  git submodule update --init --recursive 2>&1 | tail -3; \
 	  echo ''; echo '  ── disk-space precheck ──'; \
 	  AVAIL_GB=\$$(df -BG . | tail -1 | awk '{gsub(/G/,\"\",\$$4); print \$$4}'); \
@@ -262,9 +266,7 @@ bench-sm: ship-precheck
 	echo "  connecting to neurotic..."; \
 	$(NEUROTIC_SSH) "set -e; cd gzippy; \
 	  echo '  fetching origin/$$BRANCH...'; \
-	  git fetch origin '$$BRANCH'; \
-	  git checkout -B '$$BRANCH' 'origin/$$BRANCH'; \
-	  git reset --hard 'origin/$$BRANCH'; \
+	  $(NEUROTIC_SYNC); \
 	  echo '  building gzippy (--features isal-compression)...'; \
 	  cargo build --release --features isal-compression 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
 	  RAPIDGZIP=vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip; \
@@ -319,9 +321,7 @@ test-x86_64: ship-precheck
 	git push origin $$BRANCH || (echo "PUSH FAILED — aborting" >&2 && exit 1); \
 	echo "  connecting to neurotic..."; \
 	$(NEUROTIC_SSH) "set -e; cd gzippy; \
-	  git fetch origin '$$BRANCH'; \
-	  git checkout -B '$$BRANCH' 'origin/$$BRANCH'; \
-	  git reset --hard 'origin/$$BRANCH'; \
+	  $(NEUROTIC_SYNC); \
 	  git submodule update --init --recursive 2>&1 | tail -3; \
 	  echo '  building + testing (--features isal-compression)...'; \
 	  cargo test --release --features isal-compression"
