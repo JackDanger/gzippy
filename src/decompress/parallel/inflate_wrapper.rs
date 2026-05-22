@@ -620,6 +620,56 @@ mod tests {
         enc.finish().unwrap()
     }
 
+    fn make_multi_block_deflate(payload: &[u8]) -> Vec<u8> {
+        use flate2::{Compress, Compression, FlushCompress, Status};
+        let mut compress = Compress::new(Compression::new(6), false);
+        let mut out = Vec::new();
+        let mut scratch = vec![0u8; 64 * 1024];
+        for piece in payload.chunks(32 * 1024) {
+            let mut block_data = piece;
+            loop {
+                let before_in = compress.total_in();
+                let before_out = compress.total_out();
+                let status = compress
+                    .compress(block_data, &mut scratch, FlushCompress::None)
+                    .unwrap();
+                let consumed = (compress.total_in() - before_in) as usize;
+                let produced = (compress.total_out() - before_out) as usize;
+                out.extend_from_slice(&scratch[..produced]);
+                block_data = &block_data[consumed..];
+                if block_data.is_empty() {
+                    break;
+                }
+                if matches!(status, Status::BufError) && produced == 0 {
+                    break;
+                }
+            }
+            loop {
+                let before_out = compress.total_out();
+                let status = compress
+                    .compress(&[], &mut scratch, FlushCompress::Sync)
+                    .unwrap();
+                let produced = (compress.total_out() - before_out) as usize;
+                out.extend_from_slice(&scratch[..produced]);
+                if produced == 0 || matches!(status, Status::StreamEnd) {
+                    break;
+                }
+            }
+        }
+        loop {
+            let before_out = compress.total_out();
+            let status = compress
+                .compress(&[], &mut scratch, FlushCompress::Finish)
+                .unwrap();
+            let produced = (compress.total_out() - before_out) as usize;
+            out.extend_from_slice(&scratch[..produced]);
+            if matches!(status, Status::StreamEnd) || produced == 0 {
+                break;
+            }
+        }
+        out
+    }
+
     #[test]
     fn round_trip_decode_no_stopping_points() {
         let payload = b"hello world hello world hello world".repeat(1000);
@@ -729,7 +779,7 @@ mod tests {
         for i in 0..(512 * 1024) {
             payload.push((i as u8).wrapping_mul(31).wrapping_add(7));
         }
-        let deflate = make_deflate(&payload);
+        let deflate = make_multi_block_deflate(&payload);
 
         // Enumerate end-of-block positions by decoding once with
         // END_OF_BLOCK stops and recording bit_position at each stop.
@@ -813,6 +863,17 @@ mod tests {
     /// tell_compressed == 0. Edge case for the refill-loop entry guard
     /// at vendor isal.hpp:231.
     #[test]
+    fn with_until_bits_zero_cap_decodes_nothing() {
+        let payload = b"abcdefg".repeat(1000);
+        let deflate = make_deflate(&payload);
+        let mut w = IsalInflateWrapper::with_until_bits(&deflate, 0, 0).expect("init");
+        w.set_window(&[]).expect("set_window");
+        let mut buf = vec![0u8; 4096];
+        let r = w.read_stream(&mut buf).expect("read_stream");
+        assert_eq!(r.bytes_written, 0);
+        assert_eq!(w.tell_compressed(), 0);
+    }
+
     /// Cross-chunk resume: decode to a non-byte-aligned boundary, take the
     /// last 32 KiB as dict, resume with `with_until_bits` + `set_window`.
     #[test]
@@ -891,17 +952,5 @@ mod tests {
             out
         };
         assert_eq!(full, reference);
-    }
-
-    #[test]
-    fn with_until_bits_zero_cap_decodes_nothing() {
-        let payload = b"abcdefg".repeat(1000);
-        let deflate = make_deflate(&payload);
-        let mut w = IsalInflateWrapper::with_until_bits(&deflate, 0, 0).expect("init");
-        w.set_window(&[]).expect("set_window");
-        let mut buf = vec![0u8; 4096];
-        let r = w.read_stream(&mut buf).expect("read_stream");
-        assert_eq!(r.bytes_written, 0);
-        assert_eq!(w.tell_compressed(), 0);
     }
 }

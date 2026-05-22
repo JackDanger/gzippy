@@ -23,14 +23,21 @@ use std::io::Write;
 use crate::error::{GzippyError, GzippyResult};
 
 const MAGIC: &[u8] = b"GZIDX\x01";
+const MAGIC_V2: &[u8] = b"GZIDX\x02";
 const WINDOW_SIZE: usize = 32768;
 
 /// A single checkpoint in the index.
 #[derive(Clone)]
 pub struct IndexPoint {
-    pub compressed_bit_offset: u64,
+    /// Byte cursor in the deflate stream (`consume_first::Bits::pos`).
+    pub input_byte_pos: u32,
+    pub bitbuf: u64,
+    pub bitsleft: u32,
     pub uncompressed_offset: u64,
     pub window: [u8; WINDOW_SIZE],
+    /// Derived: absolute bit offset in the deflate stream (for diagnostics).
+    #[allow(dead_code)]
+    pub compressed_bit_offset: u64,
 }
 
 /// A complete seek index.
@@ -90,18 +97,25 @@ pub fn build_index(gzip_data: &[u8], interval_bytes: usize) -> GzippyResult<Seek
         // Compute absolute bit offset from deflate start.
         // input_byte_pos is the byte position in the deflate stream,
         // bitsleft is the number of bits still in the buffer (not yet consumed).
-        // So consumed bits = input_byte_pos * 8 - bitsleft
+        // So consumed bits = input_byte_pos * 8 - bitsleft.
+        // `Bits.bitsleft` may carry garbage in high bits (libdeflate-style
+        // wrapping_sub); only the low 8 bits are meaningful — same as
+        // consume_first_decode and pipeline_tests oracles.
         let input_bits = (checkpoint.input_byte_pos as u64).saturating_mul(8);
-        let compressed_bit_offset = input_bits.saturating_sub(checkpoint.bitsleft as u64);
+        let bits_in_buffer = (checkpoint.bitsleft as u8) as u64;
+        let compressed_bit_offset = input_bits.saturating_sub(bits_in_buffer);
 
         let mut window = [0u8; WINDOW_SIZE];
         let window_len = checkpoint.window.len().min(WINDOW_SIZE);
         window[..window_len].copy_from_slice(&checkpoint.window[..window_len]);
 
         points.push(IndexPoint {
-            compressed_bit_offset,
+            input_byte_pos: checkpoint.input_byte_pos as u32,
+            bitbuf: checkpoint.bitbuf,
+            bitsleft: checkpoint.bitsleft,
             uncompressed_offset: checkpoint.output_offset as u64,
             window,
+            compressed_bit_offset,
         });
     }
 
@@ -111,9 +125,12 @@ pub fn build_index(gzip_data: &[u8], interval_bytes: usize) -> GzippyResult<Seek
         // Create a single checkpoint at offset 0 (beginning)
         // This requires decompressing from the start
         points.push(IndexPoint {
-            compressed_bit_offset: 0,
+            input_byte_pos: 0,
+            bitbuf: 0,
+            bitsleft: 0,
             uncompressed_offset: 0,
             window: [0u8; WINDOW_SIZE],
+            compressed_bit_offset: 0,
         });
     }
 
@@ -126,8 +143,8 @@ pub fn build_index(gzip_data: &[u8], interval_bytes: usize) -> GzippyResult<Seek
 
 /// Serialize an index to a writer.
 pub fn serialize_index(index: &SeekIndex, writer: &mut dyn Write) -> GzippyResult<()> {
-    // Magic
-    writer.write_all(MAGIC).map_err(GzippyError::Io)?;
+    // Magic (v2 includes bit reader state for seek resume)
+    writer.write_all(MAGIC_V2).map_err(GzippyError::Io)?;
 
     // Header
     writer
@@ -146,12 +163,18 @@ pub fn serialize_index(index: &SeekIndex, writer: &mut dyn Write) -> GzippyResul
     // Points
     for point in &index.points {
         writer
-            .write_all(&point.compressed_bit_offset.to_le_bytes())
+            .write_all(&point.input_byte_pos.to_le_bytes())
             .map_err(GzippyError::Io)?;
         writer
             .write_all(&point.uncompressed_offset.to_le_bytes())
             .map_err(GzippyError::Io)?;
         writer.write_all(&point.window).map_err(GzippyError::Io)?;
+        writer
+            .write_all(&point.bitbuf.to_le_bytes())
+            .map_err(GzippyError::Io)?;
+        writer
+            .write_all(&point.bitsleft.to_le_bytes())
+            .map_err(GzippyError::Io)?;
     }
 
     Ok(())
@@ -163,12 +186,14 @@ pub fn load_index(data: &[u8]) -> GzippyResult<SeekIndex> {
         return Err(GzippyError::parse("Index file too small"));
     }
 
-    // Check magic
-    if &data[..MAGIC.len()] != MAGIC {
+    // Check magic (v1 or v2)
+    let v2 = data.len() >= MAGIC_V2.len() && &data[..MAGIC_V2.len()] == MAGIC_V2;
+    let v1 = !v2 && data.len() >= MAGIC.len() && &data[..MAGIC.len()] == MAGIC;
+    if !v1 && !v2 {
         return Err(GzippyError::parse("Invalid index file magic"));
     }
-
-    let mut offset = MAGIC.len();
+    let magic_len = if v2 { MAGIC_V2.len() } else { MAGIC.len() };
+    let mut offset = magic_len;
 
     // Parse header
     let deflate_offset = u32::from_le_bytes([
@@ -202,7 +227,11 @@ pub fn load_index(data: &[u8]) -> GzippyResult<SeekIndex> {
     offset += 2; // skip reserved
 
     // Parse points
-    let point_size = 8 + 8 + WINDOW_SIZE;
+    let point_size = if v2 {
+        4 + 8 + WINDOW_SIZE + 8 + 4
+    } else {
+        8 + 8 + WINDOW_SIZE
+    };
     let expected_size = offset + point_count * point_size;
     if data.len() < expected_size {
         return Err(GzippyError::parse(format!(
@@ -214,17 +243,29 @@ pub fn load_index(data: &[u8]) -> GzippyResult<SeekIndex> {
 
     let mut points = Vec::new();
     for _ in 0..point_count {
-        let compressed_bit_offset = u64::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-            data[offset + 4],
-            data[offset + 5],
-            data[offset + 6],
-            data[offset + 7],
-        ]);
-        offset += 8;
+        let (input_byte_pos, compressed_bit_offset) = if v2 {
+            let input_byte_pos = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            offset += 4;
+            (input_byte_pos, 0u64)
+        } else {
+            let compressed_bit_offset = u64::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]);
+            offset += 8;
+            (0u32, compressed_bit_offset)
+        };
 
         let uncompressed_offset = u64::from_le_bytes([
             data[offset],
@@ -242,10 +283,37 @@ pub fn load_index(data: &[u8]) -> GzippyResult<SeekIndex> {
         window.copy_from_slice(&data[offset..offset + WINDOW_SIZE]);
         offset += WINDOW_SIZE;
 
+        let (bitbuf, bitsleft) = if v2 {
+            let bitbuf = u64::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]);
+            offset += 8;
+            let bitsleft = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            offset += 4;
+            (bitbuf, bitsleft)
+        } else {
+            (0, 0)
+        };
+
         points.push(IndexPoint {
-            compressed_bit_offset,
+            input_byte_pos,
+            bitbuf,
+            bitsleft,
             uncompressed_offset,
             window,
+            compressed_bit_offset,
         });
     }
 
@@ -338,18 +406,29 @@ pub fn seek_decompress<W: Write>(
     let deflate_data = &gzip_data[index.deflate_offset..];
 
     // Decompress from the checkpoint's bit offset
-    // We need to decompress at least skip_bytes + up to max_bytes
-    let max_output =
-        skip_bytes.saturating_add(max_bytes.min(u64::MAX - skip_bytes as u64) as usize);
-    let max_output = max_output.max(skip_bytes + 1); // At least enough to skip
+    let max_output = if max_bytes >= u64::MAX / 2 {
+        deflate_data.len().saturating_mul(32).max(skip_bytes + 1)
+    } else {
+        skip_bytes
+            .saturating_add(max_bytes as usize)
+            .max(skip_bytes + 1)
+    };
 
-    let (output, _) = crate::backends::inflate_bit::decompress_deflate_from_bit_with_end(
+    let scan_cp = crate::decompress::scan_inflate::ScanCheckpoint {
+        input_byte_pos: checkpoint.input_byte_pos as usize,
+        bitbuf: checkpoint.bitbuf,
+        bitsleft: checkpoint.bitsleft,
+        output_offset: checkpoint.uncompressed_offset as usize,
+        window: checkpoint.window.to_vec(),
+    };
+    let output = crate::decompress::scan_inflate::decompress_from_checkpoint(
         deflate_data,
-        checkpoint.compressed_bit_offset as usize,
-        &checkpoint.window,
+        &scan_cp,
         max_output,
     )
-    .ok_or_else(|| GzippyError::decompression("Failed to decompress from checkpoint"))?;
+    .map_err(|e| {
+        GzippyError::decompression(format!("Failed to decompress from checkpoint: {e}"))
+    })?;
 
     // Skip the bytes we don't need
     let remaining = if skip_bytes < output.len() {

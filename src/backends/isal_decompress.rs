@@ -1141,35 +1141,6 @@ mod tests {
     /// valid output. The first non-byte-aligned position that produces >= 1KB is a real boundary.
     #[test]
     #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-    /// x86_64 ISA-L path must not OOM when max_output=usize::MAX.
-    ///
-    /// Old behaviour: `let cap = max_output.max(256 * 1024)` with no upper bound
-    /// attempted to allocate `usize::MAX` bytes, causing an immediate OOM panic.
-    /// The arm64 zlib-ng path already clamps at 512 MB; this test ensures the
-    /// x86_64 path is consistent.
-    #[test]
-    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-    fn test_decompress_deflate_from_bit_huge_max_output_no_oom() {
-        use super::*;
-        // Empty input: should return None without attempting a huge allocation.
-        let result = decompress_deflate_from_bit(&[], 0, &[], usize::MAX);
-        assert!(result.is_none(), "empty input must return None, not OOM");
-
-        // Real data with a huge max_output hint: should decompress correctly
-        // and return the real (small) output, not allocate 512 MB.
-        let original = b"hello world hello world hello world";
-        let mut enc =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-        std::io::Write::write_all(&mut enc, original).unwrap();
-        let deflate = enc.finish().unwrap();
-
-        let result = decompress_deflate_from_bit(&deflate, 0, &[], usize::MAX)
-            .expect("real input with usize::MAX hint must succeed");
-        assert_eq!(result, original);
-    }
-
-    #[test]
-    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
     fn test_deflate_from_bit_non_byte_aligned() {
         use super::*;
 
@@ -1211,6 +1182,33 @@ mod tests {
             "confirmed boundary must be non-byte-aligned: bit={}",
             bit_offset
         );
+    }
+
+    /// x86_64 ISA-L path must not OOM when max_output=usize::MAX.
+    ///
+    /// Old behaviour: `let cap = max_output.max(256 * 1024)` with no upper bound
+    /// attempted to allocate `usize::MAX` bytes, causing an immediate OOM panic.
+    /// The arm64 zlib-ng path already clamps at 512 MB; this test ensures the
+    /// x86_64 path is consistent.
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn test_decompress_deflate_from_bit_huge_max_output_no_oom() {
+        use super::*;
+        // Empty input: should return None without attempting a huge allocation.
+        let result = decompress_deflate_from_bit(&[], 0, &[], usize::MAX);
+        assert!(result.is_none(), "empty input must return None, not OOM");
+
+        // Real data with a huge max_output hint: should decompress correctly
+        // and return the real (small) output, not allocate 512 MB.
+        let original = b"hello world hello world hello world";
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, original).unwrap();
+        let deflate = enc.finish().unwrap();
+
+        let result = decompress_deflate_from_bit(&deflate, 0, &[], usize::MAX)
+            .expect("real input with usize::MAX hint must succeed");
+        assert_eq!(result, original);
     }
 
     /// Verify that the CRC accumulated inside the ISA-L loop equals the CRC

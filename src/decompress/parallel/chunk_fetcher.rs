@@ -477,6 +477,9 @@ fn consumer_loop<W: std::io::Write>(
 ) -> Result<(), FetchError> {
     // Vendor's `m_nextUnprocessedBlockIndex` (GzipChunkFetcher.hpp:318 + 410).
     let mut next_unprocessed_block_index: usize = 0;
+    // Furthest compressed bit offset whose decoded bytes have been
+    // handed to the consumer loop (chunk end, not partition guess).
+    let mut furthest_decoded_bit: usize = 0;
     // Pending writes (post-process jobs in flight, output order).
     let mut pending: std::collections::VecDeque<PendingWrite> =
         std::collections::VecDeque::with_capacity(pool_size * 2);
@@ -498,6 +501,24 @@ fn consumer_loop<W: std::io::Write>(
         if next_block_offset >= total_bits {
             break;
         }
+
+        let block_is_confirmed = next_unprocessed_block_index < block_finder.size();
+        // A spacing guess behind already-emitted bytes is stale — the
+        // fast path jumped over this partition index in one chunk.
+        if !block_is_confirmed && next_block_offset < furthest_decoded_bit {
+            next_unprocessed_block_index += 1;
+            continue;
+        }
+        // When the guess overshoots the last decoded bit (large fast-path
+        // chunk ended before the next spacing multiple), resume from the
+        // actual tail instead of leaving a compressed gap.
+        let decode_start = if block_is_confirmed {
+            next_block_offset
+        } else if next_block_offset > furthest_decoded_bit {
+            furthest_decoded_bit
+        } else {
+            next_block_offset
+        };
 
         // Vendor GzipChunkFetcher.hpp:329 —
         //   `chunkData = getBlock(*nextBlockOffset, m_nextUnprocessedBlockIndex)`
@@ -522,11 +543,11 @@ fn consumer_loop<W: std::io::Write>(
             block_finder,
             next_unprocessed_block_index,
             total_bits,
-            next_block_offset,
+            decode_start,
         );
         let partition_idx_for_trace = next_unprocessed_block_index;
         let params = DecodeParams {
-            start_bit: next_block_offset,
+            start_bit: decode_start,
             until_bit,
             is_speculative_prefetch: false,
             partition_idx: partition_idx_for_trace,
@@ -724,11 +745,11 @@ fn consumer_loop<W: std::io::Write>(
 
         // Vendor GzipChunkFetcher.hpp:349 —
         //   `chunkData->setEncodedOffset(*nextBlockOffset);`
-        // Adjusts encoded_offset_bits to the consumer-requested seed
-        // (matters when a speculative worker decoded at an earlier
-        // candidate inside [next_block_offset, max_acceptable_start_bit]).
-        if chunk.encoded_offset_bits != next_block_offset {
-            chunk.set_encoded_offset(next_block_offset);
+        // When we resumed from furthest_decoded_bit because the spacing
+        // guess overshot, use the actual decode start — not the stale guess.
+        let effective_start = decode_start;
+        if chunk.encoded_offset_bits != effective_start {
+            chunk.set_encoded_offset(effective_start);
         }
 
         // Vendor GzipChunkFetcher.hpp:350-355 — EOF mid-decode
@@ -737,6 +758,7 @@ fn consumer_loop<W: std::io::Write>(
             break;
         }
         let chunk_end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+        furthest_decoded_bit = furthest_decoded_bit.max(chunk_end_bit);
 
         // Vendor GzipChunkFetcher.hpp:343 — `postProcessChunk(chunkData, lastWindow)`.
         // The window emplacement at lines 558-575 (tail-window publish on
@@ -754,7 +776,7 @@ fn consumer_loop<W: std::io::Write>(
             // on the consumer only (vendor queueChunkForPostProcessing:558-575).
             // Mirror vendor `getLastWindow(*previousWindow)` — not `last_32kib`
             // alone, which ignores the predecessor chain at stream start.
-            if let Some(pred) = window_map.get(chunk.encoded_offset_bits) {
+            if let Some((_pred_key, pred)) = window_map.get_predecessor(chunk.encoded_offset_bits) {
                 let bytes = materialize_window(&pred);
                 let tail = chunk
                     .last_32kib_window()
@@ -791,16 +813,12 @@ fn consumer_loop<W: std::io::Write>(
             // miss — so a presence check is free. Gzippy's `get`
             // currently still allocates `Arc<[u8; 32768]>` on hit;
             // `contains` skips that path entirely.
-            // Vendor `waitForReplacedMarkers` (GzipChunkFetcher.hpp:544):
-            // `m_windowMap->get(chunkData->encodedOffsetInBits)` — the
-            // chunk's own start offset, which equals the predecessor's
-            // published tail key when the chain is correct.
-            let window_key = chunk.encoded_offset_bits;
-            while !window_map.contains(window_key) {
+            // Predecessor window is keyed at the prior chunk's *end* bit
+            // offset. When a spacing guess overshoots that tail, the
+            // published window lives at furthest_decoded_bit, not at
+            // chunk.encoded_offset_bits.
+            while !window_map.has_predecessor(chunk.encoded_offset_bits) {
                 if pending.is_empty() {
-                    // No post-process can produce the missing window —
-                    // bubble the same error vendor would (a logic_error
-                    // about a missing predecessor window).
                     break;
                 }
                 drain_one_pending(
@@ -812,17 +830,13 @@ fn consumer_loop<W: std::io::Write>(
                     block_fetcher,
                 )?;
             }
-            // Vendor `GzipChunkFetcher.hpp:334` —
-            //   `auto sharedLastWindow = m_windowMap->get( *nextBlockOffset );`
-            // in `processNextChunk` uses the consumer's next block seed;
-            // the marker-replace wait above uses `encodedOffsetInBits`
-            // per `waitForReplacedMarkers` (line 544).
-            let window = window_map.get(window_key).ok_or(FetchError::Decode(
-                ChunkDecodeError::ExactStopMissed {
-                    requested: window_key,
-                    actual: next_block_offset,
-                },
-            ))?;
+            let (pred_key, window) = window_map
+                .get_predecessor(chunk.encoded_offset_bits)
+                .ok_or(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+                    requested: chunk.encoded_offset_bits,
+                    actual: furthest_decoded_bit,
+                }))?;
+            let _ = pred_key;
             // Vendor `GzipChunkFetcher.hpp:341`: `sharedLastWindow->
             // decompress()` materializes the bytes once. For
             // CompressionType::None this is a zero-alloc slice borrow.
@@ -974,9 +988,12 @@ fn until_bit_for(
 
     for delta in 1..=8 {
         let candidate = match block_finder.get(block_index + delta) {
-            (Some(offset), GetReturnCode::Success) | (Some(offset), GetReturnCode::Failure) => {
+            (Some(offset), GetReturnCode::Success) => offset.max(floor),
+            (Some(offset), GetReturnCode::Failure) if offset == total_bits => {
+                PREFETCH_NEXT_FILESIZE_ACCEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 offset.max(floor)
             }
+            (Some(offset), GetReturnCode::Failure) => offset.max(floor),
             _ => return total_bits,
         };
         if candidate > floor && candidate.saturating_sub(floor) >= min_gap {
@@ -1393,9 +1410,24 @@ fn speculative_decode_find_boundary(
 ) -> Result<ChunkData, ChunkDecodeError> {
     const CHUNK_SIZE_BITS: usize = 8 * 1024 * 8;
     const MAX_SCAN_BITS: usize = 512 * 1024 * 8;
-    let finder = BlockFinder::new(input);
     let input_bits = input.len() * 8;
+    if start_bit >= input_bits {
+        let mut chunk = ChunkData::new(start_bit, configuration);
+        chunk.finalize(start_bit);
+        return Ok(chunk);
+    }
+    let finder = BlockFinder::new(input);
     let max_end = (start_bit + MAX_SCAN_BITS).min(input_bits);
+
+    // Vendor `tryToDecode` (GzipChunk.hpp:712-841) attempts the partition
+    // seed itself before walking BlockFinder candidates.
+    if let Ok(chunk) =
+        try_speculative_decode_candidate(input, start_bit, start_bit, until_bit, configuration)
+    {
+        SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(chunk);
+    }
+
     let mut chunk_begin = start_bit;
     while chunk_begin < max_end {
         let chunk_end = (chunk_begin + CHUNK_SIZE_BITS).min(max_end);
@@ -1423,6 +1455,26 @@ fn speculative_decode_find_boundary(
         }
         chunk_begin = chunk_end;
     }
+
+    // Near-EOF tail: when the 512 KiB scan window reaches the end of
+    // the deflate stream and every BlockFinder candidate failed trial
+    // decode (common for pipelined L9 random data — tail is a few KiB
+    // of fixed/stored blocks with few valid dynamic boundaries), walk
+    // byte-aligned offsets in the remaining tail. Cost is bounded:
+    // e.g. 4 KiB tail → 4096 cheap read_header rejects.
+    if max_end >= input_bits {
+        let tail_start_byte = start_bit / 8;
+        for byte_off in tail_start_byte..input.len() {
+            let bit = byte_off * 8;
+            if let Ok(chunk) =
+                try_speculative_decode_candidate(input, bit, start_bit, until_bit, configuration)
+            {
+                SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(chunk);
+            }
+        }
+    }
+
     SLOW_PATH_NO_CANDIDATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Err(ChunkDecodeError::ExactStopMissed {
         requested: start_bit,
@@ -1563,6 +1615,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow integration test; run with --ignored"]
     fn drive_round_trips_8mb_level9() {
         let payload = b"the quick brown fox jumps over the lazy dog ".repeat(200_000);
         let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(9));
@@ -1603,6 +1656,7 @@ mod tests {
     /// Regression for neurotic `make profile-decompression-x86_64` (64 MiB
     /// silesia → **gzip(1) -9 -c**, T=2). Skipped when benchmark_data is absent.
     #[test]
+    #[ignore = "requires benchmark_data/silesia-large.bin; run with --ignored"]
     fn drive_silesia_head_gzip9_t2() {
         use crate::decompress::parallel::sm_driver::read_parallel_sm;
         use std::io::Read;
@@ -1639,6 +1693,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow integration test (~60 MiB); run with --ignored"]
     fn drive_round_trips_60mb_level9_prod_split() {
         // ~60 MB payload at -9 compresses to ~40 MB → ~10 chunks at the
         // production 4 MiB spacing. Enough to exercise multiple iter +

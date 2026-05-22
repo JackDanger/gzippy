@@ -527,10 +527,21 @@ mod tests {
     /// switch backends inside `decompress_single_member`.
     #[test]
     fn test_classify_routes_at_classifier_not_in_body() {
+        let mut raw = vec![0u8; 12 * 1024 * 1024];
+        let mut state = 0x12345678u64;
+        for b in &mut raw {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (state >> 32) as u8;
+        }
         let mut payload = Vec::new();
         let mut enc = flate2::write::GzEncoder::new(&mut payload, Compression::default());
-        enc.write_all(&vec![0u8; 12 * 1024 * 1024]).unwrap();
+        enc.write_all(&raw).unwrap();
         enc.finish().unwrap();
+        assert!(
+            payload.len() > MIN_PARALLEL_COMPRESSED,
+            "fixture must exceed parallel gate (got {} bytes)",
+            payload.len()
+        );
         let path = classify_gzip(&payload, 4);
         #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
         assert_eq!(
@@ -553,11 +564,17 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
     #[test]
     fn test_no_libdeflate_fallback_ever_fires_from_sm_path() {
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // Build an input above MIN_PARALLEL_COMPRESSED so the classifier
         // returns IsalParallelSM.
-        let original: Vec<u8> = (0u32..(24 * 1024 * 1024))
-            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
-            .collect();
+        let mut original = vec![0u8; 24 * 1024 * 1024];
+        let mut state = 0xc0ffeeu64;
+        for b in &mut original {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (state >> 32) as u8;
+        }
         let mut compressed = Vec::new();
         {
             let mut enc = GzEncoder::new(&mut compressed, Compression::default());
@@ -570,21 +587,18 @@ mod tests {
             compressed.len()
         );
         let before_lib = LIBDEFLATE_SM_CALLS.load(Ordering::Relaxed);
-        let before_isal = ISAL_STREAM_SM_CALLS.load(Ordering::Relaxed);
         let mut out = Vec::new();
         decompress_single_member(&compressed, &mut out, 4).expect("must succeed");
         assert_eq!(out, original, "byte-perfect output required");
         let after_lib = LIBDEFLATE_SM_CALLS.load(Ordering::Relaxed);
-        let after_isal = ISAL_STREAM_SM_CALLS.load(Ordering::Relaxed);
         assert_eq!(
             after_lib, before_lib,
             "libdeflate SM backend must not be called from the parallel-eligible SM path \
              (would indicate a silent fallback)"
         );
-        assert_eq!(
-            after_isal, before_isal,
-            "ISA-L stream SM backend must not be called from the parallel-eligible SM path"
-        );
+        // ISA-L sequential counter is incremented by other unit tests that
+        // call `decompress_single_member(..., T=1)` in parallel; only the
+        // libdeflate counter is a reliable no-fallback signal here.
     }
 
     /// A corrupted CRC must surface as `GzippyError::Decompression`, not
@@ -592,6 +606,9 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
     #[test]
     fn test_parallel_sm_propagates_errors_not_fallbacks() {
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let original: Vec<u8> = (0u32..(24 * 1024 * 1024))
             .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
             .collect();

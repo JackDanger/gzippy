@@ -107,26 +107,13 @@ impl BlockMap {
             Ok(i) => {
                 let match_decoded = g.block_to_data_offsets[i].1;
                 if i + 1 >= g.block_to_data_offsets.len() {
-                    let tail: Vec<(usize, usize)> = g
-                        .block_to_data_offsets
-                        .iter()
-                        .rev()
-                        .take(6)
-                        .rev()
-                        .copied()
-                        .collect();
-                    panic!(
-                        "BlockMap: duplicate offset is the most-recent — should have appended.\n  \
-                         push(encoded={}, encoded_size={}, decoded_size={})\n  \
-                         last_block_encoded_size={} last_block_decoded_size={}\n  \
-                         tail entries (enc, dec): {:?}",
-                        encoded_block_offset,
-                        encoded_size,
-                        decoded_size,
-                        g.last_block_encoded_size,
-                        g.last_block_decoded_size,
-                        tail,
-                    );
+                    // Same encoded start as the open tail block — update
+                    // sizes instead of panicking. Happens when a spacing
+                    // guess overshoots and the consumer resumes from
+                    // `furthest_decoded_bit` (see chunk_fetcher).
+                    g.last_block_encoded_size = encoded_size;
+                    g.last_block_decoded_size = decoded_size;
+                    return match_decoded;
                 }
                 let next_decoded = g.block_to_data_offsets[i + 1].1;
                 let implied = next_decoded - match_decoded;

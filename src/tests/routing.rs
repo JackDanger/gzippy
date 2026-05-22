@@ -401,10 +401,14 @@ mod tests {
     fn test_prefetch_next_filesize_accept_fires() {
         use std::sync::atomic::Ordering;
 
-        // Same fixture shape as test_unsplit_blocks_emplaces — guarantees
-        // multiple partitions so prefetch_new_blocks iterates at least
-        // through the last-block's idx+1 lookup.
-        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        // Needs gzip file >= 32 MiB so `adjusted_chunk_size_bytes` keeps the
+        // default 4 MiB spacing, AND compressed size < 9 × 4 MiB so the first
+        // prefetch batch (indexes 1..=8) reaches `lookup_next(9)` Failure.
+        let original = make_low_entropy_data(56 * 1024 * 1024);
         let compressed = compress_single_member_gzip(&original);
 
         let before = crate::decompress::parallel::chunk_fetcher::PREFETCH_NEXT_FILESIZE_ACCEPT
@@ -449,6 +453,10 @@ mod tests {
     // =========================================================================
     #[test]
     fn test_single_member_parallel_not_slower_than_sequential() {
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
         // Same fixture shape as the routing-correctness test above. Clears the
         // 10 MiB parallel-path gate.
         let original = make_low_entropy_data(24 * 1024 * 1024);

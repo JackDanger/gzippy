@@ -199,6 +199,21 @@ impl WindowMap {
             .entries
             .contains_key(&encoded_offset_bits)
     }
+
+    /// Largest published window key at or before `encoded_offset_bits`.
+    /// Used when a chunk's partition seed overshoots the predecessor's
+    /// published tail key (spacing guess > last confirmed end).
+    pub fn get_predecessor(&self, encoded_offset_bits: usize) -> Option<(usize, Window)> {
+        let g = self.state.lock().unwrap();
+        g.entries
+            .range(..=encoded_offset_bits)
+            .next_back()
+            .map(|(k, v)| (*k, v.clone()))
+    }
+
+    pub fn has_predecessor(&self, encoded_offset_bits: usize) -> bool {
+        self.get_predecessor(encoded_offset_bits).is_some()
+    }
 }
 
 impl Default for WindowMap {
