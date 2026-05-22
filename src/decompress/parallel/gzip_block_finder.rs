@@ -19,14 +19,11 @@
 //! `TARGET_COMPRESSED_CHUNK_BYTES * 8` with no feedback when chunk N
 //! actually ends at bit X.
 //!
-//! Wired into `chunk_fetcher::drive` post commit on
-//! `feat/cross-chunk-retry`: consumer queries `get(idx)` for partition
-//! seeds and calls `insert(actual_end)` per subchunk. Mirror of vendor's
-//! `m_blockFinder->get(...)` + `m_blockFinder->insert(...)` cascade in
+//! `chunk_fetcher::consumer_loop` queries `get(idx)` for partition
+//! seeds and calls `insert(actual_end)` per subchunk — mirror of
+//! vendor's `m_blockFinder->get(...)` + `insert(...)` cascade in
 //! `GzipChunkFetcher::processNextChunk`
-//! (vendor/.../GzipChunkFetcher.hpp:318 + 374). The structural
-//! cutover (2026-05-17) replaces the prior deletion-trap counter with
-//! a vendor-shaped call site — see `chunk_fetcher::consumer_loop`.
+//! (vendor/.../GzipChunkFetcher.hpp:318 + 374).
 
 #![allow(dead_code)]
 
@@ -175,7 +172,7 @@ impl GzipBlockFinder {
     /// position past the last confirmed offset. Mirror of rapidgzip's
     /// `get(blockIndex, timeoutInSeconds)`
     /// (GzipBlockFinder.hpp:120-158); the timeout parameter is dropped
-    /// (gzippy's get is non-blocking — see B5 in the port reference).
+    /// (gzippy's get is non-blocking).
     pub fn get(&self, block_index: usize) -> (Option<usize>, GetReturnCode) {
         let g = self.inner.lock().unwrap();
         let block_offsets = &g.block_offsets;

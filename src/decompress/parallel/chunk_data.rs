@@ -1,6 +1,5 @@
 //! Port of `rapidgzip::ChunkData` (ChunkData.hpp, especially lines 80-400)
-//! plus its nested `Subchunk` and `Statistics`. Exactly the shape rapidgzip
-//! uses; gzippy-specific extensions get added in later commits, not here.
+//! plus its nested `Subchunk` and `Statistics`.
 //!
 //! Two segment layout matches rapidgzip's `DecodedData`:
 //!   - `data_with_markers`: prefix where some u16 values are markers
@@ -12,11 +11,9 @@
 //! enabling per-subchunk independent post-processing once their window is
 //! available — rapidgzip's pattern.
 //
-// dead_code is allowed module-wide: these types are part of the
-// rapidgzip-port-design.md step 2 (types-only commit). The next modules
-// (apply_window, gzip_chunk, chunk_fetcher) consume them; until those
-// land the items have no production callers but are exercised by the
-// unit tests below.
+// Module-wide dead_code allowance: this is a types-heavy port; some
+// accessors are exercised only by the unit tests below or by
+// configuration-gated callers.
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -365,8 +362,7 @@ impl ChunkData {
     /// `data.as_mut_ptr().add(prev_len)` and produced `written` bytes
     /// there). Saves the `extend_from_slice` memcpy that
     /// `decode_chunk_isal`'s tight loop was paying on every
-    /// `isal_inflate` call — accounted for ~10% of decode wall time
-    /// per `docs/runs/run-20260518-085124-perf/`.
+    /// `isal_inflate` call — measured at ~10% of decode wall time.
     ///
     /// The caller is responsible for:
     /// - Reserving capacity in `self.data` BEFORE writing.

@@ -1,12 +1,6 @@
-//! Literal port of `rapidgzip::deflate::Block` skeleton + state +
-//! `readHeader` + `readDynamicHuffmanCoding`
-//! (vendor/.../gzip/deflate.hpp:513-1156).
-//!
-//! This file ports the Block STATE MACHINE + HEADER PARSER. The
-//! inner-loop bodies (`readInternalCompressed`, `readInternalUncompressed`,
-//! `read`, `appendToWindow`, `resolveBackreference`) land in follow-up
-//! commits — the structural skeleton + header surface is the foundation
-//! they hang off of.
+//! Literal port of `rapidgzip::deflate::Block`
+//! (vendor/.../gzip/deflate.hpp:513-1156): the deflate Block state
+//! machine, header parser, and decode inner loops.
 
 #![allow(dead_code)]
 
@@ -97,10 +91,8 @@ impl From<BlockError> for io::Error {
 /// Literal port of `rapidgzip::deflate::Block<ENABLE_STATISTICS>`
 /// (deflate.hpp:513-961) — the deflate block state machine.
 ///
-/// This struct holds only the STATE + HEADER-derived metadata. The
-/// concrete inner-loop methods (`read`, `read_internal_compressed`,
-/// `read_internal_uncompressed`, `append_to_window`, `resolve_back_ref`)
-/// land in subsequent commits to keep individual changes reviewable.
+/// Holds the block state + header-derived metadata, with the decode
+/// inner loops as methods.
 ///
 /// **Huffman tables are held as fields and REUSED across blocks** —
 /// rebuilt in-place by `read_internal_compressed` via
@@ -683,9 +675,7 @@ impl Block {
     /// Public entry point — literal port of `Block::read`
     /// (deflate.hpp:1192-1300). Decodes up to `n_max_to_decode` bytes
     /// of the CURRENT block's payload, appending u16 values into
-    /// `output`. Dynamic/Fixed Huffman bodies are decoded in a
-    /// follow-up commit (Step 7c); this slice handles the uncompressed
-    /// case end-to-end.
+    /// `output`.
     pub fn read(
         &mut self,
         bits: &mut Bits,
@@ -1087,10 +1077,7 @@ impl Block {
     /// Decodes via the ported `HuffmanCodingSymbolsPerLength` (vendor
     /// `vendor/.../huffman/HuffmanCodingSymbolsPerLength.hpp:97-124` —
     /// `decode<BitReader>`), driven by the `LsbBitReader` adapter that
-    /// `huffman_base.rs` provides for `Bits`. This replaces the prior
-    /// in-tree `build_canonical_table` / `decode_canonical` helpers and
-    /// gives the new ports production correctness coverage on the
-    /// non-x86_64 path (tests in this file exercise both branches).
+    /// `huffman_base.rs` provides for `Bits`.
     /// Public entry — runtime-dispatches to const-generic specialization
     /// (see ISA-L sibling).
     pub fn read_internal_compressed_canonical(
@@ -1374,101 +1361,6 @@ fn fixed_huffman_code_lengths() -> (Vec<u8>, Vec<u8>) {
     (lit, dist)
 }
 
-/// Build a canonical-Huffman decode table. Returns a table of size
-/// `1 << max_bits` where each entry packs `(symbol << 5) | length`,
-/// with length=0 meaning no valid code at that bit pattern.
-///
-/// `MAX_SYMBOLS` is a compile-time bound for the symbol alphabet
-/// size. `max_bits` is the longest code length expected (15 for
-/// deflate lit/len + distance).
-fn build_canonical_table<const MAX_SYMBOLS: usize>(
-    code_lengths: &[u8],
-    max_bits: u8,
-) -> Result<Vec<u32>, BlockError> {
-    let mut bl_count = [0u32; 16];
-    for &len in code_lengths.iter() {
-        if len > max_bits {
-            return Err(BlockError::InvalidCodeLengths);
-        }
-        if len > 0 {
-            bl_count[len as usize] += 1;
-        }
-    }
-    // Kraft check.
-    let mut code = 0u32;
-    let mut next_code = [0u32; 16];
-    for b in 1..=max_bits as usize {
-        code = (code + bl_count[b - 1]) << 1;
-        if code > (1u32 << b) {
-            return Err(BlockError::InvalidCodeLengths);
-        }
-        next_code[b] = code;
-    }
-    let table_size = 1usize << max_bits;
-    let mut table = vec![0u32; table_size];
-    for (sym, &len) in code_lengths.iter().enumerate() {
-        if len == 0 || sym >= MAX_SYMBOLS {
-            continue;
-        }
-        let canonical = next_code[len as usize];
-        next_code[len as usize] += 1;
-        let reversed = reverse_bits_u32(canonical, len);
-        let entry = ((sym as u32) << 5) | (len as u32);
-        let step = 1usize << len;
-        let mut idx = reversed as usize;
-        while idx < table_size {
-            table[idx] = entry;
-            idx += step;
-        }
-    }
-    Ok(table)
-}
-
-fn reverse_bits_u32(mut v: u32, n: u8) -> u32 {
-    let mut r = 0u32;
-    for _ in 0..n {
-        r = (r << 1) | (v & 1);
-        v >>= 1;
-    }
-    r
-}
-
-fn decode_canonical(
-    table: &[u32],
-    max_bits: u8,
-    bits: &mut Bits,
-) -> Result<(u16, u32), BlockError> {
-    // Refill opportunistically. Don't error on insufficient bits —
-    // the actual decoded symbol's code length might be short enough
-    // that the remaining buffer suffices. We only error if the chosen
-    // code length exceeds what's available.
-    if bits.available() < max_bits as u32 {
-        bits.refill();
-    }
-    let mask = (1u64 << max_bits) - 1;
-    let peek = (bits.peek() & mask) as usize;
-    let entry = table[peek];
-    let length = entry & 0x1F;
-    let symbol = (entry >> 5) as u16;
-    if length == 0 {
-        return Err(BlockError::InvalidHuffmanCode);
-    }
-    if bits.available() < length {
-        return Err(BlockError::EndOfFile);
-    }
-    Ok((symbol, length))
-}
-
-/// Emit a deflate back-reference of `(distance, length)` at the
-/// current end of `output`. Bytes whose back-reference reaches before
-/// the chunk start become MapMarkers indices (`MARKER_BASE +
-/// (MAX_WINDOW_SIZE - distance + out_pos_in_chunk + i)`); the
-/// remainder are chunk-local copies.
-///
-/// `out_pos` is the decoded-byte position WITHIN THE CHUNK at the
-/// start of this back-ref's emission window. For a fresh Block this
-/// equals `output.len()`; for multi-block per-chunk use the caller
-/// passes the running chunk-relative position.
 /// Ring-buffer back-reference emit. Mirror of vendor's
 /// `resolveBackreference` (vendor/.../gzip/deflate.hpp:1349-1410):
 /// non-overlap is a single `memcpy`, RLE (distance=1) is a tight

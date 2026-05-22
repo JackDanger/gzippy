@@ -32,10 +32,8 @@
 //!   - `refill_buffer()` is the literal port of `refillBuffer()` at
 //!     isal.hpp:228-250.
 //
-// Allowed dead_code: this module is part of step 4 of the
-// rapidgzip-port-design.md migration; consumed by gzip_chunk.rs in
-// step 5. Module ships with unit tests so cfg(test) builds exercise
-// every public item.
+// Module-wide dead_code allowance: some public items are exercised
+// only by the unit tests below or by configuration-gated callers.
 #![allow(dead_code)]
 
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]

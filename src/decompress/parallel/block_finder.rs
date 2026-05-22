@@ -33,17 +33,15 @@ const PRECODE_ALPHABET: [usize; 19] = [
 /// END_OF_BLOCK symbol
 const END_OF_BLOCK_SYMBOL: usize = 256;
 
-/// LUT size in bits (use 13 bits to keep compile time reasonable)
-// Matches rapidgzip's OPTIMAL_NEXT_DEFLATE_LUT_SIZE = 15
-// (vendor/rapidgzip/.../blockfinder/DynamicHuffman.hpp:145). With 15 bits
-// the LUT can fully verify bfinal(1)+btype(2)+hlit(5)+hdist(5) = 13 bits,
-// dramatically reducing false-positive candidates compared to the 13-bit
-// LUT (which can only partially verify hlit/hdist).
+/// LUT size in bits. Matches rapidgzip's OPTIMAL_NEXT_DEFLATE_LUT_SIZE
+/// = 15 (vendor/rapidgzip/.../blockfinder/DynamicHuffman.hpp:145). 15
+/// bits lets the LUT fully verify bfinal(1)+btype(2)+hlit(5)+hdist(5)
+/// = 13 bits, far fewer false-positive candidates than a 13-bit LUT.
 const LUT_BITS: usize = 15;
 const LUT_SIZE: usize = 1 << LUT_BITS;
 
 // ============================================================================
-// 13-bit LUT for block candidate detection
+// 15-bit LUT for block candidate detection
 // ============================================================================
 
 /// Literal port of rapidgzip's `isDeflateCandidate<bitCount>`
@@ -102,7 +100,7 @@ fn next_deflate_candidate(bits: u32, bit_count: u8) -> u8 {
     1 + next_deflate_candidate(bits >> 1, bit_count - 1)
 }
 
-/// Generate the 13-bit NEXT_DYNAMIC_DEFLATE_CANDIDATE_LUT.
+/// Generate the 15-bit NEXT_DYNAMIC_DEFLATE_CANDIDATE_LUT.
 /// Literal port of `NEXT_DYNAMIC_DEFLATE_CANDIDATE_LUT` (DynamicHuffman.hpp:113-124),
 /// minus the negative-encoding for lut[i] == 0 case (we don't use that
 /// branch yet; just store the positive skip).

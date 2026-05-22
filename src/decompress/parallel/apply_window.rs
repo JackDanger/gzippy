@@ -5,26 +5,15 @@
 //! corresponding byte from the window. After this call, every value in
 //! `data_with_markers` is < 256 (a literal byte).
 //!
-//! Updates `chunk.crc` so that the chunk's per-chunk CRC32 covers the
-//! full ordered byte stream `(data_with_markers as u8) ++ data`.
-//! `data` was CRC'd at append time; we prepend the CRC of the resolved
-//! `data_with_markers` bytes via the ported
-//! `CRC32Calculator::prepend` (gzip/crc32.hpp:332-339) so the
-//! polynomial combine goes through `combine_crc32`
-//! (gzip/crc32.hpp:214-258) — same vendor-faithful code path the
-//! consumer's stream-level `total_crc.append(...)` takes.
+//! CRC32 accounting is the caller's responsibility — see `apply_window`.
 
 use crate::decompress::parallel::chunk_data::{ChunkData, MARKER_BASE};
 use crate::decompress::parallel::replace_markers::replace_markers;
 
-/// Resolve markers in place. CRC accounting is the CALLER's
-/// responsibility — the per-chunk perf trace 2026-05-18 showed
-/// `apply_window`'s prior scalar 4 KiB narrow + CRC loop was ~80 ms
-/// (~30% of consumer wall), AND the consumer was about to do an
-/// AVX2 narrow over the same bytes for the output write. Moved the
-/// CRC out so it runs once over the already-narrowed `scratch_resolved`
-/// buffer in the consumer (one fewer narrow pass, SIMD CRC32 via
-/// `crc32fast::hash` over a contiguous slice).
+/// Resolve markers in place. CRC32 accounting is the CALLER's
+/// responsibility: the consumer CRCs the resolved bytes once, over the
+/// already-narrowed buffer it builds for the output write, so this
+/// function does not pay a separate narrow + CRC pass.
 #[allow(dead_code)]
 pub fn apply_window(chunk: &mut ChunkData, window: &[u8]) {
     if chunk.data_with_markers.is_empty() {

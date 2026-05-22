@@ -1,26 +1,18 @@
 //! Shared, thread-safe port of `rapidgzip::WindowMap` (WindowMap.hpp).
 //! Stores propagated 32-KiB windows keyed by the compressed-bit offset
-//! they're meant to seed. Workers AND the consumer share one handle.
+//! they seed; workers and the consumer share one handle.
 //!
-//! Audit step 5 (2026-05-17) — removed the `Condvar` that workers
-//! formerly waited on via `get_or_wait`. Vendor's `WindowMap`
-//! (vendor/rapidgzip/.../WindowMap.hpp:19-186) is a plain
-//! `std::map<size_t, SharedWindow>` guarded by `mutable std::mutex` —
-//! NO `condition_variable`, NO `wait`. Workers don't block on the
-//! WindowMap because the `BlockFetcher::get` dispatch model
-//! (BlockFetcher.hpp:245-329) waits on the per-block future, which
-//! guarantees the predecessor's decode (and its tail-window emplace)
-//! has finished before the consumer pulls the next chunk.
+//! A plain `BTreeMap<usize, Window>` behind a `Mutex` — no `Condvar`,
+//! matching vendor's `std::map` + `std::mutex`. Workers never block on
+//! the map: `BlockFetcher::get` waits on the per-block future, which
+//! guarantees a predecessor's tail-window is emplaced before the
+//! consumer pulls the next chunk.
 //!
-//! **Window type (2026-05-18)** — `Window = Arc<CompressedVector>`,
-//! matching vendor's `SharedWindow = shared_ptr<const Window>` exactly
-//! (WindowMap.hpp:22-24). `get` returns the shared pointer with **zero
-//! allocation** — vendor's WindowMap.hpp:79-90 pattern. Callers
-//! materialize bytes on demand via `cv.raw_bytes()` (None-compression
-//! path: zero-alloc slice borrow) or `cv.decompress()` (Zlib path: one
-//! allocation for the decompressed buffer). Mirror of vendor's
-//! consumer pattern at GzipChunkFetcher.hpp:341 (`sharedLastWindow->
-//! decompress()`).
+//! `Window = Arc<CompressedVector>` (vendor's `SharedWindow =
+//! shared_ptr<const Window>`); `get` returns the shared pointer with
+//! zero allocation. Callers materialize bytes via `cv.raw_bytes()`
+//! (None-compression: borrowed slice) or `cv.decompress()` (Zlib: one
+//! allocation).
 
 #![allow(dead_code)]
 
@@ -34,27 +26,6 @@ use crate::decompress::parallel::compressed_vector::{CompressedVector, Compressi
 /// only when needed. Mirror of vendor's `SharedWindow =
 /// shared_ptr<const CompressedVector>` (WindowMap.hpp:24).
 pub type Window = Arc<CompressedVector>;
-
-/// TEMPORARY diagnostic — enabled by `GZIPPY_WINTRACE=1`. Traces every
-/// WindowMap insert/get with a content fingerprint so a wrong/missing
-/// window under T≥3 (Bug C) can be read directly instead of guessed.
-/// Remove once Bug C is fixed.
-pub fn wintrace_enabled() -> bool {
-    use std::sync::OnceLock;
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("GZIPPY_WINTRACE").is_ok())
-}
-
-/// FNV-1a 64-bit content fingerprint. Two windows with the same `fp`
-/// are byte-identical; different `fp` = different bytes.
-pub fn wfp(bytes: &[u8]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{h:016x}")
-}
 
 /// The compression strategy used for in-map window storage. Matches
 /// rapidgzip's default `WindowMap` strategy (Zlib).
@@ -114,17 +85,6 @@ impl WindowMap {
             .entries
             .get(&encoded_offset_bits)
             .cloned();
-        if wintrace_enabled() {
-            match &r {
-                Some(w) => eprintln!(
-                    "[WIN] get    key={:>12}  HIT  len={} fp={}",
-                    encoded_offset_bits,
-                    w.raw_bytes().len(),
-                    wfp(w.raw_bytes())
-                ),
-                None => eprintln!("[WIN] get    key={:>12}  MISS", encoded_offset_bits),
-            }
-        }
         r
     }
 
@@ -165,15 +125,6 @@ impl WindowMap {
         bytes: &[u8],
         compression: CompressionType,
     ) {
-        if wintrace_enabled() {
-            eprintln!(
-                "[WIN] insert key={:>12}  len={} fp={} comp={}",
-                encoded_offset_bits,
-                bytes.len(),
-                wfp(bytes),
-                compression.as_str()
-            );
-        }
         let cv = Arc::new(CompressedVector::from_bytes(bytes, compression));
         self.insert(encoded_offset_bits, cv);
     }

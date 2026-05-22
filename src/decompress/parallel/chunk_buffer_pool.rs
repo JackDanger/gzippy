@@ -150,14 +150,6 @@ pub fn return_u16(mut v: Vec<u16>) {
     }
 }
 
-// A previous revision had `prewarm()` + `prefault_pages()` here.
-// They were measured to regress SM throughput by 50% on neurotic
-// (fresh-CLI-process bench paid ~170 ms of consumer-thread page-touch
-// without amortization). Deleted to avoid dead-code-with-future-promises.
-// Notes on the page-fault gap live in the module-level docs above;
-// closing it requires a real per-Vec allocator (allocator-api2 +
-// rpmalloc-rs) or daemon-mode CLI wiring, not a pre-touch loop.
-
 /// Test-only counters that prove the recycle path is being exercised.
 /// Catches the silent-rot case where someone reverts the worker call
 /// sites to `ChunkData::new` (fresh-allocate path) without flipping

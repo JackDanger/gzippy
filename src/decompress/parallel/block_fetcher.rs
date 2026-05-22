@@ -19,14 +19,11 @@
 //!   prefetch queue (BlockFetcher.hpp:385-410) instead of an inline
 //!   ad-hoc ring.
 //!
-//! The thread pool itself is still external — gzippy uses
-//! `chunk_fetcher::drive`'s `std::thread::scope` + `mpsc::Receiver<Job>`
-//! pool. Callers pass a `submit_decode` closure that knows how to send
-//! a `DecodeJob` to that pool; we just hold the `Receiver` for the
-//! result. This is the rapidgzip `BS::thread_pool::submit` -> `future`
-//! mapping with stdlib mpsc as the closest equivalent. See the
-//! "Threading model" note in the port reference; full pool unification
-//! is a follow-up.
+//! The thread pool is external: callers pass a `submit_decode` closure
+//! that dispatches a `DecodeJob` to the ported `ThreadPool`, and
+//! `BlockFetcher` holds the `Receiver` for the result. This is the
+//! rapidgzip `BS::thread_pool::submit` -> `future` mapping with a
+//! stdlib `mpsc` channel as the closest equivalent.
 
 #![allow(dead_code)]
 
@@ -142,12 +139,12 @@ where
     /// BlockFetcher.hpp:554-558, factored out so this generic core
     /// doesn't depend on the gzip job type.
     ///
-    /// **Threading-model deviation (§B5)**: rapidgzip uses
+    /// **Threading-model deviation**: rapidgzip uses
     /// `BS::thread_pool` + `std::future`. We use stdlib `mpsc::Receiver`
     /// as the closest equivalent. The CALLER pattern is identical:
     /// `get()` does cache lookup + prefetch take + dispatch + wait +
     /// cache-insert in a single call. Underlying thread-pool unification
-    /// is a follow-up (see `docs/rapidgzip-port-reference.md` §B5).
+    /// is a follow-up.
     pub fn get<S>(&self, block_offset: Key, submit: S) -> Result<Value, Err>
     where
         S: FnOnce(Key) -> Receiver<Result<Value, Err>>,

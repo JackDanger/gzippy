@@ -1,14 +1,8 @@
 //! Literal port of `rapidgzip::gzip` + `rapidgzip::deflate` constants
 //! (vendor/rapidgzip/librapidarchive/src/rapidgzip/gzip/definitions.hpp).
 //!
-//! This is the centralized, rapidgzip-shaped home for the deflate
-//! format constants. Several existing modules (`block_finder.rs`,
-//! `blockfinder_precode_check.rs`, `deflate_block.rs`) currently
-//! declare their own local copies of these values — see the
-//! "Duplication map" doc-comment block at the bottom of this file for
-//! the consolidation list. A follow-up port will switch those modules
-//! to re-use the constants from here so there is a single source of
-//! truth aligned with the vendor.
+//! The centralized, rapidgzip-shaped home for the deflate format
+//! constants.
 
 #![allow(dead_code)]
 
@@ -195,32 +189,12 @@ impl core::ops::BitAnd for StoppingPoint {
 ///
 /// Pair of `(encodedOffset, decodedOffset)` describing a deflate block
 /// boundary. The existing `chunk_data.rs::ChunkData::append_block_boundary`
-/// uses a Rust-native `(u64, u64)` pair today — see the duplication map
-/// below.
+/// uses a Rust-native `(u64, u64)` pair today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlockBoundary {
     pub encoded_offset: usize,
     pub decoded_offset: usize,
 }
-
-// =====================================================================
-// Duplication map (for the follow-up consolidation pass).
-// =====================================================================
-//
-// As of this commit, the following modules declare their own local
-// copies of constants that this module now hosts. A follow-up should
-// switch them to re-export from here so the vendor port stays
-// authoritative:
-//
-// - `block_finder.rs:23` — `MAX_PRECODE_COUNT`
-// - `block_finder.rs:29` — `PRECODE_ALPHABET` (typed `[usize; 19]`)
-// - `block_finder.rs:34` — `END_OF_BLOCK_SYMBOL`
-// - `blockfinder_precode_check.rs:35-37` — `MAX_PRECODE_COUNT` (already
-//   cites the vendor file:line, just isn't re-using this module yet).
-// - `chunk_data.rs::ChunkData::append_block_boundary` — uses `(u64, u64)`
-//   rather than `BlockBoundary { encoded_offset, decoded_offset }`.
-// - `gzip_chunk.rs::StoppingPoints` (alias from ISA-L) — separate from
-//   the rapidgzip `StoppingPoint` bit-flag set ported here.
 
 #[cfg(test)]
 mod tests {

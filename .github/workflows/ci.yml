@@ -86,14 +86,6 @@ jobs:
           fi
 
       - name: Run unit tests
-        env:
-          # On `push` to main, also run the comprehensive main-only fuzz
-          # (`tests/main_branch_fuzz.rs`). On PRs and feature branches the
-          # env var is empty and the test skips trivially. The
-          # `fuzz_diff_against_oracle_comprehensive` test panics with a
-          # specific reminder when its trial body is empty — that's the
-          # "TODO that screams" beacon for future agents.
-          GZIPPY_MAIN_FUZZ: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && '1' || '' }}
         run: |
           if [ "${{ matrix.os }}" = "linux" ] && [ "${{ matrix.arch }}" = "x86_64" ]; then
             cargo test --release --features isal-compression

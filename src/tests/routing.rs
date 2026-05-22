@@ -292,8 +292,6 @@ mod tests {
     // We snapshot it around a real CLI-shaped decode and assert it moved.
     // On platforms where the parallel path is correctly gated off (arm64,
     // non-ISA-L builds) the test is a no-op.
-    //
-    // See `docs/marker-decoder-plan.md` for the full rationale.
     // =========================================================================
     #[test]
     fn test_marker_pipeline_actually_runs_on_x86_64_isal() {
@@ -441,7 +439,7 @@ mod tests {
     // parallel path ran at ~1.75× the elapsed time of pure sequential.
     //
     // The v0.6 marker pipeline has no per-physical-core routing gate (the
-    // earlier core floor was dropped — see `docs/marker-decoder-plan.md`).
+    // earlier core floor was dropped).
     // On ≥4-physical-core hardware parallel comfortably beats sequential
     // (tight assertion: ratio < 1.5 catches v0.3.0-class 1.75× regression).
     // On <4 physical cores (e.g. 2-core CI runners) parallel-at-T=4 pays

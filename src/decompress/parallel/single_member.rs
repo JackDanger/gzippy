@@ -12,9 +12,7 @@
 //!
 //! The architecture (worker pool, prefetch loop, shared WindowMap, fast
 //! and slow decode paths, async re-dispatch on speculative mismatch)
-//! lives in [`crate::decompress::parallel::chunk_fetcher`]. See
-//! `docs/rapidgzip-port-reference.md` for ground-truth alignment with
-//! rapidgzip's C++.
+//! lives in [`crate::decompress::parallel::chunk_fetcher`].
 //!
 //! Streaming-write trade-off: bytes flow to the writer as each chunk
 //! resolves, so a CRC/ISIZE mismatch at the end leaves partial output
@@ -317,8 +315,4 @@ mod tests {
         let err = decompress_parallel(&gz, &mut out, 1).unwrap_err();
         assert!(matches!(err, ParallelError::InvalidGzipFormat));
     }
-
-    // Note: `test_window_map_uses_compressed_vector` (spec §I new
-    // tests #5) lives in `decompress::tests` — the type-level fence
-    // there asserts the same `WindowMap` default = `CompressionType::Zlib`.
 }

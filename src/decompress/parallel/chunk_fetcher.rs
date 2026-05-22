@@ -421,26 +421,17 @@ pub fn drive<W: std::io::Write>(
             TAKE_U16_MISSES.load(Ordering::Relaxed),
             RETURN_U16_CALLS.load(Ordering::Relaxed),
         );
-        // Advisor 12 instrumentation: slow-path candidate iteration.
-        // SLOW_PATH_FIRST_CANDIDATE_OK + SLOW_PATH_FIRST_CANDIDATE_FAIL +
-        // SLOW_PATH_NO_CANDIDATE should sum to the slow-path call count.
-        // A high FAIL count vs OK proves the marker decoder rejects
-        // candidates that vendor accepts (advisor 11 Q2 hypothesis).
+        // Slow-path candidate iteration: ok + fail + no_candidate sum
+        // to the slow-path call count.
         eprintln!(
             "  Slow-path decode: ok={} fail={} no_candidate={}",
             SLOW_PATH_FIRST_CANDIDATE_OK.load(Ordering::Relaxed),
             SLOW_PATH_FIRST_CANDIDATE_FAIL.load(Ordering::Relaxed),
             SLOW_PATH_NO_CANDIDATE.load(Ordering::Relaxed),
         );
-        // Advisor 14 instrumentation: per-fetch rejection cause.
-        // PREFETCH_REJECT_BY_GUARD bumps when a prefetched chunk arrived
-        // at the consumer but the safety guard rejected it (chain
-        // invariant broken — chunk.max != next_block_offset). A high
-        // count vs the cache-miss count would mean closing the chain
-        // (wrapper avail_in cap + paired metadata fix) is needed.
-        // A LOW count (≈ 0) would mean the on-demand fetches are
-        // overwhelmingly "prefetch wasn't ready in time" (scheduling),
-        // and the perf gap is a worker-utilization problem instead.
+        // Per-fetch rejection cause: a prefetched chunk arrived but the
+        // safety guard rejected it (chain invariant broken —
+        // chunk.max != next_block_offset).
         eprintln!(
             "  Prefetch guard-rejects: {}",
             PREFETCH_REJECT_BY_GUARD.load(Ordering::Relaxed),
@@ -1167,35 +1158,6 @@ fn run_decode_task(
     // Workers must not publish to WindowMap — consumer publishes fast-path
     // windows after decode (see consumer_loop marker-free branch).
 
-    // TEMPORARY Bug-C diagnostic (GZIPPY_WINTRACE=1): which decode mode
-    // each chunk took, and the encoded range it actually produced.
-    if crate::decompress::parallel::window_map::wintrace_enabled() {
-        let path = if params.start_bit == 0 {
-            "chunk0"
-        } else if window.is_some() {
-            "fast-window"
-        } else {
-            "slow-spec"
-        };
-        match &chunk_result {
-            Ok(c) => eprintln!(
-                "[WIN] decode start={:>12} until={:>12} spec={} path={:<11} \
-                 -> enc=[{}, {}) markers={}",
-                params.start_bit,
-                params.stop_hint_bit,
-                params.is_speculative_prefetch,
-                path,
-                c.encoded_offset_bits,
-                c.encoded_offset_bits + c.encoded_size_bits,
-                !c.data_with_markers.is_empty(),
-            ),
-            Err(e) => eprintln!(
-                "[WIN] decode start={:>12} path={:<11} -> ERR {:?}",
-                params.start_bit, path, e
-            ),
-        }
-    }
-
     // Wrap in Arc to match BlockFetcher's `Value = Arc<ChunkData>`
     // (vendor's `std::shared_ptr<BlockData>` at BlockFetcher.hpp:46).
     let result = chunk_result.map(Arc::new);
@@ -1293,73 +1255,9 @@ fn publish_subchunk_windows(window_map: &WindowMap, chunk: &ChunkData) {
 
 // ── Slow-path decoder (tryToDecode + BlockFinder iteration) ──────────────
 
-/// Try to decode at `start_bit` directly; if that fails, iterate
-/// BlockFinder candidates in [start_bit, start_bit + 512 KiB] until
-/// one succeeds. Mirror of rapidgzip's `tryToDecode` + candidate
-/// iteration at vendor/.../GzipChunk.hpp:712-841.
-///
-/// The returned chunk's `encoded_offset_bits` is the REAL candidate
-/// position the decode ran from — not a fabricated `start_bit`. Vendor
-/// invariant (GzipChunk.hpp:716-722): `bitReader.seekTo(offset.second)`
-/// then `result.encodedOffsetInBits = offset.first`, with `first ==
-/// second` for compressed blocks. The two-key consumer wrapper at
-/// `GzipChunkFetcher::getBlock` (GzipChunkFetcher.hpp:646-654) uses
-/// `matchesEncodedOffset` to detect when a speculatively-prefetched
-/// chunk landed on a different valid boundary than the real one, and
-/// falls back to an on-demand decode at the real offset.
-///
-/// Previously this function fabricated `encoded_offset_bits = start_bit`
-/// and stored `max_acceptable_start_bit = actual`, claiming the chunk
-/// spanned `[start_bit, actual + size]`. But the decoded bytes ONLY
-/// covered `[actual, actual + size]`, so consumers that took the chunk
-/// at face value (after the partition-keyed cache lookup landed) would
-/// emit wrong output — bytes `[start_bit, actual)` were missing from the
-/// payload but counted in the metadata. The lie was harmless in the
-/// pre-port era because the prefetch queue's key mismatch caused every
-/// prefetched chunk to be silently discarded. With the two-key lookup
-/// in place the lie surfaces; drop it to match vendor exactly.
-/// Slow-path decoder for prefetched chunks whose predecessor window is
-/// not yet published. Mirror of vendor's `tryToDecode` cascade at
-/// vendor/.../chunkdecoding/GzipChunk.hpp:712-846.
-///
-/// **Vendor parity** — the cascade at GzipChunk.hpp:803-846 walks 8 KiB
-/// sub-chunks (`CHUNK_SIZE = 8_Ki * BYTE_SIZE`, line 804), calls
-/// `findNextDynamic`/`findNextUncompressed` ONCE per sub-chunk to get
-/// the next candidate, calls `tryToDecode(offset)`, and on success
-/// returns immediately (line 837-841). The pre-2026-05-17 gzippy
-/// equivalent enumerated ALL candidates in a 512 KiB window via
-/// `find_blocks`, then trial-decoded EVERY candidate even after the
-/// first failure — a layering on top of vendor's cascade, not a port of
-/// it.
-///
-/// **Investigation finding (trace silesia-large.gz @ gzip -9, 16T)**:
-/// `find_blocks` returns 55-137 candidates per 512 KiB window. The
-/// first candidate IS the real next-block boundary (typical Δ from
-/// partition_offset = 12-150 KiB). EVERY candidate, including the real
-/// one, fails trial-decode with `InvalidHuffmanCode` — a marker-decoder
-/// bug we haven't isolated. With 67 attempts × 200 µs per false-positive
-/// trial decode, each failed prefetch burns ~14 ms of worker time. With
-/// 15-38 such prefetches per silesia decode, that's 200-500 ms of pure
-/// waste, half the total wall time.
-///
-/// Slow-path trial decode uses marker bootstrap (`decode_chunk_marker_bootstrap_then_isal`).
-/// We still walk
-/// every candidate in each 8 KiB sub-window and return on first success
-/// (vendor GzipChunk.hpp:837-841).
-///
-/// Vendor parity (GzipChunk.hpp:803-846): scan in 8 KiB CHUNK_SIZE
-/// increments but keep iterating until 512 KiB total or until a valid
-/// boundary is found. Real gzip -9 boundaries on silesia typically sit
-/// 8-150 KiB past the partition seed, so a SINGLE 8 KiB pass misses
-/// the boundary on ~80% of partitions (observed via decode_err trace);
-/// the outer 512 KiB cap matches vendor's `chunkBegin - blockOffset >=
-/// 512_Ki * BYTE_SIZE` break at GzipChunk.hpp:811.
-/// Diagnostic counters for slow-path candidate iteration. Advisor 12
-/// asked: of the 22 on-demand fallbacks observed in --verbose stats,
-/// how many are caused by `speculative_decode_find_boundary` returning Err vs the
-/// consumer-side `matches_encoded_offset` check rejecting? These
-/// counters let a single GZIPPY_VERBOSE decode answer the question
-/// without needing trace parsing.
+/// Diagnostic counters for slow-path candidate iteration, surfaced in
+/// `--verbose` stats: `NO_CANDIDATE` (no boundary found in the search
+/// window) and the first-candidate trial-decode outcomes `OK` / `FAIL`.
 pub static SLOW_PATH_NO_CANDIDATE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static SLOW_PATH_FIRST_CANDIDATE_OK: std::sync::atomic::AtomicU64 =
@@ -1370,10 +1268,8 @@ pub static SLOW_PATH_FIRST_CANDIDATE_FAIL: std::sync::atomic::AtomicU64 =
 /// Bumps once per consumer iter where the partition-keyed
 /// `try_take_prefetched` returned a chunk but the safety guard
 /// rejected it (mismatch between `chunk.max_acceptable_start_bit` and
-/// consumer-requested `next_block_offset`). Separating this from
-/// `prefetch_cache_miss` (which counts "prefetch absent") was advisor
-/// 14's question: of the on-demand fetches counted in --verbose, how
-/// many are guard-rejects vs cache-misses? Different fixes apply.
+/// consumer-requested `next_block_offset`) — distinct from
+/// `prefetch_cache_miss`, which counts a prefetch being absent.
 pub static PREFETCH_REJECT_BY_GUARD: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 

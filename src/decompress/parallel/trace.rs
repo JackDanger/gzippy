@@ -92,31 +92,6 @@ pub fn worker_label(idx: usize) -> String {
     format!("worker-{idx}")
 }
 
-/// Read process RSS in KiB from /proc/self/status (Linux only).
-/// Returns 0 on non-Linux or read failure. Used to embed memory
-/// numbers in trace events so post-hoc analysis can correlate
-/// memory pressure with specific dispatcher actions.
-pub fn rss_kib() -> u64 {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
-            for line in s.lines() {
-                if let Some(rest) = line.strip_prefix("VmRSS:") {
-                    return rest
-                        .trim()
-                        .trim_end_matches(" kB")
-                        .trim()
-                        .parse()
-                        .unwrap_or(0);
-                }
-            }
-        }
-        0
-    }
-    #[cfg(not(target_os = "linux"))]
-    0
-}
-
 /// Minimal JSON string escape — only what we emit (escape `"`, `\`, and
 /// control bytes by collapsing them). Sufficient for `format!("{e:?}")`
 /// output of Rust error types which can include embedded quotes from
@@ -135,22 +110,4 @@ pub fn esc(s: &str) -> String {
         }
     }
     out
-}
-
-/// Helper for the common "thread = boundary-N" pattern.
-pub fn boundary_label(idx: usize) -> String {
-    format!("boundary-{idx}")
-}
-
-/// Monotonic seconds since the trace epoch (process start when trace
-/// was first initialized; falls back to a per-call `Instant::now()` if
-/// tracing is disabled — value is still useful for relative
-/// difference within the same call site).
-///
-/// Used by `ChunkFetcherStatistics::note_decode_block_start` /
-/// `note_decode_block_end` to compute pool efficiency.
-pub fn now_secs() -> f64 {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    let epoch = *EPOCH.get_or_init(Instant::now);
-    epoch.elapsed().as_secs_f64()
 }
