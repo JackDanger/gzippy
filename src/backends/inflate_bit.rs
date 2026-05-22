@@ -42,6 +42,7 @@ pub fn decompress_deflate_from_bit(
 }
 
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[allow(dead_code)]
 pub fn decompress_deflate_from_bit_with_end(
     data: &[u8],
     bit_offset: usize,
