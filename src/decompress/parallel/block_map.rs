@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of `rapidgzip::BlockMap`
 //! (vendor/rapidgzip/.../core/BlockMap.hpp).
 //!
@@ -8,8 +10,6 @@
 //!
 //! Expects `push` to be called with monotonically-increasing
 //! `encoded_block_offset` arguments (rapidgzip's contract).
-
-#![allow(dead_code)]
 
 use std::sync::Mutex;
 

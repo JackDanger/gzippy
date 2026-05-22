@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of `rapidgzip::FetchingStrategy`
 //! (vendor/.../core/Prefetcher.hpp).
 //!
@@ -10,8 +12,6 @@
 //!   between 1 and `max_to_prefetch`).
 //! - [`FetchMultiStream`]: extend `FetchNextAdaptive` with detection
 //!   of multiple interleaved sequential access streams.
-
-#![allow(dead_code)]
 
 use std::collections::VecDeque;
 

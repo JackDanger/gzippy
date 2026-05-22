@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Port of `rapidgzip::IsalInflateWrapper`
 //! (vendor/rapidgzip/.../gzip/isal.hpp) scoped to single-member raw-
 //! deflate decode. Caller is expected to strip the gzip header and
@@ -23,8 +25,7 @@
 //!   - `input` is the underlying bytes (vendor stores a `BitReader`,
 //!     which is conceptually a `(slice, bit_cursor)` pair).
 //!   - `bit_reader_tell` is the vendor `m_bitReader.tell()` value.
-//!   - `encoded_start_offset_bits`, `encoded_until_bits` mirror
-//!     `m_encodedStartOffset`, `m_encodedUntilOffset`.
+//!   - `encoded_until_bits` mirrors `m_encodedUntilOffset`.
 //!   - `buffer` is the 128 KiB staging area `m_buffer` at isal.hpp:207.
 //!     Vendor's comment there: "Loading the whole encoded data
 //!     (multiple MiB) into memory first and then decoding it in one go
@@ -34,12 +35,12 @@
 //
 // Module-wide dead_code allowance: some public items are exercised
 // only by the unit tests below or by configuration-gated callers.
-#![allow(dead_code)]
 
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use isal::isal_sys::igzip_lib as isal_raw;
 
 /// Vendor `m_buffer` capacity at `gzip/isal.hpp:207` (`std::array<char, 128_Ki>`).
+#[allow(dead_code)] // used by the x86_64+isal-compression IsalInflateWrapper
 const STAGING_BUFFER_BYTES: usize = 128 * 1024;
 
 /// Bit-flag set matching the patched ISA-L's `ISAL_STOPPING_POINT_*`
@@ -125,8 +126,6 @@ pub struct IsalInflateWrapper<'a> {
     /// equivalent file/slice; gzippy holds the slice directly +
     /// `bit_reader_tell` as the bit cursor.
     input: &'a [u8],
-    /// Vendor `m_encodedStartOffset` (isal.hpp:200).
-    encoded_start_offset_bits: usize,
     /// Vendor `m_encodedUntilOffset` (isal.hpp:201). The cap that
     /// `refill_buffer` will not advance past.
     encoded_until_bits: usize,
@@ -209,7 +208,6 @@ impl<'a> IsalInflateWrapper<'a> {
         Ok(Self {
             state,
             input,
-            encoded_start_offset_bits: bit_offset,
             encoded_until_bits: capped_until,
             bit_reader_tell,
             buffer: [0u8; STAGING_BUFFER_BYTES],

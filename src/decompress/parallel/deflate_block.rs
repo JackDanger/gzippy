@@ -1,8 +1,8 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of `rapidgzip::deflate::Block`
 //! (vendor/.../gzip/deflate.hpp:513-1156): the deflate Block state
 //! machine, header parser, and decode inner loops.
-
-#![allow(dead_code)]
 
 use std::io;
 
@@ -1249,37 +1249,6 @@ impl Block {
         self.read_internal_compressed_canonical(bits, n_max_to_decode)
     }
 }
-
-/// RFC 1951 §3.2.6 fixed-Huffman lit/len code lengths, truncated to 286
-/// symbols (ISA-L's LIT_LEN ceiling). Symbols 286–287 in the full table
-/// are unused in real streams. Returned as a `'static` slice so the
-/// caller doesn't allocate per block.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-static FIXED_LITLEN_LENGTHS_286: [u8; 286] = {
-    let mut lens = [0u8; 286];
-    let mut i = 0;
-    while i < 144 {
-        lens[i] = 8;
-        i += 1;
-    }
-    while i < 256 {
-        lens[i] = 9;
-        i += 1;
-    }
-    while i < 280 {
-        lens[i] = 7;
-        i += 1;
-    }
-    while i < 286 {
-        lens[i] = 8;
-        i += 1;
-    }
-    lens
-};
-
-/// RFC 1951 §3.2.6 fixed-Huffman distance code lengths (all 5).
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-static FIXED_DIST_LENGTHS_30: [u8; 30] = [5u8; 30];
 
 // ── Length / distance extra-bits tables (RFC 1951 §3.2.5) ──────────────────
 

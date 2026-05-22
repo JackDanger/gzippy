@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Cross-thread Vec recycler for `ChunkData`'s `data` (`Vec<u8>`) and
 //! `data_with_markers` (`Vec<u16>`) buffers.
 //!
@@ -76,8 +78,6 @@
 //!   - `#[global_allocator] = rpmalloc::RpMalloc` (global; the
 //!     mimalloc/jemalloc tries regressed, so this is unproven).
 //!   - Daemon-mode CLI wrapper (sidesteps the fresh-process problem).
-
-#![allow(dead_code)]
 
 use std::sync::Mutex;
 

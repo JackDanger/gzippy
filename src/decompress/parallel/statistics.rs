@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of rapidgzip's fetcher statistics types
 //! (vendor/.../core/BlockFetcher.hpp:34-200 +
 //! vendor/.../GzipChunkFetcher.hpp:55-75).
@@ -11,8 +13,6 @@
 //!
 //! Both are thread-safe via internal mutex (rapidgzip uses
 //! `std::scoped_lock` on a mutex member).
-
-#![allow(dead_code)]
 
 use std::fmt;
 use std::sync::Mutex;

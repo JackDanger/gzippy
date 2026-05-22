@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Verbose structured tracing for the parallel single-member decoder.
 //!
 //! When the environment variable `GZIPPY_LOG_FILE` is set, every
@@ -22,8 +24,6 @@
 //! - `thread`: short label (`consumer`, `worker-N`, `boundary-N`).
 //! - `ev`: event kind (snake_case verb).
 //! - Bit positions are absolute in the deflate stream.
-
-#![allow(dead_code)]
 
 use std::fs::OpenOptions;
 use std::io::Write;

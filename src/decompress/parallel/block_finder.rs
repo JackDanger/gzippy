@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! High-Performance Deflate Block Finder
 //!
 //! Implements rapidgzip's approach to finding valid deflate block boundaries:
@@ -7,7 +9,6 @@
 //! 4. Symbol 256 (END_OF_BLOCK) must have non-zero length
 
 #![allow(clippy::unusual_byte_groupings)]
-#![allow(dead_code)]
 #![allow(clippy::needless_range_loop)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,12 +19,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Maximum precode length (7 bits)
 const MAX_PRECODE_LENGTH: u8 = 7;
-
-/// Number of precode symbols
-const MAX_PRECODE_COUNT: usize = 19;
-
-/// Bits per precode length
-const PRECODE_BITS: u8 = 3;
 
 /// Precode alphabet order (RFC 1951)
 const PRECODE_ALPHABET: [usize; 19] = [

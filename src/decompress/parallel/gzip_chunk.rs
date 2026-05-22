@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Per-chunk deflate decode for parallel single-member.
 //!
 //! - [`decode_chunk_isal`] — on-demand decode when the predecessor
@@ -7,8 +9,6 @@
 //!
 //! `stop_hint_bits` is an inexact stop hint (vendor `untilOffset`): the
 //! decoder runs to the first block boundary at-or-past it, then stops.
-
-#![allow(dead_code)]
 
 use crate::decompress::parallel::chunk_data::{ChunkConfiguration, ChunkData};
 use crate::decompress::parallel::inflate_wrapper::InflateError;
@@ -39,6 +39,7 @@ impl From<std::io::Error> for ChunkDecodeError {
 
 /// Output buffer size used per `read_stream` iteration. Matches
 /// rapidgzip's `ALLOCATION_CHUNK_SIZE` (GzipChunk.hpp uses 128 KiB).
+#[allow(dead_code)] // used by x86_64+isal-compression decode_chunk_isal path
 const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 
 /// ISA-L decode of one chunk when the predecessor window is known.
@@ -757,8 +758,7 @@ mod tests {
             gz
         };
         let head_len = {
-            let (_hdr, hdr_len) =
-                crate::decompress::parallel::gzip_format::read_header(&gz).expect("gzip hdr");
+            let _ = crate::decompress::parallel::gzip_format::read_header(&gz).expect("gzip hdr");
             let footer = crate::decompress::parallel::gzip_format::read_footer(&gz, gz.len() - 8)
                 .expect("footer");
             footer.uncompressed_size as usize

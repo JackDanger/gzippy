@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Parallel single-member gzip decompression — rapidgzip-shaped port.
 //!
 //! Production path on x86_64 + ISA-L when the classifier returns
@@ -21,8 +23,6 @@
 //! caller surfaces it; the silent libdeflate retry that used to follow
 //! has been removed.
 
-#![allow(dead_code)]
-
 use std::io::{self, Write};
 use std::sync::atomic::AtomicU64;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
@@ -31,9 +31,11 @@ use std::sync::Mutex;
 
 const MIN_PARALLEL_SIZE: usize = 4 * 1024 * 1024;
 const MIN_THREADS_FOR_PARALLEL: usize = 2;
+#[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
 const TARGET_COMPRESSED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// Floor on the adjusted chunk size when the file is small.
 /// Mirror of `512_Ki` literal at vendor's ParallelGzipReader.hpp:305.
+#[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
 const MIN_ADJUSTED_CHUNK_BYTES: usize = 512 * 1024;
 
 /// Literal port of vendor's small-file chunk-size adjustment at
@@ -60,6 +62,7 @@ const MIN_ADJUSTED_CHUNK_BYTES: usize = 512 * 1024;
 /// num_threads` chunks (vendor's "give the thread pool more time to
 /// be filled out" — chosen empirically per the comment), with a
 /// 512 KiB floor (block-finder overhead would dominate below that).
+#[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
 pub(crate) fn adjusted_chunk_size_bytes(
     file_size: usize,
     num_threads: usize,
@@ -88,14 +91,17 @@ pub static ADJUSTED_CHUNK_SIZE_APPLIED: AtomicU64 = AtomicU64::new(0);
 ///
 /// `pub(crate)` rather than `pub`: internal diagnostic surface, not a
 /// library API.
+#[allow(dead_code)] // incremented by the x86_64+isal-compression decompress_parallel path; read by tests
 pub(crate) static MARKER_PIPELINE_RUNS: AtomicU64 = AtomicU64::new(0);
 
 /// Mutex serializing routing tests that snapshot `MARKER_PIPELINE_RUNS`
 /// against each other. Without this, `cargo test`'s default parallel
 /// execution can mask a real silent-fallback regression with a false
 /// positive.
+#[allow(dead_code)] // wired by #[cfg(test)] consumers in src/tests/routing.rs + src/decompress/mod.rs
 pub(crate) static MARKER_PIPELINE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
 #[inline]
 fn debug_enabled() -> bool {
     use std::sync::OnceLock;

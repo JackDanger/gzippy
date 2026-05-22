@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of `rapidgzip::CRC32Calculator` plus the carryless
 //! polynomial helpers used by `combineCRC32`
 //! (vendor/rapidgzip/librapidarchive/src/rapidgzip/gzip/crc32.hpp).
@@ -30,8 +32,6 @@
 //! Cross-check tests assert that our `combine_crc32` agrees with
 //! both `crc32fast::Hasher::combine` and a direct call to the
 //! polynomial-multiply formula.
-
-#![allow(dead_code)]
 
 use crc32fast::Hasher;
 

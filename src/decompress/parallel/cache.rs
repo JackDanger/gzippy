@@ -1,11 +1,11 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of `rapidgzip::Cache` + `LeastRecentlyUsed` strategy
 //! (vendor/.../core/Cache.hpp).
 //!
 //! LRU-evicting key/value map with hit/miss/unused-entry statistics.
 //! `BlockFetcher` uses two instances (a main cache + a prefetch cache);
 //! both share this implementation.
-
-#![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;

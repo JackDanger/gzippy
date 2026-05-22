@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of `rapidgzip::GzipBlockFinder`
 //! (vendor/rapidgzip/librapidarchive/src/rapidgzip/GzipBlockFinder.hpp:34-307).
 //!
@@ -24,8 +26,6 @@
 //! vendor's `m_blockFinder->get(...)` + `insert(...)` cascade in
 //! `GzipChunkFetcher::processNextChunk`
 //! (vendor/.../GzipChunkFetcher.hpp:318 + 374).
-
-#![allow(dead_code)]
 
 use std::sync::Mutex;
 

@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Rust port of rapidgzip's `HuffmanCodingISAL`
 //! (vendor/rapidgzip/.../huffman/HuffmanCodingISAL.hpp).
 //!
@@ -26,7 +28,6 @@
 //! - Decode constants are bit-packed into the LUT entries the same way
 //!   ISA-L lays them out; see `Self::decode` for the exact layout.
 
-#![allow(dead_code)]
 #![cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 
 use crate::decompress::inflate::consume_first_decode::Bits;

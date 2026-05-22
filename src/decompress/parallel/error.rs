@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of `rapidgzip::Error`
 //! (vendor/rapidgzip/librapidarchive/src/core/Error.hpp).
 //!
@@ -11,8 +13,6 @@
 //! Rust callers should prefer pattern-matching the variants, but the
 //! `as u8` representation matches the vendor's `static_cast<int>(Error)`
 //! used in some debug prints / logging.
-
-#![allow(dead_code)]
 
 /// Mirror of `rapidgzip::Error` (Error.hpp:9-41).
 ///

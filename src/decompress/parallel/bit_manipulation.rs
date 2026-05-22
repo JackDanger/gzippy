@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of `rapidgzip::*` bit-manipulation primitives
 //! (vendor/rapidgzip/librapidarchive/src/core/BitManipulation.hpp).
 //!
@@ -34,8 +36,6 @@
 //!   uses `T::reverse_bits` then shifts off the unused high bits.
 //! - `required_bits` (BM.hpp:300-315) — ceil(log2(N)) with the
 //!   N==0/N==1 special cases preserved.
-
-#![allow(dead_code)]
 
 /// Mirror of `rapidgzip::isLittleEndian` (BitManipulation.hpp:11-16).
 ///

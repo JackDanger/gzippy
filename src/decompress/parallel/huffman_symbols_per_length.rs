@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of `rapidgzip::HuffmanCodingSymbolsPerLength`
 //! (`vendor/rapidgzip/librapidarchive/src/huffman/HuffmanCodingSymbolsPerLength.hpp`).
 //!
@@ -13,12 +15,10 @@
 //! is `u16` (the only width used by deflate). `MAX_CODE_LENGTH` is fixed
 //! at 15 — same rationale as `huffman_base.rs`.
 
-#![allow(dead_code)]
-
 use super::error::Error;
 use super::gzip_definitions::MAX_CODE_LENGTH;
 use super::huffman_base::{
-    BitReaderError, CodeLengthFrequencies, HuffmanCodingBase, LsbBitReader, CODE_LENGTH_STORAGE,
+    CodeLengthFrequencies, HuffmanCodingBase, LsbBitReader, CODE_LENGTH_STORAGE,
 };
 
 /// Symbol type used by every deflate Huffman variant. The vendor's
@@ -187,13 +187,6 @@ impl<const MAX_SYMBOL_COUNT: usize> Default for HuffmanCodingSymbolsPerLength<MA
     fn default() -> Self {
         Self::new()
     }
-}
-
-// Helper for porting bit-reader EOF propagation when we don't need to
-// distinguish missing bits from logic errors.
-#[inline]
-pub(crate) fn err_to_option<T>(r: Result<T, BitReaderError>) -> Option<T> {
-    r.ok()
 }
 
 #[cfg(test)]

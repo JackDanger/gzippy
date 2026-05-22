@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of `rapidgzip::HuffmanCodingBase`
 //! (`vendor/rapidgzip/librapidarchive/src/huffman/HuffmanCodingBase.hpp`).
 //!
@@ -30,8 +32,6 @@
 //! covering these methods so each Huffman variant can be generic over it.
 //! See `LsbBitReader` below for the canonical mapping to the rapidgzip
 //! `gzip::BitReader` (`vendor/.../filereader/BitReader.hpp:194-289`).
-
-#![allow(dead_code)]
 
 use super::error::Error;
 use super::gzip_definitions::MAX_CODE_LENGTH;

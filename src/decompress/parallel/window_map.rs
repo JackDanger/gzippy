@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Shared, thread-safe port of `rapidgzip::WindowMap` (WindowMap.hpp).
 //! Stores propagated 32-KiB windows keyed by the compressed-bit offset
 //! they seed; workers and the consumer share one handle.
@@ -13,8 +15,6 @@
 //! zero allocation. Callers materialize bytes via `cv.raw_bytes()`
 //! (None-compression: borrowed slice) or `cv.decompress()` (Zlib: one
 //! allocation).
-
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

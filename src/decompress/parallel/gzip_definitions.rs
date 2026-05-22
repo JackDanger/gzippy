@@ -1,10 +1,10 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of `rapidgzip::gzip` + `rapidgzip::deflate` constants
 //! (vendor/rapidgzip/librapidarchive/src/rapidgzip/gzip/definitions.hpp).
 //!
 //! The centralized, rapidgzip-shaped home for the deflate format
 //! constants.
-
-#![allow(dead_code)]
 
 // =====================================================================
 // rapidgzip top-level (definitions.hpp:25).

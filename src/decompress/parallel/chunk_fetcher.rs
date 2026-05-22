@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Port of `rapidgzip::GzipChunkFetcher::processNextChunk`
 //! (vendor/rapidgzip/.../GzipChunkFetcher.hpp:311-362) layered on a
 //! `BlockFetcher`-driven dispatch
@@ -47,8 +49,6 @@
 //!   (priority −1). **WindowMap publishes stay on the consumer** (vendor
 //!   orchestrator thread): tail before post-process, subchunk windows
 //!   after `apply_window` completes (`appendSubchunksToIndexes`).
-
-#![allow(dead_code)]
 
 use crate::decompress::parallel::chunk_data::ChunkConfiguration;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]

@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of `rapidgzip::BlockFetcher`
 //! (vendor/.../core/BlockFetcher.hpp:38-688).
 //!
@@ -24,8 +26,6 @@
 //! `BlockFetcher` holds the `Receiver` for the result. This is the
 //! rapidgzip `BS::thread_pool::submit` -> `future` mapping with a
 //! stdlib `mpsc` channel as the closest equivalent.
-
-#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;

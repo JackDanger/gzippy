@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of `rapidgzip::gzip` header + footer parsing
 //! (vendor/rapidgzip/.../gzip/gzip.hpp:77-309).
 //!
@@ -6,8 +8,6 @@
 //! / footer. Used by the parallel single-member driver and by future
 //! multi-stream support to bracket each gzip stream within a multi-
 //! member input.
-
-#![allow(dead_code)]
 
 use std::io;
 

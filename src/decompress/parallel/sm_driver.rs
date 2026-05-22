@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Production entry for parallel single-member gzip decompression.
 //!
 //! Parses the gzip envelope, runs [`super::chunk_fetcher::drive`] on the

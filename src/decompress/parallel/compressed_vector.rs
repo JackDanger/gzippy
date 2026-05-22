@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of `rapidgzip::CompressedVector`
 //! (vendor/.../CompressedVector.hpp:113-246).
 //!
@@ -5,8 +7,6 @@
 //! memory-efficient window caching. Decompresses on demand. Used by
 //! `WindowMap` (Step 13 wiring) so the cache holds 32 KiB windows in
 //! ~1-10 KiB each on highly-compressible data.
-
-#![allow(dead_code)]
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -57,7 +57,10 @@ impl CompressedVector {
         let data = if matches!(compression_type, CompressionType::None) {
             to_compress.to_vec()
         } else {
-            compress(to_compress, compression_type).unwrap_or_else(|_| to_compress.to_vec())
+            compress(to_compress, compression_type).expect(
+                "CompressedVector::from_bytes: compression failed — should be infallible \
+                 for in-memory zlib/gzip/deflate over valid bytes",
+            )
         };
         Self {
             compression_type,

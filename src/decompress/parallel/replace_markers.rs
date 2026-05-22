@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! SIMD-accelerated marker replacement.
 //!
 //! Literal port of rapidgzip's `MapMarkers` semantics
@@ -14,8 +16,6 @@
 //! Switched from the old "offset from newest byte" encoding to align with
 //! rapidgzip's `MapMarkers` so any downstream rapidgzip code that depends
 //! on marker semantics ports byte-for-byte.
-
-#![allow(dead_code)]
 
 /// Values at or above this are markers; values below are literal bytes.
 pub const MARKER_BASE: u16 = 32768;

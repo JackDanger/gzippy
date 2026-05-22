@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Port of `rapidgzip::ChunkData::applyWindow` (ChunkData.hpp:302).
 //!
 //! Resolves marker-tagged values in `chunk.data_with_markers` against a
@@ -14,7 +16,6 @@ use crate::decompress::parallel::replace_markers::replace_markers;
 /// responsibility: the consumer CRCs the resolved bytes once, over the
 /// already-narrowed buffer it builds for the output write, so this
 /// function does not pay a separate narrow + CRC pass.
-#[allow(dead_code)]
 pub fn apply_window(chunk: &mut ChunkData, window: &[u8]) {
     if chunk.data_with_markers.is_empty() {
         return;

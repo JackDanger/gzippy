@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Literal port of `rapidgzip::ThreadPool`
 //! (vendor/rapidgzip/librapidarchive/src/core/ThreadPool.hpp:33-248).
 //!
@@ -35,8 +37,6 @@
 //! [`crate::decompress::parallel::chunk_fetcher`] (the gzippy equivalent of
 //! rapidgzip's `BS::thread_pool` consumer) is a follow-up commit because
 //! that rewires the existing mpsc worker loop.
-
-#![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

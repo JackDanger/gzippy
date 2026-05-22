@@ -1,3 +1,5 @@
+#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+
 //! Port of `rapidgzip::ChunkData` (ChunkData.hpp, especially lines 80-400)
 //! plus its nested `Subchunk` and `Statistics`.
 //!
@@ -14,7 +16,6 @@
 // Module-wide dead_code allowance: this is a types-heavy port; some
 // accessors are exercised only by the unit tests below or by
 // configuration-gated callers.
-#![allow(dead_code)]
 
 use std::sync::Arc;
 
