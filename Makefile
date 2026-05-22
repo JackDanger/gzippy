@@ -162,7 +162,7 @@ NEUROTIC_SSH := ssh -J neurotic root@10.30.0.199
 # to origin/$BRANCH — $BRANCH must be set in the calling recipe's shell.
 # The safe.directory exception is required because the checkout is not
 # owned by the ssh user (git refuses "dubious ownership" repos otherwise).
-NEUROTIC_SYNC := git config --global --add safe.directory /root/gzippy; git fetch origin '$$BRANCH'; git checkout -B '$$BRANCH' 'origin/$$BRANCH'; git reset --hard 'origin/$$BRANCH'
+NEUROTIC_SYNC := git config --global --add safe.directory /root/gzippy; git fetch origin '$$BRANCH'; git checkout -f -B '$$BRANCH' 'origin/$$BRANCH'; git reset --hard 'origin/$$BRANCH'
 
 # =============================================================================
 # Ship: the "are we good?" gate. Always tests the *current branch*.
