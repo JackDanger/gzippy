@@ -123,4 +123,66 @@ mod tests {
         assert_eq!(out, payload);
         assert_eq!(result.total_size, payload.len());
     }
+
+    /// Regression: a raw deflate stream ends mid-byte, but
+    /// `total_bits = deflate_data.len() * 8` counts the whole last byte,
+    /// so `total_bits - furthest_decoded_bit` lands in 1..=7 (gzip's
+    /// byte-alignment padding). `chunk_fetcher::consumer_loop` then
+    /// scheduled a sub-byte "chunk" for that padding, and
+    /// `decode_chunk_isal_impl` spun forever on `read_stream`'s
+    /// NONE + 0-bytes (input-exhausted) result — the decode never
+    /// returned.
+    ///
+    /// A deflate stream's bit-length mod 8 is ~uniform, so one fixture
+    /// would miss the bug ~1/8 of the time (stream happens to end
+    /// byte-aligned). Four independent fixtures drop that to ~0.02%.
+    /// 16 MiB of incompressible data compresses ~1:1, so a 1 MiB chunk
+    /// size yields ~16 partitions and the consumer reaches the tail.
+    /// Each decode runs on a worker thread under a hard 60s bound: a
+    /// hang must fail this test, not wedge the whole suite.
+    #[test]
+    fn read_parallel_sm_does_not_hang_on_eof_padding_tail() {
+        let seeds: [u64; 4] = [
+            0x9e3779b97f4a7c15,
+            0xc2b2ae3d27d4eb4f,
+            0x165667b19e3779f9,
+            0xff51afd7ed558ccd,
+        ];
+        for (i, seed) in seeds.into_iter().enumerate() {
+            let mut original = vec![0u8; 16 * 1024 * 1024];
+            let mut state = seed;
+            for b in &mut original {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *b = (state >> 33) as u8;
+            }
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+            enc.write_all(&original).unwrap();
+            let gzip = enc.finish().unwrap();
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            let original_len = original.len();
+            let handle = std::thread::spawn(move || {
+                let mut out = Vec::with_capacity(original_len);
+                let res = read_parallel_sm(&gzip, &mut out, 16, 1024 * 1024);
+                let _ = tx.send((res, out));
+            });
+
+            match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                Ok((res, out)) => {
+                    if let Err(e) = res {
+                        panic!("read_parallel_sm errored (seed {i}): {e:?}");
+                    }
+                    assert_eq!(out, original, "parallel-SM output mismatch (seed {i})");
+                    handle.join().unwrap();
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "read_parallel_sm did not return within 60s (seed {i}) — \
+                     parallel-SM hang on the gzip EOF byte-alignment padding tail"
+                ),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("decode thread panicked (seed {i})")
+                }
+            }
+        }
+    }
 }
