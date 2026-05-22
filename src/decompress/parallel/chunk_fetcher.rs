@@ -520,6 +520,20 @@ fn consumer_loop<W: std::io::Write>(
             next_block_offset
         };
 
+        // A sub-byte span between `decode_start` and the end of the
+        // deflate data is gzip end-of-stream byte-alignment padding
+        // (0-7 zero bits before the 8-byte footer), not a deflate
+        // block — the smallest complete block is ~10 bits, so this
+        // fragment carries no decodable content. Handing it to the
+        // parallel decode path spins forever: the ISA-L stopping-point
+        // patch does not terminate `isal_inflate` on a sub-block
+        // fragment. rapidgzip avoids this by never scheduling such a
+        // chunk; mirror that here.
+        if total_bits.saturating_sub(decode_start) < 8 {
+            next_unprocessed_block_index += 1;
+            continue;
+        }
+
         // Vendor GzipChunkFetcher.hpp:329 —
         //   `chunkData = getBlock(*nextBlockOffset, m_nextUnprocessedBlockIndex)`
         // which calls `BaseType::get(*nextBlockOffset, blockIndex,
