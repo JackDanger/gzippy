@@ -113,6 +113,7 @@ fn decode_chunk_isal_impl(
 
         let decode_base = already_decoded;
         while n_bytes_read < buffer.len() && !stopping_point_reached {
+            let bit_before_read = wrapper.tell_compressed();
             let r = wrapper.read_stream(&mut buffer[n_bytes_read..])?;
             last_per_call = r.bytes_written;
             n_bytes_read += last_per_call;
@@ -121,6 +122,32 @@ fn decode_chunk_isal_impl(
             last_stopped_at = r.stopped_at;
             last_finished = r.finished;
             last_end_bit = r.bit_position;
+
+            // Defense-in-depth termination guard. If `read_stream` made
+            // no progress whatsoever — no output, no stopping point, not
+            // finished, and the compressed cursor did not advance — then
+            // ISA-L is exhausted on this input and every further call
+            // would stall identically (the input is fixed; `read_stream`
+            // already looped internally until `!made_progress`). Finalize
+            // the chunk here instead of spinning forever.
+            //
+            // In production `consumer_loop`'s sub-byte-tail guard means a
+            // chunk too small to hold a deflate block is never scheduled;
+            // this is the backstop for any future caller that hands
+            // `decode_chunk_isal` such a fragment directly.
+            //
+            // A genuinely truncated stream also stalls here; its
+            // already-decoded prefix is kept (appended by earlier
+            // iterations) and the short finalize is caught downstream by
+            // CRC32/ISIZE verification.
+            if r.bytes_written == 0
+                && r.stopped_at == StoppingPoints::NONE
+                && !r.finished
+                && r.bit_position == bit_before_read
+            {
+                stopping_point_reached = true;
+                break;
+            }
 
             // END_OF_STREAM must be detected even when ISA-L reports
             // `finished` on the same call — `read_stream` returns both
@@ -770,5 +797,40 @@ mod tests {
         let chunk1 = decode_chunk_isal(deflate, resume_at, resume_at + spacing_bits, &tail, cfg)
             .expect("chunk1 at chunk0 end");
         assert!(!chunk1.is_empty());
+    }
+
+    /// Regression for the parallel-SM hang. Given a sub-block input
+    /// fragment — the gzip end-of-stream byte-alignment padding (0-7
+    /// zero bits before the footer) — `read_stream` can make no
+    /// progress, and `decode_chunk_isal_impl`'s decode loop used to
+    /// call it forever. `decode_chunk_isal` must instead return.
+    ///
+    /// The decode runs in a child thread joined against a deadline, so
+    /// a regression fails this test instead of hanging the whole suite.
+    #[test]
+    fn decode_chunk_isal_terminates_on_sub_byte_eof_padding() {
+        let worker = std::thread::spawn(|| {
+            let cfg = ChunkConfiguration {
+                split_chunk_size: 512 * 1024,
+                max_decoded_chunk_size: 20 * 512 * 1024,
+                crc32_enabled: true,
+            };
+            // One zero byte; decode the sub-byte span [4, 8) — four
+            // zero bits, exactly an EOF byte-alignment padding tail.
+            // Fresh wrapper, NEW_HDR, stopping points set — same shape
+            // as the production chunk in the gdb backtrace.
+            let _ = decode_chunk_isal(&[0u8], 4, 8, &[], cfg);
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !worker.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decode_chunk_isal did not return on a sub-byte EOF-padding \
+                 fragment: isal_inflate is spinning"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        worker.join().expect("decode worker panicked");
     }
 }

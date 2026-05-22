@@ -124,24 +124,21 @@ mod tests {
         assert_eq!(result.total_size, payload.len());
     }
 
-    /// Regression: a raw deflate stream ends mid-byte, but
-    /// `total_bits = deflate_data.len() * 8` counts the whole last byte,
-    /// so `total_bits - furthest_decoded_bit` lands in 1..=7 (gzip's
-    /// byte-alignment padding). `chunk_fetcher::consumer_loop` then
-    /// scheduled a sub-byte "chunk" for that padding, and
-    /// `decode_chunk_isal_impl` spun forever on `read_stream`'s
-    /// NONE + 0-bytes (input-exhausted) result — the decode never
-    /// returned.
+    /// High-thread parallel-SM stress: 16 MiB of incompressible data per
+    /// fixture (compresses ~1:1 into many stored blocks) decoded at
+    /// T=16, four PRNG seeds varying the block layout. Each decode runs
+    /// on a worker thread under a hard 60s bound, so any hang in the
+    /// parallel driver fails this test instead of wedging the suite.
     ///
-    /// A deflate stream's bit-length mod 8 is ~uniform, so one fixture
-    /// would miss the bug ~1/8 of the time (stream happens to end
-    /// byte-aligned). Four independent fixtures drop that to ~0.02%.
-    /// 16 MiB of incompressible data compresses ~1:1, so a 1 MiB chunk
-    /// size yields ~16 partitions and the consumer reaches the tail.
-    /// Each decode runs on a worker thread under a hard 60s bound: a
-    /// hang must fail this test, not wedge the whole suite.
+    /// This is a general integration guard, NOT the deterministic
+    /// regression for the EOF byte-alignment-padding hang — that hang
+    /// only triggers when `consumer_loop` schedules a sub-byte tail
+    /// chunk, which depends on the exact confirmed-block layout and is
+    /// not reliably forced here. The deterministic reproducer for it
+    /// lives in `gzip_chunk` — see
+    /// `decode_chunk_isal_terminates_on_sub_byte_eof_padding`.
     #[test]
-    fn read_parallel_sm_does_not_hang_on_eof_padding_tail() {
+    fn read_parallel_sm_roundtrip_incompressible_high_thread() {
         let seeds: [u64; 4] = [
             0x9e3779b97f4a7c15,
             0xc2b2ae3d27d4eb4f,
