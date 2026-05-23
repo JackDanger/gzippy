@@ -2966,12 +2966,13 @@ impl<'a> ResumableInflate<'a> {
     /// 32-KiB sliding window for cross-chunk backrefs (mirrors ISA-L `set_dict`).
     pub fn set_window(&mut self, window: &[u8]) -> Result<()> {
         self.session.clear();
-        self.user_emitted = 0;
         let take = window.len().min(32768);
         if take > 0 {
             self.session
                 .extend_from_slice(&window[window.len() - take..]);
         }
+        // Dictionary bytes are for backref resolution only — never re-emit them.
+        self.user_emitted = self.session.len();
         Ok(())
     }
 
