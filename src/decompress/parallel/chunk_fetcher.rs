@@ -74,7 +74,7 @@ use crate::decompress::parallel::gzip_chunk::{
     decode_chunk_isal, decode_chunk_marker_bootstrap_then_isal,
 };
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-use crate::decompress::parallel::prefetcher::FetchNextAdaptive;
+use crate::decompress::parallel::prefetcher::FetchMultiStream;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::raw_block_finder::RawBlockFinderCoordinator;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
@@ -168,11 +168,12 @@ impl From<ChunkDecodeError> for FetchError {
     }
 }
 
-/// Default `FetchNextAdaptive` memory size (vendor Prefetcher.hpp uses
-/// per-instance values from ParallelGzipReader; 32 biases toward longer
-/// sequential runs).
+/// Vendor production defaults for `FetchMultiStream`
+/// (ParallelGzipReader.hpp:85, Prefetcher.hpp:234-336).
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-const FETCH_STRATEGY_MEMORY: usize = 32;
+const FETCH_MEMORY_PER_STREAM: usize = 3;
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+const FETCH_MAX_STREAM_COUNT: usize = 16;
 
 // ── Worker pool job parameters ───────────────────────────────────────────
 
@@ -296,11 +297,11 @@ pub fn drive<W: std::io::Write>(
     let cache_capacity = pool_size * 2;
     let prefetch_capacity = pool_size * 2;
     let block_fetcher: Arc<
-        BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive, ChunkDecodeError>,
+        BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
     > = Arc::new(BlockFetcher::new(
         cache_capacity,
         prefetch_capacity,
-        FetchNextAdaptive::new(FETCH_STRATEGY_MEMORY),
+        FetchMultiStream::new(FETCH_MEMORY_PER_STREAM, FETCH_MAX_STREAM_COUNT),
         pool_size,
     ));
 
@@ -462,7 +463,7 @@ fn consumer_loop<W: std::io::Write>(
     writer: &mut W,
     total_bits: usize,
     block_finder: &GzipBlockFinder,
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive, ChunkDecodeError>>,
+    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
     block_map: &BlockMap,
     window_map: &WindowMap,
     unsplit_blocks: &UnsplitBlocks,
@@ -1034,7 +1035,7 @@ fn submit_decode_to_pool(
     input: InputSlice,
     params: DecodeParams,
     window_map: &WindowMap,
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive, ChunkDecodeError>>,
+    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
     configuration: ChunkConfiguration,
 ) -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
     if trace::is_enabled() {
@@ -1095,7 +1096,7 @@ fn run_decode_task(
     input: InputSlice,
     params: DecodeParams,
     window_map: &WindowMap,
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive, ChunkDecodeError>>,
+    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
     configuration: ChunkConfiguration,
 ) -> Result<Arc<ChunkData>, ChunkDecodeError> {
     // SAFETY: `drive`'s contract — input outlives the thread pool.
@@ -1456,7 +1457,7 @@ fn drain_one_pending<W: std::io::Write>(
     writer: &mut W,
     total_crc: &mut CRC32Calculator,
     total_size: &mut usize,
-    block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchNextAdaptive, ChunkDecodeError>,
+    block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
 ) -> Result<(), FetchError> {
     let head = match pending.pop_front() {
         Some(h) => h,

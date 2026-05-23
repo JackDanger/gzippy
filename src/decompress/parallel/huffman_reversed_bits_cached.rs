@@ -34,6 +34,10 @@ impl<const MAX_SYMBOL_COUNT: usize> HuffmanCodingReversedBitsCached<MAX_SYMBOL_C
         self.base.is_valid()
     }
 
+    pub fn max_code_length(&self) -> u8 {
+        self.base.base.max_code_length
+    }
+
     /// Mirror of `initializeFromLengths` (ReversedBitsCached.hpp:41-101).
     pub fn initialize_from_lengths(
         &mut self,
