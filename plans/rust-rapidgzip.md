@@ -1,5 +1,7 @@
 # Rapidgzip → gzippy parallel single-member: architectural completion
 
+*Last verified against commit `2345dbc`.*
+
 **Scope.** `src/decompress/parallel/` and the surfaces it touches. One
 structural port of rapidgzip's `ParallelGzipReader → GzipChunkFetcher →
 BlockFetcher → GzipChunk → IsalInflateWrapper` chain. GNU-gzip family
@@ -16,7 +18,9 @@ T=4 is *slower* than T=1 on a 24 MiB low-entropy fixture. The test
 applies a tight 1.5× threshold on ≥4-core hosts and a relaxed 3.0×
 threshold on <4-core hosts (`routing.rs:507`); GHA CI runners are
 typically <4 cores, so the failure surfaces only on neurotic via
-`make test-x86_64`. End state: ratio < 0.5 on the same host.
+`make test-x86_64`. End state: ratio < 0.5 on the same host. (If `make test-x86_64`
+on neurotic currently shows ratio ≤ 1.5, re-measure — the 1.72
+figure may be stale.)
 
 **Incompleteness marker.** Every parallel module carries
 `#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are
@@ -66,6 +70,25 @@ without them.
 
 The diff against current code does not move any of the above.
 
+## Routing and sizing facts
+
+Three size thresholds frame the motivating signal and the gap items
+below.
+
+| Gate | Location | Value |
+|---|---|---|
+| Classifier parallel-SM eligibility | `decompress/mod.rs:81 MIN_PARALLEL_COMPRESSED` | compressed ≥ **10 MiB** |
+| Internal `decompress_parallel` floor | `single_member.rs:32 MIN_PARALLEL_SIZE` | deflate body ≥ **4 MiB** |
+| Perf-guard fixture | `routing.rs:453` | 24 MiB raw → ~12 MiB gzip |
+
+`adjusted_chunk_size_bytes` (`single_member.rs:66-79`) shrinks the
+default 4 MiB chunk when `file_size < 2 × default × parallelization`;
+on the 24 MiB perf fixture at T = 4 this still yields only ~3 chunks,
+so the motivating ratio = 1.72 is partly under-partition pressure on
+top of any page-fault cost. *Parallel block-finding* (below) targets
+the under-partition; *Per-thread allocator arena* (below) targets the
+faults.
+
 ## The gap
 
 ### Per-thread allocator arena for chunk buffers
@@ -103,7 +126,12 @@ pub struct ChunkData {
 
 `ThreadArenaAlloc` is a `Copy + Send` ZST wrapping `mimalloc` (mature;
 preferred) or `rpmalloc-rs` (closer vendor analogue but less
-maintained). Per-thread init is lazy, matching vendor 64.
+maintained). Per-thread init is lazy, matching vendor 64. The
+motivating metric is rapidgzip + rpmalloc
+(`LIBRAPIDARCHIVE_WITH_RPMALLOC`); mimalloc is fine for first
+implementation, but if validation gate (5)'s `minor-faults` 1.5×
+bound is missed, switch to `rpmalloc-rs` before declaring this
+pillar complete.
 `chunk_buffer_pool.rs` is keyed per worker index — `take_u8(worker_id)`
 / `return_u8(worker_id, buf)`. The take path becomes lock-free per
 worker; cross-thread returns (the `Arc<ChunkData>` `Drop` may run on a
@@ -111,15 +139,17 @@ post-process worker, not the decoder that allocated) stay supported
 via a fallback enqueue.
 
 **Modules touched.** `chunk_data.rs` (two fields, ~30 constructor /
-accessor call sites), `chunk_buffer_pool.rs` (thread-local), every
-test that constructs `ChunkData` directly. `Cargo.toml` adds
+accessor call sites), `chunk_buffer_pool.rs` (per-worker-index pools),
+every test that constructs `ChunkData` directly. `Cargo.toml` adds
 `allocator-api2 = "0.2"` and `mimalloc` behind a feature gate
 `arena-allocator`.
 
 **Risks.** `allocator-api2::Vec` does not expose every `std::Vec`
-method; `extend_from_slice` / `extend` callsites at
-`gzip_chunk.rs:650`, `:665`, `:677`, `:690` are supported, but audit
-every `extend`. Do not pre-warm pages at process start — that
+method. The production `extend_from_slice` callsites on the two
+buffers are `chunk_data.rs:337` (`append_markered` →
+`data_with_markers`), `:355` (`append_clean` → `data`), and `:426`
+(`append_owned_buffer` → `data`). Audit those plus every other
+`extend` on either field. Do not pre-warm pages at process start — that
 experiment was −50% throughput on the bench (`chunk_buffer_pool.rs:68-72`).
 The per-thread arena pays its init cost once per worker, amortising
 across all chunks that worker handles.
@@ -151,7 +181,7 @@ macOS: `thread_policy_set(THREAD_AFFINITY_POLICY)` — Apple's policy
 is advisory, no-op on Apple Silicon; benign. The `core_affinity` crate
 is already a dep and no-ops where unsupported.
 
-### `StreamedResults` for both block-finder output and ordered drain
+### `StreamedResults` for async raw-finder coordination
 
 **Vendor.** `core/StreamedResults.hpp:27-158`:
 `std::deque<Value>` + mutex + condvar. Push-side never blocks; read
@@ -201,25 +231,29 @@ block-finding (next item) and the prefetch wait-with-timeout
 
 ### Parallel block-finding on the production slow path
 
-**Vendor.** `core/ParallelBitStringFinder.hpp:35-265` parallelises the
-bit-string scan via a worker-pool fan-out. `chunkSize` at vendor
-91–115 picks the per-task range; offsets stream out through a
-`StreamedResults`-shaped queue.
-
-**Now.** `block_finder.rs:1034 find_blocks_parallel` exists — vendored
-in shape — but its callers are only tests (lines 1274, 1302, 1314).
+**Now.** `block_finder.rs:1034 find_blocks_parallel` already exists,
+already does fan-out + merge with a `+1024`-bit boundary overlap at
+`:1065` — but its only callers are tests (lines 1274, 1302, 1314).
 The production slow path at `chunk_fetcher.rs:1344` calls
-`finder.find_blocks(chunk_begin, chunk_end)` from
-`block_finder.rs:668` — single-threaded, on the consumer, inside a
-64-iteration loop (`chunk_fetcher.rs:1321-1322`; constants are in
-bits: `CHUNK_SIZE_BITS = 65 536` ≈ 8 KiB scanned per iteration,
+single-threaded `finder.find_blocks(chunk_begin, chunk_end)` from
+`block_finder.rs:668` on the consumer, inside a 64-iteration loop
+(`chunk_fetcher.rs:1321-1322`; constants are in bits:
+`CHUNK_SIZE_BITS = 65 536` ≈ 8 KiB scanned per iteration,
 `MAX_SCAN_BITS = 4 Mib` ≈ 512 KiB total window).
 
-**Work.** Pass `thread_pool: &Arc<ThreadPool>` into
-`speculative_decode_find_boundary` (`chunk_fetcher.rs:1315`), fan out
-per-sub-chunk scans via `ThreadPool::submit`, join via
-`Future::wait`. Activation threshold: `chunkSize` rule from vendor 91
-— inputs below ~16 KiB stay single-threaded.
+**Work.** Wire `speculative_decode_find_boundary`
+(`chunk_fetcher.rs:1315`) through the existing `find_blocks_parallel`,
+rehosted on `Arc<ThreadPool>` (not `std::thread::scope`) and the
+per-worker buffer pool. Activation threshold: vendor's `chunkSize`
+rule (`core/ParallelBitStringFinder.hpp:91-115`) — inputs below
+~16 KiB stay single-threaded.
+
+**Optional second layer.** `core/ParallelBitStringFinder.hpp:35-265`
+(vendor's general parallelised bit-string scan, offsets streamed
+through a `StreamedResults`-shaped queue) is worth porting *only* if
+profiling after `find_blocks_parallel` is wired shows the LUT scan
+itself is still the bottleneck on real fixtures. Evaluate after the
+production rehost, not before.
 
 **Why it's part of the unit.** Without the per-thread arena, the
 fan-out's N concurrent allocations of LUT scratch fault fresh pages —
@@ -249,8 +283,9 @@ dispatch ahead of the dynamic-Huffman scan; hits short-circuit the
 slow path (no trial decode needed).
 
 Both are necessary because the *rate* of slow-path triggering is high
-on input classes gzippy itself emits. The marker-bootstrap bug is
-fixed; the *finder coverage* gap remains.
+on pigz-shaped and stored-block inputs — both common in the wild as
+fleet input classes. The marker-bootstrap bug is fixed; the
+*finder coverage* gap remains.
 
 ### Cached-bits Huffman for the marker-bootstrap inner loop
 
@@ -305,6 +340,40 @@ uses for the same job are absent.
 Swap the import in `deflate_block.rs:222-228`. Retain
 `huffman_symbols_per_length.rs` as the long-code fallback (codes
 exceeding `LUT_BITS_COUNT`).
+
+**Bootstrap decode matrix:**
+
+| Block type | x86 today | Target |
+|---|---|---|
+| Dynamic (BTYPE=10) | `IsalLitLenCode` / ISA-L | keep |
+| Fixed (BTYPE=01) | `HuffmanCodingSymbolsPerLength` (one bit per symbol) | `HuffmanCodingReversedBitsCached` |
+| Stored (BTYPE=00) | dynamic finder rejects → tail byte walk | `Uncompressed` finder (above) |
+
+### Opportunistic prefetch promotion
+
+**Vendor.** `core/BlockFetcher.hpp:427 processReadyPrefetches` is
+called from `prefetchNewBlocks` (vendor 463) before issuing a new
+prefetch. It walks `m_prefetching` for receivers whose
+`future.wait_for(0s) == future_status::ready`, takes them, and inserts
+the result into `prefetch_cache` — so workers don't idle on
+prefetches that completed while the consumer was elsewhere.
+
+**Now.** `block_fetcher.rs:575-588` documents the deliberate omission:
+"we don't yet poll-collect ready prefetches into the prefetch_cache
+because the worker pool's mpsc::Receiver doesn't expose a
+non-blocking `wait_for(0s)` equivalent…". The premise is stale —
+`mpsc::Receiver::try_recv()` is exactly that non-blocking poll. The
+comment's fallback reasoning ("consumer will take them via
+getFromCaches on the next iteration") only holds for a *hot*
+consumer; on finder-bottlenecked decodes the consumer waits on a
+*different* key while a ready prefetch sits in `prefetching` unused.
+
+**Work.** Add `process_ready_prefetches(&self)` to `block_fetcher.rs`:
+iterate `prefetching: HashMap<Key, Receiver<…>>`, call `try_recv` on
+each, on `Ok(value)` insert into `prefetch_cache` and remove from
+`prefetching`. Call it from `prefetch_new_blocks` before each new
+dispatch (mirroring vendor 463) and from `consumer_loop` once per
+outer iteration. Strip the now-stale comment block at `:575-588`.
 
 ### `FetchMultiStream`
 
@@ -378,14 +447,25 @@ the gate, not the merge order.
 
 ## Validation gate
 
-All on `neurotic` (16 physical x86_64, ISA-L). Local `make` is
-insufficient — the ratio=1.72 regression triggers only at ≥4 physical
-cores.
+All on `neurotic` (16 physical x86_64, ISA-L), driven by
+`make test-x86_64` (pushes the branch, runs the `routing` suite over
+SSH). Local `make` is insufficient — the ratio=1.72 regression
+triggers only at ≥4 physical cores.
 
-1. `cargo test --release -- test_single_member_parallel_not_slower_than_sequential`
-   reports `ratio < 0.5`. Capture printed `seq_mbps`, `par_mbps`,
-   `ratio`. Floor for `par_mbps`: ≥2× sequential libdeflate throughput
-   on the same fixture (~600 MB/s baseline on neurotic).
+1a. **Synthetic perf guard.**
+    `cargo test --release -- test_single_member_parallel_not_slower_than_sequential`
+    reports `ratio < 0.5` at T = `min(16, num_cpus::get_physical())` on
+    the 24 MiB low-entropy synthetic fixture. Capture printed
+    `seq_mbps`, `par_mbps`, `ratio`. Floor for `par_mbps`: ≥ 2×
+    sequential libdeflate throughput on the same fixture (~600 MB/s
+    baseline on neurotic). T = 4 stays as an optional regression
+    canary.
+
+1b. **Real-corpus perf guard.** Add
+    `test_single_member_parallel_silesia` (or rely on gate (5)
+    wall-time, which subsumes it): same ratio < 0.5 bar at the same
+    T on the real Silesia corpus. Synthetic-only is friendly to
+    speculation; the real corpus is the honest gate.
 
 2. `cargo test --release -- test_single_member_routing_multithread`
    passes byte-perfect, and `MARKER_PIPELINE_RUNS`
@@ -396,10 +476,14 @@ cores.
    passes (header-parse / partition-offset interaction).
 
 4. Every `#![allow(dead_code)] // vendor-faithful rapidgzip port`
-   removed from `src/decompress/parallel/*.rs`.
-   `cargo build --release -- -D warnings` succeeds. The allows are
-   the structural signal that exported symbols lack callers; removing
-   them is the closure proof.
+   removed from the **production SM hot-path modules** in
+   `src/decompress/parallel/*.rs`. Out-of-scope seekable scaffolding
+   (`UnsplitBlocks`, `block_map`, the subchunk index — listed in
+   *Out of scope*) keeps its allow behind
+   `#[cfg(feature = "seekable-index")]`; those modules stay dead
+   until the seekable reader lands, which is not in this unit.
+   `cargo build --release -- -D warnings` succeeds for the hot-path
+   set.
 
 5. `perf stat -e dTLB-load-misses,major-faults,minor-faults,cycles
    ./target/release/gzippy -d -c silesia.tar.gz > /dev/null`
@@ -408,16 +492,20 @@ cores.
    the same host. Required: gzippy `minor-faults` within 1.5× of
    rapidgzip's; gzippy wall-time within 1.2× of rapidgzip's. Capture
    exact baseline numbers when the first item lands (rapidgzip is
-   already installable on neurotic via `pip install rapidgzip`); the
-   1.2× / 1.5× bounds are relative to that capture.
+   installable on neurotic via `pip install rapidgzip`); the 1.2× /
+   1.5× bounds are relative to that capture.
 
-6. `GZIPPY_VERBOSE=1 ./target/release/gzippy -d -c <fixture>` (stats
-   dump at `chunk_fetcher.rs:384-438`): `Slow-path decode: ok > 0
-   and fail < 0.1 × ok`; `Buffer pool u8: misses < 0.05 × hits`;
-   `Prefetch guard-rejects` does not grow with input size. (6) is
-   diagnostic — use to localise which item regressed if (1)–(5) miss.
+6. **Diagnostic only.** `GZIPPY_VERBOSE=1
+   ./target/release/gzippy -d -c <fixture>` (stats dump at
+   `chunk_fetcher.rs:384-438`): `Slow-path decode: ok > 0 and
+   fail < 0.1 × ok`; `Buffer pool u8: misses < 0.05 × hits`;
+   `Prefetch guard-rejects` does not grow with input size. For
+   partition-level regressions add `GZIPPY_LOG_FILE=/tmp/sm.log
+   ./target/release/gzippy -d -c <fixture>` and post-process with
+   `scripts/parallel_sm_log_summary.py`. Use (6) to localise which
+   item regressed if (1a)–(5) miss.
 
-If any of (1)–(5) miss, the unit didn't land — a single item's gap
+If any of (1a)–(5) miss, the unit didn't land — a single item's gap
 broke a cross-pillar invariant.
 
 ## Reading order for picking this up cold
@@ -434,180 +522,3 @@ broke a cross-pillar invariant.
    before changing the corresponding gzippy module.
 
 The vendor citations are the spec.
-
----
-
-## Appendix: review corrections (integrate into body above)
-
-Second-pass review against vendor sources and current gzippy tree. Opus
-should merge these into the main sections and delete this appendix once
-done.
-
-### A1. `StreamedResults` — wrong dual callsite (critical)
-
-**Main doc claim (§ StreamedResults):** vendor uses `StreamedResults` for
-both ordered drain (`m_markersBeingReplaced`) and `BlockFinder` output.
-
-**Correction:** only one vendor callsite.
-
-| Mechanism | Vendor type | gzippy analogue |
-|---|---|---|
-| Post-process ordering | `PostProcessingFutures` = `std::map<size_t, std::future<void>>` (`GzipChunkFetcher.hpp:48`, member at `:783`) | `VecDeque<PendingWrite>` + `mpsc::Receiver` (`chunk_fetcher.rs:475`) — **already correct** |
-| Async raw-finder scan DB | `StreamedResults<size_t>` inside `core/BlockFinder<RawFinder>` (`BlockFinder.hpp:202`) | **missing** — not `GzipBlockFinder` |
-| Partition spacing | `GzipBlockFinder` = `std::deque` + mutex; `get(idx, timeout)` ignores timeout (`GzipBlockFinder.hpp:120-157`) | `gzip_block_finder.rs` — **already correct shape** |
-
-**Do not:** replace `pending: VecDeque<PendingWrite>` with
-`StreamedResults<PendingWrite>`. That is not vendor-faithful.
-
-**Do:** port `streamed_results.rs` for a future `core_block_finder.rs`
-(async wrapper around pigz/dynamic/uncompressed raw finders) OR for the
-slow-path scan coordinator join inside `speculative_decode_find_boundary`.
-Wire `get(idx, timeout)` blocking there so prefetch/decode can overlap
-finder fan-out — mirror `BlockFetcher.hpp:518` (`0.0001` s timeout on
-`m_blockFinder->get`), which applies when the finder is the async
-`core/BlockFinder` wrapper, not `GzipBlockFinder`.
-
-**Remove or rewrite** “Smallest viable work item: land `streamed_results.rs`
-and consume it in `gzip_block_finder.rs`” — wrong target module.
-
-**Coherence fix:** “StreamedResults ↔ parallel block-finding” is valid for
-**async raw-finder join**, not for `GzipBlockFinder` or post-process ordering.
-
-### A2. Parallel scan — reuse `find_blocks_parallel`, don't greenfield
-
-**Main doc claim:** port `ParallelBitStringFinder` into production slow path.
-
-**Correction:** `block_finder.rs:1034` **`find_blocks_parallel`** already
-exists (fan-out + merge, `+1024`-bit overlap at `:1065`). Callers today
-are **tests only** (`:1244`, `:1273`, `:1298`). Production slow path at
-`chunk_fetcher.rs:1344` calls single-threaded `finder.find_blocks`.
-
-**Work should say:** wire `speculative_decode_find_boundary` through existing
-`find_blocks_parallel`, rehosted on `Arc<ThreadPool>` (not
-`std::thread::scope`) + per-worker buffer pool id. Evaluate whether
-`ParallelBitStringFinder.hpp` adds anything beyond what
-`find_blocks_parallel` + pigz/uncompressed finders already provide before
-porting another scan layer.
-
-### A3. Fixed-Huffman decoder missing from pillar 3
-
-**Main doc:** ports `HuffmanCodingShortBitsCachedDeflate` +
-`HuffmanCodingShortBitsMultiCached` only.
-
-**Correction:** on x86, **dynamic** bootstrap already uses ISA-L tables
-(`deflate_block.rs:864-878`). **Fixed** blocks explicitly bypass ISA-L and
-use canonical decode because ISA-L's fixed-table LUT is incomplete
-(`deflate_block.rs:836-857`, cites vendor `deflate.hpp:195-196`). Vendor
-uses **`HuffmanCodingReversedBitsCached`** for fixed Huffman, not
-ShortBitsCached.
-
-Slow-path tail walk (`chunk_fetcher.rs:1369-1374`) targets fixed/stored
-tails. Add to pillar 3:
-
-- `huffman_reversed_bits_cached.rs` ← vendor fixed path
-- Wire in `read_internal_compressed_canonical_specialized` before or
-  alongside ShortBitsCached
-
-**Bootstrap decode matrix (add to doc):**
-
-| Block type | x86 today | Target |
-|---|---|---|
-| Dynamic | `IsalLitLenCode` / ISA-L | keep |
-| Fixed | `HuffmanCodingSymbolsPerLength` (one bit/symbol) | ReversedBitsCached |
-| Stored | dynamic finder rejects → tail byte walk | Uncompressed finder |
-
-### A4. `PigzStringView` motivation — soften PipelinedGzEncoder claim
-
-**Main doc:** “`PipelinedGzEncoder` produces this shape, so gzippy frequently
-decodes pigz-shaped input.”
-
-**Correction:** pigz's `00 00 ff ff` sync-flush is **pigz output**, a major
-**fleet input class** (silesia-pigz losses). No verified emission of that
-pattern from `src/compress/pipelined.rs`. Rephrase: “pigz-compressed inputs
-and pigz-shaped single-member streams”; add a reproducer test if claiming
-gzippy-generated output.
-
-### A5. Per-thread arena — worker-index lifecycle, not TLS alone
-
-**Main doc:** collapse `chunk_buffer_pool` to thread-local storage; remove
-cross-thread `Mutex`.
-
-**Correction:** buffers are returned on **`Arc<ChunkData>` drop**, often on
-the post-process worker, while the next decode may run on a **different**
-pool worker. Vendor rpmalloc amortises **malloc/free on the same OS thread**
-(`FasterVector.hpp:64` `thread_local RpmallocThreadInit`).
-
-**Add invariant:** `take_u8(worker_id)` / `return_u8(worker_id, buf)` from
-decode **and** post-process closures using the same `worker_id` obtained
-from `ThreadPool` TLS in `worker_main`. Debug-assert
-`pool_id == current_worker()` on return. “Thread-local pool” without
-worker-index keyed take/return will not close the 40% → 17% gap.
-
-### A6. mimalloc vs rpmalloc — tie to perf gate (5)
-
-**Main doc:** prefer mimalloc for maintainability.
-
-**Correction:** the motivating metric compares to **rapidgzip + rpmalloc**
-(`LIBRAPIDARCHIVE_WITH_RPMALLOC`). mimalloc is fine for first implementation
-velocity; **gate (5) is authoritative**. If `minor-faults` miss 1.5×
-rapidgzip after mimalloc, switch to `rpmalloc-rs` before declaring pillar 1
-complete. Document both behind `feature = "arena-allocator"`.
-
-### A7. Validation gate fixes
-
-**Gate (1) — thread count:** motivating ratio 1.72 is at **T=4** on 16
-physical cores; perf gate (5) compares rapidgzip **-P 16**. North-star
-gate (1) should require ratio < 0.5 at
-**T = min(16, num_cpus::get_physical())**, not T=4 alone. Keep T=4 as an
-optional regression canary.
-
-**Gate (1) — fixture split:** current test uses **24 MiB low-entropy
-synthetic** (friendly to speculation). Gate (5) uses **silesia.tar.gz**
-(~1.4 GB, hard). State explicitly:
-
-- Gate (1a): synthetic, ratio < 0.5 at T=max — algorithmic parallel win.
-- Gate (1b): add `test_single_member_parallel_silesia_*` on neurotic —
-  same ratio bar on real corpus (or gate (5) wall-time subsumes this).
-
-**Gate (4) — dead_code allows:** “remove every `#![allow(dead_code)]` from
-`parallel/*.rs`” conflicts with **out-of-scope seekable scaffolding**
-(`UnsplitBlocks`, `block_map`, subchunk index — listed in Out of scope).
-Scope gate (4) to **production SM hot-path modules** only, with an explicit
-allowlist or `#[cfg(feature = "seekable-index")]` for index/scaffolding
-files.
-
-**Homelab entrypoint:** add `make test-x86_64` (pushes branch, runs
-`routing` suite on neurotic) as the authoritative CI path alongside raw
-`cargo test` on the box.
-
-### A8. Routing / sizing facts to document
-
-| Gate | Location | Value |
-|---|---|---|
-| Classifier parallel SM | `decompress/mod.rs:81` `MIN_PARALLEL_COMPRESSED` | compressed ≥ **10 MiB** |
-| Internal `decompress_parallel` | `single_member.rs:32` `MIN_PARALLEL_SIZE` | deflate body ≥ **4 MiB** |
-| Perf test fixture | `routing.rs:453` | 24 MiB raw → ~12 MiB gzip |
-
-`adjusted_chunk_size_bytes` (`single_member.rs:66-78`) affects chunk count
-on the 24 MiB fixture — mention when interpreting ratio 1.72 (may be
-partly under-partitioned at T=4, not purely page-fault cost).
-
-### A9. Missing work items (add to gap list)
-
-| Item | Location | Why |
-|---|---|---|
-| `processReadyPrefetches` | `block_fetcher.rs:575-584` | Vendor moves ready prefetches into cache opportunistically; gzippy skips — workers may idle while prefetches sit in-flight |
-| Trace triage | `GZIPPY_LOG_FILE` + `scripts/parallel_sm_log_summary.py` | Gate (6) uses `GZIPPY_VERBOSE`; add log summary for partition-level regressions |
-| `FetchMultiStream` | `prefetcher.rs:13` preamble lie | Keep as honesty fix; safe to defer entirely for SM-only completion |
-
-### A10. Suggested integration order for Opus
-
-When merging this appendix into the body:
-
-1. Rewrite **§ StreamedResults** (A1) — highest impact; fixes smallest-work-item and coherence bullets.
-2. Expand **§ Cached-bits Huffman** with fixed reversed-bits (A3).
-3. Expand **§ Per-thread allocator** with worker-index lifecycle (A5).
-4. Fix **§ Parallel block-finding** to reference `find_blocks_parallel` (A2).
-5. Update **§ Validation gate** (A7) and **§ Out of scope / gate (4)** (A7).
-6. Soften pigz motivation (A4); add bootstrap matrix table (A3).
-7. Delete this appendix.
