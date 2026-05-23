@@ -180,6 +180,9 @@ pub struct ChunkData {
     /// subchunk. Internal; not part of rapidgzip's public surface but
     /// the equivalent of `decodedSize - subchunks.back().decodedOffset`.
     next_subchunk_start_decoded_offset: usize,
+    /// Worker pool index that allocated `data` / `data_with_markers`.
+    /// Buffers return to this worker's arena on drop.
+    pool_worker_index: usize,
 }
 
 impl ChunkData {
@@ -217,6 +220,7 @@ impl ChunkData {
             configuration,
             chunk_buffer_pool::take_u16(0),
             chunk_buffer_pool::take_u8(cap),
+            chunk_buffer_pool::current_worker_pool_index().unwrap_or(0),
         )
     }
 
@@ -231,6 +235,7 @@ impl ChunkData {
         configuration: ChunkConfiguration,
         data_with_markers: Vec<u16>,
         data: Vec<u8>,
+        pool_worker_index: usize,
     ) -> Self {
         debug_assert!(data_with_markers.is_empty());
         debug_assert!(data.is_empty());
@@ -257,6 +262,7 @@ impl ChunkData {
             statistics: ChunkStatistics::default(),
             configuration,
             next_subchunk_start_decoded_offset: 0,
+            pool_worker_index,
         }
     }
 
@@ -1062,8 +1068,8 @@ impl Drop for ChunkData {
         use crate::decompress::parallel::chunk_buffer_pool;
         let data = std::mem::take(&mut self.data);
         let dwm = std::mem::take(&mut self.data_with_markers);
-        chunk_buffer_pool::return_u8(data);
-        chunk_buffer_pool::return_u16(dwm);
+        chunk_buffer_pool::return_u8_to_worker(self.pool_worker_index, data);
+        chunk_buffer_pool::return_u16_to_worker(self.pool_worker_index, dwm);
     }
 }
 

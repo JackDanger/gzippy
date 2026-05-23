@@ -572,16 +572,8 @@ where
         F: Fn(usize) -> bool,
         PO: Fn(&Key) -> Key,
     {
-        // BlockFetcher.hpp:463 — processReadyPrefetches(): we don't yet
-        // poll-collect ready prefetches into the prefetch_cache because
-        // the worker pool's mpsc::Receiver doesn't expose a non-blocking
-        // `wait_for(0s)` equivalent without consuming the receiver. The
-        // exact-match `take_prefetch` branch on the consumer's `get`
-        // already takes them as soon as the consumer asks; this matches
-        // the steady-state behavior on a hot consumer. (Vendor's
-        // processReadyPrefetches is an opportunistic move; the consumer
-        // would otherwise take them via `getFromCaches` on the next
-        // iteration regardless.)
+        // BlockFetcher.hpp:463 — processReadyPrefetches() before new dispatch.
+        self.process_ready_prefetches();
 
         // BlockFetcher.hpp:465-472 — threadPoolSaturated() gate.
         // Vendor: `m_prefetching.size() + 1 >= m_threadPool.capacity()`.

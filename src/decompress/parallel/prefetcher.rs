@@ -210,6 +210,138 @@ impl FetchingStrategy for FetchNextAdaptive {
     }
 }
 
+/// Round-robin merge of same-index elements across subsequences.
+/// Mirror of `interleave` (vendor/.../core/common.hpp:496-512).
+fn interleave(subsequences: &[Vec<usize>]) -> Vec<usize> {
+    let total: usize = subsequences.iter().map(|s| s.len()).sum();
+    let max_len = subsequences.iter().map(|s| s.len()).max().unwrap_or(0);
+    let mut result = Vec::with_capacity(total);
+    for i in 0..max_len {
+        for sub in subsequences {
+            if i < sub.len() {
+                result.push(sub[i]);
+            }
+        }
+    }
+    result
+}
+
+/// Extend [`FetchNextAdaptive`] with detection of multiple interleaved
+/// sequential access streams. Mirror of `FetchMultiStream`
+/// (Prefetcher.hpp:234-336).
+#[derive(Debug)]
+pub struct FetchMultiStream {
+    adaptive: FetchNextAdaptive,
+    memory_size_per_stream: usize,
+}
+
+impl FetchMultiStream {
+    pub fn new(memory_size_per_stream: usize, max_stream_count: usize) -> Self {
+        Self {
+            adaptive: FetchNextAdaptive::new(max_stream_count * memory_size_per_stream),
+            memory_size_per_stream,
+        }
+    }
+
+    pub fn memory_size_per_stream(&self) -> usize {
+        self.memory_size_per_stream
+    }
+
+    fn memory_full(&self) -> bool {
+        self.adaptive.previous_indexes().len() >= self.adaptive.memory_size()
+    }
+}
+
+impl FetchingStrategy for FetchMultiStream {
+    fn fetch(&mut self, index: usize) {
+        self.adaptive.fetch(index);
+    }
+
+    fn last_fetched(&self) -> Option<usize> {
+        self.adaptive.last_fetched()
+    }
+
+    fn is_sequential(&self) -> bool {
+        self.adaptive.is_sequential()
+    }
+
+    fn prefetch(&self, max_amount_to_prefetch: usize) -> Vec<usize> {
+        let previous_indexes = self.adaptive.previous_indexes();
+        if previous_indexes.is_empty() {
+            return Vec::new();
+        }
+
+        if previous_indexes.len() == 1 {
+            let start = *previous_indexes.front().unwrap() + 1;
+            return (start..start + max_amount_to_prefetch).collect();
+        }
+
+        let mut sorted: Vec<usize> = previous_indexes.iter().copied().collect();
+        sorted.sort_unstable();
+
+        let mut subsequence_prefetches: Vec<Vec<usize>> = Vec::new();
+
+        let extrapolate_subsequence = |begin: usize, end: usize, out: &mut Vec<Vec<usize>>| {
+            if begin >= end {
+                return;
+            }
+            let highest_value = sorted[end - 1];
+            let mut sequence_length = 0usize;
+            let mut indexes_begin = 0usize;
+            for current_highest in (begin..end).rev() {
+                let target = sorted[current_highest];
+                if let Some(pos) = previous_indexes
+                    .iter()
+                    .skip(indexes_begin)
+                    .position(|&v| v == target)
+                {
+                    indexes_begin += pos + 1;
+                    sequence_length += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if self.memory_full() && sequence_length == 1 {
+                return;
+            }
+
+            let consecutive_values = if sequence_length <= 1 {
+                0
+            } else {
+                sequence_length
+            };
+            let saturation_count = if !self.memory_full() && consecutive_values > 0 {
+                consecutive_values
+            } else {
+                self.memory_size_per_stream
+            };
+            out.push(FetchNextAdaptive::extrapolate_forward(
+                highest_value,
+                consecutive_values,
+                saturation_count,
+                max_amount_to_prefetch,
+            ));
+        };
+
+        let mut last_range_begin = 0usize;
+        for i in 0..sorted.len() {
+            let at_end = i + 1 == sorted.len();
+            let consecutive_break = !at_end && sorted[i] + 1 != sorted[i + 1];
+            if at_end || consecutive_break {
+                let range_end = if at_end { sorted.len() } else { i + 1 };
+                extrapolate_subsequence(last_range_begin, range_end, &mut subsequence_prefetches);
+                last_range_begin = i + 1;
+            }
+        }
+
+        let mut result = interleave(&subsequence_prefetches);
+        result.retain(|value| !previous_indexes.contains(value));
+        result.truncate(max_amount_to_prefetch);
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +411,36 @@ mod tests {
         //   1 == 1 → push 3, 2, 1 in that order
         //   0 < 1 → 0
         assert_eq!(v, vec![4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn multi_stream_single_access_extrapolates_fully() {
+        let mut s = FetchMultiStream::new(3, 16);
+        s.fetch(5);
+        assert_eq!(s.prefetch(4), vec![6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn multi_stream_two_interleaved_sequences() {
+        let mut s = FetchMultiStream::new(3, 16);
+        // Two sequential streams interleaved: 10,11 and 20,21
+        s.fetch(11);
+        s.fetch(21);
+        s.fetch(10);
+        s.fetch(20);
+        let p = s.prefetch(6);
+        assert!(
+            !p.is_empty(),
+            "interleaved sequential streams should prefetch"
+        );
+        assert!(p.contains(&12) || p.contains(&22));
+    }
+
+    #[test]
+    fn interleave_round_robin() {
+        assert_eq!(
+            interleave(&[vec![1, 2], vec![10, 20, 30]]),
+            vec![1, 10, 2, 20, 30]
+        );
     }
 }

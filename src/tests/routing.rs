@@ -450,6 +450,7 @@ mod tests {
     // entirely lost regression protection on the most common CI class).
     // =========================================================================
     #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
     fn test_single_member_parallel_not_slower_than_sequential() {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
             .lock()
@@ -485,32 +486,118 @@ mod tests {
         };
 
         let seq = bench(1);
-        let par = bench(4);
+        let threads = num_cpus::get_physical().min(16);
+        let par = bench(threads);
 
         let ratio = par.as_secs_f64() / seq.as_secs_f64().max(1e-9);
         let seq_mbps = (original.len() as f64) / seq.as_secs_f64() / 1e6;
         let par_mbps = (original.len() as f64) / par.as_secs_f64() / 1e6;
         let physical = num_cpus::get_physical();
         eprintln!(
-            "single-member ({physical} physical cores): \
-             sequential={seq_mbps:.0} MB/s  parallel(T=4)={par_mbps:.0} MB/s  ratio={ratio:.2}"
+            "single-member ({physical} physical cores, T={threads}): \
+             sequential={seq_mbps:.0} MB/s  parallel={par_mbps:.0} MB/s  ratio={ratio:.2}"
         );
 
-        // Two-tier threshold (Opus advisor feedback on PR #97): on
-        // ≥4 physical cores the bar is tight (1.5×) — anything looser
-        // wouldn't catch the v0.3.0-class 1.75× algorithmic regression.
-        // On <4 physical cores keep a *relaxed* bar (3.0×) instead of
-        // disabling the assertion entirely, so a catastrophic regression
-        // on 2-core hardware (e.g. parallel path becomes 5× slower than
-        // sequential) is still caught. The structural 1.5–2.0× tax on
-        // 2-core CI is below 3.0×.
-        let threshold = if physical >= 4 { 1.5 } else { 3.0 };
+        // Validation Gate 1a (synthetic): parallel must not be slower than
+        // sequential on ≥4 physical cores (tightened from 1.5× to catch the
+        // v0.3.0-class 1.72× regression). On <4 cores keep relaxed 3.0×.
+        let threshold = if physical >= 4 { 1.0 } else { 3.0 };
         assert!(
             ratio < threshold,
             "parallel single-member must not be > {threshold:.1}× slower than sequential \
-             on {physical}-physical-core hardware: \
+             on {physical}-physical-core hardware (T={threads}): \
              par={par:?} seq={seq:?} ratio={ratio:.2}"
         );
+    }
+
+    /// Validation Gate 1b — silesia-class high-entropy fixture at
+    /// T = min(16, physical cores). Uses incompressible random data
+    /// (same entropy class as silesia) compressed with flate2 best.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    fn test_single_member_parallel_silesia_class_not_slower_than_sequential() {
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let mut original = vec![0u8; 24 * 1024 * 1024];
+        let mut state = 0x12345678u64;
+        for b in &mut original {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (state >> 32) as u8;
+        }
+        let mut compressed = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc =
+                flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::best());
+            enc.write_all(&original).unwrap();
+            enc.finish().unwrap();
+        }
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "silesia-class fixture must exceed 10 MiB parallel gate (got {} bytes)",
+            compressed.len()
+        );
+
+        let bench = |threads: usize| -> std::time::Duration {
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..3 {
+                let mut sink = Vec::with_capacity(original.len());
+                let t = std::time::Instant::now();
+                crate::decompress::decompress_single_member(&compressed, &mut sink, threads)
+                    .expect("decompress");
+                best = best.min(t.elapsed());
+                assert_eq!(sink.len(), original.len());
+            }
+            best
+        };
+
+        let threads = num_cpus::get_physical().min(16);
+        let seq = bench(1);
+        let par = bench(threads);
+        let ratio = par.as_secs_f64() / seq.as_secs_f64().max(1e-9);
+        let physical = num_cpus::get_physical();
+        eprintln!("silesia-class ({physical} physical cores, T={threads}): ratio={ratio:.2}");
+
+        let threshold = if physical >= 4 { 1.0 } else { 3.0 };
+        assert!(
+            ratio < threshold,
+            "silesia-class parallel must not be > {threshold:.1}× slower than sequential \
+             on {physical}-core hardware (T={threads}): ratio={ratio:.2}"
+        );
+    }
+
+    /// Deletion-trap: proves slow-path boundary search routes through the
+    /// async `RawBlockFinderCoordinator`, not a silent sequential fallback.
+    #[test]
+    fn test_coordinator_boundary_search_runs_on_x86_64_isal() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let original = make_btype01_heavy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip_l1(&original);
+        assert!(compressed.len() > 10 * 1024 * 1024);
+
+        let before = crate::decompress::parallel::chunk_fetcher::COORDINATOR_BOUNDARY_SEARCH_RUNS
+            .load(Ordering::Relaxed);
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        assert_eq!(output, original);
+        let after = crate::decompress::parallel::chunk_fetcher::COORDINATOR_BOUNDARY_SEARCH_RUNS
+            .load(Ordering::Relaxed);
+
+        #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+        assert!(
+            after > before,
+            "COORDINATOR_BOUNDARY_SEARCH_RUNS did not increment ({before} -> {after}); \
+             slow-path boundary search is not routing through RawBlockFinderCoordinator."
+        );
+        #[cfg(not(all(target_arch = "x86_64", feature = "isal-compression")))]
+        let _ = (before, after);
     }
 
     /// 60% random / 40% short repetition — compresses to ~60% of original.

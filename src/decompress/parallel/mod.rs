@@ -28,10 +28,14 @@ pub mod inflate_wrapper;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub mod isal_huffman;
 pub mod prefetcher;
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+pub mod raw_block_finder;
 pub mod replace_markers;
 pub mod single_member;
 pub mod sm_driver;
 pub mod statistics;
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+pub mod streamed_results;
 pub mod thread_pool;
 pub mod trace;
 pub mod window_map;

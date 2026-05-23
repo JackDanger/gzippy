@@ -289,8 +289,10 @@ impl<'a> IsalInflateWrapper<'a> {
     /// Compressed-stream bit position. Mirror of
     /// `IsalInflateWrapper::tellCompressed` (isal.hpp:69-74):
     ///
-    ///     m_bitReader.tell() - m_stream.avail_in * BYTE_SIZE
-    ///                        - m_stream.read_in_length
+    /// ```text
+    /// m_bitReader.tell() - m_stream.avail_in * BYTE_SIZE
+    ///                    - m_stream.read_in_length
+    /// ```
     pub fn tell_compressed(&self) -> usize {
         self.bit_reader_tell
             .saturating_sub(self.state.avail_in as usize * 8)

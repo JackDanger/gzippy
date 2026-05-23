@@ -1296,26 +1296,53 @@ mod tests {
 
     #[test]
     fn test_find_blocks_parallel_small_data_fallback() {
-        // Very small data: parallel should fall back to sequential
-        let data = vec![0u8; 64];
+        let mut rng_data = Vec::with_capacity(64 * 1024);
+        let mut rng: u64 = 0xabc123;
+        while rng_data.len() < 64 * 1024 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            rng_data.push((rng >> 16) as u8);
+        }
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        use std::io::Write;
+        enc.write_all(&rng_data).unwrap();
+        let data = enc.finish().unwrap();
         let sequential = BlockFinder::new(&data).find_blocks(0, data.len() * 8);
         let parallel = find_blocks_parallel(&data, 4);
         assert_eq!(
             sequential.len(),
             parallel.len(),
-            "small data: parallel must match sequential count"
+            "small span: parallel must match sequential count"
+        );
+        assert!(
+            !sequential.is_empty(),
+            "random deflate must yield at least one dynamic boundary"
         );
     }
 
     #[test]
     fn test_find_blocks_parallel_single_thread() {
-        let data = vec![0u8; 4096];
+        let mut rng_data = vec![0u8; 256 * 1024];
+        let mut rng: u64 = 0xfeedface;
+        for b in &mut rng_data {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (rng >> 16) as u8;
+        }
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        use std::io::Write;
+        enc.write_all(&rng_data).unwrap();
+        let data = enc.finish().unwrap();
         let sequential = BlockFinder::new(&data).find_blocks(0, data.len() * 8);
         let parallel = find_blocks_parallel(&data, 1);
         assert_eq!(
             sequential.len(),
             parallel.len(),
             "T1: parallel must match sequential"
+        );
+        assert!(
+            !sequential.is_empty(),
+            "random deflate must yield at least one dynamic boundary"
         );
     }
 

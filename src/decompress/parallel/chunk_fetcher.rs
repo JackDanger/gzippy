@@ -62,8 +62,6 @@ use crate::decompress::parallel::apply_window::apply_window;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::block_fetcher::BlockFetcher;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-use crate::decompress::parallel::block_finder::BlockFinder;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::block_map::{append_subchunks_to_block_map, BlockMap};
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::compressed_vector::CompressionType;
@@ -78,7 +76,11 @@ use crate::decompress::parallel::gzip_chunk::{
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::prefetcher::FetchNextAdaptive;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-use crate::decompress::parallel::thread_pool::{ThreadPinning, ThreadPool};
+use crate::decompress::parallel::raw_block_finder::RawBlockFinderCoordinator;
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+use crate::decompress::parallel::streamed_results::StreamedGetReturnCode;
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+use crate::decompress::parallel::thread_pool::ThreadPool;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use crate::decompress::parallel::trace;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
@@ -87,6 +89,8 @@ use crate::decompress::parallel::window_map::{Window, WindowMap};
 use std::borrow::Cow;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 use std::sync::mpsc;
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+use std::time::Duration;
 
 /// Materialize a `Window`'s raw bytes. Mirror of vendor's
 /// `sharedLastWindow->decompress()` call at
@@ -257,7 +261,9 @@ pub fn drive<W: std::io::Write>(
     configuration: ChunkConfiguration,
 ) -> Result<(u32, usize), FetchError> {
     let total_bits = input.len() * 8;
-    let pool_size = parallelization.max(1);
+    // Vendor `availableCores()` (AffinityHelpers.hpp:18-21): avoid pinning
+    // more workers than physical cores — SMT siblings collide on cache.
+    let pool_size = parallelization.max(1).min(num_cpus::get_physical().max(1));
 
     // ── m_blockFinder (vendor GzipChunkFetcher.hpp:283) ─────────────
     let block_finder = Arc::new(GzipBlockFinder::new(
@@ -315,7 +321,7 @@ pub fn drive<W: std::io::Write>(
     // through `submit` + `submitTaskWithHighPriority`. `Arc` so the
     // submit closure inside `BlockFetcher::get` (cloned per call) can
     // hold a reference for `ThreadPool::submit`.
-    let thread_pool = Arc::new(ThreadPool::new(pool_size, ThreadPinning::new()));
+    let thread_pool = Arc::new(ThreadPool::with_pinning_for_capacity(pool_size));
 
     // Running CRC + size accumulators. Mirror of vendor's
     // `m_crc32Calculator` + `m_totalDecompressedSize` updates inside
@@ -482,6 +488,10 @@ fn consumer_loop<W: std::io::Write>(
     // CRC) stays simple.
     #[allow(clippy::while_let_loop)] // faithful port of vendor processNextChunk loop
     loop {
+        // BlockFetcher.hpp:427 — opportunistically promote ready prefetches
+        // so workers don't idle while the consumer waits on a different key.
+        block_fetcher.process_ready_prefetches();
+
         // Vendor GzipChunkFetcher.hpp:318 — `m_blockFinder->get(m_nextUnprocessedBlockIndex)`.
         let next_block_offset = match block_finder.get(next_unprocessed_block_index) {
             (Some(offset), GetReturnCode::Success) => offset,
@@ -1265,6 +1275,13 @@ pub static SLOW_PATH_FIRST_CANDIDATE_OK: std::sync::atomic::AtomicU64 =
 pub static SLOW_PATH_FIRST_CANDIDATE_FAIL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Incremented when the slow-path boundary search uses the async
+/// `RawBlockFinderCoordinator` (StreamedResults + single finder thread).
+/// Proves production routes through the coordinator — see deletion-trap
+/// test in `src/tests/routing.rs`.
+pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Bumps once per consumer iter where the partition-keyed
 /// `try_take_prefetched` returned a chunk but the safety guard
 /// rejected it (mismatch between `chunk.max_acceptable_start_bit` and
@@ -1318,7 +1335,6 @@ fn speculative_decode_find_boundary(
     stop_hint_bit: usize,
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    const CHUNK_SIZE_BITS: usize = 8 * 1024 * 8;
     const MAX_SCAN_BITS: usize = 512 * 1024 * 8;
     let input_bits = input.len() * 8;
     if start_bit >= input_bits {
@@ -1326,7 +1342,6 @@ fn speculative_decode_find_boundary(
         chunk.finalize(start_bit);
         return Ok(chunk);
     }
-    let finder = BlockFinder::new(input);
     let max_end = (start_bit + MAX_SCAN_BITS).min(input_bits);
 
     // Vendor `tryToDecode` (GzipChunk.hpp:712-841) attempts the partition
@@ -1338,32 +1353,49 @@ fn speculative_decode_find_boundary(
         return Ok(chunk);
     }
 
-    let mut chunk_begin = start_bit;
-    while chunk_begin < max_end {
-        let chunk_end = (chunk_begin + CHUNK_SIZE_BITS).min(max_end);
-        let candidates = finder.find_blocks(chunk_begin, chunk_end);
-        for cand in candidates
-            .into_iter()
-            .filter(|c| c.bit_offset >= chunk_begin && c.bit_offset < chunk_end)
-        {
-            match try_speculative_decode_candidate(
-                input,
-                cand.bit_offset,
-                start_bit,
-                stop_hint_bit,
-                configuration,
-            ) {
-                Ok(chunk) => {
-                    SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(chunk);
-                }
-                Err(_) => {
-                    SLOW_PATH_FIRST_CANDIDATE_FAIL
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    COORDINATOR_BOUNDARY_SEARCH_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    if let Some(chunk) =
+        RawBlockFinderCoordinator::with_scoped_boundary_search(input, start_bit, max_end, |coord| {
+            let mut candidate_index = 0usize;
+            loop {
+                let (off, code) = coord.get_offset(candidate_index, Duration::from_micros(100));
+                match code {
+                    StreamedGetReturnCode::Success => {
+                        if let Some(cand_bit) = off {
+                            match try_speculative_decode_candidate(
+                                input,
+                                cand_bit,
+                                start_bit,
+                                stop_hint_bit,
+                                configuration,
+                            ) {
+                                Ok(chunk) => {
+                                    coord.cancel_search();
+                                    SLOW_PATH_FIRST_CANDIDATE_OK
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    return Some(chunk);
+                                }
+                                Err(_) => {
+                                    SLOW_PATH_FIRST_CANDIDATE_FAIL
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        candidate_index += 1;
+                    }
+                    StreamedGetReturnCode::Timeout => {
+                        if coord.results().finalized() && candidate_index >= coord.results().len() {
+                            break;
+                        }
+                    }
+                    StreamedGetReturnCode::Failure => break,
                 }
             }
-        }
-        chunk_begin = chunk_end;
+            None
+        })
+    {
+        return Ok(chunk);
     }
 
     // Near-EOF tail: when the 512 KiB scan window reaches the end of

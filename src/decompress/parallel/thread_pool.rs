@@ -59,6 +59,21 @@ fn available_cores() -> usize {
     num_cpus::get()
 }
 
+/// Build a worker-index → logical-core map for `thread_count` workers.
+/// Cycles through `core_affinity::get_core_ids()` when there are fewer
+/// cores than workers (mirror of vendor AffinityHelpers).
+pub fn pinning_for_capacity(thread_count: usize) -> ThreadPinning {
+    let cores = core_affinity::get_core_ids().unwrap_or_default();
+    let mut map = ThreadPinning::new();
+    if cores.is_empty() || thread_count == 0 {
+        return map;
+    }
+    for i in 0..thread_count {
+        map.insert(i, cores[i % cores.len()].id as u32);
+    }
+    map
+}
+
 /// A move-only handle to the eventual result of a submitted task.
 ///
 /// Mirror of `std::future<T>` as returned by
@@ -208,6 +223,14 @@ impl ThreadPool {
     /// ThreadPool.hpp:101-103.
     pub fn with_default_capacity() -> Self {
         Self::new(available_cores(), ThreadPinning::new())
+    }
+
+    /// Construct a pool with one logical core pinned per worker index.
+    /// Mirror of vendor's `ThreadPool(threadCount, threadPinning)` where
+    /// the caller pre-populates the pinning map
+    /// (`ThreadPool.hpp:101-108`, `AffinityHelpers.hpp`).
+    pub fn with_pinning_for_capacity(thread_count: usize) -> Self {
+        Self::new(thread_count, pinning_for_capacity(thread_count))
     }
 
     /// `size_t capacity() const` (ThreadPool.hpp:166-170).
@@ -376,13 +399,14 @@ impl Drop for ThreadPool {
 /// 4. Otherwise pop the front of the lowest-priority non-empty deque,
 ///    drop the lock, run the task (ThreadPool.hpp:213-220).
 fn worker_main(
-    _thread_index: usize,
+    thread_index: usize,
     shared: Arc<Mutex<PoolShared>>,
     cv: Arc<Condvar>,
     idle: Arc<AtomicUsize>,
     running: Arc<AtomicBool>,
     pin: Option<u32>,
 ) {
+    crate::decompress::parallel::chunk_buffer_pool::bind_worker_pool_index(thread_index);
     if let Some(core_id) = pin {
         // Mirror of `pinThreadToLogicalCore(static_cast<int>(pinning->second))`
         // (ThreadPool.hpp:199). `core_affinity` is portable across the
