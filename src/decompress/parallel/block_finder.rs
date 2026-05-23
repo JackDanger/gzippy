@@ -254,6 +254,15 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// Returns true if at least `n` bits are available (refilling first).
+    #[inline]
+    pub fn can_read(&mut self, n: u8) -> bool {
+        if self.bits_available < n {
+            self.refill();
+        }
+        self.bits_available >= n
+    }
+
     /// Peek up to `n` bits. Caller must ensure `bits_available >= n` —
     /// use `peek_refilled` for the safe variant.
     #[inline]

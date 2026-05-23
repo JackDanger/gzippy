@@ -118,7 +118,10 @@ impl<'a> LsbBitReader for super::block_finder::BitReader<'a> {
 
     #[inline]
     fn peek(&mut self, num_bits: u8) -> Result<u64, BitReaderError> {
-        if self.is_eof() && num_bits > 0 {
+        if num_bits == 0 {
+            return Ok(0);
+        }
+        if !self.can_read(num_bits) {
             return Err(BitReaderError::Eof);
         }
         Ok(self.peek_refilled(num_bits))

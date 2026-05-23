@@ -1097,6 +1097,7 @@ impl Block {
         bits: &mut Bits,
         n_max_to_decode: usize,
     ) -> Result<usize, BlockError> {
+        use crate::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached;
         use crate::decompress::parallel::huffman_symbols_per_length::HuffmanCodingSymbolsPerLength;
 
         let (litlen_lens, dist_lens) = match self.compression_type {
@@ -1111,129 +1112,125 @@ impl Block {
             _ => return Err(BlockError::InvalidCompression),
         };
 
-        // Mirror of `Block::initializeHuffmanCoding` (vendor
-        // gzip/deflate.hpp:1112-1156) which instantiates two
-        // `HuffmanCodingISAL`-style decoders. On the non-x86_64 fallback
-        // we use the ported `HuffmanCodingSymbolsPerLength` — the base
-        // canonical decoder rapidgzip's faster variants derive from
-        // (vendor HuffmanCodingSymbolsPerLength.hpp:30-142).
-        // Match vendor `LiteralOrLengthHuffmanCoding`'s
-        // `MAX_LITERAL_OR_LENGTH_SYMBOLS + 2 = 288` instantiation
-        // (vendor/.../gzip/deflate.hpp:196). The `+ 2` accommodates the
-        // RFC 1951 fixed-Huffman tree which sets lengths for the
-        // reserved symbols 286-287; dynamic-block instantiations cap
-        // `literalCodeCount` at 286 so they fit too.
-        let mut litlen_hc: HuffmanCodingSymbolsPerLength<{ MAX_LITERAL_OR_LENGTH_SYMBOLS + 2 }> =
-            HuffmanCodingSymbolsPerLength::new();
-        let err = litlen_hc.initialize_from_lengths(&litlen_lens, true);
-        if err != super::error::Error::None {
-            return Err(BlockError::InvalidCodeLengths);
-        }
+        const LITLEN_CAP: usize = MAX_LITERAL_OR_LENGTH_SYMBOLS + 2;
         let mut dist_hc: HuffmanCodingSymbolsPerLength<MAX_DISTANCE_SYMBOL_COUNT> =
             HuffmanCodingSymbolsPerLength::new();
-        // Distance codes can be sub-optimal (single-code trees etc.);
-        // disable the strict optimality check to match the vendor's
-        // `Block::readDistanceAndLiteralCodings` path which accepts
-        // such trees (deflate.hpp:1085-1090).
         let err = dist_hc.initialize_from_lengths(&dist_lens, false);
         if err != super::error::Error::None {
             return Err(BlockError::InvalidCodeLengths);
         }
 
-        // Cap n_max_to_decode to ring capacity minus one max back-ref
-        // length — see ISA-L path for full rationale (mirror of vendor
-        // gzip/deflate.hpp:1602).
-        const MAX_RUN_LENGTH: usize = 258;
-        let n_max_to_decode = n_max_to_decode.min(RING_SIZE - MAX_RUN_LENGTH);
+        macro_rules! run_canonical_loop {
+            ($decode_litlen:expr) => {{
+                // Cap n_max_to_decode to ring capacity minus one max back-ref
+                // length — see ISA-L path for full rationale (mirror of vendor
+                // gzip/deflate.hpp:1602).
+                const MAX_RUN_LENGTH: usize = 258;
+                let n_max_to_decode = n_max_to_decode.min(RING_SIZE - MAX_RUN_LENGTH);
 
-        // Ring writes — same model as the ISA-L path. SAFETY as
-        // documented at `read_internal_compressed`.
-        let ring_ptr = self.output_ring.as_mut_ptr();
-        let mut pos = self.ring_pos;
-        let mut emitted: usize = 0;
-        let mut distance_marker = self.distance_to_last_marker_byte;
+                let ring_ptr = self.output_ring.as_mut_ptr();
+                let mut pos = self.ring_pos;
+                let mut emitted: usize = 0;
+                let mut distance_marker = self.distance_to_last_marker_byte;
 
-        macro_rules! commit {
-            ($result:expr) => {{
+                macro_rules! commit {
+                    ($result:expr) => {{
+                        self.ring_pos = pos;
+                        self.decoded_bytes += emitted;
+                        self.distance_to_last_marker_byte = distance_marker;
+                        return $result;
+                    }};
+                }
+
+                while emitted < n_max_to_decode {
+                    let sym = match $decode_litlen(bits) {
+                        Some(s) => s,
+                        None => commit!(Err(BlockError::InvalidHuffmanCode)),
+                    };
+
+                    if sym < 256 {
+                        unsafe {
+                            ring_ptr.add(pos % RING_SIZE).write(sym);
+                        }
+                        pos += 1;
+                        emitted += 1;
+                        if CONTAINS_MARKERS {
+                            distance_marker += 1;
+                        }
+                        continue;
+                    }
+                    if sym == END_OF_BLOCK_SYMBOL {
+                        self.at_end_of_block = true;
+                        commit!(Ok(emitted));
+                    }
+                    if sym > 285 {
+                        commit!(Err(BlockError::InvalidHuffmanCode));
+                    }
+                    let lidx = (sym - 257) as usize;
+                    let length = match read_length_extra(bits, lidx) {
+                        Ok(l) => l,
+                        Err(e) => commit!(Err(e)),
+                    };
+                    let dsym = match dist_hc.decode(bits) {
+                        Some(d) => d,
+                        None => commit!(Err(BlockError::InvalidHuffmanCode)),
+                    };
+                    if (dsym as usize) >= DISTANCE_BASE.len() {
+                        commit!(Err(BlockError::InvalidHuffmanCode));
+                    }
+                    let distance = match read_distance_extra(bits, dsym as usize) {
+                        Ok(d) => d,
+                        Err(e) => commit!(Err(e)),
+                    };
+                    if distance == 0 || distance > MAX_WINDOW_SIZE {
+                        commit!(Err(BlockError::ExceededWindowRange));
+                    }
+                    if !CONTAINS_MARKERS && distance > self.decoded_bytes + emitted {
+                        commit!(Err(BlockError::ExceededWindowRange));
+                    }
+                    unsafe {
+                        emit_backref_ring::<CONTAINS_MARKERS>(
+                            ring_ptr,
+                            &mut pos,
+                            distance,
+                            length,
+                            &mut distance_marker,
+                        );
+                    }
+                    emitted += length;
+                    if self.track_backreferences {
+                        self.backreferences.push(Backreference {
+                            distance: distance as u16,
+                            length: length as u16,
+                        });
+                    }
+                }
                 self.ring_pos = pos;
                 self.decoded_bytes += emitted;
                 self.distance_to_last_marker_byte = distance_marker;
-                return $result;
+                Ok(emitted)
             }};
         }
 
-        while emitted < n_max_to_decode {
-            let sym = match litlen_hc.decode(bits) {
-                Some(s) => s,
-                None => commit!(Err(BlockError::InvalidHuffmanCode)),
-            };
-
-            if sym < 256 {
-                // SAFETY: ring_ptr valid; pos % RING_SIZE in bounds.
-                unsafe {
-                    ring_ptr.add(pos % RING_SIZE).write(sym);
+        match self.compression_type {
+            CompressionType::FixedHuffman => {
+                let mut litlen_hc = HuffmanCodingReversedBitsCached::<LITLEN_CAP>::new();
+                let err = litlen_hc.initialize_from_lengths(&litlen_lens, true);
+                if err != super::error::Error::None {
+                    return Err(BlockError::InvalidCodeLengths);
                 }
-                pos += 1;
-                emitted += 1;
-                if CONTAINS_MARKERS {
-                    distance_marker += 1;
+                run_canonical_loop!(|bits: &mut Bits| litlen_hc.decode(bits))
+            }
+            CompressionType::DynamicHuffman => {
+                let mut litlen_hc = HuffmanCodingSymbolsPerLength::<LITLEN_CAP>::new();
+                let err = litlen_hc.initialize_from_lengths(&litlen_lens, true);
+                if err != super::error::Error::None {
+                    return Err(BlockError::InvalidCodeLengths);
                 }
-                continue;
+                run_canonical_loop!(|bits: &mut Bits| litlen_hc.decode(bits))
             }
-            if sym == END_OF_BLOCK_SYMBOL {
-                self.at_end_of_block = true;
-                commit!(Ok(emitted));
-            }
-            if sym > 285 {
-                commit!(Err(BlockError::InvalidHuffmanCode));
-            }
-            let lidx = (sym - 257) as usize;
-            let length = match read_length_extra(bits, lidx) {
-                Ok(l) => l,
-                Err(e) => commit!(Err(e)),
-            };
-            let dsym = match dist_hc.decode(bits) {
-                Some(d) => d,
-                None => commit!(Err(BlockError::InvalidHuffmanCode)),
-            };
-            if (dsym as usize) >= DISTANCE_BASE.len() {
-                commit!(Err(BlockError::InvalidHuffmanCode));
-            }
-            let distance = match read_distance_extra(bits, dsym as usize) {
-                Ok(d) => d,
-                Err(e) => commit!(Err(e)),
-            };
-            if distance == 0 || distance > MAX_WINDOW_SIZE {
-                commit!(Err(BlockError::ExceededWindowRange));
-            }
-            // Clean-mode distance check — see ISA-L path for rationale
-            // (mirror of vendor deflate.hpp:1652-1655). Const-folded.
-            if !CONTAINS_MARKERS && distance > self.decoded_bytes + emitted {
-                commit!(Err(BlockError::ExceededWindowRange));
-            }
-            // SAFETY: same as ISA-L path. emit_backref_ring updates
-            // pos in place.
-            unsafe {
-                emit_backref_ring::<CONTAINS_MARKERS>(
-                    ring_ptr,
-                    &mut pos,
-                    distance,
-                    length,
-                    &mut distance_marker,
-                );
-            }
-            emitted += length;
-            if self.track_backreferences {
-                self.backreferences.push(Backreference {
-                    distance: distance as u16,
-                    length: length as u16,
-                });
-            }
+            _ => Err(BlockError::InvalidCompression),
         }
-        self.ring_pos = pos;
-        self.decoded_bytes += emitted;
-        self.distance_to_last_marker_byte = distance_marker;
-        Ok(emitted)
     }
 
     /// Non-ISA-L entry point — dispatches everything to the canonical

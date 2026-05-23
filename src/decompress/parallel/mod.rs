@@ -23,6 +23,7 @@ pub mod gzip_chunk;
 pub mod gzip_definitions;
 pub mod gzip_format;
 pub mod huffman_base;
+pub mod huffman_reversed_bits_cached;
 pub mod huffman_symbols_per_length;
 pub mod inflate_wrapper;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
