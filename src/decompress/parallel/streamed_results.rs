@@ -52,6 +52,8 @@ impl<V: Clone> StreamedResults<V> {
         self.inner.lock().unwrap().results.len()
     }
 
+    /// Mirror of empty check (StreamedResults.hpp — vendor `empty()`).
+    #[allow(dead_code)] // vendor parity
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

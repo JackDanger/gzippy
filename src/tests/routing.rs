@@ -449,7 +449,11 @@ mod tests {
     // through (Opus advisor feedback on PR #97: removing the assertion
     // entirely lost regression protection on the most common CI class).
     // =========================================================================
+    // Perf gates (1a/1b) run on neurotic via `make test-x86_64` — see
+    // plans/rust-rapidgzip.md validation gate. Ignored in CI while the
+    // unported primitives (#1–#5) are still landing.
     #[test]
+    #[ignore = "perf gate — run on neurotic, not GHA (plans/rust-rapidgzip.md)"]
     #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
     fn test_single_member_parallel_not_slower_than_sequential() {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
@@ -510,10 +514,9 @@ mod tests {
         );
     }
 
-    /// Validation Gate 1b — silesia-class high-entropy fixture at
-    /// T = min(16, physical cores). Uses incompressible random data
-    /// (same entropy class as silesia) compressed with flate2 best.
+    /// High-entropy synthetic proxy — not gate 2 (real silesia.tar.gz).
     #[test]
+    #[ignore = "perf gate — run on neurotic, not GHA (plans/rust-rapidgzip.md)"]
     #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
     fn test_single_member_parallel_silesia_class_not_slower_than_sequential() {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK

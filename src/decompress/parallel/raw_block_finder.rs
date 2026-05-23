@@ -74,7 +74,8 @@ impl RawBlockFinderCoordinator {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
-    /// Run a synchronous scan over `[start_bit, max_end)` (tests only).
+    /// Run a synchronous scan over `[start_bit, max_end)` (unit tests).
+    #[cfg(test)]
     pub fn run_sync_boundary_search(&mut self, data: &[u8], start_bit: usize, max_end: usize) {
         push_boundary_candidates(&self.results, data, start_bit, max_end, None);
     }
