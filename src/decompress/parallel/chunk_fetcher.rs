@@ -1,4 +1,7 @@
-#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+#![cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 
 //! Port of `rapidgzip::GzipChunkFetcher::processNextChunk`
 //! (vendor/rapidgzip/.../GzipChunkFetcher.hpp:311-362) layered on a
@@ -220,8 +223,10 @@ pub static PREFETCH_NEXT_FILESIZE_ACCEPT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug)]
+#[allow(dead_code)] // error payloads surfaced via Debug in production
 pub enum FetchError {
     Decode(ChunkDecodeError),
+    #[allow(dead_code)] // non-x86 cfg stub; constructed only off the SM hot path
     UnsupportedPlatform,
 }
 

@@ -1,3 +1,8 @@
+#![cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+
 //! Port of `rapidgzip::RpmallocAllocator` / `rpmalloc_ensuring_initialization`
 //! (`vendor/.../core/FasterVector.hpp:46-113`).
 //!

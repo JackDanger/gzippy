@@ -1,4 +1,7 @@
-#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+#![cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 
 //! Production entry for parallel single-member gzip decompression.
 //!

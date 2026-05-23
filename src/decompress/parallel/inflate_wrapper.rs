@@ -1,4 +1,7 @@
-#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+#![cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 
 //! Port of `rapidgzip::IsalInflateWrapper`
 //! (vendor/rapidgzip/.../gzip/isal.hpp) scoped to single-member raw-
@@ -62,6 +65,7 @@ impl StoppingPoints {
     pub const ALL: Self = Self(0xFFFF_FFFF);
 
     #[inline]
+    #[allow(dead_code)] // vendor StoppingPoint parity (definitions.hpp)
     pub fn contains(self, other: StoppingPoints) -> bool {
         (self.0 & other.0) != 0
     }
@@ -105,6 +109,7 @@ pub enum DeflateCompressionType {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // error payloads surfaced via Debug in production
 pub enum InflateError {
     InvalidBlock,
     InvalidLookback,
@@ -165,6 +170,7 @@ impl<'a> IsalInflateWrapper<'a> {
     /// Convenience constructor: `until_bits = input.len() * 8` (no cap
     /// beyond the slice end). Existing call sites that don't know a
     /// real chunk-end offset use this.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn new(input: &'a [u8], bit_offset: usize) -> Result<Self, InflateError> {
         Self::with_until_bits(input, bit_offset, input.len() * 8)
     }
@@ -254,7 +260,11 @@ impl<'a> IsalInflateWrapper<'a> {
     /// fire. Setting NONE disables stopping. Mirror of
     /// `IsalInflateWrapper::setStoppingPoints` (isal.hpp:76-79).
     pub fn set_stopping_points(&mut self, points: StoppingPoints) {
-        self.state.points_to_stop_at = points.0;
+        self.state.points_to_stop_at = if points.is_none() {
+            0
+        } else {
+            points.0 & StoppingPoints::ALL.0
+        };
     }
 
     pub fn stopped_at(&self) -> StoppingPoints {
@@ -263,19 +273,24 @@ impl<'a> IsalInflateWrapper<'a> {
 
     /// Clear `stopped_at` so the next `read_stream` advances past the
     /// stop instead of re-reporting it.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn clear_stop(&mut self) {
         self.state.stopped_at = 0;
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn debug_points_to_stop_at(&self) -> u32 {
         self.state.points_to_stop_at
     }
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn debug_stopped_at_raw(&self) -> u32 {
         self.state.stopped_at
     }
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn debug_tmp_out_stopped_at(&self) -> u32 {
         self.state.tmp_out_stopped_at
     }
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn debug_block_state(&self) -> u32 {
         self.state.block_state
     }
@@ -517,6 +532,7 @@ impl<'a> IsalInflateWrapper<'a> {
 
     /// Returns true iff the current decode has hit a stream end
     /// (END_OF_STREAM) and not yet been advanced.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn at_end_of_stream(&self) -> bool {
         self.stopped_at() == StoppingPoints::END_OF_STREAM
     }
@@ -525,6 +541,7 @@ impl<'a> IsalInflateWrapper<'a> {
     /// `set_encoded_until_bits` or by `advance_input` widening past
     /// the original cap. Exposed for tests and diagnostics; mirrors
     /// vendor `m_encodedUntilOffset` field at isal.hpp:201.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn encoded_until_bits(&self) -> usize {
         self.encoded_until_bits
     }
@@ -604,6 +621,7 @@ pub struct IsalInflateWrapper<'a> {
 
 #[cfg(all(feature = "pure-rust-inflate", target_arch = "x86_64"))]
 impl<'a> IsalInflateWrapper<'a> {
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn new(input: &'a [u8], bit_offset: usize) -> Result<Self, InflateError> {
         Self::with_until_bits(input, bit_offset, input.len() * 8)
     }
@@ -636,22 +654,27 @@ impl<'a> IsalInflateWrapper<'a> {
         StoppingPoints(self.inner.stopped_at().0)
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn clear_stop(&mut self) {
         self.inner.clear_stop();
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn debug_points_to_stop_at(&self) -> u32 {
         self.inner.points_to_stop_at().0
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn debug_stopped_at_raw(&self) -> u32 {
         self.inner.stopped_at().0
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn debug_tmp_out_stopped_at(&self) -> u32 {
         0
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn debug_block_state(&self) -> u32 {
         0
     }
@@ -674,6 +697,10 @@ impl<'a> IsalInflateWrapper<'a> {
     }
 
     pub fn read_footer_at_current(&mut self) -> Result<(u32, u32), InflateError> {
+        debug_assert!(
+            self.inner.tell_compressed().is_multiple_of(8),
+            "read_footer_at_current requires byte-aligned bit cursor"
+        );
         let mut footer = [0u8; 8];
         let rem = self.inner.remaining_input();
         if rem.len() < 8 {
@@ -698,10 +725,12 @@ impl<'a> IsalInflateWrapper<'a> {
         self.inner.advance_input(n);
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn at_end_of_stream(&self) -> bool {
         self.inner.at_end_of_stream()
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn encoded_until_bits(&self) -> usize {
         self.inner.encoded_until_bits()
     }

@@ -1,4 +1,7 @@
-#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+#![cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 
 //! Literal port of `rapidgzip::BlockMap`
 //! (vendor/rapidgzip/.../core/BlockMap.hpp).
@@ -16,6 +19,7 @@ use std::sync::Mutex;
 /// Per-block lookup result returned by `find_data_offset` /
 /// `get_encoded_offset`. Mirror of `BlockMap::BlockInfo`
 /// (BlockMap.hpp:30-59).
+#[allow(dead_code)] // seekable-index scaffolding (Track C)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BlockInfo {
     pub block_index: usize,
@@ -27,6 +31,7 @@ pub struct BlockInfo {
 
 impl BlockInfo {
     /// True iff `data_offset` lies inside this block's decoded range.
+    #[allow(dead_code)] // seekable-index scaffolding (Track C)
     pub fn contains(&self, data_offset: usize) -> bool {
         self.decoded_offset_in_bytes <= data_offset
             && data_offset < self.decoded_offset_in_bytes + self.decoded_size_in_bytes
@@ -129,6 +134,7 @@ impl BlockMap {
     /// Returns the block containing `data_offset`, or the last block if
     /// `data_offset` is past the end. Mirror of `findDataOffset`
     /// (BlockMap.hpp:126-145).
+    #[allow(dead_code)] // seekable-index scaffolding (Track C)
     pub fn find_data_offset(&self, data_offset: usize) -> Option<BlockInfo> {
         let g = self.inner.lock().unwrap();
         // Find the highest entry whose decoded_offset_in_bytes <= data_offset.
@@ -145,6 +151,7 @@ impl BlockMap {
 
     /// Look up a chunk by its encoded bit offset. Mirror of
     /// `getEncodedOffset` (BlockMap.hpp:147-162).
+    #[allow(dead_code)] // seekable-index scaffolding (Track C)
     pub fn get_encoded_offset(&self, encoded_offset_in_bits: usize) -> Option<BlockInfo> {
         let g = self.inner.lock().unwrap();
         let pos = g
@@ -179,14 +186,17 @@ impl BlockMap {
         g.finalized = true;
     }
 
+    #[allow(dead_code)] // seekable-index scaffolding (Track C)
     pub fn finalized(&self) -> bool {
         self.inner.lock().unwrap().finalized
     }
 
+    #[allow(dead_code)] // seekable-index scaffolding (Track C)
     pub fn is_empty(&self) -> bool {
         self.inner.lock().unwrap().block_to_data_offsets.is_empty()
     }
 
+    #[allow(dead_code)] // seekable-index scaffolding (Track C)
     pub fn back(&self) -> (usize, usize) {
         let g = self.inner.lock().unwrap();
         *g.block_to_data_offsets
@@ -194,6 +204,7 @@ impl BlockMap {
             .expect("BlockMap: empty back()")
     }
 
+    #[allow(dead_code)] // seekable-index scaffolding (Track C)
     pub fn block_offsets(&self) -> Vec<(usize, usize)> {
         let g = self.inner.lock().unwrap();
         g.block_to_data_offsets.clone()
@@ -221,6 +232,7 @@ pub fn append_subchunks_to_block_map(
     }
 }
 
+#[allow(dead_code)] // seekable-index scaffolding (Track C)
 fn get_locked(g: &Inner, idx: usize) -> BlockInfo {
     let (enc, dec) = g.block_to_data_offsets[idx];
     let mut info = BlockInfo {

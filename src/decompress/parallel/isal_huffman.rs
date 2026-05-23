@@ -1,5 +1,3 @@
-#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
-
 //! Rust port of rapidgzip's `HuffmanCodingISAL`
 //! (vendor/rapidgzip/.../huffman/HuffmanCodingISAL.hpp).
 //!
@@ -93,6 +91,7 @@ pub struct IsalLitLenCode {
 }
 
 impl IsalLitLenCode {
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn from_lengths(code_lengths: &[u8]) -> Option<Self> {
         let mut c = Self::new_empty();
         if c.rebuild_from(code_lengths) {
@@ -228,6 +227,7 @@ impl IsalLitLenCode {
         }
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn is_valid(&self) -> bool {
         self.valid
     }
@@ -306,6 +306,7 @@ impl IsalDistCode {
         true
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn is_valid(&self) -> bool {
         self.valid
     }
@@ -352,6 +353,7 @@ thread_local! {
 
 /// Run `f` with a thread-local IsalLitLenCode rebuilt from `code_lengths`.
 /// Avoids per-call allocation of the 19 KB table.
+#[allow(dead_code)] // vendor parity or unit-test surface
 pub fn with_thread_litlen<R>(
     code_lengths: &[u8],
     f: impl FnOnce(&IsalLitLenCode) -> R,
@@ -366,6 +368,7 @@ pub fn with_thread_litlen<R>(
 }
 
 /// Run `f` with both lit/len and distance thread-local tables rebuilt.
+#[allow(dead_code)] // vendor parity or unit-test surface
 pub fn with_thread_litlen_dist<R>(
     litlen_lengths: &[u8],
     dist_lengths: &[u8],

@@ -1,4 +1,7 @@
-#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+#![cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 
 //! Literal port of `rapidgzip::ThreadPool`
 //! (vendor/rapidgzip/librapidarchive/src/core/ThreadPool.hpp:33-248).
@@ -55,6 +58,7 @@ pub type ThreadPinning = HashMap<usize, u32>;
 /// `sched_getaffinity`-derived counts on Linux. `num_cpus::get()` (already a
 /// gzippy dependency) honors cgroup/cpuset bounds on Linux and falls back
 /// to `hardware_concurrency` elsewhere — same intent.
+#[allow(dead_code)] // vendor parity or unit-test surface
 fn available_cores() -> usize {
     num_cpus::get()
 }
@@ -101,6 +105,7 @@ impl<T> Future<T> {
     /// thread was destroyed before the task ran, which only happens
     /// across [`ThreadPool::stop`] races; `std::future` would throw a
     /// `broken_promise` here.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn wait(self) -> Result<T, FutureError> {
         self.rx.recv().map_err(|_| FutureError::Cancelled)
     }
@@ -121,6 +126,7 @@ impl<T> Future<T> {
 
 /// Errors observable on a [`Future`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // vendor ThreadPool.hpp parity; used by Future::wait in unit tests
 pub enum FutureError {
     /// The pool was stopped before the task could run.
     /// Equivalent to `std::future_errc::broken_promise`.
@@ -221,6 +227,7 @@ impl ThreadPool {
     /// Convenience constructor using [`available_cores`] and an empty
     /// pinning map. Mirror of the default-argument form on
     /// ThreadPool.hpp:101-103.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn with_default_capacity() -> Self {
         Self::new(available_cores(), ThreadPinning::new())
     }
@@ -234,6 +241,7 @@ impl ThreadPool {
     }
 
     /// `size_t capacity() const` (ThreadPool.hpp:166-170).
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn capacity(&self) -> usize {
         self.thread_count
     }
@@ -243,6 +251,7 @@ impl ThreadPool {
     /// test-only reads. Vendor has no public accessor; we expose this
     /// to support the on-demand-spawn unit test that asserts
     /// `m_threads.size() == N` after submitting N blocking tasks.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn spawned_threads(&self) -> usize {
         self.threads.lock().unwrap().len()
     }
@@ -253,6 +262,7 @@ impl ThreadPool {
     /// `priority = None` sums all priority buckets via
     /// `std::accumulate` (ThreadPool.hpp:180-181). `priority = Some(p)`
     /// returns the size of that single bucket (ThreadPool.hpp:176-179).
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn unprocessed_tasks_count(&self, priority: Option<i32>) -> usize {
         let shared = self.shared.lock().expect("ThreadPool mutex poisoned");
         match priority {

@@ -4,21 +4,53 @@
 //! → [`chunk_fetcher::drive`] → [`gzip_chunk::decode_chunk_isal`]
 //! or [`gzip_chunk::decode_chunk_marker_bootstrap_then_isal`] (prefetch).
 
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub mod apply_window;
 pub mod bit_manipulation;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub mod block_fetcher;
 pub mod block_finder;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub mod block_map;
 pub mod cache;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub mod chunk_buffer_pool;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub mod chunk_data;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub mod chunk_fetcher;
 pub mod compressed_vector;
 pub mod crc32;
 // Bootstrap-only (speculative prefetch): marker emit via `deflate_block::Block`.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub mod deflate_block;
 pub mod error;
 pub mod gzip_block_finder;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub mod gzip_chunk;
 pub mod gzip_definitions;
 pub mod gzip_format;
@@ -27,21 +59,44 @@ pub mod huffman_reversed_bits_cached;
 pub mod huffman_short_bits_cached_deflate;
 pub mod huffman_short_bits_multi_cached;
 pub mod huffman_symbols_per_length;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub mod inflate_wrapper;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub mod isal_huffman;
 pub mod prefetcher;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub mod raw_block_finder;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub mod replace_markers;
 pub mod rfc_tables;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub mod rpmalloc_alloc;
 pub mod single_member;
 pub mod sm_cfg;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub mod sm_driver;
 pub mod statistics;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub mod streamed_results;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub mod thread_pool;
 pub mod trace;
 pub mod window_map;

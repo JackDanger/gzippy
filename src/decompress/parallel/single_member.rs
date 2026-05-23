@@ -1,5 +1,3 @@
-#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
-
 //! Parallel single-member gzip decompression — rapidgzip-shaped port.
 //!
 //! Production path on x86_64 + ISA-L when the classifier returns
@@ -86,6 +84,13 @@ pub(crate) fn adjusted_chunk_size_bytes(
 /// `PREFETCH_NEXT_FILESIZE_ACCEPT` / `UNSPLIT_BLOCKS_EMPLACED`
 /// deletion-trap pattern — proves the adjustment branch is reached on
 /// real production decodes.
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        any(feature = "isal-compression", feature = "pure-rust-inflate")
+    )),
+    allow(dead_code)
+)] // incremented on the x86 SM path; routing traps read it under the same cfg
 pub static ADJUSTED_CHUNK_SIZE_APPLIED: AtomicU64 = AtomicU64::new(0);
 
 /// Successful runs of the parallel pipeline. Snapshot before/after a
@@ -225,15 +230,19 @@ pub enum ParallelError {
     /// One or more chunk decodes failed inside the worker pool.
     /// Carries `sm_driver` / `chunk_fetcher` `Debug` detail (e.g.
     /// `Decode(InflateFailed(InvalidBlock))`).
+    #[allow(dead_code)] // constructed on the x86+isal SM path only
     DecodeFailed(String),
     /// Output size doesn't match the gzip ISIZE trailer — corruption.
+    #[allow(dead_code)] // constructed on the x86+isal SM path only
     SizeMismatch,
     /// CRC32 doesn't match the gzip CRC trailer — corruption.
+    #[allow(dead_code)] // constructed on the x86+isal SM path only
     CrcMismatch,
     /// Build doesn't support the parallel pipeline on this platform
     /// (no x86_64 + ISA-L). The classifier never routes here on
     /// unsupported builds; this exists only as the cfg-stubbed body's
     /// guaranteed error path.
+    #[allow(dead_code)] // non-SM-build cfg stub; constructed only off the x86+isal path
     UnsupportedPlatform,
     Io(io::Error),
 }

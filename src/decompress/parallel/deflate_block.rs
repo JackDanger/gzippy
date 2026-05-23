@@ -1,4 +1,7 @@
-#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+#![cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 
 //! Literal port of `rapidgzip::deflate::Block`
 //! (vendor/.../gzip/deflate.hpp:513-1156): the deflate Block state
@@ -18,13 +21,10 @@ use crate::decompress::parallel::bit_manipulation::n_lowest_bits_set;
 
 pub const MAX_LITERAL_OR_LENGTH_SYMBOLS: usize = 286;
 pub const MAX_DISTANCE_SYMBOL_COUNT: usize = 30;
-pub const MAX_CODE_LENGTH: u8 = 15;
 pub const MAX_PRECODE_LENGTH: u8 = 7;
 pub const PRECODE_BITS: u8 = 3;
-pub const PRECODE_COUNT_BITS: u8 = 4;
 pub const MAX_PRECODE_COUNT: usize = 19;
 pub const END_OF_BLOCK_SYMBOL: u16 = 256;
-pub const MAX_RUN_LENGTH: usize = 258;
 pub const MAX_WINDOW_SIZE: usize = 32768;
 
 /// RFC 1951 precode alphabet order (matches deflate.hpp's PRECODE_ALPHABET).
@@ -59,6 +59,7 @@ impl CompressionType {
 /// A back-reference discovered during decoding. Mirror of
 /// `Block::Backreference` (deflate.hpp:520-523).
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)] // populated when track_backreferences is enabled
 pub struct Backreference {
     pub distance: u16,
     pub length: u16,
@@ -309,21 +310,26 @@ impl Block {
     pub fn eob(&self) -> bool {
         self.at_end_of_block
     }
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn eos(&self) -> bool {
         self.at_end_of_block && self.is_last_block
     }
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn eof(&self) -> bool {
         self.at_end_of_file
     }
     pub fn is_last_block(&self) -> bool {
         self.is_last_block
     }
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn compression_type(&self) -> CompressionType {
         self.compression_type
     }
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn padding(&self) -> u8 {
         self.padding
     }
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn uncompressed_size(&self) -> usize {
         if self.compression_type == CompressionType::Uncompressed {
             self.uncompressed_size
@@ -331,9 +337,11 @@ impl Block {
             0
         }
     }
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn set_track_backreferences(&mut self, enable: bool) {
         self.track_backreferences = enable;
     }
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn track_backreferences(&self) -> bool {
         self.track_backreferences
     }
@@ -342,6 +350,7 @@ impl Block {
     /// accumulated 32 KiB of consecutive clean output AND the chunk
     /// hasn't emitted any markers yet, OR the entire ring is clean.
     /// Mirror of vendor's `m_containsMarkerBytes` accessor.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn contains_marker_bytes(&self) -> bool {
         self.contains_marker_bytes
     }
@@ -354,6 +363,7 @@ impl Block {
     /// `m_containsMarkerBytes = true` default at deflate.hpp:683); when
     /// one IS provided the next back-references resolve directly against
     /// the seeded window prefix in `output`.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn reset(&mut self, output: Option<&mut Vec<u16>>, initial_window: Option<&[u8]>) {
         self.at_end_of_block = false;
         self.at_end_of_file = false;
@@ -442,6 +452,7 @@ impl Block {
     /// Mirrors rapidgzip's behavior: an empty `initial_window` is a no-op
     /// (`m_decodedBytes` stays 0). Useful when the caller knows the chunk
     /// starts at a stream boundary (BFINAL=1 successor or chunk 0).
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn set_initial_window(
         &mut self,
         output: &mut Vec<u16>,
@@ -1104,6 +1115,7 @@ impl Block {
     /// `huffman_base.rs` provides for `Bits`.
     /// Public entry — runtime-dispatches to const-generic specialization
     /// (see ISA-L sibling).
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn read_internal_compressed_canonical(
         &mut self,
         bits: &mut Bits,

@@ -1,4 +1,7 @@
-#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+#![cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 
 //! Per-chunk deflate decode for parallel single-member.
 //!
@@ -26,10 +29,15 @@ use crate::decompress::parallel::inflate_wrapper::{
 use crate::decompress::parallel::rpmalloc_alloc::types;
 
 #[derive(Debug)]
+#[allow(dead_code)] // error payloads surfaced via Debug in production
 pub enum ChunkDecodeError {
     InflateFailed(InflateError),
     BootstrapFailed(std::io::Error),
-    ExactStopMissed { requested: usize, actual: usize },
+    ExactStopMissed {
+        requested: usize,
+        actual: usize,
+    },
+    #[allow(dead_code)] // non-SM-build cfg stub
     UnsupportedPlatform,
 }
 
@@ -813,10 +821,10 @@ mod tests {
             crc32_enabled: false,
         };
         let zero = [0u8; 32768];
-        let chunk0 = decode_chunk_isal(&deflate, 0, spacing_bits, &zero, cfg).expect("chunk0");
+        let chunk0 = decode_chunk_isal(deflate, 0, spacing_bits, &zero, cfg).expect("chunk0");
         let resume_at = chunk0.encoded_offset_bits + chunk0.encoded_size_bits;
         assert!(
-            resume_at > 0 && resume_at % 8 != 0,
+            resume_at > 0 && !resume_at.is_multiple_of(8),
             "expected non-zero non-byte-aligned handoff, got {resume_at}"
         );
         let tail = chunk0

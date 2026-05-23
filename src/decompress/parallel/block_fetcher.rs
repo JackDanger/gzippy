@@ -1,4 +1,7 @@
-#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+#![cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 
 //! Literal port of `rapidgzip::BlockFetcher`
 //! (vendor/.../core/BlockFetcher.hpp:38-688).
@@ -145,6 +148,7 @@ where
     /// `get()` does cache lookup + prefetch take + dispatch + wait +
     /// cache-insert in a single call. Underlying thread-pool unification
     /// is a follow-up.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn get<S>(&self, block_offset: Key, submit: S) -> Result<Value, Err>
     where
         S: FnOnce(Key) -> Receiver<Result<Value, Err>>,
@@ -430,6 +434,7 @@ where
     /// Insert a prefetched block into the prefetch cache. Stats:
     /// records the prefetch (rapidgzip's BlockFetcher tracks this via
     /// `prefetchCount` increment on prefetch submission).
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn insert_prefetched(&self, block_offset: Key, block_data: Value) {
         self.prefetch_cache
             .lock()
@@ -455,6 +460,7 @@ where
     }
 
     /// True iff a prefetch task at `block_offset` is in flight.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn prefetch_in_flight(&self, block_offset: &Key) -> bool {
         self.prefetching.lock().unwrap().contains_key(block_offset)
     }
@@ -464,6 +470,7 @@ where
     /// `BlockFetcher::get` call. Mirror of vendor's
     /// `m_prefetching.emplace(*prefetchBlockOffset, std::move(prefetchedFuture))`
     /// at BlockFetcher.hpp:558.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn submit_prefetch(&self, block_offset: Key, rx: Receiver<Result<Value, Err>>) {
         self.prefetching.lock().unwrap().insert(block_offset, rx);
     }
@@ -472,6 +479,7 @@ where
     /// Mirror of vendor's `processReadyPrefetches` cleanup
     /// (BlockFetcher.hpp:431-450) — receivers whose consumer no longer
     /// cares are dropped, the worker's `reply.send` then fails silently.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn drop_prefetches_matching<F: FnMut(&Key) -> bool>(&self, mut pred: F) {
         self.prefetching.lock().unwrap().retain(|k, _| !pred(k));
     }
@@ -483,12 +491,14 @@ where
     }
 
     /// Snapshot of the in-flight prefetch keys.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn prefetching_keys(&self) -> Vec<Key> {
         self.prefetching.lock().unwrap().keys().cloned().collect()
     }
 
     /// Vendor's `m_parallelization` cap on simultaneous prefetches
     /// (BlockFetcher.hpp:467: `m_threadPool.capacity()`).
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn parallelization(&self) -> usize {
         self.parallelization
     }
@@ -496,6 +506,7 @@ where
     /// Mark a block offset as a failed prefetch (rapidgzip
     /// `m_failedPrefetchCache`). Future `is_failed_prefetch` lookups
     /// return true so the caller doesn't re-issue.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn mark_failed_prefetch(&self, block_offset: Key) {
         self.failed_prefetch.lock().unwrap().insert(block_offset);
     }
@@ -662,6 +673,7 @@ where
     }
 
     /// Ask the fetching strategy which indexes to prefetch.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn prefetch_indexes(&self, max_amount_to_prefetch: usize) -> Vec<usize> {
         self.fetching_strategy
             .lock()
@@ -674,6 +686,7 @@ where
         self.fetching_strategy.lock().unwrap().last_fetched()
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn clear_cache(&self) {
         self.cache.lock().unwrap().clear();
     }
@@ -742,6 +755,7 @@ where
     /// Lock + snapshot both caches' statistics + the chunk-extra
     /// counters. Mirror of `BlockFetcher::statistics`
     /// (BlockFetcher.hpp:337-348).
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn cache_statistics(
         &self,
     ) -> (super::cache::CacheStatistics, super::cache::CacheStatistics) {
@@ -751,14 +765,17 @@ where
         )
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn cache_size(&self) -> usize {
         self.cache.lock().unwrap().size()
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn prefetch_cache_size(&self) -> usize {
         self.prefetch_cache.lock().unwrap().size()
     }
 
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn in_flight_count(&self) -> usize {
         self.prefetching.lock().unwrap().len()
     }

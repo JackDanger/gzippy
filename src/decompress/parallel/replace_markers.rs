@@ -1,4 +1,7 @@
-#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+#![cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 
 //! SIMD-accelerated marker replacement.
 //!
@@ -226,6 +229,7 @@ fn replace_markers_neon(data: &mut [u16], window: &[u8]) {
 /// Convert a `Vec<u16>` (with all markers already resolved, so every value
 /// fits in u8) to a `Vec<u8>`. Returns Err if any value still has the marker
 /// bit set — callers should call this only after `replace_markers`.
+#[allow(dead_code)] // vendor parity or unit-test surface
 pub fn u16_to_u8(data: &[u16]) -> Result<Vec<u8>, usize> {
     if let Some(bad) = data.iter().position(|&v| v >= MARKER_BASE) {
         return Err(bad);

@@ -1,4 +1,7 @@
-#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are pending consumer-port
+#![cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 
 //! Port of `rapidgzip::ChunkData` (ChunkData.hpp, especially lines 80-400)
 //! plus its nested `Subchunk` and `Statistics`.
@@ -40,6 +43,7 @@ pub struct Subchunk {
 /// `ChunkData::Statistics` (ChunkData.hpp:147-180); we surface only the
 /// counters used by bench-sm telemetry.
 #[derive(Debug, Default, Clone, Copy)]
+#[allow(dead_code)] // timing fields populated for future diagnostics
 pub struct ChunkStatistics {
     pub decode_duration_ns: u64,
     pub apply_window_duration_ns: u64,
@@ -85,6 +89,7 @@ impl Default for ChunkConfiguration {
 /// associated block boundary. We only record the gzip CRC32 + ISIZE +
 /// the boundary at footer-end (post-footer file offset).
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)] // seekable-index / multi-stream footer metadata
 pub struct Footer {
     /// Gzip footer CRC32 (last 8 bytes, little-endian: CRC32 then ISIZE).
     pub crc32: u32,
@@ -142,6 +147,7 @@ pub struct ChunkData {
     /// Consumer skips its own `apply_window` call when set, saving
     /// the redundant scan of `data_with_markers`. Mirror of vendor's
     /// `m_markersResolved` flag pattern at ChunkData.hpp.
+    #[allow(dead_code)] // set by apply_window; read in future seekable path
     pub markers_resolved: bool,
     /// Real deflate block boundaries the decoder crossed during decode.
     /// Indexed into the combined `(data_with_markers ++ data)` stream.
@@ -325,6 +331,7 @@ impl ChunkData {
     }
 
     #[inline]
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn is_empty(&self) -> bool {
         self.data_with_markers.is_empty() && self.data.is_empty()
     }
@@ -380,6 +387,7 @@ impl ChunkData {
     ///
     /// Safety contract: bytes in `self.data[prev_len..prev_len+written]`
     /// must be fully initialized at the moment of this call.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn note_clean_bytes_written_in_place(
         &mut self,
         prev_len: usize,
@@ -466,6 +474,7 @@ impl ChunkData {
     /// same encoded bit position with different decoded offsets (and
     /// vice versa for empty dynamic blocks at the same decoded pos), so
     /// dedupping on encoded-only loses information.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn append_block_boundary_at(
         &mut self,
         encoded_offset_bits: usize,
@@ -512,6 +521,7 @@ impl ChunkData {
     ///
     /// Panics if `spacing == 0` (mirrors rapidgzip's
     /// `std::invalid_argument`).
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn split(&self, spacing: usize) -> Vec<Subchunk> {
         if spacing == 0 {
             panic!("ChunkData::split: spacing must be > 0");
@@ -938,6 +948,7 @@ impl ChunkData {
     /// of subchunk records, negligible. The win: speculation hit rate
     /// jumps from ~3% to ~100% on Silesia gzip -9 because the consumer
     /// no longer demands exact start matching.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn append_block_boundary(&mut self, encoded_offset_bits: usize) -> bool {
         // Derive decoded_offset from current data size (caller wasn't
         // forced to supply it). Forward to append_block_boundary_at,
@@ -1044,6 +1055,7 @@ impl ChunkData {
     /// leading bytes to skip in this chunk's output). Returns None if
     /// no subchunk matches; the consumer then falls back to
     /// authoritative re-dispatch.
+    #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn decoded_offset_for(&self, expected_start: usize) -> Option<usize> {
         if expected_start == self.encoded_offset_bits {
             return Some(0);
