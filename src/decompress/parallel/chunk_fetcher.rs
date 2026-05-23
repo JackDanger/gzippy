@@ -339,6 +339,21 @@ pub fn drive<W: std::io::Write>(
     // can outlive the borrowed `input` slice.
     let input_view = unsafe { InputSlice::from_slice(input) };
 
+    if trace::is_enabled() {
+        trace::emit(
+            "consumer",
+            "drive_begin",
+            &format!(
+                r#""input_bytes":{},"total_bits":{},"pool_size":{},"chunk_size":{}"#,
+                input.len(),
+                total_bits,
+                pool_size,
+                configuration.split_chunk_size,
+            ),
+        );
+    }
+
+    let drive_t0 = std::time::Instant::now();
     let consumer_result = consumer_loop(
         input_view,
         writer,
@@ -362,6 +377,19 @@ pub fn drive<W: std::io::Write>(
     thread_pool.stop();
 
     consumer_result?;
+
+    if trace::is_enabled() {
+        trace::emit(
+            "consumer",
+            "drive_end",
+            &format!(
+                r#""duration_us":{},"decoded_bytes":{},"crc32":{}"#,
+                drive_t0.elapsed().as_micros(),
+                total_size,
+                total_crc.crc32(),
+            ),
+        );
+    }
 
     // Vendor parity: `m_blockMap->finalize()` + `m_blockFinder->finalize()`
     // at the end of `processNextChunk`'s EOF branch
@@ -707,7 +735,19 @@ fn consumer_loop<W: std::io::Write>(
                 // chain: chunk_N.end == chunk_{N+1}.start at max).
                 let handoff_at_decode_start = arc.max_acceptable_start_bit == next_block_offset;
                 if arc.matches_encoded_offset(next_block_offset) && handoff_at_decode_start {
-                    chunk_arc_from_partition = Some(arc);
+                    chunk_arc_from_partition = Some(arc.clone());
+                    if trace::is_enabled() {
+                        trace::emit(
+                            "consumer",
+                            "speculative_accept",
+                            &format!(
+                                r#""partition_idx":{partition_idx_for_trace},"expected_start":{next_block_offset},"speculative_start":{},"encoded_offset":{},"max_acceptable":{}"#,
+                                arc.encoded_offset_bits,
+                                arc.encoded_offset_bits,
+                                arc.max_acceptable_start_bit,
+                            ),
+                        );
+                    }
                 } else {
                     // Diagnostic counter (added 2026-05-19): a prefetch
                     // arrived at the consumer (matches the partition
@@ -718,6 +758,18 @@ fn consumer_loop<W: std::io::Write>(
                     // counted by `prefetch_cache_miss` and means a
                     // scheduling/timing miss, not a metadata mismatch.
                     PREFETCH_REJECT_BY_GUARD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if trace::is_enabled() {
+                        trace::emit(
+                            "consumer",
+                            "speculative_mismatch",
+                            &format!(
+                                r#""partition_idx":{partition_idx_for_trace},"expected_start":{next_block_offset},"speculative_start":{},"encoded_offset":{},"max_acceptable":{}"#,
+                                arc.encoded_offset_bits,
+                                arc.encoded_offset_bits,
+                                arc.max_acceptable_start_bit,
+                            ),
+                        );
+                    }
                 }
                 // If !matches OR the safety guard rejected, the Arc
                 // is dropped here (vendor "throws away" the
@@ -726,6 +778,14 @@ fn consumer_loop<W: std::io::Write>(
                 // vendor's `catch ( const NoBlockInRange& )` at
                 // GzipChunkFetcher.hpp:604-609 silently discards
                 // prefetch failures.
+            } else if trace::is_enabled() {
+                trace::emit(
+                    "consumer",
+                    "speculative_missing",
+                    &format!(
+                        r#""partition_idx":{partition_idx_for_trace},"partition_offset":{partition_offset},"expected_start":{next_block_offset}"#
+                    ),
+                );
             }
         }
 

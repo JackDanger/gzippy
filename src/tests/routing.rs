@@ -502,15 +502,66 @@ mod tests {
              sequential={seq_mbps:.0} MB/s  parallel={par_mbps:.0} MB/s  ratio={ratio:.2}"
         );
 
-        // Validation Gate 1a (synthetic): parallel must not be slower than
-        // sequential on ≥4 physical cores (tightened from 1.5× to catch the
-        // v0.3.0-class 1.72× regression). On <4 cores keep relaxed 3.0×.
-        let threshold = if physical >= 4 { 1.0 } else { 3.0 };
+        // Validation Gate 1a (synthetic): parallel must beat sequential
+        // by 2× on ≥4 physical cores (plans/rust-rapidgzip.md Track A).
+        let threshold = if physical >= 4 { 0.5 } else { 3.0 };
         assert!(
             ratio < threshold,
-            "parallel single-member must not be > {threshold:.1}× slower than sequential \
+            "parallel single-member must achieve ratio < {threshold:.1} vs sequential \
              on {physical}-physical-core hardware (T={threads}): \
              par={par:?} seq={seq:?} ratio={ratio:.2}"
+        );
+    }
+
+    /// Real silesia corpus — Validation Gate 1b (plans/rust-rapidgzip.md A4).
+    #[test]
+    #[ignore = "perf gate — run on neurotic, not GHA (plans/rust-rapidgzip.md)"]
+    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    fn test_single_member_parallel_silesia() {
+        use crate::tests::datasets;
+
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let Some(compressed) = datasets::load_silesia_gzip() else {
+            eprintln!("skip: benchmark_data/silesia-gzip.tar.gz not present");
+            return;
+        };
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "silesia gzip must exceed 10 MiB parallel gate (got {} bytes)",
+            compressed.len()
+        );
+
+        let bench = |threads: usize| -> std::time::Duration {
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..3 {
+                let mut sink = Vec::new();
+                let t = std::time::Instant::now();
+                crate::decompress::decompress_single_member(&compressed, &mut sink, threads)
+                    .expect("decompress");
+                best = best.min(t.elapsed());
+                assert!(!sink.is_empty(), "T={threads} produced empty output");
+            }
+            best
+        };
+
+        let threads = num_cpus::get_physical().min(16);
+        let seq = bench(1);
+        let par = bench(threads);
+        let ratio = par.as_secs_f64() / seq.as_secs_f64().max(1e-9);
+        let physical = num_cpus::get_physical();
+        eprintln!(
+            "silesia ({physical} physical cores, T={threads}): ratio={ratio:.2} \
+             seq={seq:?} par={par:?}"
+        );
+
+        let threshold = if physical >= 4 { 0.5 } else { 3.0 };
+        assert!(
+            ratio < threshold,
+            "silesia parallel must achieve ratio < {threshold:.1} vs sequential \
+             on {physical}-core hardware (T={threads}): ratio={ratio:.2}"
         );
     }
 
@@ -563,10 +614,10 @@ mod tests {
         let physical = num_cpus::get_physical();
         eprintln!("silesia-class ({physical} physical cores, T={threads}): ratio={ratio:.2}");
 
-        let threshold = if physical >= 4 { 1.0 } else { 3.0 };
+        let threshold = if physical >= 4 { 0.5 } else { 3.0 };
         assert!(
             ratio < threshold,
-            "silesia-class parallel must not be > {threshold:.1}× slower than sequential \
+            "silesia-class parallel must achieve ratio < {threshold:.1} vs sequential \
              on {physical}-core hardware (T={threads}): ratio={ratio:.2}"
         );
     }

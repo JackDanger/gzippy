@@ -18,6 +18,7 @@ use std::arch::x86_64;
 
 use crate::decompress::inflate::jit_decode::TableFingerprint;
 use crate::decompress::inflate::libdeflate_entry::{DistTable, LitLenTable};
+use crate::decompress::inflate::stopping_point::StoppingPoint;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Result};
@@ -211,6 +212,32 @@ impl<'a> Bits<'a> {
         };
         bits.refill();
         bits
+    }
+
+    /// Seek to a non-byte-aligned bit offset in `data`.
+    pub fn at_bit_offset(data: &'a [u8], bit_offset: usize) -> Self {
+        let byte_idx = bit_offset / 8;
+        let skip = (bit_offset % 8) as u32;
+        let mut bits = Self {
+            data,
+            pos: byte_idx,
+            bitbuf: 0,
+            bitsleft: 0,
+        };
+        if skip != 0 && byte_idx < data.len() {
+            bits.bitbuf = (data[byte_idx] as u64) >> skip;
+            bits.bitsleft = 8 - skip;
+            bits.pos = byte_idx + 1;
+        } else {
+            bits.refill();
+        }
+        bits
+    }
+
+    /// Absolute bit position of the next bit to consume.
+    pub fn bit_position(&self) -> usize {
+        let unread = (self.bitsleft as u8).min(64) as usize;
+        self.pos.saturating_mul(8).saturating_sub(unread)
     }
 
     /// Branchless refill matching libdeflate
@@ -2865,6 +2892,146 @@ pub fn inflate_consume_first_bits(bits: &mut Bits, output: &mut [u8]) -> Result<
     }
 }
 
+/// Result of one resumable inflate call (mirrors `ReadStreamResult` in
+/// `parallel/inflate_wrapper.rs`).
+#[derive(Debug, Clone, Copy)]
+pub struct InflateStreamResult {
+    pub bytes_written: usize,
+    pub stopped_at: StoppingPoint,
+    pub bit_position: usize,
+    pub finished: bool,
+}
+
+/// Resumable deflate decoder with patched-ISA-L stopping-point semantics.
+pub struct ResumableInflate<'a> {
+    bits: Bits<'a>,
+    points_to_stop_at: StoppingPoint,
+    stopped_at: StoppingPoint,
+    encoded_until_bits: usize,
+}
+
+impl<'a> ResumableInflate<'a> {
+    pub fn new(input: &'a [u8], bit_offset: usize) -> Result<Self> {
+        Self::with_until_bits(input, bit_offset, input.len() * 8)
+    }
+
+    pub fn with_until_bits(input: &'a [u8], bit_offset: usize, until_bits: usize) -> Result<Self> {
+        if bit_offset / 8 >= input.len() {
+            return Err(Error::new(ErrorKind::InvalidData, "start bit past end"));
+        }
+        Ok(Self {
+            bits: Bits::at_bit_offset(input, bit_offset),
+            points_to_stop_at: StoppingPoint::NONE,
+            stopped_at: StoppingPoint::NONE,
+            encoded_until_bits: until_bits.min(input.len() * 8),
+        })
+    }
+
+    pub fn set_stopping_points(&mut self, points: StoppingPoint) {
+        self.points_to_stop_at = points;
+    }
+
+    pub fn stopped_at(&self) -> StoppingPoint {
+        self.stopped_at
+    }
+
+    pub fn clear_stop(&mut self) {
+        self.stopped_at = StoppingPoint::NONE;
+    }
+
+    pub fn tell_compressed(&self) -> usize {
+        self.bits.bit_position().min(self.encoded_until_bits)
+    }
+
+    pub fn at_end_of_stream(&self) -> bool {
+        self.tell_compressed() >= self.encoded_until_bits
+    }
+
+    /// Decode into `output`, stopping early when a requested stop point fires.
+    pub fn read_stream(&mut self, output: &mut [u8]) -> Result<InflateStreamResult> {
+        self.stopped_at = StoppingPoint::NONE;
+        let mut out_pos = 0usize;
+
+        while out_pos < output.len() {
+            if self.bits.bit_position() >= self.encoded_until_bits {
+                break;
+            }
+            if self.bits.available() < 3 {
+                self.bits.refill();
+            }
+            if self.bits.bit_position() >= self.encoded_until_bits {
+                break;
+            }
+
+            let bfinal = (self.bits.peek() & 1) != 0;
+            let btype = ((self.bits.peek() >> 1) & 3) as u8;
+            self.bits.consume(3);
+
+            if self
+                .points_to_stop_at
+                .contains(StoppingPoint::END_OF_BLOCK_HEADER)
+            {
+                self.stopped_at = StoppingPoint::END_OF_BLOCK_HEADER;
+                return Ok(InflateStreamResult {
+                    bytes_written: out_pos,
+                    stopped_at: self.stopped_at,
+                    bit_position: self.tell_compressed(),
+                    finished: false,
+                });
+            }
+
+            let prev_pos = out_pos;
+            match btype {
+                0 => out_pos = decode_stored(&mut self.bits, output, out_pos)?,
+                1 => out_pos = decode_fixed(&mut self.bits, output, out_pos)?,
+                2 => out_pos = decode_dynamic(&mut self.bits, output, out_pos)?,
+                3 => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type")),
+                _ => unreachable!(),
+            }
+            let _ = prev_pos;
+
+            if bfinal {
+                self.bits.align_to_byte();
+                if self
+                    .points_to_stop_at
+                    .contains(StoppingPoint::END_OF_STREAM)
+                {
+                    self.stopped_at = StoppingPoint::END_OF_STREAM;
+                    return Ok(InflateStreamResult {
+                        bytes_written: out_pos,
+                        stopped_at: self.stopped_at,
+                        bit_position: self.tell_compressed(),
+                        finished: true,
+                    });
+                }
+                return Ok(InflateStreamResult {
+                    bytes_written: out_pos,
+                    stopped_at: StoppingPoint::NONE,
+                    bit_position: self.tell_compressed(),
+                    finished: true,
+                });
+            }
+
+            if self.points_to_stop_at.contains(StoppingPoint::END_OF_BLOCK) {
+                self.stopped_at = StoppingPoint::END_OF_BLOCK;
+                return Ok(InflateStreamResult {
+                    bytes_written: out_pos,
+                    stopped_at: self.stopped_at,
+                    bit_position: self.tell_compressed(),
+                    finished: false,
+                });
+            }
+        }
+
+        Ok(InflateStreamResult {
+            bytes_written: out_pos,
+            stopped_at: StoppingPoint::NONE,
+            bit_position: self.tell_compressed(),
+            finished: self.at_end_of_stream(),
+        })
+    }
+}
+
 // =============================================================================
 // Option 3: Interleaved Multi-Block Decode (SIMD-style parallelism)
 // =============================================================================
@@ -3557,6 +3724,153 @@ mod tests {
              GitHub Actions runners always support AVX2. \
              If this fails in CI, the AVX2 fast path in copy_match_fast \
              and fill_byte_avx2 will be unused, reducing decompression throughput."
+        );
+    }
+
+    #[test]
+    fn test_resumable_stopping_points_end_of_block_header() {
+        use super::ResumableInflate;
+        use crate::decompress::inflate::stopping_point::StoppingPoint;
+
+        let original = b"hello resumable stopping points test data".repeat(20);
+        let mut compressed = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc =
+                flate2::write::DeflateEncoder::new(&mut compressed, flate2::Compression::best());
+            enc.write_all(&original).unwrap();
+            enc.finish().unwrap();
+        }
+
+        let mut dec = ResumableInflate::new(&compressed, 0).unwrap();
+        dec.set_stopping_points(StoppingPoint::END_OF_BLOCK_HEADER);
+        let mut out = vec![0u8; 65536];
+        let r = dec.read_stream(&mut out).unwrap();
+        assert_eq!(r.stopped_at, StoppingPoint::END_OF_BLOCK_HEADER);
+        assert_eq!(r.bytes_written, 0);
+    }
+
+    #[test]
+    fn test_resumable_full_stream_matches_consume_first() {
+        use super::ResumableInflate;
+
+        let original = b"roundtrip via resumable inflate".repeat(50);
+        let mut compressed = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc =
+                flate2::write::DeflateEncoder::new(&mut compressed, flate2::Compression::best());
+            enc.write_all(&original).unwrap();
+            enc.finish().unwrap();
+        }
+
+        let mut dec = ResumableInflate::new(&compressed, 0).unwrap();
+        let mut out = vec![0u8; original.len() + 64];
+        let r = dec.read_stream(&mut out).unwrap();
+        assert!(r.finished);
+        assert_eq!(r.bytes_written, original.len());
+        assert_slices_eq!(&out[..r.bytes_written], original.as_slice());
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    #[test]
+    fn test_resumable_stops_match_isal_wrapper() {
+        use super::ResumableInflate;
+        use crate::decompress::inflate::stopping_point::StoppingPoint;
+        use crate::decompress::parallel::inflate_wrapper::{
+            IsalInflateWrapper, StoppingPoints as IsalStop,
+        };
+
+        let original = b"differential oracle for stopping points".repeat(80);
+        let mut compressed = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc =
+                flate2::write::DeflateEncoder::new(&mut compressed, flate2::Compression::best());
+            enc.write_all(&original).unwrap();
+            enc.finish().unwrap();
+        }
+
+        for stop in [
+            StoppingPoint::END_OF_BLOCK_HEADER,
+            StoppingPoint::END_OF_BLOCK,
+        ] {
+            let isal_stop = IsalStop(stop.0);
+            let mut isal = IsalInflateWrapper::new(&compressed, 0).unwrap();
+            isal.set_stopping_points(isal_stop);
+            let mut isal_out = vec![0u8; 65536];
+            let isal_r = isal.read_stream(&mut isal_out).unwrap();
+
+            let mut rust = ResumableInflate::new(&compressed, 0).unwrap();
+            rust.set_stopping_points(stop);
+            let mut rust_out = vec![0u8; 65536];
+            let rust_r = rust.read_stream(&mut rust_out).unwrap();
+
+            assert_eq!(
+                rust_r.stopped_at, stop,
+                "pure-Rust stopped_at mismatch for {stop:?}"
+            );
+            assert_eq!(
+                isal_r.stopped_at.0, stop.0,
+                "ISA-L stopped_at mismatch for {stop:?}"
+            );
+            assert_eq!(
+                rust_r.bytes_written, isal_r.bytes_written,
+                "output length mismatch at {stop:?}"
+            );
+            assert_eq!(
+                &rust_out[..rust_r.bytes_written],
+                &isal_out[..isal_r.bytes_written],
+                "output bytes mismatch at {stop:?}"
+            );
+        }
+    }
+
+    /// Track B4 Tier-1 gate: pure-Rust resumable inflate within 1.5× of ISA-L
+    /// on silesia. Run on neurotic: `--ignored --nocapture`.
+    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    #[test]
+    #[ignore = "perf gate — run on neurotic (Track B4)"]
+    fn test_isal_vs_pure_rust_silesia_throughput() {
+        use super::ResumableInflate;
+        use crate::decompress::parallel::inflate_wrapper::IsalInflateWrapper;
+        use crate::tests::datasets;
+
+        let Some(data) = datasets::load_silesia_gzip() else {
+            eprintln!("skip: silesia gzip not present");
+            return;
+        };
+        let header_off =
+            crate::decompress::parallel::single_member::skip_gzip_header(&data).unwrap();
+        let deflate = &data[header_off..data.len().saturating_sub(8)];
+
+        let bench = |is_isal: bool| -> f64 {
+            let mut best = 0.0f64;
+            for _ in 0..2 {
+                let start = std::time::Instant::now();
+                let mut total = 0usize;
+                if is_isal {
+                    let mut w = IsalInflateWrapper::new(deflate, 0).unwrap();
+                    let mut out = vec![0u8; 256 * 1024 * 1024];
+                    total = w.read_stream(&mut out).unwrap().bytes_written;
+                } else {
+                    let mut d = ResumableInflate::new(deflate, 0).unwrap();
+                    let mut out = vec![0u8; 256 * 1024 * 1024];
+                    total = d.read_stream(&mut out).unwrap().bytes_written;
+                }
+                let mbps = (total as f64) / start.elapsed().as_secs_f64() / 1e6;
+                best = best.max(mbps);
+            }
+            best
+        };
+
+        let isal = bench(true);
+        let rust = bench(false);
+        let ratio = isal / rust.max(1e-9);
+        eprintln!("B4 silesia: ISA-L={isal:.0} MB/s  Rust={rust:.0} MB/s  ratio={ratio:.2}x");
+        assert!(
+            ratio <= 1.5,
+            "pure-Rust must be within 1.5× of ISA-L (got {ratio:.2}x)"
         );
     }
 }
