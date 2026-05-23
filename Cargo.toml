@@ -97,6 +97,12 @@ cc = "1"
 tempfile = "3.8"
 assert_cmd = "2.0"
 predicates = "3.0"
+flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
+
+[[bench]]
+name = "inflate_isal_vs_pure_rust"
+harness = false
+required-features = ["isal-compression"]
 
 [profile.release]
 lto = "fat"           # Full cross-crate LTO (slower build, faster binary)

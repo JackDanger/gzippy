@@ -152,7 +152,10 @@ mod tests {
     /// Verifies the parallel path is actually faster than sequential on x86_64
     /// where ISA-L (~1500 MB/s) is available. Not run on arm64 where sequential
     /// libdeflate (~14,000 MB/s) beats parallel zlib-ng (4×600 MB/s).
-    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(feature = "isal-compression", feature = "pure-rust-inflate")
+    ))]
     #[test]
     fn diff_ratio_parallel_single_member_speedup() {
         let fixture = crate::tests::fixtures::text_10mb();
@@ -205,6 +208,10 @@ mod tests {
     ///
     /// Catches catastrophic regressions in the parallel path. The threshold is
     /// intentionally loose (parallel may be slower than libdeflate on arm64).
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(feature = "isal-compression", feature = "pure-rust-inflate")
+    ))]
     #[test]
     fn diff_ratio_parallel_no_regression_vs_sequential() {
         let fixture = crate::tests::fixtures::text_10mb();
