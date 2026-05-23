@@ -12,11 +12,17 @@
 
 use crate::decompress::parallel::chunk_data::{ChunkConfiguration, ChunkData};
 use crate::decompress::parallel::inflate_wrapper::InflateError;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::inflate_wrapper::{
     DeflateCompressionType, IsalInflateWrapper, StoppingPoints,
 };
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::rpmalloc_alloc::types;
 
 #[derive(Debug)]
@@ -48,7 +54,10 @@ const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 ///
 /// Stops at the first block boundary at-or-past `stop_hint_bits` (an
 /// inexact hint — the decoder may overshoot), or at end-of-stream.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub fn decode_chunk_isal(
     input: &[u8],
     encoded_offset_bits: usize,
@@ -65,7 +74,10 @@ pub fn decode_chunk_isal(
     )
 }
 
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 fn decode_chunk_isal_impl(
     input: &[u8],
     encoded_offset_bits: usize,
@@ -286,7 +298,10 @@ fn decode_chunk_isal_impl(
 /// The chunk stops at the next deflate block boundary at-or-past
 /// `stop_hint_bits`, or at BFINAL, or when accumulated `decoded_size`
 /// crosses `max_decoded_chunk_size`.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub fn decode_chunk_marker_bootstrap_then_isal(
     input: &[u8],
     encoded_offset_bits: usize,
@@ -349,7 +364,10 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
 
 /// Merge an ISA-L tail segment (clean bytes + block boundaries) into a
 /// chunk that already holds a marker bootstrap prefix.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 fn absorb_isal_tail(dst: &mut ChunkData, tail: ChunkData) {
     let end_bit = tail.encoded_offset_bits + tail.encoded_size_bits;
     let decoded_base = dst.decoded_size();
@@ -375,7 +393,10 @@ fn absorb_isal_tail(dst: &mut ChunkData, tail: ChunkData) {
 /// [`deflate_block::Block`]. Mirrors the early-exit contract of
 /// rapidgzip's `decodeChunkWithRapidgzip` main loop
 /// (vendor/.../chunkdecoding/GzipChunk.hpp:468-654).
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 struct DeflateBootstrap {
     /// u16 output spanning every block decoded in this bootstrap pass.
     /// Values < MARKER_BASE are literal bytes; values ≥ MARKER_BASE are
@@ -407,7 +428,10 @@ struct DeflateBootstrap {
 /// `decodeChunkWithRapidgzip` (GzipChunk.hpp:468-654), restricted to the
 /// single-member case (no multi-stream loop) and with the handoff
 /// triggered exclusively by `cleanDataCount` (GzipChunk.hpp:520-525).
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 fn bootstrap_with_deflate_block(
     data: &[u8],
     start_bit_offset: usize,
@@ -584,7 +608,10 @@ fn bootstrap_with_deflate_block(
 /// was constructed from `&data[byte_offset..]`. The Bits buffer
 /// pre-loads bytes from its slice, so the actual consumed-from-slice
 /// count is `bits.pos * 8 - bits.available()`.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 #[inline]
 fn absolute_bit_pos(
     byte_offset: usize,
@@ -598,7 +625,10 @@ fn absolute_bit_pos(
     byte_offset * 8 + bits_consumed_from_slice
 }
 
-#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+)))]
 pub fn decode_chunk_marker_bootstrap_then_isal(
     _input: &[u8],
     _encoded_offset_bits: usize,
@@ -609,7 +639,10 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     Err(ChunkDecodeError::UnsupportedPlatform)
 }
 
-#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+)))]
 pub fn decode_chunk_isal(
     _input: &[u8],
     _encoded_offset_bits: usize,
@@ -621,7 +654,10 @@ pub fn decode_chunk_isal(
 }
 
 #[cfg(test)]
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 mod tests {
     use super::*;
     use std::io::Write;

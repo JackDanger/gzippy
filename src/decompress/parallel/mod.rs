@@ -37,6 +37,7 @@ pub mod replace_markers;
 pub mod rfc_tables;
 pub mod rpmalloc_alloc;
 pub mod single_member;
+pub mod sm_cfg;
 pub mod sm_driver;
 pub mod statistics;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]

@@ -36,7 +36,11 @@
 // Module-wide dead_code allowance: some public items are exercised
 // only by the unit tests below or by configuration-gated callers.
 
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "isal-compression",
+    not(feature = "pure-rust-inflate"),
+    target_arch = "x86_64"
+))]
 use isal::isal_sys::igzip_lib as isal_raw;
 
 /// Vendor `m_buffer` capacity at `gzip/isal.hpp:207` (`std::array<char, 128_Ki>`).
@@ -119,7 +123,11 @@ pub enum InflateError {
 /// `next_in`/`avail_in`; the bit reader (`input` + `bit_reader_tell`)
 /// is the canonical "where in the input are we" cursor, and
 /// `refill_buffer` is what bridges the two.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "isal-compression",
+    not(feature = "pure-rust-inflate"),
+    target_arch = "x86_64"
+))]
 pub struct IsalInflateWrapper<'a> {
     state: isal_raw::inflate_state,
     /// Underlying compressed input. Vendor's `m_bitReader` wraps the
@@ -148,7 +156,11 @@ pub struct IsalInflateWrapper<'a> {
     buffer: [u8; STAGING_BUFFER_BYTES],
 }
 
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "isal-compression",
+    not(feature = "pure-rust-inflate"),
+    target_arch = "x86_64"
+))]
 impl<'a> IsalInflateWrapper<'a> {
     /// Convenience constructor: `until_bits = input.len() * 8` (no cap
     /// beyond the slice end). Existing call sites that don't know a
@@ -583,14 +595,144 @@ impl<'a> IsalInflateWrapper<'a> {
     }
 }
 
-// On non-x86_64 / no-feature builds, the wrapper is unavailable.
-// Provide a stub type so callers compile but cannot construct it.
-#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+// ── Pure-Rust backend (Track B3) ─────────────────────────────────────────
+
+#[cfg(all(feature = "pure-rust-inflate", target_arch = "x86_64"))]
+pub struct IsalInflateWrapper<'a> {
+    inner: crate::decompress::inflate::consume_first_decode::ResumableInflate<'a>,
+}
+
+#[cfg(all(feature = "pure-rust-inflate", target_arch = "x86_64"))]
+impl<'a> IsalInflateWrapper<'a> {
+    pub fn new(input: &'a [u8], bit_offset: usize) -> Result<Self, InflateError> {
+        Self::with_until_bits(input, bit_offset, input.len() * 8)
+    }
+
+    pub fn with_until_bits(
+        input: &'a [u8],
+        bit_offset: usize,
+        until_bits: usize,
+    ) -> Result<Self, InflateError> {
+        let inner =
+            crate::decompress::inflate::consume_first_decode::ResumableInflate::with_until_bits(
+                input, bit_offset, until_bits,
+            )
+            .map_err(|_| InflateError::StartBitPastEnd)?;
+        Ok(Self { inner })
+    }
+
+    pub fn set_window(&mut self, window: &[u8]) -> Result<(), InflateError> {
+        self.inner
+            .set_window(window)
+            .map_err(|_| InflateError::SetDictFailed)
+    }
+
+    pub fn set_stopping_points(&mut self, points: StoppingPoints) {
+        use crate::decompress::inflate::stopping_point::StoppingPoint;
+        self.inner.set_stopping_points(StoppingPoint(points.0));
+    }
+
+    pub fn stopped_at(&self) -> StoppingPoints {
+        StoppingPoints(self.inner.stopped_at().0)
+    }
+
+    pub fn clear_stop(&mut self) {
+        self.inner.clear_stop();
+    }
+
+    pub fn debug_points_to_stop_at(&self) -> u32 {
+        self.inner.points_to_stop_at().0
+    }
+
+    pub fn debug_stopped_at_raw(&self) -> u32 {
+        self.inner.stopped_at().0
+    }
+
+    pub fn debug_tmp_out_stopped_at(&self) -> u32 {
+        0
+    }
+
+    pub fn debug_block_state(&self) -> u32 {
+        0
+    }
+
+    pub fn is_final_block(&self) -> bool {
+        self.inner.is_final_block()
+    }
+
+    pub fn btype(&self) -> Option<DeflateCompressionType> {
+        self.inner.btype().and_then(|t| match t {
+            0 => Some(DeflateCompressionType::Uncompressed),
+            1 => Some(DeflateCompressionType::FixedHuffman),
+            2 => Some(DeflateCompressionType::DynamicHuffman),
+            _ => None,
+        })
+    }
+
+    pub fn tell_compressed(&self) -> usize {
+        self.inner.tell_compressed()
+    }
+
+    pub fn read_footer_at_current(&mut self) -> Result<(u32, u32), InflateError> {
+        let mut footer = [0u8; 8];
+        let rem = self.inner.remaining_input();
+        if rem.len() < 8 {
+            return Err(InflateError::Internal(-1));
+        }
+        footer.copy_from_slice(&rem[..8]);
+        self.inner.advance_input(8);
+        let crc32 = u32::from_le_bytes([footer[0], footer[1], footer[2], footer[3]]);
+        let isize_field = u32::from_le_bytes([footer[4], footer[5], footer[6], footer[7]]);
+        Ok((crc32, isize_field))
+    }
+
+    pub fn reset_for_next_stream(&mut self) {
+        self.inner.reset_for_next_stream();
+    }
+
+    pub fn remaining_input(&self) -> &'a [u8] {
+        self.inner.remaining_input()
+    }
+
+    pub fn advance_input(&mut self, n: usize) {
+        self.inner.advance_input(n);
+    }
+
+    pub fn at_end_of_stream(&self) -> bool {
+        self.inner.at_end_of_stream()
+    }
+
+    pub fn encoded_until_bits(&self) -> usize {
+        self.inner.encoded_until_bits()
+    }
+
+    pub fn read_stream(&mut self, output: &mut [u8]) -> Result<ReadStreamResult, InflateError> {
+        let r = self
+            .inner
+            .read_stream(output)
+            .map_err(|_| InflateError::InvalidBlock)?;
+        Ok(ReadStreamResult {
+            bytes_written: r.bytes_written,
+            stopped_at: StoppingPoints(r.stopped_at.0),
+            bit_position: r.bit_position,
+            finished: r.finished,
+        })
+    }
+}
+
+// On non-x86_64 / no parallel-SM feature builds, the wrapper is unavailable.
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+)))]
 pub struct IsalInflateWrapper<'a> {
     _phantom: std::marker::PhantomData<&'a [u8]>,
 }
 
-#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+)))]
 impl<'a> IsalInflateWrapper<'a> {
     pub fn new(_input: &'a [u8], _bit_offset: usize) -> Result<Self, InflateError> {
         Err(InflateError::UnsupportedPlatform)
@@ -607,7 +749,10 @@ impl<'a> IsalInflateWrapper<'a> {
 // ── Unit tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -950,5 +1095,152 @@ mod tests {
             out
         };
         assert_eq!(full, reference);
+    }
+
+    /// Differential oracle (Track B1): pure-Rust `ResumableInflate` must
+    /// match patched ISA-L at every block boundary, including with a
+    /// predecessor window at non-zero bit offsets.
+    #[cfg(all(feature = "isal-compression", not(feature = "pure-rust-inflate")))]
+    mod resumable_isal_oracle {
+        use super::*;
+        use crate::decompress::inflate::consume_first_decode::ResumableInflate;
+        use crate::decompress::inflate::stopping_point::StoppingPoint;
+
+        fn collect_block_ends(deflate: &[u8]) -> Vec<usize> {
+            let mut probe = IsalInflateWrapper::new(deflate, 0).expect("probe");
+            probe.set_window(&[]).expect("set_window");
+            probe.set_stopping_points(StoppingPoints::END_OF_BLOCK);
+            let mut buf = vec![0u8; deflate.len() * 16];
+            let mut total = 0usize;
+            let mut ends = Vec::new();
+            loop {
+                let r = probe.read_stream(&mut buf[total..]).expect("read");
+                total += r.bytes_written;
+                if r.stopped_at == StoppingPoints::END_OF_BLOCK {
+                    ends.push(r.bit_position);
+                    if r.finished {
+                        break;
+                    }
+                    continue;
+                }
+                if r.finished || r.bytes_written == 0 {
+                    break;
+                }
+            }
+            ends
+        }
+
+        fn decode_isal(
+            deflate: &[u8],
+            bit_offset: usize,
+            until_bits: usize,
+            window: &[u8],
+            stop: StoppingPoints,
+        ) -> ReadStreamResult {
+            let mut w =
+                IsalInflateWrapper::with_until_bits(deflate, bit_offset, until_bits).expect("isal");
+            w.set_window(window).expect("window");
+            w.set_stopping_points(stop);
+            let mut buf = vec![0u8; deflate.len() * 16];
+            w.read_stream(&mut buf).expect("read")
+        }
+
+        fn decode_rust(
+            deflate: &[u8],
+            bit_offset: usize,
+            until_bits: usize,
+            window: &[u8],
+            stop: StoppingPoint,
+        ) -> crate::decompress::inflate::consume_first_decode::InflateStreamResult {
+            let mut r =
+                ResumableInflate::with_until_bits(deflate, bit_offset, until_bits).expect("rust");
+            r.set_window(window).expect("window");
+            r.set_stopping_points(stop);
+            let mut buf = vec![0u8; deflate.len() * 16];
+            r.read_stream(&mut buf).expect("read")
+        }
+
+        #[test]
+        fn stopping_points_match_at_every_block_boundary() {
+            let payload = vec![0xABu8; 300_000];
+            let deflate = make_multi_block_deflate(&payload);
+            let ends = collect_block_ends(&deflate);
+            assert!(ends.len() >= 2, "need multi-block fixture");
+
+            for &until in &ends {
+                for stop in [
+                    StoppingPoints::END_OF_BLOCK,
+                    StoppingPoints::END_OF_BLOCK_HEADER,
+                ] {
+                    let isal = decode_isal(&deflate, 0, until, &[], stop);
+                    let rust = decode_rust(&deflate, 0, until, &[], StoppingPoint(stop.0));
+                    assert_eq!(
+                        StoppingPoints(rust.stopped_at.0),
+                        isal.stopped_at,
+                        "stopped_at mismatch at until={until} stop={stop:?}"
+                    );
+                    assert_eq!(
+                        rust.bit_position, isal.bit_position,
+                        "bit_position mismatch at until={until} stop={stop:?}"
+                    );
+                    assert_eq!(
+                        rust.bytes_written, isal.bytes_written,
+                        "bytes_written mismatch at until={until} stop={stop:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn resume_with_window_matches_isal() {
+            let payload = vec![0xCDu8; 400_000];
+            let deflate = make_deflate(&payload);
+            let ends = collect_block_ends(&deflate);
+            let resume_at = ends
+                .iter()
+                .copied()
+                .find(|p| *p % 8 != 0)
+                .unwrap_or_else(|| ends[ends.len() / 2]);
+
+            let mut prefix = vec![0u8; payload.len()];
+            {
+                let mut w = IsalInflateWrapper::with_until_bits(&deflate, 0, resume_at).unwrap();
+                w.set_window(&[]).unwrap();
+                let r = w.read_stream(&mut prefix).unwrap();
+                prefix.truncate(r.bytes_written);
+                assert_eq!(r.bit_position, resume_at);
+            }
+            {
+                let mut r =
+                    ResumableInflate::with_until_bits(&deflate, 0, resume_at).expect("rust");
+                r.set_window(&[]).expect("window");
+                let mut buf = vec![0u8; payload.len()];
+                let rr = r.read_stream(&mut buf).expect("read");
+                assert_eq!(rr.bit_position, resume_at);
+                assert_eq!(rr.bytes_written, prefix.len());
+                assert_eq!(&buf[..rr.bytes_written], prefix.as_slice());
+            }
+
+            let window_start = prefix.len().saturating_sub(32768);
+            let window = &prefix[window_start..];
+
+            let isal_tail = decode_isal(
+                &deflate,
+                resume_at,
+                deflate.len() * 8,
+                window,
+                StoppingPoints::END_OF_BLOCK,
+            );
+            let rust_tail = decode_rust(
+                &deflate,
+                resume_at,
+                deflate.len() * 8,
+                window,
+                StoppingPoint::END_OF_BLOCK,
+            );
+            assert_eq!(StoppingPoints(rust_tail.stopped_at.0), isal_tail.stopped_at);
+            assert_eq!(rust_tail.bit_position, isal_tail.bit_position);
+            assert_eq!(rust_tail.bytes_written, isal_tail.bytes_written);
+        }
     }
 }

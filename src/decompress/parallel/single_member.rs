@@ -25,7 +25,10 @@
 
 use std::io::{self, Write};
 use std::sync::atomic::AtomicU64;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
@@ -138,7 +141,10 @@ pub fn decompress_parallel<W: Write>(
         return Err(ParallelError::InvalidGzipFormat);
     }
 
-    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(feature = "isal-compression", feature = "pure-rust-inflate")
+    ))]
     {
         use crate::decompress::parallel::sm_driver::{read_parallel_sm, ReadParallelSmError};
 
@@ -189,7 +195,10 @@ pub fn decompress_parallel<W: Write>(
         }
         Ok(result.total_size as u64)
     }
-    #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        any(feature = "isal-compression", feature = "pure-rust-inflate")
+    )))]
     {
         let _ = (writer, t0, deflate_data_len);
         Err(ParallelError::UnsupportedPlatform)

@@ -219,11 +219,19 @@ pub struct Block {
     /// `Block::new`, rebuilt in place at the start of each compressed
     /// block. Mirror of `HuffmanCodingISAL` member storage in
     /// `vendor/rapidgzip/.../huffman/HuffmanCodingISAL.hpp:185-188`.
-    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    #[cfg(all(
+        feature = "isal-compression",
+        not(feature = "pure-rust-inflate"),
+        target_arch = "x86_64"
+    ))]
     isal_litlen: crate::decompress::parallel::isal_huffman::IsalLitLenCode,
     /// Reusable ISA-L distance decode table — same reuse contract as
     /// `isal_litlen`. Mirror of `HuffmanCodingDistanceISAL`.
-    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    #[cfg(all(
+        feature = "isal-compression",
+        not(feature = "pure-rust-inflate"),
+        target_arch = "x86_64"
+    ))]
     isal_dist: crate::decompress::parallel::isal_huffman::IsalDistCode,
 }
 
@@ -281,9 +289,17 @@ impl Block {
             ring_drained: 0,
             distance_to_last_marker_byte: 0,
             contains_marker_bytes: true,
-            #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+            #[cfg(all(
+                feature = "isal-compression",
+                not(feature = "pure-rust-inflate"),
+                target_arch = "x86_64"
+            ))]
             isal_litlen: crate::decompress::parallel::isal_huffman::IsalLitLenCode::new_empty(),
-            #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+            #[cfg(all(
+                feature = "isal-compression",
+                not(feature = "pure-rust-inflate"),
+                target_arch = "x86_64"
+            ))]
             isal_dist: crate::decompress::parallel::isal_huffman::IsalDistCode::new_empty(),
         }
     }
@@ -814,7 +830,11 @@ impl Block {
     /// dead-strips marker-maintenance code in the `false` variant.
     /// Mirror of vendor's `if constexpr (containsMarkerBytes)`
     /// pattern at deflate.hpp:1311, 1379, 1652.
-    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    #[cfg(all(
+        feature = "isal-compression",
+        not(feature = "pure-rust-inflate"),
+        target_arch = "x86_64"
+    ))]
     pub fn read_internal_compressed(
         &mut self,
         bits: &mut Bits,
@@ -827,7 +847,11 @@ impl Block {
         }
     }
 
-    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    #[cfg(all(
+        feature = "isal-compression",
+        not(feature = "pure-rust-inflate"),
+        target_arch = "x86_64"
+    ))]
     fn read_internal_compressed_specialized<const CONTAINS_MARKERS: bool>(
         &mut self,
         bits: &mut Bits,
@@ -1336,7 +1360,11 @@ impl Block {
     /// decoder. On x86_64+ISA-L `read_internal_compressed` above
     /// dispatches DYNAMIC to the ISA-L LUT and FIXED to the canonical
     /// path; elsewhere both go through the canonical path.
-    #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+    #[cfg(not(all(
+        feature = "isal-compression",
+        not(feature = "pure-rust-inflate"),
+        target_arch = "x86_64"
+    )))]
     pub fn read_internal_compressed(
         &mut self,
         bits: &mut Bits,

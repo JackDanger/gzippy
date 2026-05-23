@@ -51,45 +51,99 @@
 //!   after `apply_window` completes (`appendSubchunksToIndexes`).
 
 use crate::decompress::parallel::chunk_data::ChunkConfiguration;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::chunk_data::ChunkData;
 use crate::decompress::parallel::gzip_chunk::ChunkDecodeError;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use std::sync::Arc;
 
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::apply_window::apply_window;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::block_fetcher::BlockFetcher;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::block_map::{append_subchunks_to_block_map, BlockMap};
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::compressed_vector::CompressionType;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::crc32::CRC32Calculator;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::gzip_block_finder::{GetReturnCode, GzipBlockFinder};
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::gzip_chunk::{
     decode_chunk_isal, decode_chunk_marker_bootstrap_then_isal,
 };
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::prefetcher::FetchMultiStream;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::raw_block_finder::RawBlockFinderCoordinator;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::streamed_results::StreamedGetReturnCode;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::thread_pool::ThreadPool;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::trace;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use crate::decompress::parallel::window_map::{Window, WindowMap};
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use std::borrow::Cow;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use std::sync::mpsc;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 use std::time::Duration;
 
 /// Materialize a `Window`'s raw bytes. Mirror of vendor's
@@ -98,7 +152,10 @@ use std::time::Duration;
 /// single-pass single-member production case) this is a zero-alloc
 /// slice borrow into the existing `CompressedVector`. For Zlib
 /// (seekable-reader path) it allocates a fresh `Vec<u8>`.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 fn materialize_window(w: &Window) -> Cow<'_, [u8]> {
     if w.compression_type() == CompressionType::None {
         Cow::Borrowed(w.raw_bytes())
@@ -118,12 +175,18 @@ fn materialize_window(w: &Window) -> Cow<'_, [u8]> {
 /// `:264-289`). Single-pass single-member streaming never queries
 /// this; it is scaffolding for the seekable-reader path
 /// (`sm_driver.rs`).
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub type UnsplitBlocks = Arc<std::sync::Mutex<std::collections::HashMap<usize, usize>>>;
 
 /// Construct a fresh, empty `UnsplitBlocks`. Mirror of the default
 /// construction of `m_unsplitBlocks` as a `GzipChunkFetcher` member.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 fn new_unsplit_blocks() -> UnsplitBlocks {
     Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -170,9 +233,15 @@ impl From<ChunkDecodeError> for FetchError {
 
 /// Vendor production defaults for `FetchMultiStream`
 /// (ParallelGzipReader.hpp:85, Prefetcher.hpp:234-336).
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 const FETCH_MEMORY_PER_STREAM: usize = 3;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 const FETCH_MAX_STREAM_COUNT: usize = 16;
 
 // ── Worker pool job parameters ───────────────────────────────────────────
@@ -183,7 +252,10 @@ const FETCH_MAX_STREAM_COUNT: usize = 16;
 /// work channel). Mirror of the arguments captured by vendor's
 /// `decodeAndMeasureBlock` task lambda body at
 /// vendor/.../core/BlockFetcher.hpp:555-558.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 #[derive(Clone, Copy)]
 struct DecodeParams {
     /// Bit offset where this chunk's decode starts.
@@ -215,19 +287,31 @@ struct DecodeParams {
 /// Mirror of the `BlockFetcher`'s implicit "captured by reference"
 /// pattern in `submitOnDemandTask` and the lambda at BlockFetcher.hpp:554
 /// (`[this, ...] () { return decodeAndMeasureBlock(...); }`).
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 #[derive(Clone, Copy)]
 struct InputSlice {
     ptr: *const u8,
     len: usize,
 }
 
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 unsafe impl Send for InputSlice {}
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 unsafe impl Sync for InputSlice {}
 
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 impl InputSlice {
     /// SAFETY: caller must guarantee the slice outlives every
     /// `InputSlice` derived from it. `drive` enforces this by holding
@@ -254,7 +338,10 @@ impl InputSlice {
 /// size. Mirror of `ParallelGzipReader::read` flowing through
 /// `GzipChunkFetcher::processNextChunk` until EOF
 /// (vendor/.../ParallelGzipReader.hpp:702-810 + GzipChunkFetcher.hpp:311-362).
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub fn drive<W: std::io::Write>(
     input: &[u8],
     writer: &mut W,
@@ -484,7 +571,10 @@ pub fn drive<W: std::io::Write>(
 /// (ParallelGzipReader.hpp:702-810). Every per-iteration step is a
 /// vendor primitive — no inline ring, no inline cache logic, no
 /// inline take-from-prefetch.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 #[allow(clippy::too_many_arguments)]
 fn consumer_loop<W: std::io::Write>(
     input: InputSlice,
@@ -1052,7 +1142,10 @@ fn consumer_loop<W: std::io::Write>(
 /// guess P = B + spacing (e.g. only 5 bits past B on a 4 MiB spacing).
 /// Using P as `until` caps the next worker to a handful of bits → ISA-L
 /// `InvalidBlock`. Skip hints that are not meaningfully past `floor`.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 fn stop_hint_bit_for(
     block_finder: &GzipBlockFinder,
     block_index: usize,
@@ -1089,7 +1182,10 @@ fn stop_hint_bit_for(
 /// whose `std::future<BlockData>` the caller waits on. Vendor calls
 /// `m_threadPool.submit([this, ...] () { return decodeAndMeasureBlock(...); }, 0)`;
 /// we mirror that with `thread_pool.submit(run_decode_task, /* priority */ 0)`.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 fn submit_decode_to_pool(
     thread_pool: &Arc<ThreadPool>,
     input: InputSlice,
@@ -1126,7 +1222,10 @@ fn submit_decode_to_pool(
 /// GzipChunkFetcher.hpp:579 (which forwards to
 /// `m_threadPool.submit(task, /* priority */ -1)` at
 /// BlockFetcher.hpp:606-611).
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 fn submit_post_process_to_pool(
     thread_pool: &Arc<ThreadPool>,
     chunk: ChunkData,
@@ -1151,7 +1250,10 @@ fn submit_post_process_to_pool(
 /// GzipChunkFetcher.hpp:692-729). Routes to `decode_chunk_isal`
 /// when the predecessor window is published, else
 /// `speculative_decode_find_boundary` (marker bootstrap when no window).
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 fn run_decode_task(
     input: InputSlice,
     params: DecodeParams,
@@ -1291,7 +1393,10 @@ fn run_decode_task(
 /// Pool-side execution of a post-process task. Mirror of the lambda
 /// body at `GzipChunkFetcher::queueChunkForPostProcessing`
 /// (vendor/.../GzipChunkFetcher.hpp:579-582).
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> ChunkData {
     // Vendor lambda at GzipChunkFetcher.hpp:579-582 — `applyWindow` only.
     // WindowMap writes happen on the consumer (`publish_subchunk_windows`).
@@ -1303,7 +1408,10 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
 
 /// Consumer-thread publication of per-subchunk tail windows. Mirror of
 /// vendor `appendSubchunksToIndexes` (GzipChunkFetcher.hpp:429-458).
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 fn publish_subchunk_windows(window_map: &WindowMap, chunk: &ChunkData) {
     for sc in &chunk.subchunks {
         let sc_end_bit = sc.encoded_offset_bits + sc.encoded_size_bits;
@@ -1354,7 +1462,10 @@ pub static PREFETCH_REJECT_BY_GUARD: std::sync::atomic::AtomicU64 =
 /// Speculative slow-path decode without a predecessor window. Must use
 /// marker bootstrap — plain ISA-L with an empty dict resolves unknown
 /// back-refs against zeros and corrupts output (Bug B, commit 4909ac7).
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 fn try_speculative_decode_candidate(
     input: &[u8],
     decode_start: usize,
@@ -1389,7 +1500,10 @@ fn try_speculative_decode_candidate(
     Ok(chunk)
 }
 
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 fn speculative_decode_find_boundary(
     input: &[u8],
     start_bit: usize,
@@ -1491,7 +1605,10 @@ fn speculative_decode_find_boundary(
 
 // ── Pending-write queue (order-preserved output) ─────────────────────────
 
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 #[allow(clippy::large_enum_variant)] // boxing ChunkData would add an alloc on the per-chunk write path
 enum PendingWrite {
     Ready {
@@ -1510,7 +1627,10 @@ enum PendingWrite {
 /// needed, then write its bytes + advance the stream CRC. Mirror of
 /// the tail of `GzipChunkFetcher::waitForReplacedMarkers` + write loop
 /// at vendor lines 516 + 333-342.
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 fn drain_one_pending<W: std::io::Write>(
     pending: &mut std::collections::VecDeque<PendingWrite>,
     window_map: &WindowMap,
@@ -1581,7 +1701,10 @@ fn drain_one_pending<W: std::io::Write>(
 }
 
 // Non-x86_64 / non-isal stub.
-#[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+)))]
 pub fn drive<W: std::io::Write>(
     _input: &[u8],
     _writer: &mut W,
@@ -1594,7 +1717,10 @@ pub fn drive<W: std::io::Write>(
 // ── Integration tests ────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 mod tests {
     use super::*;
     use std::io::Write;

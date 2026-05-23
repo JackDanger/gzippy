@@ -1,4 +1,7 @@
-#![cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+#![cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 //! Literal port of `rapidgzip::StreamedResults`
 //! (vendor/rapidgzip/librapidarchive/src/core/StreamedResults.hpp:27-158).
 //!

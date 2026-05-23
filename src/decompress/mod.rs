@@ -96,10 +96,13 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
             DecodePath::MultiMemberSeq
         };
     }
+    if crate::decompress::parallel::sm_cfg::PARALLEL_SM
+        && num_threads > 1
+        && data.len() > MIN_PARALLEL_COMPRESSED
+    {
+        return DecodePath::IsalParallelSM;
+    }
     if crate::backends::isal_decompress::is_available() {
-        if num_threads > 1 && data.len() > MIN_PARALLEL_COMPRESSED {
-            return DecodePath::IsalParallelSM;
-        }
         return DecodePath::IsalSingle;
     }
     if data.len() > 1024 * 1024 * 1024 {
@@ -517,7 +520,10 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::Write;
-    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(feature = "isal-compression", feature = "pure-rust-inflate")
+    ))]
     use std::sync::atomic::Ordering;
 
     /// The classifier — not an in-body fallback — is the only place that
@@ -543,13 +549,19 @@ mod tests {
             payload.len()
         );
         let path = classify_gzip(&payload, 4);
-        #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(feature = "isal-compression", feature = "pure-rust-inflate")
+        ))]
         assert_eq!(
             path,
             DecodePath::IsalParallelSM,
             "12 MiB compressed input on x86_64+ISA-L must classify parallel"
         );
-        #[cfg(not(all(target_arch = "x86_64", feature = "isal-compression")))]
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            any(feature = "isal-compression", feature = "pure-rust-inflate")
+        )))]
         assert_ne!(
             path,
             DecodePath::IsalParallelSM,
@@ -561,7 +573,10 @@ mod tests {
     /// never be called from the single-member dispatcher. This is the
     /// no-fallback invariant the user asked for: under no circumstances
     /// can a silent libdeflate retry mask a parallel-pipeline failure.
-    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(feature = "isal-compression", feature = "pure-rust-inflate")
+    ))]
     #[test]
     fn test_no_libdeflate_fallback_ever_fires_from_sm_path() {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
@@ -603,7 +618,10 @@ mod tests {
 
     /// A corrupted CRC must surface as `GzippyError::Decompression`, not
     /// produce silent `Ok` via a libdeflate retry.
-    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(feature = "isal-compression", feature = "pure-rust-inflate")
+    ))]
     #[test]
     fn test_parallel_sm_propagates_errors_not_fallbacks() {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK

@@ -2904,10 +2904,17 @@ pub struct InflateStreamResult {
 
 /// Resumable deflate decoder with patched-ISA-L stopping-point semantics.
 pub struct ResumableInflate<'a> {
+    input: &'a [u8],
     bits: Bits<'a>,
     points_to_stop_at: StoppingPoint,
     stopped_at: StoppingPoint,
     encoded_until_bits: usize,
+    /// Prefix window + decoded bytes for cross-chunk backrefs (`set_window`).
+    session: Vec<u8>,
+    /// Bytes from `session` already returned to the caller.
+    user_emitted: usize,
+    last_bfinal: bool,
+    last_btype: u8,
 }
 
 impl<'a> ResumableInflate<'a> {
@@ -2920,10 +2927,15 @@ impl<'a> ResumableInflate<'a> {
             return Err(Error::new(ErrorKind::InvalidData, "start bit past end"));
         }
         Ok(Self {
+            input,
             bits: Bits::at_bit_offset(input, bit_offset),
             points_to_stop_at: StoppingPoint::NONE,
             stopped_at: StoppingPoint::NONE,
             encoded_until_bits: until_bits.min(input.len() * 8),
+            session: Vec::new(),
+            user_emitted: 0,
+            last_bfinal: false,
+            last_btype: 0,
         })
     }
 
@@ -2935,24 +2947,91 @@ impl<'a> ResumableInflate<'a> {
         self.stopped_at
     }
 
+    pub fn points_to_stop_at(&self) -> StoppingPoint {
+        self.points_to_stop_at
+    }
+
     pub fn clear_stop(&mut self) {
         self.stopped_at = StoppingPoint::NONE;
+    }
+
+    /// 32-KiB sliding window for cross-chunk backrefs (mirrors ISA-L `set_dict`).
+    pub fn set_window(&mut self, window: &[u8]) -> Result<()> {
+        self.session.clear();
+        self.user_emitted = 0;
+        let take = window.len().min(32768);
+        if take > 0 {
+            self.session
+                .extend_from_slice(&window[window.len() - take..]);
+        }
+        Ok(())
+    }
+
+    pub fn is_final_block(&self) -> bool {
+        self.last_bfinal
+    }
+
+    pub fn btype(&self) -> Option<u8> {
+        if self.stopped_at == StoppingPoint::END_OF_BLOCK_HEADER {
+            Some(self.last_btype)
+        } else {
+            None
+        }
     }
 
     pub fn tell_compressed(&self) -> usize {
         self.bits.bit_position().min(self.encoded_until_bits)
     }
 
+    pub fn encoded_until_bits(&self) -> usize {
+        self.encoded_until_bits
+    }
+
     pub fn at_end_of_stream(&self) -> bool {
-        self.tell_compressed() >= self.encoded_until_bits
+        self.stopped_at == StoppingPoint::END_OF_STREAM
+    }
+
+    pub fn remaining_input(&self) -> &'a [u8] {
+        let byte_pos = self.tell_compressed() / 8;
+        if byte_pos >= self.input.len() {
+            &[]
+        } else {
+            &self.input[byte_pos..]
+        }
+    }
+
+    pub fn advance_input(&mut self, n: usize) {
+        let target = (self.tell_compressed() + n.saturating_mul(8)).min(self.encoded_until_bits);
+        self.bits = Bits::at_bit_offset(self.input, target);
+        if target > self.encoded_until_bits {
+            self.encoded_until_bits = self.input.len() * 8;
+        }
+    }
+
+    pub fn reset_for_next_stream(&mut self) {
+        self.points_to_stop_at = StoppingPoint::NONE;
+        self.stopped_at = StoppingPoint::NONE;
+        self.last_bfinal = false;
+        self.last_btype = 0;
+    }
+
+    fn copy_session_to_user(&mut self, output: &mut [u8], user_written: usize) -> usize {
+        let pending = self.session.len().saturating_sub(self.user_emitted);
+        let n = pending.min(output.len() - user_written);
+        if n > 0 {
+            output[user_written..user_written + n]
+                .copy_from_slice(&self.session[self.user_emitted..self.user_emitted + n]);
+            self.user_emitted += n;
+        }
+        n
     }
 
     /// Decode into `output`, stopping early when a requested stop point fires.
     pub fn read_stream(&mut self, output: &mut [u8]) -> Result<InflateStreamResult> {
         self.stopped_at = StoppingPoint::NONE;
-        let mut out_pos = 0usize;
+        let mut user_written = 0usize;
 
-        while out_pos < output.len() {
+        while user_written < output.len() {
             if self.bits.bit_position() >= self.encoded_until_bits {
                 break;
             }
@@ -2965,6 +3044,8 @@ impl<'a> ResumableInflate<'a> {
 
             let bfinal = (self.bits.peek() & 1) != 0;
             let btype = ((self.bits.peek() >> 1) & 3) as u8;
+            self.last_bfinal = bfinal;
+            self.last_btype = btype;
             self.bits.consume(3);
 
             if self
@@ -2973,27 +3054,30 @@ impl<'a> ResumableInflate<'a> {
             {
                 self.stopped_at = StoppingPoint::END_OF_BLOCK_HEADER;
                 return Ok(InflateStreamResult {
-                    bytes_written: out_pos,
+                    bytes_written: user_written,
                     stopped_at: self.stopped_at,
                     bit_position: self.tell_compressed(),
                     finished: false,
                 });
             }
 
-            let prev_pos = out_pos;
-            match btype {
-                0 => out_pos = decode_stored(&mut self.bits, output, out_pos)?,
-                1 => out_pos = decode_fixed(&mut self.bits, output, out_pos)?,
-                2 => out_pos = decode_dynamic(&mut self.bits, output, out_pos)?,
+            let decode_start = self.session.len();
+            let max_new = output.len() - user_written;
+            self.session.resize(decode_start + max_new.max(65536), 0);
+            let new_pos = match btype {
+                0 => decode_stored(&mut self.bits, &mut self.session, decode_start)?,
+                1 => decode_fixed(&mut self.bits, &mut self.session, decode_start)?,
+                2 => decode_dynamic(&mut self.bits, &mut self.session, decode_start)?,
                 3 => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type")),
                 _ => unreachable!(),
-            }
-            let _ = prev_pos;
+            };
+            self.session.truncate(new_pos);
+            user_written += self.copy_session_to_user(output, user_written);
 
             if self.points_to_stop_at.contains(StoppingPoint::END_OF_BLOCK) {
                 self.stopped_at = StoppingPoint::END_OF_BLOCK;
                 return Ok(InflateStreamResult {
-                    bytes_written: out_pos,
+                    bytes_written: user_written,
                     stopped_at: self.stopped_at,
                     bit_position: self.tell_compressed(),
                     finished: bfinal,
@@ -3008,14 +3092,14 @@ impl<'a> ResumableInflate<'a> {
                 {
                     self.stopped_at = StoppingPoint::END_OF_STREAM;
                     return Ok(InflateStreamResult {
-                        bytes_written: out_pos,
+                        bytes_written: user_written,
                         stopped_at: self.stopped_at,
                         bit_position: self.tell_compressed(),
                         finished: true,
                     });
                 }
                 return Ok(InflateStreamResult {
-                    bytes_written: out_pos,
+                    bytes_written: user_written,
                     stopped_at: StoppingPoint::NONE,
                     bit_position: self.tell_compressed(),
                     finished: true,
@@ -3024,7 +3108,7 @@ impl<'a> ResumableInflate<'a> {
         }
 
         Ok(InflateStreamResult {
-            bytes_written: out_pos,
+            bytes_written: user_written,
             stopped_at: StoppingPoint::NONE,
             bit_position: self.tell_compressed(),
             finished: self.at_end_of_stream(),
