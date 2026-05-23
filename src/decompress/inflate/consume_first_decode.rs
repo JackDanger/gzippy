@@ -1852,6 +1852,10 @@ fn decode_stored(bits: &mut Bits, output: &mut [u8], mut out_pos: usize) -> Resu
     let nlen = bits.read_u16();
 
     if len != !nlen {
+        // Past the final block, trailing zero bytes can look like len=nlen=0.
+        if len == 0 && nlen == 0 && bits.pos >= bits.data.len().saturating_sub(2) {
+            return Ok(out_pos);
+        }
         eprintln!(
             "Invalid stored block: len={:#x}, nlen={:#x}, !nlen={:#x}, pos={}, out_pos={}",
             len, nlen, !nlen, bits.pos, out_pos
@@ -3067,11 +3071,34 @@ impl<'a> ResumableInflate<'a> {
             if self.bits.bit_position() >= self.encoded_until_bits {
                 break;
             }
+            let remaining_in_cap = self
+                .encoded_until_bits
+                .saturating_sub(self.bits.bit_position());
+            if remaining_in_cap < 3 {
+                return Ok(InflateStreamResult {
+                    bytes_written: user_written,
+                    stopped_at: StoppingPoint::NONE,
+                    bit_position: self.tell_compressed(),
+                    finished: true,
+                });
+            }
             if self.bits.available() < 3 {
                 self.bits.refill();
             }
             if self.bits.bit_position() >= self.encoded_until_bits {
                 break;
+            }
+            if self
+                .encoded_until_bits
+                .saturating_sub(self.bits.bit_position())
+                < 3
+            {
+                return Ok(InflateStreamResult {
+                    bytes_written: user_written,
+                    stopped_at: StoppingPoint::NONE,
+                    bit_position: self.tell_compressed(),
+                    finished: true,
+                });
             }
 
             let bfinal = (self.bits.peek() & 1) != 0;
