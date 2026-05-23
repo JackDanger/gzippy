@@ -1222,26 +1222,22 @@ impl Block {
                 run_canonical_loop!(|bits: &mut Bits| litlen_hc.decode(bits))
             }
             CompressionType::DynamicHuffman => {
-                use crate::decompress::parallel::huffman_short_bits_cached_deflate::{
-                    HuffmanCodingShortBitsCachedDeflate, DISTANCE_EOB,
+                use crate::decompress::parallel::gzip_definitions::END_OF_BLOCK_SYMBOL;
+                use crate::decompress::parallel::huffman_short_bits_multi_cached::{
+                    HuffmanCodingShortBitsMultiCached, MULTI_DISTANCE_OFFSET,
                 };
+                use crate::decompress::parallel::rfc_tables::get_distance_dynamic;
 
-                const DIST_CAP: usize = MAX_DISTANCE_SYMBOL_COUNT + 2;
-                let mut dist_rev = HuffmanCodingReversedBitsCached::<DIST_CAP>::new();
-                let err = dist_rev.initialize_from_lengths(&dist_lens, false);
+                let mut litlen_hc = HuffmanCodingShortBitsMultiCached::new();
+                let err = litlen_hc.initialize_from_lengths(&litlen_lens);
                 if err != super::error::Error::None {
                     return Err(BlockError::InvalidCodeLengths);
                 }
 
-                let mut litlen_hc = HuffmanCodingShortBitsCachedDeflate::new();
-                let err = litlen_hc.initialize_from_lengths(&litlen_lens, &dist_rev);
-                if err != super::error::Error::None {
-                    return Err(BlockError::InvalidCodeLengths);
-                }
-
-                macro_rules! run_deflate_cached_loop {
+                macro_rules! run_multi_cached_loop {
                     () => {{
                         const MAX_RUN_LENGTH: usize = 258;
+                        const MAX_LIT_LEN_SYM: u32 = 512;
                         let n_max_to_decode = n_max_to_decode.min(RING_SIZE - MAX_RUN_LENGTH);
 
                         let ring_ptr = self.output_ring.as_mut_ptr();
@@ -1259,55 +1255,69 @@ impl Block {
                         }
 
                         while emitted < n_max_to_decode {
-                            let cache_entry = litlen_hc.decode(bits, &dist_hc);
-                            match cache_entry.distance {
-                                DISTANCE_EOB => {
-                                    self.at_end_of_block = true;
-                                    commit!(Ok(emitted));
-                                }
-                                0 => {
-                                    let byte = cache_entry.symbol_or_length;
+                            let (mut symbol, mut symbol_count) = litlen_hc.decode(bits);
+                            if symbol_count == 0 {
+                                commit!(Err(BlockError::InvalidHuffmanCode));
+                            }
+
+                            while symbol_count > 0 {
+                                let code = (symbol & 0xFFFF) as u16;
+                                if code <= 255 || symbol_count > 1 {
                                     unsafe {
-                                        ring_ptr.add(pos % RING_SIZE).write(byte as u16);
+                                        ring_ptr.add(pos % RING_SIZE).write(code);
                                     }
                                     pos += 1;
                                     emitted += 1;
                                     if CONTAINS_MARKERS {
                                         distance_marker += 1;
                                     }
+                                    symbol >>= 8;
+                                    symbol_count -= 1;
+                                    continue;
                                 }
-                                distance => {
-                                    if cache_entry.bits_to_skip == 0
-                                        && cache_entry.symbol_or_length == 0
-                                    {
-                                        commit!(Err(BlockError::InvalidHuffmanCode));
-                                    }
-                                    let length = cache_entry.symbol_or_length as usize + 3;
-                                    let distance = distance as usize;
-                                    if distance == 0 || distance > MAX_WINDOW_SIZE {
-                                        commit!(Err(BlockError::ExceededWindowRange));
-                                    }
-                                    if !CONTAINS_MARKERS && distance > self.decoded_bytes + emitted
-                                    {
-                                        commit!(Err(BlockError::ExceededWindowRange));
-                                    }
-                                    unsafe {
-                                        emit_backref_ring::<CONTAINS_MARKERS>(
-                                            ring_ptr,
-                                            &mut pos,
-                                            distance,
-                                            length,
-                                            &mut distance_marker,
-                                        );
-                                    }
-                                    emitted += length;
-                                    if self.track_backreferences {
-                                        self.backreferences.push(Backreference {
-                                            distance: distance as u16,
-                                            length: length as u16,
-                                        });
-                                    }
+
+                                if code == END_OF_BLOCK_SYMBOL {
+                                    self.at_end_of_block = true;
+                                    commit!(Ok(emitted));
                                 }
+                                if u32::from(code) > MAX_LIT_LEN_SYM {
+                                    commit!(Err(BlockError::InvalidHuffmanCode));
+                                }
+
+                                let length = (symbol - MULTI_DISTANCE_OFFSET) as usize;
+                                if length == 0 {
+                                    symbol >>= 8;
+                                    symbol_count -= 1;
+                                    continue;
+                                }
+                                let distance = match get_distance_dynamic(&dist_hc, bits) {
+                                    Ok(d) => d as usize,
+                                    Err(_) => commit!(Err(BlockError::InvalidHuffmanCode)),
+                                };
+                                if distance == 0 || distance > MAX_WINDOW_SIZE {
+                                    commit!(Err(BlockError::ExceededWindowRange));
+                                }
+                                if !CONTAINS_MARKERS && distance > self.decoded_bytes + emitted {
+                                    commit!(Err(BlockError::ExceededWindowRange));
+                                }
+                                unsafe {
+                                    emit_backref_ring::<CONTAINS_MARKERS>(
+                                        ring_ptr,
+                                        &mut pos,
+                                        distance,
+                                        length,
+                                        &mut distance_marker,
+                                    );
+                                }
+                                emitted += length;
+                                if self.track_backreferences {
+                                    self.backreferences.push(Backreference {
+                                        distance: distance as u16,
+                                        length: length as u16,
+                                    });
+                                }
+                                symbol >>= 8;
+                                symbol_count -= 1;
                             }
                         }
                         self.ring_pos = pos;
@@ -1316,7 +1326,7 @@ impl Block {
                         Ok(emitted)
                     }};
                 }
-                run_deflate_cached_loop!()
+                run_multi_cached_loop!()
             }
             _ => Err(BlockError::InvalidCompression),
         }

@@ -20,8 +20,11 @@ on `neurotic` (16 physical x86_64).
 | `core/StreamedResults.hpp:27-158` | `streamed_results.rs` |
 | `core/BlockFinder.hpp:35-218` | `raw_block_finder.rs::RawBlockFinderCoordinator` |
 | `core/BlockFetcher.hpp:38-687` | `block_fetcher.rs`; `process_ready_prefetches` at `:696` (vendor 427/463) |
+| `rapidgzip/huffman/HuffmanCodingReversedBitsCached.hpp:32-136` | `huffman_reversed_bits_cached.rs`; wired for FIXED litlen at `deflate_block.rs` canonical path |
+| `rapidgzip/huffman/HuffmanCodingShortBitsCachedDeflate.hpp:22-280` | `huffman_short_bits_cached_deflate.rs` (+ `rfc_tables.rs` helpers); distance HC uses §1 `code_cache()` at LUT fill |
+| `rapidgzip/huffman/HuffmanCodingShortBitsMultiCached.hpp:24-269` | `huffman_short_bits_multi_cached.rs`; wired for DYNAMIC canonical decode in `deflate_block.rs` (bootstrap leg) |
+| `core/Prefetcher.hpp:234-336` | `prefetcher.rs:232-343` (`FetchMultiStream`); **wired** at `chunk_fetcher.rs:304` (`3×16` vendor defaults) |
 | `core/Prefetcher.hpp:60-225` | `prefetcher.rs:41-211` (`FetchNextFixed`, `FetchNextAdaptive`) |
-| `core/Prefetcher.hpp:234-336` | `prefetcher.rs:232-343` (`FetchMultiStream` — **not yet wired**, see §4) |
 | `core/FasterVector.hpp:73-113` (`RpmallocAllocator`), `:124` (`FasterVector` alias) | `rpmalloc_alloc.rs` (`unsafe impl allocator_api2::alloc::Allocator for RpmallocAlloc` on `rpmalloc-sys`); `chunk_data.rs:24` `ChunkData::data` / `data_with_markers` typed `allocator_api2::vec::Vec<T, RpmallocAlloc>`; `Cargo.toml` features `arena-allocator = ["dep:allocator-api2", "dep:rpmalloc-sys"]`, transitively enabled by `isal-compression` |
 | `core/BlockMap.hpp` | `block_map.rs` |
 | `core/Cache.hpp` | `cache.rs` |
@@ -38,119 +41,26 @@ on `neurotic` (16 physical x86_64).
 
 ## Unported primitives
 
-Listed in dependency order.
+Listed in dependency order. **§§1–4 are done** (May 2026); §5 remains.
 
-### 1. `HuffmanCodingReversedBitsCached`
+### ~~1. `HuffmanCodingReversedBitsCached`~~ ✅
 
-**Vendor:** `huffman/HuffmanCodingReversedBitsCached.hpp:32-136`.
-Generic LUT-cached canonical decoder, `1 << MAX_CODE_LENGTH` entries of
-`(length, symbol)`. `gzip/deflate.hpp:196` aliases it as
-`FixedHuffmanCoding` — every BTYPE=01 block. Also the distance HC for
-the deflate-specific decoder in §2.
+**Done.** `huffman_reversed_bits_cached.rs`; FIXED litlen in
+`deflate_block.rs::read_internal_compressed_canonical_specialized`.
 
-**gzippy now.** No port.
-`deflate_block.rs:1095 read_internal_compressed_canonical_specialized`
-builds tables via `HuffmanCodingSymbolsPerLength` (one-bit-per-symbol
-tree walk) for both DYNAMIC and FIXED, with the litlen call site at
-`:1126` and the distance call site at `:1132`. RFC 1951 length arrays
-for FIXED come from `fixed_huffman_code_lengths()` at `:1315`. x86_64
-production routes through ISA-L (`inflate_wrapper.rs`) for the
-post-bootstrap leg and bypasses this; the marker-bootstrap leg
-(`gzip_chunk.rs:411 bootstrap_with_deflate_block`) hits this slow path
-on every arch.
+### ~~2. `HuffmanCodingShortBitsCachedDeflate<11>`~~ ✅
 
-**Delta.** Add `huffman_reversed_bits_cached.rs`. Wraps
-`HuffmanCodingSymbolsPerLength` plus
-`code_cache: [(u8 /*length*/, u16 /*symbol*/); 1 << MAX_LEN]`.
-`initialize_from_lengths` fills the cache by reversing each canonical
-code via `bit_manipulation::reverse_bits`. `decode(bit_reader)` peeks
-`MAX_LEN` and returns the cache entry directly.
+**Done.** `huffman_short_bits_cached_deflate.rs` + `rfc_tables.rs`.
+Ported for vendor fidelity; DYNAMIC canonical path uses §3 MultiCached.
 
-**Wiring.** `deflate_block.rs:1126` litlen HC: for
-`CompressionType::FixedHuffman` the litlen HC swaps to
-`HuffmanCodingReversedBitsCached`; the `:1132` distance HC stays —
-FIXED blocks have no separate distance table (RFC 1951 3.2.6).
+### ~~3. `HuffmanCodingShortBitsMultiCached<11>`~~ ✅
 
-**Dependency.** None — base `HuffmanCodingSymbolsPerLength`
-(`huffman_symbols_per_length.rs:228`) is already ported.
+**Done.** `huffman_short_bits_multi_cached.rs`; DYNAMIC canonical loop
+mirrors vendor `readInternalCompressedMultiCached` (deflate.hpp:1585-1666).
 
-### 2. `HuffmanCodingShortBitsCachedDeflate<11>`
+### ~~4. `FetchMultiStream` production wiring~~ ✅
 
-**Vendor:** `huffman/HuffmanCodingShortBitsCachedDeflate.hpp:22-280`.
-Deflate-specialized 11-bit LUT for DYNAMIC blocks. Cache entry:
-
-```cpp
-struct CacheEntry { uint8_t bitsToSkip; uint8_t symbolOrLength; uint16_t distance; };
-```
-
-The distance code is fused into the literal-LUT when both fit one
-peek. Selected by `gzip/deflate.hpp:177 LiteralOrLengthHuffmanCoding`
-when `WITH_DEFLATE_SPECIFIC_HUFFMAN_DECODER` is defined. The LUT fill
-at vendor `:84-109` reads `distanceHC.codeCache()` directly.
-
-**gzippy now.** No port. Same call site as §1 uses
-`HuffmanCodingSymbolsPerLength` for the
-`CompressionType::DynamicHuffman` arm.
-
-**Delta.** Add `huffman_short_bits_cached_deflate.rs`. Const-generic
-`LUT_BITS`. `code_cache: [CacheEntry; 1 << LUT_BITS]` with the layout
-above. `decode` peeks `LUT_BITS` and returns the cache entry; falls
-back to base canonical decode for codes longer than `LUT_BITS`.
-
-**Wiring.** `deflate_block.rs:1126` litlen HC for the
-`CompressionType::DynamicHuffman` arm (non-ISA-L fallback) and the
-marker-bootstrap path at `gzip_chunk.rs:411`.
-
-**Dependency.** Requires §1 — the LUT fill reads the distance HC's
-`code_cache`.
-
-### 3. `HuffmanCodingShortBitsMultiCached<11>`
-
-**Vendor:** `huffman/HuffmanCodingShortBitsMultiCached.hpp:24-269`.
-Two-symbols-per-lookup variant of §2. Cache entry packs
-`needToReadDistanceBits:1, bitsToSkip:6, symbolCount:2, symbols:18`
-into one `u32`. `decode` returns `(packed_symbols: u32, count: u32)`.
-Selected by `gzip/deflate.hpp:179` when
-`WITH_MULTI_CACHED_HUFFMAN_DECODER`.
-
-**gzippy now.** No port.
-
-**Delta.** Add `huffman_short_bits_multi_cached.rs`. Packed-u32 cache
-entry; `decode` returns the two-symbol pair.
-
-**Wiring.** Same site as §2. The appender loop in
-`gzip_chunk.rs:411 bootstrap_with_deflate_block` unpacks the
-two-symbol return.
-
-**Dependency.** Requires §1 for the distance HC at fill time.
-
-### 4. `FetchMultiStream` production wiring
-
-**Vendor:** `rapidgzip/ParallelGzipReader.hpp:85`:
-
-```cpp
-using ChunkFetcher = rapidgzip::GzipChunkFetcher<
-    FetchingStrategy::FetchMultiStream, ChunkData>;
-```
-
-This is the prefetch strategy vendor ships in production.
-
-**gzippy now.** `FetchMultiStream` is ported at `prefetcher.rs:232-343`.
-`chunk_fetcher.rs:303` constructs `FetchNextAdaptive::new(FETCH_STRATEGY_MEMORY)`
-(`FETCH_STRATEGY_MEMORY = 32` at `:175`).
-
-**Delta.**
-
-- Swap the `FetchNextAdaptive` type parameter to `FetchMultiStream` at
-  the five `BlockFetcher<…, FetchNextAdaptive, …>` occurrences:
-  `chunk_fetcher.rs:299, 465, 1037, 1098, 1459`.
-- Replace the constructor at `chunk_fetcher.rs:303` with
-  `FetchMultiStream::new(memory_size_per_stream = 3, max_stream_count = 16)`
-  (vendor defaults).
-
-**Dependency.** None — the `FetchingStrategy` trait
-(`prefetcher.rs:20-36`) covers both, and `BlockFetcher` is generic
-over it.
+**Done.** `chunk_fetcher.rs` uses `FetchMultiStream::new(3, 16)`.
 
 ### 5. Pure-Rust DEFLATE inflate with stopping points
 
