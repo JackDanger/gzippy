@@ -31,6 +31,7 @@ pub mod prefetcher;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub mod raw_block_finder;
 pub mod replace_markers;
+pub mod rpmalloc_alloc;
 pub mod single_member;
 pub mod sm_driver;
 pub mod statistics;

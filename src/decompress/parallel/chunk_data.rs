@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::decompress::parallel::crc32::CRC32Calculator;
 pub use crate::decompress::parallel::replace_markers::MARKER_BASE;
+use crate::decompress::parallel::rpmalloc_alloc::types::{self, U16, U8};
 
 /// One deflate-block-aligned slice of a chunk's decoded output.
 /// Port of `rapidgzip::ChunkData::Subchunk` (ChunkData.hpp:138-145).
@@ -130,11 +131,11 @@ pub struct ChunkData {
     /// rapidgzip MapMarkers: window[v - MARKER_BASE]). Cross-chunk
     /// last 32 KiB window. `apply_window` (next module) resolves these
     /// in place against a known window.
-    pub data_with_markers: Vec<u16>,
+    pub data_with_markers: U16,
     /// Clean byte suffix. All bytes here were decoded with a known
     /// window (set via IsalInflateWrapper::set_window) so no markers
     /// were emitted. CRC32'd at append time.
-    pub data: Vec<u8>,
+    pub data: U8,
     /// True if `apply_window` has already been run on this chunk —
     /// either on the worker thread before send (when the predecessor's
     /// window was published in time) or by an earlier consumer pass.
@@ -233,8 +234,8 @@ impl ChunkData {
     pub fn new_with_buffers(
         encoded_offset_bits: usize,
         configuration: ChunkConfiguration,
-        data_with_markers: Vec<u16>,
-        data: Vec<u8>,
+        data_with_markers: U16,
+        data: U8,
         pool_worker_index: usize,
     ) -> Self {
         debug_assert!(data_with_markers.is_empty());
@@ -417,7 +418,7 @@ impl ChunkData {
     /// `std::move` semantics. When `data` already holds bytes we fall
     /// back to `extend_from_slice` (a single contiguous Vec is required
     /// by downstream consumers).
-    pub fn append_owned_buffer(&mut self, mut buffer: Vec<u8>) {
+    pub fn append_owned_buffer(&mut self, mut buffer: U8) {
         if self.configuration.crc32_enabled {
             if let Some(last_crc) = self.crc32s.last_mut() {
                 last_crc.update(&buffer);
@@ -427,7 +428,7 @@ impl ChunkData {
         if self.data.is_empty() {
             // Zero-copy move of the owned allocation, mirroring
             // BaseType::append(std::move(toAppend)).
-            self.data = std::mem::take(&mut buffer);
+            self.data = std::mem::replace(&mut buffer, types::u8_empty());
         } else {
             self.data.extend_from_slice(&buffer);
         }
@@ -1066,8 +1067,8 @@ impl ChunkData {
 impl Drop for ChunkData {
     fn drop(&mut self) {
         use crate::decompress::parallel::chunk_buffer_pool;
-        let data = std::mem::take(&mut self.data);
-        let dwm = std::mem::take(&mut self.data_with_markers);
+        let data = std::mem::replace(&mut self.data, types::u8_empty());
+        let dwm = std::mem::replace(&mut self.data_with_markers, types::u16_empty());
         chunk_buffer_pool::return_u8_to_worker(self.pool_worker_index, data);
         chunk_buffer_pool::return_u16_to_worker(self.pool_worker_index, dwm);
     }

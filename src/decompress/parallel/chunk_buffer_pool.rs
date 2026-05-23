@@ -41,7 +41,10 @@
 //! allocation time. This preserves Vec **capacity** across chunks on
 //! the same worker — avoiding re-faulting pages on re-take — but does
 //! **not** replace a true per-thread rpmalloc arena (freed pages may
-//! still be munmapped by `System` when the pool is full or on miss).
+//! still be munmapped when the pool is full or on miss). With the
+//! `arena-allocator` feature, `take_*` / `return_*` use
+//! `Vec<T, RpmallocAlloc>` so freed pages stay in rpmalloc's per-thread
+//! free list (vendor `FasterVector.hpp:120-128`).
 //!
 //! ## Lifecycle
 //!
@@ -90,6 +93,8 @@
 use std::cell::Cell;
 use std::sync::{Mutex, OnceLock};
 
+use crate::decompress::parallel::rpmalloc_alloc::types::{self, U16, U8};
+
 /// Cap on pool size per worker per Vec type. Sized to a handful of
 /// in-flight chunks per worker (not the old shared cap of 64).
 const MAX_POOLED: usize = 8;
@@ -99,13 +104,13 @@ thread_local! {
     static WORKER_POOL_INDEX: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-fn u8_pools() -> &'static [Mutex<Vec<Vec<u8>>>] {
-    static POOLS: OnceLock<Vec<Mutex<Vec<Vec<u8>>>>> = OnceLock::new();
+fn u8_pools() -> &'static [Mutex<Vec<U8>>] {
+    static POOLS: OnceLock<Vec<Mutex<Vec<U8>>>> = OnceLock::new();
     POOLS.get_or_init(|| (0..MAX_WORKERS).map(|_| Mutex::new(Vec::new())).collect())
 }
 
-fn u16_pools() -> &'static [Mutex<Vec<Vec<u16>>>] {
-    static POOLS: OnceLock<Vec<Mutex<Vec<Vec<u16>>>>> = OnceLock::new();
+fn u16_pools() -> &'static [Mutex<Vec<U16>>] {
+    static POOLS: OnceLock<Vec<Mutex<Vec<U16>>>> = OnceLock::new();
     POOLS.get_or_init(|| (0..MAX_WORKERS).map(|_| Mutex::new(Vec::new())).collect())
 }
 
@@ -130,7 +135,7 @@ fn pool_index_for_take() -> usize {
 /// Take a `Vec<u8>` from the current worker's pool (or worker 0 if unbound).
 /// Decode tasks run on pool workers and record the correct index; trial
 /// decodes on the consumer thread bucket returns to worker 0's pool.
-pub fn take_u8(min_capacity: usize) -> Vec<u8> {
+pub fn take_u8(min_capacity: usize) -> U8 {
     let idx = pool_index_for_take();
     if let Ok(mut pool) = u8_pools()[idx].lock() {
         if let Some(mut v) = pool.pop() {
@@ -143,11 +148,11 @@ pub fn take_u8(min_capacity: usize) -> Vec<u8> {
         }
     }
     TAKE_U8_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Vec::with_capacity(min_capacity)
+    types::u8_with_capacity(min_capacity)
 }
 
 /// Take a `Vec<u16>` from the current worker's pool.
-pub fn take_u16(min_capacity: usize) -> Vec<u16> {
+pub fn take_u16(min_capacity: usize) -> U16 {
     let idx = pool_index_for_take();
     if let Ok(mut pool) = u16_pools()[idx].lock() {
         if let Some(mut v) = pool.pop() {
@@ -160,11 +165,11 @@ pub fn take_u16(min_capacity: usize) -> Vec<u16> {
         }
     }
     TAKE_U16_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Vec::with_capacity(min_capacity)
+    types::u16_with_capacity(min_capacity)
 }
 
 /// Return a `Vec<u8>` to the pool for `owner_worker` (recorded at take time).
-pub fn return_u8_to_worker(owner_worker: usize, mut v: Vec<u8>) {
+pub fn return_u8_to_worker(owner_worker: usize, mut v: U8) {
     if v.capacity() == 0 {
         return;
     }
@@ -179,7 +184,7 @@ pub fn return_u8_to_worker(owner_worker: usize, mut v: Vec<u8>) {
 }
 
 /// Return a `Vec<u16>` to the pool for `owner_worker`.
-pub fn return_u16_to_worker(owner_worker: usize, mut v: Vec<u16>) {
+pub fn return_u16_to_worker(owner_worker: usize, mut v: U16) {
     if v.capacity() == 0 {
         return;
     }

@@ -16,6 +16,8 @@ use crate::decompress::parallel::inflate_wrapper::InflateError;
 use crate::decompress::parallel::inflate_wrapper::{
     DeflateCompressionType, IsalInflateWrapper, StoppingPoints,
 };
+#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+use crate::decompress::parallel::rpmalloc_alloc::types;
 
 #[derive(Debug)]
 pub enum ChunkDecodeError {
@@ -101,7 +103,7 @@ fn decode_chunk_isal_impl(
     let mut reached_stream_end = false;
 
     while !stopping_point_reached {
-        let mut buffer: Vec<u8> = Vec::with_capacity(ALLOCATION_CHUNK_SIZE);
+        let mut buffer: types::U8 = types::u8_with_capacity(ALLOCATION_CHUNK_SIZE);
         #[allow(clippy::uninit_vec)]
         unsafe {
             buffer.set_len(ALLOCATION_CHUNK_SIZE)
