@@ -164,7 +164,11 @@ pub fn prepare_datasets() -> Result<Vec<(&'static str, String, String)>> {
 /// Load the real silesia gzip benchmark file if present on disk.
 /// Returns `None` when `benchmark_data/silesia-gzip.tar.gz` is missing
 /// (typical in CI; neurotic/homelab has the corpus).
-#[cfg(all(test, target_arch = "x86_64", feature = "isal-compression"))]
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
 pub fn load_silesia_gzip() -> Option<Vec<u8>> {
     let path = Path::new("benchmark_data/silesia-gzip.tar.gz");
     if !path.exists() {

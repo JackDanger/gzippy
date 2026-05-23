@@ -275,6 +275,38 @@ mod tests {
         );
     }
 
+    /// B3 proof: parallel SM byte-perfect with `--no-default-features
+    /// --features pure-rust-inflate` (no isal-sys in the dependency graph).
+    #[test]
+    #[cfg(all(
+        target_arch = "x86_64",
+        feature = "pure-rust-inflate",
+        not(feature = "isal-compression")
+    ))]
+    fn test_pure_rust_parallel_sm_e2e() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+        assert!(compressed.len() > 10 * 1024 * 1024);
+
+        let before = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+            .load(Ordering::Relaxed);
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        assert_eq!(output, original);
+        let after = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
+            .load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "pure-rust-inflate must run parallel SM (MARKER_PIPELINE_RUNS {before} -> {after})"
+        );
+    }
+
     // =========================================================================
     // Deletion-trap killer — the routing-assertion test from the v0.6 marker
     // decoder premortem.
@@ -358,6 +390,10 @@ mod tests {
     // a single decode large enough to force multiple subchunks per chunk
     // and asserts the counter moved.
     // =========================================================================
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(feature = "isal-compression", feature = "pure-rust-inflate")
+    ))]
     #[test]
     fn test_unsplit_blocks_emplaces_on_multi_subchunk_decode() {
         use std::sync::atomic::Ordering;
@@ -407,6 +443,10 @@ mod tests {
     // `lookup_next_block_offset` accepts the file-size sentinel during
     // a real parallel SM decode.
     // =========================================================================
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(feature = "isal-compression", feature = "pure-rust-inflate")
+    ))]
     #[test]
     fn test_prefetch_next_filesize_accept_fires() {
         use std::sync::atomic::Ordering;
@@ -651,6 +691,10 @@ mod tests {
 
     /// Deletion-trap: proves slow-path boundary search routes through the
     /// async `RawBlockFinderCoordinator`, not a silent sequential fallback.
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(feature = "isal-compression", feature = "pure-rust-inflate")
+    ))]
     #[test]
     fn test_coordinator_boundary_search_runs_on_x86_64_isal() {
         use std::sync::atomic::Ordering;
