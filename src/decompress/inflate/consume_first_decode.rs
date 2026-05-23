@@ -2988,7 +2988,7 @@ impl<'a> ResumableInflate<'a> {
     }
 
     pub fn tell_compressed(&self) -> usize {
-        self.bits.bit_position().min(self.encoded_until_bits)
+        self.bits.bit_position()
     }
 
     pub fn encoded_until_bits(&self) -> usize {
@@ -3022,6 +3022,12 @@ impl<'a> ResumableInflate<'a> {
         self.last_bfinal = false;
         self.last_btype = 0;
         self.pending_stream_header_stop = true;
+    }
+
+    fn clamp_to_until_bits(&mut self) {
+        if self.bits.bit_position() > self.encoded_until_bits {
+            self.bits = Bits::at_bit_offset(self.input, self.encoded_until_bits);
+        }
     }
 
     fn copy_session_to_user(&mut self, output: &mut [u8], user_written: usize) -> usize {
@@ -3098,6 +3104,16 @@ impl<'a> ResumableInflate<'a> {
             };
             self.session.truncate(new_pos);
             user_written += self.copy_session_to_user(output, user_written);
+            self.clamp_to_until_bits();
+
+            if self.bits.bit_position() >= self.encoded_until_bits {
+                return Ok(InflateStreamResult {
+                    bytes_written: user_written,
+                    stopped_at: StoppingPoint::NONE,
+                    bit_position: self.tell_compressed(),
+                    finished: false,
+                });
+            }
 
             if self.points_to_stop_at.contains(StoppingPoint::END_OF_BLOCK) {
                 self.stopped_at = StoppingPoint::END_OF_BLOCK;
