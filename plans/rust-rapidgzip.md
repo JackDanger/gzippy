@@ -13,8 +13,10 @@ across commits; the validation gate fires once the whole shape lands.
 **Motivating signal.** `tests::routing::tests::test_single_member_parallel_not_slower_than_sequential`
 reports ratio = 1.72 on `neurotic` (16 physical cores, x86_64, ISA-L):
 T=4 is *slower* than T=1 on a 24 MiB low-entropy fixture. The test
-passes the <4-core relaxed 3.0× threshold, so CI never sees it.
-End state: ratio < 0.5 on the same host.
+applies a tight 1.5× threshold on ≥4-core hosts and a relaxed 3.0×
+threshold on <4-core hosts (`routing.rs:507`); GHA CI runners are
+typically <4 cores, so the failure surfaces only on neurotic via
+`make test-x86_64`. End state: ratio < 0.5 on the same host.
 
 **Incompleteness marker.** Every parallel module carries
 `#![allow(dead_code)] // vendor-faithful rapidgzip port; many items are
@@ -35,13 +37,13 @@ without them.
   the only dispatch primitive in use.
 - **`FetchNextFixed` + `FetchNextAdaptive`.** `prefetcher.rs:38-211` =
   `core/Prefetcher.hpp:60-225` line-for-line, including
-  `extrapolateForward` (vendor 126–146) and `splitIndex` (vendor
-  197–219).
-- **`BlockFetcher` skeleton.** `block_fetcher.rs` = `core/BlockFetcher.hpp:38-686`:
+  `extrapolateForward` (vendor 127–146) and `splitIndex` (vendor
+  198–219).
+- **`BlockFetcher` skeleton.** `block_fetcher.rs` = `core/BlockFetcher.hpp:38-687`:
   two-cache (primary + prefetch) with hit-promote; `m_prefetching`
   holding `mpsc::Receiver<Result<V, E>>` in place of `std::map<size_t,
-  std::future<BlockData>>` (vendor 558); `prefetchNewBlocks` (vendor
-  459) driven by the consumer's `prefetch_submit` closure
+  std::future<BlockData>>` (declared at vendor 685); `prefetchNewBlocks`
+  (vendor 459) driven by the consumer's `prefetch_submit` closure
   (`chunk_fetcher.rs:576-594`).
 - **`GzipBlockFinder`.** `gzip_block_finder.rs` = `GzipBlockFinder.hpp:34-307`
   minus the FileReader/BGZF branches. Partition guesses via `get(idx)`,
@@ -54,12 +56,11 @@ without them.
   decode_chunk_marker_bootstrap_then_isal` = tail of
   `chunkdecoding/GzipChunk.hpp:468-654` (handoff at vendor 520–525).
   The "every candidate fails InvalidHuffmanCode" claim in older
-  doc-comments is stale — fixed in commit `3b73bee`;
-  `SLOW_PATH_FIRST_CANDIDATE_OK` (`chunk_fetcher.rs:1263`) increments
-  on real fixtures.
-- **Post-process priority.** `chunk_fetcher.rs:922
-  submit_post_process_to_pool` runs `applyWindow` via
-  `ThreadPool::submit(..., -1)`, mirroring
+  doc-comments is stale; `SLOW_PATH_FIRST_CANDIDATE_OK`
+  (`chunk_fetcher.rs:1263`) increments on real fixtures.
+- **Post-process priority.** `chunk_fetcher.rs:1059
+  submit_post_process_to_pool` (callsite at `:922`) runs `applyWindow`
+  via `ThreadPool::submit(..., -1)`, mirroring
   `GzipChunkFetcher.hpp:554-583 queueChunkForPostProcessing` and
   `BlockFetcher.hpp:608-611 submitTaskWithHighPriority`.
 
@@ -71,8 +72,8 @@ The diff against current code does not move any of the above.
 
 **Vendor.** `core/FasterVector.hpp:120-128` aliases `FasterVector<T>` to
 `std::vector<T, RpmallocAllocator<T>>`. `RpmallocAllocator` (vendor
-72–113) calls `rpmalloc` / `rpaligned_alloc` / `rpfree`; per-thread
-init is lazy via `static thread_local RpmallocThreadInit` (vendor 64).
+72–113) calls `rpmalloc` / `rpfree`; per-thread init is lazy via
+`static thread_local RpmallocThreadInit` (vendor 64).
 The two `FasterVector` instances that matter are `ChunkData::data`
 (`Vec<u8>`) and `ChunkData::data_with_markers` (`Vec<u16>`).
 
@@ -103,8 +104,11 @@ pub struct ChunkData {
 `ThreadArenaAlloc` is a `Copy + Send` ZST wrapping `mimalloc` (mature;
 preferred) or `rpmalloc-rs` (closer vendor analogue but less
 maintained). Per-thread init is lazy, matching vendor 64.
-`chunk_buffer_pool.rs` collapses to thread-local storage; the
-cross-thread `Mutex` is removed from the recycle hot path.
+`chunk_buffer_pool.rs` is keyed per worker index — `take_u8(worker_id)`
+/ `return_u8(worker_id, buf)`. The take path becomes lock-free per
+worker; cross-thread returns (the `Arc<ChunkData>` `Drop` may run on a
+post-process worker, not the decoder that allocated) stay supported
+via a fallback enqueue.
 
 **Modules touched.** `chunk_data.rs` (two fields, ~30 constructor /
 accessor call sites), `chunk_buffer_pool.rs` (thread-local), every
@@ -113,9 +117,9 @@ test that constructs `ChunkData` directly. `Cargo.toml` adds
 `arena-allocator`.
 
 **Risks.** `allocator-api2::Vec` does not expose every `std::Vec`
-method; `extend_from_slice` and `extend(&[u8])` callsites at
-`replace_markers.rs:377` and `gzip_chunk.rs:355` are supported, but
-audit every `extend`. Do not pre-warm pages at process start — that
+method; `extend_from_slice` / `extend` callsites at
+`gzip_chunk.rs:650`, `:665`, `:677`, `:690` are supported, but audit
+every `extend`. Do not pre-warm pages at process start — that
 experiment was −50% throughput on the bench (`chunk_buffer_pool.rs:68-72`).
 The per-thread arena pays its init cost once per worker, amortising
 across all chunks that worker handles.
@@ -139,7 +143,7 @@ No pin map is built.
 `core_affinity::get_core_ids()[i % len]`, mirroring vendor's typical
 embedder pattern. Switch the `chunk_fetcher.rs:318` callsite. Clamp
 `pool_size` to `num_cpus::get_physical()` to match vendor
-`availableCores()` semantics (`AffinityHelpers.hpp:18-21` / 104–130)
+`availableCores()` semantics (`AffinityHelpers.hpp:18-21` / 104–124)
 and avoid SMT-sibling collisions.
 
 **Cross-platform.** Linux: `sched_setaffinity` (vendor parity).
@@ -152,20 +156,24 @@ is already a dep and no-ops where unsupported.
 **Vendor.** `core/StreamedResults.hpp:27-158`:
 `std::deque<Value>` + mutex + condvar. Push-side never blocks; read
 blocks on `get(idx, timeout)` until the index is available or
-`finalised`. Used in two places: `GzipChunkFetcher`'s ordered drain
-via `m_markersBeingReplaced` futures (`GzipChunkFetcher.hpp:478-518
-waitForReplacedMarkers`) and the `BlockFinder` output that
-`BlockFetcher::prefetchNewBlocks` waits on with the `0.0001`-s timeout
-(`BlockFetcher.hpp:518`).
+`finalised`. The vendor callsite is `core/BlockFinder<RawFinder>`
+(`BlockFinder.hpp:202`): the async raw-finder coordinator queues
+candidate offsets through it, and `BlockFetcher::prefetchNewBlocks`
+waits on `get(idx, 0.0001 s)` (`BlockFetcher.hpp:518`). (Ordered-drain
+post-processing uses a different primitive — vendor's
+`std::map<size_t, std::future<void>> PostProcessingFutures` at
+`GzipChunkFetcher.hpp:48` — and is *not* a `StreamedResults`
+consumer.)
 
-**Now.** Neither callsite uses `StreamedResults`. The ordered drain
-uses a `VecDeque<PendingWrite>` (`chunk_fetcher.rs:475`) with
-`Ready { chunk }` / `Async { rx: mpsc::Receiver }` variants — works,
-but does not match vendor. `gzip_block_finder.rs:65 Inner` wraps a
-`Vec<usize>` in `Mutex<Inner>`; there is no condvar, no wait-with-timeout,
-which forces every consumer-side `get(idx)` to be a non-blocking
-lookup-or-fail. That single missing primitive is what serialises
-parallel block-finding (next item) onto the consumer thread.
+**Now.** gzippy has no `core/BlockFinder<RawFinder>` async-coordinator
+port; the raw block-finding (`block_finder.rs::find_blocks`) is
+invoked synchronously from `chunk_fetcher.rs:1344`. There is no
+condvar, no wait-with-timeout, no async candidate queue. That
+missing primitive is what serialises parallel block-finding (next
+item) onto the consumer thread. (`gzip_block_finder.rs:65 Inner`'s
+`Vec<usize>` in `Mutex<Inner>` is the synchronous `GzipBlockFinder`
+shape — faithful to vendor `GzipBlockFinder.hpp:120-157`'s raw deque
++ mutex — and is not the gap.)
 
 **Work.** Add `streamed_results.rs` (~250 lines):
 
@@ -182,27 +190,30 @@ impl<V: Clone> StreamedResults<V> {
 }
 ```
 
-Wire both callsites: `chunk_fetcher.rs::consumer_loop`'s
-`pending: VecDeque<PendingWrite>` → `StreamedResults<PendingWrite>`;
-`gzip_block_finder.rs`'s `Mutex<Inner>` is replaced. Preserve the
-`(Some(offset), Failure)` "finalised past EOF" asymmetry that
-`chunk_fetcher.rs:617-621` (`PREFETCH_NEXT_FILESIZE_ACCEPT`) depends
-on — same shape as vendor `GzipBlockFinder.hpp:144-157`.
+The new consumer is the async raw-finder coordinator that wraps
+`block_finder.rs::find_blocks` and emits offsets through
+`StreamedResults<usize>`. This is the substrate for parallel
+block-finding (next item) and the prefetch wait-with-timeout
+(`BlockFetcher.hpp:518`). Preserve the `(Some(offset), Failure)`
+"finalised past EOF" asymmetry that `chunk_fetcher.rs:617-621`
+(`PREFETCH_NEXT_FILESIZE_ACCEPT`) depends on — same shape as vendor
+`GzipBlockFinder.hpp:144-157`.
 
 ### Parallel block-finding on the production slow path
 
 **Vendor.** `core/ParallelBitStringFinder.hpp:35-265` parallelises the
 bit-string scan via a worker-pool fan-out. `chunkSize` at vendor
-91–119 picks the per-task range; offsets stream out through a
+91–115 picks the per-task range; offsets stream out through a
 `StreamedResults`-shaped queue.
 
 **Now.** `block_finder.rs:1034 find_blocks_parallel` exists — vendored
-in shape — but its callers are only tests (lines 1244, 1273, 1298).
+in shape — but its callers are only tests (lines 1274, 1302, 1314).
 The production slow path at `chunk_fetcher.rs:1344` calls
 `finder.find_blocks(chunk_begin, chunk_end)` from
 `block_finder.rs:668` — single-threaded, on the consumer, inside a
-64-iteration loop (`chunk_fetcher.rs:1321-1322`,
-`CHUNK_SIZE_BITS = 64 KiB`, `MAX_SCAN_BITS = 512 KiB`).
+64-iteration loop (`chunk_fetcher.rs:1321-1322`; constants are in
+bits: `CHUNK_SIZE_BITS = 65 536` ≈ 8 KiB scanned per iteration,
+`MAX_SCAN_BITS = 4 Mib` ≈ 512 KiB total window).
 
 **Work.** Pass `thread_pool: &Arc<ThreadPool>` into
 `speculative_decode_find_boundary` (`chunk_fetcher.rs:1315`), fan out
@@ -231,9 +242,8 @@ dispatch in parallel with the dynamic-Huffman scan at
 **`blockfinder/PigzStringView.hpp:30-179`** — `PigzStringView` detects
 pigz's `00 00 ff ff` sync-flush via `std::string_view::find` (vendor
 77); 8 GB/s on the boundary search (vendor 22–26 comment).
-`compress::pipelined::PipelinedGzEncoder` produces this shape, so
-gzippy frequently decodes pigz-shaped input. Without
-`PigzStringView`, every bit position runs through the dynamic-Huffman
+Pigz-produced inputs are common in the wild; on those, every bit
+position without `PigzStringView` runs through the dynamic-Huffman
 LUT — ~95% wasted. Port as `pigz_string_view.rs` (~200 lines),
 dispatch ahead of the dynamic-Huffman scan; hits short-circuit the
 slow path (no trial decode needed).
@@ -244,21 +254,26 @@ fixed; the *finder coverage* gap remains.
 
 ### Cached-bits Huffman for the marker-bootstrap inner loop
 
-**Vendor.** `huffman/HuffmanCodingShortBitsCachedDeflate.hpp:23-280`
-(deflate specialisation, 8–12 bit LUT) and
-`huffman/HuffmanCodingShortBitsMultiCached.hpp:25-269` (two
-symbols per lookup when both fit the cached bits). Vendor
-`gzip/deflate.hpp` uses these for the `decodeChunkWithRapidgzip` slow
-path.
+**Vendor.** Three cached variants in `huffman/`:
+`HuffmanCodingShortBitsCachedDeflate.hpp:23-280` (deflate
+specialisation, 8–12 bit LUT), `HuffmanCodingShortBitsMultiCached.hpp:25-269`
+(two symbols per lookup when both fit the cached bits), and
+`HuffmanCodingReversedBitsCached.hpp` — used by
+`gzip/deflate.hpp:195-196`'s `FixedHuffmanCoding`, which is the table
+for BTYPE=01 blocks. The dynamic-Huffman bootstrap uses the ShortBits
+variants; the fixed-Huffman bootstrap path (which
+`deflate_block.rs:836-857` explicitly bypasses ISA-L for) uses the
+Reversed variant.
 
 **Now.** `deflate_block.rs:223` uses `IsalLitLenCode` on the ISA-L
 fast path (fine). Non-ISA-L Huffman decode falls through to
 `huffman_symbols_per_length.rs` =
 `huffman/HuffmanCodingSymbolsPerLength.hpp:30-142`, which walks one
-bit per symbol. The marker bootstrap (`gzip_chunk.rs:311
-bootstrap_with_deflate_block`) runs this *even on x86_64* — it
-precedes the ISA-L handoff and decides where the boundary is. The
-cached variant rapidgzip uses for the same job is absent.
+bit per symbol. The marker bootstrap
+(`gzip_chunk.rs:409 bootstrap_with_deflate_block`, callsite at
+`:311`) runs this *even on x86_64* — it precedes the ISA-L handoff
+and decides where the boundary is. The cached variants rapidgzip
+uses for the same job are absent.
 
 **Work.** Two new modules:
 
@@ -276,10 +291,16 @@ cached variant rapidgzip uses for the same job is absent.
   ```
 
   `initialize_from_lengths` = vendor 43–100; `decode(bit_reader)` =
-  vendor 133–200.
+  vendor 120–142.
 
 - `huffman_short_bits_multi_cached.rs` ← vendor 25–269. Same shape,
   cache entries hold two symbols.
+
+- `huffman_reversed_bits_cached.rs` ← `HuffmanCodingReversedBitsCached`
+  for the fixed-Huffman BTYPE=01 path. Vendor `deflate.hpp:195-196`
+  declares `FixedHuffmanCoding = HuffmanCodingReversedBitsCached<…>`;
+  `deflate_block.rs:836-857` currently bypasses ISA-L for fixed
+  blocks via the slow `SymbolsPerLength` path, which this closes.
 
 Swap the import in `deflate_block.rs:222-228`. Retain
 `huffman_symbols_per_length.rs` as the long-code fallback (codes
@@ -326,9 +347,12 @@ structural dependency.
 
 ## Out of scope
 
-- `IndexFileFormat.hpp` and the seekable-reader path
-  (`chunk_data.rs::subchunks`, `block_map.rs`, `UnsplitBlocks` at
-  `chunk_fetcher.rs:118` exist as scaffolding; no production caller).
+- `IndexFileFormat.hpp` and the seekable-reader path. Supporting
+  scaffolding — `chunk_data.rs::subchunks`, `block_map.rs`,
+  `UnsplitBlocks` at `chunk_fetcher.rs:118` — is plumbed through
+  `consumer_loop` (line 462) but currently surfaces only via the
+  `GZIPPY_VERBOSE` stats dump (`UNSPLIT_BLOCKS_EMPLACED` at line 408).
+  The seekable reader that would consume them is out of scope.
 - Python bindings, `rapidgzip.hpp` public API.
 - `GzipReader.hpp`, `GzipAnalyzer.hpp` (single-threaded paths route
   through `decompress::mod`, not `parallel/`).
@@ -336,19 +360,21 @@ structural dependency.
 - `FasterVector.hpp` custom-storage variant (vendor 159–416, behind
   `#if 1 … #else`) — the active branch is the allocator variant; only
   that needs porting.
-- `AlignedAllocator.hpp` — `replace_markers.rs:377` uses unaligned
-  AVX loads, faithful to `MarkerReplacement.hpp`. Re-evaluate only if
-  `dTLB-load-misses` stays elevated after the arena lands.
+- `AlignedAllocator.hpp` — `replace_markers.rs:146` uses unaligned
+  AVX loads (`_mm256_loadu_si256`), faithful to `MarkerReplacement.hpp`.
+  Re-evaluate only if `dTLB-load-misses` stays elevated after the
+  arena lands.
 
 ## Smallest viable work item
 
 Commits stage independently. The smallest is "land
-`streamed_results.rs` and consume it in `gzip_block_finder.rs`" — no
-perf change on its own, but it's the substrate the
-parallel-block-finding and ordered-drain items rest on. The largest
-single commit is "wire per-thread arena through `chunk_data.rs`"
-because every `Vec<u8>`/`Vec<u16>` field changes type. Both are fine.
-The unit is the gate, not the merge order.
+`streamed_results.rs` plus a tiny async raw-finder coordinator that
+wraps `block_finder.rs::find_blocks` and emits offsets through it" —
+no perf change on its own, but it is the substrate the
+parallel-block-finding item rests on. The largest single commit is
+"wire per-thread arena through `chunk_data.rs`" because every
+`Vec<u8>`/`Vec<u16>` field changes type. Both are fine. The unit is
+the gate, not the merge order.
 
 ## Validation gate
 
@@ -400,11 +426,188 @@ broke a cross-pillar invariant.
    `MARKER_PIPELINE_RUNS` deletion trap.
 2. `chunk_fetcher.rs:253 drive` → `consumer_loop` →
    `submit_decode_to_pool` → `submit_post_process_to_pool`.
-3. Vendor `GzipChunkFetcher.hpp:311 processNextChunk` and
+3. Vendor `GzipChunkFetcher.hpp:312 processNextChunk` and
    `BlockFetcher.hpp:245 get`, side-by-side with the Rust.
-4. Vendor `ParallelGzipReader.hpp:702 read` for the outer-loop shape.
+4. Vendor `ParallelGzipReader.hpp:495 read` for the outer-loop shape.
 5. This document, item by item, with the cited vendor line ranges in
    a second window. Every claim above is at vendor `file:line`. Verify
    before changing the corresponding gzippy module.
 
 The vendor citations are the spec.
+
+---
+
+## Appendix: review corrections (integrate into body above)
+
+Second-pass review against vendor sources and current gzippy tree. Opus
+should merge these into the main sections and delete this appendix once
+done.
+
+### A1. `StreamedResults` — wrong dual callsite (critical)
+
+**Main doc claim (§ StreamedResults):** vendor uses `StreamedResults` for
+both ordered drain (`m_markersBeingReplaced`) and `BlockFinder` output.
+
+**Correction:** only one vendor callsite.
+
+| Mechanism | Vendor type | gzippy analogue |
+|---|---|---|
+| Post-process ordering | `PostProcessingFutures` = `std::map<size_t, std::future<void>>` (`GzipChunkFetcher.hpp:48`, member at `:783`) | `VecDeque<PendingWrite>` + `mpsc::Receiver` (`chunk_fetcher.rs:475`) — **already correct** |
+| Async raw-finder scan DB | `StreamedResults<size_t>` inside `core/BlockFinder<RawFinder>` (`BlockFinder.hpp:202`) | **missing** — not `GzipBlockFinder` |
+| Partition spacing | `GzipBlockFinder` = `std::deque` + mutex; `get(idx, timeout)` ignores timeout (`GzipBlockFinder.hpp:120-157`) | `gzip_block_finder.rs` — **already correct shape** |
+
+**Do not:** replace `pending: VecDeque<PendingWrite>` with
+`StreamedResults<PendingWrite>`. That is not vendor-faithful.
+
+**Do:** port `streamed_results.rs` for a future `core_block_finder.rs`
+(async wrapper around pigz/dynamic/uncompressed raw finders) OR for the
+slow-path scan coordinator join inside `speculative_decode_find_boundary`.
+Wire `get(idx, timeout)` blocking there so prefetch/decode can overlap
+finder fan-out — mirror `BlockFetcher.hpp:518` (`0.0001` s timeout on
+`m_blockFinder->get`), which applies when the finder is the async
+`core/BlockFinder` wrapper, not `GzipBlockFinder`.
+
+**Remove or rewrite** “Smallest viable work item: land `streamed_results.rs`
+and consume it in `gzip_block_finder.rs`” — wrong target module.
+
+**Coherence fix:** “StreamedResults ↔ parallel block-finding” is valid for
+**async raw-finder join**, not for `GzipBlockFinder` or post-process ordering.
+
+### A2. Parallel scan — reuse `find_blocks_parallel`, don't greenfield
+
+**Main doc claim:** port `ParallelBitStringFinder` into production slow path.
+
+**Correction:** `block_finder.rs:1034` **`find_blocks_parallel`** already
+exists (fan-out + merge, `+1024`-bit overlap at `:1065`). Callers today
+are **tests only** (`:1244`, `:1273`, `:1298`). Production slow path at
+`chunk_fetcher.rs:1344` calls single-threaded `finder.find_blocks`.
+
+**Work should say:** wire `speculative_decode_find_boundary` through existing
+`find_blocks_parallel`, rehosted on `Arc<ThreadPool>` (not
+`std::thread::scope`) + per-worker buffer pool id. Evaluate whether
+`ParallelBitStringFinder.hpp` adds anything beyond what
+`find_blocks_parallel` + pigz/uncompressed finders already provide before
+porting another scan layer.
+
+### A3. Fixed-Huffman decoder missing from pillar 3
+
+**Main doc:** ports `HuffmanCodingShortBitsCachedDeflate` +
+`HuffmanCodingShortBitsMultiCached` only.
+
+**Correction:** on x86, **dynamic** bootstrap already uses ISA-L tables
+(`deflate_block.rs:864-878`). **Fixed** blocks explicitly bypass ISA-L and
+use canonical decode because ISA-L's fixed-table LUT is incomplete
+(`deflate_block.rs:836-857`, cites vendor `deflate.hpp:195-196`). Vendor
+uses **`HuffmanCodingReversedBitsCached`** for fixed Huffman, not
+ShortBitsCached.
+
+Slow-path tail walk (`chunk_fetcher.rs:1369-1374`) targets fixed/stored
+tails. Add to pillar 3:
+
+- `huffman_reversed_bits_cached.rs` ← vendor fixed path
+- Wire in `read_internal_compressed_canonical_specialized` before or
+  alongside ShortBitsCached
+
+**Bootstrap decode matrix (add to doc):**
+
+| Block type | x86 today | Target |
+|---|---|---|
+| Dynamic | `IsalLitLenCode` / ISA-L | keep |
+| Fixed | `HuffmanCodingSymbolsPerLength` (one bit/symbol) | ReversedBitsCached |
+| Stored | dynamic finder rejects → tail byte walk | Uncompressed finder |
+
+### A4. `PigzStringView` motivation — soften PipelinedGzEncoder claim
+
+**Main doc:** “`PipelinedGzEncoder` produces this shape, so gzippy frequently
+decodes pigz-shaped input.”
+
+**Correction:** pigz's `00 00 ff ff` sync-flush is **pigz output**, a major
+**fleet input class** (silesia-pigz losses). No verified emission of that
+pattern from `src/compress/pipelined.rs`. Rephrase: “pigz-compressed inputs
+and pigz-shaped single-member streams”; add a reproducer test if claiming
+gzippy-generated output.
+
+### A5. Per-thread arena — worker-index lifecycle, not TLS alone
+
+**Main doc:** collapse `chunk_buffer_pool` to thread-local storage; remove
+cross-thread `Mutex`.
+
+**Correction:** buffers are returned on **`Arc<ChunkData>` drop**, often on
+the post-process worker, while the next decode may run on a **different**
+pool worker. Vendor rpmalloc amortises **malloc/free on the same OS thread**
+(`FasterVector.hpp:64` `thread_local RpmallocThreadInit`).
+
+**Add invariant:** `take_u8(worker_id)` / `return_u8(worker_id, buf)` from
+decode **and** post-process closures using the same `worker_id` obtained
+from `ThreadPool` TLS in `worker_main`. Debug-assert
+`pool_id == current_worker()` on return. “Thread-local pool” without
+worker-index keyed take/return will not close the 40% → 17% gap.
+
+### A6. mimalloc vs rpmalloc — tie to perf gate (5)
+
+**Main doc:** prefer mimalloc for maintainability.
+
+**Correction:** the motivating metric compares to **rapidgzip + rpmalloc**
+(`LIBRAPIDARCHIVE_WITH_RPMALLOC`). mimalloc is fine for first implementation
+velocity; **gate (5) is authoritative**. If `minor-faults` miss 1.5×
+rapidgzip after mimalloc, switch to `rpmalloc-rs` before declaring pillar 1
+complete. Document both behind `feature = "arena-allocator"`.
+
+### A7. Validation gate fixes
+
+**Gate (1) — thread count:** motivating ratio 1.72 is at **T=4** on 16
+physical cores; perf gate (5) compares rapidgzip **-P 16**. North-star
+gate (1) should require ratio < 0.5 at
+**T = min(16, num_cpus::get_physical())**, not T=4 alone. Keep T=4 as an
+optional regression canary.
+
+**Gate (1) — fixture split:** current test uses **24 MiB low-entropy
+synthetic** (friendly to speculation). Gate (5) uses **silesia.tar.gz**
+(~1.4 GB, hard). State explicitly:
+
+- Gate (1a): synthetic, ratio < 0.5 at T=max — algorithmic parallel win.
+- Gate (1b): add `test_single_member_parallel_silesia_*` on neurotic —
+  same ratio bar on real corpus (or gate (5) wall-time subsumes this).
+
+**Gate (4) — dead_code allows:** “remove every `#![allow(dead_code)]` from
+`parallel/*.rs`” conflicts with **out-of-scope seekable scaffolding**
+(`UnsplitBlocks`, `block_map`, subchunk index — listed in Out of scope).
+Scope gate (4) to **production SM hot-path modules** only, with an explicit
+allowlist or `#[cfg(feature = "seekable-index")]` for index/scaffolding
+files.
+
+**Homelab entrypoint:** add `make test-x86_64` (pushes branch, runs
+`routing` suite on neurotic) as the authoritative CI path alongside raw
+`cargo test` on the box.
+
+### A8. Routing / sizing facts to document
+
+| Gate | Location | Value |
+|---|---|---|
+| Classifier parallel SM | `decompress/mod.rs:81` `MIN_PARALLEL_COMPRESSED` | compressed ≥ **10 MiB** |
+| Internal `decompress_parallel` | `single_member.rs:32` `MIN_PARALLEL_SIZE` | deflate body ≥ **4 MiB** |
+| Perf test fixture | `routing.rs:453` | 24 MiB raw → ~12 MiB gzip |
+
+`adjusted_chunk_size_bytes` (`single_member.rs:66-78`) affects chunk count
+on the 24 MiB fixture — mention when interpreting ratio 1.72 (may be
+partly under-partitioned at T=4, not purely page-fault cost).
+
+### A9. Missing work items (add to gap list)
+
+| Item | Location | Why |
+|---|---|---|
+| `processReadyPrefetches` | `block_fetcher.rs:575-584` | Vendor moves ready prefetches into cache opportunistically; gzippy skips — workers may idle while prefetches sit in-flight |
+| Trace triage | `GZIPPY_LOG_FILE` + `scripts/parallel_sm_log_summary.py` | Gate (6) uses `GZIPPY_VERBOSE`; add log summary for partition-level regressions |
+| `FetchMultiStream` | `prefetcher.rs:13` preamble lie | Keep as honesty fix; safe to defer entirely for SM-only completion |
+
+### A10. Suggested integration order for Opus
+
+When merging this appendix into the body:
+
+1. Rewrite **§ StreamedResults** (A1) — highest impact; fixes smallest-work-item and coherence bullets.
+2. Expand **§ Cached-bits Huffman** with fixed reversed-bits (A3).
+3. Expand **§ Per-thread allocator** with worker-index lifecycle (A5).
+4. Fix **§ Parallel block-finding** to reference `find_blocks_parallel` (A2).
+5. Update **§ Validation gate** (A7) and **§ Out of scope / gate (4)** (A7).
+6. Soften pigz motivation (A4); add bootstrap matrix table (A3).
+7. Delete this appendix.
