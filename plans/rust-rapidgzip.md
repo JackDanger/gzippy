@@ -6,8 +6,8 @@ IsalInflateWrapper` chain. The destination is rapidgzip's parallel
 architecture with no external compiled deflate: pure Rust for both the
 orchestration (rapidgzip's C++ templates) and the inner inflate
 (patched ISA-L). This document lists what still has to land — the
-unported rapidgzip primitives (§§1–5) and the pure-Rust replacement
-for ISA-L (§6). Each named item is a literal vendor class, header, or
+unported rapidgzip primitives (§§1–4) and the pure-Rust replacement
+for ISA-L (§5). Each named item is a literal vendor class, header, or
 patch. The unit is "done" when the validation gate at the bottom passes
 on `neurotic` (16 physical x86_64).
 
@@ -21,7 +21,8 @@ on `neurotic` (16 physical x86_64).
 | `core/BlockFinder.hpp:35-218` | `raw_block_finder.rs::RawBlockFinderCoordinator` |
 | `core/BlockFetcher.hpp:38-687` | `block_fetcher.rs`; `process_ready_prefetches` at `:696` (vendor 427/463) |
 | `core/Prefetcher.hpp:60-225` | `prefetcher.rs:41-211` (`FetchNextFixed`, `FetchNextAdaptive`) |
-| `core/Prefetcher.hpp:234-336` | `prefetcher.rs:232-343` (`FetchMultiStream` — **not yet wired**, see #5) |
+| `core/Prefetcher.hpp:234-336` | `prefetcher.rs:232-343` (`FetchMultiStream` — **not yet wired**, see §4) |
+| `core/FasterVector.hpp:73-113` (`RpmallocAllocator`), `:124` (`FasterVector` alias) | `rpmalloc_alloc.rs` (`unsafe impl allocator_api2::alloc::Allocator for RpmallocAlloc` on `rpmalloc-sys`); `chunk_data.rs:24` `ChunkData::data` / `data_with_markers` typed `allocator_api2::vec::Vec<T, RpmallocAlloc>`; `Cargo.toml` features `arena-allocator = ["dep:allocator-api2", "dep:rpmalloc-sys"]`, transitively enabled by `isal-compression` |
 | `core/BlockMap.hpp` | `block_map.rs` |
 | `core/Cache.hpp` | `cache.rs` |
 | `core/MarkerReplacement.hpp` | `replace_markers.rs:146` (unaligned AVX) |
@@ -31,75 +32,32 @@ on `neurotic` (16 physical x86_64).
 | `rapidgzip/blockfinder/DynamicHuffman.hpp:39-225` + `precodecheck/CountAllocatedLeaves.hpp` | `block_finder.rs` (stored-block from `blockfinder/Uncompressed.hpp` folded in at `:668 find_blocks`) |
 | `rapidgzip/chunkdecoding/GzipChunk.hpp:468-654` (handoff at vendor 520-525) | `gzip_chunk.rs:288 decode_chunk_marker_bootstrap_then_isal` |
 | `rapidgzip/GzipChunkFetcher.hpp:554-583 queueChunkForPostProcessing` + `applyWindow` | `chunk_fetcher.rs:1069 submit_post_process_to_pool` (callsite `:932`); marker resolution in `apply_window.rs` + `replace_markers.rs` |
-| `rapidgzip/gzip/isal.hpp:26-212` | `inflate_wrapper.rs`: FFI shim over patched `mxmlnkn/isa-l`. **To be replaced by §6.** |
-| `rapidgzip/gzip/deflate.hpp:175` (`HuffmanCodingISAL`) + `:38-39` (`HuffmanCodingDistanceISAL`) | `isal_huffman.rs` |
+| `rapidgzip/gzip/isal.hpp:26-212` | `inflate_wrapper.rs`: FFI shim over patched `mxmlnkn/isa-l`. **Interim production path; removed at §5 Tier 3.** |
+| `rapidgzip/gzip/deflate.hpp:175` (`HuffmanCodingISAL`) + `:38-39` (`HuffmanCodingDistanceISAL`) | `isal_huffman.rs`. **Interim production path on the post-bootstrap leg; removed at §5 Tier 3.** |
 | `rapidgzip/huffman/HuffmanCodingBase.hpp`, `HuffmanCodingSymbolsPerLength.hpp:30-142` | `huffman_base.rs`, `huffman_symbols_per_length.rs` |
 
 ## Unported primitives
 
 Listed in dependency order.
 
-### 1. `RpmallocAllocator` / `FasterVector`
-
-**Vendor:** `core/FasterVector.hpp:73-113` (`RpmallocAllocator`),
-`:124` (`FasterVector` alias).
-
-```cpp
-template<typename T>
-using FasterVector = std::vector<T, RpmallocAllocator<T>>;
-```
-
-`RpmallocAllocator` calls `rpmalloc` / `rpfree`; per-thread heap init
-via `static thread_local RpmallocThreadInit` (vendor `:64`). Freed
-pages return to rpmalloc's per-thread free list, so the next allocation
-on the same thread reuses warm pages without faulting. The two
-`FasterVector` instances on the SM hot path are `ChunkData::data`
-(`DecodedVector = FasterVector<uint8_t>`) and `data_with_markers`
-(`MarkerVector = FasterVector<uint16_t>`), cited at
-`rapidgzip/DecodedData.hpp:23-24`.
-
-**gzippy now.** `chunk_data.rs:133` `pub data_with_markers: Vec<u16>`,
-`:137` `pub data: Vec<u8>` — system allocator. Recycled by a per-worker
-LIFO pool in `chunk_buffer_pool.rs` (preserves Vec capacity, eliminates
-cross-thread Mutex contention; pool misses and drops past
-`MAX_POOLED = 8` still hit `std::alloc::System`'s `munmap`).
-`chunk_buffer_pool.rs:67-90` records the ~40% / ~17% silesia
-page-fault gap this leaves open.
-
-**Delta.** Add `allocator-api2 = "0.2"` + `rpmalloc-rs` to
-`Cargo.toml`. Define `unsafe impl allocator_api2::alloc::Allocator for
-RpmallocAlloc` — `Copy + Send` ZST. Change the two `ChunkData` fields
-to `allocator_api2::vec::Vec<T, RpmallocAlloc>`. Audit the three
-production `extend_from_slice` callsites: `chunk_data.rs:343`
-(`append_markered` → `data_with_markers`), `:361` (`append_clean` →
-`data`), `:432` (`append_owned_buffer` → `data`). Do not pre-warm
-pages at process start — that experiment was −50% throughput
-(`chunk_buffer_pool.rs:78-83`).
-
-**Wiring.** `ChunkData::new_with_buffers` at `chunk_data.rs:236-253`
-and callers in `gzip_chunk.rs` / `chunk_fetcher.rs`. The per-worker
-buffer-pool keys stay; the wrapped Vec then allocates via the
-per-thread arena.
-
-**Dependency.** None. Worker → physical-core stability is already in
-place via `with_pinning_for_capacity`.
-
-### 2. `HuffmanCodingReversedBitsCached`
+### 1. `HuffmanCodingReversedBitsCached`
 
 **Vendor:** `huffman/HuffmanCodingReversedBitsCached.hpp:32-136`.
 Generic LUT-cached canonical decoder, `1 << MAX_CODE_LENGTH` entries of
 `(length, symbol)`. `gzip/deflate.hpp:196` aliases it as
 `FixedHuffmanCoding` — every BTYPE=01 block. Also the distance HC for
-the deflate-specific decoder in #3.
+the deflate-specific decoder in §2.
 
-**gzippy now.** No port. `deflate_block.rs:1110
-read_internal_compressed_canonical_specialized` builds tables via
-`HuffmanCodingSymbolsPerLength` (one-bit-per-symbol tree walk) for
-both DYNAMIC and FIXED. RFC 1951 length arrays for FIXED come from
-`fixed_huffman_code_lengths()` at `:1315`. x86_64 production routes
-through ISA-L (`inflate_wrapper.rs`) and bypasses this; the
-marker bootstrap (`gzip_chunk.rs:409 bootstrap_with_deflate_block`)
-still hits the slow path on every arch.
+**gzippy now.** No port.
+`deflate_block.rs:1095 read_internal_compressed_canonical_specialized`
+builds tables via `HuffmanCodingSymbolsPerLength` (one-bit-per-symbol
+tree walk) for both DYNAMIC and FIXED, with the litlen call site at
+`:1126` and the distance call site at `:1132`. RFC 1951 length arrays
+for FIXED come from `fixed_huffman_code_lengths()` at `:1315`. x86_64
+production routes through ISA-L (`inflate_wrapper.rs`) for the
+post-bootstrap leg and bypasses this; the marker-bootstrap leg
+(`gzip_chunk.rs:411 bootstrap_with_deflate_block`) hits this slow path
+on every arch.
 
 **Delta.** Add `huffman_reversed_bits_cached.rs`. Wraps
 `HuffmanCodingSymbolsPerLength` plus
@@ -108,16 +66,15 @@ still hits the slow path on every arch.
 code via `bit_manipulation::reverse_bits`. `decode(bit_reader)` peeks
 `MAX_LEN` and returns the cache entry directly.
 
-**Wiring.** `deflate_block.rs:1126` instantiates the litlen HC and
-`:1132` the distance HC. For `CompressionType::FixedHuffman` the
-litlen HC swaps to `HuffmanCodingReversedBitsCached`; the distance HC
-stays — FIXED blocks have no separate distance table (RFC 1951
-3.2.6).
+**Wiring.** `deflate_block.rs:1126` litlen HC: for
+`CompressionType::FixedHuffman` the litlen HC swaps to
+`HuffmanCodingReversedBitsCached`; the `:1132` distance HC stays —
+FIXED blocks have no separate distance table (RFC 1951 3.2.6).
 
 **Dependency.** None — base `HuffmanCodingSymbolsPerLength`
 (`huffman_symbols_per_length.rs:228`) is already ported.
 
-### 3. `HuffmanCodingShortBitsCachedDeflate<11>`
+### 2. `HuffmanCodingShortBitsCachedDeflate<11>`
 
 **Vendor:** `huffman/HuffmanCodingShortBitsCachedDeflate.hpp:22-280`.
 Deflate-specialized 11-bit LUT for DYNAMIC blocks. Cache entry:
@@ -131,9 +88,9 @@ peek. Selected by `gzip/deflate.hpp:177 LiteralOrLengthHuffmanCoding`
 when `WITH_DEFLATE_SPECIFIC_HUFFMAN_DECODER` is defined. The LUT fill
 at vendor `:84-109` reads `distanceHC.codeCache()` directly.
 
-**gzippy now.** No port. Same call site as #2 uses
-`HuffmanCodingSymbolsPerLength` for the `CompressionType::DynamicHuffman`
-arm.
+**gzippy now.** No port. Same call site as §1 uses
+`HuffmanCodingSymbolsPerLength` for the
+`CompressionType::DynamicHuffman` arm.
 
 **Delta.** Add `huffman_short_bits_cached_deflate.rs`. Const-generic
 `LUT_BITS`. `code_cache: [CacheEntry; 1 << LUT_BITS]` with the layout
@@ -142,15 +99,15 @@ back to base canonical decode for codes longer than `LUT_BITS`.
 
 **Wiring.** `deflate_block.rs:1126` litlen HC for the
 `CompressionType::DynamicHuffman` arm (non-ISA-L fallback) and the
-marker-bootstrap path at `gzip_chunk.rs:409`.
+marker-bootstrap path at `gzip_chunk.rs:411`.
 
-**Dependency.** Requires #2 — the LUT fill reads the distance HC's
+**Dependency.** Requires §1 — the LUT fill reads the distance HC's
 `code_cache`.
 
-### 4. `HuffmanCodingShortBitsMultiCached<11>`
+### 3. `HuffmanCodingShortBitsMultiCached<11>`
 
 **Vendor:** `huffman/HuffmanCodingShortBitsMultiCached.hpp:24-269`.
-Two-symbols-per-lookup variant of #3. Cache entry packs
+Two-symbols-per-lookup variant of §2. Cache entry packs
 `needToReadDistanceBits:1, bitsToSkip:6, symbolCount:2, symbols:18`
 into one `u32`. `decode` returns `(packed_symbols: u32, count: u32)`.
 Selected by `gzip/deflate.hpp:179` when
@@ -161,13 +118,13 @@ Selected by `gzip/deflate.hpp:179` when
 **Delta.** Add `huffman_short_bits_multi_cached.rs`. Packed-u32 cache
 entry; `decode` returns the two-symbol pair.
 
-**Wiring.** Same site as #3. The appender loop in
-`gzip_chunk.rs:409 bootstrap_with_deflate_block` unpacks the
+**Wiring.** Same site as §2. The appender loop in
+`gzip_chunk.rs:411 bootstrap_with_deflate_block` unpacks the
 two-symbol return.
 
-**Dependency.** Requires #2 for the distance HC at fill time.
+**Dependency.** Requires §1 for the distance HC at fill time.
 
-### 5. `FetchMultiStream` production wiring
+### 4. `FetchMultiStream` production wiring
 
 **Vendor:** `rapidgzip/ParallelGzipReader.hpp:85`:
 
@@ -195,11 +152,20 @@ This is the prefetch strategy vendor ships in production.
 (`prefetcher.rs:20-36`) covers both, and `BlockFetcher` is generic
 over it.
 
-### 6. Pure-Rust DEFLATE inflate with stopping points
+### 5. Pure-Rust DEFLATE inflate with stopping points
 
 The only C dependency on the parallel SM hot path is patched ISA-L
 (rapidgzip itself relies on it). gzippy's destination is no compiled-C
-deflate.
+deflate anywhere in production. Two-phase scope:
+
+- **§5 itself** replaces the parallel SM post-bootstrap inflate
+  (`IsalInflateWrapper`'s `read_stream`).
+- **§5 Tier 3** (submodule deletion) additionally requires pure-Rust
+  replacements for the non-SM ISA-L users — see Tier 3 below.
+
+The marker-bootstrap leg (`gzip_chunk.rs:411 bootstrap_with_deflate_block`)
+already uses pure-Rust `deflate_block::Block` and is **not** what §5
+swaps; the cached-Huffman items §§1–3 are what speed up that leg.
 
 **Vendor + patches.** Rapidgzip's inner inflate is
 `vendor/isa-l/igzip/igzip_inflate.c`. The stopping-point capability is
@@ -217,22 +183,23 @@ at `packaging/isal-patches/`:
 
 **gzippy now.** Two inflates live side by side:
 
-- **C path on the parallel SM literal-stream.** `inflate_wrapper.rs` =
-  `IsalInflateWrapper` FFI shim. Owns stopping points today.
-- **Pure-Rust paths already in production.** ~14.8k lines across
-  `src/decompress/inflate/` plus five standalone modules; callers:
-  - `scan_inflate.rs:96,103,110,194,201,208,275,282,289` — calls
-    `consume_first_decode::{decode_stored_pub, decode_fixed_pub,
-    decode_dynamic_pub}` via `scan_deflate_fast`. Reached on the SM
-    path from `parallel/block_finder.rs:1151`.
-  - `parallel/gzip_chunk.rs:416 bootstrap_with_deflate_block` —
-    drives `inflate::consume_first_decode::Bits` + `Block` to decode
-    whole DEFLATE blocks (DYNAMIC + FIXED) until window-fill, output
-    written through `replace_markers::MARKER_BASE` so back-references
-    surface as 16-bit markers. This is the bootstrap leg of the
-    marker-bootstrap-then-ISA-L handoff (`gzip_chunk.rs:288`).
-  - `bgzf.rs` — `TwoLevelTable` / `CombinedLUT` path
-    (`bgzf.rs:71,1149,1170,1422`).
+- **C path on the parallel SM post-bootstrap leg.**
+  `inflate_wrapper.rs` = `IsalInflateWrapper` FFI shim. Owns stopping
+  points today.
+- **Pure-Rust paths already in production (non-SM).** ~14.8k lines
+  across `src/decompress/inflate/` plus standalone modules; production
+  callers today:
+  - `bgzf.rs:71,1149,1170,1422` — `TwoLevelTable` / `CombinedLUT`
+    inflate path (BGZF parallel decompress).
+  - `backends/isal_decompress.rs:1054` — sequential x86 decompress
+    falls into the `_pub` family at the slow-path boundary.
+  - `src/decompress/index.rs:87,417,424` — gzip-index building uses
+    `scan_inflate::scan_deflate_fast` → `consume_first_decode::{
+    decode_stored_pub, decode_fixed_pub, decode_dynamic_pub}`.
+  - `parallel/gzip_chunk.rs:411 bootstrap_with_deflate_block` — uses
+    only the `Bits` reader from `consume_first_decode`; the actual
+    block decoder is `deflate_block::Block` (a separate engine).
+    Not a `consume_first_decode` inflate-engine caller.
 
   | Module | Lines | Role |
   |---|---|---|
@@ -257,9 +224,9 @@ at `packaging/isal-patches/`:
 
 (a) **Add stopping points to `consume_first_decode`.** Mirror the C
 patch field-for-field. `StoppingPoints` already exists at
-`inflate_wrapper.rs:50` — reuse it. Add an extension method on the
-inflate driver (not a free function), shaped like vendor's pattern of
-storing the stop result on the state struct and returning normally:
+`inflate_wrapper.rs:50` — reuse it. Add resumable state on the
+inflate driver, shaped like vendor's pattern of storing the stop result
+on the state struct:
 
 ```rust
 // in src/decompress/inflate/consume_first_decode.rs
@@ -284,23 +251,19 @@ pub fn inflate_resumable(
 ) -> Result<usize /*bytes_written*/, Error>;
 ```
 
-The inflate state machine checks `points_to_stop_at` at the four
-patched sites (after BFINAL/BTYPE decode →
-`END_OF_STREAM_HEADER`/`END_OF_BLOCK_HEADER`; after BFINAL=1's last
-symbol → `END_OF_STREAM`; after any block's last symbol →
-`END_OF_BLOCK`). On a fired stop, return early with `stopped_at` set.
-
-Output mode must support **both** raw bytes (for `read_stream`) **and**
-the 16-bit `MARKER_BASE`-encoded form that
-`gzip_chunk.rs:416 bootstrap_with_deflate_block` already emits — the
-bootstrap-leg call site is exactly the place where the `_pub` family
-is too granular.
+State-machine checks at the four patched sites: after BFINAL/BTYPE
+decode → `END_OF_STREAM_HEADER`/`END_OF_BLOCK_HEADER`; after BFINAL=1's
+last symbol → `END_OF_STREAM`; after any block's last symbol →
+`END_OF_BLOCK`. On a fired stop, return early with `stopped_at` set.
+Output is raw bytes (matching `IsalInflateWrapper::read_stream`); the
+16-bit `MARKER_BASE` form is `deflate_block::Block`'s concern and is
+not part of this delta.
 
 (b) **Pure-Rust `inflate_wrapper.rs` body, same module path.**
 Keep the file name `inflate_wrapper.rs`. Add a body alternative behind
 `#[cfg(feature = "pure-rust-inflate")]` that hosts the existing public
-surface — every method on `IsalInflateWrapper` from
-`inflate_wrapper.rs:60-540`:
+surface — every method on `IsalInflateWrapper`
+(`inflate_wrapper.rs:60-540`):
 
 ```
 new, with_until_bits, set_window, set_stopping_points,
@@ -319,29 +282,45 @@ calling the wrapper API (NOT raw inflate against a flat buffer — the
 production hot path runs through `IsalInflateWrapper::read_stream` from
 within the marker-bootstrap + chunk-decode loop). Silesia + the 24 MiB
 low-entropy fixture, AVX2 + BMI2 enabled, three trials each.
+`ChunkData::data` is now on `RpmallocAlloc` (already ported), so the
+bench compares like-for-like allocator behaviour.
 
-- **Tier 1 — opt-in:** pure-Rust wall-time within **1.5×** of ISA-L.
-  Build with `--features pure-rust-inflate`.
+- **Tier 1 — opt-in:** pure-Rust wall-time within **1.5×** of ISA-L
+  on silesia. Build with `--features pure-rust-inflate`.
 - **Tier 2 — default behind feature:** within **1.2×** on silesia
   AND no regression on the 24 MiB fixture vs Tier-1 numbers. Flip the
   default; ISA-L still selectable.
-- **Tier 3 — submodule deletion:** within **1.05×** on silesia. Drop
-  `isal-compression` feature, remove `vendor/isa-l`,
-  `vendor/isal-rs`, `packaging/isal-patches/`.
+- **Tier 3 — submodule deletion:** within **1.05×** on silesia, AND
+  pure-Rust replacements landed for the non-SM ISA-L users:
 
-Comparable measurement requires §1 in place. Until then, bench at the
-wrapper level only (raw deflate → pre-allocated flat output buffer);
-do not attribute production-throughput parity to a §1-less run.
+  - `backends/isal_decompress.rs` (T1 x86 sequential decompress) →
+    swap to the pure-Rust inflate already used at
+    `:1054`.
+  - `backends/isal_compress.rs` (L0–L3 x86 compress) → pure-Rust
+    replacement is out of scope of the rapidgzip port; either land a
+    separate pure-Rust fast-compression module or accept that Tier 3
+    removes the L0–L3 fast path until a Rust replacement ships.
+  - `Cargo.toml`: detach `arena-allocator` from
+    `isal-compression` so the arena survives the feature drop.
+
+  When the above land: drop the `isal-compression` feature, remove
+  `vendor/isa-l`, `vendor/isal-rs`, `packaging/isal-patches/`.
 
 (d) **Production swap (Tier 2 onward).** Replace
-`IsalInflateWrapper::*` call sites: `gzip_chunk.rs`,
-`chunk_fetcher.rs`, `single_member.rs`, `block_fetcher.rs`.
+`IsalInflateWrapper::*` call sites on the parallel SM path:
+`gzip_chunk.rs`, `chunk_fetcher.rs`, `single_member.rs`,
+`block_fetcher.rs`.
 
 **Wiring.** Above.
 
-**Dependency.** §1 (`RpmallocAllocator`) is a *measurement* dependency
-for Tier 2 onward — the bench must compare like-for-like allocator
-behaviour. Independent of §§2–5 in code terms.
+**Dependency.**
+
+- §§1–3 (cached Huffman) speed up the **bootstrap** leg; §5 swaps the
+  **post-bootstrap** leg. Independent in code terms — neither blocks
+  the other on swap-correctness. Bench results (c) are easier to
+  attribute once §§1–3 land because bootstrap stops dominating the
+  hot-path profile.
+- Tier 3 requires the non-SM ISA-L migrations listed above.
 
 ## Not part of this port
 
@@ -356,14 +335,16 @@ Vendor primitives or gzippy code intentionally excluded.
   `gzip/deflate.hpp:45,182` shows it commented out.
 - **`IndexFileFormat.hpp` and the seekable reader.** Subchunk indexing
   at `chunk_data.rs::subchunks` and `UnsplitBlocks` at
-  `chunk_fetcher.rs:118` are plumbed but gated behind
-  `#[cfg(feature = "seekable-index")]` until the seekable reader
-  lands.
+  `chunk_fetcher.rs:122` (the type alias) are plumbed but the
+  consumer-side seekable reader is unbuilt. Today the supporting code
+  is gated on `#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]`
+  (same as the rest of the parallel SM path); a dedicated
+  `seekable-index` feature flag should land when the reader does.
 - BZIP2, ZLIB-format, BGZF parallel encoders, multi-member parallel
   encoders, Python bindings, `GzipReader.hpp`, `GzipAnalyzer.hpp`.
 - **`AlignedAllocator.hpp`** — `replace_markers.rs:146` uses unaligned
   AVX (`_mm256_loadu_si256`); re-evaluate only if `dTLB-load-misses`
-  stays elevated after #1.
+  stays elevated.
 - **`src/decompress/deflate64.rs`** — gzippy-original Deflate64; no
   rapidgzip counterpart; no consumer in the SM path. Published API at
   `src/lib.rs:267,277` (`decompress_deflate64`,
@@ -381,22 +362,28 @@ The unit is the gate.
    `cargo test --release -- test_single_member_parallel_not_slower_than_sequential`
    reports `ratio < 0.5` at `T = min(16, num_cpus::get_physical())` on
    the 24 MiB low-entropy fixture in `routing.rs`.
-2. **Silesia perf.** `test_single_member_parallel_silesia` reports
-   `ratio < 0.5` on real `silesia.tar.gz`
-   (`https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia`). The
-   synthetic-class proxy in `routing.rs` is not this gate.
+2. **Silesia perf (real corpus, not yet implemented).** Add
+   `test_single_member_parallel_silesia` against real `silesia.tar.gz`
+   (`https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia`); report
+   `ratio < 0.5` at the same T. The existing
+   `test_single_member_parallel_silesia_class_not_slower_than_sequential`
+   in `routing.rs:521` is a synthetic-high-entropy proxy and does not
+   discharge this gate.
 3. **Routing / FNAME / coordinator traps.**
    `test_single_member_routing_multithread`,
    `test_coordinator_boundary_search_runs_on_x86_64_isal`, and
-   `test_parallel_sm_handles_fname_header` pass byte-perfect.
-   `MARKER_PIPELINE_RUNS` (`single_member.rs:95`) and
-   `COORDINATOR_BOUNDARY_SEARCH_RUNS` (`chunk_fetcher.rs:1281`)
-   increment.
+   `test_parallel_sm_handles_fname_header` (nested under
+   `#[cfg(all(target_arch = "x86_64", feature = "isal-compression"))] mod fname_header_parallel_sm`)
+   pass byte-perfect. `MARKER_PIPELINE_RUNS` (`single_member.rs:95`)
+   and `COORDINATOR_BOUNDARY_SEARCH_RUNS` (`chunk_fetcher.rs:1282`)
+   both increment.
 4. **Dead-code allows gone.** Every
    `#![allow(dead_code)] // vendor-faithful rapidgzip port` removed
-   from production SM hot-path modules. `cargo build --release -- -D warnings`
-   succeeds. Seekable scaffolding stays behind
-   `#[cfg(feature = "seekable-index")]`.
+   from production SM hot-path modules.
+   `cargo clippy --release --all-targets --features isal-compression -- -D warnings`
+   succeeds. Pre-seekable-reader scaffolding stays under the existing
+   `cfg(all(feature = "isal-compression", target_arch = "x86_64"))`
+   gating until the seekable reader lands.
 5. **`perf stat` vs vendor.**
 
    ```
@@ -407,15 +394,15 @@ The unit is the gate.
    compared against `rapidgzip -P 16 -c silesia.tar.gz > /dev/null` on
    the same host (`pip install rapidgzip`). Required: gzippy
    `minor-faults` within 1.5× of rapidgzip's; gzippy wall-time within
-   1.2×. The arena in #1 is what closes the `minor-faults` gap;
-   vendor's rpmalloc per-thread free list keeps freed pages off
-   `munmap`.
+   1.2×. (The `RpmallocAllocator` port already landed; this gate
+   measures whether it closes the page-fault gap as expected.)
 6. **No external compiled deflate.** `cargo tree --release` shows no
    `isal-sys` / `isal-rs` in the production dependency graph; the
    `vendor/isa-l` and `vendor/isal-rs` submodules and
-   `packaging/isal-patches/` are removed. Gates 1–5 mark parity with
+   `packaging/isal-patches/` are removed. §§1–4 mark parity with
    rapidgzip's *architecture*; this gate marks parity with no C
-   dependency.
+   dependency anywhere in production (parallel SM, sequential
+   decompress, fast-tier compress).
 
 If any of (1)–(6) miss, the unit hasn't landed.
 
