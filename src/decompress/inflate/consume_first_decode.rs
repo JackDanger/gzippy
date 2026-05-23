@@ -3856,7 +3856,11 @@ mod tests {
         assert_slices_eq!(&out[..r.bytes_written], original.as_slice());
     }
 
-    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        feature = "isal-compression",
+        not(feature = "pure-rust-inflate")
+    ))]
     #[test]
     fn test_resumable_stops_match_isal_wrapper() {
         use super::ResumableInflate;
@@ -3912,7 +3916,11 @@ mod tests {
 
     /// Track B4 Tier-1 gate: pure-Rust resumable inflate within 1.5× of ISA-L
     /// on silesia. Run on neurotic: `--ignored --nocapture`.
-    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        feature = "isal-compression",
+        not(feature = "pure-rust-inflate")
+    ))]
     #[test]
     #[ignore = "perf gate — run on neurotic (Track B4)"]
     fn test_isal_vs_pure_rust_silesia_throughput() {
