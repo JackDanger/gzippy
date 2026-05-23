@@ -146,7 +146,7 @@ def normalize_compression_result(data: dict, source_file: str) -> list:
                 "threads": data.get("threads", r.get("threads", 1)),
                 "time": r.get("median", r.get("time", 0)),
                 "size": r.get("output_size", r.get("size", 0)),
-                "speed": r.get("speed", 0),
+                "speed": r.get("speed_mbps", r.get("speed", 0)),
                 "data_type": data_type,
                 "size_mb": data.get("size_mb", 0),
             })
@@ -157,11 +157,11 @@ def normalize_compression_result(data: dict, source_file: str) -> list:
 def normalize_decompression_result(data: dict, source_file: str) -> list:
     """
     Normalize a decompression result to a standard format.
-    
+
     Returns a list of individual benchmark results.
     """
     results = []
-    
+
     # Extract data_type from filename or path
     data_type = "unknown"
     source_lower = source_file.lower()
@@ -175,7 +175,6 @@ def normalize_decompression_result(data: dict, source_file: str) -> list:
         data_type = "text"
     elif "tarball" in source_lower:
         data_type = "tarball"
-    
     archive_type = data.get("archive_type", "unknown")
     if archive_type != "unknown":
         data_type = archive_type.split("-", 1)[0]

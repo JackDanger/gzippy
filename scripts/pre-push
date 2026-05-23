@@ -22,4 +22,8 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     fi
 done
 
+if ! bash scripts/verify_submodule_remotes.sh; then
+    exit 1
+fi
+
 exit 0

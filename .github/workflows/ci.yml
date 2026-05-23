@@ -58,7 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: true  # Only direct submodules (pigz), not recursive (gzip has problematic gnulib)
+          submodules: true  # vendor/isa-l, vendor/isal-rs, pigz, … (not recursive — gzip gnulib)
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -947,4 +947,13 @@ jobs:
 
           echo "Checking versions: VERSION=$VERSION Cargo=$CARGO_VERSION"
           [ "$VERSION" = "$CARGO_VERSION" ] || { echo "VERSION ($VERSION) != Cargo.toml ($CARGO_VERSION)"; exit 1; }
+
+          # Formula may use a dynamic read (version File.read(...)) or a static string.
+          # Dynamic read is always consistent with VERSION by construction; skip comparison.
+          if grep -q 'version File.read' Formula/gzippy.rb; then
+            echo "Formula uses dynamic VERSION read — always consistent with VERSION file"
+          else
+            FORMULA_VERSION=$(grep "version \"" Formula/gzippy.rb | sed 's/.*version "\(.*\)".*/\1/')
+            [ "$VERSION" = "$FORMULA_VERSION" ] || { echo "VERSION ($VERSION) != Formula ($FORMULA_VERSION)"; exit 1; }
+          fi
           echo "✓ All versions match"

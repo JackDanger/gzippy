@@ -17,8 +17,13 @@ pub mod zlib;
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, feature = "oracle"))]
-mod oracle_tests;
+// Note: the `oracle` corpus test that compares against vendored C zopfli lives
+// at `src/oracle_tests.rs` and is included only by `src/lib.rs` (via
+// `#[path]`), not by `src/main.rs`. Declaring it inside this `mod backends;`
+// tree would cause the bin's `mod backends;` to also compile it, and the
+// resulting bin-test binary fails to link against `zopfli_oracle` (build.rs
+// links it into the lib's targets via cc::Build, not into a transient bin
+// test that doesn't directly use the package's library target).
 
 /// Compression knobs. The first five fields mirror the *active* knobs in
 /// Google Zopfli's `ZopfliOptions`. The C struct also has a sixth field

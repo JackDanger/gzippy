@@ -63,6 +63,13 @@ mod utils;
 #[cfg(test)]
 mod tests;
 
+// Lib-only oracle corpus test. See note in
+// `src/backends/zopfli_pure/mod.rs` for why this is declared here rather
+// than under the `mod backends;` tree.
+#[cfg(all(test, feature = "oracle"))]
+#[path = "backends/zopfli_pure/oracle_tests.rs"]
+mod zopfli_oracle_tests;
+
 // `compress::io` and `decompress::io` call `crate::set_output_file` to register
 // the in-progress output path for signal-handler cleanup. In the library there
 // is no signal handler, so this is a no-op.

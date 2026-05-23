@@ -13,7 +13,11 @@
 
 #![cfg(feature = "oracle")]
 
-use super::{compress, ZopfliFormat, ZopfliOptions};
+// Imported via `crate::` rather than `super::` because this file is included
+// by `src/lib.rs` directly (via `#[path]`), so its module parent is the crate
+// root, not `crate::backends::zopfli_pure`. See lib.rs / zopfli_pure/mod.rs
+// for the rationale (avoids dual lib/bin compilation of an FFI-using test).
+use crate::backends::zopfli_pure::{compress, ZopfliFormat, ZopfliOptions};
 
 #[repr(C)]
 #[derive(Clone, Copy)]

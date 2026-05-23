@@ -214,37 +214,93 @@ def generate_key_metrics(compression: list, decompression: list) -> list:
     return lines
 
 
-def generate_goals_table(compression: list, decompression: list) -> list:
+def generate_single_member_section(single_member: list) -> list:
+    """Generate single-member parallel decompression section."""
+    lines = []
+    if not single_member:
+        return lines
+
+    lines.append("## ⚡ Single-Member Parallel Decompression (v0.6 marker pipeline)")
+    lines.append("")
+    lines.append(
+        "Standard gzip file (no natural block boundaries). Tests the marker-based "
+        "parallel path: per-chunk pure-Rust marker decode + SIMD `replace_markers` "
+        "resolve, ~1.1N total compute work."
+    )
+    lines.append("")
+    lines.append("| Threads | gzippy Speed | vs rapidgzip | vs unpigz |")
+    lines.append("|---------|--------------|--------------|-----------|")
+
+    by_threads = {}
+    for r in single_member:
+        t = r.get("threads", "?")
+        by_threads.setdefault(t, {})[r.get("tool", "?")] = r
+
+    for threads in sorted(by_threads.keys()):
+        tools = by_threads[threads]
+        gzippy = tools.get("gzippy")
+        if not gzippy or "error" in gzippy:
+            continue
+
+        gzippy_speed = gzippy.get("speed_mbps", 0)
+        gzippy_str = f"{gzippy_speed:.0f} MB/s"
+
+        comparisons = []
+        for comp in ["rapidgzip", "unpigz"]:
+            other = tools.get(comp)
+            if other and "error" not in other and other.get("speed_mbps", 0) > 0:
+                icon, diff = compare_icon(gzippy_speed, other["speed_mbps"])
+                comparisons.append(f"{icon} {diff:+.0f}%")
+            else:
+                comparisons.append("—")
+
+        lines.append(f"| T{threads} | {gzippy_str} | {comparisons[0]} | {comparisons[1]} |")
+
+    lines.append("")
+    return lines
+
+
+def generate_goals_table(compression: list, decompression: list,
+                         single_member: list | None = None) -> list:
     """Generate pass/fail goals table."""
     lines = []
     lines.append("## ✅ Performance Goals")
     lines.append("")
     lines.append("| Goal | Status |")
     lines.append("|------|--------|")
-    
+
     gzippy_comp = [r for r in compression if r['tool'] == 'gzippy']
     pigz_comp = [r for r in compression if r['tool'] == 'pigz']
-    
+
     # Compression speed goal
     gzippy_l1_mt = next((r for r in gzippy_comp if r['level'] == 1 and r['threads'] > 1), None)
     pigz_l1_mt = next((r for r in pigz_comp if r['level'] == 1 and r['threads'] > 1), None)
-    
+
     if gzippy_l1_mt and pigz_l1_mt:
         if gzippy_l1_mt['speed'] >= pigz_l1_mt['speed']:
             lines.append("| Compression faster than pigz | ✅ PASS |")
         else:
             lines.append("| Compression faster than pigz | ❌ FAIL |")
-    
-    # Compression ratio goal
+
+    # Compression ratio goal at L9
     gzippy_l9 = next((r for r in gzippy_comp if r['level'] == 9), None)
     pigz_l9 = next((r for r in pigz_comp if r['level'] == 9), None)
-    
+
     if gzippy_l9 and pigz_l9:
         if gzippy_l9['size'] <= pigz_l9['size'] * 1.005:  # Within 0.5%
             lines.append("| Compression ratio matches pigz (L9) | ✅ PASS |")
         else:
             lines.append("| Compression ratio matches pigz (L9) | ❌ FAIL |")
-    
+
+    # L11 ratio goal vs gzip -9
+    gzippy_l11 = next((r for r in gzippy_comp if r['level'] == 11), None)
+    gzip_l11 = next((r for r in compression if r['tool'] == 'gzip' and r['level'] == 11), None)
+    if gzippy_l11 and gzip_l11 and gzip_l11.get('size', 0) > 0:
+        if gzippy_l11['size'] <= gzip_l11['size']:
+            lines.append("| L11 ratio beats gzip -9 | ✅ PASS |")
+        else:
+            lines.append("| L11 ratio beats gzip -9 | ❌ FAIL |")
+
     # Decompression speed goal
     gzippy_decomp = [r for r in decompression if r['tool'] == 'gzippy' and r.get('source') == 'gzippy']
     if gzippy_decomp:
@@ -252,15 +308,31 @@ def generate_goals_table(compression: list, decompression: list) -> list:
             lines.append("| Decompression ≥300 MB/s (BGZF) | ✅ PASS |")
         else:
             lines.append("| Decompression ≥300 MB/s (BGZF) | ❌ FAIL |")
-    
+
+    # Single-member goal
+    if single_member:
+        by_threads = {}
+        for r in single_member:
+            by_threads.setdefault(r.get("threads", 1), {})[r.get("tool")] = r
+        for threads, tools in sorted(by_threads.items()):
+            gzippy = tools.get("gzippy")
+            rapidgzip = tools.get("rapidgzip")
+            if gzippy and rapidgzip and not any("error" in x for x in [gzippy, rapidgzip]):
+                ratio = gzippy.get("speed_mbps", 0) / rapidgzip.get("speed_mbps", 1)
+                if ratio >= 0.99:
+                    lines.append(f"| Single-member T{threads} ≥99% of rapidgzip | ✅ PASS |")
+                else:
+                    lines.append(f"| Single-member T{threads} ≥99% of rapidgzip | ❌ FAIL |")
+
     lines.append("")
     return lines
 
 
-def generate_summary(system: dict, compression: list, decompression: list) -> str:
+def generate_summary(system: dict, compression: list, decompression: list,
+                     single_member: list | None = None) -> str:
     """Generate full Markdown summary."""
     lines = []
-    
+
     # Header
     lines.append("# 🚀 gzippy Performance Summary")
     lines.append("")
@@ -268,29 +340,57 @@ def generate_summary(system: dict, compression: list, decompression: list) -> st
         lines.append(f"**System**: {system.get('cpu', 'Unknown')} ({system.get('cores', '?')} cores)")
         lines.append(f"**SIMD**: {system.get('simd', 'Unknown')}")
         lines.append("")
-    
+
     # Compression
     if compression:
         lines.append("## 📦 Compression: gzippy vs Alternatives")
         lines.append("")
-        
+
         threads = sorted(set(r['threads'] for r in compression))
         for t in threads:
             lines.extend(generate_compression_table(compression, t))
-    
+
     # Decompression
     if decompression:
         lines.append("## 📤 Decompression: gzippy vs Alternatives")
         lines.append("")
         decomp_lines, _ = generate_decompression_table(decompression)
         lines.extend(decomp_lines)
-    
+
+    # Single-member
+    if single_member:
+        lines.extend(generate_single_member_section(single_member))
+
     # Key metrics
     if compression or decompression:
         lines.extend(generate_key_metrics(compression, decompression))
-        lines.extend(generate_goals_table(compression, decompression))
-    
+        lines.extend(generate_goals_table(compression, decompression, single_member))
+
     return "\n".join(lines)
+
+
+def load_single_member_dir(results_dir: str) -> list:
+    """Load all single-member benchmark results from a directory."""
+    results = []
+    if not results_dir:
+        return results
+    p = Path(results_dir)
+    if not p.exists():
+        return results
+    for json_file in sorted(p.glob("*.json")):
+        try:
+            with open(json_file) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("benchmark") != "single-member":
+            continue
+        threads = data.get("threads", "?")
+        for r in data.get("results", []):
+            if "error" not in r:
+                r["threads"] = threads
+                results.append(r)
+    return results
 
 
 def main():
@@ -301,25 +401,28 @@ def main():
                        help="Path to compression.json")
     parser.add_argument("--decompression", type=str, default="results/decompression.json",
                        help="Path to decompression.json")
+    parser.add_argument("--single-member-dir", type=str, default=None,
+                       help="Directory containing single-member benchmark result JSONs")
     parser.add_argument("--output", type=str, default=None,
                        help="Output file (default: stdout)")
-    
+
     args = parser.parse_args()
-    
+
     # Load data
     system = load_json(args.system)
     compression = load_json(args.compression)
     decompression = load_json(args.decompression)
-    
+    single_member = load_single_member_dir(args.single_member_dir)
+
     # Handle list vs dict formats
     if isinstance(compression, dict):
         compression = compression.get('benchmarks', compression.get('results', []))
     if isinstance(decompression, dict):
         decompression = decompression.get('benchmarks', decompression.get('results', []))
-    
+
     # Generate summary
-    summary = generate_summary(system, compression, decompression)
-    
+    summary = generate_summary(system, compression, decompression, single_member)
+
     # Output
     if args.output:
         Path(args.output).write_text(summary)

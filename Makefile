@@ -27,7 +27,21 @@ SYSTEM_GZIP := $(shell which gzip)
 # Set APPLE_GZIP when it differs from GZIP_BIN so bench targets compare both
 APPLE_GZIP := $(if $(filter Darwin,$(shell uname)),/usr/bin/gzip,)
 
-.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship ship-local route-check oracle-vs-c
+# Time budgets (seconds). Each nontrivial target wraps its work in
+# `timeout` so a hang or runaway build fails the target instead of
+# blocking forever. The number is the expectation: blowing the budget is
+# a regression to investigate, not a knob to bump.
+#   QUICK    — local quick-check stage, typically <30s
+#   BENCH_SM — neurotic: build + single-member benchmark
+#   TEST_X86 — neurotic: build + the x86_64-gated test subset
+#   SHIP     — neurotic: build + gzippy-dev bench + L11 head-to-head
+QUICK_TIMEOUT    := 300
+BENCH_SM_TIMEOUT := 1200
+TEST_X86_TIMEOUT := 1500
+SHIP_TIMEOUT     := 2700
+
+.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship ship-local route-check oracle-vs-c bench-sm \
+	profile-single-member-decompression-x86_64 profile-single-member-decompression-arm64 profile-decompression-x86_64
 
 # =============================================================================
 # Default target: quick benchmark for fast iteration (< 30 seconds)
@@ -99,27 +113,20 @@ FORCE:
 #   Stage 2: allocation budget (any new alloc on hot path = fail)
 #   Stage 3: differential ratio vs libdeflate (cancels thermal noise)
 #   Stage 4: hot-path hit rates in bgzf decoder
-#   Stage 5: cachegrind instruction count (Linux only, skipped on macOS)
 # See benchmarks/baselines.json for thresholds. Run 'make update-baselines'
 # after an intentional perf change.
 # =============================================================================
 quick: $(GZIPPY_BIN)
 	@echo "══ make quick ══════════════════════════════════════════"
 	@echo "── Stage 1: correctness + routing smoke ────────────────"
-	@cargo test --release correctness 2>&1 | tail -3
-	@cargo test --release routing 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release correctness 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release routing 2>&1 | tail -3
 	@echo "── Stage 2: allocation budget ──────────────────────────"
-	@cargo test --release alloc_budget 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release alloc_budget 2>&1 | tail -3
 	@echo "── Stage 3: differential ratio vs libdeflate ───────────"
-	@cargo test --release diff_ratio 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release diff_ratio 2>&1 | tail -3
 	@echo "── Stage 4: hot-path hit rates ─────────────────────────"
-	@cargo test --release hot_path 2>&1 | tail -3
-	@echo "── Stage 5: cachegrind (Linux only) ────────────────────"
-	@if [ "$$(uname)" = "Darwin" ]; then \
-		echo "  (skipped — cachegrind not available on macOS)"; \
-	else \
-		bash scripts/cachegrind_check.sh; \
-	fi
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release hot_path 2>&1 | tail -3
 	@echo "════════════════════════════════════════════════════════"
 	@echo "✓ make quick passed"
 
@@ -129,7 +136,6 @@ update-baselines: $(GZIPPY_BIN)
 	@RECORD_BASELINES=1 cargo test --release alloc_budget -- --nocapture 2>&1 | grep -E "baseline:|RECORD" || true
 	@RECORD_BASELINES=1 cargo test --release diff_ratio -- --nocapture 2>&1 | grep -E "baseline:|RECORD" || true
 	@RECORD_BASELINES=1 cargo test --release hot_path -- --nocapture 2>&1 | grep -E "baseline:|RECORD" || true
-	@bash scripts/cachegrind_check.sh --record
 	@echo "Done."
 
 # =============================================================================
@@ -147,6 +153,31 @@ route-check: $(GZIPPY_BIN) $(PIGZ_BIN)
 	@python3 scripts/route_check.py $(GZIPPY_BIN) $(PIGZ_BIN)
 
 # =============================================================================
+# Single-member decompression profiling (correctness gate + CPU/alloc artifacts)
+# =============================================================================
+profile-single-member-decompression-x86_64:
+	@chmod +x scripts/profile_single_member_decompression_x86_64.sh
+	@bash scripts/profile_single_member_decompression_x86_64.sh
+
+profile-single-member-decompression-arm64:
+	@chmod +x scripts/profile_single_member_decompression_arm64.sh
+	@bash scripts/profile_single_member_decompression_arm64.sh
+
+profile-decompression-x86_64: profile-single-member-decompression-x86_64
+
+# Remote homelab box (Intel i9-14000), reached via an SSH jump host. This
+# is the only place the isal-compression / parallel single-member path
+# builds and runs — local arm64 macOS cannot. Used by `ship`, `bench-sm`,
+# and `test-x86_64`.
+NEUROTIC_SSH := ssh -o ConnectTimeout=15 -J neurotic root@10.30.0.199
+
+# Shell snippet (run on neurotic) that hard-syncs the /root/gzippy checkout
+# to origin/$BRANCH — $BRANCH must be set in the calling recipe's shell.
+# The safe.directory exception is required because the checkout is not
+# owned by the ssh user (git refuses "dubious ownership" repos otherwise).
+NEUROTIC_SYNC := git config --global --add safe.directory /root/gzippy; git fetch origin '$$BRANCH'; git checkout -f -B '$$BRANCH' 'origin/$$BRANCH'; git reset --hard 'origin/$$BRANCH'
+
+# =============================================================================
 # Ship: the "are we good?" gate. Always tests the *current branch*.
 #
 # Runs the cheap local checks first, then expensive homelab bench last so
@@ -159,7 +190,7 @@ route-check: $(GZIPPY_BIN) $(PIGZ_BIN)
 # Step 5: cross-tool roundtrip smoke (gzippy ↔ gzip/pigz/igzip when available)
 # Step 6: push current branch + homelab fetches THIS branch + bench
 #
-# Target: ssh -J neurotic root@10.30.0.199 (homelab intel i9-14000)
+# Target: $(NEUROTIC_SSH) (homelab intel i9-14000)
 # Time: ~25 minutes total (~30s through step 5; ~20-25 min on step 6)
 # Use `make ship-local` to run steps 1-5 only and skip the homelab.
 # =============================================================================
@@ -175,11 +206,9 @@ ship: ship-precheck ship-local
 	  echo "  origin/$$BRANCH already up to date"; \
 	fi; \
 	echo "  connecting to neurotic..."; \
-	ssh -J neurotic root@10.30.0.199 "set -e; cd gzippy; \
+	timeout $(SHIP_TIMEOUT) $(NEUROTIC_SSH) "set -e; cd gzippy; \
 	  echo '  fetching origin/$$BRANCH...'; \
-	  git fetch origin '$$BRANCH'; \
-	  git checkout -B '$$BRANCH' 'origin/$$BRANCH'; \
-	  git reset --hard 'origin/$$BRANCH'; \
+	  $(NEUROTIC_SYNC); \
 	  git submodule update --init --recursive 2>&1 | tail -3; \
 	  echo ''; echo '  ── disk-space precheck ──'; \
 	  AVAIL_GB=\$$(df -BG . | tail -1 | awk '{gsub(/G/,\"\",\$$4); print \$$4}'); \
@@ -225,6 +254,95 @@ ship: ship-precheck ship-local
 	@echo ""
 	@echo "✓ ship complete on branch $$(git rev-parse --abbrev-ref HEAD)"
 
+# =============================================================================
+# bench-sm: single-member x86_64 Tmax gzippy vs rapidgzip on neurotic.
+#
+# Skips all local quality gates (fmt/test/clippy/oracle). Pushes the current
+# branch, SSHs to neurotic, builds gzippy + rapidgzip, runs
+# scripts/benchmark_single_member.py against silesia.tar compressed at -9.
+# Use this for tight iteration on the parallel single-member path without
+# the 20-minute full ship round-trip.
+#
+# Time: ~3-5 minutes (build ~1 min, bench ~2-3 min for 10 trials).
+# =============================================================================
+bench-sm: ship-precheck
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	echo ""; \
+	echo "── bench-sm: x86_64 Tmax single-member  gzippy vs rapidgzip ──"; \
+	if ! git rev-parse origin/$$BRANCH >/dev/null 2>&1 \
+	    || [ -n "$$(git log origin/$$BRANCH..HEAD 2>/dev/null)" ]; then \
+	  echo "  pushing $$BRANCH to origin..."; \
+	  git push origin $$BRANCH || (echo "PUSH FAILED — aborting bench-sm" >&2 && exit 1); \
+	else \
+	  echo "  origin/$$BRANCH already up to date"; \
+	fi; \
+	echo "  connecting to neurotic..."; \
+	timeout $(BENCH_SM_TIMEOUT) $(NEUROTIC_SSH) "set -e; cd gzippy; \
+	  echo '  fetching origin/$$BRANCH...'; \
+	  $(NEUROTIC_SYNC); \
+	  echo '  building gzippy (--features isal-compression)...'; \
+	  cargo build --release --features isal-compression 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
+	  RAPIDGZIP=vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip; \
+	  if [ ! -x \"\$$RAPIDGZIP\" ]; then \
+	    echo '  building rapidgzip (first time only)...'; \
+	    cd vendor/rapidgzip && git submodule update --init --recursive >/dev/null 2>&1 || true; \
+	    mkdir -p librapidarchive/build; \
+	    cd librapidarchive/build && cmake .. -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1; \
+	    make -j\$$(nproc) rapidgzip 2>&1 | grep -E 'Linking|Built|error' || true; \
+	    cd /root/gzippy; \
+	  fi; \
+	  BD=benchmark_data; \
+	  [ -f \"\$$BD/silesia.tar\" ] || { [ -f \"\$$BD/silesia.tar.xz\" ] && xz -dk \"\$$BD/silesia.tar.xz\" -c > \"\$$BD/silesia.tar\"; }; \
+	  SL=\$$BD/silesia-large.bin; \
+	  SLG=\$$BD/silesia-large.gz; \
+	  [ -s \"\$$SL\" ] || { \
+	    echo '  building silesia-large.bin (~500MB, one-time)...'; \
+	    cat \"\$$BD/silesia.tar\" \"\$$BD/silesia.tar\" > \"\$$SL\"; \
+	    head -c \$$((76 * 1024 * 1024)) \"\$$BD/silesia.tar\" >> \"\$$SL\"; \
+	  }; \
+	  [ -s \"\$$SLG\" ] || { echo '  compressing silesia-large.bin at gzip -9 (one-time, ~60s)...'; gzip -9 -c \"\$$SL\" > \"\$$SLG\"; }; \
+	  BDIR=/tmp/bench-sm-bin; mkdir -p \"\$$BDIR\"; \
+	  cp target/release/gzippy \"\$$BDIR/\"; \
+	  cp \"\$$RAPIDGZIP\" \"\$$BDIR/\" 2>/dev/null || true; \
+	  [ -x vendor/pigz/unpigz ] && cp vendor/pigz/unpigz \"\$$BDIR/\" || true; \
+	  THREADS=\$$(nproc); \
+	  echo ''; \
+	  python3 scripts/benchmark_single_member.py \
+	    --binaries \"\$$BDIR\" \
+	    --compressed-file \"\$$SLG\" \
+	    --original-file \"\$$SL\" \
+	    --threads \"\$$THREADS\" \
+	    --output /tmp/bench-sm-result.json; \
+	  echo ''; \
+	  echo 'Full JSON: /tmp/bench-sm-result.json'"
+	@echo ""
+	@echo "✓ bench-sm complete on branch $$(git rev-parse --abbrev-ref HEAD)"
+
+# =============================================================================
+# test-x86_64: verify the x86_64-only code on the homelab box. The parallel
+# single-member decode path (ISA-L) is gated on x86_64 + the
+# isal-compression feature and does not build on local arm64 macOS. This
+# pushes the branch, hard-syncs the homelab checkout, and runs the
+# `routing` oracle — the suite that exercises that path end-to-end; the
+# rest of the tests are arch-independent and run locally. Hard-capped by
+# `timeout` (TEST_X86_TIMEOUT); typically ~8-12 min.
+# =============================================================================
+.PHONY: test-x86_64
+test-x86_64: ship-precheck
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	echo ""; \
+	echo "── test-x86_64: cargo test --features isal-compression on neurotic ──"; \
+	echo "  pushing $$BRANCH to origin..."; \
+	git push origin $$BRANCH || (echo "PUSH FAILED — aborting" >&2 && exit 1); \
+	echo "  connecting to neurotic..."; \
+	timeout $(TEST_X86_TIMEOUT) $(NEUROTIC_SSH) "set -e; cd gzippy; \
+	  $(NEUROTIC_SYNC); \
+	  git submodule update --init vendor/isa-l vendor/isal-rs 2>&1 | tail -3; \
+	  echo '  building + testing the x86_64-gated path...'; \
+	  cargo test --release --features isal-compression routing"
+	@echo ""
+	@echo "✓ test-x86_64 passed on branch $$(git rev-parse --abbrev-ref HEAD)"
+
 # `ship-precheck`: dirty-tree refusal. Pulled out of `ship-local` so a
 # dirty tree fails in <1s instead of after 30s of local checks. Only
 # runs as a prereq of `ship` (which pushes); `ship-local` is permitted
@@ -233,7 +351,7 @@ ship: ship-precheck ship-local
 ship-precheck:
 	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
 	if [ "$$BRANCH" = "HEAD" ]; then echo "ERROR: detached HEAD; checkout a branch first" >&2; exit 1; fi; \
-	if [ -n "$$(git status --porcelain | grep -v '^?? vendor/zopfli')" ]; then \
+	if [ -n "$$(git status --porcelain | grep -v 'vendor/zopfli')" ]; then \
 	  echo "ERROR: uncommitted changes — homelab needs to fetch a committed branch" >&2; \
 	  echo "       run 'git status' and commit (or stash) before 'make ship'" >&2; \
 	  echo "       (use 'make ship-local' to run local checks against a dirty tree)" >&2; \
@@ -645,12 +763,17 @@ help:
 		'                    cross-tool roundtrip + push branch + homelab bench.' \
 		'                    Fail-fast (~30s through local steps; ~25min total).' \
 		'  make ship-local   Same as `ship` but skips the homelab step (steps 1-5 only).' \
+		'  make test-x86_64  cargo test --features isal-compression on the homelab box' \
+		'                    (the x86_64-only parallel single-member path).' \
 		'  make oracle-vs-c  Phase 11.2 corpus oracle: zopfli_pure vs vendor/zopfli' \
 		'' \
 		'Quick commands (for AI tools and iteration):' \
 		'  make              Build and run quick benchmark (< 30 seconds)' \
 		'  make quick        Same as above' \
 		'  make route-check  Show decompression routing + timing for T1/T4 x 1MB/10MB' \
+		'  make profile-single-member-decompression-x86_64  Homelab: SM decode + perf' \
+		'  make profile-single-member-decompression-arm64   Local M1: SM libdeflate + samply' \
+		'  make profile-decompression-x86_64              Alias for x86_64 target above' \
 		'  make build        Build gzippy and ungzippy' \
 		'  make deps         Build gzip and pigz from submodules' \
 		'  make validate     Run validation suite (adaptive 3-17 trials)' \

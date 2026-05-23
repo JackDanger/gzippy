@@ -17,9 +17,9 @@ name: Benchmarks
 
 on:
   push:
-    branches: ["*"]
+    branches: ["**"]  # match slashed names like feat/foo too (single-* is just one segment)
   pull_request:
-    branches: ["*"]
+    branches: ["**"]
   workflow_dispatch:
 
 permissions:
@@ -266,6 +266,22 @@ jobs:
             data_type: logs
             level: 9
             threads: "max"
+          # x86_64 - L11 (ultra/zopfli: ratio guard vs gzip -9; T1 only, zopfli is single-threaded)
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: silesia
+            level: 11
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: software
+            level: 11
+            threads: "1"
+          - platform: x86_64
+            runner: ubuntu-latest
+            data_type: logs
+            level: 11
+            threads: "1"
           # ARM64 - full matrix (matches x86_64)
           - platform: arm64
             runner: ubuntu-24.04-arm
@@ -528,6 +544,87 @@ jobs:
           retention-days: 7
 
   # ============================================================================
+  # STAGE 4b: Single-member parallel decompression benchmark (x86_64 only)
+  # Tests the v0.6 marker pipeline on a standard single-member file:
+  # per-chunk pure-Rust marker decode + SIMD `replace_markers` resolve,
+  # ~1.1N total compute work, scales ~T from T=2 upward.
+  # arm64 skipped: ISA-L unavailable, parallel single-member path is gated off.
+  # ============================================================================
+  single-member-benchmark:
+    name: Single-Member Decomp T${{ matrix.threads }} (x86_64)
+    runs-on: ubuntu-latest
+    # Bound the job at 8 minutes. Earlier today (2026-05-13) a runaway
+    # tier-3 boundary-search sweep ran for 34+ s per gzippy invocation
+    # before the runner sent SIGTERM; the cause was ambiguous because the
+    # signal looked like generic runner preemption. An explicit job-level
+    # timeout turns that class of regression into a clear "exceeded
+    # timeout" failure instead of "runner died, who knows why."
+    timeout-minutes: 8
+    needs: prepare-data
+    strategy:
+      fail-fast: false
+      matrix:
+        threads: ["1", "max"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries-x86_64
+          path: ./bin
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: benchmark-data
+          path: ./benchmark_data
+
+      - name: Setup
+        run: |
+          chmod +x ./bin/*
+          mkdir -p results
+
+          if [ "${{ matrix.threads }}" = "max" ]; then
+            echo "THREADS=$(nproc)" >> $GITHUB_ENV
+          else
+            echo "THREADS=${{ matrix.threads }}" >> $GITHUB_ENV
+          fi
+
+      - name: Verify data exists
+        run: |
+          ls -lh benchmark_data/
+          if [ ! -f "benchmark_data/silesia-large.gz" ]; then
+            echo "ERROR: benchmark_data/silesia-large.gz not found"
+            exit 1
+          fi
+          if [ ! -f "benchmark_data/silesia-large.bin" ]; then
+            echo "ERROR: benchmark_data/silesia-large.bin not found"
+            exit 1
+          fi
+          echo "Compressed: $(du -h benchmark_data/silesia-large.gz | cut -f1)"
+          echo "Original: $(du -h benchmark_data/silesia-large.bin | cut -f1)"
+
+      - name: Run single-member benchmark
+        run: |
+          python3 scripts/benchmark_single_member.py \
+            --binaries ./bin \
+            --compressed-file benchmark_data/silesia-large.gz \
+            --original-file benchmark_data/silesia-large.bin \
+            --threads $THREADS \
+            --output results/single-member-t${{ matrix.threads }}.json
+
+      # `if: always()` so a failing bench still uploads the JSON with
+      # routing_trace.stderr_head and per-phase timings — otherwise the
+      # only signal is the bench's stdout summary, which doesn't include
+      # the GZIPPY_DEBUG output needed to diagnose perf shortfalls
+      # (silent fallback vs slow marker pipeline vs chain-decode).
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: single-member-results-x86_64-t${{ matrix.threads }}
+          path: results/
+          retention-days: 7
+
+  # ============================================================================
   # STAGE 5: Random data correctness check
   # ============================================================================
   random-data:
@@ -604,7 +701,7 @@ jobs:
   guards:
     name: Performance Guards (${{ matrix.platform }})
     runs-on: ubuntu-latest
-    needs: [compression-benchmark, decompression-benchmark, random-data]
+    needs: [compression-benchmark, decompression-benchmark, random-data, single-member-benchmark]
     if: always() && needs.compression-benchmark.result == 'success' && needs.decompression-benchmark.result == 'success'
     strategy:
       matrix:
@@ -617,7 +714,20 @@ jobs:
         with:
           pattern: results-*-${{ matrix.platform }}-*
           path: results/
+          # merge-multiple intentionally omitted: each artifact goes into its own
+          # subdirectory (results/<artifact-name>/), so compression.json and
+          # decompression.json from different jobs don't collide. aggregate_benchmark_results.py
+          # uses rglob to find all JSON files recursively, and infers data_type from the
+          # subdirectory name (which contains "silesia", "software", "logs", etc.).
+
+      - name: Download single-member results
+        if: matrix.platform == 'x86_64'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: single-member-results-x86_64-*
+          path: results-sm/
           merge-multiple: true
+        continue-on-error: true
 
       - name: Collect system info
         run: |
@@ -641,17 +751,27 @@ jobs:
       - name: Check performance guards
         id: guards
         run: |
+          SM_ARG=""
+          if [ "${{ matrix.platform }}" = "x86_64" ] && [ -d results-sm ]; then
+            SM_ARG="--single-member-dir results-sm"
+          fi
           python3 scripts/check_guards.py \
             --compression aggregated/compression.json \
             --decompression aggregated/decompression.json \
+            $SM_ARG \
             --output guards-report.json
 
       - name: Generate summary
         run: |
+          SM_ARG=""
+          if [ "${{ matrix.platform }}" = "x86_64" ] && [ -d results-sm ]; then
+            SM_ARG="--single-member-dir results-sm"
+          fi
           python3 scripts/generate_summary.py \
             --system results/system.json \
             --compression aggregated/compression.json \
             --decompression aggregated/decompression.json \
+            $SM_ARG \
             --output summary.md
 
           echo "## ${{ matrix.platform }} Performance" >> $GITHUB_STEP_SUMMARY

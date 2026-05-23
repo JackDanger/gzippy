@@ -370,10 +370,10 @@ mod tests {
             let mut rng: u64 = 0xdeadbeef;
             while data.len() < size {
                 rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-                let byte = if rng % 4 == 0 {
+                let byte = if rng.is_multiple_of(4) {
                     (rng >> 16) as u8
                 } else {
-                    b"the quick brown fox jumps over the lazy dog "[data.len() % 44] as u8
+                    b"the quick brown fox jumps over the lazy dog "[data.len() % 44]
                 };
                 data.push(byte);
             }

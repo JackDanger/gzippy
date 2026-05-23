@@ -19,6 +19,7 @@ pub mod scan_inflate;
 pub mod simd_copy;
 pub mod simd_huffman;
 pub mod two_level_table;
+pub mod ultra_fast_inflate;
 
 use std::io::Write;
 
@@ -52,23 +53,38 @@ fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
 ///   GzippyParallel   — gzippy-produced multi-block files ("GZ" FEXTRA subfield)
 ///   MultiMemberPar   — pigz-style multi-member, Tmax threads
 ///   MultiMemberSeq   — pigz-style multi-member, T1
-///   IsalSingle       — x86_64 single-member via ISA-L (fastest sequential)
+///   IsalParallelSM   — x86_64 single-member ≥ 10 MiB w/ T>1 — parallel marker pipeline
+///   IsalSingle       — x86_64 single-member via ISA-L (one-shot, T=1 or small input)
 ///   StreamingSingle  — single-member > 1GB, no ISA-L (avoids huge allocation)
-///   LibdeflateSingle — default single-member via libdeflate one-shot
+///   LibdeflateSingle — default single-member via libdeflate one-shot (no ISA-L)
+///
+/// The single-member sub-paths are now fully decided here. The body of
+/// `decompress_single_member` is a pure dispatcher — no `if-let-Some-else`
+/// fall-through, no silent retry against a different backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodePath {
     GzippyParallel,
     MultiMemberPar,
     MultiMemberSeq,
+    IsalParallelSM,
     IsalSingle,
     StreamingSingle,
     LibdeflateSingle,
 }
 
+/// Inputs ≥ this size on a multi-threaded host with ISA-L take the
+/// parallel single-member pipeline. Below this, single-shot libdeflate
+/// (or ISA-L on x86_64) wins on wall-clock because the parallel
+/// pipeline's per-chunk fixed overhead dominates. This is a *routing*
+/// decision (visible at the classifier level); it is never used as a
+/// silent in-body fallback.
+pub(crate) const MIN_PARALLEL_COMPRESSED: usize = 10 * 1024 * 1024;
+
 /// Classify a gzip input into the optimal `DecodePath`.
 ///
 /// Single source of truth for routing. All classification logic lives here;
-/// `decompress_gzip_libdeflate` only dispatches on the result.
+/// `decompress_gzip_libdeflate` and `decompress_single_member` only
+/// dispatch on the result.
 pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
     if has_bgzf_markers(data) {
         return DecodePath::GzippyParallel;
@@ -81,6 +97,9 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
         };
     }
     if crate::backends::isal_decompress::is_available() {
+        if num_threads > 1 && data.len() > MIN_PARALLEL_COMPRESSED {
+            return DecodePath::IsalParallelSM;
+        }
         return DecodePath::IsalSingle;
     }
     if data.len() > 1024 * 1024 * 1024 {
@@ -167,8 +186,11 @@ pub(crate) fn decompress_gzip_libdeflate<W: Write + Send>(
             }
         }
         DecodePath::MultiMemberSeq => decompress_multi_member_sequential(data, writer),
-        DecodePath::IsalSingle | DecodePath::StreamingSingle | DecodePath::LibdeflateSingle => {
-            decompress_single_member(data, writer, num_threads)
+        DecodePath::IsalParallelSM
+        | DecodePath::IsalSingle
+        | DecodePath::StreamingSingle
+        | DecodePath::LibdeflateSingle => {
+            decompress_single_member_for(path, data, writer, num_threads)
         }
     }
 }
@@ -203,57 +225,101 @@ pub(crate) fn decompress_gzip_to_vec(data: &[u8], num_threads: usize) -> GzippyR
     Ok(output)
 }
 
-/// Route to the best available single-member decoder.
+/// Route a single-member input. Pure dispatcher — classifies once and
+/// hands off to exactly one backend. **No fallback.** Each backend
+/// either succeeds or returns `Err(GzippyError::Decompression(_))`.
 pub(crate) fn decompress_single_member<W: Write>(
     data: &[u8],
     writer: &mut W,
     num_threads: usize,
 ) -> GzippyResult<u64> {
-    // Parallel single-member path: speculative block-boundary search + ISA-L
-    // re-decode per confirmed chunk via inflatePrime. x86_64 + ISA-L only.
-    // Arm64: sequential libdeflate (~14,000 MB/s) beats parallel zlib-ng (4 × 600 = 2,400 MB/s).
-    const MIN_PARALLEL_COMPRESSED: usize = 10 * 1024 * 1024;
-    if crate::backends::isal_decompress::is_available()
-        && num_threads > 1
-        && data.len() > MIN_PARALLEL_COMPRESSED
-    {
-        match crate::decompress::parallel::single_member::decompress_parallel(
-            data,
-            writer,
+    let path = classify_gzip(data, num_threads);
+    debug_assert!(
+        matches!(
+            path,
+            DecodePath::IsalParallelSM
+                | DecodePath::IsalSingle
+                | DecodePath::StreamingSingle
+                | DecodePath::LibdeflateSingle
+        ),
+        "decompress_single_member called on non-single-member input: {path:?}"
+    );
+    if crate::utils::debug_enabled() {
+        eprintln!(
+            "[gzippy] decompress_single_member path={:?} threads={} bytes={}",
+            path,
             num_threads,
-        ) {
-            Ok(n) => {
-                writer.flush()?;
-                return Ok(n);
-            }
-            Err(_) => {
-                if crate::utils::debug_enabled() {
-                    eprintln!("[gzippy] parallel single-member failed, falling back to sequential");
-                }
-            }
-        }
+            data.len()
+        );
     }
+    decompress_single_member_for(path, data, writer, num_threads)
+}
 
-    if crate::backends::isal_decompress::is_available() {
-        if let Some(bytes) = crate::backends::isal_decompress::decompress_gzip_stream(data, writer)
-        {
+/// Test-only counter incremented every time a single-member call reaches
+/// the libdeflate one-shot backend. Snapshot before/after a decode to
+/// verify the no-fallback invariant — any increment from a call that
+/// *should* have routed parallel is a bug.
+#[cfg(test)]
+pub(crate) static LIBDEFLATE_SM_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only counter incremented every time a single-member call reaches
+/// the ISA-L one-shot backend. Together with `LIBDEFLATE_SM_CALLS`
+/// these prove that a parallel-eligible input never silently took a
+/// sequential backend.
+#[cfg(test)]
+pub(crate) static ISAL_STREAM_SM_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Hard dispatcher. Each arm is terminal — success or `Err`.
+fn decompress_single_member_for<W: Write>(
+    path: DecodePath,
+    data: &[u8],
+    writer: &mut W,
+    num_threads: usize,
+) -> GzippyResult<u64> {
+    match path {
+        DecodePath::IsalParallelSM => {
+            // The parallel pipeline runs and verifies CRC + ISIZE — or
+            // returns an error. No fallback. This is the production
+            // hot path on x86_64 + ISA-L for inputs ≥ MIN_PARALLEL_COMPRESSED
+            // with T > 1.
+            let n = crate::decompress::parallel::single_member::decompress_parallel(
+                data,
+                writer,
+                num_threads,
+            )
+            .map_err(|e| GzippyError::decompression(format!("parallel SM: {e}")))?;
             writer.flush()?;
-            return Ok(bytes);
+            Ok(n)
         }
-        if crate::utils::debug_enabled() {
-            eprintln!(
-                "[gzippy] WARNING: ISA-L decompress failed on {} bytes, using libdeflate",
-                data.len()
-            );
+        DecodePath::IsalSingle => {
+            #[cfg(test)]
+            ISAL_STREAM_SM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let bytes = crate::backends::isal_decompress::decompress_gzip_stream(data, writer)
+                .ok_or_else(|| {
+                    GzippyError::decompression("ISA-L sequential decompress failed".to_string())
+                })?;
+            writer.flush()?;
+            Ok(bytes)
         }
+        DecodePath::StreamingSingle => {
+            if crate::utils::debug_enabled() {
+                eprintln!("[gzippy] streaming zlib-ng decode: {} bytes", data.len());
+            }
+            decompress_single_member_streaming(data, writer)
+        }
+        DecodePath::LibdeflateSingle => {
+            #[cfg(test)]
+            LIBDEFLATE_SM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            decompress_single_member_libdeflate(data, writer)
+        }
+        // unreachable on well-formed callers — `decompress_gzip_libdeflate`
+        // routes multi-member / bgzf paths before calling here.
+        other => Err(GzippyError::decompression(format!(
+            "decompress_single_member_for called with non-single-member path: {other:?}"
+        ))),
     }
-    if !crate::backends::isal_decompress::is_available() && data.len() > 1024 * 1024 * 1024 {
-        if crate::utils::debug_enabled() {
-            eprintln!("[gzippy] streaming zlib-ng decode: {} bytes", data.len());
-        }
-        return decompress_single_member_streaming(data, writer);
-    }
-    decompress_single_member_libdeflate(data, writer)
 }
 
 /// Streaming single-member decompress via flate2/zlib-ng. Fixed 1MB buffer —
@@ -451,6 +517,161 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::Write;
+    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    use std::sync::atomic::Ordering;
+
+    /// The classifier — not an in-body fallback — is the only place that
+    /// decides whether parallel SM runs. An input that satisfies the
+    /// gate must classify to `IsalParallelSM` on x86_64+ISA-L hosts and
+    /// to `IsalSingle`/`LibdeflateSingle` elsewhere — never silently
+    /// switch backends inside `decompress_single_member`.
+    #[test]
+    fn test_classify_routes_at_classifier_not_in_body() {
+        let mut raw = vec![0u8; 12 * 1024 * 1024];
+        let mut state = 0x12345678u64;
+        for b in &mut raw {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (state >> 32) as u8;
+        }
+        let mut payload = Vec::new();
+        let mut enc = flate2::write::GzEncoder::new(&mut payload, Compression::default());
+        enc.write_all(&raw).unwrap();
+        enc.finish().unwrap();
+        assert!(
+            payload.len() > MIN_PARALLEL_COMPRESSED,
+            "fixture must exceed parallel gate (got {} bytes)",
+            payload.len()
+        );
+        let path = classify_gzip(&payload, 4);
+        #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+        assert_eq!(
+            path,
+            DecodePath::IsalParallelSM,
+            "12 MiB compressed input on x86_64+ISA-L must classify parallel"
+        );
+        #[cfg(not(all(target_arch = "x86_64", feature = "isal-compression")))]
+        assert_ne!(
+            path,
+            DecodePath::IsalParallelSM,
+            "no-ISA-L host must not classify parallel"
+        );
+    }
+
+    /// On a parallel-eligible input the libdeflate one-shot backend must
+    /// never be called from the single-member dispatcher. This is the
+    /// no-fallback invariant the user asked for: under no circumstances
+    /// can a silent libdeflate retry mask a parallel-pipeline failure.
+    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    #[test]
+    fn test_no_libdeflate_fallback_ever_fires_from_sm_path() {
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Build an input above MIN_PARALLEL_COMPRESSED so the classifier
+        // returns IsalParallelSM.
+        let mut original = vec![0u8; 24 * 1024 * 1024];
+        let mut state = 0xc0ffeeu64;
+        for b in &mut original {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (state >> 32) as u8;
+        }
+        let mut compressed = Vec::new();
+        {
+            let mut enc = GzEncoder::new(&mut compressed, Compression::default());
+            enc.write_all(&original).unwrap();
+            enc.finish().unwrap();
+        }
+        assert!(
+            compressed.len() > MIN_PARALLEL_COMPRESSED,
+            "fixture must clear the parallel gate (got {} bytes)",
+            compressed.len()
+        );
+        let before_lib = LIBDEFLATE_SM_CALLS.load(Ordering::Relaxed);
+        let mut out = Vec::new();
+        decompress_single_member(&compressed, &mut out, 4).expect("must succeed");
+        assert_eq!(out, original, "byte-perfect output required");
+        let after_lib = LIBDEFLATE_SM_CALLS.load(Ordering::Relaxed);
+        assert_eq!(
+            after_lib, before_lib,
+            "libdeflate SM backend must not be called from the parallel-eligible SM path \
+             (would indicate a silent fallback)"
+        );
+        // ISA-L sequential counter is incremented by other unit tests that
+        // call `decompress_single_member(..., T=1)` in parallel; only the
+        // libdeflate counter is a reliable no-fallback signal here.
+    }
+
+    /// A corrupted CRC must surface as `GzippyError::Decompression`, not
+    /// produce silent `Ok` via a libdeflate retry.
+    #[cfg(all(target_arch = "x86_64", feature = "isal-compression"))]
+    #[test]
+    fn test_parallel_sm_propagates_errors_not_fallbacks() {
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let original: Vec<u8> = (0u32..(24 * 1024 * 1024))
+            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+        let mut compressed = Vec::new();
+        {
+            let mut enc = GzEncoder::new(&mut compressed, Compression::default());
+            enc.write_all(&original).unwrap();
+            enc.finish().unwrap();
+        }
+        // Flip a byte deep in the deflate stream; CRC check at the end
+        // of the parallel SM path catches the corruption.
+        let mid = compressed.len() / 2;
+        compressed[mid] ^= 0xFF;
+        let mut out = Vec::new();
+        let res = decompress_single_member(&compressed, &mut out, 4);
+        assert!(
+            matches!(res, Err(GzippyError::Decompression(_))),
+            "corrupt input must propagate Err(Decompression(_)), got {:?}",
+            res.as_ref().err()
+        );
+    }
+
+    /// An input *below* the parallel gate routes deterministically. This
+    /// is a routing decision visible at the classifier — not a silent
+    /// in-body fallback. Document it explicitly.
+    #[test]
+    fn test_parallel_sm_routes_below_10mib() {
+        let small: Vec<u8> = vec![0u8; 1024 * 1024]; // 1 MiB original
+        let mut compressed = Vec::new();
+        {
+            let mut enc = GzEncoder::new(&mut compressed, Compression::default());
+            enc.write_all(&small).unwrap();
+            enc.finish().unwrap();
+        }
+        // Compressed size of all-zeros 1 MiB is tiny — well below 10 MiB.
+        assert!(compressed.len() < MIN_PARALLEL_COMPRESSED);
+        let path = classify_gzip(&compressed, 4);
+        assert_ne!(
+            path,
+            DecodePath::IsalParallelSM,
+            "below-gate input must not classify parallel"
+        );
+        // Whatever sub-path the classifier picks, it must decode.
+        let mut out = Vec::new();
+        decompress_single_member(&compressed, &mut out, 4).expect("below-gate must still decode");
+        assert_eq!(out, small);
+    }
+
+    /// Type-level fence: WindowMap's stored type is
+    /// `Arc<CompressedVector>`, decompressed lazily on `get`. The test
+    /// is structural — if someone reverts to `Arc<[u8;32768]>` storage
+    /// this will fail to compile.
+    #[test]
+    fn test_window_map_uses_compressed_vector() {
+        use crate::decompress::parallel::compressed_vector::CompressionType;
+        use crate::decompress::parallel::window_map::WindowMap;
+        let m = WindowMap::new();
+        assert_eq!(
+            m.compression(),
+            CompressionType::Zlib,
+            "default compression must be Zlib to match rapidgzip's WindowMap"
+        );
+    }
 
     #[test]
     fn test_decompress_multi_member_file() {

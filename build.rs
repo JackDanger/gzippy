@@ -64,36 +64,47 @@ fn build_zopfli_oracle() {
 }
 
 fn install_git_hooks() {
-    let git = std::path::Path::new(".git");
-    if !git.is_dir() {
-        return; // missing or a file (git worktree)
+    // Resolve the *effective* hooks directory via git itself. This works
+    // from a linked worktree (where `.git` is a file, not a directory)
+    // and honors a custom `core.hooksPath`. The old literal `.git/hooks`
+    // silently installed nothing whenever `cargo build` ran inside a
+    // worktree, leaving the pre-commit / pre-push hooks frozen at
+    // whatever revision was last built from the main checkout.
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .output();
+    let hooks_dir = match output {
+        Ok(o) if o.status.success() => {
+            std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        }
+        _ => return, // not a git checkout, or git unavailable
+    };
+    if std::fs::create_dir_all(&hooks_dir).is_err() {
+        return;
     }
-    install_hook("scripts/pre-commit", ".git/hooks/pre-commit");
-    install_hook("scripts/pre-push", ".git/hooks/pre-push");
+    install_hook("scripts/pre-commit", &hooks_dir.join("pre-commit"));
+    install_hook("scripts/pre-push", &hooks_dir.join("pre-push"));
 }
 
-fn install_hook(src: &str, dst: &str) {
+fn install_hook(src: &str, dst: &std::path::Path) {
     let src = std::path::Path::new(src);
-    let dst = std::path::Path::new(dst);
 
     if !src.exists() {
         return;
     }
 
-    let needs_update = !dst.exists() || {
-        let src_mtime = src.metadata().and_then(|m| m.modified()).ok();
-        let dst_mtime = dst.metadata().and_then(|m| m.modified()).ok();
-        src_mtime > dst_mtime
-    };
-
-    if needs_update {
-        let content = std::fs::read(src).unwrap_or_else(|_| panic!("read {}", src.display()));
-        std::fs::write(dst, &content).unwrap_or_else(|_| panic!("write {}", dst.display()));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755))
-                .unwrap_or_else(|_| panic!("chmod +x {}", dst.display()));
-        }
+    // Compare content, not mtime: a worktree checkout gives tracked
+    // files arbitrary timestamps, so an mtime heuristic can leave a
+    // stale hook installed. Rewrite whenever the bytes differ.
+    let content = std::fs::read(src).unwrap_or_else(|_| panic!("read {}", src.display()));
+    if std::fs::read(dst).map(|d| d == content).unwrap_or(false) {
+        return;
+    }
+    std::fs::write(dst, &content).unwrap_or_else(|_| panic!("write {}", dst.display()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|_| panic!("chmod +x {}", dst.display()));
     }
 }

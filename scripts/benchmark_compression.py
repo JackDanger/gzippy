@@ -74,7 +74,8 @@ def benchmark_compression(
     elif tool == "pigz":
         cmd = [bin_path, f"-{level}", f"-p{threads}", "-c", input_file]
     elif tool == "gzip":
-        cmd = [bin_path, f"-{level}", "-c", input_file]
+        # Cap at L9; at L>=10 gzip runs at its max level as a size baseline
+        cmd = [bin_path, f"-{min(9, level)}", "-c", input_file]
     elif tool == "igzip":
         # igzip only supports levels 0-3
         igzip_level = min(3, level)
@@ -120,19 +121,24 @@ def benchmark_compression(
             result = subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
         return result.returncode == 0
 
+    # L>=10 (zopfli) is too slow for statistical convergence; 1 trial is enough
+    # since the ratio (output size) is deterministic and that's all we guard on.
+    effective_min = 1 if level >= 10 else MIN_TRIALS
+    effective_max = 3 if level >= 10 else MAX_TRIALS
+
     times = []
     converged = False
 
     # Warmup
     run_compress()
 
-    for trial in range(MAX_TRIALS):
+    for trial in range(effective_max):
         start = time.perf_counter()
         if not run_compress():
             return {"error": f"{tool} compression failed"}
         times.append(time.perf_counter() - start)
 
-        if len(times) >= MIN_TRIALS:
+        if len(times) >= effective_min:
             _, _, _, cv = trimmed_stats(times)
             if cv < TARGET_CV:
                 converged = True
@@ -211,7 +217,11 @@ def main():
     }
 
     # Tools to benchmark
-    comp_tools = ["gzippy", "pigz", "gzip"]
+    # pigz only supports L1-L9; exclude it at L10+ so it doesn't error out
+    comp_tools = ["gzippy"]
+    if args.level < 10:
+        comp_tools.append("pigz")
+    comp_tools.append("gzip")  # runs at L9 when level>=10 (see benchmark_compression())
     if args.level <= 3 and tools["igzip"]:
         comp_tools.append("igzip")
     if args.level >= 9 and tools["zopfli"]:

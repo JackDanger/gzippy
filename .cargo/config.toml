@@ -1,0 +1,4 @@
+# Patched ISA-L C source for isal-sys (see packaging/isal-patches/README.md).
+# Relative to this file's directory (gzippy repo root).
+[env]
+ISAL_SOURCE = { value = "vendor/isa-l", relative = true }

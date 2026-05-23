@@ -4,13 +4,52 @@
 
 **gzippy aims to be the fastest gzip implementation ever created.**
 
+## Cutover Goal (May 2026)
+
+**Port the rapidgzip algorithmic core into Rust, faithfully — but ONLY for
+formats GNU gzip supports.** We want rapidgzip's *speed*, not its *format
+breadth*. GNU gzip handles gzip-family streams (single-member, multi-member,
+BGZF — all valid gzip). BZIP2 and ZLIB are NOT gzip and are out of scope.
+
+The goal is **every gzip-relevant primitive, decoder, block finder, huffman
+variant, reader, index, and analyzer in `vendor/rapidgzip/librapidarchive/`
+ported into gzippy with vendor file:line citations.** That includes:
+
+- **Formats** (IN SCOPE): gzip single-member, multi-member gzip, BGZF, raw
+  DEFLATE (as the inner codec).
+- **Formats** (OUT OF SCOPE — not part of GNU gzip): BZIP2 (`Bzip2Chunk.hpp`,
+  `indexed_bzip2/bzip2.hpp`), ZLIB stream format (`gzip/zlib.hpp`). A small
+  ZLIB-format header parser landed (commit `db19347`) as a side-effect of the
+  port pass; keep it for now since it's harmless, but no Bzip2 or Zlib
+  decoder is in scope.
+- **Decoders** (gzip-only): `chunkdecoding/GzipChunk`, `gzip/GzipReader`,
+  `gzip/GzipAnalyzer`, `gzip/InflateWrapper`, `gzip/isal`. NOT
+  `chunkdecoding/Bzip2Chunk`.
+- **Block finders**: `blockfinder/Bgzf`, `blockfinder/DynamicHuffman`,
+  `blockfinder/Uncompressed`, `blockfinder/PigzStringView`,
+  `blockfinder/precodecheck/CountAllocatedLeaves` (all gzip-family).
+- **Huffman variants**: `HuffmanCodingDoubleLiteralCached`, `HuffmanCodingISAL`,
+  `HuffmanCodingReversedBitsCached*`, `HuffmanCodingShortBitsMultiCached*`,
+  `HuffmanCodingDistanceISAL` (gzip Deflate decoders).
+- **Core primitives**: `ThreadPool` (the real one), `BitStringFinder`,
+  `ParallelBitStringFinder`, `StreamedResults`, `SimpleRunLengthEncoding`,
+  `AtomicMutex`, `AffinityHelpers`, `AlignedAllocator`, `FasterVector`,
+  `FileRanges`, `JoiningThread`, etc.
+- **High-level**: `ParallelGzipReader`, `IndexFileFormat` (seekable indexes
+  for gzip), gzip-relevant `rapidgzip.hpp` public API surface.
+
+Done when an Opus advisor agrees gzippy structurally and calculationally
+matches the gzip-relevant surface of rapidgzip (not the BZIP2/ZLIB-decoder
+surface). Performance optimization happens after that.
+
 ## Rules
 
 1. **ONE PRODUCTION PATH** — know exactly which function the CLI calls. Test that function.
 2. **RUN `make` FIRST** — before `make ship`, before committing. `make` catches regressions in 30s.
 3. **BENCHMARK EVERYTHING** — `make ship` (homelab bench on `neurotic`) is authoritative; local `make` is for iteration.
-4. **REVERT REGRESSIONS** — if `make` or `make ship` shows a loss, revert immediately.
-5. **NEVER COMPROMISE PERFORMANCE** — clippy, style, readability: none justify slower code.
+4. **NEVER COMPROMISE CORRECTNESS** — output bytes, CRC32, ISIZE must always verify.
+5. **NO FALLBACKS** — failure is an explicit `Err(GzippyError::Decompression(_))`. No silent libdeflate or ISA-L retries from the SM body. `decompress_single_member` either succeeds via the parallel pipeline or returns an error.
+6. **THE GOAL IS SPEED, NOT FIDELITY.** gzippy aims to be the fastest gzip implementation ever created. Rapidgzip is the current reference for parallel decompression because its architecture is the fastest known — port it as a *means*. Where gzippy's own SIMD inflate primitives (in `src/decompress/inflate/`, `src/decompress/{combined_lut,packed_lut,simd_huffman,vector_huffman,two_level_table}.rs`, `src/backends/inflate_bit.rs`) beat rapidgzip's inner inflate, use them. The deliverable is throughput, not vendor parity.
 
 ## Production Routing (Apr 2026)
 
@@ -26,7 +65,16 @@ Input → decompress::mod: decompress_gzip_libdeflate
   └─ Single-member?
         ISA-L + T>1 + compressed > 10 MiB
             → parallel::single_member::decompress_parallel
-              (rapidgzip-style speculation + ISA-L inflatePrime; v0.3.0)
+              (parallel chunk pipeline — see `src/decompress/parallel/`.
+               Output STREAMS: bytes flow to the writer as each chunk
+               resolves; CRC32 + ISIZE are verified against the gzip
+               trailer AFTER the final chunk is written, so a mismatch
+               is a terminal Err with partial output already on the
+               writer — same as gzip(1); for file output
+               `io::decompress_file` then deletes the dest file.
+               Counter `MARKER_PIPELINE_RUNS` proves production routing
+               called us; see the deletion-trap test in
+               src/tests/routing.rs)
         x86_64 (ISA-L available)        → isal_decompress::decompress_gzip_stream
         any arch, data > 1 GiB (no ISA-L) → decompress_single_member_streaming (zlib-ng)
         default                          → decompress_single_member_libdeflate
@@ -58,11 +106,29 @@ call site in the routing table above, and add a strict correctness test (no
 silent fallback). When `make ship` confirms the win, lift the gate. When
 abandoned, delete the module — `main` does not host dead code.
 
-Regression test that locks in the parallel single-member wiring:
-`tests::routing::tests::test_single_member_routing_multithread`. It runs
-`decompress_single_member(T=4)` on a 24 MiB input and asserts byte-perfect
-output — covering both \"parallel path takes the input\" and \"falls back
-correctly when speculation fails on adversarial chunks.\"
+Two regression tests lock the parallel single-member wiring:
+
+1. `tests::routing::tests::test_single_member_routing_multithread` — runs
+   `decompress_single_member(T=4)` on a 24 MiB input and asserts byte-perfect
+   output. Covers "parallel path takes the input" and "falls back correctly
+   when speculation fails on adversarial chunks."
+
+2. `tests::routing::tests::test_single_member_parallel_not_slower_than_sequential`
+   — runs the same fixture at T=1 (sequential) and T=4 (parallel) and asserts
+   `parallel_elapsed` stays within a small multiple of `sequential_elapsed`.
+   This is the local-CI guard against a parallel-slower-than-sequential
+   regression.
+
+## Active port: rapidgzip → gzippy parallel single-member
+
+The parallel single-member path under `src/decompress/parallel/` is an
+in-progress port of rapidgzip's chunked-decode architecture. Vendor
+source is in `vendor/rapidgzip/librapidarchive/`; port modules cite
+vendor `file:line` in their doc comments — treat those citations as the
+reference when a change appears to "work" but looks structurally off.
+
+Capture a trace with `GZIPPY_LOG_FILE=/tmp/sm.log` and analyze via
+`scripts/parallel_sm_log_summary.py` before claiming a perf change worked.
 
 ## Hard-Won Lessons
 
@@ -79,12 +145,6 @@ two-pass scan-then-decode, large pre-allocations.
 Streaming path only for files > 1 GiB. ISA-L is unavailable on arm64; the parallel
 single-member path is gated on `isal_decompress::is_available()` so arm64 never
 takes it.
-
-**v0.3.0 — parallel single-member**: ISA-L `inflatePrime` (rapidgzip's pattern from
-`isal.hpp`) re-decodes confirmed chunks at non-byte-aligned bit offsets at full
-ISA-L SIMD speed (~1500 MB/s/thread), replacing the prior pure-Rust marker decoder
-(22 MB/s/thread). Wired into `decompress::decompress_single_member` behind
-`isal_decompress::is_available() && num_threads > 1 && data.len() > 10 MiB`.
 
 ## Branch and PR Workflow
 
@@ -144,7 +204,7 @@ vs pigz for all four combos (T1/T4 × 1MB/10MB). Use this before ANY decompressi
 | `src/decompress/mod.rs` | Decompression entry, format detect, routing |
 | `src/decompress/bgzf.rs` | gzippy-parallel + multi-member parallel (core engine) |
 | `src/decompress/scan_inflate.rs` | Streaming scan-and-inflate path |
-| `src/decompress/parallel/single_member.rs` | v0.3.0 parallel SM — ISA-L `inflatePrime` |
+| `src/decompress/parallel/single_member.rs` | Parallel single-member decode — entry point |
 | `src/decompress/parallel/{block_finder,marker_decode,ultra_fast_inflate}.rs` | Speculation supporting primitives |
 | `src/decompress/inflate/consume_first_decode.rs` | Pure-Rust inflate (production helpers used by `bgzf`, `scan_inflate`) |
 | `src/decompress/inflate/{consume_first_table,jit_decode,libdeflate_decode,libdeflate_entry,specialized_decode,vector_huffman,double_literal,bmi2}.rs` | Huffman/inflate building blocks |

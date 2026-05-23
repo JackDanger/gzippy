@@ -287,8 +287,6 @@ dependencies = [
 [[package]]
 name = "isal-sys"
 version = "0.5.3+496255c"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aefc9239959a60eaba201ccdd99897b5270be98d01f561c2166f5e3343e5a29b"
 dependencies = [
  "cc",
  "copy_dir",

@@ -78,34 +78,133 @@ def benchmark_decompress(
     else:
         return {"error": f"unknown tool: {tool}"}
     
-    def run_decompress():
+    # Routing-trace audit (gzippy only). Without this, a silent fallback to
+    # sequential libdeflate looks identical to "marker pipeline ran but was
+    # slow" — both produce correct output at ~libdeflate throughput.
+    # Capture stderr from gzippy with GZIPPY_DEBUG=1 and parse for the
+    # marker-pipeline log line. We do this once before the timed runs so
+    # it doesn't affect the perf numbers.
+    routing_trace = None
+    if tool == "gzippy":
+        env = dict(os.environ)
+        env["GZIPPY_DEBUG"] = "1"
+        with open(compressed_file, 'rb') as fin:
+            trace_result = subprocess.run(
+                cmd, stdin=fin, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env,
+            )
+        stderr_text = trace_result.stderr.decode(errors="replace")
+        ran_marker = "[parallel_sm:v0.6]" in stderr_text and "total=" in stderr_text
+        # New: typed-routing message added in PR #90 for the BTYPE=01-heavy
+        # case (see premortem D1+D5). Older log strings retained for
+        # backward compatibility with older gzippy binaries on the path.
+        fell_back = (
+            "parallel single-member fell back" in stderr_text
+            or "parallel single-member failed" in stderr_text
+        )
+        routing_trace = {
+            "ran_marker_pipeline": ran_marker,
+            "fell_back_to_sequential": fell_back,
+            # Capture a larger window of stderr so the per-phase
+            # timing line ("[parallel_sm:v0.6] search=Xms decode=Yms
+            # retry=Zms resolve=Wms total=Tms ...") survives — that
+            # line is what tells us WHY the bench is slow.
+            "stderr_head": stderr_text[:8000],
+        }
+
+    # rapidgzip verbose stats: chunk count, pool efficiency, decode times.
+    # Run with --verbose once (not during timed runs) to capture internal
+    # BlockFetcher statistics that explain the parallelism structure.
+    rapidgzip_verbose = None
+    if tool == "rapidgzip":
+        verbose_cmd = [bin_path, "-d", "-P", str(threads), "--verbose"]
+        with open(compressed_file, 'rb') as fin:
+            vr = subprocess.run(
+                verbose_cmd, stdin=fin, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+        rapidgzip_verbose = vr.stderr.decode(errors="replace")
+
+    def run_decompress(capture_stderr: bool = False):
+        env = None
+        if capture_stderr and tool == "gzippy":
+            env = dict(os.environ)
+            env["GZIPPY_DEBUG"] = "1"
         with open(compressed_file, 'rb') as fin, open(output_file, 'wb') as fout:
-            result = subprocess.run(cmd, stdin=fin, stdout=fout, stderr=subprocess.DEVNULL)
-        return result.returncode == 0
-    
+            result = subprocess.run(
+                cmd,
+                stdin=fin,
+                stdout=fout,
+                stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL,
+                env=env,
+            )
+        stderr_text = ""
+        if capture_stderr and result.stderr is not None:
+            stderr_text = result.stderr.decode(errors="replace")
+        return result.returncode == 0, stderr_text
+
     # Warmup
     print(f"  {tool}: warming up...", end="", flush=True)
-    if not run_decompress():
+    ok, warmup_stderr = run_decompress(capture_stderr=True)
+    if not ok:
         print(" FAILED")
+        if tool == "gzippy" and routing_trace is not None:
+            head = routing_trace.get("stderr_head", "").strip()
+            if head:
+                print("      [preflight GZIPPY_DEBUG]")
+                print("        " + head[:12000].replace("\n", "\n        "))
+        if warmup_stderr.strip():
+            print("      [warmup stderr]")
+            print("        " + warmup_stderr[:12000].strip().replace("\n", "\n        "))
         return {"error": f"{tool} decompression failed on warmup", "tool": tool}
-    
+
     # Verify correctness
     import filecmp
     if not filecmp.cmp(original_file, output_file, shallow=False):
         print(" INCORRECT OUTPUT")
         return {"error": f"{tool} decompression produced incorrect output", "tool": tool, "status": "fail"}
+
+    # Surface the routing decision now that the warmup proved correctness.
+    # When marker pipeline fell back, the throughput number reflects
+    # libdeflate, not gzippy's parallel path — call that out explicitly so
+    # the guard report doesn't read like "marker pipeline is slow."
+    if tool == "gzippy" and threads > 1 and routing_trace is not None:
+        if routing_trace["fell_back_to_sequential"] or not routing_trace["ran_marker_pipeline"]:
+            print(" [SILENT FALLBACK: marker pipeline did not run end-to-end]", end="")
+        # Always print the GZIPPY_DEBUG stderr after the bench line on
+        # parallel runs — so a perf shortfall surfaces per-phase timing
+        # (search/decode/retry/resolve/total) without needing to
+        # download the JSON artifact.
+        head = routing_trace.get("stderr_head", "").strip()
+        if head:
+            print(f"\n      [GZIPPY_DEBUG]\n        " + head.replace("\n", "\n        "))
+
+    # Print rapidgzip's internal statistics (chunk count, pool efficiency).
+    if tool == "rapidgzip" and rapidgzip_verbose:
+        key_lines = [
+            line.strip() for line in rapidgzip_verbose.splitlines()
+            if any(k in line for k in [
+                "Parallelization", "Total Fetched", "Prefetched", "On-demand",
+                "decodeBlock", "futureWait", "Total Real Decode", "Theoretical Optimal",
+                "Pool Efficiency", "Spent", "Decompressed",
+            ])
+        ]
+        if key_lines:
+            print(f"\n      [rapidgzip --verbose]\n        " + "\n        ".join(key_lines))
     
     # Benchmark
     times = []
     converged = False
-    
+
     for trial in range(MAX_TRIALS):
         start = time.perf_counter()
-        if not run_decompress():
+        ok, trial_stderr = run_decompress(capture_stderr=(tool == "gzippy"))
+        if not ok:
+            if trial_stderr.strip():
+                print("    [trial stderr]")
+                print("      " + trial_stderr[:12000].strip().replace("\n", "\n      "))
             return {"error": f"{tool} decompression failed on trial {trial}", "tool": tool}
         elapsed = time.perf_counter() - start
         times.append(elapsed)
-        
+
         if len(times) >= MIN_TRIALS:
             mean = statistics.mean(times)
             stdev = statistics.stdev(times)
@@ -113,14 +212,53 @@ def benchmark_decompress(
             if cv < TARGET_CV:
                 converged = True
                 break
-    
+
     median = statistics.median(times)
     mean = statistics.mean(times)
     stdev = statistics.stdev(times) if len(times) > 1 else 0
     cv = stdev / mean if mean > 0 else 0
     speed = original_size / median / 1_000_000
-    
+
+    # Per-trial raw times so variance spikes are visible.
+    raw_s = "  ".join(f"{t:.3f}s" for t in times)
+    times_sorted = sorted(times)
+    p10 = times_sorted[len(times_sorted) // 10] if len(times_sorted) > 1 else times_sorted[0]
+    p90 = times_sorted[int(len(times_sorted) * 0.9)] if len(times_sorted) > 1 else times_sorted[-1]
+    fastest = original_size / min(times) / 1_000_000
+    slowest = original_size / max(times) / 1_000_000
+
     print(f" {speed:.1f} MB/s ({len(times)} trials, CV={cv:.2%})")
+    print(f"    raw: {raw_s}")
+    print(f"    p10={fastest:.0f} MB/s  p50={speed:.0f} MB/s  p90={slowest:.0f} MB/s  "
+          f"(min={min(times):.3f}s  max={max(times):.3f}s)")
+
+    # For gzippy: capture one timed trial with GZIPPY_DEBUG to get per-chunk
+    # breakdown without distorting the benchmark times above.
+    per_chunk_debug = None
+    if tool == "gzippy":
+        env = dict(os.environ)
+        env["GZIPPY_DEBUG"] = "1"
+        with open(compressed_file, 'rb') as fin:
+            dbg = subprocess.run(
+                cmd, stdin=fin, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env,
+            )
+        per_chunk_debug = dbg.stderr.decode(errors="replace")
+        # Print per-chunk breakdown lines (not the full warmup trace again).
+        chunk_lines = [
+            l
+            for l in per_chunk_debug.splitlines()
+            if "chunk " in l
+            or "imbalance" in l
+            or "per-chunk" in l
+            or "[parallel_sm:v0.6] counters" in l
+            or "[parallel_sm:v0.6] search=" in l
+            or "[parallel_sm:v0.6] partition_outcomes" in l
+            or "[parallel_sm:v0.6] swallowed" in l
+        ]
+        if chunk_lines:
+            print("    per-chunk phase1b breakdown:")
+            for line in chunk_lines:
+                print(f"      {line.strip()}")
     
     return {
         "tool": tool,
@@ -134,10 +272,15 @@ def benchmark_decompress(
         "trials": len(times),
         "converged": converged,
         "speed_mbps": speed,
+        "fastest_mbps": fastest,
+        "slowest_mbps": slowest,
         "original_size": original_size,
         "compressed_size": compressed_size,
         "ratio": compressed_size / original_size,
         "status": "pass",
+        "routing_trace": routing_trace,
+        "per_chunk_debug": per_chunk_debug,
+        "rapidgzip_verbose": rapidgzip_verbose,
     }
 
 
@@ -264,17 +407,47 @@ def main():
     rapidgzip = next((r for r in results["results"] if r["tool"] == "rapidgzip" and "error" not in r), None)
     unpigz = next((r for r in results["results"] if r["tool"] == "unpigz" and "error" not in r), None)
     
+    # Distinguish "marker pipeline ran but was slow" from "marker pipeline
+    # never ran (silent fallback to libdeflate)". Both produce the same
+    # throughput number; only the routing trace tells us which.
+    if gzippy and args.threads > 1:
+        trace = gzippy.get("routing_trace") or {}
+        if trace.get("fell_back_to_sequential") or not trace.get("ran_marker_pipeline"):
+            passed = False
+            reasons.append(
+                "marker pipeline did not run end-to-end on this fixture "
+                "(silent fallback to sequential libdeflate). Throughput "
+                "numbers reflect libdeflate, not the parallel path. "
+                "See routing_trace.stderr_head in the JSON output."
+            )
+
+    # Universal goals — no hardware-class split. The bootstrap→ISA-L
+    # handoff in `decode_chunk_with_handoff` matches rapidgzip's
+    # per-chunk design (`vendor/rapidgzip/.../GzipChunk.hpp:413-657`):
+    # the marker decoder bootstraps ≤32 KB per chunk, then ISA-L
+    # handles the bulk at full single-thread ISA-L speed. There's no
+    # structural per-thread gap to compensate for. If a runner can't
+    # hit these ratios, the implementation has a regression, not the
+    # threshold a hardware excuse.
+    rapidgzip_threshold = 0.99
+    unpigz_threshold = 1.0
     if gzippy and rapidgzip:
         ratio = gzippy["speed_mbps"] / rapidgzip["speed_mbps"]
-        if ratio < 0.99:  # Must be within 1% of rapidgzip
+        if ratio < rapidgzip_threshold:
             passed = False
-            reasons.append(f"gzippy {ratio:.2f}x rapidgzip (need ≥0.99)")
-    
+            reasons.append(
+                f"gzippy {ratio:.2f}x rapidgzip — below universal goal "
+                f"of ≥{rapidgzip_threshold:.2f}"
+            )
+
     if gzippy and unpigz:
         ratio = gzippy["speed_mbps"] / unpigz["speed_mbps"]
-        if ratio < 1.0:  # Must beat pigz
+        if ratio < unpigz_threshold:
             passed = False
-            reasons.append(f"gzippy {ratio:.2f}x unpigz (need ≥1.0)")
+            reasons.append(
+                f"gzippy {ratio:.2f}x unpigz — below universal goal "
+                f"of ≥{unpigz_threshold:.2f}"
+            )
     
     results["passed"] = passed
     results["reasons"] = reasons

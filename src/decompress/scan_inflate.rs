@@ -228,6 +228,89 @@ pub fn scan_deflate_fast(
     })
 }
 
+/// Decompress from a scan checkpoint to the end of the deflate stream.
+///
+/// Uses the same `consume_first` bit reader that built the index, so
+/// resume bit positions match exactly. ISA-L inflatePrime does not share
+/// the libdeflate-style `Bits` cursor semantics and returns None here.
+pub fn decompress_from_checkpoint(
+    deflate_data: &[u8],
+    checkpoint: &ScanCheckpoint,
+    max_output: usize,
+) -> Result<Vec<u8>> {
+    const INITIAL_BUF: usize = 8 * 1024 * 1024;
+
+    let mut bits = Bits::new(deflate_data);
+    bits.pos = checkpoint.input_byte_pos;
+    bits.bitbuf = checkpoint.bitbuf;
+    bits.bitsleft = checkpoint.bitsleft;
+
+    let window_len = checkpoint.window.len().min(WINDOW_SIZE);
+    let mut output = vec![0u8; INITIAL_BUF.max(max_output.saturating_add(window_len))];
+    if window_len > 0 {
+        output[..window_len]
+            .copy_from_slice(&checkpoint.window[checkpoint.window.len() - window_len..]);
+    }
+    let mut out_pos = window_len;
+
+    loop {
+        if out_pos >= window_len + max_output {
+            break;
+        }
+        if out_pos + 4 * 1024 * 1024 > output.len() {
+            output.resize((output.len() * 2).max(out_pos + 8 * 1024 * 1024), 0);
+        }
+
+        if bits.available() < 3 {
+            bits.refill();
+        }
+
+        let bfinal = (bits.peek() & 1) != 0;
+        let btype = ((bits.peek() >> 1) & 3) as u8;
+        bits.consume(3);
+
+        let old_out_pos = out_pos;
+        match btype {
+            0 => {
+                out_pos = crate::decompress::inflate::consume_first_decode::decode_stored_pub(
+                    &mut bits,
+                    &mut output,
+                    out_pos,
+                )?
+            }
+            1 => {
+                out_pos = crate::decompress::inflate::consume_first_decode::decode_fixed_pub(
+                    &mut bits,
+                    &mut output,
+                    out_pos,
+                )?
+            }
+            2 => {
+                out_pos = crate::decompress::inflate::consume_first_decode::decode_dynamic_pub(
+                    &mut bits,
+                    &mut output,
+                    out_pos,
+                )?
+            }
+            3 => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type")),
+            _ => unreachable!(),
+        }
+
+        if out_pos == old_out_pos {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Decode made no progress",
+            ));
+        }
+
+        if bfinal {
+            break;
+        }
+    }
+
+    Ok(output[window_len..out_pos].to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,7 +475,7 @@ mod tests {
             }
         };
 
-        let header_size = crate::decompress::parallel::marker_decode::skip_gzip_header(&gz)
+        let header_size = crate::decompress::parallel::single_member::skip_gzip_header(&gz)
             .expect("valid header");
         let deflate = &gz[header_size..gz.len() - 8];
         let isize_val = u32::from_le_bytes([
