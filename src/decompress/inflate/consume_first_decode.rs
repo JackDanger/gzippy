@@ -2990,6 +2990,16 @@ impl<'a> ResumableInflate<'a> {
             }
             let _ = prev_pos;
 
+            if self.points_to_stop_at.contains(StoppingPoint::END_OF_BLOCK) {
+                self.stopped_at = StoppingPoint::END_OF_BLOCK;
+                return Ok(InflateStreamResult {
+                    bytes_written: out_pos,
+                    stopped_at: self.stopped_at,
+                    bit_position: self.tell_compressed(),
+                    finished: bfinal,
+                });
+            }
+
             if bfinal {
                 self.bits.align_to_byte();
                 if self
@@ -3009,16 +3019,6 @@ impl<'a> ResumableInflate<'a> {
                     stopped_at: StoppingPoint::NONE,
                     bit_position: self.tell_compressed(),
                     finished: true,
-                });
-            }
-
-            if self.points_to_stop_at.contains(StoppingPoint::END_OF_BLOCK) {
-                self.stopped_at = StoppingPoint::END_OF_BLOCK;
-                return Ok(InflateStreamResult {
-                    bytes_written: out_pos,
-                    stopped_at: self.stopped_at,
-                    bit_position: self.tell_compressed(),
-                    finished: false,
                 });
             }
         }
