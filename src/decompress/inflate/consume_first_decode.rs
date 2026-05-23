@@ -2915,6 +2915,9 @@ pub struct ResumableInflate<'a> {
     user_emitted: usize,
     last_bfinal: bool,
     last_btype: u8,
+    /// Set by `reset_for_next_stream`; the next `read_stream` returns
+    /// `END_OF_STREAM_HEADER` when requested (vendor `readHeader` path).
+    pending_stream_header_stop: bool,
 }
 
 impl<'a> ResumableInflate<'a> {
@@ -2936,11 +2939,16 @@ impl<'a> ResumableInflate<'a> {
             user_emitted: 0,
             last_bfinal: false,
             last_btype: 0,
+            pending_stream_header_stop: false,
         })
     }
 
     pub fn set_stopping_points(&mut self, points: StoppingPoint) {
-        self.points_to_stop_at = points;
+        self.points_to_stop_at = if points.is_none() {
+            StoppingPoint::NONE
+        } else {
+            StoppingPoint(points.0 & StoppingPoint::ALL.0)
+        };
     }
 
     pub fn stopped_at(&self) -> StoppingPoint {
@@ -3013,6 +3021,7 @@ impl<'a> ResumableInflate<'a> {
         self.stopped_at = StoppingPoint::NONE;
         self.last_bfinal = false;
         self.last_btype = 0;
+        self.pending_stream_header_stop = true;
     }
 
     fn copy_session_to_user(&mut self, output: &mut [u8], user_written: usize) -> usize {
@@ -3030,6 +3039,22 @@ impl<'a> ResumableInflate<'a> {
     pub fn read_stream(&mut self, output: &mut [u8]) -> Result<InflateStreamResult> {
         self.stopped_at = StoppingPoint::NONE;
         let mut user_written = 0usize;
+
+        if self.pending_stream_header_stop {
+            self.pending_stream_header_stop = false;
+            if self
+                .points_to_stop_at
+                .contains(StoppingPoint::END_OF_STREAM_HEADER)
+            {
+                self.stopped_at = StoppingPoint::END_OF_STREAM_HEADER;
+                return Ok(InflateStreamResult {
+                    bytes_written: user_written,
+                    stopped_at: self.stopped_at,
+                    bit_position: self.tell_compressed(),
+                    finished: false,
+                });
+            }
+        }
 
         while user_written < output.len() {
             if self.bits.bit_position() >= self.encoded_until_bits {
@@ -3835,6 +3860,31 @@ mod tests {
     }
 
     #[test]
+    fn test_resumable_end_of_stream_header_after_reset() {
+        use super::ResumableInflate;
+        use crate::decompress::inflate::stopping_point::StoppingPoint;
+
+        let original = b"stream header stop".repeat(40);
+        let mut compressed = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc =
+                flate2::write::DeflateEncoder::new(&mut compressed, flate2::Compression::best());
+            enc.write_all(&original).unwrap();
+            enc.finish().unwrap();
+        }
+
+        let mut dec = ResumableInflate::new(&compressed, 0).unwrap();
+        dec.reset_for_next_stream();
+        dec.set_stopping_points(StoppingPoint::END_OF_STREAM_HEADER);
+        let mut out = vec![0u8; 65536];
+        let r = dec.read_stream(&mut out).unwrap();
+        assert_eq!(r.stopped_at, StoppingPoint::END_OF_STREAM_HEADER);
+        assert_eq!(r.bytes_written, 0);
+        assert!(!r.finished);
+    }
+
+    #[test]
     fn test_resumable_full_stream_matches_consume_first() {
         use super::ResumableInflate;
 
@@ -3940,16 +3990,15 @@ mod tests {
             let mut best = 0.0f64;
             for _ in 0..2 {
                 let start = std::time::Instant::now();
-                let mut total = 0usize;
-                if is_isal {
+                let total = if is_isal {
                     let mut w = IsalInflateWrapper::new(deflate, 0).unwrap();
                     let mut out = vec![0u8; 256 * 1024 * 1024];
-                    total = w.read_stream(&mut out).unwrap().bytes_written;
+                    w.read_stream(&mut out).unwrap().bytes_written
                 } else {
                     let mut d = ResumableInflate::new(deflate, 0).unwrap();
                     let mut out = vec![0u8; 256 * 1024 * 1024];
-                    total = d.read_stream(&mut out).unwrap().bytes_written;
-                }
+                    d.read_stream(&mut out).unwrap().bytes_written
+                };
                 let mbps = (total as f64) / start.elapsed().as_secs_f64() / 1e6;
                 best = best.max(mbps);
             }

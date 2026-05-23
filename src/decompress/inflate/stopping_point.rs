@@ -4,8 +4,6 @@
 //! patched ISA-L `ISAL_STOPPING_POINT_*` constants used by the parallel
 //! single-member wrapper.
 
-#![allow(dead_code)] // END_OF_STREAM_HEADER / ALL wired at Track B3 wrapper parity
-
 /// Bit-flag set: callers OR variants to request early return from inflate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
 #[repr(transparent)]
@@ -34,5 +32,23 @@ impl core::ops::BitOr for StoppingPoint {
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_matches_every_stop_point() {
+        let combo = StoppingPoint::END_OF_BLOCK | StoppingPoint::END_OF_STREAM;
+        assert!(StoppingPoint::ALL.contains(combo));
+        assert!(StoppingPoint::ALL.contains(StoppingPoint::END_OF_STREAM_HEADER));
+    }
+
+    #[test]
+    fn is_none_only_for_zero() {
+        assert!(StoppingPoint::NONE.is_none());
+        assert!(!StoppingPoint::END_OF_BLOCK.is_none());
     }
 }
