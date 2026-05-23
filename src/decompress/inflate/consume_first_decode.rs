@@ -2922,6 +2922,10 @@ pub struct ResumableInflate<'a> {
     /// Set by `reset_for_next_stream`; the next `read_stream` returns
     /// `END_OF_STREAM_HEADER` when requested (vendor `readHeader` path).
     pending_stream_header_stop: bool,
+    /// After `END_OF_BLOCK_HEADER`, the 3-bit header is consumed but the
+    /// block body is not — the next `read_stream` must decode it without
+    /// re-reading the header (matches patched ISA-L resume semantics).
+    pending_block_after_header: bool,
 }
 
 impl<'a> ResumableInflate<'a> {
@@ -2944,6 +2948,7 @@ impl<'a> ResumableInflate<'a> {
             last_bfinal: false,
             last_btype: 0,
             pending_stream_header_stop: false,
+            pending_block_after_header: false,
         })
     }
 
@@ -3027,6 +3032,7 @@ impl<'a> ResumableInflate<'a> {
         self.last_bfinal = false;
         self.last_btype = 0;
         self.pending_stream_header_stop = true;
+        self.pending_block_after_header = false;
     }
 
     fn clamp_to_until_bits(&mut self) {
@@ -3074,7 +3080,7 @@ impl<'a> ResumableInflate<'a> {
             let remaining_in_cap = self
                 .encoded_until_bits
                 .saturating_sub(self.bits.bit_position());
-            if remaining_in_cap < 3 {
+            if remaining_in_cap < 3 && !self.pending_block_after_header {
                 return Ok(InflateStreamResult {
                     bytes_written: user_written,
                     stopped_at: StoppingPoint::NONE,
@@ -3092,6 +3098,7 @@ impl<'a> ResumableInflate<'a> {
                 .encoded_until_bits
                 .saturating_sub(self.bits.bit_position())
                 < 3
+                && !self.pending_block_after_header
             {
                 return Ok(InflateStreamResult {
                     bytes_written: user_written,
@@ -3101,16 +3108,26 @@ impl<'a> ResumableInflate<'a> {
                 });
             }
 
-            let bfinal = (self.bits.peek() & 1) != 0;
-            let btype = ((self.bits.peek() >> 1) & 3) as u8;
-            self.last_bfinal = bfinal;
-            self.last_btype = btype;
-            self.bits.consume(3);
+            let (bfinal, btype) = if self.pending_block_after_header {
+                self.pending_block_after_header = false;
+                (self.last_bfinal, self.last_btype)
+            } else {
+                if self.bits.available() < 3 {
+                    self.bits.refill();
+                }
+                let bfinal = (self.bits.peek() & 1) != 0;
+                let btype = ((self.bits.peek() >> 1) & 3) as u8;
+                self.bits.consume(3);
+                self.last_bfinal = bfinal;
+                self.last_btype = btype;
+                (bfinal, btype)
+            };
 
             if self
                 .points_to_stop_at
                 .contains(StoppingPoint::END_OF_BLOCK_HEADER)
             {
+                self.pending_block_after_header = true;
                 self.stopped_at = StoppingPoint::END_OF_BLOCK_HEADER;
                 return Ok(InflateStreamResult {
                     bytes_written: user_written,
