@@ -12,7 +12,7 @@
     not(feature = "pure-rust-inflate")
 ))]
 mod bench {
-    use gzippy::decompress::inflate::consume_first_decode::ResumableInflate;
+    use gzippy::decompress::inflate::resumable::ResumableInflate2;
     use gzippy::decompress::parallel::inflate_wrapper::IsalInflateWrapper;
     use std::time::Instant;
 
@@ -69,7 +69,8 @@ mod bench {
         });
 
         let rust_mbps = bench_throughput(|| {
-            let mut d = ResumableInflate::new(&deflate, 0).expect("rust init");
+            let mut d = ResumableInflate2::with_until_bits(&deflate, 0, deflate.len() * 8)
+                .expect("rust init");
             d.set_window(&[]).expect("window");
             let mut out = vec![0u8; deflate.len() * 16];
             let mut total = 0usize;
