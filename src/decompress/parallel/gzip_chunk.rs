@@ -135,7 +135,6 @@ fn decode_chunk_isal_impl(
         let mut end_of_stream_hit = false;
 
         let decode_base = already_decoded;
-        let mut past_eob_in_buffer = false;
         while n_bytes_read < buffer.len() && !stopping_point_reached {
             let bit_before_read = wrapper.tell_compressed();
             let r = wrapper.read_stream(&mut buffer[n_bytes_read..])?;
@@ -146,13 +145,6 @@ fn decode_chunk_isal_impl(
             last_stopped_at = r.stopped_at;
             last_finished = r.finished;
             last_end_bit = r.bit_position;
-
-            if past_eob_in_buffer && last_per_call > 0 {
-                // Pure-Rust ResumableInflate returns END_OF_BLOCK after the
-                // first buffer fill; remaining block bytes arrive on later
-                // NONE reads. Keep the EOB byte count current for finalize.
-                last_eob_decoded_bytes = decode_base + n_bytes_read;
-            }
 
             // Defense-in-depth termination guard. If `read_stream` made
             // no progress whatsoever — no output, no stopping point, not
@@ -209,10 +201,45 @@ fn decode_chunk_isal_impl(
                     }
                     last_eob_pos = r.bit_position;
                     last_eob_decoded_bytes = decode_base + n_bytes_read;
-                    past_eob_in_buffer = true;
+                    // Pure-Rust ResumableInflate may return END_OF_BLOCK while
+                    // block output remains in session; drain before HEADER/NONE
+                    // finalize can truncate at a stale byte count.
+                    while n_bytes_read < buffer.len() {
+                        let bit_before_drain = wrapper.tell_compressed();
+                        let r2 = wrapper.read_stream(&mut buffer[n_bytes_read..])?;
+                        if r2.bytes_written == 0
+                            && r2.stopped_at == StoppingPoints::NONE
+                            && r2.bit_position == bit_before_drain
+                        {
+                            break;
+                        }
+                        n_bytes_read += r2.bytes_written;
+                        chunk.note_inner_decoded_bytes(r2.bytes_written);
+                        last_eob_decoded_bytes = decode_base + n_bytes_read;
+                        last_per_call = r2.bytes_written;
+                        last_stopped_at = r2.stopped_at;
+                        last_finished = r2.finished;
+                        last_end_bit = r2.bit_position;
+                        if r2.stopped_at == StoppingPoints::END_OF_BLOCK_HEADER {
+                            let not_final = !wrapper.is_final_block();
+                            let not_fixed =
+                                wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
+                            if last_eob_pos >= stop_hint_bits && not_final && not_fixed {
+                                last_end_bit = last_eob_pos;
+                                stopping_point_reached = true;
+                            }
+                            break;
+                        }
+                        if r2.stopped_at == StoppingPoints::END_OF_STREAM {
+                            end_of_stream_hit = true;
+                            break;
+                        }
+                        if r2.finished {
+                            break;
+                        }
+                    }
                 }
                 sp if sp == StoppingPoints::END_OF_BLOCK_HEADER => {
-                    past_eob_in_buffer = false;
                     let not_final = !wrapper.is_final_block();
                     let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
                     if last_eob_pos >= stop_hint_bits && not_final && not_fixed {
@@ -230,6 +257,9 @@ fn decode_chunk_isal_impl(
                     stopping_point_reached = true;
                 }
                 _ => {}
+            }
+            if end_of_stream_hit || last_finished {
+                break;
             }
         }
 
