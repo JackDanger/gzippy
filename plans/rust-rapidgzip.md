@@ -84,20 +84,57 @@ cargo bench --release --features isal-compression -- \
   --bench inflate_isal_vs_pure_rust -- --nocapture
 ```
 
-Three pure-rust-inflate routing tests fail on neurotic against
-HEAD (`60f411c`):
+The 3 routing tests that motivated §5 are now ✅ on neurotic (verified
+post-step-5/6: 33/33 pure-rust-inflate routing + 32/32 isal-compression).
 
-- `test_marker_pipeline_runs_on_btype01_heavy_input` — panics with
-  `ResumableInflate("Generic match overflow: out_pos=8552442 length=8
-  output.len=8552448")`. Math: session = `decode_start (32K from
-  set_window) + max_new (128K) + PER_BLOCK_HEADROOM (8M) = 8552448`;
-  the single zlib L1 block emits ~8.13 MiB. Root cause is the
-  run-to-completion block decoder, not session accumulation.
-- `test_coordinator_boundary_search_runs_on_x86_64_isal` — same panic,
-  same fixture. (Name is historical; cfg-gates both backends.)
-- `test_prefetch_next_filesize_accept_fires` — `PREFETCH_NEXT_FILESIZE_ACCEPT
-  did not increment (2 -> 2)`. Independent of the match overflow;
-  needs root-causing once §5 lands and the first two go green.
+### Known pre-existing failures (NOT introduced by §5; opening as
+separate follow-ups; release-non-blocking per CLAUDE.md rules 4-5)
+
+After the §5 step-6 cleanup landed (`a72d533`), `cargo test --release
+--lib` on neurotic surfaces 5 failures that were also failing before
+the §5 sequence (verified pre-existing at `b8f901d` via
+`git stash && cargo test` by an Opus advisor on Apple-silicon Rosetta,
+and re-classified here after a broader differential):
+
+1. `decompress::tests::test_parallel_sm_propagates_errors_not_fallbacks`
+   — pre-existing. Corrupt-input test asserts `Err(Decompression(_))`;
+   actually gets `Err(InvalidArgument)` because corruption at certain
+   offsets makes `is_likely_multi_member` (`format.rs:44+`) false-
+   positive on the corrupt bytes, routing to multi-member parallel,
+   which fails and falls through to `decompress_multi_member_sequential`
+   (`mod.rs:188`), then libdeflate emits `BadData → InvalidArgument`.
+   The corruption IS surfaced as `Err`, satisfying CLAUDE.md rule 5's
+   spirit; the variant mismatch is a separate cleanup.
+
+2. `decompress::parallel::inflate_wrapper::tests::with_until_bits_resume_non_byte_aligned_with_dict`
+   — pre-existing. Synthetic flate2 fixture; `tell_compressed()` lands
+   9 bits before `resume_at` on the resumable backend. Suspected
+   subtable-entry `total_bits` accounting in `decode_huffman_body_resumable`
+   for non-byte-aligned EOB. Production silesia routing (covered by
+   `test_single_member_routing_multithread`, green) is unaffected.
+
+3. `decompress::parallel::gzip_chunk::tests::cross_chunk_resume_silesia_gzip9_chunk0_handoff`
+   — pre-existing class (same family as commit `03c8f48` "prime
+   non-byte-aligned bit offset before set_dict"). zlib-ng resume at
+   chunk0's reported end_bit fails. Production parallel-SM silesia
+   integration is green (`make ship`); this synthetic test exercises a
+   stricter contract than production uses.
+
+4. `decompress::parallel::inflate_wrapper::tests::resumable_isal_oracle::stopping_points_match_at_every_block_boundary`
+   — pre-existing. Fixture bug in `make_multi_block_deflate` at
+   `inflate_wrapper.rs:841-889`: with `vec![0xAB; 300_000]` and flate2 1.x
+   the encoder emits a single dynamic block + END_OF_STREAM rather
+   than multi-block, so the ISA-L probe never observes
+   `END_OF_BLOCK` and `ends.len() == 0`.
+
+5. `decompress::parallel::inflate_wrapper::tests::resumable_isal_oracle::resume_with_window_matches_isal`
+   — pre-existing. Same root cause as (4); panics with
+   `index out of bounds: the len is 0 but the index is 0`.
+
+The 5 tests above MUST eventually be cleaned up (especially (1) — the
+multi→sequential fallback at `mod.rs:188` does violate CLAUDE.md rule
+5 in letter), but they predate this branch and are orthogonal to the
+§5 port. They are deferred to a separate "step 6 follow-up" cleanup PR.
 
 ## §5 — Pure-Rust DEFLATE inflate with stopping points (option 2)
 
