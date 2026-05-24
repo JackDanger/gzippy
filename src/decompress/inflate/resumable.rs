@@ -195,6 +195,10 @@ pub struct ResumableInflate2<'a> {
     pub(crate) block_state: BlockState,
     pub(crate) pending_match: Option<PendingMatch>,
     pub(crate) last_bfinal: bool,
+    /// Last `BTYPE` read in `try_enter_next_block`. Exposed via
+    /// `btype()` only when `stopped_at == END_OF_BLOCK_HEADER` to match
+    /// vendor semantics (`consume_first_decode.rs:2992-2998`).
+    pub(crate) last_btype: u8,
     pub(crate) points_to_stop_at: StoppingPoint,
     pub(crate) stopped_at: StoppingPoint,
     pub(crate) encoded_until_bits: usize,
@@ -203,6 +207,11 @@ pub struct ResumableInflate2<'a> {
     /// into a non-dynamic block. Invariant: `Some(_)` iff
     /// `block_state == InDynamic`.
     pub(crate) dynamic_tables: Option<(LitLenTable, DistTable)>,
+    /// Set by `reset_for_next_stream` (used between gzip members); the
+    /// next `read_stream` call fires `END_OF_STREAM_HEADER` if that
+    /// stopping point is configured. Mirrors vendor pattern
+    /// (`consume_first_decode.rs:3091-3100`).
+    pub(crate) pending_stream_header_stop: bool,
 }
 
 impl<'a> ResumableInflate2<'a> {
@@ -222,10 +231,12 @@ impl<'a> ResumableInflate2<'a> {
             block_state: BlockState::default(),
             pending_match: None,
             last_bfinal: false,
+            last_btype: 0,
             points_to_stop_at: StoppingPoint::NONE,
             stopped_at: StoppingPoint::NONE,
             encoded_until_bits: until_bits.min(input_bits),
             dynamic_tables: None,
+            pending_stream_header_stop: false,
         })
     }
 
@@ -236,8 +247,10 @@ impl<'a> ResumableInflate2<'a> {
         self.block_state = BlockState::AwaitingHeader;
         self.pending_match = None;
         self.last_bfinal = false;
+        self.last_btype = 0;
         self.stopped_at = StoppingPoint::NONE;
         self.dynamic_tables = None;
+        self.pending_stream_header_stop = false;
         Ok(())
     }
 
@@ -255,12 +268,106 @@ impl<'a> ResumableInflate2<'a> {
         self.stopped_at
     }
 
+    /// Mirror of `consume_first_decode::ResumableInflate::clear_stop`:
+    /// resets `stopped_at` so the caller can re-poll without ambiguity.
+    pub fn clear_stop(&mut self) {
+        self.stopped_at = StoppingPoint::NONE;
+    }
+
+    pub fn points_to_stop_at(&self) -> StoppingPoint {
+        self.points_to_stop_at
+    }
+
     pub fn bit_position(&self) -> usize {
         self.bits.bit_position()
     }
 
+    /// Vendor parity alias for `bit_position`. Vendor `IsalInflateWrapper`
+    /// exposes `tellCompressed()` (isal.hpp:69-74); existing call sites
+    /// in `inflate_wrapper.rs` and `gzip_chunk.rs` use this name.
+    pub fn tell_compressed(&self) -> usize {
+        self.bits.bit_position()
+    }
+
+    pub fn encoded_until_bits(&self) -> usize {
+        self.encoded_until_bits
+    }
+
     pub fn is_final_block(&self) -> bool {
         self.last_bfinal
+    }
+
+    /// Returns `Some(last_btype)` ONLY when stopped at
+    /// `END_OF_BLOCK_HEADER`. Matches vendor semantics
+    /// (`consume_first_decode.rs:2992-2998`). Used by `gzip_chunk.rs:217`
+    /// to detect fixed-Huffman blocks where the chunk can't safely stop.
+    pub fn btype(&self) -> Option<u8> {
+        if self.stopped_at == StoppingPoint::END_OF_BLOCK_HEADER {
+            Some(self.last_btype)
+        } else {
+            None
+        }
+    }
+
+    /// True when the deflate stream is fully decoded (BFINAL=1 block's
+    /// EOB consumed). Matches vendor
+    /// `consume_first_decode.rs:3008-3010`.
+    pub fn at_end_of_stream(&self) -> bool {
+        matches!(self.block_state, BlockState::Finished)
+    }
+
+    /// Bytes of input not yet consumed (`&data[bit_position/8..]`,
+    /// byte-aligned). Caller must ensure the bit cursor is byte-aligned
+    /// before relying on this — `read_footer_at_current` (in the
+    /// wrapper) asserts that. Matches vendor
+    /// `consume_first_decode.rs:3012-3019`.
+    pub fn remaining_input(&self) -> &'a [u8] {
+        let start_byte = self.bits.bit_position() / 8;
+        &self.bits.data[start_byte.min(self.bits.data.len())..]
+    }
+
+    /// Advance the bit cursor by `n` bytes; widen `encoded_until_bits`
+    /// if needed so the next member's body isn't capped by the prior
+    /// member's `until_bits`. Mirrors
+    /// `consume_first_decode.rs:3021-3027`. Clears `bitbuf`/`bitsleft`
+    /// so the next refill loads cleanly (matches the bitbuf-stale
+    /// trap pattern from §5 step 2).
+    pub fn advance_input(&mut self, n: usize) {
+        let cur = self.bits.bit_position() / 8;
+        let new_pos = (cur + n).min(self.bits.data.len());
+        self.bits.pos = new_pos;
+        self.bits.bitbuf = 0;
+        self.bits.bitsleft = 0;
+        let input_bits = self.bits.data.len() * 8;
+        if input_bits > self.encoded_until_bits {
+            self.encoded_until_bits = input_bits;
+        }
+    }
+
+    /// Reset per-member state for the next gzip member in a multi-member
+    /// stream. Window is NOT reset (caller will `set_window(&[])` if
+    /// they want to discard the predecessor window). Sets
+    /// `pending_stream_header_stop` so the next `read_stream` fires
+    /// `END_OF_STREAM_HEADER` if requested — matches vendor
+    /// `consume_first_decode.rs:3029-3036`.
+    pub fn reset_for_next_stream(&mut self) {
+        self.block_state = BlockState::AwaitingHeader;
+        self.pending_match = None;
+        self.last_bfinal = false;
+        self.last_btype = 0;
+        self.stopped_at = StoppingPoint::NONE;
+        self.dynamic_tables = None;
+        self.pending_stream_header_stop = true;
+    }
+
+    /// `ResumableInflate2` writes directly into the caller's `output`
+    /// buffer — there is no internal session accumulator. Returning
+    /// `false` here is correct and matches the new architecture's
+    /// vendor-faithful sliding-window design. The wrapper API still
+    /// exposes this for source compatibility with the old backend
+    /// (`session: Vec<u8>` accumulator).
+    pub fn session_pending(&self) -> bool {
+        false
     }
 
     /// Drive the decoder into `output`, stopping when:
@@ -272,6 +379,26 @@ impl<'a> ResumableInflate2<'a> {
         self.stopped_at = StoppingPoint::NONE;
         let out_pos_start = 0usize;
         let mut out_pos = out_pos_start;
+
+        // Vendor multi-stream pattern: after `reset_for_next_stream`, the
+        // next `read_stream` fires `END_OF_STREAM_HEADER` immediately if
+        // requested (zero bytes consumed, zero output written). Mirror
+        // of `consume_first_decode.rs:3091-3100`.
+        if self.pending_stream_header_stop {
+            self.pending_stream_header_stop = false;
+            if self
+                .points_to_stop_at
+                .contains(StoppingPoint::END_OF_STREAM_HEADER)
+            {
+                self.stopped_at = StoppingPoint::END_OF_STREAM_HEADER;
+                return Ok(InflateStreamResult {
+                    bytes_written: 0,
+                    stopped_at: self.stopped_at,
+                    bit_position: self.bits.bit_position(),
+                    finished: false,
+                });
+            }
+        }
 
         loop {
             if out_pos >= output.len() {
@@ -405,7 +532,8 @@ impl<'a> ResumableInflate2<'a> {
         let header = self.bits.bitbuf & 0b111;
         self.bits.consume(3);
         self.last_bfinal = (header & 1) != 0;
-        let btype = (header >> 1) & 0b11;
+        let btype = ((header >> 1) & 0b11) as u8;
+        self.last_btype = btype;
         match btype {
             0 => {
                 let len = self.bits.read_u16();
@@ -472,11 +600,20 @@ impl<'a> ResumableInflate2<'a> {
         // Block is ending — drop tables. If the NEXT block is also
         // dynamic, `try_enter_next_block`'s BTYPE=2 arm rebuilds them.
         self.dynamic_tables = None;
-        self.block_state = if self.last_bfinal {
-            BlockState::Finished
+        if self.last_bfinal {
+            // Per RFC 1952 the gzip footer is byte-aligned; the encoder
+            // pads the last DEFLATE block's bit stream with zero bits up
+            // to the next byte boundary. EOB symbols are Huffman codes
+            // and rarely land on a byte boundary themselves, so without
+            // this alignment ~7 of every 8 streams would read a footer
+            // 1-7 bits early — Opus advisor flagged this as the highest-
+            // risk silent-corruption path during the wrapper swap audit.
+            // Matches vendor `consume_first_decode.rs:3204` semantics.
+            self.bits.align_to_byte();
+            self.block_state = BlockState::Finished;
         } else {
-            BlockState::AwaitingHeader
-        };
+            self.block_state = BlockState::AwaitingHeader;
+        }
     }
 }
 
