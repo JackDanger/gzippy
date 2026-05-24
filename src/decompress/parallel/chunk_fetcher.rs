@@ -1768,6 +1768,8 @@ fn drain_one_pending<W: std::io::Write>(
         Some(h) => h,
         None => return Ok(()),
     };
+    let t_chunk = std::time::Instant::now();
+    let t_recv = std::time::Instant::now();
     let (idx, chunk, cache_key) = match head {
         PendingWrite::Ready {
             idx,
@@ -1784,9 +1786,12 @@ fn drain_one_pending<W: std::io::Write>(
             (idx, chunk, cache_key)
         }
     };
+    let recv_us = t_recv.elapsed().as_micros();
 
     // Vendor `appendSubchunksToIndexes` window emplace — orchestrator only.
+    let t_pub = std::time::Instant::now();
     publish_subchunk_windows(window_map, &chunk);
+    let publish_us = t_pub.elapsed().as_micros();
 
     // Mirror of vendor's per-chunk write loop (GzipChunkFetcher.hpp:333-342).
     // The post-process worker pre-narrows `data_with_markers` into
@@ -1797,6 +1802,7 @@ fn drain_one_pending<W: std::io::Write>(
     // nothing to write here — the clean tail comes through `chunk.data`
     // below.
     let mut written_crc = CRC32Calculator::new();
+    let t_crc_write = std::time::Instant::now();
     if !chunk.narrowed.is_empty() {
         written_crc.update(&chunk.narrowed);
         writer
@@ -1827,14 +1833,18 @@ fn drain_one_pending<W: std::io::Write>(
             .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
         *total_size += chunk.data.len();
     }
+    let crc_write_us = t_crc_write.elapsed().as_micros();
+    let t_combine = std::time::Instant::now();
     total_crc.append(&written_crc);
+    let combine_us = t_combine.elapsed().as_micros();
+    let total_us = t_chunk.elapsed().as_micros();
 
     if trace::is_enabled() {
         trace::emit(
             "consumer",
             "consume_done",
             &format!(
-                r#""partition_idx":{idx},"decoded":{}"#,
+                r#""partition_idx":{idx},"decoded":{},"recv_us":{recv_us},"publish_us":{publish_us},"crc_write_us":{crc_write_us},"combine_us":{combine_us},"total_us":{total_us}"#,
                 chunk.decoded_size()
             ),
         );
