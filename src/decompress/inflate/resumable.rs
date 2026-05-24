@@ -34,6 +34,8 @@ use super::consume_first_decode::{build_code_length_table, Bits};
 pub static MULTI_LITERAL_HITS: AtomicU64 = AtomicU64::new(0);
 pub static MULTI_LITERAL_MISSES: AtomicU64 = AtomicU64::new(0);
 pub static MULTI_LITERAL_SYMBOLS: AtomicU64 = AtomicU64::new(0);
+pub static BODY_RESUMABLE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static BODY_RESUMABLE_FASTLOOP_ENTERS: AtomicU64 = AtomicU64::new(0);
 use super::libdeflate_entry::{DistTable, LitLenTable};
 use super::stopping_point::StoppingPoint;
 
@@ -805,6 +807,7 @@ fn decode_huffman_body_resumable(
     litlen: &LitLenTable,
     dist: &DistTable,
 ) -> Result<usize> {
+    BODY_RESUMABLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Build the 256-entry VectorTable from the LitLenTable for the
     // multi-literal fastloop. ~256 lookups, cheap to construct per
     // block (this function is called once per block).
@@ -829,6 +832,7 @@ fn decode_huffman_body_resumable(
         && state.pending_match.is_none()
         && state.bits.bit_position() + FASTLOOP_BIT_SLACK <= state.encoded_until_bits
     {
+        BODY_RESUMABLE_FASTLOOP_ENTERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         state.bits.refill();
 
         // Try multi-literal lookahead — decodes 1-4 short-code literals

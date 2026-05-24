@@ -124,8 +124,10 @@ fn main() {
         } else {
             0.0
         };
+        let calls = r::BODY_RESUMABLE_CALLS.load(Ordering::Relaxed);
+        let fastloop_iters = r::BODY_RESUMABLE_FASTLOOP_ENTERS.load(Ordering::Relaxed);
         eprintln!(
-            "[multi-literal] hits={hits} misses={misses} syms={syms} hit_rate={hit_rate:.1}% avg_syms_per_hit={avg_syms:.2}"
+            "[multi-literal] calls={calls} fastloop_iters={fastloop_iters} hits={hits} misses={misses} syms={syms} hit_rate={hit_rate:.1}% avg_syms_per_hit={avg_syms:.2}"
         );
     }
 
