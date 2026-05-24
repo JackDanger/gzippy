@@ -808,6 +808,17 @@ fn decode_huffman_body_resumable(
     dist: &DistTable,
 ) -> Result<usize> {
     BODY_RESUMABLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if std::env::var_os("GZIPPY_TRACE_MULTI").is_some() {
+        let prev = BODY_RESUMABLE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        if prev <= 3 {
+            eprintln!(
+                "[trace] decode_huffman_body_resumable call #{prev} out_pos={out_pos} output.len={} bit_pos={} encoded_until_bits={}",
+                output.len(),
+                state.bits.bit_position(),
+                state.encoded_until_bits
+            );
+        }
+    }
     // Build the 256-entry VectorTable from the LitLenTable for the
     // multi-literal fastloop. ~256 lookups, cheap to construct per
     // block (this function is called once per block).
