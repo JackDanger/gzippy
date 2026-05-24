@@ -807,110 +807,18 @@ fn decode_huffman_body_resumable(
     litlen: &LitLenTable,
     dist: &DistTable,
 ) -> Result<usize> {
-    BODY_RESUMABLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if std::env::var_os("GZIPPY_TRACE_MULTI").is_some() {
-        let prev = BODY_RESUMABLE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
-        if prev <= 3 {
-            eprintln!(
-                "[trace] decode_huffman_body_resumable call #{prev} addr={:p} out_pos={out_pos} output.len={} bit_pos={} encoded_until_bits={}",
-                &BODY_RESUMABLE_CALLS,
-                output.len(),
-                state.bits.bit_position(),
-                state.encoded_until_bits
-            );
-        }
-    }
-    // Build the 256-entry VectorTable from the LitLenTable for the
-    // multi-literal fastloop. ~256 lookups, cheap to construct per
-    // block (this function is called once per block).
-    // The fastloop pattern mirrors `decode_huffman_cf_vector`
-    // (consume_first_decode.rs:571+) — the production SIMD path used
-    // by BGZF + sequential decompress. Resumable adds two preconditions:
-    //   1. `state.encoded_until_bits` must leave at least 64 bits of
-    //      slack so a 4-cluster decode can't overrun the stopping
-    //      point boundary.
-    //   2. `state.pending_match.is_none()` — a yielded mid-match must
-    //      complete via the scalar path's `copy_match_windowed` before
-    //      we can fastloop again.
-    let mut vector_table = crate::decompress::inflate::vector_huffman::VectorTable::new();
-    vector_table.build_from_litlen(litlen);
-    const FASTLOOP_MARGIN: usize = 320;
-    const FASTLOOP_BIT_SLACK: usize = 64;
-    // FASTLOOP: process literal clusters via decode_multi_literals.
-    // Bound checks happen per fastloop iteration, NOT per symbol —
-    // up to 4 literals per iteration; matches fall through to the
-    // scalar tail below (then re-enter the fastloop).
-    while out_pos + FASTLOOP_MARGIN <= output.len()
-        && state.pending_match.is_none()
-        && state.bits.bit_position() + FASTLOOP_BIT_SLACK <= state.encoded_until_bits
-    {
-        BODY_RESUMABLE_FASTLOOP_ENTERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        state.bits.refill();
-
-        // Try multi-literal lookahead — decodes 1-4 short-code literals
-        // from a single 32-bit bitbuf.
-        let (symbols, count, bits_count) =
-            crate::decompress::inflate::vector_huffman::decode_multi_literals(
-                state.bits.peek(),
-                &vector_table.table,
-            );
-        if count > 0 {
-            MULTI_LITERAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            MULTI_LITERAL_SYMBOLS.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
-            output[out_pos..(out_pos + count)].copy_from_slice(&symbols[..count]);
-            out_pos += count;
-            state.bits.consume(bits_count);
-            continue;
-        }
-        MULTI_LITERAL_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        // Multi-literal decode hit an overflow / length / EOB at
-        // position 0 — fall through to scalar single-symbol decode.
-        let mut saved_bitbuf = state.bits.peek();
-        let mut entry = litlen.lookup(saved_bitbuf);
-        if entry.is_subtable_ptr() {
-            state.bits.consume(LitLenTable::TABLE_BITS as u32);
-            entry = litlen.lookup_subtable(entry, saved_bitbuf);
-            saved_bitbuf = state.bits.peek();
-            state.bits.consume_entry(entry.raw());
-        } else {
-            state.bits.consume_entry(entry.raw());
-        }
-
-        if (entry.raw() as i32) < 0 {
-            output[out_pos] = entry.literal_value();
-            out_pos += 1;
-            continue;
-        }
-        if entry.is_end_of_block() {
-            state.finish_current_block();
-            return Ok(out_pos);
-        }
-
-        // Match — use the existing scalar path via copy_match_windowed.
-        let length = entry.decode_length(saved_bitbuf);
-        state.bits.refill();
-        let dist_saved = state.bits.peek();
-        let mut dist_entry = dist.lookup(dist_saved);
-        if dist_entry.is_subtable_ptr() {
-            state.bits.consume(DistTable::TABLE_BITS as u32);
-            dist_entry = dist.lookup_subtable(dist_entry, dist_saved);
-        }
-        let dist_extra_saved = state.bits.peek();
-        state.bits.consume_entry(dist_entry.raw());
-        let distance = dist_entry.decode_distance(dist_extra_saved);
-
-        out_pos = copy_match_windowed(state, output, out_pos, distance, length)?;
-        if state.pending_match.is_some() {
-            debug_assert_eq!(out_pos, output.len());
-            return Ok(out_pos);
-        }
-    }
-
-    // GENERIC LOOP for the boundary tail (output < FASTLOOP_MARGIN
-    // headroom OR bit position close to stopping point OR pending
-    // match outstanding). Same per-symbol decode as before — the only
-    // path through which we can yield mid-match and resume.
+    // SIMD multi-literal fastloop was tried at commit ca52389 and
+    // regressed the inflate bench from 334 → 284 MB/s (-15%) plus
+    // the silesia E2E test 2.79× → 3.06×. Suspected cause: silesia
+    // data has too few literal clusters for `vector_huffman::
+    // decode_multi_literals` lookahead to pay back the per-iteration
+    // overhead. Reverted to the original scalar loop below; the
+    // counters left in place (`MULTI_LITERAL_*`, `BODY_RESUMABLE_*`)
+    // remain reachable for future microbenches.
+    //
+    // The vendor-faithful win is elsewhere — likely BMI2 pext bit
+    // extraction or specializing on FIXED-Huffman static tables.
+    // See `plans/pure-rust-perf.md` Phase B work-item #1(a).
     loop {
         if out_pos >= output.len() {
             return Ok(out_pos);
