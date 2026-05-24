@@ -197,7 +197,11 @@ fn decode_chunk_isal_impl(
                             // Do not keep filling this buffer from the next block
                             // before HEADER/NONE handling — finalize at pre-header EOB.
                             last_end_bit = r.bit_position;
-                            pending_stop_after_flush = true;
+                            if wrapper.session_pending() {
+                                pending_stop_after_flush = true;
+                            } else {
+                                stopping_point_reached = true;
+                            }
                         }
                     }
                     last_eob_pos = r.bit_position;
@@ -208,7 +212,11 @@ fn decode_chunk_isal_impl(
                     let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
                     if last_eob_pos >= stop_hint_bits && not_final && not_fixed {
                         last_end_bit = last_eob_pos;
-                        pending_stop_after_flush = true;
+                        if wrapper.session_pending() {
+                            pending_stop_after_flush = true;
+                        } else {
+                            stopping_point_reached = true;
+                        }
                     }
                 }
                 sp if sp == StoppingPoints::NONE
@@ -218,7 +226,11 @@ fn decode_chunk_isal_impl(
                     // ISA-L can return 0 bytes between block boundaries.
                     // Do not end the chunk early while still before `stop_hint_bits`.
                     last_end_bit = last_eob_pos;
-                    pending_stop_after_flush = true;
+                    if wrapper.session_pending() {
+                        pending_stop_after_flush = true;
+                    } else {
+                        stopping_point_reached = true;
+                    }
                 }
                 _ => {}
             }
