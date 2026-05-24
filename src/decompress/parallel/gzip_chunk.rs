@@ -136,7 +136,7 @@ fn decode_chunk_isal_impl(
         let mut end_of_stream_hit = false;
 
         let decode_base = already_decoded;
-        while n_bytes_read < buffer.len() && !stopping_point_reached && !pending_stop_after_flush {
+        while n_bytes_read < buffer.len() && !stopping_point_reached {
             let bit_before_read = wrapper.tell_compressed();
             let r = wrapper.read_stream(&mut buffer[n_bytes_read..])?;
             last_per_call = r.bytes_written;
