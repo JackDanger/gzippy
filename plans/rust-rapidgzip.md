@@ -212,19 +212,18 @@ subtable `total_bits` accounting at `resumable.rs:812-818` — **must
 land before Phase B** (Phase A is decoder-independent and safe to land
 first).
 
-- **Phase A — Close the page-fault gap.** `chunk_buffer_pool.rs:73-82`
-  notes gzippy spends ~40% of CPU in
-  `asm_exc_page_fault`/`clear_page_erms` vs rapidgzip's ~17%.
-  **Already in the build (do NOT re-do):** `Cargo.toml:39,50-51`
-  forces `arena-allocator`, which makes
-  `ChunkData::data`/`data_with_markers` `Vec<_, RpmallocAlloc>` via
-  `rpmalloc_alloc.rs:14-89`. The fact that the bench is regressed at
-  4.04× WITH this in place means Phase A's remaining levers are below,
-  not the rpmalloc-Vec switch.
-
-  **Step zero:** re-confirm the 40% page-fault CPU% on neurotic with
-  the current build (see Troubleshooting → flame-graph). If it's
-  already < 25%, Phase A is largely done; pivot to Phase B.
+- **Phase A — Close the page-fault gap. CLOSED 2026-05-24.**
+  Fresh `perf record` on neurotic against real silesia.tar.gz shows
+  `asm_exc_page_fault + clear_page_erms` at **17.2%** of weighted
+  cycles — matches rapidgzip's documented 17%. The arena-allocator
+  (`Cargo.toml:39,50-51` → `Vec<_, RpmallocAlloc>` for `ChunkData::data`
+  / `data_with_markers`) + per-worker LIFO pool
+  (`chunk_buffer_pool.rs:108-204`) shipping on `main` already closed
+  this gap. The 2.76× pure-Rust-parallel vs T=1-libdeflate ratio on
+  real silesia is NOT page-fault bound — see Phase B "Instrument
+  before optimizing." If a future regression brings page-faults back,
+  the levers (in `plans/pure-rust-perf.md`) are: worker-local
+  pre-touch → MADV_HUGEPAGE → `#[global_allocator] = RpMalloc`.
 
   **Try in order (decreasing safety):**
     1. **Worker-local pre-touch of pool buffers.** The
@@ -241,15 +240,22 @@ first).
        mimalloc/jemalloc tries regressed).
 
   Largest expected win; independent of §5.
-- **Phase B — Bring gzippy's SIMD inflate primitives to the
-  parallel-SM resumable path.** `vector_huffman`, `simd_huffman`,
-  `two_level_table`, `packed_lut`, `combined_lut`, `bmi2` already
-  ship for BGZF and sequential decompress (used by
-  `decode_huffman_cf_vector` at `consume_first_decode.rs:571+`);
-  extend `decode_huffman_body_resumable` (`resumable.rs:793-852`) to
-  dispatch literal-batch and match-copy through them. **Pre-req:
-  failure #2 fixed.** This is where pure-Rust beats ISA-L's general
-  inflate on the code-length distributions gzip(1) produces.
+- **Phase B — Instrument the per-chunk path THEN optimize.** Real
+  silesia per-chunk decode is p50=47ms; the inflate-only bench says
+  pure-Rust does ~5-8ms for a 1.6 MB chunk. ~85% of wall time is
+  NOT inner inflate. Step zero: add per-chunk timing spans
+  (`bootstrap`, `inflate_to_markers`, `replace_markers`,
+  `window_publish`, `output_copy`) and emit p50/p95 per span via
+  the existing GZIPPY_LOG_FILE trace. Then SIMD inflate primitives
+  (`vector_huffman`, `simd_huffman`, `two_level_table`, `packed_lut`,
+  `combined_lut`, `bmi2` — already production in
+  `decode_huffman_cf_vector` at `consume_first_decode.rs:571+`) get
+  wired into `decode_huffman_body_resumable` (`resumable.rs:793-852`)
+  **only if** measurement shows inflate dominates. **Pre-req for
+  SIMD path: failure #2 fixed.** Otherwise Phase B work goes to
+  bootstrap amortization or speculation depth (closer to Phase E)
+  per the measurement. See `plans/pure-rust-perf.md` "Phase B —
+  Instrument before optimizing."
 - **Phase C — Architecture-specific dispatch.** `target_feature` +
   CPUID runtime dispatch (`multiversion` crate). AVX2 + AVX-512 +
   NEON variants of `decode_*_resumable`'s inner loops. Bench each ISA

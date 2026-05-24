@@ -630,6 +630,15 @@ mod tests {
     }
 
     /// High-entropy synthetic proxy — not gate 2 (real silesia.tar.gz).
+    ///
+    /// PRNG-compressed-via-flate2-best is adversarial: dense literals,
+    /// few back-refs, few block boundaries → speculation pathology. The
+    /// 0.5× gate encodes the **production** (isal-compression) bar.
+    /// **Expected RED on `--features pure-rust-inflate` until Phase B
+    /// lands** (`plans/pure-rust-perf.md`); pure-Rust inflate at ~334
+    /// MB/s vs ISA-L's ~800 MB/s leaves no headroom for speculation
+    /// overhead on this fixture. Use `test_single_member_parallel_silesia`
+    /// (real silesia.tar.gz) as the pure-Rust Phase B gate.
     #[test]
     #[ignore = "perf gate — run on neurotic, not GHA (plans/rust-rapidgzip.md)"]
     #[cfg(all(
