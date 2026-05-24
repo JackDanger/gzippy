@@ -576,6 +576,34 @@ pub fn drive<W: std::io::Write>(
             SPEC_FAIL_STOP_MISSED.load(Ordering::Relaxed),
             SPEC_FAIL_OTHER.load(Ordering::Relaxed),
         );
+        // Body-failure forensic detail — speculation-accuracy attack.
+        // After disprove-advisor confirmed body failures are the dominant
+        // re-decode cost, characterize them by error variant + waste size.
+        use crate::decompress::parallel::gzip_chunk as gc;
+        let body_count = gc::BODY_FAIL_COUNT.load(Ordering::Relaxed);
+        let body_wasted = gc::BODY_FAIL_BYTES_WASTED.load(Ordering::Relaxed);
+        let body_bits = gc::BODY_FAIL_BITS_INTO_BODY.load(Ordering::Relaxed);
+        let avg_waste = if body_count > 0 {
+            body_wasted as f64 / body_count as f64
+        } else {
+            0.0
+        };
+        let avg_bits = if body_count > 0 {
+            body_bits as f64 / body_count as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "  Body-fail forensics: count={body_count} wasted_bytes={body_wasted} avg_waste={avg_waste:.0}B avg_bits_into_body={avg_bits:.0}",
+        );
+        eprintln!(
+            "    by variant: invalid_huffman={} exceeded_window={} invalid_compression={} invalid_code_lengths={} other={}",
+            gc::BODY_FAIL_INVALID_HUFFMAN.load(Ordering::Relaxed),
+            gc::BODY_FAIL_EXCEEDED_WINDOW.load(Ordering::Relaxed),
+            gc::BODY_FAIL_INVALID_COMPRESSION.load(Ordering::Relaxed),
+            gc::BODY_FAIL_INVALID_CODE_LENGTHS.load(Ordering::Relaxed),
+            gc::BODY_FAIL_OTHER_VARIANT.load(Ordering::Relaxed),
+        );
         // Per-fetch rejection cause: a prefetched chunk arrived but the
         // safety guard rejected it (chain invariant broken —
         // chunk.max != next_block_offset).
