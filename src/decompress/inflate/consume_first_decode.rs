@@ -3052,6 +3052,32 @@ impl<'a> ResumableInflate<'a> {
         n
     }
 
+    /// Fill `output` from undrained session bytes (mirrors ISA-L tmp_out drain).
+    fn fill_output_from_session(&mut self, output: &mut [u8], mut user_written: usize) -> usize {
+        while user_written < output.len() && self.user_emitted < self.session.len() {
+            user_written += self.copy_session_to_user(output, user_written);
+        }
+        user_written
+    }
+
+    /// True when the deflate body is fully decoded and every session byte
+    /// was returned to the caller. Matches vendor `finished` semantics:
+    /// `finished` may be false while output remains in the internal buffer.
+    fn stream_output_finished(&self) -> bool {
+        self.last_bfinal
+            && !self.pending_block_after_header
+            && self.user_emitted >= self.session.len()
+    }
+
+    fn stream_result(&self, bytes_written: usize, finished: bool) -> InflateStreamResult {
+        InflateStreamResult {
+            bytes_written,
+            stopped_at: self.stopped_at,
+            bit_position: self.tell_compressed(),
+            finished: finished && self.stream_output_finished(),
+        }
+    }
+
     /// Decode into `output`, stopping early when a requested stop point fires.
     pub fn read_stream(&mut self, output: &mut [u8]) -> Result<InflateStreamResult> {
         self.stopped_at = StoppingPoint::NONE;
@@ -3064,30 +3090,20 @@ impl<'a> ResumableInflate<'a> {
                 .contains(StoppingPoint::END_OF_STREAM_HEADER)
             {
                 self.stopped_at = StoppingPoint::END_OF_STREAM_HEADER;
-                return Ok(InflateStreamResult {
-                    bytes_written: user_written,
-                    stopped_at: self.stopped_at,
-                    bit_position: self.tell_compressed(),
-                    finished: false,
-                });
+                return Ok(self.stream_result(user_written, false));
             }
         }
 
-        user_written += self.copy_session_to_user(output, user_written);
+        user_written = self.fill_output_from_session(output, user_written);
 
         while user_written < output.len() {
             // Block decoders run to completion in one shot; if the caller's
             // output buffer is smaller, bytes remain in session until drained.
             // Do not start the next block while prior output is pending.
             if self.user_emitted < self.session.len() {
-                user_written += self.copy_session_to_user(output, user_written);
+                user_written = self.fill_output_from_session(output, user_written);
                 if user_written >= output.len() {
-                    return Ok(InflateStreamResult {
-                        bytes_written: user_written,
-                        stopped_at: StoppingPoint::NONE,
-                        bit_position: self.tell_compressed(),
-                        finished: false,
-                    });
+                    return Ok(self.stream_result(user_written, false));
                 }
                 continue;
             }
@@ -3099,12 +3115,8 @@ impl<'a> ResumableInflate<'a> {
                 .encoded_until_bits
                 .saturating_sub(self.bits.bit_position());
             if remaining_in_cap < 3 && !self.pending_block_after_header {
-                return Ok(InflateStreamResult {
-                    bytes_written: user_written,
-                    stopped_at: StoppingPoint::NONE,
-                    bit_position: self.tell_compressed(),
-                    finished: true,
-                });
+                user_written = self.fill_output_from_session(output, user_written);
+                return Ok(self.stream_result(user_written, true));
             }
             if self.bits.available() < 3 {
                 self.bits.refill();
@@ -3118,12 +3130,8 @@ impl<'a> ResumableInflate<'a> {
                 < 3
                 && !self.pending_block_after_header
             {
-                return Ok(InflateStreamResult {
-                    bytes_written: user_written,
-                    stopped_at: StoppingPoint::NONE,
-                    bit_position: self.tell_compressed(),
-                    finished: true,
-                });
+                user_written = self.fill_output_from_session(output, user_written);
+                return Ok(self.stream_result(user_written, true));
             }
 
             let (bfinal, btype, header_just_read) = if self.pending_block_after_header {
@@ -3148,12 +3156,8 @@ impl<'a> ResumableInflate<'a> {
             {
                 self.pending_block_after_header = true;
                 self.stopped_at = StoppingPoint::END_OF_BLOCK_HEADER;
-                return Ok(InflateStreamResult {
-                    bytes_written: user_written,
-                    stopped_at: self.stopped_at,
-                    bit_position: self.tell_compressed(),
-                    finished: false,
-                });
+                user_written = self.fill_output_from_session(output, user_written);
+                return Ok(self.stream_result(user_written, false));
             }
 
             let decode_start = self.session.len();
@@ -3172,26 +3176,16 @@ impl<'a> ResumableInflate<'a> {
                 _ => unreachable!(),
             };
             self.session.truncate(new_pos);
-            user_written += self.copy_session_to_user(output, user_written);
+            user_written = self.fill_output_from_session(output, user_written);
             self.clamp_to_until_bits();
 
             if self.bits.bit_position() >= self.encoded_until_bits {
-                return Ok(InflateStreamResult {
-                    bytes_written: user_written,
-                    stopped_at: StoppingPoint::NONE,
-                    bit_position: self.tell_compressed(),
-                    finished: false,
-                });
+                return Ok(self.stream_result(user_written, false));
             }
 
             if self.points_to_stop_at.contains(StoppingPoint::END_OF_BLOCK) {
                 self.stopped_at = StoppingPoint::END_OF_BLOCK;
-                return Ok(InflateStreamResult {
-                    bytes_written: user_written,
-                    stopped_at: self.stopped_at,
-                    bit_position: self.tell_compressed(),
-                    finished: bfinal,
-                });
+                return Ok(self.stream_result(user_written, bfinal));
             }
 
             if bfinal {
@@ -3201,28 +3195,14 @@ impl<'a> ResumableInflate<'a> {
                     .contains(StoppingPoint::END_OF_STREAM)
                 {
                     self.stopped_at = StoppingPoint::END_OF_STREAM;
-                    return Ok(InflateStreamResult {
-                        bytes_written: user_written,
-                        stopped_at: self.stopped_at,
-                        bit_position: self.tell_compressed(),
-                        finished: true,
-                    });
+                    return Ok(self.stream_result(user_written, true));
                 }
-                return Ok(InflateStreamResult {
-                    bytes_written: user_written,
-                    stopped_at: StoppingPoint::NONE,
-                    bit_position: self.tell_compressed(),
-                    finished: true,
-                });
+                return Ok(self.stream_result(user_written, true));
             }
         }
 
-        Ok(InflateStreamResult {
-            bytes_written: user_written,
-            stopped_at: StoppingPoint::NONE,
-            bit_position: self.tell_compressed(),
-            finished: self.at_end_of_stream(),
-        })
+        user_written = self.fill_output_from_session(output, user_written);
+        Ok(self.stream_result(user_written, self.at_end_of_stream()))
     }
 }
 
