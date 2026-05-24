@@ -565,6 +565,17 @@ pub fn drive<W: std::io::Write>(
             "  BlockFinder coordinator spawns: {}",
             COORDINATOR_BOUNDARY_SEARCH_RUNS.load(Ordering::Relaxed),
         );
+        // V1: Speculative-decode failure breakdown — picks Design 1
+        // (precode pre-pass) vs Design 3 (coordinator amortization)
+        // vs Design 4 (boundary-confirmed speculation).
+        eprintln!(
+            "  Speculation failure modes: header={} body={} inflate={} stop_missed={} other={}",
+            SPEC_FAIL_HEADER.load(Ordering::Relaxed),
+            SPEC_FAIL_BODY.load(Ordering::Relaxed),
+            SPEC_FAIL_INFLATE.load(Ordering::Relaxed),
+            SPEC_FAIL_STOP_MISSED.load(Ordering::Relaxed),
+            SPEC_FAIL_OTHER.load(Ordering::Relaxed),
+        );
         // Per-fetch rejection cause: a prefetched chunk arrived but the
         // safety guard rejected it (chain invariant broken —
         // chunk.max != next_block_offset).
@@ -1608,6 +1619,13 @@ pub static SLOW_PATH_FIRST_CANDIDATE_FAIL: std::sync::atomic::AtomicU64 =
 /// `RawBlockFinderCoordinator` (StreamedResults + single finder thread).
 /// Proves production routes through the coordinator — see deletion-trap
 /// test in `src/tests/routing.rs`.
+pub static SPEC_FAIL_HEADER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_FAIL_BODY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_FAIL_INFLATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_FAIL_STOP_MISSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_FAIL_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -1633,13 +1651,45 @@ fn try_speculative_decode_candidate(
     stop_hint_bit: usize,
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    let mut chunk = decode_chunk_marker_bootstrap_then_isal(
+    let result = decode_chunk_marker_bootstrap_then_isal(
         input,
         decode_start,
         stop_hint_bit,
         &[],
         configuration,
-    )?;
+    );
+    // V1: classify failures so we know which fix to attack.
+    //   header_fail  → "deflate header at bit X" — could be caught by
+    //                  precode pre-pass (CountAllocatedLeaves port)
+    //   body_fail    → "deflate body at bit X" — mid-stream Huffman
+    //                  decode failed; precode wouldn't catch it
+    //   inflate_fail → phase-2 IsalInflateWrapper / ResumableInflate2
+    //   stop_missed  → chunk size cap hit (not really a "failure")
+    if let Err(ref e) = result {
+        use std::sync::atomic::Ordering;
+        match e {
+            ChunkDecodeError::BootstrapFailed(io_err) => {
+                let msg = io_err.to_string();
+                if msg.contains("deflate header") {
+                    SPEC_FAIL_HEADER.fetch_add(1, Ordering::Relaxed);
+                } else if msg.contains("deflate body") {
+                    SPEC_FAIL_BODY.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    SPEC_FAIL_OTHER.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            ChunkDecodeError::InflateFailed(_) => {
+                SPEC_FAIL_INFLATE.fetch_add(1, Ordering::Relaxed);
+            }
+            ChunkDecodeError::ExactStopMissed { .. } => {
+                SPEC_FAIL_STOP_MISSED.fetch_add(1, Ordering::Relaxed);
+            }
+            ChunkDecodeError::UnsupportedPlatform => {
+                SPEC_FAIL_OTHER.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let mut chunk = result?;
     // Vendor tryToDecode metadata (GzipChunk.hpp:716-722): encoded =
     // partition seed, max = actual decode start.
     if partition_seed < decode_start {
