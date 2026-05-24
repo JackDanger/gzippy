@@ -3108,9 +3108,9 @@ impl<'a> ResumableInflate<'a> {
                 });
             }
 
-            let (bfinal, btype) = if self.pending_block_after_header {
+            let (bfinal, btype, header_just_read) = if self.pending_block_after_header {
                 self.pending_block_after_header = false;
-                (self.last_bfinal, self.last_btype)
+                (self.last_bfinal, self.last_btype, false)
             } else {
                 if self.bits.available() < 3 {
                     self.bits.refill();
@@ -3120,12 +3120,13 @@ impl<'a> ResumableInflate<'a> {
                 self.bits.consume(3);
                 self.last_bfinal = bfinal;
                 self.last_btype = btype;
-                (bfinal, btype)
+                (bfinal, btype, true)
             };
 
-            if self
-                .points_to_stop_at
-                .contains(StoppingPoint::END_OF_BLOCK_HEADER)
+            if header_just_read
+                && self
+                    .points_to_stop_at
+                    .contains(StoppingPoint::END_OF_BLOCK_HEADER)
             {
                 self.pending_block_after_header = true;
                 self.stopped_at = StoppingPoint::END_OF_BLOCK_HEADER;
