@@ -334,10 +334,19 @@ pub struct LitLenTable {
 }
 
 impl LitLenTable {
-    /// Number of bits for main table lookup (11 bits = 8KB table).
-    /// Benchmarked 11-15 on ARM64: 11-bit is fastest due to L1d cache locality.
-    /// Larger tables (12-15 bit) reduce subtable lookups but cause cache misses.
-    pub const TABLE_BITS: u8 = 11;
+    /// Number of bits for main table lookup.
+    ///
+    /// ARM64 (the original tuning target): 11 bits = 8 KB table was
+    /// fastest due to L1d cache locality.
+    ///
+    /// x86_64 (neurotic, i7-13700T, where the perf/pure-rust-inflate
+    /// branch lives): bumped to **12** per the Phase B advisor audit.
+    /// Larger main table → fewer subtable hits on common code lengths,
+    /// removing a dependent load from the hot path of every symbol
+    /// that previously hit the subtable. 12-bit table = 16 KB, still
+    /// fits in 48 KB L1d on Raptor Lake. rapidgzip uses larger main
+    /// tables for the same reason (vendor's HuffmanCoding* variants).
+    pub const TABLE_BITS: u8 = 12;
     /// Maximum number of subtable bits for codes longer than TABLE_BITS
     pub const MAX_SUBTABLE_BITS: u8 = 15 - Self::TABLE_BITS;
 
