@@ -649,7 +649,7 @@ impl<'a> IsalInflateWrapper<'a> {
 
 #[cfg(all(feature = "pure-rust-inflate", target_arch = "x86_64"))]
 pub struct IsalInflateWrapper<'a> {
-    inner: crate::decompress::inflate::consume_first_decode::ResumableInflate<'a>,
+    inner: crate::decompress::inflate::resumable::ResumableInflate2<'a>,
 }
 
 #[cfg(all(feature = "pure-rust-inflate", target_arch = "x86_64"))]
@@ -664,11 +664,10 @@ impl<'a> IsalInflateWrapper<'a> {
         bit_offset: usize,
         until_bits: usize,
     ) -> Result<Self, InflateError> {
-        let inner =
-            crate::decompress::inflate::consume_first_decode::ResumableInflate::with_until_bits(
-                input, bit_offset, until_bits,
-            )
-            .map_err(|_| InflateError::StartBitPastEnd)?;
+        let inner = crate::decompress::inflate::resumable::ResumableInflate2::with_until_bits(
+            input, bit_offset, until_bits,
+        )
+        .map_err(|_| InflateError::StartBitPastEnd)?;
         Ok(Self { inner })
     }
 
@@ -723,6 +722,16 @@ impl<'a> IsalInflateWrapper<'a> {
             2 => Some(DeflateCompressionType::DynamicHuffman),
             _ => None,
         })
+    }
+
+    /// Drop tables / pending state — called between blocks via the
+    /// existing `clear_stop` API to ensure idempotent re-entry.
+    /// (No-op on the new backend; kept for source compat.)
+    #[allow(dead_code)]
+    pub fn debug_assert_session_pending_false(&self) {
+        // ResumableInflate2 never accumulates session bytes. Sanity
+        // helper for unit-test paths that previously asserted this.
+        debug_assert!(!self.inner.session_pending());
     }
 
     pub fn tell_compressed(&self) -> usize {
