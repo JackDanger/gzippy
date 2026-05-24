@@ -121,8 +121,9 @@ fn decode_chunk_isal_impl(
     // from the chunk's encoded range and the consumer re-decodes it,
     // duplicating its bytes in the output.
     let mut reached_stream_end = false;
+    let mut pending_stop_after_flush = false;
 
-    while !stopping_point_reached {
+    while !stopping_point_reached || wrapper.session_pending() {
         let mut buffer: types::U8 = types::u8_with_capacity(ALLOCATION_CHUNK_SIZE);
         #[allow(clippy::uninit_vec)]
         unsafe {
@@ -196,55 +197,18 @@ fn decode_chunk_isal_impl(
                             // Do not keep filling this buffer from the next block
                             // before HEADER/NONE handling — finalize at pre-header EOB.
                             last_end_bit = r.bit_position;
-                            stopping_point_reached = true;
+                            pending_stop_after_flush = true;
                         }
                     }
                     last_eob_pos = r.bit_position;
                     last_eob_decoded_bytes = decode_base + n_bytes_read;
-                    // Pure-Rust ResumableInflate may return END_OF_BLOCK while
-                    // block output remains in session; drain before HEADER/NONE
-                    // finalize can truncate at a stale byte count.
-                    while n_bytes_read < buffer.len() {
-                        let bit_before_drain = wrapper.tell_compressed();
-                        let r2 = wrapper.read_stream(&mut buffer[n_bytes_read..])?;
-                        if r2.bytes_written == 0
-                            && r2.stopped_at == StoppingPoints::NONE
-                            && r2.bit_position == bit_before_drain
-                        {
-                            break;
-                        }
-                        n_bytes_read += r2.bytes_written;
-                        chunk.note_inner_decoded_bytes(r2.bytes_written);
-                        last_eob_decoded_bytes = decode_base + n_bytes_read;
-                        last_per_call = r2.bytes_written;
-                        last_stopped_at = r2.stopped_at;
-                        last_finished = r2.finished;
-                        last_end_bit = r2.bit_position;
-                        if r2.stopped_at == StoppingPoints::END_OF_BLOCK_HEADER {
-                            let not_final = !wrapper.is_final_block();
-                            let not_fixed =
-                                wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
-                            if last_eob_pos >= stop_hint_bits && not_final && not_fixed {
-                                last_end_bit = last_eob_pos;
-                                stopping_point_reached = true;
-                            }
-                            break;
-                        }
-                        if r2.stopped_at == StoppingPoints::END_OF_STREAM {
-                            end_of_stream_hit = true;
-                            break;
-                        }
-                        if r2.finished {
-                            break;
-                        }
-                    }
                 }
                 sp if sp == StoppingPoints::END_OF_BLOCK_HEADER => {
                     let not_final = !wrapper.is_final_block();
                     let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
                     if last_eob_pos >= stop_hint_bits && not_final && not_fixed {
                         last_end_bit = last_eob_pos;
-                        stopping_point_reached = true;
+                        pending_stop_after_flush = true;
                     }
                 }
                 sp if sp == StoppingPoints::NONE
@@ -254,7 +218,7 @@ fn decode_chunk_isal_impl(
                     // ISA-L can return 0 bytes between block boundaries.
                     // Do not end the chunk early while still before `stop_hint_bits`.
                     last_end_bit = last_eob_pos;
-                    stopping_point_reached = true;
+                    pending_stop_after_flush = true;
                 }
                 _ => {}
             }
@@ -269,12 +233,20 @@ fn decode_chunk_isal_impl(
             // already appended in a previous outer iteration — do not
             // emit bytes from the next block read into this buffer.
             append_len = last_eob_decoded_bytes.saturating_sub(decode_base);
+        } else if pending_stop_after_flush {
+            // Session-flush outer iterations after the EOB hint fired:
+            // all bytes in this buffer are tail output from the same block.
+            append_len = n_bytes_read;
         }
         buffer.truncate(append_len);
         if !buffer.is_empty() {
             chunk.append_owned_buffer(buffer);
         }
         already_decoded = decode_base + append_len;
+
+        if pending_stop_after_flush && !wrapper.session_pending() {
+            stopping_point_reached = true;
+        }
 
         if end_of_stream_hit {
             let (crc32, isize_field) = wrapper.read_footer_at_current()?;

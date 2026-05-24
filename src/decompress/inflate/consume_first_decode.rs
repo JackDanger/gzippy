@@ -3069,6 +3069,11 @@ impl<'a> ResumableInflate<'a> {
             && self.user_emitted >= self.session.len()
     }
 
+    /// True when decoded bytes remain in the internal session buffer.
+    pub fn session_pending(&self) -> bool {
+        self.user_emitted < self.session.len()
+    }
+
     fn stream_result(&self, bytes_written: usize, finished: bool) -> InflateStreamResult {
         InflateStreamResult {
             bytes_written,
