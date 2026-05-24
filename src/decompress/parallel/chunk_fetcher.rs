@@ -556,6 +556,15 @@ pub fn drive<W: std::io::Write>(
             SLOW_PATH_FIRST_CANDIDATE_FAIL.load(Ordering::Relaxed),
             SLOW_PATH_NO_CANDIDATE.load(Ordering::Relaxed),
         );
+        // V6: Was the boundary search (scoped BlockFinder spawn) needed
+        // for most slow-path decodes, or did the first-candidate try
+        // win without it? If runs == ok_count, every slow-path needed
+        // a search; if runs << ok_count, the partition seed was usually
+        // a real block boundary.
+        eprintln!(
+            "  BlockFinder coordinator spawns: {}",
+            COORDINATOR_BOUNDARY_SEARCH_RUNS.load(Ordering::Relaxed),
+        );
         // Per-fetch rejection cause: a prefetched chunk arrived but the
         // safety guard rejected it (chain invariant broken —
         // chunk.max != next_block_offset).
