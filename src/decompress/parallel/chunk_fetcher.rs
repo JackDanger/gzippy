@@ -1416,16 +1416,110 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
     let t_pop = std::time::Instant::now();
     chunk.populate_subchunk_windows(&bytes);
     let populate_us = t_pop.elapsed().as_micros();
+    // Worker-side narrow: produce `chunk.narrowed` so the single
+    // consumer thread doesn't pay the ~24ms / 3.3MiB scalar narrow
+    // per chunk that previously dominated wall time on real silesia
+    // (`plans/pure-rust-perf.md` consumer-narrow finding). Pool-
+    // recycles a u8 buffer rather than allocating per chunk.
+    let t_narrow = std::time::Instant::now();
+    if !chunk.data_with_markers.is_empty() {
+        use crate::decompress::parallel::chunk_buffer_pool;
+        let dwm_len = chunk.data_with_markers.len();
+        let mut narrowed = chunk_buffer_pool::take_u8(dwm_len);
+        narrow_u16_to_u8(&chunk.data_with_markers, &mut narrowed);
+        chunk.narrowed = narrowed;
+    }
+    let narrow_us = t_narrow.elapsed().as_micros();
     if trace::is_enabled() {
         trace::emit(
             "post_process",
             "post_process_span",
             &format!(
-                r#""start_bit":{start_bit},"materialize_us":{materialize_us},"apply_window_us":{apply_us},"populate_subchunk_windows_us":{populate_us},"marker_bytes":{marker_bytes}"#,
+                r#""start_bit":{start_bit},"materialize_us":{materialize_us},"apply_window_us":{apply_us},"populate_subchunk_windows_us":{populate_us},"narrow_us":{narrow_us},"marker_bytes":{marker_bytes}"#,
             ),
         );
     }
     chunk
+}
+
+/// Narrow `src: &[u16]` into `dst: &mut U8`, appending bytes. All values
+/// in `src` MUST be < 256 (post-`apply_window` invariant). AVX2 path
+/// uses `_mm256_packus_epi16` for 16-lane parallel narrowing
+/// (saturating pack — since values are already < 256, saturation is
+/// a no-op). Scalar tail handles the remainder.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+fn narrow_u16_to_u8(src: &[u16], dst: &mut crate::decompress::parallel::rpmalloc_alloc::types::U8) {
+    dst.clear();
+    dst.reserve(src.len());
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: avx2 just detected at runtime.
+        unsafe {
+            narrow_u16_to_u8_avx2(src, dst);
+        }
+        return;
+    }
+    for &v in src {
+        dst.push(v as u8);
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+#[target_feature(enable = "avx2")]
+unsafe fn narrow_u16_to_u8_avx2(
+    src: &[u16],
+    dst: &mut crate::decompress::parallel::rpmalloc_alloc::types::U8,
+) {
+    use core::arch::x86_64::{
+        _mm256_loadu_si256, _mm256_packus_epi16, _mm256_permute4x64_epi64, _mm256_storeu_si256,
+    };
+
+    let n = src.len();
+    let mut i = 0usize;
+    // Each iteration consumes 32 u16s and produces 32 u8s.
+    let chunk = 32usize;
+    let simd_end = n & !(chunk - 1);
+    // Use raw pointers into dst's spare capacity to avoid per-push
+    // length checks. We bump len at the end.
+    let dst_ptr = dst.as_mut_ptr();
+    while i < simd_end {
+        // Load two 256-bit vectors (16 u16 each).
+        let a = _mm256_loadu_si256(src.as_ptr().add(i) as *const _);
+        let b = _mm256_loadu_si256(src.as_ptr().add(i + 16) as *const _);
+        // packus_epi16 packs across 128-bit lanes with saturation:
+        //   out = [low(a)_lo, low(b)_lo, high(a)_lo, high(b)_lo]
+        // (the 4 64-bit lanes are interleaved a/b within each 128-bit half).
+        let packed = _mm256_packus_epi16(a, b);
+        // Permute lanes to restore the natural order [a0..a15, b0..b15]:
+        //   0b11_01_10_00 == permute mask (0, 2, 1, 3)
+        let permuted = _mm256_permute4x64_epi64(packed, 0b11_01_10_00);
+        _mm256_storeu_si256(dst_ptr.add(i) as *mut _, permuted);
+        i += chunk;
+    }
+    // Scalar tail.
+    while i < n {
+        *dst_ptr.add(i) = *src.get_unchecked(i) as u8;
+        i += 1;
+    }
+    dst.set_len(n);
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+)))]
+fn narrow_u16_to_u8(src: &[u16], dst: &mut crate::decompress::parallel::rpmalloc_alloc::types::U8) {
+    dst.clear();
+    dst.reserve(src.len());
+    for &v in src {
+        dst.push(v as u8);
+    }
 }
 
 /// Consumer-thread publication of per-subchunk tail windows. Mirror of
@@ -1686,10 +1780,28 @@ fn drain_one_pending<W: std::io::Write>(
     publish_subchunk_windows(window_map, &chunk);
 
     // Mirror of vendor's per-chunk write loop (GzipChunkFetcher.hpp:333-342).
+    // The post-process worker pre-narrows `data_with_markers` into
+    // `chunk.narrowed` so the consumer thread does not pay the scalar
+    // u16→u8 cast loop (~24ms/3.3MiB chunk previously dominated wall
+    // time on real silesia). When the post-process step was skipped
+    // (chunks with no markers), `narrowed` is empty and there is
+    // nothing to write here — the clean tail comes through `chunk.data`
+    // below.
     let mut written_crc = CRC32Calculator::new();
-    if !chunk.data_with_markers.is_empty() {
-        let dwm_len = chunk.data_with_markers.len();
-        let mut narrowed: Vec<u8> = Vec::with_capacity(dwm_len);
+    if !chunk.narrowed.is_empty() {
+        written_crc.update(&chunk.narrowed);
+        writer
+            .write_all(&chunk.narrowed)
+            .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+        *total_size += chunk.narrowed.len();
+    } else if !chunk.data_with_markers.is_empty() {
+        // Defensive fallback when `apply_window` ran but the narrow
+        // step was somehow skipped — narrows scalar inline. Should
+        // not happen on the production path (post_process always
+        // runs narrow after apply_window). Keeps the consumer
+        // correctness invariant: all marker bytes written before
+        // `chunk.data`.
+        let mut narrowed: Vec<u8> = Vec::with_capacity(chunk.data_with_markers.len());
         for v in &chunk.data_with_markers {
             narrowed.push(*v as u8);
         }
