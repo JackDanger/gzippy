@@ -55,16 +55,82 @@ profile: gzippy spends ~40% of CPU in `asm_exc_page_fault +
 clear_page_erms`; rapidgzip spends ~17%. Largest expected win;
 independent of decoder tuning.
 
-Try in order:
-1. `Vec<T, RpmallocAlloc>` for chunk buffers (per-Vec, faithful to
-   vendor `FasterVector<u8, RpmallocAllocator>`). Lowest risk.
-2. `MADV_HUGEPAGE` on the output Vec.
-3. `#[global_allocator] = rpmalloc::RpMalloc`. Highest risk (prior
-   mimalloc/jemalloc tries regressed).
+**Already in the build (do NOT re-do):** `Cargo.toml:39,50-51` forces
+`arena-allocator`, which makes `ChunkData::data` / `data_with_markers`
+`Vec<_, RpmallocAlloc>` via `rpmalloc_alloc.rs:14-89`. The per-worker
+LIFO pool (`chunk_buffer_pool.rs:108-204`) recycles them via
+`chunk_data.rs:1079-1085` Drop. The bench being regressed at 4.04×
+WITH this in place means Phase A's remaining levers are below, not
+the rpmalloc-Vec switch.
 
-Bench gate: `make ship` parallel-SM throughput improves measurably on
-silesia. Re-measure the perf-profile flame-graph to confirm the
-page-fault CPU% comes down.
+**Step zero:** re-confirm the 40% page-fault CPU% on neurotic with the
+current build (see "Flame-graph" below). If it's already < 25%, Phase
+A is largely done; pivot to Phase B.
+
+**Try in order (decreasing safety):**
+
+1. **Worker-local pre-touch of pool buffers.** The consumer-thread
+   prewarm regressed −50% (`chunk_buffer_pool.rs:84-88`); worker-local
+   has not been tried. After `bind_worker_pool_index`
+   (`chunk_buffer_pool.rs:124`), iterate the pool and write a zero
+   to each pooled Vec's first byte per 4 KiB page. One fault per page
+   *once per worker*, not once per chunk.
+2. **`MADV_HUGEPAGE` on chunk buffers ≥ 2 MiB.** New code in
+   `rpmalloc_alloc.rs::types::u8_with_capacity`:
+   ```rust
+   #[cfg(target_os = "linux")]
+   if cap >= 2 * 1024 * 1024 {
+       unsafe {
+           libc::madvise(v.as_mut_ptr().cast(), v.capacity(),
+                         libc::MADV_HUGEPAGE);
+       }
+   }
+   ```
+3. **`#[global_allocator] = rpmalloc::RpMalloc`.** Highest risk
+   (`chunk_buffer_pool.rs:94-96` flags it "unproven"; prior
+   mimalloc/jemalloc tries regressed). Requires adding the `rpmalloc`
+   crate (not `rpmalloc-sys`) and a `static GLOBAL: RpMalloc =
+   RpMalloc;` in `main.rs`.
+
+**Exact commands** (run on neurotic over `ssh -J neurotic root@REDACTED_IP`):
+
+```bash
+# Build (pure-rust feature, release):
+cargo build --release --features pure-rust-inflate
+
+# Correctness gate (must stay green):
+cargo test --release --features pure-rust-inflate -- routing
+
+# Bench gate (the failing test today):
+cargo test --release --features pure-rust-inflate -- \
+  test_single_member_parallel_silesia_class_not_slower_than_sequential \
+  --ignored --nocapture
+
+# Inner-inflate bench (the 799 / 334 MB/s baseline):
+cargo bench --features isal-compression \
+  --bench inflate_isal_vs_pure_rust -- --nocapture
+```
+
+**Bench gate (pass/fail):**
+
+- `silesia_class_not_slower_than_sequential` ratio drops from baseline
+  4.04 to < 2.0 (test threshold is 0.5; intermediate Phase A wins
+  land between those numbers).
+- Flame-graph: `asm_exc_page_fault + clear_page_erms` total CPU%
+  drops by at least 10 absolute points (40% → ≤ 30%).
+- `TAKE_U8_HITS / (TAKE_U8_HITS + TAKE_U8_MISSES)` > 0.8 on iters 2-3
+  of the 3-iter warm-up.
+
+**Flame-graph capture (on neurotic):**
+
+```bash
+ssh -J neurotic root@REDACTED_IP
+cd ~/gzippy-dev
+cargo build --release --features pure-rust-inflate
+perf record -F 999 -g --call-graph dwarf -- \
+    ./target/release/gzippy -d -c benchmark_data/silesia-gzip.tar.gz > /dev/null
+perf script | inferno-flamegraph > /tmp/flame-pure-rust.svg
+```
 
 ### Phase B — SIMD inflate primitives on the resumable path
 
@@ -113,18 +179,19 @@ flavor.
 
 ### Phase D — Pipeline overlap
 
-Two rapidgzip doesn't fully exploit:
+One rapidgzip doesn't fully exploit, one already shipped:
 
 1. **CRC32 in flight with decode.** Hardware CLMUL CRC32 issues at
    ~1 byte/cycle. Today gzippy + rapidgzip compute CRC32 after the
    chunk decode completes. Interleaving CRC compute with literal/
    match emission hides it almost entirely.
 
-2. **`apply_window` on worker, not consumer.** `apply_window` resolves
-   cross-chunk back-references via `replace_markers`. Currently runs
-   on the consumer thread between chunks. Move it onto the worker as
-   a post-decode step so the consumer immediately accepts the next
-   chunk.
+2. **(DONE on this branch — verify before re-doing.)** `apply_window`
+   already runs on the worker via `run_post_process_task`
+   (`chunk_fetcher.rs:1405-1412`). What remains on the consumer is
+   `publish_subchunk_windows` — the WindowMap index write. Moving
+   that earlier is the remaining D opportunity if profiling shows
+   the consumer stalls on it.
 
 Bench gate: per-chunk wall time → not pipeline-stalled by serialized
 post-decode work.
@@ -169,6 +236,68 @@ Per the §5 retrospective:
    neurotic.
 4. **Monitor every long-running job.** 10-min health-check monitors
    for any `cargo bench` / neurotic ssh that might hang.
+
+## Troubleshooting
+
+### If Phase A doesn't move the bench number — first 3 things to check
+
+1. **`arena-allocator` actually on?** `cargo tree --features
+   pure-rust-inflate | grep rpmalloc-sys`. If missing, feature graph
+   broke.
+2. **Pool being hit?** Add `eprintln!` of `TAKE_U8_HITS` / `MISSES`
+   (`chunk_buffer_pool.rs:206-207`) at end of the silesia-class test.
+   Hit-rate < 50% on iters 2-3 means workers aren't returning buffers
+   — check `chunk_data.rs:1079-1085` Drop is firing.
+3. **Fixture re-compresses on every iter?** `routing.rs:651-657` builds
+   the compressed fixture inside the test fn. The 3-iter loop
+   (`routing.rs:666`) is decode-only, but if you moved any compression
+   into the loop you'd double-count.
+
+### If Phase B's SIMD primitives produce wrong output — first 3 things to check
+
+1. **Failure #2 status.** If
+   `with_until_bits_resume_non_byte_aligned_with_dict` is still red,
+   the subtable `total_bits` bug at `resumable.rs:812-818`
+   (`consume(TABLE_BITS=11)` then `consume_entry(subtable.raw())`) is
+   biasing every bit-position downstream. Fix first or the SIMD path
+   inherits the bug.
+2. **Stopping-point bookkeeping at literal clusters.**
+   `decode_huffman_cf_vector` (`consume_first_decode.rs:582+`) has no
+   yield mid-block; `decode_huffman_body_resumable` must check
+   `bit_position() >= encoded_until_bits` after every batched cluster,
+   not just every iteration of the outer loop.
+3. **`copy_match_windowed` window precondition.** The window-stitched
+   copy is per-byte; SIMD bulk replacement requires
+   `distance <= out_pos - window_head`. Off-by-one reads
+   uninitialized window bytes — the bug surfaces only on cross-chunk
+   boundaries (`cross_chunk_resume_silesia_gzip9_chunk0_handoff` would
+   re-red).
+
+### Verify isal-compression production path stays green after any pure-rust change
+
+```bash
+# Local (30s):
+cargo test --release --features isal-compression -- routing
+
+# Authoritative (neurotic):
+ssh -J neurotic root@REDACTED_IP \
+  'cd ~/gzippy-dev && cargo test --release --features isal-compression -- \
+     test_single_member_parallel_silesia_class_not_slower_than_sequential \
+     --ignored --nocapture'
+# Ratio must stay < 0.5 on the 16-core homelab box.
+```
+
+### Confidence ratings (calibrated post-advisor-audit)
+
+| Target | Confidence | Notes |
+|---|---|---|
+| Phase A diagnosis | MEDIUM-HIGH | 40%/17% number from one-off flame-graph; re-measure first |
+| Phase A fix-on-first-try | LOW-MEDIUM | Vec<T,RpmallocAlloc> already shipped; real fix is MADV_HUGEPAGE or global rpmalloc — both flagged "unproven" |
+| Phase B reaches Tier 2 (1.2× ISA-L) | MEDIUM | Integration risk: `decode_huffman_body_resumable` has stopping-point bookkeeping that `decode_huffman_cf_vector` lacks |
+| Phase B reaches Tier 3 (1.05× ISA-L; delete ISA-L submodule) | LOW-MEDIUM | Requires breadth-of-tree deletion |
+| Phase C / D | MEDIUM (C) / MEDIUM-LOW (D — half already done) | |
+| Phase E | MEDIUM-LOW | |
+| Phase F | LOW | Most relevant on > 500 MiB files |
 
 ## Known issues to clean up while we're here (orthogonal to perf)
 

@@ -41,7 +41,7 @@ Cfg gates live in `src/decompress/parallel/sm_cfg.rs`:
 | B2 Bootstrap without C                  | ✅     | `deflate_block.rs` canonical path when `!USE_ISAL_INFLATE`; §3 cached-Huffman bootstrap exercises end-to-end           |
 | B3 Pure-Rust wrapper body               | ✅     | `inflate_wrapper.rs` pure backend uses `ResumableInflate2`; all 33 pure-rust-inflate routing tests green on neurotic   |
 | B3a Block scratch sizing                | —      | Obsoleted by §5: `ResumableInflate2` writes directly into caller's output with a 32 KiB sliding window. No per-block scratch exists. B3a band-aid (commit 2eff70f) deleted in §5 step 6. |
-| B4 Throughput bench                     | ✅     | `benches/inflate_isal_vs_pure_rust.rs` + inline `test_isal_vs_pure_rust_silesia_throughput`                            |
+| B4 Throughput bench                     | ✅     | `benches/inflate_isal_vs_pure_rust.rs` (the inline `test_isal_vs_pure_rust_silesia_throughput` mentioned in earlier drafts was never landed — the bench harness alone is the gate) |
 
 
 ### Track A — Infrastructure ✅ (perf gates deferred)
@@ -188,7 +188,7 @@ path. Window is updated after each `read_stream` from the trailing
   `backends/isal_compress.rs` (L0-L3 fast compress; out of port scope),
   and any other ISA-L call site.
 
-**Implementation order**:
+**Implementation order (completed; retained for history)**:
 
 1. Scaffold `resumable.rs` + `resumable_decoders.rs` with stubs returning
    `Err(NotImplemented)`. Wire `inflate_wrapper.rs` behind a
@@ -204,41 +204,77 @@ path. Window is updated after each `read_stream` from the trailing
 
 ## Beyond parity — path to exceed rapidgzip
 
-Once §5 ships (parity within ~5%), the throughput-exceed path is six
-phases, each gated by `make ship` on neurotic and abandoned if its
-measurement doesn't beat the prior:
+§5 ships (parity); the throughput-exceed path is six phases, each
+gated by `make ship` on neurotic. **Order**: fix failure #2 → Phase A →
+Phase B → rest as measurements dictate. Failure #2
+(`with_until_bits_resume_non_byte_aligned_with_dict`) is suspected
+subtable `total_bits` accounting at `resumable.rs:812-818` — **must
+land before Phase B** (Phase A is decoder-independent and safe to land
+first).
 
 - **Phase A — Close the page-fault gap.** `chunk_buffer_pool.rs:73-82`
-  notes gzippy spends ~40% of CPU in `asm_exc_page_fault`/`clear_page_erms`
-  vs rapidgzip's ~17%. Try (in order): `Vec<T, RpmallocAlloc>` for chunk
-  buffers (per-Vec, faithful to vendor `FasterVector<u8, RpmallocAllocator>`),
-  then `MADV_HUGEPAGE` on output, then `#[global_allocator] = RpMalloc`.
+  notes gzippy spends ~40% of CPU in
+  `asm_exc_page_fault`/`clear_page_erms` vs rapidgzip's ~17%.
+  **Already in the build (do NOT re-do):** `Cargo.toml:39,50-51`
+  forces `arena-allocator`, which makes
+  `ChunkData::data`/`data_with_markers` `Vec<_, RpmallocAlloc>` via
+  `rpmalloc_alloc.rs:14-89`. The fact that the bench is regressed at
+  4.04× WITH this in place means Phase A's remaining levers are below,
+  not the rpmalloc-Vec switch.
+
+  **Step zero:** re-confirm the 40% page-fault CPU% on neurotic with
+  the current build (see Troubleshooting → flame-graph). If it's
+  already < 25%, Phase A is largely done; pivot to Phase B.
+
+  **Try in order (decreasing safety):**
+    1. **Worker-local pre-touch of pool buffers.** The
+       consumer-thread prewarm regressed −50%
+       (`chunk_buffer_pool.rs:84-88`); worker-local has not been
+       tried. After `bind_worker_pool_index`
+       (`chunk_buffer_pool.rs:124`), write a zero to each pooled
+       Vec's first byte per 4 KiB page.
+    2. `MADV_HUGEPAGE` on chunk buffers ≥ 2 MiB. New code in
+       `rpmalloc_alloc.rs::types::u8_with_capacity` or
+       `chunk_buffer_pool.rs::take_u8`.
+    3. `#[global_allocator] = rpmalloc::RpMalloc`. Highest risk
+       (`chunk_buffer_pool.rs:94-96` flags it "unproven"; prior
+       mimalloc/jemalloc tries regressed).
+
   Largest expected win; independent of §5.
-- **Phase B — Bring gzippy's SIMD inflate primitives to the parallel-SM
-  resumable path.** `vector_huffman`, `simd_huffman`, `two_level_table`,
-  `packed_lut`, `combined_lut`, `bmi2` already ship for BGZF and
-  sequential decompress; extend `decode_*_resumable` to dispatch through
-  them. This is where pure-Rust beats ISA-L's general inflate on the
-  code-length distributions gzip(1) produces.
+- **Phase B — Bring gzippy's SIMD inflate primitives to the
+  parallel-SM resumable path.** `vector_huffman`, `simd_huffman`,
+  `two_level_table`, `packed_lut`, `combined_lut`, `bmi2` already
+  ship for BGZF and sequential decompress (used by
+  `decode_huffman_cf_vector` at `consume_first_decode.rs:571+`);
+  extend `decode_huffman_body_resumable` (`resumable.rs:793-852`) to
+  dispatch literal-batch and match-copy through them. **Pre-req:
+  failure #2 fixed.** This is where pure-Rust beats ISA-L's general
+  inflate on the code-length distributions gzip(1) produces.
 - **Phase C — Architecture-specific dispatch.** `target_feature` +
-  CPUID runtime dispatch (`multiversion` crate). AVX2 + AVX-512 + NEON
-  variants of `decode_*_resumable`'s inner loops. Bench each ISA flavor
-  against ISA-L's equivalent.
+  CPUID runtime dispatch (`multiversion` crate). AVX2 + AVX-512 +
+  NEON variants of `decode_*_resumable`'s inner loops. Bench each ISA
+  flavor against ISA-L's equivalent. **Cross-cutting note**: lifting
+  the arm64 gate requires undoing arch gates on every parallel-SM
+  module (`chunk_buffer_pool.rs:1-4`, `rpmalloc_alloc.rs:1-4`, etc.),
+  not just `sm_cfg.rs`.
 - **Phase D — Pipeline overlap.** (1) CRC32 via hardware CLMUL
   interleaved with decode; today computed per-chunk after decode
-  completes. (2) Move `apply_window` from consumer thread to worker as
-  post-decode step.
-- **Phase E — Speculation depth + SIMD BlockFinder.** `RawBlockFinderCoordinator`'s
-  scan loop replaced by 4-byte SIMD pattern match on block-header
-  candidates. Speculate two-three boundaries ahead per worker instead
-  of one.
+  completes. (2) **NOTE: `apply_window` already runs on the worker**
+  via `run_post_process_task` (`chunk_fetcher.rs:1405-1412`). What
+  remains on the consumer is `publish_subchunk_windows` — the
+  WindowMap index write. Moving that earlier is the remaining D
+  opportunity *if* profiling shows the consumer stalls on it.
+- **Phase E — Speculation depth + SIMD BlockFinder.**
+  `RawBlockFinderCoordinator`'s scan loop replaced by 4-byte SIMD
+  pattern match on block-header candidates. Speculate two-three
+  boundaries ahead per worker instead of one.
 - **Phase F — Memory bandwidth.** Non-temporal stores for outputs
   >500 MiB. NUMA-aware worker pinning. `MADV_POPULATE_WRITE` on
   output. Marginal individually, multiplicative with A-E.
 
-Each phase is its own branch + PR with its own neurotic bench measurement.
-Don't pre-commit to all six; abandon any that doesn't beat its prior
-measurement.
+Each phase is its own branch + PR with its own neurotic bench
+measurement. Don't pre-commit to all six; abandon any that doesn't
+beat its prior measurement.
 
 ## Out of scope (Tier 3 / separate projects)
 
@@ -250,6 +286,69 @@ measurement.
 ## Reading order
 
 - `single_member.rs` — entry, `MARKER_PIPELINE_RUNS` deletion trap
-- `chunk_fetcher.rs:257 drive` → consumer_loop → submit_decode_to_pool
+- `chunk_fetcher.rs:350 drive` → consumer_loop → submit_decode_to_pool
 - Vendor `GzipChunkFetcher.hpp:312 processNextChunk` side-by-side with Rust
+
+## Troubleshooting (Beyond parity work)
+
+### If Phase A doesn't move the bench number — first 3 things to check
+
+1. **Is `arena-allocator` actually on?** `cargo tree --features
+   pure-rust-inflate | grep rpmalloc-sys` must list it. If missing,
+   the feature graph broke.
+2. **Is the pool being hit?** Add `eprintln!` of `TAKE_U8_HITS` /
+   `MISSES` (`chunk_buffer_pool.rs:206-207`) at end of
+   `test_single_member_parallel_silesia_class_not_slower_than_sequential`.
+   Hit-rate < 50% on iters 2-3 means workers aren't returning buffers
+   — check `chunk_data.rs:1079-1085` Drop is firing.
+3. **Is the silesia-class fixture re-compressing on every iter?** The
+   test (`routing.rs:639+`) loops 3× and the fixture build runs each
+   time the test starts. Check the bench is measuring decode only.
+
+### If Phase B's SIMD primitives produce wrong output — first 3 things to check
+
+1. **Failure #2 status.** If
+   `with_until_bits_resume_non_byte_aligned_with_dict` is still red,
+   the subtable `total_bits` bug at `resumable.rs:812-818`
+   (`consume(TABLE_BITS=11)` then `consume_entry(subtable.raw())`) is
+   biasing every bit-position downstream. Fix first or the SIMD path
+   inherits the bug.
+2. **Stopping-point bookkeeping at literal clusters.**
+   `decode_huffman_cf_vector` (`consume_first_decode.rs:582+`) has no
+   yield mid-block; `decode_huffman_body_resumable`
+   (`resumable.rs:800+`) must check `bit_position() >=
+   encoded_until_bits` after every batched cluster, not every
+   literal.
+3. **`copy_match_windowed` window precondition.** The window-stitched
+   copy at `resumable.rs::copy_match_windowed` is per-byte. SIMD bulk
+   replacement requires `distance <= out_pos - window_head`.
+   Off-by-one reads uninitialized window bytes — the bug surfaces
+   only on cross-chunk boundaries
+   (`cross_chunk_resume_silesia_gzip9_chunk0_handoff` would re-red).
+
+### How to capture a flame-graph on neurotic
+
+```bash
+ssh -J neurotic root@REDACTED_IP
+cd ~/gzippy-dev   # the worktree the bench job uses
+cargo build --release --features pure-rust-inflate
+perf record -F 999 -g --call-graph dwarf -- \
+    ./target/release/gzippy -d -c benchmark_data/silesia-gzip.tar.gz > /dev/null
+perf script | inferno-flamegraph > /tmp/flame-pure-rust.svg
+# Target: asm_exc_page_fault + clear_page_erms < 25% combined CPU
+```
+
+### How to verify isal-compression production path stays green after any pure-rust change
+
+```bash
+# Local (30s):
+cargo test --release --features isal-compression -- routing
+
+# Authoritative (neurotic):
+ssh -J neurotic root@REDACTED_IP \
+  'cd ~/gzippy-dev && cargo test --release --features isal-compression -- \
+     test_single_member_parallel_silesia_class_not_slower_than_sequential \
+     --ignored --nocapture'
+# Ratio must stay < 0.5 on the 16-core homelab box.
+```
 
