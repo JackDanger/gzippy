@@ -1123,6 +1123,55 @@ mod tests {
         assert_eq!(out, reference);
     }
 
+    /// Same as above but with 128 KiB read buffers like `decode_chunk_isal`.
+    #[test]
+    fn full_stream_stopping_points_128k_buffers_matches_flate2() {
+        const BUF: usize = 128 * 1024;
+        let payload = b"abcdefghij".repeat(200_000);
+        let deflate = make_deflate(&payload);
+        let read_cap = deflate.len() * 8;
+
+        let mut wrapper = IsalInflateWrapper::with_until_bits(&deflate, 0, read_cap).expect("init");
+        wrapper.set_window(&[]).expect("set_window");
+        wrapper.set_stopping_points(
+            StoppingPoints::END_OF_BLOCK
+                | StoppingPoints::END_OF_BLOCK_HEADER
+                | StoppingPoints::END_OF_STREAM_HEADER
+                | StoppingPoints::END_OF_STREAM,
+        );
+
+        let mut out = vec![0u8; payload.len() + 1024];
+        let mut total = 0usize;
+        let mut finished = false;
+        while total < out.len() && !finished {
+            let end = (total + BUF).min(out.len());
+            let r = wrapper.read_stream(&mut out[total..end]).expect("read");
+            total += r.bytes_written;
+            finished = r.finished;
+            if r.bytes_written == 0 && r.stopped_at == StoppingPoints::NONE && !r.finished {
+                break;
+            }
+        }
+        out.truncate(total);
+
+        let reference = {
+            let mut d = flate2::Decompress::new(false);
+            let mut ref_out = vec![0u8; payload.len()];
+            d.decompress(&deflate, &mut ref_out, flate2::FlushDecompress::Finish)
+                .expect("flate2");
+            ref_out.truncate(d.total_out() as usize);
+            ref_out
+        };
+        assert_eq!(
+            out.len(),
+            reference.len(),
+            "128k-buffer decode len {} vs {}",
+            out.len(),
+            reference.len()
+        );
+        assert_eq!(out, reference);
+    }
+
     /// Cross-chunk resume: decode to a non-byte-aligned boundary, take the
     /// last 32 KiB as dict, resume with `with_until_bits` + `set_window`.
     #[test]
