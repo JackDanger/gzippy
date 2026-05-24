@@ -812,7 +812,8 @@ fn decode_huffman_body_resumable(
         let prev = BODY_RESUMABLE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
         if prev <= 3 {
             eprintln!(
-                "[trace] decode_huffman_body_resumable call #{prev} out_pos={out_pos} output.len={} bit_pos={} encoded_until_bits={}",
+                "[trace] decode_huffman_body_resumable call #{prev} addr={:p} out_pos={out_pos} output.len={} bit_pos={} encoded_until_bits={}",
+                &BODY_RESUMABLE_CALLS,
                 output.len(),
                 state.bits.bit_position(),
                 state.encoded_until_bits
