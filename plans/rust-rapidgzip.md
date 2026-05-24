@@ -40,6 +40,7 @@ Cfg gates live in `src/decompress/parallel/sm_cfg.rs`:
 | B1 ResumableInflate + 4 stopping points | ✅             | `consume_first_decode.rs`; differential oracle in `inflate_wrapper.rs`; `test_resumable_end_of_stream_header_after_reset` |
 | B2 Bootstrap without C                  | ✅ (§3 bypass) | `deflate_block.rs` canonical path when `!USE_ISAL_INFLATE`; no LUT entry-for-entry test (§3 is end-to-end equivalent)     |
 | B3 Pure-Rust wrapper body               | ✅             | `inflate_wrapper.rs` pure backend; `test_pure_rust_parallel_sm_e2e` (pure-rust-inflate only)                              |
+| B3a Block scratch sizing                | ✅             | `consume_first_decode.rs:3174` — session = `decode_start + max_new + PER_BLOCK_HEADROOM` so one block can overflow caller buffer by up to PER_BLOCK_HEADROOM, surplus drains on next `read_stream` (matches ISA-L tmp_out) |
 | B4 Throughput bench                     | ✅             | `benches/inflate_isal_vs_pure_rust.rs` + inline `test_isal_vs_pure_rust_silesia_throughput`                               |
 
 
@@ -82,6 +83,17 @@ cargo test --release --features isal-compression -- \
 cargo bench --release --features isal-compression -- \
   --bench inflate_isal_vs_pure_rust -- --nocapture
 ```
+
+Three pure-rust-inflate routing tests known to fail before the B3a
+headroom fix (commit 2eff70f); re-verify against HEAD on neurotic:
+
+- `test_marker_pipeline_runs_on_btype01_heavy_input` — directly fixed
+  by B3a (match overflow on chunk_size+window boundary).
+- `test_prefetch_next_filesize_accept_fires` — likely downstream
+  (decode aborted before reaching last-chunk prefetch); re-test.
+- `test_coordinator_boundary_search_runs_on_x86_64_isal` — name is
+  historical (gated for both backends since pure-rust-inflate landed);
+  re-test, and rename to drop the `_isal` suffix once it stays green.
 
 ## Out of scope (Tier 3 / separate projects)
 
