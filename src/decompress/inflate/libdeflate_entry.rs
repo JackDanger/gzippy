@@ -346,7 +346,7 @@ impl LitLenTable {
     /// that previously hit the subtable. 12-bit table = 16 KB, still
     /// fits in 48 KB L1d on Raptor Lake. rapidgzip uses larger main
     /// tables for the same reason (vendor's HuffmanCoding* variants).
-    pub const TABLE_BITS: u8 = 13;
+    pub const TABLE_BITS: u8 = 12;
     /// Maximum number of subtable bits for codes longer than TABLE_BITS
     pub const MAX_SUBTABLE_BITS: u8 = 15 - Self::TABLE_BITS;
 
