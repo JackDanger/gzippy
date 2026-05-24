@@ -1454,8 +1454,17 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
 fn narrow_u16_to_u8(src: &[u16], dst: &mut crate::decompress::parallel::rpmalloc_alloc::types::U8) {
     dst.clear();
     dst.reserve(src.len());
+    // AVX2 path disabled pending diagnostic: it produced a per-task
+    // perf regression on neurotic (apply_window+populate were 3×
+    // higher in the same trace) despite the AVX2 routine itself
+    // being byte-correct (test_single_member_routing_multithread
+    // passes). Suspected: AVX2 license keeps the post-process worker
+    // downclocked through apply_window's SIMD too. Re-enable behind
+    // GZIPPY_NARROW_AVX2 env once isolated.
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
+    if std::env::var_os("GZIPPY_NARROW_AVX2").is_some()
+        && std::arch::is_x86_feature_detected!("avx2")
+    {
         // SAFETY: avx2 just detected at runtime.
         unsafe {
             narrow_u16_to_u8_avx2(src, dst);
