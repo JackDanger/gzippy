@@ -178,6 +178,14 @@ What does NOT move wall:
 | `41076a0` | Worker-side **scalar** narrow only | **kept** — silesia 998→881 ms (12% wall improvement) |
 | `ca52389` | Multi-literal FASTLOOP in `decode_huffman_body_resumable` mirroring `decode_huffman_cf_vector` | regressed bench 334→284 MB/s, silesia 2.79→3.06 — reverted in `d08732f` |
 | `d08732f` | Revert multi-literal fastloop | back to 323 MB/s bench, 2.72× silesia |
+| `ee05316` | LitLenTable::TABLE_BITS 11 → 12 (16 KB main table) | **kept** — silesia 895→863 ms, ratio 2.72→2.60 (4% wall) |
+| `1bda635` | LitLenTable::TABLE_BITS 12 → 13 (32 KB main table) | regressed bench 322→309, silesia 2.60→2.76 — reverted in `b61b970` |
+| `9a34f32` | DistTable::TABLE_BITS 8 → 9 (512 entries) | **kept** — silesia 863→809 ms, ratio 2.60→2.41 (6% wall) |
+| `160b8c6` | DistTable::TABLE_BITS 9 → 10 (1024 entries) | regressed silesia 2.41→2.85 — reverted in `6e1e322` |
+
+**Cumulative session wins**: silesia E2E ratio **2.76 → 2.41** (wall **998 → 809 ms**, 19% reduction). Inner-inflate bench still at 318-322 MB/s (~unchanged) — the table-size wins are NOT per-symbol throughput; they reduce subtable lookups for common codes, which shows up in real-data E2E but not in the bench's whole-stream rate.
+
+The remaining 2.41× gap to gate-2's < 0.5 target is the per-chunk decode rate (322 MB/s pure-Rust vs 779 MB/s ISA-L). To close it requires real algorithmic changes — multi-symbol packed table (vendor's TRIPLE_SYM pattern, already in `HuffmanCodingShortBitsMultiCached` used by bootstrap), BMI2 pext, or libdeflate-specific tricks. The 4-candidate plan stays; A (BMI2) and D (libdeflate scalar) are now next.
 
 **Why the multi-literal fastloop regressed**: `vector_huffman::decode_multi_literals` (4-symbol lookahead) wins when literal clusters are common in the data. Silesia is binary/mixed-content (tar of various corpus files); short literal runs are interrupted by length codes, so the lookahead returns `count=0` on most calls and the per-iteration overhead isn't recovered. The advisor's hypothesis #4 (low hit rate on length-heavy data) was correct.
 
