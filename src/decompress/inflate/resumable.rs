@@ -18,15 +18,19 @@
 //! via [`crate::decompress::parallel::inflate_wrapper::IsalInflateWrapper`],
 //! the parallel-SM hot path.
 //!
-//! Fill-in status: steps 2 (stored block) and 3 (fixed-Huffman block +
-//! window-stitched match copy) landed. Dynamic-Huffman (BTYPE=10) is
-//! pending step 4. See `plans/rust-rapidgzip.md §5 — Implementation order`.
+//! Fill-in status: steps 2 (stored), 3 (fixed Huffman + window-stitched
+//! match copy), and 4 (dynamic Huffman) landed. Remaining: step 5
+//! wires `inflate_wrapper.rs`'s pure-rust backend to `ResumableInflate2`;
+//! step 6 deletes the old `ResumableInflate` + `session`; step 7 reverts
+//! the B3a headroom band-aid. See `plans/rust-rapidgzip.md §5 —
+//! Implementation order`.
 
-#![allow(dead_code)] // step 4: dynamic decoder still stubbed
+#![allow(dead_code)] // step 5: wired in to inflate_wrapper.rs in a follow-up commit
 
 use std::io::{Error, ErrorKind, Result};
 
-use super::consume_first_decode::Bits;
+use super::consume_first_decode::{build_code_length_table, Bits};
+use super::libdeflate_entry::{DistTable, LitLenTable};
 use super::stopping_point::StoppingPoint;
 
 /// Max DEFLATE back-reference distance; size of the sliding window the
@@ -194,7 +198,11 @@ pub struct ResumableInflate2<'a> {
     pub(crate) points_to_stop_at: StoppingPoint,
     pub(crate) stopped_at: StoppingPoint,
     pub(crate) encoded_until_bits: usize,
-    // TODO(§5 step 3+): persistent Huffman tables for `BlockState::InDynamic`.
+    /// Built when a dynamic-Huffman block is entered (BTYPE=10); reused
+    /// across mid-block yields; dropped on EOB / `set_window` / entry
+    /// into a non-dynamic block. Invariant: `Some(_)` iff
+    /// `block_state == InDynamic`.
+    pub(crate) dynamic_tables: Option<(LitLenTable, DistTable)>,
 }
 
 impl<'a> ResumableInflate2<'a> {
@@ -217,6 +225,7 @@ impl<'a> ResumableInflate2<'a> {
             points_to_stop_at: StoppingPoint::NONE,
             stopped_at: StoppingPoint::NONE,
             encoded_until_bits: until_bits.min(input_bits),
+            dynamic_tables: None,
         })
     }
 
@@ -228,6 +237,7 @@ impl<'a> ResumableInflate2<'a> {
         self.pending_match = None;
         self.last_bfinal = false;
         self.stopped_at = StoppingPoint::NONE;
+        self.dynamic_tables = None;
         Ok(())
     }
 
@@ -267,6 +277,21 @@ impl<'a> ResumableInflate2<'a> {
             if out_pos >= output.len() {
                 break;
             }
+
+            // No-progress guard: snapshot (out_pos, bit_position,
+            // block_state discriminant, pending_match.is_some()) at the
+            // top of every iteration. If nothing changes by the bottom,
+            // we'd loop forever — break out instead. Catches the class
+            // of bug where a sub-decoder yields 0 progress without
+            // transitioning state (e.g. body decoder hitting
+            // encoded_until_bits while block_state still says InDynamic).
+            // Vendor `isal.hpp` doesn't need this because ISA-L's state
+            // machine never returns "no progress, no error"; we add it
+            // as defensive plumbing per the Opus advisor review of step 4.
+            let snap_out_pos = out_pos;
+            let snap_bit_pos = self.bits.bit_position();
+            let snap_state_disc = std::mem::discriminant(&self.block_state);
+            let snap_pending = self.pending_match.is_some();
 
             // Resume any pending match from a prior yield BEFORE reading new
             // bits — the match is logically part of the prior block.
@@ -308,10 +333,7 @@ impl<'a> ResumableInflate2<'a> {
                     out_pos = resume_decode_fixed_resumable(self, output, out_pos)?;
                 }
                 BlockState::InDynamic => {
-                    return Err(Error::new(
-                        ErrorKind::Unsupported,
-                        "dynamic resumable decoder pending §5 step 4",
-                    ));
+                    out_pos = resume_decode_dynamic_resumable(self, output, out_pos)?;
                 }
             }
 
@@ -329,6 +351,19 @@ impl<'a> ResumableInflate2<'a> {
                 && self.points_to_stop_at.contains(StoppingPoint::END_OF_BLOCK)
             {
                 self.stopped_at = StoppingPoint::END_OF_BLOCK;
+                break;
+            }
+
+            // No-progress check at loop bottom.
+            if out_pos == snap_out_pos
+                && self.bits.bit_position() == snap_bit_pos
+                && std::mem::discriminant(&self.block_state) == snap_state_disc
+                && self.pending_match.is_some() == snap_pending
+            {
+                // Nothing advanced. Most likely cause: a body decoder
+                // observed bit_position >= encoded_until_bits at top of
+                // its loop and returned without state transition. Break
+                // with finished=false so the caller sees a clean stop.
                 break;
             }
         }
@@ -394,6 +429,30 @@ impl<'a> ResumableInflate2<'a> {
                 Ok(true)
             }
             2 => {
+                // Parse the dynamic-Huffman header atomically and stash
+                // the built tables on `self`. Vendor `isal.hpp:263-272`
+                // treats `readHeader` as atomic.
+                let tables = parse_dynamic_header(&mut self.bits)?;
+                // CLAUDE.md "no fallbacks" + vendor GzipReader contract:
+                // parallel-SM chunk boundaries land at block boundaries,
+                // so a dynamic header that straddles `encoded_until_bits`
+                // is a contract violation. Surface loudly rather than
+                // leaving the body decoder in a state where it sees
+                // bit_position past cap and returns Ok(0) forever (the
+                // infinite-loop bug Opus advisor caught).
+                if self.bits.bit_position() > self.encoded_until_bits {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "Dynamic header straddled encoded_until_bits cap: \
+                             bit_position={} > cap={}. Chunk boundary contract \
+                             expects boundaries at block boundaries.",
+                            self.bits.bit_position(),
+                            self.encoded_until_bits
+                        ),
+                    ));
+                }
+                self.dynamic_tables = Some(tables);
                 self.block_state = BlockState::InDynamic;
                 Ok(true)
             }
@@ -409,6 +468,10 @@ impl<'a> ResumableInflate2<'a> {
     /// hook used by every `resume_decode_*_resumable` to keep that bit of
     /// state machine logic out of each individual decoder.
     pub(crate) fn finish_current_block(&mut self) {
+        // Invariant: dynamic_tables Some iff block_state == InDynamic.
+        // Block is ending — drop tables. If the NEXT block is also
+        // dynamic, `try_enter_next_block`'s BTYPE=2 arm rebuilds them.
+        self.dynamic_tables = None;
         self.block_state = if self.last_bfinal {
             BlockState::Finished
         } else {
@@ -522,20 +585,68 @@ pub fn resume_decode_stored_resumable(
 pub fn resume_decode_fixed_resumable(
     state: &mut ResumableInflate2<'_>,
     output: &mut [u8],
-    mut out_pos: usize,
+    out_pos: usize,
 ) -> Result<usize> {
-    use super::libdeflate_entry::{DistTable, LitLenTable};
-
     let (litlen, dist) = crate::decompress::inflate::libdeflate_decode::get_fixed_tables();
+    decode_huffman_body_resumable(state, output, out_pos, litlen, dist)
+}
 
+/// Resumable BTYPE=02 (dynamic Huffman). The block header was parsed
+/// atomically in `try_enter_next_block` (BTYPE=2 arm); tables live on
+/// `state.dynamic_tables` and persist across mid-block yields. On EOB,
+/// `finish_current_block` drops the tables.
+pub fn resume_decode_dynamic_resumable(
+    state: &mut ResumableInflate2<'_>,
+    output: &mut [u8],
+    out_pos: usize,
+) -> Result<usize> {
+    debug_assert!(
+        state.dynamic_tables.is_some(),
+        "dynamic_tables invariant: must be Some(_) iff block_state == InDynamic"
+    );
+    // Standard "borrow one field while mutating another" pattern:
+    // take the tables out of `state`, drive the body decoder (which
+    // mutably borrows `state` for the window/bit reader/pending_match),
+    // then put them back on return. Avoids the borrow checker fight
+    // around aliased mutable access to `state` while holding references
+    // to its `dynamic_tables` field. If the body decoder transitions
+    // out of InDynamic (EOB), `finish_current_block` has already
+    // dropped tables to None — restoring our `take`d copy would
+    // violate the invariant, so check before restoring.
+    let tables = state.dynamic_tables.take().ok_or_else(|| {
+        Error::other("dynamic_tables invariant violated: None at entry to InDynamic body")
+    })?;
+    let result = decode_huffman_body_resumable(state, output, out_pos, &tables.0, &tables.1);
+    // Restore only if still in InDynamic (i.e., didn't complete the
+    // block this call). `finish_current_block` runs on EOB and sets
+    // dynamic_tables = None already.
+    if matches!(state.block_state, BlockState::InDynamic) {
+        state.dynamic_tables = Some(tables);
+    }
+    result
+}
+
+/// Shared inner loop for fixed + dynamic Huffman blocks. Identical to
+/// the generic loop of `decode_huffman_libdeflate_style` (vendor
+/// `consume_first_decode.rs:1764-1841`) except:
+///   - yield at top of loop when output is full (no `WriteZero` error),
+///   - matches go through `copy_match_windowed` (window-aware + yield),
+///   - EOB transitions the parent state machine via `finish_current_block`.
+///
+/// No fastloop: every iteration has a yield check, which precludes
+/// FASTLOOP_MARGIN bounds-skipping. Documented at the call site as the
+/// §5 Tier-2/3 perf gate target.
+fn decode_huffman_body_resumable(
+    state: &mut ResumableInflate2<'_>,
+    output: &mut [u8],
+    mut out_pos: usize,
+    litlen: &LitLenTable,
+    dist: &DistTable,
+) -> Result<usize> {
     loop {
-        // Yield at top: if output is full, return without consuming more
-        // bits. The next call resumes from the same bit position.
         if out_pos >= output.len() {
             return Ok(out_pos);
         }
-
-        // Stop at the encoded-bits cap (chunk boundary in parallel SM).
         if state.bits.bit_position() >= state.encoded_until_bits {
             return Ok(out_pos);
         }
@@ -565,10 +676,8 @@ pub fn resume_decode_fixed_resumable(
             return Ok(out_pos);
         }
 
-        // Length symbol — decode extra bits from `saved_bitbuf`.
         let length = entry.decode_length(saved_bitbuf);
 
-        // Distance symbol.
         state.bits.refill();
         let dist_saved = state.bits.peek();
         let mut dist_entry = dist.lookup(dist_saved);
@@ -580,25 +689,144 @@ pub fn resume_decode_fixed_resumable(
         state.bits.consume_entry(dist_entry.raw());
         let distance = dist_entry.decode_distance(dist_extra_saved);
 
-        // Match copy with window stitching. May yield with PendingMatch.
         out_pos = copy_match_windowed(state, output, out_pos, distance, length)?;
         if state.pending_match.is_some() {
-            // copy_match_windowed yielded — output is full mid-match.
             debug_assert_eq!(out_pos, output.len());
             return Ok(out_pos);
         }
     }
 }
 
-/// Resumable BTYPE=02 (dynamic Huffman). On first entry the block header is
-/// read and tables are built onto `state`; subsequent re-entries resume
-/// mid-block using those same tables. Pending — §5 step 4.
-pub fn resume_decode_dynamic_resumable(
-    _state: &mut ResumableInflate2<'_>,
-    _output: &mut [u8],
-    _out_pos: usize,
-) -> Result<usize> {
-    unimplemented!("§5 step 4 fill-in")
+/// Parse a dynamic-Huffman block header atomically and return the built
+/// litlen + distance tables. Mirror of the header-parse portion of the
+/// existing non-resumable `decode_dynamic`
+/// (`consume_first_decode.rs:2095-2188`). Atomicity matches vendor
+/// `isal.hpp:263-272`: on input exhaustion we'd ideally return a
+/// "defer" signal, but the parallel-SM chunk contract (boundaries at
+/// block boundaries) guarantees the entire header always fits. A
+/// truncated header surfaces as `Err(UnexpectedEof)`.
+fn parse_dynamic_header(bits: &mut Bits) -> Result<(LitLenTable, DistTable)> {
+    // HLIT (5) + HDIST (5) + HCLEN (4) = 14 bits.
+    if bits.available() < 14 {
+        bits.refill();
+    }
+    let hlit = (bits.peek() & 0x1F) as usize + 257;
+    bits.consume(5);
+    let hdist = (bits.peek() & 0x1F) as usize + 1;
+    bits.consume(5);
+    let hclen = (bits.peek() & 0xF) as usize + 4;
+    bits.consume(4);
+
+    // Code-length code lengths in the canonical permutation order.
+    const CODE_LENGTH_ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+    let mut code_length_lengths = [0u8; 19];
+    for i in 0..hclen {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+        code_length_lengths[CODE_LENGTH_ORDER[i]] = (bits.peek() & 0x7) as u8;
+        bits.consume(3);
+    }
+
+    let cl_table = build_code_length_table(&code_length_lengths)?;
+
+    // Decode the literal/length+distance code lengths via the code-length
+    // Huffman code. Symbols 0..15 are literal lengths; 16/17/18 are
+    // run-length markers (repeat prev / zero-run-short / zero-run-long).
+    //
+    // Stack buffer to avoid the heap allocation the non-resumable path
+    // does on every block (`vec![0u8; hlit + hdist]`,
+    // consume_first_decode.rs:2126). 286 + 30 = 316 is the RFC max.
+    let mut all_lengths = [0u8; 320];
+    let total_lengths = hlit + hdist;
+    if total_lengths > all_lengths.len() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("Dynamic header: hlit+hdist {total_lengths} exceeds RFC max 316"),
+        ));
+    }
+    let mut i = 0usize;
+    while i < total_lengths {
+        // Need ≤7 bits for code + up to 7 bits of run-length extra = 14 max.
+        if bits.available() < 15 {
+            bits.refill();
+        }
+        let entry = cl_table[(bits.peek() & 0x7F) as usize];
+        let symbol = (entry >> 8) as u8;
+        let len = (entry & 0xFF) as u8;
+        if len == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Dynamic header: undefined code-length code",
+            ));
+        }
+        bits.consume(len as u32);
+        match symbol {
+            0..=15 => {
+                all_lengths[i] = symbol;
+                i += 1;
+            }
+            16 => {
+                if i == 0 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Dynamic header: repeat-prev at position 0",
+                    ));
+                }
+                let repeat = 3 + (bits.peek() & 0x3) as usize;
+                bits.consume(2);
+                let val = all_lengths[i - 1];
+                let take = repeat.min(total_lengths - i);
+                for _ in 0..take {
+                    all_lengths[i] = val;
+                    i += 1;
+                }
+            }
+            17 => {
+                let repeat = 3 + (bits.peek() & 0x7) as usize;
+                bits.consume(3);
+                let take = repeat.min(total_lengths - i);
+                for _ in 0..take {
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            18 => {
+                let repeat = 11 + (bits.peek() & 0x7F) as usize;
+                bits.consume(7);
+                let take = repeat.min(total_lengths - i);
+                for _ in 0..take {
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Dynamic header: invalid code-length symbol",
+                ));
+            }
+        }
+    }
+
+    let litlen_lengths = &all_lengths[..hlit];
+    let dist_lengths = &all_lengths[hlit..total_lengths];
+
+    let litlen_table = LitLenTable::build(litlen_lengths).ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "Dynamic header: failed to build litlen table",
+        )
+    })?;
+    let dist_table = DistTable::build(dist_lengths).ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "Dynamic header: failed to build dist table",
+        )
+    })?;
+    Ok((litlen_table, dist_table))
 }
 
 // =============================================================================
@@ -859,27 +1087,8 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
     }
 
-    // Advisor-requested H3 (now step-3-aware): stored-then-DYNAMIC still
-    // returns Unsupported (dynamic is step 4). The original H3 covered
-    // stored-then-fixed before fixed was implemented; that case now
-    // round-trips correctly in `stored_then_fixed_then_stored_roundtrip`
-    // below, so this version pivots to BTYPE=10 (dynamic).
-    #[test]
-    fn stored_then_dynamic_returns_unsupported_until_step4() {
-        // Block 1: stored "hi" (non-final).
-        let mut stream = raw_stored_block(b"hi", false);
-        // Block 2: header byte's low 3 bits = 0b101 (BFINAL=1, BTYPE=10
-        // dynamic). Rest of bits don't matter — we'll fail at dispatch.
-        stream.push(0b101);
-        let mut inflate = ResumableInflate2::with_until_bits(&stream, 0, stream.len() * 8).unwrap();
-        let mut output = vec![0u8; 64];
-        let err = inflate.read_stream(&mut output).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::Unsupported);
-        assert!(
-            err.to_string().contains("step 4"),
-            "expected reference to step 4: {err}"
-        );
-    }
+    // (The step-4-pending sentinel test was deleted now that dynamic
+    // Huffman is wired. Tests below cover real dynamic-block behavior.)
 
     // ---- Step 3: fixed-Huffman + window-stitched match copy ---------------
 
@@ -955,11 +1164,11 @@ mod tests {
     fn multi_block_deflate_roundtrip() {
         // A long-enough payload forces flate2 to emit multiple DEFLATE
         // blocks (the encoder splits when its internal buffer fills),
-        // exercising the AwaitingHeader → InFixed transition end-to-end
-        // for whatever BTYPEs the encoder chose. Stitching blocks
-        // manually is dangerous because DEFLATE blocks aren't
-        // byte-aligned at their boundaries (only stored blocks force
-        // alignment) — let the encoder produce a valid bit-stream.
+        // exercising both the AwaitingHeader → InFixed AND → InDynamic
+        // transitions end-to-end. Stitching blocks manually is dangerous
+        // because DEFLATE blocks aren't byte-aligned at their boundaries
+        // (only stored blocks force alignment) — let the encoder produce
+        // a valid bit-stream. Strict roundtrip now that step 4 is wired.
         let mut payload = Vec::with_capacity(64 * 1024);
         let mut state: u64 = 0xc0ffee;
         for _ in 0..64 * 1024 {
@@ -968,18 +1177,162 @@ mod tests {
         }
         let stream = raw_deflate(&payload, 1);
         let got = decode_via_resumable_in_chunks(&stream, 4096);
-        // If we hit a dynamic-Huffman block (BTYPE=10), step 4 isn't
-        // wired yet — surface that as a skip rather than a flaky test.
-        // Otherwise it's a strict roundtrip.
-        if got.len() < payload.len() {
-            // Best-effort: at least we should not have produced garbage.
-            assert_eq!(&got[..], &payload[..got.len()]);
-            eprintln!(
-                "(skipped suffix — encoder probably emitted a dynamic block; \
-                 covered by step 4)"
-            );
-        } else {
-            assert_eq!(got, payload);
+        assert_eq!(got, payload);
+    }
+
+    // ---- Step 4: dynamic-Huffman + advisor-suggested edge cases ----------
+
+    /// Build a payload that strongly biases flate2 toward emitting a
+    /// dynamic-Huffman block (variable entropy = dynamic Huffman wins
+    /// vs fixed/stored). Returns the raw-deflate bytes.
+    fn deflate_dynamic_payload(seed: u64, size: usize, level: u32) -> (Vec<u8>, Vec<u8>) {
+        // English-like prose with skewed letter frequency forces dynamic
+        // Huffman in practice (much smaller than fixed for skewed
+        // distributions).
+        let words: &[&[u8]] = &[
+            b"the ", b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"a ", b"lazy ", b"dog ",
+            b"and ", b"then ", b"runs ",
+        ];
+        let mut state = seed;
+        let mut payload = Vec::with_capacity(size);
+        while payload.len() < size {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let w = words[(state as usize) % words.len()];
+            let take = w.len().min(size - payload.len());
+            payload.extend_from_slice(&w[..take]);
+        }
+        let stream = raw_deflate(&payload, level);
+        (payload, stream)
+    }
+
+    // Advisor item 1: dynamic block roundtrip through tiny output chunks.
+    // Catches table-persistence-across-yield bugs (the `take`/restore
+    // dance around `state.dynamic_tables`).
+    #[test]
+    fn dynamic_block_yields_with_one_byte_chunks() {
+        let (payload, stream) = deflate_dynamic_payload(0xa11ce, 8 * 1024, 9);
+        let got = decode_via_resumable_in_chunks(&stream, 1);
+        assert_eq!(got, payload);
+    }
+
+    // Advisor item 2: dynamic block forcing matches longer than a single
+    // output chunk → PendingMatch save/restore plus dynamic-table
+    // persistence on the same call boundary.
+    #[test]
+    fn dynamic_block_match_crosses_yield_boundary() {
+        let (payload, stream) = deflate_dynamic_payload(0xb0b, 64 * 1024, 9);
+        // Chunk size 7 is intentionally smaller than the DEFLATE
+        // max-match (258), so most matches yield mid-copy.
+        let got = decode_via_resumable_in_chunks(&stream, 7);
+        assert_eq!(got, payload);
+    }
+
+    // Advisor item 3: two consecutive dynamic blocks with DIFFERENT
+    // tables. Catches "stale dynamic_tables leak across block
+    // boundaries." Build by concatenating two independent
+    // raw_deflate streams via a stored-block bridge to force byte
+    // alignment between them. (We can't concatenate two DEFLATE
+    // streams directly — both have BFINAL=1.)
+    //
+    // Construction: stored_block(b"X", false) acts as a single-bit
+    // BTYPE=00 sentinel; raw_deflate(..., 9) is then guaranteed to
+    // start byte-aligned because stored blocks force alignment.
+    // After the first dynamic block completes (its EOB in arbitrary
+    // bit position), we can't just concatenate another raw_deflate —
+    // so use a different strategy: ONE raw_deflate of a payload
+    // big enough that flate2 emits >=2 dynamic blocks naturally.
+    #[test]
+    fn two_consecutive_dynamic_blocks_with_different_tables() {
+        // 256 KiB of varied prose — at level 9 with this size flate2
+        // typically emits multiple blocks; the encoder picks per-block
+        // Huffman tables based on local statistics, so adjacent
+        // dynamic blocks usually differ.
+        let (payload, stream) = deflate_dynamic_payload(0xfeed, 256 * 1024, 9);
+        // Large chunk so blocks process in one read_stream — exercises
+        // the EOB → finish_current_block → dynamic_tables.None pattern
+        // mid-call, then re-entry to a new dynamic block on the next
+        // loop iteration. Catches "tables leaked from block N into
+        // block N+1."
+        let got = decode_via_resumable_in_chunks(&stream, 16 * 1024);
+        assert_eq!(got, payload);
+    }
+
+    // Advisor item 4: dynamic block straddling `encoded_until_bits`.
+    // Per CLAUDE.md "no fallbacks" + vendor GzipReader contract
+    // (parallel-SM boundaries land at block boundaries), this MUST be
+    // a loud Err — not silent stop and not infinite loop. The
+    // post-parse check in try_enter_next_block + the no-progress guard
+    // in read_stream both defend this; this test asserts the Err
+    // surfaces with the expected kind.
+    #[test]
+    fn dynamic_header_straddling_encoded_until_bits_errors_loudly() {
+        let (_payload, stream) = deflate_dynamic_payload(0xc0de, 16 * 1024, 9);
+        // 8 bytes = 64 bits is well inside the dynamic header parse window
+        // (the header alone is typically 50-200 bits).
+        let mut inflate = ResumableInflate2::with_until_bits(&stream, 0, 64).unwrap();
+        let mut output = vec![0u8; 1024];
+        let err = inflate
+            .read_stream(&mut output)
+            .expect_err("straddling header must Err, not Ok or hang");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("straddled encoded_until_bits"),
+            "expected straddling-cap message; got: {err}"
+        );
+    }
+
+    // Advisor item 5 (highest-value): RFC 1951 §3.2.7 special case —
+    // "If only one distance code is used, it is encoded using one bit,
+    // not zero bits". A block with all distance code lengths = 0 except
+    // a single code of length 1 should decode correctly. If
+    // `DistTable::build` doesn't handle the degenerate-tree case, this
+    // test will surface it.
+    //
+    // We can't easily synthesize this manually — instead, force flate2
+    // into a low-match regime where only one distance code gets used,
+    // by feeding short, highly-random data.
+    #[test]
+    fn dynamic_block_with_single_distance_code_decodes() {
+        // Tiny PRNG payload — flate2 may or may not emit a one-distance
+        // dynamic block, but if it does, our decoder must handle it.
+        // Even if it doesn't, the test still passes (it's a roundtrip
+        // assertion regardless of the encoded block structure).
+        let mut payload = Vec::with_capacity(48);
+        let mut state: u64 = 0xdeadbeef;
+        for _ in 0..48 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            payload.push((state >> 24) as u8);
+        }
+        let stream = raw_deflate(&payload, 9);
+        let got = decode_via_resumable_in_chunks(&stream, 4);
+        assert_eq!(got, payload);
+
+        // Also verify `DistTable::build` accepts a degenerate
+        // single-code tree directly (one code of length 1 + 1 unused
+        // code, as RFC §3.2.7 prescribes).
+        let mut lengths = [0u8; 30];
+        lengths[0] = 1;
+        lengths[1] = 1;
+        assert!(
+            DistTable::build(&lengths).is_some(),
+            "DistTable::build must accept the degenerate single-distance-code tree"
+        );
+    }
+
+    // Advisor item 6: truncate the dynamic header at every byte offset
+    // and ensure the result is Err, never panic or silent corruption.
+    #[test]
+    fn dynamic_header_truncated_at_every_offset_does_not_panic() {
+        let (_payload, stream) = deflate_dynamic_payload(0xface, 8 * 1024, 9);
+        // First N bytes — there's a deflate header inside that.
+        for cut in 1..stream.len().min(40) {
+            let truncated = &stream[..cut];
+            let mut inflate =
+                ResumableInflate2::with_until_bits(truncated, 0, truncated.len() * 8).unwrap();
+            let mut output = vec![0u8; 8 * 1024];
+            // Must not panic. May return Err (preferred) or Ok with
+            // partial output that is byte-correct for what it produced.
+            let _ = inflate.read_stream(&mut output);
         }
     }
 

@@ -2790,7 +2790,7 @@ fn decode_dynamic_hyperfast(
     decode_huffman_cf(bits, output, out_pos, litlen, dist)
 }
 
-fn build_code_length_table(lengths: &[u8; 19]) -> Result<[u16; 128]> {
+pub(crate) fn build_code_length_table(lengths: &[u8; 19]) -> Result<[u16; 128]> {
     let mut table = [0u16; 128];
 
     let mut count = [0u16; 8];
