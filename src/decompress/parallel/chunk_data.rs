@@ -141,6 +141,18 @@ pub struct ChunkData {
     /// window (set via IsalInflateWrapper::set_window) so no markers
     /// were emitted. CRC32'd at append time.
     pub data: U8,
+    /// `data_with_markers` narrowed to u8 — populated by the
+    /// post-process worker (`run_post_process_task`) right after
+    /// `apply_window` resolves markers. Consumer thread just streams
+    /// this Vec to the output writer instead of allocating + scalar-
+    /// narrowing per chunk (the prior pattern serialized 24 ms/chunk
+    /// on the single consumer thread and dominated wall time on
+    /// real silesia — see `plans/pure-rust-perf.md` consumer-narrow
+    /// finding).
+    ///
+    /// Empty when `data_with_markers` is empty or `apply_window` hasn't
+    /// run yet. Pool-recycled via the U8 pool alongside `data`.
+    pub narrowed: U8,
     /// True if `apply_window` has already been run on this chunk —
     /// either on the worker thread before send (when the predecessor's
     /// window was published in time) or by an earlier consumer pass.
@@ -259,6 +271,7 @@ impl ChunkData {
             encoded_size_bits: 0,
             data_with_markers,
             data,
+            narrowed: types::u8_with_capacity(0),
             markers_resolved: false,
             subchunks: vec![first_subchunk],
             // Mirror of ChunkData.hpp:561 default-init:
@@ -1081,7 +1094,9 @@ impl Drop for ChunkData {
         use crate::decompress::parallel::chunk_buffer_pool;
         let data = std::mem::replace(&mut self.data, types::u8_empty());
         let dwm = std::mem::replace(&mut self.data_with_markers, types::u16_empty());
+        let narrowed = std::mem::replace(&mut self.narrowed, types::u8_empty());
         chunk_buffer_pool::return_u8_to_worker(self.pool_worker_index, data);
+        chunk_buffer_pool::return_u8_to_worker(self.pool_worker_index, narrowed);
         chunk_buffer_pool::return_u16_to_worker(self.pool_worker_index, dwm);
     }
 }
