@@ -209,44 +209,65 @@ The 334 MB/s pure-Rust inflate benched in
 code path** from `deflate_block::Block`. The bench measures phase 2.
 Phase 1 has never been benched in isolation; it is the bottleneck.
 
-### Phase B — Fix path options (advisor-flagged)
+### Phase B — Fix path (advisor-revised after vendor cross-check)
 
-Three candidates (advisor recommendation: **C with B fallback**):
+**TL;DR: Option A — SIMD-ify `deflate_block::Block::read()` — is the
+vendor-faithful fix.**
 
-A. **Optimize `deflate_block::Block`.** Wire SIMD primitives
-   (`vector_huffman`, `two_level_table`) into its hot loop. Lowest
-   risk to architecture; preserves the bootstrap pattern.
-   **Advisor verdict**: dead-end, perpetuates non-vendor architecture.
-   Don't pursue.
+Initial advisor recommendation was option C (SIMD BlockFinder parent-
+thread pre-pass to skip bootstrap). Cross-checking vendor:
 
-B. **Have `ResumableInflate2` emit markers when window unknown.**
-   Today phase 2 requires a clean window; phase 1 exists to build
-   one. Unifying lets phase 2's SIMD-friendly code path handle the
-   whole chunk, with markers, when window is empty. Bootstrap
-   becomes vestigial.
+1. `vendor/rapidgzip/librapidarchive/src/core/BlockFinder.hpp` —
+   vendor's BlockFinder is **async single-thread prefetcher**, NOT a
+   parent-thread pre-pass. Runs in parallel with workers.
+2. `vendor/rapidgzip/librapidarchive/src/rapidgzip/chunkdecoding/GzipChunk.hpp`
+   — vendor's `decodeChunkWithRapidgzip` is the bootstrap analog. It
+   uses `deflate::Block::read()` block-by-block. **Vendor has the
+   same bootstrap pattern gzippy ports.**
+3. So the slowdown is NOT architectural. It's that gzippy's
+   `deflate_block::Block::read()` is slower than vendor's
+   `deflate::Block::read()`.
 
-C. **SIMD `BlockFinder` boundary handoff.** Run a SIMD-aware
-   pre-pass over the compressed stream that produces
-   `Vec<BitOffset>` of valid dynamic-Huffman / fixed / stored block
-   starts. Workers receive `(start_bit, end_bit)` pairs and skip
-   bootstrap entirely — they dispatch directly to phase 2 from a
-   known boundary with an empty initial window (markers emerge
-   naturally for the first ≤ 32 KiB).
-   - Vendor pattern: `vendor/rapidgzip/librapidarchive/blockfinder/DynamicHuffman.hpp`
-     + `PigzStringView.hpp`, driven by `ParallelBitStringFinder`.
-   - Cost: O(compressed_size) SIMD scan on parent thread before
-     worker dispatch. Probably < 50 ms vs the 1060 ms bootstrap
-     currently consumes.
-   - **Advisor verdict**: this is what rapidgzip actually ships.
+**Concrete next step (Phase B implementation)**:
 
-**Combined plan**: implement C first, fall back to B for chunks
-where the finder finds no boundary in range. Both share the
-`ResumableInflate2` SIMD path; C eliminates bootstrap from the hot
-worker path; B's marker-emission mode covers the residual.
+1. **SIMD-ify `deflate_block::Block::read()`** (`src/decompress/parallel/deflate_block.rs`).
+   Bring the existing gzippy primitives into the read hot loop:
+   - `vector_huffman::decode_huffman_cf_vector`
+     (`consume_first_decode.rs:571+`) — already production for BGZF.
+   - `two_level_table` — main-table + subtable Huffman decode.
+   - `packed_lut` / `combined_lut` — fused literal/length.
+   - `bmi2` `pext` extraction for bit-shuffling on AVX2 + BMI2 CPUs.
+   - `double_literal` — two-literal cache for back-to-back short codes.
 
-Once C+B ship, `bootstrap_with_deflate_block` becomes unused and
-`gzip_chunk.rs:511` + the `deflate_block::Block` module can be
-retired.
+   Match vendor's `deflate::Block::readInternalCompressed` SIMD
+   shape (`vendor/.../gzip/deflate.hpp`).
+
+2. **Make `RawBlockFinderCoordinator` proactive** (separate, smaller
+   commit). Today it's invoked reactively in
+   `speculative_decode_find_boundary` after a partition's start_bit
+   fails to decode. Vendor's BlockFinder prefetches offsets ahead of
+   when workers need them; mirror that by pre-populating
+   `BlockFetcher`'s offset cache when partitions are created. Goal:
+   fewer "slow path" decodes (today 28.6% missing speculation).
+
+**Bench gates**:
+
+- After step 1, `bootstrap` p50 should drop from 14.2ms toward 4-6ms
+  (matching the 334 MB/s phase 2 path — same SIMD primitives, same
+  Huffman-decode-then-emit pattern).
+- After step 2, "missing speculation" drops from 28.6% to < 10%.
+- E2E ratio (`test_single_member_parallel_silesia`) drops from 2.76×
+  toward < 1.0×.
+
+**Options previously considered**:
+
+- B — Have `ResumableInflate2` emit markers when window unknown.
+  Unifies phase 1 + phase 2. Larger refactor; deferred unless A
+  doesn't close the gap. The `decode_huffman_body_resumable` already
+  has stopping-point bookkeeping — extending it to emit markers
+  on cross-chunk back-refs is plausible but invasive.
+- C — Parent-thread SIMD BlockFinder pre-pass. **Rejected**: not
+  vendor-faithful (vendor's BlockFinder is async, not pre-pass).
 
 **Then**, once measurements show the hot span:
 
