@@ -707,7 +707,8 @@ fn consumer_loop<W: std::io::Write>(
         block_fetcher.record_fetch(next_unprocessed_block_index);
         let should_drive_prefetch = last_fetched_before
             .map(|li| li != next_unprocessed_block_index)
-            .unwrap_or(true);
+            .unwrap_or(true)
+            && std::env::var_os("GZIPPY_NO_PREFETCH").is_none();
 
         let stop_hint_bit = stop_hint_bit_for(
             block_finder,
