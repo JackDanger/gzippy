@@ -8,24 +8,20 @@
 //! (`PendingMatch` + bit-reader position + active tables) to resume on the
 //! next call.
 //!
-//! This replaces the `session: Vec<u8>` accumulator in
-//! [`crate::decompress::inflate::consume_first_decode::ResumableInflate`].
-//! The old accumulator was a band-aid for the fact that the existing
-//! `decode_dynamic` / `decode_fixed` / `decode_stored` (used by BGZF and
-//! sequential decompress) run a block to completion in one shot. Those
-//! decoders stay untouched for their non-resumable callers; this module
-//! contains the resumable variants used only by `ResumableInflate2` and,
-//! via [`crate::decompress::parallel::inflate_wrapper::IsalInflateWrapper`],
+//! This is the production resumable inflate for the parallel-SM hot
+//! path. The non-resumable `decode_dynamic` / `decode_fixed` /
+//! `decode_stored` in `consume_first_decode.rs` (used by BGZF and
+//! sequential decompress) run a block to completion in one shot and
+//! pay no yield-check tax; this module's resumable variants exist
+//! ONLY for `ResumableInflate2` and, via
+//! [`crate::decompress::parallel::inflate_wrapper::IsalInflateWrapper`],
 //! the parallel-SM hot path.
 //!
-//! Fill-in status: steps 2 (stored), 3 (fixed Huffman + window-stitched
-//! match copy), and 4 (dynamic Huffman) landed. Remaining: step 5
-//! wires `inflate_wrapper.rs`'s pure-rust backend to `ResumableInflate2`;
-//! step 6 deletes the old `ResumableInflate` + `session`; step 7 reverts
-//! the B3a headroom band-aid. See `plans/rust-rapidgzip.md §5 —
-//! Implementation order`.
+//! Plan progress (`plans/rust-rapidgzip.md §5`): all 7 steps complete.
+//! The old `ResumableInflate` + `session: Vec<u8>` accumulator and the
+//! B3a headroom band-aid (commit 2eff70f) are deleted as of §5 step 6.
 
-#![allow(dead_code)] // step 5: wired in to inflate_wrapper.rs in a follow-up commit
+#![allow(dead_code)] // some vendor-parity methods are wrapper-only callers
 
 use std::io::{Error, ErrorKind, Result};
 
@@ -186,9 +182,10 @@ pub struct InflateStreamResult {
 
 /// Vendor-faithful resumable inflate.
 ///
-/// Owns the input bit reader and a [`SlidingWindow`]. Replaces the
-/// `session: Vec<u8>` accumulator on
-/// [`crate::decompress::inflate::consume_first_decode::ResumableInflate`].
+/// Owns the input bit reader and a [`SlidingWindow`]. This is the
+/// production resumable inflate for the parallel-SM path (the old
+/// `session: Vec<u8>`-accumulator `ResumableInflate` was deleted in
+/// §5 step 6).
 pub struct ResumableInflate2<'a> {
     pub(crate) bits: Bits<'a>,
     pub(crate) window: SlidingWindow,
@@ -268,8 +265,8 @@ impl<'a> ResumableInflate2<'a> {
         self.stopped_at
     }
 
-    /// Mirror of `consume_first_decode::ResumableInflate::clear_stop`:
-    /// resets `stopped_at` so the caller can re-poll without ambiguity.
+    /// Reset `stopped_at` so the caller can re-poll without ambiguity.
+    /// Vendor parity with `IsalInflateWrapper::clearStop` (isal.hpp).
     pub fn clear_stop(&mut self) {
         self.stopped_at = StoppingPoint::NONE;
     }

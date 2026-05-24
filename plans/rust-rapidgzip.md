@@ -32,16 +32,16 @@ Cfg gates live in `src/decompress/parallel/sm_cfg.rs`:
 
 ## Completed items
 
-### Track B — C-free SM hot path (⚠ B3 partial)
+### Track B — C-free SM hot path ✅
 
 
-| Item                                    | Status        | Proof                                                                                                                     |
-| --------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| B1 ResumableInflate + 4 stopping points | ✅             | `consume_first_decode.rs`; differential oracle in `inflate_wrapper.rs`; `test_resumable_end_of_stream_header_after_reset` |
-| B2 Bootstrap without C                  | ✅ (§3 bypass) | `deflate_block.rs` canonical path when `!USE_ISAL_INFLATE`; no LUT entry-for-entry test (§3 is end-to-end equivalent)     |
-| B3 Pure-Rust wrapper body               | ⚠ partial     | `inflate_wrapper.rs` pure backend wired; `test_pure_rust_parallel_sm_e2e` passes; **3 routing tests still red on neurotic** — fixture-driven blocks exceed the per-block scratch invented to simulate ISA-L's tmp_out. Path forward in §5 (option 2). |
-| B3a Block scratch sizing                | ⚠ band-aid    | `consume_first_decode.rs:3174` — `decode_start + max_new + PER_BLOCK_HEADROOM` (commit 2eff70f). Reduces failure window by max_new but a single ~8 MiB block still overflows. Replaced by §5 option 2; remove after that lands. |
-| B4 Throughput bench                     | ✅             | `benches/inflate_isal_vs_pure_rust.rs` + inline `test_isal_vs_pure_rust_silesia_throughput`                               |
+| Item                                    | Status | Proof                                                                                                                  |
+| --------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------- |
+| B1 ResumableInflate + 4 stopping points | ✅     | `inflate/resumable.rs`; 25 unit tests; differential oracle in `inflate_wrapper.rs:1276+` (`ResumableInflate2` vs ISA-L) |
+| B2 Bootstrap without C                  | ✅     | `deflate_block.rs` canonical path when `!USE_ISAL_INFLATE`; §3 cached-Huffman bootstrap exercises end-to-end           |
+| B3 Pure-Rust wrapper body               | ✅     | `inflate_wrapper.rs` pure backend uses `ResumableInflate2`; all 33 pure-rust-inflate routing tests green on neurotic   |
+| B3a Block scratch sizing                | —      | Obsoleted by §5: `ResumableInflate2` writes directly into caller's output with a 32 KiB sliding window. No per-block scratch exists. B3a band-aid (commit 2eff70f) deleted in §5 step 6. |
+| B4 Throughput bench                     | ✅     | `benches/inflate_isal_vs_pure_rust.rs` + inline `test_isal_vs_pure_rust_silesia_throughput`                            |
 
 
 ### Track A — Infrastructure ✅ (perf gates deferred)
