@@ -110,6 +110,11 @@ fn main() {
     if std::env::var_os("GZIPPY_TRACE_MULTI").is_some() {
         use gzippy::decompress::inflate::resumable as r;
         use std::sync::atomic::Ordering;
+        // Also probe the static via std::ptr to detect duplicate instances.
+        eprintln!(
+            "[trace] main BODY_RESUMABLE_CALLS addr={:p}",
+            &r::BODY_RESUMABLE_CALLS
+        );
         let hits = r::MULTI_LITERAL_HITS.load(Ordering::Relaxed);
         let misses = r::MULTI_LITERAL_MISSES.load(Ordering::Relaxed);
         let syms = r::MULTI_LITERAL_SYMBOLS.load(Ordering::Relaxed);
