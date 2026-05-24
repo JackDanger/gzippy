@@ -105,37 +105,6 @@ fn main() {
 
     let result = run();
 
-    // Optional multi-literal fastloop hit-rate dump (Phase B step-1 diagnostic).
-    #[cfg(feature = "pure-rust-inflate")]
-    if std::env::var_os("GZIPPY_TRACE_MULTI").is_some() {
-        use gzippy::decompress::inflate::resumable as r;
-        use std::sync::atomic::Ordering;
-        // Also probe the static via std::ptr to detect duplicate instances.
-        eprintln!(
-            "[trace] main BODY_RESUMABLE_CALLS addr={:p}",
-            &r::BODY_RESUMABLE_CALLS
-        );
-        let hits = r::MULTI_LITERAL_HITS.load(Ordering::Relaxed);
-        let misses = r::MULTI_LITERAL_MISSES.load(Ordering::Relaxed);
-        let syms = r::MULTI_LITERAL_SYMBOLS.load(Ordering::Relaxed);
-        let total = hits + misses;
-        let hit_rate = if total > 0 {
-            hits as f64 * 100.0 / total as f64
-        } else {
-            0.0
-        };
-        let avg_syms = if hits > 0 {
-            syms as f64 / hits as f64
-        } else {
-            0.0
-        };
-        let calls = r::BODY_RESUMABLE_CALLS.load(Ordering::Relaxed);
-        let fastloop_iters = r::BODY_RESUMABLE_FASTLOOP_ENTERS.load(Ordering::Relaxed);
-        eprintln!(
-            "[multi-literal] calls={calls} fastloop_iters={fastloop_iters} hits={hits} misses={misses} syms={syms} hit_rate={hit_rate:.1}% avg_syms_per_hit={avg_syms:.2}"
-        );
-    }
-
     match result {
         Ok(exit_code) => process::exit(exit_code),
         Err(e) => {
