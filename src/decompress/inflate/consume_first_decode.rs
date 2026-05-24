@@ -3073,7 +3073,25 @@ impl<'a> ResumableInflate<'a> {
             }
         }
 
+        user_written += self.copy_session_to_user(output, user_written);
+
         while user_written < output.len() {
+            // Block decoders run to completion in one shot; if the caller's
+            // output buffer is smaller, bytes remain in session until drained.
+            // Do not start the next block while prior output is pending.
+            if self.user_emitted < self.session.len() {
+                user_written += self.copy_session_to_user(output, user_written);
+                if user_written >= output.len() {
+                    return Ok(InflateStreamResult {
+                        bytes_written: user_written,
+                        stopped_at: StoppingPoint::NONE,
+                        bit_position: self.tell_compressed(),
+                        finished: false,
+                    });
+                }
+                continue;
+            }
+
             if self.bits.bit_position() >= self.encoded_until_bits {
                 break;
             }
