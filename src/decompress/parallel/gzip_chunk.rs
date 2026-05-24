@@ -63,6 +63,71 @@ impl From<std::io::Error> for ChunkDecodeError {
 #[allow(dead_code)] // used by x86_64+isal-compression decode_chunk_isal path
 const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 
+// =========================================================================
+// Body-failure diagnostics — speculation-accuracy investigation
+// =========================================================================
+// Per advisor-disproof: gzippy fails ~34 body speculations per silesia run,
+// vendor fails 0. The hypothesis is that the WHY of these failures matters:
+// where in the body does decode break, what error variant fires, how many
+// bytes are wasted before failure. If failures cluster on specific corpus
+// regions or specific error types, we can build a precondition heuristic
+// that vendor has but we don't.
+
+pub static BODY_FAIL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BODY_FAIL_BYTES_WASTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static BODY_FAIL_BITS_INTO_BODY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static BODY_FAIL_INVALID_HUFFMAN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static BODY_FAIL_EXCEEDED_WINDOW: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static BODY_FAIL_INVALID_COMPRESSION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static BODY_FAIL_INVALID_CODE_LENGTHS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static BODY_FAIL_OTHER_VARIANT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Per-failure structured log. Writes one JSON line to the path in
+/// `GZIPPY_BODY_FAIL_LOG` env var (no-op if unset). Use this for
+/// distributional analysis: cluster failures by offset to see if they
+/// fall in specific corpus regions.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+fn body_fail_log(start_bit: usize, bits_into_body: usize, bytes_wasted: usize, err: &str) {
+    use std::io::Write;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let f = FILE.get_or_init(|| {
+        let path = std::env::var("GZIPPY_BODY_FAIL_LOG").ok()?;
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        Some(Mutex::new(f))
+    });
+    let Some(mtx) = f else {
+        return;
+    };
+    let line = format!(
+        r#"{{"start_bit":{start_bit},"bits_into_body":{bits_into_body},"bytes_wasted":{bytes_wasted},"err":"{}"}}"#,
+        err.replace('"', "\\\"")
+    );
+    let mut g = mtx.lock().unwrap();
+    let _ = writeln!(g, "{}", line);
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+)))]
+fn body_fail_log(_: usize, _: usize, _: usize, _: &str) {}
+
 /// ISA-L decode of one chunk when the predecessor window is known.
 ///
 /// Stops at the first block boundary at-or-past `stop_hint_bits` (an
@@ -367,13 +432,15 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     // the `cleanDataCount >= deflate::MAX_WINDOW_SIZE` handoff at
     // L520-525.
     let t_bootstrap = std::time::Instant::now();
-    let bootstrap = bootstrap_with_deflate_block(input, encoded_offset_bits, stop_hint_bits)?;
+    let mut bootstrap = bootstrap_with_deflate_block(input, encoded_offset_bits, stop_hint_bits)?;
     let bootstrap_dur_us = t_bootstrap.elapsed().as_micros();
 
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
     if !bootstrap.markers.is_empty() {
         chunk.append_markered(&bootstrap.markers);
     }
+    // EXPERIMENT: return the markers Vec to the per-thread pool.
+    return_bootstrap_output_to_pool(std::mem::take(&mut bootstrap.markers));
 
     // Whenever the bootstrap reached a block boundary at-or-past
     // stop_hint_bits (rare on chunks > 32 KiB), or BFINAL fired, or no
@@ -500,6 +567,45 @@ struct DeflateBootstrap {
 /// MAX_WINDOW_SIZE at a block boundary, (b) BFINAL fires, or (c) we're
 /// at a non-fixed block boundary at-or-past `stop_hint_bits`.
 ///
+/// EXPERIMENT: per-thread pool of bootstrap output buffers.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+thread_local! {
+    static BOOTSTRAP_OUTPUT_POOL: std::cell::RefCell<Vec<u16>> = std::cell::RefCell::new(Vec::with_capacity(128 * 1024));
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+fn take_bootstrap_output_from_pool() -> Vec<u16> {
+    BOOTSTRAP_OUTPUT_POOL.with(|cell| {
+        let mut v = std::mem::take(&mut *cell.borrow_mut());
+        v.clear();
+        if v.capacity() < 128 * 1024 {
+            v.reserve(128 * 1024);
+        }
+        v
+    })
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+fn return_bootstrap_output_to_pool(mut v: Vec<u16>) {
+    v.clear();
+    BOOTSTRAP_OUTPUT_POOL.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        // Keep the larger of the two.
+        if v.capacity() > slot.capacity() {
+            *slot = v;
+        }
+    });
+}
+
 /// Mirror of the `while ( true )` loop in
 /// `decodeChunkWithRapidgzip` (GzipChunk.hpp:468-654), restricted to the
 /// single-member case (no multi-stream loop) and with the handoff
@@ -541,9 +647,9 @@ fn bootstrap_with_deflate_block(
     }
 
     // Bootstrap output: typically ~32 KiB + one trailing block, up to
-    // ~128 KiB worst case for a single dense dynamic block. Pre-reserve
-    // generously to avoid early growth.
-    let mut output: Vec<u16> = Vec::with_capacity(128 * 1024);
+    // ~128 KiB worst case for a single dense dynamic block.
+    // EXPERIMENT: take pooled buffer from thread-local instead of fresh alloc.
+    let mut output: Vec<u16> = take_bootstrap_output_from_pool();
     BOOTSTRAP_BLOCK.with(|cell_block| {
         let mut block = cell_block.borrow_mut();
         block.reset(None, None);
@@ -610,14 +716,62 @@ fn bootstrap_with_deflate_block(
             // `std::numeric_limits<size_t>::max()` at GzipChunk.hpp:568.
             let before_len = output.len();
             while !block.eob() {
-                let _ = block
-                    .read(&mut bits, &mut *output, usize::MAX)
-                    .map_err(|e| {
-                        ChunkDecodeError::BootstrapFailed(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("deflate body at bit {next_block_offset}: {e:?}"),
-                        ))
-                    })?;
+                let res = block.read(&mut bits, &mut *output, usize::MAX);
+                if let Err(e) = res {
+                    // Body-failure diagnostics for the speculation-accuracy
+                    // investigation (per advisor recommendation). Captures
+                    // (a) candidate start_bit, (b) bit position when body
+                    // failed (= bits consumed past block start), (c) bytes
+                    // emitted before failure (= waste), (d) error variant.
+                    let bits_at_fail = absolute_bit_pos(byte_offset, &bits);
+                    let bytes_wasted = output.len() - before_len;
+                    let bits_into_body = bits_at_fail.saturating_sub(next_block_offset);
+                    BODY_FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    BODY_FAIL_BYTES_WASTED
+                        .fetch_add(bytes_wasted as u64, std::sync::atomic::Ordering::Relaxed);
+                    BODY_FAIL_BITS_INTO_BODY
+                        .fetch_add(bits_into_body as u64, std::sync::atomic::Ordering::Relaxed);
+                    // Per-error-variant counter so we can see which
+                    // block_error dominates.
+                    use crate::decompress::parallel::deflate_block::BlockError;
+                    match &e {
+                        BlockError::InvalidHuffmanCode => {
+                            BODY_FAIL_INVALID_HUFFMAN
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        BlockError::ExceededWindowRange => {
+                            BODY_FAIL_EXCEEDED_WINDOW
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        BlockError::InvalidCompression => {
+                            BODY_FAIL_INVALID_COMPRESSION
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        BlockError::InvalidCodeLengths => {
+                            BODY_FAIL_INVALID_CODE_LENGTHS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        _ => {
+                            BODY_FAIL_OTHER_VARIANT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    // Detailed per-failure dump (one JSON line) if the
+                    // GZIPPY_BODY_FAIL_LOG env var points at a writable
+                    // path. Mirror of trace.rs pattern.
+                    body_fail_log(
+                        next_block_offset,
+                        bits_into_body,
+                        bytes_wasted,
+                        &format!("{e:?}"),
+                    );
+                    return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "deflate body at bit {next_block_offset} (failed +{bits_into_body} bits, wasted {bytes_wasted} bytes): {e:?}"
+                        ),
+                    )));
+                }
             }
 
             // Block fully decoded. Update trailing_clean from the bytes
