@@ -189,16 +189,18 @@ fn decode_chunk_isal_impl(
                 sp if sp == StoppingPoints::END_OF_STREAM_HEADER => {
                     chunk.append_block_boundary_at(r.bit_position, decode_base + n_bytes_read);
                 }
-                sp if sp == StoppingPoints::END_OF_BLOCK && !wrapper.is_final_block() => {
-                    chunk.append_block_boundary_at(r.bit_position, decode_base + n_bytes_read);
+                sp if sp == StoppingPoints::END_OF_BLOCK => {
+                    if !wrapper.is_final_block() {
+                        chunk.append_block_boundary_at(r.bit_position, decode_base + n_bytes_read);
+                        if r.bit_position >= stop_hint_bits {
+                            // Do not keep filling this buffer from the next block
+                            // before HEADER/NONE handling — finalize at pre-header EOB.
+                            last_end_bit = r.bit_position;
+                            stopping_point_reached = true;
+                        }
+                    }
                     last_eob_pos = r.bit_position;
                     last_eob_decoded_bytes = decode_base + n_bytes_read;
-                    if last_eob_pos >= stop_hint_bits {
-                        // Do not keep filling this buffer from the next block
-                        // before HEADER/NONE handling — finalize at pre-header EOB.
-                        last_end_bit = last_eob_pos;
-                        stopping_point_reached = true;
-                    }
                 }
                 sp if sp == StoppingPoints::END_OF_BLOCK_HEADER => {
                     let not_final = !wrapper.is_final_block();
