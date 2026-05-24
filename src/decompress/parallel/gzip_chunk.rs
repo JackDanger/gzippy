@@ -136,7 +136,10 @@ fn decode_chunk_isal_impl(
         let mut end_of_stream_hit = false;
 
         let decode_base = already_decoded;
-        while n_bytes_read < buffer.len() && !stopping_point_reached {
+        while n_bytes_read < buffer.len()
+            && !stopping_point_reached
+            && !(pending_stop_after_flush && !wrapper.session_pending())
+        {
             let bit_before_read = wrapper.tell_compressed();
             let r = wrapper.read_stream(&mut buffer[n_bytes_read..])?;
             last_per_call = r.bytes_written;
@@ -197,11 +200,7 @@ fn decode_chunk_isal_impl(
                             // Do not keep filling this buffer from the next block
                             // before HEADER/NONE handling — finalize at pre-header EOB.
                             last_end_bit = r.bit_position;
-                            if wrapper.session_pending() {
-                                pending_stop_after_flush = true;
-                            } else {
-                                stopping_point_reached = true;
-                            }
+                            pending_stop_after_flush = true;
                         }
                     }
                     last_eob_pos = r.bit_position;
@@ -212,11 +211,7 @@ fn decode_chunk_isal_impl(
                     let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
                     if last_eob_pos >= stop_hint_bits && not_final && not_fixed {
                         last_end_bit = last_eob_pos;
-                        if wrapper.session_pending() {
-                            pending_stop_after_flush = true;
-                        } else {
-                            stopping_point_reached = true;
-                        }
+                        pending_stop_after_flush = true;
                     }
                 }
                 sp if sp == StoppingPoints::NONE
@@ -226,11 +221,7 @@ fn decode_chunk_isal_impl(
                     // ISA-L can return 0 bytes between block boundaries.
                     // Do not end the chunk early while still before `stop_hint_bits`.
                     last_end_bit = last_eob_pos;
-                    if wrapper.session_pending() {
-                        pending_stop_after_flush = true;
-                    } else {
-                        stopping_point_reached = true;
-                    }
+                    pending_stop_after_flush = true;
                 }
                 _ => {}
             }
