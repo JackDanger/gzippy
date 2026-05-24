@@ -525,10 +525,18 @@ pub fn copy_match_windowed(
     _distance: u32,
     _length: u32,
 ) -> Result<usize> {
-    // §5 step 3+: implementation once the first Huffman block decoder lands.
-    // Until then, only stored blocks (which never emit matches) reach
-    // `read_stream`, so this is unreachable on the stored-only path.
-    unimplemented!("§5 step 3 fill-in")
+    // §5 step 3+: implementation once the first match-emitting Huffman
+    // decoder lands. Until then, only stored blocks (which never emit
+    // matches) reach `read_stream`. Returning `Unsupported` instead of
+    // `unimplemented!()` means a future bug that stashes a `PendingMatch`
+    // before step 3 lands surfaces as a recoverable `Err` rather than a
+    // process panic — important since this runs on worker threads in
+    // the parallel-SM path. (Advisor review of commit f296be1.)
+    Err(Error::new(
+        ErrorKind::Unsupported,
+        "copy_match_windowed pending §5 step 3 — no decoder should be \
+         emitting PendingMatch yet",
+    ))
 }
 
 #[cfg(test)]
@@ -659,5 +667,97 @@ mod tests {
         let mut output = [0u8; 16];
         let err = inflate.read_stream(&mut output).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    // Advisor-requested H1: tiny output buffer (1 byte) forces every iteration
+    // to yield with bytes_remaining > 0. Catches off-by-one in the
+    // bytes_remaining -= copy_n math, and proves resume-after-yield works.
+    #[test]
+    fn stored_block_one_byte_chunks_yield_every_iteration() {
+        let payload = b"the quick brown fox jumps over the lazy dog".repeat(3);
+        let stream = raw_stored_block(&payload, true);
+        let mut inflate = ResumableInflate2::with_until_bits(&stream, 0, stream.len() * 8).unwrap();
+        let mut collected = Vec::with_capacity(payload.len());
+        let mut iterations = 0usize;
+        loop {
+            let mut output = [0u8; 1];
+            let r = inflate.read_stream(&mut output).unwrap();
+            iterations += 1;
+            if r.bytes_written == 0 && r.finished {
+                break;
+            }
+            collected.extend_from_slice(&output[..r.bytes_written]);
+            if r.finished {
+                break;
+            }
+            assert!(iterations < payload.len() + 10, "runaway loop");
+        }
+        assert_eq!(collected, payload);
+        assert!(
+            iterations >= payload.len(),
+            "expected ≥ payload.len() yields, got {iterations}"
+        );
+    }
+
+    // Advisor-requested H2: stored block whose LEN claims more bytes than
+    // the input has. The truncated-stored branch in
+    // resume_decode_stored_resumable returns UnexpectedEof — until this
+    // test landed it was uncovered.
+    #[test]
+    fn stored_block_truncated_input_errors() {
+        let payload = b"ten bytes!"; // LEN = 10
+        let mut stream = raw_stored_block(payload, true);
+        // Drop the last 4 bytes so the stored body is shorter than LEN claims.
+        stream.truncate(stream.len() - 4);
+        let mut inflate = ResumableInflate2::with_until_bits(&stream, 0, stream.len() * 8).unwrap();
+        let mut output = [0u8; 32];
+        let err = inflate.read_stream(&mut output).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    // Advisor-requested H3: stored block followed by a fixed-Huffman block
+    // currently routes to the `Unsupported` arm in read_stream. Locks in
+    // "stored-then-fixed yields Unsupported, not silent corruption or a
+    // panic" so step 3 wiring can't regress this contract by accident.
+    #[test]
+    fn stored_then_fixed_returns_unsupported_until_step3() {
+        // Block 1: stored "hi" (non-final).
+        let mut stream = raw_stored_block(b"hi", false);
+        // Block 2: minimal fixed-Huffman BFINAL=1 block — header byte's
+        // low 3 bits are 0b011 (BFINAL=1, BTYPE=01). Body content doesn't
+        // matter; we only need to reach `InFixed` dispatch.
+        stream.push(0b011);
+        let mut inflate = ResumableInflate2::with_until_bits(&stream, 0, stream.len() * 8).unwrap();
+        let mut output = vec![0u8; 64];
+        let err = inflate.read_stream(&mut output).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("step 3") || msg.contains("step 4"),
+            "Unsupported error should reference the fill-in step: {msg}"
+        );
+    }
+
+    // Advisor-requested H4: bit_position after a stored block lands exactly
+    // on the byte after the stored payload — locks down the explicit
+    // bitbuf=0/bitsleft=0 reset pattern so future "optimizations" can't
+    // silently break the byte alignment.
+    #[test]
+    fn stored_block_bit_position_lands_at_payload_end() {
+        let payload = b"ABCDEFGH"; // 8 bytes
+        let stream = raw_stored_block(payload, true);
+        let mut inflate = ResumableInflate2::with_until_bits(&stream, 0, stream.len() * 8).unwrap();
+        let mut output = vec![0u8; payload.len()];
+        let r = inflate.read_stream(&mut output).unwrap();
+        assert_eq!(r.bytes_written, payload.len());
+        // Block layout: 1 header byte + 2 LEN + 2 NLEN + payload.
+        // bit_position should be the bit-index of the byte immediately after.
+        let expected_bit_position = (5 + payload.len()) * 8;
+        assert_eq!(
+            inflate.bit_position(),
+            expected_bit_position,
+            "bit_position must land on the byte after the stored payload"
+        );
+        assert_eq!(r.bit_position, expected_bit_position);
     }
 }
