@@ -27,6 +27,11 @@ use crate::decompress::parallel::inflate_wrapper::{
     any(feature = "isal-compression", feature = "pure-rust-inflate")
 ))]
 use crate::decompress::parallel::rpmalloc_alloc::types;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+use crate::decompress::parallel::trace;
 
 #[derive(Debug)]
 #[allow(dead_code)] // error payloads surfaced via Debug in production
@@ -361,7 +366,9 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     // (vendor/.../chunkdecoding/GzipChunk.hpp:468-654), in particular
     // the `cleanDataCount >= deflate::MAX_WINDOW_SIZE` handoff at
     // L520-525.
+    let t_bootstrap = std::time::Instant::now();
     let bootstrap = bootstrap_with_deflate_block(input, encoded_offset_bits, stop_hint_bits)?;
+    let bootstrap_dur_us = t_bootstrap.elapsed().as_micros();
 
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
     if !bootstrap.markers.is_empty() {
@@ -372,11 +379,31 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     // stop_hint_bits (rare on chunks > 32 KiB), or BFINAL fired, or no
     // clean window accumulated — we're done. The chunk is marker-only.
     let Some(clean_window) = bootstrap.clean_window else {
+        if trace::is_enabled() {
+            trace::emit(
+                "worker",
+                "decode_span",
+                &format!(
+                    r#""start_bit":{encoded_offset_bits},"bootstrap_us":{bootstrap_dur_us},"inflate_us":0,"phase":"bootstrap_only","markers":{}"#,
+                    bootstrap.markers.len(),
+                ),
+            );
+        }
         chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
         chunk.finalize(bootstrap.end_bit_offset);
         return Ok(chunk);
     };
     if bootstrap.bfinal_hit || bootstrap.end_bit_offset >= stop_hint_bits {
+        if trace::is_enabled() {
+            trace::emit(
+                "worker",
+                "decode_span",
+                &format!(
+                    r#""start_bit":{encoded_offset_bits},"bootstrap_us":{bootstrap_dur_us},"inflate_us":0,"phase":"bootstrap_terminal","markers":{}"#,
+                    bootstrap.markers.len(),
+                ),
+            );
+        }
         chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
         chunk.finalize(bootstrap.end_bit_offset);
         return Ok(chunk);
@@ -386,6 +413,7 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     // with the clean 32 KiB tail as dict. Uses the same production
     // `IsalInflateWrapper` path as on-demand decode.
     let bit_offset = bootstrap.end_bit_offset;
+    let t_inflate = std::time::Instant::now();
     let tail = decode_chunk_isal_impl(
         input,
         bit_offset,
@@ -393,7 +421,19 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
         &clean_window,
         configuration,
     )?;
+    let inflate_dur_us = t_inflate.elapsed().as_micros();
+    let tail_bytes = tail.data.len();
     absorb_isal_tail(&mut chunk, tail);
+    if trace::is_enabled() {
+        trace::emit(
+            "worker",
+            "decode_span",
+            &format!(
+                r#""start_bit":{encoded_offset_bits},"bootstrap_us":{bootstrap_dur_us},"inflate_us":{inflate_dur_us},"phase":"bootstrap+inflate","markers":{},"tail_bytes":{tail_bytes}"#,
+                bootstrap.markers.len(),
+            ),
+        );
+    }
     chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
     Ok(chunk)
 }

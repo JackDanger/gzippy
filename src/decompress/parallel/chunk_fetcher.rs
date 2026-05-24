@@ -1405,9 +1405,26 @@ fn run_decode_task(
 fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> ChunkData {
     // Vendor lambda at GzipChunkFetcher.hpp:579-582 — `applyWindow` only.
     // WindowMap writes happen on the consumer (`publish_subchunk_windows`).
+    let start_bit = chunk.encoded_offset_bits;
+    let marker_bytes = chunk.data_with_markers.len();
+    let t_materialize = std::time::Instant::now();
     let bytes = materialize_window(&predecessor_window);
+    let materialize_us = t_materialize.elapsed().as_micros();
+    let t_apply = std::time::Instant::now();
     apply_window(&mut chunk, &bytes);
+    let apply_us = t_apply.elapsed().as_micros();
+    let t_pop = std::time::Instant::now();
     chunk.populate_subchunk_windows(&bytes);
+    let populate_us = t_pop.elapsed().as_micros();
+    if trace::is_enabled() {
+        trace::emit(
+            "post_process",
+            "post_process_span",
+            &format!(
+                r#""start_bit":{start_bit},"materialize_us":{materialize_us},"apply_window_us":{apply_us},"populate_subchunk_windows_us":{populate_us},"marker_bytes":{marker_bytes}"#,
+            ),
+        );
+    }
     chunk
 }
 
