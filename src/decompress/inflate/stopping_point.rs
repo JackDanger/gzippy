@@ -23,6 +23,9 @@ impl StoppingPoint {
     }
 
     #[inline]
+    #[allow(dead_code)] // vendor parity surface; sole call site (the deleted
+                        // ResumableInflate) went away in §5 step 6. Keep for
+                        // future StoppingPoint additions.
     pub const fn is_none(self) -> bool {
         self.0 == 0
     }

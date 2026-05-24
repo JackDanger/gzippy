@@ -1269,13 +1269,14 @@ mod tests {
         assert_eq!(full, reference);
     }
 
-    /// Differential oracle (Track B1): pure-Rust `ResumableInflate` must
-    /// match patched ISA-L at every block boundary, including with a
-    /// predecessor window at non-zero bit offsets.
+    /// Differential oracle (Track B1): pure-Rust `ResumableInflate2`
+    /// must match patched ISA-L at every block boundary, including
+    /// with a predecessor window at non-zero bit offsets. Repointed
+    /// from the deleted `ResumableInflate` in §5 step 6.
     #[cfg(all(feature = "isal-compression", not(feature = "pure-rust-inflate")))]
     mod resumable_isal_oracle {
         use super::*;
-        use crate::decompress::inflate::consume_first_decode::ResumableInflate;
+        use crate::decompress::inflate::resumable::ResumableInflate2;
         use crate::decompress::inflate::stopping_point::StoppingPoint;
 
         fn collect_block_ends(deflate: &[u8]) -> Vec<usize> {
@@ -1323,9 +1324,9 @@ mod tests {
             until_bits: usize,
             window: &[u8],
             stop: StoppingPoint,
-        ) -> crate::decompress::inflate::consume_first_decode::InflateStreamResult {
+        ) -> crate::decompress::inflate::resumable::InflateStreamResult {
             let mut r =
-                ResumableInflate::with_until_bits(deflate, bit_offset, until_bits).expect("rust");
+                ResumableInflate2::with_until_bits(deflate, bit_offset, until_bits).expect("rust");
             r.set_window(window).expect("window");
             r.set_stopping_points(stop);
             let mut buf = vec![0u8; deflate.len() * 16];
@@ -1384,7 +1385,7 @@ mod tests {
             }
             {
                 let mut r =
-                    ResumableInflate::with_until_bits(&deflate, 0, resume_at).expect("rust");
+                    ResumableInflate2::with_until_bits(&deflate, 0, resume_at).expect("rust");
                 r.set_window(&[]).expect("window");
                 let mut buf = vec![0u8; payload.len()];
                 let rr = r.read_stream(&mut buf).expect("read");
