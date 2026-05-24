@@ -611,18 +611,29 @@ fn consumer_loop<W: std::io::Write>(
     // here so the local-state mutation (post-process queue + writer +
     // CRC) stays simple.
     #[allow(clippy::while_let_loop)] // faithful port of vendor processNextChunk loop
+    let mut iter_us_sum: u128 = 0;
+    let mut prefetch_us_sum: u128 = 0;
+    let mut finder_us_sum: u128 = 0;
+    let mut fetcher_get_us_sum: u128 = 0;
+    let mut submit_us_sum: u128 = 0;
+    let mut iter_count: usize = 0;
     loop {
+        let t_iter = std::time::Instant::now();
         // BlockFetcher.hpp:427 — opportunistically promote ready prefetches
         // so workers don't idle while the consumer waits on a different key.
+        let t_prefetch = std::time::Instant::now();
         block_fetcher.process_ready_prefetches();
+        prefetch_us_sum += t_prefetch.elapsed().as_micros();
 
         // Vendor GzipChunkFetcher.hpp:318 — `m_blockFinder->get(m_nextUnprocessedBlockIndex)`.
+        let t_finder = std::time::Instant::now();
         let next_block_offset = match block_finder.get(next_unprocessed_block_index) {
             (Some(offset), GetReturnCode::Success) => offset,
             // Vendor GzipChunkFetcher.hpp:320-327 — EOF when no offset
             // or offset past end of file.
             _ => break,
         };
+        finder_us_sum += t_finder.elapsed().as_micros();
         if next_block_offset >= total_bits {
             break;
         }
@@ -887,6 +898,7 @@ fn consumer_loop<W: std::io::Write>(
         let chunk_arc = match chunk_arc_from_partition {
             Some(arc) => arc,
             None => {
+                let t_fg = std::time::Instant::now();
                 let (chunk_arc_result, _prefetched) = block_fetcher.get_with_prefetch(
                     next_block_offset,
                     |_key: usize| -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
@@ -906,6 +918,7 @@ fn consumer_loop<W: std::io::Write>(
                     partition_offset_for,
                     should_drive_prefetch,
                 );
+                fetcher_get_us_sum += t_fg.elapsed().as_micros();
                 chunk_arc_result.map_err(FetchError::Decode)?
             }
         };
@@ -1120,6 +1133,8 @@ fn consumer_loop<W: std::io::Write>(
                 block_fetcher,
             )?;
         }
+        iter_us_sum += t_iter.elapsed().as_micros();
+        iter_count += 1;
     }
 
     // Final drain — flush remaining post-processes in encoded order.
@@ -1132,6 +1147,17 @@ fn consumer_loop<W: std::io::Write>(
             total_size,
             block_fetcher,
         )?;
+    }
+    let _ = submit_us_sum; // reserved for future submit-only timing
+
+    if trace::is_enabled() {
+        trace::emit(
+            "consumer",
+            "consumer_loop_summary",
+            &format!(
+                r#""iters":{iter_count},"iter_sum_us":{iter_us_sum},"prefetch_us":{prefetch_us_sum},"finder_us":{finder_us_sum},"fetcher_get_us":{fetcher_get_us_sum}"#,
+            ),
+        );
     }
 
     Ok(())
