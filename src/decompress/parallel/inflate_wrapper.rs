@@ -639,6 +639,10 @@ impl<'a> IsalInflateWrapper<'a> {
             finished,
         })
     }
+
+    pub fn session_pending(&self) -> bool {
+        false
+    }
 }
 
 // ── Pure-Rust backend (Track B3) ─────────────────────────────────────────
@@ -775,6 +779,10 @@ impl<'a> IsalInflateWrapper<'a> {
             bit_position: r.bit_position,
             finished: r.finished,
         })
+    }
+
+    pub fn session_pending(&self) -> bool {
+        self.inner.session_pending()
     }
 }
 
