@@ -167,47 +167,86 @@ perf record -F 999 -g --call-graph dwarf -- \
 perf script | inferno-flamegraph > /tmp/flame-pure-rust.svg
 ```
 
-### Phase B — Instrument before optimizing (CURRENT FOCUS)
+### Phase B — Instrument before optimizing (STEP-ZERO COMPLETE)
 
-**Step zero**: locate the per-chunk wall-time penalty. On real
-silesia, per-chunk decode is ~47ms p50 (109ms p95); the inflate-only
-bench says pure-Rust does 334 MB/s → ~5-8ms for a 1.6 MB chunk. So
-85% of per-chunk wall time is something OTHER than inner inflate.
-Optimizing inflate alone (doubling to 600 MB/s) would only shave
-~3ms — leaves the gap effectively unchanged. **Find the missing 40ms
-before writing SIMD code.**
+**Step-zero result (2026-05-24, neurotic, real silesia.tar.gz)**:
 
-Per-chunk timing spans to add (worker thread, gated on `trace::is_enabled()`):
+Two trace events landed at commit `6788651`: `decode_span` (worker)
+splits `bootstrap_us` vs `inflate_us`; `post_process_span`
+(post_process pool) splits `materialize_us` / `apply_window_us` /
+`populate_subchunk_windows_us`. Numbers on a fresh CLI run (49 decode
+spans, 26 post-process spans, ~889 ms wall):
 
-1. **`bootstrap`** — `decode_chunk_marker_bootstrap_then_isal` from
-   stream entry to first inflate byte (Huffman-table parse for
-   DYNAMIC blocks, or BlockFinder candidate-walk if start_bit ≠
-   block boundary).
-2. **`inflate_to_markers`** — pure-Rust resumable inflate emitting
-   u16 marker stream (`ResumableInflate2::read_stream`).
-3. **`replace_markers`** — `apply_window` resolving u16 markers vs
-   the 32 KiB predecessor window (AVX2 path already in
-   `replace_markers.rs:147-181`).
-4. **`window_publish`** — building per-subchunk tail windows
-   (`populate_subchunk_windows`) + consumer-side
-   `publish_subchunk_windows`.
-5. **`output_copy`** — consumer-thread narrow + write to user's
-   writer.
+| span                            | sum (ms) | p50    | p95    | max    |
+| ------------------------------- | --------:| ------:| ------:| ------:|
+| **bootstrap**                   | **1060** | 14.2ms | 56.3ms | 62.4ms |
+| inflate (phase 2)               | 499      | 0us    | 48.6ms | 52.2ms |
+| apply_window (replace_markers AVX2) | 17   | 459us  | 1.8ms  | 2.1ms  |
+| populate_subchunk_windows       | 52       | 1.3ms  | 3.1ms  | 20.7ms |
 
-Emit p50/p95/max for each span. `scripts/parallel_sm_log_summary.py`
-already parses span events; extend its summary table with the new
-labels.
+Phase distribution among decode_spans:
+- `bootstrap_only`: **29 of 49** (59% — chunk fully decoded in phase 1)
+- `bootstrap+inflate`: 19 of 49
+- `bootstrap_terminal`: 1 (BFINAL fired)
 
-**Likely outcomes** (in decreasing prior):
-- Marker bootstrap dominates on slow-path chunks (no window → must
-  re-bootstrap DYNAMIC table per chunk). Fix: amortize boundary search
-  → fewer "slow" decodes. See Phase E (speculation depth).
-- Marker replace is small (already AVX2) — verify, not assume.
-- Inner inflate is the predicted 5-8ms per chunk; SIMD primitives buy
-  ~3ms per chunk = 5-10% of wall time, not the order-of-magnitude
-  fix.
-- Output copy is small (consumer is single-thread but bytes are
-  already resolved).
+**Bootstrap dominates: 1060 ms of CPU work vs 499 ms inflate.** Across
+T=16 workers ideal wall = 97 ms; actual wall = 889 ms → ~9% scaling.
+**Marker replacement is NOT the bottleneck** (advisor's prior was
+wrong — AVX2 replace_markers takes 17 ms total).
+
+**Why bootstrap dominates**: `bootstrap_with_deflate_block`
+(`gzip_chunk.rs:511`) drives `deflate_block::Block::read_header` +
+`Block::read` block-by-block, emitting u16 markers when back-ref
+distance reaches before chunk start. It hands off to phase 2 (fast
+`decode_chunk_isal_impl` using `ResumableInflate2`) only once 32 KiB
+of "clean" (non-marker) bytes have accumulated AT a block boundary.
+For incompressible / dense-match regions of silesia, that threshold
+is never crossed in a chunk → 59% of chunks run end-to-end through
+the slow per-block bootstrap path.
+
+The 334 MB/s pure-Rust inflate benched in
+`inflate_isal_vs_pure_rust.rs` is `ResumableInflate2` — a **different
+code path** from `deflate_block::Block`. The bench measures phase 2.
+Phase 1 has never been benched in isolation; it is the bottleneck.
+
+### Phase B — Fix path options (advisor-flagged)
+
+Three candidates (advisor recommendation: **C with B fallback**):
+
+A. **Optimize `deflate_block::Block`.** Wire SIMD primitives
+   (`vector_huffman`, `two_level_table`) into its hot loop. Lowest
+   risk to architecture; preserves the bootstrap pattern.
+   **Advisor verdict**: dead-end, perpetuates non-vendor architecture.
+   Don't pursue.
+
+B. **Have `ResumableInflate2` emit markers when window unknown.**
+   Today phase 2 requires a clean window; phase 1 exists to build
+   one. Unifying lets phase 2's SIMD-friendly code path handle the
+   whole chunk, with markers, when window is empty. Bootstrap
+   becomes vestigial.
+
+C. **SIMD `BlockFinder` boundary handoff.** Run a SIMD-aware
+   pre-pass over the compressed stream that produces
+   `Vec<BitOffset>` of valid dynamic-Huffman / fixed / stored block
+   starts. Workers receive `(start_bit, end_bit)` pairs and skip
+   bootstrap entirely — they dispatch directly to phase 2 from a
+   known boundary with an empty initial window (markers emerge
+   naturally for the first ≤ 32 KiB).
+   - Vendor pattern: `vendor/rapidgzip/librapidarchive/blockfinder/DynamicHuffman.hpp`
+     + `PigzStringView.hpp`, driven by `ParallelBitStringFinder`.
+   - Cost: O(compressed_size) SIMD scan on parent thread before
+     worker dispatch. Probably < 50 ms vs the 1060 ms bootstrap
+     currently consumes.
+   - **Advisor verdict**: this is what rapidgzip actually ships.
+
+**Combined plan**: implement C first, fall back to B for chunks
+where the finder finds no boundary in range. Both share the
+`ResumableInflate2` SIMD path; C eliminates bootstrap from the hot
+worker path; B's marker-emission mode covers the residual.
+
+Once C+B ship, `bootstrap_with_deflate_block` becomes unused and
+`gzip_chunk.rs:511` + the `deflate_block::Block` module can be
+retired.
 
 **Then**, once measurements show the hot span:
 
