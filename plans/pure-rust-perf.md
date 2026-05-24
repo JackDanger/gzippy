@@ -122,12 +122,53 @@ items land.
 
 | # | Item | Status | Bench moved? |
 |---|---|---|---|
-| 1 | SIMD-ify Huffman hot loops (a)+(b) | not started | gate 1 still 2.39×, gate 2 still 2.76× |
+| 1 | SIMD-ify Huffman hot loops (a)+(b) | ACTIVE — confirmed as the lever | gate 1 still 2.39×, gate 2 went 2.76× → 2.79× (no change yet) |
 | 2 | Subtable bit-accounting (failure #2) | not started | `with_until_bits_resume_non_byte_aligned_with_dict` red |
 | 3 | Proactive `RawBlockFinderCoordinator` | not started | `speculative_missing` still 28.6% |
 | 4 | Retire phase-1 bootstrap | blocked on #1, #2 | bootstrap span still dominant |
-| 5 | CRC32 interleave + worker-side window publish | not started | consumer-thread stall span not yet traced |
+| 5 | CRC32 interleave + worker-side window publish | partial (worker-side narrow landed 41076a0) | wall 998ms → 881ms (12% improvement) |
 | 6 | `Cargo.toml` + ISA-L deletion | blocked on #1, #4 | gate 4 not attempted |
+
+## Pipeline serialization is vendor-faithful — the lever is per-chunk decode time
+
+Diagnostic trace from commit `79ff796` (`consumer_loop_summary` event)
+on real silesia (727ms wall):
+
+| consumer-thread span                  | sum    | % of wall |
+| ------------------------------------- | ------:| ---------:|
+| `iter_sum` (outer-loop iterations)    | 706 ms | 97%       |
+| `fetcher_get_us` (`block_fetcher.get_with_prefetch`) | 500 ms | 70% |
+| `prefetch_us` (`process_ready_prefetches`) | 0 ms |           |
+| `finder_us` (`block_finder.get`)      | 0 ms   |           |
+| `total_us` (consumer drain — narrow/CRC/write/publish) | 38 ms | 5% |
+| `recv_us` (waiting for post_process)  | 0 ms   |           |
+| Worker decode work sum                | 3000 ms (T=16 ideal: **187 ms**) |
+| Worker queue wait sum                 | 12 ms  |           |
+
+**Interpretation**: the consumer outer loop spends 70% of wall time
+inside `block_fetcher.get_with_prefetch`, waiting for the NEXT chunk
+in encoded order to finish decoding. This is structurally serial —
+the chunk's stitched window must be applied in order. Vendor
+`rapidgzip::GzipChunkFetcher::processNextChunk` has the same shape;
+this is the rapidgzip-faithful design.
+
+Because workers ARE saturated (3000 ms work / 16 cores = 187 ms
+ideal wall) but the consumer can only ADVANCE one chunk at a time,
+the only way to reduce wall is to reduce the per-chunk wait the
+consumer spends inside `block_fetcher.get_with_prefetch`. That wait
+equals **per-chunk decode time minus parallelism overlap**.
+
+At ~14ms wait per chunk × 35 iterations = 500ms `fetcher_get_us`.
+Reducing per-chunk decode time from 40ms → 13ms (3× speedup via
+SIMD inner inflate) drops the wait to ~5ms × 35 = 175ms. Total
+wall would land near 250-300ms (2.5-3× speedup). This is the
+**only** lever that moves wall.
+
+What does NOT move wall:
+- Increasing prefetch depth (workers already saturated).
+- Larger chunks (reduces iter count but proportionally raises per-chunk wait).
+- Making the consumer's outer loop "parallel" (vendor doesn't, and
+  the in-order stitching is a correctness constraint).
 
 ## How to capture the next measurement
 
