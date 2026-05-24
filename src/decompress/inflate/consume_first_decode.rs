@@ -3140,7 +3140,12 @@ impl<'a> ResumableInflate<'a> {
 
             let decode_start = self.session.len();
             let max_new = output.len() - user_written;
-            self.session.resize(decode_start + max_new.max(65536), 0);
+            // Block decoders run to completion (no mid-block yield). ISA-L drains
+            // incrementally via tmp_out; we need enough scratch for one block's
+            // full expansion. TODO: resumable tmp_out_buffer (vendor isal.hpp).
+            const PER_BLOCK_HEADROOM: usize = 8 * 1024 * 1024;
+            self.session
+                .resize(decode_start + max_new.max(PER_BLOCK_HEADROOM), 0);
             let new_pos = match btype {
                 0 => decode_stored(&mut self.bits, &mut self.session, decode_start)?,
                 1 => decode_fixed(&mut self.bits, &mut self.session, decode_start)?,

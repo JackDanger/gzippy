@@ -118,6 +118,35 @@ pub enum InflateError {
     StartBitPastEnd,
     SetDictFailed,
     Internal(i32),
+    /// Pure-Rust `ResumableInflate` decode error with the original message.
+    ResumableInflate(String),
+}
+
+/// Map `std::io::Error` from `ResumableInflate` without collapsing to `InvalidBlock`.
+#[cfg(all(feature = "pure-rust-inflate", target_arch = "x86_64"))]
+fn map_resumable_inflate_err(err: std::io::Error) -> InflateError {
+    use std::io::ErrorKind;
+    let msg = err.to_string();
+    match err.kind() {
+        ErrorKind::InvalidData => {
+            if msg.contains("Output overflow") {
+                return InflateError::ResumableInflate(msg);
+            }
+            if msg.contains("Invalid distance") || msg.contains("lookback") {
+                return InflateError::InvalidLookback;
+            }
+            if msg.contains("Invalid code") || msg.contains("symbol") {
+                return InflateError::InvalidSymbol;
+            }
+            if msg.contains("Invalid stored block") || msg.contains("Reserved block type") {
+                return InflateError::InvalidBlock;
+            }
+            InflateError::ResumableInflate(msg)
+        }
+        ErrorKind::UnexpectedEof => InflateError::ResumableInflate(msg),
+        ErrorKind::WriteZero => InflateError::ResumableInflate(msg),
+        _ => InflateError::ResumableInflate(msg),
+    }
 }
 
 /// Wraps a patched-ISA-L `inflate_state`. Consumes raw deflate bits
@@ -739,7 +768,7 @@ impl<'a> IsalInflateWrapper<'a> {
         let r = self
             .inner
             .read_stream(output)
-            .map_err(|_| InflateError::InvalidBlock)?;
+            .map_err(map_resumable_inflate_err)?;
         Ok(ReadStreamResult {
             bytes_written: r.bytes_written,
             stopped_at: StoppingPoints(r.stopped_at.0),
