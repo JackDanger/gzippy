@@ -122,7 +122,7 @@ items land.
 
 | # | Item | Status | Bench moved? |
 |---|---|---|---|
-| 1 | SIMD-ify Huffman hot loops (a)+(b) | ACTIVE — confirmed as the lever | gate 1 still 2.39×, gate 2 went 2.76× → 2.79× (no change yet) |
+| 1 | SIMD-ify Huffman hot loops (a)+(b) | ACTIVE — confirmed as the lever; one SIMD attempt reverted | gate 1 currently 2.43× (323/785 MB/s); gate 2 currently 2.72× |
 | 2 | Subtable bit-accounting (failure #2) | not started | `with_until_bits_resume_non_byte_aligned_with_dict` red |
 | 3 | Proactive `RawBlockFinderCoordinator` | not started | `speculative_missing` still 28.6% |
 | 4 | Retire phase-1 bootstrap | blocked on #1, #2 | bootstrap span still dominant |
@@ -169,6 +169,27 @@ What does NOT move wall:
 - Larger chunks (reduces iter count but proportionally raises per-chunk wait).
 - Making the consumer's outer loop "parallel" (vendor doesn't, and
   the in-order stitching is a correctness constraint).
+
+## SIMD attempt log
+
+| commit | attempt | result |
+| --- | --- | --- |
+| `48c8cf4` | Worker-side narrow + AVX2 `_mm256_packus_epi16` | regressed (silesia 2.76→3.00) — AVX2 narrow gated behind env in `41076a0` |
+| `41076a0` | Worker-side **scalar** narrow only | **kept** — silesia 998→881 ms (12% wall improvement) |
+| `ca52389` | Multi-literal FASTLOOP in `decode_huffman_body_resumable` mirroring `decode_huffman_cf_vector` | regressed bench 334→284 MB/s, silesia 2.79→3.06 — reverted in `d08732f` |
+| `d08732f` | Revert multi-literal fastloop | back to 323 MB/s bench, 2.72× silesia |
+
+**Why the multi-literal fastloop regressed**: `vector_huffman::decode_multi_literals` (4-symbol lookahead) wins when literal clusters are common in the data. Silesia is binary/mixed-content (tar of various corpus files); short literal runs are interrupted by length codes, so the lookahead returns `count=0` on most calls and the per-iteration overhead isn't recovered. The advisor's hypothesis #4 (low hit rate on length-heavy data) was correct.
+
+**Known infrastructure issue**: The `pub static` counters in `resumable.rs` are duplicated between the lib and bin compilations of the same crate name (addresses differ by 160 bytes). main.rs `use gzippy::...::COUNTER` reads a different instance than `decode_huffman_body_resumable` increments. Workaround: read counters from a unit-test in the lib, or move main.rs to a separate crate. Both feasible; track when next diagnostic needs counter visibility from the CLI.
+
+**What to try next for item #1**:
+- BMI2 `pext` bit extraction in the per-symbol decode (no table reshape, just faster bit shifts). Independent of cluster patterns.
+- FIXED-Huffman static-table specialization in `decode_huffman_body_resumable` (FIXED blocks have known code lengths, table doesn't need rebuilding).
+- Larger TABLE_BITS in LitLenTable (12 or 13 bit main table → fewer subtable hits on common codes).
+- libdeflate's specific scalar tricks (it's faster per-call than `decode_huffman_cf_vector` minus multi-literal because of subtler optimizations in `lookup`/`consume_entry`).
+
+Each one independent of cluster-pattern assumptions, so each one's win is measurable in isolation.
 
 ## How to capture the next measurement
 
