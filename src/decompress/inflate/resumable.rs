@@ -465,7 +465,27 @@ impl<'a> ResumableInflate2<'a> {
             }
 
             if matches!(self.block_state, BlockState::Finished) {
-                if self
+                // Match vendor / OLD wrapper semantics
+                // (consume_first_decode.rs:3198-3211): when both
+                // END_OF_BLOCK and END_OF_STREAM are requested, the
+                // BFINAL block's EOB fires END_OF_BLOCK FIRST. Callers
+                // that drive a chunk-by-chunk decoder
+                // (`gzip_chunk.rs::decode_chunk_isal_impl`) treat
+                // END_OF_BLOCK+`is_final_block=true` as the natural exit
+                // for the last block of a single-member stream — they
+                // never want to read a footer from the chunk's input
+                // slice (which contains only the deflate body, no
+                // trailer; the trailer is parsed by `sm_driver` from
+                // the outer gzip envelope). The new wrapper firing
+                // END_OF_STREAM here would route execution into the
+                // footer-read branch of `decode_chunk_isal_impl` and
+                // `read_footer_at_current` would return Internal(-1)
+                // because the input slice ends at the deflate body.
+                // END_OF_STREAM still fires when ONLY END_OF_STREAM is
+                // requested (e.g. multi-stream `gzip_chunk` config).
+                if self.points_to_stop_at.contains(StoppingPoint::END_OF_BLOCK) {
+                    self.stopped_at = StoppingPoint::END_OF_BLOCK;
+                } else if self
                     .points_to_stop_at
                     .contains(StoppingPoint::END_OF_STREAM)
                 {

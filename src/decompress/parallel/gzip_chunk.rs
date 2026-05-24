@@ -122,10 +122,15 @@ fn decode_chunk_isal_impl(
     // duplicating its bytes in the output.
     let mut reached_stream_end = false;
     let mut pending_stop_after_flush = false;
-    #[cfg(not(feature = "pure-rust-inflate"))]
+    // §5 step 5 (NEW wrapper / ResumableInflate2): the pure-rust backend no
+    // longer has a `session` accumulator, so `session_pending()` is always
+    // false. The old "keep looping to drain session" behavior (a6c0a8b) would
+    // run past the partition boundary, clobbering `last_end_bit` with the
+    // bit_position of the NEXT block's header — successor chunks would then
+    // resume at a non-block-boundary and decode garbage Huffman tables. With
+    // ResumableInflate2 the inner loop must STOP as soon as
+    // `pending_stop_after_flush` fires, same as the isal-only build.
     const STOP_INNER_ON_PENDING_FLUSH: bool = true;
-    #[cfg(feature = "pure-rust-inflate")]
-    const STOP_INNER_ON_PENDING_FLUSH: bool = false;
 
     while !stopping_point_reached || wrapper.session_pending() {
         let mut buffer: types::U8 = types::u8_with_capacity(ALLOCATION_CHUNK_SIZE);
