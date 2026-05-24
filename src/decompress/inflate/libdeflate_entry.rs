@@ -536,10 +536,13 @@ pub struct DistTable {
 }
 
 impl DistTable {
-    /// Number of bits for main table
-    pub const TABLE_BITS: u8 = 8;
+    /// Number of bits for main table.
+    /// 9 bits (512 entries) on x86_64 — same rationale as
+    /// LitLenTable::TABLE_BITS, fewer subtable hits on common distance
+    /// codes. Tested 8 → 9 on neurotic post-LitLenTable=12.
+    pub const TABLE_BITS: u8 = 9;
     /// Maximum number of subtable bits
-    pub const MAX_SUBTABLE_BITS: u8 = 7; // 15 - 8
+    pub const MAX_SUBTABLE_BITS: u8 = 6; // 15 - 9
 
     /// Build a distance decode table from code lengths
     pub fn build(code_lengths: &[u8]) -> Option<Self> {
