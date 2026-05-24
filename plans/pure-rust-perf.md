@@ -1,181 +1,88 @@
-# Pure-Rust parallel SM — performance plan
+# Pure-Rust perf — measurement log + active work-item status
 
-§5 of `rust-rapidgzip.md` is correctness-complete: pure-Rust resumable
-inflate + vendor-faithful parallel SM ports, both backends green on
-neurotic (33/33 pure-rust-inflate routing + 32/32 isal-compression).
-This document is the *performance* follow-up: drive the
-`--features pure-rust-inflate` path from "works" to "matches and then
-exceeds rapidgzip's patched-ISA-L parallel SM."
+This document tracks the live measurements that prove (or refute)
+progress on the **one deliverable** stated in `plans/rust-rapidgzip.md`.
 
-## Baseline measurements (2026-05-24, neurotic, 16-core x86_64)
+It is not a phase plan. There is exactly one deliverable; this file
+is its dashboard.
 
-### Inner inflate — full-stream silesia deflate body, single-threaded
+## Live baseline (2026-05-24, neurotic, 16-core x86_64)
 
-`benches/inflate_isal_vs_pure_rust.rs` (best of 3 runs):
+All numbers via `--features pure-rust-inflate` unless noted.
 
-| Decoder                                 | Throughput |
-| --------------------------------------- | ---------- |
-| Patched ISA-L via `IsalInflateWrapper`  | 799 MB/s   |
-| Pure-Rust `ResumableInflate2`           | 334 MB/s   |
-| **Ratio (ISA-L / pure-Rust)**           | **2.39×**  |
+### Gate 1 — inner-inflate parity
 
-Plan §5 Tier 1 gate: ≤ 1.5× ISA-L. **Currently failing by ~0.9×.**
+`benches/inflate_isal_vs_pure_rust.rs`, best of 3 runs:
 
-### End-to-end parallel SM — real silesia.tar.gz (67 MiB → 211 MiB), T=16
+| Decoder                                       | Throughput |
+| --------------------------------------------- | ---------- |
+| Patched ISA-L via `IsalInflateWrapper`        | 799 MB/s   |
+| Pure-Rust `ResumableInflate2`                 | 334 MB/s   |
+| **Ratio (ISA-L / pure-Rust)**                 | **2.39×**  |
 
-`test_single_member_parallel_silesia` with
-`--features pure-rust-inflate` (Phase A's real gate per advisor audit):
+Deliverable target: ≤ 1.05×. Currently failing by 1.34×.
 
-| Path                                | Wall time | Output rate |
-| ----------------------------------- | --------- | ----------- |
-| T=1 sequential (libdeflate one-shot) | 361 ms    | 586 MB/s    |
-| T=16 parallel SM (pure-Rust resumable inflate) | 998 ms | 212 MB/s |
-| **Ratio (par/seq)**                 | **2.76× SLOWER parallel** |
+⚠️ **This bench measures `ResumableInflate2` (parallel-SM phase 2 /
+work item 1(a)).** It does NOT measure `deflate_block::Block::read_
+internal_compressed_canonical_specialized` (parallel-SM phase 1 /
+work item 1(b)). The 334 MB/s number was treated as the
+single-thread inflate rate for the whole parallel-SM pipeline. It
+isn't — see "Phase B step-zero finding" below.
 
-Per-chunk decode trace from `GZIPPY_LOG_FILE`:
+### Gate 2 — E2E silesia parallel beats sequential
 
-- 75 chunks decoded, p50=39ms, p95=109ms, max=172ms per chunk
-- For ~1.6 MB output per chunk @ 334 MB/s pure-Rust inflate rate, expected ≈ 5-8ms
-- **Per-chunk decode is ~5-10× slower than the inflate-only bench predicts**
-- Speculation outcomes: 62.9% accepted, 28.6% missing (slow-path
-  boundary search), 2.9% mismatched
+`test_single_member_parallel_silesia` (real silesia.tar.gz, 67 MiB
+→ 211 MiB output):
 
-### Page-fault CPU% (2026-05-24 fresh measurement, neurotic, real silesia)
+| Path                                          | Wall time | Output rate |
+| --------------------------------------------- | --------- | ----------- |
+| T=1 sequential (libdeflate one-shot)          | 361 ms    | 586 MB/s    |
+| T=16 parallel SM (pure-Rust resumable inflate) | 998 ms    | 212 MB/s    |
+| **Ratio (par/seq)**                           | **2.76× SLOWER parallel** |
 
-`perf record -F 999 --call-graph dwarf` on
-`./target/release/gzippy -d -c silesia-gzip.tar.gz --features pure-rust-inflate`:
+Deliverable target: < 0.5. Currently failing by 5.5×.
+
+### Gate 3 — `make ship` vs rapidgzip
+
+Not yet measured for pure-rust-inflate (would be performative — Gate 2
+is the dominant signal, and `make ship` requires Gate 2 to pass first).
+
+### Gate 4 — tree cleanliness
+
+Not yet attempted. `vendor/isa-l`, `vendor/isal-rs`,
+`packaging/isal-patches/` present. `src/backends/isal_decompress.rs`
+and `isal_compress.rs` present.
+
+## Phase A — page-faults (CLOSED 2026-05-24)
+
+`perf record -F 999 --call-graph dwarf` on neurotic against real
+silesia:
 
 | Component                                    | % of weighted cycles |
 | -------------------------------------------- | -------------------- |
 | `asm_exc_page_fault` ∪ `clear_page_erms` (all stacks) | **17.2%**     |
 | `clear_page_erms` alone                      | 0.7%                 |
 
-**Phase A's premise was stale.** The 40% page-fault number cited in
-prior plan text was measured BEFORE arena-allocator
-(`Cargo.toml:39,50-51`) + per-worker LIFO pool
-(`chunk_buffer_pool.rs:108-204`) landed. Current measurement matches
-rapidgzip's 17% — Phase A's page-fault gap is already closed. The
-2.76× slowdown is NOT page-fault-bound.
+This matches rapidgzip's documented 17%. The arena-allocator
+(`Cargo.toml:39,50-51` → `Vec<_, RpmallocAlloc>` for `ChunkData::data`)
++ per-worker LIFO pool (`chunk_buffer_pool.rs:108-204`) closed the gap.
 
-### End-to-end parallel SM — synthetic PRNG fixture, T=16 (adversarial)
+The 40% number cited in prior plan revisions was measured **before**
+arena-allocator landed on main. Stale prior, caught by re-measurement.
+**Do not re-do.**
 
-`test_single_member_parallel_silesia_class_not_slower_than_sequential`
-runs a 24 MiB **PRNG-generated** fixture compressed with
-`flate2::Compression::best()`. PRNG is incompressible; the gzip
-stream is dense literals with few back-refs and few block boundaries
-— the speculation-pathology corner case CLAUDE.md flags. Ratios
-(parallel/seq): 3.5×–7.7× across runs. **This fixture is NOT the
-Phase A gate**; it's a graceful-degradation check. Loosen its
-threshold to 6× (catch catastrophe, not require parity).
+If a future regression brings page-faults back, the untried levers
+(in decreasing safety) are: worker-local pre-touch of pool buffers
+after `bind_worker_pool_index` → `MADV_HUGEPAGE` on buffers ≥ 2 MiB →
+`#[global_allocator] = rpmalloc::RpMalloc`. Each carries its own
+unproven-tier risk; consumer-thread prewarm regressed −50%
+previously (`chunk_buffer_pool.rs:84-88`).
 
-### vs rapidgzip parallel SM on x86_64
+## Phase B step-zero finding — bootstrap dominates
 
-gzippy's `--features isal-compression` parallel SM ≈ rapidgzip
-parallel: same patches, same ISA-L underneath, same chunked-decode
-architecture. That path is covered by `make ship`'s authoritative
-bench. The **pure-Rust** path is currently slower than gzippy's own
-sequential libdeflate decoder; the per-chunk-decode penalty (≥5×
-the inflate-rate prediction) means inner-inflate SIMD alone won't
-close the gap. Phase B must first locate WHERE the per-chunk
-penalty lives — see "Phase B — instrument before optimizing."
-
-## Six phases to exceed rapidgzip (from `rust-rapidgzip.md §"Beyond parity"`)
-
-Each phase is its own branch + PR + bench-on-neurotic. Abandon any
-that doesn't beat its prior measurement.
-
-### Phase A — Close the page-fault gap (CLOSED 2026-05-24)
-
-**STATUS: COMPLETE.** Re-measurement on neurotic against real
-silesia.tar.gz shows `asm_exc_page_fault + clear_page_erms` at
-**17.2%** (matches rapidgzip's documented 17%). The arena-allocator
-+ per-worker LIFO pool already in `main` closed this gap. The
-remaining slowdown of pure-Rust parallel SM vs sequential libdeflate
-(2.76× ratio on real silesia) is NOT page-fault-bound. See "Phase B
-— instrument before optimizing."
-
-**Historical premise (kept for context):**
-`src/decompress/parallel/chunk_buffer_pool.rs:73-82` originally
-documented ~40% page-fault CPU% vs rapidgzip's 17%. That measurement
-predated the `arena-allocator` (`Cargo.toml:39,50-51`) + per-worker
-LIFO pool (`chunk_buffer_pool.rs:108-204`) shipping on `main`. The
-2.76× E2E slowdown is from a different cause — per-chunk decode is
-5-10× slower than the inflate-only bench would predict, meaning
-~85% of per-chunk wall time is something OTHER than inflate
-(suspected: marker bootstrap + BlockFinder + speculation overhead).
-
-**If a future regression brings page-faults back, the levers (in
-decreasing safety) are:**
-
-1. **Worker-local pre-touch of pool buffers.** The consumer-thread
-   prewarm regressed −50% (`chunk_buffer_pool.rs:84-88`); worker-local
-   has not been tried. After `bind_worker_pool_index`
-   (`chunk_buffer_pool.rs:124`), iterate the pool and write a zero
-   to each pooled Vec's first byte per 4 KiB page. One fault per page
-   *once per worker*, not once per chunk.
-2. **`MADV_HUGEPAGE` on chunk buffers ≥ 2 MiB.** New code in
-   `rpmalloc_alloc.rs::types::u8_with_capacity`:
-   ```rust
-   #[cfg(target_os = "linux")]
-   if cap >= 2 * 1024 * 1024 {
-       unsafe {
-           libc::madvise(v.as_mut_ptr().cast(), v.capacity(),
-                         libc::MADV_HUGEPAGE);
-       }
-   }
-   ```
-3. **`#[global_allocator] = rpmalloc::RpMalloc`.** Highest risk
-   (`chunk_buffer_pool.rs:94-96` flags it "unproven"; prior
-   mimalloc/jemalloc tries regressed). Requires adding the `rpmalloc`
-   crate (not `rpmalloc-sys`) and a `static GLOBAL: RpMalloc =
-   RpMalloc;` in `main.rs`.
-
-**Exact commands** (run on neurotic over `ssh -J neurotic root@10.30.0.199`):
-
-```bash
-# Build (pure-rust feature, release):
-cargo build --release --features pure-rust-inflate
-
-# Correctness gate (must stay green):
-cargo test --release --features pure-rust-inflate -- routing
-
-# Bench gate (the failing test today):
-cargo test --release --features pure-rust-inflate -- \
-  test_single_member_parallel_silesia_class_not_slower_than_sequential \
-  --ignored --nocapture
-
-# Inner-inflate bench (the 799 / 334 MB/s baseline):
-cargo bench --features isal-compression \
-  --bench inflate_isal_vs_pure_rust -- --nocapture
-```
-
-**Bench gate (pass/fail) — superseded.** The 4.04 / page-fault gates
-above were Phase A measurements. After 2026-05-24's re-measurement
-(17% page-fault — already at rapidgzip parity), Phase A's exit gate
-collapses to: re-measure annually to detect regression. **The active
-gate is now Phase B's bench** (real silesia ratio < 1.0 vs T=1
-libdeflate, then < 0.5).
-
-**Flame-graph capture (on neurotic):**
-
-```bash
-ssh -J neurotic root@10.30.0.199
-cd ~/gzippy-dev
-cargo build --release --features pure-rust-inflate
-perf record -F 999 -g --call-graph dwarf -- \
-    ./target/release/gzippy -d -c benchmark_data/silesia-gzip.tar.gz > /dev/null
-perf script | inferno-flamegraph > /tmp/flame-pure-rust.svg
-```
-
-### Phase B — Instrument before optimizing (STEP-ZERO COMPLETE)
-
-**Step-zero result (2026-05-24, neurotic, real silesia.tar.gz)**:
-
-Two trace events landed at commit `6788651`: `decode_span` (worker)
-splits `bootstrap_us` vs `inflate_us`; `post_process_span`
-(post_process pool) splits `materialize_us` / `apply_window_us` /
-`populate_subchunk_windows_us`. Numbers on a fresh CLI run (49 decode
-spans, 26 post-process spans, ~889 ms wall):
+Instrumented run on real silesia (commit `6788651` added
+`decode_span` + `post_process_span` events; commit `77eda45`
+recorded the numbers below):
 
 | span                            | sum (ms) | p50    | p95    | max    |
 | ------------------------------- | --------:| ------:| ------:| ------:|
@@ -184,282 +91,181 @@ spans, 26 post-process spans, ~889 ms wall):
 | apply_window (replace_markers AVX2) | 17   | 459us  | 1.8ms  | 2.1ms  |
 | populate_subchunk_windows       | 52       | 1.3ms  | 3.1ms  | 20.7ms |
 
-Phase distribution among decode_spans:
-- `bootstrap_only`: **29 of 49** (59% — chunk fully decoded in phase 1)
-- `bootstrap+inflate`: 19 of 49
+Phase distribution among 49 worker decodes:
+- `bootstrap_only`: **29** (chunk fully decoded in phase 1)
+- `bootstrap+inflate`: 19
 - `bootstrap_terminal`: 1 (BFINAL fired)
 
-**Bootstrap dominates: 1060 ms of CPU work vs 499 ms inflate.** Across
-T=16 workers ideal wall = 97 ms; actual wall = 889 ms → ~9% scaling.
-**Marker replacement is NOT the bottleneck** (advisor's prior was
-wrong — AVX2 replace_markers takes 17 ms total).
+Speculation outcomes: 62.9% accepted, 28.6% missing, 2.9%
+mismatched.
 
-**Why bootstrap dominates**: `bootstrap_with_deflate_block`
-(`gzip_chunk.rs:511`) drives `deflate_block::Block::read_header` +
-`Block::read` block-by-block, emitting u16 markers when back-ref
-distance reaches before chunk start. It hands off to phase 2 (fast
-`decode_chunk_isal_impl` using `ResumableInflate2`) only once 32 KiB
-of "clean" (non-marker) bytes have accumulated AT a block boundary.
-For incompressible / dense-match regions of silesia, that threshold
-is never crossed in a chunk → 59% of chunks run end-to-end through
-the slow per-block bootstrap path.
+**Interpretation**:
 
-The 334 MB/s pure-Rust inflate benched in
-`inflate_isal_vs_pure_rust.rs` is `ResumableInflate2` — a **different
-code path** from `deflate_block::Block`. The bench measures phase 2.
-Phase 1 has never been benched in isolation; it is the bottleneck.
+Bootstrap is the bottleneck, not inflate. Bootstrap runs
+`deflate_block::Block::read_internal_compressed_canonical_specialized`
+(work item 1(b)). The 334 MB/s pure-Rust inflate bench measures
+`ResumableInflate2` (work item 1(a)) — a different code path. Phase
+1 has never been benched in isolation.
 
-### Phase B — Fix path (advisor-revised after vendor cross-check)
+Vendor's `GzipChunk.hpp::decodeChunkWithRapidgzip` ALSO has a
+bootstrap phase using `deflate::Block::read()`. The slowdown is not
+architectural — gzippy's per-symbol scalar decoder is just slower
+than vendor's SIMD-batched one. Work item #1 is the vendor-faithful
+fix; the architectural alternatives (parent-thread BlockFinder
+pre-pass, unified phase 1 / phase 2 decoder via marker emission) are
+not vendor patterns and are not on the critical path.
 
-**TL;DR: Option A — SIMD-ify `deflate_block::Block::read()` — is the
-vendor-faithful fix.**
+## Work-item status
 
-Initial advisor recommendation was option C (SIMD BlockFinder parent-
-thread pre-pass to skip bootstrap). Cross-checking vendor:
+Mirrors `plans/rust-rapidgzip.md` six items. Update this table as
+items land.
 
-1. `vendor/rapidgzip/librapidarchive/src/core/BlockFinder.hpp` —
-   vendor's BlockFinder is **async single-thread prefetcher**, NOT a
-   parent-thread pre-pass. Runs in parallel with workers.
-2. `vendor/rapidgzip/librapidarchive/src/rapidgzip/chunkdecoding/GzipChunk.hpp`
-   — vendor's `decodeChunkWithRapidgzip` is the bootstrap analog. It
-   uses `deflate::Block::read()` block-by-block. **Vendor has the
-   same bootstrap pattern gzippy ports.**
-3. So the slowdown is NOT architectural. It's that gzippy's
-   `deflate_block::Block::read()` is slower than vendor's
-   `deflate::Block::read()`.
+| # | Item | Status | Bench moved? |
+|---|---|---|---|
+| 1 | SIMD-ify Huffman hot loops (a)+(b) | not started | gate 1 still 2.39×, gate 2 still 2.76× |
+| 2 | Subtable bit-accounting (failure #2) | not started | `with_until_bits_resume_non_byte_aligned_with_dict` red |
+| 3 | Proactive `RawBlockFinderCoordinator` | not started | `speculative_missing` still 28.6% |
+| 4 | Retire phase-1 bootstrap | blocked on #1, #2 | bootstrap span still dominant |
+| 5 | CRC32 interleave + worker-side window publish | not started | consumer-thread stall span not yet traced |
+| 6 | `Cargo.toml` + ISA-L deletion | blocked on #1, #4 | gate 4 not attempted |
 
-**Concrete next step (Phase B implementation)**:
+## How to capture the next measurement
 
-1. **SIMD-ify `deflate_block::Block::read()`** (`src/decompress/parallel/deflate_block.rs`).
-   Bring the existing gzippy primitives into the read hot loop:
-   - `vector_huffman::decode_huffman_cf_vector`
-     (`consume_first_decode.rs:571+`) — already production for BGZF.
-   - `two_level_table` — main-table + subtable Huffman decode.
-   - `packed_lut` / `combined_lut` — fused literal/length.
-   - `bmi2` `pext` extraction for bit-shuffling on AVX2 + BMI2 CPUs.
-   - `double_literal` — two-literal cache for back-to-back short codes.
-
-   Match vendor's `deflate::Block::readInternalCompressed` SIMD
-   shape (`vendor/.../gzip/deflate.hpp`).
-
-2. **Make `RawBlockFinderCoordinator` proactive** (separate, smaller
-   commit). Today it's invoked reactively in
-   `speculative_decode_find_boundary` after a partition's start_bit
-   fails to decode. Vendor's BlockFinder prefetches offsets ahead of
-   when workers need them; mirror that by pre-populating
-   `BlockFetcher`'s offset cache when partitions are created. Goal:
-   fewer "slow path" decodes (today 28.6% missing speculation).
-
-**Bench gates**:
-
-- After step 1, `bootstrap` p50 should drop from 14.2ms toward 4-6ms
-  (matching the 334 MB/s phase 2 path — same SIMD primitives, same
-  Huffman-decode-then-emit pattern).
-- After step 2, "missing speculation" drops from 28.6% to < 10%.
-- E2E ratio (`test_single_member_parallel_silesia`) drops from 2.76×
-  toward < 1.0×.
-
-**Options previously considered**:
-
-- B — Have `ResumableInflate2` emit markers when window unknown.
-  Unifies phase 1 + phase 2. Larger refactor; deferred unless A
-  doesn't close the gap. The `decode_huffman_body_resumable` already
-  has stopping-point bookkeeping — extending it to emit markers
-  on cross-chunk back-refs is plausible but invasive.
-- C — Parent-thread SIMD BlockFinder pre-pass. **Rejected**: not
-  vendor-faithful (vendor's BlockFinder is async, not pre-pass).
-
-**Then**, once measurements show the hot span:
-
-#### B.SIMD — SIMD inflate primitives on the resumable path
-
-Only if Step zero shows inflate is ≥ 30% of per-chunk wall time.
-gzippy has `vector_huffman`, `simd_huffman`, `two_level_table`,
-`packed_lut`, `combined_lut`, `bmi2` (`src/decompress/inflate/`,
-`src/decompress/`). They're production for BGZF + sequential
-decompress. NOT on the parallel SM resumable path because
-`ResumableInflate2`'s body is `decode_huffman_body_resumable` →
-generic libdeflate-style table lookup with no SIMD batching.
-
-Sub-tasks:
-- Wire `vector_huffman` multi-symbol decode for short codes
-  (≤ TABLE_BITS).
-- Bring `double_literal` two-symbol cache for back-to-back short
-  literals.
-- Specialize `copy_match_windowed` for `distance > 32` (bulk
-  `copy_match_safe`-style) and for `distance > out_pos` (window
-  branch) separately.
-- Drop the per-byte loop in `copy_match_windowed` for the common
-  case where `distance > out_pos` is false.
-
-Bench gate: inner-inflate ratio ≤ 1.2× ISA-L (Tier 2). E2E
-parallel-SM ≥ 2× faster than sequential (the silesia test gate).
-
-#### B.BOOT — bootstrap amortization
-
-If Step zero shows DYNAMIC bootstrap dominates on slow-path chunks:
-- Cache the Huffman-table parse for block boundaries already visited
-  (`block_map.rs` already keys by start_bit).
-- Tighten BlockFinder pre-scan so workers receive a known-good
-  boundary rather than scanning per-chunk
-  (`raw_block_finder.rs`).
-
-This is closer to Phase E (SIMD BlockFinder + speculation depth).
-
-### Phase C — Architecture-specific dispatch
-
-`target_feature` + CPUID runtime dispatch (`multiversion` crate or
-hand-rolled `is_x86_feature_detected!`). AVX-512, AVX2, NEON variants
-of the inner-loop hot paths.
-
-- AVX-512 BMI2 `pext`/`pdep` for bit-shuffling — speeds up Huffman
-  decode and bit extraction.
-- AVX2 256-bit copies for `length >= 32` matches.
-- NEON dispatch for arm64. Today the parallel SM path is x86-only
-  (gated by `sm_cfg::PARALLEL_SM`); arm64 falls back to libdeflate.
-  Lift that gate once NEON variants exist.
-
-Bench gate: per-ISA flavor compared against ISA-L's equivalent ISA
-flavor.
-
-### Phase D — Pipeline overlap
-
-One rapidgzip doesn't fully exploit, one already shipped:
-
-1. **CRC32 in flight with decode.** Hardware CLMUL CRC32 issues at
-   ~1 byte/cycle. Today gzippy + rapidgzip compute CRC32 after the
-   chunk decode completes. Interleaving CRC compute with literal/
-   match emission hides it almost entirely.
-
-2. **(DONE on this branch — verify before re-doing.)** `apply_window`
-   already runs on the worker via `run_post_process_task`
-   (`chunk_fetcher.rs:1405-1412`). What remains on the consumer is
-   `publish_subchunk_windows` — the WindowMap index write. Moving
-   that earlier is the remaining D opportunity if profiling shows
-   the consumer stalls on it.
-
-Bench gate: per-chunk wall time → not pipeline-stalled by serialized
-post-decode work.
-
-### Phase E — SIMD BlockFinder + deeper speculation
-
-`src/decompress/parallel/raw_block_finder.rs` scans 8 KiB-bit windows
-sequentially looking for valid block starts. Vendor's
-`BlockFinder.hpp` + `blockfinder/DynamicHuffman.hpp` do the same.
-
-- Multi-byte SIMD pattern match for `0b10`/`0b01` followed by HLIT/
-  HDIST ranges that gate valid block headers. Probably 4-8× faster
-  boundary scan.
-- Speculate two-three boundaries ahead per worker instead of one.
-
-Bench gate: time-to-first-output drops; T=16 utilization stays
-> 14 cores.
-
-### Phase F — Memory bandwidth tricks
-
-After A-E, throughput approaches DRAM bandwidth. Then:
-- Non-temporal stores for the output writer on very large files
-  (> 500 MiB).
-- NUMA-aware worker pinning. On 2-socket boxes, pin workers to the
-  socket whose memory holds the input mmap.
-- Pre-fault output with `MADV_POPULATE_WRITE`.
-
-Marginal returns (5-15%) individually, multiplicative atop A-E.
-
-## Discipline
-
-Per the §5 retrospective:
-
-1. **Bench before code.** Every phase opens with a flame-graph and a
-   throughput measurement on neurotic. No phase commits until that
-   measurement repeats green at the PR's bench gate.
-2. **Get adversarial Opus reviews on judgment calls.** §5 dodged
-   two infinite-loop bugs only because we paused for advisor
-   diagnosis instead of patching blindly. Same rule here.
-3. **Don't break the isal-compression path.** It's the production
-   default. Every PR's CI must keep `isal-compression` green on
-   neurotic.
-4. **Monitor every long-running job.** 10-min health-check monitors
-   for any `cargo bench` / neurotic ssh that might hang.
-
-## Troubleshooting
-
-### If Phase A doesn't move the bench number — first 3 things to check
-
-1. **`arena-allocator` actually on?** `cargo tree --features
-   pure-rust-inflate | grep rpmalloc-sys`. If missing, feature graph
-   broke.
-2. **Pool being hit?** Add `eprintln!` of `TAKE_U8_HITS` / `MISSES`
-   (`chunk_buffer_pool.rs:206-207`) at end of the silesia-class test.
-   Hit-rate < 50% on iters 2-3 means workers aren't returning buffers
-   — check `chunk_data.rs:1079-1085` Drop is firing.
-3. **Fixture re-compresses on every iter?** `routing.rs:651-657` builds
-   the compressed fixture inside the test fn. The 3-iter loop
-   (`routing.rs:666`) is decode-only, but if you moved any compression
-   into the loop you'd double-count.
-
-### If Phase B's SIMD primitives produce wrong output — first 3 things to check
-
-1. **Failure #2 status.** If
-   `with_until_bits_resume_non_byte_aligned_with_dict` is still red,
-   the subtable `total_bits` bug at `resumable.rs:812-818`
-   (`consume(TABLE_BITS=11)` then `consume_entry(subtable.raw())`) is
-   biasing every bit-position downstream. Fix first or the SIMD path
-   inherits the bug.
-2. **Stopping-point bookkeeping at literal clusters.**
-   `decode_huffman_cf_vector` (`consume_first_decode.rs:582+`) has no
-   yield mid-block; `decode_huffman_body_resumable` must check
-   `bit_position() >= encoded_until_bits` after every batched cluster,
-   not just every iteration of the outer loop.
-3. **`copy_match_windowed` window precondition.** The window-stitched
-   copy is per-byte; SIMD bulk replacement requires
-   `distance <= out_pos - window_head`. Off-by-one reads
-   uninitialized window bytes — the bug surfaces only on cross-chunk
-   boundaries (`cross_chunk_resume_silesia_gzip9_chunk0_handoff` would
-   re-red).
-
-### Verify isal-compression production path stays green after any pure-rust change
+### Flame-graph (page-faults + user-space hot spots)
 
 ```bash
-# Local (30s):
-cargo test --release --features isal-compression -- routing
-
-# Authoritative (neurotic):
-ssh -J neurotic root@10.30.0.199 \
-  'cd ~/gzippy-dev && cargo test --release --features isal-compression -- \
-     test_single_member_parallel_silesia_class_not_slower_than_sequential \
-     --ignored --nocapture'
-# Ratio must stay < 0.5 on the 16-core homelab box.
+ssh -J neurotic root@10.30.0.199
+cd ~/gzippy
+git fetch origin && git checkout perf/pure-rust-inflate
+cargo build --release --features pure-rust-inflate
+perf record -F 999 -g --call-graph dwarf -o /tmp/perf.data -- \
+  ./target/release/gzippy -d -c /root/benchmark_data/silesia-gzip.tar.gz > /dev/null
+perf script -i /tmp/perf.data | inferno-collapse-perf > /tmp/perf.collapsed
+# Page-fault percentage:
+awk -F' ' '{s+=$NF} END {print "total=" s}' /tmp/perf.collapsed
+grep -E 'asm_exc_page_fault|clear_page_erms' /tmp/perf.collapsed | \
+  awk -F' ' '{s+=$NF} END {print "page_fault=" s}'
+# SVG:
+inferno-flamegraph < /tmp/perf.collapsed > /tmp/flame.svg
 ```
 
-### Confidence ratings (calibrated 2026-05-24 post-fresh-measurement)
+For user-space Rust symbols to demangle cleanly in flame-graphs,
+build with `RUSTFLAGS='-C force-frame-pointers=yes'` and
+`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`.
 
-| Target | Confidence | Notes |
-|---|---|---|
-| Phase A — closed | HIGH | 17.2% page-fault on real silesia matches rapidgzip's 17% |
-| Phase B Step zero (find missing 40ms/chunk) | HIGH | Pure measurement work; new spans land in trace.rs |
-| Phase B fix-on-first-try (closing 47ms → 15ms p50) | LOW-MEDIUM | Depends what Step zero finds — bootstrap or replace_markers are the prior suspects |
-| Phase B reaches Tier 2 (1.2× ISA-L inner inflate) | MEDIUM | Integration risk: `decode_huffman_body_resumable` has stopping-point bookkeeping that `decode_huffman_cf_vector` lacks |
-| Phase B reaches Tier 3 (1.05× ISA-L; delete ISA-L submodule) | LOW-MEDIUM | Requires breadth-of-tree deletion |
-| Phase C / D | MEDIUM (C) / MEDIUM-LOW (D — half already done) | |
-| Phase E | MEDIUM | Speculation pathology (28.6% missing) is real; SIMD BlockFinder + deeper prefetch hits this |
-| Phase F | LOW | Most relevant on > 500 MiB files |
+### Per-chunk span trace (where time goes inside a chunk)
 
-## Known issues to clean up while we're here (orthogonal to perf)
+```bash
+ssh -J neurotic root@10.30.0.199
+cd ~/gzippy
+cargo build --release --features pure-rust-inflate
+rm -f /tmp/sm.log
+GZIPPY_LOG_FILE=/tmp/sm.log ./target/release/gzippy -d -c \
+  /root/benchmark_data/silesia-gzip.tar.gz > /dev/null
+python3 - <<'PY'
+import json, statistics as st
+boot, infl, app, pop = [], [], [], []
+phases = {}
+for line in open('/tmp/sm.log'):
+    d = json.loads(line)
+    if d.get('ev') == 'decode_span':
+        boot.append(d['bootstrap_us'])
+        infl.append(d['inflate_us'])
+        phases[d['phase']] = phases.get(d['phase'], 0) + 1
+    elif d.get('ev') == 'post_process_span':
+        app.append(d['apply_window_us'])
+        pop.append(d['populate_subchunk_windows_us'])
+def stats(v, label):
+    if not v: return f'{label}: empty'
+    v = sorted(v)
+    return f'{label}: n={len(v)} sum={sum(v)/1000:.0f}ms p50={v[len(v)//2]}us p95={v[int(len(v)*0.95)]}us max={v[-1]}us'
+print(stats(boot, 'bootstrap'))
+print(stats(infl, 'inflate'))
+print(stats(app, 'apply_window'))
+print(stats(pop, 'populate_subchunk_windows'))
+print('phases:', phases)
+PY
+```
 
-From `rust-rapidgzip.md "Known pre-existing failures"`:
+Also: `scripts/parallel_sm_log_summary.py /tmp/sm.log` for the
+higher-level event summary (per-chunk decode_ok, speculation
+outcomes, BlockFinder counts).
 
-1. `test_parallel_sm_propagates_errors_not_fallbacks` — silent
-   multi→sequential fallback at `mod.rs:188` violates CLAUDE.md
-   "no fallbacks" rule. Fix scope: gzip-format classifier + routing.
-2. `with_until_bits_resume_non_byte_aligned_with_dict` — synthetic
-   fixture; suspected subtable `total_bits` accounting in
-   `decode_huffman_body_resumable`. Worth chasing because it might
-   point to a real bit-accounting issue that limits Phase B.
-3. `cross_chunk_resume_silesia_gzip9_chunk0_handoff` — zlib-ng
-   resume at chunk-end-bit (same class as `03c8f48`).
-4-5. `resumable_isal_oracle::*` — `make_multi_block_deflate` fixture
-   bug on flate2 1.x. Trivial: replace fixture builder, repoint.
+### Bench gates
 
-Pick these up opportunistically when the active phase touches the
-relevant area, not as scheduled work.
+```bash
+# Gate 1 — inner-inflate
+cargo bench --features pure-rust-inflate --bench inflate_isal_vs_pure_rust
+
+# Gate 2 — E2E silesia (the deliverable's primary gate)
+cargo test --release --features pure-rust-inflate -- \
+  test_single_member_parallel_silesia --ignored --nocapture
+
+# Sanity — isal-compression production path stays green
+cargo test --release --features isal-compression -- routing
+cargo test --release --features isal-compression -- \
+  test_single_member_parallel_silesia --ignored --nocapture
+```
+
+### CI-friendly local checks (30 sec)
+
+```bash
+make                                # local CI battery
+cargo test --release -- routing     # routing-table assertions
+cargo test --release --features pure-rust-inflate -- routing
+```
+
+## Anti-mistake rules (mirror of `plans/rust-rapidgzip.md`)
+
+Before touching any work item:
+
+1. **Re-measure on neurotic.** The number quoted in the
+   "Live baseline" section above may be stale; the page-fault
+   measurement was stale for weeks.
+
+2. **Confirm via vendor citation.** Open the cited
+   `vendor/rapidgzip/.../...hpp:line` and read it. If the proposed
+   change doesn't have a vendor counterpart, reject it.
+
+3. **Confirm not already shipped.** `cargo tree`, `grep -rn`. The
+   `arena-allocator` Vec story was instructive.
+
+4. **Mind which bench measures which path.** The 334 MB/s number is
+   `ResumableInflate2`, not `deflate_block::Block`. Don't conflate.
+
+5. **Real silesia, not synthetic PRNG.** Use
+   `test_single_member_parallel_silesia` for perf gates, not
+   `..._silesia_class_...` (that's an adversarial degenerate-data
+   check; expected RED on pure-rust-inflate until item #1 lands).
+
+6. **Re-measure after landing.** Items interact via the chunk
+   pipeline. Even after item #1's gate 1 passes, re-run gates 2-3.
+
+## Known pre-existing failures (NOT release-blocking, deferred per CLAUDE.md)
+
+These are summarized in `plans/rust-rapidgzip.md`'s §5 retrospective.
+Status, in this measurement-doc's terms:
+
+1. `test_parallel_sm_propagates_errors_not_fallbacks` — not on any
+   work-item path; cleanup-only.
+2. `with_until_bits_resume_non_byte_aligned_with_dict` — **work item
+   #2.** Blocks SIMD landing in item 1(a) `decode_huffman_body_resumable`.
+3. `cross_chunk_resume_silesia_gzip9_chunk0_handoff` — re-reds if
+   item 1's SIMD path has off-by-one window stitching.
+4-5. `resumable_isal_oracle::*` — fixture bug, trivial cleanup.
+
+## Trace event reference
+
+These events ship in the tree (commit `6788651` for the new spans).
+Listed for grep-ability when extending the analysis.
+
+| event | thread | file:fn | purpose |
+|---|---|---|---|
+| `drive_begin` / `drive_end` | consumer | chunk_fetcher.rs `drive` | overall wall time |
+| `submit_decode` | consumer | chunk_fetcher.rs | partition dispatch |
+| `decode_ok` / `decode_err` | worker | chunk_fetcher.rs | per-chunk decode wall (fast/slow path) |
+| `decode_span` | worker | gzip_chunk.rs `decode_chunk_marker_bootstrap_then_isal` | bootstrap_us vs inflate_us |
+| `submit_post_process` | consumer | chunk_fetcher.rs | post-process pool dispatch |
+| `post_process_span` | post_process | chunk_fetcher.rs `run_post_process_task` | materialize_us / apply_window_us / populate_subchunk_windows_us |
+| `consume_done` | consumer | chunk_fetcher.rs | bytes flowed to writer |
+| `speculative_accept` / `_missing` / `_mismatch` | consumer | chunk_fetcher.rs | speculation outcomes |

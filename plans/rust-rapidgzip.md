@@ -1,360 +1,368 @@
-# Rapidgzip → gzippy parallel single-member port
+# The deliverable
 
-Structural port of rapidgzip's `ParallelGzipReader → GzipChunkFetcher → BlockFetcher → GzipChunk → IsalInflateWrapper` chain into
-`src/decompress/parallel/`. GNU gzip formats only (single-member,
-multi-member, BGZF).
+**ONE deliverable, exactly one:**
 
-## End-state architecture (implemented)
+> A pure-Rust parallel single-member gzip decoder whose end-to-end
+> throughput on real silesia matches or exceeds rapidgzip-with-patched-
+> ISA-L, with `vendor/isa-l` + `vendor/isal-rs` + `packaging/isal-patches/`
+> + `backends/isal_*.rs` all deleted from the tree and CI green.
 
-```
-classify_gzip (sm_cfg::PARALLEL_SM)
-  → single_member::decompress_parallel
-  → sm_driver::read_parallel_sm
-  → chunk_fetcher::drive
-  → gzip_chunk (marker bootstrap + IsalInflateWrapper read_stream)
-  → apply_window / replace_markers
-```
+Everything in this document is in service of that one outcome.
+Anything that does not move a measurement toward it is not on the
+critical path.
 
-**Feature matrix (x86_64):**
+## Done when (all four)
 
+1. `cargo bench --features pure-rust-inflate --bench inflate_isal_vs_pure_rust`
+   reports **pure-Rust ≥ 1/1.05× ISA-L** on neurotic. (Currently 1/2.39×.)
+2. `cargo test --release --features pure-rust-inflate -- \
+   test_single_member_parallel_silesia --ignored --nocapture` reports
+   **ratio < 0.5** (T=16 parallel < ½ T=1 sequential) on neurotic.
+   (Currently 2.76× the wrong direction.)
+3. `make ship` reports pure-rust-inflate throughput **≥ rapidgzip**
+   throughput on the silesia corpus, same hardware.
+4. `vendor/isa-l`, `vendor/isal-rs`, `packaging/isal-patches/`,
+   `backends/isal_decompress.rs`, `backends/isal_compress.rs` are
+   deleted; `arena-allocator` is decoupled from `isal-compression` in
+   `Cargo.toml`; CI is green with `pure-rust-inflate` as the only
+   inflate backend.
 
-| Build                           | Bootstrap DYNAMIC                      | Post-bootstrap inflate                      |
-| ------------------------------- | -------------------------------------- | ------------------------------------------- |
-| `isal-compression` (default SM) | `isal_huffman.rs` (C FFI)              | patched ISA-L via `inflate_wrapper.rs`      |
-| `pure-rust-inflate`             | §3 `HuffmanCodingShortBitsMultiCached` | `ResumableInflate` via `inflate_wrapper.rs` |
-| both features enabled           | §3 canonical (pure-Rust wins)          | `ResumableInflate` (pure-Rust wins)         |
+If you're reading this in 2027 and trying to figure out whether the
+work is finished: run those four. If all four are green, it's done.
+If any one is red, it isn't, and the work items below say what's left.
 
+## The six work items
 
-Cfg gates live in `src/decompress/parallel/sm_cfg.rs`:
+In dependency order. Each one names files, vendor citations, and the
+measurement that proves it's done. **Re-measure before AND after every
+item.** Stale priors are this plan's #1 historical failure mode (see
+"Mistakes to not repeat" below).
 
-- `PARALLEL_SM` — orchestration compiles
-- `USE_ISAL_INFLATE` — C inflate + C Huffman table build
+### 1. SIMD-ify every Huffman hot loop
 
-## Completed items
+Pure-Rust decode today has **three Huffman-decoding hot loops**, only
+one of which is SIMD:
 
-### Track B — C-free SM hot path ✅
+| Loop | File:fn | SIMD today? | Used by |
+|---|---|---|---|
+| (a) `decode_huffman_body_resumable` | `src/decompress/inflate/resumable.rs:793-852` | no — generic libdeflate-style table lookup | parallel-SM phase 2; `inflate_isal_vs_pure_rust` bench (this IS what 334 MB/s measures) |
+| (b) `read_internal_compressed_canonical_specialized` | `src/decompress/parallel/deflate_block.rs:1131-1240` | no — per-symbol scalar | parallel-SM phase 1 bootstrap (the **bottleneck** at 1060ms / chunk per `plans/pure-rust-perf.md`) |
+| (c) `decode_huffman_cf_vector` | `src/decompress/inflate/consume_first_decode.rs:571+` | **yes** | BGZF + sequential decompress (production) |
 
+The deliverable requires (a) and (b) on the same SIMD primitives as (c):
 
-| Item                                    | Status | Proof                                                                                                                  |
-| --------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------- |
-| B1 ResumableInflate + 4 stopping points | ✅     | `inflate/resumable.rs`; 25 unit tests; differential oracle in `inflate_wrapper.rs:1276+` (`ResumableInflate2` vs ISA-L) |
-| B2 Bootstrap without C                  | ✅     | `deflate_block.rs` canonical path when `!USE_ISAL_INFLATE`; §3 cached-Huffman bootstrap exercises end-to-end           |
-| B3 Pure-Rust wrapper body               | ✅     | `inflate_wrapper.rs` pure backend uses `ResumableInflate2`; all 33 pure-rust-inflate routing tests green on neurotic   |
-| B3a Block scratch sizing                | —      | Obsoleted by §5: `ResumableInflate2` writes directly into caller's output with a 32 KiB sliding window. No per-block scratch exists. B3a band-aid (commit 2eff70f) deleted in §5 step 6. |
-| B4 Throughput bench                     | ✅     | `benches/inflate_isal_vs_pure_rust.rs` (the inline `test_isal_vs_pure_rust_silesia_throughput` mentioned in earlier drafts was never landed — the bench harness alone is the gate) |
+- `vector_huffman` — multi-symbol decode for short codes (≤ TABLE_BITS).
+- `two_level_table` — main-table + subtable.
+- `packed_lut` / `combined_lut` — fused literal/length.
+- `bmi2` `pext` — bit-shuffling on AVX2+BMI2 hosts.
+- `double_literal` — back-to-back short-code cache.
 
+Plus the CONTAINS_MARKERS specialization in (b) preserved.
 
-### Track A — Infrastructure ✅ (perf gates deferred)
+**Vendor reference**: `vendor/rapidgzip/librapidarchive/src/rapidgzip/gzip/deflate.hpp::Block::readInternalCompressedMultiCached`
+(deflate.hpp:1585-1666) — the SIMD-friendly shape we are porting.
+gzippy's (b) cites this vendor function already; today it specializes on
+ISA-L LUTs for `isal-compression` builds and falls through to the
+scalar canonical decoder for `pure-rust-inflate`. The pure-Rust
+specialization gets the SIMD primitives.
 
+**Bench gate**:
 
-| Item                  | Status | Notes                                                                                                                       |
-| --------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------- |
-| A1 Trace events       | ✅      | `chunk_fetcher.rs` drive_begin/drive_end/speculative_*                                                                      |
-| A4 Silesia perf test  | ✅      | `test_single_member_parallel_silesia` (#[ignore])                                                                           |
-| A5 Hot-path dead_code | ✅      | Module-level `#![allow(dead_code)]` removed from 14 hot-path modules; item-level allows for seekable-index scaffolding only |
+- Inner-inflate (`inflate_isal_vs_pure_rust`): pure-Rust ≥ 600 MB/s
+  (Tier 2: 1/1.2× ISA-L), then ≥ 760 MB/s (Tier 3: 1/1.05× ISA-L).
+- Bootstrap span p50 in `decode_span` trace: 14.2ms → ≤ 6ms.
 
+### 2. Fix subtable bit-accounting (failure #2)
 
-### §§1–4 Huffman + prefetch
+`with_until_bits_resume_non_byte_aligned_with_dict` is red because
+`decode_huffman_body_resumable` at `src/decompress/inflate/resumable.rs:812-818`
+biases `total_bits` by 9 bits across the subtable boundary. Until
+this is fixed, the SIMD batched-decode in item 1's loop (a) will
+**inherit the bias** and silently produce wrong bit-position
+bookkeeping on cross-chunk boundaries — and the failure surfaces
+only on specific fixtures (`cross_chunk_resume_silesia_gzip9_chunk0_handoff`
+would re-red).
 
+**Blocks**: SIMD landing in (a) requires this fix first. (b)'s SIMD
+work is decoder-independent and can land before #2; we don't need a
+hard ordering between #1(b) and #2.
 
-| §   | Module                              | x86+isal                | x86+pure-rust         |
-| --- | ----------------------------------- | ----------------------- | --------------------- |
-| 1   | `huffman_reversed_bits_cached`      | FIXED bootstrap         | FIXED bootstrap       |
-| 2   | `huffman_short_bits_cached_deflate` | unused                  | unused                |
-| 3   | `huffman_short_bits_multi_cached`   | unreachable (isal path) | **DYNAMIC bootstrap** |
-| 4   | `FetchMultiStream`                  | wired                   | wired                 |
+**Done when**: `cargo test --release --features pure-rust-inflate -- \
+with_until_bits_resume_non_byte_aligned_with_dict` is green.
 
+### 3. Make `RawBlockFinderCoordinator` proactive
 
-## Remaining proof on neurotic (not code)
+Today gzippy's `RawBlockFinderCoordinator` (`src/decompress/parallel/raw_block_finder.rs`)
+is invoked **reactively** — only after a chunk's start_bit fails
+trial-decode in `speculative_decode_find_boundary`
+(`chunk_fetcher.rs:1512`). Each worker spawns its own finder
+thread on miss.
 
-Run this yourself (don't wait for the user) on 16-core x86_64 homelab via 'ssh -J neurotic root@10.30.0.199'
+Vendor's `BlockFinder<RawFinder>` (`vendor/rapidgzip/librapidarchive/src/core/BlockFinder.hpp`)
+is **proactive**: single background `JoiningThread` running
+`blockFinderMain()` that prefetches block offsets ahead of when
+workers need them, populating `m_blockOffsets`. Workers consume
+from the prefetch queue.
+
+**Effect on bench**: today's trace shows **28.6% missing speculation**
+on real silesia. Proactive prefetch should drop that toward < 10%,
+meaning more chunks hit phase 2 (fast SIMD path from item 1) with a
+known boundary instead of paying the slow-path candidate walk.
+
+**Files to touch**:
+- `chunk_fetcher.rs` — `drive`, `consumer_loop`, `submit_decode_to_pool`:
+  inject prefetched offsets into BlockFetcher's offset cache when
+  partitions are created, BEFORE worker dispatch.
+- `raw_block_finder.rs` — extend coordinator to run as a
+  long-lived single thread (one per `drive` call), not per-chunk
+  scoped.
+
+**Vendor side-by-side**: `BlockFinder.hpp:60-90` startThreads /
+stopThreads, `BlockFinder.hpp:130-180` blockFinderMain pattern.
+
+**Bench gate**: trace summary `speculative_missing` drops from 28.6%
+to ≤ 10% on real silesia. E2E silesia ratio drops accordingly.
+
+### 4. Retire phase-1 bootstrap
+
+Once #1 puts the bootstrap decoder (b) on the same SIMD primitives
+as phase 2 (a), and #2 ensures bit-accounting is correct, the two
+decoders become functionally identical except for "have we seen 32
+KiB of clean bytes yet?" — which is a single branch over one shared
+loop body.
+
+**Action**: delete `bootstrap_with_deflate_block` in `gzip_chunk.rs:511`.
+Replace its callers with a single SIMD decoder that takes either a
+window OR an empty window + marker-emission mode. The `deflate_block`
+module shrinks to its `read_header` + Huffman-table-build surface
+(needed for the candidate trial-decode); the per-symbol read path
+deletes.
+
+**Vendor reference**: vendor's `Block::read()` is one function with
+the same template specialization (`CONTAINS_MARKERS`) gzippy already
+has; vendor doesn't have a separate "bootstrap" code path. Today's
+gzippy split is a porting artifact.
+
+**Bench gate**: `decode_span` phase distribution: today 59% of chunks
+are `bootstrap_only`. Post-#4, the `bootstrap_only` phase tag
+disappears (the trace shows phase 2 spans only, with markers when
+applicable).
+
+### 5. CRC32 interleave + worker-side window publish
+
+Phase D leftovers, mechanical but real:
+
+- **CRC32**: hardware CLMUL CRC32 issues at ~1 byte/cycle.
+  Today gzippy + rapidgzip both compute CRC32 *after* the chunk
+  decode completes. Interleaving CRC computation with literal/match
+  emission hides it almost entirely.
+  Vendor reference: `vendor/rapidgzip/librapidarchive/src/rapidgzip/gzip/GzipChunk.hpp`'s
+  `m_crc32`. Files to touch: `chunk_data.rs` (incremental CRC), the
+  SIMD decode loop from item 1 (CRC update on literal emission).
+
+- **`publish_subchunk_windows`**: today the consumer thread writes
+  the WindowMap index after each chunk's apply_window completes
+  (`chunk_fetcher.rs::publish_subchunk_windows`). `apply_window` itself
+  already runs on the post-process worker pool (verified
+  `chunk_fetcher.rs:1405-1412`). Moving the index publish onto the
+  same worker task removes a consumer-thread serialization point.
+
+**Bench gate**: per-chunk consumer-thread wall span (currently not
+traced — add a trace event around `consume_done` for this gate). The
+bench is "no consumer-side stalls on serialized post-decode work."
+
+### 6. `Cargo.toml` cleanup + ISA-L deletion
+
+The mechanical end-state. After items 1-5 put pure-Rust at parity:
+
+- `Cargo.toml`: `arena-allocator` becomes a default (no longer
+  transitively activated by `isal-compression`). `pure-rust-inflate`
+  becomes the only inflate feature; `isal-compression` deletes.
+- `vendor/isa-l`, `vendor/isal-rs`, `packaging/isal-patches/` deleted
+  as submodules.
+- `src/backends/isal_decompress.rs`, `src/backends/isal_compress.rs`
+  deleted. Routing in `src/decompress/mod.rs` simplifies: the
+  IsalSingle path collapses into the pure-Rust single-member path
+  (T=1 also goes through `ResumableInflate2`).
+- CI matrix simplifies from `isal-compression × pure-rust-inflate ×
+  default` to one config.
+- `make ship` becomes the authoritative bench on neurotic.
+
+**Bench gate**: this IS the deliverable's gate. All four "Done when"
+items above must be green simultaneously.
+
+## Bench gates that lock the deliverable
+
+These are the four measurements that prove the deliverable is real,
+restated for ease of running:
 
 ```bash
-# Routing + deletion traps (both feature sets)
-cargo test --release --features isal-compression -- routing
-cargo test --release --no-default-features --features pure-rust-inflate -- routing
+# Gate 1 — inner-inflate parity (Tier 3)
+cargo bench --features pure-rust-inflate --bench inflate_isal_vs_pure_rust
+# Expect: pure-Rust ≥ 1/1.05× ISA-L
 
-# Perf gates (#[ignore])
-cargo test --release --features isal-compression -- \
-  test_single_member_parallel_not_slower_than_sequential \
+# Gate 2 — E2E silesia parallel beats sequential
+cargo test --release --features pure-rust-inflate -- \
   test_single_member_parallel_silesia --ignored --nocapture
+# Expect: ratio < 0.5
 
-# B4 bench
-cargo bench --release --features isal-compression -- \
-  --bench inflate_isal_vs_pure_rust -- --nocapture
+# Gate 3 — make ship matches rapidgzip
+make ship
+# Expect: pure-rust-inflate throughput ≥ rapidgzip on silesia
+
+# Gate 4 — tree is clean
+test ! -d vendor/isa-l && \
+test ! -d vendor/isal-rs && \
+test ! -f src/backends/isal_decompress.rs && \
+test ! -f src/backends/isal_compress.rs && \
+cargo build --release --features pure-rust-inflate
 ```
 
-The 3 routing tests that motivated §5 are now ✅ on neurotic (verified
-post-step-5/6: 33/33 pure-rust-inflate routing + 32/32 isal-compression).
+Run them on neurotic (`ssh -J neurotic root@10.30.0.199`), not on
+GHA. The synthetic test
+`test_single_member_parallel_silesia_class_not_slower_than_sequential`
+is **NOT a deliverable gate**; it's an adversarial-PRNG
+graceful-degradation check that encodes the production
+(isal-compression) bar and is expected RED on pure-rust-inflate
+until item #1+#4 land (see `src/tests/routing.rs:632-638` docstring).
 
-### Known pre-existing failures (NOT introduced by §5; opening as
-separate follow-ups; release-non-blocking per CLAUDE.md rules 4-5)
+## How to read this plan (anti-mistake rules)
 
-After the §5 step-6 cleanup landed (`a72d533`), `cargo test --release
---lib` on neurotic surfaces 5 failures that were also failing before
-the §5 sequence (verified pre-existing at `b8f901d` via
-`git stash && cargo test` by an Opus advisor on Apple-silicon Rosetta,
-and re-classified here after a broader differential):
+The plan and the advisors have a prior. The prior has been wrong
+**every time** measurement contradicted it (see "Mistakes to not
+repeat" below). Until this directory has earned trust:
+
+1. **Measure first, every time.** Before starting any work item,
+   capture a fresh measurement on neurotic. The plan's claimed
+   bottleneck may be stale. Do not optimize on the basis of a
+   stated bottleneck without re-confirming it.
+
+2. **Vendor citation required.** If a proposed change has no
+   `vendor/rapidgzip/...:line` reference, reject it. This catches
+   "advisor says vendor does X" when vendor actually doesn't.
+   `find vendor/rapidgzip -name "*.hpp"` is your first move when
+   verifying.
+
+3. **"Already shipped?" check.** Before listing an action as "try
+   this," grep the tree:
+   - `cargo tree --features <feature> | grep <crate>` for deps.
+   - `grep -rn '<symbol>' src/` for code.
+   The 40% page-fault plan instructed us to "try `Vec<T, RpmallocAlloc>`
+   first" — that had shipped months earlier via `arena-allocator`.
+
+4. **Which bench measures which code path?** Document next to every
+   bench *what code path it exercises*. The inner-inflate bench at
+   334 MB/s measures `ResumableInflate2` (parallel-SM phase 2 / item
+   1(a)). It does NOT measure `deflate_block::Block::read_internal_compressed_canonical_specialized`
+   (parallel-SM phase 1 / item 1(b) — the actual bottleneck).
+   Confusing these wasted half an analysis session.
+
+5. **Real silesia is the gate.** Synthetic PRNG is incompressible
+   under `flate2::best()` and produces speculation pathology (29 of
+   49 chunks all-marker, no block boundaries). It's the right
+   adversarial check; it is NOT the right perf gate. Use
+   `test_single_member_parallel_silesia` for perf, not
+   `..._silesia_class_...`.
+
+6. **Re-measure after every item lands.** Even if item 1's bench
+   gate passes, re-run gates 2-3 before declaring item 1 done.
+   Items interact via the chunk pipeline; a 600 MB/s inner-inflate
+   win can be eaten by a regression in BlockFinder dispatch.
+
+## Mistakes to not repeat (caught by advisor pushback)
+
+These almost shipped. Each one is captured here so future-us doesn't
+re-make the same wrong turn.
+
+1. **"Try `Vec<T, RpmallocAlloc>` first."** The plan listed this as
+   Phase A step 1. It had already shipped via the `arena-allocator`
+   feature (`Cargo.toml:39,50-51`). Would have wasted half a day.
+   **Caught by**: pre-implementation audit; advisor flagged on
+   plan-tuning pass.
+
+2. **"40% page-fault is the bottleneck."** Re-measurement on
+   2026-05-24 showed 17%. The 40% number was from a measurement
+   taken **before** arena-allocator landed on main. The plan
+   propagated the stale number for weeks.
+   **Caught by**: re-measuring before writing code (anti-mistake
+   rule #1).
+
+3. **"Loosen the synthetic test gate to 6×."** First advisor
+   recommendation. Wrong: the test encodes the production
+   (isal-compression) bar; loosening to 6× would mask a 12×
+   regression in the production path. It's `#[ignore]`-gated so it
+   doesn't run in CI; expected-red on pure-rust-inflate is the
+   correct state.
+   **Caught by**: pushing back on the advisor with the production-vs-
+   feature distinction.
+
+4. **"Build a parent-thread SIMD BlockFinder pre-pass (option C)."**
+   First advisor recommendation. Wrong: vendor's BlockFinder is
+   an **async single-thread prefetcher**, NOT a parent-thread
+   pre-pass. Building option C would have been a multi-week refactor
+   AWAY from the vendor pattern.
+   **Caught by**: checking `vendor/rapidgzip/librapidarchive/src/core/BlockFinder.hpp`
+   before implementing. The advisor reversed himself when shown the
+   vendor file.
+
+5. **"Optimize replace_markers (apply_window) for AVX-512."** A
+   tempting prior given marker-replacement sounds expensive. Wrong:
+   `apply_window` takes 17 ms total across the whole silesia run.
+   It's already AVX2 and is not a bottleneck.
+   **Caught by**: instrumenting the per-chunk spans (commit `6788651`)
+   before optimizing.
+
+Pattern: the plan / advisor had a prior; the prior was wrong; only
+the measurement was right. **Trust the measurement, not the prior.**
+
+## §5 retrospective — pure-Rust resumable inflate (correctness)
+
+§5 (May 2026) replaced the band-aid `session: Vec<u8>` accumulator
+with `ResumableInflate2` — a 32-KiB-ring resumable inflater
+faithful to vendor's `gzip/isal.hpp:254-356`. Architecture decision
+was "two decoders per BTYPE":
+
+| Caller                                   | Decoder                            | Yield mid-block? |
+| ---------------------------------------- | ---------------------------------- | ---------------- |
+| BGZF, scan_inflate, sequential decompress | existing `decode_huffman_*`        | no |
+| `ResumableInflate2::read_stream`         | new `decode_huffman_*_resumable`   | yes |
+
+Done at commit `30839e8`. 33/33 pure-rust-inflate routing tests
+green on neurotic; 32/32 isal-compression routing tests green.
+
+**Known pre-existing failures** (NOT introduced by §5, deferred per
+CLAUDE.md rules):
 
 1. `decompress::tests::test_parallel_sm_propagates_errors_not_fallbacks`
-   — pre-existing. Corrupt-input test asserts `Err(Decompression(_))`;
-   actually gets `Err(InvalidArgument)` because corruption at certain
-   offsets makes `is_likely_multi_member` (`format.rs:44+`) false-
-   positive on the corrupt bytes, routing to multi-member parallel,
-   which fails and falls through to `decompress_multi_member_sequential`
-   (`mod.rs:188`), then libdeflate emits `BadData → InvalidArgument`.
-   The corruption IS surfaced as `Err`, satisfying CLAUDE.md rule 5's
-   spirit; the variant mismatch is a separate cleanup.
+   — silent multi→sequential fallback at `mod.rs:188` violates
+   CLAUDE.md "no fallbacks." Variant mismatch (Decompression vs
+   InvalidArgument); error IS surfaced. Cleanup: gzip-format
+   classifier + routing.
+2. `with_until_bits_resume_non_byte_aligned_with_dict` — **this is
+   work item #2 above.** Subtable `total_bits` accounting at
+   `resumable.rs:812-818`. Blocks SIMD in item 1(a).
+3. `cross_chunk_resume_silesia_gzip9_chunk0_handoff` — zlib-ng
+   resume at chunk-end-bit (same class as commit `03c8f48`).
+4-5. `resumable_isal_oracle::*` — `make_multi_block_deflate`
+   fixture bug on flate2 1.x. Replace fixture builder, repoint.
 
-2. `decompress::parallel::inflate_wrapper::tests::with_until_bits_resume_non_byte_aligned_with_dict`
-   — pre-existing. Synthetic flate2 fixture; `tell_compressed()` lands
-   9 bits before `resume_at` on the resumable backend. Suspected
-   subtable-entry `total_bits` accounting in `decode_huffman_body_resumable`
-   for non-byte-aligned EOB. Production silesia routing (covered by
-   `test_single_member_routing_multithread`, green) is unaffected.
+§5's port surface (Track A infrastructure + Track B C-free SM hot
+path) is complete. The remaining work is performance, captured in
+the six items above.
 
-3. `decompress::parallel::gzip_chunk::tests::cross_chunk_resume_silesia_gzip9_chunk0_handoff`
-   — pre-existing class (same family as commit `03c8f48` "prime
-   non-byte-aligned bit offset before set_dict"). zlib-ng resume at
-   chunk0's reported end_bit fails. Production parallel-SM silesia
-   integration is green (`make ship`); this synthetic test exercises a
-   stricter contract than production uses.
+## Out of scope (not part of this deliverable)
 
-4. `decompress::parallel::inflate_wrapper::tests::resumable_isal_oracle::stopping_points_match_at_every_block_boundary`
-   — pre-existing. Fixture bug in `make_multi_block_deflate` at
-   `inflate_wrapper.rs:841-889`: with `vec![0xAB; 300_000]` and flate2 1.x
-   the encoder emits a single dynamic block + END_OF_STREAM rather
-   than multi-block, so the ISA-L probe never observes
-   `END_OF_BLOCK` and `ends.len() == 0`.
+- Seekable index reader (`IndexFileFormat.hpp`).
+- BZIP2, ZLIB-format decoders (per CLAUDE.md scope: gzip-family only).
+- Compress-side ISA-L removal (`backends/isal_compress.rs` deletion
+  is gated on compress-side parity work; item #6 names the file but
+  the compress replacement is a separate deliverable).
 
-5. `decompress::parallel::inflate_wrapper::tests::resumable_isal_oracle::resume_with_window_matches_isal`
-   — pre-existing. Same root cause as (4); panics with
-   `index out of bounds: the len is 0 but the index is 0`.
+## Reading order for a fresh agent
 
-The 5 tests above MUST eventually be cleaned up (especially (1) — the
-multi→sequential fallback at `mod.rs:188` does violate CLAUDE.md rule
-5 in letter), but they predate this branch and are orthogonal to the
-§5 port. They are deferred to a separate "step 6 follow-up" cleanup PR.
-
-## §5 — Pure-Rust DEFLATE inflate with stopping points (option 2)
-
-**Architecture decision** (May 2026): two decoders per BTYPE.
-
-| Caller                                   | Decoder                                | Yield mid-block? |
-| ---------------------------------------- | -------------------------------------- | ---------------- |
-| BGZF, scan_inflate, sequential decompress | existing `decode_huffman_*` (fast)     | no               |
-| `ResumableInflate::read_stream`          | new `decode_huffman_*_resumable`       | yes              |
-
-Faithfulness to vendor (`vendor/.../gzip/isal.hpp:254-356`): ISA-L writes
-incrementally into the caller's `output` with an internal sliding window
-(~32 KiB via `tmp_out_buffer`). Our resumable decoders do the same; the
-non-resumable decoders stay untouched so BGZF/sequential pay no
-yield-check tax. This is what the band-aid `session` buffer (B3/B3a) was
-faking.
-
-**Files**:
-
-- `src/decompress/inflate/resumable.rs` (new) — `ResumableInflate2`
-  holding a `[u8; 32768]` ring buffer + pending-match state. Replaces
-  the `session: Vec<u8>` accumulator.
-- `src/decompress/inflate/resumable_decoders.rs` (new) — `decode_stored_resumable`,
-  `decode_fixed_resumable`, `decode_dynamic_resumable`. Each yields by
-  returning `Ok(YieldedMidBlock { pending_match })` instead of erroring
-  with `WriteZero`. Resume = re-enter with same `(litlen, dist, pending_match)`.
-- `src/decompress/parallel/inflate_wrapper.rs` — pure-rust backend
-  switches `inner` from `ResumableInflate` to `ResumableInflate2`.
-- `src/decompress/inflate/consume_first_decode.rs` — `ResumableInflate`
-  marked deprecated; deleted once `inflate_wrapper.rs` is the only
-  caller and migrates over.
-
-**Match-copy when distance reaches past `output[0]`**: the new module's
-hot path is `copy_match_windowed(output, out_pos, distance, length,
-window: &[u8; 32768], window_head: usize)`. Branch on
-`distance <= out_pos` — fast path (existing logic) vs window-stitched
-path. Window is updated after each `read_stream` from the trailing
-≤32 KiB of bytes just emitted to `output`.
-
-**Tiered bench gates** (preserved from earlier draft):
-
-- **Tier 1** — feature `pure-rust-inflate` is opt-in; throughput ≥ 1/1.5 ×
-  ISA-L acceptable. Gate: `benches/inflate_isal_vs_pure_rust.rs` green
-  on neurotic.
-- **Tier 2** — `pure-rust-inflate` becomes the default; throughput ≥ 1/1.2 ×
-  ISA-L. Same bench, stricter threshold.
-- **Tier 3** — `vendor/isa-l` + `isal-rs` + `packaging/isal-patches/`
-  deleted; throughput ≥ 1/1.05 × ISA-L. Detaches
-  `isal-compression`/`arena-allocator` coupling in `Cargo.toml`.
-  Migrates `backends/isal_decompress.rs` (T1 x86 sequential),
-  `backends/isal_compress.rs` (L0-L3 fast compress; out of port scope),
-  and any other ISA-L call site.
-
-**Implementation order (completed; retained for history)**:
-
-1. Scaffold `resumable.rs` + `resumable_decoders.rs` with stubs returning
-   `Err(NotImplemented)`. Wire `inflate_wrapper.rs` behind a
-   `cfg(feature = "resumable-decoders")` flag so both backends coexist
-   during the cut.
-2. Land `decode_stored_resumable` first (simplest — no Huffman). Validate
-   via existing oracles.
-3. Land `decode_fixed_resumable` (static tables, just yield logic).
-4. Land `decode_dynamic_resumable` (full path).
-5. Flip the feature default to on; re-run the 3 red routing tests.
-6. Delete `ResumableInflate` + `session` field from `consume_first_decode.rs`.
-7. Delete B3a band-aid (commit 2eff70f).
-
-## Beyond parity — path to exceed rapidgzip
-
-§5 ships (parity); the throughput-exceed path is six phases, each
-gated by `make ship` on neurotic. **Order**: fix failure #2 → Phase A →
-Phase B → rest as measurements dictate. Failure #2
-(`with_until_bits_resume_non_byte_aligned_with_dict`) is suspected
-subtable `total_bits` accounting at `resumable.rs:812-818` — **must
-land before Phase B** (Phase A is decoder-independent and safe to land
-first).
-
-- **Phase A — Close the page-fault gap. CLOSED 2026-05-24.**
-  Fresh `perf record` on neurotic against real silesia.tar.gz shows
-  `asm_exc_page_fault + clear_page_erms` at **17.2%** of weighted
-  cycles — matches rapidgzip's documented 17%. The arena-allocator
-  (`Cargo.toml:39,50-51` → `Vec<_, RpmallocAlloc>` for `ChunkData::data`
-  / `data_with_markers`) + per-worker LIFO pool
-  (`chunk_buffer_pool.rs:108-204`) shipping on `main` already closed
-  this gap. The 2.76× pure-Rust-parallel vs T=1-libdeflate ratio on
-  real silesia is NOT page-fault bound — see Phase B "Instrument
-  before optimizing." If a future regression brings page-faults back,
-  the levers (in `plans/pure-rust-perf.md`) are: worker-local
-  pre-touch → MADV_HUGEPAGE → `#[global_allocator] = RpMalloc`.
-
-  **Try in order (decreasing safety):**
-    1. **Worker-local pre-touch of pool buffers.** The
-       consumer-thread prewarm regressed −50%
-       (`chunk_buffer_pool.rs:84-88`); worker-local has not been
-       tried. After `bind_worker_pool_index`
-       (`chunk_buffer_pool.rs:124`), write a zero to each pooled
-       Vec's first byte per 4 KiB page.
-    2. `MADV_HUGEPAGE` on chunk buffers ≥ 2 MiB. New code in
-       `rpmalloc_alloc.rs::types::u8_with_capacity` or
-       `chunk_buffer_pool.rs::take_u8`.
-    3. `#[global_allocator] = rpmalloc::RpMalloc`. Highest risk
-       (`chunk_buffer_pool.rs:94-96` flags it "unproven"; prior
-       mimalloc/jemalloc tries regressed).
-
-  Largest expected win; independent of §5.
-- **Phase B — Instrument the per-chunk path THEN optimize.** Real
-  silesia per-chunk decode is p50=47ms; the inflate-only bench says
-  pure-Rust does ~5-8ms for a 1.6 MB chunk. ~85% of wall time is
-  NOT inner inflate. Step zero: add per-chunk timing spans
-  (`bootstrap`, `inflate_to_markers`, `replace_markers`,
-  `window_publish`, `output_copy`) and emit p50/p95 per span via
-  the existing GZIPPY_LOG_FILE trace. Then SIMD inflate primitives
-  (`vector_huffman`, `simd_huffman`, `two_level_table`, `packed_lut`,
-  `combined_lut`, `bmi2` — already production in
-  `decode_huffman_cf_vector` at `consume_first_decode.rs:571+`) get
-  wired into `decode_huffman_body_resumable` (`resumable.rs:793-852`)
-  **only if** measurement shows inflate dominates. **Pre-req for
-  SIMD path: failure #2 fixed.** Otherwise Phase B work goes to
-  bootstrap amortization or speculation depth (closer to Phase E)
-  per the measurement. See `plans/pure-rust-perf.md` "Phase B —
-  Instrument before optimizing."
-- **Phase C — Architecture-specific dispatch.** `target_feature` +
-  CPUID runtime dispatch (`multiversion` crate). AVX2 + AVX-512 +
-  NEON variants of `decode_*_resumable`'s inner loops. Bench each ISA
-  flavor against ISA-L's equivalent. **Cross-cutting note**: lifting
-  the arm64 gate requires undoing arch gates on every parallel-SM
-  module (`chunk_buffer_pool.rs:1-4`, `rpmalloc_alloc.rs:1-4`, etc.),
-  not just `sm_cfg.rs`.
-- **Phase D — Pipeline overlap.** (1) CRC32 via hardware CLMUL
-  interleaved with decode; today computed per-chunk after decode
-  completes. (2) **NOTE: `apply_window` already runs on the worker**
-  via `run_post_process_task` (`chunk_fetcher.rs:1405-1412`). What
-  remains on the consumer is `publish_subchunk_windows` — the
-  WindowMap index write. Moving that earlier is the remaining D
-  opportunity *if* profiling shows the consumer stalls on it.
-- **Phase E — Speculation depth + SIMD BlockFinder.**
-  `RawBlockFinderCoordinator`'s scan loop replaced by 4-byte SIMD
-  pattern match on block-header candidates. Speculate two-three
-  boundaries ahead per worker instead of one.
-- **Phase F — Memory bandwidth.** Non-temporal stores for outputs
-  >500 MiB. NUMA-aware worker pinning. `MADV_POPULATE_WRITE` on
-  output. Marginal individually, multiplicative with A-E.
-
-Each phase is its own branch + PR with its own neurotic bench
-measurement. Don't pre-commit to all six; abandon any that doesn't
-beat its prior measurement.
-
-## Out of scope (Tier 3 / separate projects)
-
-- Remove `vendor/isa-l`, `isal-rs`, `packaging/isal-patches/` (requires sequential compress/decompress replacements)
-- `backends/isal_decompress.rs` / `isal_compress.rs` pure-Rust replacements
-- Seekable index reader (`IndexFileFormat.hpp`)
-- BZIP2, ZLIB-format decoders
-
-## Reading order
-
-- `single_member.rs` — entry, `MARKER_PIPELINE_RUNS` deletion trap
-- `chunk_fetcher.rs:350 drive` → consumer_loop → submit_decode_to_pool
-- Vendor `GzipChunkFetcher.hpp:312 processNextChunk` side-by-side with Rust
-
-## Troubleshooting (Beyond parity work)
-
-### If Phase A doesn't move the bench number — first 3 things to check
-
-1. **Is `arena-allocator` actually on?** `cargo tree --features
-   pure-rust-inflate | grep rpmalloc-sys` must list it. If missing,
-   the feature graph broke.
-2. **Is the pool being hit?** Add `eprintln!` of `TAKE_U8_HITS` /
-   `MISSES` (`chunk_buffer_pool.rs:206-207`) at end of
-   `test_single_member_parallel_silesia_class_not_slower_than_sequential`.
-   Hit-rate < 50% on iters 2-3 means workers aren't returning buffers
-   — check `chunk_data.rs:1079-1085` Drop is firing.
-3. **Is the silesia-class fixture re-compressing on every iter?** The
-   test (`routing.rs:639+`) loops 3× and the fixture build runs each
-   time the test starts. Check the bench is measuring decode only.
-
-### If Phase B's SIMD primitives produce wrong output — first 3 things to check
-
-1. **Failure #2 status.** If
-   `with_until_bits_resume_non_byte_aligned_with_dict` is still red,
-   the subtable `total_bits` bug at `resumable.rs:812-818`
-   (`consume(TABLE_BITS=11)` then `consume_entry(subtable.raw())`) is
-   biasing every bit-position downstream. Fix first or the SIMD path
-   inherits the bug.
-2. **Stopping-point bookkeeping at literal clusters.**
-   `decode_huffman_cf_vector` (`consume_first_decode.rs:582+`) has no
-   yield mid-block; `decode_huffman_body_resumable`
-   (`resumable.rs:800+`) must check `bit_position() >=
-   encoded_until_bits` after every batched cluster, not every
-   literal.
-3. **`copy_match_windowed` window precondition.** The window-stitched
-   copy at `resumable.rs::copy_match_windowed` is per-byte. SIMD bulk
-   replacement requires `distance <= out_pos - window_head`.
-   Off-by-one reads uninitialized window bytes — the bug surfaces
-   only on cross-chunk boundaries
-   (`cross_chunk_resume_silesia_gzip9_chunk0_handoff` would re-red).
-
-### How to capture a flame-graph on neurotic
-
-```bash
-ssh -J neurotic root@10.30.0.199
-cd ~/gzippy-dev   # the worktree the bench job uses
-cargo build --release --features pure-rust-inflate
-perf record -F 999 -g --call-graph dwarf -- \
-    ./target/release/gzippy -d -c benchmark_data/silesia-gzip.tar.gz > /dev/null
-perf script | inferno-flamegraph > /tmp/flame-pure-rust.svg
-# Target: asm_exc_page_fault + clear_page_erms < 25% combined CPU
-```
-
-### How to verify isal-compression production path stays green after any pure-rust change
-
-```bash
-# Local (30s):
-cargo test --release --features isal-compression -- routing
-
-# Authoritative (neurotic):
-ssh -J neurotic root@10.30.0.199 \
-  'cd ~/gzippy-dev && cargo test --release --features isal-compression -- \
-     test_single_member_parallel_silesia_class_not_slower_than_sequential \
-     --ignored --nocapture'
-# Ratio must stay < 0.5 on the 16-core homelab box.
-```
-
+1. `CLAUDE.md` — gzippy's goal, routing table, hard-won lessons.
+2. This file — what's left, in priority order, with anti-mistake rules.
+3. `plans/pure-rust-perf.md` — live measurements, active work-item
+   status, how to capture the next measurement.
+4. `vendor/rapidgzip/librapidarchive/src/rapidgzip/chunkdecoding/GzipChunk.hpp:468-654`
+   — the vendor decoder this all ports.
