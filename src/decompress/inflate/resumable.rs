@@ -24,8 +24,16 @@
 #![allow(dead_code)] // some vendor-parity methods are wrapper-only callers
 
 use std::io::{Error, ErrorKind, Result};
+use std::sync::atomic::AtomicU64;
 
 use super::consume_first_decode::{build_code_length_table, Bits};
+
+/// FASTLOOP multi-literal hit/miss counters. Inspect via test
+/// harness or end-of-run print to verify the SIMD lookahead pays off
+/// on the actual workload.
+pub static MULTI_LITERAL_HITS: AtomicU64 = AtomicU64::new(0);
+pub static MULTI_LITERAL_MISSES: AtomicU64 = AtomicU64::new(0);
+pub static MULTI_LITERAL_SYMBOLS: AtomicU64 = AtomicU64::new(0);
 use super::libdeflate_entry::{DistTable, LitLenTable};
 use super::stopping_point::StoppingPoint;
 
@@ -831,11 +839,14 @@ fn decode_huffman_body_resumable(
                 &vector_table.table,
             );
         if count > 0 {
+            MULTI_LITERAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            MULTI_LITERAL_SYMBOLS.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
             output[out_pos..(out_pos + count)].copy_from_slice(&symbols[..count]);
             out_pos += count;
             state.bits.consume(bits_count);
             continue;
         }
+        MULTI_LITERAL_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Multi-literal decode hit an overflow / length / EOB at
         // position 0 — fall through to scalar single-symbol decode.
