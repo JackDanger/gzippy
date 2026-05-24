@@ -32,15 +32,15 @@ Cfg gates live in `src/decompress/parallel/sm_cfg.rs`:
 
 ## Completed items
 
-### Track B — C-free SM hot path ✅
+### Track B — C-free SM hot path (⚠ B3 partial)
 
 
 | Item                                    | Status        | Proof                                                                                                                     |
 | --------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | B1 ResumableInflate + 4 stopping points | ✅             | `consume_first_decode.rs`; differential oracle in `inflate_wrapper.rs`; `test_resumable_end_of_stream_header_after_reset` |
 | B2 Bootstrap without C                  | ✅ (§3 bypass) | `deflate_block.rs` canonical path when `!USE_ISAL_INFLATE`; no LUT entry-for-entry test (§3 is end-to-end equivalent)     |
-| B3 Pure-Rust wrapper body               | ✅             | `inflate_wrapper.rs` pure backend; `test_pure_rust_parallel_sm_e2e` (pure-rust-inflate only)                              |
-| B3a Block scratch sizing                | ✅             | `consume_first_decode.rs:3174` — session = `decode_start + max_new + PER_BLOCK_HEADROOM` so one block can overflow caller buffer by up to PER_BLOCK_HEADROOM, surplus drains on next `read_stream` (matches ISA-L tmp_out) |
+| B3 Pure-Rust wrapper body               | ⚠ partial     | `inflate_wrapper.rs` pure backend wired; `test_pure_rust_parallel_sm_e2e` passes; **3 routing tests still red on neurotic** — fixture-driven blocks exceed the per-block scratch invented to simulate ISA-L's tmp_out. Path forward in §5 (option 2). |
+| B3a Block scratch sizing                | ⚠ band-aid    | `consume_first_decode.rs:3174` — `decode_start + max_new + PER_BLOCK_HEADROOM` (commit 2eff70f). Reduces failure window by max_new but a single ~8 MiB block still overflows. Replaced by §5 option 2; remove after that lands. |
 | B4 Throughput bench                     | ✅             | `benches/inflate_isal_vs_pure_rust.rs` + inline `test_isal_vs_pure_rust_silesia_throughput`                               |
 
 
@@ -84,16 +84,124 @@ cargo bench --release --features isal-compression -- \
   --bench inflate_isal_vs_pure_rust -- --nocapture
 ```
 
-Three pure-rust-inflate routing tests known to fail before the B3a
-headroom fix (commit 2eff70f); re-verify against HEAD on neurotic:
+Three pure-rust-inflate routing tests fail on neurotic against
+HEAD (`60f411c`):
 
-- `test_marker_pipeline_runs_on_btype01_heavy_input` — directly fixed
-  by B3a (match overflow on chunk_size+window boundary).
-- `test_prefetch_next_filesize_accept_fires` — likely downstream
-  (decode aborted before reaching last-chunk prefetch); re-test.
-- `test_coordinator_boundary_search_runs_on_x86_64_isal` — name is
-  historical (gated for both backends since pure-rust-inflate landed);
-  re-test, and rename to drop the `_isal` suffix once it stays green.
+- `test_marker_pipeline_runs_on_btype01_heavy_input` — panics with
+  `ResumableInflate("Generic match overflow: out_pos=8552442 length=8
+  output.len=8552448")`. Math: session = `decode_start (32K from
+  set_window) + max_new (128K) + PER_BLOCK_HEADROOM (8M) = 8552448`;
+  the single zlib L1 block emits ~8.13 MiB. Root cause is the
+  run-to-completion block decoder, not session accumulation.
+- `test_coordinator_boundary_search_runs_on_x86_64_isal` — same panic,
+  same fixture. (Name is historical; cfg-gates both backends.)
+- `test_prefetch_next_filesize_accept_fires` — `PREFETCH_NEXT_FILESIZE_ACCEPT
+  did not increment (2 -> 2)`. Independent of the match overflow;
+  needs root-causing once §5 lands and the first two go green.
+
+## §5 — Pure-Rust DEFLATE inflate with stopping points (option 2)
+
+**Architecture decision** (May 2026): two decoders per BTYPE.
+
+| Caller                                   | Decoder                                | Yield mid-block? |
+| ---------------------------------------- | -------------------------------------- | ---------------- |
+| BGZF, scan_inflate, sequential decompress | existing `decode_huffman_*` (fast)     | no               |
+| `ResumableInflate::read_stream`          | new `decode_huffman_*_resumable`       | yes              |
+
+Faithfulness to vendor (`vendor/.../gzip/isal.hpp:254-356`): ISA-L writes
+incrementally into the caller's `output` with an internal sliding window
+(~32 KiB via `tmp_out_buffer`). Our resumable decoders do the same; the
+non-resumable decoders stay untouched so BGZF/sequential pay no
+yield-check tax. This is what the band-aid `session` buffer (B3/B3a) was
+faking.
+
+**Files**:
+
+- `src/decompress/inflate/resumable.rs` (new) — `ResumableInflate2`
+  holding a `[u8; 32768]` ring buffer + pending-match state. Replaces
+  the `session: Vec<u8>` accumulator.
+- `src/decompress/inflate/resumable_decoders.rs` (new) — `decode_stored_resumable`,
+  `decode_fixed_resumable`, `decode_dynamic_resumable`. Each yields by
+  returning `Ok(YieldedMidBlock { pending_match })` instead of erroring
+  with `WriteZero`. Resume = re-enter with same `(litlen, dist, pending_match)`.
+- `src/decompress/parallel/inflate_wrapper.rs` — pure-rust backend
+  switches `inner` from `ResumableInflate` to `ResumableInflate2`.
+- `src/decompress/inflate/consume_first_decode.rs` — `ResumableInflate`
+  marked deprecated; deleted once `inflate_wrapper.rs` is the only
+  caller and migrates over.
+
+**Match-copy when distance reaches past `output[0]`**: the new module's
+hot path is `copy_match_windowed(output, out_pos, distance, length,
+window: &[u8; 32768], window_head: usize)`. Branch on
+`distance <= out_pos` — fast path (existing logic) vs window-stitched
+path. Window is updated after each `read_stream` from the trailing
+≤32 KiB of bytes just emitted to `output`.
+
+**Tiered bench gates** (preserved from earlier draft):
+
+- **Tier 1** — feature `pure-rust-inflate` is opt-in; throughput ≥ 1/1.5 ×
+  ISA-L acceptable. Gate: `benches/inflate_isal_vs_pure_rust.rs` green
+  on neurotic.
+- **Tier 2** — `pure-rust-inflate` becomes the default; throughput ≥ 1/1.2 ×
+  ISA-L. Same bench, stricter threshold.
+- **Tier 3** — `vendor/isa-l` + `isal-rs` + `packaging/isal-patches/`
+  deleted; throughput ≥ 1/1.05 × ISA-L. Detaches
+  `isal-compression`/`arena-allocator` coupling in `Cargo.toml`.
+  Migrates `backends/isal_decompress.rs` (T1 x86 sequential),
+  `backends/isal_compress.rs` (L0-L3 fast compress; out of port scope),
+  and any other ISA-L call site.
+
+**Implementation order**:
+
+1. Scaffold `resumable.rs` + `resumable_decoders.rs` with stubs returning
+   `Err(NotImplemented)`. Wire `inflate_wrapper.rs` behind a
+   `cfg(feature = "resumable-decoders")` flag so both backends coexist
+   during the cut.
+2. Land `decode_stored_resumable` first (simplest — no Huffman). Validate
+   via existing oracles.
+3. Land `decode_fixed_resumable` (static tables, just yield logic).
+4. Land `decode_dynamic_resumable` (full path).
+5. Flip the feature default to on; re-run the 3 red routing tests.
+6. Delete `ResumableInflate` + `session` field from `consume_first_decode.rs`.
+7. Delete B3a band-aid (commit 2eff70f).
+
+## Beyond parity — path to exceed rapidgzip
+
+Once §5 ships (parity within ~5%), the throughput-exceed path is six
+phases, each gated by `make ship` on neurotic and abandoned if its
+measurement doesn't beat the prior:
+
+- **Phase A — Close the page-fault gap.** `chunk_buffer_pool.rs:73-82`
+  notes gzippy spends ~40% of CPU in `asm_exc_page_fault`/`clear_page_erms`
+  vs rapidgzip's ~17%. Try (in order): `Vec<T, RpmallocAlloc>` for chunk
+  buffers (per-Vec, faithful to vendor `FasterVector<u8, RpmallocAllocator>`),
+  then `MADV_HUGEPAGE` on output, then `#[global_allocator] = RpMalloc`.
+  Largest expected win; independent of §5.
+- **Phase B — Bring gzippy's SIMD inflate primitives to the parallel-SM
+  resumable path.** `vector_huffman`, `simd_huffman`, `two_level_table`,
+  `packed_lut`, `combined_lut`, `bmi2` already ship for BGZF and
+  sequential decompress; extend `decode_*_resumable` to dispatch through
+  them. This is where pure-Rust beats ISA-L's general inflate on the
+  code-length distributions gzip(1) produces.
+- **Phase C — Architecture-specific dispatch.** `target_feature` +
+  CPUID runtime dispatch (`multiversion` crate). AVX2 + AVX-512 + NEON
+  variants of `decode_*_resumable`'s inner loops. Bench each ISA flavor
+  against ISA-L's equivalent.
+- **Phase D — Pipeline overlap.** (1) CRC32 via hardware CLMUL
+  interleaved with decode; today computed per-chunk after decode
+  completes. (2) Move `apply_window` from consumer thread to worker as
+  post-decode step.
+- **Phase E — Speculation depth + SIMD BlockFinder.** `RawBlockFinderCoordinator`'s
+  scan loop replaced by 4-byte SIMD pattern match on block-header
+  candidates. Speculate two-three boundaries ahead per worker instead
+  of one.
+- **Phase F — Memory bandwidth.** Non-temporal stores for outputs
+  >500 MiB. NUMA-aware worker pinning. `MADV_POPULATE_WRITE` on
+  output. Marginal individually, multiplicative with A-E.
+
+Each phase is its own branch + PR with its own neurotic bench measurement.
+Don't pre-commit to all six; abandon any that doesn't beat its prior
+measurement.
 
 ## Out of scope (Tier 3 / separate projects)
 

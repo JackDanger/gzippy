@@ -22,6 +22,7 @@ pub mod double_literal;
 pub mod jit_decode;
 pub mod libdeflate_decode;
 pub mod libdeflate_entry;
+pub mod resumable;
 pub mod specialized_decode;
 pub mod stopping_point;
 pub mod vector_huffman;
