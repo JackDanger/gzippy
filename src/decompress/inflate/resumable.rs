@@ -18,12 +18,13 @@
 //! via [`crate::decompress::parallel::inflate_wrapper::IsalInflateWrapper`],
 //! the parallel-SM hot path.
 //!
-//! Skeleton only — see `Beyond parity` and `§5 — Implementation order` in
-//! `plans/rust-rapidgzip.md` for the fill-in plan.
+//! Fill-in status: step 2 (stored block) landed; fixed + dynamic + the
+//! window-stitched match copy are still `unimplemented!`. See
+//! `plans/rust-rapidgzip.md §5 — Implementation order`.
 
-#![allow(dead_code)] // skeleton; methods unused until decoders land
+#![allow(dead_code)] // step 2: dispatch methods called only by step-3 wiring
 
-use std::io::Result;
+use std::io::{Error, ErrorKind, Result};
 
 use super::consume_first_decode::Bits;
 use super::stopping_point::StoppingPoint;
@@ -44,7 +45,7 @@ pub struct PendingMatch {
 
 /// Block-decode state machine position. Persists across `read_stream` calls
 /// so the decoder can resume mid-block.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BlockState {
     /// Not currently inside a block — the next call reads the 3-bit
     /// `(BFINAL, BTYPE)` header.
@@ -58,6 +59,8 @@ pub enum BlockState {
     /// Inside a BTYPE=02 dynamic-Huffman block; tables live on the
     /// `ResumableInflate2` (rebuilt from the block header at entry).
     InDynamic,
+    /// Stream is finished (final block's BFINAL=1 completed).
+    Finished,
 }
 
 /// 32 KiB ring buffer holding the last `WINDOW_SIZE` decoded output bytes.
@@ -66,10 +69,12 @@ pub enum BlockState {
 #[derive(Clone)]
 pub struct SlidingWindow {
     buf: Box<[u8; WINDOW_SIZE]>,
-    /// Next write position; wraps. `len < WINDOW_SIZE` until the first wrap.
+    /// Next write position; wraps mod `WINDOW_SIZE`. After the first
+    /// `WINDOW_SIZE` bytes have been written, `head` no longer corresponds
+    /// to "logical length" — use `written` instead.
     head: usize,
-    /// Total bytes ever written (saturating); used to know whether `head`
-    /// has wrapped.
+    /// Total bytes ever written, saturating at `usize::MAX`. Used by
+    /// `lookback` to know how many bytes the window actually contains.
     written: usize,
 }
 
@@ -84,27 +89,67 @@ impl Default for SlidingWindow {
 }
 
 impl SlidingWindow {
-    /// Returns the last `n` bytes ever fed into the window (or `None` if
-    /// fewer than `n` bytes have ever been written). `n` must be ≤
-    /// [`WINDOW_SIZE`].
-    pub fn lookback(&self, _n: usize) -> Option<&[u8]> {
-        // TODO(§5): wrap-aware lookup returning a slice (may span the wrap
-        // boundary; caller must handle two-segment reads via `lookback_split`).
-        unimplemented!("§5 fill-in")
+    /// Number of bytes currently retrievable from the window
+    /// (= `min(written, WINDOW_SIZE)`).
+    pub fn len(&self) -> usize {
+        self.written.min(WINDOW_SIZE)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.written == 0
     }
 
     /// Append `src` to the window, advancing `head` (mod `WINDOW_SIZE`).
     /// Only the trailing `WINDOW_SIZE` bytes are retained.
-    pub fn extend(&mut self, _src: &[u8]) {
-        // TODO(§5): memcpy with potential wrap split.
-        unimplemented!("§5 fill-in")
+    pub fn extend(&mut self, src: &[u8]) {
+        if src.is_empty() {
+            return;
+        }
+        // Only the trailing WINDOW_SIZE bytes can possibly matter.
+        let drop = src.len().saturating_sub(WINDOW_SIZE);
+        let tail = &src[drop..];
+        let n = tail.len();
+        // Copy in up to two segments (`head..head+n` may wrap past WINDOW_SIZE).
+        let first = n.min(WINDOW_SIZE - self.head);
+        self.buf[self.head..self.head + first].copy_from_slice(&tail[..first]);
+        let rest = n - first;
+        if rest > 0 {
+            self.buf[..rest].copy_from_slice(&tail[first..]);
+        }
+        self.head = (self.head + n) % WINDOW_SIZE;
+        // `src.len()` (not `n`) so callers that flushed >WINDOW_SIZE bytes
+        // still mark the window as full.
+        self.written = self.written.saturating_add(src.len());
+    }
+
+    /// Copy the last `n` bytes of the window into `dst[..n]`. `n` must be
+    /// ≤ `self.len()` (call `len()` first to check). Handles the
+    /// ring-buffer wrap with up to two memcpys.
+    pub fn copy_last_n_into(&self, n: usize, dst: &mut [u8]) {
+        debug_assert!(n <= self.len(), "lookback {n} > window len {}", self.len());
+        debug_assert!(dst.len() >= n, "dst too small: {} < {n}", dst.len());
+        if n == 0 {
+            return;
+        }
+        // The byte that is `i` positions back from the most recent write
+        // sits at `(head + WINDOW_SIZE - 1 - i) mod WINDOW_SIZE`. The "last
+        // n" range begins at `(head + WINDOW_SIZE - n) mod WINDOW_SIZE`.
+        let start = (self.head + WINDOW_SIZE - n) % WINDOW_SIZE;
+        let first = n.min(WINDOW_SIZE - start);
+        dst[..first].copy_from_slice(&self.buf[start..start + first]);
+        let rest = n - first;
+        if rest > 0 {
+            dst[first..first + rest].copy_from_slice(&self.buf[..rest]);
+        }
     }
 
     /// Seed the window with up to 32 KiB of bytes (the chunk's predecessor
     /// window from `WindowMap`). Replaces any prior contents.
-    pub fn seed(&mut self, _bytes: &[u8]) {
-        // TODO(§5): take `bytes[bytes.len().saturating_sub(WINDOW_SIZE)..]`.
-        unimplemented!("§5 fill-in")
+    pub fn seed(&mut self, bytes: &[u8]) {
+        self.head = 0;
+        self.written = 0;
+        // `extend` will correctly take the trailing 32 KiB.
+        self.extend(bytes);
     }
 }
 
@@ -134,50 +179,223 @@ pub struct ResumableInflate2<'a> {
     pub(crate) points_to_stop_at: StoppingPoint,
     pub(crate) stopped_at: StoppingPoint,
     pub(crate) encoded_until_bits: usize,
-    // TODO(§5): persistent Huffman tables for `BlockState::InDynamic`.
-    // These are built once per dynamic block at entry and must survive
-    // across mid-block yields.
+    // TODO(§5 step 3+): persistent Huffman tables for `BlockState::InDynamic`.
 }
 
 impl<'a> ResumableInflate2<'a> {
     /// Construct positioned at `bit_offset` into `input`, with no window
     /// (caller seeds via [`Self::set_window`]).
-    pub fn with_until_bits(
-        _input: &'a [u8],
-        _bit_offset: usize,
-        _until_bits: usize,
-    ) -> Result<Self> {
-        // TODO(§5): mirror `consume_first_decode::ResumableInflate::with_until_bits`.
-        unimplemented!("§5 fill-in")
+    pub fn with_until_bits(input: &'a [u8], bit_offset: usize, until_bits: usize) -> Result<Self> {
+        let input_bits = input.len().saturating_mul(8);
+        if bit_offset > input_bits {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "bit_offset past end of input",
+            ));
+        }
+        Ok(Self {
+            bits: Bits::at_bit_offset(input, bit_offset),
+            window: SlidingWindow::default(),
+            block_state: BlockState::default(),
+            pending_match: None,
+            last_bfinal: false,
+            points_to_stop_at: StoppingPoint::NONE,
+            stopped_at: StoppingPoint::NONE,
+            encoded_until_bits: until_bits.min(input_bits),
+        })
     }
 
-    /// Seed the sliding window from a chunk's predecessor 32 KiB.
-    pub fn set_window(&mut self, _window: &[u8]) -> Result<()> {
-        unimplemented!("§5 fill-in")
+    /// Seed the sliding window from a chunk's predecessor 32 KiB. Replaces
+    /// any prior window contents and clears block state.
+    pub fn set_window(&mut self, window: &[u8]) -> Result<()> {
+        self.window.seed(window);
+        self.block_state = BlockState::AwaitingHeader;
+        self.pending_match = None;
+        self.last_bfinal = false;
+        self.stopped_at = StoppingPoint::NONE;
+        Ok(())
     }
 
     /// Configure which `StoppingPoint`s cause an early return from
     /// `read_stream`.
-    pub fn set_stopping_points(&mut self, _points: StoppingPoint) {
-        unimplemented!("§5 fill-in")
+    pub fn set_stopping_points(&mut self, points: StoppingPoint) {
+        self.points_to_stop_at = if points == StoppingPoint::NONE {
+            StoppingPoint::NONE
+        } else {
+            StoppingPoint(points.0 & StoppingPoint::ALL.0)
+        };
+    }
+
+    pub fn stopped_at(&self) -> StoppingPoint {
+        self.stopped_at
+    }
+
+    pub fn bit_position(&self) -> usize {
+        self.bits.bit_position()
+    }
+
+    pub fn is_final_block(&self) -> bool {
+        self.last_bfinal
     }
 
     /// Drive the decoder into `output`, stopping when:
     ///   (1) `output` is full,
     ///   (2) a requested `StoppingPoint` fires,
     ///   (3) `encoded_until_bits` is reached,
-    ///   (4) the final block's BFINAL completes and footer is past.
-    ///
-    /// On (1), the decoder saves [`BlockState`] + [`PendingMatch`] + bit
-    /// reader state so the next call resumes mid-block.
-    pub fn read_stream(&mut self, _output: &mut [u8]) -> Result<InflateStreamResult> {
-        // TODO(§5): dispatch on `self.block_state`:
-        //   AwaitingHeader → read (BFINAL, BTYPE); enter Stored/Fixed/Dynamic.
-        //   InStored      → resume_decode_stored_resumable(self, output)
-        //   InFixed       → resume_decode_fixed_resumable(self, output)
-        //   InDynamic     → resume_decode_dynamic_resumable(self, output)
-        // Match-copy uses `copy_match_windowed` (see below).
-        unimplemented!("§5 fill-in")
+    ///   (4) the final block's BFINAL completes.
+    pub fn read_stream(&mut self, output: &mut [u8]) -> Result<InflateStreamResult> {
+        self.stopped_at = StoppingPoint::NONE;
+        let out_pos_start = 0usize;
+        let mut out_pos = out_pos_start;
+
+        loop {
+            if out_pos >= output.len() {
+                break;
+            }
+
+            // Resume any pending match from a prior yield BEFORE reading new
+            // bits — the match is logically part of the prior block.
+            if let Some(pending) = self.pending_match {
+                let new_pos = copy_match_windowed(
+                    self,
+                    output,
+                    out_pos,
+                    pending.distance,
+                    pending.length_remaining,
+                )?;
+                out_pos = new_pos;
+                if self.pending_match.is_some() {
+                    // copy_match_windowed yielded again — output is full.
+                    debug_assert_eq!(out_pos, output.len());
+                    break;
+                }
+            }
+
+            match self.block_state {
+                BlockState::Finished => break,
+                BlockState::AwaitingHeader => {
+                    if !self.try_enter_next_block()? {
+                        // Out of input bits.
+                        break;
+                    }
+                    if self
+                        .points_to_stop_at
+                        .contains(StoppingPoint::END_OF_BLOCK_HEADER)
+                    {
+                        self.stopped_at = StoppingPoint::END_OF_BLOCK_HEADER;
+                        break;
+                    }
+                }
+                BlockState::InStored { .. } => {
+                    out_pos = resume_decode_stored_resumable(self, output, out_pos)?;
+                }
+                BlockState::InFixed | BlockState::InDynamic => {
+                    return Err(Error::new(
+                        ErrorKind::Unsupported,
+                        "fixed/dynamic resumable decoders pending §5 step 3/4",
+                    ));
+                }
+            }
+
+            if matches!(self.block_state, BlockState::Finished) {
+                if self
+                    .points_to_stop_at
+                    .contains(StoppingPoint::END_OF_STREAM)
+                {
+                    self.stopped_at = StoppingPoint::END_OF_STREAM;
+                }
+                break;
+            }
+
+            if matches!(self.block_state, BlockState::AwaitingHeader)
+                && self.points_to_stop_at.contains(StoppingPoint::END_OF_BLOCK)
+            {
+                self.stopped_at = StoppingPoint::END_OF_BLOCK;
+                break;
+            }
+        }
+
+        // Feed the bytes just emitted to the user into the sliding window so
+        // future match-copies can reach them after they leave `output`.
+        if out_pos > out_pos_start {
+            self.window.extend(&output[out_pos_start..out_pos]);
+        }
+
+        let finished =
+            matches!(self.block_state, BlockState::Finished) && self.pending_match.is_none();
+        Ok(InflateStreamResult {
+            bytes_written: out_pos - out_pos_start,
+            stopped_at: self.stopped_at,
+            bit_position: self.bits.bit_position(),
+            finished,
+        })
+    }
+
+    /// Read the 3-bit `(BFINAL, BTYPE)` header and parse any block-type-specific
+    /// header bits (LEN/NLEN for stored). Returns `Ok(false)` if no header bits
+    /// are available (end of input). On entry must have `block_state ==
+    /// AwaitingHeader`.
+    fn try_enter_next_block(&mut self) -> Result<bool> {
+        debug_assert!(matches!(self.block_state, BlockState::AwaitingHeader));
+
+        // Need at least 3 bits to read (BFINAL, BTYPE).
+        if self.bits.available() < 3 {
+            self.bits.refill();
+        }
+        if self.bits.available() < 3 {
+            return Ok(false);
+        }
+        if self.bits.bit_position() >= self.encoded_until_bits {
+            return Ok(false);
+        }
+
+        let header = self.bits.bitbuf & 0b111;
+        self.bits.consume(3);
+        self.last_bfinal = (header & 1) != 0;
+        let btype = (header >> 1) & 0b11;
+        match btype {
+            0 => {
+                let len = self.bits.read_u16();
+                let nlen = self.bits.read_u16();
+                if len != !nlen {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "Stored block: len={len:#x} nlen={nlen:#x} (~nlen={:#x})",
+                            !nlen
+                        ),
+                    ));
+                }
+                self.block_state = BlockState::InStored {
+                    bytes_remaining: len as u32,
+                };
+                Ok(true)
+            }
+            1 => {
+                self.block_state = BlockState::InFixed;
+                Ok(true)
+            }
+            2 => {
+                self.block_state = BlockState::InDynamic;
+                Ok(true)
+            }
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                "Reserved DEFLATE block type (BTYPE=11)",
+            )),
+        }
+    }
+
+    /// Mark the current block complete: transition back to `AwaitingHeader`,
+    /// or to `Finished` if the most recent block's BFINAL=1. After-block
+    /// hook used by every `resume_decode_*_resumable` to keep that bit of
+    /// state machine logic out of each individual decoder.
+    pub(crate) fn finish_current_block(&mut self) {
+        self.block_state = if self.last_bfinal {
+            BlockState::Finished
+        } else {
+            BlockState::AwaitingHeader
+        };
     }
 }
 
@@ -191,38 +409,95 @@ impl<'a> ResumableInflate2<'a> {
 // decompress (they need no yield-check tax).
 
 /// Resumable BTYPE=00 (uncompressed): copy `bytes_remaining` literal bytes
-/// from input to output, yielding when `output` fills.
-pub fn resume_decode_stored_resumable<'a>(
-    _state: &mut ResumableInflate2<'a>,
-    _output: &mut [u8],
-    _out_pos: usize,
+/// from input to output, yielding when `output` fills. On entry, the bit
+/// reader is positioned immediately after LEN/NLEN (see
+/// `ResumableInflate2::try_enter_next_block`); `block_state` is
+/// `InStored { bytes_remaining }` with `bytes_remaining > 0` (or the block
+/// is empty and we transition straight out).
+pub fn resume_decode_stored_resumable(
+    state: &mut ResumableInflate2<'_>,
+    output: &mut [u8],
+    mut out_pos: usize,
 ) -> Result<usize> {
-    // TODO(§5): straight memcpy with byte-aligned bit reader; trivial yield.
-    unimplemented!("§5 fill-in")
+    let BlockState::InStored {
+        mut bytes_remaining,
+    } = state.block_state
+    else {
+        debug_assert!(
+            false,
+            "resume_decode_stored_resumable called outside InStored"
+        );
+        return Ok(out_pos);
+    };
+
+    if bytes_remaining == 0 {
+        state.finish_current_block();
+        return Ok(out_pos);
+    }
+
+    // After try_enter_next_block parsed LEN/NLEN, the bit cursor is
+    // byte-aligned (read_u16 calls align_to_byte). We could drain the
+    // remaining buffered bits into output one byte at a time — but that
+    // leaves `bitsleft = 0` while `bitbuf` still holds the bytes the
+    // libdeflate-style refill speculatively loaded past the LEN/NLEN
+    // word. The next `refill()` (`bitbuf |= word << bits_u8` with
+    // `bits_u8 = 0`) ORs new bytes onto those stale ones and corrupts
+    // the next block's header. Avoid the trap entirely: locate the
+    // first data byte via `bit_position`, memcpy directly from
+    // `bits.data`, and reset the bit reader so the next refill starts
+    // clean.
+    debug_assert_eq!(
+        state.bits.bit_position() % 8,
+        0,
+        "stored block body must start byte-aligned"
+    );
+    let data_start_byte = state.bits.bit_position() / 8;
+    let copy_n = (bytes_remaining as usize).min(output.len() - out_pos);
+    if data_start_byte + copy_n > state.bits.data.len() {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            format!(
+                "Truncated stored block: need {copy_n} bytes from offset {data_start_byte}, have {}",
+                state.bits.data.len().saturating_sub(data_start_byte)
+            ),
+        ));
+    }
+    output[out_pos..out_pos + copy_n]
+        .copy_from_slice(&state.bits.data[data_start_byte..data_start_byte + copy_n]);
+    state.bits.pos = data_start_byte + copy_n;
+    state.bits.bitbuf = 0;
+    state.bits.bitsleft = 0;
+    out_pos += copy_n;
+    bytes_remaining -= copy_n as u32;
+
+    if bytes_remaining == 0 {
+        state.finish_current_block();
+    } else {
+        // Yield mid-block: stash remaining count so the next call resumes.
+        state.block_state = BlockState::InStored { bytes_remaining };
+    }
+    Ok(out_pos)
 }
 
 /// Resumable BTYPE=01 (fixed Huffman): static tables, no header parse.
-pub fn resume_decode_fixed_resumable<'a>(
-    _state: &mut ResumableInflate2<'a>,
+/// Pending — §5 step 3.
+pub fn resume_decode_fixed_resumable(
+    _state: &mut ResumableInflate2<'_>,
     _output: &mut [u8],
     _out_pos: usize,
 ) -> Result<usize> {
-    // TODO(§5): inner loop based on `decode_huffman_libdeflate_style` but
-    // with yield-on-output-full + window-stitched match-copy. Tables are
-    // the static fixed-Huffman tables from `libdeflate_entry`.
-    unimplemented!("§5 fill-in")
+    unimplemented!("§5 step 3 fill-in")
 }
 
 /// Resumable BTYPE=02 (dynamic Huffman). On first entry the block header is
 /// read and tables are built onto `state`; subsequent re-entries resume
-/// mid-block using those same tables.
-pub fn resume_decode_dynamic_resumable<'a>(
-    _state: &mut ResumableInflate2<'a>,
+/// mid-block using those same tables. Pending — §5 step 4.
+pub fn resume_decode_dynamic_resumable(
+    _state: &mut ResumableInflate2<'_>,
     _output: &mut [u8],
     _out_pos: usize,
 ) -> Result<usize> {
-    // TODO(§5): table build on first entry; yield-aware inner loop on resume.
-    unimplemented!("§5 fill-in")
+    unimplemented!("§5 step 4 fill-in")
 }
 
 // =============================================================================
@@ -241,41 +516,148 @@ pub fn resume_decode_dynamic_resumable<'a>(
 ///      into `output` if `length` exceeds that.
 ///
 /// Returns the new `out_pos` (advanced by `length`), or yields a
-/// [`PendingMatch`] on `state` and returns the unchanged `out_pos` if
-/// `output` filled mid-copy.
-pub fn copy_match_windowed<'a>(
-    _state: &mut ResumableInflate2<'a>,
+/// [`PendingMatch`] on `state` and returns the (truncated) `out_pos`
+/// (= `output.len()`) if `output` filled mid-copy.
+pub fn copy_match_windowed(
+    _state: &mut ResumableInflate2<'_>,
     _output: &mut [u8],
     _out_pos: usize,
     _distance: u32,
     _length: u32,
 ) -> Result<usize> {
-    // TODO(§5):
-    //   if distance <= out_pos: existing copy_match_safe / copy_match_fast.
-    //   else: split = (distance - out_pos) as usize;
-    //         read `split` bytes from `state.window.lookback(split)` into
-    //         output[out_pos..out_pos+split], then loop into output for
-    //         the remaining `length - split`.
-    //   On output.len() boundary mid-copy: save PendingMatch + return.
-    unimplemented!("§5 fill-in")
+    // §5 step 3+: implementation once the first Huffman block decoder lands.
+    // Until then, only stored blocks (which never emit matches) reach
+    // `read_stream`, so this is unreachable on the stored-only path.
+    unimplemented!("§5 step 3 fill-in")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn raw_stored_block(data: &[u8], bfinal: bool) -> Vec<u8> {
+        // 3-bit header packed into byte 0: low bit = BFINAL, next 2 = BTYPE=0.
+        // After byte-align, LEN (2 bytes LE), NLEN (~LEN, 2 bytes LE), then data.
+        let mut out = Vec::with_capacity(5 + data.len());
+        out.push(if bfinal { 0b001 } else { 0b000 });
+        let len = data.len() as u16;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
     #[test]
-    fn skeleton_compiles() {
-        // The fill-in plan lives in `plans/rust-rapidgzip.md §5`. This test
-        // exists only so the skeleton is exercised by `cargo test` and any
-        // drift between this module's public API and the wrapper's
-        // expectations surfaces immediately.
-        assert_eq!(WINDOW_SIZE, 32 * 1024);
-        let w = SlidingWindow::default();
-        assert_eq!(w.head, 0);
-        assert_eq!(w.written, 0);
-        assert_eq!(BlockState::default(), BlockState::AwaitingHeader);
-        let p = PendingMatch::default();
-        assert_eq!(p.length_remaining, 0);
+    fn sliding_window_roundtrip() {
+        let mut w = SlidingWindow::default();
+        w.extend(b"hello world");
+        assert_eq!(w.len(), 11);
+        let mut buf = [0u8; 5];
+        w.copy_last_n_into(5, &mut buf);
+        assert_eq!(&buf, b"world");
+
+        // Force a wrap: write more than WINDOW_SIZE bytes total.
+        let big = vec![0xAAu8; WINDOW_SIZE + 100];
+        w.extend(&big);
+        assert_eq!(w.len(), WINDOW_SIZE);
+        let mut tail = vec![0u8; 50];
+        w.copy_last_n_into(50, &mut tail);
+        assert!(tail.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn sliding_window_seed_replaces_contents() {
+        let mut w = SlidingWindow::default();
+        w.extend(b"oldoldold");
+        w.seed(b"NEW");
+        assert_eq!(w.len(), 3);
+        let mut buf = [0u8; 3];
+        w.copy_last_n_into(3, &mut buf);
+        assert_eq!(&buf, b"NEW");
+    }
+
+    #[test]
+    fn sliding_window_seed_trims_to_window_size() {
+        let mut w = SlidingWindow::default();
+        let big = vec![0xCDu8; WINDOW_SIZE * 3 + 17];
+        w.seed(&big);
+        // `seed` truncates to keep only the trailing WINDOW_SIZE bytes.
+        assert_eq!(w.len(), WINDOW_SIZE);
+        let mut tail = [0u8; 16];
+        w.copy_last_n_into(16, &mut tail);
+        assert!(tail.iter().all(|&b| b == 0xCD));
+    }
+
+    #[test]
+    fn stored_block_full_output_buffer() {
+        let payload = b"abcdefghijklmnopqrstuvwxyz0123456789".repeat(10);
+        let stream = raw_stored_block(&payload, true);
+        let mut inflate = ResumableInflate2::with_until_bits(&stream, 0, stream.len() * 8).unwrap();
+        let mut output = vec![0u8; payload.len()];
+        let r = inflate.read_stream(&mut output).unwrap();
+        assert_eq!(r.bytes_written, payload.len());
+        assert!(r.finished);
+        assert_eq!(output, payload);
+    }
+
+    #[test]
+    fn stored_block_small_output_yields_then_resumes() {
+        let payload = b"abcdefghijklmnopqrstuvwxyz0123456789".repeat(20); // 720 bytes
+        let stream = raw_stored_block(&payload, true);
+        let mut inflate = ResumableInflate2::with_until_bits(&stream, 0, stream.len() * 8).unwrap();
+        let mut collected = Vec::with_capacity(payload.len());
+        let chunk = 37usize; // intentionally awkward
+        loop {
+            let mut output = vec![0u8; chunk];
+            let r = inflate.read_stream(&mut output).unwrap();
+            if r.bytes_written == 0 && r.finished {
+                break;
+            }
+            collected.extend_from_slice(&output[..r.bytes_written]);
+            if r.finished {
+                break;
+            }
+            assert!(r.bytes_written > 0, "no progress on chunk of {chunk}");
+        }
+        assert_eq!(collected, payload);
+    }
+
+    #[test]
+    fn stored_block_empty_payload_finishes_immediately() {
+        let stream = raw_stored_block(b"", true);
+        let mut inflate = ResumableInflate2::with_until_bits(&stream, 0, stream.len() * 8).unwrap();
+        let mut output = [0u8; 16];
+        let r = inflate.read_stream(&mut output).unwrap();
+        assert_eq!(r.bytes_written, 0);
+        assert!(r.finished);
+    }
+
+    #[test]
+    fn multi_stored_blocks_concatenate() {
+        let mut stream = raw_stored_block(b"first chunk ", false);
+        stream.extend(raw_stored_block(b"second chunk ", false));
+        stream.extend(raw_stored_block(b"third final chunk", true));
+        let mut inflate = ResumableInflate2::with_until_bits(&stream, 0, stream.len() * 8).unwrap();
+        let mut output = vec![0u8; 256];
+        let r = inflate.read_stream(&mut output).unwrap();
+        assert!(
+            r.finished,
+            "all 3 blocks should decode in one call given ample output"
+        );
+        assert_eq!(
+            &output[..r.bytes_written],
+            b"first chunk second chunk third final chunk"
+        );
+    }
+
+    #[test]
+    fn stored_block_corrupt_nlen_errors() {
+        let mut stream = raw_stored_block(b"data", true);
+        // Flip a bit in NLEN (bytes 3..5) so len != !nlen.
+        stream[3] ^= 0x01;
+        let mut inflate = ResumableInflate2::with_until_bits(&stream, 0, stream.len() * 8).unwrap();
+        let mut output = [0u8; 16];
+        let err = inflate.read_stream(&mut output).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 }
