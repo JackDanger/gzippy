@@ -922,7 +922,22 @@ fn consumer_loop<W: std::io::Write>(
         let partition_offset = partition_offset_for(&next_block_offset);
         let mut chunk_arc_from_partition: Option<Arc<ChunkData>> = None;
         if partition_offset != next_block_offset {
-            if let Some(Ok(arc)) = block_fetcher.try_take_prefetched(&partition_offset) {
+            // Lever H: while blocking on the in-flight prefetch's
+            // `rx.recv`, pump `prefetch_new_blocks` every 1ms so the
+            // prefetch horizon advances during the wait. Mirror of
+            // vendor BlockFetcher.hpp:312-316.
+            let pump = || {
+                if should_drive_prefetch {
+                    block_fetcher.prefetch_new_blocks(
+                        &lookup_block_offset,
+                        &lookup_next_block_offset,
+                        &prefetch_submit,
+                        &is_finalized_too_high,
+                        &partition_offset_for,
+                    );
+                }
+            };
+            if let Some(Ok(arc)) = block_fetcher.try_take_prefetched_pumping(&partition_offset, pump) {
                 // Vendor GzipChunkFetcher.hpp:646-648 — accept the chunk
                 // only if `matchesEncodedOffset(blockOffset)`. If not,
                 // discard and dispatch on-demand at the real offset.
