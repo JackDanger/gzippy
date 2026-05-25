@@ -633,7 +633,13 @@ fn bootstrap_with_deflate_block(
     use crate::decompress::inflate::consume_first_decode::Bits;
     use crate::decompress::parallel::deflate_block::{Block, MAX_WINDOW_SIZE};
     use crate::decompress::parallel::replace_markers::MARKER_BASE;
+    use crate::decompress::parallel::trace_v2;
     use std::cell::RefCell;
+
+    let _tv2 = trace_v2::SpanGuard::begin_with(
+        "worker.bootstrap",
+        &format!(r#""start_bit":{start_bit_offset},"stop_hint":{stop_hint_bits}"#),
+    );
 
     // Per-thread Block recycling. Block::new() allocates a 128 KiB
     // ring + initializes the marker zone (64 KiB writes). Doing that
@@ -700,13 +706,17 @@ fn bootstrap_with_deflate_block(
 
             // Read this block's header. `treat_last_block_as_error = false`
             // (we WANT to see BFINAL so we can stop).
-            let t_header = std::time::Instant::now();
-            let header_res = block.read_header(&mut bits, false);
-            BOOTSTRAP_HEADER_US.fetch_add(
-                t_header.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            BOOTSTRAP_HEADER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let header_res = {
+                let _tv2 = trace_v2::SpanGuard::begin("worker.block_header");
+                let t_header = std::time::Instant::now();
+                let r = block.read_header(&mut bits, false);
+                BOOTSTRAP_HEADER_US.fetch_add(
+                    t_header.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                BOOTSTRAP_HEADER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                r
+            };
             match header_res {
                 Ok(()) => {}
                 Err(e) => {
@@ -734,6 +744,7 @@ fn bootstrap_with_deflate_block(
             // `std::numeric_limits<size_t>::max()` at GzipChunk.hpp:568.
             let before_len = output.len();
             let t_body = std::time::Instant::now();
+            let _tv2_body = trace_v2::SpanGuard::begin("worker.block_body");
             while !block.eob() {
                 let res = block.read(&mut bits, &mut *output, usize::MAX);
                 if let Err(e) = res {

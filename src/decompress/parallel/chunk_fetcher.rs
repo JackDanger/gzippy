@@ -128,6 +128,7 @@ use crate::decompress::parallel::thread_pool::ThreadPool;
     any(feature = "isal-compression", feature = "pure-rust-inflate")
 ))]
 use crate::decompress::parallel::trace;
+use crate::decompress::parallel::trace_v2;
 #[cfg(all(
     target_arch = "x86_64",
     any(feature = "isal-compression", feature = "pure-rust-inflate")
@@ -353,6 +354,14 @@ pub fn drive<W: std::io::Write>(
     parallelization: usize,
     configuration: ChunkConfiguration,
 ) -> Result<(u32, usize), FetchError> {
+    let _tv2 = trace_v2::SpanGuard::begin_with(
+        "drive",
+        &format!(
+            r#""input_bytes":{},"parallelization":{}"#,
+            input.len(),
+            parallelization
+        ),
+    );
     let total_bits = input.len() * 8;
     // Vendor `availableCores()` (AffinityHelpers.hpp:18-21): avoid pinning
     // more workers than physical cores — SMT siblings collide on cache.
@@ -648,6 +657,9 @@ pub fn drive<W: std::io::Write>(
         );
     }
 
+    // Flush all per-thread trace_v2 buffers (consumer thread + any
+    // already-joined worker threads).
+    trace_v2::flush_all();
     Ok((total_crc.crc32(), total_size))
 }
 
@@ -701,6 +713,7 @@ fn consumer_loop<W: std::io::Write>(
     let mut submit_us_sum: u128 = 0;
     let mut iter_count: usize = 0;
     loop {
+        let _tv2 = trace_v2::SpanGuard::begin("consumer.iter");
         let t_iter = std::time::Instant::now();
         // BlockFetcher.hpp:427 — opportunistically promote ready prefetches
         // so workers don't idle while the consumer waits on a different key.
@@ -983,6 +996,13 @@ fn consumer_loop<W: std::io::Write>(
             Some(arc) => arc,
             None => {
                 let t_fg = std::time::Instant::now();
+                let _tv2 = trace_v2::SpanGuard::begin_with(
+                    "wait.block_fetcher_get",
+                    &format!(
+                        r#""chunk_id":{},"offset":{}"#,
+                        partition_idx_for_trace, next_block_offset
+                    ),
+                );
                 let (chunk_arc_result, _prefetched) = block_fetcher.get_with_prefetch(
                     next_block_offset,
                     |_key: usize| -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
@@ -1376,6 +1396,16 @@ fn run_decode_task(
     block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
     configuration: ChunkConfiguration,
 ) -> Result<Arc<ChunkData>, ChunkDecodeError> {
+    let _tv2 = trace_v2::SpanGuard::begin_with(
+        "worker.decode_chunk",
+        &format!(
+            r#""chunk_id":{},"start_bit":{},"stop_hint":{},"speculative":{}"#,
+            params.partition_idx,
+            params.start_bit,
+            params.stop_hint_bit,
+            params.is_speculative_prefetch
+        ),
+    );
     // SAFETY: `drive`'s contract — input outlives the thread pool.
     let input_bytes: &[u8] = unsafe { input.as_slice() };
 
@@ -1513,6 +1543,14 @@ fn run_decode_task(
     any(feature = "isal-compression", feature = "pure-rust-inflate")
 ))]
 fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> ChunkData {
+    let _tv2 = trace_v2::SpanGuard::begin_with(
+        "post_process.task",
+        &format!(
+            r#""start_bit":{},"marker_bytes":{}"#,
+            chunk.encoded_offset_bits,
+            chunk.data_with_markers.len()
+        ),
+    );
     // Vendor lambda at GzipChunkFetcher.hpp:579-582 — `applyWindow` only.
     // WindowMap writes happen on the consumer (`publish_subchunk_windows`).
     let start_bit = chunk.encoded_offset_bits;
@@ -1913,6 +1951,7 @@ fn drain_one_pending<W: std::io::Write>(
     total_size: &mut usize,
     block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
 ) -> Result<(), FetchError> {
+    let _tv2 = trace_v2::SpanGuard::begin("consumer.drain");
     let head = match pending.pop_front() {
         Some(h) => h,
         None => return Ok(()),
@@ -1926,6 +1965,10 @@ fn drain_one_pending<W: std::io::Write>(
             cache_key,
         } => (idx, chunk, cache_key),
         PendingWrite::Async { idx, rx, cache_key } => {
+            let _tv2_wait = trace_v2::SpanGuard::begin_with(
+                "wait.future_recv",
+                &format!(r#""chunk_id":{idx}"#),
+            );
             let chunk = rx.recv().map_err(|_| {
                 FetchError::Decode(ChunkDecodeError::ExactStopMissed {
                     requested: idx,

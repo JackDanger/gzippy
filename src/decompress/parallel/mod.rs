@@ -102,4 +102,5 @@ pub mod streamed_results;
 ))]
 pub mod thread_pool;
 pub mod trace;
+pub mod trace_v2;
 pub mod window_map;
