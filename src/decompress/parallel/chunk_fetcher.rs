@@ -1594,19 +1594,6 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
         chunk.narrowed = narrowed;
     }
     let narrow_us = t_narrow.elapsed().as_micros();
-    // Lever B: precompute CRC32 of `chunk.narrowed` on the worker and
-    // PREPEND it into `chunk.crc32s[0]` so the first calculator covers
-    // (narrowed || data) in output order. `chunk.data` is already CRC'd
-    // by `append_clean` during decode (also on a worker). Consumer
-    // becomes `combine_crc32` only — the per-chunk `update(narrowed)`
-    // call was previously serial on the critical path.
-    if !chunk.narrowed.is_empty() && chunk.configuration.crc32_enabled {
-        let mut narrow_crc = CRC32Calculator::new();
-        narrow_crc.update(&chunk.narrowed);
-        if !chunk.crc32s.is_empty() {
-            chunk.crc32s[0].prepend(&narrow_crc);
-        }
-    }
     if trace::is_enabled() {
         trace::emit(
             "post_process",
@@ -2016,14 +2003,16 @@ fn drain_one_pending<W: std::io::Write>(
 
     // Mirror of vendor's per-chunk write loop (GzipChunkFetcher.hpp:333-342).
     // The post-process worker pre-narrows `data_with_markers` into
-    // `chunk.narrowed` AND prepends CRC32(narrowed) into chunk.crc32s[0]
-    // so the consumer thread does not pay the scalar u16→u8 cast loop
-    // OR the per-chunk CRC32 update (Lever B). For chunks without
-    // markers, chunk.crc32s[0] already covers chunk.data from
-    // `append_clean` during decode. In both cases the consumer's CRC
-    // duty is a single polynomial `combine_crc32` via `total_crc.append`.
+    // `chunk.narrowed` so the consumer thread does not pay the scalar
+    // u16→u8 cast loop (~24ms/3.3MiB chunk previously dominated wall
+    // time on real silesia). When the post-process step was skipped
+    // (chunks with no markers), `narrowed` is empty and there is
+    // nothing to write here — the clean tail comes through `chunk.data`
+    // below.
+    let mut written_crc = CRC32Calculator::new();
     let t_crc_write = std::time::Instant::now();
     if !chunk.narrowed.is_empty() {
+        written_crc.update(&chunk.narrowed);
         writer
             .write_all(&chunk.narrowed)
             .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
@@ -2034,23 +2023,19 @@ fn drain_one_pending<W: std::io::Write>(
         // not happen on the production path (post_process always
         // runs narrow after apply_window). Keeps the consumer
         // correctness invariant: all marker bytes written before
-        // `chunk.data`. Also folds CRC into chunk.crc32s[0] to mirror
-        // the worker-side Lever B path.
+        // `chunk.data`.
         let mut narrowed: Vec<u8> = Vec::with_capacity(chunk.data_with_markers.len());
         for v in &chunk.data_with_markers {
             narrowed.push(*v as u8);
         }
-        if chunk.configuration.crc32_enabled && !chunk.crc32s.is_empty() {
-            let mut narrow_crc = CRC32Calculator::new();
-            narrow_crc.update(&narrowed);
-            chunk.crc32s[0].prepend(&narrow_crc);
-        }
+        written_crc.update(&narrowed);
         writer
             .write_all(&narrowed)
             .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
         *total_size += narrowed.len();
     }
     if !chunk.data.is_empty() {
+        written_crc.update(&chunk.data);
         writer
             .write_all(&chunk.data)
             .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
@@ -2058,9 +2043,7 @@ fn drain_one_pending<W: std::io::Write>(
     }
     let crc_write_us = t_crc_write.elapsed().as_micros();
     let t_combine = std::time::Instant::now();
-    if let Some(chunk_crc) = chunk.crc32s.first() {
-        total_crc.append(chunk_crc);
-    }
+    total_crc.append(&written_crc);
     let combine_us = t_combine.elapsed().as_micros();
     let total_us = t_chunk.elapsed().as_micros();
 
