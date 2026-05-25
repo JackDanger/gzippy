@@ -399,13 +399,27 @@ pub fn drive<W: std::io::Write>(
     // Tried 4x — regressed (wall 486→510ms; misses dropped 4→3 but
     // overhead elsewhere ate it). Keep 2x.
     let prefetch_capacity = pool_size * 2;
+    // Step 0 of plans/cache-miss-fix.md: falsifiability test for the
+    // "cache misses are the lever" hypothesis. Per adversarial advisor:
+    // the existing `prefetching_len() + 1 >= parallelization` gate at
+    // block_fetcher.rs:584 caps in-flight prefetches at pool_size - 1.
+    // Knob to raise: the `parallelization` arg below (which the gate
+    // reads), NOT the cache_capacity (advisor: previously-killed cap
+    // changes never reached the saturation gate). Under
+    // GZIPPY_BURST_PREFETCH=1 this raises the gate to pool_size * 2,
+    // allowing 17 in-flight prefetches at T=9 instead of 8.
+    let saturation_parallelization = if std::env::var_os("GZIPPY_BURST_PREFETCH").is_some() {
+        pool_size * 2
+    } else {
+        pool_size
+    };
     let block_fetcher: Arc<
         BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
     > = Arc::new(BlockFetcher::new(
         cache_capacity,
         prefetch_capacity,
         FetchMultiStream::new(FETCH_MEMORY_PER_STREAM, FETCH_MAX_STREAM_COUNT),
-        pool_size,
+        saturation_parallelization,
     ));
 
     // ── m_unsplitBlocks (vendor GzipChunkFetcher.hpp:781) ───────────
