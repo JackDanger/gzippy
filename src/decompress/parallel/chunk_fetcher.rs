@@ -1987,7 +1987,7 @@ fn drain_one_pending<W: std::io::Write>(
     };
     let t_chunk = std::time::Instant::now();
     let t_recv = std::time::Instant::now();
-    let (idx, mut chunk, cache_key) = match head {
+    let (idx, chunk, cache_key) = match head {
         PendingWrite::Ready {
             idx,
             chunk,
