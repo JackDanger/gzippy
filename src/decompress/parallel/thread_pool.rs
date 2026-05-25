@@ -290,6 +290,10 @@ impl ThreadPool {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
+            "pool.submit",
+            &format!(r#""priority":{priority}"#),
+        );
         let (tx, rx) = mpsc::sync_channel::<T>(1);
         let future = Future { rx };
 
@@ -428,7 +432,10 @@ fn worker_main(
         }
     }
 
+    use crate::decompress::parallel::trace_v2;
     while running.load(Ordering::Acquire) {
+        // pool.pick = the time a worker spends waiting for + dequeuing a task.
+        let _pick = trace_v2::SpanGuard::begin("pool.pick");
         let mut guard = shared.lock().expect("ThreadPool mutex poisoned");
 
         // ++m_idleThreadCount (ThreadPool.hpp:205) — must happen under
@@ -455,9 +462,11 @@ fn worker_main(
         // order, matching std::map.
         let task = first_pending_task(&mut guard.tasks);
         drop(guard);
+        drop(_pick);
 
         if let Some(t) = task {
             // task() (ThreadPool.hpp:219).
+            let _run = trace_v2::SpanGuard::begin("pool.run_task");
             t();
         }
         // No task: loop and re-wait. This can happen if another worker
@@ -465,6 +474,10 @@ fn worker_main(
         // tolerance (the `if (nonEmptyTasks != m_tasks.end())` gate at
         // ThreadPool.hpp:215).
     }
+    // Flush this worker thread's trace buffer before exit so its events
+    // make it to disk. thread_local Drop is unreliable for pooled
+    // workers — explicit flush is the only guarantee.
+    trace_v2::flush_all();
 }
 
 /// Mirror of `bool hasUnprocessedTasks() const` (ThreadPool.hpp:188-193).
