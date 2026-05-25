@@ -401,15 +401,14 @@ where
             let mut pc = self.prefetch_cache.lock().unwrap();
             if let Some(v) = pc.get(block_offset) {
                 self.statistics.base.record_prefetch_cache_hit(true);
-                // Remove from prefetch cache (the "take" semantic) and
-                // promote to main cache so subsequent gets are direct
-                // main-cache hits. Mirror BlockFetcher.hpp:392-410.
+                // Lever G: previously this evicted from prefetch_cache
+                // and PROMOTED a clone into self.cache for "subsequent
+                // gets". The single-pass forward consumer never re-gets
+                // the same key, so the promotion held a redundant Arc
+                // ref that forced the consumer's `Arc::try_unwrap` to
+                // deep-clone (~7ms × 24 chunks). Drop the promote —
+                // just evict from prefetch_cache and return.
                 pc.evict(block_offset);
-                drop(pc);
-                self.cache
-                    .lock()
-                    .unwrap()
-                    .insert(block_offset.clone(), v.clone());
                 return Some(v);
             }
         }
