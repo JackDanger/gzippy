@@ -310,6 +310,41 @@ savings (486 → 386-436 ms). The stretch is 100-170 ms (486 → 316-386 ms).
 **Neither closes the gap alone** — per-chunk decode rate is the
 separate 1.9× lever and must be attacked next regardless.
 
+## EXECUTION RESULT (2026-05-25)
+
+**Step 0 falsification failed. Plan aborted.**
+
+Mechanism tested (per advisor): `GZIPPY_BURST_PREFETCH=1` env raised
+`BlockFetcher::new`'s `parallelization` argument from `pool_size`
+(9) to `pool_size * 2` (18). This decouples the saturation gate at
+`block_fetcher.rs:584` (`prefetching_len() + 1 >= parallelization`)
+from worker count, allowing up to 17 in-flight prefetches at T=9.
+
+Result on silesia T=9 P-cores (3-trial median, commit `821d917`):
+
+| Metric | Baseline | BURST | Δ |
+|---|---|---|---|
+| Wall | 551 ms | 649 ms | **+18%** (REGRESSED) |
+| `wait.block_fetcher_get` total | 242 ms | **319 ms** | **+31%** (WORSE) |
+| Cache miss count | 4 | **5** | +1 |
+| Miss chunk_ids | 0, 201, 1855, 2545 | 0, 1543, 1790, 2342, 2622 | shifted |
+
+Both dual-gate criteria failed. Per the plan's binding anti-mistake
+rule "implement + measure beats theorize", abort and reallocate to
+per-chunk decode rate work.
+
+Observation worth keeping (NOT to chase under this plan): the miss
+chunk_ids SHIFTED rather than disappearing. More in-flight prefetches
+→ more pool contention → consumer waits in NEW places. This is
+consistent with "prefetch saturation isn't the right lever" rather
+than "prefetch saturation needs further tuning."
+
+The env-var knob is left in place behind `GZIPPY_BURST_PREFETCH` for
+future reproducibility (defaults to baseline when unset).
+
+Next work: per-chunk decode rate (`plans/pure-rust-perf.md` Verified
+Finding #4 — gzippy 47 ms/chunk vs rapidgzip 25 ms/chunk).
+
 ## Adversarial-advisor feedback log
 
 For traceability if compacted:
