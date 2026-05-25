@@ -604,6 +604,41 @@ pub fn drive<W: std::io::Write>(
             gc::BODY_FAIL_INVALID_CODE_LENGTHS.load(Ordering::Relaxed),
             gc::BODY_FAIL_OTHER_VARIANT.load(Ordering::Relaxed),
         );
+        // B: BlockFinder per-spawn breakdown — scan vs consumer time.
+        use crate::decompress::parallel::raw_block_finder as rbf;
+        let bf_calls = rbf::BOUNDARY_SEARCH_CALLS.load(Ordering::Relaxed);
+        let bf_total = rbf::BOUNDARY_SEARCH_TOTAL_US.load(Ordering::Relaxed);
+        let bf_scan = rbf::BOUNDARY_SEARCH_SCAN_US.load(Ordering::Relaxed);
+        let bf_consumer = rbf::CONSUMER_TIME_US.load(Ordering::Relaxed);
+        eprintln!(
+            "  BlockFinder spawn breakdown: calls={bf_calls} total_ms={:.1} scan_ms={:.1} consumer_ms={:.1} avg_total_us={}",
+            bf_total as f64 / 1000.0,
+            bf_scan as f64 / 1000.0,
+            bf_consumer as f64 / 1000.0,
+            if bf_calls > 0 { bf_total / bf_calls } else { 0 },
+        );
+        // C: bootstrap per-block header vs body cost.
+        let bs_h_us = gc::BOOTSTRAP_HEADER_US.load(Ordering::Relaxed);
+        let bs_h_calls = gc::BOOTSTRAP_HEADER_CALLS.load(Ordering::Relaxed);
+        let bs_b_us = gc::BOOTSTRAP_BODY_US.load(Ordering::Relaxed);
+        let bs_b_bytes = gc::BOOTSTRAP_BODY_BYTES.load(Ordering::Relaxed);
+        let bs_h_avg = if bs_h_calls > 0 {
+            bs_h_us as f64 / bs_h_calls as f64
+        } else {
+            0.0
+        };
+        let bs_b_rate = if bs_b_us > 0 {
+            (bs_b_bytes as f64) / (bs_b_us as f64)
+        } else {
+            0.0
+        };
+        eprintln!(
+            "  Bootstrap per-block: header_calls={bs_h_calls} header_ms={:.1} avg_header_us={:.1} body_ms={:.1} body_bytes={bs_b_bytes} body_rate_MB/s={:.0}",
+            bs_h_us as f64 / 1000.0,
+            bs_h_avg,
+            bs_b_us as f64 / 1000.0,
+            bs_b_rate,
+        );
         // Per-fetch rejection cause: a prefetched chunk arrived but the
         // safety guard rejected it (chain invariant broken —
         // chunk.max != next_block_offset).
