@@ -734,11 +734,15 @@ fn consumer_loop<W: std::io::Write>(
         // BlockFetcher.hpp:427 — opportunistically promote ready prefetches
         // so workers don't idle while the consumer waits on a different key.
         let t_prefetch = std::time::Instant::now();
-        block_fetcher.process_ready_prefetches();
+        {
+            let _tv2 = trace_v2::SpanGuard::begin("consumer.process_prefetches");
+            block_fetcher.process_ready_prefetches();
+        }
         prefetch_us_sum += t_prefetch.elapsed().as_micros();
 
         // Vendor GzipChunkFetcher.hpp:318 — `m_blockFinder->get(m_nextUnprocessedBlockIndex)`.
         let t_finder = std::time::Instant::now();
+        let _tv2_finder = trace_v2::SpanGuard::begin("consumer.block_finder_get");
         let next_block_offset = match block_finder.get(next_unprocessed_block_index) {
             (Some(offset), GetReturnCode::Success) => offset,
             // Vendor GzipChunkFetcher.hpp:320-327 — EOF when no offset
@@ -746,6 +750,7 @@ fn consumer_loop<W: std::io::Write>(
             _ => break,
         };
         finder_us_sum += t_finder.elapsed().as_micros();
+        drop(_tv2_finder);
         if next_block_offset >= total_bits {
             break;
         }
@@ -1080,6 +1085,7 @@ fn consumer_loop<W: std::io::Write>(
             // on the consumer only (vendor queueChunkForPostProcessing:558-575).
             // Mirror vendor `getLastWindow(*previousWindow)` — not `last_32kib`
             // alone, which ignores the predecessor chain at stream start.
+            let _tv2 = trace_v2::SpanGuard::begin("consumer.window_publish_clean");
             if let Some((_pred_key, pred)) = window_map.get_predecessor(chunk.encoded_offset_bits) {
                 let bytes = materialize_window(&pred);
                 let tail = chunk
@@ -1121,19 +1127,23 @@ fn consumer_loop<W: std::io::Write>(
             // offset. When a spacing guess overshoots that tail, the
             // published window lives at furthest_decoded_bit, not at
             // chunk.encoded_offset_bits.
-            while !window_map.has_predecessor(chunk.encoded_offset_bits) {
-                if pending.is_empty() {
-                    break;
+            {
+                let _tv2 = trace_v2::SpanGuard::begin("consumer.wait_replaced_markers");
+                while !window_map.has_predecessor(chunk.encoded_offset_bits) {
+                    if pending.is_empty() {
+                        break;
+                    }
+                    drain_one_pending(
+                        &mut pending,
+                        window_map,
+                        writer,
+                        total_crc,
+                        total_size,
+                        block_fetcher,
+                    )?;
                 }
-                drain_one_pending(
-                    &mut pending,
-                    window_map,
-                    writer,
-                    total_crc,
-                    total_size,
-                    block_fetcher,
-                )?;
             }
+            let _tv2_pred = trace_v2::SpanGuard::begin("consumer.window_publish_marker");
             let (pred_key, window) = window_map
                 .get_predecessor(chunk.encoded_offset_bits)
                 .ok_or(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
