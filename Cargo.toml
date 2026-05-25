@@ -49,6 +49,9 @@ oracle = []
 # Pure-Rust resumable inflate with stopping points (Track B); no ISA-L in wrapper body.
 pure-rust-inflate = ["arena-allocator"]
 arena-allocator = ["dep:allocator-api2", "dep:rpmalloc-sys"]
+# Activates `#[global_allocator] = rpmalloc::RpMalloc` in src/main.rs.
+# Test for the "pipeline idle is allocator contention" hypothesis.
+global-rpmalloc = ["dep:rpmalloc"]
 
 [dependencies]
 # Compression: flate2 with zlib-ng for maximum performance
@@ -89,6 +92,9 @@ core_affinity = "0.8"
 libc = "0.2"
 allocator-api2 = { version = "0.2", optional = true }
 rpmalloc-sys = { version = "0.2", optional = true }
+# Global rpmalloc allocator — vendor parity test. Gated behind
+# `global-rpmalloc` feature; only activated for the perf experiment.
+rpmalloc = { version = "0.2", optional = true }
 
 [build-dependencies]
 cc = "1"

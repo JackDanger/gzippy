@@ -3,6 +3,16 @@
 //! A drop-in replacement for gzip that uses multiple processors for compression.
 //! Inspired by [pigz](https://zlib.net/pigz/) by Mark Adler.
 
+// Global rpmalloc experiment — gated behind `global-rpmalloc` feature.
+// Prior history (below) noted mimalloc + jemalloc both regressed. rpmalloc
+// has different characteristics (lock-free per-thread heaps); worth one
+// fresh data point especially since vendor uses rpmalloc as their per-Vec
+// allocator. NOT recommended for production — vendor explicitly avoids
+// global rpmalloc per `ChunkData.hpp:24` ("memory slab reuse issues").
+#[cfg(feature = "global-rpmalloc")]
+#[global_allocator]
+static GLOBAL: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
+
 // Global allocator: system default (glibc on Linux).
 //
 // History note (2026-05-19): tried mimalloc and jemalloc as global
