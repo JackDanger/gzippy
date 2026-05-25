@@ -178,6 +178,37 @@ Falsifiable target: -≥3% wall + no test regression. Met both.
 `consumer.arc_take_or_clone` post-Lever-G: **0 ms across 24 events**.
 Commit: `4890e81` (perf(parallel-sm): drop prefetch→main cache promote).
 
+### 7. The "in-flight prefetch wait" is a hidden cache-miss class
+
+Sub-instrumenting `try_take_prefetched` revealed where its 60-100ms goes:
+
+| sub-span             | sum     | n events | per-event |
+|----------------------|---------|----------|-----------|
+| `ttp.get_if_available` | 0.0 ms  | 22       | <1 us     |
+| `ttp.take_prefetch`    | 0.0 ms  | 8-12     | <1 us     |
+| **`ttp.rx_recv_block`**| **89-171 ms** | **4-9** | **20-25 ms blocking** |
+
+`ttp.rx_recv_block` fires when the prefetch was submitted to the worker
+pool but the worker hasn't finished yet — consumer calls `rx.recv()` and
+blocks until the worker completes. Effectively a second class of cache
+miss not captured by `wait.block_fetcher_get` (which only fires when no
+prefetch was ever issued).
+
+Combined slow path per session:
+- `wait.block_fetcher_get`:  200-410 ms (4-6 events, ~50-90 ms each)
+- `ttp.rx_recv_block`:        89-171 ms (4-9 events, ~20-25 ms each)
+- **Total**: 300-550 ms — **the entire consumer.iter wall** is either
+  blocking on prefetches or finishing a chunk's drain.
+
+The root cause: consumer reads chunks in strict order but workers are
+not delivering them in order (longer bootstraps lag short ones). Some
+in-flight prefetches are slower than consumer demand → blocked rx.recv.
+
+Implication: **worker.bootstrap latency directly lengthens consumer
+wait time** when the slow bootstrap is on the chunk consumer needs next.
+Faster bootstrap → less rx.recv waiting. The hoist's wall win partly
+came from this mechanism, not just steady-state body throughput.
+
 ## VERIFIED REFUTATIONS (do NOT pursue)
 
 Each killed by direct measurement:
