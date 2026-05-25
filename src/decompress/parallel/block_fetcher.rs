@@ -223,10 +223,18 @@ where
         // matched prefetch is in flight — wait on it. Dropping is a
         // broken-promise panic, same as `get()`.
         match rx.recv() {
-            Ok(Ok(v)) => {
-                self.insert(block_offset.clone(), v.clone());
-                Some(Ok(v))
-            }
+            // Lever G: do NOT re-insert into the cache here. The
+            // single-pass consumer never queries the same key twice,
+            // and the previous `self.insert(.., v.clone())` held a
+            // second Arc ref that forced `Arc::try_unwrap` at the
+            // consumer's takeover (chunk_fetcher.rs:1056) to fail and
+            // deep-clone ChunkData (~7ms × 24 chunks = 177ms wall on
+            // silesia). Vendor's `BlockFetcher::insertIntoCache` runs
+            // INSIDE `BlockFetcher::get` (BlockFetcher.hpp:317-320),
+            // not after the consumer has taken the prefetch. The
+            // post-take re-insert was gzippy-specific defensive caching
+            // with no vendor counterpart.
+            Ok(Ok(v)) => Some(Ok(v)),
             Ok(Err(e)) => Some(Err(e)),
             Err(_) => panic!(
                 "block_fetcher::try_take_prefetched: dispatch worker dropped reply \
@@ -366,7 +374,12 @@ where
         self.statistics
             .base
             .add_future_wait_time(t_future_wait_start.elapsed().as_secs_f64());
-        self.insert(block_offset.clone(), value.clone());
+        // Lever G: do NOT insert into the cache after on-demand fetch.
+        // See note at `try_take_prefetched` — the cache-insert held a
+        // second Arc ref forcing the consumer's `Arc::try_unwrap` to
+        // fail and deep-clone the ~MB-sized ChunkData. Vendor's cache
+        // insert is only used to satisfy CONCURRENT lookups against
+        // the same key, which the single-pass consumer never issues.
         self.statistics
             .base
             .add_get_time(t_get_start.elapsed().as_secs_f64());

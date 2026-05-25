@@ -2093,7 +2093,12 @@ fn drain_one_pending<W: std::io::Write>(
             ),
         );
     }
-    block_fetcher.insert(cache_key, Arc::new(chunk));
+    // Lever G: do NOT re-insert the consumed chunk into the cache.
+    // Single-pass forward decode never queries the same key twice, so
+    // the post-consume re-insert was strictly wasted bookkeeping (and
+    // an extra Arc allocation per chunk).
+    let _ = cache_key;
+    let _ = block_fetcher;
     Ok(())
 }
 
