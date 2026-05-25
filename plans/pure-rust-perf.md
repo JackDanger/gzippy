@@ -244,6 +244,94 @@ Commit: `5a9e51c` (perf(parallel-sm): pump prefetch while blocked).
 **Cumulative session wins:** baseline (hoist only) 666 → Lever G+H 473
 ms best = **-29% wall**. Per-thread variance also collapsed.
 
+### 9. Lever I — Kraft-equality + subchunk-emission gate (May 25)
+
+Two coupled vendor-parity restorations, captured in a deep-dive
+investigation session.
+
+**Lever I.1 — `is_valid_huffman_lengths` (Kraft equality)**
+
+The BlockFinder's dynamic-Huffman candidate filter accepted any code
+lengths satisfying Kraft INEQUALITY (`code <= 2^bits` at every step).
+Vendor's `checkHuffmanCodeLengths<MAX_CODE_LENGTH>` at
+`src/huffman/HuffmanCodingBase.hpp:215-236` requires Kraft EQUALITY
+(`sum( 2^(MAX_LEN - len_i) ) == 2^MAX_LEN`), with the single-symbol
+edge case (`sum == 2^(MAX_LEN-1)` and no `codeLength > 1`).
+
+Before: 58 candidate trial failures per silesia decode (`header=17
+body=41` per `--verbose` Speculation failure modes).
+After: 23 failures (`header=18 body=5`). Body-fail count dropped from
+41 → 5 (88% reduction).
+
+Commit: `43518fe`.
+
+**Lever I.2 — `append_block_boundary_at` decoded-size gate**
+
+The decoder pushed a new `Subchunk` for EVERY deflate EOB. Vendor's
+`appendDeflateBlockBoundary` at `GzipChunk.hpp:177-182` only starts a
+new subchunk when the trailing subchunk's decoded byte count crosses
+`splitChunkSize`. Without this gate, gzippy was emitting ~17
+subchunks per chunk instead of vendor's ~3 — polluting the
+BlockFinder index space with intra-chunk block boundaries.
+
+Before: `Total Existing 458` (BlockFinder confirmed-block count),
+`Unsplit blocks emplaced 2187`.
+After: `Total Existing 34`, `Unsplit blocks emplaced 20`. The
+prefetcher now sees coarse chunk-spacing offsets instead of intra-
+chunk block boundaries.
+
+Commit: `b529b3c`.
+
+**Wall impact (20-trial median, gzippy T=9, pure-rust-inflate):**
+
+| stage | best | p25 | median | mean | stdev |
+| --- | ---:| ---:| ---:| ---:| ---:|
+| before (Lever H baseline) | 416 | — | 469 | 453 | 24 |
+| after Kraft fix only | 424 | — | 456 | 464 | 28 |
+| after Kraft + subchunk gate | **414** | 440 | **452** | 453 | 18 |
+
+The pre-registered abandon was `wall ≥ -3% best/median`. Best moved
+~0.5% (noise), median moved ~3.6% (real but small). **Why is the
+visible wall change small despite a 13× reduction in BlockFinder
+population and a 39% → 19% reduction in `Useless Prefetches`?**
+Because the consumer thread's serial latency (~16 ms / iteration vs
+vendor's 4.3 ms / iteration) is now the gate, not worker total
+throughput. Workers are 60% efficient (was 50%); pool wall has fallen
+by 80 ms, but consumer wall has not.
+
+Both fixes are vendor parity wins kept regardless — they make the
+fetcher's behavior structurally correct and unlock the next lever.
+
+### Per-chunk decode rate (post-Lever-I, May 25)
+
+A separate side-by-side trace capture using matching `tracev2`
+patches:
+
+| span | gzippy | rapidgzip | ratio |
+| --- | ---:| ---:| ---:|
+| wall (1-trial) | 419 ms | 117 ms | 3.6× |
+| `worker.decode_chunk` sum | 2.35 s | 0.638 s | 3.7× |
+| `worker.decode_chunk` per-event (mean) | **57 ms** | **25 ms** | 2.3× |
+| `worker.bootstrap` sum | 945 ms | (subsumed in `decode_chunk`) | — |
+| `consumer.iter` per-event (mean) | 16 ms | 4.3 ms | 3.7× |
+| Total Fetched | 41 | 26 | 1.6× |
+| Useless Prefetches | 39% | 0% | — |
+| `decodeBlock` (verbose) cumulative | 2.33 s | 0.65 s | 3.6× |
+
+The **per-chunk decode is now 2.3× vendor's** (down from 3× before
+Lever I). The remaining gap is the pure-Rust marker bootstrap kernel
+(`bootstrap_with_deflate_block` → `Block::read` / `run_multi_cached_loop`)
+running at **224 MB/s vs vendor's 345 MB/s** on the same fixture.
+This is Candidate A in the original three-way investigation:
+per-byte inner-inflate loop speed.
+
+Recommended next lever (uncommitted): port vendor's
+`HuffmanCodingISAL` to the gzippy bootstrap inner loop, OR port the
+`HuffmanCodingDoubleLiteralCached` SIMD reads (`HuffmanCoding/...`).
+Both are gzip-relevant primitives explicitly listed in CLAUDE.md's
+work-item inventory. Vendor citation
+`src/rapidgzip/huffman/HuffmanCodingDoubleLiteralCached.hpp`.
+
 ## VERIFIED REFUTATIONS (do NOT pursue)
 
 Each killed by direct measurement:
