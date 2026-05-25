@@ -1166,6 +1166,13 @@ impl Block {
 
                 let ring_ptr = self.output_ring.as_mut_ptr();
                 let mut pos = self.ring_pos;
+                // Step C SIMD-bootstrap experiment (per Opus advisor 2026-05-25):
+                // maintain `phys` as a u16 physical-ring-index alongside the
+                // monotonic logical `pos`. Per-literal write becomes a pure
+                // pointer bump (no `% RING_SIZE` AND on the write-address
+                // dependency chain). Back-refs resync via `pos & (RING_SIZE-1)`
+                // after emit_backref_ring runs.
+                let mut phys: u16 = (pos & (RING_SIZE - 1)) as u16;
                 let mut emitted: usize = 0;
                 let mut distance_marker = self.distance_to_last_marker_byte;
 
@@ -1186,8 +1193,9 @@ impl Block {
 
                     if sym < 256 {
                         unsafe {
-                            ring_ptr.add(pos % RING_SIZE).write(sym);
+                            ring_ptr.add(phys as usize).write(sym);
                         }
+                        phys = phys.wrapping_add(1);
                         pos += 1;
                         emitted += 1;
                         if CONTAINS_MARKERS {
@@ -1233,6 +1241,7 @@ impl Block {
                             &mut distance_marker,
                         );
                     }
+                    phys = (pos & (RING_SIZE - 1)) as u16;
                     emitted += length;
                     if self.track_backreferences {
                         self.backreferences.push(Backreference {
@@ -1278,6 +1287,10 @@ impl Block {
 
                         let ring_ptr = self.output_ring.as_mut_ptr();
                         let mut pos = self.ring_pos;
+                        // Step C SIMD-bootstrap experiment: hoist ring-modulo
+                        // out of the per-literal hot path. `phys` is the
+                        // physical u16 ring index, kept in sync with pos.
+                        let mut phys: u16 = (pos & (RING_SIZE - 1)) as u16;
                         let mut emitted: usize = 0;
                         let mut distance_marker = self.distance_to_last_marker_byte;
 
@@ -1300,8 +1313,9 @@ impl Block {
                                 let code = (symbol & 0xFFFF) as u16;
                                 if code <= 255 || symbol_count > 1 {
                                     unsafe {
-                                        ring_ptr.add(pos % RING_SIZE).write(code);
+                                        ring_ptr.add(phys as usize).write(code);
                                     }
+                                    phys = phys.wrapping_add(1);
                                     pos += 1;
                                     emitted += 1;
                                     if CONTAINS_MARKERS {
@@ -1345,6 +1359,7 @@ impl Block {
                                         &mut distance_marker,
                                     );
                                 }
+                                phys = (pos & (RING_SIZE - 1)) as u16;
                                 emitted += length;
                                 if self.track_backreferences {
                                     self.backreferences.push(Backreference {
