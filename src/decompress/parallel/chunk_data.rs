@@ -506,6 +506,44 @@ impl ChunkData {
                 return false;
             }
         }
+        // Vendor's on-the-fly chunk splitting at
+        // `GzipChunk.hpp::appendDeflateBlockBoundary` (lines 177-182):
+        // only start a new subchunk when the trailing subchunk's
+        // decoded byte count crosses `splitChunkSize`. Without this
+        // gate, gzippy was pushing a new subchunk for EVERY deflate
+        // EOB boundary — on silesia gzip-9, that's ~17 subchunks per
+        // chunk vs vendor's ~3, polluting the BlockFinder index space
+        // with intra-chunk block offsets (Total Existing: 458 vs
+        // vendor 85). The prefetcher then dispatched prefetches at
+        // these intra-chunk offsets (5-50 KiB-sized "chunks"), causing
+        // 27% useless prefetches and a 3x decode-block-time inflation.
+        //
+        // The dedup check (`encoded_offset_bits == last`) above still
+        // returns `false` for duplicates — i.e., we still "accept" the
+        // boundary; we just don't materialize a new Subchunk entry
+        // until the spacing threshold fires. Callers that need
+        // per-EOB awareness use the dedup return value, not the
+        // post-call subchunk count.
+        let split_threshold = self.configuration.split_chunk_size;
+        let current_subchunk_decoded_size = self
+            .subchunks
+            .last()
+            .map(|last| {
+                // For the trailing (open) subchunk, the live size lives
+                // on `last.decoded_size` (updated by
+                // `note_inner_decoded_bytes`); for already-closed
+                // entries it's already the final size. Either way it
+                // reflects bytes since the subchunk's `decoded_offset`.
+                last.decoded_size
+            })
+            .unwrap_or(0);
+        if current_subchunk_decoded_size < split_threshold {
+            // Vendor `GzipChunk.hpp:178` — no split yet. Return `true`
+            // to acknowledge a distinct boundary (so the caller's
+            // dedup logic flows correctly), but don't push a new
+            // Subchunk entry.
+            return true;
+        }
         if let Some(last) = self.subchunks.last_mut() {
             debug_assert!(encoded_offset_bits >= last.encoded_offset_bits);
             last.encoded_size_bits = encoded_offset_bits - last.encoded_offset_bits;
@@ -1260,17 +1298,22 @@ mod tests {
     }
 
     #[test]
-    fn append_block_boundary_always_emits_subchunk() {
-        // Semantics changed: every call to append_block_boundary emits
-        // a new subchunk (replaces the split_chunk_size gate). This
-        // enables consumer-side per-block-boundary trimming.
+    fn append_block_boundary_below_threshold_does_not_emit_subchunk() {
+        // Vendor parity (GzipChunk.hpp::appendDeflateBlockBoundary
+        // lines 177-182): only emit a new subchunk when the trailing
+        // subchunk's decoded byte count crosses split_chunk_size. A
+        // boundary below threshold is acknowledged (return value
+        // signals it was distinct) but the subchunk list does NOT
+        // grow. This is the gating fix for the BlockFinder index-
+        // space pollution that drove silesia parallel SM speculation
+        // overhead from ~16% to ~3x the necessary chunks.
         let mut chunk = ChunkData::new(0, small_config()); // split = 100
-        chunk.append_clean(&[0u8; 50][..]); // 50 bytes
+        chunk.append_clean(&[0u8; 50][..]); // 50 bytes < threshold
         chunk.append_block_boundary(400);
         assert_eq!(
             chunk.subchunks.len(),
-            2,
-            "subchunk emitted at every boundary"
+            1,
+            "no new subchunk below split_chunk_size threshold"
         );
     }
 
