@@ -913,6 +913,7 @@ fn consumer_loop<W: std::io::Write>(
         // real offset, dispatching an on-demand task (matching vendor's
         // `BaseType::get(blockOffset, blockIndex, ...)` at
         // GzipChunkFetcher.hpp:654).
+        let _tv2_specf = trace_v2::SpanGuard::begin("consumer.try_take_prefetched");
         let partition_offset = partition_offset_for(&next_block_offset);
         let mut chunk_arc_from_partition: Option<Arc<ChunkData>> = None;
         if partition_offset != next_block_offset {
@@ -1013,6 +1014,7 @@ fn consumer_loop<W: std::io::Write>(
             }
         }
 
+        drop(_tv2_specf);
         let chunk_arc = match chunk_arc_from_partition {
             Some(arc) => arc,
             None => {
@@ -1050,7 +1052,10 @@ fn consumer_loop<W: std::io::Write>(
         // Take ownership when we hold the only Arc; otherwise clone the
         // inner ChunkData. Mirror of rapidgzip's shared_ptr aliasing at
         // GzipChunkFetcher.hpp:329.
-        let mut chunk: ChunkData = Arc::try_unwrap(chunk_arc).unwrap_or_else(|a| (*a).clone());
+        let mut chunk: ChunkData = {
+            let _tv2 = trace_v2::SpanGuard::begin("consumer.arc_take_or_clone");
+            Arc::try_unwrap(chunk_arc).unwrap_or_else(|a| (*a).clone())
+        };
 
         // Vendor GzipChunkFetcher.hpp:349 —
         //   `chunkData->setEncodedOffset(*nextBlockOffset);`
@@ -1226,26 +1231,29 @@ fn consumer_loop<W: std::io::Write>(
 
         // Hand off to post-process worker if there are markers; else
         // queue as immediately-ready for ordered write.
-        match predecessor_window_for_postprocess {
-            Some(window) => {
-                let rx = submit_post_process_to_pool(
-                    thread_pool,
-                    chunk,
-                    window,
-                    partition_idx_for_trace,
-                );
-                pending.push_back(PendingWrite::Async {
-                    idx: partition_idx_for_trace,
-                    rx,
-                    cache_key: next_block_offset,
-                });
-            }
-            None => {
-                pending.push_back(PendingWrite::Ready {
-                    idx: partition_idx_for_trace,
-                    chunk,
-                    cache_key: next_block_offset,
-                });
+        {
+            let _tv2 = trace_v2::SpanGuard::begin("consumer.dispatch_post_process");
+            match predecessor_window_for_postprocess {
+                Some(window) => {
+                    let rx = submit_post_process_to_pool(
+                        thread_pool,
+                        chunk,
+                        window,
+                        partition_idx_for_trace,
+                    );
+                    pending.push_back(PendingWrite::Async {
+                        idx: partition_idx_for_trace,
+                        rx,
+                        cache_key: next_block_offset,
+                    });
+                }
+                None => {
+                    pending.push_back(PendingWrite::Ready {
+                        idx: partition_idx_for_trace,
+                        chunk,
+                        cache_key: next_block_offset,
+                    });
+                }
             }
         }
 
