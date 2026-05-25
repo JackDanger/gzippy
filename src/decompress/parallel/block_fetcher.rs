@@ -215,10 +215,23 @@ where
     /// here would pollute the cache: a wrong-range chunk would short-
     /// circuit the next `get_if_available(realOffset)` check.
     pub fn try_take_prefetched(&self, block_offset: &Key) -> Option<Result<Value, Err>> {
-        if let Some(v) = self.get_if_available(block_offset) {
+        if let Some(v) = {
+            let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin(
+                "ttp.get_if_available",
+            );
+            self.get_if_available(block_offset)
+        } {
             return Some(Ok(v));
         }
-        let rx = self.take_prefetch(block_offset)?;
+        let rx = {
+            let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin(
+                "ttp.take_prefetch",
+            );
+            self.take_prefetch(block_offset)?
+        };
+        let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin(
+            "ttp.rx_recv_block",
+        );
         // Vendor `queuedResult.get()` at BlockFetcher.hpp:317. A
         // matched prefetch is in flight — wait on it. Dropping is a
         // broken-promise panic, same as `get()`.
