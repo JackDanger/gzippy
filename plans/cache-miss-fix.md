@@ -46,116 +46,185 @@ Per `plans/rust-rapidgzip.md`'s anti-mistake catalogue:
    eff, cache hit, byte correctness, isal-compression path), revert
    that step in the same session.
 
-## Step-by-step plan
+## Revised plan (post-adversarial review 2026-05-25)
 
-### Step 0 — reproducibility check (15 minutes, NOT optional)
+The first draft of this plan had three real defects (see comments at
+end of file). Revised:
 
-Concern: the 4-miss finding is from a single trace (n=1). The advisor
-flagged this as the largest unaddressed risk in the diagnosis.
+### Step 0 — cheapest possible falsification (30 minutes)
+
+Per the adversarial-advisor recommendation: **skip the instrumentation
+work entirely if a brute-force test refutes the theory.**
+
+```rust
+// In chunk_fetcher.rs, BEHIND a GZIPPY_BURST_PREFETCH env var:
+//   - Bump prefetch_cache.capacity() to 64 (vs current pool_size * 2 = 18).
+//   - At drive() entry, BEFORE entering consumer_loop, dispatch
+//     prefetches for chunk indices 0..16 in a tight loop.
+// One-line capacity change + ~10 lines of burst dispatch.
+```
+
+Then run ONCE (best of 3 trials) on neurotic, silesia, T=9 P-cores.
+
+**Falsification criterion**: if `wait.block_fetcher_get` does NOT drop
+below 150 ms (from the 210 ms baseline), the cache-miss theory has a
+ceiling well below this plan's claimed savings. ABORT and reallocate
+to per-chunk decode work (separate work item).
+
+**Confirmation criterion**: if `wait.block_fetcher_get` drops to
+< 100 ms AND wall drops by ≥ 80 ms (486 → 406 ms or better), the
+theory holds at scale — proceed to Step 1 to design a non-regressing
+fix (the brute force one may have its own overhead).
+
+**If wall drops < 50 ms despite cache-misses dropping**: the misses
+weren't on the critical path (they overlapped with worker decode
+time, so eliminating them shifts the bottleneck elsewhere). This is
+the "hidden assumption #7" the advisor flagged. Document and stop.
+
+### Step 0a — reproducibility + critical-path check (in parallel with Step 0, 1 hour)
+
+The 4-miss finding is from n=1. The adversarial advisor flagged TWO
+risks:
+
+(i) **chunk_id stability**: the SAME chunk_ids appear across runs?
+(ii) **wait magnitude stability**: do the waits have the same size?
+
+Run 20 traces (10 with `echo 3 > /proc/sys/vm/drop_caches` between
+runs, 10 with warm page cache):
 
 ```bash
-ssh -J neurotic root@REDACTED_IP \
-  'cd ~/gzippy && cargo build --release --features pure-rust-inflate'
-
-# Run 10 traces, extract miss chunk_ids from each
-for i in $(seq 1 10); do
-  ssh -J neurotic root@REDACTED_IP \
-    "rm -f /tmp/gz.$i.json &&
-     taskset -c 1,3,4,5,6,7,10,13,15 \
-       env GZIPPY_TIMELINE=/tmp/gz.$i.json \
-       /root/gzippy/target/release/gzippy -d -c -p 9 \
-       /root/benchmark_data/silesia-gzip.tar.gz > /dev/null &&
-     python3 /tmp/show_misses.py /tmp/gz.$i.json"
+for cache_state in cold warm; do
+  if [ $cache_state = cold ]; then
+    ssh -J neurotic root@REDACTED_IP 'echo 3 > /proc/sys/vm/drop_caches'
+  fi
+  for i in $(seq 1 10); do
+    ssh -J neurotic root@REDACTED_IP \
+      "rm -f /tmp/gz.$cache_state.$i.json &&
+       taskset -c 1,3,4,5,6,7,10,13,15 \
+         env GZIPPY_TIMELINE=/tmp/gz.$cache_state.$i.json \
+         /root/gzippy/target/release/gzippy -d -c -p 9 \
+         /root/benchmark_data/silesia-gzip.tar.gz > /dev/null"
+    ssh -J neurotic root@REDACTED_IP \
+      "python3 /tmp/show_misses.py /tmp/gz.$cache_state.$i.json"
+  done
 done
 ```
 
-**Pass criterion**: the same chunk_ids appear in ≥7 of 10 runs (allow
-some jitter; expect chunk 0 in 10/10, chunks 201/1855/2545 in most).
+**Pass criterion**: chunk_ids stable in ≥ 15 of 20 runs. Wait
+magnitudes within 2× across runs for the same chunk_id.
 
-**Fail criterion**: miss chunk_ids vary widely run-to-run → the
-finding is noise, abort the plan and go back to instrumentation.
+**Fail criterion**: chunk_ids jitter OR wait magnitudes swing > 3×
+between runs → the diagnosis itself is noisy and Step 0's brute-force
+test is the only reliable signal.
 
-### Step 1 — cold start fix (1 hour, ~40 ms expected)
+**ALSO** (separate concern): for each miss in each trace, check
+whether `block_finder.last_found_idx` was ≥ `miss_chunk_id` at the
+miss moment. Requires adding a `BLOCK_FINDER_LAST_FOUND` atomic
+counter, snapshotted into `wait.block_fetcher_get` span args. If
+the finder was BEHIND the consumer at miss moment, the prefetcher
+COULDN'T have helped because there was nothing to prefetch — the
+fix needs to attack the finder, not the prefetcher.
 
-Smallest, cleanest target. Chunk 0 ALWAYS misses because no prefetch
-has fired yet when `consumer_loop` makes its first `get_with_prefetch`
-call. The vendor avoids this because their consumer issues a
-prefetch-warming pass at construction.
+### Step 1 — DELETED
 
-Look at `src/decompress/parallel/chunk_fetcher.rs::consumer_loop`
-(line 668+). The first iteration calls `block_finder.get(0)` and then
-`block_fetcher.get_with_prefetch(...)` — on the very first call,
-`should_drive_prefetch` is true (last_fetched_before is None), so
-prefetch IS dispatched. The issue: prefetch is dispatched IN PARALLEL
-with the on-demand fetch for chunk 0. Chunk 0 still costs 39 ms wall
-because IT'S the on-demand work.
+Original plan had a "cold start fix" step with predicted-zero
+savings. Adversarial advisor: "dead weight, delete it." Agreed.
 
-**Real fix**: chunk 0's wait is *unavoidable* — it IS the decode
-time on the critical path. We can't make decode 0 finish faster.
-BUT we can confirm by:
+Chunk 0's wait = decode time, structurally on the critical path,
+cannot be shrunk without making chunk 0 itself smaller (compromises
+elsewhere) or pre-decoding before consumer asks (requires changing
+the API contract).
 
-(a) Hand the consumer chunks 1..N as a hand-rolled prefetch at
-    `drive()` entry, BEFORE entering `consumer_loop`. Measure
-    whether chunk 0's wait drops below 39 ms (it shouldn't — it's
-    the decode itself).
+### Step 2 — mid-stream prefetch (REVISED, 3-4 hours)
 
-(b) IF chunk 0 wait stays at 39 ms after (a), CONFIRMED chunk 0 is
-    the decode-time floor. SKIP. Move to Step 2.
+#### Step 2a — full per-miss state instrumentation
 
-**Pass criterion**: Step 1 either eliminates chunk 0's wait OR
-confirms (with measurement) that it's irreducible. Either result is
-a useful narrowing.
+Add a `prefetch.snapshot` instant event INSIDE
+`block_fetcher.rs::get_with_prefetch`, emitted at the moment a miss
+is detected (i.e., when `take_prefetch` returns None and on-demand
+fetch is about to fire). Capture:
 
-**Predicted savings**: 0-39 ms wall (skewed low — likely irreducible).
+- `chunk_id` (the requested index)
+- `prefetch_cache_size` (current cache occupancy)
+- `prefetch_inflight_ids` (list of in-flight prefetch indices)
+- `prefetch_completed_ids` (list of completed-but-not-taken prefetches)
+- `last_fetched_idx` (the prefetcher's last dispatch index)
+- `block_finder_last_found_idx` (the finder's confirmed-index high
+  watermark)
+- `time_since_drive_start_ms`
 
-### Step 2 — mid-stream prefetch behavior (2-3 hours)
+This is the **per-miss state snapshot** the adversarial advisor said
+was missing. With this we can classify each miss into one of FOUR
+buckets (vs the original plan's two):
 
-The 3 mid-stream misses (chunks 201, 1855, 2545) are the real lever.
-Consumer outran the prefetch window OR the prefetcher fell behind.
+1. **Finder-behind**: `block_finder_last_found_idx < miss_chunk_id`.
+   Prefetcher couldn't have helped. Fix is in the finder, not the
+   prefetcher.
+2. **Prefetcher-behind**: finder ahead, but
+   `last_fetched_idx < miss_chunk_id`. Prefetcher fell behind
+   consumer rate.
+3. **In-flight**: chunk was prefetched but still decoding when
+   consumer asked. Wait time = decode time. Mitigation: dispatch
+   prefetches earlier.
+4. **Evicted**: chunk was completed but evicted from prefetch_cache.
+   Bigger cache (or LRU eviction tuning) would help.
 
-#### Step 2a — confirm WHICH: outran-window OR prefetcher-fell-behind
+**Pass criterion**: each of the 4 misses gets a clean classification.
 
-Add a span around each prefetch-strategy decision in
-`block_fetcher.rs::prefetch_new_blocks`:
+#### Step 2b — fix based on Step 2a, with explicit mechanism
 
-```rust
-trace_v2::SpanGuard::begin_with("prefetch.dispatch",
-    &format!(r#""last_fetched_idx":{},"submitted":{},"queue_depth":{}"#,
-             ...));
+Adversarial advisor: "your Case A fix risks repeating the killed
+2x→4x prefetch_capacity regression unless you have a distinguishing
+mechanism." Acknowledge. Specific mechanisms per class:
+
+| Bucket | Mechanism | Distinguishes from killed 2x→4x how? |
+| --- | --- | --- |
+| Finder-behind | Force BlockFinder to confirm offsets aggressively at drive() entry | NOT a prefetch-side change |
+| Prefetcher-behind | Dispatch N prefetches per consumer iteration instead of waiting for `should_drive_prefetch` re-trigger | Doesn't change cache CAPACITY, changes dispatch RATE |
+| In-flight | Issue prefetches EARLIER (at drive() entry, burst N) so they finish before consumer asks | Doesn't change capacity, changes TIMING |
+| Evicted | Sharded prefetch_cache to remove lock contention, then bigger cache | Killed 2x→4x might have regressed from lock contention, not capacity overhead — separate fix |
+
+For each bucket present in the data, implement the matching fix
+behind a feature flag (e.g., `GZIPPY_FIX_PREFETCH_DISPATCH`),
+measure, keep or revert.
+
+**Pass criterion (per bucket fix)**: wall drops by the predicted
+band (Step 4 spelled out below); no regression on routing tests.
+
+**Predicted savings (REVISED, honest band)**:
+
+Per adversarial advisor: "your <350 ms criterion contradicts your
+own ceiling math." Corrected:
+
+- Realistic band: wall drops 50-100 ms (486 → 386-436 ms)
+- Stretch (all buckets fix cleanly): 100-170 ms (486 → 316-386 ms)
+- Best case lower than vendor 162 ms: not achievable from this plan
+  alone; per-chunk decode rate is the missing 1.9× factor.
+
+### Step 3 — pool eff + load balance re-measurement
+
+Re-run after Step 2b succeeds. Predicted side-effects:
+
+- `pool.pick` sum should drop 5-10× the wall savings (workers idle
+  less when consumer doesn't block).
+- per-thread busy time σ should shrink from 130 ms toward 50-80 ms
+  (not vendor's 7 ms — that requires fixing per-chunk decode rate
+  too).
+
+### Step 4 — cross-tool diff verification
+
+```bash
+ssh -J neurotic root@REDACTED_IP \
+  'python3 /tmp/timeline_analyze.py /tmp/gz.tl.json /tmp/rg.tl.json | head -60'
 ```
 
-Then re-run and join with `wait.block_fetcher_get` events. For each
-cache miss, see what the prefetch state was at the miss moment:
+**Done criterion for this fix**:
 
-- If `last_fetched_idx < miss_chunk_id`: the prefetcher hadn't reached
-  this chunk yet (window-too-narrow OR prefetcher-slow).
-- If `last_fetched_idx >= miss_chunk_id` but the chunk isn't in
-  prefetch_cache: it was dispatched but evicted (cache capacity issue).
-
-**Pass criterion**: each miss is classified into one of two buckets.
-
-#### Step 2b — fix based on Step 2a classification
-
-Case A (prefetcher behind): the consumer iterates faster than the
-prefetcher dispatches. Increase prefetch fan-out OR change scheduling.
-WARNING: we already tried `prefetch_capacity 2x → 4x` (regressed). The
-fix has to be more nuanced — perhaps speeding up the prefetcher
-dispatch rate, not the cache size.
-
-Case B (cache evicted): the prefetcher hit the chunk early but it
-got evicted from `prefetch_cache` before consumer asked. Bigger
-prefetch_cache might help (different from `prefetch_capacity` which
-also affects in-flight count).
-
-Case C (other): TBD; data will say.
-
-**Pass criterion**: wall drops 50-150 ms (the 3 misses total 170 ms;
-fix should capture most but allow for some not closing).
-
-**Failure mode**: if wall regresses or doesn't drop, revert and
-either re-classify (Step 2a was wrong) or accept that mid-stream
-misses are structurally unavoidable and move to per-chunk decode
-speed (separate work item).
+- `wait.block_fetcher_get` ≤ 80 ms (from 210 ms baseline)
+- Wall in the predicted band (386-436 ms realistic, 316-386 ms stretch)
+- pool eff > 50% (from 45% baseline)
+- `cargo test --release -- routing` green
+- isal-compression path green (`cargo test --features isal-compression -- routing`)
 
 ### Step 3 — measure pool efficiency change
 
@@ -224,17 +293,60 @@ If Steps 1+2 don't move the needle:
 In any of these cases, the cross-tool diff harness in Phase 3 stays
 useful — every subsequent investigation reuses it.
 
-## Confidence ratings
+## Confidence ratings (REVISED)
 
 | Step | Confidence in plan being right | Confidence in stated savings |
 | --- | --- | --- |
-| 0 (repro check) | HIGH (cheap, falsifiable) | N/A |
-| 1 (cold start) | MEDIUM (chunk 0 likely irreducible) | LOW (0-40 ms predicted, likely 0) |
-| 2a (classify misses) | HIGH (instrumentation work is clean) | N/A |
-| 2b (fix based on class) | MEDIUM (depends on class) | MEDIUM (predicted 50-150 ms wall, real number depends on cause) |
-| 3 (pool eff measurement) | HIGH (existing instrumentation reads) | N/A |
+| 0 (brute-force falsification) | HIGH | N/A — falsifies or confirms in 30 min |
+| 0a (repro + critical-path check) | HIGH | N/A — finder-behind discriminates whole-plan validity |
+| 1 (deleted) | n/a | n/a |
+| 2a (per-miss 4-bucket classification) | HIGH (instrumentation is clean) | N/A |
+| 2b (per-bucket fix with explicit mechanism) | MEDIUM (depends on bucket distribution) | MEDIUM (50-100 ms realistic, 100-170 ms stretch) |
+| 3 (pool eff measurement) | HIGH (existing reads) | N/A |
 | 4 (cross-tool diff) | HIGH (harness exists) | N/A |
 
-Don't oversell. The plan's downside case is ~50 ms wall savings; its
-upside case is ~150 ms. Either is useful; neither closes the gap
-alone. Per-chunk decode rate work follows regardless.
+Honest framing: the plan's realistic outcome is 50-100 ms wall
+savings (486 → 386-436 ms). The stretch is 100-170 ms (486 → 316-386 ms).
+**Neither closes the gap alone** — per-chunk decode rate is the
+separate 1.9× lever and must be attacked next regardless.
+
+## Adversarial-advisor feedback log
+
+For traceability if compacted:
+
+1. **Step 0 was n=1**, advisor flagged single-trace risk. Revised
+   Step 0a to 20 traces (10 cold + 10 warm cache) AND check wait
+   magnitude stability, not just chunk_id stability.
+
+2. **Step 1 was dead weight** — chunk 0 wait = decode time, no fix
+   possible. Advisor: "delete or downgrade to 5-min sanity check."
+   Deleted.
+
+3. **Step 2a needed more per-miss state**, not just `last_fetched_idx`.
+   Revised to 7 fields per miss (inflight, completed, finder
+   high-water, etc.) supporting 4-bucket classification (not 2).
+
+4. **Step 2b Case A risked repackaging killed 2x→4x experiment.**
+   Revised with explicit mechanism table distinguishing dispatch
+   RATE from cache CAPACITY (the failed knob).
+
+5. **Pass criterion <350 ms contradicted ceiling math.** Advisor:
+   "fraudulent." Corrected to honest 386-436 ms realistic band,
+   316-386 ms stretch.
+
+6. **Cheapest falsification < 30 min wasn't in original plan.**
+   Added as new Step 0 (brute-force prefetch_cache=64 + burst
+   dispatch). If theory holds at scale, proceed; if not, abort
+   without doing instrumentation work.
+
+7. **Hidden assumption: misses on critical path.** Advisor: "what
+   if misses overlap with worker decode time, so eliminating them
+   shifts the bottleneck?" Added explicit critical-path check via
+   `block_finder.last_found_idx` snapshot. If finder is behind
+   consumer at miss moment, prefetcher couldn't have helped — fix
+   is in the finder, not the prefetcher.
+
+8. **Prefetch_cache lock contention as alternative.** Advisor noted
+   the killed 2x→4x might have regressed from lock contention, not
+   capacity overhead. Sharded map is a separate fix listed in Step
+   2b's Evicted bucket.
