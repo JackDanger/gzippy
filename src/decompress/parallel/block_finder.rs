@@ -848,26 +848,47 @@ impl<'a> BlockFinder<'a> {
         Some(lengths)
     }
 
-    /// Check if lengths form a valid Huffman code
+    /// Check if lengths form a valid (canonical) Huffman code.
+    ///
+    /// Literal port of vendor's `checkHuffmanCodeLengths<MAX_CODE_LENGTH>`
+    /// at `src/huffman/HuffmanCodingBase.hpp:215-236`. Tests Kraft
+    /// **equality** (full canonical tree, sum-of-leaves == 2^MAX_LEN),
+    /// with the standard edge case allowing a single-symbol tree
+    /// (`sum == 2^(MAX_LEN - 1)` AND no code length > 1).
+    ///
+    /// The prior implementation only tested Kraft **inequality**
+    /// (`code <= 2^bits` at every step), which accepts non-canonical
+    /// trees with missing codes — admitting false-positive block
+    /// candidates that fail later in `try_speculative_decode_candidate`.
+    /// On silesia (May 2026), the loose check produced ~58 false
+    /// positives per decode; vendor reports 0. Each FP triggers a full
+    /// `bootstrap_with_deflate_block` candidate trial before erroring
+    /// out, accounting for ~0.55s of useless worker time.
     fn is_valid_huffman_lengths(&self, lengths: &[u8]) -> bool {
-        let mut bl_count = [0u32; 16];
-
+        // MAX_CODE_LENGTH for deflate literal/distance alphabets is 15
+        // (RFC 1951 §3.2.7). Vendor uses the same constant via the
+        // `MAX_CODE_LENGTH` template parameter.
+        const MAX_CODE_LENGTH: u32 = 15;
+        let mut virtual_leaf_count: u32 = 0;
+        let mut greater_than_one: u32 = 0;
         for &len in lengths {
-            if len > 0 && len <= 15 {
-                bl_count[len as usize] += 1;
+            if len == 0 || (len as u32) > MAX_CODE_LENGTH {
+                if (len as u32) > MAX_CODE_LENGTH {
+                    return false;
+                }
+                continue;
+            }
+            virtual_leaf_count += 1u32 << (MAX_CODE_LENGTH - len as u32);
+            if len > 1 {
+                greater_than_one += 1;
             }
         }
-
-        // Kraft inequality check
-        let mut code = 0u32;
-        for bits in 1..16 {
-            code = (code + bl_count[bits - 1]) << 1;
-            if code > (1 << bits) {
-                return false;
-            }
+        // Single-symbol tree edge case: sum == 2^(MAX_LEN - 1) AND no
+        // code length > 1 (vendor HuffmanCodingBase.hpp:226-234).
+        if virtual_leaf_count == (1u32 << (MAX_CODE_LENGTH - 1)) {
+            return greater_than_one == 0;
         }
-
-        true
+        virtual_leaf_count == (1u32 << MAX_CODE_LENGTH)
     }
 
     /// Validate that we can build valid literal/distance Huffman codes.
