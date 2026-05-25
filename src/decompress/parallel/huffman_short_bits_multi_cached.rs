@@ -10,7 +10,15 @@ use super::huffman_base::LsbBitReader;
 use super::huffman_symbols_per_length::{HuffmanCodingSymbolsPerLength, Symbol};
 use super::rfc_tables::{calculate_length, get_length};
 
-pub const LUT_BITS_COUNT: u8 = 11;
+/// Vendor's `HuffmanCodingDoubleLiteralCached` uses an adaptive cached
+/// bit count `min(max(maxCodeLength, 2*minCodeLength+1), MAX_CODE_LENGTH)`
+/// up to 15 bits. gzippy's MultiCached previously was a fixed 11-bit LUT
+/// — too small to absorb typical maxCodeLength of 12-15 in silesia
+/// literal codings, so the `decode_long` fallback fires often. Bumping
+/// to 12 increases LUT size from 16 KB to 32 KB (still L1 on most x86)
+/// and reduces fallback rate without doubling memory pressure.
+/// Cite: vendor HuffmanCodingDoubleLiteralCached.hpp:89-91.
+pub const LUT_BITS_COUNT: u8 = 12;
 const CACHE_LEN: usize = 1 << LUT_BITS_COUNT as usize;
 
 /// Packed literal/length symbols use `254 + length` for match entries
