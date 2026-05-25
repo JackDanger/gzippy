@@ -214,7 +214,23 @@ where
     /// (GzipChunkFetcher.hpp:646-654). Re-keying under the real offset
     /// here would pollute the cache: a wrong-range chunk would short-
     /// circuit the next `get_if_available(realOffset)` check.
-    pub fn try_take_prefetched(&self, block_offset: &Key) -> Option<Result<Value, Err>> {
+    /// `pump_prefetch` is called once per 1ms wait tick while `rx.recv`
+    /// is blocking — the caller threads in `prefetch_new_blocks` with its
+    /// closures captured. Vendor parity: BlockFetcher.hpp:314-316
+    /// `while ( queuedResult.wait_for(1ms) == timeout ) prefetchNewBlocks(...)`.
+    /// Previously gzippy did a bare `rx.recv()` here, which parked the
+    /// consumer thread without dispatching new prefetches — `pool.pick`
+    /// stayed at 2.3s of idle worker capacity while consumer waited
+    /// 89-171 ms per session on in-flight prefetches that took 20-25 ms
+    /// each (`ttp.rx_recv_block` trace bucket).
+    pub fn try_take_prefetched_pumping<F>(
+        &self,
+        block_offset: &Key,
+        mut pump_prefetch: F,
+    ) -> Option<Result<Value, Err>>
+    where
+        F: FnMut(),
+    {
         if let Some(v) = {
             let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin(
                 "ttp.get_if_available",
@@ -232,28 +248,31 @@ where
         let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin(
             "ttp.rx_recv_block",
         );
-        // Vendor `queuedResult.get()` at BlockFetcher.hpp:317. A
-        // matched prefetch is in flight — wait on it. Dropping is a
-        // broken-promise panic, same as `get()`.
-        match rx.recv() {
-            // Lever G: do NOT re-insert into the cache here. The
-            // single-pass consumer never queries the same key twice,
-            // and the previous `self.insert(.., v.clone())` held a
-            // second Arc ref that forced `Arc::try_unwrap` at the
-            // consumer's takeover (chunk_fetcher.rs:1056) to fail and
-            // deep-clone ChunkData (~7ms × 24 chunks = 177ms wall on
-            // silesia). Vendor's `BlockFetcher::insertIntoCache` runs
-            // INSIDE `BlockFetcher::get` (BlockFetcher.hpp:317-320),
-            // not after the consumer has taken the prefetch. The
-            // post-take re-insert was gzippy-specific defensive caching
-            // with no vendor counterpart.
-            Ok(Ok(v)) => Some(Ok(v)),
-            Ok(Err(e)) => Some(Err(e)),
-            Err(_) => panic!(
-                "block_fetcher::try_take_prefetched: dispatch worker dropped reply \
-                 (broken promise)"
-            ),
+        // Lever H: pump prefetch on 1ms ticks while waiting (vendor
+        // BlockFetcher.hpp:314-316). Keeps the prefetch horizon
+        // advancing so by the time chunk N arrives, chunks N+1..N+k
+        // are already in flight or done — reducing subsequent
+        // `wait.block_fetcher_get` and `ttp.rx_recv_block` events.
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+                Ok(Ok(v)) => return Some(Ok(v)),
+                Ok(Err(e)) => return Some(Err(e)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    pump_prefetch();
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                    "block_fetcher::try_take_prefetched: dispatch worker dropped reply \
+                     (broken promise)"
+                ),
+            }
         }
+    }
+
+    /// Back-compat wrapper for callers that don't want to thread a pump
+    /// closure (tests). Production callers must use the pumping variant.
+    #[allow(dead_code)]
+    pub fn try_take_prefetched(&self, block_offset: &Key) -> Option<Result<Value, Err>> {
+        self.try_take_prefetched_pumping(block_offset, || {})
     }
 
     /// Like `get`, plus the `prefetchNewBlocks` body interleaved
