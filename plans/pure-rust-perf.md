@@ -143,6 +143,41 @@ same code path at 242 MB/s on a fresh deflate stream — the 2.5×
 production-vs-bench gap is from surrounding pipeline overhead
 (allocator, narrow, apply_window).
 
+### 6. Lever G — ChunkData deep-clone was 177 ms on critical path
+
+Trace pre-Lever-G showed `consumer.arc_take_or_clone` at **177 ms / 24
+events** — the dark matter inside `consumer.iter` after subtracting
+`wait.block_fetcher_get` (cache misses) and `consumer.drain` (writes +
+CRC + window publish). Root cause: `Arc::try_unwrap(chunk_arc)` at
+chunk_fetcher.rs:1056 was failing because **three separate code paths
+were holding a redundant second Arc reference**:
+
+1. `block_fetcher::try_take_prefetched` re-inserted into main cache
+   after `rx.recv()` (line 227).
+2. `block_fetcher::get_with_prefetch` re-inserted into main cache
+   after on-demand fetch (line 369).
+3. `block_fetcher::get_if_available` PROMOTED from prefetch_cache to
+   main cache on hit (line 412 — the dominant path for hits).
+4. `drain_one_pending` re-inserted the consumed chunk back into the
+   cache (chunk_fetcher.rs:2096).
+
+Vendor `BlockFetcher::insertIntoCache` only runs INSIDE `get` (vendor
+BlockFetcher.hpp:317-320), not as a "promote" or "re-cache after
+consume" pattern. gzippy's defensive caching was a port-time
+fabrication. Diagnostic counter `ARC_TRY_UNWRAP_HITS` confirmed 24/24
+chunks exclusively owned after the four inserts were removed (0
+misses, 0 deep clones).
+
+**A/B (10-trial, noisy system load=9.4):**
+- baseline (hoist only): best 666 / median 812 / mean 789 ms
+- Lever G:                best 618 / median 663 / mean 659 ms
+- Saving: best -7%, median -18%, mean -16%
+
+Falsifiable target: -≥3% wall + no test regression. Met both.
+
+`consumer.arc_take_or_clone` post-Lever-G: **0 ms across 24 events**.
+Commit: `4890e81` (perf(parallel-sm): drop prefetch→main cache promote).
+
 ## VERIFIED REFUTATIONS (do NOT pursue)
 
 Each killed by direct measurement:
