@@ -396,7 +396,12 @@ pub fn drive<W: std::io::Write>(
     // (`m_prefetching`), fetching strategy, and statistics. Sized to
     // hold the active working set plus prefetched chunks.
     let cache_capacity = pool_size * 2;
-    let prefetch_capacity = pool_size * 2;
+    // Phase 1 timeline-trace finding (commit fa5c170 + analyzer): consumer
+    // hit 4 cache misses across silesia T=9 (chunks 0, 201, 1855, 2545)
+    // totalling 210ms wall. Chunks 201/1855/2545 are mid-stream "consumer
+    // outran prefetch window" misses. Raising prefetch capacity gives the
+    // window more headroom. Bumped 2x → 4x for the experiment.
+    let prefetch_capacity = pool_size * 4;
     let block_fetcher: Arc<
         BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
     > = Arc::new(BlockFetcher::new(
