@@ -89,6 +89,17 @@ pub static BODY_FAIL_INVALID_CODE_LENGTHS: std::sync::atomic::AtomicU64 =
 pub static BODY_FAIL_OTHER_VARIANT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// C-instrumentation: per-block table-build vs body cost inside
+// bootstrap_with_deflate_block. Each chunk's bootstrap iterates blocks,
+// for each: read_header (precode + lit/len/dist table build) then body.
+// 8.3B flame samples in "marker bootstrap" — need to split.
+pub static BOOTSTRAP_HEADER_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BOOTSTRAP_HEADER_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static BOOTSTRAP_BODY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BOOTSTRAP_BODY_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Per-failure structured log. Writes one JSON line to the path in
 /// `GZIPPY_BODY_FAIL_LOG` env var (no-op if unset). Use this for
 /// distributional analysis: cluster failures by offset to see if they
@@ -689,7 +700,14 @@ fn bootstrap_with_deflate_block(
 
             // Read this block's header. `treat_last_block_as_error = false`
             // (we WANT to see BFINAL so we can stop).
-            match block.read_header(&mut bits, false) {
+            let t_header = std::time::Instant::now();
+            let header_res = block.read_header(&mut bits, false);
+            BOOTSTRAP_HEADER_US.fetch_add(
+                t_header.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            BOOTSTRAP_HEADER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match header_res {
                 Ok(()) => {}
                 Err(e) => {
                     return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
@@ -715,6 +733,7 @@ fn bootstrap_with_deflate_block(
             // EOB. `n_max_to_decode = usize::MAX` matches rapidgzip's
             // `std::numeric_limits<size_t>::max()` at GzipChunk.hpp:568.
             let before_len = output.len();
+            let t_body = std::time::Instant::now();
             while !block.eob() {
                 let res = block.read(&mut bits, &mut *output, usize::MAX);
                 if let Err(e) = res {
@@ -773,6 +792,14 @@ fn bootstrap_with_deflate_block(
                     )));
                 }
             }
+            BOOTSTRAP_BODY_US.fetch_add(
+                t_body.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            BOOTSTRAP_BODY_BYTES.fetch_add(
+                (output.len() - before_len) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
 
             // Block fully decoded. Update trailing_clean from the bytes
             // just produced. Markers (≥ MARKER_BASE) reset the run; clean

@@ -16,12 +16,22 @@
 //! borrows `&[u8]` with zero copy (vendor passes a raw pointer; we use
 //! `thread::scope` instead of `Arc::from` which would clone the slice).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::block_finder::BlockFinder;
 use super::streamed_results::{StreamedGetReturnCode, StreamedResults};
+
+// B-instrumentation: per-spawn cost breakdown for the BlockFinder
+// coordinator. Each `with_scoped_boundary_search` spawns one thread,
+// so 22 calls per silesia means 22 spawns. We want to know if the
+// 7.5B CPU samples are in scan (push_boundary_candidates) or in the
+// consumer (try-each-candidate loop) or in spawn/sync overhead.
+pub static BOUNDARY_SEARCH_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static BOUNDARY_SEARCH_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+pub static BOUNDARY_SEARCH_SCAN_US: AtomicU64 = AtomicU64::new(0);
+pub static CONSUMER_TIME_US: AtomicU64 = AtomicU64::new(0);
 
 /// Window size for incremental boundary search — matches
 /// `speculative_decode_find_boundary`'s scan window.
@@ -92,15 +102,35 @@ impl RawBlockFinderCoordinator {
         max_end: usize,
         consumer: impl FnOnce(&Self) -> R,
     ) -> R {
+        let t_total = std::time::Instant::now();
         let coord = Self::new();
         let results = Arc::clone(&coord.results);
         let cancel = Arc::clone(&coord.cancel);
-        std::thread::scope(|scope| {
+        let scan_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let scan_us_inner = std::sync::Arc::clone(&scan_us);
+        let r = std::thread::scope(|scope| {
             scope.spawn(move || {
+                let t_scan = std::time::Instant::now();
                 push_boundary_candidates(&results, data, start_bit, max_end, Some(&cancel));
+                scan_us_inner.store(
+                    t_scan.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             });
-            consumer(&coord)
-        })
+            let t_consumer = std::time::Instant::now();
+            let result = consumer(&coord);
+            CONSUMER_TIME_US.fetch_add(
+                t_consumer.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            result
+        });
+        let total_us = t_total.elapsed().as_micros() as u64;
+        let scan_us = scan_us.load(std::sync::atomic::Ordering::Relaxed);
+        BOUNDARY_SEARCH_TOTAL_US.fetch_add(total_us, std::sync::atomic::Ordering::Relaxed);
+        BOUNDARY_SEARCH_SCAN_US.fetch_add(scan_us, std::sync::atomic::Ordering::Relaxed);
+        BOUNDARY_SEARCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        r
     }
 
     pub fn get_offset(
