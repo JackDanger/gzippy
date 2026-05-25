@@ -1998,7 +1998,10 @@ fn drain_one_pending<W: std::io::Write>(
 
     // Vendor `appendSubchunksToIndexes` window emplace — orchestrator only.
     let t_pub = std::time::Instant::now();
-    publish_subchunk_windows(window_map, &chunk);
+    {
+        let _tv2 = trace_v2::SpanGuard::begin("consumer.publish_windows");
+        publish_subchunk_windows(window_map, &chunk);
+    }
     let publish_us = t_pub.elapsed().as_micros();
 
     // Mirror of vendor's per-chunk write loop (GzipChunkFetcher.hpp:333-342).
@@ -2012,10 +2015,16 @@ fn drain_one_pending<W: std::io::Write>(
     let mut written_crc = CRC32Calculator::new();
     let t_crc_write = std::time::Instant::now();
     if !chunk.narrowed.is_empty() {
-        written_crc.update(&chunk.narrowed);
-        writer
-            .write_all(&chunk.narrowed)
-            .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+        {
+            let _tv2 = trace_v2::SpanGuard::begin("consumer.crc_narrowed");
+            written_crc.update(&chunk.narrowed);
+        }
+        {
+            let _tv2 = trace_v2::SpanGuard::begin("consumer.write_narrowed");
+            writer
+                .write_all(&chunk.narrowed)
+                .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+        }
         *total_size += chunk.narrowed.len();
     } else if !chunk.data_with_markers.is_empty() {
         // Defensive fallback when `apply_window` ran but the narrow
@@ -2035,15 +2044,24 @@ fn drain_one_pending<W: std::io::Write>(
         *total_size += narrowed.len();
     }
     if !chunk.data.is_empty() {
-        written_crc.update(&chunk.data);
-        writer
-            .write_all(&chunk.data)
-            .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+        {
+            let _tv2 = trace_v2::SpanGuard::begin("consumer.crc_data");
+            written_crc.update(&chunk.data);
+        }
+        {
+            let _tv2 = trace_v2::SpanGuard::begin("consumer.write_data");
+            writer
+                .write_all(&chunk.data)
+                .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+        }
         *total_size += chunk.data.len();
     }
     let crc_write_us = t_crc_write.elapsed().as_micros();
     let t_combine = std::time::Instant::now();
-    total_crc.append(&written_crc);
+    {
+        let _tv2 = trace_v2::SpanGuard::begin("consumer.combine_crc");
+        total_crc.append(&written_crc);
+    }
     let combine_us = t_combine.elapsed().as_micros();
     let total_us = t_chunk.elapsed().as_micros();
 
