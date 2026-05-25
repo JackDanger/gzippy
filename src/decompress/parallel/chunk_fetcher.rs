@@ -671,6 +671,11 @@ pub fn drive<W: std::io::Write>(
             "  Prefetch guard-rejects: {}",
             PREFETCH_REJECT_BY_GUARD.load(Ordering::Relaxed),
         );
+        eprintln!(
+            "  Arc::try_unwrap hits/misses: {} / {}",
+            ARC_TRY_UNWRAP_HITS.load(Ordering::Relaxed),
+            ARC_TRY_UNWRAP_MISSES.load(Ordering::Relaxed),
+        );
     }
 
     // Flush all per-thread trace_v2 buffers (consumer thread + any
@@ -1054,7 +1059,16 @@ fn consumer_loop<W: std::io::Write>(
         // GzipChunkFetcher.hpp:329.
         let mut chunk: ChunkData = {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.arc_take_or_clone");
-            Arc::try_unwrap(chunk_arc).unwrap_or_else(|a| (*a).clone())
+            match Arc::try_unwrap(chunk_arc) {
+                Ok(c) => {
+                    ARC_TRY_UNWRAP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    c
+                }
+                Err(a) => {
+                    ARC_TRY_UNWRAP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    (*a).clone()
+                }
+            }
         };
 
         // Vendor GzipChunkFetcher.hpp:349 —
@@ -1771,6 +1785,14 @@ pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
 /// consumer-requested `next_block_offset`) — distinct from
 /// `prefetch_cache_miss`, which counts a prefetch being absent.
 pub static PREFETCH_REJECT_BY_GUARD: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Lever G diagnostic: counts how often the consumer's
+/// `Arc::try_unwrap(chunk_arc)` actually succeeded (HITS) vs fell back
+/// to a deep clone (MISSES). Goal: HITS == chunk count, MISSES == 0.
+pub static ARC_TRY_UNWRAP_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static ARC_TRY_UNWRAP_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Speculative slow-path decode without a predecessor window. Must use
