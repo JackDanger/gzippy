@@ -312,8 +312,86 @@ re-make the same wrong turn.
    **Caught by**: instrumenting the per-chunk spans (commit `6788651`)
    before optimizing.
 
+6. **"Per-chunk allocator overhead is the bottleneck."** An advisor
+   pointed at `bootstrap_with_deflate_block`'s unpooled `Vec::with_capacity(128*1024)`,
+   predicted pooling it would save 150-200 ms wall. Another advisor
+   implemented the fix and measured — actual savings: **30 ms**. Page-fault
+   count basically unchanged. CPU-fraction reasoning (17% of CPU in
+   page-fault paths) doesn't translate to wall on a 9-thread system;
+   parallelism dilutes it.
+   **Caught by**: insisting an advisor actually implement and measure
+   before recommending. Saved several days of allocator spelunking.
+
+7. **"Body-failure speculation accuracy is the real lever."** V1
+   instrumentation showed gzippy has 39 body failures per silesia run.
+   Forensic measurement (commit `ddc3a3c`): 608 bytes wasted total,
+   ~4 ms of work. Body failures are CHEAP — they abort during table
+   construction before any decode. NOT the cost. 34 of 39 are
+   `InvalidCodeLengths` (precode decoded into bad lengths), which a
+   deeper precode validator could catch but with bounded ~4 ms savings.
+   **Caught by**: per-failure structured logging
+   (`GZIPPY_BODY_FAIL_LOG`).
+
+8. **"Inflate engine choice (ISA-L vs pure-Rust) is the lever."**
+   Multiple advisors suggested. Built gzippy with `--features
+   isal-compression --no-default-features`: 537 ms vs pure-rust 506 ms.
+   ISA-L makes it slightly SLOWER. Engine isn't the gap; the parallel
+   pipeline structure around it is.
+
+9. **"Global rpmalloc allocator will close the gap (vendor uses it)."**
+   Vendor uses rpmalloc as a PER-VEC custom allocator in specific
+   places (`FasterVector.hpp:38-42`), NOT as global allocator. Vendor
+   explicitly avoids `rpnew.h` global override per `ChunkData.hpp:24`
+   ("memory slab reuse issues"). gzippy already has per-Vec
+   `RpmallocAlloc` via `allocator-api2`. Tried global anyway: regressed
+   12% (matches mimalloc and jemalloc history).
+
+10. **"Just bump prefetch_capacity from 2x to 4x."** Cheap-looking
+    tunable. Cache misses dropped 4 → 3 but wall regressed 486 → 510 ms
+    — overhead from larger cache ate the savings.
+
+11. **"SIMD multi-literal lookahead (vector_huffman) ported into the
+    resumable inflate body."** Sounded straightforward — port the
+    production cf_vector pattern into `decode_huffman_body_resumable`.
+    Regressed bench 334 → 284 MB/s and silesia 2.79 → 3.06. Reverted at
+    commit `d08732f`. Silesia's mixed-content data has too few literal
+    clusters for the 4-symbol lookahead to pay back its overhead.
+
 Pattern: the plan / advisor had a prior; the prior was wrong; only
 the measurement was right. **Trust the measurement, not the prior.**
+
+## Verified findings — cited evidence (refer to plans/pure-rust-perf.md for full data)
+
+The cross-tool Chrome-trace instrumentation (`trace_v2.rs` for gzippy,
+`scripts/rapidgzip_trace_patch/` for vendor) emits matching spans so
+both tools' decisions can be made from identical data shapes:
+
+1. **The 200 ms pipeline idle = 4 specific cache misses.** Consumer
+   thread's `wait.block_fetcher_get` totals 210 ms across cached chunks
+   0, 201, 1855, 2545. Chunk 0 is cold-start (~40 ms unavoidable);
+   the other 3 are consumer outrunning the prefetch window mid-stream.
+2. **Worker load imbalance is a CONSEQUENCE of (1), not a separate
+   bug.** Per-thread busy times σ=130 ms (gzippy) vs σ=7 ms (rapidgzip).
+   `pool.pick` time is 6.7× higher in gzippy. Both track the same
+   root cause: when consumer blocks on cache misses, no new work
+   submits, workers idle in condvar wait.
+3. **Per-chunk decode rate is 1.9× slower** (47 vs 25 ms avg). This
+   IS separate from the cache-miss story and remains a follow-up
+   lever after (1) is fixed.
+4. **Equal-hardware gap is 3.4×, NOT the originally-feared 6.1×.**
+   The earlier 6.1× included an unmeasured P/E hybrid CPU confound
+   that closed 25% of the gap once gzippy was P-core-pinned.
+
+## Anti-mistake rule (in addition to the six already documented)
+
+**Rule 7 (newly added 2026-05-25): "Run any candidate fix end-to-end
+on neurotic and report wall delta BEFORE recommending."** Advisors
+who recommended fixes based on CPU-fraction reasoning (page-fault
+%, allocator share, body-failure share) repeatedly overestimated
+wall impact by 5-10×. The single advisor who actually implemented +
+measured the bootstrap-Vec pool delivered the correct prediction
+(30 ms, not 150-200 ms) and saved the team from a multi-day pursuit
+of a phantom. **Implement + measure beats theorize, every time.**
 
 ## §5 retrospective — pure-Rust resumable inflate (correctness)
 

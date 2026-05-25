@@ -6,6 +6,186 @@ progress on the **one deliverable** stated in `plans/rust-rapidgzip.md`.
 It is not a phase plan. There is exactly one deliverable; this file
 is its dashboard.
 
+## Apples-to-apples comparison on equal hardware (2026-05-24+, neurotic)
+
+The full-population number that should drive decisions:
+
+| Tool | T=1 (silesia, P-cores only) | T=9 (P-cores) | T=16/T=1 ratio | T=9 output rate |
+| --- | ---:| ---:| ---:| ---:|
+| gzippy (pure-rust-inflate) | 258 ms (libdeflate path) | 506 ms | 2.78 (par SLOWER) | 282 MB/s |
+| gzippy (isal-compression)  | 271 ms                   | 537 ms | similar          | similar    |
+| **rapidgzip 0.16.0**       | **273 ms**               | **147 ms** | **0.42 (par FASTER)** | **1100 MB/s** |
+
+- **gzippy T=1 (libdeflate) is FASTER than rapidgzip T=1.** Sequential isn't the gap.
+- **gzippy T=9 is 3.4× SLOWER than rapidgzip T=9** on equal hardware (P-core pinned).
+- **Gate 2's <0.5 target IS achievable** — rapidgzip hits 0.42 on this fixture.
+- Switching gzippy from pure-rust-inflate to isal-compression doesn't close the gap
+  (537 vs 506 ms). **Inflate engine choice is NOT the lever.**
+- Hybrid CPU confound: gzippy T=16 mixed P+E cores = 753 ms; gzippy T=9 P-only =
+  506 ms. ~25% of measured gap was thread placement.
+
+## Cross-tool instrumentation infrastructure (Phase 1/2/3, in tree)
+
+The plan and its decisions are now driven by data emitted by **matching
+Chrome-trace JSON emitters** on both sides:
+
+- **gzippy**: `src/decompress/parallel/trace_v2.rs` (`SpanGuard` RAII +
+  `emit_alloc` + `LockSpan` macros). pid=1. Activated by
+  `GZIPPY_TIMELINE=/tmp/gz.tl.json`.
+- **rapidgzip**: `scripts/rapidgzip_trace_patch/TraceV2.hpp` +
+  `patch_vendor*.sh`. pid=2. Same env var. Built from
+  `vendor/rapidgzip/librapidarchive/` via included patch scripts.
+- **Analyzer**: `scripts/timeline_analyze.py` reads either file or
+  both (diff mode). Top spans, per-thread busy/wait, critical-path
+  contributors.
+
+Build/run recipes:
+
+```bash
+# gzippy
+ssh -J neurotic root@REDACTED_IP 'cd ~/gzippy &&
+  cargo build --release --features pure-rust-inflate'
+ssh -J neurotic root@REDACTED_IP '
+  rm -f /tmp/gz.tl.json &&
+  taskset -c 1,3,4,5,6,7,10,13,15 \
+    env GZIPPY_TIMELINE=/tmp/gz.tl.json \
+    /root/gzippy/target/release/gzippy -d -c -p 9 \
+    /root/benchmark_data/silesia-gzip.tar.gz > /dev/null'
+
+# rapidgzip (one-time vendor build)
+ssh -J neurotic root@REDACTED_IP '
+  cp scripts/rapidgzip_trace_patch/TraceV2.hpp \
+     /root/gzippy/vendor/rapidgzip/librapidarchive/src/core/ &&
+  bash scripts/rapidgzip_trace_patch/patch_vendor.sh &&
+  bash scripts/rapidgzip_trace_patch/patch_vendor_phase3b.sh &&
+  cd /root/gzippy/vendor/rapidgzip/librapidarchive/build &&
+  cmake --build . --target rapidgzip -j 9'
+ssh -J neurotic root@REDACTED_IP '
+  rm -f /tmp/rg.tl.json &&
+  taskset -c 1,3,4,5,6,7,10,13,15 \
+    env GZIPPY_TIMELINE=/tmp/rg.tl.json \
+    /root/gzippy/vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip -d -c -P 9 \
+    /root/benchmark_data/silesia-gzip.tar.gz > /dev/null'
+
+# Diff
+ssh -J neurotic root@REDACTED_IP \
+  'python3 /tmp/timeline_analyze.py /tmp/gz.tl.json /tmp/rg.tl.json'
+```
+
+Span vocabulary (semantic, matched across both tools):
+
+| Span | Meaning | Both tools? |
+| --- | --- | --- |
+| `worker.decode_chunk` | One chunk's full decode | both |
+| `worker.bootstrap` | gzippy phase-1 marker bootstrap | gzippy only (no vendor counterpart — unified inflate) |
+| `worker.block_header` / `worker.block_body` | per-block decode in bootstrap | gzippy only |
+| `consumer.iter` | One outer-loop iteration | both |
+| `consumer.drain` | gzippy pending-write drain | gzippy only |
+| `post_process.task` / `post_process.apply_window` | window apply / narrow | both |
+| `wait.future_recv` | mpsc::Receiver::recv | gzippy only (vendor uses BlockFetcher::get path) |
+| `wait.block_fetcher_get` | block_fetcher.get_with_prefetch wait | both |
+| `pool.submit` | thread pool task enqueue | both |
+| `pool.pick` | worker dequeue + condvar wait | both |
+| `pool.run_task` | task body execution | both |
+| `block_finder.scan` | BlockFinder scan thread | both (vendor wired but path may differ) |
+| `drive` | entire parallel-SM run | gzippy only |
+
+## VERIFIED FINDINGS (anti-mistake rule: cite the span data)
+
+### 1. Cache-miss culprit on consumer thread
+
+`wait.block_fetcher_get` on the consumer thread:
+
+- gzippy: **4 cache misses** at chunk_id (0, 201, 1855, 2545) for **210 ms total wait** = 43% of wall
+- rapidgzip: 26 small waits (~3 ms avg) for 84 ms total, no big misses
+
+These are SPECIFIC, NAMED chunks. Chunk 0 = cold start (~40 ms unavoidable);
+chunks 201/1855/2545 = consumer outran the prefetch window mid-stream
+(~50-75 ms each).
+
+### 2. Worker load imbalance (more diffuse than the cache-miss data)
+
+Per-thread busy times across 9 workers:
+
+- rapidgzip: 70-92 ms range, σ ≈ 7 ms (TIGHT)
+- gzippy: 124-555 ms range, σ ≈ 130 ms (WIDE)
+
+Per Phase 3 dispatch data, this imbalance is largely a **consequence**
+of the cache misses: while consumer is blocked, workers idle in
+`pool.pick`. Fix the misses → idle drops → imbalance tightens.
+
+### 3. Pool efficiency gap
+
+(useful decode work / (cores × wall)):
+
+- gzippy: 2670 ms / (9 × 666 ms) = **45%**
+- rapidgzip: 879 ms / (9 × 162 ms) = **60%**
+- Gap: 15 percentage points.
+
+Same root cause as (1) — consumer blocking propagates to pool idle.
+
+### 4. Per-chunk decode rate 1.9× slower
+
+`worker.decode_chunk` averages:
+
+- gzippy: 47 ms / chunk (33 chunks)
+- rapidgzip: 25 ms / chunk (26 chunks)
+
+This is real but SEPARATE from the cache-miss + load-balance story.
+Ceiling test: even closing all cache misses leaves wall at ~290 ms
+vs rapidgzip's 147 ms — per-chunk rate must come down too.
+
+### 5. Bootstrap body rate in production: 98 MB/s (vs bench 242 MB/s)
+
+`worker.block_body` sum (gzippy): 1.03 s of decode for 101 MB output =
+98 MB/s per worker. Bench (`bootstrap_marker_overhead.rs`) shows the
+same code path at 242 MB/s on a fresh deflate stream — the 2.5×
+production-vs-bench gap is from surrounding pipeline overhead
+(allocator, narrow, apply_window).
+
+## VERIFIED REFUTATIONS (do NOT pursue)
+
+Each killed by direct measurement:
+
+- **40% page-fault wall premise** — actual is 17% on real silesia
+  (matches rapidgzip's 17%). Phase A closed (commit `dd5c64f`).
+- **Body-failure speculation accuracy** as the dominant cost — 39 body
+  failures total cost 608 bytes wasted = ~4 ms work. Not a lever.
+- **CountAllocatedLeaves precode pre-pass** would buy 25% wall — V1
+  showed only 29% (17/58) of failures are precode-catchable. Ceiling
+  is ~4% wall, not 25%.
+- **Cache-key mismatch hypothesis (H2)** — gzippy mirrors vendor's
+  two-key dance at `chunk_fetcher.rs:663-666`. Architecture identical.
+- **Prefetch-fires-before-confirm race (H1)** — `GZIPPY_NO_PREFETCH=1`
+  makes wall 1.55× slower (727 → 1131 ms). Prefetch is helping.
+- **Inflate engine (ISA-L vs pure-Rust)** — `--features isal-compression`
+  build measures 537 ms vs pure-rust 506 ms. ISA-L doesn't help.
+- **Global allocator swap** — `#[global_allocator] = rpmalloc::RpMalloc`
+  regressed 12% (492 → 552 ms). Matches mimalloc / jemalloc history.
+  Vendor explicitly avoids global rpmalloc per `ChunkData.hpp:24`.
+- **Pool the `bootstrap_with_deflate_block` Vec** — advisor-suggested
+  fix; advisor implemented and measured. Delivered 30 ms, not the
+  predicted 150-200 ms. Page-fault count unchanged.
+- **`prefetch_capacity` 2x → 4x** — regressed wall 486 → 510 ms.
+  Cache misses dropped 4 → 3 but overhead elsewhere ate it.
+- **Marker bookkeeping in bootstrap** — bench showed markers ON/OFF =
+  0.99× ratio. Not the cost.
+- **Larger LitLenTable::TABLE_BITS (13)** — regressed (32 KB table out of
+  L1 territory). Sweet spot is **12** (kept). DistTable sweet spot **9** (kept).
+- **SIMD multi-literal fastloop** (vector_huffman ported into
+  `decode_huffman_body_resumable`) — regressed bench 334 → 284 MB/s,
+  silesia 2.79 → 3.06. Reverted at commit `d08732f`. Silesia data has
+  too few literal clusters for the lookahead to pay back its overhead.
+
+## Confirmed wins kept
+
+| Commit | Change | Win |
+| --- | --- | --- |
+| `41076a0` | Worker-side scalar `narrow_u16_to_u8` | wall 998 → 881 ms (12%) |
+| `ee05316` | LitLenTable::TABLE_BITS 11 → 12 | wall 895 → 863 ms (4%) |
+| `9a34f32` | DistTable::TABLE_BITS 8 → 9 | wall 863 → 809 ms (6%) |
+| (cumulative) | All session wins | wall 998 → 506 ms = 49% (silesia gate 2 ratio 2.76 → 2.78 post-P-core baseline correction) |
+
 ## Live baseline (2026-05-24, neurotic, 16-core x86_64)
 
 All numbers via `--features pure-rust-inflate` unless noted.
