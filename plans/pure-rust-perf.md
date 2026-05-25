@@ -209,6 +209,41 @@ wait time** when the slow bootstrap is on the chunk consumer needs next.
 Faster bootstrap → less rx.recv waiting. The hoist's wall win partly
 came from this mechanism, not just steady-state body throughput.
 
+### 8. Lever H — pump prefetch during in-flight wait
+
+Fix: `try_take_prefetched` did a bare `rx.recv()` blocking the consumer
+thread while in-flight prefetches finished. Its sibling
+`get_with_prefetch` already mirrored the vendor 1ms-pump pattern at
+BlockFetcher.hpp:312-316 — but this matched-prefetch path did not.
+Effect: while consumer spent 89-171 ms in `ttp.rx_recv_block` per
+session, NO new prefetches were being dispatched even though
+`pool.pick` showed workers had 2.3s of cumulative idle capacity.
+
+Implementation: new `try_take_prefetched_pumping(key, FnMut())`. Caller
+threads a pump closure capturing the prefetch-submit closures.
+`recv_timeout(1ms)` loop, calls pump on each Timeout.
+
+Vendor citation: `BlockFetcher.hpp:312-316`:
+```cpp
+while ( queuedResult.wait_for(1ms) == timeout ) prefetchNewBlocks(...)
+```
+
+**A/B (10-trial, system load=2.4):**
+- Lever G only:           best 567 / median 595 / mean 606 ms (stdev 42)
+- Lever G + Lever H:      best 473 / median 496 / mean 500 ms (stdev 21)
+- **Saving: best -17%, median -17%, mean -17%, stdev halved**
+
+Falsifiable target: combined slow path -≥30%, wall -≥4%. Wall -17% far
+exceeds. Combined slow path event counts shifted: fewer hard misses
+(`wait.block_fetcher_get` 4-6→2-4 events), more in-flight catches
+(`ttp.rx_recv_block` 4-9→8-13 events) — prefetch horizon is now
+advancing while the consumer waits.
+
+Commit: `5a9e51c` (perf(parallel-sm): pump prefetch while blocked).
+
+**Cumulative session wins:** baseline (hoist only) 666 → Lever G+H 473
+ms best = **-29% wall**. Per-thread variance also collapsed.
+
 ## VERIFIED REFUTATIONS (do NOT pursue)
 
 Each killed by direct measurement:
