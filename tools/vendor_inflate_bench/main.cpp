@@ -21,7 +21,8 @@
 
 // Vendor headers
 #include <rapidgzip/gzip/deflate.hpp>
-#include <gzip/BitReader.hpp>
+#include <filereader/BitReader.hpp>
+#include <filereader/BufferView.hpp>
 
 namespace fs = std::filesystem;
 
