@@ -362,9 +362,33 @@ impl ChunkData {
     /// report total values in `non_marker_count` only.
     pub fn append_markered(&mut self, values: &[u16]) {
         self.statistics.non_marker_count += values.len() as u64;
-        self.data_with_markers.extend_from_slice(values);
+        // `allocator_api2::vec::Vec::extend_from_slice` does NOT
+        // specialize for `Copy` source types — it falls back to
+        // the generic `extend → Cloned::next → Option::cloned →
+        // Clone::clone` iterator chain. For `Vec<u16>` that's a
+        // per-element u16 load through 4 inlined adapter frames
+        // instead of a memcpy. Replace with the explicit
+        // `reserve` + `copy_nonoverlapping` + `set_len` shape that
+        // `std::vec::Vec`'s `SpecExtend` specialization would
+        // have produced.
+        let added = values.len();
+        let prev_len = self.data_with_markers.len();
+        self.data_with_markers.reserve(added);
+        // SAFETY: `reserve(added)` ensures capacity covers
+        // `prev_len + added`; `values` and `data_with_markers`
+        // are distinct allocations; set_len with the post-copy
+        // length is legal because all `added` u16s are
+        // initialized from the `values` slice.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr(),
+                self.data_with_markers.as_mut_ptr().add(prev_len),
+                added,
+            );
+            self.data_with_markers.set_len(prev_len + added);
+        }
         if let Some(last) = self.subchunks.last_mut() {
-            last.decoded_size += values.len();
+            last.decoded_size += added;
         }
     }
 

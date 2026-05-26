@@ -644,9 +644,34 @@ fn absorb_isal_tail(dst: &mut ChunkData, tail: ChunkData) {
         // Bytes + statistics + subchunk size — the non-CRC half of
         // `append_clean`. We extend in place rather than via
         // `append_clean` because that path would re-CRC.
-        dst.statistics.non_marker_count += tail.data.len() as u64;
+        //
+        // `allocator_api2::vec::Vec::extend_from_slice` does NOT
+        // specialize for `Copy` source types (unlike `std::vec::Vec`
+        // which has `SpecExtend`) — it falls back to the generic
+        // `extend → Cloned::next → Option::cloned → Clone::clone`
+        // iterator chain. Per the bench-sm profile post-absorb-fix,
+        // that chain accounted for 2.47% of total cycles for u8
+        // bytes (where `Clone::clone` is a no-op load that should
+        // have been folded into a memcpy). Replace with an explicit
+        // `reserve` + `copy_nonoverlapping` + `set_len` — the same
+        // shape `std::vec::Vec`'s specialization would have used.
         let added = tail.data.len();
-        dst.data.extend_from_slice(&tail.data);
+        let prev_len = dst.data.len();
+        dst.data.reserve(added);
+        // SAFETY: `reserve(added)` ensures capacity covers
+        // `prev_len + added`; `tail.data` and `dst.data` are
+        // distinct allocations (separate Vecs); set_len with the
+        // post-copy length is legal because all `added` bytes are
+        // initialized from `tail.data`'s slice.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                tail.data.as_ptr(),
+                dst.data.as_mut_ptr().add(prev_len),
+                added,
+            );
+            dst.data.set_len(prev_len + added);
+        }
+        dst.statistics.non_marker_count += added as u64;
         if let Some(last) = dst.subchunks.last_mut() {
             last.decoded_size += added;
         }
