@@ -365,12 +365,31 @@ fn decode_chunk_isal_impl(
         }
         if append_len > 0 {
             // Commit the bytes ISA-L wrote into chunk.data's spare
-            // capacity, update CRC + statistics in one pass. Bytes
-            // beyond `prev_data_len + append_len` (between EOB and the
-            // truncate point) are left uninitialized in the Vec — the
-            // NEXT outer iteration will overwrite them starting at
+            // capacity. Bytes beyond `prev_data_len + append_len`
+            // (between EOB and the truncate point) are left
+            // uninitialized in the Vec — the NEXT outer iteration
+            // will overwrite them starting at
             // `chunk.data.len() = prev_data_len + append_len`.
-            chunk.note_clean_bytes_written_in_place(prev_data_len, append_len, true);
+            //
+            // We deliberately do NOT call
+            // `chunk.note_clean_bytes_written_in_place` here because
+            // its `subchunks.last_mut().decoded_size += written`
+            // would double-count: the inner loop already updated
+            // subchunks via `note_inner_decoded_bytes(last_per_call)`
+            // for the FULL n_bytes_read (before truncation).
+            //
+            // SAFETY: `prev_data_len + append_len ≤ prev_data_len +
+            // n_bytes_read ≤ prev_data_len + buffer_cap`, which is
+            // within the capacity reserved at the start of the
+            // outer iteration; ISA-L wrote initialized bytes through
+            // `prev_data_len + n_bytes_read`.
+            unsafe { chunk.data.set_len(prev_data_len + append_len) };
+            if chunk.configuration.crc32_enabled {
+                if let Some(last_crc) = chunk.crc32s.last_mut() {
+                    last_crc.update(&chunk.data[prev_data_len..prev_data_len + append_len]);
+                }
+            }
+            chunk.statistics.non_marker_count += append_len as u64;
         }
         already_decoded = decode_base + append_len;
 
