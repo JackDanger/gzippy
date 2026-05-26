@@ -673,21 +673,14 @@ fn bootstrap_with_deflate_block(
         let block = &mut *block;
         let output = &mut output;
 
-        // Handoff signal: use `Block::contains_marker_bytes()` directly.
-        // It flips to false (sticky) when `distance_to_last_marker_byte
-        // >= MAX_WINDOW_SIZE`, which guarantees the trailing 32 KiB of
-        // output is clean. Mirror of vendor's flip at deflate.hpp:1282-1287
-        // inside `Block::read`, which is what triggers `setInitialWindow`
-        // and exits marker mode.
-        //
-        // Previous implementation used a `trailing_clean` counter updated
-        // only at block boundaries. On silesia, individual blocks (~85 KiB)
-        // frequently contain a marker mid-block which reset the counter to
-        // the trailing clean tail of the block — typically < 32 KiB. As a
-        // result `trailing_clean` rarely reached MAX_WINDOW_SIZE and
-        // bootstrap consumed ~60% of bytes (vs vendor ~0%). Switching to
-        // the per-symbol distance-to-last-marker counter that Block
-        // already maintains is both vendor-parity and the right signal.
+        // Tracks trailing CLEAN-byte run length. When it reaches
+        // MAX_WINDOW_SIZE AT a block boundary, the next 32 KiB of `output`
+        // forms a clean dict for ISA-L. Cumulative count saturates at
+        // MAX_WINDOW_SIZE (we only need the latest 32 KiB).
+        let mut trailing_clean: usize = 0;
+        // True once `trailing_clean >= MAX_WINDOW_SIZE` AND the most recent
+        // block has just finished (so the next bit position is a real block
+        // header start that ISA-L can resume from).
         let mut clean_handoff_armed: bool;
         let mut bfinal_hit = false;
         // `end_bit_offset` always points just past the last completed block.
@@ -701,17 +694,11 @@ fn bootstrap_with_deflate_block(
             // chunk hands off to ISA-L (or when this block becomes BFINAL).
             let next_block_offset = absolute_bit_pos(byte_offset, &bits);
 
-            // Handoff check (rapidgzip GzipChunk.hpp:520-525): hand off to
-            // ISA-L when Block has flipped to clean mode AND we have
-            // enough output to seed a 32 KiB window.
-            //
-            // `!block.contains_marker_bytes()` is the per-symbol-tracked
-            // signal that the last `distance_to_last_marker_byte` ≥
-            // MAX_WINDOW_SIZE — i.e., the trailing 32 KiB of output is
-            // clean. Cheaper and earlier than the previous block-boundary
-            // `trailing_clean` recompute.
-            clean_handoff_armed =
-                !block.contains_marker_bytes() && output.len() >= MAX_WINDOW_SIZE;
+            // Handoff check (rapidgzip GzipChunk.hpp:520-525): if we have a
+            // clean 32 KiB tail AND we're at a real block boundary, stop
+            // bootstrap and let phase 2 run. We do this BEFORE reading the
+            // next header so `end_bit_offset` is at a clean boundary.
+            clean_handoff_armed = trailing_clean >= MAX_WINDOW_SIZE;
             if clean_handoff_armed {
                 end_bit_offset = next_block_offset;
                 break;
@@ -825,9 +812,26 @@ fn bootstrap_with_deflate_block(
                 std::sync::atomic::Ordering::Relaxed,
             );
 
-            // (Previously here: trailing_clean update from block_slice.
-            // No longer needed — handoff uses Block::contains_marker_bytes()
-            // which is updated per-symbol inside Block::read.)
+            // Block fully decoded. Update trailing_clean from the bytes
+            // just produced. Markers (≥ MARKER_BASE) reset the run; clean
+            // bytes extend it (saturating at MAX_WINDOW_SIZE).
+            let block_slice = &output[before_len..];
+            if !block_slice.is_empty() {
+                let trailing_this_block = block_slice
+                    .iter()
+                    .rev()
+                    .take_while(|&&v| v < MARKER_BASE)
+                    .count();
+                if trailing_this_block == block_slice.len() {
+                    // Entire block was clean — extend the prior run.
+                    trailing_clean = (trailing_clean + trailing_this_block).min(MAX_WINDOW_SIZE);
+                } else {
+                    // A marker appeared mid-block; the trailing clean run
+                    // restarts from after that last marker.
+                    trailing_clean = trailing_this_block.min(MAX_WINDOW_SIZE);
+                }
+            }
+
             end_bit_offset = absolute_bit_pos(byte_offset, &bits);
 
             if block.is_last_block() {
