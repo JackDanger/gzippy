@@ -1149,8 +1149,12 @@ impl Block {
         };
 
         const LITLEN_CAP: usize = MAX_LITERAL_OR_LENGTH_SYMBOLS + 2;
-        let mut dist_hc: HuffmanCodingSymbolsPerLength<MAX_DISTANCE_SYMBOL_COUNT> =
-            HuffmanCodingSymbolsPerLength::new();
+        // Vendor parity (deflate.hpp:336): distance Huffman uses the cached
+        // variant, not the canonical bit-by-bit decoder. perf record on
+        // PGO build showed 8.85% of cycles in the canonical fallback via
+        // get_distance_dynamic — swapping cuts that.
+        let mut dist_hc: HuffmanCodingReversedBitsCached<MAX_DISTANCE_SYMBOL_COUNT> =
+            HuffmanCodingReversedBitsCached::new();
         let err = dist_hc.initialize_from_lengths(&dist_lens, false);
         if err != super::error::Error::None {
             return Err(BlockError::InvalidCodeLengths);
