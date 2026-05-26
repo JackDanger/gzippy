@@ -839,53 +839,20 @@ mod tests {
     }
 
     fn make_multi_block_deflate(payload: &[u8]) -> Vec<u8> {
-        use flate2::{Compress, Compression, FlushCompress, Status};
-        let mut compress = Compress::new(Compression::new(6), false);
-        let mut out = Vec::new();
-        let mut scratch = vec![0u8; 64 * 1024];
-        for piece in payload.chunks(32 * 1024) {
-            let mut block_data = piece;
-            loop {
-                let before_in = compress.total_in();
-                let before_out = compress.total_out();
-                let status = compress
-                    .compress(block_data, &mut scratch, FlushCompress::None)
-                    .unwrap();
-                let consumed = (compress.total_in() - before_in) as usize;
-                let produced = (compress.total_out() - before_out) as usize;
-                out.extend_from_slice(&scratch[..produced]);
-                block_data = &block_data[consumed..];
-                if block_data.is_empty() {
-                    break;
-                }
-                if matches!(status, Status::BufError) && produced == 0 {
-                    break;
-                }
-            }
-            loop {
-                let before_out = compress.total_out();
-                let status = compress
-                    .compress(&[], &mut scratch, FlushCompress::Sync)
-                    .unwrap();
-                let produced = (compress.total_out() - before_out) as usize;
-                out.extend_from_slice(&scratch[..produced]);
-                if produced == 0 || matches!(status, Status::StreamEnd) {
-                    break;
-                }
-            }
-        }
-        loop {
-            let before_out = compress.total_out();
-            let status = compress
-                .compress(&[], &mut scratch, FlushCompress::Finish)
-                .unwrap();
-            let produced = (compress.total_out() - before_out) as usize;
-            out.extend_from_slice(&scratch[..produced]);
-            if matches!(status, Status::StreamEnd) || produced == 0 {
-                break;
-            }
-        }
-        out
+        // Compression::new(0) emits raw STORED blocks split at the 65535-
+        // byte deflate stored-block limit (RFC 1951 §3.2.4). For payloads
+        // larger than 65 KiB this produces multiple distinct deflate
+        // blocks naturally: N-1 blocks with BFINAL=0 plus one final
+        // BFINAL=1 block. No bit-twiddling required.
+        //
+        // Replaces the prior `FlushCompress::Sync`-based approach which
+        // broke on flate2 1.x — Sync now emits sync markers inside the
+        // same outer block rather than splitting the stream (see f9201a3
+        // commit notes documenting the resumable_isal_oracle::* test
+        // pair as deferred for this exact reason).
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(0));
+        enc.write_all(payload).unwrap();
+        enc.finish().unwrap()
     }
 
     #[test]
@@ -1367,8 +1334,17 @@ mod tests {
         #[test]
         fn resume_with_window_matches_isal() {
             let payload = vec![0xCDu8; 400_000];
-            let deflate = make_deflate(&payload);
+            // `make_multi_block_deflate` (stored-block split) guarantees
+            // multiple block boundaries — `make_deflate` (Compression::new(6))
+            // on the repetitive 0xCD payload RLE-compresses into a single
+            // dynamic block with no intermediate ends, so `ends` was empty
+            // and `ends[ends.len() / 2]` panicked with index out of bounds.
+            let deflate = make_multi_block_deflate(&payload);
             let ends = collect_block_ends(&deflate);
+            assert!(
+                !ends.is_empty(),
+                "make_multi_block_deflate must produce ≥1 block boundary"
+            );
             let resume_at = ends
                 .iter()
                 .copied()

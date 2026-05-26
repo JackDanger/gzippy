@@ -306,7 +306,11 @@ mod tests {
             crc32_enabled: true,
         };
         let mut chunk = ChunkData::new(0, cfg);
-        chunk.append_clean(&[0u8; 50]);
+        // First subchunk needs > split_chunk_size = 100 decoded bytes for the
+        // gate at chunk_data.rs:append_block_boundary_at to materialize the
+        // second Subchunk. Was 50 bytes (pre-gate behavior); bumped to 150
+        // so the new vendor-parity gate at b529b3c still produces 2 subchunks.
+        chunk.append_clean(&[0u8; 150]);
         chunk.append_block_boundary(400);
         chunk.append_clean(&[0u8; 50]);
         chunk.finalize(800);
@@ -314,11 +318,12 @@ mod tests {
         append_subchunks_to_block_map(&m, &chunk);
         // Two subchunks pushed. data_block_count = 2 minus any EOS (none here).
         assert_eq!(m.data_block_count(), 2);
-        // First subchunk decoded_offset = 0; second's offset = 50.
+        // First subchunk decoded_offset = 0; second's offset = 150 (bytes from
+        // the first append_clean that pushed past the split-chunk gate).
         let first = m.get_encoded_offset(0).unwrap();
         assert_eq!(first.decoded_offset_in_bytes, 0);
         let second = m.get_encoded_offset(400).unwrap();
-        assert_eq!(second.decoded_offset_in_bytes, 50);
+        assert_eq!(second.decoded_offset_in_bytes, 150);
     }
 
     #[test]

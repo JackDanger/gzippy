@@ -1203,6 +1203,11 @@ mod tests {
         // Build a chunk with two subchunks: first at bit 100, second at bit 200,
         // chunk end at bit 300. max = 150 (range [100,150]).
         let mut chunk = ChunkData::new(100, small_config());
+        // Need enough decoded bytes in the first subchunk (> split_chunk_size = 100)
+        // for append_block_boundary_at to materialize a NEW subchunk per the
+        // vendor-parity gate at append_block_boundary_at:541. Without enough
+        // bytes the gate returns `true` for dedup but does not push a Subchunk.
+        chunk.append_clean(&[0u8; 150]);
         chunk.append_block_boundary(200);
         chunk.finalize(300);
         // Pretend the decoder set max via tryToDecode iteration; rapidgzip
@@ -1242,7 +1247,9 @@ mod tests {
         // boundary exactly), the first subchunk would collapse to zero
         // encoded_size and duplicate subchunks[1]'s key in the BlockMap.
         let mut chunk = ChunkData::new(100, small_config());
-        chunk.append_clean(&[0u8; 50]);
+        // First subchunk needs > split_chunk_size = 100 decoded bytes for the
+        // gate at append_block_boundary_at:541 to materialize a new Subchunk.
+        chunk.append_clean(&[0u8; 150]);
         chunk.append_block_boundary(400);
         chunk.append_clean(&[0u8; 50]);
         chunk.finalize(700);
