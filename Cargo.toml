@@ -104,6 +104,9 @@ tempfile = "3.8"
 assert_cmd = "2.0"
 predicates = "3.0"
 flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
+# Phase 0.6 spike: iai-callgrind for SIMD-fidelity test.
+# See plans/inner-loop-execution.md Phase 0.6.
+iai-callgrind = "0.13"
 
 [[bench]]
 name = "inflate_isal_vs_pure_rust"
@@ -114,6 +117,10 @@ required-features = ["isal-compression"]
 name = "bootstrap_marker_overhead"
 harness = false
 required-features = ["pure-rust-inflate"]
+
+[[bench]]
+name = "iai_simd_spike"
+harness = false
 
 [profile.release]
 lto = "fat"           # Full cross-crate LTO (slower build, faster binary)
