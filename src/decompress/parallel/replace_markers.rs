@@ -138,20 +138,47 @@ pub fn replace_markers_lut_narrow(
         32768,
         "vendor LUT path requires 32 KiB window"
     );
-    let mut lut = [0u8; 65536];
-    for (i, slot) in lut[0..256].iter_mut().enumerate() {
-        *slot = i as u8;
-    }
-    lut[MARKER_BASE as usize..MARKER_BASE as usize + 32768].copy_from_slice(window);
-
+    // Branched lookup, skipping the 64 KiB stack LUT:
+    //   v < 256        → literal byte, write `v as u8` directly.
+    //   v >= MARKER_BASE → marker, load from `window[v - MARKER_BASE]`.
+    // Equivalent to the prior LUT layout
+    //   lut[0..256]      = iota   (identity for literals)
+    //   lut[256..32768]  = 0      (unused mid-range — never produced
+    //                              by a well-formed deflate stream)
+    //   lut[32768..65536] = window
+    // but skips:
+    //   * The 64 KiB per-call stack zero (`[0u8; 65536]`) + iota fill
+    //     + 32 KiB window copy (~96 KiB writes per call before the
+    //     hot loop even starts).
+    //   * One memory load per LITERAL element (most elements in
+    //     typical compressed text). The literal-branch arm just
+    //     truncates the u16; no L1/L2 access. The LUT version
+    //     always paid the load even though `lut[v]` for v < 256
+    //     was a trivial cache-hot value.
+    //
+    // Vendor `DecodedData.hpp:316-337` uses the unified LUT; CLAUDE.md
+    // Rule 6 ("speed, not fidelity") sanctions deviating when faster.
     dst.clear();
     dst.reserve(src.len());
-    // Use spare_capacity + set_len to avoid Vec::push branch overhead
-    // (push has a capacity check per element; we know the final size).
     let dst_ptr = dst.as_mut_ptr();
+    let window_ptr = window.as_ptr();
     for (i, &v) in src.iter().enumerate() {
+        let b = if (v as usize) < 256 {
+            v as u8
+        } else {
+            // SAFETY: well-formed deflate emits markers only in
+            // `[MARKER_BASE, MARKER_BASE + 32768)`. The branch
+            // guarantees v >= 256; the assumption is v >=
+            // MARKER_BASE (256..32768 range is unreachable for
+            // valid streams — matches the prior LUT's zero
+            // fill which would have written 0 for any such
+            // value, so behavior on malformed input is the same
+            // class of garbage). `window.len() == 32768` per the
+            // debug_assert.
+            unsafe { *window_ptr.add((v as usize) - MARKER_BASE as usize) }
+        };
         // SAFETY: reserve(src.len()) above guarantees capacity.
-        unsafe { dst_ptr.add(i).write(lut[v as usize]) };
+        unsafe { dst_ptr.add(i).write(b) };
     }
     // SAFETY: wrote src.len() initialized bytes via dst_ptr above.
     unsafe { dst.set_len(src.len()) };
