@@ -6,6 +6,7 @@
 use crate::decompress::parallel::error::Error;
 use crate::decompress::parallel::huffman_base::LsbBitReader;
 use crate::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached;
+use crate::decompress::parallel::huffman_symbols_per_length::HuffmanCodingSymbolsPerLength;
 
 /// Mirror of `distanceLUT` (RFCTables.hpp:64-65).
 pub const DISTANCE_LUT: [u16; 30] = {
@@ -60,23 +61,14 @@ pub fn get_length_minus3<R: LsbBitReader>(code: u16, bit_reader: &mut R) -> Resu
     Ok((len - 3) as u8)
 }
 
-/// Mirror of `getDistance` for dynamic Huffman (RFCTables.hpp:126-157).
-///
-/// Vendor parity: the distance Huffman is the cached variant
-/// (`HuffmanCodingReversedBitsCached`), not the canonical
-/// `HuffmanCodingSymbolsPerLength`. perf record on the PGO build
-/// showed 8.85% of cycles in the slow canonical path; swapping to
-/// the cached variant matches vendor's `deflate.hpp:336`
-/// `DistanceHuffmanCoding = HuffmanCodingReversedBitsCached<...>`.
-pub fn get_distance_dynamic<R: LsbBitReader, const MAX_DIST: usize>(
-    distance_hc: &HuffmanCodingReversedBitsCached<MAX_DIST>,
+/// Apply extra-bits + base-distance lookup once the distance symbol
+/// is decoded. Mirror of the tail of `getDistance` (RFCTables.hpp:142-157).
+#[inline]
+fn apply_distance_extra<R: LsbBitReader>(
+    decoded: u16,
     bit_reader: &mut R,
 ) -> Result<u16, Error> {
-    let decoded = distance_hc
-        .decode(bit_reader)
-        .ok_or(Error::InvalidHuffmanCode)?;
     let mut distance = decoded;
-
     if distance <= 3 {
         distance += 1;
     } else if distance <= 29 {
@@ -93,4 +85,34 @@ pub fn get_distance_dynamic<R: LsbBitReader, const MAX_DIST: usize>(
         return Err(Error::InvalidHuffmanCode);
     }
     Ok(distance)
+}
+
+/// Mirror of `getDistance` for dynamic Huffman (RFCTables.hpp:126-157).
+///
+/// Vendor parity: vendor's `DistanceHuffmanCoding` is
+/// `HuffmanCodingReversedBitsCached` (deflate.hpp:336), the cached
+/// variant. perf record on a PGO build of gzippy showed 8.85% of
+/// inner-loop cycles in the slow canonical fallback; swapping to the
+/// cached variant matches vendor's choice.
+pub fn get_distance_dynamic<R: LsbBitReader, const MAX_DIST: usize>(
+    distance_hc: &HuffmanCodingReversedBitsCached<MAX_DIST>,
+    bit_reader: &mut R,
+) -> Result<u16, Error> {
+    let decoded = distance_hc
+        .decode(bit_reader)
+        .ok_or(Error::InvalidHuffmanCode)?;
+    apply_distance_extra(decoded, bit_reader)
+}
+
+/// Canonical-variant version of `get_distance_dynamic`, used by the
+/// legacy `run_canonical_loop!` macro and the `ShortBitsCachedDeflate`
+/// dispatcher that retain the `HuffmanCodingSymbolsPerLength` shape.
+pub fn get_distance_dynamic_canonical<R: LsbBitReader, const MAX_DIST: usize>(
+    distance_hc: &HuffmanCodingSymbolsPerLength<MAX_DIST>,
+    bit_reader: &mut R,
+) -> Result<u16, Error> {
+    let decoded = distance_hc
+        .decode(bit_reader)
+        .ok_or(Error::InvalidHuffmanCode)?;
+    apply_distance_extra(decoded, bit_reader)
 }
