@@ -214,11 +214,28 @@ fn decode_chunk_isal_impl(
     const STOP_INNER_ON_PENDING_FLUSH: bool = true;
 
     while !stopping_point_reached || wrapper.session_pending() {
-        let mut buffer: types::U8 = types::u8_with_capacity(ALLOCATION_CHUNK_SIZE);
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            buffer.set_len(ALLOCATION_CHUNK_SIZE)
-        };
+        // Write ISA-L output DIRECTLY into chunk.data's spare capacity.
+        // Previous version allocated a fresh `ALLOCATION_CHUNK_SIZE`
+        // (128 KiB) buffer per outer iteration, ran ISA-L into it, then
+        // called `append_owned_buffer` which either replaced
+        // chunk.data (first call — losing the 80 MiB pre-allocated
+        // pool buffer) or extend_from_slice'd it (subsequent calls —
+        // paying a memcpy + grow page faults). Per the bench-sm
+        // perf-dwarf profile this accounted for ~3.4% of total cycles
+        // (`append_owned_buffer → Vec::extend_from_slice → page fault`).
+        //
+        // Vendor pattern: `GzipChunk::readBlock` writes directly into
+        // the chunk's vector via `next_out`; no intermediate buffer.
+        // gzippy's `ChunkData::note_clean_bytes_written_in_place`
+        // helper was already in place (chunk_data.rs:405) — this just
+        // wires it up.
+        let prev_data_len = chunk.data.len();
+        // Reserve at least ALLOCATION_CHUNK_SIZE of spare capacity.
+        // chunk.data starts with `max_decoded_chunk_size` (80 MiB)
+        // capacity from `take_u8`, so this is a no-op until we exceed
+        // that — at which point amortized growth handles it.
+        chunk.data.reserve(ALLOCATION_CHUNK_SIZE);
+        let buffer_cap = ALLOCATION_CHUNK_SIZE;
         let mut n_bytes_read: usize = 0;
         let mut last_per_call: usize = 0;
         let mut last_stopped_at = StoppingPoints::NONE;
@@ -226,14 +243,27 @@ fn decode_chunk_isal_impl(
         let mut end_of_stream_hit = false;
 
         let decode_base = already_decoded;
-        while n_bytes_read < buffer.len()
+        while n_bytes_read < buffer_cap
             && !stopping_point_reached
             && !(STOP_INNER_ON_PENDING_FLUSH
                 && pending_stop_after_flush
                 && !wrapper.session_pending())
         {
             let bit_before_read = wrapper.tell_compressed();
-            let r = wrapper.read_stream(&mut buffer[n_bytes_read..])?;
+            // SAFETY: we reserved `ALLOCATION_CHUNK_SIZE` of spare
+            // capacity above; `prev_data_len + n_bytes_read` is within
+            // the allocation and the slice covers
+            // `[prev_data_len + n_bytes_read, prev_data_len + buffer_cap)`
+            // bytes which are uninitialized but writable. ISA-L writes
+            // monotonically forward; we only `set_len` AFTER the inner
+            // loop has decided how many bytes are valid.
+            let spare: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    chunk.data.as_mut_ptr().add(prev_data_len + n_bytes_read),
+                    buffer_cap - n_bytes_read,
+                )
+            };
+            let r = wrapper.read_stream(spare)?;
             last_per_call = r.bytes_written;
             n_bytes_read += last_per_call;
             chunk.note_inner_decoded_bytes(last_per_call);
@@ -333,9 +363,14 @@ fn decode_chunk_isal_impl(
             // all bytes in this buffer are tail output from the same block.
             append_len = n_bytes_read;
         }
-        buffer.truncate(append_len);
-        if !buffer.is_empty() {
-            chunk.append_owned_buffer(buffer);
+        if append_len > 0 {
+            // Commit the bytes ISA-L wrote into chunk.data's spare
+            // capacity, update CRC + statistics in one pass. Bytes
+            // beyond `prev_data_len + append_len` (between EOB and the
+            // truncate point) are left uninitialized in the Vec — the
+            // NEXT outer iteration will overwrite them starting at
+            // `chunk.data.len() = prev_data_len + append_len`.
+            chunk.note_clean_bytes_written_in_place(prev_data_len, append_len, true);
         }
         already_decoded = decode_base + append_len;
 
