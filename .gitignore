@@ -1,5 +1,6 @@
 # Build artifacts
 /target/
+**/target/
 Cargo.lock
 
 # Test data (generated, not the seed)
