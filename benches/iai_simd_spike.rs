@@ -81,11 +81,19 @@ fn make_popcount_input() -> [u64; 256] {
 
 // ── Test 2: narrow u16→u8 (the actual SIMD path we'd use in Phase 5) ────────
 
-/// Scalar narrow: u16[N] → u8[N], truncating cast.
+/// Genuinely scalar narrow: u16[N] → u8[N], truncating cast.
+/// `black_box` inside the loop body defeats LLVM's auto-vectorizer.
+/// Without this, `target-cpu=x86-64-v3` lowers a naive zip-iter loop to
+/// AVX2 packus, making the "scalar" baseline indistinguishable from the
+/// hand-rolled AVX2 variant.
 #[inline(never)]
 fn narrow_scalar(src: &[u16; 1024], dst: &mut [u8; 1024]) {
-    for (s, d) in src.iter().zip(dst.iter_mut()) {
-        *d = *s as u8;
+    for i in 0..1024 {
+        // black_box on the read prevents LLVM from recognizing the
+        // memory-to-memory truncating-narrow pattern. Per-element load
+        // and store are scalar.
+        let v = black_box(src[i]);
+        dst[i] = v as u8;
     }
 }
 
