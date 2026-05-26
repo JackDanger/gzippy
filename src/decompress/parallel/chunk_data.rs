@@ -881,26 +881,29 @@ impl ChunkData {
     /// per-subchunk windows are derived from the chunk's own resolved
     /// output prefixed by the predecessor's tail window.
     ///
+    /// `dwm_bytes` must equal the u8 narrow of `data_with_markers`
+    /// post-`apply_window` (i.e., the buffer the consumer will later
+    /// write to the output). Callers narrow once and reuse the buffer
+    /// here so this routine does NOT re-narrow `data_with_markers`.
+    ///
     /// Literal port of the window-emplacement step in rapidgzip's
     /// `appendSubchunksToIndexes` cascade
     /// (vendor/.../GzipChunkFetcher.hpp:560-580): for each subchunk's
     /// `decodedOffset`, the window is the 32 KiB immediately preceding
     /// that offset in the concatenated `predecessor_window ++ data_with_markers ++ data`.
-    pub fn populate_subchunk_windows(&mut self, predecessor_window: &[u8]) {
+    pub fn populate_subchunk_windows(&mut self, predecessor_window: &[u8], dwm_bytes: &[u8]) {
         const W: usize = 32768;
         debug_assert_eq!(predecessor_window.len(), W);
         debug_assert!(
             self.data_with_markers.iter().all(|v| *v < MARKER_BASE),
             "populate_subchunk_windows requires apply_window already ran"
         );
+        debug_assert_eq!(
+            dwm_bytes.len(),
+            self.data_with_markers.len(),
+            "populate_subchunk_windows requires narrowed dwm_bytes matching data_with_markers length"
+        );
 
-        // Pre-materialize `data_with_markers` as bytes (markers are all
-        // resolved, debug_assert above guarantees v < MARKER_BASE so the
-        // `as u8` is lossless). One allocation up front avoids paying
-        // O(W) per-byte u16→u8 conversion inside the per-subchunk loop.
-        // For the typical chunk this is at most a few hundred KiB and
-        // happens once instead of N_subchunks × W times.
-        let dwm_bytes: Vec<u8> = self.data_with_markers.iter().map(|v| *v as u8).collect();
         let dwm_len = dwm_bytes.len();
 
         for sc in self.subchunks.iter_mut() {
