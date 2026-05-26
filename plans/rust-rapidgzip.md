@@ -35,16 +35,27 @@ service of that.
 
 | Metric | Value |
 |---|---:|
-| gzippy mean throughput | **~740 MB/s** |
-| gzippy best single run | **851 MB/s** |
-| gzippy best raw wall | **0.55 s** |
-| rapidgzip mean | ~1400 MB/s |
-| gzippy / rapidgzip ratio | **0.53×** (≈ 1.9× behind) |
-| Total cycles per 5-iter perf record | ~62.9 B |
+| gzippy mean throughput | **772 MB/s** (was 740 before `8ef7a4e`) |
+| gzippy best single run | **800 MB/s** |
+| gzippy best raw wall | **0.630 s** |
+| rapidgzip mean (same run) | 1251 MB/s |
+| gzippy / rapidgzip ratio | **0.62×** (was 0.53×) |
+| Total cycles per 5-iter perf record | ~62.9 B (pre-CRC-move) |
 
 Compared to the session-start baseline at commit `73c4a21` (BitReader
-8-byte refill), throughput is **+75 %** (423 → 740 MB/s) and the ratio
-vs rapidgzip closed from 0.30× to 0.53×.
+8-byte refill), throughput is **+82 %** (423 → 772 MB/s) and the ratio
+vs rapidgzip closed from 0.30× to 0.62×. The +17 % ratio jump from
+0.53× → 0.62× came from commit `8ef7a4e` (move narrowed-bytes CRC32
+from consumer to post-process worker, vendor parity).
+
+### Note on absolute numbers vs ratio
+
+The 1400 MB/s rapidgzip number that previously appeared in this doc
+came from a less-loaded snapshot of neurotic; on the 2026-05-26 bench
+both gzippy and rapidgzip wall numbers were lower (system busier).
+The **ratio** is the controlled measurement — bench-sm runs both
+binaries on the same host in the same window. Quote ratios when
+comparing across sessions; absolute MB/s only inside a single run.
 
 ### Top of profile, post-iteration
 
@@ -370,61 +381,78 @@ Signs you've reached this point:
 Ranked by evidence-strength for the win, with the surgical reverts
 documented so they're not re-tried without new information.
 
-### Structural candidates (the things to try first when surgical is exhausted)
+### Status of the original S1–S4 candidates (2026-05-26 update)
 
-#### S1. Pre-fault chunk buffers via `MADV_POPULATE_WRITE`
+- **S1 (madvise pre-fault) — FALSIFIED.** rpmalloc-per-Vec is already
+  deployed via `arena-allocator` feature (`Cargo.toml:39, 51`;
+  `rpmalloc_alloc.rs`). `clear_page_erms` at 17.8 % is at vendor parity
+  (vendor ~17 %). The `0da3530` pre-allocate attempt regressed; remaining
+  surgical surface is at-floor. Don't reattempt without daemon-mode
+  amortization across invocations.
+- **S2 (out-of-order drain) — FALSIFIED.** Writer must emit in order;
+  CRC32 must combine in order. Out-of-order *completion* doesn't
+  reduce wall because the slow chunk is on the critical path — it
+  has to finish before its bytes are written. Memory cost real
+  (~500 MB reorder buffer); benefit unclear.
+- **S3 (global BlockBoundaryIndex) — FALSIFIED.** The current
+  `with_sync_boundary_search` (`0abc483`) runs boundary scan
+  per-chunk *in parallel* with decode. Doing it once up-front adds
+  ~700 ms sequential CPU to the critical path (less if parallelized
+  but then it's no longer "global, once").
+- **S4 (segmented `chunk.data`) — PENDING.** Still real (~2 %
+  cycles). Invasive (touches writer drain, `populate_subchunk_windows`,
+  `get_last_window`); land only after the bigger-shape wins.
 
-**Evidence.** `clear_page_erms` at 17.8 % of cycles. Pre-allocating
-`data_with_markers` capacity (commit `0da3530`) did NOT help — the
-problem is first-touch fault timing, not allocation. Linux
-`MADV_POPULATE_WRITE` (5.14+) commits and zeros pages at madvise
-time, so the worker's first write doesn't fault.
+### Vendor-parity divergences from this session's archaeology
 
-**Risk.** The madvise cost itself is the same total page-zero time;
-it's just MOVED off the worker's critical path. Net win only if the
-madvise can be done in a quiescent moment (e.g. process startup) or
-on a non-bottleneck thread. If done inline in the worker, it's a
-wash.
+Read with: vendor file:line + gzippy file:line. Each labeled by
+remaining surface area to land it.
 
-**Sketch.** At `ChunkData::new`'s `take_u8` / `take_u16`, when the
-pool returns a fresh buffer, madvise the entire capacity. Subsequent
-worker chunks reuse the pre-faulted buffer.
+- **CRC of resolved marker bytes — LANDED (`8ef7a4e`).** Vendor's
+  `ChunkData::applyWindow` (`vendor/.../ChunkData.hpp:313-328`) CRCs
+  the resolved marker bytes on the worker; we deferred to the consumer.
+  Moved to `run_post_process_task` (`chunk_fetcher.rs:1672-1685`);
+  ratio 0.53× → 0.62× (+17 % relative).
+- **Proactive post-process pipelining — OPEN (medium surface).**
+  Vendor `waitForReplacedMarkers` → `queuePrefetchedChunkPostProcessing`
+  (`vendor/.../GzipChunkFetcher.hpp:521-551`) iterates the prefetch
+  cache before blocking and submits post-process for every prefetched
+  chunk whose predecessor window is published. Gzippy only submits
+  post-process from the consumer's main loop (`chunk_fetcher.rs:1269`),
+  so the post-process pipeline serializes through the consumer.
+  Simpler shape (chain post-process inline at the end of
+  `run_decode_task` when the predecessor window is already in
+  `window_map`) has subtleties: `replace_markers_lut_narrow` doesn't
+  clear `chunk.data_with_markers`, so the consumer's marker-vs-clean
+  branch at `chunk_fetcher.rs:1119` would still take the marker path
+  on an already-resolved chunk. Needs either a `chunk.post_processed`
+  flag + new consumer branch, OR clear `data_with_markers` and
+  refactor the tail-window publish to use `chunk.narrowed` for the
+  trailing bytes.
+- **`narrow_u16_to_u8` AVX2 disabled — OPEN (one env flip + verify).**
+  AVX2 path at `chunk_fetcher.rs:1736` exists but is env-gated due to
+  a suspected AVX2-license downclock through `apply_window`'s SIMD
+  (`chunk_fetcher.rs:1707-1715`). Only matters for the non-fused
+  path (small marker chunks < 128 KiB); silesia bench-sm never enters
+  this path, so the win is for other workloads.
+- **`publish_subchunk_windows` runs on consumer — OPEN (light surgical).**
+  `chunk_fetcher.rs:2096`. Per-subchunk window_map insert serialized
+  on consumer thread; could move to the worker right after
+  `populate_subchunk_windows` (`chunk_fetcher.rs:1670`). Risk: ordering
+  vs consumer's tail-window publish at `chunk_fetcher.rs:1130/1195`.
+  Light work per chunk (only multi-subchunk chunks pay).
+- **`insert_bytes_with_compression` allocates fresh `CompressedVector`
+  per insert — OPEN (small).** `chunk_fetcher.rs:1130, 1195`. Each
+  insert copies the 32 KiB tail into a new buffer. Vendor uses
+  `shared_ptr<const CompressedVector>` and inserts the existing Arc.
+  Could take `Arc<[u8; 32768]>` directly.
+- **`ChunkData::clone` on `Arc::try_unwrap` miss — OPEN (verify-first).**
+  `chunk_fetcher.rs:1086`. Diagnostic counter `ARC_TRY_UNWRAP_MISSES`
+  tracks this; if non-zero in production, a per-chunk MB-scale clone
+  sits on the consumer thread. Check the counter on a verbose run
+  before acting.
 
-#### S2. Out-of-order chunk completion + reorder buffer
-
-**Evidence.** Wall is bounded by MAX worker chunk time (~87 ms per
-the old floor). Workers are 32 % CPU-utilized on average. The slow
-chunk pins wall while other workers idle waiting for it to drain
-through the FIFO.
-
-**Risk.** Vendor (rapidgzip) uses strict FIFO too, so this deviates
-from the reference architecture. Out-of-order completion needs an
-output reorder buffer keyed by chunk decoded-offset. Memory cost is
-real (peak Vec is total chunk output ≈ 500 MB on silesia-large).
-
-**Sketch.** Workers write to per-chunk `narrowed` + `data` as today,
-but the FIFO drain is replaced with a `BTreeMap<decoded_offset,
-ChunkData>` that releases sequentially as gaps close. Combined CRC
-still has to assemble in order — keep the per-chunk CRC, append in
-decoded-offset order when releasing.
-
-#### S3. Eliminate the per-chunk BlockFinder coordinator altogether
-
-**Evidence.** `with_sync_boundary_search` (this session's `0abc483`)
-eliminated the thread spawn but still runs BlockFinder per chunk.
-A SINGLE global BlockFinder pass over the entire input — pre-decode —
-produces all block boundaries once. Workers index into the boundary
-list instead of scanning.
-
-**Risk.** The global pass is sequential and competes for the same
-CPU as the consumer. Total scan work ≈ 700 ms per single
-decompression (per the spawn-breakdown stats); spread across the
-length of the input, that's a substantial up-front cost. May be net
-loss for small inputs.
-
-**Sketch.** Add a `BlockBoundaryIndex` that runs on the main thread
-during the initial header-parse window. Workers consult the index
-instead of calling `with_sync_boundary_search`.
+### Open S4 candidate (re-stated)
 
 #### S4. Segmented `chunk.data` to avoid `absorb_isal_tail`'s memmove
 
