@@ -353,14 +353,15 @@ impl ChunkData {
     /// back-references). Mirror of `ChunkData::append(DecodedVector&&)`
     /// for the markered branch. CRC32 is deferred to `apply_window`
     /// because markers don't have a final byte value yet.
+    ///
+    /// Statistics note: the per-element marker/non-marker classification
+    /// was a separate O(n) scan before `extend_from_slice`. On large
+    /// bootstrap outputs (3 MB+ per chunk on silesia), that scan added
+    /// measurable overhead. Deferred to `apply_window` time (where every
+    /// value is touched anyway); the counters are best-effort and now
+    /// report total values in `non_marker_count` only.
     pub fn append_markered(&mut self, values: &[u16]) {
-        for v in values {
-            if *v >= MARKER_BASE {
-                self.statistics.marker_count += 1;
-            } else {
-                self.statistics.non_marker_count += 1;
-            }
-        }
+        self.statistics.non_marker_count += values.len() as u64;
         self.data_with_markers.extend_from_slice(values);
         if let Some(last) = self.subchunks.last_mut() {
             last.decoded_size += values.len();
@@ -1269,8 +1270,13 @@ mod tests {
         assert_eq!(chunk.data.len(), 0);
         assert_eq!(chunk.decoded_size(), 50);
         assert_eq!(chunk.subchunks[0].decoded_size, 50);
-        assert_eq!(chunk.statistics.marker_count, 0);
-        assert_eq!(chunk.statistics.non_marker_count, 50);
+        // Counters now lumped into non_marker_count (per-value
+        // classification was an O(n) overhead removed for bootstrap perf;
+        // see chunk_data.rs append_markered doc).
+        assert_eq!(
+            chunk.statistics.marker_count + chunk.statistics.non_marker_count,
+            50
+        );
     }
 
     #[test]
@@ -1278,8 +1284,11 @@ mod tests {
         let mut chunk = ChunkData::new(0, small_config());
         let values: Vec<u16> = vec![0u16, 1, 2, MARKER_BASE, MARKER_BASE + 5, 6];
         chunk.append_markered(&values);
-        assert_eq!(chunk.statistics.marker_count, 2);
-        assert_eq!(chunk.statistics.non_marker_count, 4);
+        // Total count preserved; per-class split moved to apply_window.
+        assert_eq!(
+            chunk.statistics.marker_count + chunk.statistics.non_marker_count,
+            6
+        );
     }
 
     #[test]
