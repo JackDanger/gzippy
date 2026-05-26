@@ -131,11 +131,14 @@ strip = true          # Remove symbols for smaller binary
 
 # iai-callgrind requires debug symbols to find its instrumented sentinels;
 # the stripped release profile breaks it. Keep release-grade optimization
-# but retain symbols for cachegrind output parsing.
+# but retain full debug info for cachegrind output parsing.
+# LTO disabled here because iai-callgrind's sentinel-finder doesn't work
+# well with fat LTO (sentinels can be merged across translation units).
 [profile.bench]
 inherits = "release"
 strip = false
-debug = "line-tables-only"
+debug = true
+lto = false
 
 # Enable native CPU optimizations when building locally
 # (commented out for portable binaries - uncomment for max local perf)
