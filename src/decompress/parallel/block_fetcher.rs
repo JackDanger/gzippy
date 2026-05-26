@@ -889,15 +889,20 @@ mod tests {
     }
 
     #[test]
-    fn prefetched_block_promotes_to_main_cache_on_get() {
+    fn prefetched_block_is_evicted_on_get_without_promotion() {
+        // Lever G (commit 4890e81): the single-pass forward consumer never
+        // re-gets the same key, so the old prefetch→main-cache PROMOTE held
+        // a redundant Arc ref that forced the consumer's `Arc::try_unwrap`
+        // to deep-clone (~7ms × 24 chunks). Behavior changed: `get_if_available`
+        // on a prefetch hit now EVICTS from prefetch_cache and returns the
+        // value WITHOUT promoting to the main cache.
         let bf = new_fetcher();
         bf.insert_prefetched(200, "pre-200".into());
         assert_eq!(bf.prefetch_cache_size(), 1);
         let v = bf.get_if_available(&200);
         assert_eq!(v, Some("pre-200".into()));
-        // After promotion, main cache has it (prefetch_cache still has it
-        // too — Cache::get does NOT evict; promotion just inserts into main).
-        assert_eq!(bf.cache_size(), 1);
+        // Post-Lever-G: prefetch evicted, main cache NOT populated.
+        assert_eq!(bf.cache_size(), 0);
     }
 
     #[test]
@@ -928,10 +933,14 @@ mod tests {
 
     #[test]
     fn statistics_track_hits_and_prefetch_count() {
+        // Lever G (4890e81): no promotion. The second `get_if_available`
+        // after the first one drained the prefetch_cache returns None
+        // — it's a miss, not a main-cache hit. Statistics still record
+        // the original prefetch insertion + the one prefetch hit.
         let bf = new_fetcher();
         bf.insert_prefetched(500, "p".into());
-        let _ = bf.get_if_available(&500); // prefetch hit
-        let _ = bf.get_if_available(&500); // main cache hit (promoted)
+        let _ = bf.get_if_available(&500); // prefetch hit, evicts
+        let _ = bf.get_if_available(&500); // miss (no promotion under Lever G)
         let snap = bf.statistics.base.snapshot();
         assert!(snap.prefetch_count >= 1);
         assert!(snap.prefetch_cache_hits >= 1);
@@ -996,9 +1005,13 @@ mod tests {
             .unwrap();
         assert_eq!(v, "prefetched");
         assert!(!dispatched);
-        // Prefetch receiver was consumed; cache holds the result now.
+        // Prefetch receiver was consumed. Lever G (4890e81): no promotion
+        // to main cache — single-pass forward consumer never re-gets the
+        // same key, so the prefetch→main-cache promote was holding a
+        // redundant Arc ref. Post-Lever-G, the in-flight receiver is
+        // drained and the result is returned WITHOUT entering main cache.
         assert!(!bf.prefetch_in_flight(&900));
-        assert_eq!(bf.cache_size(), 1);
+        assert_eq!(bf.cache_size(), 0);
     }
 
     #[test]
