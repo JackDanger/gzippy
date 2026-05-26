@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/user/www/gzippy-perf-pure-rust-inflate/tools/extract_blocks/target/release/build/libz-ng-sys-0817446114111cc0/out/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

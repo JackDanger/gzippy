@@ -126,8 +126,11 @@ fn narrow_avx2(src: &[u16; 1024], dst: &mut [u8; 1024]) {
 }
 
 #[cfg(not(target_feature = "avx2"))]
-fn narrow_avx2(src: &[u16; 1024], dst: &mut [u8; 1024]) {
-    narrow_scalar(src, dst);
+fn narrow_avx2(_src: &[u16; 1024], _dst: &mut [u8; 1024]) {
+    panic!(
+        "iai_simd_spike requires AVX2 (target-cpu=x86-64-v3); \
+         silently falling back to scalar would confound the measurement."
+    );
 }
 
 fn make_narrow_input() -> Box<([u16; 1024], [u8; 1024])> {

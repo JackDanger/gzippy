@@ -1,0 +1,19 @@
+[package]
+name = "gzippy-extract-blocks"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 1.1 corpus extractor: dump dynamic-Huffman DEFLATE blocks from silesia for use by the inner-loop microbench"
+
+[[bin]]
+name = "gzippy-extract-blocks"
+path = "src/main.rs"
+
+[dependencies]
+# Use gzippy's Block + Bits directly for vendor-parity extraction
+# (matches the production decode path; corpus is self-consistent).
+gzippy = { path = "../..", features = ["pure-rust-inflate"] }
+libdeflater = "1.0"
+crc32fast = "1"
+
+[lints.clippy]
+all = "deny"
