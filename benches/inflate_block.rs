@@ -24,7 +24,7 @@ use gzippy::decompress::parallel::deflate_block::Block;
 
 #[path = "common/corpus_loader.rs"]
 mod corpus_loader;
-use corpus_loader::{load_corpus, corpus_dir, CorpusBlock};
+use corpus_loader::{corpus_dir, load_corpus, CorpusBlock};
 
 /// Decode one block from a corpus entry with the window already seeded.
 /// Buffers come from the caller (hoisted; allocator noise not measured).

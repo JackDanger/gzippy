@@ -29,15 +29,12 @@ impl CorpusBlock {
         if &data[..8] != b"GZBLK01\0" {
             return Err(format!("{}: bad magic", file_name));
         }
-        let read_u32 = |off: usize| -> u32 {
-            u32::from_le_bytes(data[off..off + 4].try_into().unwrap())
-        };
-        let read_u64 = |off: usize| -> u64 {
-            u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
-        };
-        let read_u16 = |off: usize| -> u16 {
-            u16::from_le_bytes(data[off..off + 2].try_into().unwrap())
-        };
+        let read_u32 =
+            |off: usize| -> u32 { u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) };
+        let read_u64 =
+            |off: usize| -> u64 { u64::from_le_bytes(data[off..off + 8].try_into().unwrap()) };
+        let read_u16 =
+            |off: usize| -> u16 { u16::from_le_bytes(data[off..off + 2].try_into().unwrap()) };
         let block_idx = read_u32(8);
         let _btype = read_u32(12);
         let bit_offset_in_compressed = read_u64(16);
@@ -85,12 +82,7 @@ pub fn load_corpus(dir: impl AsRef<Path>) -> Vec<CorpusBlock> {
     let mut blocks: Vec<CorpusBlock> = fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("read_dir({}): {e}", dir.display()))
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|x| x == "bin")
-                .unwrap_or(false)
-        })
+        .filter(|e| e.path().extension().map(|x| x == "bin").unwrap_or(false))
         .map(|e| {
             let path = e.path();
             let file_name = path.file_name().unwrap().to_string_lossy().to_string();

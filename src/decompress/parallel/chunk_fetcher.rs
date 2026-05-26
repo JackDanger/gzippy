@@ -937,7 +937,9 @@ fn consumer_loop<W: std::io::Write>(
                     );
                 }
             };
-            if let Some(Ok(arc)) = block_fetcher.try_take_prefetched_pumping(&partition_offset, pump) {
+            if let Some(Ok(arc)) =
+                block_fetcher.try_take_prefetched_pumping(&partition_offset, pump)
+            {
                 // Vendor GzipChunkFetcher.hpp:646-648 — accept the chunk
                 // only if `matchesEncodedOffset(blockOffset)`. If not,
                 // discard and dispatch on-demand at the real offset.
@@ -1805,8 +1807,7 @@ pub static PREFETCH_REJECT_BY_GUARD: std::sync::atomic::AtomicU64 =
 /// Lever G diagnostic: counts how often the consumer's
 /// `Arc::try_unwrap(chunk_arc)` actually succeeded (HITS) vs fell back
 /// to a deep clone (MISSES). Goal: HITS == chunk count, MISSES == 0.
-pub static ARC_TRY_UNWRAP_HITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static ARC_TRY_UNWRAP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ARC_TRY_UNWRAP_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
