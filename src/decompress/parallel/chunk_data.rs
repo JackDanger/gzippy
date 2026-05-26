@@ -219,25 +219,32 @@ impl ChunkData {
     pub fn new(encoded_offset_bits: usize, configuration: ChunkConfiguration) -> Self {
         use crate::decompress::parallel::chunk_buffer_pool;
         let cap = configuration.max_decoded_chunk_size;
-        // `data_with_markers` is allocated lazily — the fast path
-        // (window known) never emits markers, so paying for the
-        // capacity reservation up front is wasted address space AND
-        // wasted page commits if the worker writes anywhere into it
-        // (e.g. `Vec::truncate` does not, but a later `extend` would).
-        // Slow-path workers call `append_markered` which grows the
-        // Vec from zero on demand; the pool's `take_u16` returns
-        // recycled Vecs at that point so growth is amortized.
+        // Pre-allocate `data_with_markers` to the same chunk-output
+        // ceiling as `data`. Speculative chunks (no predecessor
+        // window) push EVERY decoded byte into `data_with_markers`
+        // as u16 markers — growth from cap-0 was 2.41% of total
+        // bench-sm cycles in `clear_page_erms` per the
+        // `append_markered → extend_from_slice → asm_exc_page_fault`
+        // callgraph (post-absorb-isal-tail commit 9053895).
         //
-        // Vendor parity: `ChunkData::data_with_markers` is a
-        // FasterVector<uint16_t> that's default-constructed (empty)
-        // and only grown when the marker pipeline emits markers
-        // (ChunkData.hpp uses `subchunks.back().data.push_back(...)`).
-        // Allocating max-size up front was a gzippy-specific
-        // pre-emptive sizing that defied the vendor pattern.
+        // The earlier "lazy-init wastes page commits" worry was a
+        // misreading of Linux's overcommit semantics: virtual
+        // address reservation costs NO physical pages until the
+        // worker actually writes into the buffer. Fast-path chunks
+        // (predecessor window known → no markers emitted) keep
+        // `data_with_markers.len() == 0`, never write, and pay
+        // zero page commits despite the upfront capacity. Slow-path
+        // chunks write up to `cap` u16 elements — pre-allocating
+        // means ONE first-touch sweep instead of log₂(N) doubling
+        // reallocs + copies.
+        //
+        // `cap` is in output-byte units; data_with_markers is u16
+        // element-count, but each u16 corresponds to one output
+        // byte, so `cap` is the correct element count too.
         Self::new_with_buffers(
             encoded_offset_bits,
             configuration,
-            chunk_buffer_pool::take_u16(0),
+            chunk_buffer_pool::take_u16(cap),
             chunk_buffer_pool::take_u8(cap),
             chunk_buffer_pool::current_worker_pool_index().unwrap_or(0),
         )
