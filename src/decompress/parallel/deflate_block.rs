@@ -999,23 +999,26 @@ impl Block {
         }
 
         while emitted < n_max_to_decode {
-            // Single refill at the top of the outer iteration. After
-            // `bits.refill()` returns, `bits.available()` is in
-            // [56, 63] (libdeflate-style refill rounds DOWN to a
-            // multiple of 8 plus the residue) — well above the 48
-            // bits a worst-case back-ref iter consumes (20 for
-            // lit/len decode + 15 for dist decode + 13 for dist extra).
-            // With this guarantee, the per-decode `< 32` checks
-            // inside `IsalLitLenCode::decode`, `IsalDistCode::decode`,
-            // and the dist-extra `ensure_bits` all become
-            // predictably-false branches that never trigger the
-            // expensive 8-byte unaligned load. Net: ~1-2 refills
-            // saved per iter on back-ref-heavy chunks.
+            // Top-of-iter refill guarantees `bits.available() >= 48`
+            // (worst-case iter: 20 lit/len + 15 dist + 13 dist-extra),
+            // so the per-decode `< 32` checks inside
+            // `IsalLitLenCode::decode` / `IsalDistCode::decode` /
+            // dist-extra become predictably-false branches.
             //
-            // Calling refill when already near-full is a no-op:
-            // `refill` advances `pos` by 0 when `bitsleft >= 56`
-            // (see consume_first_decode.rs:259).
-            bits.refill();
+            // Guard against the wasted load when bitsleft is
+            // already in the saturated range: `Bits::refill`'s
+            // fast path UNCONDITIONALLY executes an unaligned
+            // u64 load + OR + shift even when `pos` won't advance
+            // (see consume_first_decode.rs:255-263). Per the
+            // bench-sm profile post-absorb-isal-tail, that wasted
+            // work was 1.37% of total cycles attributed to
+            // `Bits::refill`. For literal-only iter runs
+            // (consuming ~12 bits each), bitsleft stays >= 56
+            // for several iters before dropping — this skips
+            // those wasted no-op refills entirely.
+            if (bits.bitsleft as u8) < 56 {
+                bits.refill();
+            }
             let decoded = self.isal_litlen.decode(bits);
             if decoded.bit_count == 0 {
                 // Inside `IsalLitLenCode::decode`, `symbol` is set to
