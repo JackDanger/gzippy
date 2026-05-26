@@ -115,16 +115,11 @@ static size_t decode_one(const CorpusBlock& blk) {
     if constexpr (!IsBootstrap) {
         // Fast path: seed window with predecessor. setInitialWindow flips
         // containsMarkerBytes off so back-refs resolve to clean bytes.
-        // Vendor signature: setInitialWindow(VectorView<uint8_t>)
+        // Vendor signature: void setInitialWindow(VectorView<uint8_t> const&)
         VectorView<uint8_t> window(
             blk.predecessor.data(),
             blk.predecessor.size());
-        const auto err = block.setInitialWindow(window);
-        if (err != Error::NONE) {
-            std::cerr << "setInitialWindow err on " << blk.file_name << ": "
-                      << static_cast<int>(err) << "\n";
-            std::exit(3);
-        }
+        block.setInitialWindow(window);
     }
     // For bootstrap: no setInitialWindow; ring stays in marker mode.
 
