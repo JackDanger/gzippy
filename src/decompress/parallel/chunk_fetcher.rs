@@ -1623,29 +1623,48 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
     let t_materialize = std::time::Instant::now();
     let bytes = materialize_window(&predecessor_window);
     let materialize_us = t_materialize.elapsed().as_micros();
+    // For chunks at or above the vendor LUT threshold (≥128 Ki u16
+    // markers ≈ 256 KiB of marker prefix), fuse `replace_markers` +
+    // `narrow_u16_to_u8` into one pass that reads u16 and writes the
+    // resolved u8 directly into `chunk.narrowed`. Vendor parity:
+    // `DecodedData.hpp:316-337` writes `target[i] = fullWindow[chunk[i]]`
+    // in a single LUT pass. Below the threshold, the LUT construction
+    // overhead (64 KiB stack zeroing + 32 KiB window copy ≈ 96 KiB)
+    // dominates so we keep the existing two-pass path (AVX2 in-place
+    // replace + scalar narrow).
+    use crate::decompress::parallel::replace_markers::replace_markers_lut_narrow;
+    const LUT_FUSE_THRESHOLD: usize = 128 * 1024;
+    let dwm_len_pre = chunk.data_with_markers.len();
+    let use_fused = dwm_len_pre >= LUT_FUSE_THRESHOLD && bytes.len() == 32768;
     let t_apply = std::time::Instant::now();
-    apply_window(&mut chunk, &bytes);
-    let apply_us = t_apply.elapsed().as_micros();
-    // Worker-side narrow: produce `chunk.narrowed` so the single
-    // consumer thread doesn't pay the ~24ms / 3.3MiB scalar narrow
-    // per chunk that previously dominated wall time on real silesia
-    // (`plans/pure-rust-perf.md` consumer-narrow finding). Pool-
-    // recycles a u8 buffer rather than allocating per chunk.
-    //
-    // Narrow happens BEFORE populate_subchunk_windows so the latter
-    // can reuse the already-narrowed buffer instead of doing its own
-    // scalar u16→u8 pass (was chunk_data.rs:903 pre-fuse). Saves one
-    // full pass over `data_with_markers` per chunk on the worker.
-    let t_narrow = std::time::Instant::now();
     let mut narrowed_buf: Option<crate::decompress::parallel::rpmalloc_alloc::types::U8> = None;
-    if !chunk.data_with_markers.is_empty() {
+    let t_narrow;
+    let narrow_us;
+    if use_fused {
+        // Fused path. `apply_window` is skipped entirely on this branch:
+        // markers in `chunk.data_with_markers` are left in-place (no
+        // downstream reader inspects them after this point — populate
+        // takes `dwm_bytes` and the consumer writes `chunk.narrowed`).
         use crate::decompress::parallel::chunk_buffer_pool;
-        let dwm_len = chunk.data_with_markers.len();
-        let mut narrowed = chunk_buffer_pool::take_u8(dwm_len);
-        narrow_u16_to_u8(&chunk.data_with_markers, &mut narrowed);
+        let mut narrowed = chunk_buffer_pool::take_u8(dwm_len_pre);
+        replace_markers_lut_narrow(&chunk.data_with_markers, &bytes, &mut narrowed);
         narrowed_buf = Some(narrowed);
+        t_narrow = std::time::Instant::now();
+        narrow_us = 0u128;
+    } else {
+        apply_window(&mut chunk, &bytes);
+        t_narrow = std::time::Instant::now();
+        if !chunk.data_with_markers.is_empty() {
+            use crate::decompress::parallel::chunk_buffer_pool;
+            let dwm_len = chunk.data_with_markers.len();
+            let mut narrowed = chunk_buffer_pool::take_u8(dwm_len);
+            narrow_u16_to_u8(&chunk.data_with_markers, &mut narrowed);
+            narrowed_buf = Some(narrowed);
+        }
+        narrow_us = t_narrow.elapsed().as_micros();
     }
-    let narrow_us = t_narrow.elapsed().as_micros();
+    let apply_us = t_apply.elapsed().as_micros();
+    let _ = t_narrow;
     let t_pop = std::time::Instant::now();
     let dwm_slice: &[u8] = narrowed_buf.as_deref().unwrap_or(&[]);
     chunk.populate_subchunk_windows(&bytes, dwm_slice);

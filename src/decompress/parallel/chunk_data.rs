@@ -877,32 +877,27 @@ impl ChunkData {
 
     /// Populate the `window` field of every subchunk with the 32 KiB
     /// window required to resume decode at that subchunk's start.
-    /// Must be called AFTER `apply_window` resolves markers — the
-    /// per-subchunk windows are derived from the chunk's own resolved
-    /// output prefixed by the predecessor's tail window.
+    /// Must be called AFTER markers in the chunk's marker-prefix have
+    /// been resolved into `dwm_bytes` — the per-subchunk windows are
+    /// derived from the chunk's own resolved output prefixed by the
+    /// predecessor's tail window.
     ///
-    /// `dwm_bytes` must equal the u8 narrow of `data_with_markers`
-    /// post-`apply_window` (i.e., the buffer the consumer will later
-    /// write to the output). Callers narrow once and reuse the buffer
-    /// here so this routine does NOT re-narrow `data_with_markers`.
+    /// `dwm_bytes` must be the resolved u8 bytes of the chunk's
+    /// marker-prefix (the buffer the consumer will later write to the
+    /// output). It may have been produced by either
+    /// `apply_window` + `narrow_u16_to_u8` (two-pass small-chunk
+    /// path) or `replace_markers_lut_narrow` (fused large-chunk path,
+    /// vendor `DecodedData.hpp:316-337`); in either case
+    /// `chunk.data_with_markers` is irrelevant to this routine.
     ///
     /// Literal port of the window-emplacement step in rapidgzip's
     /// `appendSubchunksToIndexes` cascade
     /// (vendor/.../GzipChunkFetcher.hpp:560-580): for each subchunk's
     /// `decodedOffset`, the window is the 32 KiB immediately preceding
-    /// that offset in the concatenated `predecessor_window ++ data_with_markers ++ data`.
+    /// that offset in the concatenated `predecessor_window ++ dwm_bytes ++ data`.
     pub fn populate_subchunk_windows(&mut self, predecessor_window: &[u8], dwm_bytes: &[u8]) {
         const W: usize = 32768;
         debug_assert_eq!(predecessor_window.len(), W);
-        debug_assert!(
-            self.data_with_markers.iter().all(|v| *v < MARKER_BASE),
-            "populate_subchunk_windows requires apply_window already ran"
-        );
-        debug_assert_eq!(
-            dwm_bytes.len(),
-            self.data_with_markers.len(),
-            "populate_subchunk_windows requires narrowed dwm_bytes matching data_with_markers length"
-        );
 
         let dwm_len = dwm_bytes.len();
 
