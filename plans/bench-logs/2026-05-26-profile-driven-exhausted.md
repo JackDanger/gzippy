@@ -40,6 +40,79 @@ Vendor (no-ISA-L, apples-to-apples ShortBitsMultiCached): 873.7 / 654.0 MiB/s.
 
 Hot symbols are all vendor-parity. No new actionable profile-driven targets identified.
 
+## perf stat evidence for LUT=11 vs LUT=12 (L1d spill confirmation)
+
+Both binaries built fresh with their own PGO profile (instrumented build →
+silesia run → llvm-profdata merge → optimized rebuild). Each bench ran for
+the same `--profile-time 5` window on CPU 1, taskset-pinned.
+
+LUT=11 (current production):
+```
+21,296,037,484  cycles
+46,942,062,598  instructions   (2.20 IPC)
+   358,367,937  L1-dcache-load-misses   (3.53% miss rate)
+10,162,973,540  L1-dcache-loads
+       154,019  LLC-load-misses         (16.88% of LL-cache accesses)
+       912,307  LLC-loads
+```
+
+LUT=12 (regressed):
+```
+21,511,587,293  cycles
+38,823,486,316  instructions   (1.80 IPC)
+   343,954,568  L1-dcache-load-misses   (4.17% miss rate)
+ 8,256,371,118  L1-dcache-loads
+       162,679  LLC-load-misses         (18.96% of LL-cache accesses)
+       857,986  LLC-loads
+```
+
+Diff:
+| Metric | LUT=11 | LUT=12 | Delta |
+|---|---:|---:|---:|
+| IPC | 2.20 | 1.80 | **-18.2%** |
+| L1d miss rate | 3.53% | 4.17% | **+18.1% relative** |
+| LLC miss rate | 16.88% | 18.96% | +12.3% relative |
+| Instructions completed in 5s | 46.94B | 38.82B | -17.3% |
+
+Interpretation:
+- LUT=12 doubles `CacheEntry[CACHE_LEN]` storage from 16 KB to 32 KB. The
+  Intel i7-13700T has 48 KB L1d cache (with effective allocation lower
+  due to other working-set: marker ring, bit-reader state, output Vec).
+- L1d miss rate climbed 18% relative — confirmed cache pressure.
+- IPC collapsed from 2.20 to 1.80 (cache stalls serialize execution).
+- Despite fewer total instructions (the larger LUT is supposed to reduce
+  fallback decodes), throughput dropped because each instruction is
+  slower.
+
+The PGO profile in both cases was collected against the **same-LUT-size binary**
+(LUT=11 profile against LUT=11 binary; LUT=12 profile against LUT=12 binary).
+No stale-profile confound.
+
+## Raw bench output ladder (PGO state isolated)
+
+Four-point ladder, all under `RUSTFLAGS="-Cprofile-use=... -Ctarget-cpu=x86-64-v3"`
+on CPU 1 of neurotic. 200-sample Criterion measurements.
+
+| State | inner_loop_only | from_scratch | bootstrap_path |
+|---|---:|---:|---:|
+| **A** Pre-PGO baseline (LUT=11, no PGO) | 560.4 MiB/s | 561.2 MiB/s | 478.8 MiB/s |
+| **B** +PGO (LUT=11, distance HC = SymbolsPerLength) | 560.4 MiB/s | 567.8 MiB/s | 494.7 MiB/s |
+| **C** +PGO+distance-HC-swap (LUT=11, distance HC = ReversedBitsCached) | 627.6 MiB/s | 608.8 MiB/s | 523.5 MiB/s |
+| **D** +LUT=12 under PGO (compounded on C) | 512.3 MiB/s | 525.2 MiB/s | 423.2 MiB/s |
+
+Deltas:
+- B − A (PGO alone): +0% / +1.2% / **+3.3% bootstrap**
+- C − B (distance HC swap alone): **+12% inner / +7.2% / +5.8% bootstrap**
+- D − C (LUT=12 attempt): -18.4% / -13.7% / **-19.2% bootstrap** → reverted
+
+Cumulative landed (C vs A):
+- inner_loop_only: 560 → 628 MiB/s (+12%)
+- from_scratch: 561 → 609 MiB/s (+8.6%)
+- bootstrap_path: 479 → 524 MiB/s (+9.4%)
+
+Profile-driven cumulative: ~+9% bootstrap (~+5.8% from distance-HC-swap dominates;
+PGO contributes ~+3.3%).
+
 ## Commits
 
 - `4890e81` Lever G (Arc clone elim, prior session, kept)
