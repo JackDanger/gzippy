@@ -247,6 +247,32 @@ impl<'a> BitReader<'a> {
 
     #[inline]
     fn refill(&mut self) {
+        // Vendor-parity 8-byte misaligned refill. Previously this loop
+        // OR'd one byte at a time, up to 7 iterations to refill a low
+        // bit_buf. Vendor (`BitReader.hpp`) issues a single unaligned
+        // 8-byte little-endian load and OR-shifts it in.
+        //
+        // The shift may discard the top `bits_available` bits of the
+        // loaded value (they overflow the u64); we compensate by
+        // advancing `byte_pos` by ONLY `(64 - bits_available) / 8`
+        // bytes — the discarded high bits are re-read on the next refill
+        // from the not-yet-advanced byte position.
+        if self.bits_available <= 56 && self.byte_pos + 8 <= self.data.len() {
+            // SAFETY: bounds-checked above; little-endian byte order
+            // matches our bit-numbering (low bit of byte 0 → bit 0 of bit_buf).
+            let next8: u64 = unsafe {
+                core::ptr::read_unaligned(
+                    self.data.as_ptr().add(self.byte_pos) as *const u64,
+                )
+            }
+            .to_le();
+            self.bit_buf |= next8 << self.bits_available;
+            let bytes_consumed = (64 - self.bits_available as usize) / 8;
+            self.bits_available += (bytes_consumed * 8) as u8;
+            self.byte_pos += bytes_consumed;
+        }
+        // Tail: byte-by-byte for the last <8 bytes of input (and the
+        // path taken when bits_available > 56 already, which is a no-op).
         while self.bits_available <= 56 && self.byte_pos < self.data.len() {
             self.bit_buf |= (self.data[self.byte_pos] as u64) << self.bits_available;
             self.bits_available += 8;
