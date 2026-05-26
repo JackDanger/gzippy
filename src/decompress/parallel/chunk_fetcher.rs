@@ -1943,46 +1943,43 @@ fn speculative_decode_find_boundary(
 
     COORDINATOR_BOUNDARY_SEARCH_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    if let Some(chunk) =
-        RawBlockFinderCoordinator::with_scoped_boundary_search(input, start_bit, max_end, |coord| {
-            let mut candidate_index = 0usize;
-            loop {
-                let (off, code) = coord.get_offset(candidate_index, Duration::from_micros(100));
-                match code {
-                    StreamedGetReturnCode::Success => {
-                        if let Some(cand_bit) = off {
-                            match try_speculative_decode_candidate(
-                                input,
-                                cand_bit,
-                                start_bit,
-                                stop_hint_bit,
-                                configuration,
-                            ) {
-                                Ok(chunk) => {
-                                    coord.cancel_search();
-                                    SLOW_PATH_FIRST_CANDIDATE_OK
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    return Some(chunk);
-                                }
-                                Err(_) => {
-                                    SLOW_PATH_FIRST_CANDIDATE_FAIL
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-                        }
-                        candidate_index += 1;
-                    }
-                    StreamedGetReturnCode::Timeout => {
-                        if coord.results().finalized() && candidate_index >= coord.results().len() {
-                            break;
-                        }
-                    }
-                    StreamedGetReturnCode::Failure => break,
-                }
+    // Sync chunk-by-chunk boundary search — no thread spawn.
+    // Per the bench-sm post-absorb-isal-tail profile, the prior
+    // `with_scoped_boundary_search` path spent 77% of its
+    // elapsed time in clone3 + 8 MiB stack page-faults +
+    // scheduling + join overhead, and only 23% in the actual
+    // BlockFinder scan. Verified empirically:
+    //   Slow-path decode: ok=61 fail=0 no_candidate=0
+    //   BlockFinder coordinator spawns: 33
+    //   total_ms=3010 / scan_ms=702 / avg_total_us=91236
+    // → ~70 ms / spawn of pure overhead.
+    //
+    // Sync trades the ~5 ms "streaming overlap" (consumer trying
+    // candidate N while scan finds candidate N+1) for ~70 ms
+    // saved per call. For 33 slow-path chunks per single run,
+    // that's ~2.3 s of CPU-time saved per iteration across all
+    // workers.
+    if let Some(chunk) = RawBlockFinderCoordinator::with_sync_boundary_search(
+        input,
+        start_bit,
+        max_end,
+        |cand_bit| match try_speculative_decode_candidate(
+            input,
+            cand_bit,
+            start_bit,
+            stop_hint_bit,
+            configuration,
+        ) {
+            Ok(chunk) => {
+                SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(chunk)
             }
-            None
-        })
-    {
+            Err(_) => {
+                SLOW_PATH_FIRST_CANDIDATE_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+        },
+    ) {
         return Ok(chunk);
     }
 
