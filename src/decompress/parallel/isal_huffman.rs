@@ -184,7 +184,16 @@ impl IsalLitLenCode {
     ///
     /// LITERAL port of `HuffmanCodingISAL::decode` at
     /// `vendor/rapidgzip/.../huffman/HuffmanCodingISAL.hpp:94-183`.
-    #[inline]
+    ///
+    /// `#[inline(always)]`: per the bench-sm post-bootstrap-opt
+    /// profile, plain `#[inline]` was not enough — `decode`
+    /// appeared as a separate leaf symbol consuming 3.25% of
+    /// total cycles with the function-call overhead (push/jump/
+    /// prologue/epilogue) attributable to ~4-6 cycles × 50M+
+    /// invocations. Forcing inlining lets the inner loop fuse the
+    /// LUT lookup directly with the surrounding bit ops and the
+    /// multi-symbol unpack, eliminating that overhead.
+    #[inline(always)]
     pub fn decode(&self, bits: &mut Bits) -> DecodedSymbol {
         const INVALID_SYMBOL: u32 = 0x1FFF;
         if bits.available() < 32 {
@@ -313,7 +322,11 @@ impl IsalDistCode {
 
     /// Literal port of `HuffmanCodingDistanceISAL::decode`. Returns
     /// `Some((symbol, bit_count))` or `None` on invalid code.
-    #[inline]
+    ///
+    /// `#[inline(always)]`: same justification as
+    /// `IsalLitLenCode::decode` — fuse with the bootstrap inner-loop
+    /// callsite to avoid the function-call overhead.
+    #[inline(always)]
     pub fn decode(&self, bits: &mut Bits) -> Option<(u32, u32)> {
         if bits.available() < 32 {
             bits.refill();
