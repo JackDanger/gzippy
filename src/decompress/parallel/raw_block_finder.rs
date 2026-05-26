@@ -93,9 +93,52 @@ impl RawBlockFinderCoordinator {
         push_boundary_candidates(&self.results, data, start_bit, max_end, None);
     }
 
+    /// Synchronous chunk-by-chunk boundary search. Scans
+    /// `[start_bit, max_end)` in `CHUNK_SIZE_BITS` windows on the
+    /// caller's thread (no `std::thread::scope`, no `clone3`
+    /// syscall, no fresh 8 MiB stack allocation), invokes
+    /// `try_candidate(bit_offset)` for each valid boundary found,
+    /// and returns the FIRST `Some(R)` the callback yields.
+    ///
+    /// Replaces `with_scoped_boundary_search` for callers that
+    /// don't actually benefit from streaming overlap. Per the
+    /// bench-sm verbose stats (post-absorb-isal-tail commit
+    /// 9053895): `Slow-path decode: ok=61 fail=0 no_candidate=0`,
+    /// `BlockFinder coordinator spawns: 33`, `total_ms=3010 /
+    /// scan_ms=702 / avg_total_us=91236` — i.e., the actual
+    /// BlockFinder scan work was 23% of the elapsed
+    /// `with_scoped_boundary_search` time. The other 77% was
+    /// thread spawn + page-fault for fresh stack + scheduling +
+    /// join overhead. Sync runs the scan inline at full speed,
+    /// trades the ~5 ms "streaming overlap" for the ~70 ms
+    /// spawn-cleanup tax, and stops at the first successful
+    /// candidate.
+    pub fn with_sync_boundary_search<R>(
+        data: &[u8],
+        start_bit: usize,
+        max_end: usize,
+        mut try_candidate: impl FnMut(usize) -> Option<R>,
+    ) -> Option<R> {
+        let finder = BlockFinder::new(data);
+        let mut chunk_begin = start_bit;
+        while chunk_begin < max_end {
+            let chunk_end = (chunk_begin + CHUNK_SIZE_BITS).min(max_end);
+            for block in finder.find_blocks(chunk_begin, chunk_end) {
+                if block.valid && block.bit_offset >= chunk_begin && block.bit_offset < chunk_end {
+                    if let Some(result) = try_candidate(block.bit_offset) {
+                        return Some(result);
+                    }
+                }
+            }
+            chunk_begin = chunk_end;
+        }
+        None
+    }
+
     /// Zero-copy async boundary search: spawns one scoped finder thread
     /// that borrows `data`, runs `consumer` on the caller thread, then
     /// joins the finder when the scope ends.
+    #[allow(dead_code)] // retained for tests / parallel callers
     pub fn with_scoped_boundary_search<R>(
         data: &[u8],
         start_bit: usize,
