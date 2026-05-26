@@ -260,6 +260,22 @@ What does NOT work:
   the analysis to whichever frame the most recent advisor brought.
   Use ONE advisor pass per concrete question.
 
+**Worktree gotcha (2026-05-26).** When the parallel-SM work runs inside a
+git worktree (e.g. `/Users/jackdanger/www/gzippy/.git/worktrees/perf/...`),
+the `Agent` tool spawns the subagent rooted at the **main repo dir**, not at
+the spawning agent's Bash CWD. Putting `Working dir: <worktree>` in the prompt
+TEXT is ignored. Symptom: the advisor reads files from `main`, doesn't see
+your branch's commits, and disagrees with your premise on facts you have
+verified locally. Confirmed when an advisor reading `Cargo.toml` reported no
+`arena-allocator` feature while it was plainly at `Cargo.toml:39` on this
+branch.
+
+**Mitigation.** Step 0 of every advisor prompt must be an explicit
+`cd <absolute-worktree-path> && pwd` with the instruction that every
+subsequent Read/Grep MUST resolve relative to that directory, and to halt
+with a clear error if `pwd` shows anything else. Without this, the round
+trip is wasted.
+
 ### Neurotic measurements are noisy; characterize variance, don't chase single-run jumps
 
 `bench-sm` runs on the homelab Intel i9. Wall variance is ~5-15 % CV
