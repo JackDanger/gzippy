@@ -416,7 +416,21 @@ Cost: ~50ms total. Mandatory.
 
 Cost: ~500ms (one-time callgrind setup) per test invocation. **Deterministic**: same toolchain + same binary + same corpus → same instruction count (within callgrind's noise floor, which is ~0.01%).
 
-Baseline lives in `tests/baselines/iai_inflate.json`. Updated by `make update-iai-baselines` (reviewer-checked).
+**Per-variant baselines** (Phase 0.6 spike outcome (b) confirmed): SIMD variants reduce instruction count by 5-10× vs scalar (cachegrind sees the wider work as fewer iterations but doesn't model widened throughput). A single shared baseline would trip whenever a SIMD variant lands. Each variant ships with its own baseline:
+
+- Scalar reference: `tests/baselines/iai_inflate_scalar.json`
+- AVX2 variant: `tests/baselines/iai_inflate_simd_avx2.json`
+- BMI2 variant: `tests/baselines/iai_inflate_simd_bmi2.json`
+- etc.
+
+The ±2% gate applies to the variant's OWN baseline, not the scalar baseline.
+
+**rustc-bump exception path applies**: each baseline file embeds `rustc_version`. If `rustc --version` at test time differs, the test prints "rustc bump detected; regenerate baselines via `make update-baselines`" and is `#[ignore]`d for that run. Applies to scalar AND SIMD variant baselines.
+
+**CI-only wall-clock supplement for SIMD variants**: `make perf-counters` on a fixed-machine-class CI runner (or neurotic) measures actual cycles via `perf stat -e cycles` on the corpus. Each SIMD variant has a pre-declared wall-clock floor in its design doc (Phase 0.4):
+
+- **Narrow variant (AVX2 `_mm256_packus_epi16`)**: floor ≥ **2.0× scalar reference**. Citation: production code at `src/decompress/parallel/chunk_fetcher.rs:1665-1731` documents the AVX2 license-downclock concern; the floor must be high enough to make the SIMD path worth the downclock tax. Spike data shows cachegrind reports 7.2× fewer instructions and 2.9× fewer estimated cycles; real wall-clock typically 5-8× faster.
+- **Future SIMD variants**: floor declared in `plans/inner-loop-design-decisions.md` BEFORE the bench runs, not after.
 
 #### 6.1.3 Asm-pattern assertions
 
