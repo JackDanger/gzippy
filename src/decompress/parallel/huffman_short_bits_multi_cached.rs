@@ -10,7 +10,11 @@ use super::huffman_base::LsbBitReader;
 use super::huffman_symbols_per_length::{HuffmanCodingSymbolsPerLength, Symbol};
 use super::rfc_tables::{calculate_length, get_length};
 
-pub const LUT_BITS_COUNT: u8 = 11;
+// Phase 1.7 profile-driven re-test (post-PGO, post-distance-HC-swap).
+// perf record showed MultiCached::decode at 19.78% of cycles; the
+// previous LUT=12 attempt was on a noisy bench WITHOUT PGO and reverted.
+// Re-test under PGO + corpus.
+pub const LUT_BITS_COUNT: u8 = 12;
 const CACHE_LEN: usize = 1 << LUT_BITS_COUNT as usize;
 
 /// Packed literal/length symbols use `254 + length` for match entries
