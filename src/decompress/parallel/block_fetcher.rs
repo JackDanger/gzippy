@@ -232,22 +232,17 @@ where
         F: FnMut(),
     {
         if let Some(v) = {
-            let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin(
-                "ttp.get_if_available",
-            );
+            let _tv2 =
+                crate::decompress::parallel::trace_v2::SpanGuard::begin("ttp.get_if_available");
             self.get_if_available(block_offset)
         } {
             return Some(Ok(v));
         }
         let rx = {
-            let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin(
-                "ttp.take_prefetch",
-            );
+            let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin("ttp.take_prefetch");
             self.take_prefetch(block_offset)?
         };
-        let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin(
-            "ttp.rx_recv_block",
-        );
+        let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin("ttp.rx_recv_block");
         // Lever H: pump prefetch on 1ms ticks while waiting (vendor
         // BlockFetcher.hpp:314-316). Keeps the prefetch horizon
         // advancing so by the time chunk N arrives, chunks N+1..N+k

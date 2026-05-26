@@ -261,9 +261,7 @@ impl<'a> BitReader<'a> {
             // SAFETY: bounds-checked above; little-endian byte order
             // matches our bit-numbering (low bit of byte 0 → bit 0 of bit_buf).
             let next8: u64 = unsafe {
-                core::ptr::read_unaligned(
-                    self.data.as_ptr().add(self.byte_pos) as *const u64,
-                )
+                core::ptr::read_unaligned(self.data.as_ptr().add(self.byte_pos) as *const u64)
             }
             .to_le();
             self.bit_buf |= next8 << self.bits_available;

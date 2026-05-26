@@ -64,10 +64,7 @@ pub fn get_length_minus3<R: LsbBitReader>(code: u16, bit_reader: &mut R) -> Resu
 /// Apply extra-bits + base-distance lookup once the distance symbol
 /// is decoded. Mirror of the tail of `getDistance` (RFCTables.hpp:142-157).
 #[inline]
-fn apply_distance_extra<R: LsbBitReader>(
-    decoded: u16,
-    bit_reader: &mut R,
-) -> Result<u16, Error> {
+fn apply_distance_extra<R: LsbBitReader>(decoded: u16, bit_reader: &mut R) -> Result<u16, Error> {
     let mut distance = decoded;
     if distance <= 3 {
         distance += 1;
