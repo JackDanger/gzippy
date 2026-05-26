@@ -951,7 +951,6 @@ impl Block {
         //    (igzip_inflate.c:473-476). Vendor expresses this as the
         //    `code <= 255 || sym_count > 1 → literal` branch at
         //    deflate.hpp:1615.
-        const INVALID_SYMBOL: u32 = 0x1FFF;
         const MAX_LIT_LEN_SYM: u32 = 512;
         const MAX_RUN_LENGTH: usize = 258;
 
@@ -1000,8 +999,31 @@ impl Block {
         }
 
         while emitted < n_max_to_decode {
+            // Single refill at the top of the outer iteration. After
+            // `bits.refill()` returns, `bits.available()` is in
+            // [56, 63] (libdeflate-style refill rounds DOWN to a
+            // multiple of 8 plus the residue) — well above the 48
+            // bits a worst-case back-ref iter consumes (20 for
+            // lit/len decode + 15 for dist decode + 13 for dist extra).
+            // With this guarantee, the per-decode `< 32` checks
+            // inside `IsalLitLenCode::decode`, `IsalDistCode::decode`,
+            // and the dist-extra `ensure_bits` all become
+            // predictably-false branches that never trigger the
+            // expensive 8-byte unaligned load. Net: ~1-2 refills
+            // saved per iter on back-ref-heavy chunks.
+            //
+            // Calling refill when already near-full is a no-op:
+            // `refill` advances `pos` by 0 when `bitsleft >= 56`
+            // (see consume_first_decode.rs:259).
+            bits.refill();
             let decoded = self.isal_litlen.decode(bits);
-            if decoded.bit_count == 0 || decoded.symbol == INVALID_SYMBOL {
+            if decoded.bit_count == 0 {
+                // Inside `IsalLitLenCode::decode`, `symbol` is set to
+                // `INVALID_SYMBOL` (0x1FFF) exactly when
+                // `bit_count == 0`, so the prior
+                // `|| symbol == INVALID_SYMBOL` half of the check was
+                // redundant. Drop it: one cmp + branch saved per
+                // outer iter.
                 commit!(Err(BlockError::InvalidHuffmanCode));
             }
             // Consume the LUT-reported bit count (covers Huffman code +
@@ -1059,9 +1081,30 @@ impl Block {
                 if dsym as usize >= DISTANCE_BASE.len() {
                     commit!(Err(BlockError::InvalidHuffmanCode));
                 }
-                let distance = match read_distance_extra(bits, dsym as usize) {
-                    Ok(d) => d,
-                    Err(e) => commit!(Err(e)),
+                // Inlined `read_distance_extra` — eliminates the
+                // function call, the double `if extra > 0` checks,
+                // the `ensure_bits` function call (re-check + branch),
+                // and the `n_lowest_bits_set` runtime-branch helper.
+                // Outer-loop refill guarantees `bits.available() >=
+                // 13 - dbit - decoded.bit_count` (worst case 13 bits
+                // of extra for symbol 29), so the inner availability
+                // check is also a predictably-false branch.
+                let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                let distance = if extra > 0 {
+                    if bits.available() < extra {
+                        bits.refill();
+                        if bits.available() < extra {
+                            commit!(Err(BlockError::EndOfFile));
+                        }
+                    }
+                    // `extra` is bounded by DISTANCE_EXTRA[29] = 13,
+                    // so `1u64 << extra` is always well-defined.
+                    let mask = (1u64 << extra) - 1;
+                    let v = (bits.peek() & mask) as usize;
+                    bits.consume(extra);
+                    DISTANCE_BASE[dsym as usize] as usize + v
+                } else {
+                    DISTANCE_BASE[dsym as usize] as usize
                 };
                 if distance == 0 || distance > MAX_WINDOW_SIZE {
                     commit!(Err(BlockError::ExceededWindowRange));
