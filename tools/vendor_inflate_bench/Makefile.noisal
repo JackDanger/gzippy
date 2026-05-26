@@ -1,0 +1,39 @@
+# Variant Makefile: builds vendor_inflate_bench against the vendor build
+# WITHOUT ISA-L, so it uses HuffmanCodingShortBitsMultiCached (apples-to-
+# apples with gzippy's pure-Rust ShortBitsMultiCached).
+#
+# Prerequisite:
+#   cd ../../vendor/rapidgzip/librapidarchive
+#   mkdir -p build_noisal && cd build_noisal
+#   cmake -DLIBRAPIDARCHIVE_WITH_ISAL=OFF \
+#         -DCMAKE_CXX_FLAGS="-DWITH_MULTI_CACHED_HUFFMAN_DECODER" ..
+#   cmake --build . --target rapidgzip -j
+
+ROOT := $(realpath ../..)
+VENDOR := $(ROOT)/vendor/rapidgzip/librapidarchive
+BUILD := $(VENDOR)/build_noisal
+
+INCLUDES := \
+	-I$(VENDOR)/src \
+	-I$(VENDOR)/src/external \
+	-I$(VENDOR)/src/external/cxxopts/include
+
+LIBS := \
+	$(BUILD)/src/librpmalloc.a \
+	$(BUILD)/src/libzlibstatic.a
+
+CXX := g++
+CXXFLAGS := -O3 -std=c++17 -DNDEBUG -DWITH_MULTI_CACHED_HUFFMAN_DECODER \
+	-march=x86-64-v3 -pthread $(INCLUDES)
+LDFLAGS := -pthread
+
+vendor_inflate_bench_noisal: main.cpp
+	$(CXX) $(CXXFLAGS) main.cpp $(LIBS) $(LDFLAGS) -o vendor_inflate_bench_noisal
+
+run: vendor_inflate_bench_noisal
+	./vendor_inflate_bench_noisal $(ROOT)/corpus/silesia_blocks
+
+clean:
+	rm -f vendor_inflate_bench_noisal
+
+.PHONY: run clean
