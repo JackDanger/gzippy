@@ -129,6 +129,14 @@ panic = "abort"       # Smaller binary, no unwinding overhead
 opt-level = 3         # Maximum optimization
 strip = true          # Remove symbols for smaller binary
 
+# iai-callgrind requires debug symbols to find its instrumented sentinels;
+# the stripped release profile breaks it. Keep release-grade optimization
+# but retain symbols for cachegrind output parsing.
+[profile.bench]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
+
 # Enable native CPU optimizations when building locally
 # (commented out for portable binaries - uncomment for max local perf)
 # [build]
