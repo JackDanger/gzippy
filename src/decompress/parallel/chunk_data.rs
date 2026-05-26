@@ -153,6 +153,18 @@ pub struct ChunkData {
     /// Empty when `data_with_markers` is empty or `apply_window` hasn't
     /// run yet. Pool-recycled via the U8 pool alongside `data`.
     pub narrowed: U8,
+    /// CRC32 of `narrowed`, computed on the post-process worker (parallel)
+    /// instead of on the consumer (serial). Vendor parity: `ChunkData::
+    /// applyWindow` (vendor/.../ChunkData.hpp:313-328) fuses the CRC32
+    /// pass into apply_window on the worker; gzippy previously deferred
+    /// this to `drain_one_pending` and paid pclmulqdq cycles on the
+    /// single-threaded consumer. Move to the worker so it parallelizes
+    /// across the 16-thread pool — for silesia (~400 MB marker bytes /
+    /// pclmulqdq ~15 GB/s) saves ~25 ms of consumer-serial wall.
+    ///
+    /// `default()` is the empty-stream CRC sentinel; valid for chunks
+    /// with no narrowed bytes (where the consumer skips the append).
+    pub narrowed_crc: CRC32Calculator,
     /// True if `apply_window` has already been run on this chunk —
     /// either on the worker thread before send (when the predecessor's
     /// window was published in time) or by an earlier consumer pass.
@@ -272,6 +284,7 @@ impl ChunkData {
             data_with_markers,
             data,
             narrowed: types::u8_with_capacity(0),
+            narrowed_crc: CRC32Calculator::new(),
             markers_resolved: false,
             subchunks: vec![first_subchunk],
             // Mirror of ChunkData.hpp:561 default-init:
