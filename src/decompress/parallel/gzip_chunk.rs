@@ -581,11 +581,84 @@ fn absorb_isal_tail(dst: &mut ChunkData, tail: ChunkData) {
     let decoded_base = dst.decoded_size();
 
     if !tail.data.is_empty() {
-        dst.append_clean(&tail.data);
+        // Per the post-inline-always bench-sm profile, the prior
+        // `dst.append_clean(&tail.data)` re-CRC'd `tail.data` from
+        // scratch — 2.45% of total cycles in
+        // `crc32fast::specialized::pclmulqdq::calculate` traced
+        // back here. `decode_chunk_isal_impl` had ALREADY computed
+        // those bytes' CRC into `tail.crc32s.last_mut()` during
+        // the in-place commit step. Combine that CRC into
+        // `dst.crc32s` via the constant-time polynomial `append`
+        // (vendor `crc32.hpp:214-258`) and skip the bytewise
+        // pclmulqdq pass.
+        //
+        // We still need the bytes in `dst.data`, the statistics
+        // update, and the subchunk size bump — inline those bits
+        // of `append_clean` directly.
+        if dst.configuration.crc32_enabled {
+            // For parallel-SM (single-member at routing time),
+            // tail's crc32s has exactly one entry. If `tail` ever
+            // crosses a stream boundary mid-decode (multi-member
+            // input that slipped past `is_likely_multi_member`'s
+            // 16 MiB scan and was misrouted as single-member),
+            // tail.crc32s.len() > 1 and the per-stream entries
+            // need to be split by the corresponding footers.
+            // Handle that explicitly below; the common case is
+            // the fast single-`append` path.
+            if tail.crc32s.len() == 1 && tail.footers.is_empty() {
+                if let (Some(dst_last), Some(tail_only)) =
+                    (dst.crc32s.last_mut(), tail.crc32s.first())
+                {
+                    dst_last.append(tail_only);
+                }
+            } else {
+                // Multi-stream tail: walk the (crc, footer) pairs
+                // in order. Each crc[i] covers bytes between
+                // footer[i-1] and footer[i] (with footer[0] being
+                // the first footer if i == 0, etc). Approximate by
+                // appending crc[0] into dst's current trailing
+                // hasher, then for each footer push a fresh
+                // hasher and append the next tail crc into it.
+                for (i, footer) in tail.footers.iter().enumerate() {
+                    if let (Some(dst_last), Some(tail_crc)) =
+                        (dst.crc32s.last_mut(), tail.crc32s.get(i))
+                    {
+                        dst_last.append(tail_crc);
+                    }
+                    dst.append_footer(
+                        footer.crc32,
+                        footer.uncompressed_size,
+                        footer.end_bit_offset,
+                    );
+                }
+                // The crc entry AFTER the last footer (if any) goes
+                // into the freshly-pushed hasher from append_footer.
+                if let (Some(dst_last), Some(tail_trailing)) =
+                    (dst.crc32s.last_mut(), tail.crc32s.get(tail.footers.len()))
+                {
+                    dst_last.append(tail_trailing);
+                }
+            }
+        }
+
+        // Bytes + statistics + subchunk size — the non-CRC half of
+        // `append_clean`. We extend in place rather than via
+        // `append_clean` because that path would re-CRC.
+        dst.statistics.non_marker_count += tail.data.len() as u64;
+        let added = tail.data.len();
+        dst.data.extend_from_slice(&tail.data);
+        if let Some(last) = dst.subchunks.last_mut() {
+            last.decoded_size += added;
+        }
     }
 
-    for f in &tail.footers {
-        dst.append_footer(f.crc32, f.uncompressed_size, f.end_bit_offset);
+    // Multi-stream case already emitted footers above (interleaved
+    // with the per-stream CRC propagation). For the
+    // single-stream-or-empty case, footers still need pushing.
+    if tail.crc32s.len() == 1 || tail.data.is_empty() {
+        for f in &tail.footers {
+            dst.append_footer(f.crc32, f.uncompressed_size, f.end_bit_offset);
+        }
     }
 
     for sc in tail.subchunks.iter().skip(1) {
