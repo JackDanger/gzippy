@@ -82,6 +82,41 @@ fn decode_from_scratch(
     }
 }
 
+/// SYNTHETIC bootstrap-path decode: omits `set_initial_window`, so
+/// `contains_marker_bytes` stays TRUE and back-refs into the
+/// (uninitialized-as-data) ring emit markers. Mirrors what production
+/// `bootstrap_with_deflate_block` runs on chunk-0 of a parallel SM
+/// decode.
+///
+/// Note: the decoded output will contain marker u16 values (≥ 256)
+/// because the corpus blocks were extracted with a real predecessor and
+/// their back-refs reach into that predecessor; without seeding, those
+/// back-refs become markers. The bench measures cycles spent in the
+/// inner loop, not output validity. Marker density is HEAVIER than a
+/// real first-of-member block (which has only intra-block back-refs),
+/// so the synthetic bench is conservative: any optimization that wins
+/// here will also win on lighter real-bootstrap input.
+#[inline(always)]
+fn decode_bootstrap_synthetic(
+    block_data: &CorpusBlock,
+    decoder: &mut Block,
+    body_buf: &mut Vec<u16>,
+) {
+    *decoder = Block::new();
+    // No set_initial_window — Block::new() initializes the ring marker zone.
+    body_buf.clear();
+    let mut bits = Bits::at_bit_offset(
+        &block_data.compressed,
+        block_data.bit_offset_in_compressed as usize,
+    );
+    decoder.read_header(&mut bits, false).expect("read_header");
+    while !decoder.eob() {
+        decoder
+            .read(&mut bits, body_buf, usize::MAX)
+            .expect("read body");
+    }
+}
+
 fn bench_corpus_aggregate(c: &mut Criterion) {
     let corpus = load_corpus(corpus_dir());
     assert!(!corpus.is_empty(), "empty corpus directory");
@@ -114,6 +149,19 @@ fn bench_corpus_aggregate(c: &mut Criterion) {
         b.iter(|| {
             for block_data in &corpus {
                 decode_from_scratch(block_data, &mut decoder, &mut out_buf, &mut body_buf);
+                black_box(&body_buf);
+            }
+        });
+    });
+
+    // Synthetic bootstrap path: the CONTAINS_MARKERS=true instantiation
+    // of `run_multi_cached_loop`. This is where the 1.54× per-byte gap
+    // with rapidgzip lives (per plans/pure-rust-perf.md Lever I).
+    // Phase 0.2 pivot table gates on THIS measurement, not inner_loop_only.
+    group.bench_function("bootstrap_path", |b| {
+        b.iter(|| {
+            for block_data in &corpus {
+                decode_bootstrap_synthetic(block_data, &mut decoder, &mut body_buf);
                 black_box(&body_buf);
             }
         });
