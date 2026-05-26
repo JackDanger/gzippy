@@ -2097,12 +2097,26 @@ fn drain_one_pending<W: std::io::Write>(
     // (chunks with no markers), `narrowed` is empty and there is
     // nothing to write here — the clean tail comes through `chunk.data`
     // below.
-    let mut written_crc = CRC32Calculator::new();
+    // CRC pipeline split:
+    //   - chunk.data: bytes were CRC'd on the WORKER (every `append_clean` /
+    //     `append_owned_buffer` updates `chunk.crc32s.last_mut()`). Re-CRCing
+    //     them on the consumer was a ~5 MB pclmulqdq pass per chunk that
+    //     dominated the consumer thread (~55% of E-core cycles per
+    //     `target/tooling/profile-single-member-decompression-x86_64/9bbf17c-...`).
+    //   - chunk.narrowed: resolved marker bytes — the WORKER could NOT CRC
+    //     these during decode because markers in `data_with_markers` were
+    //     unresolved u16 values; CRC happens here, on the consumer, for
+    //     just the marker-prefix bytes (small relative to the full chunk).
+    //
+    // Vendor parity: rapidgzip combines per-chunk CRCs via constant-time
+    // polynomial combine (crc32.hpp:214-258) and never re-CRCs decoded
+    // bytes on the writer thread.
+    let mut narrowed_crc = CRC32Calculator::new();
     let t_crc_write = std::time::Instant::now();
     if !chunk.narrowed.is_empty() {
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.crc_narrowed");
-            written_crc.update(&chunk.narrowed);
+            narrowed_crc.update(&chunk.narrowed);
         }
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.write_narrowed");
@@ -2122,17 +2136,13 @@ fn drain_one_pending<W: std::io::Write>(
         for v in &chunk.data_with_markers {
             narrowed.push(*v as u8);
         }
-        written_crc.update(&narrowed);
+        narrowed_crc.update(&narrowed);
         writer
             .write_all(&narrowed)
             .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
         *total_size += narrowed.len();
     }
     if !chunk.data.is_empty() {
-        {
-            let _tv2 = trace_v2::SpanGuard::begin("consumer.crc_data");
-            written_crc.update(&chunk.data);
-        }
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.write_data");
             writer
@@ -2145,7 +2155,15 @@ fn drain_one_pending<W: std::io::Write>(
     let t_combine = std::time::Instant::now();
     {
         let _tv2 = trace_v2::SpanGuard::begin("consumer.combine_crc");
-        total_crc.append(&written_crc);
+        // Concatenated chunk output is (narrowed | data), so we combine
+        // in that order. `narrowed_crc` covers narrowed bytes; the
+        // worker-computed `chunk.crc32s` cover the data-stream bytes.
+        // Multiple stream entries (multi-member inside a chunk) are
+        // appended in stream order to match the output byte order.
+        total_crc.append(&narrowed_crc);
+        for stream_crc in &chunk.crc32s {
+            total_crc.append(stream_crc);
+        }
     }
     let combine_us = t_combine.elapsed().as_micros();
     let total_us = t_chunk.elapsed().as_micros();
