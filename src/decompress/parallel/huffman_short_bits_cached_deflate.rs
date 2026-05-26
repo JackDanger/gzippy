@@ -9,7 +9,9 @@ use super::gzip_definitions::{END_OF_BLOCK_SYMBOL, MAX_LITERAL_HUFFMAN_CODE_COUN
 use super::huffman_base::LsbBitReader;
 use super::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached;
 use super::huffman_symbols_per_length::{HuffmanCodingSymbolsPerLength, Symbol};
-use super::rfc_tables::{calculate_length, get_distance_dynamic, get_length_minus3, DISTANCE_LUT};
+use super::rfc_tables::{
+    calculate_length, get_distance_dynamic_canonical, get_length_minus3, DISTANCE_LUT,
+};
 
 pub const LUT_BITS_COUNT: u8 = 11;
 const CACHE_LEN: usize = 1 << LUT_BITS_COUNT as usize;
@@ -242,7 +244,7 @@ impl HuffmanCodingShortBitsCachedDeflate {
             Ok(v) => v,
             Err(_) => return CacheEntry::default(),
         };
-        let distance = match get_distance_dynamic(distance_hc, bit_reader) {
+        let distance = match get_distance_dynamic_canonical(distance_hc, bit_reader) {
             Ok(d) => d,
             Err(_) => return CacheEntry::default(),
         };
