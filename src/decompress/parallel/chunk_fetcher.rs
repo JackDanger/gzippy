@@ -1626,23 +1626,33 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
     let t_apply = std::time::Instant::now();
     apply_window(&mut chunk, &bytes);
     let apply_us = t_apply.elapsed().as_micros();
-    let t_pop = std::time::Instant::now();
-    chunk.populate_subchunk_windows(&bytes);
-    let populate_us = t_pop.elapsed().as_micros();
     // Worker-side narrow: produce `chunk.narrowed` so the single
     // consumer thread doesn't pay the ~24ms / 3.3MiB scalar narrow
     // per chunk that previously dominated wall time on real silesia
     // (`plans/pure-rust-perf.md` consumer-narrow finding). Pool-
     // recycles a u8 buffer rather than allocating per chunk.
+    //
+    // Narrow happens BEFORE populate_subchunk_windows so the latter
+    // can reuse the already-narrowed buffer instead of doing its own
+    // scalar u16→u8 pass (was chunk_data.rs:903 pre-fuse). Saves one
+    // full pass over `data_with_markers` per chunk on the worker.
     let t_narrow = std::time::Instant::now();
+    let mut narrowed_buf: Option<crate::decompress::parallel::rpmalloc_alloc::types::U8> = None;
     if !chunk.data_with_markers.is_empty() {
         use crate::decompress::parallel::chunk_buffer_pool;
         let dwm_len = chunk.data_with_markers.len();
         let mut narrowed = chunk_buffer_pool::take_u8(dwm_len);
         narrow_u16_to_u8(&chunk.data_with_markers, &mut narrowed);
-        chunk.narrowed = narrowed;
+        narrowed_buf = Some(narrowed);
     }
     let narrow_us = t_narrow.elapsed().as_micros();
+    let t_pop = std::time::Instant::now();
+    let dwm_slice: &[u8] = narrowed_buf.as_deref().unwrap_or(&[]);
+    chunk.populate_subchunk_windows(&bytes, dwm_slice);
+    let populate_us = t_pop.elapsed().as_micros();
+    if let Some(narrowed) = narrowed_buf {
+        chunk.narrowed = narrowed;
+    }
     if trace::is_enabled() {
         trace::emit(
             "post_process",
