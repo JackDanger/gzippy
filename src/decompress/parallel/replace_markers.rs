@@ -116,6 +116,47 @@ fn replace_markers_lut(data: &mut [u16], window: &[u8]) {
     }
 }
 
+/// Fused marker-replace + u8 narrow in ONE pass. Vendor parity for
+/// `DecodedData::applyWindow` (DecodedData.hpp:316-337) where the C++
+/// writes the resolved byte to a `target[]` u8 buffer directly:
+/// `target[i] = fullWindow[chunk[i]]`. Single read of `src[i]` and
+/// single write of `dst[i]` per element, vs gzippy's prior
+/// `replace_markers_lut` (u16→u16 in-place) + `narrow_u16_to_u8`
+/// (u16→u8) which was two full passes over the buffer (~24ms / 3.3MiB
+/// per chunk per `plans/pure-rust-perf.md` consumer-narrow finding).
+///
+/// `dst` is cleared and grown to `src.len()`. The LUT layout matches
+/// `replace_markers_lut`: literals pass through, markers (≥32768)
+/// resolve to `window[v - 32768]`.
+pub fn replace_markers_lut_narrow(
+    src: &[u16],
+    window: &[u8],
+    dst: &mut crate::decompress::parallel::rpmalloc_alloc::types::U8,
+) {
+    debug_assert_eq!(
+        window.len(),
+        32768,
+        "vendor LUT path requires 32 KiB window"
+    );
+    let mut lut = [0u8; 65536];
+    for (i, slot) in lut[0..256].iter_mut().enumerate() {
+        *slot = i as u8;
+    }
+    lut[MARKER_BASE as usize..MARKER_BASE as usize + 32768].copy_from_slice(window);
+
+    dst.clear();
+    dst.reserve(src.len());
+    // Use spare_capacity + set_len to avoid Vec::push branch overhead
+    // (push has a capacity check per element; we know the final size).
+    let dst_ptr = dst.as_mut_ptr();
+    for (i, &v) in src.iter().enumerate() {
+        // SAFETY: reserve(src.len()) above guarantees capacity.
+        unsafe { dst_ptr.add(i).write(lut[v as usize]) };
+    }
+    // SAFETY: wrote src.len() initialized bytes via dst_ptr above.
+    unsafe { dst.set_len(src.len()) };
+}
+
 #[inline]
 fn replace_markers_scalar(data: &mut [u16], window: &[u8]) {
     for val in data.iter_mut() {
