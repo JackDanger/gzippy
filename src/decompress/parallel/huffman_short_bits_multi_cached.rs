@@ -10,11 +10,14 @@ use super::huffman_base::LsbBitReader;
 use super::huffman_symbols_per_length::{HuffmanCodingSymbolsPerLength, Symbol};
 use super::rfc_tables::{calculate_length, get_length};
 
-// Phase 1.7 profile-driven re-test (post-PGO, post-distance-HC-swap).
-// perf record showed MultiCached::decode at 19.78% of cycles; the
-// previous LUT=12 attempt was on a noisy bench WITHOUT PGO and reverted.
-// Re-test under PGO + corpus.
-pub const LUT_BITS_COUNT: u8 = 12;
+// Phase 1.7 profile-driven exhaustion: LUT=12 was re-tested under PGO on
+// the bench corpus and regressed -18-19% across all three bench groups
+// (vs LUT=11). 32 KB CacheEntry array spills L1d on i7-13700T. The
+// LUT_BITS_COUNT knob is exhausted at 11.
+//
+// Vendor parity: this matches HuffmanCodingShortBitsMultiCached<11>
+// in vendor's deflate.hpp:179.
+pub const LUT_BITS_COUNT: u8 = 11;
 const CACHE_LEN: usize = 1 << LUT_BITS_COUNT as usize;
 
 /// Packed literal/length symbols use `254 + length` for match entries
