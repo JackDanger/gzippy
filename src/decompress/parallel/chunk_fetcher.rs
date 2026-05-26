@@ -1669,7 +1669,18 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
     let dwm_slice: &[u8] = narrowed_buf.as_deref().unwrap_or(&[]);
     chunk.populate_subchunk_windows(&bytes, dwm_slice);
     let populate_us = t_pop.elapsed().as_micros();
+    // Vendor parity: `ChunkData::applyWindow` (ChunkData.hpp:313-328)
+    // CRC32s the resolved marker bytes on the worker. Previously this
+    // ran on the consumer inside `drain_one_pending` and serialized
+    // ~27 ms / 400 MB of pclmulqdq onto the wall-binding thread. Moving
+    // it here parallelizes the work across the 16-thread pool — each
+    // worker pays its own per-chunk CRC scan, and only the constant-time
+    // polynomial `append` happens on the consumer.
     if let Some(narrowed) = narrowed_buf {
+        {
+            let _tv2 = trace_v2::SpanGuard::begin("post_process.crc_narrowed");
+            chunk.narrowed_crc.update(&narrowed);
+        }
         chunk.narrowed = narrowed;
     }
     if trace::is_enabled() {
@@ -2056,7 +2067,7 @@ fn drain_one_pending<W: std::io::Write>(
     };
     let t_chunk = std::time::Instant::now();
     let t_recv = std::time::Instant::now();
-    let (idx, chunk, cache_key) = match head {
+    let (idx, mut chunk, cache_key) = match head {
         PendingWrite::Ready {
             idx,
             chunk,
@@ -2107,14 +2118,12 @@ fn drain_one_pending<W: std::io::Write>(
     //
     // Vendor parity: rapidgzip combines per-chunk CRCs via constant-time
     // polynomial combine (crc32.hpp:214-258) and never re-CRCs decoded
-    // bytes on the writer thread.
-    let mut narrowed_crc = CRC32Calculator::new();
+    // bytes on the writer thread. The narrowed-bytes CRC is now computed
+    // on the post-process worker (`run_post_process_task` stores it on
+    // `chunk.narrowed_crc`) so the consumer just consumes the result —
+    // no second scan of `chunk.narrowed` here.
     let t_crc_write = std::time::Instant::now();
     if !chunk.narrowed.is_empty() {
-        {
-            let _tv2 = trace_v2::SpanGuard::begin("consumer.crc_narrowed");
-            narrowed_crc.update(&chunk.narrowed);
-        }
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.write_narrowed");
             writer
@@ -2128,12 +2137,13 @@ fn drain_one_pending<W: std::io::Write>(
         // not happen on the production path (post_process always
         // runs narrow after apply_window). Keeps the consumer
         // correctness invariant: all marker bytes written before
-        // `chunk.data`.
+        // `chunk.data`. This path computes CRC inline because the
+        // worker's path didn't (no `chunk.narrowed` was produced).
         let mut narrowed: Vec<u8> = Vec::with_capacity(chunk.data_with_markers.len());
         for v in &chunk.data_with_markers {
             narrowed.push(*v as u8);
         }
-        narrowed_crc.update(&narrowed);
+        chunk.narrowed_crc.update(&narrowed);
         writer
             .write_all(&narrowed)
             .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
@@ -2153,11 +2163,12 @@ fn drain_one_pending<W: std::io::Write>(
     {
         let _tv2 = trace_v2::SpanGuard::begin("consumer.combine_crc");
         // Concatenated chunk output is (narrowed | data), so we combine
-        // in that order. `narrowed_crc` covers narrowed bytes; the
-        // worker-computed `chunk.crc32s` cover the data-stream bytes.
+        // in that order. `chunk.narrowed_crc` covers narrowed bytes
+        // (now computed on the post-process worker — vendor parity);
+        // the worker-computed `chunk.crc32s` cover the data-stream bytes.
         // Multiple stream entries (multi-member inside a chunk) are
         // appended in stream order to match the output byte order.
-        total_crc.append(&narrowed_crc);
+        total_crc.append(&chunk.narrowed_crc);
         for stream_crc in &chunk.crc32s {
             total_crc.append(stream_crc);
         }
