@@ -21,14 +21,34 @@
 
 #[cfg(feature = "pure-rust-inflate")]
 mod bench {
-    use gzippy::decompress::inflate::resumable::ResumableInflate2;
+    use gzippy::decompress::inflate::resumable::{
+        ResumableInflate2, BODY_RESUMABLE_FASTLOOP_ENTERS,
+    };
     use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
     use std::time::Instant;
 
     fn make_deflate(payload: &[u8], level: u32) -> Vec<u8> {
-        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
         enc.write_all(payload).unwrap();
         enc.finish().unwrap()
+    }
+
+    /// Best-effort identifier of the active target-cpu for the bench
+    /// header. Doesn't query LLVM directly — just reports the rustc
+    /// target triple and whether `target-cpu=native` is likely set
+    /// (presence of any `target_feature` beyond the baseline).
+    fn get_target_cpu() -> &'static str {
+        #[cfg(target_feature = "bmi2")]
+        return "x86_64+bmi2 (likely native)";
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        return "aarch64+neon (likely native)";
+        #[cfg(not(any(
+            target_feature = "bmi2",
+            all(target_arch = "aarch64", target_feature = "neon")
+        )))]
+        return "generic (no native flags detected)";
     }
 
     /// Best-of-N timing after `warmup` warmup iterations. Both timers
@@ -36,9 +56,15 @@ mod bench {
     /// region; construct any decoder state outside the timed region;
     /// time only the decode. Advisor item E1-E3: bench harness must be
     /// symmetric.
-    fn time_resumable(deflate: &[u8], expected_out: usize, iters: usize, warmup: usize) -> f64 {
+    /// Monolithic decode: one giant output buffer, decoder fills in one
+    /// call. Favors decoders that benefit from large contiguous writes.
+    fn time_resumable_monolithic(
+        deflate: &[u8],
+        expected_out: usize,
+        iters: usize,
+        warmup: usize,
+    ) -> (f64, u64) {
         let mut out = vec![0u8; expected_out + 1024];
-        // Warmup: prime caches, JIT, allocator.
         for _ in 0..warmup {
             let mut decoder =
                 ResumableInflate2::with_until_bits(deflate, 0, deflate.len() * 8).unwrap();
@@ -52,10 +78,9 @@ mod bench {
                 }
             }
         }
+        let fastloop_before = BODY_RESUMABLE_FASTLOOP_ENTERS.load(Ordering::Relaxed);
         let mut best_ns_per_byte = f64::MAX;
         for _ in 0..iters {
-            // Decoder construction is outside the timed region (mirrors
-            // flate2 harness which also constructs outside).
             let mut decoder =
                 ResumableInflate2::with_until_bits(deflate, 0, deflate.len() * 8).unwrap();
             decoder.set_window(&[]).unwrap();
@@ -65,6 +90,60 @@ mod bench {
                 let r = decoder.read_stream(&mut out[total..]).unwrap();
                 total += r.bytes_written;
                 if r.finished || r.bytes_written == 0 {
+                    break;
+                }
+            }
+            let elapsed_ns = start.elapsed().as_nanos() as f64;
+            let ns_per_byte = elapsed_ns / total as f64;
+            if ns_per_byte < best_ns_per_byte {
+                best_ns_per_byte = ns_per_byte;
+            }
+        }
+        let fastloop_after = BODY_RESUMABLE_FASTLOOP_ENTERS.load(Ordering::Relaxed);
+        (best_ns_per_byte, fastloop_after - fastloop_before)
+    }
+
+    /// Chunked decode: read into a 64 KiB output window at a time, like
+    /// a streaming consumer would. Tests whether the win from monolithic
+    /// decode is real or just bench-construction artifact (advisor item B1).
+    fn time_resumable_chunked(
+        deflate: &[u8],
+        expected_out: usize,
+        iters: usize,
+        warmup: usize,
+    ) -> f64 {
+        const CHUNK: usize = 64 * 1024;
+        let mut out = vec![0u8; CHUNK];
+        for _ in 0..warmup {
+            let mut decoder =
+                ResumableInflate2::with_until_bits(deflate, 0, deflate.len() * 8).unwrap();
+            decoder.set_window(&[]).unwrap();
+            let mut total = 0usize;
+            loop {
+                let r = decoder.read_stream(&mut out).unwrap();
+                total += r.bytes_written;
+                if r.finished {
+                    break;
+                }
+                if r.bytes_written == 0 && total >= expected_out {
+                    break;
+                }
+            }
+        }
+        let mut best_ns_per_byte = f64::MAX;
+        for _ in 0..iters {
+            let mut decoder =
+                ResumableInflate2::with_until_bits(deflate, 0, deflate.len() * 8).unwrap();
+            decoder.set_window(&[]).unwrap();
+            let start = Instant::now();
+            let mut total = 0usize;
+            loop {
+                let r = decoder.read_stream(&mut out).unwrap();
+                total += r.bytes_written;
+                if r.finished {
+                    break;
+                }
+                if r.bytes_written == 0 {
                     break;
                 }
             }
@@ -109,35 +188,296 @@ mod bench {
         // 280 unique words; cycling produces diverse-enough literal
         // frequencies to force dynamic Huffman with many codes.
         const WORDS: &[&str] = &[
-            "the", "of", "and", "to", "a", "in", "for", "is", "on", "that", "by", "this", "with",
-            "I", "you", "it", "not", "or", "be", "are", "from", "at", "as", "your", "all", "have",
-            "new", "more", "an", "was", "we", "will", "home", "can", "us", "about", "if", "page",
-            "my", "has", "search", "free", "but", "our", "one", "other", "do", "no", "information",
-            "time", "they", "site", "he", "up", "may", "what", "which", "their", "news", "out",
-            "use", "any", "there", "see", "only", "so", "his", "when", "contact", "here", "business",
-            "who", "web", "also", "now", "help", "get", "view", "online", "first", "am", "been",
-            "would", "how", "were", "me", "services", "some", "these", "click", "its", "like",
-            "service", "than", "find", "price", "date", "back", "top", "people", "had", "list",
-            "name", "just", "over", "state", "year", "day", "into", "email", "two", "health",
-            "world", "next", "used", "go", "work", "last", "most", "products", "music", "buy",
-            "data", "make", "them", "should", "product", "system", "post", "her", "city", "add",
-            "policy", "number", "such", "please", "available", "copyright", "support", "message",
-            "after", "best", "software", "then", "jan", "good", "video", "well", "where", "info",
-            "rights", "public", "books", "high", "school", "through", "each", "links", "she",
-            "review", "years", "order", "very", "privacy", "book", "items", "company", "read",
-            "group", "sex", "need", "many", "user", "said", "de", "does", "set", "under", "general",
-            "research", "university", "January", "mail", "full", "map", "reviews", "program", "life",
-            "know", "games", "way", "days", "management", "part", "could", "great", "United", "hotel",
-            "real", "item", "international", "center", "ebay", "must", "store", "travel", "comments",
-            "made", "development", "report", "off", "member", "details", "line", "terms", "before",
-            "hotels", "did", "send", "right", "type", "because", "local", "those", "using", "results",
-            "office", "education", "national", "car", "design", "take", "posted", "internet", "address",
-            "community", "within", "States", "area", "want", "phone", "shipping", "reserved", "subject",
-            "between", "forum", "family", "long", "based", "code", "show", "even", "black", "check",
-            "special", "prices", "website", "index", "being", "women", "much", "sign", "file", "link",
-            "open", "today", "technology", "south", "case", "project", "same", "pages", "version",
-            "section", "own", "found", "sports", "house", "related", "security", "both", "county",
-            "American", "photo", "game", "members", "power", "while", "care", "network",
+            "the",
+            "of",
+            "and",
+            "to",
+            "a",
+            "in",
+            "for",
+            "is",
+            "on",
+            "that",
+            "by",
+            "this",
+            "with",
+            "I",
+            "you",
+            "it",
+            "not",
+            "or",
+            "be",
+            "are",
+            "from",
+            "at",
+            "as",
+            "your",
+            "all",
+            "have",
+            "new",
+            "more",
+            "an",
+            "was",
+            "we",
+            "will",
+            "home",
+            "can",
+            "us",
+            "about",
+            "if",
+            "page",
+            "my",
+            "has",
+            "search",
+            "free",
+            "but",
+            "our",
+            "one",
+            "other",
+            "do",
+            "no",
+            "information",
+            "time",
+            "they",
+            "site",
+            "he",
+            "up",
+            "may",
+            "what",
+            "which",
+            "their",
+            "news",
+            "out",
+            "use",
+            "any",
+            "there",
+            "see",
+            "only",
+            "so",
+            "his",
+            "when",
+            "contact",
+            "here",
+            "business",
+            "who",
+            "web",
+            "also",
+            "now",
+            "help",
+            "get",
+            "view",
+            "online",
+            "first",
+            "am",
+            "been",
+            "would",
+            "how",
+            "were",
+            "me",
+            "services",
+            "some",
+            "these",
+            "click",
+            "its",
+            "like",
+            "service",
+            "than",
+            "find",
+            "price",
+            "date",
+            "back",
+            "top",
+            "people",
+            "had",
+            "list",
+            "name",
+            "just",
+            "over",
+            "state",
+            "year",
+            "day",
+            "into",
+            "email",
+            "two",
+            "health",
+            "world",
+            "next",
+            "used",
+            "go",
+            "work",
+            "last",
+            "most",
+            "products",
+            "music",
+            "buy",
+            "data",
+            "make",
+            "them",
+            "should",
+            "product",
+            "system",
+            "post",
+            "her",
+            "city",
+            "add",
+            "policy",
+            "number",
+            "such",
+            "please",
+            "available",
+            "copyright",
+            "support",
+            "message",
+            "after",
+            "best",
+            "software",
+            "then",
+            "jan",
+            "good",
+            "video",
+            "well",
+            "where",
+            "info",
+            "rights",
+            "public",
+            "books",
+            "high",
+            "school",
+            "through",
+            "each",
+            "links",
+            "she",
+            "review",
+            "years",
+            "order",
+            "very",
+            "privacy",
+            "book",
+            "items",
+            "company",
+            "read",
+            "group",
+            "sex",
+            "need",
+            "many",
+            "user",
+            "said",
+            "de",
+            "does",
+            "set",
+            "under",
+            "general",
+            "research",
+            "university",
+            "January",
+            "mail",
+            "full",
+            "map",
+            "reviews",
+            "program",
+            "life",
+            "know",
+            "games",
+            "way",
+            "days",
+            "management",
+            "part",
+            "could",
+            "great",
+            "United",
+            "hotel",
+            "real",
+            "item",
+            "international",
+            "center",
+            "ebay",
+            "must",
+            "store",
+            "travel",
+            "comments",
+            "made",
+            "development",
+            "report",
+            "off",
+            "member",
+            "details",
+            "line",
+            "terms",
+            "before",
+            "hotels",
+            "did",
+            "send",
+            "right",
+            "type",
+            "because",
+            "local",
+            "those",
+            "using",
+            "results",
+            "office",
+            "education",
+            "national",
+            "car",
+            "design",
+            "take",
+            "posted",
+            "internet",
+            "address",
+            "community",
+            "within",
+            "States",
+            "area",
+            "want",
+            "phone",
+            "shipping",
+            "reserved",
+            "subject",
+            "between",
+            "forum",
+            "family",
+            "long",
+            "based",
+            "code",
+            "show",
+            "even",
+            "black",
+            "check",
+            "special",
+            "prices",
+            "website",
+            "index",
+            "being",
+            "women",
+            "much",
+            "sign",
+            "file",
+            "link",
+            "open",
+            "today",
+            "technology",
+            "south",
+            "case",
+            "project",
+            "same",
+            "pages",
+            "version",
+            "section",
+            "own",
+            "found",
+            "sports",
+            "house",
+            "related",
+            "security",
+            "both",
+            "county",
+            "American",
+            "photo",
+            "game",
+            "members",
+            "power",
+            "while",
+            "care",
+            "network",
         ];
         let mut data = Vec::with_capacity(size_kb * 1024);
         let mut i = 0usize;
@@ -239,51 +579,97 @@ mod bench {
         ];
 
         println!("\n=== Tight Huffman Decoder Baseline ===");
-        println!("Build: pure-rust-inflate, release, target_feature unset (portable)");
-        println!("Best-of-{} after {} warmup. Decoder construction outside timed region.", ITERS, WARMUP);
+        println!(
+            "Build: pure-rust-inflate, release, target-cpu={}",
+            get_target_cpu()
+        );
+        println!(
+            "Best-of-{} after {} warmup. Decoder construction outside timed region.",
+            ITERS, WARMUP
+        );
+        println!("Two harness shapes: MONO (one giant output buffer) + CHUNKED (64 KiB output reads, mirrors a streaming consumer).");
         println!();
         println!(
-            "{:<20} {:>12} {:>12} {:>10} {:>12} {:>10} {:>10}",
-            "case", "raw_bytes", "deflate_bytes", "compress%", "rust_ns/B", "flate2_ns/B", "ratio"
+            "{:<18} {:>9} {:>9} {:>8} {:>9} {:>10} {:>7} {:>9} {:>7}",
+            "case",
+            "raw",
+            "deflate",
+            "compr%",
+            "mono_ns/B",
+            "flate2_ns/B",
+            "mono_x",
+            "chunk_ns/B",
+            "chunk_x"
         );
-        println!("{}", "-".repeat(100));
+        println!("{}", "-".repeat(108));
 
         let mut report = String::new();
         report.push_str("# Tight Huffman Decoder Baseline\n");
         report.push_str(&format!(
-            "# Build: pure-rust-inflate, release. Best-of-{} runs after {} warmup.\n\n",
-            ITERS, WARMUP
+            "# Build: pure-rust-inflate, target-cpu={}. Best-of-{} runs after {} warmup.\n\n",
+            get_target_cpu(),
+            ITERS,
+            WARMUP
         ));
-        report.push_str("| case | raw_bytes | deflate_bytes | compress% | rust_ns/B | flate2_ns/B | ratio (rust/flate2) |\n");
-        report.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
+        report.push_str("| case | raw | deflate | compr% | mono_ns/B | flate2_ns/B | mono_x | chunk_ns/B | chunk_x |\n");
+        report.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
 
+        // Reset fastloop counter once before the whole run; track per-case
+        // deltas via the monolithic timer (which returns the delta).
+        BODY_RESUMABLE_FASTLOOP_ENTERS.store(0, Ordering::Relaxed);
+
+        let mut total_fastloop_entries: u64 = 0;
         for (label, payload, level) in &cases {
             let deflate = make_deflate(payload, *level);
             let compress_pct = (deflate.len() as f64 / payload.len() as f64) * 100.0;
-            let rust_ns_per_byte = time_resumable(&deflate, payload.len(), ITERS, WARMUP);
+            let (mono_ns_per_byte, fastloop_delta) =
+                time_resumable_monolithic(&deflate, payload.len(), ITERS, WARMUP);
+            let chunk_ns_per_byte = time_resumable_chunked(&deflate, payload.len(), ITERS, WARMUP);
             let flate2_ns_per_byte = time_flate2(&deflate, payload.len(), ITERS, WARMUP);
-            let ratio = rust_ns_per_byte / flate2_ns_per_byte;
+            let mono_ratio = mono_ns_per_byte / flate2_ns_per_byte;
+            let chunk_ratio = chunk_ns_per_byte / flate2_ns_per_byte;
+            total_fastloop_entries += fastloop_delta;
             println!(
-                "{:<20} {:>12} {:>12} {:>9.1}% {:>12.2} {:>10.2} {:>9.2}x",
+                "{:<18} {:>9} {:>9} {:>7.1}% {:>9.2} {:>10.2} {:>6.2}x {:>9.2} {:>6.2}x",
                 label,
                 payload.len(),
                 deflate.len(),
                 compress_pct,
-                rust_ns_per_byte,
+                mono_ns_per_byte,
                 flate2_ns_per_byte,
-                ratio,
+                mono_ratio,
+                chunk_ns_per_byte,
+                chunk_ratio,
             );
             report.push_str(&format!(
-                "| {} | {} | {} | {:.1}% | {:.2} | {:.2} | {:.2}× |\n",
+                "| {} | {} | {} | {:.1}% | {:.2} | {:.2} | {:.2}× | {:.2} | {:.2}× |\n",
                 label,
                 payload.len(),
                 deflate.len(),
                 compress_pct,
-                rust_ns_per_byte,
+                mono_ns_per_byte,
                 flate2_ns_per_byte,
-                ratio,
+                mono_ratio,
+                chunk_ns_per_byte,
+                chunk_ratio,
             ));
         }
+
+        // Per advisor item B7: FASTLOOP must fire across the corpus. If
+        // not, the bench is meaningless because we're measuring the
+        // safe-loop path, not the optimized fastloop.
+        println!();
+        println!(
+            "FASTLOOP entries across all cases: {} (must be > 0; else the bench is meaningless)",
+            total_fastloop_entries
+        );
+        assert!(
+            total_fastloop_entries > 0,
+            "BODY_RESUMABLE_FASTLOOP_ENTERS = 0 — fastloop never fired across {} cases. \
+             Either the corpus is too small (no case > FASTLOOP_MARGIN), or the fastloop \
+             entry condition regressed.",
+            cases.len()
+        );
 
         let _ = std::fs::write("/tmp/gzippy-tight-huffman-baseline.txt", &report);
         println!();
