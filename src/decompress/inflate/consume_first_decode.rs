@@ -395,7 +395,12 @@ unsafe fn fill_byte_avx2(mut dst: *mut u8, end: *const u8, byte: u8) {
 /// Fast match copy for fastloop - may write up to 40 bytes beyond length
 /// ONLY use when you have FASTLOOP_MARGIN bytes of buffer margin!
 #[inline(always)]
-fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32) -> usize {
+pub(crate) fn copy_match_fast(
+    output: &mut [u8],
+    out_pos: usize,
+    distance: u32,
+    length: u32,
+) -> usize {
     let dist = distance as usize;
     let len = length as usize;
 

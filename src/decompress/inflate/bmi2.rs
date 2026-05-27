@@ -67,16 +67,33 @@ pub fn extract_bits(val: u64, n: u8) -> u64 {
 /// `codeword_bits`: how many bits the codeword consumed
 /// `extra_bits`: how many extra bits to extract
 ///
-/// Inlined and branchless for maximum performance
+/// Inlined and branchless for maximum performance.
+///
+/// Lever B4 (pure-Rust ISA-L sign-off): when compiled with
+/// `target-feature=+bmi2`, the extras extraction uses the single-cycle
+/// BZHI instruction (matching vendor `consume_first_decode.rs::bzhi_u64`
+/// at `:168-182`). Without BMI2, the branchless mask path is identical
+/// to the prior implementation — non-BMI2 builds see no codegen change.
 #[inline(always)]
 pub fn decode_extra_bits(saved_bitbuf: u64, codeword_bits: u8, extra_bits: u8) -> u64 {
-    // Branchless: shift right to position extra bits at bit 0
+    // Branchless: shift right to position extra bits at bit 0.
     let shifted = saved_bitbuf >> codeword_bits;
 
-    // Branchless mask: when extra_bits is 0, mask is 0
-    // When extra_bits is 64, we'd overflow, but DEFLATE max is 13 extra bits
-    let mask = (1u64 << extra_bits).wrapping_sub(1);
-    shifted & mask
+    // Extract low `extra_bits` from `shifted`. On BMI2-capable builds
+    // this compiles to a single `bzhi` instruction; otherwise to a
+    // mask-and-AND.
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        std::arch::x86_64::_bzhi_u64(shifted, extra_bits as u32)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        // Branchless mask: when extra_bits is 0, mask is 0.
+        // When extra_bits is 64, we'd overflow, but DEFLATE max is 13
+        // extra bits.
+        let mask = (1u64 << extra_bits).wrapping_sub(1);
+        shifted & mask
+    }
 }
 
 #[cfg(test)]

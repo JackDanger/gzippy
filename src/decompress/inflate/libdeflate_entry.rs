@@ -209,17 +209,24 @@ impl LitLenEntry {
 
     /// Decode length value using saved_bitbuf
     /// Length = base + extra_bits_value
-    /// Decode length from saved_bitbuf (branchless)
+    ///
+    /// Lever B4 (pure-Rust ISA-L sign-off): now delegates extras
+    /// extraction to `bmi2::decode_extra_bits`, which uses the BZHI
+    /// instruction on BMI2-capable builds. Matches vendor pattern at
+    /// `consume_first_decode.rs:1071-1072, :1111-1112` and the
+    /// symmetric `decode_distance` below.
     #[inline(always)]
     pub fn decode_length(self, saved_bitbuf: u64) -> u32 {
         let base = self.length_base() as u32;
         let codeword_bits = self.codeword_bits();
         let total_bits = self.total_bits();
         let extra_bits = total_bits - codeword_bits;
-        // Branchless: when extra_bits is 0, mask is 0 and extra_value is 0
-        let extra_mask = (1u64 << extra_bits).wrapping_sub(1);
-        let extra_value = (saved_bitbuf >> codeword_bits) & extra_mask;
-        base + extra_value as u32
+        let extra_value = crate::decompress::inflate::bmi2::decode_extra_bits(
+            saved_bitbuf,
+            codeword_bits,
+            extra_bits,
+        ) as u32;
+        base + extra_value
     }
 }
 
@@ -496,6 +503,21 @@ impl LitLenTable {
         let subtable_bits = entry.subtable_bits();
         let main_bits = entry.main_table_bits();
         let idx = ((bits >> main_bits) as usize) & ((1usize << subtable_bits) - 1);
+        // SAFETY: subtable entries are allocated during build
+        unsafe { *self.entries.get_unchecked(subtable_start + idx) }
+    }
+
+    /// Look up subtable entry from already-shifted bitbuf (libdeflate
+    /// fastloop pattern). Use when bitbuf has already been shifted by
+    /// `main_table_bits`. Mirrors `DistTable::lookup_subtable_direct`
+    /// (`:668-674`). Vendor pattern: `consume_first_decode.rs:1042-1046`
+    /// — vendor uses post-consume bitbuf directly with no extra shift.
+    /// Lever B6 (sixth-pass advisor sign-off).
+    #[inline(always)]
+    pub fn lookup_subtable_direct(&self, entry: LitLenEntry, shifted_bits: u64) -> LitLenEntry {
+        let subtable_start = entry.subtable_start() as usize;
+        let subtable_bits = entry.subtable_bits();
+        let idx = (shifted_bits as usize) & ((1usize << subtable_bits) - 1);
         // SAFETY: subtable entries are allocated during build
         unsafe { *self.entries.get_unchecked(subtable_start + idx) }
     }
