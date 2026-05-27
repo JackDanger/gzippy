@@ -597,6 +597,7 @@ fn decode_chunk_pure_bulk_impl(
         };
         let mut out_pos_in_view = prev_len - stream_data_start;
 
+        let block_start_bit = bits.bit_position();
         let result = decode_block(
             &mut bits,
             stream_view,
@@ -605,6 +606,12 @@ fn decode_chunk_pure_bulk_impl(
             &mut scratch,
         )
         .map_err(|e| {
+            eprintln!(
+                "[bulk-diag] decode_block error={e:?} at block_start_bit={block_start_bit} \
+                 (encoded_offset_bits={encoded_offset_bits}, prev_len={prev_len}, \
+                 stream_data_start={stream_data_start}, predecessor.len()={}, input.len()={}, bits.pos={})",
+                predecessor.len(), input.len(), bits.pos
+            );
             ChunkDecodeError::InflateFailed(InflateError::Internal(match e {
                 BulkDecodeError::InvalidHuffmanCode => -101,
                 BulkDecodeError::InvalidLookback => -102,
@@ -618,6 +625,18 @@ fn decode_chunk_pure_bulk_impl(
         chunk.note_clean_bytes_written_in_place(prev_len, bytes_written, true);
 
         let block_end_bit = bits.bit_position();
+
+        // No-progress guard: if a block produces zero output AND the
+        // bit cursor didn't advance AND it's not a final block, we're
+        // at sub-byte EOF padding (or some other no-progress state).
+        // Without this guard the bulk loop spins forever on inputs
+        // like the sub-byte EOF padding fragment exercised by
+        // `decode_chunk_isal_terminates_on_sub_byte_eof_padding`.
+        if bytes_written == 0 && block_end_bit == block_start_bit && !result.is_final_block {
+            reached_stream_end = true;
+            break;
+        }
+
         last_end_bit = block_end_bit;
         last_eob_pos = block_end_bit;
 
