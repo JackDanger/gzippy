@@ -1737,12 +1737,71 @@ mod tests {
             max_decoded_chunk_size: 20 * 512 * 1024,
             crc32_enabled: false,
         };
+        // BISECT: directly invoke decode_block with a Vec-backed output
+        // that mirrors chunk.data's capacity (10 MiB), bypassing the
+        // chunk-level orchestration. This isolates "is the bug in the
+        // chunk-level wrapper, or in decode_block on a 10-MiB output?"
+        {
+            use crate::decompress::inflate::consume_first_decode::Bits;
+            use crate::decompress::parallel::isal_lut_bulk::{decode_block, DecoderScratch};
+            let mut output = vec![0u8; cfg.max_decoded_chunk_size];
+            let mut bits = Bits::new(deflate);
+            bits.refill();
+            let mut scratch = DecoderScratch::new();
+            let predecessor = [0u8; 32768];
+            let mut out_pos = 0usize;
+            let mut block_count = 0;
+            loop {
+                let r = decode_block(
+                    &mut bits,
+                    &mut output,
+                    &mut out_pos,
+                    &predecessor[..],
+                    &mut scratch,
+                );
+                match r {
+                    Ok(res) => {
+                        block_count += 1;
+                        if res.is_final_block {
+                            eprintln!(
+                                "[direct-vec] decoded {block_count} blocks, total {out_pos} bytes (final)"
+                            );
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[direct-vec] decode_block error={e:?} after {block_count} blocks, out_pos={out_pos}"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
         // Call the bulk impl directly to bypass the OnceLock env-var check.
-        let chunk =
-            decode_chunk_pure_bulk_impl(deflate, 0, deflate_stop_bits, &[0u8; 32768][..], cfg)
-                .unwrap();
-        let flat = flatten(&chunk);
-        assert_eq!(flat, payload, "byte-perfect output");
+        let chunk_result =
+            decode_chunk_pure_bulk_impl(deflate, 0, deflate_stop_bits, &[0u8; 32768][..], cfg);
+        match chunk_result {
+            Ok(chunk) => {
+                let flat = flatten(&chunk);
+                let same = flat
+                    .iter()
+                    .zip(payload.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                eprintln!(
+                    "[chunk-repro] decoded {} bytes; matches flate2 for first {} bytes",
+                    flat.len(),
+                    same
+                );
+                assert_eq!(flat, payload[..flat.len()], "first {} bytes diverge", same);
+            }
+            Err(e) => {
+                eprintln!("[chunk-repro] ERR: {e:?}");
+                panic!("decode failed: {e:?}");
+            }
+        }
     }
 
     #[test]
