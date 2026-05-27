@@ -495,8 +495,10 @@ mod tests {
     fn decode_block_random_data_l1_with_zero_predecessor() {
         use std::io::Write;
         let mut rng: u64 = 0xcafef00d_deadbeef;
-        let mut payload = Vec::with_capacity(1 << 20);
-        for _ in 0..(1 << 20) {
+        // 4 KiB — small enough to be one block at most, still triggers
+        // the bug. 1 MiB also fails identically.
+        let mut payload = Vec::with_capacity(4096);
+        for _ in 0..4096 {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
             payload.push((rng >> 24) as u8);
         }
