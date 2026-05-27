@@ -573,6 +573,70 @@ mod tests {
         assert_eq!(&output[..out_pos], &payload[..out_pos]);
     }
 
+    /// btype01-heavy fixture (mimics tests::routing::make_btype01_heavy_data
+    /// compressed at L1). Exercises the full multi-block decode against
+    /// flate2 ground truth. Smaller payload (256 KiB instead of 24 MiB)
+    /// so it runs fast in the unit-test suite.
+    #[test]
+    fn decode_block_btype01_heavy_l1_full_stream() {
+        use std::io::Write;
+        let phrases: &[&[u8]] = &[b"abc", b"foo bar ", b"the quick brown ", b"hello ", b"xyz "];
+        let mut payload = Vec::with_capacity(256 * 1024);
+        let mut rng: u64 = 0xb0bd1ec0de;
+        while payload.len() < 256 * 1024 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if (rng >> 32) % 100 < 70 {
+                payload.push((rng >> 16) as u8);
+            } else {
+                let phrase = phrases[(rng as usize) % phrases.len()];
+                let take = phrase.len().min(256 * 1024 - payload.len());
+                payload.extend_from_slice(&phrase[..take]);
+            }
+        }
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(1));
+        enc.write_all(&payload).unwrap();
+        let gz = enc.finish().unwrap();
+        let (_hdr, hdr_size) =
+            crate::decompress::parallel::gzip_format::read_header(&gz).expect("gz header");
+        let deflate = &gz[hdr_size..gz.len() - 8];
+
+        let mut output = vec![0u8; payload.len() + 4096];
+        let mut bits = Bits::new(deflate);
+        bits.refill();
+        let mut scratch = DecoderScratch::new();
+        let predecessor = [0u8; MAX_WINDOW_SIZE];
+
+        let mut out_pos = 0;
+        let mut block_count = 0;
+        loop {
+            let result = decode_block(
+                &mut bits,
+                &mut output,
+                &mut out_pos,
+                &predecessor[..],
+                &mut scratch,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "btype01 L1 block decode failed at block {block_count}, out_pos={out_pos}: {e:?}"
+                )
+            });
+            block_count += 1;
+            if result.is_final_block {
+                break;
+            }
+        }
+        assert_eq!(out_pos, payload.len(), "output length mismatch");
+        for i in (0..out_pos).step_by(4096) {
+            let end = (i + 4096).min(out_pos);
+            assert_eq!(
+                &output[i..end],
+                &payload[i..end],
+                "divergence at [{i}..{end}]"
+            );
+        }
+    }
+
     /// Multi-block cross-reference test: a payload large enough to force
     /// multiple Huffman blocks, with strong intra-stream redundancy so
     /// back-references reach across block boundaries.
