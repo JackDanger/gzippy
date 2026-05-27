@@ -226,6 +226,20 @@ pub struct ResumableInflate2<'a> {
     /// into a non-dynamic block. Invariant: `Some(_)` iff
     /// `block_state == InDynamic`.
     pub(crate) dynamic_tables: Option<(LitLenTable, DistTable)>,
+    /// Parallel ISA-L LUT tables for the same dynamic block. Built
+    /// alongside `dynamic_tables` so the inner-Huffman migration
+    /// (advisor 2026-05-27, "Option D") can drop a new inner loop
+    /// using the multi-symbol-pack LUT format without restructuring
+    /// data flow. Same lifecycle as `dynamic_tables` — built in
+    /// `parse_dynamic_header`, dropped in `finish_current_block`.
+    /// Behind cfg(feature = "pure-rust-inflate") only; on
+    /// `isal-compression` builds the field is omitted to avoid
+    /// pulling the LUT struct into builds that don't need it.
+    #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+    pub(crate) dynamic_tables_isal: Option<(
+        crate::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure,
+        crate::decompress::parallel::isal_lut_bulk::BulkDistDecoder,
+    )>,
     /// Set by `reset_for_next_stream` (used between gzip members); the
     /// next `read_stream` call fires `END_OF_STREAM_HEADER` if that
     /// stopping point is configured. Mirrors vendor pattern
@@ -255,6 +269,8 @@ impl<'a> ResumableInflate2<'a> {
             stopped_at: StoppingPoint::NONE,
             encoded_until_bits: until_bits.min(input_bits),
             dynamic_tables: None,
+            #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+            dynamic_tables_isal: None,
             pending_stream_header_stop: false,
         })
     }
@@ -269,6 +285,10 @@ impl<'a> ResumableInflate2<'a> {
         self.last_btype = 0;
         self.stopped_at = StoppingPoint::NONE;
         self.dynamic_tables = None;
+        #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+        {
+            self.dynamic_tables_isal = None;
+        }
         self.pending_stream_header_stop = false;
         Ok(())
     }
@@ -376,6 +396,10 @@ impl<'a> ResumableInflate2<'a> {
         self.last_btype = 0;
         self.stopped_at = StoppingPoint::NONE;
         self.dynamic_tables = None;
+        #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+        {
+            self.dynamic_tables_isal = None;
+        }
         self.pending_stream_header_stop = true;
     }
 
@@ -682,6 +706,10 @@ impl<'a> ResumableInflate2<'a> {
         // Block is ending — drop tables. If the NEXT block is also
         // dynamic, `try_enter_next_block`'s BTYPE=2 arm rebuilds them.
         self.dynamic_tables = None;
+        #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+        {
+            self.dynamic_tables_isal = None;
+        }
         if self.last_bfinal {
             // Per RFC 1952 the gzip footer is byte-aligned; the encoder
             // pads the last DEFLATE block's bit stream with zero bits up
@@ -1432,6 +1460,49 @@ fn parse_dynamic_header(bits: &mut Bits) -> Result<(LitLenTable, DistTable)> {
         )
     })?;
     Ok((litlen_table, dist_table))
+}
+
+/// Build IsalLitLenCodePure + BulkDistDecoder from the raw code lengths of
+/// a dynamic-Huffman block. The lens are the same arrays parse_dynamic_header
+/// uses internally; this helper accepts them directly so the caller doesn't
+/// have to re-parse the header. Used by the Option-D inner-Huffman migration
+/// (advisor 2026-05-27): when the new inner loop is active, every dynamic
+/// block builds both LUT formats. The libdeflate format will be removed
+/// in a follow-up commit once the ISA-L inner loop is verified on neurotic.
+#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+pub(crate) fn build_isal_dynamic_tables(
+    litlen_lengths: &[u8],
+    dist_lengths: &[u8],
+) -> Result<(
+    crate::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure,
+    crate::decompress::parallel::isal_lut_bulk::BulkDistDecoder,
+)> {
+    use crate::decompress::parallel::isal_huffman_pure::{IsalLitLenCodePure, LIT_LEN};
+    use crate::decompress::parallel::isal_lut_bulk::BulkDistDecoder;
+
+    let mut litlen = IsalLitLenCodePure::new_empty();
+    // The ISA-L LUT builder accepts up to 288 entries (RFC reserved 286/287
+    // included). Dynamic blocks have hlit ≤ 286; pad with zeros.
+    let mut litlen_padded = [0u8; LIT_LEN];
+    litlen_padded[..litlen_lengths.len()].copy_from_slice(litlen_lengths);
+    if !litlen.rebuild_from(&litlen_padded) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "ISA-L dynamic header: invalid litlen code lengths",
+        ));
+    }
+    let mut dist = BulkDistDecoder::new();
+    // BulkDistDecoder is sized 32 (RFC reserved 30/31); dist_lengths ≤ 30.
+    let mut dist_padded = [0u8; 32];
+    dist_padded[..dist_lengths.len()].copy_from_slice(dist_lengths);
+    let err = dist.initialize_from_lengths(&dist_padded, false);
+    if err != crate::decompress::parallel::error::Error::None {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "ISA-L dynamic header: invalid dist code lengths",
+        ));
+    }
+    Ok((litlen, dist))
 }
 
 // =============================================================================
