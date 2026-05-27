@@ -250,6 +250,81 @@ mod tests {
         }
     }
 
+    /// Real-world silesia: gzip it ourselves at level 9, then decode
+    /// via ResumableInflate2 in 64 KiB chunks (mirrors the production
+    /// chunked-call shape). Asserts byte-identical to the libdeflate
+    /// oracle.
+    ///
+    /// This test exists because the synthetic 729-case differential
+    /// did NOT catch a real bug (`InvalidLookback` on silesia in the
+    /// neurotic bench, 2026-05-27). Real-world deflate streams exercise
+    /// match-distance patterns that PRNG / phrase-rotation fixtures
+    /// don't. Without this test the next regression goes unnoticed
+    /// until neurotic measurement.
+    ///
+    /// silesia.tar.xz must be present in benchmark_data/; the test
+    /// skips with a printed warning if missing (CI without the fixture
+    /// won't fail).
+    #[test]
+    fn resumable_decodes_real_silesia() {
+        use std::path::Path;
+        use std::process::Command;
+
+        let xz_path = Path::new("benchmark_data/silesia.tar.xz");
+        let tar_path = Path::new("benchmark_data/silesia.tar");
+        if !xz_path.exists() {
+            eprintln!(
+                "silesia: benchmark_data/silesia.tar.xz missing — skipping. \
+                 (Get from https://sun.aei.polsl.pl//~sdeor/index.php?page=silesia)"
+            );
+            return;
+        }
+        if !tar_path.exists() {
+            eprintln!("silesia: extracting silesia.tar (~211 MB)…");
+            let status = Command::new("xz")
+                .arg("-dk")
+                .arg(xz_path)
+                .status()
+                .expect("xz -dk failed");
+            assert!(status.success(), "xz extraction failed");
+        }
+        let payload = std::fs::read(tar_path).expect("read silesia.tar");
+        eprintln!("silesia: {} bytes raw", payload.len());
+
+        // gzip -9 — what bench-sm uses.
+        let deflate = make_deflate(&payload, 9);
+        eprintln!(
+            "silesia: {} bytes deflate ({:.1}%)",
+            deflate.len(),
+            (deflate.len() as f64 / payload.len() as f64) * 100.0
+        );
+
+        // Decode via ResumableInflate2 in chunks of various sizes.
+        // First try monolithic (single call) to isolate chunked-mode bugs.
+        // Then 64 KiB (chunked-bench), 128 KiB (ALLOCATION_CHUNK_SIZE),
+        // 256 KiB ("monolithic-ish").
+        for chunk_size in [payload.len() + 1024, 64 * 1024, 128 * 1024, 256 * 1024] {
+            eprintln!("silesia: decoding with {}-byte chunks…", chunk_size);
+            let got = decode_resumable_in_chunks(&deflate, chunk_size);
+            if got != payload {
+                let first_diff = got
+                    .iter()
+                    .zip(payload.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(got.len().min(payload.len()));
+                panic!(
+                    "silesia mismatch with chunk_size={}: got.len()={} payload.len()={} \
+                     first_diff_at={}",
+                    chunk_size,
+                    got.len(),
+                    payload.len(),
+                    first_diff
+                );
+            }
+        }
+        eprintln!("silesia: OK at all three chunk sizes");
+    }
+
     /// Decode using the given schedule of output buffer sizes for
     /// successive read_stream calls. If the schedule runs out before
     /// the stream finishes, the LAST entry is reused indefinitely.
