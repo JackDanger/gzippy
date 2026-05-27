@@ -36,6 +36,18 @@ pub static MULTI_LITERAL_MISSES: AtomicU64 = AtomicU64::new(0);
 pub static MULTI_LITERAL_SYMBOLS: AtomicU64 = AtomicU64::new(0);
 pub static BODY_RESUMABLE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static BODY_RESUMABLE_FASTLOOP_ENTERS: AtomicU64 = AtomicU64::new(0);
+/// Total bytes produced across all `read_stream` calls. Divide by
+/// `READ_STREAM_CALLS` to get bytes/call — exposes the chunked-vs-mono
+/// gap in production. Step 2.5 (advisor third-pass post-C1 verdict):
+/// if production's bytes/call is small (e.g. ~64 KiB) we have the same
+/// chunked-mode problem the bench shows; if it's large (multi-MiB) the
+/// bench gap is bench-only and production is fine.
+pub static READ_STREAM_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static READ_STREAM_BYTES_OUT: AtomicU64 = AtomicU64::new(0);
+/// Sum across all calls. Divide by `READ_STREAM_CALLS` for average
+/// per-call. High avg = caller passes small buffers (chunked); low
+/// avg = caller passes big buffers (monolithic-ish).
+pub static READ_STREAM_OUTPUT_BUF_BYTES: AtomicU64 = AtomicU64::new(0);
 use super::libdeflate_entry::{DistTable, LitLenTable, HUFFDEC_END_OF_BLOCK, HUFFDEC_EXCEPTIONAL};
 use super::stopping_point::StoppingPoint;
 
@@ -383,6 +395,15 @@ impl<'a> ResumableInflate2<'a> {
     ///   (3) `encoded_until_bits` is reached,
     ///   (4) the final block's BFINAL completes.
     pub fn read_stream(&mut self, output: &mut [u8]) -> Result<InflateStreamResult> {
+        // Step 2.5 instrumentation: record per-call shape so production
+        // hot-path analysis can distinguish "small-buffer chunked
+        // caller" from "large-buffer monolithic caller". Counters are
+        // single atomic-add per call (not per iteration) so the hot
+        // path pays no per-symbol tax.
+        READ_STREAM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        READ_STREAM_OUTPUT_BUF_BYTES
+            .fetch_add(output.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
         self.stopped_at = StoppingPoint::NONE;
         let out_pos_start = 0usize;
         let mut out_pos = out_pos_start;
@@ -562,8 +583,10 @@ impl<'a> ResumableInflate2<'a> {
 
         let finished =
             matches!(self.block_state, BlockState::Finished) && self.pending_match.is_none();
+        let bytes_written = out_pos - out_pos_start;
+        READ_STREAM_BYTES_OUT.fetch_add(bytes_written as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(InflateStreamResult {
-            bytes_written: out_pos - out_pos_start,
+            bytes_written,
             stopped_at: self.stopped_at,
             bit_position: self.bits.bit_position(),
             finished,
