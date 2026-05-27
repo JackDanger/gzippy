@@ -609,6 +609,23 @@ pub fn drive<W: std::io::Write>(
             POST_PROCESS_FUSED_PATH.load(Ordering::Relaxed),
             POST_PROCESS_SMALL_MARKERS_PATH.load(Ordering::Relaxed),
         );
+        // Prefetch dispatcher outcomes: disambiguates worker idleness.
+        // If `called` is high but `saturated` + `zero_submitted` together
+        // dominate, dispatch is firing but the gates short-circuit it.
+        // If `called` is low, the dispatcher just isn't being invoked
+        // often enough — and the fix is hoisting the call site.
+        use crate::decompress::parallel::block_fetcher::{
+            PREFETCH_NEW_BLOCKS_CALLED, PREFETCH_RETURN_SATURATED, PREFETCH_RETURN_SUBMITTED_ANY,
+            PREFETCH_RETURN_ZERO_SUBMITTED, PREFETCH_TOTAL_SUBMITTED,
+        };
+        eprintln!(
+            "  Prefetch dispatch: called={} saturated={} zero_submitted={} any_submitted={} total_submitted={}",
+            PREFETCH_NEW_BLOCKS_CALLED.load(Ordering::Relaxed),
+            PREFETCH_RETURN_SATURATED.load(Ordering::Relaxed),
+            PREFETCH_RETURN_ZERO_SUBMITTED.load(Ordering::Relaxed),
+            PREFETCH_RETURN_SUBMITTED_ANY.load(Ordering::Relaxed),
+            PREFETCH_TOTAL_SUBMITTED.load(Ordering::Relaxed),
+        );
         // Body-failure forensic detail — speculation-accuracy attack.
         // After disprove-advisor confirmed body failures are the dominant
         // re-decode cost, characterize them by error variant + waste size.
