@@ -429,9 +429,9 @@ remaining surface area to land it.
   flag + new consumer branch, OR clear `data_with_markers` and
   refactor the tail-window publish to use `chunk.narrowed` for the
   trailing bytes.
-- **`narrow_u16_to_u8` AVX2 — RE-ENABLED (`37fc295`); downclock claim
-  unfalsified.** The prior env-gate was removed and replaced with a
-  pure runtime `is_x86_feature_detected!("avx2")` check. Same-session
+- **`narrow_u16_to_u8` AVX2 — RE-ENABLED + downclock claim REFUTED
+  (`37fc295`, `4e939c7`).** Prior env-gate removed and replaced with
+  a pure runtime `is_x86_feature_detected!("avx2")` check. Same-session
   controlled bench (today's neurotic state, AVX2-off vs AVX2-on
   three runs):
 
@@ -442,15 +442,26 @@ remaining surface area to land it.
   | `37fc295` (AVX2 on) run 2 | 878 | 1893 | 0.46× |
 
   +1.9 % gzippy, within 2-5 % CV — statistically indistinguishable.
-  The "scary warning" about a 3× downclock through `apply_window` +
-  `populate_subchunk_windows` does NOT trigger on silesia, BUT the
-  new counters (`POST_PROCESS_FUSED_PATH=23,
-  POST_PROCESS_SMALL_MARKERS_PATH=2`) show silesia exercises the
-  small-markers path only 2/25 = 8 % of post-process tasks. Silesia
-  is the wrong fixture to falsify the downclock claim. The change is
-  kept (it's strictly safer than the env-gate) but the original
-  observation could still be real on a workload that exercises this
-  path heavily — that workload is not in the current corpus.
+  Counter (`POST_PROCESS_FUSED_PATH=23, POST_PROCESS_SMALL_MARKERS_PATH=2`)
+  showed silesia exercises the small-markers path only 8 % of tasks,
+  so the wall-level null result was diluted exposure. To remove the
+  dilution, `4e939c7` added a `GZIPPY_NARROW_INJECT=1` env var that
+  injects a 4 KiB `narrow_u16_to_u8` call on a scratch buffer before
+  EVERY task's `populate_subchunk_windows` — 12× more AVX-256 exposure
+  than current production. 5-trial wall comparison on neurotic:
+
+  | mode | trials (ms) | mean | drop-warmup mean |
+  |---|---|---:|---:|
+  | baseline | 414, 442, 439, 421, 433 | 429.8 | 433.8 |
+  | injection on | 465, 393, 442, 438, 430 | 433.6 | 425.8 |
+
+  +0.9 % all-trial / -1.9 % drop-warmup. Both within 2-6 % per-set CV.
+  **Downclock claim is empirically refuted at the resolution that
+  matters.** The original session's 3× observation was likely a
+  measurement artifact (cache state, system load, or attribution to
+  the wrong region) or a CPU-model difference not relevant to the
+  i9-14000 neurotic target. The probe is kept as a diagnostic
+  (one-line env-var to re-test on a different host).
 - **`publish_subchunk_windows` runs on consumer — OPEN (light surgical).**
   `chunk_fetcher.rs:2096`. Per-subchunk window_map insert serialized
   on consumer thread; could move to the worker right after
