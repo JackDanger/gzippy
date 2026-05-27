@@ -1737,25 +1737,24 @@ pub(crate) fn build_isal_dynamic_tables(
     crate::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure,
     crate::decompress::parallel::isal_lut_bulk::BulkDistDecoder,
 )> {
-    use crate::decompress::parallel::isal_huffman_pure::{IsalLitLenCodePure, LIT_LEN};
+    use crate::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure;
     use crate::decompress::parallel::isal_lut_bulk::BulkDistDecoder;
 
+    if litlen_lengths.len() > 288 || dist_lengths.len() > 32 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "ISA-L dynamic header: code-length arrays exceed expected sizes",
+        ));
+    }
     let mut litlen = IsalLitLenCodePure::new_empty();
-    // The ISA-L LUT builder accepts up to 288 entries (RFC reserved 286/287
-    // included). Dynamic blocks have hlit ≤ 286; pad with zeros.
-    let mut litlen_padded = [0u8; LIT_LEN];
-    litlen_padded[..litlen_lengths.len()].copy_from_slice(litlen_lengths);
-    if !litlen.rebuild_from(&litlen_padded) {
+    if !litlen.rebuild_from(litlen_lengths) {
         return Err(Error::new(
             ErrorKind::InvalidData,
             "ISA-L dynamic header: invalid litlen code lengths",
         ));
     }
     let mut dist = BulkDistDecoder::new();
-    // BulkDistDecoder is sized 32 (RFC reserved 30/31); dist_lengths ≤ 30.
-    let mut dist_padded = [0u8; 32];
-    dist_padded[..dist_lengths.len()].copy_from_slice(dist_lengths);
-    let err = dist.initialize_from_lengths(&dist_padded, false);
+    let err = dist.initialize_from_lengths(dist_lengths, false);
     if err != crate::decompress::parallel::error::Error::None {
         return Err(Error::new(
             ErrorKind::InvalidData,
