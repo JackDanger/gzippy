@@ -780,6 +780,79 @@ fn return_bootstrap_output_to_pool(mut v: Vec<u16>) {
     });
 }
 
+/// RAII guard that owns the bootstrap output buffer and returns it to
+/// the thread-local pool on Drop — UNCONDITIONALLY (success OR failure).
+///
+/// Background: prior to this guard, the bootstrap function held the
+/// buffer as a local `Vec<u16>` and only returned it to the pool on
+/// the success path (via the caller's
+/// `return_bootstrap_output_to_pool(std::mem::take(&mut bootstrap.markers))`
+/// at the call site). On Err, the function early-returned and the
+/// local Vec dropped — its underlying allocation (often 7 MB, well
+/// above glibc's 128 KiB `MMAP_THRESHOLD`) went through `munmap` and
+/// the next `take_*_from_pool` on that thread paid a fresh
+/// `mmap + first-touch faults` (≈ 2.7 ms per leaked Vec).
+///
+/// The May 26 2026 visibility counters made this measurable: across
+/// silesia-large 16T, `takes=98 returns=64` — i.e. **34 takes never
+/// returned**, matching the 33 bootstrap failures observed via
+/// `worker.bootstrap.outcome` instrumentation. With this guard, the
+/// failure path also returns the buffer.
+///
+/// On success the buffer is consumed via `std::mem::take(output)`
+/// inside the closure; the guard's `inner` then has capacity = 0
+/// (mem::take swaps with `Vec::default()`), and the Drop's
+/// `cap == 0` check makes the post-mem::take Drop a no-op so we
+/// don't pollute the pool's slot with an empty Vec.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+struct BootstrapBuffer {
+    inner: Option<Vec<u16>>,
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+impl BootstrapBuffer {
+    fn new() -> Self {
+        Self {
+            inner: Some(take_bootstrap_output_from_pool()),
+        }
+    }
+    fn get_mut(&mut self) -> &mut Vec<u16> {
+        self.inner
+            .as_mut()
+            .expect("BootstrapBuffer::get_mut after take")
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+impl Drop for BootstrapBuffer {
+    fn drop(&mut self) {
+        if let Some(v) = self.inner.take() {
+            // On the success path, the closure called
+            // `std::mem::take(output)` to transfer the buffer into
+            // `DeflateBootstrap.markers` — the guard's inner now has
+            // cap=0 because `mem::take` swapped in `Vec::default()`.
+            // Skip the return; the success-path caller will
+            // explicitly return the BIG markers Vec to the pool.
+            //
+            // On the failure path the buffer is intact (cap >= 128 KiB
+            // from `take_*_from_pool`) and we want to put it back so
+            // the next take on this thread reuses the same warm pages.
+            if v.capacity() > 0 {
+                return_bootstrap_output_to_pool(v);
+            }
+        }
+    }
+}
+
 /// Counter: fresh `Vec::reserve(128*1024)` events from
 /// `take_bootstrap_output_from_pool`. Each is an mmap-eligible
 /// allocation (256 KiB u16 buffer > glibc mmap threshold). With
@@ -954,14 +1027,16 @@ fn bootstrap_with_deflate_block_inner(
     }
 
     // Bootstrap output: typically ~32 KiB + one trailing block, up to
-    // ~128 KiB worst case for a single dense dynamic block.
-    // EXPERIMENT: take pooled buffer from thread-local instead of fresh alloc.
-    let mut output: Vec<u16> = take_bootstrap_output_from_pool();
+    // ~128 KiB worst case for a single dense dynamic block. The
+    // `BootstrapBuffer` RAII guard ensures the buffer goes back to
+    // the thread-local pool on BOTH the success and failure paths —
+    // see the type's doc comment for the leak this plugs.
+    let mut buffer_guard = BootstrapBuffer::new();
     BOOTSTRAP_BLOCK.with(|cell_block| {
         let mut block = cell_block.borrow_mut();
         block.reset(None, None);
         let block = &mut *block;
-        let output = &mut output;
+        let output: &mut Vec<u16> = buffer_guard.get_mut();
 
         // Tracks trailing CLEAN-byte run length. When it reaches
         // MAX_WINDOW_SIZE AT a block boundary, the next 32 KiB of `output`
