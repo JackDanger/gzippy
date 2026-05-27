@@ -568,12 +568,10 @@ pub fn drive<W: std::io::Write>(
             RETURN_U8_CALLS.load(Ordering::Relaxed),
         );
         eprintln!(
-            "  Buffer pool u16: hits={} misses={} returns={}  (steal u8={} u16={})",
+            "  Buffer pool u16: hits={} misses={} returns={}",
             TAKE_U16_HITS.load(Ordering::Relaxed),
             TAKE_U16_MISSES.load(Ordering::Relaxed),
             RETURN_U16_CALLS.load(Ordering::Relaxed),
-            STEAL_U8_HITS.load(Ordering::Relaxed),
-            STEAL_U16_HITS.load(Ordering::Relaxed),
         );
         // Per-worker distribution — disambiguates "16 workers each
         // cold-start" (first-touch dominance) vs "worker 0 is the
