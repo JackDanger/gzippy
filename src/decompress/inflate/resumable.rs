@@ -1060,6 +1060,22 @@ fn decode_huffman_body_resumable(
                 // LLVM proves it on inlining). In the safe loop (1-byte
                 // output buffers exist in unit tests), the check
                 // prevents UB.
+                //
+                // T3 BUG FIX 2026-05-27: when we carry forward an entry
+                // (entry = e_next; continue), the next iter's consume
+                // requires up to 45 bits (length codeword + extras +
+                // dist codeword + extras). Post-batch bitsleft can be
+                // as low as 8 (after 4 literals from a 56-bit start).
+                // We MUST refill before carrying, else the next consume
+                // reads garbage bits past the valid window. Each carry
+                // site below does `if (bitsleft as u8) < 56 { refill }`
+                // before the carry to guarantee sufficient bits.
+                //
+                // Caught by the silesia unit test (real-world deflate);
+                // missed by the 729-case synthetic differential because
+                // synthetic fixtures don't produce the multi-literal-
+                // followed-by-length pattern frequently enough to trip
+                // the bug deterministically.
                 if (bitsleft as u8) >= REFILL_THRESHOLD {
                     let mut e_next = litlen.lookup(bitbuf);
                     let mut r_next = e_next.raw();
@@ -1106,16 +1122,27 @@ fn decode_huffman_body_resumable(
                                         continue;
                                     }
                                     // 4th was non-literal — carry as
-                                    // next iter's entry.
+                                    // next iter's entry. REFILL FIRST
+                                    // so next iter has bits to consume
+                                    // (T3 bug fix).
+                                    if (bitsleft as u8) < REFILL_THRESHOLD {
+                                        refill_local!();
+                                    }
                                     entry = e_next;
                                     continue;
                                 }
-                                // 3rd was non-literal — carry.
+                                // 3rd was non-literal — carry. Refill.
+                                if (bitsleft as u8) < REFILL_THRESHOLD {
+                                    refill_local!();
+                                }
                                 entry = e_next;
                                 continue;
                             }
                             // 3rd-position lookup was non-literal —
-                            // carry.
+                            // carry. Refill.
+                            if (bitsleft as u8) < REFILL_THRESHOLD {
+                                refill_local!();
+                            }
                             entry = e_next;
                             continue;
                         }
@@ -1129,7 +1156,10 @@ fn decode_huffman_body_resumable(
                     }
                     // 2nd was non-literal (or no output room). Carry as
                     // next iter's entry — saves a lookup vs the
-                    // pre-T3 path.
+                    // pre-T3 path. Refill first.
+                    if (bitsleft as u8) < REFILL_THRESHOLD {
+                        refill_local!();
+                    }
                     entry = e_next;
                     continue;
                 }
