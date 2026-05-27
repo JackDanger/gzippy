@@ -429,12 +429,28 @@ remaining surface area to land it.
   flag + new consumer branch, OR clear `data_with_markers` and
   refactor the tail-window publish to use `chunk.narrowed` for the
   trailing bytes.
-- **`narrow_u16_to_u8` AVX2 disabled — OPEN (one env flip + verify).**
-  AVX2 path at `chunk_fetcher.rs:1736` exists but is env-gated due to
-  a suspected AVX2-license downclock through `apply_window`'s SIMD
-  (`chunk_fetcher.rs:1707-1715`). Only matters for the non-fused
-  path (small marker chunks < 128 KiB); silesia bench-sm never enters
-  this path, so the win is for other workloads.
+- **`narrow_u16_to_u8` AVX2 — RE-ENABLED (`37fc295`); downclock claim
+  unfalsified.** The prior env-gate was removed and replaced with a
+  pure runtime `is_x86_feature_detected!("avx2")` check. Same-session
+  controlled bench (today's neurotic state, AVX2-off vs AVX2-on
+  three runs):
+
+  | commit | gzippy | rapidgzip | ratio |
+  |---|---:|---:|---:|
+  | `8ef7a4e` (AVX2 off) | 857 MB/s | 1852 | 0.46× |
+  | `37fc295` (AVX2 on) run 1 | 868 | 1831 | 0.47× |
+  | `37fc295` (AVX2 on) run 2 | 878 | 1893 | 0.46× |
+
+  +1.9 % gzippy, within 2-5 % CV — statistically indistinguishable.
+  The "scary warning" about a 3× downclock through `apply_window` +
+  `populate_subchunk_windows` does NOT trigger on silesia, BUT the
+  new counters (`POST_PROCESS_FUSED_PATH=23,
+  POST_PROCESS_SMALL_MARKERS_PATH=2`) show silesia exercises the
+  small-markers path only 2/25 = 8 % of post-process tasks. Silesia
+  is the wrong fixture to falsify the downclock claim. The change is
+  kept (it's strictly safer than the env-gate) but the original
+  observation could still be real on a workload that exercises this
+  path heavily — that workload is not in the current corpus.
 - **`publish_subchunk_windows` runs on consumer — OPEN (light surgical).**
   `chunk_fetcher.rs:2096`. Per-subchunk window_map insert serialized
   on consumer thread; could move to the worker right after
