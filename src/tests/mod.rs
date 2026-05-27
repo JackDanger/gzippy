@@ -16,5 +16,6 @@ pub mod golden;
 pub mod hot_path;
 pub mod index;
 pub mod inflate_oracle;
+pub mod pure_rust_inflate_corpus;
 pub mod routing;
 pub mod trace_parity;

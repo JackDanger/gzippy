@@ -36,7 +36,7 @@ pub static MULTI_LITERAL_MISSES: AtomicU64 = AtomicU64::new(0);
 pub static MULTI_LITERAL_SYMBOLS: AtomicU64 = AtomicU64::new(0);
 pub static BODY_RESUMABLE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static BODY_RESUMABLE_FASTLOOP_ENTERS: AtomicU64 = AtomicU64::new(0);
-use super::libdeflate_entry::{DistTable, LitLenTable};
+use super::libdeflate_entry::{DistTable, LitLenTable, HUFFDEC_END_OF_BLOCK, HUFFDEC_EXCEPTIONAL};
 use super::stopping_point::StoppingPoint;
 
 /// Max DEFLATE back-reference distance; size of the sliding window the
@@ -514,10 +514,42 @@ impl<'a> ResumableInflate2<'a> {
                 && std::mem::discriminant(&self.block_state) == snap_state_disc
                 && self.pending_match.is_some() == snap_pending
             {
-                // Nothing advanced. Most likely cause: a body decoder
-                // observed bit_position >= encoded_until_bits at top of
-                // its loop and returned without state transition. Break
-                // with finished=false so the caller sees a clean stop.
+                // Nothing advanced. Two legitimate cases:
+                //   (a) a body decoder observed bit_position >=
+                //       encoded_until_bits at top of its loop and
+                //       returned without state transition — a CLEAN
+                //       stop at a chunk's `until_bits` cap.
+                //   (b) bit_position < encoded_until_bits but no body
+                //       progress AND no stopping point fired — this is
+                //       a contract violation (advisor item D4): a
+                //       future change to chunk-boundary logic that
+                //       lands `encoded_until_bits` mid-symbol would
+                //       silently truncate output here. Convert to a
+                //       loud Err.
+                //
+                // (a) is "we ran out of input under the cap" and the
+                // caller's CRC32 verification will surface any
+                // truncation downstream.
+                let bit_position_under_cap = self.bits.bit_position() < self.encoded_until_bits;
+                let mid_block = !matches!(
+                    self.block_state,
+                    BlockState::AwaitingHeader | BlockState::Finished
+                );
+                let no_stop_fired = self.stopped_at == StoppingPoint::NONE;
+                if bit_position_under_cap && mid_block && no_stop_fired {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "ResumableInflate2 no-progress mid-body: \
+                             bit_position={} cap={} block_state={:?} — \
+                             a sub-decoder yielded without transitioning \
+                             state; refusing to silently truncate (advisor D4)",
+                            self.bits.bit_position(),
+                            self.encoded_until_bits,
+                            self.block_state
+                        ),
+                    ));
+                }
                 break;
             }
         }
@@ -819,57 +851,270 @@ fn decode_huffman_body_resumable(
     // The vendor-faithful win is elsewhere — likely BMI2 pext bit
     // extraction or specializing on FIXED-Huffman static tables.
     // See `plans/pure-rust-perf.md` Phase B work-item #1(a).
+    // Vendor refill threshold pattern (mirror of
+    // `consume_first_decode::decode_huffman_libdeflate_style:852-863`):
+    // a single match consumes at most 48 bits — 20 for litlen (12 table +
+    // 3 subtable + 5 length-extra) + 28 for dist (9 table + 6 subtable +
+    // 13 dist-extra). One refill brings `bitsleft` into [56, 63], which
+    // is enough for one full match. Refill only when below the threshold;
+    // the prior unconditional per-iteration refill (and the extra refill
+    // before the dist lookup) was wasted work on the hot path.
+    const REFILL_THRESHOLD: u8 = 48;
+
+    // Lever B1 (advisor sign-off review): lift bits-reader fields into
+    // stack locals so LLVM can promote them into registers across loop
+    // iterations. Vendor counterpart: `consume_first_decode.rs:743-747`
+    // (`let mut bitbuf = bits.bitbuf;` etc) with writebacks at every
+    // function exit (`:1036-1039` and parallel sites).
+    //
+    // Without this, every `state.bits.bitbuf` access through the
+    // `&mut state` reference re-reads from memory because the compiler
+    // can't prove `output[i] = ...` writes don't alias `state.bits`.
+    // Locals decouple them. `copy_match_windowed` doesn't touch
+    // `state.bits` (it only reads `state.window` and writes
+    // `state.pending_match`), so we don't need to write back / re-lift
+    // around that call — only at return sites.
+    let mut bitbuf: u64 = state.bits.bitbuf;
+    let mut bitsleft: u32 = state.bits.bitsleft;
+    let mut in_pos: usize = state.bits.pos;
+    let in_data: &[u8] = state.bits.data;
+    let in_data_len: usize = in_data.len();
+    let in_data_ptr: *const u8 = in_data.as_ptr();
+    let encoded_until_bits: usize = state.encoded_until_bits;
+
+    // Mirror of `Bits::bit_position` semantics
+    // (`consume_first_decode.rs:237-240`): bit position of the NEXT bit
+    // to consume = (in_pos in bytes × 8) − unread-bits-in-buffer.
+    #[inline(always)]
+    fn bit_position_of(bitsleft: u32, in_pos: usize) -> usize {
+        let unread = (bitsleft as u8).min(64) as usize;
+        in_pos.saturating_mul(8).saturating_sub(unread)
+    }
+
+    // Mirror of `Bits::refill`
+    // (`consume_first_decode.rs:245-264`): branchless 8-byte unaligned
+    // load when room, byte-by-byte slow path otherwise. Identical
+    // arithmetic and underflow handling.
+    macro_rules! refill_local {
+        () => {{
+            let mut bits_u8 = bitsleft as u8;
+            if bits_u8 > 64 {
+                bitbuf = 0;
+                bits_u8 = 0;
+            }
+            if in_pos + 8 <= in_data_len {
+                let word = unsafe { (in_data_ptr.add(in_pos) as *const u64).read_unaligned() };
+                let word = u64::from_le(word);
+                bitbuf |= word << bits_u8;
+                in_pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
+                bitsleft = (bits_u8 as u32) | 56;
+            } else {
+                // Slow path: byte-by-byte until 56 bits filled or EOF.
+                let mut b = bits_u8;
+                while b <= 56 && in_pos < in_data_len {
+                    bitbuf |= (in_data[in_pos] as u64) << b;
+                    in_pos += 1;
+                    b = b.wrapping_add(8);
+                }
+                bitsleft = b as u32;
+            }
+        }};
+    }
+
+    // Sync locals back into state.bits. Call before any return that
+    // expects subsequent calls to observe the consumed bits.
+    macro_rules! writeback_bits {
+        () => {{
+            state.bits.bitbuf = bitbuf;
+            state.bits.bitsleft = bitsleft;
+            state.bits.pos = in_pos;
+        }};
+    }
+
+    // Lever B2 (advisor second-pass): PRELOAD the first entry before
+    // entering the loop, and re-load (`huffdec!`-style) at the END of
+    // each iteration's branch. This overlaps the table-lookup latency
+    // with the literal emit / match copy. Vendor counterpart:
+    // `consume_first_decode.rs:842-844` (preload), `:829-840`
+    // (`huffdec!` macro), `:877-879, :889, :903, :909, :922` (per-branch
+    // re-lookup at tail).
+    //
+    // Yield-contract preservation: on yield (output full / cap reached),
+    // we return BEFORE consuming the preloaded entry's bits. On resume,
+    // the function re-runs the PRELOAD step at the top, so any preloaded
+    // entry from the prior call is discarded. The bit reader state is
+    // writeback'd before every return, so the re-preload reads the same
+    // `bitbuf` value the prior preload did.
+    if (bitsleft as u8) < REFILL_THRESHOLD {
+        refill_local!();
+    }
+    let mut entry = litlen.lookup(bitbuf);
+
     loop {
         if out_pos >= output.len() {
+            writeback_bits!();
             return Ok(out_pos);
         }
-        if state.bits.bit_position() >= state.encoded_until_bits {
+        if bit_position_of(bitsleft, in_pos) >= encoded_until_bits {
+            writeback_bits!();
             return Ok(out_pos);
         }
 
-        state.bits.refill();
+        // saved_bitbuf for length / dist-extra extraction. Captured
+        // BEFORE consume so the same bits the entry was decoded from
+        // are available for extra-bit reads. May be re-assigned in the
+        // subtable branch to point at the post-main-consume bitbuf so
+        // the sub-entry's extras read from the right slice.
+        let mut saved_bitbuf = bitbuf;
+        let mut raw = entry.raw();
 
-        let mut saved_bitbuf = state.bits.peek();
-        let mut entry = litlen.lookup(saved_bitbuf);
-        if entry.is_subtable_ptr() {
-            state.bits.consume(LitLenTable::TABLE_BITS as u32);
-            entry = litlen.lookup_subtable(entry, saved_bitbuf);
-            saved_bitbuf = state.bits.peek();
-            state.bits.consume_entry(entry.raw());
-        } else {
-            state.bits.consume_entry(entry.raw());
-        }
+        // Consume entry's bits FIRST (mirrors vendor `consume!` at
+        // `consume_first_decode.rs:820-827, :867`). For literal/EOB:
+        // codeword bits. For length: codeword + extra. For subtable:
+        // main_table_bits (the low 4 bits of a subtable entry).
+        bitbuf >>= raw as u8;
+        bitsleft = bitsleft.wrapping_sub(raw & 0x1F);
 
-        // Negative raw = literal (libdeflate entry-encoding convention).
-        if (entry.raw() as i32) < 0 {
+        // Lever B3 (advisor third-pass sign-off): branch order matches
+        // vendor `decode_huffman_libdeflate_style`'s hot path
+        // (`consume_first_decode.rs:870, :1032-1068, :1107-1147`):
+        //   1. LITERAL (bit 31) — fastest, most common on text/log.
+        //   2. EXCEPTIONAL (bit 15) — collapses subtable + EOB under
+        //      one branch; specializes on EOB (bit 13) inside.
+        //   3. LENGTH (fall-through) — most common after a literal run.
+        //
+        // The prior shape tested `is_subtable_ptr()` THEN
+        // `is_end_of_block()` separately, evaluating both predicates on
+        // every length-code iteration. The new shape gates both behind
+        // one `(raw & 0x8000) != 0` test.
+
+        // LITERAL FAST PATH (bit 31). Vendor: `:870-1030`.
+        if (raw as i32) < 0 {
             output[out_pos] = entry.literal_value();
             out_pos += 1;
+            // huffdec!-style preload of next entry. Vendor: `:1025-1028`
+            // (conditional refill then top-of-loop lookup; we inline the
+            // lookup since PRELOAD is at end-of-branch).
+            if (bitsleft as u8) < REFILL_THRESHOLD {
+                refill_local!();
+            }
+            entry = litlen.lookup(bitbuf);
             continue;
         }
 
-        if entry.is_end_of_block() {
-            state.finish_current_block();
-            return Ok(out_pos);
+        // EXCEPTIONAL PATH (bit 15: subtable_ptr OR end_of_block).
+        // Vendor: `:1032-1068`.
+        if (raw & HUFFDEC_EXCEPTIONAL) != 0 {
+            // EOB (bit 13). Vendor: `:1034-1040`.
+            if (raw & HUFFDEC_END_OF_BLOCK) != 0 {
+                writeback_bits!();
+                state.finish_current_block();
+                return Ok(out_pos);
+            }
+            // SUBTABLE: resolve the sub-entry and re-classify. The
+            // sub-entry can itself be literal / EOB / length. After
+            // re-classification, either continue/return for
+            // literal/EOB, or fall through to the LENGTH path below
+            // with `entry` + `saved_bitbuf` re-pointed at the
+            // sub-entry's bit slice. Vendor: `:1042-1068`.
+            //
+            // Lever B6 (advisor sixth-pass): use `_direct` variant that
+            // takes already-shifted bits — we ALREADY consumed
+            // `main_table_bits` (= 12) on the line above, so `bitbuf` is
+            // post-shift. Saves one `shr` per litlen-subtable hit.
+            // Vendor: `consume_first_decode.rs:1042-1046` uses the
+            // post-consume bitbuf directly (`bitbuf & ((1<<subtable_bits)-1)`).
+            entry = litlen.lookup_subtable_direct(entry, bitbuf);
+            // The sub-entry's length-extra bits live in the
+            // post-main-consume bitbuf, so update saved_bitbuf BEFORE
+            // consuming the sub-entry.
+            saved_bitbuf = bitbuf;
+            raw = entry.raw();
+            bitbuf >>= raw as u8;
+            bitsleft = bitsleft.wrapping_sub(raw & 0x1F);
+
+            // Sub-entry literal. Vendor: `:1050-1060`.
+            if (raw as i32) < 0 {
+                output[out_pos] = entry.literal_value();
+                out_pos += 1;
+                if (bitsleft as u8) < REFILL_THRESHOLD {
+                    refill_local!();
+                }
+                entry = litlen.lookup(bitbuf);
+                continue;
+            }
+            // Sub-entry EOB. Vendor: `:1062-1068`.
+            if (raw & HUFFDEC_END_OF_BLOCK) != 0 {
+                writeback_bits!();
+                state.finish_current_block();
+                return Ok(out_pos);
+            }
+            // Sub-entry is a length code → fall through to LENGTH path
+            // below with `entry` + `saved_bitbuf` updated.
         }
 
+        // LENGTH+DISTANCE path — main-table length OR sub-table length
+        // code. Vendor: `:1070-1104` (subtable case) + `:1107-1147`
+        // (main case). The two share the dist lookup + match copy code,
+        // which is why we collapsed them here.
         let length = entry.decode_length(saved_bitbuf);
 
-        state.bits.refill();
-        let dist_saved = state.bits.peek();
+        // Dist lookup. The top-of-loop refill (after each literal /
+        // match) guarantees `bitsleft >= 56 − 20 = 36` here, which
+        // covers the worst-case dist consume of 28 bits. No
+        // intermediate refill needed; matches vendor single-symbol
+        // path (no per-symbol refill in the inner loop).
+        let dist_saved = bitbuf;
         let mut dist_entry = dist.lookup(dist_saved);
         if dist_entry.is_subtable_ptr() {
-            state.bits.consume(DistTable::TABLE_BITS as u32);
-            dist_entry = dist.lookup_subtable(dist_entry, dist_saved);
+            bitbuf >>= DistTable::TABLE_BITS;
+            bitsleft = bitsleft.wrapping_sub(DistTable::TABLE_BITS as u32);
+            // Lever B5 (advisor fifth-pass): use `_direct` variant that
+            // takes already-shifted bits. Saves one `shr` per dist-
+            // subtable hit (~6% of matches on silesia). Vendor pattern:
+            // `consume_first_decode.rs:1081, :1123`.
+            dist_entry = dist.lookup_subtable_direct(dist_entry, bitbuf);
         }
-        let dist_extra_saved = state.bits.peek();
-        state.bits.consume_entry(dist_entry.raw());
+        let dist_extra_saved = bitbuf;
+        let dist_raw = dist_entry.raw();
+        bitbuf >>= dist_raw as u8;
+        bitsleft = bitsleft.wrapping_sub(dist_raw & 0x1F);
         let distance = dist_entry.decode_distance(dist_extra_saved);
 
+        // copy_match_windowed reads `state.window` and writes
+        // `state.pending_match`. It does NOT touch `state.bits`. The
+        // debug_assert below verifies the VALUES of `state.bits.*`
+        // haven't moved across the call (the prior `addr_of!` version
+        // checked a field address, which is trivially invariant —
+        // advisor item, second pass). Locals don't need writeback
+        // around this call.
+        let bits_value_snapshot = if cfg!(debug_assertions) {
+            Some((state.bits.bitbuf, state.bits.bitsleft, state.bits.pos))
+        } else {
+            None
+        };
         out_pos = copy_match_windowed(state, output, out_pos, distance, length)?;
+        debug_assert_eq!(
+            bits_value_snapshot,
+            Some((state.bits.bitbuf, state.bits.bitsleft, state.bits.pos)),
+            "decode_huffman_body_resumable B1 contract: copy_match_windowed \
+             must not mutate state.bits.{{bitbuf,bitsleft,pos}}; if you \
+             added state.bits.* writes there, restructure to writeback \
+             before the call and re-lift after"
+        );
         if state.pending_match.is_some() {
             debug_assert_eq!(out_pos, output.len());
+            writeback_bits!();
             return Ok(out_pos);
         }
+
+        // Refill + preload next entry. Vendor:
+        // `consume_first_decode.rs:1142-1144` (refill BEFORE preload so
+        // entry corresponds to post-refill bitbuf).
+        if (bitsleft as u8) < REFILL_THRESHOLD {
+            refill_local!();
+        }
+        entry = litlen.lookup(bitbuf);
     }
 }
 
@@ -1049,6 +1294,41 @@ pub fn copy_match_windowed(
     let remaining_in_buf = output.len() - out_pos;
     let copy_n = len.min(remaining_in_buf);
 
+    // Fast path: the entire match source lives in `output[out_pos - dist..]`
+    // (no window touch) AND there's enough output headroom to absorb
+    // `copy_match_fast`'s unconditional 40-byte unrolled write block. Both
+    // conditions are necessary:
+    //   - `dist <= out_pos` means the source bytes are all in `output`.
+    //   - `copy_n == len` means we're not yielding mid-copy; if we yield
+    //     we'd need to record bytes-written correctly which complicates
+    //     the fast path (the slow path's `PendingMatch` yield is fine).
+    //   - `output.len() - out_pos >= len + COPY_FAST_MARGIN` guarantees
+    //     `copy_match_fast`'s unconditional past-the-end writes don't
+    //     run off the slice. Tight bound is 40 bytes (5×8-byte unrolled
+    //     words for the dist>=8 path) + 8 bytes for the final unaligned
+    //     u64 store = 48. Vendor `consume_first_decode.rs:395-397`
+    //     documents the "up to 40 bytes beyond length" overshoot.
+    //
+    // This is a vendor-faithful port: libdeflate's FASTLOOP_OUTPUT_MARGIN
+    // serves the same purpose; rapidgzip / ISA-L use the same pattern in
+    // their bulk-decode hot loops. The slow per-byte path below remains
+    // for window-touch cases and tail cases — same shape as
+    // `consume_first_decode::copy_match_fast` vs `copy_match_safe`.
+    const COPY_FAST_MARGIN: usize = 48;
+    if dist <= out_pos && copy_n == len && output.len() - out_pos >= len + COPY_FAST_MARGIN {
+        let new_pos = crate::decompress::inflate::consume_first_decode::copy_match_fast(
+            output, out_pos, distance, length,
+        );
+        // copy_match_fast returns `out_pos + len`; the caller's contract
+        // is the same so we mirror PendingMatch=None.
+        state.pending_match = None;
+        return Ok(new_pos);
+    }
+
+    // Slow path: window touch (`dist > out_pos`), insufficient margin, or
+    // yielding mid-copy. Per-byte loop is the safe baseline; correctness
+    // first.
+    //
     // Byte at *logical* history position `(total_history - dist + i)`:
     //   if pos < window_len: window.byte_at_logical(pos)
     //   else                : output[pos - window_len]
@@ -1057,10 +1337,6 @@ pub fn copy_match_windowed(
     // loop because once we write to `output[out_pos + j]`, a subsequent
     // read at logical position (window_len + out_pos + j) sees the
     // just-written byte via the `output` branch.
-    //
-    // Per-byte loop is intentionally simple for correctness; §5 Tier 2/3
-    // can specialize for `dist <= out_pos` (no window touch) and large
-    // contiguous matches.
     let start_logical = total_history - dist;
     for i in 0..copy_n {
         let src_logical = start_logical + i;
@@ -1584,5 +1860,303 @@ mod tests {
             "bit_position must land on the byte after the stored payload"
         );
         assert_eq!(r.bit_position, expected_bit_position);
+    }
+
+    // Correctness gate for the `copy_match_windowed` fast-path port.
+    //
+    // The fast path delegates to `copy_match_fast` from
+    // `consume_first_decode.rs` (the vendor-shape SIMD/u64-unrolled match
+    // copy) when `dist <= out_pos` and there's enough output headroom.
+    // The slow path is the per-byte loop. This test exercises both with
+    // identical inputs and asserts byte-equality, plus exercises the
+    // fall-through cases (window touch, insufficient margin) to confirm
+    // the gate keeps them on the slow path.
+    #[test]
+    fn copy_match_windowed_fast_path_matches_slow_path() {
+        // Deterministic PRNG without an extra dep — LCG (same constants
+        // as `make_low_entropy_data` in routing.rs).
+        let mut hash: u64 = 0xdead_beef_cafe_f00d;
+        let mut next_byte = || {
+            hash = hash.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (hash >> 24) as u8
+        };
+
+        // For each scenario, run via copy_match_windowed (the production
+        // function under test) AND via a hand-rolled reference per-byte
+        // copy. The two must agree.
+
+        struct Case {
+            label: &'static str,
+            // Bytes already in output before the match.
+            prefix: Vec<u8>,
+            // (distance, length) of the back-reference.
+            distance: u32,
+            length: u32,
+            // Window seed (32 KiB or shorter).
+            window: Vec<u8>,
+            // Total output slice length (so headroom can be controlled).
+            output_len: usize,
+        }
+
+        // Helper: hand-rolled byte-by-byte LZ77 with window. Authoritative
+        // reference. Total "history" is logically `[window, output[..out_pos]]`;
+        // a match `dist` back starts at logical position
+        // `window_len + out_pos - dist`. Indices < window_len read from
+        // `window[src_logical]` directly (assumes the input window slice
+        // matches what `SlidingWindow::seed` stores, i.e. the trailing
+        // WINDOW_SIZE bytes if the slice is longer than WINDOW_SIZE).
+        fn ref_copy(
+            prefix: &[u8],
+            window: &[u8],
+            distance: u32,
+            length: u32,
+            output_len: usize,
+        ) -> Vec<u8> {
+            let mut out = vec![0u8; output_len];
+            out[..prefix.len()].copy_from_slice(prefix);
+            let out_pos = prefix.len();
+            // Mirror SlidingWindow::seed: it keeps only the trailing
+            // WINDOW_SIZE (= 32 KiB) bytes of any longer input.
+            let effective_window: &[u8] = if window.len() > WINDOW_SIZE {
+                &window[window.len() - WINDOW_SIZE..]
+            } else {
+                window
+            };
+            let window_len = effective_window.len();
+            let total_history = window_len + out_pos;
+            let dist = distance as usize;
+            let len = length as usize;
+            let copy_n = len.min(output_len - out_pos);
+            let start_logical = total_history - dist;
+            for i in 0..copy_n {
+                let src_logical = start_logical + i;
+                let byte = if src_logical < window_len {
+                    effective_window[src_logical]
+                } else {
+                    out[src_logical - window_len]
+                };
+                out[out_pos + i] = byte;
+            }
+            out
+        }
+
+        // Generate enough cases to exercise: fast-path eligible, fast-path
+        // ineligible by margin, fast-path ineligible by window touch.
+        let mut prefix_a = Vec::with_capacity(256);
+        for _ in 0..256 {
+            prefix_a.push(next_byte());
+        }
+        let mut window_a = Vec::with_capacity(32 * 1024);
+        for _ in 0..32 * 1024 {
+            window_a.push(next_byte());
+        }
+
+        let cases: Vec<Case> = vec![
+            // Fast-path eligible (dist 16, len 200, plenty of headroom).
+            Case {
+                label: "fast: dist=16 len=200 margin=2KB",
+                prefix: prefix_a.clone(),
+                distance: 16,
+                length: 200,
+                window: Vec::new(),
+                output_len: prefix_a.len() + 2048,
+            },
+            // Fast-path eligible (large match, max SIMD path).
+            Case {
+                label: "fast: dist=64 len=2000",
+                prefix: {
+                    let mut p = prefix_a.clone();
+                    while p.len() < 4096 {
+                        p.push(next_byte());
+                    }
+                    p
+                },
+                distance: 64,
+                length: 2000,
+                window: Vec::new(),
+                output_len: 8192,
+            },
+            // Fast-path eligible: short match (must still go through fast
+            // path's 5-word unconditional store).
+            Case {
+                label: "fast: dist=8 len=4",
+                prefix: prefix_a.clone(),
+                distance: 8,
+                length: 4,
+                window: Vec::new(),
+                output_len: prefix_a.len() + 512,
+            },
+            // Fast-path eligible: RLE (dist=1).
+            Case {
+                label: "fast: dist=1 len=100",
+                prefix: prefix_a.clone(),
+                distance: 1,
+                length: 100,
+                window: Vec::new(),
+                output_len: prefix_a.len() + 512,
+            },
+            // Fast-path eligible: small distance (2-7) overlap.
+            Case {
+                label: "fast: dist=3 len=30",
+                prefix: prefix_a.clone(),
+                distance: 3,
+                length: 30,
+                window: Vec::new(),
+                output_len: prefix_a.len() + 512,
+            },
+            // Slow-path forced: insufficient headroom (would overrun
+            // fast path's 40-byte unrolled write). Must still produce
+            // correct output.
+            Case {
+                label: "slow: tight margin (output ends right after match)",
+                prefix: prefix_a.clone(),
+                distance: 16,
+                length: 100,
+                window: Vec::new(),
+                output_len: prefix_a.len() + 100, // exactly len of match
+            },
+            // Slow-path forced: window touch (dist > out_pos).
+            Case {
+                label: "slow: window touch (dist > out_pos)",
+                prefix: vec![0u8; 10], // out_pos = 10
+                distance: 100,         // > out_pos → must read from window
+                length: 50,
+                window: window_a.clone(),
+                output_len: 1024,
+            },
+            // Slow-path forced: window-then-output span.
+            Case {
+                label: "slow: window-then-output span",
+                prefix: prefix_a[..50].to_vec(), // out_pos = 50
+                distance: 80,                    // 30 bytes from window, 50 from output
+                length: 100,
+                window: window_a.clone(),
+                output_len: 1024,
+            },
+        ];
+
+        for case in &cases {
+            // Reference output.
+            let want = ref_copy(
+                &case.prefix,
+                &case.window,
+                case.distance,
+                case.length,
+                case.output_len,
+            );
+
+            // Production output via copy_match_windowed.
+            let mut state =
+                ResumableInflate2::with_until_bits(&[0u8; 0], 0, 0).expect("dummy init");
+            state.set_window(&case.window).expect("set_window");
+            let mut got = vec![0u8; case.output_len];
+            got[..case.prefix.len()].copy_from_slice(&case.prefix);
+            let out_pos = case.prefix.len();
+            let new_pos =
+                copy_match_windowed(&mut state, &mut got, out_pos, case.distance, case.length)
+                    .expect("copy_match_windowed");
+            assert_eq!(
+                new_pos,
+                out_pos + (case.length as usize).min(case.output_len - out_pos),
+                "{}: new_pos must equal out_pos + min(length, remaining)",
+                case.label
+            );
+            assert_eq!(
+                &got[..new_pos],
+                &want[..new_pos],
+                "{}: copy_match_windowed output disagrees with reference",
+                case.label
+            );
+        }
+    }
+
+    // §2 divergence 2 (pure-rust-isa-l plan): the no-progress guard at
+    // `resumable.rs:512-522` silently breaks the inner loop when a
+    // `read_stream` iteration makes zero progress. This catches the case
+    // where a body decoder observes `bit_position >= encoded_until_bits`
+    // at the top of its loop and returns without a state transition.
+    //
+    // This test locks the current contract:
+    //   1. The first `read_stream` call with a mid-block `encoded_until_bits`
+    //      must return cleanly (no panic, no infinite loop), with
+    //      `finished=false`.
+    //   2. The bytes written so far must be byte-correct (a prefix of the
+    //      full decoded output).
+    //   3. After widening `encoded_until_bits` to cover the full input
+    //      (via `advance_input(0)` post-fact won't widen — we instead
+    //      construct a fresh wrapper at the same start with the full
+    //      `until_bits`), the same input decodes to the full payload.
+    //
+    // The "silent truncation" risk in the plan is: a production caller
+    // sees `finished=false, bytes_written < expected` and treats the
+    // partial output as authoritative without checking the surface-level
+    // contract. The parallel-SM consumer DOES check (`sm_driver.rs`
+    // verifies the final CRC32 + ISIZE; a truncated chunk fails CRC).
+    // This test guarantees that the wrapper's own contract is
+    // truncation-as-non-error, NOT panic, NOT infinite loop.
+    #[test]
+    fn no_progress_guard_breaks_cleanly_on_mid_block_until_bits() {
+        // 16 KiB dynamic-block payload — produces a single dynamic block
+        // whose body is hundreds of bytes long; cap mid-body.
+        let (payload, stream) = deflate_dynamic_payload(0xfeed_face_c0de, 16 * 1024, 9);
+        let stream_bits = stream.len() * 8;
+
+        // First, decode fully so we know the legitimate output.
+        let full: Vec<u8> = {
+            let mut inflate = ResumableInflate2::with_until_bits(&stream, 0, stream_bits).unwrap();
+            let mut out = vec![0u8; payload.len() + 64];
+            let r = inflate.read_stream(&mut out).expect("full decode");
+            assert_eq!(r.bytes_written, payload.len(), "fixture sanity");
+            out.truncate(r.bytes_written);
+            out
+        };
+        assert_eq!(full, payload);
+
+        // Now cap `encoded_until_bits` at 75 % of the stream — well past
+        // any dynamic header (~50-200 bits) and squarely inside the body.
+        let mid_cap_bits = (stream_bits * 3) / 4;
+        let mut inflate = ResumableInflate2::with_until_bits(&stream, 0, mid_cap_bits).unwrap();
+        let mut out = vec![0u8; payload.len() + 64];
+
+        // Drive the wrapper to exhaustion under the cap. Loop terminates
+        // because the no-progress guard fires on the iteration that hits
+        // `bit_position >= encoded_until_bits` mid-body.
+        let mut total = 0usize;
+        let mut iterations = 0usize;
+        loop {
+            iterations += 1;
+            assert!(
+                iterations < 1000,
+                "no-progress guard MUST break the loop; \
+                 hitting 1000 iterations means the guard regressed"
+            );
+            let r = inflate.read_stream(&mut out[total..]).expect("read");
+            total += r.bytes_written;
+            if r.finished {
+                // The cap is mid-block, so the stream cannot have finished.
+                panic!(
+                    "stream cannot be `finished` while encoded_until_bits is \
+                     mid-block; finished=true here means the cap was ignored"
+                );
+            }
+            if r.bytes_written == 0 {
+                // No more progress possible under the cap. Clean exit.
+                break;
+            }
+        }
+
+        // The decoder produced SOME prefix of the legitimate output.
+        // (It might be zero if the cap landed before any body bytes could
+        // be emitted — that's still a valid outcome of the guard.)
+        assert!(
+            total <= payload.len(),
+            "wrote {total} bytes; full payload is {} bytes — wrote more than fits",
+            payload.len()
+        );
+        assert_eq!(
+            &out[..total],
+            &payload[..total],
+            "the bytes written must be a byte-correct prefix of the full payload"
+        );
     }
 }
