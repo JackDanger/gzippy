@@ -66,6 +66,48 @@ Prior falsifications (e.g. commit `ca52389` SIMD multi-literal regression)
 are **NOT binding** — they were measured against the pre-PRELOAD,
 pre-BMI2 hot loop. Re-attempt any of them with fresh measurement.
 
+### Update 2026-05-27 (later same day): innovation allowed in the inner loop
+
+The "every change must have a vendor counterpart" requirement is
+RESCINDED for the inner Huffman decode loop. Novel techniques that
+have no vendor counterpart are now in scope provided they:
+
+- Preserve correctness (all 635+ lib tests + corpus differential pass).
+- Show measured win on the bench harness (no negative-results-allowed).
+- Document the deviation in the commit message so the falsification
+  record stays honest.
+
+This still doesn't extend to architecture (chunk pipeline /
+prefetcher / block finder / consumer) — those keep the vendor-port
+rule. Only the inner Huffman loop and supporting primitives
+(`LitLenTable`, `DistTable`, `Bits`, `bmi2.rs`) are open territory.
+
+### Update 2026-05-27 (final): build the fastest possible raw Huffman decoder
+
+Sharpening: the GOAL is *"build a provably-correct, fastest-possible
+raw Huffman decoder"* (user directive). Implications:
+
+- **Provably correct.** Strong testing — corpus differential against
+  multiple independent oracles (flate2 + libdeflate), property-based
+  testing with proptest, fuzzing if needed, plus the existing 635 lib
+  tests. The decoder must produce byte-for-byte output identical to
+  vendor on every legal input.
+- **Fastest possible.** Beat ISA-L, libdeflate, AND flate2/zlib-ng on
+  representative workloads. Not just "vendor-competitive" — strictly
+  faster.
+- **Arch-specific compilation is in scope.** Use `RUSTFLAGS="-C
+  target-cpu=native"` for benches; build per-arch variants (BMI2 on
+  x86_64, NEON on aarch64); per-CPU dispatch where it pays. Portable
+  binaries can ship later via runtime dispatch; for the perf claim,
+  arch-specific is the target.
+
+The decoder is now decoupled (in principle) from the rest of the
+parallel-SM machinery — it lives in `src/decompress/inflate/` and can
+be evaluated as a standalone primitive. The resumable contract still
+applies because callers in `parallel/` need it, but the contract's
+cost should be amortized into the FASTLOOP and irrelevant to the
+fastest-possible claim.
+
 ## Rules
 
 1. **ONE PRODUCTION PATH** — know exactly which function the CLI calls. Test that function.

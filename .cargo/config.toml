@@ -2,3 +2,11 @@
 # Relative to this file's directory (gzippy repo root).
 [env]
 ISAL_SOURCE = { value = "vendor/isa-l", relative = true }
+
+# Per CLAUDE.md "Update 2026-05-27 (final)": for the tight-Huffman work
+# we need arch-specific compilation to compete with libdeflate/ISA-L
+# (which build with -march=native via CMake). Applies to all builds in
+# this checkout. For portable-binary CI work, override with
+# `CARGO_BUILD_RUSTFLAGS=""` in the environment.
+[build]
+rustflags = ["-C", "target-cpu=native"]

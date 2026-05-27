@@ -356,6 +356,12 @@ impl LitLenTable {
     pub const TABLE_BITS: u8 = 12;
     /// Maximum number of subtable bits for codes longer than TABLE_BITS
     pub const MAX_SUBTABLE_BITS: u8 = 15 - Self::TABLE_BITS;
+    // Lever 2 falsification (2026-05-27): tried TABLE_BITS=13 — flat
+    // delta on all bench cases (text_words mono +1%, chunk -2%, others
+    // ~unchanged). Doubling table size didn't reduce subtable hits
+    // enough to matter on this corpus + arm64. Vendor (libdeflate)
+    // uses 11; ISA-L uses dynamic (13 or 14). Pinning at 12 — vendor's
+    // closest static choice — and falsified for arm64 M-series.
 
     /// Build a literal/length decode table from code lengths
     pub fn build(code_lengths: &[u8]) -> Option<Self> {
