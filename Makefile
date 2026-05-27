@@ -319,6 +319,73 @@ bench-sm: ship-precheck
 	@echo "✓ bench-sm complete on branch $$(git rev-parse --abbrev-ref HEAD)"
 
 # =============================================================================
+# bench-sm-pure-rust: same as bench-sm but builds gzippy with
+# `--no-default-features --features pure-rust-inflate` so the parallel-SM
+# path goes through ResumableInflate2 instead of the ISA-L C FFI. This is
+# the A/B that settles whether the tight-Huffman work has reached
+# vendor-competitive performance with ISA-L.
+#
+# Produces two `gzippy` binaries on neurotic:
+#   /tmp/bench-sm-bin/gzippy-isal   (current production path)
+#   /tmp/bench-sm-bin/gzippy-purerust (pure-Rust decoder path)
+# Both are run against rapidgzip; reports both ratios.
+# =============================================================================
+bench-sm-pure-rust: ship-precheck
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	echo ""; \
+	echo "── bench-sm-pure-rust: A/B gzippy{isal,pure-rust} vs rapidgzip ──"; \
+	if ! git rev-parse origin/$$BRANCH >/dev/null 2>&1 \
+	    || [ -n "$$(git log origin/$$BRANCH..HEAD 2>/dev/null)" ]; then \
+	  echo "  pushing $$BRANCH to origin..."; \
+	  git push origin $$BRANCH || (echo "PUSH FAILED — aborting" >&2 && exit 1); \
+	else \
+	  echo "  origin/$$BRANCH already up to date"; \
+	fi; \
+	echo "  connecting to neurotic..."; \
+	timeout $(BENCH_SM_TIMEOUT) $(NEUROTIC_SSH) "set -e; cd gzippy; \
+	  echo '  fetching origin/$$BRANCH...'; \
+	  $(NEUROTIC_SYNC); \
+	  BDIR=/tmp/bench-sm-bin; mkdir -p \"\$$BDIR\"; \
+	  echo '  building gzippy (--features isal-compression)...'; \
+	  cargo build --release --features isal-compression 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
+	  cp target/release/gzippy \"\$$BDIR/gzippy-isal\"; \
+	  echo '  building gzippy (--no-default-features --features pure-rust-inflate)...'; \
+	  cargo build --release --no-default-features --features pure-rust-inflate 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
+	  cp target/release/gzippy \"\$$BDIR/gzippy-purerust\"; \
+	  RAPIDGZIP=vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip; \
+	  cp \"\$$RAPIDGZIP\" \"\$$BDIR/\" 2>/dev/null || true; \
+	  BD=benchmark_data; \
+	  SL=\$$BD/silesia-large.bin; \
+	  SLG=\$$BD/silesia-large.gz; \
+	  THREADS=\$$(nproc); \
+	  echo ''; \
+	  echo '=== A: gzippy-isal (current production, ISA-L FFI) ==='; \
+	  for trial in 1 2 3 4 5; do \
+	    /usr/bin/time -f '%e sec' \"\$$BDIR/gzippy-isal\" -d -c -p \"\$$THREADS\" \"\$$SLG\" > /dev/null 2>>/tmp/bench-isal.times; \
+	  done; \
+	  cat /tmp/bench-isal.times; \
+	  echo ''; \
+	  echo '=== B: gzippy-purerust (this branch, ResumableInflate2) ==='; \
+	  rm -f /tmp/bench-purerust.times; \
+	  for trial in 1 2 3 4 5; do \
+	    /usr/bin/time -f '%e sec' \"\$$BDIR/gzippy-purerust\" -d -c -p \"\$$THREADS\" \"\$$SLG\" > /dev/null 2>>/tmp/bench-purerust.times; \
+	  done; \
+	  cat /tmp/bench-purerust.times; \
+	  echo ''; \
+	  echo '=== C: rapidgzip (reference) ==='; \
+	  rm -f /tmp/bench-rapidgzip.times; \
+	  for trial in 1 2 3 4 5; do \
+	    /usr/bin/time -f '%e sec' \"\$$BDIR/rapidgzip\" -d -P \"\$$THREADS\" -c \"\$$SLG\" > /dev/null 2>>/tmp/bench-rapidgzip.times; \
+	  done; \
+	  cat /tmp/bench-rapidgzip.times; \
+	  echo ''; \
+	  echo 'Input: silesia-large.gz (503 MB raw, gzip -9)'; \
+	  echo 'Three best-of-5 results above — compute MB/s = 503 / time.'; \
+	  rm -f /tmp/bench-isal.times /tmp/bench-purerust.times /tmp/bench-rapidgzip.times"
+	@echo ""
+	@echo "✓ bench-sm-pure-rust complete on branch $$(git rev-parse --abbrev-ref HEAD)"
+
+# =============================================================================
 # test-x86_64: verify the x86_64-only code on the homelab box. The parallel
 # single-member decode path (ISA-L) is gated on x86_64 + the
 # isal-compression feature and does not build on local arm64 macOS. This
