@@ -1716,10 +1716,11 @@ fn decode_huffman_body_resumable_isal(
                     ));
                 }
 
-                // copy_match_windowed reads state.window/pending_match
-                // only — NOT state.bits — so skip writeback/re-lift
-                // around the call (matches libdeflate-inner pattern).
+                writeback_bits!();
                 out_pos = copy_match_windowed(state, output, out_pos, distance, length)?;
+                bitbuf = state.bits.bitbuf;
+                bitsleft = state.bits.bitsleft;
+                in_pos = state.bits.pos;
 
                 remaining = 0;
             }
