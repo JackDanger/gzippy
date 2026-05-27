@@ -163,6 +163,25 @@ pub fn decode_chunk_isal(
     )
 }
 
+/// Env-flag dispatch helper. When `GZIPPY_ISAL_PURE_BULK=1` is set,
+/// the windowed-decode path routes through `decode_chunk_pure_bulk_impl`
+/// (the stateless ISA-L-LUT bulk decoder from
+/// `isal_lut_bulk::decode_block`) instead of `IsalInflateWrapper`.
+///
+/// Default OFF for controlled rollout: ResumableInflate2 (the heavily-
+/// optimized incumbent) stays the production path until the bulk
+/// decoder proves out on neurotic. Once the win is confirmed, flip the
+/// default.
+///
+/// Read once at process start via OnceLock so the env-var lookup
+/// doesn't tax the hot path.
+#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+fn use_pure_bulk_path() -> bool {
+    use std::sync::OnceLock;
+    static USE_BULK: OnceLock<bool> = OnceLock::new();
+    *USE_BULK.get_or_init(|| std::env::var_os("GZIPPY_ISAL_PURE_BULK").is_some())
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     any(feature = "isal-compression", feature = "pure-rust-inflate")
@@ -174,6 +193,20 @@ fn decode_chunk_isal_impl(
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
+    // Env-flag dispatch: route windowed-decode through the new pure-Rust
+    // bulk decoder when GZIPPY_ISAL_PURE_BULK is set. Available only on
+    // the pure-rust-inflate build (the isal-compression build uses real
+    // ISA-L FFI, which is fast enough we don't override it from here).
+    #[cfg(feature = "pure-rust-inflate")]
+    if use_pure_bulk_path() {
+        return decode_chunk_pure_bulk_impl(
+            input,
+            encoded_offset_bits,
+            stop_hint_bits,
+            initial_window,
+            configuration,
+        );
+    }
     // `worker.isal_stream_inflate` span — wraps every invocation of
     // gzippy's ISA-L stream-inflate path. Both call sites land here:
     //   (a) the post-bootstrap call at gzip_chunk.rs:549 (after the
@@ -482,6 +515,215 @@ fn decode_chunk_isal_impl(
     chunk.finalize(final_bit);
     Ok(chunk)
 }
+
+/// Pure-Rust bulk-decode path. Used when `GZIPPY_ISAL_PURE_BULK=1`.
+///
+/// Drives [`crate::decompress::parallel::isal_lut_bulk::decode_block`]
+/// in a multi-block loop, replacing the IsalInflateWrapper/
+/// ResumableInflate2 path. Skips the stopping-point state machine,
+/// session accumulator, and yield-on-output-fill machinery — all
+/// unnecessary for the windowed bulk phase.
+///
+/// Correctness gated by the silesia byte-perfect test in
+/// `isal_lut_bulk` (162 MB byte-equal vs flate2 GzDecoder) and the
+/// existing routing tests (which will additionally run with the env
+/// flag set in `tests::routing`).
+#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+fn decode_chunk_pure_bulk_impl(
+    input: &[u8],
+    encoded_offset_bits: usize,
+    stop_hint_bits: usize,
+    initial_window: &[u8],
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    use crate::decompress::inflate::consume_first_decode::Bits;
+    use crate::decompress::parallel::isal_lut_bulk::{
+        decode_block, BulkDecodeError, DecoderScratch,
+    };
+
+    let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
+        "worker.pure_bulk_inflate",
+        &format!(
+            r#""start_bit":{encoded_offset_bits},"stop_hint":{stop_hint_bits},"has_window":{}"#,
+            !initial_window.is_empty()
+        ),
+    );
+    let t_decode = std::time::Instant::now();
+
+    let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
+    let mut bits = Bits::at_bit_offset(input, encoded_offset_bits);
+    let mut scratch = DecoderScratch::new();
+
+    // `predecessor_window` is the bytes immediately before this gzip
+    // stream's first decoded byte (i.e., the prior chunk's tail for
+    // the first member; empty for any subsequent gzip member started
+    // mid-chunk after a footer).
+    let mut predecessor: &[u8] = initial_window;
+    // Offset in chunk.data where the CURRENT gzip stream's bytes start.
+    // Back-references must not reach across this boundary (each gzip
+    // member has its own sliding window per RFC 1952).
+    let mut stream_data_start: usize = 0;
+
+    let mut last_end_bit = encoded_offset_bits;
+    let mut last_eob_pos = encoded_offset_bits;
+    let mut reached_stream_end = false;
+    let mut stopped_at_block_boundary = false;
+
+    PURE_BULK_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    loop {
+        // Reserve spare for one max-size DEFLATE block. Stored blocks
+        // are bounded at 65 KiB by RFC 1951 §3.2.4 (LEN is u16);
+        // dynamic-Huffman has no hard bound but rarely exceeds 64 KiB
+        // in practice. 128 KiB headroom covers both.
+        const PER_BLOCK_RESERVE: usize = 128 * 1024;
+        let prev_len = chunk.data.len();
+        chunk.data.reserve(PER_BLOCK_RESERVE);
+
+        // SAFETY: chunk.data.capacity() bytes are allocated. The
+        // initialized prefix is [0, prev_len); the rest is uninit but
+        // writable. The bulk decoder reads only [stream_data_start,
+        // out_pos) (the current stream's already-decoded bytes), which
+        // is a subset of [0, prev_len). It writes only to [out_pos, ..).
+        // We update Vec's len via note_clean_bytes_written_in_place
+        // after decode_block returns.
+        let buf_ptr = chunk.data.as_mut_ptr();
+        let buf_cap = chunk.data.capacity();
+        let stream_view: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                buf_ptr.add(stream_data_start),
+                buf_cap - stream_data_start,
+            )
+        };
+        let mut out_pos_in_view = prev_len - stream_data_start;
+
+        let result = decode_block(
+            &mut bits,
+            stream_view,
+            &mut out_pos_in_view,
+            predecessor,
+            &mut scratch,
+        )
+        .map_err(|e| {
+            ChunkDecodeError::InflateFailed(InflateError::Internal(match e {
+                BulkDecodeError::InvalidHuffmanCode => -101,
+                BulkDecodeError::InvalidLookback => -102,
+                BulkDecodeError::OutputOverflow => -103,
+                BulkDecodeError::BlockTypeReserved => -104,
+                BulkDecodeError::InvalidCodeLengths => -105,
+            }))
+        })?;
+
+        let bytes_written = (stream_data_start + out_pos_in_view) - prev_len;
+        chunk.note_clean_bytes_written_in_place(prev_len, bytes_written, true);
+
+        let block_end_bit = bits.bit_position();
+        last_end_bit = block_end_bit;
+        last_eob_pos = block_end_bit;
+
+        if !result.is_final_block {
+            chunk.append_block_boundary_at(block_end_bit, chunk.data.len());
+        }
+
+        if result.is_final_block {
+            // Byte-align then read 8-byte gzip footer (CRC32 + ISIZE).
+            let byte_align = (8 - (block_end_bit % 8)) % 8;
+            if byte_align != 0 {
+                bits.refill();
+                bits.consume(byte_align as u32);
+            }
+            let footer_byte = bits.bit_position() / 8;
+            if footer_byte + 8 > input.len() {
+                return Err(ChunkDecodeError::InflateFailed(InflateError::Internal(
+                    -106,
+                )));
+            }
+            let crc32 = u32::from_le_bytes([
+                input[footer_byte],
+                input[footer_byte + 1],
+                input[footer_byte + 2],
+                input[footer_byte + 3],
+            ]);
+            let isize_field = u32::from_le_bytes([
+                input[footer_byte + 4],
+                input[footer_byte + 5],
+                input[footer_byte + 6],
+                input[footer_byte + 7],
+            ]);
+            let footer_end_bits = (footer_byte + 8) * 8;
+            chunk.append_footer(crc32, isize_field, footer_end_bits);
+            last_end_bit = footer_end_bits;
+
+            // Multi-stream gzip: next member's header follows the footer.
+            if footer_byte + 8 >= input.len() {
+                reached_stream_end = true;
+                break;
+            }
+            let next_start_byte = footer_byte + 8;
+            let remaining = &input[next_start_byte..];
+            match crate::decompress::parallel::gzip_format::read_header(remaining) {
+                Ok((_hdr, hdr_size)) => {
+                    let next_stream_byte = next_start_byte + hdr_size;
+                    bits = Bits::at_bit_offset(input, next_stream_byte * 8);
+                    // New gzip member: fresh sliding window. Reset
+                    // both the back-ref reach base and the predecessor.
+                    stream_data_start = chunk.data.len();
+                    predecessor = &[];
+                    last_end_bit = bits.bit_position();
+                    last_eob_pos = last_end_bit;
+                    chunk.append_block_boundary_at(last_end_bit, chunk.data.len());
+                    continue;
+                }
+                Err(e) => {
+                    return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("multi-stream gzip header at bit {footer_end_bits}: {e}"),
+                    )));
+                }
+            }
+        }
+
+        // Stop-hint logic: stop at the next EOB at-or-past stop_hint_bits,
+        // BUT not when the next block is fixed Huffman (matches the
+        // END_OF_BLOCK_HEADER + not_fixed gate in the wrapper-based impl
+        // at gzip_chunk.rs ~354-360). Fixed-Huffman blocks aren't
+        // discoverable by the dynamic-Huffman block finder; the
+        // consumer would re-decode them anyway, so we extend the
+        // current chunk past them.
+        if block_end_bit >= stop_hint_bits {
+            // Peek next block's BFINAL+BTYPE without consuming.
+            let saved_buf = bits.bitbuf;
+            let saved_left = bits.bitsleft;
+            let saved_pos = bits.pos;
+            bits.refill();
+            let next_btype = ((bits.bitbuf >> 1) & 0b11) as u32;
+            bits.bitbuf = saved_buf;
+            bits.bitsleft = saved_left;
+            bits.pos = saved_pos;
+            if next_btype != 1 {
+                stopped_at_block_boundary = true;
+                break;
+            }
+        }
+    }
+
+    chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+    let final_bit = if stopped_at_block_boundary || reached_stream_end {
+        last_end_bit
+    } else if last_eob_pos > encoded_offset_bits {
+        last_eob_pos
+    } else {
+        bits.bit_position()
+    };
+    chunk.finalize(final_bit);
+    Ok(chunk)
+}
+
+/// Counter for deletion-trap tests that need to assert the pure-bulk
+/// path actually executed (mirrors `UNIFIED_INFLATE_RUNS` /
+/// `MARKER_PIPELINE_RUNS` pattern).
+#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+pub static PURE_BULK_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Marker-bootstrap then ISA-L for speculative prefetch (no predecessor window).
 /// Requires a real deflate block boundary at `encoded_offset_bits`.
