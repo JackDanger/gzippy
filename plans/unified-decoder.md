@@ -827,7 +827,8 @@ Suggested order:
    Interpreted Rust loop becomes the cold-path fallback only.
 3. Add AVX-512 / NEON wide bitbuf paths.
 4. Add per-block perfect-hash table builder.
-5. Add two-pass exact-output-bound mode (`OwnedOutput`).
+5. Add exact-output-bound mode (`OwnedOutput`) via ISIZE trailer
+   read for files + amortized-growth Vec for chunks (per §2.4).
 6. Add constant-time variant.
 7. Add GPU offload.
 8. Add hardware-coprocessor dispatch.
