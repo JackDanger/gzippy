@@ -174,6 +174,29 @@ fn decode_chunk_isal_impl(
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
+    // `worker.isal_stream_inflate` span — wraps every invocation of
+    // gzippy's ISA-L stream-inflate path. Both call sites land here:
+    //   (a) the post-bootstrap call at gzip_chunk.rs:549 (after the
+    //       pure-Rust phase-1 produces a clean 32 KiB window)
+    //   (b) the non-speculative direct path via `decode_chunk_isal`
+    //       at gzip_chunk.rs:150 (when the predecessor window is
+    //       already known and bootstrap is skipped)
+    //
+    // Pre-instrumentation the only proxy for ISA-L bulk-inflate time
+    // was `decode_chunk dur - bootstrap dur` — a derived value with
+    // no per-call visibility. With this span we can answer the
+    // post-Fix-#3 question: is the 1.5x per-chunk gap to vendor in
+    // bootstrap or in ISA-L bulk inflate?
+    //
+    // Args: `start_bit` (where decode starts) + `stop_hint` + a
+    // `has_window` flag distinguishing the two call paths above.
+    let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
+        "worker.isal_stream_inflate",
+        &format!(
+            r#""start_bit":{encoded_offset_bits},"stop_hint":{stop_hint_bits},"has_window":{}"#,
+            !initial_window.is_empty()
+        ),
+    );
     let t_decode = std::time::Instant::now();
     // `stop_hint_bits` is an inexact stop *hint* (vendor `untilOffset`), not a hard
     // read cap. Capping `refill_buffer` at a partition guess stops mid-block
