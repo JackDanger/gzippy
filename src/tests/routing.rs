@@ -420,21 +420,33 @@ mod tests {
             compressed.len()
         );
 
-        let before =
+        let bulk_before =
+            crate::decompress::parallel::gzip_chunk::PURE_BULK_RUNS.load(Ordering::Relaxed);
+        let unified_before =
             crate::decompress::inflate::unified::UNIFIED_INFLATE_RUNS.load(Ordering::Relaxed);
         let mut output = Vec::new();
         crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
         assert_eq!(output, original, "byte-perfect output");
-        let after =
+        let bulk_after =
+            crate::decompress::parallel::gzip_chunk::PURE_BULK_RUNS.load(Ordering::Relaxed);
+        let unified_after =
             crate::decompress::inflate::unified::UNIFIED_INFLATE_RUNS.load(Ordering::Relaxed);
 
+        // Either path is acceptable. When `GZIPPY_ISAL_PURE_BULK=1` is set the
+        // chunk decode goes through `decode_chunk_pure_bulk_impl` and
+        // `PURE_BULK_RUNS` increments; otherwise `IsalInflateWrapper`'s
+        // delegation to `Inflate<Clean, Generic, Streaming>` increments
+        // `UNIFIED_INFLATE_RUNS`. What we're guarding against is BOTH
+        // counters staying flat — that would mean the wrapper has reverted
+        // to bypassing both designed entry points.
         assert!(
-            after > before,
-            "UNIFIED_INFLATE_RUNS did not increment ({before} -> {after}); \
-             the parallel-SM wrapper has reverted to bypassing \
-             `Inflate<Clean, Generic, Streaming>`. Every chunk decode \
-             must pass through the unified surface (see \
-             `src/decompress/parallel/inflate_wrapper.rs` IsalInflateWrapper)."
+            unified_after > unified_before || bulk_after > bulk_before,
+            "Neither UNIFIED_INFLATE_RUNS ({unified_before} -> {unified_after}) \
+             nor PURE_BULK_RUNS ({bulk_before} -> {bulk_after}) incremented; \
+             the parallel-SM wrapper has reverted to bypassing both \
+             `Inflate<Clean, Generic, Streaming>` AND \
+             `decode_chunk_pure_bulk_impl`. Every chunk decode must pass \
+             through one of the designed surfaces."
         );
     }
 
