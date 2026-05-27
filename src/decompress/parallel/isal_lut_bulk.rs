@@ -581,15 +581,18 @@ mod tests {
     fn decode_block_btype01_heavy_l1_full_stream() {
         use std::io::Write;
         let phrases: &[&[u8]] = &[b"abc", b"foo bar ", b"the quick brown ", b"hello ", b"xyz "];
-        let mut payload = Vec::with_capacity(256 * 1024);
+        // 12 MiB — large enough to exercise many block transitions and
+        // catch any state-leak between successive decode_block calls.
+        let target = 12 * 1024 * 1024;
+        let mut payload = Vec::with_capacity(target);
         let mut rng: u64 = 0xb0bd1ec0de;
-        while payload.len() < 256 * 1024 {
+        while payload.len() < target {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
             if (rng >> 32) % 100 < 70 {
                 payload.push((rng >> 16) as u8);
             } else {
                 let phrase = phrases[(rng as usize) % phrases.len()];
-                let take = phrase.len().min(256 * 1024 - payload.len());
+                let take = phrase.len().min(target - payload.len());
                 payload.extend_from_slice(&phrase[..take]);
             }
         }
