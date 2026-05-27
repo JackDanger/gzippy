@@ -75,22 +75,47 @@ without forking. Kernel paths (~20 % combined) are inherent to the
 workload's memory pattern. **Roughly 40 % of cycles are off-limits to
 surgical Rust changes.**
 
+### Where the gap is, from a fresh trace_v2 timeline (2026-05-26)
+
+`GZIPPY_TIMELINE=…` on both binaries on silesia-large.gz, T=16,
+neurotic (`scripts/timeline_analyze.py` diff):
+
+| Metric | gzippy | rapidgzip | gap |
+|---|---:|---:|---:|
+| Wall | 379 ms | 152 ms | **2.49×** |
+| Max single chunk decode | 112 ms | 91 ms | 1.23× |
+| Cumulative `pool.run_task` | 3.34 s | 1.87 s | 1.78× |
+| Cumulative `pool.pick` (idle/contend) | **2.59 s** | 0.57 s | **4.6×** |
+| Pool utilization (run_task / (run+pick)) | **55 %** | **77 %** | 0.71× |
+| Consumer `wait.block_fetcher_get` | 247 ms | 69 ms | 3.5× |
+
+**The per-chunk decode is only 1.23× slower** (Rust-vs-C++ codegen
+gap, known); the headline 2.49× wall gap is **dispatch inefficiency**:
+gzippy workers spend 43 % of wall idle/contending vs rapidgzip's 23 %.
+
 ### What's structurally locked
 
 - **Per-byte rate of bootstrap.** ~149 MB/s. Vendor's equivalent runs
   at ~250 MB/s. The ~1.25× per-byte Rust-vs-C++ codegen gap on the
-  same algorithm is measured (`plans/`-era apples-to-apples bench).
-  Closing it without leaving pure-Rust is not on the table.
+  same algorithm is measured. Closing it without leaving pure-Rust is
+  not on the table — but per the fresh trace, this is at most a 23 %
+  share of the wall gap, not the dominant one.
 - **First-touch page faults on chunk buffers.** Each new pool buffer
   costs ~4 KiB of kernel page-zero per page written. Pre-allocating
-  capacity does NOT help (`0da3530` revert). The only fix is
-  `MADV_POPULATE_WRITE` or reusing pre-faulted memory across
-  invocations (structural).
-- **Wall is bounded by MAX worker chunk time.** Wall ≈ 0.55-0.70 s,
-  CPU usage ≈ 32 % across 16 logical cores. Workers are NOT
-  CPU-bound — they're waiting on the slowest critical-path chunk.
-  Cycle-reduction wins translate to wall reduction only if they hit
-  the chunk that bounds the FIFO drain.
+  capacity does NOT help (`0da3530` revert). rpmalloc-per-Vec is
+  already deployed (`Cargo.toml:39, 51`) and we're at vendor parity
+  (~17 % `clear_page_erms`). Daemon-mode amortization is the only
+  remaining lever.
+
+### What's NOT locked — the new structural opening
+
+- **Pool dispatch inefficiency dominates the wall gap.** Workers idle
+  ~125 ms more wall each than rapidgzip's. Closing the 55 % → 77 %
+  utilization gap is a ~40 % wall improvement on its own.
+- **Wall is NOT bounded by max worker chunk time** (the prior plan
+  text was wrong). gzippy wall is 3.4× max chunk; rapidgzip wall is
+  1.7× max chunk. Gzippy can't sustain 16-way parallelism; rapidgzip
+  can.
 
 ---
 
