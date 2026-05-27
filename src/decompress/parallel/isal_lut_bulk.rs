@@ -155,7 +155,20 @@ pub fn decode_block(
         0b00 => {
             return decode_stored_block(bits, output, out_pos, is_final_block);
         }
-        0b01 => build_fixed_huffman(scratch)?,
+        0b01 => {
+            build_fixed_huffman(scratch)?;
+            // DIAG: verify fixed-Huffman LUT[0..32] all decode to sym 256
+            // (EOB) with bit_count=7. Code 0b0000000 in 7 bits is EOB.
+            if std::env::var_os("GZIPPY_BULK_DIAG").is_some() {
+                let e0 = scratch.litlen.table.short_code_lookup[0];
+                let bit_count = e0 >> 28;
+                let sym_count = (e0 >> 26) & 0b11;
+                let symbol = e0 & ((1u32 << 25) - 1);
+                eprintln!(
+                    "[bulk-diag] fixed LUT[0]=0x{e0:08x} bit_count={bit_count} sym_count={sym_count} symbol={symbol}"
+                );
+            }
+        }
         0b10 => build_dynamic_huffman(bits, scratch)?,
         _ => return Err(BulkDecodeError::BlockTypeReserved),
     }
