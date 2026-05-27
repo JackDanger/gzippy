@@ -66,6 +66,11 @@ pub mod huffman_symbols_per_length;
 pub mod inflate_wrapper;
 #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
 pub mod isal_huffman;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+pub mod isal_huffman_pure;
 pub mod prefetcher;
 #[cfg(all(
     target_arch = "x86_64",
