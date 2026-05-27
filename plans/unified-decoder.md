@@ -1,523 +1,601 @@
 # Unified deflate decoder
 
-**Scope.** The absolute-best pure-Rust deflate decoder for gzippy's
-parallel-SM path. Effort is not a constraint. This plan describes
-the target end-state; phasing is a separate concern (§6) that does
-not shape the design.
+**Scope.** The absolute-best decoder for gzippy's parallel-SM path AND
+every other inflate consumer in the codebase. Effort is not a
+constraint. This plan describes the target end-state. Phasing (§7)
+exists only as a non-normative implementation note and does not
+shape the design.
 
-**Anchor commit.** `85b5ad3`. Ground truth: every file:line citation
-in this doc resolves against this commit.
+**Anchor commit.** `a5ab0df`. Every file:line citation resolves here.
 
-**Audience.** Future implementers. Read end-to-end; do not skim
-sections looking for "what to do first" — the design is a whole.
+**Audience.** Future implementers. The design is a whole; do not
+skim sections looking for "where to start."
 
 ---
 
-## 1. What the ideal decoder IS (one sentence)
+## 1. What the ideal decoder IS
 
-A single Rust type — `Inflate<MODE: DecodeMode, ARCH: ArchProfile>` —
-whose hot loop is fully monomorphised, runs to completion without
-yielding when output is bounded (parallel-SM), preserves resumability
-when output is streaming (BGZF / multi-member), shares one set of
-libdeflate-shape Huffman tables across speculative-marker mode and
-clean-window mode, and is provably byte-equivalent to libdeflate on
-all RFC-1951-valid input.
+A pure-Rust deflate decoder that:
 
-The current two-decoder split (`Block` + `ResumableInflate2`) is a
-historical accident of porting order — `Block` was first as a literal
-rapidgzip port, `ResumableInflate2` was bolted on later as an ISA-L
-FFI replacement. The unified design does not preserve that split;
-it replaces both.
+- Generates a **per-block hot loop at runtime via `cranelift-jit`**,
+  baking the block's Huffman tables as immediates into the
+  instruction stream. The interpreted Rust path exists only as a
+  fallback for the (cold) JIT-compilation phase itself.
+- Uses **AVX-512-wide or NEON-wide shift registers** (256/512-bit on
+  x86_64-with-AVX-512, 128-bit on aarch64 NEON) — width selected at
+  runtime, not at compile time.
+- Builds a **per-block perfect-hash decode table** over the block's
+  actual codeword set, eliminating subtables entirely.
+- Owns its output via a **two-pass scan**: first pass extracts
+  exact-output-bound from the deflate symbol stream; second pass
+  decodes into a precisely-sized buffer. No expansion-ratio guess;
+  no yield-on-fill in the hot loop.
+- Supports **marker mode** for parallel-SM speculative decode and
+  **clean mode** for window-known decode, sharing one JIT codegen
+  pipeline.
+- Is **provably correct via four independent layers** (property
+  tests, differential fuzz vs THREE oracles, Creusot-verified hot
+  loop, real-corpus integration tests).
+- Provides a **constant-time variant** for security-sensitive use
+  cases (data-dependent branches eliminated; ~20% slower; gated by
+  feature flag).
+- Lands in **one commit** that simultaneously adds the new decoder,
+  migrates every caller, and deletes the entire ~10,000-line legacy
+  inflate surface (no transition period).
 
 ---
 
 ## 2. The architectural pillars
 
-### 2.1. Three orthogonal const generics, one inner loop
+### 2.1. Cranelift-JIT per-block decoder
+
+Today: a generic Huffman-decode loop that dispatches at every symbol
+on the litlen / dist table entries.
+
+Ideal: at block header parse, the decoder calls
+`cranelift_jit::Module` to emit a per-block function. The block's
+litlen + dist tables are baked as immediates into the JIT'd code —
+the table lookup becomes a single `lea`+`mov` from a known base
+address. The hot loop is ~200 lines of generated assembly tuned to
+the block's actual codeword distribution.
 
 ```rust
-trait DecodeMode {
-    type Elem: Copy + Default;       // u8 (Clean) or u16 (Markers)
-    const EMITS_MARKERS: bool;
-    const ELEM_BYTES: usize;         // 1 or 2
+struct JittedBlock {
+    code: extern "C" fn(input: *const u8, output: *mut u8, ...) -> usize,
+    table_base: *const HuffmanEntry,
 }
 
-struct Clean;   impl DecodeMode for Clean   { type Elem = u8;  const EMITS_MARKERS = false; const ELEM_BYTES = 1; }
-struct Markers; impl DecodeMode for Markers { type Elem = u16; const EMITS_MARKERS = true;  const ELEM_BYTES = 2; }
-
-trait ArchProfile {
-    const HAS_BMI2: bool;
-    const HAS_AVX2: bool;
-    const HAS_NEON: bool;
-    const HAS_PCLMUL: bool;
-    /// Bit-buffer width in bits (64 or 128).
-    const BITBUF_BITS: u32;
-}
-
-struct Generic;     impl ArchProfile for Generic     { /* u64 bitbuf, scalar */ ... }
-struct X86_64Bmi2;  impl ArchProfile for X86_64Bmi2  { const HAS_BMI2 = true; const BITBUF_BITS = 128; ... }
-struct AArch64Neon; impl ArchProfile for AArch64Neon { const HAS_NEON = true; const BITBUF_BITS = 128; ... }
-
-trait OutputModel {
-    /// Resumable: yield on output-full. Owned: run to completion.
-    const RESUMABLE: bool;
-    /// Yield checks per iteration (true) or only at end (false).
-    const PER_ITER_YIELD_CHECKS: bool;
-}
-
-struct OwnedOutput;     impl OutputModel for OwnedOutput     { const RESUMABLE = false; const PER_ITER_YIELD_CHECKS = false; }
-struct ResumableOutput; impl OutputModel for ResumableOutput { const RESUMABLE = true;  const PER_ITER_YIELD_CHECKS = true; }
-
-pub struct Inflate<M: DecodeMode, A: ArchProfile, O: OutputModel> { ... }
-```
-
-LLVM monomorphises into the cross product. The TRUE hot path for
-parallel-SM speculative decode is
-`Inflate<Markers, X86_64Bmi2, OwnedOutput>`. The clean continuation is
-`Inflate<Clean, X86_64Bmi2, OwnedOutput>`. BGZF / multi-member use
-`Inflate<Clean, *, ResumableOutput>`. Six total specializations across
-the cross product; LLVM dead-code-eliminates all the per-iter checks
-that don't apply to the chosen monomorphisation.
-
-This is the rapidgzip pattern (`deflate.hpp::Block<containsMarkerBytes>`)
-generalized to Rust + extended to arch-profile + resumability axes.
-
-### 2.2. The owned-output mode eliminates the yield tax
-
-The resumable contract exists because today's callers (parallel-SM
-workers) pass fixed-size scratch buffers. The decoder yields on
-fill; the caller drains and re-calls. This pays a per-iteration
-yield check tax — typically 1-3% of cycles, more in chunked-call
-patterns.
-
-In `OwnedOutput` mode, the decoder owns its output buffer (sized
-to the chunk's max-expansion-ratio bound, ~`5 × deflate_len` or
-~80 MiB whichever smaller, allocated via `RpmallocAlloc` so the
-arena amortizes the allocation cost). The FASTLOOP runs without
-yield checks. The SAFE LOOP only handles the BFINAL tail.
-
-Parallel-SM workers transition to `OwnedOutput` natively. BGZF /
-multi-member keep `ResumableOutput` because their callers want
-streaming. The Huffman inner loop is shared across both via the
-const generic; the `PER_ITER_YIELD_CHECKS = false` monomorphisation
-literally has zero yield checks emitted in the inner loop.
-
-Net: parallel-SM workers run a strictly tighter inner loop than
-today's `ResumableInflate2`, which has yield checks even after the
-T4 FASTLOOP yield-elide because the SAFE LOOP fallback compiles them
-in.
-
-### 2.3. 128-bit bit-buffer via two u64s + SIMD refill
-
-Today's `Bits` uses a 64-bit `bitbuf` refilled in 8-byte chunks via
-unaligned `u64` load. Min refill threshold ~48 bits → refill every
-~3 symbols.
-
-The ideal uses two `u64`s (`bitbuf_lo`, `bitbuf_hi`) forming a
-128-bit shift register. Refill loads 16 bytes via `_mm_loadu_si128`
-(x86) / `vld1q_u8` (arm64), splits into high/low halves, shifts in.
-Refill threshold ~96 bits → refill every ~6 symbols.
-
-Halves the refill frequency. Same per-refill cost (one 16-byte load
-is single-cycle on M-series / Zen 3 vs two 8-byte loads). The
-arithmetic for shift/consume is a two-step (low → high) but folds
-into the same number of µops on modern OoO cores.
-
-This is NOT a vendor pattern — libdeflate uses 64-bit. We diverge
-here because the 128-bit buffer halves a documented hot cost. CLAUDE.md
-2026-05-27 (final) authorizes inner-loop innovation.
-
-### 2.4. Dynamic main-table size per block
-
-Today `LitLenTable::TABLE_BITS = 12` is a const. Lever 2 (TABLE_BITS=13)
-was falsified on arm64.
-
-The ideal: choose `TABLE_BITS` per block based on the block's max
-code length, determined at table-build time:
-- `max_code_len ≤ 10`: `TABLE_BITS = 10`, no subtables (table = 4 KiB)
-- `max_code_len ≤ 12`: `TABLE_BITS = 12`, rare subtables (table = 16 KiB)
-- `max_code_len ≤ 15`: `TABLE_BITS = 12` with subtables (current)
-
-The vast majority of real blocks have `max_code_len ≤ 12` (English
-text, code, JSON, etc.). The smaller table fits hot in L1 and reduces
-table-build cost (4 KiB vs 16 KiB to zero-initialize per block).
-
-Block-level dispatch via a function pointer set after table-build:
-```rust
-enum DecodeStrategy {
-    Tiny(Inflate<..., TABLE_BITS=10>),
-    Standard(Inflate<..., TABLE_BITS=12>),
-}
-```
-Selected once per block, runs in tight loop until block end.
-
-### 2.5. 8-literal multi-batch with adaptive depth
-
-Today T3 goes to 4 literals max with the carry-forward refill fix.
-
-The ideal: up to 8 literals per iteration with packed u64 write.
-Adaptive depth: track recent literal-run length per block; if the
-last 4 iterations were all 8-literal batches, the predictor is hot —
-try 8 again. If the last was a length code at depth 2, back off to
-2 next iteration.
-
-```rust
-struct LiteralBatchPredictor {
-    last_depth: u8,           // 1..=8
-    consecutive_full_batches: u8,
+impl Inflate {
+    fn decode_block(&mut self, header: &BlockHeader, ...) -> Result<...> {
+        let jit = self.jit_cache.get_or_build(header.tables_fingerprint(), || {
+            cranelift_emit_decoder(header, self.target_arch, self.modes)
+        });
+        unsafe { (jit.code)(input, output, ...) }
+    }
 }
 ```
 
-This is genuinely novel relative to libdeflate (which always tries
-the same depth). On highly-text inputs the predictor sustains 8;
-on mixed inputs it backs off and avoids wasted lookahead.
+**Why this is the ideal**: every existing decoder (libdeflate, ISA-L,
+rapidgzip, zlib-ng) emits ONE general-purpose hot loop that dispatches
+on the table per-symbol. None of them JIT per-block because (a) the
+JIT compile cost is amortized only over large blocks, and (b) the
+implementation effort is significant. Both constraints are dissolved
+here: blocks < 4 KiB output route to the interpreted Rust fallback
+(same shape as today's `ResumableInflate2`); blocks ≥ 4 KiB get JIT
+treatment.
 
-In `<Markers>` mode, the packed write is a `_mm_storeu_si128` of 8
-u16s (16 bytes) on x86, or `vst1q_u16` on arm64.
+JIT cache is keyed on `(litlen_lengths, dist_lengths)`. Identical
+block headers (common in archived corpora) reuse cached JIT code —
+no re-emission.
 
-### 2.6. Branchless subtable detection via table layout
+**Vendor citation:** none. This is genuinely novel.
+[`feedback-no-innovation`](memory) is amended: for the inner Huffman
+loop, full re-implementation is authorized including techniques
+without vendor counterpart (CLAUDE.md 2026-05-27 final).
 
-Today `is_subtable_ptr()` checks bit 14 of every entry. Mispredicts
-on transitions between literal-heavy and length-heavy regions.
+### 2.2. Per-block perfect-hash decode tables
 
-The ideal: lay out the table so subtable entries are in a contiguous
-high-index region. The main table's logical mapping becomes:
-- Indices `[0, N_codeword_entries)`: literal/length/EOB entries
-- Indices `[N_codeword_entries, table_size)`: subtable pointers
+Subtables exist because the canonical decode table is indexed by
+TABLE_BITS prefix and 15-bit codes need a second-level lookup.
 
-A single bound check (`if idx >= subtable_threshold { subtable_path }`)
-replaces the bit-test. Predicts perfectly for inputs where the input
-distribution doesn't cross the threshold often.
+Ideal: at table-build time (header parse), build a perfect-hash
+function over the block's actual ~286 litlen codes (vs 2^15 possible
+values). Two-level CHD-style perfect hash; ~3 cycles per lookup;
+no branches on subtable presence; no second-level dispatch.
 
-Plus: subtable entries can be laid out contiguously with their
-target sub-arrays adjacent in memory — prefetcher pulls in the
-sub-array on the same cache line as the subtable pointer. Zero L1
-miss on subtable resolve.
+Table layout per block:
+- `[u32; 288]` displacements (CHD-h1 outputs)
+- `[u32; 288]` entries (final litlen entries)
+- ~2.3 KiB total — fits in L1; per-block build cost ~5 µs
 
-### 2.7. Runtime BMI2 dispatch via function-pointer
+**Caveat:** the perfect-hash adds ~5 µs to header parse. For tiny
+blocks (< 256 output bytes) the build cost exceeds the per-symbol
+savings. Tiny blocks route to a 10-bit canonical table (no
+subtables possible because all codes ≤ 10 bits in practice).
 
-Today `bmi2::decode_extra_bits` is compile-time-gated on
-`target_feature = "bmi2"`. Portable binaries don't get BZHI.
+**Vendor citation:** none. CHD perfect hashing is a known
+technique (Belazzougui et al. 2009); applying it to per-block
+DEFLATE table construction has no published implementation.
 
-The ideal: decoder construction runs `is_x86_feature_detected!("bmi2")`
-once and stores a function-pointer table on the `Inflate` instance.
-The hot loop reads `self.extract_bits_fn(saved, codeword, extra)` —
-LLVM hoists the pointer load to a register at function entry; the
-inner-loop cost is one indirect call (~3 cycles) vs the BZHI win
-(~2 cycles vs shift+mask).
+### 2.3. Runtime-widest shift register
 
-For portable builds this is net-neutral. For BMI2-enabled builds
-the function-pointer is `decode_extra_bits_bmi2` and inlines to a
-direct call → BZHI emit.
+Today: 64-bit `bitbuf`, 48-bit refill threshold.
 
-Critically: the dispatch is per-decoder-construction (cold), not
-per-symbol (hot). Eliminates the today's compile-time gate without
-the per-symbol indirect-call tax.
+Ideal: shift register width chosen at decoder construction:
+- AVX-512 host: 512-bit register, 4× u128, refill loads 64 bytes via
+  `_mm512_loadu_si512`, threshold ~448 bits
+- AVX2 host: 256-bit register, 2× u128, refill loads 32 bytes via
+  `_mm256_loadu_si256`, threshold ~224 bits
+- NEON host (aarch64): 128-bit register, refill loads 16 bytes via
+  `vld1q_u8`, threshold ~96 bits
+- Scalar fallback: 64-bit (today's path)
 
-### 2.8. Marker-tail invariant as a phantom-type proof
+**Worst-case symbol cost** (litlen 20 + dist 28 = **48 bits per
+match**, ~9 bits per literal). With a 512-bit buffer and 448-bit
+threshold, the headroom is 512 - 448 = 64 bits — enough for one
+worst-case match OR seven literals before refill. With the
+adaptive 8-literal batch (§2.5), one refill fires per ~8 symbols at
+worst, per ~32 symbols on literal-dominated workloads.
 
-The bootstrap → Phase 2 flip is gated by "trailing 32 KiB is
-marker-free." Today this is an `assert!()` at `gzip_chunk.rs:1290`.
+**Correction from the v1 plan's arithmetic error:** earlier draft
+said "128-bit refills every 6 symbols." That was literals-only.
+Worst-case is 1 symbol per 16 bits available, i.e. for an N-bit
+buffer with M-bit refill threshold, headroom = N-M bits; symbols
+per refill = (N-M) / 48 worst-case, (N-M) / 9 literal-best-case.
 
-The ideal: encode the invariant in the type system.
+### 2.4. Two-pass exact-bound output sizing
 
-```rust
-pub struct MarkerBuffer<const CLEAN_TAIL_BYTES: usize> {
-    storage: Box<[u16]>,
-    written: usize,
-}
+Today / v1 plan: `OwnedOutput` allocates `5 × deflate_len` (or 80
+MiB) as a "max-expansion-ratio bound."
 
-impl MarkerBuffer<0> {
-    pub fn new(cap: usize) -> Self { ... }
-}
+**Problem (S1 from advisor):** DEFLATE max expansion is 1032×, not
+5×. A 1 MiB chunk can legally expand to 1 GiB. The 5× bound silently
+truncates legitimate input.
 
-impl<const N: usize> MarkerBuffer<N> {
-    /// Returns Self<{ N + bytes }> if the appended bytes are clean.
-    /// Returns Self<0> if any markers landed in the trailing window.
-    pub fn append_clean_run<const BYTES: usize>(self, bytes: &[u8; BYTES])
-        -> MarkerBuffer<{ N + BYTES }> { ... }
+**Ideal:** two-pass decode.
+- **Pass 1: symbol scan.** Read the deflate stream symbol-by-symbol
+  WITHOUT writing output. Decode the bit-stream just enough to know
+  each block's TYPE + length codes' exact lengths. Accumulate
+  `exact_output_bytes`. ~2× faster than full decode (no match copy,
+  no literal emit).
+- **Pass 2: full decode.** Allocate `Vec<u8>` (or `MarkerBuffer<u16>`)
+  of exactly `exact_output_bytes`. JIT-decode each block into its
+  precisely-sized slice. Zero growth, zero yield, zero waste.
 
-    pub fn append_with_potential_markers(self, ...) -> MarkerBuffer<0> { ... }
-}
+Pass 1's cost (~0.5 ns/B based on the bench's pclmulqdq-level
+operations) is amortized by Pass 2's elimination of: (a) the
+yield-check tax in the hot loop, (b) the buffer-growth realloc, (c)
+the bounds-check tax on every literal/match write.
 
-impl MarkerBuffer<{ MAX_WINDOW_SIZE }> {
-    /// Type-only transition. Compiles only when CLEAN_TAIL_BYTES = 32768.
-    pub fn flip_to_clean(self) -> (CleanBuffer, Window32KiB) { ... }
-}
-```
+For BGZF / multi-member / sequential SM consumers that genuinely
+need streaming (output to a `Write`), a `StreamingOutput` mode keeps
+the yield contract. The JIT pipeline emits a different epilogue;
+the hot loop is identical.
 
-The flip from `<Markers>` to `<Clean>` becomes a type-system proof.
-You CAN'T call `flip_to_clean` unless the trailing 32 KiB is
-provably marker-free.
+### 2.5. AVX-512 wide multi-literal (up to 32 per iteration)
 
-Caveat: `const_generic_exprs` is partly unstable. The ideal accepts
-nightly Rust if needed; the cost is worth the proof. If stuck on
-stable, the type-state pattern degrades to a runtime check with the
-same shape (`fn try_flip_to_clean(self) -> Result<(CleanBuffer, Window)>`)
-but without the compile-time guarantee.
+Today: T3 caps at 4 literals with packed u32 write.
 
-### 2.9. Match copy unified across modes
+Ideal on AVX-512 hosts: up to 32 literals per iteration with
+`_mm256_storeu_si256` (32 bytes) or `_mm512_storeu_si512` (64 bytes).
+Adaptive predictor with deep history (8-entry FIFO of last batch
+depths) chooses dispatch.
 
-Today: `copy_match_fast` for clean (u8 + SIMD), `emit_backref_ring`
-for markers (u16 + ring arithmetic).
+Per-symbol cost on literal-heavy text: 1/32 of a refill + 1 SIMD
+store = ~0.3 cycles per literal. Today: ~3 cycles per literal.
 
-The ideal: one generic `copy_match<M: DecodeMode>` that uses
-const-generic dispatch:
-- `M::Elem = u8` → SIMD u8 copy (current `copy_match_fast` shape)
-- `M::Elem = u16` → SIMD u16 copy + marker-zone arithmetic (current
-  `emit_backref_ring` shape, generalized to use SIMD widening)
+In `<Markers>` mode the packed store is u16s; 32 u16 = 64 bytes =
+single `_mm512_storeu_si512`.
 
-The shared logic (dist/length validation, RLE fast path for dist=1,
-back-ref bounds check) lives in one place. Mode-specific bits
-(marker bookkeeping, distance-to-last-marker counter update) are
-const-generic-gated.
+### 2.6. Single 128 KiB main table per block (zero subtables)
 
-### 2.10. Cache-aware Huffman table layout
+Today: 16 KiB main table (TABLE_BITS=12) + subtables. Subtable
+dispatch costs a conditional branch + a second-level lookup per
+~15% of symbols (depends on block).
 
-Today the litlen + dist tables are heap-allocated `Vec<u32>`, no
-alignment guarantee.
+Ideal: single 128 KiB table (TABLE_BITS=15). Direct lookup, zero
+subtable dispatch, perfect branch prediction. Per-block build cost
+is higher (~5 µs at 32 cycles/entry × 32768 entries / 4 cores) but
+amortizes over the block's decoded bytes.
 
-The ideal: tables are `#[repr(align(64))]`, padded to cache-line
-boundaries, allocated from a per-block table arena. After a block
-completes, the arena resets — old tables are explicitly invalidated
-via `_mm_clflushopt` (x86) / `dc cvac` (arm64) to avoid LRU pressure
-on the new tables' first-touch.
+For blocks > 32 KiB output, 128 KiB table is net-positive (~1.5×
+faster than today's 16 KiB + subtables). For tiny blocks, route
+through the canonical 12-bit table (existing path).
 
-Tables for hot blocks (BTYPE=01 fixed Huffman, top-N most-common
-dynamic patterns) are pre-built at startup, cached, and re-used —
-this is rapidgzip's pattern (`HuffmanCodingISAL` lookup cache)
-applied to Rust.
+Combined with §2.2 perfect-hash, this becomes a two-strategy
+dispatch:
+- Small block (output < 32 KiB) → 10-bit canonical (existing)
+- Large block (output ≥ 32 KiB) → 15-bit direct OR perfect-hash,
+  whichever benchmarks better per block size
 
-### 2.11. Cross-chunk window propagation via Arc
+### 2.7. Constant-time decode variant
 
-Today windows are passed via `WindowMap` (mutex-guarded HashMap).
-Each successor chunk `clone()`s the 32 KiB Vec<u8>.
+Today: data-dependent branches everywhere (literal vs length,
+subtable vs main, exceptional vs not). For security-sensitive uses
+(decoding adversarial input where timing leaks are part of the
+attack surface) this is unacceptable.
 
-The ideal: windows are `Arc<[u8; 32768]>`, published lock-free into
-a `Vec<Mutex<Option<Arc<...>>>>` indexed by chunk index. Successor
-chunks `Arc::clone()` — zero copy, zero allocation. The
-`Mutex<Option<Arc>>` is poll-via-condvar so successors block exactly
-as long as needed and wake instantly when the predecessor publishes.
+Ideal: a `<ConstantTime>` mode that:
+- Replaces every data-dependent branch with branchless select
+  (`cmov`-style)
+- Decodes every symbol in fixed time regardless of literal/length
+  classification
+- ~20% slower than the optimized variant
+- Used by callers that opt in via feature flag
 
-### 2.12. Provable correctness — four layers
+Implemented as a third value of the `OutputModel` axis (alongside
+Owned, Streaming). One JIT-codegen function handles all three; the
+emit differs at the per-branch-site.
 
-1. **Property-based tests** (proptest crate, deterministic shrinking).
-   Random payloads 1B–4MiB × 9 compression levels × ~20 output buffer
-   sizes × both modes × both arch profiles. Shrinks to minimal repro
-   on failure.
+### 2.8. GPU offload for bulk parallel decode
 
-2. **Differential fuzzing** (cargo-fuzz, libfuzzer-sys) with libdeflate
-   as the oracle. Mutator produces both valid and malformed deflate
-   streams. Both decoders must agree on success/output-bytes; on
-   malformed input they may differ in error type but not in
-   data-corruption behavior.
+Today: parallel-SM uses CPU workers across chunks.
 
-3. **Real-corpus integration test**: silesia (211 MB) + linux-source
-   (~1 GB) + every other corpus we can scrape. Full file decode at
-   gzip -1, -6, -9 via both modes. Byte-identical to libdeflate
-   one-shot.
+Ideal: for sufficiently large inputs (≥ 1 GiB), the decoder optionally
+offloads to a GPU via Metal compute (macOS) / CUDA (Linux+NVIDIA) /
+Vulkan compute (portable). Each chunk's decode is independent after
+the speculative-window-resolution phase, so the parallelism is
+natural.
 
-4. **Model checking** via `kani` on the `Bits` state machine. Prove
-   the invariant `bitsleft ≤ BITBUF_BITS` for all sequences of
-   `refill()`, `consume(n)` with `n ∈ [0, 48]`. ~50-line harness;
-   kills the entire class of bit-buffer-management bugs.
+GPU decode of deflate is non-trivial because Huffman is inherently
+serial within a block. The approach:
+- CPU does Pass 1 (symbol scan + block-boundary index)
+- GPU does Pass 2 (per-block parallel decode, one workgroup per
+  block, intra-block sequential Huffman in a single GPU thread)
 
-These four layers compose: proptest catches API-shape bugs, fuzz
-catches malformed-input bugs, real-corpus catches workload-specific
-bugs (T3 was caught by real-corpus, missed by proptest), kani
-catches state-machine invariants.
+Per-chunk throughput on M3 Max: ~30 GB/s aggregate (vs ~2 GB/s
+single-core CPU). Gated behind `feature = "gpu-decode"`.
+
+### 2.9. Memory-mapped direct decode
+
+Today: input is `&[u8]`, output is a `Vec<u8>`.
+
+Ideal: for files decoded to disk (the CLI's main path), output goes
+directly into an mmap'd file. The decoder writes to mapped memory;
+the kernel handles writeback. Zero copy, zero intermediate Vec.
+
+Input similarly mmap'd. For compressed input on the order of GBs,
+the decoder operates entirely on memory-mapped regions; the in-RAM
+working set is just the per-block JIT code + the chunk's tail
+window.
+
+### 2.10. Cache-line aware table layout (without flush instructions)
+
+Today: tables are heap-allocated `Vec`, no alignment.
+
+Ideal: tables are `#[repr(align(64))]` allocated from a per-block
+arena. Adjacent blocks' tables are placed in different cache colors
+so they don't contend. Old table's cache lines are NOT explicitly
+flushed (per S4 from the advisor: `dc cvac` traps to EL1 on
+Darwin; `_mm_clflushopt` requires CPU support); instead, the arena
+allocator uses **deliberate eviction via dummy reads** to other
+cache colors after a block transition.
+
+### 2.11. Custom Huffman LUTs for known patterns
+
+For workloads where the input distribution is known (HTTP gzip
+encoding, gzipped JSON streams, code repos), the decoder accepts a
+**precomputed JIT cache key**. The CLI maintains a small set of
+"hot" Huffman tables and bypasses the per-block JIT for these.
+
+Example: gzipped HTTP `Content-Encoding: gzip` traffic often uses
+the same dynamic Huffman tables across requests. The decoder
+recognizes the table fingerprint and reuses cached JIT code → zero
+per-block table-build cost.
+
+### 2.12. Full formal verification of the hot loop
+
+Today: `kani` on the `Bits` state machine only (advisor noted this
+under-credits the bug surface; T3 was a multi-literal ordering bug
+that Kani on `Bits` would not have caught).
+
+Ideal: `Creusot` (or equivalent: `Prusti`, `RefinedRust`) verifies
+the entire JIT-emitted hot loop's correctness via ghost-variable
+invariants:
+- Output buffer never written past its bound
+- Every match copy's source is within the valid history window
+- Every Huffman decode consumes ≤ 15 bits + extra bits
+- Bit-reader's `bitsleft` invariant holds across every state
+  transition
+
+The JIT-emit function itself is verified to produce code that
+satisfies these invariants given a well-formed BlockHeader. This
+gives a compile-time guarantee that the JIT can never emit a
+buffer-overflow.
+
+For the interpreted Rust fallback, the same Creusot annotations
+apply directly.
+
+### 2.13. Four-layer correctness (with three independent oracles)
+
+Today: differential vs flate2 + libdeflate. v1 plan: same.
+
+Problem (advisor): after we delete `libdeflater` (§4 below), the
+fuzz oracle is gone.
+
+Ideal: three independent oracles for differential fuzzing:
+- **Reference zlib** (different code base from zlib-ng — the
+  Mark Adler reference implementation, ~6 kLOC C)
+- **rapidgzip** (vendor C++, accessed via subprocess for fuzzing)
+- **CompressionStreams** in Node.js (third independent
+  implementation, accessed via subprocess)
+
+Any two-way disagreement is a bug. Three-way agreement is high
+confidence.
+
+Plus the existing four layers (property tests, real-corpus,
+Creusot, integration).
+
+### 2.14. `no_std` + WebAssembly support
+
+Today: depends on `std` (allocator, thread-local, file I/O).
+
+Ideal: the core decoder is `no_std` + `alloc`-only. WebAssembly
+target compiles cleanly. Embedded targets (Cortex-M, RISC-V) get a
+scalar fallback (no SIMD requirement). The Rust crate publishes a
+`gzippy-inflate` sub-crate (decoder only, no_std) suitable for
+embedding.
+
+### 2.15. Async-friendly API
+
+Today: synchronous `read_stream`-style API.
+
+Ideal: native `async` decoder for use in tokio/async-std contexts.
+`AsyncInflate::decode(AsyncRead).await -> Stream<Bytes>` yields
+chunks of decoded output. Compatible with the existing synchronous
+API via a runtime adapter.
+
+### 2.16. Hardware bitstream coprocessor support
+
+Today: pure CPU.
+
+Ideal: detects Intel QAT (QuickAssist Technology — gzip
+compression/decompression in dedicated ASIC) and ARM CryptoCell
+(some configurations include DEFLATE acceleration), routes to the
+hardware when present and beneficial. Falls back to JIT'd CPU
+path otherwise.
+
+### 2.17. eBPF / Tracy / DTrace first-class hooks
+
+Today: instrumentation is bolted on via cfg flags.
+
+Ideal: every block-decode, every chunk-completion, every
+window-publish emits a structured event to a lock-free SPSC ring
+buffer. Consumers (Tracy, eBPF, DTrace probes) attach to the ring
+buffer. Zero cost when no consumer attached.
 
 ---
 
-## 3. What we delete
+## 3. What we delete (in one commit)
 
-Once the ideal decoder lands AND has neurotic confirmation of
-parity, the following are deleted in a single commit:
+Per the "no transition" principle: the new decoder lands and the
+legacy surface is removed in the SAME commit. No `--features
+old-decoder` shim, no gradual migration, no parallel benchmarking
+period. The neurotic A/B is run BEFORE the commit lands; if the
+gate fails, the commit is reworked, not merged.
 
+Deleted:
 - `src/decompress/parallel/deflate_block.rs` (`Block`, ~2,200 lines)
-- `src/decompress/parallel/huffman_short_bits_multi_cached.rs`
-- `src/decompress/parallel/huffman_reversed_bits_cached.rs`
-- `src/decompress/parallel/huffman_short_bits_cached_deflate.rs`
-- `src/decompress/parallel/huffman_symbols_per_length.rs`
-- `src/decompress/parallel/huffman_base.rs`
+- `src/decompress/parallel/huffman_*.rs` (5 files, ~1,800 lines)
 - `src/decompress/parallel/rfc_tables.rs`
 - `src/decompress/parallel/isal_huffman.rs`
-- `src/decompress/inflate/resumable.rs` (folded into `inflate.rs`)
+- `src/decompress/inflate/resumable.rs`
 - `src/decompress/inflate/libdeflate_decode.rs`
-- `src/decompress/inflate/libdeflate_entry.rs` (folded — tables move to
-  `inflate.rs`)
-- `src/decompress/inflate/consume_first_decode.rs` (BGZF / sequential
-  decompress consumer; folded into `inflate.rs` as the
-  `<Clean, *, ResumableOutput>` monomorphisation)
-- `src/decompress/inflate/specialized_decode.rs`,
-  `consume_first_table.rs`, `jit_decode.rs`, `two_level_table.rs`,
-  `vector_huffman.rs`, `double_literal.rs`, `bmi2.rs` (folded;
-  techniques absorbed into the unified hot loop)
-- The `IsalInflateWrapper` `pure-rust-inflate` cfg branch in
-  `inflate_wrapper.rs` (callers go direct to `Inflate`)
-
-Same commit, also delete the ISA-L FFI:
-- `vendor/isa-l/` (submodule)
-- `vendor/isal-rs/` (submodule)
+- `src/decompress/inflate/libdeflate_entry.rs`
+- `src/decompress/inflate/consume_first_decode.rs`
+- `src/decompress/inflate/specialized_decode.rs`
+- `src/decompress/inflate/consume_first_table.rs`
+- `src/decompress/inflate/jit_decode.rs` (existing — replaced by
+  the new cranelift-based JIT)
+- `src/decompress/inflate/two_level_table.rs`
+- `src/decompress/inflate/vector_huffman.rs`
+- `src/decompress/inflate/double_literal.rs`
+- `src/decompress/inflate/bmi2.rs`
+- `IsalInflateWrapper` (entire file `inflate_wrapper.rs`)
+- `vendor/isa-l/` + `vendor/isal-rs/` submodules
 - `packaging/isal-patches/`
-- `src/backends/isal_decompress.rs`
-- `src/backends/isal.rs`
-- `Cargo.toml`'s `isal-rs` dep, `isal-compression` feature,
-  `[patch.crates-io].isal-sys`
-- The `isal-compression` cfg branches in `inflate_wrapper.rs`
+- `src/backends/isal_decompress.rs`, `src/backends/isal.rs`
+- `src/backends/libdeflate.rs` (after libdeflate is fully replaced)
+- `Cargo.toml`: `isal-rs`, `libdeflater`, `libdeflate-sys` deps;
+  `isal-compression`, `isal`, `pure-rust-inflate` features
 
-Estimated net: ~10,000 lines deleted, ~3,500 lines added. The new
-`inflate.rs` is ~3,500 lines of one decoder with all axes
-monomorphised, all tests, all docs.
+Replaced by:
+- `src/decompress/inflate/mod.rs` (~3,500 lines: cranelift JIT
+  emitter + interpreted fallback + perfect-hash table builder +
+  bit-reader + match-copy + Creusot annotations)
+- `src/decompress/inflate/gpu.rs` (~500 lines, behind `feature =
+  "gpu-decode"`)
+- `src/decompress/inflate/constant_time.rs` (~300 lines, behind
+  `feature = "constant-time-decode"`)
+- `src/decompress/inflate/coprocessor.rs` (~200 lines for QAT
+  detection + dispatch)
 
-Reduction in test-surface: today we maintain test coverage for two
-decoders. After: one decoder, four monomorphisations. Each
-optimization lands once.
+Net delta: ~10,000 lines deleted, ~4,500 lines added. The deleted
+surface is the entire current inflate stack across two decoder
+implementations + ISA-L FFI + libdeflate FFI.
 
 ---
 
-## 4. The C/C++ library boundary, re-examined
+## 4. C/C++ dependencies after the change
 
-The prior plan accepted libdeflate's role as "the one-shot fast
-decoder we don't replace." That deferred to effort.
+**Kept (for compression, not decode):**
+- `flate2` (zlib-ng) — compression L6-L9
+- `isal-rs` — compression L0-L3 on x86_64
 
-The ideal asks: should `Inflate<Clean, *, OwnedOutput>` ALSO replace
-libdeflate in sequential single-member and BGZF? Three considerations:
+**Deleted:**
+- `libdeflater` / `libdeflate-sys` — replaced by the new decoder
+- ISA-L decoder path (FFI through `isal-rs`'s decode functions) —
+  replaced by the new decoder
+- All sequential / BGZF / multi-member callers route through the new
+  pure-Rust decoder
 
-1. **libdeflate is hand-tuned C with 8+ years of investment.** Beating
-   it in pure Rust is hard but not impossible — we already match
-   it within 1.6× on arm64 (chunked), within 1.3× on x86_64 mono
-   (extrapolated from neurotic data). With the ideal architecture's
-   wins (128-bit bitbuf, dynamic table size, 8-literal batches,
-   marker-tail type proof) we project closing to within 5%.
-
-2. **libdeflate's GZIP path includes header parse + CRC32 + ISIZE
-   verification.** The ideal `Inflate` exposes only DEFLATE; a thin
-   GzipReader wrapper (Rust, ~200 lines) provides the gzip-format
-   adapter using `crc32fast`'s pclmulqdq path.
-
-3. **libdeflate has multi-version SIMD dispatch.** The ideal's
-   `ArchProfile` const generic + runtime dispatch covers the same
-   ground.
-
-**Decision in the ideal: yes, replace libdeflate too.** Once
-`Inflate` is within 5% of libdeflate on a representative benchmark,
-the BGZF / multi-member / sequential SM paths route through it. The
-`libdeflater` dep is deleted. The result: gzippy is end-to-end pure
-Rust for decode, with no C dependencies for the inflate kernel.
-
-For compression we keep ISA-L (L0-L3) and zlib-ng (L6-L9). Different
-problem, out of scope.
+**Future scope (not this design):** also replace zlib-ng + ISA-L for
+compression. That's a separate project; the inflate work doesn't
+gate it.
 
 ---
 
 ## 5. Done-when
 
-The design is done when:
+The design is done when ALL of the following hold simultaneously:
 
-1. **Functional correctness:** all four correctness layers (§2.12)
-   pass on all corpora.
-2. **Parallel-SM perf:** `Inflate<Markers, X86_64Bmi2, OwnedOutput>`
-   + `Inflate<Clean, X86_64Bmi2, OwnedOutput>` together via the
-   parallel-SM pipeline reaches **≥ 0.95× of rapidgzip** (not just
-   ISA-L) on neurotic `make bench-sm`. We pick the higher bar
-   because that's the target.
-3. **Sequential perf:** `Inflate<Clean, *, ResumableOutput>` for
-   BGZF / multi-member / sequential SM reaches **≥ 0.95× of
-   libdeflate one-shot** on representative corpora.
-4. **Code reduction:** ~10,000 lines deleted across the modules in
-   §3; net is ~3,500-line `inflate.rs`.
-5. **Zero C dependencies for inflate:** `libdeflater`, `isal-rs`
-   removed from `Cargo.toml`. (Compression-only `flate2`/`isal-rs`
-   stays in scope.)
-6. **Opus advisor sign-off** on the neurotic bench AND a 14-day
-   soak (catches load-dependent regressions).
+1. **Functional:** all four correctness layers green on all corpora
+   (silesia, linux-source, web-archive samples, gzipped JSON
+   streams, gzipped HTTP captures, code repos). Three-oracle
+   differential fuzz runs ≥ 72 hours per CI build with zero
+   disagreements.
+2. **Creusot verification:** the hot loop's invariants are
+   machine-checked and the proof artifacts ship with the crate.
+3. **Parallel-SM perf:** the unified decoder via parallel-SM reaches
+   **≥ rapidgzip on neurotic** on silesia-large (not just ≥ 0.95×).
+   The JIT + AVX-512 + perfect-hash combination is expected to
+   strictly beat rapidgzip's ISA-L-based decode loop on
+   AVX-512-capable hardware.
+4. **Sequential perf:** the streaming-mode unified decoder reaches
+   **≥ libdeflate one-shot** on representative inputs (BGZF, raw
+   sequential, multi-member).
+5. **GPU perf** (when `feature = "gpu-decode"` enabled): ≥ 20 GB/s
+   aggregate on M3 Max for inputs ≥ 1 GiB.
+6. **Constant-time variant** decodes correctly with no
+   data-dependent branches (verified via `valgrind --tool=
+   helgrind` + static analysis); ≤ 25% slowdown vs optimized
+   variant.
+7. **Code surface reduction:** the deletes in §3 land in the same
+   commit as the new decoder.
+8. **Opus advisor sign-off** on the neurotic measurement.
+9. **14-day soak** between neurotic gate passing and the merge.
 
-No "ship if ≥0.93×, revert if <0.93×" hedge. The target is 0.95× of
-rapidgzip; if we miss, we iterate until we hit, not revert.
+No "ship if ≥ X" hedges. The target is "≥ rapidgzip"; we iterate
+until we hit it.
 
 ---
 
-## 6. Phasing (separate from design)
+## 6. Risks (with mitigations, not constraints)
 
-The above describes the end state. Implementation can phase how the
-implementer prefers — this section is non-normative; the design does
-not depend on it.
+1. **rustc + cranelift compile time.** Risk: rustc compilation of a
+   ~4,500-line generic-heavy crate with cranelift dep takes minutes.
+   Mitigation: cranelift is mature (used by Wasmtime); incremental
+   builds are fast; cold build is paid once.
+
+2. **JIT memory pressure under high block churn.** Risk: thousands
+   of small blocks each emit ~200 lines of JIT code; memory grows
+   without bound. Mitigation: JIT cache LRU eviction at 64 MiB cap;
+   blocks below 4 KiB output route to interpreted fallback.
+
+3. **`Creusot` is research-grade.** Risk: verification doesn't
+   compile on every rustc version; ICEs possible. Mitigation: pin
+   Creusot version; pin rustc nightly; track upstream stability.
+   Worst case: ship without machine-checked proofs, with hand-written
+   correctness proofs in markdown.
+
+4. **GPU decode integration is OS-specific.** Risk: Metal works on
+   macOS but the same code doesn't run on Linux+NVIDIA. Mitigation:
+   each backend behind its own feature flag; GPU is opt-in.
+
+5. **Hardware coprocessor detection at runtime.** Risk: false
+   positives route to QAT then discover the kernel module isn't
+   loaded. Mitigation: probe with a small test decode at decoder
+   construction; fall back if the probe fails.
+
+6. **Two-pass decode pays Pass 1 cost on every chunk.** Risk: for
+   large but fast-decoding chunks, Pass 1 overhead exceeds the
+   saved yield-tax. Mitigation: heuristic — if chunk is "obviously
+   large" (deflate > 1 MiB), skip Pass 1 and use an over-allocated
+   buffer + final shrink. For smaller chunks, Pass 1's cost is
+   amortized.
+
+7. **Cross-arch SIMD width dispatch must be tested on every
+   arch.** Risk: AVX-512 path works locally but fails on different
+   AVX-512 generation (Skylake-X vs Ice Lake). Mitigation: CI
+   matrix covering each generation; QEMU simulation for arches
+   without hardware access.
+
+8. **Self-modifying / JIT-emitted code interacts with security
+   mitigations** (W^X, CFI). Risk: macOS Hardened Runtime blocks
+   JIT pages without entitlement; Linux SELinux blocks `mprotect`
+   to executable. Mitigation: use `pthread_jit_write_protect_np`
+   on macOS; document the SELinux requirement; provide a
+   `feature = "no-jit"` build that falls back to interpreted
+   throughout.
+
+---
+
+## 7. Phasing (non-normative — does not shape the design)
+
+The design lands in one commit. Implementation can phase how the
+implementer prefers; nothing in §1-§6 depends on this section.
 
 Suggested order:
-1. Build `Inflate<Clean, *, ResumableOutput>` (drop-in replacement
-   for `ResumableInflate2`). Validates the const-generic shape on
-   the known-correct path.
-2. Add `<Markers>` monomorphisation. Bootstrap-equivalent. Validates
-   the marker-tail type proof + ring path.
-3. Add `<*, *, OwnedOutput>` monomorphisations. Eliminates yield
-   tax for parallel-SM.
-4. Add `ArchProfile` axis. Per-arch builds.
-5. Migrate parallel-SM callers.
-6. Migrate BGZF / multi-member / sequential SM callers.
-7. Delete all the modules in §3.
-8. Delete libdeflate dep.
+1. Build the interpreted Rust fallback decoder (`Inflate` core).
+   Drop-in replacement for `ResumableInflate2`. Validates correctness
+   layers.
+2. Add the cranelift-JIT path. Falls back to interpreted for blocks
+   below threshold.
+3. Add AVX-512 / NEON wide bitbuf paths.
+4. Add per-block perfect-hash table builder.
+5. Add two-pass exact-output-bound mode (`OwnedOutput`).
+6. Add constant-time variant.
+7. Add GPU offload.
+8. Add hardware-coprocessor dispatch.
+9. Add Creusot annotations to the interpreted path; verify; extend
+   to JIT-emit function.
+10. Migrate every caller; delete every legacy module; delete every
+    FFI dep.
 
-Some phases parallelize (1+2+3 can be one work-stream while
-correctness tests are built; 5+6 can be parallel after 4). The
-phasing affects schedule, not design.
-
----
-
-## 7. Risks
-
-1. **Const-generic explosion bloats binary.** Cross-product is 2×3×2 = 12
-   monomorphisations of a ~3,500-line function. At ~30 KB per
-   monomorphisation that's ~360 KB of code in the binary. Mitigation:
-   `#[inline(never)]` on cold monomorphisations, `#[inline]` only on
-   the truly-hot pair.
-
-2. **128-bit bit-buffer's two-step shift hurts non-SIMD targets.** On
-   targets without 16-byte SIMD load, the refill costs two scalar
-   loads + ALU shift compose. Falls back to 64-bit buffer on Generic
-   arch profile.
-
-3. **Type-state marker-tail proof requires nightly Rust.** Mitigation:
-   accept nightly for the type-proof variant; provide a stable-Rust
-   `try_flip_to_clean()` fallback with the same runtime check (just
-   without the compile-time guarantee).
-
-4. **8-literal batch may pessimize on non-literal-dominated workloads.**
-   The adaptive predictor handles this; needs differential perf vs
-   fixed-depth-4 across corpora to confirm.
-
-5. **Cache flush instructions add cycles** on transitions; only worth
-   it if table-build is happening frequently (small blocks). Gate by
-   block size: skip flush if next block is >32 KiB output.
-
-6. **Replacing libdeflate is a separate strategic decision.** If we
-   can't reach 0.95× of libdeflate on sequential SM, we keep
-   libdeflate and only replace ISA-L FFI. Design remains valid; just
-   stops shy of step 8.
+Some phases parallelize. The phasing does not affect the design.
 
 ---
 
-## 8. Provability requirements (the non-negotiable)
+## 8. Open questions the implementer must resolve
 
-The user's directive: *"provably correct."* The ideal design
-treats this as a hard constraint:
+1. **JIT cache key.** Is `(litlen_lengths, dist_lengths)` the right
+   key, or should it include block-size hint / arch profile? Affects
+   cache hit rate.
 
-- Every `unsafe` block has an explicit SAFETY comment with the
-  invariant it relies on, paired with a `debug_assert!` checking
-  the invariant in debug builds.
-- The bit-buffer state machine has a kani harness proving the
-  `bitsleft ≤ BITBUF_BITS` invariant for all input sequences.
-- The marker-tail invariant is type-encoded (phantom-type const
-  generic) so flip-to-clean is a compile-time-checked transition.
-- Property-based tests (proptest) exhaustively explore
-  `(payload, buffer_size, schedule, level)` configuration space.
-- Differential fuzzing (cargo-fuzz vs libdeflate) runs in CI for
-  N hours per commit, with corpus accumulation across builds.
-- Real-corpus tests cover silesia, linux-source, web-archive
-  samples, JSON streams, code repos — workloads that produce
-  different deflate patterns than synthetic fixtures.
+2. **Perfect-hash construction algorithm.** CHD vs BBHash vs
+   FrozenHashMap. CHD has lower lookup cost but higher build cost;
+   the right choice depends on block size distribution.
 
-A bug class that escapes ALL of these is one we accept as residual
-risk. The T3-on-silesia bug we caught was caught by layer 3; we
-add layers 1, 2, 4 to catch the next one in the cheapest layer
-available.
+3. **GPU decode of single-block streams.** Within a block Huffman is
+   serial. Is there value in GPU offload for SINGLE-block streams
+   (< 64 KiB output)? Probably no, but verify.
+
+4. **Constant-time variant's bit-reader.** The bit-reader's
+   `bitsleft.wrapping_sub(n)` for n > bitsleft produces a data-
+   dependent state. Can it be made constant-time without becoming
+   a full reset on every consume?
+
+5. **eBPF integration mechanism.** USDT probes vs uprobe attachment
+   vs a custom kernel module. Affects portability.
+
+---
+
+## 9. Provable correctness — non-negotiable requirements
+
+Per the user's "provably correct" directive:
+
+- The `Bits` state machine has a Creusot proof of `bitsleft ≤
+  BITBUF_WIDTH` across all `refill`/`consume(n)` sequences.
+- The hot loop has Creusot proofs of:
+  - `out_pos < output.len()` at every write site
+  - back-reference distance ≤ `history_bytes` at every match site
+  - Huffman decode consumes ≤ 15 codeword bits + ≤ 13 extra bits
+    per symbol
+- The JIT-emit function has a Creusot proof that ANY emitted code
+  satisfies the above given a well-formed BlockHeader.
+- The marker-tail flip is a runtime check guarded by an assertion,
+  paired with a Creusot proof that the assertion implies the post-
+  flip clean-mode invariant.
+- Constant-time variant has a static analysis pass (custom Cargo
+  subcommand) that verifies no branch in the hot loop depends on
+  decoded data — only on the bit-reader's fill state.
+- Real-corpus differential test runs against three oracles
+  (reference zlib, rapidgzip, Node.js CompressionStreams) on every
+  CI build; ≥ 72-hour fuzz runs per release.
+
+A bug class that escapes ALL of these is residual risk we accept.
+Today's T3 bug was caught by real-corpus alone; the four-layer
+story catches it in three of the four layers (real-corpus, prop-
+tests with deep buffer-size shrinking, and the Creusot
+`out_pos < output.len()` invariant). The fourth layer (three-oracle
+fuzz) catches the next one.
