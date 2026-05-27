@@ -22,7 +22,8 @@
 #[cfg(feature = "pure-rust-inflate")]
 mod bench {
     use gzippy::decompress::inflate::resumable::{
-        ResumableInflate2, BODY_RESUMABLE_FASTLOOP_ENTERS,
+        ResumableInflate2, BODY_RESUMABLE_FASTLOOP_ENTERS, READ_STREAM_BYTES_OUT,
+        READ_STREAM_CALLS, READ_STREAM_OUTPUT_BUF_BYTES,
     };
     use std::io::{Read, Write};
     use std::sync::atomic::Ordering;
@@ -669,6 +670,42 @@ mod bench {
              Either the corpus is too small (no case > FASTLOOP_MARGIN), or the fastloop \
              entry condition regressed.",
             cases.len()
+        );
+
+        // Step 2.5: read_stream calling-shape diagnostic. Counts
+        // accumulate across MONO + CHUNKED + warmups for all cases —
+        // so this is "across the whole bench run", not per-case.
+        // Direction-of-travel only; absolute numbers reflect the bench
+        // mix, not production.
+        let calls = READ_STREAM_CALLS.load(Ordering::Relaxed);
+        let bytes_out = READ_STREAM_BYTES_OUT.load(Ordering::Relaxed);
+        let buf_bytes = READ_STREAM_OUTPUT_BUF_BYTES.load(Ordering::Relaxed);
+        let avg_out = if calls > 0 { bytes_out / calls } else { 0 };
+        let avg_buf = if calls > 0 { buf_bytes / calls } else { 0 };
+        let fill_pct = if buf_bytes > 0 {
+            (bytes_out as f64 / buf_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+        println!();
+        println!("read_stream calling-shape (bench-wide, mono+chunked+warmups combined):");
+        println!("  total calls:     {}", calls);
+        println!(
+            "  avg bytes/call:  {} ({:.1} KiB)",
+            avg_out,
+            avg_out as f64 / 1024.0
+        );
+        println!(
+            "  avg buffer/call: {} ({:.1} KiB)",
+            avg_buf,
+            avg_buf as f64 / 1024.0
+        );
+        println!("  buffer fill %:   {:.1}%", fill_pct);
+        println!(
+            "  (Step 2.5: for production-shape characterization, run \
+             `cargo test --release --features pure-rust-inflate -- \
+             step25 --ignored --nocapture` on a host where parallel-SM \
+             is gated on, i.e. x86_64.)"
         );
 
         let _ = std::fs::write("/tmp/gzippy-tight-huffman-baseline.txt", &report);
