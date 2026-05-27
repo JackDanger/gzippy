@@ -129,6 +129,11 @@ name = "inflate_block"
 harness = false
 required-features = ["pure-rust-inflate"]
 
+[[bench]]
+name = "tight_huffman_baseline"
+harness = false
+required-features = ["pure-rust-inflate"]
+
 [profile.release]
 lto = "fat"           # Full cross-crate LTO (slower build, faster binary)
 codegen-units = 1     # Single codegen unit for maximum optimization
