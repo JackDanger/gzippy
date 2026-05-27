@@ -601,6 +601,14 @@ pub fn drive<W: std::io::Write>(
             SPEC_FAIL_STOP_MISSED.load(Ordering::Relaxed),
             SPEC_FAIL_OTHER.load(Ordering::Relaxed),
         );
+        // Post-process path mix: tells us if the AVX2 narrow re-enable
+        // is bench-relevant for this fixture. Small-markers path is the
+        // only one that calls `narrow_u16_to_u8`.
+        eprintln!(
+            "  Post-process path: fused_lut={} small_markers={}",
+            POST_PROCESS_FUSED_PATH.load(Ordering::Relaxed),
+            POST_PROCESS_SMALL_MARKERS_PATH.load(Ordering::Relaxed),
+        );
         // Body-failure forensic detail — speculation-accuracy attack.
         // After disprove-advisor confirmed body failures are the dominant
         // re-decode cost, characterize them by error variant + waste size.
@@ -1641,6 +1649,7 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
     let t_narrow;
     let narrow_us;
     if use_fused {
+        POST_PROCESS_FUSED_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Fused path. `apply_window` is skipped entirely on this branch:
         // markers in `chunk.data_with_markers` are left in-place (no
         // downstream reader inspects them after this point — populate
@@ -1652,6 +1661,7 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
         t_narrow = std::time::Instant::now();
         narrow_us = 0u128;
     } else {
+        POST_PROCESS_SMALL_MARKERS_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         apply_window(&mut chunk, &bytes);
         t_narrow = std::time::Instant::now();
         if !chunk.data_with_markers.is_empty() {
@@ -1707,17 +1717,18 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
 fn narrow_u16_to_u8(src: &[u16], dst: &mut crate::decompress::parallel::rpmalloc_alloc::types::U8) {
     dst.clear();
     dst.reserve(src.len());
-    // AVX2 path disabled pending diagnostic: it produced a per-task
-    // perf regression on neurotic (apply_window+populate were 3×
-    // higher in the same trace) despite the AVX2 routine itself
-    // being byte-correct (test_single_member_routing_multithread
-    // passes). Suspected: AVX2 license keeps the post-process worker
-    // downclocked through apply_window's SIMD too. Re-enable behind
-    // GZIPPY_NARROW_AVX2 env once isolated.
+    // AVX2 path: re-enabled 2026-05-26 with measurement (commit
+    // following this one). Prior gate was a `GZIPPY_NARROW_AVX2` env
+    // var added because a session-old trace showed `apply_window` +
+    // `populate_subchunk_windows` running 3× slower when this AVX2
+    // narrow was active — hypothesis: AVX-256 license-based downclock
+    // dragging the subsequent SIMD code. We re-tested on neurotic; on
+    // silesia bench-sm `POST_PROCESS_SMALL_MARKERS_PATH` counter
+    // verifies whether this code is exercised at all (the fused LUT
+    // path at LUT_FUSE_THRESHOLD ≥ 128 KiB markers handles the large-
+    // marker majority for silesia speculative chunks).
     #[cfg(target_arch = "x86_64")]
-    if std::env::var_os("GZIPPY_NARROW_AVX2").is_some()
-        && std::arch::is_x86_feature_detected!("avx2")
-    {
+    if std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: avx2 just detected at runtime.
         unsafe {
             narrow_u16_to_u8_avx2(src, dst);
@@ -1842,6 +1853,18 @@ pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
 /// consumer-requested `next_block_offset`) — distinct from
 /// `prefetch_cache_miss`, which counts a prefetch being absent.
 pub static PREFETCH_REJECT_BY_GUARD: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Count of post-process tasks that took the fused
+/// `replace_markers_lut_narrow` path (markers ≥ 128 KiB, 32 KiB window).
+pub static POST_PROCESS_FUSED_PATH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Count of post-process tasks that took the small-markers path
+/// (`apply_window` + separate `narrow_u16_to_u8`). This is the path
+/// that benefits from the AVX2 narrow re-enable. If this is ~0 on
+/// silesia bench-sm, the AVX2-narrow change is benchmark-invisible
+/// for that fixture (but may still help BGZF / small-marker workloads).
+pub static POST_PROCESS_SMALL_MARKERS_PATH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Lever G diagnostic: counts how often the consumer's
