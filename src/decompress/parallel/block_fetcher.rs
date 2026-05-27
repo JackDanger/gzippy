@@ -700,43 +700,6 @@ where
             "t",
         );
 
-        // BlockFetcher.hpp:476-491 — pre-build `blockOffsetsToPrefetch`
-        // with BOTH the block offset and its partition offset for each
-        // index. This set is used by:
-        //   (a) the cache-pollution guard below to avoid evicting an
-        //       offset we intend to prefetch this round, and
-        //   (b) the `touch` pass below to anchor those offsets at the
-        //       MRU end of both caches so they survive evictions
-        //       triggered by the dispatch loop itself.
-        // Without this set-build, the May 26 2026 silesia trace showed
-        // gzippy emitting 26 sub-partition prefetches that vendor never
-        // emits — see [project-prefetch-overemit] / commit c6502b6 and
-        // the `coord.prefetch_emit offset_eq_partition` arg.
-        let mut block_offsets_to_prefetch: Vec<Key> =
-            Vec::with_capacity(block_indexes_to_prefetch.len() * 2);
-        for &index in &block_indexes_to_prefetch {
-            if let Some(offset) = lookup_block_offset(index) {
-                let partition = partition_offset_for(&offset);
-                let offset_neq_partition = partition != offset;
-                block_offsets_to_prefetch.push(offset);
-                if offset_neq_partition {
-                    block_offsets_to_prefetch.push(partition);
-                }
-            }
-        }
-
-        // BlockFetcher.hpp:493-497 — touch every offset in both caches,
-        // reverse-iterating so the FIRST (earliest) block ends up most
-        // recently touched and last to be evicted.
-        {
-            let mut pc = self.prefetch_cache.lock().unwrap();
-            let mut mc = self.cache.lock().unwrap();
-            for offset in block_offsets_to_prefetch.iter().rev() {
-                pc.touch(offset);
-                mc.touch(offset);
-            }
-        }
-
         let mut submitted = 0usize;
         for index in block_indexes_to_prefetch {
             // BlockFetcher.hpp:500-502 — stop when the pool is full.
@@ -819,34 +782,6 @@ where
                     continue;
                 }
             };
-
-            // BlockFetcher.hpp:544-551 — cache-pollution guard.
-            // If emitting this prefetch would push the prefetch_cache
-            // over capacity and the entry that would be evicted is one
-            // we still intend to prefetch this round, STOP emitting:
-            // any later submission this round would only thrash the
-            // cache against itself.
-            // `prefetching_len() + 1` accounts for both the in-flight
-            // map AND the slot the upcoming submission will eventually
-            // land in once `process_ready_prefetches` moves it into
-            // prefetch_cache. Vendor's identical expression.
-            {
-                let pc = self.prefetch_cache.lock().unwrap();
-                let evict_count = self.prefetching_len() + 1;
-                if let Some(offset_to_be_evicted) = pc.next_nth_eviction(evict_count) {
-                    if block_offsets_to_prefetch.contains(&offset_to_be_evicted) {
-                        trace_v2::emit_instant(
-                            "coord.prefetch_skip",
-                            &format!(
-                                r#""reason":"would_evict_useful","index":{index},"would_evict":{:?}"#,
-                                offset_to_be_evicted
-                            ),
-                            "t",
-                        );
-                        break;
-                    }
-                }
-            }
 
             // BlockFetcher.hpp:553-557 — submit prefetch task.
             // coord.prefetch_emit span: per-emission, one B/E pair with
