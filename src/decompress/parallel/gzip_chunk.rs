@@ -606,10 +606,6 @@ fn decode_chunk_pure_bulk_impl(
             &mut scratch,
         )
         .map_err(|e| {
-            eprintln!(
-                "[bulk-diag] err={e:?} block_start={block_start_bit} eob={encoded_offset_bits} prev={prev_len} stream_start={stream_data_start} pre.len={} input.len={} bits.pos={} cap={} svlen={} out={}",
-                predecessor.len(), input.len(), bits.pos, buf_cap, stream_view.len(), out_pos_in_view
-            );
             ChunkDecodeError::InflateFailed(InflateError::Internal(match e {
                 BulkDecodeError::InvalidHuffmanCode => -101,
                 BulkDecodeError::InvalidLookback => -102,
