@@ -583,6 +583,36 @@ where
             .fetch(data_block_index);
     }
 
+    /// Notify the fetching strategy that a chunk at `index_to_split`
+    /// has expanded into `split_count` sequential subchunk indexes.
+    /// Mirror of vendor's call at
+    /// `GzipChunkFetcher::appendSubchunksToIndexes`
+    /// (`vendor/.../rapidgzip/GzipChunkFetcher.hpp:382`):
+    ///
+    /// ```cpp
+    /// if ( subchunks.size() > 1 ) {
+    ///     BaseType::m_fetchingStrategy.splitIndex(
+    ///         m_nextUnprocessedBlockIndex, subchunks.size() );
+    /// }
+    /// ```
+    ///
+    /// Without this call the strategy's `previous_indexes` /
+    /// `last_fetched` accounting stays in CHUNK units while the
+    /// BlockFinder accumulates SUBCHUNK indexes, and the next
+    /// `prefetch_new_blocks` call queries indexes that are already
+    /// in `block_offsets` — returning confirmed sub-partition
+    /// offsets that get emitted as wasted sub-partition prefetches.
+    /// Falsification commit aba6b59 showed ~50 ms wall savings on
+    /// silesia-large 16T from suppressing those emits via env-gated
+    /// skip; this is the upstream fix that makes the emits never
+    /// generated in the first place.
+    pub fn split_index(&self, index_to_split: usize, split_count: usize) {
+        self.fetching_strategy
+            .lock()
+            .unwrap()
+            .split_index(index_to_split, split_count);
+    }
+
     /// Fill the prefetch queue (`m_prefetching`) with up to
     /// `parallelization - 1` futures for the next expected block
     /// indices. Literal port of `BlockFetcher::prefetchNewBlocks`
@@ -797,22 +827,6 @@ where
             // prefetch — those are the candidates for the missing
             // vendor `nextNthEviction` cache-pollution guard
             // (BlockFetcher.hpp:544-551).
-            // FALSIFICATION EXPERIMENT (TEMPORARY — DO NOT MERGE):
-            // Skip sub-partition emits to upper-bound the wall benefit
-            // of suppressing them. If wall doesn't move vs baseline,
-            // these emits aren't on the critical path and Fix #3
-            // shouldn't pursue this lever.
-            // Gated on env var so a single build can A/B without rebuild.
-            if partition_offset != prefetch_block_offset
-                && std::env::var_os("GZIPPY_SKIP_SUBPARTITION_EMITS").is_some()
-            {
-                trace_v2::emit_instant(
-                    "coord.prefetch_skip",
-                    &format!(r#""reason":"experimental_skip_subpartition","index":{index}"#),
-                    "t",
-                );
-                continue;
-            }
             let _tv2_emit = {
                 use std::fmt::Write as _;
                 let mut args = String::with_capacity(160);

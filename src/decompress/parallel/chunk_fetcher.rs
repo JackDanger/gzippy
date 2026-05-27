@@ -1273,6 +1273,20 @@ fn consumer_loop<W: std::io::Write>(
                 block_finder.insert(sc.encoded_offset_bits + sc.encoded_size_bits);
             }
         }
+        // Vendor GzipChunkFetcher.hpp:380-382 — when the chunk produced
+        // multiple subchunks, the fetching strategy's index accounting
+        // (in CHUNK units) needs to be re-stretched into SUBCHUNK units
+        // so it matches `block_offsets.len()`. Without this, the
+        // strategy's `prefetch()` returns chunk-indexes that are ALREADY
+        // in `block_offsets` — the BlockFinder returns them as
+        // confirmed sub-partition offsets and `prefetch_new_blocks`
+        // emits sub-partition prefetches that vendor never emits.
+        // See `BlockFetcher::split_index` doc comment for the full
+        // chain. Empirically: 26 sub-partition emits per silesia-large
+        // run worth ~50 ms wall.
+        if chunk.subchunks.len() > 1 {
+            block_fetcher.split_index(next_unprocessed_block_index, chunk.subchunks.len());
+        }
 
         // Vendor `appendSubchunksToIndexes` continued
         // (GzipChunkFetcher.hpp:380-396): when a chunk produced multiple
