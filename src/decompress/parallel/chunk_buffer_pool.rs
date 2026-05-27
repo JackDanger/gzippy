@@ -137,118 +137,34 @@ fn pool_index_for_take() -> usize {
     current_worker_pool_index().unwrap_or(0)
 }
 
-/// Cross-worker steal optimization (May 2026): an AtomicU64 bitmask
-/// where bit `i` is set iff `u8_pools()[i]` has at least one buffer.
-/// `take_u8` checks the bitmask after its own-pool miss to find a
-/// non-empty foreign pool without locking N mutexes.
-///
-/// Background: per-worker pools had a 92% u16 miss rate on
-/// silesia-large because decode-to-Drop lag means most workers'
-/// next take happens before their last chunk's Drop fires. But
-/// OTHER workers' Drops have fired (returns=62 vs hits=13) — those
-/// buffers sit unused in foreign pools. Cross-worker steal
-/// converts those into hits without touching the fast-path
-/// hit semantics.
-///
-/// The bitmask is best-effort: occasional false-set (pop+empty race
-/// loses the clear) costs at most one wasted mutex lock; occasional
-/// false-clear (push race) costs at most one missed steal. Both
-/// converge to truth within a few ops.
-pub static U8_POOLS_NONEMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static U16_POOLS_NONEMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Counter: total cross-worker pops. Disaggregates a "hit" into
-/// "own-pool hit" vs "stolen from worker j". Lets us see whether
-/// the steal path is actually firing.
-pub static STEAL_U8_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static STEAL_U16_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Try to pop from a specific pool. Updates the non-empty bitmask
-/// when the pool becomes empty. Returns the buffer if popped, None
-/// if the pool was empty or locked.
-fn try_pop_u8(idx: usize) -> Option<U8> {
-    let mut pool = u8_pools()[idx].lock().ok()?;
-    let v = pool.pop()?;
-    if pool.is_empty() {
-        U8_POOLS_NONEMPTY.fetch_and(!(1u64 << idx), std::sync::atomic::Ordering::Relaxed);
-    }
-    Some(v)
-}
-
-fn try_pop_u16(idx: usize) -> Option<U16> {
-    let mut pool = u16_pools()[idx].lock().ok()?;
-    let v = pool.pop()?;
-    if pool.is_empty() {
-        U16_POOLS_NONEMPTY.fetch_and(!(1u64 << idx), std::sync::atomic::Ordering::Relaxed);
-    }
-    Some(v)
-}
-
-/// Take a `Vec<u8>` from the current worker's pool (or any non-empty
-/// foreign pool when own is empty). Decode tasks run on pool workers
-/// and record the correct index; trial decodes on the consumer thread
-/// bucket returns to worker 0's pool.
+/// Take a `Vec<u8>` from the current worker's pool (or worker 0 if unbound).
+/// Decode tasks run on pool workers and record the correct index; trial
+/// decodes on the consumer thread bucket returns to worker 0's pool.
 pub fn take_u8(min_capacity: usize) -> U8 {
     let idx = pool_index_for_take();
-    // Fast path: own pool.
-    if let Some(mut v) = try_pop_u8(idx) {
-        TAKE_U8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        TAKE_U8_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        v.clear();
-        if v.capacity() < min_capacity {
-            v.reserve(min_capacity - v.capacity());
-        }
-        return v;
-    }
-    // Cross-worker steal: walk the non-empty bitmask.
-    let mut bits = U8_POOLS_NONEMPTY.load(std::sync::atomic::Ordering::Relaxed);
-    bits &= !(1u64 << idx); // own pool already tried (was empty)
-    while bits != 0 {
-        let j = bits.trailing_zeros() as usize;
-        bits &= !(1u64 << j);
-        if let Some(mut v) = try_pop_u8(j) {
+    if let Ok(mut pool) = u8_pools()[idx].lock() {
+        if let Some(mut v) = pool.pop() {
             TAKE_U8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             TAKE_U8_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            STEAL_U8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             v.clear();
             if v.capacity() < min_capacity {
                 v.reserve(min_capacity - v.capacity());
             }
             return v;
         }
-        // try_pop_u8 returned None despite bitmask claiming non-empty —
-        // race (another worker drained that pool between bitmask load
-        // and lock). Continue scanning.
     }
     TAKE_U8_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     TAKE_U8_MISSES_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     types::u8_with_capacity(min_capacity)
 }
 
-/// Take a `Vec<u16>` from the current worker's pool (or any non-empty
-/// foreign pool when own is empty).
+/// Take a `Vec<u16>` from the current worker's pool.
 pub fn take_u16(min_capacity: usize) -> U16 {
     let idx = pool_index_for_take();
-    // Fast path: own pool.
-    if let Some(mut v) = try_pop_u16(idx) {
-        TAKE_U16_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        TAKE_U16_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        v.clear();
-        if v.capacity() < min_capacity {
-            v.reserve(min_capacity - v.capacity());
-        }
-        return v;
-    }
-    // Cross-worker steal.
-    let mut bits = U16_POOLS_NONEMPTY.load(std::sync::atomic::Ordering::Relaxed);
-    bits &= !(1u64 << idx);
-    while bits != 0 {
-        let j = bits.trailing_zeros() as usize;
-        bits &= !(1u64 << j);
-        if let Some(mut v) = try_pop_u16(j) {
+    if let Ok(mut pool) = u16_pools()[idx].lock() {
+        if let Some(mut v) = pool.pop() {
             TAKE_U16_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             TAKE_U16_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            STEAL_U16_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             v.clear();
             if v.capacity() < min_capacity {
                 v.reserve(min_capacity - v.capacity());
@@ -273,7 +189,6 @@ pub fn return_u8_to_worker(owner_worker: usize, mut v: U8) {
         if pool.len() < MAX_POOLED {
             v.clear();
             pool.push(v);
-            U8_POOLS_NONEMPTY.fetch_or(1u64 << idx, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -290,7 +205,6 @@ pub fn return_u16_to_worker(owner_worker: usize, mut v: U16) {
         if pool.len() < MAX_POOLED {
             v.clear();
             pool.push(v);
-            U16_POOLS_NONEMPTY.fetch_or(1u64 << idx, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
