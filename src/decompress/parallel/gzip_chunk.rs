@@ -609,8 +609,9 @@ fn decode_chunk_pure_bulk_impl(
             eprintln!(
                 "[bulk-diag] decode_block error={e:?} at block_start_bit={block_start_bit} \
                  (encoded_offset_bits={encoded_offset_bits}, prev_len={prev_len}, \
-                 stream_data_start={stream_data_start}, predecessor.len()={}, input.len()={}, bits.pos={})",
-                predecessor.len(), input.len(), bits.pos
+                 stream_data_start={stream_data_start}, predecessor.len()={}, input.len()={}, bits.pos={}, \
+                 buf_cap={}, stream_view_len={}, out_pos_in_view={})",
+                predecessor.len(), input.len(), bits.pos, buf_cap, stream_view.len(), out_pos_in_view
             );
             ChunkDecodeError::InflateFailed(InflateError::Internal(match e {
                 BulkDecodeError::InvalidHuffmanCode => -101,
