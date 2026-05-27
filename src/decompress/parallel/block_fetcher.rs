@@ -428,6 +428,17 @@ where
             let mut pc = self.prefetch_cache.lock().unwrap();
             if let Some(v) = pc.get(block_offset) {
                 self.statistics.base.record_prefetch_cache_hit(true);
+                // cache.get_outcome: per-lookup result. Pairs against
+                // each `coord.prefetch_emit` span so the diff can
+                // attribute every emitted prefetch to either a
+                // consume ("source":"prefetch") or a wasted decode
+                // (no matching cache.get_outcome → discarded by
+                // clear_prefetch_cache at end-of-decode).
+                crate::decompress::parallel::trace_v2::emit_instant(
+                    "cache.get_outcome",
+                    &format!(r#""source":"prefetch","offset":{:?}"#, block_offset),
+                    "t",
+                );
                 // Lever G: previously this evicted from prefetch_cache
                 // and PROMOTED a clone into self.cache for "subsequent
                 // gets". The single-pass forward consumer never re-gets
@@ -444,6 +455,11 @@ where
         match c.get(block_offset) {
             Some(v) => {
                 self.statistics.base.record_get();
+                crate::decompress::parallel::trace_v2::emit_instant(
+                    "cache.get_outcome",
+                    &format!(r#""source":"main","offset":{:?}"#, block_offset),
+                    "t",
+                );
                 Some(v)
             }
             None => {
@@ -452,6 +468,11 @@ where
                 // dispatch a fresh decode. Records the miss for stats
                 // visibility (cache hit rate = hits / (hits + misses)).
                 self.statistics.base.record_prefetch_cache_miss();
+                crate::decompress::parallel::trace_v2::emit_instant(
+                    "cache.get_outcome",
+                    &format!(r#""source":"miss","offset":{:?}"#, block_offset),
+                    "t",
+                );
                 None
             }
         }
@@ -623,6 +644,14 @@ where
         PO: Fn(&Key) -> Key,
     {
         PREFETCH_NEW_BLOCKS_CALLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        use crate::decompress::parallel::trace_v2;
+
+        // coord.prefetch_call span: wraps the entire prefetch decision
+        // loop. End-of-span outcome is emitted as a separate instant
+        // event ("coord.prefetch_call.outcome") so the SpanGuard name
+        // can stay 'static while args carry per-call detail.
+        let _tv2_call = trace_v2::SpanGuard::begin("coord.prefetch_call");
+        let prefetching_len_at_entry = self.prefetching_len();
 
         // BlockFetcher.hpp:463 — processReadyPrefetches() before new dispatch.
         self.process_ready_prefetches();
@@ -637,6 +666,19 @@ where
 
         if thread_pool_saturated() {
             PREFETCH_RETURN_SATURATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            trace_v2::emit_instant(
+                "coord.prefetch_skip",
+                &format!(
+                    r#""reason":"saturated_entry","prefetching_len":{prefetching_len_at_entry},"parallelization":{}"#,
+                    self.parallelization
+                ),
+                "t",
+            );
+            trace_v2::emit_instant(
+                "coord.prefetch_call.outcome",
+                r#""submitted":0,"early_exit":"saturated_entry""#,
+                "t",
+            );
             return 0;
         }
 
@@ -649,16 +691,37 @@ where
             let cap = self.prefetch_cache.lock().unwrap().capacity();
             strategy.prefetch(cap)
         };
+        let strategy_candidates = block_indexes_to_prefetch.len();
+        trace_v2::emit_instant(
+            "coord.prefetch_strategy",
+            &format!(
+                r#""candidates":{strategy_candidates},"prefetching_len":{prefetching_len_at_entry}"#
+            ),
+            "t",
+        );
 
         let mut submitted = 0usize;
         for index in block_indexes_to_prefetch {
             // BlockFetcher.hpp:500-502 — stop when the pool is full.
             if thread_pool_saturated() {
+                trace_v2::emit_instant(
+                    "coord.prefetch_skip",
+                    &format!(
+                        r#""reason":"saturated_loop","index":{index},"prefetching_len":{}"#,
+                        self.prefetching_len()
+                    ),
+                    "t",
+                );
                 break;
             }
 
             // BlockFetcher.hpp:504-506 — drop indices past finalize.
             if is_finalized_and_index_too_high(index) {
+                trace_v2::emit_instant(
+                    "coord.prefetch_skip",
+                    &format!(r#""reason":"finalized_too_high","index":{index}"#),
+                    "t",
+                );
                 continue;
             }
 
@@ -667,6 +730,11 @@ where
                 Some(o) => o,
                 None => {
                     // Vendor BlockFetcher.hpp:533 — skip when no offset.
+                    trace_v2::emit_instant(
+                        "coord.prefetch_skip",
+                        &format!(r#""reason":"lookup_miss","index":{index}"#),
+                        "t",
+                    );
                     continue;
                 }
             };
@@ -678,10 +746,20 @@ where
             // that was already submitted under its partition offset.
             if self.test(&prefetch_block_offset) || self.is_failed_prefetch(&prefetch_block_offset)
             {
+                trace_v2::emit_instant(
+                    "coord.prefetch_skip",
+                    r#""reason":"in_cache_or_queue""#,
+                    "t",
+                );
                 continue;
             }
             let partition_offset = partition_offset_for(&prefetch_block_offset);
             if partition_offset != prefetch_block_offset && self.test(&partition_offset) {
+                trace_v2::emit_instant(
+                    "coord.prefetch_skip",
+                    r#""reason":"partition_in_cache""#,
+                    "t",
+                );
                 continue;
             }
 
@@ -695,10 +773,43 @@ where
             // index lookup above remains SUCCESS-only.
             let next_prefetch_block_offset = match lookup_next_block_offset(index + 1) {
                 Some(o) => o,
-                None => continue,
+                None => {
+                    trace_v2::emit_instant(
+                        "coord.prefetch_skip",
+                        &format!(r#""reason":"next_offset_missing","index":{index}"#),
+                        "t",
+                    );
+                    continue;
+                }
             };
 
             // BlockFetcher.hpp:553-557 — submit prefetch task.
+            // coord.prefetch_emit span: per-emission, one B/E pair with
+            // rich args. The vendor patch (patch_vendor.sh) wraps the
+            // equivalent `m_threadPool.submit([..]decodeAndMeasureBlock..)`
+            // at BlockFetcher.hpp:554-557 with the same span name and
+            // matching arg keys, so timeline_analyze.py can diff them
+            // emission-for-emission.
+            //
+            // `offset_eq_partition`: true means this is a
+            // partition-aligned prefetch (the "main" one for a
+            // partition); false means a sub-partition speculative
+            // prefetch — those are the candidates for the missing
+            // vendor `nextNthEviction` cache-pollution guard
+            // (BlockFetcher.hpp:544-551).
+            let _tv2_emit = {
+                use std::fmt::Write as _;
+                let mut args = String::with_capacity(160);
+                let _ = write!(
+                    args,
+                    r#""index":{index},"offset":{:?},"partition_offset":{:?},"next_offset":{:?},"offset_eq_partition":{}"#,
+                    prefetch_block_offset,
+                    partition_offset,
+                    next_prefetch_block_offset,
+                    partition_offset == prefetch_block_offset
+                );
+                trace_v2::SpanGuard::begin_with("coord.prefetch_emit", &args)
+            };
             self.statistics.base.record_prefetch();
             let rx = submit_for(prefetch_block_offset.clone(), next_prefetch_block_offset);
             // BlockFetcher.hpp:558 — `m_prefetching.emplace(offset, std::move(future))`.
@@ -718,6 +829,14 @@ where
                 .fetch_add(submitted as u64, std::sync::atomic::Ordering::Relaxed);
             PREFETCH_RETURN_SUBMITTED_ANY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        trace_v2::emit_instant(
+            "coord.prefetch_call.outcome",
+            &format!(
+                r#""submitted":{submitted},"candidates":{strategy_candidates},"prefetching_len_after":{}"#,
+                self.prefetching_len()
+            ),
+            "t",
+        );
         submitted
     }
 
@@ -795,6 +914,16 @@ where
         // each remaining one counts as a cache_unused_entry. Mirrors
         // the LRU eviction-callback path vendor uses.
         let unused = pc.size();
+        // cache.discard_unused: emit per-entry so the diff can show
+        // exactly which offsets in `coord.prefetch_emit` were never
+        // consumed. Sum equals the (count of `coord.prefetch_emit`
+        // spans) - (count of `cache.get_outcome source=prefetch`
+        // events) modulo any still-in-flight in `prefetching`.
+        crate::decompress::parallel::trace_v2::emit_instant(
+            "cache.discard_unused.summary",
+            &format!(r#""unused_count":{unused}"#),
+            "t",
+        );
         for _ in 0..unused {
             self.statistics.base.record_cache_unused_entry();
         }
