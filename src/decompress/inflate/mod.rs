@@ -25,4 +25,5 @@ pub mod libdeflate_entry;
 pub mod resumable;
 pub mod specialized_decode;
 pub mod stopping_point;
+pub mod unified;
 pub mod vector_huffman;
