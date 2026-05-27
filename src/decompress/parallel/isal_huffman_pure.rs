@@ -1166,6 +1166,148 @@ mod tests {
         assert_eq!(h.code_and_extra(), 0x42_3456);
     }
 
+    /// Cross-check: build the LUT with both pure-Rust and ISA-L C on
+    /// the SAME code-length input and assert byte-equality of the
+    /// resulting `inflate_huff_code_large.short_code_lookup` +
+    /// `long_code_lookup`. This is the gate that pinpoints any bug in
+    /// the pure-Rust port — silesia decode failures surface as CRC32
+    /// mismatches but don't say WHERE the LUT differs.
+    ///
+    /// Only runs when BOTH the `isal-compression` and `pure-rust-inflate`
+    /// features are enabled (which means ISA-L is linked AND we
+    /// constructed `IsalLitLenCodePure`). Use:
+    ///
+    ///     cargo test --release --features isal-compression \
+    ///         --features pure-rust-inflate --lib \
+    ///         port_matches_c_isal -- --nocapture
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn port_matches_c_isal_byte_for_byte_fixed() {
+        let mut code_lengths = vec![0u8; LIT_LEN];
+        for sym in 0..144 {
+            code_lengths[sym] = 8;
+        }
+        for sym in 144..256 {
+            code_lengths[sym] = 9;
+        }
+        for sym in 256..280 {
+            code_lengths[sym] = 7;
+        }
+        for sym in 280..286 {
+            code_lengths[sym] = 8;
+        }
+        compare_litlen_lut(&code_lengths, "fixed");
+    }
+
+    /// Same cross-check on a couple of randomized real-world-shape
+    /// dynamic-Huffman code-length sets (Kraft-valid by construction).
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn port_matches_c_isal_byte_for_byte_dynamic() {
+        // A simple Kraft-valid set: most symbols short, a few long.
+        // Lit symbols 0..128 = length 7 (128 codes), 128..256 = length 9
+        // (128 codes), 256 = length 4 (EOB), 257..264 = length 8 (length
+        // codes, 8 symbols). Sums: 128*1/128 + 128*1/512 + 1/16 + 8/256
+        //    = 1 + 0.25 + 0.0625 + 0.03125 = 1.343 (Kraft-INVALID)
+        // — so this won't actually be valid. Let me design a valid set:
+        // 256 lit codes length 9 + EOB length 1 + 1 length-code length 1
+        // = 256/512 + 1/2 + 1/2 = 0.5 + 0.5 + 0.5 = 1.5 — invalid.
+        // Try: 128 codes length 8 + 128 length 9 + EOB length 7 +
+        // 8 length codes length 8.
+        //  = 128/256 + 128/512 + 1/128 + 8/256 = 0.5 + 0.25 + 0.0078 + 0.03125
+        //  = 0.789 — sub-Kraft, leaves headroom. Valid.
+        let mut code_lengths = vec![0u8; LIT_LEN];
+        for sym in 0..128 {
+            code_lengths[sym] = 8;
+        }
+        for sym in 128..256 {
+            code_lengths[sym] = 9;
+        }
+        code_lengths[256] = 7;
+        for sym in 257..265 {
+            code_lengths[sym] = 8;
+        }
+        compare_litlen_lut(&code_lengths, "dynamic_kraft_valid");
+    }
+
+    /// Helper used by the two cross-check tests above.
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn compare_litlen_lut(code_lengths: &[u8], label: &str) {
+        // Build via pure-Rust
+        let mut rust_decoder = IsalLitLenCodePure::new_empty();
+        let rust_ok = rust_decoder.rebuild_from(code_lengths);
+        assert!(rust_ok, "[{}] pure-Rust rebuild_from must succeed", label);
+
+        // Build via ISA-L C
+        let mut c_decoder = crate::decompress::parallel::isal_huffman::IsalLitLenCode::new_empty();
+        let c_ok = c_decoder.rebuild_from(code_lengths);
+        assert!(c_ok, "[{}] C ISA-L rebuild_from must succeed", label);
+
+        // Compare short_code_lookup byte-for-byte
+        let rust_short = &rust_decoder.table.short_code_lookup;
+        let c_short = &c_decoder.table.short_code_lookup;
+        assert_eq!(
+            rust_short.len(),
+            c_short.len(),
+            "[{}] short_code_lookup length",
+            label
+        );
+        let mut diffs = 0usize;
+        let mut first_diff: Option<usize> = None;
+        for (i, (r, c)) in rust_short.iter().zip(c_short.iter()).enumerate() {
+            if r != c {
+                diffs += 1;
+                if first_diff.is_none() {
+                    first_diff = Some(i);
+                    eprintln!(
+                        "[{}] short_code_lookup diff at idx={}: rust=0x{:08x} c=0x{:08x}",
+                        label, i, r, c
+                    );
+                }
+                if diffs > 5 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            diffs, 0,
+            "[{}] short_code_lookup has {} diffs (first at {:?})",
+            label, diffs, first_diff
+        );
+
+        // Compare long_code_lookup byte-for-byte
+        let rust_long = &rust_decoder.table.long_code_lookup;
+        let c_long = &c_decoder.table.long_code_lookup;
+        assert_eq!(
+            rust_long.len(),
+            c_long.len(),
+            "[{}] long_code_lookup length",
+            label
+        );
+        let mut ldiffs = 0usize;
+        let mut first_ldiff: Option<usize> = None;
+        for (i, (r, c)) in rust_long.iter().zip(c_long.iter()).enumerate() {
+            if r != c {
+                ldiffs += 1;
+                if first_ldiff.is_none() {
+                    first_ldiff = Some(i);
+                    eprintln!(
+                        "[{}] long_code_lookup diff at idx={}: rust=0x{:04x} c=0x{:04x}",
+                        label, i, r, c
+                    );
+                }
+                if ldiffs > 5 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            ldiffs, 0,
+            "[{}] long_code_lookup has {} diffs (first at {:?})",
+            label, ldiffs, first_ldiff
+        );
+    }
+
     /// Build a lit/len decoder from a real dynamic-block code-length set
     /// and round-trip decode a few hand-crafted symbol bit patterns.
     ///
