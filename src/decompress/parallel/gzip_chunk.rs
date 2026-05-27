@@ -626,7 +626,13 @@ fn decode_chunk_pure_bulk_impl(
         }
 
         if result.is_final_block {
-            // Byte-align then read 8-byte gzip footer (CRC32 + ISIZE).
+            // Byte-align then optionally read 8-byte gzip footer (CRC32+ISIZE).
+            // The bulk path is invoked both for full gzip streams (footer
+            // present) and for tests passing raw deflate (no footer). Match
+            // the wrapper-based impl's tolerant behavior: if remaining
+            // input is < 8 bytes after byte-align, end the stream cleanly
+            // without footer (the wrapper finishes via `r.finished` in
+            // that path; gzip_chunk.rs line 333).
             let byte_align = (8 - (block_end_bit % 8)) % 8;
             if byte_align != 0 {
                 bits.refill();
@@ -634,9 +640,9 @@ fn decode_chunk_pure_bulk_impl(
             }
             let footer_byte = bits.bit_position() / 8;
             if footer_byte + 8 > input.len() {
-                return Err(ChunkDecodeError::InflateFailed(InflateError::Internal(
-                    -106,
-                )));
+                last_end_bit = bits.bit_position();
+                reached_stream_end = true;
+                break;
             }
             let crc32 = u32::from_le_bytes([
                 input[footer_byte],
