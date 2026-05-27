@@ -747,9 +747,17 @@ fn take_bootstrap_output_from_pool() -> Vec<u16> {
     BOOTSTRAP_OUTPUT_POOL.with(|cell| {
         let mut v = std::mem::take(&mut *cell.borrow_mut());
         v.clear();
-        if v.capacity() < 128 * 1024 {
+        let cap_before = v.capacity();
+        if cap_before < 128 * 1024 {
+            BOOTSTRAP_OUTPUT_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             v.reserve(128 * 1024);
+        } else {
+            BOOTSTRAP_OUTPUT_REUSED_BYTES.fetch_add(
+                (cap_before * std::mem::size_of::<u16>()) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
+        BOOTSTRAP_OUTPUT_TAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         v
     })
 }
@@ -760,14 +768,73 @@ fn take_bootstrap_output_from_pool() -> Vec<u16> {
 ))]
 fn return_bootstrap_output_to_pool(mut v: Vec<u16>) {
     v.clear();
+    BOOTSTRAP_OUTPUT_RETURNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     BOOTSTRAP_OUTPUT_POOL.with(|cell| {
         let mut slot = cell.borrow_mut();
         // Keep the larger of the two.
         if v.capacity() > slot.capacity() {
             *slot = v;
+        } else {
+            BOOTSTRAP_OUTPUT_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     });
 }
+
+/// Counter: fresh `Vec::reserve(128*1024)` events from
+/// `take_bootstrap_output_from_pool`. Each is an mmap-eligible
+/// allocation (256 KiB u16 buffer > glibc mmap threshold). With
+/// pool reuse working, expected ≈ num_worker_threads (one allocation
+/// per thread, then reused on every subsequent call). If this counter
+/// approaches the bootstrap call count, the pool is broken.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+pub static BOOTSTRAP_OUTPUT_ALLOCS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Counter: total `take` calls. Pool effectiveness =
+/// `1 - (allocs / takes)`. Vendor-equivalent: rpmalloc per-thread arena
+/// reuse rate, which approaches 1.0 after warm-up.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+pub static BOOTSTRAP_OUTPUT_TAKES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Counter: sum of capacity (in BYTES) of Vecs returned from the
+/// pool with cap ≥ 128 KiB. Total bytes the pool "saved" from a fresh
+/// allocation. A run-end value of `~BOOTSTRAP_OUTPUT_TAKES *
+/// 256 KiB` means every take hit the pool path.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+pub static BOOTSTRAP_OUTPUT_REUSED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Counter: every call to `return_bootstrap_output_to_pool`. Mirrors
+/// TAKES on the success path; if RETURNS << TAKES, bootstraps are
+/// erroring out and not returning their buffer (it's still moved via
+/// the chunk_fetcher.rs path at line 508, so should always match).
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+pub static BOOTSTRAP_OUTPUT_RETURNS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Counter: returns where the incoming Vec was DROPPED instead of
+/// retained (because the pool's slot already had a larger cap).
+/// Non-zero means we threw away a hot allocation — should be 0 with
+/// 1-Vec-per-thread pool when caps are stable.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+pub static BOOTSTRAP_OUTPUT_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Mirror of the `while ( true )` loop in
 /// `decodeChunkWithRapidgzip` (GzipChunk.hpp:468-654), restricted to the
