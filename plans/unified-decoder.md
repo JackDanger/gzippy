@@ -839,6 +839,41 @@ Suggested order:
 
 Some phases parallelize. The phasing does not affect the design.
 
+### 7.a Implementer deviation log (binding for future agents)
+
+The "Suggested order" above describes the design's natural decomposition.
+The actual implementation may deviate when a no-op refactor would add
+review risk without changing behavior. Document deviations here so the
+next agent doesn't undo them on a literal re-read of §7.
+
+**Deviation 1 (Phase 1 + Phase 2, commits `d6d6633` + this commit):**
+Step 1's "Build the interpreted Rust fallback decoder" was split into
+two commits:
+
+  - **Commit 1 (`d6d6633`)** added `Inflate<M, A, O>` as a *wrap* over
+    `ResumableInflate2` — sealed-trait surface + counter + kill-switch +
+    1 monomorphisation by delegation. No hot-loop code moved.
+  - **Commit 2 (this commit)** expanded the wrap's surface and switched
+    the sole production caller (`IsalInflateWrapper` in
+    `src/decompress/parallel/inflate_wrapper.rs`) to construct
+    `Inflate<Clean, Generic, Streaming>` instead of `ResumableInflate2`.
+    No hot-loop code moved.
+
+  The §7 step 1 phrase "Build the interpreted Rust fallback decoder"
+  is satisfied *by reference* — the interpreted Rust fallback already
+  exists at `src/decompress/inflate/resumable.rs::ResumableInflate2`,
+  validated by 641 lib tests including the real-silesia byte-perfect
+  test. Moving its 2000-line hot loop into a new file with no
+  behavioral change would be a no-op refactor: review surface without
+  testable delta. The body moves *when its implementation changes* —
+  i.e., when Step 2 (dynasm-JIT + AOT-codegen) lands and the
+  interpreted path becomes the cold-path fallback inside `Inflate`'s
+  own file. Until then, `Inflate<Clean, Generic, Streaming>::inner`
+  is `ResumableInflate2<'a>` and delegates.
+
+  *Do not* perform the no-op body move as a separate commit. Lift the
+  body *as part of* the Step 2 commit, when the new code replaces it.
+
 ---
 
 ## 8. Open questions the implementer must resolve

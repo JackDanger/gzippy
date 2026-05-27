@@ -93,6 +93,18 @@ jobs:
             cargo test --release
           fi
 
+      # Pure-Rust-inflate lane — exercises the unified-decoder routing trap
+      # (`tests::routing::unified_inflate_path_runs_on_parallel_sm`). The
+      # default Linux x86_64 build above uses ISA-L for parallel-SM, which
+      # bypasses `IsalInflateWrapper` entirely; the unified surface is only
+      # the active backend when `pure-rust-inflate` is the only feature.
+      # Without this lane, the routing trap would never run in CI and the
+      # unified surface could rot to dead code (the failure mode that
+      # caused every prior marker-decoder to be deleted as "dead code").
+      - name: Run unit tests (pure-rust-inflate, x86_64 only)
+        if: matrix.os == 'linux' && matrix.arch == 'x86_64'
+        run: cargo test --release --no-default-features --features pure-rust-inflate
+
       # Phase 11.2 corpus oracle. Compares zopfli_pure's output to the
       # vendored C zopfli reference byte-for-byte across a fixed corpus
       # and a tuning matrix. Doubles as the Phase 11.3 arm64 ULP audit:

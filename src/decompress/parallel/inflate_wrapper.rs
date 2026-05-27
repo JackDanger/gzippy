@@ -646,10 +646,22 @@ impl<'a> IsalInflateWrapper<'a> {
 }
 
 // ── Pure-Rust backend (Track B3) ─────────────────────────────────────────
+//
+// Routes through `Inflate<Clean, Generic, Streaming>` — the unified-decoder
+// surface (`plans/unified-decoder.md`, phase 2). Every parallel-SM chunk
+// decode goes through this wrapper, so `UNIFIED_INFLATE_RUNS` counts each
+// `read_stream` call and the deletion-trap test
+// `tests::routing::unified_inflate_path_runs_on_parallel_sm` ensures the
+// route stays live.
 
 #[cfg(all(feature = "pure-rust-inflate", target_arch = "x86_64"))]
 pub struct IsalInflateWrapper<'a> {
-    inner: crate::decompress::inflate::resumable::ResumableInflate2<'a>,
+    inner: crate::decompress::inflate::unified::Inflate<
+        'a,
+        crate::decompress::inflate::unified::Clean,
+        crate::decompress::inflate::unified::Generic,
+        crate::decompress::inflate::unified::Streaming,
+    >,
 }
 
 #[cfg(all(feature = "pure-rust-inflate", target_arch = "x86_64"))]
@@ -664,10 +676,10 @@ impl<'a> IsalInflateWrapper<'a> {
         bit_offset: usize,
         until_bits: usize,
     ) -> Result<Self, InflateError> {
-        let inner = crate::decompress::inflate::resumable::ResumableInflate2::with_until_bits(
-            input, bit_offset, until_bits,
-        )
-        .map_err(|_| InflateError::StartBitPastEnd)?;
+        use crate::decompress::inflate::unified::{Clean, Generic, Inflate, Streaming};
+        let inner =
+            Inflate::<Clean, Generic, Streaming>::with_until_bits(input, bit_offset, until_bits)
+                .map_err(|_| InflateError::StartBitPastEnd)?;
         Ok(Self { inner })
     }
 

@@ -380,6 +380,65 @@ mod tests {
     }
 
     // =========================================================================
+    // Unified-decoder routing trap — paired with `UNIFIED_INFLATE_RUNS`.
+    //
+    // Phase 2 of `plans/unified-decoder.md` switches `IsalInflateWrapper`
+    // (the parallel-SM chunk decoder) from `ResumableInflate2` to
+    // `Inflate<Clean, Generic, Streaming>`. Every chunk `read_stream` on
+    // the production path now passes through the unified surface and
+    // bumps `UNIFIED_INFLATE_RUNS`.
+    //
+    // Without this test, a future refactor could revert the wrapper to
+    // `ResumableInflate2` and leave `Inflate` dead — the silesia tests
+    // and the marker-pipeline trap would still pass because output bytes
+    // would still be correct. The mark of "the unified surface is wired
+    // into production" is *this counter moving on a real CLI-shaped
+    // decode*.
+    //
+    // Same lock + same fixture as `test_marker_pipeline_actually_runs...`
+    // so the two traps don't race each other under parallel test
+    // execution.
+    // =========================================================================
+    #[test]
+    #[cfg(all(
+        target_arch = "x86_64",
+        feature = "pure-rust-inflate",
+        not(feature = "isal-compression")
+    ))]
+    fn unified_inflate_path_runs_on_parallel_sm() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "fixture must exceed 10 MiB parallel gate (got {} bytes)",
+            compressed.len()
+        );
+
+        let before =
+            crate::decompress::inflate::unified::UNIFIED_INFLATE_RUNS.load(Ordering::Relaxed);
+        let mut output = Vec::new();
+        crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
+        assert_eq!(output, original, "byte-perfect output");
+        let after =
+            crate::decompress::inflate::unified::UNIFIED_INFLATE_RUNS.load(Ordering::Relaxed);
+
+        assert!(
+            after > before,
+            "UNIFIED_INFLATE_RUNS did not increment ({before} -> {after}); \
+             the parallel-SM wrapper has reverted to bypassing \
+             `Inflate<Clean, Generic, Streaming>`. Every chunk decode \
+             must pass through the unified surface (see \
+             `src/decompress/parallel/inflate_wrapper.rs` IsalInflateWrapper)."
+        );
+    }
+
+    // =========================================================================
     // m_unsplitBlocks emplacement reaches production
     //
     // Vendor `GzipChunkFetcher.hpp:393` populates `m_unsplitBlocks` inside
