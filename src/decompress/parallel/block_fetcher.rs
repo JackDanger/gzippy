@@ -47,7 +47,7 @@ use super::statistics::ChunkFetcherStatistics;
 /// `Strategy` defaults to LRU; `Prefetch` defaults to nothing — caller
 /// picks a `FetchingStrategy` implementor.
 pub struct BlockFetcher<
-    Key: Hash + Eq + Clone + Ord,
+    Key: Hash + Eq + Clone + Ord + std::fmt::Debug,
     Value: Clone,
     Prefetch: FetchingStrategy,
     Err = (),
@@ -86,7 +86,7 @@ pub struct BlockFetcher<
 
 impl<Key, Value, Prefetch, Err> BlockFetcher<Key, Value, Prefetch, Err>
 where
-    Key: Hash + Eq + Clone + Ord,
+    Key: Hash + Eq + Clone + Ord + std::fmt::Debug,
     Value: Clone,
     Prefetch: FetchingStrategy,
 {
