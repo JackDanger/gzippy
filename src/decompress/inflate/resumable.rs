@@ -1477,114 +1477,131 @@ fn decode_huffman_body_resumable_isal(
             ));
         }
 
-        // Check ALL packed symbols are literals before consuming any
-        // bits. If output room < pack size AND all are literals, we
-        // can't emit them atomically — yield before consume. (For 1-sym
-        // entries containing a length or EOB, we'll handle below.)
-        if decoded.sym_count > 1 {
-            // Multi-pack entries are always all-literals (per ISA-L LUT
-            // builder semantics — see make_inflate_huff_code_lit_len).
-            if out_pos + (decoded.sym_count as usize) > output.len() {
-                // Yield without consuming the bits — caller resumes with
-                // larger output buffer.
-                return Ok(out_pos);
-            }
-            state.bits.consume(decoded.bit_count);
-            let mut symbol = decoded.symbol;
-            for _ in 0..decoded.sym_count {
-                output[out_pos] = (symbol & 0xFF) as u8;
-                out_pos += 1;
-                symbol >>= 8;
-            }
-            continue;
-        }
-
-        // sym_count == 1: could be a literal, EOB, or pre-expanded length.
-        let code = decoded.symbol;
-
-        if code <= 255 {
-            // Literal
-            state.bits.consume(decoded.bit_count);
-            output[out_pos] = (code & 0xFF) as u8;
-            out_pos += 1;
-            continue;
-        }
-
-        if code == 256 {
-            // EOB
-            state.bits.consume(decoded.bit_count);
-            state.finish_current_block();
+        // Pessimistic yield: the multi-pack iteration below cannot yield
+        // mid-pack because we've already consumed `decoded.bit_count` bits
+        // before iterating. Worst case per pack: (sym_count - 1) literals
+        // + a 258-byte match (when the LAST sym in a 2- or 3-pack is a
+        // length code per ISA-L LUT semantics — sym2/sym3 in pairs/triples
+        // can be a length-code-post-expansion, NOT only literals as my
+        // first cut assumed). Reserve room for that worst case before
+        // consuming. Matches the bulk decoder's `while sym_count > 0`
+        // pattern (`isal_lut_bulk::decode_block`).
+        let worst_case_bytes = (decoded.sym_count as usize).saturating_sub(1) + 258;
+        if out_pos + worst_case_bytes > output.len() {
+            // Not enough room for worst case; yield without consuming.
+            // Caller resumes with a fresh (or larger) output buffer.
+            // For single-sym literals or EOB we could still proceed, but
+            // the bulk-decoder pattern (no mid-pack yield) is simpler and
+            // chunk-buffer is always ≥ 128 KiB in production so we yield
+            // far before the buffer fills.
             return Ok(out_pos);
         }
 
-        if code > MAX_LIT_LEN_SYM {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "ISA-L litlen: symbol out of range",
-            ));
-        }
-
-        // Length code (pre-expansion in ISA-L LUT: symbol = 254 + actual_length).
-        // bit_count already includes any length-extra bits.
-        let length = (code - LENGTH_BASE_OFFSET) as u32;
-        if length == 0 || length > 258 {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "ISA-L litlen: invalid length value",
-            ));
-        }
         state.bits.consume(decoded.bit_count);
 
-        // Decode distance code.
-        let dist_sym = dist
-            .decode(&mut state.bits)
-            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "ISA-L dist: invalid code"))?
-            as u32;
-        if dist_sym >= 30 {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "ISA-L dist: symbol out of range (>= 30)",
-            ));
-        }
-        // Distance extra bits.
-        if state.bits.available() < 14 {
-            state.bits.refill();
-        }
-        const DIST_EXTRA_BIT_COUNT: [u8; 32] = [
-            0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12,
-            12, 13, 13, 0, 0,
-        ];
-        const DIST_START: [u32; 32] = [
-            1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025,
-            1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577, 0, 0,
-        ];
-        let extra_bits = DIST_EXTRA_BIT_COUNT[dist_sym as usize];
-        let extra_val = if extra_bits > 0 {
-            let v = (state.bits.bitbuf & ((1u64 << extra_bits) - 1)) as u32;
-            state.bits.consume(extra_bits as u32);
-            v
-        } else {
-            0
-        };
-        let distance = DIST_START[dist_sym as usize] + extra_val;
-        if std::env::var_os("GZIPPY_ISAL_INNER_DIAG").is_some() && out_pos < 200 {
-            eprintln!(
-                "[isal-inner]   match len={length} dist_sym={dist_sym} extra_bits={extra_bits} extra_val={extra_val} distance={distance}"
-            );
-        }
-        if distance == 0 || distance > 32768 {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "ISA-L dist: distance out of range",
-            ));
+        let mut symbol = decoded.symbol;
+        let mut remaining = decoded.sym_count;
+
+        while remaining > 0 {
+            let code = symbol & 0xFFFF;
+
+            // Literal path: either standalone literal (sym_count=1, code≤255)
+            // OR all but the last element of a pack (sym_count>1, any code —
+            // the leading elements MUST be literals per LUT builder).
+            if code <= 255 || remaining > 1 {
+                output[out_pos] = (code & 0xFF) as u8;
+                out_pos += 1;
+                symbol >>= 8;
+                remaining -= 1;
+                continue;
+            }
+
+            if code == 256 {
+                // EOB (must be sym_count=1 — multi-pack entries never
+                // contain EOB).
+                state.finish_current_block();
+                return Ok(out_pos);
+            }
+
+            if code > MAX_LIT_LEN_SYM {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "ISA-L litlen: symbol out of range",
+                ));
+            }
+
+            // Length code (last element of pack OR sym_count=1).
+            let length = (code - LENGTH_BASE_OFFSET) as u32;
+            if length == 0 || length > 258 {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "ISA-L litlen: invalid length value",
+                ));
+            }
+
+            // Length-code path is handled below the loop.
+            // Break out and run dist-decode + match-copy with `length`.
+            // `remaining` is set to 0 to exit the symbol iteration.
+            remaining = 0;
+            decode_length_match(state, output, &mut out_pos, length, dist)?;
         }
 
-        // Match copy via the existing window-stitched helper. Yields a
-        // PendingMatch and returns truncated out_pos if output fills
-        // mid-copy — the outer read_stream loop drains pending_match
-        // before re-entering this function.
-        out_pos = copy_match_windowed(state, output, out_pos, distance, length)?;
+        continue;
     }
+}
+
+/// Per-match handler used by the ISA-L inner loop: decode dist symbol +
+/// extras, then issue `copy_match_windowed`. Factored out because the
+/// match path needs the same logic whether the length came from a 1-sym
+/// entry or the trailing element of a multi-pack.
+#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+fn decode_length_match(
+    state: &mut ResumableInflate2<'_>,
+    output: &mut [u8],
+    out_pos: &mut usize,
+    length: u32,
+    dist: &crate::decompress::parallel::isal_lut_bulk::BulkDistDecoder,
+) -> Result<()> {
+    use crate::decompress::parallel::huffman_base::LsbBitReader as _;
+
+    let dist_sym = dist
+        .decode(&mut state.bits)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "ISA-L dist: invalid code"))?
+        as u32;
+    if dist_sym >= 30 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "ISA-L dist: symbol out of range (>= 30)",
+        ));
+    }
+    if state.bits.available() < 14 {
+        state.bits.refill();
+    }
+    const DIST_EXTRA_BIT_COUNT: [u8; 32] = [
+        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12,
+        13, 13, 0, 0,
+    ];
+    const DIST_START: [u32; 32] = [
+        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+        2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577, 0, 0,
+    ];
+    let extra_bits = DIST_EXTRA_BIT_COUNT[dist_sym as usize];
+    let extra_val = if extra_bits > 0 {
+        let v = (state.bits.bitbuf & ((1u64 << extra_bits) - 1)) as u32;
+        state.bits.consume(extra_bits as u32);
+        v
+    } else {
+        0
+    };
+    let distance = DIST_START[dist_sym as usize] + extra_val;
+    if distance == 0 || distance > 32768 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "ISA-L dist: distance out of range",
+        ));
+    }
+    *out_pos = copy_match_windowed(state, output, *out_pos, distance, length)?;
+    Ok(())
 }
 
 /// Parse a dynamic-Huffman block header atomically and return the built
