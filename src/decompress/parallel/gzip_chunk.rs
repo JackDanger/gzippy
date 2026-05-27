@@ -978,14 +978,45 @@ fn bootstrap_with_deflate_block(
     let result = bootstrap_with_deflate_block_inner(data, start_bit_offset, stop_hint_bits);
     match &result {
         Ok(b) => {
+            // handoff_reason: disambiguates the three Ok exit paths in
+            // `bootstrap_with_deflate_block_inner`:
+            //   - clean_window_armed: trailing_clean reached
+            //     MAX_WINDOW_SIZE at a block boundary; ISA-L will
+            //     take over (the "good" path).
+            //   - bfinal_hit: BFINAL block decoded; chunk is complete
+            //     in pure-Rust phase-1 alone.
+            //   - stop_hint_reached: the last block header was at-or-past
+            //     stop_hint_bits AND non-FixedHuffman AND not BFINAL;
+            //     decode stopped on the upcoming block (caller's
+            //     successor will re-decode that block).
+            // For the 6 heavy-tail chunks per silesia-large run that
+            // burn 200+ ms in bootstrap, the suspicion is they all hit
+            // either `bfinal_hit` or `stop_hint_reached` after running
+            // through the entire chunk without arming a clean window —
+            // this arg confirms or falsifies that prior. Plan:
+            // plans/pure-rust-phase1-speedup.md.
+            let handoff_reason = if b.clean_window.is_some() {
+                "clean_window_armed"
+            } else if b.bfinal_hit {
+                "bfinal_hit"
+            } else {
+                "stop_hint_reached"
+            };
+            // bytes_decoded: the bootstrap-decoded byte count. Each u16
+            // in `b.markers` represents ONE decoded byte (high bits
+            // distinguish markers from clean bytes). Join with the
+            // worker.bootstrap span's duration to compute per-call MB/s
+            // for the Step-2 analyzer.
             trace_v2::emit_instant(
                 "worker.bootstrap.outcome",
                 &format!(
-                    r#""result":"ok","markers_len":{},"end_bit":{},"clean_window":{},"bfinal":{}"#,
+                    r#""result":"ok","markers_len":{},"end_bit":{},"clean_window":{},"bfinal":{},"handoff_reason":"{}","bytes_decoded":{}"#,
                     b.markers.len(),
                     b.end_bit_offset,
                     b.clean_window.is_some(),
-                    b.bfinal_hit
+                    b.bfinal_hit,
+                    handoff_reason,
+                    b.markers.len(),
                 ),
                 "t",
             );
