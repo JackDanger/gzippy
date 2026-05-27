@@ -854,7 +854,14 @@ impl IsalLitLenCodePure {
     /// dispatches to the pure-rust builders defined above.
     pub fn rebuild_from(&mut self, code_lengths: &[u8]) -> bool {
         self.valid = false;
-        if code_lengths.len() > LIT_LEN {
+        // Allow up to 288 entries: 286 for dynamic-Huffman (LIT_LEN) plus
+        // symbols 286 and 287 for fixed-Huffman participation (RFC 1951
+        // §3.2.6 says these "should never actually appear in compressed
+        // data, but participate in the code construction"). Capping at
+        // LIT_LEN=286 caused fixed-Huffman tables to omit 2 length-8
+        // codes, shifting next_code[9] by 2 → every 9-bit literal symbol
+        // (144..255) decoded with an off-by-4 byte value.
+        if code_lengths.len() > 288 {
             return false;
         }
 
