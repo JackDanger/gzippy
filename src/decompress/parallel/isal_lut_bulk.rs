@@ -147,10 +147,6 @@ pub fn decode_block(
 
     let start_pos = *out_pos;
 
-    eprintln!(
-        "[diag] decode_block btype={} bfinal={} out_pos_start={}",
-        btype, is_final_block, *out_pos
-    );
     match btype {
         0b00 => {
             return decode_stored_block(bits, output, out_pos, is_final_block);
@@ -298,22 +294,28 @@ fn copy_match(
 }
 
 fn build_fixed_huffman(scratch: &mut DecoderScratch) -> Result<(), BulkDecodeError> {
+    // RFC 1951 §3.2.6 fixed-Huffman code lengths. Note 280..288 (NOT
+    // 280..286): symbols 286 and 287 are RESERVED ("should never
+    // actually appear in compressed data, but participate in the code
+    // construction"). Their length-8 contributions are required so that
+    // count[8] == 152 and canonical codes for length-9 (symbols
+    // 144..255) start at the correct value next_code[9] == 0b110010000.
+    // Without these two entries count[8] == 150 → next_code[9] shifts
+    // down by 4 → every 9-bit literal decodes off by +4 in the byte.
+    let mut fixed_lens = [0u8; 288];
     for sym in 0..144 {
-        scratch.litlen_lens[sym] = 8;
+        fixed_lens[sym] = 8;
     }
     for sym in 144..256 {
-        scratch.litlen_lens[sym] = 9;
+        fixed_lens[sym] = 9;
     }
     for sym in 256..280 {
-        scratch.litlen_lens[sym] = 7;
+        fixed_lens[sym] = 7;
     }
-    for sym in 280..286 {
-        scratch.litlen_lens[sym] = 8;
+    for sym in 280..288 {
+        fixed_lens[sym] = 8;
     }
-    for sym in 286..LIT_LEN {
-        scratch.litlen_lens[sym] = 0;
-    }
-    if !scratch.litlen.rebuild_from(&scratch.litlen_lens) {
+    if !scratch.litlen.rebuild_from(&fixed_lens) {
         return Err(BulkDecodeError::InvalidCodeLengths);
     }
     for sym in 0..30 {
