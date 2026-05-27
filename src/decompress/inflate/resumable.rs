@@ -666,6 +666,28 @@ impl<'a> ResumableInflate2<'a> {
                 // Parse the dynamic-Huffman header atomically and stash
                 // the built tables on `self`. Vendor `isal.hpp:263-272`
                 // treats `readHeader` as atomic.
+                //
+                // ISA-L parallel tables are built alongside the libdeflate
+                // tables when on x86_64 + pure-rust-inflate. Same lens
+                // feed both builders so the next-step inner-loop migration
+                // (advisor "Option D" 2026-05-27) can use the multi-symbol
+                // pack LUT without restructuring control flow.
+                #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+                let tables = {
+                    let mut litlen_lens = [0u8; 288];
+                    let mut dist_lens = [0u8; 32];
+                    let tables = parse_dynamic_header_with_lens(
+                        &mut self.bits,
+                        &mut litlen_lens,
+                        &mut dist_lens,
+                    )?;
+                    // Build ISA-L parallel tables for the next-step
+                    // inner-loop swap. Stored on self alongside `tables`.
+                    let isal_tables = build_isal_dynamic_tables(&litlen_lens[..], &dist_lens[..])?;
+                    self.dynamic_tables_isal = Some(isal_tables);
+                    tables
+                };
+                #[cfg(not(all(target_arch = "x86_64", feature = "pure-rust-inflate")))]
                 let tables = parse_dynamic_header(&mut self.bits)?;
                 // CLAUDE.md "no fallbacks" + vendor GzipReader contract:
                 // parallel-SM chunk boundaries land at block boundaries,
@@ -851,6 +873,31 @@ pub fn resume_decode_dynamic_resumable(
         state.dynamic_tables.is_some(),
         "dynamic_tables invariant: must be Some(_) iff block_state == InDynamic"
     );
+
+    // Option-D dispatch: when GZIPPY_RESUMABLE_ISAL_INNER=1, route
+    // through the ISA-L LUT inner loop. Default OFF; the next neurotic
+    // bench validates correctness and measures the perf delta before
+    // the flip becomes the production default.
+    #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+    if use_resumable_isal_inner() && state.dynamic_tables_isal.is_some() {
+        let isal_tables = state.dynamic_tables_isal.take().unwrap();
+        // Also take the libdeflate tables so we can restore both
+        // together if we yield without completing the block.
+        let lib_tables = state.dynamic_tables.take().unwrap();
+        let result = decode_huffman_body_resumable_isal(
+            state,
+            output,
+            out_pos,
+            &isal_tables.0,
+            &isal_tables.1,
+        );
+        if matches!(state.block_state, BlockState::InDynamic) {
+            state.dynamic_tables_isal = Some(isal_tables);
+            state.dynamic_tables = Some(lib_tables);
+        }
+        return result;
+    }
+
     // Standard "borrow one field while mutating another" pattern:
     // take the tables out of `state`, drive the body decoder (which
     // mutably borrows `state` for the window/bit reader/pending_match),
@@ -1330,6 +1377,192 @@ fn decode_huffman_body_resumable(
     }
 }
 
+/// Env-flag for the Option-D inner-Huffman migration. Read once at
+/// process start; default OFF. When set, every dynamic-Huffman block
+/// in ResumableInflate2 routes through the ISA-L LUT inner loop.
+/// Once verified on neurotic, this becomes the production default and
+/// the libdeflate-LUT inner loop is deleted.
+#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+fn use_resumable_isal_inner() -> bool {
+    use std::sync::OnceLock;
+    static USE_ISAL: OnceLock<bool> = OnceLock::new();
+    *USE_ISAL.get_or_init(|| std::env::var_os("GZIPPY_RESUMABLE_ISAL_INNER").is_some())
+}
+
+/// ISA-L-LUT-based inner symbol-decode loop. Replacement for
+/// [`decode_huffman_body_resumable`] using the multi-symbol-pack LUT
+/// format from [`IsalLitLenCodePure`] instead of libdeflate's
+/// [`LitLenTable`]. Preserves yield-on-output-fill semantics.
+///
+/// Correctness contract identical to the libdeflate variant: writes
+/// monotonically forward into `output[out_pos..]`, returns the new
+/// `out_pos` on yield (output filled OR `encoded_until_bits` reached
+/// before EOB) OR on EOB after calling `state.finish_current_block()`.
+///
+/// This function exists as the foundation for Option D (advisor
+/// 2026-05-27): once verified on neurotic, the dispatcher in
+/// `resume_decode_dynamic_resumable` switches over and the libdeflate
+/// LUT path is deleted. The ISA-L LUT's native multi-symbol pack
+/// (up to 3 literals per LUT entry) replaces libdeflate's T3
+/// multi-literal lookahead, with the goal of beating ISA-L+libdeflate
+/// per the user's "match within 1-2%" goal.
+///
+/// Behind `cfg(target_arch = "x86_64", feature = "pure-rust-inflate")`.
+#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+fn decode_huffman_body_resumable_isal(
+    state: &mut ResumableInflate2<'_>,
+    output: &mut [u8],
+    mut out_pos: usize,
+    litlen: &crate::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure,
+    dist: &crate::decompress::parallel::isal_lut_bulk::BulkDistDecoder,
+) -> Result<usize> {
+    use crate::decompress::parallel::huffman_base::LsbBitReader as _;
+    use crate::decompress::parallel::isal_huffman_pure::{
+        LARGE_FLAG_BIT, LARGE_LONG_CODE_LEN_OFFSET, LARGE_LONG_SYM_MASK,
+        LARGE_SHORT_CODE_LEN_OFFSET, LARGE_SHORT_MAX_LEN_OFFSET, LARGE_SHORT_SYM_MASK,
+        LARGE_SYM_COUNT_MASK, LARGE_SYM_COUNT_OFFSET,
+    };
+
+    // Per-iteration write-back of bits state — required because
+    // IsalLitLenCodePure::decode takes &mut Bits (not raw locals).
+    // The hot loop here is the correctness baseline; perf-equivalent
+    // local-promotion mirroring decode_huffman_body_resumable's
+    // bitbuf/bitsleft/in_pos locals is a follow-up.
+
+    const LENGTH_BASE_OFFSET: u32 = 254;
+    const MAX_LIT_LEN_SYM: u32 = 512;
+
+    loop {
+        // Yield check: if output full, the caller will resume here with
+        // a fresh buffer.
+        if out_pos >= output.len() {
+            return Ok(out_pos);
+        }
+
+        // encoded_until_bits guard: prevents reading past the chunk's
+        // assigned bit range. Mirrors the libdeflate variant's
+        // semantics.
+        if state.bits.bit_position() >= state.encoded_until_bits {
+            return Ok(out_pos);
+        }
+
+        // ISA-L LUT lookup: decodes up to 3 packed symbols in ONE
+        // table access. bit_count is the bits consumed for ALL packed
+        // symbols (codeword + any length-extras if the entry is a
+        // pre-expanded length).
+        let decoded = litlen.decode(&mut state.bits);
+        if decoded.bit_count == 0 || decoded.sym_count == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "ISA-L litlen: zero bit_count or sym_count (invalid Huffman code)",
+            ));
+        }
+
+        // Check ALL packed symbols are literals before consuming any
+        // bits. If output room < pack size AND all are literals, we
+        // can't emit them atomically — yield before consume. (For 1-sym
+        // entries containing a length or EOB, we'll handle below.)
+        if decoded.sym_count > 1 {
+            // Multi-pack entries are always all-literals (per ISA-L LUT
+            // builder semantics — see make_inflate_huff_code_lit_len).
+            if out_pos + (decoded.sym_count as usize) > output.len() {
+                // Yield without consuming the bits — caller resumes with
+                // larger output buffer.
+                return Ok(out_pos);
+            }
+            state.bits.consume(decoded.bit_count);
+            let mut symbol = decoded.symbol;
+            for _ in 0..decoded.sym_count {
+                output[out_pos] = (symbol & 0xFF) as u8;
+                out_pos += 1;
+                symbol >>= 8;
+            }
+            continue;
+        }
+
+        // sym_count == 1: could be a literal, EOB, or pre-expanded length.
+        let code = decoded.symbol;
+
+        if code <= 255 {
+            // Literal
+            state.bits.consume(decoded.bit_count);
+            output[out_pos] = (code & 0xFF) as u8;
+            out_pos += 1;
+            continue;
+        }
+
+        if code == 256 {
+            // EOB
+            state.bits.consume(decoded.bit_count);
+            state.finish_current_block();
+            return Ok(out_pos);
+        }
+
+        if code > MAX_LIT_LEN_SYM {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "ISA-L litlen: symbol out of range",
+            ));
+        }
+
+        // Length code (pre-expansion in ISA-L LUT: symbol = 254 + actual_length).
+        // bit_count already includes any length-extra bits.
+        let length = (code - LENGTH_BASE_OFFSET) as u32;
+        if length == 0 || length > 258 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "ISA-L litlen: invalid length value",
+            ));
+        }
+        state.bits.consume(decoded.bit_count);
+
+        // Decode distance code.
+        let dist_sym = dist
+            .decode(&mut state.bits)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "ISA-L dist: invalid code"))?
+            as u32;
+        if dist_sym >= 30 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "ISA-L dist: symbol out of range (>= 30)",
+            ));
+        }
+        // Distance extra bits.
+        if state.bits.available() < 14 {
+            state.bits.refill();
+        }
+        const DIST_EXTRA_BIT_COUNT: [u8; 32] = [
+            0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12,
+            12, 13, 13, 0, 0,
+        ];
+        const DIST_START: [u32; 32] = [
+            1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025,
+            1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577, 0, 0,
+        ];
+        let extra_bits = DIST_EXTRA_BIT_COUNT[dist_sym as usize];
+        let extra_val = if extra_bits > 0 {
+            let v = (state.bits.bitbuf & ((1u64 << extra_bits) - 1)) as u32;
+            state.bits.consume(extra_bits as u32);
+            v
+        } else {
+            0
+        };
+        let distance = DIST_START[dist_sym as usize] + extra_val;
+        if distance == 0 || distance > 32768 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "ISA-L dist: distance out of range",
+            ));
+        }
+
+        // Match copy via the existing window-stitched helper. Yields a
+        // PendingMatch and returns truncated out_pos if output fills
+        // mid-copy — the outer read_stream loop drains pending_match
+        // before re-entering this function.
+        out_pos = copy_match_windowed(state, output, out_pos, distance, length)?;
+    }
+}
+
 /// Parse a dynamic-Huffman block header atomically and return the built
 /// litlen + distance tables. Mirror of the header-parse portion of the
 /// existing non-resumable `decode_dynamic`
@@ -1339,6 +1572,26 @@ fn decode_huffman_body_resumable(
 /// block boundaries) guarantees the entire header always fits. A
 /// truncated header surfaces as `Err(UnexpectedEof)`.
 fn parse_dynamic_header(bits: &mut Bits) -> Result<(LitLenTable, DistTable)> {
+    let mut litlen_lens = [0u8; 288];
+    let mut dist_lens = [0u8; 32];
+    parse_dynamic_header_with_lens(bits, &mut litlen_lens, &mut dist_lens)
+}
+
+/// Variant of [`parse_dynamic_header`] that also captures the raw
+/// litlen/dist code lengths into caller-provided arrays. Used by
+/// try_enter_next_block to build the parallel ISA-L LUT alongside the
+/// libdeflate LUT without re-parsing the header.
+///
+/// `litlen_lens` is sized 288 (RFC 1951 §3.2.6 includes reserved symbols
+/// 286/287 — see the fixed-Huffman fix in `isal_lut_bulk::build_fixed_huffman`).
+/// `dist_lens` is sized 32 (RFC reserved 30/31).
+/// The caller must zero them; this function only writes the indices
+/// actually parsed from the header.
+fn parse_dynamic_header_with_lens(
+    bits: &mut Bits,
+    litlen_lens: &mut [u8; 288],
+    dist_lens: &mut [u8; 32],
+) -> Result<(LitLenTable, DistTable)> {
     // HLIT (5) + HDIST (5) + HCLEN (4) = 14 bits.
     if bits.available() < 14 {
         bits.refill();
@@ -1446,6 +1699,13 @@ fn parse_dynamic_header(bits: &mut Bits) -> Result<(LitLenTable, DistTable)> {
 
     let litlen_lengths = &all_lengths[..hlit];
     let dist_lengths = &all_lengths[hlit..total_lengths];
+
+    // Capture the raw lengths into the caller's buffers so the parallel
+    // ISA-L LUT can be built without re-parsing. The leading section was
+    // already zeroed by the caller; we only overwrite the prefix that
+    // the dynamic header actually emitted.
+    litlen_lens[..hlit].copy_from_slice(litlen_lengths);
+    dist_lens[..hdist].copy_from_slice(dist_lengths);
 
     let litlen_table = LitLenTable::build(litlen_lengths).ok_or_else(|| {
         Error::new(
