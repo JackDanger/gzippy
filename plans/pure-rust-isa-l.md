@@ -517,17 +517,45 @@ Two tiers. **Tier 1 (FFI removal)** is the structural prerequisite;
 
 ## 7. Numbers as of Step 0
 
-Empty; fill on first bench. Expected schema:
+**FILLED 2026-05-27 via `make bench-sm-pure-rust` on neurotic.**
+
+Commit `242accf` (post T3-carry-forward fix). silesia-large.gz
+(503.6 MB raw, gzip -9, 16 threads). Best-of-5 trials:
 
 ```
-date:                       YYYY-MM-DD HH:MM (neurotic snapshot)
-gzippy pure-rust-only MB/s: <number> (5-run mean, drop warmup)
-rapidgzip MB/s:             <number>
-ratio:                      <number>x
-wrapper-A/B (ISA-L/Rust):   <number>x   (Tier-1 gate ≤ 1.5x)
-corpus differential:        <pass|fail>  (silesia | silesia-large |
-                            silesia-gzip9 | software-gzip | logs-gzip)
+date:                       2026-05-27 (neurotic snapshot)
+gzippy-isal     MB/s:       1047 (median), 1092 (best)
+gzippy-purerust MB/s:        948 (median),  970 (best)
+rapidgzip       MB/s:       1845 (median), 1900 (best)
+
+Tier 2 gate ratio:           gzippy-purerust / gzippy-isal = 0.91×
+                             → MEETS the ≥ 0.9× gate
+gzippy-purerust / rapidgzip: 0.51×  (production-pipeline gap, out of scope)
+gzippy-isal     / rapidgzip: 0.57×  (current production baseline)
+
+corpus differential:        PASS (silesia 211 MB at chunk sizes 64K,
+                            128K, 256K, mono — all byte-identical to
+                            libdeflate oracle; T3 bug caught + fixed
+                            by `resumable_decodes_real_silesia` unit
+                            test)
+total tests pass:           638 (--no-default-features --features
+                            pure-rust-inflate)
 ```
+
+## 7.5 Final Opus advisor sign-off (2026-05-27)
+
+Advisor concession on commit `242accf`:
+
+> *"The controlling goal is met; 0.91× of ISA-L via a 638-test-
+> validated pure-Rust decoder — with the T3 fix locked by a real-
+> silesia dual-oracle test — is vendor-competitive on x86_64 per the
+> pre-registered Tier 2 gate in `plans/pure-rust-isa-l.md:490-495`."*
+
+Process critique (recorded in
+`[[feedback-real-corpus-test-with-lever]]`): the T3 multi-literal
+carry-forward bug shipped despite passing the 729-case synthetic
+differential; future fastloop levers must ship a real-corpus
+differential test in the same commit.
 
 ---
 
