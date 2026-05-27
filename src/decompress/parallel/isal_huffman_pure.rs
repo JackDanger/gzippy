@@ -910,7 +910,8 @@ impl IsalLitLenCodePure {
             LIT_LEN_ELEMS,
             &lit_count,
             &self.code_list[..],
-            TRIPLE_SYM_FLAG,
+            // BISECT: force SINGLE to verify packing is the bug
+            SINGLE_SYM_FLAG,
         );
 
         self.valid = true;
