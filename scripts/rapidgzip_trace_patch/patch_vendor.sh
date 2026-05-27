@@ -7,9 +7,10 @@ CORE_HDR='#include <core/TraceV2.hpp>'
 GCF=/root/gzippy/vendor/rapidgzip/librapidarchive/src/rapidgzip/GzipChunkFetcher.hpp
 BF=/root/gzippy/vendor/rapidgzip/librapidarchive/src/core/BlockFetcher.hpp
 RG=/root/gzippy/vendor/rapidgzip/librapidarchive/src/tools/rapidgzip.cpp
+GC=/root/gzippy/vendor/rapidgzip/librapidarchive/src/rapidgzip/chunkdecoding/GzipChunk.hpp
 
 # Add includes if not present.
-for F in "$GCF" "$BF"; do
+for F in "$GCF" "$BF" "$GC"; do
     if ! grep -q "TraceV2.hpp" "$F"; then
         # Insert after the #pragma once line.
         sed -i '/^#pragma once/a\
@@ -50,6 +51,26 @@ if ! grep -q "applyWindow.*tv2_apply" "$GCF"; then
     perl -i -0777 -pe 's|(chunkData->applyWindow\( \*lastWindow, chunkData->windowCompressionType\(\) \);)|{ ::tracev2::ScopedSpan _tv2_apply("post_process.apply_window"); $1 }|g' "$GCF"
     perl -i -0777 -pe 's|(chunkData->applyWindow\( \*window, chunkData->windowCompressionType\(\) \);)|{ ::tracev2::ScopedSpan _tv2_apply("post_process.apply_window"); $1 }|g' "$GCF"
     echo "PATCHED applyWindow sites: $GCF"
+fi
+
+# Patch GzipChunk.hpp speculation phases.
+# - worker.seed_first wraps `tryToDecode({blockOffset, blockOffset})` at ~line 739.
+# - worker.scan_run starts at the `const auto tBlockFinderStart = now();` site
+#   (line 803), RAII-ending when tryToDecode finds a candidate (return at 841)
+#   or the function throws (NoBlockInRange at 851).
+# - worker.scan_candidate wraps the inner `tryToDecode( offsetToTest )` per
+#   loop iteration, started right after `tBlockFinderStop = now();` (line 836).
+if ! grep -q "worker.seed_first" "$GC"; then
+    perl -i -0777 -pe 's|(if \( auto result = tryToDecode\( \{ blockOffset, blockOffset \} \); result \) \{\n            return \*std::move\( result \);\n        \})|\{ ::tracev2::ScopedSpan _tv2_seed("worker.seed_first"); $1 \}|' "$GC"
+    echo "PATCHED seed-first: $GC"
+fi
+if ! grep -q "worker.scan_run" "$GC"; then
+    sed -i 's|const auto tBlockFinderStart = now();|const auto tBlockFinderStart = now(); ::tracev2::ScopedSpan _tv2_scan("worker.scan_run");|' "$GC"
+    echo "PATCHED scan_run: $GC"
+fi
+if ! grep -q "worker.scan_candidate" "$GC"; then
+    sed -i 's|const auto tBlockFinderStop = now();|const auto tBlockFinderStop = now(); ::tracev2::ScopedSpan _tv2_cand("worker.scan_candidate");|' "$GC"
+    echo "PATCHED scan_candidate: $GC"
 fi
 
 # Add tracev2::flush_all() at end of main in rapidgzip.cpp.
