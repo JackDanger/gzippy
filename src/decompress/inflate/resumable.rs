@@ -1446,6 +1446,15 @@ fn decode_huffman_body_resumable_isal(
             return Ok(out_pos);
         }
 
+        // Always refill at the top of the loop — same pattern as the
+        // standalone bulk decoder (`isal_lut_bulk::decode_block`) which
+        // is silesia byte-perfect on 162 MB. The conditional refill
+        // inside `IsalLitLenCodePure::decode` is insufficient when
+        // running inside ResumableInflate2's outer machinery: header
+        // parsing leaves bits.bitsleft in states that the conditional
+        // doesn't reliably catch.
+        state.bits.refill();
+
         // ISA-L LUT lookup: decodes up to 3 packed symbols in ONE
         // table access. bit_count is the bits consumed for ALL packed
         // symbols (codeword + any length-extras if the entry is a
