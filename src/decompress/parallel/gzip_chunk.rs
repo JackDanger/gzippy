@@ -782,16 +782,87 @@ fn bootstrap_with_deflate_block(
     start_bit_offset: usize,
     stop_hint_bits: usize,
 ) -> Result<DeflateBootstrap, ChunkDecodeError> {
+    use crate::decompress::parallel::trace_v2;
+    let _tv2 = trace_v2::SpanGuard::begin_with(
+        "worker.bootstrap",
+        &format!(r#""start_bit":{start_bit_offset},"stop_hint":{stop_hint_bits}"#),
+    );
+    // Inner function so we can capture the Result and emit an outcome
+    // instant event before the SpanGuard drops. Per-attempt outcome
+    // attribution lets `scripts/timeline_analyze.py` correlate the
+    // 29 retries seen on silesia-large with their specific failure
+    // variant (header parse vs body invalid-huffman vs
+    // exceeded-window-range vs ...).
+    let result = bootstrap_with_deflate_block_inner(data, start_bit_offset, stop_hint_bits);
+    match &result {
+        Ok(b) => {
+            trace_v2::emit_instant(
+                "worker.bootstrap.outcome",
+                &format!(
+                    r#""result":"ok","markers_len":{},"end_bit":{},"clean_window":{},"bfinal":{}"#,
+                    b.markers.len(),
+                    b.end_bit_offset,
+                    b.clean_window.is_some(),
+                    b.bfinal_hit
+                ),
+                "t",
+            );
+        }
+        Err(e) => {
+            let kind = match e {
+                ChunkDecodeError::BootstrapFailed(io_err) => {
+                    let msg = io_err.to_string();
+                    // Extract the first identifying token of the inner
+                    // BlockError (e.g. "InvalidHuffmanCode"). The error
+                    // strings are formatted in bootstrap as
+                    // `"deflate body at bit ... : InvalidHuffmanCode"`
+                    // or `"deflate header at bit ...: InvalidHuffmanCode"`.
+                    if msg.contains("InvalidHuffmanCode") {
+                        "InvalidHuffmanCode"
+                    } else if msg.contains("ExceededWindowRange") {
+                        "ExceededWindowRange"
+                    } else if msg.contains("InvalidCompression") {
+                        "InvalidCompression"
+                    } else if msg.contains("InvalidCodeLengths") {
+                        "InvalidCodeLengths"
+                    } else if msg.contains("EndOfFile") {
+                        "EndOfFile"
+                    } else if msg.contains("past end of data") {
+                        "past_eof"
+                    } else if msg.contains("header") {
+                        "header_other"
+                    } else if msg.contains("body") {
+                        "body_other"
+                    } else {
+                        "other"
+                    }
+                }
+                _ => "non_bootstrap_err",
+            };
+            trace_v2::emit_instant(
+                "worker.bootstrap.outcome",
+                &format!(r#""result":"err","kind":"{kind}""#),
+                "t",
+            );
+        }
+    }
+    result
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+fn bootstrap_with_deflate_block_inner(
+    data: &[u8],
+    start_bit_offset: usize,
+    stop_hint_bits: usize,
+) -> Result<DeflateBootstrap, ChunkDecodeError> {
     use crate::decompress::inflate::consume_first_decode::Bits;
     use crate::decompress::parallel::deflate_block::{Block, MAX_WINDOW_SIZE};
     use crate::decompress::parallel::replace_markers::MARKER_BASE;
     use crate::decompress::parallel::trace_v2;
     use std::cell::RefCell;
-
-    let _tv2 = trace_v2::SpanGuard::begin_with(
-        "worker.bootstrap",
-        &format!(r#""start_bit":{start_bit_offset},"stop_hint":{stop_hint_bits}"#),
-    );
 
     // Per-thread Block recycling. Block::new() allocates a 128 KiB
     // ring + initializes the marker zone (64 KiB writes). Doing that
