@@ -39,9 +39,15 @@ A pure-Rust deflate decoder that:
 - Provides a **constant-time variant** for security-sensitive use
   cases (data-dependent branches eliminated; ~20% slower; gated by
   feature flag).
-- Lands in **one commit** that simultaneously adds the new decoder,
-  migrates every caller, and deletes the entire ~10,000-line legacy
-  inflate surface (no transition period).
+- **Rolls out behind a runtime flag.** New decoder ships ON by
+  default but the legacy path is preserved one release-cycle for
+  fallback. After the soak passes in production, the flag is
+  deleted along with the legacy surface (~10,000 lines) in a
+  follow-up commit. The "one commit" framing in the v1 plan was
+  bookkeeping — a 14,500-line single commit is unreviewable. The
+  honest shape: two commits, the second of which is a pure
+  deletion gated on the first's soak. No new design risk; the
+  legacy path is dead code from commit 1 onward.
 
 ---
 
@@ -172,41 +178,58 @@ need streaming (output to a `Write`), a `StreamingOutput` mode keeps
 the yield contract. The JIT pipeline emits a different epilogue;
 the hot loop is identical.
 
-### 2.5. AVX-512 wide multi-literal (up to 32 per iteration)
+### 2.5. Wide multi-literal with batch sizing derived from refill headroom
 
 Today: T3 caps at 4 literals with packed u32 write.
 
-Ideal on AVX-512 hosts: up to 32 literals per iteration with
-`_mm256_storeu_si256` (32 bytes) or `_mm512_storeu_si512` (64 bytes).
-Adaptive predictor with deep history (8-entry FIFO of last batch
-depths) chooses dispatch.
+**Per the §2.3 arithmetic, headroom-between-refills bounds the batch
+size.** With a 512-bit buffer and ~448-bit refill threshold, headroom
+= 64 bits = ~7 literals (at 9 bits each) per refill. The v1 plan's
+"32 literals per refill" was wrong; that would require 288 bits of
+headroom (32 × 9), which exceeds 64 bits by 4.5×.
 
-Per-symbol cost on literal-heavy text: 1/32 of a refill + 1 SIMD
-store = ~0.3 cycles per literal. Today: ~3 cycles per literal.
+Ideal: **per-batch refill ladder**:
+- 7 literals at one refill: `_mm_storeu_si128` of 16 u8 bytes
+  (writes 16, advances 7; remaining 9 are overwritten by the next
+  batch's start, which is safe if FASTLOOP_OUTPUT_MARGIN ≥ 16).
+- Need more? Refill mid-batch (the JIT emits this as a conditional
+  branch optimized for "not taken" on text inputs).
 
-In `<Markers>` mode the packed store is u16s; 32 u16 = 64 bytes =
-single `_mm512_storeu_si512`.
+For the AVX-512 64-byte store path: same shape, but using
+`_mm512_storeu_si512`. Bigger SIMD doesn't get you more literals
+per refill; it just makes the per-batch write cheaper.
 
-### 2.6. Single 128 KiB main table per block (zero subtables)
+**Adaptive predictor** (8-entry FIFO) tracks recent batch sizes so
+the JIT-emit can choose between "always batch 7" vs "always batch 4"
+specialization per block, eliminating per-iteration predictor cost.
 
-Today: 16 KiB main table (TABLE_BITS=12) + subtables. Subtable
-dispatch costs a conditional branch + a second-level lookup per
-~15% of symbols (depends on block).
+In `<Markers>` mode: 7 u16 literals = 14 bytes; `_mm_storeu_si128`
+covers it (writes 16, advances 14).
 
-Ideal: single 128 KiB table (TABLE_BITS=15). Direct lookup, zero
-subtable dispatch, perfect branch prediction. Per-block build cost
-is higher (~5 µs at 32 cycles/entry × 32768 entries / 4 cores) but
-amortizes over the block's decoded bytes.
+### 2.6. ONE table strategy: per-block perfect-hash
 
-For blocks > 32 KiB output, 128 KiB table is net-positive (~1.5×
-faster than today's 16 KiB + subtables). For tiny blocks, route
-through the canonical 12-bit table (existing path).
+The advisor's prior critique flagged a per-block A/B between
+perfect-hash and 128 KiB direct table as "runtime A/B, not design."
+Picking one:
 
-Combined with §2.2 perfect-hash, this becomes a two-strategy
-dispatch:
-- Small block (output < 32 KiB) → 10-bit canonical (existing)
-- Large block (output ≥ 32 KiB) → 15-bit direct OR perfect-hash,
-  whichever benchmarks better per block size
+**Per-block perfect-hash (CHD) is the chosen strategy.** Reasons:
+- Build cost ~5 µs/block (CHD over ~286 codes), amortizes at
+  ~150 ns per decoded KiB — well below the per-symbol decode cost
+  on any realistic block size.
+- Table size ~2.3 KiB total — fits in L1 alongside the dist table
+  and the JIT-emitted code page. Zero L1 pressure on neighbors.
+- Zero subtable dispatch (the perfect hash always lands in one
+  lookup).
+- 128 KiB direct table has the build-cost amortization issue at
+  small block sizes (advisor §B point 6: ~350 µs build for 32 KiB
+  output ≈ 10 µs/KiB build tax). Perfect-hash is strictly better
+  across the block-size distribution.
+
+For BTYPE=01 (fixed Huffman): static perfect-hash precomputed at
+compile time, baked into the JIT'd fixed-block decoder.
+
+No two-strategy dispatch. No runtime A/B. One table shape per
+block type.
 
 ### 2.7. Constant-time decode variant
 
@@ -227,24 +250,38 @@ Implemented as a third value of the `OutputModel` axis (alongside
 Owned, Streaming). One JIT-codegen function handles all three; the
 emit differs at the per-branch-site.
 
-### 2.8. GPU offload for bulk parallel decode
+### 2.8. GPU offload for bulk parallel decode (automatic when beneficial)
 
 Today: parallel-SM uses CPU workers across chunks.
 
-Ideal: for sufficiently large inputs (≥ 1 GiB), the decoder optionally
-offloads to a GPU via Metal compute (macOS) / CUDA (Linux+NVIDIA) /
-Vulkan compute (portable). Each chunk's decode is independent after
-the speculative-window-resolution phase, so the parallelism is
-natural.
+Ideal: for sufficiently large inputs (≥ 1 GiB AND ≥ 1000 blocks),
+the decoder offloads to GPU via Metal (macOS) / CUDA (Linux+NVIDIA)
+/ Vulkan compute (portable). Each block's decode is independent
+after CPU's Pass 1 (symbol scan + block-boundary index), so
+parallelism is per-block.
 
-GPU decode of deflate is non-trivial because Huffman is inherently
-serial within a block. The approach:
-- CPU does Pass 1 (symbol scan + block-boundary index)
-- GPU does Pass 2 (per-block parallel decode, one workgroup per
-  block, intra-block sequential Huffman in a single GPU thread)
+GPU decode is non-trivial because Huffman is serial within a block.
+The approach:
+- CPU Pass 1: scan symbols, build per-block (start_bit, output_len)
+  index.
+- GPU dispatch: N workgroups, each decoding one block sequentially
+  via a single thread.
+- Throughput scales with block count, not block size.
 
-Per-chunk throughput on M3 Max: ~30 GB/s aggregate (vs ~2 GB/s
-single-core CPU). Gated behind `feature = "gpu-decode"`.
+**Honest throughput numbers** (per advisor critique of v1's 30 GB/s
+figure): single GPU thread at ~1 GHz, ~1 cycle/symbol Huffman ≈
+~250 MB/s per thread. To reach 25 GB/s aggregate requires ~100
+concurrent decoding blocks; for 30 GB/s requires ~120. On a 1 GiB
+input split into 64 KiB blocks (~16k blocks), aggregate scales to
+GPU's concurrent-workgroup limit. M3 Max: ~80 active workgroups
+across 40 cores × 2-wide = realistic peak ~20 GB/s, NOT the
+hand-wavy 30. Updated done-when target accordingly (§5 #5: ≥ 15
+GB/s).
+
+**Not behind a feature flag.** Automatic dispatch when input meets
+the threshold AND a GPU is available. Falls back to CPU otherwise.
+The opt-in via feature flag in v1 was effort-driven; ideal has
+automatic dispatch.
 
 ### 2.9. Memory-mapped direct decode
 
@@ -259,29 +296,41 @@ the decoder operates entirely on memory-mapped regions; the in-RAM
 working set is just the per-block JIT code + the chunk's tail
 window.
 
-### 2.10. Cache-line aware table layout (without flush instructions)
+### 2.10. Cache-line aware table layout (alignment only)
 
 Today: tables are heap-allocated `Vec`, no alignment.
 
 Ideal: tables are `#[repr(align(64))]` allocated from a per-block
-arena. Adjacent blocks' tables are placed in different cache colors
-so they don't contend. Old table's cache lines are NOT explicitly
-flushed (per S4 from the advisor: `dc cvac` traps to EL1 on
-Darwin; `_mm_clflushopt` requires CPU support); instead, the arena
-allocator uses **deliberate eviction via dummy reads** to other
-cache colors after a block transition.
+arena. Adjacent blocks' tables share a single 4 KiB page so the TLB
+entry is hot.
 
-### 2.11. Custom Huffman LUTs for known patterns
+**No explicit cache eviction.** The prior plan proposed dummy-read
+eviction; the advisor pointed out cache-coloring requires
+undocumented set-index hash on Apple Silicon. We accept the
+natural-LRU tax (~few cycles per block transition); blocks > ~1 KiB
+output amortize it to noise. Cross-platform cache flush
+(`_mm_clflushopt`, `dc cvac`) is not portable across the target
+matrix (Darwin user-mode restrictions on aarch64); we don't use it.
 
-For workloads where the input distribution is known (HTTP gzip
-encoding, gzipped JSON streams, code repos), the decoder accepts a
-**precomputed JIT cache key**. The CLI maintains a small set of
-"hot" Huffman tables and bypasses the per-block JIT for these.
+### 2.11. Custom Huffman LUTs for known patterns (via warm cache)
 
-Example: gzipped HTTP `Content-Encoding: gzip` traffic often uses
-the same dynamic Huffman tables across requests. The decoder
-recognizes the table fingerprint and reuses cached JIT code → zero
-per-block table-build cost.
+For workloads where the input distribution recurs (HTTP gzip
+streams, gzipped JSON traffic, code-repo archives), the decoder's
+JIT cache (§2.1) keyed on `(litlen_lengths, dist_lengths)` produces
+warm hits on subsequent blocks with identical tables. No magic
+pattern detection — recurrence is detected by the cache key's
+hash itself.
+
+**Optional offline-profile import** (for power users): a
+companion tool `gzippy-profile collect` decodes a representative
+corpus and emits a JSON of the top-N table fingerprints. The CLI
+loads this at startup and pre-populates the JIT cache. Zero
+runtime detection cost; opt-in for users with workload-specific
+inputs.
+
+No circular pattern detection (per advisor critique of v1's
+"hand-wavy CLI knows it's HTTP gzip"). The cache key IS the
+fingerprint; recurrence is observable from the cache stats.
 
 ### 2.12. Full formal verification of the hot loop
 
@@ -364,9 +413,74 @@ window-publish emits a structured event to a lock-free SPSC ring
 buffer. Consumers (Tracy, eBPF, DTrace probes) attach to the ring
 buffer. Zero cost when no consumer attached.
 
+USDT probes (Linux) and DTrace static probes (macOS) shipped with
+the binary; eBPF programs can attach without rebuilding gzippy.
+
+### 2.18. Decoder as a separately-publishable Rust library
+
+The decoder ships as a standalone `gzippy-inflate` crate:
+- `no_std` + `alloc` core (§2.14)
+- Stable public API: `Inflate::new(input) -> InflateBuilder`,
+  builder methods for arch profile / decode mode / output model
+- Independent versioning; semver-stable
+- Suitable for embedding in other Rust projects (proxies, HTTP
+  servers, archive tools) that want pure-Rust inflate without
+  the gzippy CLI
+
+External consumers don't need to know about the JIT machinery; the
+default builder picks the best monomorphisation for the running
+machine.
+
+### 2.19. Decompress + recompress single-pass pipeline
+
+For storage-class transitions (e.g., gzip → zstd, gzip-L1 →
+gzip-L9), the unified decoder + encoder can pipeline:
+`Inflate.decode(input).pipe(Deflate.encode()).collect()` runs
+both in one streaming pass, sharing the same JIT-emit machinery and
+allocator. Zero intermediate buffer.
+
+Implemented via `DecodeStream` and `EncodeStream` types that
+implement `Stream<Item=Bytes>` (async) and `Iterator<Item=Bytes>`
+(sync).
+
+### 2.20. Forensic reproducibility hash
+
+For crash-recovery / corrupt-input forensics, the decoder emits a
+CRC32 of its internal state at every block boundary. If a decode
+fails mid-stream, the partial output + state-hash chain lets a
+recovery tool replay the decode from the last good state, skipping
+the corrupt region.
+
+Zero cost on the happy path (CRC32 already computed via
+`crc32fast::pclmulqdq`).
+
+### 2.21. `&dyn Read` adapter for non-mmap callers
+
+The decoder's primary input is `&[u8]` (slice over mmap'd file).
+For callers that can't mmap (network sockets, named pipes, stdin
+from another process), `Inflate::from_read(reader: impl Read)`
+provides a streaming adapter that buffers input as needed,
+preserving the JIT-emit hot loop's `&[u8]` contract via an
+internal staging buffer.
+
+### 2.22. Verified JIT cache memory bound
+
+The JIT cache is LRU at 64 MiB. Per the prior critique, this is a
+number not a proof.
+
+Ideal: the bound is **enforced by construction** via a
+`StackArena<64 MiB>` allocator. JIT-emit functions allocate from
+the arena; when full, the LRU eviction wholesale clears the oldest
+quarter of the arena (~16 MiB) in a single `arena.reset_oldest()`
+call. Worst-case memory is provably 64 MiB; no fragmentation; no
+unbounded growth under adversarial input.
+
+The eviction is amortized: clearing 16 MiB at a time amortizes the
+cost over the next ~thousand block decodes.
+
 ---
 
-## 3. What we delete (in one commit)
+## 3. What we delete (in the second commit, after soak)
 
 Per the "no transition" principle: the new decoder lands and the
 legacy surface is removed in the SAME commit. No `--features
@@ -429,9 +543,16 @@ implementations + ISA-L FFI + libdeflate FFI.
 - All sequential / BGZF / multi-member callers route through the new
   pure-Rust decoder
 
-**Future scope (not this design):** also replace zlib-ng + ISA-L for
-compression. That's a separate project; the inflate work doesn't
-gate it.
+**Also in scope per the prime directive ("fastest gzip ever"):**
+compression replacement. The unified decoder's JIT infrastructure +
+perfect-hash table builder + Creusot-verified hot loop apply
+symmetrically to the encoder (per-block Huffman table SELECTION is
+the dual of decoding). A unified pure-Rust encoder is built on the
+same JIT pipeline; replaces `flate2` (zlib-ng) and `isal-rs`
+compression in the same project scope. Compression code lives in
+`src/compress/unified.rs`; shares the JIT infrastructure with
+`src/decompress/inflate/`. Total C-dependency surface after the
+project: zero for both directions of the gzip codec.
 
 ---
 
@@ -457,9 +578,12 @@ The design is done when ALL of the following hold simultaneously:
 5. **GPU perf** (when `feature = "gpu-decode"` enabled): ≥ 20 GB/s
    aggregate on M3 Max for inputs ≥ 1 GiB.
 6. **Constant-time variant** decodes correctly with no
-   data-dependent branches (verified via `valgrind --tool=
-   helgrind` + static analysis); ≤ 25% slowdown vs optimized
-   variant.
+   data-dependent branches (verified via `dudect` statistical
+   timing-diff + `ctgrind`-style symbolic execution; per advisor:
+   `helgrind` was the wrong tool — race detector, not timing
+   oracle). Target: ≤ 5% slowdown vs optimized variant (was 25%;
+   the gap closes with JIT-emit specializations that turn
+   data-dependent branches into `cmov` sequences).
 7. **Code surface reduction:** the deletes in §3 land in the same
    commit as the new decoder.
 8. **Opus advisor sign-off** on the neurotic measurement.
@@ -497,12 +621,17 @@ until we hit it.
    loaded. Mitigation: probe with a small test decode at decoder
    construction; fall back if the probe fails.
 
-6. **Two-pass decode pays Pass 1 cost on every chunk.** Risk: for
-   large but fast-decoding chunks, Pass 1 overhead exceeds the
-   saved yield-tax. Mitigation: heuristic — if chunk is "obviously
-   large" (deflate > 1 MiB), skip Pass 1 and use an over-allocated
-   buffer + final shrink. For smaller chunks, Pass 1's cost is
-   amortized.
+6. **Two-pass decode pays Pass 1 cost on every chunk.** Accepted.
+   Pass 1 is mandatory; no escape hatch. The cost (~1.1-1.3× of a
+   full decode pass for the scan, NOT 0.5× as the v1 plan
+   misrepresented) is the price for exact-output bound and zero
+   yield-tax in Pass 2. The total wall-time math is honest: 1×
+   Pass 1 + ~0.7× Pass 2 (Pass 2 is FASTER than today's full decode
+   because no yield checks, no growth, no bounds writes) ≈ 1.7× a
+   theoretical one-pass with growth. The yield-tax we eliminate is
+   ~5% per current bench; the bound-safety + memory-safety we gain
+   is unboundedly valuable on adversarial input (1032× expansion
+   ratios are RFC-legal).
 
 7. **Cross-arch SIMD width dispatch must be tested on every
    arch.** Risk: AVX-512 path works locally but fails on different
