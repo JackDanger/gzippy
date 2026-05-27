@@ -53,51 +53,52 @@ A pure-Rust deflate decoder that:
 
 ## 2. The architectural pillars
 
-### 2.1. Cranelift-JIT per-block decoder
+### 2.1. AOT-codegen + dynasm hot-loop emitter (NOT cranelift)
 
-Today: a generic Huffman-decode loop that dispatches at every symbol
-on the litlen / dist table entries.
+The v1 plan proposed `cranelift-jit` per-block. The pass-3 critique
+correctly identified that cranelift's `JITModule` doesn't expose
+partial-arena reset, and its per-function compile cost (~100µs-1ms)
+loses on blocks ≤ a few hundred µs decode work unless cache hit
+rate is > 99% (a workload claim, not a design proof).
 
-Ideal: at block header parse, the decoder calls
-`cranelift_jit::Module` to emit a per-block function. The block's
-litlen + dist tables are baked as immediates into the JIT'd code —
-the table lookup becomes a single `lea`+`mov` from a known base
-address. The hot loop is ~200 lines of generated assembly tuned to
-the block's actual codeword distribution.
+**Use dynasm-rs** (assembly DSL macro) for the JIT path. dynasm-rs
+gives direct page ownership — we control allocation, can clear
+arenas freely, and the per-emit cost is single-digit µs (it's a
+macro that emits bytes; no SSA, no regalloc, no scheduler).
+
+**Plus AOT-codegen** for the hot patterns: a `build.rs` script
+takes a corpus profile (the offline-profile from §2.11) and emits
+Rust code containing pre-compiled per-fingerprint decoders. New
+fingerprints fall through to dynasm JIT; first decode of an
+unknown fingerprint pays JIT cost (~10 µs), subsequent decodes
+reuse cached code.
+
+The interpreted Rust fallback (the ResumableInflate2-shape hot
+loop with all B1-B6+T0-T5 wins) handles the cold path during JIT
+emit and for inputs where JIT memory is exhausted.
 
 ```rust
-struct JittedBlock {
-    code: extern "C" fn(input: *const u8, output: *mut u8, ...) -> usize,
-    table_base: *const HuffmanEntry,
+enum BlockDecoder {
+    Aot(extern "C" fn(...)),       // build.rs pre-compiled
+    Jit(DynasmEmittedCode),        // first-seen + cached
+    Interpreted(InterpreterState), // fallback
 }
 
 impl Inflate {
     fn decode_block(&mut self, header: &BlockHeader, ...) -> Result<...> {
-        let jit = self.jit_cache.get_or_build(header.tables_fingerprint(), || {
-            cranelift_emit_decoder(header, self.target_arch, self.modes)
-        });
-        unsafe { (jit.code)(input, output, ...) }
+        let fp = header.fingerprint();
+        match self.codegen_cache.dispatch(fp) {
+            BlockDecoder::Aot(f) | BlockDecoder::Jit(f) => unsafe { f(...) },
+            BlockDecoder::Interpreted(s) => s.decode(...),
+        }
     }
 }
 ```
 
-**Why this is the ideal**: every existing decoder (libdeflate, ISA-L,
-rapidgzip, zlib-ng) emits ONE general-purpose hot loop that dispatches
-on the table per-symbol. None of them JIT per-block because (a) the
-JIT compile cost is amortized only over large blocks, and (b) the
-implementation effort is significant. Both constraints are dissolved
-here: blocks < 4 KiB output route to the interpreted Rust fallback
-(same shape as today's `ResumableInflate2`); blocks ≥ 4 KiB get JIT
-treatment.
-
-JIT cache is keyed on `(litlen_lengths, dist_lengths)`. Identical
-block headers (common in archived corpora) reuse cached JIT code —
-no re-emission.
-
-**Vendor citation:** none. This is genuinely novel.
-[`feedback-no-innovation`](memory) is amended: for the inner Huffman
-loop, full re-implementation is authorized including techniques
-without vendor counterpart (CLAUDE.md 2026-05-27 final).
+**Vendor citation:** dynasm-rs is mature (used by `wasmer`,
+`b3`, others). AOT codegen from corpus profiles is a libdeflate
+contemporary in spirit but not directly ported. CLAUDE.md
+2026-05-27 (final) authorizes inner-loop innovation.
 
 ### 2.2. Per-block perfect-hash decode tables
 
@@ -149,34 +150,44 @@ Worst-case is 1 symbol per 16 bits available, i.e. for an N-bit
 buffer with M-bit refill threshold, headroom = N-M bits; symbols
 per refill = (N-M) / 48 worst-case, (N-M) / 9 literal-best-case.
 
-### 2.4. Two-pass exact-bound output sizing
+### 2.4. Single-pass decode with exact bound from gzip trailer + amortized growth fallback
 
-Today / v1 plan: `OwnedOutput` allocates `5 × deflate_len` (or 80
-MiB) as a "max-expansion-ratio bound."
+The v1 plan's "two-pass scan-then-decode" had two flaws caught by
+prior advisor passes: (a) Pass 1's "~2× faster" claim was wrong
+because Pass 1 must still decode every Huffman symbol to know
+match/literal classification, and (b) the cost model contradicted
+itself across §2.4 and §6 risk 6. Single-pass is honest.
 
-**Problem (S1 from advisor):** DEFLATE max expansion is 1032×, not
-5×. A 1 MiB chunk can legally expand to 1 GiB. The 5× bound silently
-truncates legitimate input.
+**FILE-level decode (CLI, BGZF, multi-member):** the gzip trailer
+contains ISIZE (uncompressed size mod 2³²). Read trailer FIRST
+(one ~8-byte seek-to-end + read; ~1 µs total). Allocate
+exact-sized output buffer. Forward-decode in a single pass. Zero
+growth, zero yield-check tax, zero waste. For files > 2³² bytes
+the ISIZE is ambiguous; the decoder falls back to amortized growth
+(below) AND verifies the final size matches ISIZE mod 2³².
 
-**Ideal:** two-pass decode.
-- **Pass 1: symbol scan.** Read the deflate stream symbol-by-symbol
-  WITHOUT writing output. Decode the bit-stream just enough to know
-  each block's TYPE + length codes' exact lengths. Accumulate
-  `exact_output_bytes`. ~2× faster than full decode (no match copy,
-  no literal emit).
-- **Pass 2: full decode.** Allocate `Vec<u8>` (or `MarkerBuffer<u16>`)
-  of exactly `exact_output_bytes`. JIT-decode each block into its
-  precisely-sized slice. Zero growth, zero yield, zero waste.
+**PARALLEL-SM CHUNK-level decode:** per-chunk output size isn't
+recorded anywhere. The decoder uses amortized-growth via
+`Vec<u8>`: standard doubling, O(1) amortized per byte, worst-case
+2× over-allocation reclaimed via `shrink_to_fit()` at chunk
+completion. Zero yield-check tax (the decoder writes via
+`Vec::extend_from_slice` after each multi-literal batch; growth
+amortizes against future writes).
 
-Pass 1's cost (~0.5 ns/B based on the bench's pclmulqdq-level
-operations) is amortized by Pass 2's elimination of: (a) the
-yield-check tax in the hot loop, (b) the buffer-growth realloc, (c)
-the bounds-check tax on every literal/match write.
+**STREAMING decode** (writer-output for BGZF / sequential SM /
+async): the decoder keeps the yield contract; output goes via
+`Write::write_all` after each batch. Hot loop is identical to the
+owned-output path; only the epilogue differs.
 
-For BGZF / multi-member / sequential SM consumers that genuinely
-need streaming (output to a `Write`), a `StreamingOutput` mode keeps
-the yield contract. The JIT pipeline emits a different epilogue;
-the hot loop is identical.
+No "skip Pass 1 for large chunks" — there is no Pass 1. No "Pass 1
+cost amortized" — there is no Pass 1. No internal cost-model
+contradiction.
+
+**DEFLATE max expansion is 1032×** (the prior advisor's S1
+concern). For the file path this doesn't matter — ISIZE is exact.
+For the chunk path the amortized-growth Vec handles arbitrary
+expansion safely; the 2× worst-case over-allocation is bounded by
+the actual decoded size, not by a heuristic expansion ratio.
 
 ### 2.5. Wide multi-literal with batch sizing derived from refill headroom
 
@@ -362,15 +373,24 @@ Today: differential vs flate2 + libdeflate. v1 plan: same.
 Problem (advisor): after we delete `libdeflater` (§4 below), the
 fuzz oracle is gone.
 
-Ideal: three independent oracles for differential fuzzing:
-- **Reference zlib** (different code base from zlib-ng — the
-  Mark Adler reference implementation, ~6 kLOC C)
-- **rapidgzip** (vendor C++, accessed via subprocess for fuzzing)
-- **CompressionStreams** in Node.js (third independent
-  implementation, accessed via subprocess)
+Ideal: three independent oracles, **all linked in-process via
+Rust C-FFI bindings**, for differential fuzzing at native fuzz
+throughput (~1M cases/sec, vs ~1k/sec for subprocess oracles —
+the pass-3 critique correctly noted subprocesses kill throughput).
+
+- **Reference zlib** (Mark Adler's reference, ~6 kLOC C) via
+  `libz-sys` crate. In-process.
+- **rapidgzip** via a thin C-ABI shim (`vendor/rapidgzip` is built
+  as a static lib exposing `rapidgzip_inflate` for fuzz harness;
+  the same shim is used by the bench harness). In-process.
+- **libdeflate** (kept as a fuzz oracle even after the production
+  dep is deleted; `libdeflate-sys` exists only in the fuzz
+  workspace). In-process.
 
 Any two-way disagreement is a bug. Three-way agreement is high
-confidence.
+confidence. Fuzz runs are 72h per release, plus a 60-second
+smoke per CI build (in-process throughput makes per-CI viable
+where subprocess didn't).
 
 Plus the existing four layers (property tests, real-corpus,
 Creusot, integration).
@@ -463,30 +483,43 @@ provides a streaming adapter that buffers input as needed,
 preserving the JIT-emit hot loop's `&[u8]` contract via an
 internal staging buffer.
 
-### 2.22. Verified JIT cache memory bound
+### 2.22. Verified JIT cache memory bound (via dynasm page ownership)
 
-The JIT cache is LRU at 64 MiB. Per the prior critique, this is a
-number not a proof.
+dynasm-rs owns the executable-page allocations directly (unlike
+cranelift, which wraps its `Memory` opaquely). The JIT cache is a
+ring of N executable pages (each 4 KiB on Linux/macOS arm64, 16 KiB
+on macOS x86_64). When the ring is full, the oldest page is
+unmapped via `munmap` and reused — no fragmentation, no opaque
+allocator state, bound is exact and provably 64 MiB (or whatever
+the configured N).
 
-Ideal: the bound is **enforced by construction** via a
-`StackArena<64 MiB>` allocator. JIT-emit functions allocate from
-the arena; when full, the LRU eviction wholesale clears the oldest
-quarter of the arena (~16 MiB) in a single `arena.reset_oldest()`
-call. Worst-case memory is provably 64 MiB; no fragmentation; no
-unbounded growth under adversarial input.
-
-The eviction is amortized: clearing 16 MiB at a time amortizes the
-cost over the next ~thousand block decodes.
+The pass-3 critique correctly noted that cranelift's StackArena
+doesn't compose with partial reset. Switching to dynasm dissolves
+this — page ownership is direct, and the ring-buffer-of-pages
+allocator is a known-correct pattern (used by V8's code cache,
+LuaJIT, Wasmtime's interpreter-side patcher).
 
 ---
 
 ## 3. What we delete (in the second commit, after soak)
 
-Per the "no transition" principle: the new decoder lands and the
-legacy surface is removed in the SAME commit. No `--features
-old-decoder` shim, no gradual migration, no parallel benchmarking
-period. The neurotic A/B is run BEFORE the commit lands; if the
-gate fails, the commit is reworked, not merged.
+**Two-commit shape** (consistent with §1):
+- **Commit 1**: lands the new decoder ON by default. Legacy decoder
+  preserved behind a `--features legacy-inflate` build-flag, OFF by
+  default, present only as a one-release-cycle fallback for
+  emergency rollback. Production CI runs the new decoder; the
+  legacy build is verified via a single CI smoke job. Neurotic A/B
+  gate runs against commit 1 before merge.
+- **Commit 2**: ~10,000-line pure deletion of `legacy-inflate` +
+  every file in the deletion list below. Lands one release cycle
+  after commit 1 ships, conditional on a clean soak (no
+  production rollbacks, no field bug reports tied to the new
+  decoder). No design risk; commit 2 is mechanical.
+
+The pass-3 critique correctly identified the §1-vs-§3 contradiction
+where v3 said "two commits" in §1 but "lands and deletes in same
+commit" in §3. This rewrite makes them consistent. The "one commit
+of 14,500 lines" framing is dropped — it was unreviewable bookkeeping.
 
 Deleted:
 - `src/decompress/parallel/deflate_block.rs` (`Block`, ~2,200 lines)
