@@ -435,7 +435,13 @@ fn worker_main(
     use crate::decompress::parallel::trace_v2;
     while running.load(Ordering::Acquire) {
         // pool.pick = the time a worker spends waiting for + dequeuing a task.
+        // Split into `pool.pick.lock` (mutex acquire + dequeue) vs
+        // `pool.pick.wait` (condvar wait) so a follow-up trace can tell
+        // condvar-starvation (consumer-side fix) from mutex contention
+        // (pool-side fix). Outer `pool.pick` preserved for back-compat
+        // with prior timeline diffs.
         let _pick = trace_v2::SpanGuard::begin("pool.pick");
+        let _pick_lock = trace_v2::SpanGuard::begin("pool.pick.lock");
         let mut guard = shared.lock().expect("ThreadPool mutex poisoned");
 
         // ++m_idleThreadCount (ThreadPool.hpp:205) — must happen under
@@ -443,11 +449,17 @@ fn worker_main(
         // this increment cannot interleave.
         idle.fetch_add(1, Ordering::AcqRel);
 
+        // End the lock-acquire span here; the condvar will atomically
+        // release the mutex and re-acquire it on wake, so the time
+        // inside `wait_while` is condvar-wait + lock-reacquire combined.
+        drop(_pick_lock);
+        let _pick_wait = trace_v2::SpanGuard::begin("pool.pick.wait");
         // m_pingWorkers.wait(tasksLock, [this] () { return hasUnprocessedTasks() || !m_threadPoolRunning; });
         // (ThreadPool.hpp:206).
         guard = cv
             .wait_while(guard, |s| s.running && !has_unprocessed_tasks(&s.tasks))
             .expect("ThreadPool mutex poisoned during condvar wait");
+        drop(_pick_wait);
 
         // --m_idleThreadCount (ThreadPool.hpp:207).
         idle.fetch_sub(1, Ordering::AcqRel);
