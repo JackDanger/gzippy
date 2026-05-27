@@ -250,6 +250,11 @@ impl<'a, M: DecodeMode, A: ArchProfile, O: OutputModel> Inflate<'a, M, A, O> {
 // -----------------------------------------------------------------------------
 
 impl<'a> Inflate<'a, Clean, Generic, Streaming> {
+    /// Construct positioned at `bit_offset = 0` over the full input.
+    pub fn new(input: &'a [u8], bit_offset: usize) -> std::io::Result<Self> {
+        Self::with_until_bits(input, bit_offset, input.len() * 8)
+    }
+
     /// Construct positioned at `bit_offset` with `until_bits` as the
     /// inclusive bit-cap. Matches `ResumableInflate2::with_until_bits`.
     pub fn with_until_bits(
@@ -300,6 +305,59 @@ impl<'a> Inflate<'a, Clean, Generic, Streaming> {
     /// True if the most recent block had `BFINAL=1`.
     pub fn is_final_block(&self) -> bool {
         self.inner.is_final_block()
+    }
+
+    /// Clear any pending `set_stopping_points` configuration so the next
+    /// `read_stream` decodes through every boundary.
+    pub fn clear_stop(&mut self) {
+        self.inner.clear_stop()
+    }
+
+    /// The set of stopping points currently configured.
+    pub fn points_to_stop_at(&self) -> StoppingPoint {
+        self.inner.points_to_stop_at()
+    }
+
+    /// Block-type of the current block, if known (0=stored, 1=fixed,
+    /// 2=dynamic). `None` between blocks.
+    pub fn btype(&self) -> Option<u8> {
+        self.inner.btype()
+    }
+
+    /// Number of compressed bits consumed from the start of the stream.
+    pub fn tell_compressed(&self) -> usize {
+        self.inner.tell_compressed()
+    }
+
+    /// The inclusive bit-cap configured at construction.
+    pub fn encoded_until_bits(&self) -> usize {
+        self.inner.encoded_until_bits()
+    }
+
+    /// Bytes remaining in the input buffer, starting at the byte-aligned
+    /// position after `tell_compressed()`. Caller must confirm the
+    /// cursor is byte-aligned before calling.
+    pub fn remaining_input(&self) -> &'a [u8] {
+        self.inner.remaining_input()
+    }
+
+    /// Consume `n` bytes from `remaining_input()` — typically used to
+    /// advance past a gzip-member trailer the caller has just read.
+    pub fn advance_input(&mut self, n: usize) {
+        self.inner.advance_input(n)
+    }
+
+    /// Reset block / pending state to begin a new gzip stream from the
+    /// current bit position (used by multi-member parallel chunk
+    /// decoders that reuse the same allocation across members).
+    pub fn reset_for_next_stream(&mut self) {
+        self.inner.reset_for_next_stream()
+    }
+
+    /// True when an inner state-machine session is mid-block. Used by
+    /// the production wrapper as a sanity check between yields.
+    pub fn session_pending(&self) -> bool {
+        self.inner.session_pending()
     }
 }
 
