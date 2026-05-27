@@ -40,7 +40,31 @@ ported into gzippy with vendor file:line citations.** That includes:
 
 Done when an Opus advisor agrees gzippy structurally and calculationally
 matches the gzip-relevant surface of rapidgzip (not the BZIP2/ZLIB-decoder
-surface). Performance optimization happens after that.
+surface), AND the inner Huffman decode primitives are vendor-competitive
+on neurotic. Structural port and perf parity are now BOTH required —
+"performance optimization later" is rescinded as a guiding principle
+when it blocks vendor-competitive throughput.
+
+## Permission to fully reimplement the inner inflate
+
+The "port faithfully, don't innovate" rule is **scoped to architecture
+and high-level shape** (chunk pipeline, prefetcher, block finder, etc.).
+For the inner Huffman decode loop — `decode_huffman_body_resumable` and
+the `LitLenTable` / `DistTable` / `Bits` primitives — full
+re-implementation of every libdeflate / ISA-L technique is in scope and
+explicitly authorized, including:
+
+- Multi-literal lookahead (2-/3-/4-literal packed-write paths).
+- Fixed-Huffman static-table specialization.
+- BMI2 PEXT / BZHI runtime dispatch.
+- Table prefetch (`_mm_prefetch`) ahead of dependent loads.
+- Inline-asm hot loops if needed to match vendor codegen.
+- Reorganized state-machine that elides the resumable yield-check tax
+  when output has FASTLOOP_OUTPUT_MARGIN bytes of headroom.
+
+Prior falsifications (e.g. commit `ca52389` SIMD multi-literal regression)
+are **NOT binding** — they were measured against the pre-PRELOAD,
+pre-BMI2 hot loop. Re-attempt any of them with fresh measurement.
 
 ## Rules
 

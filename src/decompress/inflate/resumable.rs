@@ -882,6 +882,18 @@ fn decode_huffman_body_resumable(
     let in_data_ptr: *const u8 = in_data.as_ptr();
     let encoded_until_bits: usize = state.encoded_until_bits;
 
+    // Lever T0 (tight-Huffman-decoder plan): lift output base pointer
+    // and length to locals so literal writes go through raw-pointer
+    // arithmetic instead of slice-indexing. The top-of-loop yield
+    // check `out_pos >= output.len()` is the safety boundary that
+    // makes the unsafe writes sound — when control enters the body,
+    // `out_pos < output_len` is invariant. Vendor counterpart:
+    // `consume_first_decode.rs:738-739` lifts `out_ptr`/`out_end`,
+    // all literal writes use `(out_ptr.add(out_pos) as *mut u8).write(...)`
+    // (`:1021-1024, :1057-1058`).
+    let output_ptr: *mut u8 = output.as_mut_ptr();
+    let output_len: usize = output.len();
+
     // Mirror of `Bits::bit_position` semantics
     // (`consume_first_decode.rs:237-240`): bit position of the NEXT bit
     // to consume = (in_pos in bytes × 8) − unread-bits-in-buffer.
@@ -950,8 +962,277 @@ fn decode_huffman_body_resumable(
     }
     let mut entry = litlen.lookup(bitbuf);
 
+    // Lever T4 (tight-Huffman-decoder plan): FASTLOOP yield-elide.
+    // When both buffers have safety margin, run a tight inner loop that
+    // omits the per-iteration yield checks. Vendor pattern:
+    // `consume_first_decode.rs:752` (`in_fastloop_end = in_data.len() - 32`),
+    // `:858-859` (`while in_pos < in_fastloop_end && out_pos +
+    // FASTLOOP_MARGIN <= out_end`).
+    //
+    // FASTLOOP_MARGIN bounds the max bytes a single iteration may write
+    // to output: max match length is 258, plus a small safety margin.
+    // 320 matches vendor.
+    const FASTLOOP_MARGIN: usize = 320;
+    // Refill_local! reads up to 8 bytes ahead of in_pos; we leave 32
+    // bytes (4 refills' worth) headroom so the fastloop body never
+    // checks bounds.
+    const FASTLOOP_INPUT_TAIL: usize = 32;
+
+    // The symbol decode body. Used inside the fastloop (no yield checks)
+    // and inside the safe loop (yield checks above). `continue` advances
+    // to the enclosing loop top; `return` exits the function. The body
+    // assumes `entry` is preloaded and corresponds to the current `bitbuf`.
+    macro_rules! decode_one_symbol {
+        () => {{
+            // saved_bitbuf for length / dist-extra extraction. Captured
+            // BEFORE consume so the same bits the entry was decoded from
+            // are available for extra-bit reads.
+            let mut saved_bitbuf = bitbuf;
+            let mut raw = entry.raw();
+
+            bitbuf >>= raw as u8;
+            bitsleft = bitsleft.wrapping_sub(raw & 0x1F);
+
+            // LITERAL FAST PATH (bit 31). Vendor: `:870-1030`.
+            if (raw as i32) < 0 {
+                // Lever T3 (tight-Huffman-decoder plan): multi-literal
+                // lookahead. After emitting the first literal, peek at
+                // the preloaded `bitbuf` to see if the NEXT entry is
+                // also a literal. If yes, consume+emit it inline. Try
+                // up to 3 extra literals (4 total) when bit budget
+                // allows. Vendor pattern: `:870-1030` packs up to 8.
+                //
+                // Bit budget: each main-table lookup consumes up to
+                // TABLE_BITS=12 bits. Starting from post-refill bitsleft
+                // ∈ [56, 63] (T1's literal-tail refill ensured this on
+                // the previous iter), we can absorb 4 lookups (48 bits)
+                // before needing another refill. We don't multi-batch
+                // subtable literals — those go through the EXCEPTIONAL
+                // path with a different consume size.
+                //
+                // Falsification record: commit `ca52389` regressed -15%
+                // at the pre-PRELOAD loop shape. CLAUDE.md update
+                // 2026-05-27 explicitly allows the re-attempt; this
+                // implementation is structurally different (PRELOAD +
+                // register locals + raw-pointer writes are all in place).
+                unsafe {
+                    output_ptr.add(out_pos).write(entry.literal_value());
+                }
+                out_pos += 1;
+
+                // Speculative lookup for the next entry. Two outcomes:
+                //   (A) Next is literal → consume + emit it; try to
+                //       chain up to 4 literals. After the chain, refill
+                //       + lookup once for the iter-after-batch entry.
+                //   (B) Next is NOT literal → use this entry as the
+                //       NEXT iteration's `entry`. No re-lookup needed
+                //       (this is the key vendor trick that avoids the
+                //       wasted-lookup regression: the speculative
+                //       lookup ALWAYS yields the next iter's entry,
+                //       whether or not we batched).
+                //
+                // Output bound is critical for the SAFE-loop path: the
+                // FASTLOOP guarantees `out_pos + 320 <= output_len` so
+                // these checks are redundant when fastloop fires (and
+                // LLVM proves it on inlining). In the safe loop (1-byte
+                // output buffers exist in unit tests), the check
+                // prevents UB.
+                if (bitsleft as u8) >= REFILL_THRESHOLD {
+                    let mut e_next = litlen.lookup(bitbuf);
+                    let mut r_next = e_next.raw();
+
+                    // 2nd literal
+                    if (r_next as i32) < 0 && out_pos < output_len {
+                        bitbuf >>= r_next as u8;
+                        bitsleft = bitsleft.wrapping_sub(r_next & 0x1F);
+                        unsafe {
+                            output_ptr.add(out_pos).write(e_next.literal_value());
+                        }
+                        out_pos += 1;
+
+                        // 3rd literal
+                        if (bitsleft as u8) >= 24 {
+                            e_next = litlen.lookup(bitbuf);
+                            r_next = e_next.raw();
+                            if (r_next as i32) < 0 && out_pos < output_len {
+                                bitbuf >>= r_next as u8;
+                                bitsleft = bitsleft.wrapping_sub(r_next & 0x1F);
+                                unsafe {
+                                    output_ptr.add(out_pos).write(e_next.literal_value());
+                                }
+                                out_pos += 1;
+
+                                // 4th literal
+                                if (bitsleft as u8) >= 12 {
+                                    e_next = litlen.lookup(bitbuf);
+                                    r_next = e_next.raw();
+                                    if (r_next as i32) < 0 && out_pos < output_len {
+                                        bitbuf >>= r_next as u8;
+                                        bitsleft = bitsleft.wrapping_sub(r_next & 0x1F);
+                                        unsafe {
+                                            output_ptr.add(out_pos).write(e_next.literal_value());
+                                        }
+                                        out_pos += 1;
+                                        // Hit 4-literal cap. Refill +
+                                        // lookup for next iter; don't
+                                        // carry e_next.
+                                        if (bitsleft as u8) < REFILL_THRESHOLD {
+                                            refill_local!();
+                                        }
+                                        entry = litlen.lookup(bitbuf);
+                                        continue;
+                                    }
+                                    // 4th was non-literal — carry as
+                                    // next iter's entry.
+                                    entry = e_next;
+                                    continue;
+                                }
+                                // 3rd was non-literal — carry.
+                                entry = e_next;
+                                continue;
+                            }
+                            // 3rd-position lookup was non-literal —
+                            // carry.
+                            entry = e_next;
+                            continue;
+                        }
+                        // bitsleft too low for 3rd lookup. Refill +
+                        // lookup for next iter.
+                        if (bitsleft as u8) < REFILL_THRESHOLD {
+                            refill_local!();
+                        }
+                        entry = litlen.lookup(bitbuf);
+                        continue;
+                    }
+                    // 2nd was non-literal (or no output room). Carry as
+                    // next iter's entry — saves a lookup vs the
+                    // pre-T3 path.
+                    entry = e_next;
+                    continue;
+                }
+
+                // bitsleft too low even for speculative lookup. Refill,
+                // then preload as usual. Same shape as single-literal
+                // path pre-T3.
+                if (bitsleft as u8) < REFILL_THRESHOLD {
+                    refill_local!();
+                }
+                entry = litlen.lookup(bitbuf);
+                continue;
+            }
+
+            // EXCEPTIONAL PATH (bit 15: subtable_ptr OR end_of_block).
+            // Vendor: `:1032-1068`.
+            if (raw & HUFFDEC_EXCEPTIONAL) != 0 {
+                if (raw & HUFFDEC_END_OF_BLOCK) != 0 {
+                    writeback_bits!();
+                    state.finish_current_block();
+                    return Ok(out_pos);
+                }
+                // SUBTABLE
+                entry = litlen.lookup_subtable_direct(entry, bitbuf);
+                saved_bitbuf = bitbuf;
+                raw = entry.raw();
+                bitbuf >>= raw as u8;
+                bitsleft = bitsleft.wrapping_sub(raw & 0x1F);
+
+                if (raw as i32) < 0 {
+                    unsafe {
+                        output_ptr.add(out_pos).write(entry.literal_value());
+                    }
+                    out_pos += 1;
+                    if (bitsleft as u8) < REFILL_THRESHOLD {
+                        refill_local!();
+                    }
+                    entry = litlen.lookup(bitbuf);
+                    continue;
+                }
+                if (raw & HUFFDEC_END_OF_BLOCK) != 0 {
+                    writeback_bits!();
+                    state.finish_current_block();
+                    return Ok(out_pos);
+                }
+                // Fall through to LENGTH path.
+            }
+
+            // LENGTH+DISTANCE path.
+            let length = entry.decode_length(saved_bitbuf);
+            let dist_saved = bitbuf;
+            let mut dist_entry = dist.lookup(dist_saved);
+            if dist_entry.is_subtable_ptr() {
+                bitbuf >>= DistTable::TABLE_BITS;
+                bitsleft = bitsleft.wrapping_sub(DistTable::TABLE_BITS as u32);
+                dist_entry = dist.lookup_subtable_direct(dist_entry, bitbuf);
+            }
+            let dist_extra_saved = bitbuf;
+            let dist_raw = dist_entry.raw();
+            bitbuf >>= dist_raw as u8;
+            bitsleft = bitsleft.wrapping_sub(dist_raw & 0x1F);
+            let distance = dist_entry.decode_distance(dist_extra_saved);
+
+            // copy_match_windowed reads `state.window` and writes
+            // `state.pending_match`. It does NOT touch `state.bits`.
+            let bits_value_snapshot = if cfg!(debug_assertions) {
+                Some((state.bits.bitbuf, state.bits.bitsleft, state.bits.pos))
+            } else {
+                None
+            };
+            out_pos = copy_match_windowed(state, output, out_pos, distance, length)?;
+            debug_assert_eq!(
+                bits_value_snapshot,
+                Some((state.bits.bitbuf, state.bits.bitsleft, state.bits.pos)),
+                "decode_huffman_body_resumable B1 contract: copy_match_windowed \
+                 must not mutate state.bits.{{bitbuf,bitsleft,pos}}"
+            );
+            if state.pending_match.is_some() {
+                debug_assert_eq!(out_pos, output.len());
+                writeback_bits!();
+                return Ok(out_pos);
+            }
+
+            // Refill + preload next entry.
+            if (bitsleft as u8) < REFILL_THRESHOLD {
+                refill_local!();
+            }
+            entry = litlen.lookup(bitbuf);
+        }};
+    }
+
+    // Outer loop alternates: try the fastloop, then run safe iterations
+    // until either we can re-enter the fastloop OR a yield/EOB fires.
     loop {
-        if out_pos >= output.len() {
+        // FASTLOOP entry condition. Bounds:
+        //   - in_pos < in_data_len - 32: refill_local! 8-byte loads safe
+        //   - in_pos * 8 < encoded_until_bits: won't decode past cap
+        //   - out_pos < output_len - FASTLOOP_MARGIN: any single iter's
+        //     write fits (max match 258 + literals)
+        //
+        // `cap_byte_floor = encoded_until_bits / 8` is a conservative
+        // floor: if in_pos < cap_byte_floor, in_pos*8 < cap_byte_floor*8
+        // ≤ encoded_until_bits, so bit_position_of(...) ≤ in_pos*8 <
+        // cap. The bound is strict enough that the fastloop body can
+        // omit the cap check entirely.
+        let cap_byte_floor = encoded_until_bits / 8;
+        let in_fl_end = in_data_len
+            .saturating_sub(FASTLOOP_INPUT_TAIL)
+            .min(cap_byte_floor);
+        let out_fl_end = output_len.saturating_sub(FASTLOOP_MARGIN);
+
+        if in_pos < in_fl_end && out_pos < out_fl_end {
+            BODY_RESUMABLE_FASTLOOP_ENTERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            while in_pos < in_fl_end && out_pos < out_fl_end {
+                decode_one_symbol!();
+            }
+            // Fastloop exited because bounds broke. Re-evaluate yield
+            // conditions at the safe-loop top.
+            continue;
+        }
+
+        // SAFE LOOP iteration: per-iter yield checks then ONE symbol.
+        // SAFETY boundary: `out_pos < output_len` after the next check;
+        // the unsafe literal writes inside `decode_one_symbol!` rely on
+        // this invariant.
+        if out_pos >= output_len {
             writeback_bits!();
             return Ok(out_pos);
         }
@@ -960,161 +1241,11 @@ fn decode_huffman_body_resumable(
             return Ok(out_pos);
         }
 
-        // saved_bitbuf for length / dist-extra extraction. Captured
-        // BEFORE consume so the same bits the entry was decoded from
-        // are available for extra-bit reads. May be re-assigned in the
-        // subtable branch to point at the post-main-consume bitbuf so
-        // the sub-entry's extras read from the right slice.
-        let mut saved_bitbuf = bitbuf;
-        let mut raw = entry.raw();
-
-        // Consume entry's bits FIRST (mirrors vendor `consume!` at
-        // `consume_first_decode.rs:820-827, :867`). For literal/EOB:
-        // codeword bits. For length: codeword + extra. For subtable:
-        // main_table_bits (the low 4 bits of a subtable entry).
-        bitbuf >>= raw as u8;
-        bitsleft = bitsleft.wrapping_sub(raw & 0x1F);
-
-        // Lever B3 (advisor third-pass sign-off): branch order matches
-        // vendor `decode_huffman_libdeflate_style`'s hot path
-        // (`consume_first_decode.rs:870, :1032-1068, :1107-1147`):
-        //   1. LITERAL (bit 31) — fastest, most common on text/log.
-        //   2. EXCEPTIONAL (bit 15) — collapses subtable + EOB under
-        //      one branch; specializes on EOB (bit 13) inside.
-        //   3. LENGTH (fall-through) — most common after a literal run.
-        //
-        // The prior shape tested `is_subtable_ptr()` THEN
-        // `is_end_of_block()` separately, evaluating both predicates on
-        // every length-code iteration. The new shape gates both behind
-        // one `(raw & 0x8000) != 0` test.
-
-        // LITERAL FAST PATH (bit 31). Vendor: `:870-1030`.
-        if (raw as i32) < 0 {
-            output[out_pos] = entry.literal_value();
-            out_pos += 1;
-            // huffdec!-style preload of next entry. Vendor: `:1025-1028`
-            // (conditional refill then top-of-loop lookup; we inline the
-            // lookup since PRELOAD is at end-of-branch).
-            if (bitsleft as u8) < REFILL_THRESHOLD {
-                refill_local!();
-            }
-            entry = litlen.lookup(bitbuf);
-            continue;
-        }
-
-        // EXCEPTIONAL PATH (bit 15: subtable_ptr OR end_of_block).
-        // Vendor: `:1032-1068`.
-        if (raw & HUFFDEC_EXCEPTIONAL) != 0 {
-            // EOB (bit 13). Vendor: `:1034-1040`.
-            if (raw & HUFFDEC_END_OF_BLOCK) != 0 {
-                writeback_bits!();
-                state.finish_current_block();
-                return Ok(out_pos);
-            }
-            // SUBTABLE: resolve the sub-entry and re-classify. The
-            // sub-entry can itself be literal / EOB / length. After
-            // re-classification, either continue/return for
-            // literal/EOB, or fall through to the LENGTH path below
-            // with `entry` + `saved_bitbuf` re-pointed at the
-            // sub-entry's bit slice. Vendor: `:1042-1068`.
-            //
-            // Lever B6 (advisor sixth-pass): use `_direct` variant that
-            // takes already-shifted bits — we ALREADY consumed
-            // `main_table_bits` (= 12) on the line above, so `bitbuf` is
-            // post-shift. Saves one `shr` per litlen-subtable hit.
-            // Vendor: `consume_first_decode.rs:1042-1046` uses the
-            // post-consume bitbuf directly (`bitbuf & ((1<<subtable_bits)-1)`).
-            entry = litlen.lookup_subtable_direct(entry, bitbuf);
-            // The sub-entry's length-extra bits live in the
-            // post-main-consume bitbuf, so update saved_bitbuf BEFORE
-            // consuming the sub-entry.
-            saved_bitbuf = bitbuf;
-            raw = entry.raw();
-            bitbuf >>= raw as u8;
-            bitsleft = bitsleft.wrapping_sub(raw & 0x1F);
-
-            // Sub-entry literal. Vendor: `:1050-1060`.
-            if (raw as i32) < 0 {
-                output[out_pos] = entry.literal_value();
-                out_pos += 1;
-                if (bitsleft as u8) < REFILL_THRESHOLD {
-                    refill_local!();
-                }
-                entry = litlen.lookup(bitbuf);
-                continue;
-            }
-            // Sub-entry EOB. Vendor: `:1062-1068`.
-            if (raw & HUFFDEC_END_OF_BLOCK) != 0 {
-                writeback_bits!();
-                state.finish_current_block();
-                return Ok(out_pos);
-            }
-            // Sub-entry is a length code → fall through to LENGTH path
-            // below with `entry` + `saved_bitbuf` updated.
-        }
-
-        // LENGTH+DISTANCE path — main-table length OR sub-table length
-        // code. Vendor: `:1070-1104` (subtable case) + `:1107-1147`
-        // (main case). The two share the dist lookup + match copy code,
-        // which is why we collapsed them here.
-        let length = entry.decode_length(saved_bitbuf);
-
-        // Dist lookup. The top-of-loop refill (after each literal /
-        // match) guarantees `bitsleft >= 56 − 20 = 36` here, which
-        // covers the worst-case dist consume of 28 bits. No
-        // intermediate refill needed; matches vendor single-symbol
-        // path (no per-symbol refill in the inner loop).
-        let dist_saved = bitbuf;
-        let mut dist_entry = dist.lookup(dist_saved);
-        if dist_entry.is_subtable_ptr() {
-            bitbuf >>= DistTable::TABLE_BITS;
-            bitsleft = bitsleft.wrapping_sub(DistTable::TABLE_BITS as u32);
-            // Lever B5 (advisor fifth-pass): use `_direct` variant that
-            // takes already-shifted bits. Saves one `shr` per dist-
-            // subtable hit (~6% of matches on silesia). Vendor pattern:
-            // `consume_first_decode.rs:1081, :1123`.
-            dist_entry = dist.lookup_subtable_direct(dist_entry, bitbuf);
-        }
-        let dist_extra_saved = bitbuf;
-        let dist_raw = dist_entry.raw();
-        bitbuf >>= dist_raw as u8;
-        bitsleft = bitsleft.wrapping_sub(dist_raw & 0x1F);
-        let distance = dist_entry.decode_distance(dist_extra_saved);
-
-        // copy_match_windowed reads `state.window` and writes
-        // `state.pending_match`. It does NOT touch `state.bits`. The
-        // debug_assert below verifies the VALUES of `state.bits.*`
-        // haven't moved across the call (the prior `addr_of!` version
-        // checked a field address, which is trivially invariant —
-        // advisor item, second pass). Locals don't need writeback
-        // around this call.
-        let bits_value_snapshot = if cfg!(debug_assertions) {
-            Some((state.bits.bitbuf, state.bits.bitsleft, state.bits.pos))
-        } else {
-            None
-        };
-        out_pos = copy_match_windowed(state, output, out_pos, distance, length)?;
-        debug_assert_eq!(
-            bits_value_snapshot,
-            Some((state.bits.bitbuf, state.bits.bitsleft, state.bits.pos)),
-            "decode_huffman_body_resumable B1 contract: copy_match_windowed \
-             must not mutate state.bits.{{bitbuf,bitsleft,pos}}; if you \
-             added state.bits.* writes there, restructure to writeback \
-             before the call and re-lift after"
-        );
-        if state.pending_match.is_some() {
-            debug_assert_eq!(out_pos, output.len());
-            writeback_bits!();
-            return Ok(out_pos);
-        }
-
-        // Refill + preload next entry. Vendor:
-        // `consume_first_decode.rs:1142-1144` (refill BEFORE preload so
-        // entry corresponds to post-refill bitbuf).
-        if (bitsleft as u8) < REFILL_THRESHOLD {
-            refill_local!();
-        }
-        entry = litlen.lookup(bitbuf);
+        // One safe iteration via the shared body macro. The macro's
+        // `continue` returns to the outer `loop` top, which re-checks
+        // the FASTLOOP entry conditions before running another safe
+        // iteration.
+        decode_one_symbol!();
     }
 }
 
