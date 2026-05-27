@@ -1735,16 +1735,7 @@ fn decode_huffman_body_resumable_isal(
             .min(cap_byte_floor);
         let out_fl_end = output_len.saturating_sub(FASTLOOP_MARGIN);
         if state.pending_pack.is_none() && in_pos < in_fl_end && out_pos < out_fl_end {
-            // Unrolled-2 FASTLOOP: process two multi-pack entries per
-            // outer iter to amortize loop-condition overhead and match
-            // libdeflate's T3 emit-per-iter rate. With 1.5-avg syms per
-            // ISA-L LUT entry, this gives ~3 emits per outer iter
-            // (vs libdeflate's T3 chain of up to 4).
             while state.pending_pack.is_none() && in_pos < in_fl_end && out_pos < out_fl_end {
-                decode_one_iter!();
-                if state.pending_pack.is_some() || in_pos >= in_fl_end || out_pos >= out_fl_end {
-                    break;
-                }
                 decode_one_iter!();
             }
             continue;
