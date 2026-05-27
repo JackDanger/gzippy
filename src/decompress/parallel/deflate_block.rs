@@ -1315,116 +1315,167 @@ impl Block {
             }
             CompressionType::DynamicHuffman => {
                 use crate::decompress::parallel::gzip_definitions::END_OF_BLOCK_SYMBOL;
-                use crate::decompress::parallel::huffman_short_bits_multi_cached::{
-                    HuffmanCodingShortBitsMultiCached, MULTI_DISTANCE_OFFSET,
+                use crate::decompress::parallel::isal_huffman_pure::{
+                    IsalLitLenCodePure, INVALID_SYMBOL,
                 };
                 use crate::decompress::parallel::rfc_tables::get_distance_dynamic;
 
-                let mut litlen_hc = HuffmanCodingShortBitsMultiCached::new();
-                let err = litlen_hc.initialize_from_lengths(&litlen_lens);
-                if err != super::error::Error::None {
-                    return Err(BlockError::InvalidCodeLengths);
+                // ISA-L's length-symbol encoding: post-expansion symbols
+                // are `254 + actual_length` (vendor deflate.hpp:1642
+                // extracts via `symbol - 254U`). MultiCached also uses
+                // 254 as MULTI_DISTANCE_OFFSET so this constant matches
+                // both decoders' semantics; advisor flag #2 confirmed.
+                const MULTI_DISTANCE_OFFSET: u32 = 254;
+
+                // Per-thread pure-rust ISA-L decoder. Allocates the
+                // 19 KB LUT once per worker; subsequent blocks call
+                // `rebuild_from` to rebuild in place. Replaces
+                // `HuffmanCodingShortBitsMultiCached` (vendor MultiCached
+                // 11-bit, 1-sym-per-entry) with ISA-L's `inflate_huff_code_large`
+                // format (12-bit short + variable-length long, up to 3 packed
+                // syms, length-extras pre-baked).
+                //
+                // Per the 2026-05-27 advisor cross-check `port_matches_c_isal_*`
+                // verified the LUT is byte-equal to ISA-L's C output for both
+                // fixed and Kraft-valid dynamic code-length sets. The hot-loop
+                // wiring below uses `(code & 0xFF) as u16` for ring writes —
+                // critical because `code = symbol & 0xFFFF` captures the
+                // packed pair (low byte sym1 + high byte sym2). The legacy
+                // MultiCached path wrote full `code` without masking, which was
+                // harmless ONLY because MultiCached's sym_count is always 1
+                // (no packing). ISA-L's sym_count can be 1, 2, or 3 — the high
+                // bytes contain the next packed symbols and must NOT be written
+                // into the same ring slot.
+                thread_local! {
+                    static THREAD_PURE_LITLEN: std::cell::RefCell<IsalLitLenCodePure> =
+                        std::cell::RefCell::new(IsalLitLenCodePure::new_empty());
                 }
 
-                macro_rules! run_multi_cached_loop {
-                    () => {{
-                        const MAX_RUN_LENGTH: usize = 258;
-                        const MAX_LIT_LEN_SYM: u32 = 512;
-                        let n_max_to_decode = n_max_to_decode.min(RING_SIZE - MAX_RUN_LENGTH);
+                let result_or_err: Result<usize, BlockError> = THREAD_PURE_LITLEN.with(|cell| {
+                    let mut litlen_hc = cell.borrow_mut();
+                    if !litlen_hc.rebuild_from(&litlen_lens) {
+                        return Err(BlockError::InvalidCodeLengths);
+                    }
 
-                        let ring_ptr = self.output_ring.as_mut_ptr();
-                        let mut pos = self.ring_pos;
-                        // Step C SIMD-bootstrap experiment: hoist ring-modulo
-                        // out of the per-literal hot path. `phys` is the
-                        // physical u16 ring index, kept in sync with pos.
-                        let mut phys: u16 = (pos & (RING_SIZE - 1)) as u16;
-                        let mut emitted: usize = 0;
-                        let mut distance_marker = self.distance_to_last_marker_byte;
+                    macro_rules! run_multi_cached_loop {
+                        () => {{
+                            const MAX_RUN_LENGTH: usize = 258;
+                            const MAX_LIT_LEN_SYM: u32 = 512;
+                            let n_max_to_decode = n_max_to_decode.min(RING_SIZE - MAX_RUN_LENGTH);
 
-                        macro_rules! commit {
-                            ($result:expr) => {{
-                                self.ring_pos = pos;
-                                self.decoded_bytes += emitted;
-                                self.distance_to_last_marker_byte = distance_marker;
-                                return $result;
-                            }};
-                        }
+                            let ring_ptr = self.output_ring.as_mut_ptr();
+                            let mut pos = self.ring_pos;
+                            // Step C SIMD-bootstrap experiment: hoist ring-modulo
+                            // out of the per-literal hot path. `phys` is the
+                            // physical u16 ring index, kept in sync with pos.
+                            let mut phys: u16 = (pos & (RING_SIZE - 1)) as u16;
+                            let mut emitted: usize = 0;
+                            let mut distance_marker = self.distance_to_last_marker_byte;
 
-                        while emitted < n_max_to_decode {
-                            let (mut symbol, mut symbol_count) = litlen_hc.decode(bits);
-                            if symbol_count == 0 {
-                                commit!(Err(BlockError::InvalidHuffmanCode));
+                            macro_rules! commit {
+                                ($result:expr) => {{
+                                    self.ring_pos = pos;
+                                    self.decoded_bytes += emitted;
+                                    self.distance_to_last_marker_byte = distance_marker;
+                                    return $result;
+                                }};
                             }
 
-                            while symbol_count > 0 {
-                                let code = (symbol & 0xFFFF) as u16;
-                                if code <= 255 || symbol_count > 1 {
-                                    unsafe {
-                                        ring_ptr.add(phys as usize).write(code);
-                                    }
-                                    phys = phys.wrapping_add(1);
-                                    pos += 1;
-                                    emitted += 1;
-                                    if CONTAINS_MARKERS {
-                                        distance_marker += 1;
-                                    }
-                                    symbol >>= 8;
-                                    symbol_count -= 1;
-                                    continue;
+                            while emitted < n_max_to_decode {
+                                let decoded = litlen_hc.decode(bits);
+                                // IsalLitLenCodePure returns bit_count=0 with
+                                // symbol=INVALID_SYMBOL on invalid lookup. Consume
+                                // bits BEFORE dispatching on symbol — vendor
+                                // `seekAfterPeek` at HuffmanCodingISAL.hpp:143.
+                                if decoded.bit_count == 0 || decoded.symbol == INVALID_SYMBOL {
+                                    commit!(Err(BlockError::InvalidHuffmanCode));
                                 }
-
-                                if code == END_OF_BLOCK_SYMBOL {
-                                    self.at_end_of_block = true;
-                                    commit!(Ok(emitted));
-                                }
-                                if u32::from(code) > MAX_LIT_LEN_SYM {
+                                bits.consume(decoded.bit_count);
+                                let mut symbol = decoded.symbol;
+                                let mut symbol_count = decoded.sym_count;
+                                if symbol_count == 0 {
                                     commit!(Err(BlockError::InvalidHuffmanCode));
                                 }
 
-                                let length = (symbol - MULTI_DISTANCE_OFFSET) as usize;
-                                if length == 0 {
+                                while symbol_count > 0 {
+                                    let code = (symbol & 0xFFFF) as u16;
+                                    if code <= 255 || symbol_count > 1 {
+                                        // CRITICAL: mask `& 0xFF` for packed-sym
+                                        // safety. ISA-L packs up to 3 literals
+                                        // in one symbol value (sym1=low byte,
+                                        // sym2=next, sym3=third). Writing the
+                                        // full u16 would put sym1|(sym2<<8)
+                                        // into one ring slot, and the next iter
+                                        // would clobber what should be sym3.
+                                        unsafe {
+                                            ring_ptr.add(phys as usize).write((code & 0xFF) as u16);
+                                        }
+                                        phys = phys.wrapping_add(1);
+                                        pos += 1;
+                                        emitted += 1;
+                                        if CONTAINS_MARKERS {
+                                            distance_marker += 1;
+                                        }
+                                        symbol >>= 8;
+                                        symbol_count -= 1;
+                                        continue;
+                                    }
+
+                                    if code == END_OF_BLOCK_SYMBOL {
+                                        self.at_end_of_block = true;
+                                        commit!(Ok(emitted));
+                                    }
+                                    if u32::from(code) > MAX_LIT_LEN_SYM {
+                                        commit!(Err(BlockError::InvalidHuffmanCode));
+                                    }
+
+                                    let length = (symbol - MULTI_DISTANCE_OFFSET) as usize;
+                                    if length == 0 {
+                                        symbol >>= 8;
+                                        symbol_count -= 1;
+                                        continue;
+                                    }
+                                    let distance = match get_distance_dynamic(&dist_hc, bits) {
+                                        Ok(d) => d as usize,
+                                        Err(_) => commit!(Err(BlockError::InvalidHuffmanCode)),
+                                    };
+                                    if distance == 0 || distance > MAX_WINDOW_SIZE {
+                                        commit!(Err(BlockError::ExceededWindowRange));
+                                    }
+                                    if !CONTAINS_MARKERS && distance > self.decoded_bytes + emitted
+                                    {
+                                        commit!(Err(BlockError::ExceededWindowRange));
+                                    }
+                                    unsafe {
+                                        emit_backref_ring::<CONTAINS_MARKERS>(
+                                            ring_ptr,
+                                            &mut pos,
+                                            distance,
+                                            length,
+                                            &mut distance_marker,
+                                        );
+                                    }
+                                    phys = (pos & (RING_SIZE - 1)) as u16;
+                                    emitted += length;
+                                    if self.track_backreferences {
+                                        self.backreferences.push(Backreference {
+                                            distance: distance as u16,
+                                            length: length as u16,
+                                        });
+                                    }
                                     symbol >>= 8;
                                     symbol_count -= 1;
-                                    continue;
                                 }
-                                let distance = match get_distance_dynamic(&dist_hc, bits) {
-                                    Ok(d) => d as usize,
-                                    Err(_) => commit!(Err(BlockError::InvalidHuffmanCode)),
-                                };
-                                if distance == 0 || distance > MAX_WINDOW_SIZE {
-                                    commit!(Err(BlockError::ExceededWindowRange));
-                                }
-                                if !CONTAINS_MARKERS && distance > self.decoded_bytes + emitted {
-                                    commit!(Err(BlockError::ExceededWindowRange));
-                                }
-                                unsafe {
-                                    emit_backref_ring::<CONTAINS_MARKERS>(
-                                        ring_ptr,
-                                        &mut pos,
-                                        distance,
-                                        length,
-                                        &mut distance_marker,
-                                    );
-                                }
-                                phys = (pos & (RING_SIZE - 1)) as u16;
-                                emitted += length;
-                                if self.track_backreferences {
-                                    self.backreferences.push(Backreference {
-                                        distance: distance as u16,
-                                        length: length as u16,
-                                    });
-                                }
-                                symbol >>= 8;
-                                symbol_count -= 1;
                             }
-                        }
-                        self.ring_pos = pos;
-                        self.decoded_bytes += emitted;
-                        self.distance_to_last_marker_byte = distance_marker;
-                        Ok(emitted)
-                    }};
-                }
-                run_multi_cached_loop!()
+                            self.ring_pos = pos;
+                            self.decoded_bytes += emitted;
+                            self.distance_to_last_marker_byte = distance_marker;
+                            Ok(emitted)
+                        }};
+                    }
+                    run_multi_cached_loop!()
+                });
+                result_or_err
             }
             _ => Err(BlockError::InvalidCompression),
         }
