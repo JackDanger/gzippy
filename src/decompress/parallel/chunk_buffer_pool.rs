@@ -145,6 +145,7 @@ pub fn take_u8(min_capacity: usize) -> U8 {
     if let Ok(mut pool) = u8_pools()[idx].lock() {
         if let Some(mut v) = pool.pop() {
             TAKE_U8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            TAKE_U8_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             v.clear();
             if v.capacity() < min_capacity {
                 v.reserve(min_capacity - v.capacity());
@@ -153,6 +154,7 @@ pub fn take_u8(min_capacity: usize) -> U8 {
         }
     }
     TAKE_U8_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TAKE_U8_MISSES_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     types::u8_with_capacity(min_capacity)
 }
 
@@ -162,6 +164,7 @@ pub fn take_u16(min_capacity: usize) -> U16 {
     if let Ok(mut pool) = u16_pools()[idx].lock() {
         if let Some(mut v) = pool.pop() {
             TAKE_U16_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            TAKE_U16_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             v.clear();
             if v.capacity() < min_capacity {
                 v.reserve(min_capacity - v.capacity());
@@ -170,6 +173,7 @@ pub fn take_u16(min_capacity: usize) -> U16 {
         }
     }
     TAKE_U16_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TAKE_U16_MISSES_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     types::u16_with_capacity(min_capacity)
 }
 
@@ -180,6 +184,7 @@ pub fn return_u8_to_worker(owner_worker: usize, mut v: U8) {
     }
     RETURN_U8_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let idx = owner_worker.min(MAX_WORKERS - 1);
+    RETURN_U8_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut pool) = u8_pools()[idx].lock() {
         if pool.len() < MAX_POOLED {
             v.clear();
@@ -195,6 +200,7 @@ pub fn return_u16_to_worker(owner_worker: usize, mut v: U16) {
     }
     RETURN_U16_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let idx = owner_worker.min(MAX_WORKERS - 1);
+    RETURN_U16_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut pool) = u16_pools()[idx].lock() {
         if pool.len() < MAX_POOLED {
             v.clear();
@@ -209,6 +215,24 @@ pub static RETURN_U8_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 pub static TAKE_U16_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static TAKE_U16_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RETURN_U16_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Per-worker hit/miss/return counters. Surface the distribution
+/// across worker pool indexes — the global counters above can't
+/// distinguish "all 16 workers see 5 misses + 1 hit" (cold-start /
+/// decode-to-Drop lag) from "worker 0 sees 80 misses, others see 0"
+/// (consumer-thread-on-wrong-bucket). Different fixes for each.
+pub static TAKE_U8_HITS_BY_WORKER: [std::sync::atomic::AtomicU64; MAX_WORKERS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MAX_WORKERS];
+pub static TAKE_U8_MISSES_BY_WORKER: [std::sync::atomic::AtomicU64; MAX_WORKERS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MAX_WORKERS];
+pub static TAKE_U16_HITS_BY_WORKER: [std::sync::atomic::AtomicU64; MAX_WORKERS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MAX_WORKERS];
+pub static TAKE_U16_MISSES_BY_WORKER: [std::sync::atomic::AtomicU64; MAX_WORKERS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MAX_WORKERS];
+pub static RETURN_U8_BY_WORKER: [std::sync::atomic::AtomicU64; MAX_WORKERS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MAX_WORKERS];
+pub static RETURN_U16_BY_WORKER: [std::sync::atomic::AtomicU64; MAX_WORKERS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MAX_WORKERS];
 
 // Unit tests intentionally omitted: the pool is a process-global LIFO
 // that other tests (via `ChunkData::new`) concurrently take/return
