@@ -573,17 +573,6 @@ pub fn drive<W: std::io::Write>(
             TAKE_U16_MISSES.load(Ordering::Relaxed),
             RETURN_U16_CALLS.load(Ordering::Relaxed),
         );
-        // Z-allocator prewarm visibility (commit `774e5a1`). When
-        // `GZIPPY_PREWARM_POOL=1` is set, this should equal the number
-        // of worker threads (typically 16 on neurotic). Zero means the
-        // env-var was unset or the kill-switch cached `false` at process
-        // start — important to confirm during bench A/B before reading
-        // a "neutral wall" as falsification of the lever (it might just
-        // mean prewarm never ran).
-        eprintln!(
-            "  Worker prewarm runs: {} (GZIPPY_PREWARM_POOL=1 to enable)",
-            WORKER_PREWARM_RUNS.load(Ordering::Relaxed),
-        );
         // Per-worker distribution — disambiguates "16 workers each
         // cold-start" (first-touch dominance) vs "worker 0 is the
         // hotspot" (consumer-thread-on-wrong-bucket).
