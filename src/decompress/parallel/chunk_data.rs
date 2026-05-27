@@ -374,6 +374,15 @@ impl ChunkData {
     /// value is touched anyway); the counters are best-effort and now
     /// report total values in `non_marker_count` only.
     pub fn append_markered(&mut self, values: &[u16]) {
+        // `worker.append_markered` span — wraps the memcpy of the
+        // bootstrap's u16 marker output into the chunk's
+        // `data_with_markers`. For bootstraps that filled the whole
+        // chunk (no clean-window handoff), values can be several
+        // million u16 = 10+ MB memcpy per call.
+        let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
+            "worker.append_markered",
+            &format!(r#""len":{}"#, values.len()),
+        );
         self.statistics.non_marker_count += values.len() as u64;
         // `allocator_api2::vec::Vec::extend_from_slice` does NOT
         // specialize for `Copy` source types — it falls back to

@@ -600,6 +600,25 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     any(feature = "isal-compression", feature = "pure-rust-inflate")
 ))]
 fn absorb_isal_tail(dst: &mut ChunkData, tail: ChunkData) {
+    // `worker.absorb_isal_tail` span — wraps the merge of the
+    // ISA-L bulk-decode result into the chunk that holds the
+    // bootstrap marker prefix. Copies `tail.data` into `dst.data`,
+    // appends the tail's CRC into `dst.crc32s` via the constant-time
+    // polynomial-append path (vendor `crc32.hpp:214-258`), and
+    // merges subchunk metadata.
+    //
+    // For a typical 7.5 MB silesia chunk where most of the chunk
+    // came through ISA-L (bootstrap was small), tail.data can be
+    // several MB — large memcpy + statistics merge.
+    let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
+        "worker.absorb_isal_tail",
+        &format!(
+            r#""tail_bytes":{},"tail_crcs":{},"tail_footers":{}"#,
+            tail.data.len(),
+            tail.crc32s.len(),
+            tail.footers.len()
+        ),
+    );
     let end_bit = tail.encoded_offset_bits + tail.encoded_size_bits;
     let decoded_base = dst.decoded_size();
 

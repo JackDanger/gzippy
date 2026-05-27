@@ -115,6 +115,25 @@ fi
 # requires a separate pass. The COUNTS we need are in `coord.prefetch_emit`
 # vs `coord.prefetch_call.outcome` aggregates on both sides.)
 
+# Patch GzipChunk.hpp ISA-L stream-inflate entry points so the
+# vendor-side `worker.isal_stream_inflate` span matches gzippy's
+# (added in gzippy commit 5a614c3 in `decode_chunk_isal_impl`).
+# Two vendor entry points dispatch to ISA-L's readStream loop:
+#   (a) `finishDecodeChunkWithInexactOffset` at GzipChunk.hpp:280
+#       — the inexact-window path after speculation
+#   (b) `decodeChunkWithInflateWrapper` at GzipChunk.hpp:192
+#       — the ideal-window path when the predecessor is known
+# Wrap each with a SpanGuard at the opening brace.
+if ! grep -q 'ScopedSpan _tv2_isal("worker.isal_stream_inflate")' "$GC"; then
+    sed -i '/^    finishDecodeChunkWithInexactOffset( gzip::BitReader\* const/,/^    {/{
+        s|^    {$|    {\n        ::tracev2::ScopedSpan _tv2_isal("worker.isal_stream_inflate");|
+    }' "$GC"
+    sed -i '/^    decodeChunkWithInflateWrapper( UniqueFileReader/,/^    {/{
+        s|^    {$|    {\n        ::tracev2::ScopedSpan _tv2_isal("worker.isal_stream_inflate");|
+    }' "$GC"
+    echo "PATCHED isal_stream_inflate spans: $GC"
+fi
+
 # Patch GzipChunk.hpp speculation phases.
 # - worker.seed_first wraps `tryToDecode({blockOffset, blockOffset})` at ~line 739.
 # - worker.scan_run starts at the `const auto tBlockFinderStart = now();` site
