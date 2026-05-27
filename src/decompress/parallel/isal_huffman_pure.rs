@@ -917,7 +917,8 @@ impl IsalLitLenCodePure {
             LIT_LEN_ELEMS,
             &lit_count,
             &self.code_list[..],
-            TRIPLE_SYM_FLAG,
+            // BISECT v2: try SINGLE again now that fixed-Huffman is right
+            SINGLE_SYM_FLAG,
         );
 
         self.valid = true;
