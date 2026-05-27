@@ -573,6 +573,105 @@ mod tests {
         assert_eq!(&output[..total], &payload[..]);
     }
 
+    /// REAL-CORPUS correctness gate. Per memory rule
+    /// `feedback-real-corpus-test-with-lever`: any new inner-decoder
+    /// lever must include a silesia (or equivalent) differential test
+    /// IN THE SAME COMMIT as the lever. Synthetic round-trips
+    /// over-trust — silesia exercises real-world block diversity,
+    /// packed-pair bit patterns, length-extra encodings, dynamic
+    /// huffman header diversity, and multi-MB back-reference patterns
+    /// that fixture-only tests miss.
+    ///
+    /// This test reads silesia-large.gz IF AVAILABLE, decompresses
+    /// via flate2 (ground truth), then independently decompresses the
+    /// raw DEFLATE stream via our bulk decoder in a multi-block loop,
+    /// and asserts byte-equal output. Reads only the first single-gzip-
+    /// member portion (no multi-member handling in this stateless
+    /// decoder — caller orchestrates members in the production wiring).
+    ///
+    /// Skipped silently when silesia-large.gz isn't on the local
+    /// machine (CI without corpus). Always runs on neurotic.
+    #[test]
+    fn decode_block_byte_perfect_silesia_if_available() {
+        // Try several common locations for the silesia corpus.
+        let candidates = [
+            "benchmark_data/silesia-large.gz",
+            "benchmark_data/silesia.tar.gz",
+            "benchmark_data/silesia-gzip.tar.gz",
+        ];
+        let data = match candidates.iter().find_map(|p| std::fs::read(p).ok()) {
+            Some(d) => d,
+            None => {
+                eprintln!("[silesia bulk test] no silesia corpus available, skipping");
+                return;
+            }
+        };
+
+        // Parse gzip header to find DEFLATE start. RFC 1952 §2.2:
+        // 10-byte fixed header + optional FNAME / FCOMMENT / FEXTRA /
+        // FHCRC. We use the existing gzip_format parser.
+        let (hdr, hdr_size) =
+            crate::decompress::parallel::gzip_format::read_header(&data).expect("gzip header");
+        let _ = hdr;
+        let deflate_start = hdr_size;
+        // Footer is 8 bytes (CRC32 + ISIZE).
+        let deflate_end = data.len() - 8;
+        let deflate = &data[deflate_start..deflate_end];
+
+        // Ground truth via flate2.
+        use std::io::Read;
+        let mut gz = flate2::read::GzDecoder::new(&data[..]);
+        let mut expected = Vec::new();
+        gz.read_to_end(&mut expected).expect("flate2 decode");
+
+        // Decompress via our bulk decoder in a multi-block loop.
+        let mut output = vec![0u8; expected.len() + 4096];
+        let mut bits = Bits::new(deflate);
+        bits.refill();
+        let mut litlen = IsalLitLenCodePure::new_empty();
+        let mut dist = BulkDistDecoder::new();
+        let predecessor = [0u8; MAX_WINDOW_SIZE];
+
+        let mut total = 0;
+        loop {
+            let result = decode_block(
+                &mut bits,
+                &mut output,
+                total,
+                &predecessor[..],
+                &mut litlen,
+                &mut dist,
+            )
+            .unwrap_or_else(|e| panic!("silesia block decode failed at out_pos={total}: {e:?}"));
+            total += result.bytes_written;
+            if result.is_final_block {
+                break;
+            }
+        }
+        // Trim to actual length and compare.
+        output.truncate(total);
+        assert_eq!(
+            output.len(),
+            expected.len(),
+            "decoded length mismatch: got {}, expected {}",
+            output.len(),
+            expected.len()
+        );
+        // Compare in chunks for clearer failure reports.
+        const CHUNK: usize = 4096;
+        for i in (0..output.len()).step_by(CHUNK) {
+            let end = (i + CHUNK).min(output.len());
+            assert_eq!(
+                &output[i..end],
+                &expected[i..end],
+                "byte mismatch in chunk [{}..{}]",
+                i,
+                end
+            );
+        }
+        eprintln!("[silesia bulk test] {} bytes byte-perfect", total);
+    }
+
     /// Decode a stored (uncompressed) block.
     #[test]
     fn decode_block_round_trips_stored() {
