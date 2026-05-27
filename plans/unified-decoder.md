@@ -43,11 +43,16 @@ A pure-Rust deflate decoder that:
 - Provides a **constant-time variant** for security-sensitive use
   cases (data-dependent branches eliminated via JIT-emit
   specialization).
-- **Two-commit rollout shape.** Commit 1: new decoder ON by default;
-  legacy preserved behind `--features legacy-inflate` (build flag,
-  OFF by default) for emergency-rollback rebuild. Commit 2: pure
-  deletion of `legacy-inflate` and ~10,000 lines, conditional on
-  one-release-cycle soak with zero production rollbacks.
+- **Two-commit rollout shape with runtime kill-switch.** Commit 1:
+  new decoder ON by default; legacy compiled into the binary AND
+  reachable via runtime env-var `GZIPPY_LEGACY_INFLATE=1` for
+  sub-second ops rollback (one cold-path branch at decoder
+  construction; zero hot-loop cost). Commit 2: pure deletion of
+  the legacy decoder, the kill-switch, and ~10,000 lines,
+  conditional on one-release-cycle soak with zero production
+  rollbacks. A build-time `--no-default-features --features
+  no-legacy` exists for builders who want the slimmer commit-1
+  binary before commit 2 ships.
 
 ---
 
@@ -276,18 +281,24 @@ emit differs at the per-branch-site.
 
 Today: parallel-SM uses CPU workers across chunks.
 
-Ideal: for sufficiently large inputs (≥ 1 GiB AND ≥ 1000 blocks),
-the decoder offloads to GPU via Metal (macOS) / CUDA (Linux+NVIDIA)
-/ Vulkan compute (portable). Each block's decode is independent
-after CPU's Pass 1 (symbol scan + block-boundary index), so
-parallelism is per-block.
+Ideal: for sufficiently large inputs (compressed > 1 GiB AND
+compressed/avg-block-size estimated ≥ 1000 blocks via
+header-density heuristic — no Pass 1 scan), the decoder offloads
+to GPU via Metal (macOS) / CUDA (Linux+NVIDIA) / Vulkan compute
+(portable). Each block's decode is independent.
 
-GPU decode is non-trivial because Huffman is serial within a block.
-The approach:
-- CPU Pass 1: scan symbols, build per-block (start_bit, output_len)
-  index.
-- GPU dispatch: N workgroups, each decoding one block sequentially
-  via a single thread.
+GPU decode is non-trivial because Huffman is serial within a
+block. The approach:
+- **CPU block-boundary scan** (NOT a symbol-decode Pass 1).
+  Reads only block headers (BTYPE, HLIT, HDIST, HCLEN — fixed
+  positions, no Huffman decoding). Skips block body via the
+  block's encoded length (stored: explicit LEN; dynamic: compute
+  from code lengths). Cost: ~5 ns/B vs decoded path's ~1 ns/B,
+  but only the headers are touched — bandwidth-bound at ~10 GB/s
+  scan. Consistent with §2.4's "no Pass 1 symbol scan" since this
+  is a header-only scan, not a Huffman decode.
+- **GPU dispatch**: N workgroups, each decoding one block
+  sequentially via a single thread.
 - Throughput scales with block count, not block size.
 
 **Honest throughput numbers** (per advisor critique of v1's 30 GB/s
@@ -586,16 +597,14 @@ primitives and provide their own block-format logic.
 ### 2.22. Verified JIT cache memory bound (via dynasm page ownership)
 
 dynasm-rs owns the executable-page allocations directly (unlike
-cranelift, which wraps its `Memory` opaquely). The JIT cache is a
-ring of N executable pages (each 4 KiB on Linux/macOS arm64, 16 KiB
-on macOS x86_64). When the ring is full, the oldest page is
-unmapped via `munmap` and reused — no fragmentation, no opaque
-allocator state, bound is exact and provably 64 MiB (or whatever
-the configured N).
+The JIT cache is a ring of N executable pages (each 4 KiB on
+Linux/macOS arm64, 16 KiB on macOS x86_64). When the ring is full,
+the oldest page is unmapped via `munmap` and reused — no
+fragmentation, no opaque allocator state, bound is exact and
+provably 64 MiB (or whatever the configured N).
 
-The pass-3 critique correctly noted that cranelift's StackArena
-doesn't compose with partial reset. Switching to dynasm dissolves
-this — page ownership is direct, and the ring-buffer-of-pages
+dynasm-rs gives direct page ownership (unlike higher-level JITs
+that wrap their memory opaquely). The ring-buffer-of-pages
 allocator is a known-correct pattern (used by V8's code cache,
 LuaJIT, Wasmtime's interpreter-side patcher).
 
@@ -604,17 +613,19 @@ LuaJIT, Wasmtime's interpreter-side patcher).
 ## 3. What we delete (in the second commit, after soak)
 
 **Two-commit shape** (consistent with §1):
-- **Commit 1**: lands the new decoder ON by default. Legacy decoder
-  preserved behind a `--features legacy-inflate` build-flag, OFF by
-  default, present only as a one-release-cycle fallback for
-  emergency rollback. Production CI runs the new decoder; the
-  legacy build is verified via a single CI smoke job. Neurotic A/B
-  gate runs against commit 1 before merge.
-- **Commit 2**: ~10,000-line pure deletion of `legacy-inflate` +
-  every file in the deletion list below. Lands one release cycle
-  after commit 1 ships, conditional on a clean soak (no
-  production rollbacks, no field bug reports tied to the new
-  decoder). No design risk; commit 2 is mechanical.
+- **Commit 1**: lands the new decoder ON by default. Legacy
+  decoder is **compiled into the binary** and reachable via
+  runtime env-var `GZIPPY_LEGACY_INFLATE=1` for sub-second
+  rollback (one cold-path branch at decoder construction; zero
+  hot-loop cost). Production CI runs the new decoder; one CI
+  smoke job verifies the legacy fallback works under the env-var.
+  Neurotic A/B gate runs against commit 1 before merge.
+- **Commit 2**: ~10,000-line pure deletion of the legacy
+  decoder + the env-var dispatch + every file in the deletion
+  list below. Lands one release cycle after commit 1 ships,
+  conditional on a clean soak (no production rollbacks, no
+  field bug reports tied to the new decoder). No design risk;
+  commit 2 is mechanical.
 
 The pass-3 critique correctly identified the §1-vs-§3 contradiction
 where v3 said "two commits" in §1 but "lands and deletes in same
@@ -647,9 +658,12 @@ Deleted:
   `isal-compression`, `isal`, `pure-rust-inflate` features
 
 Replaced by:
-- `src/decompress/inflate/mod.rs` (~3,500 lines: cranelift JIT
-  emitter + interpreted fallback + perfect-hash table builder +
-  bit-reader + match-copy + Creusot annotations)
+- `src/decompress/inflate/mod.rs` (~3,500 lines: dynasm-rs JIT
+  emitter + AOT-codegen dispatch + interpreted fallback +
+  perfect-hash table builder + bit-reader + match-copy +
+  Creusot annotations)
+- `src/decompress/inflate/aot_decoders.rs` (build.rs-generated;
+  ~200 KB for ~256 fingerprints per §2.1)
 - `src/decompress/inflate/gpu.rs` (~500 lines, behind `feature =
   "gpu-decode"`)
 - `src/decompress/inflate/constant_time.rs` (~300 lines, behind
@@ -744,15 +758,19 @@ until we hit it.
 
 ## 6. Risks (with mitigations, not constraints)
 
-1. **rustc + cranelift compile time.** Risk: rustc compilation of a
-   ~4,500-line generic-heavy crate with cranelift dep takes minutes.
-   Mitigation: cranelift is mature (used by Wasmtime); incremental
-   builds are fast; cold build is paid once.
+1. **rustc compile time of AOT-generated decoders.** Risk: the
+   build.rs-emitted `aot_decoders.rs` (~256 fingerprints × ~200
+   lines = ~200 KB) adds rustc compile time. Mitigation: bounded
+   to ≤ 30s cold build add per §2.1's AOT codegen budget. dynasm
+   is a proc-macro; per-emit cost is single-digit µs at runtime,
+   not compile time.
 
 2. **JIT memory pressure under high block churn.** Risk: thousands
-   of small blocks each emit ~200 lines of JIT code; memory grows
-   without bound. Mitigation: JIT cache LRU eviction at 64 MiB cap;
-   blocks below 4 KiB output route to interpreted fallback.
+   of distinct fingerprints overflow the dynasm page ring. Mitigation:
+   dynasm page ring per §2.22 (LRU eviction at 64 MiB cap; oldest
+   page munmap'd when full). Truly cold-path fingerprints fall
+   through to the interpreted Rust loop (no minimum block size —
+   AOT covers all sizes per §2.1).
 
 3. **`Creusot` is research-grade.** Risk: verification doesn't
    compile on every rustc version; ICEs possible. Mitigation: pin
@@ -805,8 +823,8 @@ Suggested order:
 1. Build the interpreted Rust fallback decoder (`Inflate` core).
    Drop-in replacement for `ResumableInflate2`. Validates correctness
    layers.
-2. Add the cranelift-JIT path. Falls back to interpreted for blocks
-   below threshold.
+2. Add the dynasm-JIT + AOT-codegen pipeline (per §2.1).
+   Interpreted Rust loop becomes the cold-path fallback only.
 3. Add AVX-512 / NEON wide bitbuf paths.
 4. Add per-block perfect-hash table builder.
 5. Add two-pass exact-output-bound mode (`OwnedOutput`).
