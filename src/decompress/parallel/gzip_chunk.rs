@@ -1700,6 +1700,51 @@ mod tests {
         out
     }
 
+    /// REPRO: feeds a btype01-heavy L1 deflate stream through
+    /// `decode_chunk_isal` with `GZIPPY_ISAL_PURE_BULK=1` set — the
+    /// exact same shape as the production failure in
+    /// `test_marker_pipeline_runs_on_btype01_heavy_input`, but at the
+    /// chunk-decode entry point instead of the full parallel-SM
+    /// pipeline. If THIS passes but the production test still fails,
+    /// the bug is in chunk-fetcher orchestration, not the bulk impl.
+    #[test]
+    #[cfg(feature = "pure-rust-inflate")]
+    fn decode_chunk_pure_bulk_btype01_heavy_l1_full() {
+        let phrases: &[&[u8]] = &[b"abc", b"foo bar ", b"the quick brown ", b"hello ", b"xyz "];
+        let target = 12 * 1024 * 1024;
+        let mut payload = Vec::with_capacity(target);
+        let mut rng: u64 = 0xb0bd1ec0de;
+        while payload.len() < target {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if (rng >> 32) % 100 < 70 {
+                payload.push((rng >> 16) as u8);
+            } else {
+                let phrase = phrases[(rng as usize) % phrases.len()];
+                let take = phrase.len().min(target - payload.len());
+                payload.extend_from_slice(&phrase[..take]);
+            }
+        }
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(1));
+        enc.write_all(&payload).unwrap();
+        let gz = enc.finish().unwrap();
+        let (_hdr, hdr_size) =
+            crate::decompress::parallel::gzip_format::read_header(&gz).expect("gz header");
+        let deflate_stop_bits = (gz.len() - 8) * 8 - hdr_size * 8;
+        let deflate = &gz[hdr_size..gz.len() - 8];
+
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 512 * 1024,
+            max_decoded_chunk_size: 20 * 512 * 1024,
+            crc32_enabled: false,
+        };
+        // Call the bulk impl directly to bypass the OnceLock env-var check.
+        let chunk =
+            decode_chunk_pure_bulk_impl(deflate, 0, deflate_stop_bits, &[0u8; 32768][..], cfg)
+                .unwrap();
+        let flat = flatten(&chunk);
+        assert_eq!(flat, payload, "byte-perfect output");
+    }
+
     #[test]
     fn decode_chunk_isal_from_bit_0_matches_payload() {
         let payload = b"abcdefghij".repeat(200_000);
