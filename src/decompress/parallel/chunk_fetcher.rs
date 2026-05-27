@@ -1976,11 +1976,21 @@ fn speculative_decode_find_boundary(
 
     // Vendor `tryToDecode` (GzipChunk.hpp:712-841) attempts the partition
     // seed itself before walking BlockFinder candidates.
-    if let Ok(chunk) =
-        try_speculative_decode_candidate(input, start_bit, start_bit, stop_hint_bit, configuration)
+    // worker.seed_first span: wraps the seed-exact attempt; matched on
+    // the vendor side by the trace patch around
+    // `tryToDecode({ blockOffset, blockOffset })` at GzipChunk.hpp:739.
     {
-        SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Ok(chunk);
+        let _tv2 = trace_v2::SpanGuard::begin("worker.seed_first");
+        if let Ok(chunk) = try_speculative_decode_candidate(
+            input,
+            start_bit,
+            start_bit,
+            stop_hint_bit,
+            configuration,
+        ) {
+            SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(chunk);
+        }
     }
 
     COORDINATOR_BOUNDARY_SEARCH_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2001,29 +2011,42 @@ fn speculative_decode_find_boundary(
     // saved per call. For 33 slow-path chunks per single run,
     // that's ~2.3 s of CPU-time saved per iteration across all
     // workers.
+    // worker.scan_run span: the bit-by-bit scan + candidate-try loop.
+    // Matched on vendor side by the trace patch around the alternating
+    // findNextDynamic/findNextUncompressed loop at GzipChunk.hpp:803+.
+    let _tv2_scan = trace_v2::SpanGuard::begin("worker.scan_run");
     if let Some(chunk) = RawBlockFinderCoordinator::with_sync_boundary_search(
         input,
         start_bit,
         max_end,
-        |cand_bit| match try_speculative_decode_candidate(
-            input,
-            cand_bit,
-            start_bit,
-            stop_hint_bit,
-            configuration,
-        ) {
-            Ok(chunk) => {
-                SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Some(chunk)
-            }
-            Err(_) => {
-                SLOW_PATH_FIRST_CANDIDATE_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                None
+        |cand_bit| {
+            // worker.scan_candidate span: one full-decode attempt at a
+            // single bit position the scan flagged as a valid block
+            // candidate. Matched on vendor side by the trace patch
+            // around each tryToDecode call inside the alternating loop.
+            let _tv2_cand = trace_v2::SpanGuard::begin("worker.scan_candidate");
+            match try_speculative_decode_candidate(
+                input,
+                cand_bit,
+                start_bit,
+                stop_hint_bit,
+                configuration,
+            ) {
+                Ok(chunk) => {
+                    SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(chunk)
+                }
+                Err(_) => {
+                    SLOW_PATH_FIRST_CANDIDATE_FAIL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    None
+                }
             }
         },
     ) {
         return Ok(chunk);
     }
+    drop(_tv2_scan);
 
     // Near-EOF tail: when the 512 KiB scan window reaches the end of
     // the deflate stream and every BlockFinder candidate failed trial
