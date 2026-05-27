@@ -65,6 +65,17 @@ pub struct PendingMatch {
     pub length_remaining: u32,
 }
 
+/// Suspended state of a partially-emitted multi-symbol pack from the
+/// ISA-L LUT inner loop. The LUT entry's bits were already consumed
+/// when we first hit the pack; this struct carries the un-emitted
+/// suffix so the next `read_stream` call can resume mid-pack.
+#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+#[derive(Copy, Clone, Debug)]
+pub struct PendingPack {
+    pub remaining_symbol: u32,
+    pub remaining_count: u8,
+}
+
 /// Block-decode state machine position. Persists across `read_stream` calls
 /// so the decoder can resume mid-block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -226,6 +237,16 @@ pub struct ResumableInflate2<'a> {
     /// into a non-dynamic block. Invariant: `Some(_)` iff
     /// `block_state == InDynamic`.
     pub(crate) dynamic_tables: Option<(LitLenTable, DistTable)>,
+    /// Pending tail of a multi-symbol LUT pack from
+    /// `decode_huffman_body_resumable_isal`. When that loop consumes a
+    /// 2- or 3-pack entry and starts emitting literals but the output
+    /// buffer fills mid-pack, the un-emitted suffix is parked here and
+    /// the next call drains it before resuming the symbol decode.
+    /// Lifecycle: set on yield in the ISA-L inner loop, cleared at
+    /// drain, set to None on `set_window` / `reset_for_next_stream` /
+    /// `finish_current_block`. Cheap (4 bytes total).
+    #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+    pub(crate) pending_pack: Option<PendingPack>,
     /// Parallel ISA-L LUT tables for the same dynamic block. Built
     /// alongside `dynamic_tables` so the inner-Huffman migration
     /// (advisor 2026-05-27, "Option D") can drop a new inner loop
@@ -271,6 +292,8 @@ impl<'a> ResumableInflate2<'a> {
             dynamic_tables: None,
             #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
             dynamic_tables_isal: None,
+            #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+            pending_pack: None,
             pending_stream_header_stop: false,
         })
     }
@@ -288,6 +311,7 @@ impl<'a> ResumableInflate2<'a> {
         #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
         {
             self.dynamic_tables_isal = None;
+            self.pending_pack = None;
         }
         self.pending_stream_header_stop = false;
         Ok(())
@@ -399,6 +423,7 @@ impl<'a> ResumableInflate2<'a> {
         #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
         {
             self.dynamic_tables_isal = None;
+            self.pending_pack = None;
         }
         self.pending_stream_header_stop = true;
     }
@@ -731,6 +756,10 @@ impl<'a> ResumableInflate2<'a> {
         #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
         {
             self.dynamic_tables_isal = None;
+            // pending_pack is always None at EOB — the ISA-L inner
+            // returns BEFORE finishing a block when there's a partial
+            // pack to drain. Defensive reset.
+            self.pending_pack = None;
         }
         if self.last_bfinal {
             // Per RFC 1952 the gzip footer is byte-aligned; the encoder
@@ -1433,77 +1462,60 @@ fn decode_huffman_body_resumable_isal(
     const MAX_LIT_LEN_SYM: u32 = 512;
 
     loop {
-        // Yield check: if output full, the caller will resume here with
-        // a fresh buffer.
-        if out_pos >= output.len() {
-            return Ok(out_pos);
-        }
+        // Drain any pending pack tail from a prior yield BEFORE
+        // touching the bit reader. Per Option-A-minimal contract:
+        // `pending_pack` holds the un-emitted suffix of a previously-
+        // decoded multi-symbol LUT entry whose bits were already
+        // consumed. Resume the inner sym-loop where it left off.
+        let (mut symbol, mut remaining) = if let Some(pp) = state.pending_pack.take() {
+            (pp.remaining_symbol, pp.remaining_count)
+        } else {
+            // Yield check (top of fresh iteration): if output full, the
+            // caller will resume here with a fresh buffer.
+            if out_pos >= output.len() {
+                return Ok(out_pos);
+            }
 
-        // encoded_until_bits guard: prevents reading past the chunk's
-        // assigned bit range. Mirrors the libdeflate variant's
-        // semantics.
-        if state.bits.bit_position() >= state.encoded_until_bits {
-            return Ok(out_pos);
-        }
+            // encoded_until_bits guard: prevents reading past the chunk's
+            // assigned bit range. Mirrors the libdeflate variant.
+            if state.bits.bit_position() >= state.encoded_until_bits {
+                return Ok(out_pos);
+            }
 
-        // Always refill at the top of the loop — same pattern as the
-        // standalone bulk decoder (`isal_lut_bulk::decode_block`) which
-        // is silesia byte-perfect on 162 MB. The conditional refill
-        // inside `IsalLitLenCodePure::decode` is insufficient when
-        // running inside ResumableInflate2's outer machinery: header
-        // parsing leaves bits.bitsleft in states that the conditional
-        // doesn't reliably catch.
-        state.bits.refill();
+            // Always refill at the top of the loop — same pattern as the
+            // standalone bulk decoder (silesia byte-perfect on 162 MB).
+            state.bits.refill();
 
-        let _diag_bit_pos = state.bits.bit_position();
-        let _diag_bitbuf = state.bits.bitbuf;
-        let _diag_bitsleft = state.bits.bitsleft;
-
-        // ISA-L LUT lookup: decodes up to 3 packed symbols in ONE
-        // table access. bit_count is the bits consumed for ALL packed
-        // symbols (codeword + any length-extras if the entry is a
-        // pre-expanded length).
-        let decoded = litlen.decode(&mut state.bits);
-        if std::env::var_os("GZIPPY_ISAL_INNER_DIAG").is_some() && out_pos < 200 {
-            eprintln!(
-                "[isal-inner] iter out_pos={out_pos} bit_pos={_diag_bit_pos} bitbuf=0x{_diag_bitbuf:016x} bitsleft={_diag_bitsleft} -> bit_count={} sym_count={} symbol={}",
-                decoded.bit_count, decoded.sym_count, decoded.symbol
-            );
-        }
-        if decoded.bit_count == 0 || decoded.sym_count == 0 {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "ISA-L litlen: zero bit_count or sym_count (invalid Huffman code)",
-            ));
-        }
-
-        state.bits.consume(decoded.bit_count);
-
-        let mut symbol = decoded.symbol;
-        let mut remaining = decoded.sym_count;
+            // ISA-L LUT lookup: decodes up to 3 packed symbols in ONE
+            // table access. bit_count is the bits consumed for ALL packed
+            // symbols.
+            let decoded = litlen.decode(&mut state.bits);
+            if decoded.bit_count == 0 || decoded.sym_count == 0 {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "ISA-L litlen: zero bit_count or sym_count (invalid Huffman code)",
+                ));
+            }
+            state.bits.consume(decoded.bit_count);
+            (decoded.symbol, decoded.sym_count)
+        };
 
         while remaining > 0 {
             let code = symbol & 0xFFFF;
 
-            // Literal path: either standalone literal (sym_count=1, code≤255)
-            // OR all but the last element of a pack (sym_count>1, any code —
-            // the leading elements MUST be literals per LUT builder).
+            // Literal path: either standalone literal (remaining=1, code≤255)
+            // OR all but the last element of a pack (remaining>1).
             if code <= 255 || remaining > 1 {
-                // The pre-loop yield check ensures out_pos < output.len()
-                // at entry; literal emits 1 byte. For multi-pack the
-                // bits are already consumed; if room runs out mid-pack
-                // we'd be stuck. In practice production buffers are
-                // ≥ 128 KiB and the worst-case 3-byte literal pack
-                // (or 2-byte literal pack + 258-byte match) fits.
-                // If it doesn't fit, that's a programmer error — surface
-                // it loudly rather than silently truncate (advisor D4).
+                // Mid-pack output overflow: park the un-emitted suffix on
+                // state.pending_pack and yield. Next call drains it
+                // before the next LUT lookup. This is the Option-A-minimal
+                // yield mechanism (advisor 2026-05-27).
                 if out_pos >= output.len() {
-                    return Err(Error::new(
-                        ErrorKind::WriteZero,
-                        "ISA-L inner: output buffer too small for multi-pack literal — \
-                         output.len must be ≥ 261 bytes to safely yield after \
-                         consuming the LUT entry's bits",
-                    ));
+                    state.pending_pack = Some(PendingPack {
+                        remaining_symbol: symbol,
+                        remaining_count: remaining,
+                    });
+                    return Ok(out_pos);
                 }
                 output[out_pos] = (code & 0xFF) as u8;
                 out_pos += 1;
