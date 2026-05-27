@@ -1464,7 +1464,7 @@ fn decode_huffman_body_resumable_isal(
         // symbols (codeword + any length-extras if the entry is a
         // pre-expanded length).
         let decoded = litlen.decode(&mut state.bits);
-        if std::env::var_os("GZIPPY_ISAL_INNER_DIAG").is_some() && out_pos < 40 {
+        if std::env::var_os("GZIPPY_ISAL_INNER_DIAG").is_some() && out_pos < 200 {
             eprintln!(
                 "[isal-inner] iter out_pos={out_pos} bit_pos={_diag_bit_pos} bitbuf=0x{_diag_bitbuf:016x} bitsleft={_diag_bitsleft} -> bit_count={} sym_count={} symbol={}",
                 decoded.bit_count, decoded.sym_count, decoded.symbol
@@ -1567,6 +1567,11 @@ fn decode_huffman_body_resumable_isal(
             0
         };
         let distance = DIST_START[dist_sym as usize] + extra_val;
+        if std::env::var_os("GZIPPY_ISAL_INNER_DIAG").is_some() && out_pos < 200 {
+            eprintln!(
+                "[isal-inner]   match len={length} dist_sym={dist_sym} extra_bits={extra_bits} extra_val={extra_val} distance={distance}"
+            );
+        }
         if distance == 0 || distance > 32768 {
             return Err(Error::new(
                 ErrorKind::InvalidData,
