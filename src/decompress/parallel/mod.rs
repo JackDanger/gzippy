@@ -71,6 +71,11 @@ pub mod isal_huffman;
     any(feature = "isal-compression", feature = "pure-rust-inflate")
 ))]
 pub mod isal_huffman_pure;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "isal-compression", feature = "pure-rust-inflate")
+))]
+pub mod isal_lut_bulk;
 pub mod prefetcher;
 #[cfg(all(
     target_arch = "x86_64",
