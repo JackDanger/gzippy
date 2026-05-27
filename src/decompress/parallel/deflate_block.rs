@@ -1315,9 +1315,7 @@ impl Block {
             }
             CompressionType::DynamicHuffman => {
                 use crate::decompress::parallel::gzip_definitions::END_OF_BLOCK_SYMBOL;
-                use crate::decompress::parallel::isal_huffman_pure::{
-                    IsalLitLenCodePure, INVALID_SYMBOL,
-                };
+                use crate::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure;
                 use crate::decompress::parallel::rfc_tables::get_distance_dynamic;
 
                 // ISA-L's length-symbol encoding: post-expansion symbols
@@ -1383,11 +1381,17 @@ impl Block {
 
                             while emitted < n_max_to_decode {
                                 let decoded = litlen_hc.decode(bits);
-                                // IsalLitLenCodePure returns bit_count=0 with
-                                // symbol=INVALID_SYMBOL on invalid lookup. Consume
-                                // bits BEFORE dispatching on symbol — vendor
-                                // `seekAfterPeek` at HuffmanCodingISAL.hpp:143.
-                                if decoded.bit_count == 0 || decoded.symbol == INVALID_SYMBOL {
+                                // Check ONLY bit_count == 0 for invalid lookup,
+                                // matching the ISA-L hot path at
+                                // deflate_block.rs:1020. The earlier
+                                // `decoded.symbol == INVALID_SYMBOL` check was
+                                // WRONG: for packed pairs where sym1=0xFF and
+                                // sym2=0x1F (a valid 2-byte literal pair),
+                                // symbol packs to 0xFF | (0x1F << 8) = 0x1FFF,
+                                // which equals INVALID_SYMBOL. ISA-L signals
+                                // invalid via bit_count=0 ALONE; the symbol
+                                // field is don't-care when invalid.
+                                if decoded.bit_count == 0 {
                                     commit!(Err(BlockError::InvalidHuffmanCode));
                                 }
                                 bits.consume(decoded.bit_count);
