@@ -359,29 +359,23 @@ bench-sm-pure-rust: ship-precheck
 	  SLG=\$$BD/silesia-large.gz; \
 	  THREADS=\$$(nproc); \
 	  echo ''; \
-	  echo '=== A: gzippy-isal (current production, ISA-L FFI) ==='; \
-	  for trial in 1 2 3 4 5; do \
-	    /usr/bin/time -f '%e sec' \"\$$BDIR/gzippy-isal\" -d -c -p \"\$$THREADS\" \"\$$SLG\" > /dev/null 2>>/tmp/bench-isal.times; \
-	  done; \
-	  cat /tmp/bench-isal.times; \
-	  echo ''; \
-	  echo '=== B: gzippy-purerust (this branch, ResumableInflate2) ==='; \
-	  rm -f /tmp/bench-purerust.times; \
-	  for trial in 1 2 3 4 5; do \
-	    /usr/bin/time -f '%e sec' \"\$$BDIR/gzippy-purerust\" -d -c -p \"\$$THREADS\" \"\$$SLG\" > /dev/null 2>>/tmp/bench-purerust.times; \
-	  done; \
-	  cat /tmp/bench-purerust.times; \
-	  echo ''; \
-	  echo '=== C: rapidgzip (reference) ==='; \
-	  rm -f /tmp/bench-rapidgzip.times; \
-	  for trial in 1 2 3 4 5; do \
-	    /usr/bin/time -f '%e sec' \"\$$BDIR/rapidgzip\" -d -P \"\$$THREADS\" -c \"\$$SLG\" > /dev/null 2>>/tmp/bench-rapidgzip.times; \
-	  done; \
-	  cat /tmp/bench-rapidgzip.times; \
-	  echo ''; \
-	  echo 'Input: silesia-large.gz (503 MB raw, gzip -9)'; \
-	  echo 'Three best-of-5 results above — compute MB/s = 503 / time.'; \
-	  rm -f /tmp/bench-isal.times /tmp/bench-purerust.times /tmp/bench-rapidgzip.times"
+	  bench_one() { \
+	    local label=\"\$$1\" bin=\"\$$2\" args=\"\$$3\"; \
+	    echo \"=== \$$label ===\"; \
+	    for trial in 1 2 3 4 5; do \
+	      local t0=\$$(date +%s.%N); \
+	      \"\$$bin\" \$$args > /dev/null; \
+	      local t1=\$$(date +%s.%N); \
+	      local elapsed=\$$(awk \"BEGIN{printf \\\"%.3f\\\", \$$t1 - \$$t0}\"); \
+	      local mbps=\$$(awk \"BEGIN{printf \\\"%.0f\\\", 503.6 / \$$elapsed}\"); \
+	      echo \"  trial \$$trial: \$${elapsed}s = \$${mbps} MB/s\"; \
+	    done; \
+	    echo ''; \
+	  }; \
+	  bench_one 'A: gzippy-isal (current production, ISA-L FFI)' \"\$$BDIR/gzippy-isal\" \"-d -c -p \$$THREADS \$$SLG\"; \
+	  bench_one 'B: gzippy-purerust (this branch, ResumableInflate2)' \"\$$BDIR/gzippy-purerust\" \"-d -c -p \$$THREADS \$$SLG\"; \
+	  bench_one 'C: rapidgzip (reference)' \"\$$BDIR/rapidgzip\" \"-d -P \$$THREADS -c \$$SLG\"; \
+	  echo 'Input: silesia-large.gz (503.6 MB raw, gzip -9)'"
 	@echo ""
 	@echo "✓ bench-sm-pure-rust complete on branch $$(git rev-parse --abbrev-ref HEAD)"
 
