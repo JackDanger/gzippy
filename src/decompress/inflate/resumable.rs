@@ -1735,8 +1735,142 @@ fn decode_huffman_body_resumable_isal(
             .min(cap_byte_floor);
         let out_fl_end = output_len.saturating_sub(FASTLOOP_MARGIN);
         if state.pending_pack.is_none() && in_pos < in_fl_end && out_pos < out_fl_end {
+            // FASTLOOP with B2 PRELOAD: peek the NEXT iter's LUT entry
+            // at the END of each iter so its memory-load latency
+            // overlaps with the literal/match write of the CURRENT iter.
+            // The cached values are used at the top of the next iter
+            // (skipping the lookup). On exit from FASTLOOP, we discard
+            // the cached values — the SAFELOOP re-decodes from bitbuf.
+            //
+            // CORRECTNESS: bit_count/sym_count/sym depend only on bitbuf
+            // state. After consume, bitbuf is shifted; the peek for the
+            // next entry sees the new low-12 bits. Refill at end if
+            // bitsleft fell below REFILL_THRESHOLD. On any yield (mid-pack
+            // pending_pack, match copy overflow), the cached values
+            // are discarded (loop breaks via `break;` after decode_one_iter!
+            // detects state.pending_pack.is_some()).
+            //
+            // We hoist the initial PRELOAD here (outside the while) so
+            // the first iter's lookup happens before the loop entry.
+            if (bitsleft as u8) < REFILL_THRESHOLD {
+                refill_local!();
+            }
+            let (mut cached_bc, mut cached_sc, mut cached_s) = decode_litlen_local!();
             while state.pending_pack.is_none() && in_pos < in_fl_end && out_pos < out_fl_end {
-                decode_one_iter!();
+                // Process the CACHED entry (do not re-decode).
+                if cached_bc == 0 || cached_sc == 0 {
+                    writeback_bits!();
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "ISA-L litlen: zero bit_count or sym_count (invalid Huffman code)",
+                    ));
+                }
+                bitbuf >>= cached_bc;
+                bitsleft = bitsleft.wrapping_sub(cached_bc);
+                let mut symbol = cached_s;
+                let mut remaining = cached_sc;
+
+                while remaining > 0 {
+                    let code = symbol & 0xFFFF;
+
+                    if code <= 255 || remaining > 1 {
+                        if out_pos >= output_len {
+                            state.pending_pack = Some(PendingPack {
+                                remaining_symbol: symbol,
+                                remaining_count: remaining,
+                            });
+                            writeback_bits!();
+                            return Ok(out_pos);
+                        }
+                        unsafe {
+                            output_ptr.add(out_pos).write((code & 0xFF) as u8);
+                        }
+                        out_pos += 1;
+                        symbol >>= 8;
+                        remaining -= 1;
+                        continue;
+                    }
+
+                    if code == 256 {
+                        writeback_bits!();
+                        state.finish_current_block();
+                        return Ok(out_pos);
+                    }
+
+                    if code > MAX_LIT_LEN_SYM {
+                        writeback_bits!();
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "ISA-L litlen: symbol out of range",
+                        ));
+                    }
+
+                    let length = (code - LENGTH_BASE_OFFSET) as u32;
+                    if length == 0 || length > 258 {
+                        writeback_bits!();
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "ISA-L litlen: invalid length value",
+                        ));
+                    }
+
+                    let dist_sym = match decode_dist_local!() {
+                        Some(s) => s as u32,
+                        None => {
+                            writeback_bits!();
+                            return Err(Error::new(
+                                ErrorKind::InvalidData,
+                                "ISA-L dist: invalid code",
+                            ));
+                        }
+                    };
+                    if dist_sym >= 30 {
+                        writeback_bits!();
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "ISA-L dist: symbol out of range (>= 30)",
+                        ));
+                    }
+                    if (bitsleft as u8) < 14 {
+                        refill_local!();
+                    }
+                    let extra_bits = DIST_EXTRA_BIT_COUNT[dist_sym as usize];
+                    let extra_val = if extra_bits > 0 {
+                        let v = (bitbuf & ((1u64 << extra_bits) - 1)) as u32;
+                        bitbuf >>= extra_bits;
+                        bitsleft = bitsleft.wrapping_sub(extra_bits as u32);
+                        v
+                    } else {
+                        0
+                    };
+                    let distance = DIST_START[dist_sym as usize] + extra_val;
+                    if distance == 0 || distance > 32768 {
+                        writeback_bits!();
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "ISA-L dist: distance out of range",
+                        ));
+                    }
+
+                    writeback_bits!();
+                    out_pos = copy_match_windowed(state, output, out_pos, distance, length)?;
+                    bitbuf = state.bits.bitbuf;
+                    bitsleft = state.bits.bitsleft;
+                    in_pos = state.bits.pos;
+
+                    remaining = 0;
+                }
+
+                // PRELOAD next iter's entry. Lookup latency overlaps
+                // with literal/match writes the OOO engine is still
+                // retiring from this iter's emit work.
+                if (bitsleft as u8) < REFILL_THRESHOLD {
+                    refill_local!();
+                }
+                let (bc, sc, s) = decode_litlen_local!();
+                cached_bc = bc;
+                cached_sc = sc;
+                cached_s = s;
             }
             continue;
         }
