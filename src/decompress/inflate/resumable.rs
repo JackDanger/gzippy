@@ -1445,146 +1445,16 @@ fn decode_huffman_body_resumable_isal(
     litlen: &crate::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure,
     dist: &crate::decompress::parallel::isal_lut_bulk::BulkDistDecoder,
 ) -> Result<usize> {
-    use crate::decompress::parallel::huffman_base::LsbBitReader as _;
     use crate::decompress::parallel::isal_huffman_pure::{
         LARGE_FLAG_BIT, LARGE_LONG_CODE_LEN_OFFSET, LARGE_LONG_SYM_MASK,
         LARGE_SHORT_CODE_LEN_OFFSET, LARGE_SHORT_MAX_LEN_OFFSET, LARGE_SHORT_SYM_MASK,
         LARGE_SYM_COUNT_MASK, LARGE_SYM_COUNT_OFFSET,
     };
 
-    // Per-iteration write-back of bits state — required because
-    // IsalLitLenCodePure::decode takes &mut Bits (not raw locals).
-    // The hot loop here is the correctness baseline; perf-equivalent
-    // local-promotion mirroring decode_huffman_body_resumable's
-    // bitbuf/bitsleft/in_pos locals is a follow-up.
-
     const LENGTH_BASE_OFFSET: u32 = 254;
     const MAX_LIT_LEN_SYM: u32 = 512;
-
-    loop {
-        // Drain any pending pack tail from a prior yield BEFORE
-        // touching the bit reader. Per Option-A-minimal contract:
-        // `pending_pack` holds the un-emitted suffix of a previously-
-        // decoded multi-symbol LUT entry whose bits were already
-        // consumed. Resume the inner sym-loop where it left off.
-        let (mut symbol, mut remaining) = if let Some(pp) = state.pending_pack.take() {
-            (pp.remaining_symbol, pp.remaining_count)
-        } else {
-            // Yield check (top of fresh iteration): if output full, the
-            // caller will resume here with a fresh buffer.
-            if out_pos >= output.len() {
-                return Ok(out_pos);
-            }
-
-            // encoded_until_bits guard: prevents reading past the chunk's
-            // assigned bit range. Mirrors the libdeflate variant.
-            if state.bits.bit_position() >= state.encoded_until_bits {
-                return Ok(out_pos);
-            }
-
-            // Always refill at the top of the loop — same pattern as the
-            // standalone bulk decoder (silesia byte-perfect on 162 MB).
-            state.bits.refill();
-
-            // ISA-L LUT lookup: decodes up to 3 packed symbols in ONE
-            // table access. bit_count is the bits consumed for ALL packed
-            // symbols.
-            let decoded = litlen.decode(&mut state.bits);
-            if decoded.bit_count == 0 || decoded.sym_count == 0 {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "ISA-L litlen: zero bit_count or sym_count (invalid Huffman code)",
-                ));
-            }
-            state.bits.consume(decoded.bit_count);
-            (decoded.symbol, decoded.sym_count)
-        };
-
-        while remaining > 0 {
-            let code = symbol & 0xFFFF;
-
-            // Literal path: either standalone literal (remaining=1, code≤255)
-            // OR all but the last element of a pack (remaining>1).
-            if code <= 255 || remaining > 1 {
-                // Mid-pack output overflow: park the un-emitted suffix on
-                // state.pending_pack and yield. Next call drains it
-                // before the next LUT lookup. This is the Option-A-minimal
-                // yield mechanism (advisor 2026-05-27).
-                if out_pos >= output.len() {
-                    state.pending_pack = Some(PendingPack {
-                        remaining_symbol: symbol,
-                        remaining_count: remaining,
-                    });
-                    return Ok(out_pos);
-                }
-                output[out_pos] = (code & 0xFF) as u8;
-                out_pos += 1;
-                symbol >>= 8;
-                remaining -= 1;
-                continue;
-            }
-
-            if code == 256 {
-                // EOB (must be sym_count=1 — multi-pack entries never
-                // contain EOB).
-                state.finish_current_block();
-                return Ok(out_pos);
-            }
-
-            if code > MAX_LIT_LEN_SYM {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "ISA-L litlen: symbol out of range",
-                ));
-            }
-
-            // Length code (last element of pack OR sym_count=1).
-            let length = (code - LENGTH_BASE_OFFSET) as u32;
-            if length == 0 || length > 258 {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "ISA-L litlen: invalid length value",
-                ));
-            }
-
-            // Length-code path is handled below the loop.
-            // Break out and run dist-decode + match-copy with `length`.
-            // `remaining` is set to 0 to exit the symbol iteration.
-            remaining = 0;
-            decode_length_match(state, output, &mut out_pos, length, dist)?;
-        }
-
-        continue;
-    }
-}
-
-/// Per-match handler used by the ISA-L inner loop: decode dist symbol +
-/// extras, then issue `copy_match_windowed`. Factored out because the
-/// match path needs the same logic whether the length came from a 1-sym
-/// entry or the trailing element of a multi-pack.
-#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
-fn decode_length_match(
-    state: &mut ResumableInflate2<'_>,
-    output: &mut [u8],
-    out_pos: &mut usize,
-    length: u32,
-    dist: &crate::decompress::parallel::isal_lut_bulk::BulkDistDecoder,
-) -> Result<()> {
-    use crate::decompress::parallel::huffman_base::LsbBitReader as _;
-
-    let dist_sym = dist
-        .decode(&mut state.bits)
-        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "ISA-L dist: invalid code"))?
-        as u32;
-    if dist_sym >= 30 {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "ISA-L dist: symbol out of range (>= 30)",
-        ));
-    }
-    if state.bits.available() < 14 {
-        state.bits.refill();
-    }
+    const REFILL_THRESHOLD: u8 = 48;
+    const ISAL_DECODE_LONG_BITS: u32 = 12;
     const DIST_EXTRA_BIT_COUNT: [u8; 32] = [
         0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12,
         13, 13, 0, 0,
@@ -1593,24 +1463,280 @@ fn decode_length_match(
         1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
         2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577, 0, 0,
     ];
-    let extra_bits = DIST_EXTRA_BIT_COUNT[dist_sym as usize];
-    let extra_val = if extra_bits > 0 {
-        let v = (state.bits.bitbuf & ((1u64 << extra_bits) - 1)) as u32;
-        state.bits.consume(extra_bits as u32);
-        v
-    } else {
-        0
-    };
-    let distance = DIST_START[dist_sym as usize] + extra_val;
-    if distance == 0 || distance > 32768 {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "ISA-L dist: distance out of range",
-        ));
+
+    // Lever B1: bits-locals. Lift bits state into stack locals so LLVM
+    // can register-promote across iterations. Vendor counterpart:
+    // `decode_huffman_body_resumable` line ~900. Without this, every
+    // bits-access through `&mut state` re-reads from memory because the
+    // compiler can't prove `output[i] = ...` doesn't alias `state.bits`.
+    let mut bitbuf: u64 = state.bits.bitbuf;
+    let mut bitsleft: u32 = state.bits.bitsleft;
+    let mut in_pos: usize = state.bits.pos;
+    let in_data: &[u8] = state.bits.data;
+    let in_data_len: usize = in_data.len();
+    let in_data_ptr: *const u8 = in_data.as_ptr();
+    let encoded_until_bits: usize = state.encoded_until_bits;
+    let output_ptr: *mut u8 = output.as_mut_ptr();
+    let output_len: usize = output.len();
+
+    macro_rules! refill_local {
+        () => {{
+            let mut bits_u8 = bitsleft as u8;
+            if bits_u8 > 64 {
+                bitbuf = 0;
+                bits_u8 = 0;
+            }
+            if in_pos + 8 <= in_data_len {
+                let word = unsafe { (in_data_ptr.add(in_pos) as *const u64).read_unaligned() };
+                let word = u64::from_le(word);
+                bitbuf |= word << bits_u8;
+                in_pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
+                bitsleft = (bits_u8 as u32) | 56;
+            } else {
+                let mut b = bits_u8;
+                while b <= 56 && in_pos < in_data_len {
+                    bitbuf |= (in_data[in_pos] as u64) << b;
+                    in_pos += 1;
+                    b = b.wrapping_add(8);
+                }
+                bitsleft = b as u32;
+            }
+        }};
     }
-    *out_pos = copy_match_windowed(state, output, *out_pos, distance, length)?;
-    Ok(())
+
+    macro_rules! writeback_bits {
+        () => {{
+            state.bits.bitbuf = bitbuf;
+            state.bits.bitsleft = bitsleft;
+            state.bits.pos = in_pos;
+        }};
+    }
+
+    #[inline(always)]
+    fn bit_position_of(bitsleft: u32, in_pos: usize) -> usize {
+        let unread = (bitsleft as u8).min(64) as usize;
+        in_pos.saturating_mul(8).saturating_sub(unread)
+    }
+
+    // Inlined ISA-L litlen LUT decode using bits-locals. Mirrors
+    // IsalLitLenCodePure::decode (isal_huffman_pure.rs:933-976) but
+    // operates directly on `bitbuf` without going through &mut Bits.
+    // Returns (bit_count, sym_count, symbol).
+    macro_rules! decode_litlen_local {
+        () => {{
+            let next_bits = bitbuf;
+            let next_12_bits = (next_bits & ((1u64 << ISAL_DECODE_LONG_BITS) - 1)) as usize;
+            let mut next_sym = litlen.table.short_code_lookup[next_12_bits];
+            if (next_sym & LARGE_FLAG_BIT) == 0 {
+                let bit_count = next_sym >> LARGE_SHORT_CODE_LEN_OFFSET;
+                let symbol = next_sym & LARGE_SHORT_SYM_MASK;
+                let sym_count = (next_sym >> LARGE_SYM_COUNT_OFFSET) & LARGE_SYM_COUNT_MASK;
+                (bit_count, sym_count, symbol)
+            } else {
+                let long_max_len = next_sym >> LARGE_SHORT_MAX_LEN_OFFSET;
+                let used_bits = if long_max_len <= 32 {
+                    next_bits & ((1u64 << long_max_len) - 1)
+                } else {
+                    next_bits
+                };
+                let long_idx = ((next_sym & LARGE_SHORT_SYM_MASK)
+                    + ((used_bits >> ISAL_DECODE_LONG_BITS) as u32))
+                    as usize;
+                next_sym = litlen.table.long_code_lookup[long_idx] as u32;
+                let bit_count = next_sym >> LARGE_LONG_CODE_LEN_OFFSET;
+                let symbol = next_sym & LARGE_LONG_SYM_MASK;
+                (bit_count, 1u32, symbol)
+            }
+        }};
+    }
+
+    // Inlined dist decode using bits-locals. Mirrors
+    // HuffmanCodingReversedBitsCached::decode (huffman_reversed_bits_cached.rs:90-106).
+    // Returns Some(symbol) or None on invalid.
+    macro_rules! decode_dist_local {
+        () => {{
+            let max_len = dist.max_code_length();
+            if (bitsleft as u8) < max_len {
+                refill_local!();
+                if (bitsleft as u8) < max_len {
+                    None
+                } else {
+                    let mask = (1u64 << max_len) - 1;
+                    let value = (bitbuf & mask) as usize;
+                    let (length, symbol) = dist.code_cache()[value];
+                    if length == 0 {
+                        // Rare slow-path: writeback and fall through to
+                        // the full HuffmanCodingSymbolsPerLength::decode.
+                        // Acceptable correctness for now (silesia rarely
+                        // hits this).
+                        writeback_bits!();
+                        use crate::decompress::parallel::huffman_base::LsbBitReader as _;
+                        let s = dist.decode(&mut state.bits);
+                        bitbuf = state.bits.bitbuf;
+                        bitsleft = state.bits.bitsleft;
+                        in_pos = state.bits.pos;
+                        s
+                    } else {
+                        bitbuf >>= length;
+                        bitsleft = bitsleft.wrapping_sub(length as u32);
+                        Some(symbol)
+                    }
+                }
+            } else {
+                let mask = (1u64 << max_len) - 1;
+                let value = (bitbuf & mask) as usize;
+                let (length, symbol) = dist.code_cache()[value];
+                if length == 0 {
+                    writeback_bits!();
+                    use crate::decompress::parallel::huffman_base::LsbBitReader as _;
+                    let s = dist.decode(&mut state.bits);
+                    bitbuf = state.bits.bitbuf;
+                    bitsleft = state.bits.bitsleft;
+                    in_pos = state.bits.pos;
+                    s
+                } else {
+                    bitbuf >>= length;
+                    bitsleft = bitsleft.wrapping_sub(length as u32);
+                    Some(symbol)
+                }
+            }
+        }};
+    }
+
+    loop {
+        // Drain pending pack tail FIRST (no bits operations needed).
+        let (mut symbol, mut remaining) = if let Some(pp) = state.pending_pack.take() {
+            (pp.remaining_symbol, pp.remaining_count)
+        } else {
+            // Yield checks
+            if out_pos >= output_len {
+                writeback_bits!();
+                return Ok(out_pos);
+            }
+            if bit_position_of(bitsleft, in_pos) >= encoded_until_bits {
+                writeback_bits!();
+                return Ok(out_pos);
+            }
+
+            if (bitsleft as u8) < REFILL_THRESHOLD {
+                refill_local!();
+            }
+
+            let (bit_count, sym_count, sym) = decode_litlen_local!();
+            if bit_count == 0 || sym_count == 0 {
+                writeback_bits!();
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "ISA-L litlen: zero bit_count or sym_count (invalid Huffman code)",
+                ));
+            }
+            bitbuf >>= bit_count;
+            bitsleft = bitsleft.wrapping_sub(bit_count);
+            (sym, sym_count)
+        };
+
+        while remaining > 0 {
+            let code = symbol & 0xFFFF;
+
+            if code <= 255 || remaining > 1 {
+                if out_pos >= output_len {
+                    state.pending_pack = Some(PendingPack {
+                        remaining_symbol: symbol,
+                        remaining_count: remaining,
+                    });
+                    writeback_bits!();
+                    return Ok(out_pos);
+                }
+                // Lever T0: raw-pointer literal write avoids slice bounds check.
+                unsafe {
+                    output_ptr.add(out_pos).write((code & 0xFF) as u8);
+                }
+                out_pos += 1;
+                symbol >>= 8;
+                remaining -= 1;
+                continue;
+            }
+
+            if code == 256 {
+                writeback_bits!();
+                state.finish_current_block();
+                return Ok(out_pos);
+            }
+
+            if code > MAX_LIT_LEN_SYM {
+                writeback_bits!();
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "ISA-L litlen: symbol out of range",
+                ));
+            }
+
+            // Length code: decode dist + match copy.
+            let length = (code - LENGTH_BASE_OFFSET) as u32;
+            if length == 0 || length > 258 {
+                writeback_bits!();
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "ISA-L litlen: invalid length value",
+                ));
+            }
+
+            let dist_sym = match decode_dist_local!() {
+                Some(s) => s as u32,
+                None => {
+                    writeback_bits!();
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "ISA-L dist: invalid code",
+                    ));
+                }
+            };
+            if dist_sym >= 30 {
+                writeback_bits!();
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "ISA-L dist: symbol out of range (>= 30)",
+                ));
+            }
+            if (bitsleft as u8) < 14 {
+                refill_local!();
+            }
+            let extra_bits = DIST_EXTRA_BIT_COUNT[dist_sym as usize];
+            let extra_val = if extra_bits > 0 {
+                let v = (bitbuf & ((1u64 << extra_bits) - 1)) as u32;
+                bitbuf >>= extra_bits;
+                bitsleft = bitsleft.wrapping_sub(extra_bits as u32);
+                v
+            } else {
+                0
+            };
+            let distance = DIST_START[dist_sym as usize] + extra_val;
+            if distance == 0 || distance > 32768 {
+                writeback_bits!();
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "ISA-L dist: distance out of range",
+                ));
+            }
+
+            // Match copy via the existing window-stitched helper.
+            // copy_match_windowed wants state.bits valid (it reads
+            // state.window only, but state is borrowed mutably).
+            writeback_bits!();
+            out_pos = copy_match_windowed(state, output, out_pos, distance, length)?;
+            // Re-lift bits state after the call (state.bits unchanged
+            // by copy_match_windowed but the locals went stale).
+            bitbuf = state.bits.bitbuf;
+            bitsleft = state.bits.bitsleft;
+            in_pos = state.bits.pos;
+
+            remaining = 0;
+        }
+    }
 }
+
+// (decode_length_match removed — replaced by inlined match handling in
+// decode_huffman_body_resumable_isal with bits-locals per B1 lever.)
 
 /// Parse a dynamic-Huffman block header atomically and return the built
 /// litlen + distance tables. Mirror of the header-parse portion of the
