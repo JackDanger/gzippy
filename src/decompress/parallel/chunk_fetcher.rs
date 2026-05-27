@@ -1675,6 +1675,27 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
     }
     let apply_us = t_apply.elapsed().as_micros();
     let _ = t_narrow;
+    // Downclock-hypothesis probe (one-shot test, NOT a perf change).
+    // Set `GZIPPY_NARROW_INJECT=1` to call `narrow_u16_to_u8` on a
+    // small persistent scratch buffer right before
+    // `populate_subchunk_windows`. This injects the AVX-256 instruction
+    // stream every post-process task — including fused-path tasks
+    // that don't otherwise call `narrow_u16_to_u8`. If the prior
+    // session's "AVX2 license downclock drags apply_window+populate
+    // 3× slower" claim is real, this should show as a wall regression
+    // on bench-sm. If wall is within noise, the claim is refuted at
+    // bench-sm resolution. Workload bytes/structure are unchanged.
+    if narrow_inject_enabled() {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<(Vec<u16>, crate::decompress::parallel::rpmalloc_alloc::types::U8)> =
+                std::cell::RefCell::new((vec![0u16; 4096], crate::decompress::parallel::rpmalloc_alloc::types::u8_with_capacity(4096)));
+        }
+        SCRATCH.with(|s| {
+            let mut b = s.borrow_mut();
+            let scratch = &mut *b;
+            narrow_u16_to_u8(&scratch.0, &mut scratch.1);
+        });
+    }
     let t_pop = std::time::Instant::now();
     let dwm_slice: &[u8] = narrowed_buf.as_deref().unwrap_or(&[]);
     chunk.populate_subchunk_windows(&bytes, dwm_slice);
@@ -1703,6 +1724,13 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
         );
     }
     chunk
+}
+
+/// One-shot cached env-var lookup for the downclock-probe injection.
+/// See the call site in `run_post_process_task`.
+fn narrow_inject_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GZIPPY_NARROW_INJECT").is_some())
 }
 
 /// Narrow `src: &[u16]` into `dst: &mut U8`, appending bytes. All values
