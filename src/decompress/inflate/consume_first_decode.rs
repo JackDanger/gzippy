@@ -350,10 +350,27 @@ fn prefetch_read(ptr: *const u8) {
     }
 }
 
-// Note: ARM64 prefetch intrinsics are unstable in Rust, so we skip prefetch on ARM
-#[cfg(not(target_arch = "x86_64"))]
+/// Prefetch hint for arm64 via inline asm. `prfm pldl1keep` = preload
+/// into L1 data cache, "keep" temporal locality hint. Universally
+/// available on aarch64 (no extension needed). Stable Rust inline-asm
+/// is the correct path since `core::arch::aarch64::_prefetch` is
+/// unstable. Lever T5 (tight-Huffman plan, advisor-named lever for
+/// arm64 measurability).
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn prefetch_read(_ptr: *const u8) {}
+pub(crate) fn prefetch_read(ptr: *const u8) {
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+pub(crate) fn prefetch_read(_ptr: *const u8) {}
 
 /// AVX2 copy for large non-overlapping matches (distance >= 32, length >= 64).
 /// Uses 32-byte stores for 4x throughput vs scalar 8-byte copies.
