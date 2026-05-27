@@ -1603,140 +1603,159 @@ fn decode_huffman_body_resumable_isal(
         }};
     }
 
-    loop {
-        // Drain pending pack tail FIRST (no bits operations needed).
-        let (mut symbol, mut remaining) = if let Some(pp) = state.pending_pack.take() {
-            (pp.remaining_symbol, pp.remaining_count)
-        } else {
-            // Yield checks
-            if out_pos >= output_len {
-                writeback_bits!();
-                return Ok(out_pos);
-            }
-            if bit_position_of(bitsleft, in_pos) >= encoded_until_bits {
-                writeback_bits!();
-                return Ok(out_pos);
-            }
+    // FASTLOOP / SAFELOOP structure mirroring decode_huffman_body_resumable:
+    // - FASTLOOP: out_pos+320 ≤ output_len AND in_pos < in_data_len-32 AND
+    //   in_pos < encoded_until_bits/8 → skip yield checks. Per-iter cost
+    //   reduces dramatically.
+    // - SAFELOOP: one iter with full yield checks (handles tail + pending_pack).
+    const FASTLOOP_MARGIN: usize = 320;
+    const FASTLOOP_INPUT_TAIL: usize = 32;
 
-            if (bitsleft as u8) < REFILL_THRESHOLD {
-                refill_local!();
-            }
-
-            let (bit_count, sym_count, sym) = decode_litlen_local!();
-            if bit_count == 0 || sym_count == 0 {
-                writeback_bits!();
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "ISA-L litlen: zero bit_count or sym_count (invalid Huffman code)",
-                ));
-            }
-            bitbuf >>= bit_count;
-            bitsleft = bitsleft.wrapping_sub(bit_count);
-            (sym, sym_count)
-        };
-
-        while remaining > 0 {
-            let code = symbol & 0xFFFF;
-
-            if code <= 255 || remaining > 1 {
-                if out_pos >= output_len {
-                    state.pending_pack = Some(PendingPack {
-                        remaining_symbol: symbol,
-                        remaining_count: remaining,
-                    });
-                    writeback_bits!();
-                    return Ok(out_pos);
+    macro_rules! decode_one_iter {
+        () => {{
+            // Drain pending pack tail FIRST (no bits operations needed).
+            let (mut symbol, mut remaining) = if let Some(pp) = state.pending_pack.take() {
+                (pp.remaining_symbol, pp.remaining_count)
+            } else {
+                if (bitsleft as u8) < REFILL_THRESHOLD {
+                    refill_local!();
                 }
-                // Lever T0: raw-pointer literal write avoids slice bounds check.
-                unsafe {
-                    output_ptr.add(out_pos).write((code & 0xFF) as u8);
-                }
-                out_pos += 1;
-                symbol >>= 8;
-                remaining -= 1;
-                continue;
-            }
 
-            if code == 256 {
-                writeback_bits!();
-                state.finish_current_block();
-                return Ok(out_pos);
-            }
-
-            if code > MAX_LIT_LEN_SYM {
-                writeback_bits!();
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "ISA-L litlen: symbol out of range",
-                ));
-            }
-
-            // Length code: decode dist + match copy.
-            let length = (code - LENGTH_BASE_OFFSET) as u32;
-            if length == 0 || length > 258 {
-                writeback_bits!();
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "ISA-L litlen: invalid length value",
-                ));
-            }
-
-            let dist_sym = match decode_dist_local!() {
-                Some(s) => s as u32,
-                None => {
+                let (bit_count, sym_count, sym) = decode_litlen_local!();
+                if bit_count == 0 || sym_count == 0 {
                     writeback_bits!();
                     return Err(Error::new(
                         ErrorKind::InvalidData,
-                        "ISA-L dist: invalid code",
+                        "ISA-L litlen: zero bit_count or sym_count (invalid Huffman code)",
                     ));
                 }
+                bitbuf >>= bit_count;
+                bitsleft = bitsleft.wrapping_sub(bit_count);
+                (sym, sym_count)
             };
-            if dist_sym >= 30 {
-                writeback_bits!();
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "ISA-L dist: symbol out of range (>= 30)",
-                ));
-            }
-            if (bitsleft as u8) < 14 {
-                refill_local!();
-            }
-            let extra_bits = DIST_EXTRA_BIT_COUNT[dist_sym as usize];
-            let extra_val = if extra_bits > 0 {
-                let v = (bitbuf & ((1u64 << extra_bits) - 1)) as u32;
-                bitbuf >>= extra_bits;
-                bitsleft = bitsleft.wrapping_sub(extra_bits as u32);
-                v
-            } else {
-                0
-            };
-            let distance = DIST_START[dist_sym as usize] + extra_val;
-            if distance == 0 || distance > 32768 {
-                writeback_bits!();
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "ISA-L dist: distance out of range",
-                ));
-            }
 
-            // Match copy via the existing window-stitched helper.
-            // copy_match_windowed wants state.bits valid (it reads
-            // state.window only, but state is borrowed mutably).
-            writeback_bits!();
-            out_pos = copy_match_windowed(state, output, out_pos, distance, length)?;
-            // Re-lift bits state after the call (state.bits unchanged
-            // by copy_match_windowed but the locals went stale).
-            bitbuf = state.bits.bitbuf;
-            bitsleft = state.bits.bitsleft;
-            in_pos = state.bits.pos;
+            while remaining > 0 {
+                let code = symbol & 0xFFFF;
 
-            remaining = 0;
+                if code <= 255 || remaining > 1 {
+                    if out_pos >= output_len {
+                        state.pending_pack = Some(PendingPack {
+                            remaining_symbol: symbol,
+                            remaining_count: remaining,
+                        });
+                        writeback_bits!();
+                        return Ok(out_pos);
+                    }
+                    unsafe {
+                        output_ptr.add(out_pos).write((code & 0xFF) as u8);
+                    }
+                    out_pos += 1;
+                    symbol >>= 8;
+                    remaining -= 1;
+                    continue;
+                }
+
+                if code == 256 {
+                    writeback_bits!();
+                    state.finish_current_block();
+                    return Ok(out_pos);
+                }
+
+                if code > MAX_LIT_LEN_SYM {
+                    writeback_bits!();
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "ISA-L litlen: symbol out of range",
+                    ));
+                }
+
+                let length = (code - LENGTH_BASE_OFFSET) as u32;
+                if length == 0 || length > 258 {
+                    writeback_bits!();
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "ISA-L litlen: invalid length value",
+                    ));
+                }
+
+                let dist_sym = match decode_dist_local!() {
+                    Some(s) => s as u32,
+                    None => {
+                        writeback_bits!();
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "ISA-L dist: invalid code",
+                        ));
+                    }
+                };
+                if dist_sym >= 30 {
+                    writeback_bits!();
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "ISA-L dist: symbol out of range (>= 30)",
+                    ));
+                }
+                if (bitsleft as u8) < 14 {
+                    refill_local!();
+                }
+                let extra_bits = DIST_EXTRA_BIT_COUNT[dist_sym as usize];
+                let extra_val = if extra_bits > 0 {
+                    let v = (bitbuf & ((1u64 << extra_bits) - 1)) as u32;
+                    bitbuf >>= extra_bits;
+                    bitsleft = bitsleft.wrapping_sub(extra_bits as u32);
+                    v
+                } else {
+                    0
+                };
+                let distance = DIST_START[dist_sym as usize] + extra_val;
+                if distance == 0 || distance > 32768 {
+                    writeback_bits!();
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "ISA-L dist: distance out of range",
+                    ));
+                }
+
+                writeback_bits!();
+                out_pos = copy_match_windowed(state, output, out_pos, distance, length)?;
+                bitbuf = state.bits.bitbuf;
+                bitsleft = state.bits.bitsleft;
+                in_pos = state.bits.pos;
+
+                remaining = 0;
+            }
+        }};
+    }
+
+    loop {
+        // FASTLOOP entry: yield-elide when buffers have headroom.
+        let cap_byte_floor = encoded_until_bits / 8;
+        let in_fl_end = in_data_len
+            .saturating_sub(FASTLOOP_INPUT_TAIL)
+            .min(cap_byte_floor);
+        let out_fl_end = output_len.saturating_sub(FASTLOOP_MARGIN);
+        if state.pending_pack.is_none() && in_pos < in_fl_end && out_pos < out_fl_end {
+            while state.pending_pack.is_none() && in_pos < in_fl_end && out_pos < out_fl_end {
+                decode_one_iter!();
+            }
+            continue;
         }
+
+        // SAFELOOP: one iter with full yield checks.
+        if out_pos >= output_len {
+            writeback_bits!();
+            return Ok(out_pos);
+        }
+        if bit_position_of(bitsleft, in_pos) >= encoded_until_bits && state.pending_pack.is_none() {
+            writeback_bits!();
+            return Ok(out_pos);
+        }
+
+        decode_one_iter!();
     }
 }
 
-// (decode_length_match removed — replaced by inlined match handling in
-// decode_huffman_body_resumable_isal with bits-locals per B1 lever.)
+// (orphaned dead code from the pre-FASTLOOP restructure removed)
 
 /// Parse a dynamic-Huffman block header atomically and return the built
 /// litlen + distance tables. Mirror of the header-parse portion of the
