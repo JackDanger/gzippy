@@ -20,7 +20,7 @@ for F in "$GCF" "$BF" "$GC"; do
 done
 
 # Patch processNextChunk: add ScopedSpan as first statement after opening brace.
-if ! grep -q "TRACEV2_SPAN.*consumer.iter" "$GCF"; then
+if ! grep -q 'ScopedSpan _tv2_proc("consumer.iter")' "$GCF"; then
     sed -i '/processNextChunk()$/,/^    {/{
         s|^    {$|    {\n        ::tracev2::ScopedSpan _tv2_proc("consumer.iter");|
     }' "$GCF"
@@ -29,7 +29,7 @@ fi
 
 # Patch BlockFetcher::get_with_prefetch — wrap on-demand fetch path.
 # Vendor's `BlockFetcher::get` starts ~line 280. We'll wrap the entry.
-if ! grep -q "TRACEV2_SPAN.*consumer.get_block" "$BF"; then
+if ! grep -q 'ScopedSpan _tv2_get("wait.block_fetcher_get")' "$BF"; then
     # Insert at top of `get( const Key & blockOffset` body.
     sed -i '/^    get( const Key & blockOffset.*)/,/^    {/{
         s|^    {$|    {\n        ::tracev2::ScopedSpan _tv2_get("wait.block_fetcher_get");|
@@ -38,7 +38,7 @@ if ! grep -q "TRACEV2_SPAN.*consumer.get_block" "$BF"; then
 fi
 
 # Patch decodeAndMeasureBlock — the worker decode site.
-if ! grep -q "TRACEV2_SPAN.*worker.decode_chunk" "$BF"; then
+if ! grep -q 'ScopedSpan _tv2_dec("worker.decode_chunk")' "$BF"; then
     sed -i '/^    decodeAndMeasureBlock( size_t blockOffset,/,/^    {/{
         s|^    {$|    {\n        ::tracev2::ScopedSpan _tv2_dec("worker.decode_chunk");|
     }' "$BF"
@@ -91,21 +91,19 @@ if ! grep -q "coord.prefetch_emit" "$BF"; then
     echo "PATCHED prefetch_emit span: $BF"
 fi
 if ! grep -q "coord.prefetch_call.outcome" "$BF"; then
-    # Emit a final outcome instant event at function end. The
-    # function has two exits: (a) the early `return;` at line 471 when
-    # the pool is saturated at entry; (b) fall-through at line 569.
-    # Patch the early exit: insert outcome instant before the return.
+    # Emit a final outcome instant event at function end. Two exits:
+    # (a) early `return;` when threadPoolSaturated at entry; (b)
+    # fall-through past the post-loop logic_error throw. Use C++ raw
+    # string literals (R"(...)") for the JSON args body — avoids the
+    # quote-escape headache of going shell -> perl -> file.
     perl -i -0777 -pe '
-      s|(\s+)if \( threadPoolSaturated\(\) \) \{(\s+)return;(\s+)\}|$1if ( threadPoolSaturated() ) {$2::tracev2::emit_instant("coord.prefetch_call.outcome", "\"submitted\":0,\"early_exit\":\"saturated_entry\"", '\''t'\'');$2return;$3}|;
+      s|(\s+)if \( threadPoolSaturated\(\) \) \{(\s+)return;(\s+)\}|$1if ( threadPoolSaturated() ) {$2::tracev2::emit_instant("coord.prefetch_call.outcome", R"("submitted":0,"early_exit":"saturated_entry")", '\''t'\'');$2return;$3}|;
     ' "$BF"
-    # Patch the fall-through exit: insert outcome instant before the
-    # closing brace of prefetchNewBlocks. Use the unique throw line
-    # immediately above it as an anchor.
+    # Fall-through exit: inject just before the closing `}` of
+    # prefetchNewBlocks. Anchor is the unique post-loop logic_error
+    # throw block that ends the function body.
     perl -i -0777 -pe '
-      s|(throw std::logic_error\( "The thread pool should not have more tasks than there are prefetching futures!" \);\s*\}\s*\})|$1|;
-      # Use a different injection strategy: insert just before the closing
-      # `}` that ends prefetchNewBlocks. Anchor via the unique throw line.
-      s|(throw std::logic_error\( "The thread pool should not have more tasks than there are prefetching futures!" \);\n        \}\n)(    \})|$1        ::tracev2::emit_instant("coord.prefetch_call.outcome", "\"submitted\":-1,\"early_exit\":\"fallthrough\"", '\''t'\'');\n$2|;
+      s|(throw std::logic_error\( "The thread pool should not have more tasks than there are prefetching futures!" \);\n        \}\n)(    \})|$1        ::tracev2::emit_instant("coord.prefetch_call.outcome", R"("submitted":-1,"early_exit":"fallthrough")", '\''t'\'');\n$2|;
     ' "$BF"
     echo "PATCHED prefetch_call.outcome instants: $BF"
 fi
