@@ -495,8 +495,6 @@ mod tests {
     fn decode_block_random_data_l1_with_zero_predecessor() {
         use std::io::Write;
         let mut rng: u64 = 0xcafef00d_deadbeef;
-        // 4 KiB — small enough to be one block at most, still triggers
-        // the bug. 1 MiB also fails identically.
         let mut payload = Vec::with_capacity(4096);
         for _ in 0..4096 {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -516,20 +514,38 @@ mod tests {
         let predecessor = [0u8; MAX_WINDOW_SIZE];
 
         let mut out_pos = 0;
-        loop {
-            let result = decode_block(
-                &mut bits,
-                &mut output,
-                &mut out_pos,
-                &predecessor[..],
-                &mut scratch,
-            )
-            .unwrap_or_else(|e| panic!("random-L1 decode failed at out_pos={out_pos}: {e:?}"));
-            if result.is_final_block {
-                break;
+        let result = decode_block(
+            &mut bits,
+            &mut output,
+            &mut out_pos,
+            &predecessor[..],
+            &mut scratch,
+        );
+        if let Err(e) = result {
+            eprintln!("[repro] decode failed at out_pos={out_pos}: {e:?}");
+            eprintln!(
+                "[repro] first 32 decoded bytes: {:02x?}",
+                &output[..out_pos.min(32)]
+            );
+            eprintln!("[repro] first 32 expected bytes:  {:02x?}", &payload[..32]);
+            // Compare byte-by-byte to find divergence point.
+            for i in 0..out_pos.min(payload.len()) {
+                if output[i] != payload[i] {
+                    eprintln!(
+                        "[repro] divergence at byte {i}: got {:02x}, want {:02x}",
+                        output[i], payload[i]
+                    );
+                    break;
+                }
             }
+            panic!("decode failed");
         }
-        assert_eq!(&output[..out_pos], &payload[..]);
+        eprintln!(
+            "[repro] first block decoded {} bytes (final={})",
+            out_pos,
+            result.unwrap().is_final_block
+        );
+        assert_eq!(&output[..out_pos], &payload[..out_pos]);
     }
 
     /// Multi-block cross-reference test: a payload large enough to force
