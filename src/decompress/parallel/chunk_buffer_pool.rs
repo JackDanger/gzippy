@@ -200,31 +200,25 @@ pub fn take_u8(min_capacity: usize) -> U8 {
         }
         return v;
     }
-    // Cross-worker steal: walk the non-empty bitmask, starting at
-    // `idx+1` so each worker tries a different victim first. Without
-    // this rotation, all stealing workers converge on
-    // `bits.trailing_zeros()` (worker 0) and serialize on its mutex —
-    // observed regression on neurotic 16T despite ~50% steal hit rate.
-    let bits = U8_POOLS_NONEMPTY.load(std::sync::atomic::Ordering::Relaxed);
-    if bits & !(1u64 << idx) != 0 {
-        for offset in 1..MAX_WORKERS {
-            let j = (idx + offset) % MAX_WORKERS;
-            if bits & (1u64 << j) == 0 {
-                continue;
+    // Cross-worker steal: walk the non-empty bitmask.
+    let mut bits = U8_POOLS_NONEMPTY.load(std::sync::atomic::Ordering::Relaxed);
+    bits &= !(1u64 << idx); // own pool already tried (was empty)
+    while bits != 0 {
+        let j = bits.trailing_zeros() as usize;
+        bits &= !(1u64 << j);
+        if let Some(mut v) = try_pop_u8(j) {
+            TAKE_U8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            TAKE_U8_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            STEAL_U8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            v.clear();
+            if v.capacity() < min_capacity {
+                v.reserve(min_capacity - v.capacity());
             }
-            if let Some(mut v) = try_pop_u8(j) {
-                TAKE_U8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                TAKE_U8_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                STEAL_U8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                v.clear();
-                if v.capacity() < min_capacity {
-                    v.reserve(min_capacity - v.capacity());
-                }
-                return v;
-            }
-            // bitmask claimed non-empty but try_pop returned None —
-            // race (drained between load and lock). Continue scanning.
+            return v;
         }
+        // try_pop_u8 returned None despite bitmask claiming non-empty —
+        // race (another worker drained that pool between bitmask load
+        // and lock). Continue scanning.
     }
     TAKE_U8_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     TAKE_U8_MISSES_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -245,24 +239,21 @@ pub fn take_u16(min_capacity: usize) -> U16 {
         }
         return v;
     }
-    // Cross-worker steal, rotated start (see take_u8).
-    let bits = U16_POOLS_NONEMPTY.load(std::sync::atomic::Ordering::Relaxed);
-    if bits & !(1u64 << idx) != 0 {
-        for offset in 1..MAX_WORKERS {
-            let j = (idx + offset) % MAX_WORKERS;
-            if bits & (1u64 << j) == 0 {
-                continue;
+    // Cross-worker steal.
+    let mut bits = U16_POOLS_NONEMPTY.load(std::sync::atomic::Ordering::Relaxed);
+    bits &= !(1u64 << idx);
+    while bits != 0 {
+        let j = bits.trailing_zeros() as usize;
+        bits &= !(1u64 << j);
+        if let Some(mut v) = try_pop_u16(j) {
+            TAKE_U16_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            TAKE_U16_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            STEAL_U16_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            v.clear();
+            if v.capacity() < min_capacity {
+                v.reserve(min_capacity - v.capacity());
             }
-            if let Some(mut v) = try_pop_u16(j) {
-                TAKE_U16_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                TAKE_U16_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                STEAL_U16_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                v.clear();
-                if v.capacity() < min_capacity {
-                    v.reserve(min_capacity - v.capacity());
-                }
-                return v;
-            }
+            return v;
         }
     }
     TAKE_U16_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
