@@ -797,6 +797,22 @@ where
             // prefetch — those are the candidates for the missing
             // vendor `nextNthEviction` cache-pollution guard
             // (BlockFetcher.hpp:544-551).
+            // FALSIFICATION EXPERIMENT (TEMPORARY — DO NOT MERGE):
+            // Skip sub-partition emits to upper-bound the wall benefit
+            // of suppressing them. If wall doesn't move vs baseline,
+            // these emits aren't on the critical path and Fix #3
+            // shouldn't pursue this lever.
+            // Gated on env var so a single build can A/B without rebuild.
+            if partition_offset != prefetch_block_offset
+                && std::env::var_os("GZIPPY_SKIP_SUBPARTITION_EMITS").is_some()
+            {
+                trace_v2::emit_instant(
+                    "coord.prefetch_skip",
+                    &format!(r#""reason":"experimental_skip_subpartition","index":{index}"#),
+                    "t",
+                );
+                continue;
+            }
             let _tv2_emit = {
                 use std::fmt::Write as _;
                 let mut args = String::with_capacity(160);
