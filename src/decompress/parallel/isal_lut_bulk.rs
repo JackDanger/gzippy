@@ -487,6 +487,49 @@ mod tests {
         roundtrip(&payload, 0);
     }
 
+    /// Random data at zlib L1 with a 32 KiB zero predecessor window —
+    /// the exact shape of the chunk-0 production call for the
+    /// `corpus_large_random` parallel-SM test. If this fails, the
+    /// production failure is reproducible in isolation.
+    #[test]
+    fn decode_block_random_data_l1_with_zero_predecessor() {
+        use std::io::Write;
+        let mut rng: u64 = 0xcafef00d_deadbeef;
+        let mut payload = Vec::with_capacity(1 << 20);
+        for _ in 0..(1 << 20) {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            payload.push((rng >> 24) as u8);
+        }
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(1));
+        enc.write_all(&payload).unwrap();
+        let gz = enc.finish().unwrap();
+        let (_hdr, hdr_size) =
+            crate::decompress::parallel::gzip_format::read_header(&gz).expect("gz header");
+        let deflate = &gz[hdr_size..gz.len() - 8];
+
+        let mut output = vec![0u8; payload.len() + 4096];
+        let mut bits = Bits::new(deflate);
+        bits.refill();
+        let mut scratch = DecoderScratch::new();
+        let predecessor = [0u8; MAX_WINDOW_SIZE];
+
+        let mut out_pos = 0;
+        loop {
+            let result = decode_block(
+                &mut bits,
+                &mut output,
+                &mut out_pos,
+                &predecessor[..],
+                &mut scratch,
+            )
+            .unwrap_or_else(|e| panic!("random-L1 decode failed at out_pos={out_pos}: {e:?}"));
+            if result.is_final_block {
+                break;
+            }
+        }
+        assert_eq!(&output[..out_pos], &payload[..]);
+    }
+
     /// Multi-block cross-reference test: a payload large enough to force
     /// multiple Huffman blocks, with strong intra-stream redundancy so
     /// back-references reach across block boundaries.
