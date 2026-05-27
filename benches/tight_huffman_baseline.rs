@@ -180,6 +180,37 @@ mod bench {
         best_ns_per_byte
     }
 
+    /// libdeflate one-shot decode via the safe `libdeflater` wrapper.
+    /// Wrap input with gzip header/trailer once outside the timed
+    /// region (libdeflater exposes gzip decode, not raw deflate).
+    ///
+    /// libdeflate is the second vendor with viable arm64 paths
+    /// (ISA-L is x86_64-only). Third comparison column — vs flate2
+    /// (zlib-ng) and now vs libdeflate.
+    fn time_libdeflate(payload: &[u8], iters: usize, warmup: usize) -> f64 {
+        use libdeflater::Decompressor;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+        enc.write_all(payload).unwrap();
+        let gz = enc.finish().unwrap();
+        let mut out = vec![0u8; payload.len() + 1024];
+        for _ in 0..warmup {
+            let mut decoder = Decompressor::new();
+            let _ = decoder.gzip_decompress(&gz, &mut out).unwrap();
+        }
+        let mut best_ns_per_byte = f64::MAX;
+        for _ in 0..iters {
+            let mut decoder = Decompressor::new();
+            let start = Instant::now();
+            let n = decoder.gzip_decompress(&gz, &mut out).unwrap();
+            let elapsed_ns = start.elapsed().as_nanos() as f64;
+            let ns_per_byte = elapsed_ns / n as f64;
+            if ns_per_byte < best_ns_per_byte {
+                best_ns_per_byte = ns_per_byte;
+            }
+        }
+        best_ns_per_byte
+    }
+
     /// English-like text with vocabulary diversity. Compresses to ~50-60%
     /// at L6 — the realistic "Huffman-bound" workload (dynamic-Huffman
     /// blocks with many distinct literal/length codes; moderate match
@@ -588,21 +619,24 @@ mod bench {
             "Best-of-{} after {} warmup. Decoder construction outside timed region.",
             ITERS, WARMUP
         );
-        println!("Two harness shapes: MONO (one giant output buffer) + CHUNKED (64 KiB output reads, mirrors a streaming consumer).");
+        println!(
+            "Three vendors: flate2 (zlib-ng), libdeflate (one-shot). Our decoder: MONO + CHUNKED."
+        );
         println!();
         println!(
-            "{:<18} {:>9} {:>9} {:>8} {:>9} {:>10} {:>7} {:>9} {:>7}",
+            "{:<18} {:>9} {:>8} {:>9} {:>9} {:>6} {:>9} {:>6} {:>9} {:>6}",
             "case",
             "raw",
-            "deflate",
             "compr%",
-            "mono_ns/B",
-            "flate2_ns/B",
-            "mono_x",
-            "chunk_ns/B",
-            "chunk_x"
+            "rust_mono",
+            "rust_chunk",
+            "vs_z_m",
+            "flate2",
+            "vs_z_c",
+            "libdef",
+            "vs_ld"
         );
-        println!("{}", "-".repeat(108));
+        println!("{}", "-".repeat(110));
 
         let mut report = String::new();
         report.push_str("# Tight Huffman Decoder Baseline\n");
@@ -612,47 +646,48 @@ mod bench {
             ITERS,
             WARMUP
         ));
-        report.push_str("| case | raw | deflate | compr% | mono_ns/B | flate2_ns/B | mono_x | chunk_ns/B | chunk_x |\n");
-        report.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+        report.push_str("| case | raw | compr% | rust_mono | rust_chunk | vs zlib mono | flate2 | vs zlib chunk | libdef | vs libdef |\n");
+        report.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
 
-        // Reset fastloop counter once before the whole run; track per-case
-        // deltas via the monolithic timer (which returns the delta).
         BODY_RESUMABLE_FASTLOOP_ENTERS.store(0, Ordering::Relaxed);
-
         let mut total_fastloop_entries: u64 = 0;
         for (label, payload, level) in &cases {
             let deflate = make_deflate(payload, *level);
             let compress_pct = (deflate.len() as f64 / payload.len() as f64) * 100.0;
-            let (mono_ns_per_byte, fastloop_delta) =
+            let (mono_ns, fastloop_delta) =
                 time_resumable_monolithic(&deflate, payload.len(), ITERS, WARMUP);
-            let chunk_ns_per_byte = time_resumable_chunked(&deflate, payload.len(), ITERS, WARMUP);
-            let flate2_ns_per_byte = time_flate2(&deflate, payload.len(), ITERS, WARMUP);
-            let mono_ratio = mono_ns_per_byte / flate2_ns_per_byte;
-            let chunk_ratio = chunk_ns_per_byte / flate2_ns_per_byte;
+            let chunk_ns = time_resumable_chunked(&deflate, payload.len(), ITERS, WARMUP);
+            let flate2_ns = time_flate2(&deflate, payload.len(), ITERS, WARMUP);
+            let libdef_ns = time_libdeflate(payload, ITERS, WARMUP);
+            let vs_z_m = mono_ns / flate2_ns;
+            let vs_z_c = chunk_ns / flate2_ns;
+            let vs_ld = chunk_ns / libdef_ns;
             total_fastloop_entries += fastloop_delta;
             println!(
-                "{:<18} {:>9} {:>9} {:>7.1}% {:>9.2} {:>10.2} {:>6.2}x {:>9.2} {:>6.2}x",
+                "{:<18} {:>9} {:>7.1}% {:>9.2} {:>9.2} {:>5.2}x {:>9.2} {:>5.2}x {:>9.2} {:>5.2}x",
                 label,
                 payload.len(),
-                deflate.len(),
                 compress_pct,
-                mono_ns_per_byte,
-                flate2_ns_per_byte,
-                mono_ratio,
-                chunk_ns_per_byte,
-                chunk_ratio,
+                mono_ns,
+                chunk_ns,
+                vs_z_m,
+                flate2_ns,
+                vs_z_c,
+                libdef_ns,
+                vs_ld
             );
             report.push_str(&format!(
-                "| {} | {} | {} | {:.1}% | {:.2} | {:.2} | {:.2}× | {:.2} | {:.2}× |\n",
+                "| {} | {} | {:.1}% | {:.2} | {:.2} | {:.2}× | {:.2} | {:.2}× | {:.2} | {:.2}× |\n",
                 label,
                 payload.len(),
-                deflate.len(),
                 compress_pct,
-                mono_ns_per_byte,
-                flate2_ns_per_byte,
-                mono_ratio,
-                chunk_ns_per_byte,
-                chunk_ratio,
+                mono_ns,
+                chunk_ns,
+                vs_z_m,
+                flate2_ns,
+                vs_z_c,
+                libdef_ns,
+                vs_ld
             ));
         }
 
