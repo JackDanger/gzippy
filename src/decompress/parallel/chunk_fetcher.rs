@@ -573,6 +573,26 @@ pub fn drive<W: std::io::Write>(
             TAKE_U16_MISSES.load(Ordering::Relaxed),
             RETURN_U16_CALLS.load(Ordering::Relaxed),
         );
+        use crate::decompress::parallel::gzip_chunk::{
+            BOOTSTRAP_OUTPUT_ALLOCS, BOOTSTRAP_OUTPUT_DROPPED, BOOTSTRAP_OUTPUT_RETURNS,
+            BOOTSTRAP_OUTPUT_REUSED_BYTES, BOOTSTRAP_OUTPUT_TAKES,
+        };
+        let takes = BOOTSTRAP_OUTPUT_TAKES.load(Ordering::Relaxed);
+        let allocs = BOOTSTRAP_OUTPUT_ALLOCS.load(Ordering::Relaxed);
+        let reuse_pct = if takes > 0 {
+            100.0 * (takes - allocs) as f64 / takes as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "  Bootstrap pool: takes={} allocs={} returns={} dropped={} reused_MB={:.1} reuse_rate={:.1}%",
+            takes,
+            allocs,
+            BOOTSTRAP_OUTPUT_RETURNS.load(Ordering::Relaxed),
+            BOOTSTRAP_OUTPUT_DROPPED.load(Ordering::Relaxed),
+            BOOTSTRAP_OUTPUT_REUSED_BYTES.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0),
+            reuse_pct,
+        );
         // Slow-path candidate iteration: ok + fail + no_candidate sum
         // to the slow-path call count.
         eprintln!(
