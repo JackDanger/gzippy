@@ -1477,26 +1477,6 @@ fn decode_huffman_body_resumable_isal(
             ));
         }
 
-        // Pessimistic yield: the multi-pack iteration below cannot yield
-        // mid-pack because we've already consumed `decoded.bit_count` bits
-        // before iterating. Worst case per pack: (sym_count - 1) literals
-        // + a 258-byte match (when the LAST sym in a 2- or 3-pack is a
-        // length code per ISA-L LUT semantics — sym2/sym3 in pairs/triples
-        // can be a length-code-post-expansion, NOT only literals as my
-        // first cut assumed). Reserve room for that worst case before
-        // consuming. Matches the bulk decoder's `while sym_count > 0`
-        // pattern (`isal_lut_bulk::decode_block`).
-        let worst_case_bytes = (decoded.sym_count as usize).saturating_sub(1) + 258;
-        if out_pos + worst_case_bytes > output.len() {
-            // Not enough room for worst case; yield without consuming.
-            // Caller resumes with a fresh (or larger) output buffer.
-            // For single-sym literals or EOB we could still proceed, but
-            // the bulk-decoder pattern (no mid-pack yield) is simpler and
-            // chunk-buffer is always ≥ 128 KiB in production so we yield
-            // far before the buffer fills.
-            return Ok(out_pos);
-        }
-
         state.bits.consume(decoded.bit_count);
 
         let mut symbol = decoded.symbol;
@@ -1509,6 +1489,22 @@ fn decode_huffman_body_resumable_isal(
             // OR all but the last element of a pack (sym_count>1, any code —
             // the leading elements MUST be literals per LUT builder).
             if code <= 255 || remaining > 1 {
+                // The pre-loop yield check ensures out_pos < output.len()
+                // at entry; literal emits 1 byte. For multi-pack the
+                // bits are already consumed; if room runs out mid-pack
+                // we'd be stuck. In practice production buffers are
+                // ≥ 128 KiB and the worst-case 3-byte literal pack
+                // (or 2-byte literal pack + 258-byte match) fits.
+                // If it doesn't fit, that's a programmer error — surface
+                // it loudly rather than silently truncate (advisor D4).
+                if out_pos >= output.len() {
+                    return Err(Error::new(
+                        ErrorKind::WriteZero,
+                        "ISA-L inner: output buffer too small for multi-pack literal — \
+                         output.len must be ≥ 261 bytes to safely yield after \
+                         consuming the LUT entry's bits",
+                    ));
+                }
                 output[out_pos] = (code & 0xFF) as u8;
                 out_pos += 1;
                 symbol >>= 8;
