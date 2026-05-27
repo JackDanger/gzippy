@@ -231,53 +231,25 @@ impl ChunkData {
     pub fn new(encoded_offset_bits: usize, configuration: ChunkConfiguration) -> Self {
         use crate::decompress::parallel::chunk_buffer_pool;
         let cap = configuration.max_decoded_chunk_size;
-        // u16 marker buffer sizing — Lever B (2026-05-27 perf analysis).
+        // `data_with_markers` is allocated lazily — the fast path
+        // (window known) never emits markers, so paying for the
+        // capacity reservation up front is wasted address space AND
+        // wasted page commits if the worker writes anywhere into it
+        // (e.g. `Vec::truncate` does not, but a later `extend` would).
+        // Slow-path workers call `append_markered` which grows the
+        // Vec from zero on demand; the pool's `take_u16` returns
+        // recycled Vecs at that point so growth is amortized.
         //
-        // Prior behavior: `take_u16(0)` returned a cap=0 Vec, then
-        // `append_markered` grew it from zero via doubling realloc on
-        // each speculative chunk. Per neurotic perf on pure-rust-inflate
-        // build, this produced:
-        //   - 18.39% CPU in `__memmove_avx_unaligned_erms` (the realloc
-        //     copies during Vec doubling)
-        //   - 12.99% CPU in kernel `clear_page_erms` (page commits on
-        //     first-touch of freshly-mmap'd doubling allocations)
-        //
-        // Vendor's `FasterVector<uint16_t>` uses rpmalloc's per-thread
-        // arena where freed pages stay mapped; the cap-0 + doubling
-        // pattern paid both the doubling-realloc + the first-touch
-        // fault on every chunk. With gzippy's per-worker LIFO pool
-        // (`chunk_buffer_pool::take_u16` / `return_u16_to_worker`,
-        // `MAX_POOLED = 8` per worker), pre-sizing the take to a
-        // realistic marker count means:
-        //   1. Chunk 1 on each worker pays the page-commit cost once
-        //      during decode (parallelized across workers, same as
-        //      today's incremental fault cost on the first touch).
-        //   2. The doubling-realloc memcpy is eliminated — append_markered
-        //      finds enough capacity for typical chunks.
-        //   3. On chunk Drop, the Vec returns to the worker's LIFO
-        //      with capacity intact; chunk 2..N on the same worker
-        //      take the warm Vec (already-faulted pages), eliminating
-        //      both the realloc AND the fault cost for subsequent
-        //      chunks.
-        //
-        // Cap sizing: split_chunk_size (= 4 MiB by default) is the
-        // common case for marker emission. Speculative chunks that
-        // emit more markers than that pay a SINGLE doubling realloc
-        // to 8 MiB elements — still far better than the 0 → 4 MiB
-        // doubling chain (11 reallocs).
-        //
-        // Distinct from the falsified `Z2 MADV_POPULATE_WRITE` lever
-        // (see `feedback_z2_falsified.md`): that prefaulted at
-        // allocation time on the caller thread, serializing 20480
-        // faults. This change leaves first-touch faulting in the
-        // existing parallel per-worker path; the only difference is
-        // the Vec arrives with capacity reserved, eliminating the
-        // doubling memcpy chain.
-        let u16_cap = configuration.split_chunk_size;
+        // Vendor parity: `ChunkData::data_with_markers` is a
+        // FasterVector<uint16_t> that's default-constructed (empty)
+        // and only grown when the marker pipeline emits markers
+        // (ChunkData.hpp uses `subchunks.back().data.push_back(...)`).
+        // Allocating max-size up front was a gzippy-specific
+        // pre-emptive sizing that defied the vendor pattern.
         Self::new_with_buffers(
             encoded_offset_bits,
             configuration,
-            chunk_buffer_pool::take_u16(u16_cap),
+            chunk_buffer_pool::take_u16(0),
             chunk_buffer_pool::take_u8(cap),
             chunk_buffer_pool::current_worker_pool_index().unwrap_or(0),
         )
