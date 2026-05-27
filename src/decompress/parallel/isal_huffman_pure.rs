@@ -808,6 +808,297 @@ pub fn make_inflate_huff_code_dist(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Decoder types — pure-rust analogs of `IsalLitLenCode` / `IsalDistCode`
+// from `isal_huffman.rs`. The `decode` bodies are literal Rust ports of
+// `HuffmanCodingISAL::decode` and `HuffmanCodingDistanceISAL::decode`
+// (vendor `HuffmanCodingISAL.hpp:94-183` /
+// `HuffmanCodingDistanceISAL.hpp:?-?`). The TABLE BUILDERS use the pure-
+// Rust functions above instead of FFI, so this type is available on
+// builds that don't link ISA-L.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Decode result — symbol, packed sym count (1..=3), bits consumed.
+/// Matches the layout of `isal_huffman::DecodedSymbol`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodedSymbol {
+    pub symbol: u32,
+    pub sym_count: u32,
+    pub bit_count: u32,
+}
+
+/// Pure-rust analog of `IsalLitLenCode` (isal_huffman.rs:86-243). The
+/// decode body is identical (already pure Rust); the rebuild path uses
+/// pure-rust `set_and_expand_lit_len_huffcode` +
+/// `make_inflate_huff_code_lit_len` instead of ISA-L FFI.
+pub struct IsalLitLenCodePure {
+    pub table: Box<InflateHuffCodeLarge>,
+    lit_and_dist_huff: Box<[HuffCode; LIT_LEN_ELEMS]>,
+    code_list: Box<[u32; LIT_LEN_ELEMS + 2]>,
+    valid: bool,
+}
+
+impl IsalLitLenCodePure {
+    pub fn new_empty() -> Self {
+        Self {
+            table: Box::new(InflateHuffCodeLarge::default()),
+            lit_and_dist_huff: Box::new([HuffCode::default(); LIT_LEN_ELEMS]),
+            code_list: Box::new([0u32; LIT_LEN_ELEMS + 2]),
+            valid: false,
+        }
+    }
+
+    /// Rebuild from a slice of code lengths IN-PLACE — reuses the
+    /// table/buffer allocations. Returns `true` on success. On failure
+    /// `is_valid() == false`. Mirror of
+    /// `isal_huffman.rs::IsalLitLenCode::rebuild_from` (line 119-175) but
+    /// dispatches to the pure-rust builders defined above.
+    pub fn rebuild_from(&mut self, code_lengths: &[u8]) -> bool {
+        self.valid = false;
+        if code_lengths.len() > LIT_LEN {
+            return false;
+        }
+
+        // Reset only the entries we'll touch (mirror of vendor's
+        // per-call `lit_and_dist_huff[i].code_and_length = 0` loop).
+        for h in self.lit_and_dist_huff.iter_mut() {
+            h.0 = 0;
+        }
+        let mut lit_count: [u16; MAX_LIT_LEN_COUNT] = [0; MAX_LIT_LEN_COUNT];
+        let mut lit_expand_count: [u16; MAX_LIT_LEN_COUNT] = [0; MAX_LIT_LEN_COUNT];
+
+        for (i, &length) in code_lengths.iter().enumerate() {
+            if (length as usize) >= MAX_LIT_LEN_COUNT {
+                return false;
+            }
+            lit_count[length as usize] += 1;
+            self.lit_and_dist_huff[i].set_length(length);
+            // Length-extra accounting for symbols ≥ 264 (length codes
+            // with extra bits per RFC 1951 §3.2.5). The wrapping_sub /
+            // wrapping_add mirror the C's `expand_count[l] -= 1;
+            // expand_count[target] += 1 << extra` pattern where the
+            // initial value is 0 (so -1 wraps to 0xFFFF and the +N
+            // later wraps back). This is intentional in the C, not a
+            // bug — `set_and_expand_lit_len_huffcode` consumes the
+            // wrapping algebra in its setup loop.
+            if length != 0 && i >= 264 {
+                let extra_count = LEN_EXTRA_BIT_COUNT[i - 257] as usize;
+                lit_expand_count[length as usize] =
+                    lit_expand_count[length as usize].wrapping_sub(1);
+                let target = (length as usize) + extra_count;
+                if target < MAX_LIT_LEN_COUNT {
+                    lit_expand_count[target] =
+                        lit_expand_count[target].wrapping_add(1u16 << extra_count);
+                }
+            }
+        }
+
+        if set_and_expand_lit_len_huffcode(
+            &mut self.lit_and_dist_huff[..],
+            LIT_LEN,
+            &mut lit_count,
+            &mut lit_expand_count,
+            &mut self.code_list[..],
+        )
+        .is_err()
+        {
+            return false;
+        }
+
+        make_inflate_huff_code_lit_len(
+            &mut self.table,
+            &mut self.lit_and_dist_huff[..],
+            LIT_LEN_ELEMS,
+            &lit_count,
+            &self.code_list[..],
+            TRIPLE_SYM_FLAG,
+        );
+
+        self.valid = true;
+        true
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    /// Decode one symbol packet (up to 3 packed literals or 1 length).
+    /// LITERAL port of `isal_huffman.rs::IsalLitLenCode::decode`
+    /// (line 196-237) — same algorithm, same constants, no behavioral
+    /// change. The table is layout-equivalent (`InflateHuffCodeLarge`).
+    ///
+    /// `#[inline(always)]`: the C++ vendor wrapper inlines through this
+    /// to fuse with the marker hot loop. Plain `#[inline]` left the
+    /// function as a separate symbol consuming ~3.25% of cycles via
+    /// call overhead on the perf profile that motivated this port.
+    #[inline(always)]
+    pub fn decode(
+        &self,
+        bits: &mut crate::decompress::inflate::consume_first_decode::Bits<'_>,
+    ) -> DecodedSymbol {
+        if bits.available() < 32 {
+            bits.refill();
+        }
+        let next_bits = bits.peek();
+        let next_12_bits = (next_bits & ((1u64 << ISAL_DECODE_LONG_BITS) - 1)) as usize;
+        let mut next_sym = self.table.short_code_lookup[next_12_bits];
+        if (next_sym & LARGE_FLAG_BIT) == 0 {
+            let bit_count = next_sym >> LARGE_SHORT_CODE_LEN_OFFSET;
+            let mut symbol = next_sym & LARGE_SHORT_SYM_MASK;
+            if bit_count == 0 {
+                symbol = INVALID_SYMBOL;
+            }
+            return DecodedSymbol {
+                symbol,
+                sym_count: (next_sym >> LARGE_SYM_COUNT_OFFSET) & LARGE_SYM_COUNT_MASK,
+                bit_count,
+            };
+        }
+        // Long code path.
+        let long_max_len = next_sym >> LARGE_SHORT_MAX_LEN_OFFSET;
+        let used_bits = if long_max_len <= 32 {
+            next_bits & ((1u64 << long_max_len) - 1)
+        } else {
+            next_bits
+        };
+        let long_idx = ((next_sym & LARGE_SHORT_SYM_MASK)
+            + ((used_bits >> ISAL_DECODE_LONG_BITS) as u32)) as usize;
+        next_sym = self.table.long_code_lookup[long_idx] as u32;
+        let bit_count = next_sym >> LARGE_LONG_CODE_LEN_OFFSET;
+        let mut symbol = next_sym & LARGE_LONG_SYM_MASK;
+        if bit_count == 0 {
+            symbol = INVALID_SYMBOL;
+        }
+        DecodedSymbol {
+            symbol,
+            sym_count: 1,
+            bit_count,
+        }
+    }
+}
+
+/// Pure-rust analog of `IsalDistCode`. `dist_huff` is sized at
+/// LIT_LEN_ELEMS to match the C, which uses the same buffer for both
+/// lit/len and dist phases (the dist phase uses only the first 30
+/// entries — `ISAL_DEF_DIST_SYMBOLS`).
+pub struct IsalDistCodePure {
+    pub table: Box<InflateHuffCodeSmall>,
+    dist_huff: Box<[HuffCode; LIT_LEN_ELEMS]>,
+    valid: bool,
+}
+
+impl IsalDistCodePure {
+    pub fn new_empty() -> Self {
+        Self {
+            table: Box::new(InflateHuffCodeSmall::default()),
+            dist_huff: Box::new([HuffCode::default(); LIT_LEN_ELEMS]),
+            valid: false,
+        }
+    }
+
+    /// Mirror of `isal_huffman.rs::IsalDistCode::rebuild_from`
+    /// (line 279-316). Distance codes have no length-extra expansion,
+    /// so this is simpler than the lit/len builder.
+    pub fn rebuild_from(&mut self, code_lengths: &[u8]) -> bool {
+        self.valid = false;
+        if code_lengths.len() > LIT_LEN {
+            return false;
+        }
+        for h in self.dist_huff.iter_mut() {
+            h.0 = 0;
+        }
+        // `set_codes` count array is [u16; MAX_HUFF_TREE_DEPTH + 1] (16);
+        // the dist alphabet has codes up to length 15 so [0..=15] is sized.
+        let mut dist_count: [u16; MAX_HUFF_TREE_DEPTH + 1] = [0; MAX_HUFF_TREE_DEPTH + 1];
+        for (i, &length) in code_lengths.iter().enumerate() {
+            if length as usize >= 16 {
+                return false;
+            }
+            dist_count[length as usize] += 1;
+            self.dist_huff[i].set_length(length);
+        }
+        // `set_codes` writes back canonical codes for the dist table.
+        if set_codes(&mut self.dist_huff[..], LIT_LEN as usize, &mut dist_count).is_err() {
+            return false;
+        }
+        // Build the LUT. `make_inflate_huff_code_dist` wants a [u16; 17]
+        // count array (sized via MAX_HUFF_TREE_DEPTH + 1 + 1 in its
+        // signature); we build that from the cumulative dist_count.
+        let mut count_cumulative: [u16; MAX_HUFF_TREE_DEPTH + 1 + 1] =
+            [0u16; MAX_HUFF_TREE_DEPTH + 1 + 1];
+        // Build code_list ordered by code-length the way the LUT builder
+        // expects: indices grouped by length, with `count_cumulative[k]`
+        // giving the start of length-k group.
+        // First pass: cumulative offsets.
+        let mut acc: u16 = 0;
+        for k in 0..=MAX_HUFF_TREE_DEPTH {
+            count_cumulative[k] = acc;
+            acc = acc.wrapping_add(dist_count[k]);
+        }
+        count_cumulative[MAX_HUFF_TREE_DEPTH + 1] = acc; // total count
+                                                         // Second pass: write code_list grouped by length.
+        let mut offsets = count_cumulative;
+        let mut code_list = [0u32; 32];
+        for (i, &length) in code_lengths.iter().enumerate() {
+            if length == 0 {
+                continue;
+            }
+            let li = length as usize;
+            code_list[offsets[li] as usize] = i as u32;
+            offsets[li] += 1;
+        }
+        make_inflate_huff_code_dist(
+            &mut self.table,
+            &mut self.dist_huff[..],
+            LIT_LEN as usize,
+            &count_cumulative,
+            &code_list,
+            ISAL_DEF_DIST_SYMBOLS as u32,
+        );
+        self.valid = true;
+        true
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    /// LITERAL port of `isal_huffman.rs::IsalDistCode::decode`
+    /// (line 329-357).
+    #[inline(always)]
+    pub fn decode(
+        &self,
+        bits: &mut crate::decompress::inflate::consume_first_decode::Bits<'_>,
+    ) -> Option<(u32, u32)> {
+        if bits.available() < 32 {
+            bits.refill();
+        }
+        let next_bits = bits.peek();
+        let next_10 = (next_bits & ((1u64 << ISAL_DECODE_SHORT_BITS) - 1)) as usize;
+        let mut next_sym = self.table.short_code_lookup[next_10] as u32;
+        let bit_count;
+        if (next_sym & SMALL_FLAG_BIT) == 0 {
+            bit_count = next_sym >> SMALL_SHORT_CODE_LEN_OFFSET;
+        } else {
+            let bit_len = (next_sym - SMALL_FLAG_BIT) >> SMALL_SHORT_CODE_LEN_OFFSET;
+            let long_next_bits = if bit_len <= 32 {
+                next_bits & ((1u64 << bit_len) - 1)
+            } else {
+                next_bits
+            };
+            let long_idx = ((next_sym & SMALL_SHORT_SYM_MASK)
+                + ((long_next_bits >> ISAL_DECODE_SHORT_BITS) as u32))
+                as usize;
+            next_sym = self.table.long_code_lookup[long_idx] as u32;
+            bit_count = next_sym >> SMALL_LONG_CODE_LEN_OFFSET;
+        }
+        if bit_count == 0 {
+            return None;
+        }
+        Some((next_sym & DIST_SYM_MASK, bit_count))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests — table-build sanity. The wiring commit ships the silesia byte-
 // perfect differential and the C-ISAL cross-check.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -873,6 +1164,69 @@ mod tests {
         assert_eq!(h.code(), 0x3456);
         assert_eq!(h.extra_bit_count(), 0x42);
         assert_eq!(h.code_and_extra(), 0x42_3456);
+    }
+
+    /// Build a lit/len decoder from a real dynamic-block code-length set
+    /// and round-trip decode a few hand-crafted symbol bit patterns.
+    ///
+    /// Code-length set is the fixed-Huffman table per RFC 1951 §3.2.6:
+    /// literals 0..143 → 8 bits; 144..255 → 9 bits; 256..279 → 7 bits;
+    /// 280..285 → 8 bits. Symbol 256 has the unique 7-bit code
+    /// 0b0000000 (which after bit-reversal is also 0b0000000). The
+    /// rebuilt decoder must return symbol=256 for that input pattern.
+    #[test]
+    fn decode_round_trips_fixed_huffman_eob() {
+        let mut code_lengths = vec![0u8; LIT_LEN];
+        for sym in 0..144 {
+            code_lengths[sym] = 8;
+        }
+        for sym in 144..256 {
+            code_lengths[sym] = 9;
+        }
+        for sym in 256..280 {
+            code_lengths[sym] = 7;
+        }
+        for sym in 280..286 {
+            code_lengths[sym] = 8;
+        }
+
+        let mut decoder = IsalLitLenCodePure::new_empty();
+        assert!(
+            decoder.rebuild_from(&code_lengths),
+            "fixed-Huffman code lengths must build"
+        );
+        assert!(decoder.is_valid());
+
+        // The fixed table guarantees symbol 256 has code 0b0000000 (7
+        // bits). Bit-reversed that's still 0b0000000.
+        // Stream the bits little-endian into a Bits reader.
+        let bytes = [0u8; 16];
+        let mut bits = crate::decompress::inflate::consume_first_decode::Bits::new(&bytes);
+        bits.refill();
+        let result = decoder.decode(&mut bits);
+        assert_eq!(result.symbol, 256, "EOB symbol decode failed");
+        assert_eq!(result.bit_count, 7);
+        assert_eq!(result.sym_count, 1);
+    }
+
+    /// The pure-rust dist-table decoder round-trips a single-bit input
+    /// when the dist code-length set assigns length 1 to one symbol.
+    #[test]
+    fn dist_decode_round_trips() {
+        // 2 dist symbols both with length 1 — codes 0 and 1.
+        let mut code_lengths = vec![0u8; 30];
+        code_lengths[0] = 1;
+        code_lengths[1] = 1;
+
+        let mut decoder = IsalDistCodePure::new_empty();
+        assert!(decoder.rebuild_from(&code_lengths));
+        // Bit 0 -> symbol 0.
+        let bytes = [0u8; 16];
+        let mut bits = crate::decompress::inflate::consume_first_decode::Bits::new(&bytes);
+        bits.refill();
+        let r = decoder.decode(&mut bits).expect("valid code");
+        assert_eq!(r.0, 0, "dist symbol 0 for bit-0 input");
+        assert_eq!(r.1, 1, "1 bit consumed");
     }
 
     /// Build a simple lit/len table from a fixed code-length distribution
