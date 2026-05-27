@@ -380,6 +380,50 @@ bench-sm-pure-rust: ship-precheck
 	@echo "✓ bench-sm-pure-rust complete on branch $$(git rev-parse --abbrev-ref HEAD)"
 
 # =============================================================================
+# perf-pure-rust: profile the pure-Rust decoder on neurotic to find waste.
+#
+# Builds gzippy with --no-default-features --features pure-rust-inflate AND
+# debuginfo (RUSTFLAGS adds -C debuginfo=1 -C force-frame-pointers=yes -C
+# strip=none). Runs perf record on a single silesia decode; prints the top
+# hot symbols. Use this AFTER bench-sm-pure-rust meets a gate to find
+# what's burning the remaining cycles.
+# =============================================================================
+perf-pure-rust: ship-precheck
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	echo ""; \
+	echo "── perf-pure-rust: profile ResumableInflate2 on neurotic ──"; \
+	if ! git rev-parse origin/$$BRANCH >/dev/null 2>&1 \
+	    || [ -n "$$(git log origin/$$BRANCH..HEAD 2>/dev/null)" ]; then \
+	  git push origin $$BRANCH || (echo "PUSH FAILED" >&2 && exit 1); \
+	fi; \
+	timeout $(BENCH_SM_TIMEOUT) $(NEUROTIC_SSH) "set -e; cd gzippy; \
+	  $(NEUROTIC_SYNC); \
+	  echo '  building gzippy with debuginfo...'; \
+	  RUSTFLAGS='-C debuginfo=1 -C force-frame-pointers=yes -C strip=none' \
+	    cargo build --release --no-default-features --features pure-rust-inflate \
+	    2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
+	  SLG=benchmark_data/silesia-large.gz; \
+	  THREADS=\$$(nproc); \
+	  PERF_DATA=/tmp/perf-pure-rust.data; \
+	  rm -f \"\$$PERF_DATA\"; \
+	  echo ''; \
+	  echo '── perf record: 5 silesia-large decodes (16T) ──'; \
+	  perf record -F 999 --call-graph dwarf,8192 -o \"\$$PERF_DATA\" -- bash -c \"\
+	    for i in 1 2 3 4 5; do \
+	      target/release/gzippy -d -c -p \$$THREADS \$$SLG > /dev/null; \
+	    done\" 2>&1 | tail -3; \
+	  echo ''; \
+	  echo '── top 30 self-time symbols (--no-children) ──'; \
+	  perf report -i \"\$$PERF_DATA\" --no-children --stdio 2>/dev/null \
+	    | grep -E '^[[:space:]]+[0-9]+\\.[0-9]+%' | head -30; \
+	  echo ''; \
+	  echo '── top 30 caller-view symbols ──'; \
+	  perf report -i \"\$$PERF_DATA\" -g graph,1,caller --stdio 2>/dev/null \
+	    | head -50"
+	@echo ""
+	@echo "✓ perf-pure-rust complete on branch $$(git rev-parse --abbrev-ref HEAD)"
+
+# =============================================================================
 # test-x86_64: verify the x86_64-only code on the homelab box. The parallel
 # single-member decode path (ISA-L) is gated on x86_64 + the
 # isal-compression feature and does not build on local arm64 macOS. This
