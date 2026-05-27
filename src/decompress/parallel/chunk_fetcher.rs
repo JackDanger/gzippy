@@ -573,6 +573,26 @@ pub fn drive<W: std::io::Write>(
             TAKE_U16_MISSES.load(Ordering::Relaxed),
             RETURN_U16_CALLS.load(Ordering::Relaxed),
         );
+        // Per-worker distribution — disambiguates "16 workers each
+        // cold-start" (first-touch dominance) vs "worker 0 is the
+        // hotspot" (consumer-thread-on-wrong-bucket).
+        // Shows only workers with any activity to keep the dump
+        // readable when MAX_WORKERS = 64.
+        eprintln!("  Per-worker buffer pool activity (worker: u8 h/m/r | u16 h/m/r):");
+        for i in 0..TAKE_U8_HITS_BY_WORKER.len() {
+            let u8h = TAKE_U8_HITS_BY_WORKER[i].load(Ordering::Relaxed);
+            let u8m = TAKE_U8_MISSES_BY_WORKER[i].load(Ordering::Relaxed);
+            let u8r = RETURN_U8_BY_WORKER[i].load(Ordering::Relaxed);
+            let u16h = TAKE_U16_HITS_BY_WORKER[i].load(Ordering::Relaxed);
+            let u16m = TAKE_U16_MISSES_BY_WORKER[i].load(Ordering::Relaxed);
+            let u16r = RETURN_U16_BY_WORKER[i].load(Ordering::Relaxed);
+            if u8h + u8m + u8r + u16h + u16m + u16r > 0 {
+                eprintln!(
+                    "    w{:>2}:  {}/{}/{}  |  {}/{}/{}",
+                    i, u8h, u8m, u8r, u16h, u16m, u16r
+                );
+            }
+        }
         use crate::decompress::parallel::gzip_chunk::{
             BOOTSTRAP_OUTPUT_ALLOCS, BOOTSTRAP_OUTPUT_DROPPED, BOOTSTRAP_OUTPUT_RETURNS,
             BOOTSTRAP_OUTPUT_REUSED_BYTES, BOOTSTRAP_OUTPUT_TAKES,
