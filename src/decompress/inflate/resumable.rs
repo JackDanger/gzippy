@@ -1455,11 +1455,21 @@ fn decode_huffman_body_resumable_isal(
         // doesn't reliably catch.
         state.bits.refill();
 
+        let _diag_bit_pos = state.bits.bit_position();
+        let _diag_bitbuf = state.bits.bitbuf;
+        let _diag_bitsleft = state.bits.bitsleft;
+
         // ISA-L LUT lookup: decodes up to 3 packed symbols in ONE
         // table access. bit_count is the bits consumed for ALL packed
         // symbols (codeword + any length-extras if the entry is a
         // pre-expanded length).
         let decoded = litlen.decode(&mut state.bits);
+        if std::env::var_os("GZIPPY_ISAL_INNER_DIAG").is_some() && out_pos < 40 {
+            eprintln!(
+                "[isal-inner] iter out_pos={out_pos} bit_pos={_diag_bit_pos} bitbuf=0x{_diag_bitbuf:016x} bitsleft={_diag_bitsleft} -> bit_count={} sym_count={} symbol={}",
+                decoded.bit_count, decoded.sym_count, decoded.symbol
+            );
+        }
         if decoded.bit_count == 0 || decoded.sym_count == 0 {
             return Err(Error::new(
                 ErrorKind::InvalidData,
