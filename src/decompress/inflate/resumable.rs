@@ -73,7 +73,7 @@ pub struct PendingMatch {
 #[derive(Copy, Clone, Debug)]
 pub struct PendingPack {
     pub remaining_symbol: u32,
-    pub remaining_count: u8,
+    pub remaining_count: u32,
 }
 
 /// Block-decode state machine position. Persists across `read_stream` calls
