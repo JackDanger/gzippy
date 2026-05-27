@@ -1351,19 +1351,7 @@ impl Block {
                         }
 
                         while emitted < n_max_to_decode {
-                            // Single refill at outer-loop top guarantees
-                            // `bits.available() >= 56`. The fast-path
-                            // `decode_assume_refilled` reads
-                            // `Bits::peek()` directly (no trait, no
-                            // Result, no per-call availability check) —
-                            // ~3-4 cycles saved per iter per the
-                            // 2026-05-27 perf profile where the trait-
-                            // based `decode` was 7.65% of total CPU.
-                            // Calling refill when bitsleft >= 56 is a
-                            // no-op (see consume_first_decode::Bits::refill).
-                            bits.refill();
-                            let (mut symbol, mut symbol_count) =
-                                litlen_hc.decode_assume_refilled(bits);
+                            let (mut symbol, mut symbol_count) = litlen_hc.decode(bits);
                             if symbol_count == 0 {
                                 commit!(Err(BlockError::InvalidHuffmanCode));
                             }
