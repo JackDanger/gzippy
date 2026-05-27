@@ -1611,27 +1611,45 @@ fn decode_huffman_body_resumable_isal(
     const FASTLOOP_MARGIN: usize = 320;
     const FASTLOOP_INPUT_TAIL: usize = 32;
 
+    // Lever B2: PRELOAD. Hoist the next LUT lookup BEFORE the current
+    // iter's emit so the table-lookup latency overlaps with the
+    // literal/match write. `preloaded_entry` is the result of the
+    // upcoming iter's `decode_litlen_local!()`, captured at the END of
+    // each iter (and initially before the loop).
+    //
+    // On yield without consume (pending_pack park, output-full at
+    // SAFELOOP top), the preloaded entry is DISCARDED — bits weren't
+    // consumed, so the next call re-PRELOADs the same value. No
+    // correctness risk, just a wasted lookup at yield boundaries.
+    let mut preloaded_bit_count: u32;
+    let mut preloaded_sym_count: u32;
+    let mut preloaded_sym: u32;
+    if (bitsleft as u8) < REFILL_THRESHOLD {
+        refill_local!();
+    }
+    {
+        let (bc, sc, s) = decode_litlen_local!();
+        preloaded_bit_count = bc;
+        preloaded_sym_count = sc;
+        preloaded_sym = s;
+    }
+
     macro_rules! decode_one_iter {
         () => {{
             // Drain pending pack tail FIRST (no bits operations needed).
             let (mut symbol, mut remaining) = if let Some(pp) = state.pending_pack.take() {
                 (pp.remaining_symbol, pp.remaining_count)
             } else {
-                if (bitsleft as u8) < REFILL_THRESHOLD {
-                    refill_local!();
-                }
-
-                let (bit_count, sym_count, sym) = decode_litlen_local!();
-                if bit_count == 0 || sym_count == 0 {
+                if preloaded_bit_count == 0 || preloaded_sym_count == 0 {
                     writeback_bits!();
                     return Err(Error::new(
                         ErrorKind::InvalidData,
                         "ISA-L litlen: zero bit_count or sym_count (invalid Huffman code)",
                     ));
                 }
-                bitbuf >>= bit_count;
-                bitsleft = bitsleft.wrapping_sub(bit_count);
-                (sym, sym_count)
+                bitbuf >>= preloaded_bit_count;
+                bitsleft = bitsleft.wrapping_sub(preloaded_bit_count);
+                (preloaded_sym, preloaded_sym_count)
             };
 
             while remaining > 0 {
@@ -1723,6 +1741,20 @@ fn decode_huffman_body_resumable_isal(
                 in_pos = state.bits.pos;
 
                 remaining = 0;
+            }
+
+            // B2 PRELOAD: peek next iter's LUT entry so the table
+            // lookup overlaps with whatever the caller does between
+            // iters. Skips on pending_pack (drain re-enters at top
+            // and uses the stashed state directly).
+            if state.pending_pack.is_none() {
+                if (bitsleft as u8) < REFILL_THRESHOLD {
+                    refill_local!();
+                }
+                let (bc, sc, s) = decode_litlen_local!();
+                preloaded_bit_count = bc;
+                preloaded_sym_count = sc;
+                preloaded_sym = s;
             }
         }};
     }
