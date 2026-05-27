@@ -1736,7 +1736,119 @@ fn decode_huffman_body_resumable_isal(
         let out_fl_end = output_len.saturating_sub(FASTLOOP_MARGIN);
         if state.pending_pack.is_none() && in_pos < in_fl_end && out_pos < out_fl_end {
             while state.pending_pack.is_none() && in_pos < in_fl_end && out_pos < out_fl_end {
-                decode_one_iter!();
+                // FAST PATH: single-literal entry. ~80% of dynamic-Huffman
+                // LUT entries on text data fall into this case (sym_count=1
+                // with literal value 0..255). Hardcoding it inline saves
+                // the while-loop entry/exit cost of decode_one_iter!.
+                if (bitsleft as u8) < REFILL_THRESHOLD {
+                    refill_local!();
+                }
+                let (bit_count, sym_count, sym) = decode_litlen_local!();
+                if bit_count != 0 && sym_count == 1 && (sym & 0xFFFF) <= 255 {
+                    bitbuf >>= bit_count;
+                    bitsleft = bitsleft.wrapping_sub(bit_count);
+                    unsafe {
+                        output_ptr.add(out_pos).write((sym & 0xFF) as u8);
+                    }
+                    out_pos += 1;
+                    continue;
+                }
+                // SLOW PATH: multi-pack, length code, EOB. We've already
+                // looked up — feed the result into the general processor.
+                if bit_count == 0 || sym_count == 0 {
+                    writeback_bits!();
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "ISA-L litlen: zero bit_count or sym_count",
+                    ));
+                }
+                bitbuf >>= bit_count;
+                bitsleft = bitsleft.wrapping_sub(bit_count);
+                let mut symbol = sym;
+                let mut remaining = sym_count;
+                while remaining > 0 {
+                    let code = symbol & 0xFFFF;
+                    if code <= 255 || remaining > 1 {
+                        if out_pos >= output_len {
+                            state.pending_pack = Some(PendingPack {
+                                remaining_symbol: symbol,
+                                remaining_count: remaining,
+                            });
+                            writeback_bits!();
+                            return Ok(out_pos);
+                        }
+                        unsafe {
+                            output_ptr.add(out_pos).write((code & 0xFF) as u8);
+                        }
+                        out_pos += 1;
+                        symbol >>= 8;
+                        remaining -= 1;
+                        continue;
+                    }
+                    if code == 256 {
+                        writeback_bits!();
+                        state.finish_current_block();
+                        return Ok(out_pos);
+                    }
+                    if code > MAX_LIT_LEN_SYM {
+                        writeback_bits!();
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "ISA-L litlen: symbol out of range",
+                        ));
+                    }
+                    let length = (code - LENGTH_BASE_OFFSET) as u32;
+                    if length == 0 || length > 258 {
+                        writeback_bits!();
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "ISA-L litlen: invalid length value",
+                        ));
+                    }
+                    let dist_sym = match decode_dist_local!() {
+                        Some(s) => s as u32,
+                        None => {
+                            writeback_bits!();
+                            return Err(Error::new(
+                                ErrorKind::InvalidData,
+                                "ISA-L dist: invalid code",
+                            ));
+                        }
+                    };
+                    if dist_sym >= 30 {
+                        writeback_bits!();
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "ISA-L dist: symbol out of range (>= 30)",
+                        ));
+                    }
+                    if (bitsleft as u8) < 14 {
+                        refill_local!();
+                    }
+                    let extra_bits = DIST_EXTRA_BIT_COUNT[dist_sym as usize];
+                    let extra_val = if extra_bits > 0 {
+                        let v = (bitbuf & ((1u64 << extra_bits) - 1)) as u32;
+                        bitbuf >>= extra_bits;
+                        bitsleft = bitsleft.wrapping_sub(extra_bits as u32);
+                        v
+                    } else {
+                        0
+                    };
+                    let distance = DIST_START[dist_sym as usize] + extra_val;
+                    if distance == 0 || distance > 32768 {
+                        writeback_bits!();
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "ISA-L dist: distance out of range",
+                        ));
+                    }
+                    writeback_bits!();
+                    out_pos = copy_match_windowed(state, output, out_pos, distance, length)?;
+                    bitbuf = state.bits.bitbuf;
+                    bitsleft = state.bits.bitsleft;
+                    in_pos = state.bits.pos;
+                    remaining = 0;
+                }
             }
             continue;
         }
