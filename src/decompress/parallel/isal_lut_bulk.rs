@@ -55,7 +55,13 @@ use crate::decompress::parallel::isal_huffman_pure::{IsalLitLenCodePure, LIT_LEN
 
 /// Distance decoder uses the proven `HuffmanCodingReversedBitsCached`.
 /// The dist code is only ~2.56% of CPU per profile; not the lever.
-pub type BulkDistDecoder = HuffmanCodingReversedBitsCached<30>;
+///
+/// Sized at 32 (NOT 30) so fixed-Huffman builds can include symbols
+/// 30 and 31 (RFC 1951 §3.2.6: reserved, "never actually occur in the
+/// compressed data, but participate in the code construction").
+/// Without these two length-5 entries count[5] is 30 instead of 32 →
+/// Kraft 0.9375 → incomplete code tree → mis-decoded dist symbols.
+pub type BulkDistDecoder = HuffmanCodingReversedBitsCached<32>;
 
 const MAX_WINDOW_SIZE: usize = 32 * 1024;
 const MAX_MATCH_LENGTH: usize = 258;
@@ -96,8 +102,7 @@ pub struct BulkBlockResult {
 pub struct DecoderScratch {
     pub litlen: IsalLitLenCodePure,
     pub dist: BulkDistDecoder,
-    litlen_lens: [u8; LIT_LEN],
-    dist_lens: [u8; 30],
+    dist_lens: [u8; 32],
     cl_lens: [u8; 19],
     all_lens: [u8; LIT_LEN + 30],
 }
@@ -107,8 +112,7 @@ impl DecoderScratch {
         Self {
             litlen: IsalLitLenCodePure::new_empty(),
             dist: BulkDistDecoder::new(),
-            litlen_lens: [0u8; LIT_LEN],
-            dist_lens: [0u8; 30],
+            dist_lens: [0u8; 32],
             cl_lens: [0u8; 19],
             all_lens: [0u8; LIT_LEN + 30],
         }
@@ -318,7 +322,9 @@ fn build_fixed_huffman(scratch: &mut DecoderScratch) -> Result<(), BulkDecodeErr
     if !scratch.litlen.rebuild_from(&fixed_lens) {
         return Err(BulkDecodeError::InvalidCodeLengths);
     }
-    for sym in 0..30 {
+    // Fixed-Huffman dist: 32 codes at length 5 (30 valid + 2 reserved).
+    // Same reasoning as the litlen 286/287 reserved-symbols fix above.
+    for sym in 0..32 {
         scratch.dist_lens[sym] = 5;
     }
     let err = scratch
