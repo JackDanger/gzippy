@@ -147,6 +147,10 @@ pub fn decode_block(
 
     let start_pos = *out_pos;
 
+    eprintln!(
+        "[diag] decode_block btype={} bfinal={} out_pos_start={}",
+        btype, is_final_block, *out_pos
+    );
     match btype {
         0b00 => {
             return decode_stored_block(bits, output, out_pos, is_final_block);
