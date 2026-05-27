@@ -421,12 +421,6 @@ fn worker_main(
     pin: Option<u32>,
 ) {
     crate::decompress::parallel::chunk_buffer_pool::bind_worker_pool_index(thread_index);
-    // Z-allocator lever: worker-side chunk_buffer_pool pre-warm.
-    // Default-off; enable on neurotic via `GZIPPY_PREWARM_POOL=1` for the
-    // 20-trial bench-on-branch gate per `project_allocator_lever_confirmed`
-    // (mechanism: pre-allocated Vecs in pool eliminate the u16
-    // doubling-realloc thrash on speculative chunks).
-    crate::decompress::parallel::chunk_buffer_pool::prewarm_current_worker();
     if let Some(core_id) = pin {
         // Mirror of `pinThreadToLogicalCore(static_cast<int>(pinning->second))`
         // (ThreadPool.hpp:199). `core_affinity` is portable across the
