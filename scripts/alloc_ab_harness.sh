@@ -116,8 +116,10 @@ for FIXTURE in "${FIXTURES[@]}"; do
                 TIME_OUT=$({ time GZIPPY_PREWARM_POOL=0 "$BIN" -d -c -p 16 "$FIXTURE" > "$OUTFILE"; } 2>&1)
                 WALL_S=$(echo "$TIME_OUT" | awk '/^real/{ gsub(/[ms]/, " ", $2); split($2, a, " "); print a[1]*60 + a[2] }')
                 WALL_MS=$(awk -v ws="$WALL_S" 'BEGIN { print ws*1000 }')
-                # Capture page-faults via perf-stat (single short event group)
-                PF_OUT=$({ perf stat -e page-faults,minor-faults,major-faults GZIPPY_PREWARM_POOL=0 "$BIN" -d -c -p 16 "$FIXTURE" > "$OUTFILE"; } 2>&1)
+                # Capture page-faults via perf-stat (single short event group).
+                # `perf stat` doesn't accept env-var prefix syntax for its
+                # workload; use `env` explicitly.
+                PF_OUT=$({ perf stat -e page-faults,minor-faults,major-faults env GZIPPY_PREWARM_POOL=0 "$BIN" -d -c -p 16 "$FIXTURE" > "$OUTFILE"; } 2>&1)
                 MINFLT=$(echo "$PF_OUT" | grep -E "minor-faults" | awk '{print $1}' | tr -d ',')
                 MAJFLT=$(echo "$PF_OUT" | grep -E "major-faults" | awk '{print $1}' | tr -d ',')
                 MINFLT=${MINFLT:-0}; MAJFLT=${MAJFLT:-0}
