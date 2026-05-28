@@ -268,6 +268,33 @@ pub fn literal_loop_fn() -> &'static (ExecutableBuffer, dynasmrt::AssemblyOffset
     FN.get_or_init(emit_literal_loop)
 }
 
+/// Safe wrapper that calls the JIT'd literal loop.
+///
+/// Returns the ExitReason. Updates `state` in place.
+pub fn run_literal_loop(
+    input: &[u8],
+    lut_entries: &[u8],
+    out_buf: &mut [u8],
+    state: &mut DecodeState,
+) -> ExitReason {
+    let (buf, off) = literal_loop_fn();
+    let fp: LiteralLoopFn = unsafe { std::mem::transmute(buf.ptr(*off)) };
+    let r = unsafe {
+        fp(
+            input.as_ptr(),
+            lut_entries.as_ptr(),
+            out_buf.as_mut_ptr(),
+            out_buf.len() as u64,
+            state,
+        )
+    };
+    match r {
+        0 => ExitReason::NonLiteral,
+        1 => ExitReason::OutputFull,
+        _ => ExitReason::InputUnderflow,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
