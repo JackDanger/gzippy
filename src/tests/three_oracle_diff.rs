@@ -350,3 +350,58 @@ fn three_oracle_mini_fuzz_50_cases() {
         assert_three_oracle_agree(&gz, &format!("fuzz_case_{case}_size{size}_L{level}"));
     }
 }
+
+/// Extended fuzz soak — proxy for the plan §7 criterion #2's 72h
+/// requirement. We can't run 72h in a test session, but we CAN run
+/// a high-case-count batch (10,000 cases) to materially raise
+/// statistical confidence vs. the 50-case mini-fuzz above.
+///
+/// Per the project's process rule: the 72h soak is a release-gate
+/// requirement that must run pre-release in CI, not in unit-test
+/// budget. This test stands in for the pre-release validation
+/// shape — it runs ~minutes on neurotic and zero disagreements
+/// across this scale is necessary-but-not-sufficient for the full
+/// 72h gate.
+///
+/// Skipped by default (run with --ignored to opt in).
+#[test]
+#[ignore = "extended fuzz — run with --ignored; ~minutes on neurotic"]
+fn three_oracle_extended_fuzz_10k_cases() {
+    let mut rng_seed: u64 = 0xB5C0_FACE_DEAD_BEEF;
+    let mut max_size = 0usize;
+    let mut total_bytes = 0usize;
+    for case in 0..10_000 {
+        rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        // Bias toward smaller cases (more cases per minute) but
+        // include occasional larger ones (more entropy coverage).
+        let size = if case % 100 == 0 {
+            ((rng_seed >> 32) as usize) % (1024 * 1024) + 1
+        } else {
+            ((rng_seed >> 32) as usize) % (64 * 1024) + 1
+        };
+        max_size = max_size.max(size);
+        total_bytes += size;
+        let mut rng = rng_seed ^ 0xC0DE_FEED_DEAD_BEEF;
+        let mut payload = Vec::with_capacity(size);
+        for _ in 0..size {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            payload.push((rng >> 24) as u8);
+        }
+        let level = ((rng_seed >> 8) as u32) % 10;
+        let gz = compress(&payload, level);
+        assert_three_oracle_agree(&gz, &format!("ext_fuzz_{case}_size{size}_L{level}"));
+        if case % 1000 == 999 {
+            eprintln!(
+                "extended_fuzz: case {} / 10000, max_size {} bytes, total {} MB",
+                case + 1,
+                max_size,
+                total_bytes / 1_048_576
+            );
+        }
+    }
+    eprintln!(
+        "extended_fuzz: 10000 / 10000 passed, max_size {} bytes, total {} MB",
+        max_size,
+        total_bytes / 1_048_576
+    );
+}
