@@ -6,11 +6,17 @@ not**. Cheap experiments still belong in the plan — not because they
 save labor but because they produce information that changes what we
 build. Measurement is a hard constraint, not a budget item.
 
-This is the plan for closing the measured 22pp perf gap to ISA-L FFI
-to within 1-2pp (CLAUDE.md prime directive: ultimately *beat* ISA-L
-and libdeflate). With infinite labor we build competing routes in
-parallel and pick the winner by measurement, rather than sequencing
-phases by cost.
+This is the plan for closing the measured perf gap to ISA-L FFI to
+within 1-2pp (CLAUDE.md prime directive: ultimately *beat* ISA-L and
+libdeflate). With infinite labor we build competing routes in parallel
+and pick the winner by measurement, rather than sequencing phases by
+cost.
+
+**Measured gap (corrected 2026-05-28)**: ~10pp (down from the 22pp
+figure in earlier drafts of this plan — see §1.1 methodology gate
+for the contamination explanation). The route sizing (§4) and the
+risk #10 reference (§9) were written against 22pp; they have been
+annotated, not rewritten — most of the architecture stays.
 
 The companion document `plans/unified-decoder-stretch.md` is
 **ignorable for the purpose of this plan**. Items from it that have
@@ -20,21 +26,51 @@ doesn't change their priority order.
 
 ---
 
-## 1. Measured baseline (2026-05-27)
+## 1. Measured baseline
 
-Paired alternating bench, 12 trials, neurotic i7-13700T,
-silesia-large.gz at T=16:
+### 1.1 Methodology gate (CRITICAL — added 2026-05-28)
 
-| Build | env | Median MB/s | Δ vs ISA-L |
-|---|---|---|---|
-| `--features isal-compression` | — | ~1050 | (baseline) |
-| `--features pure-rust-inflate` (libdeflate-inner) | default | ~820 | -22% |
-| `--features pure-rust-inflate` | `GZIPPY_RESUMABLE_ISAL_INNER=1` | ~770 | -27% |
+Before any bench claim, verify clean release profile:
+
+```
+grep -E "^strip" Cargo.toml | head -3
+# Expect first line: strip = true
+```
+
+The 2026-05-27 baseline below was measured under a contaminated
+Cargo.toml (debug-info enabled in release profile during a perf
+symbolization experiment). That contamination accounts for an
+~12pp overstatement of the gap. The 2026-05-28 row reflects clean
+builds.
+
+### 1.2 Baseline measurements
+
+Paired alternating bench, neurotic i7-13700T, silesia-gzip9.gz at T=16:
+
+| Date | Trials | Build | env | Median MB/s | Δ vs ISA-L |
+|------|--------|-------|-----|-------------|------------|
+| 2026-05-27 (contaminated) | 12 | `--features isal-compression` | — | ~1050 | (baseline) |
+| 2026-05-27 (contaminated) | 12 | `--features pure-rust-inflate` (libdeflate-inner) | default | ~820 | -22% |
+| 2026-05-27 (contaminated) | 12 | `--features pure-rust-inflate` | `GZIPPY_RESUMABLE_ISAL_INNER=1` | ~770 | -27% |
+| **2026-05-28 (clean)** | **10** | `--features isal-compression` | — | **1212** | (baseline) |
+| **2026-05-28 (clean)** | **10** | `--features pure-rust-inflate` (libdeflate-inner) | default | **1092** | **-10%** |
+| **2026-05-28 (clean, post-T3)** | **20** | `--features pure-rust-inflate` (libdeflate-inner) | default | **904** | (different system load — noisy) |
+
+**NOTE (insufficiently verified)**: the **2026-05-28 10pp row is
+below §7's ≥12-trial floor**. Treat as directional; re-run at 20+
+trials before treating "10%" as canonical for future planning.
+The 20-trial T3 row's lower absolute throughput vs the 10-trial
+row reflects CPU thermal/clock throttling between runs, not a
+T3 regression — interleaved A/B within the 20-trial set showed
+T3 at +1.9% vs the pre-T3 baseline.
+
+### 1.3 Compile flags status
 
 Compile flags (`LTO=fat`, `codegen-units=1`,
-`RUSTFLAGS=-C target-cpu=native`) did not move the gap. Eight
-session-length lever attempts all either no-op'd or regressed —
-preserved in §6 falsification record.
+`RUSTFLAGS=-C target-cpu=native`) did not move the gap. Eleven
+session-length lever attempts (7 from May 27 + 6 from May 28)
+all either no-op'd or regressed — preserved in §6 falsification
+record.
 
 ### What this session DID land (real wins regardless of next step)
 
@@ -282,6 +318,23 @@ in parallel.
 **Risk:** dynasm-rs maintenance status; macOS Hardened Runtime
 entitlement; per-fingerprint asm authoring quality.
 
+**2026-05-28 caveat (weakening this route)**: Route C v3.7 and
+v3.9 spikes (commits `e642d7f`, `50d2930`) demonstrated that
+**pure scalar dynasm asm is at parity with rustc-generated code**
+on the literal-decode loop (369-405 MB/s asm vs 364-400 MB/s
+rustc on 3350 silesia blocks). rustc with `-C target-cpu=native`
+already emits equivalent scalar codegen. Route C only earns its
+~3 person-month cost if the dynasm-emitted code is structurally
+DIFFERENT from rustc output — i.e., uses BMI2 PEXT for bit
+extraction OR AVX2 vpshufb for multi-byte literal output OR
+speculative-parallel LUT lookups. The pure scalar asm pattern is
+falsified as the differentiator.
+
+**Implication for v1 scope**: §5's "Route C v1 ships with fixed
+Huffman" should be amended to "Route C v1 ships with AVX2
+vector-decode for the inner-loop hot path." Scalar Route C v1
+doesn't earn its keep at the corrected ~10pp gap.
+
 ### 4.4 Route D: bit-reader rewrite (§3.2) on the current libdeflate-inner
 
 Land the signed-i32 rollback pattern on the existing path (no JIT).
@@ -373,12 +426,14 @@ parallel as soon as oracle infra exists.
 
 ---
 
-## 6. Falsification record from 2026-05-27 (preserved — institutional memory)
+## 6. Falsification record (preserved — institutional memory)
 
 Future attempts must address the specific hypothesized failure mode
 or validate that mode was wrong via perf counters before retrying.
 Even under infinite labor, re-walking these dead ends is wasted
 information.
+
+### 6.1 From 2026-05-27
 
 | Attempt | Measured | Hypothesized cause |
 |---|---|---|
@@ -389,6 +444,46 @@ information.
 | Writeback-skip around copy_match_windowed | -9pp | Borrow-checker pessimism plausibly caused spills; not validated via codegen diff |
 | LTO=fat + codegen-units=1 + native | no change | Compile flags alone insufficient |
 | `target-cpu=native` alone | no change | Same |
+
+### 6.2 From 2026-05-28
+
+| Attempt | Measured | Hypothesized cause | Future-retry guard |
+|---|---|---|---|
+| Route C v3.7 dynasm asm literal decode + byte-by-byte refill | at parity (369 vs 364 MB/s) | rustc with `-C target-cpu=native` already emits equivalent scalar codegen for the tight literal loop | Don't retry pure-scalar asm — needs SIMD (vpshufb / BMI2 PEXT) to be different from rustc output |
+| Route C v3.9 dynasm asm + libdeflate-style chunked 8-byte refill | at parity (405 vs 400 MB/s) | Same as v3.7 — confirmation that refill strategy isn't the lever | Same guard |
+| S1 u32 packed multi-literal store | +0.4% (within noise, 10 trials) | LLVM + x86 store-buffer coalescing already merges 4 adjacent byte stores as one cache-line write | Don't reorganize byte stores; the OoO core's store buffer already optimizes them |
+| S2 bulk window-copy in `copy_match_windowed` slow path | at parity (657.8 vs 655.7 MB/s, 10-trial interleaved) | Slow path fires on ~3% of chunk bytes only — too rare to move overall throughput | Attack the FAST path (copy_match_fast) only, not the slow path |
+| L1 madvise(MADV_HUGEPAGE) on fresh chunk allocations | -38% (487 vs 789 MB/s) | khugepaged contention when 16 workers all hint at once + madvise call latency exceeds savings | Don't use madvise hints under high worker count; explore MAP_HUGETLB direct mmap or daemon-mode prewarm instead |
+| `GZIPPY_RESUMABLE_ISAL_INNER=1` as production default | -6% (630 vs 670 MB/s, 10-trial interleaved) | The ISA-L LUT inner loop's multi-pack symbol-emit path adds overhead per literal that libdeflate-LUT's single-symbol-emit doesn't have on production silesia | Keep libdeflate-LUT as default; ISA-L LUT helps marker phase only |
+| C-fastloop iter-count batch (replace `while ... { decode_one_symbol!() }` with `for _ in 0..safe_iters`) | INFINITE LOOP (hung cargo test 4+ hours per stuck process) | When `safe_iters = 0` near chunk tail, for-loop ran zero iters and re-entered fastloop with same bounds | Any iter-count rewrite needs `safe_iters >= 1` invariant OR explicit fall-through to safe loop |
+
+### 6.3 Confirmed positive results (2026-05-28)
+
+| Attempt | Measured | Mechanism |
+|---|---|---|
+| **T3-simplify** (4-literal cap → vendor's 2-extra-literal) | +1.9% (904 vs 887 MB/s, 20-trial interleaved) | Removes a measured-bad path: vendor libdeflate `decompress_template.h:370` explicitly comments 3+ extras "actually decreases performance slightly" — gzippy's 4-cap was worse than vendor's 2-cap. Reduces i-cache pressure + branch-pred state. **Needs 30-trial confirm** before treating as canonical (currently below §7's ≥12 floor, but well above paired-bench noise floor on these 20 trials). |
+
+### 6.4 Perf attribution (2026-05-28 symbolized)
+
+Fresh `perf record` on neurotic (force-frame-pointers + debuginfo=1)
+shows 19.10% memmove is **entirely in marker-bootstrap path**:
+- `emit_backref_ring` (marker u16 ring backref copy): 2.84%
+- `Vec::extend_from_slice` from `Block::drain_to_output`: 1.61%
+- `copy_within` in `ChunkData::clean_unmarked_data`: 1.82%
+
+Bulk inflate (`decode_huffman_body_resumable`,
+`copy_match_windowed`) contributes essentially zero memmove. The
+marker bootstrap runs in BOTH `pure-rust-inflate` and
+`isal-compression` builds (same code; only bulk phase differs),
+so memmove % is NOT what differentiates pure-rust from ISA-L
+throughput. The gap really IS in the bulk inflate inner loop.
+
+This redirects optimization effort: don't attack the per-byte slow
+path of copy_match_windowed (S2 falsification confirms); do
+consider the marker-phase u8 ring + parallel bitmap as a separate
+~5% lever in the marker-decode workload.
+
+See `docs/perf/2026-05-28-memmove-symbolized.md`.
 
 ---
 
@@ -412,7 +507,16 @@ ALL of:
    production traffic, zero rollbacks attributed to the new decoder,
    no field bug reports), then delete the legacy inflate paths per
    §8.
-5. **Opus advisor sign-off** on the neurotic measurement.
+5. **Opus advisor sign-off**. Per user process rule (2026-05-27),
+   advisor consultation is required for **every judgment call AND
+   every claimed task completion**, not only on the final neurotic
+   1pp measurement. Enforced by `.claude/settings.json` hooks.
+   Scope examples:
+   - Before picking the next lever from §6.2/§6.3.
+   - Before claiming a falsification is sufficient to update §6.
+   - Before promoting a feature-gated experiment to production default.
+   - Before declaring the 1pp threshold is met (the final gate).
+   - Before any commit that touches the inflate hot path.
 
 ---
 
@@ -462,6 +566,34 @@ in the all-routes-compose case; substantially smaller if Route A
     hand-tuned asm; per-CPU dispatch; arch-specific binaries.
     Multi-quarter even under infinite labor because the work is
     sequential learning, not parallel coding.
+    **2026-05-28 UPDATE**: gap is ~10pp after clean-build re-measure
+    (not 22pp). This risk now reads "the 10pp gap may be unreachable"
+    — still real, but the routes have less work to do.
+11. **Iter-count rewrites of the inflate fastloop need a non-zero
+    invariant.** The 2026-05-28 C-fastloop attempt replaced
+    `while in_pos < in_fl_end && out_pos < out_fl_end { ... }` with
+    `for _ in 0..safe_iters { ... }`. When `safe_iters = 0` near
+    the chunk tail (e.g., `in_fl_end - in_pos < 8`), the for loop
+    ran zero iterations and `continue`d to outer loop, which
+    re-entered the fastloop with the same bounds → infinite loop.
+    Hung `cargo test resumable` 4+ hours (235 minutes CPU) before
+    kill. **Mitigation**: any iter-count rewrite of the fastloop
+    MUST ensure `safe_iters >= 1` OR fall through to a bounded
+    safe-loop iteration. Pre-flight gate: cargo test resumable
+    must finish in <30s (vs hanging) before benching.
+12. **Scalar codegen is already optimal in rustc + LLVM**
+    (2026-05-28 — confirmed by 3 falsifications: Route C v3.7/v3.9
+    dynasm asm at parity, S1 packed store at parity). New attempts
+    on the inflate inner loop must demonstrate a structural
+    difference (SIMD, BMI2 PEXT, vector-shaped data movement) or
+    pre-justify why they wouldn't be LLVM-defeated.
+13. **Bench contamination from debug-info in release profile.**
+    Adding `debug = "line-tables-only"` and `strip = false` to
+    Cargo.toml's `[profile.release]` (e.g., for perf symbolization)
+    materially slows the binary. This session showed -12pp
+    throughput on the contaminated build. **Mitigation**: every
+    bench session starts with `grep -E "^strip" Cargo.toml | head -3`
+    showing `strip = true`.
 
 ---
 
@@ -473,6 +605,13 @@ in the all-routes-compose case; substantially smaller if Route A
    dist_lengths)` tuples and their frequency. Determines whether
    AOT specialization (§3.1) yields hit rate worth the build-time
    tax.
+   **2026-05-28 status: ANSWERED — falsified.** Corpus walker on
+   silesia found 3348 dynamic blocks with 3348 unique fingerprints
+   (zero repeats). Top-N AOT specialization yields ~0% hit rate on
+   silesia. Memory: [[project_phase1_codegen_audit]]. Combined
+   with the gap correction (10pp not 22pp), AOT fingerprints are
+   downgraded as a lever. Re-prioritize toward AVX2 vector decode
+   for Route C v1.
 2. **CHD vs BBHash vs FrozenHashMap for perfect-hash construction
    (§3.5).** **Answered by:** half-day microbench on silesia block-
    size distribution.
