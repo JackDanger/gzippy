@@ -31,10 +31,12 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 pub mod aot;
+pub mod bit_reader;
 pub mod chd;
 pub mod constant_time;
 pub mod gpu;
 pub use aot::{fingerprint_hash, match_aot_fingerprint};
+pub use bit_reader::{pext, BitReaderI32, ShiftRegisterWidth};
 pub use chd::ChdTable;
 pub use constant_time::ConstantTimeInflate;
 pub use gpu::{BlockRange, GpuBackend, GpuError, GpuInflate};
