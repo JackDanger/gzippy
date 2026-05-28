@@ -216,9 +216,10 @@ just zeroing kernel pages.
 
 **This is the page-fault gap manifesting as syscall cost.**
 
-## 4. The exact lever (no longer "stab in dark")
+## 4. The levers (advisor-corrected — 5 sub-levers, not 2)
 
-To match rapidgzip's allocator pattern, gzippy must do BOTH of:
+Advisor review of Step 1 caught 3 missed sub-levers + a downgrade
+of the headline claim. Updated:
 
 ### Lever 4.1: Use rpmalloc as the GLOBAL allocator
 
@@ -234,23 +235,77 @@ Fix: set `#[global_allocator] = RpMalloc` in `main.rs`. The
 Expected: brk time drops from 24.7 ms to ~0.25 ms (24.5 ms saved =
 ~3.4% of a 720 ms decode).
 
-### Lever 4.2: Switch ChunkData::data to chunked allocation
+### Lever 4.1a (advisor-added): rpmalloc_thread_initialize per worker
+
+**Critical caveat**: gzippy uses a custom thread pool (rayon-like
+in `chunk_fetcher`). rpmalloc REQUIRES `rpmalloc_thread_initialize()`
+to be called per worker thread on entry. If we forget, workers fall
+back to a global mutex'd heap — a silent perf cliff with no crash.
+
+The Rust `rpmalloc` crate handles this for `std::thread::spawn`
+threads automatically via a thread-local guard. **For custom thread
+pools we must wire the init hook in `bind_worker_pool_index` or
+similar.**
+
+Expected: required for Lever 4.1 to deliver any win; if missing, 4.1
+could be NEUTRAL or NEGATIVE.
+
+### Lever 4.1b (advisor-added): RPMALLOC_CONFIGURABLE span size
+
+rpmalloc default span size is 64 KiB; spans are grouped in pairs
+(128 KiB). This is **not a coincidence** with the 128 KiB
+ALLOCATION_CHUNK_SIZE — 128 KiB chunks fit exactly one span pair.
+The lever only delivers if Lever 4.2 chunk size matches the span
+geometry.
+
+### Lever 4.2 (modified): Switch ChunkData::data to chunked allocation
 
 Replace the single `Vec<u8>` with `Vec<Box<[u8; 128*1024]>>` — a
 vector of fixed-size 128 KiB chunks. When decoding writes overflow
 the current chunk, allocate a new one. The downstream consumer
 (write to writer) iterates the chunks in order.
 
-With rpmalloc backing AND fixed 128 KiB chunks: each `Box::new([0u8; 128*1024])`
-hits rpmalloc's thread-local cache after the first few. Page-faults
-amortize across the whole process lifetime.
+**ADVISOR CAVEAT (read-side risk)**: strace measures syscall
+wall-time. It does NOT tell us whether the consumer (writer / CRC /
+inflate's match copy) stalls on cold-cache loads of those same
+ChunkData pages later. If 128 KiB Box-per-chunk breaks contiguity,
+the writer's `write_all` loses sequential prefetch and we could
+lose more on the consumer than we save on the allocator.
 
-Expected: page-fault count drops from 168.9K to ~80K (matching
-rapidgzip's 78.5K).
+**Mitigation**: capture Step 2 perf-mem PEBS attribution to
+verify dominant LLC misses are write-side (alloc) vs read-side
+(consumer). If consumer-side: 128 KiB chunking is a NET REGRESSION
+and we need a different shape (e.g., one big mmap with reusable
+pool that pre-faults).
 
-Combined throughput expectation (extrapolating from rapidgzip's own
-bench): up to 2.5× on the alloc-bound portion, ~30-40% e2e
-throughput improvement.
+### Lever 4.1c (advisor-added: NEGATIVE CONTROL): glibc M_MMAP_THRESHOLD
+
+Before doing the rpmalloc swap, validate the hypothesis by tweaking
+glibc directly:
+
+```c
+mallopt(M_MMAP_THRESHOLD, 4 * 1024 * 1024);  // 4 MiB; below 12 MiB Vec
+```
+
+This converts gzippy's brk-heavy pattern into mmap-heavy WITHOUT
+changing the allocator. If it shows the same throughput win we're
+predicting from rpmalloc, we have evidence the lever is "avoid brk"
+not "rpmalloc magic". If it shows nothing, rpmalloc is doing
+something else (likely the span-size + thread-local cache magic).
+
+Cheap (one-line `mallopt` call in main.rs); should ship as Step 4
+microbench negative control.
+
+### Headline claim (advisor downgraded)
+
+Originally claimed 30-40% e2e throughput. **Not defensible** at T=16
+single-file silesia per advisor. rapidgzip's 2.5× internal bench was
+on a 256x-silesia file where allocator cost is amortized over far
+more allocations per process.
+
+**Corrected estimate: 10-20% wall improvement on silesia-gzip9.gz at
+T=16.** The 2.5× number applies only to the allocator-bound portion
+of the work, which is ~10-30% of total CPU per Step A counters.
 
 ## 5. Why we now have a NON-stab-in-dark framework
 
