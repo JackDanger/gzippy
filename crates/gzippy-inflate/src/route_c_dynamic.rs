@@ -341,6 +341,27 @@ pub fn decode_dynamic_block_layered_with_window(
             }
             out_buf[out_pos] = sym as u8;
             out_pos += 1;
+
+            // Multi-literal lookahead — libdeflate's FASTLOOP pattern.
+            // We've already paid for the bit-buffer refill at the top
+            // of the iteration; if there's still ≥ MAIN_BITS bits left
+            // AND the next entry is also a short literal, write it
+            // inline. Up to 3 additional literals (4 total per iter)
+            // before falling through to the next refill.
+            for _ in 0..3 {
+                if bitsleft < MAIN_BITS as i32 || out_pos >= out_buf.len() {
+                    break;
+                }
+                let key2 = (bitbuf & ((1u64 << MAIN_BITS) - 1)) as usize;
+                let e2 = litlen_lut.entries[key2];
+                if e2.length == 0 || e2.length & SUBTABLE_FLAG != 0 || e2.symbol >= 256 {
+                    break;
+                }
+                bitbuf >>= e2.length;
+                bitsleft -= e2.length as i32;
+                out_buf[out_pos] = e2.symbol as u8;
+                out_pos += 1;
+            }
         } else if sym == 256 {
             let end_bit = (byte_pos as u64) * 8 - bitsleft.max(0) as u64;
             return Ok((end_bit, out_pos - out_start));
