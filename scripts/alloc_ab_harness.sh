@@ -111,7 +111,9 @@ for FIXTURE in "${FIXTURES[@]}"; do
             for SINK in devnull file; do
                 OUTFILE=$([[ "$SINK" == "devnull" ]] && echo "/dev/null" || echo "/tmp/sink.bin")
                 # Use /usr/bin/time -v to capture page-faults reliably + wall
-                STATS=$(/usr/bin/time -v env GZIPPY_PREWARM_POOL=0 "$BIN" -d -c -p 16 "$FIXTURE" > "$OUTFILE" 2>&1 | tail -23)
+                # Important: group-redirect so command stdout goes to $OUTFILE
+                # but /usr/bin/time -v's stderr goes to STATS.
+                STATS=$({ /usr/bin/time -v env GZIPPY_PREWARM_POOL=0 "$BIN" -d -c -p 16 "$FIXTURE" > "$OUTFILE"; } 2>&1)
                 WALL=$(echo "$STATS" | grep "Elapsed (wall clock)" | awk -F': ' '{print $NF}')
                 # Convert h:mm:ss.ss or m:ss.ss to seconds
                 WALL_S=$(echo "$WALL" | awk -F: '{
