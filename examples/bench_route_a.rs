@@ -102,12 +102,62 @@ fn bench_zlibng_c(gz: &[u8], expected_size: usize, trials: usize) -> Vec<f64> {
     tps
 }
 
+// `backends` is private inside gzippy. For the example bench we inline a
+// copy of the Route A wrapper here (functionally identical to
+// `src/backends/libdeflate_rs.rs::decompress_gzip`). Keeps the lib
+// surface clean and the example self-contained.
+#[cfg(feature = "streaming-libdeflate-rs")]
+fn route_a_decompress(gz: &[u8]) -> Vec<u8> {
+    use streaming_libdeflate_rs::{
+        decompress_gzip::libdeflate_gzip_decompress,
+        libdeflate_alloc_decode_tables,
+        streams::{
+            deflate_chunked_buffer_input::DeflateChunkedBufferInput,
+            deflate_chunked_buffer_output::DeflateChunkedBufferOutput,
+        },
+        DeflateInput,
+    };
+    let mut cursor = 0usize;
+    let mut input_stream = DeflateChunkedBufferInput::new(
+        |buf: &mut [u8]| {
+            let remaining = gz.len().saturating_sub(cursor);
+            let take = remaining.min(buf.len());
+            buf[..take].copy_from_slice(&gz[cursor..cursor + take]);
+            cursor += take;
+            take
+        },
+        64 * 1024,
+    );
+    let collected: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cc = std::sync::Arc::clone(&collected);
+    let mut output_stream = DeflateChunkedBufferOutput::new(
+        move |chunk: &[u8]| -> Result<(), ()> {
+            cc.lock().unwrap().extend_from_slice(chunk);
+            Ok(())
+        },
+        64 * 1024,
+    );
+    let mut decoder = libdeflate_alloc_decode_tables();
+    while {
+        input_stream.ensure_overread_length();
+        input_stream.has_valid_bytes_slow()
+    } {
+        libdeflate_gzip_decompress(&mut decoder, &mut input_stream, &mut output_stream).unwrap();
+    }
+    drop(output_stream);
+    std::sync::Arc::try_unwrap(collected)
+        .unwrap()
+        .into_inner()
+        .unwrap()
+}
+
 #[cfg(feature = "streaming-libdeflate-rs")]
 fn bench_route_a(gz: &[u8], trials: usize) -> Vec<f64> {
     let mut tps = Vec::with_capacity(trials);
     for _ in 0..trials {
         let t0 = Instant::now();
-        let out = gzippy::backends::libdeflate_rs::decompress_gzip(gz).unwrap();
+        let out = route_a_decompress(gz);
         let dt = t0.elapsed().as_secs_f64();
         let mbps = (out.len() as f64) / 1_000_000.0 / dt;
         tps.push(mbps);
