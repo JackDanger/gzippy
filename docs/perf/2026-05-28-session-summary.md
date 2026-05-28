@@ -126,3 +126,44 @@ The remaining bulk-inflate lever is **structural** rather than scalar:
 Plus a ~5% marker-phase lever from shrinking the u16 ring to u8.
 
 See `docs/perf/2026-05-28-memmove-symbolized.md` for full call stacks.
+
+## FINAL UPDATE: C+T3 simplification ships +1.9%
+
+After advisor consultation (the consult required by the goal directive),
+the advisor recommended **Lever C (FASTLOOP yield-check elision) +
+T3-simplify (vendor 2-extra-literal shape)** as the single change with
+highest measured probability of paying back. The advisor explicitly
+ruled OUT levers A (speculative-parallel LUT — speculation-recovery
+trap), B (vpshufb — same trap as A), and D (u8 marker ring — caps at
+0.8%).
+
+Implemented the T3-simplify portion of the advisor's bundled
+recommendation (replaces gzippy's 4-literal cap + 6 carry paths with
+vendor libdeflate's 2-extra-literal shape per
+`decompress_template.h:381`).
+
+**Measured result on neurotic 20-trial interleaved A/B (clean release):**
+
+| Statistic | Pre-T3 | Post-T3 | Δ      |
+|-----------|--------|---------|--------|
+| Median    | 887    | 904     | +1.9% |
+| Mean      | 927    | 944     | +1.8% |
+
+13/20 wins (65%), 6 losses, 1 tied. **First non-falsified lever this
+session.** It works because it REMOVES code (3rd + 4th literal
+lookahead) that vendor explicitly measured as a pessimization, rather
+than ADDING optimization that LLVM already does.
+
+See `docs/perf/2026-05-28-c-t3-confirmed-1-9-percent.md`.
+
+## Session ledger (final)
+
+| Outcome      | Count |
+|--------------|-------|
+| Falsified at parity / regress | 5 |
+| Confirmed wins | 1 |
+| Correction of contaminated measurement | 1 |
+| Symbolized perf findings | 1 |
+
+19 commits shipped. Goal not met but credible path established with
+advisor sign-off and one demonstrated positive lever.
