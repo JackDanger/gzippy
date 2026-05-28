@@ -102,6 +102,56 @@ contention. Definitive comparison.
 | Consumer/dispatcher | 8.31 + 1.64 = **9.95%** | 3.25 = **3.25%** | gzippy 3.1× more |
 | CRC | not in top-15 | 2.73% (SIMD VPCLMULQDQ) | gzippy doesn't use the SIMD variant |
 
+### CRITICAL ATTRIBUTION CORRECTION (advisor 2026-05-28)
+
+The 21.09% `LocalKey<T>::with` reading is **misleading**. It's NOT
+RefCell overhead — it's the rolled-up call-graph subtree under
+`BOOTSTRAP_BLOCK.with(...)` at `gzip_chunk.rs:1447-1473`. That
+closure body contains:
+- `block.reset()` (~128 KiB marker zone re-init)
+- The ENTIRE bootstrap inflate (`decode_huffman_body_resumable`
+  on the chunk-head)
+- Output Vec ops + marker rebuild
+
+DWARF call-graph rolls the entire subtree under the with() closure
+because it's the outermost frame in the dwarf chain. The
+RefCell::borrow_mut itself is single-digit ns; replacing it with
+`OnceCell` / `UnsafeCell` saves **<0.5pp, not 8-10pp**.
+
+The real lever inside the 21.09% is the bootstrap inflate WORK
+itself plus the 128 KiB Block reset. Per the code comment at
+`gzip_chunk.rs:1442-1446`: "Block::new() allocates a 128 KiB ring +
+initializes the marker zone (64 KiB writes). Doing that per chunk
+was a measured ~4pp of CPU in `clear_page_erms`."
+
+So the 21.09% decomposes (approximately):
+- ~4pp: Block::reset marker-zone init (clear_page_erms triggered)
+- ~10-12pp: bootstrap inflate (decode_huffman_body_resumable on
+  chunk head)
+- ~5pp: output Vec ops + marker rebuild + RefCell trivial overhead
+
+### THE KEY EVIDENCE (advisor pointed out — promote to finding #0)
+
+**gzippy-isal vs rapidgzip is the clean control**:
+- gzippy-isal: 3.71B cycles, 3.69B instructions, IPC 1.00
+- rapidgzip:   2.32B cycles, 3.78B instructions, IPC 1.63
+
+These two binaries run **near-identical instruction counts** on the
+same workload, but gzippy-isal takes **1.6× the cycles** due to a
+memory-subsystem stall.
+
+This proves: **the throughput gap is NOT the inflate inner loop**.
+ISA-L's hand-asm inflate inside gzippy runs the SAME instruction
+mix as ISA-L's hand-asm inflate inside rapidgzip, but gzippy stalls
+1.6× more on memory. The lever is the **chunk pipeline / allocator
+/ marker bootstrap** infrastructure that surrounds the inflate
+call, not the inflate itself.
+
+This is also the strongest disproof of the session's earlier
+inflate-inner-loop work — even ISA-L FFI inside gzippy can't close
+the gap to rapidgzip because the surrounding infrastructure
+stalls.
+
 ## C. Where the gap lives — operational interpretation
 
 ### C.1 The inflate inner loop is NOT the dominant lever
@@ -186,28 +236,54 @@ following the methodology in `docs/perf/2026-05-28-corrected-gap-measurement.md`
 /tmp/perfdata/rg.report   — perf-report flat top-30 for rapidgzip
 ```
 
-## F. Key actionable findings (priority-sorted)
+## F. Key actionable findings (priority-sorted, advisor-corrected)
+
+0. **THE KEY EVIDENCE — the gap is memory stalls, not the inflate
+   inner loop**. gzippy-isal (ISA-L FFI inside gzippy's parallel-SM)
+   runs ~the same instructions as rapidgzip (3.69B vs 3.78B) but
+   takes 1.6× the cycles. Same inflate algorithm; gzippy stalls
+   1.6× more on memory. Lever is the chunk pipeline + allocator +
+   marker bootstrap, NOT the inflate inner loop.
 
 1. **STOP attacking the inflate inner loop in isolation.** It's
-   17.3% absolute CPU — even at 0% it can't close the 2.17× cycle
-   gap to rapidgzip.
+   17.3% absolute CPU. Even ISA-L FFI inside gzippy can't close the
+   gap to rapidgzip — proven by the cycle/instruction ratio above.
+   The 5 session falsifications + 1 small win are consistent with
+   this.
 
-2. **Attack the marker-bootstrap LocalKey path** — replace
-   `LocalKey<T>::with` + `RefCell<Block>` with `OnceCell<Block>` or
-   per-worker owned Block. Expected: -8 to -10pp absolute CPU.
+2. **Allocator + memcg + page-fault path** — gzippy spends:
+   - 9.54% in `clear_page_erms`
+   - 1.06% in `try_charge_memcg`
+   - 0.88% in `__rmqueue_pcplist`
+   - Total ~11.5% in kernel allocator path
+   - Plus 16.86% in libc `__memmove_avx_unaligned_erms` (some of
+     which is also output-buffer driven)
+   rapidgzip has half the page-faults (79K vs 179K) and half the
+   memmove time. Source dive at rapidgzip's `ChunkData` allocation:
+   does it use MAP_HUGETLB? Does it pre-zero a recycled buffer?
+   Expected lever: ~15pp absolute CPU.
 
-3. **Profile the allocator pattern.** rapidgzip allocates 2.28× less
-   page-fault traffic. Source dive at rapidgzip's `ChunkData`
-   allocation to identify the pattern (MAP_HUGETLB? pool size?).
-   Expected: -10 to -13pp absolute CPU.
+3. **Marker-bootstrap path (NOT RefCell)** — the 21.09% under
+   `LocalKey<T>::with` is mostly the bootstrap inflate itself + the
+   128 KiB Block reset, NOT RefCell overhead. To attack:
+   - Reduce the per-chunk Block reset cost (currently re-inits the
+     128 KiB marker zone every chunk = ~4pp of clear_page)
+   - Or skip bootstrap entirely on chunks with known predecessor
+     window (only first 1-2 chunks of a job need it)
+   Expected: -4pp from Block reset alone; potentially -10pp+ if
+   bootstrap can be deferred for non-first chunks.
 
-4. **Verify CRC SIMD path.** gzippy uses `crc32fast`. Confirm it's
-   selecting the AVX2 VPCLMULQDQ variant on neurotic. Expected:
-   ~2-3pp if it's not.
+4. **Context switches 3.27× rapidgzip's** (6,144 vs 1,876). Worker
+   pool blocking — likely the `submit_post_process_to_pool` 8.31%
+   closure waiting on a bounded channel. Add a `SpanGuard` around
+   the channel send/recv to measure, then size the channel /
+   restructure the consumer to reduce blocks. Expected: ~3-5pp.
 
-5. **Audit consumer/dispatcher closure** for hot suboperations.
-   Expected: ~3-5pp.
+5. **Verify CRC SIMD path.** gzippy uses `crc32fast` crate. rapidgzip
+   shows 2.73% in `crc32_gzip_refl_by8_02.fold_128_B_loop` (VPCLMULQDQ
+   AVX2). Check if crc32fast selects the same path on neurotic;
+   expected: ~2-3pp if not.
 
-6. **THEN** revisit the inflate inner loop with the SIMD techniques
-   (BMI2 PEXT for bit extract, AVX2 vpshufb for literal output,
-   speculative-parallel LUT lookups). Expected: the LAST 5-10%.
+6. **THEN** revisit the inflate inner loop with SIMD techniques
+   (BMI2 PEXT, AVX2 vpshufb, speculative-parallel lookups). Expected:
+   the LAST 5-10% only after #2 + #3 + #4 land.
