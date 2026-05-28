@@ -35,11 +35,13 @@ pub mod bit_reader;
 pub mod chd;
 pub mod constant_time;
 pub mod gpu;
+pub mod route_c_testbed;
 pub use aot::{fingerprint_hash, match_aot_fingerprint};
 pub use bit_reader::{pext, BitReaderI32, ShiftRegisterWidth};
 pub use chd::ChdTable;
 pub use constant_time::ConstantTimeInflate;
 pub use gpu::{BlockRange, GpuBackend, GpuError, GpuInflate};
+pub use route_c_testbed::{BlockSummary, DiffResult, TestCase, TestbedReport};
 
 /// Public inflate primitive. Stateless; each method allocates its own output.
 ///
