@@ -149,6 +149,7 @@ pub fn emit_literal_loop() -> (ExecutableBuffer, dynasmrt::AssemblyOffset) {
     //   r12 = byte_pos (callee-saved; pushed)
     //   r13 = out_pos  (callee-saved; pushed)
 
+    let loop_top = ops.new_dynamic_label();
     let non_literal_exit = ops.new_dynamic_label();
     let output_full_exit = ops.new_dynamic_label();
     let underflow_exit = ops.new_dynamic_label();
@@ -159,11 +160,14 @@ pub fn emit_literal_loop() -> (ExecutableBuffer, dynasmrt::AssemblyOffset) {
         // Prologue: save callee-saved regs we use.
         ; push r12
         ; push r13
+        ; push r14
         ; push rbx
 
-        // Move out_buf_ptr from rdx (arg slot) to rbx (callee-saved)
-        // so rdx is free as scratch in the inner loop.
+        // Move out_buf_ptr from rdx to rbx (callee-saved).
+        // Move out_buf_end from rcx to r14 (callee-saved) so the loop
+        // can freely clobber rcx as shift-count + scratch.
         ; mov rbx, rdx
+        ; mov r14, rcx
 
         // Load state.
         ; mov r12, QWORD [r8 + 0]       // byte_pos
@@ -171,8 +175,9 @@ pub fn emit_literal_loop() -> (ExecutableBuffer, dynasmrt::AssemblyOffset) {
         ; movsxd r11, DWORD [r8 + 16]   // bitsleft
         ; mov r13, QWORD [r8 + 24]      // out_pos
 
+        ;=> loop_top
         // Output bounds check.
-        ; cmp r13, rcx
+        ; cmp r13, r14
         ; jae =>output_full_exit
 
         // Refill if bitsleft < 12 (need at least MAIN_BITS).
@@ -219,16 +224,14 @@ pub fn emit_literal_loop() -> (ExecutableBuffer, dynasmrt::AssemblyOffset) {
         ; inc r13
 
         // Consume code_bits (cl) from bitbuf.
-        // Save cl for the shift (rcx is preserved across the byte write).
         ; mov rax, r10
         ; shr rax, cl                    // bitbuf >>= code_bits
         ; mov r10, rax
         ; movzx ecx, cl                  // zero-extend cl to ecx
         ; sub r11, rcx                   // bitsleft -= code_bits
 
-        // v3.3 still single-symbol: jump to writeback after one literal.
-        ; mov eax, 0                     // ExitReason::NonLiteral (re-entry needed for next sym)
-        ; jmp =>writeback
+        // v3.4: loop back for the next symbol.
+        ; jmp =>loop_top
 
         ;=> non_literal_exit
         ; mov eax, 0                     // ExitReason::NonLiteral
@@ -248,6 +251,7 @@ pub fn emit_literal_loop() -> (ExecutableBuffer, dynasmrt::AssemblyOffset) {
         ; mov DWORD [r8 + 16], r11d      // bitsleft
         ; mov QWORD [r8 + 24], r13       // out_pos
         ; pop rbx
+        ; pop r14
         ; pop r13
         ; pop r12
         ; ret
@@ -309,25 +313,21 @@ mod tests {
         assert_eq!(state.bitsleft, 64);
     }
 
-    /// v3.3: when the LUT entry is a 4-bit literal code mapping to
-    /// byte 'X' (0x58), the asm writes 'X' to out_buf and advances.
-    /// We construct a hand-rolled LUT entry: at key 0 → (symbol=0x58,
-    /// length=4, length_extra=0). All other keys are empty.
+    /// v3.4: under a literal-only LUT (LUT[0] = literal 'X', length 4),
+    /// the asm loop fills the output buffer to capacity then exits
+    /// OutputFull. Every byte should be 'X'.
     #[test]
-    fn v3_asm_writes_literal_byte() {
+    fn v3_asm_fills_with_literal() {
         let (buf, off) = literal_loop_fn();
         let fp: LiteralLoopFn = unsafe { std::mem::transmute(buf.ptr(*off)) };
 
-        // 16 bytes of zero input so the refill loads all-zero bits.
-        // After refill, bitbuf = 0, so the key lookup hits LUT[0].
-        let input = [0u8; 16];
+        let input = [0u8; 64];
         let mut out_buf = [0u8; 32];
-        // LUT: 4096 entries × 4 bytes. Entry 0 = (sym=0x58 'X', len=4, len_extra=0).
         let mut lut_entries = vec![0u8; 4096 * 4];
-        lut_entries[0] = 0x58; // symbol low byte 'X'
-        lut_entries[1] = 0x00; // symbol high byte
-        lut_entries[2] = 0x04; // length = 4 bits (no flags)
-        lut_entries[3] = 0x00; // length_extra
+        lut_entries[0] = 0x58; // 'X'
+        lut_entries[1] = 0x00;
+        lut_entries[2] = 0x04; // length=4
+        lut_entries[3] = 0x00;
 
         let mut state = DecodeState {
             byte_pos: 0,
@@ -345,13 +345,56 @@ mod tests {
                 &mut state,
             )
         };
-        assert_eq!(r, ExitReason::NonLiteral as i32, "single-symbol exit");
-        assert_eq!(out_buf[0], b'X', "wrote 'X' literal");
-        assert_eq!(state.out_pos, 1, "out_pos advanced by 1");
-        // bitsleft was 64 after refill; we consumed 4 bits → 60.
-        assert_eq!(state.bitsleft, 60);
-        // byte_pos advanced by 8 in the refill.
-        assert_eq!(state.byte_pos, 8);
+        assert_eq!(r, ExitReason::OutputFull as i32, "loop fills then exits");
+        assert_eq!(state.out_pos, 32, "out_pos reached out_buf_end");
+        assert!(out_buf.iter().all(|&b| b == b'X'), "every byte is 'X'");
+    }
+
+    /// v3.4: multiple literals decoded in one call. With a 4-bit
+    /// repeating literal code, we should write multiple 'X' bytes
+    /// before the bit buffer runs out and triggers a non-literal
+    /// exit (when the empty slot after the valid bits is hit).
+    #[test]
+    fn v3_asm_loops_through_multiple_literals() {
+        let (buf, off) = literal_loop_fn();
+        let fp: LiteralLoopFn = unsafe { std::mem::transmute(buf.ptr(*off)) };
+
+        // Bitbuf will be all zeros after refill. Every 4-bit window
+        // is 0, so every lookup hits LUT[0] which we set to literal 'X'
+        // length 4. After 16 such writes (64 bits / 4 bits = 16
+        // literals), bitsleft drops to 0; the refill check at
+        // loop_top sees bitsleft < 12, refills another 64 bits (byte_pos
+        // advances by 8) and continues. Loop terminates when out_pos
+        // hits out_buf_end.
+        let input = vec![0u8; 256];
+        let mut out_buf = vec![0u8; 100]; // 100 'X's expected
+        let mut lut_entries = vec![0u8; 4096 * 4];
+        lut_entries[0] = 0x58; // 'X'
+        lut_entries[1] = 0x00;
+        lut_entries[2] = 0x04; // length=4
+        lut_entries[3] = 0x00;
+
+        let mut state = DecodeState {
+            byte_pos: 0,
+            bitbuf: 0,
+            bitsleft: 0,
+            _pad: 0,
+            out_pos: 0,
+        };
+        let r = unsafe {
+            fp(
+                input.as_ptr(),
+                lut_entries.as_ptr(),
+                out_buf.as_mut_ptr(),
+                out_buf.len() as u64,
+                &mut state,
+            )
+        };
+        // Loop fills out_buf to capacity, then exits OutputFull.
+        assert_eq!(r, ExitReason::OutputFull as i32);
+        assert_eq!(state.out_pos, 100);
+        // Every byte should be 'X'.
+        assert!(out_buf.iter().all(|&b| b == b'X'), "all 'X'");
     }
 
     /// v3.2: output-full exit path. With out_buf_end == out_pos, the
