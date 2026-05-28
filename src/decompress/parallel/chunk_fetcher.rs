@@ -2258,6 +2258,17 @@ fn drain_one_pending<W: std::io::Write>(
         *total_size += narrowed.len();
     }
     if !chunk.data.is_empty() {
+        // A1 invariant: this is the final exit point for decoded bytes
+        // leaving the parallel-SM path. A leftover window-image prefix
+        // here would be written to the user's output. The chunk's
+        // finalize/apply_window/clean_unmarked_data path should have
+        // caught it earlier, but trip the assert at the write site as
+        // belt-and-suspenders insurance against future refactors that
+        // bypass finalize (per A1-review follow-up).
+        debug_assert_eq!(
+            chunk.data_prefix_len, 0,
+            "trim_window_prefix before consumer write_all (would emit window image)"
+        );
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.write_data");
             writer

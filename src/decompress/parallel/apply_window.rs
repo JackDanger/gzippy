@@ -27,6 +27,14 @@ pub fn apply_window(chunk: &mut ChunkData, window: &[u8]) {
         window.len() == 32768,
         "rapidgzip semantics require a 32 KiB window for applyWindow"
     );
+    // A1 invariant: marker resolution only writes into
+    // `chunk.data_with_markers`, but downstream the consumer reads
+    // `chunk.data` AFTER apply_window. A leftover window-image prefix
+    // would be emitted as decoded output. Trim before apply_window.
+    debug_assert_eq!(
+        chunk.data_prefix_len, 0,
+        "trim_window_prefix before apply_window"
+    );
 
     // Resolve markers in place. After this call, every value in
     // `data_with_markers` is < 256 (a literal byte).
