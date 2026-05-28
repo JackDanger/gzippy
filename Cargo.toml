@@ -54,6 +54,11 @@ arena-allocator = ["dep:allocator-api2", "dep:rpmalloc-sys"]
 global-rpmalloc = ["dep:rpmalloc"]
 libdeflate = []
 streaming-libdeflate-rs = ["dep:streaming-libdeflate-rs"]
+dynasm = ["dep:dynasm"]
+dynasmrt = ["dep:dynasmrt"]
+# Route C: per-block hand-written x86_64 assembly inflate via dynasm-rs
+# (plans/unified-decoder.md §3.1 / §4.3 / §5.1). x86_64-only for v1.
+route-c-dynasm = ["dynasm", "dynasmrt"]
 
 [dependencies]
 # Compression: flate2 with zlib-ng for maximum performance
@@ -98,6 +103,8 @@ rpmalloc-sys = { version = "0.2", optional = true }
 # `global-rpmalloc` feature; only activated for the perf experiment.
 rpmalloc = { version = "0.2", optional = true }
 streaming-libdeflate-rs = { version = "0.2", optional = true }
+dynasm = { version = "5", optional = true }
+dynasmrt = { version = "5", optional = true }
 
 [build-dependencies]
 cc = "1"
