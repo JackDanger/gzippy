@@ -609,12 +609,14 @@ pub fn decode_dynamic_block_layered_with_window(
             out_pos += 1;
 
             // Multi-literal lookahead — write up to 3 additional
-            // short-code literals from the same bit buffer fill.
-            // FALSIFICATION: extending to 7 regressed throughput to
-            // ~360 MB/s (412 → 360). The longer unroll hurt icache
-            // + branch mispredict by more than the saved refill
-            // amortization. Same pattern as commit `ca52389`'s
-            // multi-literal regression — keep the cap at 4 total.
+            // short-code literals. FALSIFICATION: unchecked-writes
+            // via raw pointer arithmetic + 4-byte headroom check
+            // up front REGRESSED throughput from ~395 to ~360 MB/s,
+            // even though the bounds check is theoretically dead.
+            // Hypothesis: rustc was already eliding the check (LLVM
+            // recognizes that out_pos < out_buf.len() is preserved
+            // by the multi-lit pattern); the explicit unsafe shape
+            // disrupted register allocation.
             for _ in 0..3 {
                 if bitsleft < MAIN_BITS as i32 || out_pos >= out_buf.len() {
                     break;
