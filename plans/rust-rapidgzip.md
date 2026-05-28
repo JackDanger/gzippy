@@ -1,576 +1,383 @@
-# gzippy parallel-single-member: state, wisdom, next moves
+# Closing the gap to rapidgzip — current state & action queue
 
-This is the canonical reference for the parallel-single-member decode
-pipeline (`src/decompress/parallel/`). It replaces the older
-`plan.md` + every other file that used to live in `plans/`. Read it
-end-to-end before changing parallel-SM code. Update it when something
-in here goes stale.
+**FRAMING (read this first; everything else follows):**
+**gzippy-pure vs rapidgzip is 1.30× cycles, 0.98× instructions, IPC
+1.08 vs 1.42.** Same algorithm, ~same instruction count. The gap is
+**memory-subsystem stalls in the chunk pipeline + allocator + marker
+bootstrap**, NOT the inflate inner loop. Do not propose Huffman
+inner-loop optimizations until §4 falsifications are addressed; six
+of them on this branch already prove rustc + LLVM is at parity with
+hand-tuned scalar code there.
 
-The contents are:
-
-1. **Where we are.** Current throughput, what's on the hot path, what's
-   structurally locked.
-2. **What the system is.** The pipeline anatomy from input slice to
-   output writer, with file:fn citations.
-3. **What we now know about doing this work.** Hard-won wisdom about
-   measurement, advisors, reverts, and the patterns that produce real
-   wins vs apparent ones.
-4. **Opportunities for next.** Concrete next moves, ranked by the
-   evidence we have for them, with the structural alternatives flagged
-   when the surgical search is exhausted.
-5. **Done-when criteria.** Four measurable gates that close the project.
-
-The prime directive in `CLAUDE.md` still rules: **gzippy aims to be the
-fastest gzip implementation ever created.** Everything below is in
-service of that.
+For instructions on how to work on this plan, see §3 (the 5-step
+framework) and §4 (methodology guard rails). For what to actually
+do next, see §2 (action queue).
 
 ---
 
-## 1. Where we are (as of 2026-05-26)
+## 1. Current gap
 
-### Numbers
+### 1.1 Measured baseline [PROVISIONAL n=3 — re-measure at n=20 before acting]
 
-`make bench-sm` on neurotic, T=16, fixture = `silesia-large.gz`
-(503 MB raw → 162 MB compressed, ~3 × silesia.tar concatenated):
+Neurotic i7-13700T, silesia-gzip9.gz at T=16, clean release builds
+(`strip = true` verified). 10-trial interleaved A/B for wall;
+n=3 perf-stat for counters (below §4.3's own ≥20 rule — the n=1
+"2.17× cycles" prior cherry-pick proves this matters).
+**Before committing to any lever based on these numbers, re-run
+at n=20 with load<4.**
 
-| Metric | Value |
-|---|---:|
-| gzippy mean throughput | **772 MB/s** (was 740 before `8ef7a4e`) |
-| gzippy best single run | **800 MB/s** |
-| gzippy best raw wall | **0.630 s** |
-| rapidgzip mean (same run) | 1251 MB/s |
-| gzippy / rapidgzip ratio | **0.62×** (was 0.53×) |
-| Total cycles per 5-iter perf record | ~62.9 B (pre-CRC-move) |
+| Tool | Median wall MB/s | Cycles | Instructions | IPC |
+|------|------------------|--------|--------------|-----|
+| gzippy-pure (libdeflate-LUT default + T3 simplify) | 1092 | 4.28B | 4.62B | 1.08 |
+| gzippy-isal (`isal-compression` feature) | ~1212 | 3.71B | 3.69B | 1.00 |
+| rapidgzip 0.16.0 (`-P 16 -o /dev/null`) | ~1212 | 3.29B | 4.72B | 1.42 |
 
-Compared to the session-start baseline at commit `73c4a21` (BitReader
-8-byte refill), throughput is **+82 %** (423 → 772 MB/s) and the ratio
-vs rapidgzip closed from 0.30× to 0.62×. The +17 % ratio jump from
-0.53× → 0.62× came from commit `8ef7a4e` (move narrowed-bytes CRC32
-from consumer to post-process worker, vendor parity).
+**Gap to rapidgzip: ~10% throughput.** Page-faults 2.15× more
+(168.9K gzippy vs 78.5K rapidgzip — verified n=3, this is the
+single most reproducible signal).
 
-### Note on absolute numbers vs ratio
+### 1.2 KEY EVIDENCE — gap is memory stalls
 
-The 1400 MB/s rapidgzip number that previously appeared in this doc
-came from a less-loaded snapshot of neurotic; on the 2026-05-26 bench
-both gzippy and rapidgzip wall numbers were lower (system busier).
-The **ratio** is the controlled measurement — bench-sm runs both
-binaries on the same host in the same window. Quote ratios when
-comparing across sessions; absolute MB/s only inside a single run.
+The instruction-count parity (0.98×) with rapidgzip combined with
+the cycle gap (1.30×) and IPC drop (1.08 vs 1.42) proves the issue
+is **memory subsystem**, not algorithm. gzippy executes
+near-identical work — it just stalls 30% more cycles waiting on
+memory.
 
-### Top of profile, post-iteration
+PEBS-precise attribution
+(`docs/perf/2026-05-28-framework-step2-pebs-attribution.md`):
 
-`perf record -F 999 --call-graph=dwarf` on the latest commit:
+- `__memmove_avx_unaligned_erms`: 45.42% memory accesses, 11.77%
+  L3-miss + RAM-hit (true stall). The **write-side** of chunk-data
+  extend.
+- `decode_huffman_body_resumable` (bulk inflate): 1.10% LFB/MAB hit
+  only. **Fully L1-cached. Not a stall site.**
+- Marker bootstrap subtree under `LocalKey<T>::with`: 21.09% of CPU
+  (rolled-up DWARF), but this is the bootstrap *work* + 128 KiB
+  Block reset, not RefCell overhead.
 
-| Symbol | % cycles | Notes |
-|---|---:|---|
-| `bootstrap_with_deflate_block` | **22.8 %** | Phase 1 marker-mode Huffman decode. Vendor-parity tight. |
-| `__memmove_avx_unaligned_erms` (libc) | **21.9 %** | 47 % kernel page-fault path, 25 % back-ref copy, 28 % mixed. |
-| `clear_page_erms` (kernel) | **17.8 %** | First-touch faults on chunk buffers. |
-| `submit_post_process_to_pool` body | 6.1 % | `replace_markers_lut_narrow` LUT pass. |
-| `..@37.end` / `..@42.end` / `loop_block` / `decode_len_dist` | ~13 % | ISA-L C library internals. |
-| `__rmqueue_pcplist` (kernel) | 1.2 % | Page allocator. |
+### 1.3 What's structurally locked (do not touch)
 
-ISA-L internals (~13 %) are in `vendor/isa-l` and cannot be improved
-without forking. Kernel paths (~20 % combined) are inherent to the
-workload's memory pattern. **Roughly 40 % of cycles are off-limits to
-surgical Rust changes.**
-
-### Where the gap is, from a fresh trace_v2 timeline (2026-05-26)
-
-`GZIPPY_TIMELINE=…` on both binaries on silesia-large.gz, T=16,
-neurotic (`scripts/timeline_analyze.py` diff):
-
-| Metric | gzippy | rapidgzip | gap |
-|---|---:|---:|---:|
-| Wall | 379 ms | 152 ms | **2.49×** |
-| Max single chunk decode | 112 ms | 91 ms | 1.23× |
-| Cumulative `pool.run_task` | 3.34 s | 1.87 s | 1.78× |
-| Cumulative `pool.pick` (idle/contend) | **2.59 s** | 0.57 s | **4.6×** |
-| Pool utilization (run_task / (run+pick)) | **55 %** | **77 %** | 0.71× |
-| Consumer `wait.block_fetcher_get` | 247 ms | 69 ms | 3.5× |
-
-**The per-chunk decode is only 1.23× slower** (Rust-vs-C++ codegen
-gap, known); the headline 2.49× wall gap is **dispatch inefficiency**:
-gzippy workers spend 43 % of wall idle/contending vs rapidgzip's 23 %.
-
-### What's structurally locked
-
-- **Per-byte rate of bootstrap.** ~149 MB/s. Vendor's equivalent runs
-  at ~250 MB/s. The ~1.25× per-byte Rust-vs-C++ codegen gap on the
-  same algorithm is measured. Closing it without leaving pure-Rust is
-  not on the table — but per the fresh trace, this is at most a 23 %
-  share of the wall gap, not the dominant one.
-- **First-touch page faults on chunk buffers.** Each new pool buffer
-  costs ~4 KiB of kernel page-zero per page written. Pre-allocating
-  capacity does NOT help (`0da3530` revert). rpmalloc-per-Vec is
-  already deployed (`Cargo.toml:39, 51`) and we're at vendor parity
-  (~17 % `clear_page_erms`). Daemon-mode amortization is the only
-  remaining lever.
-
-### What's NOT locked — the new structural opening
-
-- **Pool dispatch inefficiency dominates the wall gap.** Workers idle
-  ~125 ms more wall each than rapidgzip's. Closing the 55 % → 77 %
-  utilization gap is a ~40 % wall improvement on its own.
-- **Wall is NOT bounded by max worker chunk time** (the prior plan
-  text was wrong). gzippy wall is 3.4× max chunk; rapidgzip wall is
-  1.7× max chunk. Gzippy can't sustain 16-way parallelism; rapidgzip
-  can.
+- Chunk pipeline shape (parallel-SM with predecessor 32 KiB window
+  at chunk boundaries).
+- Lever G / Lever H / FetchingStrategy::splitIndex wiring (May 2026
+  -29% wall, vendor parity on emit count).
+- T3 simplification to vendor's 2-extra-literal shape (this branch,
+  +1.9% confirmed 20-trial neurotic A/B).
+- The libdeflate-LUT inner loop (default). ISA-L LUT inner is opt-in
+  only; it falsified at -6% on production silesia.
+- **Speculative prefetch in chunk_fetcher**. `GZIPPY_NO_PREFETCH=1`
+  regressed bench-sm by +42%. Speculation is net-positive despite the
+  bootstrap cost on chunks whose `contains_marker_bytes` never flips.
+  Do not propose disabling it.
 
 ---
 
-## 2. What the system is
+## 2. Action queue
 
-The CLI calls `decompress::decompress_gzip_libdeflate` which routes
-per the table in `CLAUDE.md` "Production Routing". Single-member
-inputs ≥ 10 MiB on a multi-thread host with ISA-L available take
-**`parallel::single_member::decompress_parallel`** — this section
-covers that path.
+Ranked by expected wall impact, each with hypothesis + how to
+falsify + prior attempts.
 
-### The pipeline, end to end
+### 2.1 Allocator: pthread-init the rpmalloc binding [PRIORITY]
+
+**Hypothesis**: Rust `rpmalloc 0.2.2` crate's `RpMalloc` global
+allocator wrapper does NOT call `rpmalloc_thread_initialize()` per
+thread. Workers fall back to a global-mutex'd heap. Rapidgzip's
+bundled rpmalloc auto-installs pthread hooks (CHANGELOG line 231).
+
+**Evidence**: Step 5 production A/B (this branch) falsified Lever 4.1
+at +167% wall on `-o real_file`, +41% page-faults. Source-dive of
+`~/.cargo/registry/.../rpmalloc-0.2.2/src/lib.rs:145-155` confirmed
+no thread-init.
+
+**How to falsify**: Vendor rapidgzip's bundled rpmalloc into
+`vendor/rpmalloc-vendored/` and write a `#[global_allocator]`
+wrapper that installs pthread keys with destructors calling
+`rpmalloc_thread_finalize`. Re-run `scripts/alloc_ab_harness.sh`
+at n=20 with load<4. Pass gate: ≥5% p50 wall reduction AND ≥10%
+page-fault reduction on silesia/-o real_file.
+
+**Expected signal**: page-faults drop from 248K → ~80K (matching
+rapidgzip). Wall on file output recovers from +167% regression to
+neutral or better.
+
+**Prior attempts**: Lever 4.1 falsified
+(`docs/perf/2026-05-28-framework-step5-lever4-1-falsified.md`),
+Z-allocator prewarm falsified (-15%, single-thread serialized
+faults), L1 MADV_HUGEPAGE -38% (khugepaged contention).
+
+**If multi-day vendor work feels heavy, run §2.2 FIRST** as a
+1-afternoon falsification — but be aware §2.2 can only refute the
+allocator class, not positively confirm rpmalloc specifically.
+
+### 2.2 Negative control: mimalloc + jemalloc as allocators
+
+**Hypothesis**: If allocator-of-the-month is the lever, any
+production-quality binding (mimalloc-rs, jemallocator) should
+deliver. If both ALSO regress, rpmalloc isn't specially magical
+and the win is structural (chunk shape, marker phase).
+
+**How to falsify**: Add `--features global-mimalloc` and
+`--features global-jemalloc`. Re-run harness. Expected runtime: 1
+afternoon. Cheaper than vendoring rpmalloc properly.
+
+**Why this is queued ahead of any chunk-shape change**: it tests
+the hypothesis class without committing to vendoring work.
+
+### 2.3 Chunk-shape: 128 KiB segmented ChunkData
+
+**Hypothesis**: rapidgzip's `ALLOCATION_CHUNK_SIZE = 128 KiB` +
+many small Boxes vs gzippy's single 12 MiB Vec causes the page-fault
+delta. Their own bench (in source comment): 21.2 GB/s at 1 MiB vs
+8.4 GB/s at 4 MiB allocation chunk size = 2.5× difference.
+
+**Evidence**: Step 4 microbench showed glibc+manyBoxes+readOFF = -84%
+wall vs baseline. On read-sweep (with current allocator), manyBoxes
+regressed +21% wall (advisor caught: prefetcher loses contiguity at
+chunk boundaries).
+
+**How to falsify**: Add a feature-gated variant of `ChunkData::data`
+that uses `Vec<Box<[u8; 128*1024]>>`. Validate silesia byte-perfect.
+Run harness at n=20, load<4. Must include `-o real_file` (where the
+arm64 read-regression surfaced locally).
+
+**Risk**: The chunk-shape and allocator levers are coupled. Per
+Step 4 microbench, rpmalloc+manyBoxes was -64% but glibc+manyBoxes
+was +21% worse. Don't stack with 2.1 until 2.1 is independently
+validated.
+
+**Prior attempts**: S2 bulk-window-copy ported the chunk-shape
+philosophy to `copy_match_windowed`'s slow path; at parity (slow
+path too rare to matter).
+
+### 2.4 Marker bootstrap: shrink u16 ring → u8 + parallel bitmap
+
+**Hypothesis**: marker bootstrap u16 ring writes 2 bytes per output
+byte. Replace with u8 ring + 1-bit selector bitmap. rapidgzip's own
+ChunkData.hpp comment block (lines 247-300) explicitly plans this
+("would reduce allocation overhead by ~80%") but hasn't shipped it.
+
+**Evidence**: symbolized perf shows `emit_backref_ring` at 2.84%,
+`Vec::extend_from_slice` from `drain_to_output` at 1.61%,
+`clean_unmarked_data` at 1.82% — combined ~6.3% of CPU in marker
+data-movement.
+
+**How to falsify**: Multi-day surgery touching `deflate_block.rs`,
+`chunk_data.rs`. Defer until 2.1-2.3 resolved.
+
+**Expected ceiling**: ~5% e2e per advisor (marker-phase share of
+CPU). Not the dominant lever.
+
+### 2.5 Inflate inner loop (LAST resort, only after 2.1-2.4)
+
+The bulk inflate is **1.10% LFB hit** in PEBS — fully L1-cached.
+**Inflate inner-loop work cannot close the gap on its own.**
+
+If 2.1-2.4 all fail to close the remaining 10%, then and only then
+consider: BMI2 PEXT, AVX2 vpshufb literal output, speculative-
+parallel LUT lookups. These are the multi-week structural
+deviations CLAUDE.md 2026-05-27 explicitly authorized — but they
+are LAST in the queue, not first.
+
+---
+
+## 3. The 5-step instrumented framework
+
+Used at every step in 2.1-2.5 to avoid the stab-in-dark pattern
+that produced 13 falsifications and 1 confirmed win in 2026.
+
+1. **Source-dive target tool first.** Read rapidgzip/libdeflate
+   source for the exact pattern. Don't guess. See
+   `docs/perf/2026-05-28-framework-step1-allocator-spec.md`.
+
+2. **PEBS attribution.** `perf mem record --call-graph=dwarf` then
+   `perf mem report --sort=mem,sym`. Find which load addresses
+   stall, not which functions look hot. See
+   `docs/perf/2026-05-28-framework-step2-pebs-attribution.md`.
+
+3. **Timeline events** (`GZIPPY_TIMELINE=/tmp/out.json`) — deferred;
+   wire allocator events here only when Steps 1+2 don't yield a clear
+   flat-profile attribution.
+
+4. **Microbench mirroring production shape.** `benches/alloc_pattern.rs`
+   is the template: 16 workers × actual write/read sizes × dual sinks.
+   30s iteration. **Not sufficient for production confidence** — the
+   microbench predicted Lever 4.1 = -54%, production was +167%.
+
+5. **Production A/B harness.** `scripts/alloc_ab_harness.sh` runs
+   n=20 with the mandatory rollup fields (§4.4). Pass gate: ≥5%
+   p50 wall reduction AND ≥10% page-fault reduction on the harder
+   of the two sinks.
+
+The pattern microbench-says-yes-production-says-no caught the
+broken rpmalloc binding in <30 minutes. Use it.
+
+---
+
+## 4. Methodology guard rails
+
+### 4.1 Clean-build verification (every bench)
 
 ```
-Input slice (mmap'd or read into Vec)
-  │
-  ▼
-sm_driver.rs::read_parallel_sm  ──── trims gzip header + trailer,
-  │                                  reads ISIZE / CRC32 from footer,
-  │                                  builds ChunkConfiguration,
-  │                                  calls chunk_fetcher::drive
-  ▼
-chunk_fetcher.rs::drive  ──── owns the ThreadPool (vendor JoiningThread
-  │                            equivalent), the WindowMap, the BlockMap,
-  │                            and the FIFO drain loop. One main thread.
-  │
-  ├─► [prefetcher] dispatches speculative decode tasks to workers,
-  │   keyed by partition seed (a guess at where the next deflate
-  │   block starts).
-  │
-  ├─► [workers]    ┌── try_speculative_decode_candidate(start_bit)
-  │   (Tmax of      │     ├─ Phase 1 bootstrap: marker-emitting
-  │   them)         │     │     deflate decode via Block::read +
-  │                 │     │     IsalLitLenCode::decode + IsalDistCode +
-  │                 │     │     emit_backref_ring. Output goes to
-  │                 │     │     chunk.data_with_markers (u16). When
-  │                 │     │     32 KiB of clean output materializes,
-  │                 │     │     contains_marker_bytes flips → switch
-  │                 │     │     to Phase 2.
-  │                 │     ├─ Phase 2 ISA-L: hands off to
-  │                 │     │     IsalInflateWrapper. ISA-L writes
-  │                 │     │     DIRECTLY into chunk.data spare
-  │                 │     │     capacity (no intermediate buffer).
-  │                 │     │     The worker calls
-  │                 │     │     note_inner_decoded_bytes per ISA-L
-  │                 │     │     call and updates chunk.crc32s.last
-  │                 │     │     inline after each outer iter.
-  │                 │     └─ if speculation fails at start_bit:
-  │                 │           with_sync_boundary_search scans the
-  │                 │           input in CHUNK_SIZE_BITS windows on
-  │                 │           this same worker thread (NO thread
-  │                 │           spawn) and tries each candidate.
-  │                 │
-  │                 └── on success, returns ChunkData to the
-  │                     BlockFetcher cache keyed by partition seed.
-  │                     If the actual decode start ≠ seed, the
-  │                     chunk is re-keyed under the real offset.
-  │
-  ├─► [consumer / main thread]
-  │     ├─ rx.recv()s the next chunk from the FIFO.
-  │     ├─ set_encoded_offset to match the prior chunk's actual end.
-  │     ├─ Publishes the chunk's tail 32 KiB to the WindowMap.
-  │     ├─ Submits a post_process task to the pool:
-  │     │   ── if data_with_markers ≥ 128 Ki elements:
-  │     │      replace_markers_lut_narrow fuses replace + narrow
-  │     │      into a single u16→u8 pass (vendor
-  │     │      DecodedData.hpp:316-337 pattern).
-  │     │   ── otherwise: apply_window in place then narrow.
-  │     │   ── populate_subchunk_windows uses the resulting
-  │     │      narrowed buffer (no internal re-narrow).
-  │     ├─ Awaits the post_process future.
-  │     ├─ Drains: writes chunk.narrowed + chunk.data to the
-  │     │   output writer. Combines worker CRCs (chunk.crc32s)
-  │     │   into total_crc via the constant-time polynomial
-  │     │   `append` (NO bytewise re-CRC of chunk.data).
-  │     ├─ append_subchunks_to_block_map for successor routing.
-  │     └─ Returns chunk to pool on Drop.
-  │
-  └─► Final: total_crc.verify(footer.crc32) + total_size ==
-      footer.uncompressed_size. Either succeeds or returns a
-      hard `Err(GzippyError::Decompression(_))` — NO fallback
-      (CLAUDE.md Rule 5).
+grep -E "^strip" Cargo.toml | head -3   # must show: strip = true
 ```
 
-### Files that matter
+The 2026-05-28 session lost 6 hours to a contaminated build where
+`debug = "line-tables-only"` had been left in the `release` profile.
+The "41% gap" headline that drove most of that session's work was
+the contamination, not real.
 
-| File | Role |
-|---|---|
-| `src/decompress/parallel/sm_driver.rs` | Entry; trims gzip header/trailer; reads expected CRC + ISIZE; calls `drive` and verifies the result. |
-| `src/decompress/parallel/single_member.rs` | Public-facing routing wrapper; converts errors; tracks `MARKER_PIPELINE_RUNS` counter for the routing-trap test. |
-| `src/decompress/parallel/chunk_fetcher.rs` | The main thread + worker pool + consumer drain. `drive`, `consumer_loop`, `drain_one_pending`, `run_decode_task`, `run_post_process_task`, `submit_post_process_to_pool`, `speculative_decode_find_boundary`, `try_speculative_decode_candidate`. |
-| `src/decompress/parallel/gzip_chunk.rs` | The per-worker chunk decoder. `bootstrap_with_deflate_block`, `decode_chunk_isal_impl` (Phase 2 inline-into-chunk.data writer), `absorb_isal_tail`, `decode_chunk_marker_bootstrap_then_isal`. |
-| `src/decompress/parallel/deflate_block.rs` | The pure-Rust deflate decoder for Phase 1. `Block::read`, `Block::read_internal_compressed_specialized<CONTAINS_MARKERS>`, `emit_backref_ring`. Inner Huffman loop lives here. |
-| `src/decompress/parallel/isal_huffman.rs` | `IsalLitLenCode`, `IsalDistCode` — the multi-symbol LUT Huffman decoders. Both `#[inline(always)]`. |
-| `src/decompress/inflate/consume_first_decode.rs` | `Bits` (libdeflate-shaped bit reader, branchless 8-byte refill). Shared with the sequential / BGZF decoders. |
-| `src/decompress/parallel/chunk_data.rs` | The `ChunkData` struct: `data`, `data_with_markers`, `narrowed`, `crc32s`, `subchunks`, `footers`. Plus `append_clean`, `append_markered`, `note_inner_decoded_bytes`, `note_clean_bytes_written_in_place`, `populate_subchunk_windows`. |
-| `src/decompress/parallel/replace_markers.rs` | `replace_markers_lut_narrow` (fused u16→u8 LUT pass for ≥128 Ki chunks); `replace_markers` (AVX2/scalar for smaller chunks). |
-| `src/decompress/parallel/block_finder.rs` | The dynamic-Huffman block-boundary scanner with the 15-bit LUT + the 8-byte unaligned BitReader refill (`73c4a21`). |
-| `src/decompress/parallel/raw_block_finder.rs` | `RawBlockFinderCoordinator` + `with_sync_boundary_search` (the sync slow-path replacement for the prior thread-spawning `with_scoped_boundary_search`). |
-| `src/decompress/parallel/window_map.rs` | Inter-chunk window publication (consumer publishes the tail 32 KiB; successor worker reads it). |
-| `src/decompress/parallel/block_map.rs` | Post-decode subchunk lookup index. |
-| `src/decompress/parallel/chunk_buffer_pool.rs` | Per-worker recycling pool for `Vec<u8>` and `Vec<u16>` chunk buffers. Hits/misses tracked. |
+### 4.2 System load gate
 
-### Routing facts that surprise people
+Bench at **load avg < 4**, not 47. neurotic is shared; check
+`uptime` before benching. Under high load, wall times swing 10×.
+Counter ratios (page-faults, branch-misses) are load-independent
+and remain valid; wall is not.
 
-- **Speculative chunks dominate the wall.** ~80 % of bench-sm chunks
-  fail their first-try speculation at the prefetcher's partition seed
-  and need a boundary search. Of those, EVERY attempt succeeds on the
-  first BlockFinder candidate (per `Slow-path decode: ok=61 fail=0`
-  in the verbose stats). The slow-path is invoked often but never
-  has to walk a candidate list.
-- **`contains_marker_bytes` rarely flips on speculative chunks.** For
-  highly compressible inputs (silesia), back-refs span the entire
-  chunk → no 32 KiB clean run materializes → the worker runs Phase 1
-  bootstrap for the WHOLE chunk. Bench-sm `body_rate_MB/s ≈ 149`
-  reports the bootstrap rate.
-- **The wall is consumer-bound at first glance and worker-bound on
-  closer reading.** The consumer thread is no longer the bottleneck
-  (since the CRC fix at `e1beab4` and the `extend_from_slice` →
-  `copy_nonoverlapping` fix at `630d44d`). Wall ≈ max(worker chunk
-  time) per the strict-FIFO drain. The slowest single chunk's
-  bootstrap time defines wall.
+### 4.3 Trial count
 
----
+**n ≥ 20 with per-iter MEDIAN, not mean.** n=3 already produced a
+cherry-pick in this session (advisor proved it: the n=1 "2.17×
+cycles" headline was wrong — real ratio was 1.30×). n=10 mean can
+mask warmup effects (rpmalloc TLS cache warms in iter 2+).
 
-## 3. What we now know about doing this work
+**Trial 1 (cold) reported separately** from trials 2-N. Production
+gzippy spawns FRESH workers per `decompress_parallel` call; the
+trial-1 number is closer to user experience than the steady-state.
 
-These are wisdom-class rules, in priority order. Each was learned the
-expensive way.
+### 4.4 Mandatory rollup fields for every A/B
 
-### Measure before AND after every change. Two priors will not save you.
+Reject any rollup missing any of: wall_ms (per-iter median),
+cycles/instructions/IPC (no multiplexing, enable rate ≥95%),
+page-faults (minor+major separately), dTLB+L1+LLC misses,
+context-switches, task-clock, peak RSS, smaps AnonHugePages +
+Private_Dirty, mmap+munmap+brk counts (`strace -c`), correctness
+hash (silesia SHA256 byte-identical), build hash (Cargo.lock +
+RUSTFLAGS + strip=true verified).
 
-The single biggest historical failure mode of this project is
-acting on stale profile data. Examples from THIS session alone:
+### 4.5 Adversarial advisor on every claimed win
 
-- **The "floor" doc was wrong by 75 % throughput.** A previous session
-  declared parallel-SM at its "architectural floor" at 356 ms / 423
-  MB/s. The next session opened with no new measurement, applied
-  several optimizations, and discovered the floor was actually
-  closer to 740 MB/s — the previous "floor" was the profile state
-  before three obvious wins.
-- **Bootstrap-bench cycle shares don't apply to silesia.** A SIMD
-  marker-scan plan was built on a bench-fixture profile showing
-  ~7 % cycles in marker scanning. On the real silesia full-pipeline
-  it was ≤ 1.5 %. The plan was abandoned mid-implementation after
-  re-measurement.
-- **Three reverts in a row** in this session, each one looked like
-  an obvious win in source: pre-allocate `data_with_markers`,
-  guard the hoisted refill, branch instead of the unified LUT.
-  All three regressed cycles. CPU branch predictors and
-  instruction-level parallelism are not what a Rust reader
-  intuitively expects.
+Per user process rule (2026-05-27): every judgment call AND every
+claimed task completion goes to an Opus advisor (`Agent` tool,
+`subagent_type=claude`) BEFORE finalizing. Frame the request as
+"try to disprove this" — adversarial is the high-signal mode.
 
-The discipline: every commit gets `make bench-sm` numbers and a fresh
-`perf record` on neurotic. If both move the right way, ship. If either
-regresses, revert immediately — there's nothing to learn from a
-broken commit sitting on the branch.
+This session: 3 advisor consultations caught the n=1 cherry-pick,
+3 missed sub-levers in the allocator design, and the read-pattern
+over-claim in the microbench result. Every catch was empirically
+confirmed at the next measurement step.
 
-### Use Opus advisors for sanity-checks, not for synthesis
-
-Two patterns work for advisors:
-
-- **Pre-flight cross-check.** "Here's my plan, here are the numbers
-  I have, here are the unknowns. Find gaps." → useful. The advisor
-  has no context coupling, sees the analysis fresh, and catches
-  blind spots (wrong cycle-share extrapolation; assumed but
-  unconfigured build flags; missed code paths).
-- **Post-mortem audit.** "Here's the code I shipped, here's what
-  failed, here's the diff. Find what I missed." → useful. The
-  advisor walks the diff with adversarial eyes.
-
-What does NOT work:
-
-- **"Implement X based on your findings."** The advisor pushes
-  synthesis off your context; the result is shallow and you have to
-  re-derive everything to verify it.
-- **Loops of advisors talking to each other.** Each round shifts
-  the analysis to whichever frame the most recent advisor brought.
-  Use ONE advisor pass per concrete question.
-
-**Worktree gotcha (2026-05-26).** When the parallel-SM work runs inside a
-git worktree (e.g. `/Users/jackdanger/www/gzippy/.git/worktrees/perf/...`),
-the `Agent` tool spawns the subagent rooted at the **main repo dir**, not at
-the spawning agent's Bash CWD. Putting `Working dir: <worktree>` in the prompt
-TEXT is ignored. Symptom: the advisor reads files from `main`, doesn't see
-your branch's commits, and disagrees with your premise on facts you have
-verified locally. Confirmed when an advisor reading `Cargo.toml` reported no
-`arena-allocator` feature while it was plainly at `Cargo.toml:39` on this
-branch.
-
-**Mitigation.** Step 0 of every advisor prompt must be an explicit
-`cd <absolute-worktree-path> && pwd` with the instruction that every
-subsequent Read/Grep MUST resolve relative to that directory, and to halt
-with a clear error if `pwd` shows anything else. Without this, the round
-trip is wasted.
-
-### Neurotic measurements are noisy; characterize variance, don't chase single-run jumps
-
-`bench-sm` runs on the homelab Intel i9. Wall variance is ~5-15 % CV
-across runs (system load matters). A 10 % delta on a single run is
-within noise. The patterns that ARE signal:
-
-- **5+ run mean, both gzippy and rapidgzip.** rapidgzip's number is
-  the "system speed" baseline; if both gzippy and rapidgzip moved
-  together, it's neurotic load, not our code.
-- **best-of-N min wall.** Sometimes more stable than mean — the
-  best-case is bounded by the actual decode work, the rest is
-  scheduling jitter.
-- **Total cycles from `perf record`.** Much less noisy than wall.
-  Cycle reduction is the right signal for "did my code do less
-  work"; wall reduction needs the cycle reduction PLUS the savings
-  landing on the critical path.
-
-When wall doesn't move but cycles drop, the savings landed on
-non-critical-path work (parallel headroom). When wall drops but
-cycles barely move, you've moved work off the critical-path chunk.
-Both are wins; they tell you different things.
-
-### "Vendor parity" is the right default; "speed, not fidelity" is the override
-
-`CLAUDE.md` Rule 6 sanctions deviating from vendor when faster. In
-practice this session:
-
-- **Vendor-parity changes that won.** All five landing commits in
-  the final iteration batch were vendor-parity-shaped: LUT-fuse
-  matches `DecodedData.hpp:316-337`; in-place ISA-L write matches
-  vendor's `next_out` pointer pattern; constant-time CRC combine
-  matches vendor's polynomial-multiply path. When in doubt, port
-  vendor first; THEN measure.
-- **One deliberate deviation worked.** Sync `with_sync_boundary_search`
-  replaces vendor's parallel BlockFinder thread because measurement
-  showed thread-spawn was 77 % of the call's elapsed time, dwarfing
-  the streaming-overlap benefit. The deviation is documented at
-  the call site with the stats that justified it.
-- **One deviation regressed.** The branchless `replace_markers`
-  attempt swapped the LUT load for a `v < 256` branch — looked
-  faster on paper, branch mispredict cost beat the saved load.
-  Reverted in 18 minutes.
-
-The pattern: deviate when you have a per-call number showing the
-deviation pays for itself. Don't deviate on aesthetic preference.
-
-### Tools that earned their keep
-
-- `make bench-sm` on neurotic — the authoritative wall-clock number.
-- `perf record -F 999 --call-graph=dwarf` (with
-  `RUSTFLAGS='-C debuginfo=1 -C strip=none -C force-frame-pointers=yes'`)
-  — the only profile data worth optimizing against. Without symbols
-  the report is hex addresses.
-- `perf report --stdio --no-children -g graph,1,caller --group` —
-  the right invocation. `--no-children` puts self-time on the leaf;
-  `--group` combines E-core + P-core events on Intel hybrid; the
-  `caller` view shows who's calling the hot symbol.
-- `GZIPPY_DEBUG=1 gzippy -d -c -p 16 -v ...` — verbose decode stats
-  (slow-path counts, BlockFinder spawn counts, bootstrap rate,
-  buffer-pool hits/misses, prefetch metrics).
-- Opus subagent for cross-checks (see above).
-
-Tools that DIDN'T earn their keep this session:
-
-- iai-callgrind for the inner Huffman loop. Synthetic inputs gave
-  cycle-share numbers that didn't match silesia. Use real-workload
-  perf instead.
-- Mac arm64 local builds for x86-specific code. The
-  `#![cfg(target_arch = "x86_64")]` gates mean local tests skip the
-  failing tests; correctness verification has to run on neurotic.
-
-### Stop when the surgical search is exhausted
-
-After 5 wins and 3 reverts in one session, every remaining
-high-percentage symbol in the profile is either (a) inside ISA-L's C
-library, (b) in the kernel page-allocator path, or (c) already at
-vendor parity. At that point the next move is structural — bigger
-than a single commit — and should change the system's
-shape, not its inner loops.
-
-Signs you've reached this point:
-- Two consecutive reverts.
-- Top-5 hot symbols are all "vendor-parity already" or "can't touch".
-- A 10 % cycle reduction translated to ~2 % wall improvement.
-- CPU utilization across cores is < 50 % (workers idling, not
-  saturating).
+**Update from May-26 plan:** advisors are now used for both
+synthesis (lever ranking, design review) AND adversarial review.
+The "sanity-check only" rule from the May-26 plan was wrong.
 
 ---
 
-## 4. Opportunities for next
+## 5. System map (orientation only — see code for details)
 
-Ranked by evidence-strength for the win, with the surgical reverts
-documented so they're not re-tried without new information.
+### 5.1 Pipeline
 
-### Status of the original S1–S4 candidates (2026-05-26 update)
+```
+gzippy -d <file.gz>
+ → src/decompress/mod.rs: route by header
+ → src/decompress/parallel/single_member.rs: parallel-SM dispatch
+ → src/decompress/parallel/sm_driver.rs: chunk_fetcher::drive
+ → workers (T=16):
+    bootstrap_with_deflate_block_inner (marker phase, ~21% CPU)
+    → decode_chunk_isal_impl (calls IsalInflateWrapper → ResumableInflate2)
+    → ChunkData::data via chunk_buffer_pool::take_u8(cap)
+ → consumer thread:
+    reorder buffer → CRC → writer.write_all
+```
 
-- **S1 (madvise pre-fault) — FALSIFIED.** rpmalloc-per-Vec is already
-  deployed via `arena-allocator` feature (`Cargo.toml:39, 51`;
-  `rpmalloc_alloc.rs`). `clear_page_erms` at 17.8 % is at vendor parity
-  (vendor ~17 %). The `0da3530` pre-allocate attempt regressed; remaining
-  surgical surface is at-floor. Don't reattempt without daemon-mode
-  amortization across invocations.
-- **S2 (out-of-order drain) — FALSIFIED.** Writer must emit in order;
-  CRC32 must combine in order. Out-of-order *completion* doesn't
-  reduce wall because the slow chunk is on the critical path — it
-  has to finish before its bytes are written. Memory cost real
-  (~500 MB reorder buffer); benefit unclear.
-- **S3 (global BlockBoundaryIndex) — FALSIFIED.** The current
-  `with_sync_boundary_search` (`0abc483`) runs boundary scan
-  per-chunk *in parallel* with decode. Doing it once up-front adds
-  ~700 ms sequential CPU to the critical path (less if parallelized
-  but then it's no longer "global, once").
-- **S4 (segmented `chunk.data`) — PENDING.** Still real (~2 %
-  cycles). Invasive (touches writer drain, `populate_subchunk_windows`,
-  `get_last_window`); land only after the bigger-shape wins.
+### 5.2 Files that own the gap
 
-### Vendor-parity divergences from this session's archaeology
+- `src/decompress/parallel/chunk_data.rs` — the single-Vec
+  allocation pattern (Lever 2.3 target).
+- `src/decompress/parallel/chunk_buffer_pool.rs` — pool with
+  thread-local indices (rpmalloc wiring point for Lever 2.1).
+- `src/decompress/parallel/gzip_chunk.rs:1431+` — marker bootstrap
+  (Lever 2.4 surgery zone).
+- `src/decompress/parallel/deflate_block.rs:1626` — `emit_backref_ring`
+  (the 2.84% memmove site).
+- `src/decompress/inflate/resumable.rs:1003+` — `decode_huffman_body_resumable`
+  inner loop. **Do NOT optimize this** until §2.1-2.4 resolved.
 
-Read with: vendor file:line + gzippy file:line. Each labeled by
-remaining surface area to land it.
+### 5.3 Routing facts that surprise people
 
-- **CRC of resolved marker bytes — LANDED (`8ef7a4e`).** Vendor's
-  `ChunkData::applyWindow` (`vendor/.../ChunkData.hpp:313-328`) CRCs
-  the resolved marker bytes on the worker; we deferred to the consumer.
-  Moved to `run_post_process_task` (`chunk_fetcher.rs:1672-1685`);
-  ratio 0.53× → 0.62× (+17 % relative).
-- **Proactive post-process pipelining — OPEN (medium surface).**
-  Vendor `waitForReplacedMarkers` → `queuePrefetchedChunkPostProcessing`
-  (`vendor/.../GzipChunkFetcher.hpp:521-551`) iterates the prefetch
-  cache before blocking and submits post-process for every prefetched
-  chunk whose predecessor window is published. Gzippy only submits
-  post-process from the consumer's main loop (`chunk_fetcher.rs:1269`),
-  so the post-process pipeline serializes through the consumer.
-  Simpler shape (chain post-process inline at the end of
-  `run_decode_task` when the predecessor window is already in
-  `window_map`) has subtleties: `replace_markers_lut_narrow` doesn't
-  clear `chunk.data_with_markers`, so the consumer's marker-vs-clean
-  branch at `chunk_fetcher.rs:1119` would still take the marker path
-  on an already-resolved chunk. Needs either a `chunk.post_processed`
-  flag + new consumer branch, OR clear `data_with_markers` and
-  refactor the tail-window publish to use `chunk.narrowed` for the
-  trailing bytes.
-- **`narrow_u16_to_u8` AVX2 — RE-ENABLED + downclock claim REFUTED
-  (`37fc295`, `4e939c7`).** Prior env-gate removed and replaced with
-  a pure runtime `is_x86_feature_detected!("avx2")` check. Same-session
-  controlled bench (today's neurotic state, AVX2-off vs AVX2-on
-  three runs):
-
-  | commit | gzippy | rapidgzip | ratio |
-  |---|---:|---:|---:|
-  | `8ef7a4e` (AVX2 off) | 857 MB/s | 1852 | 0.46× |
-  | `37fc295` (AVX2 on) run 1 | 868 | 1831 | 0.47× |
-  | `37fc295` (AVX2 on) run 2 | 878 | 1893 | 0.46× |
-
-  +1.9 % gzippy, within 2-5 % CV — statistically indistinguishable.
-  Counter (`POST_PROCESS_FUSED_PATH=23, POST_PROCESS_SMALL_MARKERS_PATH=2`)
-  showed silesia exercises the small-markers path only 8 % of tasks,
-  so the wall-level null result was diluted exposure. To remove the
-  dilution, `4e939c7` added a `GZIPPY_NARROW_INJECT=1` env var that
-  injects a 4 KiB `narrow_u16_to_u8` call on a scratch buffer before
-  EVERY task's `populate_subchunk_windows` — 12× more AVX-256 exposure
-  than current production. 5-trial wall comparison on neurotic:
-
-  | mode | trials (ms) | mean | drop-warmup mean |
-  |---|---|---:|---:|
-  | baseline | 414, 442, 439, 421, 433 | 429.8 | 433.8 |
-  | injection on | 465, 393, 442, 438, 430 | 433.6 | 425.8 |
-
-  +0.9 % all-trial / -1.9 % drop-warmup. Both within 2-6 % per-set CV.
-  **Downclock claim is empirically refuted at the resolution that
-  matters.** The original session's 3× observation was likely a
-  measurement artifact (cache state, system load, or attribution to
-  the wrong region) or a CPU-model difference not relevant to the
-  i9-14000 neurotic target. The probe is kept as a diagnostic
-  (one-line env-var to re-test on a different host).
-- **`publish_subchunk_windows` runs on consumer — OPEN (light surgical).**
-  `chunk_fetcher.rs:2096`. Per-subchunk window_map insert serialized
-  on consumer thread; could move to the worker right after
-  `populate_subchunk_windows` (`chunk_fetcher.rs:1670`). Risk: ordering
-  vs consumer's tail-window publish at `chunk_fetcher.rs:1130/1195`.
-  Light work per chunk (only multi-subchunk chunks pay).
-- **`insert_bytes_with_compression` allocates fresh `CompressedVector`
-  per insert — OPEN (small).** `chunk_fetcher.rs:1130, 1195`. Each
-  insert copies the 32 KiB tail into a new buffer. Vendor uses
-  `shared_ptr<const CompressedVector>` and inserts the existing Arc.
-  Could take `Arc<[u8; 32768]>` directly.
-- **`ChunkData::clone` on `Arc::try_unwrap` miss — OPEN (verify-first).**
-  `chunk_fetcher.rs:1086`. Diagnostic counter `ARC_TRY_UNWRAP_MISSES`
-  tracks this; if non-zero in production, a per-chunk MB-scale clone
-  sits on the consumer thread. Check the counter on a verbose run
-  before acting.
-
-### Open S4 candidate (re-stated)
-
-#### S4. Segmented `chunk.data` to avoid `absorb_isal_tail`'s memmove
-
-**Evidence.** ~2 % of cycles in the `dst.data.extend_from_slice(&tail.data)`
-shift inside `absorb_isal_tail`. If `chunk.data` were `Vec<Vec<u8>>`
-(segments), the tail could be moved by `Vec::append` (pointer swap)
-instead of memcpy. Vendor stores data this way
-(`std::vector<FasterVector<uint8_t>>`).
-
-**Risk.** Downstream consumers (the writer drain, `populate_subchunk_windows`,
-`get_last_window`) all assume contiguous `chunk.data`. Refactoring is
-invasive.
-
-### Surgical reverts to NOT re-try without new evidence
-
-- **Pre-allocate `data_with_markers` to chunk capacity** (`0da3530`).
-  Increased total cycles by 5 %. The page faults aren't from
-  realloc; they're from first-touch on the new pool buffer.
-  Pre-allocation doesn't help that.
-- **Guard the hoisted `bits.refill()` with `bitsleft < 56`**
-  (`d8e11a3`). Increased total cycles by 5 %. The branch broke
-  instruction-level parallelism that the unconditional load+shift
-  benefited from.
-- **Branch `v < 256` instead of unified LUT in `replace_markers_lut_narrow`**
-  (`63a1e97`). Increased `submit_post_process_to_pool` cycles
-  from 6.1 % → 8.6 %. Branch mispredicts on mixed-distribution
-  data dominated the saved LUT load.
-
-If you have NEW evidence (e.g. a different fixture's distribution
-makes the branch predictable, or `MADV_POPULATE_WRITE` shifts the
-fault cost off-thread), re-try with a re-measurement plan. Don't
-re-try because the source looks cleaner.
-
-### Confirmed dead ends (don't even start)
-
-- **SIMD marker scan in `emit_backref_ring`.** Maximum theoretical
-  win < 1.5 % cycles on silesia (`plans/`-era abandoned plan).
-  Below noise floor.
-- **Hand-asm / inline-asm Huffman decode.** Outside the pure-Rust
-  identity per `CLAUDE.md`'s deliverable definition.
-- **Removing speculation entirely.** `GZIPPY_NO_PREFETCH=1` regressed
-  bench-sm by +42 %. Speculation is net-positive despite the
-  bootstrap cost it imposes on chunks whose `contains_marker_bytes`
-  never flips.
+- `gzippy -d` at T=16 on silesia routes through parallel-SM, NOT
+  the single-member fallback. The classifier gates this on
+  `data.len() > MIN_PARALLEL_COMPRESSED` AND `num_threads > 1`.
+- `IsalInflateWrapper` in `--features pure-rust-inflate` is a
+  wrapper over `unified::Inflate` over `ResumableInflate2`. The
+  ISA-L name is historical; the pure-rust path runs through it.
+- Marker bootstrap is SAME code in `pure-rust-inflate` and
+  `isal-compression` builds. Allocator/page-fault gap is therefore
+  NOT what differentiates the two — the inflate bulk does.
 
 ---
 
-## 5. Done-when criteria
+## 6. Falsification index (don't re-walk)
 
-Same as before. Run these four; if all four are green, the project is
-done. If any one is red, the work items above say what's left.
+17 entries. Grep this before proposing any lever. Each row links to
+the falsification doc with the hypothesized cause + future-retry
+guard.
 
-1. `cargo bench --features pure-rust-inflate --bench inflate_isal_vs_pure_rust`
-   reports **pure-Rust ≥ 1/1.05× ISA-L** on neurotic.
-2. `cargo test --release --features pure-rust-inflate -- \
-   test_single_member_parallel_silesia --ignored --nocapture` reports
-   **ratio < 0.5** (T=16 parallel < ½ T=1 sequential) on neurotic.
-3. `make ship` reports pure-rust-inflate throughput **≥ rapidgzip**
-   throughput on the silesia corpus, same hardware.
-4. `vendor/isa-l`, `vendor/isal-rs`, `packaging/isal-patches/`,
-   `backends/isal_decompress.rs`, `backends/isal_compress.rs` are
-   deleted; `arena-allocator` is decoupled from `isal-compression`
-   in `Cargo.toml`; CI is green with `pure-rust-inflate` as the only
-   inflate backend.
+| # | Date | Lever | Result | Cause | Doc |
+|---|------|-------|--------|-------|-----|
+| 1 | May-26 | B2 PRELOAD naive | -10% | Wasted lookups on yield paths | `archive/rust-rapidgzip-2026-05-26.md` |
+| 2 | May-26 | 2-unroll FASTLOOP | -10% | I-cache pressure | same |
+| 3 | May-26 | FASTLOOP PRELOAD with cached entry | no change | OoO already overlaps | same |
+| 4 | May-26 | Single-literal fast path | no change | Compiler already branch-predicts | same |
+| 5 | May-26 | Writeback-skip around copy_match | -9pp | Borrow-checker spills | same |
+| 6 | May-26 | LTO=fat + cgu=1 + native | no change | Flags alone insufficient | same |
+| 7 | May-26 | target-cpu=native alone | no change | same | same |
+| 8 | May-28 | Route C v3.7/v3.9 dynasm asm | at parity | rustc + target-cpu=native already optimal scalar | `docs/perf/2026-05-28-v3.8-hybrid-silesia-bench.md` |
+| 9 | May-28 | S1 u32 packed literal store | +0.4% noise | LLVM + x86 store-buffer coalesces | `docs/perf/2026-05-28-s1-packed-lit-store-falsified.md` |
+| 10 | May-28 | S2 bulk window-copy slow path | at parity | Slow path fires on ~3% of bytes | `docs/perf/2026-05-28-s2-bulk-window-copy-falsified.md` |
+| 11 | May-28 | L1 MADV_HUGEPAGE on chunk buffers | -38% | khugepaged contention + madvise latency | `docs/perf/2026-05-28-framework-step1-allocator-spec.md` |
+| 12 | May-28 | `GZIPPY_RESUMABLE_ISAL_INNER=1` as prod default | -6% | ISA-L LUT multi-pack emit has more overhead on production silesia than libdeflate-LUT | `project_isal_lut_port_landed.md` |
+| 13 | May-28 | C-fastloop iter-count batch (`for _ in 0..safe_iters`) | INFINITE LOOP | `safe_iters=0` near chunk tail re-enters with same bounds; hung cargo test 4hr | git commit 762ac0a → reverted 6a7b72e |
+| 14 | May-28 | Lever 4.1 rpmalloc global allocator | +167% wall on `-o file`, +41% page-faults | Rust rpmalloc 0.2.2 crate doesn't call `rpmalloc_thread_initialize` per thread | `docs/perf/2026-05-28-framework-step5-lever4-1-falsified.md` |
+| 15 | May-26 | Z-allocator pool prewarm | -15% | Serialized 20K faults that were previously parallel across 16 workers | `feedback_z_allocator_prewarm_falsified.md` |
+| 16 | May-28 | BZHI/BMI2 explicit wrapper around `(src & ((1<<n)-1))` | regress | rustc with `-C target-cpu=native` already lowers the inline pattern to BZHI on Raptor Lake; explicit wrapper's indirection regressed | `crates/gzippy-inflate/src/route_c_dynamic.rs:93-99` |
+| 17 | May-28 | Unchecked raw-pointer multi-literal writes + upfront 4-byte headroom check | -9% (395→360 MB/s) | rustc was already eliding the bounds check via range analysis; the explicit unsafe shape disrupted register allocation | `crates/gzippy-inflate/src/route_c_dynamic.rs:611-619` |
 
-At the time of writing we are at ~0.53× rapidgzip with ISA-L still
-the production path. None of the four gates are green. The
-opportunities in §4 are the path from where we are to where the
-gates close.
+### Confirmed wins (alongside the falsifications)
+
+| # | Date | Lever | Result | Mechanism |
+|---|------|-------|--------|-----------|
+| W1 | May-28 | C+T3 simplify (4-literal → 2-extra-literal cap) | +1.9% wall, 20-trial neurotic A/B | Vendor `decompress_template.h:370` explicitly measured 3+ extras as a pessimization; removes i-cache + branch-pred pressure |
+
+---
+
+## 7. Done-when criteria
+
+ALL of:
+
+1. **Perf**: pure-rust within 1pp of rapidgzip on neurotic
+   silesia-gzip9.gz at T=16, n=20 paired-bench median, load<4,
+   strip=true verified. Confirmed on AT LEAST silesia + a
+   low-redundancy file (where marker bootstrap dominates) + a
+   high-redundancy file (4 GiB-base64-like, where inflate inner
+   loop dominates).
+2. **No regression on `-o real_file`** (the 2026-05-28 Lever 4.1
+   regression mode). Test both `-c >/dev/null` AND `-o real_file`
+   sinks in every A/B.
+3. **Correctness**: silesia SHA256 byte-identical; 3-oracle
+   differential fuzz (flate2 + libdeflate-sys + zlib-ng-sys) ≥ 72h
+   per release with zero disagreements.
+4. **Adversarial advisor sign-off** on the final neurotic
+   measurement.
+
+CLAUDE.md prime directive ("fastest gzip ever") is a stretch goal:
+beating rapidgzip on representative workloads. This plan closes the
+gap to within 1pp. Beating rapidgzip likely requires the marker
+u8-ring + BMI2 PEXT path (§2.4 + §2.5).
+
+---
+
+*Plan last updated: 2026-05-28. Pre-update version preserved at
+`plans/archive/rust-rapidgzip-2026-05-26.md`. If you are picking
+this up cold: read §1 first, then §2.1 for the highest-priority
+lever, then §3+§4 for how to work without re-falsifying.*
