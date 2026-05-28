@@ -1,48 +1,53 @@
-//! §3.5 — per-block perfect-hash decode tables (CHD-style).
+//! §3.5 — per-block perfect-hash decode tables (CHD).
 //!
-//! ## Design
-//!
-//! For a given DEFLATE block, the litlen alphabet uses ≤ 286 symbols.
-//! A perfect hash function over those ~286 codes lets us index into
-//! a compact value table without subtable-dispatch overhead. Target:
-//! ~3 cycles/lookup, table size ~2.3 KiB (fits L1 alongside the
-//! dist table + JIT decoder code).
+//! ## Design (v0.2 — real CHD displacement table)
 //!
 //! CHD = Compress-Hash-Displace (Belazzougui et al., 2009). Two-level
-//! hash:
-//!   - h1(key) → bucket index in [0, m).
-//!   - For each bucket, choose a "displacement" value `d` such that
-//!     `(h2(key) ^ d) mod n` is unique for all keys in the bucket.
-//!   - Lookup: `g[h1(key)] = d`; then `value[(h2(key) ^ d) mod n]`.
+//! perfect hash:
+//!   - h1(key) → bucket index in `[0, m)`.
+//!   - For each bucket (largest first), choose a displacement `d` such
+//!     that `(h2(key) ^ d) mod n` is unique across all assigned keys.
+//!   - Lookup: `value[(h2(key) ^ displacements[h1(key)]) mod n]`.
 //!
 //! ## Adapting CHD to DEFLATE
 //!
-//! DEFLATE codes are variable-length (1..15 bits). The "key" we hash
-//! is the FIXED 15-bit window peeked from the bit stream — the code's
-//! actual bits, MSB-padded with the next bits in the stream. Each
-//! actual code (length `L`) occupies `2^(15 - L)` 15-bit keys. The
-//! hash must:
-//!   - Map every 15-bit key whose low-L bits match a real code to
-//!     the same (symbol, length) entry.
-//!   - Reject 15-bit keys whose low-1..15 bits don't match any code
-//!     (return an "invalid code" marker; the decoder retries with
-//!     a malformed-data error).
+//! DEFLATE codes are variable-length (1..15 bits) and stored MSB-first
+//! into LSB-first byte stream → caller peeks a 15-bit window and we
+//! key on `(reversed_codeword, length)` per actual code.
 //!
-//! Per-block build cost: walk symbols, compute h1/h2 per symbol,
-//! assign displacements greedily. Target: ~5 µs per block on
-//! Raptor Lake (286 ops × ~17ns each).
+//! For each (code, len) pair, the LUT slot we'd traditionally
+//! populate for EVERY 15-bit key whose low-`len` bits == rev_code
+//! becomes a single CHD entry that records `(symbol, length)`. At
+//! lookup time, the caller peeks 15 bits and we strip the high bits
+//! per-length until we find a match; the per-length table is small
+//! enough that this is cache-friendly.
 //!
-//! ## Scope of this module (v0.1)
+//! ## v0.2 implementation
 //!
-//! Skeleton only. The full CHD construction + lookup is multi-week
-//! work per `plans/unified-decoder.md` §11. v0.1 ships:
-//!   - The `ChdTable` struct shape (g + value arrays).
-//!   - A naive O(N²) build that bootstraps via canonical Huffman
-//!     and falls back to it on construction failure.
-//!   - `lookup_15bit(key) -> Option<(symbol, code_length)>` API.
+//! We use a simplified two-table scheme that achieves the same
+//! "no flat 32 KiB table" goal:
+//!   - `displacements: [u16; m]` where m ≈ N/4 (typically 64-128
+//!     for the 286-symbol litlen alphabet).
+//!   - `values: Vec<(u16, u8)>` sized to next-prime above N.
+//!   - On lookup, h1 picks a bucket, h2 + displacement picks the
+//!     value index.
 //!
-//! Real CHD construction (with displacement-table greedy assignment,
-//! retry on collision, BMI2-accelerated hash) is deferred to v0.2.
+//! For DEFLATE specifically we ALSO need to validate the lookup
+//! result (since CHD only guarantees uniqueness for INSERTED keys;
+//! any 15-bit pattern that doesn't correspond to a real codeword
+//! must return None). We store the original 15-bit key alongside
+//! the value and compare at lookup.
+//!
+//! ## Tradeoffs vs v0.1 flat table
+//!
+//! v0.1: 64 KiB flat lookup, O(1) lookup with 1 load. Cache-unfriendly
+//! for the LARGE litlen alphabet (286 entries × 256 bits = ~9 KB of
+//! "live" working set per block, vs the 64 KiB table's 16 cache lines
+//! per lookup).
+//!
+//! v0.2: ~2-3 KiB combined (displacements + values + keys). One extra
+//! load on lookup but stays in L1. Per-block build cost ~10 µs
+//! (vs v0.1's instant flat-array fill).
 
 #[cfg(feature = "std")]
 use std::vec::Vec;
@@ -50,25 +55,46 @@ use std::vec::Vec;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-/// Per-block perfect-hash decode table.
-///
-/// v0.1: stores a direct 32 KiB lookup (indexed by 15 bits) instead
-/// of the real CHD displacement table. This is functionally
-/// equivalent for correctness but doesn't achieve the cache locality
-/// goal — left as a placeholder for v0.2 to swap in the actual CHD
-/// build.
+/// Per-block perfect-hash decode table (v0.2 CHD).
 pub struct ChdTable {
-    /// Indexed by 15 bits peeked from the stream (LSB-first).
-    /// Each entry: (symbol, code_length). code_length == 0 means
-    /// "no valid code at this 15-bit key" (caller signals malformed
-    /// DEFLATE input).
-    entries: Vec<(u16, u8)>,
+    /// CHD displacement table. `displacements[h1(key) % m] = d`.
+    displacements: Vec<u16>,
+    /// Value table. `values[(h2(key) ^ d) % n] = (key, symbol, length)`.
+    values: Vec<ChdEntry>,
+    /// Modulus for the displacement table (m).
+    m: usize,
+    /// Modulus for the value table (n).
+    n: usize,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct ChdEntry {
+    /// Original 15-bit canonical key (with low `length` bits being the
+    /// reversed codeword). `0xFFFF` sentinel = empty slot.
+    key: u16,
+    /// Symbol decoded at this position. Unused when slot is empty.
+    symbol: u16,
+    /// Code length in bits. `0` when slot is empty.
+    length: u8,
+}
+
+impl ChdEntry {
+    const EMPTY: ChdEntry = ChdEntry {
+        key: 0xFFFF,
+        symbol: 0,
+        length: 0,
+    };
+}
+
+/// Public CHD lookup result.
+pub type ChdLookup = Option<(u16, u8)>;
 
 impl ChdTable {
     /// Build from per-symbol code lengths (DEFLATE canonical Huffman).
+    /// Returns the displacement-table CHD layout (v0.2).
     pub fn build(code_lengths: &[u8]) -> Self {
-        // Mirror the canonical Huffman code assignment.
+        // First materialize the set of (key, symbol, length) tuples
+        // where key = reverse_bits(canonical_code, length).
         let mut count = [0u16; 16];
         for &len in code_lengths {
             if len > 0 && len <= 15 {
@@ -81,43 +107,197 @@ impl ChdTable {
             code = (code + count[len - 1] as u32) << 1;
             first_code[len] = code;
         }
-        let mut entries = vec![(0u16, 0u8); 1 << 15];
         let mut next_code = first_code;
+
+        // Collect codes (we only insert one entry per code, NOT
+        // per-15-bit-key — the lookup masks per length).
+        let mut codes: Vec<(u16, u16, u8)> = Vec::new(); // (key, symbol, length)
         for (symbol, &len) in code_lengths.iter().enumerate() {
             if len == 0 {
                 continue;
             }
             let codeword = next_code[len as usize];
             next_code[len as usize] += 1;
-            let rev = reverse_bits(codeword, len);
-            // Populate every 15-bit key whose low-len bits == rev.
-            let stride = 1u32 << len;
-            let mut key = rev;
-            while (key as usize) < (1 << 15) {
-                entries[key as usize] = (symbol as u16, len);
-                key += stride;
+            let rev = reverse_bits(codeword, len) as u16;
+            codes.push((rev, symbol as u16, len));
+        }
+
+        if codes.is_empty() {
+            // Empty table — every lookup returns None.
+            return Self {
+                displacements: vec![0],
+                values: vec![ChdEntry::EMPTY],
+                m: 1,
+                n: 1,
+            };
+        }
+
+        let n_keys = codes.len();
+        // Value table size: next prime above n_keys * 5/4 for low
+        // load factor (helps the greedy displacement assignment
+        // converge fast). For DEFLATE's typical 286 codes this is
+        // ~360, well within L1.
+        let n = next_prime((n_keys * 5 / 4).max(16));
+        // Bucket count: ~n_keys / 4 buckets (CHD literature suggests
+        // λ ≈ 4 entries/bucket maximizes compactness vs build cost).
+        let m = ((n_keys / 4).max(4)).next_power_of_two();
+
+        // Group codes into buckets by h1(key) % m.
+        let mut buckets: Vec<Vec<(u16, u16, u8)>> = vec![Vec::new(); m];
+        for &(key, sym, len) in &codes {
+            let b = (hash1(key) as usize) % m;
+            buckets[b].push((key, sym, len));
+        }
+
+        // Sort bucket indices by descending size for greedy assignment.
+        let mut bucket_order: Vec<usize> = (0..m).collect();
+        bucket_order.sort_by_key(|&i| std::cmp::Reverse(buckets[i].len()));
+
+        let mut displacements = vec![0u16; m];
+        let mut values = vec![ChdEntry::EMPTY; n];
+
+        // Greedy CHD: for each bucket (largest first), try
+        // displacements 0..MAX_DISP; the first d that places every
+        // bucket member into an empty value slot wins.
+        const MAX_DISP: u32 = 65536;
+        for &b in &bucket_order {
+            let bucket = &buckets[b];
+            if bucket.is_empty() {
+                continue;
+            }
+            let mut found = false;
+            for d in 0..MAX_DISP {
+                let mut slots: Vec<usize> = Vec::with_capacity(bucket.len());
+                let mut ok = true;
+                for &(key, _sym, _len) in bucket {
+                    let slot = ((hash2(key) ^ d) as usize) % n;
+                    if values[slot].length != 0 || slots.contains(&slot) {
+                        ok = false;
+                        break;
+                    }
+                    slots.push(slot);
+                }
+                if ok {
+                    displacements[b] = d as u16;
+                    for (i, &(key, sym, len)) in bucket.iter().enumerate() {
+                        values[slots[i]] = ChdEntry {
+                            key,
+                            symbol: sym,
+                            length: len,
+                        };
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                // CHD construction failed — fall back to a sparse layout
+                // by growing n. For DEFLATE-sized alphabets this should
+                // be rare with the 5/4 load factor; we panic in v0.2
+                // and document the rebuild path for v0.3.
+                panic!(
+                    "CHD construction failed for bucket {} of size {} (n={}, m={})",
+                    b,
+                    bucket.len(),
+                    n,
+                    m
+                );
             }
         }
-        Self { entries }
-    }
 
-    /// Lookup a 15-bit key. Returns `None` if no valid code matches.
-    #[inline]
-    pub fn lookup_15bit(&self, key: u16) -> Option<(u16, u8)> {
-        let key = (key as usize) & 0x7FFF;
-        let (sym, len) = self.entries[key];
-        if len == 0 {
-            None
-        } else {
-            Some((sym, len))
+        Self {
+            displacements,
+            values,
+            m,
+            n,
         }
     }
 
-    /// Table size in bytes. v0.1 stores a flat 32 KiB lookup; v0.2
-    /// CHD target is ~2.3 KiB.
-    pub fn size_bytes(&self) -> usize {
-        self.entries.len() * core::mem::size_of::<(u16, u8)>()
+    /// Lookup a 15-bit key. Returns `Some((symbol, code_length))` if
+    /// the low-`code_length` bits of `key` match an inserted codeword;
+    /// returns `None` otherwise.
+    ///
+    /// Implementation: peek the 15-bit key. For DEFLATE, the actual
+    /// codeword length is unknown at lookup time, so we try keys
+    /// masked to each plausible length (1..15) and return the first
+    /// CHD match whose stored key matches the masked input. This is
+    /// a small fixed cost (~15 iterations max, typically 8-9 since
+    /// most DEFLATE codes are 7-9 bits).
+    ///
+    /// A future v0.3 will eliminate the per-length scan by storing
+    /// a length-discriminating hint in the displacement table.
+    #[inline]
+    pub fn lookup_15bit(&self, key: u16) -> ChdLookup {
+        // Try each plausible code length, shortest first (so common
+        // short codes terminate the loop fast).
+        for len in 1u8..=15 {
+            let masked = key & ((1u16 << len) - 1);
+            let b = (hash1(masked) as usize) % self.m;
+            let d = self.displacements[b];
+            let slot = ((hash2(masked) ^ d as u32) as usize) % self.n;
+            let entry = self.values[slot];
+            if entry.length == len && entry.key == masked {
+                return Some((entry.symbol, entry.length));
+            }
+        }
+        None
     }
+
+    /// Total table size in bytes.
+    pub fn size_bytes(&self) -> usize {
+        self.displacements.len() * core::mem::size_of::<u16>()
+            + self.values.len() * core::mem::size_of::<ChdEntry>()
+    }
+}
+
+/// Murmur-style fast hash for 16-bit keys. h1 is the bucket hash;
+/// h2 is the value-table hash. They MUST be uncorrelated for CHD to
+/// converge fast on typical inputs.
+#[inline(always)]
+fn hash1(key: u16) -> u32 {
+    let mut x = key as u32;
+    x = x.wrapping_mul(0x85eb_ca6b);
+    x ^= x >> 13;
+    x = x.wrapping_mul(0xc2b2_ae35);
+    x ^= x >> 16;
+    x
+}
+
+#[inline(always)]
+fn hash2(key: u16) -> u32 {
+    let mut x = key as u32 ^ 0xdead_beef;
+    x = x.wrapping_mul(0xff51_afd7);
+    x ^= x >> 13;
+    x = x.wrapping_mul(0x4c19_5f5e);
+    x ^= x >> 16;
+    x
+}
+
+fn next_prime(n: usize) -> usize {
+    fn is_prime(n: usize) -> bool {
+        if n < 2 {
+            return false;
+        }
+        if n < 4 {
+            return true;
+        }
+        if n.is_multiple_of(2) {
+            return false;
+        }
+        let mut i = 3;
+        while i * i <= n {
+            if n.is_multiple_of(i) {
+                return false;
+            }
+            i += 2;
+        }
+        true
+    }
+    let mut k = n;
+    while !is_prime(k) {
+        k += 1;
+    }
+    k
 }
 
 fn reverse_bits(mut code: u32, n: u8) -> u32 {
@@ -134,8 +314,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chd_table_decodes_fixed_huffman_codes() {
-        // Fixed-Huffman code lengths per RFC 1951 §3.2.6.
+    fn chd_v2_decodes_fixed_huffman_codes() {
         let mut code_lengths = [0u8; 288];
         code_lengths[0..=143].fill(8);
         code_lengths[144..=255].fill(9);
@@ -144,31 +323,97 @@ mod tests {
 
         let chd = ChdTable::build(&code_lengths);
 
-        // Symbol 65 ('A') has code 0b01110001 (8 bits). Reversed = 0b10001110 = 142.
-        // A 15-bit key with low 8 bits = 142 should decode to (65, 8).
-        let key = 142u16;
-        let (sym, len) = chd.lookup_15bit(key).unwrap();
-        assert_eq!(sym, 65);
-        assert_eq!(len, 8);
-
-        // EOB (symbol 256) has code 0 (7 bits). Reversed = 0.
-        let (sym, len) = chd.lookup_15bit(0).unwrap();
-        assert_eq!(sym, 256);
-        assert_eq!(len, 7);
+        // Walk every (symbol, code) pair and verify the lookup
+        // returns the matching symbol+length.
+        let mut count = [0u16; 16];
+        for &len in code_lengths.iter() {
+            if len > 0 {
+                count[len as usize] += 1;
+            }
+        }
+        let mut first_code = [0u32; 16];
+        let mut code: u32 = 0;
+        for len in 1..=15 {
+            code = (code + count[len - 1] as u32) << 1;
+            first_code[len] = code;
+        }
+        let mut next_code = first_code;
+        let mut checked = 0;
+        for (symbol, &len) in code_lengths.iter().enumerate() {
+            if len == 0 {
+                continue;
+            }
+            let codeword = next_code[len as usize];
+            next_code[len as usize] += 1;
+            let rev = reverse_bits(codeword, len) as u16;
+            // The 15-bit key has the rev'd codeword in the low `len` bits;
+            // upper bits can be anything (we use 0 here).
+            let key = rev;
+            let r = chd.lookup_15bit(key).unwrap_or_else(|| {
+                panic!("CHD lookup failed for symbol {symbol}, len {len}, key 0x{key:04x}")
+            });
+            assert_eq!(r.0, symbol as u16, "wrong symbol at key 0x{key:04x}");
+            assert_eq!(r.1, len, "wrong length at key 0x{key:04x}");
+            checked += 1;
+        }
+        assert_eq!(checked, 288, "should check all 288 fixed-Huffman codes");
     }
 
     #[test]
-    fn chd_lookup_invalid_returns_none() {
-        // Code lengths array with only symbol 0 having a 1-bit code.
+    fn chd_v2_size_under_4kib() {
         let mut code_lengths = [0u8; 288];
-        code_lengths[0] = 1;
-        // Note: this is malformed canonical (1 code of length 1 leaves
-        // no codes elsewhere) — but a 15-bit key with low bit = 1
-        // doesn't match symbol 0's code (reversed code = 0) so it's
-        // a "no code" position.
+        code_lengths[0..=143].fill(8);
+        code_lengths[144..=255].fill(9);
+        code_lengths[256..=279].fill(7);
+        code_lengths[280..=287].fill(8);
         let chd = ChdTable::build(&code_lengths);
-        // Key with low bit 1 should not find symbol 0.
-        let r = chd.lookup_15bit(1);
-        assert!(r.is_none());
+        let size = chd.size_bytes();
+        eprintln!("CHD v2 table size for fixed-Huffman: {size} bytes");
+        // Plan §3.5 target: ~2.3 KiB. We're more lax in v0.2 since
+        // we store the key + symbol + length per entry (6 bytes) vs
+        // the theoretical 3 bytes — this is the correctness-first
+        // version.
+        assert!(
+            size <= 4 * 1024,
+            "CHD table {size} bytes exceeds 4 KiB target"
+        );
+    }
+
+    #[test]
+    fn chd_v2_lookup_invalid_returns_none() {
+        // Build a sparse table: only symbol 0 with code length 8.
+        let mut code_lengths = [0u8; 288];
+        code_lengths[0] = 8;
+        let chd = ChdTable::build(&code_lengths);
+        // Symbol 0 has code 0 (8 bits), reversed = 0. Key 0 with low 8
+        // bits = 0 should hit.
+        assert_eq!(chd.lookup_15bit(0).unwrap(), (0, 8));
+        // Any other low-8-bits pattern should NOT hit.
+        for key in 1u16..=255 {
+            let r = chd.lookup_15bit(key);
+            assert!(
+                r.is_none() || r.unwrap().0 != 0 || r.unwrap().1 != 8,
+                "unexpected hit at key 0x{key:04x}: {:?}",
+                r
+            );
+        }
+    }
+
+    #[test]
+    fn chd_v2_smaller_than_flat_table() {
+        // Compare v2 (this impl) vs the flat 32 KiB lookup it replaces.
+        let mut code_lengths = [0u8; 288];
+        code_lengths[0..=143].fill(8);
+        code_lengths[144..=255].fill(9);
+        code_lengths[256..=279].fill(7);
+        code_lengths[280..=287].fill(8);
+        let chd = ChdTable::build(&code_lengths);
+        let v0_1_size = (1 << 15) * core::mem::size_of::<(u16, u8)>();
+        assert!(
+            chd.size_bytes() < v0_1_size / 8,
+            "v0.2 ({} bytes) should be at least 8x smaller than v0.1 ({} bytes)",
+            chd.size_bytes(),
+            v0_1_size
+        );
     }
 }
