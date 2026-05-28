@@ -35,6 +35,7 @@ pub mod bit_reader;
 pub mod chd;
 pub mod constant_time;
 pub mod gpu;
+pub mod route_c_dynamic;
 pub mod route_c_testbed;
 pub use aot::{fingerprint_hash, match_aot_fingerprint};
 pub use bit_reader::{pext, BitReaderI32, ShiftRegisterWidth};

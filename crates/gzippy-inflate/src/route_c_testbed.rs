@@ -96,6 +96,10 @@ pub struct TestCase {
     pub fingerprint: Option<u64>,
     /// Decoded bytes this block emits.
     pub expected_output: Vec<u8>,
+    /// Up to 32 KiB of decoded output IMMEDIATELY preceding this block.
+    /// Required for back-references in the first 32 KiB of this block's
+    /// output to resolve correctly. Empty for the first block.
+    pub predecessor_window: Vec<u8>,
 }
 
 /// Comparison result for one decoder run against one test case.
@@ -192,6 +196,9 @@ mod corpus {
                     format!("block {i} decoded_bytes overrun: {end} > {}", oracle.len()),
                 ));
             }
+            const W: usize = 32 * 1024;
+            let win_start = cum_bytes.saturating_sub(W);
+            let predecessor_window = oracle[win_start..cum_bytes].to_vec();
             cases.push(TestCase {
                 block_index: i,
                 start_bit_in_deflate: b.start_bit,
@@ -199,6 +206,7 @@ mod corpus {
                 btype: b.btype,
                 fingerprint: b.fingerprint,
                 expected_output: oracle[cum_bytes..end].to_vec(),
+                predecessor_window,
             });
             cum_bytes = end;
         }
@@ -239,7 +247,7 @@ pub fn run_testbed_with_caps<F>(
     decoder: F,
 ) -> TestbedReport
 where
-    F: FnMut(&[u8], u64, u8, Option<u64>, usize) -> std::io::Result<(u64, Vec<u8>)>,
+    F: FnMut(&[u8], u64, u8, Option<u64>, usize, &[u8]) -> std::io::Result<(u64, Vec<u8>)>,
 {
     if !caps.host_supports() {
         return TestbedReport {
@@ -252,10 +260,14 @@ where
 
 /// Run a candidate decoder against a slice of test cases. No cap
 /// gating (assumes the decoder is portable scalar).
+///
+/// The decoder callback receives: (deflate body, start_bit, btype,
+/// fingerprint, expected_output_capacity, predecessor_window).
+/// Returns (end_bit, output bytes).
 #[cfg(feature = "std")]
 pub fn run_testbed<F>(cases: &[TestCase], deflate_body: &[u8], mut decoder: F) -> TestbedReport
 where
-    F: FnMut(&[u8], u64, u8, Option<u64>, usize) -> std::io::Result<(u64, Vec<u8>)>,
+    F: FnMut(&[u8], u64, u8, Option<u64>, usize, &[u8]) -> std::io::Result<(u64, Vec<u8>)>,
 {
     let mut report = TestbedReport {
         total_cases: cases.len(),
@@ -269,6 +281,7 @@ where
             case.btype,
             case.fingerprint,
             case.expected_output.len(),
+            &case.predecessor_window,
         );
         let decode_ns = t0.elapsed().as_nanos() as u64;
         report.total_decode_ns += decode_ns;
@@ -323,7 +336,9 @@ mod tests {
     fn empty_testbed_report() {
         let cases: Vec<TestCase> = Vec::new();
         let deflate = b"";
-        let report = run_testbed(&cases, deflate, |_, start, _, _, _| Ok((start, Vec::new())));
+        let report = run_testbed(&cases, deflate, |_, start, _, _, _, _| {
+            Ok((start, Vec::new()))
+        });
         assert_eq!(report.total_cases, 0);
         assert_eq!(report.pass_rate(), 0.0);
     }
@@ -339,6 +354,7 @@ mod tests {
                 btype: 1,
                 fingerprint: None,
                 expected_output: vec![1, 2, 3],
+                predecessor_window: Vec::new(),
             },
             TestCase {
                 block_index: 1,
@@ -347,10 +363,11 @@ mod tests {
                 btype: 2,
                 fingerprint: Some(0xdead_beef),
                 expected_output: vec![4, 5],
+                predecessor_window: vec![1, 2, 3],
             },
         ];
         let deflate = b"";
-        let report = run_testbed(&cases, deflate, |_, _, _, _, _| Ok((8, vec![1, 2, 3])));
+        let report = run_testbed(&cases, deflate, |_, _, _, _, _, _| Ok((8, vec![1, 2, 3])));
         assert_eq!(report.total_cases, 2);
         assert_eq!(report.passed, 1, "first case passes (expects 1,2,3)");
         assert_eq!(report.failed, 1, "second case fails (expects 4,5)");
@@ -419,6 +436,7 @@ mod tests {
             btype: 2,
             fingerprint: None,
             expected_output: vec![1, 2, 3],
+            predecessor_window: Vec::new(),
         }];
         // Use a caps set we know fails on every host (NEON on x86_64
         // or BMI2 on aarch64 — pick whichever is foreign).
@@ -438,7 +456,7 @@ mod tests {
             ..Default::default()
         };
         let mut called = false;
-        let report = run_testbed_with_caps(&cases, b"", caps, |_, _, _, _, _| {
+        let report = run_testbed_with_caps(&cases, b"", caps, |_, _, _, _, _, _| {
             called = true;
             Ok((0, vec![]))
         });

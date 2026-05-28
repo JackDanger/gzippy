@@ -30,6 +30,9 @@ use std::fs;
 use std::process::ExitCode;
 
 use gzippy::decompress::block_walker::{walk_block_boundaries, BlockMeta};
+use gzippy_inflate::route_c_dynamic::{
+    build_canonical_lut, decode_dynamic_block_rust_with_window, parse_dynamic_header, BitReader,
+};
 use gzippy_inflate::route_c_testbed::{extract_cases, run_testbed, BlockSummary};
 
 fn main() -> ExitCode {
@@ -84,16 +87,89 @@ fn main() -> ExitCode {
         cases.len()
     );
 
-    // Run testbed with a TRIVIAL decoder that just returns the expected
-    // output. Confirms the testbed plumbing end-to-end on real corpus
-    // data. Route C v3 swaps this for a real decoder.
-    let report = run_testbed(&cases, deflate_body, |_, _, _, _, _expected_len| {
-        // For now: cheat — return the expected output. Establishes the
-        // upper-bound pass rate (100%). Real decoder substitutes here.
-        Ok((0, Vec::new()))
-    });
+    // Route C v3 baseline: Rust reference decoder from the sub-crate.
+    // Each subsequent Route C v3+ commit will replace pieces of this
+    // with dynasm-emitted asm and the testbed will report regressions
+    // per case_index.
+    let report = run_testbed(
+        &cases,
+        deflate_body,
+        |deflate, start_bit, btype, _fp, expected_len, window| {
+            let after_header = start_bit + 3;
+            let mut out_buf = vec![0u8; expected_len];
+            match btype {
+                0 => {
+                    let aligned = after_header.div_ceil(8) * 8;
+                    let mut br = BitReader {
+                        buf: deflate,
+                        bit_pos: aligned,
+                    };
+                    let len = br.read(16) as usize;
+                    let _nlen = br.read(16);
+                    let byte = (br.bit_pos / 8) as usize;
+                    if byte + len > deflate.len() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "stored block overruns deflate body",
+                        ));
+                    }
+                    out_buf[..len].copy_from_slice(&deflate[byte..byte + len]);
+                    Ok((br.bit_pos + (len as u64) * 8, out_buf[..len].to_vec()))
+                }
+                1 => {
+                    let mut ll = [0u8; 288];
+                    for e in ll.iter_mut().take(144) {
+                        *e = 8;
+                    }
+                    for e in ll.iter_mut().take(256).skip(144) {
+                        *e = 9;
+                    }
+                    for e in ll.iter_mut().take(280).skip(256) {
+                        *e = 7;
+                    }
+                    for e in ll.iter_mut().take(288).skip(280) {
+                        *e = 8;
+                    }
+                    let dl = [5u8; 32];
+                    let lut_ll = build_canonical_lut(&ll, 15);
+                    let lut_d = build_canonical_lut(&dl, 15);
+                    let (end_bit, bytes) = decode_dynamic_block_rust_with_window(
+                        deflate,
+                        after_header,
+                        &lut_ll,
+                        &lut_d,
+                        &mut out_buf,
+                        0,
+                        window,
+                    )?;
+                    out_buf.truncate(bytes);
+                    Ok((end_bit, out_buf))
+                }
+                2 => {
+                    let (after_hdr, ll, dl) = parse_dynamic_header(deflate, after_header)?;
+                    let lut_ll = build_canonical_lut(&ll, 15);
+                    let lut_d = build_canonical_lut(&dl, 15);
+                    let (end_bit, bytes) = decode_dynamic_block_rust_with_window(
+                        deflate,
+                        after_hdr,
+                        &lut_ll,
+                        &lut_d,
+                        &mut out_buf,
+                        0,
+                        window,
+                    )?;
+                    out_buf.truncate(bytes);
+                    Ok((end_bit, out_buf))
+                }
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("reserved BTYPE={btype}"),
+                )),
+            }
+        },
+    );
 
-    println!("Testbed report (placeholder decoder — Route C v3 fills this in):");
+    println!("Testbed report (Rust reference decoder — Route C v3 baseline):");
     println!("  total_cases:    {}", report.total_cases);
     println!("  passed:         {}", report.passed);
     println!("  failed:         {}", report.failed);
@@ -102,6 +178,22 @@ fn main() -> ExitCode {
     println!("  decode_ns:      {}", report.total_decode_ns);
     if report.total_decode_ns > 0 {
         println!("  throughput:     {:.0} MB/s", report.throughput_mbps());
+    }
+
+    // First-5 failures triage.
+    if !report.failures.is_empty() {
+        eprintln!("\nFirst 5 failures:");
+        for f in report.failures.iter().take(5) {
+            eprintln!(
+                "  case {} btype {} fp {:?} bytes_match {} end_bit_match {} first_diff {:?}",
+                f.case_index,
+                f.btype,
+                f.fingerprint,
+                f.bytes_match,
+                f.end_bit_match,
+                f.first_diff_byte
+            );
+        }
     }
 
     // Histogram of fingerprint frequency (top 10) — preview of where
