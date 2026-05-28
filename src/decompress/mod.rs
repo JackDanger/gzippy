@@ -6,6 +6,7 @@
 //! `lib.rs`; all other functions are `pub(crate)`.
 
 pub mod bgzf;
+pub mod block_walker;
 pub mod combined_lut;
 pub mod deflate64;
 pub mod format;
