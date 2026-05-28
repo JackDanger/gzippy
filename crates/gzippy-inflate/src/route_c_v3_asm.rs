@@ -150,6 +150,8 @@ pub fn emit_literal_loop() -> (ExecutableBuffer, dynasmrt::AssemblyOffset) {
     //   r13 = out_pos  (callee-saved; pushed)
 
     let loop_top = ops.new_dynamic_label();
+    let refill_top = ops.new_dynamic_label();
+    let refill_done = ops.new_dynamic_label();
     let non_literal_exit = ops.new_dynamic_label();
     let output_full_exit = ops.new_dynamic_label();
     let underflow_exit = ops.new_dynamic_label();
@@ -180,18 +182,22 @@ pub fn emit_literal_loop() -> (ExecutableBuffer, dynasmrt::AssemblyOffset) {
         ; cmp r13, r14
         ; jae =>output_full_exit
 
-        // Refill if bitsleft < 12 (need at least MAIN_BITS).
-        ; cmp r11, 12
-        ; jge >have_bits
-        // Load 8 bytes from input[byte_pos]; OR into bitbuf at
-        // current bitsleft offset.
-        ; mov rax, QWORD [rdi + r12]    // 8 bytes from input
-        ; mov cl, r11b                   // shift count (max 11 here)
-        ; shl rax, cl                    // shift new bits into position
-        ; or r10, rax                    // merge into bitbuf
-        ; add r12, 8                     // advance byte_pos
-        ; add r11, 64                    // bitsleft += 64
-        ;have_bits:
+        // v3.7 byte-by-byte refill — correct, no bit truncation.
+        // While bitsleft < 56, load 1 byte, OR at position bitsleft,
+        // advance byte_pos + 8 bits. 56 chosen so that 1 lookup
+        // (≤15 bits) + 1 length-code extras (≤5) + 1 dist code
+        // (≤15) + 1 dist extras (≤13) = ≤48 bits comfortably fit.
+        ;=> refill_top
+        ; cmp r11, 56
+        ; jge =>refill_done
+        ; movzx rax, BYTE [rdi + r12]
+        ; mov cl, r11b
+        ; shl rax, cl
+        ; or r10, rax
+        ; add r12, 1
+        ; add r11, 8
+        ; jmp =>refill_top
+        ;=> refill_done
 
         // 12-bit LUT lookup: key = bitbuf & 0xFFF.
         ; mov rax, r10
@@ -333,11 +339,11 @@ mod tests {
             ExitReason::NonLiteral as i32,
             "empty-slot lookup → NonLiteral"
         );
-        // After the refill + lookup, byte_pos should have advanced
-        // by 8 (one refill load).
-        assert_eq!(state.byte_pos, 8, "refill should have consumed 8 bytes");
-        // bitsleft should be 64 (refill loaded 64 bits, no consume yet).
-        assert_eq!(state.bitsleft, 64);
+        // v3.7 byte-by-byte refill: load 1 byte at a time while
+        // bitsleft < 56. From bitsleft=0 we load 7 bytes to reach
+        // bitsleft=56.
+        assert_eq!(state.byte_pos, 7, "refill consumes 7 bytes (0→56 bits)");
+        assert_eq!(state.bitsleft, 56);
     }
 
     /// v3.4: under a literal-only LUT (LUT[0] = literal 'X', length 4),
