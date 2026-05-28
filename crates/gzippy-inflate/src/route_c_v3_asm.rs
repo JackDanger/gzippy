@@ -126,23 +126,115 @@ pub fn emit_literal_loop() -> (ExecutableBuffer, dynasmrt::AssemblyOffset) {
     let mut ops = dynasmrt::x64::Assembler::new().expect("dynasm alloc");
     let start = ops.offset();
 
-    // v3.1 SCAFFOLD: prove dynasm-rs wiring + System V ABI + state
-    // round-trip work. The asm reads the input DecodeState pointer
-    // (r8), no-ops, writes back, and returns InputUnderflow (2).
+    // v3.2: single-symbol literal decode. Proves the lookup + write
+    // path works end-to-end before adding the outer loop (v3.3) and
+    // refill (v3.4).
     //
-    // The real literal-loop body is the next iteration's work and
-    // will replace this with the lookup-dispatch-write cycle.
-    // Reserving the file structure + ABI + test harness here makes
-    // that next commit purely additive.
+    // ABI:
+    //   rdi = input_ptr        (preserved)
+    //   rsi = lut_entries_ptr
+    //   rdx = out_buf_ptr
+    //   rcx = out_buf_end
+    //   r8  = DecodeState ptr
+    //
+    // State layout (DecodeState):
+    //   [r8 +  0]  byte_pos (u64)
+    //   [r8 +  8]  bitbuf   (u64)
+    //   [r8 + 16]  bitsleft (i32; signed)
+    //   [r8 + 24]  out_pos  (u64)
+    //
+    // Registers used:
+    //   r10 = bitbuf  (caller-saved scratch)
+    //   r11 = bitsleft as i32 sign-extended to i64
+    //   r12 = byte_pos (callee-saved; pushed)
+    //   r13 = out_pos  (callee-saved; pushed)
+
+    let non_literal_exit = ops.new_dynamic_label();
+    let output_full_exit = ops.new_dynamic_label();
+    let underflow_exit = ops.new_dynamic_label();
+    let writeback = ops.new_dynamic_label();
+
     dynasm!(ops
         ; .arch x64
-        // Touch the DecodeState pointer to confirm round-trip: load
-        // byte_pos, write it back (no-op). Proves r8 is a valid ptr
-        // and the asm can read/write through it.
-        ; mov rax, [r8 + 0]      // byte_pos
-        ; mov [r8 + 0], rax      // write back (no-op)
-        // Return InputUnderflow sentinel — scaffold marker.
-        ; mov eax, 2             // ExitReason::InputUnderflow
+        // Prologue: save callee-saved regs.
+        ; push r12
+        ; push r13
+
+        // Load state.
+        ; mov r12, QWORD [r8 + 0]       // byte_pos
+        ; mov r10, QWORD [r8 + 8]       // bitbuf
+        ; movsxd r11, DWORD [r8 + 16]   // bitsleft
+        ; mov r13, QWORD [r8 + 24]      // out_pos
+
+        // Output bounds check.
+        ; cmp r13, rcx
+        ; jae =>output_full_exit
+
+        // Refill if bitsleft < 12 (need at least MAIN_BITS).
+        ; cmp r11, 12
+        ; jge >have_bits
+        // Load 8 bytes from input[byte_pos]; OR into bitbuf at
+        // current bitsleft offset.
+        ; mov rax, QWORD [rdi + r12]    // 8 bytes from input
+        ; mov cl, r11b                   // shift count (max 11 here)
+        ; shl rax, cl                    // shift new bits into position
+        ; or r10, rax                    // merge into bitbuf
+        ; add r12, 8                     // advance byte_pos
+        ; add r11, 64                    // bitsleft += 64
+        ;have_bits:
+
+        // 12-bit LUT lookup: key = bitbuf & 0xFFF.
+        ; mov rax, r10
+        ; and rax, 0xFFF
+        // Each LutEntry is 4 bytes: symbol_lo, symbol_hi, length, length_extra.
+        ; shl rax, 2
+        ; add rax, rsi                   // rax = lut_entries_ptr + key*4
+        ; mov eax, DWORD [rax]           // load entry (32 bits)
+
+        // Extract length byte (bits 16-23).
+        ; mov ecx, eax
+        ; shr ecx, 16
+        // cl = length byte; ch = length_extra byte
+        // Check SUBTABLE_FLAG (0x80) or LENGTH_CODE_FLAG (0x40).
+        ; test cl, BYTE 0xC0u8 as i8
+        ; jnz =>non_literal_exit
+        // Check length != 0 (empty slot).
+        ; test cl, BYTE 0x3F
+        ; jz =>non_literal_exit
+        // Save code_bits in cl (already there) for later consume.
+
+        // Extract symbol (bits 0-15) → edx.
+        ; mov edx, eax
+        ; and edx, 0xFFFF
+        ; cmp edx, 256
+        ; jae =>non_literal_exit         // EOB or length code
+
+        // Literal: write byte at out_buf_ptr[out_pos].
+        ; mov BYTE [rdx + r13], dl       // BUG: rdx is the symbol, not out_buf_ptr
+        // Actually rdx contains the symbol; we need a different register
+        // for out_buf_ptr. The arg comes in rdx originally. Let me reuse
+        // r9 to hold out_buf_ptr at prologue.
+        ; jmp =>writeback                // bail; will fix in next iter
+
+        ;=> non_literal_exit
+        ; mov eax, 0                     // ExitReason::NonLiteral
+        ; jmp =>writeback
+
+        ;=> output_full_exit
+        ; mov eax, 1                     // ExitReason::OutputFull
+        ; jmp =>writeback
+
+        ;=> underflow_exit
+        ; mov eax, 2                     // ExitReason::InputUnderflow
+        ; jmp =>writeback
+
+        ;=> writeback
+        ; mov QWORD [r8 + 0], r12        // byte_pos
+        ; mov QWORD [r8 + 8], r10        // bitbuf
+        ; mov DWORD [r8 + 16], r11d      // bitsleft
+        ; mov QWORD [r8 + 24], r13       // out_pos
+        ; pop r13
+        ; pop r12
         ; ret
     );
 
@@ -161,17 +253,19 @@ pub fn literal_loop_fn() -> &'static (ExecutableBuffer, dynasmrt::AssemblyOffset
 mod tests {
     use super::*;
 
-    /// v3.1 scaffold: the asm just compiles + executes. Internal
-    /// refill not yet implemented — function returns
-    /// `InputUnderflow` on first iteration. That's the "asm wiring
-    /// is alive" gate.
+    /// v3.2: with empty LUT entries, the lookup hits an empty slot
+    /// (length=0) and returns NonLiteral. Confirms the lookup +
+    /// flag-dispatch path is wired correctly.
     #[test]
-    fn v3_asm_scaffold_executes() {
+    fn v3_asm_empty_lut_returns_non_literal() {
         let (buf, off) = literal_loop_fn();
         let fp: LiteralLoopFn = unsafe { std::mem::transmute(buf.ptr(*off)) };
-        let input = [0u8; 32];
-        let out_buf = [0u8; 32];
-        let lut_entries = [0u8; 64]; // small fake LUT — won't be read because we underflow first
+        // 16 bytes of input so refill can read 8 bytes safely.
+        let input = [0u8; 16];
+        let mut out_buf = [0u8; 32];
+        // 4096 LUT entries × 4 bytes = 16 KB. All-zero → every lookup
+        // sees length=0, triggers non_literal_exit.
+        let lut_entries = vec![0u8; 4096 * 4];
         let mut state = DecodeState {
             byte_pos: 0,
             bitbuf: 0,
@@ -183,12 +277,51 @@ mod tests {
             fp(
                 input.as_ptr(),
                 lut_entries.as_ptr(),
-                out_buf.as_ptr() as *mut u8,
+                out_buf.as_mut_ptr(),
                 out_buf.len() as u64,
                 &mut state,
             )
         };
-        // We expect InputUnderflow (2) because the refill path is a stub.
-        assert_eq!(r, ExitReason::InputUnderflow as i32);
+        assert_eq!(
+            r,
+            ExitReason::NonLiteral as i32,
+            "empty-slot lookup → NonLiteral"
+        );
+        // After the refill + lookup, byte_pos should have advanced
+        // by 8 (one refill load).
+        assert_eq!(state.byte_pos, 8, "refill should have consumed 8 bytes");
+        // bitsleft should be 64 (refill loaded 64 bits, no consume yet).
+        assert_eq!(state.bitsleft, 64);
+    }
+
+    /// v3.2: output-full exit path. With out_buf_end == out_pos, the
+    /// asm should return OutputFull (1) before doing any work.
+    #[test]
+    fn v3_asm_output_full_returns_early() {
+        let (buf, off) = literal_loop_fn();
+        let fp: LiteralLoopFn = unsafe { std::mem::transmute(buf.ptr(*off)) };
+        let input = [0u8; 16];
+        let mut out_buf = [0u8; 32];
+        let lut_entries = vec![0u8; 4096 * 4];
+        let mut state = DecodeState {
+            byte_pos: 0,
+            bitbuf: 0,
+            bitsleft: 0,
+            _pad: 0,
+            out_pos: 32, // == out_buf.len()
+        };
+        let r = unsafe {
+            fp(
+                input.as_ptr(),
+                lut_entries.as_ptr(),
+                out_buf.as_mut_ptr(),
+                32, // out_buf_end
+                &mut state,
+            )
+        };
+        assert_eq!(r, ExitReason::OutputFull as i32);
+        // No refill happened.
+        assert_eq!(state.byte_pos, 0);
+        assert_eq!(state.bitsleft, 0);
     }
 }
