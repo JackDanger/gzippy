@@ -30,9 +30,11 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+pub mod aot;
 pub mod chd;
 pub mod constant_time;
 pub mod gpu;
+pub use aot::{fingerprint_hash, match_aot_fingerprint};
 pub use chd::ChdTable;
 pub use constant_time::ConstantTimeInflate;
 pub use gpu::{BlockRange, GpuBackend, GpuError, GpuInflate};

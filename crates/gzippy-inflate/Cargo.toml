@@ -8,6 +8,7 @@ repository = "https://github.com/jackdanger/gzippy"
 keywords = ["gzip", "deflate", "decompression", "inflate"]
 categories = ["compression"]
 readme = "README.md"
+build = "build.rs"
 
 # Per plans/unified-decoder.md §3.11: this sub-crate is intended to be
 # `no_std` + `alloc` compatible at the core, with optional std-only
