@@ -2233,6 +2233,13 @@ pub fn copy_match_windowed(
     // back to per-byte only for LZ77-overlap (dist < copy_n) in the
     // output-to-output phase.
     //
+    // Perf falsification: throughput at parity with the pre-split
+    // per-byte loop in 10-trial interleaved A/B on neurotic (655.7 vs
+    // 657.8 MB/s). The slow path fires too rarely to move overall
+    // throughput — most matches hit `copy_match_fast` above. The new
+    // shape is kept for structural clarity, not perf.
+    // See docs/perf/2026-05-28-s2-bulk-window-copy-falsified.md
+    //
     // Logical layout (src_logical = total_history - dist + i):
     //   Phase 1: i ∈ [0, n_window) where src_logical < window_len
     //            → bulk read from window (no overlap)
