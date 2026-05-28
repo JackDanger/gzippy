@@ -156,9 +156,14 @@ pub fn emit_literal_loop() -> (ExecutableBuffer, dynasmrt::AssemblyOffset) {
 
     dynasm!(ops
         ; .arch x64
-        // Prologue: save callee-saved regs.
+        // Prologue: save callee-saved regs we use.
         ; push r12
         ; push r13
+        ; push rbx
+
+        // Move out_buf_ptr from rdx (arg slot) to rbx (callee-saved)
+        // so rdx is free as scratch in the inner loop.
+        ; mov rbx, rdx
 
         // Load state.
         ; mov r12, QWORD [r8 + 0]       // byte_pos
@@ -191,7 +196,7 @@ pub fn emit_literal_loop() -> (ExecutableBuffer, dynasmrt::AssemblyOffset) {
         ; add rax, rsi                   // rax = lut_entries_ptr + key*4
         ; mov eax, DWORD [rax]           // load entry (32 bits)
 
-        // Extract length byte (bits 16-23).
+        // Extract length byte (bits 16-23) into cl.
         ; mov ecx, eax
         ; shr ecx, 16
         // cl = length byte; ch = length_extra byte
@@ -201,20 +206,29 @@ pub fn emit_literal_loop() -> (ExecutableBuffer, dynasmrt::AssemblyOffset) {
         // Check length != 0 (empty slot).
         ; test cl, BYTE 0x3F
         ; jz =>non_literal_exit
-        // Save code_bits in cl (already there) for later consume.
 
         // Extract symbol (bits 0-15) → edx.
         ; mov edx, eax
         ; and edx, 0xFFFF
         ; cmp edx, 256
-        ; jae =>non_literal_exit         // EOB or length code
+        ; jae =>non_literal_exit         // EOB or reserved
 
         // Literal: write byte at out_buf_ptr[out_pos].
-        ; mov BYTE [rdx + r13], dl       // BUG: rdx is the symbol, not out_buf_ptr
-        // Actually rdx contains the symbol; we need a different register
-        // for out_buf_ptr. The arg comes in rdx originally. Let me reuse
-        // r9 to hold out_buf_ptr at prologue.
-        ; jmp =>writeback                // bail; will fix in next iter
+        // rbx = out_buf_ptr, r13 = out_pos, dl = symbol low byte
+        ; mov BYTE [rbx + r13], dl
+        ; inc r13
+
+        // Consume code_bits (cl) from bitbuf.
+        // Save cl for the shift (rcx is preserved across the byte write).
+        ; mov rax, r10
+        ; shr rax, cl                    // bitbuf >>= code_bits
+        ; mov r10, rax
+        ; movzx ecx, cl                  // zero-extend cl to ecx
+        ; sub r11, rcx                   // bitsleft -= code_bits
+
+        // v3.3 still single-symbol: jump to writeback after one literal.
+        ; mov eax, 0                     // ExitReason::NonLiteral (re-entry needed for next sym)
+        ; jmp =>writeback
 
         ;=> non_literal_exit
         ; mov eax, 0                     // ExitReason::NonLiteral
@@ -233,6 +247,7 @@ pub fn emit_literal_loop() -> (ExecutableBuffer, dynasmrt::AssemblyOffset) {
         ; mov QWORD [r8 + 8], r10        // bitbuf
         ; mov DWORD [r8 + 16], r11d      // bitsleft
         ; mov QWORD [r8 + 24], r13       // out_pos
+        ; pop rbx
         ; pop r13
         ; pop r12
         ; ret
@@ -292,6 +307,51 @@ mod tests {
         assert_eq!(state.byte_pos, 8, "refill should have consumed 8 bytes");
         // bitsleft should be 64 (refill loaded 64 bits, no consume yet).
         assert_eq!(state.bitsleft, 64);
+    }
+
+    /// v3.3: when the LUT entry is a 4-bit literal code mapping to
+    /// byte 'X' (0x58), the asm writes 'X' to out_buf and advances.
+    /// We construct a hand-rolled LUT entry: at key 0 → (symbol=0x58,
+    /// length=4, length_extra=0). All other keys are empty.
+    #[test]
+    fn v3_asm_writes_literal_byte() {
+        let (buf, off) = literal_loop_fn();
+        let fp: LiteralLoopFn = unsafe { std::mem::transmute(buf.ptr(*off)) };
+
+        // 16 bytes of zero input so the refill loads all-zero bits.
+        // After refill, bitbuf = 0, so the key lookup hits LUT[0].
+        let input = [0u8; 16];
+        let mut out_buf = [0u8; 32];
+        // LUT: 4096 entries × 4 bytes. Entry 0 = (sym=0x58 'X', len=4, len_extra=0).
+        let mut lut_entries = vec![0u8; 4096 * 4];
+        lut_entries[0] = 0x58; // symbol low byte 'X'
+        lut_entries[1] = 0x00; // symbol high byte
+        lut_entries[2] = 0x04; // length = 4 bits (no flags)
+        lut_entries[3] = 0x00; // length_extra
+
+        let mut state = DecodeState {
+            byte_pos: 0,
+            bitbuf: 0,
+            bitsleft: 0,
+            _pad: 0,
+            out_pos: 0,
+        };
+        let r = unsafe {
+            fp(
+                input.as_ptr(),
+                lut_entries.as_ptr(),
+                out_buf.as_mut_ptr(),
+                out_buf.len() as u64,
+                &mut state,
+            )
+        };
+        assert_eq!(r, ExitReason::NonLiteral as i32, "single-symbol exit");
+        assert_eq!(out_buf[0], b'X', "wrote 'X' literal");
+        assert_eq!(state.out_pos, 1, "out_pos advanced by 1");
+        // bitsleft was 64 after refill; we consumed 4 bits → 60.
+        assert_eq!(state.bitsleft, 60);
+        // byte_pos advanced by 8 in the refill.
+        assert_eq!(state.byte_pos, 8);
     }
 
     /// v3.2: output-full exit path. With out_buf_end == out_pos, the
