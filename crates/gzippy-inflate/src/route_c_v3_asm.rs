@@ -99,6 +99,7 @@ pub enum ExitReason {
 /// - `out_buf_ptr` (rdx)
 /// - `out_buf_end` (rcx) — `out_pos < out_buf_end` invariant
 /// - `state_ptr` (r8) — pointer to DecodeState (read + write back)
+/// - `input_len` (r9) — input byte length; refill guards against OOB
 ///
 /// Returns `ExitReason` as i32 in eax.
 type LiteralLoopFn = unsafe extern "sysv64" fn(
@@ -107,6 +108,7 @@ type LiteralLoopFn = unsafe extern "sysv64" fn(
     out_buf_ptr: *mut u8,
     out_buf_end: u64,
     state_ptr: *mut DecodeState,
+    input_len: u64,
 ) -> i32;
 
 const MAIN_MASK: u64 = (1u64 << 12) - 1; // 0x0FFF for 12-bit main table
@@ -150,7 +152,8 @@ pub fn emit_literal_loop() -> (ExecutableBuffer, dynasmrt::AssemblyOffset) {
     //   r13 = out_pos  (callee-saved; pushed)
 
     let loop_top = ops.new_dynamic_label();
-    let refill_top = ops.new_dynamic_label();
+    let refill_chunked = ops.new_dynamic_label();
+    let refill_byte = ops.new_dynamic_label();
     let refill_done = ops.new_dynamic_label();
     let non_literal_exit = ops.new_dynamic_label();
     let output_full_exit = ops.new_dynamic_label();
@@ -182,21 +185,51 @@ pub fn emit_literal_loop() -> (ExecutableBuffer, dynasmrt::AssemblyOffset) {
         ; cmp r13, r14
         ; jae =>output_full_exit
 
-        // v3.7 byte-by-byte refill — correct, no bit truncation.
-        // While bitsleft < 56, load 1 byte, OR at position bitsleft,
-        // advance byte_pos + 8 bits. 56 chosen so that 1 lookup
-        // (≤15 bits) + 1 length-code extras (≤5) + 1 dist code
-        // (≤15) + 1 dist extras (≤13) = ≤48 bits comfortably fit.
-        ;=> refill_top
+        // v3.9 chunked refill — libdeflate-style 8-byte load with the
+        // `bitsleft |= 56` trick. Hot path is the chunked branch.
+        //
+        //   bitbuf |= load_u64(in_next) << bitsleft;
+        //   in_next += (63 - bitsleft) >> 3;
+        //   bitsleft |= 56;                   // bitsleft now ∈ [56, 63]
+        //
+        // The spilled high bits of the load are NOT lost — we advanced
+        // in_next by exactly the bytes consumed, so the spilled bytes
+        // appear on the next refill load.
+        //
+        // Bounds: requires (byte_pos + 8) <= input_len. Falls back to
+        // byte-by-byte for the tail.
         ; cmp r11, 56
         ; jge =>refill_done
+        ; lea rax, [r12 + 8]
+        ; cmp rax, r9                    // r9 = input_len
+        ; ja =>refill_byte               // not enough input for 8-byte load
+
+        ;=> refill_chunked
+        ; mov rax, QWORD [rdi + r12]
+        ; mov cl, r11b
+        ; shl rax, cl                    // rax <<= bitsleft (top bits drop)
+        ; or r10, rax                    // bitbuf |= shifted load
+        ; mov rax, 63
+        ; sub rax, r11                   // rax = 63 - bitsleft
+        ; shr rax, 3                     // rax = (63 - bitsleft) >> 3
+        ; add r12, rax                   // byte_pos += bytes_consumed
+        ; or r11, 56                     // bitsleft |= 56  ∈ [56, 63]
+        ; jmp =>refill_done
+
+        ;=> refill_byte
+        // Byte-by-byte for the input tail: while bitsleft < 56 AND
+        // bytes remain, load 1 byte at bitsleft, advance.
+        ; cmp r11, 56
+        ; jge =>refill_done
+        ; cmp r12, r9
+        ; jae =>refill_done              // ran out — proceed with what we have
         ; movzx rax, BYTE [rdi + r12]
         ; mov cl, r11b
         ; shl rax, cl
         ; or r10, rax
         ; add r12, 1
         ; add r11, 8
-        ; jmp =>refill_top
+        ; jmp =>refill_byte
         ;=> refill_done
 
         // 12-bit LUT lookup: key = bitbuf & 0xFFF.
@@ -292,6 +325,7 @@ pub fn run_literal_loop(
             out_buf.as_mut_ptr(),
             out_buf.len() as u64,
             state,
+            input.len() as u64,
         )
     };
     match r {
@@ -325,6 +359,7 @@ mod tests {
             _pad: 0,
             out_pos: 0,
         };
+        let input_len = input.len() as u64;
         let r = unsafe {
             fp(
                 input.as_ptr(),
@@ -332,6 +367,7 @@ mod tests {
                 out_buf.as_mut_ptr(),
                 out_buf.len() as u64,
                 &mut state,
+                input_len,
             )
         };
         assert_eq!(
@@ -339,10 +375,9 @@ mod tests {
             ExitReason::NonLiteral as i32,
             "empty-slot lookup → NonLiteral"
         );
-        // v3.7 byte-by-byte refill: load 1 byte at a time while
-        // bitsleft < 56. From bitsleft=0 we load 7 bytes to reach
-        // bitsleft=56.
-        assert_eq!(state.byte_pos, 7, "refill consumes 7 bytes (0→56 bits)");
+        // v3.9 chunked refill: load 8 bytes, advance by (63-0)>>3 = 7,
+        // set bitsleft |= 56 → bitsleft=56 (since 0 was the seed).
+        assert_eq!(state.byte_pos, 7, "chunked refill consumes 7 bytes");
         assert_eq!(state.bitsleft, 56);
     }
 
@@ -369,6 +404,7 @@ mod tests {
             _pad: 0,
             out_pos: 0,
         };
+        let input_len = input.len() as u64;
         let r = unsafe {
             fp(
                 input.as_ptr(),
@@ -376,6 +412,7 @@ mod tests {
                 out_buf.as_mut_ptr(),
                 out_buf.len() as u64,
                 &mut state,
+                input_len,
             )
         };
         assert_eq!(r, ExitReason::OutputFull as i32, "loop fills then exits");
@@ -414,6 +451,7 @@ mod tests {
             _pad: 0,
             out_pos: 0,
         };
+        let input_len = input.len() as u64;
         let r = unsafe {
             fp(
                 input.as_ptr(),
@@ -421,6 +459,7 @@ mod tests {
                 out_buf.as_mut_ptr(),
                 out_buf.len() as u64,
                 &mut state,
+                input_len,
             )
         };
         // Loop fills out_buf to capacity, then exits OutputFull.
@@ -446,6 +485,7 @@ mod tests {
             _pad: 0,
             out_pos: 32, // == out_buf.len()
         };
+        let input_len = input.len() as u64;
         let r = unsafe {
             fp(
                 input.as_ptr(),
@@ -453,6 +493,7 @@ mod tests {
                 out_buf.as_mut_ptr(),
                 32, // out_buf_end
                 &mut state,
+                input_len,
             )
         };
         assert_eq!(r, ExitReason::OutputFull as i32);
