@@ -275,6 +275,159 @@ fn reverse_bits(mut code: u32, n: u8) -> u32 {
     rev
 }
 
+/// Layered-LUT version of `decode_dynamic_block_rust_with_window`.
+/// Same correctness contract; uses the 12-bit main + subtable LUT
+/// shape that Route C v3 asm will execute against.
+pub fn decode_dynamic_block_layered_with_window(
+    input: &[u8],
+    bit_pos: u64,
+    litlen_lut: &LayeredLut,
+    dist_lut: &LayeredLut,
+    out_buf: &mut [u8],
+    out_start: usize,
+    predecessor_window: &[u8],
+) -> std::io::Result<(u64, usize)> {
+    let initial_byte = (bit_pos / 8) as usize;
+    let initial_off = (bit_pos % 8) as u32;
+    let mut byte_pos = initial_byte;
+    let bitbuf: u64;
+    let bitsleft: i32;
+    {
+        let mut loaded: u64 = 0;
+        let avail = input.len().saturating_sub(byte_pos).min(8);
+        for i in 0..avail {
+            loaded |= (input[byte_pos + i] as u64) << (i * 8);
+        }
+        bitbuf = loaded >> initial_off;
+        bitsleft = (avail as i32) * 8 - initial_off as i32;
+        byte_pos += avail;
+    }
+    let mut bitbuf = bitbuf;
+    let mut bitsleft = bitsleft;
+    let mut out_pos = out_start;
+
+    loop {
+        if bitsleft < 56 {
+            let want_bytes = ((64 - bitsleft.max(0)) / 8) as usize;
+            let avail = input.len().saturating_sub(byte_pos).min(want_bytes);
+            let mut chunk: u64 = 0;
+            for i in 0..avail {
+                chunk |= (input[byte_pos + i] as u64) << (i * 8);
+            }
+            bitbuf |= chunk << (bitsleft.max(0) as u32);
+            bitsleft += (avail as i32) * 8;
+            byte_pos += avail;
+        }
+
+        // Layered lookup. Pass the full low 24 bits so the lookup can
+        // consume main_bits + up to 12 subtable bits if needed (max
+        // total = 15 bits anyway).
+        let entry = litlen_lut.lookup((bitbuf & 0xFFFFFF) as u32);
+        if entry.length == 0 || entry.length & SUBTABLE_FLAG != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "litlen lookup returned subtable redirect or empty entry",
+            ));
+        }
+        bitbuf >>= entry.length;
+        bitsleft -= entry.length as i32;
+        let sym = entry.symbol;
+        if sym < 256 {
+            if out_pos >= out_buf.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "output overflow",
+                ));
+            }
+            out_buf[out_pos] = sym as u8;
+            out_pos += 1;
+        } else if sym == 256 {
+            let end_bit = (byte_pos as u64) * 8 - bitsleft.max(0) as u64;
+            return Ok((end_bit, out_pos - out_start));
+        } else if sym <= 285 {
+            let li = (sym - 257) as usize;
+            let extra_bits = LENGTH_EXTRA[li];
+            let length = LENGTH_BASE[li] as usize + (bitbuf & ((1u64 << extra_bits) - 1)) as usize;
+            bitbuf >>= extra_bits;
+            bitsleft -= extra_bits as i32;
+            let dentry = dist_lut.lookup((bitbuf & 0xFFFFFF) as u32);
+            if dentry.length == 0 || dentry.length & SUBTABLE_FLAG != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "dist lookup returned subtable redirect or empty entry",
+                ));
+            }
+            bitbuf >>= dentry.length;
+            bitsleft -= dentry.length as i32;
+            let dsym = dentry.symbol as usize;
+            if dsym >= 30 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid dist symbol {dsym}"),
+                ));
+            }
+            let dextra = DIST_EXTRA[dsym];
+            let distance = DIST_BASE[dsym] as usize + (bitbuf & ((1u64 << dextra) - 1)) as usize;
+            bitbuf >>= dextra;
+            bitsleft -= dextra as i32;
+            let block_decoded = out_pos - out_start;
+            let total_history = block_decoded + predecessor_window.len();
+            if distance == 0 || distance > total_history {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid distance {distance} (block_decoded {block_decoded}, window {})",
+                        predecessor_window.len()
+                    ),
+                ));
+            }
+            if out_pos + length > out_buf.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "match overflow",
+                ));
+            }
+            // Match copy — same three cases as flat-LUT version.
+            let win_len = predecessor_window.len();
+            let src_logical_start = total_history - distance;
+            if src_logical_start >= win_len && distance >= 8 {
+                let src_offset_in_out = src_logical_start - win_len;
+                if distance >= length {
+                    let src_start = out_start + src_offset_in_out;
+                    out_buf.copy_within(src_start..src_start + length, out_pos);
+                } else {
+                    let mut remaining = length;
+                    let mut dst = out_pos;
+                    let mut src = out_start + src_offset_in_out;
+                    while remaining > 0 {
+                        let chunk = remaining.min(distance);
+                        out_buf.copy_within(src..src + chunk, dst);
+                        dst += chunk;
+                        src += chunk;
+                        remaining -= chunk;
+                    }
+                }
+            } else {
+                for i in 0..length {
+                    let logical_src = src_logical_start + i;
+                    let byte = if logical_src < win_len {
+                        predecessor_window[logical_src]
+                    } else {
+                        out_buf[out_start + (logical_src - win_len)]
+                    };
+                    out_buf[out_pos + i] = byte;
+                }
+            }
+            out_pos += length;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("reserved litlen symbol {sym}"),
+            ));
+        }
+    }
+}
+
 /// LSB-first bit reader over a byte slice (matches DEFLATE conventions).
 pub struct BitReader<'a> {
     pub buf: &'a [u8],
