@@ -1,6 +1,7 @@
 //! Corpus differential harness for the `pure-rust-inflate` backend.
 //!
-//! Plan: `plans/pure-rust-isa-l.md` Step 0.2.
+//! Plan: see `plans/rust-rapidgzip.md` (this corpus is the §7
+//! correctness gate). The original Step 0.2 plan is in git history.
 //!
 //! This is the gate that catches "the wrapper API tests pass against
 //! flate2 fixtures but a real-world corpus breaks." The three §2
