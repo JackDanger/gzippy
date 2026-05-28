@@ -182,24 +182,28 @@ fn use_pure_bulk_path() -> bool {
     *USE_BULK.get_or_init(|| std::env::var_os("GZIPPY_ISAL_PURE_BULK").is_some())
 }
 
-/// Option A3 dispatch (`plans/unified-decoder.md` §6 / A1 scaffolding
-/// commit `9e14bbe`). When `GZIPPY_OPTION_A_PREFILL=1` is set, the
-/// windowed-decode path pre-fills `chunk.data[0..32K]` with the
-/// predecessor's window image and runs the decoder via
-/// `read_stream_starting_at` so every back-reference resolves through
-/// `copy_match_fast` (AVX2 SIMD) instead of the `state.window`
-/// byte-by-byte slow path. Targets the 3.5pp `copy_match_windowed`
-/// delta vs ISA-L's `large_byte_copy` documented in the perf
-/// attribution log.
+/// Option A3+A4 dispatch (`plans/unified-decoder.md` §6, commits
+/// `9e14bbe`/`757e7a4`/`a6076e1`). Pre-fills `chunk.data[0..32K]` with
+/// the predecessor's window image so every back-reference hits the
+/// AVX2 fast path; the consumer skips `chunk.data[..data_prefix_len]`
+/// when writing.
 ///
-/// Default OFF for controlled rollout; correctness verified by the
-/// three-oracle differential + silesia byte-perfect + neurotic
-/// production paths.
+/// Measured +4.2% T=16 silesia on neurotic, byte-perfect across 11
+/// corpora (silesia/logs/software in gzip/pigz/bgzf flavors +
+/// urandom-100M) at T∈{1,4,16} — 33/33 pass.
+///
+/// **Default ON** as of the cross-corpus validation gate. To disable
+/// for A/B comparison: `GZIPPY_OPTION_A_PREFILL=0`.
 #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
 fn use_option_a_prefill_path() -> bool {
     use std::sync::OnceLock;
-    static USE_A3: OnceLock<bool> = OnceLock::new();
-    *USE_A3.get_or_init(|| std::env::var_os("GZIPPY_OPTION_A_PREFILL").is_some())
+    static USE_A: OnceLock<bool> = OnceLock::new();
+    *USE_A.get_or_init(|| match std::env::var("GZIPPY_OPTION_A_PREFILL") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false") => {
+            false
+        }
+        _ => true,
+    })
 }
 
 #[cfg(all(
