@@ -178,6 +178,21 @@ pub fn decode_dynamic_block_rust(
 /// window holds the LAST 32 KiB of decoded output from the prior
 /// block(s); back-references with `distance > (out_pos - out_start)`
 /// resolve into the window.
+///
+/// ## Inner-loop optimizations vs the naive shape
+///
+/// 1. **64-bit shift-register bit buffer**: loads 8 bytes at a time
+///    into a u64, shifts out 1-15 bits per symbol. Avoids the 6-byte
+///    per-symbol peek of the original `BitReader::peek`.
+/// 2. **Refill threshold** of 56 bits keeps the buffer "always
+///    full enough" for any single 15-bit lookup + 13 extra bits.
+/// 3. **Lookup-then-dispatch**: read the litlen entry first, then
+///    branch on the symbol class. Compiler keeps `bitbuf` and
+///    `bitsleft` in registers for the duration of the loop.
+///
+/// libdeflate (deflate_decompress.c) calls this "the FASTLOOP";
+/// rapidgzip's `ConsumeBits` pattern matches. ISA-L's asm reaches
+/// the same effective shape via inline hot-loop.
 pub fn decode_dynamic_block_rust_with_window(
     input: &[u8],
     bit_pos: u64,
@@ -187,13 +202,51 @@ pub fn decode_dynamic_block_rust_with_window(
     out_start: usize,
     predecessor_window: &[u8],
 ) -> std::io::Result<(u64, usize)> {
-    let mut br = BitReader {
-        buf: input,
-        bit_pos,
-    };
+    // FASTLOOP shape: keep bitbuf + bitsleft in stack locals (compiler
+    // should promote to registers). Refill from `input` 8 bytes at a
+    // time. Operates on 64-bit u64 shift register.
+    let initial_byte = (bit_pos / 8) as usize;
+    let initial_off = (bit_pos % 8) as u32;
+    let mut byte_pos = initial_byte;
+    let bitbuf: u64;
+    let bitsleft: i32;
+
+    // Pre-fill the buffer with up to 7 bytes shifted by `initial_off`.
+    // We load 8 bytes (zero-padded past EOF), shift right by the
+    // sub-byte offset, and set bitsleft to the resulting valid bit
+    // count.
+    {
+        let mut loaded: u64 = 0;
+        let avail = input.len().saturating_sub(byte_pos).min(8);
+        for i in 0..avail {
+            loaded |= (input[byte_pos + i] as u64) << (i * 8);
+        }
+        bitbuf = loaded >> initial_off;
+        bitsleft = (avail as i32) * 8 - initial_off as i32;
+        byte_pos += avail;
+    }
+    let mut bitbuf = bitbuf;
+    let mut bitsleft = bitsleft;
+
     let mut out_pos = out_start;
     loop {
-        let key = br.peek(15) as usize;
+        // Refill: load as many bytes as fit WITHOUT overflowing
+        // bitbuf's 64 bits. If bitsleft is 48, we can fit 16 more
+        // bits = 2 bytes (loading 7 would overflow and silently
+        // drop the high bits).
+        if bitsleft < 56 {
+            let want_bytes = ((64 - bitsleft.max(0)) / 8) as usize;
+            let avail = input.len().saturating_sub(byte_pos).min(want_bytes);
+            let mut chunk: u64 = 0;
+            for i in 0..avail {
+                chunk |= (input[byte_pos + i] as u64) << (i * 8);
+            }
+            bitbuf |= chunk << (bitsleft.max(0) as u32);
+            bitsleft += (avail as i32) * 8;
+            byte_pos += avail;
+        }
+
+        let key = (bitbuf & 0x7FFF) as usize;
         let entry = litlen_lut[key];
         if entry.length == 0 {
             return Err(std::io::Error::new(
@@ -201,7 +254,8 @@ pub fn decode_dynamic_block_rust_with_window(
                 format!("no litlen code at key 0x{key:04x}"),
             ));
         }
-        br.consume(entry.length);
+        bitbuf >>= entry.length;
+        bitsleft -= entry.length as i32;
         let sym = entry.symbol;
         if sym < 256 {
             if out_pos >= out_buf.len() {
@@ -213,11 +267,17 @@ pub fn decode_dynamic_block_rust_with_window(
             out_buf[out_pos] = sym as u8;
             out_pos += 1;
         } else if sym == 256 {
-            return Ok((br.bit_pos, out_pos - out_start));
+            // Recover the bit_pos for the caller. byte_pos is the
+            // NEXT byte we'd read; subtract the bits still buffered.
+            let end_bit = (byte_pos as u64) * 8 - bitsleft.max(0) as u64;
+            return Ok((end_bit, out_pos - out_start));
         } else if sym <= 285 {
             let li = (sym - 257) as usize;
-            let length = LENGTH_BASE[li] as usize + br.read(LENGTH_EXTRA[li]) as usize;
-            let dkey = br.peek(15) as usize;
+            let extra_bits = LENGTH_EXTRA[li];
+            let length = LENGTH_BASE[li] as usize + (bitbuf & ((1u64 << extra_bits) - 1)) as usize;
+            bitbuf >>= extra_bits;
+            bitsleft -= extra_bits as i32;
+            let dkey = (bitbuf & 0x7FFF) as usize;
             let dentry = dist_lut[dkey];
             if dentry.length == 0 {
                 return Err(std::io::Error::new(
@@ -225,7 +285,8 @@ pub fn decode_dynamic_block_rust_with_window(
                     format!("no dist code at key 0x{dkey:04x}"),
                 ));
             }
-            br.consume(dentry.length);
+            bitbuf >>= dentry.length;
+            bitsleft -= dentry.length as i32;
             let dsym = dentry.symbol as usize;
             if dsym >= 30 {
                 return Err(std::io::Error::new(
@@ -233,7 +294,10 @@ pub fn decode_dynamic_block_rust_with_window(
                     format!("invalid dist symbol {dsym}"),
                 ));
             }
-            let distance = DIST_BASE[dsym] as usize + br.read(DIST_EXTRA[dsym]) as usize;
+            let dextra = DIST_EXTRA[dsym];
+            let distance = DIST_BASE[dsym] as usize + (bitbuf & ((1u64 << dextra) - 1)) as usize;
+            bitbuf >>= dextra;
+            bitsleft -= dextra as i32;
             let block_decoded = out_pos - out_start;
             let total_history = block_decoded + predecessor_window.len();
             if distance == 0 || distance > total_history {
@@ -251,20 +315,61 @@ pub fn decode_dynamic_block_rust_with_window(
                     "match overflow",
                 ));
             }
-            // Byte-by-byte; sources may be in the predecessor window
-            // (logical positions [0, window.len())) OR in the current
-            // block's decoded bytes (logical positions
-            // [window.len(), window.len() + block_decoded)).
+            // Match copy. Three cases by source location + overlap:
+            //
+            // CASE A — fully inside out_buf, distance ≥ 8: byte-block
+            //          copy_within (compiler vectorizes; safe because
+            //          non-overlapping or stride-≥-8).
+            // CASE B — fully inside out_buf, distance < 8: byte-by-byte
+            //          RLE (each output byte depends on the just-written
+            //          one; can't vectorize without overlap-safe SIMD).
+            // CASE C — reaches into predecessor_window: walk logical
+            //          positions, byte-by-byte.
+            //
+            // libdeflate's `copy_match_fast` uses overlap-safe SIMD for
+            // CASE B but for the Rust reference we keep CASE B scalar;
+            // Route C v3+ asm emit lands the SIMD overlap.
             let win_len = predecessor_window.len();
-            for i in 0..length {
-                let logical_src = total_history + i - distance;
-                let byte = if logical_src < win_len {
-                    predecessor_window[logical_src]
+            let block_decoded_now = out_pos - out_start;
+            let src_logical_start = total_history - distance;
+            let src_logical_end = src_logical_start + length;
+            if src_logical_start >= win_len && distance >= 8 && length > 0 {
+                // CASE A: source fully in out_buf, stride ≥ 8 means
+                // copy_within is overlap-safe.
+                let src_offset_in_out = src_logical_start - win_len;
+                if distance >= length {
+                    // No overlap → single copy_within.
+                    let src_start = out_start + src_offset_in_out;
+                    out_buf.copy_within(src_start..src_start + length, out_pos);
                 } else {
-                    out_buf[out_start + (logical_src - win_len)]
-                };
-                out_buf[out_pos + i] = byte;
+                    // RLE-style overlap with stride ≥ 8: copy in
+                    // `distance`-sized chunks so each chunk reads from
+                    // already-finalized bytes.
+                    let mut remaining = length;
+                    let mut dst = out_pos;
+                    let mut src = out_start + src_offset_in_out;
+                    while remaining > 0 {
+                        let chunk = remaining.min(distance);
+                        out_buf.copy_within(src..src + chunk, dst);
+                        dst += chunk;
+                        src += chunk;
+                        remaining -= chunk;
+                    }
+                }
+            } else {
+                // CASE B (distance < 8 RLE) or CASE C (touches window):
+                // walk byte-by-byte.
+                for i in 0..length {
+                    let logical_src = src_logical_start + i;
+                    let byte = if logical_src < win_len {
+                        predecessor_window[logical_src]
+                    } else {
+                        out_buf[out_start + (logical_src - win_len)]
+                    };
+                    out_buf[out_pos + i] = byte;
+                }
             }
+            let _ = (block_decoded_now, src_logical_end);
             out_pos += length;
         } else {
             return Err(std::io::Error::new(
