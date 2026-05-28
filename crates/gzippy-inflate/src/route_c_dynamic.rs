@@ -90,6 +90,14 @@ const SUBTABLE_FLAG: u8 = 0x80;
 const LENGTH_CODE_FLAG: u8 = 0x40;
 const CODE_BITS_MASK: u8 = 0x3F;
 
+// NOTE: a bzhi wrapper was attempted and falsified — even with
+// #[inline(always)] + #[cfg(target_feature="bmi2")] the indirection
+// regressed throughput vs the inline `(src & ((1<<n) - 1))` pattern,
+// because rustc with `-C target-cpu=native` already lowers that
+// inline pattern to BZHI on Raptor Lake (neurotic). Keep the inline
+// shape; revisit if benchmarks ever show the inline lowering is
+// suboptimal.
+
 /// Layered LUT — 12-bit main table + per-long-code subtables.
 ///
 /// Lookup protocol:
@@ -602,6 +610,11 @@ pub fn decode_dynamic_block_layered_with_window(
 
             // Multi-literal lookahead — write up to 3 additional
             // short-code literals from the same bit buffer fill.
+            // FALSIFICATION: extending to 7 regressed throughput to
+            // ~360 MB/s (412 → 360). The longer unroll hurt icache
+            // + branch mispredict by more than the saved refill
+            // amortization. Same pattern as commit `ca52389`'s
+            // multi-literal regression — keep the cap at 4 total.
             for _ in 0..3 {
                 if bitsleft < MAIN_BITS as i32 || out_pos >= out_buf.len() {
                     break;
