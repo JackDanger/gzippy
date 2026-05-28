@@ -100,6 +100,64 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::decompress::parallel::rpmalloc_alloc::types::{self, U16, U8};
 
+/// Lever L1 (2026-05-28): hint the kernel to use 2 MiB transparent huge
+/// pages for fresh chunk-buffer allocations. Reduces page-fault count
+/// ~512× on first touch (12 MiB chunk: 3072 4 KiB faults → 6 2 MiB
+/// faults). Default OFF until A/B on neurotic confirms a win.
+///
+/// MADV_HUGEPAGE is a hint; the kernel grants it opportunistically via
+/// khugepaged. On a one-shot CLI process khugepaged may not get
+/// scheduling time, so the hint may be ignored. MADV_COLLAPSE (kernel
+/// 6.1+) is synchronous but adds latency at the madvise call site.
+///
+/// Per perf attribution 2026-05-28: clear_page_erms is 13.26% of CPU
+/// (kernel page-zeroing on first touch); the per-fault overhead is the
+/// bigger cost than the zeroing itself. Fewer faults → less overhead.
+#[cfg(target_os = "linux")]
+fn use_hugepage_hint() -> bool {
+    use std::sync::OnceLock as Once;
+    static USE: Once<bool> = Once::new();
+    *USE.get_or_init(|| std::env::var_os("GZIPPY_HUGEPAGE").is_some())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn use_hugepage_hint() -> bool {
+    false
+}
+
+/// Apply `MADV_HUGEPAGE` hint to a freshly-allocated chunk buffer.
+/// Only effective on Linux; called on miss path of `take_u8` so the
+/// hint is set once per backing allocation, not per pool reuse.
+#[cfg(target_os = "linux")]
+fn hugepage_hint(ptr: *mut u8, len: usize) {
+    if !use_hugepage_hint() || len < 2 * 1024 * 1024 {
+        return;
+    }
+    // Round pointer up to 4 KiB page boundary and length down to whole
+    // pages. madvise requires page-aligned args; the kernel rejects
+    // unaligned calls with EINVAL (silently dropped since we ignore
+    // errors here).
+    const PAGE_SIZE: usize = 4096;
+    let addr = ptr as usize;
+    let aligned_addr = (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let end = addr + len;
+    let aligned_end = end & !(PAGE_SIZE - 1);
+    if aligned_end > aligned_addr {
+        let aligned_len = aligned_end - aligned_addr;
+        unsafe {
+            libc::madvise(
+                aligned_addr as *mut libc::c_void,
+                aligned_len,
+                libc::MADV_HUGEPAGE,
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline(always)]
+fn hugepage_hint(_ptr: *mut u8, _len: usize) {}
+
 /// Cap on pool size per worker per Vec type. Sized to a handful of
 /// in-flight chunks per worker (not the old shared cap of 64).
 const MAX_POOLED: usize = 8;
@@ -155,7 +213,11 @@ pub fn take_u8(min_capacity: usize) -> U8 {
     }
     TAKE_U8_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     TAKE_U8_MISSES_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    types::u8_with_capacity(min_capacity)
+    let v = types::u8_with_capacity(min_capacity);
+    // Lever L1: hint huge pages on the fresh allocation. Cap is the
+    // useful range — `len()` is 0 at this point.
+    hugepage_hint(v.as_ptr() as *mut u8, v.capacity());
+    v
 }
 
 /// Take a `Vec<u16>` from the current worker's pool.
