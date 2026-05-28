@@ -1,6 +1,43 @@
 # Closing the gap to rapidgzip — current state & action queue
 
-**FRAMING (read this first; everything else follows):**
+> **2026-05-28 RE-MEASUREMENT — the old framing below was WRONG. Read this first.**
+>
+> A clean pinned-P-core re-measurement (`taskset -c 0,2,4,6`, 4 worker
+> threads, perf counters; the shared box could not be quieted below
+> load 4 so wall is contaminated — pinned counters are the signal)
+> **falsifies the "~10% gap / parity reached" headline.** The real gap
+> to rapidgzip on silesia-large is **~1.5× core-cycles**:
+>
+> | pinned, 4 P-cores | purerust | isal | rapidgzip |
+> |---|---|---|---|
+> | core-cycles | 8.12B | 6.59B | **5.28B** |
+> | core-instructions | 14.4B | 10.6B | 11.0B |
+> | IPC | 1.77 | 1.61 | **2.08** |
+> | TopdownL1 backend-bound slots | 15.9B | 11.7B | **6.4B** |
+> | TopdownL1 retiring slots | 14.0B | 10.1B | 9.8B |
+>
+> Two measurement traps were caught and must not be re-walked:
+> 1. The "1.9 vs 3.0 GHz" gap at 16 threads was an **E-core-spillover
+>    artifact** (cpu_core cycles ÷ total task-clock incl. E-cores).
+>    Pinned to P-cores, all three run ~3.6 GHz. **Frequency is not a lever.**
+> 2. "2.3× more page-faults" is **circular** — normalized to faults/sec,
+>    rapidgzip ≈ purerust < isal. The total is a symptom of longer
+>    runtime. **Allocator is not the first lever.**
+>
+> **The real two levers** (both frequency-independent):
+> - **purerust → isal: ~+36% instructions** (inner Huffman loop does
+>   far more work than ISA-L). Pure-Rust-specific, tractable. The old
+>   framing below WRONGLY deprioritized this.
+> - **isal → rapidgzip (dominant, shared): ~2× the backend-bound memory
+>   stalls** (11.7B vs 6.4B slots). The marker u16-ring (2×-traffic),
+>   multi-pass marker replacement, and window scatter loads — i.e. the
+>   chunk pipeline §1.3 marked "structurally locked." It is the biggest
+>   single bucket; even C ISA-L is 1.25× behind rapidgzip here.
+>
+> Everything from "**FRAMING**" down to §6 predates this and is kept for
+> the falsification record only. Trust the table above.
+
+**FRAMING (SUPERSEDED 2026-05-28 — see re-measurement block above):**
 **gzippy-pure vs rapidgzip is 1.30× cycles, 0.98× instructions, IPC
 1.08 vs 1.42.** Same algorithm, ~same instruction count. The gap is
 **memory-subsystem stalls in the chunk pipeline + allocator + marker
@@ -75,10 +112,50 @@ PEBS-precise attribution
 
 ## 2. Action queue
 
-Ranked by expected wall impact, each with hypothesis + how to
-falsify + prior attempts.
+> **2026-05-28 RE-AIM (supersedes the §2.1-first ranking below).**
+> Pinned-P-core diagnosis + advisor review re-ordered the queue.
+> Measured lever order is now **B → C → A → D**:
+>
+> - **B. Allocator/buffer pool — LARGELY EXHAUSTED, not the priority.**
+>   The pure-rust build ALREADY uses the correct per-Vec rpmalloc arena
+>   WITH per-thread init (`rpmalloc_alloc.rs` `THREAD_INIT` calls
+>   `rpmalloc_thread_initialize`) — the §2.1 "binding doesn't pthread-init"
+>   premise is FALSE for the per-Vec path (it was only true for the
+>   falsified *global* `rpmalloc 0.2.2` lever). Measured pool hit rates
+>   on silesia-large/4-thread: u8 74% (76h/27m), u16 48% (benign — the
+>   "misses" are free `take_u16(0)` 0-capacity fast-path takes). The
+>   remaining ~14% page-faults are **irreducible first-touch** on
+>   distinct output + the 2× u16 marker traffic. Kill criterion met:
+>   not allocator churn. Stop here unless a daemon-mode caller appears.
+> - **C. Cut the volume through the marker pipeline [REAL PRIZE].**
+>   rapidgzip is ~2× LESS backend-bound (6.4B vs 11.7-15.9B slots). The
+>   27%-of-CPU marker bootstrap is a SEPARATE u16 decoder
+>   (`bootstrap_with_deflate_block_inner`, gzip_chunk.rs:1430) emitting
+>   2 bytes/byte. Cutting bootstrap *volume* hits backend + bad-spec +
+>   memmove at once. CAVEAT: at 4 threads "useless prefetches" is only
+>   7.89%, so the 1.66× over-emit premise is weak at the low-thread
+>   measurement point — re-measure emit ratio at T=16 before committing.
+>   Needs the marker u16→u8+bitmap rework OR fewer/larger bootstrap
+>   buffers.
+> - **A. Inner-loop branch reduction** — bad-spec is 22.5% but the 4→2
+>   literal-lookahead simplification already landed (resumable.rs:1266);
+>   re-attribute bad-spec between the inner loop vs block-boundary
+>   speculation (perf record -e branch-misses:pp) before touching it.
+> - **D. Inner-loop BMI2/SIMD instruction reduction** — last; worst
+>   track record (SIMD multi-lit, packed store, dynasm, explicit BMI2
+>   all falsified/parity). purerust retires +40% slots vs rapidgzip,
+>   but the loop is at codegen parity with rustc.
+>
+> **Validation note:** the shared box is stuck at load 4-10; wall is
+> unreliable. Validate via PINNED perf counters (`taskset -c 0,2,4,6`,
+> 4 threads): TopdownL1 backend-bound %, core-cycles, page-faults,
+> branch-misses — all load-independent.
 
-### 2.1 Allocator: pthread-init the rpmalloc binding [PRIORITY]
+Ranked by expected wall impact, each with hypothesis + how to
+falsify + prior attempts. **(Ranking below is PRE-2026-05-28; the
+re-aim block above supersedes it.)**
+
+### 2.1 Allocator: pthread-init the rpmalloc binding [PRIORITY — SUPERSEDED: per-Vec arena already correct, see re-aim block]
 
 **Hypothesis**: Rust `rpmalloc 0.2.2` crate's `RpMalloc` global
 allocator wrapper does NOT call `rpmalloc_thread_initialize()` per
