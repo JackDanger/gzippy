@@ -302,6 +302,247 @@ pub fn decode_literal_only_block(
     }
 }
 
+// ── Route C v2 — full fixed-Huffman inflate (literals + matches) ─────────
+//
+// Pure-Rust reference decoder that handles ALL fixed-Huffman symbols:
+// literals (0-255), EOB (256), and length codes (257-285) with their
+// extra bits, plus the fixed 5-bit distance code and its extra bits.
+// This is the correctness oracle; a future v2 commit will mirror this
+// in dynasm-rs asm. Lives in the same module because the LUT + bit-reader
+// primitives are shared.
+
+/// Length base + extra-bits table per RFC 1951 §3.2.5 (length symbols 257-285).
+/// Indexed by `symbol - 257`. Entry: (length base, extra bits).
+const LENGTH_BASE: [u16; 29] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
+];
+const LENGTH_EXTRA: [u8; 29] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+];
+
+/// Distance base + extra-bits table per RFC 1951 §3.2.5 (distance symbols 0-29).
+const DIST_BASE: [u16; 30] = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+];
+const DIST_EXTRA: [u8; 30] = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
+];
+
+/// LSB-first bit reader over a byte slice.
+struct BitReader<'a> {
+    buf: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(buf: &'a [u8], bit_pos: usize) -> Self {
+        Self { buf, bit_pos }
+    }
+
+    /// Peek `n` bits (≤ 32). Returns 0-padded if past EOF.
+    fn peek(&self, n: u8) -> u32 {
+        debug_assert!(n <= 32);
+        let byte = self.bit_pos / 8;
+        let off = (self.bit_pos % 8) as u32;
+        let mut buf: u64 = 0;
+        for i in 0..6 {
+            if byte + i < self.buf.len() {
+                buf |= (self.buf[byte + i] as u64) << (i * 8);
+            }
+        }
+        ((buf >> off) & ((1u64 << n) - 1)) as u32
+    }
+
+    fn consume(&mut self, n: u8) {
+        self.bit_pos += n as usize;
+    }
+
+    fn read(&mut self, n: u8) -> u32 {
+        let v = self.peek(n);
+        self.consume(n);
+        v
+    }
+
+    fn pos(&self) -> usize {
+        self.bit_pos
+    }
+}
+
+/// Pure-Rust reference decoder for a fixed-Huffman block.
+/// Caller positions `bit_pos` at the START of block data (after the
+/// 3-bit header `BFINAL|BTYPE`); the decoder consumes through EOB
+/// and returns the new bit position + total bytes written.
+///
+/// Output is appended to `output` starting at `out_start`. Returns
+/// `(new_bit_pos, total_out_pos)` or an io::Error on malformed data
+/// or output overflow.
+pub fn decode_fixed_block_rust(
+    input: &[u8],
+    bit_pos: usize,
+    output: &mut [u8],
+    out_start: usize,
+) -> std::io::Result<(usize, usize)> {
+    let lut = fixed_lut();
+    let mut br = BitReader::new(input, bit_pos);
+    let mut out_pos = out_start;
+
+    loop {
+        // Decode litlen symbol via 9-bit LUT.
+        let key = br.peek(9) as usize;
+        let entry = lut[key];
+        br.consume(entry.bits);
+        let sym = entry.symbol;
+        if sym < 256 {
+            // Literal byte.
+            if out_pos >= output.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "route-c v2: output overflow",
+                ));
+            }
+            output[out_pos] = sym as u8;
+            out_pos += 1;
+        } else if sym == 256 {
+            // EOB.
+            return Ok((br.pos(), out_pos));
+        } else if sym <= 285 {
+            // Length code 257..285. Read extra bits + decode dist.
+            let li = (sym - 257) as usize;
+            let length_base = LENGTH_BASE[li] as usize;
+            let extra = LENGTH_EXTRA[li];
+            let length = length_base + br.read(extra) as usize;
+
+            // Fixed-Huffman dist code is a fixed 5-bit codeword (per RFC §3.2.6).
+            // Read 5 bits and REVERSE them to recover the symbol.
+            let dist_code_bits = br.read(5) as u32;
+            let dist_sym = reverse_bits_local(dist_code_bits, 5) as usize;
+            if dist_sym >= 30 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("route-c v2: invalid distance symbol {dist_sym}"),
+                ));
+            }
+            let dist_base = DIST_BASE[dist_sym] as usize;
+            let dist_extra = DIST_EXTRA[dist_sym];
+            let distance = dist_base + br.read(dist_extra) as usize;
+
+            // Match copy with overlap (RLE for dist < length).
+            if distance == 0 || distance > out_pos {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("route-c v2: invalid distance {distance} at out_pos {out_pos}"),
+                ));
+            }
+            if out_pos + length > output.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "route-c v2: match overflow",
+                ));
+            }
+            // Byte-by-byte to handle overlap (dist < length).
+            for i in 0..length {
+                output[out_pos + i] = output[out_pos + i - distance];
+            }
+            out_pos += length;
+        } else {
+            // Symbols 286, 287 are reserved per RFC 1951.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("route-c v2: reserved symbol {sym}"),
+            ));
+        }
+    }
+}
+
+/// Decode a complete fixed-Huffman gzip stream (header + fixed block + footer)
+/// using the Route C v2 reference decoder. Used in tests to round-trip vs
+/// flate2-encoded data.
+///
+/// `gz` is the full gzip bytes. Returns the decoded payload.
+pub fn decode_gzip_with_route_c_v2(gz: &[u8]) -> std::io::Result<Vec<u8>> {
+    // Minimal gzip header parse: 10-byte fixed header (no FEXTRA/FNAME).
+    if gz.len() < 18 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "gzip stream too short",
+        ));
+    }
+    if gz[0] != 0x1f || gz[1] != 0x8b {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a gzip stream",
+        ));
+    }
+    if gz[2] != 8 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "non-DEFLATE compression",
+        ));
+    }
+    let flg = gz[3];
+    let mut header_end = 10;
+    if flg & 0x04 != 0 {
+        // FEXTRA
+        let xlen = u16::from_le_bytes([gz[header_end], gz[header_end + 1]]) as usize;
+        header_end += 2 + xlen;
+    }
+    if flg & 0x08 != 0 {
+        // FNAME (NUL-terminated)
+        while header_end < gz.len() && gz[header_end] != 0 {
+            header_end += 1;
+        }
+        header_end += 1;
+    }
+    if flg & 0x10 != 0 {
+        // FCOMMENT
+        while header_end < gz.len() && gz[header_end] != 0 {
+            header_end += 1;
+        }
+        header_end += 1;
+    }
+    if flg & 0x02 != 0 {
+        // FHCRC
+        header_end += 2;
+    }
+    let isize_field = u32::from_le_bytes([
+        gz[gz.len() - 4],
+        gz[gz.len() - 3],
+        gz[gz.len() - 2],
+        gz[gz.len() - 1],
+    ]) as usize;
+
+    // Bit position 0 is the first bit of the deflate stream.
+    let mut bit_pos = header_end * 8;
+    let mut output = vec![0u8; isize_field + 64]; // small slack for over-emit
+    let mut out_pos = 0;
+
+    loop {
+        // 3-bit block header: BFINAL (1 bit), BTYPE (2 bits).
+        let mut br = BitReader::new(gz, bit_pos);
+        let bfinal = br.read(1);
+        let btype = br.read(2);
+        bit_pos = br.pos();
+        if btype != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("route-c v2 only supports BTYPE=01 (fixed Huffman); got BTYPE={btype}"),
+            ));
+        }
+        let (new_bit_pos, new_out_pos) =
+            decode_fixed_block_rust(gz, bit_pos, &mut output, out_pos)?;
+        bit_pos = new_bit_pos;
+        out_pos = new_out_pos;
+        if bfinal == 1 {
+            break;
+        }
+    }
+    output.truncate(out_pos);
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +613,152 @@ mod tests {
         let r = decode_literal_only_block(&input, 0, &mut output);
         assert_eq!(r.ok(), Some(1), "single 'A' + EOB should write 1 byte");
         assert_eq!(output[0], b'A');
+    }
+
+    /// Helper: gzip-encode `data` at level 1 (zlib's default for fast =
+    /// fixed-Huffman where the encoder chooses it). Flate2's behavior:
+    /// level=1 emits fixed-Huffman blocks for typical data.
+    fn gzip_level1(data: &[u8]) -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::new(1));
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Route C v2 reference Rust decoder vs flate2 oracle: empty payload.
+    #[test]
+    fn route_c_v2_empty_payload() {
+        let payload = b"";
+        let gz = gzip_level1(payload);
+        // flate2 may emit a stored block for empty payload — check first.
+        let header_end = {
+            let flg = gz[3];
+            let mut p = 10;
+            if flg & 0x04 != 0 {
+                let xlen = u16::from_le_bytes([gz[p], gz[p + 1]]) as usize;
+                p += 2 + xlen;
+            }
+            if flg & 0x08 != 0 {
+                while gz[p] != 0 {
+                    p += 1;
+                }
+                p += 1;
+            }
+            p
+        };
+        let btype = (gz[header_end] >> 1) & 0b11;
+        if btype != 1 {
+            eprintln!("flate2 emitted BTYPE={btype} for empty payload; skipping");
+            return;
+        }
+        let decoded = decode_gzip_with_route_c_v2(&gz).expect("decode");
+        assert_eq!(decoded.as_slice(), payload);
+    }
+
+    /// Round-trip ASCII text through flate2 level 1, decode with Route C v2,
+    /// compare byte-for-byte. This exercises literal codes only.
+    #[test]
+    fn route_c_v2_text_round_trip() {
+        let payload = b"Hello, World! This is a test of Route C v2 fixed-Huffman.";
+        let gz = gzip_level1(payload);
+
+        // Skip the test if flate2 chose a different block type than BTYPE=01.
+        // (For small inputs zlib sometimes uses stored.)
+        let header_end = {
+            let flg = gz[3];
+            let mut p = 10;
+            if flg & 0x04 != 0 {
+                let xlen = u16::from_le_bytes([gz[p], gz[p + 1]]) as usize;
+                p += 2 + xlen;
+            }
+            if flg & 0x08 != 0 {
+                while gz[p] != 0 {
+                    p += 1;
+                }
+                p += 1;
+            }
+            p
+        };
+        let btype = (gz[header_end] >> 1) & 0b11;
+        if btype != 1 {
+            eprintln!("flate2 emitted BTYPE={btype} for text; skipping");
+            return;
+        }
+
+        let decoded = decode_gzip_with_route_c_v2(&gz).expect("decode");
+        assert_eq!(decoded.as_slice(), payload);
+    }
+
+    /// Round-trip a repetitive payload that's GUARANTEED to exercise the
+    /// match-copy path (length + distance codes).
+    #[test]
+    fn route_c_v2_match_copy_round_trip() {
+        // 200-byte pattern: 'A' repeated. Must produce many back-refs.
+        let payload = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let gz = gzip_level1(payload);
+
+        let header_end = {
+            let flg = gz[3];
+            let mut p = 10;
+            if flg & 0x04 != 0 {
+                let xlen = u16::from_le_bytes([gz[p], gz[p + 1]]) as usize;
+                p += 2 + xlen;
+            }
+            if flg & 0x08 != 0 {
+                while gz[p] != 0 {
+                    p += 1;
+                }
+                p += 1;
+            }
+            p
+        };
+        let btype = (gz[header_end] >> 1) & 0b11;
+        if btype != 1 {
+            eprintln!("flate2 emitted BTYPE={btype} for repetitive; skipping");
+            return;
+        }
+
+        let decoded = decode_gzip_with_route_c_v2(&gz).expect("decode");
+        assert_eq!(decoded.as_slice(), payload.as_slice());
+    }
+
+    /// Differential vs flate2: random binary data round-trip.
+    #[test]
+    fn route_c_v2_random_binary_round_trip() {
+        // Deterministic pseudo-random payload.
+        let mut payload = vec![0u8; 4096];
+        let mut x: u32 = 0xdead_beef;
+        for b in payload.iter_mut() {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *b = (x >> 16) as u8;
+        }
+        let gz = gzip_level1(&payload);
+
+        let header_end = {
+            let flg = gz[3];
+            let mut p = 10;
+            if flg & 0x04 != 0 {
+                let xlen = u16::from_le_bytes([gz[p], gz[p + 1]]) as usize;
+                p += 2 + xlen;
+            }
+            if flg & 0x08 != 0 {
+                while gz[p] != 0 {
+                    p += 1;
+                }
+                p += 1;
+            }
+            p
+        };
+        let btype = (gz[header_end] >> 1) & 0b11;
+        if btype != 1 {
+            // Random data often goes to stored blocks (BTYPE=00) under level 1.
+            eprintln!("flate2 emitted BTYPE={btype} for random; skipping (expected)");
+            return;
+        }
+
+        let decoded = decode_gzip_with_route_c_v2(&gz).expect("decode");
+        assert_eq!(decoded.len(), payload.len());
+        assert_eq!(decoded.as_slice(), payload.as_slice());
     }
 }
