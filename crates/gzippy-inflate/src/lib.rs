@@ -30,8 +30,12 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+pub mod chd;
 pub mod constant_time;
+pub mod gpu;
+pub use chd::ChdTable;
 pub use constant_time::ConstantTimeInflate;
+pub use gpu::{BlockRange, GpuBackend, GpuError, GpuInflate};
 
 /// Public inflate primitive. Stateless; each method allocates its own output.
 ///

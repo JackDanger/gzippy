@@ -23,6 +23,14 @@ std = []
 # no-std builds don't pull in tokio/futures.
 async = ["std", "dep:futures", "dep:tokio"]
 
+# §3.9 GPU offload backend stubs. Per-backend feature flags so
+# users only pull in the deps they need. v0.1 ships the API only —
+# enabling these does nothing yet; v0.2+ adds real Metal/CUDA/Vulkan
+# implementations (multi-month per plan §11).
+gpu-metal = ["std"]
+gpu-cuda = ["std"]
+gpu-vulkan = ["std"]
+
 [dependencies]
 # Sync API uses libdeflater (same as parent crate today) until v0.2.0
 # migrates the pure-Rust path.
