@@ -48,9 +48,7 @@ pub static READ_STREAM_BYTES_OUT: AtomicU64 = AtomicU64::new(0);
 /// per-call. High avg = caller passes small buffers (chunked); low
 /// avg = caller passes big buffers (monolithic-ish).
 pub static READ_STREAM_OUTPUT_BUF_BYTES: AtomicU64 = AtomicU64::new(0);
-use super::libdeflate_entry::{
-    DistTable, LitLenEntry, LitLenTable, HUFFDEC_END_OF_BLOCK, HUFFDEC_EXCEPTIONAL,
-};
+use super::libdeflate_entry::{DistTable, LitLenTable, HUFFDEC_END_OF_BLOCK, HUFFDEC_EXCEPTIONAL};
 use super::stopping_point::StoppingPoint;
 
 /// Max DEFLATE back-reference distance; size of the sliding window the
@@ -1165,88 +1163,16 @@ fn decode_huffman_body_resumable(
 
             // LITERAL FAST PATH (bit 31). Vendor: `:870-1030`.
             if (raw as i32) < 0 {
-                // Lever S1 (2026-05-28 advisor): packed-u32 store path.
-                // Replaces 4 separate 1-byte stores with 1 unaligned u32
-                // store. Speculatively decodes up to 4 literals, packs
-                // them into a u32, stores once, advances by actual
-                // literal count. Garbage past out_pos+lit_count gets
-                // overwritten by subsequent iterations (FASTLOOP
-                // guarantees the loop continues; SAFE loop's tail uses
-                // the per-byte fallback).
+                // FALSIFICATION 2026-05-28: u32 packed multi-literal
+                // store (GZIPPY_PACKED_LIT_STORE) attempted on this
+                // path; 10-trial neurotic A/B showed parity (+0.4%,
+                // within noise). LLVM + store-buffer coalescing already
+                // merges the 4 separate 1-byte stores below as
+                // effectively one cache-line write. The packed path
+                // added bounds-check + Option<LitLenEntry> carry
+                // tracking that ate any savings. See
+                // docs/perf/2026-05-28-s1-packed-lit-store-falsified.md
                 //
-                // Vendor counterpart: libdeflate
-                // `consume_first_decode.rs:870-1030` packs up to 8
-                // literals into a 64-bit store.
-                //
-                // Safety: u32 store touches [out_pos, out_pos+4). Gated
-                // on `out_pos + 4 <= output_len` to prevent OOB. In
-                // FASTLOOP, this is always true (FASTLOOP_MARGIN=320).
-                // In SAFE loop, when bounds fail, the per-byte path
-                // below handles it.
-                if use_packed_literal_store() && out_pos + 4 <= output_len {
-                    let mut packed: u32 = entry.literal_value() as u32;
-                    let mut lit_count: u32 = 1;
-                    let mut carry: Option<LitLenEntry> = None;
-
-                    if (bitsleft as u8) >= REFILL_THRESHOLD {
-                        let e1 = litlen.lookup(bitbuf);
-                        let r1 = e1.raw();
-                        if (r1 as i32) < 0 {
-                            bitbuf >>= r1 as u8;
-                            bitsleft = bitsleft.wrapping_sub(r1 & 0x1F);
-                            packed |= (e1.literal_value() as u32) << 8;
-                            lit_count = 2;
-
-                            if (bitsleft as u8) >= 24 {
-                                let e2 = litlen.lookup(bitbuf);
-                                let r2 = e2.raw();
-                                if (r2 as i32) < 0 {
-                                    bitbuf >>= r2 as u8;
-                                    bitsleft = bitsleft.wrapping_sub(r2 & 0x1F);
-                                    packed |= (e2.literal_value() as u32) << 16;
-                                    lit_count = 3;
-
-                                    if (bitsleft as u8) >= 12 {
-                                        let e3 = litlen.lookup(bitbuf);
-                                        let r3 = e3.raw();
-                                        if (r3 as i32) < 0 {
-                                            bitbuf >>= r3 as u8;
-                                            bitsleft = bitsleft.wrapping_sub(r3 & 0x1F);
-                                            packed |= (e3.literal_value() as u32) << 24;
-                                            lit_count = 4;
-                                        } else {
-                                            carry = Some(e3);
-                                        }
-                                    }
-                                } else {
-                                    carry = Some(e2);
-                                }
-                            }
-                        } else {
-                            carry = Some(e1);
-                        }
-                    }
-
-                    // Single u32 unaligned store. Safe by gate above.
-                    unsafe {
-                        (output_ptr.add(out_pos) as *mut u32).write_unaligned(packed);
-                    }
-                    out_pos += lit_count as usize;
-
-                    // Refill so next iter has bits to consume.
-                    if (bitsleft as u8) < REFILL_THRESHOLD {
-                        refill_local!();
-                    }
-
-                    // Next-iter entry: either the carried non-literal,
-                    // or re-lookup.
-                    entry = match carry {
-                        Some(e) => e,
-                        None => litlen.lookup(bitbuf),
-                    };
-                    continue;
-                }
-
                 // Lever T3 (tight-Huffman-decoder plan): multi-literal
                 // lookahead. After emitting the first literal, peek at
                 // the preloaded `bitbuf` to see if the NEXT entry is
@@ -1541,20 +1467,6 @@ fn use_resumable_isal_inner() -> bool {
     use std::sync::OnceLock;
     static USE_ISAL: OnceLock<bool> = OnceLock::new();
     *USE_ISAL.get_or_init(|| std::env::var_os("GZIPPY_RESUMABLE_ISAL_INNER").is_some())
-}
-
-/// Env-flag for the packed-literal-store lever (advisor 2026-05-28).
-/// When set, the multi-literal lookahead inside the libdeflate-LUT
-/// inner loop replaces 4 separate 1-byte stores with a single u32
-/// unaligned store. Default OFF until A/B bench on neurotic confirms
-/// throughput improvement. Once confirmed, becomes production default.
-///
-/// Vendor counterpart: libdeflate `consume_first_decode.rs:870-1030`
-/// packs up to 8 literals into a 64-bit store.
-pub fn use_packed_literal_store() -> bool {
-    use std::sync::OnceLock;
-    static USE_PACKED: OnceLock<bool> = OnceLock::new();
-    *USE_PACKED.get_or_init(|| std::env::var_os("GZIPPY_PACKED_LIT_STORE").is_some())
 }
 
 /// ISA-L-LUT-based inner symbol-decode loop. Replacement for
