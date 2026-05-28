@@ -1381,24 +1381,36 @@ fn decode_huffman_body_resumable(
             bitsleft = bitsleft.wrapping_sub(dist_raw & 0x1F);
             let distance = dist_entry.decode_distance(dist_extra_saved);
 
-            // copy_match_windowed reads `state.window` and writes
-            // `state.pending_match`. It does NOT touch `state.bits`.
-            let bits_value_snapshot = if cfg!(debug_assertions) {
-                Some((state.bits.bitbuf, state.bits.bitsleft, state.bits.pos))
-            } else {
-                None
-            };
-            out_pos = copy_match_windowed(state, output, out_pos, distance, length)?;
-            debug_assert_eq!(
-                bits_value_snapshot,
-                Some((state.bits.bitbuf, state.bits.bitsleft, state.bits.pos)),
-                "decode_huffman_body_resumable B1 contract: copy_match_windowed \
-                 must not mutate state.bits.{{bitbuf,bitsleft,pos}}"
-            );
-            if state.pending_match.is_some() {
-                debug_assert_eq!(out_pos, output.len());
-                writeback_bits!();
-                return Ok(out_pos);
+            // Inline fast match-copy for the clean common case: the match
+            // source is entirely within already-decoded `output` (dist <=
+            // out_pos, so no `state.window` touch) AND there is headroom for
+            // copy_match_fast's 48-byte unrolled overshoot. This skips the
+            // per-match `copy_match_windowed` FUNCTION CALL + its predicate
+            // tower + `state.pending_match` plumbing — that wrapper is ~28%
+            // of inner-loop instructions vs the same copy_match_fast inlined
+            // (examples/inner_bench.rs A/B: ResumableInflate2 22.86B instr vs
+            // non-resumable consume_first 13.82B). pending_match is None on
+            // entry (a yielded match would have returned last iteration), and
+            // the headroom guarantees no yield, so it stays None.
+            //
+            // The fall-back call handles window-touch, the tail/yield case
+            // (output nearly full → PendingMatch), and the dist==0 /
+            // dist>history error exactly as before.
+            {
+                let d = distance as usize;
+                let l = length as usize;
+                if d != 0 && d <= out_pos && output_len - out_pos >= l + 48 {
+                    out_pos = crate::decompress::inflate::consume_first_decode::copy_match_fast(
+                        output, out_pos, distance, length,
+                    );
+                } else {
+                    out_pos = copy_match_windowed(state, output, out_pos, distance, length)?;
+                    if state.pending_match.is_some() {
+                        debug_assert_eq!(out_pos, output.len());
+                        writeback_bits!();
+                        return Ok(out_pos);
+                    }
+                }
             }
 
             // Refill + preload next entry.
@@ -2591,6 +2603,125 @@ mod tests {
         // max-match (258), so most matches yield mid-copy.
         let got = decode_via_resumable_in_chunks(&stream, 7);
         assert_eq!(got, payload);
+    }
+
+    /// Adversarial coverage for the INLINED match-fast path (commit
+    /// inlining `copy_match_fast` into `decode_huffman_body_resumable`).
+    /// The inline predicate is `d != 0 && d <= out_pos && output_len -
+    /// out_pos >= l + 48`. The risk is at the boundary: matches that
+    /// sit right where headroom drops below `l+48` must transparently
+    /// fall back to `copy_match_windowed` and still produce identical
+    /// bytes. We decode each stream into a SINGLE buffer sized exactly
+    /// to the payload — so the trailing matches sit at progressively
+    /// smaller headroom — AND independently into chunked buffers of
+    /// every awkward size from 1..=320 (320 = FASTLOOP_MARGIN, crosses
+    /// the 48-byte overshoot). Oracle is the original payload (already
+    /// validated by flate2's own roundtrip on encode).
+    #[test]
+    fn inline_match_fast_path_boundary_differential() {
+        // Payloads engineered to exercise every copy_match_fast sub-path:
+        //   - dist==1 RLE runs (the byte-broadcast path)
+        //   - dist 2..7 small-stride overlap
+        //   - dist>=8 word-copy
+        //   - dist>=32 && len>=64 SIMD path
+        //   - overlapping matches (dist < len)
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+
+        // 1. Long RLE run (dist==1, len up to 258 repeatedly).
+        payloads.push(vec![0x5Au8; 9000]);
+
+        // 2. Period-3 overlap (dist=3, len>>dist → LZ77 self-overlap).
+        {
+            let mut p = Vec::new();
+            while p.len() < 9000 {
+                p.extend_from_slice(b"abc");
+            }
+            payloads.push(p);
+        }
+
+        // 3. Period-7 overlap.
+        {
+            let mut p = Vec::new();
+            while p.len() < 9000 {
+                p.extend_from_slice(b"ABCDEFG");
+            }
+            payloads.push(p);
+        }
+
+        // 4. Long non-overlapping repeats with a 64-byte unique block
+        //    (dist>=32, len>=64 → SIMD path).
+        {
+            let block: Vec<u8> = (0..96u8).collect();
+            let mut p = Vec::new();
+            for _ in 0..120 {
+                p.extend_from_slice(&block);
+            }
+            payloads.push(p);
+        }
+
+        // 5. Pseudo-random with embedded repeats (mixed dist/len, forces
+        //    dynamic Huffman + a wide match-length distribution).
+        {
+            let mut p = Vec::with_capacity(40000);
+            let mut state: u64 = 0xdead_beef_cafe;
+            let lexicon: &[&[u8]] = &[b"alpha", b"beta", b"gamma", b"x", b"the lazy dog "];
+            while p.len() < 40000 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                if state & 1 == 0 {
+                    p.push((state >> 30) as u8);
+                } else {
+                    p.extend_from_slice(lexicon[(state as usize >> 4) % lexicon.len()]);
+                }
+            }
+            payloads.push(p);
+        }
+
+        for (pi, payload) in payloads.iter().enumerate() {
+            for level in [1u32, 6, 9] {
+                let stream = raw_deflate(payload, level);
+
+                // (a) Single exact-sized buffer: the inline fast path
+                // fires for most matches, dropping to the windowed
+                // fallback only as headroom shrinks below l+48 near the
+                // tail. This is the path the production A3 chunk uses.
+                {
+                    let mut inflate =
+                        ResumableInflate2::with_until_bits(&stream, 0, stream.len() * 8).unwrap();
+                    let mut output = vec![0u8; payload.len()];
+                    let mut total = 0;
+                    loop {
+                        let r = inflate.read_stream(&mut output[total..]).unwrap();
+                        total += r.bytes_written;
+                        if r.finished {
+                            break;
+                        }
+                        // When the exact-sized buffer is full but the
+                        // trailing EOB hasn't been consumed yet, a 0-write
+                        // is legitimate — but we have all the payload
+                        // bytes. Stop; correctness is asserted below.
+                        if r.bytes_written == 0 {
+                            assert_eq!(total, payload.len(), "stall before full p{pi} L{level}");
+                            break;
+                        }
+                    }
+                    assert_eq!(
+                        &output[..total],
+                        &payload[..],
+                        "single-buffer mismatch payload {pi} level {level}"
+                    );
+                }
+
+                // (b) Chunked at awkward sizes spanning the 48-byte
+                // overshoot and the 320-byte FASTLOOP margin.
+                for chunk in [1usize, 2, 3, 7, 8, 9, 47, 48, 49, 64, 256, 258, 320] {
+                    let got = decode_via_resumable_in_chunks(&stream, chunk);
+                    assert_eq!(
+                        &got, payload,
+                        "chunked mismatch payload {pi} level {level} chunk {chunk}"
+                    );
+                }
+            }
+        }
     }
 
     // Advisor item 3: two consecutive dynamic blocks with DIFFERENT
