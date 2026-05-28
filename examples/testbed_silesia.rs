@@ -31,7 +31,7 @@ use std::process::ExitCode;
 
 use gzippy::decompress::block_walker::{walk_block_boundaries, BlockMeta};
 use gzippy_inflate::route_c_dynamic::{
-    build_layered_lut, decode_dynamic_block_layered_with_window, parse_dynamic_header, BitReader,
+    decode_dynamic_block_layered_with_window, parse_dynamic_header, BitReader, LayeredLut,
 };
 use gzippy_inflate::route_c_testbed::{extract_cases, run_testbed, BlockSummary};
 
@@ -91,6 +91,10 @@ fn main() -> ExitCode {
     // Each subsequent Route C v3+ commit will replace pieces of this
     // with dynasm-emitted asm and the testbed will report regressions
     // per case_index.
+    // Scratch LUTs reused across all 3350 blocks. Saves ~50 MB of
+    // allocator churn per silesia run.
+    let mut lut_ll = LayeredLut::default();
+    let mut lut_d = LayeredLut::default();
     let report = run_testbed(
         &cases,
         deflate_body,
@@ -131,8 +135,8 @@ fn main() -> ExitCode {
                         *e = 8;
                     }
                     let dl = [5u8; 32];
-                    let lut_ll = build_layered_lut(&ll);
-                    let lut_d = build_layered_lut(&dl);
+                    lut_ll.build_into(&ll);
+                    lut_d.build_into(&dl);
                     let (end_bit, bytes) = decode_dynamic_block_layered_with_window(
                         deflate,
                         after_header,
@@ -147,8 +151,8 @@ fn main() -> ExitCode {
                 }
                 2 => {
                     let (after_hdr, ll, dl) = parse_dynamic_header(deflate, after_header)?;
-                    let lut_ll = build_layered_lut(&ll);
-                    let lut_d = build_layered_lut(&dl);
+                    lut_ll.build_into(&ll);
+                    lut_d.build_into(&dl);
                     let (end_bit, bytes) = decode_dynamic_block_layered_with_window(
                         deflate,
                         after_hdr,

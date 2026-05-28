@@ -96,6 +96,107 @@ pub struct LayeredLut {
     pub main_bits: u8,
 }
 
+impl Default for LayeredLut {
+    fn default() -> Self {
+        Self {
+            entries: Vec::with_capacity(MAIN_SIZE + 512),
+            main_bits: MAIN_BITS,
+        }
+    }
+}
+
+impl LayeredLut {
+    /// Rebuild the table in place using the existing `entries` Vec's
+    /// allocation. Mirrors `build_layered_lut` but doesn't allocate a
+    /// fresh Vec each call — critical for the per-block-rebuild
+    /// inflate path where 3350 blocks × ~16 KB allocation = 50 MB+ of
+    /// allocator churn per silesia run.
+    pub fn build_into(&mut self, code_lengths: &[u8]) {
+        let mut count = [0u16; 16];
+        for &len in code_lengths {
+            if len > 0 && len <= 15 {
+                count[len as usize] += 1;
+            }
+        }
+        let mut first_code = [0u32; 16];
+        let mut code: u32 = 0;
+        for len in 1..=15 {
+            code = (code + count[len - 1] as u32) << 1;
+            first_code[len] = code;
+        }
+
+        // Compute per-prefix subtable max-bits.
+        let mut sub_prefix_max_len = [0u8; MAIN_SIZE];
+        {
+            let mut nc = first_code;
+            for &len in code_lengths.iter().filter(|&&l| l > MAIN_BITS && l <= 15) {
+                let codeword = nc[len as usize];
+                nc[len as usize] += 1;
+                let prefix = (reverse_bits(codeword, len) & ((1u32 << MAIN_BITS) - 1)) as usize;
+                let extra = len - MAIN_BITS;
+                if sub_prefix_max_len[prefix] < extra {
+                    sub_prefix_max_len[prefix] = extra;
+                }
+            }
+        }
+
+        let mut sub_offsets = [0u32; MAIN_SIZE];
+        let mut total = MAIN_SIZE;
+        for (i, &m) in sub_prefix_max_len.iter().enumerate() {
+            if m > 0 {
+                sub_offsets[i] = total as u32;
+                total += 1usize << m;
+            }
+        }
+
+        // Resize-clear without dropping the underlying allocation.
+        self.entries.clear();
+        self.entries.resize(total, LutEntry::EMPTY);
+        self.main_bits = MAIN_BITS;
+
+        let mut next_code = first_code;
+        for (symbol, &len) in code_lengths.iter().enumerate() {
+            if len == 0 || len > 15 {
+                continue;
+            }
+            let codeword = next_code[len as usize];
+            next_code[len as usize] += 1;
+            let rev = reverse_bits(codeword, len);
+            if len <= MAIN_BITS {
+                let stride = 1u32 << len;
+                let mut k = rev;
+                while (k as usize) < MAIN_SIZE {
+                    self.entries[k as usize] = LutEntry {
+                        symbol: symbol as u16,
+                        length: len,
+                    };
+                    k += stride;
+                }
+            } else {
+                let prefix = (rev & ((1u32 << MAIN_BITS) - 1)) as usize;
+                let sub_offset = sub_offsets[prefix];
+                let sub_max_bits = sub_prefix_max_len[prefix];
+                let extra = len - MAIN_BITS;
+                let sub_key = (rev >> MAIN_BITS) & ((1u32 << extra) - 1);
+                let stride = 1u32 << extra;
+                let sub_size = 1u32 << sub_max_bits;
+                let mut k = sub_key;
+                while k < sub_size {
+                    self.entries[sub_offset as usize + k as usize] = LutEntry {
+                        symbol: symbol as u16,
+                        length: len,
+                    };
+                    k += stride;
+                }
+                self.entries[prefix] = LutEntry {
+                    symbol: sub_offset as u16,
+                    length: sub_max_bits | SUBTABLE_FLAG,
+                };
+            }
+        }
+    }
+}
+
 impl LayeredLut {
     /// Direct-hit decode in 1 lookup; subtable in 2.
     /// `bits` is the low N bits of the bit stream (caller supplies
