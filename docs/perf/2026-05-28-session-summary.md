@@ -94,12 +94,35 @@ Plus this summary doc and memory updates
 
 ## Bottom line
 
-The goal as stated **cannot be achieved by inflate-inner-loop
+The goal as stated **cannot be achieved by inflate-inner-loop scalar
 optimization alone**. The session confirmed this empirically with 5
-falsifications across the inflate-inner-loop dimension. The remaining
-gap requires architectural work (daemon mode, parallel worker
-prewarm, or full ISA-L bulk port) that does not fit a single
-session.
+falsifications across the inflate-inner-loop dimension.
 
-Each of the 5 falsifications above documents an explicitly-tried
-approach the next session must NOT re-attempt.
+## Late session update: symbolized memmove
+
+Built with `force-frame-pointers + debuginfo=1`, captured fresh perf
+record with `--call-graph dwarf`. The 19.10% memmove decomposes:
+
+  - 2.84% `emit_backref_ring` (marker u16 ring)
+  - 1.61% `Vec::extend_from_slice` from `drain_to_output`
+  - 1.82% `copy_within` in `clean_unmarked_data`
+  - All three: **marker-bootstrap phase only**
+
+The bulk inflate (`decode_huffman_body_resumable`, `copy_match_windowed`)
+contributes essentially zero memmove. This means:
+- The 13.26% `clear_page_erms` is the only TRULY allocator-side cost.
+- The 18% memmove is **shared between pure-rust and ISA-L builds**
+  (same bootstrap code).
+- The 41% throughput gap really IS in the bulk inflate inner loop,
+  even though scalar levers all measure parity.
+
+The remaining bulk-inflate lever is **structural** rather than scalar:
+- Speculative-parallel LUT lookups (vector_huffman re-attempt;
+  CLAUDE.md 2026-05-27 authorizes)
+- AVX2 multi-byte literal output via vpshufb (different shape than
+  the falsified S1 u32 store)
+- Yield-check elision restructure in FASTLOOP (CLAUDE.md authorizes)
+
+Plus a ~5% marker-phase lever from shrinking the u16 ring to u8.
+
+See `docs/perf/2026-05-28-memmove-symbolized.md` for full call stacks.
