@@ -52,6 +52,8 @@ arena-allocator = ["dep:allocator-api2", "dep:rpmalloc-sys"]
 # Activates `#[global_allocator] = rpmalloc::RpMalloc` in src/main.rs.
 # Test for the "pipeline idle is allocator contention" hypothesis.
 global-rpmalloc = ["dep:rpmalloc"]
+libdeflate = []
+streaming-libdeflate-rs = ["dep:streaming-libdeflate-rs"]
 
 [dependencies]
 # Compression: flate2 with zlib-ng for maximum performance
@@ -95,6 +97,7 @@ rpmalloc-sys = { version = "0.2", optional = true }
 # Global rpmalloc allocator — vendor parity test. Gated behind
 # `global-rpmalloc` feature; only activated for the perf experiment.
 rpmalloc = { version = "0.2", optional = true }
+streaming-libdeflate-rs = { version = "0.2", optional = true }
 
 [build-dependencies]
 cc = "1"
