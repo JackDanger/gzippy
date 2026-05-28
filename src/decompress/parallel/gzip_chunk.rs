@@ -182,6 +182,26 @@ fn use_pure_bulk_path() -> bool {
     *USE_BULK.get_or_init(|| std::env::var_os("GZIPPY_ISAL_PURE_BULK").is_some())
 }
 
+/// Option A3 dispatch (`plans/unified-decoder.md` §6 / A1 scaffolding
+/// commit `9e14bbe`). When `GZIPPY_OPTION_A_PREFILL=1` is set, the
+/// windowed-decode path pre-fills `chunk.data[0..32K]` with the
+/// predecessor's window image and runs the decoder via
+/// `read_stream_starting_at` so every back-reference resolves through
+/// `copy_match_fast` (AVX2 SIMD) instead of the `state.window`
+/// byte-by-byte slow path. Targets the 3.5pp `copy_match_windowed`
+/// delta vs ISA-L's `large_byte_copy` documented in the perf
+/// attribution log.
+///
+/// Default OFF for controlled rollout; correctness verified by the
+/// three-oracle differential + silesia byte-perfect + neurotic
+/// production paths.
+#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+fn use_option_a_prefill_path() -> bool {
+    use std::sync::OnceLock;
+    static USE_A3: OnceLock<bool> = OnceLock::new();
+    *USE_A3.get_or_init(|| std::env::var_os("GZIPPY_OPTION_A_PREFILL").is_some())
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     any(feature = "isal-compression", feature = "pure-rust-inflate")
@@ -245,6 +265,23 @@ fn decode_chunk_isal_impl(
     );
 
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
+
+    // Option A3 (env-flag-gated): pre-fill chunk.data[0..32K] with the
+    // predecessor's sliding-window image so back-references in the
+    // wrapper's decode hit copy_match_fast's SIMD path instead of the
+    // copy_match_windowed slow path (the 3.5pp delta vs ISA-L per the
+    // perf attribution log). Default OFF — `GZIPPY_OPTION_A_PREFILL=1`
+    // to opt in. Trim happens before `chunk.finalize()` at the bottom
+    // of this function so the chunk leaves with only decoded bytes in
+    // `data` (the A1 debug_asserts enforce this).
+    #[cfg(feature = "pure-rust-inflate")]
+    let a3_prefill_active = use_option_a_prefill_path() && initial_window.len() == 32768;
+    #[cfg(not(feature = "pure-rust-inflate"))]
+    let a3_prefill_active = false;
+    if a3_prefill_active {
+        chunk.prefill_window_prefix(initial_window);
+    }
+
     let mut stopping_point_reached = false;
     let mut last_end_bit = encoded_offset_bits;
     let mut last_eob_pos = encoded_offset_bits;
@@ -313,13 +350,55 @@ fn decode_chunk_isal_impl(
             // bytes which are uninitialized but writable. ISA-L writes
             // monotonically forward; we only `set_len` AFTER the inner
             // loop has decided how many bytes are valid.
-            let spare: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    chunk.data.as_mut_ptr().add(prev_data_len + n_bytes_read),
-                    buffer_cap - n_bytes_read,
-                )
+            // Option A3 path: hand the wrapper the FULL chunk.data
+            // buffer (extended through the spare capacity) with
+            // `out_pos_start = prev_data_len + n_bytes_read`. Back-refs
+            // resolve via output[..out_pos] (which includes the 32 KiB
+            // window prefix at the front of chunk.data), keeping every
+            // dist ≤ 32K within copy_match_fast's fast path.
+            //
+            // Non-A3 path: existing spare-slice handoff; the wrapper
+            // sees out_pos=0 and falls through to state.window for
+            // every cross-chunk back-ref.
+            //
+            // SAFETY (A3): `chunk.data.reserve(ALLOCATION_CHUNK_SIZE)`
+            // above guarantees the allocation covers
+            // `[0, prev_data_len + buffer_cap)`. The first
+            // `prev_data_len` bytes are initialized (prefill + prior
+            // outer-iter writes); the tail `[prev_data_len + n_bytes_read,
+            // prev_data_len + buffer_cap)` is uninitialized but
+            // writable. `read_stream_starting_at` only WRITES at
+            // out_pos_start onward and only READS at indices < out_pos
+            // (i.e. into the initialized portion). The `set_len` at
+            // the bottom of the outer iter records the actual bytes
+            // written.
+            //
+            // SAFETY (non-A3): unchanged from the original.
+            #[cfg(feature = "pure-rust-inflate")]
+            let r = if a3_prefill_active {
+                let total_len = prev_data_len + buffer_cap;
+                let output_slice: &mut [u8] =
+                    unsafe { std::slice::from_raw_parts_mut(chunk.data.as_mut_ptr(), total_len) };
+                wrapper.read_stream_starting_at(output_slice, prev_data_len + n_bytes_read)?
+            } else {
+                let spare: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        chunk.data.as_mut_ptr().add(prev_data_len + n_bytes_read),
+                        buffer_cap - n_bytes_read,
+                    )
+                };
+                wrapper.read_stream(spare)?
             };
-            let r = wrapper.read_stream(spare)?;
+            #[cfg(not(feature = "pure-rust-inflate"))]
+            let r = {
+                let spare: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        chunk.data.as_mut_ptr().add(prev_data_len + n_bytes_read),
+                        buffer_cap - n_bytes_read,
+                    )
+                };
+                wrapper.read_stream(spare)?
+            };
             last_per_call = r.bytes_written;
             n_bytes_read += last_per_call;
             chunk.note_inner_decoded_bytes(last_per_call);
@@ -500,6 +579,13 @@ fn decode_chunk_isal_impl(
     }
 
     chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+    // Option A3: strip the window-image prefix before finalize. After
+    // this returns, chunk.data contains only the decoded bytes
+    // (data_prefix_len == 0); the A1 debug_asserts at finalize /
+    // clean_unmarked_data / apply_window / etc. are now satisfied.
+    if a3_prefill_active {
+        chunk.trim_window_prefix();
+    }
     // When the reader runs past `stop_hint_bits` without an inexact
     // stop, `tell_compressed()` can land mid-block. Successor chunks must
     // resume at the last END_OF_BLOCK position (pre-header), not mid-block.

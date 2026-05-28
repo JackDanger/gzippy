@@ -297,6 +297,29 @@ impl<'a> Inflate<'a, Clean, Generic, Streaming> {
         self.inner.read_stream(output)
     }
 
+    /// Option A3 entry point — runs decode starting at `output[out_pos_start..]`
+    /// with the contract that `output[0..out_pos_start]` already contains the
+    /// predecessor's sliding-window image. The fast path in
+    /// `copy_match_windowed` then matches every legal back-reference
+    /// (max distance 32 KiB ≤ out_pos_start when prefix is 32 KiB),
+    /// eliminating the `state.window` slow path entirely.
+    ///
+    /// Counters use the same UNIFIED_INFLATE_RUNS bucket so production
+    /// telemetry continues to work.
+    #[cfg(feature = "pure-rust-inflate")]
+    pub fn read_stream_starting_at(
+        &mut self,
+        output: &mut [u8],
+        out_pos_start: usize,
+    ) -> std::io::Result<InflateStreamResult> {
+        if legacy_kill_switch_active() {
+            LEGACY_FALLBACK_RUNS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            UNIFIED_INFLATE_RUNS.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.read_stream_starting_at(output, out_pos_start)
+    }
+
     /// Snapshot of `stopped_at` after the last `read_stream` call.
     pub fn stopped_at(&self) -> StoppingPoint {
         self.inner.stopped_at()
