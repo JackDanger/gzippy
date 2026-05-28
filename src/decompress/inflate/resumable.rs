@@ -1934,7 +1934,7 @@ fn parse_dynamic_header(bits: &mut Bits) -> Result<(LitLenTable, DistTable)> {
 /// `dist_lens` is sized 32 (RFC reserved 30/31).
 /// The caller must zero them; this function only writes the indices
 /// actually parsed from the header.
-fn parse_dynamic_header_with_lens(
+pub fn parse_dynamic_header_with_lens(
     bits: &mut Bits,
     litlen_lens: &mut [u8; 288],
     dist_lens: &mut [u8; 32],
