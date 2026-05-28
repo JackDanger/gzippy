@@ -160,10 +160,35 @@ See `docs/perf/2026-05-28-c-t3-confirmed-1-9-percent.md`.
 
 | Outcome      | Count |
 |--------------|-------|
-| Falsified at parity / regress | 5 |
+| Falsified at parity / regress | 6 |
 | Confirmed wins | 1 |
 | Correction of contaminated measurement | 1 |
 | Symbolized perf findings | 1 |
+| Advisor consultations (per process rule) | 2 |
 
-19 commits shipped. Goal not met but credible path established with
+21 commits shipped. Goal not met but credible path established with
 advisor sign-off and one demonstrated positive lever.
+
+## Late update: C-fastloop iter-count batch — INFINITE LOOP BUG, REVERTED
+
+Attempted the C part of the advisor's bundled C+T3 recommendation
+(commit `762ac0a`). Replaced inner fastloop `while in_pos < in_fl_end
+&& out_pos < out_fl_end { decode_one_symbol!(); }` with iter-count
+`for _ in 0..safe_iters`.
+
+**Bug**: when `safe_iters = 0` near the chunk tail (e.g.,
+`in_fl_end - in_pos < 8` causing `safe_iters_in = 0`), the for loop
+ran zero iterations, `continue`d to outer loop, which re-entered the
+fastloop with same bounds (still `< in_fl_end` and `< out_fl_end`
+because those thresholds are looser than the safe_iters
+thresholds), looping forever.
+
+Caught by `cargo test resumable` hanging for 4+ hours
+(235 minutes CPU per stuck process before kill). Reverted in commit
+`6a7b72e`.
+
+**Final advisor consultation**: ship `6a7b72e` as session deliverable;
+remaining levers (vpshufb / u8 marker ring / fixed C-fastloop) share
+the same hung-test failure mode; expected value is negative after
+the 4-hour debug tax. Open next session with fresh clean-build
+re-measure of the gap before picking the next lever.
