@@ -30,6 +30,9 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+pub mod constant_time;
+pub use constant_time::ConstantTimeInflate;
+
 /// Public inflate primitive. Stateless; each method allocates its own output.
 ///
 /// v0.1.0: delegates to `libdeflater::Decompressor`. Production code in
