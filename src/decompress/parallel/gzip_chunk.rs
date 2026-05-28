@@ -579,16 +579,21 @@ fn decode_chunk_isal_impl(
     }
 
     chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
-    // Option A3: strip the window-image prefix before finalize. After
-    // this returns, chunk.data contains only the decoded bytes
-    // (data_prefix_len == 0); the A1 debug_asserts at finalize /
-    // clean_unmarked_data / apply_window / etc. are now satisfied.
-    if a3_prefill_active {
-        chunk.trim_window_prefix();
-    }
-    // When the reader runs past `stop_hint_bits` without an inexact
-    // stop, `tell_compressed()` can land mid-block. Successor chunks must
-    // resume at the last END_OF_BLOCK position (pre-header), not mid-block.
+    // A4: window-image prefix STAYS in chunk.data through finalize
+    // and into the consumer. The consumer write site reads
+    // &chunk.data[chunk.data_prefix_len..] so the prefix never
+    // reaches the user's output. Downstream chunk methods that
+    // need the decoded portion (last_32kib_window, get_last_window,
+    // populate_subchunk_windows) skip data_prefix_len bytes;
+    // absorb_isal_tail (the bootstrap merge path) reads from
+    // `tail.data[tail.data_prefix_len..]`. Eliminating the trim
+    // memmove was measured at -3.81pp `__memmove_avx_unaligned_erms`
+    // CPU share vs A3-with-trim, lifting net throughput to +4.2%
+    // vs default at T=16 on neurotic silesia-gzip9.
+    let _ = a3_prefill_active; // value consumed at decode-start
+                               // When the reader runs past `stop_hint_bits` without an inexact
+                               // stop, `tell_compressed()` can land mid-block. Successor chunks must
+                               // resume at the last END_OF_BLOCK position (pre-header), not mid-block.
     let final_bit = if stopping_point_reached || reached_stream_end {
         last_end_bit
     } else if last_eob_pos > encoded_offset_bits {
@@ -969,7 +974,13 @@ fn absorb_isal_tail(dst: &mut ChunkData, tail: ChunkData) {
     let end_bit = tail.encoded_offset_bits + tail.encoded_size_bits;
     let decoded_base = dst.decoded_size();
 
-    if !tail.data.is_empty() {
+    // A4: skip the tail's window-image prefix when absorbing — it's
+    // the predecessor's window image installed by A3 prefill, not
+    // decoded output. For non-A3 tails, `data_prefix_len == 0` and
+    // this is a no-op.
+    let tail_payload_offset = tail.data_prefix_len;
+    let tail_payload_len = tail.data.len().saturating_sub(tail_payload_offset);
+    if tail_payload_len > 0 {
         // Per the post-inline-always bench-sm profile, the prior
         // `dst.append_clean(&tail.data)` re-CRC'd `tail.data` from
         // scratch — 2.45% of total cycles in
@@ -1044,17 +1055,17 @@ fn absorb_isal_tail(dst: &mut ChunkData, tail: ChunkData) {
         // have been folded into a memcpy). Replace with an explicit
         // `reserve` + `copy_nonoverlapping` + `set_len` — the same
         // shape `std::vec::Vec`'s specialization would have used.
-        let added = tail.data.len();
+        let added = tail_payload_len;
         let prev_len = dst.data.len();
         dst.data.reserve(added);
         // SAFETY: `reserve(added)` ensures capacity covers
         // `prev_len + added`; `tail.data` and `dst.data` are
         // distinct allocations (separate Vecs); set_len with the
         // post-copy length is legal because all `added` bytes are
-        // initialized from `tail.data`'s slice.
+        // initialized from `tail.data[tail_payload_offset..]`.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                tail.data.as_ptr(),
+                tail.data.as_ptr().add(tail_payload_offset),
                 dst.data.as_mut_ptr().add(prev_len),
                 added,
             );
