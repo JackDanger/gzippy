@@ -1263,97 +1263,68 @@ fn decode_huffman_body_resumable(
                 // synthetic fixtures don't produce the multi-literal-
                 // followed-by-length pattern frequently enough to trip
                 // the bug deterministically.
+                // C+T3-simplify (2026-05-28 advisor): drop 4-literal cap
+                // to vendor's 2-extra-literal shape. Vendor
+                // `decompress_template.h:381` explicitly comments that 3
+                // extras "actually decreases performance slightly,
+                // perhaps by messing with branch prediction of the
+                // conditional refill that happens later." Gzippy's
+                // 4-cap with 6 conditional-refill carry paths adds
+                // i-cache pressure + branch-pred state. Simpler 2-cap +
+                // unconditional refill matches vendor's measured shape.
                 if (bitsleft as u8) >= REFILL_THRESHOLD {
-                    let mut e_next = litlen.lookup(bitbuf);
-                    let mut r_next = e_next.raw();
-
-                    // 2nd literal
-                    if (r_next as i32) < 0 && out_pos < output_len {
-                        bitbuf >>= r_next as u8;
-                        bitsleft = bitsleft.wrapping_sub(r_next & 0x1F);
+                    let e1 = litlen.lookup(bitbuf);
+                    let r1 = e1.raw();
+                    if (r1 as i32) < 0 && out_pos < output_len {
+                        // 2nd literal
+                        bitbuf >>= r1 as u8;
+                        bitsleft = bitsleft.wrapping_sub(r1 & 0x1F);
                         unsafe {
-                            output_ptr.add(out_pos).write(e_next.literal_value());
+                            output_ptr.add(out_pos).write(e1.literal_value());
                         }
                         out_pos += 1;
 
-                        // 3rd literal
                         if (bitsleft as u8) >= 24 {
-                            e_next = litlen.lookup(bitbuf);
-                            r_next = e_next.raw();
-                            if (r_next as i32) < 0 && out_pos < output_len {
-                                bitbuf >>= r_next as u8;
-                                bitsleft = bitsleft.wrapping_sub(r_next & 0x1F);
+                            let e2 = litlen.lookup(bitbuf);
+                            let r2 = e2.raw();
+                            if (r2 as i32) < 0 && out_pos < output_len {
+                                // 3rd literal (the last)
+                                bitbuf >>= r2 as u8;
+                                bitsleft = bitsleft.wrapping_sub(r2 & 0x1F);
                                 unsafe {
-                                    output_ptr.add(out_pos).write(e_next.literal_value());
+                                    output_ptr.add(out_pos).write(e2.literal_value());
                                 }
                                 out_pos += 1;
-
-                                // 4th literal
-                                if (bitsleft as u8) >= 12 {
-                                    e_next = litlen.lookup(bitbuf);
-                                    r_next = e_next.raw();
-                                    if (r_next as i32) < 0 && out_pos < output_len {
-                                        bitbuf >>= r_next as u8;
-                                        bitsleft = bitsleft.wrapping_sub(r_next & 0x1F);
-                                        unsafe {
-                                            output_ptr.add(out_pos).write(e_next.literal_value());
-                                        }
-                                        out_pos += 1;
-                                        // Hit 4-literal cap. Refill +
-                                        // lookup for next iter; don't
-                                        // carry e_next.
-                                        if (bitsleft as u8) < REFILL_THRESHOLD {
-                                            refill_local!();
-                                        }
-                                        entry = litlen.lookup(bitbuf);
-                                        continue;
-                                    }
-                                    // 4th was non-literal — carry as
-                                    // next iter's entry. REFILL FIRST
-                                    // so next iter has bits to consume
-                                    // (T3 bug fix).
-                                    if (bitsleft as u8) < REFILL_THRESHOLD {
-                                        refill_local!();
-                                    }
-                                    entry = e_next;
-                                    continue;
-                                }
-                                // 3rd was non-literal — carry. Refill.
+                                // Refill + preload next iter's entry.
                                 if (bitsleft as u8) < REFILL_THRESHOLD {
                                     refill_local!();
                                 }
-                                entry = e_next;
+                                entry = litlen.lookup(bitbuf);
                                 continue;
                             }
-                            // 3rd-position lookup was non-literal —
-                            // carry. Refill.
+                            // 3rd-position was non-literal → carry e2.
                             if (bitsleft as u8) < REFILL_THRESHOLD {
                                 refill_local!();
                             }
-                            entry = e_next;
+                            entry = e2;
                             continue;
                         }
-                        // bitsleft too low for 3rd lookup. Refill +
-                        // lookup for next iter.
+                        // bitsleft too low for 3rd lookup.
                         if (bitsleft as u8) < REFILL_THRESHOLD {
                             refill_local!();
                         }
                         entry = litlen.lookup(bitbuf);
                         continue;
                     }
-                    // 2nd was non-literal (or no output room). Carry as
-                    // next iter's entry — saves a lookup vs the
-                    // pre-T3 path. Refill first.
+                    // 2nd was non-literal → carry e1.
                     if (bitsleft as u8) < REFILL_THRESHOLD {
                         refill_local!();
                     }
-                    entry = e_next;
+                    entry = e1;
                     continue;
                 }
 
-                // bitsleft too low even for speculative lookup. Refill,
-                // then preload as usual. Same shape as single-literal
-                // path pre-T3.
+                // bitsleft too low even for 2nd lookup.
                 if (bitsleft as u8) < REFILL_THRESHOLD {
                     refill_local!();
                 }
