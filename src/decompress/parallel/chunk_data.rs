@@ -290,6 +290,17 @@ impl ChunkData {
     ) -> Self {
         debug_assert!(data_with_markers.is_empty());
         debug_assert!(data.is_empty());
+        // Instrumentation (Step A, 2026-05-28): track the peak number of
+        // simultaneously-live ChunkData. This is the in-flight buffer
+        // working set that drives page-fault churn — each live chunk holds
+        // a ~12 MiB u8 + (slow path) up-to-24 MiB u16 Vec, both > rpmalloc's
+        // ~3.94 MiB huge-alloc threshold so they munmap-on-free / re-fault
+        // on next take. MAX_LIVE_CHUNKS sizes any bounded-pool / ring fix
+        // and tests the "prefetch depth, not topology" churn thesis.
+        // Clones=0 in production (Arc::try_unwrap 36/0) so this stays
+        // balanced against the Drop decrement below.
+        let live = LIVE_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        MAX_LIVE_CHUNKS.fetch_max(live, std::sync::atomic::Ordering::Relaxed);
         let first_subchunk = Subchunk {
             encoded_offset_bits,
             encoded_size_bits: 0,
@@ -1314,8 +1325,15 @@ impl ChunkData {
 /// `Clone` is derived: clones produce independent Vecs, each
 /// returning to the pool on its own drop. Cross-thread safe: pool
 /// is a `static Mutex<Vec<...>>`.
+/// Live / peak simultaneously-live ChunkData (Step A instrumentation).
+/// Read via GZIPPY_VERBOSE. MAX_LIVE_CHUNKS = peak in-flight depth, which
+/// determines the page-fault working set and sizes a bounded-pool fix.
+pub static LIVE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MAX_LIVE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Drop for ChunkData {
     fn drop(&mut self) {
+        LIVE_CHUNKS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         // A4: a window-image prefix is allowed to persist through the
         // chunk's lifetime; the consumer skipped over it on write and
         // the pool's `take_u8` clears the Vec length, so the bytes
