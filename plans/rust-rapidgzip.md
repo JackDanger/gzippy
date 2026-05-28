@@ -34,8 +34,33 @@
 >   chunk pipeline §1.3 marked "structurally locked." It is the biggest
 >   single bucket; even C ISA-L is 1.25× behind rapidgzip here.
 >
+> **THREAD-SCALING (the headline — got root on the Proxmox host, herded
+> frigate+plex to E-cores to free clean P-cores 0-15, interleaved n=12):
+> the gap GROWS with thread count because gzippy's parallel scaling is
+> broken.**
+>
+> | T  | purerust | isal | rapidgzip | rg/pure |
+> |----|----------|------|-----------|---------|
+> | 4  | 836      | 1048 | 1371      | 1.64x   |
+> | 8  | 934      | 1195 | 1740      | 1.86x   |
+> | 16 | 998      | 1229 | 2119      | 2.12x   |
+>
+> Scaling 4->16 (4x the cores): purerust **1.19x**, isal **1.17x**,
+> rapidgzip **1.55x**. BOTH gzippy variants plateau by T=8 (~1000 / ~1230
+> ceiling); rapidgzip keeps scaling. The inner-loop gap (isal/pure ~1.25x)
+> is CONSTANT across T — a fixed per-core cost. The DOMINANT, GROWING gap
+> is a **SERIAL BOTTLENECK** (Amdahl): the single consumer thread doing
+> reorder + CRC + window-application (`apply_window`/`replace_markers`
+> resolve markers serially) and the prefetcher/WindowMap locks. rapidgzip
+> parallelizes marker-replacement/window-apply; gzippy likely serializes
+> it. **NEW #1 LEVER (supersedes inner-loop AND allocator): find and
+> parallelize gzippy's serial bottleneck at T=16** — profile the consumer
+> thread, measure consumer-busy vs worker-idle, parallelize window-apply /
+> marker-replace. The T=4 counter diagnosis understated the production
+> (T=16) gap because gzippy scales fine to T=4 then plateaus.
+>
 > Everything from "**FRAMING**" down to §6 predates this and is kept for
-> the falsification record only. Trust the table above.
+> the falsification record only. Trust the tables above.
 
 **FRAMING (SUPERSEDED 2026-05-28 — see re-measurement block above):**
 **gzippy-pure vs rapidgzip is 1.30× cycles, 0.98× instructions, IPC
