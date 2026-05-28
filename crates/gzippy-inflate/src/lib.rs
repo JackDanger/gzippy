@@ -37,6 +37,8 @@ pub mod constant_time;
 pub mod gpu;
 pub mod route_c_dynamic;
 pub mod route_c_testbed;
+#[cfg(all(target_arch = "x86_64", feature = "route-c-dynasm"))]
+pub mod route_c_v3_asm;
 pub use aot::{fingerprint_hash, match_aot_fingerprint};
 pub use bit_reader::{pext, BitReaderI32, ShiftRegisterWidth};
 pub use chd::ChdTable;
