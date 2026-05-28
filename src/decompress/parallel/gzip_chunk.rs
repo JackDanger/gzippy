@@ -1355,8 +1355,7 @@ fn bootstrap_with_deflate_block(
             // burn 200+ ms in bootstrap, the suspicion is they all hit
             // either `bfinal_hit` or `stop_hint_reached` after running
             // through the entire chunk without arming a clean window —
-            // this arg confirms or falsifies that prior. Plan:
-            // plans/pure-rust-phase1-speedup.md.
+            // this arg confirms or falsifies that prior.
             let handoff_reason = if b.clean_window.is_some() {
                 "clean_window_armed"
             } else if b.bfinal_hit {

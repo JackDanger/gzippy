@@ -325,7 +325,7 @@ guard.
 
 | # | Date | Lever | Result | Cause | Doc |
 |---|------|-------|--------|-------|-----|
-| 1 | May-26 | B2 PRELOAD naive | -10% | Wasted lookups on yield paths | `archive/rust-rapidgzip-2026-05-26.md` |
+| 1 | May-26 | B2 PRELOAD naive | -10% | Wasted lookups on yield paths | git history of this file |
 | 2 | May-26 | 2-unroll FASTLOOP | -10% | I-cache pressure | same |
 | 3 | May-26 | FASTLOOP PRELOAD with cached entry | no change | OoO already overlaps | same |
 | 4 | May-26 | Single-literal fast path | no change | Compiler already branch-predicts | same |
@@ -377,7 +377,7 @@ u8-ring + BMI2 PEXT path (§2.4 + §2.5).
 
 ---
 
-*Plan last updated: 2026-05-28. Pre-update version preserved at
-`plans/archive/rust-rapidgzip-2026-05-26.md`. If you are picking
+*Plan last updated: 2026-05-28. Pre-update versions are in git
+history (`git log -- plans/rust-rapidgzip.md`). If you are picking
 this up cold: read §1 first, then §2.1 for the highest-priority
 lever, then §3+§4 for how to work without re-falsifying.*

@@ -18,11 +18,11 @@ for the contamination explanation). The route sizing (§4) and the
 risk #10 reference (§9) were written against 22pp; they have been
 annotated, not rewritten — most of the architecture stays.
 
-The companion document `plans/unified-decoder-stretch.md` is
-**ignorable for the purpose of this plan**. Items from it that have
-been pulled back into scope are listed in §3; the rest stay out
-because they don't touch the inflate hot path and "infinite labor"
-doesn't change their priority order.
+The "stretch" companion (Creusot proofs, eBPF telemetry, GPU
+backends, etc.) was folded into §3.8-§3.13 here when it was
+load-bearing, then deleted (`plans/unified-decoder-stretch.md`).
+Recover from git history if needed: `git log --diff-filter=D --
+plans/unified-decoder-stretch.md`.
 
 ---
 
@@ -644,13 +644,13 @@ Under literal infinite labor, ~3 months calendar. Under realistic
 
 ---
 
-## 12. Companion document
+## 12. Out-of-scope (was the stretch document; now deleted)
 
-`plans/unified-decoder-stretch.md` is **explicitly ignorable for
-this plan**. Most of its prior content has been pulled into §3 here
-(constant-time, GPU, perfect-hash, sub-crate publish, async API,
-mmap, three-oracle fuzz). What remains stretch-only and OUT of this
-plan: Creusot formal verification (research-grade); hardware
+The "stretch" plan (`plans/unified-decoder-stretch.md`) was deleted;
+recover from git history if needed. Most of its content was pulled
+into §3 here (constant-time, GPU, perfect-hash, sub-crate publish,
+async API, mmap, three-oracle fuzz). What remains explicitly
+out-of-scope: Creusot formal verification (research-grade); hardware
 coprocessor dispatch (QAT not present on target hardware); eBPF
 probes (observability, not perf); forensic recovery API (post-decode
 feature, not inflate hot path); coroutine suspend/resume (parallel-
