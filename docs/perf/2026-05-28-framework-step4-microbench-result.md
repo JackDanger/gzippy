@@ -89,28 +89,108 @@ stat counter at exit. To capture per-variant faults we'd need
 variant. Earlier perf-stat already gave us the absolute counts
 (~168K gzippy vs ~79K rapidgzip).
 
-## D. Implication for production lever
+## D. ADVERSARIAL ADVISOR REVIEW — DOWNGRADED PREDICTION
 
-Both Lever 4.1 (rpmalloc global) and Lever 4.2 (128 KiB chunked
-ChunkData::data) should ship.
+The advisor caught **six substantive overestimation paths** in the
+production extrapolation above. Corrected projection:
 
-Expected production impact, extrapolating microbench delta to e2e:
-- The microbench measures the alloc + write + read of a 12 MiB
-  buffer (gzippy's per-chunk workload).
-- The e2e workload also includes inflate (which we know is ~17%
-  CPU, not the bottleneck) and bookkeeping (~10%).
-- Allocator + chunk-write + chunk-read is the dominant ~70% of CPU
-  per the symbolized perf attribution.
-- 64% microbench wall reduction → ~70% × 64% = ~45% reduction in
-  the dominant component → ~30-35% e2e throughput improvement.
+### D.1 Read pattern is wrong (most damning)
 
-This is well above the corrected 10-12% gap to rapidgzip from the
-n=3 perf-stat. **A successful Lever 4.1 + 4.2 should not just close
-the gap — it should leapfrog rapidgzip** on this single workload.
+Production consumer (`chunk_fetcher.rs:2234-2273`) does
+`writer.write_all(payload)` — one big contiguous memcpy to BufWriter.
+The microbench's `for chunk in buf.chunks(4096) { sum literal bytes
+}` is a **scalar load-and-reduce per byte** that has nothing in
+common with `memcpy(stdout_buf, src, 12MiB)`.
 
-Open question: gzippy's parallel-SM may have additional bookkeeping
-overhead (consumer thread reorder, CRC verification) that rapidgzip
-doesn't, which would damp the e2e win.
+The readON variant's "rpmalloc -54%" gain mostly measures hot-cache
+scalar reduce cost — irrelevant to the production read path.
+
+**readOFF numbers are closer to production-relevant**: -47.9% for
+rpmalloc+manyBoxes vs glibc+singleVec is more honest, but the +84%
+glibc+manyBoxes readOFF win is also irrelevant (it's measuring
+scalar pointer-chase across Box headers vs Vec linear, not memcpy).
+
+### D.2 Write shape is wrong
+
+Real `ChunkData::data` writes via `extend_from_slice(bytes)` where
+`bytes` is hundreds-of-bytes to KiB-sized inflate-output. Marker
+bootstrap (`LocalKey<T>::with` at 21.09% per perf) writes u16 values
+one-at-a-time. My fixed 64KiB+512B extends pre-amortize allocator
+overhead over much larger writes than production.
+
+### D.3 Extrapolation double-counts
+
+My "~70% alloc share" was wrong. Honest decomposition of the
+symbolized perf:
+- memmove + clear_page = 26.4% (touched by allocator change)
+- LocalKey 21.09% bootstrap subtree (PARTIALLY touched — only the
+  alloc inside; the marker decode work isn't)
+- submit_post_process 5.31% (touched)
+- decode_huffman_body + copy_match_windowed = 13.3% **NOT touched**
+
+Realistic allocator-touchable share: **~35-45%, not 70%**.
+
+With production-shape microbench gain probably ~30% (not 64%):
+`0.40 × 0.30 = 12% e2e`. That **exactly matches the 10-12% gap to
+rapidgzip — closing it but NOT leapfrogging**.
+
+### D.4 n=10 mean masks rpmalloc warmup
+
+rpmalloc's TLS cache is empty on iteration 1; iterations 2-10 reuse
+warm regions. Production gzippy spawns workers FRESH per
+`decompress_parallel` invocation — production sees iteration-1 cost,
+not iteration-2-10 cost. The honest stat is per-iter median, not
+n=10 mean.
+
+### D.5 arm64 read-regression may extend to Linux
+
+When stdout is a real sink (write_all triggers kernel-side prefetch
+on the SOURCE buffer), chunked Boxes break that prefetch on Linux
+too. Step 5 must test BOTH `-o /dev/null` AND output-to-real-file.
+
+### D.6 Don't stack with falsified prewarm
+
+The Z-allocator prewarm was falsified at -15%. Ship Lever 4.1
+standalone (or with explicit `GZIPPY_PREWARM_POOL=0`) before any
+combined experiment.
+
+## D'. Corrected expected production impact
+
+| Original claim | Corrected estimate |
+|---------------|--------------------|
+| 30-35% e2e throughput | **~10-15% e2e** |
+| Leapfrog rapidgzip | **Match rapidgzip (close the 10-12% gap)** |
+
+This is still a major win — closes the entire measured gap — but it
+does NOT exceed rapidgzip. The "fastest gzip ever" claim from
+CLAUDE.md still requires either the inflate-inner SIMD work later
+OR a fundamentally different architecture.
+
+## E. Mandatory Step 5 tests (per advisor)
+
+The production A/B harness MUST include:
+
+1. **n=20 with per-iter median** (NOT mean) AND a trial-1-vs-trial-N
+   split to expose rpmalloc warmup amortization.
+2. **Two output sinks**: `-o /dev/null` AND `-o <real_file>`. The
+   real-file path triggers kernel-side prefetch on the source
+   buffer; chunked Boxes might regress here.
+3. **Full perf-stat rollup**: task-clock, page-faults (minor+major
+   separately), L1/LLC/dTLB misses, IPC, cycles, instructions —
+   page-fault delta is the load-bearing signal, not wall.
+4. **Correctness hash** in rollup (CLAUDE.md rule 4) — rpmalloc +
+   chunked alloc interacting with `allocator_api2::vec::Vec` is a
+   real soundness surface.
+5. **Multi-corpus**: silesia AND a low-redundancy file where marker
+   bootstrap (LocalKey<T>::with) dominates. Silesia A/B may not
+   exercise the worst-case allocator path.
+6. **Standalone Lever 4.1 first**: ship rpmalloc-global with
+   `GZIPPY_PREWARM_POOL=0` and confirm it doesn't regress before
+   stacking Lever 4.2.
+
+If Step 5 measures only silesia-to-/dev/null with n=20 median wall,
+we'll get an inflated number that production (file output, mixed
+corpora) won't reproduce.
 
 ## E. Mandatory next step (per advisor build order)
 
