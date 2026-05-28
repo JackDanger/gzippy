@@ -213,11 +213,15 @@ pub fn take_u8(min_capacity: usize) -> U8 {
     }
     TAKE_U8_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     TAKE_U8_MISSES_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let v = types::u8_with_capacity(min_capacity);
-    // Lever L1: hint huge pages on the fresh allocation. Cap is the
-    // useful range — `len()` is 0 at this point.
-    hugepage_hint(v.as_ptr() as *mut u8, v.capacity());
-    v
+    // FALSIFICATION 2026-05-28: L1 (madvise(MADV_HUGEPAGE)) was tried
+    // here for the 13.26% clear_page CPU. neurotic 10-trial A/B:
+    // default median 789 MB/s vs GZIPPY_HUGEPAGE=1 median 487 MB/s
+    // (-38%). khugepaged contention OR madvise call latency
+    // dominated. The `hugepage_hint` fn is left in place but no
+    // caller invokes it; future attempt must use a different shape
+    // (e.g. MADV_COLLAPSE for synchronous merge, OR direct mmap
+    // with MAP_HUGETLB rather than madvise hint).
+    types::u8_with_capacity(min_capacity)
 }
 
 /// Take a `Vec<u16>` from the current worker's pool.
