@@ -199,6 +199,38 @@ impl SlidingWindow {
         let idx = (self.head + WINDOW_SIZE - self.len() + i) % WINDOW_SIZE;
         self.buf[idx]
     }
+
+    /// Bulk-copy `n` bytes starting at logical position `start_logical`
+    /// into `dst[..n]`. Handles the ring-buffer wrap with up to two
+    /// memcpys — LLVM lowers each to `memcpy` (SIMD'd by the libc on
+    /// neurotic). Caller guarantees `start_logical + n <= self.len()`.
+    ///
+    /// Replaces the per-byte `byte_at_logical` loop in
+    /// `copy_match_windowed`'s slow path when the source range is
+    /// entirely within the window (typical case in parallel-SM chunks
+    /// before the first 32 KiB of output is filled).
+    #[inline(always)]
+    pub fn copy_logical_range_into(&self, start_logical: usize, dst: &mut [u8], n: usize) {
+        debug_assert!(
+            start_logical + n <= self.len(),
+            "range [{start_logical}, {}) > window len {}",
+            start_logical + n,
+            self.len()
+        );
+        debug_assert!(dst.len() >= n, "dst too small: {} < {n}", dst.len());
+        if n == 0 {
+            return;
+        }
+        // Logical 0 sits at buf[(head + WINDOW_SIZE - len()) % WINDOW_SIZE].
+        let base = (self.head + WINDOW_SIZE - self.len()) % WINDOW_SIZE;
+        let start_phys = (base + start_logical) % WINDOW_SIZE;
+        let first = n.min(WINDOW_SIZE - start_phys);
+        dst[..first].copy_from_slice(&self.buf[start_phys..start_phys + first]);
+        let rest = n - first;
+        if rest > 0 {
+            dst[first..first + rest].copy_from_slice(&self.buf[..rest]);
+        }
+    }
 }
 
 /// Result of one `read_stream` call. Mirrors
@@ -2196,27 +2228,60 @@ pub fn copy_match_windowed(
         return Ok(new_pos);
     }
 
-    // Slow path: window touch (`dist > out_pos`), insufficient margin, or
-    // yielding mid-copy. Per-byte loop is the safe baseline; correctness
-    // first.
+    // S2 (2026-05-28): split slow-path into three vectorizable phases.
+    // Replaces the per-byte loop with bulk memcpys where safe; falls
+    // back to per-byte only for LZ77-overlap (dist < copy_n) in the
+    // output-to-output phase.
     //
-    // Byte at *logical* history position `(total_history - dist + i)`:
-    //   if pos < window_len: window.byte_at_logical(pos)
-    //   else                : output[pos - window_len]
+    // Logical layout (src_logical = total_history - dist + i):
+    //   Phase 1: i ∈ [0, n_window) where src_logical < window_len
+    //            → bulk read from window (no overlap)
+    //   Phase 2: i ∈ [n_window, copy_n) where src_logical >= window_len
+    //            → read from output[src_logical - window_len]
     //
-    // LZ77 overlap (dist < len) is handled naturally by the per-byte
-    // loop because once we write to `output[out_pos + j]`, a subsequent
-    // read at logical position (window_len + out_pos + j) sees the
-    // just-written byte via the `output` branch.
+    // n_window = min(copy_n, window_len - start_logical) if
+    // start_logical < window_len, else 0. Bytes after that are
+    // output-to-output reads.
     let start_logical = total_history - dist;
-    for i in 0..copy_n {
-        let src_logical = start_logical + i;
-        let byte = if src_logical < window_len {
-            state.window.byte_at_logical(src_logical)
+    let n_window = if start_logical < window_len {
+        copy_n.min(window_len - start_logical)
+    } else {
+        0
+    };
+
+    // Phase 1: bulk window read into output[out_pos..out_pos+n_window].
+    // Source is entirely within the window — no overlap. LLVM lowers
+    // copy_from_slice to memcpy, which the libc SIMD-vectorizes.
+    if n_window > 0 {
+        state.window.copy_logical_range_into(
+            start_logical,
+            &mut output[out_pos..out_pos + n_window],
+            n_window,
+        );
+    }
+
+    // Phase 2: output-to-output copy for the remaining bytes. Source
+    // starts at output[src_logical - window_len] = output[out_pos -
+    // dist + n_window]. Destination starts at output[out_pos +
+    // n_window]. The gap between source and destination is exactly
+    // `dist`. If `dist >= copy_n - n_window` (no LZ77 overlap), use
+    // copy_within (bulk memmove). Else per-byte for LZ77 semantics.
+    let n_output = copy_n - n_window;
+    if n_output > 0 {
+        let src_start = out_pos.wrapping_sub(dist).wrapping_add(n_window);
+        let dst_start = out_pos + n_window;
+        debug_assert!(start_logical + n_window >= window_len);
+        debug_assert_eq!(start_logical + n_window - window_len, src_start);
+        if dist >= n_output {
+            // No overlap between source and destination: memmove is safe.
+            output.copy_within(src_start..src_start + n_output, dst_start);
         } else {
-            output[src_logical - window_len]
-        };
-        output[out_pos + i] = byte;
+            // LZ77 overlap (dist < n_output): each subsequent read sees
+            // a just-written byte. Per-byte loop preserves semantics.
+            for i in 0..n_output {
+                output[dst_start + i] = output[src_start + i];
+            }
+        }
     }
 
     if copy_n < len {
