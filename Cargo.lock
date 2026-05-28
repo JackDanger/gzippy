@@ -596,6 +596,8 @@ dependencies = [
 name = "gzippy-inflate"
 version = "0.1.0"
 dependencies = [
+ "dynasm",
+ "dynasmrt",
  "futures",
  "libdeflater",
  "tokio",

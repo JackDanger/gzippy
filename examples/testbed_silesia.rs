@@ -30,6 +30,8 @@ use std::fs;
 use std::process::ExitCode;
 
 use gzippy::decompress::block_walker::{walk_block_boundaries, BlockMeta};
+#[cfg(all(target_arch = "x86_64", feature = "route-c-dynasm"))]
+use gzippy_inflate::route_c_dynamic::decode_dynamic_block_hybrid_with_window;
 use gzippy_inflate::route_c_dynamic::{
     decode_dynamic_block_layered_with_window, parse_dynamic_header, BitReader, LayeredLut, LutRole,
 };
@@ -95,6 +97,21 @@ fn main() -> ExitCode {
     // allocator churn per silesia run.
     let mut lut_ll = LayeredLut::default();
     let mut lut_d = LayeredLut::default();
+
+    // GZIPPY_TESTBED_DECODER=hybrid → use v3.7 asm+Rust hybrid.
+    // Default = pure-Rust reference (decode_dynamic_block_layered_with_window).
+    let use_hybrid = std::env::var("GZIPPY_TESTBED_DECODER")
+        .map(|v| v == "hybrid")
+        .unwrap_or(false);
+    eprintln!(
+        "Decoder: {}",
+        if use_hybrid {
+            "v3.7 asm+Rust hybrid"
+        } else {
+            "pure-Rust reference"
+        }
+    );
+
     let report = run_testbed(
         &cases,
         deflate_body,
@@ -153,6 +170,29 @@ fn main() -> ExitCode {
                     let (after_hdr, ll, dl) = parse_dynamic_header(deflate, after_header)?;
                     lut_ll.build_into_with_role(&ll, LutRole::Litlen);
                     lut_d.build_into_with_role(&dl, LutRole::Dist);
+                    #[cfg(all(target_arch = "x86_64", feature = "route-c-dynasm"))]
+                    let (end_bit, bytes) = if use_hybrid {
+                        decode_dynamic_block_hybrid_with_window(
+                            deflate,
+                            after_hdr,
+                            &lut_ll,
+                            &lut_d,
+                            &mut out_buf,
+                            0,
+                            window,
+                        )?
+                    } else {
+                        decode_dynamic_block_layered_with_window(
+                            deflate,
+                            after_hdr,
+                            &lut_ll,
+                            &lut_d,
+                            &mut out_buf,
+                            0,
+                            window,
+                        )?
+                    };
+                    #[cfg(not(all(target_arch = "x86_64", feature = "route-c-dynasm")))]
                     let (end_bit, bytes) = decode_dynamic_block_layered_with_window(
                         deflate,
                         after_hdr,
