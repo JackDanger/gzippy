@@ -1336,22 +1336,11 @@ mod tests {
         }
     }
 
-    /// v3.6: hybrid asm+Rust decoder round-trips against libdeflater.
-    ///
-    /// CURRENTLY #[ignore]'d — surfaces a known refill correctness bug
-    /// in route_c_v3_asm.rs:
-    /// the v3.4 refill always loads 8 bytes and shifts by `bitsleft`,
-    /// which TRUNCATES the top `bitsleft` bits of input. Literal-only
-    /// LUT tests didn't catch it because every lookup hit the same
-    /// entry regardless of bits. Real-data lookups (where bits matter)
-    /// fail with "invalid distance N" once the truncation drops real
-    /// Huffman code bits.
-    ///
-    /// v3.7 fixes refill: only refill when `bitsleft < 8` AND advance
-    /// `byte_pos` by `(64 - bitsleft) / 8` rounded down.
+    /// v3.6+v3.7: hybrid asm+Rust decoder round-trips against
+    /// libdeflater. v3.7's byte-by-byte refill replaces the v3.4
+    /// 8-byte-load refill that truncated bits when bitsleft > 0.
     #[cfg(all(target_arch = "x86_64", feature = "route-c-dynasm"))]
     #[test]
-    #[ignore = "v3.4 refill truncates input bits; fixed in v3.7"]
     fn hybrid_decoder_round_trip() {
         use libdeflater::{CompressionLvl, Compressor};
         let payload: Vec<u8> = (0..20000u32)
