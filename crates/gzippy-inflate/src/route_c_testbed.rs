@@ -29,6 +29,57 @@ use std::vec::Vec;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+/// CPU-capability requirements a decoder declares for itself. Tests
+/// auto-skip when the host doesn't satisfy `requires`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArchCaps {
+    pub requires_bmi2: bool,
+    pub requires_avx2: bool,
+    pub requires_avx512: bool,
+    pub requires_neon: bool,
+}
+
+impl ArchCaps {
+    /// Is the current process host's CPU compatible with this cap set?
+    pub fn host_supports(&self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.requires_bmi2 && !std::is_x86_feature_detected!("bmi2") {
+                return false;
+            }
+            if self.requires_avx2 && !std::is_x86_feature_detected!("avx2") {
+                return false;
+            }
+            if self.requires_avx512 && !std::is_x86_feature_detected!("avx512f") {
+                return false;
+            }
+            if self.requires_neon {
+                return false; // can't have NEON on x86_64
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if self.requires_bmi2 || self.requires_avx2 || self.requires_avx512 {
+                return false; // no x86_64 features on aarch64
+            }
+            if self.requires_neon && !std::arch::is_aarch64_feature_detected!("neon") {
+                return false;
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            if self.requires_bmi2
+                || self.requires_avx2
+                || self.requires_avx512
+                || self.requires_neon
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// One block extracted from a corpus.
 #[derive(Debug, Clone)]
 pub struct TestCase {
@@ -175,6 +226,32 @@ pub use corpus::extract_cases;
 /// fingerprint, expected_output_capacity) and returns the produced
 /// bytes + end_bit. Failures are appended to the report with
 /// first-diff-byte location.
+///
+/// `caps` declares what CPU features the decoder requires. If the
+/// host doesn't support them, `run_testbed` returns an empty report
+/// without invoking the decoder (the Cargo target may be a CI runner
+/// without AVX-512, etc).
+#[cfg(feature = "std")]
+pub fn run_testbed_with_caps<F>(
+    cases: &[TestCase],
+    deflate_body: &[u8],
+    caps: ArchCaps,
+    decoder: F,
+) -> TestbedReport
+where
+    F: FnMut(&[u8], u64, u8, Option<u64>, usize) -> std::io::Result<(u64, Vec<u8>)>,
+{
+    if !caps.host_supports() {
+        return TestbedReport {
+            total_cases: 0,
+            ..Default::default()
+        };
+    }
+    run_testbed(cases, deflate_body, decoder)
+}
+
+/// Run a candidate decoder against a slice of test cases. No cap
+/// gating (assumes the decoder is portable scalar).
 #[cfg(feature = "std")]
 pub fn run_testbed<F>(cases: &[TestCase], deflate_body: &[u8], mut decoder: F) -> TestbedReport
 where
@@ -306,5 +383,66 @@ mod tests {
     fn pass_rate_zero_total_is_zero() {
         let r = TestbedReport::default();
         assert_eq!(r.pass_rate(), 0.0);
+    }
+
+    /// On every supported host, `ArchCaps::default()` (no requirements)
+    /// passes `host_supports`.
+    #[test]
+    fn arch_caps_default_supports_any_host() {
+        assert!(ArchCaps::default().host_supports());
+    }
+
+    /// AVX-512 requirement should fail on a typical Mac arm64 dev box
+    /// but pass on a host that actually has AVX-512.
+    #[test]
+    fn arch_caps_avx512_gating_matches_host() {
+        let caps = ArchCaps {
+            requires_avx512: true,
+            ..Default::default()
+        };
+        #[cfg(target_arch = "aarch64")]
+        assert!(!caps.host_supports(), "aarch64 can't have AVX-512");
+        #[cfg(target_arch = "x86_64")]
+        {
+            let expected = std::is_x86_feature_detected!("avx512f");
+            assert_eq!(caps.host_supports(), expected);
+        }
+    }
+
+    /// `run_testbed_with_caps` skips the decoder when caps unmet.
+    #[test]
+    fn run_testbed_skips_on_unsupported_caps() {
+        let cases = vec![TestCase {
+            block_index: 0,
+            start_bit_in_deflate: 0,
+            end_bit_in_deflate: 8,
+            btype: 2,
+            fingerprint: None,
+            expected_output: vec![1, 2, 3],
+        }];
+        // Use a caps set we know fails on every host (NEON on x86_64
+        // or BMI2 on aarch64 — pick whichever is foreign).
+        #[cfg(target_arch = "aarch64")]
+        let caps = ArchCaps {
+            requires_bmi2: true,
+            ..Default::default()
+        };
+        #[cfg(target_arch = "x86_64")]
+        let caps = ArchCaps {
+            requires_neon: true,
+            ..Default::default()
+        };
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let caps = ArchCaps {
+            requires_avx2: true,
+            ..Default::default()
+        };
+        let mut called = false;
+        let report = run_testbed_with_caps(&cases, b"", caps, |_, _, _, _, _| {
+            called = true;
+            Ok((0, vec![]))
+        });
+        assert!(!called, "decoder should not have been called");
+        assert_eq!(report.total_cases, 0);
     }
 }
