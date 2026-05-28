@@ -110,20 +110,17 @@ for FIXTURE in "${FIXTURES[@]}"; do
             BIN="$OUT_DIR/gzippy-$VARIANT"
             for SINK in devnull file; do
                 OUTFILE=$([[ "$SINK" == "devnull" ]] && echo "/dev/null" || echo "/tmp/sink.bin")
-                # Use /usr/bin/time -v to capture page-faults reliably + wall
-                # Important: group-redirect so command stdout goes to $OUTFILE
-                # but /usr/bin/time -v's stderr goes to STATS.
-                STATS=$({ /usr/bin/time -v env GZIPPY_PREWARM_POOL=0 "$BIN" -d -c -p 16 "$FIXTURE" > "$OUTFILE"; } 2>&1)
-                WALL=$(echo "$STATS" | grep "Elapsed (wall clock)" | awk -F': ' '{print $NF}')
-                # Convert h:mm:ss.ss or m:ss.ss to seconds
-                WALL_S=$(echo "$WALL" | awk -F: '{
-                    if (NF==3) { print ($1*3600)+($2*60)+$3 }
-                    else if (NF==2) { print ($1*60)+$2 }
-                    else { print $1 }
-                }')
-                WALL_MS=$(echo "$WALL_S * 1000" | bc -l)
-                MINFLT=$(echo "$STATS" | grep "Minor.*page faults" | awk -F': ' '{print $NF}' | tr -d ' ')
-                MAJFLT=$(echo "$STATS" | grep "Major.*page faults" | awk -F': ' '{print $NF}' | tr -d ' ')
+                # bash builtin `time` (perl /usr/bin/time not on neurotic).
+                # Use perf-stat for page-fault counts (separate run; cheap on
+                # silesia at ~5-10s per trial under load).
+                TIME_OUT=$({ time GZIPPY_PREWARM_POOL=0 "$BIN" -d -c -p 16 "$FIXTURE" > "$OUTFILE"; } 2>&1)
+                WALL_S=$(echo "$TIME_OUT" | awk '/^real/{ gsub(/[ms]/, " ", $2); split($2, a, " "); print a[1]*60 + a[2] }')
+                WALL_MS=$(awk -v ws="$WALL_S" 'BEGIN { print ws*1000 }')
+                # Capture page-faults via perf-stat (single short event group)
+                PF_OUT=$({ perf stat -e page-faults,minor-faults,major-faults GZIPPY_PREWARM_POOL=0 "$BIN" -d -c -p 16 "$FIXTURE" > "$OUTFILE"; } 2>&1)
+                MINFLT=$(echo "$PF_OUT" | grep -E "minor-faults" | awk '{print $1}' | tr -d ',')
+                MAJFLT=$(echo "$PF_OUT" | grep -E "major-faults" | awk '{print $1}' | tr -d ',')
+                MINFLT=${MINFLT:-0}; MAJFLT=${MAJFLT:-0}
                 echo -e "${trial}\t${VARIANT}\t${FNAME}\t${SINK}\t${WALL_MS}\t-\t-\t${MINFLT}\t${MAJFLT}" >> "$OUT_DIR/rollup.tsv"
                 printf "%2d %-8s %-10s %s wall=%.0fms minflt=%s majflt=%s\n" "$trial" "$VARIANT" "$SINK" "$FNAME" "$WALL_MS" "$MINFLT" "$MAJFLT"
             done
