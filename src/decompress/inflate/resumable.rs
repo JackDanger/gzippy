@@ -1431,11 +1431,30 @@ fn decode_huffman_body_resumable(
 
         if in_pos < in_fl_end && out_pos < out_fl_end {
             BODY_RESUMABLE_FASTLOOP_ENTERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            while in_pos < in_fl_end && out_pos < out_fl_end {
+            // Lever C (advisor 2026-05-28): replace per-iter
+            // bound-check with iter-count batch. The inner while
+            // checked `in_pos < in_fl_end && out_pos < out_fl_end` on
+            // every iteration; we instead compute a conservative
+            // safe-iter count from current bounds and per-iter worst-
+            // case consume/write, then run that many iterations with
+            // no bound check, falling back to the outer loop for the
+            // next batch.
+            //
+            // Per-iter bounds (worst case):
+            //   - input bytes consumed: ≤ 8 (one 8-byte refill)
+            //   - output bytes written: ≤ 261 (max match 258 + 3 literals)
+            //
+            // Conservative safe_iters guarantees we never overshoot
+            // in_fl_end or out_fl_end inside the unchecked batch.
+            const MAX_IN_BYTES_PER_ITER: usize = 8;
+            const MAX_OUT_BYTES_PER_ITER: usize = 261;
+            let safe_iters_in = (in_fl_end - in_pos) / MAX_IN_BYTES_PER_ITER;
+            let safe_iters_out = (out_fl_end - out_pos) / MAX_OUT_BYTES_PER_ITER;
+            let safe_iters = safe_iters_in.min(safe_iters_out);
+            for _ in 0..safe_iters {
                 decode_one_symbol!();
             }
-            // Fastloop exited because bounds broke. Re-evaluate yield
-            // conditions at the safe-loop top.
+            // After safe_iters batch, re-evaluate at outer loop top.
             continue;
         }
 
