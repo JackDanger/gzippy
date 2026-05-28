@@ -338,27 +338,26 @@ impl ChunkData {
     /// 32 KiB, this always returns Some.
     pub fn last_32kib_window(&self) -> Option<[u8; 32768]> {
         const W: usize = 32768;
-        // A1 invariant: `last_32kib_window` reads `self.data` raw and
-        // would return the predecessor's window image verbatim if a
-        // pre-fill is still in place. Caller must `trim_window_prefix`
-        // before requesting the tail window.
-        debug_assert_eq!(
-            self.data_prefix_len, 0,
-            "trim_window_prefix before last_32kib_window"
-        );
         let total = self.decoded_size();
         if total == 0 {
             return None;
         }
+        // A4: the decoded portion of `self.data` is
+        // `self.data[self.data_prefix_len..]`. The prefix region (if
+        // any) is the predecessor's window image, NOT this chunk's
+        // decoded output — so we must skip it when sourcing tail-window
+        // bytes. Marker-bootstrap chunks have prefix == 0 and the
+        // existing logic falls out unchanged.
+        let decoded_data_len = self.data.len() - self.data_prefix_len;
         let mut out = [0u8; W];
-        if self.data.len() >= W {
+        if decoded_data_len >= W {
             out.copy_from_slice(&self.data[self.data.len() - W..]);
             Some(out)
         } else if total >= W {
             // Tail straddles markers + clean. Markers in the trailing
             // W bytes mean we can't build a clean window without
             // apply_window resolving them first; caller has to wait.
-            let from_data = self.data.len();
+            let from_data = decoded_data_len;
             let from_markers = W - from_data;
             let m_start = self.data_with_markers.len() - from_markers;
             for v in &self.data_with_markers[m_start..] {
@@ -369,7 +368,7 @@ impl ChunkData {
             for (i, v) in self.data_with_markers[m_start..].iter().enumerate() {
                 out[i] = *v as u8;
             }
-            out[from_markers..].copy_from_slice(&self.data);
+            out[from_markers..].copy_from_slice(&self.data[self.data_prefix_len..]);
             Some(out)
         } else {
             // Less than W bytes total. We don't try to combine with the
@@ -955,27 +954,27 @@ impl ChunkData {
             "get_last_window requires a full 32 KiB predecessor window \
              (vendor DecodedData.hpp:402: `DecodedVector window( MAX_WINDOW_SIZE )`)"
         );
-        // A1 invariant: reads `self.data` raw to extract the tail
-        // window. A still-present window-image prefix would shift the
-        // tail's true position and return wrong bytes. Trim first.
-        debug_assert_eq!(
-            self.data_prefix_len, 0,
-            "trim_window_prefix before get_last_window"
-        );
+        // A4: the decoded portion of `self.data` starts at
+        // `self.data_prefix_len`. For window arithmetic we operate on
+        // a `decoded_data` view that excludes the window-image prefix.
+        // The vendor algorithm sees a logical
+        // `(predecessor_window | dataWithMarkers | decoded_data)` view;
+        // the prefix is not part of any of those segments.
 
         // Direct port of `getWindowAt(previousWindow, skipBytes = size())`
         // (vendor/.../DecodedData.hpp:401-490). We want the last W bytes
-        // of the concatenated view (predecessor_window | dataWithMarkers | data),
+        // of the concatenated view (predecessor_window | dataWithMarkers | decoded_data),
         // so `skip_bytes == decoded_size()`. The vendor's two-arm copy
         // (prefilled-from-previousWindow then copyFromDataWithMarkers
         // then data) collapses for `skip_bytes == size()` into:
         //   - if decoded_size < W: take the trailing (W - decoded_size)
         //     bytes of predecessor_window into the head of the window,
-        //     then ALL of dataWithMarkers (mapped) and data into the tail.
-        //   - else: take only the last W bytes of (dataWithMarkers | data),
+        //     then ALL of dataWithMarkers (mapped) and decoded_data into the tail.
+        //   - else: take only the last W bytes of (dataWithMarkers | decoded_data),
         //     mapping any marker we land on through MapMarkers.
         let dwm_len = self.data_with_markers.len();
-        let data_len = self.data.len();
+        let data_len = self.data.len() - self.data_prefix_len;
+        let decoded_data: &[u8] = &self.data[self.data_prefix_len..];
         let total = dwm_len + data_len;
 
         let mut window = [0u8; W];
@@ -1021,11 +1020,12 @@ impl ChunkData {
                 offset -= dwm_len;
             }
 
-            // Segment 2: from data (already clean bytes).
+            // Segment 2: from decoded_data (already clean bytes).
             // Vendor DecodedData.hpp:471-485.
             if written < W && offset < data_len {
                 let take = (data_len - offset).min(W - written);
-                window[written..written + take].copy_from_slice(&self.data[offset..offset + take]);
+                window[written..written + take]
+                    .copy_from_slice(&decoded_data[offset..offset + take]);
                 written += take;
             }
             debug_assert_eq!(written, W, "get_last_window underran the tail buffer");
@@ -1045,8 +1045,8 @@ impl ChunkData {
                 };
                 written += 1;
             }
-            // Then ALL of data.
-            window[written..written + data_len].copy_from_slice(&self.data);
+            // Then ALL of decoded_data.
+            window[written..written + data_len].copy_from_slice(decoded_data);
         }
 
         window
@@ -1075,13 +1075,11 @@ impl ChunkData {
     pub fn populate_subchunk_windows(&mut self, predecessor_window: &[u8], dwm_bytes: &[u8]) {
         const W: usize = 32768;
         debug_assert_eq!(predecessor_window.len(), W);
-        // A1 invariant: reads `self.data` raw to source window bytes
-        // for each subchunk. A still-present window-image prefix
-        // would shift every per-subchunk window. Trim first.
-        debug_assert_eq!(
-            self.data_prefix_len, 0,
-            "trim_window_prefix before populate_subchunk_windows"
-        );
+        // A4: source bytes come from `self.data[self.data_prefix_len..]`
+        // (the decoded portion); the prefix region is the predecessor's
+        // window image and is NOT part of this chunk's output.
+        let decoded_data: &[u8] = &self.data[self.data_prefix_len..];
+        let decoded_data_len = decoded_data.len();
 
         let dwm_len = dwm_bytes.len();
 
@@ -1129,14 +1127,14 @@ impl ChunkData {
                 }
             }
 
-            // Segment 3: bytes from `data`.
+            // Segment 3: bytes from `decoded_data` (A4: prefix-skipped).
             if written < W {
                 let abs = needed_start + written;
                 let data_offset = abs.saturating_sub(W + dwm_len);
-                if data_offset < self.data.len() {
-                    let take = (self.data.len() - data_offset).min(W - written);
+                if data_offset < decoded_data_len {
+                    let take = (decoded_data_len - data_offset).min(W - written);
                     window[written..written + take]
-                        .copy_from_slice(&self.data[data_offset..data_offset + take]);
+                        .copy_from_slice(&decoded_data[data_offset..data_offset + take]);
                     written += take;
                 }
             }
@@ -1207,14 +1205,12 @@ impl ChunkData {
     /// to re-use the predecessor chunk and `set_encoded_offset` to
     /// zero out `encoded_size_bits` → premature EOF break.
     pub fn finalize(&mut self, end_encoded_offset_bits: usize) {
-        // A1 invariant: finalize is the chunk's "ready for consumer"
-        // signal. Any window-image prefix must have been trimmed by
-        // now or downstream (get_last_window, populate_subchunk_windows,
-        // apply_window) will see the wrong bytes.
-        debug_assert_eq!(
-            self.data_prefix_len, 0,
-            "trim_window_prefix before finalize"
-        );
+        // A4: a window-image prefix is allowed to remain in self.data
+        // through finalize and into the consumer. Downstream methods
+        // (`get_last_window`, `populate_subchunk_windows`,
+        // `last_32kib_window`) handle `data_prefix_len > 0` via
+        // explicit prefix-skipping, and the consumer write site reads
+        // `&chunk.data[chunk.data_prefix_len..]`.
         debug_assert!(end_encoded_offset_bits >= self.encoded_offset_bits);
         self.encoded_size_bits = end_encoded_offset_bits - self.encoded_offset_bits;
         if let Some(last) = self.subchunks.last_mut() {
@@ -1320,18 +1316,10 @@ impl ChunkData {
 /// is a `static Mutex<Vec<...>>`.
 impl Drop for ChunkData {
     fn drop(&mut self) {
-        // A1 invariant: a chunk should never be dropped with an
-        // un-trimmed window-image prefix. The pool reuse path clears
-        // length but not the underlying allocation, so a leaked
-        // prefix would be silently absorbed by the next take. Trip
-        // the assert in debug to surface the leak (per A1-review
-        // follow-up). NOT a panic in release — the pool reuse is
-        // safe-but-wrong, and we don't want a debug-only safety net
-        // to abort on a drop-during-unwind path.
-        debug_assert_eq!(
-            self.data_prefix_len, 0,
-            "ChunkData dropped with un-trimmed window-image prefix"
-        );
+        // A4: a window-image prefix is allowed to persist through the
+        // chunk's lifetime; the consumer skipped over it on write and
+        // the pool's `take_u8` clears the Vec length, so the bytes
+        // are reused as uninitialized capacity by the next chunk.
         use crate::decompress::parallel::chunk_buffer_pool;
         let data = std::mem::replace(&mut self.data, types::u8_empty());
         let dwm = std::mem::replace(&mut self.data_with_markers, types::u16_empty());
