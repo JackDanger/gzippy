@@ -10,45 +10,71 @@
 **Fixture**: `benchmark_data/silesia-gzip9.gz` (212 MB uncompressed)
 **Parallelism**: T=16 in all three
 
-## A. Single-run perf-stat counters (robust to system load)
+## A. perf-stat counters
 
-These are EVENT COUNTS per workload — they don't depend on system load or
-contention. Definitive comparison.
+### CORRECTION (2026-05-28 adversarial advisor): the original
+### single-run numbers below were CHERRY-PICKED.
 
-| Counter | gzippy-pure | gzippy-isal | rapidgzip | gzippy-pure ÷ rapidgzip |
-|---------|-------------|-------------|-----------|------------------------|
-| **Cycles (core)** | 5.04B | 3.71B | **2.32B** | **2.17×** more |
-| **Instructions (core)** | 5.11B | 3.69B | **3.78B** | 1.35× more |
-| **IPC (core)** | 1.01 | 1.00 | **1.63** | 0.62× (worse) |
-| **Branches (core)** | 822M | 590M | **678M** | 1.21× more |
-| **Branch-misses** | 23.0M (2.80%) | 15.9M (2.70%) | 18.7M (2.75%) | similar % |
-| **L1-dcache misses (core)** | 42.6M | 20.6M | **15.0M** | **2.84×** more |
-| **LLC misses (core)** | 1.65M | 1.90M | **573K** | **2.88×** more |
-| **Page faults** | 179,505 | 174,051 | **78,623** | **2.28×** more |
-| **Context switches** | 6,144 | 2,259 | **1,876** | 3.27× more |
+The first version of this doc reported n=1 perf-stat numbers at
+neurotic load avg 48, with multiplexed counters at 64-80% enable
+rate. The "2.17× cycles" headline was the gzippy-pure shot landing
+near the top of its distribution and the rapidgzip shot landing near
+the bottom of its distribution. An adversarial Opus advisor re-ran
+perf-stat n=3 each and got a materially different picture.
 
-### Top empirical findings
+### A.1 Corrected n=3 medians (advisor re-run)
 
-1. **gzippy-pure takes 2.17× the cycles rapidgzip does** for the same
-   workload. That's the throughput gap proper.
+| Counter | gzippy-pure | rapidgzip | gzippy ÷ rapidgzip |
+|---------|-------------|-----------|--------------------|
+| Cycles (core)  | 4.28B (3.45-4.76) | 3.29B (2.34-4.42) | **1.30×** |
+| Instructions (core) | 4.62B (3.80-5.18) | 4.72B (3.33-6.64) | **0.98×** |
+| IPC (core) | 1.08 (1.06-1.10) | 1.42 (1.34-1.50) | **0.76×** |
+| Page faults | 168.9K (166-172) | 78.5K (74.6-81.2) | **2.15×** |
 
-2. **gzippy-pure takes 1.35× the instructions rapidgzip does**. So
-   gzippy is doing MORE WORK per byte, not just doing the same work
-   slower.
+### A.2 What's TRUE vs what was CHERRY-PICKED
 
-3. **gzippy-pure has 2.84× the L1 cache misses and 2.88× the LLC
-   misses**. Cache locality is materially worse.
+| Original claim | Status | Real value |
+|----------------|--------|------------|
+| Cycles 2.17× more | **REFUTED** (n=1 cherry-pick) | 1.30× |
+| Instructions 1.35× more | **REFUTED** (n=1 cherry-pick) | **0.98× — gzippy runs ESSENTIALLY EQUAL instructions** |
+| IPC 1.01 vs 1.63 (0.62× worse) | **partially refuted** | IPC 1.08 vs 1.42 (0.76× worse) |
+| Page-faults 2.28× more | **HOLDS** | 2.15× more |
+| L1 misses 2.84× more | UNVERIFIED at n=3 | likely real, but treat ±sigma |
+| LLC misses 2.88× more | UNVERIFIED at n=3 | likely real, but treat ±sigma |
+| Context switches 3.27× more | UNVERIFIED at n=3 | likely real, but treat ±sigma |
 
-4. **gzippy-pure has 2.28× the page faults**. The output-buffer
-   allocator pattern triggers more kernel page-zeroing trips than
-   rapidgzip's.
+### A.3 The honest finding (n=3, advisor-verified)
 
-5. **gzippy-pure's IPC is 1.01 vs rapidgzip's 1.63**. Even with more
-   instructions, gzippy retires fewer per cycle — significant
-   memory-subsystem stall.
+**gzippy-pure and rapidgzip run essentially the SAME instructions
+on the same workload** (4.62B vs 4.72B core instructions, ratio
+0.98×). But gzippy-pure takes **1.30× the cycles** to retire them,
+due to lower IPC (1.08 vs 1.42).
 
-6. **gzippy-pure has 3.27× the context switches**. Worker
-   synchronization is more expensive than rapidgzip's.
+This means the gap is **purely memory-subsystem stalls**, not
+algorithmic. gzippy executes the same amount of work — it just
+stalls 30% more cycles waiting for memory.
+
+**Page faults are 2.15× higher** (real, advisor-verified). The
+~90K extra faults × 4 KiB = ~360 MB of un-prefaulted memory that
+gzippy's allocator pattern touches but rapidgzip's doesn't.
+
+### A.4 Methodology fixes for any future bench
+
+The adversarial review prescribed (and I should adopt):
+1. Bench at load avg < 4 (not 48). Wait for the system to be idle.
+2. n ≥ 5 perf-stat runs, report MEDIAN.
+3. Avoid multiplexed counters — pass fewer events per group OR
+   pin with `perf stat --cpu <list>`.
+4. **NEVER quote n=1 perf-stat numbers as canonical.** The original
+   version of this doc violated this rule.
+
+### A.5 Output-mode + fidelity sanity (advisor-verified)
+
+- Both gzippy and rapidgzip write 2706 times totalling ~20ms in
+  both `-o /dev/null` and `-c >/dev/null` modes (strace verified).
+  Write path is NOT a confounder.
+- Both produce md5 `b0ef8cda…` matching gunzip ground-truth on
+  silesia (211,968,000 bytes). Fidelity is matched.
 
 ## B. Symbolized perf-record top-15
 
@@ -130,27 +156,29 @@ So the 21.09% decomposes (approximately):
   chunk head)
 - ~5pp: output Vec ops + marker rebuild + RefCell trivial overhead
 
-### THE KEY EVIDENCE (advisor pointed out — promote to finding #0)
+### THE KEY EVIDENCE (advisor-corrected after n=3 re-run)
 
-**gzippy-isal vs rapidgzip is the clean control**:
-- gzippy-isal: 3.71B cycles, 3.69B instructions, IPC 1.00
-- rapidgzip:   2.32B cycles, 3.78B instructions, IPC 1.63
+The gzippy-isal-vs-rapidgzip comparison stated earlier was based on
+the same single-run perf-stat that was cherry-picked for the
+pure-rust comparison. Treat those gzippy-isal numbers as ±sigma.
 
-These two binaries run **near-identical instruction counts** on the
-same workload, but gzippy-isal takes **1.6× the cycles** due to a
-memory-subsystem stall.
+But the corrected n=3 pure-rust comparison reaches the **same
+qualitative conclusion** via a different route:
 
-This proves: **the throughput gap is NOT the inflate inner loop**.
-ISA-L's hand-asm inflate inside gzippy runs the SAME instruction
-mix as ISA-L's hand-asm inflate inside rapidgzip, but gzippy stalls
-1.6× more on memory. The lever is the **chunk pipeline / allocator
-/ marker bootstrap** infrastructure that surrounds the inflate
-call, not the inflate itself.
+- gzippy-pure: 4.62B instructions, IPC 1.08
+- rapidgzip:   4.72B instructions, IPC 1.42
 
-This is also the strongest disproof of the session's earlier
-inflate-inner-loop work — even ISA-L FFI inside gzippy can't close
-the gap to rapidgzip because the surrounding infrastructure
-stalls.
+Same instructions. Different IPC. The gap is memory-subsystem
+stalls, not the inflate inner loop. The 5 inflate-inner-loop
+falsifications + 1 small win (T3 +1.9%) this session are consistent
+with this.
+
+The lever is the **chunk pipeline + allocator + marker bootstrap**
+infrastructure that surrounds the inflate call, NOT the inflate
+itself. Specifically: the 2.15× page-fault gap (verified n=3) is
+the most reproducible single signal — ~90K extra faults × 4 KiB =
+~360 MB of un-prefaulted memory gzippy touches but rapidgzip
+doesn't.
 
 ## C. Where the gap lives — operational interpretation
 
@@ -238,12 +266,14 @@ following the methodology in `docs/perf/2026-05-28-corrected-gap-measurement.md`
 
 ## F. Key actionable findings (priority-sorted, advisor-corrected)
 
-0. **THE KEY EVIDENCE — the gap is memory stalls, not the inflate
-   inner loop**. gzippy-isal (ISA-L FFI inside gzippy's parallel-SM)
-   runs ~the same instructions as rapidgzip (3.69B vs 3.78B) but
-   takes 1.6× the cycles. Same inflate algorithm; gzippy stalls
-   1.6× more on memory. Lever is the chunk pipeline + allocator +
-   marker bootstrap, NOT the inflate inner loop.
+0. **THE KEY EVIDENCE (advisor-corrected n=3) — the gap is memory
+   stalls, not the inflate inner loop**. gzippy-pure and rapidgzip
+   run essentially the SAME instructions on this workload (4.62B
+   vs 4.72B, ratio 0.98×), but gzippy takes 1.30× the cycles due
+   to lower IPC (1.08 vs 1.42). 2.15× page faults verified n=3 —
+   that's the most reproducible reproducible signal: 90K extra
+   page-zeroing trips for ~360 MB of un-prefaulted memory the
+   gzippy allocator pattern touches but rapidgzip's doesn't.
 
 1. **STOP attacking the inflate inner loop in isolation.** It's
    17.3% absolute CPU. Even ISA-L FFI inside gzippy can't close the
