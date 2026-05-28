@@ -31,7 +31,7 @@ use std::process::ExitCode;
 
 use gzippy::decompress::block_walker::{walk_block_boundaries, BlockMeta};
 use gzippy_inflate::route_c_dynamic::{
-    build_canonical_lut, decode_dynamic_block_rust_with_window, parse_dynamic_header, BitReader,
+    build_layered_lut, decode_dynamic_block_layered_with_window, parse_dynamic_header, BitReader,
 };
 use gzippy_inflate::route_c_testbed::{extract_cases, run_testbed, BlockSummary};
 
@@ -131,9 +131,9 @@ fn main() -> ExitCode {
                         *e = 8;
                     }
                     let dl = [5u8; 32];
-                    let lut_ll = build_canonical_lut(&ll, 15);
-                    let lut_d = build_canonical_lut(&dl, 15);
-                    let (end_bit, bytes) = decode_dynamic_block_rust_with_window(
+                    let lut_ll = build_layered_lut(&ll);
+                    let lut_d = build_layered_lut(&dl);
+                    let (end_bit, bytes) = decode_dynamic_block_layered_with_window(
                         deflate,
                         after_header,
                         &lut_ll,
@@ -147,9 +147,9 @@ fn main() -> ExitCode {
                 }
                 2 => {
                     let (after_hdr, ll, dl) = parse_dynamic_header(deflate, after_header)?;
-                    let lut_ll = build_canonical_lut(&ll, 15);
-                    let lut_d = build_canonical_lut(&dl, 15);
-                    let (end_bit, bytes) = decode_dynamic_block_rust_with_window(
+                    let lut_ll = build_layered_lut(&ll);
+                    let lut_d = build_layered_lut(&dl);
+                    let (end_bit, bytes) = decode_dynamic_block_layered_with_window(
                         deflate,
                         after_hdr,
                         &lut_ll,
