@@ -52,28 +52,43 @@ const DIST_EXTRA: [u8; 30] = [
     13,
 ];
 
-/// Canonical Huffman flat LUT entry. `length=0` means "no code at this key."
+/// Layered LUT entry. 4 bytes; packed:
 ///
-/// For the 12-bit-main-table layout: `length & 0x80` set means the
-/// entry is a SUBTABLE pointer. The low 7 bits of `length` are the
-/// subtable bits, and `symbol` is the byte offset into the values
-/// array where the subtable starts.
+/// - `length` low 7 bits: code bit-count (or subtable bit-count if
+///   SUBTABLE_FLAG set).
+/// - `length & SUBTABLE_FLAG (0x80)`: this entry redirects to a
+///   subtable at offset `symbol`, with `length & 0x7F` extra bits.
+/// - `length & LENGTH_CODE_FLAG (0x40)`: the original symbol was a
+///   length code (257-285); `symbol` stores `length_base` (3-258)
+///   and `length_extra` stores the number of extra-bits to read.
+/// - Otherwise: literal (symbol = byte if < 256) or EOB (symbol = 256).
+///
+/// `length == 0` means "no code at this key" (build-time empty slot).
+///
+/// Packing length info inline saves the per-length-code
+/// `LENGTH_BASE[sym-257]` + `LENGTH_EXTRA[sym-257]` array reads —
+/// ~20% of silesia symbols are length codes so this is a measurable
+/// inner-loop win and the entry shape Route C v3 asm executes against.
 #[derive(Clone, Copy, Debug)]
 pub struct LutEntry {
     pub symbol: u16,
     pub length: u8,
+    pub length_extra: u8,
 }
 
 impl LutEntry {
     pub const EMPTY: Self = Self {
         symbol: 0,
         length: 0,
+        length_extra: 0,
     };
 }
 
 const MAIN_BITS: u8 = 12;
 const MAIN_SIZE: usize = 1 << MAIN_BITS;
 const SUBTABLE_FLAG: u8 = 0x80;
+const LENGTH_CODE_FLAG: u8 = 0x40;
+const CODE_BITS_MASK: u8 = 0x3F;
 
 /// Layered LUT — 12-bit main table + per-long-code subtables.
 ///
@@ -105,13 +120,27 @@ impl Default for LayeredLut {
     }
 }
 
+/// Which symbol alphabet this LUT decodes — controls how leaf
+/// entries pack length info.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LutRole {
+    /// Litlen alphabet (0-285). Length codes 257-285 pack
+    /// length_base + length_extra; LENGTH_CODE_FLAG marks them.
+    Litlen,
+    /// Distance alphabet (0-29). Pack dist_base + dist_extra; no flag.
+    Dist,
+}
+
 impl LayeredLut {
     /// Rebuild the table in place using the existing `entries` Vec's
-    /// allocation. Mirrors `build_layered_lut` but doesn't allocate a
-    /// fresh Vec each call — critical for the per-block-rebuild
-    /// inflate path where 3350 blocks × ~16 KB allocation = 50 MB+ of
-    /// allocator churn per silesia run.
+    /// allocation. `role` controls the leaf-entry packing (see
+    /// `make_litlen_entry` vs `make_dist_entry`).
     pub fn build_into(&mut self, code_lengths: &[u8]) {
+        self.build_into_with_role(code_lengths, LutRole::Litlen);
+    }
+
+    /// Rebuild for a specific role (litlen or dist).
+    pub fn build_into_with_role(&mut self, code_lengths: &[u8], role: LutRole) {
         let mut count = [0u16; 16];
         for &len in code_lengths {
             if len > 0 && len <= 15 {
@@ -162,14 +191,15 @@ impl LayeredLut {
             let codeword = next_code[len as usize];
             next_code[len as usize] += 1;
             let rev = reverse_bits(codeword, len);
+            let entry = match role {
+                LutRole::Litlen => make_litlen_entry(symbol as u16, len),
+                LutRole::Dist => make_dist_entry(symbol as u16, len),
+            };
             if len <= MAIN_BITS {
                 let stride = 1u32 << len;
                 let mut k = rev;
                 while (k as usize) < MAIN_SIZE {
-                    self.entries[k as usize] = LutEntry {
-                        symbol: symbol as u16,
-                        length: len,
-                    };
+                    self.entries[k as usize] = entry;
                     k += stride;
                 }
             } else {
@@ -182,17 +212,67 @@ impl LayeredLut {
                 let sub_size = 1u32 << sub_max_bits;
                 let mut k = sub_key;
                 while k < sub_size {
-                    self.entries[sub_offset as usize + k as usize] = LutEntry {
-                        symbol: symbol as u16,
-                        length: len,
-                    };
+                    self.entries[sub_offset as usize + k as usize] = entry;
                     k += stride;
                 }
                 self.entries[prefix] = LutEntry {
                     symbol: sub_offset as u16,
                     length: sub_max_bits | SUBTABLE_FLAG,
+                    length_extra: 0,
                 };
             }
+        }
+    }
+}
+
+/// Produce a leaf LutEntry for the given litlen `symbol` + code bit-count.
+/// - Literals (0-255): symbol = byte, length = code_bits, length_extra = 0.
+/// - EOB (256): symbol = 256, length = code_bits, length_extra = 0.
+/// - Length codes (257-285): symbol = LENGTH_BASE[..], length =
+///   code_bits | LENGTH_CODE_FLAG, length_extra = LENGTH_EXTRA[..].
+///
+/// `dist` LUT entries don't use the LENGTH_CODE_FLAG; the caller
+/// stores dist_base + dist_extra inline by passing the dist symbol
+/// to `make_dist_entry` (see below).
+fn make_litlen_entry(symbol: u16, code_bits: u8) -> LutEntry {
+    if (257..=285).contains(&symbol) {
+        let li = (symbol - 257) as usize;
+        LutEntry {
+            symbol: LENGTH_BASE[li],
+            length: code_bits | LENGTH_CODE_FLAG,
+            length_extra: LENGTH_EXTRA[li],
+        }
+    } else {
+        // Literal or EOB or reserved.
+        LutEntry {
+            symbol,
+            length: code_bits,
+            length_extra: 0,
+        }
+    }
+}
+
+/// Produce a leaf LutEntry for a `dist` symbol + code bit-count.
+/// Distance codes 0-29 each carry a `dist_base` + `dist_extra` that
+/// we pack the same way length codes do — but distance codes don't
+/// share the LENGTH_CODE_FLAG (they're in a separate LUT). We store:
+/// - symbol = DIST_BASE[..]
+/// - length = code_bits
+/// - length_extra = DIST_EXTRA[..]
+fn make_dist_entry(symbol: u16, code_bits: u8) -> LutEntry {
+    if (symbol as usize) < 30 {
+        let di = symbol as usize;
+        LutEntry {
+            symbol: DIST_BASE[di],
+            length: code_bits,
+            length_extra: DIST_EXTRA[di],
+        }
+    } else {
+        // Reserved distance symbol — leave defaults, decoder will error.
+        LutEntry {
+            symbol,
+            length: code_bits,
+            length_extra: 0,
         }
     }
 }
@@ -209,10 +289,23 @@ impl LayeredLut {
         if e.length & SUBTABLE_FLAG == 0 {
             return e;
         }
-        // Subtable: e.symbol = subtable offset, e.length & 0x7F = bits
         let sub_bits = e.length & 0x7F;
         let subkey = ((bits >> self.main_bits) & ((1u32 << sub_bits) - 1)) as usize;
         self.entries[e.symbol as usize + subkey]
+    }
+
+    /// Total code bits consumed from the bit stream for this entry.
+    /// `length & CODE_BITS_MASK` for direct hits; full subtable cost
+    /// for subtable entries.
+    #[inline]
+    pub fn code_bits(entry: &LutEntry) -> u8 {
+        entry.length & CODE_BITS_MASK
+    }
+
+    /// True if this entry represents a length code (sym 257-285).
+    #[inline]
+    pub fn is_length_code(entry: &LutEntry) -> bool {
+        entry.length & LENGTH_CODE_FLAG != 0
     }
 }
 
@@ -283,14 +376,12 @@ pub fn build_layered_lut(code_lengths: &[u8]) -> LayeredLut {
     //   - length > MAIN_BITS: replicate in subtable at stride 2^extra.
     for &(symbol, codeword, len) in &codes {
         let rev = reverse_bits(codeword, len);
+        let entry = make_litlen_entry(symbol, len);
         if len <= MAIN_BITS {
             let stride = 1u32 << len;
             let mut k = rev;
             while (k as usize) < MAIN_SIZE {
-                entries[k as usize] = LutEntry {
-                    symbol,
-                    length: len,
-                };
+                entries[k as usize] = entry;
                 k += stride;
             }
         } else {
@@ -303,20 +394,14 @@ pub fn build_layered_lut(code_lengths: &[u8]) -> LayeredLut {
             let sub_size = 1u32 << sub_max_bits;
             let mut k = sub_key;
             while k < sub_size {
-                entries[sub_offset as usize + k as usize] = LutEntry {
-                    symbol,
-                    length: len,
-                };
+                entries[sub_offset as usize + k as usize] = entry;
                 k += stride;
             }
-            // Also stamp the main-table entry for this prefix as a
-            // subtable redirector.
-            let main_entry = LutEntry {
+            entries[prefix] = LutEntry {
                 symbol: sub_offset as u16,
                 length: sub_max_bits | SUBTABLE_FLAG,
+                length_extra: 0,
             };
-            // Only stamp ONCE per prefix; multiple codes share it.
-            entries[prefix] = main_entry;
         }
     }
 
@@ -360,6 +445,7 @@ pub fn build_canonical_lut(code_lengths: &[u8], max_bits: u8) -> Vec<LutEntry> {
             entries[k] = LutEntry {
                 symbol: symbol as u16,
                 length: len,
+                length_extra: 0,
             };
             k += stride;
         }
@@ -420,9 +506,8 @@ pub fn decode_dynamic_block_layered_with_window(
             byte_pos += avail;
         }
 
-        // Layered lookup. Pass the full low 24 bits so the lookup can
-        // consume main_bits + up to 12 subtable bits if needed (max
-        // total = 15 bits anyway).
+        // Layered lookup. Subtable redirect is resolved internally;
+        // returned entry is always a leaf.
         let entry = litlen_lut.lookup((bitbuf & 0xFFFFFF) as u32);
         if entry.length == 0 || entry.length & SUBTABLE_FLAG != 0 {
             return Err(std::io::Error::new(
@@ -430,46 +515,14 @@ pub fn decode_dynamic_block_layered_with_window(
                 "litlen lookup returned subtable redirect or empty entry",
             ));
         }
-        bitbuf >>= entry.length;
-        bitsleft -= entry.length as i32;
-        let sym = entry.symbol;
-        if sym < 256 {
-            if out_pos >= out_buf.len() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "output overflow",
-                ));
-            }
-            out_buf[out_pos] = sym as u8;
-            out_pos += 1;
+        let code_bits = entry.length & CODE_BITS_MASK;
+        bitbuf >>= code_bits;
+        bitsleft -= code_bits as i32;
 
-            // Multi-literal lookahead — libdeflate's FASTLOOP pattern.
-            // We've already paid for the bit-buffer refill at the top
-            // of the iteration; if there's still ≥ MAIN_BITS bits left
-            // AND the next entry is also a short literal, write it
-            // inline. Up to 3 additional literals (4 total per iter)
-            // before falling through to the next refill.
-            for _ in 0..3 {
-                if bitsleft < MAIN_BITS as i32 || out_pos >= out_buf.len() {
-                    break;
-                }
-                let key2 = (bitbuf & ((1u64 << MAIN_BITS) - 1)) as usize;
-                let e2 = litlen_lut.entries[key2];
-                if e2.length == 0 || e2.length & SUBTABLE_FLAG != 0 || e2.symbol >= 256 {
-                    break;
-                }
-                bitbuf >>= e2.length;
-                bitsleft -= e2.length as i32;
-                out_buf[out_pos] = e2.symbol as u8;
-                out_pos += 1;
-            }
-        } else if sym == 256 {
-            let end_bit = (byte_pos as u64) * 8 - bitsleft.max(0) as u64;
-            return Ok((end_bit, out_pos - out_start));
-        } else if sym <= 285 {
-            let li = (sym - 257) as usize;
-            let extra_bits = LENGTH_EXTRA[li];
-            let length = LENGTH_BASE[li] as usize + (bitbuf & ((1u64 << extra_bits) - 1)) as usize;
+        if entry.length & LENGTH_CODE_FLAG != 0 {
+            // Length code: symbol = length_base, length_extra = extras.
+            let extra_bits = entry.length_extra;
+            let length = entry.symbol as usize + (bitbuf & ((1u64 << extra_bits) - 1)) as usize;
             bitbuf >>= extra_bits;
             bitsleft -= extra_bits as i32;
             let dentry = dist_lut.lookup((bitbuf & 0xFFFFFF) as u32);
@@ -479,19 +532,14 @@ pub fn decode_dynamic_block_layered_with_window(
                     "dist lookup returned subtable redirect or empty entry",
                 ));
             }
-            bitbuf >>= dentry.length;
-            bitsleft -= dentry.length as i32;
-            let dsym = dentry.symbol as usize;
-            if dsym >= 30 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid dist symbol {dsym}"),
-                ));
-            }
-            let dextra = DIST_EXTRA[dsym];
-            let distance = DIST_BASE[dsym] as usize + (bitbuf & ((1u64 << dextra) - 1)) as usize;
-            bitbuf >>= dextra;
-            bitsleft -= dextra as i32;
+            let dist_code_bits = dentry.length & CODE_BITS_MASK;
+            bitbuf >>= dist_code_bits;
+            bitsleft -= dist_code_bits as i32;
+            // Dist LUT packs dist_base in symbol + dist_extra in length_extra.
+            let distance =
+                dentry.symbol as usize + (bitbuf & ((1u64 << dentry.length_extra) - 1)) as usize;
+            bitbuf >>= dentry.length_extra;
+            bitsleft -= dentry.length_extra as i32;
             let block_decoded = out_pos - out_start;
             let total_history = block_decoded + predecessor_window.len();
             if distance == 0 || distance > total_history {
@@ -541,10 +589,45 @@ pub fn decode_dynamic_block_layered_with_window(
                 }
             }
             out_pos += length;
+        } else if entry.symbol < 256 {
+            // Literal.
+            if out_pos >= out_buf.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "output overflow",
+                ));
+            }
+            out_buf[out_pos] = entry.symbol as u8;
+            out_pos += 1;
+
+            // Multi-literal lookahead — write up to 3 additional
+            // short-code literals from the same bit buffer fill.
+            for _ in 0..3 {
+                if bitsleft < MAIN_BITS as i32 || out_pos >= out_buf.len() {
+                    break;
+                }
+                let key2 = (bitbuf & ((1u64 << MAIN_BITS) - 1)) as usize;
+                let e2 = litlen_lut.entries[key2];
+                if e2.length == 0
+                    || e2.length & SUBTABLE_FLAG != 0
+                    || e2.length & LENGTH_CODE_FLAG != 0
+                    || e2.symbol >= 256
+                {
+                    break;
+                }
+                let cb = e2.length & CODE_BITS_MASK;
+                bitbuf >>= cb;
+                bitsleft -= cb as i32;
+                out_buf[out_pos] = e2.symbol as u8;
+                out_pos += 1;
+            }
+        } else if entry.symbol == 256 {
+            let end_bit = (byte_pos as u64) * 8 - bitsleft.max(0) as u64;
+            return Ok((end_bit, out_pos - out_start));
         } else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("reserved litlen symbol {sym}"),
+                format!("reserved litlen symbol {}", entry.symbol),
             ));
         }
     }
@@ -966,11 +1049,19 @@ mod tests {
             next_code[len as usize] += 1;
             let rev = reverse_bits(codeword, len);
             let e = lut.lookup(rev);
-            assert_eq!(
-                e.symbol as usize, symbol,
-                "wrong symbol for code {codeword:b}"
-            );
-            assert_eq!(e.length, len);
+            let code_bits = e.length & CODE_BITS_MASK;
+            assert_eq!(code_bits, len, "wrong code_bits for code {codeword:b}");
+            if (257..=285).contains(&(symbol as u16)) {
+                // Length code: symbol field now holds length_base.
+                let li = symbol - 257;
+                assert_eq!(e.symbol, LENGTH_BASE[li]);
+                assert!(e.length & LENGTH_CODE_FLAG != 0);
+                assert_eq!(e.length_extra, LENGTH_EXTRA[li]);
+            } else {
+                // Literal / EOB / reserved.
+                assert_eq!(e.symbol as usize, symbol);
+                assert_eq!(e.length & LENGTH_CODE_FLAG, 0);
+            }
         }
     }
 
@@ -1015,6 +1106,9 @@ mod tests {
         for entry in lens.iter_mut().take(288).skip(280) {
             *entry = 8;
         }
+        // Both build litlen-shaped LUTs. flat keeps the legacy
+        // symbol-only payload; layered packs length info for length
+        // codes. We compare just code_bits (low 6 bits of length).
         let flat = build_canonical_lut(&lens, 15);
         let layered = build_layered_lut(&lens);
         // For every 15-bit key the flat LUT has, the layered LUT should
@@ -1022,11 +1116,21 @@ mod tests {
         for key in 0u32..512 {
             let flat_e = flat[key as usize];
             let layered_e = layered.lookup(key);
+            // code_bits must match
             assert_eq!(
-                (layered_e.symbol, layered_e.length & 0x7F),
-                (flat_e.symbol, flat_e.length),
-                "mismatch at key 0x{key:04x}: flat={flat_e:?} layered={layered_e:?}"
+                layered_e.length & CODE_BITS_MASK,
+                flat_e.length,
+                "code_bits mismatch at key 0x{key:04x}"
             );
+            // For literal/EOB/reserved: symbols must match.
+            // For length codes: layered.symbol holds length_base.
+            if (257..=285).contains(&flat_e.symbol) {
+                let li = (flat_e.symbol - 257) as usize;
+                assert_eq!(layered_e.symbol, LENGTH_BASE[li]);
+                assert!(layered_e.length & LENGTH_CODE_FLAG != 0);
+            } else {
+                assert_eq!(layered_e.symbol, flat_e.symbol);
+            }
         }
     }
 
