@@ -573,6 +573,7 @@ dependencies = [
  "dynasmrt",
  "filetime",
  "flate2",
+ "gzippy-inflate",
  "iai-callgrind",
  "isal-rs",
  "libc",

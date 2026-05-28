@@ -71,6 +71,7 @@ pub struct BlockRange {
 
 /// GPU inflate dispatcher.
 pub struct GpuInflate {
+    #[allow(dead_code)] // set by v0.2 when real backends land
     backend: Option<GpuBackend>,
 }
 
@@ -90,6 +91,7 @@ impl GpuInflate {
     /// Which backends are compiled into THIS BUILD. v0.1: always
     /// empty Vec because no feature is wired up yet.
     pub fn available_backends() -> Vec<GpuBackend> {
+        #[allow(unused_mut)]
         let mut v = Vec::new();
         #[cfg(feature = "gpu-metal")]
         v.push(GpuBackend::Metal);

@@ -118,6 +118,7 @@ tempfile = "3.8"
 assert_cmd = "2.0"
 predicates = "3.0"
 flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
+gzippy-inflate = { path = "crates/gzippy-inflate" }
 # Phase 0.6 spike: iai-callgrind for SIMD-fidelity test.
 # See plans/inner-loop-execution.md Phase 0.6.
 iai-callgrind = "0.13"
