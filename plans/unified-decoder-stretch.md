@@ -1,5 +1,25 @@
 # Unified deflate decoder — stretch goals
 
+**⚠️ EXPLICITLY IGNORABLE FOR CURRENT PLANNING (as of 2026-05-27).**
+
+`plans/unified-decoder.md` was rewritten under the "infinite labor /
+infinite time" lens; items previously deferred here (constant-time,
+GPU, perfect-hash, async API, sub-crate publish, mmap, three-oracle
+fuzz, etc.) are now in §3 of the main plan as parallel workstreams.
+
+What remains in THIS document is what stays out of the main plan
+even under infinite labor: things that don't touch the inflate hot
+path AND don't pay off for the perf goal AND aren't required for
+correctness (Creusot proofs, hardware coprocessor dispatch, eBPF
+probes, forensic recovery API, coroutine suspend/resume).
+
+Do not consult this document while planning current work. Its
+content is preserved for archival reference only.
+
+---
+
+(Below: original prior content, preserved verbatim.)
+
 This document captures architectural goals that were intentionally
 removed from `plans/unified-decoder.md` to keep that roadmap focused
 on closing the measured 22pp perf gap to ISA-L FFI. These items
