@@ -802,6 +802,27 @@ impl<'a> IsalInflateWrapper<'a> {
         })
     }
 
+    /// Option A3 entry point — see
+    /// `crate::decompress::inflate::resumable::ResumableInflate2::read_stream_starting_at`
+    /// for the contract.
+    #[cfg(feature = "pure-rust-inflate")]
+    pub fn read_stream_starting_at(
+        &mut self,
+        output: &mut [u8],
+        out_pos_start: usize,
+    ) -> Result<ReadStreamResult, InflateError> {
+        let r = self
+            .inner
+            .read_stream_starting_at(output, out_pos_start)
+            .map_err(map_resumable_inflate_err)?;
+        Ok(ReadStreamResult {
+            bytes_written: r.bytes_written,
+            stopped_at: StoppingPoints(r.stopped_at.0),
+            bit_position: r.bit_position,
+            finished: r.finished,
+        })
+    }
+
     pub fn session_pending(&self) -> bool {
         self.inner.session_pending()
     }

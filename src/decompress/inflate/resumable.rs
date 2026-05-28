@@ -444,17 +444,58 @@ impl<'a> ResumableInflate2<'a> {
     ///   (3) `encoded_until_bits` is reached,
     ///   (4) the final block's BFINAL completes.
     pub fn read_stream(&mut self, output: &mut [u8]) -> Result<InflateStreamResult> {
+        self.read_stream_inner(output, 0)
+    }
+
+    /// Option A3 entry point. `out_pos_start` indexes into `output`; the
+    /// decoder writes into `output[out_pos_start..]` and treats
+    /// `output[0..out_pos_start]` as already-decoded bytes for the purpose
+    /// of back-reference resolution.
+    ///
+    /// Caller contract:
+    /// - `output[0..out_pos_start]` MUST contain the predecessor's
+    ///   sliding-window image (the last 32 KiB of the byte stream
+    ///   immediately preceding this chunk's first decoded byte).
+    /// - `state.window` is still consulted on the slow path but is
+    ///   effectively dead code when `out_pos_start >= 32768` (the
+    ///   DEFLATE max distance): every back-ref hits
+    ///   `copy_match_windowed`'s fast path via `dist <= out_pos`.
+    /// - `bytes_written` in the returned result counts ONLY bytes
+    ///   actually decoded in this call (NOT including the prefix);
+    ///   i.e. `out_pos_after - out_pos_start`.
+    ///
+    /// See `plans/unified-decoder.md` §6 "copy_match_windowed slow-path
+    /// elimination" for the perf rationale.
+    pub fn read_stream_starting_at(
+        &mut self,
+        output: &mut [u8],
+        out_pos_start: usize,
+    ) -> Result<InflateStreamResult> {
+        debug_assert!(
+            out_pos_start <= output.len(),
+            "out_pos_start {out_pos_start} > output.len() {}",
+            output.len()
+        );
+        self.read_stream_inner(output, out_pos_start)
+    }
+
+    fn read_stream_inner(
+        &mut self,
+        output: &mut [u8],
+        out_pos_start: usize,
+    ) -> Result<InflateStreamResult> {
         // Step 2.5 instrumentation: record per-call shape so production
         // hot-path analysis can distinguish "small-buffer chunked
         // caller" from "large-buffer monolithic caller". Counters are
         // single atomic-add per call (not per iteration) so the hot
         // path pays no per-symbol tax.
         READ_STREAM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        READ_STREAM_OUTPUT_BUF_BYTES
-            .fetch_add(output.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        READ_STREAM_OUTPUT_BUF_BYTES.fetch_add(
+            (output.len() - out_pos_start) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         self.stopped_at = StoppingPoint::NONE;
-        let out_pos_start = 0usize;
         let mut out_pos = out_pos_start;
 
         // Vendor multi-stream pattern: after `reset_for_next_stream`, the
