@@ -1,0 +1,33 @@
+[package]
+name = "gzippy-inflate"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust DEFLATE / gzip inflate primitive — public surface for gzippy"
+license = "Zlib"
+repository = "https://github.com/jackdanger/gzippy"
+keywords = ["gzip", "deflate", "decompression", "inflate"]
+categories = ["compression"]
+readme = "README.md"
+
+# Per plans/unified-decoder.md §3.11: this sub-crate is intended to be
+# `no_std` + `alloc` compatible at the core, with optional std-only
+# helpers behind the `std` feature. v0.1.0 scaffold ships the public
+# API surface only; the actual inflate implementation continues to
+# live in the gzippy parent crate until v0.2.0 when it migrates here.
+
+[features]
+default = ["std"]
+std = []
+
+# §3.12 async API: AsyncInflate gated on the `async` feature so
+# no-std builds don't pull in tokio/futures.
+async = ["std", "dep:futures", "dep:tokio"]
+
+[dependencies]
+# Sync API uses libdeflater (same as parent crate today) until v0.2.0
+# migrates the pure-Rust path.
+libdeflater = "1.0"
+
+# §3.12 async deps (optional)
+futures = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["io-util"], optional = true }
