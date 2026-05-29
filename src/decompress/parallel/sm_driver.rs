@@ -43,9 +43,22 @@ pub fn read_parallel_sm<W: std::io::Write>(
         crc32_enabled: true,
     };
 
-    let (total_crc, total_size) =
+    // Clean-window oracle (GZIPPY_CLEAN_WINDOW_ORACLE=1, default OFF): decode
+    // every chunk with its true predecessor window — no speculation, no marker
+    // bootstrap, no append_markered/absorb_isal_tail/narrow copies — to size
+    // whether the marker pipeline is the rapidgzip gap. CRC/size still verified
+    // below, so the known-window path's correctness is checked too.
+    let (total_crc, total_size) = if std::env::var_os("GZIPPY_CLEAN_WINDOW_ORACLE").is_some() {
+        chunk_fetcher::drive_clean_window_oracle(
+            deflate_data,
+            writer,
+            parallelization,
+            configuration,
+        )
+    } else {
         chunk_fetcher::drive(deflate_data, writer, parallelization, configuration)
-            .map_err(|e| ReadParallelSmError::DecodeFailed(format!("{e:?}")))?;
+    }
+    .map_err(|e| ReadParallelSmError::DecodeFailed(format!("{e:?}")))?;
 
     if total_size != expected_size {
         return Err(ReadParallelSmError::SizeMismatch {
