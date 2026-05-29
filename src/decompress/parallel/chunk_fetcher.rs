@@ -731,8 +731,14 @@ pub fn drive<W: std::io::Write>(
         } else {
             0.0
         };
+        let bs_postflip = gc::BOOTSTRAP_POST_FLIP_U16_BYTES.load(Ordering::Relaxed);
+        let postflip_pct = if bs_b_bytes > 0 {
+            100.0 * bs_postflip as f64 / bs_b_bytes as f64
+        } else {
+            0.0
+        };
         eprintln!(
-            "  Bootstrap per-block: header_calls={bs_h_calls} header_ms={:.1} avg_header_us={:.1} body_ms={:.1} body_bytes={bs_b_bytes} body_rate_MB/s={:.0}",
+            "  Bootstrap per-block: header_calls={bs_h_calls} header_ms={:.1} avg_header_us={:.1} body_ms={:.1} body_bytes={bs_b_bytes} body_rate_MB/s={:.0} post_flip_u16_bytes={bs_postflip} ({postflip_pct:.1}% of body = Design-B1 prize)",
             bs_h_us as f64 / 1000.0,
             bs_h_avg,
             bs_b_us as f64 / 1000.0,

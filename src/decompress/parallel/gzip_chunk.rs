@@ -99,6 +99,14 @@ pub static BOOTSTRAP_HEADER_CALLS: std::sync::atomic::AtomicU64 =
 pub static BOOTSTRAP_BODY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BOOTSTRAP_BODY_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Commit-1 instrumentation for the bootstrap-unification lever: bytes decoded
+/// into the u16 marker ring AFTER `contains_marker_bytes` flips false (the flip
+/// is permanent within a chunk — once 32 KiB clean exists, no back-ref can
+/// reach the unknown predecessor). These are the bytes that could instead be
+/// decoded into a u8 linear buffer with the fast copy path (Design B1). The
+/// ratio POST_FLIP / BODY_BYTES sizes the prize. No behavior change.
+pub static BOOTSTRAP_POST_FLIP_U16_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Per-failure structured log. Writes one JSON line to the path in
 /// `GZIPPY_BODY_FAIL_LOG` env var (no-op if unset). Use this for
@@ -1629,6 +1637,19 @@ fn bootstrap_with_deflate_block_inner(
                     // restarts from after that last marker.
                     trailing_clean = trailing_this_block.min(MAX_WINDOW_SIZE);
                 }
+            }
+
+            // Commit-1 instrumentation (no behavior change): once the block's
+            // marker mode has flipped off, every byte this block produced is a
+            // clean u16-ring write that Design B1 would route to a u8 buffer.
+            // The flip is permanent within a chunk, so counting whole post-flip
+            // blocks over-counts only the pre-flip prefix of the single
+            // flip-block (≤32 KiB, negligible vs multi-MB blocks).
+            if !block.contains_marker_bytes() {
+                BOOTSTRAP_POST_FLIP_U16_BYTES.fetch_add(
+                    (output.len() - before_len) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
 
             end_bit_offset = absolute_bit_pos(byte_offset, &bits);
