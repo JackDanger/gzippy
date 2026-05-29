@@ -59,8 +59,13 @@ def pair_spans(events: List[dict]) -> List[dict]:
                 if b["name"] != e["name"]:
                     # Mismatched — skip (could log warning).
                     pass
+                # Parent = the span still open on this thread's stack (the
+                # enclosing B), so paired spans reconstruct the real
+                # call-stack nesting. "<root>" when at the top.
+                parent = stacks[key][-1]["name"] if stacks[key] else "<root>"
                 spans.append({
                     "name": b["name"],
+                    "parent": parent,
                     "pid": b.get("pid", 0),
                     "tid": b.get("tid", 0),
                     "ts_start": b.get("ts", 0),
@@ -69,6 +74,61 @@ def pair_spans(events: List[dict]) -> List[dict]:
                     "args": b.get("args", {}),
                 })
     return spans
+
+
+def print_call_tree(path: str, top: int = 0):
+    """Reconstruct the per-thread span CALL-TREE with total + self time.
+
+    This is the 'graph of the call stack with exact numbers' view: each
+    node is a span name; edges are observed parent->child nesting; total
+    is the summed duration of that name, self is total minus time spent
+    in its direct children. Works identically for gzippy (pid 1) and the
+    rapidgzip-side trace (pid 2), so it doubles as the cross-tool
+    structural map of what calls what.
+    """
+    events = load_events(path)
+    spans = pair_spans(events)
+    if not spans:
+        print(f"\n=== call-tree {path}: no spans ===")
+        return
+    total = defaultdict(int)          # name -> summed dur
+    count = defaultdict(int)          # name -> span count
+    edge = defaultdict(int)           # (parent, child) -> summed child dur
+    children = defaultdict(set)       # parent -> {child names}
+    for s in spans:
+        total[s["name"]] += s["dur"]
+        count[s["name"]] += 1
+        edge[(s["parent"], s["name"])] += s["dur"]
+        children[s["parent"]].add(s["name"])
+
+    def self_of(name: str) -> int:
+        return total[name] - sum(edge[(name, c)] for c in children.get(name, ()))
+
+    print(f"\n=== call-tree {path}  (total | self | count) ===")
+    seen_depth: Dict[str, int] = {}
+
+    def walk(name: str, depth: int, via_dur: int):
+        # Guard against runaway recursion on cyclic nesting (recursive
+        # spans): only expand a name at its shallowest occurrence.
+        if depth > 12:
+            return
+        indent = "  " * depth
+        s = self_of(name)
+        print(f"  {indent}{name:<42s} {fmt_us(total[name]):>9s} | "
+              f"{fmt_us(s):>9s} | {count[name]:>6d}")
+        kids = sorted(children.get(name, ()), key=lambda c: -edge[(name, c)])
+        for c in kids:
+            if c == name:
+                continue
+            if c in seen_depth and seen_depth[c] <= depth:
+                continue
+            seen_depth[c] = depth
+            walk(c, depth + 1, edge[(name, c)])
+
+    roots = sorted(children.get("<root>", ()), key=lambda c: -total[c])
+    for r in roots:
+        seen_depth[r] = 0
+        walk(r, 0, total[r])
 
 
 def instant_events(events: List[dict]) -> List[dict]:
@@ -248,16 +308,23 @@ def print_diff(left: dict, right: dict):
 
 
 def main():
-    if len(sys.argv) < 2:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    if not args:
         print(__doc__)
+        print("Flags:\n  --tree   print the per-thread span call-tree (total|self|count)")
         sys.exit(1)
-    summaries = [summarize(p) for p in sys.argv[1:]]
+    if "--tree" in flags:
+        for p in args:
+            print_call_tree(p)
+        return
+    summaries = [summarize(p) for p in args]
     for s in summaries:
         print_summary(s)
     if len(summaries) == 2:
         print_diff(*summaries)
         print("\nCritical-path contributors (waits overlapping consumer thread):")
-        events = load_events(sys.argv[1])
+        events = load_events(args[0])
         cp = critical_path(events)
         print(f"  {'name':40s} {'tid':>4s} {'dur':>10s} {'pct_wall':>10s}")
         for n, t, d, pct in cp:
