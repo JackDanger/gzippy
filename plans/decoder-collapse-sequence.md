@@ -5,20 +5,34 @@ with a plan that does not introduce regressions so significant we can't make
 sense of them." Structure-first; correctness non-negotiable; then it must be
 fast enough to delete libdeflate/ISA-L/zlib-ng entirely (`plans/pure-rust-everywhere.md`).
 
-## End state (DEFINITION — needs explicit sign-off before Phase 3)
+## End state (DEFINITION — SIGNED OFF by user 2026-05-29)
 
 We land on **ONE decode primitive** — one FASTLOOP, one dynamic-header parser,
 one `Bits` reader, one symbol-decode body — instantiated as **two
-monomorphs**: `Clean` (u8 linear output) and `Markers` (u16 ring, window-absent),
-plus a small handoff stitch where a speculative chunk transitions marker→clean.
+monomorphs**:
+- **`Clean` (u8)** — THE GENERAL-PURPOSE gzip decoder. "This is a generic gzip"
+  (user): Clean mode must handle EVERYTHING a normal gzip does — single-threaded
+  whole-file, tiny files, streaming, multi-member, BGZF blocks, and ANY legal
+  input — in both a one-shot (`Owned`) and a resumable (`Streaming`) form. It is
+  not just the parallel-SM clean path; it is the decoder for all of gzippy's
+  generic-gzip use cases (Phase 4 is therefore a MANDATE, not a nicety).
+- **`Markers` (u16 ring, window-absent)** — adds SPECULATIVE PARALLEL decode on
+  top (cross-chunk back-refs → markers). Kept deliberately: "we need to be able
+  to do speculative parallel decode" (user). Hands off to `Clean` for the tail.
 
 This is "one engine, two modes," NOT one runtime code path. The u16 marker ring
 is a **hard architectural fork** from u8-linear (different addressing: linear+
-overshoot vs ring-modulo+marker-zone), inherited from rapidgzip's own design.
-Literally-one-code-path would require abandoning the marker mechanism, which is
-how cross-chunk back-references are resolved in speculative parallel decode —
-not on the table. "Collapse until one remains" = one source of truth for the
-Huffman decode logic; the two output modes and the handoff are plumbing.
+overshoot vs ring-modulo+marker-zone), inherited from rapidgzip's design.
+Abandoning markers would kill speculative parallel decode — explicitly off the
+table. "Collapse until one remains" = one source of truth for the Huffman decode
+logic; the two output modes and the handoff are plumbing.
+
+**Generic-gzip correctness bar:** because Clean is the general-purpose decoder,
+"correct" means RFC-1951/1952-complete on ANY legal input — not just the bench
+corpus. The golden harness (0a) MUST include broad + property-based/fuzzed
+inputs (all block types, multi-member, truncation/edge cases, degenerate
+Huffman tables), differentialled against flate2 + libdeflate, in addition to the
+silesia perf corpus.
 
 ## Ground truth (from the 2026-05-29 audit; see git for the two full maps)
 
@@ -81,9 +95,12 @@ Huffman decode logic; the two output modes and the handoff are plumbing.
   production routing unchanged. (Multi-step surgical untangle, not a flat rm —
   needs a fresh context budget to run the build/test cycles to completion.)
 - **0a: build the primitive-level golden differential + bench harness** and
-  snapshot golden output vectors for A, B, C, D on the corpus (silesia +
-  multimember + edge cases). Freeze the clean-path bench baseline on the lean
-  binary. This is the fixed yardstick for everything after.
+  snapshot golden output vectors for A, B, C, D. Corpus must serve the
+  generic-gzip bar: silesia (perf) + multimember + BGZF + tiny + truncated +
+  **property-based/fuzzed inputs** (all block types incl. stored/fixed/dynamic,
+  degenerate/incomplete Huffman tables, max-distance back-refs, empty members),
+  differentialled byte+CRC vs flate2 AND libdeflate. Freeze the clean-path bench
+  baseline on the lean binary. This is the fixed yardstick for everything after.
 - **0c: settle the table format.** resumable.rs carries TWO FASTLOOPs
   (libdeflate-LUT vs ISA-L-LUT). The shared inner loop can't exist until one is
   deleted — and which one is a MEASURED perf decision, not a default. Bench both
@@ -116,9 +133,12 @@ out). Reroute scan_inflate + isal_lut_bulk callers to it. Delete C's decode path
   on u8-linear overshoot + margin math that don't hold for a u16 ring). Gate it
   independently so a perf regression never rides with a correctness change.
 
-### Phase 4 — generalize to all formats, replacing C (env-gated longest, flip last)
-Each: implement on the unified engine, env-gate, A/B vs the C path it replaces,
-flip default only at ≥ parity + byte-exact, then delete the C call site.
+### Phase 4 — generic-gzip MANDATE: Clean mode serves all formats, replacing C
+(env-gated longest, flip last). This is where "this is a generic gzip" is
+honored — Clean mode (one-shot Owned + resumable Streaming) becomes the decoder
+for every gzip use case, not just the parallel hot path. Each: implement on the
+unified engine, env-gate, A/B vs the C path it replaces, flip default only at
+≥ parity + byte-exact on the full generic-gzip corpus, then delete the C call site.
 - 4a single-member T1 + >1 GiB streaming (replaces ISA-L stream, zlib-ng,
   libdeflate single). **Highest ship-risk** (these are today's default ship
   paths, not pure-gated) → keep gated longest.
