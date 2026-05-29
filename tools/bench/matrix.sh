@@ -30,11 +30,12 @@ declare -A PIN=( [1]=0 [2]=0,2 [4]=0,2,4,6 [8]=0,2,4,6,8,10,12,14 [16]=0-15 )
 
 # Corpus: label -> path  (edit to match what is built on the box)
 CORPUS=(
-  "single-silesia:benchmark_data/silesia-large.gz"
-  "single-small:benchmark_data/silesia-gzip9.gz"
+  "single-large:benchmark_data/silesia-large.gz"
+  "single-l9:benchmark_data/silesia-gzip9.gz"
   "bgzf:benchmark_data/silesia-bgzf.gz"
   "multimember:benchmark_data/silesia-multimember.gz"
-  "incompressible:benchmark_data/random.gz"
+  "incompressible:benchmark_data/random100.gz"
+  "tiny:benchmark_data/tiny.gz"
 )
 
 # best-of-TRIALS wall in ns for: $1=pin  rest=command
