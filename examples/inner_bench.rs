@@ -65,16 +65,19 @@ fn main() {
         .unwrap_or_else(|| "benchmark_data/silesia-gzip.tar.gz".into());
 
     let deflate = load_raw_deflate(&path);
-    // Learn the output size once (over-allocate generously, then size exact).
-    let mut probe = vec![0u8; deflate.len() * 20];
-    let out_len = decode_libdeflate(&deflate, &mut probe);
-    drop(probe);
-    let mut out = vec![0u8; out_len];
+    // Over-allocate a generous output buffer ONCE (deflate ratio is well under
+    // 8x). NO libdeflate sizing-probe: a probe decode contaminated every run
+    // (~16% of a `consume_first` perf-stat was actually the one libdeflate
+    // probe decode), poisoning the cross-decoder instruction ratio. The buffer
+    // is faulted once and reused across iters — identical cost for every
+    // decoder, so it cancels in the ratio.
+    let mut out = vec![0u8; deflate.len() * 8];
 
     let t0 = Instant::now();
     let mut total = 0usize;
+    let mut out_len = 0usize;
     for _ in 0..iters {
-        total += match which.as_str() {
+        out_len = match which.as_str() {
             "libdeflate" => decode_libdeflate(&deflate, &mut out),
             #[cfg(feature = "pure-rust-inflate")]
             "pure" => decode_pure(&deflate, &mut out),
@@ -82,6 +85,7 @@ fn main() {
             "consume_first" => decode_consume_first(&deflate, &mut out),
             other => panic!("unknown decoder {other:?} (or pure-rust-inflate feature off)"),
         };
+        total += out_len;
     }
     let secs = t0.elapsed().as_secs_f64();
     let mbps = total as f64 / secs / 1e6;
