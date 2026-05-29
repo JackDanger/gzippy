@@ -55,7 +55,7 @@ fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
 ///   GzippyParallel   — gzippy-produced multi-block files ("GZ" FEXTRA subfield)
 ///   MultiMemberPar   — pigz-style multi-member, Tmax threads
 ///   MultiMemberSeq   — pigz-style multi-member, T1
-///   IsalParallelSM   — x86_64 single-member ≥ 10 MiB w/ T>1 — parallel marker pipeline
+///   IsalParallelSM   — x86_64 single-member ≥ 10 MiB w/ T≥4 — parallel marker pipeline
 ///   IsalSingle       — x86_64 single-member via ISA-L (one-shot, T=1 or small input)
 ///   StreamingSingle  — single-member > 1GB, no ISA-L (avoids huge allocation)
 ///   LibdeflateSingle — default single-member via libdeflate one-shot (no ISA-L)
@@ -81,6 +81,18 @@ pub enum DecodePath {
 /// decision (visible at the classifier level); it is never used as a
 /// silent in-body fallback.
 pub(crate) const MIN_PARALLEL_COMPRESSED: usize = 10 * 1024 * 1024;
+
+/// Minimum thread count before the speculative parallel single-member pipeline
+/// is worth taking over the ISA-L one-shot decode.
+///
+/// The speculative pipeline has structurally lower per-core throughput than a
+/// monolithic ISA-L pass (speculation + block-finding + post-processing +
+/// single-consumer reorder overhead, plus ~35 speculation re-decodes even on
+/// silesia). Measured 2026-05-29 (silesia-large): one-shot T1 = 1074 MB/s,
+/// parallel T2 = 863 (a LOSS), parallel T4 = 1320 (a win). So below 4 threads
+/// the one-shot path is faster — route there. (Multi-member / BGZF have their
+/// own parallel paths and are unaffected; they win at T≥2.)
+pub(crate) const MIN_PARALLEL_SM_THREADS: usize = 4;
 
 /// Compression ratio (uncompressed / compressed) below which the speculative
 /// parallel single-member pipeline is a NET LOSS and we route to the one-shot
@@ -132,7 +144,7 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
         };
     }
     if crate::decompress::parallel::sm_cfg::PARALLEL_SM
-        && num_threads > 1
+        && num_threads >= MIN_PARALLEL_SM_THREADS
         && data.len() > MIN_PARALLEL_COMPRESSED
         && !parallel_sm_unprofitable(data)
     {
@@ -619,6 +631,34 @@ mod tests {
             path,
             DecodePath::IsalParallelSM,
             "no-ISA-L host must not classify parallel"
+        );
+    }
+
+    /// The speculative parallel single-member pipeline must engage only at
+    /// T≥4 (its per-core throughput is below the ISA-L one-shot until ~4
+    /// threads; 2026-05-29 matrix: one-shot T1 1074 > parallel T2 863). At T2/T3
+    /// a compressible, size-eligible input must route to the one-shot path.
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(feature = "isal-compression", feature = "pure-rust-inflate")
+    ))]
+    #[test]
+    fn test_parallel_sm_thread_gate() {
+        let (_raw, payload) = compressible_parallel_fixture();
+        assert_ne!(
+            classify_gzip(&payload, 2),
+            DecodePath::IsalParallelSM,
+            "T=2 must NOT take the speculative pipeline (one-shot is faster)"
+        );
+        assert_ne!(
+            classify_gzip(&payload, 3),
+            DecodePath::IsalParallelSM,
+            "T=3 must NOT take the speculative pipeline"
+        );
+        assert_eq!(
+            classify_gzip(&payload, 4),
+            DecodePath::IsalParallelSM,
+            "T=4 must take the speculative pipeline"
         );
     }
 
