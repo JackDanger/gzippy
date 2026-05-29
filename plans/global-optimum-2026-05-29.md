@@ -94,7 +94,58 @@ Entry points: production driver `sm_driver::read_parallel_sm` →
 `window_map`. The oracle is a parallel sibling that skips the bootstrap and
 feeds known windows.
 
-### Step 1+ (branch on Step 0's result)
+### Step 0 RESULT (2026-05-29) — D1 is DEAD, D2 is the entire game
+
+Cheap proxy for the oracle: gzippy's **BGZF parallel path is already a
+markers-free parallel clean decode** (independent 64 KiB blocks, libdeflate
+FFI, zero markers, zero apply_window). Measured frozen/pinned, best-of-7,
+silesia-bgzf (212 MB) vs silesia-large single-member (503 MB):
+
+| T  | BGZF-clean | single-member (markers) |
+|----|-----------|--------------------------|
+| 1  | 1124      | 1080  |
+| 4  | 3867      | 1367  |
+| 8  | **6100**  | 1837  |
+| 16 | **7029**  | 1734  |
+
+gzippy's parallel pipeline + buffer pool + allocator sustain **6100 MB/s at
+T8 (2.4× past rapidgzip's 2571)** with a clean engine. The single-member
+plateau (1837) is therefore **100% the marker-speculation engine**, NOT the
+data model. **D1 (segmented buffers / allocator / right-size) is DEAD** —
+the fault/DRAM/working-set symptoms are downstream of the slow engine
+holding buffers live longer + doing 2× marker traffic. The advisor's
+refutation is confirmed by measurement.
+
+Caveat: BGZF uses small independent blocks (empty window by construction) +
+libdeflate; single-member uses 4 MB chunks + ISA-L + window dependency. Not
+perfectly apples-to-apples, but the 3.3× internal gap (6100 vs 1837) is far
+too large to be backend/block-size — it is the engine.
+
+### THE TARGET (revised): kill the slow window-absent marker path
+
+Root cause (per [[project_sm_bootstrap_overshoot_2026_05_29]]): silesia uses
+large deflate blocks (2–14 MB). gzippy can't hand off from the slow pure-Rust
+marker decode to fast ISA-L until a clean 32 KiB boundary appears, so it
+decodes WHOLE multi-MB blocks (156 MB, ~31% of output) on the slow path. The
+window is actually DETERMINISTIC for the sequential CLI (chunk N's window =
+chunk N−1's last 32 KiB) — only the first ≤32 KiB of each chunk can reference
+the unknown predecessor window; the rest is decodable clean.
+
+Two complementary directions (both D2, both authorized open-territory per
+CLAUDE.md inner-loop rule):
+1. **Hand off to the clean fast path EARLY.** Decode only the chunk prefix
+   that can reference the unknown window via markers; switch to ISA-L for the
+   remainder even mid-large-block. Shrinks the 156 MB slow path drastically.
+2. **Make the window-absent decode itself fast.** Close the inner-loop
+   2.07× instruction gap (1.65× resumable-contract tax already partly
+   addressed in f01eb74; 1.25× algorithm remains) and the **bad-spec 18%**
+   (inner-loop branch mispredict) — the dominant IPC gap (1.08 vs 1.42).
+
+Ceiling proof: 6100 MB/s shows there is no data-model ceiling below ~6 GB/s;
+a clean-enough engine could in principle blow past rapidgzip. Even halving
+the slow-path share should move T8 materially toward 2571+.
+
+### Step 1+ (superseded by Step 0 result — D1 branch removed)
 
 - **Engine branch:** known-window decode + inner-loop bad-spec work
   (the inner Huffman loop is explicitly open territory per CLAUDE.md).
