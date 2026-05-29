@@ -53,6 +53,21 @@ oracle = []
 # Pure-Rust resumable inflate with stopping points (Track B); no ISA-L in wrapper body.
 pure-rust-inflate = ["arena-allocator"]
 arena-allocator = ["dep:allocator-api2", "dep:rpmalloc-sys"]
+# Allocator-visibility tooling: enable rpmalloc's ENABLE_STATISTICS so
+# dump_global_stats() reports mapped_total / unmapped_total / cached /
+# huge_alloc_peak — i.e. whether segments are warm-reused (span cache) or
+# re-mapped (faults). Measurement only; dump gated at runtime by
+# GZIPPY_RPMALLOC_STATS.
+rpmalloc-stats = ["arena-allocator", "rpmalloc-sys/statistics"]
+# The rpmalloc span-cache TUNING KNOBS (the lever): global cache for
+# cross-thread span reuse + thread cache + adaptive sizing. Toggleable so
+# they can be A/B'd against the default rpmalloc-sys build.
+rpmalloc-caches = [
+    "arena-allocator",
+    "rpmalloc-sys/global_cache",
+    "rpmalloc-sys/thread_cache",
+    "rpmalloc-sys/adaptive_thread_cache",
+]
 # Activates `#[global_allocator] = rpmalloc::RpMalloc` in src/main.rs.
 # Test for the "pipeline idle is allocator contention" hypothesis.
 global-rpmalloc = ["dep:rpmalloc"]
