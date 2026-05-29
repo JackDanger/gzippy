@@ -89,10 +89,16 @@ fn current_tid() -> u32 {
     })
 }
 
-fn now_us() -> u64 {
+fn now_us() -> f64 {
+    // Microseconds as f64 carrying sub-µs (nanosecond) precision. Chrome-trace
+    // `ts` is conventionally microseconds and accepts floats, so this stays
+    // perfetto/speedscope-compatible AND gives nanosecond resolution — exact
+    // ns numbers for aggregate span sums and for short (sub-µs) spans, which
+    // integer-µs truncation was silently dropping. Unit is still µs (hence the
+    // name); it's just fractional now.
     state()
-        .map(|s| s.anchor.elapsed().as_micros() as u64)
-        .unwrap_or(0)
+        .map(|s| s.anchor.elapsed().as_nanos() as f64 / 1000.0)
+        .unwrap_or(0.0)
 }
 
 fn flush_locked(buf: &mut Vec<u8>) {
@@ -137,12 +143,12 @@ pub fn emit_begin(name: &str, args_body: &str) {
     let tid = current_tid();
     let line = if args_body.is_empty() {
         format!(
-            r#"{{"name":"{name}","ph":"B","ts":{ts},"pid":{GZIPPY_PID},"tid":{tid}}},
+            r#"{{"name":"{name}","ph":"B","ts":{ts:.3},"pid":{GZIPPY_PID},"tid":{tid}}},
 "#
         )
     } else {
         format!(
-            r#"{{"name":"{name}","ph":"B","ts":{ts},"pid":{GZIPPY_PID},"tid":{tid},"args":{{{args_body}}}}},
+            r#"{{"name":"{name}","ph":"B","ts":{ts:.3},"pid":{GZIPPY_PID},"tid":{tid},"args":{{{args_body}}}}},
 "#
         )
     };
@@ -156,7 +162,7 @@ pub fn emit_end(name: &str) {
     let ts = now_us();
     let tid = current_tid();
     let line = format!(
-        r#"{{"name":"{name}","ph":"E","ts":{ts},"pid":{GZIPPY_PID},"tid":{tid}}},
+        r#"{{"name":"{name}","ph":"E","ts":{ts:.3},"pid":{GZIPPY_PID},"tid":{tid}}},
 "#
     );
     append_event(&line);
@@ -172,12 +178,12 @@ pub fn emit_instant(name: &str, args_body: &str, scope: &str) {
     let tid = current_tid();
     let line = if args_body.is_empty() {
         format!(
-            r#"{{"name":"{name}","ph":"i","ts":{ts},"pid":{GZIPPY_PID},"tid":{tid},"s":"{scope}"}},
+            r#"{{"name":"{name}","ph":"i","ts":{ts:.3},"pid":{GZIPPY_PID},"tid":{tid},"s":"{scope}"}},
 "#
         )
     } else {
         format!(
-            r#"{{"name":"{name}","ph":"i","ts":{ts},"pid":{GZIPPY_PID},"tid":{tid},"s":"{scope}","args":{{{args_body}}}}},
+            r#"{{"name":"{name}","ph":"i","ts":{ts:.3},"pid":{GZIPPY_PID},"tid":{tid},"s":"{scope}","args":{{{args_body}}}}},
 "#
         )
     };
