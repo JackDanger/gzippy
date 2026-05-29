@@ -415,8 +415,25 @@ pub(crate) fn decompress_single_member_libdeflate<W: Write>(
         match decompressor.gzip_decompress_ex(data, &mut output) {
             Ok(result) => {
                 writer.write_all(&output[..result.output_size])?;
+                let mut total = result.output_size as u64;
+                // Multi-member gzip (RFC 1952 §2.2; `cat a.gz b.gz`, pigz, log
+                // rotation): `gzip_decompress_ex` decodes ONE member and
+                // reports `input_consumed`. If another member follows, decode
+                // the remainder — otherwise we'd SILENTLY TRUNCATE to the first
+                // member (classify() can land a multi-member file here when its
+                // 2nd member starts past the 16 MiB detection window). Zero cost
+                // on a true single member: input_consumed == data.len().
+                let consumed = result.input_consumed;
+                if consumed < data.len()
+                    && data.len() - consumed >= 2
+                    && data[consumed] == 0x1f
+                    && data[consumed + 1] == 0x8b
+                {
+                    total += decompress_multi_member_sequential(&data[consumed..], writer)?;
+                    return Ok(total);
+                }
                 writer.flush()?;
-                return Ok(result.output_size as u64);
+                return Ok(total);
             }
             Err(DecompressError::InsufficientSpace) => {
                 let new_size = output.len().saturating_mul(2);
