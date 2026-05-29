@@ -12,11 +12,11 @@ it is **NOT in the inner Huffman loop** — that is at the Rust-vs-hand-C floor.
 The gap is, in descending order of impact:
 
 1. **Parallel scaling** — gzippy plateaus at T=8 while rapidgzip scales to T=16
-   (a ~2× *multiplier*, the dominant end-to-end gap). [biggest, not yet started]
-2. **The resumable-contract tax (1.33×)** — the production decoder
-   (`ResumableInflate2`) pays it on every chunk; larger than the whole
-   inner-loop algorithm gap, and it ships. [**current focus — the "work
-   outward" next step from the inner loop**]
+   (a ~2× *multiplier*, the dominant end-to-end gap). [**CURRENT FOCUS**]
+2. **The resumable-contract tax (1.33×)** — [SUBSTANTIVELY CLOSED 2026-05-28]
+   the tractable win (inline-match-copy, f01eb74, +5% T16) landed; the rest is
+   the silesia floor (avg_batch 1.32 — short literal runs; batching more is
+   falsified) + a small-ceiling packed-store (also falsified). See §2.
 3. **Allocator / page-faults (~33% CPU)** — partly shared with rapidgzip; the
    easy levers (global rpmalloc, prewarm, hugepage) are falsified. [later]
 
@@ -41,7 +41,7 @@ rapidgzip ≈ 1.6–1.8× our throughput; the ratio **grows** with thread count
 (1.64× at T=4 → 2.12× at T=16) — the signature of a serial bottleneck, not a
 per-symbol cost.
 
-## 2. CURRENT FOCUS — the resumable-contract tax (1.33×)
+## 2. [CLOSED] the resumable-contract tax (1.33×)
 
 `ResumableInflate2` does 1.33× the instructions of the same-repo non-resumable
 `consume_first` decoder — the cost of the yield-on-output-fill contract
@@ -51,18 +51,20 @@ landed inline-match-copy (commit f01eb74) already cut −22.6% of the resumable
 inner instructions and +5.2% T=16 wall by removing the per-match
 `copy_match_windowed` call.
 
-Next moves to investigate (plan + advisor-review each before implementing):
-- Quantify fastloop vs safe-loop residency (`BODY_RESUMABLE_FASTLOOP_ENTERS`) —
-  frequent fall-out of the FASTLOOP = the tax being paid.
-- The FASTLOOP_MARGIN yield-elide (CLAUDE.md explicitly authorizes eliding the
-  yield-check tax when output has ≥ FASTLOOP_MARGIN headroom).
-- Reduce per-match state writeback / pending_match bookkeeping the non-resumable
-  path doesn't pay.
+CLOSED 2026-05-28 after investigation (asmlens diff + a batch-ratio probe):
+- The unroll / FASTLOOP_MARGIN yield-elide is DEAD — the fastloop already elides
+  per-symbol yield checks, and the loop condition fires once per
+  `decode_one_symbol!` invocation (continue-batching), with the 320 B margin too
+  small to amortize further.
+- Batch-ratio probe: **avg_batch = 1.32** symbols/invocation on silesia (~68%
+  single-symbol) = the silesia floor (short literal runs). Batching more is
+  falsified (de-ladder). The residual delta is a small-ceiling packed-store
+  (also falsified, +0.4%). (A) loop-cond / (B) speculative-miss / (C) yield
+  machinery all ruled out as the dominant tax.
+- Net: the tractable part was the landed inline-match-copy. No remaining
+  tractable lever here → §3 is the focus. (See project_inner_loop_resumable_tax.)
 
-Validate every change on `inner_bench` (instructions, deterministic) + the
-frozen pinned wall A/B + correctness (silesia byte-identical + boundary test).
-
-## 3. BIGGEST eventual lever — parallel scaling (T=8 → T=16)
+## 3. CURRENT FOCUS — parallel scaling (T=8 → T=16), the multiplier
 
 gzippy plateaus at T=8; rapidgzip scales to T=16. Suspected serial bottleneck:
 the single consumer thread (reorder + CRC + `apply_window`/`replace_markers`
