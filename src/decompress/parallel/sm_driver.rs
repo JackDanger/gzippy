@@ -73,6 +73,10 @@ pub fn read_parallel_sm<W: std::io::Write>(
         });
     }
 
+    // Allocator visibility (GZIPPY_RPMALLOC_STATS=1): show whether the
+    // decode's span allocations were warm-reused (cache) or re-mapped (faults).
+    crate::decompress::parallel::rpmalloc_alloc::dump_global_stats("post-decode");
+
     Ok(ReadResult {
         total_crc,
         total_size,
