@@ -243,12 +243,15 @@ def critical_path(events: List[dict]) -> List[Tuple[str, int, int, int]]:
     return [(n, t, dur, dur / wall if wall else 0) for (n, t), dur in rank[:20]]
 
 
-def fmt_us(us: int) -> str:
+def fmt_us(us: float) -> str:
+    # `us` is fractional microseconds (trace_v2 now emits ns precision).
     if us >= 1_000_000:
-        return f"{us / 1_000_000:.2f}s"
+        return f"{us / 1_000_000:.3f}s"
     if us >= 1000:
-        return f"{us / 1000:.1f}ms"
-    return f"{us}us"
+        return f"{us / 1000:.2f}ms"
+    if us >= 1:
+        return f"{us:.2f}us"
+    return f"{us * 1000:.0f}ns"
 
 
 def print_summary(s: dict):
