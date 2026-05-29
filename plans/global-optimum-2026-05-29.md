@@ -108,20 +108,61 @@ silesia-bgzf (212 MB) vs silesia-large single-member (503 MB):
 | 8  | **6100**  | 1837  |
 | 16 | **7029**  | 1734  |
 
-gzippy's parallel pipeline + buffer pool + allocator sustain **6100 MB/s at
-T8 (2.4× past rapidgzip's 2571)** with a clean engine. The single-member
-plateau (1837) is therefore **100% the marker-speculation engine**, NOT the
-data model. **D1 (segmented buffers / allocator / right-size) is DEAD** —
-the fault/DRAM/working-set symptoms are downstream of the slow engine
-holding buffers live longer + doing 2× marker traffic. The advisor's
-refutation is confirmed by measurement.
+**CORRECTION (2026-05-29, user caught the overclaim):** This is NOT a clean
+kill-test and "D1 is dead" is RETRACTED. BGZF parallel uses **libdeflate
+(C) FFI** (`bgzf.rs:473`), a **separate pipeline** (`bgzf.rs`, not
+`single_member.rs`), on **independent 64 KiB blocks** (empty window by
+construction). The single-member 1837 uses a **different backend** (ISA-L C
+for clean tails + gzippy **pure-Rust ResumableInflate2** for the 156 MB
+window-absent bootstrap) AND window-dependent 4 MB chunks. So 6100 vs 1837
+moves FOUR variables at once: (a) markers vs none, (b) libdeflate vs
+ISA-L+Rust, (c) bgzf pipeline vs single-member pipeline, (d) independent vs
+window-dependent blocks. It CANNOT attribute the gap to the engine alone.
 
-Caveat: BGZF uses small independent blocks (empty window by construction) +
-libdeflate; single-member uses 4 MB chunks + ISA-L + window dependency. Not
-perfectly apples-to-apples, but the 3.3× internal gap (6100 vs 1837) is far
-too large to be backend/block-size — it is the engine.
+What 6100 honestly establishes: the hardware/memory subsystem + gzippy's
+process can sustain ~6 GB/s with libdeflate on independent blocks → 1837 is
+NOT a hardware/IO cap. It does NOT isolate the single-member data model from
+the engine. The CLEAN discriminator is still the advisor's actual oracle:
+disable markers INSIDE the single-member pipeline (same buffer pool, same
+consumer, same ISA-L backend, known windows) so only the engine variable
+moves. D1 vs D2 remains OPEN until that runs.
 
-### THE TARGET (revised): kill the slow window-absent marker path
+### REAL three-way numbers + corrected attribution (2026-05-29)
+
+Audit finding (verified file:line): the SHIPPED x86_64 binary AND all prior
+session benchmarks (`--features isal-compression`) use **C ISA-L FFI** for
+clean chunks; gzippy's OWN pure-Rust `ResumableInflate2` is reachable only
+under `--features pure-rust-inflate` (ships nowhere). So prior "single-member"
+numbers measured a C library, not gzippy's decoder, for clean bytes.
+
+Built both binaries; frozen, P-pinned, best-of-7, silesia-large (503 MB),
+gzippy-PURE byte-exact (c070ed84):
+
+| T  | gzippy-PURE (own Rust) | gzippy-ISAL (C) | rapidgzip |
+|----|------------------------|------------------|-----------|
+| 1  | 898  | 1083 | 884  |
+| 4  | 1150 | 1378 | 1726 |
+| 8  | 1623 | 1835 | 2235 |
+| 16 | 1211 | 1477 | 2340 |
+
+Corrected attribution:
+- pure-Rust engine ~12% behind C ISA-L (achievement, unshipped).
+- **T8 gap to rapidgzip (22%) is MOSTLY ENGINE, not pipeline.** gzippy-ISAL
+  IPC 1.44 ≈ rapidgzip 1.42 → at equal IPC, rapidgzip executes fewer
+  instructions/byte → the 156 MB pure-Rust **bootstrap overshoot** is the
+  extra work. (My "22% is pipeline" was wrong — re-derived the retracted
+  BGZF conclusion.)
+- **T16 "collapse" is an HT/topology artifact, not a pipeline bug.** perf
+  T8→T16: instructions FLAT (10.94B→11.10B), page-faults +9% only, IPC
+  1.44→0.92 (16 threads on 8 physical P-cores contend for ports). Box has
+  8 fast P-cores; gzippy is execution-port-bound so HT doesn't help;
+  rapidgzip is memory-bound so it does. Not a fixable gzippy bug.
+
+HARD-RESET DECISION (advisor): **NO.** The inner-loop commits are correct,
+measured-positive, on-goal, and the bootstrap path is pure-Rust in the
+shipped binary too. Falsified pipeline levers already reverted/gated-OFF.
+
+### THE TARGET (revised again): the 156 MB bootstrap overshoot is ENGINE work
 
 Root cause (per [[project_sm_bootstrap_overshoot_2026_05_29]]): silesia uses
 large deflate blocks (2–14 MB). gzippy can't hand off from the slow pure-Rust
