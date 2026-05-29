@@ -52,14 +52,15 @@ for entry in "${CORPUS[@]}"; do
   [ -f "$path" ] || { printf "## %-16s MISSING (%s)\n" "$label" "$path"; continue; }
   usize=$(gunzip -c "$path" 2>/dev/null | wc -c)
   printf "\n## %s  (%s, decompressed %d bytes)\n" "$label" "$path" "$usize"
+  # single-threaded competitors are constant across T — measure once
+  l=$(mbps "$(best 0 $LD "$path")" "$usize")
+  z=$(mbps "$(best 0 $ZNG "$path")" "$usize")
+  pg=$(mbps "$(best 0 pigz -d -c "$path")" "$usize")
   printf "   %-4s %-10s %-10s %-10s %-10s %-10s  %s\n" "T" "gzippy" "rapidgzip" "libdefl" "zlib-ng" "pigz" "VERDICT"
   for t in "${THREADS[@]}"; do
     p="${PIN[$t]}"
     g=$(mbps "$(best "$p" $GZ -d -c -p "$t" "$path")" "$usize")
     r=$(mbps "$(best "$p" $RG -d -c -f -P "$t" "$path")" "$usize")
-    l=$(mbps "$(best 0 $LD "$path")" "$usize")
-    z=$(mbps "$(best 0 $ZNG "$path")" "$usize")
-    pg=$(mbps "$(best 0 pigz -d -c "$path")" "$usize")
     verdict=$(awk -v g="$g" -v r="$r" -v l="$l" -v z="$z" 'BEGIN{
       loses=""; if(g<r)loses=loses" rapidgzip"; if(g<l)loses=loses" libdeflate"; if(g<z)loses=loses" zlib-ng";
       print (loses==""?"WIN":"LOSES:"loses) }')
