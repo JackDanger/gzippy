@@ -53,6 +53,29 @@ pub fn decompress_gzip_stream<W: std::io::Write>(input: &[u8], writer: &mut W) -
         }
 
         if state.block_state == isal_raw::isal_block_state_ISAL_BLOCK_FINISH {
+            // Multi-member gzip: a single .gz file may be the concatenation of
+            // several members (RFC 1952 §2.2; `cat a.gz b.gz`, pigz, log
+            // rotation). ISA-L finishes ONE member, leaving `next_in`/`avail_in`
+            // pointing at the residual. If another gzip member follows, re-init
+            // and keep decoding — otherwise we'd SILENTLY TRUNCATE to the first
+            // member (the bug this fixes; classify() can misroute a multi-member
+            // file here when its 2nd member starts past the 16 MiB detection
+            // window). Zero cost on a true single member: avail_in == 0 → return.
+            if state.avail_in >= 2 {
+                let next = state.next_in;
+                let b0 = unsafe { *next };
+                let b1 = unsafe { *next.add(1) };
+                if b0 == 0x1f && b1 == 0x8b {
+                    let saved_next = state.next_in;
+                    let saved_avail = state.avail_in;
+                    unsafe { isal_raw::isal_inflate_init(&mut state) };
+                    state.crc_flag = isal_raw::IGZIP_GZIP;
+                    state.next_in = saved_next;
+                    state.avail_in = saved_avail;
+                    continue;
+                }
+            }
+            // No further member (or trailing non-gzip bytes): done.
             return Some(total);
         }
         if written == 0 && state.avail_in == 0 {

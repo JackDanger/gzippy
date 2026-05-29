@@ -1430,6 +1430,46 @@ mod tests {
         );
     }
 
+    /// Regression (2026-05-29): a multi-member gzip whose SECOND member starts
+    /// past the 16 MiB `is_likely_multi_member` detection window is misrouted
+    /// to the single-member backend. The single-member backends (ISA-L
+    /// `decompress_gzip_stream` and `decompress_single_member_libdeflate`) must
+    /// consume-and-loop residual members so the FULL output is produced — not
+    /// silently truncated to member 1. Real-world shape: `cat big.gz small.gz`.
+    /// Before the fix this produced member 1 only (silent corruption).
+    #[test]
+    fn test_concatenated_members_large_first_member_no_truncation() {
+        // member 1: 17 MiB incompressible → > 16 MiB compressed → the 2nd
+        // member's magic falls outside the scan window → misrouted single.
+        let mut m1 = vec![0u8; 17 * 1024 * 1024];
+        let mut s = 0x9e3779b97f4a7c15u64;
+        for b in &mut m1 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (s >> 33) as u8;
+        }
+        let m2 = b"second member payload after a >16MiB first member".to_vec();
+        let mut gz = compress_single_member(&m1);
+        gz.extend_from_slice(&compress_single_member(&m2));
+
+        // Guard: the fixture must actually trigger the single-member misroute.
+        assert!(
+            !crate::decompress::format::is_likely_multi_member(&gz),
+            "fixture must be misdetected single-member (2nd member past 16 MiB)"
+        );
+
+        let mut expected = m1.clone();
+        expected.extend_from_slice(&m2);
+        for t in [1usize, 4] {
+            let out = crate::decompress::decompress_gzip_to_vec(&gz, t).unwrap();
+            assert_eq!(
+                out.len(),
+                expected.len(),
+                "T{t}: multi-member output truncated (silent corruption regression)"
+            );
+            assert_eq!(out, expected, "T{t}: multi-member output mismatch");
+        }
+    }
+
     #[test]
     fn test_routing_single_member_parallel_thread_independence_large() {
         let data = make_mixed(6 * 1024 * 1024);
