@@ -220,6 +220,92 @@ fn compress(data: &[u8], level: u32) -> Vec<u8> {
     enc.finish().unwrap()
 }
 
+// ── Marker-decoder (deflate_block::Block) fuzz differential ──────────────────
+//
+// E2 gap closer: `decode_via_gzippy` above uses num_threads=1 and deliberately
+// avoids the parallel-SM / marker path, so the window-absent marker decoder
+// (`deflate_block::Block`) — the code the COLLAPSE (plans/decoder-plan.md E3)
+// will rewrite — had ZERO fuzz coverage (only one silesia md5). This decodes
+// raw DEFLATE through `Block` directly (from offset 0, empty window → all
+// output is clean, no markers emitted) and asserts byte-exactness vs both the
+// libdeflate oracle and the original payload, over fuzzed inputs. It is the
+// safety net the collapse validates against per commit.
+#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+fn decode_via_deflate_block(gz: &[u8]) -> Vec<u8> {
+    use crate::decompress::inflate::consume_first_decode::Bits;
+    use crate::decompress::parallel::deflate_block::Block;
+    use crate::decompress::parallel::replace_markers::MARKER_BASE;
+
+    let (_h, header) =
+        crate::decompress::parallel::gzip_format::read_header(gz).expect("parse gzip header");
+    let raw = &gz[header..gz.len() - 8];
+    let mut block = Block::new();
+    block.reset(None, None);
+    let mut bits = Bits::new(raw);
+    let mut out16: Vec<u16> = Vec::new();
+    loop {
+        if block.read_header(&mut bits, false).is_err() {
+            break;
+        }
+        while !block.eob() {
+            block
+                .read(&mut bits, &mut out16, usize::MAX)
+                .expect("deflate_block read");
+        }
+        if block.is_last_block() {
+            break;
+        }
+    }
+    // From offset 0 with no predecessor window, no back-ref can reach before
+    // the start → no markers → every value is a literal byte.
+    out16
+        .iter()
+        .map(|&v| {
+            assert!(
+                v < MARKER_BASE,
+                "offset-0 decode emitted a marker (={v:#x})"
+            );
+            v as u8
+        })
+        .collect()
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+#[test]
+fn deflate_block_marker_decoder_fuzz_200_cases() {
+    let mut rng_seed: u64 = 0x1234_5678_9abc_def0;
+    for case in 0..200 {
+        rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let size = ((rng_seed >> 32) as usize) % (96 * 1024) + 1;
+        let mut rng = rng_seed ^ 0xFEED_FACE_CAFE_BABE;
+        let mut payload = Vec::with_capacity(size);
+        // Mix random bytes with periodic repetitive runs so flate2 emits real
+        // back-references/matches (exercises the match-copy in the Block loop),
+        // not just literal/stored blocks.
+        for i in 0..size {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if (rng >> 40) & 7 == 0 {
+                payload.push((i % 37) as u8);
+            } else {
+                payload.push((rng >> 24) as u8);
+            }
+        }
+        let level = ((rng_seed >> 8) as u32) % 10;
+        let gz = compress(&payload, level);
+        let exact = isize_from_trailer(&gz);
+        let oracle = decode_via_libdeflate(&gz, exact);
+        let dblock = decode_via_deflate_block(&gz);
+        assert_eq!(
+            dblock, oracle,
+            "deflate_block marker-decoder fuzz case {case} (size {size}, L{level}) disagrees with libdeflate"
+        );
+        assert_eq!(
+            dblock, payload,
+            "deflate_block marker-decoder fuzz case {case} (size {size}, L{level}) != original payload"
+        );
+    }
+}
+
 // ── Coverage tests: corpora across all DEFLATE block-type frequencies ──
 
 #[test]
