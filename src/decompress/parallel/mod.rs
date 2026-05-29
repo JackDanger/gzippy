@@ -93,6 +93,7 @@ pub mod rfc_tables;
     any(feature = "isal-compression", feature = "pure-rust-inflate")
 ))]
 pub mod rpmalloc_alloc;
+pub mod segmented_buffer;
 pub mod single_member;
 pub mod sm_cfg;
 #[cfg(all(
