@@ -218,13 +218,13 @@ impl LitLenEntry {
     #[inline(always)]
     pub fn decode_length(self, saved_bitbuf: u64) -> u32 {
         let base = self.length_base() as u32;
-        let codeword_bits = self.codeword_bits();
-        let total_bits = self.total_bits();
-        let extra_bits = total_bits - codeword_bits;
-        let extra_value = crate::decompress::inflate::bmi2::decode_extra_bits(
+        // libdeflate-form extraction from the two pre-baked fields — no
+        // per-symbol `total_bits - codeword_bits` subtract (the diffuse
+        // ALU-op cost vs libdeflate; decompress_template.h:495-496).
+        let extra_value = crate::decompress::inflate::bmi2::extract_varbits(
             saved_bitbuf,
-            codeword_bits,
-            extra_bits,
+            self.codeword_bits(),
+            self.total_bits(),
         ) as u32;
         base + extra_value
     }
@@ -318,14 +318,11 @@ impl DistEntry {
     #[inline(always)]
     pub fn decode_distance(self, saved_bitbuf: u64) -> u32 {
         let base = self.distance_base() as u32;
-        let codeword_bits = self.codeword_bits();
-        let total_bits = self.total_bits();
-        let extra_bits = total_bits - codeword_bits;
-        // Use BMI2 _bzhi_u64 when available for faster bit extraction
-        let extra_value = crate::decompress::inflate::bmi2::decode_extra_bits(
+        // libdeflate-form extraction — no per-symbol subtract (see decode_length).
+        let extra_value = crate::decompress::inflate::bmi2::extract_varbits(
             saved_bitbuf,
-            codeword_bits,
-            extra_bits,
+            self.codeword_bits(),
+            self.total_bits(),
         ) as u32;
         base + extra_value
     }
