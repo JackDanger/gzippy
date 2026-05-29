@@ -21,3 +21,6 @@
 	path = vendor/isal-rs
 	url = https://github.com/JackDanger/isal-rs.git
 	branch = gzippy-stopping-points
+[submodule "vendor/zlib-ng"]
+	path = vendor/zlib-ng
+	url = https://github.com/zlib-ng/zlib-ng

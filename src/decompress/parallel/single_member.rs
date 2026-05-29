@@ -160,8 +160,17 @@ pub fn decompress_parallel<W: Write>(
         // ISIZE verification + chunk_fetcher::drive orchestration all
         // live in the new driver (mirror of vendor's
         // `ParallelGzipReader::read` at ParallelGzipReader.hpp:553-646).
-        let chunk_size =
-            adjusted_chunk_size_bytes(gzip_data.len(), num_threads, TARGET_COMPRESSED_CHUNK_BYTES);
+        // Granularity probe (2026-05-29): GZIPPY_CHUNK_KIB overrides the
+        // 4 MiB default chunk target so a T=16 chunk-count sweep can
+        // discriminate "T16 regression is straggler/granularity" from
+        // "T16 regression is HT microarchitecture" without a rebuild per
+        // size. Falls back to TARGET_COMPRESSED_CHUNK_BYTES when unset.
+        let default_chunk = std::env::var("GZIPPY_CHUNK_KIB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|kib| kib * 1024)
+            .unwrap_or(TARGET_COMPRESSED_CHUNK_BYTES);
+        let chunk_size = adjusted_chunk_size_bytes(gzip_data.len(), num_threads, default_chunk);
         if chunk_size < TARGET_COMPRESSED_CHUNK_BYTES {
             ADJUSTED_CHUNK_SIZE_APPLIED.fetch_add(1, Ordering::Relaxed);
         }
