@@ -54,6 +54,37 @@ fn decode_consume_first(deflate: &[u8], out: &mut [u8]) -> usize {
         .expect("consume_first")
 }
 
+// Window-absent BOOTSTRAP decoder (`deflate_block::Block`) — the marker-path
+// inner loop that decodes ~31% of silesia (the speculative window-absent
+// chunks) at ~175 MB/s in production. Decoding from offset 0 with no window
+// exercises the SAME per-symbol decode (IsalLitLenCodePure litlen +
+// get_distance_dynamic/apply_distance_extra + u16-ring writes) that runs on
+// the marker path, isolating its instructions/byte from the parallel pipeline.
+// This is the measurement gate for the bootstrap-unification lever.
+#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+fn decode_bootstrap(deflate: &[u8], out16: &mut Vec<u16>) -> usize {
+    use gzippy::decompress::inflate::consume_first_decode::Bits;
+    use gzippy::decompress::parallel::deflate_block::Block;
+    let mut block = Block::new();
+    block.reset(None, None);
+    let mut bits = Bits::new(deflate);
+    out16.clear();
+    loop {
+        if block.read_header(&mut bits, false).is_err() {
+            break;
+        }
+        while !block.eob() {
+            if block.read(&mut bits, out16, usize::MAX).is_err() {
+                return out16.len();
+            }
+        }
+        if block.is_last_block() {
+            break;
+        }
+    }
+    out16.len()
+}
+
 fn main() {
     let which = std::env::args().nth(1).unwrap_or_else(|| "pure".into());
     let iters: usize = std::env::args()
@@ -65,6 +96,28 @@ fn main() {
         .unwrap_or_else(|| "benchmark_data/silesia-gzip.tar.gz".into());
 
     let deflate = load_raw_deflate(&path);
+
+    // Bootstrap (window-absent marker-path) mode uses a u16 output buffer.
+    #[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+    if which == "bootstrap" {
+        let mut out16: Vec<u16> = Vec::with_capacity(deflate.len() * 4);
+        let t0 = Instant::now();
+        let mut total = 0usize;
+        let mut out_len = 0usize;
+        for _ in 0..iters {
+            out_len = decode_bootstrap(&deflate, &mut out16);
+            total += out_len;
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        eprintln!(
+            "decoder=bootstrap iters={iters} out_len={out_len} total_bytes={total} \
+             wall={secs:.3}s {:.0} MB/s  (perf: instructions/{total} = ins/byte)",
+            total as f64 / secs / 1e6,
+        );
+        println!("{total}");
+        return;
+    }
+
     // Over-allocate a generous output buffer ONCE (deflate ratio is well under
     // 8x). NO libdeflate sizing-probe: a probe decode contaminated every run
     // (~16% of a `consume_first` perf-stat was actually the one libdeflate
