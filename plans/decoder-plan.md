@@ -1,106 +1,161 @@
-# gzippy decoder plan — ONE pure-Rust DEFLATE engine (canonical, 2026-05-29)
+# gzippy decoder plan — ONE pure-Rust DEFLATE engine (canonical v2, 2026-05-29)
 
-Supersedes `decoder-collapse-sequence.md`, `pure-rust-everywhere.md`,
-`global-optimum-2026-05-29.md` (kept in git history for the falsification record).
+v2 incorporates a 3-angle Opus review (direct critique + premortem + full
+architectural planning). Supersedes prior plans (git history keeps them).
 
-## THE DELIVERABLE (single, with a binary done-test)
+## THE DELIVERABLE
 
-> **gzippy ships ONE pure-Rust DEFLATE engine as its only decode path —
-> byte-exact on a fuzzed corpus, and at least as fast as
-> libdeflate/ISA-L/zlib-ng/rapidgzip on every archive type × thread count —
-> with `isal-rs`, `libdeflate-sys`, and `zlib-ng` deleted from the production
-> dependency tree.**
+> gzippy ships ONE pure-Rust DEFLATE engine as its only decode path —
+> byte-exact on a continuous fuzz corpus, ≥ libdeflate/ISA-L/zlib-ng/rapidgzip
+> on every **decoder-closable** cell (structural cells justified, see done-test
+> #5), with `isal-rs`/`libdeflate-sys`/`zlib-ng` removed from the production
+> dep graph (kept behind a `dev`/`oracle` feature as permanent CI oracles).
 
-"Done" = all five, each checkable:
-1. **One engine.** `Inflate<Mode>` with `Clean`(u8) + `Markers`(u16) modes
-   sharing ONE FASTLOOP, one `Bits`, one dynamic-header parser. `deflate_block::Block`,
-   `consume_first_decode`'s decode loops, `isal_lut_bulk`, and the LUT graveyard
-   are DELETED — `grep` finds one decode loop.
-2. **Sole path.** `decompress/mod.rs` routes every format (single-member
-   T1+parallel, multi-member, BGZF, all arches) to `Inflate`. No FFI inflate
-   call remains on a production path.
-3. **C gone.** `isal-rs`/`libdeflate-sys`/`zlib-ng` exist only behind a
-   `dev`/`oracle` feature for differential tests; the default/release dep graph
-   has none.
-4. **Correct.** lib tests + a proptest/fuzz corpus + silesia/multimember/bgzf
-   all byte-exact vs flate2 AND libdeflate.
-5. **Fast.** `tools/bench/matrix.sh` (interleaved-delta harness) shows gzippy ≥
-   every competitor on every cell — OR a written, measured justification that the
-   residual is STRUCTURAL (tiny-file process startup; T16 on an 8-P-core box),
-   with the decoder itself at parity.
+### Done-test (binary, checkable)
+1. **One engine.** `Inflate<M: DecodeMode, O: OutputModel>` (Clean-u8 /
+   Markers-u16 × Owned / Streaming) with ONE shared `decode_huffman_body<S: OutputSink>`,
+   one `Bits`, one header parser. `deflate_block::Block`, `consume_first_decode`
+   loops, `isal_lut_bulk`, the LUT graveyard DELETED.
+2. **Sole path.** Every format routes to `Inflate`; no FFI inflate on a
+   production path **on a platform that has flipped** (per-platform, done-test #5b).
+3. **C gone (per-platform).** `isal-rs`/`libdeflate-sys`/`zlib-ng` only behind
+   `dev`/`oracle`; a platform's prod dep graph drops them only after that
+   platform shows measured ≥parity.
+4. **Correct.** lib tests + **continuous cargo-fuzz (dual-oracle: flate2 AND
+   libdeflate, adversarial seed corpus)** + silesia/multimember/bgzf/>1GiB-stream/
+   seekable-index all byte-exact. C oracles diffed in CI forever.
+5. **Fast — against a PRE-CLASSIFIED cell list (no self-judged waivers):**
+   - **Closable (must hit literal ≥parity):** single-member T1, single-member
+     T2–T8, multi-member all-T, bgzf all-T, incompressible, L9.
+   - **Structural (waiver allowed, with a written measured TMA/attribution
+     justification; a NEW waiver needs adversary-advisor sign-off, not self):**
+     tiny-file (~300 µs irreducible Rust process startup); single-member T9–T16
+     on an 8-P-core box (hardware core count); and single-member T4–T8 vs
+     rapidgzip ONLY IF the pre-E3 TMA attribution (M0.3) shows <50% of that gap
+     is inner-loop/decoder-closable.
 
-## Measurement discipline (hard-won; non-negotiable)
+## M0 — MEASUREMENT & ADVISOR-FEEDBACK STRATEGY (do FIRST; gates everything)
 
-- **Wall:** only INTERLEAVED-delta A/B (both binaries one trial loop, share
-  contention, report the delta) — the box has ~15-20% absolute jitter that
-  swamps non-interleaved comparisons. Freeze LXC 111+105, pin physical P-cores
-  (`0,2,4,6,8,10,12,14`, not `0-15`), turbo ON.
-- **Sub-10% / inner-loop:** deterministic `inner_bench` instructions/byte
-  (`pure`/`consume_first`/`libdeflate`/`bootstrap` modes) — jitter-immune.
-- **Correctness gate every commit:** silesia md5 `c070ed84` + multimember/bgzf
-  roundtrips + (once built) the fuzz corpus, vs flate2 AND libdeflate.
-- Build the pure engine: `--no-default-features --features pure-rust-inflate`.
-  The parallel-SM + deflate_block code is x86_64-gated — **validate on the box**
-  (aarch64 silently compiles it out; this trap bit us twice).
+Every later phase is validated by these; establishing them first is the
+highest-leverage work (per the review, most failures are measurement
+self-deception or unguarded regressions).
 
-## Current state (this session, all committed on reimplement-isa-l)
+**Wall perf:** ONLY interleaved-delta A/B (both binaries one trial loop, share
+contention, report the DELTA; absolute is meaningless — box has ~15-20% jitter).
+Freeze LXC 111+105, pin physical P-cores `0,2,4,6,8,10,12,14`, turbo ON.
+**No wall number enters a commit message unless it's an interleaved-delta, n≥5.**
 
-- `0c` consolidated 2 FASTLOOPs → 1 (`d15e35e`, +7% interleaved).
-- A2 step 1 subtract-elimination (`d4c9294`, −2.5% ins/byte).
-- Bootstrap instrumentation (`ed4ca13`) — REFUTED Design B1 (post-flip clean = 2.7%).
-- `inner_bench bootstrap` mode (`e68be90`) — MEASURED marker path = **27.4 ins/byte**
-  (2.1× our clean loop, 3.1× libdeflate), on 31% of output. Mechanism: `deflate_block`
-  runs a SEPARATE unoptimized loop (IsalLitLenCodePure + canonical distance + u16
-  ring) instead of the FASTLOOP. **The collapse is the biggest quantified lever.**
-- Reliable interleaved-delta + `inner_bench` harness built; `vector_huffman` deleted.
+**Inner-loop perf:** deterministic `inner_bench` instructions/byte (jitter-immune):
+modes `pure` / `consume_first` / `libdeflate` / `bootstrap` (marker path). Build
+the **`markers` mode FIRST** for E3 (measures `Inflate<Markers>` in isolation).
 
-## Execution order — enablers first (each makes the next safer/easier)
+**Codegen-diff guard (NEW, the architect's #1 containment):** a `make`/CI check
+that disassembles `Inflate<Clean,Owned>::decode_huffman_body` and asserts ZERO
+`call` in the FASTLOOP region + instruction count within ±2% of a checked-in
+golden. Converts a silent trait-inline deopt of the clean path into a hard
+every-commit failure. Live from the first trait commit (E3.2).
 
-**E1 — finish the dead-code delete (0b).** Shrinks the surface so the collapse
-is legible and there's one fewer decoder to reason about. Dependency-ordered
-(callers before modules), build+test green after each:
-`double_literal` (pre-verified all-dead: `decode_huffman_double_lit`,
-`decode_huffman_cf_double`, `get_fixed_double_lit_cache`, `bench_double_literal`)
-→ bgzf's dead decode path (`decode_*_into`, `decompress_single_member_parallel`
-+ tests) → then the now-orphaned LUT modules (`combined_lut`, `packed_lut`,
-`simd_huffman`, `two_level_table`, `ultra_fast_inflate`).
+**Dual-arch CI gate (NEW, kills the cfg trap that bit twice):** CI builds AND
+runs the corpus test for BOTH `x86_64` and `aarch64` (`--no-default-features
+--features pure-rust-inflate`) every commit on this branch. An arch-only break
+becomes loud, not "caught only on the box."
 
-**E2 — the golden fuzz/differential harness (0a).** THE safety net for the
-collapse and everything after: a proptest + corpus differential that decodes
-through the pure engine vs flate2 AND libdeflate, byte+CRC. Snapshot each
-decoder's golden output vectors BEFORE it is deleted. Run in-process at the
-decode-primitive level (NOT the parallel pipeline — avoids the known test
-deadlock and isolates the engine).
+**Pre-registered kill-numbers (NEW):** before writing a lever's code, write its
+abandon threshold. E3: "abandon the unified-markers path if, after the first
+complete `RingSink` prototype, `inner_bench markers` is not ≤ [13 + measured
+u16/ring/scan floor from M0.3] AND interleaved-delta T8 is not ≥ +[X]%."
 
-**E3 — THE COLLAPSE (biggest lever).** Implement `Inflate<Markers>` u16
-emission on the FASTLOOP so the marker decode shares the optimized loop
-(27.4 → toward 13 + marker overhead on 31% of output). Markers mode = the
-clean FASTLOOP + a per-match "distance > out_pos ⇒ emit marker instead of
-copy" branch (rare); reuse the fast literal/length decode + bit refill.
-Env-gated default-OFF; per-step byte-exact via E2 + `inner_bench bootstrap`;
-interleaved-delta T8 wall to bank the win. Then route the bootstrap through it
-and delete `deflate_block::Block`.
+**No same-session win-banking on irreversible deletes:** a perf win that
+precedes deleting a decoder (e.g. `deflate_block`) must be re-confirmed in a
+SECOND independent run before the delete commit.
 
-**E4 — A2 remainder.** Close the 1.20× resumable-contract tax + residual
-algorithmic gap (pure 13 → libdeflate 8.6). Deterministic `inner_bench`.
+**M0.3 — TMA attribution of the rapidgzip T8/T16 gap (NEW, before E3):** perf
+TMA on gzippy-pure vs rapidgzip at T8 and T16; state what fraction is
+inner-loop (decoder-closable) vs backend-memory/parallel-scaling (structural).
+This decides whether T4–T8-vs-rapidgzip is a closable cell or a structural
+waiver (done-test #5). Cheap; do before betting E3 on it.
 
-**E5 — generalize (Phase 4).** Make Clean the sole path for single-member
-T1/streaming, multi-member, BGZF, arm64/NEON — replacing ISA-L/libdeflate/zlib-ng.
-Env-gated longest; flip default per-format only at ≥parity + byte-exact on the
-full corpus. Highest ship-risk → gate longest.
+**Advisor-feedback strategy (process rule, mechanized):** consult an Opus
+advisor (Agent `claude`) BEFORE: each design fork, each claimed-done, each
+surprise, and each irreversible delete. Specifically — adversary sign-off
+required for: any new structural-cell waiver; the E3 kill-number; deleting
+`deflate_block`/C deps. Use multi-angle (critique + premortem + architecture)
+for plan-level decisions, single adversary for lever-level.
 
-**E6 — demolish (Phase 5).** Delete `isal-rs`/`libdeflate-sys`/`zlib-ng` from
-Cargo (keep behind `dev`/`oracle`); update CLAUDE.md routing + release.yml.
+## Architecture (from the full architectural-planning pass)
 
-**E7 — close/justify the remaining cells.** incompressible (stored-block bulk
-memcpy fast path); bgzf-T1 (falls out of E5); tiny (static-link investigation —
-flag as structural if irreducible); single-member T4-16 (the collapse + A2
-move it; the T16-on-8-P-cores ceiling is structural — justify in writing).
+Collapse the two inner loops (`resumable.rs` FASTLOOP ~13 ins/byte +
+`deflate_block.rs` marker loop 27.4 ins/byte) into ONE generic body:
 
-## Honest caveats
-- Multi-week effort. E3 and E5 are the long poles.
-- Done-test line 5 includes 1-2 STRUCTURAL cells (process startup, physical
-  core count) that a faster Huffman loop cannot close — the deliverable
-  documents those with measured justification rather than pretending parity.
-- Correctness is the prime directive: no unvalidated decoder change ships; every
-  step is one gated, bisectable commit.
+```rust
+fn decode_huffman_body<S: OutputSink>(bits, sink: &mut S, litlen, dist, marker: &mut S::Marker) -> ...
+```
+
+- `DecodeMode`: `Clean{Elem=u8, Sink=LinearSink, Marker=NoMarkers, EMITS_MARKERS=false}`
+  vs `Markers{Elem=u16, Sink=RingSink, Marker=RingMarkers, EMITS_MARKERS=true}`.
+- `OutputSink` (sealed, 2 impls): `put_literal`, `copy_match` (the divergence —
+  LinearSink = linear+overshoot+AVX; RingSink = ring-modulo + pre-init marker
+  zone), `headroom`, `position`. `#[inline(always)]` over ZST/pointer receivers;
+  NO `dyn`; split `copy_match` into `#[inline(always)]` hot + `#[inline(never)]`
+  cold (window/wrap/RLE) so the hot path always inlines.
+- `MarkerPolicy`: `NoMarkers` (ZST, empty bodies → vanish) / `RingMarkers`
+  (the `distance_to_last_marker_byte` + backward scan). Gated by `const ACTIVE`.
+- `OutputModel`: `Owned{PER_ITER_YIELD_CHECKS=false}` (one-shot, no resumable
+  tax) / `Streaming{=true}` (yield-on-fill for the parallel-SM wrapper).
+- **DROP `ArchProfile` as a type axis** — SIMD lives in 2 runtime-dispatched
+  leaf helpers (bit-extract, match-copy), not a monomorphization axis.
+- Approach **(a)-via-trait**, NOT (b)-bolt-markers-onto-ResumableInflate2 (that
+  drags the SlidingWindow slow path into the marker case — wrong dependency).
+
+## Current state (committed, reimplement-isa-l)
+0c consolidate 2 FASTLOOPs→1 (`d15e35e`, +7%); A2 subtract-elim (`d4c9294`,
+−2.5% ins/byte); bootstrap instrumentation refuting B1 (`ed4ca13`); `inner_bench
+bootstrap` (`e68be90`, marker path = 27.4 ins/byte); E2 marker-fuzz seed
+(`e630f01`, 200 cases — to be hardened into continuous dual-oracle fuzz);
+plan v2 (this). Interleaved-delta + inner_bench harness built; `vector_huffman` deleted.
+
+## Execution order (re-sequenced per the review)
+
+- **M0** — measurement & advisor strategy above: build the codegen-diff guard +
+  dual-arch CI + `markers` inner_bench mode + run M0.3 TMA attribution +
+  pre-classify cells. FIRST.
+- **E2** — harden the fuzz harness into continuous cargo-fuzz, dual-oracle
+  (flate2+libdeflate), adversarial seed corpus (marker/clean straddle,
+  max-distance back-refs, degenerate Huffman, stored boundaries, empty dynamic
+  blocks), + snapshot `Block` golden vectors. NO E3 code until this exists.
+- **E1** — delete dead code (after E2's snapshot capability exists, so nothing
+  deletable is lost): `double_literal` → bgzf dead decode path → orphaned LUT modules.
+- **E3** — THE COLLAPSE via `OutputSink` (E3.1 extract FASTLOOP to generic body,
+  flat; E3.2 traits+LinearSink, codegen-guard live; E3.3 RingSink unit-tested;
+  E3.4 env-gated wire-in, fuzz+inner_bench; E3.5 bank interleaved-delta, flip;
+  E3.6 delete old marker loop + ISA-L huffman). Kill-number pre-registered.
+- **E6 (per-format, decoupled from E4)** — flip each format's default to the
+  pure engine the moment it's at parity for that platform, and delete the C dep
+  for that platform. "C gone" is the deliverable; don't block it on E4 polish.
+- **E5a** — generalize x86 (single-member T1/streaming/>1GiB, multi-member,
+  bgzf, seekable-index) through `Inflate` drivers in `drivers.rs`.
+- **E5b** — arm64 NEON parity (separate done-test; arm64 correctness is
+  immediate scalar Rust, NEON is a perf leaf in `copy_match`).
+- **E4 (optional polish)** — close the residual 13→8.6 algorithmic gap + the
+  1.20× resumable tax. ONLY after E6 ships. Don't churn micro-levers (project
+  record warns); gate every attempt on `inner_bench` + a kill-number.
+- **E7** — close/justify the pre-classified cells.
+
+## Top risks (premortem) + baked-in mitigations
+1. Collapse ships a silent correctness regression on adversarial input → M0/E2
+   continuous dual-oracle fuzz + golden vectors BEFORE any E3 code.
+2. Collapse is perf-neutral (27.4→13 wishful) → M0.3 attribution sets a measured
+   floor; pre-registered kill-number; markers inner_bench first.
+3. Deleting C regresses arm64/Mac (no ISA-L/NEON) → per-platform parity gate on
+   C deletion (done-test #3); keep libdeflate as arm64 prod path until E5b proven.
+4. "≥ everyone everywhere" never converges / micro-lever churn → pre-classified
+   finite cell set; E6 ahead of E4; E4 optional.
+5. Measurement self-deception → interleaved-delta-only for wall, no same-session
+   banking on deletes, codegen-diff guard.
+6. cfg trap (3rd bite) → dual-arch CI build+corpus gate.
+7. inner_bench green but wall flat (drain is ~half the marker tax) → E3 success
+   gate is interleaved-delta T8 wall, not inner_bench alone.
+
+## Prime directive
+Correctness over speed, always. One gated, bisectable commit per step. No
+unvalidated decoder change ships. Multi-week effort; pace it.
