@@ -354,6 +354,66 @@ pub fn drive<W: std::io::Write>(
     parallelization: usize,
     configuration: ChunkConfiguration,
 ) -> Result<(u32, usize), FetchError> {
+    drive_impl(input, writer, parallelization, configuration, None)
+}
+
+/// Clean-window oracle (advisor 2026-05-29): the cheapest experiment that
+/// discriminates "is the marker/copy/bootstrap pipeline the rapidgzip gap"
+/// from "the gap is inner-loop / scan". Decode every chunk with its TRUE
+/// predecessor window so NO chunk takes the speculative bootstrap path —
+/// no markers, hence no `append_markered` / `absorb_isal_tail` /
+/// `narrow_u16_to_u8` copies. Pass 1 runs the normal speculative decode to
+/// a sink, populating a shared `WindowMap` with every chunk-boundary
+/// window; pass 2 re-runs with that map pre-seeded (every
+/// `window_map.get(start_bit)` HITS → `decode_chunk_isal`) and is the
+/// TIMED measurement. Reuses the entire production pool/consumer/decoder —
+/// apples-to-apples with production minus speculation. Output is correct
+/// (windows from pass 1 are real), so byte-exactness is verifiable.
+/// Triggered by `GZIPPY_CLEAN_WINDOW_ORACLE=1`.
+pub fn drive_clean_window_oracle<W: std::io::Write>(
+    input: &[u8],
+    writer: &mut W,
+    parallelization: usize,
+    configuration: ChunkConfiguration,
+) -> Result<(u32, usize), FetchError> {
+    let seed = WindowMap::with_compression(
+        crate::decompress::parallel::compressed_vector::CompressionType::None,
+    );
+    // Pass 1: populate the shared window map (output discarded).
+    let mut sink = std::io::sink();
+    drive_impl(
+        input,
+        &mut sink,
+        parallelization,
+        configuration,
+        Some(seed.clone()),
+    )?;
+    // Pass 2: TIMED — every chunk now finds its predecessor window and
+    // takes the clean known-window decode path.
+    let t = std::time::Instant::now();
+    let r = drive_impl(
+        input,
+        writer,
+        parallelization,
+        configuration,
+        Some(seed.clone()),
+    )?;
+    let secs = t.elapsed().as_secs_f64();
+    let mb = r.1 as f64 / secs / 1e6;
+    eprintln!(
+        "CLEAN_WINDOW_ORACLE pass2 wall={secs:.4}s out={} bytes {mb:.0} MB/s ({parallelization} workers)",
+        r.1
+    );
+    Ok(r)
+}
+
+fn drive_impl<W: std::io::Write>(
+    input: &[u8],
+    writer: &mut W,
+    parallelization: usize,
+    configuration: ChunkConfiguration,
+    seed_window_map: Option<WindowMap>,
+) -> Result<(u32, usize), FetchError> {
     let _tv2 = trace_v2::SpanGuard::begin_with(
         "drive",
         &format!(
@@ -379,9 +439,13 @@ pub fn drive<W: std::io::Write>(
     // reader where windows accumulate (memory pressure matters). For
     // single-pass single-member decode each window is published and
     // consumed once; compress/decompress overhead is pure waste.
-    let window_map = WindowMap::with_compression(
-        crate::decompress::parallel::compressed_vector::CompressionType::None,
-    );
+    // Oracle mode injects a pre-populated map (clean-window experiment);
+    // production passes None and builds a fresh one.
+    let window_map = seed_window_map.unwrap_or_else(|| {
+        WindowMap::with_compression(
+            crate::decompress::parallel::compressed_vector::CompressionType::None,
+        )
+    });
     // Chunk 0's input window is empty by definition (start of stream).
     // Vendor pattern: insert an empty / zero window so subsequent
     // get(0) lookups return a valid SharedWindow rather than nullptr.
