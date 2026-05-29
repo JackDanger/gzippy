@@ -20,6 +20,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <link.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,7 +30,7 @@
 
 static void *(*real_memmove)(void *, const void *, size_t);
 static void *(*real_memcpy)(void *, const void *, size_t);
-static uintptr_t exe_lo, exe_hi;
+static uintptr_t exe_lo, exe_hi, load_bias; /* bias = addr - ELF vaddr (for addr2line) */
 static size_t min_bytes = 1024;
 
 #define NSLOT 16384
@@ -37,25 +38,22 @@ static struct { uintptr_t addr; uint64_t bytes; uint64_t count; } tbl[NSLOT];
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread int in_hook = 0;
 
-static void read_maps(void) {
-    char exe[512];
-    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
-    if (n < 0) return;
-    exe[n] = 0;
-    FILE *f = fopen("/proc/self/maps", "r");
-    if (!f) return;
-    char line[1024], perms[8], path[768];
-    uintptr_t lo, hi;
-    while (fgets(line, sizeof line, f)) {
-        path[0] = 0;
-        if (sscanf(line, "%lx-%lx %7s %*x %*x:%*x %*d %767[^\n]", &lo, &hi, perms, path) >= 3) {
-            if (perms[2] == 'x' && path[0] && strstr(path, exe)) {
-                if (exe_lo == 0 || lo < exe_lo) exe_lo = lo;
-                if (hi > exe_hi) exe_hi = hi;
-            }
+/* The first dl_iterate_phdr entry is the main executable. Record its load
+ * bias (dlpi_addr) and the runtime range of its executable PT_LOAD segments.
+ * file_vaddr passed to addr2line = runtime_addr - dlpi_addr. */
+static int phdr_cb(struct dl_phdr_info *info, size_t sz, void *data) {
+    (void)sz; (void)data;
+    load_bias = info->dlpi_addr; /* main exe is first */
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *p = &info->dlpi_phdr[i];
+        if (p->p_type == PT_LOAD && (p->p_flags & PF_X)) {
+            uintptr_t lo = info->dlpi_addr + p->p_vaddr;
+            uintptr_t hi = lo + p->p_memsz;
+            if (exe_lo == 0 || lo < exe_lo) exe_lo = lo;
+            if (hi > exe_hi) exe_hi = hi;
         }
     }
-    fclose(f);
+    return 1; /* stop after the first object (main exe) */
 }
 
 __attribute__((constructor)) static void init(void) {
@@ -63,7 +61,7 @@ __attribute__((constructor)) static void init(void) {
     real_memcpy = dlsym(RTLD_NEXT, "memcpy");
     const char *m = getenv("MMTRACE_MIN");
     if (m) min_bytes = strtoull(m, 0, 10);
-    read_maps();
+    dl_iterate_phdr(phdr_cb, 0);
 }
 
 static uintptr_t first_exe_frame(void) {
@@ -113,7 +111,7 @@ __attribute__((destructor)) static void dump(void) {
         for (size_t i = 0; i < NSLOT; i++)
             if (tbl[i].addr && tbl[i].bytes > bb) { bb = tbl[i].bytes; best = i; }
         if (best == NSLOT) break;
-        fprintf(f, "%016lx %12llu %10llu\n", (unsigned long)tbl[best].addr,
+        fprintf(f, "%016lx %12llu %10llu\n", (unsigned long)(tbl[best].addr - load_bias),
                 (unsigned long long)tbl[best].bytes, (unsigned long long)tbl[best].count);
         tbl[best].bytes = 0; /* consumed; bb>0 guard skips it next pass */
     }
