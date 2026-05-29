@@ -2426,7 +2426,14 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn gzip");
-        std::io::Write::write_all(child.stdin.as_mut().expect("stdin"), head).expect("write");
+        // Feed stdin on a worker thread while draining stdout here, else
+        // gzip's stdout pipe fills mid-write and deadlocks (see
+        // gzip_chunk::cross_chunk_resume for the same fix).
+        let mut stdin = child.stdin.take().expect("stdin");
+        let head_owned = head.to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = std::io::Write::write_all(&mut stdin, &head_owned);
+        });
         let mut gz = Vec::new();
         child
             .stdout
@@ -2434,6 +2441,7 @@ mod tests {
             .expect("stdout")
             .read_to_end(&mut gz)
             .expect("read gzip stdout");
+        writer.join().expect("stdin writer thread");
         let _ = child.wait();
 
         let chunk_size = 4 * 1024 * 1024;
