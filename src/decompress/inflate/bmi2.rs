@@ -96,6 +96,28 @@ pub fn decode_extra_bits(saved_bitbuf: u64, codeword_bits: u8, extra_bits: u8) -
     }
 }
 
+/// libdeflate-form extra-bits extraction: mask to `total_bits` THEN shift
+/// right by `codeword_bits`. Identical result to
+/// `decode_extra_bits(buf, codeword_bits, total_bits - codeword_bits)` but
+/// takes the two PRE-BAKED entry fields directly, eliminating the per-symbol
+/// `total_bits - codeword_bits` subtract from the hot loop (matches
+/// libdeflate's `EXTRACT_VARBITS8(bitbuf, entry) >> (u8)(entry >> 8)` at
+/// `decompress_template.h:495-496`). `total_bits >= codeword_bits` always
+/// (total = codeword + extra), so the masked value's low `codeword_bits` are
+/// the codeword and the shift drops them, leaving the extra-bits value.
+#[inline(always)]
+pub fn extract_varbits(saved_bitbuf: u64, codeword_bits: u8, total_bits: u8) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        std::arch::x86_64::_bzhi_u64(saved_bitbuf, total_bits as u32) >> codeword_bits
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mask = (1u64 << total_bits).wrapping_sub(1);
+        (saved_bitbuf & mask) >> codeword_bits
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
