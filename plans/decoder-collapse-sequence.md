@@ -60,9 +60,26 @@ Huffman decode logic; the two output modes and the handoff are plumbing.
 ## The ordered sequence (advisor-reviewed 2026-05-29)
 
 ### Phase 0 — foundation
-- **0b FIRST: delete the graveyard** (the DEAD list above). Zero prod callers.
+- **0b FIRST: delete the graveyard** (the DEAD list above). Zero *production*
+  callers, but NOT leaf-dead — verified 2026-05-29 the LUT modules are wired
+  into dead-but-present code, so deletion is DEPENDENCY-ORDERED (delete callers
+  before modules, or the build breaks mid-way):
+  1. Delete `bgzf.rs`'s dead pure-Rust decode path first: `decode_stored_into` /
+     `decode_fixed_into` / `decode_dynamic_into`, `decompress_single_member_parallel`,
+     `get_fixed_tables`, and their TESTS (the only callers of `ultra_fast_inflate`
+     at bgzf.rs:6597/7281, `CombinedLUT`, `PackedLUT`, `simd_huffman::MultiSymTable`,
+     `two_level_table::{FastBits,TurboBits,TwoLevelTable}`).
+  2. Delete `consume_first_decode.rs`'s dead inner-loop variants
+     (`decode_huffman_cf_vector` → frees `vector_huffman`; the dead
+     `double_literal` users at :1933).
+  3. THEN delete the now-unreferenced leaf modules: `ultra_fast_inflate`,
+     `two_level_table`, `simd_huffman`, `combined_lut`, `packed_lut`,
+     `vector_huffman`, `double_literal`, + their `mod` decls in
+     `decompress/mod.rs` / `inflate/mod.rs`.
   Done before freezing any baseline so dead code can't perturb layout/icache.
-  Gate: `make` + full tests + production routing unchanged.
+  Gate after EACH sub-step: `cargo build` + `cargo test --release` green +
+  production routing unchanged. (Multi-step surgical untangle, not a flat rm —
+  needs a fresh context budget to run the build/test cycles to completion.)
 - **0a: build the primitive-level golden differential + bench harness** and
   snapshot golden output vectors for A, B, C, D on the corpus (silesia +
   multimember + edge cases). Freeze the clean-path bench baseline on the lean
