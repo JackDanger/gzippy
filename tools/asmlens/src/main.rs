@@ -10,6 +10,12 @@
 //! Multi-arch on purpose: same tool for the x86 bench box and the arm64 (M4)
 //! native Rust-decoder builds we'll optimize later.
 //!
+//! CAVEAT: the per-source-line DWARF attribution is UNRELIABLE for our Rust at
+//! -O3 (heavy inlining destroys the line table — expect line-0 buckets and
+//! occasional misattribution to unrelated inlined sites). Trust the static
+//! structure, opcode histogram, loop detection, and per-FUNCTION dynamic totals;
+//! treat per-line as a hint only. (libdeflate's C line table is clean.)
+//!
 //! Usage:
 //!   asmlens <binary> --sym <substr> [--sym <substr2>] [--perf <perf-ip-file>]
 //!
@@ -259,6 +265,8 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         eprintln!("usage: asmlens <binary> --sym <substr> [--sym <substr2>] [--perf <perf-ip-file>]");
+        eprintln!("note: per-line source attribution is unreliable at -O3 for Rust (inlining);");
+        eprintln!("      trust static/opcode/per-function-dynamic; treat per-line as a hint.");
         std::process::exit(2);
     }
     let bin = &args[0];
