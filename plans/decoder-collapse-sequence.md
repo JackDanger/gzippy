@@ -83,9 +83,17 @@ silesia perf corpus.
      `get_fixed_tables`, and their TESTS (the only callers of `ultra_fast_inflate`
      at bgzf.rs:6597/7281, `CombinedLUT`, `PackedLUT`, `simd_huffman::MultiSymTable`,
      `two_level_table::{FastBits,TurboBits,TwoLevelTable}`).
-  2. Delete `consume_first_decode.rs`'s dead inner-loop variants
-     (`decode_huffman_cf_vector` → frees `vector_huffman`; the dead
-     `double_literal` users at :1933).
+  2. Delete `consume_first_decode.rs`'s dead inner-loop variants.
+     - DONE (commit 7ca654a): `decode_huffman_cf_vector` + the `vector_huffman`
+       module (validated: builds + roundtrip + 61 tests).
+     - NEXT, pre-verified all-dead (zero callers, 2026-05-29): `double_literal`
+       removal = delete `decode_huffman_double_lit` (libdeflate_decode.rs ~795) +
+       `#[test] fn bench_double_literal` (libdeflate_decode.rs ~1180) +
+       `decode_huffman_cf_double` (consume_first_decode.rs ~1896) +
+       `get_fixed_double_lit_cache` (consume_first_decode.rs ~1849) + the
+       `double_literal` module + its mod decl (inflate/mod.rs:21). Then check the
+       other dead `decode_huffman_*` variants the audit named (decode_huffman_optimized,
+       _flat, _with_dispatch, decode_with_specialized_tables, decode_generic_with_spec).
   3. THEN delete the now-unreferenced leaf modules: `ultra_fast_inflate`,
      `two_level_table`, `simd_huffman`, `combined_lut`, `packed_lut`,
      `vector_huffman`, `double_literal`, + their `mod` decls in
