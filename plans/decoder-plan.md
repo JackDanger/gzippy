@@ -30,9 +30,16 @@ architectural planning). Supersedes prior plans (git history keeps them).
    - **Structural (waiver allowed, with a written measured TMA/attribution
      justification; a NEW waiver needs adversary-advisor sign-off, not self):**
      tiny-file (~300 µs irreducible Rust process startup); single-member T9–T16
-     on an 8-P-core box (hardware core count); and single-member T4–T8 vs
-     rapidgzip ONLY IF the pre-E3 TMA attribution (M0.3) shows <50% of that gap
-     is inner-loop/decoder-closable.
+     on an 8-P-core box (hardware core count); and **single-member T4–T8 vs
+     rapidgzip — CONFIRMED STRUCTURAL by M0.3 (2026-05-29, interleaved best-of-15
+     T8): pure 1709 / isal 1818 / rapidgzip 2483. Only 14.1% of the
+     pure→rapidgzip gap is inner-loop (pure→isal, closable by collapse+A2);
+     85.9% is isal→rapidgzip = pipeline/memory/parallel-scaling, NOT
+     decoder-closable.** ⇒ the collapse does NOT make gzippy beat rapidgzip at
+     T4–T8; it closes the 14% inner-loop slice (matching ISA-L, enabling C
+     deletion). Beating rapidgzip here requires a SEPARATE parallel-pipeline /
+     buffer-lifecycle / allocator re-port (out of the decoder's scope; a future
+     deliverable, not this one).
 
 ## M0 — MEASUREMENT & ADVISOR-FEEDBACK STRATEGY (do FIRST; gates everything)
 
