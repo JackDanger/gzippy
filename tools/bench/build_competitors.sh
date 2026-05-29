@@ -27,9 +27,9 @@ cmake --build vendor/libdeflate/build -j"$JOBS" >/dev/null
 echo "== build zlib-ng (static, zlib-compat) =="
 cmake -S vendor/zlib-ng -B vendor/zlib-ng/build \
   -DCMAKE_BUILD_TYPE=Release -DZLIB_COMPAT=ON -DBUILD_SHARED_LIBS=OFF \
-  -DWITH_GTEST=OFF -DZLIB_ENABLE_TESTS=OFF -DZLIBNG_ENABLE_TESTS=OFF \
+  -DWITH_GTEST=OFF \
   -DCMAKE_C_FLAGS="-O3 -march=native" >/dev/null
-cmake --build vendor/zlib-ng/build -j"$JOBS" --target zlib >/dev/null
+cmake --build vendor/zlib-ng/build -j"$JOBS" >/dev/null
 
 echo "== compile front-ends =="
 gcc -O3 -march=native tools/bench/ld_gunzip.c \
