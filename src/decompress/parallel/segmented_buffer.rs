@@ -114,6 +114,68 @@ impl SegmentedU8 {
         }
     }
 
+    /// Zero-copy decode sink: return a writable slice into the tail
+    /// segment's spare capacity for a decoder to write DIRECTLY into
+    /// (no intermediate buffer, no copy). Allocates a fresh 128 KiB
+    /// segment when the tail is full, so the returned slice is always
+    /// `[0, ALLOCATION_CHUNK_SIZE - tail.len())` bytes — uninitialized
+    /// but writable. After the decoder writes N bytes, call
+    /// [`Self::commit`] to record them. This is how `ResumableInflate2`
+    /// (resumable: stops when `output` fills) decodes a chunk one
+    /// segment at a time — its 32 KiB window ring resolves back-refs
+    /// across segment boundaries (deflate max distance 32 KiB ≤ the
+    /// 128 KiB segment, so the ring always covers them).
+    ///
+    /// SAFETY contract: the caller must only WRITE into the returned
+    /// slice (it aliases uninitialized spare capacity) and must call
+    /// `commit(n)` with `n <= slice.len()` before the next mutating call.
+    pub fn writable_tail(&mut self) -> &mut [u8] {
+        let needs_new = match self.segments.last() {
+            Some(seg) => seg.len() >= ALLOCATION_CHUNK_SIZE,
+            None => true,
+        };
+        if needs_new {
+            let mut seg = types::u8_with_capacity(ALLOCATION_CHUNK_SIZE);
+            seg.reserve_exact(ALLOCATION_CHUNK_SIZE);
+            self.segments.push(seg);
+        }
+        let last = self.segments.last_mut().unwrap();
+        let len = last.len();
+        // SAFETY: the tail segment has capacity >= ALLOCATION_CHUNK_SIZE
+        // (allocated above or by `reserve`), so `[len, ALLOCATION_CHUNK_SIZE)`
+        // is owned, writable spare capacity. The slice is uninitialized;
+        // the caller writes before any read, then calls `commit`.
+        unsafe {
+            std::slice::from_raw_parts_mut(last.as_mut_ptr().add(len), ALLOCATION_CHUNK_SIZE - len)
+        }
+    }
+
+    /// Record `n` bytes written into the slice returned by
+    /// [`Self::writable_tail`]. Bumps the tail segment's length and the
+    /// cached total. Panics in debug if `n` exceeds the tail's spare.
+    pub fn commit(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let last = self
+            .segments
+            .last_mut()
+            .expect("commit without a preceding writable_tail");
+        let new_len = last.len() + n;
+        debug_assert!(
+            new_len <= last.capacity(),
+            "commit {n} overflows tail spare (len {} cap {})",
+            last.len(),
+            last.capacity()
+        );
+        // SAFETY: bytes `[old_len, old_len+n)` were just written by the
+        // caller through the `writable_tail` slice; `new_len <= capacity`.
+        unsafe {
+            last.set_len(new_len);
+        }
+        self.cached_len += n;
+    }
+
     /// Iterate over the segments as byte slices, in append order.
     /// Used by the consumer's write path:
     ///
@@ -330,5 +392,50 @@ mod tests {
         assert_eq!(restored.len(), 11);
         let cat: Vec<u8> = restored.segments().flatten().copied().collect();
         assert_eq!(cat, b"first batch");
+    }
+
+    #[test]
+    fn writable_tail_commit_zero_copy_decode() {
+        // Mimics a resumable decoder writing into segment spare capacity
+        // directly, across the 128 KiB segment boundary.
+        let mut buf = SegmentedU8::default();
+        {
+            let s = buf.writable_tail();
+            assert_eq!(s.len(), ALLOCATION_CHUNK_SIZE);
+            for b in s[..100 * 1024].iter_mut() {
+                *b = 0x11;
+            }
+        }
+        buf.commit(100 * 1024);
+        assert_eq!(buf.len(), 100 * 1024);
+        assert_eq!(buf.segment_count(), 1);
+
+        let room;
+        {
+            let s = buf.writable_tail(); // same segment, 28 KiB spare left
+            room = s.len();
+            assert_eq!(room, ALLOCATION_CHUNK_SIZE - 100 * 1024);
+            for b in s.iter_mut() {
+                *b = 0x22;
+            }
+        }
+        buf.commit(room);
+        assert_eq!(buf.len(), ALLOCATION_CHUNK_SIZE);
+        assert_eq!(buf.segment_count(), 1);
+
+        {
+            let s = buf.writable_tail(); // tail full -> fresh segment
+            assert_eq!(s.len(), ALLOCATION_CHUNK_SIZE);
+            s[0] = 0x33;
+        }
+        buf.commit(1);
+        assert_eq!(buf.segment_count(), 2);
+        assert_eq!(buf.len(), ALLOCATION_CHUNK_SIZE + 1);
+
+        let cat = buf.to_contiguous();
+        assert_eq!(cat[0], 0x11);
+        assert_eq!(cat[100 * 1024 - 1], 0x11);
+        assert_eq!(cat[100 * 1024], 0x22);
+        assert_eq!(cat[ALLOCATION_CHUNK_SIZE], 0x33);
     }
 }
