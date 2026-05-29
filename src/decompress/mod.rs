@@ -82,6 +82,39 @@ pub enum DecodePath {
 /// silent in-body fallback.
 pub(crate) const MIN_PARALLEL_COMPRESSED: usize = 10 * 1024 * 1024;
 
+/// Compression ratio (uncompressed / compressed) below which the speculative
+/// parallel single-member pipeline is a NET LOSS and we route to the one-shot
+/// path instead.
+///
+/// Stored-dominated / incompressible data has very sparse deflate-block
+/// boundaries, so the block finder's spacing-aligned arithmetic guesses never
+/// land on a real boundary: every speculative chunk fails to validate (header
+/// / body speculation failures) and decode serializes — measured 3–4× SLOWER
+/// than a single ISA-L pass. (2026-05-29 matrix: random100 collapses from T1
+/// 7263 MB/s to T8 1963 MB/s; GZIPPY_VERBOSE showed 228 header + 69 body
+/// speculation failures.) The ratio cleanly separates incompressible (~1.00)
+/// from compressible silesia (~3.1); 1.15 leaves margin.
+const PARALLEL_SM_MIN_RATIO_NUM: u64 = 115;
+const PARALLEL_SM_MIN_RATIO_DEN: u64 = 100;
+
+/// True when a single-member stream is too incompressible for the speculative
+/// parallel pipeline to pay off (see [`PARALLEL_SM_MIN_RATIO_NUM`]).
+///
+/// Uses the gzip ISIZE trailer (uncompressed size mod 2^32). For the rare
+/// single-member stream whose true uncompressed size ≥ 4 GiB *and* is highly
+/// compressible, ISIZE wraps and this may mis-fire — a perf-only miss (it
+/// picks the correct, just non-parallel, one-shot decoder), never a
+/// correctness issue.
+fn parallel_sm_unprofitable(data: &[u8]) -> bool {
+    match read_gzip_isize(data) {
+        Some(isize_bytes) => {
+            (isize_bytes as u64) * PARALLEL_SM_MIN_RATIO_DEN
+                < (data.len() as u64) * PARALLEL_SM_MIN_RATIO_NUM
+        }
+        None => false,
+    }
+}
+
 /// Classify a gzip input into the optimal `DecodePath`.
 ///
 /// Single source of truth for routing. All classification logic lives here;
@@ -101,6 +134,7 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
     if crate::decompress::parallel::sm_cfg::PARALLEL_SM
         && num_threads > 1
         && data.len() > MIN_PARALLEL_COMPRESSED
+        && !parallel_sm_unprofitable(data)
     {
         return DecodePath::IsalParallelSM;
     }
@@ -528,6 +562,37 @@ mod tests {
     ))]
     use std::sync::atomic::Ordering;
 
+    /// Build a moderately-compressible single-member gzip fixture whose
+    /// compressed size clears `MIN_PARALLEL_COMPRESSED` AND whose ratio clears
+    /// the `parallel_sm_unprofitable` gate (~2:1), so it routes to the parallel
+    /// SM path. (Incompressible fixtures now correctly route to one-shot, so
+    /// parallel-path tests must use compressible data.) Returns (original,
+    /// compressed). 32 MiB of 4-bit-entropy bytes → ~16 MiB compressed.
+    fn compressible_parallel_fixture() -> (Vec<u8>, Vec<u8>) {
+        let mut original = vec![0u8; 32 * 1024 * 1024];
+        let mut state = 0xc0ffeeu64;
+        for b in &mut original {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = ((state >> 32) as u8) & 0x0F;
+        }
+        let mut compressed = Vec::new();
+        {
+            let mut enc = GzEncoder::new(&mut compressed, Compression::default());
+            enc.write_all(&original).unwrap();
+            enc.finish().unwrap();
+        }
+        assert!(
+            compressed.len() > MIN_PARALLEL_COMPRESSED,
+            "fixture must clear parallel gate (got {} bytes)",
+            compressed.len()
+        );
+        assert!(
+            !parallel_sm_unprofitable(&compressed),
+            "fixture must be compressible enough to route parallel"
+        );
+        (original, compressed)
+    }
+
     /// The classifier — not an in-body fallback — is the only place that
     /// decides whether parallel SM runs. An input that satisfies the
     /// gate must classify to `IsalParallelSM` on x86_64+ISA-L hosts and
@@ -535,21 +600,7 @@ mod tests {
     /// switch backends inside `decompress_single_member`.
     #[test]
     fn test_classify_routes_at_classifier_not_in_body() {
-        let mut raw = vec![0u8; 12 * 1024 * 1024];
-        let mut state = 0x12345678u64;
-        for b in &mut raw {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *b = (state >> 32) as u8;
-        }
-        let mut payload = Vec::new();
-        let mut enc = flate2::write::GzEncoder::new(&mut payload, Compression::default());
-        enc.write_all(&raw).unwrap();
-        enc.finish().unwrap();
-        assert!(
-            payload.len() > MIN_PARALLEL_COMPRESSED,
-            "fixture must exceed parallel gate (got {} bytes)",
-            payload.len()
-        );
+        let (_raw, payload) = compressible_parallel_fixture();
         let path = classify_gzip(&payload, 4);
         #[cfg(all(
             target_arch = "x86_64",
@@ -571,6 +622,47 @@ mod tests {
         );
     }
 
+    /// Incompressible single-member input above the size gate must NOT take
+    /// the speculative parallel pipeline — on stored-dominated data the block
+    /// finder's spacing guesses never hit a real boundary and the pipeline is
+    /// 3-4× slower than a single ISA-L pass (2026-05-29 matrix). It must route
+    /// to the one-shot path instead via `parallel_sm_unprofitable`.
+    #[test]
+    fn test_incompressible_single_member_bails_to_one_shot() {
+        // 16 MiB of high-entropy bytes -> compressed ~= raw, ratio ~1.0.
+        let mut original = vec![0u8; 16 * 1024 * 1024];
+        let mut state = 0xdeadbeefu64;
+        for b in &mut original {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (state >> 32) as u8;
+        }
+        let mut compressed = Vec::new();
+        {
+            let mut enc = GzEncoder::new(&mut compressed, Compression::default());
+            enc.write_all(&original).unwrap();
+            enc.finish().unwrap();
+        }
+        assert!(
+            compressed.len() > MIN_PARALLEL_COMPRESSED,
+            "fixture clears the size gate (got {} bytes)",
+            compressed.len()
+        );
+        assert!(
+            parallel_sm_unprofitable(&compressed),
+            "incompressible input must be flagged unprofitable for parallel SM"
+        );
+        // Even at T=4 it must NOT classify parallel.
+        assert_ne!(
+            classify_gzip(&compressed, 4),
+            DecodePath::IsalParallelSM,
+            "incompressible single-member must bail off the speculative pipeline"
+        );
+        // And it must still decode byte-perfectly through whatever path it took.
+        let mut out = Vec::new();
+        decompress_single_member(&compressed, &mut out, 4).expect("must decode");
+        assert_eq!(out, original, "byte-perfect output required after bail");
+    }
+
     /// On a parallel-eligible input the libdeflate one-shot backend must
     /// never be called from the single-member dispatcher. This is the
     /// no-fallback invariant the user asked for: under no circumstances
@@ -584,25 +676,10 @@ mod tests {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        // Build an input above MIN_PARALLEL_COMPRESSED so the classifier
-        // returns IsalParallelSM.
-        let mut original = vec![0u8; 24 * 1024 * 1024];
-        let mut state = 0xc0ffeeu64;
-        for b in &mut original {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *b = (state >> 32) as u8;
-        }
-        let mut compressed = Vec::new();
-        {
-            let mut enc = GzEncoder::new(&mut compressed, Compression::default());
-            enc.write_all(&original).unwrap();
-            enc.finish().unwrap();
-        }
-        assert!(
-            compressed.len() > MIN_PARALLEL_COMPRESSED,
-            "fixture must clear the parallel gate (got {} bytes)",
-            compressed.len()
-        );
+        // Compressible fixture above MIN_PARALLEL_COMPRESSED so the
+        // classifier returns IsalParallelSM (incompressible would now bail
+        // to one-shot via parallel_sm_unprofitable).
+        let (original, compressed) = compressible_parallel_fixture();
         let before_lib = LIBDEFLATE_SM_CALLS.load(Ordering::Relaxed);
         let mut out = Vec::new();
         decompress_single_member(&compressed, &mut out, 4).expect("must succeed");
@@ -629,15 +706,7 @@ mod tests {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let original: Vec<u8> = (0u32..(24 * 1024 * 1024))
-            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
-            .collect();
-        let mut compressed = Vec::new();
-        {
-            let mut enc = GzEncoder::new(&mut compressed, Compression::default());
-            enc.write_all(&original).unwrap();
-            enc.finish().unwrap();
-        }
+        let (_original, mut compressed) = compressible_parallel_fixture();
         // Flip a byte deep in the deflate stream; CRC check at the end
         // of the parallel SM path catches the corruption.
         let mid = compressed.len() / 2;
