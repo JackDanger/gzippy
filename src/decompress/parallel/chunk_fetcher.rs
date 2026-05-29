@@ -395,20 +395,11 @@ pub fn drive<W: std::io::Write>(
     // The BlockFetcher owns the cache, prefetch cache, prefetch queue
     // (`m_prefetching`), fetching strategy, and statistics. Sized to
     // hold the active working set plus prefetched chunks.
-    // 2026-05-28: in-flight depth (max concurrently-live ChunkData) tracks
-    // page-fault churn — at T=16 the LRU cache (cap pool_size*2=32) lets ~45
-    // chunks stay live at once, so every chunk's 12MB+24MB buffers fault
-    // fresh (no reuse; both > rpmalloc's 3.94MiB huge threshold → munmap on
-    // free). GZIPPY_CACHE_CAP overrides the multiplier for a sweep:
-    // smaller cap → fewer live buffers → reuse → fewer faults, but too
-    // small starves prefetch / forces re-decode. Measure, don't guess.
-    let cache_capacity = match std::env::var("GZIPPY_CACHE_CAP")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(n) if n > 0 => n,
-        _ => pool_size * 2,
-    };
+    // (GZIPPY_CACHE_CAP sweep removed 2026-05-28: shrinking the LRU cap did
+    // NOT bound in-flight depth — chunks are held by the prefetch cache +
+    // pending reorder queue, not the LRU — and the wall delta was ordering
+    // noise. See project_real_gap_pinned_2026_05_28 memory.)
+    let cache_capacity = pool_size * 2;
     // Tried 4x — regressed (wall 486→510ms; misses dropped 4→3 but
     // overhead elsewhere ate it). Keep 2x.
     let prefetch_capacity = pool_size * 2;

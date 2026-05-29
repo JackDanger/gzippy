@@ -167,46 +167,13 @@ thread_local! {
     static WORKER_POOL_INDEX: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-/// 2026-05-28 lever (T=16 pool-collapse): the per-worker LIFO pools
-/// barely reuse at high parallelism — on silesia-large/T=16 the u8 hit
-/// rate falls to 40% and u16 to ~3% because ~42 chunks spread across 16
-/// workers gives each worker too few chunks to build reuse, so cold-start
-/// misses dominate and fresh 2×-size u16 buffers fault in (~14% CPU in
-/// the page-fault handler). A SHARED pool (all workers take/return from
-/// index 0) reuses buffers across workers; take/return is per-chunk
-/// (~42×), so the single Mutex sees negligible contention. Env-gated for
-/// a clean pinned-counter A/B (page-faults are load-independent on the
-/// contended bench box). Distinct from the falsified prewarm /
-/// global-rpmalloc / hugepage levers — this changes pool TOPOLOGY only.
-///
-/// RESULT (2026-05-28, silesia-large T=16, load-independent counters on a
-/// load-4-10 box): NO MEASURABLE WALL EFFECT. page-faults −3.7% (319K→307K,
-/// n=3) and u8 hits 41→49, but core-cycles delta (n=4) was within noise (one
-/// +13% contention outlier swamps a ~−2% median — the outlier IS a real
-/// shared-pool contention cost, not an error). Faults are dominated by
-/// IRREDUCIBLE first-touch + IN-FLIGHT DEPTH (the pool still missed ~54×
-/// against a ~25-30-buffer live working set, because chunks sit in the
-/// consumer reorder buffer holding their buffers until Drop). Topology was
-/// never the limiter; buffer RETURN LATENCY is. DO NOT promote to default
-/// without a 20-trial paired A/B on a QUIET box (load<4) showing a wall win
-/// — this repo has 4 prior counter-says-yes/wall-says-no allocator
-/// falsifications. Real next lever: return buffers right after window-publish
-/// (not at ChunkData::Drop); measure max concurrently-live ChunkData first.
-fn shared_pool_enabled() -> bool {
-    static USE_SHARED: OnceLock<bool> = OnceLock::new();
-    *USE_SHARED.get_or_init(|| std::env::var_os("GZIPPY_SHARED_POOL").is_some())
-}
-
-/// Per-pool length cap. Shared pool must hold the whole in-flight working
-/// set (workers decoding + consumer reorder depth), so it gets a larger
-/// cap; the per-worker pool keeps the small `MAX_POOLED`.
-fn pool_cap() -> usize {
-    if shared_pool_enabled() {
-        4 * MAX_WORKERS
-    } else {
-        MAX_POOLED
-    }
-}
+// (GZIPPY_SHARED_POOL experiment removed 2026-05-28: a shared cross-worker
+// pool showed NO measurable wall effect on a quiet-enough box — page-faults
+// −3.7% but cycles within noise. The per-worker pool collapses at T=16
+// because chunks sit in the consumer reorder buffer until Drop (buffer
+// RETURN LATENCY), not because of pool topology. See
+// project_real_gap_pinned_2026_05_28 / project_parallel_test_hang memory; the
+// real fix is earlier buffer return, queued for the parallel-pipeline work.)
 
 fn u8_pools() -> &'static [Mutex<Vec<U8>>] {
     static POOLS: OnceLock<Vec<Mutex<Vec<U8>>>> = OnceLock::new();
@@ -233,9 +200,6 @@ pub fn current_worker_pool_index() -> Option<usize> {
 }
 
 fn pool_index_for_take() -> usize {
-    if shared_pool_enabled() {
-        return 0;
-    }
     current_worker_pool_index().unwrap_or(0)
 }
 
@@ -293,14 +257,10 @@ pub fn return_u8_to_worker(owner_worker: usize, mut v: U8) {
         return;
     }
     RETURN_U8_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let idx = if shared_pool_enabled() {
-        0
-    } else {
-        owner_worker.min(MAX_WORKERS - 1)
-    };
+    let idx = owner_worker.min(MAX_WORKERS - 1);
     RETURN_U8_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut pool) = u8_pools()[idx].lock() {
-        if pool.len() < pool_cap() {
+        if pool.len() < MAX_POOLED {
             v.clear();
             pool.push(v);
         }
@@ -313,14 +273,10 @@ pub fn return_u16_to_worker(owner_worker: usize, mut v: U16) {
         return;
     }
     RETURN_U16_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let idx = if shared_pool_enabled() {
-        0
-    } else {
-        owner_worker.min(MAX_WORKERS - 1)
-    };
+    let idx = owner_worker.min(MAX_WORKERS - 1);
     RETURN_U16_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut pool) = u16_pools()[idx].lock() {
-        if pool.len() < pool_cap() {
+        if pool.len() < MAX_POOLED {
             v.clear();
             pool.push(v);
         }
