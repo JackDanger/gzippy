@@ -269,6 +269,23 @@ pub struct RegionCurve {
 }
 
 impl RegionCurve {
+    /// The region's PEAK lever: the slope of its highest-confidence line
+    /// (max |slope|·√samples), with that line's sample count. This is the
+    /// single line a developer would optimize — and it does NOT get masked
+    /// by a high-sample near-zero line the way the weighted median can.
+    /// Returns (peak_slope, samples_of_that_line).
+    pub fn peak_line_elasticity(&self) -> (f64, f64) {
+        self.line_slopes
+            .iter()
+            .max_by(|a, b| {
+                let ca = a.0.abs() * a.1.sqrt();
+                let cb = b.0.abs() * b.1.sqrt();
+                ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(s, n)| (*s, *n))
+            .unwrap_or((0.0, 0.0))
+    }
+
     /// Region wall-elasticity as the SAMPLE-WEIGHTED MEDIAN of its
     /// contributing lines' slopes — robust to the low-sample coz noise that
     /// a plain mean (or a single-top-level read) would let flip the sign.

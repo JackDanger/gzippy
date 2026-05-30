@@ -172,19 +172,25 @@ fn print_coz(p: &coz::CozProfile) {
     println!("experiments     : {}", p.n_experiments);
     println!("\nPer-REGION wall-elasticity (∂program-speedup / ∂region-speedup):");
     println!(
-        "  {:<14} {:>12} {:>18} {:>10}",
-        "region", "elasticity", "95% CI (proxy)", "samples"
+        "  {:<14} {:>10} {:>16} {:>10} {:>9}",
+        "region", "median", "95% CI (proxy)", "PEAK-line", "peak-n"
     );
     for (region, rc) in &p.region_curves {
         let (e, lo, hi) = rc.elasticity_ci();
+        let (peak, peak_n) = rc.peak_line_elasticity();
         println!(
-            "  {:<14} {:>+12.3} {:>18} {:>10.0}",
+            "  {:<14} {:>+10.3} {:>16} {:>+10.3} {:>9.0}",
             region,
             e,
             format!("[{:+.3},{:+.3}]", lo, hi),
-            rc.samples
+            peak,
+            peak_n,
         );
     }
+    println!(
+        "  (median can be masked by a high-sample ~0 line; PEAK-line = the\n   \
+         single highest-confidence line you'd actually optimize)"
+    );
     if !p.region_latency.is_empty() {
         println!("\nRegion latency points (begin!/end! scopes):");
         println!(

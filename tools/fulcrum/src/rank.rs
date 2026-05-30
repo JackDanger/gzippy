@@ -86,11 +86,18 @@ pub fn rank(coz: Option<&CozProfile>, crit: &CritPath, mech: Option<&Mech>) -> V
     let mut levers = Vec::new();
 
     for region in regions {
+        // The lever score is the PEAK-line elasticity (the single highest-
+        // confidence line you'd optimize), NOT the weighted median — the
+        // median can be masked to ~0 by a high-sample near-zero line in the
+        // same region (observed: bootstrap's deflate_block.rs:1168 @18k
+        // samples ≈0 masks :1170 @2.7k samples +0.36). The median is kept as
+        // the CI-context band.
         let (elasticity, lo, hi, samples) = coz
             .and_then(|c| c.region_curves.get(region))
             .map(|rc| {
-                let (e, lo, hi) = rc.elasticity_ci();
-                (e, lo, hi, rc.samples)
+                let (peak, _peak_n) = rc.peak_line_elasticity();
+                let (_med, lo, hi) = rc.elasticity_ci();
+                (peak, lo, hi, rc.samples)
             })
             .unwrap_or((f64::NAN, f64::NAN, f64::NAN, 0.0));
 
