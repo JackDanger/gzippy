@@ -1,7 +1,4 @@
-#![cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#![cfg(parallel_sm)]
 
 //! Per-chunk deflate decode for parallel single-member.
 //!
@@ -15,22 +12,13 @@
 
 use crate::decompress::parallel::chunk_data::{ChunkConfiguration, ChunkData};
 use crate::decompress::parallel::inflate_wrapper::InflateError;
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 use crate::decompress::parallel::inflate_wrapper::{
     DeflateCompressionType, IsalInflateWrapper, StoppingPoints,
 };
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 use crate::decompress::parallel::rpmalloc_alloc::types;
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 use crate::decompress::parallel::trace;
 
 #[derive(Debug)]
@@ -112,10 +100,7 @@ pub static BOOTSTRAP_POST_FLIP_U16_BYTES: std::sync::atomic::AtomicU64 =
 /// `GZIPPY_BODY_FAIL_LOG` env var (no-op if unset). Use this for
 /// distributional analysis: cluster failures by offset to see if they
 /// fall in specific corpus regions.
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 fn body_fail_log(start_bit: usize, bits_into_body: usize, bytes_wasted: usize, err: &str) {
     use std::io::Write;
     use std::sync::Mutex;
@@ -141,20 +126,14 @@ fn body_fail_log(start_bit: usize, bits_into_body: usize, bytes_wasted: usize, e
     let _ = writeln!(g, "{}", line);
 }
 
-#[cfg(not(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-)))]
+#[cfg(not(parallel_sm))]
 fn body_fail_log(_: usize, _: usize, _: usize, _: &str) {}
 
 /// ISA-L decode of one chunk when the predecessor window is known.
 ///
 /// Stops at the first block boundary at-or-past `stop_hint_bits` (an
 /// inexact hint — the decoder may overshoot), or at end-of-stream.
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 pub fn decode_chunk_isal(
     input: &[u8],
     encoded_offset_bits: usize,
@@ -183,7 +162,7 @@ pub fn decode_chunk_isal(
 ///
 /// Read once at process start via OnceLock so the env-var lookup
 /// doesn't tax the hot path.
-#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+#[cfg(pure_inflate_decode)]
 fn use_pure_bulk_path() -> bool {
     use std::sync::OnceLock;
     static USE_BULK: OnceLock<bool> = OnceLock::new();
@@ -202,7 +181,7 @@ fn use_pure_bulk_path() -> bool {
 ///
 /// **Default ON** as of the cross-corpus validation gate. To disable
 /// for A/B comparison: `GZIPPY_OPTION_A_PREFILL=0`.
-#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+#[cfg(pure_inflate_decode)]
 fn use_option_a_prefill_path() -> bool {
     use std::sync::OnceLock;
     static USE_A: OnceLock<bool> = OnceLock::new();
@@ -214,10 +193,7 @@ fn use_option_a_prefill_path() -> bool {
     })
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 fn decode_chunk_isal_impl(
     input: &[u8],
     encoded_offset_bits: usize,
@@ -631,7 +607,7 @@ fn decode_chunk_isal_impl(
 /// `isal_lut_bulk` (162 MB byte-equal vs flate2 GzDecoder) and the
 /// existing routing tests (which will additionally run with the env
 /// flag set in `tests::routing`).
-#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+#[cfg(pure_inflate_decode)]
 fn decode_chunk_pure_bulk_impl(
     input: &[u8],
     encoded_offset_bits: usize,
@@ -844,7 +820,7 @@ fn decode_chunk_pure_bulk_impl(
 /// Counter for deletion-trap tests that need to assert the pure-bulk
 /// path actually executed (mirrors `UNIFIED_INFLATE_RUNS` /
 /// `MARKER_PIPELINE_RUNS` pattern).
-#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+#[cfg(pure_inflate_decode)]
 pub static PURE_BULK_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Marker-bootstrap then ISA-L for speculative prefetch (no predecessor window).
@@ -856,10 +832,7 @@ pub static PURE_BULK_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// The chunk stops at the next deflate block boundary at-or-past
 /// `stop_hint_bits`, or at BFINAL, or when accumulated `decoded_size`
 /// crosses `max_decoded_chunk_size`.
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 pub fn decode_chunk_marker_bootstrap_then_isal(
     input: &[u8],
     encoded_offset_bits: usize,
@@ -959,10 +932,7 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
 
 /// Merge an ISA-L tail segment (clean bytes + block boundaries) into a
 /// chunk that already holds a marker bootstrap prefix.
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 fn absorb_isal_tail(dst: &mut ChunkData, mut tail: ChunkData) {
     // `worker.absorb_isal_tail` span — wraps the merge of the
     // ISA-L bulk-decode result into the chunk that holds the
@@ -1130,10 +1100,7 @@ fn absorb_isal_tail(dst: &mut ChunkData, mut tail: ChunkData) {
 /// [`deflate_block::Block`]. Mirrors the early-exit contract of
 /// rapidgzip's `decodeChunkWithRapidgzip` main loop
 /// (vendor/.../chunkdecoding/GzipChunk.hpp:468-654).
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 struct DeflateBootstrap {
     /// u16 output spanning every block decoded in this bootstrap pass.
     /// Values < MARKER_BASE are literal bytes; values ≥ MARKER_BASE are
@@ -1162,18 +1129,12 @@ struct DeflateBootstrap {
 /// at a non-fixed block boundary at-or-past `stop_hint_bits`.
 ///
 /// EXPERIMENT: per-thread pool of bootstrap output buffers.
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 thread_local! {
     static BOOTSTRAP_OUTPUT_POOL: std::cell::RefCell<Vec<u16>> = std::cell::RefCell::new(Vec::with_capacity(128 * 1024));
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 fn take_bootstrap_output_from_pool() -> Vec<u16> {
     BOOTSTRAP_OUTPUT_POOL.with(|cell| {
         let mut v = std::mem::take(&mut *cell.borrow_mut());
@@ -1193,10 +1154,7 @@ fn take_bootstrap_output_from_pool() -> Vec<u16> {
     })
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 fn return_bootstrap_output_to_pool(mut v: Vec<u16>) {
     v.clear();
     BOOTSTRAP_OUTPUT_RETURNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1235,18 +1193,12 @@ fn return_bootstrap_output_to_pool(mut v: Vec<u16>) {
 /// (mem::take swaps with `Vec::default()`), and the Drop's
 /// `cap == 0` check makes the post-mem::take Drop a no-op so we
 /// don't pollute the pool's slot with an empty Vec.
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 struct BootstrapBuffer {
     inner: Option<Vec<u16>>,
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 impl BootstrapBuffer {
     fn new() -> Self {
         Self {
@@ -1260,10 +1212,7 @@ impl BootstrapBuffer {
     }
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 impl Drop for BootstrapBuffer {
     fn drop(&mut self) {
         if let Some(v) = self.inner.take() {
@@ -1290,20 +1239,14 @@ impl Drop for BootstrapBuffer {
 /// pool reuse working, expected ≈ num_worker_threads (one allocation
 /// per thread, then reused on every subsequent call). If this counter
 /// approaches the bootstrap call count, the pool is broken.
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 pub static BOOTSTRAP_OUTPUT_ALLOCS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Counter: total `take` calls. Pool effectiveness =
 /// `1 - (allocs / takes)`. Vendor-equivalent: rpmalloc per-thread arena
 /// reuse rate, which approaches 1.0 after warm-up.
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 pub static BOOTSTRAP_OUTPUT_TAKES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -1311,10 +1254,7 @@ pub static BOOTSTRAP_OUTPUT_TAKES: std::sync::atomic::AtomicU64 =
 /// pool with cap ≥ 128 KiB. Total bytes the pool "saved" from a fresh
 /// allocation. A run-end value of `~BOOTSTRAP_OUTPUT_TAKES *
 /// 256 KiB` means every take hit the pool path.
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 pub static BOOTSTRAP_OUTPUT_REUSED_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -1322,10 +1262,7 @@ pub static BOOTSTRAP_OUTPUT_REUSED_BYTES: std::sync::atomic::AtomicU64 =
 /// TAKES on the success path; if RETURNS << TAKES, bootstraps are
 /// erroring out and not returning their buffer (it's still moved via
 /// the chunk_fetcher.rs path at line 508, so should always match).
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 pub static BOOTSTRAP_OUTPUT_RETURNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -1333,10 +1270,7 @@ pub static BOOTSTRAP_OUTPUT_RETURNS: std::sync::atomic::AtomicU64 =
 /// retained (because the pool's slot already had a larger cap).
 /// Non-zero means we threw away a hot allocation — should be 0 with
 /// 1-Vec-per-thread pool when caps are stable.
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 pub static BOOTSTRAP_OUTPUT_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -1344,10 +1278,7 @@ pub static BOOTSTRAP_OUTPUT_DROPPED: std::sync::atomic::AtomicU64 =
 /// `decodeChunkWithRapidgzip` (GzipChunk.hpp:468-654), restricted to the
 /// single-member case (no multi-stream loop) and with the handoff
 /// triggered exclusively by `cleanDataCount` (GzipChunk.hpp:520-525).
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 fn bootstrap_with_deflate_block(
     data: &[u8],
     start_bit_offset: usize,
@@ -1450,10 +1381,7 @@ fn bootstrap_with_deflate_block(
     result
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 fn bootstrap_with_deflate_block_inner(
     data: &[u8],
     start_bit_offset: usize,
@@ -1715,10 +1643,7 @@ fn bootstrap_with_deflate_block_inner(
 /// was constructed from `&data[byte_offset..]`. The Bits buffer
 /// pre-loads bytes from its slice, so the actual consumed-from-slice
 /// count is `bits.pos * 8 - bits.available()`.
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 #[inline]
 fn absolute_bit_pos(
     byte_offset: usize,
@@ -1732,10 +1657,7 @@ fn absolute_bit_pos(
     byte_offset * 8 + bits_consumed_from_slice
 }
 
-#[cfg(not(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-)))]
+#[cfg(not(parallel_sm))]
 pub fn decode_chunk_marker_bootstrap_then_isal(
     _input: &[u8],
     _encoded_offset_bits: usize,
@@ -1746,10 +1668,7 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     Err(ChunkDecodeError::UnsupportedPlatform)
 }
 
-#[cfg(not(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-)))]
+#[cfg(not(parallel_sm))]
 pub fn decode_chunk_isal(
     _input: &[u8],
     _encoded_offset_bits: usize,
@@ -1761,10 +1680,7 @@ pub fn decode_chunk_isal(
 }
 
 #[cfg(test)]
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 mod tests {
     use super::*;
     use std::io::Write;

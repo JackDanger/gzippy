@@ -1,7 +1,4 @@
-#![cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#![cfg(parallel_sm)]
 
 //! Literal port of `rapidgzip::deflate::Block`
 //! (vendor/.../gzip/deflate.hpp:513-1156): the deflate Block state

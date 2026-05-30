@@ -1,7 +1,4 @@
-#![cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#![cfg(parallel_sm)]
 
 //! Cross-thread Vec recycler for `ChunkData`'s `data` (`Vec<u8>`) and
 //! `data_with_markers` (`Vec<u16>`) buffers.

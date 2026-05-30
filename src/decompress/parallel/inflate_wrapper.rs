@@ -1,7 +1,4 @@
-#![cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#![cfg(parallel_sm)]
 
 //! Port of `rapidgzip::IsalInflateWrapper`
 //! (vendor/rapidgzip/.../gzip/isal.hpp) scoped to single-member raw-
@@ -123,7 +120,7 @@ pub enum InflateError {
 }
 
 /// Map `std::io::Error` from `ResumableInflate` without collapsing to `InvalidBlock`.
-#[cfg(all(feature = "pure-rust-inflate", target_arch = "x86_64"))]
+#[cfg(pure_inflate_decode)]
 fn map_resumable_inflate_err(err: std::io::Error) -> InflateError {
     use std::io::ErrorKind;
     let msg = err.to_string();
@@ -654,7 +651,7 @@ impl<'a> IsalInflateWrapper<'a> {
 // `tests::routing::unified_inflate_path_runs_on_parallel_sm` ensures the
 // route stays live.
 
-#[cfg(all(feature = "pure-rust-inflate", target_arch = "x86_64"))]
+#[cfg(pure_inflate_decode)]
 pub struct IsalInflateWrapper<'a> {
     inner: crate::decompress::inflate::unified::Inflate<
         'a,
@@ -664,7 +661,7 @@ pub struct IsalInflateWrapper<'a> {
     >,
 }
 
-#[cfg(all(feature = "pure-rust-inflate", target_arch = "x86_64"))]
+#[cfg(pure_inflate_decode)]
 impl<'a> IsalInflateWrapper<'a> {
     #[allow(dead_code)] // vendor parity or unit-test surface
     pub fn new(input: &'a [u8], bit_offset: usize) -> Result<Self, InflateError> {
@@ -829,18 +826,12 @@ impl<'a> IsalInflateWrapper<'a> {
 }
 
 // On non-x86_64 / no parallel-SM feature builds, the wrapper is unavailable.
-#[cfg(not(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-)))]
+#[cfg(not(parallel_sm))]
 pub struct IsalInflateWrapper<'a> {
     _phantom: std::marker::PhantomData<&'a [u8]>,
 }
 
-#[cfg(not(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-)))]
+#[cfg(not(parallel_sm))]
 impl<'a> IsalInflateWrapper<'a> {
     pub fn new(_input: &'a [u8], _bit_offset: usize) -> Result<Self, InflateError> {
         Err(InflateError::UnsupportedPlatform)
@@ -857,10 +848,7 @@ impl<'a> IsalInflateWrapper<'a> {
 // ── Unit tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 mod tests {
     use super::*;
     use std::io::Write;

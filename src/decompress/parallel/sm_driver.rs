@@ -1,7 +1,4 @@
-#![cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#![cfg(parallel_sm)]
 
 //! Production entry for parallel single-member gzip decompression.
 //!
@@ -10,10 +7,7 @@
 //! classifier-routed wrapper around [`read_parallel_sm`].
 
 /// Decompress one single-member gzip buffer with the parallel chunk pipeline.
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 pub fn read_parallel_sm<W: std::io::Write>(
     gzip_data: &[u8],
     writer: &mut W,

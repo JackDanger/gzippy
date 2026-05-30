@@ -44,10 +44,7 @@
 //!   no back-ref exceeds the in-buffer history).
 //! - Returns whether this was the final block.
 
-#![cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#![cfg(parallel_sm)]
 
 use crate::decompress::inflate::consume_first_decode::Bits;
 use crate::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached;

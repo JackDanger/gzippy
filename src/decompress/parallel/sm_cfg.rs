@@ -1,10 +1,13 @@
 //! Compile-time gates for the parallel single-member production path.
 
 /// Parallel SM orchestration (chunk_fetcher, block_finder, etc.) is available.
-pub const PARALLEL_SM: bool = cfg!(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-));
+///
+/// The `parallel_sm` cfg is emitted by `build.rs::emit_parallel_sm_cfgs` and is
+/// true when EITHER `x86_64 + (isal-compression | pure-rust-inflate)` OR
+/// `aarch64 + pure-rust-inflate`. arm64 always uses the pure-Rust inner decoder
+/// (ISA-L's C library is x86-only); see `inflate_wrapper::IsalInflateWrapper`'s
+/// `#[cfg(pure_inflate_decode)]` backend.
+pub const PARALLEL_SM: bool = cfg!(parallel_sm);
 
 /// Post-bootstrap + bootstrap DYNAMIC table build use patched ISA-L C code.
 #[allow(dead_code)]
