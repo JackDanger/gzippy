@@ -291,6 +291,12 @@ pub fn parse_profile(
     let mut latency: BTreeMap<String, (f64, f64, f64)> = BTreeMap::new();
     let mut cur_selected: Option<String> = None;
     let mut cur_level: u64 = 0;
+    // Real coz (JSON form) puts `duration` on the EXPERIMENT record; the
+    // following `throughput-point` record carries only `name` + `delta`.
+    // So we carry the current experiment's duration here and use it for the
+    // throughput period (period = duration / delta). The older tab format
+    // put duration on the throughput-point itself — both handled.
+    let mut cur_duration: f64 = 0.0;
     let mut n_exp = 0usize;
 
     for line in text.lines() {
@@ -306,7 +312,14 @@ pub fn parse_profile(
                     .unwrap_or(0.0);
                 // Quantize speedup to per-mille to use as a stable map key.
                 cur_level = (speedup * 1000.0).round() as u64;
-                if let Some(s) = field(&rec, "selected-samples").and_then(|s| s.parse::<f64>().ok())
+                cur_duration = field(&rec, "duration")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0);
+                // `selected_samples` (JSON, underscore) or `selected-samples`
+                // (tab, hyphen) — accept either.
+                if let Some(s) = field(&rec, "selected_samples")
+                    .or_else(|| field(&rec, "selected-samples"))
+                    .and_then(|s| s.parse::<f64>().ok())
                 {
                     *samples.entry(selected.clone()).or_default() += s;
                 }
@@ -320,9 +333,13 @@ pub fn parse_profile(
                 let delta: f64 = field(&rec, "delta")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0.0);
+                // Prefer the throughput-point's own duration (tab format);
+                // fall back to the enclosing experiment's duration (JSON
+                // format, where the point record omits it).
                 let duration: f64 = field(&rec, "duration")
                     .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.0);
+                    .filter(|d: &f64| *d > 0.0)
+                    .unwrap_or(cur_duration);
                 if let Some(sel) = &cur_selected {
                     let e = acc.entry((sel.clone(), cur_level)).or_default();
                     e.delta += delta;
