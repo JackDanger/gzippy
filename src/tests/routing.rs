@@ -131,6 +131,29 @@ mod tests {
         );
     }
 
+    /// Regression (multi-member `-p1` audit): a multi-member stream that reaches
+    /// the non-parallel CLI entry `decompress_single_member` (used for `-p1` and
+    /// for small inputs the dispatcher won't parallelize) must decode
+    /// member-by-member, not error. The old guard was a `debug_assert!` —
+    /// compiled out in release — so `cat a.gz a.gz | gzippy -d -p1` produced
+    /// **zero bytes / a terminal error** in a release build. Small fixture +
+    /// low thread counts force the non-parallel branch.
+    #[test]
+    fn test_multi_member_decodes_via_single_member_entry() {
+        let original = make_test_data(600 * 1024); // >2 256KiB members
+        let mm = compress_multi_member_gzip(&original);
+        assert!(
+            crate::decompress::format::is_likely_multi_member(&mm),
+            "fixture must classify as multi-member"
+        );
+        for threads in [1usize, 2, 4] {
+            let mut out = Vec::new();
+            crate::decompress::decompress_single_member(&mm, &mut out, threads)
+                .unwrap_or_else(|e| panic!("multi-member -p{threads} must decode, got {e:?}"));
+            assert_eq!(out, original, "multi-member -p{threads} must be byte-exact");
+        }
+    }
+
     // =========================================================================
     // Layer 1: Format Detection
     // =========================================================================

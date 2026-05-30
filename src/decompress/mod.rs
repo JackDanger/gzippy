@@ -287,16 +287,6 @@ pub(crate) fn decompress_single_member<W: Write>(
     num_threads: usize,
 ) -> GzippyResult<u64> {
     let path = classify_gzip(data, num_threads);
-    debug_assert!(
-        matches!(
-            path,
-            DecodePath::IsalParallelSM
-                | DecodePath::IsalSingle
-                | DecodePath::StreamingSingle
-                | DecodePath::LibdeflateSingle
-        ),
-        "decompress_single_member called on non-single-member input: {path:?}"
-    );
     if crate::utils::debug_enabled() {
         eprintln!(
             "[gzippy] decompress_single_member path={:?} threads={} bytes={}",
@@ -305,7 +295,26 @@ pub(crate) fn decompress_single_member<W: Write>(
             data.len()
         );
     }
-    decompress_single_member_for(path, data, writer, num_threads)
+    match path {
+        // A multi-member or BGZF stream can reach this non-parallel CLI entry
+        // (small files, or `-p1`) — the io dispatcher routes here whenever it
+        // can't parallelize, for ANY format. Decode it sequentially
+        // member-by-member rather than erroring; the parallel branches handle
+        // these when threads/size allow. (Previously a release-compiled-out
+        // `debug_assert!` let these fall through to
+        // `decompress_single_member_for`, which rejects non-single-member
+        // paths -> empty output / terminal error. Caught by the multi-member
+        // `-p1` audit: `cat a.gz a.gz | gzippy -d -p1` produced 0 bytes.)
+        DecodePath::MultiMemberSeq | DecodePath::MultiMemberPar | DecodePath::GzippyParallel => {
+            decompress_multi_member_sequential(data, writer)
+        }
+        DecodePath::IsalParallelSM
+        | DecodePath::IsalSingle
+        | DecodePath::StreamingSingle
+        | DecodePath::LibdeflateSingle => {
+            decompress_single_member_for(path, data, writer, num_threads)
+        }
+    }
 }
 
 /// Test-only counter incremented every time a single-member call reaches
