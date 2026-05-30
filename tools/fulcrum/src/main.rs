@@ -195,17 +195,35 @@ fn print_coz(p: &coz::CozProfile) {
             println!("  {:<20} {:>10.0} {:>12.0} {:>14.0}", name, a, d, diff);
         }
     }
-    println!("\nTop per-LINE curves (by |slope|, top 12):");
     println!(
-        "  {:<48} {:>10} {:>10}",
-        "selected (file:line)", "slope", "samples"
+        "\nTop per-LINE curves (confidence-ranked |slope|·√samples; \
+         samples≥{:.0} trusted):",
+        coz::MIN_LINE_SAMPLES
     );
-    for c in p.line_curves.iter().take(12) {
+    println!(
+        "  {:<46} {:>9} {:>9} {}",
+        "selected (file:line)", "slope", "samples", "region"
+    );
+    let maps = coz::default_region_maps();
+    for c in p
+        .line_curves
+        .iter()
+        .filter(|c| c.total_samples >= 5.0)
+        .take(14)
+    {
+        let region = coz::region_of(&c.selected, &maps).unwrap_or_else(|| "-".into());
+        let mark = if c.total_samples >= coz::MIN_LINE_SAMPLES {
+            " "
+        } else {
+            "~" // low-confidence
+        };
         println!(
-            "  {:<48} {:>+10.3} {:>10.0}",
+            "  {}{:<45} {:>+9.3} {:>9.0} {}",
+            mark,
             c.selected,
             c.slope(),
-            c.total_samples
+            c.total_samples,
+            region
         );
     }
 }

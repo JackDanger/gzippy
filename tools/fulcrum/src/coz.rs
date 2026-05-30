@@ -170,6 +170,12 @@ pub fn default_region_maps() -> Vec<RegionMap> {
     ]
 }
 
+/// Public wrapper over `classify` — map a coz `selected` (file:line) to its
+/// FULCRUM region, for callers that want to annotate per-line output.
+pub fn region_of(selected: &str, maps: &[RegionMap]) -> Option<String> {
+    classify(selected, maps)
+}
+
 fn classify(selected: &str, maps: &[RegionMap]) -> Option<String> {
     let (file, line) = selected.rsplit_once(':')?;
     let base = Path::new(file)
@@ -245,32 +251,66 @@ pub struct CozProfile {
     pub n_experiments: usize,
 }
 
+/// Minimum coz sample count for a line's elasticity to be trusted. coz's
+/// per-line estimate is pure noise below a handful of samples (we observed
+/// |slope|>0.2 on lines with 0 samples). Lines under this are dropped from
+/// the region aggregate.
+pub const MIN_LINE_SAMPLES: f64 = 20.0;
+
 #[derive(Clone)]
 pub struct RegionCurve {
     pub region: String,
     pub points: BTreeMap<u64, (f64, f64)>, // level -> (sum program_speedup, weight)
     pub samples: f64,
+    /// Per-contributing-line robust slope estimates with their sample
+    /// weights — the basis for the region's weighted-median elasticity.
+    /// Only lines with samples ≥ MIN_LINE_SAMPLES are recorded.
+    pub line_slopes: Vec<(f64, f64)>, // (slope, samples)
 }
 
 impl RegionCurve {
-    /// Sample-weighted mean program-speedup at the max measured level, plus
-    /// a crude 95% half-width from the per-line spread (±1.96·sd/√k). For
-    /// the MVP this CI is indicative, not rigorous (Coz's own bootstrapping
-    /// would be tighter); reported as such.
+    /// Region wall-elasticity as the SAMPLE-WEIGHTED MEDIAN of its
+    /// contributing lines' slopes — robust to the low-sample coz noise that
+    /// a plain mean (or a single-top-level read) would let flip the sign.
+    /// CI is the weighted inter-quartile-ish spread (the 25th/75th weighted
+    /// percentiles). Indicative, not a rigorous bootstrap — reported as a
+    /// proxy.
     pub fn elasticity_ci(&self) -> (f64, f64, f64) {
+        if self.line_slopes.is_empty() {
+            // Fall back to the old top-level read if no per-line data
+            // cleared the sample floor (keeps a number rather than 0).
+            return self.elasticity_ci_toplevel();
+        }
+        let mut v = self.line_slopes.clone();
+        v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let total_w: f64 = v.iter().map(|(_, w)| *w).sum();
+        let wpct = |p: f64| -> f64 {
+            let target = p * total_w;
+            let mut acc = 0.0;
+            for (slope, w) in &v {
+                acc += *w;
+                if acc >= target {
+                    return *slope;
+                }
+            }
+            v.last().map(|(s, _)| *s).unwrap_or(0.0)
+        };
+        (wpct(0.5), wpct(0.25), wpct(0.75))
+    }
+
+    /// Legacy single-top-level estimator (kept as a fallback).
+    fn elasticity_ci_toplevel(&self) -> (f64, f64, f64) {
         let Some((lvl, _)) = self.points.iter().next_back() else {
             return (0.0, 0.0, 0.0);
         };
         let line_speedup = *lvl as f64 / 1000.0;
         let (sum, w) = self.points[lvl];
         let mean_ps = if w > 0.0 { sum / w } else { 0.0 };
-        // elasticity = program_speedup / line_speedup at the top level
         let elasticity = if line_speedup > 0.0 {
             mean_ps / line_speedup
         } else {
             0.0
         };
-        // Half-width proxy: scale inversely with sqrt(samples).
         let halfwidth = if self.samples > 1.0 {
             0.5 * elasticity.abs() / self.samples.sqrt().max(1.0)
         } else {
@@ -427,6 +467,7 @@ pub fn parse_profile(
                     region: region.clone(),
                     points: BTreeMap::new(),
                     samples: 0.0,
+                    line_slopes: Vec::new(),
                 });
             let w = curve.total_samples.max(1.0);
             for (lvl, ps) in &curve.points {
@@ -435,6 +476,12 @@ pub fn parse_profile(
                 e.1 += w;
             }
             rc.samples += curve.total_samples;
+            // Record this line's robust slope for the region's weighted
+            // median — but ONLY if it cleared the coz sample floor, so the
+            // 0-sample noise lines never enter the aggregate.
+            if curve.total_samples >= MIN_LINE_SAMPLES {
+                rc.line_slopes.push((curve.slope(), curve.total_samples));
+            }
         }
         line_curves.push(curve);
     }
@@ -443,10 +490,13 @@ pub fn parse_profile(
     // the stored form: points hold (sum_program_speedup*w, w). elasticity_ci
     // divides sum/w. Good.
 
+    // Rank lines by CONFIDENCE-WEIGHTED leverage |slope|·√samples, so a
+    // high-sample line with a real slope ranks above a 0-sample line whose
+    // |slope| is coz noise. This is the ordering a human should read.
+    let conf = |c: &LineCurve| c.slope().abs() * c.total_samples.max(0.0).sqrt();
     line_curves.sort_by(|a, b| {
-        b.slope()
-            .abs()
-            .partial_cmp(&a.slope().abs())
+        conf(b)
+            .partial_cmp(&conf(a))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
