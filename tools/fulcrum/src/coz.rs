@@ -123,10 +123,21 @@ pub fn default_region_maps() -> Vec<RegionMap> {
             lo: 221,
             hi: 820,
         },
-        // isal_lut_bulk::decode_block — the actual inner inflate
+        // isal_lut_bulk::decode_block — the bulk decode driver.
         RegionMap {
             region: "bulk_inflate".into(),
             file_basename: "isal_lut_bulk.rs".into(),
+            lo: 1,
+            hi: 100000,
+        },
+        // isal_huffman_pure.rs — the pure-Rust ISA-L LUT inner Huffman
+        // decode loop. THIS is where the bulk-inflate hot lines land
+        // (coz sampled isal_huffman_pure.rs:419/468/473) — without this
+        // map those samples would be unattributed and bulk_inflate would
+        // be under-counted.
+        RegionMap {
+            region: "bulk_inflate".into(),
+            file_basename: "isal_huffman_pure.rs".into(),
             lo: 1,
             hi: 100000,
         },
