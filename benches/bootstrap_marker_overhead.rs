@@ -92,6 +92,67 @@ mod bench {
         (blocks_decoded, bytes_emitted)
     }
 
+    /// DRAIN-COST kill-test: decode the SAME blocks via the inner
+    /// `read_internal_*` paths directly, markers ON, but WITHOUT the
+    /// per-`read()` `drain_to_output` ring→Vec copy (rapidgzip's
+    /// window-view model: the ring IS the output, no second store).
+    /// Output bytes are not preserved — we measure pure decode
+    /// throughput minus the drain copy. Back-refs (≤32 KiB lookback)
+    /// still resolve from the ring's recent history, so decode stays
+    /// correct; only the (discarded) output differs. Ratio of the
+    /// drained markers-ON rate to THIS rate = the drain copy cost,
+    /// the 150-vs-340 hypothesis.
+    fn decode_full_stream_no_drain(deflate: &[u8]) -> (usize, usize) {
+        use gzippy::decompress::parallel::deflate_block::CompressionType;
+        let mut block = Block::new();
+        let mut sink: Vec<u16> = Vec::with_capacity(64 * 1024);
+        block.reset(Some(&mut sink), None); // markers ON (empty window)
+        let mut bits = Bits::new(deflate);
+        let mut blocks_decoded = 0usize;
+        let mut bytes_emitted = 0usize;
+        loop {
+            if block.read_header(&mut bits, false).is_err() {
+                break;
+            }
+            blocks_decoded += 1;
+            while !block.eob() {
+                // Inner decode directly into the ring — NO drain_to_output.
+                let res = match block.compression_type() {
+                    CompressionType::Uncompressed => {
+                        block.read_internal_uncompressed(&mut bits, usize::MAX)
+                    }
+                    _ => block.read_internal_compressed(&mut bits, usize::MAX),
+                };
+                match res {
+                    Ok(n) => bytes_emitted += n,
+                    Err(_) => return (blocks_decoded, bytes_emitted),
+                }
+            }
+            if block.is_last_block() {
+                break;
+            }
+        }
+        (blocks_decoded, bytes_emitted)
+    }
+
+    fn bench_best_of_no_drain(runs: usize, deflate: &[u8]) -> (f64, usize) {
+        let mut best_ns_per_byte = f64::INFINITY;
+        let mut bytes_seen = 0usize;
+        for _ in 0..runs {
+            let t = Instant::now();
+            let (_blocks, bytes) = decode_full_stream_no_drain(deflate);
+            let dur_ns = t.elapsed().as_nanos() as f64;
+            bytes_seen = bytes;
+            if bytes > 0 {
+                let ns = dur_ns / bytes as f64;
+                if ns < best_ns_per_byte {
+                    best_ns_per_byte = ns;
+                }
+            }
+        }
+        (best_ns_per_byte, bytes_seen)
+    }
+
     fn bench_best_of(runs: usize, deflate: &[u8], with_markers: bool) -> (f64, usize) {
         let mut best_ns_per_byte = f64::INFINITY;
         let mut bytes_seen = 0usize;
@@ -119,14 +180,59 @@ mod bench {
             synthetic_deflate(4 * 1024 * 1024)
         };
 
+        // Single-mode path for the 8-concurrent bandwidth A/B: all
+        // instances run the SAME mode simultaneously so the memory-bus
+        // contention is apples-to-apples. BENCH_MODE=drain|nodrain.
+        if let Ok(mode) = std::env::var("BENCH_MODE") {
+            let runs = 5;
+            let (ns, bytes, label) = match mode.as_str() {
+                "drain" => {
+                    let _ = decode_full_stream(&deflate, true);
+                    let (n, b) = bench_best_of(runs, &deflate, true);
+                    (n, b, "drained (markers ON)")
+                }
+                "nodrain" => {
+                    let _ = decode_full_stream_no_drain(&deflate);
+                    let (n, b) = bench_best_of_no_drain(runs, &deflate);
+                    (n, b, "no-drain (view model)")
+                }
+                _ => {
+                    eprintln!("BENCH_MODE must be drain|nodrain");
+                    return;
+                }
+            };
+            let mbps = if ns.is_finite() { 1000.0 / ns } else { 0.0 };
+            println!("MODE {label}: {ns:.2} ns/lit ({mbps:.0} MB/s) bytes={bytes}");
+            return;
+        }
+
         // Warm one run before timing — JIT-y effects from rpmalloc + Huffman
         // table builds.
         let _ = decode_full_stream(&deflate, true);
         let _ = decode_full_stream(&deflate, false);
+        let _ = decode_full_stream_no_drain(&deflate);
 
-        let runs = 3;
+        let runs = 5;
         let (with_ns, with_bytes) = bench_best_of(runs, &deflate, true);
         let (no_ns, no_bytes) = bench_best_of(runs, &deflate, false);
+        let (nodrain_ns, nodrain_bytes) = bench_best_of_no_drain(runs, &deflate);
+
+        // The DECISIVE drain-cost number: markers-ON drained (production
+        // bootstrap) vs markers-ON no-drain (rapidgzip window-view model),
+        // SAME decoder, only the ring→Vec copy differs.
+        let nodrain_mbps = if nodrain_ns.is_finite() {
+            1000.0 / nodrain_ns
+        } else {
+            0.0
+        };
+        let drain_ratio = if nodrain_ns > 0.0 {
+            with_ns / nodrain_ns
+        } else {
+            0.0
+        };
+        println!(
+            "\n  >>> DRAIN KILL-TEST: markers-ON drained vs no-drain (same decoder):\n      no-drain (view model): {nodrain_ns:.2} ns/lit ({nodrain_mbps:.0} MB/s) bytes={nodrain_bytes}\n      drain/no-drain ratio : {drain_ratio:.2}x  (≈2x ⇒ the ring+drain copy IS the 150-vs-340 gap)"
+        );
 
         let with_mbps = if with_ns.is_finite() {
             1000.0 / with_ns
