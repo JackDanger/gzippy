@@ -21,7 +21,7 @@
 //! ```
 
 #[cfg(test)]
-#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+#[cfg(pure_inflate_decode)]
 mod tests {
     use crate::decompress::inflate::resumable::{
         READ_STREAM_BYTES_OUT, READ_STREAM_CALLS, READ_STREAM_OUTPUT_BUF_BYTES,

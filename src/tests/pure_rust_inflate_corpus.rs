@@ -34,11 +34,7 @@
 //! the fixture is absent.
 
 #[cfg(test)]
-#[cfg(all(
-    target_arch = "x86_64",
-    feature = "pure-rust-inflate",
-    not(feature = "isal-compression")
-))]
+#[cfg(all(pure_inflate_decode, not(feature = "isal-compression")))]
 mod tests {
     use std::io::{Read, Write};
 
@@ -199,6 +195,53 @@ mod tests {
         data
     }
 
+    /// Semi-compressible data with a *controlled* ratio: each 4 KiB block is
+    /// `motif_frac` of a block-unique repeating motif (long matches WITHIN the
+    /// block + cross-block sliding-window resume) followed by a PRNG literal
+    /// tail (stored/literal coverage). The block-unique motif keeps the ratio
+    /// bounded (matches don't reach across blocks), so the compressed size
+    /// scales ~linearly with `raw` and the uncompressed/compressed ratio stays
+    /// comfortably above the routing `parallel_sm_unprofitable` floor (1.15)
+    /// while clearing the 10 MiB `MIN_PARALLEL_COMPRESSED` size gate.
+    ///
+    /// This is what `corpus_large_random` / `corpus_large_repetitive` feed the
+    /// pipeline: pure random trips the ratio gate (routes to one-shot) and pure
+    /// repetition compresses far below 10 MiB on this zlib build — neither
+    /// reaches the parallel-SM path the test exists to exercise. `motif_frac`
+    /// near 1.0 → repetition-heavy; near 0.0 → literal/stored-heavy.
+    fn make_semicompressible_data(raw: usize, motif_frac: f64) -> Vec<u8> {
+        const BLK: usize = 4096;
+        let mut out = Vec::with_capacity(raw);
+        let mut rng: u64 = 0x0bad_c0de_1234_5678;
+        let mut block_index: u64 = 0;
+        while out.len() < raw {
+            block_index += 1;
+            // Motif unique to this block: 24 bytes derived from the index.
+            let mut motif = [0u8; 24];
+            for (j, b) in motif.iter_mut().enumerate() {
+                *b = (block_index.wrapping_mul(31).wrapping_add(j as u64) & 0xff) as u8;
+            }
+            let motif_len = ((BLK as f64) * motif_frac) as usize;
+            let mut written = 0usize;
+            while written < motif_len && out.len() < raw {
+                let take = motif.len().min(motif_len - written);
+                out.extend_from_slice(&motif[..take]);
+                written += take;
+            }
+            // PRNG literal tail.
+            let tail = BLK.saturating_sub(motif_len);
+            for _ in 0..tail {
+                if out.len() >= raw {
+                    break;
+                }
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                out.push((rng >> 24) as u8);
+            }
+        }
+        out.truncate(raw);
+        out
+    }
+
     /// Mixed entropy: 60% PRNG / 40% short repeats. Pushes zlib into
     /// emitting a mix of BTYPE=00/01/10. Many small blocks → many
     /// dynamic-header table builds.
@@ -223,23 +266,30 @@ mod tests {
 
     #[test]
     fn corpus_large_random() {
-        // Random data → essentially incompressible → most output is
-        // stored blocks (BTYPE=00). Need a big payload to land > 10 MiB
-        // compressed. 24 MiB raw at zlib L1 yields ~24 MiB compressed
-        // for random (stored blocks have ~5 bytes of overhead per
-        // 65535-byte block — negligible).
-        let payload = make_random_data(24 * 1024 * 1024);
+        // Literal/stored-heavy (motif_frac 0.15): mostly PRNG literals with a
+        // thin block-unique motif so the stream still clears the ratio gate
+        // (pure random would route to one-shot via `parallel_sm_unprofitable`)
+        // AND clears 10 MiB compressed. Exercises `BlockState::InStored` resume
+        // and the no-progress guard near `encoded_until_bits` boundaries.
+        // `make_random_data` is kept (documents the PRNG shape) but pure-random
+        // cannot reach the parallel-SM path the test exists to cover.
+        let _ = make_random_data;
+        let payload = make_semicompressible_data(60 * 1024 * 1024, 0.30);
         let compressed = gz_at(&payload, 1);
         assert_pure_rust_parallel_sm_roundtrips(&compressed, "large_random");
     }
 
     #[test]
     fn corpus_large_repetitive() {
-        // Highly-compressible repeating data → ~100 MiB raw compresses
-        // to ~12 MiB at default level → just clears the 10 MiB gate.
-        // Exercises long matches and sliding-window references.
-        let payload = make_repetitive_data(100 * 1024 * 1024);
-        let compressed = gz_default(&payload);
+        // Motif-heavy (motif_frac 0.7): long in-block matches + cross-block
+        // sliding-window resume, with enough literal tail that the stream
+        // compresses to a *moderate* ratio that clears 10 MiB compressed.
+        // Pure repetition (`make_repetitive_data`) compresses to < 1 MiB on
+        // this zlib build — far below the 10 MiB gate — so it never routes
+        // parallel; the block-unique motif here keeps the ratio bounded.
+        let _ = make_repetitive_data;
+        let payload = make_semicompressible_data(48 * 1024 * 1024, 0.70);
+        let compressed = gz_at(&payload, 1);
         assert_pure_rust_parallel_sm_roundtrips(&compressed, "large_repetitive");
     }
 
