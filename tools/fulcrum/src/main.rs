@@ -256,15 +256,28 @@ fn cmd_mech_report(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn load_mech_from_report(path: Option<&str>) -> Option<mech::Mech> {
-    let path = path?;
-    let text = std::fs::read_to_string(path).ok()?;
-    let by_func_pct = mech::parse_perf_report(&text);
+fn load_mech_from_report(path: Option<&str>, topdown_path: Option<&str>) -> Option<mech::Mech> {
     let mut m = mech::Mech::default();
-    for (name, pct) in by_func_pct {
-        m.by_func.entry(name).or_default().cycles_pct = pct;
+    let mut any = false;
+    if let Some(p) = path {
+        if let Ok(text) = std::fs::read_to_string(p) {
+            for (name, pct) in mech::parse_perf_report(&text) {
+                m.by_func.entry(name).or_default().cycles_pct = pct;
+            }
+            any = true;
+        }
     }
-    Some(m)
+    if let Some(tp) = topdown_path {
+        if let Ok(text) = std::fs::read_to_string(tp) {
+            m.topdown = mech::parse_topdown(&text);
+            any = true;
+        }
+    }
+    if any {
+        Some(m)
+    } else {
+        None
+    }
 }
 
 fn cmd_rank(args: &[String]) -> ExitCode {
@@ -290,7 +303,24 @@ fn cmd_rank(args: &[String]) -> ExitCode {
     let maps = coz::default_region_maps();
     let coz_prof =
         coz_path.and_then(|p| coz::parse_profile(Path::new(p), "chunk_emitted", &maps).ok());
-    let mech = load_mech_from_report(perf_path);
+    let mech = load_mech_from_report(perf_path, flag(args, "--topdown"));
+
+    // Surface the run-level TMA top-down bound (the mechanism headline) if a
+    // --topdown perf-stat capture was supplied.
+    if let Some(m) = &mech {
+        let (bound, pct) = m.topdown.dominant();
+        if pct > 0.0 {
+            println!(
+                "\n========  TMA TOP-DOWN (run-level mechanism)  ========\n  \
+                 dominant: {bound} {pct:.1}%   [retiring {:.1} | bad-spec {:.1} | \
+                 frontend {:.1} | backend {:.1}]",
+                m.topdown.retiring,
+                m.topdown.bad_speculation,
+                m.topdown.frontend_bound,
+                m.topdown.backend_bound,
+            );
+        }
+    }
 
     print_critpath(&cp);
     if let Some(c) = &coz_prof {

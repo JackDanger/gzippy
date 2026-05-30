@@ -139,36 +139,72 @@ pub fn perf_topdown_command(
     cmd
 }
 
-/// Parse `perf stat --topdown -x,` CSV for the four TMA percentages.
-/// perf emits rows like: `,,12.3,,topdown-retiring,...` — we match by the
-/// metric/event name column containing the topdown slot names.
-pub fn parse_topdown(csv: &str) -> TopDown {
+/// Parse `perf stat --topdown` output for the four TMA percentages.
+///
+/// Modern `perf stat --topdown` (the box's perf 6.x) emits a space-aligned
+/// HEADER row naming the metrics in column order, then a DATA row of the
+/// percentages — NOT a per-line keyword+value CSV:
+///
+///   ` %  tma_backend_bound  %  tma_retiring  %  tma_bad_speculation  %  tma_frontend_bound`
+///   `                  40.1               22.5                  21.3                   16.1`
+///
+/// So we (1) find the header row (the one carrying the `tma_*` / `topdown-*`
+/// metric names), record the metric ORDER, then (2) map the next row's
+/// floats positionally. We also keep a fallback for the old same-line CSV
+/// form (`,,12.3,,topdown-retiring`).
+pub fn parse_topdown(text: &str) -> TopDown {
     let mut td = TopDown::default();
-    for line in csv.lines() {
-        let lower = line.to_lowercase();
-        let cols: Vec<&str> = line.split(',').collect();
-        // Find a numeric percentage anywhere on a topdown line.
-        let pct = cols
-            .iter()
-            .find_map(|c| c.trim().trim_end_matches('%').parse::<f64>().ok());
-        let Some(pct) = pct else { continue };
-        // Match both the verbose (`topdown-retiring`) and the abbreviated
-        // metric-group spellings perf uses across versions / hybrid cores
-        // (`tma_retiring`, `be-bound`, `fe-bound`, `bad-spec`).
-        if lower.contains("retiring") {
+    let classify = |name: &str, pct: f64, td: &mut TopDown| {
+        let l = name.to_lowercase();
+        if l.contains("retiring") {
             td.retiring = pct;
-        } else if lower.contains("bad") && lower.contains("spec") {
+        } else if l.contains("bad") && (l.contains("spec") || l.contains("speculation")) {
             td.bad_speculation = pct;
-        } else if lower.contains("frontend")
-            || lower.contains("fe-bound")
-            || lower.contains("fe_bound")
-        {
+        } else if l.contains("frontend") || l.contains("fe_bound") || l.contains("fe-bound") {
             td.frontend_bound = pct;
-        } else if lower.contains("backend")
-            || lower.contains("be-bound")
-            || lower.contains("be_bound")
-        {
+        } else if l.contains("backend") || l.contains("be_bound") || l.contains("be-bound") {
             td.backend_bound = pct;
+        }
+    };
+
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let lower = line.to_lowercase();
+        // Header row: contains the TMA metric tokens.
+        let names: Vec<&str> = line
+            .split_whitespace()
+            .filter(|t| {
+                let t = t.to_lowercase();
+                t.contains("tma_") || t.contains("topdown")
+            })
+            .collect();
+        if names.len() >= 2 && (lower.contains("retiring") || lower.contains("bound")) {
+            // The DATA row is the next non-empty line of floats.
+            if let Some(data) = lines.get(i + 1..).and_then(|rest| {
+                rest.iter()
+                    .find(|l| l.split_whitespace().any(|t| t.parse::<f64>().is_ok()))
+            }) {
+                let nums: Vec<f64> = data
+                    .split_whitespace()
+                    .filter_map(|t| t.trim_end_matches('%').parse::<f64>().ok())
+                    .collect();
+                for (name, pct) in names.iter().zip(nums.iter()) {
+                    classify(name, *pct, &mut td);
+                }
+                return td;
+            }
+        }
+        // Fallback: same-line keyword + percentage (old CSV / -x, form).
+        if let Some(pct) = line
+            .split(|c| c == ',' || c == ' ' || c == '\t')
+            .find_map(|c| c.trim().trim_end_matches('%').parse::<f64>().ok())
+        {
+            if lower.contains("retiring")
+                || lower.contains("bound")
+                || (lower.contains("bad") && lower.contains("spec"))
+            {
+                classify(&lower, pct, &mut td);
+            }
         }
     }
     td
