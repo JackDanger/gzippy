@@ -366,18 +366,33 @@ pub fn parse_profile(
         }
     }
 
-    // Build per-line curves: for each selected, baseline = period at level
-    // 0; program_speedup at each level = (baseline − period) / baseline.
+    // Build per-line curves. coz establishes the program's BASELINE
+    // throughput from the speedup=0 experiments — and crucially those
+    // baselines are GLOBAL (the program runs at its native speed), shared
+    // across every `selected` line, not per-line. With few runs a given
+    // line may only ever be measured at a NONZERO speedup, with its
+    // speedup=0 baseline contributed by experiments on OTHER lines. So we
+    // compute a global baseline period = aggregate(delta,duration) over ALL
+    // speedup=0 experiments and use it when a per-line level-0 is absent.
     let mut by_selected: BTreeMap<String, BTreeMap<u64, ThroughputAccum>> = BTreeMap::new();
+    let mut global_base = ThroughputAccum::default();
     for ((sel, lvl), a) in acc {
+        if lvl == 0 {
+            global_base.delta += a.delta;
+            global_base.duration += a.duration;
+        }
         by_selected.entry(sel).or_default().insert(lvl, a);
     }
+    let global_baseline = global_base.period();
 
     let mut line_curves = Vec::new();
     let mut region_curves: BTreeMap<String, RegionCurve> = BTreeMap::new();
 
     for (selected, levels) in by_selected {
-        let baseline = levels.get(&0).and_then(|a| a.period());
+        // coz's baseline is the program's native (speedup=0) throughput,
+        // which is GLOBAL — so use the aggregated global baseline. Fall
+        // back to a line-local level-0 only if no global-0 exists at all.
+        let baseline = global_baseline.or_else(|| levels.get(&0).and_then(|a| a.period()));
         let Some(baseline) = baseline else { continue };
         if baseline <= 0.0 {
             continue;
