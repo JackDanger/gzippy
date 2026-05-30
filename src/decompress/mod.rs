@@ -55,7 +55,9 @@ fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
 ///   GzippyParallel   — gzippy-produced multi-block files ("GZ" FEXTRA subfield)
 ///   MultiMemberPar   — pigz-style multi-member, Tmax threads
 ///   MultiMemberSeq   — pigz-style multi-member, T1
-///   IsalParallelSM   — x86_64 single-member ≥ 10 MiB w/ T≥4 — parallel marker pipeline
+///   IsalParallelSM   — single-member ≥ 10 MiB w/ T≥4 — parallel marker pipeline
+///                      (x86_64: ISA-L or pure-Rust; aarch64: pure-Rust inner decoder).
+///                      Gated by `parallel::sm_cfg::PARALLEL_SM`; name is historical.
 ///   IsalSingle       — x86_64 single-member via ISA-L (one-shot, T=1 or small input)
 ///   StreamingSingle  — single-member > 1GB, no ISA-L (avoids huge allocation)
 ///   LibdeflateSingle — default single-member via libdeflate one-shot (no ISA-L)
