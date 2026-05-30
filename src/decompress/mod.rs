@@ -71,6 +71,13 @@ pub enum DecodePath {
     MultiMemberPar,
     MultiMemberSeq,
     IsalParallelSM,
+    /// Stored-block-dominated (incompressible) single-member, decoded in
+    /// parallel WITHOUT speculation by splitting on explicit stored-block
+    /// `LEN` fields. See [`crate::decompress::parallel::stored_split`]. The
+    /// `parallel_sm_unprofitable` ratio gate routes incompressible input here
+    /// (instead of single-thread libdeflate) when its first block is stored —
+    /// stored streams are trivially, bandwidth-bound parallelizable.
+    StoredParallel,
     IsalSingle,
     StreamingSingle,
     LibdeflateSingle,
@@ -148,9 +155,22 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
     if crate::decompress::parallel::sm_cfg::PARALLEL_SM
         && num_threads >= MIN_PARALLEL_SM_THREADS
         && data.len() > MIN_PARALLEL_COMPRESSED
-        && !parallel_sm_unprofitable(data)
     {
-        return DecodePath::IsalParallelSM;
+        if !parallel_sm_unprofitable(data) {
+            // Compressible single-member: the speculative marker pipeline.
+            return DecodePath::IsalParallelSM;
+        }
+        // Incompressible / stored-dominated single-member: the speculative
+        // pipeline thrashes (block finder never lands a boundary), so the ratio
+        // gate above declines it. But if it's actually a STORED stream we can
+        // still parallelize WITHOUT speculation using the explicit block
+        // lengths. `first_block_is_stored` is a cheap heuristic; the
+        // stored_split decoder re-validates and bails (NotStoredDominated) to
+        // the safe one-shot path below if the stream is not 100% stored, so a
+        // mis-fire is perf-only, never a correctness issue.
+        if crate::decompress::parallel::stored_split::first_block_is_stored(data) {
+            return DecodePath::StoredParallel;
+        }
     }
     if crate::backends::isal_decompress::is_available() {
         return DecodePath::IsalSingle;
@@ -240,6 +260,7 @@ pub(crate) fn decompress_gzip_libdeflate<W: Write + Send>(
         }
         DecodePath::MultiMemberSeq => decompress_multi_member_sequential(data, writer),
         DecodePath::IsalParallelSM
+        | DecodePath::StoredParallel
         | DecodePath::IsalSingle
         | DecodePath::StreamingSingle
         | DecodePath::LibdeflateSingle => {
@@ -309,6 +330,7 @@ pub(crate) fn decompress_single_member<W: Write>(
             decompress_multi_member_sequential(data, writer)
         }
         DecodePath::IsalParallelSM
+        | DecodePath::StoredParallel
         | DecodePath::IsalSingle
         | DecodePath::StreamingSingle
         | DecodePath::LibdeflateSingle => {
@@ -355,6 +377,27 @@ fn decompress_single_member_for<W: Write>(
             writer.flush()?;
             Ok(n)
         }
+        DecodePath::StoredParallel => {
+            // Non-speculative parallel stored-block decode. The classifier's
+            // `first_block_is_stored` heuristic sent us here; if the stream is
+            // not actually 100% stored, the decoder reports `NotStoredDominated`
+            // WITHOUT writing, and we decode via the safe one-shot path. This is
+            // a router correction, NOT a silent backend retry masking a failure:
+            // any genuine corruption (CRC / size / LEN mismatch) is terminal.
+            use crate::decompress::parallel::stored_split::{
+                decompress_stored_parallel, StoredSplitError,
+            };
+            match decompress_stored_parallel(data, writer, num_threads) {
+                Ok(n) => Ok(n),
+                Err(StoredSplitError::NotStoredDominated) => {
+                    if crate::utils::debug_enabled() {
+                        eprintln!("[gzippy] StoredParallel declined (not pure-stored) → one-shot");
+                    }
+                    decompress_single_member_one_shot(data, writer)
+                }
+                Err(e) => Err(GzippyError::decompression(format!("stored parallel: {e}"))),
+            }
+        }
         DecodePath::IsalSingle => {
             #[cfg(test)]
             ISAL_STREAM_SM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -382,6 +425,30 @@ fn decompress_single_member_for<W: Write>(
             "decompress_single_member_for called with non-single-member path: {other:?}"
         ))),
     }
+}
+
+/// Safe one-shot single-member decode — the path the classifier would pick if
+/// the parallel/stored fast-paths were unavailable. Used as the correction
+/// target when `StoredParallel`'s heuristic mis-fires on a non-stored stream
+/// (`NotStoredDominated`). Mirrors the tail of [`classify_gzip`]: ISA-L when
+/// available, zlib-ng streaming for >1 GiB, else libdeflate one-shot.
+fn decompress_single_member_one_shot<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
+    if crate::backends::isal_decompress::is_available() {
+        #[cfg(test)]
+        ISAL_STREAM_SM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bytes = crate::backends::isal_decompress::decompress_gzip_stream(data, writer)
+            .ok_or_else(|| {
+                GzippyError::decompression("ISA-L sequential decompress failed".to_string())
+            })?;
+        writer.flush()?;
+        return Ok(bytes);
+    }
+    if data.len() > 1024 * 1024 * 1024 {
+        return decompress_single_member_streaming(data, writer);
+    }
+    #[cfg(test)]
+    LIBDEFLATE_SM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    decompress_single_member_libdeflate(data, writer)
 }
 
 /// Streaming single-member decompress via flate2/zlib-ng. Fixed 1MB buffer —
@@ -685,13 +752,17 @@ mod tests {
         );
     }
 
-    /// Incompressible single-member input above the size gate must NOT take
-    /// the speculative parallel pipeline — on stored-dominated data the block
-    /// finder's spacing guesses never hit a real boundary and the pipeline is
-    /// 3-4× slower than a single ISA-L pass (2026-05-29 matrix). It must route
-    /// to the one-shot path instead via `parallel_sm_unprofitable`.
+    /// Incompressible single-member input above the size gate must NOT take the
+    /// SPECULATIVE parallel pipeline — on stored-dominated data the block
+    /// finder's spacing guesses never hit a real boundary and that pipeline is
+    /// 3-4× slower than a single ISA-L pass (2026-05-29 matrix). The
+    /// `parallel_sm_unprofitable` ratio gate keeps it off the speculative path;
+    /// instead such input (a stored stream) is routed to the NON-speculative
+    /// `StoredParallel` split path on x86_64 + ISA-L/pure-rust, which decodes
+    /// the explicit stored-block lengths in parallel. Either way the speculative
+    /// `IsalParallelSM` path is never chosen, and the output is byte-exact.
     #[test]
-    fn test_incompressible_single_member_bails_to_one_shot() {
+    fn test_incompressible_single_member_avoids_speculative_pipeline() {
         // 16 MiB of high-entropy bytes -> compressed ~= raw, ratio ~1.0.
         let mut original = vec![0u8; 16 * 1024 * 1024];
         let mut state = 0xdeadbeefu64;
@@ -712,18 +783,27 @@ mod tests {
         );
         assert!(
             parallel_sm_unprofitable(&compressed),
-            "incompressible input must be flagged unprofitable for parallel SM"
+            "incompressible input must be flagged unprofitable for the speculative SM"
         );
-        // Even at T=4 it must NOT classify parallel.
+        // It must NEVER take the speculative pipeline (the slow path on stored
+        // data), at any thread count.
         assert_ne!(
             classify_gzip(&compressed, 4),
             DecodePath::IsalParallelSM,
-            "incompressible single-member must bail off the speculative pipeline"
+            "incompressible single-member must avoid the speculative pipeline"
         );
-        // And it must still decode byte-perfectly through whatever path it took.
+        // On parallel-SM builds it takes the non-speculative stored split
+        // instead of single-thread libdeflate.
+        #[cfg(parallel_sm)]
+        assert_eq!(
+            classify_gzip(&compressed, 4),
+            DecodePath::StoredParallel,
+            "stored incompressible input must take the parallel stored-split path"
+        );
+        // And it must decode byte-perfectly through whatever path it took.
         let mut out = Vec::new();
         decompress_single_member(&compressed, &mut out, 4).expect("must decode");
-        assert_eq!(out, original, "byte-perfect output required after bail");
+        assert_eq!(out, original, "byte-perfect output required");
     }
 
     /// On a parallel-eligible input the libdeflate one-shot backend must
