@@ -1,0 +1,38 @@
+{
+  "progress_point": "chunk_emitted",
+  "regions": [
+    {
+      "name": "boundary_scan",
+      "functions": ["scan_candidate", "scan_run"]
+    },
+    {
+      "name": "marker_bootstrap",
+      "functions": ["worker.bootstrap"]
+    },
+    {
+      "name": "clean_isal_tail",
+      "functions": ["isal_stream_inflate", "block_body", "block_header"]
+    },
+    {
+      "name": "copies",
+      "functions": ["drain", "append_markered", "absorb_isal_tail", "write_narrowed", "narrow"]
+    },
+    {
+      "name": "apply_window",
+      "functions": ["post_process.task", "window_publish_marker", "publish_windows"]
+    },
+    {
+      "name": "consumer_write",
+      "functions": ["write_data", "try_take_prefetched", "rx_recv_block"]
+    },
+    {
+      "name": "pool_wrapper",
+      "functions": ["pool.run_task", "pool.pick", "pool.submit"]
+    }
+  ],
+  "ground_truth": {
+    "cp_offpath_region": "copies",
+    "cp_offpath_max": 0.12,
+    "min_heavy_blockers": 2
+  }
+}
