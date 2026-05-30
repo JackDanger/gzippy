@@ -133,6 +133,11 @@ impl WindowMap {
         self.state.lock().unwrap().entries.len()
     }
 
+    /// Diagnostic: snapshot all published window keys (encoded bit offsets).
+    pub fn keys_snapshot(&self) -> Vec<usize> {
+        self.state.lock().unwrap().entries.keys().copied().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
