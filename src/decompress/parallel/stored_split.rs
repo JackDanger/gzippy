@@ -384,13 +384,16 @@ fn decode_with_huffman_tail<W: Write>(
     #[cfg(parallel_sm)]
     {
         let mut output = time_phase("alloc_zero", || vec![0u8; expected_size]);
-        // 1) Parallel-copy the stored prefix into output[0..prefix_out].
-        time_phase("prefix_copy", || {
+        // 1) Parallel-copy the stored prefix into output[0..prefix_out], KEEPING
+        //    the prefix CRC that `fill_and_crc` already computes in parallel.
+        //    (Previously this CRC was discarded and the whole 100 MB buffer was
+        //    re-CRC'd serially after the tail — a redundant ~6 ms full-buffer
+        //    pass on the critical path. Now we fold prefix_crc with a CRC over
+        //    only the much smaller tail region, so the prefix is CRC'd once and
+        //    in parallel.)
+        let prefix_crc = time_phase("prefix_copy", || {
             let (prefix_buf, _tail_buf) = output.split_at_mut(prefix_out);
-            // Reuse the parallel filler (it computes a CRC we ignore here; the
-            // whole-buffer CRC is taken once at the end so prefix + tail fold
-            // together without a separate combine).
-            let _ = fill_and_crc(prefix_buf, deflate, base_off, prefix_runs, num_threads);
+            fill_and_crc(prefix_buf, deflate, base_off, prefix_runs, num_threads)
         });
         // 2) Sequentially decode the Huffman tail into output[prefix_out..].
         //    Back-refs reach into output[..out_pos] (the materialised prefix),
@@ -399,7 +402,18 @@ fn decode_with_huffman_tail<W: Write>(
             decode_tail_blocks(&deflate[tail_byte..], &mut output, prefix_out)
         })?;
 
-        let crc = time_phase("crc32", || crc32(&output));
+        // 3) CRC only the tail region, then fold prefix_crc ⊕ tail_crc in output
+        //    order. `combine_crc32` is the standard CRC32 concatenation (tested
+        //    against crc32fast::Hasher::combine) so prefix(parallel) + tail folds
+        //    to the exact whole-buffer CRC.
+        let crc = time_phase("crc32", || {
+            let tail = &output[prefix_out..];
+            if tail.is_empty() {
+                prefix_crc
+            } else {
+                combine_crc32(prefix_crc, crc32(tail), tail.len() as u64)
+            }
+        });
         time_phase("verify_write", || {
             verify_and_write(writer, &output, crc, expected_crc, expected_size)
         })
