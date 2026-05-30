@@ -230,7 +230,7 @@ fn compress(data: &[u8], level: u32) -> Vec<u8> {
 // output is clean, no markers emitted) and asserts byte-exactness vs both the
 // libdeflate oracle and the original payload, over fuzzed inputs. It is the
 // safety net the collapse validates against per commit.
-#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+#[cfg(pure_inflate_decode)]
 fn decode_via_deflate_block(gz: &[u8]) -> Vec<u8> {
     use crate::decompress::inflate::consume_first_decode::Bits;
     use crate::decompress::parallel::deflate_block::Block;
@@ -270,7 +270,7 @@ fn decode_via_deflate_block(gz: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "pure-rust-inflate"))]
+#[cfg(pure_inflate_decode)]
 #[test]
 fn deflate_block_marker_decoder_fuzz_200_cases() {
     let mut rng_seed: u64 = 0x1234_5678_9abc_def0;

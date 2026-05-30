@@ -585,10 +585,7 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::Write;
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(feature = "isal-compression", feature = "pure-rust-inflate")
-    ))]
+    #[cfg(parallel_sm)]
     use std::sync::atomic::Ordering;
 
     /// Build a moderately-compressible single-member gzip fixture whose
@@ -624,41 +621,39 @@ mod tests {
 
     /// The classifier — not an in-body fallback — is the only place that
     /// decides whether parallel SM runs. An input that satisfies the
-    /// gate must classify to `IsalParallelSM` on x86_64+ISA-L hosts and
-    /// to `IsalSingle`/`LibdeflateSingle` elsewhere — never silently
-    /// switch backends inside `decompress_single_member`.
+    /// gate must classify to `IsalParallelSM` wherever the parallel-SM
+    /// pipeline is compiled in (`PARALLEL_SM`) and to
+    /// `IsalSingle`/`LibdeflateSingle` otherwise — never silently switch
+    /// backends inside `decompress_single_member`.
+    ///
+    /// `PARALLEL_SM` is true on x86_64 (isal-compression | pure-rust-inflate)
+    /// AND on aarch64 (pure-rust-inflate) — the latter being the arm64
+    /// pure-Rust parallel path. Asserting against the const keeps this test
+    /// in lockstep with the gate instead of duplicating the cfg predicate.
     #[test]
     fn test_classify_routes_at_classifier_not_in_body() {
         let (_raw, payload) = compressible_parallel_fixture();
         let path = classify_gzip(&payload, 4);
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(feature = "isal-compression", feature = "pure-rust-inflate")
-        ))]
-        assert_eq!(
-            path,
-            DecodePath::IsalParallelSM,
-            "12 MiB compressed input on x86_64+ISA-L must classify parallel"
-        );
-        #[cfg(not(all(
-            target_arch = "x86_64",
-            any(feature = "isal-compression", feature = "pure-rust-inflate")
-        )))]
-        assert_ne!(
-            path,
-            DecodePath::IsalParallelSM,
-            "no-ISA-L host must not classify parallel"
-        );
+        if crate::decompress::parallel::sm_cfg::PARALLEL_SM {
+            assert_eq!(
+                path,
+                DecodePath::IsalParallelSM,
+                "size+ratio-eligible input must classify parallel where PARALLEL_SM is on"
+            );
+        } else {
+            assert_ne!(
+                path,
+                DecodePath::IsalParallelSM,
+                "host without the parallel-SM pipeline must not classify parallel"
+            );
+        }
     }
 
     /// The speculative parallel single-member pipeline must engage only at
     /// T≥4 (its per-core throughput is below the ISA-L one-shot until ~4
     /// threads; 2026-05-29 matrix: one-shot T1 1074 > parallel T2 863). At T2/T3
     /// a compressible, size-eligible input must route to the one-shot path.
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(feature = "isal-compression", feature = "pure-rust-inflate")
-    ))]
+    #[cfg(parallel_sm)]
     #[test]
     fn test_parallel_sm_thread_gate() {
         let (_raw, payload) = compressible_parallel_fixture();
@@ -724,10 +719,7 @@ mod tests {
     /// never be called from the single-member dispatcher. This is the
     /// no-fallback invariant the user asked for: under no circumstances
     /// can a silent libdeflate retry mask a parallel-pipeline failure.
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(feature = "isal-compression", feature = "pure-rust-inflate")
-    ))]
+    #[cfg(parallel_sm)]
     #[test]
     fn test_no_libdeflate_fallback_ever_fires_from_sm_path() {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
@@ -754,10 +746,7 @@ mod tests {
 
     /// A corrupted CRC must surface as `GzippyError::Decompression`, not
     /// produce silent `Ok` via a libdeflate retry.
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(feature = "isal-compression", feature = "pure-rust-inflate")
-    ))]
+    #[cfg(parallel_sm)]
     #[test]
     fn test_parallel_sm_propagates_errors_not_fallbacks() {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK

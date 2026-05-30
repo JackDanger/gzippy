@@ -278,11 +278,7 @@ mod tests {
     /// B3 proof: parallel SM byte-perfect with `--no-default-features
     /// --features pure-rust-inflate` (no isal-sys in the dependency graph).
     #[test]
-    #[cfg(all(
-        target_arch = "x86_64",
-        feature = "pure-rust-inflate",
-        not(feature = "isal-compression")
-    ))]
+    #[cfg(all(pure_inflate_decode, not(feature = "isal-compression")))]
     fn test_pure_rust_parallel_sm_e2e() {
         use std::sync::atomic::Ordering;
 
@@ -360,10 +356,7 @@ mod tests {
         // Only assert the counter moved on platforms where the parallel
         // marker pipeline is the intended path. Elsewhere the routing
         // correctly steers to libdeflate/zlib-ng and `after == before`.
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(feature = "isal-compression", feature = "pure-rust-inflate")
-        ))]
+        #[cfg(parallel_sm)]
         assert!(
             after > before,
             "MARKER_PIPELINE_RUNS did not increment ({before} -> {after}); \
@@ -372,10 +365,7 @@ mod tests {
              Check that `decompress_single_member`'s parallel gate is \
              reachable (ISA-L available, num_threads > 1, data > 10 MiB)."
         );
-        #[cfg(not(all(
-            target_arch = "x86_64",
-            any(feature = "isal-compression", feature = "pure-rust-inflate")
-        )))]
+        #[cfg(not(parallel_sm))]
         let _ = (before, after); // suppress unused-vars on non-target platforms
     }
 
@@ -400,11 +390,7 @@ mod tests {
     // execution.
     // =========================================================================
     #[test]
-    #[cfg(all(
-        target_arch = "x86_64",
-        feature = "pure-rust-inflate",
-        not(feature = "isal-compression")
-    ))]
+    #[cfg(all(pure_inflate_decode, not(feature = "isal-compression")))]
     fn unified_inflate_path_runs_on_parallel_sm() {
         use std::sync::atomic::Ordering;
 
@@ -461,10 +447,7 @@ mod tests {
     // a single decode large enough to force multiple subchunks per chunk
     // and asserts the counter moved.
     // =========================================================================
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(feature = "isal-compression", feature = "pure-rust-inflate")
-    ))]
+    #[cfg(parallel_sm)]
     #[test]
     fn test_unsplit_blocks_emplaces_on_multi_subchunk_decode() {
         use std::sync::atomic::Ordering;
@@ -484,10 +467,7 @@ mod tests {
         let after = crate::decompress::parallel::chunk_fetcher::UNSPLIT_BLOCKS_EMPLACED
             .load(Ordering::Relaxed);
 
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(feature = "isal-compression", feature = "pure-rust-inflate")
-        ))]
+        #[cfg(parallel_sm)]
         assert!(
             after > before,
             "UNSPLIT_BLOCKS_EMPLACED did not increment ({before} -> {after}); \
@@ -495,10 +475,7 @@ mod tests {
              GzipChunkFetcher.hpp:393) is unreachable. This catches the same \
              silent-fallback failure class as the marker-pipeline deletion trap."
         );
-        #[cfg(not(all(
-            target_arch = "x86_64",
-            any(feature = "isal-compression", feature = "pure-rust-inflate")
-        )))]
+        #[cfg(not(parallel_sm))]
         let _ = (before, after);
     }
 
@@ -514,10 +491,7 @@ mod tests {
     // `lookup_next_block_offset` accepts the file-size sentinel during
     // a real parallel SM decode.
     // =========================================================================
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(feature = "isal-compression", feature = "pure-rust-inflate")
-    ))]
+    #[cfg(parallel_sm)]
     #[test]
     fn test_prefetch_next_filesize_accept_fires() {
         use std::sync::atomic::Ordering;
@@ -540,10 +514,7 @@ mod tests {
         let after = crate::decompress::parallel::chunk_fetcher::PREFETCH_NEXT_FILESIZE_ACCEPT
             .load(Ordering::Relaxed);
 
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(feature = "isal-compression", feature = "pure-rust-inflate")
-        ))]
+        #[cfg(parallel_sm)]
         assert!(
             after > before,
             "PREFETCH_NEXT_FILESIZE_ACCEPT did not increment ({before} -> {after}); \
@@ -552,10 +523,7 @@ mod tests {
              the last prefetch in any file is skipped — visible on the 3-partition \
              fixture as a 1.24-CPU serial bottleneck on a 16-core machine."
         );
-        #[cfg(not(all(
-            target_arch = "x86_64",
-            any(feature = "isal-compression", feature = "pure-rust-inflate")
-        )))]
+        #[cfg(not(parallel_sm))]
         let _ = (before, after);
     }
 
@@ -583,10 +551,7 @@ mod tests {
     // unported primitives (#1–#5) are still landing.
     #[test]
     #[ignore = "perf gate — run on neurotic, not GHA (plans/rust-rapidgzip.md)"]
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(feature = "isal-compression", feature = "pure-rust-inflate")
-    ))]
+    #[cfg(parallel_sm)]
     fn test_single_member_parallel_not_slower_than_sequential() {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
             .lock()
@@ -648,10 +613,7 @@ mod tests {
     /// Real silesia corpus — Validation Gate 1b (plans/rust-rapidgzip.md A4).
     #[test]
     #[ignore = "perf gate — run on neurotic, not GHA (plans/rust-rapidgzip.md)"]
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(feature = "isal-compression", feature = "pure-rust-inflate")
-    ))]
+    #[cfg(parallel_sm)]
     fn test_single_member_parallel_silesia() {
         use crate::tests::datasets;
 
@@ -712,10 +674,7 @@ mod tests {
     /// (real silesia.tar.gz) as the pure-Rust Phase B gate.
     #[test]
     #[ignore = "perf gate — run on neurotic, not GHA (plans/rust-rapidgzip.md)"]
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(feature = "isal-compression", feature = "pure-rust-inflate")
-    ))]
+    #[cfg(parallel_sm)]
     fn test_single_member_parallel_silesia_class_not_slower_than_sequential() {
         let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
             .lock()
@@ -771,10 +730,7 @@ mod tests {
 
     /// Deletion-trap: proves slow-path boundary search routes through the
     /// async `RawBlockFinderCoordinator`, not a silent sequential fallback.
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(feature = "isal-compression", feature = "pure-rust-inflate")
-    ))]
+    #[cfg(parallel_sm)]
     #[test]
     fn test_coordinator_boundary_search_runs_on_x86_64_isal() {
         use std::sync::atomic::Ordering;
@@ -795,19 +751,13 @@ mod tests {
         let after = crate::decompress::parallel::chunk_fetcher::COORDINATOR_BOUNDARY_SEARCH_RUNS
             .load(Ordering::Relaxed);
 
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(feature = "isal-compression", feature = "pure-rust-inflate")
-        ))]
+        #[cfg(parallel_sm)]
         assert!(
             after > before,
             "COORDINATOR_BOUNDARY_SEARCH_RUNS did not increment ({before} -> {after}); \
              slow-path boundary search is not routing through RawBlockFinderCoordinator."
         );
-        #[cfg(not(all(
-            target_arch = "x86_64",
-            any(feature = "isal-compression", feature = "pure-rust-inflate")
-        )))]
+        #[cfg(not(parallel_sm))]
         let _ = (before, after);
     }
 
@@ -902,30 +852,21 @@ mod tests {
         let after_runs = crate::decompress::parallel::single_member::MARKER_PIPELINE_RUNS
             .load(Ordering::Relaxed);
 
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(feature = "isal-compression", feature = "pure-rust-inflate")
-        ))]
+        #[cfg(parallel_sm)]
         assert!(
             after_runs > before_runs,
             "MARKER_PIPELINE_RUNS did not increment ({before_runs} -> {after_runs}) on \
              BTYPE=01-heavy fixture — parallel path silently fell back to \
              sequential libdeflate."
         );
-        #[cfg(not(all(
-            target_arch = "x86_64",
-            any(feature = "isal-compression", feature = "pure-rust-inflate")
-        )))]
+        #[cfg(not(parallel_sm))]
         let _ = (before_runs, after_runs);
     }
 
     /// Mirrors benchmarks.yml `random-data` (10 MiB urandom, L9 T4 compress,
     /// parallel SM decompress). Reproduces CI's `ExactStopMissed` at the 10 MiB
     /// partition when fixed-Huffman tail blocks were skipped by BlockFinder.
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(feature = "isal-compression", feature = "pure-rust-inflate")
-    ))]
+    #[cfg(parallel_sm)]
     #[test]
     fn test_random_10mb_pipelined_l9_roundtrip_parallel_sm() {
         use crate::compress::pipelined::PipelinedGzEncoder;
@@ -957,10 +898,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(feature = "isal-compression", feature = "pure-rust-inflate")
-    ))]
+    #[cfg(parallel_sm)]
     mod fname_header_parallel_sm {
         use super::*;
 
