@@ -57,6 +57,10 @@ pub mod sm_cfg;
 #[cfg(parallel_sm)]
 pub mod sm_driver;
 pub mod statistics;
+/// Non-speculative parallel decode for stored-block-dominated (incompressible)
+/// single-member streams. Portable (depends only on crc32 + gzip_format), so it
+/// is NOT cfg-gated; routing to it lives in [`crate::decompress::classify_gzip`].
+pub mod stored_split;
 #[cfg(parallel_sm)]
 pub mod streamed_results;
 #[cfg(parallel_sm)]
