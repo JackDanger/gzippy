@@ -57,6 +57,10 @@
 mod backends;
 mod cli;
 mod format;
+// FULCRUM causal-profiler probe surface. Always compiled; the Coz calls
+// inside are `#[cfg(feature = "fulcrum")]` so non-fulcrum builds pay zero.
+// Public so the standalone `tools/fulcrum` crate can reuse `Region`.
+pub mod fulcrum_probe;
 mod infra;
 mod utils;
 

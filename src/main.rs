@@ -45,6 +45,10 @@ mod analyze;
 mod cli;
 mod error;
 mod format;
+// FULCRUM causal-profiler probe surface (Coz progress/scope points).
+// Coz calls inside are feature-gated; this `mod` is always present so the
+// decode-path call sites resolve in every build configuration.
+mod fulcrum_probe;
 mod index_mode;
 mod utils;
 

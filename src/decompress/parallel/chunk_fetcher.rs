@@ -2148,6 +2148,10 @@ fn speculative_decode_find_boundary(
     // Matched on vendor side by the trace patch around the alternating
     // findNextDynamic/findNextUncompressed loop at GzipChunk.hpp:803+.
     let _tv2_scan = trace_v2::SpanGuard::begin("worker.scan_run");
+    // FULCRUM region scope: speculative block-boundary scan + candidate
+    // full-decode attempts (the "speculation/scan" lever candidate).
+    // Co-extensive with the worker.scan_run trace span.
+    let _fulcrum_scan = crate::fulcrum_scope!(crate::fulcrum_probe::Region::Scan);
     if let Some(chunk) = RawBlockFinderCoordinator::with_sync_boundary_search(
         input,
         start_bit,
@@ -2385,6 +2389,14 @@ fn drain_one_pending<W: std::io::Write>(
     // an extra Arc allocation per chunk).
     let _ = cache_key;
     let _ = block_fetcher;
+
+    // FULCRUM throughput progress point: one chunk has been emitted to the
+    // writer IN ORDER. This is the pipeline's unit of work — the wall is
+    // the time to visit this point N_chunks times. Coz virtual-speedup
+    // experiments report their effect as a change in this visit rate, so
+    // a region's elasticity is measured against in-order emission, not
+    // against out-of-order worker completion. No-op without `fulcrum`.
+    crate::fulcrum_probe::chunk_emitted();
     Ok(())
 }
 

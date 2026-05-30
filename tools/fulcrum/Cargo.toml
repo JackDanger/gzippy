@@ -1,0 +1,27 @@
+[package]
+name = "fulcrum"
+version = "0.1.0"
+edition = "2021"
+description = "FULCRUM — causal-mechanistic pipeline profiler for gzippy's parallel pure-Rust gzip decoder. Finds the leverage point: the code region whose speedup moves the wall the most (wall-elasticity), with on/off-critical-path + mechanism + CI."
+
+# Standalone crate (NOT a workspace member — the root [workspace] only lists
+# crates/gzippy-inflate, so tools/ are excluded). Mirrors tools/devtool. Build
+# directly: `cargo build --release --manifest-path tools/fulcrum/Cargo.toml`.
+
+[[bin]]
+name = "fulcrum"
+path = "src/main.rs"
+
+[dependencies]
+# Chrome-trace JSON (trace_v2.rs output) + profile fusion. serde_json only;
+# everything else is std + shelling out to coz/perf/interleaved_ab.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
+
+# Own workspace (built with --manifest-path, like tools/devtool and
+# tools/asmlens). This empty table opts the crate out of the root gzippy
+# workspace so it doesn't pull the heavy gzippy dep graph.
+[workspace]

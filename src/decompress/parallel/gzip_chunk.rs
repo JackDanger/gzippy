@@ -225,6 +225,12 @@ fn decode_chunk_isal_impl(
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
+    // FULCRUM region scope: the clean windowed bulk inflate — the
+    // "pure-Rust clean inflate" lever candidate. Wraps BOTH dispatch arms
+    // (pure-bulk and ISA-L-stream) so Coz measures the whole clean-decode
+    // region regardless of GZIPPY_ISAL_PURE_BULK. Covers both call paths
+    // (windowed-direct and post-bootstrap Phase 2).
+    let _fulcrum_bulk = crate::fulcrum_scope!(crate::fulcrum_probe::Region::BulkInflate);
     // Env-flag dispatch: route windowed-decode through the new pure-Rust
     // bulk decoder when GZIPPY_ISAL_PURE_BULK is set. Available only on
     // the pure-rust-inflate build (the isal-compression build uses real
@@ -884,7 +890,15 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     // the `cleanDataCount >= deflate::MAX_WINDOW_SIZE` handoff at
     // L520-525.
     let t_bootstrap = std::time::Instant::now();
-    let mut bootstrap = bootstrap_with_deflate_block(input, encoded_offset_bits, stop_hint_bits)?;
+    // FULCRUM region scope: the slow window-absent pure-Rust bootstrap that
+    // gates the heavy "overshoot" chunks. Coz measures ∂(chunk_emitted
+    // rate) / ∂(speed of THIS scope) — the bootstrap-vs-absorb lever
+    // discriminator the validation requires. Guard drops at the `;` after
+    // the `?`, so an early bootstrap error still closes the scope.
+    let mut bootstrap = {
+        let _fulcrum = crate::fulcrum_scope!(crate::fulcrum_probe::Region::Bootstrap);
+        bootstrap_with_deflate_block(input, encoded_offset_bits, stop_hint_bits)?
+    };
     let bootstrap_dur_us = t_bootstrap.elapsed().as_micros();
 
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
@@ -942,7 +956,14 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     )?;
     let inflate_dur_us = t_inflate.elapsed().as_micros();
     let tail_bytes = tail.data.len();
-    absorb_isal_tail(&mut chunk, tail);
+    // FULCRUM region scope: the stitch/append copy that merges the ISA-L
+    // tail into the bootstrap chunk. KNOWN non-lever (eliminating a 212 ms
+    // variant of this copy moved the wall 0.0 %). FULCRUM MUST report ≈0
+    // elasticity here — that is the tool's correctness oracle.
+    {
+        let _fulcrum = crate::fulcrum_scope!(crate::fulcrum_probe::Region::Absorb);
+        absorb_isal_tail(&mut chunk, tail);
+    }
     if trace::is_enabled() {
         trace::emit(
             "worker",

@@ -72,6 +72,14 @@ rpmalloc-caches = [
 # Test for the "pipeline idle is allocator contention" hypothesis.
 global-rpmalloc = ["dep:rpmalloc"]
 libdeflate = []
+# FULCRUM causal-mechanistic profiler hooks: compiles Coz progress/scope
+# points into the pure-Rust parallel decode path so `coz run` can measure
+# per-region wall-elasticity (∂program-speedup / ∂region-speedup). Zero
+# cost in production builds (feature off ⇒ macros expand to nothing). The
+# Coz runtime is supplied at run time by `coz run` via dlsym; no static
+# link. Pair with `--profile fulcrum` so line tables survive (release
+# `strip=true` would blind Coz + perf). See tools/fulcrum/.
+fulcrum = ["dep:coz"]
 streaming-libdeflate-rs = ["dep:streaming-libdeflate-rs"]
 dynasm = ["dep:dynasm"]
 dynasmrt = ["dep:dynasmrt"]
@@ -122,6 +130,9 @@ rpmalloc-sys = { version = "0.2", optional = true }
 # `global-rpmalloc` feature; only activated for the perf experiment.
 rpmalloc = { version = "0.2", optional = true }
 streaming-libdeflate-rs = { version = "0.2", optional = true }
+# FULCRUM: Coz causal-profiler progress/scope macros (plasma-umass/coz
+# rust bindings). dlsym-linked — pulls in the runtime only under `coz run`.
+coz = { version = "0.1", optional = true }
 dynasm = { version = "5", optional = true }
 dynasmrt = { version = "5", optional = true }
 
@@ -185,6 +196,23 @@ inherits = "release"
 strip = false
 debug = true
 lto = false
+
+# FULCRUM profiling profile: production-faithful (KEEP fat LTO + cu=1 +
+# opt3 so the binary we profile is the binary we ship), but retain line
+# tables (debug=1, strip=false) so Coz can resolve source lines and perf
+# can symbolize. panic=abort is dropped back to unwind ONLY here because
+# Coz's delay-injection can interact badly with abort-on-panic during an
+# experiment; production keeps abort. Build with:
+#   cargo build --profile fulcrum --no-default-features \
+#     --features pure-rust-inflate,fulcrum
+[profile.fulcrum]
+inherits = "release"
+strip = false
+debug = 1
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "unwind"
 
 # Enable native CPU optimizations when building locally
 # (commented out for portable binaries - uncomment for max local perf)
