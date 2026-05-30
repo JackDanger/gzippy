@@ -275,6 +275,131 @@ mod tests {
         );
     }
 
+    /// Pure incompressible bytes (PRNG), compressed into STORED deflate blocks
+    /// via `Compression::none()` — what `gzip` produces on random data.
+    fn make_high_entropy_data(size: usize) -> Vec<u8> {
+        let mut data = vec![0u8; size];
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        for b in &mut data {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (state >> 33) as u8;
+        }
+        data
+    }
+
+    /// Force stored deflate blocks (BTYPE=00) by compressing at level 0.
+    fn compress_stored_gzip(data: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Stored-dominated single-member input above the 10 MiB gate must route to
+    /// the NON-speculative `StoredParallel` path on x86_64 + ISA-L/pure-rust
+    /// (the speculative pipeline thrashes on stored data — FULCRUM 2026-05-29).
+    /// Everywhere it must decode byte-exact through the full single-member path.
+    #[test]
+    fn test_stored_dominated_routes_parallel_and_decodes() {
+        let original = make_high_entropy_data(16 * 1024 * 1024);
+        let compressed = compress_stored_gzip(&original);
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "stored fixture must exceed the 10 MiB gate (got {} bytes)",
+            compressed.len()
+        );
+        // It is genuinely incompressible (ratio gate would bail the speculative
+        // path) AND its first block is stored (the StoredParallel trigger).
+        assert!(
+            crate::decompress::parallel::stored_split::first_block_is_stored(&compressed),
+            "level-0 gzip must start with a stored block"
+        );
+
+        let path = crate::decompress::classify_gzip(&compressed, 4);
+        // `parallel_sm` is the classifier's own gate (sm_cfg::PARALLEL_SM).
+        #[cfg(parallel_sm)]
+        assert_eq!(
+            path,
+            crate::decompress::DecodePath::StoredParallel,
+            "stored-dominated input on a parallel-SM build must take the \
+             non-speculative parallel stored-split path (not single-thread libdeflate)"
+        );
+        // On non-parallel-SM builds it must NOT pick StoredParallel (no regression
+        // to the routing on those platforms).
+        #[cfg(not(parallel_sm))]
+        assert_ne!(path, crate::decompress::DecodePath::StoredParallel);
+
+        // Byte-exact through the full single-member dispatcher at T1/T4/T8.
+        // Serialize against the no-silent-fallback counter tests: the T1 decode
+        // takes the one-shot single-member path (libdeflate/ISA-L), which bumps
+        // the process-global LIBDEFLATE_SM_CALLS / ISAL_STREAM_SM_CALLS counters
+        // those tests snapshot. Without the lock our T1 decode races their
+        // before/after read and flakes them.
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for t in [1usize, 4, 8] {
+            let mut out = Vec::new();
+            crate::decompress::decompress_single_member(&compressed, &mut out, t).unwrap();
+            assert_eq!(out, original, "stored-parallel output mismatch at T={t}");
+        }
+    }
+
+    /// A stream whose FIRST block is stored but which then contains Huffman
+    /// blocks (mixed entropy) routes to StoredParallel by the cheap first-block
+    /// heuristic, but the decoder must detect the Huffman block, decline
+    /// (NotStoredDominated), and the dispatcher must still produce byte-exact
+    /// output via the safe one-shot path. This is the correctness guard for the
+    /// heuristic mis-fire.
+    #[test]
+    fn test_mixed_entropy_first_block_stored_decodes_byte_exact() {
+        // Incompressible prefix (forces a stored first block) + compressible
+        // suffix (forces Huffman blocks). Build as one member by concatenating
+        // the raw payloads and compressing at default level: zlib emits stored
+        // blocks for the random region and Huffman for the zero region.
+        let mut original = make_high_entropy_data(12 * 1024 * 1024);
+        original.resize(original.len() + 8 * 1024 * 1024, 0u8);
+        let compressed = compress_single_member_gzip(&original);
+        assert!(compressed.len() > 10 * 1024 * 1024);
+        assert!(
+            crate::decompress::parallel::stored_split::first_block_is_stored(&compressed),
+            "random-prefix member must start with a stored block"
+        );
+
+        // Whatever path it takes, output must be byte-exact. Hold the SM test
+        // lock so the T1 one-shot decode doesn't race the no-silent-fallback
+        // counter snapshots (see test_stored_dominated_routes_parallel_and_decodes).
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for t in [1usize, 4, 8] {
+            let mut out = Vec::new();
+            crate::decompress::decompress_single_member(&compressed, &mut out, t).unwrap();
+            assert_eq!(
+                out, original,
+                "mixed-entropy output mismatch at T={t} — StoredParallel fallback broken"
+            );
+        }
+    }
+
+    /// Compressible input (Huffman first block) must NEVER route to
+    /// StoredParallel — the compressible routing is unaffected by this change.
+    #[test]
+    fn test_compressible_input_not_routed_stored_parallel() {
+        // Highly compressible: repeating phrases → dynamic Huffman first block.
+        let original = make_test_data(16 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+        assert!(
+            !crate::decompress::parallel::stored_split::first_block_is_stored(&compressed),
+            "compressible gzip must NOT start with a stored block"
+        );
+        let path = crate::decompress::classify_gzip(&compressed, 4);
+        assert_ne!(
+            path,
+            crate::decompress::DecodePath::StoredParallel,
+            "compressible input must not take the stored-split path"
+        );
+    }
+
     /// B3 proof: parallel SM byte-perfect with `--no-default-features
     /// --features pure-rust-inflate` (no isal-sys in the dependency graph).
     #[test]
