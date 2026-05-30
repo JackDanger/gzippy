@@ -289,7 +289,9 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
     let seed = WindowMap::with_compression(
         crate::decompress::parallel::compressed_vector::CompressionType::None,
     );
-    // Pass 1: populate the shared window map (output discarded).
+    // Pass 1: normal speculative decode to a sink — its ONLY purpose is to
+    // populate `seed` with a real 32 KiB dict at every published block
+    // boundary (the consumer publishes one per chunk/subchunk end).
     let mut sink = std::io::sink();
     drive_impl(
         input,
@@ -298,23 +300,139 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
         configuration,
         Some(seed.clone()),
     )?;
-    // Pass 2: TIMED — every chunk now finds its predecessor window and
-    // takes the clean known-window decode path.
+
+    // Build the clean partition from the published window keys. Each key is a
+    // real deflate block boundary, so a chunk starting there decodes CLEAN
+    // (no markers, no bootstrap). Consecutive keys bound each span; the final
+    // span runs to EOF.
+    let mut starts = seed.keys_snapshot();
+    starts.sort_unstable();
+    if starts.first() != Some(&0) {
+        starts.insert(0, 0);
+    }
+    let total_bits = input.len() * 8;
+    let n_spans = starts.len();
+    let pool_size = parallelization.max(1).min(num_cpus::get_physical().max(1));
+
+    // --- Phase A (UNTIMED): build a CORRECT dict per span. ---
+    // The window map populated by pass 1 turned out to publish a stale/wrong
+    // 32 KiB at some keys (speculative re-decode + get_predecessor publish),
+    // so we do NOT trust it for dicts. Instead we decode the spans
+    // sequentially, chaining each span's true trailing-32 KiB output as the
+    // next span's dict. The DECODE CONTROL FLOW (and thus each span's decoded
+    // length and the resulting bytes) is exact because every dict here is the
+    // real predecessor output. This is the ground-truth dict set; it is the
+    // "clean window known a priori" premise of the oracle, computed honestly.
+    let mut dicts: Vec<Vec<u8>> = Vec::with_capacity(n_spans);
+    {
+        let zero = vec![0u8; 32768];
+        let mut prev_tail = zero.clone();
+        for span_idx in 0..n_spans {
+            dicts.push(prev_tail.clone());
+            let start_bit = starts[span_idx];
+            let stop_hint = starts.get(span_idx + 1).copied().unwrap_or(total_bits);
+            let c = crate::decompress::parallel::gzip_chunk::decode_chunk_isal(
+                input,
+                start_bit,
+                stop_hint,
+                &prev_tail,
+                configuration,
+            )
+            .map_err(FetchError::Decode)?;
+            let payload = &c.data[c.data_prefix_len..];
+            // Next span's dict = trailing 32 KiB of this span's output
+            // (or the prior tail extended, if this span < 32 KiB).
+            if payload.len() >= 32768 {
+                prev_tail = payload[payload.len() - 32768..].to_vec();
+            } else {
+                let mut nt = prev_tail.clone();
+                nt.extend_from_slice(payload);
+                let n = nt.len();
+                prev_tail = nt[n.saturating_sub(32768)..].to_vec();
+            }
+        }
+    }
+
+    // --- Phase B (TIMED): clean-parallel decode with the correct dicts. ---
+    // A purpose-built clean-parallel driver that BYPASSES the speculative
+    // scheduler (block_finder / prefetcher / block_map) entirely — those
+    // carry tight invariants a hand-seeded partition violates. We dispatch
+    // one clean `decode_chunk_isal` per span across `pool_size` workers and
+    // write results in order. This isolates EXACTLY the clean-parallel
+    // ceiling: pure-Rust inner decode × parallelism + the in-order consumer
+    // write, with ZERO marker / bootstrap / narrow / absorb cost. It is the
+    // markers-vs-scaling discriminator.
+    let mut results: Vec<Option<Result<ChunkData, ChunkDecodeError>>> =
+        (0..n_spans).map(|_| None).collect();
+
     let t = std::time::Instant::now();
-    let r = drive_impl(
-        input,
-        writer,
-        parallelization,
-        configuration,
-        Some(seed.clone()),
-    )?;
+    {
+        // Bounded fan-out: waves of `pool_size` so concurrency never exceeds
+        // physical cores (matches the production pool for a fair ceiling).
+        let mut idx = 0usize;
+        while idx < n_spans {
+            let wave_end = (idx + pool_size).min(n_spans);
+            std::thread::scope(|scope| {
+                for (i, slot) in results[idx..wave_end].iter_mut().enumerate() {
+                    let span_idx = idx + i;
+                    let start_bit = starts[span_idx];
+                    let stop_hint = starts.get(span_idx + 1).copied().unwrap_or(total_bits);
+                    let dict: &[u8] = &dicts[span_idx];
+                    scope.spawn(move || {
+                        let r = crate::decompress::parallel::gzip_chunk::decode_chunk_isal(
+                            input,
+                            start_bit,
+                            stop_hint,
+                            dict,
+                            configuration,
+                        );
+                        *slot = Some(r);
+                    });
+                }
+            });
+            idx = wave_end;
+        }
+    }
+
+    // In-order write + CRC fold (mirror of the consumer's clean branch).
+    let mut total_crc = CRC32Calculator::new();
+    let mut total_size = 0usize;
+    for (i, slot) in results.into_iter().enumerate() {
+        let chunk = slot
+            .ok_or(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+                requested: starts[i],
+                actual: 0,
+            }))?
+            .map_err(FetchError::Decode)?;
+        // Clean chunks carry no markers: output is data[data_prefix_len..],
+        // CRC is the per-stream crc32s folded in order.
+        if chunk.data.len() > chunk.data_prefix_len {
+            let payload = &chunk.data[chunk.data_prefix_len..];
+            writer
+                .write_all(payload)
+                .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+            total_size += payload.len();
+        }
+        for stream_crc in &chunk.crc32s {
+            total_crc.append(stream_crc);
+        }
+        if std::env::var_os("GZIPPY_ORACLE_TRACE").is_some() {
+            eprintln!(
+                "ORACLE_SPAN i={i} start_bit={} stop_hint={} decoded_bytes={} out_cum={total_size} end_bit={} prefix_len={}",
+                starts[i],
+                starts.get(i + 1).copied().unwrap_or(total_bits),
+                chunk.decoded_size(),
+                chunk.encoded_offset_bits + chunk.encoded_size_bits,
+                chunk.data_prefix_len,
+            );
+        }
+    }
     let secs = t.elapsed().as_secs_f64();
-    let mb = r.1 as f64 / secs / 1e6;
+    let mb = total_size as f64 / secs / 1e6;
     eprintln!(
-        "CLEAN_WINDOW_ORACLE pass2 wall={secs:.4}s out={} bytes {mb:.0} MB/s ({parallelization} workers)",
-        r.1
+        "CLEAN_WINDOW_ORACLE pass2 wall={secs:.4}s out={total_size} bytes {mb:.0} MB/s ({parallelization} workers, {n_spans} spans)"
     );
-    Ok(r)
+    Ok((total_crc.crc32(), total_size))
 }
 
 fn drive_impl<W: std::io::Write>(
