@@ -4,46 +4,34 @@
 
 **gzippy aims to be the fastest gzip implementation ever created.**
 
-## Cutover Goal (May 2026)
+## Goal (updated 2026-05-29 — perf-driven; faithful structural port RESCINDED)
 
-**Port the rapidgzip algorithmic core into Rust, faithfully — but ONLY for
-formats GNU gzip supports.** We want rapidgzip's *speed*, not its *format
-breadth*. GNU gzip handles gzip-family streams (single-member, multi-member,
-BGZF — all valid gzip). BZIP2 and ZLIB are NOT gzip and are out of scope.
+**gzippy must be at least at parity with EVERY gzip/DEFLATE tool — gzip, pigz,
+libdeflate, ISA-L, zlib-ng, AND rapidgzip — across archive × thread-count, with a
+pure-Rust DEFLATE engine as the SOLE production decode path and C-FFI removed from
+the decode graph (kept behind a dev/oracle feature as fuzz oracles).** Scope is the
+GNU-gzip-family formats: gzip single-member, multi-member, BGZF, raw DEFLATE (inner
+codec). BZIP2 and the ZLIB *stream decoder* are OUT (a harmless ZLIB header parser
+may stay).
 
-The goal is **every gzip-relevant primitive, decoder, block finder, huffman
-variant, reader, index, and analyzer in `vendor/rapidgzip/librapidarchive/`
-ported into gzippy with vendor file:line citations.** That includes:
+**Faithful structural porting of rapidgzip is RESCINDED — throughput wins over
+fidelity (Rule 6). Do NOT re-port rapidgzip primitives for fidelity's sake or
+require vendor file:line structural mirroring; port/keep only what beats what we
+have, and DIVERGE from rapidgzip's structure freely wherever it wins.** This is
+grounded in measurement (2026-05-29, frozen clean-window oracle): gzippy's parallel
+pipeline (pool/prefetcher/window-map/consumer) is ALREADY at rapidgzip parity
+(isal clean-window 2035 MB/s ≈ rapidgzip 2067). The whole remaining gap is that
+gzippy runs THREE inner decoders — clean + a slow pure-Rust window-absent bootstrap
+(`deflate_block`, ~10× slower) + `apply_window` — whereas rapidgzip's bootstrap is
+decode-loop-fast, so its 32 KiB marker prefix is free. The lever is therefore ONE
+ISA-L-parity pure-Rust inner decoder used for BOTH clean and bootstrap (delete
+`deflate_block` + the marker copies). Falsified structural levers (segmentation,
+allocator/rpmalloc, ~18 total) are NOT the target — the pipeline is proven at
+parity; do not reopen it. Full roadmap: `plans/systemic-parity-plan.md`.
 
-- **Formats** (IN SCOPE): gzip single-member, multi-member gzip, BGZF, raw
-  DEFLATE (as the inner codec).
-- **Formats** (OUT OF SCOPE — not part of GNU gzip): BZIP2 (`Bzip2Chunk.hpp`,
-  `indexed_bzip2/bzip2.hpp`), ZLIB stream format (`gzip/zlib.hpp`). A small
-  ZLIB-format header parser landed (commit `db19347`) as a side-effect of the
-  port pass; keep it for now since it's harmless, but no Bzip2 or Zlib
-  decoder is in scope.
-- **Decoders** (gzip-only): `chunkdecoding/GzipChunk`, `gzip/GzipReader`,
-  `gzip/GzipAnalyzer`, `gzip/InflateWrapper`, `gzip/isal`. NOT
-  `chunkdecoding/Bzip2Chunk`.
-- **Block finders**: `blockfinder/Bgzf`, `blockfinder/DynamicHuffman`,
-  `blockfinder/Uncompressed`, `blockfinder/PigzStringView`,
-  `blockfinder/precodecheck/CountAllocatedLeaves` (all gzip-family).
-- **Huffman variants**: `HuffmanCodingDoubleLiteralCached`, `HuffmanCodingISAL`,
-  `HuffmanCodingReversedBitsCached*`, `HuffmanCodingShortBitsMultiCached*`,
-  `HuffmanCodingDistanceISAL` (gzip Deflate decoders).
-- **Core primitives**: `ThreadPool` (the real one), `BitStringFinder`,
-  `ParallelBitStringFinder`, `StreamedResults`, `SimpleRunLengthEncoding`,
-  `AtomicMutex`, `AffinityHelpers`, `AlignedAllocator`, `FasterVector`,
-  `FileRanges`, `JoiningThread`, etc.
-- **High-level**: `ParallelGzipReader`, `IndexFileFormat` (seekable indexes
-  for gzip), gzip-relevant `rapidgzip.hpp` public API surface.
-
-Done when an Opus advisor agrees gzippy structurally and calculationally
-matches the gzip-relevant surface of rapidgzip (not the BZIP2/ZLIB-decoder
-surface), AND the inner Huffman decode primitives are vendor-competitive
-on neurotic. Structural port and perf parity are now BOTH required —
-"performance optimization later" is rescinded as a guiding principle
-when it blocks vendor-competitive throughput.
+Done when an Opus advisor agrees gzippy is at >=parity with every tool above on the
+closable cells AND the pure-Rust decoder is the sole decode path with C-FFI off the
+decode graph. **Structural match to rapidgzip is NOT a done-criterion — THROUGHPUT is.**
 
 ## Permission to fully reimplement the inner inflate
 
