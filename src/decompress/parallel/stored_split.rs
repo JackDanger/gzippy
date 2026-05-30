@@ -48,6 +48,27 @@ use std::io::{self, Write};
 use crate::decompress::parallel::crc32::{combine_crc32, crc32};
 use crate::decompress::parallel::gzip_format;
 
+/// Env-gated phase timing for the stored decode path. When
+/// `GZIPPY_STORED_PHASE_TIMING=1` is set, each phase's wall time is printed to
+/// stderr. Measurement-only; zero cost when the env is unset (the closure body
+/// is skipped and `Instant::now` is never called).
+#[inline]
+fn phase_timing_enabled() -> bool {
+    std::env::var_os("GZIPPY_STORED_PHASE_TIMING").is_some()
+}
+
+#[inline]
+fn time_phase<T>(name: &str, f: impl FnOnce() -> T) -> T {
+    if phase_timing_enabled() {
+        let t0 = std::time::Instant::now();
+        let r = f();
+        eprintln!("[stored-phase] {name}: {:?}", t0.elapsed());
+        r
+    } else {
+        f()
+    }
+}
+
 /// A decoded stored-block descriptor: where its raw literal bytes live in the
 /// compressed input and where they land in the decompressed output.
 #[derive(Clone, Copy)]
@@ -273,9 +294,13 @@ pub fn decompress_stored_parallel<W: Write>(
                     actual: total,
                 });
             }
-            let mut output = vec![0u8; total];
-            let crc = fill_and_crc(&mut output, deflate, header_size, &runs, num_threads);
-            verify_and_write(writer, &output, crc, expected_crc, expected_size)
+            let mut output = time_phase("alloc_zero", || vec![0u8; total]);
+            let crc = time_phase("fill_and_crc", || {
+                fill_and_crc(&mut output, deflate, header_size, &runs, num_threads)
+            });
+            time_phase("verify_write", || {
+                verify_and_write(writer, &output, crc, expected_crc, expected_size)
+            })
         }
         WalkEnd::HuffmanTail {
             tail_byte,
@@ -358,22 +383,100 @@ fn decode_with_huffman_tail<W: Write>(
     // whole stream — same bytes, just not parallel.
     #[cfg(parallel_sm)]
     {
-        let mut output = vec![0u8; expected_size];
-        // 1) Parallel-copy the stored prefix into output[0..prefix_out].
-        {
-            let (prefix_buf, _tail_buf) = output.split_at_mut(prefix_out);
-            // Reuse the parallel filler (it computes a CRC we ignore here; the
-            // whole-buffer CRC is taken once at the end so prefix + tail fold
-            // together without a separate combine).
-            let _ = fill_and_crc(prefix_buf, deflate, base_off, prefix_runs, num_threads);
-        }
-        // 2) Sequentially decode the Huffman tail into output[prefix_out..].
-        //    Back-refs reach into output[..out_pos] (the materialised prefix),
-        //    so predecessor_window is unused.
-        decode_tail_blocks(&deflate[tail_byte..], &mut output, prefix_out)?;
+        let mut output = time_phase("alloc_zero", || vec![0u8; expected_size]);
 
-        let crc = crc32(&output);
-        verify_and_write(writer, &output, crc, expected_crc, expected_size)
+        // The Huffman tail's back-references reach at most MAX_WINDOW_SIZE
+        // (32 KiB) bytes before its first output byte. So the tail decode only
+        // depends on the LAST 32 KiB of the stored prefix — not the whole
+        // prefix. That lets us OVERLAP the (single-threaded) tail decode with
+        // the (parallel) bulk copy of the rest of the prefix: build a 32 KiB
+        // predecessor window directly from the runs, then run the tail decode
+        // and the full-prefix copy concurrently into disjoint output regions.
+        //
+        // `GZIPPY_STORED_NO_OVERLAP=1` forces the old sequential order (prefix
+        // copy THEN tail decode) for A/B comparison.
+        //
+        // The overlap path requires `prefix_out >= MAX_WINDOW_SIZE` so the
+        // predecessor window is exactly 32 KiB — then for every legal tail
+        // back-reference (`distance <= 32 KiB`, validated by `decode_block`)
+        // `copy_match`'s window arithmetic is in-bounds. With a shorter prefix
+        // the standalone-buffer window could be smaller than a (corrupt)
+        // distance; the contiguous sequential path has no such edge, so we use
+        // it. Stored-dominated production input always has a multi-MiB prefix,
+        // so this guard never excludes the real workload.
+        let overlap =
+            std::env::var_os("GZIPPY_STORED_NO_OVERLAP").is_none() && prefix_out >= MAX_WINDOW_SIZE;
+
+        let (prefix_crc, tail_crc) = if overlap {
+            // Gather the predecessor window (last min(prefix_out, 32 KiB) bytes
+            // of the decoded prefix) from the stored runs, independent of the
+            // full-prefix copy that runs concurrently below.
+            let pred = time_phase("pred_window", || {
+                build_predecessor_window(deflate, base_off, prefix_runs, prefix_out)
+            });
+
+            let (prefix_buf, tail_buf) = output.split_at_mut(prefix_out);
+            let tail_in = &deflate[tail_byte..];
+
+            // Run both halves concurrently: Unit Y parallel-copies the whole
+            // prefix (and returns its CRC); Unit X decodes the tail into the
+            // disjoint tail buffer, resolving early back-refs against `pred`.
+            let mut tail_result: Result<(usize, u32), StoredSplitError> =
+                Ok((0, crc32(&[])));
+            let prefix_crc = time_phase("overlap_copy+tail", || {
+                let mut pcrc = 0u32;
+                std::thread::scope(|scope| {
+                    let tr = &mut tail_result;
+                    scope.spawn(move || {
+                        *tr = decode_tail_into(tail_in, tail_buf, &pred);
+                    });
+                    // The tail decode occupies one core for the whole overlap,
+                    // so the parallel prefix copy gets num_threads-1 to avoid
+                    // oversubscribing (copy threads + tail thread <= cores). The
+                    // main thread drives the copy's own thread::scope.
+                    let copy_threads = num_threads.saturating_sub(1).max(1);
+                    pcrc =
+                        fill_and_crc(prefix_buf, deflate, base_off, prefix_runs, copy_threads);
+                });
+                pcrc
+            });
+            let (tail_len, tcrc) = tail_result?;
+            // Guard: the tail must exactly fill the tail buffer (size agreement).
+            if tail_len != tail_buf_len(expected_size, prefix_out) {
+                return Err(StoredSplitError::SizeMismatch {
+                    expected: expected_size,
+                    actual: prefix_out + tail_len,
+                });
+            }
+            (prefix_crc, tcrc)
+        } else {
+            // Sequential path: copy the whole prefix, then decode the tail into
+            // output[prefix_out..] (its back-refs resolve in the now-contiguous
+            // output). Used when overlap is disabled or there is no prefix.
+            let prefix_crc = time_phase("prefix_copy", || {
+                let (prefix_buf, _tail_buf) = output.split_at_mut(prefix_out);
+                fill_and_crc(prefix_buf, deflate, base_off, prefix_runs, num_threads)
+            });
+            time_phase("huffman_tail", || {
+                decode_tail_blocks(&deflate[tail_byte..], &mut output, prefix_out)
+            })?;
+            let tail = &output[prefix_out..];
+            let tcrc = if tail.is_empty() { 0 } else { crc32(tail) };
+            (prefix_crc, tcrc)
+        };
+
+        // Fold prefix_crc ⊕ tail_crc in output order. `combine_crc32` is the
+        // standard CRC32 concatenation (tested against crc32fast's combine) so
+        // prefix(parallel) + tail folds to the exact whole-buffer CRC.
+        let tail_len = expected_size - prefix_out;
+        let crc = if tail_len == 0 {
+            prefix_crc
+        } else {
+            combine_crc32(prefix_crc, tail_crc, tail_len as u64)
+        };
+        time_phase("verify_write", || {
+            verify_and_write(writer, &output, crc, expected_crc, expected_size)
+        })
     }
     #[cfg(not(parallel_sm))]
     {
@@ -388,6 +491,90 @@ fn decode_with_huffman_tail<W: Write>(
         );
         Err(StoredSplitError::NotStoredDominated)
     }
+}
+
+/// Maximum DEFLATE back-reference distance (RFC 1951 §3.2.5): a tail block can
+/// reach at most this far before its first output byte.
+#[cfg(parallel_sm)]
+const MAX_WINDOW_SIZE: usize = 32 * 1024;
+
+/// Length of the Huffman-tail output region (everything after the prefix).
+#[cfg(parallel_sm)]
+#[inline]
+fn tail_buf_len(expected_size: usize, prefix_out: usize) -> usize {
+    expected_size - prefix_out
+}
+
+/// Build the predecessor window for the Huffman tail: the last
+/// `min(prefix_out, MAX_WINDOW_SIZE)` bytes of the decoded stored prefix,
+/// gathered directly from the stored runs (so it does not depend on the
+/// concurrent full-prefix copy). The returned buffer's LAST byte is
+/// `decoded_output[prefix_out - 1]`, matching `copy_match`'s contract that
+/// `predecessor_window` holds the bytes immediately preceding `output[0]`.
+#[cfg(parallel_sm)]
+fn build_predecessor_window(
+    deflate: &[u8],
+    base_off: usize,
+    runs: &[StoredRun],
+    prefix_out: usize,
+) -> Vec<u8> {
+    let w = prefix_out.min(MAX_WINDOW_SIZE);
+    let mut pred = vec![0u8; w];
+    if w == 0 {
+        return pred;
+    }
+    let window_start = prefix_out - w; // output offset of pred[0]
+    // Copy the portion of each run that intersects [window_start, prefix_out).
+    for r in runs {
+        let r_start = r.out_off;
+        let r_end = r.out_off + r.len;
+        if r_end <= window_start {
+            continue;
+        }
+        // Overlap of [r_start, r_end) with [window_start, prefix_out).
+        let lo = r_start.max(window_start);
+        let hi = r_end.min(prefix_out);
+        if lo >= hi {
+            continue;
+        }
+        let dst = lo - window_start;
+        let src = (r.src_off - base_off) + (lo - r_start);
+        pred[dst..dst + (hi - lo)].copy_from_slice(&deflate[src..src + (hi - lo)]);
+    }
+    pred
+}
+
+/// Decode the Huffman tail into a STANDALONE `tail_buf` (out_pos starts at 0),
+/// resolving back-references that reach before the tail against `pred` (the last
+/// 32 KiB of the prefix). Returns `(bytes_written, crc32_of_those_bytes)`.
+///
+/// This is the overlap-friendly variant of [`decode_tail_blocks`]: because the
+/// tail writes its own disjoint buffer and reaches the prefix only through the
+/// immutable `pred` window, it can run concurrently with the full-prefix copy.
+#[cfg(parallel_sm)]
+fn decode_tail_into(
+    tail: &[u8],
+    tail_buf: &mut [u8],
+    pred: &[u8],
+) -> Result<(usize, u32), StoredSplitError> {
+    use crate::decompress::inflate::consume_first_decode::Bits;
+    use crate::decompress::parallel::isal_lut_bulk::{decode_block, DecoderScratch};
+
+    let mut bits = Bits::new(tail);
+    let mut out_pos = 0usize;
+    let mut scratch = DecoderScratch::new();
+    loop {
+        let result = decode_block(&mut bits, tail_buf, &mut out_pos, pred, &mut scratch)
+            .map_err(|_| StoredSplitError::Corrupt("huffman tail decode failed"))?;
+        if result.is_final_block {
+            break;
+        }
+        if out_pos >= tail_buf.len() {
+            return Err(StoredSplitError::Corrupt("huffman tail overran output"));
+        }
+    }
+    let crc = crc32(&tail_buf[..out_pos]);
+    Ok((out_pos, crc))
 }
 
 /// Decode the Huffman tail (a byte-aligned suffix of the deflate stream) into
