@@ -101,8 +101,13 @@ jobs:
       # Without this lane, the routing trap would never run in CI and the
       # unified surface could rot to dead code (the failure mode that
       # caused every prior marker-decoder to be deleted as "dead code").
-      - name: Run unit tests (pure-rust-inflate, x86_64 only)
-        if: matrix.os == 'linux' && matrix.arch == 'x86_64'
+      # arm64 addition: the default arm64 build uses libdeflate one-shot, so
+      # this is the ONLY CI coverage of the arm64 parallel-SM pure-Rust path
+      # (enabled in 089e1d3 via the parallel_sm cfg alias). Without it, that
+      # path — which builds/links/runs only when pure-rust-inflate is set —
+      # could silently regress on a future change.
+      - name: Run unit tests (pure-rust-inflate)
+        if: ${{ (matrix.os == 'linux' && matrix.arch == 'x86_64') || matrix.arch == 'arm64' }}
         run: cargo test --release --no-default-features --features pure-rust-inflate
 
       # Phase 11.2 corpus oracle. Compares zopfli_pure's output to the
