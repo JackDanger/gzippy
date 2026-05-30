@@ -963,7 +963,7 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     target_arch = "x86_64",
     any(feature = "isal-compression", feature = "pure-rust-inflate")
 ))]
-fn absorb_isal_tail(dst: &mut ChunkData, tail: ChunkData) {
+fn absorb_isal_tail(dst: &mut ChunkData, mut tail: ChunkData) {
     // `worker.absorb_isal_tail` span — wraps the merge of the
     // ISA-L bulk-decode result into the chunk that holds the
     // bootstrap marker prefix. Copies `tail.data` into `dst.data`,
@@ -992,6 +992,10 @@ fn absorb_isal_tail(dst: &mut ChunkData, tail: ChunkData) {
     // this is a no-op.
     let tail_payload_offset = tail.data_prefix_len;
     let tail_payload_len = tail.data.len().saturating_sub(tail_payload_offset);
+    // Captured BEFORE the buffer swap below: the footer branch at the end
+    // of this fn reads `tail.data.is_empty()`, but the swap empties
+    // `tail.data`, so the live value would be wrong post-swap.
+    let tail_data_was_empty = tail.data.is_empty();
     if tail_payload_len > 0 {
         // Per the post-inline-always bench-sm profile, the prior
         // `dst.append_clean(&tail.data)` re-CRC'd `tail.data` from
@@ -1068,20 +1072,35 @@ fn absorb_isal_tail(dst: &mut ChunkData, tail: ChunkData) {
         // `reserve` + `copy_nonoverlapping` + `set_len` — the same
         // shape `std::vec::Vec`'s specialization would have used.
         let added = tail_payload_len;
-        let prev_len = dst.data.len();
-        dst.data.reserve(added);
-        // SAFETY: `reserve(added)` ensures capacity covers
-        // `prev_len + added`; `tail.data` and `dst.data` are
-        // distinct allocations (separate Vecs); set_len with the
-        // post-copy length is legal because all `added` bytes are
-        // initialized from `tail.data[tail_payload_offset..]`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                tail.data.as_ptr().add(tail_payload_offset),
-                dst.data.as_mut_ptr().add(prev_len),
-                added,
-            );
-            dst.data.set_len(prev_len + added);
+        // FAST PATH (the common bootstrap-then-ISA-L chunk): the marker
+        // prefix lives in `data_with_markers`, so `dst.data` is still
+        // empty here, and without an A3 window-image prefix the tail's
+        // buffer IS the chunk's clean data verbatim. Swap the buffers
+        // (O(1) pointer move) instead of a multi-MB `copy_nonoverlapping`
+        // — measured at ~212 ms / silesia-large T8 in
+        // `worker.absorb_isal_tail` (the dominant clean-tail copy). Use
+        // `mem::swap` rather than `take`: the rpmalloc-backed `U8` has no
+        // `Default`, and swapping parks `dst`'s empty buffer in `tail` to
+        // be dropped. Byte-identical to the copy (same source bytes, same
+        // order, prefix-free).
+        if tail_payload_offset == 0 && dst.data.is_empty() {
+            std::mem::swap(&mut dst.data, &mut tail.data);
+        } else {
+            let prev_len = dst.data.len();
+            dst.data.reserve(added);
+            // SAFETY: `reserve(added)` ensures capacity covers
+            // `prev_len + added`; `tail.data` and `dst.data` are
+            // distinct allocations (separate Vecs); set_len with the
+            // post-copy length is legal because all `added` bytes are
+            // initialized from `tail.data[tail_payload_offset..]`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    tail.data.as_ptr().add(tail_payload_offset),
+                    dst.data.as_mut_ptr().add(prev_len),
+                    added,
+                );
+                dst.data.set_len(prev_len + added);
+            }
         }
         dst.statistics.non_marker_count += added as u64;
         if let Some(last) = dst.subchunks.last_mut() {
@@ -1092,7 +1111,7 @@ fn absorb_isal_tail(dst: &mut ChunkData, tail: ChunkData) {
     // Multi-stream case already emitted footers above (interleaved
     // with the per-stream CRC propagation). For the
     // single-stream-or-empty case, footers still need pushing.
-    if tail.crc32s.len() == 1 || tail.data.is_empty() {
+    if tail.crc32s.len() == 1 || tail_data_was_empty {
         for f in &tail.footers {
             dst.append_footer(f.crc32, f.uncompressed_size, f.end_bit_offset);
         }
