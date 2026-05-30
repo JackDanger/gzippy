@@ -1030,6 +1030,40 @@ fn decode_huffman_body_resumable(
         }};
     }
 
+    // Lever T4b (P1.1, resumable-contract tax): branchless refill for the
+    // FASTLOOP body ONLY. Identical arithmetic to `refill_local!`'s fast
+    // arm but WITHOUT the per-refill `in_pos + 8 <= in_data_len` bounds
+    // branch — the FASTLOOP entry condition `in_pos < in_fl_end` (where
+    // `in_fl_end = in_data_len - FASTLOOP_INPUT_TAIL`, TAIL=32) already
+    // guarantees the 8-byte unaligned load stays in bounds: a single
+    // `decode_one_symbol!` iteration issues at most ONE refill, which
+    // advances `in_pos` by ≤7, so the load touches at most
+    // `(in_fl_end - 1) + 7 + 8 = in_data_len - 18 < in_data_len`.
+    //
+    // The `bits_u8 > 64` underflow guard is RETAINED (it's a no-op when
+    // the pre-lookup `< REFILL_THRESHOLD` refill holds bitsleft in
+    // [48, 63], and a correct fixup otherwise) so this macro is
+    // byte-for-byte equivalent to `refill_local!` on every input the
+    // FASTLOOP admits — the ONLY elided work is the unpredictable
+    // bounds branch. Vendor counterpart: `consume_first_decode.rs:694`
+    // `refill_branchless_fast!` (used identically inside that decoder's
+    // fastloop where `in_pos < in_fastloop_end` provides the same
+    // guarantee).
+    macro_rules! refill_fast {
+        () => {{
+            let mut bits_u8 = bitsleft as u8;
+            if bits_u8 > 64 {
+                bitbuf = 0;
+                bits_u8 = 0;
+            }
+            let word = unsafe { (in_data_ptr.add(in_pos) as *const u64).read_unaligned() };
+            let word = u64::from_le(word);
+            bitbuf |= word << bits_u8;
+            in_pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
+            bitsleft = (bits_u8 as u32) | 56;
+        }};
+    }
+
     // Sync locals back into state.bits. Call before any return that
     // expects subsequent calls to observe the consumed bits.
     macro_rules! writeback_bits {
@@ -1079,8 +1113,17 @@ fn decode_huffman_body_resumable(
     // and inside the safe loop (yield checks above). `continue` advances
     // to the enclosing loop top; `return` exits the function. The body
     // assumes `entry` is preloaded and corresponds to the current `bitbuf`.
+    //
+    // The `$refill` parameter selects the refill macro: the FASTLOOP
+    // passes `refill_fast` (branchless, bounds-check elided — the
+    // FASTLOOP margin makes it sound); the SAFE loop passes
+    // `refill_local` (bounds-checked, valid right up to EOF). The decode
+    // arithmetic is otherwise byte-for-byte identical between the two,
+    // so the FASTLOOP and SAFE loop produce bit-identical output and the
+    // FASTLOOP→SAFE handoff carries exactly the same `bitbuf` / `bitsleft`
+    // / `in_pos` state regardless of which loop emitted a given symbol.
     macro_rules! decode_one_symbol {
-        () => {{
+        ($refill:ident) => {{
             // saved_bitbuf for length / dist-extra extraction. Captured
             // BEFORE consume so the same bits the entry was decoded from
             // are available for extra-bit reads.
@@ -1194,28 +1237,28 @@ fn decode_huffman_body_resumable(
                                 out_pos += 1;
                                 // Refill + preload next iter's entry.
                                 if (bitsleft as u8) < REFILL_THRESHOLD {
-                                    refill_local!();
+                                    $refill!();
                                 }
                                 entry = litlen.lookup(bitbuf);
                                 continue;
                             }
                             // 3rd-position was non-literal → carry e2.
                             if (bitsleft as u8) < REFILL_THRESHOLD {
-                                refill_local!();
+                                $refill!();
                             }
                             entry = e2;
                             continue;
                         }
                         // bitsleft too low for 3rd lookup.
                         if (bitsleft as u8) < REFILL_THRESHOLD {
-                            refill_local!();
+                            $refill!();
                         }
                         entry = litlen.lookup(bitbuf);
                         continue;
                     }
                     // 2nd was non-literal → carry e1.
                     if (bitsleft as u8) < REFILL_THRESHOLD {
-                        refill_local!();
+                        $refill!();
                     }
                     entry = e1;
                     continue;
@@ -1223,7 +1266,7 @@ fn decode_huffman_body_resumable(
 
                 // bitsleft too low even for 2nd lookup.
                 if (bitsleft as u8) < REFILL_THRESHOLD {
-                    refill_local!();
+                    $refill!();
                 }
                 entry = litlen.lookup(bitbuf);
                 continue;
@@ -1250,7 +1293,7 @@ fn decode_huffman_body_resumable(
                     }
                     out_pos += 1;
                     if (bitsleft as u8) < REFILL_THRESHOLD {
-                        refill_local!();
+                        $refill!();
                     }
                     entry = litlen.lookup(bitbuf);
                     continue;
@@ -1312,7 +1355,7 @@ fn decode_huffman_body_resumable(
 
             // Refill + preload next entry.
             if (bitsleft as u8) < REFILL_THRESHOLD {
-                refill_local!();
+                $refill!();
             }
             entry = litlen.lookup(bitbuf);
         }};
@@ -1322,7 +1365,8 @@ fn decode_huffman_body_resumable(
     // until either we can re-enter the fastloop OR a yield/EOB fires.
     loop {
         // FASTLOOP entry condition. Bounds:
-        //   - in_pos < in_data_len - 32: refill_local! 8-byte loads safe
+        //   - in_pos < in_data_len - 32: refill_fast! 8-byte loads safe
+        //     (32-byte tail covers the ≤1 refill/iter, ≤7-byte advance)
         //   - in_pos * 8 < encoded_until_bits: won't decode past cap
         //   - out_pos < output_len - FASTLOOP_MARGIN: any single iter's
         //     write fits (max match 258 + literals)
@@ -1341,7 +1385,9 @@ fn decode_huffman_body_resumable(
         if in_pos < in_fl_end && out_pos < out_fl_end {
             BODY_RESUMABLE_FASTLOOP_ENTERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             while in_pos < in_fl_end && out_pos < out_fl_end {
-                decode_one_symbol!();
+                // FASTLOOP: branchless refill — the `in_pos < in_fl_end`
+                // bound makes the bounds check redundant (P1.1 tax-elide).
+                decode_one_symbol!(refill_fast);
             }
             // Fastloop exited because bounds broke. Re-evaluate yield
             // conditions at the safe-loop top.
@@ -1364,8 +1410,9 @@ fn decode_huffman_body_resumable(
         // One safe iteration via the shared body macro. The macro's
         // `continue` returns to the outer `loop` top, which re-checks
         // the FASTLOOP entry conditions before running another safe
-        // iteration.
-        decode_one_symbol!();
+        // iteration. SAFE loop uses `refill_local` (bounds-checked) since
+        // it runs right up to EOF where the 32-byte tail isn't guaranteed.
+        decode_one_symbol!(refill_local);
     }
 }
 
