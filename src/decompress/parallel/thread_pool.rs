@@ -1,7 +1,4 @@
-#![cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#![cfg(parallel_sm)]
 
 //! Literal port of `rapidgzip::ThreadPool`
 //! (vendor/rapidgzip/librapidarchive/src/core/ThreadPool.hpp:33-248).

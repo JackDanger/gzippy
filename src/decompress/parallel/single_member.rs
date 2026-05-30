@@ -23,10 +23,7 @@
 
 use std::io::{self, Write};
 use std::sync::atomic::AtomicU64;
-#[cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#[cfg(parallel_sm)]
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
@@ -84,13 +81,7 @@ pub(crate) fn adjusted_chunk_size_bytes(
 /// `PREFETCH_NEXT_FILESIZE_ACCEPT` / `UNSPLIT_BLOCKS_EMPLACED`
 /// deletion-trap pattern — proves the adjustment branch is reached on
 /// real production decodes.
-#[cfg_attr(
-    not(all(
-        target_arch = "x86_64",
-        any(feature = "isal-compression", feature = "pure-rust-inflate")
-    )),
-    allow(dead_code)
-)] // incremented on the x86 SM path; routing traps read it under the same cfg
+#[cfg_attr(not(parallel_sm), allow(dead_code))] // incremented on the x86 SM path; routing traps read it under the same cfg
 pub static ADJUSTED_CHUNK_SIZE_APPLIED: AtomicU64 = AtomicU64::new(0);
 
 /// Successful runs of the parallel pipeline. Snapshot before/after a
@@ -146,10 +137,7 @@ pub fn decompress_parallel<W: Write>(
         return Err(ParallelError::InvalidGzipFormat);
     }
 
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(feature = "isal-compression", feature = "pure-rust-inflate")
-    ))]
+    #[cfg(parallel_sm)]
     {
         use crate::decompress::parallel::sm_driver::{read_parallel_sm, ReadParallelSmError};
 
@@ -209,10 +197,7 @@ pub fn decompress_parallel<W: Write>(
         }
         Ok(result.total_size as u64)
     }
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        any(feature = "isal-compression", feature = "pure-rust-inflate")
-    )))]
+    #[cfg(not(parallel_sm))]
     {
         let _ = (writer, t0, deflate_data_len);
         Err(ParallelError::UnsupportedPlatform)

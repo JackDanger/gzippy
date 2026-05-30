@@ -23,8 +23,65 @@ fn main() {
     println!("cargo:rerun-if-changed=scripts/pre-push");
     install_git_hooks();
 
+    emit_parallel_sm_cfgs();
+
     if std::env::var("CARGO_FEATURE_ORACLE").is_ok() {
         build_zopfli_oracle();
+    }
+}
+
+/// Emit the compile-time `cfg` aliases that gate the parallel single-member
+/// decode pipeline. Centralizing the predicate here (instead of repeating a
+/// multi-clause `all(...)` at ~140 call sites) makes the architecture/feature
+/// matrix auditable in ONE place — the exact concern raised in the arm64
+/// enablement task ("the cfg generalization must not silently drop a needed
+/// gate or mis-route").
+///
+/// Two aliases:
+///
+/// * `parallel_sm` — the whole chunked parallel-SM orchestration
+///   (chunk_fetcher / gzip_chunk / inflate_wrapper / sm_driver / …) is
+///   compiled in. True when EITHER:
+///     - `x86_64` with `isal-compression` OR `pure-rust-inflate`
+///       (x86 historically ran ISA-L; `pure-rust-inflate` is the
+///       C-FFI-free path), OR
+///     - `aarch64` with `pure-rust-inflate` (NEW: the pure-Rust inner
+///       decoder compiles + runs natively on arm64; ISA-L's C library is
+///       x86-only and is intentionally NOT required here).
+///
+/// * `pure_inflate_decode` — the pure-Rust inner decode wrapper
+///   (`Inflate<Clean, Generic, Streaming>`) is the active decoder. True on
+///   `x86_64` or `aarch64` when `pure-rust-inflate` is enabled. This is the
+///   subset of `parallel_sm` that previously read
+///   `all(target_arch = "x86_64", feature = "pure-rust-inflate")`.
+///
+/// Anything that genuinely needs the ISA-L **C** library stays gated on
+/// `all(feature = "isal-compression", target_arch = "x86_64")` and is NOT
+/// covered by these aliases.
+fn emit_parallel_sm_cfgs() {
+    // Declare the custom cfgs so `--cfg`/`cfg!()` uses don't trip the
+    // `unexpected_cfgs` lint (required since Rust 1.80).
+    println!("cargo::rustc-check-cfg=cfg(parallel_sm)");
+    println!("cargo::rustc-check-cfg=cfg(pure_inflate_decode)");
+
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let is_x86_64 = arch == "x86_64";
+    let is_aarch64 = arch == "aarch64";
+
+    // Cargo exposes enabled features as CARGO_FEATURE_<NAME> (uppercased,
+    // `-` → `_`).
+    let has_isal_compression = std::env::var_os("CARGO_FEATURE_ISAL_COMPRESSION").is_some();
+    let has_pure_rust_inflate = std::env::var_os("CARGO_FEATURE_PURE_RUST_INFLATE").is_some();
+
+    let pure_inflate_decode = (is_x86_64 || is_aarch64) && has_pure_rust_inflate;
+    let parallel_sm = (is_x86_64 && (has_isal_compression || has_pure_rust_inflate))
+        || (is_aarch64 && has_pure_rust_inflate);
+
+    if parallel_sm {
+        println!("cargo::rustc-cfg=parallel_sm");
+    }
+    if pure_inflate_decode {
+        println!("cargo::rustc-cfg=pure_inflate_decode");
     }
 }
 

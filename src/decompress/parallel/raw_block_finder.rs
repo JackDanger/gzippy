@@ -1,7 +1,4 @@
-#![cfg(all(
-    target_arch = "x86_64",
-    any(feature = "isal-compression", feature = "pure-rust-inflate")
-))]
+#![cfg(parallel_sm)]
 //! Async raw block-finder coordinator — slim port of vendor
 //! `core/BlockFinder<RawFinder>` (BlockFinder.hpp:35-218).
 //!
