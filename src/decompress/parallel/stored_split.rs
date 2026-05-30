@@ -48,6 +48,27 @@ use std::io::{self, Write};
 use crate::decompress::parallel::crc32::{combine_crc32, crc32};
 use crate::decompress::parallel::gzip_format;
 
+/// Env-gated phase timing for the stored decode path. When
+/// `GZIPPY_STORED_PHASE_TIMING=1` is set, each phase's wall time is printed to
+/// stderr. Measurement-only; zero cost when the env is unset (the closure body
+/// is skipped and `Instant::now` is never called).
+#[inline]
+fn phase_timing_enabled() -> bool {
+    std::env::var_os("GZIPPY_STORED_PHASE_TIMING").is_some()
+}
+
+#[inline]
+fn time_phase<T>(name: &str, f: impl FnOnce() -> T) -> T {
+    if phase_timing_enabled() {
+        let t0 = std::time::Instant::now();
+        let r = f();
+        eprintln!("[stored-phase] {name}: {:?}", t0.elapsed());
+        r
+    } else {
+        f()
+    }
+}
+
 /// A decoded stored-block descriptor: where its raw literal bytes live in the
 /// compressed input and where they land in the decompressed output.
 #[derive(Clone, Copy)]
@@ -273,9 +294,13 @@ pub fn decompress_stored_parallel<W: Write>(
                     actual: total,
                 });
             }
-            let mut output = vec![0u8; total];
-            let crc = fill_and_crc(&mut output, deflate, header_size, &runs, num_threads);
-            verify_and_write(writer, &output, crc, expected_crc, expected_size)
+            let mut output = time_phase("alloc_zero", || vec![0u8; total]);
+            let crc = time_phase("fill_and_crc", || {
+                fill_and_crc(&mut output, deflate, header_size, &runs, num_threads)
+            });
+            time_phase("verify_write", || {
+                verify_and_write(writer, &output, crc, expected_crc, expected_size)
+            })
         }
         WalkEnd::HuffmanTail {
             tail_byte,
@@ -358,22 +383,26 @@ fn decode_with_huffman_tail<W: Write>(
     // whole stream — same bytes, just not parallel.
     #[cfg(parallel_sm)]
     {
-        let mut output = vec![0u8; expected_size];
+        let mut output = time_phase("alloc_zero", || vec![0u8; expected_size]);
         // 1) Parallel-copy the stored prefix into output[0..prefix_out].
-        {
+        time_phase("prefix_copy", || {
             let (prefix_buf, _tail_buf) = output.split_at_mut(prefix_out);
             // Reuse the parallel filler (it computes a CRC we ignore here; the
             // whole-buffer CRC is taken once at the end so prefix + tail fold
             // together without a separate combine).
             let _ = fill_and_crc(prefix_buf, deflate, base_off, prefix_runs, num_threads);
-        }
+        });
         // 2) Sequentially decode the Huffman tail into output[prefix_out..].
         //    Back-refs reach into output[..out_pos] (the materialised prefix),
         //    so predecessor_window is unused.
-        decode_tail_blocks(&deflate[tail_byte..], &mut output, prefix_out)?;
+        time_phase("huffman_tail", || {
+            decode_tail_blocks(&deflate[tail_byte..], &mut output, prefix_out)
+        })?;
 
-        let crc = crc32(&output);
-        verify_and_write(writer, &output, crc, expected_crc, expected_size)
+        let crc = time_phase("crc32", || crc32(&output));
+        time_phase("verify_write", || {
+            verify_and_write(writer, &output, crc, expected_crc, expected_size)
+        })
     }
     #[cfg(not(parallel_sm))]
     {
