@@ -1,3 +1,4 @@
+#![allow(dead_code)] // CritEntry/output-struct fields are the embeddable API.
 //! Critical-path layer (wPerf-style), specialized for gzippy's in-order
 //! streaming pipeline.
 //!

@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+// command-builders + struct fields are the embeddable
+// API surface (used by `plan`-generated scripts, programmatic callers, and
+// kept for completeness); not all are exercised by the CLI default path.
 //! Chrome-trace JSON ingestion + B/E span pairing.
 //!
 //! Consumes the timeline emitted by gzippy's `trace_v2.rs` (activated by

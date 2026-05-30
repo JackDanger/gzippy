@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+// command-builders + struct fields are the embeddable
+// API surface (used by `plan`-generated scripts, programmatic callers, and
+// kept for completeness); not all are exercised by the CLI default path.
 //! Mechanistic layer (Linux perf): attach a WHY to each region.
 //!
 //! Each lever in the ranked list carries a mechanism so the next move is

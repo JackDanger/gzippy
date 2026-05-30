@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+// command-builders + struct fields are the embeddable
+// API surface (used by `plan`-generated scripts, programmatic callers, and
+// kept for completeness); not all are exercised by the CLI default path.
 //! Validation layer — the gate that makes FULCRUM trustworthy.
 //!
 //! FULCRUM is only useful if its causal verdict reproduces the EMPIRICAL

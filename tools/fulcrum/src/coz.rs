@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+// command-builders + struct fields are the embeddable
+// API surface (used by `plan`-generated scripts, programmatic callers, and
+// kept for completeness); not all are exercised by the CLI default path.
 //! Coz layer: run the looped decode harness under `coz run` and parse the
 //! resulting `profile.coz` into per-region wall-elasticity curves.
 //!

@@ -1,3 +1,4 @@
+#![allow(dead_code)] // Lever output-struct fields are the embeddable API.
 //! Fusion + ranking: combine the causal (Coz), critical-path, and
 //! mechanistic layers over the four candidate regions into ONE ranked
 //! lever list — the FULCRUM deliverable.
