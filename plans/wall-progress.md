@@ -114,3 +114,10 @@ NOT signed off (the lever ceiling): "speeding bootstrap = -15-20% wall" is NOT e
 2. busy-spin TURBO-DEPRESSION confound — 8 spinning cores can depress all-core turbo, inflating the +30% (it's an UPPER bound). Need a frequency-neutral delay or per-core MHz logging.
 3. FastBootstrap TIE may ALREADY be the speed-up result (if its 1.7× was real and hit the knee). Need forensics: did it actually move production bootstrap_dur_us, interleaved?
 DECISIVE next experiment = the bootstrap-REMOVED upper bound: `drive_clean_window_oracle` (chunk_fetcher.rs:283, GZIPPY_CLEAN_WINDOW_ORACLE=1). **BUT it is BROKEN** — produces empty output (sha e3b0c442 = empty-string), matching the memory's "broken clean-window oracle" warning. REPAIR IT, then oracle-wall vs production-wall = the speed-up ceiling. If oracle ≈ production → lever ceiling ~0 (structural change needed); if oracle ≪ production → bootstrap speed is the lever.
+
+## 2026-05-31 — DISPROOF SURVIVED: bootstrap criticality is real (turbo confound refuted)
+Attempted to disprove "bootstrap on critical path" via the advisor's frequency-neutral control: re-ran the +100% injection as a SLEEP (yields the core, cannot depress turbo) instead of a busy-spin. T8 frozen interleaved sha-verified:
+- base 0.342s · spin+100% 0.446s (+30%) · sleep+100% 0.435s (+27%).
+The sleep delta (+27%) ≈ the spin delta (+30%), both ≫ the 12% noise floor ⇒ the turbo-depression confound is REFUTED; the wall response is genuine bootstrap criticality. SIGNED-OFF claim stands: the window-absent bootstrap is ON the critical path (~0.27-0.30× wall per 1× its time), NOT overlapped slack. "Decode is wall-dead" is FALSE.
+STILL OPEN (not disproven, not confirmed): the speed-up CEILING — slow-down slope ≠ speed-up gain; needs the bootstrap-removed oracle (currently broken, emits empty output) repaired.
+PROCESS encoded into CLAUDE.md (replacing the falsified "decode wall-dead / structural-slice / 14%-ceiling" conclusions): perturb-don't-attribute; frequency-neutral control; slow-slope≠speed-ceiling; validate-instrument-first; disproof-driven; frozen/interleaved/N≥7/sha.
