@@ -20,42 +20,28 @@ clean-window oracle ("gzippy's pipeline is ALREADY at rapidgzip parity, isal
 clean-window 2035 ≈ rapidgzip 2067") — the instrument later proven BROKEN: it
 silently re-ran the full bootstrap (fixed `64eb6df`). With that premise dead, so is
 the decompose-a-slice-and-shave-it loop it licensed — that loop is how multiple
-sessions were spent measuring TIEs. **rapidgzip's source (`vendor/rapidgzip/`) is a
-WORKING BLUEPRINT that hits the number on the same hardware; the gap is not a floor to
-decompose, it is structural machinery gzippy runs and rapidgzip does not.** **CORRECTION (2026-05-31, Opus meta-audit + traced head-to-head — REPLACES the
-"delete the marker machinery to converge" claim that was here):** the claim that
-rapidgzip "uses ONE decode loop and a lean consumer" and that gzippy's marker
-machinery is "structural machinery gzippy runs and rapidgzip does NOT" is
-**FALSE — measured.** A traced rapidgzip on silesia-large reports its OWN counters:
-"Replaced marker symbol buffers 157,391,249 (31.25%)" + "Time spent applying the
-last window 0.113s". rapidgzip carries the SAME u16 marker machinery, the SAME ~31%
-window-absent fraction, and an apply-window pass; gzippy's clean-window ARMING
-condition is a byte-for-byte port of vendor (`deflate.hpp:1282-1284` ↔
-`deflate_block.rs:781-783`). **Deleting `deflate_block`/marker rings/`apply_window`
-would DIVERGE from rapidgzip, not converge** — that work item is RETRACTED. The TMA
-"2.4× more memory-stalled" was the symptom of doing the same work ~1.8× slower, not
-of extra machinery.
+sessions were spent measuring TIEs. rapidgzip's source (`vendor/rapidgzip/`) is the
+WORKING BLUEPRINT — faithfully port its structure.
 
-**Decode-RATE is NOT the wall lever (retracted).** FastBootstrap (`5514453`, ledger
-`x86-falsification-ledger.md:48-56`) sped the decode 1.72–1.89× byte-identical and
-the wall **TIED** (N=11, frozen); `lever-selection-gate.md:24` caps the decoder
-slice at a ~14% ceiling. Speeding the inner Huffman loop / "window-absent marker
-decode" is the corpse the campaign keeps re-digging up. The wall lives in the
-**structural/scheduling slice (~86%)**: chunk dispatch, prefetch depth keeping
-workers fed, the in-order consumer, thread-scaling fill-factor. Attack that.
+rapidgzip carries the SAME u16 marker machinery gzippy does (measured on a traced
+rapidgzip: 31.25% replaced-marker symbols, a 0.113s apply-window pass), and gzippy's
+clean-window arming is a byte-for-byte port of vendor (`deflate.hpp:1282-1284` ↔
+`deflate_block.rs:781-783`). So the gap is NOT extra machinery to delete — deleting
+`deflate_block`/marker rings/`apply_window` would diverge from rapidgzip, not converge.
 
-**Verdict instrument = `fulcrum coz` (CAUSAL virtual-speedup), NOT `critpath`/`flow`
-`--whatif`.** `critpath`/`flow` attribution is analyst-biasable (the
-`preferred_blockers` set manufactured 2 phantoms on 2026-05-31) — hypothesis
-generators only. Before ANY optimization: (1) assert the production path
-(`GZIPPY_DEBUG=1` → `path=IsalParallelSM`, build
-`--no-default-features --features pure-rust-inflate`); (2) grep
-`x86-falsification-ledger.md` for the region — if DEAD, don't reopen without
-falsifying the prior measurement; (3) `fulcrum coz` on the production binary,
-frozen host, confirm the wall is causally sensitive with a CI clearing the gap.
-Verify wall on `scripts/measure.sh` (interleaved, sha-verified, N≥7, frozen) —
-NEVER a single un-interleaved/traced run (that error produced the retracted
-"1.77× marker-decode" headline).
+Decode RATE is wall-overlapped: FastBootstrap (`x86-falsification-ledger.md:48-56`)
+sped the decode 1.72–1.89× byte-identical and the wall TIED (N=11, frozen); the
+decoder slice has a ~14% ceiling (`lever-selection-gate.md:24`). The wall lives in the
+structural/scheduling slice (~86%): chunk dispatch, prefetch depth keeping workers fed,
+the in-order consumer, thread-scaling fill-factor.
+
+Measurement discipline: the verdict instrument is `fulcrum coz` (causal virtual-speedup
+on the production binary, frozen host) — `critpath`/`flow --whatif` attribution is
+analyst-biasable, so use it for hypotheses only. Before any optimization: assert the
+production path (`GZIPPY_DEBUG=1` → `path=IsalParallelSM`, build
+`--no-default-features --features pure-rust-inflate`); check
+`x86-falsification-ledger.md` for the region; verify wall on `scripts/measure.sh`
+(interleaved, sha-verified, N≥7, frozen) — never a single un-interleaved/traced run.
 
 Done when an Opus advisor agrees gzippy is at >=parity with every tool above on the
 closable cells AND the pure-Rust decoder is the sole decode path with C-FFI off the
