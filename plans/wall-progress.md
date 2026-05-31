@@ -169,3 +169,14 @@ GRANULAR (fulcrum vs, baseline gz_pre vs all-layered, T8 single-trace):
 - BETTER: worker.block_body 1022->877ms, worker.bootstrap 1031->886ms (decode -145ms busy — the unification DID speed the decode; the earlier 124->125 body_rate was a loaded-box artifact). consumer.iter -18ms, try_take_prefetched -14ms.
 - WORSE (small): post_process.task -12.5ms, isal_stream_inflate -9ms.
 REASONING: decode is now faster but OVERLAPPED across 8 workers, so the wall gain is small + noise-masked. The binding constraint stays the in-order consumer waiting on per-chunk latency. All changes correct+kept (layer, don't revert). Next lever (system reasoning): the consumer serial path / per-chunk latency — keep layering obvious consumer-serial wins (background agent's findings #2,#4,#5 remain) + the still-untried output-store path (u16 ring store width vs clean u8, candidate ii — the decode-vs-store split showed store is now the larger share since decode is at clean-table parity).
+
+## 2026-05-31 — CUMULATIVE LAYERED stack moves the wall (frozen N=11, vs baseline gz_pre)
+5 layered byte-identical changes (FASTLOOP + LitLenTable core + consumer window-publish copy-elim + fuse 128->16KiB + back-ref word-copy @43fdc1c). All kept (layer, don't revert). sha e114dd2.
+| T | baseline MB/s | layered MB/s | gain | ratio vs rapidgzip |
+|---|---|---|---|---|
+| 4 | 1122 | 1224 | +9% (>spread) | 0.753 -> 0.821 |
+| 8 | 1423 | 1448 | +2% (in noise) | 0.697 -> 0.709 |
+| 16| 1282 | 1344 | +5% (in noise) | 0.786 -> 0.823 |
+Decode rate cumulative 157 -> 194 MB/s (+24%). Wall +2-9% (decode is OVERLAPPED so wall gain < decode gain). The word-copy (kill scalar tail, 98.6% of back-refs are len<16) gave the clearest single decode bump (184->194). FASTLOOP + table swap were ~neutral on decode but kept (correct). 
+TRAJECTORY POSITIVE (vs the earlier 5-TIE era) — the whole-system LAYERED method works. Still ~0.71-0.82x rapidgzip.
+NEXT LEVER (system reasoning): decode-rate gains are now overlapped/diminishing on the wall; leverage shifts to (a) consumer in-order serial path / per-chunk latency (the wall binding), (b) the SYSTEMIC ~1.6x-across-all-components gap (likely memory: u16 2x width / allocator / DRAM-bound per old TMA). Keep layering toward those.
