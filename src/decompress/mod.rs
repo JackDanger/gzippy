@@ -94,14 +94,20 @@ pub(crate) const MIN_PARALLEL_COMPRESSED: usize = 10 * 1024 * 1024;
 /// Minimum thread count before the speculative parallel single-member pipeline
 /// is worth taking over the ISA-L one-shot decode.
 ///
-/// The speculative pipeline has structurally lower per-core throughput than a
-/// monolithic ISA-L pass (speculation + block-finding + post-processing +
-/// single-consumer reorder overhead, plus ~35 speculation re-decodes even on
-/// silesia). Measured 2026-05-29 (silesia-large): one-shot T1 = 1074 MB/s,
-/// parallel T2 = 863 (a LOSS), parallel T4 = 1320 (a win). So below 4 threads
-/// the one-shot path is faster — route there. (Multi-member / BGZF have their
-/// own parallel paths and are unaffected; they win at T≥2.)
-pub(crate) const MIN_PARALLEL_SM_THREADS: usize = 4;
+/// **Set to 0 (2026-05-31, user directive): the parallel-SM pipeline is the
+/// production path we optimize at EVERY thread count, including T=1.** Routing
+/// to libdeflate/ISA-L one-shot below T=4 made the thing-under-optimization
+/// ambiguous (a T1/T2 "win" was actually C libdeflate, not our engine) and hid
+/// the parallel path's low-thread behavior from measurement. We now always
+/// exercise the parallel engine so every benchmark and trace reflects the code
+/// we are actually trying to make fast. (The compressed-size gate
+/// `MIN_PARALLEL_COMPRESSED` still applies — tiny inputs don't parallelize.)
+///
+/// Historical note: with the one-shot fallback, 2026-05-29 measured one-shot
+/// T1 = 1074 MB/s vs parallel T2 = 863 (a LOSS) — i.e. the parallel engine was
+/// slower than C libdeflate below ~4 threads. Closing that low-thread gap is
+/// now in scope, not hidden behind a fallback.
+pub(crate) const MIN_PARALLEL_SM_THREADS: usize = 0;
 
 /// Compression ratio (uncompressed / compressed) below which the speculative
 /// parallel single-member pipeline is a NET LOSS and we route to the one-shot
@@ -152,6 +158,11 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
             DecodePath::MultiMemberSeq
         };
     }
+    // The thread-count floor is intentionally a no-op now (MIN_PARALLEL_SM_THREADS
+    // = 0, user directive): we exercise the parallel-SM engine at every thread
+    // count. The comparison is kept (rather than deleted) so the policy stays
+    // explicit and re-introducing a floor is a one-line edit.
+    #[allow(clippy::absurd_extreme_comparisons)]
     if crate::decompress::parallel::sm_cfg::PARALLEL_SM
         && num_threads >= MIN_PARALLEL_SM_THREADS
         && data.len() > MIN_PARALLEL_COMPRESSED
