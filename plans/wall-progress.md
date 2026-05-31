@@ -257,3 +257,19 @@ CLEAN fixed-sleep result (meta-only, frozen, interleaved N=9, 503MB):
 - ⇒ COORDINATION IS NOT THE LEVER (healthy, well-overlapped). The ~1.5× gap is the (overlapped) DECODE — re-confirms the pre-bypass conclusion.
 CAVEAT (asymmetry): rapidgzip's ChunkData was too coupled to fabricate, so its sleep was injected AFTER real decode (rapidgzip-sleep = real-decode + sleep) while gzippy zero-fills (decode≈0). So the absolute "gzippy 0.41-0.84× rapidgzip / gzippy faster" is NOT a clean coord-vs-coord (gzippy skipped decode). ROBUST signals = (a) gzippy floor ~100-190ms healthy [gzippy-only critpath], (b) slope = no overlap defect either tool, (c) bypass-was-OOM debunk. A truly clean coord-vs-coord needs rapidgzip to also bypass decode (return dummy ChunkData) — not done.
 NET: coordination healthy; gap is overlapped decode (sub-linear payoff, as long established). The bypass redirect is dead (OOM artifact).
+
+## 2026-05-31 — CONFOUND-FREE THREE-INSTRUMENT result (bypass re-run + sleep + oracle agree): gap = SPECULATION overhead, NOT decode-rate, NOT coordination
+The bypass agent SELF-CORRECTED (meta-only 6KB capture + /dev/null timing, killing the OOM + sha-in-timed-region confounds). Frozen, N=5-7, /dev/null:
+| T | gz_normal | oracle(clean,no-spec) | sleep0(no-decode) | rg_normal | norm/rg | oracle/rg |
+|---|---|---|---|---|---|---|
+| 2 | 787 | 439 | 230 | 495 | 1.59 | 0.89 |
+| 4 | 463 | 211 | 166 | 297 | 1.56 | 0.71 |
+| 8 | 369 | 144 | 131 | 229 | 1.61 | 0.63 |
+| 16| 307 | 115 | 127 | 227 | 1.35 | 0.51 |
+THREE instruments agree (sleep-decode, clean-window oracle, critpath). REVERSALS:
+1. "coordination floor" (prior bypass) = OOM ARTIFACT (663MB replay on 8GB box). DEAD.
+2. "decode overlapped/wall-dead" = WRONG: sleep0 HALVES the wall (decode ~60% of wall, ON critical path; critpath normal ~90% blocked-on-decode, 43% scan_candidate+bootstrap = SPECULATIVE).
+3. gzippy CLEAN decode + coordination = at-or-BETTER than rapidgzip (oracle beats rg 0.51-0.89×).
+4. GAP = SPECULATION OVERHEAD (gz_norm − oracle ≈ 225ms@T8 = 61% of wall). gzippy's speculation ~2.6× rapidgzip's (both speculate 31%).
+THE LEVER (three-instrument-confirmed): reduce gzippy's SPECULATION overhead (the marker-bootstrap path that runs when a predecessor window isn't ready in time) toward rapidgzip's efficiency. The oracle (windows a-priori) = unreachable upper bound (advisor's prior caveat); achievable target = rapidgzip's spec-efficiency (~85ms vs gzippy's 225ms).
+TENSION TO RECONCILE: this session REFUTED the obvious spec sub-levers — FastBootstrap (spec decode-RATE) TIED; eager-postproc NET-LOSS; window-absent FRACTION is a faithful vendor port; Design-B early-window fired but didn't bank. So if the gap is speculation overhead but rate/fraction/early-window are refuted, WHAT is the actionable reduction? (→ advisor)
