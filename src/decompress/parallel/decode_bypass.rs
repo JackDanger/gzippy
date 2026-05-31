@@ -75,9 +75,16 @@ struct CapturedChunk {
     encoded_size_bits: usize,
     stopped_preemptively: bool,
     data_prefix_len: usize,
-    /// Marker-tagged prefix (u16). Empty for clean/windowed chunks.
+    /// Total decoded OUTPUT bytes for this chunk
+    /// (= data_with_markers.len() + data.len() - data_prefix_len).
+    /// Recorded explicitly so META-ONLY captures (no byte payloads) can
+    /// still size the sleep-replay chunk. For full captures it equals the
+    /// derived value.
+    total_decoded: usize,
+    /// Marker-tagged prefix (u16). Empty for clean/windowed chunks AND for
+    /// META-ONLY captures.
     data_with_markers: Vec<u16>,
-    /// Clean byte suffix.
+    /// Clean byte suffix. Empty for META-ONLY captures.
     data: Vec<u8>,
     /// (encoded_offset_bits, encoded_size_bits, decoded_offset, decoded_size)
     subchunks: Vec<(usize, usize, usize, usize)>,
@@ -94,8 +101,23 @@ impl CapturedChunk {
             encoded_size_bits: c.encoded_size_bits,
             stopped_preemptively: c.stopped_preemptively,
             data_prefix_len: c.data_prefix_len,
-            data_with_markers: c.data_with_markers.clone(),
-            data: c.data.as_slice().to_vec(),
+            total_decoded: c.data_with_markers.len() + c.data.len() - c.data_prefix_len,
+            // META-ONLY capture (GZIPPY_BYPASS_META_ONLY=1): drop the byte
+            // payloads entirely so the capture file is tiny (a few hundred
+            // bytes/chunk). The sleep harness only needs sizing/boundary
+            // metadata; the decode-bytes replay path is unused in sleep mode.
+            // This avoids the tmpfs/RAM pressure of 661MB capture files on a
+            // memory-constrained box (the dominant prior confound).
+            data_with_markers: if meta_only() {
+                Vec::new()
+            } else {
+                c.data_with_markers.clone()
+            },
+            data: if meta_only() {
+                Vec::new()
+            } else {
+                c.data.as_slice().to_vec()
+            },
             subchunks: c
                 .subchunks
                 .iter()
@@ -281,6 +303,11 @@ pub fn sleep_decode_enabled() -> bool {
     sleep_decode_ns().is_some()
 }
 
+fn meta_only() -> bool {
+    static M: OnceLock<bool> = OnceLock::new();
+    *M.get_or_init(|| std::env::var_os("GZIPPY_BYPASS_META_ONLY").is_some())
+}
+
 pub fn capture_enabled() -> bool {
     capture_path().is_some()
 }
@@ -329,6 +356,7 @@ pub fn flush_capture() {
         write_usize(&mut buf, c.encoded_size_bits);
         buf.push(c.stopped_preemptively as u8);
         write_usize(&mut buf, c.data_prefix_len);
+        write_usize(&mut buf, c.total_decoded);
         // data_with_markers
         write_usize(&mut buf, c.data_with_markers.len());
         for &v in &c.data_with_markers {
@@ -493,7 +521,7 @@ pub fn sleep_replay(
     // Total decoded output for this chunk = clean data + (resolved) marker
     // prefix, minus the non-output window-image prefix. We fold EVERYTHING
     // into clean zeroed `data` so no marker/apply_window coordination runs.
-    let total_output = cap.data_with_markers.len() + cap.data.len() - cap.data_prefix_len;
+    let total_output = cap.total_decoded;
     let mut data = types::u8_with_capacity(total_output);
     data.resize(total_output, 0u8);
 
@@ -588,27 +616,49 @@ fn write_usize(buf: &mut Vec<u8>, v: usize) {
 struct Reader<'a> {
     b: &'a [u8],
     pos: usize,
+    /// Set when a read would overrun the buffer (truncated/corrupt file).
+    /// Callers check `overran` and bail gracefully instead of panicking.
+    overran: bool,
 }
 
 impl<'a> Reader<'a> {
+    fn have(&self, n: usize) -> bool {
+        self.pos + n <= self.b.len()
+    }
     fn usize(&mut self) -> usize {
+        if !self.have(8) {
+            self.overran = true;
+            return 0;
+        }
         let mut a = [0u8; 8];
         a.copy_from_slice(&self.b[self.pos..self.pos + 8]);
         self.pos += 8;
         u64::from_le_bytes(a) as usize
     }
     fn u32(&mut self) -> u32 {
+        if !self.have(4) {
+            self.overran = true;
+            return 0;
+        }
         let mut a = [0u8; 4];
         a.copy_from_slice(&self.b[self.pos..self.pos + 4]);
         self.pos += 4;
         u32::from_le_bytes(a)
     }
     fn u8b(&mut self) -> u8 {
+        if !self.have(1) {
+            self.overran = true;
+            return 0;
+        }
         let v = self.b[self.pos];
         self.pos += 1;
         v
     }
     fn bytes(&mut self, n: usize) -> &'a [u8] {
+        if !self.have(n) {
+            self.overran = true;
+            return &[];
+        }
         let s = &self.b[self.pos..self.pos + n];
         self.pos += n;
         s
@@ -621,9 +671,20 @@ fn parse_capture(bytes: &[u8]) -> HashMap<Key, CapturedChunk> {
         eprintln!("BYPASS_DECODE: bad magic");
         return map;
     }
-    let mut r = Reader { b: bytes, pos: 8 };
+    let mut r = Reader {
+        b: bytes,
+        pos: 8,
+        overran: false,
+    };
     let n = r.usize();
     for _ in 0..n {
+        if r.overran {
+            eprintln!(
+                "BYPASS_DECODE: capture truncated/corrupt, parsed {} chunks",
+                map.len()
+            );
+            break;
+        }
         let sb = r.usize();
         let sh = r.usize();
         let encoded_offset_bits = r.usize();
@@ -632,6 +693,7 @@ fn parse_capture(bytes: &[u8]) -> HashMap<Key, CapturedChunk> {
         let encoded_size_bits = r.usize();
         let stopped_preemptively = r.u8b() != 0;
         let data_prefix_len = r.usize();
+        let total_decoded = r.usize();
         let dwm_len = r.usize();
         let mut data_with_markers = Vec::with_capacity(dwm_len);
         for _ in 0..dwm_len {
@@ -662,6 +724,7 @@ fn parse_capture(bytes: &[u8]) -> HashMap<Key, CapturedChunk> {
                 encoded_size_bits,
                 stopped_preemptively,
                 data_prefix_len,
+                total_decoded,
                 data_with_markers,
                 data,
                 subchunks,
