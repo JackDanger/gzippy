@@ -63,11 +63,32 @@ conclude a lever from attribution. The only verdict is a CAUSAL PERTURBATION:
    interleaved best-of-N≥7; sha-verified output (a speed win with wrong bytes is a
    loss).
 
+7. **A REJECTION needs a mechanism, not a narrow miss (user-set 2026-05-31).** We
+   do NOT abandon a direction just because one fix didn't measure narrowly the way
+   we hoped. To reject a lever you MUST supply EITHER (a) a concrete hypothesis of
+   what happens if attempted PLUS an explanation of *how rapidgzip does the same
+   thing differently* (the vendor is the existence proof — if it's faster there
+   must be a structural reason), OR (b) a specific measurement of how it makes
+   things worse in some other named way (e.g. "bounding depth re-inflates
+   `rx_recv_block` wait by Xms"). "It TIE'd" / "Δ < spread" alone is a TIE verdict
+   on THAT run, NOT a refutation of the direction. A correct (byte-identical) change
+   is KEPT and layered even on a TIE ([[feedback_layer_dont_revert_whole_system]]).
+8. **Numbers come from the FULLEST Fulcrum test, never a hand-rolled script
+   (user-set 2026-05-31).** Hand scripts manufacture phantoms (the combine_crc
+   "62ms serial CRC" was a nested-span double-count; it's actually an O(1) combine
+   of worker-computed CRCs). Keep DEVELOPING Fulcrum toward a COMPLETE picture even
+   if it gets slow to run — a correct, validated, complete instrument (self-time
+   with no double-count, idle-gap, busy+idle==span asserted, wait-vs-compute-vs-output
+   classification, per-T) beats a fast partial one. If the instrument can't yet show
+   it, extend the instrument before trusting a number.
+
 Fulcrum tools — `fulcrum vs A B` (cross-tool per-span busy + wall-critical),
-`fulcrum flow` (per-stage slack/serial/starved), `fulcrum critpath` — are
-HYPOTHESIS GENERATORS, never the verdict. The verdict is the causal perturbation.
-Record only survived-disproof findings in `plans/wall-progress.md`; treat every
-"the lever is X" line there as provisional until a perturbation confirms it.
+`fulcrum flow` (per-stage slack/serial/starved), `fulcrum critpath`,
+`fulcrum causal` (speculation decode→publish chain + runtime window-absent fraction)
+— are HYPOTHESIS GENERATORS, never the verdict. The verdict is the causal
+perturbation. Record only survived-disproof findings in `plans/wall-progress.md`;
+treat every "the lever is X" line there as provisional until a perturbation confirms
+it.
 
 Done when an Opus advisor agrees gzippy is at >=parity with every tool above on the
 closable cells AND the pure-Rust decoder is the sole decode path with C-FFI off the
