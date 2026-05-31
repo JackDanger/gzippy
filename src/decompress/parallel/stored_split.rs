@@ -421,8 +421,7 @@ fn decode_with_huffman_tail<W: Write>(
             // Run both halves concurrently: Unit Y parallel-copies the whole
             // prefix (and returns its CRC); Unit X decodes the tail into the
             // disjoint tail buffer, resolving early back-refs against `pred`.
-            let mut tail_result: Result<(usize, u32), StoredSplitError> =
-                Ok((0, crc32(&[])));
+            let mut tail_result: Result<(usize, u32), StoredSplitError> = Ok((0, crc32(&[])));
             let prefix_crc = time_phase("overlap_copy+tail", || {
                 let mut pcrc = 0u32;
                 std::thread::scope(|scope| {
@@ -435,8 +434,7 @@ fn decode_with_huffman_tail<W: Write>(
                     // oversubscribing (copy threads + tail thread <= cores). The
                     // main thread drives the copy's own thread::scope.
                     let copy_threads = num_threads.saturating_sub(1).max(1);
-                    pcrc =
-                        fill_and_crc(prefix_buf, deflate, base_off, prefix_runs, copy_threads);
+                    pcrc = fill_and_crc(prefix_buf, deflate, base_off, prefix_runs, copy_threads);
                 });
                 pcrc
             });
@@ -524,7 +522,7 @@ fn build_predecessor_window(
         return pred;
     }
     let window_start = prefix_out - w; // output offset of pred[0]
-    // Copy the portion of each run that intersects [window_start, prefix_out).
+                                       // Copy the portion of each run that intersects [window_start, prefix_out).
     for r in runs {
         let r_start = r.out_off;
         let r_end = r.out_off + r.len;
