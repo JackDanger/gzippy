@@ -301,47 +301,39 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
         Some(seed.clone()),
     )?;
 
-    // Build the clean partition from the published window keys. Each key is a
-    // real deflate block boundary, so a chunk starting there decodes CLEAN
-    // (no markers, no bootstrap). Consecutive keys bound each span; the final
-    // span runs to EOF.
-    let mut starts = seed.keys_snapshot();
-    starts.sort_unstable();
-    if starts.first() != Some(&0) {
-        starts.insert(0, 0);
-    }
+    let _ = &seed; // (pass-1 window keys are NOT trusted for boundaries; see below)
     let total_bits = input.len() * 8;
-    let n_spans = starts.len();
     let pool_size = parallelization.max(1).min(num_cpus::get_physical().max(1));
 
-    // --- Phase A (UNTIMED): build a CORRECT dict per span. ---
-    // The window map populated by pass 1 turned out to publish a stale/wrong
-    // 32 KiB at some keys (speculative re-decode + get_predecessor publish),
-    // so we do NOT trust it for dicts. Instead we decode the spans
-    // sequentially, chaining each span's true trailing-32 KiB output as the
-    // next span's dict. The DECODE CONTROL FLOW (and thus each span's decoded
-    // length and the resulting bytes) is exact because every dict here is the
-    // real predecessor output. This is the ground-truth dict set; it is the
-    // "clean window known a priori" premise of the oracle, computed honestly.
-    let mut dicts: Vec<Vec<u8>> = Vec::with_capacity(n_spans);
+    // --- Phase A (UNTIMED): self-derive REAL block boundaries + correct dicts. ---
+    // Do NOT trust the speculative pass's published window keys for span starts:
+    // some are not confirmed block boundaries, so decode_chunk_isal starting
+    // there misreads random bits as a block header ("Stored block len=0"). Chain
+    // from the decoder's OWN returned end bit instead — decode_chunk_isal stops
+    // at a real block boundary at-or-past stop_hint and reports it
+    // (encoded_offset_bits + encoded_size_bits), so the next span begins at a
+    // guaranteed-valid boundary with the true trailing 32 KiB as its dict. This
+    // is the honest "clean window known a priori" partition.
+    const STRIDE_BITS: usize = 4 * 1024 * 1024 * 8; // ~4 MiB compressed per span
+    let mut starts: Vec<usize> = Vec::new();
+    let mut dicts: Vec<Vec<u8>> = Vec::new();
     {
-        let zero = vec![0u8; 32768];
-        let mut prev_tail = zero.clone();
-        for span_idx in 0..n_spans {
+        let mut prev_tail = vec![0u8; 32768];
+        let mut cur = 0usize;
+        while cur < total_bits {
+            starts.push(cur);
             dicts.push(prev_tail.clone());
-            let start_bit = starts[span_idx];
-            let stop_hint = starts.get(span_idx + 1).copied().unwrap_or(total_bits);
+            let stop_hint = (cur + STRIDE_BITS).min(total_bits);
             let c = crate::decompress::parallel::gzip_chunk::decode_chunk_isal(
                 input,
-                start_bit,
+                cur,
                 stop_hint,
                 &prev_tail,
                 configuration,
             )
             .map_err(FetchError::Decode)?;
+            let end_bit = c.encoded_offset_bits + c.encoded_size_bits;
             let payload = &c.data[c.data_prefix_len..];
-            // Next span's dict = trailing 32 KiB of this span's output
-            // (or the prior tail extended, if this span < 32 KiB).
             if payload.len() >= 32768 {
                 prev_tail = payload[payload.len() - 32768..].to_vec();
             } else {
@@ -350,8 +342,13 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
                 let n = nt.len();
                 prev_tail = nt[n.saturating_sub(32768)..].to_vec();
             }
+            if end_bit <= cur {
+                break; // no forward progress — stop (last span ran to EOF/BFINAL)
+            }
+            cur = end_bit;
         }
     }
+    let n_spans = starts.len();
 
     // --- Phase B (TIMED): clean-parallel decode with the correct dicts. ---
     // A purpose-built clean-parallel driver that BYPASSES the speculative
