@@ -1764,9 +1764,40 @@ fn submit_decode_to_pool(
     }
     let window_map = window_map.clone();
     let block_fetcher = block_fetcher.clone();
+    // FRONTIER SCHEDULING (gzippy deviation from vendor's flat /* priority */ 0
+    // at BlockFetcher.hpp:557 prefetch AND :586 submitOnDemandTask).
+    //
+    // Vendor submits both the on-demand frontier decode and speculative
+    // prefetches at priority 0, relying on the on-demand task being ENQUEUED
+    // (line 276) before prefetchNewBlocks (line 298) in the same FIFO bucket,
+    // so a worker picks the frontier chunk first. gzippy's Lever-H pump
+    // (try_take_prefetched_pumping) and the prefetch driver can enqueue FAR
+    // speculative successors into the priority-0 bucket BEFORE the consumer
+    // reaches the on-demand dispatch for the chunk it is blocked on NOW — so
+    // the frontier chunk sits behind unrelated speculation in FIFO order and
+    // the consumer waits (measured: ~85% of T8 wall blocked on the next
+    // in-order chunk's decode while speculative successors were already done).
+    //
+    // Fix: the ON-DEMAND frontier decode (is_speculative_prefetch == false)
+    // gets priority -1 so a worker picks it ahead of any priority-0
+    // speculative prefetch. Speculative prefetches keep priority 0 (vendor
+    // value). Post-process is bumped to -2 (see submit_post_process_to_pool)
+    // so it still strictly outranks the frontier decode — the consumer waits
+    // on post-process results directly, so they must never be starved. A
+    // worker can always make progress on the highest-priority pending band,
+    // so no deadlock: frontier (-1) and prefetch (0) work both eventually
+    // complete, and post-process (-2) — which the consumer blocks on — is
+    // never blocked by lower-priority decode work.
+    let priority = if params.is_speculative_prefetch {
+        /* speculative prefetch — vendor priority */
+        0
+    } else {
+        /* on-demand frontier decode — favored ahead of prefetch */
+        -1
+    };
     let future = thread_pool.submit(
         move || run_decode_task(input, params, &window_map, &block_fetcher, configuration),
-        /* priority */ 0,
+        priority,
     );
     future.into_receiver()
 }
@@ -1914,9 +1945,19 @@ fn submit_post_process_to_pool(
             &format!(r#""partition_idx":{}"#, partition_idx),
         );
     }
+    // FRONTIER SCHEDULING (gzippy deviation from vendor's flat -1):
+    // post-process is bumped to -2 (highest) so it strictly outranks the
+    // on-demand frontier decode (-1 below). The consumer's pending-write
+    // queue waits DIRECTLY on these post-process results, so they must
+    // never be starved by a frontier decode that the consumer is only
+    // about to need. Vendor keeps both decode (0) and post-process (-1)
+    // and relies on the on-demand task being ENQUEUED before prefetches in
+    // the same priority bucket; gzippy's pump can enqueue far prefetches
+    // ahead of the frontier on-demand task in the 0 bucket, so we promote
+    // the frontier decode to its own band instead (see submit_decode_to_pool).
     let future = thread_pool.submit(
         move || run_post_process_task(chunk, predecessor_window),
-        /* priority */ -1,
+        /* priority */ -2,
     );
     future.into_receiver()
 }
