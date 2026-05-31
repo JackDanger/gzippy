@@ -29,19 +29,45 @@ clean-window arming is a byte-for-byte port of vendor (`deflate.hpp:1282-1284` �
 `deflate_block.rs:781-783`). So the gap is NOT extra machinery to delete — deleting
 `deflate_block`/marker rings/`apply_window` would diverge from rapidgzip, not converge.
 
-Decode RATE is wall-overlapped: FastBootstrap (`x86-falsification-ledger.md:48-56`)
-sped the decode 1.72–1.89× byte-identical and the wall TIED (N=11, frozen); the
-decoder slice has a ~14% ceiling (`lever-selection-gate.md:24`). The wall lives in the
-structural/scheduling slice (~86%): chunk dispatch, prefetch depth keeping workers fed,
-the in-order consumer, thread-scaling fill-factor.
+## Measurement PROCESS (the rules that survived disproof — follow the process, never a cached conclusion)
 
-Measurement discipline: the verdict instrument is `fulcrum coz` (causal virtual-speedup
-on the production binary, frozen host) — `critpath`/`flow --whatif` attribution is
-analyst-biasable, so use it for hypotheses only. Before any optimization: assert the
-production path (`GZIPPY_DEBUG=1` → `path=IsalParallelSM`, build
-`--no-default-features --features pure-rust-inflate`); check
-`x86-falsification-ledger.md` for the region; verify wall on `scripts/measure.sh`
-(interleaved, sha-verified, N≥7, frozen) — never a single un-interleaved/traced run.
+The wall of this in-order pipeline is NOT predictable from producer-side
+attribution. Busy-time, latency-share, and critical-path "blame" are all
+ANALYST-BIASABLE and have repeatedly manufactured phantom levers — a region can
+be huge in any of them and wall-neutral, or small and still gate the wall. NEVER
+conclude a lever from attribution. The only verdict is a CAUSAL PERTURBATION:
+
+1. **Perturb, don't attribute.** To test whether region R gates the wall, change
+   R's time by a known factor and measure the *interleaved wall response*. A
+   monotonic, proportional response ⇒ R is on the critical path; a flat response
+   ⇒ R is slack. Template: `GZIPPY_SLOW_BOOTSTRAP=N` spins/sleeps N% of a
+   region's own measured time. (This is what coz does; coz needs perf-event
+   sampling and is BLOCKED in the LXC, so slow-injection is the substitute.)
+2. **Always run a frequency-neutral control.** A busy-spin can depress all-core
+   turbo and inflate the delta. Re-run with a SLEEP (yields the core); if the
+   delta survives, the criticality is real, not a spin artifact.
+3. **Slow-down slope ≠ speed-up ceiling.** Slowing a critical region always adds
+   wall; SPEEDING it helps only until the next component binds. To bound a
+   speed-up lever you must REMOVE the region (oracle) and measure — never
+   extrapolate the slow-down slope through an unlocated knee.
+4. **Validate the instrument before trusting it.** Positive/negative controls
+   first; a binary-vs-itself self-test must read 1.0 ± spread. (Two instruments
+   here were silently broken: a clean-window oracle that re-ran the bootstrap,
+   and another that emitted EMPTY output.)
+5. **Disproof-driven.** State the claim, then actively try to BREAK it (control
+   region, frequency-neutral variant, instrument self-test). Only what survives a
+   genuine disproof attempt is real. Δ < inter-run spread ⇒ TIE, full stop.
+6. **Always, mechanically:** assert the production path (`GZIPPY_DEBUG=1` →
+   `path=IsalParallelSM`; build `--no-default-features --features pure-rust-inflate`;
+   `GZIPPY_FORCE_PARALLEL_SM=1` to exercise the engine at every T); frozen host;
+   interleaved best-of-N≥7; sha-verified output (a speed win with wrong bytes is a
+   loss).
+
+Fulcrum tools — `fulcrum vs A B` (cross-tool per-span busy + wall-critical),
+`fulcrum flow` (per-stage slack/serial/starved), `fulcrum critpath` — are
+HYPOTHESIS GENERATORS, never the verdict. The verdict is the causal perturbation.
+Record only survived-disproof findings in `plans/wall-progress.md`; treat every
+"the lever is X" line there as provisional until a perturbation confirms it.
 
 Done when an Opus advisor agrees gzippy is at >=parity with every tool above on the
 closable cells AND the pure-Rust decoder is the sole decode path with C-FFI off the
@@ -55,15 +81,12 @@ rapidgzip, and the pure-Rust decoder is the sole decode path.**
 
 ## Permission to fully reimplement the inner inflate
 
-> **⚠️ READ FIRST (2026-05-31): this permission still stands, but inner-loop
-> decode speed is NOT the wall lever and is measured-DEAD for parity.**
-> FastBootstrap already sped this decode 1.7–1.9× → wall TIE (frozen, N=11);
-> the decoder slice has a ~14% ceiling (`lever-selection-gate.md`). Do not spend
-> a work-stretch here expecting a wall win without a `fulcrum coz` causal run
-> proving the wall moves. The levers below are for *correctness/maintenance or a
-> causally-confirmed hotspot*, not a default parity strategy. The parity wall is
-> in the structural/scheduling slice (dispatch, prefetch feeding, consumer,
-> fill-factor) — see the CORRECTION in the Goal section above.
+> **Confirm the wall moves with a causal perturbation BEFORE a work-stretch here**
+> (Measurement PROCESS above). Do not pre-judge the inner loop as either the lever
+> or a dead end from cached A/Bs — a +50–200% slow-injection of the window-absent
+> bootstrap moves the wall ~proportionally (survived a frequency-neutral disproof),
+> so the decode is on the critical path; whether SPEEDING it pays is bounded by the
+> bootstrap-removed oracle, which must be repaired and run to set the ceiling.
 
 The "port faithfully, don't innovate" rule is **scoped to architecture
 and high-level shape** (chunk pipeline, prefetcher, block finder, etc.).
