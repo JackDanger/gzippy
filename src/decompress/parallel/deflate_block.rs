@@ -1868,31 +1868,61 @@ unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
     let dst_phys = *pos % RING_SIZE;
 
     if distance >= length {
-        // Non-overlap path. Single `memcpy`-equivalent. Vendor:
-        // `std::memcpy(&window[m_windowPosition], &window[offset],
-        // length * 2)` at deflate.hpp:1376.
-        let src_fits = src_phys + length <= RING_SIZE;
-        let dst_fits = dst_phys + length <= RING_SIZE;
-        if src_fits && dst_fits {
-            // Inlined short back-ref copy. `copy_nonoverlapping(.., .., length)`
-            // with a RUNTIME `length` lowers to a libc memcpy CALL whose
-            // size-class dispatch dominates for the short matches that make up
-            // most back-refs (length is 3-258 u16, usually < 32) — measured at
-            // 16.7% of decode cycles (cross-tool PEBS) vs rapidgzip's 3.95%
-            // (it inlines this into `Block::read`, deflate.hpp). Copy in
-            // COMPILE-TIME-CONSTANT 8-u16 (16-byte) chunks so LLVM emits inline
-            // moves (no call), with a scalar tail. Non-overlap holds here
-            // (`distance >= length`).
+        // Non-overlap path. Vendor: `std::memcpy(&window[m_windowPosition],
+        // &window[offset], length * 2)` at deflate.hpp:1376.
+        //
+        // MEASURED DISTRIBUTION (silesia, flate2 L6, window-absent path):
+        // 99.94% of back-refs are non-overlap and ~98.6% have length < 16
+        // (77% are length 4-7, mean ≈ 6.3 u16). The prior 8-u16 (16-byte)
+        // chunk loop NEVER fired for those — its `i + 8 <= length` guard is
+        // false for length < 8 — so every common match fell to the per-element
+        // scalar tail: 4-7 dependent single-u16 stores on the critical path.
+        // That tail, not wide copies, is the window-absent path's output cost.
+        //
+        // Mirror `copy_match_fast`'s `dist >= 8` (bytes) arm
+        // (consume_first_decode.rs:479-503) for u16: copy in 8-byte (4-u16)
+        // unaligned WORD writes, UNCONDITIONALLY rounding the run up to a
+        // multiple of 4 u16. The overshoot (≤ 3 u16) is sound because:
+        //   * `distance >= 4` u16 ⇒ the 8-byte word stride never aliases
+        //     (src and dst are ≥ 8 bytes apart), so each word read sees the
+        //     original bytes — exactly the `dist >= WORDBYTES` invariant
+        //     copy_match_fast relies on.
+        //   * The rounded copy stays inside the physical buffer (the
+        //     `*_round_fits` guards below), and the overcopied tail lies
+        //     AHEAD of the advanced `*pos`; no back-ref ever reads ahead of
+        //     `*pos`, and subsequent literals/copies overwrite those slots,
+        //     so the extra bytes are invisible. The marker backward-scan
+        //     below reads only the `length` bytes behind the new `*pos`.
+        // `distance < 4` non-overlap (only length-3/distance-3) is rare and
+        // would alias the word stride, so it keeps the exact element copy.
+        let rounded = (length + 3) & !3;
+        let src_round_fits = src_phys + rounded <= RING_SIZE;
+        let dst_round_fits = dst_phys + rounded <= RING_SIZE;
+        if distance >= 4 && src_round_fits && dst_round_fits {
+            // UNCONDITIONAL fixed-stride word copy (no `length`-dependent
+            // branch on the hot path). One 8-byte (4-u16) word covers
+            // length 4; a second covers length ≤ 8; the loop handles the
+            // long tail. Writes exactly `rounded` (≥ length) u16.
+            let mut s = ring_ptr.add(src_phys) as *const u8;
+            let mut d = ring_ptr.add(dst_phys) as *mut u8;
+            let dend = (ring_ptr.add(dst_phys + rounded)) as *mut u8;
+            // First word always valid (rounded >= 4 u16 = 8 bytes since
+            // length >= 1; the non-overlap branch only sees length >= 3).
+            (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
+            s = s.add(8);
+            d = d.add(8);
+            while d < dend {
+                (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
+                s = s.add(8);
+                d = d.add(8);
+            }
+        } else if src_phys + length <= RING_SIZE && dst_phys + length <= RING_SIZE {
+            // Non-wrap but distance < 4 (would alias a word stride): exact
+            // element copy.
             let src = ring_ptr.add(src_phys);
             let dst = ring_ptr.add(dst_phys);
-            let mut i = 0usize;
-            while i + 8 <= length {
-                std::ptr::copy_nonoverlapping(src.add(i), dst.add(i), 8);
-                i += 8;
-            }
-            while i < length {
+            for i in 0..length {
                 dst.add(i).write(*src.add(i));
-                i += 1;
             }
         } else {
             // Wrap-straddle non-overlap fallback (rare boundary case).
