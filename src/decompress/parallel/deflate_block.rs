@@ -1401,33 +1401,7 @@ impl Block {
                         () => {{
                             const MAX_RUN_LENGTH: usize = 258;
                             const MAX_LIT_LEN_SYM: u32 = 512;
-                            // FASTLOOP_INPUT_TAIL (mirror of resumable.rs:1110):
-                            // a conservative 32-byte tail kept off-limits to the
-                            // branchless refill so its 8-byte unaligned load never
-                            // reads past `bits.data.len()` — even on the LAST /
-                            // BFINAL block of the WHOLE input. A single FASTLOOP
-                            // iteration issues at most one branchless refill, which
-                            // advances `bits.pos` by ≤7, so the load touches at most
-                            // `(in_fastloop_end - 1) + 7 + 8 = data.len() - 18`.
-                            // 32 (vs the strictly-needed 8) keeps a comfortable
-                            // margin and matches the reference decoder. This is the
-                            // #1 correctness risk per the design note — the SAFE
-                            // tier (existing branchy decode/refill) handles the
-                            // final 32 bytes + EOB / sub-byte-EOF padding.
-                            const FASTLOOP_INPUT_TAIL: usize = 32;
                             let n_max_to_decode = n_max_to_decode.min(RING_SIZE - MAX_RUN_LENGTH);
-
-                            // Conservative FASTLOOP input bound: never let the
-                            // branchless 8-byte load reach past `data.len()`.
-                            // There is no separate output-margin bound — the u16
-                            // ring is pre-sized to RING_SIZE and `emitted` is
-                            // capped at `n_max_to_decode` (= RING_SIZE -
-                            // MAX_RUN_LENGTH), so a single packet's ≤258-byte
-                            // back-ref or ≤3 literals can never overrun it; that
-                            // check stays on the SAME `emitted < n_max_to_decode`
-                            // tier guard both loops share.
-                            let in_fastloop_end: usize =
-                                bits.data.len().saturating_sub(FASTLOOP_INPUT_TAIL);
 
                             let ring_ptr = self.output_ring.as_mut_ptr();
                             let mut pos = self.ring_pos;
@@ -1447,160 +1421,96 @@ impl Block {
                                 }};
                             }
 
-                            // Branchless refill for the FASTLOOP body ONLY (mirror
-                            // of resumable.rs:1052 `refill_fast!`). Identical
-                            // arithmetic to `Bits::refill`'s fast arm but WITHOUT
-                            // the per-refill `pos + 8 <= data.len()` bounds branch
-                            // — the FASTLOOP guard `bits.pos < in_fastloop_end`
-                            // already proves the 8-byte load is in bounds. The
-                            // `bits_u8 > 64` underflow guard is RETAINED so this is
-                            // byte-for-byte equivalent to `Bits::refill` on every
-                            // input the FASTLOOP admits; the ONLY elided work is the
-                            // unpredictable bounds branch. Gated on `available() <
-                            // 32` so it mirrors `IsalLitLenCodePure::decode`'s own
-                            // refill predicate (isal_huffman_pure.rs:945): after
-                            // this runs, decode's internal refill is a no-op, so
-                            // the per-symbol litlen lookup pays no branchy refill.
-                            macro_rules! refill_fast {
-                                () => {{
-                                    if bits.available() < 32 {
-                                        let mut bits_u8 = bits.bitsleft as u8;
-                                        if bits_u8 > 64 {
-                                            bits.bitbuf = 0;
-                                            bits_u8 = 0;
-                                        }
-                                        let word = unsafe {
-                                            (bits.data.as_ptr().add(bits.pos) as *const u64)
-                                                .read_unaligned()
-                                        };
-                                        let word = u64::from_le(word);
-                                        bits.bitbuf |= word << bits_u8;
-                                        bits.pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
-                                        bits.bitsleft = (bits_u8 as u32) | 56;
-                                    }
-                                }};
-                            }
+                            while emitted < n_max_to_decode {
+                                let decoded = litlen_hc.decode(bits);
+                                // Check ONLY bit_count == 0 for invalid lookup,
+                                // matching the ISA-L hot path at
+                                // deflate_block.rs:1020. The earlier
+                                // `decoded.symbol == INVALID_SYMBOL` check was
+                                // WRONG: for packed pairs where sym1=0xFF and
+                                // sym2=0x1F (a valid 2-byte literal pair),
+                                // symbol packs to 0xFF | (0x1F << 8) = 0x1FFF,
+                                // which equals INVALID_SYMBOL. ISA-L signals
+                                // invalid via bit_count=0 ALONE; the symbol
+                                // field is don't-care when invalid.
+                                if decoded.bit_count == 0 {
+                                    commit!(Err(BlockError::InvalidHuffmanCode));
+                                }
+                                bits.consume(decoded.bit_count);
+                                let mut symbol = decoded.symbol;
+                                let mut symbol_count = decoded.sym_count;
+                                if symbol_count == 0 {
+                                    commit!(Err(BlockError::InvalidHuffmanCode));
+                                }
 
-                            // Per-packet body, shared verbatim by the FASTLOOP and
-                            // SAFE tiers so output is bit-identical. `$decoded` is
-                            // the `DecodedSymbol` already fetched by the caller (the
-                            // ONLY thing that differs between tiers is whether the
-                            // litlen refill ahead of `decode` was branchless).
-                            macro_rules! decode_packet {
-                                ($decoded:expr) => {{
-                                    let decoded = $decoded;
-                                    // Check ONLY bit_count == 0 for invalid lookup,
-                                    // matching the ISA-L hot path at
-                                    // deflate_block.rs:1020. The earlier
-                                    // `decoded.symbol == INVALID_SYMBOL` check was
-                                    // WRONG: for packed pairs where sym1=0xFF and
-                                    // sym2=0x1F (a valid 2-byte literal pair),
-                                    // symbol packs to 0xFF | (0x1F << 8) = 0x1FFF,
-                                    // which equals INVALID_SYMBOL. ISA-L signals
-                                    // invalid via bit_count=0 ALONE; the symbol
-                                    // field is don't-care when invalid.
-                                    if decoded.bit_count == 0 {
-                                        commit!(Err(BlockError::InvalidHuffmanCode));
-                                    }
-                                    bits.consume(decoded.bit_count);
-                                    let mut symbol = decoded.symbol;
-                                    let mut symbol_count = decoded.sym_count;
-                                    if symbol_count == 0 {
-                                        commit!(Err(BlockError::InvalidHuffmanCode));
-                                    }
-
-                                    while symbol_count > 0 {
-                                        let code = (symbol & 0xFFFF) as u16;
-                                        if code <= 255 || symbol_count > 1 {
-                                            // CRITICAL: mask `& 0xFF` for packed-sym
-                                            // safety. ISA-L packs up to 3 literals
-                                            // in one symbol value (sym1=low byte,
-                                            // sym2=next, sym3=third). Writing the
-                                            // full u16 would put sym1|(sym2<<8)
-                                            // into one ring slot, and the next iter
-                                            // would clobber what should be sym3.
-                                            unsafe {
-                                                ring_ptr
-                                                    .add(phys as usize)
-                                                    .write((code & 0xFF) as u16);
-                                            }
-                                            phys = phys.wrapping_add(1);
-                                            pos += 1;
-                                            emitted += 1;
-                                            if CONTAINS_MARKERS {
-                                                distance_marker += 1;
-                                            }
-                                            symbol >>= 8;
-                                            symbol_count -= 1;
-                                            continue;
-                                        }
-
-                                        if code == END_OF_BLOCK_SYMBOL {
-                                            self.at_end_of_block = true;
-                                            commit!(Ok(emitted));
-                                        }
-                                        if u32::from(code) > MAX_LIT_LEN_SYM {
-                                            commit!(Err(BlockError::InvalidHuffmanCode));
-                                        }
-
-                                        let length = (symbol - MULTI_DISTANCE_OFFSET) as usize;
-                                        if length == 0 {
-                                            symbol >>= 8;
-                                            symbol_count -= 1;
-                                            continue;
-                                        }
-                                        let distance = match get_distance_dynamic(&dist_hc, bits) {
-                                            Ok(d) => d as usize,
-                                            Err(_) => commit!(Err(BlockError::InvalidHuffmanCode)),
-                                        };
-                                        if distance == 0 || distance > MAX_WINDOW_SIZE {
-                                            commit!(Err(BlockError::ExceededWindowRange));
-                                        }
-                                        if !CONTAINS_MARKERS
-                                            && distance > self.decoded_bytes + emitted
-                                        {
-                                            commit!(Err(BlockError::ExceededWindowRange));
-                                        }
+                                while symbol_count > 0 {
+                                    let code = (symbol & 0xFFFF) as u16;
+                                    if code <= 255 || symbol_count > 1 {
+                                        // CRITICAL: mask `& 0xFF` for packed-sym
+                                        // safety. ISA-L packs up to 3 literals
+                                        // in one symbol value (sym1=low byte,
+                                        // sym2=next, sym3=third). Writing the
+                                        // full u16 would put sym1|(sym2<<8)
+                                        // into one ring slot, and the next iter
+                                        // would clobber what should be sym3.
                                         unsafe {
-                                            emit_backref_ring::<CONTAINS_MARKERS>(
-                                                ring_ptr,
-                                                &mut pos,
-                                                distance,
-                                                length,
-                                                &mut distance_marker,
-                                            );
+                                            ring_ptr.add(phys as usize).write((code & 0xFF) as u16);
                                         }
-                                        phys = (pos & (RING_SIZE - 1)) as u16;
-                                        emitted += length;
-                                        if self.track_backreferences {
-                                            self.backreferences.push(Backreference {
-                                                distance: distance as u16,
-                                                length: length as u16,
-                                            });
+                                        phys = phys.wrapping_add(1);
+                                        pos += 1;
+                                        emitted += 1;
+                                        if CONTAINS_MARKERS {
+                                            distance_marker += 1;
                                         }
                                         symbol >>= 8;
                                         symbol_count -= 1;
+                                        continue;
                                     }
-                                }};
-                            }
 
-                            // Two-tier decode (mirror of
-                            // resumable.rs:1385-1417). FASTLOOP: while there is
-                            // input headroom AND output budget, pre-refill
-                            // branchlessly then decode — the litlen lookup pays no
-                            // branchy refill. SAFE tier: one packet at a time with
-                            // the existing branchy decode/refill, which handles
-                            // EOB, sub-byte-EOF padding, and the final
-                            // FASTLOOP_INPUT_TAIL bytes correctly. EOB exits both
-                            // tiers via `commit!` inside `decode_packet!`.
-                            while emitted < n_max_to_decode {
-                                if bits.pos < in_fastloop_end {
-                                    while bits.pos < in_fastloop_end && emitted < n_max_to_decode {
-                                        refill_fast!();
-                                        decode_packet!(litlen_hc.decode(bits));
+                                    if code == END_OF_BLOCK_SYMBOL {
+                                        self.at_end_of_block = true;
+                                        commit!(Ok(emitted));
                                     }
-                                } else {
-                                    decode_packet!(litlen_hc.decode(bits));
+                                    if u32::from(code) > MAX_LIT_LEN_SYM {
+                                        commit!(Err(BlockError::InvalidHuffmanCode));
+                                    }
+
+                                    let length = (symbol - MULTI_DISTANCE_OFFSET) as usize;
+                                    if length == 0 {
+                                        symbol >>= 8;
+                                        symbol_count -= 1;
+                                        continue;
+                                    }
+                                    let distance = match get_distance_dynamic(&dist_hc, bits) {
+                                        Ok(d) => d as usize,
+                                        Err(_) => commit!(Err(BlockError::InvalidHuffmanCode)),
+                                    };
+                                    if distance == 0 || distance > MAX_WINDOW_SIZE {
+                                        commit!(Err(BlockError::ExceededWindowRange));
+                                    }
+                                    if !CONTAINS_MARKERS && distance > self.decoded_bytes + emitted
+                                    {
+                                        commit!(Err(BlockError::ExceededWindowRange));
+                                    }
+                                    unsafe {
+                                        emit_backref_ring::<CONTAINS_MARKERS>(
+                                            ring_ptr,
+                                            &mut pos,
+                                            distance,
+                                            length,
+                                            &mut distance_marker,
+                                        );
+                                    }
+                                    phys = (pos & (RING_SIZE - 1)) as u16;
+                                    emitted += length;
+                                    if self.track_backreferences {
+                                        self.backreferences.push(Backreference {
+                                            distance: distance as u16,
+                                            length: length as u16,
+                                        });
+                                    }
+                                    symbol >>= 8;
+                                    symbol_count -= 1;
                                 }
                             }
                             self.ring_pos = pos;
