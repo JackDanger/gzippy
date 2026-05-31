@@ -71,3 +71,19 @@ Unit = effortful work-stretches, NOT levers (a cheap paper-Amdahl kill doesn't t
 ## Current candidate (advisor-validated, src-grounded) — CLOSE THE CHAIN INVARIANT
 The pump TIE re-localized the wall: the consumer eats **on-demand heavy-chunk decode** because it **throws away range-valid prefetches** — `chunk_fetcher.rs:1152` demands exact equality (`max_acceptable_start_bit == next_block_offset`) where rapidgzip accepts a range (`encoded ≤ offset ≤ max`). The missing **chain invariant** blocks BOTH the prefetch-accept AND the pump's window cascade-publish (one gap, two dead levers — ledger OPEN LEVER 58-64). Lever: anchor `max_acceptable_start_bit` at the real found boundary on the fast path + guarantee the predecessor's end lands in `[encoded, max]`.
 **BEFORE coding:** one traced run, confirm `PREFETCH_REJECT_BY_GUARD ≈ 4` (vs `on_demand`/`is_speculative` = late-prefetch instead). Reach ≈ 100–130ms (frontier/first-chunk irreducible). See `plans/refreshed-plan.md`.
+
+## 2026-05-31 — `fulcrum vs` PER-THREAD-COUNT cross-tool comparison (the clear measurement)
+Built `fulcrum vs A B` (committed fulcrum 260e154): span-by-span busy + wall-critical diff of gzippy vs traced-rapidgzip (same Chrome-trace vocab). Ran both at T1-16.
+Wall ratio ≈ decode_chunk-busy ratio at EVERY T:
+| T | wall | decode_chunk gz/rg |
+|---|---|---|
+| 1 | 1.14× | 628/545=1.15× |
+| 2 | 1.67× | 1572/915=1.72× |
+| 4 | 1.69× | 1736/991=1.75× |
+| 8 | 1.65× | 1998/1126=1.77× |
+| 16| 1.38× | 2443/1644=1.49× |
+**Two separable causes (the targeted fixes):**
+1. **Clean-decode ~1.15× slower (the T1 gap):** at T1 gzippy decodes via isal_stream_inflate 628ms vs rapidgzip 545ms — sequential, no speculation, yet 15% slower.
+2. **Window-absent speculation tax = the dominant lever (T1→T2 jump 1.15→1.67×):** appears only at T≥2; `worker.bootstrap` (pure-Rust window-absent decode of the 31% markers) is 823-1142ms that rapidgzip does ~1.7× faster inside its decode. ~0.5× of wall.
+gzippy-only overhead rapidgzip lacks: consumer.try_take_prefetched (803ms@T2), pool.pick (566ms@T16, grows with threads).
+**Measurement gap:** rapidgzip trace patch doesn't instrument consumer WAITS (wall-crit=0 for rg) — busy half is decisive, blocking half not symmetric. Fix scripts/rapidgzip_trace_patch to wrap rapidgzip's getBlock wait for the complete picture.
