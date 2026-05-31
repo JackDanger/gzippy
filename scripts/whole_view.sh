@@ -54,7 +54,7 @@ echo "== 2. GAP STRUCTURE (instr / IPC / parallelism — work vs stalls vs cores
 for which in gz rg; do
   if [ "$which" = gz ]; then nm="gzippy "; cmd="$GZ"; bw=$gb; else nm="rapidgz"; cmd="$RGC"; bw=$rb; fi
   perf stat -e instructions,cycles,task-clock $PIN $cmd >/dev/null 2>/tmp/wv.txt
-  ins=$(grep -E "^[[:space:]]*[0-9,]+[[:space:]]+instructions" /tmp/wv.txt | grep -oE "^[[:space:]]*[0-9,]+" | head -1 | tr -d ', ')
+  ins=$(grep -E "instructions" /tmp/wv.txt | grep -oE "[0-9,]{8,}" | head -1 | tr -d ',')
   ipc=$(grep -oE "#[[:space:]]+[0-9]+\.[0-9]+[[:space:]]+insn per cycle" /tmp/wv.txt | grep -oE "[0-9]+\.[0-9]+" | head -1)
   tc=$(grep -oE "[0-9,]+\.[0-9]+ msec task-clock" /tmp/wv.txt | grep -oE "[0-9,]+\.[0-9]+" | head -1 | tr -d ,)
   # parallelism from the STABLE best-of-N wall (gb/rb), not perf's noisy single elapsed.
