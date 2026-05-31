@@ -297,3 +297,18 @@ Decomposed the consumer (tid1) serial span on /tmp/causal_T*.json (advisor a4616
 - process_prefetches 31-71ms.
 CROSSOVER: wait-bound at low T (block_finder_get dominates), COMPUTE-bound on serial marker-resolution at high T. So fusion (cheapen the 3-pass tax) IS a real lever at T16 (partially overturns the "fusion=TIE" prior), but bound-depth (cut 95%→31% window-absent = fewer chunks paying resolution) attacks the root + changes fusion's denominator.
 LEVER ORDER (advisor-set): (1) combine_crc OFF the consumer (worker-side per-chunk CRC + folded combine) — highest confidence, associative, no re-exposed wait, no correctness landmine, T-flat ~60ms; (2) bound prefetch depth (95%→31%); (3) fuse residual 3-pass tax. (1) isolates cleanly (doesn't touch the window/resolution chain). Range-accept/chain-invariant lever = DEAD (window is ABSENT not mis-keyed; range-lookup finds nothing). Eager-postproc = already in tree (GZIPPY_EAGER_POSTPROC) + TIE'd (ac41ef0: confirmed-window is an irreducible serial dep).
+
+## 2026-05-31 — CORRECTION: the entry above used a BUGGY self-time script; combine_crc=62ms is a PHANTOM. Real consumer serial = OUTPUT-WRITE + NARROW + DECODE-WAIT
+The "combine_crc flat 62ms" + "marker-resolution 126/134/155ms growing to 50%" numbers above came from a python script that DOUBLE-COUNTED nested same-name spans (Σself > span). A corrected stack-based self-time pass on the SAME /tmp/causal_T*.json gives the real consumer (tid1) serial self-time:
+| consumer tid1 SELF-time | T4 (span 486) | T8 (span 354) | T16 (span 307) |
+| consumer.write_data (503MB output materialization/write) | 115ms | 126ms | 123ms |
+| ttp.rx_recv_block (WAIT for next chunk's decode result) | 246ms | 106ms | 66ms |
+| wait.block_fetcher_get (WAIT) | 74ms | 72ms | 64ms |
+| consumer.write_narrowed (u16→u8 NARROW tax) | 48ms | 45ms | 47ms |
+| consumer.window_publish_marker (marker RESOLUTION on consumer) | 0.4ms | 0.5ms | 1.2ms |
+REVERSALS vs the buggy entry:
+- Marker RESOLUTION is NOT on the consumer serial path (0.4-1.2ms) — it is OVERLAPPED on workers. The "3-pass data-model tax on the consumer" framing for the RESOLVE pass is WRONG. (The NARROW pass, write_narrowed ~45ms, IS on the consumer.)
+- combine_crc is NOT a top serial term (the 62ms was the script bug). combine_crc lever = WITHDRAWN.
+- The REAL consumer serial cost = output-write (~120ms, ~irreducible 503MB) + narrow (~45ms) + DECODE-WAIT (rx_recv_block + block_finder_get = ~180ms@T8, ~130ms@T16 = blocked on worker decode results).
+- The decode-wait SHRINKS with T (246→106→66 rx_recv) = parallel decode scaling; it is the term bound-prefetch-depth attacks (clean chunks decode ~3× faster → consumer waits less + produce u8 directly → less narrow).
+LEVER (re-grounded on the CORRECTED trace): bound prefetch depth (95%→31% window-absent) attacks decode-WAIT (~180ms) + narrow (~45ms), NOT a resolution tax. combine_crc WITHDRAWN. Fulcrum needs a CORRECT consumer-span decomposition view (self-time + idle-gap, busy+idle=span validated) so this class of script bug can't recur — see 2026-05-31 user directive.
