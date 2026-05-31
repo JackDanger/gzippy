@@ -67,8 +67,20 @@ fn state() -> Option<&'static TraceState> {
 
 #[inline]
 pub fn is_enabled() -> bool {
-    // Cheap: avoid OnceLock::get_or_init in hot path after first call.
-    ENABLED.load(Ordering::Relaxed) || state().is_some()
+    // Under Coz profiling, force-OFF so trace_v2's per-call OnceLock+atomic
+    // (executed by every SpanGuard begin/drop, ~2 per deflate block in the
+    // bootstrap loop) doesn't sit ON the measured path and inflate the
+    // attribution of whatever region it's nested in. The advisor caught this:
+    // trace_v2 itself showed up as a Coz "lever" with the timeline OFF.
+    #[cfg(feature = "coz")]
+    {
+        false
+    }
+    #[cfg(not(feature = "coz"))]
+    {
+        // Cheap: avoid OnceLock::get_or_init in hot path after first call.
+        ENABLED.load(Ordering::Relaxed) || state().is_some()
+    }
 }
 
 thread_local! {
