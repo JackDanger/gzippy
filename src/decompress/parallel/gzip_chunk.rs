@@ -880,6 +880,23 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
         )
     }?;
     let bootstrap_dur_us = t_bootstrap.elapsed().as_micros();
+    // CAUSAL PROBE (GZIPPY_SLOW_BOOTSTRAP=N percent): coz is unavailable in this
+    // container (perf-event sampling restricted), so measure the bootstrap's
+    // causal wall impact directly — spin N% of the bootstrap's own duration to
+    // simulate it being (1 + N/100)x slower, then A/B the interleaved wall with
+    // the probe off vs on. Byte-identical (pure delay). If 2x-slower-bootstrap
+    // (N=100) barely moves the wall, the bootstrap is overlapped/wall-dead;
+    // if it adds ~its critical share, it is the lever. Off by default.
+    if let Some(pct) = std::env::var("GZIPPY_SLOW_BOOTSTRAP")
+        .ok()
+        .and_then(|s| s.parse::<u128>().ok())
+    {
+        let extra = std::time::Duration::from_micros((bootstrap_dur_us * pct / 100) as u64);
+        let until = std::time::Instant::now() + extra;
+        while std::time::Instant::now() < until {
+            std::hint::spin_loop();
+        }
+    }
     // Statistic previously bumped inside `append_markered` (now gone): the
     // count of u16 values the bootstrap emitted into data_with_markers.
     chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
