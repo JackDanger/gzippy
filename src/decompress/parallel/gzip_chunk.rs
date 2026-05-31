@@ -892,9 +892,18 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
         .and_then(|s| s.parse::<u128>().ok())
     {
         let extra = std::time::Duration::from_micros((bootstrap_dur_us * pct / 100) as u64);
-        let until = std::time::Instant::now() + extra;
-        while std::time::Instant::now() < until {
-            std::hint::spin_loop();
+        // Frequency-neutral control (disproof of the turbo-depression confound):
+        // GZIPPY_SLOW_BOOTSTRAP_SLEEP=1 yields the core via sleep instead of a
+        // busy-spin. A sleeping worker can't depress all-core turbo, so if the
+        // wall delta survives with sleep it is genuine bootstrap criticality,
+        // not a spin artifact.
+        if std::env::var_os("GZIPPY_SLOW_BOOTSTRAP_SLEEP").is_some() {
+            std::thread::sleep(extra);
+        } else {
+            let until = std::time::Instant::now() + extra;
+            while std::time::Instant::now() < until {
+                std::hint::spin_loop();
+            }
         }
     }
     // Statistic previously bumped inside `append_markered` (now gone): the
