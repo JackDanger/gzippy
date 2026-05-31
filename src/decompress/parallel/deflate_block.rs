@@ -1640,7 +1640,26 @@ unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
         let src_fits = src_phys + length <= RING_SIZE;
         let dst_fits = dst_phys + length <= RING_SIZE;
         if src_fits && dst_fits {
-            std::ptr::copy_nonoverlapping(ring_ptr.add(src_phys), ring_ptr.add(dst_phys), length);
+            // Inlined short back-ref copy. `copy_nonoverlapping(.., .., length)`
+            // with a RUNTIME `length` lowers to a libc memcpy CALL whose
+            // size-class dispatch dominates for the short matches that make up
+            // most back-refs (length is 3-258 u16, usually < 32) — measured at
+            // 16.7% of decode cycles (cross-tool PEBS) vs rapidgzip's 3.95%
+            // (it inlines this into `Block::read`, deflate.hpp). Copy in
+            // COMPILE-TIME-CONSTANT 8-u16 (16-byte) chunks so LLVM emits inline
+            // moves (no call), with a scalar tail. Non-overlap holds here
+            // (`distance >= length`).
+            let src = ring_ptr.add(src_phys);
+            let dst = ring_ptr.add(dst_phys);
+            let mut i = 0usize;
+            while i + 8 <= length {
+                std::ptr::copy_nonoverlapping(src.add(i), dst.add(i), 8);
+                i += 8;
+            }
+            while i < length {
+                dst.add(i).write(*src.add(i));
+                i += 1;
+            }
         } else {
             // Wrap-straddle non-overlap fallback (rare boundary case).
             for i in 0..length {
