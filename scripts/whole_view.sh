@@ -26,29 +26,38 @@
 set -u
 G="${1:?gzippy bin}"; RG="${2:?rapidgzip bin}"; SLG="${3:?file.gz}"
 PIN="${PIN:-taskset -c 0,2,4,6,8,10,12,14}"
-ROUNDS="${ROUNDS:-5}"
+ROUNDS="${ROUNDS:-7}"
 GZ="$G -d -c -p 8 $SLG"; RGC="$RG -d -c -f -P 8 $SLG"
 
 echo "############ THE WHOLE — gzippy vs rapidgzip — $(basename "$SLG") T8 ############"
 echo "REGIME (known, ledger): CONSUMER-CP_dep-bound + overlapped => decode-rate wall-DEAD."
 echo "       => Section 3 is CPU-TIME (hypotheses), NOT wall. Verdict = Section 1 (WALL)."
 
-echo "== 1. WALL (interleaved best-of-$ROUNDS, sha-verified — the ONLY verdict) =="
+echo "== 1. WALL — sha-verified, interleaved best-of-$ROUNDS, ABSOLUTE+ratio (the ONLY verdict) =="
 sg=$($PIN $GZ 2>/dev/null | sha256sum | cut -d' ' -f1)
 sr=$($PIN $RGC 2>/dev/null | sha256sum | cut -d' ' -f1)
 [ "$sg" = "$sr" ] && echo "   sha: MATCH (byte-identical) OK" || echo "   sha: MISMATCH gz=$sg rg=$sr  <<< CORRECTNESS BROKEN"
-# Positive control: a timer that doesn't bracket the process is the oracle-class
-# failure. Assert a known +0.3s sleep shows up in the measured wall.
+OUT=$($PIN $GZ 2>/dev/null | wc -c)   # decompressed bytes -> absolute MB/s
+# self-test 1: the timer must bracket the process (a known +0.3s sleep must appear).
 s=$(date +%s.%N); $PIN $GZ >/dev/null 2>&1; e=$(date +%s.%N); base=$(awk "BEGIN{print $e-$s}")
 s=$(date +%s.%N); sleep 0.3; $PIN $GZ >/dev/null 2>&1; e=$(date +%s.%N); slow=$(awk "BEGIN{print $e-$s}")
-awk -v a=$base -v b=$slow 'BEGIN{d=b-a; if(d>0.2 && d<0.45) print "   timer self-test: OK (+0.3s sleep -> +"d"s)"; else print "   timer self-test: SUSPECT (+0.3s sleep -> +"d"s) <<< section 1 timing unreliable"}'
-gb=99; rb=99
+awk -v a=$base -v b=$slow 'BEGIN{d=b-a; if(d>0.2 && d<0.45) print "   timer self-test: OK (+0.3s -> +"d"s)"; else print "   timer self-test: SUSPECT (+0.3s -> +"d"s) <<< timing unreliable"}'
+# self-test 2: a binary vs ITSELF must read ~1.0, else the box is too noisy to trust ANY ratio.
+s=$(date +%s.%N); $PIN $GZ >/dev/null 2>&1; e=$(date +%s.%N); x=$(awk "BEGIN{print $e-$s}")
+awk -v a=$base -v b=$x 'BEGIN{r=(a>b)?a/b:b/a; if(r<1.15) printf "   self-test (gz vs gz): %.3f OK\n",r; else printf "   self-test (gz vs gz): %.3f <<< BOX TOO NOISY (>15%%) — rows INCONCLUSIVE; freeze host\n",r}'
+gb=99; gx=0; rb=99
 for t in $(seq 1 "$ROUNDS"); do
   s=$(date +%s.%N); $PIN $GZ  >/dev/null 2>&1; e=$(date +%s.%N); g=$(awk "BEGIN{print $e-$s}")
   s=$(date +%s.%N); $PIN $RGC >/dev/null 2>&1; e=$(date +%s.%N); r=$(awk "BEGIN{print $e-$s}")
-  gb=$(awk -v a=$gb -v b=$g 'BEGIN{print (b<a)?b:a}'); rb=$(awk -v a=$rb -v b=$r 'BEGIN{print (b<a)?b:a}')
+  gb=$(awk -v a=$gb -v b=$g 'BEGIN{print (b<a)?b:a}'); gx=$(awk -v a=$gx -v b=$g 'BEGIN{print (b>a)?b:a}'); rb=$(awk -v a=$rb -v b=$r 'BEGIN{print (b<a)?b:a}')
 done
-awk -v g=$gb -v r=$rb 'BEGIN{printf "   gzippy=%.3fs  rapidgzip=%.3fs  RATIO=%.3fx  (parity=1.000)\n",g,r,g/r}'
+awk -v g=$gb -v gx=$gx -v r=$rb -v out=$OUT 'BEGIN{
+  gmb=out/g/1e6; rmb=out/r/1e6; sp=(gx-g)/g*100;
+  printf "   gzippy=%.0f MB/s (best %.3fs, spread %.1f%%)   rapidgzip=%.0f MB/s   RATIO=%.3fx (parity=1.0)\n",gmb,g,sp,rmb,g/r;
+  printf "   PROGRESS RULE: WIN only if gzippy MB/s ROSE vs last row AND ratio fell by > spread(%.1f%%); else TIE / rival-regressed.\n",sp
+}'
+# append-only trajectory log (emitted by the instrument, not hand-edited)
+echo "$(date +%FT%H:%M),$(git rev-parse --short HEAD 2>/dev/null),$gb,$rb,$(awk -v g=$gb -v r=$rb 'BEGIN{printf "%.3f",g/r}'),$(awk -v g=$gb -v gx=$gx 'BEGIN{printf "%.1f",(gx-g)/g*100}')" >> plans/wall-progress.csv 2>/dev/null
 
 echo "== 2. GAP STRUCTURE (instr / IPC / parallelism — work vs stalls vs cores) =="
 for which in gz rg; do
