@@ -216,6 +216,19 @@ impl<Key: Hash + Eq + Clone + Ord, Value: Clone, Strategy: CacheStrategy<Key>>
     pub fn size(&self) -> usize {
         self.cache.len()
     }
+
+    /// Snapshot of `(key, value)` pairs currently held, WITHOUT touching
+    /// the LRU strategy or hit/miss stats. Mirror of vendor's
+    /// `prefetchCache().contents()` (used by
+    /// `GzipChunkFetcher::queuePrefetchedChunkPostProcessing`,
+    /// GzipChunkFetcher.hpp:524). Caller is expected to sort by key.
+    #[cfg_attr(not(parallel_sm), allow(dead_code))]
+    pub fn contents_snapshot(&self) -> Vec<(Key, Value)> {
+        self.cache
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
