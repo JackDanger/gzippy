@@ -376,20 +376,30 @@ fn replay_map() -> &'static HashMap<Key, CapturedChunk> {
         let Some(path) = replay_path() else {
             return HashMap::new();
         };
-        let mut f = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("BYPASS_DECODE failed to open {path}: {e}");
-                return HashMap::new();
+        // Accept a `:`-separated list of capture files and MERGE them. This
+        // gives full start_bit coverage across thread-counts for the
+        // fixed-sleep mode (the speculative (start_bit, stop_hint) keys vary
+        // run-to-run and per-T; merging every captured chunk by start_bit
+        // lets sleep_replay's start_bit-only fallback hit at any T).
+        let mut map: HashMap<Key, CapturedChunk> = HashMap::new();
+        for p in path.split(':').filter(|s| !s.is_empty()) {
+            let mut f = match std::fs::File::open(p) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("BYPASS_DECODE failed to open {p}: {e}");
+                    continue;
+                }
+            };
+            let mut bytes = Vec::new();
+            if let Err(e) = f.read_to_end(&mut bytes) {
+                eprintln!("BYPASS_DECODE failed to read {p}: {e}");
+                continue;
             }
-        };
-        let mut bytes = Vec::new();
-        if let Err(e) = f.read_to_end(&mut bytes) {
-            eprintln!("BYPASS_DECODE failed to read {path}: {e}");
-            return HashMap::new();
+            let sub = parse_capture(&bytes);
+            eprintln!("BYPASS_DECODE loaded {} chunks from {p}", sub.len());
+            map.extend(sub);
         }
-        let map = parse_capture(&bytes);
-        eprintln!("BYPASS_DECODE loaded {} chunks from {path}", map.len());
+        eprintln!("BYPASS_DECODE merged map: {} keys", map.len());
         map
     })
 }
@@ -459,12 +469,24 @@ pub fn sleep_replay(
         std::thread::sleep(std::time::Duration::from_nanos(ns));
     }
     let map = replay_map();
+    // Exact (start_bit, stop_hint_bit) match first; else fall back to a
+    // start_bit-only match. The decoded SIZE/boundaries of a chunk are a
+    // function of start_bit (the predecessor window only changes marker vs
+    // clean form, which we collapse to clean anyway), so a different
+    // stop_hint at another thread-count still yields a correctly-sized
+    // sleep chunk. This makes the SAME capture valid across all T (at T=1
+    // the sequential dispatch uses different stop_hints than the prefetch
+    // capture — without this, T=1 would miss 40/41 and silently run REAL
+    // decode, invalidating the experiment).
     let cap = match map.get(&(start_bit, stop_hint_bit)) {
         Some(c) => c,
-        None => {
-            REPLAY_MISSES.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
+        None => match map.iter().find(|((sb, _), _)| *sb == start_bit) {
+            Some((_, c)) => c,
+            None => {
+                REPLAY_MISSES.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        },
     };
     REPLAY_HITS.fetch_add(1, Ordering::Relaxed);
 
