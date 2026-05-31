@@ -61,3 +61,9 @@ perl -i -0777 -pe '
 ' "$BF"
 echo "PATCHED fixed-sleep into decodeAndMeasureBlock: $BF"
 echo "Done. Rebuild build-trace: cmake --build /root/gzippy/vendor/rapidgzip/librapidarchive/build-trace --target rapidgzip -j"
+
+# REBUILT BINARY (2026-05-31): after applying this patch on the x86 box,
+# the traced rapidgzip with the sleep hook is at
+#   /root/gzippy/vendor/rapidgzip/librapidarchive/build-trace/src/tools/rapidgzip
+# rebuilt via: cmake --build .../build-trace --target rapidgzip -j
+# Activated by RAPIDGZIP_SLEEP_DECODE_NS=<ns>; unset = stock decode.
