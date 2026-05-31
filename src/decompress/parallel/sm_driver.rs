@@ -54,17 +54,24 @@ pub fn read_parallel_sm<W: std::io::Write>(
     }
     .map_err(|e| ReadParallelSmError::DecodeFailed(format!("{e:?}")))?;
 
-    if total_size != expected_size {
-        return Err(ReadParallelSmError::SizeMismatch {
-            expected: expected_size,
-            actual: total_size,
-        });
-    }
-    if total_crc != expected_crc {
-        return Err(ReadParallelSmError::CrcMismatch {
-            expected: expected_crc,
-            actual: total_crc,
-        });
+    // FIXED-SLEEP coordination-isolation mode produces GARBAGE output (zeros)
+    // by design — it is a wall-only measurement of the coordination chain
+    // with decode replaced by a fixed sleep. Skip CRC/size verification in
+    // that mode only (zero production change when unset).
+    let sleep_mode = crate::decompress::parallel::decode_bypass::sleep_decode_enabled();
+    if !sleep_mode {
+        if total_size != expected_size {
+            return Err(ReadParallelSmError::SizeMismatch {
+                expected: expected_size,
+                actual: total_size,
+            });
+        }
+        if total_crc != expected_crc {
+            return Err(ReadParallelSmError::CrcMismatch {
+                expected: expected_crc,
+                actual: total_crc,
+            });
+        }
     }
 
     // Allocator visibility (GZIPPY_RPMALLOC_STATS=1): show whether the
