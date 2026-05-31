@@ -26,7 +26,16 @@ Why absolute too, not just ratio: a ratio can fall because **rapidgzip got slowe
 | 05-30 | copy-collapse (reverted) | flat | flat | 1.40× | — | TIE (Δ<spread) |
 | 05-30 | `feat/consumer-postprocess-pump` | flat | flat | 1.39× | in-noise | **TIE** — pump enqueued 0 tasks; premise falsified (stalls are on-demand decode of guard-rejected prefetches, not unpumped post-processing). 2nd TIE in a row ⇒ tripwire fired ⇒ re-localized. |
 
-## 2026-05-31 — FULCRUM HEAD-TO-HEAD (same instrument, both binaries) — lever DECISIVELY localized
+## 2026-05-31 — ⚠️ RETRACTION (Opus meta-audit): the "marker-decode-speed lever" below is the 4th PHANTOM
+The head-to-head conclusion immediately below (window-absent marker decode SPEED = the lever) is **RETRACTED**. A meta-audit of the full history found:
+- **It re-opens a measured-DEAD lever.** `x86-falsification-ledger.md:48-56` (FastBootstrap): a libdeflate-style u16 bootstrap decoder, 1.72–1.89× faster decode, byte-identical, produced a production wall **TIE** (N=11, 4 rounds, 3 host-frozen). "Decode RATE is wall-DEAD entirely." `lever-selection-gate.md:24`: decoder slice ceiling ~14%, CANNOT close the gap alone.
+- **The 1.77× decode-CPU headline came from SINGLE un-interleaved traced runs** (one GZIPPY_TIMELINE each, loaded box, tracing perturbs timing) — violates this scoreboard's own N≥7/frozen/interleaved protocol. busy-CPU ≠ critical-path when workers are 37× overlapped.
+- **`critpath`/`flow` attribution is BIASABLE** (analyst-chosen `preferred_blockers`); it manufactured 2 phantoms this session (decode-bias, scan_candidate umbrella). It is a hypothesis generator, NOT the verdict instrument.
+- **The likely REAL lever is the SCALING CLIFF / consumer-feeding** (gzippy wins P2 0.93×, loses P4–P16; fill-factor 93→80%), in the 86% structural slice the gate says to attack FIRST.
+
+**Corrected method (do this BEFORE any decode port):** the VERDICT instrument is `fulcrum coz` (CAUSAL virtual-speedup, empirical ∂wall±CI on the production parallel-SM binary, frozen host) — NOT static `--whatif`, NOT biasable critpath. Gate every lever: no code until a Coz run shows the wall is sensitive to that region with a CI that clears the gap. Build `fulcrum doctor` (path-assert + noise-gate + scaling-table + causal-verdict + ledger-check). The RLE-fill micro-opt (byte-identical, 19 tests pass) is NOT a claimed win — it targets the overlapped/wall-dead stage; do not promote without a causal+interleaved wall measurement.
+
+## 2026-05-31 — FULCRUM HEAD-TO-HEAD (same instrument, both binaries) — lever localized [RETRACTED ABOVE]
 Built `fulcrum flow` (committed fulcrum 6f920a8/8ee27df, 4 tests): per-stage WALL-CRITICAL vs TOTAL-BUSY (gap=slack), SERIAL/STARVED flags, `--whatif`. Then patched rapidgzip to emit the SAME Chrome-trace spans (scripts/rapidgzip_trace_patch, built `/root/gzippy/vendor/rapidgzip/librapidarchive/build-trace`) and ran the SAME tool on BOTH (T8, gzipcli-large 503MB, /dev/null).
 
 **The instrument-consistent signal (both emit `worker.decode_chunk`):**
