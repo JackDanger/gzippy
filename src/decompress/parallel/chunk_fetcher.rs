@@ -1299,13 +1299,9 @@ fn consumer_loop<W: std::io::Write>(
             if let Some((_pred_key, pred)) = window_map.get_predecessor(chunk.encoded_offset_bits) {
                 let bytes = materialize_window(&pred);
                 let tail = chunk
-                    .last_32kib_window()
-                    .unwrap_or_else(|| chunk.get_last_window(&bytes));
-                window_map.insert_bytes_with_compression(
-                    chunk_end_bit,
-                    &tail,
-                    CompressionType::None,
-                );
+                    .last_32kib_window_vec()
+                    .unwrap_or_else(|| chunk.get_last_window_vec(&bytes));
+                window_map.insert_owned_none(chunk_end_bit, tail);
             }
             predecessor_window_for_postprocess = None;
         } else {
@@ -1365,8 +1361,8 @@ fn consumer_loop<W: std::io::Write>(
             // decompress()` materializes the bytes once. For
             // CompressionType::None this is a zero-alloc slice borrow.
             let window_bytes = materialize_window(&window);
-            let tail = chunk.get_last_window(&window_bytes);
-            window_map.insert_bytes_with_compression(chunk_end_bit, &tail, CompressionType::None);
+            let tail = chunk.get_last_window_vec(&window_bytes);
+            window_map.insert_owned_none(chunk_end_bit, tail);
             predecessor_window_for_postprocess = Some(window);
         }
 
@@ -1796,17 +1792,27 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
     let t_materialize = std::time::Instant::now();
     let bytes = materialize_window(&predecessor_window);
     let materialize_us = t_materialize.elapsed().as_micros();
-    // For chunks at or above the vendor LUT threshold (≥128 Ki u16
-    // markers ≈ 256 KiB of marker prefix), fuse `replace_markers` +
+    // For chunks at or above the LUT threshold, fuse `replace_markers` +
     // `narrow_u16_to_u8` into one pass that reads u16 and writes the
     // resolved u8 directly into `chunk.narrowed`. Vendor parity:
     // `DecodedData.hpp:316-337` writes `target[i] = fullWindow[chunk[i]]`
-    // in a single LUT pass. Below the threshold, the LUT construction
-    // overhead (64 KiB stack zeroing + 32 KiB window copy ≈ 96 KiB)
-    // dominates so we keep the existing two-pass path (AVX2 in-place
-    // replace + scalar narrow).
+    // in a single LUT pass.
+    //
+    // Threshold lowered 128 KiB → 16 KiB (2026-05-31, consumer-path
+    // copy-elimination): the two-pass path costs ~3 buffer passes
+    // (AVX2 u16 in-place replace = read+write 2·N bytes, then narrow =
+    // read 2·N + write N), while the fused path costs ~96 KiB of LUT
+    // setup (64 KiB zero-init + 32 KiB window copy) plus ONE write of N
+    // bytes. The LUT is window-dependent (every chunk has a different
+    // predecessor window), so it cannot be reused across chunks — the
+    // ~96 KiB setup is paid per fused call regardless. Break-even is
+    // around N ≈ 16 KiB of markers; below that the LUT setup dominates,
+    // so 16 KiB is the conservative floor (not 0). Above it the fused
+    // single-pass wins. The fused path already produces byte-identical
+    // output (it is the production large-marker path), so only the
+    // threshold moves.
     use crate::decompress::parallel::replace_markers::replace_markers_lut_narrow;
-    const LUT_FUSE_THRESHOLD: usize = 128 * 1024;
+    const LUT_FUSE_THRESHOLD: usize = 16 * 1024;
     let dwm_len_pre = chunk.data_with_markers.len();
     let use_fused = dwm_len_pre >= LUT_FUSE_THRESHOLD && bytes.len() == 32768;
     let t_apply = std::time::Instant::now();

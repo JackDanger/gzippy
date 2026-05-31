@@ -391,6 +391,43 @@ impl ChunkData {
         }
     }
 
+    /// Vec-producing twin of `last_32kib_window`. Builds the clean tail
+    /// window DIRECTLY into a freshly-allocated 32 KiB `Vec<u8>` (no
+    /// stack-array intermediate), so the consumer's publish path can hand
+    /// ownership straight into the `WindowMap` via `insert_owned_none` —
+    /// exactly one heap allocation, zero redundant memcpy. Byte-identical
+    /// to `last_32kib_window().map(|a| a.to_vec())`.
+    pub fn last_32kib_window_vec(&self) -> Option<Vec<u8>> {
+        const W: usize = 32768;
+        let total = self.decoded_size();
+        if total == 0 {
+            return None;
+        }
+        let decoded_data_len = self.data.len() - self.data_prefix_len;
+        if decoded_data_len >= W {
+            return Some(self.data[self.data.len() - W..].to_vec());
+        }
+        if total >= W {
+            // Tail straddles markers + clean. Markers in the trailing W
+            // bytes mean we can't build a clean window standalone.
+            let from_data = decoded_data_len;
+            let from_markers = W - from_data;
+            let m_start = self.data_with_markers.len() - from_markers;
+            for v in &self.data_with_markers[m_start..] {
+                if *v >= crate::decompress::parallel::replace_markers::MARKER_BASE {
+                    return None;
+                }
+            }
+            let mut out = Vec::with_capacity(W);
+            out.extend(self.data_with_markers[m_start..].iter().map(|v| *v as u8));
+            out.extend_from_slice(&self.data[self.data_prefix_len..]);
+            debug_assert_eq!(out.len(), W);
+            Some(out)
+        } else {
+            None
+        }
+    }
+
     #[inline]
     pub fn decoded_size(&self) -> usize {
         // `data_prefix_len` accounts for window-image bytes pre-filled
@@ -1062,6 +1099,69 @@ impl ChunkData {
             }
             // Then ALL of decoded_data.
             window[written..written + data_len].copy_from_slice(decoded_data);
+        }
+
+        window
+    }
+
+    /// Vec-producing twin of `get_last_window`. Builds the resolved tail
+    /// window DIRECTLY into a freshly-allocated 32 KiB `Vec<u8>` so the
+    /// consumer publish path can hand ownership into the `WindowMap` via
+    /// `insert_owned_none` — one heap allocation, zero redundant memcpy.
+    /// Byte-identical to `get_last_window(predecessor_window).to_vec()`.
+    pub fn get_last_window_vec(&self, predecessor_window: &[u8]) -> Vec<u8> {
+        const W: usize = 32768;
+        debug_assert_eq!(predecessor_window.len(), W);
+        let dwm_len = self.data_with_markers.len();
+        let data_len = self.data.len() - self.data_prefix_len;
+        let decoded_data: &[u8] = &self.data[self.data_prefix_len..];
+        let total = dwm_len + data_len;
+
+        let mut window = Vec::with_capacity(W);
+
+        if total >= W {
+            let mut offset = total - W;
+            // Segment 1: dataWithMarkers, mapping markers.
+            if offset < dwm_len {
+                let take = (dwm_len - offset).min(W);
+                window.extend(
+                    self.data_with_markers[offset..offset + take]
+                        .iter()
+                        .map(|&v| {
+                            if v >= MARKER_BASE {
+                                predecessor_window[(v - MARKER_BASE) as usize]
+                            } else {
+                                v as u8
+                            }
+                        }),
+                );
+                offset = 0;
+            } else {
+                offset -= dwm_len;
+            }
+            // Segment 2: decoded_data (clean bytes).
+            let written = window.len();
+            if written < W && offset < data_len {
+                let take = (data_len - offset).min(W - written);
+                window.extend_from_slice(&decoded_data[offset..offset + take]);
+            }
+            debug_assert_eq!(
+                window.len(),
+                W,
+                "get_last_window_vec underran the tail buffer"
+            );
+        } else {
+            // total < W: head comes from predecessor_window's tail.
+            window.extend_from_slice(&predecessor_window[total..]);
+            window.extend(self.data_with_markers.iter().map(|&v| {
+                if v >= MARKER_BASE {
+                    predecessor_window[(v - MARKER_BASE) as usize]
+                } else {
+                    v as u8
+                }
+            }));
+            window.extend_from_slice(decoded_data);
+            debug_assert_eq!(window.len(), W);
         }
 
         window
