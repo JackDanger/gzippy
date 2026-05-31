@@ -1862,6 +1862,14 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
             ),
         );
     }
+    // WARM-CYCLE the marker buffer (completes the zero-copy bootstrap merge).
+    // `data_with_markers` is fully resolved into `narrowed` above and never read
+    // again. Return it to the owner worker's u16 pool NOW (not at Drop, which
+    // under pipelining lands after the next chunk's bootstrap already took a
+    // cold buffer) so the next bootstrap decodes DIRECTLY into a warm recycled
+    // buffer — the missing half of the merge that turns the copy-free bootstrap
+    // from a ~3% regression into a clean no-copy path.
+    chunk.recycle_markers_after_resolution();
     chunk
 }
 

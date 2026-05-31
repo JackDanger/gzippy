@@ -14,6 +14,51 @@ use crate::decompress::inflate::consume_first_decode::Bits;
 // rather than an inline `(1 << n) - 1`.
 use crate::decompress::parallel::bit_manipulation::n_lowest_bits_set;
 
+/// Sink for decoded u16 marker/literal output. Lets the bootstrap decode
+/// DIRECTLY into the chunk's pooled `U16` (rpmalloc-backed) buffer instead of
+/// a separate `std::Vec<u16>` that is then copied in (`append_markered`). Both
+/// the std `Vec<u16>` (tests / non-arena builds) and the arena-backed `U16`
+/// implement it, so the same decode path serves both with zero copy.
+pub trait MarkerSink {
+    fn push_slice(&mut self, values: &[u16]);
+    fn sink_len(&self) -> usize;
+    fn as_slice(&self) -> &[u16];
+}
+
+impl MarkerSink for Vec<u16> {
+    #[inline]
+    fn push_slice(&mut self, values: &[u16]) {
+        self.extend_from_slice(values);
+    }
+    #[inline]
+    fn sink_len(&self) -> usize {
+        self.len()
+    }
+    #[inline]
+    fn as_slice(&self) -> &[u16] {
+        self
+    }
+}
+
+// When `arena-allocator` is on, `U16` is a DISTINCT type from `Vec<u16>`
+// (allocator_api2 Vec), so it needs its own impl. Without the feature `U16 ==
+// Vec<u16>` and the impl above already covers it (cfg avoids a duplicate).
+#[cfg(feature = "arena-allocator")]
+impl MarkerSink for crate::decompress::parallel::rpmalloc_alloc::types::U16 {
+    #[inline]
+    fn push_slice(&mut self, values: &[u16]) {
+        self.extend_from_slice(values);
+    }
+    #[inline]
+    fn sink_len(&self) -> usize {
+        self.len()
+    }
+    #[inline]
+    fn as_slice(&self) -> &[u16] {
+        self
+    }
+}
+
 // ── Constants (from rapidgzip definitions.hpp) ──────────────────────────────
 
 pub const MAX_LITERAL_OR_LENGTH_SYMBOLS: usize = 286;
@@ -548,7 +593,7 @@ impl Block {
     /// guarantees no read past `MAX_WINDOW_SIZE` bytes ago, so the
     /// preserved-history requirement is `MAX_WINDOW_SIZE` slots
     /// behind `ring_pos`).
-    fn drain_to_output(&mut self, output: &mut Vec<u16>) {
+    fn drain_to_output(&mut self, output: &mut impl MarkerSink) {
         let new_bytes = self.ring_pos - self.ring_drained;
         if new_bytes == 0 {
             return;
@@ -558,12 +603,12 @@ impl Block {
         if start_idx + new_bytes <= RING_SIZE {
             // Contiguous slice — covers both the non-wrap case and
             // the exactly-fills-to-end case (end_idx_excl == 0).
-            output.extend_from_slice(&self.output_ring[start_idx..start_idx + new_bytes]);
+            output.push_slice(&self.output_ring[start_idx..start_idx + new_bytes]);
         } else {
             // Wraps: first part `[start_idx..RING_SIZE)`, second part
             // `[0..end_idx_excl)`.
-            output.extend_from_slice(&self.output_ring[start_idx..]);
-            output.extend_from_slice(&self.output_ring[..end_idx_excl]);
+            output.push_slice(&self.output_ring[start_idx..]);
+            output.push_slice(&self.output_ring[..end_idx_excl]);
         }
         self.ring_drained = self.ring_pos;
     }
@@ -703,7 +748,7 @@ impl Block {
     pub fn read(
         &mut self,
         bits: &mut Bits,
-        output: &mut Vec<u16>,
+        output: &mut impl MarkerSink,
         n_max_to_decode: usize,
     ) -> Result<usize, BlockError> {
         if self.eob() {

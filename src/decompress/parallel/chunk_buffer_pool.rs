@@ -111,6 +111,7 @@ use crate::decompress::parallel::rpmalloc_alloc::types::{self, U16, U8};
 /// (kernel page-zeroing on first touch); the per-fault overhead is the
 /// bigger cost than the zeroing itself. Fewer faults → less overhead.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn use_hugepage_hint() -> bool {
     use std::sync::OnceLock as Once;
     static USE: Once<bool> = Once::new();
@@ -126,6 +127,7 @@ fn use_hugepage_hint() -> bool {
 /// Only effective on Linux; called on miss path of `take_u8` so the
 /// hint is set once per backing allocation, not per pool reuse.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn hugepage_hint(ptr: *mut u8, len: usize) {
     if !use_hugepage_hint() || len < 2 * 1024 * 1024 {
         return;
@@ -177,6 +179,7 @@ fn u8_pools() -> &'static [Mutex<Vec<U8>>] {
     POOLS.get_or_init(|| (0..MAX_WORKERS).map(|_| Mutex::new(Vec::new())).collect())
 }
 
+#[allow(dead_code)]
 fn u16_pools() -> &'static [Mutex<Vec<U16>>] {
     static POOLS: OnceLock<Vec<Mutex<Vec<U16>>>> = OnceLock::new();
     POOLS.get_or_init(|| (0..MAX_WORKERS).map(|_| Mutex::new(Vec::new())).collect())
@@ -230,6 +233,7 @@ pub fn take_u8(min_capacity: usize) -> U8 {
 }
 
 /// Take a `Vec<u16>` from the current worker's pool.
+#[allow(dead_code)]
 pub fn take_u16(min_capacity: usize) -> U16 {
     let idx = pool_index_for_take();
     if let Ok(mut pool) = u16_pools()[idx].lock() {
@@ -265,6 +269,7 @@ pub fn return_u8_to_worker(owner_worker: usize, mut v: U8) {
 }
 
 /// Return a `Vec<u16>` to the pool for `owner_worker`.
+#[allow(dead_code)]
 pub fn return_u16_to_worker(owner_worker: usize, mut v: U16) {
     if v.capacity() == 0 {
         return;
@@ -273,6 +278,48 @@ pub fn return_u16_to_worker(owner_worker: usize, mut v: U16) {
     let idx = owner_worker.min(MAX_WORKERS - 1);
     RETURN_U16_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut pool) = u16_pools()[idx].lock() {
+        if pool.len() < MAX_POOLED {
+            v.clear();
+            pool.push(v);
+        }
+    }
+}
+
+// ── Dedicated std `Vec<u16>` pool for the bootstrap marker buffer ──────────
+// The window-absent bootstrap decodes into `data_with_markers`. Measurement
+// (frozen interleaved x86 T8) showed decoding into the rpmalloc-backed `U16`
+// is ~3% slower per-byte than into a std `Vec<u16>` (the allocator the deleted
+// thread-local BOOTSTRAP_OUTPUT_POOL used). So `data_with_markers` is a std
+// `Vec<u16>` taken from THIS retained pool (warm pages, no per-chunk mmap)
+// and decoded into directly — no `append_markered` copy AND baseline decode
+// speed. The buffer cycles take → decode → resolve → return (recycle/drop).
+fn std_u16_pools() -> &'static [Mutex<Vec<Vec<u16>>>] {
+    static POOLS: OnceLock<Vec<Mutex<Vec<Vec<u16>>>>> = OnceLock::new();
+    POOLS.get_or_init(|| (0..MAX_WORKERS).map(|_| Mutex::new(Vec::new())).collect())
+}
+
+/// Take a std `Vec<u16>` from the current worker's pool (warm if recycled).
+pub fn take_std_u16(min_capacity: usize) -> Vec<u16> {
+    let idx = pool_index_for_take();
+    if let Ok(mut pool) = std_u16_pools()[idx].lock() {
+        if let Some(mut v) = pool.pop() {
+            v.clear();
+            if v.capacity() < min_capacity {
+                v.reserve(min_capacity - v.capacity());
+            }
+            return v;
+        }
+    }
+    Vec::with_capacity(min_capacity)
+}
+
+/// Return a std `Vec<u16>` to the owner worker's pool.
+pub fn return_std_u16_to_worker(owner_worker: usize, mut v: Vec<u16>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    let idx = owner_worker.min(MAX_WORKERS - 1);
+    if let Ok(mut pool) = std_u16_pools()[idx].lock() {
         if pool.len() < MAX_POOLED {
             v.clear();
             pool.push(v);

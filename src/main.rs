@@ -50,6 +50,7 @@ mod utils;
 
 // ── Compression & decompression stacks ───────────────────────────────────────
 mod compress; // engine (mod.rs) + io, parallel, pipelined, optimization, simple
+mod coz_probe; // Coz causal-profiling probe shim (no-op without --features coz)
 mod decompress; // engine (mod.rs) + io, format, bgzf, SIMD tables, scan_inflate
 
 // ── Hardware backends (ISA-L, libdeflate FFI) ─────────────────────────────────
