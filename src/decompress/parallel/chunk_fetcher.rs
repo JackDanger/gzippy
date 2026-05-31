@@ -736,6 +736,17 @@ fn drive_impl<W: std::io::Write>(
             SLOW_PATH_FIRST_CANDIDATE_FAIL.load(Ordering::Relaxed),
             SLOW_PATH_NO_CANDIDATE.load(Ordering::Relaxed),
         );
+        // Early window publish: did the worker publish provably-clean
+        // tail windows off the consumer's serial path (the lever)? A high
+        // `published` count with `range_speculative` accounting for the
+        // rest is the success signal; `tail_not_clean` are chunks that
+        // fell back to the consumer's serial `get_last_window_vec(pred)`.
+        eprintln!(
+            "  Early window publish: published={} tail_not_clean={} range_speculative={}",
+            EARLY_WINDOW_PUBLISHED.load(Ordering::Relaxed),
+            EARLY_WINDOW_TAIL_NOT_CLEAN.load(Ordering::Relaxed),
+            EARLY_WINDOW_RANGE_SPECULATIVE.load(Ordering::Relaxed),
+        );
         // V6: Was the boundary search (scoped BlockFinder spawn) needed
         // for most slow-path decodes, or did the first-candidate try
         // win without it? If runs == ok_count, every slow-path needed
@@ -1930,8 +1941,77 @@ fn run_decode_task(
         )
     };
 
-    // Workers must not publish to WindowMap — consumer publishes fast-path
-    // windows after decode (see consumer_loop marker-free branch).
+    // EARLY WINDOW PUBLISH (break the serial window-resolution chain).
+    //
+    // The in-order consumer is the wall: a successor chunk that decoded
+    // with markers can only be RESOLVED (apply_window) once its
+    // predecessor's tail-window is in the WindowMap, and historically
+    // that window appeared only as the consumer serially advanced to and
+    // resolved the predecessor (a strict N-1 → N chain). A probe (this
+    // branch's parent commit) confirmed ready prefetched successors sit
+    // idle because `get_predecessor` misses.
+    //
+    // The lever: a chunk's last 32 KiB is the exact window the NEXT chunk
+    // needs, and the worker has it RIGHT AFTER decode — long before the
+    // consumer reaches this chunk. Publish it now so successors'
+    // predecessor windows become available off the consumer's serial path
+    // (both the consumer's `has_predecessor` wait and
+    // `eager_postprocess_prefetched`'s `get_predecessor` then succeed).
+    //
+    // CORRECTNESS — three invariants make this byte-identical to the
+    // consumer's eventual publish:
+    //
+    //  1. KEY STABILITY. We key at `chunk_end_bit = encoded_offset_bits +
+    //     encoded_size_bits`. The consumer publishes at the same
+    //     expression AFTER `set_encoded_offset`, which holds that sum
+    //     invariant (ChunkData::set_encoded_offset: new_size = end - off,
+    //     new_off = off ⇒ off + new_size == end). So the worker's
+    //     `chunk_end_bit` equals the consumer's for any chunk the
+    //     consumer accepts.
+    //
+    //  2. ACCEPT DETERMINISM. We publish ONLY when
+    //     `max_acceptable_start_bit == encoded_offset_bits` — i.e. the
+    //     chunk decoded at an EXACT confirmed offset, not a speculative
+    //     RANGE. These are (a) fast-path `decode_chunk_isal` chunks
+    //     (window known) and (b) marker-bootstrap chunks whose partition
+    //     seed already WAS the real boundary (`try_speculative_decode_
+    //     candidate` widens `max` past `encoded` only when
+    //     `partition_seed < decode_start`). Such chunks are always
+    //     accepted by the consumer's `matches_encoded_offset` +
+    //     `max == next_block_offset` guard with the SAME end, so the
+    //     window we publish is never stale/rejected. Range-speculative
+    //     chunks (`max > encoded`) may be rejected and re-decoded at a
+    //     different start/end — we never publish for those; they take the
+    //     existing serial consumer publish unchanged.
+    //
+    //  3. PROVABLY-CLEAN TAIL. We publish only `last_32kib_window_vec()`,
+    //     which returns `Some` IFF the trailing 32 KiB contains no
+    //     markers (resolved purely from clean bytes, no predecessor
+    //     needed). On a clean tail it is byte-identical to the consumer's
+    //     `get_last_window_vec(pred)` (which only consults the
+    //     predecessor for marker bytes in the tail — of which there are
+    //     none). When the tail straddles markers it returns `None` and we
+    //     publish nothing → the chunk falls back to the consumer's serial
+    //     `get_last_window_vec(pred)` publish, unchanged.
+    //
+    // `insert` uses overwrite semantics (WindowMap.hpp:65-76
+    // insert_or_assign), so the consumer's later publish at the same key
+    // is a harmless idempotent overwrite with identical bytes.
+    if let Ok(ref chunk) = chunk_result {
+        if chunk.max_acceptable_start_bit == chunk.encoded_offset_bits
+            && chunk.encoded_size_bits > 0
+        {
+            if let Some(tail) = chunk.last_32kib_window_vec() {
+                let chunk_end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+                window_map.insert_owned_none(chunk_end_bit, tail);
+                EARLY_WINDOW_PUBLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                EARLY_WINDOW_TAIL_NOT_CLEAN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else {
+            EARLY_WINDOW_RANGE_SPECULATIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 
     // Wrap in Arc to match BlockFetcher's `Value = Arc<ChunkData>`
     // (vendor's `std::shared_ptr<BlockData>` at BlockFetcher.hpp:46).
@@ -2228,6 +2308,21 @@ pub static SPEC_FAIL_INFLATE: std::sync::atomic::AtomicU64 = std::sync::atomic::
 pub static SPEC_FAIL_STOP_MISSED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static SPEC_FAIL_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Early-window-publish telemetry (run_decode_task). PUBLISHED: worker
+/// published a provably-clean 32 KiB tail at chunk_end_bit, off the
+/// consumer's serial path. TAIL_NOT_CLEAN: chunk had an exact confirmed
+/// start but its trailing 32 KiB straddled markers (falls back to the
+/// consumer's serial `get_last_window_vec(pred)` publish).
+/// RANGE_SPECULATIVE: chunk decoded over a speculative start RANGE
+/// (`max > encoded`) so its end is not yet authoritative — never early-
+/// published (the consumer publishes it after accept + set_encoded_offset).
+pub static EARLY_WINDOW_PUBLISHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static EARLY_WINDOW_TAIL_NOT_CLEAN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static EARLY_WINDOW_RANGE_SPECULATIVE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
