@@ -1,5 +1,19 @@
 # Complete learnings — gzippy → rapidgzip parity campaign (x86 single-member decode)
 
+> **⚠️ CORRECTION BANNER (2026-05-31, Opus meta-audit). Read before trusting any
+> lever below.** Two ideas this campaign repeatedly entertained are MEASURED-WRONG:
+> (1) **"delete the marker machinery / converge by removing deflate_block+apply_window"**
+> — FALSE: traced rapidgzip carries the SAME machinery (its own counters: 31.25%
+> replaced-marker symbols, 0.113s apply-window) and gzippy's arming is a byte-for-byte
+> vendor port; deleting it DIVERGES. (2) **"speed the inner Huffman / window-absent
+> marker decode to win the wall"** — DEAD: FastBootstrap sped it 1.7–1.9× → wall TIE
+> (frozen, N=11); decoder slice ceiling ~14% (`lever-selection-gate.md`). The wall is
+> the **structural/scheduling slice (~86%)**: dispatch, prefetch feeding, in-order
+> consumer, thread-scaling fill-factor. VERDICT instrument is **`fulcrum coz` (causal)**,
+> not biasable `critpath`/`flow --whatif`; gate every lever on a frozen causal run +
+> production-path assertion + ledger check BEFORE coding. See the CORRECTION in
+> `CLAUDE.md` Goal section and the RETRACTION at the top of `wall-progress.md`.
+
 _2026-05-31. The full knowledge body, advisor-audited for completeness. Companions:
 `refreshed-plan.md`, `x86-falsification-ledger.md`, `wall-progress.md`, and the memory notes
 (`project_t8_saturated_pool_diag_2026_05_30`, `project_wall_is_consumer_critical_path`,
