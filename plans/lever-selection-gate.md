@@ -18,12 +18,16 @@ Source instruments + their validity stamp (a claim is only usable if its instrum
 - **Work-stealing driver e44bf0b (VALID, sha-verified):** replacing a wave-barrier with work-stealing lifted clean decode **2065→2654 (+28%)** — a STRUCTURAL/scheduling lever, UN-applied to production. THE biggest gain found all session.
 - **clean-window oracle pre-b757038 (BROKEN — do not use): its "pipeline at parity 2035≈2067" corrupted CLAUDE.md's decision to rescind the structural port.**
 
-## CEILINGS (use these to veto levers)
-| Slice | Max fraction of the gap | ⇒ Levers it can/can't justify |
-|---|---|---|
-| Inner-loop / decoder (markers decode-speed, BMI2, multi-literal, branch-mispredict, distance-LUT) | **~14%** | CANNOT close a 1.5× gap alone. Attack ONLY after the structural slice is exhausted. (We did the opposite.) |
-| Bootstrap MARKER decode rate | bandwidth-bound floor (proven) | DEAD for speed; only volume-reduction could help, and that's 0% reducible (kill-test). |
-| **Structural pipeline: scheduling / load-balance / buffer-lifecycle / work-stealing** | **~86%** | THE slice. Work-stealing already proved +28% here. ATTACK THIS FIRST. |
+## CEILINGS — derive each from a CAUSAL PERTURBATION, never from attribution
+The prior fixed table here ("inner-loop ~14%", "bootstrap marker decode DEAD",
+"structural ~86%") was derived from attribution + the FastBootstrap TIE and is
+FALSIFIED: a frequency-neutral +100% slow-injection of the window-absent bootstrap
+moves the wall ~27-30% (survived disproof, 2026-05-31). Attribution fractions are
+NOT ceilings. A lever's ceiling = the measured wall response to a CAUSAL
+perturbation of its region — slow-injection slope answers "is it on the path";
+the region-REMOVED oracle answers "how much can speeding it win" (the slow-down
+slope does NOT bound the speed-up). Never pre-register a ceiling from a
+busy/latency fraction. See the Measurement PROCESS in CLAUDE.md.
 
 ## PER-LEVER PRE-REGISTRATION TEMPLATE (fill before attacking)
 ```
