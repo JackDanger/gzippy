@@ -747,6 +747,16 @@ fn drive_impl<W: std::io::Write>(
             EARLY_WINDOW_TAIL_NOT_CLEAN.load(Ordering::Relaxed),
             EARLY_WINDOW_RANGE_SPECULATIVE.load(Ordering::Relaxed),
         );
+        // (Design B) Speculative side-slot: did early-published speculative
+        // windows get promoted (accept) off the consumer's serial chain, or
+        // evicted (reject)? High promoted = the serial window-resolution
+        // chain was broken for those chunks (the lever).
+        eprintln!(
+            "  Speculative window slot: spec_published={} promoted={} evicted={}",
+            EARLY_SPEC_PUBLISHED.load(Ordering::Relaxed),
+            EARLY_SPEC_PROMOTED.load(Ordering::Relaxed),
+            EARLY_SPEC_EVICTED.load(Ordering::Relaxed),
+        );
         // V6: Was the boundary search (scoped BlockFinder spawn) needed
         // for most slow-path decodes, or did the first-candidate try
         // win without it? If runs == ok_count, every slow-path needed
@@ -1203,8 +1213,25 @@ fn consumer_loop<W: std::io::Write>(
                 // requires the consumer's confirmed start == max (vendor
                 // chain: chunk_N.end == chunk_{N+1}.start at max).
                 let handoff_at_decode_start = arc.max_acceptable_start_bit == next_block_offset;
+                // (Design B) The chunk's `encoded_end` — preserved by
+                // `set_encoded_offset` through the accept rewrite, so it
+                // equals both the consumer's post-accept `chunk_end_bit`
+                // AND the worker's speculative side-slot key. Used to
+                // promote (accept) / evict (reject) the speculative window.
+                let spec_key = arc.encoded_offset_bits + arc.encoded_size_bits;
                 if arc.matches_encoded_offset(next_block_offset) && handoff_at_decode_start {
                     chunk_arc_from_partition = Some(arc.clone());
+                    // ACCEPT: confirmed_start == max == decode_origin, so
+                    // the worker's speculative key == this chunk's
+                    // accept-time `chunk_end_bit`. Promote (move spec→real)
+                    // synchronously, BEFORE the consumer advances to any
+                    // successor — so no successor can ever resolve against
+                    // an un-promoted window. No-op if the worker skipped
+                    // early-publish (unclean tail); the serial publish at
+                    // ~line 1361 then handles the key.
+                    if window_map.promote_speculative(spec_key) {
+                        EARLY_SPEC_PROMOTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if trace::is_enabled() {
                         trace::emit(
                             "consumer",
@@ -1227,6 +1254,15 @@ fn consumer_loop<W: std::io::Write>(
                     // counted by `prefetch_cache_miss` and means a
                     // scheduling/timing miss, not a metadata mismatch.
                     PREFETCH_REJECT_BY_GUARD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // REJECT: this speculative chunk is discarded and
+                    // re-decoded at the real offset below. Evict its
+                    // speculative window so a stale unconfirmed tail can
+                    // never be promoted later (the re-decode publishes a
+                    // fresh, confirmed window). No-op if the worker skipped
+                    // early-publish for this chunk.
+                    if window_map.evict_speculative(spec_key) {
+                        EARLY_SPEC_EVICTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if trace::is_enabled() {
                         trace::emit(
                             "consumer",
@@ -2008,7 +2044,31 @@ fn run_decode_task(
             } else {
                 EARLY_WINDOW_TAIL_NOT_CLEAN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-        } else {
+        } else if chunk.encoded_size_bits > 0 {
+            // RANGE-SPECULATIVE chunk (`max > encoded`): its end is not yet
+            // authoritative (the consumer may accept or reject the
+            // speculative start). Design B: publish the provably-clean tail
+            // into the SPECULATIVE side-slot so it is INVISIBLE to successor
+            // resolution until the consumer confirms the start. The consumer
+            // promotes it (accept) or evicts it (reject).
+            //
+            // KEY PROOF: on accept the consumer sets `effective_start =
+            // decode_start = max_acceptable_start_bit` and calls
+            // `set_encoded_offset(effective_start)`, which preserves
+            // `encoded_offset_bits + encoded_size_bits`. So the consumer's
+            // `chunk_end_bit` (computed post-rewrite) equals THIS expression
+            // (`chunk.encoded_offset_bits + chunk.encoded_size_bits`,
+            // pre-rewrite) exactly — both equal the chunk's `encoded_end`.
+            // Hence the speculative key matches the consumer's accept-time
+            // key, making `promote_speculative` an identity-key move.
+            // (NOTE: `decode_origin_bit + encoded_size_bits` would be WRONG
+            // — after the partition-seed rewrite `encoded_size_bits` is
+            // measured from `partition_seed`, not from `decode_origin_bit`.)
+            if let Some(tail) = chunk.last_32kib_window_vec() {
+                let key = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+                window_map.insert_speculative_owned_none(key, tail);
+                EARLY_SPEC_PUBLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             EARLY_WINDOW_RANGE_SPECULATIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -2324,6 +2384,20 @@ pub static EARLY_WINDOW_TAIL_NOT_CLEAN: std::sync::atomic::AtomicU64 =
 pub static EARLY_WINDOW_RANGE_SPECULATIVE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// (Design B) Speculative side-slot telemetry.
+/// PUBLISHED: worker published a range-speculative chunk's provably-clean
+/// tail into the speculative side-slot (subset of RANGE_SPECULATIVE that
+/// had a clean tail).
+/// PROMOTED: consumer accepted the speculative chunk and moved its window
+/// into the real map (identity-key move).
+/// EVICTED: consumer rejected the speculative chunk and dropped its
+/// stale window. PUBLISHED should ≈ PROMOTED + EVICTED (+ a small residue
+/// for entries whose chunk the consumer never reached, e.g. EOF).
+pub static EARLY_SPEC_PUBLISHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static EARLY_SPEC_PROMOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static EARLY_SPEC_EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -2463,6 +2537,11 @@ fn try_speculative_decode_candidate(
         }
     }
     let mut chunk = result?;
+    // (Design B) Record the encoded bit the worker decoded byte 0 from.
+    // `decode_chunk_marker_bootstrap_then_isal` anchored the chunk at
+    // `decode_start`, so that is the true origin regardless of the
+    // partition-seed rewrite below.
+    chunk.decode_origin_bit = decode_start;
     // Vendor tryToDecode metadata (GzipChunk.hpp:716-722): encoded =
     // partition seed, max = actual decode start.
     if partition_seed < decode_start {
