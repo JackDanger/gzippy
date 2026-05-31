@@ -83,6 +83,8 @@ pub fn set_output_file(_path: Option<String>) {}
 #[doc(hidden)]
 pub mod compress;
 #[doc(hidden)]
+pub mod coz_probe;
+#[doc(hidden)]
 pub mod decompress;
 #[doc(hidden)]
 pub mod error;

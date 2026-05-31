@@ -2378,6 +2378,10 @@ fn drain_one_pending<W: std::io::Write>(
     // an extra Arc allocation per chunk).
     let _ = cache_key;
     let _ = block_fetcher;
+    // Coz throughput marker: one in-order chunk just left the consumer. Coz
+    // measures a virtual speedup's effect as the change in THIS visit-rate —
+    // the program's true end-to-end throughput. No-op without --features coz.
+    crate::coz_probe::progress("chunk_emitted");
     Ok(())
 }
 

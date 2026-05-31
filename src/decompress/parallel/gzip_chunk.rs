@@ -857,7 +857,16 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     // the `cleanDataCount >= deflate::MAX_WINDOW_SIZE` handoff at
     // L520-525.
     let t_bootstrap = std::time::Instant::now();
-    let mut bootstrap = bootstrap_with_deflate_block(input, encoded_offset_bits, stop_hint_bits)?;
+    let bootstrap_result = {
+        // Coz region: the slow window-absent pure-Rust marker bootstrap. Its
+        // wall-elasticity (does speeding it actually move the wall, per thread
+        // count?) is the measurement that decides whether to hand-carve it
+        // toward ISA-L speed — FastBootstrap's wall-TIE says decode RATE alone
+        // may be overlapped slack, so this is the gate before the ASM work.
+        let _coz = crate::coz_probe::scope("marker_bootstrap");
+        bootstrap_with_deflate_block(input, encoded_offset_bits, stop_hint_bits)
+    };
+    let mut bootstrap = bootstrap_result?;
     let bootstrap_dur_us = t_bootstrap.elapsed().as_micros();
 
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
@@ -906,13 +915,17 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     // `IsalInflateWrapper` path as on-demand decode.
     let bit_offset = bootstrap.end_bit_offset;
     let t_inflate = std::time::Instant::now();
-    let tail = decode_chunk_isal_impl(
-        input,
-        bit_offset,
-        stop_hint_bits,
-        &clean_window,
-        configuration,
-    )?;
+    let tail = {
+        // Coz region: the fast ISA-L clean-window bulk decode (the tail).
+        let _coz = crate::coz_probe::scope("clean_isal");
+        decode_chunk_isal_impl(
+            input,
+            bit_offset,
+            stop_hint_bits,
+            &clean_window,
+            configuration,
+        )
+    }?;
     let inflate_dur_us = t_inflate.elapsed().as_micros();
     let tail_bytes = tail.data.len();
     absorb_isal_tail(&mut chunk, tail);

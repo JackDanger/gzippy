@@ -42,6 +42,12 @@ default = []
 isal = []  # ISA-L decompression (enabled by build.rs when static lib is built)
 isal-compression = ["isal-rs", "arena-allocator"]  # ISA-L + parallel SM chunk arenas
 trace = []  # Enable decode tracing instrumentation
+# Coz causal profiling: wires fulcrum::probe scopes/progress into the
+# parallel-SM decode so `coz run` can measure per-region wall-elasticity
+# (∂wall/∂speed). OFF by default — no fulcrum dep, probes compile to no-ops.
+# Build with `--features pure-rust-inflate,coz` and run the coz_bench example
+# under `coz run`. See examples/coz_bench.rs.
+coz = ["dep:fulcrum", "fulcrum/coz"]
 profile = []  # Enable timing profiler (adds overhead, only use for profiling)
 debug_decode = []  # Log decode operations around DEBUG_POS (e.g., DEBUG_POS=124088477)
 counters = []     # Enable AtomicU64 hot-path counters in bgzf (always on in test builds)
@@ -80,6 +86,10 @@ dynasmrt = ["dep:dynasmrt"]
 route-c-dynasm = ["dynasm", "dynasmrt"]
 
 [dependencies]
+# Causal profiler probes (optional; pulled only under --features coz). Path
+# dep so the same checkout layout works locally and on the perf box
+# (../fulcrum alongside this repo). See the `coz` feature.
+fulcrum = { path = "../fulcrum", optional = true }
 # Compression: flate2 with zlib-ng for maximum performance
 # zlib-ng is a modernized fork with SIMD optimizations (2-3x faster)
 flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
@@ -139,6 +149,10 @@ gzippy-inflate = { path = "crates/gzippy-inflate", features = ["route-c-dynasm"]
 iai-callgrind = "0.13"
 # Phase 1.2 microbench harness.
 criterion = "0.5"
+
+[[example]]
+name = "coz_bench"
+required-features = ["pure-rust-inflate"]
 
 [[bench]]
 name = "inflate_isal_vs_pure_rust"
