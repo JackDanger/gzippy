@@ -26,6 +26,26 @@ Why absolute too, not just ratio: a ratio can fall because **rapidgzip got slowe
 | 05-30 | copy-collapse (reverted) | flat | flat | 1.40× | — | TIE (Δ<spread) |
 | 05-30 | `feat/consumer-postprocess-pump` | flat | flat | 1.39× | in-noise | **TIE** — pump enqueued 0 tasks; premise falsified (stalls are on-demand decode of guard-rejected prefetches, not unpumped post-processing). 2nd TIE in a row ⇒ tripwire fired ⇒ re-localized. |
 
+## 2026-05-31 — FULCRUM HEAD-TO-HEAD (same instrument, both binaries) — lever DECISIVELY localized
+Built `fulcrum flow` (committed fulcrum 6f920a8/8ee27df, 4 tests): per-stage WALL-CRITICAL vs TOTAL-BUSY (gap=slack), SERIAL/STARVED flags, `--whatif`. Then patched rapidgzip to emit the SAME Chrome-trace spans (scripts/rapidgzip_trace_patch, built `/root/gzippy/vendor/rapidgzip/librapidarchive/build-trace`) and ran the SAME tool on BOTH (T8, gzipcli-large 503MB, /dev/null).
+
+**The instrument-consistent signal (both emit `worker.decode_chunk`):**
+- rapidgzip worker decode busy = **1208ms** (8 workers) · wall 188ms
+- gzippy worker decode busy = **2143ms** (8 workers) · wall 306ms
+- ⇒ **gzippy's workers do 1.77× the decode CPU** (wall ratio 1.63× tracks it).
+
+**Window-absent FRACTION is FAITHFUL (not the lever):** rapidgzip's own verbose reports "Replaced marker symbol buffers 31.25%"; gzippy decodes 31.97% window-absent. MATCH. The clean-window ARMING condition is a byte-for-byte port of vendor (deflate.hpp:1282-1284 ↔ deflate_block.rs:781-783), incl. the 64KiB/no-marker-ever clauses — vendor comments the 64KiB is deliberate. So reducing the window-absent fraction would be UNFAITHFUL and is dead.
+
+**THE LEVER (measured, faithful-port-consistent):** gzippy's **window-absent MARKER decode SPEED** — pure-Rust ~160 MB/s (GZIPPY_VERBOSE body_rate) vs rapidgzip's unified decoder doing marker+clean at ~ISA-L class. Authorized by CLAUDE.md (inner Huffman reimplementation). Next cycle: speed the CONTAINS_MARKERS=true path in `read_internal_compressed`/`emit_backref_ring` (deflate_block.rs:1043-1188, 1668-1769) toward the clean ISA-L rate, emitting u16 markers. whatif: 1.6× bootstrap ⇒ −26% wall ≈ parity (Amdahl UPPER bound; advisor flags 209ms is straggler-gated so treat as ceiling not forecast).
+
+**Three intermediate WRONG conclusions this session, each caught by cross-check (the discipline that worked):** (1) decode-bias in my own blame set → phantom; (2) `scan_candidate` umbrella double-counting decode → phantom "block-find 51%"; (3) "reduce the 32% fraction" → killed by rapidgzip's own 31.25% counter. Trust the SAME-instrument head-to-head, not one tool's number.
+
+**Routing:** MIN_PARALLEL_SM_THREADS=0 (committed 4c876a0) — parallel-SM is the path optimized at every T, no libdeflate-one-shot confound at T1-3.
+
+**Measurement gap (next "improve continuously"):** rapidgzip trace patch does NOT instrument consumer waits (no wait/recv spans) — "97% vs 0% consumer-wait" was an artifact, RETRACTED. Fix the patch's `wait.block_fetcher_get` site for a true wait-side head-to-head.
+
+**OPEN:** parity not reached; T1-16 sweep + multi-archive + advisor final sign-off pending the inner-loop port.
+
 ## Convergence axis (replaces the gameable "kill count")
 - Every candidate carries, **on paper before attack**, a `predicted_wall_ceiling ≥ remaining_gap` with its assumed fraction-on-critical-path. A lever that can't clear its own Amdahl bound is dead before it costs a work-stretch. (This would have pre-killed "marker-decode 82%" — it's 28% of WALL, ceiling < the 1.5× gap.)
 - Convergence = the **measured critical-path bound is trending down across rows**, not the kill count.
