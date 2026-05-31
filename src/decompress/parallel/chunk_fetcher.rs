@@ -364,31 +364,39 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
 
     let t = std::time::Instant::now();
     {
-        // Bounded fan-out: waves of `pool_size` so concurrency never exceeds
-        // physical cores (matches the production pool for a fair ceiling).
-        let mut idx = 0usize;
-        while idx < n_spans {
-            let wave_end = (idx + pool_size).min(n_spans);
-            std::thread::scope(|scope| {
-                for (i, slot) in results[idx..wave_end].iter_mut().enumerate() {
-                    let span_idx = idx + i;
+        // Atomic-index work queue (NO wave barriers): spawn `pool_size`
+        // persistent workers that each pull the next span from a shared counter
+        // and decode it. The previous wave-of-pool_size design serialized on a
+        // per-wave join — a single straggler stalled the whole wave, giving only
+        // ~1.2× effective parallelism and making this oracle's wall dispatch-
+        // limited rather than decode-limited. A pull queue keeps every worker
+        // busy to the end, isolating the true clean-parallel decode ceiling.
+        // The brief mutex is held only to store a finished result, never during
+        // decode, so it adds no decode contention.
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+        let next = AtomicUsize::new(0);
+        let results_mtx = std::sync::Mutex::new(&mut results);
+        std::thread::scope(|scope| {
+            for _ in 0..pool_size {
+                scope.spawn(|| loop {
+                    let span_idx = next.fetch_add(1, AOrd::Relaxed);
+                    if span_idx >= n_spans {
+                        break;
+                    }
                     let start_bit = starts[span_idx];
                     let stop_hint = starts.get(span_idx + 1).copied().unwrap_or(total_bits);
                     let dict: &[u8] = &dicts[span_idx];
-                    scope.spawn(move || {
-                        let r = crate::decompress::parallel::gzip_chunk::decode_chunk_isal(
-                            input,
-                            start_bit,
-                            stop_hint,
-                            dict,
-                            configuration,
-                        );
-                        *slot = Some(r);
-                    });
-                }
-            });
-            idx = wave_end;
-        }
+                    let r = crate::decompress::parallel::gzip_chunk::decode_chunk_isal(
+                        input,
+                        start_bit,
+                        stop_hint,
+                        dict,
+                        configuration,
+                    );
+                    results_mtx.lock().unwrap()[span_idx] = Some(r);
+                });
+            }
+        });
     }
 
     // In-order write + CRC fold (mirror of the consumer's clean branch).
