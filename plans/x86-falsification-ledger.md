@@ -45,12 +45,23 @@ the BOOTSTRAP marker decoder**: ~8-10 chunks run wholly through the slow pure-Ru
 COMPUTE-bound (see retracted row). So the gap is ONE thing, gated YES (it's ~the whole gap), and the
 decoder slice that's DEAD is the CLEAN inner loop — NOT the bootstrap decoder.
 
-## THE OPEN LEVER (Amdahl-gated YES — it is ~the whole remaining gap)
-**Bootstrap-decoder UNIFICATION (CLAUDE.md's canonical lever):** route window-absent (bootstrap) decode
-through the FAST clean pure-Rust decoder with marker emission, delete `deflate_block`. The clean decoder
-proves a 2-6×-faster pure-Rust decode exists; the open question (resolve by building/measuring, NOT
-assuming): does the u16 marker store cap the gain (partial a0f2ce23 bandwidth concern) or does the better
-access pattern reach near-clean rate? CHEAP-DISCRIMINATOR FIRST before the full port.
+## BOOTSTRAP DECODE-RATE = WALL-DEAD (agent a10edf55, RESOLVED — discipline worked)
+Built FastBootstrap (clean libdeflate-style u16 hot loop, flat buffer): discriminator PASS = **1.72-1.89×
+faster decode than deflate_block, byte-identical** (u16 store does NOT cap — a0f2ce23 falsified; deflate_block
+slow = 128KiB ring + per-symbol single-slot writes + backward-scan + drain + Vec::push). BUT production WALL
+A/B (measure.sh N=11, 4 rounds, 3 host-frozen) = **TIE (1.04-1.10×, in noise)**: the bootstrap decode is
+PIPELINE-OVERLAPPED — speeding it removes worker-thread slack but does NOT shorten the in-order CONSUMER
+critical path. **This FALSIFIES "the entire gap is the bootstrap decoder" (a1e4b175 mis-localized).** Decode
+RATE (bootstrap + clean inner) is now wall-DEAD entirely. Landed default-OFF behind GZIPPY_FAST_BOOTSTRAP
+(deflate_block kept), branch bootstrap-u16-discriminator @5514453, NOT merged (a correct simplification to keep).
+
+## THE OPEN LEVER (Amdahl-gated YES) — STRUCTURAL CONSUMER / PIPELINE, the ~86% slice
+The gap is the in-order CONSUMER's serial critical path (window-dependency resolution chain: resolve chunk N-1's
+markers → publish N's window → process N — a serial LATENCY chain the worker decode can't shorten) + buffer-
+lifecycle. Clean-import (free windows, no chain) = 4577 = 2.1× rapidgzip; production (with the chain) = 1244-1684.
+The lever is to make gzippy's consumer/window-resolution as lean as rapidgzip's (faithful structural port — the
+thing CLAUDE.md wrongly rescinded on the broken-oracle "pipeline at parity"). ANALYZE via CONSUMER CRITICAL-PATH /
+dependency-graph (trace_v2 + timeline_analyze), NOT decode asm (wall-dead). Pin the serial bottleneck before porting.
 
 ## OPEN / lower-priority
 - Single-member-T2: same low-thread bootstrap; lowering T≥4 gate REGRESSES (tested).
