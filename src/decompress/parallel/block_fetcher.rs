@@ -561,6 +561,18 @@ where
         self.prefetching.lock().unwrap().keys().cloned().collect()
     }
 
+    /// Snapshot of `(key, value)` pairs in the prefetch cache, sorted by
+    /// key. Does NOT touch LRU/stats and does NOT evict — the consumer's
+    /// later `get_if_available` still finds the entries. Mirror of
+    /// vendor's `prefetchCache().contents()` consumed by
+    /// `queuePrefetchedChunkPostProcessing` (GzipChunkFetcher.hpp:524-528).
+    #[cfg_attr(not(parallel_sm), allow(dead_code))]
+    pub fn prefetch_cache_contents_sorted(&self) -> Vec<(Key, Value)> {
+        let mut v = self.prefetch_cache.lock().unwrap().contents_snapshot();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
     /// Vendor's `m_parallelization` cap on simultaneous prefetches
     /// (BlockFetcher.hpp:467: `m_threadPool.capacity()`).
     #[allow(dead_code)] // vendor parity or unit-test surface

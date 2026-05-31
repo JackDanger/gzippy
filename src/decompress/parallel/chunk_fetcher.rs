@@ -661,6 +661,15 @@ fn drive_impl<W: std::io::Write>(
             "  Unsplit blocks emplaced: {}",
             UNSPLIT_BLOCKS_EMPLACED.load(Ordering::Relaxed)
         );
+        eprintln!(
+            "  Eager post-process: runs={} runs_nonempty={} inspected={} submitted={} max/run={} reused={}",
+            EAGER_PROBE_RUNS.load(Ordering::Relaxed),
+            EAGER_PROBE_RUNS_NONEMPTY.load(Ordering::Relaxed),
+            EAGER_PROBE_INSPECTED.load(Ordering::Relaxed),
+            EAGER_PROBE_SUBMITTED.load(Ordering::Relaxed),
+            EAGER_PROBE_MAX_PER_RUN.load(Ordering::Relaxed),
+            EAGER_PROBE_REUSED.load(Ordering::Relaxed),
+        );
         use crate::decompress::parallel::chunk_buffer_pool::*;
         eprintln!(
             "  Max concurrently-live ChunkData (in-flight depth): {}  (live now: {})",
@@ -896,6 +905,15 @@ fn consumer_loop<W: std::io::Write>(
         std::collections::VecDeque::with_capacity(pool_size * 2);
     let post_process_inflight_cap = pool_size;
 
+    // Eager post-process probe state (GZIPPY_EAGER_POSTPROC=1). Maps a
+    // chunk's real encoded_offset_bits → an in-flight apply_window
+    // receiver submitted eagerly during a stall. The consumer reuses the
+    // receiver when it reaches that offset (see dispatch site below).
+    // Default OFF so it's a clean A/B against the in-order baseline.
+    let eager_enabled = eager_postproc_enabled();
+    let mut eager_submitted: std::collections::HashMap<usize, (usize, mpsc::Receiver<ChunkData>)> =
+        std::collections::HashMap::new();
+
     // The vendor's `processNextChunk` returns one chunk per call; the
     // caller loops in `ParallelGzipReader::read`. We inline that loop
     // here so the local-state mutation (post-process queue + writer +
@@ -918,6 +936,25 @@ fn consumer_loop<W: std::io::Write>(
             block_fetcher.process_ready_prefetches();
         }
         prefetch_us_sum += t_prefetch.elapsed().as_micros();
+
+        // Eager post-process probe (GZIPPY_EAGER_POSTPROC=1). The vendor
+        // calls `queuePrefetchedChunkPostProcessing` *during* the marker-
+        // replace wait (the `has_predecessor` spin below). Empirically
+        // that spin almost never iterates in gzippy (`has_predecessor` is
+        // a range-at-or-before check that stays true after chunk 0), so
+        // we ALSO run the probe once per consumer iteration here — at the
+        // top, before the head fetch that may block — so the counters
+        // measure whether ready prefetched successors EVER exist at the
+        // moments the consumer could overlap their post-processing. Reuse
+        // is window-key-validated downstream, so output stays identical.
+        if eager_enabled {
+            eager_postprocess_prefetched(
+                block_fetcher,
+                window_map,
+                thread_pool,
+                &mut eager_submitted,
+            );
+        }
 
         // Vendor GzipChunkFetcher.hpp:318 — `m_blockFinder->get(m_nextUnprocessedBlockIndex)`.
         let t_finder = std::time::Instant::now();
@@ -1262,6 +1299,11 @@ fn consumer_loop<W: std::io::Write>(
             }
         };
 
+        // Real offset the eager probe would have keyed this chunk under
+        // (its `encoded_offset_bits` BEFORE set_encoded_offset rewrites
+        // it). Used to reuse an eager-submitted post-process below.
+        let chunk_offset_pre_set = chunk.encoded_offset_bits;
+
         // Vendor GzipChunkFetcher.hpp:349 —
         //   `chunkData->setEncodedOffset(*nextBlockOffset);`
         // When we resumed from furthest_decoded_bit because the spacing
@@ -1290,6 +1332,10 @@ fn consumer_loop<W: std::io::Write>(
         // consumer in `drain_one_pending` after post-process returns.
         #[allow(clippy::needless_late_init)] // assigned in two long branches below
         let predecessor_window_for_postprocess: Option<Window>;
+        // Predecessor-window key the consumer resolved against (marker
+        // branch only). Used to validate an eager-submitted result is
+        // byte-identical before reusing it.
+        let mut consumer_pred_key: Option<usize> = None;
         if chunk.data_with_markers.is_empty() {
             // No markers → apply_window is a no-op. Publish successor window
             // on the consumer only (vendor queueChunkForPostProcessing:558-575).
@@ -1336,6 +1382,18 @@ fn consumer_loop<W: std::io::Write>(
             {
                 let _tv2 = trace_v2::SpanGuard::begin("consumer.wait_replaced_markers");
                 while !window_map.has_predecessor(chunk.encoded_offset_bits) {
+                    // Vendor GzipChunkFetcher.hpp:513 — during the
+                    // marker-replace wait, queue post-processing for any
+                    // prefetched successor whose window is now available.
+                    // Gated probe; default OFF for a clean A/B.
+                    if eager_enabled {
+                        eager_postprocess_prefetched(
+                            block_fetcher,
+                            window_map,
+                            thread_pool,
+                            &mut eager_submitted,
+                        );
+                    }
                     if pending.is_empty() {
                         break;
                     }
@@ -1356,7 +1414,7 @@ fn consumer_loop<W: std::io::Write>(
                     requested: chunk.encoded_offset_bits,
                     actual: furthest_decoded_bit,
                 }))?;
-            let _ = pred_key;
+            consumer_pred_key = Some(pred_key);
             // Vendor `GzipChunkFetcher.hpp:341`: `sharedLastWindow->
             // decompress()` materializes the bytes once. For
             // CompressionType::None this is a zero-alloc slice borrow.
@@ -1450,12 +1508,45 @@ fn consumer_loop<W: std::io::Write>(
             let _tv2 = trace_v2::SpanGuard::begin("consumer.dispatch_post_process");
             match predecessor_window_for_postprocess {
                 Some(window) => {
-                    let rx = submit_post_process_to_pool(
-                        thread_pool,
-                        chunk,
-                        window,
-                        partition_idx_for_trace,
-                    );
+                    // Reuse an eager-submitted apply_window result if one
+                    // exists for this chunk AND it resolved against the
+                    // SAME predecessor window (byte-identity guard). The
+                    // eager probe keyed on the chunk's pre-set offset;
+                    // post-processing the same chunk+window earlier vs.
+                    // now yields identical bytes.
+                    let reuse = if eager_enabled {
+                        use std::sync::atomic::Ordering;
+                        match eager_submitted.remove(&chunk_offset_pre_set) {
+                            Some((eager_pred_key, eager_rx))
+                                if consumer_pred_key == Some(eager_pred_key) =>
+                            {
+                                EAGER_PROBE_REUSED.fetch_add(1, Ordering::Relaxed);
+                                Some(eager_rx)
+                            }
+                            Some(_) => {
+                                // Found, but it resolved against a
+                                // different predecessor window → rejecting
+                                // is mandatory for byte-identity.
+                                EAGER_PROBE_REUSE_PRED_MISMATCH.fetch_add(1, Ordering::Relaxed);
+                                None
+                            }
+                            None => {
+                                EAGER_PROBE_REUSE_KEY_ABSENT.fetch_add(1, Ordering::Relaxed);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let rx = match reuse {
+                        Some(eager_rx) => eager_rx,
+                        None => submit_post_process_to_pool(
+                            thread_pool,
+                            chunk,
+                            window,
+                            partition_idx_for_trace,
+                        ),
+                    };
                     pending.push_back(PendingWrite::Async {
                         idx: partition_idx_for_trace,
                         rx,
@@ -1511,6 +1602,41 @@ fn consumer_loop<W: std::io::Write>(
                 r#""iters":{iter_count},"iter_sum_us":{iter_us_sum},"prefetch_us":{prefetch_us_sum},"finder_us":{finder_us_sum},"fetcher_get_us":{fetcher_get_us_sum}"#,
             ),
         );
+    }
+
+    // Eager post-process probe report — the deliverable. Always printed
+    // to stderr when the probe is enabled so an A/B run records whether
+    // the lever actually fired. If `submitted ≈ 0`, the prefetch cache is
+    // empty during the stall and the real lever is prefetch DEPTH, not
+    // post-process eagerness.
+    if eager_enabled {
+        use std::sync::atomic::Ordering;
+        let runs = EAGER_PROBE_RUNS.load(Ordering::Relaxed);
+        let inspected = EAGER_PROBE_INSPECTED.load(Ordering::Relaxed);
+        let submitted = EAGER_PROBE_SUBMITTED.load(Ordering::Relaxed);
+        let nonempty = EAGER_PROBE_RUNS_NONEMPTY.load(Ordering::Relaxed);
+        let max_per_run = EAGER_PROBE_MAX_PER_RUN.load(Ordering::Relaxed);
+        let reused = EAGER_PROBE_REUSED.load(Ordering::Relaxed);
+        let avg_inspected = if runs > 0 {
+            inspected as f64 / runs as f64
+        } else {
+            0.0
+        };
+        let key_absent = EAGER_PROBE_REUSE_KEY_ABSENT.load(Ordering::Relaxed);
+        let pred_mismatch = EAGER_PROBE_REUSE_PRED_MISMATCH.load(Ordering::Relaxed);
+        eprintln!(
+            "[gzippy EAGER_POSTPROC] probe_runs={runs} runs_with_ready_successor={nonempty} \
+             cache_chunks_inspected={inspected} (avg {avg_inspected:.2}/run) \
+             eager_submitted={submitted} max_per_run={max_per_run} reused_by_consumer={reused} \
+             reuse_miss[key_absent={key_absent} pred_mismatch={pred_mismatch}]"
+        );
+        if submitted == 0 {
+            eprintln!(
+                "[gzippy EAGER_POSTPROC] KEY FINDING: 0 ready successors during stalls — \
+                 the prefetch cache holds no post-processable successor whose predecessor \
+                 window is published. The lever is prefetch DEPTH, not post-process eagerness."
+            );
+        }
     }
 
     Ok(())
@@ -1600,6 +1726,100 @@ fn submit_decode_to_pool(
 /// GzipChunkFetcher.hpp:579 (which forwards to
 /// `m_threadPool.submit(task, /* priority */ -1)` at
 /// BlockFetcher.hpp:606-611).
+/// Eager post-process probe — gated port of vendor's
+/// `queuePrefetchedChunkPostProcessing` (GzipChunkFetcher.hpp:520-551).
+///
+/// Called during the consumer's stall (the `while !has_predecessor` wait
+/// in `drive_impl`). Walks the prefetch cache contents in offset order
+/// and, for each prefetched SUCCESSOR chunk whose predecessor window is
+/// already published, submits its `apply_window` post-processing to the
+/// pool NOW instead of waiting for the consumer to reach it in order.
+///
+/// Structural note vs. vendor: rapidgzip mutates the shared
+/// `ChunkData` in place (shared_ptr), so the consumer later picks up the
+/// already-resolved chunk. gzippy's post-process CONSUMES a `ChunkData`
+/// (moves it into the pool task). To stay byte-identical AND not perturb
+/// the consumer's fetch/ordering, we eager-post-process a CLONE of the
+/// cached chunk and stash the resulting receiver in `eager_submitted`,
+/// keyed by the chunk's real `encoded_offset_bits`. The original Arc
+/// stays in the prefetch cache so the consumer's `get_if_available`
+/// still hits. When the consumer later reaches that offset it REUSES the
+/// stashed receiver (see the dispatch site in `drive_impl`) instead of
+/// re-submitting — so the apply_window runs exactly once and the bytes
+/// are identical regardless of WHEN it ran.
+///
+/// Returns the number of eager tasks submitted in this run.
+#[cfg(parallel_sm)]
+#[allow(clippy::too_many_arguments)]
+fn eager_postprocess_prefetched(
+    block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
+    window_map: &WindowMap,
+    thread_pool: &Arc<ThreadPool>,
+    eager_submitted: &mut std::collections::HashMap<usize, (usize, mpsc::Receiver<ChunkData>)>,
+) -> usize {
+    use std::sync::atomic::Ordering;
+    let _tv2 = trace_v2::SpanGuard::begin("consumer.eager_postproc");
+    EAGER_PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
+
+    // Vendor BlockFetcher.hpp:280 — drain ready in-flight prefetches into
+    // the prefetch cache first so `contents()` sees them.
+    block_fetcher.process_ready_prefetches();
+
+    // Vendor GzipChunkFetcher.hpp:524-528 — `prefetchCache().contents()`,
+    // sorted by offset. Non-evicting snapshot: the consumer still finds
+    // these entries on its own fetch.
+    let contents = block_fetcher.prefetch_cache_contents_sorted();
+    EAGER_PROBE_INSPECTED.fetch_add(contents.len() as u64, Ordering::Relaxed);
+
+    let mut submitted_this_run = 0usize;
+    for (_partition_key, arc) in contents {
+        let real_offset = arc.encoded_offset_bits;
+
+        // Vendor :533 — skip blocks already enqueued for marker
+        // replacement (here: already eager-submitted by a prior probe).
+        if eager_submitted.contains_key(&real_offset) {
+            continue;
+        }
+
+        // Vendor :539 — skip blocks that have no markers to resolve.
+        // apply_window is a no-op for a clean chunk; the consumer handles
+        // it on the cheap `PendingWrite::Ready` path. (Vendor's
+        // `hasBeenPostProcessed()` is the analogous "nothing to do" gate.)
+        if arc.data_with_markers.is_empty() {
+            continue;
+        }
+
+        // Vendor :544-547 — require the predecessor window. Use the same
+        // range-at-or-before lookup the consumer's own dispatch uses
+        // (`get_predecessor`, drive_impl marker branch) so the eager
+        // apply_window resolves against exactly the window the in-order
+        // path would have used → byte-identical.
+        let (pred_key, predecessor_window) = match window_map.get_predecessor(real_offset) {
+            Some((k, w)) => (k, w),
+            None => continue,
+        };
+
+        // Vendor :549 — submit apply_window. Operate on a CLONE so the
+        // cached Arc is untouched and the consumer's fetch still hits.
+        // Record `pred_key` so the consumer can verify it would resolve
+        // against the SAME predecessor window before reusing this result
+        // (byte-identity guard for the speculative/overshoot case where
+        // the consumer rewrites the chunk's start offset).
+        let chunk_clone: ChunkData = (*arc).clone();
+        let rx =
+            submit_post_process_to_pool(thread_pool, chunk_clone, predecessor_window, real_offset);
+        eager_submitted.insert(real_offset, (pred_key, rx));
+        submitted_this_run += 1;
+    }
+
+    EAGER_PROBE_SUBMITTED.fetch_add(submitted_this_run as u64, Ordering::Relaxed);
+    if submitted_this_run > 0 {
+        EAGER_PROBE_RUNS_NONEMPTY.fetch_add(1, Ordering::Relaxed);
+        EAGER_PROBE_MAX_PER_RUN.fetch_max(submitted_this_run as u64, Ordering::Relaxed);
+    }
+    submitted_this_run
+}
+
 #[cfg(parallel_sm)]
 fn submit_post_process_to_pool(
     thread_pool: &Arc<ThreadPool>,
@@ -2038,6 +2258,65 @@ pub static POST_PROCESS_SMALL_MARKERS_PATH: std::sync::atomic::AtomicU64 =
 pub static ARC_TRY_UNWRAP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ARC_TRY_UNWRAP_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+// ── Eager post-process probe (GZIPPY_EAGER_POSTPROC=1) ────────────────────
+// Port of rapidgzip's `queuePrefetchedChunkPostProcessing`
+// (GzipChunkFetcher.hpp:520-551): during a consumer stall, submit
+// apply_window for prefetched SUCCESSOR chunks whose predecessor window
+// is already published, instead of waiting to reach them in order.
+//
+// These counters are the deliverable: a prior pump attempt TIED because
+// it found 0 ready successors. We MUST distinguish "the lever works"
+// (many eager submits) from "the cache is empty during the stall" (the
+// real lever is prefetch DEPTH, not eagerness).
+/// How many times the eager probe ran (once per stall iteration where it
+/// was invoked).
+pub static EAGER_PROBE_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Total prefetched-cache chunks the probe inspected across all runs.
+pub static EAGER_PROBE_INSPECTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Total eager post-process tasks the probe actually submitted (ready
+/// successors: had markers + a published predecessor window + not yet
+/// submitted). This is THE number that tells us whether the lever fires.
+pub static EAGER_PROBE_SUBMITTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Probe runs that submitted at least one eager task (so we can report
+/// "N of M stalls found ready successors").
+pub static EAGER_PROBE_RUNS_NONEMPTY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Max ready successors found in a single probe run (per-stall peak).
+pub static EAGER_PROBE_MAX_PER_RUN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Eager-submitted results the consumer actually reused (vs. submitted
+/// but never consumed — e.g. evicted before the consumer reached them).
+pub static EAGER_PROBE_REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Consumer reached a markered chunk but found NO eager entry under its
+/// pre-set offset key (the eager probe keyed it differently, or it was
+/// never eagerly submitted).
+pub static EAGER_PROBE_REUSE_KEY_ABSENT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Consumer found an eager entry but its predecessor-window key did not
+/// match the consumer's (would have changed bytes — correctly rejected).
+pub static EAGER_PROBE_REUSE_PRED_MISMATCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// True iff `GZIPPY_EAGER_POSTPROC=1`. Read once and cached.
+#[cfg(parallel_sm)]
+fn eager_postproc_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHED: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=off, 2=on
+    match CACHED.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var_os("GZIPPY_EAGER_POSTPROC")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
 
 /// Speculative slow-path decode without a predecessor window. Must use
 /// marker bootstrap — plain ISA-L with an empty dict resolves unknown
