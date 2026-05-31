@@ -94,3 +94,15 @@ Most powerful measurement built (awaited-chunk latency, ttp.rx_recv_block now ca
 **coz BLOCKED in this LXC:** 2 attempts (non-end-to-end n_exp=0; end-to-end → only startup/runtime, no experiments) — coz needs perf-event PC sampling, restricted in the container. The standard causal tool does not function here.
 **Indisputable causal test that DOES work here:** deterministic slow-injection A/B (env-gated delay ∝ bootstrap's own time; measure interleaved wall delta). 2×-slower-bootstrap → ~0 wall delta ⇒ bootstrap conclusively wall-dead. NEXT.
 **Implication:** parity is unlikely from bottleneck-hunting; the structure (speculate-then-resolve) is the suspected cause. The decisive experiment is the known-window SINGLE-DECODE oracle (advisor) — also the stated vision (unify bootstrap+marker decode, decode once). Build that.
+
+## 2026-05-31 — ★ CAUSAL BREAKTHROUGH (slow-injection, indisputable): bootstrap IS the lever
+coz is blocked in-container, so used a DIRECT causal perturbation: GZIPPY_SLOW_BOOTSTRAP=N spins N% of the bootstrap's own time (byte-identical pure delay). Frozen, interleaved, sha-verified, T8:
+| bootstrap slowdown | wall | Δwall |
+|---|---|---|
+| +0% | 0.345s | — |
+| +50% | 0.378s | +9% |
+| +100% | 0.447s | +30% |
+| +200% | 0.543s | +57% |
+Monotonic & proportional ⇒ the window-absent bootstrap CAUSALLY gates ~30% of the wall (slope ~0.3× wall per 1× bootstrap-time). This is a direct perturbation of EXACTLY the bootstrap — not biasable attribution — so it is indisputable.
+**OVERTURNS the 5-TIE "decode is wall-dead" doctrine.** The prior TIEs (FastBootstrap, backward-scan-skip) were too-small/unrealized bootstrap speedups (few-% change invisible under the 10% noise floor); a 50-200% perturbation is unmistakable. Direct causal test > indirect optimization A/Bs.
+**LEVER (causally confirmed, not a phantom):** speed the window-absent bootstrap Huffman decode (pure-Rust ~160 MB/s → rapidgzip-class). Predicted ~1.7× faster ⇒ ~-15-20% wall ⇒ most of the T8 gap. This IS the inner-Huffman reimplementation (hand-tuned Rust, drop the slow path) — the stated vision. Method that worked: when coz is unavailable, slow-inject a region proportional to its own time and measure interleaved wall response (linearity = causality).
