@@ -1716,16 +1716,20 @@ unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
     } else if distance == 1 {
         // RLE: repeat the last element. Vendor's clean-mode path
         // (`!containsMarkerBytes && nToCopyPerRepeat == 1`) at
-        // deflate.hpp:1393-1398 uses `std::memset` — a SIMD
-        // broadcast. The marker-mode path falls through to the
-        // general overlap loop. We mirror both:
-        //   * `!CONTAINS_MARKERS && dst fits without wrap` →
-        //     `slice::fill` (Rust's idiomatic memset, lowers to
-        //     `vpbroadcastw` + aligned-store on AVX2).
-        //   * Otherwise (marker mode, OR clean-mode wrap-straddle)
-        //     → element-by-element loop with `% RING_SIZE`.
+        // deflate.hpp:1393-1398 uses `std::memset` — a SIMD broadcast.
+        //   * dst fits without wrap → `slice::fill` (Rust's idiomatic
+        //     memset, lowers to `vpbroadcastw` + aligned-store on AVX2).
+        //   * wrap-straddle → element-by-element loop with `% RING_SIZE`.
+        // The fill is now used in MARKER MODE TOO (was gated on
+        // `!CONTAINS_MARKERS`): it writes the identical `v` `length` times
+        // either way — byte-for-byte the same ring contents — and the shared
+        // backward marker-scan below still recomputes `distance_marker` from
+        // those bytes, so the counter is unchanged. This was the largest
+        // single avoidable slowdown on the window-absent path (RLE runs are
+        // common; the slow element loop was paid only because the chunk hadn't
+        // armed a clean window yet). [2026-05-31, fulcrum head-to-head lever]
         let v = *ring_ptr.add((*pos + RING_SIZE - 1) % RING_SIZE);
-        if !CONTAINS_MARKERS && dst_phys + length <= RING_SIZE {
+        if dst_phys + length <= RING_SIZE {
             let dst = std::slice::from_raw_parts_mut(ring_ptr.add(dst_phys), length);
             dst.fill(v);
         } else {
