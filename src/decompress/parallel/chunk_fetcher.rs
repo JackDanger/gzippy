@@ -594,6 +594,9 @@ fn drive_impl<W: std::io::Write>(
     // from `~GzipChunkFetcher` before member destruction (line 686).
     thread_pool.stop();
 
+    // Report replay stats even on a (CRC) error so the bypass experiment
+    // can see hit/miss counts when the run aborts.
+    crate::decompress::parallel::decode_bypass::report_replay_stats();
     consumer_result?;
 
     if trace::is_enabled() {

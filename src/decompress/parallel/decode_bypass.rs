@@ -373,8 +373,33 @@ pub fn replay(
     stop_hint_bit: usize,
     configuration: ChunkConfiguration,
 ) -> Option<ChunkData> {
-    let c = replay_map().get(&(start_bit, stop_hint_bit))?;
-    Some(c.to_chunk_data(configuration, force_clean()))
+    use std::sync::atomic::Ordering;
+    match replay_map().get(&(start_bit, stop_hint_bit)) {
+        Some(c) => {
+            REPLAY_HITS.fetch_add(1, Ordering::Relaxed);
+            Some(c.to_chunk_data(configuration, force_clean()))
+        }
+        None => {
+            REPLAY_MISSES.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+pub static REPLAY_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static REPLAY_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Print replay hit/miss counters (called at drive end when replay on).
+pub fn report_replay_stats() {
+    use std::sync::atomic::Ordering;
+    if !replay_enabled() {
+        return;
+    }
+    eprintln!(
+        "BYPASS_DECODE replay: hits={} misses={} (misses fall back to real decode)",
+        REPLAY_HITS.load(Ordering::Relaxed),
+        REPLAY_MISSES.load(Ordering::Relaxed),
+    );
 }
 
 // ── Serialization helpers ─────────────────────────────────────────────
