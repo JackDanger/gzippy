@@ -239,7 +239,15 @@ where
             let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin("ttp.take_prefetch");
             self.take_prefetch(block_offset)?
         };
-        let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin("ttp.rx_recv_block");
+        // Record the AWAITED chunk's encoded offset so the consumer wait can be
+        // decomposed (Fulcrum) against that exact chunk's decode span — robust
+        // keyed correlation, not overlap-heuristic blame. This is THE wait that
+        // gates the in-order wall (~97% of it), so knowing which chunk it waits
+        // on, and what that chunk was doing, is the indisputable measurement.
+        let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
+            "ttp.rx_recv_block",
+            &format!(r#""awaited_offset":{block_offset}"#),
+        );
         // Lever H: pump prefetch on 1ms ticks while waiting (vendor
         // BlockFetcher.hpp:314-316). Keeps the prefetch horizon
         // advancing so by the time chunk N arrives, chunks N+1..N+k
