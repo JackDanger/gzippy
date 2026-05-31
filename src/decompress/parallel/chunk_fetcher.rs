@@ -932,8 +932,7 @@ fn consumer_loop<W: std::io::Write>(
     // receiver when it reaches that offset (see dispatch site below).
     // Default OFF so it's a clean A/B against the in-order baseline.
     let eager_enabled = eager_postproc_enabled();
-    let mut eager_submitted: std::collections::HashMap<usize, (usize, mpsc::Receiver<ChunkData>)> =
-        std::collections::HashMap::new();
+    let mut eager_submitted: EagerSubmitted = std::collections::HashMap::new();
 
     // The vendor's `processNextChunk` returns one chunk per call; the
     // caller loops in `ParallelGzipReader::read`. We inline that loop
@@ -957,25 +956,6 @@ fn consumer_loop<W: std::io::Write>(
             block_fetcher.process_ready_prefetches();
         }
         prefetch_us_sum += t_prefetch.elapsed().as_micros();
-
-        // Eager post-process probe (GZIPPY_EAGER_POSTPROC=1). The vendor
-        // calls `queuePrefetchedChunkPostProcessing` *during* the marker-
-        // replace wait (the `has_predecessor` spin below). Empirically
-        // that spin almost never iterates in gzippy (`has_predecessor` is
-        // a range-at-or-before check that stays true after chunk 0), so
-        // we ALSO run the probe once per consumer iteration here — at the
-        // top, before the head fetch that may block — so the counters
-        // measure whether ready prefetched successors EVER exist at the
-        // moments the consumer could overlap their post-processing. Reuse
-        // is window-key-validated downstream, so output stays identical.
-        if eager_enabled {
-            eager_postprocess_prefetched(
-                block_fetcher,
-                window_map,
-                thread_pool,
-                &mut eager_submitted,
-            );
-        }
 
         // Vendor GzipChunkFetcher.hpp:318 — `m_blockFinder->get(m_nextUnprocessedBlockIndex)`.
         let t_finder = std::time::Instant::now();
@@ -1298,6 +1278,21 @@ fn consumer_loop<W: std::io::Write>(
         let chunk_arc = match chunk_arc_from_partition {
             Some(arc) => arc,
             None => {
+                // The head chunk is NOT in the prefetch cache → the
+                // consumer is about to BLOCK on its decode (the
+                // `wait.block_fetcher_get` span, the other real serial wait
+                // besides `wait.future_recv`). Vendor's
+                // `queuePrefetchedChunkPostProcessing` overlaps post-process
+                // of ready successors with exactly this kind of stall —
+                // submit it NOW so it runs on the pool while we block.
+                if eager_enabled {
+                    eager_postprocess_prefetched(
+                        block_fetcher,
+                        window_map,
+                        thread_pool,
+                        &mut eager_submitted,
+                    );
+                }
                 let t_fg = std::time::Instant::now();
                 let _tv2 = trace_v2::SpanGuard::begin_with(
                     "wait.block_fetcher_get",
@@ -1429,21 +1424,15 @@ fn consumer_loop<W: std::io::Write>(
             {
                 let _tv2 = trace_v2::SpanGuard::begin("consumer.wait_replaced_markers");
                 while !window_map.has_predecessor(chunk.encoded_offset_bits) {
-                    // Vendor GzipChunkFetcher.hpp:513 — during the
-                    // marker-replace wait, queue post-processing for any
-                    // prefetched successor whose window is now available.
-                    // Gated probe; default OFF for a clean A/B.
-                    if eager_enabled {
-                        eager_postprocess_prefetched(
-                            block_fetcher,
-                            window_map,
-                            thread_pool,
-                            &mut eager_submitted,
-                        );
-                    }
                     if pending.is_empty() {
                         break;
                     }
+                    // Vendor GzipChunkFetcher.hpp:513 — `drain_one_pending`
+                    // queues successor post-processing during its
+                    // `wait.future_recv` block (see `eager_ctx`). This spin
+                    // is empirically near-0× (has_predecessor stays true
+                    // after chunk 0), but keep the eager hook wired through
+                    // for the rare overshoot case.
                     drain_one_pending(
                         &mut pending,
                         window_map,
@@ -1451,6 +1440,11 @@ fn consumer_loop<W: std::io::Write>(
                         total_crc,
                         total_size,
                         block_fetcher,
+                        if eager_enabled {
+                            Some((thread_pool, &mut eager_submitted))
+                        } else {
+                            None
+                        },
                     )?;
                 }
             }
@@ -1622,6 +1616,11 @@ fn consumer_loop<W: std::io::Write>(
                 total_crc,
                 total_size,
                 block_fetcher,
+                if eager_enabled {
+                    Some((thread_pool, &mut eager_submitted))
+                } else {
+                    None
+                },
             )?;
         }
         iter_us_sum += t_iter.elapsed().as_micros();
@@ -1637,6 +1636,11 @@ fn consumer_loop<W: std::io::Write>(
             total_crc,
             total_size,
             block_fetcher,
+            if eager_enabled {
+                Some((thread_pool, &mut eager_submitted))
+            } else {
+                None
+            },
         )?;
     }
     let _ = submit_us_sum; // reserved for future submit-only timing
@@ -1802,7 +1806,7 @@ fn eager_postprocess_prefetched(
     block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
     window_map: &WindowMap,
     thread_pool: &Arc<ThreadPool>,
-    eager_submitted: &mut std::collections::HashMap<usize, (usize, mpsc::Receiver<ChunkData>)>,
+    eager_submitted: &mut EagerSubmitted,
 ) -> usize {
     use std::sync::atomic::Ordering;
     let _tv2 = trace_v2::SpanGuard::begin("consumer.eager_postproc");
@@ -1836,12 +1840,41 @@ fn eager_postprocess_prefetched(
             continue;
         }
 
-        // Vendor :544-547 — require the predecessor window. Use the same
-        // range-at-or-before lookup the consumer's own dispatch uses
-        // (`get_predecessor`, drive_impl marker branch) so the eager
-        // apply_window resolves against exactly the window the in-order
-        // path would have used → byte-identical.
-        let (pred_key, predecessor_window) = match window_map.get_predecessor(real_offset) {
+        // Vendor :544-547 — require the predecessor window.
+        //
+        // CORRECTNESS — which offset to resolve the predecessor at. The
+        // consumer accepts a speculative/prefetched chunk only when
+        // `next_block_offset == arc.max_acceptable_start_bit` (the handoff
+        // guard above), then rewrites the chunk's start to that value
+        // (`set_encoded_offset(effective_start)`, effective_start ==
+        // decode_start == max_acceptable_start_bit) and resolves
+        // `get_predecessor(chunk.encoded_offset_bits)` == `get_predecessor(
+        // max_acceptable_start_bit)`. The chunk's `encoded_offset_bits`
+        // here is the PARTITION SEED (offset.first), which for a markered
+        // bootstrap chunk is strictly BEFORE where its decoded bytes begin
+        // — resolving the predecessor there would (a) pick a wrong/earlier
+        // window and (b) never match the consumer's key. Resolve at
+        // `max_acceptable_start_bit` so the eager apply_window uses the
+        // SAME window the in-order consumer will → byte-identical, and the
+        // recorded `pred_key` matches the consumer's `consumer_pred_key`
+        // so the result is actually REUSED (not rejected by the guard).
+        let resolve_offset = arc.max_acceptable_start_bit;
+
+        // STRICT GATE — only eager-process when the predecessor window is
+        // CONFIRMED-published at the EXACT key the consumer will use
+        // (`contains(resolve_offset)`), not merely "some earlier window
+        // exists" (`has_predecessor`). Design B promotes a confirmed
+        // chunk's clean tail at its `chunk_end_bit` (== the successor's
+        // `max_acceptable_start_bit`) on accept; the serial publish does
+        // the same. Requiring an exact key here guarantees we NEVER
+        // eager-resolve against an unconfirmed/earlier predecessor — the
+        // crux correctness invariant. Range-lookup `get_predecessor` would
+        // silently return a stale earlier window when the true predecessor
+        // hasn't been published yet, corrupting the chunk.
+        if !window_map.contains(resolve_offset) {
+            continue;
+        }
+        let (pred_key, predecessor_window) = match window_map.get_predecessor(resolve_offset) {
             Some((k, w)) => (k, w),
             None => continue,
         };
@@ -2428,6 +2461,15 @@ pub static ARC_TRY_UNWRAP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic
 pub static ARC_TRY_UNWRAP_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Eager post-process bookkeeping: maps a prefetched chunk's real
+/// `encoded_offset_bits` (partition-seed key, stable across the consumer's
+/// `set_encoded_offset` rewrite) → (predecessor-window key it resolved
+/// against, in-flight apply_window receiver). The consumer reuses the
+/// receiver when it reaches that offset, after validating the predecessor
+/// key still matches (byte-identity guard).
+#[cfg(parallel_sm)]
+type EagerSubmitted = std::collections::HashMap<usize, (usize, mpsc::Receiver<ChunkData>)>;
+
 // ── Eager post-process probe (GZIPPY_EAGER_POSTPROC=1) ────────────────────
 // Port of rapidgzip's `queuePrefetchedChunkPostProcessing`
 // (GzipChunkFetcher.hpp:520-551): during a consumer stall, submit
@@ -2704,6 +2746,7 @@ enum PendingWrite {
 /// the tail of `GzipChunkFetcher::waitForReplacedMarkers` + write loop
 /// at vendor lines 516 + 333-342.
 #[cfg(parallel_sm)]
+#[allow(clippy::too_many_arguments)]
 fn drain_one_pending<W: std::io::Write>(
     pending: &mut std::collections::VecDeque<PendingWrite>,
     window_map: &WindowMap,
@@ -2711,12 +2754,28 @@ fn drain_one_pending<W: std::io::Write>(
     total_crc: &mut CRC32Calculator,
     total_size: &mut usize,
     block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
+    // Eager post-process context (GZIPPY_EAGER_POSTPROC=1). When the head
+    // pending write is an in-flight post-process (`Async`), the consumer is
+    // about to BLOCK on `rx.recv()` (the `wait.future_recv` span — the
+    // consumer's real serial wait once Design B has promoted predecessor
+    // windows early). Vendor GzipChunkFetcher.hpp:513 queues successor
+    // post-processing DURING exactly this wait. Mirror that: submit
+    // apply_window for ready prefetched successors whose CONFIRMED
+    // predecessor window is published, so they run on the pool while the
+    // consumer blocks on the head. `None` (eager disabled) skips it.
+    eager_ctx: Option<(&Arc<ThreadPool>, &mut EagerSubmitted)>,
 ) -> Result<(), FetchError> {
     let _tv2 = trace_v2::SpanGuard::begin("consumer.drain");
     let head = match pending.pop_front() {
         Some(h) => h,
         None => return Ok(()),
     };
+    // Vendor GzipChunkFetcher.hpp:513 — queue successor post-processing
+    // BEFORE blocking on the head chunk's future, but only when the head is
+    // actually an in-flight `Async` (else there is no wait to overlap).
+    if let (PendingWrite::Async { .. }, Some((thread_pool, eager_submitted))) = (&head, eager_ctx) {
+        eager_postprocess_prefetched(block_fetcher, window_map, thread_pool, eager_submitted);
+    }
     let t_chunk = std::time::Instant::now();
     let t_recv = std::time::Instant::now();
     let (idx, mut chunk, cache_key) = match head {
