@@ -126,6 +126,16 @@ pub struct ChunkData {
     /// (`offset.first`). Decoded bytes begin at `max_acceptable_start_bit`.
     /// Mirror of `ChunkData::maxEncodedOffsetInBits` (ChunkData.hpp:546).
     pub max_acceptable_start_bit: usize,
+    /// (Design B) The encoded bit offset the WORKER actually decoded byte 0
+    /// from — i.e. `decode_start` (== `max_acceptable_start_bit` for a
+    /// range-speculative chunk). For non-speculative chunks this equals
+    /// `encoded_offset_bits`. Records WHERE the chunk's decoded bytes
+    /// truly begin, independent of the speculative claimed-start range
+    /// `[encoded_offset_bits, max_acceptable_start_bit]`. Audit-only; the
+    /// speculative-window KEY is derived from `encoded_offset_bits +
+    /// encoded_size_bits` (see `chunk_fetcher::run_decode_task`), which is
+    /// the value the consumer recomputes after `set_encoded_offset`.
+    pub decode_origin_bit: usize,
     pub encoded_size_bits: usize,
     /// Marker-tagged prefix. Each u16 < MARKER_BASE is a literal byte
     /// (`v as u8`); values ≥ MARKER_BASE are direct indices into the
@@ -312,6 +322,7 @@ impl ChunkData {
         Self {
             encoded_offset_bits,
             max_acceptable_start_bit: encoded_offset_bits,
+            decode_origin_bit: encoded_offset_bits,
             encoded_size_bits: 0,
             data_with_markers,
             data,
