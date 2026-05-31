@@ -28,7 +28,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
 const MIN_PARALLEL_SIZE: usize = 4 * 1024 * 1024;
-const MIN_THREADS_FOR_PARALLEL: usize = 2;
+// 1 (was 2, 2026-05-31): the parallel-SM engine is the production path at EVERY
+// thread count (MIN_PARALLEL_SM_THREADS=0, user directive). At num_threads=1 the
+// pool has one worker and the consumer runs on the calling thread (2 OS threads,
+// no worker==consumer deadlock), so the engine runs single-threaded rather than
+// erroring "input below parallel SM minimum (routing bug)". This is what lets us
+// measure the engine we are optimizing at T=1 instead of a libdeflate confound.
+const MIN_THREADS_FOR_PARALLEL: usize = 1;
 #[allow(dead_code)] // used by the x86_64+isal-compression decompress_parallel path
 const TARGET_COMPRESSED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// Floor on the adjusted chunk size when the file is small.
