@@ -21,6 +21,8 @@ pub mod chunk_data;
 pub mod chunk_fetcher;
 pub mod compressed_vector;
 pub mod crc32;
+#[cfg(parallel_sm)]
+pub mod decode_bypass;
 // Bootstrap-only (speculative prefetch): marker emit via `deflate_block::Block`.
 #[cfg(parallel_sm)]
 pub mod deflate_block;

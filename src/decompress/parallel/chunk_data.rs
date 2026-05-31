@@ -343,6 +343,62 @@ impl ChunkData {
         }
     }
 
+    /// Reconstruct a `ChunkData` from precomputed segments + metadata,
+    /// for the decode-BYPASS experiment (`decode_bypass.rs`). NOT a
+    /// production path — gated to the bypass harness, used to replay a
+    /// captured decode with ~zero inner-Huffman CPU so the wall reveals
+    /// coordination cost. The caller supplies the already-CRC'd `crc0`
+    /// covering all of `data` (mirrors the post-finalize invariant).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_bypass_parts(
+        encoded_offset_bits: usize,
+        max_acceptable_start_bit: usize,
+        decode_origin_bit: usize,
+        encoded_size_bits: usize,
+        stopped_preemptively: bool,
+        data_prefix_len: usize,
+        data_with_markers: Vec<u16>,
+        data: U8,
+        crc0: CRC32Calculator,
+        subchunks: Vec<Subchunk>,
+        footers: Vec<Footer>,
+        configuration: ChunkConfiguration,
+    ) -> Self {
+        let live = LIVE_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        MAX_LIVE_CHUNKS.fetch_max(live, std::sync::atomic::Ordering::Relaxed);
+        let subchunks = if subchunks.is_empty() {
+            vec![Subchunk {
+                encoded_offset_bits,
+                encoded_size_bits,
+                decoded_offset: 0,
+                decoded_size: 0,
+                window: None,
+            }]
+        } else {
+            subchunks
+        };
+        Self {
+            encoded_offset_bits,
+            max_acceptable_start_bit,
+            decode_origin_bit,
+            encoded_size_bits,
+            data_with_markers,
+            data,
+            narrowed: types::u8_with_capacity(0),
+            narrowed_crc: CRC32Calculator::new(),
+            markers_resolved: false,
+            subchunks,
+            crc32s: vec![crc0],
+            footers,
+            stopped_preemptively,
+            statistics: ChunkStatistics::default(),
+            configuration,
+            next_subchunk_start_decoded_offset: 0,
+            pool_worker_index: 0,
+            data_prefix_len,
+        }
+    }
+
     /// Whether `expected_start` falls within this chunk's acceptable
     /// start range. Mirror of `rapidgzip::ChunkData::matchesEncodedOffset`
     /// (ChunkData.hpp:396-403). Used by the consumer to accept

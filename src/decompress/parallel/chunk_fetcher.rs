@@ -888,6 +888,8 @@ fn drive_impl<W: std::io::Write>(
     // Flush all per-thread trace_v2 buffers (consumer thread + any
     // already-joined worker threads).
     trace_v2::flush_all();
+    // DECODE-BYPASS: serialize the capture map (no-op unless capture on).
+    crate::decompress::parallel::decode_bypass::flush_capture();
     Ok((total_crc.crc32(), total_size))
 }
 
@@ -1987,6 +1989,36 @@ fn run_decode_task(
     // SAFETY: `drive`'s contract — input outlives the thread pool.
     let input_bytes: &[u8] = unsafe { input.as_slice() };
 
+    // DECODE-BYPASS replay (campaign instrument, GZIPPY_BYPASS_DECODE).
+    // Return the precomputed ChunkData for this (start_bit, stop_hint)
+    // via memcpy — ~zero inner-Huffman CPU — keeping the FULL downstream
+    // coordination chain. On a cache miss fall through to real decode so
+    // output stays byte-correct.
+    if crate::decompress::parallel::decode_bypass::replay_enabled() {
+        if let Some(chunk) = crate::decompress::parallel::decode_bypass::replay(
+            params.start_bit,
+            params.stop_hint_bit,
+            configuration,
+        ) {
+            // Preserve the early-window-publish behavior the real decode
+            // path performs so successor resolution is unchanged.
+            if chunk.max_acceptable_start_bit == chunk.encoded_offset_bits
+                && chunk.encoded_size_bits > 0
+            {
+                if let Some(tail) = chunk.last_32kib_window_vec() {
+                    let chunk_end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+                    window_map.insert_owned_none(chunk_end_bit, tail);
+                }
+            } else if chunk.encoded_size_bits > 0 {
+                if let Some(tail) = chunk.last_32kib_window_vec() {
+                    let key = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+                    window_map.insert_speculative_owned_none(key, tail);
+                }
+            }
+            return Ok(Arc::new(chunk));
+        }
+    }
+
     let label = trace::worker_label(params.partition_idx);
     let t0 = std::time::Instant::now();
 
@@ -2107,6 +2139,17 @@ fn run_decode_task(
     // `insert` uses overwrite semantics (WindowMap.hpp:65-76
     // insert_or_assign), so the consumer's later publish at the same key
     // is a harmless idempotent overwrite with identical bytes.
+    // DECODE-BYPASS capture (campaign instrument, GZIPPY_BYPASS_CAPTURE).
+    // Record this decode result keyed by (start_bit, stop_hint_bit) so a
+    // later replay run can memcpy it back. No-op unless capture is on.
+    if let Ok(ref chunk) = chunk_result {
+        crate::decompress::parallel::decode_bypass::record(
+            params.start_bit,
+            params.stop_hint_bit,
+            chunk,
+        );
+    }
+
     if let Ok(ref chunk) = chunk_result {
         if chunk.max_acceptable_start_bit == chunk.encoded_offset_bits
             && chunk.encoded_size_bits > 0
