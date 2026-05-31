@@ -13,7 +13,12 @@
 #[cfg(feature = "coz")]
 pub use fulcrum::probe::{progress, scope, Scope};
 
+// Without the `coz` feature these are no-ops. Their only callers are the
+// parallel-SM decode probes (`#[cfg(parallel_sm)]`), so under the default
+// feature set (no parallel_sm) they have no callers — allow that rather than
+// fail `-D warnings`.
 #[cfg(not(feature = "coz"))]
+#[allow(dead_code)]
 mod noop {
     /// Zero-size RAII guard; drops with no effect.
     #[must_use]
@@ -27,4 +32,5 @@ mod noop {
 }
 
 #[cfg(not(feature = "coz"))]
+#[allow(unused_imports)]
 pub use noop::{progress, scope, Scope};

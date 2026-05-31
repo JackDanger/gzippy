@@ -857,24 +857,32 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     // the `cleanDataCount >= deflate::MAX_WINDOW_SIZE` handoff at
     // L520-525.
     let t_bootstrap = std::time::Instant::now();
-    let bootstrap_result = {
-        // Coz region: the slow window-absent pure-Rust marker bootstrap. Its
-        // wall-elasticity (does speeding it actually move the wall, per thread
-        // count?) is the measurement that decides whether to hand-carve it
-        // toward ISA-L speed — FastBootstrap's wall-TIE says decode RATE alone
-        // may be overlapped slack, so this is the gate before the ASM work.
-        let _coz = crate::coz_probe::scope("marker_bootstrap");
-        bootstrap_with_deflate_block(input, encoded_offset_bits, stop_hint_bits)
-    };
-    let mut bootstrap = bootstrap_result?;
-    let bootstrap_dur_us = t_bootstrap.elapsed().as_micros();
-
+    // ZERO-COPY MERGE (DecodedData convergence): decode the window-absent
+    // marker bootstrap DIRECTLY into the chunk's pooled `data_with_markers`
+    // (U16) — no separate std-Vec pool, no `append_markered` copy. The chunk
+    // owns the buffer the decoder fills; rpmalloc's per-thread arena keeps the
+    // pages warm across chunks (the std-Vec `BOOTSTRAP_OUTPUT_POOL` it replaces
+    // was hand-rolling exactly that and is now deleted).
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
-    if !bootstrap.markers.is_empty() {
-        chunk.append_markered(&bootstrap.markers);
-    }
-    // EXPERIMENT: return the markers Vec to the per-thread pool.
-    return_bootstrap_output_to_pool(std::mem::take(&mut bootstrap.markers));
+    // `ChunkData::new` takes a capacity-0 pooled U16 (lazy: the clean fast path
+    // never emits markers). The bootstrap WILL fill it, so pre-reserve the same
+    // warm capacity the deleted std-Vec `BOOTSTRAP_OUTPUT_POOL` held (128 Ki
+    // u16) — without it, decoding into a 0-cap buffer reallocates repeatedly and
+    // is ~5% SLOWER than the old warm-pool-then-copy (measured, frozen box).
+    chunk.data_with_markers.reserve(128 * 1024);
+    let bootstrap = {
+        let _coz = crate::coz_probe::scope("marker_bootstrap");
+        bootstrap_with_deflate_block(
+            input,
+            encoded_offset_bits,
+            stop_hint_bits,
+            &mut chunk.data_with_markers,
+        )
+    }?;
+    let bootstrap_dur_us = t_bootstrap.elapsed().as_micros();
+    // Statistic previously bumped inside `append_markered` (now gone): the
+    // count of u16 values the bootstrap emitted into data_with_markers.
+    chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
 
     // Whenever the bootstrap reached a block boundary at-or-past
     // stop_hint_bits (rare on chunks > 32 KiB), or BFINAL fired, or no
@@ -886,7 +894,7 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
                 "decode_span",
                 &format!(
                     r#""start_bit":{encoded_offset_bits},"bootstrap_us":{bootstrap_dur_us},"inflate_us":0,"phase":"bootstrap_only","markers":{}"#,
-                    bootstrap.markers.len(),
+                    chunk.data_with_markers.len(),
                 ),
             );
         }
@@ -901,7 +909,7 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
                 "decode_span",
                 &format!(
                     r#""start_bit":{encoded_offset_bits},"bootstrap_us":{bootstrap_dur_us},"inflate_us":0,"phase":"bootstrap_terminal","markers":{}"#,
-                    bootstrap.markers.len(),
+                    chunk.data_with_markers.len(),
                 ),
             );
         }
@@ -935,7 +943,7 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
             "decode_span",
             &format!(
                 r#""start_bit":{encoded_offset_bits},"bootstrap_us":{bootstrap_dur_us},"inflate_us":{inflate_dur_us},"phase":"bootstrap+inflate","markers":{},"tail_bytes":{tail_bytes}"#,
-                bootstrap.markers.len(),
+                chunk.data_with_markers.len(),
             ),
         );
     }
@@ -1115,11 +1123,10 @@ fn absorb_isal_tail(dst: &mut ChunkData, mut tail: ChunkData) {
 /// (vendor/.../chunkdecoding/GzipChunk.hpp:468-654).
 #[cfg(parallel_sm)]
 struct DeflateBootstrap {
-    /// u16 output spanning every block decoded in this bootstrap pass.
-    /// Values < MARKER_BASE are literal bytes; values ≥ MARKER_BASE are
-    /// MapMarkers cross-chunk back-references (consumer resolves via
-    /// `apply_window`).
-    markers: Vec<u16>,
+    // The u16 marker/literal output is now written DIRECTLY into the caller's
+    // `data_with_markers` buffer (passed as `&mut impl MarkerSink`), not
+    // returned here — that's the zero-copy merge. This struct carries only the
+    // post-decode metadata the caller needs.
     /// Bit position immediately after the last fully-decoded block.
     /// Always at a real deflate block boundary, suitable as a resume
     /// point for ISA-L's `isal_inflate_set_dict` + decode.
@@ -1134,116 +1141,6 @@ struct DeflateBootstrap {
     /// True when the bootstrap exited because it decoded a BFINAL=1
     /// block. Single-stream tail; no further deflate data follows.
     bfinal_hit: bool,
-}
-
-/// Phase 1 bootstrap: drive [`deflate_block::Block`] block-by-block from
-/// `start_bit_offset` until any of (a) cumulative clean bytes reach
-/// MAX_WINDOW_SIZE at a block boundary, (b) BFINAL fires, or (c) we're
-/// at a non-fixed block boundary at-or-past `stop_hint_bits`.
-///
-/// EXPERIMENT: per-thread pool of bootstrap output buffers.
-#[cfg(parallel_sm)]
-thread_local! {
-    static BOOTSTRAP_OUTPUT_POOL: std::cell::RefCell<Vec<u16>> = std::cell::RefCell::new(Vec::with_capacity(128 * 1024));
-}
-
-#[cfg(parallel_sm)]
-fn take_bootstrap_output_from_pool() -> Vec<u16> {
-    BOOTSTRAP_OUTPUT_POOL.with(|cell| {
-        let mut v = std::mem::take(&mut *cell.borrow_mut());
-        v.clear();
-        let cap_before = v.capacity();
-        if cap_before < 128 * 1024 {
-            BOOTSTRAP_OUTPUT_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            v.reserve(128 * 1024);
-        } else {
-            BOOTSTRAP_OUTPUT_REUSED_BYTES.fetch_add(
-                (cap_before * std::mem::size_of::<u16>()) as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
-        BOOTSTRAP_OUTPUT_TAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        v
-    })
-}
-
-#[cfg(parallel_sm)]
-fn return_bootstrap_output_to_pool(mut v: Vec<u16>) {
-    v.clear();
-    BOOTSTRAP_OUTPUT_RETURNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    BOOTSTRAP_OUTPUT_POOL.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        // Keep the larger of the two.
-        if v.capacity() > slot.capacity() {
-            *slot = v;
-        } else {
-            BOOTSTRAP_OUTPUT_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    });
-}
-
-/// RAII guard that owns the bootstrap output buffer and returns it to
-/// the thread-local pool on Drop — UNCONDITIONALLY (success OR failure).
-///
-/// Background: prior to this guard, the bootstrap function held the
-/// buffer as a local `Vec<u16>` and only returned it to the pool on
-/// the success path (via the caller's
-/// `return_bootstrap_output_to_pool(std::mem::take(&mut bootstrap.markers))`
-/// at the call site). On Err, the function early-returned and the
-/// local Vec dropped — its underlying allocation (often 7 MB, well
-/// above glibc's 128 KiB `MMAP_THRESHOLD`) went through `munmap` and
-/// the next `take_*_from_pool` on that thread paid a fresh
-/// `mmap + first-touch faults` (≈ 2.7 ms per leaked Vec).
-///
-/// The May 26 2026 visibility counters made this measurable: across
-/// silesia-large 16T, `takes=98 returns=64` — i.e. **34 takes never
-/// returned**, matching the 33 bootstrap failures observed via
-/// `worker.bootstrap.outcome` instrumentation. With this guard, the
-/// failure path also returns the buffer.
-///
-/// On success the buffer is consumed via `std::mem::take(output)`
-/// inside the closure; the guard's `inner` then has capacity = 0
-/// (mem::take swaps with `Vec::default()`), and the Drop's
-/// `cap == 0` check makes the post-mem::take Drop a no-op so we
-/// don't pollute the pool's slot with an empty Vec.
-#[cfg(parallel_sm)]
-struct BootstrapBuffer {
-    inner: Option<Vec<u16>>,
-}
-
-#[cfg(parallel_sm)]
-impl BootstrapBuffer {
-    fn new() -> Self {
-        Self {
-            inner: Some(take_bootstrap_output_from_pool()),
-        }
-    }
-    fn get_mut(&mut self) -> &mut Vec<u16> {
-        self.inner
-            .as_mut()
-            .expect("BootstrapBuffer::get_mut after take")
-    }
-}
-
-#[cfg(parallel_sm)]
-impl Drop for BootstrapBuffer {
-    fn drop(&mut self) {
-        if let Some(v) = self.inner.take() {
-            // On the success path, the closure called
-            // `std::mem::take(output)` to transfer the buffer into
-            // `DeflateBootstrap.markers` — the guard's inner now has
-            // cap=0 because `mem::take` swapped in `Vec::default()`.
-            // Skip the return; the success-path caller will
-            // explicitly return the BIG markers Vec to the pool.
-            //
-            // On the failure path the buffer is intact (cap >= 128 KiB
-            // from `take_*_from_pool`) and we want to put it back so
-            // the next take on this thread reuses the same warm pages.
-            if v.capacity() > 0 {
-                return_bootstrap_output_to_pool(v);
-            }
-        }
-    }
 }
 
 /// Counter: fresh `Vec::reserve(128*1024)` events from
@@ -1296,6 +1193,7 @@ fn bootstrap_with_deflate_block(
     data: &[u8],
     start_bit_offset: usize,
     stop_hint_bits: usize,
+    output: &mut impl crate::decompress::parallel::deflate_block::MarkerSink,
 ) -> Result<DeflateBootstrap, ChunkDecodeError> {
     use crate::decompress::parallel::trace_v2;
     let _tv2 = trace_v2::SpanGuard::begin_with(
@@ -1308,7 +1206,8 @@ fn bootstrap_with_deflate_block(
     // 29 retries seen on silesia-large with their specific failure
     // variant (header parse vs body invalid-huffman vs
     // exceeded-window-range vs ...).
-    let result = bootstrap_with_deflate_block_inner(data, start_bit_offset, stop_hint_bits);
+    let result = bootstrap_with_deflate_block_inner(data, start_bit_offset, stop_hint_bits, output);
+    let markers_len = output.sink_len();
     match &result {
         Ok(b) => {
             // handoff_reason: disambiguates the three Ok exit paths in
@@ -1343,12 +1242,12 @@ fn bootstrap_with_deflate_block(
                 "worker.bootstrap.outcome",
                 &format!(
                     r#""result":"ok","markers_len":{},"end_bit":{},"clean_window":{},"bfinal":{},"handoff_reason":"{}","bytes_decoded":{}"#,
-                    b.markers.len(),
+                    markers_len,
                     b.end_bit_offset,
                     b.clean_window.is_some(),
                     b.bfinal_hit,
                     handoff_reason,
-                    b.markers.len(),
+                    markers_len,
                 ),
                 "t",
             );
@@ -1399,6 +1298,7 @@ fn bootstrap_with_deflate_block_inner(
     data: &[u8],
     start_bit_offset: usize,
     stop_hint_bits: usize,
+    output: &mut impl crate::decompress::parallel::deflate_block::MarkerSink,
 ) -> Result<DeflateBootstrap, ChunkDecodeError> {
     use crate::decompress::inflate::consume_first_decode::Bits;
     use crate::decompress::parallel::deflate_block::{Block, MAX_WINDOW_SIZE};
@@ -1428,17 +1328,14 @@ fn bootstrap_with_deflate_block_inner(
         bits.consume(bit_in_byte);
     }
 
-    // Bootstrap output: typically ~32 KiB + one trailing block, up to
-    // ~128 KiB worst case for a single dense dynamic block. The
-    // `BootstrapBuffer` RAII guard ensures the buffer goes back to
-    // the thread-local pool on BOTH the success and failure paths —
-    // see the type's doc comment for the leak this plugs.
-    let mut buffer_guard = BootstrapBuffer::new();
+    // Zero-copy merge: the caller passes the chunk's own `data_with_markers`
+    // (U16) as `output`; the decoder fills it directly. No separate pooled
+    // std-Vec, no `append_markered` copy. (rpmalloc's per-thread arena keeps
+    // the chunk buffer's pages warm across chunks.)
     BOOTSTRAP_BLOCK.with(|cell_block| {
         let mut block = cell_block.borrow_mut();
         block.reset(None, None);
         let block = &mut *block;
-        let output: &mut Vec<u16> = buffer_guard.get_mut();
 
         // Tracks trailing CLEAN-byte run length. When it reaches
         // MAX_WINDOW_SIZE AT a block boundary, the next 32 KiB of `output`
@@ -1509,7 +1406,7 @@ fn bootstrap_with_deflate_block_inner(
             // Decode the block's body, one read() call at a time, until
             // EOB. `n_max_to_decode = usize::MAX` matches rapidgzip's
             // `std::numeric_limits<size_t>::max()` at GzipChunk.hpp:568.
-            let before_len = output.len();
+            let before_len = output.sink_len();
             let t_body = std::time::Instant::now();
             let _tv2_body = trace_v2::SpanGuard::begin("worker.block_body");
             while !block.eob() {
@@ -1521,7 +1418,7 @@ fn bootstrap_with_deflate_block_inner(
                     // failed (= bits consumed past block start), (c) bytes
                     // emitted before failure (= waste), (d) error variant.
                     let bits_at_fail = absolute_bit_pos(byte_offset, &bits);
-                    let bytes_wasted = output.len() - before_len;
+                    let bytes_wasted = output.sink_len() - before_len;
                     let bits_into_body = bits_at_fail.saturating_sub(next_block_offset);
                     BODY_FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     BODY_FAIL_BYTES_WASTED
@@ -1575,14 +1472,14 @@ fn bootstrap_with_deflate_block_inner(
                 std::sync::atomic::Ordering::Relaxed,
             );
             BOOTSTRAP_BODY_BYTES.fetch_add(
-                (output.len() - before_len) as u64,
+                (output.sink_len() - before_len) as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
 
             // Block fully decoded. Update trailing_clean from the bytes
             // just produced. Markers (≥ MARKER_BASE) reset the run; clean
             // bytes extend it (saturating at MAX_WINDOW_SIZE).
-            let block_slice = &output[before_len..];
+            let block_slice = &output.as_slice()[before_len..];
             if !block_slice.is_empty() {
                 let trailing_this_block = block_slice
                     .iter()
@@ -1607,7 +1504,7 @@ fn bootstrap_with_deflate_block_inner(
             // flip-block (≤32 KiB, negligible vs multi-MB blocks).
             if !block.contains_marker_bytes() {
                 BOOTSTRAP_POST_FLIP_U16_BYTES.fetch_add(
-                    (output.len() - before_len) as u64,
+                    (output.sink_len() - before_len) as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
             }
@@ -1621,12 +1518,12 @@ fn bootstrap_with_deflate_block_inner(
         }
 
         // Build the clean dict if we have one.
-        let clean_window = if clean_handoff_armed && output.len() >= MAX_WINDOW_SIZE {
-            let start = output.len() - MAX_WINDOW_SIZE;
+        let clean_window = if clean_handoff_armed && output.sink_len() >= MAX_WINDOW_SIZE {
+            let start = output.sink_len() - MAX_WINDOW_SIZE;
             // Invariant: the trailing MAX_WINDOW_SIZE values of `output` are
             // < MARKER_BASE (clean). Assert this — corruption here would
             // seed ISA-L with garbage and produce a wrong-CRC chunk.
-            let window: Vec<u8> = output[start..]
+            let window: Vec<u8> = output.as_slice()[start..]
                 .iter()
                 .map(|&v| {
                     assert!(
@@ -1644,7 +1541,6 @@ fn bootstrap_with_deflate_block_inner(
         };
 
         Ok(DeflateBootstrap {
-            markers: std::mem::take(output),
             end_bit_offset,
             clean_window,
             bfinal_hit,

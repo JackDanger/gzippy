@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use crate::decompress::parallel::crc32::CRC32Calculator;
 pub use crate::decompress::parallel::replace_markers::MARKER_BASE;
-use crate::decompress::parallel::rpmalloc_alloc::types::{self, U16, U8};
+use crate::decompress::parallel::rpmalloc_alloc::types::{self, U8};
 
 /// One deflate-block-aligned slice of a chunk's decoded output.
 /// Port of `rapidgzip::ChunkData::Subchunk` (ChunkData.hpp:138-145).
@@ -133,7 +133,11 @@ pub struct ChunkData {
     /// rapidgzip MapMarkers: window[v - MARKER_BASE]). Cross-chunk
     /// last 32 KiB window. `apply_window` (next module) resolves these
     /// in place against a known window.
-    pub data_with_markers: U16,
+    // std `Vec<u16>` (not the rpmalloc `U16`): the bootstrap decodes into this
+    // buffer directly (zero-copy merge), and std-Vec decode is ~3% faster
+    // per-byte than rpmalloc here (measured). Warm-cycled via the dedicated
+    // `chunk_buffer_pool::{take,return}_std_u16` retained pool.
+    pub data_with_markers: Vec<u16>,
     /// Clean byte suffix. All bytes here were decoded with a known
     /// window (set via IsalInflateWrapper::set_window) so no markers
     /// were emitted. CRC32'd at append time.
@@ -220,7 +224,7 @@ pub struct ChunkData {
     /// `self.data` once again contains only decoded bytes.
     ///
     /// Today no production caller wires this field — A1 lands the API
-    /// + accounting; A3 will flip the switch by pre-filling at chunk
+    /// and accounting; A3 will flip the switch by pre-filling at chunk
     /// start so `copy_match_windowed`'s window-touch slow path stops
     /// firing (3.5pp delta vs ISA-L's `large_byte_copy`).
     ///
@@ -266,7 +270,7 @@ impl ChunkData {
         Self::new_with_buffers(
             encoded_offset_bits,
             configuration,
-            chunk_buffer_pool::take_u16(0),
+            chunk_buffer_pool::take_std_u16(0),
             chunk_buffer_pool::take_u8(cap),
             chunk_buffer_pool::current_worker_pool_index().unwrap_or(0),
         )
@@ -281,7 +285,7 @@ impl ChunkData {
     pub fn new_with_buffers(
         encoded_offset_bits: usize,
         configuration: ChunkConfiguration,
-        data_with_markers: U16,
+        data_with_markers: Vec<u16>,
         data: U8,
         pool_worker_index: usize,
     ) -> Self {
@@ -486,6 +490,7 @@ impl ChunkData {
     /// measurable overhead. Deferred to `apply_window` time (where every
     /// value is touched anyway); the counters are best-effort and now
     /// report total values in `non_marker_count` only.
+    #[allow(dead_code)]
     pub fn append_markered(&mut self, values: &[u16]) {
         // `worker.append_markered` span — wraps the memcpy of the
         // bootstrap's u16 marker output into the chunk's
@@ -532,6 +537,7 @@ impl ChunkData {
     /// CRC32'd immediately if enabled. The CRC always feeds the most
     /// recent stream's hasher (`crc32s.last_mut()`); cross-stream byte
     /// runs are split by `append_footer`.
+    #[allow(dead_code)]
     pub fn append_clean(&mut self, bytes: &[u8]) {
         if self.configuration.crc32_enabled {
             if let Some(last_crc) = self.crc32s.last_mut() {
@@ -599,6 +605,7 @@ impl ChunkData {
     /// `std::move` semantics. When `data` already holds bytes we fall
     /// back to `extend_from_slice` (a single contiguous Vec is required
     /// by downstream consumers).
+    #[allow(dead_code)]
     pub fn append_owned_buffer(&mut self, mut buffer: U8) {
         // A1 invariant: the `self.data.is_empty()` fast path below
         // would `mem::replace` away an in-place window prefix. Caller
@@ -1328,6 +1335,26 @@ impl ChunkData {
 pub static LIVE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MAX_LIVE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+impl ChunkData {
+    /// Return the (now fully-resolved) `data_with_markers` buffer to the owner
+    /// worker's u16 pool EAGERLY — right after the post-process worker narrows
+    /// it into `narrowed`, instead of waiting for `Drop` (which under
+    /// pipelining returns it only after the consumer has already drained the
+    /// chunk, by which point the next chunk's bootstrap has taken a cold
+    /// buffer). This is what makes the zero-copy bootstrap merge (decode
+    /// straight into `data_with_markers`, no `append_markered` copy) a clean
+    /// no-copy path rather than a ~3% regression: the warm buffer cycles
+    /// take → decode → resolve → return in time for the next take. Idempotent:
+    /// leaves an empty buffer, so the `Drop` return becomes a no-op.
+    pub(crate) fn recycle_markers_after_resolution(&mut self) {
+        use crate::decompress::parallel::chunk_buffer_pool;
+        let dwm = std::mem::take(&mut self.data_with_markers);
+        if dwm.capacity() > 0 {
+            chunk_buffer_pool::return_std_u16_to_worker(self.pool_worker_index, dwm);
+        }
+    }
+}
+
 impl Drop for ChunkData {
     fn drop(&mut self) {
         LIVE_CHUNKS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -1337,11 +1364,11 @@ impl Drop for ChunkData {
         // are reused as uninitialized capacity by the next chunk.
         use crate::decompress::parallel::chunk_buffer_pool;
         let data = std::mem::replace(&mut self.data, types::u8_empty());
-        let dwm = std::mem::replace(&mut self.data_with_markers, types::u16_empty());
+        let dwm = std::mem::take(&mut self.data_with_markers);
         let narrowed = std::mem::replace(&mut self.narrowed, types::u8_empty());
         chunk_buffer_pool::return_u8_to_worker(self.pool_worker_index, data);
         chunk_buffer_pool::return_u8_to_worker(self.pool_worker_index, narrowed);
-        chunk_buffer_pool::return_u16_to_worker(self.pool_worker_index, dwm);
+        chunk_buffer_pool::return_std_u16_to_worker(self.pool_worker_index, dwm);
     }
 }
 
