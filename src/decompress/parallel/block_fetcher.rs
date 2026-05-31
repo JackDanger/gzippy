@@ -246,7 +246,7 @@ where
         // on, and what that chunk was doing, is the indisputable measurement.
         let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
             "ttp.rx_recv_block",
-            &format!(r#""awaited_offset":{block_offset}"#),
+            &format!(r#""awaited_offset":{block_offset:?}"#),
         );
         // Lever H: pump prefetch on 1ms ticks while waiting (vendor
         // BlockFetcher.hpp:314-316). Keeps the prefetch horizon
