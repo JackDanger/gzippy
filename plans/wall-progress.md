@@ -235,3 +235,16 @@ The vs-sweep named "unify the two-stage decode," but the advisor (+ our own prio
 ⇒ DO NOT build the decode-unification rewrite. 
 HARD CORE (advisor-validated): the gap is the decode ~1.6x slower BUSY than rapidgzip but OVERLAPPED across 8 workers, so isolated speedups give SUB-LINEAR wall returns. Refuted levers (this session): memory/u16, eager-scheduling, decode-rate-as-primary, range-accept, window-chain, frontier-scheduling, decode-unification, per-stage-tax. The wall is the per-chunk in-order speculative-decode latency where every isolated lever is overlapped/~0. Single-member T1-16 = 0.73-0.91x; x86 byte-correct (T8 corruption arm64-only).
 The only un-refuted direction: close the full ~1.6x window-absent-decode busy gap (the slow pure-Rust bootstrap ~194 MB/s vs rapidgzip's faster window-absent-within-one-decoder) — a long inner-loop grind with KNOWN sub-linear wall payoff; not a single lever. Measurement clarity (fulcrum vs-sweep) is now rich enough to name levers; the levers are just mostly overlapped.
+
+## 2026-05-31 — DECODE-BYPASS experiment: decode is the PARALLEL part; the SERIAL consumer/output chain is the floor (REDIRECT)
+Implemented gated byte-identical decode-bypass (GZIPPY_BYPASS_CAPTURE/DECODE, commits db8fadd..78c6406): worker memcpy's precomputed chunk instead of decoding. Frozen, interleaved, sha-verified T2-16:
+| T | gz_normal | gz_bypass | rg_normal | bypass/normal | bypass/rg |
+|---|---|---|---|---|---|
+| 2 | 928 | 1392 | 675 | 1.50 | 2.06 |
+| 4 | 623 | 1299 | 406 | 2.09 | 3.20 |
+| 8 | 510 | 1199 | 348 | 2.35 | 3.45 |
+| 16| 501 | 1202 | 390 | 2.40 | 3.08 |
+ROBUST (confound-free): removing decode made gzippy SLOWER + collapsed CPUs-utilized 6.36→1.10 (perf-stat T8). ⇒ DECODE is the PARALLELIZED work (~6.4 cores; NORMAL critpath = 90% of consumer wait blocked on decode spans). The NON-decode (in-order consumer + 663MB output materialization + write + CRC + window publish) is ~SERIAL on ~1 core and is the floor. Form-A(clean)≈Form-B(markers) 0.99-1.01 ⇒ marker/window coordination NOT a separable lever.
+CONFOUND (honest): can't make a byte-correct decoder's 663MB output free — the prebuilt-memcpy + cold faults (191K→537K) inflate bypass wall. Treat bypass ABSOLUTES as UPPER BOUND; the robust signals are the parallelism-collapse + critpath shift (decode→serial pool.run_task 95.8%).
+REDIRECT: the lever is the SERIAL in-order consumer/output chain (parallelize/pipeline output materialization + CRC + window publish — rapidgzip's "lean consumer"), NOT the inner Huffman loop. Corroborates "decode overlapped, sub-linear." 
+NEXT (user): SLEEP variant — fixed identical per-chunk sleep in BOTH gzippy+rapidgzip, garbage-output/wall-only (NO materialization confound), realistic timing regime ⇒ CLEAN coordination comparison.
