@@ -1997,6 +1997,35 @@ fn run_decode_task(
     // via memcpy — ~zero inner-Huffman CPU — keeping the FULL downstream
     // coordination chain. On a cache miss fall through to real decode so
     // output stays byte-correct.
+    // FIXED-SLEEP coordination-isolation (GZIPPY_SLEEP_DECODE_NS). Sleep a
+    // fixed duration instead of decoding, return a correct-size clean
+    // zero-filled chunk. Equalizes per-chunk "decode" cost to a constant
+    // identical to the rapidgzip sleep patch so wall delta = pure
+    // coordination. Output is garbage; CRC/size verification is gated off in
+    // sm_driver. Uses the bypass capture file for size/boundary metadata.
+    if crate::decompress::parallel::decode_bypass::sleep_decode_enabled() {
+        if let Some(chunk) = crate::decompress::parallel::decode_bypass::sleep_replay(
+            params.start_bit,
+            params.stop_hint_bit,
+            configuration,
+        ) {
+            if chunk.max_acceptable_start_bit == chunk.encoded_offset_bits
+                && chunk.encoded_size_bits > 0
+            {
+                if let Some(tail) = chunk.last_32kib_window_vec() {
+                    let chunk_end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+                    window_map.insert_owned_none(chunk_end_bit, tail);
+                }
+            } else if chunk.encoded_size_bits > 0 {
+                if let Some(tail) = chunk.last_32kib_window_vec() {
+                    let key = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+                    window_map.insert_speculative_owned_none(key, tail);
+                }
+            }
+            return Ok(Arc::new(chunk));
+        }
+    }
+
     if crate::decompress::parallel::decode_bypass::replay_enabled() {
         if let Some(chunk) = crate::decompress::parallel::decode_bypass::replay(
             params.start_bit,

@@ -248,6 +248,39 @@ fn force_clean() -> bool {
     *F.get_or_init(|| std::env::var_os("GZIPPY_BYPASS_FORCE_CLEAN").is_some())
 }
 
+// ── FIXED-SLEEP coordination-isolation mode ───────────────────────────
+//
+// `GZIPPY_SLEEP_DECODE_NS=<ns>` (requires `GZIPPY_BYPASS_DECODE=<file>`
+// for the size/boundary metadata): instead of decoding OR memcpy-replaying
+// the captured bytes, the worker SLEEPS `<ns>` nanoseconds and returns a
+// correct-SIZE, fully-CLEAN, zero-filled `ChunkData`. This equalizes the
+// per-chunk "decode" cost to a fixed constant identical to the rapidgzip
+// sleep patch — so any wall delta is PURE coordination/scheduling
+// structure (the in-order consumer chain, dispatch, window publish,
+// write). Output is GARBAGE (zeros): this is a wall-only measurement,
+// CRC/size verification is gated OFF in `sm_driver` when this is set.
+//
+// Why clean+zero (not markers, not a real-bytes memcpy):
+//  - clean (empty `data_with_markers`) avoids `apply_window` running on
+//    garbage marker indices (would index out of the window). Form-A≈Form-B
+//    showed marker coordination is negligible, so clean loses no signal.
+//  - zero-filled (NOT a memcpy from a prebuilt 663MB buffer) avoids the
+//    decode-bypass double-materialization confound; the zeroed alloc is a
+//    SINGLE materialization, same in concept as a real decode's output
+//    buffer, paid once.
+pub fn sleep_decode_ns() -> Option<u64> {
+    static N: OnceLock<Option<u64>> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("GZIPPY_SLEEP_DECODE_NS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+    })
+}
+
+pub fn sleep_decode_enabled() -> bool {
+    sleep_decode_ns().is_some()
+}
+
 pub fn capture_enabled() -> bool {
     capture_path().is_some()
 }
@@ -402,6 +435,87 @@ pub fn replay(
             None
         }
     }
+}
+
+/// FIXED-SLEEP replay: sleep `sleep_decode_ns()` then return a correct-size,
+/// fully-CLEAN, zero-filled `ChunkData` for `(start_bit, stop_hint_bit)`.
+/// Uses the captured chunk ONLY for sizing/boundary metadata (encoded
+/// extent, total decoded size, subchunks, footers). Returns `None` on a
+/// cache miss (caller falls through to real decode — but in sleep mode we
+/// expect a full-coverage capture so misses are rare).
+///
+/// The returned chunk is fully clean: all decoded bytes live in `data`
+/// (zeroed), `data_with_markers` is empty, `data_prefix_len` is 0. CRC0 is
+/// computed over the zeroed data (genuine consumer work we keep); the final
+/// stream CRC will not match the trailer, so verification is gated OFF.
+pub fn sleep_replay(
+    start_bit: usize,
+    stop_hint_bit: usize,
+    configuration: ChunkConfiguration,
+) -> Option<ChunkData> {
+    use std::sync::atomic::Ordering;
+    let ns = sleep_decode_ns()?;
+    if ns > 0 {
+        std::thread::sleep(std::time::Duration::from_nanos(ns));
+    }
+    let map = replay_map();
+    let cap = match map.get(&(start_bit, stop_hint_bit)) {
+        Some(c) => c,
+        None => {
+            REPLAY_MISSES.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    REPLAY_HITS.fetch_add(1, Ordering::Relaxed);
+
+    // Total decoded output for this chunk = clean data + (resolved) marker
+    // prefix, minus the non-output window-image prefix. We fold EVERYTHING
+    // into clean zeroed `data` so no marker/apply_window coordination runs.
+    let total_output = cap.data_with_markers.len() + cap.data.len() - cap.data_prefix_len;
+    let mut data = types::u8_with_capacity(total_output);
+    data.resize(total_output, 0u8);
+
+    let mut crc0 = CRC32Calculator::new();
+    if configuration.crc32_enabled {
+        crc0.update(&data);
+    }
+
+    let subchunks: Vec<Subchunk> = cap
+        .subchunks
+        .iter()
+        .map(|&(eo, es, dofs, ds)| Subchunk {
+            encoded_offset_bits: eo,
+            encoded_size_bits: es,
+            decoded_offset: dofs,
+            decoded_size: ds,
+            window: None,
+        })
+        .collect();
+    let footers: Vec<Footer> = cap
+        .footers
+        .iter()
+        .map(|&(crc32, usz, eb, de)| Footer {
+            crc32,
+            uncompressed_size: usz,
+            end_bit_offset: eb,
+            decoded_end_offset: de,
+        })
+        .collect();
+
+    Some(ChunkData::from_bypass_parts(
+        cap.encoded_offset_bits,
+        cap.max_acceptable_start_bit,
+        cap.decode_origin_bit,
+        cap.encoded_size_bits,
+        cap.stopped_preemptively,
+        0, // data_prefix_len: fully clean, no window-image prefix
+        Vec::new(),
+        data,
+        crc0,
+        subchunks,
+        footers,
+        configuration,
+    ))
 }
 
 fn rebuild_each_call() -> bool {
