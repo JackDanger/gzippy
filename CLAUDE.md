@@ -4,7 +4,7 @@
 
 **gzippy aims to be the fastest gzip implementation ever created.**
 
-## Goal (updated 2026-05-29 — perf-driven; faithful structural port RESCINDED)
+## Goal (updated 2026-05-30 — perf-driven; faithful structural CONVERGENCE to rapidgzip REINSTATED)
 
 **gzippy must be at least at parity with EVERY gzip/DEFLATE tool — gzip, pigz,
 libdeflate, ISA-L, zlib-ng, AND rapidgzip — across archive × thread-count, with a
@@ -14,24 +14,37 @@ GNU-gzip-family formats: gzip single-member, multi-member, BGZF, raw DEFLATE (in
 codec). BZIP2 and the ZLIB *stream decoder* are OUT (a harmless ZLIB header parser
 may stay).
 
-**Faithful structural porting of rapidgzip is RESCINDED — throughput wins over
-fidelity (Rule 6). Do NOT re-port rapidgzip primitives for fidelity's sake or
-require vendor file:line structural mirroring; port/keep only what beats what we
-have, and DIVERGE from rapidgzip's structure freely wherever it wins.** This is
-grounded in measurement (2026-05-29, frozen clean-window oracle): gzippy's parallel
-pipeline (pool/prefetcher/window-map/consumer) is ALREADY at rapidgzip parity
-(isal clean-window 2035 MB/s ≈ rapidgzip 2067). The whole remaining gap is that
-gzippy runs THREE inner decoders — clean + a slow pure-Rust window-absent bootstrap
-(`deflate_block`, ~10× slower) + `apply_window` — whereas rapidgzip's bootstrap is
-decode-loop-fast, so its 32 KiB marker prefix is free. The lever is therefore ONE
-ISA-L-parity pure-Rust inner decoder used for BOTH clean and bootstrap (delete
-`deflate_block` + the marker copies). Falsified structural levers (segmentation,
-allocator/rpmalloc, ~18 total) are NOT the target — the pipeline is proven at
-parity; do not reopen it. Full roadmap: `plans/systemic-parity-plan.md`.
+**Faithful structural convergence to rapidgzip is REINSTATED (2026-05-30) — the
+2026-05-29 rescind is REVERSED.** That rescind rested entirely on the frozen
+clean-window oracle ("gzippy's pipeline is ALREADY at rapidgzip parity, isal
+clean-window 2035 ≈ rapidgzip 2067") — the instrument later proven BROKEN: it
+silently re-ran the full bootstrap (fixed `64eb6df`). With that premise dead, so is
+the decompose-a-slice-and-shave-it loop it licensed — that loop is how multiple
+sessions were spent measuring TIEs. **rapidgzip's source (`vendor/rapidgzip/`) is a
+WORKING BLUEPRINT that hits the number on the same hardware; the gap is not a floor to
+decompose, it is structural machinery gzippy runs and rapidgzip does not.** GATE 2/3
+(2026-05-30) measured the symptom, not a cause: gzippy is ~2.4× more memory-stalled
+than rapidgzip on the same DRAM (tma dram_bound 14.4% vs 6.1%; 11× more demand-L3
+misses) — the cost of THREE inner decoders (clean + slow window-absent `deflate_block`
++ `apply_window`) plus u16 marker rings and a two-phase decode-then-resolve consumer,
+where rapidgzip uses ONE decode loop and a lean consumer. **The work is to CONVERGE
+gzippy's window-absent path AND consumer to rapidgzip's structure**: delete
+`deflate_block` + the marker machinery (rings, `apply_window`, the decode-then-resolve
+copy), not merely speed the inner loop — FastBootstrap proved decode-RATE alone is
+wall-overlapped (`5514453`). The "pipeline is proven at parity; do not reopen the
+consumer" clause is VOID (same broken oracle). Verify ONLY on wall-vs-rapidgzip
+(`scripts/measure.sh`, output-sha-verified, interleaved) — never on an internal
+slice; that is the rule the decompose-loop kept breaking.
 
 Done when an Opus advisor agrees gzippy is at >=parity with every tool above on the
 closable cells AND the pure-Rust decoder is the sole decode path with C-FFI off the
-decode graph. **Structural match to rapidgzip is NOT a done-criterion — THROUGHPUT is.**
+decode graph. **NEW GOAL (2026-05-30, user-set, supersedes the above hedges): FULLY PORT RAPIDGZIP
+TO EXACT PERFORMANCE PARITY on the same workloads.** rapidgzip's source
+(`vendor/rapidgzip/`) is the blueprint; a faithful structural port of its decode
+pipeline is the method AND the done-criterion — done when gzippy matches rapidgzip's
+wall (TIE-or-better, `scripts/measure.sh`, interleaved + sha-verified) across the
+workload matrix (silesia-large × T1–T16, etc.), the structure faithfully mirrors
+rapidgzip, and the pure-Rust decoder is the sole decode path.**
 
 ## Permission to fully reimplement the inner inflate
 
@@ -103,7 +116,7 @@ fastest-possible claim.
 3. **BENCHMARK EVERYTHING** — `make ship` (homelab bench on `neurotic`) is authoritative; local `make` is for iteration.
 4. **NEVER COMPROMISE CORRECTNESS** — output bytes, CRC32, ISIZE must always verify.
 5. **NO FALLBACKS** — failure is an explicit `Err(GzippyError::Decompression(_))`. No silent libdeflate or ISA-L retries from the SM body. `decompress_single_member` either succeeds via the parallel pipeline or returns an error.
-6. **THE GOAL IS SPEED, NOT FIDELITY.** gzippy aims to be the fastest gzip implementation ever created. Rapidgzip is the current reference for parallel decompression because its architecture is the fastest known — port it as a *means*. Where gzippy's own SIMD inflate primitives (in `src/decompress/inflate/`, `src/decompress/{combined_lut,packed_lut,simd_huffman,vector_huffman,two_level_table}.rs`, `src/backends/inflate_bit.rs`) beat rapidgzip's inner inflate, use them. The deliverable is throughput, not vendor parity.
+6. **FAITHFULLY PORT RAPIDGZIP TO EXACT PERFORMANCE PARITY (2026-05-30, user-set goal — reverses the prior "speed-not-fidelity").** rapidgzip's architecture is the fastest known and its source is in `vendor/rapidgzip/`: it is the BLUEPRINT to transliterate, not merely a reference to consult. Port its decode pipeline faithfully — consumer/chunk-lifecycle, block finder, window map, marker resolution, chunk decode — until gzippy's wall matches rapidgzip's on the same workloads. The prior "diverge freely / throughput not vendor parity" stance rested on the broken clean-window oracle (`64eb6df`) and is REVERSED. Keep gzippy's own inflate primitives ONLY where they meet-or-beat rapidgzip WITHOUT breaking the faithful structure; otherwise mirror the vendor `file:line`. Verify every change on `scripts/measure.sh` (interleaved, sha-verified) vs rapidgzip — never an internal slice; that is the rule the decompose-loop kept breaking.
 
 ## Production Routing (Apr 2026)
 
