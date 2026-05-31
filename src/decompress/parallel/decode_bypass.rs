@@ -134,64 +134,60 @@ impl CapturedChunk {
     /// computed later by `run_post_process_task`, exactly as in
     /// production.
     fn to_chunk_data(&self, configuration: ChunkConfiguration, force_clean: bool) -> ChunkData {
-        // Build the segments.
+        // Decode whether force_clean can fold this chunk's whole marker
+        // prefix into clean data. The captured marker prefix that survived
+        // `clean_unmarked_data` ends in a real marker (>= MARKER_BASE) we
+        // cannot resolve without the predecessor window, so folding is only
+        // valid when the ENTIRE prefix is marker-free. In practice that is
+        // rare; the meaningful A-vs-B delta comes from chunks captured CLEAN
+        // (windowed path, empty data_with_markers). For form-B chunks with a
+        // trailing marker, force_clean keeps them form B (no-op).
+        use crate::decompress::parallel::replace_markers::MARKER_BASE;
+        let fold = force_clean
+            && !self.data_with_markers.is_empty()
+            && !self.data_with_markers.iter().any(|&v| v >= MARKER_BASE);
+
+        // `clean_lead`: marker-free prefix bytes folded to clean data
+        // (force_clean fold case only). These ARE decoded output and must
+        // be CRC'd. They are written before `self.data` to preserve output
+        // order (output is markers | data).
         let mut data = types::u8_with_capacity(
             self.data.len()
-                + if force_clean {
+                + if fold {
                     self.data_with_markers.len()
                 } else {
                     0
                 },
         );
-        let mut data_with_markers: Vec<u16> = Vec::new();
-
-        if force_clean && !self.data_with_markers.is_empty() {
-            // Form-A-only: fold the (already-resolvable) marker prefix
-            // into `data` as clean bytes. The captured marker prefix that
-            // survived `clean_unmarked_data` still contains true markers
-            // (>= MARKER_BASE), which we CANNOT resolve without the
-            // predecessor window. So force-clean is only valid when the
-            // prefix is marker-free; otherwise we keep it as-is (the
-            // chunk stays form B). In practice `clean_unmarked_data`
-            // leaves the prefix ending in a real marker, so force-clean
-            // here is a no-op for those chunks — the meaningful A-vs-B
-            // delta comes from chunks that were captured CLEAN in the
-            // first place (windowed path). We therefore implement
-            // force_clean as: prepend any marker-free leading run to
-            // `data`, keep the rest as markers.
-            use crate::decompress::parallel::replace_markers::MARKER_BASE;
-            let first_marker = self
-                .data_with_markers
-                .iter()
-                .position(|&v| v >= MARKER_BASE)
-                .unwrap_or(self.data_with_markers.len());
-            // Leading marker-free run -> clean data prefix.
-            // (Kept before the surviving marker bytes to preserve order.)
-            let mut clean_lead = Vec::with_capacity(first_marker);
-            for &v in &self.data_with_markers[..first_marker] {
-                clean_lead.push(v as u8);
+        let data_with_markers: Vec<u16> = if fold {
+            for &v in &self.data_with_markers {
+                data.push(v as u8);
             }
-            data_with_markers.extend_from_slice(&self.data_with_markers[first_marker..]);
-            // Order in output is (markers | data); to keep that we must
-            // not move the lead in front of remaining markers. So only
-            // fold when the WHOLE prefix is clean.
-            if first_marker == self.data_with_markers.len() {
-                data.extend_from_slice(&clean_lead);
-            } else {
-                data_with_markers = self.data_with_markers.clone();
-            }
+            Vec::new()
         } else {
-            data_with_markers = self.data_with_markers.clone();
-        }
+            self.data_with_markers.clone()
+        };
+        let folded_lead = data.len(); // clean bytes already pushed (== fold count)
         data.extend_from_slice(&self.data);
 
-        // crc32s[0] covers all of `data` (clean segment) at decode-return
+        // crc32s[0] covers the DECODED portion of `data` at decode-return
         // time — mirrors the post-finalize invariant (append_clean CRCs
-        // data; clean_unmarked_data prepends the migrated-tail CRC). For
-        // single-member silesia there is exactly one stream.
+        // data; clean_unmarked_data prepends the migrated-tail CRC). The
+        // Option-A window-image prefix (`self.data[0..data_prefix_len]`) is
+        // NOT CRC'd by the real decoder (not user output — the consumer
+        // writes `data[prefix..]`), so we skip it. With folding, the layout
+        // is: [folded_lead clean][prefix non-output][decoded] — CRC the
+        // folded lead AND the post-prefix decoded bytes, skipping only the
+        // prefix window image. For single-member silesia there is one stream.
         let mut crc0 = CRC32Calculator::new();
         if configuration.crc32_enabled {
-            crc0.update(&data);
+            if folded_lead > 0 {
+                crc0.update(&data[..folded_lead]);
+            }
+            let prefix_start = folded_lead;
+            let prefix_end = (folded_lead + self.data_prefix_len).min(data.len());
+            crc0.update(&data[prefix_end..]);
+            let _ = prefix_start;
         }
 
         let subchunks: Vec<Subchunk> = self
