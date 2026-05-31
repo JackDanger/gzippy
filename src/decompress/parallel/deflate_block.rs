@@ -1755,6 +1755,21 @@ unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
     // switch clean path); the entire scan + counter update is dead
     // code the compiler strips.
     if CONTAINS_MARKERS {
+        // Fast path: if the clean run already covers the back-ref distance
+        // (`distance_marker >= distance`), the ENTIRE copy source lies inside
+        // the clean zone (the last `distance_marker` bytes have no marker, and
+        // a back-ref reads only the last `distance <= distance_marker` bytes —
+        // or, for the overlap/RLE case, repeats them), so every copied byte is
+        // clean and the run simply extends. This skips the O(length) backward
+        // scan that is the marker-mode path's main overhead over the clean
+        // (CONTAINS_MARKERS=false) path — and it holds for the common case once
+        // a chunk has decoded a window's worth of clean output. Byte-identical
+        // to the scan (which would also find no marker and do `+= length`).
+        // [2026-05-31, fulcrum-vs lever: window-absent decode is ~1.7x rg]
+        if *distance_marker >= distance {
+            *distance_marker += length;
+            return;
+        }
         // Scan backward through the just-written `length` bytes for
         // any marker (value >= MARKER_BASE = MAX_WINDOW_SIZE). The
         // earliest marker from the end determines the new counter
