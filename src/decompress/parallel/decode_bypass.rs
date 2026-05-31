@@ -370,6 +370,28 @@ pub fn replay(
     configuration: ChunkConfiguration,
 ) -> Option<ChunkData> {
     use std::sync::atomic::Ordering;
+    // PREBUILT (default): each chunk's ChunkData is reconstructed ONCE at
+    // load time and MOVED out on first request (take), so the per-call
+    // replay cost is a HashMap lookup + Option::take — no fresh-Vec
+    // allocation or memcpy on the worker, and no per-call page faults
+    // (the buffers were faulted once at load). This is what isolates the
+    // coordination floor: with decode AND reconstruction both off the
+    // worker hot path, the wall is dominated by the in-order consumer
+    // chain alone. Set GZIPPY_BYPASS_REBUILD=1 to use the per-call
+    // reconstruction path instead (the confounded variant — measures
+    // reconstruction allocation + faults too).
+    if !rebuild_each_call() {
+        let key = (start_bit, stop_hint_bit);
+        let mut slot = prebuilt_map().lock().unwrap();
+        if let Some(opt) = slot.get_mut(&key) {
+            if let Some(chunk) = opt.take() {
+                REPLAY_HITS.fetch_add(1, Ordering::Relaxed);
+                return Some(chunk);
+            }
+        }
+        REPLAY_MISSES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     match replay_map().get(&(start_bit, stop_hint_bit)) {
         Some(c) => {
             REPLAY_HITS.fetch_add(1, Ordering::Relaxed);
@@ -380,6 +402,29 @@ pub fn replay(
             None
         }
     }
+}
+
+fn rebuild_each_call() -> bool {
+    static R: OnceLock<bool> = OnceLock::new();
+    *R.get_or_init(|| std::env::var_os("GZIPPY_BYPASS_REBUILD").is_some())
+}
+
+/// Prebuilt ChunkData per key, MOVED out on first request. Built once
+/// from `replay_map()` at first access. Wrapped in a Mutex<Option<_>>
+/// per slot so concurrent workers can take distinct chunks safely.
+#[allow(clippy::type_complexity)]
+fn prebuilt_map() -> &'static Mutex<HashMap<Key, Option<ChunkData>>> {
+    static M: OnceLock<Mutex<HashMap<Key, Option<ChunkData>>>> = OnceLock::new();
+    M.get_or_init(|| {
+        // Use the production default configuration for reconstruction.
+        let cfg = ChunkConfiguration::default();
+        let fc = force_clean();
+        let mut m = HashMap::new();
+        for (k, c) in replay_map().iter() {
+            m.insert(*k, Some(c.to_chunk_data(cfg, fc)));
+        }
+        Mutex::new(m)
+    })
 }
 
 pub static REPLAY_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
