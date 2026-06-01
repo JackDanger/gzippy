@@ -1388,7 +1388,14 @@ fn consumer_loop<W: std::io::Write>(
             // on the consumer only (vendor queueChunkForPostProcessing:558-575).
             // Mirror vendor `getLastWindow(*previousWindow)` — not `last_32kib`
             // alone, which ignores the predecessor chain at stream start.
-            let _tv2 = trace_v2::SpanGuard::begin("consumer.window_publish_clean");
+            // B/E span: its DURATION is the INDEPENDENT per-link serial
+            // resolve/publish work Fulcrum's `model` view reads as L_resolve
+            // (NOT the inter-publish gap — that conflation is the tautology).
+            // `end_bit` keys the publish so the model orders + de-dups links.
+            let _tv2 = trace_v2::SpanGuard::begin_with(
+                "consumer.window_publish_clean",
+                &format!(r#""end_bit":{chunk_end_bit},"had_markers":false"#),
+            );
             if let Some((_pred_key, pred)) = window_map.get_predecessor(chunk.encoded_offset_bits) {
                 let bytes = materialize_window(&pred);
                 let tail = chunk
@@ -1453,7 +1460,15 @@ fn consumer_loop<W: std::io::Write>(
                     )?;
                 }
             }
-            let _tv2_pred = trace_v2::SpanGuard::begin("consumer.window_publish_marker");
+            // B/E span: DURATION = INDEPENDENT serial marker-resolve/publish
+            // work (L_resolve) for the model view; `end_bit` keys the link.
+            // The blocking WAIT for the predecessor is the SEPARATE
+            // `consumer.wait_replaced_markers` span above, so this span is the
+            // resolve WORK only, not the wait.
+            let _tv2_pred = trace_v2::SpanGuard::begin_with(
+                "consumer.window_publish_marker",
+                &format!(r#""end_bit":{chunk_end_bit},"had_markers":true"#),
+            );
             let (pred_key, window) = window_map
                 .get_predecessor(chunk.encoded_offset_bits)
                 .ok_or(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
@@ -2088,6 +2103,28 @@ fn run_decode_task(
     } else {
         window_map.get(params.start_bit)
     };
+
+    // INDEPENDENT decode-mode signal for Fulcrum's `model` view. The mode is
+    // the ACTUAL window-present-at-decode-start predicate (clean iff
+    // start_bit==0 or the predecessor window is published), NOT the dispatch
+    // `is_speculative_prefetch` intent (a prefetch can race the publish and
+    // run clean). Emitted as an instant keyed by start_bit so the model joins
+    // it to this chunk's `worker.decode_chunk` span and splits d_c / d_w
+    // honestly.
+    let decode_mode_clean = params.start_bit == 0 || window.is_some();
+    trace_v2::emit_instant(
+        "worker.decode_mode",
+        &format!(
+            r#""start_bit":{},"mode":"{}""#,
+            params.start_bit,
+            if decode_mode_clean {
+                "clean"
+            } else {
+                "window_absent"
+            }
+        ),
+        "t",
+    );
 
     let chunk_result = if params.start_bit == 0 {
         decode_chunk_isal(
