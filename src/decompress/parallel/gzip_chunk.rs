@@ -1226,6 +1226,10 @@ fn bootstrap_with_deflate_block(
         "worker.bootstrap",
         &format!(r#""start_bit":{start_bit_offset},"stop_hint":{stop_hint_bits}"#),
     );
+    // ALLOCATION snapshot for the window-absent bootstrap — the causally-
+    // confirmed critical region. Drops before `_tv2` (instant lands in-span).
+    // No-op unless GZIPPY_TIMELINE is set.
+    let _alloc = crate::decompress::parallel::rpmalloc_stats::AllocGuard::begin("worker.bootstrap");
     // Inner function so we can capture the Result and emit an outcome
     // instant event before the SpanGuard drops. Per-attempt outcome
     // attribution lets `scripts/timeline_analyze.py` correlate the

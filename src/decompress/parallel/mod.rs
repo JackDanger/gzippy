@@ -54,6 +54,8 @@ pub mod residual;
 pub mod rfc_tables;
 #[cfg(parallel_sm)]
 pub mod rpmalloc_alloc;
+#[cfg(parallel_sm)]
+pub mod rpmalloc_stats;
 pub mod segmented_buffer;
 pub mod single_member;
 pub mod sm_cfg;

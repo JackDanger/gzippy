@@ -955,6 +955,8 @@ fn consumer_loop<W: std::io::Write>(
         // PERF-FREE residual snapshot on the wall-critical consumer thread.
         // Drops before `_tv2`, so its instant lands inside this consumer.iter.
         let _residual = super::residual::ResidualGuard::begin("consumer.iter");
+        // ALLOCATION snapshot on the wall-critical consumer thread (drops first).
+        let _alloc = super::rpmalloc_stats::AllocGuard::begin("consumer.iter");
         let t_iter = std::time::Instant::now();
         // BlockFetcher.hpp:427 — opportunistically promote ready prefetches
         // so workers don't idle while the consumer waits on a different key.
@@ -2012,6 +2014,12 @@ fn run_decode_task(
     // the still-open `worker.decode_chunk` span, so Fulcrum's per-thread join
     // attributes the delta to this region. No-op unless GZIPPY_TIMELINE is set.
     let _residual = super::residual::ResidualGuard::begin("worker.decode_chunk");
+    // ALLOCATION snapshot (rpmalloc span-cache reuse + huge-alloc churn + THP).
+    // Declared AFTER `_residual` so it drops FIRST — its `alloc.region` instant
+    // lands inside the still-open span and (because it drops before the rusage
+    // delta is read) does not perturb the fault count residual attributes here.
+    // No-op unless GZIPPY_TIMELINE is set.
+    let _alloc = super::rpmalloc_stats::AllocGuard::begin("worker.decode_chunk");
     // SAFETY: `drive`'s contract — input outlives the thread pool.
     let input_bytes: &[u8] = unsafe { input.as_slice() };
 
