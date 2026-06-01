@@ -906,6 +906,18 @@ fn drive_impl<W: std::io::Write>(
 /// inline take-from-prefetch.
 #[cfg(parallel_sm)]
 #[allow(clippy::too_many_arguments)]
+thread_local! {
+    /// GZIPPY_SLOW_CONSUMER=N (percent), parsed once per thread. See the
+    /// injection site in `consumer_loop`.
+    static SLOW_CONSUMER_PCT: Option<u128> = std::env::var("GZIPPY_SLOW_CONSUMER")
+        .ok()
+        .and_then(|s| s.parse::<u128>().ok())
+        .filter(|&p| p > 0);
+    /// GZIPPY_SLOW_CONSUMER_SLEEP=1 → frequency-neutral sleep control.
+    static SLOW_CONSUMER_SLEEP: bool =
+        std::env::var_os("GZIPPY_SLOW_CONSUMER_SLEEP").is_some();
+}
+
 fn consumer_loop<W: std::io::Write>(
     input: InputSlice,
     writer: &mut W,
@@ -1643,8 +1655,29 @@ fn consumer_loop<W: std::io::Write>(
                 },
             )?;
         }
-        iter_us_sum += t_iter.elapsed().as_micros();
+        let iter_us = t_iter.elapsed().as_micros();
+        iter_us_sum += iter_us;
         iter_count += 1;
+        // CAUSAL PROBE (GZIPPY_SLOW_CONSUMER=N percent): the C2 perturbation.
+        // Slow the in-order CONSUMER serial chain (block-finder get + in-order
+        // drain/apply_window/publish + write) by N% of THIS iteration's own
+        // measured time, to test whether the consumer chain gates the wall.
+        // Byte-identical (pure delay on the consumer thread). Frequency-neutral
+        // control via GZIPPY_SLOW_CONSUMER_SLEEP=1 (sleep yields the core, so a
+        // surviving wall delta is genuine consumer criticality, not a spin/turbo
+        // artifact). Symmetric with GZIPPY_SLOW_BOOTSTRAP (the decode probe) so
+        // the two regions are perturbed the same way. Off by default.
+        if let Some(pct) = SLOW_CONSUMER_PCT.with(|c| *c) {
+            let extra = std::time::Duration::from_micros((iter_us * pct / 100) as u64);
+            if SLOW_CONSUMER_SLEEP.with(|s| *s) {
+                std::thread::sleep(extra);
+            } else {
+                let until = std::time::Instant::now() + extra;
+                while std::time::Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+            }
+        }
     }
 
     // Final drain — flush remaining post-processes in encoded order.
