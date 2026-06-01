@@ -157,6 +157,43 @@ pub static UNSPLIT_BLOCKS_EMPLACED: std::sync::atomic::AtomicU64 =
 pub static PREFETCH_NEXT_FILESIZE_ACCEPT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// ── CONSUMER-NULL CEILING ORACLE (GZIPPY_NULL_CONSUMER_WORK=1) ────────────
+//
+// S4 ceiling-by-REMOVAL instrument (protocol step S4 + STANDING METHOD #6).
+// Default OFF = byte-identical production. When ON, the consumer thread's
+// REMOVABLE serial compute is nulled to measure the wall FLOOR if that work
+// were free. CEILING measurement: output is NOT byte-correct when ON.
+//
+// What is nulled (consumer-thread removable compute): the per-chunk output
+// `write_all` (narrowed + data) and the `total_crc.append` CRC-fold in
+// `drain_one_pending`. These are pure consumer-thread serial work, not
+// structurally required for pipeline flow.
+//
+// What is NOT nulled (pipeline-structural — nulling would change the DECODE
+// REGIME, the clean-window-oracle trap): window-publish (per-iter clean +
+// subchunk), marker-resolve wait, rx.recv channel drain. A worker with no
+// published predecessor window does NOT block — it falls to marker-bootstrap
+// (speculative_decode_find_boundary) — so nulling the publish would force
+// every chunk into the slow window-absent regime, an entirely different
+// measurement. The publish stays; this oracle bounds ONLY the removable
+// consumer-thread compute that the 2x2 SLOW_CONSUMER knob perturbed.
+//
+// POSITIVE CONTROL (the discipline past oracles lacked):
+//   - ZERO-EXECUTION WITNESS: CONSUMER_NULL_WORK_SKIPPED bumps on every nulled
+//     region and CONSUMER_WORK_EXECUTED bumps on every real-path execution.
+//     Oracle ON ⇒ EXECUTED ≈ 0, SKIPPED > 0. Oracle OFF ⇒ EXECUTED > 0,
+//     SKIPPED == 0. If EXECUTED is nonzero with the oracle ON, the oracle is
+//     FAKE — discard, do not report a ceiling.
+//   - WORK-CONSERVATION: CONSUMER_NULL_BYTES_SKIPPED accumulates the output
+//     bytes NOT written, proving the write work was actually removed (a
+//     conservation check: bytes_skipped ≈ total decompressed size).
+pub static CONSUMER_NULL_WORK_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static CONSUMER_WORK_EXECUTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static CONSUMER_NULL_BYTES_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug)]
 #[allow(dead_code)] // error payloads surfaced via Debug in production
 pub enum FetchError {
@@ -905,6 +942,34 @@ fn drive_impl<W: std::io::Write>(
 /// vendor primitive — no inline ring, no inline cache logic, no
 /// inline take-from-prefetch.
 #[cfg(parallel_sm)]
+thread_local! {
+    /// GZIPPY_SLOW_CONSUMER=N (percent of this iteration's own time), parsed
+    /// once per thread. See the injection site in `consumer_loop`.
+    static SLOW_CONSUMER_PCT: Option<u128> = std::env::var("GZIPPY_SLOW_CONSUMER")
+        .ok()
+        .and_then(|s| s.parse::<u128>().ok())
+        .filter(|&p| p > 0);
+    /// GZIPPY_SLOW_CONSUMER_US=K — inject a FIXED K microseconds per consumer
+    /// iteration (the ABSOLUTE-ms calibration the standing protocol mandates;
+    /// avoids the fraction-of-smeared-region bias). Takes precedence over the
+    /// percent knob when both are set.
+    static SLOW_CONSUMER_US: Option<u64> = std::env::var("GZIPPY_SLOW_CONSUMER_US")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&p| p > 0);
+    /// GZIPPY_SLOW_CONSUMER_SLEEP=1 → frequency-neutral sleep control.
+    static SLOW_CONSUMER_SLEEP: bool =
+        std::env::var_os("GZIPPY_SLOW_CONSUMER_SLEEP").is_some();
+    /// GZIPPY_NULL_CONSUMER_WORK=1 → CEILING ORACLE: null the consumer
+    /// thread's removable serial compute (output write + CRC-fold) to bound
+    /// the wall floor if consumer-compute were free. Output is NOT
+    /// byte-correct when set. Default OFF = byte-identical production. See the
+    /// CONSUMER-NULL CEILING ORACLE block near the top of this module.
+    static NULL_CONSUMER_WORK: bool =
+        std::env::var_os("GZIPPY_NULL_CONSUMER_WORK").is_some();
+}
+
+#[cfg(parallel_sm)]
 #[allow(clippy::too_many_arguments)]
 fn consumer_loop<W: std::io::Write>(
     input: InputSlice,
@@ -1643,8 +1708,37 @@ fn consumer_loop<W: std::io::Write>(
                 },
             )?;
         }
-        iter_us_sum += t_iter.elapsed().as_micros();
+        let iter_us = t_iter.elapsed().as_micros();
+        iter_us_sum += iter_us;
         iter_count += 1;
+        // CAUSAL PROBE (C2 perturbation): slow the in-order CONSUMER serial
+        // chain (block-finder get + in-order drain/apply_window/publish +
+        // write) by either a FIXED K us (GZIPPY_SLOW_CONSUMER_US, the
+        // protocol-mandated absolute-ms calibration) or N% of this iteration's
+        // own measured time (GZIPPY_SLOW_CONSUMER). Byte-identical pure delay on
+        // the consumer thread. Frequency-neutral control via
+        // GZIPPY_SLOW_CONSUMER_SLEEP=1. NOTE (protocol blind-spot #4): this hits
+        // the consumer's BUSY work only — a consumer WAIT (absence of work) is
+        // structurally unperturbable, so this knob may UNDERSTATE consumer
+        // criticality if the consumer is mostly waiting. Off by default.
+        let extra_us: u64 = if let Some(k) = SLOW_CONSUMER_US.with(|c| *c) {
+            k
+        } else if let Some(pct) = SLOW_CONSUMER_PCT.with(|c| *c) {
+            (iter_us * pct / 100) as u64
+        } else {
+            0
+        };
+        if extra_us > 0 {
+            let extra = std::time::Duration::from_micros(extra_us);
+            if SLOW_CONSUMER_SLEEP.with(|s| *s) {
+                std::thread::sleep(extra);
+            } else {
+                let until = std::time::Instant::now() + extra;
+                while std::time::Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+            }
+        }
     }
 
     // Final drain — flush remaining post-processes in encoded order.
@@ -2987,6 +3081,32 @@ fn drain_one_pending<W: std::io::Write>(
     // `chunk.narrowed_crc`) so the consumer just consumes the result —
     // no second scan of `chunk.narrowed` here.
     let t_crc_write = std::time::Instant::now();
+    // CEILING ORACLE: when GZIPPY_NULL_CONSUMER_WORK=1, null the consumer's
+    // removable serial compute (output write + CRC-fold). total_size still
+    // advances (so the pipeline's size accounting + final verify path stays
+    // structurally identical) but no bytes are written and no CRC is folded.
+    let null_consumer_work = NULL_CONSUMER_WORK.with(|n| *n);
+    if null_consumer_work {
+        use std::sync::atomic::Ordering;
+        CONSUMER_NULL_WORK_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        let skipped_bytes = if !chunk.narrowed.is_empty() {
+            chunk.narrowed.len()
+        } else if !chunk.data_with_markers.is_empty() {
+            chunk.data_with_markers.len()
+        } else {
+            0
+        } + if chunk.data.len() > chunk.data_prefix_len {
+            chunk.data.len() - chunk.data_prefix_len
+        } else {
+            0
+        };
+        CONSUMER_NULL_BYTES_SKIPPED.fetch_add(skipped_bytes as u64, Ordering::Relaxed);
+        *total_size += skipped_bytes;
+        // Skip write + CRC. Coz/throughput marker still fires below.
+        let _ = t_crc_write;
+        crate::coz_probe::progress("chunk_emitted");
+        return Ok(());
+    }
     if !chunk.narrowed.is_empty() {
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.write_narrowed");
@@ -3045,6 +3165,10 @@ fn drain_one_pending<W: std::io::Write>(
     }
     let combine_us = t_combine.elapsed().as_micros();
     let total_us = t_chunk.elapsed().as_micros();
+    // ZERO-EXECUTION WITNESS (positive control): the real write+CRC path ran
+    // for this chunk. Oracle OFF ⇒ this bumps every chunk; oracle ON ⇒ this is
+    // unreachable (the null branch above returned early) so it stays 0.
+    CONSUMER_WORK_EXECUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     if trace::is_enabled() {
         trace::emit(
