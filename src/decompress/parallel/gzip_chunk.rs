@@ -1328,7 +1328,6 @@ fn bootstrap_with_deflate_block_inner(
 ) -> Result<DeflateBootstrap, ChunkDecodeError> {
     use crate::decompress::inflate::consume_first_decode::Bits;
     use crate::decompress::parallel::deflate_block::{Block, MAX_WINDOW_SIZE};
-    use crate::decompress::parallel::replace_markers::MARKER_BASE;
     use crate::decompress::parallel::trace_v2;
     use std::cell::RefCell;
 

@@ -1,4 +1,11 @@
 #![cfg(parallel_sm)]
+// After the segmented-marker memory-model port, production marker
+// resolution is done by `SegmentedU16::resolve_in_place` (the same
+// branchless 64 KiB LUT, applied per 128 KiB segment in place). The
+// standalone dispatcher + SIMD variants here are retained as tested
+// reference primitives + the `MARKER_BASE` constant the whole pipeline
+// imports; they are exercised by this module's unit tests.
+#![allow(dead_code)]
 
 //! SIMD-accelerated marker replacement.
 //!

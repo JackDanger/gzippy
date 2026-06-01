@@ -298,6 +298,117 @@ mod tests {
         );
     }
 
+    /// SEAM-FUZZ for the segmented-marker memory-model port.
+    ///
+    /// The faithful rapidgzip memory model stores `data_with_markers` as
+    /// 128 KiB-capped u16 segments and resolves them to u8 IN PLACE.
+    /// A speculative chunk (no predecessor window) bootstraps a long
+    /// MARKER prefix; when that prefix exceeds 64 Ki u16 (= one 128 KiB
+    /// segment) the marker buffer SPANS multiple segments, and back-refs
+    /// inside the bootstrap straddle the 128 KiB granule boundary. This
+    /// test hammers that seam with adversarial highly-redundant inputs
+    /// that produce large multi-segment marker prefixes, decodes through
+    /// the PRODUCTION parallel-SM path (`GZIPPY_FORCE_PARALLEL_SM`), and
+    /// asserts byte-identity against an independent oracle (flate2).
+    ///
+    /// Runs at multiple thread counts AND multiple sizes/seeds so the
+    /// chunk boundaries land at varied byte offsets relative to the
+    /// 128 KiB segment grid — maximizing the chance a marker run, a
+    /// back-ref, and a segment boundary coincide.
+    #[cfg(parallel_sm)]
+    #[test]
+    fn test_segmented_marker_seam_differential() {
+        use std::io::Read;
+
+        // A moderate-entropy generator (ratio ~2×) with frequent
+        // short-and-medium back-references. Routes to IsalParallelSM
+        // (clears the 10 MiB size gate AND the 1.15× ratio gate). At
+        // these sizes the NO-WINDOW speculative chunks decode multi-MB
+        // MARKER prefixes — every cross-chunk back-ref (of ANY length)
+        // becomes a u16 marker — so the marker buffer spans MANY 128 KiB
+        // segments and the in-place resolve + cross-segment append +
+        // window-builder + clean-tail-migration all exercise the seam.
+        // `seed` shifts byte alignment relative to the 128 KiB grid; the
+        // varied `repeat`/`run` lengths place back-refs of every size
+        // (incl. > the 128 KiB granule) at varied segment offsets.
+        fn adversarial(size: usize, seed: u64) -> Vec<u8> {
+            let mut data = Vec::with_capacity(size);
+            let mut rng: u64 = seed | 1;
+            while data.len() < size {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                // ~40% fresh entropy bytes, ~60% short repeat runs — ratio
+                // ~2×, the same low-entropy profile that
+                // `test_single_member_routing_multithread` proves routes to
+                // IsalParallelSM. The repeats produce dense back-references;
+                // the speculative no-window chunks turn the cross-chunk ones
+                // into a multi-MB MARKER prefix spanning many 128 KiB
+                // segments.
+                if (rng >> 32) % 5 < 2 {
+                    data.push((rng >> 16) as u8);
+                } else {
+                    let byte = ((rng >> 24) % 26 + b'a' as u64) as u8;
+                    let repeat = ((rng >> 40) % 8 + 2) as usize;
+                    for _ in 0..repeat.min(size - data.len()) {
+                        data.push(byte);
+                    }
+                }
+            }
+            data.truncate(size);
+            data
+        }
+
+        for (size, seed) in [
+            (40 * 1024 * 1024usize, 0xFEED_FACEu64),
+            (48 * 1024 * 1024usize, 0x0F1E_2D3Cu64),
+        ] {
+            let original = adversarial(size, seed);
+            let compressed = compress_single_member_gzip(&original);
+            assert!(
+                compressed.len() > crate::decompress::MIN_PARALLEL_COMPRESSED,
+                "seam fixture (size={size}, seed={seed:#x}) compressed to {} B, must exceed the \
+                 {} B parallel-SM gate — adjust the noise ratio",
+                compressed.len(),
+                crate::decompress::MIN_PARALLEL_COMPRESSED
+            );
+
+            // Independent oracle.
+            let mut oracle = Vec::new();
+            flate2::read::MultiGzDecoder::new(&compressed[..])
+                .read_to_end(&mut oracle)
+                .unwrap();
+            assert_eq!(oracle, original, "oracle self-check failed");
+
+            // Force the production parallel-SM (segmented-marker) path at
+            // every thread count.
+            // Serialize against other tests that touch the parallel pipeline
+            // AND the process-global FORCE env var.
+            let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            std::env::set_var("GZIPPY_FORCE_PARALLEL_SM", "1");
+            for threads in [1usize, 4, 8] {
+                let path = crate::decompress::classify_gzip(&compressed, threads);
+                assert_eq!(
+                    path,
+                    crate::decompress::DecodePath::IsalParallelSM,
+                    "seam fixture (size={size}, seed={seed:#x}) must take the \
+                     parallel-SM segmented-marker path at T{threads}"
+                );
+                let mut out = Vec::new();
+                crate::decompress::decompress_single_member(&compressed, &mut out, threads)
+                    .unwrap_or_else(|e| {
+                        panic!("seam decode failed at T{threads} (size={size}): {e:?}")
+                    });
+                assert_eq!(
+                    out, original,
+                    "SEAM MISMATCH: segmented-marker decode diverged from oracle at \
+                     T{threads} (size={size}, seed={seed:#x}) — back-ref/segment-boundary bug"
+                );
+            }
+            std::env::remove_var("GZIPPY_FORCE_PARALLEL_SM");
+        }
+    }
+
     /// Pure incompressible bytes (PRNG), compressed into STORED deflate blocks
     /// via `Compression::none()` — what `gzip` produces on random data.
     fn make_high_entropy_data(size: usize) -> Vec<u8> {
