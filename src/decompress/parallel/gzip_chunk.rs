@@ -887,11 +887,21 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     // the probe off vs on. Byte-identical (pure delay). If 2x-slower-bootstrap
     // (N=100) barely moves the wall, the bootstrap is overlapped/wall-dead;
     // if it adds ~its critical share, it is the lever. Off by default.
-    if let Some(pct) = std::env::var("GZIPPY_SLOW_BOOTSTRAP")
+    // GZIPPY_SLOW_BOOTSTRAP_US=K injects a FIXED K microseconds per chunk (the
+    // ABSOLUTE-ms calibration the standing protocol mandates); it takes
+    // precedence over the percent knob GZIPPY_SLOW_BOOTSTRAP=N.
+    let slow_us: Option<u64> = std::env::var("GZIPPY_SLOW_BOOTSTRAP_US")
         .ok()
-        .and_then(|s| s.parse::<u128>().ok())
-    {
-        let extra = std::time::Duration::from_micros((bootstrap_dur_us * pct / 100) as u64);
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&k| k > 0)
+        .or_else(|| {
+            std::env::var("GZIPPY_SLOW_BOOTSTRAP")
+                .ok()
+                .and_then(|s| s.parse::<u128>().ok())
+                .map(|pct| (bootstrap_dur_us * pct / 100) as u64)
+        });
+    if let Some(extra_us) = slow_us {
+        let extra = std::time::Duration::from_micros(extra_us);
         // Frequency-neutral control (disproof of the turbo-depression confound):
         // GZIPPY_SLOW_BOOTSTRAP_SLEEP=1 yields the core via sleep instead of a
         // busy-spin. A sleeping worker can't depress all-core turbo, so if the
