@@ -22,7 +22,23 @@ use crate::decompress::parallel::bit_manipulation::n_lowest_bits_set;
 pub trait MarkerSink {
     fn push_slice(&mut self, values: &[u16]);
     fn sink_len(&self) -> usize;
-    fn as_slice(&self) -> &[u16];
+    /// True iff the sink holds no values.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.sink_len() == 0
+    }
+    /// Run-length of trailing CLEAN (`< MARKER_BASE`) values in the sink,
+    /// capped at `cap`. The bootstrap uses this to track how long a
+    /// marker-free tail it has (for clean-window arming) WITHOUT needing
+    /// a contiguous `&[u16]` view — so a segmented sink can serve it by
+    /// walking its trailing segments. Replaces the prior
+    /// `as_slice()[before_len..].iter().rev().take_while(...)`.
+    fn trailing_clean_run(&self, cap: usize) -> usize;
+    /// Append the last `n` values, narrowed to u8, into `out`. The
+    /// bootstrap uses this to materialize the trailing 32 KiB clean
+    /// window once `trailing_clean_run` confirms it is marker-free.
+    /// Caller guarantees the last `n` values are all `< MARKER_BASE`.
+    fn copy_last_n_as_u8(&self, n: usize, out: &mut Vec<u8>);
 }
 
 impl MarkerSink for Vec<u16> {
@@ -34,11 +50,26 @@ impl MarkerSink for Vec<u16> {
     fn sink_len(&self) -> usize {
         self.len()
     }
-    #[inline]
-    fn as_slice(&self) -> &[u16] {
-        self
+    fn trailing_clean_run(&self, cap: usize) -> usize {
+        let mut run = 0usize;
+        for &v in self.iter().rev() {
+            if v >= MARKER_BASE_CONST || run >= cap {
+                break;
+            }
+            run += 1;
+        }
+        run.min(cap)
+    }
+    fn copy_last_n_as_u8(&self, n: usize, out: &mut Vec<u8>) {
+        out.clear();
+        let start = self.len() - n;
+        out.extend(self[start..].iter().map(|&v| v as u8));
     }
 }
+
+/// Local copy of `replace_markers::MARKER_BASE` to avoid a cross-module
+/// dependency in this hot file's trait impls.
+const MARKER_BASE_CONST: u16 = 32768;
 
 // When `arena-allocator` is on, `U16` is a DISTINCT type from `Vec<u16>`
 // (allocator_api2 Vec), so it needs its own impl. Without the feature `U16 ==
@@ -53,9 +84,20 @@ impl MarkerSink for crate::decompress::parallel::rpmalloc_alloc::types::U16 {
     fn sink_len(&self) -> usize {
         self.len()
     }
-    #[inline]
-    fn as_slice(&self) -> &[u16] {
-        self
+    fn trailing_clean_run(&self, cap: usize) -> usize {
+        let mut run = 0usize;
+        for &v in self.iter().rev() {
+            if v >= MARKER_BASE_CONST || run >= cap {
+                break;
+            }
+            run += 1;
+        }
+        run.min(cap)
+    }
+    fn copy_last_n_as_u8(&self, n: usize, out: &mut Vec<u8>) {
+        out.clear();
+        let start = self.len() - n;
+        out.extend(self[start..].iter().map(|&v| v as u8));
     }
 }
 

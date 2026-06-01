@@ -1502,25 +1502,16 @@ fn bootstrap_with_deflate_block_inner(
                 std::sync::atomic::Ordering::Relaxed,
             );
 
-            // Block fully decoded. Update trailing_clean from the bytes
-            // just produced. Markers (≥ MARKER_BASE) reset the run; clean
-            // bytes extend it (saturating at MAX_WINDOW_SIZE).
-            let block_slice = &output.as_slice()[before_len..];
-            if !block_slice.is_empty() {
-                let trailing_this_block = block_slice
-                    .iter()
-                    .rev()
-                    .take_while(|&&v| v < MARKER_BASE)
-                    .count();
-                if trailing_this_block == block_slice.len() {
-                    // Entire block was clean — extend the prior run.
-                    trailing_clean = (trailing_clean + trailing_this_block).min(MAX_WINDOW_SIZE);
-                } else {
-                    // A marker appeared mid-block; the trailing clean run
-                    // restarts from after that last marker.
-                    trailing_clean = trailing_this_block.min(MAX_WINDOW_SIZE);
-                }
-            }
+            // Block fully decoded. Recompute the trailing-clean run over
+            // the WHOLE sink (markers ≥ MARKER_BASE end the run; clean
+            // bytes extend it, capped at MAX_WINDOW_SIZE). Replaces the
+            // prior per-block `as_slice()[before_len..]` scan — the
+            // segmented sink (`SegmentedU16`) can't hand out a contiguous
+            // slice, but `trailing_clean_run` walks its trailing segments
+            // back-to-front and yields the identical value (the run is
+            // bounded by 32 KiB so it touches ≤1 segment in steady state).
+            let _ = before_len;
+            trailing_clean = output.trailing_clean_run(MAX_WINDOW_SIZE);
 
             // Commit-1 instrumentation (no behavior change): once the block's
             // marker mode has flipped off, every byte this block produced is a
@@ -1545,22 +1536,17 @@ fn bootstrap_with_deflate_block_inner(
 
         // Build the clean dict if we have one.
         let clean_window = if clean_handoff_armed && output.sink_len() >= MAX_WINDOW_SIZE {
-            let start = output.sink_len() - MAX_WINDOW_SIZE;
             // Invariant: the trailing MAX_WINDOW_SIZE values of `output` are
-            // < MARKER_BASE (clean). Assert this — corruption here would
-            // seed ISA-L with garbage and produce a wrong-CRC chunk.
-            let window: Vec<u8> = output.as_slice()[start..]
-                .iter()
-                .map(|&v| {
-                    assert!(
-                        v < MARKER_BASE,
-                        "bootstrap clean window contained marker at offset {}; \
-                     trailing_clean tracker broken",
-                        v.saturating_sub(MARKER_BASE)
-                    );
-                    v as u8
-                })
-                .collect();
+            // < MARKER_BASE (clean) — guaranteed by `clean_handoff_armed`
+            // (`trailing_clean >= MAX_WINDOW_SIZE`). Assert it via the
+            // sink's own trailing-clean run; corruption here would seed
+            // ISA-L with garbage and produce a wrong-CRC chunk.
+            debug_assert!(
+                output.trailing_clean_run(MAX_WINDOW_SIZE) >= MAX_WINDOW_SIZE,
+                "bootstrap clean window contained a marker; trailing_clean tracker broken"
+            );
+            let mut window: Vec<u8> = Vec::with_capacity(MAX_WINDOW_SIZE);
+            output.copy_last_n_as_u8(MAX_WINDOW_SIZE, &mut window);
             Some(window)
         } else {
             None
@@ -1680,8 +1666,8 @@ mod tests {
 
     fn flatten(chunk: &ChunkData) -> Vec<u8> {
         let mut out = Vec::with_capacity(chunk.decoded_size());
-        for v in &chunk.data_with_markers {
-            out.push(*v as u8);
+        for seg in chunk.data_with_markers.segments() {
+            out.extend(seg.iter().map(|&v| v as u8));
         }
         out.extend_from_slice(&chunk.data);
         out
