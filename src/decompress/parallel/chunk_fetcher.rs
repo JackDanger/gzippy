@@ -261,10 +261,14 @@ impl InputSlice {
 pub fn drive<W: std::io::Write>(
     input: &[u8],
     writer: &mut W,
+    // `Some(fd)` enables the zero-copy `writev` consumer output path
+    // (fd-backed File/Stdout sink); `None` uses buffered `write_all`
+    // (MmapWriter / pipe-unbeneficial / test writers / oracle sink).
+    out_fd: Option<i32>,
     parallelization: usize,
     configuration: ChunkConfiguration,
 ) -> Result<(u32, usize), FetchError> {
-    drive_impl(input, writer, parallelization, configuration, None)
+    drive_impl(input, writer, out_fd, parallelization, configuration, None)
 }
 
 /// Clean-window oracle (advisor 2026-05-29): the cheapest experiment that
@@ -296,6 +300,7 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
     drive_impl(
         input,
         &mut sink,
+        None, // sink is not fd-backed → buffered write_all path
         parallelization,
         configuration,
         Some(seed.clone()),
@@ -443,6 +448,7 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
 fn drive_impl<W: std::io::Write>(
     input: &[u8],
     writer: &mut W,
+    out_fd: Option<i32>,
     parallelization: usize,
     configuration: ChunkConfiguration,
     seed_window_map: Option<WindowMap>,
@@ -575,6 +581,7 @@ fn drive_impl<W: std::io::Write>(
     let consumer_result = consumer_loop(
         input_view,
         writer,
+        out_fd,
         total_bits,
         &block_finder,
         &block_fetcher,
@@ -909,6 +916,9 @@ fn drive_impl<W: std::io::Write>(
 fn consumer_loop<W: std::io::Write>(
     input: InputSlice,
     writer: &mut W,
+    // Zero-copy output fd for the fast `writev` payload path; `None`
+    // routes payload through `writer.write_all` (see `drain_one_pending`).
+    out_fd: Option<i32>,
     total_bits: usize,
     block_finder: &GzipBlockFinder,
     block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
@@ -1449,6 +1459,7 @@ fn consumer_loop<W: std::io::Write>(
                         &mut pending,
                         window_map,
                         writer,
+                        out_fd,
                         total_crc,
                         total_size,
                         block_fetcher,
@@ -1633,6 +1644,7 @@ fn consumer_loop<W: std::io::Write>(
                 &mut pending,
                 window_map,
                 writer,
+                out_fd,
                 total_crc,
                 total_size,
                 block_fetcher,
@@ -1653,6 +1665,7 @@ fn consumer_loop<W: std::io::Write>(
             &mut pending,
             window_map,
             writer,
+            out_fd,
             total_crc,
             total_size,
             block_fetcher,
@@ -2904,6 +2917,11 @@ fn drain_one_pending<W: std::io::Write>(
     pending: &mut std::collections::VecDeque<PendingWrite>,
     window_map: &WindowMap,
     writer: &mut W,
+    // `Some(fd)` selects the zero-copy `writev` payload path direct to
+    // the fd-backed output sink (File/Stdout); `None` uses `writer`'s
+    // buffered `write_all`. See `fd_vectored_write` for the plumbing
+    // rationale + the no-split-write-paths invariant.
+    out_fd: Option<i32>,
     total_crc: &mut CRC32Calculator,
     total_size: &mut usize,
     block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
@@ -2987,46 +3005,99 @@ fn drain_one_pending<W: std::io::Write>(
     // `chunk.narrowed_crc`) so the consumer just consumes the result —
     // no second scan of `chunk.narrowed` here.
     let t_crc_write = std::time::Instant::now();
-    if !chunk.narrowed.is_empty() {
-        {
+    // ── Per-chunk payload write: narrowed-then-data, in stream order ──
+    //
+    // The output byte order is INVARIANT: the resolved marker prefix
+    // (`narrowed`) then the clean decoded tail (`data[prefix..]`). Two
+    // sinks share this block:
+    //
+    //   * Fast path (`out_fd == Some(fd)`, fd-backed File/Stdout):
+    //     a SINGLE `writev` of the two payload slices straight to the
+    //     fd, skipping the `BufWriter` gather copy entirely (the S4
+    //     lever — see `fd_vectored_write`). The `BufWriter` was flushed
+    //     empty before the consumer started and is never touched for
+    //     payload, so the fd cursor is exactly where these bytes belong
+    //     (the no-split-write-paths invariant). A clean chunk has an
+    //     empty `narrowed` → one iovec; the helper skips empty slices.
+    //
+    //   * Fallback (`out_fd == None`, MmapWriter / pipe-unbeneficial /
+    //     test writers): the original `write_all` sequence.
+    //
+    // The defensive `data_with_markers` narrow (when post-process
+    // skipped the narrow step) builds an owned buffer; we keep it alive
+    // in `fallback_narrowed` so its bytes are valid for the `writev`.
+    let fallback_narrowed: Option<Vec<u8>> =
+        if chunk.narrowed.is_empty() && !chunk.data_with_markers.is_empty() {
+            // Defensive fallback when `apply_window` ran but the narrow
+            // step was somehow skipped — narrows scalar inline. Should
+            // not happen on the production path (post_process always
+            // runs narrow after apply_window). Keeps the consumer
+            // correctness invariant: all marker bytes written before
+            // `chunk.data`. This path computes CRC inline because the
+            // worker's path didn't (no `chunk.narrowed` was produced).
+            let mut narrowed: Vec<u8> = Vec::with_capacity(chunk.data_with_markers.len());
+            for v in &chunk.data_with_markers {
+                narrowed.push(*v as u8);
+            }
+            chunk.narrowed_crc.update(&narrowed);
+            Some(narrowed)
+        } else {
+            None
+        };
+    let narrowed_slice: &[u8] = if !chunk.narrowed.is_empty() {
+        &chunk.narrowed
+    } else if let Some(ref fb) = fallback_narrowed {
+        fb
+    } else {
+        &[]
+    };
+    // A4: write only the decoded portion. `chunk.data[0..data_prefix_len]`
+    // (if any) is the predecessor's window image installed by
+    // `prefill_window_prefix` for the inflate hot path — never the
+    // user's output. For chunks that didn't go through A3 prefill,
+    // `data_prefix_len == 0` and the slice is `&chunk.data[..]`.
+    let payload_slice: &[u8] = if chunk.data.len() > chunk.data_prefix_len {
+        &chunk.data[chunk.data_prefix_len..]
+    } else {
+        &[]
+    };
+
+    // `wrote_via_fd` is set only on the unix fast path; on non-unix
+    // `out_fd` is always `None` (the fd is never computed) so this stays
+    // false and we take the buffered fallback.
+    let mut wrote_via_fd = false;
+    #[cfg(unix)]
+    if let Some(fd) = out_fd {
+        // Fast path: single zero-copy writev of (narrowed | data)
+        // direct to the fd — no BufWriter gather copy (the S4 lever).
+        let _tv2 = trace_v2::SpanGuard::begin("consumer.writev");
+        crate::decompress::parallel::fd_vectored_write::writev_all_to_fd(
+            fd,
+            narrowed_slice,
+            payload_slice,
+        )
+        .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+        *total_size += narrowed_slice.len() + payload_slice.len();
+        wrote_via_fd = true;
+    }
+    #[cfg(not(unix))]
+    let _ = out_fd;
+    if !wrote_via_fd {
+        // Fallback: the original buffered write_all sequence.
+        if !narrowed_slice.is_empty() {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.write_narrowed");
             writer
-                .write_all(&chunk.narrowed)
+                .write_all(narrowed_slice)
                 .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+            *total_size += narrowed_slice.len();
         }
-        *total_size += chunk.narrowed.len();
-    } else if !chunk.data_with_markers.is_empty() {
-        // Defensive fallback when `apply_window` ran but the narrow
-        // step was somehow skipped — narrows scalar inline. Should
-        // not happen on the production path (post_process always
-        // runs narrow after apply_window). Keeps the consumer
-        // correctness invariant: all marker bytes written before
-        // `chunk.data`. This path computes CRC inline because the
-        // worker's path didn't (no `chunk.narrowed` was produced).
-        let mut narrowed: Vec<u8> = Vec::with_capacity(chunk.data_with_markers.len());
-        for v in &chunk.data_with_markers {
-            narrowed.push(*v as u8);
-        }
-        chunk.narrowed_crc.update(&narrowed);
-        writer
-            .write_all(&narrowed)
-            .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-        *total_size += narrowed.len();
-    }
-    if chunk.data.len() > chunk.data_prefix_len {
-        // A4: write only the decoded portion. `chunk.data[0..data_prefix_len]`
-        // (if any) is the predecessor's window image installed by
-        // `prefill_window_prefix` for the inflate hot path — never the
-        // user's output. For chunks that didn't go through A3 prefill,
-        // `data_prefix_len == 0` and the slice is `&chunk.data[..]`.
-        let payload = &chunk.data[chunk.data_prefix_len..];
-        {
+        if !payload_slice.is_empty() {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.write_data");
             writer
-                .write_all(payload)
+                .write_all(payload_slice)
                 .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+            *total_size += payload_slice.len();
         }
-        *total_size += payload.len();
     }
     let crc_write_us = t_crc_write.elapsed().as_micros();
     let t_combine = std::time::Instant::now();
@@ -3105,7 +3176,7 @@ mod tests {
             crc32_enabled: true,
         };
         let mut out = Vec::new();
-        let (_crc, size) = drive(&deflate, &mut out, 4, cfg).expect("drive");
+        let (_crc, size) = drive(&deflate, &mut out, None, 4, cfg).expect("drive");
         assert_eq!(size, payload.len());
         assert_eq!(out, payload);
     }
@@ -3123,7 +3194,7 @@ mod tests {
             crc32_enabled: true,
         };
         let mut out = Vec::new();
-        let (_crc, size) = drive(&deflate, &mut out, 8, cfg).expect("drive");
+        let (_crc, size) = drive(&deflate, &mut out, None, 8, cfg).expect("drive");
         assert_eq!(size, payload.len());
         assert_eq!(out, payload);
     }
@@ -3191,7 +3262,7 @@ mod tests {
 
         let chunk_size = 4 * 1024 * 1024;
         let mut out = Vec::new();
-        let result = read_parallel_sm(&gz, &mut out, 2, chunk_size);
+        let result = read_parallel_sm(&gz, &mut out, None, 2, chunk_size);
         assert_eq!(result.expect("read_parallel_sm T=2").total_size, head.len());
         assert_eq!(out, head);
     }
@@ -3212,7 +3283,7 @@ mod tests {
             crc32_enabled: true,
         };
         let mut out = Vec::new();
-        let (_crc, size) = drive(&deflate, &mut out, 8, cfg).expect("drive");
+        let (_crc, size) = drive(&deflate, &mut out, None, 8, cfg).expect("drive");
         assert_eq!(size, payload.len(), "size mismatch (suggests early break)");
         assert_eq!(out, payload, "byte mismatch");
     }

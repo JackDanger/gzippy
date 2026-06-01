@@ -46,7 +46,7 @@ fn main() {
         // Discard output (io::sink) so we measure decode, not the sink tax.
         let mut sink = io::sink();
         match gzippy::decompress::parallel::single_member::decompress_parallel(
-            &data, &mut sink, threads,
+            &data, &mut sink, None, threads,
         ) {
             Ok(n) => total = total.wrapping_add(n),
             Err(e) => {

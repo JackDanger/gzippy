@@ -27,6 +27,8 @@ pub mod decode_bypass;
 #[cfg(parallel_sm)]
 pub mod deflate_block;
 pub mod error;
+#[cfg(all(parallel_sm, unix))]
+pub mod fd_vectored_write;
 pub mod gzip_block_finder;
 #[cfg(parallel_sm)]
 pub mod gzip_chunk;
