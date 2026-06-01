@@ -157,6 +157,34 @@ pub static UNSPLIT_BLOCKS_EMPLACED: std::sync::atomic::AtomicU64 =
 pub static PREFETCH_NEXT_FILESIZE_ACCEPT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// ── M1 instrument: consumer WRITE-time vs NEXT-CHUNK-WAIT (GZIPPY_TIMELINE) ──
+// Fills the 2×2 factorial's consumer-WAIT blind spot and bounds the
+// writer-thread overlap ceiling. These accumulate per-chunk timers that
+// `drain_one_pending` already computes (`crc_write_us`, `recv_us`) plus the
+// consumer-loop's `fetcher_get_us_sum` (the `wait.block_fetcher_get` stall).
+// Pure timing — byte-identical whether GZIPPY_TIMELINE is set or not (the
+// stderr summary print is the only gated effect). The DECISIVE comparison:
+//   write-time  >> next-chunk-wait ⇒ consumer is WRITE-BOUND with workers
+//      ahead ⇒ a writer-thread has OVERLAP HEADROOM (build it).
+//   next-chunk-wait dominates ⇒ consumer is STARVED on decode ⇒ a
+//      writer-thread just relocates cost = flat ⇒ don't build it.
+/// Σ per-chunk write-time = the consumer's `write_all(narrowed)+write_all(data)`
+/// span (`crc_write_us` at the drain site). The output-write the S4 oracle nulled.
+pub static M1_WRITE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Σ per-chunk recv-wait = the `wait.future_recv` block on an async pending
+/// post-process result (`recv_us` at the drain site).
+pub static M1_RECV_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Σ per-chunk publish-time (`publish_us`) — structural serial work, reported
+/// alongside so write-vs-wait is not contaminated by it.
+pub static M1_PUBLISH_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Count of drained chunks (for per-chunk means).
+pub static M1_DRAIN_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(parallel_sm)]
+fn m1_timeline_enabled() -> bool {
+    std::env::var_os("GZIPPY_TIMELINE").is_some()
+}
+
 #[derive(Debug)]
 #[allow(dead_code)] // error payloads surfaced via Debug in production
 pub enum FetchError {
@@ -905,6 +933,27 @@ fn drive_impl<W: std::io::Write>(
 /// vendor primitive — no inline ring, no inline cache logic, no
 /// inline take-from-prefetch.
 #[cfg(parallel_sm)]
+thread_local! {
+    /// GZIPPY_SLOW_CONSUMER=N (percent of this iteration's own time), parsed
+    /// once per thread. See the injection site in `consumer_loop`.
+    static SLOW_CONSUMER_PCT: Option<u128> = std::env::var("GZIPPY_SLOW_CONSUMER")
+        .ok()
+        .and_then(|s| s.parse::<u128>().ok())
+        .filter(|&p| p > 0);
+    /// GZIPPY_SLOW_CONSUMER_US=K — inject a FIXED K microseconds per consumer
+    /// iteration (the ABSOLUTE-ms calibration the standing protocol mandates;
+    /// avoids the fraction-of-smeared-region bias). Takes precedence over the
+    /// percent knob when both are set.
+    static SLOW_CONSUMER_US: Option<u64> = std::env::var("GZIPPY_SLOW_CONSUMER_US")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&p| p > 0);
+    /// GZIPPY_SLOW_CONSUMER_SLEEP=1 → frequency-neutral sleep control.
+    static SLOW_CONSUMER_SLEEP: bool =
+        std::env::var_os("GZIPPY_SLOW_CONSUMER_SLEEP").is_some();
+}
+
+#[cfg(parallel_sm)]
 #[allow(clippy::too_many_arguments)]
 fn consumer_loop<W: std::io::Write>(
     input: InputSlice,
@@ -1643,8 +1692,37 @@ fn consumer_loop<W: std::io::Write>(
                 },
             )?;
         }
-        iter_us_sum += t_iter.elapsed().as_micros();
+        let iter_us = t_iter.elapsed().as_micros();
+        iter_us_sum += iter_us;
         iter_count += 1;
+        // CAUSAL PROBE (C2 perturbation): slow the in-order CONSUMER serial
+        // chain (block-finder get + in-order drain/apply_window/publish +
+        // write) by either a FIXED K us (GZIPPY_SLOW_CONSUMER_US, the
+        // protocol-mandated absolute-ms calibration) or N% of this iteration's
+        // own measured time (GZIPPY_SLOW_CONSUMER). Byte-identical pure delay on
+        // the consumer thread. Frequency-neutral control via
+        // GZIPPY_SLOW_CONSUMER_SLEEP=1. NOTE (protocol blind-spot #4): this hits
+        // the consumer's BUSY work only — a consumer WAIT (absence of work) is
+        // structurally unperturbable, so this knob may UNDERSTATE consumer
+        // criticality if the consumer is mostly waiting. Off by default.
+        let extra_us: u64 = if let Some(k) = SLOW_CONSUMER_US.with(|c| *c) {
+            k
+        } else if let Some(pct) = SLOW_CONSUMER_PCT.with(|c| *c) {
+            (iter_us * pct / 100) as u64
+        } else {
+            0
+        };
+        if extra_us > 0 {
+            let extra = std::time::Duration::from_micros(extra_us);
+            if SLOW_CONSUMER_SLEEP.with(|s| *s) {
+                std::thread::sleep(extra);
+            } else {
+                let until = std::time::Instant::now() + extra;
+                while std::time::Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+            }
+        }
     }
 
     // Final drain — flush remaining post-processes in encoded order.
@@ -1672,6 +1750,41 @@ fn consumer_loop<W: std::io::Write>(
             &format!(
                 r#""iters":{iter_count},"iter_sum_us":{iter_us_sum},"prefetch_us":{prefetch_us_sum},"finder_us":{finder_us_sum},"fetcher_get_us":{fetcher_get_us_sum}"#,
             ),
+        );
+    }
+
+    // ── M1 VERDICT print (GZIPPY_TIMELINE) ──────────────────────────────────
+    // write-time (consumer output memcpy) vs next-chunk-WAIT (recv_us = the
+    // `wait.future_recv` block on an async post-process + fetcher_get_us = the
+    // `wait.block_fetcher_get` decode stall). DECISIVE: write >> wait ⇒
+    // WRITE-BOUND with headroom (writer-thread worth building); wait >> write ⇒
+    // STARVED (writer-thread just relocates the cost = flat).
+    if m1_timeline_enabled() {
+        use std::sync::atomic::Ordering;
+        let write_us = M1_WRITE_US.load(Ordering::Relaxed);
+        let recv_wait_us = M1_RECV_WAIT_US.load(Ordering::Relaxed);
+        let publish_us_tot = M1_PUBLISH_US.load(Ordering::Relaxed);
+        let chunks = M1_DRAIN_CHUNKS.load(Ordering::Relaxed).max(1);
+        // fetcher_get is the consumer-loop-level decode-stall wait (chunk not
+        // in the prefetch cache when the head reached it).
+        let fetcher_wait_us = fetcher_get_us_sum as u64;
+        let total_wait = recv_wait_us + fetcher_wait_us;
+        let verdict = if write_us as f64 > 1.5 * total_wait as f64 {
+            "WRITE-BOUND (writer-thread has overlap headroom)"
+        } else if total_wait as f64 > 1.5 * write_us as f64 {
+            "STARVED (writer-thread would just relocate cost — flat)"
+        } else {
+            "BALANCED (write ~ wait; partial overlap headroom)"
+        };
+        eprintln!(
+            "[gzippy M1] chunks={chunks} \
+             write_us={write_us} (per_chunk {:.0}) \
+             next_chunk_wait_us={total_wait} [recv_future={recv_wait_us} block_fetcher_get={fetcher_wait_us}] (per_chunk {:.0}) \
+             publish_us={publish_us_tot} \
+             write/wait={:.2} VERDICT={verdict}",
+            write_us as f64 / chunks as f64,
+            total_wait as f64 / chunks as f64,
+            write_us as f64 / total_wait.max(1) as f64,
         );
     }
 
@@ -2331,6 +2444,32 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
             chunk.data_with_markers.len()
         ),
     );
+    // CAUSAL PROBE (M2 third knob — marker-RESOLVE perturbation): slow the
+    // worker-side post-process (apply_window + replace_markers_lut_narrow, the
+    // marker-resolve compute) by a FIXED K us. This is the region the 2-knob
+    // {decode,consumer} factorial does NOT perturb — without this it is an
+    // un-perturbed blind spot in the compute decomposition. GZIPPY_SLOW_RESOLVE_US=K
+    // (absolute µs), frequency-neutral control via GZIPPY_SLOW_RESOLVE_SLEEP=1.
+    // Byte-identical pure delay. Off by default. NB: this runs ONCE per
+    // marker-bearing chunk on the worker pool (the same place D1's copy lives),
+    // so the elasticity reflects how on-the-critical-path the marker-resolve is.
+    {
+        let resolve_us: Option<u64> = std::env::var("GZIPPY_SLOW_RESOLVE_US")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&k| k > 0);
+        if let Some(k) = resolve_us {
+            let extra = std::time::Duration::from_micros(k);
+            if std::env::var_os("GZIPPY_SLOW_RESOLVE_SLEEP").is_some() {
+                std::thread::sleep(extra);
+            } else {
+                let until = std::time::Instant::now() + extra;
+                while std::time::Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
     // Vendor lambda at GzipChunkFetcher.hpp:579-582 — `applyWindow` only.
     // WindowMap writes happen on the consumer (`publish_subchunk_windows`).
     let start_bit = chunk.encoded_offset_bits;
@@ -3045,6 +3184,16 @@ fn drain_one_pending<W: std::io::Write>(
     }
     let combine_us = t_combine.elapsed().as_micros();
     let total_us = t_chunk.elapsed().as_micros();
+
+    // M1 accumulation (only when GZIPPY_TIMELINE is set — atomics are otherwise
+    // never touched, so this is byte-identical AND time-identical off).
+    if m1_timeline_enabled() {
+        use std::sync::atomic::Ordering;
+        M1_WRITE_US.fetch_add(crc_write_us as u64, Ordering::Relaxed);
+        M1_RECV_WAIT_US.fetch_add(recv_us as u64, Ordering::Relaxed);
+        M1_PUBLISH_US.fetch_add(publish_us as u64, Ordering::Relaxed);
+        M1_DRAIN_CHUNKS.fetch_add(1, Ordering::Relaxed);
+    }
 
     if trace::is_enabled() {
         trace::emit(
