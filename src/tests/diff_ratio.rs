@@ -163,7 +163,7 @@ mod tests {
             || {
                 let mut out = Vec::new();
                 let _ = crate::decompress::parallel::single_member::decompress_parallel(
-                    data, &mut out, 4,
+                    data, &mut out, None, 4,
                 );
             },
             || {
@@ -218,7 +218,7 @@ mod tests {
             || {
                 let mut out = Vec::new();
                 let _ = crate::decompress::parallel::single_member::decompress_parallel(
-                    data, &mut out, 4,
+                    data, &mut out, None, 4,
                 );
             },
             || {

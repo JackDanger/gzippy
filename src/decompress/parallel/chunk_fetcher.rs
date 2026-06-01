@@ -259,10 +259,14 @@ impl InputSlice {
 pub fn drive<W: std::io::Write>(
     input: &[u8],
     writer: &mut W,
+    // `Some(fd)` enables the zero-copy `writev` consumer output path
+    // (fd-backed File/Stdout sink); `None` uses buffered `write_all`
+    // (MmapWriter / pipe-unbeneficial / test writers / oracle sink).
+    out_fd: Option<i32>,
     parallelization: usize,
     configuration: ChunkConfiguration,
 ) -> Result<(u32, usize), FetchError> {
-    drive_impl(input, writer, parallelization, configuration, None)
+    drive_impl(input, writer, out_fd, parallelization, configuration, None)
 }
 
 /// Clean-window oracle (advisor 2026-05-29): the cheapest experiment that
@@ -294,6 +298,7 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
     drive_impl(
         input,
         &mut sink,
+        None, // sink is not fd-backed → buffered write_all path
         parallelization,
         configuration,
         Some(seed.clone()),
@@ -441,6 +446,7 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
 fn drive_impl<W: std::io::Write>(
     input: &[u8],
     writer: &mut W,
+    out_fd: Option<i32>,
     parallelization: usize,
     configuration: ChunkConfiguration,
     seed_window_map: Option<WindowMap>,
@@ -573,6 +579,7 @@ fn drive_impl<W: std::io::Write>(
     let consumer_result = consumer_loop(
         input_view,
         writer,
+        out_fd,
         total_bits,
         &block_finder,
         &block_fetcher,
@@ -913,6 +920,9 @@ fn drive_impl<W: std::io::Write>(
 fn consumer_loop<W: std::io::Write>(
     input: InputSlice,
     writer: &mut W,
+    // Zero-copy output fd for the fast `writev` payload path; `None`
+    // routes payload through `writer.write_all` (see `drain_one_pending`).
+    out_fd: Option<i32>,
     total_bits: usize,
     block_finder: &GzipBlockFinder,
     block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
@@ -1453,6 +1463,7 @@ fn consumer_loop<W: std::io::Write>(
                         &mut pending,
                         window_map,
                         writer,
+                        out_fd,
                         total_crc,
                         total_size,
                         block_fetcher,
@@ -1637,6 +1648,7 @@ fn consumer_loop<W: std::io::Write>(
                 &mut pending,
                 window_map,
                 writer,
+                out_fd,
                 total_crc,
                 total_size,
                 block_fetcher,
@@ -1657,6 +1669,7 @@ fn consumer_loop<W: std::io::Write>(
             &mut pending,
             window_map,
             writer,
+            out_fd,
             total_crc,
             total_size,
             block_fetcher,
@@ -2899,6 +2912,11 @@ fn drain_one_pending<W: std::io::Write>(
     pending: &mut std::collections::VecDeque<PendingWrite>,
     window_map: &WindowMap,
     writer: &mut W,
+    // `Some(fd)` selects the zero-copy `writev` payload path direct to
+    // the fd-backed output sink (File/Stdout); `None` uses `writer`'s
+    // buffered `write_all`. See `fd_vectored_write` for the plumbing
+    // rationale + the no-split-write-paths invariant.
+    out_fd: Option<i32>,
     total_crc: &mut CRC32Calculator,
     total_size: &mut usize,
     block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
@@ -2982,69 +3000,162 @@ fn drain_one_pending<W: std::io::Write>(
     // `chunk.narrowed_crc`) so the consumer just consumes the result —
     // no second scan of `chunk.narrowed` here.
     let t_crc_write = std::time::Instant::now();
-    if let Some(resolved) = chunk.resolved_markers.as_ref() {
-        // FAITHFUL PORT: the resolved marker bytes live in the marker
-        // buffer's own 128 KiB segments (vendor in-place reuse). Stream
-        // each segment to the writer — zero copy, no contiguous
-        // intermediate. CRC was computed on the post-process worker
-        // (`chunk.narrowed_crc`).
-        if !resolved.is_empty() {
-            let _tv2 = trace_v2::SpanGuard::begin("consumer.write_narrowed");
-            for seg in resolved.byte_segments() {
-                writer
-                    .write_all(seg)
-                    .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-                *total_size += seg.len();
+    // ── Per-chunk payload write: (resolved marker segments) then data ──
+    //
+    // The output byte order is INVARIANT: the resolved marker prefix
+    // (now living in the marker buffer's OWN 128 KiB segments — the
+    // in-place `applyWindow` reuse, vendor DecodedData.hpp:306-392) then
+    // the clean decoded tail (`data[prefix..]`). Two sinks share this:
+    //
+    //   * Fast path (`out_fd == Some(fd)`, fd-backed File/Stdout/pipe):
+    //     gather the resolved segments + the `data` tail into one iovec
+    //     list (vendor `toIoVec`, DecodedData.hpp:529-546) and hand it
+    //     to the ported `writeAll` (vendor ChunkData.hpp:794-825):
+    //     vmsplice on a Linux pipe (with SpliceVault page-lifetime
+    //     accounting), writev otherwise. No BufWriter gather copy (the
+    //     S4 lever). The BufWriter was flushed empty before the consumer
+    //     started and is never touched for payload (no-split-write-paths
+    //     invariant).
+    //
+    //   * Fallback (`out_fd == None`, MmapWriter / test writers): the
+    //     original buffered `write_all` of each segment then the data.
+    //
+    // The defensive fallback (markers present but never resolved — e.g.
+    // post-process skipped) builds an owned u8 buffer and CRCs it inline
+    // (the worker's path didn't). On the production path resolution
+    // always ran, so any value here is a literal (< MARKER_BASE).
+    let fallback_narrowed: Option<Vec<u8>> =
+        if chunk.resolved_markers.is_none() && !chunk.data_with_markers.is_empty() {
+            let mut narrowed: Vec<u8> = Vec::with_capacity(chunk.data_with_markers.len());
+            for seg in chunk.data_with_markers.segments() {
+                narrowed.extend(seg.iter().map(|&v| v as u8));
             }
-        }
-    } else if !chunk.data_with_markers.is_empty() {
-        // Defensive fallback when markers were never resolved (e.g. a
-        // chunk whose post-process step was skipped). Narrows scalar
-        // inline, resolving any marker against an all-zero window would
-        // be wrong — but on the production path resolution always ran, so
-        // any value here is a literal (< MARKER_BASE). Computes CRC
-        // inline (the worker's path didn't). Keeps the consumer invariant:
-        // all marker bytes written before `chunk.data`.
-        let mut narrowed: Vec<u8> = Vec::with_capacity(chunk.data_with_markers.len());
-        for seg in chunk.data_with_markers.segments() {
-            narrowed.extend(seg.iter().map(|&v| v as u8));
-        }
-        chunk.narrowed_crc.update(&narrowed);
-        writer
-            .write_all(&narrowed)
-            .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-        *total_size += narrowed.len();
-    }
-    if chunk.data.len() > chunk.data_prefix_len {
-        // A4: write only the decoded portion. `chunk.data[0..data_prefix_len]`
-        // (if any) is the predecessor's window image installed by
-        // `prefill_window_prefix` for the inflate hot path — never the
-        // user's output. For chunks that didn't go through A3 prefill,
-        // `data_prefix_len == 0` and the slice is `&chunk.data[..]`.
-        let payload = &chunk.data[chunk.data_prefix_len..];
-        {
-            let _tv2 = trace_v2::SpanGuard::begin("consumer.write_data");
-            writer
-                .write_all(payload)
-                .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-        }
-        *total_size += payload.len();
-    }
-    let crc_write_us = t_crc_write.elapsed().as_micros();
-    let t_combine = std::time::Instant::now();
+            chunk.narrowed_crc.update(&narrowed);
+            Some(narrowed)
+        } else {
+            None
+        };
+
+    // A4: write only the decoded portion. `chunk.data[0..data_prefix_len]`
+    // (if any) is the predecessor's window image installed by
+    // `prefill_window_prefix` for the inflate hot path — never the
+    // user's output. For chunks that didn't go through A3 prefill,
+    // `data_prefix_len == 0` and the slice is `&chunk.data[..]`.
+    let payload_slice: &[u8] = if chunk.data.len() > chunk.data_prefix_len {
+        &chunk.data[chunk.data_prefix_len..]
+    } else {
+        &[]
+    };
+
+    // CRC combine FIRST (it only reads `chunk.narrowed_crc` +
+    // `chunk.crc32s`, independent of the write order). Doing it here lets
+    // the fd fast path MOVE `chunk` into the SpliceVault owner box right
+    // after, keeping its buffers alive for vmsplice without needing to
+    // borrow `chunk` again afterward.
+    //
+    // Concatenated chunk output is (narrowed | data), so we combine in
+    // that order. `chunk.narrowed_crc` covers the resolved marker bytes
+    // (computed on the post-process worker — vendor parity, or inline
+    // above on the defensive path); the worker-computed `chunk.crc32s`
+    // cover the data-stream bytes. Multiple stream entries (multi-member
+    // inside a chunk) are appended in stream order.
     {
         let _tv2 = trace_v2::SpanGuard::begin("consumer.combine_crc");
-        // Concatenated chunk output is (narrowed | data), so we combine
-        // in that order. `chunk.narrowed_crc` covers narrowed bytes
-        // (now computed on the post-process worker — vendor parity);
-        // the worker-computed `chunk.crc32s` cover the data-stream bytes.
-        // Multiple stream entries (multi-member inside a chunk) are
-        // appended in stream order to match the output byte order.
         total_crc.append(&chunk.narrowed_crc);
         for stream_crc in &chunk.crc32s {
             total_crc.append(stream_crc);
         }
     }
+    let decoded_size = chunk.decoded_size();
+
+    // The fd fast path is available only on unix AND only when the
+    // caller passed an fd. On non-unix `out_fd` is always `None` (the fd
+    // is never computed in `io.rs`), so `fd_fast` is `None` and we take
+    // the buffered fallback unconditionally. Keeping the whole write as a
+    // SINGLE if/else (rather than a runtime `wrote_via_fd` flag) lets the
+    // borrow checker prove the `chunk` move (fd arm) and the `chunk`
+    // borrow (fallback arm) are mutually exclusive.
+    #[cfg(unix)]
+    let fd_fast = out_fd;
+    #[cfg(not(unix))]
+    let fd_fast: Option<i32> = {
+        let _ = out_fd;
+        None
+    };
+
+    if let Some(fd) = fd_fast {
+        // ── Fast path: toIoVec + ported writeAll (vmsplice/writev) ──
+        // SAFETY/lifetime: `to_io_vec` lowers the segment/data slices to
+        // RAW pointers (no Rust lifetime retained in `Vec<iovec>`), so
+        // after it returns the `&chunk` borrow is released and `chunk`
+        // can be moved into the owner box. The owner OWNS every buffer
+        // the iovecs point into; on the vmsplice path the SpliceVault
+        // holds it until the pipe drains those bytes, on the writev path
+        // the bytes are copied synchronously and the box drops at the end
+        // of `write_all_to_fd`. Heap buffers move by-pointer when the
+        // `ChunkData` is boxed, so the raw pointers stay valid.
+        #[cfg(unix)]
+        {
+            use crate::decompress::parallel::fd_vectored_write;
+            let _tv2 = trace_v2::SpanGuard::begin("consumer.writev");
+            let payload_len = payload_slice.len();
+            let (mut iovs, marker_len) = if let Some(resolved) = chunk.resolved_markers.as_ref() {
+                let mlen = resolved.len();
+                (
+                    fd_vectored_write::to_io_vec(resolved.byte_segments(), payload_slice),
+                    mlen,
+                )
+            } else if let Some(ref fb) = fallback_narrowed {
+                (
+                    fd_vectored_write::to_io_vec(std::iter::once(fb.as_slice()), payload_slice),
+                    fb.len(),
+                )
+            } else {
+                (
+                    fd_vectored_write::to_io_vec(std::iter::empty::<&[u8]>(), payload_slice),
+                    0,
+                )
+            };
+            let owner: Box<dyn std::any::Any + Send> = Box::new((chunk, fallback_narrowed));
+            fd_vectored_write::write_all_to_fd(fd, &mut iovs, owner)
+                .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+            *total_size += marker_len + payload_len;
+        }
+        // On non-unix this arm is never taken (`fd_fast == None`); the
+        // `fd` binding would be unused there.
+        #[cfg(not(unix))]
+        let _ = fd;
+    } else {
+        // ── Fallback: buffered write_all — resolved marker segments (or
+        // the defensive narrowed buffer) first, then the clean data tail,
+        // preserving stream order. ──
+        if let Some(resolved) = chunk.resolved_markers.as_ref() {
+            if !resolved.is_empty() {
+                let _tv2 = trace_v2::SpanGuard::begin("consumer.write_narrowed");
+                for seg in resolved.byte_segments() {
+                    writer
+                        .write_all(seg)
+                        .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+                    *total_size += seg.len();
+                }
+            }
+        } else if let Some(ref fb) = fallback_narrowed {
+            let _tv2 = trace_v2::SpanGuard::begin("consumer.write_narrowed");
+            writer
+                .write_all(fb)
+                .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+            *total_size += fb.len();
+        }
+        if !payload_slice.is_empty() {
+            let _tv2 = trace_v2::SpanGuard::begin("consumer.write_data");
+            writer
+                .write_all(payload_slice)
+                .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+            *total_size += payload_slice.len();
+        }
+    }
+    let crc_write_us = t_crc_write.elapsed().as_micros();
+    let t_combine = std::time::Instant::now();
     let combine_us = t_combine.elapsed().as_micros();
     let total_us = t_chunk.elapsed().as_micros();
 
@@ -3054,7 +3165,7 @@ fn drain_one_pending<W: std::io::Write>(
             "consume_done",
             &format!(
                 r#""partition_idx":{idx},"decoded":{},"recv_us":{recv_us},"publish_us":{publish_us},"crc_write_us":{crc_write_us},"combine_us":{combine_us},"total_us":{total_us}"#,
-                chunk.decoded_size()
+                decoded_size
             ),
         );
     }
@@ -3076,6 +3187,7 @@ fn drain_one_pending<W: std::io::Write>(
 pub fn drive<W: std::io::Write>(
     _input: &[u8],
     _writer: &mut W,
+    _out_fd: Option<i32>,
     _parallelization: usize,
     _configuration: ChunkConfiguration,
 ) -> Result<(u32, usize), FetchError> {
@@ -3107,7 +3219,7 @@ mod tests {
             crc32_enabled: true,
         };
         let mut out = Vec::new();
-        let (_crc, size) = drive(&deflate, &mut out, 4, cfg).expect("drive");
+        let (_crc, size) = drive(&deflate, &mut out, None, 4, cfg).expect("drive");
         assert_eq!(size, payload.len());
         assert_eq!(out, payload);
     }
@@ -3125,7 +3237,7 @@ mod tests {
             crc32_enabled: true,
         };
         let mut out = Vec::new();
-        let (_crc, size) = drive(&deflate, &mut out, 8, cfg).expect("drive");
+        let (_crc, size) = drive(&deflate, &mut out, None, 8, cfg).expect("drive");
         assert_eq!(size, payload.len());
         assert_eq!(out, payload);
     }
@@ -3193,7 +3305,7 @@ mod tests {
 
         let chunk_size = 4 * 1024 * 1024;
         let mut out = Vec::new();
-        let result = read_parallel_sm(&gz, &mut out, 2, chunk_size);
+        let result = read_parallel_sm(&gz, &mut out, None, 2, chunk_size);
         assert_eq!(result.expect("read_parallel_sm T=2").total_size, head.len());
         assert_eq!(out, head);
     }
@@ -3214,7 +3326,7 @@ mod tests {
             crc32_enabled: true,
         };
         let mut out = Vec::new();
-        let (_crc, size) = drive(&deflate, &mut out, 8, cfg).expect("drive");
+        let (_crc, size) = drive(&deflate, &mut out, None, 8, cfg).expect("drive");
         assert_eq!(size, payload.len(), "size mismatch (suggests early break)");
         assert_eq!(out, payload, "byte mismatch");
     }

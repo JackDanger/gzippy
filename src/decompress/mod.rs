@@ -279,7 +279,10 @@ pub(crate) fn decompress_gzip_libdeflate<W: Write + Send>(
         | DecodePath::IsalSingle
         | DecodePath::StreamingSingle
         | DecodePath::LibdeflateSingle => {
-            decompress_single_member_for(path, data, writer, num_threads)
+            // Library/API entry: the concrete sink type is unknown here,
+            // so no fd-vectored fast path (buffered `write_all`). The CLI
+            // I/O layer uses `decompress_single_member_fd` to opt in.
+            decompress_single_member_for(path, data, writer, None, num_threads)
         }
     }
 }
@@ -322,6 +325,24 @@ pub(crate) fn decompress_single_member<W: Write>(
     writer: &mut W,
     num_threads: usize,
 ) -> GzippyResult<u64> {
+    // Default entry: no fd-vectored output (buffered `write_all`). The
+    // fd-aware variant `decompress_single_member_fd` is called by the
+    // I/O layer when the sink is a raw-fd-backed File/Stdout, enabling
+    // the zero-copy `writev` consumer path. See `parallel::chunk_fetcher
+    // ::fd_vectored_write` for the plumbing rationale.
+    decompress_single_member_fd(data, writer, None, num_threads)
+}
+
+/// fd-aware single-member entry. `out_fd == Some(fd)` routes the
+/// parallel-SM consumer's payload writes through zero-copy `writev`
+/// directly to the fd (the S4 lever); `None` keeps the buffered
+/// `write_all` path. Non-SM backends ignore `out_fd`.
+pub(crate) fn decompress_single_member_fd<W: Write>(
+    data: &[u8],
+    writer: &mut W,
+    out_fd: Option<i32>,
+    num_threads: usize,
+) -> GzippyResult<u64> {
     let path = classify_gzip(data, num_threads);
     if crate::utils::debug_enabled() {
         eprintln!(
@@ -349,7 +370,7 @@ pub(crate) fn decompress_single_member<W: Write>(
         | DecodePath::IsalSingle
         | DecodePath::StreamingSingle
         | DecodePath::LibdeflateSingle => {
-            decompress_single_member_for(path, data, writer, num_threads)
+            decompress_single_member_for(path, data, writer, out_fd, num_threads)
         }
     }
 }
@@ -375,6 +396,10 @@ fn decompress_single_member_for<W: Write>(
     path: DecodePath,
     data: &[u8],
     writer: &mut W,
+    // `Some(fd)` enables the zero-copy `writev` consumer output path
+    // for the parallel-SM backend (fd-backed File/Stdout sinks); `None`
+    // keeps buffered `write_all`. Non-SM arms ignore it.
+    out_fd: Option<i32>,
     num_threads: usize,
 ) -> GzippyResult<u64> {
     match path {
@@ -383,9 +408,20 @@ fn decompress_single_member_for<W: Write>(
             // returns an error. No fallback. This is the production
             // hot path on x86_64 + ISA-L for inputs ≥ MIN_PARALLEL_COMPRESSED
             // with T > 1.
+            //
+            // CORRECTNESS (no-split-write-paths): when `out_fd` is set,
+            // the consumer `writev`'s payload DIRECTLY to the fd and the
+            // BufWriter is never used for payload. Flush it once here so
+            // it is provably empty before the parallel pipeline starts —
+            // nothing else writes to it, so the fd cursor stays exactly
+            // where the next payload byte belongs.
+            if out_fd.is_some() {
+                writer.flush()?;
+            }
             let n = crate::decompress::parallel::single_member::decompress_parallel(
                 data,
                 writer,
+                out_fd,
                 num_threads,
             )
             .map_err(|e| GzippyError::decompression(format!("parallel SM: {e}")))?;

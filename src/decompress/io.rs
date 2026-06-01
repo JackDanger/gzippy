@@ -7,7 +7,30 @@
 
 use std::fs::File;
 use std::io::{self, stdin, stdout, BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
+
+/// Raw fd of an fd-backed sink, for the zero-copy `writev` consumer
+/// output path (the S4 lever). Unix only; `None` everywhere else (the
+/// parallel-SM consumer then uses buffered `write_all`).
+#[cfg(unix)]
+#[inline]
+fn out_fd_of<F: AsRawFd>(f: &F) -> Option<i32> {
+    // Escape hatch / A/B knob: `GZIPPY_DISABLE_WRITEV=1` forces the
+    // buffered `write_all` consumer path (no fd-vectored output), so a
+    // single binary can measure writev-on vs writev-off without a
+    // rebuild. Read once here (not per chunk).
+    if std::env::var_os("GZIPPY_DISABLE_WRITEV").is_some() {
+        return None;
+    }
+    Some(f.as_raw_fd())
+}
+#[cfg(not(unix))]
+#[inline]
+fn out_fd_of<F>(_f: &F) -> Option<i32> {
+    None
+}
 
 struct CountingWriter<W: Write> {
     inner: W,
@@ -146,7 +169,13 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     let result = if args.stdout {
         let stdout = stdout();
         let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
-        let r = decompress_to_writer(&mmap, &mut writer, format, args);
+        // Zero-copy consumer output: stdout is a raw-fd sink (file, pipe,
+        // or tty — `writev` is fine for all). The parallel-SM consumer
+        // writes payload directly to this fd, bypassing the BufWriter
+        // gather copy (S4 lever). The BufWriter is flushed empty before
+        // the SM pipeline starts (see `decompress_single_member_for`).
+        let out_fd = out_fd_of(writer.get_ref());
+        let r = decompress_to_writer(&mmap, &mut writer, out_fd, format, args);
         writer.flush()?;
         r
     } else {
@@ -162,21 +191,29 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             if let Some(isize_field) = extract_isize_field(&mmap) {
                 use crate::decompress::mmap_writer::MmapWriter;
                 let mut writer = MmapWriter::open_pre_sized(&output_path, isize_field as usize)?;
-                let r = decompress_to_writer(&mmap, &mut writer, format, args);
+                // MmapWriter is NOT an fd-sequential-write sink (output
+                // lands via mmap stores, not write()); keep the buffered
+                // path. No `writev` fast path here.
+                let r = decompress_to_writer(&mmap, &mut writer, None, format, args);
                 let _written = writer.finalize()?;
                 r
             } else {
                 // Fall back to BufWriter if ISIZE isn't extractable.
                 let output_file = File::create(&output_path)?;
                 let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
-                let r = decompress_to_writer(&mmap, &mut writer, format, args);
+                let out_fd = out_fd_of(writer.get_ref());
+                let r = decompress_to_writer(&mmap, &mut writer, out_fd, format, args);
                 writer.flush()?;
                 r
             }
         } else {
             let output_file = File::create(&output_path)?;
             let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
-            let r = decompress_to_writer(&mmap, &mut writer, format, args);
+            // Output file is a raw-fd sink → zero-copy `writev` consumer
+            // path (S4 lever). The BufWriter is flushed empty before the
+            // SM pipeline; payload goes straight to the fd.
+            let out_fd = out_fd_of(writer.get_ref());
+            let r = decompress_to_writer(&mmap, &mut writer, out_fd, format, args);
             writer.flush()?;
             r
         }
@@ -391,6 +428,12 @@ fn decompress_directory(dirname: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 fn decompress_to_writer<W: Write>(
     mmap: &Mmap,
     writer: &mut W,
+    // `Some(fd)` is the output sink's raw fd when it is a File/Stdout
+    // (computed at the construction site, where the concrete writer
+    // type is known). Enables the zero-copy `writev` consumer path on
+    // the single-member parallel backend. `None` for non-fd sinks
+    // (MmapWriter). See `parallel::chunk_fetcher::fd_vectored_write`.
+    out_fd: Option<i32>,
     format: CompressionFormat,
     args: &GzippyArgs,
 ) -> GzippyResult<u64> {
@@ -426,7 +469,12 @@ fn decompress_to_writer<W: Write>(
                 writer.write_all(&output)?;
                 Ok(len)
             } else {
-                crate::decompress::decompress_single_member(&mmap[..], writer, args.processes)
+                crate::decompress::decompress_single_member_fd(
+                    &mmap[..],
+                    writer,
+                    out_fd,
+                    args.processes,
+                )
             }
         }
         CompressionFormat::Zlib => crate::decompress::decompress_zlib_turbo(&mmap[..], writer),
