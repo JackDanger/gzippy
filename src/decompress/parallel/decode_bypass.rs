@@ -111,7 +111,9 @@ impl CapturedChunk {
             data_with_markers: if meta_only() {
                 Vec::new()
             } else {
-                c.data_with_markers.clone()
+                // Flatten the segmented marker buffer into a contiguous
+                // Vec<u16> for serialization.
+                c.data_with_markers.segments().flatten().copied().collect()
             },
             data: if meta_only() {
                 Vec::new()
@@ -181,13 +183,16 @@ impl CapturedChunk {
                     0
                 },
         );
-        let data_with_markers: Vec<u16> = if fold {
-            for &v in &self.data_with_markers {
-                data.push(v as u8);
+        let data_with_markers: crate::decompress::parallel::segmented_markers::SegmentedU16 = {
+            let mut seg = crate::decompress::parallel::segmented_markers::SegmentedU16::default();
+            if fold {
+                for &v in &self.data_with_markers {
+                    data.push(v as u8);
+                }
+            } else {
+                seg.push_slice(&self.data_with_markers);
             }
-            Vec::new()
-        } else {
-            self.data_with_markers.clone()
+            seg
         };
         let folded_lead = data.len(); // clean bytes already pushed (== fold count)
         data.extend_from_slice(&self.data);
@@ -559,7 +564,7 @@ pub fn sleep_replay(
         cap.encoded_size_bits,
         cap.stopped_preemptively,
         0, // data_prefix_len: fully clean, no window-image prefix
-        Vec::new(),
+        crate::decompress::parallel::segmented_markers::SegmentedU16::default(),
         data,
         crc0,
         subchunks,

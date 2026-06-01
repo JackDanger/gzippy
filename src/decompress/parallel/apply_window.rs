@@ -9,8 +9,9 @@
 //!
 //! CRC32 accounting is the caller's responsibility — see `apply_window`.
 
-use crate::decompress::parallel::chunk_data::{ChunkData, MARKER_BASE};
-use crate::decompress::parallel::replace_markers::replace_markers;
+use crate::decompress::parallel::chunk_data::ChunkData;
+#[cfg(test)]
+use crate::decompress::parallel::chunk_data::MARKER_BASE;
 
 /// Resolve markers in place. CRC32 accounting is the CALLER's
 /// responsibility: the consumer CRCs the resolved bytes once, over the
@@ -33,14 +34,14 @@ pub fn apply_window(chunk: &mut ChunkData, window: &[u8]) {
         "trim_window_prefix before apply_window"
     );
 
-    // Resolve markers in place. After this call, every value in
-    // `data_with_markers` is < 256 (a literal byte).
-    replace_markers(&mut chunk.data_with_markers, window);
+    // Resolve markers in place (u16→u16). After this call, every value
+    // in `data_with_markers` is < 256 (a literal byte). Per-segment LUT.
+    chunk.data_with_markers.resolve_markers_u16(window);
 
     // Verify in debug builds: any remaining marker would indicate a
     // resolver bug (out-of-range distance or wrong window size).
     debug_assert!(
-        chunk.data_with_markers.iter().all(|v| *v < MARKER_BASE),
+        chunk.data_with_markers.all_resolved(),
         "apply_window left unresolved markers in data_with_markers"
     );
 }
@@ -83,12 +84,12 @@ mod tests {
 
         // First 5 bytes unchanged.
         for i in 0..5 {
-            assert_eq!(chunk.data_with_markers[i], i as u16);
+            assert_eq!(chunk.data_with_markers.at(i), i as u16);
         }
         // Marker 0 → window[0], marker 1 → window[1], marker 2 → window[2].
-        assert_eq!(chunk.data_with_markers[5] as u8, window[0]);
-        assert_eq!(chunk.data_with_markers[6] as u8, window[1]);
-        assert_eq!(chunk.data_with_markers[7] as u8, window[2]);
+        assert_eq!(chunk.data_with_markers.at(5) as u8, window[0]);
+        assert_eq!(chunk.data_with_markers.at(6) as u8, window[1]);
+        assert_eq!(chunk.data_with_markers.at(7) as u8, window[2]);
     }
 
     #[test]
@@ -115,10 +116,10 @@ mod tests {
         apply_window(&mut chunk, &window);
 
         // After resolution every data_with_markers entry is < 256.
-        assert!(chunk.data_with_markers.iter().all(|v| *v < MARKER_BASE));
+        assert!(chunk.data_with_markers.all_resolved());
         // Markers map to window bytes 0 and 5.
-        assert_eq!(chunk.data_with_markers[3] as u8, window[0]);
-        assert_eq!(chunk.data_with_markers[4] as u8, window[5]);
+        assert_eq!(chunk.data_with_markers.at(3) as u8, window[0]);
+        assert_eq!(chunk.data_with_markers.at(4) as u8, window[5]);
         // (CRC accounting moved to the consumer — verified by the
         // routing-level round-trip tests in tests/routing.rs and the
         // full bench's `output size mismatch` / md5 check.)
@@ -135,6 +136,6 @@ mod tests {
         apply_window(&mut chunk, &window);
         assert_eq!(chunk.crc32s[0].crc32(), crc_before);
         // Markers still resolved.
-        assert_eq!(chunk.data_with_markers[2] as u8, 0xAB);
+        assert_eq!(chunk.data_with_markers.at(2) as u8, 0xAB);
     }
 }

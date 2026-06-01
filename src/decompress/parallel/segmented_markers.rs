@@ -206,6 +206,42 @@ impl SegmentedU16 {
         n
     }
 
+    /// If the last `n` elements are all CLEAN (`< MARKER_BASE`), append
+    /// them as u8 bytes to `out` (NOT cleared — caller controls) and
+    /// return `true`. If any of the last `n` is a marker, append nothing
+    /// and return `false`. Used by `last_32kib_window{,_vec}` which need
+    /// a marker-free tail to seed the successor's dict (otherwise the
+    /// caller must wait for resolution).
+    pub fn append_last_n_clean_bytes(&self, n: usize, out: &mut [u8]) -> bool {
+        debug_assert!(n <= self.cached_len);
+        debug_assert!(out.len() >= n);
+        if n == 0 {
+            return true;
+        }
+        let start = self.cached_len - n;
+        // First pass: marker check over the suffix.
+        let mut elem_base = 0usize;
+        let mut write_pos = 0usize;
+        for seg in &self.segments {
+            let seg_len = seg.len();
+            let seg_start = elem_base;
+            let seg_end = elem_base + seg_len;
+            if seg_end > start {
+                let local_from = start.saturating_sub(seg_start);
+                for &v in &seg[local_from..] {
+                    if v >= MARKER_BASE {
+                        return false;
+                    }
+                    out[write_pos] = v as u8;
+                    write_pos += 1;
+                }
+            }
+            elem_base = seg_end;
+        }
+        debug_assert_eq!(write_pos, n);
+        true
+    }
+
     /// Run-length of trailing CLEAN (`< MARKER_BASE`) values, capped at
     /// `cap`. Walks segments back-to-front, stopping at the first
     /// marker or at `cap`. Used by the bootstrap's per-block
@@ -333,6 +369,46 @@ impl SegmentedU16 {
         std::mem::take(&mut self.segments)
     }
 
+    /// Resolve every marker (`>= MARKER_BASE`) to its literal byte value
+    /// (as a u16 `< 256`) IN PLACE, keeping the buffer a `SegmentedU16`.
+    /// This is the u16→u16 form of vendor `applyWindow` used by the
+    /// standalone `apply_window` helper + tests; the production path uses
+    /// the u8-producing [`Self::resolve_in_place`]. Applies the same
+    /// branchless LUT per segment.
+    pub fn resolve_markers_u16(&mut self, window: &[u8]) {
+        if self.cached_len == 0 {
+            return;
+        }
+        debug_assert_eq!(window.len(), 32768);
+        let mut lut = [0u16; 65536];
+        for (i, slot) in lut[0..256].iter_mut().enumerate() {
+            *slot = i as u16;
+        }
+        for (i, &b) in window.iter().enumerate() {
+            lut[MARKER_BASE as usize + i] = b as u16;
+        }
+        for seg in &mut self.segments {
+            for v in seg.iter_mut() {
+                *v = lut[*v as usize];
+            }
+        }
+    }
+
+    /// True iff every value is `< MARKER_BASE` (no unresolved markers).
+    /// Debug-assert helper.
+    pub fn all_resolved(&self) -> bool {
+        self.segments
+            .iter()
+            .all(|seg| seg.iter().all(|&v| v < MARKER_BASE))
+    }
+
+    /// Read the value at logical index `i` (panics out of range). Used
+    /// by tests asserting resolved values.
+    #[allow(dead_code)]
+    pub fn at(&self, i: usize) -> u16 {
+        self.get(i).expect("index out of range")
+    }
+
     /// IN-PLACE resolve: turn this segmented u16 marker buffer into a
     /// [`ResolvedMarkers`] u8 view list, resolving every marker against
     /// `window` and writing the resolved u8 bytes into the LOW HALF of
@@ -413,10 +489,49 @@ impl SegmentedU16 {
 #[derive(Debug, Default)]
 pub struct ResolvedMarkers {
     u16_segments: Vec<U16>,
+    // Manual `Clone` below (deep-copy): a u16 segment carries resolved u8
+    // bytes in its low half; a naive derived Clone would copy the u16
+    // logical contents, not the u8 reinterpretation. `ChunkData` derives
+    // `Clone` for its rare cache-promote path, so we provide a faithful
+    // deep clone that reconstructs the byte segments.
     /// Resolved u8 byte count per segment (== the segment's prior u16
     /// element count).
     byte_lens: Vec<usize>,
     total_bytes: usize,
+}
+
+impl Clone for ResolvedMarkers {
+    fn clone(&self) -> Self {
+        // Deep-copy each segment's resolved u8 bytes into a fresh
+        // u16-backed segment's low half (so `byte_segments` reads them
+        // back correctly). Rare path (ChunkData cache-promote clone).
+        let mut u16_segments = Vec::with_capacity(self.u16_segments.len());
+        for (seg, &blen) in self.u16_segments.iter().zip(self.byte_lens.iter()) {
+            // SAFETY: source segment holds `blen` resolved u8 bytes in its
+            // low half (invariant of `resolve_in_place`).
+            let src_bytes = unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const u8, blen) };
+            let mut dst = new_segment();
+            // Ensure capacity for blen u16 (= 2*blen bytes) then write the
+            // u8 bytes into the low half via raw ptr.
+            if dst.capacity() < blen {
+                dst.reserve(blen - dst.capacity());
+            }
+            let base = dst.as_mut_ptr() as *mut u8;
+            // SAFETY: dst owns >= blen u16 (= 2*blen bytes) capacity.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src_bytes.as_ptr(), base, blen);
+                // Set logical u16 len so the allocation is freed correctly;
+                // ceil(blen/2) u16 elements cover blen bytes.
+                dst.set_len(blen.div_ceil(2));
+            }
+            u16_segments.push(dst);
+        }
+        Self {
+            u16_segments,
+            byte_lens: self.byte_lens.clone(),
+            total_bytes: self.total_bytes,
+        }
+    }
 }
 
 impl ResolvedMarkers {
@@ -453,6 +568,44 @@ impl ResolvedMarkers {
             seg.clear();
         }
         std::mem::take(&mut self.u16_segments)
+    }
+}
+
+/// The bootstrap decodes DIRECTLY into a `SegmentedU16` via this impl —
+/// `push_slice` is the append-only write path (the inner decoder's own
+/// 32 KiB output_ring resolves all back-refs, so the sink never reads
+/// itself), and the two tail accessors serve the clean-window arming.
+impl crate::decompress::parallel::deflate_block::MarkerSink for SegmentedU16 {
+    #[inline]
+    fn push_slice(&mut self, values: &[u16]) {
+        SegmentedU16::push_slice(self, values);
+    }
+    #[inline]
+    fn sink_len(&self) -> usize {
+        self.cached_len
+    }
+    #[inline]
+    fn trailing_clean_run(&self, cap: usize) -> usize {
+        SegmentedU16::trailing_clean_run(self, cap)
+    }
+    fn copy_last_n_as_u8(&self, n: usize, out: &mut Vec<u8>) {
+        out.clear();
+        if n == 0 {
+            return;
+        }
+        let start = self.cached_len - n;
+        let mut elem_base = 0usize;
+        out.reserve(n);
+        for seg in &self.segments {
+            let seg_len = seg.len();
+            let seg_start = elem_base;
+            let seg_end = elem_base + seg_len;
+            if seg_end > start {
+                let local_from = start.saturating_sub(seg_start);
+                out.extend(seg[local_from..].iter().map(|&v| v as u8));
+            }
+            elem_base = seg_end;
+        }
     }
 }
 
