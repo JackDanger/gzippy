@@ -57,11 +57,22 @@ conclude a lever from attribution. The only verdict is a CAUSAL PERTURBATION:
 5. **Disproof-driven.** State the claim, then actively try to BREAK it (control
    region, frequency-neutral variant, instrument self-test). Only what survives a
    genuine disproof attempt is real. Δ < inter-run spread ⇒ TIE, full stop.
-6. **Always, mechanically:** assert the production path (`GZIPPY_DEBUG=1` →
-   `path=IsalParallelSM`; build `--no-default-features --features pure-rust-inflate`;
-   `GZIPPY_FORCE_PARALLEL_SM=1` to exercise the engine at every T); frozen host;
-   interleaved best-of-N≥7; sha-verified output (a speed win with wrong bytes is a
-   loss).
+6. **Always, mechanically: run `scripts/bench/clean_bench.sh` — it bakes in
+   every invariant below and is the ONLY trustworthy harness.** It asserts the
+   production path (`GZIPPY_DEBUG=1` → `path=IsalParallelSM`; build
+   `--no-default-features --features pure-rust-inflate`; `GZIPPY_FORCE_PARALLEL_SM=1`
+   to exercise the engine at every T); LOCKS the host (no_turbo=1, uncore fixed,
+   C-state floor, governor=performance, min==max, noisy LXCs frozen) and PROVES
+   the lock held with an aperf/mperf GATE before emitting any timing row;
+   requires a clean PROVENANCE stamp (gzippy SHA + submodule commits + corpus
+   sha; dirty tree aborts unless `--allow-dirty`, which forces
+   RUN_TRUSTWORTHY=false); runs interleaved N≥9 (iter0 dropped) with sha-verified
+   output against the gzip(1) reference every run (a speed win with wrong bytes
+   is a loss); tags any cell sd>5% FAILED; and emits top-level
+   `RUN_TRUSTWORTHY=true/false`. A gate fail or any sd fail makes the run
+   UNTRUSTWORTHY and no timing rows are trusted. The host is restored to baseline
+   on exit AND by a systemd watchdog if the run is killed. NEVER trust a number
+   from any other harness.
 
 7. **A REJECTION needs a mechanism, not a narrow miss (user-set 2026-05-31).** We
    do NOT abandon a direction just because one fix didn't measure narrowly the way
@@ -96,7 +107,7 @@ decode graph. **NEW GOAL (2026-05-30, user-set, supersedes the above hedges): FU
 TO EXACT PERFORMANCE PARITY on the same workloads.** rapidgzip's source
 (`vendor/rapidgzip/`) is the blueprint; a faithful structural port of its decode
 pipeline is the method AND the done-criterion — done when gzippy matches rapidgzip's
-wall (TIE-or-better, `scripts/measure.sh`, interleaved + sha-verified) across the
+wall (TIE-or-better, `scripts/bench/clean_bench.sh`, interleaved + sha-verified + gated) across the
 workload matrix (silesia-large × T1–T16, etc.), the structure faithfully mirrors
 rapidgzip, and the pure-Rust decoder is the sole decode path.**
 
@@ -173,11 +184,14 @@ fastest-possible claim.
 ## Rules
 
 1. **ONE PRODUCTION PATH** — know exactly which function the CLI calls. Test that function.
-2. **RUN `make` FIRST** — before `make ship`, before committing. `make` catches regressions in 30s.
-3. **BENCHMARK EVERYTHING** — `make ship` (homelab bench on `neurotic`) is authoritative; local `make` is for iteration.
+2. **RUN `make` FIRST** — before benchmarking, before committing. `make` catches regressions in 30s.
+3. **BENCHMARK EVERYTHING with `scripts/bench/clean_bench.sh`** — the gated,
+   provenance-stamped, restore-guaranteed clean-bench on `neurotic` is the SOLE
+   authoritative harness; local `make` is for iteration. A number is only
+   trustworthy if that harness emitted `RUN_TRUSTWORTHY=true`.
 4. **NEVER COMPROMISE CORRECTNESS** — output bytes, CRC32, ISIZE must always verify.
 5. **NO FALLBACKS** — failure is an explicit `Err(GzippyError::Decompression(_))`. No silent libdeflate or ISA-L retries from the SM body. `decompress_single_member` either succeeds via the parallel pipeline or returns an error.
-6. **FAITHFULLY PORT RAPIDGZIP TO EXACT PERFORMANCE PARITY (2026-05-30, user-set goal — reverses the prior "speed-not-fidelity").** rapidgzip's architecture is the fastest known and its source is in `vendor/rapidgzip/`: it is the BLUEPRINT to transliterate, not merely a reference to consult. Port its decode pipeline faithfully — consumer/chunk-lifecycle, block finder, window map, marker resolution, chunk decode — until gzippy's wall matches rapidgzip's on the same workloads. The prior "diverge freely / throughput not vendor parity" stance rested on the broken clean-window oracle (`64eb6df`) and is REVERSED. Keep gzippy's own inflate primitives ONLY where they meet-or-beat rapidgzip WITHOUT breaking the faithful structure; otherwise mirror the vendor `file:line`. Verify every change on `scripts/measure.sh` (interleaved, sha-verified) vs rapidgzip — never an internal slice; that is the rule the decompose-loop kept breaking.
+6. **FAITHFULLY PORT RAPIDGZIP TO EXACT PERFORMANCE PARITY (2026-05-30, user-set goal — reverses the prior "speed-not-fidelity").** rapidgzip's architecture is the fastest known and its source is in `vendor/rapidgzip/`: it is the BLUEPRINT to transliterate, not merely a reference to consult. Port its decode pipeline faithfully — consumer/chunk-lifecycle, block finder, window map, marker resolution, chunk decode — until gzippy's wall matches rapidgzip's on the same workloads. The prior "diverge freely / throughput not vendor parity" stance rested on the broken clean-window oracle (`64eb6df`) and is REVERSED. Keep gzippy's own inflate primitives ONLY where they meet-or-beat rapidgzip WITHOUT breaking the faithful structure; otherwise mirror the vendor `file:line`. Verify every change on `scripts/bench/clean_bench.sh` (locked + gated + provenance-stamped, interleaved, sha-verified, RUN_TRUSTWORTHY) vs rapidgzip — never an internal slice; that is the rule the decompose-loop kept breaking.
 
 ## Production Routing (Apr 2026)
 
@@ -231,7 +245,7 @@ production code path or is a test fixture / supportive script.
 To prototype a new path: add the module under the relevant subsystem
 (`src/decompress/`, `src/compress/`, etc.), wire a feature-gated or size-gated
 call site in the routing table above, and add a strict correctness test (no
-silent fallback). When `make ship` confirms the win, lift the gate. When
+silent fallback). When `scripts/bench/clean_bench.sh` (RUN_TRUSTWORTHY=true) confirms the win, lift the gate. When
 abandoned, delete the module — `main` does not host dead code.
 
 Two regression tests lock the parallel single-member wiring:
@@ -319,7 +333,9 @@ make
 cargo test --release
 
 # 5. Authoritative numbers — only after make passes
-make ship   # SSH to neurotic homelab, runs gzippy-dev bench
+scripts/bench/clean_bench.sh "8"   # locked+gated+provenance clean bench on neurotic vs rapidgzip
+                                   # trust the result ONLY if it prints RUN_TRUSTWORTHY=true
+                                   # (sweep: scripts/bench/clean_bench.sh "4 8 16"). See scripts/bench/README.md
 ```
 
 `make route-check` — generates 1MB+10MB test files and shows routing + timing

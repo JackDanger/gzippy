@@ -40,7 +40,7 @@ BENCH_SM_TIMEOUT := 1200
 TEST_X86_TIMEOUT := 1500
 SHIP_TIMEOUT     := 2700
 
-.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship ship-local route-check oracle-vs-c bench-sm \
+.PHONY: all build quick quick-wallclock update-baselines perf-full test-data test-data-quick clean help validate deps ship ship-local route-check oracle-vs-c bench-sm clean-bench \
 	profile-single-member-decompression-x86_64 profile-single-member-decompression-arm64 profile-decompression-x86_64
 
 # =============================================================================
@@ -195,6 +195,9 @@ NEUROTIC_SYNC := git config --global --add safe.directory /root/gzippy; git fetc
 # Use `make ship-local` to run steps 1-5 only and skip the homelab.
 # =============================================================================
 ship: ship-precheck ship-local
+	@echo "── NOTE: 'ship' runs the COMPRESSION scoreboard. For DECODE perf claims"
+	@echo "──       (gzippy vs rapidgzip) use 'make clean-bench' — the locked+gated"
+	@echo "──       harness (scripts/bench/clean_bench.sh). Trust only RUN_TRUSTWORTHY=true."
 	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
 	echo ""; \
 	echo "── Step 6/6: push '$$BRANCH' + neurotic homelab benchmarks ──"; \
@@ -248,75 +251,32 @@ ship: ship-precheck ship-local
 	  echo \"  archives: \$$(ls \$$BD/*-{gzip,bgzf,pigz}.gz 2>/dev/null | wc -l) files ready\"; \
 	  echo ''; echo '  ── running gzippy-dev bench (--direction both: covers L1/6/9 + L11 micro-corpus) ──'; \
 	  TMPDIR=/dev/shm ./target/release/gzippy-dev bench --direction both; \
-	  echo ''; echo '  ── L11 head-to-head vs vendor C zopfli (homelab) ──'; \
-	  bash scripts/ship_l11_headtohead.sh; \
 	  rm -rf /dev/shm/gzippy-bench-* 2>/dev/null || true"
 	@echo ""
 	@echo "✓ ship complete on branch $$(git rev-parse --abbrev-ref HEAD)"
 
 # =============================================================================
-# bench-sm: single-member x86_64 Tmax gzippy vs rapidgzip on neurotic.
+# clean-bench / bench-sm: the SOLE authoritative single-member decode bench.
 #
-# Skips all local quality gates (fmt/test/clippy/oracle). Pushes the current
-# branch, SSHs to neurotic, builds gzippy + rapidgzip, runs
-# scripts/benchmark_single_member.py against silesia.tar compressed at -9.
-# Use this for tight iteration on the parallel single-member path without
-# the 20-minute full ship round-trip.
+# Repointed (2026-05-31) at scripts/bench/clean_bench.sh — the locked, gated,
+# provenance-stamped, restore-guaranteed gzippy-vs-rapidgzip harness. The old
+# push-to-neurotic + benchmark_single_member.py path is RETIRED: it ran on an
+# unlocked, unverified box and produced the noisy absolutes the campaign
+# post-mortem banned. clean_bench.sh locks the host frequency, freezes noisy
+# neighbours, PROVES the lock with an aperf/mperf gate, requires a clean
+# provenance stamp, runs interleaved N>=9 sha-verified, and emits
+# RUN_TRUSTWORTHY=true/false. The host is restored on exit AND by a systemd
+# watchdog if the run is killed. See scripts/bench/README.md.
 #
-# Time: ~3-5 minutes (build ~1 min, bench ~2-3 min for 10 trials).
+# Usage:  make clean-bench           # T8 (default)
+#         CB_THREADS="4 8 16" make clean-bench
+#         CB_ARGS="--lever" make clean-bench
 # =============================================================================
-bench-sm: ship-precheck
-	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
-	echo ""; \
-	echo "── bench-sm: x86_64 Tmax single-member  gzippy vs rapidgzip ──"; \
-	if ! git rev-parse origin/$$BRANCH >/dev/null 2>&1 \
-	    || [ -n "$$(git log origin/$$BRANCH..HEAD 2>/dev/null)" ]; then \
-	  echo "  pushing $$BRANCH to origin..."; \
-	  git push origin $$BRANCH || (echo "PUSH FAILED — aborting bench-sm" >&2 && exit 1); \
-	else \
-	  echo "  origin/$$BRANCH already up to date"; \
-	fi; \
-	echo "  connecting to neurotic..."; \
-	timeout $(BENCH_SM_TIMEOUT) $(NEUROTIC_SSH) "set -e; cd gzippy; \
-	  echo '  fetching origin/$$BRANCH...'; \
-	  $(NEUROTIC_SYNC); \
-	  echo '  building gzippy (--features isal-compression)...'; \
-	  cargo build --release --features isal-compression 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
-	  RAPIDGZIP=vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip; \
-	  if [ ! -x \"\$$RAPIDGZIP\" ]; then \
-	    echo '  building rapidgzip (first time only)...'; \
-	    cd vendor/rapidgzip && git submodule update --init --recursive >/dev/null 2>&1 || true; \
-	    mkdir -p librapidarchive/build; \
-	    cd librapidarchive/build && cmake .. -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1; \
-	    make -j\$$(nproc) rapidgzip 2>&1 | grep -E 'Linking|Built|error' || true; \
-	    cd /root/gzippy; \
-	  fi; \
-	  BD=benchmark_data; \
-	  [ -f \"\$$BD/silesia.tar\" ] || { [ -f \"\$$BD/silesia.tar.xz\" ] && xz -dk \"\$$BD/silesia.tar.xz\" -c > \"\$$BD/silesia.tar\"; }; \
-	  SL=\$$BD/silesia-large.bin; \
-	  SLG=\$$BD/silesia-large.gz; \
-	  [ -s \"\$$SL\" ] || { \
-	    echo '  building silesia-large.bin (~500MB, one-time)...'; \
-	    cat \"\$$BD/silesia.tar\" \"\$$BD/silesia.tar\" > \"\$$SL\"; \
-	    head -c \$$((76 * 1024 * 1024)) \"\$$BD/silesia.tar\" >> \"\$$SL\"; \
-	  }; \
-	  [ -s \"\$$SLG\" ] || { echo '  compressing silesia-large.bin at gzip -9 (one-time, ~60s)...'; gzip -9 -c \"\$$SL\" > \"\$$SLG\"; }; \
-	  BDIR=/tmp/bench-sm-bin; mkdir -p \"\$$BDIR\"; \
-	  cp target/release/gzippy \"\$$BDIR/\"; \
-	  cp \"\$$RAPIDGZIP\" \"\$$BDIR/\" 2>/dev/null || true; \
-	  [ -x vendor/pigz/unpigz ] && cp vendor/pigz/unpigz \"\$$BDIR/\" || true; \
-	  THREADS=\$$(nproc); \
-	  echo ''; \
-	  python3 scripts/benchmark_single_member.py \
-	    --binaries \"\$$BDIR\" \
-	    --compressed-file \"\$$SLG\" \
-	    --original-file \"\$$SL\" \
-	    --threads \"\$$THREADS\" \
-	    --output /tmp/bench-sm-result.json; \
-	  echo ''; \
-	  echo 'Full JSON: /tmp/bench-sm-result.json'"
-	@echo ""
-	@echo "✓ bench-sm complete on branch $$(git rev-parse --abbrev-ref HEAD)"
+CB_THREADS ?= 8
+CB_ARGS ?=
+clean-bench bench-sm:
+	@echo "── clean-bench: locked+gated+provenance gzippy vs rapidgzip on neurotic ──"
+	bash scripts/bench/clean_bench.sh "$(CB_THREADS)" $(CB_ARGS)
 
 # =============================================================================
 # bench-sm-pure-rust: same as bench-sm but builds gzippy with
