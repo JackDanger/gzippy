@@ -330,3 +330,22 @@ Advisor (abca15276) ruled on the bound-depth result + the agent's proposed next 
 HIGHEST-PROBABILITY UN-REFUTED DIRECTION: speed up the window-absent/bootstrap speculative decode toward multi-symbol (clean-decode parity). ~15% BOUNDED (structural to the speculative-marker datamodel — carry the bound honestly; it shrinks but won't fully close the x86 1.5×). Consistent with project_t8_saturated_pool_diag ("only live lever = bootstrap marker DECODE speed").
 DO NOT BUILD: bound-depth (D6 starvation), eager-postproc worker-side (EAGER_PROBE_SUBMITTED=0, dependency-blocked), in-order scheduling priority (likely inert — confirm via the A-vs-B split first).
 Q4 DISCRIMINATOR STILL OPEN (my no-code attempt was TOO COARSE — same bug class as combine_crc): I split consumer block_fetcher_get into (A) start-delay vs (B) decode-duration, but my test checked whether ANY decode starts in the stall window (near-certain with 40 chunks / 2 stalls), NOT whether the SPECIFIC AWAITED chunk starts then. Also this arm64 causal trace lacks the scan_candidate/bootstrap spans the (B) term needs (x86-only), and the dominant consumer wait is rx_recv_block (106ms) not block_fetcher_get (72ms). VERDICT NOT RECORDED from it. To settle SPEED-vs-SCHEDULING needs awaited-chunk attribution: tag each block_fetcher_get stall with the AWAITED chunk's decode-start vs the stall-start (one timestamp diff). Until then the advisor's SPEED conclusion rests on the x86 scan_candidate/bootstrap=214ms-are-(B)-terms finding (entry 212), not on this arm64 run.
+
+## 2026-06-01 — MODEL PARAMS measured both tools (pinned x86) — but "+0.0% residual" is a TAUTOLOGY, not a confirmed prediction (advisor a689769)
+fulcrum `model` view (PR #7) populated the wall-model params for BOTH gzippy + rapidgzip from CPU-pinned (8 P-core) x86 runs, silesia 503MB, sha-verified e114dd2b. Table (gz/rg):
+| param | gz T8 | rg T8 | gz T4 | rg T4 |
+| N | 36 | 39 | 34 | 39 |
+| window-absent f | 90.5% | 97.4% | 83.3% | 97.4% |
+| d_w (window-absent decode/chunk) | 37.5ms | 28.6ms | 32.7ms | 28.1ms |
+| L_resolve (MEAN inter-publish gap) | 12.80 | 7.74 | 17.89 | 13.21 |
+| frontier | 19.5 | 17.1 | 19.1 | 17.0 |
+| tail | 68.2 | 81.6 | 45.4 | 22.6 |
+| wall_pred/obs/resid | 535.6/535.6/+0.0% | 392.9/392.9/+0.0% | 654.8/654.8/+0.0% | 541.6/541.6/+0.0% |
+HONEST VERDICT (advisor-corrected — do NOT record "model CONFIRMED"):
+- **+0.0% at every cell = TELESCOPING IDENTITY, not a prediction.** publish-chain+tail = frontier + (Σ inter-publish gaps) + (EOF−t_pub(last)) = t_pub(0)+(t_pub(last)−t_pub(0))+(EOF−t_pub(last)) = EOF = wall, BY CONSTRUCTION (L_resolve=mean gap re-sums the wall's own timeline). publish-chain bound in ALL cells ⇒ the non-tautological worker-bound branch was NEVER exercised. The decomposition is valid BOOKKEEPING; predictive content UNTESTED.
+- **L_resolve is a CONSEQUENCE variable, NOT a lever/knob** (a chunk can't publish faster than it decodes). Don't say "cut L_resolve."
+- **The REAL levers (two, superimposed in the gap):** (a) d_w window-absent decode 1.31× slower (gz 37.5 vs rg 28.6 — the bootstrap-decode-speed lever, ~15% bounded); (b) publish SCHEDULING / eager apply_window (the consumer-critical-path lever). The gap ratio 1.65× > d_w 1.31× ⇒ (b) is NON-TRIVIAL (scheduling absorbs the residual beyond raw decode).
+- **Cleanest MODEL-INDEPENDENT fact:** rg has HIGHER window-absent fraction (97% vs 90%) yet LOWER decode AND lower gap ⇒ rg's window-absent pipeline is simply faster per chunk, full stop (isolates from "gz unlucky with fewer clean chunks").
+- d_c DROPPED (n≈3, chunk-0 cold-start dominated — gz d_c=45>d_w=37 is the artifact; also poisons the worker-bound branch's d_w_eff).
+- Thermal caveat: i7-13700T 35W throttles under 8-P-core load (wall spread 40-51% @T8); within-run trace-ratios robust, absolute 535.6/535.6 is spurious precision.
+THE ONE FALSIFIABLE PERTURBATION (next): GZIPPY_SLOW_BOOTSTRAP k-sweep {1.0,1.5,2.0}×{T4,T8,T16}, spin+sleep controls, interleaved N≥7, sha-verified — checks (1) d_w tracks k [instrument control], (2) gap-vs-k SLOPE separates lever (a) decode-gated from (b) scheduling-gated, (3) the T16 KNEE (model's only falsifiable claim: publish-chain binds T4/T8 ⇒ wall moves ~proportional; worker-bound takes over T16 ⇒ response flattens). Report as within-run ratios not absolute ms.
