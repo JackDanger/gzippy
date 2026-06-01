@@ -50,6 +50,7 @@ pub mod prefetcher;
 pub mod raw_block_finder;
 #[cfg(parallel_sm)]
 pub mod replace_markers;
+pub mod residual;
 pub mod rfc_tables;
 #[cfg(parallel_sm)]
 pub mod rpmalloc_alloc;

@@ -952,6 +952,9 @@ fn consumer_loop<W: std::io::Write>(
     let mut iter_count: usize = 0;
     loop {
         let _tv2 = trace_v2::SpanGuard::begin("consumer.iter");
+        // PERF-FREE residual snapshot on the wall-critical consumer thread.
+        // Drops before `_tv2`, so its instant lands inside this consumer.iter.
+        let _residual = super::residual::ResidualGuard::begin("consumer.iter");
         let t_iter = std::time::Instant::now();
         // BlockFetcher.hpp:427 — opportunistically promote ready prefetches
         // so workers don't idle while the consumer waits on a different key.
@@ -2004,6 +2007,11 @@ fn run_decode_task(
             params.is_speculative_prefetch
         ),
     );
+    // PERF-FREE residual snapshot (page-faults / ctxsw / runnable). Declared
+    // AFTER `_tv2` so it drops FIRST — the `rusage.region` instant lands inside
+    // the still-open `worker.decode_chunk` span, so Fulcrum's per-thread join
+    // attributes the delta to this region. No-op unless GZIPPY_TIMELINE is set.
+    let _residual = super::residual::ResidualGuard::begin("worker.decode_chunk");
     // SAFETY: `drive`'s contract — input outlives the thread pool.
     let input_bytes: &[u8] = unsafe { input.as_slice() };
 
