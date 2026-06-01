@@ -22,6 +22,10 @@ echo "## M1 tmpfs sink fstype=$FSTYPE (expect tmpfs/ramfs)  N=$N  T8 pinned 0,2,
 REFSUM=$(gzip -dc "$F" 2>/dev/null | sha256sum | cut -d' ' -f1)
 echo "REF_SHA=$REFSUM"
 
+# pre-warm input page-cache + one throwaway decode so trial 1 isn't a cold-start
+cat "$F" > /dev/null 2>&1
+$PIN "$B" -d -c -p 8 "$F" > "$TMPD/warm.bin" 2>/dev/null; rm -f "$TMPD/warm.bin"
+
 diverged=0
 for ((t=1;t<=N;t++)); do
   OUT="$TMPD/out.bin"

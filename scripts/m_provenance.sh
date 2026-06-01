@@ -14,8 +14,8 @@ echo "gzippy_head=$(cd /root/gzippy && git rev-parse --short HEAD) branch=$(cd /
 echo "dirty=$(cd /root/gzippy && git status --porcelain --ignore-submodules=dirty | grep -vE '(Cargo\.lock|target/?)' | wc -l | tr -d ' ')"
 
 # pure-rust proof: ISA-L inner-decode symbols must be ABSENT (dynsym=0)
-ISAL_DYN=$(nm -D "$B" 2>/dev/null | grep -c 'isal_inflate' || echo 0)
-ISAL_ANY=$(nm "$B" 2>/dev/null | grep -c 'isal_inflate' || echo 0)
+ISAL_DYN=$(nm -D "$B" 2>/dev/null | grep -c 'isal_inflate'); ISAL_DYN=${ISAL_DYN:-0}
+ISAL_ANY=$(nm "$B" 2>/dev/null | grep -c 'isal_inflate'); ISAL_ANY=${ISAL_ANY:-0}
 echo "isal_inflate_dynsym=$ISAL_DYN  isal_inflate_anysym=$ISAL_ANY  (pure-rust => both 0)"
 
 # path proof

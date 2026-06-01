@@ -38,28 +38,44 @@ REFSUM=$(gzip -dc "$F" 2>/dev/null | sha256sum | cut -d' ' -f1)
 echo "REF_SHA=$REFSUM  K=${K}us  N=$N  SINK=/dev/null  PIN=0,2,4,6,8,10,12,14"
 echo "load_at_start=$(awk '{print $1}' /proc/loadavg)"
 
+# Pre-warm the input page-cache + a throwaway decode so the FIRST timed cell
+# does not absorb a cold-start transient (the position-bias confound that
+# discarded the first locked run: cell 000, always first, ran ~130ms slow).
+cat "$F" > /dev/null 2>&1
+$PIN "$B" -d -c -p 8 "$F" > /dev/null 2>&1
+
+# Build the full (mode,cell) combo list; RANDOMIZE its order every trial so no
+# cell is systematically first (kills the per-group position bias). Interleaved
+# across trials => both knob states see the same per-trial contention.
+COMBOS=(); for mode in $MODES; do for cell in $CELLS; do COMBOS+=("$mode/$cell"); done; done
+
 declare -A TIMES
 diverged=0
-for ((t=1;t<=N;t++)); do
-  for mode in $MODES; do
-    for cell in $CELLS; do
+# trial 1 is the sha-verify warmup (not recorded); trials 2..N+1 are timed,
+# giving N timed samples per cell.
+for ((t=1;t<=N+1;t++)); do
+  # shuffle COMBOS for this trial
+  mapfile -t SHUF < <(printf '%s\n' "${COMBOS[@]}" | shuf)
+  for combo in "${SHUF[@]}"; do
+      mode="${combo%%/*}"; cell="${combo##*/}"
       env_vars="${CELL_ENV[$cell]}"
       sleepflag=""
       [ "$mode" = sleep ] && sleepflag="GZIPPY_SLOW_BOOTSTRAP_SLEEP=1 GZIPPY_SLOW_CONSUMER_SLEEP=1 GZIPPY_SLOW_RESOLVE_SLEEP=1"
-      # sha-verify a fraction of runs (cell 000 every trial; others trial 1)
-      if [ "$cell" = 000 ] || [ "$t" = 1 ]; then
-        out=$(mktemp)
-        s=$(date +%s.%N); env $env_vars $sleepflag $PIN "$B" -d -c -p 8 "$F" >"$out" 2>/dev/null; rc=$?; e=$(date +%s.%N)
-        sum=$(sha256sum "$out" | cut -d' ' -f1)
+      # EVERY timed run sinks to /dev/null identically (no per-cell file-write
+      # asymmetry — the confound that distorted the first run). Correctness is
+      # verified on trial 1 for all cells by piping straight to sha256sum (still
+      # /dev/null-equivalent: no file fd, just a streamed hash sink).
+      if [ "$t" = 1 ]; then
+        # trial 1 = sha-verify ONLY (not timed/recorded — the sha256sum pipe
+        # would perturb its wall). Timed samples come from trials 2..N+1.
+        sum=$(env $env_vars $sleepflag $PIN "$B" -d -c -p 8 "$F" 2>/dev/null | sha256sum | cut -d' ' -f1)
         [ "$sum" = "$REFSUM" ] || { echo "!! SHA DIVERGENCE ${mode}/${cell} trial $t"; diverged=1; }
-        rm -f "$out"
-      else
-        s=$(date +%s.%N); env $env_vars $sleepflag $PIN "$B" -d -c -p 8 "$F" >/dev/null 2>/dev/null; rc=$?; e=$(date +%s.%N)
+        continue
       fi
+      s=$(date +%s.%N); env $env_vars $sleepflag $PIN "$B" -d -c -p 8 "$F" >/dev/null 2>/dev/null; rc=$?; e=$(date +%s.%N)
       [ $rc -eq 0 ] || echo "!! ${mode}/${cell} trial $t exit $rc"
       dt=$(awk -v a=$s -v b=$e 'BEGIN{printf "%.4f", b-a}')
       TIMES["${mode}/${cell}"]="${TIMES["${mode}/${cell}"]:-} $dt"
-    done
   done
 done
 
