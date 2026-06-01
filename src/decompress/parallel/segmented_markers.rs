@@ -56,8 +56,18 @@
 //! mechanics. The deviation is documented per the inner-loop honesty
 //! rule.
 
+use crate::decompress::parallel::chunk_buffer_pool;
 use crate::decompress::parallel::replace_markers::MARKER_BASE;
-use crate::decompress::parallel::rpmalloc_alloc::types::{self, U16};
+use crate::decompress::parallel::rpmalloc_alloc::types::U16;
+
+/// Allocate (or recycle) one 128 KiB marker segment. Sources from the
+/// per-worker marker-segment pool so freed segments stay warm in
+/// rpmalloc's per-thread span cache across chunks — the vendor
+/// `FasterVector` recycle behavior (`core/FasterVector.hpp:120-128`).
+#[inline]
+fn new_segment() -> U16 {
+    chunk_buffer_pool::take_marker_segment()
+}
 
 /// Vendor's `ALLOCATION_CHUNK_SIZE` in ELEMENTS for the u16 marker
 /// buffer. Vendor (`DecodedData.hpp:241`) sizes the chunk in *bytes*
@@ -130,8 +140,7 @@ impl SegmentedU16 {
         let extra = needed - current_cap;
         let n_segments = extra.div_ceil(SEGMENT_ELEMENTS);
         for _ in 0..n_segments {
-            self.segments
-                .push(types::u16_with_capacity(SEGMENT_ELEMENTS));
+            self.segments.push(new_segment());
         }
     }
 
@@ -150,8 +159,7 @@ impl SegmentedU16 {
                 None => true,
             };
             if needs_new {
-                self.segments
-                    .push(types::u16_with_capacity(SEGMENT_ELEMENTS));
+                self.segments.push(new_segment());
             }
             let last = self.segments.last_mut().unwrap();
             let room = SEGMENT_ELEMENTS - last.len();
