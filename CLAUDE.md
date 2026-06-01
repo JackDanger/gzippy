@@ -325,6 +325,26 @@ make ship   # SSH to neurotic homelab, runs gzippy-dev bench
 `make route-check` — generates 1MB+10MB test files and shows routing + timing
 vs pigz for all four combos (T1/T4 × 1MB/10MB). Use this before ANY decompression change.
 
+## When a tool errors, FIND OUT WHY (user-set 2026-05-31) — applies to every agent
+
+**If a tool call errors, diagnose the cause before doing anything else. Never
+retry the same call, and never proceed past it, until you know why it failed.**
+This is the governing rule; the specific tactics below are just consequences:
+
+- A *repeated identical* error (e.g. `Cancelled: parallel tool call …`) is the
+  signature of an already-wedged channel or an unmet precondition — STOP and
+  investigate the FIRST failure, do not loop. Two background agents this campaign
+  burned their whole budget retrying through error #1: one on a FULL DISK
+  (`cargo build` exhausted the volume → write errors), one on a HUNG
+  `python3 -c "<multi-line>"`/heredoc through the Bash tool (broken quoting →
+  interactive Python reading stdin → never returns → wedges the tool channel →
+  every later call reports "Cancelled"). Both were one `df -h` / one read-the-
+  error away from a 30-second diagnosis.
+- Consequence: don't run multi-line Python through Bash — Write a `.py` file and
+  run `python3 file.py`. Wrap any potentially-hanging command in `timeout`.
+  Check `df -h` before/around big builds. But these are downstream of the rule:
+  *read the actual error, find the cause, fix the cause.*
+
 ## Key Files
 
 | File | Role |
