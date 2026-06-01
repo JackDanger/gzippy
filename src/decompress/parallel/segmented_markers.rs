@@ -120,6 +120,7 @@ impl SegmentedU16 {
 
     /// Truncate every segment to zero length, retaining the
     /// allocations for reuse. Mirrors `Vec::clear`.
+    #[allow(dead_code)] // Vec-surface parity; production uses take_segments
     pub fn clear(&mut self) {
         for seg in &mut self.segments {
             seg.clear();
@@ -354,6 +355,7 @@ impl SegmentedU16 {
     }
 
     /// Construct from owned segments (recycler give-back).
+    #[allow(dead_code)] // recycler-symmetry helper; tested
     pub fn from_segments(segments: Vec<U16>) -> Self {
         let cached_len = segments.iter().map(|s| s.len()).sum();
         Self {

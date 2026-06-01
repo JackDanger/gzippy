@@ -58,8 +58,6 @@ use crate::decompress::parallel::gzip_chunk::ChunkDecodeError;
 use std::sync::Arc;
 
 #[cfg(parallel_sm)]
-use crate::decompress::parallel::apply_window::apply_window;
-#[cfg(parallel_sm)]
 use crate::decompress::parallel::block_fetcher::BlockFetcher;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::block_map::{append_subchunks_to_block_map, BlockMap};
@@ -690,6 +688,12 @@ fn drive_impl<W: std::io::Write>(
             TAKE_U16_HITS.load(Ordering::Relaxed),
             TAKE_U16_MISSES.load(Ordering::Relaxed),
             RETURN_U16_CALLS.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "  Marker-segment pool (128 KiB u16): hits={} misses={}",
+            crate::decompress::parallel::chunk_buffer_pool::MARKER_SEG_HITS.load(Ordering::Relaxed),
+            crate::decompress::parallel::chunk_buffer_pool::MARKER_SEG_MISSES
+                .load(Ordering::Relaxed),
         );
         // Per-worker distribution — disambiguates "16 workers each
         // cold-start" (first-touch dominance) vs "worker 0 is the
@@ -2424,7 +2428,10 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
 /// a no-op). Scalar tail handles the remainder. AVX-256 downclock
 /// concern from an earlier session was empirically refuted on neurotic
 /// via injection probe (see `plans/rust-rapidgzip.md` §4).
+// Dead after the segmented-marker port (in-place resolve produces u8
+// views directly), retained as a primitive for potential reuse.
 #[cfg(parallel_sm)]
+#[allow(dead_code)]
 fn narrow_u16_to_u8(src: &[u16], dst: &mut crate::decompress::parallel::rpmalloc_alloc::types::U8) {
     dst.clear();
     dst.reserve(src.len());
@@ -2449,6 +2456,7 @@ fn narrow_u16_to_u8(src: &[u16], dst: &mut crate::decompress::parallel::rpmalloc
 
 #[cfg(all(parallel_sm, target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
+#[allow(dead_code)]
 unsafe fn narrow_u16_to_u8_avx2(
     src: &[u16],
     dst: &mut crate::decompress::parallel::rpmalloc_alloc::types::U8,

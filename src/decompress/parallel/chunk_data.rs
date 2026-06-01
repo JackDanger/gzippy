@@ -1499,6 +1499,7 @@ impl ChunkData {
     /// live in `resolved_markers` (still needed by the consumer's write
     /// path) and are reclaimed on Drop; this method only reclaims
     /// UNRESOLVED segments (e.g. a chunk whose markers couldn't resolve).
+    #[allow(dead_code)] // documented eager-recycle helper; Drop handles the steady state
     pub(crate) fn recycle_markers_after_resolution(&mut self) {
         use crate::decompress::parallel::chunk_buffer_pool;
         let segs = self.data_with_markers.take_segments();

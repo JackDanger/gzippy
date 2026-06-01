@@ -17,6 +17,7 @@ use crate::decompress::parallel::chunk_data::MARKER_BASE;
 /// responsibility: the consumer CRCs the resolved bytes once, over the
 /// already-narrowed buffer it builds for the output write, so this
 /// function does not pay a separate narrow + CRC pass.
+#[allow(dead_code)] // production uses SegmentedU16::resolve_in_place; this u16-in-place form is test/oracle-only
 pub fn apply_window(chunk: &mut ChunkData, window: &[u8]) {
     if chunk.data_with_markers.is_empty() {
         return;
