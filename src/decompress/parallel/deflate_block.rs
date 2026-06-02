@@ -95,6 +95,16 @@ pub mod marker_instr {
     /// busy-spin). u8: 0 unknown, 1 spin, 2 sleep.
     pub static SLOW_MARKER_SLEEP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+    /// GZIPPY_SLOW_CLEAN_NS = K ns busy-spin injected per `emit_backref_ring`
+    /// call on the CLEAN (CONTAINS_MARKERS=false) path — the SPECIFICITY /
+    /// NEGATIVE control for gating. If injecting the SAME per-call spin on the
+    /// clean path grows the T8 wall just as much as the marker-path spin does,
+    /// the marker-path signal is NOT marker-specific (it's "any worker CPU
+    /// grows wall"). Parsed once. 0 / unset = off.
+    pub static SLOW_CLEAN_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// Number of CLEAN-path emit_backref_ring calls (for control calibration).
+    pub static CLEAN_BR_CALLS: AtomicU64 = AtomicU64::new(0);
+
     /// GZIPPY_MARKER_STATS=1 → enable the MECHANISM counters. u8: 0 unknown,
     /// 1 on, 2 off.
     pub static STATS_ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -156,6 +166,38 @@ pub mod marker_instr {
     }
 
     #[inline]
+    pub fn slow_clean_ns() -> u64 {
+        let v = SLOW_CLEAN_NS.load(Ordering::Relaxed);
+        if v != u64::MAX {
+            return v;
+        }
+        let parsed = std::env::var("GZIPPY_SLOW_CLEAN_NS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        SLOW_CLEAN_NS.store(parsed, Ordering::Relaxed);
+        parsed
+    }
+
+    /// CLEAN-path (CONTAINS_MARKERS=false) negative-control injection +
+    /// call count. Pure busy-spin, byte-identical. Both the count and the spin
+    /// are gated on the clean knob being set, so the production clean hot path
+    /// (knob unset) pays only one relaxed load + predictable branch — no atomic
+    /// RMW, no taint of the K=0 baseline.
+    #[inline]
+    pub fn clean_backref_delay() {
+        let ns = slow_clean_ns();
+        if ns == 0 {
+            return;
+        }
+        CLEAN_BR_CALLS.fetch_add(1, Ordering::Relaxed);
+        let until = std::time::Instant::now() + std::time::Duration::from_nanos(ns);
+        while std::time::Instant::now() < until {
+            std::hint::spin_loop();
+        }
+    }
+
+    #[inline]
     pub fn stats_on() -> bool {
         let v = STATS_ON.load(Ordering::Relaxed);
         if v != 0 {
@@ -202,11 +244,20 @@ pub mod marker_instr {
         distance_marker: usize,
         decoded_in_chunk: usize,
     ) {
+        // Count calls when EITHER the marker knob is armed OR stats are on, so
+        // a gating run is self-calibrating (injected CPU = calls * K ns) and the
+        // stats run reports the true count. The unperturbed clean production
+        // path (both unset) pays only the const-folded CONTAINS_MARKERS branch
+        // plus two relaxed loads — no atomic RMW.
+        let armed = slow_marker_ns() > 0;
+        let stats = stats_on();
+        if armed || stats {
+            BR_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
         inject_marker_delay();
-        if !stats_on() {
+        if !stats {
             return;
         }
-        BR_CALLS.fetch_add(1, Ordering::Relaxed);
         BR_BYTES.fetch_add(length as u64, Ordering::Relaxed);
 
         // Number of marker source bytes touched by this run.
@@ -257,6 +308,20 @@ pub mod marker_instr {
 
     /// Dump the mechanism counters to stderr. Called at end of decode.
     pub fn dump() {
+        // Always report call counts when EITHER injection knob is armed, so the
+        // gating runs can calibrate the injected CPU (calls * K ns) without
+        // needing the full MECHANISM stats pass.
+        let mk_calls = BR_CALLS.load(Ordering::Relaxed);
+        let cl_calls = CLEAN_BR_CALLS.load(Ordering::Relaxed);
+        if slow_marker_ns() > 0 || slow_clean_ns() > 0 {
+            eprintln!(
+                "[GATING_CALLS] marker_path_emit_backref_calls={mk_calls} \
+                 clean_path_emit_backref_calls={cl_calls} \
+                 slow_marker_ns={} slow_clean_ns={}",
+                slow_marker_ns(),
+                slow_clean_ns()
+            );
+        }
         if !stats_on() {
             return;
         }
@@ -1378,6 +1443,8 @@ impl Block {
                         distance_marker,
                         self.decoded_bytes + emitted,
                     );
+                } else {
+                    marker_instr::clean_backref_delay();
                 }
                 // SAFETY: ring_ptr valid; pos + length writes within
                 // ring capacity (RING_SIZE = 2 * MAX_WINDOW_SIZE);
@@ -1548,6 +1615,8 @@ impl Block {
                             distance_marker,
                             self.decoded_bytes + emitted,
                         );
+                    } else {
+                        marker_instr::clean_backref_delay();
                     }
                     unsafe {
                         emit_backref_ring::<CONTAINS_MARKERS>(
@@ -1894,6 +1963,8 @@ impl Block {
                                         distance_marker,
                                         self.decoded_bytes + emitted,
                                     );
+                                } else {
+                                    marker_instr::clean_backref_delay();
                                 }
                                 unsafe {
                                     emit_backref_ring::<CONTAINS_MARKERS>(
