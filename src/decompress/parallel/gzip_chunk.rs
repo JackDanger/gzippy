@@ -183,14 +183,17 @@ fn use_pure_bulk_path() -> bool {
 /// for A/B comparison: `GZIPPY_OPTION_A_PREFILL=0`.
 #[cfg(pure_inflate_decode)]
 fn use_option_a_prefill_path() -> bool {
-    use std::sync::OnceLock;
-    static USE_A: OnceLock<bool> = OnceLock::new();
-    *USE_A.get_or_init(|| match std::env::var("GZIPPY_OPTION_A_PREFILL") {
-        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false") => {
-            false
-        }
-        _ => true,
-    })
+    // FOOTPRINT-ALIGN: A3 window-prefill is now FORCED OFF. It pre-filled the
+    // predecessor 32 KiB window into the front of a CONTIGUOUS `chunk.data`
+    // so back-refs resolved via `output[..out_pos]` on the fast path. That is
+    // fundamentally incompatible with the segmented `data` buffer (the window
+    // + decoded bytes are no longer one contiguous slice). The non-A3 path
+    // resolves cross-chunk back-refs via the resumable decoder's internal
+    // 32 KiB window ring (resumable.rs:653) — exactly what rapidgzip does
+    // (it never prefills output with the window). So this is the faithful
+    // path AND the only segment-compatible one. The GZIPPY_OPTION_A_PREFILL
+    // env knob is retired.
+    false
 }
 
 #[cfg(parallel_sm)]

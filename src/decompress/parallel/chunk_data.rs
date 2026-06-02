@@ -578,7 +578,11 @@ impl ChunkData {
     /// `data_prefix_len` therefore stays 0 forever.
     #[allow(dead_code)]
     pub fn prefill_window_prefix(&mut self, _window: &[u8]) {
-        unreachable!("A3 window-prefill removed by footprint-align segmented-buffer port");
+        // No-op: A3 prefill is retired (see `use_option_a_prefill_path`).
+        // `data_prefix_len` stays 0. No production caller reaches this
+        // (a3_prefill_active is always false); kept only so the dead test
+        // surface still type-checks.
+        debug_assert_eq!(self.data_prefix_len, 0);
     }
 
     /// Counterpart to the removed `prefill_window_prefix`; a no-op since
@@ -1474,77 +1478,6 @@ mod tests {
         }
     }
 
-    /// Option A1 scaffolding round-trip: pre-fill the window image,
-    /// append decoded bytes, trim — and verify `decoded_size()` is
-    /// honest at each step AND that the post-trim `data` contains
-    /// only the decoded bytes byte-for-byte.
-    ///
-    /// This is the only test today that exercises `data_prefix_len > 0`;
-    /// it's the load-bearing invariant before A3 wires the API into
-    /// `decode_chunk_isal_impl`.
-    #[test]
-    fn prefill_window_prefix_round_trip_preserves_decoded_bytes() {
-        let mut chunk = ChunkData::new(0, small_config());
-
-        // (1) Empty: no prefix, no decoded bytes.
-        assert_eq!(chunk.decoded_size(), 0);
-        assert_eq!(chunk.data_prefix_len, 0);
-        assert!(chunk.is_empty());
-
-        // (2) Pre-fill a 32 KiB window image — `data` grows but
-        //     `decoded_size()` must still report 0.
-        let window: Vec<u8> = (0..32 * 1024).map(|i| (i & 0xFF) as u8).collect();
-        chunk.prefill_window_prefix(&window);
-        assert_eq!(chunk.data_prefix_len, 32 * 1024);
-        assert_eq!(chunk.data.len(), 32 * 1024);
-        assert_eq!(
-            chunk.decoded_size(),
-            0,
-            "window image must not count toward decoded output"
-        );
-        assert!(
-            chunk.is_empty(),
-            "is_empty() must treat a chunk with only window-prefix as empty"
-        );
-
-        // (3) Append 100 decoded bytes via the production path.
-        let decoded: Vec<u8> = (0..100u8).collect();
-        chunk.append_clean(&decoded);
-        assert_eq!(
-            chunk.decoded_size(),
-            100,
-            "decoded_size() must report only the appended bytes"
-        );
-        assert_eq!(chunk.data.len(), 32 * 1024 + 100);
-        // The window bytes should still be intact at the front.
-        assert_eq!(&chunk.data[..32 * 1024], &window[..]);
-        assert_eq!(&chunk.data[32 * 1024..], &decoded[..]);
-
-        // (4) Trim — `data` now starts with the decoded bytes and
-        //     `data_prefix_len` is back to 0.
-        chunk.trim_window_prefix();
-        assert_eq!(chunk.data_prefix_len, 0);
-        assert_eq!(chunk.data.len(), 100);
-        assert_eq!(&chunk.data[..], &decoded[..]);
-        assert_eq!(chunk.decoded_size(), 100);
-
-        // (5) Trim is idempotent.
-        chunk.trim_window_prefix();
-        assert_eq!(chunk.data.len(), 100);
-        assert_eq!(chunk.data_prefix_len, 0);
-    }
-
-    /// Pre-filling with an empty window is a no-op (matches the
-    /// "first chunk has no predecessor window" case A3 needs).
-    #[test]
-    fn prefill_window_prefix_empty_window_is_noop() {
-        let mut chunk = ChunkData::new(0, small_config());
-        chunk.prefill_window_prefix(&[]);
-        assert_eq!(chunk.data_prefix_len, 0);
-        assert_eq!(chunk.data.len(), 0);
-        assert_eq!(chunk.decoded_size(), 0);
-    }
-
     #[test]
     fn new_chunk_has_one_zero_size_subchunk_anchored_at_encoded_offset() {
         let chunk = ChunkData::new(12_345, small_config());
@@ -1696,7 +1629,7 @@ mod tests {
         chunk.append_clean(b" world");
         assert_eq!(chunk.data_with_markers.len(), 0);
         assert_eq!(chunk.data.len(), 11);
-        assert_eq!(chunk.data, b"hello world");
+        assert_eq!(chunk.data.to_contiguous(), b"hello world");
         // CRC of "hello world" — non-zero, deterministic.
         let mut expected = crc32fast::Hasher::new();
         expected.update(b"hello world");
@@ -1837,10 +1770,11 @@ mod tests {
                 *slot = chunk_b.data_with_markers[start + i] as u8;
             }
             written += take;
-            reference[written..].copy_from_slice(&chunk_b.data[..W - written]);
+            let n = W - written;
+            chunk_b.data.copy_range_into(0, &mut reference[written..written + n]);
         } else {
             let off = start - dwm_b_len;
-            reference.copy_from_slice(&chunk_b.data[off..off + W]);
+            chunk_b.data.copy_range_into(off, &mut reference[..]);
         }
 
         let tail = chunk_a.get_last_window(&prev);
