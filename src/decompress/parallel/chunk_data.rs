@@ -148,10 +148,18 @@ pub struct ChunkData {
     // buffer directly (zero-copy merge), and std-Vec decode is ~3% faster
     // per-byte than rpmalloc here (measured). Warm-cycled via the dedicated
     // `chunk_buffer_pool::{take,return}_std_u16` retained pool.
+    // NOTE: faithful rapidgzip SegmentedU8/in-place-resolve DecodedData port lives on
+    // feat/footprint-align (commit 2b8bfae); footprint -29% but blocked on A3-removal
+    // T16 regression — see docs/dead-ends/footprint-align-segmented.md. Re-entry =
+    // segment-native A3 (prefill into segment 0). See docs/open-candidates.md.
     pub data_with_markers: Vec<u16>,
     /// Clean byte suffix. All bytes here were decoded with a known
     /// window (set via IsalInflateWrapper::set_window) so no markers
     /// were emitted. CRC32'd at append time.
+    // NOTE: writev/vmsplice scatter-gather output and in-place-resolve experiments
+    // live on feat/dataplane-2touch; aggregate port REGRESSED on file output (+6-12%
+    // wall, +22% store-walks). vmsplice-pipe sub-path is an open candidate (sign-
+    // unstable) — see docs/dead-ends/data-plane-2touch.md + docs/open-candidates.md.
     pub data: U8,
     /// `data_with_markers` narrowed to u8 — populated by the
     /// post-process worker (`run_post_process_task`) right after

@@ -1,0 +1,69 @@
+# Dead End (HELD, not fully refuted): footprint-align SegmentedU8 DecodedData port
+
+## Hypothesis
+
+Port rapidgzip's full `DecodedData` layout faithfully:
+- `SegmentedU8` at 128 KiB granule for `ChunkData::data` (the clean u8 suffix)
+- Segmented 128 KiB granule for `data_with_markers` (the u16 marker prefix),
+  moved from glibc to rpmalloc
+- In-place-resolve (eliminate the separate `narrowed` buffer)
+- Remove the A3 prefill optimization (not present in vendor)
+
+Together, this achieves footprint –29% toward rapidgzip's ~350 MB RSS (from gzippy's
+~1040 MB) while matching the vendor buffer lifecycle precisely.
+
+## How Measured
+
+Branch `feat/footprint-align`, commit `2b8bfae`. Measured on the clean frozen-clock
+neurotic harness (`scripts/bench/clean_bench.sh`, N≥9 interleaved, sha-verified,
+T4/T8/T16).
+
+- Footprint (maxrss): 1040 MB → 738 MB = **–29%** — HIT the target trajectory toward
+  rapidgzip's ~350 MB.
+- T4 / T8 wall: **TIE** (within frozen-clock spread, sd <3%).
+- T16 wall: **REGRESSED +5.5%** vs the pre-segmented baseline.
+
+The T16 regression mechanism is **confirmed**: the SegmentedU8 port removed the A3
+prefill at `gzip_chunk.rs:178`, which is a measured **+4.2% T16 production win**
+(separately A/B'd). When A3 is absent, T16 workers stall slightly more because the
+next chunk's decode buffer is not prefaulted, and the faults land on the critical
+path at high thread counts.
+
+## Verdict: HELD from production
+
+The segmented port is **not fully refuted** — the T4/T8 TIE is a TIE, not a loss, and
+the T16 regression has a **named mechanism with a clear fix path**. Per the methodology
+rule (a TIE is not a rejection; rejection requires a mechanism or a named
+worse-measurement):
+
+- T16 +5.5% regression = named worse-measurement (the A3-removal cause).
+- Fix: land the SegmentedU8 layout **with A3 prefilled into segment 0** (prefault
+  only the first 128 KiB segment of the new segmented buffer, exactly what A3 did
+  for the monolithic buffer). Re-measure T16 — if it TIEs or beats, the whole stack
+  ships.
+
+This port is the **REFERENCE implementation** for any future faithful-DecodedData
+revival. It is complete, correct (sha-verified), and the base for re-entry.
+
+## Code Location
+
+Branch: `feat/footprint-align`, commit `2b8bfae`.
+
+The SegmentedU8 type is scaffolded at:
+- `src/decompress/parallel/segmented_buffer.rs` — full implementation
+- `src/decompress/parallel/chunk_data.rs` — currently uses the flat `U8` type;
+  the segmented port rewires `ChunkData::data` to `SegmentedU8`
+
+## Re-Entry Conditions
+
+**segment-native A3**: prefill segment 0 of the new SegmentedU8 buffer at construction
+time (matching the original A3 behavior). This is the single missing piece that blocked
+production landing. Branch `feat/footprint-align` commit `2b8bfae` is the base.
+See `docs/open-candidates.md` for the full ship-gate.
+
+## Related Entries
+
+- `docs/dead-ends/footprint-bandwidth.md` — broader DRAM/footprint theory (6 refutations)
+- `docs/dead-ends/data-plane-2touch.md` — the aggregate port (granule + in-place + writev)
+  that REGRESSED on file output; the segmented port alone without writev is still open
+- `segmented_buffer.rs` — the SegmentedU8 implementation itself
