@@ -96,6 +96,42 @@ pub static BOOTSTRAP_BODY_BYTES: std::sync::atomic::AtomicU64 =
 pub static BOOTSTRAP_POST_FLIP_U16_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// ── GARBAGE-SKIP CEILING ORACLE (GZIPPY_SKIP_WINDOW_ABSENT=1) ──────────────
+// CORRECTNESS-BREAKING upper-bound instrument. When the env knob is set, the
+// window-absent speculative path (marker bootstrap u16 decode + emit_backref_ring
+// + the consumer's apply_window/replace_markers resolve) is REPLACED by a single
+// clean ISA-L bulk decode of the whole chunk against a DUMMY zero 32-KiB window.
+// This drives the window-absent decode+emit+resolve cost toward zero while the
+// pipeline keeps flowing (real bit-stream parse => correct end_bit_offset +
+// byte count + block boundaries), so the interleaved-wall delta vs knob-OFF is
+// the MAXIMUM T8 wall any window-absent optimization could ever buy.
+//
+// Output is GARBAGE (back-references that reach into the absent predecessor
+// window resolve against zeros) — do NOT sha-verify with the knob ON.
+//
+// POSITIVE CONTROL: SKIP_ORACLE_CHUNKS counts chunks that took the skip stand-in
+// and SKIP_ORACLE_BYTES the bytes produced via it; a no-op oracle that secretly
+// still ran the real bootstrap would leave these at 0 and is thereby caught.
+// When the knob is OFF both stay 0 and production semantics are byte-identical.
+pub static SKIP_ORACLE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SKIP_ORACLE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Parsed once: true iff GZIPPY_SKIP_WINDOW_ABSENT is set to a non-empty value.
+#[cfg(parallel_sm)]
+fn skip_window_absent_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=off, 2=on
+    match CACHE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var_os("GZIPPY_SKIP_WINDOW_ABSENT").is_some();
+            CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Per-failure structured log. Writes one JSON line to the path in
 /// `GZIPPY_BODY_FAIL_LOG` env var (no-op if unset). Use this for
 /// distributional analysis: cluster failures by offset to see if they
@@ -842,6 +878,32 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
 ) -> Result<ChunkData, ChunkDecodeError> {
     let t_decode = std::time::Instant::now();
 
+    // GARBAGE-SKIP CEILING ORACLE (GZIPPY_SKIP_WINDOW_ABSENT=1). Replace the
+    // entire window-absent speculative path (marker bootstrap u16 decode +
+    // emit_backref_ring) AND remove its downstream cost (no markers => the
+    // consumer's apply_window/replace_markers is a no-op, since the resulting
+    // `data_with_markers` is empty and `data` carries clean u8) with ONE clean
+    // ISA-L bulk decode against a dummy zero 32-KiB window. Boundaries/byte
+    // count stay correct (real bit-stream parse), so the pipeline flows; the
+    // bytes are GARBAGE where back-refs reach the absent predecessor window.
+    // See SKIP_ORACLE_* counters (the positive control).
+    if skip_window_absent_enabled() {
+        let dummy_window = [0u8; 32768];
+        let chunk = decode_chunk_isal_impl(
+            input,
+            encoded_offset_bits,
+            stop_hint_bits,
+            &dummy_window,
+            configuration,
+        )?;
+        SKIP_ORACLE_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SKIP_ORACLE_BYTES.fetch_add(
+            chunk.data.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        return Ok(chunk);
+    }
+
     // Phase 1 — bootstrap with deflate_block::Block, the rapidgzip-
     // faithful port of vendor/.../gzip/deflate.hpp's deflate::Block<>.
     // Decodes deflate blocks one-by-one until any of:
@@ -903,11 +965,21 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     // the probe off vs on. Byte-identical (pure delay). If 2x-slower-bootstrap
     // (N=100) barely moves the wall, the bootstrap is overlapped/wall-dead;
     // if it adds ~its critical share, it is the lever. Off by default.
-    if let Some(pct) = std::env::var("GZIPPY_SLOW_BOOTSTRAP")
+    // GZIPPY_SLOW_BOOTSTRAP_US=K injects a FIXED K microseconds per chunk (the
+    // ABSOLUTE-ms calibration the standing protocol mandates); it takes
+    // precedence over the percent knob GZIPPY_SLOW_BOOTSTRAP=N.
+    let slow_us: Option<u64> = std::env::var("GZIPPY_SLOW_BOOTSTRAP_US")
         .ok()
-        .and_then(|s| s.parse::<u128>().ok())
-    {
-        let extra = std::time::Duration::from_micros((bootstrap_dur_us * pct / 100) as u64);
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&k| k > 0)
+        .or_else(|| {
+            std::env::var("GZIPPY_SLOW_BOOTSTRAP")
+                .ok()
+                .and_then(|s| s.parse::<u128>().ok())
+                .map(|pct| (bootstrap_dur_us * pct / 100) as u64)
+        });
+    if let Some(extra_us) = slow_us {
+        let extra = std::time::Duration::from_micros(extra_us);
         // Frequency-neutral control (disproof of the turbo-depression confound):
         // GZIPPY_SLOW_BOOTSTRAP_SLEEP=1 yields the core via sleep instead of a
         // busy-spin. A sleeping worker can't depress all-core turbo, so if the
