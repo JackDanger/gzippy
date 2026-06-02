@@ -236,10 +236,7 @@ pub mod splice {
             owner: Box<dyn Any + Send>,
         ) -> io::Result<()> {
             if self.pipe_buffer_size < 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "fd is not a pipe (vmsplice declined)",
-                ));
+                return Err(io::Error::other("fd is not a pipe (vmsplice declined)"));
             }
             let total: usize = iovs.iter().map(|v| v.iov_len).sum();
             self.vmsplice_all(iovs)?;
