@@ -874,6 +874,15 @@ fn drive_impl<W: std::io::Write>(
             bs_b_us as f64 / 1000.0,
             bs_b_rate,
         );
+        // GARBAGE-SKIP CEILING ORACLE positive control: how many chunks took
+        // the window-absent skip stand-in and how many bytes it produced.
+        // Non-zero ONLY when GZIPPY_SKIP_WINDOW_ABSENT is set; zero proves the
+        // real bootstrap ran (knob OFF) or the skip silently no-op'd.
+        eprintln!(
+            "  Skip-window-absent ORACLE: chunks_skipped={} bytes_via_skip={}",
+            gc::SKIP_ORACLE_CHUNKS.load(Ordering::Relaxed),
+            gc::SKIP_ORACLE_BYTES.load(Ordering::Relaxed),
+        );
         // Per-fetch rejection cause: a prefetched chunk arrived but the
         // safety guard rejected it (chain invariant broken —
         // chunk.max != next_block_offset).
@@ -908,6 +917,27 @@ fn drive_impl<W: std::io::Write>(
 /// (ParallelGzipReader.hpp:702-810). Every per-iteration step is a
 /// vendor primitive — no inline ring, no inline cache logic, no
 /// inline take-from-prefetch.
+#[cfg(parallel_sm)]
+thread_local! {
+    /// GZIPPY_SLOW_CONSUMER=N (percent of this iteration's own time), parsed
+    /// once per thread. See the injection site in `consumer_loop`.
+    static SLOW_CONSUMER_PCT: Option<u128> = std::env::var("GZIPPY_SLOW_CONSUMER")
+        .ok()
+        .and_then(|s| s.parse::<u128>().ok())
+        .filter(|&p| p > 0);
+    /// GZIPPY_SLOW_CONSUMER_US=K — inject a FIXED K microseconds per consumer
+    /// iteration (the ABSOLUTE-ms calibration the standing protocol mandates;
+    /// avoids the fraction-of-smeared-region bias). Takes precedence over the
+    /// percent knob when both are set.
+    static SLOW_CONSUMER_US: Option<u64> = std::env::var("GZIPPY_SLOW_CONSUMER_US")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&p| p > 0);
+    /// GZIPPY_SLOW_CONSUMER_SLEEP=1 → frequency-neutral sleep control.
+    static SLOW_CONSUMER_SLEEP: bool =
+        std::env::var_os("GZIPPY_SLOW_CONSUMER_SLEEP").is_some();
+}
+
 #[cfg(parallel_sm)]
 #[allow(clippy::too_many_arguments)]
 fn consumer_loop<W: std::io::Write>(
@@ -1647,8 +1677,37 @@ fn consumer_loop<W: std::io::Write>(
                 },
             )?;
         }
-        iter_us_sum += t_iter.elapsed().as_micros();
+        let iter_us = t_iter.elapsed().as_micros();
+        iter_us_sum += iter_us;
         iter_count += 1;
+        // CAUSAL PROBE (C2 perturbation): slow the in-order CONSUMER serial
+        // chain (block-finder get + in-order drain/apply_window/publish +
+        // write) by either a FIXED K us (GZIPPY_SLOW_CONSUMER_US, the
+        // protocol-mandated absolute-ms calibration) or N% of this iteration's
+        // own measured time (GZIPPY_SLOW_CONSUMER). Byte-identical pure delay on
+        // the consumer thread. Frequency-neutral control via
+        // GZIPPY_SLOW_CONSUMER_SLEEP=1. NOTE (protocol blind-spot #4): this hits
+        // the consumer's BUSY work only — a consumer WAIT (absence of work) is
+        // structurally unperturbable, so this knob may UNDERSTATE consumer
+        // criticality if the consumer is mostly waiting. Off by default.
+        let extra_us: u64 = if let Some(k) = SLOW_CONSUMER_US.with(|c| *c) {
+            k
+        } else if let Some(pct) = SLOW_CONSUMER_PCT.with(|c| *c) {
+            (iter_us * pct / 100) as u64
+        } else {
+            0
+        };
+        if extra_us > 0 {
+            let extra = std::time::Duration::from_micros(extra_us);
+            if SLOW_CONSUMER_SLEEP.with(|s| *s) {
+                std::thread::sleep(extra);
+            } else {
+                let until = std::time::Instant::now() + extra;
+                while std::time::Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+            }
+        }
     }
 
     // Final drain — flush remaining post-processes in encoded order.
