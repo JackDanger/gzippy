@@ -2365,6 +2365,41 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
     let mut narrowed_buf: Option<crate::decompress::parallel::rpmalloc_alloc::types::U8> = None;
     let t_narrow;
     let narrow_us;
+    // FOOTPRINT CEILING ORACLE cut (1): narrowed-kill. rapidgzip resolves the
+    // u16 dataWithMarkers IN PLACE into its own backing memory (no separate
+    // U8 buffer). gzippy allocates a full second U8 copy (`chunk.narrowed`,
+    // ~124MB resident on silesia T8) co-resident with `data_with_markers`.
+    // For the oracle we still resolve markers in place (so populate sees the
+    // resolved low bytes) but we DO NOT allocate the separate U8 buffer — the
+    // consumer is gated to skip the marker write below. This may break the
+    // output bytes (we measure WALL+IPC+RSS, not sha, with the knob ON).
+    {
+        use crate::decompress::parallel::chunk_buffer_pool;
+        if chunk_buffer_pool::footprint_ceiling() {
+            // Resolve markers in place inside the u16 buffer (apply_window
+            // writes the resolved byte into the low half of each u16 — no
+            // separate U8 allocation). We exercise the resolve CPU + keep the
+            // markers buffer resident, but DO NOT allocate the extra `narrowed`
+            // U8 (~124MB resident on silesia T8). populate_subchunk_windows is
+            // given an empty dwm slice (the windows it would derive from the
+            // narrowed prefix are not needed for the wall/RSS/IPC measurement;
+            // this may corrupt output bytes — the knob is sha-exempt).
+            apply_window(&mut chunk, &bytes);
+            chunk.populate_subchunk_windows(&bytes, &[]);
+            if trace::is_enabled() {
+                let apply_us = t_apply.elapsed().as_micros();
+                trace::emit(
+                    "post_process",
+                    "post_process_span",
+                    &format!(
+                        r#""start_bit":{start_bit},"materialize_us":{materialize_us},"apply_window_us":{apply_us},"populate_subchunk_windows_us":0,"narrow_us":0,"marker_bytes":{marker_bytes},"ceiling":1"#,
+                    ),
+                );
+            }
+            chunk.recycle_markers_after_resolution();
+            return chunk;
+        }
+    }
     if use_fused {
         POST_PROCESS_FUSED_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Fused path. `apply_window` is skipped entirely on this branch:
