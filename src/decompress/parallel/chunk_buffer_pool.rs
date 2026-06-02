@@ -157,9 +157,16 @@ fn hugepage_hint(ptr: *mut u8, len: usize) {
 #[inline(always)]
 fn hugepage_hint(_ptr: *mut u8, _len: usize) {}
 
-/// Cap on pool size per worker per Vec type. Sized to a handful of
-/// in-flight chunks per worker (not the old shared cap of 64).
-const MAX_POOLED: usize = 8;
+/// Cap on pool size per worker per Vec type. FOOTPRINT-ALIGN (2026-06-02):
+/// lowered 8 → 3. With `data` buffers now right-sized to ~split_chunk_size
+/// (not the 80 MiB worst-case cap), each retained buffer is ~4-12 MiB, so a
+/// deep LIFO of 8 per worker × 16 workers held up to ~1.5 GiB resident of
+/// idle buffers — the opposite of vendor, which holds no deep per-worker free
+/// list (it relies on rpmalloc's thread arena to recycle, and `shrink_to_fit`s
+/// every buffer — DecodedData.hpp:114,191-199). A worker has at most ~1-2
+/// chunks decoding + post-processing at once, so 3 retained buffers covers the
+/// reuse window without keeping a large idle resident set.
+const MAX_POOLED: usize = 3;
 const MAX_WORKERS: usize = 64;
 
 thread_local! {

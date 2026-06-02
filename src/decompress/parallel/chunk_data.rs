@@ -261,7 +261,23 @@ impl ChunkData {
     /// `Drop` impl returns the Vecs to the pool.
     pub fn new(encoded_offset_bits: usize, configuration: ChunkConfiguration) -> Self {
         use crate::decompress::parallel::chunk_buffer_pool;
-        let cap = configuration.max_decoded_chunk_size;
+        // FOOTPRINT-ALIGN (2026-06-02): allocate `data` at the EXPECTED
+        // decoded size (one chunk's `split_chunk_size`, ~4 MiB), NOT the
+        // worst-case `max_decoded_chunk_size` (= 20× split = 80 MiB). The
+        // 80 MiB pre-size was a gzippy-specific over-allocation: a normal
+        // chunk decodes ~split_chunk_size bytes and stops at the chunk's
+        // compressed range (`stop_hint_bits`), never approaching the 80 MiB
+        // preemptive cap. With rpmalloc's ~3.94 MiB huge-alloc threshold the
+        // 80 MiB `with_capacity` mmaps+faults 80 MiB per chunk and (×N
+        // workers × pool-retain) drove the 1.04 GB maxrss (vs rapidgzip's
+        // 347 MB). Vendor never pre-sizes the worst case: `DecodedData::
+        // append` grows `dataBuffers` 128 KiB at a time and `shrink_to_fit`s
+        // (DecodedData.hpp:241-289). gzippy's growth loop
+        // (`chunk.data.reserve(ALLOCATION_CHUNK_SIZE)`, gzip_chunk.rs:318)
+        // already grows on demand, so the only change needed is to stop
+        // pre-committing the worst case here. Pathological chunks that cross
+        // 4 MiB just pay amortized doubling like vendor.
+        let cap = configuration.split_chunk_size;
         // `data_with_markers` is allocated lazily — the fast path
         // (window known) never emits markers, so paying for the
         // capacity reservation up front is wasted address space AND
