@@ -1666,7 +1666,9 @@ mod tests {
         for v in &chunk.data_with_markers {
             out.push(*v as u8);
         }
-        out.extend_from_slice(&chunk.data);
+        for seg in chunk.data.segments() {
+            out.extend_from_slice(seg);
+        }
         out
     }
 
