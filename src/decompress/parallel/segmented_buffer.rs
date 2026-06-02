@@ -22,6 +22,15 @@
 //!
 //! This module ships the u8 variant first; `data_with_markers` and
 //! `narrowed` may be segmented in follow-ups if the lever proves out.
+//!
+//! DEAD-END NOTE: this type is scaffolded but UNWIRED into production
+//! `ChunkData::data`. The full faithful DecodedData port lives on
+//! feat/footprint-align (commit 2b8bfae): footprint -29%, T4/T8 TIE,
+//! T16 +5.5% from A3-removal. Re-entry = segment-native A3 (prefill
+//! segment 0). Page-fault REMOVAL is NOT the lever (3 oracles TIE —
+//! docs/dead-ends/page-faults.md); the residency hypothesis for this
+//! type is untested. See docs/dead-ends/footprint-align-segmented.md
+//! and docs/open-candidates.md before wiring into production.
 
 use crate::decompress::parallel::rpmalloc_alloc::types::{self, U8};
 

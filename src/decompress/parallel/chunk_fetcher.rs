@@ -1448,6 +1448,9 @@ fn consumer_loop<W: std::io::Write>(
                 // decoded bytes only exist from max onward. Safe reuse
                 // requires the consumer's confirmed start == max (vendor
                 // chain: chunk_N.end == chunk_{N+1}.start at max).
+                // NOTE: the fill-lever (range-accept relaxation) and eager-resolve directions
+                // are DEAD — guard-rejects≈0 + corruption risk + eager 0 ready tasks.
+                // See docs/dead-ends/fill-lever.md and docs/dead-ends/eager-resolve-phantom.md.
                 let handoff_at_decode_start = arc.max_acceptable_start_bit == next_block_offset;
                 // (Design B) The chunk's `encoded_end` — preserved by
                 // `set_encoded_offset` through the accept rewrite, so it
@@ -3002,6 +3005,14 @@ type EagerSubmitted = std::collections::HashMap<usize, (usize, mpsc::Receiver<Ch
 // (GzipChunkFetcher.hpp:520-551): during a consumer stall, submit
 // apply_window for prefetched SUCCESSOR chunks whose predecessor window
 // is already published, instead of waiting to reach them in order.
+//
+// DEAD-END: GZIPPY_EAGER_POSTPROC = REFUTED. Both variants:
+// (a) consumer-side pump: enqueued 0 tasks (0 ready successors during stalls;
+//     the work is dependency-blocked on the same frontier). +195ms net loss.
+// (b) worker-side variant: EAGER_PROBE_SUBMITTED=0 — structurally inert.
+// See docs/dead-ends/eager-resolve-phantom.md. Left gated (default OFF) as
+// diagnostic instrumentation only. Do not re-enable without a fresh probe
+// confirming ready-work count > 0 during stalls.
 //
 // These counters are the deliverable: a prior pump attempt TIED because
 // it found 0 ready successors. We MUST distinguish "the lever works"
