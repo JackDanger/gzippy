@@ -891,6 +891,10 @@ fn drive_impl<W: std::io::Write>(
     // Flush all per-thread trace_v2 buffers (consumer thread + any
     // already-joined worker threads).
     trace_v2::flush_all();
+    // memlife: record decoded-byte normalizer + worker count, then dump the
+    // per-buffer attribution JSON (no-op unless GZIPPY_MEMLIFE is set).
+    crate::decompress::parallel::memlife::set_run_totals(total_size, parallelization);
+    crate::decompress::parallel::memlife::dump();
     // DECODE-BYPASS: serialize the capture map (no-op unless capture on).
     crate::decompress::parallel::decode_bypass::flush_capture();
     Ok((total_crc.crc32(), total_size))
@@ -2372,19 +2376,40 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
         // downstream reader inspects them after this point — populate
         // takes `dwm_bytes` and the consumer writes `chunk.narrowed`).
         use crate::decompress::parallel::chunk_buffer_pool;
-        let mut narrowed = chunk_buffer_pool::take_u8(dwm_len_pre);
+        use crate::decompress::parallel::memlife::{self, Component};
+        // memlife: the SEPARATE narrowed buffer rapidgzip does NOT allocate
+        // (it resolves in-place). Alloc + write of dwm_len_pre u8, reading
+        // dwm_len_pre u16 (2× width) from data_with_markers + the 32 KiB window.
+        let mut narrowed = chunk_buffer_pool::take_u8_memlife(dwm_len_pre, Component::Narrowed);
+        memlife::read(Component::DataWithMarkers, dwm_len_pre * 2);
+        memlife::written(Component::Narrowed, dwm_len_pre);
         replace_markers_lut_narrow(&chunk.data_with_markers, &bytes, &mut narrowed);
         narrowed_buf = Some(narrowed);
         t_narrow = std::time::Instant::now();
         narrow_us = 0u128;
     } else {
         POST_PROCESS_SMALL_MARKERS_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // memlife: apply_window READS+WRITES data_with_markers in place
+        // (replace_markers resolves each u16 marker against the window). The
+        // 2×-width in-place pass is shared with rapidgzip's marker resolve.
+        {
+            use crate::decompress::parallel::memlife::{self, Component};
+            let n = chunk.data_with_markers.len();
+            memlife::read(Component::DataWithMarkers, n * 2);
+            memlife::written(Component::DataWithMarkers, n * 2);
+        }
         apply_window(&mut chunk, &bytes);
         t_narrow = std::time::Instant::now();
         if !chunk.data_with_markers.is_empty() {
             use crate::decompress::parallel::chunk_buffer_pool;
+            use crate::decompress::parallel::memlife::{self, Component};
             let dwm_len = chunk.data_with_markers.len();
-            let mut narrowed = chunk_buffer_pool::take_u8(dwm_len);
+            // memlife: the SEPARATE narrowed buffer (rapidgzip lacks this —
+            // in-place resolve has no second buffer). Alloc + write dwm_len u8,
+            // read dwm_len u16 (2× width).
+            let mut narrowed = chunk_buffer_pool::take_u8_memlife(dwm_len, Component::Narrowed);
+            memlife::read(Component::DataWithMarkers, dwm_len * 2);
+            memlife::written(Component::Narrowed, dwm_len);
             narrow_u16_to_u8(&chunk.data_with_markers, &mut narrowed);
             narrowed_buf = Some(narrowed);
         }
@@ -2990,6 +3015,15 @@ fn drain_one_pending<W: std::io::Write>(
     if !chunk.narrowed.is_empty() {
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.write_narrowed");
+            // memlife: reading narrowed into the writer (load) + the sink copy.
+            crate::decompress::parallel::memlife::read(
+                crate::decompress::parallel::memlife::Component::Narrowed,
+                chunk.narrowed.len(),
+            );
+            crate::decompress::parallel::memlife::written(
+                crate::decompress::parallel::memlife::Component::OutputWrite,
+                chunk.narrowed.len(),
+            );
             writer
                 .write_all(&chunk.narrowed)
                 .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
@@ -3022,6 +3056,15 @@ fn drain_one_pending<W: std::io::Write>(
         let payload = &chunk.data[chunk.data_prefix_len..];
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.write_data");
+            // memlife: reading data into the writer (load) + the sink copy.
+            crate::decompress::parallel::memlife::read(
+                crate::decompress::parallel::memlife::Component::Data,
+                payload.len(),
+            );
+            crate::decompress::parallel::memlife::written(
+                crate::decompress::parallel::memlife::Component::OutputWrite,
+                payload.len(),
+            );
             writer
                 .write_all(payload)
                 .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;

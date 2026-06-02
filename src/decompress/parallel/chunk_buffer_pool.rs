@@ -232,6 +232,38 @@ pub fn take_u8(min_capacity: usize) -> U8 {
     types::u8_with_capacity(min_capacity)
 }
 
+/// memlife-tagged twin of [`take_u8`]: records the allocation against `comp`
+/// with its alloc-PATH (pool-hit = no fault; fresh = rpmalloc span/huge by
+/// size) so `fulcrum memlife` can attribute first-touch faults to the buffer.
+/// Byte-identical behavior to `take_u8` (only the gated counter differs).
+pub fn take_u8_memlife(
+    min_capacity: usize,
+    comp: crate::decompress::parallel::memlife::Component,
+) -> U8 {
+    use crate::decompress::parallel::memlife::{self, AllocPath};
+    let idx = pool_index_for_take();
+    if let Ok(mut pool) = u8_pools()[idx].lock() {
+        if let Some(mut v) = pool.pop() {
+            TAKE_U8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            TAKE_U8_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            v.clear();
+            if v.capacity() < min_capacity {
+                // grew the pooled block — the grown tail may fresh-fault
+                memlife::alloc(comp, v.capacity(), AllocPath::PoolHit);
+                v.reserve(min_capacity - v.capacity());
+            } else {
+                memlife::alloc(comp, v.capacity(), AllocPath::PoolHit);
+            }
+            return v;
+        }
+    }
+    TAKE_U8_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TAKE_U8_MISSES_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Fresh allocation: classify by size (huge = munmap-on-free → re-faults).
+    memlife::alloc(comp, min_capacity, memlife::classify_rpmalloc(min_capacity));
+    types::u8_with_capacity(min_capacity)
+}
+
 /// Take a `Vec<u16>` from the current worker's pool.
 #[allow(dead_code)]
 pub fn take_u16(min_capacity: usize) -> U16 {
