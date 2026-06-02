@@ -157,6 +157,26 @@ pub static UNSPLIT_BLOCKS_EMPLACED: std::sync::atomic::AtomicU64 =
 pub static PREFETCH_NEXT_FILESIZE_ACCEPT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// FRONTIER-PLACEMENT ORACLE instrument: count of frontier-successor
+/// chunks dispatched at the boosted priority -1 (GZIPPY_FRONTIER_PREFETCH_ORACLE=1).
+/// Zero when the oracle is OFF; a nonzero value proves the oracle BIT
+/// (the placement change actually fired) — the guard against a no-op
+/// oracle that silently measures the baseline.
+pub static FRONTIER_ORACLE_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// FRONTIER-PLACEMENT ORACLE diagnostic: how many consumer iterations
+/// found the frontier-successor chunk ALREADY in-flight / in-cache when
+/// the consumer reached the current chunk. A high ratio vs total iters
+/// means placement is ALREADY optimal (the frontier was dispatched ahead
+/// of time and is decoding before the consumer needs it) — so the
+/// priority boost has nothing to bite, and any residual wait is the
+/// frontier's OWN decode time (Lever A: rate), not a placement miss.
+pub static FRONTIER_ORACLE_ALREADY_INFLIGHT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static FRONTIER_ORACLE_ITERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug)]
 #[allow(dead_code)] // error payloads surfaced via Debug in production
 pub enum FetchError {
@@ -973,6 +993,11 @@ fn consumer_loop<W: std::io::Write>(
     let eager_enabled = eager_postproc_enabled();
     let mut eager_submitted: EagerSubmitted = std::collections::HashMap::new();
 
+    // FRONTIER-PLACEMENT ORACLE (GZIPPY_FRONTIER_PREFETCH_ORACLE=1). Read
+    // once; default OFF. When ON, the consumer's immediate-next in-order
+    // chunk is prefetched at priority -1 (ahead of deeper speculation).
+    let frontier_oracle_on = frontier_prefetch_oracle_enabled();
+
     // The vendor's `processNextChunk` returns one chunk per call; the
     // caller loops in `ParallelGzipReader::read`. We inline that loop
     // here so the local-state mutation (post-process queue + writer +
@@ -1092,16 +1117,58 @@ fn consumer_loop<W: std::io::Write>(
         // stop_hint_bit equal to `start_bit` for every prefetch past the
         // first one, causing the worker to immediately exit with an
         // empty chunk.
+        // FRONTIER-PLACEMENT ORACLE (GZIPPY_FRONTIER_PREFETCH_ORACLE=1).
+        // The chunk the consumer will block on NEXT (its immediate-next
+        // in-order index) is the FRONTIER successor. Its confirmed offset,
+        // if known, lets `prefetch_submit` recognise that exact prefetch
+        // and dispatch it at priority -1 (ahead of deeper speculation at
+        // priority 0) so a freed worker decodes it first — same work,
+        // scheduled ahead. `None` when the next index isn't confirmed yet
+        // (the prefetch then keeps vendor priority 0; the oracle simply
+        // can't bite that iteration). Default OFF → flag unread, no-op.
+        let frontier_succ_offset: Option<usize> = if frontier_oracle_on {
+            // Inline of the SUCCESS-only `lookup_block_offset` (defined
+            // below) — the confirmed/guessed offset of the consumer's
+            // immediate-next in-order index.
+            let fo = match block_finder.get(next_unprocessed_block_index + 1) {
+                (Some(offset), GetReturnCode::Success) => Some(offset),
+                _ => None,
+            };
+            // DIAGNOSTIC: is the frontier successor ALREADY dispatched
+            // (in cache or in-flight)? If yes, the priority boost cannot
+            // change its completion time — placement is already optimal
+            // and the consumer's wait is the frontier's own decode time.
+            FRONTIER_ORACLE_ITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(o) = fo {
+                let part = block_finder.partition_offset_containing_offset(o);
+                if block_fetcher.test(&o) || block_fetcher.test(&part) {
+                    FRONTIER_ORACLE_ALREADY_INFLIGHT
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            fo
+        } else {
+            None
+        };
         let prefetch_submit = |offset: usize,
                                next_offset: usize|
          -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
             let prefetch_stop_hint_bit = next_offset.max(offset);
+            // ORACLE: the frontier successor decode is dispatched as a
+            // NON-speculative (priority -1) task so it outranks deeper
+            // speculative prefetches in the pool's pick order. PLACEMENT
+            // ONLY — `run_decode_task` does the identical work at the
+            // identical rate; it just gets a worker sooner.
+            let is_frontier_prefetch = frontier_succ_offset.map(|f| f == offset).unwrap_or(false);
             let prefetch_params = DecodeParams {
                 start_bit: offset,
                 stop_hint_bit: prefetch_stop_hint_bit,
-                is_speculative_prefetch: true,
+                is_speculative_prefetch: !is_frontier_prefetch,
                 partition_idx: usize::MAX, // trace marker for "prefetch"
             };
+            if is_frontier_prefetch {
+                FRONTIER_ORACLE_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             submit_decode_to_pool(
                 thread_pool,
                 input,
@@ -1771,6 +1838,29 @@ fn consumer_loop<W: std::io::Write>(
                  window is published. The lever is prefetch DEPTH, not post-process eagerness."
             );
         }
+    }
+
+    // FRONTIER-PLACEMENT ORACLE report — proof the oracle BIT. A nonzero
+    // dispatch count means the frontier successor was actually boosted to
+    // priority -1 (the placement change fired); 0 means the next index was
+    // never confirmed at prefetch time (oracle was a no-op — do NOT read
+    // its wall as a placement verdict).
+    if frontier_oracle_on {
+        use std::sync::atomic::Ordering;
+        let dispatches = FRONTIER_ORACLE_DISPATCHES.load(Ordering::Relaxed);
+        let iters = FRONTIER_ORACLE_ITERS.load(Ordering::Relaxed);
+        let already = FRONTIER_ORACLE_ALREADY_INFLIGHT.load(Ordering::Relaxed);
+        let pct = if iters > 0 {
+            100.0 * already as f64 / iters as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[gzippy FRONTIER_ORACLE] frontier_priority_dispatches={dispatches} \
+             (nonzero ⇒ oracle BIT: frontier decoded at priority -1) | \
+             frontier_already_inflight={already}/{iters} ({pct:.0}%) \
+             (high ⇒ placement ALREADY optimal; residual wait is decode RATE, Lever A)"
+        );
     }
 
     Ok(())
@@ -2793,6 +2883,37 @@ fn eager_postproc_enabled() -> bool {
         2 => true,
         _ => {
             let on = std::env::var_os("GZIPPY_EAGER_POSTPROC")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// True iff `GZIPPY_FRONTIER_PREFETCH_ORACLE=1`. Read once and cached.
+///
+/// FRONTIER-PLACEMENT ORACLE (rule-3 removal test, NOT production).
+/// When ON, the prefetch driver dispatches the consumer's IMMEDIATE-NEXT
+/// in-order chunk (the FRONTIER successor — the very chunk the consumer
+/// will block on next) at priority -1 instead of the speculative
+/// priority 0, so a freed worker picks the frontier chunk AHEAD of any
+/// deeper speculation. This changes ONLY scheduling PLACEMENT — the same
+/// decode work runs, at the same per-byte rate — moved off the consumer's
+/// critical path (decoded ahead) where workers have slack. If workers are
+/// fully saturated (no slack to absorb the frontier earlier), reordering
+/// cannot change the frontier chunk's completion time and the wall stays
+/// flat ⇒ the gap is per-byte DECODE SPEED (Lever A), not PLACEMENT
+/// (Lever B). Default OFF → production byte-identical (priorities unchanged).
+#[cfg(parallel_sm)]
+fn frontier_prefetch_oracle_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHED: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=off, 2=on
+    match CACHED.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var_os("GZIPPY_FRONTIER_PREFETCH_ORACLE")
                 .map(|v| v == "1")
                 .unwrap_or(false);
             CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
