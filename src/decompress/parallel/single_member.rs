@@ -191,6 +191,10 @@ pub fn decompress_parallel<W: Write>(
         })?;
 
         MARKER_PIPELINE_RUNS.fetch_add(1, Ordering::Relaxed);
+        // MECHANISM instrumentation dump (GZIPPY_MARKER_STATS=1). No-op when
+        // the env var is unset. Counts are process-global atomics summed across
+        // all worker threads.
+        crate::decompress::parallel::deflate_block::marker_instr::dump();
         if debug_enabled() {
             let total = t0.elapsed();
             let mbps = result.total_size as f64 / total.as_secs_f64() / 1e6;
