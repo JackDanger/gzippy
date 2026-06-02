@@ -690,6 +690,14 @@ fn drive_impl<W: std::io::Write>(
             TAKE_U8_MISSES.load(Ordering::Relaxed),
             RETURN_U8_CALLS.load(Ordering::Relaxed),
         );
+        // vmsplice-engagement (GATE): chunk payloads that took the Linux
+        // vmsplice fast path (pipe sink). Must be > 0 on a pipe sink and
+        // == 0 on a file/tmpfs sink (which declines vmsplice → writev).
+        #[cfg(all(parallel_sm, unix, target_os = "linux"))]
+        eprintln!(
+            "  vmsplice engagements: {}",
+            crate::decompress::parallel::fd_vectored_write::splice::vmsplice_engagements()
+        );
         eprintln!(
             "  Buffer pool u16: hits={} misses={} returns={}",
             TAKE_U16_HITS.load(Ordering::Relaxed),
