@@ -143,6 +143,17 @@ impl WindowMap {
     /// the consumer's serial publish path (the gate for successor
     /// dispatch). See `CompressedVector::from_owned_none`.
     pub fn insert_owned_none(&self, encoded_offset_bits: usize, bytes: Vec<u8>) {
+        // memlife: a 32 KiB tail-window buffer built by get_last_window_vec /
+        // last_32kib_window_vec then stored here. rapidgzip stores a COMPRESSED
+        // window in WindowMap; gzippy's owned-none stores it raw. Record the
+        // alloc + the write that built it. (Gated: memlife is parallel_sm-only;
+        // window_map itself is compiled in non-parallel_sm builds too.)
+        #[cfg(parallel_sm)]
+        {
+            use crate::decompress::parallel::memlife::{self, AllocPath, Component};
+            memlife::alloc(Component::Window, bytes.len(), AllocPath::Glibc);
+            memlife::written(Component::Window, bytes.len());
+        }
         let cv = Arc::new(CompressedVector::from_owned_none(bytes));
         self.insert(encoded_offset_bits, cv);
     }

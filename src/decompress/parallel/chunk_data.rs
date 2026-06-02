@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use crate::decompress::parallel::crc32::CRC32Calculator;
+use crate::decompress::parallel::memlife::{self, Component};
 pub use crate::decompress::parallel::replace_markers::MARKER_BASE;
 use crate::decompress::parallel::rpmalloc_alloc::types::{self, U8};
 
@@ -147,10 +148,18 @@ pub struct ChunkData {
     // buffer directly (zero-copy merge), and std-Vec decode is ~3% faster
     // per-byte than rpmalloc here (measured). Warm-cycled via the dedicated
     // `chunk_buffer_pool::{take,return}_std_u16` retained pool.
+    // NOTE: faithful rapidgzip SegmentedU8/in-place-resolve DecodedData port lives on
+    // feat/footprint-align (commit 2b8bfae); footprint -29% but blocked on A3-removal
+    // T16 regression — see docs/dead-ends/footprint-align-segmented.md. Re-entry =
+    // segment-native A3 (prefill into segment 0). See docs/open-candidates.md.
     pub data_with_markers: Vec<u16>,
     /// Clean byte suffix. All bytes here were decoded with a known
     /// window (set via IsalInflateWrapper::set_window) so no markers
     /// were emitted. CRC32'd at append time.
+    // NOTE: writev/vmsplice scatter-gather output and in-place-resolve experiments
+    // live on feat/dataplane-2touch; aggregate port REGRESSED on file output (+6-12%
+    // wall, +22% store-walks). vmsplice-pipe sub-path is an open candidate (sign-
+    // unstable) — see docs/dead-ends/data-plane-2touch.md + docs/open-candidates.md.
     pub data: U8,
     /// `data_with_markers` narrowed to u8 — populated by the
     /// post-process worker (`run_post_process_task`) right after
@@ -261,7 +270,16 @@ impl ChunkData {
     /// `Drop` impl returns the Vecs to the pool.
     pub fn new(encoded_offset_bits: usize, configuration: ChunkConfiguration) -> Self {
         use crate::decompress::parallel::chunk_buffer_pool;
-        let cap = configuration.max_decoded_chunk_size;
+        // FOOTPRINT CEILING ORACLE cut (3): right-size the `data` initial
+        // capacity to ~16 MiB (observed P95 written) instead of the 80 MiB
+        // max_decoded_chunk_size. Sized ABOVE the 4 MiB realloc-trap that
+        // regressed feat/footprint-align (shrinking to split_chunk_size forced
+        // realloc+memcpy+refault). Knob OFF = the original 80 MiB reservation.
+        let cap = if chunk_buffer_pool::footprint_ceiling() {
+            chunk_buffer_pool::CEILING_DATA_CAP
+        } else {
+            configuration.max_decoded_chunk_size
+        };
         // `data_with_markers` is allocated lazily — the fast path
         // (window known) never emits markers, so paying for the
         // capacity reservation up front is wasted address space AND
@@ -281,7 +299,7 @@ impl ChunkData {
             encoded_offset_bits,
             configuration,
             chunk_buffer_pool::take_std_u16(0),
-            chunk_buffer_pool::take_u8(cap),
+            chunk_buffer_pool::take_u8_memlife(cap, Component::Data),
             chunk_buffer_pool::current_worker_pool_index().unwrap_or(0),
         )
     }
@@ -617,6 +635,17 @@ impl ChunkData {
         // have produced.
         let added = values.len();
         let prev_len = self.data_with_markers.len();
+        // memlife: the bootstrap's u16 marker output COPIED into
+        // data_with_markers (2× width). Written then later READ by
+        // apply_window. rapidgzip pays the analogous MarkerVector append.
+        memlife::copied(Component::DataWithMarkers, added * 2);
+        memlife::written(Component::DataWithMarkers, added * 2);
+        // memlife: data_with_markers is a std (glibc) Vec<u16> grown on demand.
+        // Record the backing-byte growth as a glibc alloc against this buffer.
+        if self.data_with_markers.capacity() < prev_len + added {
+            let grow = (prev_len + added - self.data_with_markers.capacity()) * 2;
+            memlife::alloc(Component::DataWithMarkers, grow, memlife::AllocPath::Glibc);
+        }
         self.data_with_markers.reserve(added);
         // SAFETY: `reserve(added)` ensures capacity covers
         // `prev_len + added`; `values` and `data_with_markers`
@@ -649,6 +678,9 @@ impl ChunkData {
             }
         }
         self.statistics.non_marker_count += bytes.len() as u64;
+        // memlife: clean bytes COPIED into data via extend_from_slice.
+        memlife::written(Component::Data, bytes.len());
+        memlife::copied(Component::Data, bytes.len());
         self.data.extend_from_slice(bytes);
         if let Some(last) = self.subchunks.last_mut() {
             last.decoded_size += bytes.len();
@@ -683,6 +715,9 @@ impl ChunkData {
         if extend_len {
             unsafe { self.data.set_len(prev_len + written) };
         }
+        // memlife: ISA-L wrote `written` bytes DIRECTLY into data (no copy —
+        // this is the zero-copy in-place decode path). Counts as a write only.
+        memlife::written(Component::Data, written);
         if self.configuration.crc32_enabled {
             if let Some(last_crc) = self.crc32s.last_mut() {
                 last_crc.update(&self.data[prev_len..prev_len + written]);
@@ -728,9 +763,14 @@ impl ChunkData {
         self.statistics.non_marker_count += buffer.len() as u64;
         if self.data.is_empty() {
             // Zero-copy move of the owned allocation, mirroring
-            // BaseType::append(std::move(toAppend)).
+            // BaseType::append(std::move(toAppend)). memlife: write only, no
+            // copy — the buffer's bytes were already written by the decoder.
+            memlife::written(Component::Data, buffer.len());
             self.data = std::mem::replace(&mut buffer, types::u8_empty());
         } else {
+            // memlife: appended-on-top path is a real copy.
+            memlife::written(Component::Data, buffer.len());
+            memlife::copied(Component::Data, buffer.len());
             self.data.extend_from_slice(&buffer);
         }
     }
@@ -1012,11 +1052,19 @@ impl ChunkData {
         // `copy_within` is a single memmove — well-vectorized in
         // libc on x86_64.
         if existing_len > 0 {
+            // memlife: the memmove shift of the ISA-L bulk — a Data→Data copy
+            // gzippy pays so the narrowed clean tail can prepend in-place.
+            memlife::copied(Component::Data, existing_len);
             self.data.copy_within(0..existing_len, prefix_len);
         }
         // Narrow u16 -> u8 directly into the front of self.data.
         // All values in [split_at..] are < 256 by the rposition
         // search above (last >= MARKER_BASE element ends at split_at).
+        // memlife: this narrow loop READS prefix_len u16s (2× width) from
+        // data_with_markers and WRITES prefix_len u8s into data. The 2×-width
+        // read is the marker-buffer tax; the write is the narrowed clean tail.
+        memlife::read(Component::DataWithMarkers, prefix_len * 2);
+        memlife::written(Component::Data, prefix_len);
         for (i, &v) in self.data_with_markers[split_at..].iter().enumerate() {
             self.data[i] = v as u8;
         }

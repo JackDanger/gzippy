@@ -1,7 +1,58 @@
 # Wall-parity scoreboard — the trustworthy progress signal
 
+## 2026-06-01 — S4 CONSUMER-NULL CEILING-BY-REMOVAL: BIG ceiling (~27% T8), but the lever is the CONSUMER OUTPUT-WRITE memcpy, NOT generic "consumer compute"
+Built the positive-controlled REMOVAL oracle the 2×2 factorial owed (commit 593819d, branch `consumer-null-oracle`): `GZIPPY_NULL_CONSUMER_WORK=1` (default OFF byte-identical, sha == rapidgzip e114dd2) nulls the consumer thread's removable serial compute in `drain_one_pending` — per-chunk `write_all` (output) + `total_crc.append` (CRC-fold). What it does NOT null (pipeline-structural; nulling = the clean-window-oracle trap): window-publish, marker-resolve wait, rx.recv. The heavy apply_window/narrow runs on the POOL (producer-side), not the consumer thread.
+PROVENANCE (all pass): pure-Rust `nm -D` isal_inflate=0, path=IsalParallelSM, T8-noSMT pinned 0,2,4,6,8,10,12,14, frozen-clock 111+105 watchdog'd, interleaved N=11/15, OFF sha==rapidgzip oracle. POSITIVE CONTROL: witness `consumer_work_executed=0` ON (>0 OFF, by construction), `nulled_chunks=36`, conservation `bytes_skipped=503627776 == expected_size` ✓, no FAKE warning.
+THE CEILING (median, removal):
+| T | OFF (real) | ON (nulled) | ceiling | OFF/rg | ON/rg | rapidgzip |
+|---|---|---|---|---|---|---|
+| 4 | 0.461s | 0.376s | +85.6ms (+18.6%) | 1.46× | 1.19× | 0.316s |
+| 8 | 0.373s | 0.273s | +100.4ms (+26.9%) | 1.81× | 1.32× | 0.206s |
+| 16| 0.408s | 0.291s | +116.7ms (+28.6%) | 2.28× | 1.63× | 0.178s |
+(T8 N=11 reproduced N=15 within 5ms; pooled_sd 14-22ms ≪ ceiling ⇒ all BIG, ~5σ.)
+VERDICT = **GO with a SHARP scope: consumer-compute removal recovers ~27% of the T8 wall and closes ROUGHLY HALF the gzippy↔rapidgzip gap (1.81×→1.32×) — but it does NOT reach parity (rapidgzip still 1.32× faster ON), so the consumer-write is necessary-not-sufficient.** This is the first lever this campaign has measured with a BIG positive-controlled removal ceiling (vs the string of TIEs).
+THE MECHANISM (adversarially nailed down — the verdict is NOT "generic consumer compute"):
+- **It is the OUTPUT WRITE, not the CRC.** `CRC32Calculator::append` is an O(1) GF(2) `combine_crc32` (crc32.rs:242) — 36 calls, microseconds. The ~100ms is the consumer thread's serial `write_all` of all 503MB into the `BufWriter` (decompress/io.rs:148, STREAM_BUFFER_SIZE) — a single-core memcpy that READS freshly cross-core-decoded chunk data (cold in the consumer core's cache) and copies it into the output buffer. To /dev/null the *flush* is free, but the user-space buffer memcpy is not.
+- **It is consumer-thread-LOCAL, not a systemic memory-contention speedup (refuted hypothesis 2).** OFF vs ON traced runs: worker.decode_chunk busy 1488 vs 1502ms, post_process 153.5 vs 153.0ms, bootstrap 614.9 vs 611.1ms — IDENTICAL. Nulling the consumer write does not speed the workers; the oracle cleanly isolates consumer-thread compute.
+- **It is ORTHOGONAL to the ORACLE-c residency/store-walk lever.** dtlb_store_misses.walk_completed OFF 4.65M → ON 4.24M (−9% only); the store-walks live in the DECODE writes (worker side), not the consumer write. minor-faults −3%. Two independent levers.
+BUSY-vs-WAIT split (caveat: TRACING perturbs — traced wall collapses to 236/233ms so the per-span absolutes UNDER-read the 100ms; use only relatively): consumer `wait.future_recv` (rx.recv on the head chunk) OFF 27ms → ON 24ms; consumer compute spans OFF 33ms → ON 28ms. The consumer is roughly HALF wait / half compute in the trace, but the wait did NOT grow when compute was nulled (24 vs 27ms) ⇒ removing the write did not just convert compute→wait; it removed real critical-path work. The BLIND SPOT (#4) holds: the consumer WAIT (future_recv, ~27ms) is unperturbable by this oracle and is a SEPARATE residual lever — but it is small (~27ms) vs the write (~100ms).
+NEXT (S5/S6 — build, layered, re-measure whole): the consumer output-write is the ranked #1 buildable lever. rapidgzip is the existence proof it can be cheaper — port HOW rapidgzip delivers output without a serial single-core 503MB memcpy on the in-order thread (candidates: writev/vectored gather of chunk buffers so the kernel does the copy off the consumer core; or overlap the write with the next chunk's recv via a writer thread / double-buffer; or hand the kernel the chunk buffers directly avoiding the BufWriter intermediate copy). Predicted ceiling = up to ~100ms (T8) ≈ half the remaining gap; layer it then re-run S2 to find the next binder (the residual is the worker decode + the consumer rx-wait + the ORACLE-c residency port). Do NOT claim parity from this alone — ON still 1.32× rapidgzip.
+
 **Goal:** gzippy wall == rapidgzip wall (ratio **1.0×**) on the workload matrix.
 **Instrument:** `scripts/whole_view.sh` section 1 — sha-verified, interleaved, best-of-7, self-tested.
+
+## 2026-06-02 — FOOTPRINT CEILING ORACLE RUN. Verdict: footprint = overlapped SLACK (4th refutation). STOP the footprint direction; residual = in-order-consumer chain.
+Executed the owed whole-aggregate ceiling oracle (the DECISION at the bottom of this file). Branch `feat/footprint-ceiling-oracle` (`GZIPPY_FOOTPRINT_CEILING=1`, knob OFF byte-identical sha==e114dd2, isal_sym=0, path=IsalParallelSM). Three cuts ON AT ONCE: (1) narrowed-kill (post-process resolves in place, no separate `chunk.narrowed` U8), (2) MAX_POOLED 8→1, (3) `data` initial cap 80MiB→16MiB (above the 4MiB realloc-trap). Guest 199, i7-13700T 8 P-cores (E offline), guests 111+105 frozen (turbo locked OFF = freq-neutral), paranoid=1→restored 4, interleaved sha-verified (DIVERGED=0), file+pipe, T8+T16.
+
+GATE — maxrss DID drop (oracle worked): T8 file base **1040→CEIL 838 MB** (−202MB), T8 pipe 1035→837, T16 file 1154→1055, T16 pipe 1184→1047. But it only closed ~30% of the gap to rapidgzip (378MB T8) — the 3 cuts cannot reach rapidgzip's footprint without segmenting `data_with_markers` (the markers buffer, which is volume-EQUAL to rapidgzip and was scoped OUT as not-excess). So the test is "remove 200MB / 30%-of-gap of aggregate residency and watch the wall+IPC".
+
+RESPONSE — IPC FLAT, wall NOT proportional ⇒ SLACK:
+| T  | sink | base ratio | CEIL ratio | base IPC | CEIL IPC | rg IPC | base minflt | CEIL minflt |
+|----|------|-----------|-----------|----------|----------|--------|-------------|-------------|
+| 8  | file | 1.475     | 1.412     | 1.477    | 1.523    | 2.096  | 243503      | 256126      |
+| 16 | file | 1.492     | 1.446     | 1.076    | 1.084    | 1.470  | 262441      | 276760      |
+| 8  | pipe | 1.288     | 1.170     | —        | —        | —      | 242367      | 264716      |
+| 16 | pipe | 1.373     | 1.241     | —        | —        | —      | 273502      | 273067      |
+- IPC recovered +3.1% T8 / +0.7% T16 — vs the +42% needed to reach rapidgzip. A 30% aggregate-RSS drop bought ~3% IPC = NOT the IPC driver.
+- The N=11 (loaded) run showed CEIL marginally faster (ratio 1.475→1.412); the **tight N=21 frozen control REVERSED it**: T8 file base med 0.2634/min 0.2554 vs CEIL med 0.2862/min 0.2687 = **CEIL +8.7% med / +5.2% min SLOWER**. The apparent N=11 "win" was noise; the clean control shows CEIL is a TIE-to-regression, NOT proportional to the 200MB it removed.
+- minflt went UP with CEIL (243k→256k T8) — cut (3) right-sized `data` re-introduces realloc+refault (the exact `feat/footprint-align` trap), eating any benefit. Mechanism-confirmed why wall doesn't track RSS.
+
+VERDICT = **SLACK (page-walk-faults-are-slack prior CONFIRMED at the AGGREGATE level, 4th refutation).** Removing 200MB / 30% of the resident-footprint gap recovered ~3% IPC and TIE-to-negative wall. The footprint excess is an overlapped CORRELATE of the leaner structure, NOT an independent recoverable wall-driver. ⇒ **STOP the footprint direction.** Consistent with: PR#123 aggregate removal +6-12%, feat/footprint-align data-cap shrink regressed, complete faithful port (a+b+c) complete-aggregate falsified, 3 prior page-walk-fault removal oracles = 0% wall. The residual ~1.18-1.5× T8 / ~1.5× T16 is the in-order-consumer serial window-resolution/coordination chain.
+
+THREAD-SWEEP (folds in owed observation #2; gz-base vs rapidgzip, file, frozen N≥7 sha-verified):
+| T | gz med(s) | rg med(s) | gz/rg | gz IPC | rg IPC |
+|---|-----------|-----------|-------|--------|--------|
+| 1 | 0.7616 | 0.6928 | **1.099** | 2.148 | 2.277 |
+| 2 | 0.7154 | 0.6388 | **1.120** | 1.897 | 2.349 |
+| 4 | 0.4822 | 0.3782 | **1.275** | 1.772 | 2.278 |
+| 8 | 0.3974 | 0.2700 | **1.472** | 1.474 | 2.036 |
+| 16| 0.4356 | 0.2823 | **1.543** | 1.063 | 1.483 |
+ONSET CONFIRMED: the gap is ~parity at T1 (1.099, IPC 2.15≈2.28) and GROWS MONOTONICALLY with thread count (1.10→1.12→1.28→1.47→1.54), and gz IPC falls faster than rg's (2.15→1.06 vs 2.28→1.48). This IS the per-thread-scaling/contention signature — BUT the ceiling oracle proves the contention is NOT recoverable by shrinking the resident footprint (the obvious footprint-contention mechanism is refuted). The scaling gap is the in-order-consumer coordination chain binding harder as T rises, with memory-traffic as a slack correlate.
+
+BOTTOM LINE: The aggregate-footprint-contention theory is REFUTED — shrinking gzippy's resident set 200MB toward rapidgzip's recovered ~3% IPC / TIE-to-negative wall; footprint is overlapped slack at the aggregate level too. The T1→T16 onset is real contention but its mechanism is the in-order-consumer chain, not recoverable resident footprint. STOP footprint; the residual is the consumer coordination chain.
+
+(Branch artifacts: scripts/guest_ceiling_bench.sh, guest /root/ceiling_bench.out. Box restored: 111=0 105=0 watchdog=killed paranoid=4 no_turbo=0; lock released.)
+
 
 ## 2026-06-01 — OVERSUBSCRIPTION TRISECTION = DECODE-SUPPLY bound, NOT a 9-on-8 artifact (one-variable causal test, frozen-clock, pure-Rust dynsym isal=0, path=IsalParallelSM, sha==e114dd2, box baseline-match-proof verified before+after)
 Resolves the 9aa68c4 confound (M1/M2 "9-THREADS-ON-8-CORES"). ONE variable = the consumer's core placement; 8-worker pinning held BYTE-IDENTICAL between arms (proven by /proc/<tid>/status Cpus_allowed_list sampling). Box = neurotic LXC 199, i7-13700T, 8 P-cores HT pairs {0,1}..{14,15}, E-cores 16-23 OFFLINE, guests 111+105 frozen.
