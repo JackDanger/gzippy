@@ -626,17 +626,19 @@ mod tests {
 
     /// EARLY-READER-DEATH (the Step-1 corruption bug, directly).
     ///
-    /// On Linux: open a pipe, set its buffer to the minimum, fill it,
-    /// then CLOSE the read end so a subsequent large vmsplice gets EPIPE.
-    /// Because some payload may have been gifted before the failure, the
-    /// fixed code must (a) NOT writev-fall-back (no duplication) and
-    /// (b) return a clean `Err` (no panic / no double-drop UAF). We
-    /// suppress SIGPIPE so the process sees EPIPE rather than dying.
+    /// On Linux: open a pipe, shrink its buffer, splice ONE payload that
+    /// fits (so the vault retains an owner), then CLOSE the read end with
+    /// the pipe non-empty and no reader. A second large `write_all_to_fd`
+    /// then hits EPIPE on vmsplice. The fixed code must (a) return a
+    /// clean `Err` (no panic / no segfault / no double-drop UAF) and
+    /// (b) NOT silently duplicate already-written bytes. We ignore
+    /// SIGPIPE so the syscall returns EPIPE rather than killing us.
+    ///
+    /// NOTE: no reader thread blocks on this pipe — the read end is
+    /// closed outright — so the test can never hang.
     #[cfg(target_os = "linux")]
     #[test]
     fn early_reader_death_is_clean_error_no_duplicate() {
-        // Ignore SIGPIPE so vmsplice/writev returns EPIPE instead of
-        // killing the test process.
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         }
@@ -645,56 +647,44 @@ mod tests {
         assert_eq!(rc, 0, "pipe()");
         let (read_fd, write_fd) = (fds[0], fds[1]);
 
-        // Shrink the pipe buffer so we can saturate it cheaply.
+        // Shrink the pipe buffer so a small splice fills it.
         unsafe {
             libc::fcntl(write_fd, libc::F_SETPIPE_SZ, 4096);
         }
         let pipe_sz = unsafe { libc::fcntl(write_fd, libc::F_GETPIPE_SZ) };
         assert!(pipe_sz > 0, "F_GETPIPE_SZ");
 
-        // Read a little, then close the read end so the pipe fills and
-        // then breaks. We read exactly one small slice and drop the fd.
-        let reader = std::thread::spawn(move || {
-            let mut f = unsafe {
-                use std::os::unix::io::FromRawFd;
-                std::fs::File::from_raw_fd(read_fd)
-            };
-            let mut small = [0u8; 1024];
-            use std::io::Read as _;
-            let _ = f.read(&mut small);
-            // Drop `f` → close(read_fd). Further writes get EPIPE.
-            drop(f);
-        });
-        // Give the reader a moment to close.
-        reader.join().unwrap();
-
-        // Payload much larger than the pipe buffer so the write cannot
-        // complete into the now-broken pipe.
-        let segs: Vec<Vec<u8>> = (0..16u32)
-            .map(|i| {
-                (0..(pipe_sz as u32))
-                    .map(|j| ((i + j) % 251) as u8)
-                    .collect()
-            })
+        // Phase 1: splice a payload that fits in the (now small) pipe
+        // buffer. This succeeds (vmsplice engages) and leaves an owner
+        // in the vault — so the later failure path must not corrupt it.
+        let first: Vec<u8> = (0..(pipe_sz as usize / 2))
+            .map(|i| (i % 251) as u8)
             .collect();
-        let data: Vec<u8> = (0..(pipe_sz as usize * 4))
+        let owner1: Box<dyn std::any::Any + Send> = Box::new(first.clone());
+        let mut iov1 = to_io_vec(std::iter::empty::<&[u8]>(), &first);
+        write_all_to_fd(write_fd, &mut iov1, owner1).expect("phase-1 splice fits");
+
+        // Kill the reader: close the read end while the pipe holds data.
+        unsafe { libc::close(read_fd) };
+
+        // Phase 2: a large payload. The pipe is non-empty and now has no
+        // reader → vmsplice returns EPIPE. Must be a clean Err, never a
+        // panic/segfault, never a duplicating writev fallback of an
+        // already-gifted prefix.
+        let big: Vec<u8> = (0..(pipe_sz as usize * 8))
             .map(|i| ((i * 13) % 247) as u8)
             .collect();
-        let owner: Box<dyn std::any::Any + Send> = Box::new((segs.clone(), data.clone()));
-        let seg_refs: Vec<&[u8]> = segs.iter().map(|s| s.as_slice()).collect();
-        let mut iovs = to_io_vec(seg_refs.iter().copied(), &data);
-
-        // Must return Err cleanly (no panic, no segfault, no hang).
-        let r = write_all_to_fd(write_fd, &mut iovs, owner);
+        let owner2: Box<dyn std::any::Any + Send> = Box::new(big.clone());
+        let mut iov2 = to_io_vec(std::iter::empty::<&[u8]>(), &big);
+        let r = write_all_to_fd(write_fd, &mut iov2, owner2);
         assert!(
             r.is_err(),
             "writing to a pipe with a dead reader must fail cleanly"
         );
 
         unsafe { libc::close(write_fd) };
-        // Buffers held to the end; the vault retains any gifted owner.
-        drop(segs);
-        drop(data);
+        drop(first);
+        drop(big);
     }
 
     /// The engagement counter must advance on a pipe sink and stay put
