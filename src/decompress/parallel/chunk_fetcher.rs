@@ -409,14 +409,13 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
                 actual: 0,
             }))?
             .map_err(FetchError::Decode)?;
-        // Clean chunks carry no markers: output is data[data_prefix_len..],
+        // Clean chunks carry no markers: output is the segmented `data`,
         // CRC is the per-stream crc32s folded in order.
-        if chunk.data.len() > chunk.data_prefix_len {
-            let payload = &chunk.data[chunk.data_prefix_len..];
+        for seg in chunk.data.segments() {
             writer
-                .write_all(payload)
+                .write_all(seg)
                 .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-            total_size += payload.len();
+            total_size += seg.len();
         }
         for stream_crc in &chunk.crc32s {
             total_crc.append(stream_crc);
@@ -2357,58 +2356,51 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
     // single-pass wins. The fused path already produces byte-identical
     // output (it is the production large-marker path), so only the
     // threshold moves.
-    use crate::decompress::parallel::replace_markers::replace_markers_lut_narrow;
-    const LUT_FUSE_THRESHOLD: usize = 16 * 1024;
+    // FOOTPRINT-ALIGN: resolve markers IN PLACE inside `data_with_markers`,
+    // then narrow IN PLACE (u16→u8 within the same backing store). No
+    // separate `narrowed` buffer is allocated — the resolved u8 output is the
+    // first `narrowed_len` bytes of `data_with_markers`. Faithful port of
+    // vendor's `applyWindow` (DecodedData.hpp:325-388). This replaces the
+    // former fused-LUT-into-separate-buffer path; the LUT fusion saved a
+    // pass but at the cost of a whole extra resident u8 buffer per chunk
+    // (memlife: 1.88 GB alloc / a buffer rapidgzip does not have), which is
+    // exactly the footprint divergence this change targets.
     let dwm_len_pre = chunk.data_with_markers.len();
-    let use_fused = dwm_len_pre >= LUT_FUSE_THRESHOLD && bytes.len() == 32768;
     let t_apply = std::time::Instant::now();
-    let mut narrowed_buf: Option<crate::decompress::parallel::rpmalloc_alloc::types::U8> = None;
-    let t_narrow;
-    let narrow_us;
-    if use_fused {
+    if dwm_len_pre >= 16 * 1024 {
         POST_PROCESS_FUSED_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Fused path. `apply_window` is skipped entirely on this branch:
-        // markers in `chunk.data_with_markers` are left in-place (no
-        // downstream reader inspects them after this point — populate
-        // takes `dwm_bytes` and the consumer writes `chunk.narrowed`).
-        use crate::decompress::parallel::chunk_buffer_pool;
-        let mut narrowed = chunk_buffer_pool::take_u8(dwm_len_pre);
-        replace_markers_lut_narrow(&chunk.data_with_markers, &bytes, &mut narrowed);
-        narrowed_buf = Some(narrowed);
-        t_narrow = std::time::Instant::now();
-        narrow_us = 0u128;
     } else {
         POST_PROCESS_SMALL_MARKERS_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        apply_window(&mut chunk, &bytes);
-        t_narrow = std::time::Instant::now();
-        if !chunk.data_with_markers.is_empty() {
-            use crate::decompress::parallel::chunk_buffer_pool;
-            let dwm_len = chunk.data_with_markers.len();
-            let mut narrowed = chunk_buffer_pool::take_u8(dwm_len);
-            narrow_u16_to_u8(&chunk.data_with_markers, &mut narrowed);
-            narrowed_buf = Some(narrowed);
-        }
-        narrow_us = t_narrow.elapsed().as_micros();
     }
+    apply_window(&mut chunk, &bytes);
+    let t_narrow = std::time::Instant::now();
+    chunk.narrow_markers_in_place();
+    let narrow_us = t_narrow.elapsed().as_micros();
     let apply_us = t_apply.elapsed().as_micros();
-    let _ = t_narrow;
     let t_pop = std::time::Instant::now();
-    let dwm_slice: &[u8] = narrowed_buf.as_deref().unwrap_or(&[]);
-    chunk.populate_subchunk_windows(&bytes, dwm_slice);
+    // `narrowed_bytes()` aliases `data_with_markers`'s store; copy out the
+    // borrow boundary by computing windows against it directly. The borrow is
+    // immutable and `populate_subchunk_windows` only reads `&self.data`/args.
+    {
+        // SAFETY-of-borrow: narrowed_bytes borrows chunk immutably; we need
+        // chunk mutably for populate. Take a raw view to satisfy the borrow
+        // checker — the bytes live in data_with_markers which populate never
+        // mutates.
+        let nb = chunk.narrowed_bytes();
+        let nb_ptr = nb.as_ptr();
+        let nb_len = nb.len();
+        let dwm_slice: &[u8] = unsafe { std::slice::from_raw_parts(nb_ptr, nb_len) };
+        chunk.populate_subchunk_windows(&bytes, dwm_slice);
+    }
     let populate_us = t_pop.elapsed().as_micros();
-    // Vendor parity: `ChunkData::applyWindow` (ChunkData.hpp:313-328)
-    // CRC32s the resolved marker bytes on the worker. Previously this
-    // ran on the consumer inside `drain_one_pending` and serialized
-    // ~27 ms / 400 MB of pclmulqdq onto the wall-binding thread. Moving
-    // it here parallelizes the work across the 16-thread pool — each
-    // worker pays its own per-chunk CRC scan, and only the constant-time
-    // polynomial `append` happens on the consumer.
-    if let Some(narrowed) = narrowed_buf {
-        {
-            let _tv2 = trace_v2::SpanGuard::begin("post_process.crc_narrowed");
-            chunk.narrowed_crc.update(&narrowed);
+    // CRC the narrowed bytes on the worker (vendor parity: applyWindow CRCs
+    // resolved marker bytes on the worker, not the serial consumer).
+    {
+        let _tv2 = trace_v2::SpanGuard::begin("post_process.crc_narrowed");
+        let nb = chunk.narrowed_bytes();
+        if !nb.is_empty() {
+            chunk.narrowed_crc.update(nb);
         }
-        chunk.narrowed = narrowed;
     }
     if trace::is_enabled() {
         trace::emit(
@@ -2419,13 +2411,9 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
             ),
         );
     }
-    // WARM-CYCLE the marker buffer (completes the zero-copy bootstrap merge).
-    // `data_with_markers` is fully resolved into `narrowed` above and never read
-    // again. Return it to the owner worker's u16 pool NOW (not at Drop, which
-    // under pipelining lands after the next chunk's bootstrap already took a
-    // cold buffer) so the next bootstrap decodes DIRECTLY into a warm recycled
-    // buffer — the missing half of the merge that turns the copy-free bootstrap
-    // from a ~3% regression into a clean no-copy path.
+    // The narrowed bytes live INSIDE data_with_markers until the consumer
+    // writes them, so we no longer eagerly recycle that buffer here (it would
+    // free the bytes the consumer still needs). Drop returns it post-consume.
     chunk.recycle_markers_after_resolution();
     chunk
 }
@@ -2987,46 +2975,29 @@ fn drain_one_pending<W: std::io::Write>(
     // `chunk.narrowed_crc`) so the consumer just consumes the result —
     // no second scan of `chunk.narrowed` here.
     let t_crc_write = std::time::Instant::now();
-    if !chunk.narrowed.is_empty() {
-        {
+    // FOOTPRINT-ALIGN: the resolved marker bytes were narrowed IN PLACE on
+    // the worker into `data_with_markers`'s own store; `narrowed_bytes()`
+    // exposes them. No separate `narrowed` buffer. (The former defensive
+    // "narrow on the consumer" fallback is gone: `narrow_markers_in_place`
+    // always runs in post_process, so `narrowed_bytes()` is authoritative.)
+    {
+        let nb = chunk.narrowed_bytes();
+        if !nb.is_empty() {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.write_narrowed");
             writer
-                .write_all(&chunk.narrowed)
+                .write_all(nb)
                 .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+            *total_size += nb.len();
         }
-        *total_size += chunk.narrowed.len();
-    } else if !chunk.data_with_markers.is_empty() {
-        // Defensive fallback when `apply_window` ran but the narrow
-        // step was somehow skipped — narrows scalar inline. Should
-        // not happen on the production path (post_process always
-        // runs narrow after apply_window). Keeps the consumer
-        // correctness invariant: all marker bytes written before
-        // `chunk.data`. This path computes CRC inline because the
-        // worker's path didn't (no `chunk.narrowed` was produced).
-        let mut narrowed: Vec<u8> = Vec::with_capacity(chunk.data_with_markers.len());
-        for v in &chunk.data_with_markers {
-            narrowed.push(*v as u8);
-        }
-        chunk.narrowed_crc.update(&narrowed);
-        writer
-            .write_all(&narrowed)
-            .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-        *total_size += narrowed.len();
     }
-    if chunk.data.len() > chunk.data_prefix_len {
-        // A4: write only the decoded portion. `chunk.data[0..data_prefix_len]`
-        // (if any) is the predecessor's window image installed by
-        // `prefill_window_prefix` for the inflate hot path — never the
-        // user's output. For chunks that didn't go through A3 prefill,
-        // `data_prefix_len == 0` and the slice is `&chunk.data[..]`.
-        let payload = &chunk.data[chunk.data_prefix_len..];
-        {
-            let _tv2 = trace_v2::SpanGuard::begin("consumer.write_data");
+    if !chunk.data.is_empty() {
+        let _tv2 = trace_v2::SpanGuard::begin("consumer.write_data");
+        for seg in chunk.data.segments() {
             writer
-                .write_all(payload)
+                .write_all(seg)
                 .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+            *total_size += seg.len();
         }
-        *total_size += payload.len();
     }
     let crc_write_us = t_crc_write.elapsed().as_micros();
     let t_combine = std::time::Instant::now();
