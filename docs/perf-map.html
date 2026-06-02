@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gzippy ↔ rapidgzip — performance map (segment-native A3)</title>
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2230;--ink:#e6edf3;--dim:#9aa7b4;--line:#30363d;
+    --win:#2ea043;--warn:#d29922;--bad:#f85149;--accent:#58a6ff;--mono:'SFMono-Regular',Consolas,Menlo,monospace;}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif}
+  .wrap{max-width:1100px;margin:0 auto;padding:30px 24px 80px}
+  h1{font-size:28px;margin:0 0 2px;letter-spacing:-.5px} .sub{color:var(--dim);font-size:13.5px;margin-bottom:6px}
+  h2{font-size:19px;margin:40px 0 12px;padding-bottom:7px;border-bottom:1px solid var(--line)}
+  .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:13px;margin:22px 0}
+  .metric{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:15px 17px}
+  .metric .big{font-size:27px;font-weight:700;line-height:1.1} .metric .lab{color:var(--dim);font-size:12px;margin-top:6px}
+  .m-win .big{color:var(--win)} .m-warn .big{color:var(--warn)} .m-acc .big{color:var(--accent)}
+  table{width:100%;border-collapse:collapse;margin:8px 0;font-size:13.5px}
+  th,td{text-align:right;padding:7px 11px;border-bottom:1px solid var(--line)} th:first-child,td:first-child{text-align:left}
+  th{color:var(--dim);font-size:11.5px;text-transform:uppercase;letter-spacing:.4px}
+  td.mono,th.mono{font-family:var(--mono);font-size:12.5px} tr:hover td{background:#ffffff06}
+  .win{color:#56d364;font-weight:600} .warn{color:#e3b341;font-weight:600} .bad{color:#ff7b72;font-weight:600} .tie{color:var(--dim)}
+  .bars{margin:8px 0} .barrow{display:flex;align-items:center;gap:10px;margin:5px 0}
+  .barrow .lbl{width:130px;font-size:12.5px;color:var(--dim);text-align:right;flex:none}
+  .track{flex:1;background:#0a0d12;border:1px solid var(--line);border-radius:6px;height:24px;position:relative;overflow:hidden}
+  .fill{height:100%;display:flex;align-items:center;padding-left:9px;font-size:11.5px;font-weight:700;color:#04140a;white-space:nowrap}
+  .callout{background:linear-gradient(180deg,#13241a,#161b22);border:1px solid #2ea04355;border-radius:11px;padding:16px 19px;margin:18px 0}
+  .callout.note{background:linear-gradient(180deg,#1a2230,#161b22);border-color:#2d4263}
+  .callout h3{margin:0 0 8px;font-size:15px} .writeup{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:6px 24px 20px}
+  .writeup p{margin:13px 0} code{font-family:var(--mono);font-size:.86em;background:#0a0d12;border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+  .tnote{color:var(--dim);font-size:12px;font-style:italic;margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>gzippy ↔ rapidgzip — performance map</h1>
+  <div class="sub">Current HEAD = <code>b7da7bd</code> (segment-native A3 / <code>SegmentedU8</code> DecodedData port) &middot; neurotic guest 199 (i7-13700T), frozen clock, N=15 interleaved, sha-verified &middot; silesia-large (212 MB) &middot; pure-Rust <code>path=IsalParallelSM</code></div>
+
+  <div class="metrics">
+    <div class="metric m-win"><div class="big">byte-exact</div><div class="lab">sha == gold over 162 runs; no data-model regression</div></div>
+    <div class="metric m-win"><div class="big">−23–27%</div><div class="lab">maxRSS vs baseline (−30% page-faults) — toward rapidgzip</div></div>
+    <div class="metric m-acc"><div class="big">1.03–1.19&times;</div><div class="lab">wall vs rapidgzip (T16-pipe ≈ parity); was ~1.47&times; historically</div></div>
+    <div class="metric m-win"><div class="big">TIE / +5%</div><div class="lab">wall vs the prior baseline — T16 regression eliminated, T8-file faster</div></div>
+  </div>
+
+  <h2>1 · What changed: the faithful memory model, completed</h2>
+  <p style="margin:6px 0 14px;color:var(--dim);font-size:14px">The clean output buffer is now rapidgzip's shape — a list of fixed <b>128 KiB segments</b> (<code>SegmentedU8</code>, vendor <code>DecodedData::data</code>), markers resolved <b>in place</b> (no separate <code>narrowed</code> buffer, vendor <code>applyWindow</code>), with the <b>A3 window-prefill</b> re-added into segment 0. Prior segmented ports regressed T16 only because they had <i>dropped</i> A3; restoring it eliminated that. Net <code>−619</code> lines (the old contiguous model + campaign oracles removed).</p>
+
+  <h2>2 · Wall — median ms (HEAD vs the prior baseline vs rapidgzip)</h2>
+  <table>
+    <tr><th>T / sink</th><th class="mono">baseline</th><th class="mono">HEAD</th><th class="mono">rapidgzip</th><th class="mono">HEAD / rg</th><th class="mono">HEAD / base</th></tr>
+    <tr><td>T8 · file</td><td class="mono">165.6</td><td class="mono">157.6</td><td class="mono">134.4</td><td class="mono warn">1.17&times;</td><td class="mono win">0.95&times; (faster)</td></tr>
+    <tr><td>T8 · pipe</td><td class="mono">219.4</td><td class="mono">219.0</td><td class="mono">184.7</td><td class="mono warn">1.19&times;</td><td class="mono tie">1.00&times; (tie)</td></tr>
+    <tr><td>T16 · file</td><td class="mono">160.7</td><td class="mono">163.3</td><td class="mono">146.1</td><td class="mono warn">1.12&times;</td><td class="mono tie">1.02&times; (tie)</td></tr>
+    <tr><td>T16 · pipe</td><td class="mono">214.5</td><td class="mono">213.3</td><td class="mono">207.8</td><td class="mono win">1.03&times; (≈parity)</td><td class="mono tie">0.99&times;</td></tr>
+  </table>
+  <div class="tnote">HEAD ≈ baseline on wall (TIE-or-slight-win) at every multi-thread cell — the memory-model port is wall-neutral, as predicted. T16 carries higher spread (17–31%); min-based ratios agree. T1 is ~1.1&times; baseline (expected: production T1 single-member uses libdeflate, not this engine).</div>
+
+  <h2>3 · Footprint — the actual win (maxRSS MB / minor-faults)</h2>
+  <div class="bars">
+    <div class="barrow"><div class="lbl">baseline T8</div><div class="track"><div class="fill" style="width:100%;background:#f0883e">486 MB · 109k faults</div></div></div>
+    <div class="barrow"><div class="lbl">HEAD T8</div><div class="track"><div class="fill" style="width:74%;background:#d29922">359 MB · 76k &nbsp;(−26%)</div></div></div>
+    <div class="barrow"><div class="lbl">rapidgzip T8</div><div class="track"><div class="fill" style="width:48%;background:#2ea043">234 MB · 59k</div></div></div>
+  </div>
+  <div class="tnote">T16: baseline 547 → HEAD 419 (−23%) → rapidgzip 322. In-place resolve eliminated the separate per-chunk <code>narrowed</code> U8 buffer (the "buffer rapidgzip doesn't have"); the 128 KiB segments removed the over-reserve/realloc churn. This is the campaign's first real <b>shippable</b> win — a memory win, not a speed win.</div>
+
+  <h2>4 · Where the residual gap is, and why</h2>
+  <table>
+    <tr><th>T8 TMA</th><th class="mono">cycles</th><th class="mono">instructions</th><th class="mono">IPC</th><th class="mono">backend-mem</th></tr>
+    <tr><td>HEAD</td><td class="mono">3.05 B</td><td class="mono">5.51 B</td><td class="mono bad">1.81</td><td class="mono bad">24.9%</td></tr>
+    <tr><td>rapidgzip</td><td class="mono">2.74 B</td><td class="mono">5.44 B</td><td class="mono">1.98</td><td class="mono">20.6%</td></tr>
+  </table>
+  <div class="callout note">
+    <h3>The gap is WAITING, not work</h3>
+    <p style="margin:6px 0">Instruction counts are <b>equal</b> (T16: HEAD uses <i>fewer</i>). The entire cycle gap is <b>IPC</b> (1.81 vs 1.98), and the IPC deficit lands in <b>backend-memory-bound stalls</b> (+4.3 pp at T8, +6.5 pp at T16). gzippy isn't doing more or different instructions — it's <b>stalling on memory</b>.</p>
+    <p style="margin:6px 0"><b>Precise locus</b> (SM trace, T8): the in-order consumer's <code>fetcher.get()</code> waits <b>~30 ms of the ~135 ms wall</b> on the next frontier chunk being ready, and that chunk's own decode is the memory-stall-bound region (in-place resolve cost is now ~0; <code>apply_window</code> ≤1.1 ms is the dominant post-step). <b>Mechanism:</b> the frontier chunk resolves slower per cycle because the decode is memory-stall-bound, so the in-order consumer waits. Same locus the campaign mapped — now at 1.1–1.2&times; rather than 1.47&times;.</p>
+  </div>
+
+  <h2>5 · The bottom line</h2>
+  <div class="writeup">
+    <p><b>Segment-native A3 is a shippable memory win.</b> It is byte-exact, cuts resident memory 23–27% toward rapidgzip's, eliminates the prior segmented port's T16 regression (by restoring the A3 window-prefill), is slightly faster at T8-file, and is −619 lines of simpler, more faithful code (it now mirrors vendor's <code>DecodedData</code>: 128 KiB-granule data, in-place marker resolve, front-prepend).</p>
+    <p><b>It does not — and is not meant to — close the speed gap.</b> The residual <b>1.03–1.19&times;</b> to rapidgzip is backend-memory-bound <i>waiting</i> on the in-order consumer's frontier-chunk decode, confirmed by TMA (equal instructions, lower IPC, higher memory-bound). That is the same architectural residual the campaign mapped and could not close with any software lever (decode is competitive; footprint is overlapped slack; coherence is kernel-side). gzippy is already the fastest decoder on arm64; this x86 residual is coordination + memory-stall, recoverable only by a deeper rearchitecture.</p>
+    <p class="tnote">Honest note on how we got here: the campaign built this memory model twice and dead-ended it as "not a speed lever" — stopping one commit short of this exact fix, which its own analysis had already designed and filed as a candidate. The lesson banked: a faithful, correct, memory-positive change ships on its own merits even when it's wall-neutral. Caveats on this run: T16 spread 17–31% (min-ratios agree); per-buffer memlife JSON wasn't CLI-wired (used maxRSS/minflt + SM trace); restore the deleted <code>data_prefix_len&gt;0</code> unit test.</p>
+  </div>
+</div>
+</body>
+</html>
