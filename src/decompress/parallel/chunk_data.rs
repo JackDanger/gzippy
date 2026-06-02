@@ -262,7 +262,16 @@ impl ChunkData {
     /// `Drop` impl returns the Vecs to the pool.
     pub fn new(encoded_offset_bits: usize, configuration: ChunkConfiguration) -> Self {
         use crate::decompress::parallel::chunk_buffer_pool;
-        let cap = configuration.max_decoded_chunk_size;
+        // FOOTPRINT CEILING ORACLE cut (3): right-size the `data` initial
+        // capacity to ~16 MiB (observed P95 written) instead of the 80 MiB
+        // max_decoded_chunk_size. Sized ABOVE the 4 MiB realloc-trap that
+        // regressed feat/footprint-align (shrinking to split_chunk_size forced
+        // realloc+memcpy+refault). Knob OFF = the original 80 MiB reservation.
+        let cap = if chunk_buffer_pool::footprint_ceiling() {
+            chunk_buffer_pool::CEILING_DATA_CAP
+        } else {
+            configuration.max_decoded_chunk_size
+        };
         // `data_with_markers` is allocated lazily — the fast path
         // (window known) never emits markers, so paying for the
         // capacity reservation up front is wasted address space AND

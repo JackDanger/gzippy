@@ -3,6 +3,39 @@
 **Goal:** gzippy wall == rapidgzip wall (ratio **1.0×**) on the workload matrix.
 **Instrument:** `scripts/whole_view.sh` section 1 — sha-verified, interleaved, best-of-7, self-tested.
 
+## 2026-06-02 — FOOTPRINT CEILING ORACLE RUN. Verdict: footprint = overlapped SLACK (4th refutation). STOP the footprint direction; residual = in-order-consumer chain.
+Executed the owed whole-aggregate ceiling oracle (the DECISION at the bottom of this file). Branch `feat/footprint-ceiling-oracle` (`GZIPPY_FOOTPRINT_CEILING=1`, knob OFF byte-identical sha==e114dd2, isal_sym=0, path=IsalParallelSM). Three cuts ON AT ONCE: (1) narrowed-kill (post-process resolves in place, no separate `chunk.narrowed` U8), (2) MAX_POOLED 8→1, (3) `data` initial cap 80MiB→16MiB (above the 4MiB realloc-trap). Guest 199, i7-13700T 8 P-cores (E offline), guests 111+105 frozen (turbo locked OFF = freq-neutral), paranoid=1→restored 4, interleaved sha-verified (DIVERGED=0), file+pipe, T8+T16.
+
+GATE — maxrss DID drop (oracle worked): T8 file base **1040→CEIL 838 MB** (−202MB), T8 pipe 1035→837, T16 file 1154→1055, T16 pipe 1184→1047. But it only closed ~30% of the gap to rapidgzip (378MB T8) — the 3 cuts cannot reach rapidgzip's footprint without segmenting `data_with_markers` (the markers buffer, which is volume-EQUAL to rapidgzip and was scoped OUT as not-excess). So the test is "remove 200MB / 30%-of-gap of aggregate residency and watch the wall+IPC".
+
+RESPONSE — IPC FLAT, wall NOT proportional ⇒ SLACK:
+| T  | sink | base ratio | CEIL ratio | base IPC | CEIL IPC | rg IPC | base minflt | CEIL minflt |
+|----|------|-----------|-----------|----------|----------|--------|-------------|-------------|
+| 8  | file | 1.475     | 1.412     | 1.477    | 1.523    | 2.096  | 243503      | 256126      |
+| 16 | file | 1.492     | 1.446     | 1.076    | 1.084    | 1.470  | 262441      | 276760      |
+| 8  | pipe | 1.288     | 1.170     | —        | —        | —      | 242367      | 264716      |
+| 16 | pipe | 1.373     | 1.241     | —        | —        | —      | 273502      | 273067      |
+- IPC recovered +3.1% T8 / +0.7% T16 — vs the +42% needed to reach rapidgzip. A 30% aggregate-RSS drop bought ~3% IPC = NOT the IPC driver.
+- The N=11 (loaded) run showed CEIL marginally faster (ratio 1.475→1.412); the **tight N=21 frozen control REVERSED it**: T8 file base med 0.2634/min 0.2554 vs CEIL med 0.2862/min 0.2687 = **CEIL +8.7% med / +5.2% min SLOWER**. The apparent N=11 "win" was noise; the clean control shows CEIL is a TIE-to-regression, NOT proportional to the 200MB it removed.
+- minflt went UP with CEIL (243k→256k T8) — cut (3) right-sized `data` re-introduces realloc+refault (the exact `feat/footprint-align` trap), eating any benefit. Mechanism-confirmed why wall doesn't track RSS.
+
+VERDICT = **SLACK (page-walk-faults-are-slack prior CONFIRMED at the AGGREGATE level, 4th refutation).** Removing 200MB / 30% of the resident-footprint gap recovered ~3% IPC and TIE-to-negative wall. The footprint excess is an overlapped CORRELATE of the leaner structure, NOT an independent recoverable wall-driver. ⇒ **STOP the footprint direction.** Consistent with: PR#123 aggregate removal +6-12%, feat/footprint-align data-cap shrink regressed, complete faithful port (a+b+c) complete-aggregate falsified, 3 prior page-walk-fault removal oracles = 0% wall. The residual ~1.18-1.5× T8 / ~1.5× T16 is the in-order-consumer serial window-resolution/coordination chain.
+
+THREAD-SWEEP (folds in owed observation #2; gz-base vs rapidgzip, file, frozen N≥7 sha-verified):
+| T | gz med(s) | rg med(s) | gz/rg | gz IPC | rg IPC |
+|---|-----------|-----------|-------|--------|--------|
+| 1 | 0.7616 | 0.6928 | **1.099** | 2.148 | 2.277 |
+| 2 | 0.7154 | 0.6388 | **1.120** | 1.897 | 2.349 |
+| 4 | 0.4822 | 0.3782 | **1.275** | 1.772 | 2.278 |
+| 8 | 0.3974 | 0.2700 | **1.472** | 1.474 | 2.036 |
+| 16| 0.4356 | 0.2823 | **1.543** | 1.063 | 1.483 |
+ONSET CONFIRMED: the gap is ~parity at T1 (1.099, IPC 2.15≈2.28) and GROWS MONOTONICALLY with thread count (1.10→1.12→1.28→1.47→1.54), and gz IPC falls faster than rg's (2.15→1.06 vs 2.28→1.48). This IS the per-thread-scaling/contention signature — BUT the ceiling oracle proves the contention is NOT recoverable by shrinking the resident footprint (the obvious footprint-contention mechanism is refuted). The scaling gap is the in-order-consumer coordination chain binding harder as T rises, with memory-traffic as a slack correlate.
+
+BOTTOM LINE: The aggregate-footprint-contention theory is REFUTED — shrinking gzippy's resident set 200MB toward rapidgzip's recovered ~3% IPC / TIE-to-negative wall; footprint is overlapped slack at the aggregate level too. The T1→T16 onset is real contention but its mechanism is the in-order-consumer chain, not recoverable resident footprint. STOP footprint; the residual is the consumer coordination chain.
+
+(Branch artifacts: scripts/guest_ceiling_bench.sh, guest /root/ceiling_bench.out. Box restored: 111=0 105=0 watchdog=killed paranoid=4 no_turbo=0; lock released.)
+
+
 ## 2026-06-01 — OVERSUBSCRIPTION TRISECTION = DECODE-SUPPLY bound, NOT a 9-on-8 artifact (one-variable causal test, frozen-clock, pure-Rust dynsym isal=0, path=IsalParallelSM, sha==e114dd2, box baseline-match-proof verified before+after)
 Resolves the 9aa68c4 confound (M1/M2 "9-THREADS-ON-8-CORES"). ONE variable = the consumer's core placement; 8-worker pinning held BYTE-IDENTICAL between arms (proven by /proc/<tid>/status Cpus_allowed_list sampling). Box = neurotic LXC 199, i7-13700T, 8 P-cores HT pairs {0,1}..{14,15}, E-cores 16-23 OFFLINE, guests 111+105 frozen.
 - ARM A "9-on-8": `taskset -c 0,2,4,6,8,10,12,14` — 8 workers self-pin one-each to the 8 physical P-cores; consumer (calling thread) floats in the SAME 8-core set (caught time-slicing onto cpu4 = a worker core). This IS the campaign's T8-noSMT mask.
