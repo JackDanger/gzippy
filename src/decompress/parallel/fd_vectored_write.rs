@@ -181,7 +181,41 @@ pub mod splice {
     use super::*;
     use std::any::Any;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+
+    /// Number of chunk payloads that engaged the vmsplice fast path
+    /// (i.e. the fd was a pipe AND vmsplice fully succeeded). The byte-
+    /// identity GATE asserts this is `> 0` on a pipe sink and `0` on a
+    /// file sink. Read with [`vmsplice_engagements`].
+    pub(crate) static VMSPLICE_ENGAGEMENTS: AtomicU64 = AtomicU64::new(0);
+
+    /// Read the vmsplice-engagement counter.
+    pub fn vmsplice_engagements() -> u64 {
+        VMSPLICE_ENGAGEMENTS.load(Ordering::Relaxed)
+    }
+
+    /// Outcome of a vmsplice attempt for one chunk payload.
+    pub enum SpliceOutcome {
+        /// All segments gifted; owner retained in the vault.
+        Spliced,
+        /// fd is not a pipe, OR vmsplice failed BEFORE any byte was
+        /// gifted (vendor `i == 0` → `return errno`). The intact owner
+        /// is handed back so the caller can `writev`-fall-back safely.
+        Declined(Box<dyn Any + Send>),
+        /// vmsplice failed AFTER gifting some segments (vendor `i > 0`
+        /// → throw). FATAL: the caller must propagate this error and
+        /// must NOT writev-fall-back (would duplicate the gifted
+        /// prefix). The owner has already been retained in the vault.
+        Fatal(io::Error),
+    }
+
+    /// A vmsplice failure plus how many bytes were already gifted to the
+    /// pipe before it occurred.
+    struct VmspliceFail {
+        err: io::Error,
+        bytes_gifted: usize,
+    }
 
     /// Per-fd vault of spliced-page owners (vendor `SpliceVault`,
     /// FileUtils.hpp:582-708). Keeps each owning handle alive until
@@ -234,22 +268,57 @@ pub mod splice {
             &mut self,
             iovs: &mut [libc::iovec],
             owner: Box<dyn Any + Send>,
-        ) -> io::Result<()> {
+        ) -> SpliceOutcome {
             if self.pipe_buffer_size < 0 {
-                return Err(io::Error::other("fd is not a pipe (vmsplice declined)"));
+                return SpliceOutcome::Declined(owner);
             }
             let total: usize = iovs.iter().map(|v| v.iov_len).sum();
-            self.vmsplice_all(iovs)?;
-            self.account(owner, total);
-            Ok(())
+            match self.vmsplice_all(iovs) {
+                Ok(()) => {
+                    self.account(owner, total);
+                    SpliceOutcome::Spliced
+                }
+                // Vendor `writeAllSpliceUnsafe` iovec overload
+                // (FileUtils.hpp:535-547): on a vmsplice error with
+                // NOTHING yet gifted (i == 0) it `return errno` →
+                // the caller (`splice`/`writeAll`) takes the writev
+                // fallback. The real `owner` is still fully intact
+                // (no pages handed to the kernel), so hand it back.
+                Err(VmspliceFail {
+                    err: _,
+                    bytes_gifted: 0,
+                }) => SpliceOutcome::Declined(owner),
+                // i > 0: some segments were ALREADY gifted to the pipe
+                // before the failure. Vendor THROWS here (a hard fatal,
+                // never a writev fallback — re-writing the full list
+                // would DUPLICATE the already-gifted prefix). We mirror
+                // the throw with a fatal `Err`, and — crucially — we
+                // RETAIN the owner in the vault so its already-gifted
+                // pages stay alive while the kernel may still reference
+                // them (the use-after-free guard). We account the FULL
+                // `total` so the owner is held for the maximal window.
+                Err(VmspliceFail { err, .. }) => {
+                    self.account(owner, total);
+                    SpliceOutcome::Fatal(err)
+                }
+            }
         }
 
         /// vmsplice the whole iovec list (vendor `writeAllSpliceUnsafe`
         /// iovec overload, FileUtils.hpp:531-573): IOV_MAX batches +
         /// partial-write advance.
-        fn vmsplice_all(&self, iovs: &mut [libc::iovec]) -> io::Result<()> {
+        ///
+        /// On error, reports how many bytes were SUCCESSFULLY gifted to
+        /// the pipe before the failure (`bytes_gifted`), so the caller
+        /// can distinguish a clean pre-splice failure (== 0 → safe
+        /// writev fallback) from a mid-list failure (> 0 → fatal, the
+        /// already-gifted pages must NOT be re-written and must stay
+        /// alive). This is the data the vendor encodes implicitly via
+        /// the `i == 0` test (FileUtils.hpp:540).
+        fn vmsplice_all(&self, iovs: &mut [libc::iovec]) -> Result<(), VmspliceFail> {
             let n = iovs.len();
             let mut idx = 0usize;
+            let mut bytes_gifted = 0usize;
             while idx < n {
                 let segment_count = (n - idx).min(iov_max());
                 // SAFETY: valid iovecs into live borrowed buffers;
@@ -267,14 +336,15 @@ pub mod splice {
                     if err.kind() == io::ErrorKind::Interrupted {
                         continue;
                     }
-                    return Err(err);
+                    return Err(VmspliceFail { err, bytes_gifted });
                 }
                 if written == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "vmsplice wrote zero bytes",
-                    ));
+                    return Err(VmspliceFail {
+                        err: io::Error::new(io::ErrorKind::WriteZero, "vmsplice wrote zero bytes"),
+                        bytes_gifted,
+                    });
                 }
+                bytes_gifted += written as usize;
                 let mut to_consume = written as usize;
                 while idx < n && to_consume >= iovs[idx].iov_len {
                     to_consume -= iovs[idx].iov_len;
@@ -335,36 +405,30 @@ pub mod splice {
     }
 
     /// Attempt the vmsplice fast path for `iovs` (gifting `owner`'s
-    /// pages to the pipe). Returns `Ok(())` on success (pages gifted,
-    /// owner retained in the vault), or `Err(owner)` when the fd is not
-    /// a pipe or vmsplice failed — the caller then falls back to
-    /// `writev` and `owner` is handed back so its lifetime can extend
-    /// across the (synchronous) writev.
+    /// pages to the pipe). The three outcomes mirror the vendor split
+    /// (FileUtils.hpp:535-547 + ChunkData.hpp:806-808):
+    ///   * [`SpliceOutcome::Spliced`] — all pages gifted, owner retained
+    ///     in the vault until the pipe drains. Increments the engagement
+    ///     counter.
+    ///   * [`SpliceOutcome::Declined`] — not a pipe, or vmsplice failed
+    ///     before any byte was gifted (`i == 0`). Owner handed back
+    ///     INTACT; caller does the safe writev fallback.
+    ///   * [`SpliceOutcome::Fatal`] — vmsplice failed mid-list (`i > 0`),
+    ///     some pages already gifted. Caller MUST propagate (no writev
+    ///     fallback). Owner already retained in the vault so the gifted
+    ///     pages stay alive.
     pub fn try_splice(
         fd: i32,
         iovs: &mut [libc::iovec],
         owner: Box<dyn Any + Send>,
-    ) -> Result<(), Box<dyn Any + Send>> {
+    ) -> SpliceOutcome {
         let mut guard = vaults().lock().unwrap_or_else(|p| p.into_inner());
         let vault = guard.entry(fd).or_insert_with(|| SpliceVault::new(fd));
-        // We don't yet know if vmsplice will succeed; the vault decides
-        // (pipe check + vmsplice). On Err we must return `owner` to the
-        // caller without having stored it — so take it back out. Since
-        // `splice` consumes `owner` only on success (it stores it), we
-        // split: probe the pipe first, then either splice-with-owner or
-        // return the owner.
-        if vault.pipe_buffer_size < 0 {
-            return Err(owner);
+        let outcome = vault.splice(iovs, owner);
+        if matches!(outcome, SpliceOutcome::Spliced) {
+            VMSPLICE_ENGAGEMENTS.fetch_add(1, Ordering::Relaxed);
         }
-        match vault.splice(iovs, owner) {
-            Ok(()) => Ok(()),
-            // vmsplice errored AFTER the pipe check (e.g. SIGPIPE). The
-            // owner was moved into `splice`; we can't recover it. Return
-            // a fresh empty owner so the caller falls back to writev —
-            // the source buffers are still alive in the caller for the
-            // synchronous writev, so a no-op owner is sufficient there.
-            Err(_) => Err(Box::new(())),
-        }
+        outcome
     }
 }
 
@@ -392,22 +456,32 @@ pub fn write_all_to_fd(
     }
     #[cfg(target_os = "linux")]
     {
+        use splice::SpliceOutcome;
         // Snapshot the iovecs BEFORE vmsplice mutates them, so a
         // writev fallback writes the full, untouched list (vendor
         // ChunkData.hpp:805-809 passes the SAME `buffersToWrite` to the
-        // writev fallback).
+        // writev fallback). The snapshot is ONLY ever used on the
+        // `Declined` path, where NO byte was gifted — so writing the
+        // full list cannot duplicate anything.
         let snapshot: Vec<libc::iovec> = iovs.to_vec();
         match splice::try_splice(fd, iovs, owner) {
-            Ok(()) => Ok(()),
-            Err(_owner) => {
-                // vmsplice declined (non-pipe fd) or failed. writev the
-                // untouched snapshot fully. writev COPIES bytes into the
-                // kernel synchronously, so the source need only live for
-                // the call; the caller holds the buffers for the whole
-                // `write_all_to_fd` invocation, so the snapshot iovecs
-                // remain valid. `_owner` is dropped at end of arm.
+            SpliceOutcome::Spliced => Ok(()),
+            SpliceOutcome::Declined(_owner) => {
+                // Not a pipe, or vmsplice failed before gifting any byte.
+                // The owner is intact and the caller holds the source
+                // buffers for the whole `write_all_to_fd` invocation, so
+                // the snapshot iovecs are valid. writev COPIES bytes into
+                // the kernel synchronously. `_owner` drops at arm end.
                 let mut snap = snapshot;
                 writev_all_to_fd(fd, &mut snap)
+            }
+            SpliceOutcome::Fatal(err) => {
+                // vmsplice gifted some segments then failed (vendor
+                // `i > 0` → throw). Propagate hard — NO writev fallback
+                // (would duplicate the already-gifted prefix). The owner
+                // is retained in the vault so the gifted pages stay alive
+                // (no use-after-free).
+                Err(err)
             }
         }
     }
@@ -548,5 +622,121 @@ mod tests {
         // the vault already guarantees lifetime on the vmsplice path).
         drop(segs);
         drop(data);
+    }
+
+    /// EARLY-READER-DEATH (the Step-1 corruption bug, directly).
+    ///
+    /// On Linux: open a pipe, set its buffer to the minimum, fill it,
+    /// then CLOSE the read end so a subsequent large vmsplice gets EPIPE.
+    /// Because some payload may have been gifted before the failure, the
+    /// fixed code must (a) NOT writev-fall-back (no duplication) and
+    /// (b) return a clean `Err` (no panic / no double-drop UAF). We
+    /// suppress SIGPIPE so the process sees EPIPE rather than dying.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn early_reader_death_is_clean_error_no_duplicate() {
+        // Ignore SIGPIPE so vmsplice/writev returns EPIPE instead of
+        // killing the test process.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        }
+        let mut fds = [0 as libc::c_int; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "pipe()");
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        // Shrink the pipe buffer so we can saturate it cheaply.
+        unsafe {
+            libc::fcntl(write_fd, libc::F_SETPIPE_SZ, 4096);
+        }
+        let pipe_sz = unsafe { libc::fcntl(write_fd, libc::F_GETPIPE_SZ) };
+        assert!(pipe_sz > 0, "F_GETPIPE_SZ");
+
+        // Read a little, then close the read end so the pipe fills and
+        // then breaks. We read exactly one small slice and drop the fd.
+        let reader = std::thread::spawn(move || {
+            let mut f = unsafe {
+                use std::os::unix::io::FromRawFd;
+                std::fs::File::from_raw_fd(read_fd)
+            };
+            let mut small = [0u8; 1024];
+            use std::io::Read as _;
+            let _ = f.read(&mut small);
+            // Drop `f` → close(read_fd). Further writes get EPIPE.
+            drop(f);
+        });
+        // Give the reader a moment to close.
+        reader.join().unwrap();
+
+        // Payload much larger than the pipe buffer so the write cannot
+        // complete into the now-broken pipe.
+        let segs: Vec<Vec<u8>> = (0..16u32)
+            .map(|i| {
+                (0..(pipe_sz as u32))
+                    .map(|j| ((i + j) % 251) as u8)
+                    .collect()
+            })
+            .collect();
+        let data: Vec<u8> = (0..(pipe_sz as usize * 4))
+            .map(|i| ((i * 13) % 247) as u8)
+            .collect();
+        let owner: Box<dyn std::any::Any + Send> = Box::new((segs.clone(), data.clone()));
+        let seg_refs: Vec<&[u8]> = segs.iter().map(|s| s.as_slice()).collect();
+        let mut iovs = to_io_vec(seg_refs.iter().copied(), &data);
+
+        // Must return Err cleanly (no panic, no segfault, no hang).
+        let r = write_all_to_fd(write_fd, &mut iovs, owner);
+        assert!(
+            r.is_err(),
+            "writing to a pipe with a dead reader must fail cleanly"
+        );
+
+        unsafe { libc::close(write_fd) };
+        // Buffers held to the end; the vault retains any gifted owner.
+        drop(segs);
+        drop(data);
+    }
+
+    /// The engagement counter must advance on a pipe sink and stay put
+    /// on a file sink (used by the byte-identity GATE).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vmsplice_counter_pipe_vs_file() {
+        use std::io::Read as _;
+        // File sink: must NOT engage vmsplice.
+        let before_file = splice::vmsplice_engagements();
+        let _ = roundtrip_file(&[b"abc"], b"def");
+        assert_eq!(
+            splice::vmsplice_engagements(),
+            before_file,
+            "file sink must not engage vmsplice"
+        );
+
+        // Pipe sink: must engage vmsplice at least once.
+        let before_pipe = splice::vmsplice_engagements();
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let dclone = data.clone();
+        let reader = std::thread::spawn(move || {
+            let mut f = unsafe {
+                use std::os::unix::io::FromRawFd;
+                std::fs::File::from_raw_fd(read_fd)
+            };
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+            buf
+        });
+        let owner: Box<dyn std::any::Any + Send> = Box::new(data.clone());
+        let mut iovs = to_io_vec(std::iter::empty::<&[u8]>(), &data);
+        write_all_to_fd(write_fd, &mut iovs, owner).expect("pipe write");
+        unsafe { libc::close(write_fd) };
+        let got = reader.join().unwrap();
+        assert_eq!(got, dclone);
+        assert!(
+            splice::vmsplice_engagements() > before_pipe,
+            "pipe sink must engage vmsplice"
+        );
     }
 }
