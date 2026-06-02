@@ -325,10 +325,16 @@ fn decode_chunk_isal_impl(
         // segment boundaries are transparent to correctness — vendor's
         // `DecodedData::append` segments output the same way
         // (DecodedData.hpp:243-289).
+        // `writable_tail` returns the CURRENT tail segment's spare — which is
+        // a FULL 128 KiB when the prior outer iteration filled (or there was
+        // none), or a partial remainder when the prior commit left the tail
+        // non-full. Either way `buffer_cap` is the real writable spare; the
+        // inner loop respects it and the outer loop simply runs again to fill
+        // the next segment. (No fixed-128KiB assumption — that was wrong for
+        // partially-committed tails and tripped the 2 MB decode test.)
         let seg_tail: &mut [u8] = chunk.data.writable_tail();
         let seg_ptr = seg_tail.as_mut_ptr();
         let buffer_cap = seg_tail.len();
-        debug_assert_eq!(buffer_cap, ALLOCATION_CHUNK_SIZE);
         let mut n_bytes_read: usize = 0;
         let mut last_per_call: usize = 0;
         let mut last_stopped_at = StoppingPoints::NONE;
