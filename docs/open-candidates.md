@@ -70,7 +70,11 @@ layer on top.
    mandate).
 4. Advisor sign-off before landing.
 
-**Branch:** `feat/footprint-align` (commit `2b8bfae` is the reference segmented port)
+**Status (2026-06-02):** Code landed on `reimplement-isa-l` (segmented `data` +
+segment-native A3). **Ship-gate still open** — run frozen T4/T8/T16 + RSS before
+production claim.
+
+**Branch:** `feat/footprint-align` (commit `2b8bfae` was the reference segmented port)
 
 **Note on residency hypothesis:** The page-fault removal oracles proved that faults
 themselves are overlapped slack (`docs/dead-ends/page-faults.md`). Those oracles

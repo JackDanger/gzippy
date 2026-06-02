@@ -29,21 +29,16 @@ prefill at `gzip_chunk.rs:178`, which is a measured **+4.2% T16 production win**
 next chunk's decode buffer is not prefaulted, and the faults land on the critical
 path at high thread counts.
 
-## Verdict: HELD from production
+## Verdict: RE-ENTERED (2026-06-02) — segment-native A3 landed on main
 
-The segmented port is **not fully refuted** — the T4/T8 TIE is a TIE, not a loss, and
-the T16 regression has a **named mechanism with a clear fix path**. Per the methodology
-rule (a TIE is not a rejection; rejection requires a mechanism or a named
-worse-measurement):
+The segmented port is wired into production `ChunkData::data` (`SegmentedU8` at
+128 KiB granule), in-place marker narrow (`narrowed_len`), and **segment-native A3**:
+`prefill_window_prefix` writes the predecessor 32 KiB window into segment 0;
+`read_stream_starting_at` uses `first_segment_a3_output()` while
+`all_in_first_segment()`; consumer skips prefix via `write_payload_skipping_prefix`.
 
-- T16 +5.5% regression = named worse-measurement (the A3-removal cause).
-- Fix: land the SegmentedU8 layout **with A3 prefilled into segment 0** (prefault
-  only the first 128 KiB segment of the new segmented buffer, exactly what A3 did
-  for the monolithic buffer). Re-measure T16 — if it TIEs or beats, the whole stack
-  ships.
-
-This port is the **REFERENCE implementation** for any future faithful-DecodedData
-revival. It is complete, correct (sha-verified), and the base for re-entry.
+The T16 +5.5% regression from A3-removal on the held branch should be addressed;
+**re-measure** T4/T8/T16 + RSS on frozen harness before calling this shipped.
 
 ## Code Location
 

@@ -110,13 +110,6 @@ use crate::decompress::parallel::rpmalloc_alloc::types::{self, U16, U8};
 /// Per perf attribution 2026-05-28: clear_page_erms is 13.26% of CPU
 /// (kernel page-zeroing on first touch); the per-fault overhead is the
 /// bigger cost than the zeroing itself. Fewer faults → less overhead.
-///
-/// DEAD-END: GZIPPY_HUGEPAGE FALSIFIED — measured -38% wall regression.
-/// Walks are only 6% of the amplified fault cost (zeroing 73%, fault-
-/// handler 13%). THP attacks the wrong axis. Do not re-enable without a
-/// new mechanism. See docs/dead-ends/page-faults.md.
-/// GZIPPY_SLAB_ALLOC also FALSIFIED (retain-but-not-segment = TIE,
-/// 3 oracles). Page-fault REMOVAL is overlapped slack. See same file.
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 fn use_hugepage_hint() -> bool {
@@ -164,47 +157,10 @@ fn hugepage_hint(ptr: *mut u8, len: usize) {
 #[inline(always)]
 fn hugepage_hint(_ptr: *mut u8, _len: usize) {}
 
-/// FOOTPRINT CEILING ORACLE (GZIPPY_FOOTPRINT_CEILING=1) — correctness-
-/// BREAKING perturbation that drives the WHOLE aggregate resident set toward
-/// rapidgzip's ~347MB AT ONCE, to causally test whether the T8/T16 gap is
-/// aggregate-footprint contention or overlapped slack. Three cuts, all gated:
-///   (1) narrowed-kill: skip the separate full U8 copy of resolved marker
-///       bytes (chunk_fetcher), writing directly. May break stream order /
-///       output bytes — we measure WALL+IPC+RSS, NOT sha, with the knob ON.
-///   (2) MAX_POOLED → 1: stop retaining 8 large data Vecs/worker.
-///   (3) data reuse right-size: ChunkData::new takes ~CEILING_DATA_CAP
-///       (observed P95 ~16MiB) instead of the 80 MiB max_decoded_chunk_size,
-///       sized ABOVE the 4MiB realloc-trap that regressed feat/footprint-align.
-/// Knob OFF = byte-identical production (verified sha==gzip -dc).
-pub fn footprint_ceiling() -> bool {
-    use std::sync::OnceLock as Once;
-    static ON: Once<bool> = Once::new();
-    *ON.get_or_init(|| std::env::var_os("GZIPPY_FOOTPRINT_CEILING").is_some())
-}
-
-/// Right-sized initial `data` capacity for the ceiling oracle. Observed P95
-/// written-per-chunk is ~12 MiB on silesia (memlife: `data` written 124MB /
-/// chunks; bulk ~12 MiB). 16 MiB sits above that AND above the 4 MiB split
-/// realloc-trap (feat/footprint-align: shrinking to 4 MiB forced
-/// realloc+memcpy+refault → +131k faults → wall regression). 16 MiB caps the
-/// resident reuse bloat without re-introducing the grow-realloc churn.
-pub const CEILING_DATA_CAP: usize = 16 * 1024 * 1024;
-
 /// Cap on pool size per worker per Vec type. Sized to a handful of
 /// in-flight chunks per worker (not the old shared cap of 64).
 const MAX_POOLED: usize = 8;
 const MAX_WORKERS: usize = 64;
-
-/// Effective per-worker pool retention. Ceiling oracle cuts to 1 to stop
-/// retaining 8 large data Vecs/worker (8×8 = 64 large buffers resident).
-#[inline]
-fn max_pooled() -> usize {
-    if footprint_ceiling() {
-        1
-    } else {
-        MAX_POOLED
-    }
-}
 
 thread_local! {
     static WORKER_POOL_INDEX: Cell<Option<usize>> = const { Cell::new(None) };
@@ -276,38 +232,6 @@ pub fn take_u8(min_capacity: usize) -> U8 {
     types::u8_with_capacity(min_capacity)
 }
 
-/// memlife-tagged twin of [`take_u8`]: records the allocation against `comp`
-/// with its alloc-PATH (pool-hit = no fault; fresh = rpmalloc span/huge by
-/// size) so `fulcrum memlife` can attribute first-touch faults to the buffer.
-/// Byte-identical behavior to `take_u8` (only the gated counter differs).
-pub fn take_u8_memlife(
-    min_capacity: usize,
-    comp: crate::decompress::parallel::memlife::Component,
-) -> U8 {
-    use crate::decompress::parallel::memlife::{self, AllocPath};
-    let idx = pool_index_for_take();
-    if let Ok(mut pool) = u8_pools()[idx].lock() {
-        if let Some(mut v) = pool.pop() {
-            TAKE_U8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            TAKE_U8_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            v.clear();
-            if v.capacity() < min_capacity {
-                // grew the pooled block — the grown tail may fresh-fault
-                memlife::alloc(comp, v.capacity(), AllocPath::PoolHit);
-                v.reserve(min_capacity - v.capacity());
-            } else {
-                memlife::alloc(comp, v.capacity(), AllocPath::PoolHit);
-            }
-            return v;
-        }
-    }
-    TAKE_U8_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    TAKE_U8_MISSES_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Fresh allocation: classify by size (huge = munmap-on-free → re-faults).
-    memlife::alloc(comp, min_capacity, memlife::classify_rpmalloc(min_capacity));
-    types::u8_with_capacity(min_capacity)
-}
-
 /// Take a `Vec<u16>` from the current worker's pool.
 #[allow(dead_code)]
 pub fn take_u16(min_capacity: usize) -> U16 {
@@ -337,7 +261,7 @@ pub fn return_u8_to_worker(owner_worker: usize, mut v: U8) {
     let idx = owner_worker.min(MAX_WORKERS - 1);
     RETURN_U8_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut pool) = u8_pools()[idx].lock() {
-        if pool.len() < max_pooled() {
+        if pool.len() < MAX_POOLED {
             v.clear();
             pool.push(v);
         }
@@ -354,7 +278,7 @@ pub fn return_u16_to_worker(owner_worker: usize, mut v: U16) {
     let idx = owner_worker.min(MAX_WORKERS - 1);
     RETURN_U16_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut pool) = u16_pools()[idx].lock() {
-        if pool.len() < max_pooled() {
+        if pool.len() < MAX_POOLED {
             v.clear();
             pool.push(v);
         }
@@ -396,7 +320,7 @@ pub fn return_std_u16_to_worker(owner_worker: usize, mut v: Vec<u16>) {
     }
     let idx = owner_worker.min(MAX_WORKERS - 1);
     if let Ok(mut pool) = std_u16_pools()[idx].lock() {
-        if pool.len() < max_pooled() {
+        if pool.len() < MAX_POOLED {
             v.clear();
             pool.push(v);
         }

@@ -22,17 +22,23 @@
 //!
 //! This module ships the u8 variant first; `data_with_markers` and
 //! `narrowed` may be segmented in follow-ups if the lever proves out.
-//!
-//! DEAD-END NOTE: this type is scaffolded but UNWIRED into production
-//! `ChunkData::data`. The full faithful DecodedData port lives on
-//! feat/footprint-align (commit 2b8bfae): footprint -29%, T4/T8 TIE,
-//! T16 +5.5% from A3-removal. Re-entry = segment-native A3 (prefill
-//! segment 0). Page-fault REMOVAL is NOT the lever (3 oracles TIE —
-//! docs/dead-ends/page-faults.md); the residency hypothesis for this
-//! type is untested. See docs/dead-ends/footprint-align-segmented.md
-//! and docs/open-candidates.md before wiring into production.
 
-use crate::decompress::parallel::rpmalloc_alloc::types::{self, U8};
+use crate::decompress::parallel::rpmalloc_alloc::types::U8;
+
+/// Allocate (or recycle) one empty 128 KiB segment. Pulls from the current
+/// worker's u8 pool (warm, pre-faulted pages) when available, falling back to
+/// a fresh `Vec::with_capacity(ALLOCATION_CHUNK_SIZE)` on miss. Returned
+/// segments are recycled to the same pool by `ChunkData::Drop`.
+#[inline]
+fn new_segment() -> U8 {
+    use crate::decompress::parallel::chunk_buffer_pool;
+    let mut seg = chunk_buffer_pool::take_u8(ALLOCATION_CHUNK_SIZE);
+    seg.clear();
+    if seg.capacity() < ALLOCATION_CHUNK_SIZE {
+        seg.reserve_exact(ALLOCATION_CHUNK_SIZE - seg.capacity());
+    }
+    seg
+}
 
 /// Vendor's `ALLOCATION_CHUNK_SIZE` (`ChunkData.hpp:65`). Each
 /// inner Vec is reserved to exactly this byte capacity. Sized to
@@ -77,6 +83,81 @@ impl SegmentedU8 {
         self.cached_len == 0
     }
 
+    /// True when all logical bytes still fit in segment 0 (A3 decode uses a
+    /// contiguous view of that segment's backing allocation).
+    #[inline]
+    pub fn all_in_first_segment(&self) -> bool {
+        self.segments.len() <= 1
+    }
+
+    /// Segment-native Option A3: install the predecessor's 32 KiB sliding window
+    /// at the front of segment 0 (128 KiB capacity — room for prefill + decode).
+    /// Must run before any decoded bytes are appended (`len() == 0`).
+    pub fn prefill_window_prefix(&mut self, window: &[u8]) {
+        debug_assert!(
+            self.cached_len == 0,
+            "prefill_window_prefix before any decoded bytes"
+        );
+        debug_assert!(
+            window.len() <= ALLOCATION_CHUNK_SIZE,
+            "window prefix exceeds one segment"
+        );
+        if window.is_empty() {
+            return;
+        }
+        let mut seg = new_segment();
+        seg.extend_from_slice(window);
+        if seg.capacity() < ALLOCATION_CHUNK_SIZE {
+            seg.reserve_exact(ALLOCATION_CHUNK_SIZE - seg.capacity());
+        }
+        self.segments.push(seg);
+        self.cached_len = window.len();
+    }
+
+    /// Mutable `[0, capacity)` view of segment 0 for A3 `read_stream_starting_at`.
+    /// The decoder writes at `out_pos_start = self.len()`; back-references into
+    /// the prefilled prefix resolve via `output[..out_pos]`. Only valid while
+    /// [`Self::all_in_first_segment`] holds.
+    ///
+    /// SAFETY contract: caller writes only at indices `>= len()` before `commit`;
+    /// same as the monolithic `Vec` handoff this replaces.
+    pub fn first_segment_a3_output(&mut self) -> &mut [u8] {
+        debug_assert_eq!(
+            self.segments.len(),
+            1,
+            "A3 contiguous view requires a single segment"
+        );
+        let seg = &mut self.segments[0];
+        debug_assert!(
+            seg.capacity() >= ALLOCATION_CHUNK_SIZE,
+            "segment 0 must reserve {} bytes at prefill time",
+            ALLOCATION_CHUNK_SIZE
+        );
+        let cap = seg.capacity();
+        // SAFETY: `cap` bytes are allocated; bytes `[0, len())` are initialized
+        // (prefill and/or prior commits); the tail is writable spare capacity.
+        unsafe { std::slice::from_raw_parts_mut(seg.as_mut_ptr(), cap) }
+    }
+
+    /// Write every decoded payload byte, skipping the first `skip_prefix` logical
+    /// bytes (the A3 window image at the front of segment 0).
+    pub fn write_payload_skipping_prefix<W: std::io::Write>(
+        &self,
+        skip_prefix: usize,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        let mut skip = skip_prefix;
+        for seg in &self.segments {
+            if skip >= seg.len() {
+                skip -= seg.len();
+                continue;
+            }
+            writer.write_all(&seg[skip..])?;
+            skip = 0;
+        }
+        Ok(())
+    }
+
     /// Truncate every segment to zero length, retaining the
     /// underlying allocations for reuse. Matches `Vec::clear` for
     /// the API surface ChunkData callers rely on (`chunk.data.clear()`
@@ -99,16 +180,11 @@ impl SegmentedU8 {
         while !src.is_empty() {
             // Ensure we have a tail segment with room.
             let needs_new = match self.segments.last() {
-                Some(seg) => seg.len() >= ALLOCATION_CHUNK_SIZE,
+                Some(seg) => seg.len() >= seg.capacity() || seg.len() >= ALLOCATION_CHUNK_SIZE,
                 None => true,
             };
             if needs_new {
-                let mut seg = types::u8_with_capacity(ALLOCATION_CHUNK_SIZE);
-                // Pre-touch the capacity. The segment will be filled
-                // immediately below; this is just a Vec growth hint —
-                // pages still fault on first write.
-                seg.reserve_exact(ALLOCATION_CHUNK_SIZE);
-                self.segments.push(seg);
+                self.segments.push(new_segment());
             }
             // SAFETY: just ensured last segment exists and has room.
             let last = self.segments.last_mut().unwrap();
@@ -137,23 +213,27 @@ impl SegmentedU8 {
     /// `commit(n)` with `n <= slice.len()` before the next mutating call.
     pub fn writable_tail(&mut self) -> &mut [u8] {
         let needs_new = match self.segments.last() {
-            Some(seg) => seg.len() >= ALLOCATION_CHUNK_SIZE,
+            Some(seg) => seg.len() >= seg.capacity() || seg.len() >= ALLOCATION_CHUNK_SIZE,
             None => true,
         };
         if needs_new {
-            let mut seg = types::u8_with_capacity(ALLOCATION_CHUNK_SIZE);
-            seg.reserve_exact(ALLOCATION_CHUNK_SIZE);
-            self.segments.push(seg);
+            self.segments.push(new_segment());
         }
         let last = self.segments.last_mut().unwrap();
         let len = last.len();
-        // SAFETY: the tail segment has capacity >= ALLOCATION_CHUNK_SIZE
-        // (allocated above or by `reserve`), so `[len, ALLOCATION_CHUNK_SIZE)`
-        // is owned, writable spare capacity. The slice is uninitialized;
+        let spare = last
+            .capacity()
+            .saturating_sub(len)
+            .min(ALLOCATION_CHUNK_SIZE.saturating_sub(len));
+        debug_assert!(
+            spare > 0,
+            "writable_tail: no spare capacity (len {} cap {})",
+            len,
+            last.capacity()
+        );
+        // SAFETY: `[len, len+spare)` lies within the segment's allocation;
         // the caller writes before any read, then calls `commit`.
-        unsafe {
-            std::slice::from_raw_parts_mut(last.as_mut_ptr().add(len), ALLOCATION_CHUNK_SIZE - len)
-        }
+        unsafe { std::slice::from_raw_parts_mut(last.as_mut_ptr().add(len), spare) }
     }
 
     /// Record `n` bytes written into the slice returned by
@@ -244,9 +324,7 @@ impl SegmentedU8 {
         let extra = needed - current_cap;
         let n_segments = extra.div_ceil(ALLOCATION_CHUNK_SIZE);
         for _ in 0..n_segments {
-            let mut seg = types::u8_with_capacity(ALLOCATION_CHUNK_SIZE);
-            seg.reserve_exact(ALLOCATION_CHUNK_SIZE);
-            self.segments.push(seg);
+            self.segments.push(new_segment());
         }
     }
 
@@ -321,11 +399,189 @@ impl SegmentedU8 {
     pub fn iter_bytes(&self) -> impl Iterator<Item = u8> + '_ {
         self.segments.iter().flat_map(|s| s.iter().copied())
     }
+
+    /// Copy the last `n` logical bytes into `out` (which must be exactly
+    /// `n` long). Used to source a chunk's trailing 32 KiB sliding window
+    /// (`last_32kib_window` / `get_last_window`). `n` must be ≤ `len()`.
+    /// Walks segments from the back, filling `out` from its end.
+    pub fn copy_last_into(&self, out: &mut [u8]) {
+        let n = out.len();
+        debug_assert!(
+            n <= self.cached_len,
+            "copy_last_into: n {n} > len {}",
+            self.cached_len
+        );
+        let mut remaining = n; // bytes still to fill, from the end of `out`
+        for seg in self.segments.iter().rev() {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(seg.len());
+            // bytes [seg.len()-take, seg.len()) of this segment land at
+            // [remaining-take, remaining) of `out`.
+            out[remaining - take..remaining].copy_from_slice(&seg[seg.len() - take..]);
+            remaining -= take;
+        }
+        debug_assert_eq!(remaining, 0, "copy_last_into under-filled");
+    }
+
+    /// Prepend `bytes` as new segment(s) at the FRONT of the buffer (the
+    /// bytes become the logical prefix, before all existing segments).
+    /// Mirror of vendor's `dataBuffers.emplace(dataBuffers.begin(), ...)` in
+    /// `cleanUnmarkedData` (DecodedData.hpp:502): when a marker chunk's
+    /// trailing run turns out to be clean, those resolved bytes are moved to
+    /// the front of `data`. `bytes` is ≤ one chunk's marker prefix; we pack
+    /// it into 128 KiB front segments to keep the segment-size invariant.
+    pub fn prepend_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        // Build the new front segments (128 KiB each), then splice before the
+        // existing segments.
+        let mut front: Vec<U8> = Vec::new();
+        let mut src = bytes;
+        while !src.is_empty() {
+            let n = src.len().min(ALLOCATION_CHUNK_SIZE);
+            let mut seg = new_segment();
+            seg.extend_from_slice(&src[..n]);
+            front.push(seg);
+            src = &src[n..];
+        }
+        front.append(&mut self.segments);
+        self.segments = front;
+        self.cached_len += bytes.len();
+    }
+
+    /// Copy the logical byte range `[start, start + out.len())` into `out`.
+    /// Walks segments, skipping to `start` then filling `out` across segment
+    /// boundaries. Used by the window-construction paths (`get_last_window`)
+    /// which read an arbitrary sub-range of the clean decoded bytes.
+    pub fn copy_range_into(&self, start: usize, out: &mut [u8]) {
+        let n = out.len();
+        debug_assert!(
+            start + n <= self.cached_len,
+            "copy_range_into: [{start}, {}) > len {}",
+            start + n,
+            self.cached_len
+        );
+        let mut skip = start;
+        let mut written = 0usize;
+        for seg in &self.segments {
+            if written == n {
+                break;
+            }
+            if skip >= seg.len() {
+                skip -= seg.len();
+                continue;
+            }
+            let avail = seg.len() - skip;
+            let take = avail.min(n - written);
+            out[written..written + take].copy_from_slice(&seg[skip..skip + take]);
+            written += take;
+            skip = 0;
+        }
+        debug_assert_eq!(written, n, "copy_range_into under-filled");
+    }
+
+    /// Truncate this buffer to the first `at` logical bytes; return the
+    /// suffix as a new `SegmentedU8`. Used to insert bytes after the A3
+    /// window prefix inside segment 0 (`clean_unmarked_data`).
+    pub fn split_off(&mut self, at: usize) -> SegmentedU8 {
+        debug_assert!(at <= self.cached_len);
+        if at == 0 {
+            let mut tail = SegmentedU8::default();
+            std::mem::swap(&mut tail.segments, &mut self.segments);
+            tail.cached_len = self.cached_len;
+            self.cached_len = 0;
+            return tail;
+        }
+        if at == self.cached_len {
+            return SegmentedU8::default();
+        }
+        let mut tail = SegmentedU8::default();
+        let mut logical = 0usize;
+        let mut split_seg = 0usize;
+        let mut split_off = 0usize;
+        for (i, seg) in self.segments.iter().enumerate() {
+            if logical + seg.len() > at {
+                split_seg = i;
+                split_off = at - logical;
+                break;
+            }
+            logical += seg.len();
+        }
+        // Tail of the split segment goes to `tail`.
+        let split_seg_len = self.segments[split_seg].len();
+        if split_off < split_seg_len {
+            let spill = self.segments[split_seg].split_off(split_off);
+            let spill_len = spill.len();
+            tail.segments.push(spill);
+            tail.cached_len += spill_len;
+        }
+        for seg in self.segments.drain(split_seg + 1..) {
+            tail.cached_len += seg.len();
+            tail.segments.push(seg);
+        }
+        self.cached_len = at;
+        tail
+    }
+
+    /// Insert `bytes` at logical offset `offset` (shifting the suffix right).
+    pub fn insert_logical_at(&mut self, offset: usize, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if offset == 0 {
+            self.prepend_bytes(bytes);
+            return;
+        }
+        if offset >= self.cached_len {
+            self.extend_from_slice(bytes);
+            return;
+        }
+        let mut tail = self.split_off(offset);
+        self.extend_from_slice(bytes);
+        self.append_segmented(&mut tail);
+    }
+
+    /// Append the entire logical contents of `other` onto `self`, moving
+    /// `other`'s segments in WITHOUT copying their bytes when alignment
+    /// permits (the common merge case: `self` empty → take all of
+    /// `other`'s segments). Falls back to a byte copy of the spill when
+    /// `self`'s tail segment is partially full. Mirror of the merge in
+    /// `absorb_isal_tail`. Leaves `other` empty.
+    pub fn append_segmented(&mut self, other: &mut SegmentedU8) {
+        if other.cached_len == 0 {
+            return;
+        }
+        if self.cached_len == 0 {
+            // Zero-copy: adopt other's segments wholesale.
+            self.segments = std::mem::take(&mut other.segments);
+            self.cached_len = other.cached_len;
+            other.cached_len = 0;
+            return;
+        }
+        // General case: copy other's bytes in (rare on the hot path).
+        for seg in other.segments.drain(..) {
+            self.extend_from_slice(&seg);
+        }
+        other.cached_len = 0;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefill_window_prefix_uses_segment_zero() {
+        let mut buf = SegmentedU8::default();
+        let window = vec![0xABu8; 32 * 1024];
+        buf.prefill_window_prefix(&window);
+        assert_eq!(buf.len(), window.len());
+        assert_eq!(buf.segment_count(), 1);
+        assert_eq!(buf.segments().next().unwrap(), window.as_slice());
+    }
 
     #[test]
     fn extend_within_one_segment() {

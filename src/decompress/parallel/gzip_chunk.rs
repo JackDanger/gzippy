@@ -96,42 +96,6 @@ pub static BOOTSTRAP_BODY_BYTES: std::sync::atomic::AtomicU64 =
 pub static BOOTSTRAP_POST_FLIP_U16_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-// ── GARBAGE-SKIP CEILING ORACLE (GZIPPY_SKIP_WINDOW_ABSENT=1) ──────────────
-// CORRECTNESS-BREAKING upper-bound instrument. When the env knob is set, the
-// window-absent speculative path (marker bootstrap u16 decode + emit_backref_ring
-// + the consumer's apply_window/replace_markers resolve) is REPLACED by a single
-// clean ISA-L bulk decode of the whole chunk against a DUMMY zero 32-KiB window.
-// This drives the window-absent decode+emit+resolve cost toward zero while the
-// pipeline keeps flowing (real bit-stream parse => correct end_bit_offset +
-// byte count + block boundaries), so the interleaved-wall delta vs knob-OFF is
-// the MAXIMUM T8 wall any window-absent optimization could ever buy.
-//
-// Output is GARBAGE (back-references that reach into the absent predecessor
-// window resolve against zeros) — do NOT sha-verify with the knob ON.
-//
-// POSITIVE CONTROL: SKIP_ORACLE_CHUNKS counts chunks that took the skip stand-in
-// and SKIP_ORACLE_BYTES the bytes produced via it; a no-op oracle that secretly
-// still ran the real bootstrap would leave these at 0 and is thereby caught.
-// When the knob is OFF both stay 0 and production semantics are byte-identical.
-pub static SKIP_ORACLE_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static SKIP_ORACLE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Parsed once: true iff GZIPPY_SKIP_WINDOW_ABSENT is set to a non-empty value.
-#[cfg(parallel_sm)]
-fn skip_window_absent_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=off, 2=on
-    match CACHE.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = std::env::var_os("GZIPPY_SKIP_WINDOW_ABSENT").is_some();
-            CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
 /// Per-failure structured log. Writes one JSON line to the path in
 /// `GZIPPY_BODY_FAIL_LOG` env var (no-op if unset). Use this for
 /// distributional analysis: cluster failures by offset to see if they
@@ -215,12 +179,6 @@ fn use_pure_bulk_path() -> bool {
 /// corpora (silesia/logs/software in gzip/pigz/bgzf flavors +
 /// urandom-100M) at T∈{1,4,16} — 33/33 pass.
 ///
-/// NOTE: the feat/footprint-align SegmentedU8 port (commit 2b8bfae)
-/// REMOVED this A3 prefill and caused T16 +5.5% regression. Re-entry
-/// = "segment-native A3" (prefill segment 0 only). This function is
-/// the exact behavior to replicate in the segmented port. See
-/// docs/dead-ends/footprint-align-segmented.md + docs/open-candidates.md.
-///
 /// **Default ON** as of the cross-corpus validation gate. To disable
 /// for A/B comparison: `GZIPPY_OPTION_A_PREFILL=0`.
 #[cfg(pure_inflate_decode)]
@@ -296,14 +254,10 @@ fn decode_chunk_isal_impl(
 
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
 
-    // Option A3 (env-flag-gated): pre-fill chunk.data[0..32K] with the
-    // predecessor's sliding-window image so back-references in the
-    // wrapper's decode hit copy_match_fast's SIMD path instead of the
-    // copy_match_windowed slow path (the 3.5pp delta vs ISA-L per the
-    // perf attribution log). Default OFF — `GZIPPY_OPTION_A_PREFILL=1`
-    // to opt in. Trim happens before `chunk.finalize()` at the bottom
-    // of this function so the chunk leaves with only decoded bytes in
-    // `data` (the A1 debug_asserts enforce this).
+    // Option A3 (default ON): pre-fill segment 0 with the predecessor's
+    // 32 KiB window so back-references hit copy_match_fast via
+    // `output[..out_pos]`. Disable with `GZIPPY_OPTION_A_PREFILL=0`.
+    // The consumer skips `data_prefix_len` when writing (A4).
     #[cfg(feature = "pure-rust-inflate")]
     let a3_prefill_active = use_option_a_prefill_path() && initial_window.len() == 32768;
     #[cfg(not(feature = "pure-rust-inflate"))]
@@ -353,12 +307,27 @@ fn decode_chunk_isal_impl(
         // helper was already in place (chunk_data.rs:405) — this just
         // wires it up.
         let prev_data_len = chunk.data.len();
-        // Reserve at least ALLOCATION_CHUNK_SIZE of spare capacity.
-        // chunk.data starts with `max_decoded_chunk_size` (80 MiB)
-        // capacity from `take_u8`, so this is a no-op until we exceed
-        // that — at which point amortized growth handles it.
-        chunk.data.reserve(ALLOCATION_CHUNK_SIZE);
-        let buffer_cap = ALLOCATION_CHUNK_SIZE;
+        // FOOTPRINT-ALIGN: `chunk.data` is a `SegmentedU8`. Acquire a fresh
+        // 128 KiB segment tail to decode this outer iteration into. The
+        // returned slice is exactly ALLOCATION_CHUNK_SIZE bytes (a brand-new
+        // segment if the prior tail was full) — uninitialized but writable.
+        // We write into it across the inner `read_stream` calls, then
+        // `commit(append_len)` the bytes we keep. Back-refs reaching before
+        // this segment resolve via the wrapper's internal 32 KiB window ring
+        // (resumable.rs:653 feeds each call's output into `state.window`), so
+        // segment boundaries are transparent to correctness — vendor's
+        // `DecodedData::append` segments output the same way
+        // (DecodedData.hpp:243-289).
+        // `writable_tail` returns the CURRENT tail segment's spare — which is
+        // a FULL 128 KiB when the prior outer iteration filled (or there was
+        // none), or a partial remainder when the prior commit left the tail
+        // non-full. Either way `buffer_cap` is the real writable spare; the
+        // inner loop respects it and the outer loop simply runs again to fill
+        // the next segment. (No fixed-128KiB assumption — that was wrong for
+        // partially-committed tails and tripped the 2 MB decode test.)
+        let seg_tail: &mut [u8] = chunk.data.writable_tail();
+        let seg_ptr = seg_tail.as_mut_ptr();
+        let buffer_cap = seg_tail.len();
         let mut n_bytes_read: usize = 0;
         let mut last_per_call: usize = 0;
         let mut last_stopped_at = StoppingPoints::NONE;
@@ -373,47 +342,18 @@ fn decode_chunk_isal_impl(
                 && !wrapper.session_pending())
         {
             let bit_before_read = wrapper.tell_compressed();
-            // SAFETY: we reserved `ALLOCATION_CHUNK_SIZE` of spare
-            // capacity above; `prev_data_len + n_bytes_read` is within
-            // the allocation and the slice covers
-            // `[prev_data_len + n_bytes_read, prev_data_len + buffer_cap)`
-            // bytes which are uninitialized but writable. ISA-L writes
-            // monotonically forward; we only `set_len` AFTER the inner
-            // loop has decided how many bytes are valid.
-            // Option A3 path: hand the wrapper the FULL chunk.data
-            // buffer (extended through the spare capacity) with
-            // `out_pos_start = prev_data_len + n_bytes_read`. Back-refs
-            // resolve via output[..out_pos] (which includes the 32 KiB
-            // window prefix at the front of chunk.data), keeping every
-            // dist ≤ 32K within copy_match_fast's fast path.
-            //
-            // Non-A3 path: existing spare-slice handoff; the wrapper
-            // sees out_pos=0 and falls through to state.window for
-            // every cross-chunk back-ref.
-            //
-            // SAFETY (A3): `chunk.data.reserve(ALLOCATION_CHUNK_SIZE)`
-            // above guarantees the allocation covers
-            // `[0, prev_data_len + buffer_cap)`. The first
-            // `prev_data_len` bytes are initialized (prefill + prior
-            // outer-iter writes); the tail `[prev_data_len + n_bytes_read,
-            // prev_data_len + buffer_cap)` is uninitialized but
-            // writable. `read_stream_starting_at` only WRITES at
-            // out_pos_start onward and only READS at indices < out_pos
-            // (i.e. into the initialized portion). The `set_len` at
-            // the bottom of the outer iter records the actual bytes
-            // written.
-            //
-            // SAFETY (non-A3): unchanged from the original.
+            // A3: decode into segment 0's full backing store so back-refs
+            // resolve via `output[..out_pos]` (includes the prefilled window).
+            // Non-A3 / multi-segment: spare slice on the tail segment only;
+            // cross-chunk refs use the wrapper's window ring.
             #[cfg(feature = "pure-rust-inflate")]
-            let r = if a3_prefill_active {
-                let total_len = prev_data_len + buffer_cap;
-                let output_slice: &mut [u8] =
-                    unsafe { std::slice::from_raw_parts_mut(chunk.data.as_mut_ptr(), total_len) };
-                wrapper.read_stream_starting_at(output_slice, prev_data_len + n_bytes_read)?
+            let r = if a3_prefill_active && chunk.data.all_in_first_segment() {
+                let out_buf = chunk.data.first_segment_a3_output();
+                wrapper.read_stream_starting_at(out_buf, prev_data_len + n_bytes_read)?
             } else {
                 let spare: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(
-                        chunk.data.as_mut_ptr().add(prev_data_len + n_bytes_read),
+                        seg_ptr.add(n_bytes_read),
                         buffer_cap - n_bytes_read,
                     )
                 };
@@ -423,7 +363,7 @@ fn decode_chunk_isal_impl(
             let r = {
                 let spare: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(
-                        chunk.data.as_mut_ptr().add(prev_data_len + n_bytes_read),
+                        seg_ptr.add(n_bytes_read),
                         buffer_cap - n_bytes_read,
                     )
                 };
@@ -529,33 +469,30 @@ fn decode_chunk_isal_impl(
             append_len = n_bytes_read;
         }
         if append_len > 0 {
-            // Commit the bytes ISA-L wrote into chunk.data's spare
-            // capacity. Bytes beyond `prev_data_len + append_len`
-            // (between EOB and the truncate point) are left
-            // uninitialized in the Vec — the NEXT outer iteration
-            // will overwrite them starting at
-            // `chunk.data.len() = prev_data_len + append_len`.
+            // CRC the kept bytes FIRST (read them straight from the segment
+            // we just wrote, before `commit`), then commit `append_len` into
+            // the segmented buffer. Bytes `[append_len, n_bytes_read)` that
+            // the decoder wrote but we're discarding (between EOB and the
+            // truncate point) simply never get committed — the next outer
+            // iteration overwrites the segment tail from `append_len`.
             //
-            // We deliberately do NOT call
-            // `chunk.note_clean_bytes_written_in_place` here because
-            // its `subchunks.last_mut().decoded_size += written`
-            // would double-count: the inner loop already updated
-            // subchunks via `note_inner_decoded_bytes(last_per_call)`
-            // for the FULL n_bytes_read (before truncation).
+            // We deliberately do NOT touch `subchunks.last_mut().decoded_size`
+            // here because the inner loop already credited the FULL
+            // n_bytes_read via `note_inner_decoded_bytes(last_per_call)`.
             //
-            // SAFETY: `prev_data_len + append_len ≤ prev_data_len +
-            // n_bytes_read ≤ prev_data_len + buffer_cap`, which is
-            // within the capacity reserved at the start of the
-            // outer iteration; ISA-L wrote initialized bytes through
-            // `prev_data_len + n_bytes_read`.
-            unsafe { chunk.data.set_len(prev_data_len + append_len) };
+            // SAFETY: `append_len ≤ n_bytes_read ≤ buffer_cap`; the decoder
+            // wrote initialized bytes through `seg_ptr[0..n_bytes_read]`, so
+            // `seg_ptr[0..append_len]` is fully initialized.
             if chunk.configuration.crc32_enabled {
+                let kept: &[u8] = unsafe { std::slice::from_raw_parts(seg_ptr, append_len) };
                 if let Some(last_crc) = chunk.crc32s.last_mut() {
-                    last_crc.update(&chunk.data[prev_data_len..prev_data_len + append_len]);
+                    last_crc.update(kept);
                 }
             }
+            chunk.data.commit(append_len);
             chunk.statistics.non_marker_count += append_len as u64;
         }
+        let _ = prev_data_len;
         already_decoded = decode_base + append_len;
 
         if pending_stop_after_flush && !wrapper.session_pending() {
@@ -675,12 +612,22 @@ fn decode_chunk_pure_bulk_impl(
     let mut bits = Bits::at_bit_offset(input, encoded_offset_bits);
     let mut scratch = DecoderScratch::new();
 
+    // FOOTPRINT-ALIGN: the pure-bulk `decode_block` path (env-gated OFF via
+    // GZIPPY_ISAL_PURE_BULK) resolves back-references by reading the
+    // already-decoded prefix of its OUTPUT buffer (`stream_view[..out_pos]`),
+    // so it needs one CONTIGUOUS buffer spanning the whole stream — it cannot
+    // decode directly into the segmented `chunk.data`. Decode into a local
+    // contiguous `bulk` Vec, then flush it into `chunk.data`'s segments at the
+    // end. (The production path is the wrapper `read_stream` loop above, which
+    // IS segment-native via its window ring.)
+    let mut bulk: Vec<u8> = Vec::new();
+
     // `predecessor_window` is the bytes immediately before this gzip
     // stream's first decoded byte (i.e., the prior chunk's tail for
     // the first member; empty for any subsequent gzip member started
     // mid-chunk after a footer).
     let mut predecessor: &[u8] = initial_window;
-    // Offset in chunk.data where the CURRENT gzip stream's bytes start.
+    // Offset in `bulk` where the CURRENT gzip stream's bytes start.
     // Back-references must not reach across this boundary (each gzip
     // member has its own sliding window per RFC 1952).
     let mut stream_data_start: usize = 0;
@@ -698,18 +645,16 @@ fn decode_chunk_pure_bulk_impl(
         // dynamic-Huffman has no hard bound but rarely exceeds 64 KiB
         // in practice. 128 KiB headroom covers both.
         const PER_BLOCK_RESERVE: usize = 128 * 1024;
-        let prev_len = chunk.data.len();
-        chunk.data.reserve(PER_BLOCK_RESERVE);
+        let prev_len = bulk.len();
+        bulk.reserve(PER_BLOCK_RESERVE);
 
-        // SAFETY: chunk.data.capacity() bytes are allocated. The
-        // initialized prefix is [0, prev_len); the rest is uninit but
-        // writable. The bulk decoder reads only [stream_data_start,
-        // out_pos) (the current stream's already-decoded bytes), which
-        // is a subset of [0, prev_len). It writes only to [out_pos, ..).
-        // We update Vec's len via note_clean_bytes_written_in_place
-        // after decode_block returns.
-        let buf_ptr = chunk.data.as_mut_ptr();
-        let buf_cap = chunk.data.capacity();
+        // SAFETY: `bulk.capacity()` bytes are allocated. The initialized
+        // prefix is [0, prev_len); the rest is uninit but writable. The bulk
+        // decoder reads only [stream_data_start, out_pos) (the current
+        // stream's already-decoded bytes), a subset of [0, prev_len). It
+        // writes only to [out_pos, ..). We bump len after decode_block.
+        let buf_ptr = bulk.as_mut_ptr();
+        let buf_cap = bulk.capacity();
         let stream_view: &mut [u8] = unsafe {
             std::slice::from_raw_parts_mut(
                 buf_ptr.add(stream_data_start),
@@ -737,7 +682,19 @@ fn decode_chunk_pure_bulk_impl(
         })?;
 
         let bytes_written = (stream_data_start + out_pos_in_view) - prev_len;
-        chunk.note_clean_bytes_written_in_place(prev_len, bytes_written, true);
+        // Bump `bulk`'s len + CRC/stats over the freshly-written bytes
+        // (replaces `note_clean_bytes_written_in_place` which targeted the
+        // old contiguous `chunk.data`).
+        if bytes_written > 0 {
+            unsafe { bulk.set_len(prev_len + bytes_written) };
+            if chunk.configuration.crc32_enabled {
+                if let Some(last_crc) = chunk.crc32s.last_mut() {
+                    last_crc.update(&bulk[prev_len..prev_len + bytes_written]);
+                }
+            }
+            chunk.statistics.non_marker_count += bytes_written as u64;
+            chunk.note_inner_decoded_bytes(bytes_written);
+        }
 
         let block_end_bit = bits.bit_position();
 
@@ -756,7 +713,7 @@ fn decode_chunk_pure_bulk_impl(
         last_eob_pos = block_end_bit;
 
         if !result.is_final_block {
-            chunk.append_block_boundary_at(block_end_bit, chunk.data.len());
+            chunk.append_block_boundary_at(block_end_bit, bulk.len());
         }
 
         if result.is_final_block {
@@ -807,11 +764,11 @@ fn decode_chunk_pure_bulk_impl(
                     bits = Bits::at_bit_offset(input, next_stream_byte * 8);
                     // New gzip member: fresh sliding window. Reset
                     // both the back-ref reach base and the predecessor.
-                    stream_data_start = chunk.data.len();
+                    stream_data_start = bulk.len();
                     predecessor = &[];
                     last_end_bit = bits.bit_position();
                     last_eob_pos = last_end_bit;
-                    chunk.append_block_boundary_at(last_end_bit, chunk.data.len());
+                    chunk.append_block_boundary_at(last_end_bit, bulk.len());
                     continue;
                 }
                 Err(e) => {
@@ -847,6 +804,10 @@ fn decode_chunk_pure_bulk_impl(
         }
     }
 
+    // Flush the contiguous bulk decode buffer into the segmented `data`.
+    if !bulk.is_empty() {
+        chunk.data.extend_from_slice(&bulk);
+    }
     chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
     let final_bit = if stopped_at_block_boundary || reached_stream_end {
         last_end_bit
@@ -884,32 +845,6 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
 ) -> Result<ChunkData, ChunkDecodeError> {
     let t_decode = std::time::Instant::now();
 
-    // GARBAGE-SKIP CEILING ORACLE (GZIPPY_SKIP_WINDOW_ABSENT=1). Replace the
-    // entire window-absent speculative path (marker bootstrap u16 decode +
-    // emit_backref_ring) AND remove its downstream cost (no markers => the
-    // consumer's apply_window/replace_markers is a no-op, since the resulting
-    // `data_with_markers` is empty and `data` carries clean u8) with ONE clean
-    // ISA-L bulk decode against a dummy zero 32-KiB window. Boundaries/byte
-    // count stay correct (real bit-stream parse), so the pipeline flows; the
-    // bytes are GARBAGE where back-refs reach the absent predecessor window.
-    // See SKIP_ORACLE_* counters (the positive control).
-    if skip_window_absent_enabled() {
-        let dummy_window = [0u8; 32768];
-        let chunk = decode_chunk_isal_impl(
-            input,
-            encoded_offset_bits,
-            stop_hint_bits,
-            &dummy_window,
-            configuration,
-        )?;
-        SKIP_ORACLE_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        SKIP_ORACLE_BYTES.fetch_add(
-            chunk.data.len() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        return Ok(chunk);
-    }
-
     // Phase 1 — bootstrap with deflate_block::Block, the rapidgzip-
     // faithful port of vendor/.../gzip/deflate.hpp's deflate::Block<>.
     // Decodes deflate blocks one-by-one until any of:
@@ -938,7 +873,6 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     // u16) — without it, decoding into a 0-cap buffer reallocates repeatedly and
     // is ~5% SLOWER than the old warm-pool-then-copy (measured, frozen box).
     chunk.data_with_markers.reserve(128 * 1024);
-    let dwm_len_before = chunk.data_with_markers.len();
     let bootstrap = {
         let _coz = crate::coz_probe::scope("marker_bootstrap");
         bootstrap_with_deflate_block(
@@ -948,21 +882,6 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
             &mut chunk.data_with_markers,
         )
     }?;
-    // memlife: the marker bootstrap decoded DIRECTLY into the chunk's pooled
-    // U16 `data_with_markers` (zero-copy merge — no append_markered copy). The
-    // bytes written = (post - pre) u16 elements × 2; the backing alloc is the
-    // chunk's pooled rpmalloc U16 (huge when it grows past the span threshold).
-    {
-        use crate::decompress::parallel::memlife::{self, AllocPath, Component};
-        let added = chunk.data_with_markers.len() - dwm_len_before;
-        memlife::written(Component::DataWithMarkers, added * 2);
-        // data_with_markers is a STD (glibc) Vec<u16> — it does NOT route
-        // through rpmalloc, so it is invisible to the allocator_total tap. We
-        // record its backing growth here as a glibc alloc so the closure check
-        // accounts for it as the off-rpmalloc component it is.
-        let cap_bytes = chunk.data_with_markers.capacity() * 2;
-        memlife::alloc(Component::DataWithMarkers, cap_bytes, AllocPath::Glibc);
-    }
     let bootstrap_dur_us = t_bootstrap.elapsed().as_micros();
     // CAUSAL PROBE (GZIPPY_SLOW_BOOTSTRAP=N percent): coz is unavailable in this
     // container (perf-event sampling restricted), so measure the bootstrap's
@@ -971,21 +890,11 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     // the probe off vs on. Byte-identical (pure delay). If 2x-slower-bootstrap
     // (N=100) barely moves the wall, the bootstrap is overlapped/wall-dead;
     // if it adds ~its critical share, it is the lever. Off by default.
-    // GZIPPY_SLOW_BOOTSTRAP_US=K injects a FIXED K microseconds per chunk (the
-    // ABSOLUTE-ms calibration the standing protocol mandates); it takes
-    // precedence over the percent knob GZIPPY_SLOW_BOOTSTRAP=N.
-    let slow_us: Option<u64> = std::env::var("GZIPPY_SLOW_BOOTSTRAP_US")
+    if let Some(pct) = std::env::var("GZIPPY_SLOW_BOOTSTRAP")
         .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&k| k > 0)
-        .or_else(|| {
-            std::env::var("GZIPPY_SLOW_BOOTSTRAP")
-                .ok()
-                .and_then(|s| s.parse::<u128>().ok())
-                .map(|pct| (bootstrap_dur_us * pct / 100) as u64)
-        });
-    if let Some(extra_us) = slow_us {
-        let extra = std::time::Duration::from_micros(extra_us);
+        .and_then(|s| s.parse::<u128>().ok())
+    {
+        let extra = std::time::Duration::from_micros((bootstrap_dur_us * pct / 100) as u64);
         // Frequency-neutral control (disproof of the turbo-depression confound):
         // GZIPPY_SLOW_BOOTSTRAP_SLEEP=1 yields the core via sleep instead of a
         // busy-spin. A sleeping worker can't depress all-core turbo, so if the
@@ -1194,25 +1103,16 @@ fn absorb_isal_tail(dst: &mut ChunkData, mut tail: ChunkData) {
         // `Default`, and swapping parks `dst`'s empty buffer in `tail` to
         // be dropped. Byte-identical to the copy (same source bytes, same
         // order, prefix-free).
-        if tail_payload_offset == 0 && dst.data.is_empty() {
-            std::mem::swap(&mut dst.data, &mut tail.data);
+        // FOOTPRINT-ALIGN: move the tail's decoded payload into `dst`.
+        // When the ISA-L tail used A3 prefill, `tail.data` begins with a
+        // 32 KiB window image (`tail_payload_offset`); drop it before merge
+        // — `dst` never records `data_prefix_len` on this path.
+        let mut payload = if tail_payload_offset == 0 {
+            std::mem::take(&mut tail.data)
         } else {
-            let prev_len = dst.data.len();
-            dst.data.reserve(added);
-            // SAFETY: `reserve(added)` ensures capacity covers
-            // `prev_len + added`; `tail.data` and `dst.data` are
-            // distinct allocations (separate Vecs); set_len with the
-            // post-copy length is legal because all `added` bytes are
-            // initialized from `tail.data[tail_payload_offset..]`.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    tail.data.as_ptr().add(tail_payload_offset),
-                    dst.data.as_mut_ptr().add(prev_len),
-                    added,
-                );
-                dst.data.set_len(prev_len + added);
-            }
-        }
+            tail.data.split_off(tail_payload_offset)
+        };
+        dst.data.append_segmented(&mut payload);
         dst.statistics.non_marker_count += added as u64;
         if let Some(last) = dst.subchunks.last_mut() {
             last.decoded_size += added;
@@ -1777,7 +1677,9 @@ mod tests {
         for v in &chunk.data_with_markers {
             out.push(*v as u8);
         }
-        out.extend_from_slice(&chunk.data);
+        for seg in chunk.data.segments() {
+            out.extend_from_slice(seg);
+        }
         out
     }
 
