@@ -54,40 +54,12 @@ pub fn read_parallel_sm<W: std::io::Write>(
     }
     .map_err(|e| ReadParallelSmError::DecodeFailed(format!("{e:?}")))?;
 
-    // CONSUMER-NULL CEILING ORACLE (GZIPPY_NULL_CONSUMER_WORK=1): the consumer
-    // nulls output-write + CRC-fold, so total_crc is meaningless and output is
-    // NOT byte-correct (this is a ceiling/floor measurement, not production).
-    // Skip verification + emit the positive-control witness + conservation.
-    let null_consumer = std::env::var_os("GZIPPY_NULL_CONSUMER_WORK").is_some();
-    if null_consumer {
-        use crate::decompress::parallel::chunk_fetcher::{
-            CONSUMER_NULL_BYTES_SKIPPED, CONSUMER_NULL_WORK_SKIPPED, CONSUMER_WORK_EXECUTED,
-        };
-        use std::sync::atomic::Ordering;
-        let skipped = CONSUMER_NULL_WORK_SKIPPED.load(Ordering::Relaxed);
-        let executed = CONSUMER_WORK_EXECUTED.load(Ordering::Relaxed);
-        let bytes_skipped = CONSUMER_NULL_BYTES_SKIPPED.load(Ordering::Relaxed);
-        eprintln!(
-            "[gzippy CONSUMER_NULL_ORACLE] witness: consumer_work_executed={executed} (MUST be ~0 ON) \
-             nulled_chunks={skipped} (MUST be >0 ON) bytes_skipped={bytes_skipped} \
-             expected_size={expected_size} total_size={total_size} \
-             conservation_ok={}",
-            bytes_skipped as usize == expected_size
-        );
-        if executed != 0 {
-            eprintln!(
-                "[gzippy CONSUMER_NULL_ORACLE] *** FAKE ORACLE *** consumer_work_executed={executed} \
-                 is NONZERO with the oracle ON — the consumer compute STILL RAN. DISCARD the ceiling."
-            );
-        }
-    }
-
     // FIXED-SLEEP coordination-isolation mode produces GARBAGE output (zeros)
     // by design — it is a wall-only measurement of the coordination chain
     // with decode replaced by a fixed sleep. Skip CRC/size verification in
     // that mode only (zero production change when unset).
     let sleep_mode = crate::decompress::parallel::decode_bypass::sleep_decode_enabled();
-    if !sleep_mode && !null_consumer {
+    if !sleep_mode {
         if total_size != expected_size {
             return Err(ReadParallelSmError::SizeMismatch {
                 expected: expected_size,

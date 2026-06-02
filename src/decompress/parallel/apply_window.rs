@@ -100,7 +100,7 @@ mod tests {
         apply_window(&mut chunk, &window);
         // No mutation: data_with_markers is empty, data unchanged, CRC unchanged.
         assert!(chunk.data_with_markers.is_empty());
-        assert_eq!(chunk.data, b"hello world");
+        assert_eq!(chunk.data.to_contiguous(), b"hello world");
         assert_eq!(chunk.crc32s[0].crc32(), original_crc);
     }
 
