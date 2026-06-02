@@ -333,12 +333,16 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
             )
             .map_err(FetchError::Decode)?;
             let end_bit = c.encoded_offset_bits + c.encoded_size_bits;
-            let payload = &c.data[c.data_prefix_len..];
-            if payload.len() >= 32768 {
-                prev_tail = payload[payload.len() - 32768..].to_vec();
+            let data_len = c.data.len();
+            if data_len >= 32768 {
+                let mut t = vec![0u8; 32768];
+                c.data.copy_last_into(&mut t);
+                prev_tail = t;
             } else {
                 let mut nt = prev_tail.clone();
-                nt.extend_from_slice(payload);
+                let mut tail_bytes = vec![0u8; data_len];
+                c.data.copy_range_into(0, &mut tail_bytes);
+                nt.extend_from_slice(&tail_bytes);
                 let n = nt.len();
                 prev_tail = nt[n.saturating_sub(32768)..].to_vec();
             }
@@ -2399,7 +2403,13 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
         let _tv2 = trace_v2::SpanGuard::begin("post_process.crc_narrowed");
         let nb = chunk.narrowed_bytes();
         if !nb.is_empty() {
-            chunk.narrowed_crc.update(nb);
+            // Decouple the immutable `narrowed_bytes` borrow from the mutable
+            // `narrowed_crc` borrow via a raw view (the bytes live in
+            // data_with_markers, which `narrowed_crc.update` never touches).
+            let nb_ptr = nb.as_ptr();
+            let nb_len = nb.len();
+            let view: &[u8] = unsafe { std::slice::from_raw_parts(nb_ptr, nb_len) };
+            chunk.narrowed_crc.update(view);
         }
     }
     if trace::is_enabled() {

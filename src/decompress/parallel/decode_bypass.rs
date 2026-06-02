@@ -116,7 +116,7 @@ impl CapturedChunk {
             data: if meta_only() {
                 Vec::new()
             } else {
-                c.data.as_slice().to_vec()
+                c.data.to_contiguous()
             },
             subchunks: c
                 .subchunks
