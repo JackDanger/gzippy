@@ -261,23 +261,26 @@ impl ChunkData {
     /// `Drop` impl returns the Vecs to the pool.
     pub fn new(encoded_offset_bits: usize, configuration: ChunkConfiguration) -> Self {
         use crate::decompress::parallel::chunk_buffer_pool;
-        // FOOTPRINT-ALIGN (2026-06-02): allocate `data` at the EXPECTED
-        // decoded size (one chunk's `split_chunk_size`, ~4 MiB), NOT the
-        // worst-case `max_decoded_chunk_size` (= 20× split = 80 MiB). The
-        // 80 MiB pre-size was a gzippy-specific over-allocation: a normal
-        // chunk decodes ~split_chunk_size bytes and stops at the chunk's
-        // compressed range (`stop_hint_bits`), never approaching the 80 MiB
-        // preemptive cap. With rpmalloc's ~3.94 MiB huge-alloc threshold the
-        // 80 MiB `with_capacity` mmaps+faults 80 MiB per chunk and (×N
-        // workers × pool-retain) drove the 1.04 GB maxrss (vs rapidgzip's
-        // 347 MB). Vendor never pre-sizes the worst case: `DecodedData::
-        // append` grows `dataBuffers` 128 KiB at a time and `shrink_to_fit`s
-        // (DecodedData.hpp:241-289). gzippy's growth loop
-        // (`chunk.data.reserve(ALLOCATION_CHUNK_SIZE)`, gzip_chunk.rs:318)
-        // already grows on demand, so the only change needed is to stop
-        // pre-committing the worst case here. Pathological chunks that cross
-        // 4 MiB just pay amortized doubling like vendor.
-        let cap = configuration.split_chunk_size;
+        // FOOTPRINT-ALIGN (2026-06-02) — REVERTED after measurement.
+        // Right-sizing `data`'s initial capacity from max_decoded_chunk_size
+        // (80 MiB) down to split_chunk_size (4 MiB) cut allocator TRAFFIC 55%
+        // (memlife T8: data alloc 8.64 GB→1.10 GB, rpmalloc-huge 3.27 GB→159
+        // MB) but on the frozen interleaved A/B it REGRESSED the wall
+        // (T8-file 1.297→1.510 vs rapidgzip; T16 1.677→1.922), RAISED minflt
+        // 232k→363k, and barely moved peak maxrss (1025→1010 MB). MECHANISM:
+        // gzippy stores decoded bytes in ONE contiguous growing `data` Vec.
+        // A small initial cap forces the `reserve(ALLOCATION_CHUNK_SIZE)`
+        // growth loop (gzip_chunk.rs:318) to realloc+memcpy+RE-FAULT as the
+        // chunk grows past 4 MiB — the extra faults are the regression. This
+        // is the OPPOSITE of vendor: rapidgzip's `DecodedData::data` is a
+        // std::vector<DecodedVector> — a LIST of fixed 128 KiB chunks that is
+        // NEVER reallocated/copied (DecodedData.hpp:231-289), so it has no
+        // grow-realloc cost regardless of total size. So for gzippy's
+        // contiguous-buffer design the large pre-size is actually CORRECT
+        // (avoids realloc); the real footprint lever is the segmented-buffer
+        // rewrite (chunk_data `data` → list of 128 KiB segments + in-place
+        // marker resolve), NOT the reservation size. Keep the 80 MiB pre-size.
+        let cap = configuration.max_decoded_chunk_size;
         // `data_with_markers` is allocated lazily — the fast path
         // (window known) never emits markers, so paying for the
         // capacity reservation up front is wasted address space AND
