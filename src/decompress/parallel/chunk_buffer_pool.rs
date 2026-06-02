@@ -110,6 +110,13 @@ use crate::decompress::parallel::rpmalloc_alloc::types::{self, U16, U8};
 /// Per perf attribution 2026-05-28: clear_page_erms is 13.26% of CPU
 /// (kernel page-zeroing on first touch); the per-fault overhead is the
 /// bigger cost than the zeroing itself. Fewer faults → less overhead.
+///
+/// DEAD-END: GZIPPY_HUGEPAGE FALSIFIED — measured -38% wall regression.
+/// Walks are only 6% of the amplified fault cost (zeroing 73%, fault-
+/// handler 13%). THP attacks the wrong axis. Do not re-enable without a
+/// new mechanism. See docs/dead-ends/page-faults.md.
+/// GZIPPY_SLAB_ALLOC also FALSIFIED (retain-but-not-segment = TIE,
+/// 3 oracles). Page-fault REMOVAL is overlapped slack. See same file.
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 fn use_hugepage_hint() -> bool {

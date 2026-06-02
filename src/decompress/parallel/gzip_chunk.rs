@@ -215,6 +215,12 @@ fn use_pure_bulk_path() -> bool {
 /// corpora (silesia/logs/software in gzip/pigz/bgzf flavors +
 /// urandom-100M) at T∈{1,4,16} — 33/33 pass.
 ///
+/// NOTE: the feat/footprint-align SegmentedU8 port (commit 2b8bfae)
+/// REMOVED this A3 prefill and caused T16 +5.5% regression. Re-entry
+/// = "segment-native A3" (prefill segment 0 only). This function is
+/// the exact behavior to replicate in the segmented port. See
+/// docs/dead-ends/footprint-align-segmented.md + docs/open-candidates.md.
+///
 /// **Default ON** as of the cross-corpus validation gate. To disable
 /// for A/B comparison: `GZIPPY_OPTION_A_PREFILL=0`.
 #[cfg(pure_inflate_decode)]
