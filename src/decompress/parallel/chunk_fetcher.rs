@@ -108,6 +108,108 @@ fn materialize_window(w: &Window) -> Cow<'_, [u8]> {
     }
 }
 
+// CAUSAL PROBE (GZIPPY_SLOW_PUBLISH=N percent): the consumer's in-order
+// serial publish region (materialize_window + get_last_window_vec +
+// window_map.insert_owned_none) is the ONLY region measured only by
+// attribution. To decide whether it GATES the T8 wall or is overlapped
+// SLACK, time JUST that region's own work and busy-spin N% of it on the
+// consumer thread, then A/B the interleaved wall off vs on. Byte-identical
+// (pure delay; production semantics unchanged when the var is absent).
+// Mirrors GZIPPY_SLOW_BOOTSTRAP in gzip_chunk.rs but scoped to the
+// consumer publish region, NOT wait_replaced_markers and NOT write/CRC.
+//
+// Frequency-neutral control: GZIPPY_SLOW_PUBLISH_SLEEP=1 yields the core
+// via sleep instead of a busy-spin (a sleeping thread can't depress
+// all-core turbo, so a surviving wall delta is genuine criticality not a
+// spin artifact). On a frozen clock (no_turbo=1) the busy-spin is already
+// frequency-neutral; the sleep is the belt-and-suspenders disproof.
+fn slow_publish_pct() -> Option<u128> {
+    use std::sync::OnceLock;
+    static PCT: OnceLock<Option<u128>> = OnceLock::new();
+    *PCT.get_or_init(|| {
+        std::env::var("GZIPPY_SLOW_PUBLISH")
+            .ok()
+            .and_then(|s| s.parse::<u128>().ok())
+            .filter(|p| *p > 0)
+    })
+}
+
+#[inline]
+fn slow_publish_probe_start() -> Option<std::time::Instant> {
+    slow_publish_pct().map(|_| std::time::Instant::now())
+}
+
+#[inline]
+fn slow_publish_spin(t0: Option<std::time::Instant>) {
+    let (Some(t0), Some(pct)) = (t0, slow_publish_pct()) else {
+        return;
+    };
+    let self_us = (t0.elapsed().as_micros() * pct / 100) as u64;
+    // SPECIFICITY (matched-CPU-elsewhere) control:
+    // GZIPPY_SLOW_PUBLISH_ELSEWHERE=1 burns the SAME total CPU but on the
+    // overlapped worker pool (run_post_process_task) instead of the
+    // in-order consumer. If the consumer-publish injection moves the wall
+    // MORE than the identical CPU spent off-consumer, the effect is
+    // consumer-publish-SPECIFIC, not just "any added CPU slows it".
+    if std::env::var_os("GZIPPY_SLOW_PUBLISH_ELSEWHERE").is_some() {
+        SLOW_PUBLISH_OFFCONSUMER_DEBT_US.fetch_add(self_us, std::sync::atomic::Ordering::Relaxed);
+        SLOW_PUBLISH_INJECTED_US.fetch_add(self_us, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let extra = std::time::Duration::from_micros(self_us);
+    if std::env::var_os("GZIPPY_SLOW_PUBLISH_SLEEP").is_some() {
+        std::thread::sleep(extra);
+    } else {
+        let until = std::time::Instant::now() + extra;
+        while std::time::Instant::now() < until {
+            std::hint::spin_loop();
+        }
+    }
+    // Positive-control accounting: total microseconds spent in the injected
+    // spin, so a counter read proves the knob actually grew the region.
+    SLOW_PUBLISH_INJECTED_US.fetch_add(self_us, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Matched-CPU specificity control: total micros the consumer has queued to
+/// be burned off-consumer (on the worker pool). Workers drain it.
+pub static SLOW_PUBLISH_OFFCONSUMER_DEBT_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Worker-side drain of the off-consumer debt: burn up to `slice_us` of the
+/// queued CPU debt on the calling (worker pool) thread via busy-spin.
+#[inline]
+fn slow_publish_drain_offconsumer() {
+    use std::sync::atomic::Ordering;
+    if std::env::var_os("GZIPPY_SLOW_PUBLISH_ELSEWHERE").is_none() {
+        return;
+    }
+    // Claim a slice of the outstanding debt (CAS loop, take all available).
+    let mut cur = SLOW_PUBLISH_OFFCONSUMER_DEBT_US.load(Ordering::Relaxed);
+    loop {
+        if cur == 0 {
+            return;
+        }
+        match SLOW_PUBLISH_OFFCONSUMER_DEBT_US.compare_exchange_weak(
+            cur,
+            0,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
+        }
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_micros(cur);
+    while std::time::Instant::now() < until {
+        std::hint::spin_loop();
+    }
+}
+
+/// Positive-control counter: cumulative microseconds the GZIPPY_SLOW_PUBLISH
+/// probe injected into the consumer publish region this process.
+pub static SLOW_PUBLISH_INJECTED_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Reverse-lookup map: subchunk encoded-bit offset → cache key of the
 /// parent chunk that produced it. Mirror of vendor's
 /// `m_unsplitBlocks: std::unordered_map<size_t, size_t>` declared at
@@ -155,6 +257,63 @@ pub static UNSPLIT_BLOCKS_EMPLACED: std::sync::atomic::AtomicU64 =
 ///
 /// Not cfg-gated for the same reason as UNSPLIT_BLOCKS_EMPLACED.
 pub static PREFETCH_NEXT_FILESIZE_ACCEPT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// FRONTIER-PLACEMENT ORACLE instrument: count of frontier-successor
+/// chunks dispatched at the boosted priority -1 (GZIPPY_FRONTIER_PREFETCH_ORACLE=1).
+/// Zero when the oracle is OFF; a nonzero value proves the oracle BIT
+/// (the placement change actually fired) — the guard against a no-op
+/// oracle that silently measures the baseline.
+pub static FRONTIER_ORACLE_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// FRONTIER-PLACEMENT ORACLE diagnostic: how many consumer iterations
+/// found the frontier-successor chunk ALREADY in-flight / in-cache when
+/// the consumer reached the current chunk. A high ratio vs total iters
+/// means placement is ALREADY optimal (the frontier was dispatched ahead
+/// of time and is decoding before the consumer needs it) — so the
+/// priority boost has nothing to bite, and any residual wait is the
+/// frontier's OWN decode time (Lever A: rate), not a placement miss.
+pub static FRONTIER_ORACLE_ALREADY_INFLIGHT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static FRONTIER_ORACLE_ITERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+// ── CONSUMER-NULL CEILING ORACLE (GZIPPY_NULL_CONSUMER_WORK=1) ────────────
+//
+// S4 ceiling-by-REMOVAL instrument (protocol step S4 + STANDING METHOD #6).
+// Default OFF = byte-identical production. When ON, the consumer thread's
+// REMOVABLE serial compute is nulled to measure the wall FLOOR if that work
+// were free. CEILING measurement: output is NOT byte-correct when ON.
+//
+// What is nulled (consumer-thread removable compute): the per-chunk output
+// `write_all` (narrowed + data) and the `total_crc.append` CRC-fold in
+// `drain_one_pending`. These are pure consumer-thread serial work, not
+// structurally required for pipeline flow.
+//
+// What is NOT nulled (pipeline-structural — nulling would change the DECODE
+// REGIME, the clean-window-oracle trap): window-publish (per-iter clean +
+// subchunk), marker-resolve wait, rx.recv channel drain. A worker with no
+// published predecessor window does NOT block — it falls to marker-bootstrap
+// (speculative_decode_find_boundary) — so nulling the publish would force
+// every chunk into the slow window-absent regime, an entirely different
+// measurement. The publish stays; this oracle bounds ONLY the removable
+// consumer-thread compute that the 2x2 SLOW_CONSUMER knob perturbed.
+//
+// POSITIVE CONTROL (the discipline past oracles lacked):
+//   - ZERO-EXECUTION WITNESS: CONSUMER_NULL_WORK_SKIPPED bumps on every nulled
+//     region and CONSUMER_WORK_EXECUTED bumps on every real-path execution.
+//     Oracle ON ⇒ EXECUTED ≈ 0, SKIPPED > 0. Oracle OFF ⇒ EXECUTED > 0,
+//     SKIPPED == 0. If EXECUTED is nonzero with the oracle ON, the oracle is
+//     FAKE — discard, do not report a ceiling.
+//   - WORK-CONSERVATION: CONSUMER_NULL_BYTES_SKIPPED accumulates the output
+//     bytes NOT written, proving the write work was actually removed (a
+//     conservation check: bytes_skipped ≈ total decompressed size).
+pub static CONSUMER_NULL_WORK_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static CONSUMER_WORK_EXECUTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static CONSUMER_NULL_BYTES_SKIPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -874,6 +1033,15 @@ fn drive_impl<W: std::io::Write>(
             bs_b_us as f64 / 1000.0,
             bs_b_rate,
         );
+        // GARBAGE-SKIP CEILING ORACLE positive control: how many chunks took
+        // the window-absent skip stand-in and how many bytes it produced.
+        // Non-zero ONLY when GZIPPY_SKIP_WINDOW_ABSENT is set; zero proves the
+        // real bootstrap ran (knob OFF) or the skip silently no-op'd.
+        eprintln!(
+            "  Skip-window-absent ORACLE: chunks_skipped={} bytes_via_skip={}",
+            gc::SKIP_ORACLE_CHUNKS.load(Ordering::Relaxed),
+            gc::SKIP_ORACLE_BYTES.load(Ordering::Relaxed),
+        );
         // Per-fetch rejection cause: a prefetched chunk arrived but the
         // safety guard rejected it (chain invariant broken —
         // chunk.max != next_block_offset).
@@ -886,11 +1054,19 @@ fn drive_impl<W: std::io::Write>(
             ARC_TRY_UNWRAP_HITS.load(Ordering::Relaxed),
             ARC_TRY_UNWRAP_MISSES.load(Ordering::Relaxed),
         );
+        eprintln!(
+            "  SLOW_PUBLISH injected_us (positive-control): {}",
+            SLOW_PUBLISH_INJECTED_US.load(Ordering::Relaxed),
+        );
     }
 
     // Flush all per-thread trace_v2 buffers (consumer thread + any
     // already-joined worker threads).
     trace_v2::flush_all();
+    // memlife: record decoded-byte normalizer + worker count, then dump the
+    // per-buffer attribution JSON (no-op unless GZIPPY_MEMLIFE is set).
+    crate::decompress::parallel::memlife::set_run_totals(total_size, parallelization);
+    crate::decompress::parallel::memlife::dump();
     // DECODE-BYPASS: serialize the capture map (no-op unless capture on).
     crate::decompress::parallel::decode_bypass::flush_capture();
     Ok((total_crc.crc32(), total_size))
@@ -904,6 +1080,34 @@ fn drive_impl<W: std::io::Write>(
 /// (ParallelGzipReader.hpp:702-810). Every per-iteration step is a
 /// vendor primitive — no inline ring, no inline cache logic, no
 /// inline take-from-prefetch.
+#[cfg(parallel_sm)]
+thread_local! {
+    /// GZIPPY_SLOW_CONSUMER=N (percent of this iteration's own time), parsed
+    /// once per thread. See the injection site in `consumer_loop`.
+    static SLOW_CONSUMER_PCT: Option<u128> = std::env::var("GZIPPY_SLOW_CONSUMER")
+        .ok()
+        .and_then(|s| s.parse::<u128>().ok())
+        .filter(|&p| p > 0);
+    /// GZIPPY_SLOW_CONSUMER_US=K — inject a FIXED K microseconds per consumer
+    /// iteration (the ABSOLUTE-ms calibration the standing protocol mandates;
+    /// avoids the fraction-of-smeared-region bias). Takes precedence over the
+    /// percent knob when both are set.
+    static SLOW_CONSUMER_US: Option<u64> = std::env::var("GZIPPY_SLOW_CONSUMER_US")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&p| p > 0);
+    /// GZIPPY_SLOW_CONSUMER_SLEEP=1 → frequency-neutral sleep control.
+    static SLOW_CONSUMER_SLEEP: bool =
+        std::env::var_os("GZIPPY_SLOW_CONSUMER_SLEEP").is_some();
+    /// GZIPPY_NULL_CONSUMER_WORK=1 → CEILING ORACLE: null the consumer
+    /// thread's removable serial compute (output write + CRC-fold) to bound
+    /// the wall floor if consumer-compute were free. Output is NOT
+    /// byte-correct when set. Default OFF = byte-identical production. See the
+    /// CONSUMER-NULL CEILING ORACLE block near the top of this module.
+    static NULL_CONSUMER_WORK: bool =
+        std::env::var_os("GZIPPY_NULL_CONSUMER_WORK").is_some();
+}
+
 #[cfg(parallel_sm)]
 #[allow(clippy::too_many_arguments)]
 fn consumer_loop<W: std::io::Write>(
@@ -938,6 +1142,11 @@ fn consumer_loop<W: std::io::Write>(
     // Default OFF so it's a clean A/B against the in-order baseline.
     let eager_enabled = eager_postproc_enabled();
     let mut eager_submitted: EagerSubmitted = std::collections::HashMap::new();
+
+    // FRONTIER-PLACEMENT ORACLE (GZIPPY_FRONTIER_PREFETCH_ORACLE=1). Read
+    // once; default OFF. When ON, the consumer's immediate-next in-order
+    // chunk is prefetched at priority -1 (ahead of deeper speculation).
+    let frontier_oracle_on = frontier_prefetch_oracle_enabled();
 
     // The vendor's `processNextChunk` returns one chunk per call; the
     // caller loops in `ParallelGzipReader::read`. We inline that loop
@@ -1058,16 +1267,58 @@ fn consumer_loop<W: std::io::Write>(
         // stop_hint_bit equal to `start_bit` for every prefetch past the
         // first one, causing the worker to immediately exit with an
         // empty chunk.
+        // FRONTIER-PLACEMENT ORACLE (GZIPPY_FRONTIER_PREFETCH_ORACLE=1).
+        // The chunk the consumer will block on NEXT (its immediate-next
+        // in-order index) is the FRONTIER successor. Its confirmed offset,
+        // if known, lets `prefetch_submit` recognise that exact prefetch
+        // and dispatch it at priority -1 (ahead of deeper speculation at
+        // priority 0) so a freed worker decodes it first — same work,
+        // scheduled ahead. `None` when the next index isn't confirmed yet
+        // (the prefetch then keeps vendor priority 0; the oracle simply
+        // can't bite that iteration). Default OFF → flag unread, no-op.
+        let frontier_succ_offset: Option<usize> = if frontier_oracle_on {
+            // Inline of the SUCCESS-only `lookup_block_offset` (defined
+            // below) — the confirmed/guessed offset of the consumer's
+            // immediate-next in-order index.
+            let fo = match block_finder.get(next_unprocessed_block_index + 1) {
+                (Some(offset), GetReturnCode::Success) => Some(offset),
+                _ => None,
+            };
+            // DIAGNOSTIC: is the frontier successor ALREADY dispatched
+            // (in cache or in-flight)? If yes, the priority boost cannot
+            // change its completion time — placement is already optimal
+            // and the consumer's wait is the frontier's own decode time.
+            FRONTIER_ORACLE_ITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(o) = fo {
+                let part = block_finder.partition_offset_containing_offset(o);
+                if block_fetcher.test(&o) || block_fetcher.test(&part) {
+                    FRONTIER_ORACLE_ALREADY_INFLIGHT
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            fo
+        } else {
+            None
+        };
         let prefetch_submit = |offset: usize,
                                next_offset: usize|
          -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
             let prefetch_stop_hint_bit = next_offset.max(offset);
+            // ORACLE: the frontier successor decode is dispatched as a
+            // NON-speculative (priority -1) task so it outranks deeper
+            // speculative prefetches in the pool's pick order. PLACEMENT
+            // ONLY — `run_decode_task` does the identical work at the
+            // identical rate; it just gets a worker sooner.
+            let is_frontier_prefetch = frontier_succ_offset.map(|f| f == offset).unwrap_or(false);
             let prefetch_params = DecodeParams {
                 start_bit: offset,
                 stop_hint_bit: prefetch_stop_hint_bit,
-                is_speculative_prefetch: true,
+                is_speculative_prefetch: !is_frontier_prefetch,
                 partition_idx: usize::MAX, // trace marker for "prefetch"
             };
+            if is_frontier_prefetch {
+                FRONTIER_ORACLE_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             submit_decode_to_pool(
                 thread_pool,
                 input,
@@ -1197,6 +1448,9 @@ fn consumer_loop<W: std::io::Write>(
                 // decoded bytes only exist from max onward. Safe reuse
                 // requires the consumer's confirmed start == max (vendor
                 // chain: chunk_N.end == chunk_{N+1}.start at max).
+                // NOTE: the fill-lever (range-accept relaxation) and eager-resolve directions
+                // are DEAD — guard-rejects≈0 + corruption risk + eager 0 ready tasks.
+                // See docs/dead-ends/fill-lever.md and docs/dead-ends/eager-resolve-phantom.md.
                 let handoff_at_decode_start = arc.max_acceptable_start_bit == next_block_offset;
                 // (Design B) The chunk's `encoded_end` — preserved by
                 // `set_encoded_offset` through the accept rewrite, so it
@@ -1396,6 +1650,13 @@ fn consumer_loop<W: std::io::Write>(
                 "consumer.window_publish_clean",
                 &format!(r#""end_bit":{chunk_end_bit},"had_markers":false"#),
             );
+            // CAUSAL PROBE (GZIPPY_SLOW_PUBLISH=N percent): time JUST this
+            // publish region's own work (materialize_window +
+            // get_last_window_vec + insert) and spin N% of it, mirroring the
+            // GZIPPY_SLOW_BOOTSTRAP pattern in gzip_chunk.rs but scoped to the
+            // in-order CONSUMER's serial publish chain. Does NOT include
+            // wait_replaced_markers or the write/CRC. See slow_publish_spin().
+            let _sp_t0 = slow_publish_probe_start();
             if let Some((_pred_key, pred)) = window_map.get_predecessor(chunk.encoded_offset_bits) {
                 let bytes = materialize_window(&pred);
                 let tail = chunk
@@ -1403,6 +1664,7 @@ fn consumer_loop<W: std::io::Write>(
                     .unwrap_or_else(|| chunk.get_last_window_vec(&bytes));
                 window_map.insert_owned_none(chunk_end_bit, tail);
             }
+            slow_publish_spin(_sp_t0);
             predecessor_window_for_postprocess = None;
         } else {
             // Vendor `waitForReplacedMarkers` (GzipChunkFetcher.hpp:478-518)
@@ -1476,12 +1738,15 @@ fn consumer_loop<W: std::io::Write>(
                     actual: furthest_decoded_bit,
                 }))?;
             consumer_pred_key = Some(pred_key);
+            // CAUSAL PROBE (GZIPPY_SLOW_PUBLISH): see clean branch above.
+            let _sp_t0 = slow_publish_probe_start();
             // Vendor `GzipChunkFetcher.hpp:341`: `sharedLastWindow->
             // decompress()` materializes the bytes once. For
             // CompressionType::None this is a zero-alloc slice borrow.
             let window_bytes = materialize_window(&window);
             let tail = chunk.get_last_window_vec(&window_bytes);
             window_map.insert_owned_none(chunk_end_bit, tail);
+            slow_publish_spin(_sp_t0);
             predecessor_window_for_postprocess = Some(window);
         }
 
@@ -1643,8 +1908,37 @@ fn consumer_loop<W: std::io::Write>(
                 },
             )?;
         }
-        iter_us_sum += t_iter.elapsed().as_micros();
+        let iter_us = t_iter.elapsed().as_micros();
+        iter_us_sum += iter_us;
         iter_count += 1;
+        // CAUSAL PROBE (C2 perturbation): slow the in-order CONSUMER serial
+        // chain (block-finder get + in-order drain/apply_window/publish +
+        // write) by either a FIXED K us (GZIPPY_SLOW_CONSUMER_US, the
+        // protocol-mandated absolute-ms calibration) or N% of this iteration's
+        // own measured time (GZIPPY_SLOW_CONSUMER). Byte-identical pure delay on
+        // the consumer thread. Frequency-neutral control via
+        // GZIPPY_SLOW_CONSUMER_SLEEP=1. NOTE (protocol blind-spot #4): this hits
+        // the consumer's BUSY work only — a consumer WAIT (absence of work) is
+        // structurally unperturbable, so this knob may UNDERSTATE consumer
+        // criticality if the consumer is mostly waiting. Off by default.
+        let extra_us: u64 = if let Some(k) = SLOW_CONSUMER_US.with(|c| *c) {
+            k
+        } else if let Some(pct) = SLOW_CONSUMER_PCT.with(|c| *c) {
+            (iter_us * pct / 100) as u64
+        } else {
+            0
+        };
+        if extra_us > 0 {
+            let extra = std::time::Duration::from_micros(extra_us);
+            if SLOW_CONSUMER_SLEEP.with(|s| *s) {
+                std::thread::sleep(extra);
+            } else {
+                let until = std::time::Instant::now() + extra;
+                while std::time::Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+            }
+        }
     }
 
     // Final drain — flush remaining post-processes in encoded order.
@@ -1708,6 +2002,29 @@ fn consumer_loop<W: std::io::Write>(
                  window is published. The lever is prefetch DEPTH, not post-process eagerness."
             );
         }
+    }
+
+    // FRONTIER-PLACEMENT ORACLE report — proof the oracle BIT. A nonzero
+    // dispatch count means the frontier successor was actually boosted to
+    // priority -1 (the placement change fired); 0 means the next index was
+    // never confirmed at prefetch time (oracle was a no-op — do NOT read
+    // its wall as a placement verdict).
+    if frontier_oracle_on {
+        use std::sync::atomic::Ordering;
+        let dispatches = FRONTIER_ORACLE_DISPATCHES.load(Ordering::Relaxed);
+        let iters = FRONTIER_ORACLE_ITERS.load(Ordering::Relaxed);
+        let already = FRONTIER_ORACLE_ALREADY_INFLIGHT.load(Ordering::Relaxed);
+        let pct = if iters > 0 {
+            100.0 * already as f64 / iters as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[gzippy FRONTIER_ORACLE] frontier_priority_dispatches={dispatches} \
+             (nonzero ⇒ oracle BIT: frontier decoded at priority -1) | \
+             frontier_already_inflight={already}/{iters} ({pct:.0}%) \
+             (high ⇒ placement ALREADY optimal; residual wait is decode RATE, Lever A)"
+        );
     }
 
     Ok(())
@@ -2331,6 +2648,10 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
             chunk.data_with_markers.len()
         ),
     );
+    // SPECIFICITY control (GZIPPY_SLOW_PUBLISH_ELSEWHERE): drain any
+    // off-consumer CPU debt the consumer queued, burning it here on the
+    // overlapped worker pool instead of the in-order consumer.
+    slow_publish_drain_offconsumer();
     // Vendor lambda at GzipChunkFetcher.hpp:579-582 — `applyWindow` only.
     // WindowMap writes happen on the consumer (`publish_subchunk_windows`).
     let start_bit = chunk.encoded_offset_bits;
@@ -2365,6 +2686,41 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
     let mut narrowed_buf: Option<crate::decompress::parallel::rpmalloc_alloc::types::U8> = None;
     let t_narrow;
     let narrow_us;
+    // FOOTPRINT CEILING ORACLE cut (1): narrowed-kill. rapidgzip resolves the
+    // u16 dataWithMarkers IN PLACE into its own backing memory (no separate
+    // U8 buffer). gzippy allocates a full second U8 copy (`chunk.narrowed`,
+    // ~124MB resident on silesia T8) co-resident with `data_with_markers`.
+    // For the oracle we still resolve markers in place (so populate sees the
+    // resolved low bytes) but we DO NOT allocate the separate U8 buffer — the
+    // consumer is gated to skip the marker write below. This may break the
+    // output bytes (we measure WALL+IPC+RSS, not sha, with the knob ON).
+    {
+        use crate::decompress::parallel::chunk_buffer_pool;
+        if chunk_buffer_pool::footprint_ceiling() {
+            // Resolve markers in place inside the u16 buffer (apply_window
+            // writes the resolved byte into the low half of each u16 — no
+            // separate U8 allocation). We exercise the resolve CPU + keep the
+            // markers buffer resident, but DO NOT allocate the extra `narrowed`
+            // U8 (~124MB resident on silesia T8). populate_subchunk_windows is
+            // given an empty dwm slice (the windows it would derive from the
+            // narrowed prefix are not needed for the wall/RSS/IPC measurement;
+            // this may corrupt output bytes — the knob is sha-exempt).
+            apply_window(&mut chunk, &bytes);
+            chunk.populate_subchunk_windows(&bytes, &[]);
+            if trace::is_enabled() {
+                let apply_us = t_apply.elapsed().as_micros();
+                trace::emit(
+                    "post_process",
+                    "post_process_span",
+                    &format!(
+                        r#""start_bit":{start_bit},"materialize_us":{materialize_us},"apply_window_us":{apply_us},"populate_subchunk_windows_us":0,"narrow_us":0,"marker_bytes":{marker_bytes},"ceiling":1"#,
+                    ),
+                );
+            }
+            chunk.recycle_markers_after_resolution();
+            return chunk;
+        }
+    }
     if use_fused {
         POST_PROCESS_FUSED_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Fused path. `apply_window` is skipped entirely on this branch:
@@ -2372,19 +2728,40 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
         // downstream reader inspects them after this point — populate
         // takes `dwm_bytes` and the consumer writes `chunk.narrowed`).
         use crate::decompress::parallel::chunk_buffer_pool;
-        let mut narrowed = chunk_buffer_pool::take_u8(dwm_len_pre);
+        use crate::decompress::parallel::memlife::{self, Component};
+        // memlife: the SEPARATE narrowed buffer rapidgzip does NOT allocate
+        // (it resolves in-place). Alloc + write of dwm_len_pre u8, reading
+        // dwm_len_pre u16 (2× width) from data_with_markers + the 32 KiB window.
+        let mut narrowed = chunk_buffer_pool::take_u8_memlife(dwm_len_pre, Component::Narrowed);
+        memlife::read(Component::DataWithMarkers, dwm_len_pre * 2);
+        memlife::written(Component::Narrowed, dwm_len_pre);
         replace_markers_lut_narrow(&chunk.data_with_markers, &bytes, &mut narrowed);
         narrowed_buf = Some(narrowed);
         t_narrow = std::time::Instant::now();
         narrow_us = 0u128;
     } else {
         POST_PROCESS_SMALL_MARKERS_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // memlife: apply_window READS+WRITES data_with_markers in place
+        // (replace_markers resolves each u16 marker against the window). The
+        // 2×-width in-place pass is shared with rapidgzip's marker resolve.
+        {
+            use crate::decompress::parallel::memlife::{self, Component};
+            let n = chunk.data_with_markers.len();
+            memlife::read(Component::DataWithMarkers, n * 2);
+            memlife::written(Component::DataWithMarkers, n * 2);
+        }
         apply_window(&mut chunk, &bytes);
         t_narrow = std::time::Instant::now();
         if !chunk.data_with_markers.is_empty() {
             use crate::decompress::parallel::chunk_buffer_pool;
+            use crate::decompress::parallel::memlife::{self, Component};
             let dwm_len = chunk.data_with_markers.len();
-            let mut narrowed = chunk_buffer_pool::take_u8(dwm_len);
+            // memlife: the SEPARATE narrowed buffer (rapidgzip lacks this —
+            // in-place resolve has no second buffer). Alloc + write dwm_len u8,
+            // read dwm_len u16 (2× width).
+            let mut narrowed = chunk_buffer_pool::take_u8_memlife(dwm_len, Component::Narrowed);
+            memlife::read(Component::DataWithMarkers, dwm_len * 2);
+            memlife::written(Component::Narrowed, dwm_len);
             narrow_u16_to_u8(&chunk.data_with_markers, &mut narrowed);
             narrowed_buf = Some(narrowed);
         }
@@ -2629,6 +3006,14 @@ type EagerSubmitted = std::collections::HashMap<usize, (usize, mpsc::Receiver<Ch
 // apply_window for prefetched SUCCESSOR chunks whose predecessor window
 // is already published, instead of waiting to reach them in order.
 //
+// DEAD-END: GZIPPY_EAGER_POSTPROC = REFUTED. Both variants:
+// (a) consumer-side pump: enqueued 0 tasks (0 ready successors during stalls;
+//     the work is dependency-blocked on the same frontier). +195ms net loss.
+// (b) worker-side variant: EAGER_PROBE_SUBMITTED=0 — structurally inert.
+// See docs/dead-ends/eager-resolve-phantom.md. Left gated (default OFF) as
+// diagnostic instrumentation only. Do not re-enable without a fresh probe
+// confirming ready-work count > 0 during stalls.
+//
 // These counters are the deliverable: a prior pump attempt TIED because
 // it found 0 ready successors. We MUST distinguish "the lever works"
 // (many eager submits) from "the cache is empty during the stall" (the
@@ -2674,6 +3059,37 @@ fn eager_postproc_enabled() -> bool {
         2 => true,
         _ => {
             let on = std::env::var_os("GZIPPY_EAGER_POSTPROC")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// True iff `GZIPPY_FRONTIER_PREFETCH_ORACLE=1`. Read once and cached.
+///
+/// FRONTIER-PLACEMENT ORACLE (rule-3 removal test, NOT production).
+/// When ON, the prefetch driver dispatches the consumer's IMMEDIATE-NEXT
+/// in-order chunk (the FRONTIER successor — the very chunk the consumer
+/// will block on next) at priority -1 instead of the speculative
+/// priority 0, so a freed worker picks the frontier chunk AHEAD of any
+/// deeper speculation. This changes ONLY scheduling PLACEMENT — the same
+/// decode work runs, at the same per-byte rate — moved off the consumer's
+/// critical path (decoded ahead) where workers have slack. If workers are
+/// fully saturated (no slack to absorb the frontier earlier), reordering
+/// cannot change the frontier chunk's completion time and the wall stays
+/// flat ⇒ the gap is per-byte DECODE SPEED (Lever A), not PLACEMENT
+/// (Lever B). Default OFF → production byte-identical (priorities unchanged).
+#[cfg(parallel_sm)]
+fn frontier_prefetch_oracle_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHED: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=off, 2=on
+    match CACHED.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var_os("GZIPPY_FRONTIER_PREFETCH_ORACLE")
                 .map(|v| v == "1")
                 .unwrap_or(false);
             CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
@@ -2987,9 +3403,44 @@ fn drain_one_pending<W: std::io::Write>(
     // `chunk.narrowed_crc`) so the consumer just consumes the result —
     // no second scan of `chunk.narrowed` here.
     let t_crc_write = std::time::Instant::now();
+    // CEILING ORACLE: when GZIPPY_NULL_CONSUMER_WORK=1, null the consumer's
+    // removable serial compute (output write + CRC-fold). total_size still
+    // advances (so the pipeline's size accounting + final verify path stays
+    // structurally identical) but no bytes are written and no CRC is folded.
+    let null_consumer_work = NULL_CONSUMER_WORK.with(|n| *n);
+    if null_consumer_work {
+        use std::sync::atomic::Ordering;
+        CONSUMER_NULL_WORK_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        let skipped_bytes = if !chunk.narrowed.is_empty() {
+            chunk.narrowed.len()
+        } else if !chunk.data_with_markers.is_empty() {
+            chunk.data_with_markers.len()
+        } else {
+            0
+        } + if chunk.data.len() > chunk.data_prefix_len {
+            chunk.data.len() - chunk.data_prefix_len
+        } else {
+            0
+        };
+        CONSUMER_NULL_BYTES_SKIPPED.fetch_add(skipped_bytes as u64, Ordering::Relaxed);
+        *total_size += skipped_bytes;
+        // Skip write + CRC. Coz/throughput marker still fires below.
+        let _ = t_crc_write;
+        crate::coz_probe::progress("chunk_emitted");
+        return Ok(());
+    }
     if !chunk.narrowed.is_empty() {
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.write_narrowed");
+            // memlife: reading narrowed into the writer (load) + the sink copy.
+            crate::decompress::parallel::memlife::read(
+                crate::decompress::parallel::memlife::Component::Narrowed,
+                chunk.narrowed.len(),
+            );
+            crate::decompress::parallel::memlife::written(
+                crate::decompress::parallel::memlife::Component::OutputWrite,
+                chunk.narrowed.len(),
+            );
             writer
                 .write_all(&chunk.narrowed)
                 .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
@@ -3022,6 +3473,15 @@ fn drain_one_pending<W: std::io::Write>(
         let payload = &chunk.data[chunk.data_prefix_len..];
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.write_data");
+            // memlife: reading data into the writer (load) + the sink copy.
+            crate::decompress::parallel::memlife::read(
+                crate::decompress::parallel::memlife::Component::Data,
+                payload.len(),
+            );
+            crate::decompress::parallel::memlife::written(
+                crate::decompress::parallel::memlife::Component::OutputWrite,
+                payload.len(),
+            );
             writer
                 .write_all(payload)
                 .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
@@ -3045,6 +3505,10 @@ fn drain_one_pending<W: std::io::Write>(
     }
     let combine_us = t_combine.elapsed().as_micros();
     let total_us = t_chunk.elapsed().as_micros();
+    // ZERO-EXECUTION WITNESS (positive control): the real write+CRC path ran
+    // for this chunk. Oracle OFF ⇒ this bumps every chunk; oracle ON ⇒ this is
+    // unreachable (the null branch above returned early) so it stays 0.
+    CONSUMER_WORK_EXECUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     if trace::is_enabled() {
         trace::emit(
