@@ -108,6 +108,108 @@ fn materialize_window(w: &Window) -> Cow<'_, [u8]> {
     }
 }
 
+// CAUSAL PROBE (GZIPPY_SLOW_PUBLISH=N percent): the consumer's in-order
+// serial publish region (materialize_window + get_last_window_vec +
+// window_map.insert_owned_none) is the ONLY region measured only by
+// attribution. To decide whether it GATES the T8 wall or is overlapped
+// SLACK, time JUST that region's own work and busy-spin N% of it on the
+// consumer thread, then A/B the interleaved wall off vs on. Byte-identical
+// (pure delay; production semantics unchanged when the var is absent).
+// Mirrors GZIPPY_SLOW_BOOTSTRAP in gzip_chunk.rs but scoped to the
+// consumer publish region, NOT wait_replaced_markers and NOT write/CRC.
+//
+// Frequency-neutral control: GZIPPY_SLOW_PUBLISH_SLEEP=1 yields the core
+// via sleep instead of a busy-spin (a sleeping thread can't depress
+// all-core turbo, so a surviving wall delta is genuine criticality not a
+// spin artifact). On a frozen clock (no_turbo=1) the busy-spin is already
+// frequency-neutral; the sleep is the belt-and-suspenders disproof.
+fn slow_publish_pct() -> Option<u128> {
+    use std::sync::OnceLock;
+    static PCT: OnceLock<Option<u128>> = OnceLock::new();
+    *PCT.get_or_init(|| {
+        std::env::var("GZIPPY_SLOW_PUBLISH")
+            .ok()
+            .and_then(|s| s.parse::<u128>().ok())
+            .filter(|p| *p > 0)
+    })
+}
+
+#[inline]
+fn slow_publish_probe_start() -> Option<std::time::Instant> {
+    slow_publish_pct().map(|_| std::time::Instant::now())
+}
+
+#[inline]
+fn slow_publish_spin(t0: Option<std::time::Instant>) {
+    let (Some(t0), Some(pct)) = (t0, slow_publish_pct()) else {
+        return;
+    };
+    let self_us = (t0.elapsed().as_micros() * pct / 100) as u64;
+    // SPECIFICITY (matched-CPU-elsewhere) control:
+    // GZIPPY_SLOW_PUBLISH_ELSEWHERE=1 burns the SAME total CPU but on the
+    // overlapped worker pool (run_post_process_task) instead of the
+    // in-order consumer. If the consumer-publish injection moves the wall
+    // MORE than the identical CPU spent off-consumer, the effect is
+    // consumer-publish-SPECIFIC, not just "any added CPU slows it".
+    if std::env::var_os("GZIPPY_SLOW_PUBLISH_ELSEWHERE").is_some() {
+        SLOW_PUBLISH_OFFCONSUMER_DEBT_US.fetch_add(self_us, std::sync::atomic::Ordering::Relaxed);
+        SLOW_PUBLISH_INJECTED_US.fetch_add(self_us, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let extra = std::time::Duration::from_micros(self_us);
+    if std::env::var_os("GZIPPY_SLOW_PUBLISH_SLEEP").is_some() {
+        std::thread::sleep(extra);
+    } else {
+        let until = std::time::Instant::now() + extra;
+        while std::time::Instant::now() < until {
+            std::hint::spin_loop();
+        }
+    }
+    // Positive-control accounting: total microseconds spent in the injected
+    // spin, so a counter read proves the knob actually grew the region.
+    SLOW_PUBLISH_INJECTED_US.fetch_add(self_us, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Matched-CPU specificity control: total micros the consumer has queued to
+/// be burned off-consumer (on the worker pool). Workers drain it.
+pub static SLOW_PUBLISH_OFFCONSUMER_DEBT_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Worker-side drain of the off-consumer debt: burn up to `slice_us` of the
+/// queued CPU debt on the calling (worker pool) thread via busy-spin.
+#[inline]
+fn slow_publish_drain_offconsumer() {
+    use std::sync::atomic::Ordering;
+    if std::env::var_os("GZIPPY_SLOW_PUBLISH_ELSEWHERE").is_none() {
+        return;
+    }
+    // Claim a slice of the outstanding debt (CAS loop, take all available).
+    let mut cur = SLOW_PUBLISH_OFFCONSUMER_DEBT_US.load(Ordering::Relaxed);
+    loop {
+        if cur == 0 {
+            return;
+        }
+        match SLOW_PUBLISH_OFFCONSUMER_DEBT_US.compare_exchange_weak(
+            cur,
+            0,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
+        }
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_micros(cur);
+    while std::time::Instant::now() < until {
+        std::hint::spin_loop();
+    }
+}
+
+/// Positive-control counter: cumulative microseconds the GZIPPY_SLOW_PUBLISH
+/// probe injected into the consumer publish region this process.
+pub static SLOW_PUBLISH_INJECTED_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Reverse-lookup map: subchunk encoded-bit offset → cache key of the
 /// parent chunk that produced it. Mirror of vendor's
 /// `m_unsplitBlocks: std::unordered_map<size_t, size_t>` declared at
@@ -886,6 +988,10 @@ fn drive_impl<W: std::io::Write>(
             ARC_TRY_UNWRAP_HITS.load(Ordering::Relaxed),
             ARC_TRY_UNWRAP_MISSES.load(Ordering::Relaxed),
         );
+        eprintln!(
+            "  SLOW_PUBLISH injected_us (positive-control): {}",
+            SLOW_PUBLISH_INJECTED_US.load(Ordering::Relaxed),
+        );
     }
 
     // Flush all per-thread trace_v2 buffers (consumer thread + any
@@ -1396,6 +1502,13 @@ fn consumer_loop<W: std::io::Write>(
                 "consumer.window_publish_clean",
                 &format!(r#""end_bit":{chunk_end_bit},"had_markers":false"#),
             );
+            // CAUSAL PROBE (GZIPPY_SLOW_PUBLISH=N percent): time JUST this
+            // publish region's own work (materialize_window +
+            // get_last_window_vec + insert) and spin N% of it, mirroring the
+            // GZIPPY_SLOW_BOOTSTRAP pattern in gzip_chunk.rs but scoped to the
+            // in-order CONSUMER's serial publish chain. Does NOT include
+            // wait_replaced_markers or the write/CRC. See slow_publish_spin().
+            let _sp_t0 = slow_publish_probe_start();
             if let Some((_pred_key, pred)) = window_map.get_predecessor(chunk.encoded_offset_bits) {
                 let bytes = materialize_window(&pred);
                 let tail = chunk
@@ -1403,6 +1516,7 @@ fn consumer_loop<W: std::io::Write>(
                     .unwrap_or_else(|| chunk.get_last_window_vec(&bytes));
                 window_map.insert_owned_none(chunk_end_bit, tail);
             }
+            slow_publish_spin(_sp_t0);
             predecessor_window_for_postprocess = None;
         } else {
             // Vendor `waitForReplacedMarkers` (GzipChunkFetcher.hpp:478-518)
@@ -1476,12 +1590,15 @@ fn consumer_loop<W: std::io::Write>(
                     actual: furthest_decoded_bit,
                 }))?;
             consumer_pred_key = Some(pred_key);
+            // CAUSAL PROBE (GZIPPY_SLOW_PUBLISH): see clean branch above.
+            let _sp_t0 = slow_publish_probe_start();
             // Vendor `GzipChunkFetcher.hpp:341`: `sharedLastWindow->
             // decompress()` materializes the bytes once. For
             // CompressionType::None this is a zero-alloc slice borrow.
             let window_bytes = materialize_window(&window);
             let tail = chunk.get_last_window_vec(&window_bytes);
             window_map.insert_owned_none(chunk_end_bit, tail);
+            slow_publish_spin(_sp_t0);
             predecessor_window_for_postprocess = Some(window);
         }
 
@@ -2331,6 +2448,10 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
             chunk.data_with_markers.len()
         ),
     );
+    // SPECIFICITY control (GZIPPY_SLOW_PUBLISH_ELSEWHERE): drain any
+    // off-consumer CPU debt the consumer queued, burning it here on the
+    // overlapped worker pool instead of the in-order consumer.
+    slow_publish_drain_offconsumer();
     // Vendor lambda at GzipChunkFetcher.hpp:579-582 — `applyWindow` only.
     // WindowMap writes happen on the consumer (`publish_subchunk_windows`).
     let start_bit = chunk.encoded_offset_bits;
