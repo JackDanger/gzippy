@@ -870,6 +870,7 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     // u16) — without it, decoding into a 0-cap buffer reallocates repeatedly and
     // is ~5% SLOWER than the old warm-pool-then-copy (measured, frozen box).
     chunk.data_with_markers.reserve(128 * 1024);
+    let dwm_len_before = chunk.data_with_markers.len();
     let bootstrap = {
         let _coz = crate::coz_probe::scope("marker_bootstrap");
         bootstrap_with_deflate_block(
@@ -879,6 +880,21 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
             &mut chunk.data_with_markers,
         )
     }?;
+    // memlife: the marker bootstrap decoded DIRECTLY into the chunk's pooled
+    // U16 `data_with_markers` (zero-copy merge — no append_markered copy). The
+    // bytes written = (post - pre) u16 elements × 2; the backing alloc is the
+    // chunk's pooled rpmalloc U16 (huge when it grows past the span threshold).
+    {
+        use crate::decompress::parallel::memlife::{self, AllocPath, Component};
+        let added = chunk.data_with_markers.len() - dwm_len_before;
+        memlife::written(Component::DataWithMarkers, added * 2);
+        // data_with_markers is a STD (glibc) Vec<u16> — it does NOT route
+        // through rpmalloc, so it is invisible to the allocator_total tap. We
+        // record its backing growth here as a glibc alloc so the closure check
+        // accounts for it as the off-rpmalloc component it is.
+        let cap_bytes = chunk.data_with_markers.capacity() * 2;
+        memlife::alloc(Component::DataWithMarkers, cap_bytes, AllocPath::Glibc);
+    }
     let bootstrap_dur_us = t_bootstrap.elapsed().as_micros();
     // CAUSAL PROBE (GZIPPY_SLOW_BOOTSTRAP=N percent): coz is unavailable in this
     // container (perf-event sampling restricted), so measure the bootstrap's

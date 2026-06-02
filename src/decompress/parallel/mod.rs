@@ -45,6 +45,8 @@ pub mod isal_huffman;
 pub mod isal_huffman_pure;
 #[cfg(parallel_sm)]
 pub mod isal_lut_bulk;
+#[cfg(parallel_sm)]
+pub mod memlife;
 pub mod prefetcher;
 #[cfg(parallel_sm)]
 pub mod raw_block_finder;
