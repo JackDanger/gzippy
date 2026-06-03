@@ -200,6 +200,19 @@ pub fn decode_block(
                 return Err(BulkDecodeError::InvalidHuffmanCode);
             }
 
+            // Hide match-source load latency (resumable.rs / libdeflate mirror).
+            #[cfg(target_arch = "x86_64")]
+            {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                let prefetch_at = out_pos.saturating_sub(32);
+                if prefetch_at < output.len() {
+                    // SAFETY: `prefetch_at` is in-bounds; hint only.
+                    unsafe {
+                        _mm_prefetch(output.as_ptr().add(prefetch_at) as *const i8, _MM_HINT_T0);
+                    }
+                }
+            }
+
             use crate::decompress::parallel::huffman_base::LsbBitReader as _;
             let dist_sym = scratch
                 .dist

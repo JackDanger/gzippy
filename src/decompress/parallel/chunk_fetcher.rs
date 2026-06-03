@@ -1366,18 +1366,24 @@ fn consumer_loop<W: std::io::Write>(
             }
         };
         // Take ownership when we hold the only Arc; otherwise clone the
-        // inner ChunkData. Mirror of rapidgzip's shared_ptr aliasing at
-        // GzipChunkFetcher.hpp:329.
-        let mut chunk: ChunkData = {
+        // inner ChunkData unless resolve-ahead already submitted post-process
+        // (borrow the `Arc` through window publish, `recv` at dispatch).
+        let chunk_holder = {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.arc_take_or_clone");
             match Arc::try_unwrap(chunk_arc) {
                 Ok(c) => {
                     ARC_TRY_UNWRAP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    c
+                    ConsumerChunkHold::Owned(c)
                 }
-                Err(a) => {
-                    ARC_TRY_UNWRAP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    (*a).clone()
+                Err(arc) => {
+                    let real_offset = arc.encoded_offset_bits;
+                    if prefetch_post_inflight.contains_key(&real_offset) {
+                        ARC_DEFERRED_BORROW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        ConsumerChunkHold::Deferred { arc }
+                    } else {
+                        ARC_TRY_UNWRAP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        ConsumerChunkHold::Owned((*arc).clone())
+                    }
                 }
             }
         };
@@ -1385,7 +1391,8 @@ fn consumer_loop<W: std::io::Write>(
         // Real offset the eager probe would have keyed this chunk under
         // (its `encoded_offset_bits` BEFORE set_encoded_offset rewrites
         // it). Used to reuse an eager-submitted post-process below.
-        let chunk_offset_pre_set = chunk.encoded_offset_bits;
+        let chunk_offset_pre_set = chunk_holder.encoded_offset_bits();
+        let chunk = chunk_holder.as_ref();
 
         // Vendor GzipChunkFetcher.hpp:334-349 — `get(*nextBlockOffset)` then
         // `postProcessChunk`, then `setEncodedOffset(*nextBlockOffset)`.
@@ -1631,7 +1638,17 @@ fn consumer_loop<W: std::io::Write>(
         // queue as immediately-ready for ordered write.
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.dispatch_post_process");
+            let (chunk, eager_already_done) =
+                chunk_holder.into_chunk_data(&mut prefetch_post_inflight, consumer_pred_key);
             match predecessor_window_for_postprocess {
+                Some(window) if eager_already_done => {
+                    pending.push_back(PendingWrite::Ready {
+                        idx: partition_idx_for_trace,
+                        chunk,
+                        cache_key: next_block_offset,
+                        handoff_bit,
+                    });
+                }
                 Some(window) => {
                     use std::sync::atomic::Ordering;
                     let reuse = match prefetch_post_inflight.remove(&chunk_offset_pre_set) {
@@ -2808,6 +2825,11 @@ pub static POST_PROCESS_SMALL_MARKERS_PATH: std::sync::atomic::AtomicU64 =
 pub static ARC_TRY_UNWRAP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ARC_TRY_UNWRAP_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// `try_unwrap` missed but resolve-ahead is in flight — borrowed `Arc` through publish.
+pub static ARC_DEFERRED_BORROW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Deferred borrow finished via in-flight post-process `recv` at dispatch.
+pub static ARC_DEFERRED_INFLIGHT_RECV: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Eager post-process bookkeeping: maps a prefetched chunk's real
 /// `encoded_offset_bits` (partition-seed key, stable across the consumer's
@@ -2817,6 +2839,71 @@ pub static ARC_TRY_UNWRAP_MISSES: std::sync::atomic::AtomicU64 =
 /// key still matches (byte-identity guard).
 #[cfg(parallel_sm)]
 type EagerSubmitted = std::collections::HashMap<usize, (usize, mpsc::Receiver<ChunkData>)>;
+
+/// Consumer chunk ownership across window publish vs post-process dispatch.
+#[cfg(parallel_sm)]
+enum ConsumerChunkHold {
+    Owned(ChunkData),
+    /// Resolve-ahead holds another `Arc` ref; borrow for publish, `recv` at dispatch.
+    Deferred {
+        arc: Arc<ChunkData>,
+    },
+}
+
+#[cfg(parallel_sm)]
+impl ConsumerChunkHold {
+    fn as_ref(&self) -> &ChunkData {
+        match self {
+            Self::Owned(c) => c,
+            Self::Deferred { arc } => arc.as_ref(),
+        }
+    }
+
+    fn encoded_offset_bits(&self) -> usize {
+        self.as_ref().encoded_offset_bits
+    }
+
+    /// Returns `(chunk, already_postprocessed)` — when true, dispatch must not
+    /// re-submit or re-`remove` from `prefetch_post_inflight`.
+    fn into_chunk_data(
+        self,
+        inflight: &mut EagerSubmitted,
+        pred_key: Option<usize>,
+    ) -> (ChunkData, bool) {
+        match self {
+            Self::Owned(c) => (c, false),
+            Self::Deferred { arc } => {
+                let real_offset = arc.encoded_offset_bits;
+                match inflight.remove(&real_offset) {
+                    Some((eager_pred_key, rx)) if pred_key == Some(eager_pred_key) => {
+                        ARC_DEFERRED_INFLIGHT_RECV
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        EAGER_PROBE_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let chunk = rx.recv().unwrap_or_else(|_| {
+                            ARC_TRY_UNWRAP_MISSES
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            (*arc).clone()
+                        });
+                        (chunk, true)
+                    }
+                    Some((eager_pred_key, rx)) => {
+                        EAGER_PROBE_REUSE_PRED_MISMATCH
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        inflight.insert(real_offset, (eager_pred_key, rx));
+                        ARC_TRY_UNWRAP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        ((*arc).clone(), false)
+                    }
+                    None => {
+                        EAGER_PROBE_REUSE_KEY_ABSENT
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        ARC_TRY_UNWRAP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        ((*arc).clone(), false)
+                    }
+                }
+            }
+        }
+    }
+}
 
 // ── Eager post-process probe (GZIPPY_EAGER_POSTPROC=1) ────────────────────
 // Port of rapidgzip's `queuePrefetchedChunkPostProcessing`
