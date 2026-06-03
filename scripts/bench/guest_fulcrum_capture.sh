@@ -41,8 +41,8 @@ git config --global --add safe.directory "$REPO" 2>/dev/null || true
 git fetch origin "$BRANCH" >>"$ARTDIR/fetch.log" 2>&1 || true
 git checkout -f -B "$BRANCH" "origin/$BRANCH" >>"$ARTDIR/fetch.log" 2>&1
 git reset --hard "origin/$BRANCH" >>"$ARTDIR/fetch.log" 2>&1
-# Drop stray untracked files in the repo root (e.g. copied bench scripts, orphan target/).
-git clean -fd -- benchmark_data vendor target guest_ceiling_bench.sh 2>/dev/null || git clean -fd 2>/dev/null || true
+# Drop stray untracked files (copied scripts, orphan target/) but keep vendor + corpus.
+git clean -fd -e vendor -e benchmark_data >>"$ARTDIR/fetch.log" 2>&1 || true
 
 DIRTY_COUNT="$(git status --porcelain --ignore-submodules=dirty 2>/dev/null | wc -l | tr -d ' ')"
 if [ "$DIRTY_COUNT" != "0" ]; then
