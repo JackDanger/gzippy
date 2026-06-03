@@ -1204,14 +1204,23 @@ fn consumer_loop<W: std::io::Write>(
                 // decoded bytes only exist from max onward. Safe reuse
                 // requires the consumer's confirmed start == max (vendor
                 // chain: chunk_N.end == chunk_{N+1}.start at max).
-                let handoff_at_decode_start = arc.max_acceptable_start_bit == next_block_offset;
+                //
+                // Compare against `decode_start`, NOT `next_block_offset`:
+                // when a spacing guess overshoots `furthest_decoded_bit`,
+                // the consumer resumes at `furthest` while the block
+                // finder still reports the partition guess. A partition
+                // prefetch whose search landed on `furthest` has
+                // `max == furthest == decode_start` but `max != next_block_offset`
+                // — accepting on `next_block_offset` threw away valid work
+                // and forced an on-demand re-decode (refreshed-plan §1.4).
+                let handoff_at_decode_start = arc.max_acceptable_start_bit == decode_start;
                 // (Design B) The chunk's `encoded_end` — preserved by
                 // `set_encoded_offset` through the accept rewrite, so it
                 // equals both the consumer's post-accept `chunk_end_bit`
                 // AND the worker's speculative side-slot key. Used to
                 // promote (accept) / evict (reject) the speculative window.
                 let spec_key = arc.encoded_offset_bits + arc.encoded_size_bits;
-                if arc.matches_encoded_offset(next_block_offset) && handoff_at_decode_start {
+                if arc.matches_encoded_offset(decode_start) && handoff_at_decode_start {
                     chunk_arc_from_partition = Some(arc.clone());
                     // ACCEPT: confirmed_start == max == decode_origin, so
                     // the worker's speculative key == this chunk's
@@ -1229,7 +1238,7 @@ fn consumer_loop<W: std::io::Write>(
                             "consumer",
                             "speculative_accept",
                             &format!(
-                                r#""partition_idx":{partition_idx_for_trace},"expected_start":{next_block_offset},"speculative_start":{},"encoded_offset":{},"max_acceptable":{}"#,
+                                r#""partition_idx":{partition_idx_for_trace},"decode_start":{decode_start},"spacing_guess":{next_block_offset},"speculative_start":{},"encoded_offset":{},"max_acceptable":{}"#,
                                 arc.encoded_offset_bits,
                                 arc.encoded_offset_bits,
                                 arc.max_acceptable_start_bit,
@@ -1260,7 +1269,7 @@ fn consumer_loop<W: std::io::Write>(
                             "consumer",
                             "speculative_mismatch",
                             &format!(
-                                r#""partition_idx":{partition_idx_for_trace},"expected_start":{next_block_offset},"speculative_start":{},"encoded_offset":{},"max_acceptable":{}"#,
+                                r#""partition_idx":{partition_idx_for_trace},"decode_start":{decode_start},"spacing_guess":{next_block_offset},"speculative_start":{},"encoded_offset":{},"max_acceptable":{}"#,
                                 arc.encoded_offset_bits,
                                 arc.encoded_offset_bits,
                                 arc.max_acceptable_start_bit,
