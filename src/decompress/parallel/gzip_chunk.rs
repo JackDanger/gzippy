@@ -269,6 +269,15 @@ fn finish_decode_chunk_bulk_lut(
         return BulkCleanTailResult::Decline;
     }
 
+    // Bulk LUT has no resumable window ring — only run when A3 prefill or at
+    // least 32 KiB of decoded output supplies the DEFLATE lookback window.
+    let a3_ready = use_option_a_prefill_path()
+        && initial_window.len() == 32 * 1024
+        && chunk.data.all_in_first_segment();
+    if !a3_ready && initial_window.len() < 32 * 1024 && chunk.data.len() < 32 * 1024 {
+        return BulkCleanTailResult::Decline;
+    }
+
     let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
         "worker.stream_inflate",
         &format!(
@@ -277,6 +286,8 @@ fn finish_decode_chunk_bulk_lut(
         ),
     );
 
+    let bulk_entry_len = chunk.data.len();
+    let bulk_entry_subchunks = chunk.subchunks.len();
     let mut bits = Bits::at_bit_offset(input, inflate_start_bit);
     let mut scratch = DecoderScratch::new();
     let mut pred_buf = [0u8; 32 * 1024];
@@ -311,7 +322,15 @@ fn finish_decode_chunk_bulk_lut(
                     let out_buf = chunk.data.first_segment_a3_output();
                     match decode_block(&mut bits, out_buf, &mut local_pos, &[], &mut scratch) {
                         Ok(r) => r,
-                        Err(_) => return BulkCleanTailResult::Decline,
+                        Err(_) => {
+                            chunk.data.truncate(bulk_entry_len);
+                            chunk.subchunks.truncate(bulk_entry_subchunks);
+                            if let Some(last) = chunk.subchunks.last_mut() {
+                                last.decoded_size =
+                                    bulk_entry_len.saturating_sub(last.decoded_offset);
+                            }
+                            return BulkCleanTailResult::Decline;
+                        }
                     }
                 };
                 last_end_bit = bits.bit_position();
@@ -376,7 +395,14 @@ fn finish_decode_chunk_bulk_lut(
                 let seg_tail = chunk.data.writable_tail();
                 match decode_block(&mut bits, seg_tail, &mut local_pos, pred, &mut scratch) {
                     Ok(r) => r,
-                    Err(_) => return BulkCleanTailResult::Decline,
+                    Err(_) => {
+                        chunk.data.truncate(bulk_entry_len);
+                        chunk.subchunks.truncate(bulk_entry_subchunks);
+                        if let Some(last) = chunk.subchunks.last_mut() {
+                            last.decoded_size = bulk_entry_len.saturating_sub(last.decoded_offset);
+                        }
+                        return BulkCleanTailResult::Decline;
+                    }
                 }
             };
             last_end_bit = bits.bit_position();
