@@ -1386,6 +1386,16 @@ fn consumer_loop<W: std::io::Write>(
             chunk.set_encoded_offset(effective_start);
         }
 
+        // Resolve-ahead only after the consumer re-anchor (vendor resolves at
+        // `*nextBlockOffset` after `setEncodedOffset`, not at partition seed).
+        if !chunk.data_with_markers.is_empty()
+            && !chunk.markers_resolved
+            && window_map.contains(chunk.encoded_offset_bits)
+            && chunk_may_resolve_markers_early(&chunk)
+        {
+            let _ = try_worker_resolve_ahead(&mut chunk, window_map);
+        }
+
         // Vendor GzipChunkFetcher.hpp:350-355 — EOF mid-decode
         // (`encodedSizeInBits == 0`).
         if chunk.encoded_size_bits == 0 {
@@ -2366,16 +2376,6 @@ fn run_decode_task(
         );
     }
 
-    let chunk_result = match chunk_result {
-        Ok(mut chunk) => {
-            if chunk_may_resolve_markers_early(&chunk) {
-                let _ = try_worker_resolve_ahead(&mut chunk, window_map);
-            }
-            Ok(chunk)
-        }
-        Err(e) => Err(e),
-    };
-
     if let Ok(ref chunk) = chunk_result {
         if chunk.max_acceptable_start_bit == chunk.encoded_offset_bits
             && chunk.encoded_size_bits > 0
@@ -2532,6 +2532,16 @@ fn chunk_may_resolve_markers_early(chunk: &ChunkData) -> bool {
         && chunk.max_acceptable_start_bit == chunk.decode_origin_bit
 }
 
+/// Re-anchor speculative prefetch chunks to the confirmed handoff bit
+/// before `apply_window` (consumer has already done this via
+/// `set_encoded_offset`; prefetch-cache clones still carry the seed).
+#[cfg(parallel_sm)]
+fn reanchor_chunk_to_handoff(chunk: &mut ChunkData, handoff_bit: usize) {
+    if chunk.encoded_offset_bits != handoff_bit && chunk.matches_encoded_offset(handoff_bit) {
+        chunk.set_encoded_offset(handoff_bit);
+    }
+}
+
 /// Worker-side resolve-ahead (Design D): when decode finishes with markers and
 /// the predecessor window is confirmed at `max_acceptable_start_bit`, run
 /// `apply_window` on the decode worker and publish the tail before the consumer
@@ -2542,18 +2552,21 @@ fn try_worker_resolve_ahead(chunk: &mut ChunkData, window_map: &WindowMap) -> bo
     if !chunk_may_resolve_markers_early(chunk) {
         return false;
     }
-    let resolve_offset = chunk.max_acceptable_start_bit;
+    let handoff = chunk.encoded_offset_bits;
+    if handoff != chunk.max_acceptable_start_bit {
+        return false;
+    }
     RESOLVE_AHEAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-    let Some((_, pred_w)) = confirmed_predecessor_window(window_map, resolve_offset) else {
+    let Some((_, pred_w)) = confirmed_predecessor_window(window_map, handoff) else {
         return false;
     };
     let _tv2 = trace_v2::SpanGuard::begin_with(
         "worker.resolve_ahead",
         &format!(
-            r#""start_bit":{},"marker_bytes":{},"resolve_offset":{}"#,
+            r#""start_bit":{},"marker_bytes":{},"handoff":{}"#,
             chunk.encoded_offset_bits,
             chunk.data_with_markers.len(),
-            resolve_offset,
+            handoff,
         ),
     );
     let bytes = materialize_window(&pred_w);
@@ -2604,6 +2617,7 @@ fn resolve_ahead_prefetch_at_handoff(
             continue;
         }
         let mut chunk = (*arc).clone();
+        reanchor_chunk_to_handoff(&mut chunk, handoff_key);
         if try_worker_resolve_ahead(&mut chunk, window_map) {
             let next_handoff = chunk.encoded_offset_bits + chunk.encoded_size_bits;
             block_fetcher.insert_prefetched(cache_key, Arc::new(chunk));
