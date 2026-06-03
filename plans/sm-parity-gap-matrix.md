@@ -39,14 +39,9 @@
 
 **Vendor:** `queuePrefetchedChunkPostProcessing` — when predecessor window is confirmed, `applyWindow` runs on the **thread pool**, not the consumer stall.
 
-**gzippy (2026-06-03+):** resolve-ahead is **always on** (vendor `queuePrefetchedChunkPostProcessing`, no env knob). Handoff chunks (`max == decode_origin`) eligible. Window lookup uses `WindowMap::get(handoff_key)` only when `contains(handoff_key)` — not `get_predecessor` at the same key (stale tail hazard).
+**gzippy (2026-06-03+):** resolve-ahead scaffolding (no `GZIPPY_RESOLVE_AHEAD` knob): exact `WindowMap::get(handoff)`, consumer `set_encoded_offset` clears stale `markers_resolved`, prefetch clones `reanchor_chunk_to_handoff`. **`try_worker_resolve_ahead` body gated off** (`4972a81`) until worker resolve + consumer tail publish are byte-identical to pool `run_post_process_task` on silesia-large — skipping the pool path with `markers_resolved` corrupted CRC.
 
-- Trigger: `try_worker_resolve_ahead` on decode return + `resolve_ahead_prefetch_at_handoff` after confirmed tail publish.
-- Gate: `chunk_may_resolve_markers_early`, `contains(max_acceptable_start_bit)`, markers present.
-- Runs `resolve_chunk_markers_on_chunk` + tail publish; sets `chunk.markers_resolved`.
-- Consumer skips marker wait/post-process when `markers_resolved`.
-
-**Ship-gate:** Locked Fulcrum N≥9; `RESOLVE_AHEAD_OK` > 0; **0 sha diverge**; wall ↓ > spread.
+**Ship-gate:** Locked Fulcrum N≥9; **0 sha diverge** (restores ~770 ms T8 baseline); re-enable body only after CRC gate + `RESOLVE_AHEAD_OK` > 0 with wall win.
 
 **Disproof:** Wall flat, only worker busy ↑ → decode-bound, not resolve-bound.
 
