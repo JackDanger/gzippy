@@ -1,8 +1,8 @@
 //! Parallel single-member gzip decompression — rapidgzip-shaped port.
 //!
-//! Production path on x86_64 + ISA-L when the classifier returns
-//! [`crate::decompress::DecodePath::IsalParallelSM`] (num_threads > 1
-//! and compressed size > `MIN_PARALLEL_COMPRESSED`). Routing lives in
+//! Production path on x86_64/arm64 with `pure-rust-inflate` when the classifier
+//! returns [`crate::decompress::DecodePath::IsalParallelSM`] (parallel SM
+//! enabled and compressed size > `MIN_PARALLEL_COMPRESSED`). Routing lives in
 //! [`crate::decompress::classify_gzip`]; this module never makes its
 //! own routing decisions — every error variant is terminal.
 //!

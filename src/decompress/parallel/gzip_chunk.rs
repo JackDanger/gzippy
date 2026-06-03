@@ -195,6 +195,255 @@ fn use_option_a_prefill_path() -> bool {
     })
 }
 
+/// Stateless ISA-L-LUT bulk decode for the clean tail (`isal_lut_bulk`).
+/// Default ON on pure-rust builds; disable with `GZIPPY_ISAL_PURE_BULK=0`.
+#[cfg(pure_inflate_decode)]
+fn use_isal_pure_bulk_tail() -> bool {
+    use std::sync::OnceLock;
+    static USE_BULK: OnceLock<bool> = OnceLock::new();
+    *USE_BULK.get_or_init(|| match std::env::var("GZIPPY_ISAL_PURE_BULK") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false") => {
+            false
+        }
+        _ => true,
+    })
+}
+
+#[cfg(pure_inflate_decode)]
+enum BulkCleanTailResult {
+    /// Entire clean tail decoded; caller should `finalize(final_bit)`.
+    Complete { final_bit: usize },
+    /// First segment filled or declined mid-stream; resume with `IsalInflateWrapper`.
+    Handoff {
+        start_bit: usize,
+        last_eob_pos: usize,
+        last_eob_decoded_bytes: usize,
+        pending_stop_after_flush: bool,
+    },
+    /// Use the existing resumable wrapper path for this call.
+    Decline,
+}
+
+/// Last ≤32 KiB of the logical decode stream before `chunk.data.len()`.
+/// With A3 prefill the window image is already in `chunk.data[0..]`;
+/// without A3, bytes from `initial_window` precede committed chunk bytes.
+#[cfg(pure_inflate_decode)]
+fn bulk_predecessor_window(
+    chunk: &ChunkData,
+    initial_window: &[u8],
+    out: &mut [u8; 32 * 1024],
+) -> usize {
+    const W: usize = 32 * 1024;
+    let n = chunk.data.len();
+    if n >= W {
+        chunk.data.copy_last_into(out);
+        return W;
+    }
+    let need_iw = W.saturating_sub(n).min(initial_window.len());
+    let iw_off = initial_window.len().saturating_sub(need_iw);
+    if need_iw > 0 {
+        out[..need_iw].copy_from_slice(&initial_window[iw_off..iw_off + need_iw]);
+    }
+    if n > 0 {
+        chunk
+            .data
+            .copy_range_into(0, &mut out[need_iw..need_iw + n]);
+    }
+    need_iw + n
+}
+
+/// Rapidgzip-shaped clean tail via [`crate::decompress::parallel::isal_lut_bulk`]
+/// (stateless ISA-L-LUT block loop — no resumable yield tax).
+#[cfg(pure_inflate_decode)]
+fn finish_decode_chunk_bulk_lut(
+    chunk: &mut ChunkData,
+    input: &[u8],
+    inflate_start_bit: usize,
+    stop_hint_bits: usize,
+    initial_window: &[u8],
+) -> BulkCleanTailResult {
+    use crate::decompress::inflate::consume_first_decode::Bits;
+    use crate::decompress::parallel::isal_lut_bulk::{decode_block, DecoderScratch};
+
+    if !use_isal_pure_bulk_tail() {
+        return BulkCleanTailResult::Decline;
+    }
+
+    let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
+        "worker.stream_inflate",
+        &format!(
+            r#""start_bit":{inflate_start_bit},"stop_hint":{stop_hint_bits},"has_window":{},"bulk_lut":true"#,
+            !initial_window.is_empty() || chunk.data.len() >= 32 * 1024
+        ),
+    );
+
+    let mut bits = Bits::at_bit_offset(input, inflate_start_bit);
+    let mut scratch = DecoderScratch::new();
+    let mut pred_buf = [0u8; 32 * 1024];
+
+    let mut last_end_bit = inflate_start_bit;
+    let mut last_eob_pos = inflate_start_bit;
+    let mut last_eob_decoded_bytes = chunk.data.len();
+    let mut pending_stop_after_flush = false;
+    let mut stopping_point_reached = false;
+    let mut reached_stream_end = false;
+
+    let a3_contiguous = use_option_a_prefill_path()
+        && initial_window.len() == 32 * 1024
+        && chunk.data.all_in_first_segment();
+
+    while !stopping_point_reached {
+        let decode_base = chunk.data.len();
+
+        if a3_contiguous && chunk.data.all_in_first_segment() {
+            let cap = chunk.data.first_segment_a3_output().len();
+            let mut local_pos = decode_base;
+            if local_pos >= cap {
+                return BulkCleanTailResult::Handoff {
+                    start_bit: bits.bit_position(),
+                    last_eob_pos,
+                    last_eob_decoded_bytes,
+                    pending_stop_after_flush,
+                };
+            }
+            while local_pos < cap && !stopping_point_reached {
+                let block_result = {
+                    let out_buf = chunk.data.first_segment_a3_output();
+                    match decode_block(&mut bits, out_buf, &mut local_pos, &[], &mut scratch) {
+                        Ok(r) => r,
+                        Err(_) => return BulkCleanTailResult::Decline,
+                    }
+                };
+                last_end_bit = bits.bit_position();
+                if !block_result.is_final_block {
+                    chunk.append_block_boundary_at(last_end_bit, local_pos);
+                    last_eob_pos = last_end_bit;
+                    last_eob_decoded_bytes = local_pos;
+                }
+                if block_result.is_final_block {
+                    stopping_point_reached = true;
+                    reached_stream_end = true;
+                    break;
+                }
+                if last_end_bit >= stop_hint_bits {
+                    pending_stop_after_flush = true;
+                    stopping_point_reached = true;
+                    break;
+                }
+            }
+            let append_len = if pending_stop_after_flush {
+                last_eob_decoded_bytes.saturating_sub(decode_base)
+            } else {
+                local_pos.saturating_sub(decode_base)
+            };
+            if append_len > 0 {
+                if chunk.configuration.crc32_enabled {
+                    let out_buf = chunk.data.first_segment_a3_output();
+                    if let Some(last_crc) = chunk.crc32s.last_mut() {
+                        last_crc.update(&out_buf[decode_base..decode_base + append_len]);
+                    }
+                }
+                chunk.data.commit(append_len);
+                chunk.statistics.non_marker_count += append_len as u64;
+                chunk.note_inner_decoded_bytes(append_len);
+            }
+            if !stopping_point_reached && local_pos >= cap {
+                return BulkCleanTailResult::Handoff {
+                    start_bit: bits.bit_position(),
+                    last_eob_pos,
+                    last_eob_decoded_bytes,
+                    pending_stop_after_flush,
+                };
+            }
+            continue;
+        }
+
+        // Multi-segment (or non-A3): one segment tail per outer iteration.
+        let pred_len = bulk_predecessor_window(chunk, initial_window, &mut pred_buf);
+        let pred = &pred_buf[..pred_len];
+        let cap = chunk.data.writable_tail().len();
+        if cap == 0 {
+            return BulkCleanTailResult::Handoff {
+                start_bit: bits.bit_position(),
+                last_eob_pos,
+                last_eob_decoded_bytes,
+                pending_stop_after_flush,
+            };
+        }
+        let mut local_pos = 0usize;
+        while local_pos < cap && !stopping_point_reached {
+            let block_result = {
+                let seg_tail = chunk.data.writable_tail();
+                match decode_block(&mut bits, seg_tail, &mut local_pos, pred, &mut scratch) {
+                    Ok(r) => r,
+                    Err(_) => return BulkCleanTailResult::Decline,
+                }
+            };
+            last_end_bit = bits.bit_position();
+            let decoded_total = decode_base + local_pos;
+            if !block_result.is_final_block {
+                chunk.append_block_boundary_at(last_end_bit, decoded_total);
+                last_eob_pos = last_end_bit;
+                last_eob_decoded_bytes = decoded_total;
+            }
+            if block_result.is_final_block {
+                stopping_point_reached = true;
+                reached_stream_end = true;
+                break;
+            }
+            if last_end_bit >= stop_hint_bits {
+                pending_stop_after_flush = true;
+                stopping_point_reached = true;
+                break;
+            }
+        }
+
+        let append_len = if pending_stop_after_flush {
+            last_eob_decoded_bytes.saturating_sub(decode_base)
+        } else {
+            local_pos
+        };
+        if append_len > 0 {
+            if chunk.configuration.crc32_enabled {
+                let kept = &chunk.data.writable_tail()[..append_len];
+                if let Some(last_crc) = chunk.crc32s.last_mut() {
+                    last_crc.update(kept);
+                }
+            }
+            chunk.data.commit(append_len);
+            chunk.statistics.non_marker_count += append_len as u64;
+            chunk.note_inner_decoded_bytes(append_len);
+        }
+
+        if !stopping_point_reached && local_pos >= cap {
+            return BulkCleanTailResult::Handoff {
+                start_bit: bits.bit_position(),
+                last_eob_pos,
+                last_eob_decoded_bytes,
+                pending_stop_after_flush,
+            };
+        }
+    }
+
+    if reached_stream_end {
+        return BulkCleanTailResult::Handoff {
+            start_bit: bits.bit_position(),
+            last_eob_pos,
+            last_eob_decoded_bytes,
+            pending_stop_after_flush: false,
+        };
+    }
+
+    let final_bit = if pending_stop_after_flush {
+        last_eob_pos
+    } else if last_eob_pos > inflate_start_bit {
+        last_eob_pos
+    } else {
+        last_end_bit
+    };
+    BulkCleanTailResult::Complete { final_bit }
+}
+
 /// Vendor `finishDecodeChunkWithInexactOffset` (GzipChunk.hpp:280-410): streaming
 /// inflate on the same [`ChunkData`] via [`IsalInflateWrapper`] /
 /// `unified::Inflate<Clean, …>`.
@@ -202,7 +451,7 @@ fn use_option_a_prefill_path() -> bool {
 fn finish_decode_chunk_inexact_offset(
     chunk: &mut ChunkData,
     input: &[u8],
-    inflate_start_bit: usize,
+    mut inflate_start_bit: usize,
     stop_hint_bits: usize,
     initial_window: &[u8],
     record_decode_duration: bool,
@@ -223,26 +472,10 @@ fn finish_decode_chunk_inexact_offset(
     //
     // Args: `start_bit` (where decode starts) + `stop_hint` + a
     // `has_window` flag distinguishing the two call paths above.
-    let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
-        "worker.stream_inflate",
-        &format!(
-            r#""start_bit":{inflate_start_bit},"stop_hint":{stop_hint_bits},"has_window":{}"#,
-            !initial_window.is_empty()
-        ),
-    );
     let t_decode = std::time::Instant::now();
-    // `stop_hint_bits` is an inexact stop *hint* (vendor `untilOffset`), not a hard
-    // read cap. Capping `refill_buffer` at a partition guess stops mid-block
-    // (e.g. silesia gzip-9 at 33554427 vs hint 33554432 → InvalidBlock on resume).
-    let read_cap = input.len() * 8;
-    let mut wrapper = IsalInflateWrapper::with_until_bits(input, inflate_start_bit, read_cap)?;
-    wrapper.set_window(initial_window)?;
-    wrapper.set_stopping_points(
-        StoppingPoints::END_OF_BLOCK
-            | StoppingPoints::END_OF_BLOCK_HEADER
-            | StoppingPoints::END_OF_STREAM_HEADER
-            | StoppingPoints::END_OF_STREAM,
-    );
+
+    #[cfg(pure_inflate_decode)]
+    let mut bulk_handoff: Option<(usize, usize, bool)> = None;
 
     // Option A3 (default ON): pre-fill segment 0 with the predecessor's
     // 32 KiB window so back-references hit copy_match_fast via
@@ -256,10 +489,63 @@ fn finish_decode_chunk_inexact_offset(
         chunk.prefill_window_prefix(initial_window);
     }
 
+    #[cfg(pure_inflate_decode)]
+    {
+        match finish_decode_chunk_bulk_lut(
+            chunk,
+            input,
+            inflate_start_bit,
+            stop_hint_bits,
+            initial_window,
+        ) {
+            BulkCleanTailResult::Complete { final_bit } => {
+                if record_decode_duration {
+                    chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+                }
+                chunk.finalize(final_bit);
+                return Ok(());
+            }
+            BulkCleanTailResult::Handoff {
+                start_bit,
+                last_eob_pos,
+                last_eob_decoded_bytes,
+                pending_stop_after_flush,
+            } => {
+                inflate_start_bit = start_bit;
+                bulk_handoff = Some((
+                    last_eob_pos,
+                    last_eob_decoded_bytes,
+                    pending_stop_after_flush,
+                ));
+            }
+            BulkCleanTailResult::Decline => {}
+        }
+    }
+
+    let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
+        "worker.stream_inflate",
+        &format!(
+            r#""start_bit":{inflate_start_bit},"stop_hint":{stop_hint_bits},"has_window":{}"#,
+            !initial_window.is_empty()
+        ),
+    );
+    // `stop_hint_bits` is an inexact stop *hint* (vendor `untilOffset`), not a hard
+    // read cap. Capping `refill_buffer` at a partition guess stops mid-block
+    // (e.g. silesia gzip-9 at 33554427 vs hint 33554432 → InvalidBlock on resume).
+    let read_cap = input.len() * 8;
+    let mut wrapper = IsalInflateWrapper::with_until_bits(input, inflate_start_bit, read_cap)?;
+    wrapper.set_window(initial_window)?;
+    wrapper.set_stopping_points(
+        StoppingPoints::END_OF_BLOCK
+            | StoppingPoints::END_OF_BLOCK_HEADER
+            | StoppingPoints::END_OF_STREAM_HEADER
+            | StoppingPoints::END_OF_STREAM,
+    );
+
     let mut stopping_point_reached = false;
     let mut last_end_bit = inflate_start_bit;
     let mut last_eob_pos = inflate_start_bit;
-    let mut last_eob_decoded_bytes: usize = 0;
+    let mut last_eob_decoded_bytes: usize = chunk.data.len();
     let mut already_decoded: usize = 0;
     // Set once the decoder reaches the genuine end of the input (final
     // gzip member's footer consumed, or ISA-L reports `finished`). When
@@ -270,6 +556,15 @@ fn finish_decode_chunk_inexact_offset(
     // duplicating its bytes in the output.
     let mut reached_stream_end = false;
     let mut pending_stop_after_flush = false;
+    #[cfg(pure_inflate_decode)]
+    if let Some((eob_pos, eob_decoded, pending)) = bulk_handoff {
+        last_eob_pos = eob_pos;
+        last_eob_decoded_bytes = eob_decoded;
+        pending_stop_after_flush = pending;
+        stopping_point_reached = pending;
+        last_end_bit = inflate_start_bit;
+        already_decoded = chunk.data.len();
+    }
     // §5 step 5 (NEW wrapper / ResumableInflate2): the pure-rust backend no
     // longer has a `session` accumulator, so `session_pending()` is always
     // false. The old "keep looping to drain session" behavior (a6c0a8b) would
@@ -1301,7 +1596,38 @@ mod tests {
         out
     }
 
-    /// KNOWN-LIMITATION: the bulk impl errors with OutputOverflow when
+    /// ISA-L-LUT bulk clean tail must match the resumable wrapper byte-for-byte.
+    #[cfg(pure_inflate_decode)]
+    #[test]
+    fn bulk_clean_tail_matches_resumable_wrapper() {
+        let payload = b"the quick brown fox ".repeat(50_000);
+        let deflate = make_multi_block_deflate(&payload);
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 512 * 1024,
+            max_decoded_chunk_size: 20 * 512 * 1024,
+            crc32_enabled: true,
+        };
+        let stop_hint_bits = deflate.len() * 8;
+        let window = [0u8; 32 * 1024];
+
+        let chunk_bulk = {
+            std::env::set_var("GZIPPY_ISAL_PURE_BULK", "1");
+            std::env::set_var("GZIPPY_OPTION_A_PREFILL", "1");
+            decode_chunk(&deflate, 0, stop_hint_bits, &window[..], cfg).unwrap()
+        };
+        let chunk_wrap = {
+            std::env::set_var("GZIPPY_ISAL_PURE_BULK", "0");
+            std::env::set_var("GZIPPY_OPTION_A_PREFILL", "1");
+            decode_chunk(&deflate, 0, stop_hint_bits, &window[..], cfg).unwrap()
+        };
+        assert_eq!(
+            chunk_bulk.data.to_contiguous(),
+            chunk_wrap.data.to_contiguous(),
+            "bulk_lut vs resumable wrapper clean tail diverged"
+        );
+        assert_eq!(flatten(&chunk_bulk), flatten(&chunk_wrap));
+    }
+
     #[test]
     fn decode_chunk_from_bit_0_matches_payload() {
         let payload = b"abcdefghij".repeat(200_000);

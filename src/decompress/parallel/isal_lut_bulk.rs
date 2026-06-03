@@ -268,6 +268,17 @@ fn copy_match(
 ) {
     let dst = *out_pos;
     if distance <= dst {
+        let margin = output.len().saturating_sub(dst);
+        if distance >= 8 && length >= 8 && margin >= length + 48 {
+            let new_pos = crate::decompress::inflate::consume_first_decode::copy_match_fast(
+                output,
+                dst,
+                distance as u32,
+                length as u32,
+            );
+            *out_pos = new_pos;
+            return;
+        }
         // Source entirely within output[..dst]. Byte-by-byte handles
         // the RLE case (distance < length).
         let src = dst - distance;

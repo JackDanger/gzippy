@@ -73,6 +73,10 @@ CFG=gzippy
   "$FULCRUM_BIN" vs "$GZ_TRACE" "$RG_TRACE" --labels gzippy,rapidgzip --config "$CFG" || true
   echo ""
 
+  echo "======== fulcrum vs --by-role (pipeline roles, T=${THREADS}) ========"
+  "$FULCRUM_BIN" vs "$GZ_TRACE" "$RG_TRACE" --by-role --threads "$THREADS" --labels gzippy,rapidgzip --config "$CFG" || true
+  echo ""
+
   echo "======== fulcrum flow (stages: wall-crit vs slack) ========"
   "$FULCRUM_BIN" flow "$GZ_TRACE" --config "$CFG" || true
   echo ""
