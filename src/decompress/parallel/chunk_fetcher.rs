@@ -2778,8 +2778,10 @@ fn try_speculative_decode_candidate(
     window_map: &WindowMap,
 ) -> Result<ChunkData, ChunkDecodeError> {
     // Clean try only when a window is published at this exact bit (confirmed
-    // chunk end). `get_predecessor` is NOT sufficient — a stale earlier tail
-    // dict mis-decodes false-positive finder candidates (CRC mismatch).
+    // chunk end). `get_predecessor` is NOT used here — unlike
+    // `run_decode_task`, boundary-search candidates are often false
+    // positives; a stale earlier tail dict can pass metadata checks yet
+    // corrupt the assembled stream (CRC mismatch).
     let result = if let Some(w) = window_map.get(decode_start) {
         let pw = materialize_window(&w);
         match decode_chunk(
@@ -2797,9 +2799,6 @@ fn try_speculative_decode_candidate(
                 Ok(chunk)
             }
             Ok(chunk) => {
-                // Clean decode with a published window but wrong stop
-                // (false-positive finder hit). Do not fall through to
-                // window-absent bootstrap — that duplicates the full decode.
                 let actual = chunk
                     .encoded_offset_bits
                     .saturating_add(chunk.encoded_size_bits);
