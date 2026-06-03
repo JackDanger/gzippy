@@ -17,7 +17,7 @@
 | **E** | Clean inflate (`d_c`) | `worker.stream_inflate` **~2×** busy vs rg `isal_stream_inflate` | Fastloop / BMI2 / prefetch in `decode_huffman_body_resumable` | Open |
 | **F** | Window-absent bootstrap (`d_w`) | `worker.bootstrap` **~2121 ms** busy; +30% wall @ +100% bootstrap slow-inject | Speed `deflate_block` / `marker_decode_step` | Open |
 | **G** | Runtime WA% vs static | 90% vs 31% | **Accept**; make WA cheap (**F**, **K**), don't cap prefetch (D6 refuted) | Policy |
-| **H** | Partition-seed key mismatch | 37/38 WA = KEY-MISMATCH | **Design H** handoff decode via `get_predecessor(stop_hint)` on speculative prefetch | **Wired** (ship-gate: Fulcrum wall ↓, `HANDOFF_DECODE_CLEAN_OK` > 0) |
+| **H** | Partition-seed key mismatch | 37/38 WA = KEY-MISMATCH | **Design H** handoff decode via `get_predecessor(stop_hint)` on speculative prefetch | **Measured TIE** (`HANDOFF_DECODE_CLEAN_OK=0`; handoff key not in map at decode start) |
 | **I** | Boundary trial cost | `scan_candidate` **+1373 ms** busy | Tail prefilter + no double-bootstrap (`e899062`); Kraft pre-reject | Partial |
 | **J** | `pool.pick` | **+618 ms** busy | Fewer tasks (**I**, **C**); `pick.wait` vs `pick.lock` trace | Open |
 | **K** | Marker resolve tax | apply+narrow; rg `apply_window` **~238 ms** busy | Fused path ≥16 KiB; **C** moves resolve off consumer | Partial |
@@ -74,8 +74,8 @@
 
 ## Execution order
 
-1. Measure **H** (handoff clean decode) — locked Fulcrum.
-2. **F/E** (bootstrap + clean inflate) with perturbation gates.
+1. **F/E** (bootstrap + clean inflate) — only remaining wall lever on silesia (Fulcrum RATE-bound).
+2. Revisit **H** only if early-publish fraction rises (handoff needs `contains(handoff_key)` at worker decode time).
 3. **L/M** (output + segments) — bounded ceilings.
 4. **I/J** (trials + pool) — incremental.
 
