@@ -14,8 +14,8 @@
 | **B** | Publish-chain binds | `fulcrum model` residual ≈ 0 | Reduce **C** + **E/F** | Confirmed |
 | **C** | `L_resolve` per link | mean **~20 ms**, p95 **~121 ms** | **Design D** worker resolve-ahead | **Measured TIE** (inert: 0 exact marker chunks in cache @ handoff) |
 | **D** | Consumer wait (`block_fetcher_get` / `future_recv`) | ~89% wall WAIT | Symptom of decode supply + **C**; not core steal (trisection TIE) | Follow **C**, **E/F** |
-| **E** | Clean inflate (`d_c`) | `worker.stream_inflate` **~2×** busy vs rg `isal_stream_inflate` | Fastloop / BMI2 / prefetch in `decode_huffman_body_resumable` | Open |
-| **F** | Window-absent bootstrap (`d_w`) | `worker.bootstrap` **~2121 ms** busy; +30% wall @ +100% bootstrap slow-inject | Speed `deflate_block` / `marker_decode_step` | Open |
+| **E** | Clean inflate (`d_c`) | `worker.stream_inflate` **~2×** busy vs rg `isal_stream_inflate` | Match-source `_mm_prefetch` in resumable LENGTH path (libdeflate mirror) | **TIE** trace +0.4% (783 vs 754 ms); interleaved TIE |
+| **F** | Window-absent bootstrap (`d_w`) | `worker.bootstrap` **~2121 ms** busy; +30% wall @ +100% bootstrap slow-inject | Speed `deflate_block` / `marker_decode_step`; causal **confirmed** (+12% wall @ +100% inject, N=3) | Open |
 | **G** | Runtime WA% vs static | 90% vs 31% | **Accept**; make WA cheap (**F**, **K**), don't cap prefetch (D6 refuted) | Policy |
 | **H** | Partition-seed key mismatch | 37/38 WA = KEY-MISMATCH | **Design H** handoff decode via `get_predecessor(stop_hint)` on speculative prefetch | **Measured TIE** (`HANDOFF_DECODE_CLEAN_OK=0`; handoff key not in map at decode start) |
 | **I** | Boundary trial cost | `scan_candidate` **+1373 ms** busy | Tail prefilter + no double-bootstrap (`e899062`); Kraft pre-reject | Partial |
