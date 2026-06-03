@@ -1928,20 +1928,6 @@ fn submit_post_process_from_prefetch(
     })
 }
 
-/// Wait for resolve-ahead post-process keyed by partition / handoff offsets.
-#[cfg(parallel_sm)]
-fn take_postproc_inflight(
-    in_flight: &mut EagerSubmitted,
-    keys: &[usize],
-) -> Option<(usize, mpsc::Receiver<ChunkData>)> {
-    for &key in keys {
-        if let Some(entry) = in_flight.remove(&key) {
-            return Some(entry);
-        }
-    }
-    None
-}
-
 #[cfg(parallel_sm)]
 fn submit_post_process_task(
     thread_pool: &Arc<ThreadPool>,
