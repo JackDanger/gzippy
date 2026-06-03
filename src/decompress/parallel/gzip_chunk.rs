@@ -7,8 +7,8 @@
 //!   one outer decode iteration (`worker.decode_chunk`) alternates
 //!   `deflate_block` blocks (u16 markers) until 32 KiB clean, then streaming
 //!   inflate on the same [`ChunkData`].
-//! - [`decode_chunk_isal`] / [`decode_chunk_marker_bootstrap_then_isal`] —
-//!   thin aliases for routing/tests.
+//! - [`decode_chunk`] — production entry (known 32 KiB window or chunk 0).
+//! - [`decode_chunk_window_absent`] — marker bootstrap + clean tail (no window).
 //!
 //! `stop_hint_bits` is an inexact stop hint (vendor `untilOffset`): the
 //! decoder runs to the first block boundary at-or-past it, then stops.
@@ -51,7 +51,6 @@ impl From<std::io::Error> for ChunkDecodeError {
 
 /// Output buffer size used per `read_stream` iteration. Matches
 /// rapidgzip's `ALLOCATION_CHUNK_SIZE` (GzipChunk.hpp uses 128 KiB).
-#[allow(dead_code)] // used by x86_64+isal-compression decode_chunk_isal path
 const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 
 // =========================================================================
@@ -153,8 +152,10 @@ pub fn decode_chunk_with_rapidgzip(
     )
 }
 
+/// Production chunk decode with optional predecessor window (vendor
+/// `decodeChunkWithRapidgzip` + `finishDecodeChunkWithInexactOffset`).
 #[cfg(parallel_sm)]
-pub fn decode_chunk_isal(
+pub fn decode_chunk(
     input: &[u8],
     encoded_offset_bits: usize,
     stop_hint_bits: usize,
@@ -168,25 +169,6 @@ pub fn decode_chunk_isal(
         initial_window,
         configuration,
     )
-}
-
-/// Env-flag dispatch helper. When `GZIPPY_ISAL_PURE_BULK=1` is set,
-/// the windowed-decode path routes through `decode_chunk_pure_bulk_impl`
-/// (the stateless ISA-L-LUT bulk decoder from
-/// `isal_lut_bulk::decode_block`) instead of `IsalInflateWrapper`.
-///
-/// Default OFF for controlled rollout: ResumableInflate2 (the heavily-
-/// optimized incumbent) stays the production path until the bulk
-/// decoder proves out on neurotic. Once the win is confirmed, flip the
-/// default.
-///
-/// Read once at process start via OnceLock so the env-var lookup
-/// doesn't tax the hot path.
-#[cfg(pure_inflate_decode)]
-fn use_pure_bulk_path() -> bool {
-    use std::sync::OnceLock;
-    static USE_BULK: OnceLock<bool> = OnceLock::new();
-    *USE_BULK.get_or_init(|| std::env::var_os("GZIPPY_ISAL_PURE_BULK").is_some())
 }
 
 /// Option A3+A4 dispatch (`plans/unified-decoder.md` §6, commits
@@ -229,7 +211,7 @@ fn finish_decode_chunk_inexact_offset(
     // gzippy's ISA-L stream-inflate path. Both call sites land here:
     //   (a) the post-bootstrap call at gzip_chunk.rs:549 (after the
     //       pure-Rust phase-1 produces a clean 32 KiB window)
-    //   (b) the non-speculative direct path via `decode_chunk_isal`
+    //   (b) the non-speculative direct path via `decode_chunk`
     //       at gzip_chunk.rs:150 (when the predecessor window is
     //       already known and bootstrap is skipped)
     //
@@ -242,7 +224,7 @@ fn finish_decode_chunk_inexact_offset(
     // Args: `start_bit` (where decode starts) + `stop_hint` + a
     // `has_window` flag distinguishing the two call paths above.
     let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
-        "worker.isal_stream_inflate",
+        "worker.stream_inflate",
         &format!(
             r#""start_bit":{inflate_start_bit},"stop_hint":{stop_hint_bits},"has_window":{}"#,
             !initial_window.is_empty()
@@ -396,7 +378,7 @@ fn finish_decode_chunk_inexact_offset(
             // In production `consumer_loop`'s sub-byte-tail guard means a
             // chunk too small to hold a deflate block is never scheduled;
             // this is the backstop for any future caller that hands
-            // `decode_chunk_isal` such a fragment directly.
+            // `decode_chunk` such a fragment directly.
             //
             // A genuinely truncated stream also stalls here; its
             // already-decoded prefix is kept (appended by earlier
@@ -562,7 +544,7 @@ fn finish_decode_chunk_inexact_offset(
     // reaches the user's output. Downstream chunk methods that
     // need the decoded portion (last_32kib_window, get_last_window,
     // populate_subchunk_windows) skip data_prefix_len bytes;
-    // absorb_isal_tail (the bootstrap merge path) reads from
+    // `finish_decode_chunk_inexact_offset` reads from
     // `tail.data[tail.data_prefix_len..]`. Eliminating the trim
     // memmove was measured at -3.81pp `__memmove_avx_unaligned_erms`
     // CPU share vs A3-with-trim, lifting net throughput to +4.2%
@@ -584,273 +566,14 @@ fn finish_decode_chunk_inexact_offset(
     Ok(())
 }
 
-/// Pure-Rust bulk-decode path. Used when `GZIPPY_ISAL_PURE_BULK=1`.
-///
-/// Drives [`crate::decompress::parallel::isal_lut_bulk::decode_block`]
-/// in a multi-block loop, replacing the IsalInflateWrapper/
-/// ResumableInflate2 path. Skips the stopping-point state machine,
-/// session accumulator, and yield-on-output-fill machinery — all
-/// unnecessary for the windowed bulk phase.
-///
-/// Correctness gated by the silesia byte-perfect test in
-/// `isal_lut_bulk` (162 MB byte-equal vs flate2 GzDecoder) and the
-/// existing routing tests (which will additionally run with the env
-/// flag set in `tests::routing`).
-#[cfg(pure_inflate_decode)]
-fn decode_chunk_pure_bulk_impl(
-    input: &[u8],
-    encoded_offset_bits: usize,
-    stop_hint_bits: usize,
-    initial_window: &[u8],
-    configuration: ChunkConfiguration,
-) -> Result<ChunkData, ChunkDecodeError> {
-    use crate::decompress::inflate::consume_first_decode::Bits;
-    use crate::decompress::parallel::isal_lut_bulk::{
-        decode_block, BulkDecodeError, DecoderScratch,
-    };
-
-    let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
-        "worker.pure_bulk_inflate",
-        &format!(
-            r#""start_bit":{encoded_offset_bits},"stop_hint":{stop_hint_bits},"has_window":{}"#,
-            !initial_window.is_empty()
-        ),
-    );
-    let t_decode = std::time::Instant::now();
-
-    let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
-    let mut bits = Bits::at_bit_offset(input, encoded_offset_bits);
-    let mut scratch = DecoderScratch::new();
-
-    // FOOTPRINT-ALIGN: the pure-bulk `decode_block` path (env-gated OFF via
-    // GZIPPY_ISAL_PURE_BULK) resolves back-references by reading the
-    // already-decoded prefix of its OUTPUT buffer (`stream_view[..out_pos]`),
-    // so it needs one CONTIGUOUS buffer spanning the whole stream — it cannot
-    // decode directly into the segmented `chunk.data`. Decode into a local
-    // contiguous `bulk` Vec, then flush it into `chunk.data`'s segments at the
-    // end. (The production path is the wrapper `read_stream` loop above, which
-    // IS segment-native via its window ring.)
-    let mut bulk: Vec<u8> = Vec::new();
-
-    // `predecessor_window` is the bytes immediately before this gzip
-    // stream's first decoded byte (i.e., the prior chunk's tail for
-    // the first member; empty for any subsequent gzip member started
-    // mid-chunk after a footer).
-    let mut predecessor: &[u8] = initial_window;
-    // Offset in `bulk` where the CURRENT gzip stream's bytes start.
-    // Back-references must not reach across this boundary (each gzip
-    // member has its own sliding window per RFC 1952).
-    let mut stream_data_start: usize = 0;
-
-    let mut last_end_bit = encoded_offset_bits;
-    let mut last_eob_pos = encoded_offset_bits;
-    let mut reached_stream_end = false;
-    let mut stopped_at_block_boundary = false;
-
-    PURE_BULK_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    loop {
-        // Reserve spare for one max-size DEFLATE block. Stored blocks
-        // are bounded at 65 KiB by RFC 1951 §3.2.4 (LEN is u16);
-        // dynamic-Huffman has no hard bound but rarely exceeds 64 KiB
-        // in practice. 128 KiB headroom covers both.
-        const PER_BLOCK_RESERVE: usize = 128 * 1024;
-        let prev_len = bulk.len();
-        bulk.reserve(PER_BLOCK_RESERVE);
-
-        // SAFETY: `bulk.capacity()` bytes are allocated. The initialized
-        // prefix is [0, prev_len); the rest is uninit but writable. The bulk
-        // decoder reads only [stream_data_start, out_pos) (the current
-        // stream's already-decoded bytes), a subset of [0, prev_len). It
-        // writes only to [out_pos, ..). We bump len after decode_block.
-        let buf_ptr = bulk.as_mut_ptr();
-        let buf_cap = bulk.capacity();
-        let stream_view: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(
-                buf_ptr.add(stream_data_start),
-                buf_cap - stream_data_start,
-            )
-        };
-        let mut out_pos_in_view = prev_len - stream_data_start;
-
-        let block_start_bit = bits.bit_position();
-        let result = decode_block(
-            &mut bits,
-            stream_view,
-            &mut out_pos_in_view,
-            predecessor,
-            &mut scratch,
-        )
-        .map_err(|e| {
-            ChunkDecodeError::InflateFailed(InflateError::Internal(match e {
-                BulkDecodeError::InvalidHuffmanCode => -101,
-                BulkDecodeError::InvalidLookback => -102,
-                BulkDecodeError::OutputOverflow => -103,
-                BulkDecodeError::BlockTypeReserved => -104,
-                BulkDecodeError::InvalidCodeLengths => -105,
-            }))
-        })?;
-
-        let bytes_written = (stream_data_start + out_pos_in_view) - prev_len;
-        // Bump `bulk`'s len + CRC/stats over the freshly-written bytes
-        // (replaces `note_clean_bytes_written_in_place` which targeted the
-        // old contiguous `chunk.data`).
-        if bytes_written > 0 {
-            unsafe { bulk.set_len(prev_len + bytes_written) };
-            if chunk.configuration.crc32_enabled {
-                if let Some(last_crc) = chunk.crc32s.last_mut() {
-                    last_crc.update(&bulk[prev_len..prev_len + bytes_written]);
-                }
-            }
-            chunk.statistics.non_marker_count += bytes_written as u64;
-            chunk.note_inner_decoded_bytes(bytes_written);
-        }
-
-        let block_end_bit = bits.bit_position();
-
-        // No-progress guard: if a block produces zero output AND the
-        // bit cursor didn't advance AND it's not a final block, we're
-        // at sub-byte EOF padding (or some other no-progress state).
-        // Without this guard the bulk loop spins forever on inputs
-        // like the sub-byte EOF padding fragment exercised by
-        // `decode_chunk_isal_terminates_on_sub_byte_eof_padding`.
-        if bytes_written == 0 && block_end_bit == block_start_bit && !result.is_final_block {
-            reached_stream_end = true;
-            break;
-        }
-
-        last_end_bit = block_end_bit;
-        last_eob_pos = block_end_bit;
-
-        if !result.is_final_block {
-            chunk.append_block_boundary_at(block_end_bit, bulk.len());
-        }
-
-        if result.is_final_block {
-            // Byte-align then optionally read 8-byte gzip footer (CRC32+ISIZE).
-            // The bulk path is invoked both for full gzip streams (footer
-            // present) and for tests passing raw deflate (no footer). Match
-            // the wrapper-based impl's tolerant behavior: if remaining
-            // input is < 8 bytes after byte-align, end the stream cleanly
-            // without footer (the wrapper finishes via `r.finished` in
-            // that path; gzip_chunk.rs line 333).
-            let byte_align = (8 - (block_end_bit % 8)) % 8;
-            if byte_align != 0 {
-                bits.refill();
-                bits.consume(byte_align as u32);
-            }
-            let footer_byte = bits.bit_position() / 8;
-            if footer_byte + 8 > input.len() {
-                last_end_bit = bits.bit_position();
-                reached_stream_end = true;
-                break;
-            }
-            let crc32 = u32::from_le_bytes([
-                input[footer_byte],
-                input[footer_byte + 1],
-                input[footer_byte + 2],
-                input[footer_byte + 3],
-            ]);
-            let isize_field = u32::from_le_bytes([
-                input[footer_byte + 4],
-                input[footer_byte + 5],
-                input[footer_byte + 6],
-                input[footer_byte + 7],
-            ]);
-            let footer_end_bits = (footer_byte + 8) * 8;
-            chunk.append_footer(crc32, isize_field, footer_end_bits);
-            last_end_bit = footer_end_bits;
-
-            // Multi-stream gzip: next member's header follows the footer.
-            if footer_byte + 8 >= input.len() {
-                reached_stream_end = true;
-                break;
-            }
-            let next_start_byte = footer_byte + 8;
-            let remaining = &input[next_start_byte..];
-            match crate::decompress::parallel::gzip_format::read_header(remaining) {
-                Ok((_hdr, hdr_size)) => {
-                    let next_stream_byte = next_start_byte + hdr_size;
-                    bits = Bits::at_bit_offset(input, next_stream_byte * 8);
-                    // New gzip member: fresh sliding window. Reset
-                    // both the back-ref reach base and the predecessor.
-                    stream_data_start = bulk.len();
-                    predecessor = &[];
-                    last_end_bit = bits.bit_position();
-                    last_eob_pos = last_end_bit;
-                    chunk.append_block_boundary_at(last_end_bit, bulk.len());
-                    continue;
-                }
-                Err(e) => {
-                    return Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("multi-stream gzip header at bit {footer_end_bits}: {e}"),
-                    )));
-                }
-            }
-        }
-
-        // Stop-hint logic: stop at the next EOB at-or-past stop_hint_bits,
-        // BUT not when the next block is fixed Huffman (matches the
-        // END_OF_BLOCK_HEADER + not_fixed gate in the wrapper-based impl
-        // at gzip_chunk.rs ~354-360). Fixed-Huffman blocks aren't
-        // discoverable by the dynamic-Huffman block finder; the
-        // consumer would re-decode them anyway, so we extend the
-        // current chunk past them.
-        if block_end_bit >= stop_hint_bits {
-            // Peek next block's BFINAL+BTYPE without consuming.
-            let saved_buf = bits.bitbuf;
-            let saved_left = bits.bitsleft;
-            let saved_pos = bits.pos;
-            bits.refill();
-            let next_btype = ((bits.bitbuf >> 1) & 0b11) as u32;
-            bits.bitbuf = saved_buf;
-            bits.bitsleft = saved_left;
-            bits.pos = saved_pos;
-            if next_btype != 1 {
-                stopped_at_block_boundary = true;
-                break;
-            }
-        }
-    }
-
-    // Flush the contiguous bulk decode buffer into the segmented `data`.
-    if !bulk.is_empty() {
-        chunk.data.extend_from_slice(&bulk);
-    }
-    chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
-    let final_bit = if stopped_at_block_boundary || reached_stream_end {
-        last_end_bit
-    } else if last_eob_pos > encoded_offset_bits {
-        last_eob_pos
-    } else {
-        bits.bit_position()
-    };
-    chunk.finalize(final_bit);
-    Ok(chunk)
-}
-
-/// Counter for deletion-trap tests that need to assert the pure-bulk
-/// path actually executed (mirrors `UNIFIED_INFLATE_RUNS` /
-/// `MARKER_PIPELINE_RUNS` pattern).
-#[cfg(pure_inflate_decode)]
-pub static PURE_BULK_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Marker-bootstrap then ISA-L for speculative prefetch (no predecessor window).
-/// Requires a real deflate block boundary at `encoded_offset_bits`.
-///
-/// Returns a `ChunkData` whose `data_with_markers` covers the bootstrap
-/// prefix (still containing markers; resolved by `apply_window` in the
-/// consumer) and whose `data` covers the ISA-L bulk (already clean).
-/// The chunk stops at the next deflate block boundary at-or-past
-/// `stop_hint_bits`, or at BFINAL, or when accumulated `decoded_size`
-/// crosses `max_decoded_chunk_size`.
+/// Window-absent chunk decode (speculative prefetch / boundary search).
+/// Same unified [`decode_chunk_with_rapidgzip_impl`] as [`decode_chunk`], with
+/// an empty initial window so the marker phase runs until 32 KiB clean.
 #[cfg(parallel_sm)]
-pub fn decode_chunk_marker_bootstrap_then_isal(
+pub fn decode_chunk_window_absent(
     input: &[u8],
     encoded_offset_bits: usize,
     stop_hint_bits: usize,
-    _initial_window_unused: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
     decode_chunk_with_rapidgzip_impl(
@@ -878,17 +601,6 @@ fn decode_chunk_with_rapidgzip_impl(
 
     let start_clean_only = initial_window.len() == MAX_WINDOW_SIZE
         || (initial_window.is_empty() && encoded_offset_bits == 0);
-
-    #[cfg(feature = "pure-rust-inflate")]
-    if start_clean_only && use_pure_bulk_path() {
-        return decode_chunk_pure_bulk_impl(
-            input,
-            encoded_offset_bits,
-            stop_hint_bits,
-            initial_window,
-            configuration,
-        );
-    }
 
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
     let mut inflate_phase = start_clean_only;
@@ -1027,163 +739,6 @@ fn apply_slow_bootstrap_probe(bootstrap_dur_us: u128) {
             }
         }
     }
-}
-
-/// Legacy merge of a separate ISA-L tail `ChunkData` (pre-unified decode).
-#[cfg(parallel_sm)]
-#[allow(dead_code)]
-fn absorb_isal_tail(dst: &mut ChunkData, mut tail: ChunkData) {
-    // `worker.absorb_isal_tail` span — wraps the merge of the
-    // ISA-L bulk-decode result into the chunk that holds the
-    // bootstrap marker prefix. Copies `tail.data` into `dst.data`,
-    // appends the tail's CRC into `dst.crc32s` via the constant-time
-    // polynomial-append path (vendor `crc32.hpp:214-258`), and
-    // merges subchunk metadata.
-    //
-    // For a typical 7.5 MB silesia chunk where most of the chunk
-    // came through ISA-L (bootstrap was small), tail.data can be
-    // several MB — large memcpy + statistics merge.
-    let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
-        "worker.absorb_isal_tail",
-        &format!(
-            r#""tail_bytes":{},"tail_crcs":{},"tail_footers":{}"#,
-            tail.data.len(),
-            tail.crc32s.len(),
-            tail.footers.len()
-        ),
-    );
-    let end_bit = tail.encoded_offset_bits + tail.encoded_size_bits;
-    let decoded_base = dst.decoded_size();
-
-    // A4: skip the tail's window-image prefix when absorbing — it's
-    // the predecessor's window image installed by A3 prefill, not
-    // decoded output. For non-A3 tails, `data_prefix_len == 0` and
-    // this is a no-op.
-    let tail_payload_offset = tail.data_prefix_len;
-    let tail_payload_len = tail.data.len().saturating_sub(tail_payload_offset);
-    // Captured BEFORE the buffer swap below: the footer branch at the end
-    // of this fn reads `tail.data.is_empty()`, but the swap empties
-    // `tail.data`, so the live value would be wrong post-swap.
-    let tail_data_was_empty = tail.data.is_empty();
-    if tail_payload_len > 0 {
-        // Per the post-inline-always bench-sm profile, the prior
-        // `dst.append_clean(&tail.data)` re-CRC'd `tail.data` from
-        // scratch — 2.45% of total cycles in
-        // `crc32fast::specialized::pclmulqdq::calculate` traced
-        // back here. `decode_chunk_isal_impl` had ALREADY computed
-        // those bytes' CRC into `tail.crc32s.last_mut()` during
-        // the in-place commit step. Combine that CRC into
-        // `dst.crc32s` via the constant-time polynomial `append`
-        // (vendor `crc32.hpp:214-258`) and skip the bytewise
-        // pclmulqdq pass.
-        //
-        // We still need the bytes in `dst.data`, the statistics
-        // update, and the subchunk size bump — inline those bits
-        // of `append_clean` directly.
-        if dst.configuration.crc32_enabled {
-            // For parallel-SM (single-member at routing time),
-            // tail's crc32s has exactly one entry. If `tail` ever
-            // crosses a stream boundary mid-decode (multi-member
-            // input that slipped past `is_likely_multi_member`'s
-            // 16 MiB scan and was misrouted as single-member),
-            // tail.crc32s.len() > 1 and the per-stream entries
-            // need to be split by the corresponding footers.
-            // Handle that explicitly below; the common case is
-            // the fast single-`append` path.
-            if tail.crc32s.len() == 1 && tail.footers.is_empty() {
-                if let (Some(dst_last), Some(tail_only)) =
-                    (dst.crc32s.last_mut(), tail.crc32s.first())
-                {
-                    dst_last.append(tail_only);
-                }
-            } else {
-                // Multi-stream tail: walk the (crc, footer) pairs
-                // in order. Each crc[i] covers bytes between
-                // footer[i-1] and footer[i] (with footer[0] being
-                // the first footer if i == 0, etc). Approximate by
-                // appending crc[0] into dst's current trailing
-                // hasher, then for each footer push a fresh
-                // hasher and append the next tail crc into it.
-                for (i, footer) in tail.footers.iter().enumerate() {
-                    if let (Some(dst_last), Some(tail_crc)) =
-                        (dst.crc32s.last_mut(), tail.crc32s.get(i))
-                    {
-                        dst_last.append(tail_crc);
-                    }
-                    dst.append_footer(
-                        footer.crc32,
-                        footer.uncompressed_size,
-                        footer.end_bit_offset,
-                    );
-                }
-                // The crc entry AFTER the last footer (if any) goes
-                // into the freshly-pushed hasher from append_footer.
-                if let (Some(dst_last), Some(tail_trailing)) =
-                    (dst.crc32s.last_mut(), tail.crc32s.get(tail.footers.len()))
-                {
-                    dst_last.append(tail_trailing);
-                }
-            }
-        }
-
-        // Bytes + statistics + subchunk size — the non-CRC half of
-        // `append_clean`. We extend in place rather than via
-        // `append_clean` because that path would re-CRC.
-        //
-        // `allocator_api2::vec::Vec::extend_from_slice` does NOT
-        // specialize for `Copy` source types (unlike `std::vec::Vec`
-        // which has `SpecExtend`) — it falls back to the generic
-        // `extend → Cloned::next → Option::cloned → Clone::clone`
-        // iterator chain. Per the bench-sm profile post-absorb-fix,
-        // that chain accounted for 2.47% of total cycles for u8
-        // bytes (where `Clone::clone` is a no-op load that should
-        // have been folded into a memcpy). Replace with an explicit
-        // `reserve` + `copy_nonoverlapping` + `set_len` — the same
-        // shape `std::vec::Vec`'s specialization would have used.
-        let added = tail_payload_len;
-        // FAST PATH (the common bootstrap-then-ISA-L chunk): the marker
-        // prefix lives in `data_with_markers`, so `dst.data` is still
-        // empty here, and without an A3 window-image prefix the tail's
-        // buffer IS the chunk's clean data verbatim. Swap the buffers
-        // (O(1) pointer move) instead of a multi-MB `copy_nonoverlapping`
-        // — measured at ~212 ms / silesia-large T8 in
-        // `worker.absorb_isal_tail` (the dominant clean-tail copy). Use
-        // `mem::swap` rather than `take`: the rpmalloc-backed `U8` has no
-        // `Default`, and swapping parks `dst`'s empty buffer in `tail` to
-        // be dropped. Byte-identical to the copy (same source bytes, same
-        // order, prefix-free).
-        // FOOTPRINT-ALIGN: move the tail's decoded payload into `dst`.
-        // When the ISA-L tail used A3 prefill, `tail.data` begins with a
-        // 32 KiB window image (`tail_payload_offset`); drop it before merge
-        // — `dst` never records `data_prefix_len` on this path.
-        let mut payload = if tail_payload_offset == 0 {
-            std::mem::take(&mut tail.data)
-        } else {
-            tail.data.split_off(tail_payload_offset)
-        };
-        dst.data.append_segmented(&mut payload);
-        dst.statistics.non_marker_count += added as u64;
-        if let Some(last) = dst.subchunks.last_mut() {
-            last.decoded_size += added;
-        }
-    }
-
-    // Multi-stream case already emitted footers above (interleaved
-    // with the per-stream CRC propagation). For the
-    // single-stream-or-empty case, footers still need pushing.
-    if tail.crc32s.len() == 1 || tail_data_was_empty {
-        for f in &tail.footers {
-            dst.append_footer(f.crc32, f.uncompressed_size, f.end_bit_offset);
-        }
-    }
-
-    for sc in tail.subchunks.iter().skip(1) {
-        let _ =
-            dst.append_block_boundary_at(sc.encoded_offset_bits, decoded_base + sc.decoded_offset);
-    }
-
-    dst.stopped_preemptively = tail.stopped_preemptively;
-    dst.finalize(end_bit);
 }
 
 /// One iteration of the vendor `decodeChunkWithRapidgzip` block loop.
@@ -1651,18 +1206,17 @@ fn absolute_bit_pos(
 }
 
 #[cfg(not(parallel_sm))]
-pub fn decode_chunk_marker_bootstrap_then_isal(
+pub fn decode_chunk_window_absent(
     _input: &[u8],
     _encoded_offset_bits: usize,
     _stop_hint_bits: usize,
-    _initial_window: &[u8],
     _configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
     Err(ChunkDecodeError::UnsupportedPlatform)
 }
 
 #[cfg(not(parallel_sm))]
-pub fn decode_chunk_isal(
+pub fn decode_chunk(
     _input: &[u8],
     _encoded_offset_bits: usize,
     _stop_hint_bits: usize,
@@ -1748,120 +1302,8 @@ mod tests {
     }
 
     /// KNOWN-LIMITATION: the bulk impl errors with OutputOverflow when
-    /// a single DEFLATE block's output exceeds `chunk.data`'s capacity.
-    /// zlib L1 on btype01-heavy data emits ONE huge fixed-Huffman block
-    /// per stream (~12 MiB output from 5.7 MiB compressed), which won't
-    /// fit in chunk.data's typical 10 MiB capacity. The bulk decoder is
-    /// stateless and cannot yield mid-block; ResumableInflate2 yields
-    /// naturally. Per advisor 2026-05-27: the right fix is to swap
-    /// ResumableInflate2's INNER Huffman hot loop to use
-    /// IsalLitLenCodePure, NOT to replace ResumableInflate2 entirely.
-    /// Until that lands, the bulk impl is gated behind
-    /// `GZIPPY_ISAL_PURE_BULK=1` and not the production default.
-    ///
-    /// This test documents the limitation; it's `#[ignore]`d because it
-    /// will fail on this fixture by design until the inner-primitive
-    /// migration completes.
     #[test]
-    #[ignore = "known limitation: bulk decoder requires output buffer >= single-block size; awaits inner-primitive migration into ResumableInflate2"]
-    #[cfg(feature = "pure-rust-inflate")]
-    fn decode_chunk_pure_bulk_btype01_heavy_l1_full() {
-        let phrases: &[&[u8]] = &[b"abc", b"foo bar ", b"the quick brown ", b"hello ", b"xyz "];
-        let target = 12 * 1024 * 1024;
-        let mut payload = Vec::with_capacity(target);
-        let mut rng: u64 = 0xb0bd1ec0de;
-        while payload.len() < target {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            if (rng >> 32) % 100 < 70 {
-                payload.push((rng >> 16) as u8);
-            } else {
-                let phrase = phrases[(rng as usize) % phrases.len()];
-                let take = phrase.len().min(target - payload.len());
-                payload.extend_from_slice(&phrase[..take]);
-            }
-        }
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(1));
-        enc.write_all(&payload).unwrap();
-        let gz = enc.finish().unwrap();
-        let (_hdr, hdr_size) =
-            crate::decompress::parallel::gzip_format::read_header(&gz).expect("gz header");
-        let deflate_stop_bits = (gz.len() - 8) * 8 - hdr_size * 8;
-        let deflate = &gz[hdr_size..gz.len() - 8];
-
-        let cfg = ChunkConfiguration {
-            split_chunk_size: 512 * 1024,
-            max_decoded_chunk_size: 20 * 512 * 1024,
-            crc32_enabled: false,
-        };
-        // BISECT: directly invoke decode_block with a Vec-backed output
-        // that mirrors chunk.data's capacity (10 MiB), bypassing the
-        // chunk-level orchestration. This isolates "is the bug in the
-        // chunk-level wrapper, or in decode_block on a 10-MiB output?"
-        {
-            use crate::decompress::inflate::consume_first_decode::Bits;
-            use crate::decompress::parallel::isal_lut_bulk::{decode_block, DecoderScratch};
-            let mut output = vec![0u8; cfg.max_decoded_chunk_size];
-            let mut bits = Bits::new(deflate);
-            bits.refill();
-            let mut scratch = DecoderScratch::new();
-            let predecessor = [0u8; 32768];
-            let mut out_pos = 0usize;
-            let mut block_count = 0;
-            loop {
-                let r = decode_block(
-                    &mut bits,
-                    &mut output,
-                    &mut out_pos,
-                    &predecessor[..],
-                    &mut scratch,
-                );
-                match r {
-                    Ok(res) => {
-                        block_count += 1;
-                        if res.is_final_block {
-                            eprintln!(
-                                "[direct-vec] decoded {block_count} blocks, total {out_pos} bytes (final)"
-                            );
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[direct-vec] decode_block error={e:?} after {block_count} blocks, out_pos={out_pos}"
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Call the bulk impl directly to bypass the OnceLock env-var check.
-        let chunk_result =
-            decode_chunk_pure_bulk_impl(deflate, 0, deflate_stop_bits, &[0u8; 32768][..], cfg);
-        match chunk_result {
-            Ok(chunk) => {
-                let flat = flatten(&chunk);
-                let same = flat
-                    .iter()
-                    .zip(payload.iter())
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                eprintln!(
-                    "[chunk-repro] decoded {} bytes; matches flate2 for first {} bytes",
-                    flat.len(),
-                    same
-                );
-                assert_eq!(flat, payload[..flat.len()], "first {} bytes diverge", same);
-            }
-            Err(e) => {
-                eprintln!("[chunk-repro] ERR: {e:?}");
-                panic!("decode failed: {e:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn decode_chunk_isal_from_bit_0_matches_payload() {
+    fn decode_chunk_from_bit_0_matches_payload() {
         let payload = b"abcdefghij".repeat(200_000);
         let deflate = make_deflate(&payload);
         let cfg = ChunkConfiguration {
@@ -1870,12 +1312,12 @@ mod tests {
             crc32_enabled: true,
         };
         let stop_hint_bits = deflate.len() * 8;
-        let chunk = decode_chunk_isal(&deflate, 0, stop_hint_bits, &[], cfg).unwrap();
+        let chunk = decode_chunk(&deflate, 0, stop_hint_bits, &[], cfg).unwrap();
         assert_eq!(flatten(&chunk), payload);
     }
 
     #[test]
-    fn decode_chunk_isal_stops_before_eof_when_stop_hint_bits_set() {
+    fn decode_chunk_stops_before_eof_when_stop_hint_bits_set() {
         let payload: Vec<u8> = (0u32..500_000)
             .map(|i| (i.wrapping_mul(31) as u8).wrapping_add(7))
             .collect();
@@ -1886,7 +1328,7 @@ mod tests {
             crc32_enabled: false,
         };
         let stop_hint_bits = deflate.len() * 8 / 2;
-        let chunk = decode_chunk_isal(&deflate, 0, stop_hint_bits, &[], cfg).unwrap();
+        let chunk = decode_chunk(&deflate, 0, stop_hint_bits, &[], cfg).unwrap();
         assert!(chunk.decoded_size() < payload.len());
         let chunk_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
         assert!(chunk_end >= stop_hint_bits);
@@ -1964,7 +1406,7 @@ mod tests {
             crc32_enabled: false,
         };
         let zero = [0u8; 32768];
-        let chunk0 = decode_chunk_isal(deflate, 0, spacing_bits, &zero, cfg).expect("chunk0");
+        let chunk0 = decode_chunk(deflate, 0, spacing_bits, &zero, cfg).expect("chunk0");
         let resume_at = chunk0.encoded_offset_bits + chunk0.encoded_size_bits;
         assert!(
             resume_at > 0 && !resume_at.is_multiple_of(8),
@@ -1980,7 +1422,7 @@ mod tests {
         .unwrap_or_else(|| {
             panic!("resume at chunk0 end bit {resume_at} must succeed");
         });
-        let chunk1 = decode_chunk_isal(deflate, resume_at, resume_at + spacing_bits, &tail, cfg)
+        let chunk1 = decode_chunk(deflate, resume_at, resume_at + spacing_bits, &tail, cfg)
             .expect("chunk1 at chunk0 end");
         assert!(!chunk1.is_empty());
     }
@@ -1988,13 +1430,10 @@ mod tests {
     /// Regression for the parallel-SM hang. Given a sub-block input
     /// fragment — the gzip end-of-stream byte-alignment padding (0-7
     /// zero bits before the footer) — `read_stream` can make no
-    /// progress, and `decode_chunk_isal_impl`'s decode loop used to
-    /// call it forever. `decode_chunk_isal` must instead return.
-    ///
-    /// The decode runs in a child thread joined against a deadline, so
-    /// a regression fails this test instead of hanging the whole suite.
+    /// progress, and the streaming inflate loop used to call it forever.
+    /// `decode_chunk` must instead return.
     #[test]
-    fn decode_chunk_isal_terminates_on_sub_byte_eof_padding() {
+    fn decode_chunk_terminates_on_sub_byte_eof_padding() {
         let worker = std::thread::spawn(|| {
             let cfg = ChunkConfiguration {
                 split_chunk_size: 512 * 1024,
@@ -2005,14 +1444,14 @@ mod tests {
             // zero bits, exactly an EOF byte-alignment padding tail.
             // Fresh wrapper, NEW_HDR, stopping points set — same shape
             // as the production chunk in the gdb backtrace.
-            let _ = decode_chunk_isal(&[0u8], 4, 8, &[], cfg);
+            let _ = decode_chunk(&[0u8], 4, 8, &[], cfg);
         });
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while !worker.is_finished() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "decode_chunk_isal did not return on a sub-byte EOF-padding \
+                "decode_chunk did not return on a sub-byte EOF-padding \
                  fragment: isal_inflate is spinning"
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
