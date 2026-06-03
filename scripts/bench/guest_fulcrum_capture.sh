@@ -116,7 +116,7 @@ capture_trace() { # capture_trace <label> <cpu-mask> <cmd...>
   local tl="$ARTDIR/trace_${label}.json"
   local ml="$ARTDIR/memlife_${label}.json"
   say "## TRACE $label -> $tl"
-  GZIPPY_TIMELINE="$tl" GZIPPY_MEMLIFE="$ml" GZIPPY_FORCE_PARALLEL_SM=1 \
+  GZIPPY_TIMELINE="$tl" GZIPPY_MEMLIFE="$ml" GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_VERBOSE=1 \
     taskset -c "$mask" "$@" >/dev/null 2>>"$ARTDIR/trace.log" || true
   [ -s "$tl" ] || { say "## WARN empty timeline $tl"; return 1; }
   ls -la "$tl" "$ml" 2>/dev/null || true
