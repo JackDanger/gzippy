@@ -62,7 +62,11 @@ GZIPPY_DEBUG=1 "${PIN[@]}" "$GZ" -d -c -p 8 "$SLG" >/dev/null 2>&1 | grep -E 'pa
 bench_wall() {
   local label="$1"
   shift
-  local -a extra=("$@")
+  # Optional env overrides as VAR=val pairs (passed to env(1), not bare shell words).
+  local -a extra=()
+  if [ "$#" -gt 0 ]; then
+    extra=(env "$@")
+  fi
   echo ""
   echo "── WALL $label (interleaved best-of-${ROUNDS}, taskset -c ${PIN_MASK}) ──"
   ref=$(gzip -dc "$SLG" | sha256sum | awk '{print $1}')
@@ -71,6 +75,7 @@ bench_wall() {
   for _t in $(seq 1 "$ROUNDS"); do
     s=$(date +%s.%N)
     GZIPPY_DEBUG=1 "${extra[@]}" "${PIN[@]}" "$GZ" -d -c -p 8 "$SLG" >/dev/null
+    # extra empty => no env prefix; with overrides => env VAR=val taskset ...
     e=$(date +%s.%N); g=$(awk "BEGIN{print $e-$s}")
     s=$(date +%s.%N)
     "${PIN[@]}" "$RG" -d -c -f -P 8 "$SLG" >/dev/null
