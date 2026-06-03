@@ -1617,24 +1617,22 @@ fn consumer_loop<W: std::io::Write>(
             match predecessor_window_for_postprocess {
                 Some(window) => {
                     use std::sync::atomic::Ordering;
-                    let inflight_keys = [chunk_offset_pre_set, partition_offset, decode_start];
-                    let reuse =
-                        match take_postproc_inflight(&mut prefetch_post_inflight, &inflight_keys) {
-                            Some((eager_pred_key, eager_rx))
-                                if consumer_pred_key == Some(eager_pred_key) =>
-                            {
-                                EAGER_PROBE_REUSED.fetch_add(1, Ordering::Relaxed);
-                                Some(eager_rx)
-                            }
-                            Some(_) => {
-                                EAGER_PROBE_REUSE_PRED_MISMATCH.fetch_add(1, Ordering::Relaxed);
-                                None
-                            }
-                            None => {
-                                EAGER_PROBE_REUSE_KEY_ABSENT.fetch_add(1, Ordering::Relaxed);
-                                None
-                            }
-                        };
+                    let reuse = match prefetch_post_inflight.remove(&chunk_offset_pre_set) {
+                        Some((eager_pred_key, eager_rx))
+                            if consumer_pred_key == Some(eager_pred_key) =>
+                        {
+                            EAGER_PROBE_REUSED.fetch_add(1, Ordering::Relaxed);
+                            Some(eager_rx)
+                        }
+                        Some(_) => {
+                            EAGER_PROBE_REUSE_PRED_MISMATCH.fetch_add(1, Ordering::Relaxed);
+                            None
+                        }
+                        None => {
+                            EAGER_PROBE_REUSE_KEY_ABSENT.fetch_add(1, Ordering::Relaxed);
+                            None
+                        }
+                    };
                     let rx = match reuse {
                         Some(eager_rx) => eager_rx,
                         None => submit_post_process_to_pool(
@@ -1924,12 +1922,9 @@ fn submit_post_process_from_prefetch(
     predecessor_window: Window,
 ) -> mpsc::Receiver<ChunkData> {
     submit_post_process_task(thread_pool, move || {
-        let mut chunk = match Arc::try_unwrap(arc) {
-            Ok(c) => c,
-            Err(shared) => (*shared).clone(),
-        };
-        reanchor_chunk_to_handoff(&mut chunk, resolve_offset);
-        run_post_process_task(chunk, predecessor_window)
+        let mut chunk_clone = (*arc).clone();
+        reanchor_chunk_to_handoff(&mut chunk_clone, resolve_offset);
+        run_post_process_task(chunk_clone, predecessor_window)
     })
 }
 
@@ -2489,13 +2484,10 @@ fn queue_prefetched_marker_postprocess(
         &format!(r#""handoff_key":{}"#, handoff_key.unwrap_or(0)),
     );
     block_fetcher.process_ready_prefetches();
-    let keys = block_fetcher.prefetch_cache_keys_sorted();
-    let n_inspected = keys.len();
+    let contents = block_fetcher.prefetch_cache_contents_sorted();
+    let n_inspected = contents.len();
     let mut submitted = 0usize;
-    for partition_key in keys {
-        let Some(arc) = block_fetcher.get_prefetch_cache_entry(&partition_key) else {
-            continue;
-        };
+    for (_partition_key, arc) in contents {
         let resolve_offset = arc.max_acceptable_start_bit;
         if let Some(key) = handoff_key {
             if resolve_offset != key {
@@ -2506,8 +2498,7 @@ fn queue_prefetched_marker_postprocess(
             continue;
         }
         let real_offset = arc.encoded_offset_bits;
-        let encoded_size_bits = arc.encoded_size_bits;
-        if in_flight.contains_key(&partition_key) || in_flight.contains_key(&real_offset) {
+        if in_flight.contains_key(&real_offset) {
             continue;
         }
         if arc.data_with_markers.is_empty() {
@@ -2518,17 +2509,18 @@ fn queue_prefetched_marker_postprocess(
         else {
             continue;
         };
-        let Some(arc) = block_fetcher.take_prefetch_cache_entry(&partition_key) else {
-            continue;
-        };
-        let rx =
-            submit_post_process_from_prefetch(thread_pool, arc, resolve_offset, predecessor_window);
-        in_flight.insert(partition_key, (pred_key, rx));
+        let rx = submit_post_process_from_prefetch(
+            thread_pool,
+            Arc::clone(&arc),
+            resolve_offset,
+            predecessor_window,
+        );
+        in_flight.insert(real_offset, (pred_key, rx));
         submitted += 1;
         if handoff_key.is_some() {
             RESOLVE_AHEAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
             RESOLVE_AHEAD_OK.fetch_add(1, Ordering::Relaxed);
-            let next_handoff = real_offset.saturating_add(encoded_size_bits);
+            let next_handoff = arc.encoded_offset_bits + arc.encoded_size_bits;
             submitted += queue_prefetched_marker_postprocess(
                 block_fetcher,
                 window_map,
