@@ -164,6 +164,16 @@ impl<Key: Hash + Eq + Clone + Ord, Value: Clone, Strategy: CacheStrategy<Key>>
         self.cache.remove(key);
     }
 
+    /// Remove `key` and return its value without counting a cache hit.
+    /// Used when resolve-ahead post-process takes sole ownership of a
+    /// prefetched entry (consumer must not re-`get` the same Arc).
+    pub fn take(&mut self, key: &Key) -> Option<Value> {
+        let v = self.cache.remove(key)?;
+        self.strategy.evict(Some(key.clone()));
+        self.accesses.remove(key);
+        Some(v)
+    }
+
     pub fn next_eviction(&self, key: Option<Key>) -> Option<Key> {
         if self.cache.len() < self.capacity()
             || (key.as_ref().is_some_and(|k| !self.cache.contains_key(k)))
@@ -228,6 +238,11 @@ impl<Key: Hash + Eq + Clone + Ord, Value: Clone, Strategy: CacheStrategy<Key>>
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    /// Current keys without cloning values.
+    pub fn keys(&self) -> Vec<Key> {
+        self.cache.keys().cloned().collect()
     }
 }
 

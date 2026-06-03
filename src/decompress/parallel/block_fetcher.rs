@@ -573,6 +573,27 @@ where
         v
     }
 
+    /// Sorted prefetch-cache keys only (no `Arc` clones). For
+    /// `queuePrefetchedChunkPostProcessing` scans.
+    #[cfg(parallel_sm)]
+    pub fn prefetch_cache_keys_sorted(&self) -> Vec<Key> {
+        let mut keys = self.prefetch_cache.lock().unwrap().keys();
+        keys.sort();
+        keys
+    }
+
+    /// Take a prefetched entry out of the cache (sole `Arc` ref if successful).
+    #[cfg(parallel_sm)]
+    pub fn take_prefetch_cache_entry(&self, key: &Key) -> Option<Value> {
+        self.prefetch_cache.lock().unwrap().take(key)
+    }
+
+    /// Non-mutating prefetch-cache lookup (clones the `Arc` for inspection).
+    #[cfg(parallel_sm)]
+    pub fn get_prefetch_cache_entry(&self, key: &Key) -> Option<Value> {
+        self.prefetch_cache.lock().unwrap().get(key)
+    }
+
     /// Vendor's `m_parallelization` cap on simultaneous prefetches
     /// (BlockFetcher.hpp:467: `m_threadPool.capacity()`).
     #[allow(dead_code)] // vendor parity or unit-test surface
