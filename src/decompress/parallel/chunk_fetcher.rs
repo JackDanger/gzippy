@@ -947,13 +947,12 @@ fn consumer_loop<W: std::io::Write>(
         std::collections::VecDeque::with_capacity(pool_size * 2);
     let post_process_inflight_cap = pool_size;
 
-    // Eager post-process probe state (GZIPPY_EAGER_POSTPROC=1). Maps a
-    // chunk's real encoded_offset_bits → an in-flight apply_window
-    // receiver submitted eagerly during a stall. The consumer reuses the
-    // receiver when it reaches that offset (see dispatch site below).
-    // Default OFF so it's a clean A/B against the in-order baseline.
-    let eager_enabled = eager_postproc_enabled();
-    let mut eager_submitted: EagerSubmitted = std::collections::HashMap::new();
+    // Vendor `m_markersBeingReplaced` + resolve-ahead: pool post-process
+    // for prefetched successors, keyed by partition `encoded_offset_bits`.
+    let mut prefetch_post_inflight: EagerSubmitted = std::collections::HashMap::new();
+    // Optional duplicate probe (GZIPPY_EAGER_POSTPROC=1) — full-cache scan
+    // on every stall; production uses handoff-triggered resolve-ahead only.
+    let eager_probe_enabled = eager_postproc_enabled();
 
     // The vendor's `processNextChunk` returns one chunk per call; the
     // caller loops in `ParallelGzipReader::read`. We inline that loop
@@ -1241,7 +1240,13 @@ fn consumer_loop<W: std::io::Write>(
                     // ~line 1361 then handles the key.
                     if window_map.promote_speculative(spec_key) {
                         EARLY_SPEC_PROMOTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        resolve_ahead_prefetch_at_handoff(block_fetcher, window_map, spec_key);
+                        queue_prefetched_marker_postprocess(
+                            block_fetcher,
+                            window_map,
+                            thread_pool,
+                            &mut prefetch_post_inflight,
+                            Some(spec_key),
+                        );
                     }
                     if trace::is_enabled() {
                         trace::emit(
@@ -1316,14 +1321,13 @@ fn consumer_loop<W: std::io::Write>(
                 // `queuePrefetchedChunkPostProcessing` overlaps post-process
                 // of ready successors with exactly this kind of stall —
                 // submit it NOW so it runs on the pool while we block.
-                if eager_enabled {
-                    eager_postprocess_prefetched(
-                        block_fetcher,
-                        window_map,
-                        thread_pool,
-                        &mut eager_submitted,
-                    );
-                }
+                queue_prefetched_marker_postprocess(
+                    block_fetcher,
+                    window_map,
+                    thread_pool,
+                    &mut prefetch_post_inflight,
+                    None,
+                );
                 let t_fg = std::time::Instant::now();
                 let _tv2 = trace_v2::SpanGuard::begin_with(
                     "wait.block_fetcher_get",
@@ -1441,28 +1445,14 @@ fn consumer_loop<W: std::io::Write>(
                     ),
                     "t",
                 );
-                resolve_ahead_prefetch_at_handoff(block_fetcher, window_map, chunk_end_bit);
-            }
-            predecessor_window_for_postprocess = None;
-        } else if chunk.markers_resolved {
-            // Worker resolve-ahead: apply_window + narrow already ran; publish
-            // the successor tail on the consumer (same as the marker branch).
-            if let Some((_pred_key, pred)) =
-                predecessor_window_for_markers(window_map, chunk.encoded_offset_bits)
-            {
-                let window_bytes = materialize_window(&pred);
-                let tail = chunk.get_last_window_vec(&window_bytes);
-                window_map.insert_owned_none(chunk_end_bit, tail);
-                trace_v2::emit_instant(
-                    "causal.window_publish",
-                    &format!(
-                        r#""start_bit":{},"end_bit":{chunk_end_bit},"site":"consumer_resolve_ahead_tail""#,
-                        chunk.encoded_offset_bits
-                    ),
-                    "t",
+                queue_prefetched_marker_postprocess(
+                    block_fetcher,
+                    window_map,
+                    thread_pool,
+                    &mut prefetch_post_inflight,
+                    Some(chunk_end_bit),
                 );
             }
-            resolve_ahead_prefetch_at_handoff(block_fetcher, window_map, chunk_end_bit);
             predecessor_window_for_postprocess = None;
         } else {
             // Vendor `waitForReplacedMarkers` (GzipChunkFetcher.hpp:478-518)
@@ -1513,11 +1503,7 @@ fn consumer_loop<W: std::io::Write>(
                         total_crc,
                         total_size,
                         block_fetcher,
-                        if eager_enabled {
-                            Some((thread_pool, &mut eager_submitted))
-                        } else {
-                            None
-                        },
+                        Some((thread_pool, &mut prefetch_post_inflight)),
                     )?;
                 }
             }
@@ -1552,7 +1538,13 @@ fn consumer_loop<W: std::io::Write>(
                 ),
                 "t",
             );
-            resolve_ahead_prefetch_at_handoff(block_fetcher, window_map, chunk_end_bit);
+            queue_prefetched_marker_postprocess(
+                block_fetcher,
+                window_map,
+                thread_pool,
+                &mut prefetch_post_inflight,
+                Some(chunk_end_bit),
+            );
             predecessor_window_for_postprocess = Some(window);
         }
 
@@ -1646,9 +1638,9 @@ fn consumer_loop<W: std::io::Write>(
                     // eager probe keyed on the chunk's pre-set offset;
                     // post-processing the same chunk+window earlier vs.
                     // now yields identical bytes.
-                    let reuse = if eager_enabled {
+                    let reuse = {
                         use std::sync::atomic::Ordering;
-                        match eager_submitted.remove(&chunk_offset_pre_set) {
+                        match prefetch_post_inflight.remove(&chunk_offset_pre_set) {
                             Some((eager_pred_key, eager_rx))
                                 if consumer_pred_key == Some(eager_pred_key) =>
                             {
@@ -1667,8 +1659,6 @@ fn consumer_loop<W: std::io::Write>(
                                 None
                             }
                         }
-                    } else {
-                        None
                     };
                     let rx = match reuse {
                         Some(eager_rx) => eager_rx,
@@ -1708,11 +1698,7 @@ fn consumer_loop<W: std::io::Write>(
                 total_crc,
                 total_size,
                 block_fetcher,
-                if eager_enabled {
-                    Some((thread_pool, &mut eager_submitted))
-                } else {
-                    None
-                },
+                Some((thread_pool, &mut prefetch_post_inflight)),
             )?;
         }
         iter_us_sum += t_iter.elapsed().as_micros();
@@ -1729,11 +1715,7 @@ fn consumer_loop<W: std::io::Write>(
             total_crc,
             total_size,
             block_fetcher,
-            if eager_enabled {
-                Some((thread_pool, &mut eager_submitted))
-            } else {
-                None
-            },
+            Some((thread_pool, &mut prefetch_post_inflight)),
         )?;
     }
     let _ = submit_us_sum; // reserved for future submit-only timing
@@ -1753,7 +1735,7 @@ fn consumer_loop<W: std::io::Write>(
     // the lever actually fired. If `submitted ≈ 0`, the prefetch cache is
     // empty during the stall and the real lever is prefetch DEPTH, not
     // post-process eagerness.
-    if eager_enabled {
+    if eager_probe_enabled {
         use std::sync::atomic::Ordering;
         let runs = EAGER_PROBE_RUNS.load(Ordering::Relaxed);
         let inspected = EAGER_PROBE_INSPECTED.load(Ordering::Relaxed);
@@ -1930,96 +1912,10 @@ fn eager_postprocess_prefetched(
     block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
     window_map: &WindowMap,
     thread_pool: &Arc<ThreadPool>,
-    eager_submitted: &mut EagerSubmitted,
+    in_flight: &mut EagerSubmitted,
 ) -> usize {
-    use std::sync::atomic::Ordering;
     let _tv2 = trace_v2::SpanGuard::begin("consumer.eager_postproc");
-    EAGER_PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
-
-    // Vendor BlockFetcher.hpp:280 — drain ready in-flight prefetches into
-    // the prefetch cache first so `contents()` sees them.
-    block_fetcher.process_ready_prefetches();
-
-    // Vendor GzipChunkFetcher.hpp:524-528 — `prefetchCache().contents()`,
-    // sorted by offset. Non-evicting snapshot: the consumer still finds
-    // these entries on its own fetch.
-    let contents = block_fetcher.prefetch_cache_contents_sorted();
-    EAGER_PROBE_INSPECTED.fetch_add(contents.len() as u64, Ordering::Relaxed);
-
-    let mut submitted_this_run = 0usize;
-    for (_partition_key, arc) in contents {
-        let real_offset = arc.encoded_offset_bits;
-
-        // Vendor :533 — skip blocks already enqueued for marker
-        // replacement (here: already eager-submitted by a prior probe).
-        if eager_submitted.contains_key(&real_offset) {
-            continue;
-        }
-
-        // Vendor :539 — skip blocks that have no markers to resolve.
-        // apply_window is a no-op for a clean chunk; the consumer handles
-        // it on the cheap `PendingWrite::Ready` path. (Vendor's
-        // `hasBeenPostProcessed()` is the analogous "nothing to do" gate.)
-        if arc.data_with_markers.is_empty() {
-            continue;
-        }
-
-        // Vendor :544-547 — require the predecessor window.
-        //
-        // CORRECTNESS — which offset to resolve the predecessor at. The
-        // consumer accepts a speculative/prefetched chunk only when
-        // `next_block_offset == arc.max_acceptable_start_bit` (the handoff
-        // guard above), then rewrites the chunk's start to that value
-        // (`set_encoded_offset(effective_start)`, effective_start ==
-        // decode_start == max_acceptable_start_bit) and resolves
-        // `get_predecessor(chunk.encoded_offset_bits)` == `get_predecessor(
-        // max_acceptable_start_bit)`. The chunk's `encoded_offset_bits`
-        // here is the PARTITION SEED (offset.first), which for a markered
-        // bootstrap chunk is strictly BEFORE where its decoded bytes begin
-        // — resolving the predecessor there would (a) pick a wrong/earlier
-        // window and (b) never match the consumer's key. Resolve at
-        // `max_acceptable_start_bit` so the eager apply_window uses the
-        // SAME window the in-order consumer will → byte-identical, and the
-        // recorded `pred_key` matches the consumer's `consumer_pred_key`
-        // so the result is actually REUSED (not rejected by the guard).
-        let resolve_offset = arc.max_acceptable_start_bit;
-
-        // STRICT GATE — only eager-process when the predecessor window is
-        // CONFIRMED-published at the EXACT key the consumer will use
-        // (`contains(resolve_offset)`), not merely "some earlier window
-        // exists" (`has_predecessor`). Design B promotes a confirmed
-        // chunk's clean tail at its `chunk_end_bit` (== the successor's
-        // `max_acceptable_start_bit`) on accept; the serial publish does
-        // the same. Requiring an exact key here guarantees we NEVER
-        // eager-resolve against an unconfirmed/earlier predecessor — the
-        // crux correctness invariant. Range-lookup `get_predecessor` would
-        // silently return a stale earlier window when the true predecessor
-        // hasn't been published yet, corrupting the chunk.
-        let Some((pred_key, predecessor_window)) =
-            confirmed_predecessor_window(window_map, resolve_offset)
-        else {
-            continue;
-        };
-
-        // Vendor :549 — submit apply_window. Operate on a CLONE so the
-        // cached Arc is untouched and the consumer's fetch still hits.
-        // Record `pred_key` so the consumer can verify it would resolve
-        // against the SAME predecessor window before reusing this result
-        // (byte-identity guard for the speculative/overshoot case where
-        // the consumer rewrites the chunk's start offset).
-        let chunk_clone: ChunkData = (*arc).clone();
-        let rx =
-            submit_post_process_to_pool(thread_pool, chunk_clone, predecessor_window, real_offset);
-        eager_submitted.insert(real_offset, (pred_key, rx));
-        submitted_this_run += 1;
-    }
-
-    EAGER_PROBE_SUBMITTED.fetch_add(submitted_this_run as u64, Ordering::Relaxed);
-    if submitted_this_run > 0 {
-        EAGER_PROBE_RUNS_NONEMPTY.fetch_add(1, Ordering::Relaxed);
-        EAGER_PROBE_MAX_PER_RUN.fetch_max(submitted_this_run as u64, Ordering::Relaxed);
-    }
-    submitted_this_run
+    queue_prefetched_marker_postprocess(block_fetcher, window_map, thread_pool, in_flight, None)
 }
 
 #[cfg(parallel_sm)]
@@ -2400,7 +2296,8 @@ fn run_decode_task(
                     ),
                     "t",
                 );
-                resolve_ahead_prefetch_at_handoff(block_fetcher, window_map, chunk_end_bit);
+                // Consumer queues resolve-ahead when this tail is confirmed
+                // (vendor `queuePrefetchedChunkPostProcessing` on orchestrator).
                 EARLY_WINDOW_PUBLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             } else {
                 EARLY_WINDOW_TAIL_NOT_CLEAN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2550,90 +2447,84 @@ fn reanchor_chunk_to_handoff(chunk: &mut ChunkData, handoff_bit: usize) {
     }
 }
 
-/// Worker-side resolve-ahead (Design D): when decode finishes with markers and
-/// the predecessor window is confirmed at `max_acceptable_start_bit`, run
-/// `apply_window` on the decode worker and publish the tail before the consumer
-/// reaches this chunk.
+/// Vendor `queuePrefetchedChunkPostProcessing` (GzipChunkFetcher.hpp:520-551).
+/// Submits pool `run_post_process_task` on prefetched clones (never mutates
+/// the cached `Arc`). `handoff_key`: `Some(k)` after a confirmed tail publish
+/// at `k` (resolve-ahead chain); `None` scans the whole cache during a stall.
 #[cfg(parallel_sm)]
-fn try_worker_resolve_ahead(chunk: &mut ChunkData, window_map: &WindowMap) -> bool {
-    use std::sync::atomic::Ordering;
-    // Disabled until worker resolve + consumer tail publish match pool
-    // `run_post_process_task` byte-for-byte on silesia-large (CRC gate).
-    let _ = (chunk, window_map);
-    return false;
-    #[allow(unreachable_code)]
-    if !chunk_may_resolve_markers_early(chunk) {
-        return false;
-    }
-    let handoff = chunk.encoded_offset_bits;
-    if handoff != chunk.max_acceptable_start_bit {
-        return false;
-    }
-    RESOLVE_AHEAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-    let Some((_, pred_w)) = confirmed_predecessor_window(window_map, handoff) else {
-        return false;
-    };
-    let _tv2 = trace_v2::SpanGuard::begin_with(
-        "worker.resolve_ahead",
-        &format!(
-            r#""start_bit":{},"marker_bytes":{},"handoff":{}"#,
-            chunk.encoded_offset_bits,
-            chunk.data_with_markers.len(),
-            handoff,
-        ),
-    );
-    let bytes = materialize_window(&pred_w);
-    let start_bit = chunk.encoded_offset_bits;
-    let marker_bytes = chunk.data_with_markers.len();
-    resolve_chunk_markers_on_chunk(chunk, bytes.as_ref());
-    // Leave `markers_resolved` false so the consumer still runs the pool
-    // post-process path (byte-identical to serial). Resolve-ahead only
-    // warms cache clones via `resolve_ahead_prefetch_at_handoff`.
-    // Tail publish stays on the consumer (vendor publishes after post-process
-    // ordering on the orchestrator thread). Publishing here *after* resolve
-    // disagreed with the serial branch (publish before pool post-process) and
-    // corrupted successor windows on silesia-large.
-    trace_v2::emit_instant(
-        "causal.tax",
-        &format!(
-            r#""start_bit":{start_bit},"marker_bytes":{marker_bytes},"resolve_us":0,"site":"worker_resolve_ahead""#,
-        ),
-        "t",
-    );
-    RESOLVE_AHEAD_OK.fetch_add(1, Ordering::Relaxed);
-    true
-}
-
-/// After a confirmed window is published at `handoff_key`, scan the
-/// prefetch cache for successors whose `max_acceptable_start_bit` equals
-/// that key and run worker resolve-ahead while `contains(handoff_key)`.
-#[cfg(parallel_sm)]
-fn resolve_ahead_prefetch_at_handoff(
+fn queue_prefetched_marker_postprocess(
     block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
     window_map: &WindowMap,
-    handoff_key: usize,
-) {
-    if !window_map.contains(handoff_key) {
-        return;
+    thread_pool: &Arc<ThreadPool>,
+    in_flight: &mut EagerSubmitted,
+    handoff_key: Option<usize>,
+) -> usize {
+    use std::sync::atomic::Ordering;
+    if let Some(key) = handoff_key {
+        if !window_map.contains(key) {
+            return 0;
+        }
+    } else {
+        EAGER_PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
     }
+    let _tv2 = trace_v2::SpanGuard::begin_with(
+        "consumer.queue_prefetched_postproc",
+        &format!(r#""handoff_key":{}"#, handoff_key.unwrap_or(0)),
+    );
     block_fetcher.process_ready_prefetches();
     let contents = block_fetcher.prefetch_cache_contents_sorted();
-    for (cache_key, arc) in contents {
-        if arc.max_acceptable_start_bit != handoff_key {
-            continue;
+    let n_inspected = contents.len();
+    let mut submitted = 0usize;
+    for (_partition_key, arc) in contents {
+        let resolve_offset = arc.max_acceptable_start_bit;
+        if let Some(key) = handoff_key {
+            if resolve_offset != key {
+                continue;
+            }
         }
         if !chunk_may_resolve_markers_early(arc.as_ref()) {
             continue;
         }
-        let mut chunk = (*arc).clone();
-        reanchor_chunk_to_handoff(&mut chunk, handoff_key);
-        chunk.markers_resolved = false;
-        if try_worker_resolve_ahead(&mut chunk, window_map) {
-            let next_handoff = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-            block_fetcher.insert_prefetched(cache_key, Arc::new(chunk));
-            resolve_ahead_prefetch_at_handoff(block_fetcher, window_map, next_handoff);
+        let real_offset = arc.encoded_offset_bits;
+        if in_flight.contains_key(&real_offset) {
+            continue;
+        }
+        if arc.data_with_markers.is_empty() {
+            continue;
+        }
+        let Some((pred_key, predecessor_window)) =
+            confirmed_predecessor_window(window_map, resolve_offset)
+        else {
+            continue;
+        };
+        let mut chunk_clone = (*arc).clone();
+        reanchor_chunk_to_handoff(&mut chunk_clone, resolve_offset);
+        let rx =
+            submit_post_process_to_pool(thread_pool, chunk_clone, predecessor_window, real_offset);
+        in_flight.insert(real_offset, (pred_key, rx));
+        submitted += 1;
+        if handoff_key.is_some() {
+            RESOLVE_AHEAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+            RESOLVE_AHEAD_OK.fetch_add(1, Ordering::Relaxed);
+            let next_handoff = arc.encoded_offset_bits + arc.encoded_size_bits;
+            submitted += queue_prefetched_marker_postprocess(
+                block_fetcher,
+                window_map,
+                thread_pool,
+                in_flight,
+                Some(next_handoff),
+            );
         }
     }
+    if handoff_key.is_none() {
+        EAGER_PROBE_INSPECTED.fetch_add(n_inspected as u64, Ordering::Relaxed);
+        EAGER_PROBE_SUBMITTED.fetch_add(submitted as u64, Ordering::Relaxed);
+        if submitted > 0 {
+            EAGER_PROBE_RUNS_NONEMPTY.fetch_add(1, Ordering::Relaxed);
+            EAGER_PROBE_MAX_PER_RUN.fetch_max(submitted as u64, Ordering::Relaxed);
+        }
+    }
+    submitted
 }
 
 /// Pool-side execution of a post-process task. Mirror of the lambda
@@ -3232,8 +3123,14 @@ fn drain_one_pending<W: std::io::Write>(
     // Vendor GzipChunkFetcher.hpp:513 — queue successor post-processing
     // BEFORE blocking on the head chunk's future, but only when the head is
     // actually an in-flight `Async` (else there is no wait to overlap).
-    if let (PendingWrite::Async { .. }, Some((thread_pool, eager_submitted))) = (&head, eager_ctx) {
-        eager_postprocess_prefetched(block_fetcher, window_map, thread_pool, eager_submitted);
+    if let (PendingWrite::Async { .. }, Some((thread_pool, in_flight))) = (&head, eager_ctx) {
+        queue_prefetched_marker_postprocess(
+            block_fetcher,
+            window_map,
+            thread_pool,
+            in_flight,
+            None,
+        );
     }
     let t_chunk = std::time::Instant::now();
     let t_recv = std::time::Instant::now();
