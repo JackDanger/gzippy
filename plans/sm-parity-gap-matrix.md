@@ -12,12 +12,12 @@
 |----|-------------------|-----------------|----------------|--------|
 | **A** | Total wall | 1.63× LOSS | Sum of rows below; re-Fulcrum after each | Ongoing |
 | **B** | Publish-chain binds | `fulcrum model` residual ≈ 0 | Reduce **C** + **E/F** | Confirmed |
-| **C** | `L_resolve` per link | mean **~20 ms**, p95 **~121 ms** | **Design D** worker resolve-ahead; measure rg same spans | **Wired** `GZIPPY_RESOLVE_AHEAD=1` (OFF default) |
+| **C** | `L_resolve` per link | mean **~20 ms**, p95 **~121 ms** | **Design D** worker resolve-ahead | **Measured TIE** (inert: 0 exact marker chunks in cache @ handoff) |
 | **D** | Consumer wait (`block_fetcher_get` / `future_recv`) | ~89% wall WAIT | Symptom of decode supply + **C**; not core steal (trisection TIE) | Follow **C**, **E/F** |
 | **E** | Clean inflate (`d_c`) | `worker.stream_inflate` **~2×** busy vs rg `isal_stream_inflate` | Fastloop / BMI2 / prefetch in `decode_huffman_body_resumable` | Open |
 | **F** | Window-absent bootstrap (`d_w`) | `worker.bootstrap` **~2121 ms** busy; +30% wall @ +100% bootstrap slow-inject | Speed `deflate_block` / `marker_decode_step` | Open |
 | **G** | Runtime WA% vs static | 90% vs 31% | **Accept**; make WA cheap (**F**, **K**), don't cap prefetch (D6 refuted) | Policy |
-| **H** | Partition-seed key mismatch | 37/38 WA = KEY-MISMATCH | Design B promote/evict; no `get_predecessor` in boundary trials | Partial |
+| **H** | Partition-seed key mismatch | 37/38 WA = KEY-MISMATCH | **Design H** handoff decode via `get_predecessor(stop_hint)` on speculative prefetch | **Wired** (ship-gate: Fulcrum wall ↓, `HANDOFF_DECODE_CLEAN_OK` > 0) |
 | **I** | Boundary trial cost | `scan_candidate` **+1373 ms** busy | Tail prefilter + no double-bootstrap (`e899062`); Kraft pre-reject | Partial |
 | **J** | `pool.pick` | **+618 ms** busy | Fewer tasks (**I**, **C**); `pick.wait` vs `pick.lock` trace | Open |
 | **K** | Marker resolve tax | apply+narrow; rg `apply_window` **~238 ms** busy | Fused path ≥16 KiB; **C** moves resolve off consumer | Partial |
@@ -74,7 +74,7 @@
 
 ## Execution order
 
-1. Measure **C** (`GZIPPY_RESOLVE_AHEAD=1`) + rg `L_resolve` parity instrumentation.
+1. Measure **H** (handoff clean decode) — locked Fulcrum.
 2. **F/E** (bootstrap + clean inflate) with perturbation gates.
 3. **L/M** (output + segments) — bounded ceilings.
 4. **I/J** (trials + pool) — incremental.
