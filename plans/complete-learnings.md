@@ -1,5 +1,13 @@
 # Complete learnings — gzippy → rapidgzip parity campaign (x86 single-member decode)
 
+> **STATUS: HISTORICAL (2026-06-03).** §0–§1 tension (consumer-chain vs clean-decode floor) is
+> resolved for **shipping decisions** by locked Fulcrum: **RATE-bound decode** (`worker.bootstrap` +
+> `worker.stream_inflate`), publish-chain binds wall. Verdicts: [`wall-progress.md`](wall-progress.md).
+> **Production path correction:** x86 parallel SM uses **pure-Rust** inflate when built with
+> `pure-rust-inflate`, not “ISA-L clean + Rust bootstrap” (§0 line 21 is stale).
+
+---
+
 _2026-05-31. The full knowledge body, advisor-audited for completeness. Companions:
 `refreshed-plan.md`, `x86-falsification-ledger.md`, `wall-progress.md`, and the memory notes
 (`project_t8_saturated_pool_diag_2026_05_30`, `project_wall_is_consumer_critical_path`,

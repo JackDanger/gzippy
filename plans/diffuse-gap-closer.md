@@ -1,5 +1,10 @@
 # Closing a diffuse performance gap, provably — design (v2, adversary-hardened)
 
+> **STATUS: METHODOLOGY ONLY (2026-06-03).** Theory doc; not a shipping plan. Active work:
+> [`sm-parity-gap-matrix.md`](sm-parity-gap-matrix.md).
+
+---
+
 > v1 claimed `wall ≡ Σ(critical-path spans)` as an *identity* and built a closure proof on it.
 > An adversary broke that proof (§0). This v2 keeps the parts that survive and replaces the proof
 > with a **two-law lower bound** that is honest about shared-resource contention, plus an

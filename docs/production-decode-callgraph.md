@@ -1,54 +1,71 @@
 # Production decode call-graph (pure-Rust, x86_64)
 
-Authoritative map of *what actually runs* on the pure-Rust decode path, to end
-the "multiple lookalike implementations, lost track of which is production"
-problem. The **live path** below is from the runtime span call-tree
-(`GZIPPY_TIMELINE=… ; timeline_analyze.py --tree`, T8 silesia-large) — it shows
-what executes, with no guessing across the lookalike decoders. Regenerate any
-time; the tree is ground truth.
+**Last updated: 2026-06-03.** Authoritative routing: [`production-paths.md`](production-paths.md).
 
-## Entry & routing (cfg-gated)
-```
-CLI → decompress::decompress_gzip_libdeflate → classify_gzip
-    → DecodePath::IsalParallelSM            (x86_64, threads>1, compressed>4 MiB)
-    → parallel::single_member::decompress_parallel → chunk_fetcher::drive
-```
-- `PARALLEL_SM = cfg!(x86_64 && (isal-compression || pure-rust-inflate))`.
-- pure-rust build (`--no-default-features --features pure-rust-inflate`):
-  `USE_ISAL_INFLATE = false` → the clean inner decoder is **ResumableInflate2**
-  (Rust), not C ISA-L. THIS is the shipping target.
-- isal-compression build: same pipeline, but `decode_chunk_isal_impl` uses the
-  C ISA-L FFI for the clean decode. (Used only as the perf oracle now.)
+## Entry (what the CLI runs)
 
-## Live worker decode path (runtime call-tree)
 ```
-pool.run_task → worker.decode_chunk → worker.scan_run → worker.scan_candidate
-  ├─ window-ABSENT chunk (~31% on silesia): decode_chunk_marker_bootstrap_then_isal
-  │    1. bootstrap_with_deflate_block → deflate_block::Block      [u16 marker ring]
-  │    2. chunk.append_markered(&bootstrap.markers)                [COPY #1 — gzippy-only]
-  │    3. decode_chunk_isal_impl → ResumableInflate2::read_stream  [u8 clean tail]
-  │    4. absorb_isal_tail(&mut chunk, tail)                       [COPY #2 — gzippy-only]
-  └─ window-KNOWN chunk: decode_chunk_isal_impl → ResumableInflate2 [u8 clean]
-→ post_process.task: apply_window (resolve u16 markers) + narrow_u16_to_u8 [COPY #3] + crc
-→ consumer.drain → write_all(chunk.narrowed) + write_all(chunk.data)
+decompress_gzip_libdeflate → classify_gzip → DecodePath::IsalParallelSM
+  → single_member::decompress_parallel → sm_driver::read_parallel_sm
+  → chunk_fetcher::drive
 ```
-rapidgzip's equivalent decodes each chunk **one-pass** into 128 KiB-segmented
-`data_with_markers`/`data` buffers — it has **no** append_markered / absorb_isal_tail
-(COPY #1/#2). Those 382 ms of merge copies are gzippy-specific (confirmed three
-ways: fault-sampling 66% in memmove, the span trace, and this call-tree).
 
-## The TWO production inner decoders (pure-Rust)
-| decoder | file | role |
-|---|---|---|
-| `ResumableInflate2` | `src/decompress/inflate/resumable.rs` | clean u8 resumable FASTLOOP; window-known chunks + bootstrap ISA-L tail |
-| `deflate_block::Block` | `src/decompress/parallel/deflate_block.rs` | window-absent u16 marker ring; the bootstrap |
+Build: `--no-default-features --features pure-rust-inflate` → `pure_inflate_decode` →
+**no C ISA-L in the decode graph**. `IsalInflateWrapper` is a name; it wraps
+`ResumableInflate2` (`inflate_wrapper.rs`).
 
-## NOT on the production path (do not optimize; candidates for deletion task #6)
-- `consume_first` (`inflate/consume_first_decode.rs`): `examples/inner_bench` + the
-  inline match-copy helpers `ResumableInflate2` calls; non-resumable. (Helpers ARE live.)
-- `isal_lut_bulk`: env-gated `GZIPPY_ISAL_PURE_BULK` (OFF).
-- Cluster `combined_lut` / `packed_lut` / `simd_huffman` / `two_level_table` /
-  `ultra_fast_inflate` / `double_literal` / `jit_decode` / `specialized_decode`:
-  mutually-referencing; **not observed on the production call-tree**. Reachability
-  from production is UNVERIFIED by grep (they reference each other) — confirm
-  unreachable before deletion (golden + fuzz gate). `vector_huffman` already deleted.
+## Per-chunk decode (same *shape* as rapidgzip)
+
+**One function:** `gzip_chunk::decode_chunk_with_rapidgzip_impl` (vendor
+`decodeChunkWithRapidgzip` + `finishDecodeChunkWithInexactOffset`).
+
+It is **not** the refuted “two-pass scan + re-decode” architecture. It **is** a
+**two-stage loop inside each chunk**:
+
+| Stage | When | Code | Output |
+|-------|------|------|--------|
+| **1. Marker bootstrap** | No exact predecessor window at worker start | `marker_decode_step` → `deflate_block::Block` | u16 into `chunk.data_with_markers` until 32 KiB clean at a block boundary |
+| **2. Clean streaming inflate** | After handoff (or immediately if 32 KiB window known) | `finish_decode_chunk_inexact_offset` → `ResumableInflate2::read_stream` | u8 into `chunk.data` (segmented 128 KiB tails) |
+
+rapidgzip uses the **same outer shape** (marker bytes until clean window, then fast
+stream decode on the same chunk). The gap is **implementation speed** (Rust marker
+ring + resumable inflate vs vendor’s fast paths), plus gzippy-specific **post-process**
+(`apply_window` / `narrow_markers_in_place`) and **publish-chain** latency — not a
+missing second stage.
+
+Legacy `bootstrap_with_deflate_block` remains in the tree for tests/trials; **production
+workers call `decode_chunk` / `decode_chunk_window_absent` → `decode_chunk_with_rapidgzip_impl`.**
+
+## Worker dispatch (`chunk_fetcher::run_decode_task`)
+
+```
+pool.run_task → worker.decode_chunk
+  ├─ chunk 0 or window_map.get(start_bit) exact  → decode_chunk (often skips stage 1)
+  ├─ Design H handoff window (spec prefetch)     → decode_chunk @ handoff key (usually 0 hits)
+  └─ else                                        → speculative_decode_find_boundary
+       → decode_chunk_window_absent (stage 1 → 2)
+```
+
+## After decode (still on critical path for wall)
+
+```
+post_process.task: resolve_chunk_markers (apply_window) + narrow_markers_in_place + CRC
+consumer: wait for chunk → write output + publish 32 KiB tail window (serial chain)
+```
+
+`append_markered` / `absorb_isal_tail` were **removed from the hot unified path**; markers
+are written via `MarkerSink` during stage 1. Narrowing still runs in post-process when markers
+are present.
+
+## NOT production (do not optimize as “shipping”)
+
+See [`production-paths.md`](production-paths.md) §5 — oracles, bypass, `GZIPPY_CLEAN_WINDOW_ORACLE`
+(validate instrument before trust), experimental modules not on the trace tree.
+
+## Regenerate the live tree
+
+```bash
+GZIPPY_TIMELINE=/tmp/t.json.gz GZIPPY_FORCE_PARALLEL_SM=1 \
+  gzippy -d -c -p8 /path/to/silesia-large.gz > /dev/null
+# then timeline_analyze.py --tree on the guest/host artifact
+```

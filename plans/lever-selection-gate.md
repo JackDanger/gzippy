@@ -1,5 +1,11 @@
 # Lever-selection gate (Amdahl gate) — read BEFORE attacking any perf lever
 
+> **Note (2026-06-03):** Methodology still applies. The §STANDING DECOMPOSITION percentages are
+> stale; use [`sm-parity-gap-matrix.md`](sm-parity-gap-matrix.md) + causal perturbation
+> (`wall-progress.md`) for current lever ranking.
+
+---
+
 The 2026-05-30 post-mortem's root cause was NOT bad measurement (per-lever refutation was
 rigorous). It was **lever SELECTION**: ~14 levers were spent in a slice the project's own
 *good* instrument had already sized at 14% of the gap, while the 86% slice with a proven

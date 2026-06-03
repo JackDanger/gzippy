@@ -1,5 +1,11 @@
 # Plan: locate WHY compiled gzippy still loses to compiled rapidgzip (x86 T8)
 
+> **STATUS: SUPERSEDED (2026-06-03).** Phases 0–4 largely executed via Fulcrum + footprint
+> oracles; residual is **decode rate + publish-chain** per [`sm-parity-gap-matrix.md`](sm-parity-gap-matrix.md),
+> not an unlocated stall hunt.
+
+---
+
 ## The cornered residual (what's already closed, so we don't re-tread)
 - T1 = PARITY (IPC 2.05=2.05). The whole gap is T8+ (IPC collapses 2.05→1.55; rapidgzip holds →1.99).
 - DECODE is competitive-or-FASTER (window-absent 0.64× cyc/byte, clean 1.04×, ~0.92× instructions). NOT the gap.

@@ -5,6 +5,11 @@ alwaysApply: true
 
 # Remaining Losses — Plan (Feb 24 2026)
 
+> **SUPERSEDED for parallel-SM work.** Fleet W/L table below is stale. Use
+> [`plans/sm-parity-gap-matrix.md`](../../plans/sm-parity-gap-matrix.md) and Fulcrum vs rapidgzip.
+
+---
+
 ## Summary: 56W / 16L (Fleet Run 9, all 12 instances completed)
 
 ## Changes Confirmed This Session (Feb 24)

@@ -1,5 +1,10 @@
 # Structural rewrite to x86 parity — SCOPING (user-chosen 2026-06-01)
 
+> **STATUS: SUPERSEDED (2026-06-03).** Prerequisite measurements moved to Fulcrum memlife/TMA.
+> Do not start a blind port without [`sm-parity-gap-matrix.md`](sm-parity-gap-matrix.md) execution order.
+
+---
+
 User chose "attempt the structural rewrite" after the located-lever space was
 exhausted (fill lever dead both halves; decode-rate ~15%-bounded; the residual is
 the diffuse 1.19/1.45× T8/16 shipped-ISA-L stall gap). Goal per CLAUDE.md: faithful

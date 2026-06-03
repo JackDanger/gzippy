@@ -1,5 +1,12 @@
 # Closing the gap to rapidgzip — clean state & lever sequence
 
+> **STATUS: PARTIALLY SUPERSEDED (2026-06-03).** §0–§2 inner-loop / resumable-contract notes
+> remain useful. “Focus = parallel scaling only” is **stale** — locked Fulcrum shows ~1.65× wall
+> with decode-bound bootstrap + inflate. Current execution order:
+> [`sm-parity-gap-matrix.md`](sm-parity-gap-matrix.md).
+
+---
+
 *Rewritten clean 2026-05-28. The prior 485-line layered-corrections version is
 in git history (`git log -- plans/rust-rapidgzip.md`). Everything below is
 current truth, measured on neurotic LXC 199 (i7-13700T, 8P+8E) with the

@@ -18,6 +18,8 @@
 | **F** | Window-absent bootstrap (`d_w`) | `worker.bootstrap` **~2121 ms** busy; +30% wall @ +100% bootstrap slow-inject | `emit_backref_ring`: short copy unroll, contiguous marker scan, cold `classify_and_delay`; causal **confirmed** | Open (Fulcrum trace **TIE** 758 vs 754–759 ms) |
 | **G** | Runtime WA% vs static | 90% vs 31% | **Accept**; make WA cheap (**F**, **K**), don't cap prefetch (D6 refuted) | Policy |
 | **H** | Partition-seed key mismatch | 37/38 WA = KEY-MISMATCH | **Design H** handoff decode via `get_predecessor(stop_hint)` on speculative prefetch | **Measured TIE** (`HANDOFF_DECODE_CLEAN_OK=0`; handoff key not in map at decode start) |
+| **H′** | Pred @ `get_predecessor(start)` | — | Decode at `pred_key < start` + trim to partition seed (vendor spacing fix) | **Reverted** (`5755772`): breaks `test_prefetch_next_filesize_accept_fires` on 56 MiB low-entropy fixture (`Stored block len=0`); needs chain-valid pred only |
+| **E′** | Clean tail path split | resumable wrapper on clean finish | **P1** `finish_decode_chunk_bulk_lut` (`GZIPPY_ISAL_PURE_BULK`, default ON) | **Shipped** `5755772`; re-Fulcrum pending |
 | **I** | Boundary trial cost | `scan_candidate` **+1373 ms** busy | Tail prefilter + no double-bootstrap (`e899062`); Kraft pre-reject | Partial |
 | **J** | `pool.pick` | **+618 ms** busy | Fewer tasks (**I**, **C**); `pick.wait` vs `pick.lock` trace | Open |
 | **K** | Marker resolve tax | apply+narrow; rg `apply_window` **~238 ms** busy | Fused path ≥16 KiB; **C** moves resolve off consumer | Partial |
@@ -81,9 +83,36 @@
 
 ---
 
+## Process alignment with rapidgzip (what “match” means)
+
+**Already aligned (structure):** prefetcher → worker pool → `WindowMap` → in-order consumer;
+per-chunk `decodeChunkWithRapidgzip` shape (marker phase → stream finish on same chunk);
+speculative boundaries; post-process `apply_window`; CRC/ISIZE verify.
+
+**Still different (why instructions ≠ rapidgzip):**
+
+| Area | rapidgzip | gzippy today | Close via |
+|------|-----------|--------------|-----------|
+| Marker bootstrap | Fast C/ISA-L-class path in unified decoder | `deflate_block::Block` pure Rust (~2× busy) | **P2 unified decoder** (one fast loop with marker emit mode) or speed `deflate_block` to parity |
+| Clean inflate | ISA-L stream | `ResumableInflate2` (~2× `stream_inflate` busy) | **P1 inner loop** (libdeflate techniques, yield tax) per `unified-decoder.md` |
+| Publish / resolve | Pool post-process when window ready | Mostly consumer + `L_resolve` | Design C (TIE so far), consumer output (L) |
+| Chain accept | Range + invariant | `max == decode_start` guard | Full chain invariant (refreshed-plan §1.4) if guard-rejects still fire |
+| Buffer motion | Segmented write in place | `narrow_markers_in_place` + segmented `data` | Memlife/L/M; verify on trace |
+
+**Not the plan:** two-pass scan; arm64-disable parallel SM (obsolete with `pure-rust-inflate`);
+treating Fulcrum Δbusy as verdict without perturbation.
+
+**Build order to “match process”:** (1) measure with counters + Fulcrum, (2) P1 clean decoder
+wall win, (3) P2 same decoder for bootstrap (delete hot `deflate_block` path), (4) chain +
+resolve scheduling, (5) output path.
+
+---
+
 ## References
 
+- [`docs/production-paths.md`](../docs/production-paths.md) — routing truth
+- [`docs/production-decode-callgraph.md`](../docs/production-decode-callgraph.md) — live call graph
 - `plans/parallel-sm-model.md` — wall model
-- `plans/fixed-architecture-design.md` — Design D rationale
+- `plans/README.md` — which plans are active vs superseded
 - `docs/dead-ends/` — refuted levers
 - `docs/fulcrum-sota.md` — instrument semantics

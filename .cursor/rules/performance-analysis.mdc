@@ -3,7 +3,14 @@ description: Performance status and strategy — cloud fleet is source of truth
 alwaysApply: true
 ---
 
-# Performance Status: 56W / 16L (Feb 24 2026, Fleet Run 9)
+# Performance Status
+
+> **STALE SCORECARD (Feb 2026 fleet below).** Single-member rapidgzip parity is tracked via
+> locked Fulcrum on neurotic (`scripts/bench/run_locked_fulcrum.sh`) and
+> [`plans/sm-parity-gap-matrix.md`](../../plans/sm-parity-gap-matrix.md) / [`plans/wall-progress.md`](../../plans/wall-progress.md).
+> Production decode path: [`docs/production-paths.md`](../../docs/production-paths.md).
+
+# Performance Status: 56W / 16L (Feb 24 2026, Fleet Run 9) — HISTORICAL
 
 ## Score Breakdown (Fleet Run 9, 72 scenarios)
 
