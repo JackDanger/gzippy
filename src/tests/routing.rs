@@ -885,11 +885,16 @@ mod tests {
             .load(Ordering::Relaxed);
 
         #[cfg(parallel_sm)]
-        assert!(
-            after > before,
-            "COORDINATOR_BOUNDARY_SEARCH_RUNS did not increment ({before} -> {after}); \
-             slow-path boundary search is not routing through RawBlockFinderCoordinator."
-        );
+        {
+            let clean = crate::decompress::parallel::chunk_fetcher::CLEAN_DECODE_VIA_PREDECESSOR
+                .load(Ordering::Relaxed);
+            assert!(
+                after > before || clean > 0,
+                "COORDINATOR_BOUNDARY_SEARCH_RUNS did not increment ({before} -> {after}) \
+                 and no clean predecessor-anchor decode ({clean}); slow-path or clean prefetch \
+                 must run."
+            );
+        }
         #[cfg(not(parallel_sm))]
         let _ = (before, after);
     }

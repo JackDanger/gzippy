@@ -16,6 +16,8 @@ RESULTS_DIR := test_results
 # Build targets
 GZIPPY_BIN := $(GZIPPY_DIR)/target/release/gzippy
 UNGZIPPY_BIN := $(GZIPPY_DIR)/target/release/ungzippy
+# Parallel single-member decode is pure-Rust-only (rapidgzip-shaped, no ISA-L C).
+GZIPPY_CARGO_FLAGS := --no-default-features --features pure-rust-inflate
 PIGZ_BIN := $(PIGZ_DIR)/pigz
 IGZIP_BIN := $(ISAL_DIR)/build/igzip
 RAPIDGZIP_BIN := $(RAPIDGZIP_DIR)/librapidarchive/build/src/tools/rapidgzip
@@ -94,8 +96,8 @@ $(RAPIDGZIP_BIN):
 	@echo "✓ Built rapidgzip"
 
 $(GZIPPY_BIN): FORCE
-	@echo "Building gzippy..."
-	@cd $(GZIPPY_DIR) && cargo build --release 2>&1 | grep -E "(Compiling gzippy|Finished|error)"
+	@echo "Building gzippy (pure-rust-inflate — parallel SM matches rapidgzip in Rust)..."
+	@cd $(GZIPPY_DIR) && cargo build --release --no-default-features --features pure-rust-inflate 2>&1 | grep -E "(Compiling gzippy|Finished|error)"
 	@test -f $(GZIPPY_BIN) || (echo "✗ gzippy build failed"; exit 1)
 	@echo "✓ Built gzippy"
 
@@ -119,14 +121,14 @@ FORCE:
 quick: $(GZIPPY_BIN)
 	@echo "══ make quick ══════════════════════════════════════════"
 	@echo "── Stage 1: correctness + routing smoke ────────────────"
-	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release correctness 2>&1 | tail -3
-	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release routing 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release $(GZIPPY_CARGO_FLAGS) correctness 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release $(GZIPPY_CARGO_FLAGS) routing 2>&1 | tail -3
 	@echo "── Stage 2: allocation budget ──────────────────────────"
-	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release alloc_budget 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release $(GZIPPY_CARGO_FLAGS) alloc_budget 2>&1 | tail -3
 	@echo "── Stage 3: differential ratio vs libdeflate ───────────"
-	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release diff_ratio 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release $(GZIPPY_CARGO_FLAGS) diff_ratio 2>&1 | tail -3
 	@echo "── Stage 4: hot-path hit rates ─────────────────────────"
-	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release hot_path 2>&1 | tail -3
+	@set -o pipefail; timeout $(QUICK_TIMEOUT) cargo test --release $(GZIPPY_CARGO_FLAGS) hot_path 2>&1 | tail -3
 	@echo "════════════════════════════════════════════════════════"
 	@echo "✓ make quick passed"
 
