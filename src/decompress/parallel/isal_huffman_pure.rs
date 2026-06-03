@@ -1375,21 +1375,24 @@ mod tests {
         // is that decode returns bit_count > 0 for EVERY in-LUT entry
         // (so a buggy `symbol == INVALID_SYMBOL` check would catch a
         // valid entry and error).
+        // Fixed-Huffman lit/len lengths (RFC 1951 §3.2.6) — Kraft-valid.
         let mut code_lengths = vec![0u8; LIT_LEN];
-        for sym in 0..8 {
+        for sym in 0..144 {
             code_lengths[sym] = 8;
         }
-        code_lengths[256] = 1; // EOB
-        for sym in 8..256 {
+        for sym in 144..256 {
             code_lengths[sym] = 9;
         }
-        for sym in 257..286 {
-            code_lengths[sym] = 9;
+        for sym in 256..280 {
+            code_lengths[sym] = 7;
+        }
+        for sym in 280..286 {
+            code_lengths[sym] = 8;
         }
         let mut decoder = IsalLitLenCodePure::new_empty();
         assert!(
             decoder.rebuild_from(&code_lengths),
-            "Kraft-valid set must build"
+            "fixed-Huffman code lengths must build"
         );
 
         // Count LUT entries with symbol bits == INVALID_SYMBOL AND
