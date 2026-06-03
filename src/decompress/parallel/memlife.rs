@@ -33,7 +33,7 @@
 //! |-----------------------|---------------------------------------------------|-----------------------|
 //! | `DataWithMarkers`     | `ChunkData::data_with_markers` (Vec<u16>, 2× width)| `DecodedData::dataWithMarkers` (MarkerVector) |
 //! | `Data`                | `ChunkData::data` (U8, clean bulk)                | `DecodedData::data` (VectorView) |
-//! | `Narrowed`            | `ChunkData::narrowed` (U8, resolve output)        | NONE — rapidgzip resolves IN-PLACE (no separate buffer) |
+//! | `Narrowed`            | `ChunkData::narrowed_len` prefix of marker segs   | IN-PLACE u8 view (no separate `narrowed` vec) |
 //! | `Window`              | 32 KiB tail windows + WindowMap storage           | `WindowMap` (compressed) |
 //! | `OutputWrite`         | bytes streamed to the writer                      | `toIoVec` writev gather |
 //!
@@ -47,11 +47,8 @@
 //!  - `copied(bytes)`        — bytes moved buffer→buffer by a memcpy/memmove
 //!    (append_markered, clean_unmarked_data shift, narrow loop).
 //!
-//! `Narrowed` is the component the in-place-resolve theory targets: in gzippy a
-//! resolve WRITES a fresh u8 buffer (alloc + write + the source read), where
-//! rapidgzip reinterprets `dataWithMarkers` in place (read+write of the same
-//! bytes, no alloc, no second buffer). The DELTA on `Narrowed` alloc+write is
-//! the exact cost of that structural divergence.
+//! `Narrowed` tracks in-place resolve: `narrow_markers_in_place` reinterprets the
+//! marker segment prefix as u8 (rapidgzip `MapMarkers` shape); no third buffer.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
