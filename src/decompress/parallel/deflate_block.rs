@@ -608,6 +608,12 @@ pub struct Block {
         target_arch = "x86_64"
     ))]
     isal_dist: crate::decompress::parallel::isal_huffman::IsalDistCode,
+    /// Pure-Rust ISA-L LUT tables (byte-matched to igzip; same decode loop
+    /// as the C `IsalLitLenCode` / `IsalDistCode` fields above).
+    #[cfg(pure_inflate_decode)]
+    isal_litlen_pure: crate::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure,
+    #[cfg(pure_inflate_decode)]
+    isal_dist_pure: crate::decompress::parallel::isal_huffman_pure::IsalDistCodePure,
 }
 
 impl std::fmt::Debug for Block {
@@ -676,6 +682,12 @@ impl Block {
                 target_arch = "x86_64"
             ))]
             isal_dist: crate::decompress::parallel::isal_huffman::IsalDistCode::new_empty(),
+            #[cfg(pure_inflate_decode)]
+            isal_litlen_pure:
+                crate::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure::new_empty(),
+            #[cfg(pure_inflate_decode)]
+            isal_dist_pure:
+                crate::decompress::parallel::isal_huffman_pure::IsalDistCodePure::new_empty(),
         }
     }
 
@@ -1215,10 +1227,13 @@ impl Block {
     /// dead-strips marker-maintenance code in the `false` variant.
     /// Mirror of vendor's `if constexpr (containsMarkerBytes)`
     /// pattern at deflate.hpp:1311, 1379, 1652.
-    #[cfg(all(
-        feature = "isal-compression",
-        not(feature = "pure-rust-inflate"),
-        target_arch = "x86_64"
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
     ))]
     pub fn read_internal_compressed(
         &mut self,
@@ -1232,10 +1247,159 @@ impl Block {
         }
     }
 
-    #[cfg(all(
-        feature = "isal-compression",
-        not(feature = "pure-rust-inflate"),
-        target_arch = "x86_64"
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    #[inline(always)]
+    fn isal_lut_litlen_rebuild(&mut self, litlen_lens: &[u8]) -> bool {
+        #[cfg(all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ))]
+        {
+            return self.isal_litlen.rebuild_from(litlen_lens);
+        }
+        #[cfg(pure_inflate_decode)]
+        {
+            return self.isal_litlen_pure.rebuild_from(litlen_lens);
+        }
+        #[cfg(not(any(
+            all(
+                feature = "isal-compression",
+                not(feature = "pure-rust-inflate"),
+                target_arch = "x86_64"
+            ),
+            pure_inflate_decode
+        )))]
+        {
+            let _ = (self, litlen_lens);
+            false
+        }
+    }
+
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    #[inline(always)]
+    fn isal_lut_dist_rebuild(&mut self, dist_lens: &[u8]) -> bool {
+        #[cfg(all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ))]
+        {
+            return self.isal_dist.rebuild_from(dist_lens);
+        }
+        #[cfg(pure_inflate_decode)]
+        {
+            return self.isal_dist_pure.rebuild_from(dist_lens);
+        }
+        #[cfg(not(any(
+            all(
+                feature = "isal-compression",
+                not(feature = "pure-rust-inflate"),
+                target_arch = "x86_64"
+            ),
+            pure_inflate_decode
+        )))]
+        {
+            let _ = (self, dist_lens);
+            false
+        }
+    }
+
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    #[inline(always)]
+    fn isal_lut_litlen_decode(&self, bits: &mut Bits) -> (u32, u32, u32) {
+        #[cfg(all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ))]
+        {
+            let d = self.isal_litlen.decode(bits);
+            return (d.symbol, d.sym_count, d.bit_count);
+        }
+        #[cfg(pure_inflate_decode)]
+        {
+            let d = self.isal_litlen_pure.decode(bits);
+            return (d.symbol, d.sym_count, d.bit_count);
+        }
+        #[cfg(not(any(
+            all(
+                feature = "isal-compression",
+                not(feature = "pure-rust-inflate"),
+                target_arch = "x86_64"
+            ),
+            pure_inflate_decode
+        )))]
+        {
+            let _ = (self, bits);
+            (0, 0, 0)
+        }
+    }
+
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    #[inline(always)]
+    fn isal_lut_dist_decode(&self, bits: &mut Bits) -> Option<(u32, u32)> {
+        #[cfg(all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ))]
+        {
+            return self.isal_dist.decode(bits);
+        }
+        #[cfg(pure_inflate_decode)]
+        {
+            return self.isal_dist_pure.decode(bits);
+        }
+        #[cfg(not(any(
+            all(
+                feature = "isal-compression",
+                not(feature = "pure-rust-inflate"),
+                target_arch = "x86_64"
+            ),
+            pure_inflate_decode
+        )))]
+        {
+            let _ = (self, bits);
+            None
+        }
+    }
+
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
     ))]
     fn read_internal_compressed_specialized<const CONTAINS_MARKERS: bool>(
         &mut self,
@@ -1270,20 +1434,20 @@ impl Block {
         // literal_cl Vec (already pre-sized) and the fixed-Huffman lookup
         // returns &'static slices. Then rebuild the persistent ISA-L
         // tables in place from those lengths.
-        let (litlen_lens, dist_lens): (&[u8], &[u8]) = match self.compression_type {
+        let (litlen_lens, dist_lens): (Vec<u8>, Vec<u8>) = match self.compression_type {
             CompressionType::DynamicHuffman => {
                 let split = self.literal_code_count;
                 let end = split + self.distance_code_count;
                 let (lit, rest) = self.literal_cl[..end].split_at(split);
-                (lit, rest)
+                (lit.to_vec(), rest.to_vec())
             }
             _ => return Err(BlockError::InvalidCompression),
         };
 
-        if !self.isal_litlen.rebuild_from(litlen_lens) {
+        if !self.isal_lut_litlen_rebuild(&litlen_lens) {
             return Err(BlockError::InvalidCodeLengths);
         }
-        if !self.isal_dist.rebuild_from(dist_lens) {
+        if !self.isal_lut_dist_rebuild(&dist_lens) {
             return Err(BlockError::InvalidCodeLengths);
         }
 
@@ -1390,8 +1554,8 @@ impl Block {
             // `refill` advances `pos` by 0 when `bitsleft >= 56`
             // (see consume_first_decode.rs:259).
             bits.refill();
-            let decoded = self.isal_litlen.decode(bits);
-            if decoded.bit_count == 0 {
+            let (symbol, sym_count, bit_count) = self.isal_lut_litlen_decode(bits);
+            if bit_count == 0 {
                 // Inside `IsalLitLenCode::decode`, `symbol` is set to
                 // `INVALID_SYMBOL` (0x1FFF) exactly when
                 // `bit_count == 0`, so the prior
@@ -1403,9 +1567,9 @@ impl Block {
             // Consume the LUT-reported bit count (covers Huffman code +
             // any baked-in length-extra bits). Vendor's `seekAfterPeek`
             // at HuffmanCodingISAL.hpp:143 is equivalent.
-            bits.consume(decoded.bit_count);
-            let mut sym = decoded.symbol;
-            let mut sym_count = decoded.sym_count;
+            bits.consume(bit_count);
+            let mut sym = symbol;
+            let mut sym_count = sym_count;
 
             // Multi-symbol unpack loop — vendor deflate.hpp:1612-1661.
             loop {
@@ -1447,7 +1611,7 @@ impl Block {
                 if length == 0 {
                     break;
                 }
-                let (dsym, dbit) = match self.isal_dist.decode(bits) {
+                let (dsym, dbit) = match self.isal_lut_dist_decode(bits) {
                     Some(d) => d,
                     None => commit!(Err(BlockError::InvalidHuffmanCode)),
                 };
@@ -1710,391 +1874,394 @@ impl Block {
                 run_canonical_loop!(|bits: &mut Bits| litlen_hc.decode(bits))
             }
             CompressionType::DynamicHuffman => {
-                use crate::decompress::inflate::libdeflate_entry::{
-                    DistTable, LitLenTable, HUFFDEC_END_OF_BLOCK, HUFFDEC_EXCEPTIONAL,
-                };
+                #[cfg(any(
+                    all(
+                        feature = "isal-compression",
+                        not(feature = "pure-rust-inflate"),
+                        target_arch = "x86_64"
+                    ),
+                    pure_inflate_decode
+                ))]
+                {
+                    return Err(BlockError::InvalidCompression);
+                }
 
-                // CORE DECODE UNIFICATION (2026-05-31, fulcrum causal sweep):
-                // the window-absent (marker-emitting) DYNAMIC decoder now
-                // shares the CLEAN path's symbol-decode core — libdeflate's
-                // 12-bit `LitLenTable` + 9-bit `DistTable`
-                // (`inflate/libdeflate_entry.rs`) with the multi-literal
-                // chaining of `ResumableInflate2::decode_huffman_body_resumable`
-                // (`inflate/resumable.rs:1125-1361`). It REPLACES the prior
-                // ISA-L 10-bit `IsalLitLenCodePure` per-symbol decode
-                // (`isal_huffman_pure.rs`) + `get_distance_dynamic`.
-                //
-                // ONLY the symbol decode (litlen/dist code → symbol +
-                // bit-consumption + length/distance) changed. The u16 ring
-                // store, `phys`/`pos` bookkeeping, `distance_marker`
-                // maintenance, marker emission via `emit_backref_ring`, and the
-                // FASTLOOP two-tier structure are all preserved bit-for-bit.
-                //
-                // Tables are built from THIS block's Huffman code lengths
-                // (`litlen_lens`/`dist_lens`, the same slices the prior path
-                // fed `rebuild_from`). `LitLenTable::build` pre-bakes length
-                // bases + extra-bit counts into its entries (libdeflate form);
-                // `DistTable::build` does the same for distances. The
-                // length/distance EXTRA bits are extracted via
-                // `entry.decode_length`/`decode_distance` from the saved
-                // bitbuf, exactly as the clean path does.
-                let litlen = match LitLenTable::build(&litlen_lens) {
-                    Some(t) => t,
-                    None => return Err(BlockError::InvalidCodeLengths),
-                };
-                let dist = match DistTable::build(&dist_lens) {
-                    Some(t) => t,
-                    None => return Err(BlockError::InvalidCodeLengths),
-                };
+                #[cfg(not(any(
+                    all(
+                        feature = "isal-compression",
+                        not(feature = "pure-rust-inflate"),
+                        target_arch = "x86_64"
+                    ),
+                    pure_inflate_decode
+                )))]
+                {
+                    use crate::decompress::inflate::libdeflate_entry::{
+                        DistTable, LitLenTable, HUFFDEC_END_OF_BLOCK, HUFFDEC_EXCEPTIONAL,
+                    };
 
-                macro_rules! run_multi_cached_loop {
-                    () => {{
-                        const MAX_RUN_LENGTH: usize = 258;
-                        // FASTLOOP_INPUT_TAIL (mirror of resumable.rs:1110):
-                        // a conservative 32-byte tail kept off-limits to the
-                        // branchless refill so its 8-byte unaligned load never
-                        // reads past `bits.data.len()` — even on the LAST /
-                        // BFINAL block of the WHOLE input. A single FASTLOOP
-                        // iteration issues at most one branchless refill, which
-                        // advances `bits.pos` by ≤7, so the load touches at most
-                        // `(in_fastloop_end - 1) + 7 + 8 = data.len() - 18`.
-                        // 32 (vs the strictly-needed 8) keeps a comfortable
-                        // margin and matches the reference decoder. This is the
-                        // #1 correctness risk per the design note — the SAFE
-                        // tier (existing branchy decode/refill) handles the
-                        // final 32 bytes + EOB / sub-byte-EOF padding.
-                        const FASTLOOP_INPUT_TAIL: usize = 32;
-                        // Refill threshold mirrors resumable.rs:959. After a
-                        // refill bitsleft ∈ [56, 63]; a single packet's worst
-                        // case is litlen codeword (≤12) + length extras (≤5) +
-                        // dist codeword (≤12 main + ≤6 sub) + dist extras
-                        // (≤13) = ≤48 bits, so refilling whenever bitsleft < 48
-                        // guarantees every consume in a packet reads valid bits.
-                        const REFILL_THRESHOLD: u8 = 48;
-                        let n_max_to_decode = n_max_to_decode.min(RING_SIZE - MAX_RUN_LENGTH);
+                    // libdeflate canonical tables when ISA-L LUT decode is off.
+                    let litlen = match LitLenTable::build(&litlen_lens) {
+                        Some(t) => t,
+                        None => return Err(BlockError::InvalidCodeLengths),
+                    };
+                    let dist = match DistTable::build(&dist_lens) {
+                        Some(t) => t,
+                        None => return Err(BlockError::InvalidCodeLengths),
+                    };
 
-                        // Conservative FASTLOOP input bound: never let the
-                        // branchless 8-byte load reach past `data.len()`.
-                        // There is no separate output-margin bound — the u16
-                        // ring is pre-sized to RING_SIZE and `emitted` is
-                        // capped at `n_max_to_decode` (= RING_SIZE -
-                        // MAX_RUN_LENGTH), so a single packet's ≤258-byte
-                        // back-ref or ≤3 literals can never overrun it; that
-                        // check stays on the SAME `emitted < n_max_to_decode`
-                        // tier guard both loops share.
-                        let in_fastloop_end: usize =
-                            bits.data.len().saturating_sub(FASTLOOP_INPUT_TAIL);
+                    macro_rules! run_multi_cached_loop {
+                        () => {{
+                            const MAX_RUN_LENGTH: usize = 258;
+                            // FASTLOOP_INPUT_TAIL (mirror of resumable.rs:1110):
+                            // a conservative 32-byte tail kept off-limits to the
+                            // branchless refill so its 8-byte unaligned load never
+                            // reads past `bits.data.len()` — even on the LAST /
+                            // BFINAL block of the WHOLE input. A single FASTLOOP
+                            // iteration issues at most one branchless refill, which
+                            // advances `bits.pos` by ≤7, so the load touches at most
+                            // `(in_fastloop_end - 1) + 7 + 8 = data.len() - 18`.
+                            // 32 (vs the strictly-needed 8) keeps a comfortable
+                            // margin and matches the reference decoder. This is the
+                            // #1 correctness risk per the design note — the SAFE
+                            // tier (existing branchy decode/refill) handles the
+                            // final 32 bytes + EOB / sub-byte-EOF padding.
+                            const FASTLOOP_INPUT_TAIL: usize = 32;
+                            // Refill threshold mirrors resumable.rs:959. After a
+                            // refill bitsleft ∈ [56, 63]; a single packet's worst
+                            // case is litlen codeword (≤12) + length extras (≤5) +
+                            // dist codeword (≤12 main + ≤6 sub) + dist extras
+                            // (≤13) = ≤48 bits, so refilling whenever bitsleft < 48
+                            // guarantees every consume in a packet reads valid bits.
+                            const REFILL_THRESHOLD: u8 = 48;
+                            let n_max_to_decode = n_max_to_decode.min(RING_SIZE - MAX_RUN_LENGTH);
 
-                        let ring_ptr = self.output_ring.as_mut_ptr();
-                        let mut pos = self.ring_pos;
-                        // Step C SIMD-bootstrap experiment: hoist ring-modulo
-                        // out of the per-literal hot path. `phys` is the
-                        // physical u16 ring index, kept in sync with pos.
-                        let mut phys: u16 = (pos & (RING_SIZE - 1)) as u16;
-                        let mut emitted: usize = 0;
-                        let mut distance_marker = self.distance_to_last_marker_byte;
+                            // Conservative FASTLOOP input bound: never let the
+                            // branchless 8-byte load reach past `data.len()`.
+                            // There is no separate output-margin bound — the u16
+                            // ring is pre-sized to RING_SIZE and `emitted` is
+                            // capped at `n_max_to_decode` (= RING_SIZE -
+                            // MAX_RUN_LENGTH), so a single packet's ≤258-byte
+                            // back-ref or ≤3 literals can never overrun it; that
+                            // check stays on the SAME `emitted < n_max_to_decode`
+                            // tier guard both loops share.
+                            let in_fastloop_end: usize =
+                                bits.data.len().saturating_sub(FASTLOOP_INPUT_TAIL);
 
-                        macro_rules! commit {
-                            ($result:expr) => {{
-                                self.ring_pos = pos;
-                                self.decoded_bytes += emitted;
-                                self.distance_to_last_marker_byte = distance_marker;
-                                return $result;
-                            }};
-                        }
+                            let ring_ptr = self.output_ring.as_mut_ptr();
+                            let mut pos = self.ring_pos;
+                            // Step C SIMD-bootstrap experiment: hoist ring-modulo
+                            // out of the per-literal hot path. `phys` is the
+                            // physical u16 ring index, kept in sync with pos.
+                            let mut phys: u16 = (pos & (RING_SIZE - 1)) as u16;
+                            let mut emitted: usize = 0;
+                            let mut distance_marker = self.distance_to_last_marker_byte;
 
-                        // Emit a single decoded literal byte into the ring,
-                        // advancing the phys/pos/emitted/distance_marker
-                        // bookkeeping (mirror of the prior path's per-literal
-                        // store; `distance_marker += 1` is the clean-byte run
-                        // extension, dead-stripped when !CONTAINS_MARKERS).
-                        macro_rules! emit_literal {
-                            ($value:expr) => {{
-                                unsafe {
-                                    ring_ptr.add(phys as usize).write($value as u16);
-                                }
-                                phys = phys.wrapping_add(1);
-                                pos += 1;
-                                emitted += 1;
-                                if CONTAINS_MARKERS {
-                                    distance_marker += 1;
-                                }
-                            }};
-                        }
+                            macro_rules! commit {
+                                ($result:expr) => {{
+                                    self.ring_pos = pos;
+                                    self.decoded_bytes += emitted;
+                                    self.distance_to_last_marker_byte = distance_marker;
+                                    return $result;
+                                }};
+                            }
 
-                        // Branchless refill for the FASTLOOP body ONLY (mirror
-                        // of resumable.rs:1052 `refill_fast!`). Identical
-                        // arithmetic to `Bits::refill`'s fast arm but WITHOUT
-                        // the per-refill `pos + 8 <= data.len()` bounds branch
-                        // — the FASTLOOP guard `bits.pos < in_fastloop_end`
-                        // already proves the 8-byte load is in bounds. The
-                        // `bits_u8 > 64` underflow guard is RETAINED so this is
-                        // byte-for-byte equivalent to `Bits::refill` on every
-                        // input the FASTLOOP admits; the ONLY elided work is the
-                        // unpredictable bounds branch.
-                        macro_rules! refill_fast {
-                            () => {{
-                                let mut bits_u8 = bits.bitsleft as u8;
-                                if bits_u8 > 64 {
-                                    bits.bitbuf = 0;
-                                    bits_u8 = 0;
-                                }
-                                let word = unsafe {
-                                    (bits.data.as_ptr().add(bits.pos) as *const u64)
-                                        .read_unaligned()
-                                };
-                                let word = u64::from_le(word);
-                                bits.bitbuf |= word << bits_u8;
-                                bits.pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
-                                bits.bitsleft = (bits_u8 as u32) | 56;
-                            }};
-                        }
-
-                        // Bounds-checked refill (mirror of resumable.rs:1007
-                        // `refill_local!`). Delegates to `Bits::refill`, which
-                        // is the SAME branchless-when-room / byte-by-byte-at-EOF
-                        // arithmetic with the underflow guard.
-                        macro_rules! refill_local {
-                            () => {{
-                                bits.refill();
-                            }};
-                        }
-
-                        // PRELOAD the first entry before entering the loop
-                        // (mirror of resumable.rs:1091-1094). Declared BEFORE
-                        // `decode_one_symbol!` so the macro's `entry` refers to
-                        // this loop-persistent local. `Bits` is refilled on
-                        // construction, but a partially-consumed reader may be
-                        // below threshold; refill defensively so the first
-                        // lookup sees valid bits.
-                        if (bits.bitsleft as u8) < REFILL_THRESHOLD {
-                            refill_local!();
-                        }
-                        let mut entry = litlen.lookup(bits.bitbuf);
-
-                        // Per-packet symbol-decode body, shared verbatim by the
-                        // FASTLOOP and SAFE tiers so output is bit-identical
-                        // (mirror of resumable.rs:1125-1361
-                        // `decode_one_symbol!`). `$refill` selects the refill
-                        // macro: FASTLOOP passes `refill_fast` (branchless,
-                        // bounds elided — its guard makes it sound), SAFE passes
-                        // `refill_local` (bounds-checked, valid to EOF). The
-                        // decode arithmetic is otherwise identical, so the two
-                        // tiers produce bit-identical output and hand off the
-                        // exact same `bits` state. `entry` is the
-                        // loop-persistent preloaded `LitLenEntry` corresponding
-                        // to the current `bits.bitbuf`. On EOB the macro
-                        // `commit!`s and returns; on a literal/length it carries
-                        // the next iteration's `entry` forward (the speculative
-                        // lookup that avoids a wasted re-lookup).
-                        macro_rules! decode_one_symbol {
-                            ($refill:ident) => {{
-                                let mut saved_bitbuf = bits.bitbuf;
-                                let mut raw = entry.raw();
-
-                                bits.bitbuf >>= raw as u8;
-                                bits.bitsleft = bits.bitsleft.wrapping_sub(raw & 0x1F);
-
-                                // LITERAL FAST PATH (bit 31).
-                                if (raw as i32) < 0 {
-                                    emit_literal!(entry.literal_value());
-
-                                    // Multi-literal chain (2-extra cap, mirror
-                                    // of resumable.rs:1215-1272). Speculatively
-                                    // look up the next entry: if literal, emit
-                                    // inline (chain up to 3 total); whether or
-                                    // not literals chain, carry the final
-                                    // lookup forward as the next iter's `entry`.
-                                    if (bits.bitsleft as u8) >= REFILL_THRESHOLD {
-                                        let e1 = litlen.lookup(bits.bitbuf);
-                                        let r1 = e1.raw();
-                                        if (r1 as i32) < 0 {
-                                            // 2nd literal
-                                            bits.bitbuf >>= r1 as u8;
-                                            bits.bitsleft = bits.bitsleft.wrapping_sub(r1 & 0x1F);
-                                            emit_literal!(e1.literal_value());
-
-                                            if (bits.bitsleft as u8) >= 24 {
-                                                let e2 = litlen.lookup(bits.bitbuf);
-                                                let r2 = e2.raw();
-                                                if (r2 as i32) < 0 {
-                                                    // 3rd literal (the last)
-                                                    bits.bitbuf >>= r2 as u8;
-                                                    bits.bitsleft =
-                                                        bits.bitsleft.wrapping_sub(r2 & 0x1F);
-                                                    emit_literal!(e2.literal_value());
-                                                    if (bits.bitsleft as u8) < REFILL_THRESHOLD {
-                                                        $refill!();
-                                                    }
-                                                    entry = litlen.lookup(bits.bitbuf);
-                                                    continue;
-                                                }
-                                                // 3rd was non-literal → carry e2.
-                                                if (bits.bitsleft as u8) < REFILL_THRESHOLD {
-                                                    $refill!();
-                                                }
-                                                entry = e2;
-                                                continue;
-                                            }
-                                            // bitsleft too low for 3rd lookup.
-                                            if (bits.bitsleft as u8) < REFILL_THRESHOLD {
-                                                $refill!();
-                                            }
-                                            entry = litlen.lookup(bits.bitbuf);
-                                            continue;
-                                        }
-                                        // 2nd was non-literal → carry e1.
-                                        if (bits.bitsleft as u8) < REFILL_THRESHOLD {
-                                            $refill!();
-                                        }
-                                        entry = e1;
-                                        continue;
+                            // Emit a single decoded literal byte into the ring,
+                            // advancing the phys/pos/emitted/distance_marker
+                            // bookkeeping (mirror of the prior path's per-literal
+                            // store; `distance_marker += 1` is the clean-byte run
+                            // extension, dead-stripped when !CONTAINS_MARKERS).
+                            macro_rules! emit_literal {
+                                ($value:expr) => {{
+                                    unsafe {
+                                        ring_ptr.add(phys as usize).write($value as u16);
                                     }
-
-                                    // bitsleft too low even for 2nd lookup.
-                                    if (bits.bitsleft as u8) < REFILL_THRESHOLD {
-                                        $refill!();
+                                    phys = phys.wrapping_add(1);
+                                    pos += 1;
+                                    emitted += 1;
+                                    if CONTAINS_MARKERS {
+                                        distance_marker += 1;
                                     }
-                                    entry = litlen.lookup(bits.bitbuf);
-                                    continue;
-                                }
+                                }};
+                            }
 
-                                // EXCEPTIONAL PATH (bit 15: subtable_ptr OR
-                                // end_of_block). Mirror of resumable.rs:1277.
-                                if (raw & HUFFDEC_EXCEPTIONAL) != 0 {
-                                    if (raw & HUFFDEC_END_OF_BLOCK) != 0 {
-                                        self.at_end_of_block = true;
-                                        commit!(Ok(emitted));
+                            // Branchless refill for the FASTLOOP body ONLY (mirror
+                            // of resumable.rs:1052 `refill_fast!`). Identical
+                            // arithmetic to `Bits::refill`'s fast arm but WITHOUT
+                            // the per-refill `pos + 8 <= data.len()` bounds branch
+                            // — the FASTLOOP guard `bits.pos < in_fastloop_end`
+                            // already proves the 8-byte load is in bounds. The
+                            // `bits_u8 > 64` underflow guard is RETAINED so this is
+                            // byte-for-byte equivalent to `Bits::refill` on every
+                            // input the FASTLOOP admits; the ONLY elided work is the
+                            // unpredictable bounds branch.
+                            macro_rules! refill_fast {
+                                () => {{
+                                    let mut bits_u8 = bits.bitsleft as u8;
+                                    if bits_u8 > 64 {
+                                        bits.bitbuf = 0;
+                                        bits_u8 = 0;
                                     }
-                                    // SUBTABLE
-                                    entry = litlen.lookup_subtable_direct(entry, bits.bitbuf);
-                                    saved_bitbuf = bits.bitbuf;
-                                    raw = entry.raw();
+                                    let word = unsafe {
+                                        (bits.data.as_ptr().add(bits.pos) as *const u64)
+                                            .read_unaligned()
+                                    };
+                                    let word = u64::from_le(word);
+                                    bits.bitbuf |= word << bits_u8;
+                                    bits.pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
+                                    bits.bitsleft = (bits_u8 as u32) | 56;
+                                }};
+                            }
+
+                            // Bounds-checked refill (mirror of resumable.rs:1007
+                            // `refill_local!`). Delegates to `Bits::refill`, which
+                            // is the SAME branchless-when-room / byte-by-byte-at-EOF
+                            // arithmetic with the underflow guard.
+                            macro_rules! refill_local {
+                                () => {{
+                                    bits.refill();
+                                }};
+                            }
+
+                            // PRELOAD the first entry before entering the loop
+                            // (mirror of resumable.rs:1091-1094). Declared BEFORE
+                            // `decode_one_symbol!` so the macro's `entry` refers to
+                            // this loop-persistent local. `Bits` is refilled on
+                            // construction, but a partially-consumed reader may be
+                            // below threshold; refill defensively so the first
+                            // lookup sees valid bits.
+                            if (bits.bitsleft as u8) < REFILL_THRESHOLD {
+                                refill_local!();
+                            }
+                            let mut entry = litlen.lookup(bits.bitbuf);
+
+                            // Per-packet symbol-decode body, shared verbatim by the
+                            // FASTLOOP and SAFE tiers so output is bit-identical
+                            // (mirror of resumable.rs:1125-1361
+                            // `decode_one_symbol!`). `$refill` selects the refill
+                            // macro: FASTLOOP passes `refill_fast` (branchless,
+                            // bounds elided — its guard makes it sound), SAFE passes
+                            // `refill_local` (bounds-checked, valid to EOF). The
+                            // decode arithmetic is otherwise identical, so the two
+                            // tiers produce bit-identical output and hand off the
+                            // exact same `bits` state. `entry` is the
+                            // loop-persistent preloaded `LitLenEntry` corresponding
+                            // to the current `bits.bitbuf`. On EOB the macro
+                            // `commit!`s and returns; on a literal/length it carries
+                            // the next iteration's `entry` forward (the speculative
+                            // lookup that avoids a wasted re-lookup).
+                            macro_rules! decode_one_symbol {
+                                ($refill:ident) => {{
+                                    let mut saved_bitbuf = bits.bitbuf;
+                                    let mut raw = entry.raw();
+
                                     bits.bitbuf >>= raw as u8;
                                     bits.bitsleft = bits.bitsleft.wrapping_sub(raw & 0x1F);
 
+                                    // LITERAL FAST PATH (bit 31).
                                     if (raw as i32) < 0 {
                                         emit_literal!(entry.literal_value());
+
+                                        // Multi-literal chain (2-extra cap, mirror
+                                        // of resumable.rs:1215-1272). Speculatively
+                                        // look up the next entry: if literal, emit
+                                        // inline (chain up to 3 total); whether or
+                                        // not literals chain, carry the final
+                                        // lookup forward as the next iter's `entry`.
+                                        if (bits.bitsleft as u8) >= REFILL_THRESHOLD {
+                                            let e1 = litlen.lookup(bits.bitbuf);
+                                            let r1 = e1.raw();
+                                            if (r1 as i32) < 0 {
+                                                // 2nd literal
+                                                bits.bitbuf >>= r1 as u8;
+                                                bits.bitsleft =
+                                                    bits.bitsleft.wrapping_sub(r1 & 0x1F);
+                                                emit_literal!(e1.literal_value());
+
+                                                if (bits.bitsleft as u8) >= 24 {
+                                                    let e2 = litlen.lookup(bits.bitbuf);
+                                                    let r2 = e2.raw();
+                                                    if (r2 as i32) < 0 {
+                                                        // 3rd literal (the last)
+                                                        bits.bitbuf >>= r2 as u8;
+                                                        bits.bitsleft =
+                                                            bits.bitsleft.wrapping_sub(r2 & 0x1F);
+                                                        emit_literal!(e2.literal_value());
+                                                        if (bits.bitsleft as u8) < REFILL_THRESHOLD
+                                                        {
+                                                            $refill!();
+                                                        }
+                                                        entry = litlen.lookup(bits.bitbuf);
+                                                        continue;
+                                                    }
+                                                    // 3rd was non-literal → carry e2.
+                                                    if (bits.bitsleft as u8) < REFILL_THRESHOLD {
+                                                        $refill!();
+                                                    }
+                                                    entry = e2;
+                                                    continue;
+                                                }
+                                                // bitsleft too low for 3rd lookup.
+                                                if (bits.bitsleft as u8) < REFILL_THRESHOLD {
+                                                    $refill!();
+                                                }
+                                                entry = litlen.lookup(bits.bitbuf);
+                                                continue;
+                                            }
+                                            // 2nd was non-literal → carry e1.
+                                            if (bits.bitsleft as u8) < REFILL_THRESHOLD {
+                                                $refill!();
+                                            }
+                                            entry = e1;
+                                            continue;
+                                        }
+
+                                        // bitsleft too low even for 2nd lookup.
                                         if (bits.bitsleft as u8) < REFILL_THRESHOLD {
                                             $refill!();
                                         }
                                         entry = litlen.lookup(bits.bitbuf);
                                         continue;
                                     }
-                                    if (raw & HUFFDEC_END_OF_BLOCK) != 0 {
-                                        self.at_end_of_block = true;
-                                        commit!(Ok(emitted));
+
+                                    // EXCEPTIONAL PATH (bit 15: subtable_ptr OR
+                                    // end_of_block). Mirror of resumable.rs:1277.
+                                    if (raw & HUFFDEC_EXCEPTIONAL) != 0 {
+                                        if (raw & HUFFDEC_END_OF_BLOCK) != 0 {
+                                            self.at_end_of_block = true;
+                                            commit!(Ok(emitted));
+                                        }
+                                        // SUBTABLE
+                                        entry = litlen.lookup_subtable_direct(entry, bits.bitbuf);
+                                        saved_bitbuf = bits.bitbuf;
+                                        raw = entry.raw();
+                                        bits.bitbuf >>= raw as u8;
+                                        bits.bitsleft = bits.bitsleft.wrapping_sub(raw & 0x1F);
+
+                                        if (raw as i32) < 0 {
+                                            emit_literal!(entry.literal_value());
+                                            if (bits.bitsleft as u8) < REFILL_THRESHOLD {
+                                                $refill!();
+                                            }
+                                            entry = litlen.lookup(bits.bitbuf);
+                                            continue;
+                                        }
+                                        if (raw & HUFFDEC_END_OF_BLOCK) != 0 {
+                                            self.at_end_of_block = true;
+                                            commit!(Ok(emitted));
+                                        }
+                                        // Fall through to LENGTH path.
                                     }
-                                    // Fall through to LENGTH path.
-                                }
 
-                                // LENGTH+DISTANCE path (mirror of
-                                // resumable.rs:1309-1354).
-                                let length = entry.decode_length(saved_bitbuf) as usize;
-                                #[cfg(target_arch = "x86_64")]
-                                unsafe {
-                                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                                    let idx = pos.wrapping_sub(32) & (RING_SIZE - 1);
-                                    _mm_prefetch(ring_ptr.add(idx) as *const i8, _MM_HINT_T0);
-                                }
-                                let dist_saved = bits.bitbuf;
-                                let mut dist_entry = dist.lookup(dist_saved);
-                                if dist_entry.is_subtable_ptr() {
-                                    bits.bitbuf >>= DistTable::TABLE_BITS;
-                                    bits.bitsleft =
-                                        bits.bitsleft.wrapping_sub(DistTable::TABLE_BITS as u32);
-                                    dist_entry =
-                                        dist.lookup_subtable_direct(dist_entry, bits.bitbuf);
-                                }
-                                let dist_extra_saved = bits.bitbuf;
-                                let dist_raw = dist_entry.raw();
-                                bits.bitbuf >>= dist_raw as u8;
-                                bits.bitsleft = bits.bitsleft.wrapping_sub(dist_raw & 0x1F);
-                                let distance =
-                                    dist_entry.decode_distance(dist_extra_saved) as usize;
+                                    // LENGTH+DISTANCE path (mirror of
+                                    // resumable.rs:1309-1354).
+                                    let length = entry.decode_length(saved_bitbuf) as usize;
+                                    #[cfg(target_arch = "x86_64")]
+                                    unsafe {
+                                        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                                        let idx = pos.wrapping_sub(32) & (RING_SIZE - 1);
+                                        _mm_prefetch(ring_ptr.add(idx) as *const i8, _MM_HINT_T0);
+                                    }
+                                    let dist_saved = bits.bitbuf;
+                                    let mut dist_entry = dist.lookup(dist_saved);
+                                    if dist_entry.is_subtable_ptr() {
+                                        bits.bitbuf >>= DistTable::TABLE_BITS;
+                                        bits.bitsleft = bits
+                                            .bitsleft
+                                            .wrapping_sub(DistTable::TABLE_BITS as u32);
+                                        dist_entry =
+                                            dist.lookup_subtable_direct(dist_entry, bits.bitbuf);
+                                    }
+                                    let dist_extra_saved = bits.bitbuf;
+                                    let dist_raw = dist_entry.raw();
+                                    bits.bitbuf >>= dist_raw as u8;
+                                    bits.bitsleft = bits.bitsleft.wrapping_sub(dist_raw & 0x1F);
+                                    let distance =
+                                        dist_entry.decode_distance(dist_extra_saved) as usize;
 
-                                if distance == 0 || distance > MAX_WINDOW_SIZE {
-                                    commit!(Err(BlockError::ExceededWindowRange));
-                                }
-                                if !CONTAINS_MARKERS && distance > self.decoded_bytes + emitted {
-                                    commit!(Err(BlockError::ExceededWindowRange));
-                                }
-                                if CONTAINS_MARKERS {
-                                    marker_instr::classify_and_delay(
-                                        distance,
-                                        length,
-                                        distance_marker,
-                                        self.decoded_bytes + emitted,
-                                    );
-                                } else {
-                                    marker_instr::clean_backref_delay();
-                                }
-                                unsafe {
-                                    emit_backref_ring::<CONTAINS_MARKERS>(
-                                        ring_ptr,
-                                        &mut pos,
-                                        distance,
-                                        length,
-                                        &mut distance_marker,
-                                    );
-                                }
-                                phys = (pos & (RING_SIZE - 1)) as u16;
-                                emitted += length;
-                                if self.track_backreferences {
-                                    self.backreferences.push(Backreference {
-                                        distance: distance as u16,
-                                        length: length as u16,
-                                    });
-                                }
+                                    if distance == 0 || distance > MAX_WINDOW_SIZE {
+                                        commit!(Err(BlockError::ExceededWindowRange));
+                                    }
+                                    if !CONTAINS_MARKERS && distance > self.decoded_bytes + emitted
+                                    {
+                                        commit!(Err(BlockError::ExceededWindowRange));
+                                    }
+                                    if CONTAINS_MARKERS {
+                                        marker_instr::classify_and_delay(
+                                            distance,
+                                            length,
+                                            distance_marker,
+                                            self.decoded_bytes + emitted,
+                                        );
+                                    } else {
+                                        marker_instr::clean_backref_delay();
+                                    }
+                                    unsafe {
+                                        emit_backref_ring::<CONTAINS_MARKERS>(
+                                            ring_ptr,
+                                            &mut pos,
+                                            distance,
+                                            length,
+                                            &mut distance_marker,
+                                        );
+                                    }
+                                    phys = (pos & (RING_SIZE - 1)) as u16;
+                                    emitted += length;
+                                    if self.track_backreferences {
+                                        self.backreferences.push(Backreference {
+                                            distance: distance as u16,
+                                            length: length as u16,
+                                        });
+                                    }
 
-                                // Refill + preload next entry.
-                                if (bits.bitsleft as u8) < REFILL_THRESHOLD {
-                                    $refill!();
-                                }
-                                entry = litlen.lookup(bits.bitbuf);
-                            }};
-                        }
-
-                        // Two-tier decode (mirror of resumable.rs:1364-1417 /
-                        // the prior ISA-L two-tier shape). FASTLOOP: while there
-                        // is input headroom AND output budget, decode with the
-                        // branchless refill — the litlen/dist lookups pay no
-                        // bounds-checked refill. SAFE tier: one symbol at a time
-                        // with the bounds-checked refill, which handles EOB,
-                        // sub-byte-EOF padding, and the final FASTLOOP_INPUT_TAIL
-                        // bytes correctly. EOB exits both tiers via `commit!`
-                        // inside `decode_one_symbol!`. The carried `entry`
-                        // crosses the FASTLOOP↔SAFE boundary unchanged, so the
-                        // handoff is bit-identical.
-                        while emitted < n_max_to_decode {
-                            if bits.pos < in_fastloop_end {
-                                while bits.pos < in_fastloop_end && emitted < n_max_to_decode {
-                                    decode_one_symbol!(refill_fast);
-                                }
-                            } else {
-                                decode_one_symbol!(refill_local);
+                                    // Refill + preload next entry.
+                                    if (bits.bitsleft as u8) < REFILL_THRESHOLD {
+                                        $refill!();
+                                    }
+                                    entry = litlen.lookup(bits.bitbuf);
+                                }};
                             }
-                        }
-                        self.ring_pos = pos;
-                        self.decoded_bytes += emitted;
-                        self.distance_to_last_marker_byte = distance_marker;
-                        Ok(emitted)
-                    }};
+
+                            // Two-tier decode (mirror of resumable.rs:1364-1417 /
+                            // the prior ISA-L two-tier shape). FASTLOOP: while there
+                            // is input headroom AND output budget, decode with the
+                            // branchless refill — the litlen/dist lookups pay no
+                            // bounds-checked refill. SAFE tier: one symbol at a time
+                            // with the bounds-checked refill, which handles EOB,
+                            // sub-byte-EOF padding, and the final FASTLOOP_INPUT_TAIL
+                            // bytes correctly. EOB exits both tiers via `commit!`
+                            // inside `decode_one_symbol!`. The carried `entry`
+                            // crosses the FASTLOOP↔SAFE boundary unchanged, so the
+                            // handoff is bit-identical.
+                            while emitted < n_max_to_decode {
+                                if bits.pos < in_fastloop_end {
+                                    while bits.pos < in_fastloop_end && emitted < n_max_to_decode {
+                                        decode_one_symbol!(refill_fast);
+                                    }
+                                } else {
+                                    decode_one_symbol!(refill_local);
+                                }
+                            }
+                            self.ring_pos = pos;
+                            self.decoded_bytes += emitted;
+                            self.distance_to_last_marker_byte = distance_marker;
+                            Ok(emitted)
+                        }};
+                    }
+                    run_multi_cached_loop!()
                 }
-                run_multi_cached_loop!()
             }
             _ => Err(BlockError::InvalidCompression),
         }
     }
 
-    /// Non-ISA-L entry point — dispatches everything to the canonical
-    /// decoder. On x86_64+ISA-L `read_internal_compressed` above
-    /// dispatches DYNAMIC to the ISA-L LUT and FIXED to the canonical
-    /// path; elsewhere both go through the canonical path.
-    #[cfg(not(all(
-        feature = "isal-compression",
-        not(feature = "pure-rust-inflate"),
-        target_arch = "x86_64"
+    /// Canonical fallback when ISA-L LUT decode is not compiled in.
+    #[cfg(not(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
     )))]
     pub fn read_internal_compressed(
         &mut self,

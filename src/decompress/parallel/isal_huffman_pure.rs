@@ -707,8 +707,19 @@ pub fn make_inflate_huff_code_dist(
         return;
     }
 
-    // Determine the length of the first code
-    let first_len = huff_code_table[code_list[0] as usize].length() as u32;
+    // Shortest length with at least one code. `count` is cumulative (start
+    // index per length), so `count[l]` is often 0 even when length `l` is
+    // present — use `count[l + 1] > count[l]`, not `count[l] > 0`.
+    let mut first_len = 0u32;
+    for l in 1..=MAX_HUFF_TREE_DEPTH as u32 {
+        if count[(l + 1) as usize] > count[l as usize] {
+            first_len = l;
+            break;
+        }
+    }
+    if first_len == 0 {
+        return;
+    }
     let mut last_length = if first_len > ISAL_DECODE_SHORT_BITS {
         ISAL_DECODE_SHORT_BITS + 1
     } else {
@@ -1420,6 +1431,39 @@ mod tests {
         // Demonstrative — the count may be 0 for this particular
         // code-length set, but the bug class is real (see deflate_block.rs
         // wiring comment).
+    }
+
+    /// Fixed-Huffman distance LUT (32× length-5) must match C igzip byte-for-byte.
+    #[test]
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn port_matches_c_isal_byte_for_byte_fixed_dist() {
+        let mut code_lengths = [0u8; 32];
+        for len in &mut code_lengths {
+            *len = 5;
+        }
+        compare_dist_lut(&code_lengths, "fixed_dist_32x5");
+    }
+
+    #[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
+    fn compare_dist_lut(code_lengths: &[u8], label: &str) {
+        let mut rust_decoder = IsalDistCodePure::new_empty();
+        assert!(
+            rust_decoder.rebuild_from(code_lengths),
+            "[{label}] pure-Rust rebuild_from"
+        );
+        let mut c_decoder = crate::decompress::parallel::isal_huffman::IsalDistCode::new_empty();
+        assert!(
+            c_decoder.rebuild_from(code_lengths),
+            "[{label}] C ISA-L rebuild_from"
+        );
+        assert_eq!(
+            rust_decoder.table.short_code_lookup, c_decoder.table.short_code_lookup,
+            "[{label}] short_code_lookup"
+        );
+        assert_eq!(
+            rust_decoder.table.long_code_lookup, c_decoder.table.long_code_lookup,
+            "[{label}] long_code_lookup"
+        );
     }
 
     /// The pure-rust dist-table decoder round-trips a single-bit input
