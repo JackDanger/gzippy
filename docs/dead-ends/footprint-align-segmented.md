@@ -46,8 +46,8 @@ Branch: `feat/footprint-align`, commit `2b8bfae`.
 
 The SegmentedU8 type is scaffolded at:
 - `src/decompress/parallel/segmented_buffer.rs` — full implementation
-- `src/decompress/parallel/chunk_data.rs` — currently uses the flat `U8` type;
-  the segmented port rewires `ChunkData::data` to `SegmentedU8`
+- `src/decompress/parallel/chunk_data.rs` — `data` is `SegmentedU8`;
+  `data_with_markers` is `segmented_markers::SegmentedU16`
 
 ## Re-Entry Conditions
 

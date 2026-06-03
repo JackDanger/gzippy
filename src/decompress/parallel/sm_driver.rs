@@ -11,6 +11,7 @@
 pub fn read_parallel_sm<W: std::io::Write>(
     gzip_data: &[u8],
     writer: &mut W,
+    out_fd: Option<i32>,
     parallelization: usize,
     target_compressed_chunk_bytes: usize,
 ) -> Result<ReadResult, ReadParallelSmError> {
@@ -50,7 +51,7 @@ pub fn read_parallel_sm<W: std::io::Write>(
             configuration,
         )
     } else {
-        chunk_fetcher::drive(deflate_data, writer, parallelization, configuration)
+        chunk_fetcher::drive(deflate_data, writer, out_fd, parallelization, configuration)
     }
     .map_err(|e| ReadParallelSmError::DecodeFailed(format!("{e:?}")))?;
 
@@ -145,7 +146,7 @@ mod tests {
         let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
         let gzip = make_gzip(&payload);
         let mut out = Vec::new();
-        let result = read_parallel_sm(&gzip, &mut out, 4, 512 * 1024).unwrap();
+        let result = read_parallel_sm(&gzip, &mut out, None, 4, 512 * 1024).unwrap();
         assert_eq!(out, payload);
         assert_eq!(result.total_size, payload.len());
     }
@@ -186,7 +187,7 @@ mod tests {
             let original_len = original.len();
             let handle = std::thread::spawn(move || {
                 let mut out = Vec::with_capacity(original_len);
-                let res = read_parallel_sm(&gzip, &mut out, 16, 1024 * 1024);
+                let res = read_parallel_sm(&gzip, &mut out, None, 16, 1024 * 1024);
                 let _ = tx.send((res, out));
             });
 

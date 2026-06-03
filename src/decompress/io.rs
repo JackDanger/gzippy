@@ -7,7 +7,23 @@
 
 use std::fs::File;
 use std::io::{self, stdin, stdout, BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
+
+#[cfg(unix)]
+#[inline]
+fn out_fd_of<F: AsRawFd>(f: &F) -> Option<i32> {
+    if std::env::var_os("GZIPPY_DISABLE_WRITEV").is_some() {
+        return None;
+    }
+    Some(f.as_raw_fd())
+}
+#[cfg(not(unix))]
+#[inline]
+fn out_fd_of<F>(_f: &F) -> Option<i32> {
+    None
+}
 
 struct CountingWriter<W: Write> {
     inner: W,
@@ -146,7 +162,9 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     let result = if args.stdout {
         let stdout = stdout();
         let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
-        let r = decompress_to_writer(&mmap, &mut writer, format, args);
+        writer.flush()?;
+        let out_fd = out_fd_of(writer.get_ref());
+        let r = decompress_to_writer(&mmap, &mut writer, out_fd, format, args);
         writer.flush()?;
         r
     } else {
@@ -162,21 +180,25 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
             if let Some(isize_field) = extract_isize_field(&mmap) {
                 use crate::decompress::mmap_writer::MmapWriter;
                 let mut writer = MmapWriter::open_pre_sized(&output_path, isize_field as usize)?;
-                let r = decompress_to_writer(&mmap, &mut writer, format, args);
+                let r = decompress_to_writer(&mmap, &mut writer, None, format, args);
                 let _written = writer.finalize()?;
                 r
             } else {
                 // Fall back to BufWriter if ISIZE isn't extractable.
                 let output_file = File::create(&output_path)?;
                 let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
-                let r = decompress_to_writer(&mmap, &mut writer, format, args);
+                writer.flush()?;
+                let out_fd = out_fd_of(writer.get_ref());
+                let r = decompress_to_writer(&mmap, &mut writer, out_fd, format, args);
                 writer.flush()?;
                 r
             }
         } else {
             let output_file = File::create(&output_path)?;
             let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
-            let r = decompress_to_writer(&mmap, &mut writer, format, args);
+            writer.flush()?;
+            let out_fd = out_fd_of(writer.get_ref());
+            let r = decompress_to_writer(&mmap, &mut writer, out_fd, format, args);
             writer.flush()?;
             r
         }
@@ -391,6 +413,7 @@ fn decompress_directory(dirname: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 fn decompress_to_writer<W: Write>(
     mmap: &Mmap,
     writer: &mut W,
+    out_fd: Option<i32>,
     format: CompressionFormat,
     args: &GzippyArgs,
 ) -> GzippyResult<u64> {
@@ -426,7 +449,12 @@ fn decompress_to_writer<W: Write>(
                 writer.write_all(&output)?;
                 Ok(len)
             } else {
-                crate::decompress::decompress_single_member(&mmap[..], writer, args.processes)
+                crate::decompress::decompress_single_member_fd(
+                    &mmap[..],
+                    writer,
+                    out_fd,
+                    args.processes,
+                )
             }
         }
         CompressionFormat::Zlib => crate::decompress::decompress_zlib_turbo(&mmap[..], writer),

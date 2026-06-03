@@ -71,8 +71,8 @@ layer on top.
 4. Advisor sign-off before landing.
 
 **Status (2026-06-02):** Code landed on `reimplement-isa-l` (segmented `data` +
-segment-native A3). **Ship-gate still open** — run frozen T4/T8/T16 + RSS before
-production claim.
+segment-native A3 + segmented `data_with_markers`). **Ship-gate still open** —
+run frozen T4/T8/T16 + RSS via `scripts/bench/clean_bench.sh` before production claim.
 
 **Branch:** `feat/footprint-align` (commit `2b8bfae` was the reference segmented port)
 
@@ -91,4 +91,5 @@ valuable for memory-constrained deployments) may still justify landing.
 | Candidate | Branch | Predicted gain | Gate status |
 |-----------|--------|----------------|-------------|
 | vmsplice-on-pipe | `feat/dataplane-2touch` | ~4–5% pipe-sink wall | sign-unstable; N≥21 needed |
-| segment-native-A3 | `feat/footprint-align` @ 2b8bfae | footprint −29% + T16 TIE | A3-in-seg0 implementation needed |
+| segment-native-A3 | `reimplement-isa-l` | footprint −29% + T16 TIE | frozen harness pending |
+| writev consumer (file) | `reimplement-isa-l` | S4 lever (pipe oracle +27% T8) | `GZIPPY_DISABLE_WRITEV=1` A/B on file |

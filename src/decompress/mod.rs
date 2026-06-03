@@ -279,7 +279,38 @@ pub(crate) fn decompress_gzip_libdeflate<W: Write + Send>(
         | DecodePath::IsalSingle
         | DecodePath::StreamingSingle
         | DecodePath::LibdeflateSingle => {
-            decompress_single_member_for(path, data, writer, num_threads)
+            decompress_single_member_for(path, data, writer, None, num_threads)
+        }
+    }
+}
+
+/// Like [`decompress_single_member`] but threads an output fd for zero-copy
+/// `writev` on the parallel-SM consumer path (file/stdout sinks).
+pub(crate) fn decompress_single_member_fd<W: Write>(
+    data: &[u8],
+    writer: &mut W,
+    out_fd: Option<i32>,
+    num_threads: usize,
+) -> GzippyResult<u64> {
+    let path = classify_gzip(data, num_threads);
+    if crate::utils::debug_enabled() {
+        eprintln!(
+            "[gzippy] decompress_single_member path={:?} threads={} bytes={}",
+            path,
+            num_threads,
+            data.len()
+        );
+    }
+    match path {
+        DecodePath::MultiMemberSeq | DecodePath::MultiMemberPar | DecodePath::GzippyParallel => {
+            decompress_multi_member_sequential(data, writer)
+        }
+        DecodePath::IsalParallelSM
+        | DecodePath::StoredParallel
+        | DecodePath::IsalSingle
+        | DecodePath::StreamingSingle
+        | DecodePath::LibdeflateSingle => {
+            decompress_single_member_for(path, data, writer, out_fd, num_threads)
         }
     }
 }
@@ -349,7 +380,7 @@ pub(crate) fn decompress_single_member<W: Write>(
         | DecodePath::IsalSingle
         | DecodePath::StreamingSingle
         | DecodePath::LibdeflateSingle => {
-            decompress_single_member_for(path, data, writer, num_threads)
+            decompress_single_member_for(path, data, writer, None, num_threads)
         }
     }
 }
@@ -375,6 +406,7 @@ fn decompress_single_member_for<W: Write>(
     path: DecodePath,
     data: &[u8],
     writer: &mut W,
+    out_fd: Option<i32>,
     num_threads: usize,
 ) -> GzippyResult<u64> {
     match path {
@@ -386,6 +418,7 @@ fn decompress_single_member_for<W: Write>(
             let n = crate::decompress::parallel::single_member::decompress_parallel(
                 data,
                 writer,
+                out_fd,
                 num_threads,
             )
             .map_err(|e| GzippyError::decompression(format!("parallel SM: {e}")))?;

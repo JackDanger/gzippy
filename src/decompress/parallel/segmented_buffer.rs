@@ -20,8 +20,8 @@
 //! vs rapidgzip 15.6%) at parity core-bound — i.e. the gap is this
 //! buffer model, not codegen.
 //!
-//! This module ships the u8 variant first; `data_with_markers` and
-//! `narrowed` may be segmented in follow-ups if the lever proves out.
+//! `data_with_markers` uses [`super::segmented_markers::SegmentedU16`]
+//! at the same 128 KiB granule (rpmalloc-backed segments).
 
 use crate::decompress::parallel::rpmalloc_alloc::types::U8;
 
@@ -156,6 +156,19 @@ impl SegmentedU8 {
             skip = 0;
         }
         Ok(())
+    }
+
+    /// Collect payload slice refs for `writev` (skips `skip_prefix` logical bytes).
+    pub fn append_payload_iovecs<'a>(&'a self, skip_prefix: usize, out: &mut Vec<&'a [u8]>) {
+        let mut skip = skip_prefix;
+        for seg in &self.segments {
+            if skip >= seg.len() {
+                skip -= seg.len();
+                continue;
+            }
+            out.push(&seg[skip..]);
+            skip = 0;
+        }
     }
 
     /// Truncate every segment to zero length, retaining the

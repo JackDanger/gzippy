@@ -126,6 +126,7 @@ pub(crate) fn skip_gzip_header(data: &[u8]) -> io::Result<usize> {
 pub fn decompress_parallel<W: Write>(
     gzip_data: &[u8],
     writer: &mut W,
+    out_fd: Option<i32>,
     num_threads: usize,
 ) -> Result<u64, ParallelError> {
     let t0 = std::time::Instant::now();
@@ -177,18 +178,21 @@ pub fn decompress_parallel<W: Write>(
         // real per-Vec allocator (allocator-api2 + rpmalloc-rs) or
         // daemon-mode CLI to close; not a pre-touch loop. See module
         // docs at `chunk_buffer_pool.rs:57-77`.
-        let result = read_parallel_sm(gzip_data, writer, num_threads, chunk_size).map_err(|e| {
-            if debug_enabled() {
-                eprintln!("[parallel_sm] driver error: {e}");
-            }
-            match e {
-                ReadParallelSmError::InvalidHeader => ParallelError::InvalidHeader,
-                ReadParallelSmError::InvalidFormat => ParallelError::InvalidGzipFormat,
-                ReadParallelSmError::DecodeFailed(detail) => ParallelError::DecodeFailed(detail),
-                ReadParallelSmError::SizeMismatch { .. } => ParallelError::SizeMismatch,
-                ReadParallelSmError::CrcMismatch { .. } => ParallelError::CrcMismatch,
-            }
-        })?;
+        let result =
+            read_parallel_sm(gzip_data, writer, out_fd, num_threads, chunk_size).map_err(|e| {
+                if debug_enabled() {
+                    eprintln!("[parallel_sm] driver error: {e}");
+                }
+                match e {
+                    ReadParallelSmError::InvalidHeader => ParallelError::InvalidHeader,
+                    ReadParallelSmError::InvalidFormat => ParallelError::InvalidGzipFormat,
+                    ReadParallelSmError::DecodeFailed(detail) => {
+                        ParallelError::DecodeFailed(detail)
+                    }
+                    ReadParallelSmError::SizeMismatch { .. } => ParallelError::SizeMismatch,
+                    ReadParallelSmError::CrcMismatch { .. } => ParallelError::CrcMismatch,
+                }
+            })?;
 
         MARKER_PIPELINE_RUNS.fetch_add(1, Ordering::Relaxed);
         // MECHANISM instrumentation dump (GZIPPY_MARKER_STATS=1). No-op when
@@ -209,7 +213,7 @@ pub fn decompress_parallel<W: Write>(
     }
     #[cfg(not(parallel_sm))]
     {
-        let _ = (writer, t0, deflate_data_len);
+        let _ = (writer, out_fd, t0, deflate_data_len);
         Err(ParallelError::UnsupportedPlatform)
     }
 }
@@ -319,7 +323,7 @@ mod tests {
     fn small_input_returns_hard_error() {
         let small = [0u8; 100];
         let mut out = Vec::new();
-        let err = decompress_parallel(&small, &mut out, 4).unwrap_err();
+        let err = decompress_parallel(&small, &mut out, None, 4).unwrap_err();
         // Either InvalidHeader (no gzip magic) or InvalidGzipFormat
         // (too short for a deflate body). Both are terminal —
         // `TooSmall` is gone.
@@ -340,7 +344,7 @@ mod tests {
         enc.write_all(&vec![0u8; 5_000_000]).unwrap();
         let gz = enc.finish().unwrap();
         let mut out = Vec::new();
-        let err = decompress_parallel(&gz, &mut out, 1).unwrap_err();
+        let err = decompress_parallel(&gz, &mut out, None, 1).unwrap_err();
         assert!(matches!(err, ParallelError::InvalidGzipFormat));
     }
 }

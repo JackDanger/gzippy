@@ -327,6 +327,55 @@ pub fn return_std_u16_to_worker(owner_worker: usize, mut v: Vec<u16>) {
     }
 }
 
+// ── Per-worker pool of 128 KiB U16 marker segments (SegmentedU16) ─────────
+const MARKER_SEGMENT_ELEMENTS: usize = 64 * 1024;
+const MAX_POOLED_SEGMENTS: usize = 64;
+
+fn marker_segment_pools() -> &'static [Mutex<Vec<U16>>] {
+    static POOLS: OnceLock<Vec<Mutex<Vec<U16>>>> = OnceLock::new();
+    POOLS.get_or_init(|| (0..MAX_WORKERS).map(|_| Mutex::new(Vec::new())).collect())
+}
+
+/// Take one 128 KiB rpmalloc-backed marker segment (`len == 0`).
+pub fn take_marker_segment() -> U16 {
+    let idx = pool_index_for_take();
+    if let Ok(mut pool) = marker_segment_pools()[idx].lock() {
+        if let Some(mut v) = pool.pop() {
+            MARKER_SEG_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            v.clear();
+            if v.capacity() < MARKER_SEGMENT_ELEMENTS {
+                v.reserve(MARKER_SEGMENT_ELEMENTS - v.capacity());
+            }
+            return v;
+        }
+    }
+    MARKER_SEG_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    types::u16_with_capacity(MARKER_SEGMENT_ELEMENTS)
+}
+
+/// Return marker segments to the owner worker's pool.
+pub fn return_marker_segments_to_worker(owner_worker: usize, segments: Vec<U16>) {
+    if segments.is_empty() {
+        return;
+    }
+    let idx = owner_worker.min(MAX_WORKERS - 1);
+    if let Ok(mut pool) = marker_segment_pools()[idx].lock() {
+        for mut v in segments {
+            if v.capacity() == 0 {
+                continue;
+            }
+            if pool.len() >= MAX_POOLED_SEGMENTS {
+                break;
+            }
+            v.clear();
+            pool.push(v);
+        }
+    }
+}
+
+pub static MARKER_SEG_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MARKER_SEG_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub static TAKE_U8_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static TAKE_U8_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RETURN_U8_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
