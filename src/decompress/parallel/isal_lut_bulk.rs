@@ -257,6 +257,9 @@ pub fn decode_block(
             if *out_pos + length > output.len() {
                 return Err(BulkDecodeError::OutputOverflow);
             }
+            if distance > *out_pos + predecessor_window.len() {
+                return Err(BulkDecodeError::InvalidLookback);
+            }
 
             copy_match(output, out_pos, distance, length, predecessor_window);
 
