@@ -1406,49 +1406,29 @@ impl Block {
         bits: &mut Bits,
         n_max_to_decode: usize,
     ) -> Result<usize, BlockError> {
-        // FIXED Huffman blocks don't take the ISA-L path. Vendor uses
-        // `HuffmanCodingReversedBitsCached` (a canonical decoder) for
-        // FixedHuffmanCoding at deflate.hpp:195-196, not
-        // `HuffmanCodingISAL`. The reason: ISA-L's
-        // `set_and_expand_lit_len_huffcode` (igzip_inflate.c:285-383)
-        // builds an INCOMPLETE-tree LUT when given the truncated
-        // 286-symbol fixed table — the RFC 1951 fixed-Huffman tree has
-        // 288 symbols (codes 286-287 with length 8) whose Kraft
-        // contribution is required for table completeness, and ISA-L's
-        // `count[8] -= 2` correction at igzip_inflate.c:326-327 fires
-        // only when table_length > LIT_LEN. The wrapper hardcodes
-        // table_length = LIT_LEN = 286, so the correction never runs.
-        // Result: LUT entries for some short codes return bit_count=0
-        // → InvalidHuffmanCode mid-decode on fixed-Huffman blocks.
-        // Dispatch fixed blocks to the canonical fallback path which
-        // handles the full 288-symbol table correctly.
-        if self.compression_type == CompressionType::FixedHuffman {
-            return self.read_internal_compressed_canonical_specialized::<CONTAINS_MARKERS>(
-                bits,
-                n_max_to_decode,
-            );
-        }
-
-        // Build the lit/len + distance code-length slices in scratch
-        // arrays we DON'T allocate per-call — they live on `Block`'s
-        // literal_cl Vec (already pre-sized) and the fixed-Huffman lookup
-        // returns &'static slices. Then rebuild the persistent ISA-L
-        // tables in place from those lengths.
-        let (litlen_lens, dist_lens): (Vec<u8>, Vec<u8>) = match self.compression_type {
+        match self.compression_type {
+            CompressionType::FixedHuffman => {
+                if !self.isal_lut_litlen_rebuild(&FIXED_LIT_LEN_LENGTHS[..]) {
+                    return Err(BlockError::InvalidCodeLengths);
+                }
+                if !self.isal_lut_dist_rebuild(&FIXED_DIST_LENGTHS[..]) {
+                    return Err(BlockError::InvalidCodeLengths);
+                }
+            }
             CompressionType::DynamicHuffman => {
                 let split = self.literal_code_count;
                 let end = split + self.distance_code_count;
-                let (lit, rest) = self.literal_cl[..end].split_at(split);
-                (lit.to_vec(), rest.to_vec())
+                // `rebuild_from` mutates `self`; copy lengths out of `literal_cl`.
+                let litlen_lens = self.literal_cl[..split].to_vec();
+                let dist_lens = self.literal_cl[split..end].to_vec();
+                if !self.isal_lut_litlen_rebuild(&litlen_lens) {
+                    return Err(BlockError::InvalidCodeLengths);
+                }
+                if !self.isal_lut_dist_rebuild(&dist_lens) {
+                    return Err(BlockError::InvalidCodeLengths);
+                }
             }
             _ => return Err(BlockError::InvalidCompression),
-        };
-
-        if !self.isal_lut_litlen_rebuild(&litlen_lens) {
-            return Err(BlockError::InvalidCodeLengths);
-        }
-        if !self.isal_lut_dist_rebuild(&dist_lens) {
-            return Err(BlockError::InvalidCodeLengths);
         }
 
         // Literal port of vendor's `readInternalCompressedMultiCached`
@@ -2327,29 +2307,34 @@ fn read_distance_extra(bits: &mut Bits, dsym: usize) -> Result<usize, BlockError
     Ok(DISTANCE_BASE[dsym] as usize + extra_val as usize)
 }
 
-/// RFC 1951 §3.2.6 fixed Huffman code lengths. Full 288-entry literal
-/// alphabet (symbols 286-287 are reserved/illegal but get code lengths
-/// per the RFC table; the Kraft sum requires their inclusion).
-///
-/// Matches vendor `LiteralOrLengthHuffmanCoding`'s
-/// `MAX_LITERAL_OR_LENGTH_SYMBOLS + 2 = 288` sizing
-/// (vendor/.../gzip/deflate.hpp:196).
+/// RFC 1951 §3.2.6 fixed Huffman — 288 lit/len symbols (286–287 participate
+/// in Kraft construction). Distances: 32 codes × length 5.
+const FIXED_LIT_LEN_LENGTHS: [u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2] = {
+    let mut t = [0u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2];
+    let mut i = 0usize;
+    while i < 144 {
+        t[i] = 8;
+        i += 1;
+    }
+    while i < 256 {
+        t[i] = 9;
+        i += 1;
+    }
+    while i < 280 {
+        t[i] = 7;
+        i += 1;
+    }
+    while i < t.len() {
+        t[i] = 8;
+        i += 1;
+    }
+    t
+};
+const FIXED_DIST_LENGTHS: [u8; MAX_DISTANCE_SYMBOL_COUNT] = [5u8; MAX_DISTANCE_SYMBOL_COUNT];
+
+/// Legacy helper for tests — returns owned copies of the static tables.
 fn fixed_huffman_code_lengths() -> (Vec<u8>, Vec<u8>) {
-    let mut lit = vec![0u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2];
-    for v in &mut lit[0..144] {
-        *v = 8;
-    }
-    for v in &mut lit[144..256] {
-        *v = 9;
-    }
-    for v in &mut lit[256..280] {
-        *v = 7;
-    }
-    for v in &mut lit[280..MAX_LITERAL_OR_LENGTH_SYMBOLS + 2] {
-        *v = 8;
-    }
-    let dist = vec![5u8; MAX_DISTANCE_SYMBOL_COUNT];
-    (lit, dist)
+    (FIXED_LIT_LEN_LENGTHS.to_vec(), FIXED_DIST_LENGTHS.to_vec())
 }
 
 /// Ring-buffer back-reference emit. Mirror of vendor's

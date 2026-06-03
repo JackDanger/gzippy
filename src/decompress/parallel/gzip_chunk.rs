@@ -274,7 +274,8 @@ fn finish_decode_chunk_bulk_lut(
     let a3_ready = use_option_a_prefill_path()
         && initial_window.len() == 32 * 1024
         && chunk.data.all_in_first_segment();
-    if !a3_ready && initial_window.len() < 32 * 1024 && chunk.data.len() < 32 * 1024 {
+    let lookback_bytes = initial_window.len().saturating_add(chunk.data.len());
+    if !a3_ready && lookback_bytes < 32 * 1024 {
         return BulkCleanTailResult::Decline;
     }
 

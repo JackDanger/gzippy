@@ -917,9 +917,10 @@ impl IsalLitLenCodePure {
             }
         }
 
+        let table_len = code_lengths.len();
         if set_and_expand_lit_len_huffcode(
             &mut self.lit_and_dist_huff[..],
-            LIT_LEN,
+            table_len,
             &mut lit_count,
             &mut lit_expand_count,
             &mut self.code_list[..],
