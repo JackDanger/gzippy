@@ -55,8 +55,14 @@ CFG=gzippy
   echo "artifacts=$ART_LOCAL"
   echo ""
 
-  for label path in gzippy "$GZ_TRACE" rapidgzip "$RG_TRACE"; do
-    [ -s "$path" ] && echo "OK $label $(wc -c <"$path") bytes" || echo "MISSING $label $path"
+  for pair in "gzippy:$GZ_TRACE" "rapidgzip:$RG_TRACE"; do
+    label="${pair%%:*}"
+    path="${pair#*:}"
+    if [ -s "$path" ]; then
+      echo "OK $label $(wc -c <"$path") bytes"
+    else
+      echo "MISSING $label $path"
+    fi
   done
   echo ""
 
@@ -99,8 +105,12 @@ CFG=gzippy
   fi
 
   ML_GZ="$ART_LOCAL/artifacts-fulcrum/memlife_gzippy_T8.json"
-  if [ -s "$ML_GZ" ] && "$FULCRUM_BIN" memlife --help >/dev/null 2>&1; then
-    echo "======== fulcrum memlife ========"
+  ML_RG="$ART_LOCAL/artifacts-fulcrum/memlife_rapidgzip_T8.json"
+  if [ -s "$ML_GZ" ] && [ -s "$ML_RG" ]; then
+    echo "======== fulcrum memlife vs ========"
+    "$FULCRUM_BIN" memlife vs "$ML_GZ" "$ML_RG" 2>/dev/null || true
+  elif [ -s "$ML_GZ" ]; then
+    echo "======== fulcrum memlife (gzippy only) ========"
     "$FULCRUM_BIN" memlife "$ML_GZ" 2>/dev/null || true
   fi
 } | tee "$REPORT"
