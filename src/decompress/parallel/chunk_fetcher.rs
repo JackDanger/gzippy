@@ -886,8 +886,9 @@ fn drive_impl<W: std::io::Write>(
             PREFETCH_REJECT_BY_GUARD.load(Ordering::Relaxed),
         );
         eprintln!(
-            "  Clean decode (predecessor @ seed / @ candidate): {} / {}",
+            "  Clean decode (pred@seed / handoff@stop / candidate): {} / {} / {}",
             CLEAN_DECODE_VIA_PREDECESSOR.load(Ordering::Relaxed),
+            HANDOFF_DECODE_CLEAN_OK.load(Ordering::Relaxed),
             SPEC_DECODE_CLEAN_OK.load(Ordering::Relaxed),
         );
         eprintln!(
@@ -2161,6 +2162,18 @@ fn run_decode_task(
             .get_predecessor(params.start_bit)
             .map(|(_k, w)| w)
     };
+    // Design H: predecessor tail is keyed at the prior chunk's end (handoff),
+    // which is `get_predecessor(stop_hint)` for a partition prefetch, not
+    // `get(start_bit)` / `get_predecessor(start_bit)` at the spacing seed.
+    let window_handoff: Option<(usize, Window)> =
+        if params.is_speculative_prefetch && params.start_bit > 0 {
+            match window_map.get_predecessor(params.stop_hint_bit) {
+                Some((k, w)) if k > params.start_bit && window_map.contains(k) => Some((k, w)),
+                _ => None,
+            }
+        } else {
+            None
+        };
 
     let decode_mode_clean = params.start_bit == 0 || window_exact.is_some();
     let predecessor_available = window_pred.is_some();
@@ -2210,6 +2223,47 @@ fn run_decode_task(
             &bytes,
             configuration,
         )
+    } else if let Some((handoff_key, w)) = window_handoff.as_ref() {
+        let bytes = materialize_window(w);
+        let partition_seed = params.start_bit;
+        match decode_chunk(
+            input_bytes,
+            *handoff_key,
+            params.stop_hint_bit,
+            bytes.as_ref(),
+            configuration,
+        ) {
+            Ok(mut chunk)
+                if chunk.encoded_offset_bits == *handoff_key
+                    && chunk.max_acceptable_start_bit == *handoff_key =>
+            {
+                chunk.decode_origin_bit = *handoff_key;
+                if partition_seed < *handoff_key {
+                    let encoded_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+                    let first_sc_upper = chunk
+                        .subchunks
+                        .get(1)
+                        .map(|sc| sc.encoded_offset_bits)
+                        .unwrap_or(encoded_end);
+                    chunk.encoded_offset_bits = partition_seed;
+                    chunk.encoded_size_bits = encoded_end - partition_seed;
+                    chunk.max_acceptable_start_bit = *handoff_key;
+                    if let Some(first_sc) = chunk.subchunks.first_mut() {
+                        first_sc.encoded_offset_bits = partition_seed;
+                        first_sc.encoded_size_bits = first_sc_upper - partition_seed;
+                    }
+                }
+                HANDOFF_DECODE_CLEAN_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(chunk)
+            }
+            Ok(_) | Err(_) => speculative_decode_find_boundary(
+                input_bytes,
+                params.start_bit,
+                params.stop_hint_bit,
+                configuration,
+                window_map,
+            ),
+        }
     } else if let Some(w) = window_pred.as_ref() {
         let bytes = materialize_window(w);
         match decode_chunk(
@@ -2761,6 +2815,11 @@ pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
 /// `WindowMap::get_predecessor` (predecessor published at prior chunk end,
 /// not at this chunk's partition seed).
 pub static CLEAN_DECODE_VIA_PREDECESSOR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Speculative partition prefetch: clean `decode_chunk` at the handoff key
+/// (`get_predecessor(stop_hint)`), not at the partition seed.
+pub static HANDOFF_DECODE_CLEAN_OK: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// `try_speculative_decode_candidate` skipped marker bootstrap via clean
