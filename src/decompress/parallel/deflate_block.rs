@@ -23,6 +23,34 @@ pub trait MarkerSink {
     fn push_slice(&mut self, values: &[u16]);
     fn sink_len(&self) -> usize;
     fn as_slice(&self) -> &[u16];
+
+    /// Trailing run of clean (`< MARKER_BASE`) values starting at logical
+    /// index `from` (inclusive). Used by the bootstrap block loop.
+    fn trailing_clean_since(&self, from: usize) -> usize {
+        use crate::decompress::parallel::replace_markers::MARKER_BASE;
+        self.as_slice()[from..]
+            .iter()
+            .rev()
+            .take_while(|&&v| v < MARKER_BASE)
+            .count()
+    }
+
+    /// Copy the last `n` sink elements as u8 into `out` if they are all clean.
+    fn copy_last_n_clean_u8(&self, n: usize, out: &mut Vec<u8>) -> bool {
+        use crate::decompress::parallel::replace_markers::MARKER_BASE;
+        let len = self.sink_len();
+        if n == 0 || n > len {
+            return false;
+        }
+        let start = len - n;
+        let slice = &self.as_slice()[start..];
+        if slice.iter().any(|&v| v >= MARKER_BASE) {
+            return false;
+        }
+        out.clear();
+        out.extend(slice.iter().map(|&v| v as u8));
+        true
+    }
 }
 
 impl MarkerSink for Vec<u16> {

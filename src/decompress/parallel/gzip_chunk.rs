@@ -1499,19 +1499,12 @@ fn bootstrap_with_deflate_block_inner(
             // Block fully decoded. Update trailing_clean from the bytes
             // just produced. Markers (≥ MARKER_BASE) reset the run; clean
             // bytes extend it (saturating at MAX_WINDOW_SIZE).
-            let block_slice = &output.as_slice()[before_len..];
-            if !block_slice.is_empty() {
-                let trailing_this_block = block_slice
-                    .iter()
-                    .rev()
-                    .take_while(|&&v| v < MARKER_BASE)
-                    .count();
-                if trailing_this_block == block_slice.len() {
-                    // Entire block was clean — extend the prior run.
+            if output.sink_len() > before_len {
+                let block_len = output.sink_len() - before_len;
+                let trailing_this_block = output.trailing_clean_since(before_len);
+                if trailing_this_block == block_len {
                     trailing_clean = (trailing_clean + trailing_this_block).min(MAX_WINDOW_SIZE);
                 } else {
-                    // A marker appeared mid-block; the trailing clean run
-                    // restarts from after that last marker.
                     trailing_clean = trailing_this_block.min(MAX_WINDOW_SIZE);
                 }
             }
@@ -1539,23 +1532,12 @@ fn bootstrap_with_deflate_block_inner(
 
         // Build the clean dict if we have one.
         let clean_window = if clean_handoff_armed && output.sink_len() >= MAX_WINDOW_SIZE {
-            let start = output.sink_len() - MAX_WINDOW_SIZE;
-            // Invariant: the trailing MAX_WINDOW_SIZE values of `output` are
-            // < MARKER_BASE (clean). Assert this — corruption here would
-            // seed ISA-L with garbage and produce a wrong-CRC chunk.
-            let window: Vec<u8> = output.as_slice()[start..]
-                .iter()
-                .map(|&v| {
-                    assert!(
-                        v < MARKER_BASE,
-                        "bootstrap clean window contained marker at offset {}; \
-                     trailing_clean tracker broken",
-                        v.saturating_sub(MARKER_BASE)
-                    );
-                    v as u8
-                })
-                .collect();
-            Some(window)
+            let mut window = Vec::with_capacity(MAX_WINDOW_SIZE);
+            if output.copy_last_n_clean_u8(MAX_WINDOW_SIZE, &mut window) {
+                Some(window)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -1674,8 +1656,8 @@ mod tests {
 
     fn flatten(chunk: &ChunkData) -> Vec<u8> {
         let mut out = Vec::with_capacity(chunk.decoded_size());
-        for v in &chunk.data_with_markers {
-            out.push(*v as u8);
+        for v in chunk.data_with_markers.iter() {
+            out.push(v as u8);
         }
         for seg in chunk.data.segments() {
             out.extend_from_slice(seg);

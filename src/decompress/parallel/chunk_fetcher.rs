@@ -261,10 +261,11 @@ impl InputSlice {
 pub fn drive<W: std::io::Write>(
     input: &[u8],
     writer: &mut W,
+    out_fd: Option<i32>,
     parallelization: usize,
     configuration: ChunkConfiguration,
 ) -> Result<(u32, usize), FetchError> {
-    drive_impl(input, writer, parallelization, configuration, None)
+    drive_impl(input, writer, out_fd, parallelization, configuration, None)
 }
 
 /// Clean-window oracle (advisor 2026-05-29): the cheapest experiment that
@@ -296,6 +297,7 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
     drive_impl(
         input,
         &mut sink,
+        None,
         parallelization,
         configuration,
         Some(seed.clone()),
@@ -445,6 +447,7 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
 fn drive_impl<W: std::io::Write>(
     input: &[u8],
     writer: &mut W,
+    out_fd: Option<i32>,
     parallelization: usize,
     configuration: ChunkConfiguration,
     seed_window_map: Option<WindowMap>,
@@ -577,6 +580,7 @@ fn drive_impl<W: std::io::Write>(
     let consumer_result = consumer_loop(
         input_view,
         writer,
+        out_fd,
         total_bits,
         &block_finder,
         &block_fetcher,
@@ -911,6 +915,7 @@ fn drive_impl<W: std::io::Write>(
 fn consumer_loop<W: std::io::Write>(
     input: InputSlice,
     writer: &mut W,
+    out_fd: Option<i32>,
     total_bits: usize,
     block_finder: &GzipBlockFinder,
     block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
@@ -1451,6 +1456,7 @@ fn consumer_loop<W: std::io::Write>(
                         &mut pending,
                         window_map,
                         writer,
+                        out_fd,
                         total_crc,
                         total_size,
                         block_fetcher,
@@ -1635,6 +1641,7 @@ fn consumer_loop<W: std::io::Write>(
                 &mut pending,
                 window_map,
                 writer,
+                out_fd,
                 total_crc,
                 total_size,
                 block_fetcher,
@@ -1655,6 +1662,7 @@ fn consumer_loop<W: std::io::Write>(
             &mut pending,
             window_map,
             writer,
+            out_fd,
             total_crc,
             total_size,
             block_fetcher,
@@ -2384,32 +2392,13 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
     // `narrowed_bytes()` aliases `data_with_markers`'s store; copy out the
     // borrow boundary by computing windows against it directly. The borrow is
     // immutable and `populate_subchunk_windows` only reads `&self.data`/args.
-    {
-        // SAFETY-of-borrow: narrowed_bytes borrows chunk immutably; we need
-        // chunk mutably for populate. Take a raw view to satisfy the borrow
-        // checker — the bytes live in data_with_markers which populate never
-        // mutates.
-        let nb = chunk.narrowed_bytes();
-        let nb_ptr = nb.as_ptr();
-        let nb_len = nb.len();
-        let dwm_slice: &[u8] = unsafe { std::slice::from_raw_parts(nb_ptr, nb_len) };
-        chunk.populate_subchunk_windows(&bytes, dwm_slice);
-    }
+    chunk.populate_subchunk_windows(&bytes);
     let populate_us = t_pop.elapsed().as_micros();
     // CRC the narrowed bytes on the worker (vendor parity: applyWindow CRCs
     // resolved marker bytes on the worker, not the serial consumer).
     {
         let _tv2 = trace_v2::SpanGuard::begin("post_process.crc_narrowed");
-        let nb = chunk.narrowed_bytes();
-        if !nb.is_empty() {
-            // Decouple the immutable `narrowed_bytes` borrow from the mutable
-            // `narrowed_crc` borrow via a raw view (the bytes live in
-            // data_with_markers, which `narrowed_crc.update` never touches).
-            let nb_ptr = nb.as_ptr();
-            let nb_len = nb.len();
-            let view: &[u8] = unsafe { std::slice::from_raw_parts(nb_ptr, nb_len) };
-            chunk.narrowed_crc.update(view);
-        }
+        chunk.update_narrowed_crc();
     }
     if trace::is_enabled() {
         trace::emit(
@@ -2901,6 +2890,7 @@ fn drain_one_pending<W: std::io::Write>(
     pending: &mut std::collections::VecDeque<PendingWrite>,
     window_map: &WindowMap,
     writer: &mut W,
+    out_fd: Option<i32>,
     total_crc: &mut CRC32Calculator,
     total_size: &mut usize,
     block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
@@ -2984,29 +2974,91 @@ fn drain_one_pending<W: std::io::Write>(
     // `chunk.narrowed_crc`) so the consumer just consumes the result —
     // no second scan of `chunk.narrowed` here.
     let t_crc_write = std::time::Instant::now();
-    // FOOTPRINT-ALIGN: the resolved marker bytes were narrowed IN PLACE on
-    // the worker into `data_with_markers`'s own store; `narrowed_bytes()`
-    // exposes them. No separate `narrowed` buffer. (The former defensive
-    // "narrow on the consumer" fallback is gone: `narrow_markers_in_place`
-    // always runs in post_process, so `narrowed_bytes()` is authoritative.)
-    {
-        let nb = chunk.narrowed_bytes();
-        if !nb.is_empty() {
-            let _tv2 = trace_v2::SpanGuard::begin("consumer.write_narrowed");
-            writer
-                .write_all(nb)
+    let decoded_data_len = chunk.data.len().saturating_sub(chunk.data_prefix_len);
+    let payload_bytes = chunk.narrowed_len + decoded_data_len;
+    let mut wrote_via_fd = false;
+    #[cfg(unix)]
+    if let Some(fd) = out_fd {
+        if std::env::var_os("GZIPPY_DISABLE_WRITEV").is_none() && payload_bytes > 0 {
+            use crate::decompress::parallel::fd_vectored_write;
+            let _tv2 = trace_v2::SpanGuard::begin("consumer.writev");
+            let mut parts: Vec<&[u8]> = Vec::with_capacity(8);
+            let mut left = chunk.narrowed_len;
+            for seg in chunk.data_with_markers.segments() {
+                if left == 0 {
+                    break;
+                }
+                let n = left.min(seg.len());
+                // SAFETY: in-place narrow wrote `n` u8 at the front of this segment.
+                let sl = unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const u8, n) };
+                parts.push(sl);
+                left -= n;
+            }
+            let mut skip = chunk.data_prefix_len;
+            for seg in chunk.data.segments() {
+                if skip >= seg.len() {
+                    skip -= seg.len();
+                    continue;
+                }
+                parts.push(&seg[skip..]);
+                skip = 0;
+            }
+            // CRC combine before boxing `chunk` for vmsplice lifetime.
+            total_crc.append(&chunk.narrowed_crc);
+            for stream_crc in &chunk.crc32s {
+                total_crc.append(stream_crc);
+            }
+            let mut iovs = fd_vectored_write::to_io_vec(parts.iter().copied(), &[]);
+            let owner: Box<dyn std::any::Any + Send> = Box::new(chunk);
+            fd_vectored_write::write_all_to_fd(fd, &mut iovs, owner)
                 .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-            *total_size += nb.len();
+            *total_size += payload_bytes;
+            wrote_via_fd = true;
+            let crc_write_us = t_crc_write.elapsed().as_micros();
+            let combine_us = 0usize;
+            let total_us = t_chunk.elapsed().as_micros();
+            if trace::is_enabled() {
+                trace::emit(
+                    "consumer",
+                    "consume_done",
+                    &format!(
+                        r#""partition_idx":{idx},"decoded":{payload_bytes},"recv_us":{recv_us},"publish_us":{publish_us},"crc_write_us":{crc_write_us},"combine_us":{combine_us},"total_us":{total_us}"#,
+                    ),
+                );
+            }
+            let _ = cache_key;
+            let _ = block_fetcher;
+            crate::coz_probe::progress("chunk_emitted");
+            return Ok(());
         }
     }
-    let decoded_data_len = chunk.data.len().saturating_sub(chunk.data_prefix_len);
-    if decoded_data_len > 0 {
-        let _tv2 = trace_v2::SpanGuard::begin("consumer.write_data");
-        chunk
-            .data
-            .write_payload_skipping_prefix(chunk.data_prefix_len, writer)
-            .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-        *total_size += decoded_data_len;
+    #[cfg(not(unix))]
+    let _ = out_fd;
+    if !wrote_via_fd {
+        if chunk.narrowed_len > 0 {
+            let _tv2 = trace_v2::SpanGuard::begin("consumer.write_narrowed");
+            let mut left = chunk.narrowed_len;
+            for seg in chunk.data_with_markers.segments() {
+                if left == 0 {
+                    break;
+                }
+                let n = left.min(seg.len());
+                let sl = unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const u8, n) };
+                writer
+                    .write_all(sl)
+                    .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+                left -= n;
+            }
+            *total_size += chunk.narrowed_len;
+        }
+        if decoded_data_len > 0 {
+            let _tv2 = trace_v2::SpanGuard::begin("consumer.write_data");
+            chunk
+                .data
+                .write_payload_skipping_prefix(chunk.data_prefix_len, writer)
+                .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+            *total_size += decoded_data_len;
+        }
     }
     let crc_write_us = t_crc_write.elapsed().as_micros();
     let t_combine = std::time::Instant::now();
@@ -3085,7 +3137,7 @@ mod tests {
             crc32_enabled: true,
         };
         let mut out = Vec::new();
-        let (_crc, size) = drive(&deflate, &mut out, 4, cfg).expect("drive");
+        let (_crc, size) = drive(&deflate, &mut out, None, 4, cfg).expect("drive");
         assert_eq!(size, payload.len());
         assert_eq!(out, payload);
     }
@@ -3103,7 +3155,7 @@ mod tests {
             crc32_enabled: true,
         };
         let mut out = Vec::new();
-        let (_crc, size) = drive(&deflate, &mut out, 8, cfg).expect("drive");
+        let (_crc, size) = drive(&deflate, &mut out, None, 8, cfg).expect("drive");
         assert_eq!(size, payload.len());
         assert_eq!(out, payload);
     }
@@ -3171,7 +3223,7 @@ mod tests {
 
         let chunk_size = 4 * 1024 * 1024;
         let mut out = Vec::new();
-        let result = read_parallel_sm(&gz, &mut out, 2, chunk_size);
+        let result = read_parallel_sm(&gz, &mut out, None, 2, chunk_size);
         assert_eq!(result.expect("read_parallel_sm T=2").total_size, head.len());
         assert_eq!(out, head);
     }
@@ -3192,7 +3244,7 @@ mod tests {
             crc32_enabled: true,
         };
         let mut out = Vec::new();
-        let (_crc, size) = drive(&deflate, &mut out, 8, cfg).expect("drive");
+        let (_crc, size) = drive(&deflate, &mut out, None, 8, cfg).expect("drive");
         assert_eq!(size, payload.len(), "size mismatch (suggests early break)");
         assert_eq!(out, payload, "byte mismatch");
     }

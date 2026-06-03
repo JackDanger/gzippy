@@ -111,7 +111,7 @@ impl CapturedChunk {
             data_with_markers: if meta_only() {
                 Vec::new()
             } else {
-                c.data_with_markers.clone()
+                c.data_with_markers.iter().collect()
             },
             data: if meta_only() {
                 Vec::new()
@@ -695,12 +695,13 @@ fn parse_capture(bytes: &[u8]) -> HashMap<Key, CapturedChunk> {
         let data_prefix_len = r.usize();
         let total_decoded = r.usize();
         let dwm_len = r.usize();
-        let mut data_with_markers = Vec::with_capacity(dwm_len);
+        let mut dwm_vals = Vec::with_capacity(dwm_len);
         for _ in 0..dwm_len {
             let mut a = [0u8; 2];
             a.copy_from_slice(r.bytes(2));
-            data_with_markers.push(u16::from_le_bytes(a));
+            dwm_vals.push(u16::from_le_bytes(a));
         }
+        let data_with_markers = dwm_vals;
         let data_len = r.usize();
         let data = r.bytes(data_len).to_vec();
         let sc_n = r.usize();

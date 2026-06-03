@@ -23,6 +23,7 @@ use crate::decompress::parallel::crc32::CRC32Calculator;
 pub use crate::decompress::parallel::replace_markers::MARKER_BASE;
 use crate::decompress::parallel::rpmalloc_alloc::types::{self, U8};
 use crate::decompress::parallel::segmented_buffer::SegmentedU8;
+use crate::decompress::parallel::segmented_markers::SegmentedU16;
 
 /// One deflate-block-aligned slice of a chunk's decoded output.
 /// Port of `rapidgzip::ChunkData::Subchunk` (ChunkData.hpp:138-145).
@@ -148,7 +149,7 @@ pub struct ChunkData {
     // buffer directly (zero-copy merge), and std-Vec decode is ~3% faster
     // per-byte than rpmalloc here (measured). Warm-cycled via the dedicated
     // `chunk_buffer_pool::{take,return}_std_u16` retained pool.
-    pub data_with_markers: Vec<u16>,
+    pub data_with_markers: SegmentedU16,
     /// Clean byte suffix. All bytes here were decoded with a known
     /// window (set via IsalInflateWrapper::set_window) so no markers
     /// were emitted. CRC32'd at append time.
@@ -243,17 +244,9 @@ pub struct ChunkData {
     /// `trim_window_prefix()` before the chunk is finalized so that
     /// `self.data` once again contains only decoded bytes.
     ///
-    /// Today no production caller wires this field — A1 lands the API
-    /// and accounting; A3 will flip the switch by pre-filling at chunk
-    /// start so `copy_match_windowed`'s window-touch slow path stops
-    /// firing (3.5pp delta vs ISA-L's `large_byte_copy`).
-    ///
-    /// The trickiest invariant to preserve is the marker-bootstrap
-    /// merge at line 747 (`clean_unmarked_data`) which does its own
-    /// `copy_within(0..existing_len, prefix_len)` shift of `self.data`
-    /// to make room for the narrowed clean tail. Any A3 wiring MUST
-    /// either trim the pre-fill before that merge runs OR teach the
-    /// merge to skip over the window-prefix region.
+    /// Segment-native A3 (production): `prefill_window_prefix` writes the
+    /// predecessor 32 KiB window image into segment 0; the consumer skips
+    /// it via `write_payload_skipping_prefix` / `append_payload_iovecs`.
     pub data_prefix_len: usize,
 }
 
@@ -312,7 +305,7 @@ impl ChunkData {
         Self::new_with_buffers(
             encoded_offset_bits,
             configuration,
-            chunk_buffer_pool::take_std_u16(0),
+            SegmentedU16::default(),
             SegmentedU8::default(),
             chunk_buffer_pool::current_worker_pool_index().unwrap_or(0),
         )
@@ -327,7 +320,7 @@ impl ChunkData {
     pub fn new_with_buffers(
         encoded_offset_bits: usize,
         configuration: ChunkConfiguration,
-        data_with_markers: Vec<u16>,
+        data_with_markers: SegmentedU16,
         data: SegmentedU8,
         pool_worker_index: usize,
     ) -> Self {
@@ -413,12 +406,14 @@ impl ChunkData {
         // `data: U8`; copy it into the segmented buffer.
         let mut seg = SegmentedU8::default();
         seg.extend_from_slice(&data);
+        let mut dwm = SegmentedU16::default();
+        dwm.push_slice(&data_with_markers);
         Self {
             encoded_offset_bits,
             max_acceptable_start_bit,
             decode_origin_bit,
             encoded_size_bits,
-            data_with_markers,
+            data_with_markers: dwm,
             data: seg,
             narrowed_len: 0,
             narrowed_crc: CRC32Calculator::new(),
@@ -470,13 +465,12 @@ impl ChunkData {
             let from_data = decoded_data_len;
             let from_markers = W - from_data;
             let m_start = self.data_with_markers.len() - from_markers;
-            for v in &self.data_with_markers[m_start..] {
-                if *v >= crate::decompress::parallel::replace_markers::MARKER_BASE {
+            for i in 0..from_markers {
+                let v = self.data_with_markers.get(m_start + i)?;
+                if v >= crate::decompress::parallel::replace_markers::MARKER_BASE {
                     return None;
                 }
-            }
-            for (i, v) in self.data_with_markers[m_start..].iter().enumerate() {
-                out[i] = *v as u8;
+                out[i] = v as u8;
             }
             self.data.copy_last_into(&mut out[from_markers..]);
             Some(out)
@@ -513,14 +507,15 @@ impl ChunkData {
             let from_data = decoded_data_len;
             let from_markers = W - from_data;
             let m_start = self.data_with_markers.len() - from_markers;
-            for v in &self.data_with_markers[m_start..] {
-                if *v >= crate::decompress::parallel::replace_markers::MARKER_BASE {
+            for i in 0..from_markers {
+                let v = self.data_with_markers.get(m_start + i)?;
+                if v >= crate::decompress::parallel::replace_markers::MARKER_BASE {
                     return None;
                 }
             }
             let mut out = vec![0u8; W];
-            for (i, v) in self.data_with_markers[m_start..].iter().enumerate() {
-                out[i] = *v as u8;
+            for i in 0..from_markers {
+                out[i] = self.data_with_markers.get(m_start + i)? as u8;
             }
             self.data.copy_last_into(&mut out[from_markers..]);
             debug_assert_eq!(out.len(), W);
@@ -619,24 +614,9 @@ impl ChunkData {
         // `reserve` + `copy_nonoverlapping` + `set_len` shape that
         // `std::vec::Vec`'s `SpecExtend` specialization would
         // have produced.
-        let added = values.len();
-        let prev_len = self.data_with_markers.len();
-        self.data_with_markers.reserve(added);
-        // SAFETY: `reserve(added)` ensures capacity covers
-        // `prev_len + added`; `values` and `data_with_markers`
-        // are distinct allocations; set_len with the post-copy
-        // length is legal because all `added` u16s are
-        // initialized from the `values` slice.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                values.as_ptr(),
-                self.data_with_markers.as_mut_ptr().add(prev_len),
-                added,
-            );
-            self.data_with_markers.set_len(prev_len + added);
-        }
+        self.data_with_markers.push_slice(values);
         if let Some(last) = self.subchunks.last_mut() {
-            last.decoded_size += added;
+            last.decoded_size += values.len();
         }
     }
 
@@ -928,11 +908,7 @@ impl ChunkData {
     /// existing `crc32s[0]` so the running CRC still covers the
     /// in-order output.
     pub fn clean_unmarked_data(&mut self) {
-        let split_at = match self
-            .data_with_markers
-            .iter()
-            .rposition(|&v| v >= MARKER_BASE)
-        {
+        let split_at = match self.data_with_markers.rposition_last_marker() {
             Some(last_marker_pos) => last_marker_pos + 1,
             None => 0,
         };
@@ -941,15 +917,9 @@ impl ChunkData {
         }
         let prefix_len = self.data_with_markers.len() - split_at;
 
-        // FOOTPRINT-ALIGN: narrow the clean trailing run (u16, all < 256 by
-        // the rposition search) to u8 and PREPEND it to the segmented `data`
-        // — the bytes precede the existing clean bulk in output order. Mirror
-        // of vendor's `dataBuffers.emplace(dataBuffers.begin(), ...)`
-        // (DecodedData.hpp:502). Replaces the former contiguous right-shift
-        // (`copy_within`) which the segment list can't do in place.
         let mut narrowed_prefix: Vec<u8> = Vec::with_capacity(prefix_len);
-        for &v in &self.data_with_markers[split_at..] {
-            narrowed_prefix.push(v as u8);
+        for i in split_at..self.data_with_markers.len() {
+            narrowed_prefix.push(self.data_with_markers.get(i).unwrap_or(0) as u8);
         }
 
         // CRC the migrated bytes (NOT CRC'd at append_markered time) and
@@ -1037,7 +1007,7 @@ impl ChunkData {
             if offset < dwm_len {
                 let take = (dwm_len - offset).min(W - written);
                 for i in 0..take {
-                    let v = self.data_with_markers[offset + i];
+                    let v = self.data_with_markers.get(offset + i).unwrap_or(0);
                     window[written + i] = if v >= MARKER_BASE {
                         predecessor_window[(v - MARKER_BASE) as usize]
                     } else {
@@ -1064,11 +1034,11 @@ impl ChunkData {
             window[..from_prev].copy_from_slice(&predecessor_window[total..]);
             let mut written = from_prev;
 
-            for v in &self.data_with_markers {
-                window[written] = if *v >= MARKER_BASE {
-                    predecessor_window[(*v - MARKER_BASE) as usize]
+            for v in self.data_with_markers.iter() {
+                window[written] = if v >= MARKER_BASE {
+                    predecessor_window[(v - MARKER_BASE) as usize]
                 } else {
-                    *v as u8
+                    v as u8
                 };
                 written += 1;
             }
@@ -1114,13 +1084,13 @@ impl ChunkData {
     /// (vendor/.../GzipChunkFetcher.hpp:560-580): for each subchunk's
     /// `decodedOffset`, the window is the 32 KiB immediately preceding
     /// that offset in the concatenated `predecessor_window ++ dwm_bytes ++ data`.
-    pub fn populate_subchunk_windows(&mut self, predecessor_window: &[u8], dwm_bytes: &[u8]) {
+    pub fn populate_subchunk_windows(&mut self, predecessor_window: &[u8]) {
         const W: usize = 32768;
         debug_assert_eq!(predecessor_window.len(), W);
         let data_skip = self.data_prefix_len;
         let decoded_data_len = self.data.len().saturating_sub(data_skip);
 
-        let dwm_len = dwm_bytes.len();
+        let dwm_len = self.narrowed_len;
 
         for sc in self.subchunks.iter_mut() {
             // Build window for offset `sc.decoded_offset`. Source bytes
@@ -1154,14 +1124,17 @@ impl ChunkData {
                 written += take;
             }
 
-            // Segment 2: bytes from `dwm_bytes`.
-            if written < W {
+            // Segment 2: in-place-narrowed marker bytes.
+            if written < W && dwm_len > 0 {
                 let abs = needed_start + written;
                 let dwm_offset = abs.saturating_sub(W);
                 if dwm_offset < dwm_len {
                     let take = (dwm_len - dwm_offset).min(W - written);
-                    window[written..written + take]
-                        .copy_from_slice(&dwm_bytes[dwm_offset..dwm_offset + take]);
+                    self.data_with_markers.copy_narrowed_u8_range_into(
+                        dwm_offset,
+                        take,
+                        &mut window[written..written + take],
+                    );
                     written += take;
                 }
             }
@@ -1382,10 +1355,8 @@ impl ChunkData {
         // The buffer returns to the pool at `Drop` after the consumer writes.
         if self.narrowed_len == 0 {
             use crate::decompress::parallel::chunk_buffer_pool;
-            let dwm = std::mem::take(&mut self.data_with_markers);
-            if dwm.capacity() > 0 {
-                chunk_buffer_pool::return_std_u16_to_worker(self.pool_worker_index, dwm);
-            }
+            let dwm = self.data_with_markers.take_segments();
+            chunk_buffer_pool::return_marker_segments_to_worker(self.pool_worker_index, dwm);
         }
     }
 
@@ -1405,46 +1376,38 @@ impl ChunkData {
     pub fn narrow_markers_in_place(&mut self) -> usize {
         let len = self.data_with_markers.len();
         debug_assert!(
-            self.data_with_markers.iter().all(|&v| v < MARKER_BASE),
+            self.data_with_markers.all_resolved(),
             "narrow_markers_in_place before markers resolved"
         );
         if len > 0 {
-            let p = self.data_with_markers.as_mut_ptr() as *mut u8;
-            // Forward scan; write i depends only on read i (no aliasing
-            // hazard as argued above). Kept as a simple loop — LLVM
-            // vectorizes the `lo-byte gather` on x86_64/aarch64.
-            for i in 0..len {
-                let v = self.data_with_markers[i];
-                // SAFETY: `i < len <= 2*len` bytes are owned by the u16 Vec;
-                // writing the low byte at offset `i` is in-bounds and does not
-                // overlap the not-yet-read element at offset `2*i`.
-                unsafe {
-                    *p.add(i) = v as u8;
-                }
-            }
+            self.data_with_markers.narrow_markers_to_u8_in_place();
         }
         self.narrowed_len = len;
         len
     }
 
-    /// View the in-place-narrowed bytes (the first `narrowed_len` bytes of
-    /// `data_with_markers`'s backing store, reinterpreted as u8). Empty when
-    /// no markers were narrowed. Used by the consumer write + CRC and by
-    /// `populate_subchunk_windows`.
-    pub fn narrowed_bytes(&self) -> &[u8] {
+    /// CRC the in-place-narrowed marker bytes (may span multiple segments).
+    pub fn update_narrowed_crc(&mut self) {
         if self.narrowed_len == 0 {
-            return &[];
+            return;
         }
-        // SAFETY: `narrow_markers_in_place` wrote `narrowed_len` valid u8
-        // bytes at the front of this allocation; `narrowed_len <=
-        // data_with_markers.len() <= capacity`, so the range is in-bounds and
-        // initialized.
-        unsafe {
-            std::slice::from_raw_parts(
-                self.data_with_markers.as_ptr() as *const u8,
-                self.narrowed_len,
-            )
+        let mut left = self.narrowed_len;
+        for seg in self.data_with_markers.segments() {
+            if left == 0 {
+                break;
+            }
+            let n = left.min(seg.len());
+            let sl = unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const u8, n) };
+            self.narrowed_crc.update(sl);
+            left -= n;
         }
+    }
+
+    /// Collect output iovecs: narrowed marker bytes then clean payload.
+    pub fn append_output_iovecs<'a>(&'a self, out: &mut Vec<&'a [u8]>) {
+        self.data_with_markers
+            .append_narrowed_iovecs(self.narrowed_len, out);
+        self.data.append_payload_iovecs(self.data_prefix_len, out);
     }
 }
 
@@ -1462,8 +1425,8 @@ impl Drop for ChunkData {
         for seg in segments {
             chunk_buffer_pool::return_u8_to_worker(self.pool_worker_index, seg);
         }
-        let dwm = std::mem::take(&mut self.data_with_markers);
-        chunk_buffer_pool::return_std_u16_to_worker(self.pool_worker_index, dwm);
+        let dwm = self.data_with_markers.take_segments();
+        chunk_buffer_pool::return_marker_segments_to_worker(self.pool_worker_index, dwm);
     }
 }
 
@@ -1770,7 +1733,7 @@ mod tests {
         if start < dwm_b_len {
             let take = (dwm_b_len - start).min(W);
             for (i, slot) in reference.iter_mut().enumerate().take(take) {
-                *slot = chunk_b.data_with_markers[start + i] as u8;
+                *slot = chunk_b.data_with_markers.get(start + i).unwrap_or(0) as u8;
             }
             written += take;
             let n = W - written;
