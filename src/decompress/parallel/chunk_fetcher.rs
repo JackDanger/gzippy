@@ -1240,6 +1240,7 @@ fn consumer_loop<W: std::io::Write>(
                     // ~line 1361 then handles the key.
                     if window_map.promote_speculative(spec_key) {
                         EARLY_SPEC_PROMOTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        resolve_ahead_prefetch_at_handoff(block_fetcher, window_map, spec_key);
                     }
                     if trace::is_enabled() {
                         trace::emit(
@@ -1434,6 +1435,7 @@ fn consumer_loop<W: std::io::Write>(
                     ),
                     "t",
                 );
+                resolve_ahead_prefetch_at_handoff(block_fetcher, window_map, chunk_end_bit);
             }
             predecessor_window_for_postprocess = None;
         } else if chunk.markers_resolved {
@@ -1528,6 +1530,7 @@ fn consumer_loop<W: std::io::Write>(
                 ),
                 "t",
             );
+            resolve_ahead_prefetch_at_handoff(block_fetcher, window_map, chunk_end_bit);
             predecessor_window_for_postprocess = Some(window);
         }
 
@@ -2308,12 +2311,6 @@ fn run_decode_task(
         );
     }
 
-    if resolve_ahead_enabled() {
-        if let Ok(ref mut chunk) = chunk_result {
-            let _ = try_worker_resolve_ahead(chunk, window_map);
-        }
-    }
-
     if let Ok(ref chunk) = chunk_result {
         if chunk.max_acceptable_start_bit == chunk.encoded_offset_bits
             && chunk.encoded_size_bits > 0
@@ -2330,6 +2327,7 @@ fn run_decode_task(
                     ),
                     "t",
                 );
+                resolve_ahead_prefetch_at_handoff(block_fetcher, window_map, chunk_end_bit);
                 EARLY_WINDOW_PUBLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             } else {
                 EARLY_WINDOW_TAIL_NOT_CLEAN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2465,17 +2463,19 @@ fn resolve_ahead_enabled() -> bool {
 #[cfg(parallel_sm)]
 fn try_worker_resolve_ahead(chunk: &mut ChunkData, window_map: &WindowMap) -> bool {
     use std::sync::atomic::Ordering;
-    RESOLVE_AHEAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     if chunk.data_with_markers.is_empty() {
         return false;
     }
-    if chunk.max_acceptable_start_bit != chunk.encoded_offset_bits {
-        return false;
-    }
+    // Handoff key: the confirmed predecessor window is published at the
+    // prior chunk's `chunk_end_bit`, which equals this chunk's
+    // `max_acceptable_start_bit` (consumer accept guard). Do not require
+    // `encoded_offset_bits == max` — at prefetch time `encoded` may still
+    // be the partition seed until the consumer rewrites on accept.
     let resolve_offset = chunk.max_acceptable_start_bit;
     if !window_map.contains(resolve_offset) {
         return false;
     }
+    RESOLVE_AHEAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     let Some((_pred_key, pred_w)) = window_map.get_predecessor(resolve_offset) else {
         return false;
     };
@@ -2512,6 +2512,36 @@ fn try_worker_resolve_ahead(chunk: &mut ChunkData, window_map: &WindowMap) -> bo
     );
     RESOLVE_AHEAD_OK.fetch_add(1, Ordering::Relaxed);
     true
+}
+
+/// After a confirmed window is published at `handoff_key`, scan the
+/// prefetch cache for successors whose `max_acceptable_start_bit` equals
+/// that key and run worker resolve-ahead while `contains(handoff_key)`.
+#[cfg(parallel_sm)]
+fn resolve_ahead_prefetch_at_handoff(
+    block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
+    window_map: &WindowMap,
+    handoff_key: usize,
+) {
+    if !resolve_ahead_enabled() || !window_map.contains(handoff_key) {
+        return;
+    }
+    block_fetcher.process_ready_prefetches();
+    let contents = block_fetcher.prefetch_cache_contents_sorted();
+    for (cache_key, arc) in contents {
+        if arc.max_acceptable_start_bit != handoff_key {
+            continue;
+        }
+        if arc.markers_resolved || arc.data_with_markers.is_empty() {
+            continue;
+        }
+        let mut chunk = (*arc).clone();
+        if try_worker_resolve_ahead(&mut chunk, window_map) {
+            let next_handoff = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+            block_fetcher.insert_prefetched(cache_key, Arc::new(chunk));
+            resolve_ahead_prefetch_at_handoff(block_fetcher, window_map, next_handoff);
+        }
+    }
 }
 
 /// Pool-side execution of a post-process task. Mirror of the lambda

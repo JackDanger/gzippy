@@ -19,9 +19,10 @@ for a in "$@"; do
     BRANCH=*) BRANCH="${a#*=}";;
     THREADS=*) THREADS="$(echo "${a#*=}" | tr ',' ' ')";;
     N=*) N="${a#*=}";;
+    RESOLVE_AHEAD=*) GZIPPY_RESOLVE_AHEAD="${a#*=}";;
   esac
 done
-# Optional experiment knob (forwarded from laptop via host_lock_and_bench env).
+# Optional experiment knob (env or RESOLVE_AHEAD=1 argument from host_lock).
 GZIPPY_RESOLVE_AHEAD="${GZIPPY_RESOLVE_AHEAD:-}"
 [ "$N" -ge 9 ] || N=9
 
@@ -90,24 +91,29 @@ say "==========================================="
 
 run_cmd_timed() {
   local mask="$1"; shift
-  local out s e
+  local out s e rc
   out="$(mktemp)"
   s=$(date +%s.%N)
-  taskset -c "$mask" "$@" >"$out" 2>/dev/null
+  # taskset execve's argv[0]; never pass a shell function here.
+  set +e
+  taskset -c "$mask" "$@" >"$out" 2>>"$ARTDIR/wall.stderr"
+  rc=$?
+  set -e
   e=$(date +%s.%N)
   local secs sha
   secs=$(awk -v a="$s" -v b="$e" 'BEGIN{printf "%.4f", b-a}')
   sha=$(sha256sum "$out" | cut -d' ' -f1)
+  [ "$rc" -eq 0 ] || say "WARN run_cmd_timed exit=$rc: $*"
   rm -f "$out"
   echo "$secs $sha"
 }
 
-# Common gzippy env for wall + trace (pure-rust parallel SM).
-gzippy_wall_invoke() {
+# Print argv prefix for gzippy wall runs (pure-rust parallel SM). One line for $(…).
+gzippy_wall_cmd() {
   if [ -n "$GZIPPY_RESOLVE_AHEAD" ]; then
-    env GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_RESOLVE_AHEAD="$GZIPPY_RESOLVE_AHEAD" "$@"
+    echo env GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_RESOLVE_AHEAD="$GZIPPY_RESOLVE_AHEAD"
   else
-    env GZIPPY_FORCE_PARALLEL_SM=1 "$@"
+    echo env GZIPPY_FORCE_PARALLEL_SM=1
   fi
 }
 
@@ -149,8 +155,9 @@ for T in $THREADS; do
   [ -n "$mask" ] || continue
   GZ_T=""; RG_T=""
   for ((i=0; i<=N; i++)); do
+    # shellcheck disable=SC2046
     read gsec gsha < <(run_cmd_timed "$mask" \
-      gzippy_wall_invoke "$GZIPPY" -d -c -p "$T" "$CORPUS")
+      $(gzippy_wall_cmd) "$GZIPPY" -d -c -p "$T" "$CORPUS")
     read rsec rsha < <(run_cmd_timed "$mask" "$RG_TRACE" -d -c -f -P "$T" "$CORPUS")
     [ "$i" -eq 0 ] && continue
     GZ_T="$GZ_T $gsec"; RG_T="$RG_T $rsec"

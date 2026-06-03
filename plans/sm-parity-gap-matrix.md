@@ -37,9 +37,10 @@
 
 **Vendor:** `queuePrefetchedChunkPostProcessing` — when predecessor window is confirmed, `applyWindow` runs on the **thread pool**, not the consumer stall.
 
-**gzippy (2026-06-03):** `GZIPPY_RESOLVE_AHEAD=1` on decode worker after exact marker chunk decode:
+**gzippy (2026-06-03):** `GZIPPY_RESOLVE_AHEAD=1` — resolve on prefetch when handoff key is published:
 
-- Gate: `max == encoded`, `window_map.contains(max)`, markers present.
+- Trigger: `resolve_ahead_prefetch_at_handoff` after `promote_speculative` / confirmed `insert_owned_none` (not at decode return — predecessor window is absent then).
+- Gate: `max_acceptable_start_bit == handoff_key`, `window_map.contains(handoff_key)`, markers present.
 - Runs `resolve_chunk_markers_on_chunk` + tail publish; sets `chunk.markers_resolved`.
 - Consumer skips `wait_replaced_markers`, `window_publish_marker`, and pool post-process for that chunk.
 
