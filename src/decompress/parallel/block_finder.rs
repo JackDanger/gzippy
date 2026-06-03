@@ -527,6 +527,35 @@ pub(crate) fn validate_fixed_block_prefix(data: &[u8], bit_offset: usize) -> boo
     code_len != 0 && sym < 286
 }
 
+/// Cheap structural prefilter before a full speculative trial decode.
+/// Used for the EOF tail byte walk in `speculative_decode_find_boundary`
+/// (thousands of offsets); block-finder candidates skip this.
+pub(crate) fn plausible_trial_decode_offset(data: &[u8], bit_offset: usize) -> bool {
+    let header = match peek_bits_at(data, bit_offset, 3) {
+        Some(h) => h,
+        None => return false,
+    };
+    let btype = (header >> 1) & 3;
+    match btype {
+        0 => {
+            let aligned_bit = (bit_offset + 3).div_ceil(8) * 8;
+            aligned_bit + 32 <= data.len() * 8
+        }
+        1 => validate_fixed_block_prefix(data, bit_offset),
+        2 => {
+            let h = match peek_bits_at(data, bit_offset, 17) {
+                Some(v) => v,
+                None => return false,
+            };
+            let hlit = ((h >> 3) & 31) as u8;
+            let hdist = ((h >> 8) & 31) as u8;
+            let hclen = ((h >> 13) & 15) as u8;
+            hlit <= 29 && hdist <= 29 && hclen <= 15
+        }
+        _ => false,
+    }
+}
+
 /// Peek `n` bits starting at absolute bit offset `bit` in `data`
 /// (LSB-first within bytes). Returns `None` if the read would overrun
 /// `data`. `n` must be ≤ 16.
@@ -1142,6 +1171,12 @@ pub fn find_blocks_parallel(data: &[u8], num_threads: usize) -> Vec<BlockBoundar
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plausible_trial_rejects_reserved_btype() {
+        let data = [0b111u8];
+        assert!(!plausible_trial_decode_offset(&data, 0));
+    }
 
     #[test]
     fn test_lut_generation() {

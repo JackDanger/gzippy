@@ -2796,9 +2796,19 @@ fn try_speculative_decode_candidate(
                 SPEC_DECODE_CLEAN_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(chunk)
             }
-            Ok(_) | Err(_) => {
-                decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration)
+            Ok(chunk) => {
+                // Clean decode with a published window but wrong stop
+                // (false-positive finder hit). Do not fall through to
+                // window-absent bootstrap — that duplicates the full decode.
+                let actual = chunk
+                    .encoded_offset_bits
+                    .saturating_add(chunk.encoded_size_bits);
+                Err(ChunkDecodeError::ExactStopMissed {
+                    requested: decode_start,
+                    actual,
+                })
             }
+            Err(_) => decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration),
         }
     } else {
         decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration)
@@ -2963,6 +2973,9 @@ fn speculative_decode_find_boundary(
         let tail_start_byte = start_bit / 8;
         for byte_off in tail_start_byte..input.len() {
             let bit = byte_off * 8;
+            if !super::block_finder::plausible_trial_decode_offset(input, bit) {
+                continue;
+            }
             if let Ok(chunk) = try_speculative_decode_candidate(
                 input,
                 bit,
