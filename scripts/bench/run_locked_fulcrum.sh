@@ -33,7 +33,11 @@ echo "=== Stage guest_fulcrum_capture.sh on host + guest ==="
 "${GUEST[@]}" "chmod +x $BENCH_HOST_DIR/guest_fulcrum_capture.sh"
 
 echo "=== Host lock + gate + guest capture (branch=$BRANCH T=$THREADS N=$N) ==="
-"${NEUROTIC[@]}" "GUEST_SCRIPT=guest_fulcrum_capture.sh bash $BENCH_HOST_DIR/host_lock_and_bench.sh \
+RA_ENV=""
+if [ -n "${GZIPPY_RESOLVE_AHEAD:-}" ]; then
+  RA_ENV="GZIPPY_RESOLVE_AHEAD=${GZIPPY_RESOLVE_AHEAD}"
+fi
+"${NEUROTIC[@]}" "GUEST_SCRIPT=guest_fulcrum_capture.sh ${RA_ENV} bash $BENCH_HOST_DIR/host_lock_and_bench.sh \
   BRANCH=${BRANCH} THREADS=${THREADS} N=${N}" 2>&1 | tee "$ART_LOCAL/host-guest.log"
 
 echo "=== Fetch artifacts from guest 199 ==="

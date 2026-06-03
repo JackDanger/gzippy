@@ -21,6 +21,8 @@ for a in "$@"; do
     N=*) N="${a#*=}";;
   esac
 done
+# Optional experiment knob (forwarded from laptop via host_lock_and_bench env).
+GZIPPY_RESOLVE_AHEAD="${GZIPPY_RESOLVE_AHEAD:-}"
 [ "$N" -ge 9 ] || N=9
 
 mkdir -p "$ARTDIR"
@@ -80,7 +82,7 @@ GZIPPY_SHA="$(git rev-parse HEAD)"
 RG_VER="$("$RG_TRACE" --version 2>&1 | head -1)"
 
 say "================ PROVENANCE ================"
-say "branch=$BRANCH head=$GZIPPY_SHA"
+say "branch=$BRANCH head=$GZIPPY_SHA resolve_ahead=${GZIPPY_RESOLVE_AHEAD:-off}"
 say "rapidgzip-trace=$RG_VER"
 say "corpus=$CORPUS ref_sha=$REF_SHA raw_bytes=$RAW_BYTES"
 say "artifacts=$ARTDIR"
@@ -100,6 +102,15 @@ run_cmd_timed() {
   echo "$secs $sha"
 }
 
+# Common gzippy env for wall + trace (pure-rust parallel SM).
+gzippy_wall_invoke() {
+  if [ -n "$GZIPPY_RESOLVE_AHEAD" ]; then
+    env GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_RESOLVE_AHEAD="$GZIPPY_RESOLVE_AHEAD" "$@"
+  else
+    env GZIPPY_FORCE_PARALLEL_SM=1 "$@"
+  fi
+}
+
 stats() {
   echo "$1" | tr ' ' '\n' | grep -v '^$' | sort -n | awk '
     { v[NR]=$1; sum+=$1 } END {
@@ -116,8 +127,14 @@ capture_trace() { # capture_trace <label> <cpu-mask> <cmd...>
   local tl="$ARTDIR/trace_${label}.json"
   local ml="$ARTDIR/memlife_${label}.json"
   say "## TRACE $label -> $tl"
-  GZIPPY_TIMELINE="$tl" GZIPPY_MEMLIFE="$ml" GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_VERBOSE=1 \
-    taskset -c "$mask" "$@" >/dev/null 2>>"$ARTDIR/trace.log" || true
+  if [ -n "$GZIPPY_RESOLVE_AHEAD" ]; then
+    GZIPPY_TIMELINE="$tl" GZIPPY_MEMLIFE="$ml" GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_VERBOSE=1 \
+      GZIPPY_RESOLVE_AHEAD="$GZIPPY_RESOLVE_AHEAD" \
+      taskset -c "$mask" "$@" >/dev/null 2>>"$ARTDIR/trace.log" || true
+  else
+    GZIPPY_TIMELINE="$tl" GZIPPY_MEMLIFE="$ml" GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_VERBOSE=1 \
+      taskset -c "$mask" "$@" >/dev/null 2>>"$ARTDIR/trace.log" || true
+  fi
   [ -s "$tl" ] || { say "## WARN empty timeline $tl"; return 1; }
   ls -la "$tl" "$ml" 2>/dev/null || true
 }
@@ -133,7 +150,7 @@ for T in $THREADS; do
   GZ_T=""; RG_T=""
   for ((i=0; i<=N; i++)); do
     read gsec gsha < <(run_cmd_timed "$mask" \
-      env GZIPPY_FORCE_PARALLEL_SM=1 "$GZIPPY" -d -c -p "$T" "$CORPUS")
+      gzippy_wall_invoke "$GZIPPY" -d -c -p "$T" "$CORPUS")
     read rsec rsha < <(run_cmd_timed "$mask" "$RG_TRACE" -d -c -f -P "$T" "$CORPUS")
     [ "$i" -eq 0 ] && continue
     GZ_T="$GZ_T $gsec"; RG_T="$RG_T $rsec"
@@ -167,6 +184,7 @@ cat >"$ARTDIR/manifest.json" <<MANIFEST
 {
   "branch": "$BRANCH",
   "head": "$GZIPPY_SHA",
+  "resolve_ahead": "${GZIPPY_RESOLVE_AHEAD:-}",
   "ref_sha": "$REF_SHA",
   "raw_bytes": $RAW_BYTES,
   "threads": "$THREADS",
