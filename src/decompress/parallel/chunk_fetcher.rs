@@ -2466,11 +2466,12 @@ fn try_worker_resolve_ahead(chunk: &mut ChunkData, window_map: &WindowMap) -> bo
     if chunk.data_with_markers.is_empty() {
         return false;
     }
-    // Handoff key: the confirmed predecessor window is published at the
-    // prior chunk's `chunk_end_bit`, which equals this chunk's
-    // `max_acceptable_start_bit` (consumer accept guard). Do not require
-    // `encoded_offset_bits == max` — at prefetch time `encoded` may still
-    // be the partition seed until the consumer rewrites on accept.
+    // Only exact confirmed chunks (consumer accept guard). Range-speculative
+    // prefetches still have `encoded_offset_bits` at the partition seed;
+    // resolving before accept corrupts marker positions → CRC mismatch.
+    if chunk.max_acceptable_start_bit != chunk.encoded_offset_bits {
+        return false;
+    }
     let resolve_offset = chunk.max_acceptable_start_bit;
     if !window_map.contains(resolve_offset) {
         return false;
@@ -2532,7 +2533,10 @@ fn resolve_ahead_prefetch_at_handoff(
         if arc.max_acceptable_start_bit != handoff_key {
             continue;
         }
-        if arc.markers_resolved || arc.data_with_markers.is_empty() {
+        if arc.markers_resolved
+            || arc.data_with_markers.is_empty()
+            || arc.max_acceptable_start_bit != arc.encoded_offset_bits
+        {
             continue;
         }
         let mut chunk = (*arc).clone();
