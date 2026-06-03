@@ -426,11 +426,8 @@ fn finish_decode_chunk_bulk_lut(
     }
 
     if reached_stream_end {
-        return BulkCleanTailResult::Handoff {
-            start_bit: bits.bit_position(),
-            last_eob_pos,
-            last_eob_decoded_bytes,
-            pending_stop_after_flush: false,
+        return BulkCleanTailResult::Complete {
+            final_bit: bits.bit_position(),
         };
     }
 
