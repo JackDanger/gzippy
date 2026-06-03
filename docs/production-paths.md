@@ -249,7 +249,7 @@ state unless noted otherwise.
 | `GZIPPY_SLAB_CAP` | Max resident free blocks retained by `SlabAlloc` (integer). Controls the retain–release tradeoff (over-retaining caused TLB regression when set to 32). | PRODUCTION-AFFECTING (allocator tuning) |
 | `GZIPPY_NO_PREFETCH` | Disable the speculative prefetch of the in-order frontier chunk. When absent (the default), prefetching is enabled. Measurement lever. | PRODUCTION-AFFECTING (prefetch) |
 | `GZIPPY_BURST_PREFETCH` | Raise the in-flight prefetch gate from `pool_size` to `pool_size * 2` (doubles the max parallel prefetch depth). | PRODUCTION-AFFECTING (prefetch) |
-| `GZIPPY_EAGER_POSTPROC` | During consumer stalls, clone+submit pool post-process for ready successors (refuted +195 ms wall). Off by default; production uses resolve-ahead instead. | PRODUCTION-AFFECTING (scheduling, refuted) |
+| `GZIPPY_EAGER_POSTPROC` | Extra full-cache post-process scan on every marker wait (diagnostic duplicate of production resolve-ahead). Off by default. | PRODUCTION-AFFECTING (scheduling probe) |
 | `GZIPPY_VERBOSE` | Print `BlockFetcher` statistics (cache hits/misses, speculation failures, chunk sizes, timing counters) to stderr after decode. Mirror of rapidgzip's `--verbose` destructor dump. | INSTRUMENTATION |
 | `GZIPPY_DEBUG` (also in bgzf/parallel) | Same flag read in multiple modules (`bgzf.rs:3431`, `parallel/single_member.rs:114`, `compress/parallel.rs:555`). Effect is additional per-operation debug prints. | INSTRUMENTATION |
 | `GZIPPY_TRACE` | Enable bgzf decode tracing. Cached once in `bgzf.rs` via `OnceLock`. | INSTRUMENTATION |
