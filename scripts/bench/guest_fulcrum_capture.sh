@@ -20,10 +20,12 @@ for a in "$@"; do
     THREADS=*) THREADS="$(echo "${a#*=}" | tr ',' ' ')";;
     N=*) N="${a#*=}";;
     RESOLVE_AHEAD=*) GZIPPY_RESOLVE_AHEAD="${a#*=}";;
+    SLOW_BOOTSTRAP=*) GZIPPY_SLOW_BOOTSTRAP="${a#*=}";;
   esac
 done
-# Optional experiment knob (env or RESOLVE_AHEAD=1 argument from host_lock).
+# Optional experiment knobs (env or host_lock arguments).
 GZIPPY_RESOLVE_AHEAD="${GZIPPY_RESOLVE_AHEAD:-}"
+GZIPPY_SLOW_BOOTSTRAP="${GZIPPY_SLOW_BOOTSTRAP:-}"
 [ "$N" -ge 9 ] || N=9
 
 mkdir -p "$ARTDIR"
@@ -83,7 +85,7 @@ GZIPPY_SHA="$(git rev-parse HEAD)"
 RG_VER="$("$RG_TRACE" --version 2>&1 | head -1)"
 
 say "================ PROVENANCE ================"
-say "branch=$BRANCH head=$GZIPPY_SHA resolve_ahead=${GZIPPY_RESOLVE_AHEAD:-off}"
+say "branch=$BRANCH head=$GZIPPY_SHA resolve_ahead=${GZIPPY_RESOLVE_AHEAD:-off} slow_bootstrap=${GZIPPY_SLOW_BOOTSTRAP:-off}"
 say "rapidgzip-trace=$RG_VER"
 say "corpus=$CORPUS ref_sha=$REF_SHA raw_bytes=$RAW_BYTES"
 say "artifacts=$ARTDIR"
@@ -108,13 +110,12 @@ run_cmd_timed() {
   echo "$secs $sha"
 }
 
-# Print argv prefix for gzippy wall runs (pure-rust parallel SM). One line for $(…).
+# Print argv prefix for gzippy wall/trace runs (pure-rust parallel SM). One line for $(…).
 gzippy_wall_cmd() {
-  if [ -n "$GZIPPY_RESOLVE_AHEAD" ]; then
-    echo env GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_RESOLVE_AHEAD="$GZIPPY_RESOLVE_AHEAD"
-  else
-    echo env GZIPPY_FORCE_PARALLEL_SM=1
-  fi
+  local parts="env GZIPPY_FORCE_PARALLEL_SM=1"
+  [ -n "$GZIPPY_RESOLVE_AHEAD" ] && parts="$parts GZIPPY_RESOLVE_AHEAD=$GZIPPY_RESOLVE_AHEAD"
+  [ -n "$GZIPPY_SLOW_BOOTSTRAP" ] && parts="$parts GZIPPY_SLOW_BOOTSTRAP=$GZIPPY_SLOW_BOOTSTRAP"
+  echo "$parts"
 }
 
 stats() {
@@ -133,14 +134,9 @@ capture_trace() { # capture_trace <label> <cpu-mask> <cmd...>
   local tl="$ARTDIR/trace_${label}.json"
   local ml="$ARTDIR/memlife_${label}.json"
   say "## TRACE $label -> $tl"
-  if [ -n "$GZIPPY_RESOLVE_AHEAD" ]; then
-    GZIPPY_TIMELINE="$tl" GZIPPY_MEMLIFE="$ml" GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_VERBOSE=1 \
-      GZIPPY_RESOLVE_AHEAD="$GZIPPY_RESOLVE_AHEAD" \
-      taskset -c "$mask" "$@" >/dev/null 2>>"$ARTDIR/trace.log" || true
-  else
-    GZIPPY_TIMELINE="$tl" GZIPPY_MEMLIFE="$ml" GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_VERBOSE=1 \
-      taskset -c "$mask" "$@" >/dev/null 2>>"$ARTDIR/trace.log" || true
-  fi
+  # shellcheck disable=SC2046
+  GZIPPY_TIMELINE="$tl" GZIPPY_MEMLIFE="$ml" GZIPPY_VERBOSE=1 \
+    taskset -c "$mask" $(gzippy_wall_cmd) "$@" >/dev/null 2>>"$ARTDIR/trace.log" || true
   [ -s "$tl" ] || { say "## WARN empty timeline $tl"; return 1; }
   ls -la "$tl" "$ml" 2>/dev/null || true
 }
@@ -192,6 +188,7 @@ cat >"$ARTDIR/manifest.json" <<MANIFEST
   "branch": "$BRANCH",
   "head": "$GZIPPY_SHA",
   "resolve_ahead": "${GZIPPY_RESOLVE_AHEAD:-}",
+  "slow_bootstrap": "${GZIPPY_SLOW_BOOTSTRAP:-}",
   "ref_sha": "$REF_SHA",
   "raw_bytes": $RAW_BYTES,
   "threads": "$THREADS",
