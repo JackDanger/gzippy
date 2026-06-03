@@ -1977,8 +1977,8 @@ fn eager_postprocess_prefetched(
         if !window_map.contains(resolve_offset) {
             continue;
         }
-        let (pred_key, predecessor_window) = match window_map.get_predecessor(resolve_offset) {
-            Some((k, w)) => (k, w),
+        let (pred_key, predecessor_window) = match window_map.get(resolve_offset) {
+            Some(w) => (resolve_offset, w),
             None => continue,
         };
 
@@ -2495,18 +2495,27 @@ fn resolve_chunk_markers_on_chunk(chunk: &mut ChunkData, predecessor_window: &[u
 /// Worker-side port of vendor `queuePrefetchedChunkPostProcessing`.
 #[cfg(parallel_sm)]
 fn resolve_ahead_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHED: AtomicU8 = AtomicU8::new(0);
-    match CACHED.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = match std::env::var_os("GZIPPY_RESOLVE_AHEAD") {
-                Some(v) => v != "0" && v != "false",
-                None => crate::decompress::parallel::sm_cfg::RESOLVE_AHEAD_DEFAULT,
-            };
-            CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
+    let read = || match std::env::var_os("GZIPPY_RESOLVE_AHEAD") {
+        Some(v) => v != "0" && v != "false",
+        None => crate::decompress::parallel::sm_cfg::RESOLVE_AHEAD_DEFAULT,
+    };
+    // Tests flip the env between A/B runs in one process; production caches once.
+    #[cfg(test)]
+    {
+        return read();
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static CACHED: AtomicU8 = AtomicU8::new(0);
+        match CACHED.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let on = read();
+                CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+                on
+            }
         }
     }
 }
@@ -3415,6 +3424,34 @@ mod tests {
             flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
         enc.write_all(payload).unwrap();
         enc.finish().unwrap()
+    }
+
+    /// Low-entropy gzip forces window-absent marker bootstrap; resolve-ahead
+    /// must not change bytes vs the default-off path.
+    #[test]
+    fn drive_resolve_ahead_byte_identical_to_off() {
+        // Low-entropy → many window-absent chunks (same shape as silesia-large trap tests).
+        let payload = vec![0x42u8; 32 * 1024 * 1024];
+        let deflate = make_deflate(&payload, 6);
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 4 * 1024 * 1024,
+            max_decoded_chunk_size: 64 * 1024 * 1024,
+            crc32_enabled: true,
+        };
+        let mut out_off = Vec::new();
+        std::env::remove_var("GZIPPY_RESOLVE_AHEAD");
+        let (_crc0, n0) = drive(&deflate, &mut out_off, None, 8, cfg).expect("drive off");
+        RESOLVE_AHEAD_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+        RESOLVE_AHEAD_OK.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut out_on = Vec::new();
+        std::env::set_var("GZIPPY_RESOLVE_AHEAD", "1");
+        let (_crc1, n1) = drive(&deflate, &mut out_on, None, 8, cfg).expect("drive on");
+        std::env::remove_var("GZIPPY_RESOLVE_AHEAD");
+        assert_eq!(n0, payload.len());
+        assert_eq!(n1, payload.len());
+        assert_eq!(out_off, payload);
+        assert_eq!(out_on, payload);
+        assert_eq!(out_off, out_on);
     }
 
     #[test]
