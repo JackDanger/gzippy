@@ -39,9 +39,9 @@
 
 **Vendor:** `queuePrefetchedChunkPostProcessing` — when predecessor window is confirmed, `applyWindow` runs on the **thread pool**, not the consumer stall.
 
-**gzippy (2026-06-03+):** resolve-ahead scaffolding (no `GZIPPY_RESOLVE_AHEAD` knob): exact `WindowMap::get(handoff)`, consumer `set_encoded_offset` clears stale `markers_resolved`, prefetch clones `reanchor_chunk_to_handoff`. **`try_worker_resolve_ahead` body gated off** (`4972a81`) until worker resolve + consumer tail publish are byte-identical to pool `run_post_process_task` on silesia-large — skipping the pool path with `markers_resolved` corrupted CRC.
+**gzippy (2026-06-03+):** `queue_prefetched_marker_postprocess` — vendor-faithful pool post-process on prefetched **clones** (not inline `apply_window` on worker). Triggered after confirmed tail publish (`Some(handoff_key)`) and during marker wait (`None` scan). Consumer reuses `prefetch_post_inflight` receivers when `pred_key` matches. No `GZIPPY_RESOLVE_AHEAD` knob.
 
-**Ship-gate:** Locked Fulcrum N≥9; **0 sha diverge** (restores ~770 ms T8 baseline); re-enable body only after CRC gate + `RESOLVE_AHEAD_OK` > 0 with wall win.
+**Ship-gate:** Locked Fulcrum N≥9; **0 sha diverge**; `RESOLVE_AHEAD_OK` > 0; wall ↓ > spread vs `4972a81` baseline.
 
 **Disproof:** Wall flat, only worker busy ↑ → decode-bound, not resolve-bound.
 
