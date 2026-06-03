@@ -2130,39 +2130,46 @@ fn run_decode_task(
     // Hold the materialized bytes on the stack so the
     // `decode_chunk_isal` slice borrow is valid for the call's
     // duration without going through WindowMap. Non-chunk-0 worker
-    // gets the predecessor window via `window_map.get` (zero-alloc
-    // Arc clone) and materializes bytes via `materialize_window`.
+    // gets the predecessor window via exact `get(start_bit)` or, when the
+    // tail is keyed at the prior chunk's end, `get_predecessor(start_bit)`.
     let zero_window: [u8; 32768] = [0u8; 32768];
-    let window: Option<Window> = if params.start_bit == 0 {
+    let window_exact: Option<Window> = if params.start_bit == 0 {
         None
     } else {
         window_map.get(params.start_bit)
     };
+    let window_pred: Option<Window> = if params.start_bit == 0 {
+        None
+    } else {
+        window_map
+            .get_predecessor(params.start_bit)
+            .map(|(_k, w)| w)
+    };
 
-    // INDEPENDENT decode-mode signal for Fulcrum's `model` view. The mode is
-    // the ACTUAL window-present-at-decode-start predicate (clean iff
-    // start_bit==0 or the predecessor window is published), NOT the dispatch
-    // `is_speculative_prefetch` intent (a prefetch can race the publish and
-    // run clean). Emitted as an instant keyed by start_bit so the model joins
-    // it to this chunk's `worker.decode_chunk` span and splits d_c / d_w
-    // honestly.
-    let decode_mode_clean = params.start_bit == 0 || window.is_some();
+    let decode_mode_clean = params.start_bit == 0 || window_exact.is_some();
+    let predecessor_available = window_pred.is_some();
     let mode_str = if decode_mode_clean {
         "clean"
+    } else if predecessor_available {
+        "predecessor_only"
     } else {
         "window_absent"
     };
     trace_v2::emit_instant(
         "worker.decode_mode",
-        &format!(r#""start_bit":{},"mode":"{mode_str}""#, params.start_bit),
+        &format!(
+            r#""start_bit":{},"mode":"{mode_str}","pred_available":{predecessor_available}"#,
+            params.start_bit
+        ),
         "t",
     );
     trace_v2::emit_instant(
         "causal.decode_decision",
         &format!(
-            r#""start_bit":{},"window_present":{},"mode":"{mode_str}","stop_hint":{},"speculative":{}"#,
+            r#""start_bit":{},"window_exact":{},"predecessor_available":{},"mode":"{mode_str}","stop_hint":{},"speculative":{}"#,
             params.start_bit,
-            decode_mode_clean,
+            window_exact.is_some(),
+            predecessor_available,
             params.stop_hint_bit,
             params.is_speculative_prefetch
         ),
@@ -2177,7 +2184,7 @@ fn run_decode_task(
             &zero_window[..],
             configuration,
         )
-    } else if let Some(w) = window.as_ref() {
+    } else if let Some(w) = window_exact.as_ref() {
         let bytes = materialize_window(w);
         decode_chunk_isal(
             input_bytes,
@@ -2186,6 +2193,29 @@ fn run_decode_task(
             &bytes,
             configuration,
         )
+    } else if let Some(w) = window_pred.as_ref() {
+        let bytes = materialize_window(w);
+        match decode_chunk_isal(
+            input_bytes,
+            params.start_bit,
+            params.stop_hint_bit,
+            &bytes,
+            configuration,
+        ) {
+            Ok(chunk)
+                if chunk.encoded_offset_bits == params.start_bit
+                    && chunk.max_acceptable_start_bit == params.start_bit =>
+            {
+                CLEAN_DECODE_VIA_PREDECESSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(chunk)
+            }
+            Ok(_) | Err(_) => speculative_decode_find_boundary(
+                input_bytes,
+                params.start_bit,
+                params.stop_hint_bit,
+                configuration,
+            ),
+        }
     } else {
         speculative_decode_find_boundary(
             input_bytes,
@@ -2628,6 +2658,12 @@ pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
 /// rejected it (mismatch between `chunk.max_acceptable_start_bit` and
 /// consumer-requested `next_block_offset`) — distinct from
 /// `prefetch_cache_miss`, which counts a prefetch being absent.
+/// Worker took the clean `decode_chunk_isal` path using
+/// `WindowMap::get_predecessor` (predecessor published at prior chunk end,
+/// not at this chunk's partition seed).
+pub static CLEAN_DECODE_VIA_PREDECESSOR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub static PREFETCH_REJECT_BY_GUARD: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
