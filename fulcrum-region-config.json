@@ -19,7 +19,12 @@
     },
     {
       "name": "apply_window",
-      "functions": ["post_process.task", "window_publish_marker", "publish_windows"]
+      "functions": [
+        "post_process.task",
+        "worker.resolve_ahead",
+        "window_publish_marker",
+        "publish_windows"
+      ]
     },
     {
       "name": "consumer_write",

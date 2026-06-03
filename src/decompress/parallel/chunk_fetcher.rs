@@ -891,6 +891,11 @@ fn drive_impl<W: std::io::Write>(
             SPEC_DECODE_CLEAN_OK.load(Ordering::Relaxed),
         );
         eprintln!(
+            "  Worker resolve-ahead (GZIPPY_RESOLVE_AHEAD): ok={} / attempts={}",
+            RESOLVE_AHEAD_OK.load(Ordering::Relaxed),
+            RESOLVE_AHEAD_ATTEMPTS.load(Ordering::Relaxed),
+        );
+        eprintln!(
             "  Arc::try_unwrap hits/misses: {} / {}",
             ARC_TRY_UNWRAP_HITS.load(Ordering::Relaxed),
             ARC_TRY_UNWRAP_MISSES.load(Ordering::Relaxed),
@@ -1430,6 +1435,11 @@ fn consumer_loop<W: std::io::Write>(
                     "t",
                 );
             }
+            predecessor_window_for_postprocess = None;
+        } else if chunk.markers_resolved {
+            // Worker resolve-ahead (`GZIPPY_RESOLVE_AHEAD`): apply_window,
+            // narrow, subchunk windows, and tail publish already ran on the
+            // decode worker when the confirmed predecessor window existed.
             predecessor_window_for_postprocess = None;
         } else {
             // Vendor `waitForReplacedMarkers` (GzipChunkFetcher.hpp:478-518)
@@ -2180,7 +2190,7 @@ fn run_decode_task(
         "t",
     );
 
-    let chunk_result = if params.start_bit == 0 {
+    let mut chunk_result = if params.start_bit == 0 {
         decode_chunk(
             input_bytes,
             params.start_bit,
@@ -2298,9 +2308,16 @@ fn run_decode_task(
         );
     }
 
+    if resolve_ahead_enabled() {
+        if let Ok(ref mut chunk) = chunk_result {
+            let _ = try_worker_resolve_ahead(chunk, window_map);
+        }
+    }
+
     if let Ok(ref chunk) = chunk_result {
         if chunk.max_acceptable_start_bit == chunk.encoded_offset_bits
             && chunk.encoded_size_bits > 0
+            && !chunk.markers_resolved
         {
             if let Some(tail) = chunk.last_32kib_window_vec() {
                 let chunk_end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
@@ -2405,6 +2422,98 @@ fn run_decode_task(
     result
 }
 
+/// Shared marker resolve body (`applyWindow` + narrow + subchunk windows + CRC).
+#[cfg(parallel_sm)]
+fn resolve_chunk_markers_on_chunk(chunk: &mut ChunkData, predecessor_window: &[u8]) {
+    let dwm_len_pre = chunk.data_with_markers.len();
+    if dwm_len_pre >= 16 * 1024 {
+        POST_PROCESS_FUSED_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        POST_PROCESS_SMALL_MARKERS_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    apply_window(chunk, predecessor_window);
+    chunk.narrow_markers_in_place();
+    chunk.populate_subchunk_windows(predecessor_window);
+    chunk.update_narrowed_crc();
+    chunk.recycle_markers_after_resolution();
+}
+
+/// True iff `GZIPPY_RESOLVE_AHEAD=1` (default OFF). Worker-side port of vendor
+/// `queuePrefetchedChunkPostProcessing` — resolve markers when the predecessor
+/// window is already confirmed at the chunk's handoff key.
+#[cfg(parallel_sm)]
+fn resolve_ahead_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHED: AtomicU8 = AtomicU8::new(0);
+    match CACHED.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var_os("GZIPPY_RESOLVE_AHEAD")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Worker-side resolve-ahead (Design D): when decode finishes with markers and
+/// the predecessor window is confirmed at `max_acceptable_start_bit`, run
+/// `apply_window` on the decode worker and publish the tail before the consumer
+/// reaches this chunk.
+#[cfg(parallel_sm)]
+fn try_worker_resolve_ahead(chunk: &mut ChunkData, window_map: &WindowMap) -> bool {
+    use std::sync::atomic::Ordering;
+    RESOLVE_AHEAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    if chunk.data_with_markers.is_empty() {
+        return false;
+    }
+    if chunk.max_acceptable_start_bit != chunk.encoded_offset_bits {
+        return false;
+    }
+    let resolve_offset = chunk.max_acceptable_start_bit;
+    if !window_map.contains(resolve_offset) {
+        return false;
+    }
+    let Some((_pred_key, pred_w)) = window_map.get_predecessor(resolve_offset) else {
+        return false;
+    };
+    let _tv2 = trace_v2::SpanGuard::begin_with(
+        "worker.resolve_ahead",
+        &format!(
+            r#""start_bit":{},"marker_bytes":{},"resolve_offset":{}"#,
+            chunk.encoded_offset_bits,
+            chunk.data_with_markers.len(),
+            resolve_offset,
+        ),
+    );
+    let bytes = materialize_window(&pred_w);
+    let start_bit = chunk.encoded_offset_bits;
+    let marker_bytes = chunk.data_with_markers.len();
+    resolve_chunk_markers_on_chunk(chunk, bytes.as_ref());
+    chunk.markers_resolved = true;
+    let chunk_end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+    let tail = chunk.get_last_window_vec(bytes.as_ref());
+    window_map.insert_owned_none(chunk_end_bit, tail);
+    trace_v2::emit_instant(
+        "causal.window_publish",
+        &format!(
+            r#""start_bit":{start_bit},"end_bit":{chunk_end_bit},"site":"worker_resolve_ahead""#,
+        ),
+        "t",
+    );
+    trace_v2::emit_instant(
+        "causal.tax",
+        &format!(
+            r#""start_bit":{start_bit},"marker_bytes":{marker_bytes},"resolve_us":0,"site":"worker_resolve_ahead""#,
+        ),
+        "t",
+    );
+    RESOLVE_AHEAD_OK.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
 /// Pool-side execution of a post-process task. Mirror of the lambda
 /// body at `GzipChunkFetcher::queueChunkForPostProcessing`
 /// (vendor/.../GzipChunkFetcher.hpp:579-582).
@@ -2418,71 +2527,20 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
             chunk.data_with_markers.len()
         ),
     );
-    // Vendor lambda at GzipChunkFetcher.hpp:579-582 — `applyWindow` only.
-    // WindowMap writes happen on the consumer (`publish_subchunk_windows`).
     let start_bit = chunk.encoded_offset_bits;
     let marker_bytes = chunk.data_with_markers.len();
     let t_materialize = std::time::Instant::now();
     let bytes = materialize_window(&predecessor_window);
     let materialize_us = t_materialize.elapsed().as_micros();
-    // For chunks at or above the LUT threshold, fuse `replace_markers` +
-    // `narrow_u16_to_u8` into one pass that reads u16 and writes the
-    // resolved u8 directly into `chunk.narrowed`. Vendor parity:
-    // `DecodedData.hpp:316-337` writes `target[i] = fullWindow[chunk[i]]`
-    // in a single LUT pass.
-    //
-    // Threshold lowered 128 KiB → 16 KiB (2026-05-31, consumer-path
-    // copy-elimination): the two-pass path costs ~3 buffer passes
-    // (AVX2 u16 in-place replace = read+write 2·N bytes, then narrow =
-    // read 2·N + write N), while the fused path costs ~96 KiB of LUT
-    // setup (64 KiB zero-init + 32 KiB window copy) plus ONE write of N
-    // bytes. The LUT is window-dependent (every chunk has a different
-    // predecessor window), so it cannot be reused across chunks — the
-    // ~96 KiB setup is paid per fused call regardless. Break-even is
-    // around N ≈ 16 KiB of markers; below that the LUT setup dominates,
-    // so 16 KiB is the conservative floor (not 0). Above it the fused
-    // single-pass wins. The fused path already produces byte-identical
-    // output (it is the production large-marker path), so only the
-    // threshold moves.
-    // FOOTPRINT-ALIGN: resolve markers IN PLACE inside `data_with_markers`,
-    // then narrow IN PLACE (u16→u8 within the same backing store). No
-    // separate `narrowed` buffer is allocated — the resolved u8 output is the
-    // first `narrowed_len` bytes of `data_with_markers`. Faithful port of
-    // vendor's `applyWindow` (DecodedData.hpp:325-388). This replaces the
-    // former fused-LUT-into-separate-buffer path; the LUT fusion saved a
-    // pass but at the cost of a whole extra resident u8 buffer per chunk
-    // (memlife: 1.88 GB alloc / a buffer rapidgzip does not have), which is
-    // exactly the footprint divergence this change targets.
-    let dwm_len_pre = chunk.data_with_markers.len();
     let t_apply = std::time::Instant::now();
-    if dwm_len_pre >= 16 * 1024 {
-        POST_PROCESS_FUSED_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    } else {
-        POST_PROCESS_SMALL_MARKERS_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    apply_window(&mut chunk, &bytes);
-    let t_narrow = std::time::Instant::now();
-    chunk.narrow_markers_in_place();
-    let narrow_us = t_narrow.elapsed().as_micros();
+    resolve_chunk_markers_on_chunk(&mut chunk, bytes.as_ref());
     let apply_us = t_apply.elapsed().as_micros();
-    let t_pop = std::time::Instant::now();
-    // `narrowed_bytes()` aliases `data_with_markers`'s store; copy out the
-    // borrow boundary by computing windows against it directly. The borrow is
-    // immutable and `populate_subchunk_windows` only reads `&self.data`/args.
-    chunk.populate_subchunk_windows(&bytes);
-    let populate_us = t_pop.elapsed().as_micros();
-    // CRC the narrowed bytes on the worker (vendor parity: applyWindow CRCs
-    // resolved marker bytes on the worker, not the serial consumer).
-    {
-        let _tv2 = trace_v2::SpanGuard::begin("post_process.crc_narrowed");
-        chunk.update_narrowed_crc();
-    }
-    let resolve_us = apply_us as f64 + narrow_us as f64;
-    let fused = dwm_len_pre >= 16 * 1024;
+    let resolve_us = apply_us as f64;
+    let fused = marker_bytes >= 16 * 1024;
     trace_v2::emit_instant(
         "causal.tax",
         &format!(
-            r#""start_bit":{start_bit},"marker_bytes":{marker_bytes},"resolve_us":{resolve_us},"narrow_us":{narrow_us},"materialize_us":{materialize_us},"populate_us":{populate_us},"fused":{fused}"#,
+            r#""start_bit":{start_bit},"marker_bytes":{marker_bytes},"resolve_us":{resolve_us},"materialize_us":{materialize_us},"fused":{fused}"#,
         ),
         "t",
     );
@@ -2491,14 +2549,10 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
             "post_process",
             "post_process_span",
             &format!(
-                r#""start_bit":{start_bit},"materialize_us":{materialize_us},"apply_window_us":{apply_us},"populate_subchunk_windows_us":{populate_us},"narrow_us":{narrow_us},"marker_bytes":{marker_bytes}"#,
+                r#""start_bit":{start_bit},"materialize_us":{materialize_us},"apply_window_us":{apply_us},"marker_bytes":{marker_bytes}"#,
             ),
         );
     }
-    // The narrowed bytes live INSIDE data_with_markers until the consumer
-    // writes them, so we no longer eagerly recycle that buffer here (it would
-    // free the bytes the consumer still needs). Drop returns it post-consume.
-    chunk.recycle_markers_after_resolution();
     chunk
 }
 
@@ -2655,6 +2709,11 @@ pub static EARLY_SPEC_PUBLISHED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static EARLY_SPEC_PROMOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static EARLY_SPEC_EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Worker resolve-ahead (`GZIPPY_RESOLVE_AHEAD=1`): attempts / successes.
+pub static RESOLVE_AHEAD_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static RESOLVE_AHEAD_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
