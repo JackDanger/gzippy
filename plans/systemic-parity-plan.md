@@ -1,5 +1,14 @@
 # Systemic plan: pure-Rust gzippy → rapidgzip parity
 
+> **STATUS: SUPERSEDED (2026-06-03).** The “clean-window oracle ≈ rapidgzip” premise was
+> falsified (oracle silently re-ran bootstrap, commit `64eb6df`). Production parity work
+> is tracked in [`sm-parity-gap-matrix.md`](sm-parity-gap-matrix.md) + [`wall-progress.md`](wall-progress.md).
+> P2 “delete deflate_block” is **not shipped** — production still uses the two-stage
+> `decode_chunk_with_rapidgzip_impl` (marker ring → resumable inflate). See
+> [`docs/production-paths.md`](../docs/production-paths.md) §3.
+
+---
+
 Decisive measurement (frozen best-of-6, T8 silesia-large, MB/s) that grounds this plan:
 `isal clean-window 2035 ≈ rapidgzip 2067` | `pure clean-window 1626` | `isal normal 1522` |
 `pure normal 1425`. The clean-window oracle (`GZIPPY_CLEAN_WINDOW_ORACLE=1`) is the instrument.

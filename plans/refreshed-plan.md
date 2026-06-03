@@ -1,5 +1,12 @@
 # Refreshed plan — closing the gzippy → rapidgzip x86 single-member wall gap
 
+> **STATUS: SUPERSEDED (2026-06-03).** Partially implemented (handoff accept uses
+> `decode_start` + `max == decode_start`, not full vendor range chain). Wall ~1.65× on
+> locked Fulcrum; active matrix: [`sm-parity-gap-matrix.md`](sm-parity-gap-matrix.md).
+> Production routing: [`docs/production-paths.md`](../docs/production-paths.md).
+
+---
+
 _2026-05-30, after the consumer-pump TIE and TWO rounds of advisor-validated re-localization
 (my "scheduling-bound" read was wrong; the agent's "32-MiB-drift" read was also wrong; the
 source-grounded diagnosis below is §1.3-1.5)._

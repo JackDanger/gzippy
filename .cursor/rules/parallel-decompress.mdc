@@ -3,43 +3,33 @@ description: Parallel decompression — architecture, proven failures, and invar
 alwaysApply: true
 ---
 
-# Parallel Single-Member Decompression: What We Know
+# Parallel Single-Member Decompression
+
+**Production map (read first):** [`docs/production-paths.md`](../../docs/production-paths.md),
+[`docs/production-decode-callgraph.md`](../../docs/production-decode-callgraph.md).
+**Active parity plan:** [`plans/sm-parity-gap-matrix.md`](../../plans/sm-parity-gap-matrix.md).
+
+## Production (2026-06)
+
+- **Route:** `classify_gzip` → `DecodePath::IsalParallelSM` when `parallel_sm` cfg,
+  `threads ≥ 4` (or `GZIPPY_FORCE_PARALLEL_SM=1`), compressed > 10 MiB, ratio gate passes.
+- **Driver:** `single_member::decompress_parallel` → `chunk_fetcher::drive` (no fallback).
+- **Decode:** `gzip_chunk::decode_chunk_with_rapidgzip_impl` — **same outer shape as rapidgzip**:
+  marker bootstrap (`deflate_block`) until 32 KiB clean, then `ResumableInflate2` streaming
+  on the same `ChunkData`. **Not** two-pass scan+redecode (refuted).
+- **Build target:** `pure-rust-inflate` (x86 + arm64 `parallel_sm`). ISA-L is optional
+  oracle / non-pure builds only.
+- **Wall gap vs rapidgzip:** ~1.65× T8 silesia (locked Fulcrum). Binding: decode rate
+  (`worker.bootstrap` + `worker.stream_inflate`) + publish-chain (`L_resolve`).
 
 ## Architecture That Works (BGZF / Multi-Member)
 
-BGZF and multi-member files have explicit boundaries between independent gzip
-members. Each member decompresses independently → trivially parallel. This is
-production-proven and dominant in benchmarks.
+BGZF and multi-member: independent members → `bgzf::decompress_*_parallel` (libdeflate FFI).
 
 ## Single-Member Parallel: The Hard Problem
 
-Single-member gzip = one deflate stream = no natural split points.
-
-### Current State (Feb 24 2026)
-
-Rapidgzip-style speculation pipeline is complete and tested (160 tests, 0 failures).
-
-**Production routing**: `parallel_single_member::decompress_parallel` is gated on
-`isal_decompress::is_available()` — **x86_64 only**. On arm64, parallel speculation
-is catastrophically slow for low-redundancy data (16x slower than sequential — block
-boundaries are rare, most chunks become all-marker forcing large sequential re-decodes).
-
-Pipeline produces **correct output** (CRC32-verified). Performance on x86_64:
-- Test data (40MB): T10=164ms (255 MB/s), 10/10 spec hits
-- Silesia (212MB): T10=2410ms (88 MB/s), 7/10 spec hits
-- Still slower than sequential libdeflate (~700 MB/s) on silesia
-
-**arm64 single-member path** (gated out of parallel):
-- data ≤ 1GB → `decompress_single_member_libdeflate` (near-parity with pigz, -0.7%)
-- data > 1GB → `decompress_single_member_streaming` (avoids huge allocation only)
-- Streaming zlib-ng was tested and is ~19% SLOWER than libdeflate for 10MB on M4.
-  Do NOT lower the 1GB streaming threshold.
-
-Key improvements (Feb 24):
-- Block-by-block confirmation: checks for spec matches at EVERY block boundary
-- Lightweight try_decode_at: 64KB decode limit (was 2MB), 5x faster search
-- Fixed 64KB margin bug: data slice now uses full remaining stream
-- Removed TooFewChunks dead code, two_pass_parallel.rs deprecated
+Single-member gzip = one deflate stream = no natural split points. Speculation + window map
++ in-order consumer (rapidgzip-shaped port in `chunk_fetcher.rs`).
 
 #### Architecture (no retry, no sequential pre-scan)
 1. Partition compressed data at regular intervals

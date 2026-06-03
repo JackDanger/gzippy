@@ -1,5 +1,11 @@
 # Fixed-architecture design — the consumer/window-resolution chain (DESIGN ONLY, for adversarial disproof)
 
+> **STATUS: HISTORICAL DESIGN (2026-06-03).** Design D (resolve-ahead) measured **TIE/inert**
+> on silesia — see [`sm-parity-gap-matrix.md`](sm-parity-gap-matrix.md) row C. Consumer null-oracle
+> (~100 ms T8) is a separate bounded lever (row L). Do not treat “consumer-only” as the sole gap.
+
+---
+
 Status: DESIGN, not built, not measured. Provisional on the causal C2 test (agent a001c98,
 in flight) confirming the gap is the consumer chain. To be disproven by an advisor before any build.
 
