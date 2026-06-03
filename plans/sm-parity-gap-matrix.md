@@ -19,7 +19,7 @@
 | **G** | Runtime WA% vs static | 90% vs 31% | **Accept**; make WA cheap (**F**, **K**), don't cap prefetch (D6 refuted) | Policy |
 | **H** | Partition-seed key mismatch | 37/38 WA = KEY-MISMATCH | **Design H** handoff decode via `get_predecessor(stop_hint)` on speculative prefetch | **Measured TIE** (`HANDOFF_DECODE_CLEAN_OK=0`; handoff key not in map at decode start) |
 | **H′** | Pred @ `get_predecessor(start)` | — | Decode at `pred_key < start` + trim to partition seed (vendor spacing fix) | **Reverted** (`5755772`): breaks `test_prefetch_next_filesize_accept_fires` on 56 MiB low-entropy fixture (`Stored block len=0`); needs chain-valid pred only |
-| **E′** | Clean tail path split | resumable wrapper on clean finish | **P1** `finish_decode_chunk_bulk_lut` (`GZIPPY_ISAL_PURE_BULK`, default ON) | **Shipped** `5755772`; Fulcrum T8 **TIE** wall 775 vs 477 (1.63×, unchanged); Δwc clean tail +223 ms; fix stream-end **Complete** not Handoff |
+| **E′** | Clean tail path split | resumable wrapper on clean finish | **P1** `finish_decode_chunk_bulk_lut` (`GZIPPY_ISAL_PURE_BULK`, default ON) | **Shipped** `5755772`+`488fbc2`; Fulcrum T8 wall 775→**765** ms (inter-run); Δwc clean tail +223→**+181** ms after stream-end **Complete** fix |
 | **I** | Boundary trial cost | `scan_candidate` **+1373 ms** busy | Tail prefilter + no double-bootstrap (`e899062`); Kraft pre-reject | Partial |
 | **J** | `pool.pick` | **+618 ms** busy | Fewer tasks (**I**, **C**); `pick.wait` vs `pick.lock` trace | Open |
 | **K** | Marker resolve tax | apply+narrow; rg `apply_window` **~238 ms** busy | Fused path ≥16 KiB; **C** moves resolve off consumer | Partial |
