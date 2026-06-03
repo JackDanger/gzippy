@@ -2166,8 +2166,9 @@ fn run_decode_task(
     trace_v2::emit_instant(
         "causal.decode_decision",
         &format!(
-            r#""start_bit":{},"window_exact":{},"predecessor_available":{},"mode":"{mode_str}","stop_hint":{},"speculative":{}"#,
+            r#""start_bit":{},"window_present":{},"window_exact":{},"predecessor_available":{},"mode":"{mode_str}","stop_hint":{},"speculative":{}"#,
             params.start_bit,
+            decode_mode_clean,
             window_exact.is_some(),
             predecessor_available,
             params.stop_hint_bit,
