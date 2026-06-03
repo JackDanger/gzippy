@@ -13,8 +13,9 @@ set -euo pipefail
 # shellcheck disable=SC2128
 NEUROTIC_SSH=(ssh -o ConnectTimeout=15 -J neurotic root@REDACTED_IP)
 BRANCH="${BRANCH:-$(git rev-parse --abbrev-ref HEAD)}"
-PIN="${PIN:-taskset -c 0,2,4,6,8,10,12,14}"
 ROUNDS="${ROUNDS:-7}"
+# Pinned P-cores for T8 (TESTING.md headline cell). Not passed via ssh argv — commas/spaces split.
+PIN_MASK="${PIN_MASK:-0,2,4,6,8,10,12,14}"
 
 if ! git rev-parse "origin/${BRANCH}" >/dev/null 2>&1 \
   || [ -n "$(git log "origin/${BRANCH}"..HEAD 2>/dev/null || true)" ]; then
@@ -23,11 +24,12 @@ if ! git rev-parse "origin/${BRANCH}" >/dev/null 2>&1 \
 fi
 
 echo "=== neurotic SM dataplane bench (branch ${BRANCH}) ==="
-"${NEUROTIC_SSH[@]}" bash -s "${BRANCH}" "${PIN}" "${ROUNDS}" <<'REMOTE'
+"${NEUROTIC_SSH[@]}" bash -s "${BRANCH}" "${ROUNDS}" "${PIN_MASK}" <<'REMOTE'
 set -euo pipefail
 BRANCH="$1"
-PIN="$2"
-ROUNDS="$3"
+ROUNDS="$2"
+PIN_MASK="$3"
+PIN=(taskset -c "$PIN_MASK")
 cd /root/gzippy
 git fetch origin "$BRANCH"
 git checkout "$BRANCH"
@@ -55,27 +57,27 @@ export GZIPPY_FORCE_PARALLEL_SM=1
 export GZIPPY_DEBUG=1
 
 echo "Routing check (must show path=IsalParallelSM):"
-GZIPPY_DEBUG=1 $PIN "$GZ" -d -c -p 8 "$SLG" >/dev/null 2>&1 | grep -E 'path=|IsalParallelSM' || true
+GZIPPY_DEBUG=1 "${PIN[@]}" "$GZ" -d -c -p 8 "$SLG" >/dev/null 2>&1 | grep -E 'path=|IsalParallelSM' || true
 
 bench_wall() {
   local label="$1"
   shift
   local -a extra=("$@")
   echo ""
-  echo "── WALL $label (interleaved best-of-${ROUNDS}, ${PIN}) ──"
+  echo "── WALL $label (interleaved best-of-${ROUNDS}, taskset -c ${PIN_MASK}) ──"
   ref=$(gzip -dc "$SLG" | sha256sum | awk '{print $1}')
   echo "reference sha256: $ref"
   gb=99; rb=99
   for _t in $(seq 1 "$ROUNDS"); do
     s=$(date +%s.%N)
-    GZIPPY_DEBUG=1 "${extra[@]}" $PIN "$GZ" -d -c -p 8 "$SLG" >/dev/null
+    GZIPPY_DEBUG=1 "${extra[@]}" "${PIN[@]}" "$GZ" -d -c -p 8 "$SLG" >/dev/null
     e=$(date +%s.%N); g=$(awk "BEGIN{print $e-$s}")
     s=$(date +%s.%N)
-    $PIN "$RG" -d -c -f -P 8 "$SLG" >/dev/null
+    "${PIN[@]}" "$RG" -d -c -f -P 8 "$SLG" >/dev/null
     e=$(date +%s.%N); r=$(awk "BEGIN{print $e-$s}")
     gb=$(awk -v a="$gb" -v b="$g" 'BEGIN{print (b<a)?b:a}')
     rb=$(awk -v a="$rb" -v b="$r" 'BEGIN{print (b<a)?b:a}')
-    out_sha=$($PIN "${extra[@]}" "$GZ" -d -c -p 8 "$SLG" 2>/dev/null | sha256sum | awk '{print $1}')
+    out_sha=$("${PIN[@]}" "${extra[@]}" "$GZ" -d -c -p 8 "$SLG" 2>/dev/null | sha256sum | awk '{print $1}')
     [ "$out_sha" = "$ref" ] || { echo "SHA MISMATCH $label"; exit 1; }
   done
   out=$(gzip -dc "$SLG" | wc -c)
@@ -91,10 +93,10 @@ echo ""
 echo "── GZIPPY_TIMELINE capture (T8, one run each) ──"
 rm -f /tmp/gz-timeline-T8.json /tmp/rg-timeline-T8.json
 GZIPPY_TIMELINE=/tmp/gz-timeline-T8.json GZIPPY_FORCE_PARALLEL_SM=1 \
-  $PIN "$GZ" -d -c -p 8 "$SLG" >/dev/null 2>/dev/null || true
+  "${PIN[@]}" "$GZ" -d -c -p 8 "$SLG" >/dev/null 2>/dev/null || true
 RG_TRACE=vendor/rapidgzip/librapidarchive/build-trace/src/tools/rapidgzip
 if [ -x "$RG_TRACE" ]; then
-  GZIPPY_TIMELINE=/tmp/rg-timeline-T8.json $PIN "$RG_TRACE" -d -c -f -P 8 "$SLG" >/dev/null 2>/dev/null || true
+  GZIPPY_TIMELINE=/tmp/rg-timeline-T8.json "${PIN[@]}" "$RG_TRACE" -d -c -f -P 8 "$SLG" >/dev/null 2>/dev/null || true
 else
   echo "  (no build-trace rapidgzip — skip rg timeline; run scripts/rapidgzip_trace_patch on guest)"
 fi
