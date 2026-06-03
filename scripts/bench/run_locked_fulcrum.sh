@@ -2,12 +2,15 @@
 # run_locked_fulcrum.sh — laptop driver: host lock + guest traces + fulcrum views.
 #
 #   scripts/bench/run_locked_fulcrum.sh
-#   BRANCH=reimplement-isa-l THREADS=8 scripts/bench/run_locked_fulcrum.sh
+#   BRANCH=reimplement-isa-l THREADS='1 4 8 16' scripts/bench/run_locked_fulcrum.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BRANCH="${BRANCH:-$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)}"
 THREADS="${THREADS:-8}"
+# host_lock passes "$@" to guest; spaces become multiple args (THREADS=1 only).
+# Guest accepts comma-separated THREADS=1,4,8,16 (see guest_fulcrum_capture.sh).
+THREADS="${THREADS// /,}"
 N="${N:-9}"
 ART_LOCAL="${ART_LOCAL:-/tmp/gzippy-locked-fulcrum-$(date +%Y%m%d-%H%M%S)}"
 FULCRUM_BIN="${FULCRUM_BIN:-${HOME}/www/fulcrum/target/release/fulcrum}"
