@@ -1640,8 +1640,9 @@ fn consumer_loop<W: std::io::Write>(
             let _tv2 = trace_v2::SpanGuard::begin("consumer.dispatch_post_process");
             let (chunk, eager_already_done) =
                 chunk_holder.into_chunk_data(&mut prefetch_post_inflight, consumer_pred_key);
+            let pool_resolved = chunk.markers_resolved;
             match predecessor_window_for_postprocess {
-                Some(window) if eager_already_done => {
+                Some(window) if eager_already_done || pool_resolved => {
                     pending.push_back(PendingWrite::Ready {
                         idx: partition_idx_for_trace,
                         chunk,
@@ -2119,9 +2120,18 @@ fn run_decode_task(
     };
     let window_handoff: Option<(usize, Window)> =
         if params.is_speculative_prefetch && params.start_bit > 0 {
-            match window_map.get_predecessor(params.stop_hint_bit) {
-                Some((k, w)) if k > params.start_bit && window_map.contains(k) => Some((k, w)),
-                _ => None,
+            if let Some((k, w)) = window_map.get_predecessor(params.stop_hint_bit) {
+                if k > params.start_bit && window_map.contains(k) {
+                    Some((k, w))
+                } else if let Some(w) = window_map.get(params.start_bit) {
+                    Some((params.start_bit, w))
+                } else {
+                    None
+                }
+            } else if let Some(w) = window_map.get(params.start_bit) {
+                Some((params.start_bit, w))
+            } else {
+                None
             }
         } else {
             None
@@ -2185,10 +2195,7 @@ fn run_decode_task(
             bytes.as_ref(),
             configuration,
         ) {
-            Ok(mut chunk)
-                if chunk.encoded_offset_bits == *handoff_key
-                    && chunk.max_acceptable_start_bit == *handoff_key =>
-            {
+            Ok(mut chunk) if chunk.encoded_offset_bits == *handoff_key => {
                 chunk.decode_origin_bit = *handoff_key;
                 if partition_seed < *handoff_key {
                     let encoded_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
@@ -2441,6 +2448,7 @@ fn resolve_chunk_markers_on_chunk(chunk: &mut ChunkData, predecessor_window: &[u
     chunk.populate_subchunk_windows(predecessor_window);
     chunk.update_narrowed_crc();
     chunk.recycle_markers_after_resolution();
+    chunk.markers_resolved = true;
 }
 
 /// Predecessor window for marker `apply_window` — vendor `WindowMap::get(*nextBlockOffset)`
@@ -2522,9 +2530,8 @@ fn queue_prefetched_marker_postprocess(
         if skip_real_offsets.contains(&real_offset) {
             continue;
         }
-        let resolve_offset = arc.max_acceptable_start_bit;
         if let Some(key) = handoff_key {
-            if resolve_offset != key {
+            if arc.max_acceptable_start_bit != key && arc.decode_origin_bit != key {
                 continue;
             }
         }
@@ -2537,15 +2544,16 @@ fn queue_prefetched_marker_postprocess(
         if arc.data_with_markers.is_empty() {
             continue;
         }
+        let resolve_anchor = handoff_key.unwrap_or(arc.max_acceptable_start_bit);
         let Some((pred_key, predecessor_window)) =
-            confirmed_predecessor_window(window_map, resolve_offset)
+            confirmed_predecessor_window(window_map, resolve_anchor)
         else {
             continue;
         };
         let rx = submit_post_process_from_prefetch(
             thread_pool,
             Arc::clone(&arc),
-            resolve_offset,
+            resolve_anchor,
             predecessor_window,
         );
         in_flight.insert(real_offset, (pred_key, rx));
