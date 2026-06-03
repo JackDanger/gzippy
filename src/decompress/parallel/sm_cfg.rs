@@ -1,4 +1,15 @@
-//! Compile-time gates for the parallel single-member production path.
+//! Compile-time gates and production defaults for parallel single-member.
+//!
+//! **Memory model (rapidgzip `DecodedData` shape):** segmented
+//! `data_with_markers` (u16) + segmented `data` (u8), in-place
+//! `narrow_markers_in_place` (no separate `narrowed` buffer), A3 window
+//! prefill in segment 0, consumer **writev** over segment iovecs.
+//!
+//! **Processing model:** prefetch pool decode → early tail publish →
+//! worker resolve-ahead when `max_acceptable_start_bit` is confirmed in
+//! `WindowMap` (vendor `queuePrefetchedChunkPostProcessing`) → in-order
+//! consumer drain. `RESOLVE_AHEAD_DEFAULT` is ON; `GZIPPY_RESOLVE_AHEAD=0`
+//! disables.
 
 /// True when the parallel-SM inner decode is pure Rust (no ISA-L C in the wrapper).
 #[allow(dead_code)]
@@ -12,6 +23,11 @@ pub const PURE_RUST_INFLATE_DECODE: bool = cfg!(pure_inflate_decode);
 /// (ISA-L's C library is x86-only); see `inflate_wrapper::IsalInflateWrapper`'s
 /// `#[cfg(pure_inflate_decode)]` backend.
 pub const PARALLEL_SM: bool = cfg!(parallel_sm);
+
+/// Worker-side marker resolve when the handoff predecessor window is
+/// confirmed (`WindowMap::contains(max_acceptable_start_bit)`).
+#[allow(dead_code)] // read from `chunk_fetcher` under `cfg(parallel_sm)` only
+pub const RESOLVE_AHEAD_DEFAULT: bool = true;
 
 /// Post-bootstrap + bootstrap DYNAMIC table build use patched ISA-L C code.
 #[allow(dead_code)]

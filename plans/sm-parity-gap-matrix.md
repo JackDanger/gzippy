@@ -39,7 +39,7 @@
 
 **Vendor:** `queuePrefetchedChunkPostProcessing` — when predecessor window is confirmed, `applyWindow` runs on the **thread pool**, not the consumer stall.
 
-**gzippy (2026-06-03):** `GZIPPY_RESOLVE_AHEAD=1` — resolve on prefetch when handoff key is published:
+**gzippy (2026-06-03+):** resolve-ahead **default ON** (`RESOLVE_AHEAD_DEFAULT`); handoff chunks (`max == decode_origin`) eligible — was gated on `max == encoded` (inert). Resolve on prefetch when handoff key is published:
 
 - Trigger: `resolve_ahead_prefetch_at_handoff` after confirmed `insert_owned_none` / promote (not at decode return).
 - Gate: `max == encoded` (exact chunk only), `max == handoff_key`, `contains(handoff_key)`, markers present.

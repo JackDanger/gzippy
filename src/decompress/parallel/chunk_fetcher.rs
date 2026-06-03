@@ -2412,6 +2412,15 @@ fn run_decode_task(
                 EARLY_SPEC_PUBLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             EARLY_WINDOW_RANGE_SPECULATIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if chunk_may_resolve_markers_early(chunk)
+                && window_map.contains(chunk.max_acceptable_start_bit)
+            {
+                resolve_ahead_prefetch_at_handoff(
+                    block_fetcher,
+                    window_map,
+                    chunk.max_acceptable_start_bit,
+                );
+            }
         }
     }
 
@@ -2490,9 +2499,9 @@ fn resolve_chunk_markers_on_chunk(chunk: &mut ChunkData, predecessor_window: &[u
     chunk.recycle_markers_after_resolution();
 }
 
-/// True iff `GZIPPY_RESOLVE_AHEAD=1` (default OFF). Worker-side port of vendor
-/// `queuePrefetchedChunkPostProcessing` — resolve markers when the predecessor
-/// window is already confirmed at the chunk's handoff key.
+/// True unless `GZIPPY_RESOLVE_AHEAD=0`. Default follows
+/// [`crate::decompress::parallel::sm_cfg::RESOLVE_AHEAD_DEFAULT`] (ON).
+/// Worker-side port of vendor `queuePrefetchedChunkPostProcessing`.
 #[cfg(parallel_sm)]
 fn resolve_ahead_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -2501,13 +2510,25 @@ fn resolve_ahead_enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = std::env::var_os("GZIPPY_RESOLVE_AHEAD")
-                .map(|v| v == "1")
-                .unwrap_or(false);
+            let on = match std::env::var_os("GZIPPY_RESOLVE_AHEAD") {
+                Some(v) => v != "0" && v != "false",
+                None => crate::decompress::parallel::sm_cfg::RESOLVE_AHEAD_DEFAULT,
+            };
             CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }
     }
+}
+
+/// Marker chunks safe for worker resolve-ahead: decode anchored at
+/// `decode_origin_bit == max_acceptable_start_bit` (exact chunk or
+/// handoff/partition-trim). Range-speculative chunks with
+/// `max > decode_origin` stay consumer-serial.
+#[cfg(parallel_sm)]
+fn chunk_may_resolve_markers_early(chunk: &ChunkData) -> bool {
+    !chunk.data_with_markers.is_empty()
+        && !chunk.markers_resolved
+        && chunk.max_acceptable_start_bit == chunk.decode_origin_bit
 }
 
 /// Worker-side resolve-ahead (Design D): when decode finishes with markers and
@@ -2517,13 +2538,7 @@ fn resolve_ahead_enabled() -> bool {
 #[cfg(parallel_sm)]
 fn try_worker_resolve_ahead(chunk: &mut ChunkData, window_map: &WindowMap) -> bool {
     use std::sync::atomic::Ordering;
-    if chunk.data_with_markers.is_empty() {
-        return false;
-    }
-    // Only exact confirmed chunks (consumer accept guard). Range-speculative
-    // prefetches still have `encoded_offset_bits` at the partition seed;
-    // resolving before accept corrupts marker positions → CRC mismatch.
-    if chunk.max_acceptable_start_bit != chunk.encoded_offset_bits {
+    if !chunk_may_resolve_markers_early(chunk) {
         return false;
     }
     let resolve_offset = chunk.max_acceptable_start_bit;
@@ -2587,10 +2602,7 @@ fn resolve_ahead_prefetch_at_handoff(
         if arc.max_acceptable_start_bit != handoff_key {
             continue;
         }
-        if arc.markers_resolved
-            || arc.data_with_markers.is_empty()
-            || arc.max_acceptable_start_bit != arc.encoded_offset_bits
-        {
+        if !chunk_may_resolve_markers_early(arc.as_ref()) {
             continue;
         }
         let mut chunk = (*arc).clone();
@@ -3410,6 +3422,23 @@ mod tests {
             flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
         enc.write_all(payload).unwrap();
         enc.finish().unwrap()
+    }
+
+    #[test]
+    fn chunk_may_resolve_markers_early_handoff_shape() {
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 4 * 1024 * 1024,
+            max_decoded_chunk_size: 64 * 1024 * 1024,
+            crc32_enabled: false,
+        };
+        let mut chunk = ChunkData::new(1_000, cfg);
+        chunk.decode_origin_bit = 5_000_000;
+        chunk.max_acceptable_start_bit = 5_000_000;
+        chunk.encoded_offset_bits = 4_000_000;
+        chunk.data_with_markers.push_slice(&[0u16, 1, 2]);
+        assert!(super::chunk_may_resolve_markers_early(&chunk));
+        chunk.max_acceptable_start_bit = 6_000_000;
+        assert!(!super::chunk_may_resolve_markers_early(&chunk));
     }
 
     #[test]
