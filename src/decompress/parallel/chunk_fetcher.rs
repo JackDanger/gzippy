@@ -1381,17 +1381,10 @@ fn consumer_loop<W: std::io::Write>(
         // it). Used to reuse an eager-submitted post-process below.
         let chunk_offset_pre_set = chunk.encoded_offset_bits;
 
-        // Vendor GzipChunkFetcher.hpp:349 —
-        //   `chunkData->setEncodedOffset(*nextBlockOffset);`
-        // When we resumed from furthest_decoded_bit because the spacing
-        // guess overshot, use the actual decode start — not the stale guess.
-        let effective_start = decode_start;
-        if chunk.encoded_offset_bits != effective_start {
-            chunk.set_encoded_offset(effective_start);
-            // Any resolve done while `encoded_offset` was still the partition
-            // seed is invalid after re-anchor (prefetch cache or stale flag).
-            chunk.markers_resolved = false;
-        }
+        // Vendor GzipChunkFetcher.hpp:334-349 — `get(*nextBlockOffset)` then
+        // `postProcessChunk`, then `setEncodedOffset(*nextBlockOffset)`.
+        // Re-anchor happens in `drain_one_pending` after post-process returns.
+        let handoff_bit = decode_start;
 
         // Vendor GzipChunkFetcher.hpp:350-355 — EOF mid-decode
         // (`encodedSizeInBits == 0`).
@@ -1429,8 +1422,7 @@ fn consumer_loop<W: std::io::Write>(
                 "consumer.window_publish_clean",
                 &format!(r#""end_bit":{chunk_end_bit},"had_markers":false"#),
             );
-            if let Some((_pred_key, pred)) =
-                predecessor_window_for_markers(window_map, chunk.encoded_offset_bits)
+            if let Some((_pred_key, pred)) = predecessor_window_for_markers(window_map, handoff_bit)
             {
                 let bytes = materialize_window(&pred);
                 let tail = chunk
@@ -1485,7 +1477,7 @@ fn consumer_loop<W: std::io::Write>(
             // chunk.encoded_offset_bits.
             {
                 let _tv2 = trace_v2::SpanGuard::begin("consumer.wait_replaced_markers");
-                while !window_map.has_predecessor(chunk.encoded_offset_bits) {
+                while !window_map.contains(handoff_bit) {
                     if pending.is_empty() {
                         break;
                     }
@@ -1516,13 +1508,12 @@ fn consumer_loop<W: std::io::Write>(
                 "consumer.window_publish_marker",
                 &format!(r#""end_bit":{chunk_end_bit},"had_markers":true"#),
             );
-            let (pred_key, window) =
-                predecessor_window_for_markers(window_map, chunk.encoded_offset_bits).ok_or(
-                    FetchError::Decode(ChunkDecodeError::ExactStopMissed {
-                        requested: chunk.encoded_offset_bits,
-                        actual: furthest_decoded_bit,
-                    }),
-                )?;
+            let (pred_key, window) = confirmed_predecessor_window(window_map, handoff_bit)
+                .or_else(|| predecessor_window_for_markers(window_map, handoff_bit))
+                .ok_or(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+                    requested: handoff_bit,
+                    actual: furthest_decoded_bit,
+                }))?;
             consumer_pred_key = Some(pred_key);
             // Vendor `GzipChunkFetcher.hpp:341`: `sharedLastWindow->
             // decompress()` materializes the bytes once. For
@@ -1597,7 +1588,7 @@ fn consumer_loop<W: std::io::Write>(
             // offset, so a chunk that came off the prefetch queue at a
             // speculative partition seed has its parent keyed under
             // partitionOffset, not its actual chunkOffset.
-            let chunk_offset = chunk.encoded_offset_bits;
+            let chunk_offset = handoff_bit;
             let partition_offset = block_finder.partition_offset_containing_offset(chunk_offset);
             let lookup_key =
                 if !block_fetcher.test(&chunk_offset) && block_fetcher.test(&partition_offset) {
@@ -1673,6 +1664,7 @@ fn consumer_loop<W: std::io::Write>(
                         idx: partition_idx_for_trace,
                         rx,
                         cache_key: next_block_offset,
+                        handoff_bit,
                     });
                 }
                 None => {
@@ -1680,6 +1672,7 @@ fn consumer_loop<W: std::io::Write>(
                         idx: partition_idx_for_trace,
                         chunk,
                         cache_key: next_block_offset,
+                        handoff_bit,
                     });
                 }
             }
@@ -3082,11 +3075,14 @@ enum PendingWrite {
         idx: usize,
         chunk: ChunkData,
         cache_key: usize,
+        /// Vendor `setEncodedOffset(*nextBlockOffset)` after post-process.
+        handoff_bit: usize,
     },
     Async {
         idx: usize,
         rx: mpsc::Receiver<ChunkData>,
         cache_key: usize,
+        handoff_bit: usize,
     },
 }
 
@@ -3134,13 +3130,19 @@ fn drain_one_pending<W: std::io::Write>(
     }
     let t_chunk = std::time::Instant::now();
     let t_recv = std::time::Instant::now();
-    let (idx, mut chunk, cache_key) = match head {
+    let (idx, mut chunk, cache_key, handoff_bit) = match head {
         PendingWrite::Ready {
             idx,
             chunk,
             cache_key,
-        } => (idx, chunk, cache_key),
-        PendingWrite::Async { idx, rx, cache_key } => {
+            handoff_bit,
+        } => (idx, chunk, cache_key, handoff_bit),
+        PendingWrite::Async {
+            idx,
+            rx,
+            cache_key,
+            handoff_bit,
+        } => {
             let _tv2_wait = trace_v2::SpanGuard::begin_with(
                 "wait.future_recv",
                 &format!(r#""chunk_id":{idx}"#),
@@ -3151,10 +3153,16 @@ fn drain_one_pending<W: std::io::Write>(
                     actual: 0,
                 })
             })?;
-            (idx, chunk, cache_key)
+            (idx, chunk, cache_key, handoff_bit)
         }
     };
     let recv_us = t_recv.elapsed().as_micros();
+
+    // Vendor GzipChunkFetcher.hpp:349 — after post-process, before indexes.
+    if chunk.encoded_offset_bits != handoff_bit && chunk.matches_encoded_offset(handoff_bit) {
+        chunk.set_encoded_offset(handoff_bit);
+        chunk.markers_resolved = false;
+    }
 
     // Vendor `appendSubchunksToIndexes` window emplace — orchestrator only.
     let t_pub = std::time::Instant::now();
