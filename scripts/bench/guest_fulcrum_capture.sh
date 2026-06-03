@@ -2,7 +2,7 @@
 # guest_fulcrum_capture.sh — frozen-host wall + Chrome-trace artifacts for fulcrum.
 #
 # RUNS ON GUEST 199 after host_lock_and_bench.sh gate PASS.
-# Args: BRANCH=reimplement-isa-l  THREADS=8  N=9
+# Args: BRANCH=reimplement-isa-l  THREADS=1,4,8,16  N=9  (comma-separated; not spaces)
 set -u
 
 REPO="${REPO:-/root/gzippy}"
