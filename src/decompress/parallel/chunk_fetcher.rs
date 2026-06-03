@@ -1409,6 +1409,14 @@ fn consumer_loop<W: std::io::Write>(
                     .last_32kib_window_vec()
                     .unwrap_or_else(|| chunk.get_last_window_vec(&bytes));
                 window_map.insert_owned_none(chunk_end_bit, tail);
+                trace_v2::emit_instant(
+                    "causal.window_publish",
+                    &format!(
+                        r#""start_bit":{},"end_bit":{chunk_end_bit},"site":"consumer_clean""#,
+                        chunk.encoded_offset_bits
+                    ),
+                    "t",
+                );
             }
             predecessor_window_for_postprocess = None;
         } else {
@@ -1490,6 +1498,14 @@ fn consumer_loop<W: std::io::Write>(
             let window_bytes = materialize_window(&window);
             let tail = chunk.get_last_window_vec(&window_bytes);
             window_map.insert_owned_none(chunk_end_bit, tail);
+            trace_v2::emit_instant(
+                "causal.window_publish",
+                &format!(
+                    r#""start_bit":{},"end_bit":{chunk_end_bit},"site":"consumer_marker""#,
+                    chunk.encoded_offset_bits
+                ),
+                "t",
+            );
             predecessor_window_for_postprocess = Some(window);
         }
 
@@ -2122,16 +2138,24 @@ fn run_decode_task(
     // it to this chunk's `worker.decode_chunk` span and splits d_c / d_w
     // honestly.
     let decode_mode_clean = params.start_bit == 0 || window.is_some();
+    let mode_str = if decode_mode_clean {
+        "clean"
+    } else {
+        "window_absent"
+    };
     trace_v2::emit_instant(
         "worker.decode_mode",
+        &format!(r#""start_bit":{},"mode":"{mode_str}""#, params.start_bit),
+        "t",
+    );
+    trace_v2::emit_instant(
+        "causal.decode_decision",
         &format!(
-            r#""start_bit":{},"mode":"{}""#,
+            r#""start_bit":{},"window_present":{},"mode":"{mode_str}","stop_hint":{},"speculative":{}"#,
             params.start_bit,
-            if decode_mode_clean {
-                "clean"
-            } else {
-                "window_absent"
-            }
+            decode_mode_clean,
+            params.stop_hint_bit,
+            params.is_speculative_prefetch
         ),
         "t",
     );
@@ -2236,6 +2260,14 @@ fn run_decode_task(
             if let Some(tail) = chunk.last_32kib_window_vec() {
                 let chunk_end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
                 window_map.insert_owned_none(chunk_end_bit, tail);
+                trace_v2::emit_instant(
+                    "causal.window_publish",
+                    &format!(
+                        r#""start_bit":{},"end_bit":{chunk_end_bit},"site":"worker_early""#,
+                        chunk.encoded_offset_bits
+                    ),
+                    "t",
+                );
                 EARLY_WINDOW_PUBLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             } else {
                 EARLY_WINDOW_TAIL_NOT_CLEAN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2400,6 +2432,15 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
         let _tv2 = trace_v2::SpanGuard::begin("post_process.crc_narrowed");
         chunk.update_narrowed_crc();
     }
+    let resolve_us = apply_us as f64 + narrow_us as f64;
+    let fused = dwm_len_pre >= 16 * 1024;
+    trace_v2::emit_instant(
+        "causal.tax",
+        &format!(
+            r#""start_bit":{start_bit},"marker_bytes":{marker_bytes},"resolve_us":{resolve_us},"narrow_us":{narrow_us},"materialize_us":{materialize_us},"populate_us":{populate_us},"fused":{fused}"#,
+        ),
+        "t",
+    );
     if trace::is_enabled() {
         trace::emit(
             "post_process",

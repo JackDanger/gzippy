@@ -875,13 +875,7 @@ fn decode_chunk_unified(
 ) -> Result<ChunkData, ChunkDecodeError> {
     use crate::decompress::parallel::deflate_block::MAX_WINDOW_SIZE;
 
-    let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
-        "worker.decode_chunk",
-        &format!(
-            r#""start_bit":{encoded_offset_bits},"stop_hint":{stop_hint_bits},"has_window":{}"#,
-            initial_window.len() == MAX_WINDOW_SIZE
-        ),
-    );
+    // Envelope span: `chunk_fetcher::run_decode_task` (`worker.decode_chunk`).
     let t_decode = std::time::Instant::now();
 
     let start_clean_only = initial_window.len() == MAX_WINDOW_SIZE
@@ -916,6 +910,7 @@ fn decode_chunk_unified(
 
     let mut marker_us: u128 = 0;
     let mut inflate_us: u128 = 0;
+    let mut marker_span: Option<crate::decompress::parallel::trace_v2::SpanGuard> = None;
 
     'decode: loop {
         if inflate_phase {
@@ -932,6 +927,14 @@ fn decode_chunk_unified(
             break 'decode;
         }
 
+        if marker_span.is_none() {
+            marker_span = Some(
+                crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
+                    "worker.bootstrap",
+                    &format!(r#""start_bit":{encoded_offset_bits},"stop_hint":{stop_hint_bits}"#,),
+                ),
+            );
+        }
         let ctx = marker_ctx.as_mut().expect("marker ctx");
         let t_marker = std::time::Instant::now();
         let step = marker_decode_step(ctx, input, stop_hint_bits, &mut chunk.data_with_markers)?;
@@ -943,16 +946,33 @@ fn decode_chunk_unified(
                 end_bit_offset,
                 clean_window,
             } => {
+                let markers_len = chunk.data_with_markers.len();
+                crate::decompress::parallel::trace_v2::emit_instant(
+                    "worker.bootstrap.outcome",
+                    &format!(
+                        r#""result":"ok","markers_len":{markers_len},"end_bit":{end_bit_offset},"clean_window":true,"bfinal":false,"handoff_reason":"clean_window_armed","bytes_decoded":{markers_len}"#,
+                    ),
+                    "t",
+                );
+                crate::decompress::parallel::trace_v2::emit_instant(
+                    "causal.decode_handoff",
+                    &format!(
+                        r#""start_bit":{encoded_offset_bits},"end_bit":{end_bit_offset},"marker_bytes":{markers_len},"inflate_start_bit":{end_bit_offset}"#,
+                    ),
+                    "t",
+                );
                 inflate_start_bit = end_bit_offset;
                 inflate_window = clean_window;
                 inflate_phase = true;
                 marker_ctx = None;
+                marker_span.take();
                 continue 'decode;
             }
             MarkerStep::Finished {
                 end_bit_offset,
                 bfinal_hit,
             } => {
+                marker_span.take();
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
                 if trace::is_enabled() {
                     let phase = if bfinal_hit {

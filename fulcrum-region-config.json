@@ -7,11 +7,11 @@
     },
     {
       "name": "marker_bootstrap",
-      "functions": ["worker.bootstrap"]
+      "functions": ["worker.block_header", "worker.block_body"]
     },
     {
       "name": "clean_isal_tail",
-      "functions": ["isal_stream_inflate", "block_body", "block_header"]
+      "functions": ["worker.isal_stream_inflate"]
     },
     {
       "name": "copies",
