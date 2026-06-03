@@ -1462,6 +1462,8 @@ mod dictionary_tests {
         // Detailed symbol verification would require encoding test data
     }
 
+    // Experimental path; not part of pure-rust parallel-SM production decode.
+    #[cfg(not(feature = "pure-rust-inflate"))]
     #[test]
     fn test_inflate_matches_flate2() {
         // Compress some data with flate2, decompress with our code
@@ -1482,7 +1484,8 @@ mod dictionary_tests {
     }
 }
 
-#[cfg(test)]
+// Experimental path; not part of pure-rust parallel-SM production decode.
+#[cfg(all(test, not(feature = "pure-rust-inflate")))]
 mod content_verification {
     use super::*;
     use crate::assert_slices_eq;
