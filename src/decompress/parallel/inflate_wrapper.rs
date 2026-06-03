@@ -859,6 +859,58 @@ mod tests {
         enc.finish().unwrap()
     }
 
+    /// Sync-flush every 32 KiB — yields non-byte-aligned END_OF_BLOCK
+    /// handoffs for cross-chunk resume tests (gzip_chunk.rs helper).
+    fn make_sync_multi_block_deflate(payload: &[u8]) -> Vec<u8> {
+        use flate2::{Compress, Compression, FlushCompress, Status};
+        let mut compress = Compress::new(Compression::new(6), false);
+        let mut out = Vec::new();
+        let mut scratch = vec![0u8; 64 * 1024];
+        for piece in payload.chunks(32 * 1024) {
+            let mut block_data = piece;
+            loop {
+                let before_in = compress.total_in();
+                let before_out = compress.total_out();
+                let status = compress
+                    .compress(block_data, &mut scratch, FlushCompress::None)
+                    .unwrap();
+                let consumed = (compress.total_in() - before_in) as usize;
+                let produced = (compress.total_out() - before_out) as usize;
+                out.extend_from_slice(&scratch[..produced]);
+                block_data = &block_data[consumed..];
+                if block_data.is_empty() {
+                    break;
+                }
+                if matches!(status, Status::BufError) && produced == 0 {
+                    break;
+                }
+            }
+            loop {
+                let before_out = compress.total_out();
+                let status = compress
+                    .compress(&[], &mut scratch, FlushCompress::Sync)
+                    .unwrap();
+                let produced = (compress.total_out() - before_out) as usize;
+                out.extend_from_slice(&scratch[..produced]);
+                if produced == 0 || matches!(status, Status::StreamEnd) {
+                    break;
+                }
+            }
+        }
+        loop {
+            let before_out = compress.total_out();
+            let status = compress
+                .compress(&[], &mut scratch, FlushCompress::Finish)
+                .unwrap();
+            let produced = (compress.total_out() - before_out) as usize;
+            out.extend_from_slice(&scratch[..produced]);
+            if matches!(status, Status::StreamEnd) || produced == 0 {
+                break;
+            }
+        }
+        out
+    }
+
     fn make_multi_block_deflate(payload: &[u8]) -> Vec<u8> {
         // Compression::new(0) emits raw STORED blocks split at the 65535-
         // byte deflate stored-block limit (RFC 1951 §3.2.4). For payloads
@@ -1181,8 +1233,10 @@ mod tests {
     /// last 32 KiB as dict, resume with `with_until_bits` + `set_window`.
     #[test]
     fn with_until_bits_resume_non_byte_aligned_with_dict() {
-        let payload = vec![b'x'; 400_000];
-        let deflate = make_deflate(&payload);
+        let payload: Vec<u8> = (0u32..400_000)
+            .map(|i| (i.wrapping_mul(31) as u8).wrapping_add(7))
+            .collect();
+        let deflate = make_sync_multi_block_deflate(&payload);
 
         let mut block_ends: Vec<usize> = Vec::new();
         {
@@ -1210,21 +1264,28 @@ mod tests {
             .iter()
             .copied()
             .find(|p| *p % 8 != 0)
-            .unwrap_or_else(|| block_ends[block_ends.len() / 2]);
+            .expect("fixture must yield a non-byte-aligned END_OF_BLOCK handoff");
 
-        let mut first = IsalInflateWrapper::with_until_bits(&deflate, 0, resume_at).expect("init");
-        first.set_window(&[]).expect("set_window");
         let mut out1 = vec![0u8; payload.len()];
         let mut n1 = 0usize;
-        loop {
-            let r = first.read_stream(&mut out1[n1..]).expect("read");
-            n1 += r.bytes_written;
-            if r.bytes_written == 0 {
-                break;
+        {
+            let mut first =
+                IsalInflateWrapper::with_until_bits(&deflate, 0, resume_at).expect("init");
+            first.set_window(&[]).expect("set_window");
+            first.set_stopping_points(StoppingPoints::END_OF_BLOCK);
+            loop {
+                let r = first.read_stream(&mut out1[n1..]).expect("read");
+                n1 += r.bytes_written;
+                if r.stopped_at == StoppingPoints::END_OF_BLOCK {
+                    assert_eq!(r.bit_position, resume_at);
+                    break;
+                }
+                if r.finished || r.bytes_written == 0 {
+                    break;
+                }
             }
         }
         out1.truncate(n1);
-        assert_eq!(first.tell_compressed(), resume_at);
 
         let window_start = n1.saturating_sub(32768);
         let window = &out1[window_start..n1];

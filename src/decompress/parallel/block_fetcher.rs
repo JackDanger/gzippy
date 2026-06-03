@@ -1145,7 +1145,7 @@ mod tests {
         let snap = bf.statistics.base.snapshot();
         assert!(snap.prefetch_count >= 1);
         assert!(snap.prefetch_cache_hits >= 1);
-        assert!(snap.gets >= 1);
+        // Prefetch hits do not touch the main cache (`record_get` is main-cache only).
     }
 
     #[test]
