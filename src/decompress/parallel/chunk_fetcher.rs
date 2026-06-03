@@ -1989,6 +1989,31 @@ fn submit_post_process_task(
     future.into_receiver()
 }
 
+/// Predecessor window for speculative partition seeds: prefer the
+/// confirmed tail at `stop_hint` (vendor handoff), then exact `start`,
+/// then any published predecessor at or before `start`.
+#[cfg(parallel_sm)]
+fn speculative_handoff_window(
+    window_map: &WindowMap,
+    start_bit: usize,
+    stop_hint_bit: usize,
+) -> Option<(usize, Window)> {
+    if let Some((k, w)) = window_map.get_predecessor(stop_hint_bit) {
+        if k > start_bit && window_map.contains(k) {
+            return Some((k, w));
+        }
+    }
+    if let Some(w) = window_map.get(start_bit) {
+        return Some((start_bit, w));
+    }
+    if let Some((k, w)) = window_map.get_predecessor(start_bit) {
+        if window_map.contains(k) {
+            return Some((k, w));
+        }
+    }
+    None
+}
+
 /// Pool-side execution of a decode task (vendor `decodeBlock`,
 /// GzipChunkFetcher.hpp:692-729). Routes to `decode_chunk`
 /// when the predecessor window is published, else
@@ -2117,15 +2142,9 @@ fn run_decode_task(
             .get_predecessor(params.start_bit)
             .map(|(_k, w)| w)
     };
-    // Design H: predecessor tail is keyed at the prior chunk's end (handoff),
-    // which is `get_predecessor(stop_hint)` for a partition prefetch, not
-    // `get(start_bit)` / `get_predecessor(start_bit)` at the spacing seed.
     let window_handoff: Option<(usize, Window)> =
         if params.is_speculative_prefetch && params.start_bit > 0 {
-            match window_map.get_predecessor(params.stop_hint_bit) {
-                Some((k, w)) if k > params.start_bit && window_map.contains(k) => Some((k, w)),
-                _ => None,
-            }
+            speculative_handoff_window(window_map, params.start_bit, params.stop_hint_bit)
         } else {
             None
         };
@@ -2180,6 +2199,9 @@ fn run_decode_task(
         )
     } else if let Some((handoff_key, w)) = window_handoff.as_ref() {
         let bytes = materialize_window(w);
+        if !window_map.contains(*handoff_key) {
+            window_map.insert_bytes(*handoff_key, &bytes);
+        }
         let partition_seed = params.start_bit;
         match decode_chunk(
             input_bytes,

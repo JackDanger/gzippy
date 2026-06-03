@@ -198,8 +198,11 @@ pub fn decode_block(
     }
 
     // ── Block body: decode symbols via the ISA-L LUT ────────────────────
+    const REFILL_THRESHOLD: u32 = 48;
     loop {
-        bits.refill();
+        if bits.available() < REFILL_THRESHOLD {
+            bits.refill();
+        }
         let decoded = scratch.litlen.decode(bits);
         if decoded.bit_count == 0 {
             return Err(BulkDecodeError::InvalidHuffmanCode);
