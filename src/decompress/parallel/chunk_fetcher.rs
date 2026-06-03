@@ -950,11 +950,6 @@ fn consumer_loop<W: std::io::Write>(
     // Vendor `m_markersBeingReplaced` + resolve-ahead: pool post-process
     // for prefetched successors, keyed by partition `encoded_offset_bits`.
     let mut prefetch_post_inflight: EagerSubmitted = std::collections::HashMap::new();
-    /// Partition keys removed from the prefetch cache for resolve-ahead
-    /// post-process. The consumer must wait on `prefetch_post_inflight`,
-    /// not re-fetch via `get_with_prefetch`.
-    let mut postproc_stolen_partitions: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
     // Optional duplicate probe (GZIPPY_EAGER_POSTPROC=1) — full-cache scan
     // on every stall; production uses handoff-triggered resolve-ahead only.
     let eager_probe_enabled = eager_postproc_enabled();
@@ -1155,25 +1150,10 @@ fn consumer_loop<W: std::io::Write>(
         // real offset, dispatching an on-demand task (matching vendor's
         // `BaseType::get(blockOffset, blockIndex, ...)` at
         // GzipChunkFetcher.hpp:654).
-        let partition_offset = partition_offset_for(&next_block_offset);
-        let mut chunk_from_stolen_postproc: Option<ChunkData> = None;
-        if postproc_stolen_partitions.remove(&partition_offset) {
-            let inflight_keys = [partition_offset, decode_start, next_block_offset];
-            if let Some((_, rx)) =
-                take_postproc_inflight(&mut prefetch_post_inflight, &inflight_keys)
-            {
-                let chunk = rx.recv().map_err(|_| {
-                    FetchError::Decode(ChunkDecodeError::ExactStopMissed {
-                        requested: partition_offset,
-                        actual: 0,
-                    })
-                })?;
-                chunk_from_stolen_postproc = Some(chunk);
-            }
-        }
         let _tv2_specf = trace_v2::SpanGuard::begin("consumer.try_take_prefetched");
+        let partition_offset = partition_offset_for(&next_block_offset);
         let mut chunk_arc_from_partition: Option<Arc<ChunkData>> = None;
-        if chunk_from_stolen_postproc.is_none() && partition_offset != next_block_offset {
+        if partition_offset != next_block_offset {
             // Lever H: while blocking on the in-flight prefetch's
             // `rx.recv`, pump `prefetch_new_blocks` every 1ms so the
             // prefetch horizon advances during the wait. Mirror of
@@ -1270,7 +1250,6 @@ fn consumer_loop<W: std::io::Write>(
                             window_map,
                             thread_pool,
                             &mut prefetch_post_inflight,
-                            &mut postproc_stolen_partitions,
                             Some(spec_key),
                         );
                     }
@@ -1325,59 +1304,58 @@ fn consumer_loop<W: std::io::Write>(
         }
 
         drop(_tv2_specf);
-        let mut chunk_postproc_done = chunk_from_stolen_postproc.is_some();
-        let mut chunk: ChunkData = if let Some(c) = chunk_from_stolen_postproc {
-            c
-        } else {
-            let chunk_arc = match chunk_arc_from_partition {
-                Some(arc) => arc,
-                None => {
-                    // The head chunk is NOT in the prefetch cache → the
-                    // consumer is about to BLOCK on its decode (the
-                    // `wait.block_fetcher_get` span, the other real serial wait
-                    // besides `wait.future_recv`). Vendor's
-                    // `queuePrefetchedChunkPostProcessing` overlaps post-process
-                    // of ready successors with exactly this kind of stall —
-                    // submit it NOW so it runs on the pool while we block.
-                    queue_prefetched_marker_postprocess(
-                        block_fetcher,
-                        window_map,
-                        thread_pool,
-                        &mut prefetch_post_inflight,
-                        &mut postproc_stolen_partitions,
-                        None,
-                    );
-                    let t_fg = std::time::Instant::now();
-                    let _tv2 = trace_v2::SpanGuard::begin_with(
-                        "wait.block_fetcher_get",
-                        &format!(
-                            r#""chunk_id":{},"offset":{}"#,
-                            partition_idx_for_trace, next_block_offset
-                        ),
-                    );
-                    let (chunk_arc_result, _prefetched) = block_fetcher.get_with_prefetch(
-                        next_block_offset,
-                        |_key: usize| -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
-                            submit_decode_to_pool(
-                                thread_pool,
-                                input,
-                                params,
-                                window_map,
-                                block_fetcher,
-                                configuration,
-                            )
-                        },
-                        lookup_block_offset,
-                        lookup_next_block_offset,
-                        prefetch_submit,
-                        is_finalized_too_high,
-                        partition_offset_for,
-                        should_drive_prefetch,
-                    );
-                    fetcher_get_us_sum += t_fg.elapsed().as_micros();
-                    chunk_arc_result.map_err(FetchError::Decode)?
-                }
-            };
+        let chunk_arc = match chunk_arc_from_partition {
+            Some(arc) => arc,
+            None => {
+                // The head chunk is NOT in the prefetch cache → the
+                // consumer is about to BLOCK on its decode (the
+                // `wait.block_fetcher_get` span, the other real serial wait
+                // besides `wait.future_recv`). Vendor's
+                // `queuePrefetchedChunkPostProcessing` overlaps post-process
+                // of ready successors with exactly this kind of stall —
+                // submit it NOW so it runs on the pool while we block.
+                queue_prefetched_marker_postprocess(
+                    block_fetcher,
+                    window_map,
+                    thread_pool,
+                    &mut prefetch_post_inflight,
+                    None,
+                );
+                let t_fg = std::time::Instant::now();
+                let _tv2 = trace_v2::SpanGuard::begin_with(
+                    "wait.block_fetcher_get",
+                    &format!(
+                        r#""chunk_id":{},"offset":{}"#,
+                        partition_idx_for_trace, next_block_offset
+                    ),
+                );
+                let (chunk_arc_result, _prefetched) = block_fetcher.get_with_prefetch(
+                    next_block_offset,
+                    |_key: usize| -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
+                        submit_decode_to_pool(
+                            thread_pool,
+                            input,
+                            params,
+                            window_map,
+                            block_fetcher,
+                            configuration,
+                        )
+                    },
+                    lookup_block_offset,
+                    lookup_next_block_offset,
+                    prefetch_submit,
+                    is_finalized_too_high,
+                    partition_offset_for,
+                    should_drive_prefetch,
+                );
+                fetcher_get_us_sum += t_fg.elapsed().as_micros();
+                chunk_arc_result.map_err(FetchError::Decode)?
+            }
+        };
+        // Take ownership when we hold the only Arc; otherwise clone the
+        // inner ChunkData. Mirror of rapidgzip's shared_ptr aliasing at
+        // GzipChunkFetcher.hpp:329.
+        let mut chunk: ChunkData = {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.arc_take_or_clone");
             match Arc::try_unwrap(chunk_arc) {
                 Ok(c) => {
@@ -1457,7 +1435,6 @@ fn consumer_loop<W: std::io::Write>(
                     window_map,
                     thread_pool,
                     &mut prefetch_post_inflight,
-                    &mut postproc_stolen_partitions,
                     Some(chunk_end_bit),
                 );
             }
@@ -1511,11 +1488,7 @@ fn consumer_loop<W: std::io::Write>(
                         total_crc,
                         total_size,
                         block_fetcher,
-                        Some((
-                            thread_pool,
-                            &mut prefetch_post_inflight,
-                            &mut postproc_stolen_partitions,
-                        )),
+                        Some((thread_pool, &mut prefetch_post_inflight)),
                     )?;
                 }
             }
@@ -1554,7 +1527,6 @@ fn consumer_loop<W: std::io::Write>(
                 window_map,
                 thread_pool,
                 &mut prefetch_post_inflight,
-                &mut postproc_stolen_partitions,
                 Some(chunk_end_bit),
             );
             predecessor_window_for_postprocess = Some(window);
@@ -1642,22 +1614,12 @@ fn consumer_loop<W: std::io::Write>(
         // queue as immediately-ready for ordered write.
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.dispatch_post_process");
-            if chunk_postproc_done {
-                pending.push_back(PendingWrite::Ready {
-                    idx: partition_idx_for_trace,
-                    chunk,
-                    cache_key: next_block_offset,
-                    handoff_bit,
-                });
-            } else {
-                match predecessor_window_for_postprocess {
-                    Some(window) => {
-                        use std::sync::atomic::Ordering;
-                        let inflight_keys = [chunk_offset_pre_set, partition_offset, decode_start];
-                        let reuse = match take_postproc_inflight(
-                            &mut prefetch_post_inflight,
-                            &inflight_keys,
-                        ) {
+            match predecessor_window_for_postprocess {
+                Some(window) => {
+                    use std::sync::atomic::Ordering;
+                    let inflight_keys = [chunk_offset_pre_set, partition_offset, decode_start];
+                    let reuse =
+                        match take_postproc_inflight(&mut prefetch_post_inflight, &inflight_keys) {
                             Some((eager_pred_key, eager_rx))
                                 if consumer_pred_key == Some(eager_pred_key) =>
                             {
@@ -1673,30 +1635,29 @@ fn consumer_loop<W: std::io::Write>(
                                 None
                             }
                         };
-                        let rx = match reuse {
-                            Some(eager_rx) => eager_rx,
-                            None => submit_post_process_to_pool(
-                                thread_pool,
-                                chunk,
-                                window,
-                                partition_idx_for_trace,
-                            ),
-                        };
-                        pending.push_back(PendingWrite::Async {
-                            idx: partition_idx_for_trace,
-                            rx,
-                            cache_key: next_block_offset,
-                            handoff_bit,
-                        });
-                    }
-                    None => {
-                        pending.push_back(PendingWrite::Ready {
-                            idx: partition_idx_for_trace,
+                    let rx = match reuse {
+                        Some(eager_rx) => eager_rx,
+                        None => submit_post_process_to_pool(
+                            thread_pool,
                             chunk,
-                            cache_key: next_block_offset,
-                            handoff_bit,
-                        });
-                    }
+                            window,
+                            partition_idx_for_trace,
+                        ),
+                    };
+                    pending.push_back(PendingWrite::Async {
+                        idx: partition_idx_for_trace,
+                        rx,
+                        cache_key: next_block_offset,
+                        handoff_bit,
+                    });
+                }
+                None => {
+                    pending.push_back(PendingWrite::Ready {
+                        idx: partition_idx_for_trace,
+                        chunk,
+                        cache_key: next_block_offset,
+                        handoff_bit,
+                    });
                 }
             }
         }
@@ -1714,11 +1675,7 @@ fn consumer_loop<W: std::io::Write>(
                 total_crc,
                 total_size,
                 block_fetcher,
-                Some((
-                    thread_pool,
-                    &mut prefetch_post_inflight,
-                    &mut postproc_stolen_partitions,
-                )),
+                Some((thread_pool, &mut prefetch_post_inflight)),
             )?;
         }
         iter_us_sum += t_iter.elapsed().as_micros();
@@ -1735,11 +1692,7 @@ fn consumer_loop<W: std::io::Write>(
             total_crc,
             total_size,
             block_fetcher,
-            Some((
-                thread_pool,
-                &mut prefetch_post_inflight,
-                &mut postproc_stolen_partitions,
-            )),
+            Some((thread_pool, &mut prefetch_post_inflight)),
         )?;
     }
     let _ = submit_us_sum; // reserved for future submit-only timing
@@ -1937,17 +1890,9 @@ fn eager_postprocess_prefetched(
     window_map: &WindowMap,
     thread_pool: &Arc<ThreadPool>,
     in_flight: &mut EagerSubmitted,
-    postproc_stolen_partitions: &mut std::collections::HashSet<usize>,
 ) -> usize {
     let _tv2 = trace_v2::SpanGuard::begin("consumer.eager_postproc");
-    queue_prefetched_marker_postprocess(
-        block_fetcher,
-        window_map,
-        thread_pool,
-        in_flight,
-        postproc_stolen_partitions,
-        None,
-    )
+    queue_prefetched_marker_postprocess(block_fetcher, window_map, thread_pool, in_flight, None)
 }
 
 #[cfg(parallel_sm)]
@@ -2529,7 +2474,6 @@ fn queue_prefetched_marker_postprocess(
     window_map: &WindowMap,
     thread_pool: &Arc<ThreadPool>,
     in_flight: &mut EagerSubmitted,
-    postproc_stolen_partitions: &mut std::collections::HashSet<usize>,
     handoff_key: Option<usize>,
 ) -> usize {
     use std::sync::atomic::Ordering;
@@ -2580,7 +2524,6 @@ fn queue_prefetched_marker_postprocess(
         let rx =
             submit_post_process_from_prefetch(thread_pool, arc, resolve_offset, predecessor_window);
         in_flight.insert(partition_key, (pred_key, rx));
-        postproc_stolen_partitions.insert(partition_key);
         submitted += 1;
         if handoff_key.is_some() {
             RESOLVE_AHEAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
@@ -2591,7 +2534,6 @@ fn queue_prefetched_marker_postprocess(
                 window_map,
                 thread_pool,
                 in_flight,
-                postproc_stolen_partitions,
                 Some(next_handoff),
             );
         }
@@ -3196,11 +3138,7 @@ fn drain_one_pending<W: std::io::Write>(
     // apply_window for ready prefetched successors whose CONFIRMED
     // predecessor window is published, so they run on the pool while the
     // consumer blocks on the head. `None` (eager disabled) skips it.
-    eager_ctx: Option<(
-        &Arc<ThreadPool>,
-        &mut EagerSubmitted,
-        &mut std::collections::HashSet<usize>,
-    )>,
+    eager_ctx: Option<(&Arc<ThreadPool>, &mut EagerSubmitted)>,
 ) -> Result<(), FetchError> {
     let _tv2 = trace_v2::SpanGuard::begin("consumer.drain");
     let head = match pending.pop_front() {
@@ -3210,14 +3148,12 @@ fn drain_one_pending<W: std::io::Write>(
     // Vendor GzipChunkFetcher.hpp:513 — queue successor post-processing
     // BEFORE blocking on the head chunk's future, but only when the head is
     // actually an in-flight `Async` (else there is no wait to overlap).
-    if let (PendingWrite::Async { .. }, Some((thread_pool, in_flight, stolen))) = (&head, eager_ctx)
-    {
+    if let (PendingWrite::Async { .. }, Some((thread_pool, in_flight))) = (&head, eager_ctx) {
         queue_prefetched_marker_postprocess(
             block_fetcher,
             window_map,
             thread_pool,
             in_flight,
-            stolen,
             None,
         );
     }
