@@ -888,6 +888,11 @@ fn drive_impl<W: std::io::Write>(
             PREFETCH_REJECT_BY_GUARD.load(Ordering::Relaxed),
         );
         eprintln!(
+            "  Clean decode (predecessor @ seed / @ candidate): {} / {}",
+            CLEAN_DECODE_VIA_PREDECESSOR.load(Ordering::Relaxed),
+            SPEC_DECODE_CLEAN_OK.load(Ordering::Relaxed),
+        );
+        eprintln!(
             "  Arc::try_unwrap hits/misses: {} / {}",
             ARC_TRY_UNWRAP_HITS.load(Ordering::Relaxed),
             ARC_TRY_UNWRAP_MISSES.load(Ordering::Relaxed),
@@ -2200,7 +2205,7 @@ fn run_decode_task(
             input_bytes,
             params.start_bit,
             params.stop_hint_bit,
-            &bytes,
+            bytes.as_ref(),
             configuration,
         ) {
             Ok(chunk)
@@ -2215,6 +2220,7 @@ fn run_decode_task(
                 params.start_bit,
                 params.stop_hint_bit,
                 configuration,
+                window_map,
             ),
         }
     } else {
@@ -2223,6 +2229,7 @@ fn run_decode_task(
             params.start_bit,
             params.stop_hint_bit,
             configuration,
+            window_map,
         )
     };
 
@@ -2665,6 +2672,11 @@ pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
 pub static CLEAN_DECODE_VIA_PREDECESSOR: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// `try_speculative_decode_candidate` skipped marker bootstrap via clean
+/// `decode_chunk_isal` at a real boundary with the predecessor dict.
+pub static SPEC_DECODE_CLEAN_OK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub static PREFETCH_REJECT_BY_GUARD: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -2755,9 +2767,9 @@ fn eager_postproc_enabled() -> bool {
     }
 }
 
-/// Speculative slow-path decode without a predecessor window. Must use
-/// marker bootstrap — plain ISA-L with an empty dict resolves unknown
-/// back-refs against zeros and corrupts output (Bug B, commit 4909ac7).
+/// Speculative try-decode at a block-finder candidate (vendor `tryToDecode`).
+/// When `pred_window` is `Some`, attempt clean [`decode_chunk_isal`] first —
+/// a real boundary with the predecessor dict skips the marker bootstrap.
 #[cfg(parallel_sm)]
 fn try_speculative_decode_candidate(
     input: &[u8],
@@ -2765,14 +2777,44 @@ fn try_speculative_decode_candidate(
     partition_seed: usize,
     stop_hint_bit: usize,
     configuration: ChunkConfiguration,
+    window_map: &WindowMap,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    let result = decode_chunk_marker_bootstrap_then_isal(
-        input,
-        decode_start,
-        stop_hint_bit,
-        &[],
-        configuration,
-    );
+    // Clean try only when a window is published at this exact bit (confirmed
+    // chunk end). `get_predecessor` is NOT sufficient — a stale earlier tail
+    // dict mis-decodes false-positive finder candidates (CRC mismatch).
+    let result = if let Some(w) = window_map.get(decode_start) {
+        let pw = materialize_window(&w);
+        match decode_chunk_isal(
+            input,
+            decode_start,
+            stop_hint_bit,
+            pw.as_ref(),
+            configuration,
+        ) {
+            Ok(chunk)
+                if chunk.encoded_offset_bits == decode_start
+                    && chunk.max_acceptable_start_bit == decode_start =>
+            {
+                SPEC_DECODE_CLEAN_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(chunk)
+            }
+            Ok(_) | Err(_) => decode_chunk_marker_bootstrap_then_isal(
+                input,
+                decode_start,
+                stop_hint_bit,
+                &[],
+                configuration,
+            ),
+        }
+    } else {
+        decode_chunk_marker_bootstrap_then_isal(
+            input,
+            decode_start,
+            stop_hint_bit,
+            &[],
+            configuration,
+        )
+    };
     // V1: classify failures so we know which fix to attack.
     //   header_fail  → "deflate header at bit X" — could be caught by
     //                  precode pre-pass (CountAllocatedLeaves port)
@@ -2836,6 +2878,7 @@ fn speculative_decode_find_boundary(
     start_bit: usize,
     stop_hint_bit: usize,
     configuration: ChunkConfiguration,
+    window_map: &WindowMap,
 ) -> Result<ChunkData, ChunkDecodeError> {
     const MAX_SCAN_BITS: usize = 512 * 1024 * 8;
     let input_bits = input.len() * 8;
@@ -2859,6 +2902,7 @@ fn speculative_decode_find_boundary(
             start_bit,
             stop_hint_bit,
             configuration,
+            window_map,
         ) {
             SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(chunk);
@@ -2903,6 +2947,7 @@ fn speculative_decode_find_boundary(
                 start_bit,
                 stop_hint_bit,
                 configuration,
+                window_map,
             ) {
                 Ok(chunk) => {
                     SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2936,6 +2981,7 @@ fn speculative_decode_find_boundary(
                 start_bit,
                 stop_hint_bit,
                 configuration,
+                window_map,
             ) {
                 SLOW_PATH_FIRST_CANDIDATE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(chunk);
