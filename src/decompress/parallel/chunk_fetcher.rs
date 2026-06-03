@@ -1384,6 +1384,9 @@ fn consumer_loop<W: std::io::Write>(
         let effective_start = decode_start;
         if chunk.encoded_offset_bits != effective_start {
             chunk.set_encoded_offset(effective_start);
+            // Any resolve done while `encoded_offset` was still the partition
+            // seed is invalid after re-anchor (prefetch cache or stale flag).
+            chunk.markers_resolved = false;
         }
 
         // Resolve-ahead only after the consumer re-anchor (vendor resolves at
@@ -2618,6 +2621,7 @@ fn resolve_ahead_prefetch_at_handoff(
         }
         let mut chunk = (*arc).clone();
         reanchor_chunk_to_handoff(&mut chunk, handoff_key);
+        chunk.markers_resolved = false;
         if try_worker_resolve_ahead(&mut chunk, window_map) {
             let next_handoff = chunk.encoded_offset_bits + chunk.encoded_size_bits;
             block_fetcher.insert_prefetched(cache_key, Arc::new(chunk));
