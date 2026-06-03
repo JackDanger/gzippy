@@ -2,7 +2,8 @@
 
 //! Per-chunk deflate decode for parallel single-member.
 //!
-//! - [`decode_chunk_with_rapidgzip`] — vendor `decodeChunkWithRapidgzip` loop:
+//! - [`decode_chunk_with_rapidgzip`] — vendor `decodeChunkWithRapidgzip` +
+//!   `finishDecodeChunkWithInexactOffset` on one [`ChunkData`]:
 //!   one outer decode iteration (`worker.decode_chunk`) alternates
 //!   `deflate_block` blocks (u16 markers) until 32 KiB clean, then streaming
 //!   inflate on the same [`ChunkData`].
@@ -131,12 +132,10 @@ fn body_fail_log(start_bit: usize, bits_into_body: usize, bytes_wasted: usize, e
 #[cfg(not(parallel_sm))]
 fn body_fail_log(_: usize, _: usize, _: usize, _: &str) {}
 
-/// Rapidgzip-shaped chunk decode (GzipChunk.hpp `decodeChunkWithRapidgzip` /
-/// `finishDecodeChunkWithInexactOffset` handoff at 32 KiB clean).
-///
-/// `initial_window`: full 32 KiB predecessor dict → skip marker phase; empty →
-/// marker phase then inflate continuation on the same `ChunkData` (no
-/// `absorb_isal_tail` merge).
+/// Rapidgzip-shaped chunk decode — `GzipChunk.hpp::decodeChunkWithRapidgzip`
+/// (outer `while` over deflate blocks) with handoff to
+/// `finishDecodeChunkWithInexactOffset` once 32 KiB clean exist at a block
+/// boundary (or immediately when `initial_window` is full 32 KiB).
 #[cfg(parallel_sm)]
 pub fn decode_chunk_with_rapidgzip(
     input: &[u8],
@@ -145,7 +144,7 @@ pub fn decode_chunk_with_rapidgzip(
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    decode_chunk_unified(
+    decode_chunk_with_rapidgzip_impl(
         input,
         encoded_offset_bits,
         stop_hint_bits,
@@ -214,10 +213,11 @@ fn use_option_a_prefill_path() -> bool {
     })
 }
 
-/// Streaming inflate into an existing `ChunkData` (vendor
-/// `finishDecodeChunkWithInexactOffset` — same chunk, no `absorb_isal_tail`).
+/// Vendor `finishDecodeChunkWithInexactOffset` (GzipChunk.hpp:280-410): streaming
+/// inflate on the same [`ChunkData`] via [`IsalInflateWrapper`] /
+/// `unified::Inflate<Clean, …>`.
 #[cfg(parallel_sm)]
-fn decode_chunk_inflate_into(
+fn finish_decode_chunk_inexact_offset(
     chunk: &mut ChunkData,
     input: &[u8],
     inflate_start_bit: usize,
@@ -853,7 +853,7 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     _initial_window_unused: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    decode_chunk_unified(
+    decode_chunk_with_rapidgzip_impl(
         input,
         encoded_offset_bits,
         stop_hint_bits,
@@ -862,11 +862,9 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     )
 }
 
-/// Vendor `decodeChunkWithRapidgzip` outer loop (GzipChunk.hpp:468-654): one
-/// `while` alternates marker blocks (`deflate_block::Block`) and, once 32 KiB
-/// clean exist at a block boundary, streaming inflate on the same [`ChunkData`].
+/// `decodeChunkWithRapidgzip` body (GzipChunk.hpp:468-654).
 #[cfg(parallel_sm)]
-fn decode_chunk_unified(
+fn decode_chunk_with_rapidgzip_impl(
     input: &[u8],
     encoded_offset_bits: usize,
     stop_hint_bits: usize,
@@ -915,7 +913,7 @@ fn decode_chunk_unified(
     'decode: loop {
         if inflate_phase {
             let t_inflate = std::time::Instant::now();
-            decode_chunk_inflate_into(
+            finish_decode_chunk_inexact_offset(
                 &mut chunk,
                 input,
                 inflate_start_bit,
