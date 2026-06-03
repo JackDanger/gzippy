@@ -36,7 +36,7 @@ echo "=== Host lock + gate + guest capture (branch=$BRANCH T=$THREADS N=$N) ==="
 EXTRA_ARGS=""
 [ -n "${GZIPPY_SLOW_BOOTSTRAP:-}" ] && EXTRA_ARGS="$EXTRA_ARGS SLOW_BOOTSTRAP=${GZIPPY_SLOW_BOOTSTRAP}"
 "${NEUROTIC[@]}" "GUEST_SCRIPT=guest_fulcrum_capture.sh bash $BENCH_HOST_DIR/host_lock_and_bench.sh \
-  BRANCH=${BRANCH} THREADS=${THREADS} N=${N}${EXTRA_ARGS}" 2>&1 | tee "$ART_LOCAL/host-guest.log"
+  BRANCH=${BRANCH} THREADS='${THREADS}' N=${N}${EXTRA_ARGS}" 2>&1 | tee "$ART_LOCAL/host-guest.log"
 
 echo "=== Fetch artifacts from guest 199 ==="
 "${GUEST[@]}" "tar czf - -C /root/gzippy-bench artifacts-fulcrum 2>/dev/null" | tar xzf - -C "$ART_LOCAL"
