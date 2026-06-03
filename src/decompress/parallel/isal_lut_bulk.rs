@@ -48,17 +48,9 @@
 
 use crate::decompress::inflate::consume_first_decode::Bits;
 use crate::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached;
-use crate::decompress::parallel::isal_huffman_pure::{IsalLitLenCodePure, LIT_LEN};
-
-/// Distance decoder uses the proven `HuffmanCodingReversedBitsCached`.
-/// The dist code is only ~2.56% of CPU per profile; not the lever.
-///
-/// Sized at 32 (NOT 30) so fixed-Huffman builds can include symbols
-/// 30 and 31 (RFC 1951 §3.2.6: reserved, "never actually occur in the
-/// compressed data, but participate in the code construction").
-/// Without these two length-5 entries count[5] is 30 instead of 32 →
-/// Kraft 0.9375 → incomplete code tree → mis-decoded dist symbols.
-pub type BulkDistDecoder = HuffmanCodingReversedBitsCached<32>;
+use crate::decompress::parallel::isal_huffman_pure::{
+    IsalDistCodePure, IsalLitLenCodePure, LIT_LEN,
+};
 
 const MAX_WINDOW_SIZE: usize = 32 * 1024;
 const MAX_MATCH_LENGTH: usize = 258;
@@ -98,7 +90,7 @@ pub struct BulkBlockResult {
 /// arrays that would otherwise be `vec![0u8; N]` per block.
 pub struct DecoderScratch {
     pub litlen: IsalLitLenCodePure,
-    pub dist: BulkDistDecoder,
+    pub dist: IsalDistCodePure,
     dist_lens: [u8; 32],
     cl_lens: [u8; 19],
     all_lens: [u8; LIT_LEN + 30],
@@ -108,12 +100,60 @@ impl DecoderScratch {
     pub fn new() -> Self {
         Self {
             litlen: IsalLitLenCodePure::new_empty(),
-            dist: BulkDistDecoder::new(),
+            dist: IsalDistCodePure::new_empty(),
             dist_lens: [0u8; 32],
             cl_lens: [0u8; 19],
             all_lens: [0u8; LIT_LEN + 30],
         }
     }
+}
+
+/// Distance symbol + extra bits → lookback distance (RFC 1951 §3.2.5).
+#[inline]
+fn distance_from_sym_extra(dist_sym: u32, extra_val: u32) -> Result<usize, BulkDecodeError> {
+    if dist_sym >= 30 {
+        return Err(BulkDecodeError::InvalidHuffmanCode);
+    }
+    let distance = (DIST_START[dist_sym as usize] + extra_val) as usize;
+    if distance == 0 || distance > MAX_WINDOW_SIZE {
+        return Err(BulkDecodeError::InvalidLookback);
+    }
+    Ok(distance)
+}
+
+#[inline]
+fn read_distance_extra(bits: &mut Bits<'_>, dist_sym: u32) -> Result<u32, BulkDecodeError> {
+    let extra_bits = DIST_EXTRA_BIT_COUNT[dist_sym as usize];
+    if extra_bits == 0 {
+        return Ok(0);
+    }
+    let extra = extra_bits as u32;
+    if bits.available() < extra {
+        bits.refill();
+        if bits.available() < extra {
+            return Err(BulkDecodeError::InvalidHuffmanCode);
+        }
+    }
+    let mask = (1u64 << extra) - 1;
+    let v = (bits.peek() & mask) as u32;
+    bits.consume(extra);
+    Ok(v)
+}
+
+/// Decode a distance codeword + RFC extra bits via the ISA-L distance LUT.
+#[inline]
+fn decode_distance(
+    bits: &mut Bits<'_>,
+    scratch: &DecoderScratch,
+) -> Result<usize, BulkDecodeError> {
+    bits.refill();
+    let (dist_sym, dbit) = scratch
+        .dist
+        .decode(bits)
+        .ok_or(BulkDecodeError::InvalidHuffmanCode)?;
+    bits.consume(dbit);
+    let extra_val = read_distance_extra(bits, dist_sym)?;
+    distance_from_sym_extra(dist_sym, extra_val)
 }
 
 impl Default for DecoderScratch {
@@ -213,27 +253,7 @@ pub fn decode_block(
                 }
             }
 
-            use crate::decompress::parallel::huffman_base::LsbBitReader as _;
-            let dist_sym = scratch
-                .dist
-                .decode(bits)
-                .ok_or(BulkDecodeError::InvalidHuffmanCode)? as u32;
-            if dist_sym >= 30 {
-                return Err(BulkDecodeError::InvalidHuffmanCode);
-            }
-            bits.refill();
-            let extra_bits = DIST_EXTRA_BIT_COUNT[dist_sym as usize];
-            let extra_val = if extra_bits > 0 {
-                let v = (bits.bitbuf & ((1u64 << extra_bits) - 1)) as u32;
-                bits.consume(extra_bits as u32);
-                v
-            } else {
-                0
-            };
-            let distance = (DIST_START[dist_sym as usize] + extra_val) as usize;
-            if distance == 0 || distance > MAX_WINDOW_SIZE {
-                return Err(BulkDecodeError::InvalidLookback);
-            }
+            let distance = decode_distance(bits, scratch)?;
             if *out_pos + length > output.len() {
                 return Err(BulkDecodeError::OutputOverflow);
             }
@@ -343,15 +363,11 @@ fn build_fixed_huffman(scratch: &mut DecoderScratch) -> Result<(), BulkDecodeErr
     if !scratch.litlen.rebuild_from(&fixed_lens) {
         return Err(BulkDecodeError::InvalidCodeLengths);
     }
-    // Fixed-Huffman dist: 32 codes at length 5 (30 valid + 2 reserved).
-    // Same reasoning as the litlen 286/287 reserved-symbols fix above.
+    // Fixed-Huffman dist: 32 codes at length 5 (ISA-L LUT, same as dynamic).
     for sym in 0..32 {
         scratch.dist_lens[sym] = 5;
     }
-    let err = scratch
-        .dist
-        .initialize_from_lengths(&scratch.dist_lens, false);
-    if err != crate::decompress::parallel::error::Error::None {
+    if !scratch.dist.rebuild_from(&scratch.dist_lens) {
         return Err(BulkDecodeError::InvalidCodeLengths);
     }
     Ok(())
@@ -459,10 +475,7 @@ fn build_dynamic_huffman(
         *v = 0;
     }
     scratch.dist_lens[..hdist].copy_from_slice(dist_lens_slice);
-    let derr = scratch
-        .dist
-        .initialize_from_lengths(&scratch.dist_lens, false);
-    if derr != crate::decompress::parallel::error::Error::None {
+    if !scratch.dist.rebuild_from(&scratch.dist_lens) {
         return Err(BulkDecodeError::InvalidCodeLengths);
     }
     Ok(())
