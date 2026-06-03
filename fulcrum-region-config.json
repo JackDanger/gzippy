@@ -10,12 +10,12 @@
       "functions": ["worker.block_header", "worker.block_body"]
     },
     {
-      "name": "clean_isal_tail",
-      "functions": ["worker.isal_stream_inflate"]
+      "name": "clean_stream_inflate",
+      "functions": ["worker.stream_inflate"]
     },
     {
       "name": "copies",
-      "functions": ["drain", "append_markered", "absorb_isal_tail", "write_narrowed", "narrow"]
+      "functions": ["drain", "append_markered", "write_narrowed", "narrow"]
     },
     {
       "name": "apply_window",
