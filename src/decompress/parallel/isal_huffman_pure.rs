@@ -463,13 +463,20 @@ pub fn make_inflate_huff_code_lit_len(
         return;
     }
 
-    // Determine the length of the first code
-    let last_first = huff_code_table[code_list[0] as usize].length() as u32;
-    let mut last_length = if last_first > ISAL_DECODE_LONG_BITS {
-        ISAL_DECODE_LONG_BITS + 1
-    } else {
-        last_first
-    };
+    // Shortest length with at least one code (`count_total` is cumulative).
+    let mut last_length = 0u32;
+    for l in 1..MAX_LIT_LEN_COUNT as u32 {
+        if count_total[(l + 1) as usize] > count_total[l as usize] {
+            last_length = l;
+            break;
+        }
+    }
+    if last_length == 0 {
+        return;
+    }
+    if last_length > ISAL_DECODE_LONG_BITS {
+        last_length = ISAL_DECODE_LONG_BITS + 1;
+    }
     let mut copy_size: usize = 1 << (last_length - 1);
 
     // Initialize short_code_lookup to zero for `copy_size` entries
