@@ -8,8 +8,7 @@
 //! **Processing model:** prefetch pool decode → early tail publish →
 //! worker resolve-ahead when `max_acceptable_start_bit` is confirmed in
 //! `WindowMap` (vendor `queuePrefetchedChunkPostProcessing`) → in-order
-//! consumer drain. `RESOLVE_AHEAD_DEFAULT` is ON; `GZIPPY_RESOLVE_AHEAD=0`
-//! disables.
+//! consumer drain.
 
 /// True when the parallel-SM inner decode is pure Rust (no ISA-L C in the wrapper).
 #[allow(dead_code)]
@@ -23,12 +22,6 @@ pub const PURE_RUST_INFLATE_DECODE: bool = cfg!(pure_inflate_decode);
 /// (ISA-L's C library is x86-only); see `inflate_wrapper::IsalInflateWrapper`'s
 /// `#[cfg(pure_inflate_decode)]` backend.
 pub const PARALLEL_SM: bool = cfg!(parallel_sm);
-
-/// Worker-side marker resolve when the handoff predecessor window is
-/// confirmed (`WindowMap::contains(max_acceptable_start_bit)`).
-#[allow(dead_code)] // read from `chunk_fetcher` under `cfg(parallel_sm)` only
-/// ON after ship-gate (sha + `RESOLVE_AHEAD_OK` > 0 on locked Fulcrum).
-pub const RESOLVE_AHEAD_DEFAULT: bool = false;
 
 /// Post-bootstrap + bootstrap DYNAMIC table build use patched ISA-L C code.
 #[allow(dead_code)]
