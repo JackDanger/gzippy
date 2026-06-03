@@ -1308,6 +1308,15 @@ fn decode_huffman_body_resumable(
 
             // LENGTH+DISTANCE path.
             let length = entry.decode_length(saved_bitbuf);
+            // Hide match-source load latency (libdeflate_decode.rs:693-701).
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                _mm_prefetch(
+                    output_ptr.add(out_pos.saturating_sub(32)) as *const i8,
+                    _MM_HINT_T0,
+                );
+            }
             let dist_saved = bitbuf;
             let mut dist_entry = dist.lookup(dist_saved);
             if dist_entry.is_subtable_ptr() {
