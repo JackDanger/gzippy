@@ -1925,6 +1925,32 @@ fn submit_post_process_to_pool(
             &format!(r#""partition_idx":{}"#, partition_idx),
         );
     }
+    submit_post_process_task(thread_pool, move || {
+        run_post_process_task(chunk, predecessor_window)
+    })
+}
+
+/// Post-process a prefetched cache entry without deep-cloning [`ChunkData`] on
+/// the consumer thread (vendor queues work; the clone happens on the pool).
+#[cfg(parallel_sm)]
+fn submit_post_process_from_prefetch(
+    thread_pool: &Arc<ThreadPool>,
+    arc: Arc<ChunkData>,
+    resolve_offset: usize,
+    predecessor_window: Window,
+) -> mpsc::Receiver<ChunkData> {
+    submit_post_process_task(thread_pool, move || {
+        let mut chunk_clone = (*arc).clone();
+        reanchor_chunk_to_handoff(&mut chunk_clone, resolve_offset);
+        run_post_process_task(chunk_clone, predecessor_window)
+    })
+}
+
+#[cfg(parallel_sm)]
+fn submit_post_process_task(
+    thread_pool: &Arc<ThreadPool>,
+    task: impl FnOnce() -> ChunkData + Send + 'static,
+) -> mpsc::Receiver<ChunkData> {
     // FRONTIER SCHEDULING (gzippy deviation from vendor's flat -1):
     // post-process is bumped to -2 (highest) so it strictly outranks the
     // on-demand frontier decode (-1 below). The consumer's pending-write
@@ -1935,10 +1961,7 @@ fn submit_post_process_to_pool(
     // the same priority bucket; gzippy's pump can enqueue far prefetches
     // ahead of the frontier on-demand task in the 0 bucket, so we promote
     // the frontier decode to its own band instead (see submit_decode_to_pool).
-    let future = thread_pool.submit(
-        move || run_post_process_task(chunk, predecessor_window),
-        /* priority */ -2,
-    );
+    let future = thread_pool.submit(task, /* priority */ -2);
     future.into_receiver()
 }
 
@@ -2490,10 +2513,12 @@ fn queue_prefetched_marker_postprocess(
         else {
             continue;
         };
-        let mut chunk_clone = (*arc).clone();
-        reanchor_chunk_to_handoff(&mut chunk_clone, resolve_offset);
-        let rx =
-            submit_post_process_to_pool(thread_pool, chunk_clone, predecessor_window, real_offset);
+        let rx = submit_post_process_from_prefetch(
+            thread_pool,
+            Arc::clone(&arc),
+            resolve_offset,
+            predecessor_window,
+        );
         in_flight.insert(real_offset, (pred_key, rx));
         submitted += 1;
         if handoff_key.is_some() {
