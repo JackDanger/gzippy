@@ -2,10 +2,11 @@
 
 //! Per-chunk deflate decode for parallel single-member.
 //!
-//! - [`decode_chunk_isal`] — on-demand decode when the predecessor
-//!   window is known (or chunk 0 with a zero dict). Clean bytes only.
-//! - [`decode_chunk_marker_bootstrap_then_isal`] — speculative prefetch when
-//!   no window yet: marker bootstrap for cross-chunk refs, then ISA-L bulk.
+//! - [`decode_chunk_with_rapidgzip`] — vendor-shaped single entry: marker
+//!   phase (window-absent) then streaming inflate into the same `ChunkData`,
+//!   or streaming-only when the 32 KiB predecessor window is already known.
+//! - [`decode_chunk_isal`] / [`decode_chunk_marker_bootstrap_then_isal`] —
+//!   thin aliases for routing/tests.
 //!
 //! `stop_hint_bits` is an inexact stop hint (vendor `untilOffset`): the
 //! decoder runs to the first block boundary at-or-past it, then stops.
@@ -129,10 +130,50 @@ fn body_fail_log(start_bit: usize, bits_into_body: usize, bytes_wasted: usize, e
 #[cfg(not(parallel_sm))]
 fn body_fail_log(_: usize, _: usize, _: usize, _: &str) {}
 
-/// ISA-L decode of one chunk when the predecessor window is known.
+/// Rapidgzip-shaped chunk decode (GzipChunk.hpp `decodeChunkWithRapidgzip` /
+/// `finishDecodeChunkWithInexactOffset` handoff at 32 KiB clean).
 ///
-/// Stops at the first block boundary at-or-past `stop_hint_bits` (an
-/// inexact hint — the decoder may overshoot), or at end-of-stream.
+/// `initial_window`: full 32 KiB predecessor dict → skip marker phase; empty →
+/// marker phase then inflate continuation on the same `ChunkData` (no
+/// `absorb_isal_tail` merge).
+#[cfg(parallel_sm)]
+pub fn decode_chunk_with_rapidgzip(
+    input: &[u8],
+    encoded_offset_bits: usize,
+    stop_hint_bits: usize,
+    initial_window: &[u8],
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    use crate::decompress::parallel::deflate_block::MAX_WINDOW_SIZE;
+
+    let skip_marker_phase = initial_window.len() == MAX_WINDOW_SIZE
+        || (initial_window.is_empty() && encoded_offset_bits == 0);
+    if skip_marker_phase {
+        #[cfg(feature = "pure-rust-inflate")]
+        if use_pure_bulk_path() {
+            return decode_chunk_pure_bulk_impl(
+                input,
+                encoded_offset_bits,
+                stop_hint_bits,
+                initial_window,
+                configuration,
+            );
+        }
+        let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
+        decode_chunk_inflate_into(
+            &mut chunk,
+            input,
+            encoded_offset_bits,
+            stop_hint_bits,
+            initial_window,
+            true,
+        )?;
+        return Ok(chunk);
+    }
+
+    decode_chunk_marker_then_inflate(input, encoded_offset_bits, stop_hint_bits, configuration)
+}
+
 #[cfg(parallel_sm)]
 pub fn decode_chunk_isal(
     input: &[u8],
@@ -141,7 +182,7 @@ pub fn decode_chunk_isal(
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    decode_chunk_isal_impl(
+    decode_chunk_with_rapidgzip(
         input,
         encoded_offset_bits,
         stop_hint_bits,
@@ -193,28 +234,17 @@ fn use_option_a_prefill_path() -> bool {
     })
 }
 
+/// Streaming inflate into an existing `ChunkData` (vendor
+/// `finishDecodeChunkWithInexactOffset` — same chunk, no `absorb_isal_tail`).
 #[cfg(parallel_sm)]
-fn decode_chunk_isal_impl(
+fn decode_chunk_inflate_into(
+    chunk: &mut ChunkData,
     input: &[u8],
-    encoded_offset_bits: usize,
+    inflate_start_bit: usize,
     stop_hint_bits: usize,
     initial_window: &[u8],
-    configuration: ChunkConfiguration,
-) -> Result<ChunkData, ChunkDecodeError> {
-    // Env-flag dispatch: route windowed-decode through the new pure-Rust
-    // bulk decoder when GZIPPY_ISAL_PURE_BULK is set. Available only on
-    // the pure-rust-inflate build (the isal-compression build uses real
-    // ISA-L FFI, which is fast enough we don't override it from here).
-    #[cfg(feature = "pure-rust-inflate")]
-    if use_pure_bulk_path() {
-        return decode_chunk_pure_bulk_impl(
-            input,
-            encoded_offset_bits,
-            stop_hint_bits,
-            initial_window,
-            configuration,
-        );
-    }
+    record_decode_duration: bool,
+) -> Result<(), ChunkDecodeError> {
     // `worker.isal_stream_inflate` span — wraps every invocation of
     // gzippy's ISA-L stream-inflate path. Both call sites land here:
     //   (a) the post-bootstrap call at gzip_chunk.rs:549 (after the
@@ -234,7 +264,7 @@ fn decode_chunk_isal_impl(
     let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
         "worker.isal_stream_inflate",
         &format!(
-            r#""start_bit":{encoded_offset_bits},"stop_hint":{stop_hint_bits},"has_window":{}"#,
+            r#""start_bit":{inflate_start_bit},"stop_hint":{stop_hint_bits},"has_window":{}"#,
             !initial_window.is_empty()
         ),
     );
@@ -243,7 +273,7 @@ fn decode_chunk_isal_impl(
     // read cap. Capping `refill_buffer` at a partition guess stops mid-block
     // (e.g. silesia gzip-9 at 33554427 vs hint 33554432 → InvalidBlock on resume).
     let read_cap = input.len() * 8;
-    let mut wrapper = IsalInflateWrapper::with_until_bits(input, encoded_offset_bits, read_cap)?;
+    let mut wrapper = IsalInflateWrapper::with_until_bits(input, inflate_start_bit, read_cap)?;
     wrapper.set_window(initial_window)?;
     wrapper.set_stopping_points(
         StoppingPoints::END_OF_BLOCK
@@ -251,8 +281,6 @@ fn decode_chunk_isal_impl(
             | StoppingPoints::END_OF_STREAM_HEADER
             | StoppingPoints::END_OF_STREAM,
     );
-
-    let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
 
     // Option A3 (default ON): pre-fill segment 0 with the predecessor's
     // 32 KiB window so back-references hit copy_match_fast via
@@ -267,8 +295,8 @@ fn decode_chunk_isal_impl(
     }
 
     let mut stopping_point_reached = false;
-    let mut last_end_bit = encoded_offset_bits;
-    let mut last_eob_pos = encoded_offset_bits;
+    let mut last_end_bit = inflate_start_bit;
+    let mut last_eob_pos = inflate_start_bit;
     let mut last_eob_decoded_bytes: usize = 0;
     let mut already_decoded: usize = 0;
     // Set once the decoder reaches the genuine end of the input (final
@@ -545,7 +573,9 @@ fn decode_chunk_isal_impl(
         }
     }
 
-    chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+    if record_decode_duration {
+        chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+    }
     // A4: window-image prefix STAYS in chunk.data through finalize
     // and into the consumer. The consumer write site reads
     // &chunk.data[chunk.data_prefix_len..] so the prefix never
@@ -563,7 +593,7 @@ fn decode_chunk_isal_impl(
                                // resume at the last END_OF_BLOCK position (pre-header), not mid-block.
     let final_bit = if stopping_point_reached || reached_stream_end {
         last_end_bit
-    } else if last_eob_pos > encoded_offset_bits {
+    } else if last_eob_pos > inflate_start_bit {
         // Hit the until read cap without an inexact header-stop — finalize at
         // the last pre-header EOB, never at a mid-block bit cursor.
         last_eob_pos
@@ -571,7 +601,7 @@ fn decode_chunk_isal_impl(
         wrapper.tell_compressed()
     };
     chunk.finalize(final_bit);
-    Ok(chunk)
+    Ok(())
 }
 
 /// Pure-Rust bulk-decode path. Used when `GZIPPY_ISAL_PURE_BULK=1`.
@@ -843,6 +873,17 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     _initial_window_unused: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
+    decode_chunk_marker_then_inflate(input, encoded_offset_bits, stop_hint_bits, configuration)
+}
+
+/// Window-absent marker phase then inflate into the same `ChunkData`.
+#[cfg(parallel_sm)]
+fn decode_chunk_marker_then_inflate(
+    input: &[u8],
+    encoded_offset_bits: usize,
+    stop_hint_bits: usize,
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
     let t_decode = std::time::Instant::now();
 
     // Phase 1 — bootstrap with deflate_block::Block, the rapidgzip-
@@ -947,25 +988,23 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
         return Ok(chunk);
     }
 
-    // Phase 2 — ISA-L bulk decode from the bootstrap's block boundary
-    // with the clean 32 KiB tail as dict. Uses the same production
-    // `IsalInflateWrapper` path as on-demand decode.
+    // Phase 2 — streaming inflate on the same `ChunkData` (vendor handoff at
+    // `clean_window` / `end_bit_offset`; no second chunk + `absorb_isal_tail`).
     let bit_offset = bootstrap.end_bit_offset;
     let t_inflate = std::time::Instant::now();
-    let tail = {
-        // Coz region: the fast ISA-L clean-window bulk decode (the tail).
+    {
         let _coz = crate::coz_probe::scope("clean_isal");
-        decode_chunk_isal_impl(
+        decode_chunk_inflate_into(
+            &mut chunk,
             input,
             bit_offset,
             stop_hint_bits,
             &clean_window,
-            configuration,
-        )
-    }?;
+            false,
+        )?;
+    }
     let inflate_dur_us = t_inflate.elapsed().as_micros();
-    let tail_bytes = tail.data.len();
-    absorb_isal_tail(&mut chunk, tail);
+    let tail_bytes = chunk.data.len();
     if trace::is_enabled() {
         trace::emit(
             "worker",
@@ -980,9 +1019,9 @@ pub fn decode_chunk_marker_bootstrap_then_isal(
     Ok(chunk)
 }
 
-/// Merge an ISA-L tail segment (clean bytes + block boundaries) into a
-/// chunk that already holds a marker bootstrap prefix.
+/// Legacy merge of a separate ISA-L tail `ChunkData` (pre-unified decode).
 #[cfg(parallel_sm)]
+#[allow(dead_code)]
 fn absorb_isal_tail(dst: &mut ChunkData, mut tail: ChunkData) {
     // `worker.absorb_isal_tail` span — wraps the merge of the
     // ISA-L bulk-decode result into the chunk that holds the
