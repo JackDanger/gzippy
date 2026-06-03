@@ -1389,16 +1389,6 @@ fn consumer_loop<W: std::io::Write>(
             chunk.markers_resolved = false;
         }
 
-        // Resolve-ahead only after the consumer re-anchor (vendor resolves at
-        // `*nextBlockOffset` after `setEncodedOffset`, not at partition seed).
-        if !chunk.data_with_markers.is_empty()
-            && !chunk.markers_resolved
-            && window_map.contains(chunk.encoded_offset_bits)
-            && chunk_may_resolve_markers_early(&chunk)
-        {
-            let _ = try_worker_resolve_ahead(&mut chunk, window_map);
-        }
-
         // Vendor GzipChunkFetcher.hpp:350-355 — EOF mid-decode
         // (`encodedSizeInBits == 0`).
         if chunk.encoded_size_bits == 0 {
@@ -2567,6 +2557,11 @@ fn reanchor_chunk_to_handoff(chunk: &mut ChunkData, handoff_bit: usize) {
 #[cfg(parallel_sm)]
 fn try_worker_resolve_ahead(chunk: &mut ChunkData, window_map: &WindowMap) -> bool {
     use std::sync::atomic::Ordering;
+    // Disabled until worker resolve + consumer tail publish match pool
+    // `run_post_process_task` byte-for-byte on silesia-large (CRC gate).
+    let _ = (chunk, window_map);
+    return false;
+    #[allow(unreachable_code)]
     if !chunk_may_resolve_markers_early(chunk) {
         return false;
     }
@@ -2591,7 +2586,9 @@ fn try_worker_resolve_ahead(chunk: &mut ChunkData, window_map: &WindowMap) -> bo
     let start_bit = chunk.encoded_offset_bits;
     let marker_bytes = chunk.data_with_markers.len();
     resolve_chunk_markers_on_chunk(chunk, bytes.as_ref());
-    chunk.markers_resolved = true;
+    // Leave `markers_resolved` false so the consumer still runs the pool
+    // post-process path (byte-identical to serial). Resolve-ahead only
+    // warms cache clones via `resolve_ahead_prefetch_at_handoff`.
     // Tail publish stays on the consumer (vendor publishes after post-process
     // ordering on the orchestrator thread). Publishing here *after* resolve
     // disagreed with the serial branch (publish before pool post-process) and
