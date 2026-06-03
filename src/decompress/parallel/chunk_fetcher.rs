@@ -2412,15 +2412,6 @@ fn run_decode_task(
                 EARLY_SPEC_PUBLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             EARLY_WINDOW_RANGE_SPECULATIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if chunk_may_resolve_markers_early(chunk)
-                && window_map.contains(chunk.max_acceptable_start_bit)
-            {
-                resolve_ahead_prefetch_at_handoff(
-                    block_fetcher,
-                    window_map,
-                    chunk.max_acceptable_start_bit,
-                );
-            }
         }
     }
 
@@ -2546,7 +2537,9 @@ fn try_worker_resolve_ahead(chunk: &mut ChunkData, window_map: &WindowMap) -> bo
         return false;
     }
     RESOLVE_AHEAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-    let Some((_pred_key, pred_w)) = window_map.get_predecessor(resolve_offset) else {
+    // Exact handoff key — `contains(resolve_offset)` was checked. Do not use
+    // `get_predecessor` here: it can return a strictly-earlier tail.
+    let Some(pred_w) = window_map.get(resolve_offset) else {
         return false;
     };
     let _tv2 = trace_v2::SpanGuard::begin_with(

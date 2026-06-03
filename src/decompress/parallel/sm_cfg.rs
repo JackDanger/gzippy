@@ -27,7 +27,8 @@ pub const PARALLEL_SM: bool = cfg!(parallel_sm);
 /// Worker-side marker resolve when the handoff predecessor window is
 /// confirmed (`WindowMap::contains(max_acceptable_start_bit)`).
 #[allow(dead_code)] // read from `chunk_fetcher` under `cfg(parallel_sm)` only
-pub const RESOLVE_AHEAD_DEFAULT: bool = true;
+/// ON after ship-gate (sha + `RESOLVE_AHEAD_OK` > 0 on locked Fulcrum).
+pub const RESOLVE_AHEAD_DEFAULT: bool = false;
 
 /// Post-bootstrap + bootstrap DYNAMIC table build use patched ISA-L C code.
 #[allow(dead_code)]
