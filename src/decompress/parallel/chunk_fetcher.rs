@@ -1455,8 +1455,23 @@ fn consumer_loop<W: std::io::Write>(
             }
             predecessor_window_for_postprocess = None;
         } else if chunk.markers_resolved {
-            // Worker resolve-ahead: apply_window + narrow + tail publish already
-            // ran when the confirmed handoff window existed at decode return.
+            // Worker resolve-ahead: apply_window + narrow already ran; publish
+            // the successor tail on the consumer (same as the marker branch).
+            if let Some((_pred_key, pred)) =
+                predecessor_window_for_markers(window_map, chunk.encoded_offset_bits)
+            {
+                let window_bytes = materialize_window(&pred);
+                let tail = chunk.get_last_window_vec(&window_bytes);
+                window_map.insert_owned_none(chunk_end_bit, tail);
+                trace_v2::emit_instant(
+                    "causal.window_publish",
+                    &format!(
+                        r#""start_bit":{},"end_bit":{chunk_end_bit},"site":"consumer_resolve_ahead_tail""#,
+                        chunk.encoded_offset_bits
+                    ),
+                    "t",
+                );
+            }
             resolve_ahead_prefetch_at_handoff(block_fetcher, window_map, chunk_end_bit);
             predecessor_window_for_postprocess = None;
         } else {
@@ -2577,16 +2592,10 @@ fn try_worker_resolve_ahead(chunk: &mut ChunkData, window_map: &WindowMap) -> bo
     let marker_bytes = chunk.data_with_markers.len();
     resolve_chunk_markers_on_chunk(chunk, bytes.as_ref());
     chunk.markers_resolved = true;
-    let chunk_end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-    let tail = chunk.get_last_window_vec(bytes.as_ref());
-    window_map.insert_owned_none(chunk_end_bit, tail);
-    trace_v2::emit_instant(
-        "causal.window_publish",
-        &format!(
-            r#""start_bit":{start_bit},"end_bit":{chunk_end_bit},"site":"worker_resolve_ahead""#,
-        ),
-        "t",
-    );
+    // Tail publish stays on the consumer (vendor publishes after post-process
+    // ordering on the orchestrator thread). Publishing here *after* resolve
+    // disagreed with the serial branch (publish before pool post-process) and
+    // corrupted successor windows on silesia-large.
     trace_v2::emit_instant(
         "causal.tax",
         &format!(
