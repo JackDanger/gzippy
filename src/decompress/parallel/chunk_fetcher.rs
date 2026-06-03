@@ -43,7 +43,7 @@
 //!   closure passed to `BlockFetcher::get`, which calls
 //!   `thread_pool.submit(run_decode_job, /* priority */ 0)` and returns
 //!   the future's receiver. Mirror of BlockFetcher.hpp:554-558.
-//! - Worker decode: `decode_chunk_isal` (window known or chunk 0) or
+//! - Worker decode: `decode_chunk` (window known or chunk 0) or
 //!   `speculative_decode_find_boundary` → marker bootstrap (prefetch, no window).
 //! - `postProcessChunk` / `applyWindow` → `apply_window` on the pool
 //!   (priority −1). **WindowMap publishes stay on the consumer** (vendor
@@ -70,9 +70,7 @@ use crate::decompress::parallel::crc32::CRC32Calculator;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::gzip_block_finder::{GetReturnCode, GzipBlockFinder};
 #[cfg(parallel_sm)]
-use crate::decompress::parallel::gzip_chunk::{
-    decode_chunk_isal, decode_chunk_marker_bootstrap_then_isal,
-};
+use crate::decompress::parallel::gzip_chunk::{decode_chunk, decode_chunk_window_absent};
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::prefetcher::FetchMultiStream;
 #[cfg(parallel_sm)]
@@ -193,7 +191,7 @@ struct DecodeParams {
     start_bit: usize,
     /// Inexact stop hint: first deflate block boundary at-or-past this
     /// bit (vendor `untilOffset` when `untilOffsetIsExact == false`).
-    /// NOT a hard byte cap on the ISA-L reader — see `decode_chunk_isal`.
+    /// NOT a hard byte cap on the ISA-L reader — see `decode_chunk`.
     stop_hint_bit: usize,
     /// True for partition-aligned prefetches that may run before the
     /// predecessor window is published (speculative path). False for
@@ -272,11 +270,11 @@ pub fn drive<W: std::io::Write>(
 /// discriminates "is the marker/copy/bootstrap pipeline the rapidgzip gap"
 /// from "the gap is inner-loop / scan". Decode every chunk with its TRUE
 /// predecessor window so NO chunk takes the speculative bootstrap path —
-/// no markers, hence no `append_markered` / `absorb_isal_tail` /
+/// no markers, hence no `append_markered` /
 /// `narrow_u16_to_u8` copies. Pass 1 runs the normal speculative decode to
 /// a sink, populating a shared `WindowMap` with every chunk-boundary
 /// window; pass 2 re-runs with that map pre-seeded (every
-/// `window_map.get(start_bit)` HITS → `decode_chunk_isal`) and is the
+/// `window_map.get(start_bit)` HITS → `decode_chunk`) and is the
 /// TIMED measurement. Reuses the entire production pool/consumer/decoder —
 /// apples-to-apples with production minus speculation. Output is correct
 /// (windows from pass 1 are real), so byte-exactness is verifiable.
@@ -309,9 +307,9 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
 
     // --- Phase A (UNTIMED): self-derive REAL block boundaries + correct dicts. ---
     // Do NOT trust the speculative pass's published window keys for span starts:
-    // some are not confirmed block boundaries, so decode_chunk_isal starting
+    // some are not confirmed block boundaries, so decode_chunk starting
     // there misreads random bits as a block header ("Stored block len=0"). Chain
-    // from the decoder's OWN returned end bit instead — decode_chunk_isal stops
+    // from the decoder's OWN returned end bit instead — decode_chunk stops
     // at a real block boundary at-or-past stop_hint and reports it
     // (encoded_offset_bits + encoded_size_bits), so the next span begins at a
     // guaranteed-valid boundary with the true trailing 32 KiB as its dict. This
@@ -326,7 +324,7 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
             starts.push(cur);
             dicts.push(prev_tail.clone());
             let stop_hint = (cur + STRIDE_BITS).min(total_bits);
-            let c = crate::decompress::parallel::gzip_chunk::decode_chunk_isal(
+            let c = crate::decompress::parallel::gzip_chunk::decode_chunk(
                 input,
                 cur,
                 stop_hint,
@@ -360,7 +358,7 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
     // A purpose-built clean-parallel driver that BYPASSES the speculative
     // scheduler (block_finder / prefetcher / block_map) entirely — those
     // carry tight invariants a hand-seeded partition violates. We dispatch
-    // one clean `decode_chunk_isal` per span across `pool_size` workers and
+    // one clean `decode_chunk` per span across `pool_size` workers and
     // write results in order. This isolates EXACTLY the clean-parallel
     // ceiling: pure-Rust inner decode × parallelism + the in-order consumer
     // write, with ZERO marker / bootstrap / narrow / absorb cost. It is the
@@ -392,7 +390,7 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
                     let start_bit = starts[span_idx];
                     let stop_hint = starts.get(span_idx + 1).copied().unwrap_or(total_bits);
                     let dict: &[u8] = &dicts[span_idx];
-                    let r = crate::decompress::parallel::gzip_chunk::decode_chunk_isal(
+                    let r = crate::decompress::parallel::gzip_chunk::decode_chunk(
                         input,
                         start_bit,
                         stop_hint,
@@ -2023,7 +2021,7 @@ fn submit_post_process_to_pool(
 }
 
 /// Pool-side execution of a decode task (vendor `decodeBlock`,
-/// GzipChunkFetcher.hpp:692-729). Routes to `decode_chunk_isal`
+/// GzipChunkFetcher.hpp:692-729). Routes to `decode_chunk`
 /// when the predecessor window is published, else
 /// `speculative_decode_find_boundary` (marker bootstrap when no window).
 #[cfg(parallel_sm)]
@@ -2133,7 +2131,7 @@ fn run_decode_task(
     // and the post-process queue do the synchronization.
     // Chunk-0 special case: predecessor window is the zero sentinel.
     // Hold the materialized bytes on the stack so the
-    // `decode_chunk_isal` slice borrow is valid for the call's
+    // `decode_chunk` slice borrow is valid for the call's
     // duration without going through WindowMap. Non-chunk-0 worker
     // gets the predecessor window via exact `get(start_bit)` or, when the
     // tail is keyed at the prior chunk's end, `get_predecessor(start_bit)`.
@@ -2183,7 +2181,7 @@ fn run_decode_task(
     );
 
     let chunk_result = if params.start_bit == 0 {
-        decode_chunk_isal(
+        decode_chunk(
             input_bytes,
             params.start_bit,
             params.stop_hint_bit,
@@ -2192,7 +2190,7 @@ fn run_decode_task(
         )
     } else if let Some(w) = window_exact.as_ref() {
         let bytes = materialize_window(w);
-        decode_chunk_isal(
+        decode_chunk(
             input_bytes,
             params.start_bit,
             params.stop_hint_bit,
@@ -2201,7 +2199,7 @@ fn run_decode_task(
         )
     } else if let Some(w) = window_pred.as_ref() {
         let bytes = materialize_window(w);
-        match decode_chunk_isal(
+        match decode_chunk(
             input_bytes,
             params.start_bit,
             params.stop_hint_bit,
@@ -2264,7 +2262,7 @@ fn run_decode_task(
     //  2. ACCEPT DETERMINISM. We publish ONLY when
     //     `max_acceptable_start_bit == encoded_offset_bits` — i.e. the
     //     chunk decoded at an EXACT confirmed offset, not a speculative
-    //     RANGE. These are (a) fast-path `decode_chunk_isal` chunks
+    //     RANGE. These are (a) fast-path `decode_chunk` chunks
     //     (window known) and (b) marker-bootstrap chunks whose partition
     //     seed already WAS the real boundary (`try_speculative_decode_
     //     candidate` widens `max` past `encoded` only when
@@ -2666,14 +2664,14 @@ pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
 /// rejected it (mismatch between `chunk.max_acceptable_start_bit` and
 /// consumer-requested `next_block_offset`) — distinct from
 /// `prefetch_cache_miss`, which counts a prefetch being absent.
-/// Worker took the clean `decode_chunk_isal` path using
+/// Worker took the clean `decode_chunk` path using
 /// `WindowMap::get_predecessor` (predecessor published at prior chunk end,
 /// not at this chunk's partition seed).
 pub static CLEAN_DECODE_VIA_PREDECESSOR: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// `try_speculative_decode_candidate` skipped marker bootstrap via clean
-/// `decode_chunk_isal` at a real boundary with the predecessor dict.
+/// `decode_chunk` at a real boundary with the predecessor dict.
 pub static SPEC_DECODE_CLEAN_OK: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -2768,7 +2766,7 @@ fn eager_postproc_enabled() -> bool {
 }
 
 /// Speculative try-decode at a block-finder candidate (vendor `tryToDecode`).
-/// When `pred_window` is `Some`, attempt clean [`decode_chunk_isal`] first —
+/// When `pred_window` is `Some`, attempt clean [`decode_chunk`] first —
 /// a real boundary with the predecessor dict skips the marker bootstrap.
 #[cfg(parallel_sm)]
 fn try_speculative_decode_candidate(
@@ -2784,7 +2782,7 @@ fn try_speculative_decode_candidate(
     // dict mis-decodes false-positive finder candidates (CRC mismatch).
     let result = if let Some(w) = window_map.get(decode_start) {
         let pw = materialize_window(&w);
-        match decode_chunk_isal(
+        match decode_chunk(
             input,
             decode_start,
             stop_hint_bit,
@@ -2798,22 +2796,12 @@ fn try_speculative_decode_candidate(
                 SPEC_DECODE_CLEAN_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(chunk)
             }
-            Ok(_) | Err(_) => decode_chunk_marker_bootstrap_then_isal(
-                input,
-                decode_start,
-                stop_hint_bit,
-                &[],
-                configuration,
-            ),
+            Ok(_) | Err(_) => {
+                decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration)
+            }
         }
     } else {
-        decode_chunk_marker_bootstrap_then_isal(
-            input,
-            decode_start,
-            stop_hint_bit,
-            &[],
-            configuration,
-        )
+        decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration)
     };
     // V1: classify failures so we know which fix to attack.
     //   header_fail  → "deflate header at bit X" — could be caught by
@@ -2848,7 +2836,7 @@ fn try_speculative_decode_candidate(
     }
     let mut chunk = result?;
     // (Design B) Record the encoded bit the worker decoded byte 0 from.
-    // `decode_chunk_marker_bootstrap_then_isal` anchored the chunk at
+    // `decode_chunk_window_absent` anchored the chunk at
     // `decode_start`, so that is the true origin regardless of the
     // partition-seed rewrite below.
     chunk.decode_origin_bit = decode_start;

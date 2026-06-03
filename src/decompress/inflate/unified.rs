@@ -29,15 +29,6 @@
 //!   exist as `pub(crate)` placeholders; promoted to `pub` per the
 //!   builder methods that select them.
 //!
-//! ## Routing kill-switch
-//!
-//! Per plan §1 + §3: callers that go through `Inflate` honor the runtime
-//! env-var `GZIPPY_LEGACY_INFLATE=1` for sub-second ops rollback to the
-//! legacy `ResumableInflate2` path. Today the new path IS the legacy
-//! path (delegation), so the env-var is a no-op at runtime; the routing
-//! exists structurally so commit 2 (full reimplementation) doesn't have
-//! to add it under perf pressure.
-//!
 //! ## Counter for routing-trap test
 //!
 //! [`UNIFIED_INFLATE_RUNS`] increments on every `read_stream` call that
@@ -192,30 +183,12 @@ impl OutputModel for OwnedOutput {
 // Routing counters (Step 2.5 instrumentation pattern)
 // =============================================================================
 
-/// Incremented on every `Inflate::read_stream` call that runs the unified
-/// path. Stays at zero when the `GZIPPY_LEGACY_INFLATE=1` env-var kill-
-/// switch redirects to the legacy `ResumableInflate2` direct path.
+/// Incremented on every `Inflate::read_stream` / `read_stream_starting_at`
+/// call (delegates to [`ResumableInflate2`] today).
 ///
-/// Read by `tests::unified_routing_traps` to prove the new path is wired
-/// into production code, not just present as dead code (mirrors the
-/// `MARKER_PIPELINE_RUNS` deletion-trap pattern in
-/// `src/decompress/parallel/single_member.rs`).
+/// Read by routing-trap tests to prove production chunk decode uses the
+/// unified inflate surface (mirrors `MARKER_PIPELINE_RUNS`).
 pub static UNIFIED_INFLATE_RUNS: AtomicU64 = AtomicU64::new(0);
-
-/// Incremented when the kill-switch redirects a call back to the legacy
-/// path. Should be zero in production; non-zero only when an operator has
-/// explicitly set `GZIPPY_LEGACY_INFLATE=1`.
-pub static LEGACY_FALLBACK_RUNS: AtomicU64 = AtomicU64::new(0);
-
-#[inline]
-fn legacy_kill_switch_active() -> bool {
-    // Cached once at process start; re-evaluating per call would be a
-    // hot-path tax. The env-var is operator-controlled and not expected
-    // to flip mid-run; if it does, the operator restarts the process.
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var("GZIPPY_LEGACY_INFLATE").is_ok())
-}
 
 // =============================================================================
 // Inflate<M, A, O> — the day-one type with one wired monomorphisation
@@ -289,11 +262,7 @@ impl<'a> Inflate<'a, Clean, Generic, Streaming> {
     /// phase 2 the inner call becomes a direct port; the surface stays
     /// identical.
     pub fn read_stream(&mut self, output: &mut [u8]) -> std::io::Result<InflateStreamResult> {
-        if legacy_kill_switch_active() {
-            LEGACY_FALLBACK_RUNS.fetch_add(1, Ordering::Relaxed);
-        } else {
-            UNIFIED_INFLATE_RUNS.fetch_add(1, Ordering::Relaxed);
-        }
+        UNIFIED_INFLATE_RUNS.fetch_add(1, Ordering::Relaxed);
         self.inner.read_stream(output)
     }
 
@@ -312,11 +281,7 @@ impl<'a> Inflate<'a, Clean, Generic, Streaming> {
         output: &mut [u8],
         out_pos_start: usize,
     ) -> std::io::Result<InflateStreamResult> {
-        if legacy_kill_switch_active() {
-            LEGACY_FALLBACK_RUNS.fetch_add(1, Ordering::Relaxed);
-        } else {
-            UNIFIED_INFLATE_RUNS.fetch_add(1, Ordering::Relaxed);
-        }
+        UNIFIED_INFLATE_RUNS.fetch_add(1, Ordering::Relaxed);
         self.inner.read_stream_starting_at(output, out_pos_start)
     }
 
@@ -405,14 +370,6 @@ mod tests {
         assert_eq!(inflate.bit_position(), 0);
     }
 
-    /// The kill-switch counter wiring works.
-    /// - With env-var unset: UNIFIED_INFLATE_RUNS increments per call.
-    /// - With env-var set: LEGACY_FALLBACK_RUNS increments instead.
-    ///
-    /// The kill-switch is OnceLock-cached so we can't toggle it mid-test;
-    /// here we just verify the unset (production) path increments the
-    /// right counter. The legacy-fallback branch is exercised when an
-    /// operator sets the env-var at process start.
     #[test]
     fn unified_inflate_runs_counter_increments() {
         // Build a tiny deflate stream we can decode.
@@ -434,16 +391,9 @@ mod tests {
         let after = UNIFIED_INFLATE_RUNS.load(Ordering::Relaxed);
 
         assert_eq!(&out[..r.bytes_written], b"hello unified");
-        // Routing-trap assertion: either the unified counter incremented
-        // OR the legacy counter incremented (the operator set the
-        // kill-switch). The test passes either way — what we're checking
-        // is that at least one of the routing paths is wired and counts.
-        let legacy_after = LEGACY_FALLBACK_RUNS.load(Ordering::Relaxed);
         assert!(
-            after > before || legacy_after > 0,
-            "neither UNIFIED_INFLATE_RUNS (was {before}, now {after}) nor \
-             LEGACY_FALLBACK_RUNS (now {legacy_after}) incremented — \
-             routing is dead"
+            after > before,
+            "UNIFIED_INFLATE_RUNS did not increment (was {before}, now {after})"
         );
     }
 
