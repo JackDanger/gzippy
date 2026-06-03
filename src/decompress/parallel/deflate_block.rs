@@ -1962,6 +1962,12 @@ impl Block {
                                 // LENGTH+DISTANCE path (mirror of
                                 // resumable.rs:1309-1354).
                                 let length = entry.decode_length(saved_bitbuf) as usize;
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                                    let idx = pos.wrapping_sub(32) & (RING_SIZE - 1);
+                                    _mm_prefetch(ring_ptr.add(idx) as *const i8, _MM_HINT_T0);
+                                }
                                 let dist_saved = bits.bitbuf;
                                 let mut dist_entry = dist.lookup(dist_saved);
                                 if dist_entry.is_subtable_ptr() {
