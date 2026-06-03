@@ -897,10 +897,9 @@ fn drive_impl<W: std::io::Write>(
             RESOLVE_AHEAD_ATTEMPTS.load(Ordering::Relaxed),
         );
         eprintln!(
-            "  Arc::try_unwrap hits/misses/inflight_recv: {} / {} / {}",
+            "  Arc::try_unwrap hits/misses: {} / {}",
             ARC_TRY_UNWRAP_HITS.load(Ordering::Relaxed),
             ARC_TRY_UNWRAP_MISSES.load(Ordering::Relaxed),
-            ARC_TRY_UNWRAP_INFLIGHT_REUSE.load(Ordering::Relaxed),
         );
     }
 
@@ -1369,7 +1368,6 @@ fn consumer_loop<W: std::io::Write>(
         // Take ownership when we hold the only Arc; otherwise clone the
         // inner ChunkData. Mirror of rapidgzip's shared_ptr aliasing at
         // GzipChunkFetcher.hpp:329.
-        let mut eager_postprocessed_at_take = false;
         let mut chunk: ChunkData = {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.arc_take_or_clone");
             match Arc::try_unwrap(chunk_arc) {
@@ -1377,26 +1375,9 @@ fn consumer_loop<W: std::io::Write>(
                     ARC_TRY_UNWRAP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     c
                 }
-                Err(arc) => {
-                    let real_offset = arc.encoded_offset_bits;
-                    if let Some((_pred_key, rx)) = prefetch_post_inflight.remove(&real_offset) {
-                        ARC_TRY_UNWRAP_INFLIGHT_REUSE
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        match rx.recv() {
-                            Ok(c) => {
-                                eager_postprocessed_at_take = true;
-                                c
-                            }
-                            Err(_) => {
-                                ARC_TRY_UNWRAP_MISSES
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                (*arc).clone()
-                            }
-                        }
-                    } else {
-                        ARC_TRY_UNWRAP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        (*arc).clone()
-                    }
+                Err(a) => {
+                    ARC_TRY_UNWRAP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    (*a).clone()
                 }
             }
         };
@@ -1651,14 +1632,6 @@ fn consumer_loop<W: std::io::Write>(
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.dispatch_post_process");
             match predecessor_window_for_postprocess {
-                Some(window) if eager_postprocessed_at_take => {
-                    pending.push_back(PendingWrite::Ready {
-                        idx: partition_idx_for_trace,
-                        chunk,
-                        cache_key: next_block_offset,
-                        handoff_bit,
-                    });
-                }
                 Some(window) => {
                     use std::sync::atomic::Ordering;
                     let reuse = match prefetch_post_inflight.remove(&chunk_offset_pre_set) {
@@ -2834,10 +2807,6 @@ pub static POST_PROCESS_SMALL_MARKERS_PATH: std::sync::atomic::AtomicU64 =
 /// to a deep clone (MISSES). Goal: HITS == chunk count, MISSES == 0.
 pub static ARC_TRY_UNWRAP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ARC_TRY_UNWRAP_MISSES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// `try_unwrap` missed because resolve-ahead post-process still held an
-/// `Arc`, but we waited on its `rx` instead of deep-cloning `ChunkData`.
-pub static ARC_TRY_UNWRAP_INFLIGHT_REUSE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Eager post-process bookkeeping: maps a prefetched chunk's real
