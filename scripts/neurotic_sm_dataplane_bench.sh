@@ -14,6 +14,8 @@ set -euo pipefail
 NEUROTIC_SSH=(ssh -o ConnectTimeout=15 -J neurotic root@REDACTED_IP)
 BRANCH="${BRANCH:-$(git rev-parse --abbrev-ref HEAD)}"
 ROUNDS="${ROUNDS:-7}"
+FULCRUM_BIN="${FULCRUM_BIN:-${HOME}/www/fulcrum/target/release/fulcrum}"
+export PATH="${FULCRUM_BIN%/*}:${PATH}"
 # Pinned P-cores for T8 (TESTING.md headline cell). Not passed via ssh argv — commas/spaces split.
 PIN_MASK="${PIN_MASK:-0,2,4,6,8,10,12,14}"
 
