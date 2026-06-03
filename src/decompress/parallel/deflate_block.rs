@@ -154,6 +154,22 @@ pub mod marker_instr {
     /// Number of emit_backref_ring calls classified (window-absent path).
     pub static BR_CALLS: AtomicU64 = AtomicU64::new(0);
 
+    /// Tri-state cache: 0 unknown, 1 hot (knob/stats on), 2 cold (production).
+    static INSTR_HOT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    #[inline(always)]
+    fn instr_hot() -> bool {
+        match INSTR_HOT.load(Ordering::Relaxed) {
+            0 => {
+                let hot = slow_marker_ns() > 0 || stats_on();
+                INSTR_HOT.store(if hot { 1 } else { 2 }, Ordering::Relaxed);
+                hot
+            }
+            1 => true,
+            _ => false,
+        }
+    }
+
     #[inline]
     pub fn slow_marker_ns() -> u64 {
         let v = SLOW_MARKER_NS.load(Ordering::Relaxed);
@@ -267,6 +283,19 @@ pub mod marker_instr {
     /// approximation is immaterial to the aggregate fraction.
     #[inline]
     pub fn classify_and_delay(
+        distance: usize,
+        length: usize,
+        distance_marker: usize,
+        decoded_in_chunk: usize,
+    ) {
+        if !instr_hot() {
+            return;
+        }
+        classify_and_delay_cold(distance, length, distance_marker, decoded_in_chunk);
+    }
+
+    #[cold]
+    fn classify_and_delay_cold(
         distance: usize,
         length: usize,
         distance_marker: usize,
@@ -2241,22 +2270,25 @@ unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
         let src_round_fits = src_phys + rounded <= RING_SIZE;
         let dst_round_fits = dst_phys + rounded <= RING_SIZE;
         if distance >= 4 && src_round_fits && dst_round_fits {
-            // UNCONDITIONAL fixed-stride word copy (no `length`-dependent
-            // branch on the hot path). One 8-byte (4-u16) word covers
-            // length 4; a second covers length ≤ 8; the loop handles the
-            // long tail. Writes exactly `rounded` (≥ length) u16.
-            let mut s = ring_ptr.add(src_phys) as *const u8;
-            let mut d = ring_ptr.add(dst_phys) as *mut u8;
-            let dend = (ring_ptr.add(dst_phys + rounded)) as *mut u8;
-            // First word always valid (rounded >= 4 u16 = 8 bytes since
-            // length >= 1; the non-overlap branch only sees length >= 3).
+            // One 8-byte word covers length ≤ 4; a second covers 5–8; the
+            // loop handles the rare long tail (≥ 9 u16).
+            let s = ring_ptr.add(src_phys) as *const u8;
+            let d = ring_ptr.add(dst_phys) as *mut u8;
             (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
-            s = s.add(8);
-            d = d.add(8);
-            while d < dend {
-                (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
-                s = s.add(8);
-                d = d.add(8);
+            if length > 4 {
+                if length <= 8 {
+                    (d.add(8) as *mut u64)
+                        .write_unaligned((s.add(8) as *const u64).read_unaligned());
+                } else {
+                    let mut s = s.add(8);
+                    let mut d = d.add(8);
+                    let dend = (ring_ptr.add(dst_phys + rounded)) as *mut u8;
+                    while d < dend {
+                        (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
+                        s = s.add(8);
+                        d = d.add(8);
+                    }
+                }
             }
         } else if src_phys + length <= RING_SIZE && dst_phys + length <= RING_SIZE {
             // Non-wrap but distance < 4 (would alias a word stride): exact
@@ -2331,18 +2363,26 @@ unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
             *distance_marker += length;
             return;
         }
-        // Scan backward through the just-written `length` bytes for
-        // any marker (value >= MARKER_BASE = MAX_WINDOW_SIZE). The
-        // earliest marker from the end determines the new counter
-        // value; if none, counter += length.
-        let mut k = 0usize;
-        while k < length {
-            let v = *ring_ptr.add((*pos - 1 - k) % RING_SIZE);
-            if v >= MAX_WINDOW_SIZE as u16 {
-                *distance_marker = k;
-                return;
+        // Scan backward through the just-written `length` u16 slots.
+        const MARKER_U16: u16 = MAX_WINDOW_SIZE as u16;
+        if dst_phys + length <= RING_SIZE {
+            let slice = std::slice::from_raw_parts(ring_ptr.add(dst_phys), length);
+            for (k, &v) in slice.iter().rev().enumerate() {
+                if v >= MARKER_U16 {
+                    *distance_marker = k;
+                    return;
+                }
             }
-            k += 1;
+        } else {
+            let mut k = 0usize;
+            while k < length {
+                let v = *ring_ptr.add((*pos - 1 - k) % RING_SIZE);
+                if v >= MARKER_U16 {
+                    *distance_marker = k;
+                    return;
+                }
+                k += 1;
+            }
         }
         *distance_marker += length;
     }
