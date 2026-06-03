@@ -892,7 +892,7 @@ fn drive_impl<W: std::io::Write>(
             SPEC_DECODE_CLEAN_OK.load(Ordering::Relaxed),
         );
         eprintln!(
-            "  Worker resolve-ahead (GZIPPY_RESOLVE_AHEAD): ok={} / attempts={}",
+            "  Worker resolve-ahead: ok={} / attempts={}",
             RESOLVE_AHEAD_OK.load(Ordering::Relaxed),
             RESOLVE_AHEAD_ATTEMPTS.load(Ordering::Relaxed),
         );
@@ -1422,7 +1422,9 @@ fn consumer_loop<W: std::io::Write>(
                 "consumer.window_publish_clean",
                 &format!(r#""end_bit":{chunk_end_bit},"had_markers":false"#),
             );
-            if let Some((_pred_key, pred)) = window_map.get_predecessor(chunk.encoded_offset_bits) {
+            if let Some((_pred_key, pred)) =
+                predecessor_window_for_markers(window_map, chunk.encoded_offset_bits)
+            {
                 let bytes = materialize_window(&pred);
                 let tail = chunk
                     .last_32kib_window_vec()
@@ -1440,9 +1442,9 @@ fn consumer_loop<W: std::io::Write>(
             }
             predecessor_window_for_postprocess = None;
         } else if chunk.markers_resolved {
-            // Worker resolve-ahead (`GZIPPY_RESOLVE_AHEAD`): apply_window,
-            // narrow, subchunk windows, and tail publish already ran on the
-            // decode worker when the confirmed predecessor window existed.
+            // Worker resolve-ahead: apply_window + narrow + tail publish already
+            // ran when the confirmed handoff window existed at decode return.
+            resolve_ahead_prefetch_at_handoff(block_fetcher, window_map, chunk_end_bit);
             predecessor_window_for_postprocess = None;
         } else {
             // Vendor `waitForReplacedMarkers` (GzipChunkFetcher.hpp:478-518)
@@ -1510,12 +1512,13 @@ fn consumer_loop<W: std::io::Write>(
                 "consumer.window_publish_marker",
                 &format!(r#""end_bit":{chunk_end_bit},"had_markers":true"#),
             );
-            let (pred_key, window) = window_map
-                .get_predecessor(chunk.encoded_offset_bits)
-                .ok_or(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
-                    requested: chunk.encoded_offset_bits,
-                    actual: furthest_decoded_bit,
-                }))?;
+            let (pred_key, window) =
+                predecessor_window_for_markers(window_map, chunk.encoded_offset_bits).ok_or(
+                    FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+                        requested: chunk.encoded_offset_bits,
+                        actual: furthest_decoded_bit,
+                    }),
+                )?;
             consumer_pred_key = Some(pred_key);
             // Vendor `GzipChunkFetcher.hpp:341`: `sharedLastWindow->
             // decompress()` materializes the bytes once. For
@@ -1974,12 +1977,10 @@ fn eager_postprocess_prefetched(
         // crux correctness invariant. Range-lookup `get_predecessor` would
         // silently return a stale earlier window when the true predecessor
         // hasn't been published yet, corrupting the chunk.
-        if !window_map.contains(resolve_offset) {
+        let Some((pred_key, predecessor_window)) =
+            confirmed_predecessor_window(window_map, resolve_offset)
+        else {
             continue;
-        }
-        let (pred_key, predecessor_window) = match window_map.get(resolve_offset) {
-            Some(w) => (resolve_offset, w),
-            None => continue,
         };
 
         // Vendor :549 — submit apply_window. Operate on a CLONE so the
@@ -2365,6 +2366,16 @@ fn run_decode_task(
         );
     }
 
+    let chunk_result = match chunk_result {
+        Ok(mut chunk) => {
+            if chunk_may_resolve_markers_early(&chunk) {
+                let _ = try_worker_resolve_ahead(&mut chunk, window_map);
+            }
+            Ok(chunk)
+        }
+        Err(e) => Err(e),
+    };
+
     if let Ok(ref chunk) = chunk_result {
         if chunk.max_acceptable_start_bit == chunk.encoded_offset_bits
             && chunk.encoded_size_bits > 0
@@ -2490,34 +2501,24 @@ fn resolve_chunk_markers_on_chunk(chunk: &mut ChunkData, predecessor_window: &[u
     chunk.recycle_markers_after_resolution();
 }
 
-/// True unless `GZIPPY_RESOLVE_AHEAD=0`. Default follows
-/// [`crate::decompress::parallel::sm_cfg::RESOLVE_AHEAD_DEFAULT`] (ON).
-/// Worker-side port of vendor `queuePrefetchedChunkPostProcessing`.
+/// Predecessor window for marker `apply_window` — vendor `WindowMap::get(*nextBlockOffset)`
+/// (GzipChunkFetcher.hpp:478-518), exact confirmed handoff key only.
 #[cfg(parallel_sm)]
-fn resolve_ahead_enabled() -> bool {
-    let read = || match std::env::var_os("GZIPPY_RESOLVE_AHEAD") {
-        Some(v) => v != "0" && v != "false",
-        None => crate::decompress::parallel::sm_cfg::RESOLVE_AHEAD_DEFAULT,
-    };
-    // Tests flip the env between A/B runs in one process; production caches once.
-    #[cfg(test)]
-    {
-        return read();
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::atomic::{AtomicU8, Ordering};
-        static CACHED: AtomicU8 = AtomicU8::new(0);
-        match CACHED.load(Ordering::Relaxed) {
-            1 => false,
-            2 => true,
-            _ => {
-                let on = read();
-                CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-                on
-            }
-        }
-    }
+fn confirmed_predecessor_window(
+    window_map: &WindowMap,
+    handoff_bit: usize,
+) -> Option<(usize, Window)> {
+    window_map.get(handoff_bit).map(|w| (handoff_bit, w))
+}
+
+/// Exact handoff window when published; else largest key ≤ `handoff_bit` (spacing overshoot).
+#[cfg(parallel_sm)]
+fn predecessor_window_for_markers(
+    window_map: &WindowMap,
+    handoff_bit: usize,
+) -> Option<(usize, Window)> {
+    confirmed_predecessor_window(window_map, handoff_bit)
+        .or_else(|| window_map.get_predecessor(handoff_bit))
 }
 
 /// Marker chunks safe for worker resolve-ahead: decode anchored at
@@ -2542,13 +2543,8 @@ fn try_worker_resolve_ahead(chunk: &mut ChunkData, window_map: &WindowMap) -> bo
         return false;
     }
     let resolve_offset = chunk.max_acceptable_start_bit;
-    if !window_map.contains(resolve_offset) {
-        return false;
-    }
     RESOLVE_AHEAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-    // Exact handoff key — `contains(resolve_offset)` was checked. Do not use
-    // `get_predecessor` here: it can return a strictly-earlier tail.
-    let Some(pred_w) = window_map.get(resolve_offset) else {
+    let Some((_, pred_w)) = confirmed_predecessor_window(window_map, resolve_offset) else {
         return false;
     };
     let _tv2 = trace_v2::SpanGuard::begin_with(
@@ -2595,7 +2591,7 @@ fn resolve_ahead_prefetch_at_handoff(
     window_map: &WindowMap,
     handoff_key: usize,
 ) {
-    if !resolve_ahead_enabled() || !window_map.contains(handoff_key) {
+    if !window_map.contains(handoff_key) {
         return;
     }
     block_fetcher.process_ready_prefetches();
@@ -2812,7 +2808,7 @@ pub static EARLY_SPEC_PUBLISHED: std::sync::atomic::AtomicU64 =
 pub static EARLY_SPEC_PROMOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static EARLY_SPEC_EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Worker resolve-ahead (`GZIPPY_RESOLVE_AHEAD=1`): attempts / successes.
+/// Worker resolve-ahead: attempts / successes.
 pub static RESOLVE_AHEAD_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static RESOLVE_AHEAD_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3426,11 +3422,10 @@ mod tests {
         enc.finish().unwrap()
     }
 
-    /// Low-entropy gzip forces window-absent marker bootstrap; resolve-ahead
-    /// must not change bytes vs the default-off path.
+    /// Low-entropy deflate forces window-absent marker bootstrap; worker
+    /// resolve-ahead must still produce byte-exact output.
     #[test]
-    fn drive_resolve_ahead_byte_identical_to_off() {
-        // Low-entropy → many window-absent chunks (same shape as silesia-large trap tests).
+    fn drive_handoff_marker_resolve_low_entropy() {
         let payload = vec![0x42u8; 32 * 1024 * 1024];
         let deflate = make_deflate(&payload, 6);
         let cfg = ChunkConfiguration {
@@ -3438,20 +3433,10 @@ mod tests {
             max_decoded_chunk_size: 64 * 1024 * 1024,
             crc32_enabled: true,
         };
-        let mut out_off = Vec::new();
-        std::env::remove_var("GZIPPY_RESOLVE_AHEAD");
-        let (_crc0, n0) = drive(&deflate, &mut out_off, None, 8, cfg).expect("drive off");
-        RESOLVE_AHEAD_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
-        RESOLVE_AHEAD_OK.store(0, std::sync::atomic::Ordering::Relaxed);
-        let mut out_on = Vec::new();
-        std::env::set_var("GZIPPY_RESOLVE_AHEAD", "1");
-        let (_crc1, n1) = drive(&deflate, &mut out_on, None, 8, cfg).expect("drive on");
-        std::env::remove_var("GZIPPY_RESOLVE_AHEAD");
-        assert_eq!(n0, payload.len());
-        assert_eq!(n1, payload.len());
-        assert_eq!(out_off, payload);
-        assert_eq!(out_on, payload);
-        assert_eq!(out_off, out_on);
+        let mut out = Vec::new();
+        let (_crc, n) = drive(&deflate, &mut out, None, 8, cfg).expect("drive");
+        assert_eq!(n, payload.len());
+        assert_eq!(out, payload);
     }
 
     #[test]

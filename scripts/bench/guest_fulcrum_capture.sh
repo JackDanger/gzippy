@@ -19,12 +19,10 @@ for a in "$@"; do
     BRANCH=*) BRANCH="${a#*=}";;
     THREADS=*) THREADS="$(echo "${a#*=}" | tr ',' ' ')";;
     N=*) N="${a#*=}";;
-    RESOLVE_AHEAD=*) GZIPPY_RESOLVE_AHEAD="${a#*=}";;
     SLOW_BOOTSTRAP=*) GZIPPY_SLOW_BOOTSTRAP="${a#*=}";;
   esac
 done
 # Optional experiment knobs (env or host_lock arguments).
-GZIPPY_RESOLVE_AHEAD="${GZIPPY_RESOLVE_AHEAD:-}"
 GZIPPY_SLOW_BOOTSTRAP="${GZIPPY_SLOW_BOOTSTRAP:-}"
 [ "$N" -ge 9 ] || N=9
 
@@ -85,7 +83,7 @@ GZIPPY_SHA="$(git rev-parse HEAD)"
 RG_VER="$("$RG_TRACE" --version 2>&1 | head -1)"
 
 say "================ PROVENANCE ================"
-say "branch=$BRANCH head=$GZIPPY_SHA resolve_ahead=${GZIPPY_RESOLVE_AHEAD:-off} slow_bootstrap=${GZIPPY_SLOW_BOOTSTRAP:-off}"
+say "branch=$BRANCH head=$GZIPPY_SHA resolve_ahead=always slow_bootstrap=${GZIPPY_SLOW_BOOTSTRAP:-off}"
 say "rapidgzip-trace=$RG_VER"
 say "corpus=$CORPUS ref_sha=$REF_SHA raw_bytes=$RAW_BYTES"
 say "artifacts=$ARTDIR"
@@ -113,7 +111,6 @@ run_cmd_timed() {
 # Print argv prefix for gzippy wall/trace runs (pure-rust parallel SM). One line for $(…).
 gzippy_wall_cmd() {
   local parts="env GZIPPY_FORCE_PARALLEL_SM=1"
-  [ -n "$GZIPPY_RESOLVE_AHEAD" ] && parts="$parts GZIPPY_RESOLVE_AHEAD=$GZIPPY_RESOLVE_AHEAD"
   [ -n "$GZIPPY_SLOW_BOOTSTRAP" ] && parts="$parts GZIPPY_SLOW_BOOTSTRAP=$GZIPPY_SLOW_BOOTSTRAP"
   echo "$parts"
 }
@@ -187,7 +184,7 @@ cat >"$ARTDIR/manifest.json" <<MANIFEST
 {
   "branch": "$BRANCH",
   "head": "$GZIPPY_SHA",
-  "resolve_ahead": "${GZIPPY_RESOLVE_AHEAD:-}",
+  "resolve_ahead": "always",
   "slow_bootstrap": "${GZIPPY_SLOW_BOOTSTRAP:-}",
   "ref_sha": "$REF_SHA",
   "raw_bytes": $RAW_BYTES,

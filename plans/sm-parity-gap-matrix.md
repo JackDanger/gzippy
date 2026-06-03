@@ -39,14 +39,14 @@
 
 **Vendor:** `queuePrefetchedChunkPostProcessing` — when predecessor window is confirmed, `applyWindow` runs on the **thread pool**, not the consumer stall.
 
-**gzippy (2026-06-03+):** resolve-ahead **default ON** (`RESOLVE_AHEAD_DEFAULT`); handoff chunks (`max == decode_origin`) eligible — was gated on `max == encoded` (inert). Resolve on prefetch when handoff key is published:
+**gzippy (2026-06-03+):** resolve-ahead is **always on** (vendor `queuePrefetchedChunkPostProcessing`, no env knob). Handoff chunks (`max == decode_origin`) eligible. Window lookup uses `WindowMap::get(handoff_key)` only when `contains(handoff_key)` — not `get_predecessor` at the same key (stale tail hazard).
 
-- Trigger: `resolve_ahead_prefetch_at_handoff` after confirmed `insert_owned_none` / promote (not at decode return).
-- Gate: `max == encoded` (exact chunk only), `max == handoff_key`, `contains(handoff_key)`, markers present.
+- Trigger: `try_worker_resolve_ahead` on decode return + `resolve_ahead_prefetch_at_handoff` after confirmed tail publish.
+- Gate: `chunk_may_resolve_markers_early`, `contains(max_acceptable_start_bit)`, markers present.
 - Runs `resolve_chunk_markers_on_chunk` + tail publish; sets `chunk.markers_resolved`.
-- Consumer skips `wait_replaced_markers`, `window_publish_marker`, and pool post-process for that chunk.
+- Consumer skips marker wait/post-process when `markers_resolved`.
 
-**Ship-gate:** Locked Fulcrum N≥9; `RESOLVE_AHEAD_OK` > 0; wall ↓ > spread; routing + corpus tests green.
+**Ship-gate:** Locked Fulcrum N≥9; `RESOLVE_AHEAD_OK` > 0; **0 sha diverge**; wall ↓ > spread.
 
 **Disproof:** Wall flat, only worker busy ↑ → decode-bound, not resolve-bound.
 
