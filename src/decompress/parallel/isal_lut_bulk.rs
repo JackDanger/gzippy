@@ -215,9 +215,32 @@ pub fn decode_block(
             return Err(BulkDecodeError::InvalidHuffmanCode);
         }
 
+        // ISA-L multi-symbol packing guarantees the first `sym_count - 1` packed
+        // symbols are LITERALS (only the LAST may be a length/EOB). Vendor writes
+        // them as one packed store; mirror that — batch the literal prefix with a
+        // SINGLE bounds check instead of the per-byte bounds-checked store the
+        // generic loop was doing (igzip_inflate.c decode_next: the packed bytes go
+        // out in one move, then `state->write_overflow_lits` advances by count).
+        let lit_prefix = (sym_count - 1) as usize;
+        if lit_prefix > 0 {
+            if *out_pos + lit_prefix > output.len() {
+                return Err(BulkDecodeError::OutputOverflow);
+            }
+            let mut p = *out_pos;
+            let mut s = symbol;
+            for _ in 0..lit_prefix {
+                output[p] = (s & 0xFF) as u8;
+                p += 1;
+                s >>= 8;
+            }
+            *out_pos = p;
+            symbol = s;
+            sym_count = 1;
+        }
+
         while sym_count > 0 {
             let code = (symbol & 0xFFFF) as u16;
-            if code as u32 <= 255 || sym_count > 1 {
+            if code as u32 <= 255 {
                 if *out_pos >= output.len() {
                     return Err(BulkDecodeError::OutputOverflow);
                 }
