@@ -22,11 +22,3 @@ pub const PURE_RUST_INFLATE_DECODE: bool = cfg!(pure_inflate_decode);
 /// (ISA-L's C library is x86-only); see `inflate_wrapper::IsalInflateWrapper`'s
 /// `#[cfg(pure_inflate_decode)]` backend.
 pub const PARALLEL_SM: bool = cfg!(parallel_sm);
-
-/// Post-bootstrap + bootstrap DYNAMIC table build use patched ISA-L C code.
-#[allow(dead_code)]
-pub const USE_ISAL_INFLATE: bool = cfg!(all(
-    feature = "isal-compression",
-    not(feature = "pure-rust-inflate"),
-    target_arch = "x86_64"
-));
