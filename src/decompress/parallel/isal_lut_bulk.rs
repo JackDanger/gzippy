@@ -379,6 +379,43 @@ fn build_fixed_huffman(scratch: &mut DecoderScratch) -> Result<(), BulkDecodeErr
     Ok(())
 }
 
+/// DEFLATE Huffman validity test (zlib `inflate_table` `left` accounting).
+/// `left` starts at 1 and, per length, doubles then subtracts the codes used.
+/// `left < 0` at any point ⇒ over-subscribed; `left > 0` at the end ⇒
+/// incomplete. The ISA-L LUT builder assumes a well-formed canonical code
+/// (vendor igzip only runs it on validated headers); a malformed length set —
+/// which a bad 4 MiB speculative seed produces from random header bits —
+/// corrupts the expanded code/bucket tables and indexes the short LUT out of
+/// bounds. `require_complete` is set for the litlen code (RFC 1951 requires it
+/// complete) and cleared for the distance code (a single distance code is a
+/// legal incomplete code). Returns true ⇒ reject, re-sync via
+/// `resumable_resync`.
+#[inline]
+fn huffman_lengths_invalid(lens: &[u8], require_complete: bool) -> bool {
+    let mut count = [0u32; 16];
+    for &l in lens {
+        if l > 15 {
+            return true;
+        }
+        if l != 0 {
+            count[l as usize] += 1;
+        }
+    }
+    let mut left: i64 = 1;
+    for len in 1..=15 {
+        left <<= 1;
+        left -= count[len] as i64;
+        if left < 0 {
+            return true; // over-subscribed
+        }
+    }
+    // `left > 0` is an incomplete code: legal in DEFLATE (a single distance
+    // code), so callers requiring completeness (litlen) opt in. The ISA-L
+    // builder additionally self-guards against the rare seed that passes this
+    // screen yet drives a LUT write out of range (see make_inflate_*).
+    require_complete && left != 0
+}
+
 fn build_dynamic_huffman(
     bits: &mut Bits<'_>,
     scratch: &mut DecoderScratch,
@@ -468,6 +505,22 @@ fn build_dynamic_huffman(
             }
             _ => return Err(BulkDecodeError::InvalidCodeLengths),
         }
+    }
+
+    // Reject an over-subscribed code BEFORE it reaches the ISA-L LUT builder.
+    // The builder (like vendor igzip, which only runs on validated headers)
+    // assumes a well-formed canonical code; an over-subscribed length set —
+    // which a bad 4 MiB speculative seed produces from random header bits —
+    // overflows `next_code[L]` past 2^L, corrupting the expanded code/bucket
+    // tables and indexing the short LUT out of bounds. Standard Kraft check:
+    // a valid prefix code never makes `left` go negative. (Incomplete codes,
+    // `left > 0` — e.g. a single-symbol distance code — are LEGAL and left to
+    // the builder; only over-subscription causes the overflow.) On rejection
+    // the chunk re-syncs via `resumable_resync`.
+    if huffman_lengths_invalid(&scratch.all_lens[..hlit], true)
+        || huffman_lengths_invalid(&scratch.all_lens[hlit..hlit + hdist], false)
+    {
+        return Err(BulkDecodeError::InvalidCodeLengths);
     }
 
     let litlen_lens_slice = &scratch.all_lens[..hlit];

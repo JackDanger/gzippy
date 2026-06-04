@@ -54,7 +54,7 @@ fn decode_consume_first(deflate: &[u8], out: &mut [u8]) -> usize {
         .expect("consume_first")
 }
 
-// Window-absent BOOTSTRAP decoder (`deflate_block::Block`) — the marker-path
+// Window-absent BOOTSTRAP decoder (`marker_inflate::Block`) — the marker-path
 // inner loop that decodes ~31% of silesia (the speculative window-absent
 // chunks) at ~175 MB/s in production. Decoding from offset 0 with no window
 // exercises the SAME per-symbol decode (IsalLitLenCodePure litlen +
@@ -64,7 +64,7 @@ fn decode_consume_first(deflate: &[u8], out: &mut [u8]) -> usize {
 #[cfg(feature = "pure-rust-inflate")]
 fn decode_bootstrap(deflate: &[u8], out16: &mut Vec<u16>) -> usize {
     use gzippy::decompress::inflate::consume_first_decode::Bits;
-    use gzippy::decompress::parallel::deflate_block::Block;
+    use gzippy::decompress::parallel::marker_inflate::Block;
     let mut block = Block::new();
     block.reset(None, None);
     let mut bits = Bits::new(deflate);
@@ -126,9 +126,9 @@ fn flat_copy_u8(out: &mut [u8], out_pos: usize, distance: usize, length: usize) 
 #[cfg(feature = "pure-rust-inflate")]
 fn decode_tbl_isal_u8(deflate: &[u8], out: &mut [u8]) -> usize {
     use gzippy::decompress::inflate::consume_first_decode::Bits;
-    use gzippy::decompress::parallel::deflate_block::{Block, END_OF_BLOCK_SYMBOL};
     use gzippy::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached;
     use gzippy::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure;
+    use gzippy::decompress::parallel::marker_inflate::{Block, END_OF_BLOCK_SYMBOL};
     use gzippy::decompress::parallel::rfc_tables::get_distance_dynamic;
 
     const MULTI_DISTANCE_OFFSET: u32 = 254;
@@ -209,9 +209,9 @@ fn decode_tbl_isal_u8(deflate: &[u8], out: &mut [u8]) -> usize {
 #[cfg(feature = "pure-rust-inflate")]
 fn decode_tbl_isal_u16(deflate: &[u8], out: &mut [u8]) -> usize {
     use gzippy::decompress::inflate::consume_first_decode::Bits;
-    use gzippy::decompress::parallel::deflate_block::{Block, END_OF_BLOCK_SYMBOL};
     use gzippy::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached;
     use gzippy::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure;
+    use gzippy::decompress::parallel::marker_inflate::{Block, END_OF_BLOCK_SYMBOL};
     use gzippy::decompress::parallel::rfc_tables::get_distance_dynamic;
 
     const MULTI_DISTANCE_OFFSET: u32 = 254;
@@ -353,7 +353,7 @@ fn decode_tbl_isal_u16(deflate: &[u8], out: &mut [u8]) -> usize {
 fn decode_clean_u8_nopack(deflate: &[u8], out: &mut [u8]) -> usize {
     use gzippy::decompress::inflate::consume_first_decode::Bits;
     use gzippy::decompress::inflate::libdeflate_entry::{DistTable, LitLenTable};
-    use gzippy::decompress::parallel::deflate_block::Block;
+    use gzippy::decompress::parallel::marker_inflate::Block;
 
     let mut bits = Bits::new(deflate);
     let mut header = Block::new();
