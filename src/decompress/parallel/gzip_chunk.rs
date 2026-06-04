@@ -109,6 +109,10 @@ pub static BULK_TAIL_SEGMENT_CONTINUES: std::sync::atomic::AtomicU64 =
 /// Bulk LUT declined; tail used ResumableInflate2 (should be rare with 32 KiB window).
 pub static BULK_TAIL_RESUMABLE_FALLBACK: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// `finish_clean_tail_decode` bulk loop saw `Handoff` with no bit advance (stall guard).
+#[cfg(pure_inflate_decode)]
+pub static BULK_HANDOFF_NO_PROGRESS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// Why [`finish_decode_chunk_bulk_lut`] returned [`BulkCleanTailResult::Decline`].
 #[cfg(pure_inflate_decode)]
 pub static BULK_LUT_ENTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -438,12 +442,9 @@ fn finish_decode_chunk_bulk_lut(
         let pred = &pred_buf[..pred_len];
         let cap = chunk.data.writable_tail().len();
         if cap == 0 {
-            return BulkCleanTailResult::Handoff {
-                start_bit: bits.bit_position(),
-                last_eob_pos,
-                last_eob_decoded_bytes,
-                pending_stop_after_flush,
-            };
+            // `writable_tail` must always have spare; cap==0 would make the
+            // parent Handoff loop spin with no bit/output progress.
+            return BulkCleanTailResult::Decline;
         }
         let mut local_pos = 0usize;
         while local_pos < cap && !stopping_point_reached {
@@ -582,27 +583,37 @@ fn finish_clean_tail_decode(
     // segment fills. Only fall back to ResumableInflate2 when bulk declines
     // (no 32 KiB lookback), not on every segment Handoff.
     #[cfg(pure_inflate_decode)]
-    loop {
-        match finish_decode_chunk_bulk_lut(
-            chunk,
-            input,
-            inflate_start_bit,
-            stop_hint_bits,
-            initial_window,
-        ) {
-            BulkCleanTailResult::Complete { final_bit } => {
-                if record_decode_duration {
-                    chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+    {
+        let mut bulk_handoffs: u32 = 0;
+        loop {
+            let bit_before = inflate_start_bit;
+            match finish_decode_chunk_bulk_lut(
+                chunk,
+                input,
+                inflate_start_bit,
+                stop_hint_bits,
+                initial_window,
+            ) {
+                BulkCleanTailResult::Complete { final_bit } => {
+                    if record_decode_duration {
+                        chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+                    }
+                    chunk.finalize(final_bit);
+                    return Ok(());
                 }
-                chunk.finalize(final_bit);
-                return Ok(());
+                BulkCleanTailResult::Handoff { start_bit, .. } => {
+                    bulk_handoffs = bulk_handoffs.saturating_add(1);
+                    BULK_TAIL_SEGMENT_CONTINUES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if start_bit == bit_before
+                        || bulk_handoffs > chunk.data.segment_count().saturating_mul(4) as u32 + 64
+                    {
+                        BULK_HANDOFF_NO_PROGRESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                    inflate_start_bit = start_bit;
+                }
+                BulkCleanTailResult::Decline => break,
             }
-            BulkCleanTailResult::Handoff { start_bit, .. } => {
-                BULK_TAIL_SEGMENT_CONTINUES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                inflate_start_bit = start_bit;
-                continue;
-            }
-            BulkCleanTailResult::Decline => break,
         }
     }
 
