@@ -487,9 +487,360 @@ fn build_dynamic_huffman(
     Ok(())
 }
 
+// ── Marker-emitting decode (window-absent fast loop) ────────────────────────
+//
+// The unified decoder's marker arm, folded INTO this fast-loop module so there
+// is ONE decoder: `decode_block` (flat u8, clean) and `MarkerRing` (u16 ring,
+// window-absent markers) share the same ISA-L LUT (`DecoderScratch`), the same
+// `build_*_huffman` header parse, and `decode_distance`. The u16 ring + the
+// pre-seeded marker zone (so cross-window markers fall out of one memcpy) +
+// `emit_backref_ring` are reused from `marker_inflate`. This retires the
+// separate `marker_inflate::Block` bootstrap engine from the production decode.
+//
+// Mirrors rapidgzip's single `deflate::Block<containsMarkerBytes>`: emit u16
+// markers while the predecessor window is absent, flip mid-stream to clean u16
+// once 32 KiB of clean output is reachable, all on one bit cursor.
+use crate::decompress::parallel::marker_inflate::{
+    emit_backref_ring, init_marker_zone, MarkerSink, RING_SIZE,
+};
+
+const MAX_RUN_LENGTH: usize = 258;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MarkerComp {
+    Stored,
+    Compressed,
+}
+
+/// Window-absent marker decoder: the marker arm of the unified fast loop.
+/// API mirrors the retired `marker_inflate::Block` so the chunk driver is a
+/// drop-in swap: `new`/`reset`/`read_header`/`read`/`eob`/`is_last_block`/
+/// `contains_marker_bytes`.
+pub struct MarkerRing {
+    ring: Box<[u16; RING_SIZE]>,
+    scratch: DecoderScratch,
+    ring_pos: usize,
+    ring_drained: usize,
+    decoded_bytes: usize,
+    distance_to_last_marker: usize,
+    contains_markers: bool,
+    at_eob: bool,
+    is_final: bool,
+    comp: MarkerComp,
+    stored_remaining: usize,
+}
+
+impl Default for MarkerRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MarkerRing {
+    pub fn new() -> Self {
+        let mut ring: Box<[u16; RING_SIZE]> = vec![0u16; RING_SIZE]
+            .into_boxed_slice()
+            .try_into()
+            .expect("RING_SIZE box");
+        init_marker_zone(&mut ring);
+        Self {
+            ring,
+            scratch: DecoderScratch::new(),
+            ring_pos: 0,
+            ring_drained: 0,
+            decoded_bytes: 0,
+            distance_to_last_marker: 0,
+            contains_markers: true,
+            at_eob: false,
+            is_final: false,
+            comp: MarkerComp::Compressed,
+            stored_remaining: 0,
+        }
+    }
+
+    /// Reset for a fresh chunk. Re-seeds the marker zone (clean bytes may have
+    /// overwritten it) and clears all decode state.
+    pub fn reset(&mut self) {
+        init_marker_zone(&mut self.ring);
+        self.ring_pos = 0;
+        self.ring_drained = 0;
+        self.decoded_bytes = 0;
+        self.distance_to_last_marker = 0;
+        self.contains_markers = true;
+        self.at_eob = false;
+        self.is_final = false;
+        self.comp = MarkerComp::Compressed;
+        self.stored_remaining = 0;
+    }
+
+    #[inline]
+    pub fn eob(&self) -> bool {
+        self.at_eob
+    }
+    #[inline]
+    pub fn is_last_block(&self) -> bool {
+        self.is_final
+    }
+    #[inline]
+    pub fn contains_marker_bytes(&self) -> bool {
+        self.contains_markers
+    }
+
+    /// Parse one block header (BFINAL + BTYPE) and build the Huffman tables
+    /// (or set up the stored-block payload). Mirrors `Block::read_header`.
+    pub fn read_header(&mut self, bits: &mut Bits<'_>) -> Result<(), BulkDecodeError> {
+        bits.refill();
+        let header_bits = bits.bitbuf & 0b111;
+        bits.consume(3);
+        self.is_final = (header_bits & 0b1) != 0;
+        self.at_eob = false;
+        match (header_bits >> 1) & 0b11 {
+            0b00 => {
+                bits.align_to_byte();
+                let len = bits.read_u16();
+                let nlen = bits.read_u16();
+                if len != !nlen {
+                    return Err(BulkDecodeError::InvalidCodeLengths);
+                }
+                self.comp = MarkerComp::Stored;
+                self.stored_remaining = len as usize;
+                if len == 0 {
+                    self.at_eob = true;
+                }
+            }
+            0b01 => {
+                build_fixed_huffman(&mut self.scratch)?;
+                self.comp = MarkerComp::Compressed;
+            }
+            0b10 => {
+                build_dynamic_huffman(bits, &mut self.scratch)?;
+                self.comp = MarkerComp::Compressed;
+            }
+            _ => return Err(BulkDecodeError::BlockTypeReserved),
+        }
+        Ok(())
+    }
+
+    fn drain_to(&mut self, output: &mut impl MarkerSink) {
+        let new_bytes = self.ring_pos - self.ring_drained;
+        if new_bytes == 0 {
+            return;
+        }
+        let start = self.ring_drained % RING_SIZE;
+        if start + new_bytes <= RING_SIZE {
+            output.push_slice(&self.ring[start..start + new_bytes]);
+        } else {
+            let end = (self.ring_drained + new_bytes) % RING_SIZE;
+            output.push_slice(&self.ring[start..]);
+            output.push_slice(&self.ring[..end]);
+        }
+        self.ring_drained = self.ring_pos;
+    }
+
+    #[inline]
+    fn maybe_flip(&mut self) {
+        if self.contains_markers
+            && (self.distance_to_last_marker >= RING_SIZE
+                || (self.distance_to_last_marker >= MAX_WINDOW_SIZE
+                    && self.distance_to_last_marker == self.decoded_bytes))
+        {
+            self.contains_markers = false;
+        }
+    }
+
+    /// Decode block body up to ~ring capacity, draining to `output`. Caller
+    /// loops while `!eob()`. Mirrors `Block::read` (+ drain + mid-decode flip).
+    pub fn read(
+        &mut self,
+        bits: &mut Bits<'_>,
+        output: &mut impl MarkerSink,
+    ) -> Result<usize, BulkDecodeError> {
+        if self.at_eob {
+            return Ok(0);
+        }
+        match self.comp {
+            MarkerComp::Stored => self.read_stored(bits, output),
+            MarkerComp::Compressed => self.read_compressed(bits, output),
+        }
+    }
+
+    fn read_stored(
+        &mut self,
+        bits: &mut Bits<'_>,
+        output: &mut impl MarkerSink,
+    ) -> Result<usize, BulkDecodeError> {
+        let to_read = self.stored_remaining.min(RING_SIZE - MAX_RUN_LENGTH);
+        let ring_ptr = self.ring.as_mut_ptr();
+        let mut pos = self.ring_pos;
+        for _ in 0..to_read {
+            if bits.available() < 8 {
+                bits.refill();
+                if bits.available() < 8 {
+                    self.ring_pos = pos;
+                    self.drain_to(output);
+                    return Err(BulkDecodeError::InvalidHuffmanCode);
+                }
+            }
+            let byte = (bits.peek() & 0xFF) as u16;
+            bits.consume(8);
+            // SAFETY: pos % RING_SIZE in bounds.
+            unsafe {
+                ring_ptr.add(pos % RING_SIZE).write(byte);
+            }
+            pos += 1;
+        }
+        self.ring_pos = pos;
+        self.decoded_bytes += to_read;
+        if self.contains_markers {
+            self.distance_to_last_marker += to_read;
+        }
+        self.stored_remaining -= to_read;
+        if self.stored_remaining == 0 {
+            self.at_eob = true;
+            self.maybe_flip();
+        }
+        self.drain_to(output);
+        Ok(to_read)
+    }
+
+    fn read_compressed(
+        &mut self,
+        bits: &mut Bits<'_>,
+        output: &mut impl MarkerSink,
+    ) -> Result<usize, BulkDecodeError> {
+        let n_max = RING_SIZE - MAX_RUN_LENGTH;
+        let ring_ptr = self.ring.as_mut_ptr();
+        let mut pos = self.ring_pos;
+        let mut emitted: usize = 0;
+        let mut distance_marker = self.distance_to_last_marker;
+        let contains = self.contains_markers;
+
+        macro_rules! commit_drain {
+            ($ret:expr) => {{
+                self.ring_pos = pos;
+                self.decoded_bytes += emitted;
+                self.distance_to_last_marker = distance_marker;
+                self.maybe_flip();
+                self.drain_to(output);
+                return $ret;
+            }};
+        }
+
+        while emitted < n_max {
+            bits.refill();
+            let d = self.scratch.litlen.decode(bits);
+            if d.bit_count == 0 {
+                commit_drain!(Err(BulkDecodeError::InvalidHuffmanCode));
+            }
+            bits.consume(d.bit_count);
+            let mut sym = d.symbol;
+            let mut sym_count = d.sym_count;
+            loop {
+                let code = (sym & 0xFFFF) as u16;
+                if code as u32 <= 255 || sym_count > 1 {
+                    // SAFETY: pos % RING_SIZE in bounds.
+                    unsafe {
+                        ring_ptr.add(pos % RING_SIZE).write(code & 0xFF);
+                    }
+                    pos += 1;
+                    emitted += 1;
+                    if contains {
+                        distance_marker += 1;
+                    }
+                    sym_count -= 1;
+                    if sym_count == 0 {
+                        break;
+                    }
+                    sym >>= 8;
+                    continue;
+                }
+                if code as u32 == END_OF_BLOCK_SYMBOL {
+                    self.at_eob = true;
+                    commit_drain!(Ok(emitted));
+                }
+                if code as u32 > MAX_LIT_LEN_SYM {
+                    commit_drain!(Err(BulkDecodeError::InvalidHuffmanCode));
+                }
+                let length = (code as usize).wrapping_sub(LENGTH_BASE_OFFSET as usize);
+                if length == 0 {
+                    break;
+                }
+                let distance = match decode_distance(bits, &self.scratch) {
+                    Ok(dd) => dd,
+                    Err(e) => commit_drain!(Err(e)),
+                };
+                if !contains && distance > self.decoded_bytes + emitted {
+                    commit_drain!(Err(BulkDecodeError::InvalidLookback));
+                }
+                // SAFETY: ring valid; n_max cap keeps pos+length within the
+                // preserved-history window; `contains` selects the const-generic
+                // marker maintenance.
+                unsafe {
+                    if contains {
+                        emit_backref_ring::<true>(
+                            ring_ptr,
+                            &mut pos,
+                            distance,
+                            length,
+                            &mut distance_marker,
+                        );
+                    } else {
+                        emit_backref_ring::<false>(
+                            ring_ptr,
+                            &mut pos,
+                            distance,
+                            length,
+                            &mut distance_marker,
+                        );
+                    }
+                }
+                emitted += length;
+                break;
+            }
+        }
+        commit_drain!(Ok(emitted));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MarkerRing offset-0 decode: no cross-window back-refs ⇒ no markers, all
+    /// clean u16 ⇒ narrowed must equal the payload. Validates the marker fast
+    /// loop (LUT + ring + drain + flip + stored) in isolation.
+    #[test]
+    fn marker_ring_round_trips_offset0() {
+        use std::io::Write;
+        for level in [0u32, 1, 6, 9] {
+            let payload = b"the quick brown fox jumps over the lazy dog 0123456789 ".repeat(3000);
+            let mut enc =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
+            enc.write_all(&payload).unwrap();
+            let deflate = enc.finish().unwrap();
+
+            let mut bits = Bits::new(&deflate);
+            bits.refill();
+            let mut mr = MarkerRing::new();
+            let mut out: Vec<u16> = Vec::new();
+            loop {
+                mr.read_header(&mut bits).expect("header");
+                while !mr.eob() {
+                    mr.read(&mut bits, &mut out).expect("read");
+                }
+                if mr.is_last_block() {
+                    break;
+                }
+            }
+            assert!(
+                out.iter().all(|&v| v < 0x8000),
+                "L{level}: unexpected markers in offset-0 decode"
+            );
+            let narrowed: Vec<u8> = out.iter().map(|&v| v as u8).collect();
+            assert_eq!(narrowed.len(), payload.len(), "L{level} length");
+            assert_eq!(narrowed, payload, "L{level} bytes");
+        }
+    }
 
     fn roundtrip(payload: &[u8], level: u32) {
         use std::io::Write;
