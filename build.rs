@@ -73,9 +73,15 @@ fn emit_parallel_sm_cfgs() {
     let has_isal_compression = std::env::var_os("CARGO_FEATURE_ISAL_COMPRESSION").is_some();
     let has_pure_rust_inflate = std::env::var_os("CARGO_FEATURE_PURE_RUST_INFLATE").is_some();
 
-    let pure_inflate_decode = (is_x86_64 || is_aarch64) && has_pure_rust_inflate;
     let parallel_sm = (is_x86_64 && (has_isal_compression || has_pure_rust_inflate))
         || (is_aarch64 && has_pure_rust_inflate);
+    // The pure-Rust inflate is now the SOLE decode engine: the C-FFI ISA-L
+    // decode wrapper has been deleted. So whenever the parallel-SM decode path
+    // is compiled, the pure-Rust decoder is the decoder. (The `isal-compression`
+    // feature keeps only the ISA-L *compression* backend; it no longer brings a
+    // C-FFI decode wrapper.)
+    let pure_inflate_decode = parallel_sm;
+    let _ = has_pure_rust_inflate;
 
     if parallel_sm {
         println!("cargo::rustc-cfg=parallel_sm");
