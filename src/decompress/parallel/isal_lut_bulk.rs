@@ -146,7 +146,11 @@ fn decode_distance(
     bits: &mut Bits<'_>,
     scratch: &DecoderScratch,
 ) -> Result<usize, BulkDecodeError> {
-    bits.refill();
+    // No leading refill: `dist.decode` refills internally when < 32 bits (it
+    // peeks 32), and after consuming the ≤15-bit distance code the ≥17 remaining
+    // bits cover the ≤13 extra bits. The old unconditional `bits.refill()` here
+    // refilled on EVERY backref even when the buffer was already full — over-eager
+    // vs ISA-L. Byte-exact (dist.decode + the extra read are self-sufficient).
     let (dist_sym, dbit) = scratch
         .dist
         .decode(bits)
@@ -198,11 +202,13 @@ pub fn decode_block(
     }
 
     // ── Block body: decode symbols via the ISA-L LUT ────────────────────
-    const REFILL_THRESHOLD: u32 = 48;
+    // No loop-level refill: `decode()` refills internally when < 32 bits (it
+    // peeks 32), and `decode_distance` refills unconditionally before reading
+    // the distance + extra bits. The old `if available < 48 { refill }` guard
+    // was therefore redundant AND over-eager — on literal-heavy data it refilled
+    // after ~1 symbol where ISA-L decodes ~3 per refill (igzip "refill only when
+    // the decode can't be guaranteed"). Removing it matches ISA-L's cadence.
     loop {
-        if bits.available() < REFILL_THRESHOLD {
-            bits.refill();
-        }
         let decoded = scratch.litlen.decode(bits);
         if decoded.bit_count == 0 {
             return Err(BulkDecodeError::InvalidHuffmanCode);
