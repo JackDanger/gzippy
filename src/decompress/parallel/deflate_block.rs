@@ -1418,13 +1418,16 @@ impl Block {
             CompressionType::DynamicHuffman => {
                 let split = self.literal_code_count;
                 let end = split + self.distance_code_count;
-                // `rebuild_from` mutates `self`; copy lengths out of `literal_cl`.
-                let litlen_lens = self.literal_cl[..split].to_vec();
-                let dist_lens = self.literal_cl[split..end].to_vec();
-                if !self.isal_lut_litlen_rebuild(&litlen_lens) {
+                // Stack copy: `rebuild_from` mutates LUT fields on `self` while
+                // lengths live in `literal_cl` (cannot hold two `&mut self` borrows).
+                let mut lit_stack = [0u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2];
+                let mut dist_stack = [0u8; MAX_DISTANCE_SYMBOL_COUNT + 2];
+                lit_stack[..split].copy_from_slice(&self.literal_cl[..split]);
+                dist_stack[..end - split].copy_from_slice(&self.literal_cl[split..end]);
+                if !self.isal_lut_litlen_rebuild(&lit_stack[..split]) {
                     return Err(BlockError::InvalidCodeLengths);
                 }
-                if !self.isal_lut_dist_rebuild(&dist_lens) {
+                if !self.isal_lut_dist_rebuild(&dist_stack[..end - split]) {
                     return Err(BlockError::InvalidCodeLengths);
                 }
             }
