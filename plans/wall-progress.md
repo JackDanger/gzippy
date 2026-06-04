@@ -1,5 +1,40 @@
 # Wall-parity scoreboard — the trustworthy progress signal
 
+## 2026-06-04 — COALESCE (warm read_stream, rapidgzip parity) = REAL T1/T4 WIN, T8/T16 TIE. KEPT.
+Ported rapidgzip/ISA-L `readStream` warm-decode shape into the clean-tail decoder
+(`resumable_resync`/`ResumableInflate2`): decode many deflate blocks per call instead of
+returning to the driver at every EOB (cold FASTLOOP re-entry per ~8-16KiB block). Stops only
+at the first pre-header EOB past the chunk's `stop_hint`; intermediate boundaries drained so
+subchunk-splitting still fires. Default `coalesce_stop_hint=0` = legacy per-block for all other
+callers. Commit 43f1685.
+CORRECTNESS: silesia 635MB byte-exact T1/4/8/16; 49 routing+three_oracle pass; new
+`test_coalesce_fixed_huffman_multithread_byte_exact` locks fixed-Huffman successor-stranding T2/4/8/16.
+MEASURE (locked Fulcrum, A/B HEAD 43f1685 vs parent 8a85229, interleaved **min-of-9**, sd% reported,
+frozen host, RESTORE VERIFIED both, diverged=0):
+| T | base min | coalesce min | Δ | sd% gz | verdict |
+|---|---|---|---|---|---|
+| 1 | 4.3699s (0.454) | 4.2181s (0.469) | **−3.5%** | 0.2 | REAL WIN (≫sd) |
+| 4 | 1.7393s (0.522) | 1.6780s (0.538) | **−3.5%** | 0.7-1.3 | REAL WIN (≫sd) |
+| 8 | 1.2403s (0.433) | 1.2340s (0.433) | −0.5% | 0.6-1.7 | TIE |
+| 16| 1.3493s (0.349) | 1.3574s (0.348) | +0.6% | 1.3-2.2 | TIE |
+(The "+1.4% T8 regression" I first cited came from the trace-PERTURBED run, NOT the authoritative
+interleaved min — wrong instrument. min-of-9 is the verdict: clear win T1/T4, tie T8/T16.)
+WHY win shrinks with T: at low T the clean decode is more wall-bound (fewer parallel slots) so
+warming the FASTLOOP helps directly; at T8/T16 the wall is the in-order consumer chain (below) so
+decode-busy savings (−5.5% busy, −161ms Σ8) are overlapped/hidden. Consistent with the whole ledger.
+DIAGNOSIS (advisor-disproved my error): "gzippy decode busy 2783ms vs ISA-L 1321ms = 2× inner-loop
+BUG" was a busy-time AGGREGATION ARTIFACT (clean-tail + window-absent bootstrap summed vs ISA-L's one
+fused number). REFUTED by this ledger's own causal findings: clean engine 4584 MB/s = 1.8× FASTER than
+rapidgzip (line ~218); instructions EQUAL 1.01× (line ~560, inner-loop compute FALSIFIED); gap = STALLS
+on the in-order consumer window-resolution chain.
+NEXT (the one named perturbation, advisor + line ~485 frontier-placement oracle, faithfulness-aligned):
+port rapidgzip's `queuePrefetchedChunkPostProcessing` (GzipChunkFetcher.hpp:520-583) — eagerly
+apply_window/marker-resolve READY successor chunks on WORKERS the moment their predecessor window
+publishes, OFF the consumer's serial path, so the in-order consumer pays only the lean handoff. Prior
+eager-postproc was hooked at the WRONG site (has_predecessor stall, ran 0×; line ~371); the right hook
+is "predecessor window just published → post-process this already-decoded chunk on a worker." Confirm
+the 161ms marker-resolve executes ON the consumer thread (not already per-worker) before the build.
+
 ## 2026-06-01 — S4 CONSUMER-NULL CEILING-BY-REMOVAL: BIG ceiling (~27% T8), but the lever is the CONSUMER OUTPUT-WRITE memcpy, NOT generic "consumer compute"
 Built the positive-controlled REMOVAL oracle the 2×2 factorial owed (commit 593819d, branch `consumer-null-oracle`): `GZIPPY_NULL_CONSUMER_WORK=1` (default OFF byte-identical, sha == rapidgzip e114dd2) nulls the consumer thread's removable serial compute in `drain_one_pending` — per-chunk `write_all` (output) + `total_crc.append` (CRC-fold). What it does NOT null (pipeline-structural; nulling = the clean-window-oracle trap): window-publish, marker-resolve wait, rx.recv. The heavy apply_window/narrow runs on the POOL (producer-side), not the consumer thread.
 PROVENANCE (all pass): pure-Rust `nm -D` isal_inflate=0, path=IsalParallelSM, T8-noSMT pinned 0,2,4,6,8,10,12,14, frozen-clock 111+105 watchdog'd, interleaved N=11/15, OFF sha==rapidgzip oracle. POSITIVE CONTROL: witness `consumer_work_executed=0` ON (>0 OFF, by construction), `nulled_chunks=36`, conservation `bytes_skipped=503627776 == expected_size` ✓, no FAKE warning.

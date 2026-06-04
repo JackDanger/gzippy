@@ -495,35 +495,23 @@ fn drive_impl<W: std::io::Write>(
     // The BlockFetcher owns the cache, prefetch cache, prefetch queue
     // (`m_prefetching`), fetching strategy, and statistics. Sized to
     // hold the active working set plus prefetched chunks.
-    // (GZIPPY_CACHE_CAP sweep removed 2026-05-28: shrinking the LRU cap did
-    // NOT bound in-flight depth — chunks are held by the prefetch cache +
-    // pending reorder queue, not the LRU — and the wall delta was ordering
-    // noise. See project_real_gap_pinned_2026_05_28 memory.)
-    let cache_capacity = pool_size * 2;
-    // Tried 4x — regressed (wall 486→510ms; misses dropped 4→3 but
-    // overhead elsewhere ate it). Keep 2x.
+    // TRANSLITERATION (vendor BlockFetcher.hpp:181-183, :185): match rapidgzip's
+    // constructor sizing exactly.
+    //   m_cache( std::max( size_t( 16 ), m_parallelization ) )
+    //   m_prefetchCache( 2 * m_parallelization )
+    //   threadPoolSaturated: m_prefetching.size() + 1 >= m_parallelization
+    // gzippy previously diverged: cache_capacity = pool_size*2 (vendor is
+    // max(16,pool)) and a GZIPPY_BURST_PREFETCH lever on the saturation arg with
+    // no vendor counterpart. Both deleted; sizing now matches vendor.
+    let cache_capacity = std::cmp::max(16, pool_size);
     let prefetch_capacity = pool_size * 2;
-    // Step 0 of plans/cache-miss-fix.md: falsifiability test for the
-    // "cache misses are the lever" hypothesis. Per adversarial advisor:
-    // the existing `prefetching_len() + 1 >= parallelization` gate at
-    // block_fetcher.rs:584 caps in-flight prefetches at pool_size - 1.
-    // Knob to raise: the `parallelization` arg below (which the gate
-    // reads), NOT the cache_capacity (advisor: previously-killed cap
-    // changes never reached the saturation gate). Under
-    // GZIPPY_BURST_PREFETCH=1 this raises the gate to pool_size * 2,
-    // allowing 17 in-flight prefetches at T=9 instead of 8.
-    let saturation_parallelization = if std::env::var_os("GZIPPY_BURST_PREFETCH").is_some() {
-        pool_size * 2
-    } else {
-        pool_size
-    };
     let block_fetcher: Arc<
         BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
     > = Arc::new(BlockFetcher::new(
         cache_capacity,
         prefetch_capacity,
         FetchMultiStream::new(FETCH_MEMORY_PER_STREAM, FETCH_MAX_STREAM_COUNT),
-        saturation_parallelization,
+        pool_size,
     ));
 
     // ── m_unsplitBlocks (vendor GzipChunkFetcher.hpp:781) ───────────
@@ -1469,12 +1457,22 @@ fn consumer_loop<W: std::io::Write>(
                     ),
                     "t",
                 );
+                // TRANSLITERATION (vendor `queuePrefetchedChunkPostProcessing`,
+                // GzipChunkFetcher.hpp:520-551, called from waitForReplacedMarkers:513
+                // on EVERY consumed chunk): full sorted scan of the prefetch cache,
+                // each chunk checked against ITS OWN predecessor independently. gzippy
+                // diverged with `Some(chunk_end_bit)` — a single chain-follow that
+                // SKIPS any chunk whose key ≠ the running handoff (isal_lut_bulk.rs
+                // :2551 `continue`), so the chain breaks at the first speculative/
+                // overshoot mismatch (resolved 5/12). `None` = vendor's robust full
+                // scan; it still propagates the chain (publishes each end-window as it
+                // goes) AND resolves the off-chain chunks one-pass in parallel.
                 queue_prefetched_marker_postprocess(
                     block_fetcher,
                     window_map,
                     thread_pool,
                     &mut prefetch_post_inflight,
-                    Some(chunk_end_bit),
+                    None,
                     &[],
                     &[],
                 );
@@ -1563,12 +1561,15 @@ fn consumer_loop<W: std::io::Write>(
                 ),
                 "t",
             );
+            // TRANSLITERATION (vendor queuePrefetchedChunkPostProcessing, full sorted
+            // scan on every consumed chunk; see clean-branch note above). `None`
+            // replaces the divergent `Some(chunk_end_bit)` chain-follow.
             queue_prefetched_marker_postprocess(
                 block_fetcher,
                 window_map,
                 thread_pool,
                 &mut prefetch_post_inflight,
-                Some(chunk_end_bit),
+                None,
                 &[],
                 &[],
             );
@@ -1815,7 +1816,15 @@ fn stop_hint_bit_for(
     floor: usize,
 ) -> usize {
     let spacing = block_finder.spacing_in_bits();
-    let min_gap = spacing.max(8);
+    // OVERSHOOT FIX (task #12). `min_gap` rejects a stop-hint candidate too close
+    // to `floor` so we don't decode a degenerate tiny chunk. It was `spacing`,
+    // which ALSO rejected the next partition boundary P+1 when `floor` is an
+    // OVERSHOOT TAIL just past P (gap to P+1 = spacing − overshoot ≈ 0.99·spacing
+    // < spacing) — bumping the on-demand decode to P+2, a 2× chunk (~16-21MB,
+    // ~130ms) decoded SYNCHRONOUSLY on the consumer's critical path (the measured
+    // head-of-line stalls, ≈40% of the T8 wall). Half a spacing still skips the
+    // genuinely-tiny gaps (the 5-bit test case) while accepting a near-full P+1.
+    let min_gap = (spacing / 2).max(8);
 
     for delta in 1..=8 {
         let candidate = match block_finder.get(block_index + delta) {
