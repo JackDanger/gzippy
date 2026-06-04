@@ -359,8 +359,15 @@ fn finish_decode_chunk_bulk_lut(
     let mut stopping_point_reached = false;
     let mut reached_stream_end = false;
 
+    let mut bulk_outer_passes: u32 = 0;
     while !stopping_point_reached {
+        bulk_outer_passes = bulk_outer_passes.saturating_add(1);
+        if bulk_outer_passes > 64 * 1024 {
+            BULK_LUT_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return BulkCleanTailResult::Decline;
+        }
         let decode_base = chunk.data.len();
+        let bit_at_pass = bits.bit_position();
         // A3 contiguous view only while segment 0 still has decode spare beyond
         // bytes already committed (prefill + tail). Once full, use the multi-
         // segment path so we don't OutputOverflow-decline into resumable.
@@ -378,6 +385,8 @@ fn finish_decode_chunk_bulk_lut(
             let cap = a3_cap;
             let mut local_pos = decode_base;
             while local_pos < cap && !stopping_point_reached {
+                let bit_before_block = bits.bit_position();
+                let out_before_block = local_pos;
                 let block_result = {
                     let out_buf = chunk.data.first_segment_a3_output();
                     match decode_block(&mut bits, out_buf, &mut local_pos, &[], &mut scratch) {
@@ -396,6 +405,14 @@ fn finish_decode_chunk_bulk_lut(
                     }
                 };
                 last_end_bit = bits.bit_position();
+                if block_result.bytes_written == 0
+                    && local_pos == out_before_block
+                    && last_end_bit == bit_before_block
+                    && !block_result.is_final_block
+                {
+                    BULK_LUT_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return BulkCleanTailResult::Decline;
+                }
                 if !block_result.is_final_block {
                     chunk.append_block_boundary_at(last_end_bit, local_pos);
                     last_eob_pos = last_end_bit;
@@ -429,7 +446,7 @@ fn finish_decode_chunk_bulk_lut(
                 chunk.note_inner_decoded_bytes(append_len);
             }
             if stopping_point_reached {
-                continue;
+                break;
             }
             if local_pos >= cap {
                 BULK_TAIL_SEGMENT_CONTINUES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -448,6 +465,8 @@ fn finish_decode_chunk_bulk_lut(
         }
         let mut local_pos = 0usize;
         while local_pos < cap && !stopping_point_reached {
+            let bit_before_block = bits.bit_position();
+            let out_before_block = local_pos;
             let block_result = {
                 let seg_tail = chunk.data.writable_tail();
                 match decode_block(&mut bits, seg_tail, &mut local_pos, pred, &mut scratch) {
@@ -466,6 +485,14 @@ fn finish_decode_chunk_bulk_lut(
             };
             last_end_bit = bits.bit_position();
             let decoded_total = decode_base + local_pos;
+            if block_result.bytes_written == 0
+                && local_pos == out_before_block
+                && last_end_bit == bit_before_block
+                && !block_result.is_final_block
+            {
+                BULK_LUT_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return BulkCleanTailResult::Decline;
+            }
             if !block_result.is_final_block {
                 chunk.append_block_boundary_at(last_end_bit, decoded_total);
                 last_eob_pos = last_end_bit;
@@ -507,6 +534,14 @@ fn finish_decode_chunk_bulk_lut(
                 last_eob_decoded_bytes,
                 pending_stop_after_flush,
             };
+        }
+
+        if !stopping_point_reached
+            && chunk.data.len() == decode_base
+            && bits.bit_position() == bit_at_pass
+        {
+            BULK_LUT_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return BulkCleanTailResult::Decline;
         }
     }
 
