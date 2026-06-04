@@ -109,6 +109,43 @@ pub static BULK_TAIL_SEGMENT_CONTINUES: std::sync::atomic::AtomicU64 =
 /// Bulk LUT declined; tail used ResumableInflate2 (should be rare with 32 KiB window).
 pub static BULK_TAIL_RESUMABLE_FALLBACK: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Why [`finish_decode_chunk_bulk_lut`] returned [`BulkCleanTailResult::Decline`].
+#[cfg(pure_inflate_decode)]
+pub static BULK_LUT_ENTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(pure_inflate_decode)]
+pub static BULK_LUT_DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(pure_inflate_decode)]
+pub static BULK_DECLINE_DISABLED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(pure_inflate_decode)]
+pub static BULK_DECLINE_NO_LOOKBACK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(pure_inflate_decode)]
+pub static BULK_DECLINE_INVALID_HUFFMAN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(pure_inflate_decode)]
+pub static BULK_DECLINE_INVALID_LOOKBACK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(pure_inflate_decode)]
+pub static BULK_DECLINE_OUTPUT_OVERFLOW: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(pure_inflate_decode)]
+pub static BULK_DECLINE_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(pure_inflate_decode)]
+fn record_bulk_decline(err: crate::decompress::parallel::isal_lut_bulk::BulkDecodeError) {
+    use crate::decompress::parallel::isal_lut_bulk::BulkDecodeError;
+    use std::sync::atomic::Ordering;
+    let c = match err {
+        BulkDecodeError::InvalidHuffmanCode => &BULK_DECLINE_INVALID_HUFFMAN,
+        BulkDecodeError::InvalidLookback => &BULK_DECLINE_INVALID_LOOKBACK,
+        BulkDecodeError::OutputOverflow => &BULK_DECLINE_OUTPUT_OVERFLOW,
+        BulkDecodeError::InvalidCodeLengths | BulkDecodeError::BlockTypeReserved => {
+            &BULK_DECLINE_OTHER
+        }
+    };
+    c.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Per-failure structured log. Writes one JSON line to the path in
 /// `GZIPPY_BODY_FAIL_LOG` env var (no-op if unset). Use this for
@@ -278,6 +315,8 @@ fn finish_decode_chunk_bulk_lut(
     use crate::decompress::parallel::isal_lut_bulk::{decode_block, DecoderScratch};
 
     if !use_isal_pure_bulk_tail() {
+        BULK_DECLINE_DISABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        BULK_LUT_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return BulkCleanTailResult::Decline;
     }
 
@@ -288,8 +327,12 @@ fn finish_decode_chunk_bulk_lut(
         && chunk.data.all_in_first_segment();
     let lookback_bytes = initial_window.len().saturating_add(chunk.data.len());
     if !a3_ready && lookback_bytes < 32 * 1024 {
+        BULK_DECLINE_NO_LOOKBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        BULK_LUT_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return BulkCleanTailResult::Decline;
     }
+
+    BULK_LUT_ENTERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
         "worker.stream_inflate",
@@ -312,36 +355,38 @@ fn finish_decode_chunk_bulk_lut(
     let mut stopping_point_reached = false;
     let mut reached_stream_end = false;
 
-    let a3_contiguous = use_option_a_prefill_path()
-        && initial_window.len() == 32 * 1024
-        && chunk.data.all_in_first_segment();
-
     while !stopping_point_reached {
         let decode_base = chunk.data.len();
+        // A3 contiguous view only while segment 0 still has decode spare beyond
+        // bytes already committed (prefill + tail). Once full, use the multi-
+        // segment path so we don't OutputOverflow-decline into resumable.
+        let a3_contiguous = use_option_a_prefill_path()
+            && initial_window.len() == 32 * 1024
+            && chunk.data.all_in_first_segment();
+        let a3_cap = if a3_contiguous {
+            chunk.data.first_segment_a3_output().len()
+        } else {
+            0
+        };
+        let use_a3_this_iter = a3_contiguous && decode_base < a3_cap;
 
-        if a3_contiguous && chunk.data.all_in_first_segment() {
-            let cap = chunk.data.first_segment_a3_output().len();
+        if use_a3_this_iter {
+            let cap = a3_cap;
             let mut local_pos = decode_base;
-            if local_pos >= cap {
-                return BulkCleanTailResult::Handoff {
-                    start_bit: bits.bit_position(),
-                    last_eob_pos,
-                    last_eob_decoded_bytes,
-                    pending_stop_after_flush,
-                };
-            }
             while local_pos < cap && !stopping_point_reached {
                 let block_result = {
                     let out_buf = chunk.data.first_segment_a3_output();
                     match decode_block(&mut bits, out_buf, &mut local_pos, &[], &mut scratch) {
                         Ok(r) => r,
-                        Err(_) => {
+                        Err(e) => {
+                            record_bulk_decline(e);
                             chunk.data.truncate(bulk_entry_len);
                             chunk.subchunks.truncate(bulk_entry_subchunks);
                             if let Some(last) = chunk.subchunks.last_mut() {
                                 last.decoded_size =
                                     bulk_entry_len.saturating_sub(last.decoded_offset);
                             }
+                            BULK_LUT_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             return BulkCleanTailResult::Decline;
                         }
                     }
@@ -379,15 +424,13 @@ fn finish_decode_chunk_bulk_lut(
                 chunk.statistics.non_marker_count += append_len as u64;
                 chunk.note_inner_decoded_bytes(append_len);
             }
-            if !stopping_point_reached && local_pos >= cap {
-                return BulkCleanTailResult::Handoff {
-                    start_bit: bits.bit_position(),
-                    last_eob_pos,
-                    last_eob_decoded_bytes,
-                    pending_stop_after_flush,
-                };
+            if stopping_point_reached {
+                continue;
             }
-            continue;
+            if local_pos >= cap {
+                BULK_TAIL_SEGMENT_CONTINUES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Spill remaining tail through multi-segment path (same `bits`).
         }
 
         // Multi-segment (or non-A3): one segment tail per outer iteration.
@@ -408,12 +451,14 @@ fn finish_decode_chunk_bulk_lut(
                 let seg_tail = chunk.data.writable_tail();
                 match decode_block(&mut bits, seg_tail, &mut local_pos, pred, &mut scratch) {
                     Ok(r) => r,
-                    Err(_) => {
+                    Err(e) => {
+                        record_bulk_decline(e);
                         chunk.data.truncate(bulk_entry_len);
                         chunk.subchunks.truncate(bulk_entry_subchunks);
                         if let Some(last) = chunk.subchunks.last_mut() {
                             last.decoded_size = bulk_entry_len.saturating_sub(last.decoded_offset);
                         }
+                        BULK_LUT_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return BulkCleanTailResult::Decline;
                     }
                 }
