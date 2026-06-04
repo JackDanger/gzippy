@@ -755,6 +755,38 @@ fn decode_chunk_unified_marker(
         }
         match step {
             MarkerStep::Continue => {}
+            MarkerStep::FlipToClean {
+                end_bit_offset,
+                window_len,
+            } => {
+                // FLIP (vendor setInitialWindow): the marker prefix (u16, ≤ ~32 KiB)
+                // is done; decode the REST as the u8 clean tail into chunk.data on
+                // the same cursor, with the flipped 32 KiB clean window narrowed
+                // from the marker-prefix tail. The clean tail is u8 (NOT u16) and is
+                // never resolved — so the marker work stays bounded.
+                use crate::decompress::parallel::marker_inflate::MarkerSink;
+                use std::cell::RefCell;
+                thread_local! {
+                    static FLIP_WINDOW: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(32 * 1024));
+                }
+                chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
+                FLIP_WINDOW.with(|cell| -> Result<(), ChunkDecodeError> {
+                    let mut win = cell.borrow_mut();
+                    let ok = chunk
+                        .data_with_markers
+                        .copy_last_n_clean_u8(window_len, &mut win);
+                    debug_assert!(ok, "flip window tail not all-clean");
+                    resumable_resync(
+                        &mut chunk,
+                        input,
+                        end_bit_offset,
+                        stop_hint_bits,
+                        &win,
+                        false,
+                    )
+                })?;
+                return Ok(chunk);
+            }
             MarkerStep::Finished { end_bit_offset, .. } => {
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
                 chunk.finalize(end_bit_offset);
@@ -787,6 +819,13 @@ fn apply_slow_bootstrap_probe(bootstrap_dur_us: u128) {
 enum MarkerStep {
     /// Another deflate block was decoded; call again.
     Continue,
+    /// 32 KiB of clean output reached at a block boundary — FLIP to the u8 clean
+    /// tail (vendor setInitialWindow). The clean 32 KiB window is the tail of
+    /// `data_with_markers`; the caller decodes the rest as u8 into `chunk.data`.
+    FlipToClean {
+        end_bit_offset: usize,
+        window_len: usize,
+    },
     /// Chunk ends in the marker path (BFINAL, stop hint, or no clean dict).
     Finished {
         end_bit_offset: usize,
@@ -919,15 +958,25 @@ fn marker_decode_step(
 
             let next_block_offset = absolute_bit_pos(slice_byte, &bits);
 
-            // UNIFIED DECODE: no marker->clean handoff. The one engine
-            // (marker_inflate::Block) decodes the WHOLE chunk into
-            // data_with_markers — emitting u16 markers while window-absent and
-            // flipping mid-stream to clean u16 (block.contains_marker_bytes
-            // false) without restarting — exactly rapidgzip's single
-            // deflate::Block. The chunk ends at BFINAL or the stop_hint
-            // partition boundary (MarkerStep::Finished below). The separate
-            // clean-tail path (resumable_resync / bulk-LUT / resumable)
-            // is retired.
+            // UNIFIED DECODE, marker(u16) -> clean(u8) FLIP on ONE cursor (vendor
+            // deflate::Block setInitialWindow, deflate.hpp:1282-1292). Once 32 KiB
+            // of clean output has accumulated at a block boundary, FLIP: the caller
+            // decodes the rest as the fast u8 clean tail into chunk.data (vendor's
+            // "~400 MB/s -> ~6 GB/s" path). The marker prefix (u16, <= ~32 KiB)
+            // stays in data_with_markers (resolved on the publish chain); the clean
+            // tail (the bulk) is u8 and is never resolved. One driver, no separate
+            // bootstrap engine and no separate clean-tail entry.
+            if ctx.trailing_clean >= MAX_WINDOW_SIZE && output.is_last_n_clean(MAX_WINDOW_SIZE) {
+                let end_bit_offset = next_block_offset;
+                ctx.current_bit_offset = end_bit_offset;
+                return Ok((
+                    MarkerStep::FlipToClean {
+                        end_bit_offset,
+                        window_len: MAX_WINDOW_SIZE,
+                    },
+                    false,
+                ));
+            }
 
         let header_res = {
             let _tv2 = trace_v2::SpanGuard::begin("worker.block_header");
