@@ -1386,6 +1386,24 @@ impl ChunkData {
         len
     }
 
+    /// FUSED resolve + narrow: replaces the two-pass
+    /// `apply_window` (resolve u16→u16) + `narrow_markers_in_place` (u16→u8)
+    /// with a single pass over `data_with_markers` (64 KiB u8 LUT). After this
+    /// the low `narrowed_len` bytes of `data_with_markers` hold the resolved
+    /// u8 output, exactly as the two-pass path produced.
+    pub fn resolve_and_narrow_markers_in_place(&mut self, window: &[u8]) -> usize {
+        debug_assert_eq!(
+            self.data_prefix_len, 0,
+            "trim_window_prefix before resolve_and_narrow_markers_in_place"
+        );
+        let len = self.data_with_markers.len();
+        if len > 0 {
+            self.data_with_markers.resolve_and_narrow_in_place(window);
+        }
+        self.narrowed_len = len;
+        len
+    }
+
     /// CRC the in-place-narrowed marker bytes (may span multiple segments).
     pub fn update_narrowed_crc(&mut self) {
         if self.narrowed_len == 0 {
