@@ -25,7 +25,7 @@ It is **not** the refuted “two-pass scan + re-decode” architecture. It **is*
 | Stage | When | Code | Output |
 |-------|------|------|--------|
 | **1. Marker bootstrap** | No exact predecessor window at worker start | `marker_decode_step` → `deflate_block::Block` | u16 into `chunk.data_with_markers` until 32 KiB clean at a block boundary |
-| **2. Clean streaming inflate** | After handoff (or immediately if 32 KiB window known) | `finish_decode_chunk_inexact_offset` → `ResumableInflate2::read_stream` | u8 into `chunk.data` (segmented 128 KiB tails) |
+| **2. Clean streaming inflate** | After handoff (or immediately if 32 KiB window known) | `finish_clean_tail_decode` → `isal_lut_bulk` bulk loop, else `ResumableInflate2::read_stream` | u8 into `chunk.data` (segmented 128 KiB tails) |
 
 rapidgzip uses the **same outer shape** (marker bytes until clean window, then fast
 stream decode on the same chunk). The gap is **implementation speed** (Rust marker
