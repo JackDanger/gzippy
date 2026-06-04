@@ -1797,10 +1797,16 @@ fn decode_stored(bits: &mut Bits, output: &mut [u8], mut out_pos: usize) -> Resu
         if len == 0 && nlen == 0 && bits.pos >= bits.data.len().saturating_sub(2) {
             return Ok(out_pos);
         }
-        eprintln!(
-            "Invalid stored block: len={:#x}, nlen={:#x}, !nlen={:#x}, pos={}, out_pos={}",
-            len, nlen, !nlen, bits.pos, out_pos
-        );
+        // Gated: in the parallel-SM speculative path this fires routinely on
+        // partition-stride seed offsets that aren't real block boundaries (the
+        // bulk LUT declines and ResumableInflate2 re-syncs — byte-exact). It is
+        // a normal speculation re-sync, not an error worth spamming to stderr.
+        if std::env::var_os("GZIPPY_DEBUG").is_some() {
+            eprintln!(
+                "Invalid stored block: len={:#x}, nlen={:#x}, !nlen={:#x}, pos={}, out_pos={}, bit_pos={}",
+                len, nlen, !nlen, bits.pos, out_pos, bits.bit_position()
+            );
+        }
         return Err(Error::new(ErrorKind::InvalidData, "Invalid stored block"));
     }
 
@@ -3125,6 +3131,46 @@ fn decode_match_for_lane(
 mod tests {
     use super::*;
     use crate::assert_slices_eq;
+
+    /// DISPROOF (advisor-required): does `Bits::at_bit_offset` (the bulk
+    /// clean-tail re-entry constructor) produce the SAME bit stream as the
+    /// marker phase's `Bits::new(&data[byte..]) + consume(skip)` construction,
+    /// for NON-byte-aligned offsets? The 29 resumable_fallbacks on silesia all
+    /// fire on the FIRST post-handoff block via `at_bit_offset`; resumable
+    /// succeeds from the SAME offset. If this test FAILS at some offset,
+    /// `at_bit_offset` is the cursor-handoff bug.
+    #[test]
+    fn at_bit_offset_matches_new_plus_consume() {
+        let data: Vec<u8> = (0..96u32)
+            .map(|i| (i.wrapping_mul(73).wrapping_add(11)) as u8)
+            .collect();
+        for offset in 0..(64 * 8usize) {
+            let byte_idx = offset / 8;
+            let skip = (offset % 8) as u32;
+            // bulk re-entry constructor
+            let mut a = Bits::at_bit_offset(&data, offset);
+            a.refill();
+            // marker-phase constructor
+            let mut b = Bits::new(&data[byte_idx..]);
+            if skip > 0 {
+                b.consume(skip);
+            }
+            b.refill();
+            // Compare the next 32 readable bits (well within both buffers).
+            assert_eq!(
+                a.bitbuf & 0xFFFF_FFFF,
+                b.bitbuf & 0xFFFF_FFFF,
+                "bitbuf diverged at offset {offset} (byte {byte_idx}, skip {skip})"
+            );
+            // And the absolute bit position must round-trip to the seek offset
+            // exactly (refill must not perturb it).
+            assert_eq!(
+                a.bit_position(),
+                offset,
+                "bit_position drift at offset {offset}"
+            );
+        }
+    }
 
     /// Helper for benchmarking a single dataset
     fn run_bench(name: &str, gz_path: &str) {
