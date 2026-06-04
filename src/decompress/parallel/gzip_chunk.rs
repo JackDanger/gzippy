@@ -1004,17 +1004,9 @@ fn decode_chunk_with_rapidgzip_impl(
                     #[cfg(pure_inflate_decode)]
                     if use_option_a_prefill_path() {
                         chunk.prefill_window_prefix(&clean_window);
-                        inflate_window.clear();
-                    } else {
-                        inflate_window = clean_window;
                     }
-                    #[cfg(not(pure_inflate_decode))]
-                    {
-                        inflate_window = clean_window;
-                    }
-                } else {
-                    inflate_window = clean_window;
                 }
+                inflate_window = clean_window;
                 inflate_phase = true;
                 marker_ctx = None;
                 marker_span.take();
