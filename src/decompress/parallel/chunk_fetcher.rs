@@ -684,15 +684,16 @@ fn drive_impl<W: std::io::Write>(
         //     slow ResumableInflate2).
         {
             use crate::decompress::parallel::gzip_chunk::{
-                BULK_TAIL_RESUMABLE_FALLBACK, BULK_TAIL_SEGMENT_CONTINUES,
-                HANDOFF_WINDOW_BUF_GROWS, UNIFIED_MODE_CLEAN_FLIPS,
+                BAD_SEED_RESYNC, BULK_TAIL_RESUMABLE_FALLBACK, FINISHED_NO_FLIP_CHUNKS,
+                FLIP_TO_CLEAN_CHUNKS, HANDOFF_WINDOW_BUF_GROWS,
             };
             eprintln!(
-                "  Unified decoder: handoff_window_grows={} resumable_fallback={} bulk_segment_continues={} clean_flips={}",
-                HANDOFF_WINDOW_BUF_GROWS.load(Ordering::Relaxed),
+                "  Unified decoder: flip_to_clean={} finished_no_flip={} bad_seed_resync={} resumable_resync_calls={} handoff_window_grows={}",
+                FLIP_TO_CLEAN_CHUNKS.load(Ordering::Relaxed),
+                FINISHED_NO_FLIP_CHUNKS.load(Ordering::Relaxed),
+                BAD_SEED_RESYNC.load(Ordering::Relaxed),
                 BULK_TAIL_RESUMABLE_FALLBACK.load(Ordering::Relaxed),
-                BULK_TAIL_SEGMENT_CONTINUES.load(Ordering::Relaxed),
-                UNIFIED_MODE_CLEAN_FLIPS.load(Ordering::Relaxed),
+                HANDOFF_WINDOW_BUF_GROWS.load(Ordering::Relaxed),
             );
         }
         use crate::decompress::parallel::chunk_buffer_pool::*;

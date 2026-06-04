@@ -121,6 +121,16 @@ pub static HANDOFF_WINDOW_BUF_GROWS: std::sync::atomic::AtomicU64 =
 /// and fell to the internal resumable re-sync (the goal's accepted re-sync).
 /// Should be ~0 for real-boundary chunks and bounded by the speculative-seed count.
 pub static BAD_SEED_RESYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Chunks that took the marker→clean FLIP: a bounded u16 marker prefix then the
+/// fast u8 clean tail (vendor setInitialWindow). This is the FAST window-absent
+/// path; if it stays 0 while speculative chunks exist, every window-absent chunk
+/// is decoding its whole body as u16 markers + full resolve (the slow path).
+pub static FLIP_TO_CLEAN_CHUNKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Chunks that finished WITHOUT a flip (BFINAL or stop-hint reached before 32 KiB
+/// of clean output accumulated) — the whole decoded body stayed u16 markers.
+pub static FINISHED_NO_FLIP_CHUNKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// `resumable_resync` bulk loop saw `Handoff` with no bit advance (stall guard).
 #[cfg(pure_inflate_decode)]
 pub static BULK_HANDOFF_NO_PROGRESS: std::sync::atomic::AtomicU64 =
@@ -759,6 +769,7 @@ fn decode_chunk_unified_marker(
                 end_bit_offset,
                 window_len,
             } => {
+                FLIP_TO_CLEAN_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // FLIP (vendor setInitialWindow): the marker prefix (u16, ≤ ~32 KiB)
                 // is done; decode the REST as the u8 clean tail into chunk.data on
                 // the same cursor, with the flipped 32 KiB clean window narrowed
@@ -788,6 +799,7 @@ fn decode_chunk_unified_marker(
                 return Ok(chunk);
             }
             MarkerStep::Finished { end_bit_offset, .. } => {
+                FINISHED_NO_FLIP_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
                 chunk.finalize(end_bit_offset);
                 return Ok(chunk);
