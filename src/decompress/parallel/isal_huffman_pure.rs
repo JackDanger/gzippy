@@ -445,6 +445,16 @@ pub fn set_and_expand_lit_len_huffcode(
 // secondary table (final loop).
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Returns `false` if the (already over-subscription-screened) table still
+/// drives a LUT write out of range. A well-formed canonical code never does —
+/// proven by every real block decoding correctly — so a `false` here can only
+/// be an exotic bad speculative seed whose length set passes the cheap Kraft
+/// screen yet corrupts ISA-L's expanded code/bucket arithmetic. The caller
+/// rejects the table and re-syncs via `resumable_resync`. (Vendor igzip omits
+/// these checks because it only runs on headers `read_header` already
+/// validated; the speculative single-member path decodes from *guessed* offsets
+/// so the builder must self-guard.)
+#[must_use]
 pub fn make_inflate_huff_code_lit_len(
     result: &mut InflateHuffCodeLarge,
     huff_code_table: &mut [HuffCode],
@@ -452,15 +462,17 @@ pub fn make_inflate_huff_code_lit_len(
     count_total: &[u16; MAX_LIT_LEN_COUNT],
     code_list: &[u32],
     multisym: u32,
-) {
+) -> bool {
     let max_symbol: u32 = MAX_LIT_LEN_SYM;
+    let short_len = result.short_code_lookup.len();
+    let long_len = result.long_code_lookup.len();
 
     let code_list_len = count_total[MAX_LIT_LEN_COUNT - 1] as u32;
     if code_list_len == 0 {
         for v in result.short_code_lookup.iter_mut() {
             *v = 0;
         }
-        return;
+        return true;
     }
 
     // Shortest length with at least one code (`count_total` is cumulative).
@@ -472,7 +484,7 @@ pub fn make_inflate_huff_code_lit_len(
         }
     }
     if last_length == 0 {
-        return;
+        return true;
     }
     if last_length > ISAL_DECODE_LONG_BITS {
         last_length = ISAL_DECODE_LONG_BITS + 1;
@@ -507,6 +519,9 @@ pub fn make_inflate_huff_code_lit_len(
             let sym1_code = huff_code_table[sym1_index as usize].code() as u32;
 
             if sym1 <= max_symbol {
+                if sym1_code as usize >= short_len {
+                    return false;
+                }
                 result.short_code_lookup[sym1_code as usize] = sym1
                     | (sym1_len << LARGE_SHORT_CODE_LEN_OFFSET)
                     | (1 << LARGE_SYM_COUNT_OFFSET);
@@ -550,6 +565,9 @@ pub fn make_inflate_huff_code_lit_len(
                 let sym2_code = huff_code_table[sym2_index as usize].code() as u32;
                 let code = sym1_code | (sym2_code << sym1_len);
                 let code_length = sym1_len + sym2_len;
+                if code as usize >= short_len {
+                    return false;
+                }
                 result.short_code_lookup[code as usize] = sym1
                     | (sym2 << 8)
                     | (code_length << LARGE_SHORT_CODE_LEN_OFFSET)
@@ -612,6 +630,9 @@ pub fn make_inflate_huff_code_lit_len(
                     let code =
                         sym1_code | (sym2_code << sym1_len) | (sym3_code << (sym2_len + sym1_len));
                     let code_length = sym1_len + sym2_len + sym3_len;
+                    if code as usize >= short_len {
+                        return false;
+                    }
                     result.short_code_lookup[code as usize] = sym1
                         | (sym2 << 8)
                         | (sym3 << 16)
@@ -656,6 +677,9 @@ pub fn make_inflate_huff_code_lit_len(
                 == first_bits as u32
             {
                 max_length = huff_code_table[lj].length() as u32;
+                if temp_code_length as usize >= temp_code_list.len() {
+                    return false;
+                }
                 temp_code_list[temp_code_length as usize] = long_code_list[j] as u16;
                 temp_code_length += 1;
             }
@@ -663,6 +687,9 @@ pub fn make_inflate_huff_code_lit_len(
 
         // Zero out the long-code-lookup region we're about to populate
         let lcl_size = 1usize << (max_length - ISAL_DECODE_LONG_BITS);
+        if long_code_lookup_length as usize + lcl_size > long_len {
+            return false;
+        }
         for k in 0..lcl_size {
             result.long_code_lookup[long_code_lookup_length as usize + k] = 0;
         }
@@ -678,6 +705,9 @@ pub fn make_inflate_huff_code_lit_len(
 
             while long_bits < (1 << (max_length - ISAL_DECODE_LONG_BITS)) {
                 let idx = (long_code_lookup_length + long_bits) as usize;
+                if idx >= long_len {
+                    return false;
+                }
                 result.long_code_lookup[idx] =
                     (sym1 | (sym1_len << LARGE_LONG_CODE_LEN_OFFSET)) as u16;
                 long_bits += min_increment;
@@ -686,10 +716,14 @@ pub fn make_inflate_huff_code_lit_len(
             // INVALID_CODE check skips it.
             huff_code_table[sym1_index].set_code_and_extra(INVALID_CODE);
         }
+        if first_bits as usize >= short_len {
+            return false;
+        }
         result.short_code_lookup[first_bits as usize] =
             long_code_lookup_length | (max_length << LARGE_SHORT_MAX_LEN_OFFSET) | LARGE_FLAG_BIT;
         long_code_lookup_length += 1u32 << (max_length - ISAL_DECODE_LONG_BITS);
     }
+    true
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -698,6 +732,14 @@ pub fn make_inflate_huff_code_lit_len(
 // multi-symbol packing).
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Returns `false` if a (Kraft-screened) table still drives a LUT write out of
+/// range — same self-guard as [`make_inflate_huff_code_lit_len`], required for
+/// the same reason: a bad speculative seed can pass the cheap over-subscription
+/// screen yet overflow ISA-L's code arithmetic, here into the much smaller
+/// distance `short_code_lookup` / `long_code_lookup`. A valid canonical code
+/// never trips these (every real block decodes correctly); a trip means garbage
+/// → reject → re-sync via `resumable_resync`.
+#[must_use]
 pub fn make_inflate_huff_code_dist(
     result: &mut InflateHuffCodeSmall,
     huff_code_table: &mut [HuffCode],
@@ -705,13 +747,15 @@ pub fn make_inflate_huff_code_dist(
     count: &[u16; MAX_HUFF_TREE_DEPTH + 1 + 1], // 17 = MAX_HUFF_TREE_DEPTH + 1 + slack
     code_list: &[u32],
     max_symbol: u32,
-) {
+) -> bool {
+    let short_len = result.short_code_lookup.len();
+    let long_len = result.long_code_lookup.len();
     let code_list_len = count[MAX_HUFF_TREE_DEPTH + 1] as u32;
     if code_list_len == 0 {
         for v in result.short_code_lookup.iter_mut() {
             *v = 0;
         }
-        return;
+        return true;
     }
 
     // Shortest length with at least one code. `count` is cumulative (start
@@ -725,7 +769,7 @@ pub fn make_inflate_huff_code_dist(
         }
     }
     if first_len == 0 {
-        return;
+        return true;
     }
     let mut last_length = if first_len > ISAL_DECODE_SHORT_BITS {
         ISAL_DECODE_SHORT_BITS + 1
@@ -752,6 +796,9 @@ pub fn make_inflate_huff_code_dist(
             let sym1_code = huff_code_table[sym1_index as usize].code() as u32;
             let sym1_extra = huff_code_table[sym1_index as usize].extra_bit_count() as u32;
             if sym1_index <= max_symbol {
+                if sym1_code as usize >= short_len {
+                    return false;
+                }
                 result.short_code_lookup[sym1_code as usize] = (sym1_index
                     | (sym1_extra << DIST_SYM_EXTRA_OFFSET)
                     | (last_length << SMALL_SHORT_CODE_LEN_OFFSET))
@@ -789,12 +836,18 @@ pub fn make_inflate_huff_code_dist(
                 == first_bits as u32
             {
                 max_length = huff_code_table[lj].length() as u32;
+                if temp_code_length as usize >= temp_code_list.len() {
+                    return false;
+                }
                 temp_code_list[temp_code_length as usize] = long_code_list[j] as u16;
                 temp_code_length += 1;
             }
         }
 
         let lcl_size = 1usize << (max_length - ISAL_DECODE_SHORT_BITS);
+        if long_code_lookup_length as usize + lcl_size > long_len {
+            return false;
+        }
         for k in 0..lcl_size {
             result.long_code_lookup[long_code_lookup_length as usize + k] = 0;
         }
@@ -810,6 +863,9 @@ pub fn make_inflate_huff_code_dist(
 
             while long_bits < (1u32 << (max_length - ISAL_DECODE_SHORT_BITS)) {
                 let idx = (long_code_lookup_length + long_bits) as usize;
+                if idx >= long_len {
+                    return false;
+                }
                 result.long_code_lookup[idx] = (sym1_index as u32
                     | (sym1_extra << DIST_SYM_EXTRA_OFFSET)
                     | (sym1_len << SMALL_LONG_CODE_LEN_OFFSET))
@@ -818,11 +874,15 @@ pub fn make_inflate_huff_code_dist(
             }
             huff_code_table[sym1_index].set_code_and_extra(INVALID_CODE);
         }
+        if first_bits as usize >= short_len {
+            return false;
+        }
         result.short_code_lookup[first_bits as usize] = (long_code_lookup_length
             | (max_length << SMALL_SHORT_CODE_LEN_OFFSET)
             | SMALL_FLAG_BIT) as u16;
         long_code_lookup_length += 1u32 << (max_length - ISAL_DECODE_SHORT_BITS);
     }
+    true
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -930,14 +990,16 @@ impl IsalLitLenCodePure {
             return false;
         }
 
-        make_inflate_huff_code_lit_len(
+        if !make_inflate_huff_code_lit_len(
             &mut self.table,
             &mut self.lit_and_dist_huff[..],
             LIT_LEN_ELEMS,
             &lit_count,
             &self.code_list[..],
             TRIPLE_SYM_FLAG,
-        );
+        ) {
+            return false;
+        }
 
         self.valid = true;
         true
@@ -1072,14 +1134,16 @@ impl IsalDistCodePure {
             code_list[offsets[li] as usize] = i as u32;
             offsets[li] += 1;
         }
-        make_inflate_huff_code_dist(
+        if !make_inflate_huff_code_dist(
             &mut self.table,
             &mut self.dist_huff[..],
             LIT_LEN as usize,
             &count_cumulative,
             &code_list,
             ISAL_DEF_DIST_SYMBOLS as u32,
-        );
+        ) {
+            return false;
+        }
         self.valid = true;
         true
     }
@@ -1541,13 +1605,16 @@ mod tests {
         .expect("static fixed Huffman should build");
 
         let mut result = Box::new(InflateHuffCodeLarge::default());
-        make_inflate_huff_code_lit_len(
-            &mut result,
-            &mut lit_len_huff,
-            LIT_LEN_ELEMS,
-            &count,
-            &code_list,
-            TRIPLE_SYM_FLAG,
+        assert!(
+            make_inflate_huff_code_lit_len(
+                &mut result,
+                &mut lit_len_huff,
+                LIT_LEN_ELEMS,
+                &count,
+                &code_list,
+                TRIPLE_SYM_FLAG,
+            ),
+            "static fixed Huffman LUT must build in range"
         );
 
         // After build, the short_code_lookup must have at least some
