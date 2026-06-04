@@ -188,6 +188,17 @@ impl<'a> IsalInflateWrapper<'a> {
         self.inner.set_stopping_points(StoppingPoint(points.0));
     }
 
+    /// Coalesce END_OF_BLOCK returns until `stop_hint` (decode warm across blocks
+    /// like ISA-L's readStream, instead of re-entering cold per deflate block).
+    pub fn set_coalesce_stop_hint(&mut self, stop_hint: usize) {
+        self.inner.set_coalesce_stop_hint(stop_hint);
+    }
+
+    /// Drain the pre-header EOB boundaries crossed during the last coalesced call.
+    pub fn take_block_boundaries(&mut self) -> Vec<(usize, usize)> {
+        self.inner.take_block_boundaries()
+    }
+
     pub fn stopped_at(&self) -> StoppingPoints {
         StoppingPoints(self.inner.stopped_at().0)
     }

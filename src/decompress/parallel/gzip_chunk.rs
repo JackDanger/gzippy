@@ -321,12 +321,19 @@ fn resumable_resync(
     let read_cap = input.len() * 8;
     let mut wrapper = IsalInflateWrapper::with_until_bits(input, inflate_start_bit, read_cap)?;
     wrapper.set_window(resumable_window)?;
+    // COALESCE (rapidgzip parity): decode many deflate blocks per read_stream
+    // call (warm FASTLOOP, like ISA-L's readStream) instead of returning at every
+    // block boundary. END_OF_BLOCK now returns only at the first pre-header EOB
+    // whose bit position reaches `stop_hint_bits` (the chunk's partition end);
+    // the boundaries crossed before that are recorded inline and drained below.
+    // END_OF_BLOCK_HEADER is dropped — stopping at the pre-header EOB subsumes its
+    // `not_fixed` guard (we never parse the post-stop_hint header).
     wrapper.set_stopping_points(
         StoppingPoints::END_OF_BLOCK
-            | StoppingPoints::END_OF_BLOCK_HEADER
             | StoppingPoints::END_OF_STREAM_HEADER
             | StoppingPoints::END_OF_STREAM,
     );
+    wrapper.set_coalesce_stop_hint(stop_hint_bits);
 
     let mut stopping_point_reached = false;
     let mut last_end_bit = inflate_start_bit;
@@ -427,6 +434,19 @@ fn resumable_resync(
             last_stopped_at = r.stopped_at;
             last_finished = r.finished;
             last_end_bit = r.bit_position;
+
+            // COALESCE drain (rapidgzip parity): this `read_stream` call may
+            // have warm-decoded across several deflate blocks before returning.
+            // Record each pre-header EOB it crossed so subchunk splitting
+            // (gated by `split_chunk_size`) still fires at vendor granularity.
+            // Offsets are relative to THIS call's start; rebase onto the
+            // cumulative decode. The final boundary (the one that returned
+            // END_OF_BLOCK) lands at `decode_base + n_bytes_read` and is
+            // deduped against the explicit append in the match arm below.
+            let call_base = decode_base + (n_bytes_read - last_per_call);
+            for (bp, rel_off) in wrapper.take_block_boundaries() {
+                chunk.append_block_boundary_at(bp, call_base + rel_off);
+            }
 
             // Defense-in-depth termination guard. If `read_stream` made
             // no progress whatsoever — no output, no stopping point, not
