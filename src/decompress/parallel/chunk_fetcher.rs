@@ -2570,6 +2570,23 @@ fn queue_prefetched_marker_postprocess(
         else {
             continue;
         };
+        // VENDOR queueChunkForPostProcessing (GzipChunkFetcher.hpp:557-575):
+        // EAGERLY publish THIS chunk's end window on the consumer (cheap,
+        // deterministic get_last_window) BEFORE the parallel marker resolve, so
+        // the NEXT confirmed chunk's predecessor becomes available and the whole
+        // confirmed chain resolves IN PARALLEL in one pass instead of one link
+        // at a time on the consumer's serial L_resolve path. Byte-exact:
+        // get_last_window is deterministic and window_map insert overwrites
+        // (WindowMap is overwrite-safe by design); only resolution TIMING moves.
+        if arc.encoded_size_bits > 0 {
+            let chunk_end_bit = arc.encoded_offset_bits + arc.encoded_size_bits;
+            if !window_map.contains(chunk_end_bit) {
+                let pred_bytes = materialize_window(&predecessor_window);
+                let end_window = arc.get_last_window(pred_bytes.as_ref());
+                window_map.insert_owned_none(chunk_end_bit, end_window.to_vec());
+                PUBLISH_AHEAD_WINDOWS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let rx = submit_post_process_from_prefetch(
             thread_pool,
             Arc::clone(&arc),
@@ -2804,6 +2821,10 @@ pub static EARLY_SPEC_EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic:
 pub static RESOLVE_AHEAD_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static RESOLVE_AHEAD_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Vendor queueChunkForPostProcessing eager end-window publishes on the consumer
+/// (the window-chain propagation that lets prefetched chunks resolve in parallel).
+pub static PUBLISH_AHEAD_WINDOWS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
