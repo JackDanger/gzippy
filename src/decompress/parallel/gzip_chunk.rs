@@ -103,6 +103,12 @@ pub static UNIFIED_ROUTE_CLEAN_U8_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static UNIFIED_MODE_CLEAN_FLIPS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Clean tail stayed on bulk LUT across a 128 KiB segment boundary (P2 unified).
+pub static BULK_TAIL_SEGMENT_CONTINUES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Bulk LUT declined; tail used ResumableInflate2 (should be rare with 32 KiB window).
+pub static BULK_TAIL_RESUMABLE_FALLBACK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Per-failure structured log. Writes one JSON line to the path in
 /// `GZIPPY_BODY_FAIL_LOG` env var (no-op if unset). Use this for
@@ -504,9 +510,6 @@ fn finish_decode_chunk_inexact_offset(
     // `has_window` flag distinguishing the two call paths above.
     let t_decode = std::time::Instant::now();
 
-    #[cfg(pure_inflate_decode)]
-    let mut bulk_handoff: Option<(usize, usize, bool)> = None;
-
     // Option A3 (default ON): pre-fill segment 0 with the predecessor's
     // 32 KiB window so back-references hit copy_match_fast via
     // `output[..out_pos]`. Disable with `GZIPPY_OPTION_A_PREFILL=0`.
@@ -519,8 +522,11 @@ fn finish_decode_chunk_inexact_offset(
         chunk.prefill_window_prefix(initial_window);
     }
 
+    // P2 unified clean tail: keep the same ISA-L LUT engine across 128 KiB
+    // segment fills. Only fall back to ResumableInflate2 when bulk declines
+    // (no 32 KiB lookback), not on every segment Handoff.
     #[cfg(pure_inflate_decode)]
-    {
+    loop {
         match finish_decode_chunk_bulk_lut(
             chunk,
             input,
@@ -535,23 +541,16 @@ fn finish_decode_chunk_inexact_offset(
                 chunk.finalize(final_bit);
                 return Ok(());
             }
-            BulkCleanTailResult::Handoff {
-                start_bit,
-                last_eob_pos,
-                last_eob_decoded_bytes,
-                pending_stop_after_flush,
-            } => {
+            BulkCleanTailResult::Handoff { start_bit, .. } => {
+                BULK_TAIL_SEGMENT_CONTINUES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 inflate_start_bit = start_bit;
-                bulk_handoff = Some((
-                    last_eob_pos,
-                    last_eob_decoded_bytes,
-                    pending_stop_after_flush,
-                ));
+                continue;
             }
-            BulkCleanTailResult::Decline => {}
+            BulkCleanTailResult::Decline => break,
         }
     }
 
+    BULK_TAIL_RESUMABLE_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
         "worker.stream_inflate",
         &format!(
@@ -586,15 +585,6 @@ fn finish_decode_chunk_inexact_offset(
     // duplicating its bytes in the output.
     let mut reached_stream_end = false;
     let mut pending_stop_after_flush = false;
-    #[cfg(pure_inflate_decode)]
-    if let Some((eob_pos, eob_decoded, pending)) = bulk_handoff {
-        last_eob_pos = eob_pos;
-        last_eob_decoded_bytes = eob_decoded;
-        pending_stop_after_flush = pending;
-        stopping_point_reached = pending;
-        last_end_bit = inflate_start_bit;
-        already_decoded = chunk.data.len();
-    }
     // §5 step 5 (NEW wrapper / ResumableInflate2): the pure-rust backend no
     // longer has a `session` accumulator, so `session_pending()` is always
     // false. The old "keep looping to drain session" behavior (a6c0a8b) would
@@ -1328,12 +1318,16 @@ fn marker_decode_step(
             ctx.block_primed = true;
         }
         let block = &mut *block;
-        let slice_byte = ctx.current_bit_offset / 8;
-        let mut bits = ctx.open_bits(data);
 
-        let next_block_offset = absolute_bit_pos(slice_byte, &bits);
+        // P2: vendor `decodeChunkWithRapidgzip` decodes many blocks per outer
+        // iteration; batch here to avoid per-block consumer-loop overhead.
+        loop {
+            let slice_byte = ctx.current_bit_offset / 8;
+            let mut bits = ctx.open_bits(data);
 
-        if ctx.trailing_clean >= MAX_WINDOW_SIZE {
+            let next_block_offset = absolute_bit_pos(slice_byte, &bits);
+
+            if ctx.trailing_clean >= MAX_WINDOW_SIZE {
             let end_bit_offset = next_block_offset;
             ctx.current_bit_offset = end_bit_offset;
             let mut window = Vec::with_capacity(MAX_WINDOW_SIZE);
@@ -1467,17 +1461,16 @@ fn marker_decode_step(
         let end_bit_offset = absolute_bit_pos(slice_byte, &bits);
         ctx.current_bit_offset = end_bit_offset;
 
-        if block.is_last_block() {
-            return Ok((
-                MarkerStep::Finished {
-                    end_bit_offset,
-                    bfinal_hit: true,
-                },
-                flipped_clean,
-            ));
+            if block.is_last_block() {
+                return Ok((
+                    MarkerStep::Finished {
+                        end_bit_offset,
+                        bfinal_hit: true,
+                    },
+                    flipped_clean,
+                ));
+            }
         }
-
-        Ok((MarkerStep::Continue, flipped_clean))
     })
 }
 
