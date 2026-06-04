@@ -220,11 +220,11 @@ fn compress(data: &[u8], level: u32) -> Vec<u8> {
     enc.finish().unwrap()
 }
 
-// ── Marker-decoder (deflate_block::Block) fuzz differential ──────────────────
+// ── Marker-decoder (marker_inflate::Block) fuzz differential ──────────────────
 //
 // E2 gap closer: `decode_via_gzippy` above uses num_threads=1 and deliberately
 // avoids the parallel-SM / marker path, so the window-absent marker decoder
-// (`deflate_block::Block`) — the code the COLLAPSE (plans/decoder-plan.md E3)
+// (`marker_inflate::Block`) — the code the COLLAPSE (plans/decoder-plan.md E3)
 // will rewrite — had ZERO fuzz coverage (only one silesia md5). This decodes
 // raw DEFLATE through `Block` directly (from offset 0, empty window → all
 // output is clean, no markers emitted) and asserts byte-exactness vs both the
@@ -233,7 +233,7 @@ fn compress(data: &[u8], level: u32) -> Vec<u8> {
 #[cfg(pure_inflate_decode)]
 fn decode_via_deflate_block(gz: &[u8]) -> Vec<u8> {
     use crate::decompress::inflate::consume_first_decode::Bits;
-    use crate::decompress::parallel::deflate_block::Block;
+    use crate::decompress::parallel::marker_inflate::Block;
     use crate::decompress::parallel::replace_markers::MARKER_BASE;
 
     let (_h, header) =

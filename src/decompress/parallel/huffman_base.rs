@@ -135,7 +135,7 @@ impl<'a> LsbBitReader for super::block_finder::BitReader<'a> {
 
 // --- Adapter for `consume_first_decode::Bits` -----------------------------
 //
-// `deflate_block::Block` drives a `Bits` (the in-tree libdeflate-style bit
+// `marker_inflate::Block` drives a `Bits` (the in-tree libdeflate-style bit
 // reader) for both header parsing and the canonical-Huffman fallback. To
 // let the ported `HuffmanCodingSymbolsPerLength::decode` (and any future
 // variant) consume the same bit reader rather than requiring a separate
