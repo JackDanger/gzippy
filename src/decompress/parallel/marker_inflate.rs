@@ -306,24 +306,6 @@ pub struct Block {
     /// Tracked back-references (debug instrumentation).
     pub backreferences: Vec<Backreference>,
     track_backreferences: bool,
-    /// Reusable ISA-L lit/len decode table — allocated once in
-    /// `Block::new`, rebuilt in place at the start of each compressed
-    /// block. Mirror of `HuffmanCodingISAL` member storage in
-    /// `vendor/rapidgzip/.../huffman/HuffmanCodingISAL.hpp:185-188`.
-    #[cfg(all(
-        feature = "isal-compression",
-        not(feature = "pure-rust-inflate"),
-        target_arch = "x86_64"
-    ))]
-    isal_litlen: crate::decompress::parallel::isal_huffman::IsalLitLenCode,
-    /// Reusable ISA-L distance decode table — same reuse contract as
-    /// `isal_litlen`. Mirror of `HuffmanCodingDistanceISAL`.
-    #[cfg(all(
-        feature = "isal-compression",
-        not(feature = "pure-rust-inflate"),
-        target_arch = "x86_64"
-    ))]
-    isal_dist: crate::decompress::parallel::isal_huffman::IsalDistCode,
     /// Pure-Rust ISA-L LUT tables (byte-matched to igzip; same decode loop
     /// as the C `IsalLitLenCode` / `IsalDistCode` fields above).
     #[cfg(pure_inflate_decode)]
@@ -386,18 +368,6 @@ impl Block {
             ring_drained: 0,
             distance_to_last_marker_byte: 0,
             contains_marker_bytes: true,
-            #[cfg(all(
-                feature = "isal-compression",
-                not(feature = "pure-rust-inflate"),
-                target_arch = "x86_64"
-            ))]
-            isal_litlen: crate::decompress::parallel::isal_huffman::IsalLitLenCode::new_empty(),
-            #[cfg(all(
-                feature = "isal-compression",
-                not(feature = "pure-rust-inflate"),
-                target_arch = "x86_64"
-            ))]
-            isal_dist: crate::decompress::parallel::isal_huffman::IsalDistCode::new_empty(),
             #[cfg(pure_inflate_decode)]
             isal_litlen_pure:
                 crate::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure::new_empty(),
@@ -973,14 +943,6 @@ impl Block {
     ))]
     #[inline(always)]
     fn isal_lut_litlen_rebuild(&mut self, litlen_lens: &[u8]) -> bool {
-        #[cfg(all(
-            feature = "isal-compression",
-            not(feature = "pure-rust-inflate"),
-            target_arch = "x86_64"
-        ))]
-        {
-            return self.isal_litlen.rebuild_from(litlen_lens);
-        }
         #[cfg(pure_inflate_decode)]
         {
             return self.isal_litlen_pure.rebuild_from(litlen_lens);
@@ -1009,14 +971,6 @@ impl Block {
     ))]
     #[inline(always)]
     fn isal_lut_dist_rebuild(&mut self, dist_lens: &[u8]) -> bool {
-        #[cfg(all(
-            feature = "isal-compression",
-            not(feature = "pure-rust-inflate"),
-            target_arch = "x86_64"
-        ))]
-        {
-            return self.isal_dist.rebuild_from(dist_lens);
-        }
         #[cfg(pure_inflate_decode)]
         {
             return self.isal_dist_pure.rebuild_from(dist_lens);
@@ -1045,15 +999,6 @@ impl Block {
     ))]
     #[inline(always)]
     fn isal_lut_litlen_decode(&self, bits: &mut Bits) -> (u32, u32, u32) {
-        #[cfg(all(
-            feature = "isal-compression",
-            not(feature = "pure-rust-inflate"),
-            target_arch = "x86_64"
-        ))]
-        {
-            let d = self.isal_litlen.decode(bits);
-            return (d.symbol, d.sym_count, d.bit_count);
-        }
         #[cfg(pure_inflate_decode)]
         {
             let d = self.isal_litlen_pure.decode(bits);
@@ -1083,14 +1028,6 @@ impl Block {
     ))]
     #[inline(always)]
     fn isal_lut_dist_decode(&self, bits: &mut Bits) -> Option<(u32, u32)> {
-        #[cfg(all(
-            feature = "isal-compression",
-            not(feature = "pure-rust-inflate"),
-            target_arch = "x86_64"
-        ))]
-        {
-            return self.isal_dist.decode(bits);
-        }
         #[cfg(pure_inflate_decode)]
         {
             return self.isal_dist_pure.decode(bits);
