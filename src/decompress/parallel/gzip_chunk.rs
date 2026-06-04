@@ -109,6 +109,14 @@ pub static BULK_TAIL_SEGMENT_CONTINUES: std::sync::atomic::AtomicU64 =
 /// Bulk LUT declined; tail used ResumableInflate2 (should be rare with 32 KiB window).
 pub static BULK_TAIL_RESUMABLE_FALLBACK: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Times the reused thread-local marker→clean handoff window buffer had to GROW
+/// its capacity. Proves the per-chunk 32 KiB `clean_window: Vec<u8>` allocation
+/// is gone: this should settle at ≈ num_worker_threads (one grow per thread on
+/// first handoff) and then stay flat — NOT scale with the window-absent chunk
+/// count. If it tracks the chunk count, the buffer is being reallocated per
+/// chunk (the seam is not actually cut).
+pub static HANDOFF_WINDOW_BUF_GROWS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// `finish_clean_tail_decode` bulk loop saw `Handoff` with no bit advance (stall guard).
 #[cfg(pure_inflate_decode)]
 pub static BULK_HANDOFF_NO_PROGRESS: std::sync::atomic::AtomicU64 =
@@ -1002,6 +1010,41 @@ pub fn decode_chunk_window_absent(
     )
 }
 
+/// Narrow the clean 32 KiB window from the tail of `chunk.data_with_markers`
+/// into a REUSED thread-local buffer (not a fresh per-chunk `Vec<u8>`), then
+/// run the clean tail. This is the marker→clean handoff with the allocation
+/// seam removed: `is_last_n_clean` already confirmed the tail is clean, so the
+/// `copy_last_n_clean_u8` here clears+extends a capacity-stable buffer with no
+/// heap allocation after the first handoff on each worker thread.
+#[cfg(parallel_sm)]
+fn handoff_clean_tail(
+    chunk: &mut ChunkData,
+    input: &[u8],
+    end_bit_offset: usize,
+    stop_hint_bits: usize,
+    window_len: usize,
+) -> Result<(), ChunkDecodeError> {
+    use crate::decompress::parallel::deflate_block::MarkerSink;
+    use std::cell::RefCell;
+    thread_local! {
+        static WINDOW_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(32 * 1024));
+    }
+    WINDOW_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.capacity() < window_len {
+            HANDOFF_WINDOW_BUF_GROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let ok = chunk
+            .data_with_markers
+            .copy_last_n_clean_u8(window_len, &mut buf);
+        debug_assert!(
+            ok,
+            "handoff window tail not clean (is_last_n_clean disagreed with copy_last_n_clean_u8)"
+        );
+        finish_clean_tail_decode(chunk, input, end_bit_offset, stop_hint_bits, &buf, false)
+    })
+}
+
 /// `decodeChunkWithRapidgzip` body (GzipChunk.hpp:468-654).
 #[cfg(parallel_sm)]
 fn decode_chunk_with_rapidgzip_impl(
@@ -1076,7 +1119,7 @@ fn decode_chunk_with_rapidgzip_impl(
             MarkerStep::Continue => {}
             MarkerStep::Handoff {
                 end_bit_offset,
-                clean_window,
+                window_len,
             } => {
                 let markers_len = chunk.data_with_markers.len();
                 crate::decompress::parallel::trace_v2::emit_instant(
@@ -1095,13 +1138,12 @@ fn decode_chunk_with_rapidgzip_impl(
                 );
                 marker_span.take();
                 let t_inflate = std::time::Instant::now();
-                finish_clean_tail_decode(
+                handoff_clean_tail(
                     &mut chunk,
                     input,
                     end_bit_offset,
                     stop_hint_bits,
-                    &clean_window,
-                    false,
+                    window_len,
                 )?;
                 let inflate_us = t_inflate.elapsed().as_micros();
                 apply_slow_bootstrap_probe(marker_us);
@@ -1172,9 +1214,12 @@ enum MarkerStep {
     /// Another deflate block was decoded; call again.
     Continue,
     /// `cleanDataCount >= MAX_WINDOW_SIZE` at a block boundary — run streaming inflate next.
+    /// The clean 32 KiB window lives in the tail of `chunk.data_with_markers`
+    /// (verified all-clean by `is_last_n_clean`); the caller narrows it into a
+    /// reused thread-local buffer rather than allocating a per-chunk `Vec<u8>`.
     Handoff {
         end_bit_offset: usize,
-        clean_window: Vec<u8>,
+        window_len: usize,
     },
     /// Chunk ends in the marker path (BFINAL, stop hint, or no clean dict).
     Finished {
@@ -1226,32 +1271,6 @@ impl MarkerDecodeCtx {
     }
 }
 
-/// Result of one bootstrap pass over deflate blocks via
-/// [`deflate_block::Block`]. Mirrors the early-exit contract of
-/// rapidgzip's `decodeChunkWithRapidgzip` main loop
-/// (vendor/.../chunkdecoding/GzipChunk.hpp:468-654).
-#[cfg(parallel_sm)]
-struct DeflateBootstrap {
-    // The u16 marker/literal output is now written DIRECTLY into the caller's
-    // `data_with_markers` buffer (passed as `&mut impl MarkerSink`), not
-    // returned here — that's the zero-copy merge. This struct carries only the
-    // post-decode metadata the caller needs.
-    /// Bit position immediately after the last fully-decoded block.
-    /// Always at a real deflate block boundary, suitable as a resume
-    /// point for ISA-L's `isal_inflate_set_dict` + decode.
-    end_bit_offset: usize,
-    /// Last 32 KiB of clean (non-marker) output, present only when the
-    /// bootstrap saw ≥ MAX_WINDOW_SIZE cumulative clean bytes ending at
-    /// a block boundary (rapidgzip's `cleanDataCount >= MAX_WINDOW_SIZE`
-    /// at GzipChunk.hpp:521). When `None`, phase 2 cannot run because we
-    /// have no clean dict — either BFINAL fired first, `stop_hint_bits` was
-    /// reached, or no block produced enough clean data.
-    clean_window: Option<Vec<u8>>,
-    /// True when the bootstrap exited because it decoded a BFINAL=1
-    /// block. Single-stream tail; no further deflate data follows.
-    bfinal_hit: bool,
-}
-
 /// Counter: fresh `Vec::reserve(128*1024)` events from
 /// `take_bootstrap_output_from_pool`. Each is an mmap-eligible
 /// allocation (256 KiB u16 buffer > glibc mmap threshold). With
@@ -1297,110 +1316,6 @@ pub static BOOTSTRAP_OUTPUT_DROPPED: std::sync::atomic::AtomicU64 =
 /// `decodeChunkWithRapidgzip` (GzipChunk.hpp:468-654), restricted to the
 /// single-member case (no multi-stream loop) and with the handoff
 /// triggered exclusively by `cleanDataCount` (GzipChunk.hpp:520-525).
-#[cfg(parallel_sm)]
-fn bootstrap_with_deflate_block(
-    data: &[u8],
-    start_bit_offset: usize,
-    stop_hint_bits: usize,
-    output: &mut impl crate::decompress::parallel::deflate_block::MarkerSink,
-) -> Result<DeflateBootstrap, ChunkDecodeError> {
-    use crate::decompress::parallel::trace_v2;
-    let _tv2 = trace_v2::SpanGuard::begin_with(
-        "worker.bootstrap",
-        &format!(r#""start_bit":{start_bit_offset},"stop_hint":{stop_hint_bits}"#),
-    );
-    // Inner function so we can capture the Result and emit an outcome
-    // instant event before the SpanGuard drops. Per-attempt outcome
-    // attribution lets `scripts/timeline_analyze.py` correlate the
-    // 29 retries seen on silesia-large with their specific failure
-    // variant (header parse vs body invalid-huffman vs
-    // exceeded-window-range vs ...).
-    let result = bootstrap_with_deflate_block_inner(data, start_bit_offset, stop_hint_bits, output);
-    let markers_len = output.sink_len();
-    match &result {
-        Ok(b) => {
-            // handoff_reason: disambiguates the three Ok exit paths in
-            // `bootstrap_with_deflate_block_inner`:
-            //   - clean_window_armed: trailing_clean reached
-            //     MAX_WINDOW_SIZE at a block boundary; ISA-L will
-            //     take over (the "good" path).
-            //   - bfinal_hit: BFINAL block decoded; chunk is complete
-            //     in pure-Rust phase-1 alone.
-            //   - stop_hint_reached: the last block header was at-or-past
-            //     stop_hint_bits AND non-FixedHuffman AND not BFINAL;
-            //     decode stopped on the upcoming block (caller's
-            //     successor will re-decode that block).
-            // For the 6 heavy-tail chunks per silesia-large run that
-            // burn 200+ ms in bootstrap, the suspicion is they all hit
-            // either `bfinal_hit` or `stop_hint_reached` after running
-            // through the entire chunk without arming a clean window —
-            // this arg confirms or falsifies that prior.
-            let handoff_reason = if b.clean_window.is_some() {
-                "clean_window_armed"
-            } else if b.bfinal_hit {
-                "bfinal_hit"
-            } else {
-                "stop_hint_reached"
-            };
-            // bytes_decoded: the bootstrap-decoded byte count. Each u16
-            // in `b.markers` represents ONE decoded byte (high bits
-            // distinguish markers from clean bytes). Join with the
-            // worker.bootstrap span's duration to compute per-call MB/s
-            // for the Step-2 analyzer.
-            trace_v2::emit_instant(
-                "worker.bootstrap.outcome",
-                &format!(
-                    r#""result":"ok","markers_len":{},"end_bit":{},"clean_window":{},"bfinal":{},"handoff_reason":"{}","bytes_decoded":{}"#,
-                    markers_len,
-                    b.end_bit_offset,
-                    b.clean_window.is_some(),
-                    b.bfinal_hit,
-                    handoff_reason,
-                    markers_len,
-                ),
-                "t",
-            );
-        }
-        Err(e) => {
-            let kind = match e {
-                ChunkDecodeError::BootstrapFailed(io_err) => {
-                    let msg = io_err.to_string();
-                    // Extract the first identifying token of the inner
-                    // BlockError (e.g. "InvalidHuffmanCode"). The error
-                    // strings are formatted in bootstrap as
-                    // `"deflate body at bit ... : InvalidHuffmanCode"`
-                    // or `"deflate header at bit ...: InvalidHuffmanCode"`.
-                    if msg.contains("InvalidHuffmanCode") {
-                        "InvalidHuffmanCode"
-                    } else if msg.contains("ExceededWindowRange") {
-                        "ExceededWindowRange"
-                    } else if msg.contains("InvalidCompression") {
-                        "InvalidCompression"
-                    } else if msg.contains("InvalidCodeLengths") {
-                        "InvalidCodeLengths"
-                    } else if msg.contains("EndOfFile") {
-                        "EndOfFile"
-                    } else if msg.contains("past end of data") {
-                        "past_eof"
-                    } else if msg.contains("header") {
-                        "header_other"
-                    } else if msg.contains("body") {
-                        "body_other"
-                    } else {
-                        "other"
-                    }
-                }
-                _ => "non_bootstrap_err",
-            };
-            trace_v2::emit_instant(
-                "worker.bootstrap.outcome",
-                &format!(r#""result":"err","kind":"{kind}""#),
-                "t",
-            );
-        }
-    }
-    result
-}
 
 /// Decode one deflate block into `output` (vendor block loop body).
 #[cfg(parallel_sm)]
@@ -1437,12 +1352,14 @@ fn marker_decode_step(
             if ctx.trailing_clean >= MAX_WINDOW_SIZE {
             let end_bit_offset = next_block_offset;
             ctx.current_bit_offset = end_bit_offset;
-            let mut window = Vec::with_capacity(MAX_WINDOW_SIZE);
-            if output.copy_last_n_clean_u8(MAX_WINDOW_SIZE, &mut window) {
+            // The window lives in the tail of `output` (data_with_markers).
+            // Only confirm it is all-clean here (no copy); the caller narrows
+            // it into a reused thread-local buffer at handoff time.
+            if output.is_last_n_clean(MAX_WINDOW_SIZE) {
                 return Ok((
                     MarkerStep::Handoff {
                         end_bit_offset,
-                        clean_window: window,
+                        window_len: MAX_WINDOW_SIZE,
                     },
                     false,
                 ));
@@ -1579,53 +1496,6 @@ fn marker_decode_step(
             }
         }
     })
-}
-
-#[cfg(parallel_sm)]
-fn bootstrap_with_deflate_block_inner(
-    data: &[u8],
-    start_bit_offset: usize,
-    stop_hint_bits: usize,
-    output: &mut impl crate::decompress::parallel::deflate_block::MarkerSink,
-) -> Result<DeflateBootstrap, ChunkDecodeError> {
-    use crate::decompress::parallel::deflate_block::MAX_WINDOW_SIZE;
-
-    let mut ctx = MarkerDecodeCtx::new(data, start_bit_offset)?;
-    loop {
-        match marker_decode_step(&mut ctx, data, stop_hint_bits, output)?.0 {
-            MarkerStep::Continue => {}
-            MarkerStep::Handoff {
-                end_bit_offset,
-                clean_window,
-            } => {
-                return Ok(DeflateBootstrap {
-                    end_bit_offset,
-                    clean_window: Some(clean_window),
-                    bfinal_hit: false,
-                });
-            }
-            MarkerStep::Finished {
-                end_bit_offset,
-                bfinal_hit,
-            } => {
-                let clean_window = if output.sink_len() >= MAX_WINDOW_SIZE {
-                    let mut window = Vec::with_capacity(MAX_WINDOW_SIZE);
-                    if output.copy_last_n_clean_u8(MAX_WINDOW_SIZE, &mut window) {
-                        Some(window)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                return Ok(DeflateBootstrap {
-                    end_bit_offset,
-                    clean_window,
-                    bfinal_hit,
-                });
-            }
-        }
-    }
 }
 
 /// Compute the absolute bit position within `data` given that `bits`

@@ -677,6 +677,24 @@ fn drive_impl<W: std::io::Write>(
             EAGER_PROBE_MAX_PER_RUN.load(Ordering::Relaxed),
             EAGER_PROBE_REUSED.load(Ordering::Relaxed),
         );
+        // Unified-decoder migration counters (reimplement-isa-l):
+        //   handoff_window_grows ≈ num_worker_threads (one per thread, then
+        //     flat) PROVES the per-chunk `clean_window: Vec<u8>` alloc is gone.
+        //   resumable_fallback MUST be 0 with a 32 KiB window (no decline into
+        //     slow ResumableInflate2).
+        {
+            use crate::decompress::parallel::gzip_chunk::{
+                BULK_TAIL_RESUMABLE_FALLBACK, BULK_TAIL_SEGMENT_CONTINUES,
+                HANDOFF_WINDOW_BUF_GROWS, UNIFIED_MODE_CLEAN_FLIPS,
+            };
+            eprintln!(
+                "  Unified decoder: handoff_window_grows={} resumable_fallback={} bulk_segment_continues={} clean_flips={}",
+                HANDOFF_WINDOW_BUF_GROWS.load(Ordering::Relaxed),
+                BULK_TAIL_RESUMABLE_FALLBACK.load(Ordering::Relaxed),
+                BULK_TAIL_SEGMENT_CONTINUES.load(Ordering::Relaxed),
+                UNIFIED_MODE_CLEAN_FLIPS.load(Ordering::Relaxed),
+            );
+        }
         use crate::decompress::parallel::chunk_buffer_pool::*;
         eprintln!(
             "  Max concurrently-live ChunkData (in-flight depth): {}  (live now: {})",
