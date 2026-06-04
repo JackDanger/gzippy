@@ -253,6 +253,16 @@ impl<'a> Inflate<'a, Clean, Generic, Streaming> {
         self.inner.set_stopping_points(points)
     }
 
+    /// Coalesce END_OF_BLOCK returns until `stop_hint` (rapidgzip-warm decode).
+    pub fn set_coalesce_stop_hint(&mut self, stop_hint: usize) {
+        self.inner.set_coalesce_stop_hint(stop_hint)
+    }
+
+    /// Drain pre-header EOB boundaries from the last coalesced `read_stream`.
+    pub fn take_block_boundaries(&mut self) -> Vec<(usize, usize)> {
+        self.inner.take_block_boundaries()
+    }
+
     /// Decode into `output`, yielding when output fills or a stop point
     /// fires. The unified routing wrapper.
     ///

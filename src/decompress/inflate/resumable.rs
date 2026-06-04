@@ -263,6 +263,20 @@ pub struct ResumableInflate2<'a> {
     /// stopping point is configured. Mirrors vendor pattern
     /// (`consume_first_decode.rs:3091-3100`).
     pub(crate) pending_stream_header_stop: bool,
+    /// COALESCE (rapidgzip parity): when END_OF_BLOCK is a configured stopping
+    /// point, do NOT return to the caller at every deflate block boundary (which
+    /// re-enters the FASTLOOP cold each ~8-16 KiB block). Instead decode across
+    /// block boundaries — recording each pre-header EOB in `block_boundaries` —
+    /// and only return on END_OF_BLOCK once `bit_position >= coalesce_stop_hint`.
+    /// Default 0 ⇒ stop at every EOB (legacy per-block behavior, used by all
+    /// non-clean-tail callers). `resumable_resync` sets it to the chunk's
+    /// `stop_hint_bits` so the clean tail decodes warm like ISA-L's readStream.
+    pub(crate) coalesce_stop_hint: usize,
+    /// Pre-header EOB boundaries crossed during a coalesced `read_stream` call,
+    /// as `(bit_position, decoded_offset_relative_to_out_pos_start)`. The driver
+    /// drains this after each call and records subchunk boundaries. NOT recorded
+    /// for the BFINAL block (it transitions to `Finished`, not `AwaitingHeader`).
+    pub(crate) block_boundaries: Vec<(usize, usize)>,
 }
 
 impl<'a> ResumableInflate2<'a> {
@@ -288,7 +302,23 @@ impl<'a> ResumableInflate2<'a> {
             encoded_until_bits: until_bits.min(input_bits),
             dynamic_tables: None,
             pending_stream_header_stop: false,
+            coalesce_stop_hint: 0,
+            block_boundaries: Vec::new(),
         })
+    }
+
+    /// Enable block-boundary coalescing for the clean-tail decode: return on
+    /// END_OF_BLOCK only at the first pre-header EOB whose bit position reaches
+    /// `stop_hint`, recording all earlier boundaries inline. See field docs.
+    pub fn set_coalesce_stop_hint(&mut self, stop_hint: usize) {
+        self.coalesce_stop_hint = stop_hint;
+    }
+
+    /// Drain the pre-header EOB boundaries recorded during the last coalesced
+    /// `read_stream` call. Each is `(bit_position, decoded_offset_rel)` where the
+    /// offset is relative to that call's `out_pos_start`.
+    pub fn take_block_boundaries(&mut self) -> Vec<(usize, usize)> {
+        std::mem::take(&mut self.block_boundaries)
     }
 
     /// Seed the sliding window from a chunk's predecessor 32 KiB. Replaces
@@ -479,6 +509,7 @@ impl<'a> ResumableInflate2<'a> {
         );
 
         self.stopped_at = StoppingPoint::NONE;
+        self.block_boundaries.clear();
         let mut out_pos = out_pos_start;
 
         // Vendor multi-stream pattern: after `reset_for_next_stream`, the
@@ -598,8 +629,20 @@ impl<'a> ResumableInflate2<'a> {
             if matches!(self.block_state, BlockState::AwaitingHeader)
                 && self.points_to_stop_at.contains(StoppingPoint::END_OF_BLOCK)
             {
-                self.stopped_at = StoppingPoint::END_OF_BLOCK;
-                break;
+                // Pre-header EOB boundary. `AwaitingHeader` (not `Finished`) ⇒ this
+                // is NOT the BFINAL block, so it is always safe to record and to
+                // coalesce across. We stop strictly HERE (before the loop top runs
+                // `try_enter_next_block`), so the finalize bit is the clean
+                // pre-header EOB — never a parsed-header cursor (which would strand
+                // the successor on a fixed-Huffman boundary).
+                let bp = self.bits.bit_position();
+                self.block_boundaries.push((bp, out_pos - out_pos_start));
+                if bp >= self.coalesce_stop_hint {
+                    self.stopped_at = StoppingPoint::END_OF_BLOCK;
+                    break;
+                }
+                // else: COALESCE — fall through and decode the next block warm
+                // (default coalesce_stop_hint=0 ⇒ bp>=0 always ⇒ legacy per-block).
             }
 
             // No-progress check at loop bottom.

@@ -298,6 +298,42 @@ mod tests {
         );
     }
 
+    /// COALESCE correctness lock (rapidgzip parity): the clean-tail decoder now
+    /// warm-decodes ACROSS deflate block boundaries within a chunk, returning to
+    /// the driver only at the first pre-header EOB whose bit position reaches the
+    /// chunk's `stop_hint`. The danger this test guards is *successor-stranding*:
+    /// if the chunk finalizes at a parsed-header cursor (instead of the clean
+    /// pre-header EOB), the next chunk would resume mid-header and diverge —
+    /// most visibly on fixed-Huffman blocks (no dynamic-table preamble to resync
+    /// against). silesia (gzip-9, all-dynamic) cannot surface this; this fixture
+    /// is fixed-Huffman-heavy (mixed BTYPE=00/01) and is swept across thread
+    /// counts so chunk boundaries land on many different block boundaries.
+    /// See `resumable.rs` coalesce branch + `gzip_chunk.rs` resumable_resync drain.
+    #[test]
+    fn test_coalesce_fixed_huffman_multithread_byte_exact() {
+        let original = make_btype01_heavy_data(32 * 1024 * 1024);
+        let compressed = compress_single_member_gzip(&original);
+        assert!(
+            compressed.len() > 10 * 1024 * 1024,
+            "fixed-Huffman fixture must exceed the 10 MiB parallel gate (got {} bytes)",
+            compressed.len()
+        );
+        for threads in [2usize, 4, 8, 16] {
+            let mut output = Vec::new();
+            crate::decompress::decompress_single_member(&compressed, &mut output, threads)
+                .unwrap_or_else(|e| panic!("coalesce decode failed at T={threads}: {e:?}"));
+            assert_eq!(
+                output.len(),
+                original.len(),
+                "coalesce T={threads} length mismatch (successor-stranding?)"
+            );
+            assert_eq!(
+                output, original,
+                "coalesce T={threads} output mismatch — block-boundary coalescing strands the successor chunk"
+            );
+        }
+    }
+
     /// Pure incompressible bytes (PRNG), compressed into STORED deflate blocks
     /// via `Compression::none()` — what `gzip` produces on random data.
     fn make_high_entropy_data(size: usize) -> Vec<u8> {
