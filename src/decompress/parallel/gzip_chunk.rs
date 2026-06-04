@@ -253,37 +253,6 @@ pub fn decode_chunk(
 /// when writing.
 ///
 /// Measured +4.2% T=16 silesia on neurotic, byte-perfect across 11
-/// corpora (silesia/logs/software in gzip/pigz/bgzf flavors +
-/// urandom-100M) at T∈{1,4,16} — 33/33 pass.
-///
-/// **Default ON** as of the cross-corpus validation gate. To disable
-/// for A/B comparison: `GZIPPY_OPTION_A_PREFILL=0`.
-#[cfg(pure_inflate_decode)]
-fn use_option_a_prefill_path() -> bool {
-    use std::sync::OnceLock;
-    static USE_A: OnceLock<bool> = OnceLock::new();
-    *USE_A.get_or_init(|| match std::env::var("GZIPPY_OPTION_A_PREFILL") {
-        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false") => {
-            false
-        }
-        _ => true,
-    })
-}
-
-/// Stateless ISA-L-LUT bulk decode for the clean tail (`isal_lut_bulk`).
-/// Default ON on pure-rust builds; disable with `GZIPPY_ISAL_PURE_BULK=0`.
-#[cfg(pure_inflate_decode)]
-fn use_isal_pure_bulk_tail() -> bool {
-    use std::sync::OnceLock;
-    static USE_BULK: OnceLock<bool> = OnceLock::new();
-    *USE_BULK.get_or_init(|| match std::env::var("GZIPPY_ISAL_PURE_BULK") {
-        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false") => {
-            false
-        }
-        _ => true,
-    })
-}
-
 /// P2 unified clean tail (vendor `finishDecodeChunkWithInexactOffset`,
 /// GzipChunk.hpp:280-410): ISA-L LUT bulk loop first; ResumableInflate2 only
 /// when lookback is unavailable (< 32 KiB predecessor).
@@ -316,12 +285,11 @@ fn resumable_resync(
     // `has_window` flag distinguishing the two call paths above.
     let t_decode = std::time::Instant::now();
 
-    // Option A3 (default ON): pre-fill segment 0 with the predecessor's
+    // Option A3 (always on): pre-fill segment 0 with the predecessor's
     // 32 KiB window so back-references hit copy_match_fast via
-    // `output[..out_pos]`. Disable with `GZIPPY_OPTION_A_PREFILL=0`.
-    // The consumer skips `data_prefix_len` when writing (A4).
+    // `output[..out_pos]`. The consumer skips `data_prefix_len` when writing (A4).
     #[cfg(feature = "pure-rust-inflate")]
-    let full_window_tail = use_option_a_prefill_path() && initial_window.len() == MAX_WINDOW_SIZE;
+    let full_window_tail = initial_window.len() == MAX_WINDOW_SIZE;
     #[cfg(not(feature = "pure-rust-inflate"))]
     let full_window_tail = false;
     // A3: seed lookback into `chunk.data[0..32K]` once, before any tail bytes.
@@ -808,24 +776,6 @@ fn decode_chunk_unified_marker(
     }
 }
 
-#[cfg(parallel_sm)]
-fn apply_slow_bootstrap_probe(bootstrap_dur_us: u128) {
-    if let Some(pct) = std::env::var("GZIPPY_SLOW_BOOTSTRAP")
-        .ok()
-        .and_then(|s| s.parse::<u128>().ok())
-    {
-        let extra = std::time::Duration::from_micros((bootstrap_dur_us * pct / 100) as u64);
-        if std::env::var_os("GZIPPY_SLOW_BOOTSTRAP_SLEEP").is_some() {
-            std::thread::sleep(extra);
-        } else {
-            let until = std::time::Instant::now() + extra;
-            while std::time::Instant::now() < until {
-                std::hint::spin_loop();
-            }
-        }
-    }
-}
-
 /// One iteration of the vendor `decodeChunkWithRapidgzip` block loop.
 #[cfg(parallel_sm)]
 enum MarkerStep {
@@ -1227,38 +1177,6 @@ mod tests {
             out.extend_from_slice(seg);
         }
         out
-    }
-
-    /// ISA-L-LUT bulk clean tail must match the resumable wrapper byte-for-byte.
-    #[cfg(pure_inflate_decode)]
-    #[test]
-    fn bulk_clean_tail_matches_resumable_wrapper() {
-        let payload = b"the quick brown fox ".repeat(50_000);
-        let deflate = make_multi_block_deflate(&payload);
-        let cfg = ChunkConfiguration {
-            split_chunk_size: 512 * 1024,
-            max_decoded_chunk_size: 20 * 512 * 1024,
-            crc32_enabled: true,
-        };
-        let stop_hint_bits = deflate.len() * 8;
-        let window = [0u8; 32 * 1024];
-
-        let chunk_bulk = {
-            std::env::set_var("GZIPPY_ISAL_PURE_BULK", "1");
-            std::env::set_var("GZIPPY_OPTION_A_PREFILL", "1");
-            decode_chunk(&deflate, 0, stop_hint_bits, &window[..], cfg).unwrap()
-        };
-        let chunk_wrap = {
-            std::env::set_var("GZIPPY_ISAL_PURE_BULK", "0");
-            std::env::set_var("GZIPPY_OPTION_A_PREFILL", "1");
-            decode_chunk(&deflate, 0, stop_hint_bits, &window[..], cfg).unwrap()
-        };
-        assert_eq!(
-            chunk_bulk.data.to_contiguous(),
-            chunk_wrap.data.to_contiguous(),
-            "bulk_lut vs resumable wrapper clean tail diverged"
-        );
-        assert_eq!(flatten(&chunk_bulk), flatten(&chunk_wrap));
     }
 
     /// MICROBENCH (advisor-prescribed disambiguation): is the ISA-L multi-symbol
