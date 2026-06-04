@@ -2461,8 +2461,10 @@ fn resolve_chunk_markers_on_chunk(chunk: &mut ChunkData, predecessor_window: &[u
     } else {
         POST_PROCESS_SMALL_MARKERS_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    apply_window(chunk, predecessor_window);
-    chunk.narrow_markers_in_place();
+    // Fused one-pass resolve+narrow (64 KiB u8 LUT) replacing the two-pass
+    // apply_window (resolve u16→u16, 128 KiB u16 LUT) + narrow_markers_in_place
+    // (u16→u8). Halves the passes over data_with_markers and the LUT size.
+    chunk.resolve_and_narrow_markers_in_place(predecessor_window);
     chunk.populate_subchunk_windows(predecessor_window);
     chunk.update_narrowed_crc();
     chunk.recycle_markers_after_resolution();

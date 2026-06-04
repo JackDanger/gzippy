@@ -422,6 +422,46 @@ impl SegmentedU16 {
         }
     }
 
+    /// FUSED resolve + narrow in a SINGLE pass with a 64 KiB u8 LUT.
+    /// Equivalent to `resolve_markers_u16(window)` followed by
+    /// `narrow_markers_to_u8_in_place()` but in ONE pass over the data and
+    /// with a 64 KiB u8 LUT instead of a 128 KiB u16 LUT — the same hot loop
+    /// as the (unwired) [`Self::resolve_in_place`], kept type-preserving so the
+    /// downstream narrowed readers (CRC, iovecs, subchunk windows) are
+    /// unchanged. After this call the low `len` bytes of each segment hold the
+    /// resolved u8 output; the buffer stays a `SegmentedU16`.
+    ///
+    /// SAFETY of the in-place u16→u8 overwrite: we read element `i` (u16 at
+    /// byte offset `2i`) then write the resolved byte at offset `i`. Since
+    /// `i <= 2i` and we iterate left-to-right, every write lands on a byte of
+    /// an element already read this pass — never clobbers an unread element.
+    pub fn resolve_and_narrow_in_place(&mut self, window: &[u8]) {
+        if self.cached_len == 0 {
+            return;
+        }
+        debug_assert_eq!(window.len(), 32768);
+        let mut lut = [0u8; 65536];
+        for (i, slot) in lut[0..256].iter_mut().enumerate() {
+            *slot = i as u8;
+        }
+        lut[MARKER_BASE as usize..MARKER_BASE as usize + 32768].copy_from_slice(window);
+        for seg in &mut self.segments {
+            let n = seg.len();
+            if n == 0 {
+                continue;
+            }
+            let base = seg.as_mut_ptr() as *mut u8;
+            let src = seg.as_ptr();
+            for i in 0..n {
+                // SAFETY: read element i in [0,n); write byte i (< n <= 2n).
+                let v = unsafe { *src.add(i) };
+                unsafe {
+                    base.add(i).write(lut[v as usize]);
+                }
+            }
+        }
+    }
+
     /// Copy `len` u8 bytes starting at logical narrowed offset `from` into
     /// `out` (must have room). Used by `populate_subchunk_windows`.
     pub fn copy_narrowed_u8_range_into(&self, from: usize, len: usize, out: &mut [u8]) {
