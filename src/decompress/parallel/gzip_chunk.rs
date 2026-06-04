@@ -117,6 +117,10 @@ pub static BULK_TAIL_RESUMABLE_FALLBACK: std::sync::atomic::AtomicU64 =
 /// chunk (the seam is not actually cut).
 pub static HANDOFF_WINDOW_BUF_GROWS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Chunks where the unified marker driver failed at a bad 4 MiB speculative seed
+/// and fell to the internal resumable re-sync (the goal's accepted re-sync).
+/// Should be ~0 for real-boundary chunks and bounded by the speculative-seed count.
+pub static BAD_SEED_RESYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// `finish_clean_tail_decode` bulk loop saw `Handoff` with no bit advance (stall guard).
 #[cfg(pure_inflate_decode)]
 pub static BULK_HANDOFF_NO_PROGRESS: std::sync::atomic::AtomicU64 =
@@ -1024,86 +1028,67 @@ fn decode_chunk_with_rapidgzip_impl(
     // Envelope span: `chunk_fetcher::run_decode_task` (`worker.decode_chunk`).
     let t_decode = std::time::Instant::now();
 
-    let start_clean_only = initial_window.len() == MAX_WINDOW_SIZE
-        || (initial_window.is_empty() && encoded_offset_bits == 0);
-
-    let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
-
-    if start_clean_only {
-        let t_inflate = std::time::Instant::now();
-        finish_clean_tail_decode(
-            &mut chunk,
-            input,
-            encoded_offset_bits,
-            stop_hint_bits,
-            initial_window,
-            false,
-        )?;
-        let inflate_us = t_inflate.elapsed().as_micros();
-        if trace::is_enabled() {
-            trace::emit(
-                "worker",
-                "decode_span",
-                &format!(
-                    r#""start_bit":{encoded_offset_bits},"bootstrap_us":0,"inflate_us":{inflate_us},"phase":"clean_only","markers":0,"tail_bytes":{}"#,
-                    chunk.data.len(),
-                ),
-            );
+    // ONE unified decode driver (vendor single deflate::Block shape): the marker
+    // engine decodes the WHOLE chunk into data_with_markers — emitting u16 markers
+    // while the predecessor window is absent and flipping mid-stream to clean u16
+    // without restarting — resolved later on the publish chain. There is no
+    // separate clean-tail entry. On a bad speculative-seed decode failure (4 MiB
+    // partition guesses that aren't real block boundaries), fall to the resumable
+    // re-sync, kept ONLY as an internal correctness strategy (the goal's accepted
+    // re-sync), never an outer fallback ladder.
+    let _ = &initial_window;
+    match decode_chunk_unified_marker(input, encoded_offset_bits, stop_hint_bits, configuration) {
+        Ok(mut chunk) => {
+            chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+            Ok(chunk)
         }
-        chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
-        return Ok(chunk);
+        Err(marker_err) => {
+            BAD_SEED_RESYNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
+            finish_clean_tail_decode(
+                &mut chunk,
+                input,
+                encoded_offset_bits,
+                stop_hint_bits,
+                initial_window,
+                false,
+            )
+            .map_err(|_| marker_err)?;
+            chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+            Ok(chunk)
+        }
     }
+}
 
+/// The ONE unified decode driver. `marker_inflate::Block` emits u16 markers while
+/// the predecessor window is absent and flips mid-stream to clean u16 (no restart),
+/// decoding the whole chunk into `data_with_markers`; the chunk ends at BFINAL or
+/// the `stop_hint` partition boundary. Returns `Err` on a bad speculative seed so
+/// the caller can fall to the internal resumable re-sync.
+#[cfg(parallel_sm)]
+fn decode_chunk_unified_marker(
+    input: &[u8],
+    encoded_offset_bits: usize,
+    stop_hint_bits: usize,
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
     chunk.data_with_markers.reserve(128 * 1024);
     let mut marker_ctx = MarkerDecodeCtx::new(input, encoded_offset_bits)?;
-
-    let mut marker_us: u128 = 0;
-    let mut marker_span: Option<crate::decompress::parallel::trace_v2::SpanGuard> = None;
     loop {
-        if marker_span.is_none() {
-            marker_span = Some(
-                crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
-                    "worker.bootstrap",
-                    &format!(r#""start_bit":{encoded_offset_bits},"stop_hint":{stop_hint_bits}"#,),
-                ),
-            );
-        }
-        let t_marker = std::time::Instant::now();
         let (step, flipped_clean) = marker_decode_step(
             &mut marker_ctx,
             input,
             stop_hint_bits,
             &mut chunk.data_with_markers,
         )?;
-        marker_us += t_marker.elapsed().as_micros();
         if flipped_clean {
             UNIFIED_MODE_CLEAN_FLIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-
         match step {
             MarkerStep::Continue => {}
-            MarkerStep::Finished {
-                end_bit_offset,
-                bfinal_hit,
-            } => {
-                marker_span.take();
+            MarkerStep::Finished { end_bit_offset, .. } => {
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
-                if trace::is_enabled() {
-                    let phase = if bfinal_hit {
-                        "bootstrap_terminal"
-                    } else {
-                        "bootstrap_only"
-                    };
-                    trace::emit(
-                        "worker",
-                        "decode_span",
-                        &format!(
-                            r#""start_bit":{encoded_offset_bits},"bootstrap_us":{marker_us},"inflate_us":0,"phase":"{phase}","markers":{}"#,
-                            chunk.data_with_markers.len(),
-                        ),
-                    );
-                }
-                chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
                 chunk.finalize(end_bit_offset);
                 return Ok(chunk);
             }
