@@ -51,6 +51,26 @@ pub trait MarkerSink {
         out.extend(slice.iter().map(|&v| v as u8));
         true
     }
+
+    /// True iff the last `n` sink elements are all clean (`< MARKER_BASE`).
+    /// Cheap predicate (no copy) so the marker→clean handoff can decide
+    /// Handoff-vs-Finished WITHOUT materializing a window buffer — the
+    /// caller narrows the clean tail into a reused thread-local buffer
+    /// only once the handoff is confirmed (kills the per-chunk 32 KiB
+    /// `Vec<u8>` clean-window allocation).
+    ///
+    /// Routed through `trailing_clean_since` (NOT `as_slice`) so it is
+    /// correct for SEGMENTED sinks: `SegmentedU16::as_slice()` returns `&[]`
+    /// (segmented storage is not one contiguous slice) and overrides
+    /// `trailing_clean_since` with a segment-aware scan. The `Vec<u16>`
+    /// default `trailing_clean_since` uses `as_slice`, which is contiguous.
+    fn is_last_n_clean(&self, n: usize) -> bool {
+        let len = self.sink_len();
+        if n == 0 || n > len {
+            return false;
+        }
+        self.trailing_clean_since(len - n) >= n
+    }
 }
 
 impl MarkerSink for Vec<u16> {
