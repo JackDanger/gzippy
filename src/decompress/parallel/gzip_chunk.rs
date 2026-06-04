@@ -1261,6 +1261,96 @@ mod tests {
         assert_eq!(flatten(&chunk_bulk), flatten(&chunk_wrap));
     }
 
+    /// MICROBENCH (advisor-prescribed disambiguation): is the ISA-L multi-symbol
+    /// bulk-LUT (`decode_block`) actually faster than the single-symbol resumable
+    /// (`ResumableInflate2` via `IsalInflateWrapper`) on THIS code state, over a
+    /// REAL silesia clean span (dynamic Huffman)? The locked-Fulcrum lever says
+    /// the clean decode tail is the wall (798ms gzippy vs 305ms rapidgzip, T8);
+    /// the FlipToClean tail currently runs 100% through resumable. Only integrate
+    /// a bulk-LUT clean tail if it wins here. Run:
+    ///   cargo test --release --lib --target x86_64-apple-darwin \
+    ///     --no-default-features --features pure-rust-inflate \
+    ///     -- --ignored --nocapture clean_tail_engine_microbench
+    #[cfg(pure_inflate_decode)]
+    #[test]
+    #[ignore = "manual perf microbench; needs /tmp/ref_silesia.bin"]
+    fn clean_tail_engine_microbench() {
+        use crate::decompress::inflate::consume_first_decode::Bits;
+        use crate::decompress::parallel::inflate_wrapper::IsalInflateWrapper;
+        use crate::decompress::parallel::isal_lut_bulk::{decode_block, DecoderScratch};
+        use std::time::Instant;
+
+        let raw = match std::fs::read("/tmp/ref_silesia.bin") {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("SKIP: /tmp/ref_silesia.bin absent");
+                return;
+            }
+        };
+        // ~8 MiB of real silesia → dynamic-Huffman blocks, realistic literal/
+        // backref mix (NOT synthetic repeat() which is backref-degenerate).
+        let payload = &raw[..(8 * 1024 * 1024).min(raw.len())];
+        let deflate = make_deflate(payload);
+        let n = payload.len();
+        let iters = 7;
+
+        // ── bulk-LUT (decode_block) ──
+        let mut bulk_out = vec![0u8; n + 64];
+        let mut best_bulk = f64::MAX;
+        for _ in 0..iters {
+            let mut bits = Bits::new(&deflate);
+            let mut out_pos = 0usize;
+            let mut scratch = DecoderScratch::new();
+            let t = Instant::now();
+            loop {
+                let r = decode_block(&mut bits, &mut bulk_out, &mut out_pos, &[], &mut scratch)
+                    .expect("bulk decode");
+                if r.is_final_block {
+                    break;
+                }
+            }
+            best_bulk = best_bulk.min(t.elapsed().as_secs_f64());
+            assert_eq!(&bulk_out[..n], payload, "bulk output mismatch");
+        }
+
+        // ── resumable (ResumableInflate2 via IsalInflateWrapper) ──
+        let mut res_out = vec![0u8; n + 64];
+        let mut best_res = f64::MAX;
+        for _ in 0..iters {
+            let mut wrapper =
+                IsalInflateWrapper::with_until_bits(&deflate, 0, deflate.len() * 8).unwrap();
+            wrapper.set_window(&[]).unwrap();
+            let mut out_pos = 0usize;
+            let t = Instant::now();
+            loop {
+                let r = wrapper
+                    .read_stream(&mut res_out[out_pos..])
+                    .expect("resumable decode");
+                out_pos += r.bytes_written;
+                if r.finished || (r.bytes_written == 0 && out_pos >= n) {
+                    break;
+                }
+                if r.bytes_written == 0 {
+                    break;
+                }
+            }
+            best_res = best_res.min(t.elapsed().as_secs_f64());
+            assert_eq!(&res_out[..n], payload, "resumable output mismatch");
+        }
+
+        let mbps = |s: f64| (n as f64 / (1024.0 * 1024.0)) / s;
+        eprintln!(
+            "CLEAN-TAIL MICROBENCH (n={} MiB, best-of-{}):\n  bulk-LUT  {:.3}ms  {:.0} MB/s\n  resumable {:.3}ms  {:.0} MB/s\n  bulk/resumable speedup = {:.2}x  (advisor gate: integrate if >= 1.5x)",
+            n / 1024 / 1024,
+            iters,
+            best_bulk * 1e3,
+            mbps(best_bulk),
+            best_res * 1e3,
+            mbps(best_res),
+            best_res / best_bulk,
+        );
+    }
+
     #[test]
     fn decode_chunk_from_bit_0_matches_payload() {
         let payload = b"abcdefghij".repeat(200_000);
