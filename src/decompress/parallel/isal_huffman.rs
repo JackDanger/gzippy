@@ -8,7 +8,7 @@
 //! `ConsumeFirstTable` (~14 MB/s/thread).
 //!
 //! Ported alongside the rest of `vendor/.../gzip/deflate.hpp` (see
-//! `deflate_block`) so the bootstrap decoder's Huffman lookups can run
+//! `marker_inflate`) so the bootstrap decoder's Huffman lookups can run
 //! at ISA-L's table-lookup speed when wired in. Distance codes still use
 //! the existing pure-Rust path — they're a small fraction of decode work.
 //!

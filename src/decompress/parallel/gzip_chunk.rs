@@ -5,7 +5,7 @@
 //! - [`decode_chunk_with_rapidgzip`] — vendor `decodeChunkWithRapidgzip` +
 //!   `finishDecodeChunkWithInexactOffset` on one [`ChunkData`]:
 //!   one outer decode iteration (`worker.decode_chunk`) alternates
-//!   `deflate_block` blocks (u16 markers) until 32 KiB clean, then streaming
+//!   `marker_inflate` blocks (u16 markers) until 32 KiB clean, then streaming
 //!   inflate on the same [`ChunkData`].
 //! - [`decode_chunk`] — production entry (known 32 KiB window or chunk 0).
 //! - [`decode_chunk_window_absent`] — marker bootstrap + clean tail (no window).
@@ -581,7 +581,7 @@ fn finish_clean_tail_decode(
     initial_window: &[u8],
     record_decode_duration: bool,
 ) -> Result<(), ChunkDecodeError> {
-    use crate::decompress::parallel::deflate_block::MAX_WINDOW_SIZE;
+    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
 
     // `worker.isal_stream_inflate` span — wraps every invocation of
     // gzippy's ISA-L stream-inflate path. Both call sites land here:
@@ -1024,7 +1024,7 @@ fn handoff_clean_tail(
     stop_hint_bits: usize,
     window_len: usize,
 ) -> Result<(), ChunkDecodeError> {
-    use crate::decompress::parallel::deflate_block::MarkerSink;
+    use crate::decompress::parallel::marker_inflate::MarkerSink;
     use std::cell::RefCell;
     thread_local! {
         static WINDOW_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(32 * 1024));
@@ -1054,7 +1054,7 @@ fn decode_chunk_with_rapidgzip_impl(
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    use crate::decompress::parallel::deflate_block::MAX_WINDOW_SIZE;
+    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
 
     // Envelope span: `chunk_fetcher::run_decode_task` (`worker.decode_chunk`).
     let t_decode = std::time::Instant::now();
@@ -1323,9 +1323,9 @@ fn marker_decode_step(
     ctx: &mut MarkerDecodeCtx,
     data: &[u8],
     stop_hint_bits: usize,
-    output: &mut impl crate::decompress::parallel::deflate_block::MarkerSink,
+    output: &mut impl crate::decompress::parallel::marker_inflate::MarkerSink,
 ) -> Result<(MarkerStep, bool), ChunkDecodeError> {
-    use crate::decompress::parallel::deflate_block::{Block, MAX_WINDOW_SIZE};
+    use crate::decompress::parallel::marker_inflate::{Block, MAX_WINDOW_SIZE};
     use crate::decompress::parallel::trace_v2;
     use std::cell::RefCell;
 
@@ -1417,7 +1417,7 @@ fn marker_decode_step(
                     .fetch_add(bytes_wasted as u64, std::sync::atomic::Ordering::Relaxed);
                 BODY_FAIL_BITS_INTO_BODY
                     .fetch_add(bits_into_body as u64, std::sync::atomic::Ordering::Relaxed);
-                use crate::decompress::parallel::deflate_block::BlockError;
+                use crate::decompress::parallel::marker_inflate::BlockError;
                 match &e {
                     BlockError::InvalidHuffmanCode => {
                         BODY_FAIL_INVALID_HUFFMAN

@@ -915,7 +915,7 @@ impl<'a> BlockFinder<'a> {
     /// candidates that fail later in `try_speculative_decode_candidate`.
     /// On silesia (May 2026), the loose check produced ~58 false
     /// positives per decode; vendor reports 0. Each FP triggers a full
-    /// `bootstrap_with_deflate_block` candidate trial before erroring
+    /// `bootstrap_with_marker_inflate` candidate trial before erroring
     /// out, accounting for ~0.55s of useless worker time.
     fn is_valid_huffman_lengths(&self, lengths: &[u8]) -> bool {
         // MAX_CODE_LENGTH for deflate literal/distance alphabets is 15

@@ -151,7 +151,7 @@ impl SegmentedU16 {
     /// vendor's `appendToEquallySizedChunks` (DecodedData.hpp:243-258).
     ///
     /// This is the decoder's write path (via
-    /// [`crate::decompress::parallel::deflate_block::MarkerSink`]).
+    /// [`crate::decompress::parallel::marker_inflate::MarkerSink`]).
     pub fn push_slice(&mut self, values: &[u16]) {
         let mut src = values;
         while !src.is_empty() {
@@ -693,7 +693,7 @@ impl ResolvedMarkers {
 /// `push_slice` is the append-only write path (the inner decoder's own
 /// 32 KiB output_ring resolves all back-refs, so the sink never reads
 /// itself), and the two tail accessors serve the clean-window arming.
-impl crate::decompress::parallel::deflate_block::MarkerSink for SegmentedU16 {
+impl crate::decompress::parallel::marker_inflate::MarkerSink for SegmentedU16 {
     #[inline]
     fn push_slice(&mut self, values: &[u16]) {
         SegmentedU16::push_slice(self, values);
