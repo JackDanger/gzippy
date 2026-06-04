@@ -910,104 +910,6 @@ pub fn decode_chunk_window_absent(
     )
 }
 
-/// Rapidgzip-shaped sink: markers stay in `data_with_markers`; once the block
-/// flips to clean mode, literals and resolved backrefs go to `chunk.data` as u8
-/// (same decoder, no second inflate stage for those bytes).
-#[cfg(parallel_sm)]
-struct UnifiedChunkMarkerSink<'a> {
-    chunk: &'a mut ChunkData,
-    route_clean_to_data: bool,
-    /// `data_with_markers.len()` at the flip — `trailing_clean_since(from)` only
-    /// applies to marker indices at or above this.
-    marker_len_at_flip: usize,
-}
-
-#[cfg(parallel_sm)]
-impl<'a> crate::decompress::parallel::deflate_block::MarkerSink for UnifiedChunkMarkerSink<'a> {
-    fn push_slice(&mut self, values: &[u16]) {
-        use crate::decompress::parallel::replace_markers::MARKER_BASE;
-        if !self.route_clean_to_data {
-            self.chunk.data_with_markers.push_slice(values);
-            return;
-        }
-        let mut i = 0usize;
-        while i < values.len() {
-            if values[i] >= MARKER_BASE {
-                self.chunk.data_with_markers.push_slice(&values[i..i + 1]);
-                i += 1;
-                continue;
-            }
-            let start = i;
-            while i < values.len() && values[i] < MARKER_BASE {
-                i += 1;
-            }
-            let run = &values[start..i];
-            let bytes: Vec<u8> = run.iter().map(|&v| v as u8).collect();
-            let n = bytes.len();
-            self.chunk.append_clean(&bytes);
-            UNIFIED_ROUTE_CLEAN_U8_BYTES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    fn sink_len(&self) -> usize {
-        if self.route_clean_to_data {
-            self.marker_len_at_flip + (self.chunk.data.len() - self.chunk.data_prefix_len)
-        } else {
-            self.chunk.data_with_markers.len()
-        }
-    }
-
-    fn as_slice(&self) -> &[u16] {
-        // Only used for trailing_clean on the marker-only path.
-        self.chunk.data_with_markers.as_slice()
-    }
-
-    fn trailing_clean_since(&self, from: usize) -> usize {
-        if self.route_clean_to_data {
-            self.chunk
-                .data
-                .len()
-                .saturating_sub(self.chunk.data_prefix_len)
-        } else {
-            self.as_slice()[from..]
-                .iter()
-                .rev()
-                .take_while(|&&v| v < crate::decompress::parallel::replace_markers::MARKER_BASE)
-                .count()
-        }
-    }
-
-    fn copy_last_n_clean_u8(&self, n: usize, out: &mut Vec<u8>) -> bool {
-        use crate::decompress::parallel::replace_markers::MARKER_BASE;
-        if self.route_clean_to_data {
-            let clean_len = self
-                .chunk
-                .data
-                .len()
-                .saturating_sub(self.chunk.data_prefix_len);
-            if n == 0 || n > clean_len {
-                return false;
-            }
-            out.resize(n, 0);
-            let start = self.chunk.data.len() - n;
-            self.chunk.data.copy_range_into(start, out);
-            return true;
-        }
-        let len = self.chunk.data_with_markers.len();
-        if n == 0 || n > len {
-            return false;
-        }
-        let start = len - n;
-        let slice = &self.chunk.data_with_markers.as_slice()[start..];
-        if slice.iter().any(|&v| v >= MARKER_BASE) {
-            return false;
-        }
-        out.clear();
-        out.extend(slice.iter().map(|&v| v as u8));
-        true
-    }
-}
-
 /// `decodeChunkWithRapidgzip` body (GzipChunk.hpp:468-654).
 #[cfg(parallel_sm)]
 fn decode_chunk_with_rapidgzip_impl(
@@ -1044,9 +946,6 @@ fn decode_chunk_with_rapidgzip_impl(
     let mut marker_us: u128 = 0;
     let mut inflate_us: u128 = 0;
     let mut marker_span: Option<crate::decompress::parallel::trace_v2::SpanGuard> = None;
-    let mut route_clean_to_data = false;
-    let mut marker_len_at_flip = 0usize;
-
     'decode: loop {
         if inflate_phase {
             let t_inflate = std::time::Instant::now();
@@ -1072,27 +971,11 @@ fn decode_chunk_with_rapidgzip_impl(
         }
         let ctx = marker_ctx.as_mut().expect("marker ctx");
         let t_marker = std::time::Instant::now();
-        let (step, flipped_clean) = {
-            let mut unified_sink = UnifiedChunkMarkerSink {
-                chunk: &mut chunk,
-                route_clean_to_data,
-                marker_len_at_flip,
-            };
-            marker_decode_step(ctx, input, stop_hint_bits, &mut unified_sink)?
-        };
+        let (step, flipped_clean) =
+            marker_decode_step(ctx, input, stop_hint_bits, &mut chunk.data_with_markers)?;
         marker_us += t_marker.elapsed().as_micros();
-        if flipped_clean && !route_clean_to_data {
-            route_clean_to_data = true;
-            marker_len_at_flip = chunk.data_with_markers.len();
+        if flipped_clean {
             UNIFIED_MODE_CLEAN_FLIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            crate::decompress::parallel::trace_v2::emit_instant(
-                "worker.bootstrap.mode_clean",
-                &format!(
-                    r#""marker_len":{marker_len_at_flip},"clean_data_len":{}"#,
-                    chunk.data.len()
-                ),
-                "t",
-            );
         }
 
         match step {
@@ -1105,7 +988,7 @@ fn decode_chunk_with_rapidgzip_impl(
                 crate::decompress::parallel::trace_v2::emit_instant(
                     "worker.bootstrap.outcome",
                     &format!(
-                        r#""result":"ok","markers_len":{markers_len},"end_bit":{end_bit_offset},"clean_window":true,"bfinal":false,"handoff_reason":"clean_window_armed","bytes_decoded":{markers_len},"route_clean":{route_clean_to_data}"#,
+                        r#""result":"ok","markers_len":{markers_len},"end_bit":{end_bit_offset},"clean_window":true,"bfinal":false,"handoff_reason":"clean_window_armed","bytes_decoded":{markers_len}"#,
                     ),
                     "t",
                 );
@@ -1117,23 +1000,19 @@ fn decode_chunk_with_rapidgzip_impl(
                     "t",
                 );
                 inflate_start_bit = end_bit_offset;
-                if route_clean_to_data
-                    && chunk.data.len().saturating_sub(chunk.data_prefix_len) >= MAX_WINDOW_SIZE
-                {
-                    inflate_window.clear();
-                } else {
-                    if chunk.data.is_empty() && clean_window.len() == MAX_WINDOW_SIZE {
-                        #[cfg(pure_inflate_decode)]
-                        if use_option_a_prefill_path() {
-                            chunk.prefill_window_prefix(&clean_window);
-                        } else {
-                            chunk.append_clean(&clean_window);
-                        }
-                        #[cfg(not(pure_inflate_decode))]
-                        chunk.append_clean(&clean_window);
-                    } else if !clean_window.is_empty() {
-                        chunk.append_clean(&clean_window);
+                if chunk.data.is_empty() && clean_window.len() == MAX_WINDOW_SIZE {
+                    #[cfg(pure_inflate_decode)]
+                    if use_option_a_prefill_path() {
+                        chunk.prefill_window_prefix(&clean_window);
+                        inflate_window.clear();
+                    } else {
+                        inflate_window = clean_window;
                     }
+                    #[cfg(not(pure_inflate_decode))]
+                    {
+                        inflate_window = clean_window;
+                    }
+                } else {
                     inflate_window = clean_window;
                 }
                 inflate_phase = true;
