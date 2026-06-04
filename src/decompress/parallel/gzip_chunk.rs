@@ -1276,7 +1276,7 @@ mod tests {
     #[ignore = "manual perf microbench; needs /tmp/ref_silesia.bin"]
     fn clean_tail_engine_microbench() {
         use crate::decompress::inflate::consume_first_decode::Bits;
-        use crate::decompress::parallel::inflate_wrapper::IsalInflateWrapper;
+        use crate::decompress::parallel::inflate_wrapper::{IsalInflateWrapper, StoppingPoints};
         use crate::decompress::parallel::isal_lut_bulk::{decode_block, DecoderScratch};
         use std::time::Instant;
 
@@ -1289,8 +1289,15 @@ mod tests {
         };
         // ~8 MiB of real silesia → dynamic-Huffman blocks, realistic literal/
         // backref mix (NOT synthetic repeat() which is backref-degenerate).
+        // Multi-block (sync flush every 32 KiB) to mirror silesia's block density
+        // so the per-block stopping-point overhead is exercised.
         let payload = &raw[..(8 * 1024 * 1024).min(raw.len())];
+        // Single-stream for the engine comparison (apples-to-apples with the
+        // first run). Multi-block (sync flush every 32 KiB) for the per-block
+        // stopping-point comparison — only ResumableInflate2 is exercised there
+        // (decode_block doesn't decode flate2 sync-flush empty stored blocks).
         let deflate = make_deflate(payload);
+        let deflate_mb = make_multi_block_deflate(payload);
         let n = payload.len();
         let iters = 7;
 
@@ -1313,12 +1320,12 @@ mod tests {
             assert_eq!(&bulk_out[..n], payload, "bulk output mismatch");
         }
 
-        // ── resumable (ResumableInflate2 via IsalInflateWrapper) ──
+        // ── resumable FREE-RUN (no stopping points) on the multi-block stream ──
         let mut res_out = vec![0u8; n + 64];
         let mut best_res = f64::MAX;
         for _ in 0..iters {
             let mut wrapper =
-                IsalInflateWrapper::with_until_bits(&deflate, 0, deflate.len() * 8).unwrap();
+                IsalInflateWrapper::with_until_bits(&deflate_mb, 0, deflate_mb.len() * 8).unwrap();
             wrapper.set_window(&[]).unwrap();
             let mut out_pos = 0usize;
             let t = Instant::now();
@@ -1338,16 +1345,56 @@ mod tests {
             assert_eq!(&res_out[..n], payload, "resumable output mismatch");
         }
 
+        // ── resumable WITH production stopping points (returns at EVERY block
+        // boundary, as resumable_resync does) — isolates the per-block stop +
+        // boundary-bookkeeping overhead from the raw decode rate. ──
+        let mut sp_out = vec![0u8; n + 64];
+        let mut best_sp = f64::MAX;
+        let mut block_stops = 0u64;
+        for it in 0..iters {
+            let mut wrapper =
+                IsalInflateWrapper::with_until_bits(&deflate_mb, 0, deflate_mb.len() * 8).unwrap();
+            wrapper.set_window(&[]).unwrap();
+            wrapper.set_stopping_points(
+                StoppingPoints::END_OF_BLOCK
+                    | StoppingPoints::END_OF_BLOCK_HEADER
+                    | StoppingPoints::END_OF_STREAM_HEADER
+                    | StoppingPoints::END_OF_STREAM,
+            );
+            let mut out_pos = 0usize;
+            let mut stops = 0u64;
+            let t = Instant::now();
+            loop {
+                let r = wrapper
+                    .read_stream(&mut sp_out[out_pos..])
+                    .expect("sp decode");
+                out_pos += r.bytes_written;
+                stops += 1;
+                if r.finished || (r.bytes_written == 0 && r.stopped_at == StoppingPoints::NONE) {
+                    break;
+                }
+            }
+            best_sp = best_sp.min(t.elapsed().as_secs_f64());
+            if it == 0 {
+                block_stops = stops;
+            }
+            assert_eq!(&sp_out[..n], payload, "sp output mismatch");
+        }
+
         let mbps = |s: f64| (n as f64 / (1024.0 * 1024.0)) / s;
         eprintln!(
-            "CLEAN-TAIL MICROBENCH (n={} MiB, best-of-{}):\n  bulk-LUT  {:.3}ms  {:.0} MB/s\n  resumable {:.3}ms  {:.0} MB/s\n  bulk/resumable speedup = {:.2}x  (advisor gate: integrate if >= 1.5x)",
+            "CLEAN-TAIL MICROBENCH (n={} MiB, best-of-{}, {} block-stops):\n  bulk-LUT             {:.3}ms  {:.0} MB/s\n  resumable free-run   {:.3}ms  {:.0} MB/s\n  resumable +stoppts   {:.3}ms  {:.0} MB/s  <- production driver shape\n  bulk/resumable = {:.2}x   stoppts-overhead = {:.2}x (free/stop)",
             n / 1024 / 1024,
             iters,
+            block_stops,
             best_bulk * 1e3,
             mbps(best_bulk),
             best_res * 1e3,
             mbps(best_res),
+            best_sp * 1e3,
+            mbps(best_sp),
             best_res / best_bulk,
+            best_res / best_sp,
         );
     }
 
