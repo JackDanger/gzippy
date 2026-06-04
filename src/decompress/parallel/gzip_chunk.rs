@@ -918,39 +918,38 @@ fn decode_chunk_with_rapidgzip_impl(
         || (initial_window.is_empty() && encoded_offset_bits == 0);
 
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
-    let mut inflate_phase = start_clean_only;
-    let mut inflate_start_bit = encoded_offset_bits;
-    let mut inflate_window: Vec<u8> = if initial_window.len() == MAX_WINDOW_SIZE {
-        initial_window.to_vec()
-    } else {
-        Vec::new()
-    };
 
-    let mut marker_ctx = if inflate_phase {
-        None
-    } else {
-        chunk.data_with_markers.reserve(128 * 1024);
-        Some(MarkerDecodeCtx::new(input, encoded_offset_bits)?)
-    };
+    if start_clean_only {
+        let t_inflate = std::time::Instant::now();
+        finish_decode_chunk_inexact_offset(
+            &mut chunk,
+            input,
+            encoded_offset_bits,
+            stop_hint_bits,
+            initial_window,
+            false,
+        )?;
+        let inflate_us = t_inflate.elapsed().as_micros();
+        if trace::is_enabled() {
+            trace::emit(
+                "worker",
+                "decode_span",
+                &format!(
+                    r#""start_bit":{encoded_offset_bits},"bootstrap_us":0,"inflate_us":{inflate_us},"phase":"clean_only","markers":0,"tail_bytes":{}"#,
+                    chunk.data.len(),
+                ),
+            );
+        }
+        chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+        return Ok(chunk);
+    }
+
+    chunk.data_with_markers.reserve(128 * 1024);
+    let mut marker_ctx = MarkerDecodeCtx::new(input, encoded_offset_bits)?;
 
     let mut marker_us: u128 = 0;
-    let mut inflate_us: u128 = 0;
     let mut marker_span: Option<crate::decompress::parallel::trace_v2::SpanGuard> = None;
-    'decode: loop {
-        if inflate_phase {
-            let t_inflate = std::time::Instant::now();
-            finish_decode_chunk_inexact_offset(
-                &mut chunk,
-                input,
-                inflate_start_bit,
-                stop_hint_bits,
-                &inflate_window,
-                false,
-            )?;
-            inflate_us += t_inflate.elapsed().as_micros();
-            break 'decode;
-        }
-
+    loop {
         if marker_span.is_none() {
             marker_span = Some(
                 crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
@@ -959,17 +958,20 @@ fn decode_chunk_with_rapidgzip_impl(
                 ),
             );
         }
-        let ctx = marker_ctx.as_mut().expect("marker ctx");
         let t_marker = std::time::Instant::now();
-        let (step, flipped_clean) =
-            marker_decode_step(ctx, input, stop_hint_bits, &mut chunk.data_with_markers)?;
+        let (step, flipped_clean) = marker_decode_step(
+            &mut marker_ctx,
+            input,
+            stop_hint_bits,
+            &mut chunk.data_with_markers,
+        )?;
         marker_us += t_marker.elapsed().as_micros();
         if flipped_clean {
             UNIFIED_MODE_CLEAN_FLIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         match step {
-            MarkerStep::Continue => continue 'decode,
+            MarkerStep::Continue => {}
             MarkerStep::Handoff {
                 end_bit_offset,
                 clean_window,
@@ -989,12 +991,31 @@ fn decode_chunk_with_rapidgzip_impl(
                     ),
                     "t",
                 );
-                inflate_start_bit = end_bit_offset;
-                inflate_window = clean_window;
-                inflate_phase = true;
-                marker_ctx = None;
                 marker_span.take();
-                continue 'decode;
+                let t_inflate = std::time::Instant::now();
+                finish_decode_chunk_inexact_offset(
+                    &mut chunk,
+                    input,
+                    end_bit_offset,
+                    stop_hint_bits,
+                    &clean_window,
+                    false,
+                )?;
+                let inflate_us = t_inflate.elapsed().as_micros();
+                apply_slow_bootstrap_probe(marker_us);
+                if trace::is_enabled() {
+                    trace::emit(
+                        "worker",
+                        "decode_span",
+                        &format!(
+                            r#""start_bit":{encoded_offset_bits},"bootstrap_us":{marker_us},"inflate_us":{inflate_us},"phase":"bootstrap+inflate","markers":{markers_len},"tail_bytes":{}"#,
+                            chunk.data.len(),
+                        ),
+                    );
+                }
+                chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
+                chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+                return Ok(chunk);
             }
             MarkerStep::Finished {
                 end_bit_offset,
@@ -1023,22 +1044,6 @@ fn decode_chunk_with_rapidgzip_impl(
             }
         }
     }
-
-    chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
-    apply_slow_bootstrap_probe(marker_us);
-    if trace::is_enabled() {
-        trace::emit(
-            "worker",
-            "decode_span",
-            &format!(
-                r#""start_bit":{encoded_offset_bits},"bootstrap_us":{marker_us},"inflate_us":{inflate_us},"phase":"bootstrap+inflate","markers":{},"tail_bytes":{}"#,
-                chunk.data_with_markers.len(),
-                chunk.data.len(),
-            ),
-        );
-    }
-    chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
-    Ok(chunk)
 }
 
 #[cfg(parallel_sm)]
