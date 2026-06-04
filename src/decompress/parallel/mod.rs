@@ -40,8 +40,6 @@ pub mod huffman_short_bits_multi_cached;
 pub mod huffman_symbols_per_length;
 #[cfg(parallel_sm)]
 pub mod inflate_wrapper;
-#[cfg(all(feature = "isal-compression", target_arch = "x86_64"))]
-pub mod isal_huffman;
 #[cfg(parallel_sm)]
 pub mod isal_huffman_pure;
 #[cfg(parallel_sm)]
