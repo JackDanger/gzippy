@@ -61,8 +61,12 @@ if [ "$DIRTY_COUNT" != "0" ]; then
 fi
 
 export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}"
-say "## build gzippy (pure-rust-inflate) ..."
-if ! cargo build --release --no-default-features --features pure-rust-inflate >"$ARTDIR/build-gzippy.log" 2>&1; then
+# GZIPPY_BUILD_FEATURES overrides the decode engine under test. Default is the
+# pure-rust clean engine; set to "isal-compression" to measure gzippy with the
+# SAME ISA-L/igzip clean decode rapidgzip uses (the apples-to-apples engine A/B).
+GZIPPY_BUILD_FEATURES="${GZIPPY_BUILD_FEATURES:-pure-rust-inflate}"
+say "## build gzippy (${GZIPPY_BUILD_FEATURES}) ..."
+if ! cargo build --release --no-default-features --features "${GZIPPY_BUILD_FEATURES}" >"$ARTDIR/build-gzippy.log" 2>&1; then
   echo "RUN_TRUSTWORTHY=false"; echo "FAILURE=gzippy-build"; tail -30 "$ARTDIR/build-gzippy.log"; exit 8
 fi
 GZIPPY="$REPO/target/release/gzippy"
