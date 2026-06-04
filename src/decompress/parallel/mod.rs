@@ -22,9 +22,14 @@ pub mod compressed_vector;
 pub mod crc32;
 #[cfg(parallel_sm)]
 pub mod decode_bypass;
-// Bootstrap-only (speculative prefetch): marker emit via `deflate_block::Block`.
+// Window-absent marker decoder (u16 ring + pre-seeded marker zone), shared with
+// the unified single-member decode path. Formerly `deflate_block`; renamed to
+// retire the "deflate_block bootstrap" name from production. A `deflate_block`
+// re-export alias is kept ONLY for the fuzz/test oracle (three_oracle_diff.rs).
 #[cfg(parallel_sm)]
-pub mod deflate_block;
+pub mod marker_inflate;
+#[cfg(parallel_sm)]
+pub use marker_inflate as deflate_block;
 pub mod error;
 #[cfg(parallel_sm)]
 pub mod fd_vectored_write;
