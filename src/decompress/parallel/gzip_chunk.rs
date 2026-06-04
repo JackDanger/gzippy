@@ -1000,12 +1000,6 @@ fn decode_chunk_with_rapidgzip_impl(
                     "t",
                 );
                 inflate_start_bit = end_bit_offset;
-                if chunk.data.is_empty() && clean_window.len() == MAX_WINDOW_SIZE {
-                    #[cfg(pure_inflate_decode)]
-                    if use_option_a_prefill_path() {
-                        chunk.prefill_window_prefix(&clean_window);
-                    }
-                }
                 inflate_window = clean_window;
                 inflate_phase = true;
                 marker_ctx = None;
