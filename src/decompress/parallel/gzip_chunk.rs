@@ -121,7 +121,7 @@ pub static HANDOFF_WINDOW_BUF_GROWS: std::sync::atomic::AtomicU64 =
 /// and fell to the internal resumable re-sync (the goal's accepted re-sync).
 /// Should be ~0 for real-boundary chunks and bounded by the speculative-seed count.
 pub static BAD_SEED_RESYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// `finish_clean_tail_decode` bulk loop saw `Handoff` with no bit advance (stall guard).
+/// `resumable_resync` bulk loop saw `Handoff` with no bit advance (stall guard).
 #[cfg(pure_inflate_decode)]
 pub static BULK_HANDOFF_NO_PROGRESS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -278,7 +278,7 @@ fn use_isal_pure_bulk_tail() -> bool {
 /// GzipChunk.hpp:280-410): ISA-L LUT bulk loop first; ResumableInflate2 only
 /// when lookback is unavailable (< 32 KiB predecessor).
 #[cfg(parallel_sm)]
-fn finish_clean_tail_decode(
+fn resumable_resync(
     chunk: &mut ChunkData,
     input: &[u8],
     mut inflate_start_bit: usize,
@@ -641,7 +641,7 @@ fn finish_clean_tail_decode(
     // reaches the user's output. Downstream chunk methods that
     // need the decoded portion (last_32kib_window, get_last_window,
     // populate_subchunk_windows) skip data_prefix_len bytes;
-    // `finish_clean_tail_decode` reads from
+    // `resumable_resync` reads from
     // `tail.data[tail.data_prefix_len..]`. Eliminating the trim
     // memmove was measured at -3.81pp `__memmove_avx_unaligned_erms`
     // CPU share vs A3-with-trim, lifting net throughput to +4.2%
@@ -713,7 +713,7 @@ fn decode_chunk_with_rapidgzip_impl(
         Err(marker_err) => {
             BAD_SEED_RESYNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
-            finish_clean_tail_decode(
+            resumable_resync(
                 &mut chunk,
                 input,
                 encoded_offset_bits,
@@ -922,7 +922,7 @@ fn marker_decode_step(
             // false) without restarting — exactly rapidgzip's single
             // deflate::Block. The chunk ends at BFINAL or the stop_hint
             // partition boundary (MarkerStep::Finished below). The separate
-            // clean-tail path (finish_clean_tail_decode / bulk-LUT / resumable)
+            // clean-tail path (resumable_resync / bulk-LUT / resumable)
             // is retired.
 
         let header_res = {
