@@ -288,10 +288,7 @@ fn resumable_resync(
     // Option A3 (always on): pre-fill segment 0 with the predecessor's
     // 32 KiB window so back-references hit copy_match_fast via
     // `output[..out_pos]`. The consumer skips `data_prefix_len` when writing (A4).
-    #[cfg(feature = "pure-rust-inflate")]
     let full_window_tail = initial_window.len() == MAX_WINDOW_SIZE;
-    #[cfg(not(feature = "pure-rust-inflate"))]
-    let full_window_tail = false;
     // A3: seed lookback into `chunk.data[0..32K]` once, before any tail bytes.
     // Resumable `set_window` must stay empty when prefilled — otherwise the
     // 32 KiB window is applied twice (bulk + resumable ring) and stored blocks
@@ -411,21 +408,10 @@ fn resumable_resync(
             // resolve via `output[..out_pos]` (includes the prefilled window).
             // Non-A3 / multi-segment: spare slice on the tail segment only;
             // cross-chunk refs use the wrapper's window ring.
-            #[cfg(feature = "pure-rust-inflate")]
             let r = if full_window_tail && chunk.data.all_in_first_segment() {
                 let out_buf = chunk.data.first_segment_a3_output();
                 wrapper.read_stream_starting_at(out_buf, prev_data_len + n_bytes_read)?
             } else {
-                let spare: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        seg_ptr.add(n_bytes_read),
-                        buffer_cap - n_bytes_read,
-                    )
-                };
-                wrapper.read_stream(spare)?
-            };
-            #[cfg(not(feature = "pure-rust-inflate"))]
-            let r = {
                 let spare: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(
                         seg_ptr.add(n_bytes_read),
