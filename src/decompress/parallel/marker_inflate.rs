@@ -524,7 +524,7 @@ pub const RING_SIZE: usize = 2 * MAX_WINDOW_SIZE;
 /// for the in-chunk portion of a single back-ref — no explicit
 /// `marker_count` loop required.
 #[inline]
-fn init_marker_zone(ring: &mut [u16; RING_SIZE]) {
+pub(crate) fn init_marker_zone(ring: &mut [u16; RING_SIZE]) {
     for i in 0..MAX_WINDOW_SIZE {
         ring[MAX_WINDOW_SIZE + i] = (MAX_WINDOW_SIZE + i) as u16;
     }
@@ -2400,7 +2400,7 @@ fn fixed_huffman_code_lengths() -> (Vec<u8>, Vec<u8>) {
 /// `CONTAINS_MARKERS`) `*distance_marker` reflects the post-copy
 /// distance to the nearest marker in the ring.
 #[inline]
-unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
+pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
     ring_ptr: *mut u16,
     pos: &mut usize,
     distance: usize,

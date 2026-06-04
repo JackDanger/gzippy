@@ -1349,29 +1349,15 @@ fn marker_decode_step(
 
             let next_block_offset = absolute_bit_pos(slice_byte, &bits);
 
-            if ctx.trailing_clean >= MAX_WINDOW_SIZE {
-            let end_bit_offset = next_block_offset;
-            ctx.current_bit_offset = end_bit_offset;
-            // The window lives in the tail of `output` (data_with_markers).
-            // Only confirm it is all-clean here (no copy); the caller narrows
-            // it into a reused thread-local buffer at handoff time.
-            if output.is_last_n_clean(MAX_WINDOW_SIZE) {
-                return Ok((
-                    MarkerStep::Handoff {
-                        end_bit_offset,
-                        window_len: MAX_WINDOW_SIZE,
-                    },
-                    false,
-                ));
-            }
-            return Ok((
-                MarkerStep::Finished {
-                    end_bit_offset,
-                    bfinal_hit: false,
-                },
-                false,
-            ));
-        }
+            // UNIFIED DECODE: no marker->clean handoff. The one engine
+            // (marker_inflate::Block) decodes the WHOLE chunk into
+            // data_with_markers — emitting u16 markers while window-absent and
+            // flipping mid-stream to clean u16 (block.contains_marker_bytes
+            // false) without restarting — exactly rapidgzip's single
+            // deflate::Block. The chunk ends at BFINAL or the stop_hint
+            // partition boundary (MarkerStep::Finished below). The separate
+            // clean-tail path (finish_clean_tail_decode / bulk-LUT / resumable)
+            // is retired.
 
         let header_res = {
             let _tv2 = trace_v2::SpanGuard::begin("worker.block_header");
