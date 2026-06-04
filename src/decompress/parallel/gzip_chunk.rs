@@ -891,18 +891,22 @@ fn marker_decode_step(
     stop_hint_bits: usize,
     output: &mut impl crate::decompress::parallel::marker_inflate::MarkerSink,
 ) -> Result<(MarkerStep, bool), ChunkDecodeError> {
-    use crate::decompress::parallel::marker_inflate::{Block, MAX_WINDOW_SIZE};
+    use crate::decompress::parallel::isal_lut_bulk::MarkerRing;
+    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
     use crate::decompress::parallel::trace_v2;
     use std::cell::RefCell;
 
+    // The ONE unified decoder's marker arm — the fast LUT loop emitting u16
+    // markers, folded into isal_lut_bulk. Replaces the retired
+    // marker_inflate::Block bootstrap engine.
     thread_local! {
-        static BOOTSTRAP_BLOCK: RefCell<Block> = RefCell::new(Block::new());
+        static BOOTSTRAP_BLOCK: RefCell<MarkerRing> = RefCell::new(MarkerRing::new());
     }
 
     BOOTSTRAP_BLOCK.with(|cell_block| {
         let mut block = cell_block.borrow_mut();
         if !ctx.block_primed {
-            block.reset(None, None);
+            block.reset();
             ctx.block_primed = true;
         }
         let block = &mut *block;
@@ -928,7 +932,7 @@ fn marker_decode_step(
         let header_res = {
             let _tv2 = trace_v2::SpanGuard::begin("worker.block_header");
             let t_header = std::time::Instant::now();
-            let r = block.read_header(&mut bits, false);
+            let r = block.read_header(&mut bits);
             BOOTSTRAP_HEADER_US.fetch_add(
                 t_header.elapsed().as_micros() as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -959,7 +963,7 @@ fn marker_decode_step(
         let t_body = std::time::Instant::now();
         let _tv2_body = trace_v2::SpanGuard::begin("worker.block_body");
         while !block.eob() {
-            let res = block.read(&mut bits, &mut *output, usize::MAX);
+            let res = block.read(&mut bits, &mut *output);
             if let Err(e) = res {
                 let bits_at_fail = absolute_bit_pos(slice_byte, &bits);
                 let bytes_wasted = output.sink_len() - before_len;
@@ -969,21 +973,21 @@ fn marker_decode_step(
                     .fetch_add(bytes_wasted as u64, std::sync::atomic::Ordering::Relaxed);
                 BODY_FAIL_BITS_INTO_BODY
                     .fetch_add(bits_into_body as u64, std::sync::atomic::Ordering::Relaxed);
-                use crate::decompress::parallel::marker_inflate::BlockError;
+                use crate::decompress::parallel::isal_lut_bulk::BulkDecodeError;
                 match &e {
-                    BlockError::InvalidHuffmanCode => {
+                    BulkDecodeError::InvalidHuffmanCode => {
                         BODY_FAIL_INVALID_HUFFMAN
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    BlockError::ExceededWindowRange => {
+                    BulkDecodeError::InvalidLookback => {
                         BODY_FAIL_EXCEEDED_WINDOW
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    BlockError::InvalidCompression => {
+                    BulkDecodeError::BlockTypeReserved => {
                         BODY_FAIL_INVALID_COMPRESSION
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    BlockError::InvalidCodeLengths => {
+                    BulkDecodeError::InvalidCodeLengths => {
                         BODY_FAIL_INVALID_CODE_LENGTHS
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
