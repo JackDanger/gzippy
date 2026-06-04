@@ -1010,41 +1010,6 @@ pub fn decode_chunk_window_absent(
     )
 }
 
-/// Narrow the clean 32 KiB window from the tail of `chunk.data_with_markers`
-/// into a REUSED thread-local buffer (not a fresh per-chunk `Vec<u8>`), then
-/// run the clean tail. This is the marker→clean handoff with the allocation
-/// seam removed: `is_last_n_clean` already confirmed the tail is clean, so the
-/// `copy_last_n_clean_u8` here clears+extends a capacity-stable buffer with no
-/// heap allocation after the first handoff on each worker thread.
-#[cfg(parallel_sm)]
-fn handoff_clean_tail(
-    chunk: &mut ChunkData,
-    input: &[u8],
-    end_bit_offset: usize,
-    stop_hint_bits: usize,
-    window_len: usize,
-) -> Result<(), ChunkDecodeError> {
-    use crate::decompress::parallel::marker_inflate::MarkerSink;
-    use std::cell::RefCell;
-    thread_local! {
-        static WINDOW_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(32 * 1024));
-    }
-    WINDOW_BUF.with(|cell| {
-        let mut buf = cell.borrow_mut();
-        if buf.capacity() < window_len {
-            HANDOFF_WINDOW_BUF_GROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        let ok = chunk
-            .data_with_markers
-            .copy_last_n_clean_u8(window_len, &mut buf);
-        debug_assert!(
-            ok,
-            "handoff window tail not clean (is_last_n_clean disagreed with copy_last_n_clean_u8)"
-        );
-        finish_clean_tail_decode(chunk, input, end_bit_offset, stop_hint_bits, &buf, false)
-    })
-}
-
 /// `decodeChunkWithRapidgzip` body (GzipChunk.hpp:468-654).
 #[cfg(parallel_sm)]
 fn decode_chunk_with_rapidgzip_impl(
@@ -1117,50 +1082,6 @@ fn decode_chunk_with_rapidgzip_impl(
 
         match step {
             MarkerStep::Continue => {}
-            MarkerStep::Handoff {
-                end_bit_offset,
-                window_len,
-            } => {
-                let markers_len = chunk.data_with_markers.len();
-                crate::decompress::parallel::trace_v2::emit_instant(
-                    "worker.bootstrap.outcome",
-                    &format!(
-                        r#""result":"ok","markers_len":{markers_len},"end_bit":{end_bit_offset},"clean_window":true,"bfinal":false,"handoff_reason":"clean_window_armed","bytes_decoded":{markers_len}"#,
-                    ),
-                    "t",
-                );
-                crate::decompress::parallel::trace_v2::emit_instant(
-                    "causal.decode_handoff",
-                    &format!(
-                        r#""start_bit":{encoded_offset_bits},"end_bit":{end_bit_offset},"marker_bytes":{markers_len},"inflate_start_bit":{end_bit_offset}"#,
-                    ),
-                    "t",
-                );
-                marker_span.take();
-                let t_inflate = std::time::Instant::now();
-                handoff_clean_tail(
-                    &mut chunk,
-                    input,
-                    end_bit_offset,
-                    stop_hint_bits,
-                    window_len,
-                )?;
-                let inflate_us = t_inflate.elapsed().as_micros();
-                apply_slow_bootstrap_probe(marker_us);
-                if trace::is_enabled() {
-                    trace::emit(
-                        "worker",
-                        "decode_span",
-                        &format!(
-                            r#""start_bit":{encoded_offset_bits},"bootstrap_us":{marker_us},"inflate_us":{inflate_us},"phase":"bootstrap+inflate","markers":{markers_len},"tail_bytes":{}"#,
-                            chunk.data.len(),
-                        ),
-                    );
-                }
-                chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
-                chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
-                return Ok(chunk);
-            }
             MarkerStep::Finished {
                 end_bit_offset,
                 bfinal_hit,
@@ -1213,14 +1134,6 @@ fn apply_slow_bootstrap_probe(bootstrap_dur_us: u128) {
 enum MarkerStep {
     /// Another deflate block was decoded; call again.
     Continue,
-    /// `cleanDataCount >= MAX_WINDOW_SIZE` at a block boundary — run streaming inflate next.
-    /// The clean 32 KiB window lives in the tail of `chunk.data_with_markers`
-    /// (verified all-clean by `is_last_n_clean`); the caller narrows it into a
-    /// reused thread-local buffer rather than allocating a per-chunk `Vec<u8>`.
-    Handoff {
-        end_bit_offset: usize,
-        window_len: usize,
-    },
     /// Chunk ends in the marker path (BFINAL, stop hint, or no clean dict).
     Finished {
         end_bit_offset: usize,
