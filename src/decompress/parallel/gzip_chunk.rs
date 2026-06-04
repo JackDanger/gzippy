@@ -480,11 +480,11 @@ fn finish_decode_chunk_bulk_lut(
     BulkCleanTailResult::Complete { final_bit }
 }
 
-/// Vendor `finishDecodeChunkWithInexactOffset` (GzipChunk.hpp:280-410): streaming
-/// inflate on the same [`ChunkData`] via [`IsalInflateWrapper`] /
-/// `unified::Inflate<Clean, …>`.
+/// P2 unified clean tail (vendor `finishDecodeChunkWithInexactOffset`,
+/// GzipChunk.hpp:280-410): ISA-L LUT bulk loop first; ResumableInflate2 only
+/// when lookback is unavailable (< 32 KiB predecessor).
 #[cfg(parallel_sm)]
-fn finish_decode_chunk_inexact_offset(
+fn finish_clean_tail_decode(
     chunk: &mut ChunkData,
     input: &[u8],
     mut inflate_start_bit: usize,
@@ -492,6 +492,8 @@ fn finish_decode_chunk_inexact_offset(
     initial_window: &[u8],
     record_decode_duration: bool,
 ) -> Result<(), ChunkDecodeError> {
+    use crate::decompress::parallel::deflate_block::MAX_WINDOW_SIZE;
+
     // `worker.isal_stream_inflate` span — wraps every invocation of
     // gzippy's ISA-L stream-inflate path. Both call sites land here:
     //   (a) the post-bootstrap call at gzip_chunk.rs:549 (after the
@@ -515,12 +517,21 @@ fn finish_decode_chunk_inexact_offset(
     // `output[..out_pos]`. Disable with `GZIPPY_OPTION_A_PREFILL=0`.
     // The consumer skips `data_prefix_len` when writing (A4).
     #[cfg(feature = "pure-rust-inflate")]
-    let a3_prefill_active = use_option_a_prefill_path() && initial_window.len() == 32768;
+    let full_window_tail = use_option_a_prefill_path() && initial_window.len() == MAX_WINDOW_SIZE;
     #[cfg(not(feature = "pure-rust-inflate"))]
-    let a3_prefill_active = false;
-    if a3_prefill_active {
+    let full_window_tail = false;
+    // A3: seed lookback into `chunk.data[0..32K]` once, before any tail bytes.
+    // Resumable `set_window` must stay empty when prefilled — otherwise the
+    // 32 KiB window is applied twice (bulk + resumable ring) and stored blocks
+    // decode with wrong lengths.
+    if full_window_tail && chunk.data.is_empty() {
         chunk.prefill_window_prefix(initial_window);
     }
+    let resumable_window: &[u8] = if chunk.data_prefix_len >= MAX_WINDOW_SIZE {
+        &[]
+    } else {
+        initial_window
+    };
 
     // P2 unified clean tail: keep the same ISA-L LUT engine across 128 KiB
     // segment fills. Only fall back to ResumableInflate2 when bulk declines
@@ -563,7 +574,7 @@ fn finish_decode_chunk_inexact_offset(
     // (e.g. silesia gzip-9 at 33554427 vs hint 33554432 → InvalidBlock on resume).
     let read_cap = input.len() * 8;
     let mut wrapper = IsalInflateWrapper::with_until_bits(input, inflate_start_bit, read_cap)?;
-    wrapper.set_window(initial_window)?;
+    wrapper.set_window(resumable_window)?;
     wrapper.set_stopping_points(
         StoppingPoints::END_OF_BLOCK
             | StoppingPoints::END_OF_BLOCK_HEADER
@@ -652,7 +663,7 @@ fn finish_decode_chunk_inexact_offset(
             // Non-A3 / multi-segment: spare slice on the tail segment only;
             // cross-chunk refs use the wrapper's window ring.
             #[cfg(feature = "pure-rust-inflate")]
-            let r = if a3_prefill_active && chunk.data.all_in_first_segment() {
+            let r = if full_window_tail && chunk.data.all_in_first_segment() {
                 let out_buf = chunk.data.first_segment_a3_output();
                 wrapper.read_stream_starting_at(out_buf, prev_data_len + n_bytes_read)?
             } else {
@@ -859,15 +870,15 @@ fn finish_decode_chunk_inexact_offset(
     // reaches the user's output. Downstream chunk methods that
     // need the decoded portion (last_32kib_window, get_last_window,
     // populate_subchunk_windows) skip data_prefix_len bytes;
-    // `finish_decode_chunk_inexact_offset` reads from
+    // `finish_clean_tail_decode` reads from
     // `tail.data[tail.data_prefix_len..]`. Eliminating the trim
     // memmove was measured at -3.81pp `__memmove_avx_unaligned_erms`
     // CPU share vs A3-with-trim, lifting net throughput to +4.2%
     // vs default at T=16 on neurotic silesia-gzip9.
-    let _ = a3_prefill_active; // value consumed at decode-start
-                               // When the reader runs past `stop_hint_bits` without an inexact
-                               // stop, `tell_compressed()` can land mid-block. Successor chunks must
-                               // resume at the last END_OF_BLOCK position (pre-header), not mid-block.
+    let _ = full_window_tail; // consumed at decode-start (A3 prefill + bulk path)
+                              // When the reader runs past `stop_hint_bits` without an inexact
+                              // stop, `tell_compressed()` can land mid-block. Successor chunks must
+                              // resume at the last END_OF_BLOCK position (pre-header), not mid-block.
     let final_bit = if stopping_point_reached || reached_stream_end {
         last_end_bit
     } else if last_eob_pos > inflate_start_bit {
@@ -921,7 +932,7 @@ fn decode_chunk_with_rapidgzip_impl(
 
     if start_clean_only {
         let t_inflate = std::time::Instant::now();
-        finish_decode_chunk_inexact_offset(
+        finish_clean_tail_decode(
             &mut chunk,
             input,
             encoded_offset_bits,
@@ -993,7 +1004,7 @@ fn decode_chunk_with_rapidgzip_impl(
                 );
                 marker_span.take();
                 let t_inflate = std::time::Instant::now();
-                finish_decode_chunk_inexact_offset(
+                finish_clean_tail_decode(
                     &mut chunk,
                     input,
                     end_bit_offset,
