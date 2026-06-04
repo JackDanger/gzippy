@@ -906,15 +906,17 @@ fn marker_decode_step(
 
             let next_block_offset = absolute_bit_pos(slice_byte, &bits);
 
-            // UNIFIED DECODE, marker(u16) -> clean(u8) FLIP on ONE cursor (vendor
-            // deflate::Block setInitialWindow, deflate.hpp:1282-1292). Once 32 KiB
-            // of clean output has accumulated at a block boundary, FLIP: the caller
-            // decodes the rest as the fast u8 clean tail into chunk.data (vendor's
-            // "~400 MB/s -> ~6 GB/s" path). The marker prefix (u16, <= ~32 KiB)
-            // stays in data_with_markers (resolved on the publish chain); the clean
-            // tail (the bulk) is u8 and is never resolved. One driver, no separate
-            // bootstrap engine and no separate clean-tail entry.
-            if ctx.trailing_clean >= MAX_WINDOW_SIZE && output.is_last_n_clean(MAX_WINDOW_SIZE) {
+            // UNIFIED DECODE, marker(u16) -> clean(u8) FLIP (vendor deflate::Block
+            // setInitialWindow, deflate.hpp:1282-1292). The MarkerRing flips its OWN
+            // `contains_marker_bytes` flag when `distance_to_last_marker >= 32 KiB`
+            // (a byte-for-byte port of the vendor condition) — at which point the
+            // trailing 32 KiB are guaranteed marker-free. THAT is the flip trigger
+            // (vendor: `!m_containsMarkerBytes`). The caller then decodes the rest as
+            // the u8 clean tail into chunk.data; the marker prefix stays in
+            // data_with_markers (resolved on the publish chain). The previous
+            // CONSECUTIVE-trailing-clean predicate diverged from vendor and stranded
+            // chunks whose propagated markers never gave a 32 KiB unbroken clean run.
+            if !block.contains_marker_bytes() {
                 let end_bit_offset = next_block_offset;
                 ctx.current_bit_offset = end_bit_offset;
                 return Ok((
