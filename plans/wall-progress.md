@@ -1,7 +1,7 @@
 # Wall-parity scoreboard — the trustworthy progress signal
 
-## 2026-06-05 — CONSUMER PAIR-READY DRAIN + ZERO-COPY WRITEV (uncommitted; lone-emit DISPROVED)
-Shipped in working tree (not yet locked-Fulcrum): `rpmalloc-caches` via `pure-rust-inflate`,
+## 2026-06-05 — CONSUMER PAIR-READY DRAIN + ZERO-COPY WRITEV (0a448d1; lone-emit DISPROVED)
+Shipped (locked-Fulcrum pending — neurotic unreachable from dev env): `rpmalloc-caches` via `pure-rust-inflate`,
 consumer `writev` gather (`append_output_iovecs` + `write_chunk_payload_to_fd`), immediate buffer
 recycle after write, `resolve_range_into_buf` for window straddle, pool depth 8→12,
 `post_process_inflight_cap = pool_size-1` (min 2).
@@ -21,7 +21,9 @@ byte at offset 13118427 = end of idx=3 / start of idx=4; both paths log idx=4
 payload bytes under lone emit). Inline re-resolve on every unresolved emit broke 8 routing
 tests; re-resolve only on re-anchor also regressed — needs vendor-faithful
 `setEncodedOffset` → re-`postProcessChunk` sequencing, not a blind re-call.
-`REANCHOR_INVALIDATES_NARROWED` counter added for Fulcrum. Locked Fulcrum still needed.
+`REANCHOR_AFTER_POSTPROCESS` counter added for Fulcrum. Vendor-order re-resolve-before-
+`set_encoded_offset` at drain landed in 0a448d1; lone-emit still CRC-fails (bisect unchanged).
+Locked Fulcrum still needed on neurotic.
 
 ## 2026-06-05 — EAGER WINDOW-CHAIN PORT = BIGGEST HIGH-T WIN OF THE CAMPAIGN (transliteration, not lever)
 Closed the PRIMARY architectural divergence (per plans/rapidgzip-architecture-divergence.md +
