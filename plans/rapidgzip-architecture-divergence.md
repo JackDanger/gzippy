@@ -120,3 +120,25 @@ NEXT: decompose get_last_window on SegmentedU8 (chunk_data.rs:969) — why ~3ms 
 Segment walk? materialize? If it's the segmented access pattern, that is the vendor-cited Divergence
 #3 to port (contiguous tail access). Pre-register and MEASURE before porting (2 hypotheses already
 falsified this session: interior-accept [no containing chunk], Arc-clone [misses=0]).
+
+## GATE + ADVISOR 2026-06-05: decode no longer slack, but #3 NOT yet greenlit; eviction is NOT a vendor divergence
+Ran the pre-registered slow-injection gate (GZIPPY_SLOW_BOOTSTRAP=N% spins N% of each decode's own
+time AFTER decode, byte-exact, harness-plumbed). +100% decode => T8 wall +61% (0.988->1.591s),
+T16 +48%. => decode is NO LONGER fully slack (the prior page-walk-REMOVE-oracle "0% wall / slack"
+finding is OBSOLETE post-eager-chain). BUT advisor (correctly) flagged the slope is CONFOUNDED:
+spinning ALL decodes (incl. prefetch) holds pool slots => the on-demand frontier decode queues
+behind spinning prefetches = SCHEDULING contention, inflating the slope above true decode-criticality;
+also +100% shifts eviction timing. And slope!=ceiling (CLAUDE.md): a slow-DOWN slope cannot greenlight
+a speed-UP campaign. So #3 is NOT greenlit yet.
+Advisor's strongest lead — "the 416ms cold re-decodes are a vendor CACHE-RETENTION divergence
+(rapidgzip protects not-yet-consumed chunks from eviction)" — FALSIFIED by reading vendor Cache.hpp:
+it is plain LeastRecentlyUsed, NO retention protection, identical to gzippy. Vendor avoids eviction
+because its faster decode keeps the consumer in pace, not via policy. So the eviction is decode-speed-
+driven (consumer pace), NOT a port-fidelity bug; a "pin soonest-needed" fix is a T3 non-vendor lever.
+=> The 416ms residual path IS #3 (faster pure-Rust decode -> consumer keeps pace -> fewer evictions),
+but it is gated, per advisor, by: (1) ON-DEMAND-ONLY slow-injection (slow only frontier decodes, not
+prefetch) to separate the scheduling confound from true decode-criticality; (2) cold-re-decode COUNT
+baseline vs perturbation (eviction-timing confound check); (3) a decode-REMOVAL oracle (decode~=0, CRC
+gated off) to BOUND the speed-up ceiling. Only if the oracle ceiling is worth it does the deep #3
+data-plane cycle start. Temp gate reverted (commit 7e7c00f). These 3 measurements are the next cycle's
+disciplined gate before any #3 port.
