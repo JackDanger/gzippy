@@ -103,3 +103,20 @@ consumer.iter 1011->855ms; consumer serial "other" still ~3x rapidgzip.
   the T1 regression). Plus window_publish_marker ~122ms (get_last_window on SegmentedU8 vs vendor
   contiguous FasterVector). Correctness-sensitive (the clone avoids a mutation race) — a real
   vendor-cited cycle, not a tail-of-session edit.
+
+## CORRECTION 2026-06-05 (measurement falsified the Arc-clone hypothesis — discipline, not assumption)
+Measured `Arc::try_unwrap hits/misses = 39 / 0`: the consumer-side deep-clone (chunk_fetcher.rs:1401)
+NEVER fires, and the eager-resolve clone (submit_post_process_from_prefetch:2005) runs INSIDE the move
+closure = on the POOL, not the consumer. So Divergence #3-as-"consumer Arc deep-clone" is DEAD (the
+T1 regression and dispatch_post_process cost are NOT the clone). Do NOT port a shared-mutate data
+model for this — measured, no clone on the critical path.
+ACTUAL remaining consumer serial cost (T8, post-eager-chain, self-times): window_publish_marker
+~122ms (= get_last_window extracting the last 32KiB on SegmentedU8 — ~3ms/chunk, far slower than a
+contiguous 32KiB copy; THIS is the real Divergence #3 candidate = SEGMENTED access pattern vs vendor
+contiguous FasterVector), dispatch_post_process ~144ms (into_chunk_data move + match + submit; NOT a
+clone since misses=0 — needs decomposition), queue_prefetched_postproc ~116ms (the eager full-scan
+itself — matches vendor structure; cost is the per-chunk get_last_window inside it).
+NEXT: decompose get_last_window on SegmentedU8 (chunk_data.rs:969) — why ~3ms for a 32KiB tail?
+Segment walk? materialize? If it's the segmented access pattern, that is the vendor-cited Divergence
+#3 to port (contiguous tail access). Pre-register and MEASURE before porting (2 hypotheses already
+falsified this session: interior-accept [no containing chunk], Arc-clone [misses=0]).
