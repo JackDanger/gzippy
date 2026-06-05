@@ -186,6 +186,8 @@ T=8
 mask="$(pin_mask "$T")"
 capture_trace "gzippy_T${T}" "$mask" "$GZIPPY" -d -c -p "$T" "$CORPUS" || true
 capture_trace "rapidgzip_T${T}" "$mask" "$RG_TRACE" -d -c -f -P "$T" "$CORPUS" || true
+capture_trace "gzippy_spec_pred_off_T${T}" "$mask" env GZIPPY_SPEC_PRED_CLEAN=0 \
+  "$GZIPPY" -d -c -p "$T" "$CORPUS" || true
 capture_trace "gzippy_writev_off_T${T}" "$mask" env GZIPPY_DISABLE_WRITEV=1 \
   "$GZIPPY" -d -c -p "$T" "$CORPUS" || true
 
