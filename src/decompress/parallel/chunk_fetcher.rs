@@ -913,6 +913,10 @@ fn drive_impl<W: std::io::Write>(
             ARC_TRY_UNWRAP_HITS.load(Ordering::Relaxed),
             ARC_TRY_UNWRAP_MISSES.load(Ordering::Relaxed),
         );
+        eprintln!(
+            "  Consumer pair-ready drains: {}",
+            DRAIN_READY_IMMEDIATE.load(Ordering::Relaxed),
+        );
     }
 
     // Flush all per-thread trace_v2 buffers (consumer thread + any
@@ -957,11 +961,21 @@ fn consumer_loop<W: std::io::Write>(
     // Pending writes (post-process jobs in flight, output order).
     let mut pending: std::collections::VecDeque<PendingWrite> =
         std::collections::VecDeque::with_capacity(pool_size * 2);
-    let post_process_inflight_cap = pool_size;
+    // One below pool capacity: forces a head drain (often `[Ready, Async]`)
+    // one iteration sooner so warm decode buffers return to the worker pool
+    // without mid-stream lone-Ready drain (CRC-unsafe at len==1).
+    let post_process_inflight_cap = pool_size.saturating_sub(1).max(2);
 
     // Vendor `m_markersBeingReplaced` + resolve-ahead: pool post-process
     // for prefetched successors, keyed by partition `encoded_offset_bits`.
     let mut prefetch_post_inflight: EagerSubmitted = std::collections::HashMap::new();
+    // Keep the last N drained chunks' buffers off the pool until the
+    // pipeline moves on (lone-drain CRC bisect 2026-06-05: 1-chunk defer
+    // insufficient; byte diff at chunk 4 boundary when lone emit races
+    // worker fill of successor buffers).
+    const RECYCLE_DEFER_DEPTH: usize = 2;
+    let mut recycle_deferral: std::collections::VecDeque<ChunkData> =
+        std::collections::VecDeque::with_capacity(RECYCLE_DEFER_DEPTH + 1);
     // Optional duplicate probe (GZIPPY_EAGER_POSTPROC=1) — full-cache scan
     // on every stall; production uses handoff-triggered resolve-ahead only.
     let eager_probe_enabled = eager_postproc_enabled();
@@ -1537,6 +1551,7 @@ fn consumer_loop<W: std::io::Write>(
                         total_size,
                         block_fetcher,
                         Some((thread_pool, &mut prefetch_post_inflight)),
+                        &mut recycle_deferral,
                     )?;
                 }
             }
@@ -1733,10 +1748,26 @@ fn consumer_loop<W: std::io::Write>(
             }
         }
 
-        // Vendor parity: drain post-processes that are FIFO-ready to keep
-        // the in-flight cap bounded. Vendor's
-        // `waitForReplacedMarkers` (GzipChunkFetcher.hpp:478-518) does
-        // this implicitly by blocking on the per-chunk future.
+        // Vendor parity: write each post-process-complete chunk as soon as
+        // it reaches the FIFO head (GzipChunkFetcher.hpp:333-342 writes
+        // inline after `postProcessChunk` returns). Previously gzippy only
+        // drained when `pending.len() > pool_size`, leaving Ready chunks
+        // holding warm rpmalloc buffers until the cap filled — the measured
+        // buffer-return-latency gap at T16 (chunk_buffer_pool.rs:176-179).
+        drain_ready_pending_heads(
+            &mut pending,
+            window_map,
+            writer,
+            out_fd,
+            total_crc,
+            total_size,
+            block_fetcher,
+            thread_pool,
+            &mut prefetch_post_inflight,
+            &mut recycle_deferral,
+        )?;
+        // Bound in-flight Async post-processes when the head is still
+        // waiting on a worker (vendor blocks on the per-chunk future).
         while pending.len() > post_process_inflight_cap {
             drain_one_pending(
                 &mut pending,
@@ -1747,6 +1778,19 @@ fn consumer_loop<W: std::io::Write>(
                 total_size,
                 block_fetcher,
                 Some((thread_pool, &mut prefetch_post_inflight)),
+                &mut recycle_deferral,
+            )?;
+            drain_ready_pending_heads(
+                &mut pending,
+                window_map,
+                writer,
+                out_fd,
+                total_crc,
+                total_size,
+                block_fetcher,
+                thread_pool,
+                &mut prefetch_post_inflight,
+                &mut recycle_deferral,
             )?;
         }
         iter_us_sum += t_iter.elapsed().as_micros();
@@ -1764,7 +1808,11 @@ fn consumer_loop<W: std::io::Write>(
             total_size,
             block_fetcher,
             Some((thread_pool, &mut prefetch_post_inflight)),
+            &mut recycle_deferral,
         )?;
+    }
+    while let Some(mut held) = recycle_deferral.pop_front() {
+        held.recycle_decoded_buffers();
     }
     let _ = submit_us_sum; // reserved for future submit-only timing
 
@@ -2866,6 +2914,15 @@ pub static RESOLVE_AHEAD_ATTEMPTS: std::sync::atomic::AtomicU64 =
 pub static RESOLVE_AHEAD_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Vendor queueChunkForPostProcessing eager end-window publishes on the consumer
 /// (the window-chain propagation that lets prefetched chunks resolve in parallel).
+/// Chunks drained immediately when the FIFO head is `Ready` (post-process
+/// complete) instead of waiting for `pending.len() > pool_size`. Returns
+/// decode buffers to the warm pool sooner — vendor writes each chunk as
+/// soon as its future completes rather than batching behind the cap.
+pub static DRAIN_READY_IMMEDIATE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// `set_encoded_offset(handoff_bit)` at drain after post-process (vendor order).
+pub static REANCHOR_AFTER_POSTPROCESS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub static PUBLISH_AHEAD_WINDOWS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -3304,6 +3361,63 @@ enum PendingWrite {
     },
 }
 
+/// Return drained chunk buffers to the pool only after `RECYCLE_DEFER_DEPTH`
+/// newer chunks have drained (see `consumer_loop`).
+#[cfg(parallel_sm)]
+fn defer_chunk_recycle(deferral: &mut std::collections::VecDeque<ChunkData>, chunk: ChunkData) {
+    const DEPTH: usize = 2;
+    deferral.push_back(chunk);
+    while deferral.len() > DEPTH {
+        if let Some(mut old) = deferral.pop_front() {
+            old.recycle_decoded_buffers();
+        }
+    }
+}
+
+/// Drain consecutive `Ready` entries at the FIFO head when two or more
+/// are queued (including `[Ready, Async]`). A sole `Ready` is flushed
+/// only via the marker-branch `wait_replaced_markers` drain (predecessor
+/// window needed), cap pressure, or the final flush — NOT at iteration
+/// end, post-`block_finder.get`, post-`block_fetcher.get`, or when
+/// eager-idle (all CRC-fail at T≥2; not buffer-pool UAF).
+/// Stops when the head is `Async` (post-process still in flight on a worker).
+#[cfg(parallel_sm)]
+#[allow(clippy::too_many_arguments)]
+fn drain_ready_pending_heads<W: std::io::Write>(
+    pending: &mut std::collections::VecDeque<PendingWrite>,
+    window_map: &WindowMap,
+    writer: &mut W,
+    out_fd: Option<i32>,
+    total_crc: &mut CRC32Calculator,
+    total_size: &mut usize,
+    block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
+    thread_pool: &Arc<ThreadPool>,
+    eager_inflight: &mut EagerSubmitted,
+    recycle_deferral: &mut std::collections::VecDeque<ChunkData>,
+) -> Result<(), FetchError> {
+    use std::sync::atomic::Ordering;
+    let debug_lone = std::env::var_os("GZIPPY_DRAIN_LONE").is_some();
+    while matches!(pending.front(), Some(PendingWrite::Ready { .. }))
+        && (debug_lone
+            || pending.len() >= 2
+            || matches!(pending.get(1), Some(PendingWrite::Async { .. })))
+    {
+        DRAIN_READY_IMMEDIATE.fetch_add(1, Ordering::Relaxed);
+        drain_one_pending(
+            pending,
+            window_map,
+            writer,
+            out_fd,
+            total_crc,
+            total_size,
+            block_fetcher,
+            Some((thread_pool, eager_inflight)),
+            recycle_deferral,
+        )?;
+    }
+    Ok(())
+}
+
 /// Pull the head of the pending FIFO, wait on its post-process if
 /// needed, then write its bytes + advance the stream CRC. Mirror of
 /// the tail of `GzipChunkFetcher::waitForReplacedMarkers` + write loop
@@ -3328,6 +3442,7 @@ fn drain_one_pending<W: std::io::Write>(
     // predecessor window is published, so they run on the pool while the
     // consumer blocks on the head. `None` (eager disabled) skips it.
     eager_ctx: Option<(&Arc<ThreadPool>, &mut EagerSubmitted)>,
+    recycle_deferral: &mut std::collections::VecDeque<ChunkData>,
 ) -> Result<(), FetchError> {
     let _tv2 = trace_v2::SpanGuard::begin("consumer.drain");
     let head = match pending.pop_front() {
@@ -3378,10 +3493,39 @@ fn drain_one_pending<W: std::io::Write>(
     };
     let recv_us = t_recv.elapsed().as_micros();
 
-    // Vendor GzipChunkFetcher.hpp:349 — after post-process, before indexes.
+    // Vendor GzipChunkFetcher.hpp:334-349 — `postProcessChunk` runs BEFORE
+    // `setEncodedOffset`. Resolve any still-unresolved marker bytes first.
+    if !chunk.data_with_markers.is_empty() && !chunk.markers_resolved {
+        let Some((_, predecessor_window)) = predecessor_window_for_markers(window_map, handoff_bit)
+        else {
+            return Err(FetchError::Decode(ChunkDecodeError::BootstrapFailed(
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("predecessor window missing at emit (handoff_bit={handoff_bit})"),
+                ),
+            )));
+        };
+        let bytes = materialize_window(&predecessor_window);
+        resolve_chunk_markers_on_chunk(&mut chunk, bytes.as_ref());
+    }
+    // Re-anchor AFTER post-process (vendor order). Do NOT clear
+    // `markers_resolved` — gzippy previously set it false here, leaving stale
+    // `narrowed_len` and corrupting output under early lone emit.
     if chunk.encoded_offset_bits != handoff_bit && chunk.matches_encoded_offset(handoff_bit) {
+        use std::sync::atomic::Ordering;
+        REANCHOR_AFTER_POSTPROCESS.fetch_add(1, Ordering::Relaxed);
         chunk.set_encoded_offset(handoff_bit);
-        chunk.markers_resolved = false;
+    }
+    if std::env::var_os("GZIPPY_TRACE_DRAIN").is_some() {
+        eprintln!(
+            "[trace_drain] idx={idx} enc={} handoff={} narrowed_len={} \
+             markers_resolved={} data_len={}",
+            chunk.encoded_offset_bits,
+            handoff_bit,
+            chunk.narrowed_len,
+            chunk.markers_resolved,
+            chunk.data.len().saturating_sub(chunk.data_prefix_len),
+        );
     }
 
     // Vendor `appendSubchunksToIndexes` window emplace — orchestrator only.
@@ -3426,39 +3570,33 @@ fn drain_one_pending<W: std::io::Write>(
         if std::env::var_os("GZIPPY_DISABLE_WRITEV").is_none() && payload_bytes > 0 {
             use crate::decompress::parallel::fd_vectored_write;
             let _tv2 = trace_v2::SpanGuard::begin("consumer.writev");
+            // Zero-copy gather: narrowed marker segments + clean payload
+            // (vendor DecodedData.hpp:529 toIoVec). No memcpy — iovecs borrow
+            // decode buffers until writev/vmsplice completes.
             let mut parts: Vec<&[u8]> = Vec::with_capacity(8);
-            let mut left = chunk.narrowed_len;
-            for seg in chunk.data_with_markers.segments() {
-                if left == 0 {
-                    break;
-                }
-                let n = left.min(seg.len());
-                // SAFETY: in-place narrow wrote `n` u8 at the front of this segment.
-                let sl = unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const u8, n) };
-                parts.push(sl);
-                left -= n;
-            }
-            let mut skip = chunk.data_prefix_len;
-            for seg in chunk.data.segments() {
-                if skip >= seg.len() {
-                    skip -= seg.len();
-                    continue;
-                }
-                parts.push(&seg[skip..]);
-                skip = 0;
-            }
+            chunk.append_output_iovecs(&mut parts);
             // CRC combine before boxing `chunk` for vmsplice lifetime.
             total_crc.append(&chunk.narrowed_crc);
             for stream_crc in &chunk.crc32s {
                 total_crc.append(stream_crc);
             }
             let mut iovs = fd_vectored_write::to_io_vec(parts.iter().copied(), &[]);
-            let owner: Box<dyn std::any::Any + Send> = Box::new(chunk);
-            fd_vectored_write::write_all_to_fd(fd, &mut iovs, owner)
-                .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+            #[cfg(target_os = "linux")]
+            if fd_vectored_write::is_pipe_fd(fd) {
+                fd_vectored_write::write_chunk_payload_to_fd(fd, &mut iovs, chunk)
+                    .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+            } else {
+                fd_vectored_write::writev_all_to_fd(fd, &mut iovs)
+                    .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+                defer_chunk_recycle(recycle_deferral, chunk);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                fd_vectored_write::writev_all_to_fd(fd, &mut iovs)
+                    .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
+                defer_chunk_recycle(recycle_deferral, chunk);
+            }
             *total_size += payload_bytes;
-            // Set for symmetry, but the fd path returns immediately below, so
-            // the read at the non-fd fallback is never reached on this path.
             #[allow(unused_assignments)]
             {
                 wrote_via_fd = true;
@@ -3484,29 +3622,14 @@ fn drain_one_pending<W: std::io::Write>(
     #[cfg(not(unix))]
     let _ = out_fd;
     if !wrote_via_fd {
-        if chunk.narrowed_len > 0 {
-            let _tv2 = trace_v2::SpanGuard::begin("consumer.write_narrowed");
-            let mut left = chunk.narrowed_len;
-            for seg in chunk.data_with_markers.segments() {
-                if left == 0 {
-                    break;
-                }
-                let n = left.min(seg.len());
-                let sl = unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const u8, n) };
-                writer
-                    .write_all(sl)
-                    .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-                left -= n;
-            }
-            *total_size += chunk.narrowed_len;
-        }
-        if decoded_data_len > 0 {
-            let _tv2 = trace_v2::SpanGuard::begin("consumer.write_data");
-            chunk
-                .data
-                .write_payload_skipping_prefix(chunk.data_prefix_len, writer)
+        let _tv2 = trace_v2::SpanGuard::begin("consumer.write_buffered");
+        let mut parts: Vec<&[u8]> = Vec::with_capacity(8);
+        chunk.append_output_iovecs(&mut parts);
+        for sl in parts {
+            writer
+                .write_all(sl)
                 .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
-            *total_size += decoded_data_len;
+            *total_size += sl.len();
         }
     }
     let crc_write_us = t_crc_write.elapsed().as_micros();
@@ -3543,6 +3666,7 @@ fn drain_one_pending<W: std::io::Write>(
     // an extra Arc allocation per chunk).
     let _ = cache_key;
     let _ = block_fetcher;
+    defer_chunk_recycle(recycle_deferral, chunk);
     // Coz throughput marker: one in-order chunk just left the consumer. Coz
     // measures a virtual speedup's effect as the change in THIS visit-rate —
     // the program's true end-to-end throughput. No-op without --features coz.

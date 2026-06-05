@@ -13,7 +13,7 @@
 
 use crate::decompress::parallel::chunk_data::ChunkData;
 #[cfg(test)]
-use crate::decompress::parallel::chunk_data::MARKER_BASE;
+use crate::decompress::parallel::replace_markers::MARKER_BASE;
 
 /// Resolve markers in place. CRC32 accounting is the CALLER's
 /// responsibility: the consumer CRCs the resolved bytes once, over the

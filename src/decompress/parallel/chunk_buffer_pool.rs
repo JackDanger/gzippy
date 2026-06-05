@@ -163,7 +163,9 @@ fn hugepage_hint(_ptr: *mut u8, _len: usize) {}
 
 /// Cap on pool size per worker per Vec type. Sized to a handful of
 /// in-flight chunks per worker (not the old shared cap of 64).
-const MAX_POOLED: usize = 8;
+// Sized for T16 in-flight depth: eager Ready-drain returns buffers sooner,
+// but several Async heads can still hold buffers while workers decode ahead.
+const MAX_POOLED: usize = 12;
 const MAX_WORKERS: usize = 64;
 
 thread_local! {

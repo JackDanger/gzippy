@@ -336,8 +336,22 @@ impl SegmentedU16 {
             return;
         }
         let end = (from + len).min(self.cached_len);
-        out.reserve(end - from);
+        let n = end - from;
+        out.resize(n, 0);
+        self.resolve_range_into_buf(from, n, window, out);
+    }
+
+    /// Segment-efficient resolve: copy logical range `[from, from+len)` into
+    /// `out[..len]`, mapping markers through `window`. One segment walk —
+    /// O(touched segments), not O(len × segments) like repeated [`Self::get`].
+    pub fn resolve_range_into_buf(&self, from: usize, len: usize, window: &[u8], out: &mut [u8]) {
+        debug_assert!(out.len() >= len);
+        if len == 0 || from >= self.cached_len {
+            return;
+        }
+        let end = (from + len).min(self.cached_len);
         let mut elem_base = 0usize;
+        let mut out_off = 0usize;
         for seg in &self.segments {
             let seg_len = seg.len();
             let seg_start = elem_base;
@@ -346,12 +360,12 @@ impl SegmentedU16 {
                 let local_from = from.saturating_sub(seg_start);
                 let local_to = (end - seg_start).min(seg_len);
                 for &v in &seg[local_from..local_to] {
-                    let b = if v >= MARKER_BASE {
+                    out[out_off] = if v >= MARKER_BASE {
                         window[(v - MARKER_BASE) as usize]
                     } else {
                         v as u8
                     };
-                    out.push(b);
+                    out_off += 1;
                 }
             }
             elem_base = seg_end;
@@ -359,6 +373,7 @@ impl SegmentedU16 {
                 break;
             }
         }
+        debug_assert_eq!(out_off, end - from);
     }
 
     /// Construct from owned segments (recycler give-back).
@@ -885,6 +900,29 @@ mod tests {
         assert_eq!(out, vec![b'a', 0, 255, b'z']);
         b.resolve_range_into(1, 2, &window, &mut out);
         assert_eq!(out, vec![0, 255]);
+    }
+
+    #[test]
+    fn resolve_range_into_buf_matches_vec_form() {
+        let mut b = SegmentedU16::default();
+        let window: Vec<u8> = (0..32768).map(|i| (i & 0xFF) as u8).collect();
+        let total = SEGMENT_ELEMENTS + 200;
+        let mut input: Vec<u16> = Vec::with_capacity(total);
+        for i in 0..total {
+            if i % 5 == 0 {
+                input.push(marker((i % 32768) as u16));
+            } else {
+                input.push((i & 0xFF) as u16);
+            }
+        }
+        b.push_slice(&input);
+        for (from, len) in [(0, 50), (SEGMENT_ELEMENTS - 10, 40), (total - 100, 100)] {
+            let mut vec_out = Vec::new();
+            b.resolve_range_into(from, len, &window, &mut vec_out);
+            let mut buf_out = vec![0u8; len];
+            b.resolve_range_into_buf(from, len, &window, &mut buf_out);
+            assert_eq!(vec_out, &buf_out[..vec_out.len()]);
+        }
     }
 
     #[test]

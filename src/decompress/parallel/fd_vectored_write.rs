@@ -444,6 +444,7 @@ pub mod splice {
 /// alive until the pipe has drained. On the writev path the iovec
 /// slices are fully copied into the kernel before this returns, so the
 /// caller's live buffers suffice and `owner` is dropped here.
+#[cfg(any(test, target_os = "linux"))]
 pub fn write_all_to_fd(
     fd: i32,
     iovs: &mut [libc::iovec],
@@ -494,6 +495,47 @@ pub fn write_all_to_fd(
         drop(owner);
         r
     }
+}
+
+/// True when `fd` is a pipe (`F_GETPIPE_SZ` succeeds on Linux).
+#[cfg(target_os = "linux")]
+#[inline]
+pub fn is_pipe_fd(fd: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        (unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) }) >= 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fd;
+        false
+    }
+}
+
+/// Consumer zero-copy output: gather-`writev` (or Linux-pipe `vmsplice`)
+/// then recycle `chunk`'s rpmalloc-backed buffers.
+///
+/// Regular files and non-Linux unix use synchronous `writev` — the kernel
+/// copies bytes before return, so `chunk` stays on the stack with no
+/// per-chunk `Box<dyn Any>` owner. Linux pipes box `chunk` for
+/// `SpliceVault` page-lifetime accounting (vendor `writeAll` pipe arm).
+pub fn write_chunk_payload_to_fd(
+    fd: i32,
+    iovs: &mut [libc::iovec],
+    mut chunk: crate::decompress::parallel::chunk_data::ChunkData,
+) -> io::Result<()> {
+    if iovs.is_empty() {
+        chunk.recycle_decoded_buffers();
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    if is_pipe_fd(fd) {
+        write_all_to_fd(fd, iovs, Box::new(chunk))?;
+        return Ok(());
+    }
+    let r = writev_all_to_fd(fd, iovs);
+    chunk.recycle_decoded_buffers();
+    r
 }
 
 #[cfg(test)]
