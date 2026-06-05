@@ -1194,3 +1194,24 @@ TMA: the gz↔rg gap is BACKEND/MEMORY-bound WAITING, NOT instructions (HEAD ins
 WHERE/WHY: consumer fetcher_get wait ~30ms/135ms on the in-order frontier chunk + that chunk's decode being memory-stall-bound (in-place resolve materialize_us=0, narrow ≤292us negligible, apply_window ≤1.1ms dominant post-step). Same locus as the campaign's STOP, smaller.
 VERDICT: segment-native-A3 = SHIPPABLE MEMORY WIN (byte-correct + −27% RSS + T16-restored + T8-file +5% + simpler code: 10eb3dd was −619 net lines). PARTIALLY VINDICATES the blind-spot critique: the campaign dead-ended the faithful memory model as "not a SPEED lever" — but COMPLETED (segment-native A3) it's a shippable MEMORY + faithfulness + code-simplification win the campaign should have finished, not stopped at. (Critical-analysis subagent a1a37337 assessing the code + blind-spot in parallel.)
 CAVEATS: T16 spread 17-31% (min-ratios agree); memlife per-buffer JSON not CLI-wired (used maxrss/minflt+trace); fulcrum vs/schedule/flow absent from this binary build (used parallel_sm_log_summary.py + perf TMA).
+
+## 2026-06-05 — REDUNDANT get_last_window PUBLISH GUARD (vendor GzipChunkFetcher.hpp:558). Small real win.
+Measured (direct timing) get_last_window calls=102 for ~39 chunks (~1.5ms each = 150ms): the consumer
+RECOMPUTED each chunk's end-window unconditionally even though the eager full-scan already published it.
+Vendor queueChunkForPostProcessing:558 guards `if(!m_windowMap->get(windowOffset))`. Ported to both
+consumer publish sites (clean+marker). get_last_window deterministic given same predecessor -> eager-
+published window byte-identical -> skip is byte-exact. calls 102->47, total 150->23ms (commit 1742100).
+LOCKED-FULCRUM A/B (min-of-9, frozen, byte-exact diverged=0, vs pre-guard 6c76b77):
+  T4 1.569->1.519s (-3.1%, 0.583->0.600), T8 1.024->0.988s (-3.5%, 0.519->0.538), T16 -0.6% (noise), T1 flat.
+DISCIPLINE NOTE: this fix came from a clean DIRECT measurement after the trace SELF-TIMES proved
+unreliable (double-counted) and code-analysis WRONGLY predicted get_last_window was cheap. 3 hypotheses
+falsified by measurement before porting this session (interior-accept: no containing chunk; Arc-clone:
+try_unwrap misses=0; get_last_window-cheap: measured 1.5ms+redundant). Measure, don't assume.
+
+## SESSION CUMULATIVE 2026-06-05 (3 vendor divergences ported, transliteration not levers):
+From 43f1685 -> 1742100, locked-Fulcrum ratio (rapidgzip_min/gzippy_min, higher=closer to parity):
+  T4  0.537 -> 0.600   T8  0.437 -> 0.538 (+23%)   T16 0.346 -> 0.451 (+30%)
+(T1 forced-parallel regressed 0.469->0.410, benchmark-only: production T1 routes to libdeflate.)
+Still 1.7-2.4x off rapidgzip — NOT parity. But the biggest sustained high-T movement in many sessions,
+and it VINDICATES the transliteration method + the bias guardrails (the "it's the engine" escape-hatch
+was falsified; the engine is a measured TIE; the wins were all consumer/control-plane divergences).
