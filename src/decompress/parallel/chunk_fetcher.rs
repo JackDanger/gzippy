@@ -1585,7 +1585,10 @@ fn consumer_loop<W: std::io::Write>(
             // the eager-published window is byte-identical; skipping the recompute is byte-exact.
             if !window_map.contains(chunk_end_bit) {
                 let window_bytes = materialize_window(&window);
-                let tail = chunk.get_last_window_vec(&window_bytes);
+                let tail = {
+                    let _tv2 = trace_v2::SpanGuard::begin("consumer.get_last_window");
+                    chunk.get_last_window_vec(&window_bytes)
+                };
                 window_map.insert_owned_none(chunk_end_bit, tail);
             }
             trace_v2::emit_instant(
@@ -2734,7 +2737,10 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
     let bytes = materialize_window(&predecessor_window);
     let materialize_us = t_materialize.elapsed().as_micros();
     let t_apply = std::time::Instant::now();
-    resolve_chunk_markers_on_chunk(&mut chunk, bytes.as_ref());
+    {
+        let _tv2 = trace_v2::SpanGuard::begin("post_process.resolve_markers");
+        resolve_chunk_markers_on_chunk(&mut chunk, bytes.as_ref());
+    }
     let apply_us = t_apply.elapsed().as_micros();
     let resolve_us = apply_us as f64;
     let fused = marker_bytes >= 16 * 1024;

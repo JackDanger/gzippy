@@ -806,6 +806,9 @@ impl MarkerRing {
         if new_bytes == 0 {
             return;
         }
+        let _tv2 = crate::decompress::parallel::trace_v2::detail_enabled().then(|| {
+            crate::decompress::parallel::trace_v2::SpanGuard::begin("worker.block_body.drain")
+        });
         let start = self.ring_drained % RING_SIZE;
         if start + new_bytes <= RING_SIZE {
             output.push_slice(&self.ring[start..start + new_bytes]);
@@ -919,8 +922,13 @@ impl MarkerRing {
             }};
         }
 
+        // No per-iteration `bits.refill()` — LUT refills internally (same as
+        // `decode_block`). ISA-L packs up to 3 literals per decode; batch
+        // the prefix with one ring write sequence.
+        let _tv2_huff = crate::decompress::parallel::trace_v2::detail_enabled().then(|| {
+            crate::decompress::parallel::trace_v2::SpanGuard::begin("worker.block_body.huffman")
+        });
         while emitted < n_max {
-            bits.refill();
             let d = self.scratch.litlen.decode(bits);
             if d.bit_count == 0 {
                 commit_drain!(Err(BulkDecodeError::InvalidHuffmanCode));
@@ -928,9 +936,38 @@ impl MarkerRing {
             bits.consume(d.bit_count);
             let mut sym = d.symbol;
             let mut sym_count = d.sym_count;
+            if sym_count == 0 {
+                commit_drain!(Err(BulkDecodeError::InvalidHuffmanCode));
+            }
+            let lit_prefix = (sym_count - 1) as usize;
+            if lit_prefix > 0 {
+                if emitted + lit_prefix > n_max {
+                    commit_drain!(Err(BulkDecodeError::InvalidHuffmanCode));
+                }
+                let mut p = pos;
+                let mut s = sym;
+                for _ in 0..lit_prefix {
+                    // SAFETY: emitted + lit_prefix <= n_max.
+                    unsafe {
+                        ring_ptr.add(p % RING_SIZE).write((s & 0xFF) as u16);
+                    }
+                    p += 1;
+                    if contains {
+                        distance_marker += 1;
+                    }
+                    s >>= 8;
+                }
+                pos = p;
+                emitted += lit_prefix;
+                sym = s;
+                sym_count = 1;
+            }
             loop {
                 let code = (sym & 0xFFFF) as u16;
-                if code as u32 <= 255 || sym_count > 1 {
+                if code as u32 <= 255 {
+                    if emitted >= n_max {
+                        commit_drain!(Err(BulkDecodeError::InvalidHuffmanCode));
+                    }
                     // SAFETY: pos % RING_SIZE in bounds.
                     unsafe {
                         ring_ptr.add(pos % RING_SIZE).write(code & 0xFF);
@@ -1175,7 +1212,6 @@ impl MarkerRing {
         }
 
         while emitted < n_max {
-            bits.refill();
             let d = self.scratch.litlen.decode(bits);
             if d.bit_count == 0 {
                 commit_drain_u8!(Err(BulkDecodeError::InvalidHuffmanCode));
@@ -1183,10 +1219,34 @@ impl MarkerRing {
             bits.consume(d.bit_count);
             let mut sym = d.symbol;
             let mut sym_count = d.sym_count;
+            if sym_count == 0 {
+                commit_drain_u8!(Err(BulkDecodeError::InvalidHuffmanCode));
+            }
+            let lit_prefix = (sym_count - 1) as usize;
+            if lit_prefix > 0 {
+                if emitted + lit_prefix > n_max {
+                    commit_drain_u8!(Err(BulkDecodeError::InvalidHuffmanCode));
+                }
+                let mut p = pos;
+                let mut s = sym;
+                for _ in 0..lit_prefix {
+                    unsafe {
+                        ring8.add(p % RING_U8_SIZE).write((s & 0xFF) as u8);
+                    }
+                    p += 1;
+                    s >>= 8;
+                }
+                pos = p;
+                emitted += lit_prefix;
+                sym = s;
+                sym_count = 1;
+            }
             loop {
                 let code = (sym & 0xFFFF) as u16;
-                if code as u32 <= 255 || sym_count > 1 {
-                    // SAFETY: pos % RING_U8_SIZE in bounds.
+                if code as u32 <= 255 {
+                    if emitted >= n_max {
+                        commit_drain_u8!(Err(BulkDecodeError::InvalidHuffmanCode));
+                    }
                     unsafe {
                         ring8.add(pos % RING_U8_SIZE).write((code & 0xFF) as u8);
                     }

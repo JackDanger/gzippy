@@ -88,15 +88,27 @@ CFG=gzippy
   echo ""
 
   echo "======== fulcrum consumer (WAIT/COMPUTE/OUTPUT/IDLE) ========"
-  "$FULCRUM_BIN" consumer "$GZ_TRACE" || true
+  "$FULCRUM_BIN" consumer "$GZ_TRACE" --config "$CFG" || true
+  echo ""
+
+  echo "======== fulcrum spans (excl-self + wall-crit atlas) ========"
+  "$FULCRUM_BIN" spans "$GZ_TRACE" --config "$CFG" --top 50 || true
+  echo ""
+
+  echo "======== fulcrum spans tree under worker.block_body ========"
+  "$FULCRUM_BIN" spans "$GZ_TRACE" --config "$CFG" --under worker.block_body || true
+  echo ""
+
+  echo "======== fulcrum spans tree under worker.decode_chunk ========"
+  "$FULCRUM_BIN" spans "$GZ_TRACE" --config "$CFG" --under worker.decode_chunk || true
   echo ""
 
   echo "======== fulcrum schedule (PLACEMENT vs RATE) ========"
-  "$FULCRUM_BIN" schedule "$GZ_TRACE" || true
+  "$FULCRUM_BIN" schedule "$GZ_TRACE" --config "$CFG" || true
   echo ""
 
   echo "======== fulcrum causal ========"
-  "$FULCRUM_BIN" causal "$GZ_TRACE" --timeline 16 || true
+  "$FULCRUM_BIN" causal "$GZ_TRACE" --config "$CFG" --timeline 16 || true
   echo ""
 
   echo "======== fulcrum decompose (residual) ========"

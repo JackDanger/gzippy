@@ -142,7 +142,7 @@ capture_trace() { # capture_trace <label> <cpu-mask> <cmd...>
   local ml="$ARTDIR/memlife_${label}.json"
   say "## TRACE $label -> $tl"
   # shellcheck disable=SC2046
-  GZIPPY_TIMELINE="$tl" GZIPPY_MEMLIFE="$ml" GZIPPY_VERBOSE=1 \
+  GZIPPY_TIMELINE="$tl" GZIPPY_MEMLIFE="$ml" GZIPPY_VERBOSE=1 GZIPPY_TRACE_DETAIL=1 \
     taskset -c "$mask" $(gzippy_wall_cmd) "$@" >/dev/null 2>>"$ARTDIR/trace.log" || true
   [ -s "$tl" ] || { say "## WARN empty timeline $tl"; return 1; }
   ls -la "$tl" "$ml" 2>/dev/null || true
