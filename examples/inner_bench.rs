@@ -207,7 +207,7 @@ fn decode_tbl_isal_u8(deflate: &[u8], out: &mut [u8]) -> usize {
 /// Output is drained to a u8 buffer at each re-entry to mimic the production
 /// per-call drain that the cap forces.
 #[cfg(feature = "pure-rust-inflate")]
-fn decode_tbl_isal_u16(deflate: &[u8], out: &mut [u8]) -> usize {
+fn decode_tbl_isal_u16(deflate: &[u8], _out: &mut [u8]) -> usize {
     use gzippy::decompress::inflate::consume_first_decode::Bits;
     use gzippy::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached;
     use gzippy::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure;
@@ -295,7 +295,7 @@ fn decode_tbl_isal_u16(deflate: &[u8], out: &mut [u8]) -> usize {
                     let code = (symbol & 0xFFFF) as u16;
                     if code <= 255 || symbol_count > 1 {
                         unsafe {
-                            ring_ptr.add(phys as usize).write((code & 0xFF) as u16);
+                            ring_ptr.add(phys as usize).write((code & 0xFF));
                         }
                         phys = phys.wrapping_add(1);
                         pos += 1;

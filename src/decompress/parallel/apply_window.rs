@@ -1,4 +1,6 @@
 #![cfg(parallel_sm)]
+#![allow(dead_code)]
+// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
 
 //! Port of `rapidgzip::ChunkData::applyWindow` (ChunkData.hpp:302).
 //!
@@ -9,8 +11,9 @@
 //!
 //! CRC32 accounting is the caller's responsibility — see `apply_window`.
 
-use crate::decompress::parallel::chunk_data::{ChunkData, MARKER_BASE};
-use crate::decompress::parallel::replace_markers::replace_markers;
+use crate::decompress::parallel::chunk_data::ChunkData;
+#[cfg(test)]
+use crate::decompress::parallel::chunk_data::MARKER_BASE;
 
 /// Resolve markers in place. CRC32 accounting is the CALLER's
 /// responsibility: the consumer CRCs the resolved bytes once, over the

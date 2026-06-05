@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
 //! Compile-time gates and production defaults for parallel single-member.
 //!
 //! **Memory model (rapidgzip `DecodedData` shape):** segmented

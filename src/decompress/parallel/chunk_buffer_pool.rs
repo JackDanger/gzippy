@@ -1,4 +1,6 @@
 #![cfg(parallel_sm)]
+#![allow(dead_code)]
+// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
 
 //! Cross-thread Vec recycler for `ChunkData`'s `data` (`Vec<u8>`) and
 //! `data_with_markers` (`Vec<u16>`) buffers.
@@ -119,6 +121,7 @@ fn use_hugepage_hint() -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 fn use_hugepage_hint() -> bool {
     false
 }
@@ -155,6 +158,7 @@ fn hugepage_hint(ptr: *mut u8, len: usize) {
 
 #[cfg(not(target_os = "linux"))]
 #[inline(always)]
+#[allow(dead_code)]
 fn hugepage_hint(_ptr: *mut u8, _len: usize) {}
 
 /// Cap on pool size per worker per Vec type. Sized to a handful of

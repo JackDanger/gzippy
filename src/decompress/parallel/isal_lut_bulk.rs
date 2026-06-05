@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
 //! Stateless windowed-bulk DEFLATE decoder using the ISA-L LUT format
 //! from `isal_huffman_pure.rs`.
 //!
@@ -473,7 +475,6 @@ fn build_dynamic_huffman(
         bits.consume(3);
     }
 
-    use crate::decompress::parallel::huffman_base::LsbBitReader as _;
     let mut cl_decoder = HuffmanCodingReversedBitsCached::<19>::new();
     let err = cl_decoder.initialize_from_lengths(&scratch.cl_lens, false);
     if err != crate::decompress::parallel::error::Error::None {

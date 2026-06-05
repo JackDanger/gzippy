@@ -1,4 +1,6 @@
 #![cfg(parallel_sm)]
+#![allow(dead_code)]
+// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
 
 //! Literal port of `rapidgzip::deflate::Block`
 //! (vendor/.../gzip/deflate.hpp:513-1156): the deflate Block state
@@ -945,7 +947,7 @@ impl Block {
     fn isal_lut_litlen_rebuild(&mut self, litlen_lens: &[u8]) -> bool {
         #[cfg(pure_inflate_decode)]
         {
-            return self.isal_litlen_pure.rebuild_from(litlen_lens);
+            self.isal_litlen_pure.rebuild_from(litlen_lens)
         }
         #[cfg(not(any(
             all(
@@ -973,7 +975,7 @@ impl Block {
     fn isal_lut_dist_rebuild(&mut self, dist_lens: &[u8]) -> bool {
         #[cfg(pure_inflate_decode)]
         {
-            return self.isal_dist_pure.rebuild_from(dist_lens);
+            self.isal_dist_pure.rebuild_from(dist_lens)
         }
         #[cfg(not(any(
             all(
@@ -1002,7 +1004,7 @@ impl Block {
         #[cfg(pure_inflate_decode)]
         {
             let d = self.isal_litlen_pure.decode(bits);
-            return (d.symbol, d.sym_count, d.bit_count);
+            (d.symbol, d.sym_count, d.bit_count)
         }
         #[cfg(not(any(
             all(
@@ -1030,7 +1032,7 @@ impl Block {
     fn isal_lut_dist_decode(&self, bits: &mut Bits) -> Option<(u32, u32)> {
         #[cfg(pure_inflate_decode)]
         {
-            return self.isal_dist_pure.decode(bits);
+            self.isal_dist_pure.decode(bits)
         }
         #[cfg(not(any(
             all(
@@ -1492,7 +1494,7 @@ impl Block {
                     pure_inflate_decode
                 ))]
                 {
-                    return Err(BlockError::InvalidCompression);
+                    Err(BlockError::InvalidCompression)
                 }
 
                 #[cfg(not(any(

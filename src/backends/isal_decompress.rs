@@ -9,7 +9,11 @@
 
 /// Check if ISA-L decompression is available and beneficial.
 /// Only true on x86_64 with the isal-compression feature enabled.
+///
+/// OFF the production decode graph (task #8): ISA-L decode is no longer
+/// routed to. Retained only for the oracle/diagnostic tests in this module.
 #[inline]
+#[allow(dead_code)]
 pub fn is_available() -> bool {
     cfg!(all(feature = "isal-compression", target_arch = "x86_64"))
 }
@@ -85,6 +89,7 @@ pub fn decompress_gzip_stream<W: std::io::Write>(input: &[u8], writer: &mut W) -
 }
 
 #[cfg(not(all(feature = "isal-compression", target_arch = "x86_64")))]
+#[allow(dead_code)] // off the production decode graph (task #8); oracle/test only
 pub fn decompress_gzip_stream<W: std::io::Write>(_input: &[u8], _writer: &mut W) -> Option<u64> {
     None
 }

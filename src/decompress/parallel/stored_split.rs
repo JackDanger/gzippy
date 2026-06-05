@@ -143,6 +143,7 @@ impl From<io::Error> for StoredSplitError {
 /// exact.
 ///
 /// Returns `false` (decline the stored path) on any parse failure.
+#[allow(dead_code)] // called only from classify's parallel_sm branch
 pub fn first_block_is_stored(gzip_data: &[u8]) -> bool {
     let header_size = match gzip_format::read_header(gzip_data) {
         Ok((_h, off)) => off,

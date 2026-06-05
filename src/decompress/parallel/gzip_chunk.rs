@@ -1,4 +1,6 @@
 #![cfg(parallel_sm)]
+#![allow(dead_code)]
+// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
 
 //! Per-chunk deflate decode for parallel single-member.
 //!
@@ -19,10 +21,6 @@ use crate::decompress::parallel::inflate_wrapper::InflateError;
 use crate::decompress::parallel::inflate_wrapper::{
     DeflateCompressionType, IsalInflateWrapper, StoppingPoints,
 };
-#[cfg(parallel_sm)]
-use crate::decompress::parallel::rpmalloc_alloc::types;
-#[cfg(parallel_sm)]
-use crate::decompress::parallel::trace;
 
 #[derive(Debug)]
 #[allow(dead_code)] // error payloads surfaced via Debug in production
@@ -51,6 +49,7 @@ impl From<std::io::Error> for ChunkDecodeError {
 
 /// Output buffer size used per `read_stream` iteration. Matches
 /// rapidgzip's `ALLOCATION_CHUNK_SIZE` (GzipChunk.hpp uses 128 KiB).
+#[allow(dead_code)]
 const ALLOCATION_CHUNK_SIZE: usize = 128 * 1024;
 
 // =========================================================================
@@ -159,6 +158,7 @@ pub static BULK_DECLINE_OUTPUT_OVERFLOW: std::sync::atomic::AtomicU64 =
 pub static BULK_DECLINE_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(pure_inflate_decode)]
+#[allow(dead_code)]
 fn record_bulk_decline(err: crate::decompress::parallel::isal_lut_bulk::BulkDecodeError) {
     use crate::decompress::parallel::isal_lut_bulk::BulkDecodeError;
     use std::sync::atomic::Ordering;
@@ -260,7 +260,7 @@ pub fn decode_chunk(
 fn resumable_resync(
     chunk: &mut ChunkData,
     input: &[u8],
-    mut inflate_start_bit: usize,
+    inflate_start_bit: usize,
     stop_hint_bits: usize,
     initial_window: &[u8],
     record_decode_duration: bool,
@@ -675,8 +675,6 @@ fn decode_chunk_with_rapidgzip_impl(
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
-
     // Envelope span: `chunk_fetcher::run_decode_task` (`worker.decode_chunk`).
     let t_decode = std::time::Instant::now();
 
@@ -786,6 +784,7 @@ fn decode_chunk_unified_marker(
 #[cfg(parallel_sm)]
 enum MarkerStep {
     /// Another deflate block was decoded; call again.
+    #[allow(dead_code)]
     Continue,
     /// 32 KiB of clean output reached at a block boundary — FLIP to the u8 clean
     /// tail (vendor setInitialWindow). The clean 32 KiB window is the tail of
@@ -797,6 +796,7 @@ enum MarkerStep {
     /// Chunk ends in the marker path (BFINAL, stop hint, or no clean dict).
     Finished {
         end_bit_offset: usize,
+        #[allow(dead_code)]
         bfinal_hit: bool,
     },
 }
@@ -805,6 +805,7 @@ enum MarkerStep {
 #[cfg(parallel_sm)]
 struct MarkerDecodeCtx {
     /// `Bits` slice base in `data` (byte index).
+    #[allow(dead_code)]
     data_base_byte: usize,
     current_bit_offset: usize,
     trailing_clean: usize,

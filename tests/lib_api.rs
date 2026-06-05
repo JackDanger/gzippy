@@ -230,7 +230,13 @@ fn classify_single_member_t1() {
     let path = gzippy::classify(&compressed, 1);
     // ISA-L on x86_64, LibdeflateSingle elsewhere.
     assert!(
-        matches!(path, DecodePath::IsalSingle | DecodePath::LibdeflateSingle),
+        matches!(
+            path,
+            DecodePath::IsalParallelSM
+                | DecodePath::StoredParallel
+                | DecodePath::StreamingSingle
+                | DecodePath::LibdeflateSingle
+        ),
         "unexpected path {path:?} for T1 single-member"
     );
 }
@@ -241,7 +247,13 @@ fn classify_single_member_t4() {
     let path = gzippy::classify(&compressed, 4);
     // Still single-member (no multi-block markers) even with T4.
     assert!(
-        matches!(path, DecodePath::IsalSingle | DecodePath::LibdeflateSingle),
+        matches!(
+            path,
+            DecodePath::IsalParallelSM
+                | DecodePath::StoredParallel
+                | DecodePath::StreamingSingle
+                | DecodePath::LibdeflateSingle
+        ),
         "unexpected path {path:?} for T4 single-member"
     );
 }

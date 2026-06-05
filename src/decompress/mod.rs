@@ -58,7 +58,6 @@ fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
 ///   IsalParallelSM   — single-member ≥ 10 MiB w/ T≥4 — parallel marker pipeline
 ///                      (x86_64: ISA-L or pure-Rust; aarch64: pure-Rust inner decoder).
 ///                      Gated by `parallel::sm_cfg::PARALLEL_SM`; name is historical.
-///   IsalSingle       — x86_64 single-member via ISA-L (one-shot, T=1 or small input)
 ///   StreamingSingle  — single-member > 1GB, no ISA-L (avoids huge allocation)
 ///   LibdeflateSingle — default single-member via libdeflate one-shot (no ISA-L)
 ///
@@ -70,6 +69,9 @@ pub enum DecodePath {
     GzippyParallel,
     MultiMemberPar,
     MultiMemberSeq,
+    // Constructed only under `parallel_sm` (the pure-rust-inflate build);
+    // dead in the legacy default build, alive in production.
+    #[allow(dead_code)]
     IsalParallelSM,
     /// Stored-block-dominated (incompressible) single-member, decoded in
     /// parallel WITHOUT speculation by splitting on explicit stored-block
@@ -77,9 +79,13 @@ pub enum DecodePath {
     /// `parallel_sm_unprofitable` ratio gate routes incompressible input here
     /// (instead of single-thread libdeflate) when its first block is stored —
     /// stored streams are trivially, bandwidth-bound parallelizable.
+    #[allow(dead_code)] // constructed only under parallel_sm (production)
     StoredParallel,
-    IsalSingle,
+    // Only constructed in the legacy `not(parallel_sm)` build; under
+    // `parallel_sm` (production) single-member never routes to C-FFI.
+    #[allow(dead_code)]
     StreamingSingle,
+    #[allow(dead_code)]
     LibdeflateSingle,
 }
 
@@ -89,34 +95,13 @@ pub enum DecodePath {
 /// pipeline's per-chunk fixed overhead dominates. This is a *routing*
 /// decision (visible at the classifier level); it is never used as a
 /// silent in-body fallback.
+#[allow(dead_code)] // referenced by tests + the legacy not(parallel_sm) gate
 pub(crate) const MIN_PARALLEL_COMPRESSED: usize = 10 * 1024 * 1024;
 
-/// Minimum thread count before the speculative parallel single-member pipeline
-/// is worth taking over the libdeflate one-shot decode.
-///
-/// Production default = 4: the parallel engine beats the single-threaded
-/// libdeflate one-shot at T>=4 but LOSES below it (2026-05-29: one-shot T1 =
-/// 1074 MB/s vs parallel T2 = 863, a LOSS — the engine's speculation tax isn't
-/// amortized by < 4 workers yet). Routing T1-3 to the engine would ship a
-/// regression, so the floor stays at 4 for production.
-///
-/// For MEASUREMENT, `GZIPPY_FORCE_PARALLEL_SM=1` drops the effective floor to 0
-/// (see [`parallel_sm_min_threads`]) so the parallel engine — the code we are
-/// actually optimizing — is exercised at every thread count without the
-/// libdeflate-one-shot confound. That is a measurement aid, NOT the production
-/// default, precisely because it regresses T1-3. (Closing the low-thread gap so
-/// the engine can become the sole path — dropping FFI — is the campaign goal.)
-pub(crate) const MIN_PARALLEL_SM_THREADS: usize = 4;
-
-/// Effective parallel-SM thread floor: the production constant, or 0 when
-/// `GZIPPY_FORCE_PARALLEL_SM` is set (measurement: exercise the engine at all T).
-fn parallel_sm_min_threads() -> usize {
-    if std::env::var_os("GZIPPY_FORCE_PARALLEL_SM").is_some() {
-        0
-    } else {
-        MIN_PARALLEL_SM_THREADS
-    }
-}
+// (Removed 2026-06-04) `MIN_PARALLEL_SM_THREADS` / `parallel_sm_min_threads`:
+// the parallel-SM engine is now the SOLE single-member decode path at every
+// thread count and size (task #8), so there is no thread floor below which a
+// C-FFI one-shot is chosen — there is no C-FFI one-shot in the decode graph.
 
 /// Compression ratio (uncompressed / compressed) below which the speculative
 /// parallel single-member pipeline is a NET LOSS and we route to the one-shot
@@ -130,7 +115,9 @@ fn parallel_sm_min_threads() -> usize {
 /// 7263 MB/s to T8 1963 MB/s; GZIPPY_VERBOSE showed 228 header + 69 body
 /// speculation failures.) The ratio cleanly separates incompressible (~1.00)
 /// from compressible silesia (~3.1); 1.15 leaves margin.
+#[allow(dead_code)] // used by classify's parallel_sm branch + tests
 const PARALLEL_SM_MIN_RATIO_NUM: u64 = 115;
+#[allow(dead_code)] // used by classify's parallel_sm branch + tests
 const PARALLEL_SM_MIN_RATIO_DEN: u64 = 100;
 
 /// True when a single-member stream is too incompressible for the speculative
@@ -141,6 +128,7 @@ const PARALLEL_SM_MIN_RATIO_DEN: u64 = 100;
 /// compressible, ISIZE wraps and this may mis-fire — a perf-only miss (it
 /// picks the correct, just non-parallel, one-shot decoder), never a
 /// correctness issue.
+#[allow(dead_code)] // used by classify's parallel_sm branch + tests
 fn parallel_sm_unprofitable(data: &[u8]) -> bool {
     match read_gzip_isize(data) {
         Some(isize_bytes) => {
@@ -167,33 +155,38 @@ pub fn classify_gzip(data: &[u8], num_threads: usize) -> DecodePath {
             DecodePath::MultiMemberSeq
         };
     }
-    if crate::decompress::parallel::sm_cfg::PARALLEL_SM
-        && num_threads >= parallel_sm_min_threads()
-        && data.len() > MIN_PARALLEL_COMPRESSED
+    // SINGLE-MEMBER. When the pure-Rust engine is compiled (`parallel_sm`,
+    // i.e. the `pure-rust-inflate` build), it is the SOLE single-member
+    // decode path — NO C-FFI in the decode graph (/goal part 1, task #8).
+    // The C-FFI backends (ISA-L / libdeflate / zlib-ng) remain compiled
+    // ONLY in the `not(parallel_sm)` legacy build and behind the dev/oracle
+    // feature as fuzz oracles; production never routes to them.
+    #[cfg(parallel_sm)]
     {
-        if !parallel_sm_unprofitable(data) {
-            // Compressible single-member: the speculative marker pipeline.
-            return DecodePath::IsalParallelSM;
-        }
-        // Incompressible / stored-dominated single-member: the speculative
-        // pipeline thrashes (block finder never lands a boundary), so the ratio
-        // gate above declines it. But if it's actually a STORED stream we can
-        // still parallelize WITHOUT speculation using the explicit block
-        // lengths. `first_block_is_stored` is a cheap heuristic; the
-        // stored_split decoder re-validates and bails (NotStoredDominated) to
-        // the safe one-shot path below if the stream is not 100% stored, so a
-        // mis-fire is perf-only, never a correctness issue.
-        if crate::decompress::parallel::stored_split::first_block_is_stored(data) {
+        // No thread/size floor: correctness-wise the pure-Rust pipeline
+        // handles any size/T (verified byte-exact for tiny / T1 /
+        // incompressible / stored), and FFI is no longer an option, so
+        // EVERY single-member stream routes to a pure-Rust decoder.
+        // Stored-dominated streams have sparse deflate boundaries; the
+        // speculative marker pipeline thrashes on them, so use the explicit
+        // stored-block parallel decoder (also pure-Rust). It re-validates
+        // and, if not actually 100% stored, the dispatch falls back to the
+        // pure-Rust marker pipeline (see `decompress_single_member_for`).
+        if parallel_sm_unprofitable(data)
+            && crate::decompress::parallel::stored_split::first_block_is_stored(data)
+        {
             return DecodePath::StoredParallel;
         }
+        DecodePath::IsalParallelSM
     }
-    if crate::backends::isal_decompress::is_available() {
-        return DecodePath::IsalSingle;
+    #[cfg(not(parallel_sm))]
+    {
+        let _ = num_threads;
+        if data.len() > 1024 * 1024 * 1024 {
+            return DecodePath::StreamingSingle;
+        }
+        DecodePath::LibdeflateSingle
     }
-    if data.len() > 1024 * 1024 * 1024 {
-        return DecodePath::StreamingSingle;
-    }
-    DecodePath::LibdeflateSingle
 }
 
 // =============================================================================
@@ -276,7 +269,6 @@ pub(crate) fn decompress_gzip_libdeflate<W: Write + Send>(
         DecodePath::MultiMemberSeq => decompress_multi_member_sequential(data, writer),
         DecodePath::IsalParallelSM
         | DecodePath::StoredParallel
-        | DecodePath::IsalSingle
         | DecodePath::StreamingSingle
         | DecodePath::LibdeflateSingle => {
             decompress_single_member_for(path, data, writer, None, num_threads)
@@ -307,7 +299,6 @@ pub(crate) fn decompress_single_member_fd<W: Write>(
         }
         DecodePath::IsalParallelSM
         | DecodePath::StoredParallel
-        | DecodePath::IsalSingle
         | DecodePath::StreamingSingle
         | DecodePath::LibdeflateSingle => {
             decompress_single_member_for(path, data, writer, out_fd, num_threads)
@@ -377,7 +368,6 @@ pub(crate) fn decompress_single_member<W: Write>(
         }
         DecodePath::IsalParallelSM
         | DecodePath::StoredParallel
-        | DecodePath::IsalSingle
         | DecodePath::StreamingSingle
         | DecodePath::LibdeflateSingle => {
             decompress_single_member_for(path, data, writer, None, num_threads)
@@ -391,14 +381,6 @@ pub(crate) fn decompress_single_member<W: Write>(
 /// *should* have routed parallel is a bug.
 #[cfg(test)]
 pub(crate) static LIBDEFLATE_SM_CALLS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Test-only counter incremented every time a single-member call reaches
-/// the ISA-L one-shot backend. Together with `LIBDEFLATE_SM_CALLS`
-/// these prove that a parallel-eligible input never silently took a
-/// sequential backend.
-#[cfg(test)]
-pub(crate) static ISAL_STREAM_SM_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Hard dispatcher. Each arm is terminal — success or `Err`.
@@ -439,22 +421,31 @@ fn decompress_single_member_for<W: Write>(
                 Ok(n) => Ok(n),
                 Err(StoredSplitError::NotStoredDominated) => {
                     if crate::utils::debug_enabled() {
-                        eprintln!("[gzippy] StoredParallel declined (not pure-stored) → one-shot");
+                        eprintln!(
+                            "[gzippy] StoredParallel declined (not pure-stored) → pure-Rust SM"
+                        );
                     }
-                    decompress_single_member_one_shot(data, writer)
+                    // Pure-Rust marker pipeline (NOT a C-FFI one-shot): the
+                    // decode graph stays FFI-free under `parallel_sm`.
+                    #[cfg(parallel_sm)]
+                    {
+                        let n = crate::decompress::parallel::single_member::decompress_parallel(
+                            data,
+                            writer,
+                            out_fd,
+                            num_threads,
+                        )
+                        .map_err(|e| GzippyError::decompression(format!("parallel SM: {e}")))?;
+                        writer.flush()?;
+                        Ok(n)
+                    }
+                    #[cfg(not(parallel_sm))]
+                    {
+                        decompress_single_member_one_shot(data, writer)
+                    }
                 }
                 Err(e) => Err(GzippyError::decompression(format!("stored parallel: {e}"))),
             }
-        }
-        DecodePath::IsalSingle => {
-            #[cfg(test)]
-            ISAL_STREAM_SM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let bytes = crate::backends::isal_decompress::decompress_gzip_stream(data, writer)
-                .ok_or_else(|| {
-                    GzippyError::decompression("ISA-L sequential decompress failed".to_string())
-                })?;
-            writer.flush()?;
-            Ok(bytes)
         }
         DecodePath::StreamingSingle => {
             if crate::utils::debug_enabled() {
@@ -480,17 +471,12 @@ fn decompress_single_member_for<W: Write>(
 /// target when `StoredParallel`'s heuristic mis-fires on a non-stored stream
 /// (`NotStoredDominated`). Mirrors the tail of [`classify_gzip`]: ISA-L when
 /// available, zlib-ng streaming for >1 GiB, else libdeflate one-shot.
+///
+/// Legacy-build only: under `parallel_sm` (the default/production build) the
+/// pure-Rust pipeline is the sole single-member path and this C-FFI one-shot is
+/// off the decode graph.
+#[cfg(not(parallel_sm))]
 fn decompress_single_member_one_shot<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
-    if crate::backends::isal_decompress::is_available() {
-        #[cfg(test)]
-        ISAL_STREAM_SM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let bytes = crate::backends::isal_decompress::decompress_gzip_stream(data, writer)
-            .ok_or_else(|| {
-                GzippyError::decompression("ISA-L sequential decompress failed".to_string())
-            })?;
-        writer.flush()?;
-        return Ok(bytes);
-    }
     if data.len() > 1024 * 1024 * 1024 {
         return decompress_single_member_streaming(data, writer);
     }
@@ -783,21 +769,24 @@ mod tests {
     #[test]
     fn test_parallel_sm_thread_gate() {
         let (_raw, payload) = compressible_parallel_fixture();
-        assert_ne!(
-            classify_gzip(&payload, 2),
-            DecodePath::IsalParallelSM,
-            "T=2 must NOT take the speculative pipeline (one-shot is faster)"
-        );
-        assert_ne!(
-            classify_gzip(&payload, 3),
-            DecodePath::IsalParallelSM,
-            "T=3 must NOT take the speculative pipeline"
-        );
-        assert_eq!(
-            classify_gzip(&payload, 4),
-            DecodePath::IsalParallelSM,
-            "T=4 must take the speculative pipeline"
-        );
+        // Pure-Rust-sole (task #8): the engine is the only single-member
+        // path at EVERY thread count — no thread gate, because there is no
+        // C-FFI one-shot to gate toward. (Legacy `not(parallel_sm)` build
+        // keeps the T>=4 gate that fed the FFI one-shot below it.)
+        #[cfg(parallel_sm)]
+        for t in [1usize, 2, 3, 4] {
+            assert_eq!(
+                classify_gzip(&payload, t),
+                DecodePath::IsalParallelSM,
+                "T={t} must take the pure-Rust pipeline (sole single-member path)"
+            );
+        }
+        #[cfg(not(parallel_sm))]
+        {
+            assert_ne!(classify_gzip(&payload, 2), DecodePath::IsalParallelSM);
+            assert_ne!(classify_gzip(&payload, 3), DecodePath::IsalParallelSM);
+            assert_eq!(classify_gzip(&payload, 4), DecodePath::IsalParallelSM);
+        }
     }
 
     /// Incompressible single-member input above the size gate must NOT take the
@@ -905,9 +894,11 @@ mod tests {
         );
     }
 
-    /// An input *below* the parallel gate routes deterministically. This
-    /// is a routing decision visible at the classifier — not a silent
-    /// in-body fallback. Document it explicitly.
+    /// A single-member input *below* the old 10 MiB parallel gate routes
+    /// deterministically. Under `parallel_sm` (the production build) the
+    /// pure-Rust engine is the SOLE single-member path — below-gate inputs
+    /// route to a pure-Rust decoder, NEVER C-FFI (task #8). Under the legacy
+    /// `not(parallel_sm)` build they route to the C-FFI one-shot.
     #[test]
     fn test_parallel_sm_routes_below_10mib() {
         let small: Vec<u8> = vec![0u8; 1024 * 1024]; // 1 MiB original
@@ -920,10 +911,19 @@ mod tests {
         // Compressed size of all-zeros 1 MiB is tiny — well below 10 MiB.
         assert!(compressed.len() < MIN_PARALLEL_COMPRESSED);
         let path = classify_gzip(&compressed, 4);
+        #[cfg(parallel_sm)]
+        assert!(
+            matches!(
+                path,
+                DecodePath::IsalParallelSM | DecodePath::StoredParallel
+            ),
+            "below-gate single-member must route pure-Rust under parallel_sm, got {path:?}"
+        );
+        #[cfg(not(parallel_sm))]
         assert_ne!(
             path,
             DecodePath::IsalParallelSM,
-            "below-gate input must not classify parallel"
+            "legacy build routes below-gate to the C-FFI one-shot"
         );
         // Whatever sub-path the classifier picks, it must decode.
         let mut out = Vec::new();
