@@ -341,17 +341,17 @@ pub fn set_and_expand_lit_len_huffcode(
 
     let mut i = 1;
     while i < MAX_HUFF_TREE_DEPTH {
-        count_total = count[i] as u32 + count_tmp + count_total;
+        count_total += count[i] as u32 + count_tmp;
         count_tmp = expand_count[i + 1] as u32;
         expand_count[i + 1] = count_total as u16;
         next_code[i + 1] = (next_code[i] + count[i] as u32) << 1;
         i += 1;
     }
 
-    count_tmp = count[i] as u32 + count_tmp;
+    count_tmp += count[i] as u32;
 
     while i < MAX_LIT_LEN_COUNT - 1 {
-        count_total = count_tmp + count_total;
+        count_total += count_tmp;
         count_tmp = expand_count[i + 1] as u32;
         expand_count[i + 1] = count_total as u16;
         i += 1;
@@ -1105,7 +1105,7 @@ impl IsalDistCodePure {
             self.dist_huff[i].set_length(length);
         }
         // `set_codes` writes back canonical codes for the dist table.
-        if set_codes(&mut self.dist_huff[..], LIT_LEN as usize, &mut dist_count).is_err() {
+        if set_codes(&mut self.dist_huff[..], LIT_LEN, &mut dist_count).is_err() {
             return false;
         }
         // Build the LUT. `make_inflate_huff_code_dist` wants a [u16; 17]
@@ -1137,7 +1137,7 @@ impl IsalDistCodePure {
         if !make_inflate_huff_code_dist(
             &mut self.table,
             &mut self.dist_huff[..],
-            LIT_LEN as usize,
+            LIT_LEN,
             &count_cumulative,
             &code_list,
             ISAL_DEF_DIST_SYMBOLS as u32,

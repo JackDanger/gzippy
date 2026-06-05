@@ -1,4 +1,6 @@
 #![cfg(parallel_sm)]
+#![allow(dead_code)]
+// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
 
 //! Segmented `Vec<u16>` replacement for `ChunkData::data_with_markers`,
 //! plus its IN-PLACE resolve-to-u8 step that eliminates the separate
@@ -821,7 +823,7 @@ mod tests {
     fn trailing_clean_run_crosses_segment_boundary() {
         let mut b = SegmentedU16::default();
         b.push_slice(&vec![1u16; SEGMENT_ELEMENTS]);
-        b.push_slice(&vec![2u16; 100]);
+        b.push_slice(&[2u16; 100]);
         assert_eq!(
             b.trailing_clean_run(SEGMENT_ELEMENTS + 100),
             SEGMENT_ELEMENTS + 100
@@ -830,7 +832,7 @@ mod tests {
         let mut first = vec![1u16; SEGMENT_ELEMENTS];
         first[SEGMENT_ELEMENTS - 10] = marker(3);
         b2.push_slice(&first);
-        b2.push_slice(&vec![2u16; 100]);
+        b2.push_slice(&[2u16; 100]);
         // trailing clean = 9 (after the marker in seg1) + 100 in seg2 = 109
         assert_eq!(b2.trailing_clean_run(32768), 109);
     }

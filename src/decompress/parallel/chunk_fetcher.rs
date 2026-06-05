@@ -58,8 +58,6 @@ use crate::decompress::parallel::gzip_chunk::ChunkDecodeError;
 use std::sync::Arc;
 
 #[cfg(parallel_sm)]
-use crate::decompress::parallel::apply_window::apply_window;
-#[cfg(parallel_sm)]
 use crate::decompress::parallel::block_fetcher::BlockFetcher;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::block_map::{append_subchunks_to_block_map, BlockMap};
@@ -76,8 +74,6 @@ use crate::decompress::parallel::prefetcher::FetchMultiStream;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::raw_block_finder::RawBlockFinderCoordinator;
 #[cfg(parallel_sm)]
-use crate::decompress::parallel::streamed_results::StreamedGetReturnCode;
-#[cfg(parallel_sm)]
 use crate::decompress::parallel::thread_pool::ThreadPool;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::trace;
@@ -88,8 +84,6 @@ use crate::decompress::parallel::window_map::{Window, WindowMap};
 use std::borrow::Cow;
 #[cfg(parallel_sm)]
 use std::sync::mpsc;
-#[cfg(parallel_sm)]
-use std::time::Duration;
 
 /// Materialize a `Window`'s raw bytes. Mirror of vendor's
 /// `sharedLastWindow->decompress()` call at
@@ -981,7 +975,7 @@ fn consumer_loop<W: std::io::Write>(
     let mut prefetch_us_sum: u128 = 0;
     let mut finder_us_sum: u128 = 0;
     let mut fetcher_get_us_sum: u128 = 0;
-    let mut submit_us_sum: u128 = 0;
+    let submit_us_sum: u128 = 0;
     let mut iter_count: usize = 0;
     loop {
         let _tv2 = trace_v2::SpanGuard::begin("consumer.iter");
@@ -1604,7 +1598,7 @@ fn consumer_loop<W: std::io::Write>(
         //   `appendSubchunksToIndexes(chunkData, chunkData->subchunks(), *lastWindow);`
         // Pushes subchunks into BlockMap (line 373) and BlockFinder
         // (line 374).
-        append_subchunks_to_block_map(block_map, &chunk);
+        append_subchunks_to_block_map(block_map, chunk);
         if chunk.subchunks.is_empty() {
             block_finder.insert(chunk_end_bit);
         } else {
@@ -1686,7 +1680,7 @@ fn consumer_loop<W: std::io::Write>(
                 chunk_holder.into_chunk_data(&mut prefetch_post_inflight, consumer_pred_key);
             let pool_resolved = chunk.markers_resolved;
             match predecessor_window_for_postprocess {
-                Some(window) if eager_already_done || pool_resolved => {
+                Some(_window) if eager_already_done || pool_resolved => {
                     pending.push_back(PendingWrite::Ready {
                         idx: partition_idx_for_trace,
                         chunk,
@@ -1970,6 +1964,7 @@ fn submit_decode_to_pool(
 /// Returns the number of eager tasks submitted in this run.
 #[cfg(parallel_sm)]
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn eager_postprocess_prefetched(
     block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
     window_map: &WindowMap,
@@ -2175,15 +2170,15 @@ fn run_decode_task(
             if let Some((k, w)) = window_map.get_predecessor(params.stop_hint_bit) {
                 if k > params.start_bit && window_map.contains(k) {
                     Some((k, w))
-                } else if let Some(w) = window_map.get(params.start_bit) {
-                    Some((params.start_bit, w))
                 } else {
-                    None
+                    window_map
+                        .get(params.start_bit)
+                        .map(|w| (params.start_bit, w))
                 }
-            } else if let Some(w) = window_map.get(params.start_bit) {
-                Some((params.start_bit, w))
             } else {
-                None
+                window_map
+                    .get(params.start_bit)
+                    .map(|w| (params.start_bit, w))
             }
         } else {
             None
@@ -2220,7 +2215,7 @@ fn run_decode_task(
         "t",
     );
 
-    let mut chunk_result = if params.start_bit == 0 {
+    let chunk_result = if params.start_bit == 0 {
         decode_chunk(
             input_bytes,
             params.start_bit,
@@ -2705,6 +2700,7 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
 /// concern from an earlier session was empirically refuted on neurotic
 /// via injection probe (see `plans/rust-rapidgzip.md` §4).
 #[cfg(parallel_sm)]
+#[allow(dead_code)]
 fn narrow_u16_to_u8(src: &[u16], dst: &mut crate::decompress::parallel::rpmalloc_alloc::types::U8) {
     dst.clear();
     dst.reserve(src.len());
@@ -3448,7 +3444,12 @@ fn drain_one_pending<W: std::io::Write>(
             fd_vectored_write::write_all_to_fd(fd, &mut iovs, owner)
                 .map_err(|e| FetchError::Decode(ChunkDecodeError::BootstrapFailed(e)))?;
             *total_size += payload_bytes;
-            wrote_via_fd = true;
+            // Set for symmetry, but the fd path returns immediately below, so
+            // the read at the non-fd fallback is never reached on this path.
+            #[allow(unused_assignments)]
+            {
+                wrote_via_fd = true;
+            }
             let crc_write_us = t_crc_write.elapsed().as_micros();
             let combine_us = 0usize;
             let total_us = t_chunk.elapsed().as_micros();

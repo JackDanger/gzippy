@@ -1341,14 +1341,15 @@ mod tests {
         use crate::decompress::{classify_gzip, DecodePath};
         let oracle = FileOracle::new(512 * 1024);
         let path = classify_gzip(&oracle.single_member_gz, 4);
-        // Single-member must route to one of the four single-member paths.
-        // The exact path depends on whether ISA-L is available on this machine
-        // and whether the input clears the parallel-SM size gate.
+        // Single-member must route to one of the single-member paths. Under
+        // `parallel_sm` (production) it's the pure-Rust pipeline; the legacy
+        // build may pick StreamingSingle / LibdeflateSingle. ISA-L decode is
+        // deleted from the decode graph (task #8).
         assert!(
             matches!(
                 path,
                 DecodePath::IsalParallelSM
-                    | DecodePath::IsalSingle
+                    | DecodePath::StoredParallel
                     | DecodePath::StreamingSingle
                     | DecodePath::LibdeflateSingle
             ),

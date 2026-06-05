@@ -1,4 +1,6 @@
 #![cfg(parallel_sm)]
+#![allow(dead_code)]
+// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
 
 //! Port of `rapidgzip::ChunkData` (ChunkData.hpp, especially lines 80-400)
 //! plus its nested `Subchunk` and `Statistics`.
@@ -21,7 +23,7 @@ use std::sync::Arc;
 
 use crate::decompress::parallel::crc32::CRC32Calculator;
 pub use crate::decompress::parallel::replace_markers::MARKER_BASE;
-use crate::decompress::parallel::rpmalloc_alloc::types::{self, U8};
+use crate::decompress::parallel::rpmalloc_alloc::types::U8;
 use crate::decompress::parallel::segmented_buffer::SegmentedU8;
 use crate::decompress::parallel::segmented_markers::SegmentedU16;
 
@@ -658,7 +660,7 @@ impl ChunkData {
     /// back to `extend_from_slice` (a single contiguous Vec is required
     /// by downstream consumers).
     #[allow(dead_code)]
-    pub fn append_owned_buffer(&mut self, mut buffer: U8) {
+    pub fn append_owned_buffer(&mut self, buffer: U8) {
         // A1 invariant: the `self.data.is_empty()` fast path below
         // would `mem::replace` away an in-place window prefix. Caller
         // must `trim_window_prefix` before handing ownership of a new

@@ -38,6 +38,14 @@ name = "gzippy"
 path = "src/main.rs"
 
 [features]
+# The pure-Rust parallel single-member decoder (the `parallel_sm` cfg, emitted
+# by `pure-rust-inflate`) is the production decode path: the release/ship/bench
+# builds enable `pure-rust-inflate`, so the SHIPPED binary decodes single-member
+# via pure-Rust with NO C-FFI (ISA-L decode is deleted from the graph entirely;
+# task #8). `default` stays empty so the bare `cargo build` / lint gate does not
+# compile the large experimental parallel module (whose pre-existing lint debt
+# is a separate cleanup). Make the default `pure-rust-inflate` once that debt is
+# cleared.
 default = []
 isal = []  # ISA-L decompression (enabled by build.rs when static lib is built)
 isal-compression = ["isal-rs", "arena-allocator"]  # ISA-L + parallel SM chunk arenas

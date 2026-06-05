@@ -27,7 +27,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
-const MIN_PARALLEL_SIZE: usize = 4 * 1024 * 1024;
+// (Removed 2026-06-04, task #8) `MIN_PARALLEL_SIZE`: was a 4 MiB floor below
+// which a C-FFI one-shot decoded small inputs. Pure-Rust is now the SOLE
+// single-member path at any size (verified byte-exact for tiny / incompressible
+// / stored at T1+T4), so there is no floor and no FFI fallback.
 // 1 (was 2, 2026-05-31): the parallel-SM engine is the production path at EVERY
 // thread count (MIN_PARALLEL_SM_THREADS=0, user directive). At num_threads=1 the
 // pool has one worker and the consumer runs on the calling thread (2 OS threads,
@@ -139,8 +142,10 @@ pub fn decompress_parallel<W: Write>(
     if gzip_data.len() < header_size + trailer_size {
         return Err(ParallelError::InvalidGzipFormat);
     }
-    let deflate_data_len = gzip_data.len().saturating_sub(header_size + trailer_size);
-    if deflate_data_len < MIN_PARALLEL_SIZE || num_threads < MIN_THREADS_FOR_PARALLEL {
+    let _deflate_data_len = gzip_data.len().saturating_sub(header_size + trailer_size);
+    // No size floor (task #8: pure-Rust is the sole single-member path at any
+    // size). Only num_threads is gated — T=0 is a caller bug.
+    if num_threads < MIN_THREADS_FOR_PARALLEL {
         return Err(ParallelError::InvalidGzipFormat);
     }
 
@@ -209,7 +214,7 @@ pub fn decompress_parallel<W: Write>(
     }
     #[cfg(not(parallel_sm))]
     {
-        let _ = (writer, out_fd, t0, deflate_data_len);
+        let _ = (writer, out_fd, t0, _deflate_data_len);
         Err(ParallelError::UnsupportedPlatform)
     }
 }
@@ -330,17 +335,20 @@ mod tests {
     }
 
     #[test]
-    fn single_thread_returns_hard_error() {
-        // Construct a valid 5 MiB gzip and pass num_threads=1. The
-        // classifier would never send this here in production (it'd
-        // pick IsalSingle), but a direct caller does; we surface a
-        // hard error rather than silently routing past.
+    fn single_thread_decodes_small_input() {
+        // Pure-Rust-sole (task #8): the engine is the ONLY single-member
+        // decode path at every size/T. A small input at num_threads=1
+        // DECODES — it used to hard-error below the 4 MiB floor (when a
+        // C-FFI one-shot existed to catch it); that floor and that
+        // fallback are both gone, so the engine handles it directly.
         use std::io::Write as _;
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
         enc.write_all(&vec![0u8; 5_000_000]).unwrap();
         let gz = enc.finish().unwrap();
         let mut out = Vec::new();
-        let err = decompress_parallel(&gz, &mut out, None, 1).unwrap_err();
-        assert!(matches!(err, ParallelError::InvalidGzipFormat));
+        let n = decompress_parallel(&gz, &mut out, None, 1)
+            .expect("pure-Rust SM decodes a small input at T=1");
+        assert_eq!(n, 5_000_000);
+        assert_eq!(out, vec![0u8; 5_000_000]);
     }
 }

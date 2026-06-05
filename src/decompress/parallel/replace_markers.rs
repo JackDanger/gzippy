@@ -1,4 +1,6 @@
 #![cfg(parallel_sm)]
+#![allow(dead_code)]
+// task #8: pre-existing parallel-module dead code, exposed by default-feature flip; delete in a dedicated cleanup
 
 //! SIMD-accelerated marker replacement.
 //!
