@@ -1931,39 +1931,10 @@ fn submit_decode_to_pool(
         -1
     };
     let future = thread_pool.submit(
-        move || {
-            let t0 = std::time::Instant::now();
-            let r = run_decode_task(input, params, &window_map, &block_fetcher, configuration);
-            // SLOW-INJECTION GATE (measurement, default OFF, byte-exact: spins AFTER the
-            // real decode so output is unchanged). GZIPPY_SLOW_BOOTSTRAP=N spins N% of the
-            // decode's OWN measured time (CLAUDE.md methodology, harness-plumbed). If the
-            // wall grows ~proportionally => decode gates the wall (Divergence #3 critical-
-            // path, worth the deep data-plane cycle); flat => decode is slack (#3 dead).
-            // Frozen-clock host => spin is fine. TEMPORARY: delete after the gate run.
-            if let Some(pct) = slow_decode_pct() {
-                let decode_elapsed = t0.elapsed();
-                let target = decode_elapsed + decode_elapsed * pct / 100;
-                while t0.elapsed() < target {
-                    std::hint::spin_loop();
-                }
-            }
-            r
-        },
+        move || run_decode_task(input, params, &window_map, &block_fetcher, configuration),
         priority,
     );
     future.into_receiver()
-}
-
-#[cfg(parallel_sm)]
-fn slow_decode_pct() -> Option<u32> {
-    use std::sync::OnceLock;
-    static V: OnceLock<Option<u32>> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("GZIPPY_SLOW_BOOTSTRAP")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .filter(|&p| p > 0)
-    })
 }
 
 /// Submit a post-process task to the `ThreadPool`, returning the
