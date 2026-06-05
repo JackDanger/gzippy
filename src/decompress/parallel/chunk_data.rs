@@ -597,6 +597,19 @@ impl ChunkData {
         let _ = self.data_prefix_len;
     }
 
+    /// Copy the A3 predecessor window prefix (32 KiB) when window-present
+    /// decode seeded `data[0..32K]`. Used to publish `WindowMap` entries at
+    /// confirmed handoff keys (vendor `get(blockOffset)` parity).
+    pub fn window_prefix_vec(&self) -> Option<Vec<u8>> {
+        use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
+        if self.data_prefix_len < MAX_WINDOW_SIZE {
+            return None;
+        }
+        let mut buf = vec![0u8; MAX_WINDOW_SIZE];
+        self.data.copy_range_into(0, &mut buf);
+        Some(buf)
+    }
+
     /// Append marker-tagged output (u16 with `MARKER_BASE` bit set on
     /// back-references). Mirror of `ChunkData::append(DecodedVector&&)`
     /// for the markered branch. CRC32 is deferred to `apply_window`
