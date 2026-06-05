@@ -1930,43 +1930,11 @@ fn submit_decode_to_pool(
         /* on-demand frontier decode — favored ahead of prefetch */
         -1
     };
-    // ON-DEMAND-ONLY slow-injection gate (advisor: separate the scheduling confound).
-    // The all-decode gate's +61%/+100% slope was confounded — spinning PREFETCH decodes
-    // holds pool slots and queues the frontier decode behind them (scheduling, not decode-
-    // criticality). Slow ONLY the on-demand frontier decode (!is_speculative_prefetch). If
-    // this slope ≈ the all-decode slope, decode-criticality is real; if it collapses, the
-    // +61% was prefetch-spin contention. Byte-exact (spins after the real decode). TEMP.
-    let is_ondemand = !params.is_speculative_prefetch;
     let future = thread_pool.submit(
-        move || {
-            let t0 = std::time::Instant::now();
-            let r = run_decode_task(input, params, &window_map, &block_fetcher, configuration);
-            if is_ondemand {
-                if let Some(pct) = slow_decode_pct() {
-                    let decode_elapsed = t0.elapsed();
-                    let target = decode_elapsed + decode_elapsed * pct / 100;
-                    while t0.elapsed() < target {
-                        std::hint::spin_loop();
-                    }
-                }
-            }
-            r
-        },
+        move || run_decode_task(input, params, &window_map, &block_fetcher, configuration),
         priority,
     );
     future.into_receiver()
-}
-
-#[cfg(parallel_sm)]
-fn slow_decode_pct() -> Option<u32> {
-    use std::sync::OnceLock;
-    static V: OnceLock<Option<u32>> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("GZIPPY_SLOW_BOOTSTRAP")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .filter(|&p| p > 0)
-    })
 }
 
 /// Submit a post-process task to the `ThreadPool`, returning the
