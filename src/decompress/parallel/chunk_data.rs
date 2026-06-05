@@ -644,6 +644,44 @@ impl ChunkData {
         }
     }
 
+    /// Append clean output that arrives as u16 ring values from a
+    /// post-flip [`MarkerRing`](crate::decompress::parallel::isal_lut_bulk::MarkerRing)
+    /// drain. After the flip (`!contains_marker_bytes()`) every value is
+    /// guaranteed `< 256`, so narrowing to u8 is lossless — this is the
+    /// unified-decoder analogue of [`append_clean`] for the merged clean
+    /// tail (the same `crc32s.last_mut()` + `subchunks.last` accounting,
+    /// no second decode engine and no 32 KiB window copy). Mirrors the
+    /// `append`-into-`data` branch of vendor `ChunkData::append`.
+    ///
+    /// `debug_assert`s the all-clean invariant; in release a stray marker
+    /// would narrow to its low byte (a corruption the CRC check catches).
+    pub fn append_clean_narrowed(&mut self, values: &[u16]) {
+        thread_local! {
+            static NARROW_SCRATCH: std::cell::RefCell<Vec<u8>> =
+                std::cell::RefCell::new(Vec::with_capacity(64 * 1024));
+        }
+        NARROW_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            scratch.clear();
+            scratch.reserve(values.len());
+            debug_assert!(
+                values.iter().all(|&v| v < 256),
+                "append_clean_narrowed received a marker value (decoder did not flip clean)"
+            );
+            scratch.extend(values.iter().map(|&v| v as u8));
+            if self.configuration.crc32_enabled {
+                if let Some(last_crc) = self.crc32s.last_mut() {
+                    last_crc.update(&scratch);
+                }
+            }
+            self.statistics.non_marker_count += scratch.len() as u64;
+            self.data.extend_from_slice(&scratch);
+            if let Some(last) = self.subchunks.last_mut() {
+                last.decoded_size += scratch.len();
+            }
+        });
+    }
+
     /// Move a whole owned decoded-byte buffer into `data`. Literal port
     /// of `ChunkData::append(deflate::DecodedVector&&)`
     /// (vendor/.../ChunkData.hpp:209-224). CRC32s the whole slice once
@@ -922,9 +960,19 @@ impl ChunkData {
         }
         let prefix_len = self.data_with_markers.len() - split_at;
 
+        // Bulk-narrow data_with_markers[split_at..] (all < 256 by construction —
+        // the marker-free clean tail) into u8. The old per-byte `get(i)` walked
+        // the segment list on EVERY index (O(n·segments)); walk the segments
+        // once instead (perf: clean_unmarked_data was ~12% of decode).
         let mut narrowed_prefix: Vec<u8> = Vec::with_capacity(prefix_len);
-        for i in split_at..self.data_with_markers.len() {
-            narrowed_prefix.push(self.data_with_markers.get(i).unwrap_or(0) as u8);
+        let mut skip = split_at;
+        for seg in self.data_with_markers.segments() {
+            if skip >= seg.len() {
+                skip -= seg.len();
+                continue;
+            }
+            narrowed_prefix.extend(seg[skip..].iter().map(|&v| v as u8));
+            skip = 0;
         }
 
         // CRC the migrated bytes (NOT CRC'd at append_markered time) and
