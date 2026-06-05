@@ -65,6 +65,14 @@ fn state() -> Option<&'static TraceState> {
         .as_ref()
 }
 
+/// Finer bootstrap sub-spans (`worker.block_body.*`). Trace capture only —
+/// gated off the hot path unless `GZIPPY_TRACE_DETAIL=1`.
+#[inline]
+pub fn detail_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| is_enabled() && std::env::var_os("GZIPPY_TRACE_DETAIL").is_some())
+}
+
 #[inline]
 pub fn is_enabled() -> bool {
     // Under Coz profiling, force-OFF so trace_v2's per-call OnceLock+atomic
