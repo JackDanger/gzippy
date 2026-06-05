@@ -821,6 +821,13 @@ impl crate::decompress::parallel::marker_inflate::MarkerSink for CleanTailSink<'
         self.pushed.saturating_sub(from)
     }
     #[inline]
+    fn push_clean_u8(&mut self, bytes: &[u8]) {
+        // Post-flip u8-direct output: write straight into chunk.data (CRC +
+        // subchunk accounting via append_clean) — no u16→u8 narrow pass.
+        self.chunk.append_clean(bytes);
+        self.pushed += bytes.len();
+    }
+    #[inline]
     fn note_block_boundary(&mut self, encoded_offset_bits: usize, decoded_offset: usize) {
         // Clean-tail-relative decoded offset (0-based on clean bytes), matching
         // the convention the retired resumable_resync clean tail used. Drives
@@ -1408,6 +1415,52 @@ mod tests {
         let stop_hint_bits = deflate.len() * 8;
         let chunk = decode_chunk(&deflate, 0, stop_hint_bits, &[], cfg).unwrap();
         assert_eq!(flatten(&chunk), payload);
+    }
+
+    /// ADVERSARIAL FLIP-SEAM test (advisor trap A): force the marker→clean flip
+    /// and then issue MAX-DISTANCE (32768) back-references that reach across the
+    /// flip seam into the OLDEST part of the pre-flip window. silesia's
+    /// differential does NOT reliably exercise a 32768-distance ref landing
+    /// exactly on the seam, so this is engineered deliberately.
+    ///
+    /// Construction: `A || A` with `|A| == 32768`. Decoding from bit 0 has no
+    /// predecessor window, so the first A is clean literals; the flip fires at
+    /// `decoded_bytes == 32768` (end of A). The second A is encoded by flate2 as
+    /// distance-32768 back-references (A repeats exactly one window back) — every
+    /// one of them resolves across the just-flipped seam. A wrong conflate /
+    /// u8-direct repositioning corrupts the second A; byte-exact vs the payload
+    /// is the gate that locks the faithful one-buffer port.
+    #[test]
+    fn decode_chunk_flip_seam_max_distance_backref() {
+        // Deterministic pseudo-random A so the first window is literal (clean)
+        // and the second copy must reference it at distance |A| = 32768.
+        let mut a = vec![0u8; 32 * 1024];
+        let mut s = 0x1234_5678_9abc_def0u64;
+        for b in &mut a {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (s >> 33) as u8;
+        }
+        let mut payload = a.clone();
+        payload.extend_from_slice(&a); // A || A → distance-32768 refs in the 2nd A
+
+        let deflate = make_deflate(&payload);
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 512 * 1024,
+            max_decoded_chunk_size: 20 * 512 * 1024,
+            crc32_enabled: true,
+        };
+        let stop_hint_bits = deflate.len() * 8;
+        // window-absent entry (the production speculative path that flips).
+        let chunk =
+            decode_chunk_window_absent(&deflate, 0, stop_hint_bits, cfg).expect("decode seam");
+        let out = flatten(&chunk);
+        assert_eq!(out.len(), payload.len(), "seam decode length");
+        assert_eq!(
+            out, payload,
+            "seam decode bytes (flip + max-distance backref)"
+        );
     }
 
     #[test]

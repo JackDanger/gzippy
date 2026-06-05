@@ -34,6 +34,21 @@ pub trait MarkerSink {
     /// `appendDeflateBlockBoundary` subchunk split, GzipChunk.hpp:177-182).
     fn note_block_boundary(&mut self, _encoded_offset_bits: usize, _decoded_offset: usize) {}
 
+    /// Push already-narrowed clean u8 bytes from the post-flip u8-direct decode
+    /// (vendor's `getWindow()` path). The clean-tail sink overrides this to write
+    /// straight into `chunk.data` (no narrow pass). Default widens to u16 for the
+    /// marker sinks — never hit on the production post-flip path (only the
+    /// clean-tail sink is active there), but keeps the trait total.
+    fn push_clean_u8(&mut self, bytes: &[u8]) {
+        let mut buf = [0u16; 256];
+        for chunk in bytes.chunks(256) {
+            for (i, &b) in chunk.iter().enumerate() {
+                buf[i] = b as u16;
+            }
+            self.push_slice(&buf[..chunk.len()]);
+        }
+    }
+
     /// Trailing run of clean (`< MARKER_BASE`) values starting at logical
     /// index `from` (inclusive). Used by the bootstrap block loop.
     fn trailing_clean_since(&self, from: usize) -> usize {

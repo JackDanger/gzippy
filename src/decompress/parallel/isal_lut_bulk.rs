@@ -672,6 +672,10 @@ use crate::decompress::parallel::marker_inflate::{
 
 const MAX_RUN_LENGTH: usize = 258;
 
+/// u8 reinterpretation of the 128 KiB ring backing — vendor `getWindow()` over
+/// `m_window16` (deflate.hpp:890-893): the same bytes, 2× the elements.
+const RING_U8_SIZE: usize = 2 * RING_SIZE;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MarkerComp {
     Stored,
@@ -694,6 +698,13 @@ pub struct MarkerRing {
     is_final: bool,
     comp: MarkerComp,
     stored_remaining: usize,
+    /// Set once `conflate_to_clean_u8` has run (the flip seam). Gates the
+    /// one-time u16→u8 window conversion before the first clean-tail decode.
+    conflated: bool,
+    /// When true (default), the post-flip clean tail decodes u8-direct into the
+    /// reinterpreted window (vendor's fast path). `GZIPPY_U16_CLEAN_TAIL=1`
+    /// forces the legacy u16-ring + narrow-at-drain path (A/B on one binary).
+    use_u8_clean_tail: bool,
 }
 
 impl Default for MarkerRing {
@@ -721,6 +732,8 @@ impl MarkerRing {
             is_final: false,
             comp: MarkerComp::Compressed,
             stored_remaining: 0,
+            conflated: false,
+            use_u8_clean_tail: std::env::var_os("GZIPPY_U16_CLEAN_TAIL").is_none(),
         }
     }
 
@@ -737,6 +750,7 @@ impl MarkerRing {
         self.is_final = false;
         self.comp = MarkerComp::Compressed;
         self.stored_remaining = 0;
+        self.conflated = false;
     }
 
     #[inline]
@@ -823,6 +837,19 @@ impl MarkerRing {
     ) -> Result<usize, BulkDecodeError> {
         if self.at_eob {
             return Ok(0);
+        }
+        // Vendor's `if (m_containsMarkerBytes) readInternal(m_window16) else
+        // readInternal(getWindow())` (deflate.hpp:1275-1298): one engine, one
+        // bit cursor, one buffer — the store element narrows u16→u8 at the flip.
+        if !self.contains_markers && self.use_u8_clean_tail {
+            if !self.conflated {
+                self.conflate_to_clean_u8();
+                self.conflated = true;
+            }
+            return match self.comp {
+                MarkerComp::Stored => self.read_stored_clean_u8(bits, output),
+                MarkerComp::Compressed => self.read_compressed_clean_u8(bits, output),
+            };
         }
         match self.comp {
             MarkerComp::Stored => self.read_stored(bits, output),
@@ -965,6 +992,207 @@ impl MarkerRing {
             }
         }
         commit_drain!(Ok(emitted));
+    }
+
+    // ── Clean (post-flip) u8-direct path — vendor's `!m_containsMarkerBytes`
+    // branch (deflate.hpp:1243-1259, 1296). After the flip the window holds no
+    // markers, so we stop paying u16 stores + a narrow pass: the SAME 128 KiB
+    // backing is reinterpreted as u8 (RING_U8_SIZE = 2*RING_SIZE elements, ==
+    // vendor's `getWindow()` over `m_window16`) and decode writes u8 DIRECTLY
+    // (one store), resolving back-refs out of the u8 window. This is the same
+    // engine (same bit cursor, same ring buffer, same %-ring arithmetic, just a
+    // narrower store element) — NOT a second decoder. ──
+
+    /// Vendor `setInitialWindow` (deflate.hpp:1742-1785) for gzippy's monotonic
+    /// ring: at the flip, value-downcast the recent ≤32 KiB window from the u16
+    /// ring into the u8 reinterpretation of the SAME backing. Explicit
+    /// `& 0xFF` value-downcast into a temp first (the u16 low byte holds the
+    /// decoded byte; a raw little-endian reinterpret would yield interleaved
+    /// zeros — advisor trap B), then seed the u8 view at the same logical
+    /// positions. After this, back-refs up to MAX_WINDOW_SIZE resolve from the
+    /// seeded u8 window; `ring_pos`/`ring_drained` stay logical byte counters
+    /// (physical = `% RING_U8_SIZE`).
+    fn conflate_to_clean_u8(&mut self) {
+        let w = self.decoded_bytes.min(MAX_WINDOW_SIZE);
+        if w == 0 {
+            return;
+        }
+        let base = self.ring_pos - w; // logical start of the live window
+                                      // Read the recent window (clean u16) into a temp to avoid aliasing the
+                                      // shared backing while we downcast into the u8 view of the same bytes.
+        let mut temp = [0u8; MAX_WINDOW_SIZE];
+        for i in 0..w {
+            temp[i] = (self.ring[(base + i) % RING_SIZE] & 0xFF) as u8;
+        }
+        let ring8 = self.ring.as_mut_ptr() as *mut u8;
+        for i in 0..w {
+            // SAFETY: phys < RING_U8_SIZE = byte length of the backing.
+            unsafe {
+                ring8.add((base + i) % RING_U8_SIZE).write(temp[i]);
+            }
+        }
+    }
+
+    /// Copy `length` bytes from `*pos - distance` to `*pos` in the u8 ring
+    /// (forward copy → correct LZ77 overlap/RLE). Fast `copy_nonoverlapping`
+    /// when non-overlapping and neither end wraps; byte-wise otherwise.
+    /// SAFETY: `*pos >= distance` (caller checks `distance <= decoded`); all
+    /// physical indices are `% RING_U8_SIZE`.
+    #[inline]
+    unsafe fn copy_match_u8(ring8: *mut u8, pos: &mut usize, distance: usize, length: usize) {
+        let dst0 = *pos;
+        let dst_phys = dst0 % RING_U8_SIZE;
+        let src_phys = (dst0 - distance) % RING_U8_SIZE;
+        if distance >= length
+            && dst_phys + length <= RING_U8_SIZE
+            && src_phys + length <= RING_U8_SIZE
+        {
+            std::ptr::copy_nonoverlapping(ring8.add(src_phys), ring8.add(dst_phys), length);
+        } else {
+            for i in 0..length {
+                let v = *ring8.add((dst0 - distance + i) % RING_U8_SIZE);
+                ring8.add((dst0 + i) % RING_U8_SIZE).write(v);
+            }
+        }
+        *pos += length;
+    }
+
+    /// Drain newly-decoded u8 bytes `[ring_drained, ring_pos)` to the sink (the
+    /// clean-tail sink writes them straight into `chunk.data` — no narrow pass).
+    fn drain_clean_u8(&mut self, output: &mut impl MarkerSink) {
+        let new = self.ring_pos - self.ring_drained;
+        if new == 0 {
+            return;
+        }
+        let ring8 = self.ring.as_ptr() as *const u8;
+        let start = self.ring_drained % RING_U8_SIZE;
+        // SAFETY: slices stay within the RING_U8_SIZE-byte backing; the wrap
+        // arm splits at the physical end.
+        unsafe {
+            if start + new <= RING_U8_SIZE {
+                output.push_clean_u8(std::slice::from_raw_parts(ring8.add(start), new));
+            } else {
+                let first = RING_U8_SIZE - start;
+                output.push_clean_u8(std::slice::from_raw_parts(ring8.add(start), first));
+                output.push_clean_u8(std::slice::from_raw_parts(ring8, new - first));
+            }
+        }
+        self.ring_drained = self.ring_pos;
+    }
+
+    /// Clean stored block, u8-direct (post-flip). Mirror of `read_stored` with
+    /// u8 stores into the reinterpreted window.
+    fn read_stored_clean_u8(
+        &mut self,
+        bits: &mut Bits<'_>,
+        output: &mut impl MarkerSink,
+    ) -> Result<usize, BulkDecodeError> {
+        let to_read = self.stored_remaining.min(RING_U8_SIZE - MAX_RUN_LENGTH);
+        let ring8 = self.ring.as_mut_ptr() as *mut u8;
+        let mut pos = self.ring_pos;
+        for _ in 0..to_read {
+            if bits.available() < 8 {
+                bits.refill();
+                if bits.available() < 8 {
+                    self.ring_pos = pos;
+                    self.drain_clean_u8(output);
+                    return Err(BulkDecodeError::InvalidHuffmanCode);
+                }
+            }
+            let byte = (bits.peek() & 0xFF) as u8;
+            bits.consume(8);
+            // SAFETY: pos % RING_U8_SIZE in bounds.
+            unsafe {
+                ring8.add(pos % RING_U8_SIZE).write(byte);
+            }
+            pos += 1;
+        }
+        self.ring_pos = pos;
+        self.decoded_bytes += to_read;
+        self.stored_remaining -= to_read;
+        if self.stored_remaining == 0 {
+            self.at_eob = true;
+        }
+        self.drain_clean_u8(output);
+        Ok(to_read)
+    }
+
+    /// Clean compressed block, u8-direct (post-flip). Same decode loop as
+    /// [`read_compressed`] (same LUT, same `decode_distance`) but writes u8
+    /// into the reinterpreted window and drains u8 — no markers, no
+    /// `distance_to_last_marker` bookkeeping (vendor's clean `readInternal`).
+    fn read_compressed_clean_u8(
+        &mut self,
+        bits: &mut Bits<'_>,
+        output: &mut impl MarkerSink,
+    ) -> Result<usize, BulkDecodeError> {
+        let n_max = RING_U8_SIZE - MAX_RUN_LENGTH;
+        let ring8 = self.ring.as_mut_ptr() as *mut u8;
+        let mut pos = self.ring_pos;
+        let mut emitted: usize = 0;
+
+        macro_rules! commit_drain_u8 {
+            ($ret:expr) => {{
+                self.ring_pos = pos;
+                self.decoded_bytes += emitted;
+                self.drain_clean_u8(output);
+                return $ret;
+            }};
+        }
+
+        while emitted < n_max {
+            bits.refill();
+            let d = self.scratch.litlen.decode(bits);
+            if d.bit_count == 0 {
+                commit_drain_u8!(Err(BulkDecodeError::InvalidHuffmanCode));
+            }
+            bits.consume(d.bit_count);
+            let mut sym = d.symbol;
+            let mut sym_count = d.sym_count;
+            loop {
+                let code = (sym & 0xFFFF) as u16;
+                if code as u32 <= 255 || sym_count > 1 {
+                    // SAFETY: pos % RING_U8_SIZE in bounds.
+                    unsafe {
+                        ring8.add(pos % RING_U8_SIZE).write((code & 0xFF) as u8);
+                    }
+                    pos += 1;
+                    emitted += 1;
+                    sym_count -= 1;
+                    if sym_count == 0 {
+                        break;
+                    }
+                    sym >>= 8;
+                    continue;
+                }
+                if code as u32 == END_OF_BLOCK_SYMBOL {
+                    self.at_eob = true;
+                    commit_drain_u8!(Ok(emitted));
+                }
+                if code as u32 > MAX_LIT_LEN_SYM {
+                    commit_drain_u8!(Err(BulkDecodeError::InvalidHuffmanCode));
+                }
+                let length = (code as usize).wrapping_sub(LENGTH_BASE_OFFSET as usize);
+                if length == 0 {
+                    break;
+                }
+                let distance = match decode_distance(bits, &self.scratch) {
+                    Ok(dd) => dd,
+                    Err(e) => commit_drain_u8!(Err(e)),
+                };
+                if distance > self.decoded_bytes + emitted {
+                    commit_drain_u8!(Err(BulkDecodeError::InvalidLookback));
+                }
+                // SAFETY: distance <= decoded_bytes+emitted ⇒ pos >= distance;
+                // n_max cap keeps the live window unclobbered.
+                unsafe {
+                    Self::copy_match_u8(ring8, &mut pos, distance, length);
+                }
+                emitted += length;
+                break;
+            }
+        }
+        commit_drain_u8!(Ok(emitted));
     }
 }
 
