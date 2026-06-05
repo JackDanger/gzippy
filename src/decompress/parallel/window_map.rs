@@ -207,6 +207,41 @@ impl WindowMap {
             .map(|(k, v)| (*k, v.clone()))
     }
 
+    /// Worker-only exact lookup: confirmed `entries` then `speculative`.
+    /// Consumer `get` stays confirmed-only so successors never resolve
+    /// against un-promoted tails.
+    pub fn get_at_worker(&self, encoded_offset_bits: usize) -> Option<Window> {
+        let g = self.state.lock().unwrap();
+        g.entries
+            .get(&encoded_offset_bits)
+            .or_else(|| g.speculative.get(&encoded_offset_bits))
+            .cloned()
+    }
+
+    /// Worker-only `get_predecessor` merging confirmed + speculative maps.
+    pub fn get_predecessor_for_worker(
+        &self,
+        encoded_offset_bits: usize,
+    ) -> Option<(usize, Window)> {
+        let g = self.state.lock().unwrap();
+        let pick = |map: &BTreeMap<usize, Window>| {
+            map.range(..=encoded_offset_bits)
+                .next_back()
+                .map(|(k, v)| (*k, v.clone()))
+        };
+        match (pick(&g.entries), pick(&g.speculative)) {
+            (Some((k1, w1)), Some((k2, w2))) => {
+                if k1 >= k2 {
+                    Some((k1, w1))
+                } else {
+                    Some((k2, w2))
+                }
+            }
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        }
+    }
+
     pub fn has_predecessor(&self, encoded_offset_bits: usize) -> bool {
         self.get_predecessor(encoded_offset_bits).is_some()
     }
@@ -447,6 +482,24 @@ mod tests {
     }
 
     #[test]
+    fn get_at_worker_reads_speculative_without_exposing_to_consumer_get() {
+        let m = WindowMap::with_compression(CompressionType::None);
+        m.insert_speculative(2000, window_of(0x55));
+        assert!(m.get(2000).is_none());
+        assert_eq!(m.get_at_worker(2000).unwrap().raw_bytes()[0], 0x55);
+    }
+
+    #[test]
+    fn get_predecessor_for_worker_merges_speculative() {
+        let m = WindowMap::with_compression(CompressionType::None);
+        m.insert(100, window_of(0x11));
+        m.insert_speculative(500, window_of(0x22));
+        let (k, w) = m.get_predecessor_for_worker(1000).unwrap();
+        assert_eq!(k, 500);
+        assert_eq!(w.raw_bytes()[0], 0x22);
+    }
+
+    #[test]
     fn handoff_in_partition_merges_confirmed_and_speculative() {
         let m = WindowMap::with_compression(CompressionType::None);
         m.insert(100, window_of(0x11));
@@ -460,9 +513,9 @@ mod tests {
         let (k2, w2) = m.get_handoff_in_partition(1000, 6000).unwrap();
         assert_eq!(k2, 5000);
         assert_eq!(w2.raw_bytes()[0], 0x22);
-        // Keys at or below low are excluded.
-        assert!(m.get_handoff_in_partition(5000, 10000).is_none());
-        assert!(m.get_handoff_in_partition(9000, 10000).is_none());
+        // Keys at or below low are excluded; empty interval returns None.
+        assert!(m.get_handoff_in_partition(9000, 9000).is_none());
+        assert!(m.get_handoff_in_partition(9500, 10000).is_none());
     }
 
     #[test]

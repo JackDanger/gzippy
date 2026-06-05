@@ -2094,8 +2094,8 @@ fn submit_post_process_task(
 #[cfg(parallel_sm)]
 fn spec_pred_clean_enabled() -> bool {
     match std::env::var_os("GZIPPY_SPEC_PRED_CLEAN") {
-        None => true,
         Some(v) => v != "0" && v != "false",
+        None => false,
     }
 }
 
@@ -2290,34 +2290,23 @@ fn run_decode_task(
     let window_exact: Option<Window> = if params.start_bit == 0 {
         None
     } else {
-        window_map.get(params.start_bit)
+        window_map.get_at_worker(params.start_bit)
     };
-    let window_pred: Option<Window> = if params.start_bit == 0 {
+    let window_pred: Option<(usize, Window)> = if params.start_bit == 0 {
         None
     } else {
-        window_map
-            .get_predecessor(params.start_bit)
-            .map(|(_k, w)| w)
+        window_map.get_predecessor_for_worker(params.start_bit)
     };
     let window_handoff: Option<(usize, Window)> =
         if params.is_speculative_prefetch && params.start_bit > 0 {
-            window_map
-                .get_handoff_in_partition(params.start_bit, params.stop_hint_bit)
-                .or_else(|| {
-                    if spec_pred_clean_enabled() {
-                        window_pred.clone().map(|w| (params.start_bit, w))
-                    } else {
-                        window_map
-                            .get(params.start_bit)
-                            .map(|w| (params.start_bit, w))
-                    }
-                })
+            window_map.get_handoff_in_partition(params.start_bit, params.stop_hint_bit)
         } else {
             None
         };
 
     let decode_mode_clean = params.start_bit == 0 || window_exact.is_some();
     let predecessor_available = window_pred.is_some();
+    let window_pred_tail = window_pred.as_ref().map(|(_, w)| w);
     let mode_str = if decode_mode_clean {
         "clean"
     } else if predecessor_available {
@@ -2401,7 +2390,7 @@ fn run_decode_task(
                 ),
             }
         }
-    } else if let Some(w) = window_pred.as_ref() {
+    } else if let Some(w) = window_pred_tail.as_ref() {
         let bytes = materialize_window(w);
         if spec_pred_clean_enabled() && params.is_speculative_prefetch {
             try_clean_decode_with_pred_window(
@@ -3225,7 +3214,7 @@ fn try_speculative_decode_candidate(
     // `run_decode_task`, boundary-search candidates are often false
     // positives; a stale earlier tail dict can pass metadata checks yet
     // corrupt the assembled stream (CRC mismatch).
-    let result = if let Some(w) = window_map.get(decode_start) {
+    let result = if let Some(w) = window_map.get_at_worker(decode_start) {
         let pw = materialize_window(&w);
         match decode_chunk(
             input,
