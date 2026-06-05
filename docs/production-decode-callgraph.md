@@ -1,6 +1,6 @@
 # Production decode call-graph (pure-Rust, x86_64)
 
-**Last updated: 2026-06-03.** Authoritative routing: [`production-paths.md`](production-paths.md).
+**Last updated: 2026-06-05.** Authoritative routing: [`production-paths.md`](production-paths.md).
 
 ## Entry (what the CLI runs)
 
@@ -12,29 +12,37 @@ decompress_gzip_libdeflate → classify_gzip → DecodePath::IsalParallelSM
 
 Build: `--no-default-features --features pure-rust-inflate` → `pure_inflate_decode` →
 **no C ISA-L in the decode graph**. `IsalInflateWrapper` is a name; it wraps
-`ResumableInflate2` (`inflate_wrapper.rs`).
+`ResumableInflate2` (`inflate_wrapper.rs`) and is now reached **only** on the
+bad-speculative-seed fallback (`resumable_resync`), never on the clean tail.
 
 ## Per-chunk decode (same *shape* as rapidgzip)
 
-**One function:** `gzip_chunk::decode_chunk_with_rapidgzip_impl` (vendor
+**One function:** `gzip_chunk::decode_chunk_with_rapidgzip_impl` →
+`decode_chunk_unified_marker` (vendor single `deflate::Block<containsMarkerBytes>`,
 `decodeChunkWithRapidgzip` + `finishDecodeChunkWithInexactOffset`).
 
-It is **not** the refuted “two-pass scan + re-decode” architecture. It **is** a
-**two-stage loop inside each chunk**:
+It is **not** the refuted “two-pass scan + re-decode” architecture, and (since
+2026-06-05) it is **not** two engines either: it is **one `MarkerRing`, one bit
+cursor**, with an in-place marker→clean flip — the two phases below are the SAME
+ring continuing, not a handoff to a second decoder.
 
-| Stage | When | Code | Output |
+| Phase | When | Code | Output |
 |-------|------|------|--------|
-| **1. Marker bootstrap** | No exact predecessor window at worker start | `marker_decode_step` → `deflate_block::Block` | u16 into `chunk.data_with_markers` until 32 KiB clean at a block boundary |
-| **2. Clean streaming inflate** | After handoff (or immediately if 32 KiB window known) | `finish_clean_tail_decode` → `isal_lut_bulk` bulk loop, else `ResumableInflate2::read_stream` | u8 into `chunk.data` (segmented 128 KiB tails) |
+| **1. Marker arm** | window absent (`contains_marker_bytes()`) | `marker_decode_step` → `isal_lut_bulk::MarkerRing` | u16 into `chunk.data_with_markers` |
+| **2. Clean arm** | after the flip (`!contains_marker_bytes()`, vendor `!m_containsMarkerBytes`) | **same** `MarkerRing` on the **same cursor** → `CleanTailSink` narrows u16→u8 | u8 into `chunk.data` (CRC + subchunk split via `append_clean_narrowed` / `note_block_boundary`) |
 
-rapidgzip uses the **same outer shape** (marker bytes until clean window, then fast
-stream decode on the same chunk). The gap is **implementation speed** (Rust marker
-ring + resumable inflate vs vendor’s fast paths), plus gzippy-specific **post-process**
-(`apply_window` / `narrow_markers_in_place`) and **publish-chain** latency — not a
-missing second stage.
+The flip fires once (`MarkerDecodeCtx::flipped`): the ring already holds the 32 KiB
+window, so the clean tail resolves back-refs **with no window copy and no second
+decode engine**. `resumable_resync` (the old clean-tail path: a separate
+`ResumableInflate2` wrapper seeded from a copied window) is **off the flip path** —
+it survives only as the internal re-sync when the speculative seed is not a real
+block boundary (`decode_chunk_with_rapidgzip_impl`’s `Err` arm). Remaining gap vs
+rapidgzip is **implementation speed** + gzippy-specific **post-process**
+(`apply_window` / `narrow_markers_in_place`) and **publish-chain** latency.
 
-Legacy `bootstrap_with_deflate_block` remains in the tree for tests/trials; **production
-workers call `decode_chunk` / `decode_chunk_window_absent` → `decode_chunk_with_rapidgzip_impl`.**
+The retired `marker_inflate::Block` bootstrap engine is now `#[cfg(test)]`-gated
+(test oracle only); **production workers call `decode_chunk` /
+`decode_chunk_window_absent` → `decode_chunk_with_rapidgzip_impl`.**
 
 ## Worker dispatch (`chunk_fetcher::run_decode_task`)
 
@@ -43,7 +51,7 @@ pool.run_task → worker.decode_chunk
   ├─ chunk 0 or window_map.get(start_bit) exact  → decode_chunk (often skips stage 1)
   ├─ Design H handoff window (spec prefetch)     → decode_chunk @ handoff key (usually 0 hits)
   └─ else                                        → speculative_decode_find_boundary
-       → decode_chunk_window_absent (stage 1 → 2)
+       → decode_chunk_window_absent (phase 1 marker → phase 2 clean, same ring)
 ```
 
 ## After decode (still on critical path for wall)
@@ -54,8 +62,9 @@ consumer: wait for chunk → write output + publish 32 KiB tail window (serial c
 ```
 
 `append_markered` / `absorb_isal_tail` were **removed from the hot unified path**; markers
-are written via `MarkerSink` during stage 1. Narrowing still runs in post-process when markers
-are present.
+are written via `MarkerSink` during phase 1, and the phase-2 clean tail narrows inline via
+`append_clean_narrowed`. Narrowing of the marker prefix still runs in post-process
+(`clean_unmarked_data` + `apply_window`) when markers are present.
 
 ## NOT production (do not optimize as “shipping”)
 

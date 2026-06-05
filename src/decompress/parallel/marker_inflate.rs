@@ -26,6 +26,14 @@ pub trait MarkerSink {
     fn sink_len(&self) -> usize;
     fn as_slice(&self) -> &[u16];
 
+    /// Record a deflate block boundary at `encoded_offset_bits` with the
+    /// sink-relative `decoded_offset` (clean-tail bytes emitted so far).
+    /// Default no-op: the marker-phase sinks (`Vec<u16>`/arena `U16`) do not
+    /// split subchunks — only the merged clean-tail sink overrides this to
+    /// drive `ChunkData::append_block_boundary_at` (the vendor on-the-fly
+    /// `appendDeflateBlockBoundary` subchunk split, GzipChunk.hpp:177-182).
+    fn note_block_boundary(&mut self, _encoded_offset_bits: usize, _decoded_offset: usize) {}
+
     /// Trailing run of clean (`< MARKER_BASE`) values starting at logical
     /// index `from` (inclusive). Used by the bootstrap block loop.
     fn trailing_clean_since(&self, from: usize) -> usize {
@@ -228,6 +236,13 @@ pub(crate) fn init_marker_zone(ring: &mut [u16; RING_SIZE]) {
     }
 }
 
+/// The original window-absent bootstrap engine. RETIRED from production —
+/// `isal_lut_bulk::MarkerRing` is the sole unified-decoder marker arm now (it
+/// reuses the same ring/zone/`emit_backref_ring` primitives). `Block` survives
+/// only as an independent test oracle (marker-decode differential + block-start
+/// boundary probe), so it is `#[cfg(test)]`-gated to keep it out of the
+/// production decode graph. See `isal_lut_bulk.rs:656-668`.
+#[cfg(test)]
 pub struct Block {
     at_end_of_block: bool,
     at_end_of_file: bool,
@@ -316,6 +331,7 @@ pub struct Block {
     isal_dist_pure: crate::decompress::parallel::isal_huffman_pure::IsalDistCodePure,
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for Block {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Block")
@@ -332,12 +348,14 @@ impl std::fmt::Debug for Block {
     }
 }
 
+#[cfg(test)]
 impl Default for Block {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl Block {
     pub fn new() -> Self {
         // Allocate the ring on the heap directly. The marker zone
@@ -1894,6 +1912,7 @@ pub const DISTANCE_EXTRA: [u8; 30] = [
     13,
 ];
 
+#[cfg(test)]
 fn read_length_extra(bits: &mut Bits, lidx: usize) -> Result<usize, BlockError> {
     let extra = LENGTH_EXTRA[lidx] as u32;
     if extra > 0 {
@@ -1930,6 +1949,7 @@ fn read_distance_extra(bits: &mut Bits, dsym: usize) -> Result<usize, BlockError
 
 /// RFC 1951 §3.2.6 fixed Huffman — 288 lit/len symbols (286–287 participate
 /// in Kraft construction). Distances: 32 codes × length 5.
+#[cfg(test)]
 const FIXED_LIT_LEN_LENGTHS: [u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2] = {
     let mut t = [0u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2];
     let mut i = 0usize;
@@ -1951,9 +1971,11 @@ const FIXED_LIT_LEN_LENGTHS: [u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2] = {
     }
     t
 };
+#[cfg(test)]
 const FIXED_DIST_LENGTHS: [u8; MAX_DISTANCE_SYMBOL_COUNT] = [5u8; MAX_DISTANCE_SYMBOL_COUNT];
 
 /// Legacy helper for tests — returns owned copies of the static tables.
+#[cfg(test)]
 fn fixed_huffman_code_lengths() -> (Vec<u8>, Vec<u8>) {
     (FIXED_LIT_LEN_LENGTHS.to_vec(), FIXED_DIST_LENGTHS.to_vec())
 }

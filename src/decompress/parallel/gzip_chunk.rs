@@ -710,11 +710,17 @@ fn decode_chunk_with_rapidgzip_impl(
     }
 }
 
-/// The ONE unified decode driver. `marker_inflate::Block` emits u16 markers while
-/// the predecessor window is absent and flips mid-stream to clean u16 (no restart),
-/// decoding the whole chunk into `data_with_markers`; the chunk ends at BFINAL or
-/// the `stop_hint` partition boundary. Returns `Err` on a bad speculative seed so
-/// the caller can fall to the internal resumable re-sync.
+/// The ONE unified decode driver — one `MarkerRing`, one bit cursor, the vendor
+/// single-`deflate::Block` shape. Phase 1 emits u16 markers into
+/// `data_with_markers` while the predecessor window is absent; at the flip
+/// (`!contains_marker_bytes()`, byte-for-byte vendor `!m_containsMarkerBytes`)
+/// phase 2 CONTINUES the SAME ring on the SAME cursor, draining its now-clean
+/// u16 output narrowed to u8 into `chunk.data` (the ring already holds the
+/// 32 KiB window, so back-refs resolve with no window copy and no second decode
+/// engine). The chunk ends at BFINAL or the `stop_hint` partition boundary.
+/// `resumable_resync` is NO LONGER on this path — it survives only as the
+/// bad-speculative-seed fallback in [`decode_chunk_with_rapidgzip_impl`].
+/// Returns `Err` on a bad seed so the caller can fall to that re-sync.
 #[cfg(parallel_sm)]
 fn decode_chunk_unified_marker(
     input: &[u8],
@@ -725,6 +731,9 @@ fn decode_chunk_unified_marker(
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
     chunk.data_with_markers.reserve(128 * 1024);
     let mut marker_ctx = MarkerDecodeCtx::new(input, encoded_offset_bits)?;
+
+    // ── Phase 1: marker arm — drain u16 (markers + post-flip clean) into
+    // `data_with_markers` until the flip block boundary or chunk end. ──
     loop {
         let (step, flipped_clean) = marker_decode_step(
             &mut marker_ctx,
@@ -737,38 +746,14 @@ fn decode_chunk_unified_marker(
         }
         match step {
             MarkerStep::Continue => {}
-            MarkerStep::FlipToClean {
-                end_bit_offset,
-                window_len,
-            } => {
+            MarkerStep::FlipToClean { .. } => {
                 FLIP_TO_CLEAN_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // FLIP (vendor setInitialWindow): the marker prefix (u16, ≤ ~32 KiB)
-                // is done; decode the REST as the u8 clean tail into chunk.data on
-                // the same cursor, with the flipped 32 KiB clean window narrowed
-                // from the marker-prefix tail. The clean tail is u8 (NOT u16) and is
-                // never resolved — so the marker work stays bounded.
-                use crate::decompress::parallel::marker_inflate::MarkerSink;
-                use std::cell::RefCell;
-                thread_local! {
-                    static FLIP_WINDOW: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(32 * 1024));
-                }
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
-                FLIP_WINDOW.with(|cell| -> Result<(), ChunkDecodeError> {
-                    let mut win = cell.borrow_mut();
-                    let ok = chunk
-                        .data_with_markers
-                        .copy_last_n_clean_u8(window_len, &mut win);
-                    debug_assert!(ok, "flip window tail not all-clean");
-                    resumable_resync(
-                        &mut chunk,
-                        input,
-                        end_bit_offset,
-                        stop_hint_bits,
-                        &win,
-                        false,
-                    )
-                })?;
-                return Ok(chunk);
+                // Arm the single-fire flip gate and fall through to phase 2.
+                // `ctx.current_bit_offset` is already at this block boundary;
+                // the ring's window/`decoded_bytes`/clean state all persist.
+                marker_ctx.flipped = true;
+                break;
             }
             MarkerStep::Finished { end_bit_offset, .. } => {
                 FINISHED_NO_FLIP_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -777,6 +762,73 @@ fn decode_chunk_unified_marker(
                 return Ok(chunk);
             }
         }
+    }
+
+    // ── Phase 2: clean arm — keep decoding the SAME ring on the SAME cursor,
+    // narrowing its u16 drains to u8 into `chunk.data` (CRC + subchunk
+    // accounting via `append_clean_narrowed`). `ctx.flipped` now suppresses the
+    // top-of-loop flip return, so the step decodes normally until BFINAL or the
+    // stop-hint partition boundary. ──
+    let end_bit_offset = loop {
+        let mut sink = CleanTailSink {
+            chunk: &mut chunk,
+            pushed: 0,
+        };
+        let (step, _) = marker_decode_step(&mut marker_ctx, input, stop_hint_bits, &mut sink)?;
+        match step {
+            MarkerStep::Continue => {}
+            // Unreachable: `ctx.flipped` gates the flip return off after phase 1.
+            MarkerStep::FlipToClean { end_bit_offset, .. } => break end_bit_offset,
+            MarkerStep::Finished { end_bit_offset, .. } => break end_bit_offset,
+        }
+    };
+    chunk.finalize(end_bit_offset);
+    Ok(chunk)
+}
+
+/// Clean-tail [`MarkerSink`] for the merged phase-2 decode: narrows the
+/// post-flip u16 ring drains to u8 and appends them to `chunk.data` (CRC +
+/// subchunk accounting). `as_slice` is never consulted on this sink —
+/// `trailing_clean_since` is overridden because every byte is clean by
+/// construction (the ring flipped before phase 2 began).
+#[cfg(parallel_sm)]
+struct CleanTailSink<'a> {
+    chunk: &'a mut ChunkData,
+    /// Running count of u8 bytes pushed — the sink's logical length. Tracked
+    /// independently of `chunk.data.len()` so any window prefix or later
+    /// `clean_unmarked_data` migration cannot perturb the `before_len` deltas
+    /// the block loop computes.
+    pushed: usize,
+}
+
+#[cfg(parallel_sm)]
+impl crate::decompress::parallel::marker_inflate::MarkerSink for CleanTailSink<'_> {
+    #[inline]
+    fn push_slice(&mut self, values: &[u16]) {
+        self.chunk.append_clean_narrowed(values);
+        self.pushed += values.len();
+    }
+    #[inline]
+    fn sink_len(&self) -> usize {
+        self.pushed
+    }
+    #[inline]
+    fn as_slice(&self) -> &[u16] {
+        &[]
+    }
+    #[inline]
+    fn trailing_clean_since(&self, from: usize) -> usize {
+        self.pushed.saturating_sub(from)
+    }
+    #[inline]
+    fn note_block_boundary(&mut self, encoded_offset_bits: usize, decoded_offset: usize) {
+        // Clean-tail-relative decoded offset (0-based on clean bytes), matching
+        // the convention the retired resumable_resync clean tail used. Drives
+        // the split_chunk_size subchunk split for vendor-parity / the seekable
+        // index (no production read site yet — locked by the
+        // UNSPLIT_BLOCKS_EMPLACED deletion trap in tests/routing.rs).
+        self.chunk
+            .append_block_boundary_at(encoded_offset_bits, decoded_offset);
     }
 }
 
@@ -810,6 +862,12 @@ struct MarkerDecodeCtx {
     current_bit_offset: usize,
     trailing_clean: usize,
     block_primed: bool,
+    /// Set once the unified driver has consumed the single `FlipToClean`
+    /// signal and switched the decode sink to the clean u8 tail. Gates the
+    /// top-of-loop flip check so it fires EXACTLY once; subsequent steps
+    /// (now draining the clean sink) decode normally on the same `MarkerRing`
+    /// and the same bit cursor instead of re-returning `FlipToClean`.
+    flipped: bool,
 }
 
 #[cfg(parallel_sm)]
@@ -827,6 +885,7 @@ impl MarkerDecodeCtx {
             current_bit_offset: start_bit_offset,
             trailing_clean: 0,
             block_primed: false,
+            flipped: false,
         })
     }
 
@@ -937,7 +996,14 @@ fn marker_decode_step(
             // data_with_markers (resolved on the publish chain). The previous
             // CONSECUTIVE-trailing-clean predicate diverged from vendor and stranded
             // chunks whose propagated markers never gave a 32 KiB unbroken clean run.
-            if !block.contains_marker_bytes() {
+            if !block.contains_marker_bytes() && !ctx.flipped {
+                // FIRST clean block boundary: hand the driver one FlipToClean
+                // so it can switch the output sink from `data_with_markers`
+                // (u16) to the clean u8 tail. The driver sets `ctx.flipped`
+                // and re-enters; from then on this `MarkerRing` keeps decoding
+                // the clean tail on the SAME bit cursor — its ring already
+                // holds the 32 KiB window, so back-refs resolve with no window
+                // copy and no second decode engine (the merged clean tail).
                 let end_bit_offset = next_block_offset;
                 ctx.current_bit_offset = end_bit_offset;
                 return Ok((
@@ -1070,6 +1136,11 @@ fn marker_decode_step(
                     flipped_clean,
                 ));
             }
+            // Non-final block boundary: record it for the split_chunk_size
+            // subchunk split. No-op for the phase-1 marker sink; the clean-tail
+            // sink (phase 2) routes it to `append_block_boundary_at` (replacing
+            // the boundary recording the retired resumable_resync did).
+            output.note_block_boundary(end_bit_offset, output.sink_len());
         }
     })
 }
