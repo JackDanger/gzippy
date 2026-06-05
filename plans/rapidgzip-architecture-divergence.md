@@ -142,3 +142,69 @@ baseline vs perturbation (eviction-timing confound check); (3) a decode-REMOVAL 
 gated off) to BOUND the speed-up ceiling. Only if the oracle ceiling is worth it does the deep #3
 data-plane cycle start. Temp gate reverted (commit 7e7c00f). These 3 measurements are the next cycle's
 disciplined gate before any #3 port.
+
+## Divergence #4 (LOCATED 2026-06-04 — producer-side, vendor-faithful, distinct from the Cache.hpp finding): prefetcher has NO cache-pollution admission control
+
+This is NOT the Cache.hpp eviction-POLICY question (settled above: both are plain LRU). It is the
+prefetch-LOOP admission control in BlockFetcher.hpp — a DIFFERENT vendor location gzippy lacks.
+gzippy's own doc comment (`block_fetcher.rs:843-846`) already names it: *"the missing vendor
+`nextNthEviction` cache-pollution guard (BlockFetcher.hpp:544-551)."*
+
+Two-column map (guardrail T2):
+
+| rapidgzip (`BlockFetcher.hpp`) | gzippy (`block_fetcher.rs`) | divergence |
+|---|---|---|
+| 474-491: resolve the prefetch INDEXES to a `blockOffsetsToPrefetch` vector up-front (incl. partition offsets) | resolves offsets one-at-a-time INSIDE the loop; no up-front set | DIVERGE |
+| 493-497: **touch** every to-be-prefetched offset (reverse order) in BOTH `m_prefetchCache` and `m_cache` so prefetching one block can't evict another we also want | **zero `.touch()` calls** anywhere in the fetcher | DIVERGE |
+| 544-551: before each submit, `offsetToBeEvicted = m_prefetchCache.nextNthEviction(m_prefetching.size()+1)`; if that offset is in `blockOffsetsToPrefetch`, **break** — refuse to pollute the cache by evicting a block we still intend to use | goes straight from the partition-check (804-811) to submit (833); no eviction guard | DIVERGE → THE PORT |
+
+The three lines are COUPLED: the touch makes the to-be-prefetched set most-recently-used so
+`nextNthEviction` returns the genuinely-stale candidate, and the guard references the up-front set.
+`Cache::next_nth_eviction` already exists vendor-faithfully (`cache.rs:186-193` ↔ `Cache.hpp:220-227`,
+unit-tested) — it is merely UNWIRED. So this port is: build the up-front offsets vector, touch both
+caches, add the cache-pollution break. Pure CREATE-to-match (type-b); no invented constant.
+
+Why this is distinct from "eviction is decode-speed-driven": both are true and compounding. The
+consumer lags because decode is slower (#3); SEPARATELY, gzippy's un-throttled prefetcher evicts
+blocks the lagging consumer still needs (vendor would have refused those prefetches). Porting #4
+removes the producer-side contribution to the cold-re-decode loop WITHOUT touching decode speed,
+and is vendor-faithful (unlike a "pin soonest-needed" T3 lever, which has no vendor counterpart).
+
+PRE-REGISTERED hypothesis + falsifier (guardrail 1):
+- HYPOTHESIS: wiring vendor's up-front-touch + cache-pollution-stop reduces evictions of
+  still-needed blocks → fewer cold re-decodes → consumer-wait drops → wall moves toward parity.
+- FALSIFIER: if cold-re-decode count / consumer-wait is UNCHANGED after the port (e.g. the guard
+  never fires because prefetch_cache is large enough that nextNthEviction always returns None, or
+  the evictions aren't from prefetch pollution), then the model is wrong → REVISE, do NOT tune the
+  cache cap to force the guard to fire (that would be a T3 lever). Byte-exact is mandatory either way.
+
+### RESULT 2026-06-04: ported byte-exact + vendor-faithful, BUT the pre-registered FALSIFIER FIRED (#4 is NOT the cold-re-decode source)
+Ported all three coupled vendor steps (up-front offsets `block_fetcher.rs:750+`, protective touch of
+both caches `:766+`, cache-pollution stop `:846+`); added a `PREFETCH_CACHE_POLLUTION_STOPS` counter
+to test the falsifier. Byte-exact at T1/4/8/16 (sha `23818da7…` == gunzip ground truth), path=IsalParallelSM.
+
+The falsifier I pre-registered FIRED cleanly:
+- `pollution_stops=0` at BOTH T8 and T16 — the cache-pollution break NEVER executes. The prefetch_cache
+  (cap = pool_size·2) never fills enough that the (prefetching+1)-th insert would evict an intended block.
+- `--verbose` stats are decisive: **`Useless Prefetches: 0.00%`**, `Speculative window slot: evicted=0`,
+  `Prefetch Cache Hit Rate 79.31%`. ZERO prefetched blocks are evicted before use.
+- So the 4 cold re-decodes (`Fetched On-demand: 4`) are NOT evictions of prefetched blocks. The earlier
+  "overshoot-tail chunks LRU-evicted before the consumer arrives (~416ms)" characterization (GATE+ADVISOR
+  section above) is DISPROVEN by `Useless Prefetches=0%` — nothing useful is evicted.
+
+REVISED model (what the 4 cold decodes actually are): blocks the prefetcher never had IN-FLIGHT when the
+consumer reached them. The consumer's join-in-flight path EXISTS and works (`block_fetcher.rs:164`
+`take_prefetch`; 46 prefetch hits) — the 4 cold decodes are the cases where `take_prefetch` returned
+`None` because the block was never prefetched. Why: `Prefetch dispatch: … saturated=102` — the prefetch
+loop hit the `thread_pool_saturated` gate 102× (pool full of other tasks when it wanted to queue the
+block the consumer would later need). So the residual gap is a prediction/scheduling timing gap
+(prefetcher saturation), NOT cache pollution and NOT eviction. This matches `[[project_confirmed_offset_prefetch_gap]]`
+(vendor joins in-flight 11/12; gzippy starts cold 4/4) — the cold starts are MISSED prefetches.
+
+DISPOSITION: the #4 port is KEPT (CLAUDE.md rule 7 / [[feedback_layer_dont_revert_whole_system]]: a
+byte-exact vendor-faithful convergence is layered even on a TIE; it makes gzippy structurally match
+BlockFetcher.hpp:474-497,544-551 and WOULD fire on a workload with real prefetch pressure). But it is
+recorded as INERT on silesia-large — it does NOT move the wall and is NOT claimed as a win. Next target
+(confirm the mechanism against BOTH codebases BEFORE any code — guardrail 4): why is gzippy's prefetcher
+saturated 102× while vendor keeps the consumer's next block in-flight — i.e. compare gzippy's
+FetchingStrategy prediction + pool-capacity accounting to vendor's at the saturation point.
