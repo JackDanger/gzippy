@@ -58,9 +58,9 @@ Fulcrum causal (T8 trace): **90.5%** runtime window-absent; **97%** labeled KEY-
 | Miss path | Block finder + `tryToDecode` (no separate bootstrap engine) | Marker bootstrap (`deflate_block`) then resolve — **~644 ms wc** vs rg **0 ms** |
 | Causal instrument | N/A | `causal.decode_decision` fires **pre-decode** — overcounts window-absent even when post-path succeeds |
 
-**Fixup shipped:** `WindowMap::get_at_worker`, `get_predecessor_for_worker`, `get_handoff_in_partition`; `try_speculative_decode_candidate` uses `get_at_worker`. `GZIPPY_SPEC_PRED_CLEAN` default **off** (oracle unproven on wall).
+**Shipped (2026-06):** `run_decode_task` mirrors vendor `decodeBlock` exactly — `get_at_worker(blockOffset)` → clean `decode_chunk`, else `speculative_decode_find_boundary` (= `GzipChunk::decodeChunk` no-window). Removed non-vendor handoff/pred/oracle branches. `try_speculative_decode_candidate` no longer falls to window-absent when `get` hit but decode failed (vendor `tryToDecode` catch-and-continue). **Handoff-key publish:** workers insert confirmed windows at `max_acceptable_start_bit` when window-present decode seeded A3 prefix — enables sibling `get(handoff)` hits.
 
-**Still open:** vendor never uses `get_predecessor` on workers — only exact `get`. Closing KEY-MISMATCH requires windows at partition seeds **before** prefetch (publish-chain timing) or vendor-equivalent `tryToDecode({seed, boundary})` without paying full window-absent tax. Design H/H′ in `plans/sm-parity-gap-matrix.md`.
+**Still open for wall parity:** bootstrap speed (`deflate_block` vs vendor `deflate::Block`), consumer `get_last_window` on segmented storage, inner clean-tail ISA-L parity.
 
 ---
 
