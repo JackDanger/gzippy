@@ -1003,6 +1003,32 @@ impl MarkerRing {
     // engine (same bit cursor, same ring buffer, same %-ring arithmetic, just a
     // narrower store element) — NOT a second decoder. ──
 
+    /// Vendor `setInitialWindow(initialWindow)` with a KNOWN predecessor window
+    /// (deflate.hpp:1751-1759, the `m_decodedBytes == 0 && m_windowPosition == 0`
+    /// case): seed the clean u8 window so this chunk decodes CLEAN from block 0
+    /// (no markers, no flip, no marker-resolve) — the window-PRESENT fast path.
+    /// The window occupies logical `[0, W)` as back-ref history; this chunk's
+    /// OUTPUT begins at `W` and is drained from there (the window bytes belong to
+    /// the predecessor chunk, not this one, so `ring_drained = W`). Mirrors the
+    /// worker passing the resolved 32 KiB predecessor window — which the old
+    /// unified driver discarded (`gzip_chunk.rs` `let _ = &initial_window`),
+    /// forcing every non-zero chunk through full marker decode.
+    pub fn set_initial_window_u8(&mut self, window: &[u8]) {
+        let w = window.len().min(MAX_WINDOW_SIZE);
+        let ring8 = self.ring.as_mut_ptr() as *mut u8;
+        for (i, &b) in window[..w].iter().enumerate() {
+            // SAFETY: i < w <= MAX_WINDOW_SIZE < RING_U8_SIZE.
+            unsafe {
+                ring8.add(i % RING_U8_SIZE).write(b);
+            }
+        }
+        self.ring_pos = w;
+        self.ring_drained = w; // window is predecessor history, NOT this chunk's output
+        self.decoded_bytes = w;
+        self.contains_markers = false;
+        self.conflated = true; // window already packed as u8; skip conflate_to_clean_u8
+    }
+
     /// Vendor `setInitialWindow` (deflate.hpp:1742-1785) for gzippy's monotonic
     /// ring: at the flip, value-downcast the recent ≤32 KiB window from the u16
     /// ring into the u8 reinterpretation of the SAME backing. Explicit
