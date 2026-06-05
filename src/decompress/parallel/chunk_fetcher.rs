@@ -2580,7 +2580,20 @@ fn queue_prefetched_marker_postprocess(
             continue;
         }
         if let Some(key) = handoff_key {
-            if arc.max_acceptable_start_bit != key && arc.decode_origin_bit != key {
+            // Follow the chain when the chunk's REAL output start
+            // (`encoded_offset_bits`) matches the predecessor's real end
+            // (`key`), not only when its partition SEED
+            // (`max_acceptable_start_bit`/`decode_origin_bit`) does. Deflate
+            // is contiguous, so chunk K's real start == chunk K-1's real end;
+            // the resolve uses the predecessor window at `key`, which is
+            // correct iff the chunk's real start == `key`. Seeds rarely equal
+            // real boundaries, so without this the chain dies at the first
+            // speculative chunk and the consumer resolves the rest serially
+            // on the wall (+206ms, gap #2). Byte-exactness gates correctness.
+            if arc.max_acceptable_start_bit != key
+                && arc.decode_origin_bit != key
+                && arc.encoded_offset_bits != key
+            {
                 continue;
             }
         }
