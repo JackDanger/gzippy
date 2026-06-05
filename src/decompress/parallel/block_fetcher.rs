@@ -747,6 +747,40 @@ where
             "t",
         );
 
+        // BlockFetcher.hpp:476-491 — resolve the prefetch INDEXES to a
+        // `blockOffsetsToPrefetch` set up-front (including partition
+        // offsets) so we can (a) protect them from eviction via touch
+        // below and (b) reference them in the cache-pollution stop in
+        // the loop. Vendor builds this with the timeout-0 lookup; we use
+        // the same `lookup_block_offset` the loop uses.
+        let mut block_offsets_to_prefetch: Vec<Key> =
+            Vec::with_capacity(block_indexes_to_prefetch.len());
+        for &index in &block_indexes_to_prefetch {
+            if let Some(off) = lookup_block_offset(index) {
+                let partition_offset = partition_offset_for(&off);
+                if partition_offset != off {
+                    block_offsets_to_prefetch.push(partition_offset);
+                }
+                block_offsets_to_prefetch.push(off);
+            }
+        }
+
+        // BlockFetcher.hpp:493-497 — touch all to-be-prefetched offsets
+        // (reverse order, vendor) in BOTH caches so that prefetching one
+        // block cannot evict another block we also intend to prefetch.
+        // The touch makes the to-be-prefetched set most-recently-used, so
+        // `next_nth_eviction` below returns a genuinely-stale candidate.
+        // Lock order is cache-then-prefetch_cache to match `test()`
+        // (block_fetcher.rs:111-113) and avoid a deadlock.
+        {
+            let mut c = self.cache.lock().unwrap();
+            let mut pc = self.prefetch_cache.lock().unwrap();
+            for off in block_offsets_to_prefetch.iter().rev() {
+                c.touch(off);
+                pc.touch(off);
+            }
+        }
+
         let mut submitted = 0usize;
         for index in block_indexes_to_prefetch {
             // BlockFetcher.hpp:500-502 — stop when the pool is full.
@@ -829,6 +863,31 @@ where
                     continue;
                 }
             };
+
+            // BlockFetcher.hpp:544-551 — avoid cache pollution: if
+            // submitting this prefetch would (on the (prefetching+1)-th
+            // hypothetical insert — the "+1" for the on-demand task the
+            // consumer is waiting on, plus the in-flight prefetches that
+            // also insert before our eviction of interest) evict a block
+            // we ourselves intend to prefetch, STOP. There is no point
+            // prefetching block X if doing so evicts block Y we also want.
+            if let Some(offset_to_be_evicted) = self
+                .prefetch_cache
+                .lock()
+                .unwrap()
+                .next_nth_eviction(self.prefetching_len() + 1)
+            {
+                if block_offsets_to_prefetch.contains(&offset_to_be_evicted) {
+                    PREFETCH_CACHE_POLLUTION_STOPS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    trace_v2::emit_instant(
+                        "coord.prefetch_skip",
+                        r#""reason":"cache_pollution_stop""#,
+                        "t",
+                    );
+                    break;
+                }
+            }
 
             // BlockFetcher.hpp:553-557 — submit prefetch task.
             // coord.prefetch_emit span: per-emission, one B/E pair with
@@ -1019,6 +1078,12 @@ pub static PREFETCH_RETURN_ZERO_SUBMITTED: std::sync::atomic::AtomicU64 =
 pub static PREFETCH_RETURN_SUBMITTED_ANY: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static PREFETCH_TOTAL_SUBMITTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Counts firings of the vendor cache-pollution stop (BlockFetcher.hpp:544-551):
+/// a prefetch refused because submitting it would evict a block we intend to
+/// prefetch. Non-zero ⇒ the admission control is live (falsifier check for
+/// Divergence #4). See plans/rapidgzip-architecture-divergence.md.
+pub static PREFETCH_CACHE_POLLUTION_STOPS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]

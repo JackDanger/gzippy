@@ -814,16 +814,18 @@ fn drive_impl<W: std::io::Write>(
         // If `called` is low, the dispatcher just isn't being invoked
         // often enough — and the fix is hoisting the call site.
         use crate::decompress::parallel::block_fetcher::{
-            PREFETCH_NEW_BLOCKS_CALLED, PREFETCH_RETURN_SATURATED, PREFETCH_RETURN_SUBMITTED_ANY,
-            PREFETCH_RETURN_ZERO_SUBMITTED, PREFETCH_TOTAL_SUBMITTED,
+            PREFETCH_CACHE_POLLUTION_STOPS, PREFETCH_NEW_BLOCKS_CALLED, PREFETCH_RETURN_SATURATED,
+            PREFETCH_RETURN_SUBMITTED_ANY, PREFETCH_RETURN_ZERO_SUBMITTED,
+            PREFETCH_TOTAL_SUBMITTED,
         };
         eprintln!(
-            "  Prefetch dispatch: called={} saturated={} zero_submitted={} any_submitted={} total_submitted={}",
+            "  Prefetch dispatch: called={} saturated={} zero_submitted={} any_submitted={} total_submitted={} pollution_stops={}",
             PREFETCH_NEW_BLOCKS_CALLED.load(Ordering::Relaxed),
             PREFETCH_RETURN_SATURATED.load(Ordering::Relaxed),
             PREFETCH_RETURN_ZERO_SUBMITTED.load(Ordering::Relaxed),
             PREFETCH_RETURN_SUBMITTED_ANY.load(Ordering::Relaxed),
             PREFETCH_TOTAL_SUBMITTED.load(Ordering::Relaxed),
+            PREFETCH_CACHE_POLLUTION_STOPS.load(Ordering::Relaxed),
         );
         // Body-failure forensic detail — speculation-accuracy attack.
         // After disprove-advisor confirmed body failures are the dominant
