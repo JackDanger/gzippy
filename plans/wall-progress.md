@@ -1,5 +1,36 @@
 # Wall-parity scoreboard — the trustworthy progress signal
 
+## 2026-06-05 — EAGER WINDOW-CHAIN PORT = BIGGEST HIGH-T WIN OF THE CAMPAIGN (transliteration, not lever)
+Closed the PRIMARY architectural divergence (per plans/rapidgzip-architecture-divergence.md +
+adversarial advisor): gzippy's post-window-publish resolve-ahead used `Some(chunk_end_bit)` — a
+single chain-follow that SKIPPED any prefetched chunk whose key != the running handoff
+(isal_lut_bulk continue), so the marker-resolution window chain broke at the first speculative/
+overshoot mismatch and most marker chunks fell to the consumer's SERIAL N*L_resolve. Vendor
+`queuePrefetchedChunkPostProcessing` (GzipChunkFetcher.hpp:520-551, run on EVERY consumed chunk via
+waitForReplacedMarkers:513) is a FULL SORTED SCAN checking each chunk vs ITS OWN predecessor,
+publishing each end-window as it goes (chain propagates in one pass) and submitting every resolvable
+apply_window to the pool. Fix = the 2 post-publish call sites `Some(chunk_end_bit)`->`None` (commits
+f7868ab, 1351909). Eager resolve-ahead 0->41 submitted, reused 43.
+LOCKED-FULCRUM A/B (min-of-9, frozen, byte-exact diverged=0, vs baseline 43f1685):
+| T  | base ratio | HEAD ratio | wall Δ |
+|----|-----------|-----------|--------|
+| 1  | 0.469     | 0.410     | +15% WORSE |
+| 4  | 0.537     | 0.583     | -7.1%  |
+| 8  | 0.437     | 0.528     | -16.5% |
+| 16 | 0.346     | 0.443     | -21.1% |
+The T8/T16 wins (-16.5/-21.1%) are the campaign's biggest single improvement, well outside sd%
+(0.7-2.0). T1 regressed +15%: the eager full-scan's serial resolution has no parallelism to overlap
+at T1 (the vendor-faithful ThreadPool 0-threads-at-par==1 fix, BlockFetcher.hpp:185, recovered only
+~42ms — the "pool overhead" hypothesis was WRONG; the cost is the eager resolution work itself).
+PRODUCTION T1 single-member routes to libdeflate (not the parallel path), so production T1 is
+unaffected; the forced-parallel T1 regression is benchmark-only. HONEST: gzippy is STILL 1.7-2.4x
+slower than rapidgzip (ratio 0.41-0.58); this closed ONE divergence. Vindicates the user's thesis
+(gap = implementation divergence, NOT the engine — engine is a measured TIE per
+rapidgzip-architecture-divergence.md). The "it's the engine" conclusion was the documented bias
+(escape-hatch), falsified by the advisor + my own prior doc. Remaining divergences: #2 dual-engine
+(perf-marginal), #3 buffer access patterns (segmented get_last_window cost — likely the T1 cost too).
+
+
 ## 2026-06-04 — COALESCE (warm read_stream, rapidgzip parity) = REAL T1/T4 WIN, T8/T16 TIE. KEPT.
 Ported rapidgzip/ISA-L `readStream` warm-decode shape into the clean-tail decoder
 (`resumable_resync`/`ResumableInflate2`): decode many deflate blocks per call instead of
