@@ -25,6 +25,17 @@ tests; re-resolve only on re-anchor also regressed — needs vendor-faithful
 `set_encoded_offset` at drain landed in 0a448d1; lone-emit still CRC-fails (bisect unchanged).
 Locked Fulcrum still needed on neurotic.
 
+## 2026-06-05 — LOCKED-FULCRUM bench-sm (neurotic T16, 42c51c6, silesia-large)
+`make bench-sm`: gzippy **900 MB/s** (med 560 ms) vs rapidgzip **1513 MB/s** (med 333 ms) = **0.59×**.
+`GZIPPY_VERBOSE=1` same fixture: pool efficiency **54%** vs rg **78–85%**; `decodeBlock` **3.5 s**
+vs rg **1.6 s**; `future::get` **225 ms** vs rg **66 ms**; slow-path ok **35** (rg: 1 on-demand);
+`SPEC_FAIL_HEADER` **26**; prefetch dispatch **110/244 zero_submitted**. Root gap = speculation
+miss → slow-path coordinator + consumer stall, not write path.
+**Disproved this session:** ingest-time `set_encoded_offset`+publish (CRC), early publish-if-anchored
+(CRC), defer internal `block_finder` inserts to drain (8 routing fails — intra-chunk prefetch needs
+boundaries before drain). **Next lever:** vendor-synchronous `postProcess→setEncodedOffset→appendSubchunks`
+per iteration (eliminate pending-queue ordering skew), or attack SPEC_FAIL_HEADER / prefetch zero-submit.
+
 ## 2026-06-05 — EAGER WINDOW-CHAIN PORT = BIGGEST HIGH-T WIN OF THE CAMPAIGN (transliteration, not lever)
 Closed the PRIMARY architectural divergence (per plans/rapidgzip-architecture-divergence.md +
 adversarial advisor): gzippy's post-window-publish resolve-ahead used `Some(chunk_end_bit)` — a

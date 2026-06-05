@@ -1440,8 +1440,8 @@ fn consumer_loop<W: std::io::Write>(
         // chunk's apply_window. We mirror exactly:
         // `Window = Arc<CompressedVector>` — vendor's
         // `SharedWindow = shared_ptr<const CompressedVector>`
-        // (WindowMap.hpp:24). Subchunk windows are published on the
-        // consumer in `drain_one_pending` after post-process returns.
+        // (WindowMap.hpp:24). Subchunk windows are published in
+        // `drain_one_pending` after post-process + `set_encoded_offset`.
         #[allow(clippy::needless_late_init)] // assigned in two long branches below
         let predecessor_window_for_postprocess: Option<Window>;
         // Predecessor-window key the consumer resolved against (marker
@@ -3508,14 +3508,6 @@ fn drain_one_pending<W: std::io::Write>(
         let bytes = materialize_window(&predecessor_window);
         resolve_chunk_markers_on_chunk(&mut chunk, bytes.as_ref());
     }
-    // Re-anchor AFTER post-process (vendor order). Do NOT clear
-    // `markers_resolved` — gzippy previously set it false here, leaving stale
-    // `narrowed_len` and corrupting output under early lone emit.
-    if chunk.encoded_offset_bits != handoff_bit && chunk.matches_encoded_offset(handoff_bit) {
-        use std::sync::atomic::Ordering;
-        REANCHOR_AFTER_POSTPROCESS.fetch_add(1, Ordering::Relaxed);
-        chunk.set_encoded_offset(handoff_bit);
-    }
     if std::env::var_os("GZIPPY_TRACE_DRAIN").is_some() {
         eprintln!(
             "[trace_drain] idx={idx} enc={} handoff={} narrowed_len={} \
@@ -3526,6 +3518,15 @@ fn drain_one_pending<W: std::io::Write>(
             chunk.markers_resolved,
             chunk.data.len().saturating_sub(chunk.data_prefix_len),
         );
+    }
+
+    // Re-anchor AFTER post-process (vendor order). Do NOT clear
+    // `markers_resolved` — gzippy previously set it false here, leaving stale
+    // `narrowed_len` and corrupting output under early lone emit.
+    if chunk.encoded_offset_bits != handoff_bit && chunk.matches_encoded_offset(handoff_bit) {
+        use std::sync::atomic::Ordering;
+        REANCHOR_AFTER_POSTPROCESS.fetch_add(1, Ordering::Relaxed);
+        chunk.set_encoded_offset(handoff_bit);
     }
 
     // Vendor `appendSubchunksToIndexes` window emplace — orchestrator only.
