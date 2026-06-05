@@ -1034,8 +1034,16 @@ impl MarkerRing {
     }
 
     /// Copy `length` bytes from `*pos - distance` to `*pos` in the u8 ring
-    /// (forward copy → correct LZ77 overlap/RLE). Fast `copy_nonoverlapping`
-    /// when non-overlapping and neither end wraps; byte-wise otherwise.
+    /// (forward copy → correct LZ77 overlap/RLE). `copy_nonoverlapping` for the
+    /// non-overlap, non-wrap case; per-byte forward otherwise (the byte-wise
+    /// loop is what makes overlapping/RLE matches replicate correctly).
+    ///
+    /// NOTE: a rounded 8-byte word-copy fast path was attempted (mirroring the
+    /// u16 `emit_backref_ring`) and REVERTED — it corrupted repetitive data
+    /// (corpus_large_repetitive CRC32 mismatch) via the circular-ring overshoot,
+    /// which the u16 path tolerates but the u8 reinterpretation does not. Any
+    /// retry MUST gate on a repetitive-data unit test, not silesia alone.
+    ///
     /// SAFETY: `*pos >= distance` (caller checks `distance <= decoded`); all
     /// physical indices are `% RING_U8_SIZE`.
     #[inline]
