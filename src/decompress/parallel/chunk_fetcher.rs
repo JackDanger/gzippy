@@ -531,7 +531,16 @@ fn drive_impl<W: std::io::Write>(
     // through `submit` + `submitTaskWithHighPriority`. `Arc` so the
     // submit closure inside `BlockFetcher::get` (cloned per call) can
     // hold a reference for `ThreadPool::submit`.
-    let thread_pool = Arc::new(ThreadPool::with_pinning_for_capacity(pool_size));
+    // TRANSLITERATION (vendor BlockFetcher.hpp:185): `m_threadPool( m_parallelization
+    // == 1 ? 0 : m_parallelization )`. At a single thread, vendor uses ZERO pool
+    // threads so submitted tasks run INLINE (deferred), avoiding a cross-thread
+    // handoff that can't be overlapped. gzippy passed `pool_size` straight through
+    // (one real worker), which made the eager full-scan's apply_window submits pure
+    // overhead at T1 (+16% regression). Apply the `==1 ? 0` ONLY at pool construction;
+    // the cache/prefetch sizing above keeps reading the true `pool_size` (vendor sizes
+    // m_prefetchCache off m_parallelization, which stays 1 → 2, not 0).
+    let pool_threads = if pool_size == 1 { 0 } else { pool_size };
+    let thread_pool = Arc::new(ThreadPool::with_pinning_for_capacity(pool_threads));
 
     // Running CRC + size accumulators. Mirror of vendor's
     // `m_crc32Calculator` + `m_totalDecompressedSize` updates inside

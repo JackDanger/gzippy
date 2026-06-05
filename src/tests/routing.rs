@@ -154,6 +154,47 @@ mod tests {
         }
     }
 
+    /// Advisor review of the eager window-chain port (queuePrefetchedChunkPostProcessing,
+    /// f7868ab): the consumer now eagerly publishes each prefetched chunk's end-window via
+    /// `get_last_window`. Vendor `queueChunkForPostProcessing` (GzipChunkFetcher.hpp:562-570)
+    /// has a FOOTER SPECIAL-CASE — it emplaces an EMPTY window when a chunk ends exactly on a
+    /// member footer — which gzippy lacks. Multi-member is hard-rerouted at `classify_gzip`
+    /// (mod.rs:163) BEFORE the parallel-SM path, so this is routing-protected. But if a
+    /// multi-member ever leaked in, a window computed ACROSS a member footer would mix
+    /// member-A tail bytes into member-B back-reference resolution → SILENT WRONG BYTES
+    /// (possibly with a passing CRC). Force the worst case directly through the parallel-SM
+    /// decode (bypassing routing) and assert it NEVER produces wrong bytes: it must either
+    /// error cleanly or be byte-exact. Run at T1 (inline pool) and T4 (concurrency).
+    #[test]
+    fn test_multi_member_forced_through_parallel_sm_never_wrong_bytes() {
+        let original = make_low_entropy_data(24 * 1024 * 1024);
+        let mm = compress_multi_member_gzip(&original); // 256 KiB members → many footers
+        assert!(
+            mm.len() > 10 * 1024 * 1024,
+            "fixture must clear the parallel-SM size gate (got {} bytes)",
+            mm.len()
+        );
+        let expected = decompress_reference(&mm);
+        for threads in [1usize, 4] {
+            let mut out = Vec::new();
+            // A clean Err is acceptable (multi-member is not this path's job; routing
+            // never sends it here in production). We only forbid SILENT CORRUPTION:
+            // byte-exact is the only acceptable SUCCESS — proving the absent footer
+            // special-case is genuinely safe under this routing.
+            if crate::decompress::parallel::single_member::decompress_parallel(
+                &mm, &mut out, None, threads,
+            )
+            .is_ok()
+            {
+                assert_eq!(
+                    out, expected,
+                    "parallel-SM forced on multi-member T={threads}: WRONG BYTES \
+                     (footer-coincident eager window publish bug — vendor GzipChunkFetcher.hpp:562-570)"
+                );
+            }
+        }
+    }
+
     // =========================================================================
     // Layer 1: Format Detection
     // =========================================================================
