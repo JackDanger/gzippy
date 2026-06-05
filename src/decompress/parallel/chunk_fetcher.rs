@@ -1453,11 +1453,15 @@ fn consumer_loop<W: std::io::Write>(
             );
             if let Some((_pred_key, pred)) = predecessor_window_for_markers(window_map, handoff_bit)
             {
-                let bytes = materialize_window(&pred);
-                let tail = chunk
-                    .last_32kib_window_vec()
-                    .unwrap_or_else(|| chunk.get_last_window_vec(&bytes));
-                window_map.insert_owned_none(chunk_end_bit, tail);
+                // Vendor queueChunkForPostProcessing:558 — only publish if not already
+                // published (the eager full-scan may have done it ahead).
+                if !window_map.contains(chunk_end_bit) {
+                    let bytes = materialize_window(&pred);
+                    let tail = chunk
+                        .last_32kib_window_vec()
+                        .unwrap_or_else(|| chunk.get_last_window_vec(&bytes));
+                    window_map.insert_owned_none(chunk_end_bit, tail);
+                }
                 trace_v2::emit_instant(
                     "causal.window_publish",
                     &format!(
@@ -1559,9 +1563,18 @@ fn consumer_loop<W: std::io::Write>(
             // Vendor `GzipChunkFetcher.hpp:341`: `sharedLastWindow->
             // decompress()` materializes the bytes once. For
             // CompressionType::None this is a zero-alloc slice borrow.
-            let window_bytes = materialize_window(&window);
-            let tail = chunk.get_last_window_vec(&window_bytes);
-            window_map.insert_owned_none(chunk_end_bit, tail);
+            // TRANSLITERATION (vendor queueChunkForPostProcessing, GzipChunkFetcher.hpp:558
+            // `if ( !m_windowMap->get( windowOffset ) )`): only compute+publish this chunk's
+            // end window if it is NOT already published. With the eager full-scan
+            // (queuePrefetchedChunkPostProcessing) publishing end-windows ahead, the consumer's
+            // recompute was REDUNDANT — measured get_last_window calls=102 for ~39 chunks
+            // (~1.5ms each). get_last_window is deterministic given the same predecessor, so
+            // the eager-published window is byte-identical; skipping the recompute is byte-exact.
+            if !window_map.contains(chunk_end_bit) {
+                let window_bytes = materialize_window(&window);
+                let tail = chunk.get_last_window_vec(&window_bytes);
+                window_map.insert_owned_none(chunk_end_bit, tail);
+            }
             trace_v2::emit_instant(
                 "causal.window_publish",
                 &format!(
