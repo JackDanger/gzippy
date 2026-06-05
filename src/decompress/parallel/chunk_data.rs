@@ -154,16 +154,19 @@ pub struct ChunkData {
     /// window (set via IsalInflateWrapper::set_window) so no markers
     /// were emitted. CRC32'd at append time.
     ///
-    /// FOOTPRINT-ALIGN (2026-06-02): this is now a SEGMENTED buffer — a
-    /// list of fixed 128 KiB `Vec<u8>` segments, never realloc'd/copied —
-    /// instead of one contiguous growing Vec. Faithful port of rapidgzip's
-    /// `DecodedData::data` (`std::vector<DecodedVector>`,
-    /// DecodedData.hpp:231-289). The contiguous Vec forced a choice between
-    /// over-reserving 80 MiB (resident waste → 3× rapidgzip's maxrss) and
-    /// growing-with-realloc (re-fault churn, measured wall regression). A
-    /// segment list avoids both: each 128 KiB segment is a stable
-    /// span-class rpmalloc allocation, recycled whole; total size grows by
-    /// pushing segments, never by reallocating.
+    /// CONTIGUOUS (2026-06-04): the clean decoded bytes live in ONE
+    /// contiguous allocation (see [`SegmentedU8`], now contiguous-backed),
+    /// grown by amortized reserve. This is the FAITHFUL port of vendor's
+    /// CLEAN-data storage: `DecodedData::append` (`DecodedData.hpp:278-289`)
+    /// stores the clean `data` in single contiguous per-append buffers and
+    /// the comment there states forcing them to 128 KiB "makes no sense".
+    /// The prior FOOTPRINT-ALIGN revision wrongly applied vendor's *marker*
+    /// 128 KiB-segment pattern to the clean buffer; that measured 3.26×
+    /// DTLB-walks / 1.42× cycles vs rapidgzip at equal instruction count —
+    /// the memory-bound gap. Reverted to contiguous; the RSS regression is
+    /// accepted for speed parity (the prime directive). The u16 MARKER
+    /// buffer (`data_with_markers`) stays 128 KiB-segmented — that one
+    /// matches vendor's `dataWithMarkers` and is correct.
     pub data: SegmentedU8,
     /// Length of the resolved-marker prefix, narrowed IN PLACE inside
     /// `data_with_markers`'s own u16 backing store (low byte of each u16
@@ -1432,12 +1435,11 @@ impl ChunkData {
 impl Drop for ChunkData {
     fn drop(&mut self) {
         LIVE_CHUNKS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        // FOOTPRINT-ALIGN: recycle the segmented `data`'s 128 KiB segments
-        // individually into the worker's u8 pool (each is a span-class
-        // rpmalloc allocation, warm-reused by the next chunk's
-        // `writable_tail`). There is no separate `narrowed` buffer to return
-        // any more — marker resolution is in place inside `data_with_markers`,
-        // which is returned to the u16 pool below.
+        // Recycle `data`'s contiguous backing allocation into the worker's
+        // u8 pool (one buffer now, warm-reused by the next chunk's
+        // `writable_tail`/`first_segment_a3_output`). There is no separate
+        // `narrowed` buffer to return — marker resolution is in place inside
+        // `data_with_markers`, which is returned to the u16 pool below.
         use crate::decompress::parallel::chunk_buffer_pool;
         let segments = self.data.take_segments();
         for seg in segments {
