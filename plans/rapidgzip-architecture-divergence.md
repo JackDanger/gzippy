@@ -83,3 +83,23 @@ GzipChunk.hpp↔gzip_chunk.rs (decode loop), deflate.hpp↔deflate_block.rs (Blo
 ChunkData.hpp↔chunk_data.rs (applyWindow/getLastWindow/footers), WindowMap.hpp↔window_map.rs,
 BlockFetcher.hpp↔block_fetcher.rs (prefetch). Priority = #1 (publish-chain) since the model
 says it binds the wall.
+
+## STATUS 2026-06-05: Divergence #1 PORTED (the win). Next divergence relocated by measurement.
+Divergence #1 (eager window-chain) CLOSED — ported vendor queuePrefetchedChunkPostProcessing
+(full sorted scan; Some(chunk_end_bit)->None at the 2 post-publish sites; commits f7868ab/1351909).
+Locked-Fulcrum A/B: T8 -16.5%, T16 -21.1%, T4 -7.1% (T1 +15% benchmark-only). See wall-progress.md.
+POST-FIX (new T8 trace): consumer head-of-line wait 737->416ms (4 cold re-decodes remain),
+consumer.iter 1011->855ms; consumer serial "other" still ~3x rapidgzip.
+- The 4 cold re-decodes: PRE-REGISTERED probe FALSIFIED interior-accept (advisor's secondary
+  divergence: gzippy exact `==max` reuse guard vs vendor matchesEncodedOffset interior-range
+  ChunkData.hpp:402 + setEncodedOffset). All 4 stalls show containing_chunk=FALSE — the partition
+  chunk is EVICTED before the lagging consumer arrives, so there is NOTHING to interior-accept.
+  These are an EVICTION consequence of consumer lag, NOT a reuse-guard gap. DO NOT port
+  interior-accept for them (dead — measured).
+- NEXT DIVERGENCE (= Divergence #3 data-plane): consumer serial cost drives the lag that drives
+  eviction. Dominant: dispatch_post_process ~144ms = gzippy DEEP-CLONES the ~16MB ChunkData when
+  `Arc::try_unwrap` fails (ConsumerChunkHold `(*arc).clone()`), where vendor SHARES via shared_ptr
+  and mutates applyWindow on the pool. The eager-chain INCREASED Arc refs -> more clone cost (also
+  the T1 regression). Plus window_publish_marker ~122ms (get_last_window on SegmentedU8 vs vendor
+  contiguous FasterVector). Correctness-sensitive (the clone avoids a mutation race) — a real
+  vendor-cited cycle, not a tail-of-session edit.
