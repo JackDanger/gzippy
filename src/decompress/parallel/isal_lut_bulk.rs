@@ -938,6 +938,7 @@ impl MarkerRing {
         // the prefix with one ring write sequence.
         let t_huff = std::time::Instant::now();
         while emitted < n_max {
+            bits.refill();
             let d = self.scratch.litlen.decode(bits);
             if d.bit_count == 0 {
                 commit_drain!(Err(BulkDecodeError::InvalidHuffmanCode));
@@ -1223,6 +1224,7 @@ impl MarkerRing {
         }
 
         while emitted < n_max {
+            bits.refill();
             let d = self.scratch.litlen.decode(bits);
             if d.bit_count == 0 {
                 commit_drain_u8!(Err(BulkDecodeError::InvalidHuffmanCode));
