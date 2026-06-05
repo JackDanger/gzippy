@@ -1,5 +1,23 @@
 # Wall-parity scoreboard — the trustworthy progress signal
 
+## 2026-06-05 — Worker window lookup fixup (post-977559c): get_at_worker
+Fulcrum showed KEY-MISMATCH oracle paths never fired because workers used `WindowMap::get`
+(confirmed-only) while **35/38** early publishes land in the **speculative** side-slot.
+Fixup: `get_at_worker` / `get_predecessor_for_worker` for worker decode + boundary try;
+consumer `get`/`get_predecessor` unchanged. `GZIPPY_SPEC_PRED_CLEAN` default **off** (unproven).
+Full structural map: `docs/structural-gap-rapidgzip.md`.
+
+## 2026-06-05 — KEY-MISMATCH oracle (3a991a8 + 977559c): TIE on wall-critical bootstrap
+**Design:** `try_clean_decode_with_pred_window` at partition seed + `get_handoff_in_partition`
+(merges speculative side-slot for worker handoff). Commits `3a991a8`, `977559c`.
+**Locked Fulcrum T16 interleaved (977559c):** gzippy min **1.202 s** (419 MB/s) vs rg **0.478 s** (1054 MB/s) = **0.40×** (unchanged vs 3a06bda ~0.59× on older bench-sm med — different statistic/fixture gate).
+**Trace T8 instrumented:** gzippy **955 ms** vs rg **463 ms** = **2.06×**.
+**Causal perturbation (spec ON vs OFF, same trace):** window-absent wc **644→661 ms** (TIE); marker-resolve **298→331 ms** (−33 ms ON); trace wall **959 vs 988 ms** (3% ON, within spread).
+**Counters (GZIPPY_VERBOSE trace):** `pred@seed=3`, `handoff@stop=0`, `boundary@seed=0` — oracle paths never fire.
+**Fulcrum causal unchanged:** 90.5% runtime window-absent, 97% KEY-MISMATCH (instrument classifies pre-decode `window_exact`, not post-decode outcome).
+**Mechanism (survived disproof attempt):** at speculative prefetch **start**, predecessor windows keyed at real boundaries are almost always **`pred_key < partition_seed`** (prior partition end), not in `(seed, stop_hint]`; speculative merge alone does not surface them to handoff. Design **H′** (decode at `pred_key` + metadata rewrite) is the remaining structural fix; prior attempt reverted (`5755772` era) for chain-invalid preds on low-entropy fixture — needs **chain-valid** gate only.
+**Kept:** code is byte-exact (164 routing pass); env `GZIPPY_SPEC_PRED_CLEAN=0` disables; guest captures spec-pred-off trace for A/B.
+
 ## 2026-06-05 — CONSUMER PAIR-READY DRAIN + ZERO-COPY WRITEV (0a448d1; lone-emit DISPROVED)
 Shipped (locked-Fulcrum pending — neurotic unreachable from dev env): `rpmalloc-caches` via `pure-rust-inflate`,
 consumer `writev` gather (`append_output_iovecs` + `write_chunk_payload_to_fd`), immediate buffer
