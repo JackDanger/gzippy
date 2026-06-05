@@ -884,12 +884,33 @@ fn drive_impl<W: std::io::Write>(
         } else {
             0.0
         };
+        let ring_h_us = crate::decompress::parallel::isal_lut_bulk::BOOTSTRAP_RING_HUFFMAN_US
+            .load(Ordering::Relaxed);
+        let ring_d_us = crate::decompress::parallel::isal_lut_bulk::BOOTSTRAP_RING_DRAIN_US
+            .load(Ordering::Relaxed);
+        let ring_d_bytes = crate::decompress::parallel::isal_lut_bulk::BOOTSTRAP_RING_DRAIN_BYTES
+            .load(Ordering::Relaxed);
+        let ring_h_pct = if bs_b_us > 0 {
+            100.0 * ring_h_us as f64 / bs_b_us as f64
+        } else {
+            0.0
+        };
+        let ring_d_pct = if bs_b_us > 0 {
+            100.0 * ring_d_us as f64 / bs_b_us as f64
+        } else {
+            0.0
+        };
         eprintln!(
             "  Bootstrap per-block: header_calls={bs_h_calls} header_ms={:.1} avg_header_us={:.1} body_ms={:.1} body_bytes={bs_b_bytes} body_rate_MB/s={:.0} post_flip_u16_bytes={bs_postflip} ({postflip_pct:.1}% of body = Design-B1 prize)",
             bs_h_us as f64 / 1000.0,
             bs_h_avg,
             bs_b_us as f64 / 1000.0,
             bs_b_rate,
+        );
+        eprintln!(
+            "  Bootstrap ring split: huffman_ms={:.1} ({ring_h_pct:.1}% of body) drain_ms={:.1} ({ring_d_pct:.1}% of body) drain_u16_bytes={ring_d_bytes}",
+            ring_h_us as f64 / 1000.0,
+            ring_d_us as f64 / 1000.0,
         );
         // Per-fetch rejection cause: a prefetched chunk arrived but the
         // safety guard rejected it (chain invariant broken —
@@ -3043,6 +3064,7 @@ impl ConsumerChunkHold {
                         ARC_DEFERRED_INFLIGHT_RECV
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         EAGER_PROBE_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let _tv2 = trace_v2::SpanGuard::begin("consumer.dispatch_recv");
                         let chunk = rx.recv().unwrap_or_else(|_| {
                             ARC_TRY_UNWRAP_MISSES
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -672,6 +672,16 @@ use crate::decompress::parallel::marker_inflate::{
 
 const MAX_RUN_LENGTH: usize = 258;
 
+/// Sub-split of [`crate::decompress::parallel::gzip_chunk::BOOTSTRAP_BODY_US`]:
+/// Huffman LUT decode inside `MarkerRing::read_compressed` (excludes ring drain).
+pub static BOOTSTRAP_RING_HUFFMAN_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Ring → `MarkerSink` copy in `drain_to` (u16 memcpy to `SegmentedU16`).
+pub static BOOTSTRAP_RING_DRAIN_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static BOOTSTRAP_RING_DRAIN_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// u8 reinterpretation of the 128 KiB ring backing — vendor `getWindow()` over
 /// `m_window16` (deflate.hpp:890-893): the same bytes, 2× the elements.
 const RING_U8_SIZE: usize = 2 * RING_SIZE;
@@ -806,9 +816,7 @@ impl MarkerRing {
         if new_bytes == 0 {
             return;
         }
-        let _tv2 = crate::decompress::parallel::trace_v2::detail_enabled().then(|| {
-            crate::decompress::parallel::trace_v2::SpanGuard::begin("worker.block_body.drain")
-        });
+        let t0 = std::time::Instant::now();
         let start = self.ring_drained % RING_SIZE;
         if start + new_bytes <= RING_SIZE {
             output.push_slice(&self.ring[start..start + new_bytes]);
@@ -818,6 +826,9 @@ impl MarkerRing {
             output.push_slice(&self.ring[..end]);
         }
         self.ring_drained = self.ring_pos;
+        use std::sync::atomic::Ordering;
+        BOOTSTRAP_RING_DRAIN_US.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        BOOTSTRAP_RING_DRAIN_BYTES.fetch_add(new_bytes as u64, Ordering::Relaxed);
     }
 
     #[inline]
@@ -925,9 +936,7 @@ impl MarkerRing {
         // No per-iteration `bits.refill()` — LUT refills internally (same as
         // `decode_block`). ISA-L packs up to 3 literals per decode; batch
         // the prefix with one ring write sequence.
-        let _tv2_huff = crate::decompress::parallel::trace_v2::detail_enabled().then(|| {
-            crate::decompress::parallel::trace_v2::SpanGuard::begin("worker.block_body.huffman")
-        });
+        let t_huff = std::time::Instant::now();
         while emitted < n_max {
             let d = self.scratch.litlen.decode(bits);
             if d.bit_count == 0 {
@@ -1028,6 +1037,8 @@ impl MarkerRing {
                 break;
             }
         }
+        use std::sync::atomic::Ordering;
+        BOOTSTRAP_RING_HUFFMAN_US.fetch_add(t_huff.elapsed().as_micros() as u64, Ordering::Relaxed);
         commit_drain!(Ok(emitted));
     }
 
