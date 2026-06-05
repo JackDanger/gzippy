@@ -65,7 +65,7 @@ counters = []     # Enable AtomicU64 hot-path counters in bgzf (always on in tes
 # does not affect production binaries. See plan.md Phase 11.2.
 oracle = []
 # Pure-Rust resumable inflate with stopping points (Track B); no ISA-L in wrapper body.
-pure-rust-inflate = ["arena-allocator"]
+pure-rust-inflate = ["rpmalloc-caches"]
 arena-allocator = ["dep:allocator-api2", "dep:rpmalloc-sys"]
 # Allocator-visibility tooling: enable rpmalloc's ENABLE_STATISTICS so
 # dump_global_stats() reports mapped_total / unmapped_total / cached /

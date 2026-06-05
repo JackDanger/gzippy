@@ -1,5 +1,28 @@
 # Wall-parity scoreboard — the trustworthy progress signal
 
+## 2026-06-05 — CONSUMER PAIR-READY DRAIN + ZERO-COPY WRITEV (uncommitted; lone-emit DISPROVED)
+Shipped in working tree (not yet locked-Fulcrum): `rpmalloc-caches` via `pure-rust-inflate`,
+consumer `writev` gather (`append_output_iovecs` + `write_chunk_payload_to_fd`), immediate buffer
+recycle after write, `resolve_range_into_buf` for window straddle, pool depth 8→12,
+`post_process_inflight_cap = pool_size-1` (min 2).
+**Lone-Ready mid-stream emit — DISPROVED (causal bisect + trace, byte-exact gates):**
+`pending == [Ready]` drained via `drain_ready_pending_heads` → CRC32 mismatch at T≥2
+(`coalesce_fixed`, 32 MiB btype01, T=2). `diagnose_lone_drain_byte_diff_coalesce` (ignored):
+first byte diff at offset 13118427 (~chunk-4 boundary); identical `[trace_drain]` metadata
+both paths but chunk-4 payload bytes differ. NOT buffer-pool UAF: `GZIPPY_RECYCLE_DEFER_DEPTH=64`
+(stores all drained shells until EOF, no pool return) **still CRC-fails** under `GZIPPY_DRAIN_LONE`.
+(`GZIPPY_NO_RECYCLE` was inconclusive — `Drop` still recycled.) Root cause is **emit-before-
+pipeline-ready** (successor/post-process/window-chain state), not early `recycle_decoded_buffers`.
+**Safe paths only:** `[Ready,Ready]` / `[Ready,Async]` pair drain; marker-branch
+`wait_replaced_markers`; final flush. **Kept:** 2-chunk `defer_chunk_recycle` on pair drain
+(delays pool return without enabling lone emit). **Trace follow-up (chunk-4):** first bad
+byte at offset 13118427 = end of idx=3 / start of idx=4; both paths log idx=4
+`markers_resolved=false narrowed_len≈6.5MB` at drain (identical metadata, different
+payload bytes under lone emit). Inline re-resolve on every unresolved emit broke 8 routing
+tests; re-resolve only on re-anchor also regressed — needs vendor-faithful
+`setEncodedOffset` → re-`postProcessChunk` sequencing, not a blind re-call.
+`REANCHOR_INVALIDATES_NARROWED` counter added for Fulcrum. Locked Fulcrum still needed.
+
 ## 2026-06-05 — EAGER WINDOW-CHAIN PORT = BIGGEST HIGH-T WIN OF THE CAMPAIGN (transliteration, not lever)
 Closed the PRIMARY architectural divergence (per plans/rapidgzip-architecture-divergence.md +
 adversarial advisor): gzippy's post-window-publish resolve-ahead used `Some(chunk_end_bit)` — a

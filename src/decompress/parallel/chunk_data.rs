@@ -22,7 +22,6 @@
 use std::sync::Arc;
 
 use crate::decompress::parallel::crc32::CRC32Calculator;
-pub use crate::decompress::parallel::replace_markers::MARKER_BASE;
 use crate::decompress::parallel::rpmalloc_alloc::types::U8;
 use crate::decompress::parallel::segmented_buffer::SegmentedU8;
 use crate::decompress::parallel::segmented_markers::SegmentedU16;
@@ -475,8 +474,14 @@ impl ChunkData {
                 if v >= crate::decompress::parallel::replace_markers::MARKER_BASE {
                     return None;
                 }
-                out[i] = v as u8;
             }
+            let window_stub = [0u8; 32768];
+            self.data_with_markers.resolve_range_into_buf(
+                m_start,
+                from_markers,
+                &window_stub,
+                &mut out[..from_markers],
+            );
             self.data.copy_last_into(&mut out[from_markers..]);
             Some(out)
         } else {
@@ -519,9 +524,14 @@ impl ChunkData {
                 }
             }
             let mut out = vec![0u8; W];
-            for i in 0..from_markers {
-                out[i] = self.data_with_markers.get(m_start + i)? as u8;
-            }
+            // All literals in range — one segment walk, not per-byte get().
+            let window_stub = [0u8; 32768];
+            self.data_with_markers.resolve_range_into_buf(
+                m_start,
+                from_markers,
+                &window_stub,
+                &mut out[..from_markers],
+            );
             self.data.copy_last_into(&mut out[from_markers..]);
             debug_assert_eq!(out.len(), W);
             Some(out)
@@ -1020,6 +1030,24 @@ impl ChunkData {
     /// `chunk_fetcher::drive` — so we keep the same width invariant
     /// here and let the caller pad with zeros.)
     pub fn get_last_window(&self, predecessor_window: &[u8]) -> [u8; 32768] {
+        let mut window = [0u8; 32768];
+        self.fill_last_window_into(predecessor_window, &mut window);
+        window
+    }
+
+    /// Vec-producing twin of `get_last_window`. One 32 KiB heap allocation,
+    /// zero stack-array → Vec memcpy.
+    pub fn get_last_window_vec(&self, predecessor_window: &[u8]) -> Vec<u8> {
+        let mut v = vec![0u8; 32768];
+        self.fill_last_window_into(predecessor_window, &mut v);
+        v
+    }
+
+    /// Core window builder shared by [`Self::get_last_window`] and
+    /// [`Self::get_last_window_vec`]. Direct port of
+    /// `getWindowAt(previousWindow, skipBytes = size())`
+    /// (vendor/.../DecodedData.hpp:401-490).
+    fn fill_last_window_into(&self, predecessor_window: &[u8], window: &mut [u8]) {
         const W: usize = 32768;
         debug_assert_eq!(
             predecessor_window.len(),
@@ -1027,53 +1055,30 @@ impl ChunkData {
             "get_last_window requires a full 32 KiB predecessor window \
              (vendor DecodedData.hpp:402: `DecodedVector window( MAX_WINDOW_SIZE )`)"
         );
-        // A4: the decoded portion of `self.data` starts at
-        // `self.data_prefix_len`. For window arithmetic we operate on
-        // a `decoded_data` view that excludes the window-image prefix.
-        // The vendor algorithm sees a logical
-        // `(predecessor_window | dataWithMarkers | decoded_data)` view;
-        // the prefix is not part of any of those segments.
-
-        // Direct port of `getWindowAt(previousWindow, skipBytes = size())`
-        // (vendor/.../DecodedData.hpp:401-490). We want the last W bytes
-        // of the concatenated view (predecessor_window | dataWithMarkers | decoded_data),
-        // so `skip_bytes == decoded_size()`. The vendor's two-arm copy
-        // (prefilled-from-previousWindow then copyFromDataWithMarkers
-        // then data) collapses for `skip_bytes == size()` into:
-        //   - if decoded_size < W: take the trailing (W - decoded_size)
-        //     bytes of predecessor_window into the head of the window,
-        //     then ALL of dataWithMarkers (mapped) and decoded_data into the tail.
-        //   - else: take only the last W bytes of (dataWithMarkers | decoded_data),
-        //     mapping any marker we land on through MapMarkers.
+        debug_assert_eq!(window.len(), W);
         let dwm_len = self.data_with_markers.len();
         let data_skip = self.data_prefix_len;
         let decoded_data_len = self.data.len().saturating_sub(data_skip);
         let total = dwm_len + decoded_data_len;
 
-        let mut window = [0u8; W];
-
         if total >= W {
-            let mut offset = total - W; // start within (dwm | data)
+            let mut offset = total - W;
             let mut written: usize = 0;
 
-            // Segment 1: from dataWithMarkers, mapping markers.
             if offset < dwm_len {
                 let take = (dwm_len - offset).min(W - written);
-                for i in 0..take {
-                    let v = self.data_with_markers.get(offset + i).unwrap_or(0);
-                    window[written + i] = if v >= MARKER_BASE {
-                        predecessor_window[(v - MARKER_BASE) as usize]
-                    } else {
-                        v as u8
-                    };
-                }
+                self.data_with_markers.resolve_range_into_buf(
+                    offset,
+                    take,
+                    predecessor_window,
+                    &mut window[written..written + take],
+                );
                 written += take;
                 offset = 0;
             } else {
                 offset -= dwm_len;
             }
 
-            // Segment 2: from the segmented clean `data` (decoded bytes only).
             if written < W && offset < decoded_data_len {
                 let take = (decoded_data_len - offset).min(W - written);
                 self.data
@@ -1082,39 +1087,24 @@ impl ChunkData {
             }
             debug_assert_eq!(written, W, "get_last_window underran the tail buffer");
         } else {
-            // total < W: window head comes from predecessor_window's tail.
             let from_prev = W - total;
             window[..from_prev].copy_from_slice(&predecessor_window[total..]);
             let mut written = from_prev;
 
-            for v in self.data_with_markers.iter() {
-                window[written] = if v >= MARKER_BASE {
-                    predecessor_window[(v - MARKER_BASE) as usize]
-                } else {
-                    v as u8
-                };
-                written += 1;
+            if dwm_len > 0 {
+                self.data_with_markers.resolve_range_into_buf(
+                    0,
+                    dwm_len,
+                    predecessor_window,
+                    &mut window[written..written + dwm_len],
+                );
+                written += dwm_len;
             }
             if decoded_data_len > 0 {
                 self.data
                     .copy_range_into(data_skip, &mut window[written..written + decoded_data_len]);
             }
         }
-
-        window
-    }
-
-    /// Vec-producing twin of `get_last_window`. Builds the resolved tail
-    /// window DIRECTLY into a freshly-allocated 32 KiB `Vec<u8>` so the
-    /// consumer publish path can hand ownership into the `WindowMap` via
-    /// `insert_owned_none` — one heap allocation, zero redundant memcpy.
-    /// Byte-identical to `get_last_window(predecessor_window).to_vec()`.
-    pub fn get_last_window_vec(&self, predecessor_window: &[u8]) -> Vec<u8> {
-        // FOOTPRINT-ALIGN: delegate to the array-producing `get_last_window`
-        // (now segment-aware) and box it. One 32 KiB heap copy — the same
-        // cost the prior bespoke builder paid, without duplicating the
-        // segment-walk logic.
-        self.get_last_window(predecessor_window).to_vec()
     }
 
     /// Populate the `window` field of every subchunk with the 32 KiB
@@ -1480,16 +1470,12 @@ impl ChunkData {
             .append_narrowed_iovecs(self.narrowed_len, out);
         self.data.append_payload_iovecs(self.data_prefix_len, out);
     }
-}
 
-impl Drop for ChunkData {
-    fn drop(&mut self) {
-        LIVE_CHUNKS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        // Recycle `data`'s contiguous backing allocation into the worker's
-        // u8 pool (one buffer now, warm-reused by the next chunk's
-        // `writable_tail`/`first_segment_a3_output`). There is no separate
-        // `narrowed` buffer to return — marker resolution is in place inside
-        // `data_with_markers`, which is returned to the u16 pool below.
+    /// Return decoded payload buffers to the per-worker pool immediately
+    /// after the consumer has finished writing them (vendor FasterVector
+    /// auto-recycle on `writeAll` completion). Idempotent — safe to call
+    /// again from `Drop` on an already-empty shell.
+    pub(crate) fn recycle_decoded_buffers(&mut self) {
         use crate::decompress::parallel::chunk_buffer_pool;
         let segments = self.data.take_segments();
         for seg in segments {
@@ -1497,6 +1483,14 @@ impl Drop for ChunkData {
         }
         let dwm = self.data_with_markers.take_segments();
         chunk_buffer_pool::return_marker_segments_to_worker(self.pool_worker_index, dwm);
+        self.narrowed_len = 0;
+    }
+}
+
+impl Drop for ChunkData {
+    fn drop(&mut self) {
+        LIVE_CHUNKS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.recycle_decoded_buffers();
     }
 }
 
@@ -1505,6 +1499,7 @@ impl Drop for ChunkData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decompress::parallel::replace_markers::MARKER_BASE;
 
     fn small_config() -> ChunkConfiguration {
         ChunkConfiguration {
