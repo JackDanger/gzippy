@@ -210,6 +210,89 @@ pub fn decode_block(
     // was therefore redundant AND over-eager — on literal-heavy data it refilled
     // after ~1 symbol where ISA-L decodes ~3 per refill (igzip "refill only when
     // the decode can't be guaranteed"). Removing it matches ISA-L's cadence.
+
+    // ── FASTLOOP (libdeflate/ISA-L bounds-check elision) ────────────────────
+    // While there are >= FASTLOOP_OUTPUT_MARGIN bytes of output headroom, every
+    // literal/match write this iteration (<= 3 packed literals + one match <=258
+    // = 261 bytes) is provably in-bounds, so we skip the per-symbol output bounds
+    // checks (`*out_pos >= output.len()`, `*out_pos + length > output.len()`).
+    // Fulcrum T16: gzippy's `stream_inflate` is 2.35x ISA-L busy; ISA-L's hot
+    // loop is bounds-check-free with an output margin. Validity checks (invalid
+    // Huffman, EOB, length/distance bounds) are KEPT — only the *output capacity*
+    // checks are elided. The existing safe loop below handles the tail (last
+    // <MARGIN bytes). Byte-exact: the writes are identical, only the redundant
+    // capacity checks are removed inside the proven-safe window.
+    const FASTLOOP_OUTPUT_MARGIN: usize = 384; // 3 lits + 258 match + slack; > len+48 for copy_match_fast
+    let out_ptr = output.as_mut_ptr();
+    while *out_pos + FASTLOOP_OUTPUT_MARGIN <= output.len() {
+        let decoded = scratch.litlen.decode(bits);
+        if decoded.bit_count == 0 {
+            return Err(BulkDecodeError::InvalidHuffmanCode);
+        }
+        bits.consume(decoded.bit_count);
+
+        let mut symbol = decoded.symbol;
+        let mut sym_count = decoded.sym_count;
+        if sym_count == 0 {
+            return Err(BulkDecodeError::InvalidHuffmanCode);
+        }
+
+        // Packed literal prefix (<= 3, symbol is u32) — margin guarantees room.
+        let lit_prefix = (sym_count - 1) as usize;
+        if lit_prefix > 0 {
+            let mut p = *out_pos;
+            let mut s = symbol;
+            for _ in 0..lit_prefix {
+                // SAFETY: p < *out_pos + 3 < *out_pos + MARGIN <= output.len().
+                unsafe {
+                    *out_ptr.add(p) = (s & 0xFF) as u8;
+                }
+                p += 1;
+                s >>= 8;
+            }
+            *out_pos = p;
+            symbol = s;
+            sym_count = 1;
+        }
+
+        while sym_count > 0 {
+            let code = (symbol & 0xFFFF) as u16;
+            if code as u32 <= 255 {
+                // SAFETY: *out_pos < *out_pos_at_iter_top + MARGIN <= output.len().
+                unsafe {
+                    *out_ptr.add(*out_pos) = (code & 0xFF) as u8;
+                }
+                *out_pos += 1;
+                symbol >>= 8;
+                sym_count -= 1;
+                continue;
+            }
+            if code as u32 == END_OF_BLOCK_SYMBOL {
+                return Ok(BulkBlockResult {
+                    bytes_written: *out_pos - start_pos,
+                    is_final_block,
+                });
+            }
+            if code as u32 > MAX_LIT_LEN_SYM {
+                return Err(BulkDecodeError::InvalidHuffmanCode);
+            }
+            let length = (symbol - LENGTH_BASE_OFFSET) as usize;
+            if length == 0 || length > MAX_MATCH_LENGTH {
+                return Err(BulkDecodeError::InvalidHuffmanCode);
+            }
+            let distance = decode_distance(bits, scratch)?;
+            if distance > *out_pos + predecessor_window.len() {
+                return Err(BulkDecodeError::InvalidLookback);
+            }
+            // Margin guarantees *out_pos + length (<=258) <= output.len();
+            // copy_match's own fast/slow split stays correct.
+            copy_match(output, out_pos, distance, length, predecessor_window);
+            symbol >>= 8;
+            sym_count -= 1;
+        }
+    }
+
+    // ── SAFE TAIL: bounds-checked loop for the last < MARGIN output bytes ────
     loop {
         let decoded = scratch.litlen.decode(bits);
         if decoded.bit_count == 0 {
