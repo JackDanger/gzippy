@@ -686,8 +686,13 @@ fn decode_chunk_with_rapidgzip_impl(
     // partition guesses that aren't real block boundaries), fall to the resumable
     // re-sync, kept ONLY as an internal correctness strategy (the goal's accepted
     // re-sync), never an outer fallback ladder.
-    let _ = &initial_window;
-    match decode_chunk_unified_marker(input, encoded_offset_bits, stop_hint_bits, configuration) {
+    match decode_chunk_unified_marker(
+        input,
+        encoded_offset_bits,
+        stop_hint_bits,
+        initial_window,
+        configuration,
+    ) {
         Ok(mut chunk) => {
             chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
             Ok(chunk)
@@ -726,55 +731,79 @@ fn decode_chunk_unified_marker(
     input: &[u8],
     encoded_offset_bits: usize,
     stop_hint_bits: usize,
+    initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
+    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
-    chunk.data_with_markers.reserve(128 * 1024);
     let mut marker_ctx = MarkerDecodeCtx::new(input, encoded_offset_bits)?;
 
-    // ── Phase 1: marker arm — drain u16 (markers + post-flip clean) into
-    // `data_with_markers` until the flip block boundary or chunk end. ──
-    loop {
-        let (step, flipped_clean) = marker_decode_step(
-            &mut marker_ctx,
-            input,
-            stop_hint_bits,
-            &mut chunk.data_with_markers,
-        )?;
-        if flipped_clean {
-            UNIFIED_MODE_CLEAN_FLIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        match step {
-            MarkerStep::Continue => {}
-            MarkerStep::FlipToClean { .. } => {
-                FLIP_TO_CLEAN_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
-                // Arm the single-fire flip gate and fall through to phase 2.
-                // `ctx.current_bit_offset` is already at this block boundary;
-                // the ring's window/`decoded_bytes`/clean state all persist.
-                marker_ctx.flipped = true;
-                break;
+    // WINDOW-PRESENT FAST PATH (vendor `setInitialWindow`, deflate.hpp:693): when
+    // the worker resolved a full 32 KiB predecessor window, seed it and decode
+    // CLEAN from block 0 — no markers, no flip, no marker-resolve. The old
+    // driver discarded `initial_window` and forced every non-zero chunk through
+    // full marker decode (the ~90% window-absent deviation).
+    let window_seeded = initial_window.len() == MAX_WINDOW_SIZE && window_seed_enabled();
+
+    if window_seeded {
+        WINDOW_SEEDED_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Skip phase 1; phase 2's first `marker_decode_step` primes the ring via
+        // `set_initial_window_u8` and decodes clean from the chunk start.
+        marker_ctx.flipped = true;
+    } else {
+        chunk.data_with_markers.reserve(128 * 1024);
+        // ── Phase 1: marker arm — drain u16 (markers + post-flip clean) into
+        // `data_with_markers` until the flip block boundary or chunk end. ──
+        loop {
+            let (step, flipped_clean) = marker_decode_step(
+                &mut marker_ctx,
+                input,
+                stop_hint_bits,
+                &[],
+                &mut chunk.data_with_markers,
+            )?;
+            if flipped_clean {
+                UNIFIED_MODE_CLEAN_FLIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            MarkerStep::Finished { end_bit_offset, .. } => {
-                FINISHED_NO_FLIP_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
-                chunk.finalize(end_bit_offset);
-                return Ok(chunk);
+            match step {
+                MarkerStep::Continue => {}
+                MarkerStep::FlipToClean { .. } => {
+                    FLIP_TO_CLEAN_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
+                    // Arm the single-fire flip gate and fall through to phase 2.
+                    // `ctx.current_bit_offset` is already at this block boundary;
+                    // the ring's window/`decoded_bytes`/clean state all persist.
+                    marker_ctx.flipped = true;
+                    break;
+                }
+                MarkerStep::Finished { end_bit_offset, .. } => {
+                    FINISHED_NO_FLIP_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
+                    chunk.finalize(end_bit_offset);
+                    return Ok(chunk);
+                }
             }
         }
     }
 
     // ── Phase 2: clean arm — keep decoding the SAME ring on the SAME cursor,
-    // narrowing its u16 drains to u8 into `chunk.data` (CRC + subchunk
-    // accounting via `append_clean_narrowed`). `ctx.flipped` now suppresses the
-    // top-of-loop flip return, so the step decodes normally until BFINAL or the
-    // stop-hint partition boundary. ──
+    // narrowing its u8 drains into `chunk.data` (CRC + subchunk accounting).
+    // `ctx.flipped` suppresses the top-of-loop flip return. The window-seeded
+    // path passes `initial_window` so the first step primes the ring; the
+    // natural-flip path passes `&[]` (the ring already holds its own window). ──
+    let phase2_window: &[u8] = if window_seeded { initial_window } else { &[] };
     let end_bit_offset = loop {
         let mut sink = CleanTailSink {
             chunk: &mut chunk,
             pushed: 0,
         };
-        let (step, _) = marker_decode_step(&mut marker_ctx, input, stop_hint_bits, &mut sink)?;
+        let (step, _) = marker_decode_step(
+            &mut marker_ctx,
+            input,
+            stop_hint_bits,
+            phase2_window,
+            &mut sink,
+        )?;
         match step {
             MarkerStep::Continue => {}
             // Unreachable: `ctx.flipped` gates the flip return off after phase 1.
@@ -785,6 +814,24 @@ fn decode_chunk_unified_marker(
     chunk.finalize(end_bit_offset);
     Ok(chunk)
 }
+
+/// Window-present clean-decode (vendor `setInitialWindow`) toggle.
+/// `GZIPPY_NO_WINDOW_SEED=1` (or forced-u16) reverts to the old discard-the-
+/// window marker-every-chunk behavior for one-binary A/B.
+#[cfg(parallel_sm)]
+fn window_seed_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        std::env::var_os("GZIPPY_NO_WINDOW_SEED").is_none()
+            && std::env::var_os("GZIPPY_U16_CLEAN_TAIL").is_none()
+    })
+}
+
+/// Counter: chunks that took the window-present clean-from-block-0 fast path
+/// (vendor `setInitialWindow`) instead of full marker decode.
+#[cfg(parallel_sm)]
+pub static WINDOW_SEEDED_CHUNKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Clean-tail [`MarkerSink`] for the merged phase-2 decode: narrows the
 /// post-flip u16 ring drains to u8 and appends them to `chunk.data` (CRC +
@@ -963,6 +1010,7 @@ fn marker_decode_step(
     ctx: &mut MarkerDecodeCtx,
     data: &[u8],
     stop_hint_bits: usize,
+    initial_window: &[u8],
     output: &mut impl crate::decompress::parallel::marker_inflate::MarkerSink,
 ) -> Result<(MarkerStep, bool), ChunkDecodeError> {
     use crate::decompress::parallel::isal_lut_bulk::MarkerRing;
@@ -981,6 +1029,12 @@ fn marker_decode_step(
         let mut block = cell_block.borrow_mut();
         if !ctx.block_primed {
             block.reset();
+            // Window-present fast path: seed the predecessor window so this
+            // chunk decodes clean from block 0 (vendor setInitialWindow). Only
+            // the window-seeded driver path passes a full 32 KiB window here.
+            if initial_window.len() == MAX_WINDOW_SIZE {
+                block.set_initial_window_u8(initial_window);
+            }
             ctx.block_primed = true;
         }
         let block = &mut *block;
