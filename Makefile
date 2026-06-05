@@ -282,8 +282,8 @@ bench-sm: ship-precheck
 	timeout $(BENCH_SM_TIMEOUT) $(NEUROTIC_SSH) "set -e; cd gzippy; \
 	  echo '  fetching origin/$$BRANCH...'; \
 	  $(NEUROTIC_SYNC); \
-	  echo '  building gzippy (--features isal-compression)...'; \
-	  cargo build --release --features isal-compression 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
+	  echo '  building gzippy (--features pure-rust-inflate — the SOLE pure-Rust single-member decode path, task #8)...'; \
+	  cargo build --release --no-default-features --features pure-rust-inflate 2>&1 | grep -E 'Compiling gzippy |Finished|error' || true; \
 	  RAPIDGZIP=vendor/rapidgzip/librapidarchive/build/src/tools/rapidgzip; \
 	  if [ ! -x \"\$$RAPIDGZIP\" ]; then \
 	    echo '  building rapidgzip (first time only)...'; \
