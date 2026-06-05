@@ -2301,24 +2301,17 @@ fn run_decode_task(
     };
     let window_handoff: Option<(usize, Window)> =
         if params.is_speculative_prefetch && params.start_bit > 0 {
-            if let Some((k, w)) = window_map.get_predecessor(params.stop_hint_bit) {
-                if k > params.start_bit && window_map.contains(k) {
-                    Some((k, w))
-                } else if spec_pred_clean_enabled() {
-                    // KEY-MISMATCH: no key at seed; predecessor tail is still valid.
-                    window_pred.clone().map(|w| (params.start_bit, w))
-                } else {
-                    window_map
-                        .get(params.start_bit)
-                        .map(|w| (params.start_bit, w))
-                }
-            } else if spec_pred_clean_enabled() {
-                window_pred.clone().map(|w| (params.start_bit, w))
-            } else {
-                window_map
-                    .get(params.start_bit)
-                    .map(|w| (params.start_bit, w))
-            }
+            window_map
+                .get_handoff_in_partition(params.start_bit, params.stop_hint_bit)
+                .or_else(|| {
+                    if spec_pred_clean_enabled() {
+                        window_pred.clone().map(|w| (params.start_bit, w))
+                    } else {
+                        window_map
+                            .get(params.start_bit)
+                            .map(|w| (params.start_bit, w))
+                    }
+                })
         } else {
             None
         };

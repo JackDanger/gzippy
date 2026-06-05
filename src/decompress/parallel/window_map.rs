@@ -211,6 +211,43 @@ impl WindowMap {
         self.get_predecessor(encoded_offset_bits).is_some()
     }
 
+    /// Worker-only handoff lookup for KEY-MISMATCH speculative prefetch.
+    /// Returns the largest published window key in `(low_exclusive, high_inclusive]`,
+    /// merging confirmed `entries` and worker early-published `speculative` tails.
+    /// Consumer `get_predecessor` / `contains` intentionally ignore speculative;
+    /// without this merge, handoff decode misses ~97% of predecessor windows that
+    /// exist only in the side-slot until consumer promote.
+    pub fn get_handoff_in_partition(
+        &self,
+        low_exclusive: usize,
+        high_inclusive: usize,
+    ) -> Option<(usize, Window)> {
+        use std::ops::Bound;
+        if low_exclusive >= high_inclusive {
+            return None;
+        }
+        let g = self.state.lock().unwrap();
+        let pick = |map: &BTreeMap<usize, Window>| {
+            map.range((
+                Bound::Excluded(low_exclusive),
+                Bound::Included(high_inclusive),
+            ))
+            .next_back()
+            .map(|(k, v)| (*k, v.clone()))
+        };
+        match (pick(&g.entries), pick(&g.speculative)) {
+            (Some((k1, w1)), Some((k2, w2))) => {
+                if k1 >= k2 {
+                    Some((k1, w1))
+                } else {
+                    Some((k2, w2))
+                }
+            }
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        }
+    }
+
     // ── Speculative side-slot (Design B) ──────────────────────────────
     //
     // The worker publishes a RANGE-speculative chunk's provably-clean tail
@@ -407,6 +444,25 @@ mod tests {
             "speculative entry must not count as a real entry"
         );
         assert_eq!(m.speculative_len(), 1);
+    }
+
+    #[test]
+    fn handoff_in_partition_merges_confirmed_and_speculative() {
+        let m = WindowMap::with_compression(CompressionType::None);
+        m.insert(100, window_of(0x11));
+        m.insert_speculative(5000, window_of(0x22));
+        m.insert(9000, window_of(0x33));
+        // Partition (1000, 10000]: largest key is 9000 confirmed.
+        let (k, w) = m.get_handoff_in_partition(1000, 10000).unwrap();
+        assert_eq!(k, 9000);
+        assert_eq!(w.raw_bytes()[0], 0x33);
+        // Partition (1000, 6000]: speculative 5000 wins over nothing else in range.
+        let (k2, w2) = m.get_handoff_in_partition(1000, 6000).unwrap();
+        assert_eq!(k2, 5000);
+        assert_eq!(w2.raw_bytes()[0], 0x22);
+        // Keys at or below low are excluded.
+        assert!(m.get_handoff_in_partition(5000, 10000).is_none());
+        assert!(m.get_handoff_in_partition(9000, 10000).is_none());
     }
 
     #[test]
