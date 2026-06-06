@@ -301,7 +301,7 @@ pub fn drive_clean_window_oracle<W: std::io::Write>(
 
     let _ = &seed; // (pass-1 window keys are NOT trusted for boundaries; see below)
     let total_bits = input.len() * 8;
-    let pool_size = parallelization.max(1).min(num_cpus::get_physical().max(1));
+    let pool_size = parallelization.max(1);
 
     // --- Phase A (UNTIMED): self-derive REAL block boundaries + correct dicts. ---
     // Do NOT trust the speculative pass's published window keys for span starts:
@@ -459,7 +459,7 @@ fn drive_impl<W: std::io::Write>(
     let total_bits = input.len() * 8;
     // Vendor `availableCores()` (AffinityHelpers.hpp:18-21): avoid pinning
     // more workers than physical cores — SMT siblings collide on cache.
-    let pool_size = parallelization.max(1).min(num_cpus::get_physical().max(1));
+    let pool_size = parallelization.max(1);
 
     // ── m_blockFinder (vendor GzipChunkFetcher.hpp:283) ─────────────
     let block_finder = Arc::new(GzipBlockFinder::new(
