@@ -1499,14 +1499,6 @@ fn consumer_loop<W: std::io::Write>(
                     window_map,
                     false,
                 );
-                trace_v2::emit_instant(
-                    "causal.window_publish",
-                    &format!(
-                        r#""start_bit":{},"end_bit":{chunk_end_bit},"site":"consumer_clean""#,
-                        chunk.encoded_offset_bits
-                    ),
-                    "t",
-                );
                 // TRANSLITERATION (vendor `queuePrefetchedChunkPostProcessing`,
                 // GzipChunkFetcher.hpp:520-551, called from waitForReplacedMarkers:513
                 // on EVERY consumed chunk): full sorted scan of the prefetch cache,
@@ -1600,14 +1592,6 @@ fn consumer_loop<W: std::io::Write>(
                 &window_bytes,
                 window_map,
                 true,
-            );
-            trace_v2::emit_instant(
-                "causal.window_publish",
-                &format!(
-                    r#""start_bit":{},"end_bit":{chunk_end_bit},"site":"consumer_marker""#,
-                    chunk.encoded_offset_bits
-                ),
-                "t",
             );
             // TRANSLITERATION (vendor queuePrefetchedChunkPostProcessing, full sorted
             // scan on every consumed chunk; see clean-branch note above). `None`
@@ -2460,6 +2444,14 @@ fn consumer_publish_end_window_if_absent(
                 .unwrap_or_else(|| chunk.get_last_window_vec(predecessor_bytes))
         };
         window_map.insert_owned_none(chunk_end_bit, tail);
+        trace_v2::emit_instant(
+            "causal.window_publish",
+            &format!(
+                r#""start_bit":{},"end_bit":{chunk_end_bit},"site":"consumer","had_markers":{had_markers}"#,
+                chunk.encoded_offset_bits
+            ),
+            "t",
+        );
     }
 }
 
@@ -2595,8 +2587,13 @@ fn queue_prefetched_marker_postprocess(
             let chunk_end_bit = arc.encoded_offset_bits + arc.encoded_size_bits;
             if !window_map.contains(chunk_end_bit) {
                 let pred_bytes = materialize_window(&predecessor_window);
-                let end_window = arc.get_last_window(pred_bytes.as_ref());
-                window_map.insert_owned_none(chunk_end_bit, end_window.to_vec());
+                consumer_publish_end_window_if_absent(
+                    arc.as_ref(),
+                    chunk_end_bit,
+                    &pred_bytes,
+                    window_map,
+                    !arc.data_with_markers.is_empty(),
+                );
                 PUBLISH_AHEAD_WINDOWS.fetch_add(1, Ordering::Relaxed);
                 EARLY_WINDOW_PUBLISHED.fetch_add(1, Ordering::Relaxed);
             }
