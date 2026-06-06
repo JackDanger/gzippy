@@ -38,6 +38,8 @@ echo "=== Stage guest_fulcrum_capture.sh on host + guest ==="
 echo "=== Host lock + gate + guest capture (branch=$BRANCH T=$THREADS N=$N) ==="
 EXTRA_ARGS=""
 [ -n "${GZIPPY_SLOW_BOOTSTRAP:-}" ] && EXTRA_ARGS="$EXTRA_ARGS SLOW_BOOTSTRAP=${GZIPPY_SLOW_BOOTSTRAP}"
+[ -n "${GZIPPY_SLOW_MODE:-}" ] && EXTRA_ARGS="$EXTRA_ARGS SLOW_MODE=${GZIPPY_SLOW_MODE}"
+[ -n "${GZIPPY_SLOW_KIND:-}" ] && EXTRA_ARGS="$EXTRA_ARGS SLOW_KIND=${GZIPPY_SLOW_KIND}"
 "${NEUROTIC[@]}" "GUEST_SCRIPT=guest_fulcrum_capture.sh bash $BENCH_HOST_DIR/host_lock_and_bench.sh \
   BRANCH=${BRANCH} THREADS='${THREADS}' N=${N}${EXTRA_ARGS}" 2>&1 | tee "$ART_LOCAL/host-guest.log"
 
