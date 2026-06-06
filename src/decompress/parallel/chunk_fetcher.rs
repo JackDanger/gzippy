@@ -1586,105 +1586,25 @@ fn consumer_loop<W: std::io::Write>(
             predecessor_window_for_postprocess = Some(window);
         }
 
-        // Vendor GzipChunkFetcher.hpp:357 —
-        //   `appendSubchunksToIndexes(chunkData, chunkData->subchunks(), *lastWindow);`
-        // Pushes subchunks into BlockMap (line 373) and BlockFinder
-        // (line 374).
-        append_subchunks_to_block_map(block_map, chunk);
-        if chunk.subchunks.is_empty() {
-            block_finder.insert(chunk_end_bit);
-        } else {
-            for sc in &chunk.subchunks {
-                block_finder.insert(sc.encoded_offset_bits + sc.encoded_size_bits);
-            }
-        }
-        // Vendor GzipChunkFetcher.hpp:380-382 — when the chunk produced
-        // multiple subchunks, the fetching strategy's index accounting
-        // (in CHUNK units) needs to be re-stretched into SUBCHUNK units
-        // so it matches `block_offsets.len()`. Without this, the
-        // strategy's `prefetch()` returns chunk-indexes that are ALREADY
-        // in `block_offsets` — the BlockFinder returns them as
-        // confirmed sub-partition offsets and `prefetch_new_blocks`
-        // emits sub-partition prefetches that vendor never emits.
-        // See `BlockFetcher::split_index` doc comment for the full
-        // chain. Empirically: 26 sub-partition emits per silesia-large
-        // run worth ~50 ms wall.
-        if chunk.subchunks.len() > 1 {
-            block_fetcher.split_index(next_unprocessed_block_index, chunk.subchunks.len());
-        }
-
-        // Vendor `appendSubchunksToIndexes` continued
-        // (GzipChunkFetcher.hpp:380-396): when a chunk produced multiple
-        // subchunks, record each *internal* subchunk's offset → parent
-        // chunk cache-key in `m_unsplitBlocks`. The seek consumer
-        // (`getIndexedChunk` at `:264-289`) consults this map to
-        // resolve a request for an internal subchunk offset back to
-        // its parent chunk in cache. Single-pass streaming never
-        // hits this lookup; the emplace is structural scaffolding for
-        // the seekable-reader path.
-        if chunk.subchunks.len() > 1 {
-            // Vendor `:384-389` — `lookupKey` is the cache key under
-            // which the parent chunk is findable, which can be EITHER
-            // the chunk's actual encoded offset OR the partition
-            // offset, depending on which one the cache holds:
-            //   if !test(chunkOffset) && test(partitionOffset):
-            //       partitionOffset
-            //   else:
-            //       chunkOffset
-            // The prefetch-take path inserts under the partition
-            // offset, so a chunk that came off the prefetch queue at a
-            // speculative partition seed has its parent keyed under
-            // partitionOffset, not its actual chunkOffset.
-            let chunk_offset = handoff_bit;
-            let partition_offset = block_finder.partition_offset_containing_offset(chunk_offset);
-            let lookup_key =
-                if !block_fetcher.test(&chunk_offset) && block_fetcher.test(&partition_offset) {
-                    partition_offset
-                } else {
-                    chunk_offset
-                };
-            let mut unsplit = unsplit_blocks.lock().unwrap();
-            for sc in &chunk.subchunks {
-                if sc.encoded_offset_bits != chunk_offset {
-                    // Vendor uses `emplace` (insert-if-absent — does
-                    // not overwrite). Match that semantic.
-                    use std::collections::hash_map::Entry;
-                    if let Entry::Vacant(v) = unsplit.entry(sc.encoded_offset_bits) {
-                        v.insert(lookup_key);
-                        UNSPLIT_BLOCKS_EMPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-
-        // Vendor GzipChunkFetcher.hpp:359 — `m_statistics.merge(*chunkData)`.
-        block_fetcher.statistics.base.record_get();
-
-        // Vendor GzipChunkFetcher.hpp:410 — `m_nextUnprocessedBlockIndex += subchunks.size()`.
-        let inserted = chunk.subchunks.len().max(1);
-        next_unprocessed_block_index += inserted;
-
-        // Hand off to post-process worker if there are markers; else
-        // queue as immediately-ready for ordered write.
+        // Vendor GzipChunkFetcher.hpp:343-357 — `postProcessChunk` (blocking
+        // `future.get()` on pool `applyWindow`), then `setEncodedOffset`, then
+        // `appendSubchunksToIndexes`. Previously gzippy appended BEFORE
+        // post-process and queued Async writes — ordering skew vs vendor and
+        // measured publish-chain inflation (Fulcrum L_resolve / dispatch_recv).
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.dispatch_post_process");
             harvest_ready_postprocess(&mut prefetch_post_inflight, &mut eager_completed);
-            let (chunk, eager_already_done) = chunk_holder.into_chunk_data(
+            let (mut chunk, eager_already_done) = chunk_holder.into_chunk_data(
                 &mut prefetch_post_inflight,
                 &mut eager_completed,
                 consumer_pred_key,
             );
             let pool_resolved = chunk_matches_consumer_pred(&chunk, consumer_pred_key);
-            match predecessor_window_for_postprocess {
-                Some(_window) if eager_already_done || pool_resolved => {
-                    pending.push_back(PendingWrite::Ready {
-                        idx: partition_idx_for_trace,
-                        chunk,
-                        cache_key: next_block_offset,
-                        handoff_bit,
-                    });
-                }
-                Some(window) => {
+            if let Some(window) = predecessor_window_for_postprocess {
+                if !(eager_already_done || pool_resolved)
+                    && !chunk.data_with_markers.is_empty()
+                    && !chunk.markers_resolved
+                {
                     use std::sync::atomic::Ordering;
                     let reuse = match prefetch_post_inflight.remove(&chunk_offset_pre_set) {
                         Some((eager_pred_key, _, eager_rx))
@@ -1712,22 +1632,52 @@ fn consumer_loop<W: std::io::Write>(
                             partition_idx_for_trace,
                         ),
                     };
-                    pending.push_back(PendingWrite::Async {
-                        idx: partition_idx_for_trace,
-                        rx,
-                        cache_key: next_block_offset,
-                        handoff_bit,
-                    });
-                }
-                None => {
-                    pending.push_back(PendingWrite::Ready {
-                        idx: partition_idx_for_trace,
-                        chunk,
-                        cache_key: next_block_offset,
-                        handoff_bit,
-                    });
+                    // Vendor GzipChunkFetcher.hpp:513 — queue successor
+                    // post-processing while blocking on the head future.
+                    queue_prefetched_marker_postprocess(
+                        block_fetcher,
+                        window_map,
+                        thread_pool,
+                        &mut prefetch_post_inflight,
+                        &[],
+                        &[],
+                    );
+                    let _tv2_wait = trace_v2::SpanGuard::begin_with(
+                        "wait.future_recv",
+                        &format!(r#""chunk_id":{partition_idx_for_trace}"#),
+                    );
+                    chunk = rx.recv().map_err(|_| {
+                        FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+                            requested: partition_idx_for_trace,
+                            actual: 0,
+                        })
+                    })?;
                 }
             }
+            // Vendor `setEncodedOffset(*nextBlockOffset)` after post-process.
+            if chunk.encoded_offset_bits != handoff_bit && chunk.matches_encoded_offset(handoff_bit)
+            {
+                use std::sync::atomic::Ordering;
+                REANCHOR_AFTER_POSTPROCESS.fetch_add(1, Ordering::Relaxed);
+                chunk.set_encoded_offset(handoff_bit);
+            }
+            let inserted = consumer_append_subchunks_vendor(
+                block_map,
+                block_finder,
+                block_fetcher,
+                &chunk,
+                handoff_bit,
+                chunk_end_bit,
+                next_unprocessed_block_index,
+                unsplit_blocks,
+            );
+            next_unprocessed_block_index += inserted;
+            pending.push_back(PendingWrite::Ready {
+                idx: partition_idx_for_trace,
+                chunk,
+                cache_key: next_block_offset,
+                handoff_bit,
+            });
         }
 
         // Vendor parity: write each post-process-complete chunk as soon as
@@ -2624,6 +2574,56 @@ fn narrow_u16_to_u8(src: &[u16], dst: &mut crate::decompress::parallel::rpmalloc
     }
 }
 
+/// Vendor `appendSubchunksToIndexes` body (GzipChunkFetcher.hpp:357-396):
+/// BlockMap push, BlockFinder insert, split_index, unsplitBlocks emplace.
+/// Must run AFTER `postProcessChunk` and `setEncodedOffset` return.
+#[cfg(parallel_sm)]
+#[allow(clippy::too_many_arguments)]
+fn consumer_append_subchunks_vendor(
+    block_map: &BlockMap,
+    block_finder: &GzipBlockFinder,
+    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
+    chunk: &ChunkData,
+    handoff_bit: usize,
+    chunk_end_bit: usize,
+    next_unprocessed_block_index: usize,
+    unsplit_blocks: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, usize>>>,
+) -> usize {
+    append_subchunks_to_block_map(block_map, chunk);
+    if chunk.subchunks.is_empty() {
+        block_finder.insert(chunk_end_bit);
+    } else {
+        for sc in &chunk.subchunks {
+            block_finder.insert(sc.encoded_offset_bits + sc.encoded_size_bits);
+        }
+    }
+    if chunk.subchunks.len() > 1 {
+        block_fetcher.split_index(next_unprocessed_block_index, chunk.subchunks.len());
+    }
+    if chunk.subchunks.len() > 1 {
+        let chunk_offset = handoff_bit;
+        let partition_offset = block_finder.partition_offset_containing_offset(chunk_offset);
+        let lookup_key =
+            if !block_fetcher.test(&chunk_offset) && block_fetcher.test(&partition_offset) {
+                partition_offset
+            } else {
+                chunk_offset
+            };
+        let mut unsplit = unsplit_blocks.lock().unwrap();
+        for sc in &chunk.subchunks {
+            if sc.encoded_offset_bits != chunk_offset {
+                use std::collections::hash_map::Entry;
+                if let Entry::Vacant(v) = unsplit.entry(sc.encoded_offset_bits) {
+                    v.insert(lookup_key);
+                    UNSPLIT_BLOCKS_EMPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    block_fetcher.statistics.base.record_get();
+    chunk.subchunks.len().max(1)
+}
+
 /// Consumer-thread publication of per-subchunk tail windows. Mirror of
 /// vendor `appendSubchunksToIndexes` (GzipChunkFetcher.hpp:429-458).
 #[cfg(parallel_sm)]
@@ -3339,22 +3339,6 @@ fn drain_one_pending<W: std::io::Write>(
     };
     let recv_us = t_recv.elapsed().as_micros();
 
-    // Vendor GzipChunkFetcher.hpp:334-349 — `postProcessChunk` runs BEFORE
-    // `setEncodedOffset`. Resolve any still-unresolved marker bytes first.
-    if !chunk.data_with_markers.is_empty() && !chunk.markers_resolved {
-        let Some((pred_key, predecessor_window)) =
-            confirmed_predecessor_window(window_map, handoff_bit)
-        else {
-            return Err(FetchError::Decode(ChunkDecodeError::BootstrapFailed(
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("predecessor window missing at emit (handoff_bit={handoff_bit})"),
-                ),
-            )));
-        };
-        let bytes = materialize_window(&predecessor_window);
-        resolve_chunk_markers_on_chunk(&mut chunk, pred_key, bytes.as_ref());
-    }
     if std::env::var_os("GZIPPY_TRACE_DRAIN").is_some() {
         eprintln!(
             "[trace_drain] idx={idx} enc={} handoff={} narrowed_len={} \
@@ -3367,16 +3351,8 @@ fn drain_one_pending<W: std::io::Write>(
         );
     }
 
-    // Re-anchor AFTER post-process (vendor order). Do NOT clear
-    // `markers_resolved` — gzippy previously set it false here, leaving stale
-    // `narrowed_len` and corrupting output under early lone emit.
-    if chunk.encoded_offset_bits != handoff_bit && chunk.matches_encoded_offset(handoff_bit) {
-        use std::sync::atomic::Ordering;
-        REANCHOR_AFTER_POSTPROCESS.fetch_add(1, Ordering::Relaxed);
-        chunk.set_encoded_offset(handoff_bit);
-    }
-
-    // Vendor `appendSubchunksToIndexes` window emplace — orchestrator only.
+    // Subchunk window publish at drain (post-process + setEncodedOffset +
+    // appendSubchunks already ran in `consumer_loop`).
     let t_pub = std::time::Instant::now();
     {
         let _tv2 = trace_v2::SpanGuard::begin("consumer.publish_windows");
