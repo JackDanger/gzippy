@@ -21,10 +21,12 @@
 
 use std::sync::Arc;
 
+use crate::decompress::parallel::compressed_vector::{CompressedVector, CompressionType};
 use crate::decompress::parallel::crc32::CRC32Calculator;
 use crate::decompress::parallel::rpmalloc_alloc::types::U8;
 use crate::decompress::parallel::segmented_buffer::SegmentedU8;
 use crate::decompress::parallel::segmented_markers::SegmentedU16;
+use crate::decompress::parallel::window_map::Window;
 
 /// One deflate-block-aligned slice of a chunk's decoded output.
 /// Port of `rapidgzip::ChunkData::Subchunk` (ChunkData.hpp:138-145).
@@ -34,9 +36,15 @@ pub struct Subchunk {
     pub encoded_size_bits: usize,
     pub decoded_offset: usize,
     pub decoded_size: usize,
-    /// The 32-KiB window the deflate decoder needed at this subchunk's
-    /// start. Populated after sequential window propagation completes.
-    pub window: Option<Arc<[u8; 32768]>>,
+    /// Compressed 32 KiB window at this subchunk's end (vendor
+    /// `Subchunk::window` = `SharedWindow`, ChunkData.hpp:143).
+    pub window: Option<Window>,
+    /// Vendor `Subchunk::newlineCount` (ChunkData.hpp:142).
+    pub newline_count: Option<usize>,
+    /// Vendor `Subchunk::usedWindowSymbols` (ChunkData.hpp:144). Populated at
+    /// subchunk split/finalize via `getUsedWindowSymbols`; cleared in
+    /// `populate_subchunk_windows` after sparsity is applied.
+    pub used_window_symbols: Vec<bool>,
 }
 
 /// Per-chunk timing + counter statistics. Subset of rapidgzip's
@@ -69,6 +77,10 @@ pub struct ChunkConfiguration {
     /// `ParallelGzipReader.hpp:292`.
     pub max_decoded_chunk_size: usize,
     pub crc32_enabled: bool,
+    /// Vendor `Configuration::windowSparsity` (ChunkData.hpp:104).
+    pub window_sparsity: bool,
+    /// Vendor `Configuration::windowCompressionType` (ChunkData.hpp:103).
+    pub window_compression_type: Option<CompressionType>,
 }
 
 impl Default for ChunkConfiguration {
@@ -78,6 +90,8 @@ impl Default for ChunkConfiguration {
             split_chunk_size: split,
             max_decoded_chunk_size: 20 * split,
             crc32_enabled: true,
+            window_sparsity: true,
+            window_compression_type: None,
         }
     }
 }
@@ -351,6 +365,8 @@ impl ChunkData {
             decoded_offset: 0,
             decoded_size: 0,
             window: None,
+            newline_count: None,
+            used_window_symbols: Vec::new(),
         };
         Self {
             encoded_offset_bits,
@@ -407,6 +423,8 @@ impl ChunkData {
                 decoded_offset: 0,
                 decoded_size: 0,
                 window: None,
+                newline_count: None,
+                used_window_symbols: Vec::new(),
             }]
         } else {
             subchunks
@@ -463,7 +481,8 @@ impl ChunkData {
             return None;
         }
         // `data` is the chunk's clean decoded suffix (segmented).
-        let decoded_data_len = self.data.len();
+        let data_skip = self.data_prefix_len;
+        let decoded_data_len = self.data.len().saturating_sub(data_skip);
         let mut out = [0u8; W];
         if decoded_data_len >= W {
             self.data.copy_last_32k(&mut out);
@@ -511,7 +530,8 @@ impl ChunkData {
         if total == 0 {
             return None;
         }
-        let decoded_data_len = self.data.len();
+        let data_skip = self.data_prefix_len;
+        let decoded_data_len = self.data.len().saturating_sub(data_skip);
         if decoded_data_len >= W {
             return Some(self.data.copy_last_32k_vec());
         }
@@ -546,7 +566,32 @@ impl ChunkData {
 
     #[inline]
     pub fn decoded_size(&self) -> usize {
-        self.data_with_markers.len() + self.data.len().saturating_sub(self.data_prefix_len)
+        let marker_bytes = if self.narrowed_len > 0 {
+            self.narrowed_len
+        } else {
+            self.data_with_markers.len()
+        };
+        marker_bytes + self.data.len().saturating_sub(self.data_prefix_len)
+    }
+
+    /// Vendor `ChunkData::containsMarkers` — any unresolved marker symbol in
+    /// `data_with_markers` (values ≥ `MARKER_BASE`).
+    #[inline]
+    pub fn contains_markers(&self) -> bool {
+        !self.data_with_markers.is_empty() && !self.data_with_markers.all_resolved()
+    }
+
+    /// Vendor `ChunkData::hasBeenPostProcessed` (ChunkData.hpp:496-501).
+    /// `require_newline_count` mirrors `configuration.newlineCharacter.has_value()`.
+    #[inline]
+    pub fn has_been_post_processed(&self, require_newline_count: bool) -> bool {
+        !self.subchunks.is_empty()
+            && !self.contains_markers()
+            && self.subchunks.iter().all(|sc| {
+                sc.window.is_some()
+                    && sc.used_window_symbols.is_empty()
+                    && (sc.newline_count.is_some() || !require_newline_count)
+            })
     }
 
     #[inline]
@@ -780,10 +825,84 @@ impl ChunkData {
     /// vice versa for empty dynamic blocks at the same decoded pos), so
     /// dedupping on encoded-only loses information.
     #[allow(dead_code)] // vendor parity or unit-test surface
+    /// Vendor `minimumSplitChunkSize` (ChunkData.hpp:516-518).
+    #[inline]
+    pub fn minimum_split_chunk_size(&self) -> usize {
+        self.configuration.split_chunk_size / 4
+    }
+
+    /// Vendor `ChunkData::windowCompressionType` (ChunkData.hpp:197-207).
+    pub fn window_compression_type(&self) -> CompressionType {
+        if let Some(ct) = self.configuration.window_compression_type {
+            return ct;
+        }
+        if self.configuration.window_sparsity
+            || self.decoded_size().saturating_mul(8) > self.encoded_size_bits.saturating_mul(2)
+        {
+            CompressionType::Zlib
+        } else {
+            CompressionType::None
+        }
+    }
+
+    /// Vendor `GzipChunk::determineUsedWindowSymbolsForLastSubchunk`
+    /// (chunkdecoding/GzipChunk.hpp:61-97).
+    fn determine_used_window_symbols_for_last_subchunk(&mut self, deflate_data: &[u8]) {
+        if !self.configuration.window_sparsity {
+            return;
+        }
+        let Some(last) = self.subchunks.last_mut() else {
+            return;
+        };
+        if last.encoded_size_bits == 0 {
+            return;
+        }
+        let start_bit = last
+            .encoded_offset_bits
+            .saturating_add(last.encoded_size_bits);
+        last.used_window_symbols =
+            crate::decompress::parallel::used_window_symbols::get_used_window_symbols(
+                deflate_data,
+                start_bit,
+            );
+        if last.used_window_symbols.iter().all(|&used| !used) {
+            last.used_window_symbols.clear();
+        }
+    }
+
+    /// Vendor `GzipChunk::finalizeWindowForLastSubchunk` (GzipChunk.hpp:100-133).
+    fn finalize_window_for_last_subchunk(&mut self, deflate_data: Option<&[u8]>) {
+        if let Some(data) = deflate_data {
+            self.determine_used_window_symbols_for_last_subchunk(data);
+        }
+    }
+
+    /// Vendor `GzipChunk::finalizeChunk` small-subchunk merge (GzipChunk.hpp:141-153).
+    fn merge_small_trailing_subchunk_if_needed(&mut self) {
+        if self.subchunks.len() < 2 {
+            return;
+        }
+        let min_size = self.minimum_split_chunk_size();
+        let Some(last) = self.subchunks.last() else {
+            return;
+        };
+        if last.decoded_size >= min_size {
+            return;
+        }
+        let last = self.subchunks.pop().expect("len >= 2");
+        if let Some(prev) = self.subchunks.last_mut() {
+            prev.encoded_size_bits += last.encoded_size_bits;
+            prev.decoded_size += last.decoded_size;
+            prev.used_window_symbols.clear();
+            prev.window = None;
+        }
+    }
+
     pub fn append_block_boundary_at(
         &mut self,
         encoded_offset_bits: usize,
         decoded_offset: usize,
+        deflate_data: Option<&[u8]>,
     ) -> bool {
         // Rapidgzip's appendDeflateBlockBoundary at ChunkData.hpp:459-461:
         //   blockBoundaries.empty()
@@ -840,6 +959,7 @@ impl ChunkData {
             debug_assert!(encoded_offset_bits >= last.encoded_offset_bits);
             last.encoded_size_bits = encoded_offset_bits - last.encoded_offset_bits;
         }
+        self.finalize_window_for_last_subchunk(deflate_data);
         self.next_subchunk_start_decoded_offset = decoded_offset;
         self.subchunks.push(Subchunk {
             encoded_offset_bits,
@@ -847,6 +967,8 @@ impl ChunkData {
             decoded_offset,
             decoded_size: 0,
             window: None,
+            newline_count: None,
+            used_window_symbols: Vec::new(),
         });
         true
     }
@@ -882,6 +1004,8 @@ impl ChunkData {
             encoded_size_bits: self.encoded_size_bits,
             decoded_size,
             window: None,
+            newline_count: None,
+            used_window_symbols: Vec::new(),
         };
         if n_blocks <= 1 || self.subchunks.is_empty() {
             return vec![whole_chunk];
@@ -940,6 +1064,8 @@ impl ChunkData {
                 encoded_size_bits: closest_enc - last_boundary_enc,
                 decoded_size: closest_dec - last_boundary_dec,
                 window: None,
+                newline_count: None,
+                used_window_symbols: Vec::new(),
             });
             last_boundary_enc = closest_enc;
             last_boundary_dec = closest_dec;
@@ -957,6 +1083,8 @@ impl ChunkData {
                 encoded_size_bits: encoded_end_offset_bits - last_boundary_enc,
                 decoded_size: decoded_size - last_boundary_dec,
                 window: None,
+                newline_count: None,
+                used_window_symbols: Vec::new(),
             });
         } else if last_boundary_dec == decoded_size {
             if let Some(last) = result.last_mut() {
@@ -1073,165 +1201,115 @@ impl ChunkData {
              (vendor DecodedData.hpp:402: `DecodedVector window( MAX_WINDOW_SIZE )`)"
         );
         debug_assert_eq!(window.len(), W);
-        let dwm_len = self.data_with_markers.len();
-        let data_skip = self.data_prefix_len;
-        let decoded_data_len = self.data.len().saturating_sub(data_skip);
-        let total = dwm_len + decoded_data_len;
+        self.copy_window_at_chunk_offset(predecessor_window, self.decoded_size(), window);
+    }
 
-        if dwm_len == 0 {
-            if decoded_data_len >= W {
-                self.data.copy_last_into(window);
-                return;
-            }
-            if data_skip == 0 {
-                let from_prev = W - decoded_data_len;
-                window[..from_prev].copy_from_slice(&predecessor_window[decoded_data_len..]);
-                if decoded_data_len > 0 {
-                    self.data.copy_range_into(0, &mut window[from_prev..]);
-                }
-                return;
-            }
-        }
+    /// Port of `DecodedData::getWindowAt(previousWindow, skipBytes)`.
+    /// `chunk_offset` is a byte index into this chunk's decoded output
+    /// (0 = first emitted byte). Returns the 32 KiB window immediately
+    /// preceding that offset in `predecessor_window ‖ markers ‖ data`.
+    fn copy_window_at_chunk_offset(
+        &self,
+        predecessor_window: &[u8],
+        chunk_offset: usize,
+        out: &mut [u8],
+    ) {
+        const W: usize = 32768;
+        debug_assert_eq!(out.len(), W);
 
-        if total >= W {
-            let mut offset = total - W;
-            let mut written: usize = 0;
-
-            if offset < dwm_len {
-                let take = (dwm_len - offset).min(W - written);
-                self.data_with_markers.resolve_range_into_buf(
-                    offset,
-                    take,
-                    predecessor_window,
-                    &mut window[written..written + take],
-                );
-                written += take;
-                offset = 0;
-            } else {
-                offset -= dwm_len;
-            }
-
-            if written < W && offset < decoded_data_len {
-                let take = (decoded_data_len - offset).min(W - written);
-                self.data
-                    .copy_range_into(data_skip + offset, &mut window[written..written + take]);
-                written += take;
-            }
-            debug_assert_eq!(written, W, "get_last_window underran the tail buffer");
+        let marker_len = if self.narrowed_len > 0 {
+            self.narrowed_len
         } else {
-            let from_prev = W - total;
-            window[..from_prev].copy_from_slice(&predecessor_window[total..]);
-            let mut written = from_prev;
+            self.data_with_markers.len()
+        };
+        let data_skip = self.data_prefix_len;
+        let payload_len = self.data.len().saturating_sub(data_skip);
 
-            if dwm_len > 0 {
-                self.data_with_markers.resolve_range_into_buf(
-                    0,
-                    dwm_len,
-                    predecessor_window,
-                    &mut window[written..written + dwm_len],
-                );
-                written += dwm_len;
-            }
-            if decoded_data_len > 0 {
-                self.data
-                    .copy_range_into(data_skip, &mut window[written..written + decoded_data_len]);
+        // Fast path: clean-only payload with enough bytes — one tail memcpy.
+        if marker_len == 0 && payload_len >= W && chunk_offset >= payload_len {
+            self.data.copy_last_into(out);
+            return;
+        }
+
+        let needed_start = chunk_offset;
+        let mut written: usize = 0;
+
+        if needed_start < W {
+            let take = (W - needed_start).min(W - written);
+            out[written..written + take]
+                .copy_from_slice(&predecessor_window[needed_start..needed_start + take]);
+            written += take;
+        }
+
+        if written < W && marker_len > 0 {
+            let abs = needed_start + written;
+            let m_off = abs.saturating_sub(W);
+            if m_off < marker_len {
+                let take = (marker_len - m_off).min(W - written);
+                if self.narrowed_len > 0 {
+                    self.data_with_markers.copy_narrowed_u8_range_into(
+                        m_off,
+                        take,
+                        &mut out[written..written + take],
+                    );
+                } else {
+                    self.data_with_markers.resolve_range_into_buf(
+                        m_off,
+                        take,
+                        predecessor_window,
+                        &mut out[written..written + take],
+                    );
+                }
+                written += take;
             }
         }
+
+        if written < W {
+            let abs = needed_start + written;
+            let data_off = abs.saturating_sub(W + marker_len);
+            if data_off < payload_len {
+                let take = (payload_len - data_off).min(W - written);
+                self.data
+                    .copy_range_into(data_skip + data_off, &mut out[written..written + take]);
+                written += take;
+            }
+        }
+        debug_assert_eq!(written, W, "copy_window_at_chunk_offset underran");
     }
 
     /// Populate the `window` field of every subchunk with the 32 KiB
     /// window required to resume decode at that subchunk's start.
-    /// Must be called AFTER markers in the chunk's marker-prefix have
-    /// been resolved into `dwm_bytes` — the per-subchunk windows are
-    /// derived from the chunk's own resolved output prefixed by the
-    /// predecessor's tail window.
-    ///
-    /// `dwm_bytes` must be the resolved u8 bytes of the chunk's
-    /// marker-prefix (the buffer the consumer will later write to the
-    /// output). It may have been produced by either
-    /// `apply_window` + `narrow_u16_to_u8` (two-pass small-chunk
-    /// path) or `replace_markers_lut_narrow` (fused large-chunk path,
-    /// vendor `DecodedData.hpp:316-337`); in either case
-    /// `chunk.data_with_markers` is irrelevant to this routine.
+    /// Must run AFTER `merge_resolved_markers_into_data` so
+    /// `getWindowAt` walks unified `data` (vendor post-swap order).
     ///
     /// Literal port of the window-emplacement step in rapidgzip's
     /// `appendSubchunksToIndexes` cascade
-    /// (vendor/.../GzipChunkFetcher.hpp:560-580): for each subchunk's
-    /// `decodedOffset`, the window is the 32 KiB immediately preceding
-    /// that offset in the concatenated `predecessor_window ++ dwm_bytes ++ data`.
+    /// (vendor/.../GzipChunkFetcher.hpp:560-580).
     pub fn populate_subchunk_windows(&mut self, predecessor_window: &[u8]) {
         const W: usize = 32768;
         debug_assert_eq!(predecessor_window.len(), W);
-        let data_skip = self.data_prefix_len;
-        let decoded_data_len = self.data.len().saturating_sub(data_skip);
+        debug_assert_eq!(
+            self.narrowed_len, 0,
+            "populate_subchunk_windows after merge_resolved_markers_into_data"
+        );
+        let compression = self.window_compression_type();
+        let offsets: Vec<usize> = self.subchunks.iter().map(|sc| sc.decoded_offset).collect();
 
-        let dwm_len = self.narrowed_len;
-
-        for sc in self.subchunks.iter_mut() {
-            // Build window for offset `sc.decoded_offset`. Source bytes
-            // come from (predecessor_window | dwm_bytes | data), taking
-            // the last 32 KiB before `sc.decoded_offset` — i.e., from
-            // absolute index `sc.decoded_offset` (in the concatenated
-            // source after `predecessor_window`) over `W` bytes.
-            //
-            // Vendor parity: `DecodedData::getWindowAt`
-            // (vendor/.../DecodedData.hpp:401-490) walks the same
-            // (previousWindow | dataWithMarkers chunks | data chunks)
-            // concatenation. Vendor's C++ loops over per-chunk inner
-            // segments because DecodedData stores both `data` and
-            // `dataWithMarkers` as `std::vector<FasterVector<...>>`
-            // (lists of contiguous buffers). gzippy's single-Vec layout
-            // for both fields lets us replace vendor's element loops
-            // with three `copy_from_slice` calls — same total work as
-            // the C++, just expressed as bulk memcpys the compiler can
-            // forward to SSE/AVX `mov`s instead of the previous
-            // per-byte `match abs { … }` chain.
+        for (i, &decoded_offset) in offsets.iter().enumerate() {
             let mut window = [0u8; W];
-            let needed_start = sc.decoded_offset; // see ascii diagram above
-            let mut written: usize = 0;
+            self.copy_window_at_chunk_offset(predecessor_window, decoded_offset, &mut window);
 
-            // Segment 1: bytes from `predecessor_window[needed_start..W]`.
-            if needed_start < W {
-                let take = W - needed_start;
-                let take = take.min(W - written);
-                window[written..written + take]
-                    .copy_from_slice(&predecessor_window[needed_start..needed_start + take]);
-                written += take;
-            }
-
-            // Segment 2: in-place-narrowed marker bytes.
-            if written < W && dwm_len > 0 {
-                let abs = needed_start + written;
-                let dwm_offset = abs.saturating_sub(W);
-                if dwm_offset < dwm_len {
-                    let take = (dwm_len - dwm_offset).min(W - written);
-                    self.data_with_markers.copy_narrowed_u8_range_into(
-                        dwm_offset,
-                        take,
-                        &mut window[written..written + take],
-                    );
-                    written += take;
+            // Vendor `ChunkData::applyWindow` sparsity (ChunkData.hpp:341-345).
+            let sc = &mut self.subchunks[i];
+            if sc.used_window_symbols.len() == W {
+                for (j, used) in sc.used_window_symbols.iter().enumerate() {
+                    if !used {
+                        window[j] = 0;
+                    }
                 }
             }
-
-            // Segment 3: bytes from the segmented clean `data`.
-            if written < W {
-                let abs = needed_start + written;
-                let data_offset = abs.saturating_sub(W + dwm_len);
-                if data_offset < decoded_data_len {
-                    let take = (decoded_data_len - data_offset).min(W - written);
-                    self.data.copy_range_into(
-                        data_skip + data_offset,
-                        &mut window[written..written + take],
-                    );
-                    written += take;
-                }
-            }
-            // Trailing bytes (if subchunk extends past decoded `data`) stay
-            // zero — matches the previous `unwrap_or(0)` fallback.
-            let _ = written;
-
-            sc.window = Some(Arc::new(window));
+            sc.used_window_symbols.clear();
+            sc.window = Some(Arc::new(CompressedVector::from_bytes(&window, compression)));
         }
     }
 
@@ -1276,7 +1354,7 @@ impl ChunkData {
         // which carries the (encoded, decoded) dedup semantic from
         // rapidgzip's appendDeflateBlockBoundary (ChunkData.hpp:455-467).
         let current_decoded = self.decoded_size();
-        self.append_block_boundary_at(encoded_offset_bits, current_decoded)
+        self.append_block_boundary_at(encoded_offset_bits, current_decoded, None)
     }
 
     /// Finalize at end of decode. Sets `encoded_size_bits` for the
@@ -1294,6 +1372,16 @@ impl ChunkData {
     /// to re-use the predecessor chunk and `set_encoded_offset` to
     /// zero out `encoded_size_bits` → premature EOF break.
     pub fn finalize(&mut self, end_encoded_offset_bits: usize) {
+        self.finalize_with_deflate(end_encoded_offset_bits, None);
+    }
+
+    /// Like [`Self::finalize`] but runs vendor subchunk sparsity when
+    /// `deflate_data` is provided (GzipChunk.hpp:136-158).
+    pub fn finalize_with_deflate(
+        &mut self,
+        end_encoded_offset_bits: usize,
+        deflate_data: Option<&[u8]>,
+    ) {
         // A4: a window-image prefix is allowed to remain in self.data
         // through finalize and into the consumer. Downstream methods
         // (`get_last_window`, `populate_subchunk_windows`,
@@ -1318,6 +1406,8 @@ impl ChunkData {
                 break;
             }
         }
+        self.merge_small_trailing_subchunk_if_needed();
+        self.finalize_window_for_last_subchunk(deflate_data);
         // Mirrors rapidgzip's ChunkData::finalize calling cleanUnmarkedData
         // (vendor/.../ChunkData.hpp ~422). Cuts down apply_window's work
         // by moving any marker-free trailing region into `data`.
@@ -1421,16 +1511,12 @@ impl ChunkData {
     /// take → decode → resolve → return in time for the next take. Idempotent:
     /// leaves an empty buffer, so the `Drop` return becomes a no-op.
     pub(crate) fn recycle_markers_after_resolution(&mut self) {
-        // FOOTPRINT-ALIGN: with IN-PLACE narrowing, the resolved u8 output
-        // lives inside `data_with_markers`'s own backing store (the first
-        // `narrowed_len` bytes) and the consumer still has to read it. So we
-        // must NOT recycle the buffer here when it holds narrowed bytes —
-        // that would free the bytes out from under the consumer. Only recycle
-        // when there's nothing narrowed to keep (no markers were present).
-        // The buffer returns to the pool at `Drop` after the consumer writes.
-        if self.narrowed_len == 0 {
-            use crate::decompress::parallel::chunk_buffer_pool;
-            let dwm = self.data_with_markers.take_segments();
+        // After `merge_resolved_markers_into_data`, marker segments are empty
+        // and payload bytes live in `data` — safe to return u16 buffers to the
+        // worker pool immediately (vendor clears `reusedDataBuffers` post-swap).
+        use crate::decompress::parallel::chunk_buffer_pool;
+        let dwm = self.data_with_markers.take_segments();
+        if !dwm.is_empty() {
             chunk_buffer_pool::return_marker_segments_to_worker(self.pool_worker_index, dwm);
         }
     }
@@ -1496,10 +1582,34 @@ impl ChunkData {
         }
     }
 
-    /// Collect output iovecs: narrowed marker bytes then clean payload.
-    pub fn append_output_iovecs<'a>(&'a self, out: &mut Vec<&'a [u8]>) {
+    /// Vendor `DecodedData::applyWindow` buffer swap (DecodedData.hpp:365-388):
+    /// prepend the in-place-narrowed marker bytes into `data`, then drop
+    /// `data_with_markers` so later `getWindowAt` / Iterator walks unified
+    /// `data` only.
+    pub fn merge_resolved_markers_into_data(&mut self) {
+        let n = self.narrowed_len;
+        if n == 0 {
+            return;
+        }
+        let mut merged = vec![0u8; n];
         self.data_with_markers
-            .append_narrowed_iovecs(self.narrowed_len, out);
+            .copy_narrowed_u8_range_into(0, n, &mut merged);
+        if self.data_prefix_len == 0 {
+            self.data.prepend_bytes(&merged);
+        } else {
+            self.data.insert_logical_at(self.data_prefix_len, &merged);
+        }
+        self.narrowed_len = 0;
+        self.data_with_markers.clear();
+    }
+
+    /// Collect output iovecs for the consumer write path. After
+    /// `merge_resolved_markers_into_data`, payload lives only in `data`.
+    pub fn append_output_iovecs<'a>(&'a self, out: &mut Vec<&'a [u8]>) {
+        if self.narrowed_len > 0 {
+            self.data_with_markers
+                .append_narrowed_iovecs(self.narrowed_len, out);
+        }
         self.data.append_payload_iovecs(self.data_prefix_len, out);
     }
 
@@ -1538,6 +1648,7 @@ mod tests {
             split_chunk_size: 100,
             max_decoded_chunk_size: 10_000,
             crc32_enabled: true,
+            ..Default::default()
         }
     }
 
@@ -1598,6 +1709,9 @@ mod tests {
         // bytes the gate returns `true` for dedup but does not push a Subchunk.
         chunk.append_clean(&[0u8; 150]);
         chunk.append_block_boundary(200);
+        // Enough bytes in the trailing subchunk to avoid vendor
+        // `finalizeChunk` small-subchunk merge (minimumSplitChunkSize = 25).
+        chunk.append_clean(&[0u8; 50]);
         chunk.finalize(300);
         // Pretend the decoder set max via tryToDecode iteration; rapidgzip
         // chunks created from a stored-block range have max > encoded.
@@ -1901,11 +2015,76 @@ mod tests {
     }
 
     #[test]
+    fn populate_subchunk_windows_after_merge_sets_post_processed_state() {
+        const W: usize = 32768;
+        let mut prev = [0u8; W];
+        for (i, b) in prev.iter_mut().enumerate() {
+            *b = (i & 0xff) as u8;
+        }
+
+        let mut chunk = ChunkData::new(0, small_config());
+        chunk.append_markered(&[0x11, MARKER_BASE + 5, 0x22]);
+        chunk.append_clean(&[0xAAu8; W + 512]);
+        chunk.finalize(10_000);
+
+        crate::decompress::parallel::apply_window::apply_window(&mut chunk, &prev);
+        chunk.narrow_markers_in_place();
+        chunk.merge_resolved_markers_into_data();
+        chunk.populate_subchunk_windows(&prev);
+
+        assert!(chunk
+            .subchunks
+            .iter()
+            .all(|sc| sc.window.is_some() && sc.used_window_symbols.is_empty()));
+        assert!(chunk.has_been_post_processed(false));
+    }
+
+    #[test]
+    fn merge_resolved_markers_into_data_unifies_output_buffer() {
+        const W: usize = 32768;
+        let mut prev = [0u8; W];
+        for (i, b) in prev.iter_mut().enumerate() {
+            *b = (i & 0xff) as u8;
+        }
+
+        let mut chunk = ChunkData::new(0, small_config());
+        chunk.append_markered(&[0x11, MARKER_BASE + 5, 0x22]);
+        chunk.append_clean(&[0xAA, 0xBB, 0xCC]);
+
+        crate::decompress::parallel::apply_window::apply_window(&mut chunk, &prev);
+        chunk.narrow_markers_in_place();
+        chunk.update_narrowed_crc();
+        let n = chunk.narrowed_len;
+        let mut expected_marker_bytes = vec![0u8; n];
+        chunk
+            .data_with_markers
+            .copy_narrowed_u8_range_into(0, n, &mut expected_marker_bytes);
+        chunk.merge_resolved_markers_into_data();
+
+        assert_eq!(chunk.narrowed_len, 0);
+        assert!(chunk.data_with_markers.is_empty());
+        assert_eq!(chunk.decoded_size(), expected_marker_bytes.len() + 3);
+        let payload_len = chunk.data.len();
+        let mut out = vec![0u8; payload_len];
+        chunk.data.copy_range_into(0, &mut out);
+        assert_eq!(
+            &out[..expected_marker_bytes.len()],
+            &expected_marker_bytes[..]
+        );
+        assert_eq!(&out[expected_marker_bytes.len()..], &[0xAA, 0xBB, 0xCC]);
+
+        let mut iovecs = Vec::new();
+        chunk.append_output_iovecs(&mut iovecs);
+        assert_eq!(iovecs.iter().map(|s| s.len()).sum::<usize>(), payload_len);
+    }
+
+    #[test]
     fn append_clean_skips_crc_when_disabled() {
         let cfg = ChunkConfiguration {
             split_chunk_size: 100,
             max_decoded_chunk_size: 10_000,
             crc32_enabled: false,
+            ..Default::default()
         };
         let mut chunk = ChunkData::new(0, cfg);
         chunk.append_clean(b"hello world");

@@ -301,6 +301,7 @@ mod tests {
             split_chunk_size: 100,
             max_decoded_chunk_size: 10_000,
             crc32_enabled: true,
+            ..Default::default()
         };
         let mut chunk = ChunkData::new(0, cfg);
         // First subchunk needs > split_chunk_size = 100 decoded bytes for the

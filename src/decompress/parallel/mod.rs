@@ -74,4 +74,6 @@ pub mod streamed_results;
 pub mod thread_pool;
 pub mod trace;
 pub mod trace_v2;
+#[cfg(parallel_sm)]
+pub mod used_window_symbols;
 pub mod window_map;

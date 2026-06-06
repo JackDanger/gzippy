@@ -56,6 +56,7 @@ mod tests {
             split_chunk_size: 100,
             max_decoded_chunk_size: 10_000,
             crc32_enabled: true,
+            ..Default::default()
         }
     }
 

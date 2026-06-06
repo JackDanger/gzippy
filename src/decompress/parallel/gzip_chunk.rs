@@ -429,7 +429,7 @@ fn finish_decode_chunk_impl(
             for (bp, rel_off) in wrapper.take_block_boundaries() {
                 let decoded_offset = call_base + rel_off;
                 if decoded_offset > 0 {
-                    chunk.append_block_boundary_at(bp, decoded_offset);
+                    chunk.append_block_boundary_at(bp, decoded_offset, Some(input));
                 }
             }
 
@@ -449,7 +449,11 @@ fn finish_decode_chunk_impl(
             match r.stopped_at {
                 sp if sp == StoppingPoints::END_OF_STREAM_HEADER => {
                     if decode_base + n_bytes_read > 0 {
-                        chunk.append_block_boundary_at(r.bit_position, decode_base + n_bytes_read);
+                        chunk.append_block_boundary_at(
+                            r.bit_position,
+                            decode_base + n_bytes_read,
+                            Some(input),
+                        );
                     }
                 }
                 sp if sp == StoppingPoints::END_OF_BLOCK => {
@@ -458,6 +462,7 @@ fn finish_decode_chunk_impl(
                             chunk.append_block_boundary_at(
                                 r.bit_position,
                                 decode_base + n_bytes_read,
+                                Some(input),
                             );
                         }
                         if !until_exact && r.bit_position >= stop_hint_bits {
@@ -551,7 +556,7 @@ fn finish_decode_chunk_impl(
             actual: final_bit,
         });
     }
-    chunk.finalize(final_bit);
+    chunk.finalize_with_deflate(final_bit, Some(input));
     Ok(())
 }
 
@@ -631,6 +636,49 @@ fn decode_chunk_with_rapidgzip_impl(
     Ok(chunk)
 }
 
+/// Records block boundaries during marker bootstrap, then applies them to
+/// [`ChunkData`] so vendor subchunk split + sparsity can run.
+#[cfg(parallel_sm)]
+struct RecordingMarkerSink<'a> {
+    inner: &'a mut crate::decompress::parallel::segmented_markers::SegmentedU16,
+    boundaries: &'a mut Vec<(usize, usize)>,
+}
+
+#[cfg(parallel_sm)]
+impl crate::decompress::parallel::marker_inflate::MarkerSink for RecordingMarkerSink<'_> {
+    fn push_slice(&mut self, values: &[u16]) {
+        self.inner.push_slice(values);
+    }
+    fn sink_len(&self) -> usize {
+        self.inner.sink_len()
+    }
+    fn as_slice(&self) -> &[u16] {
+        self.inner.as_slice()
+    }
+    fn trailing_clean_since(&self, from: usize) -> usize {
+        self.inner.trailing_clean_since(from)
+    }
+    fn copy_last_n_clean_u8(&self, n: usize, out: &mut Vec<u8>) -> bool {
+        self.inner.copy_last_n_clean_u8(n, out)
+    }
+    fn note_block_boundary(&mut self, encoded_offset_bits: usize, decoded_offset: usize) {
+        self.boundaries.push((encoded_offset_bits, decoded_offset));
+    }
+}
+
+#[cfg(parallel_sm)]
+fn apply_recorded_block_boundaries(
+    chunk: &mut ChunkData,
+    deflate_data: &[u8],
+    boundaries: &[(usize, usize)],
+) {
+    for &(encoded_offset_bits, decoded_offset) in boundaries {
+        if decoded_offset > 0 {
+            chunk.append_block_boundary_at(encoded_offset_bits, decoded_offset, Some(deflate_data));
+        }
+    }
+}
+
 /// The ONE unified decode driver — vendor `deflate::Block` by default (see
 /// `marker_decode_step`; `GZIPPY_MARKER_RING=1` selects legacy `MarkerRing`).
 /// Once 32 KiB of clean output exist at a block boundary, control hands off to
@@ -645,14 +693,16 @@ fn decode_chunk_unified_marker(
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
     let mut marker_ctx = MarkerDecodeCtx::new(input, encoded_offset_bits)?;
     chunk.data_with_markers.reserve(128 * 1024);
+    let mut pending_boundaries: Vec<(usize, usize)> = Vec::new();
     loop {
-        let (step, flipped_clean) = marker_decode_step(
-            &mut marker_ctx,
-            input,
-            stop_hint_bits,
-            &[],
-            &mut chunk.data_with_markers,
-        )?;
+        let mut sink = RecordingMarkerSink {
+            inner: &mut chunk.data_with_markers,
+            boundaries: &mut pending_boundaries,
+        };
+        let (step, flipped_clean) =
+            marker_decode_step(&mut marker_ctx, input, stop_hint_bits, &[], &mut sink)?;
+        apply_recorded_block_boundaries(&mut chunk, input, &pending_boundaries);
+        pending_boundaries.clear();
         if flipped_clean {
             UNIFIED_MODE_CLEAN_FLIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -694,7 +744,7 @@ fn decode_chunk_unified_marker(
                     "t",
                 );
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
-                chunk.finalize(end_bit_offset);
+                chunk.finalize_with_deflate(end_bit_offset, Some(input));
                 return Ok(chunk);
             }
         }
@@ -727,6 +777,7 @@ pub static WINDOW_SEEDED_CHUNKS: std::sync::atomic::AtomicU64 =
 #[cfg(parallel_sm)]
 struct CleanTailSink<'a> {
     chunk: &'a mut ChunkData,
+    deflate_data: &'a [u8],
     /// Running count of u8 bytes pushed — the sink's logical length. Tracked
     /// independently of `chunk.data.len()` so any window prefix or later
     /// `clean_unmarked_data` migration cannot perturb the `before_len` deltas
@@ -767,8 +818,11 @@ impl crate::decompress::parallel::marker_inflate::MarkerSink for CleanTailSink<'
         // the split_chunk_size subchunk split for vendor-parity / the seekable
         // index (no production read site yet — locked by the
         // UNSPLIT_BLOCKS_EMPLACED deletion trap in tests/routing.rs).
-        self.chunk
-            .append_block_boundary_at(encoded_offset_bits, decoded_offset);
+        self.chunk.append_block_boundary_at(
+            encoded_offset_bits,
+            decoded_offset,
+            Some(self.deflate_data),
+        );
     }
 }
 
@@ -1471,6 +1525,7 @@ mod tests {
             split_chunk_size: 512 * 1024,
             max_decoded_chunk_size: 20 * 512 * 1024,
             crc32_enabled: true,
+            ..Default::default()
         };
         let stop_hint_bits = deflate.len() * 8;
         let chunk = decode_chunk(&deflate, 0, stop_hint_bits, &[], cfg).unwrap();
@@ -1510,6 +1565,7 @@ mod tests {
             split_chunk_size: 512 * 1024,
             max_decoded_chunk_size: 20 * 512 * 1024,
             crc32_enabled: true,
+            ..Default::default()
         };
         let stop_hint_bits = deflate.len() * 8;
         // window-absent entry (the production speculative path that flips).
@@ -1533,6 +1589,7 @@ mod tests {
             split_chunk_size: 256 * 1024,
             max_decoded_chunk_size: 20 * 256 * 1024,
             crc32_enabled: false,
+            ..Default::default()
         };
         let stop_hint_bits = deflate.len() * 8 / 2;
         let chunk = decode_chunk(&deflate, 0, stop_hint_bits, &[], cfg).unwrap();
@@ -1611,6 +1668,7 @@ mod tests {
             split_chunk_size: 4 * 1024 * 1024,
             max_decoded_chunk_size: 20 * 4 * 1024 * 1024,
             crc32_enabled: false,
+            ..Default::default()
         };
         let zero = [0u8; 32768];
         let chunk0 = decode_chunk(deflate, 0, spacing_bits, &zero, cfg).expect("chunk0");
@@ -1646,6 +1704,7 @@ mod tests {
                 split_chunk_size: 512 * 1024,
                 max_decoded_chunk_size: 20 * 512 * 1024,
                 crc32_enabled: true,
+                ..Default::default()
             };
             // One zero byte; decode the sub-byte span [4, 8) — four
             // zero bits, exactly an EOF byte-alignment padding tail.

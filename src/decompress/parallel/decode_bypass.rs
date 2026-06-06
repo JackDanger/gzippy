@@ -221,6 +221,8 @@ impl CapturedChunk {
                 decoded_offset: dofs,
                 decoded_size: ds,
                 window: None,
+                newline_count: None,
+                used_window_symbols: Vec::new(),
             })
             .collect();
         let footers: Vec<Footer> = self
@@ -543,6 +545,8 @@ pub fn sleep_replay(
             decoded_offset: dofs,
             decoded_size: ds,
             window: None,
+            newline_count: None,
+            used_window_symbols: Vec::new(),
         })
         .collect();
     let footers: Vec<Footer> = cap

@@ -58,6 +58,8 @@ use crate::decompress::parallel::gzip_chunk::ChunkDecodeError;
 use std::sync::Arc;
 
 #[cfg(parallel_sm)]
+use crate::decompress::parallel::apply_window::apply_window;
+#[cfg(parallel_sm)]
 use crate::decompress::parallel::block_fetcher::BlockFetcher;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::block_map::{append_subchunks_to_block_map, BlockMap};
@@ -78,8 +80,10 @@ use crate::decompress::parallel::thread_pool::ThreadPool;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::trace;
 use crate::decompress::parallel::trace_v2;
-#[cfg(parallel_sm)]
 use crate::decompress::parallel::window_map::{Window, WindowMap};
+
+/// Vendor `DecodedData::applyWindow` LUT branch threshold (DecodedData.hpp:315).
+const VENDOR_APPLY_WINDOW_LUT_ELEMENTS: usize = 128 * 1024;
 #[cfg(parallel_sm)]
 use std::borrow::Cow;
 #[cfg(parallel_sm)]
@@ -1246,57 +1250,10 @@ fn consumer_loop<W: std::io::Write>(
             if let Some(Ok(arc)) =
                 block_fetcher.try_take_prefetched_pumping(&partition_offset, pump)
             {
-                // Vendor GzipChunkFetcher.hpp:646-648 — accept the chunk
-                // only if `matchesEncodedOffset(blockOffset)`. If not,
-                // discard and dispatch on-demand at the real offset.
-                //
-                // **gzippy-specific safety guard** — the speculative
-                // slow path now publishes vendor-faithful metadata
-                // (`encoded_offset = offset.first`, `max =
-                // offset.second`, speculative_decode_find_boundary above). Vendor
-                // safely uses a `matchesEncodedOffset` range hit
-                // because chunk_N.actual_end == chunk_{N+1}.offset.second
-                // by construction (chain invariant — fast-path
-                // exactUntilOffset = prefetch's offset.second). gzippy
-                // doesn't yet enforce that chain, so a `blockOffset`
-                // strictly inside (encoded_offset, max) would shift
-                // the chunk's claimed range past where its data
-                // actually starts → missing decoded bytes for
-                // `[blockOffset, max)` → output corruption.
-                //
-                // Restrict the trim to the ONE boundary case that is
-                // safe without the chain invariant:
-                //   - blockOffset == max_acceptable_start_bit → no
-                //     trim needed because chunk's data starts AT
-                //     `max` (slow path's offset.second). Writing
-                //     chunk.data wholesale emits bytes for
-                //     [max, end] = [blockOffset, end] exactly.
-                //
-                // Dropped the alternate clause `blockOffset ==
-                // encoded_offset_bits` (audit 13 reflection): when
-                // `encoded != max`, the chunk's data still starts at
-                // `max`, so a blockOffset matching `encoded` means
-                // bytes for [encoded, max) are missing from the
-                // chunk — output corruption. The clause happened to
-                // be safe in the common case (encoded == max after
-                // slow path validated at the partition seed) but
-                // unsafe in the general case. Keep only `max`.
-                // Speculative chunks may claim a start RANGE
-                // [encoded_offset_bits, max_acceptable_start_bit] but
-                // decoded bytes only exist from max onward. Safe reuse
-                // requires the consumer's confirmed start == max (vendor
-                // chain: chunk_N.end == chunk_{N+1}.start at max).
-                //
-                // Compare against `decode_start`, NOT `next_block_offset`:
-                // when a spacing guess overshoots `furthest_decoded_bit`,
-                // the consumer resumes at `furthest` while the block
-                // finder still reports the partition guess. A partition
-                // prefetch whose search landed on `furthest` has
-                // `max == furthest == decode_start` but `max != next_block_offset`
-                // — accepting on `next_block_offset` threw away valid work
-                // and forced an on-demand re-decode (refreshed-plan §1.4).
-                let handoff_at_decode_start = arc.max_acceptable_start_bit == decode_start;
-                if arc.matches_encoded_offset(decode_start) && handoff_at_decode_start {
+                // Vendor GzipChunkFetcher.hpp:646-648,670-684 — accept when
+                // `matchesEncodedOffset(blockOffset)`; else discard and
+                // re-issue at the real offset via `get(blockOffset, ...)`.
+                if arc.matches_encoded_offset(decode_start) {
                     if trace::is_enabled() {
                         trace::emit(
                             "consumer",
@@ -1312,14 +1269,8 @@ fn consumer_loop<W: std::io::Write>(
                     // ACCEPT: move the `Arc` (no extra refcount) into the consumer path.
                     chunk_arc_from_partition = Some(arc);
                 } else {
-                    // Diagnostic counter (added 2026-05-19): a prefetch
-                    // arrived at the consumer (matches the partition
-                    // lookup) but the safety guard rejected it. Bumps
-                    // mean "chain invariant broken for this fetch."
-                    // Distinguishes from "prefetch never arrived"
-                    // (try_take_prefetched returned None), which is
-                    // counted by `prefetch_cache_miss` and means a
-                    // scheduling/timing miss, not a metadata mismatch.
+                    // Vendor GzipChunkFetcher.hpp:646-648 — partition-keyed
+                    // prefetch present but `!matchesEncodedOffset(blockOffset)`.
                     PREFETCH_REJECT_BY_GUARD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if trace::is_enabled() {
                         trace::emit(
@@ -1375,7 +1326,6 @@ fn consumer_loop<W: std::io::Write>(
                         window_map,
                         thread_pool,
                         &mut prefetch_post_inflight,
-                        None,
                         &[],
                         skip_keys,
                     );
@@ -1425,7 +1375,6 @@ fn consumer_loop<W: std::io::Write>(
                     let real_offset = arc.encoded_offset_bits;
                     let resolved_pred_matches = arc.markers_resolved
                         && confirmed_predecessor_window(window_map, decode_start)
-                            .or_else(|| predecessor_window_for_markers(window_map, decode_start))
                             .map(|(pred_key, _)| arc.resolved_pred_key == Some(pred_key))
                             .unwrap_or(false);
                     if resolved_pred_matches {
@@ -1495,17 +1444,9 @@ fn consumer_loop<W: std::io::Write>(
                 "consumer.window_publish_clean",
                 &format!(r#""end_bit":{chunk_end_bit},"had_markers":false"#),
             );
-            if let Some((_pred_key, pred)) = predecessor_window_for_markers(window_map, handoff_bit)
-            {
-                // Vendor queueChunkForPostProcessing:558 — only publish if not already
-                // published (the eager full-scan may have done it ahead).
-                if !window_map.contains(chunk_end_bit) {
-                    let bytes = materialize_window(&pred);
-                    let tail = chunk
-                        .last_32kib_window_vec()
-                        .unwrap_or_else(|| chunk.get_last_window_vec(&bytes));
-                    window_map.insert_owned_none(chunk_end_bit, tail);
-                }
+            if let Some((_pred_key, pred)) = confirmed_predecessor_window(window_map, handoff_bit) {
+                let bytes = materialize_window(&pred);
+                publish_end_window_before_post_process(window_map, chunk, bytes.as_ref());
                 trace_v2::emit_instant(
                     "causal.window_publish",
                     &format!(
@@ -1529,7 +1470,6 @@ fn consumer_loop<W: std::io::Write>(
                     window_map,
                     thread_pool,
                     &mut prefetch_post_inflight,
-                    None,
                     &[],
                     &[],
                 );
@@ -1602,12 +1542,12 @@ fn consumer_loop<W: std::io::Write>(
                 "consumer.window_publish_marker",
                 &format!(r#""end_bit":{chunk_end_bit},"had_markers":true"#),
             );
-            let (pred_key, window) = confirmed_predecessor_window(window_map, handoff_bit)
-                .or_else(|| predecessor_window_for_markers(window_map, handoff_bit))
-                .ok_or(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+            let (pred_key, window) = confirmed_predecessor_window(window_map, handoff_bit).ok_or(
+                FetchError::Decode(ChunkDecodeError::ExactStopMissed {
                     requested: handoff_bit,
                     actual: furthest_decoded_bit,
-                }))?;
+                }),
+            )?;
             consumer_pred_key = Some(pred_key);
             // Vendor `GzipChunkFetcher.hpp:341`: `sharedLastWindow->
             // decompress()` materializes the bytes once. For
@@ -1640,7 +1580,6 @@ fn consumer_loop<W: std::io::Write>(
                 window_map,
                 thread_pool,
                 &mut prefetch_post_inflight,
-                None,
                 &[],
                 &[],
             );
@@ -2101,15 +2040,7 @@ fn eager_postprocess_prefetched(
     in_flight: &mut EagerSubmitted,
 ) -> usize {
     let _tv2 = trace_v2::SpanGuard::begin("consumer.eager_postproc");
-    queue_prefetched_marker_postprocess(
-        block_fetcher,
-        window_map,
-        thread_pool,
-        in_flight,
-        None,
-        &[],
-        &[],
-    )
+    queue_prefetched_marker_postprocess(block_fetcher, window_map, thread_pool, in_flight, &[], &[])
 }
 
 #[cfg(parallel_sm)]
@@ -2140,17 +2071,15 @@ fn submit_post_process_from_prefetch(
     thread_pool: &Arc<ThreadPool>,
     cache_key: usize,
     arc: Arc<ChunkData>,
-    resolve_offset: usize,
     pred_key: usize,
     predecessor_window: Window,
 ) -> mpsc::Receiver<ChunkData> {
-    let _ = block_fetcher;
+    let _ = (block_fetcher, cache_key);
     submit_post_process_task(thread_pool, move || {
-        let mut working = match Arc::try_unwrap(arc) {
+        let working = match Arc::try_unwrap(arc) {
             Ok(owned) => owned,
             Err(shared) => (*shared).clone(),
         };
-        reanchor_chunk_to_handoff(&mut working, resolve_offset);
         run_post_process_task(working, pred_key, predecessor_window)
     })
 }
@@ -2163,31 +2092,6 @@ fn submit_post_process_task(
     // Vendor queues post-process one band above decode.
     let future = thread_pool.submit(task, /* priority */ -1);
     future.into_receiver()
-}
-
-/// Vendor tryToDecode partition-seed rewrite (GzipChunk.hpp:716-722).
-#[cfg(parallel_sm)]
-fn rewrite_chunk_from_handoff_to_partition_seed(
-    chunk: &mut ChunkData,
-    partition_seed: usize,
-    handoff_key: usize,
-) {
-    chunk.decode_origin_bit = handoff_key;
-    if partition_seed < handoff_key {
-        let encoded_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-        let first_sc_upper = chunk
-            .subchunks
-            .get(1)
-            .map(|sc| sc.encoded_offset_bits)
-            .unwrap_or(encoded_end);
-        chunk.encoded_offset_bits = partition_seed;
-        chunk.encoded_size_bits = encoded_end - partition_seed;
-        chunk.max_acceptable_start_bit = handoff_key;
-        if let Some(first_sc) = chunk.subchunks.first_mut() {
-            first_sc.encoded_offset_bits = partition_seed;
-            first_sc.encoded_size_bits = first_sc_upper - partition_seed;
-        }
-    }
 }
 
 /// Pool-side execution of a decode task (vendor `decodeBlock`,
@@ -2428,10 +2332,11 @@ fn run_decode_task(
     result
 }
 
-/// True when post-process already ran against the consumer's handoff predecessor.
+/// True when pool post-process finished for this handoff (vendor
+/// `ChunkData::hasBeenPostProcessed`, ChunkData.hpp:496-501).
 #[cfg(parallel_sm)]
 fn chunk_matches_consumer_pred(chunk: &ChunkData, consumer_pred_key: Option<usize>) -> bool {
-    chunk.markers_resolved && consumer_pred_key == chunk.resolved_pred_key
+    chunk.has_been_post_processed(false) && consumer_pred_key == chunk.resolved_pred_key
 }
 
 /// Shared marker resolve body (`applyWindow` + narrow + subchunk windows + CRC).
@@ -2442,17 +2347,21 @@ fn resolve_chunk_markers_on_chunk(
     predecessor_window: &[u8],
 ) {
     let dwm_len_pre = chunk.data_with_markers.len();
-    if dwm_len_pre >= 16 * 1024 {
+    if dwm_len_pre >= VENDOR_APPLY_WINDOW_LUT_ELEMENTS {
+        // Vendor DecodedData.hpp:315-338 — 64 KiB `fullWindow` LUT, in-place u8.
         POST_PROCESS_FUSED_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    } else {
+        chunk.resolve_and_narrow_markers_in_place(predecessor_window);
+    } else if dwm_len_pre > 0 {
+        // Vendor DecodedData.hpp:339-362 — `MapMarkers` per-element, in-place u8.
         POST_PROCESS_SMALL_MARKERS_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        apply_window(chunk, predecessor_window);
+        chunk.narrow_markers_in_place();
     }
-    // Fused one-pass resolve+narrow (64 KiB u8 LUT) replacing the two-pass
-    // apply_window (resolve u16→u16, 128 KiB u16 LUT) + narrow_markers_in_place
-    // (u16→u8). Halves the passes over data_with_markers and the LUT size.
-    chunk.resolve_and_narrow_markers_in_place(predecessor_window);
-    chunk.populate_subchunk_windows(predecessor_window);
     chunk.update_narrowed_crc();
+    // Vendor DecodedData.hpp:365-388 — swap narrowed marker buffers into `data`
+    // before subchunk window emplacement and CRC Iterator walk unified `data`.
+    chunk.merge_resolved_markers_into_data();
+    chunk.populate_subchunk_windows(predecessor_window);
     chunk.recycle_markers_after_resolution();
     chunk.markers_resolved = true;
     chunk.resolved_pred_key = Some(pred_key);
@@ -2468,58 +2377,32 @@ fn confirmed_predecessor_window(
     window_map.get(handoff_bit).map(|w| (handoff_bit, w))
 }
 
-/// Exact handoff window when published; else largest key ≤ `handoff_bit` (spacing overshoot).
+/// Marker chunks eligible for prefetch post-process (vendor
+/// `queuePrefetchedChunkPostProcessing` + `hasBeenPostProcessed` gate,
+/// GzipChunkFetcher.hpp:539-546).
 #[cfg(parallel_sm)]
-fn predecessor_window_for_markers(
-    window_map: &WindowMap,
-    handoff_bit: usize,
-) -> Option<(usize, Window)> {
-    confirmed_predecessor_window(window_map, handoff_bit)
-        .or_else(|| window_map.get_predecessor(handoff_bit))
-}
-
-/// Stream-start bit for predecessor lookup on a prefetched chunk.
-/// Vendor `tryToDecode` decodes at `offset.second` (GzipChunk.hpp:718); the
-/// window chain keys windows at confirmed stream starts, not partition seeds.
-#[cfg(parallel_sm)]
-fn prefetch_stream_start_bit(chunk: &ChunkData, handoff_key: Option<usize>) -> usize {
-    handoff_key.unwrap_or_else(|| {
-        if chunk.encoded_offset_bits != chunk.max_acceptable_start_bit {
-            chunk.max_acceptable_start_bit
-        } else {
-            chunk.encoded_offset_bits
-        }
-    })
-}
-
-/// Marker chunks safe for resolve-ahead post-process (vendor
-/// `queuePrefetchedChunkPostProcessing` + `hasBeenPostProcessed` gate).
-#[cfg(parallel_sm)]
-fn chunk_may_resolve_markers_early(
-    chunk: &ChunkData,
-    window_map: &WindowMap,
-    handoff_key: Option<usize>,
-) -> bool {
-    if chunk.data_with_markers.is_empty() || chunk.markers_resolved {
+fn chunk_may_resolve_markers_early(chunk: &ChunkData, window_map: &WindowMap) -> bool {
+    // Vendor GzipChunkFetcher.hpp:539 — skip `hasBeenPostProcessed()` chunks.
+    if chunk.has_been_post_processed(false) {
         return false;
     }
-    let start = prefetch_stream_start_bit(chunk, handoff_key);
-    confirmed_predecessor_window(window_map, start).is_some()
+    window_map.get(chunk.encoded_offset_bits).is_some()
 }
 
-/// Re-anchor speculative prefetch chunks to the confirmed handoff bit
-/// before `apply_window` (consumer has already done this via
-/// `set_encoded_offset`; prefetch-cache clones still carry the seed).
+/// Vendor `queueChunkForPostProcessing` footer empty-window branch
+/// (GzipChunkFetcher.hpp:562-570).
 #[cfg(parallel_sm)]
-fn reanchor_chunk_to_handoff(chunk: &mut ChunkData, handoff_bit: usize) {
-    if chunk.encoded_offset_bits != handoff_bit && chunk.matches_encoded_offset(handoff_bit) {
-        chunk.set_encoded_offset(handoff_bit);
-    }
+fn chunk_end_uses_empty_footer_window(chunk: &ChunkData) -> bool {
+    chunk
+        .footers
+        .last()
+        .is_some_and(|footer| footer.decoded_end_offset == chunk.decoded_size())
 }
 
 /// Vendor `queueChunkForPostProcessing` publish half (GzipChunkFetcher.hpp:557-575):
-/// caller thread inserts `getLastWindow(*previousWindow)` at
-/// `encodedOffsetInBits + encodedSizeInBits` BEFORE pool `applyWindow`.
+/// caller thread inserts `getLastWindow(*previousWindow)` — or an empty window
+/// when the chunk ends on a gzip footer — at `encodedOffsetInBits +
+/// encodedSizeInBits` BEFORE pool `applyWindow`.
 #[cfg(parallel_sm)]
 fn publish_end_window_before_post_process(
     window_map: &WindowMap,
@@ -2537,38 +2420,31 @@ fn publish_end_window_before_post_process(
     if window_map.contains(window_offset) {
         return;
     }
-    let end_window = chunk.get_last_window(predecessor_window);
-    window_map.insert_owned_none(window_offset, end_window.to_vec());
+    if chunk_end_uses_empty_footer_window(chunk) {
+        window_map.insert_owned_none(window_offset, vec![0u8; 32768]);
+    } else {
+        let end_window = chunk.get_last_window_vec(predecessor_window);
+        window_map.insert_owned_none(window_offset, end_window);
+    }
     PUBLISH_AHEAD_WINDOWS.fetch_add(1, Ordering::Relaxed);
     EARLY_WINDOW_PUBLISHED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Vendor `queuePrefetchedChunkPostProcessing` (GzipChunkFetcher.hpp:520-551).
-/// Submits pool `run_post_process_task` on prefetched clones (never mutates
-/// the cached `Arc`). `handoff_key`: `Some(k)` after a confirmed tail publish
-/// at `k` (resolve-ahead chain); `None` scans the whole cache during a stall.
+/// Full sorted prefetch-cache scan; predecessor via exact
+/// `m_windowMap->get(chunkData->encodedOffsetInBits)` only.
 #[cfg(parallel_sm)]
 fn queue_prefetched_marker_postprocess(
     block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
     window_map: &WindowMap,
     thread_pool: &Arc<ThreadPool>,
     in_flight: &mut EagerSubmitted,
-    handoff_key: Option<usize>,
     skip_real_offsets: &[usize],
     skip_cache_keys: &[usize],
 ) -> usize {
     use std::sync::atomic::Ordering;
-    if let Some(key) = handoff_key {
-        if !window_map.contains(key) {
-            return 0;
-        }
-    } else {
-        EAGER_PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
-    }
-    let _tv2 = trace_v2::SpanGuard::begin_with(
-        "consumer.queue_prefetched_postproc",
-        &format!(r#""handoff_key":{}"#, handoff_key.unwrap_or(0)),
-    );
+    EAGER_PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
+    let _tv2 = trace_v2::SpanGuard::begin("consumer.queue_prefetched_postproc");
     block_fetcher.process_ready_prefetches();
     let contents = block_fetcher.prefetch_cache_contents_sorted();
     let n_inspected = contents.len();
@@ -2581,25 +2457,7 @@ fn queue_prefetched_marker_postprocess(
         if skip_real_offsets.contains(&real_offset) {
             continue;
         }
-        if let Some(key) = handoff_key {
-            // Follow the chain when the chunk's REAL output start
-            // (`encoded_offset_bits`) matches the predecessor's real end
-            // (`key`), not only when its partition SEED
-            // (`max_acceptable_start_bit`/`decode_origin_bit`) does. Deflate
-            // is contiguous, so chunk K's real start == chunk K-1's real end;
-            // the resolve uses the predecessor window at `key`, which is
-            // correct iff the chunk's real start == `key`. Seeds rarely equal
-            // real boundaries, so without this the chain dies at the first
-            // speculative chunk and the consumer resolves the rest serially
-            // on the wall (+206ms, gap #2). Byte-exactness gates correctness.
-            if arc.max_acceptable_start_bit != key
-                && arc.decode_origin_bit != key
-                && arc.encoded_offset_bits != key
-            {
-                continue;
-            }
-        }
-        if !chunk_may_resolve_markers_early(arc.as_ref(), window_map, handoff_key) {
+        if !chunk_may_resolve_markers_early(arc.as_ref(), window_map) {
             continue;
         }
         if in_flight.contains_key(&real_offset) {
@@ -2608,10 +2466,8 @@ fn queue_prefetched_marker_postprocess(
         if arc.data_with_markers.is_empty() {
             continue;
         }
-        let stream_start = prefetch_stream_start_bit(arc.as_ref(), handoff_key);
-        let resolve_anchor = stream_start;
         let Some((pred_key, predecessor_window)) =
-            confirmed_predecessor_window(window_map, stream_start)
+            confirmed_predecessor_window(window_map, arc.encoded_offset_bits)
         else {
             continue;
         };
@@ -2624,34 +2480,17 @@ fn queue_prefetched_marker_postprocess(
             thread_pool,
             cache_key,
             Arc::clone(&arc),
-            resolve_anchor,
             pred_key,
             predecessor_window,
         );
         in_flight.insert(real_offset, (pred_key, cache_key, rx));
         submitted += 1;
-        if handoff_key.is_some() {
-            RESOLVE_AHEAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-            RESOLVE_AHEAD_OK.fetch_add(1, Ordering::Relaxed);
-            let next_handoff = arc.encoded_offset_bits + arc.encoded_size_bits;
-            submitted += queue_prefetched_marker_postprocess(
-                block_fetcher,
-                window_map,
-                thread_pool,
-                in_flight,
-                Some(next_handoff),
-                &[],
-                &[],
-            );
-        }
     }
-    if handoff_key.is_none() {
-        EAGER_PROBE_INSPECTED.fetch_add(n_inspected as u64, Ordering::Relaxed);
-        EAGER_PROBE_SUBMITTED.fetch_add(submitted as u64, Ordering::Relaxed);
-        if submitted > 0 {
-            EAGER_PROBE_RUNS_NONEMPTY.fetch_add(1, Ordering::Relaxed);
-            EAGER_PROBE_MAX_PER_RUN.fetch_max(submitted as u64, Ordering::Relaxed);
-        }
+    EAGER_PROBE_INSPECTED.fetch_add(n_inspected as u64, Ordering::Relaxed);
+    EAGER_PROBE_SUBMITTED.fetch_add(submitted as u64, Ordering::Relaxed);
+    if submitted > 0 {
+        EAGER_PROBE_RUNS_NONEMPTY.fetch_add(1, Ordering::Relaxed);
+        EAGER_PROBE_MAX_PER_RUN.fetch_max(submitted as u64, Ordering::Relaxed);
     }
     submitted
 }
@@ -2685,7 +2524,7 @@ fn run_post_process_task(
     }
     let apply_us = t_apply.elapsed().as_micros();
     let resolve_us = apply_us as f64;
-    let fused = marker_bytes >= 16 * 1024;
+    let fused = marker_bytes >= VENDOR_APPLY_WINDOW_LUT_ELEMENTS;
     trace_v2::emit_instant(
         "causal.tax",
         &format!(
@@ -2803,7 +2642,7 @@ fn publish_subchunk_windows(window_map: &WindowMap, chunk: &ChunkData) {
             Some(ex) => !ex.is_empty(),
         };
         if may_insert {
-            window_map.insert_bytes(sc_end_bit, &w[..]);
+            window_map.insert(sc_end_bit, Arc::clone(w));
         }
     }
 }
@@ -3228,7 +3067,7 @@ fn speculative_decode_find_boundary(
     let input_bits = input.len() * 8;
     if start_bit >= input_bits {
         let mut chunk = ChunkData::new(start_bit, configuration);
-        chunk.finalize(start_bit);
+        chunk.finalize_with_deflate(start_bit, Some(input));
         return Ok(chunk);
     }
     let max_end = (start_bit + MAX_SCAN_BITS).min(input_bits);
@@ -3465,7 +3304,6 @@ fn drain_one_pending<W: std::io::Write>(
                 window_map,
                 thread_pool,
                 in_flight,
-                None,
                 &[],
                 &[],
             );
@@ -3506,7 +3344,6 @@ fn drain_one_pending<W: std::io::Write>(
     if !chunk.data_with_markers.is_empty() && !chunk.markers_resolved {
         let Some((pred_key, predecessor_window)) =
             confirmed_predecessor_window(window_map, handoff_bit)
-                .or_else(|| predecessor_window_for_markers(window_map, handoff_bit))
         else {
             return Err(FetchError::Decode(ChunkDecodeError::BootstrapFailed(
                 std::io::Error::new(
@@ -3548,13 +3385,9 @@ fn drain_one_pending<W: std::io::Write>(
     let publish_us = t_pub.elapsed().as_micros();
 
     // Mirror of vendor's per-chunk write loop (GzipChunkFetcher.hpp:333-342).
-    // The post-process worker pre-narrows `data_with_markers` into
-    // `chunk.narrowed` so the consumer thread does not pay the scalar
-    // u16→u8 cast loop (~24ms/3.3MiB chunk previously dominated wall
-    // time on real silesia). When the post-process step was skipped
-    // (chunks with no markers), `narrowed` is empty and there is
-    // nothing to write here — the clean tail comes through `chunk.data`
-    // below.
+    // Post-process narrows markers in-place then `merge_resolved_markers_into_data`
+    // swaps them into `chunk.data` (DecodedData.hpp:365-388), so the consumer
+    // gathers iovecs from unified `data` only.
     // CRC pipeline split:
     //   - chunk.data: bytes were CRC'd on the WORKER (every `append_clean` /
     //     `append_owned_buffer` updates `chunk.crc32s.last_mut()`). Re-CRCing
@@ -3721,6 +3554,7 @@ mod tests {
             split_chunk_size: 4 * 1024 * 1024,
             max_decoded_chunk_size: 64 * 1024 * 1024,
             crc32_enabled: true,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let (_crc, n) = drive(&deflate, &mut out, None, 8, cfg).expect("drive");
@@ -3729,11 +3563,36 @@ mod tests {
     }
 
     #[test]
-    fn chunk_may_resolve_markers_early_handoff_shape() {
+    fn has_been_post_processed_blocks_prefetch_eager_queue() {
         let cfg = ChunkConfiguration {
             split_chunk_size: 4 * 1024 * 1024,
             max_decoded_chunk_size: 64 * 1024 * 1024,
             crc32_enabled: false,
+            ..Default::default()
+        };
+        let mut chunk = ChunkData::new(1_000, cfg);
+        chunk.encoded_offset_bits = 4_000_000;
+        chunk.data_with_markers.push_slice(&[0u16, 1, 2]);
+        chunk.subchunks[0].window = Some(Arc::new(
+            crate::decompress::parallel::compressed_vector::CompressedVector::from_bytes(
+                &[0u8; 32768],
+                crate::decompress::parallel::compressed_vector::CompressionType::None,
+            ),
+        ));
+        chunk.markers_resolved = true;
+        let window_map = super::WindowMap::new();
+        window_map.insert_owned_none(4_000_000, vec![0u8; 32768]);
+        assert!(!super::chunk_may_resolve_markers_early(&chunk, &window_map));
+    }
+
+    #[test]
+    fn chunk_may_resolve_markers_early_uses_encoded_offset() {
+        // Vendor GzipChunkFetcher.hpp:544 — `m_windowMap->get(chunkData->encodedOffsetInBits)`.
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 4 * 1024 * 1024,
+            max_decoded_chunk_size: 64 * 1024 * 1024,
+            crc32_enabled: false,
+            ..Default::default()
         };
         let mut chunk = ChunkData::new(1_000, cfg);
         chunk.decode_origin_bit = 5_000_000;
@@ -3742,17 +3601,9 @@ mod tests {
         chunk.data_with_markers.push_slice(&[0u16, 1, 2]);
         let window_map = super::WindowMap::new();
         window_map.insert_owned_none(5_000_000, vec![0u8; 32768]);
-        assert!(super::chunk_may_resolve_markers_early(
-            &chunk,
-            &window_map,
-            None
-        ));
-        chunk.max_acceptable_start_bit = 6_000_000;
-        assert!(!super::chunk_may_resolve_markers_early(
-            &chunk,
-            &window_map,
-            None
-        ));
+        assert!(!super::chunk_may_resolve_markers_early(&chunk, &window_map));
+        window_map.insert_owned_none(4_000_000, vec![0u8; 32768]);
+        assert!(super::chunk_may_resolve_markers_early(&chunk, &window_map));
     }
 
     #[test]
@@ -3763,6 +3614,7 @@ mod tests {
             split_chunk_size: 512 * 1024,
             max_decoded_chunk_size: 20 * 512 * 1024,
             crc32_enabled: true,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let (_crc, size) = drive(&deflate, &mut out, None, 4, cfg).expect("drive");
@@ -3781,6 +3633,7 @@ mod tests {
             split_chunk_size: 512 * 1024,
             max_decoded_chunk_size: 20 * 512 * 1024,
             crc32_enabled: true,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let (_crc, size) = drive(&deflate, &mut out, None, 8, cfg).expect("drive");
@@ -3914,6 +3767,7 @@ mod tests {
             split_chunk_size: 4 * 1024 * 1024,
             max_decoded_chunk_size: 20 * 4 * 1024 * 1024,
             crc32_enabled: true,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let (_crc, size) = drive(&deflate, &mut out, None, 8, cfg).expect("drive");
