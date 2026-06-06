@@ -20,10 +20,14 @@ for a in "$@"; do
     THREADS=*) THREADS="$(echo "${a#*=}" | tr ',' ' ')";;
     N=*) N="${a#*=}";;
     SLOW_BOOTSTRAP=*) GZIPPY_SLOW_BOOTSTRAP="${a#*=}";;
+    SLOW_MODE=*) GZIPPY_SLOW_MODE="${a#*=}";;
+    SLOW_KIND=*) GZIPPY_SLOW_KIND="${a#*=}";;
   esac
 done
 # Optional experiment knobs (env or host_lock arguments).
 GZIPPY_SLOW_BOOTSTRAP="${GZIPPY_SLOW_BOOTSTRAP:-}"
+GZIPPY_SLOW_MODE="${GZIPPY_SLOW_MODE:-}"
+GZIPPY_SLOW_KIND="${GZIPPY_SLOW_KIND:-}"
 [ "$N" -ge 9 ] || N=9
 
 mkdir -p "$ARTDIR"
@@ -149,6 +153,8 @@ run_cmd_timed() {
 gzippy_wall_cmd() {
   local parts="env GZIPPY_FORCE_PARALLEL_SM=1"
   [ -n "$GZIPPY_SLOW_BOOTSTRAP" ] && parts="$parts GZIPPY_SLOW_BOOTSTRAP=$GZIPPY_SLOW_BOOTSTRAP"
+  [ -n "$GZIPPY_SLOW_MODE" ] && parts="$parts GZIPPY_SLOW_MODE=$GZIPPY_SLOW_MODE"
+  [ -n "$GZIPPY_SLOW_KIND" ] && parts="$parts GZIPPY_SLOW_KIND=$GZIPPY_SLOW_KIND"
   echo "$parts"
 }
 
