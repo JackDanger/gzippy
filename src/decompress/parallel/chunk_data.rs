@@ -460,7 +460,7 @@ impl ChunkData {
         let decoded_data_len = self.data.len();
         let mut out = [0u8; W];
         if decoded_data_len >= W {
-            self.data.copy_last_into(&mut out);
+            self.data.copy_last_32k(&mut out);
             Some(out)
         } else if total >= W {
             // Tail straddles markers + clean. Markers in the trailing
@@ -507,9 +507,7 @@ impl ChunkData {
         }
         let decoded_data_len = self.data.len();
         if decoded_data_len >= W {
-            let mut out = vec![0u8; W];
-            self.data.copy_last_into(&mut out);
-            return Some(out);
+            return Some(self.data.copy_last_32k_vec());
         }
         if total >= W {
             // Tail straddles markers + clean. Markers in the trailing W
@@ -1073,6 +1071,21 @@ impl ChunkData {
         let data_skip = self.data_prefix_len;
         let decoded_data_len = self.data.len().saturating_sub(data_skip);
         let total = dwm_len + decoded_data_len;
+
+        if dwm_len == 0 {
+            if decoded_data_len >= W {
+                self.data.copy_last_into(window);
+                return;
+            }
+            if data_skip == 0 {
+                let from_prev = W - decoded_data_len;
+                window[..from_prev].copy_from_slice(&predecessor_window[decoded_data_len..]);
+                if decoded_data_len > 0 {
+                    self.data.copy_range_into(0, &mut window[from_prev..]);
+                }
+                return;
+            }
+        }
 
         if total >= W {
             let mut offset = total - W;
@@ -1847,6 +1860,38 @@ mod tests {
         assert_eq!(&tail[..W - 100], &prev[100..]);
         // Tail: all 0xAB.
         assert!(tail[W - 100..].iter().all(|b| *b == 0xAB));
+    }
+
+    #[test]
+    fn get_last_window_vec_matches_array_path() {
+        const W: usize = 32768;
+        let mut prev = [0u8; W];
+        for (i, b) in prev.iter_mut().enumerate() {
+            *b = ((i * 13) & 0xff) as u8;
+        }
+
+        let mut chunk = ChunkData::new(0, small_config());
+        chunk.append_markered(&[1, 2, 3, MARKER_BASE + 7, MARKER_BASE + 9]);
+        let clean = vec![0x5Au8; W + 257];
+        chunk.append_clean(&clean);
+
+        assert_eq!(
+            chunk.get_last_window_vec(&prev),
+            chunk.get_last_window(&prev).to_vec()
+        );
+    }
+
+    #[test]
+    fn last_32kib_window_vec_matches_array_fast_path() {
+        const W: usize = 32768;
+        let mut chunk = ChunkData::new(0, small_config());
+        let clean: Vec<u8> = (0..(W + 1234)).map(|i| (i & 0xff) as u8).collect();
+        chunk.append_clean(&clean);
+
+        assert_eq!(
+            chunk.last_32kib_window_vec().unwrap(),
+            chunk.last_32kib_window().unwrap().to_vec()
+        );
     }
 
     #[test]

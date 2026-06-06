@@ -305,16 +305,34 @@ impl SegmentedU8 {
         self.buf.iter().copied()
     }
 
-    /// Copy the last `n` logical bytes into `out` (exactly `n` long).
-    /// Used to source a chunk's trailing 32 KiB sliding window.
-    pub fn copy_last_into(&self, out: &mut [u8]) {
-        let n = out.len();
+    #[inline]
+    fn tail_slice(&self, n: usize) -> &[u8] {
         debug_assert!(
             n <= self.buf.len(),
-            "copy_last_into: n {n} > len {}",
+            "tail_slice: n {n} > len {}",
             self.buf.len()
         );
-        out.copy_from_slice(&self.buf[self.buf.len() - n..]);
+        &self.buf[self.buf.len() - n..]
+    }
+
+    /// Copy the last `n` logical bytes into `out` (exactly `n` long).
+    /// Used to source a chunk's trailing 32 KiB sliding window.
+    #[inline]
+    pub fn copy_last_into(&self, out: &mut [u8]) {
+        out.copy_from_slice(self.tail_slice(out.len()));
+    }
+
+    /// Specialized hot-path tail copy for the consumer publish chain.
+    #[inline]
+    pub fn copy_last_32k(&self, out: &mut [u8; 32768]) {
+        out.copy_from_slice(self.tail_slice(32768));
+    }
+
+    /// Vec-producing twin of [`Self::copy_last_32k`]. One 32 KiB allocation,
+    /// one memcpy from the contiguous tail.
+    #[inline]
+    pub fn copy_last_32k_vec(&self) -> Vec<u8> {
+        self.tail_slice(32768).to_vec()
     }
 
     /// Prepend `bytes` as the new logical prefix. Mirror of vendor's
@@ -538,5 +556,18 @@ mod tests {
         let mut last = [0u8; 2];
         buf.copy_last_into(&mut last);
         assert_eq!(&last, b"bc");
+    }
+
+    #[test]
+    fn copy_last_32k_fast_path_matches_tail() {
+        let mut buf = SegmentedU8::default();
+        let total = 64 * 1024;
+        let src: Vec<u8> = (0..total).map(|i| (i & 0xFF) as u8).collect();
+        buf.extend_from_slice(&src);
+
+        let mut out = [0u8; 32768];
+        buf.copy_last_32k(&mut out);
+        assert_eq!(&out[..], &src[src.len() - 32768..]);
+        assert_eq!(buf.copy_last_32k_vec(), src[src.len() - 32768..].to_vec());
     }
 }
