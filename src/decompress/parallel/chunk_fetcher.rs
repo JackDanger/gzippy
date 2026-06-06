@@ -2590,7 +2590,14 @@ fn queue_prefetched_marker_postprocess(
         // at a time on the consumer's serial L_resolve path. Byte-exact:
         // get_last_window is deterministic and window_map insert overwrites
         // (WindowMap is overwrite-safe by design); only resolution TIMING moves.
-        if arc.encoded_size_bits > 0 {
+        // Publish end-window only for marker-free chunks. Unresolved marker
+        // bytes make `get_last_window` non-deterministic vs the post-resolve
+        // tail → rare CRC flake at T≥2 (~1%) when successors resolve against
+        // the early-published window (GZIPPY_NO_PUBLISH_AHEAD=1 disables all).
+        if arc.encoded_size_bits > 0
+            && arc.data_with_markers.is_empty()
+            && std::env::var_os("GZIPPY_NO_PUBLISH_AHEAD").is_none()
+        {
             let chunk_end_bit = arc.encoded_offset_bits + arc.encoded_size_bits;
             if !window_map.contains(chunk_end_bit) {
                 let pred_bytes = materialize_window(&predecessor_window);
