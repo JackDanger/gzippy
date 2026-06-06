@@ -72,11 +72,6 @@ impl<'a> StagedBitInput<'a> {
         }
     }
 
-    #[inline]
-    pub fn buffer_base_byte(&self) -> usize {
-        self.buf_base_byte
-    }
-
     /// Absolute bit position of the next bit to consume.
     #[inline]
     pub fn bit_position(&self) -> usize {
@@ -97,30 +92,15 @@ impl<'a> StagedBitInput<'a> {
     }
 
     #[inline]
+    #[allow(dead_code)] // staged_bits unit tests
     pub fn bitsleft(&self) -> u32 {
         self.inner.bitsleft
     }
 
     #[inline]
+    #[allow(dead_code)] // staged_bits unit tests
     pub fn pos(&self) -> usize {
         self.inner.pos
-    }
-
-    #[inline]
-    pub fn set_local(&mut self, pos: usize, bitbuf: u64, bitsleft: u32) {
-        self.inner.pos = pos;
-        self.inner.bitbuf = bitbuf;
-        self.inner.bitsleft = bitsleft;
-    }
-
-    #[inline]
-    pub fn staging_ptr(&self) -> *const u8 {
-        self.buf.as_ptr()
-    }
-
-    #[inline]
-    pub fn staging_len(&self) -> usize {
-        self.buf_len
     }
 
     pub fn refill(&mut self) {
@@ -157,6 +137,14 @@ impl<'a> StagedBitInput<'a> {
     pub fn seek_abs_byte(&mut self, byte: usize) {
         let bit = byte.saturating_mul(8).min(self.until_bits);
         let _ = self.reload_at_bit(bit);
+    }
+
+    /// Rebuild the 128 KiB staging window from the full-input oracle at
+    /// `bit_pos`. Used when the Huffman fastloop mirrors `Bits` on the
+    /// mmap'd `full` slice and must push absolute progress back into
+    /// `StagedBitInput` for block-header entry (`try_enter_next_block`).
+    pub(crate) fn sync_at_absolute_bit(&mut self, bit_pos: usize) {
+        let _ = self.reload_at_bit(bit_pos);
     }
 
     /// Reload staging once every byte in the current chunk is in `inner.pos`
@@ -369,13 +357,19 @@ mod tests {
 
     #[test]
     fn silesia_staged_reader_tracks_direct_to_eof() {
-        let path = std::path::Path::new("benchmark_data/silesia-gzip.tar.gz");
-        if !path.exists() {
+        let large = std::path::Path::new("benchmark_data/silesia-large.gz");
+        let tar = std::path::Path::new("benchmark_data/silesia-gzip.tar.gz");
+        let path = if large.exists() {
+            large
+        } else if tar.exists() {
+            tar
+        } else {
             eprintln!("skip: silesia fixture missing");
             return;
-        }
+        };
         let gzip = std::fs::read(path).unwrap();
-        let deflate = &gzip[10..gzip.len() - 8];
+        let header = crate::decompress::format::parse_gzip_header_size(&gzip).unwrap_or(10);
+        let deflate = &gzip[header..gzip.len() - 8];
         let until = deflate.len() * 8;
         let mut staged = StagedBitInput::with_until_bits(deflate, 0, until).unwrap();
         let mut direct = Bits::at_bit_offset(deflate, 0);

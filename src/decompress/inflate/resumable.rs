@@ -245,7 +245,11 @@ pub struct ResumableInflate2<'a> {
     /// Vendor `IsalInflateWrapper::m_buffer` (`gzip/isal.hpp:205-250`): inner
     /// `Bits` reads from a 128 KiB staging window into `full` so branchless
     /// refills stay in-bounds on mmap'd multi-MiB input.
-    pub(crate) bits: StagedBitInput<'a>,
+    ///
+    /// Heap-backed: `inner.data` points at `buf` inside this struct (vendor
+    /// `m_bitReader` → `m_buffer`). An inline `StagedBitInput` moved with
+    /// `ResumableInflate2` and corrupted `inner.data` (x86 `silesia-large`).
+    pub(crate) bits: Box<StagedBitInput<'a>>,
     pub(crate) window: SlidingWindow,
     pub(crate) block_state: BlockState,
     pub(crate) pending_match: Option<PendingMatch>,
@@ -295,7 +299,9 @@ impl<'a> ResumableInflate2<'a> {
             ));
         }
         Ok(Self {
-            bits: StagedBitInput::with_until_bits(input, bit_offset, until_bits)?,
+            bits: Box::new(StagedBitInput::with_until_bits(
+                input, bit_offset, until_bits,
+            )?),
             window: SlidingWindow::default(),
             block_state: BlockState::default(),
             pending_match: None,
@@ -1034,13 +1040,20 @@ fn decode_huffman_body_resumable(
     // `state.bits` (it only reads `state.window` and writes
     // `state.pending_match`), so we don't need to write back / re-lift
     // around that call — only at return sites.
-    let mut bitbuf: u64 = state.bits.bitbuf();
-    let mut bitsleft: u32 = state.bits.bitsleft();
-    let mut in_pos: usize = state.bits.pos();
-    let mut buffer_base_byte: usize = state.bits.buffer_base_byte();
-    let mut in_data_len: usize = state.bits.staging_len();
-    let mut in_data_ptr: *const u8 = state.bits.staging_ptr();
+    // Huffman fastloop mirrors `Bits` on the mmap'd `full` slice (absolute
+    // `in_pos`), identical to the pre-staging hot loop. `StagedBitInput`
+    // is oracle-synced on writeback so `try_enter_next_block` still reads
+    // through the 128 KiB window. Staging-relative locals drifted `bitbuf`
+    // on silesia-large while `bit_position()` still matched.
+    let full = state.bits.full_input();
+    let in_data: &[u8] = full;
+    let in_data_len: usize = full.len();
+    let in_data_ptr: *const u8 = full.as_ptr();
     let encoded_until_bits: usize = state.encoded_until_bits;
+    let oracle = Bits::at_bit_offset(full, state.bits.bit_position());
+    let mut bitbuf: u64 = oracle.bitbuf;
+    let mut bitsleft: u32 = oracle.bitsleft;
+    let mut in_pos: usize = oracle.pos;
 
     // Lever T0 (tight-Huffman-decoder plan): lift output base pointer
     // and length to locals so literal writes go through raw-pointer
@@ -1055,118 +1068,56 @@ fn decode_huffman_body_resumable(
     let output_len: usize = output.len();
 
     #[inline(always)]
-    fn abs_bit_position(bitsleft: u32, in_pos: usize, buffer_base_byte: usize) -> usize {
-        let unread = (bitsleft as u8).min(64) as isize;
-        let rel = (in_pos as isize) * 8 - unread;
-        let abs = (buffer_base_byte as isize) * 8 + rel;
-        abs.max(0) as usize
+    fn bit_position_of(bitsleft: u32, in_pos: usize) -> usize {
+        let unread = (bitsleft as u8).min(64) as usize;
+        in_pos.saturating_mul(8).saturating_sub(unread)
     }
 
-    macro_rules! lift_staging_locals {
-        () => {{
-            bitbuf = state.bits.bitbuf();
-            bitsleft = state.bits.bitsleft();
-            in_pos = state.bits.pos();
-            buffer_base_byte = state.bits.buffer_base_byte();
-            in_data_len = state.bits.staging_len();
-            in_data_ptr = state.bits.staging_ptr();
-        }};
-    }
-
-    // Mirror of `Bits::refill`
-    // (`consume_first_decode.rs:245-264`): branchless 8-byte unaligned
-    // load when room, byte-by-byte slow path otherwise. Identical
-    // arithmetic and underflow handling.
     macro_rules! refill_local {
         () => {{
-            'staging_refill: loop {
-                let mut bits_u8 = bitsleft as u8;
-                if bits_u8 > 64 {
-                    bitbuf = 0;
-                    bits_u8 = 0;
-                }
-                if in_pos + 8 <= in_data_len {
-                    let word = unsafe { (in_data_ptr.add(in_pos) as *const u64).read_unaligned() };
-                    let word = u64::from_le(word);
-                    bitbuf |= word << bits_u8;
-                    in_pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
-                    bitsleft = (bits_u8 as u32) | 56;
-                } else {
-                    // Slow path: byte-by-byte until 56 bits filled or EOF.
-                    let mut b = bits_u8;
-                    while b <= 56 && in_pos < in_data_len {
-                        let byte = unsafe { *in_data_ptr.add(in_pos) };
-                        bitbuf |= (byte as u64) << b;
-                        in_pos += 1;
-                        b = b.wrapping_add(8);
-                    }
-                    bitsleft = b as u32;
-                }
-                let b = bitsleft as u8;
-                if in_pos < in_data_len {
-                    if b >= REFILL_THRESHOLD {
-                        writeback_bits!();
-                        break 'staging_refill;
-                    }
-                    continue 'staging_refill;
-                }
-                // Staging bytes exhausted; slide window (preserves bitbuf).
-                writeback_bits!();
-                let prev_base = buffer_base_byte;
-                state.bits.refill();
-                if state.bits.buffer_base_byte() != prev_base {
-                    lift_staging_locals!();
-                    continue 'staging_refill;
-                }
-                lift_staging_locals!();
-                break 'staging_refill;
+            let mut bits_u8 = bitsleft as u8;
+            if bits_u8 > 64 {
+                bitbuf = 0;
+                bits_u8 = 0;
             }
-        }};
-    }
-
-    // Lever T4b (P1.1, resumable-contract tax): branchless refill for the
-    // FASTLOOP body ONLY. Identical arithmetic to `refill_local!`'s fast
-    // arm but WITHOUT the per-refill `in_pos + 8 <= in_data_len` bounds
-    // branch — the FASTLOOP entry condition `in_pos < in_fl_end` (where
-    // `in_fl_end = in_data_len - FASTLOOP_INPUT_TAIL`, TAIL=32) already
-    // guarantees the 8-byte unaligned load stays in bounds: a single
-    // `decode_one_symbol!` iteration issues at most ONE refill, which
-    // advances `in_pos` by ≤7, so the load touches at most
-    // `(in_fl_end - 1) + 7 + 8 = in_data_len - 18 < in_data_len`.
-    //
-    // The `bits_u8 > 64` underflow guard is RETAINED (it's a no-op when
-    // the pre-lookup `< REFILL_THRESHOLD` refill holds bitsleft in
-    // [48, 63], and a correct fixup otherwise) so this macro is
-    // byte-for-byte equivalent to `refill_local!` on every input the
-    // FASTLOOP admits — the ONLY elided work is the unpredictable
-    // bounds branch. Vendor counterpart: `consume_first_decode.rs:694`
-    // `refill_branchless_fast!` (used identically inside that decoder's
-    // fastloop where `in_pos < in_fastloop_end` provides the same
-    // guarantee).
-    macro_rules! refill_fast {
-        () => {{
-            if in_pos + 8 > in_data_len {
-                refill_local!();
-            } else {
-                let mut bits_u8 = bitsleft as u8;
-                if bits_u8 > 64 {
-                    bitbuf = 0;
-                    bits_u8 = 0;
-                }
+            if in_pos + 8 <= in_data_len {
                 let word = unsafe { (in_data_ptr.add(in_pos) as *const u64).read_unaligned() };
                 let word = u64::from_le(word);
                 bitbuf |= word << bits_u8;
                 in_pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
                 bitsleft = (bits_u8 as u32) | 56;
+            } else {
+                let mut b = bits_u8;
+                while b <= 56 && in_pos < in_data_len {
+                    bitbuf |= (in_data[in_pos] as u64) << b;
+                    in_pos += 1;
+                    b = b.wrapping_add(8);
+                }
+                bitsleft = b as u32;
             }
         }};
     }
 
-    // Sync locals back into state.bits. Call before any return that
-    // expects subsequent calls to observe the consumed bits.
+    macro_rules! refill_fast {
+        () => {{
+            let mut bits_u8 = bitsleft as u8;
+            if bits_u8 > 64 {
+                bitbuf = 0;
+                bits_u8 = 0;
+            }
+            let word = unsafe { (in_data_ptr.add(in_pos) as *const u64).read_unaligned() };
+            let word = u64::from_le(word);
+            bitbuf |= word << bits_u8;
+            in_pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
+            bitsleft = (bits_u8 as u32) | 56;
+        }};
+    }
+
     macro_rules! writeback_bits {
         () => {{
-            state.bits.set_local(in_pos, bitbuf, bitsleft);
+            state
+                .bits
+                .sync_at_absolute_bit(bit_position_of(bitsleft, in_pos));
         }};
     }
 
@@ -1468,67 +1419,36 @@ fn decode_huffman_body_resumable(
 
     // Outer loop alternates: try the fastloop, then run safe iterations
     // until either we can re-enter the fastloop OR a yield/EOB fires.
-    let cap_abs_byte = encoded_until_bits / 8;
-    let out_fl_end = output_len.saturating_sub(FASTLOOP_MARGIN);
     loop {
         // FASTLOOP entry condition. Bounds:
         //   - in_pos < in_data_len - 32: refill_fast! 8-byte loads safe
         //     (32-byte tail covers the ≤1 refill/iter, ≤7-byte advance)
-        //   - abs bit position < encoded_until_bits: won't decode past cap
+        //   - in_pos * 8 < encoded_until_bits: won't decode past cap
         //   - out_pos < output_len - FASTLOOP_MARGIN: any single iter's
         //     write fits (max match 258 + literals)
-        //
-        // `cap_rel_byte_floor` is the encoded-until cap relative to the
-        // current staging window base — MUST be recomputed after every
-        // `refill_local!` slide (x86 repro: stale cap let in_pos run past
-        // `encoded_until_bits` once `buffer_base_byte` advanced).
-        let cap_rel_byte_floor = cap_abs_byte.saturating_sub(buffer_base_byte);
+        let cap_byte_floor = encoded_until_bits / 8;
         let in_fl_end = in_data_len
             .saturating_sub(FASTLOOP_INPUT_TAIL)
-            .min(cap_rel_byte_floor);
+            .min(cap_byte_floor);
+        let out_fl_end = output_len.saturating_sub(FASTLOOP_MARGIN);
 
-        if in_pos < in_fl_end
-            && out_pos < out_fl_end
-            && abs_bit_position(bitsleft, in_pos, buffer_base_byte) < encoded_until_bits
-        {
+        if in_pos < in_fl_end && out_pos < out_fl_end {
             BODY_RESUMABLE_FASTLOOP_ENTERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            while out_pos < out_fl_end {
-                let cap_rel_byte_floor = cap_abs_byte.saturating_sub(buffer_base_byte);
-                let in_fl_end = in_data_len
-                    .saturating_sub(FASTLOOP_INPUT_TAIL)
-                    .min(cap_rel_byte_floor);
-                if in_pos >= in_fl_end
-                    || abs_bit_position(bitsleft, in_pos, buffer_base_byte) >= encoded_until_bits
-                {
-                    break;
-                }
-                // FASTLOOP: branchless refill — the `in_pos < in_fl_end`
-                // bound makes the bounds check redundant (P1.1 tax-elide).
+            while in_pos < in_fl_end && out_pos < out_fl_end {
                 decode_one_symbol!(refill_fast);
             }
-            // Fastloop exited because bounds broke. Re-evaluate yield
-            // conditions at the safe-loop top.
             continue;
         }
 
-        // SAFE LOOP iteration: per-iter yield checks then ONE symbol.
-        // SAFETY boundary: `out_pos < output_len` after the next check;
-        // the unsafe literal writes inside `decode_one_symbol!` rely on
-        // this invariant.
         if out_pos >= output_len {
             writeback_bits!();
             return Ok(out_pos);
         }
-        if abs_bit_position(bitsleft, in_pos, buffer_base_byte) >= encoded_until_bits {
+        if bit_position_of(bitsleft, in_pos) >= encoded_until_bits {
             writeback_bits!();
             return Ok(out_pos);
         }
 
-        // One safe iteration via the shared body macro. The macro's
-        // `continue` returns to the outer `loop` top, which re-checks
-        // the FASTLOOP entry conditions before running another safe
-        // iteration. SAFE loop uses `refill_local` (bounds-checked) since
-        // it runs right up to EOF where the 32-byte tail isn't guaranteed.
         decode_one_symbol!(refill_local);
     }
 }
@@ -2115,6 +2035,31 @@ mod tests {
         );
         let got = decode_via_resumable_in_chunks(&stream, 4096);
         assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn silesia_large_resumable_monolithic_if_available() {
+        let path = std::path::Path::new("benchmark_data/silesia-large.gz");
+        if !path.exists() {
+            eprintln!("skip: benchmark_data/silesia-large.gz missing");
+            return;
+        }
+        let gzip = std::fs::read(path).expect("read silesia-large.gz");
+        let header = crate::decompress::format::parse_gzip_header_size(&gzip).unwrap_or(10);
+        let trailer = 8usize;
+        let deflate = &gzip[header..gzip.len().saturating_sub(trailer)];
+        let expected = u32::from_le_bytes(gzip[gzip.len() - 4..].try_into().unwrap()) as usize;
+        let got = decode_via_resumable_in_chunks(deflate, 64 * 1024);
+        assert_eq!(
+            got.len(),
+            expected,
+            "monolithic ResumableInflate2 length mismatch"
+        );
+        let raw_path = std::path::Path::new("benchmark_data/silesia-large.bin");
+        if raw_path.exists() {
+            let raw = std::fs::read(raw_path).expect("read silesia-large.bin");
+            assert_eq!(got, raw, "monolithic ResumableInflate2 byte mismatch");
+        }
     }
 
     #[test]
