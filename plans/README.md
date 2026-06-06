@@ -6,7 +6,8 @@
 
 | Doc | Role |
 |-----|------|
-| [`structural-gap-closure.md`](structural-gap-closure.md) | **Active:** function-level closure plan (vendor port, bit contracts, phases 0–5) |
+| [`structural-gap-closure.md`](structural-gap-closure.md) | **Active:** divergence record (Fulcrum `0462f88` + forensic audit B1/B2/A1) |
+| [`path-mix-instrumentation.md`](path-mix-instrumentation.md) | Gate 0/1 path-mix counters + rapidgzip trace patch spec |
 | [`sm-parity-gap-matrix.md`](sm-parity-gap-matrix.md) | Gap matrix, closure designs (C–M), execution order |
 | [`wall-progress.md`](wall-progress.md) | Survived-disproof findings only (causal perturbation verdicts) |
 | [`parallel-sm-model.md`](parallel-sm-model.md) | Publish-chain + window-absent quantitative model |
