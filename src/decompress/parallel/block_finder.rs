@@ -342,8 +342,15 @@ impl<'a> BitReader<'a> {
 
 #[derive(Clone, Debug)]
 pub struct BlockBoundary {
-    /// Bit offset in the compressed stream
+    /// Earliest valid bit offset for this boundary (`offset.first` in vendor).
     pub bit_offset: usize,
+    /// Actual bit to seek/decode from (`offset.second` in vendor).
+    ///
+    /// Dynamic/fixed boundaries decode at `bit_offset`. Stored blocks may
+    /// admit an earlier logical boundary due to zero padding, so `seek_bit`
+    /// is the byte-aligned header position (`byte_bit - 3`) while
+    /// `bit_offset` stays at the earliest valid start.
+    pub seek_bit: usize,
     /// Whether this is a valid block start
     pub valid: bool,
     /// HLIT value (literal code count - 257)
@@ -603,7 +610,7 @@ impl<'a> BlockFinder<'a> {
         candidates
             .into_iter()
             .find(|b| b.bit_offset >= from_bit)
-            .map(|b| b.bit_offset)
+            .map(|b| b.seek_bit)
     }
 
     /// Literal port of rapidgzip's `seekToNonFinalUncompressedDeflateBlock`
@@ -611,8 +618,9 @@ impl<'a> BlockFinder<'a> {
     /// Scans byte boundaries for the LEN/~LEN coincidence pattern, then
     /// validates the 3-bit deflate header preceding the byte boundary.
     /// Returns all detected stored-block candidates (one per match), each
-    /// emitted at the EARLIEST valid bit offset (rapidgzip's offset.first,
-    /// matching the next-block boundary the predecessor would land on).
+    /// emitted as a vendor-style offset pair: `bit_offset = offset.first`
+    /// (the EARLIEST valid bit offset) and `seek_bit = offset.second`
+    /// (`byte_bit - 3`, the actual decode seek position).
     ///
     /// `start_bit` and `end_bit` are bit positions into `self.data`.
     fn find_uncompressed_blocks(&self, start_bit: usize, end_bit: usize) -> Vec<BlockBoundary> {
@@ -710,6 +718,7 @@ impl<'a> BlockFinder<'a> {
                 }
                 out.push(BlockBoundary {
                     bit_offset: earliest,
+                    seek_bit: latest,
                     valid: true,
                     hlit: 0,
                     hdist: 0,
@@ -731,8 +740,28 @@ impl<'a> BlockFinder<'a> {
         let mut dynamic = self.find_dynamic_blocks(start_bit, end_bit);
         let uncompressed = self.find_uncompressed_blocks(start_bit, end_bit);
         dynamic.extend(uncompressed);
-        dynamic.sort_by_key(|b| b.bit_offset);
+        dynamic.sort_by_key(|b| (b.bit_offset, b.seek_bit));
         dynamic
+    }
+
+    pub(crate) fn find_next_dynamic_block(
+        &self,
+        start_bit: usize,
+        end_bit: usize,
+    ) -> Option<BlockBoundary> {
+        self.find_dynamic_blocks(start_bit, end_bit)
+            .into_iter()
+            .next()
+    }
+
+    pub(crate) fn find_next_uncompressed_block(
+        &self,
+        start_bit: usize,
+        end_bit: usize,
+    ) -> Option<BlockBoundary> {
+        self.find_uncompressed_blocks(start_bit, end_bit)
+            .into_iter()
+            .next()
     }
 
     /// Dynamic-Huffman block finder. Direct port of rapidgzip's
@@ -773,6 +802,7 @@ impl<'a> BlockFinder<'a> {
                     if self.validate_stored_block(bit_offset) {
                         blocks.push(BlockBoundary {
                             bit_offset,
+                            seek_bit: bit_offset,
                             valid: true,
                             hlit: 0,
                             hdist: 0,
@@ -791,6 +821,7 @@ impl<'a> BlockFinder<'a> {
                     if validate_fixed_block_prefix(self.data, bit_offset) {
                         blocks.push(BlockBoundary {
                             bit_offset,
+                            seek_bit: bit_offset,
                             valid: true,
                             hlit: 0,
                             hdist: 0,
@@ -840,6 +871,7 @@ impl<'a> BlockFinder<'a> {
                         ) {
                             blocks.push(BlockBoundary {
                                 bit_offset,
+                                seek_bit: bit_offset,
                                 valid: true,
                                 hlit,
                                 hdist,
@@ -1162,8 +1194,8 @@ pub fn find_blocks_parallel(data: &[u8], num_threads: usize) -> Vec<BlockBoundar
         .collect();
 
     // Sort by bit offset and deduplicate
-    all_blocks.sort_by_key(|b| b.bit_offset);
-    all_blocks.dedup_by_key(|b| b.bit_offset);
+    all_blocks.sort_by_key(|b| (b.bit_offset, b.seek_bit));
+    all_blocks.dedup_by_key(|b| (b.bit_offset, b.seek_bit));
 
     all_blocks
 }

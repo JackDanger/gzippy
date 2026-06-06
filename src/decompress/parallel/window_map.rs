@@ -33,21 +33,6 @@ pub const DEFAULT_WINDOW_COMPRESSION: CompressionType = CompressionType::Zlib;
 
 struct Inner {
     entries: BTreeMap<usize, Window>,
-    /// Speculative side-slot (Design B). Windows here are the
-    /// provably-clean tails of RANGE-speculative chunks (`max > encoded`)
-    /// that the WORKER publishes right after decode — BEFORE the consumer
-    /// confirms the chunk's start. They are keyed at the chunk's would-be
-    /// `chunk_end_bit` on accept (= `encoded_offset_bits + encoded_size_bits`,
-    /// which `set_encoded_offset` preserves through the consumer's accept
-    /// rewrite — see `insert_speculative`'s callers for the proof).
-    ///
-    /// CORRECTNESS: this map is INTENTIONALLY invisible to `get`,
-    /// `get_predecessor`, `has_predecessor`, and `contains` — a successor
-    /// must NEVER resolve against an unconfirmed window. The consumer
-    /// moves an entry into `entries` only at ACCEPT (`promote_speculative`)
-    /// and drops it at REJECT (`evict_speculative`), both synchronously on
-    /// the single consumer thread before it advances to any successor.
-    speculative: BTreeMap<usize, Window>,
 }
 
 /// Thread-safe handle to the underlying map. Cheaply clonable; all
@@ -66,7 +51,6 @@ impl WindowMap {
         Self {
             state: Arc::new(Mutex::new(Inner {
                 entries: BTreeMap::new(),
-                speculative: BTreeMap::new(),
             })),
             compression: DEFAULT_WINDOW_COMPRESSION,
         }
@@ -79,7 +63,6 @@ impl WindowMap {
         Self {
             state: Arc::new(Mutex::new(Inner {
                 entries: BTreeMap::new(),
-                speculative: BTreeMap::new(),
             })),
             compression,
         }
@@ -207,162 +190,8 @@ impl WindowMap {
             .map(|(k, v)| (*k, v.clone()))
     }
 
-    /// Worker-only exact lookup: confirmed `entries` then `speculative`.
-    /// Consumer `get` stays confirmed-only so successors never resolve
-    /// against un-promoted tails.
-    pub fn get_at_worker(&self, encoded_offset_bits: usize) -> Option<Window> {
-        let g = self.state.lock().unwrap();
-        g.entries
-            .get(&encoded_offset_bits)
-            .or_else(|| g.speculative.get(&encoded_offset_bits))
-            .cloned()
-    }
-
-    /// Worker-only predecessor from **confirmed** `entries` only.
-    /// Used for Design H′ (decode at `pred_key` before partition seed): speculative
-    /// side-slot keys can be chain-invalid on low-entropy fixtures.
-    pub fn get_confirmed_predecessor_for_worker(
-        &self,
-        encoded_offset_bits: usize,
-    ) -> Option<(usize, Window)> {
-        let g = self.state.lock().unwrap();
-        g.entries
-            .range(..=encoded_offset_bits)
-            .next_back()
-            .map(|(k, v)| (*k, v.clone()))
-    }
-
-    /// Worker-only `get_predecessor` merging confirmed + speculative maps.
-    pub fn get_predecessor_for_worker(
-        &self,
-        encoded_offset_bits: usize,
-    ) -> Option<(usize, Window)> {
-        let g = self.state.lock().unwrap();
-        let pick = |map: &BTreeMap<usize, Window>| {
-            map.range(..=encoded_offset_bits)
-                .next_back()
-                .map(|(k, v)| (*k, v.clone()))
-        };
-        match (pick(&g.entries), pick(&g.speculative)) {
-            (Some((k1, w1)), Some((k2, w2))) => {
-                if k1 >= k2 {
-                    Some((k1, w1))
-                } else {
-                    Some((k2, w2))
-                }
-            }
-            (Some(x), None) | (None, Some(x)) => Some(x),
-            (None, None) => None,
-        }
-    }
-
     pub fn has_predecessor(&self, encoded_offset_bits: usize) -> bool {
         self.get_predecessor(encoded_offset_bits).is_some()
-    }
-
-    /// Worker-only handoff lookup for KEY-MISMATCH speculative prefetch.
-    /// Returns the largest published window key in `(low_exclusive, high_inclusive]`,
-    /// merging confirmed `entries` and worker early-published `speculative` tails.
-    /// Consumer `get_predecessor` / `contains` intentionally ignore speculative;
-    /// without this merge, handoff decode misses ~97% of predecessor windows that
-    /// exist only in the side-slot until consumer promote.
-    pub fn get_handoff_in_partition(
-        &self,
-        low_exclusive: usize,
-        high_inclusive: usize,
-    ) -> Option<(usize, Window)> {
-        use std::ops::Bound;
-        if low_exclusive >= high_inclusive {
-            return None;
-        }
-        let g = self.state.lock().unwrap();
-        let pick = |map: &BTreeMap<usize, Window>| {
-            map.range((
-                Bound::Excluded(low_exclusive),
-                Bound::Included(high_inclusive),
-            ))
-            .next_back()
-            .map(|(k, v)| (*k, v.clone()))
-        };
-        match (pick(&g.entries), pick(&g.speculative)) {
-            (Some((k1, w1)), Some((k2, w2))) => {
-                if k1 >= k2 {
-                    Some((k1, w1))
-                } else {
-                    Some((k2, w2))
-                }
-            }
-            (Some(x), None) | (None, Some(x)) => Some(x),
-            (None, None) => None,
-        }
-    }
-
-    // ── Speculative side-slot (Design B) ──────────────────────────────
-    //
-    // The worker publishes a RANGE-speculative chunk's provably-clean tail
-    // window into a SEPARATE map keyed at the chunk's would-be accept-time
-    // `chunk_end_bit`. Successor resolution (`get`/`get_predecessor`/
-    // `has_predecessor`/`contains`) never reads this map, so an unconfirmed
-    // window can never seed a successor. The consumer moves it into the
-    // real map at ACCEPT (`promote_speculative`) or drops it at REJECT
-    // (`evict_speculative`). Both run on the single consumer thread,
-    // synchronously, before it advances to any successor → atomic w.r.t.
-    // accept/reject from every reader's point of view.
-
-    /// Worker-side: stash a speculative tail window keyed at `key`
-    /// (the chunk's accept-time `chunk_end_bit`). Overwrite semantics
-    /// match `insert` — a later worker re-decode at the same key wins.
-    /// Returns whether an entry was newly inserted (false = overwrote).
-    pub fn insert_speculative(&self, key: usize, window: Window) {
-        self.state.lock().unwrap().speculative.insert(key, window);
-    }
-
-    /// Zero-copy `CompressionType::None` speculative insert — twin of
-    /// `insert_owned_none` for the side-slot. Takes ownership of a freshly
-    /// built 32 KiB tail `Vec<u8>` (no `to_vec`).
-    pub fn insert_speculative_owned_none(&self, key: usize, bytes: Vec<u8>) {
-        let cv = Arc::new(CompressedVector::from_owned_none(bytes));
-        self.insert_speculative(key, cv);
-    }
-
-    /// Consumer-side ACCEPT: move the speculative window at `key` into the
-    /// real map (making it visible to successors). No-op if absent (the
-    /// worker may have skipped early-publish — e.g. unclean tail — in
-    /// which case the consumer's serial publish handles the key). Returns
-    /// whether a speculative entry was promoted.
-    ///
-    /// Promotion is an IDENTITY-KEY move: on accept the consumer's
-    /// `chunk_end_bit` equals the worker's speculative key by construction
-    /// (set_encoded_offset preserves `encoded_offset_bits + encoded_size_bits`),
-    /// and the bytes are the chunk's predecessor-independent clean tail, so
-    /// the promoted window is byte-identical to the window the consumer
-    /// would otherwise publish serially.
-    pub fn promote_speculative(&self, key: usize) -> bool {
-        let mut g = self.state.lock().unwrap();
-        if let Some(w) = g.speculative.remove(&key) {
-            g.entries.insert(key, w);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Consumer-side REJECT: drop the speculative window at `key` so a
-    /// stale unconfirmed tail can never be promoted later. No-op if absent.
-    /// Returns whether an entry was evicted.
-    pub fn evict_speculative(&self, key: usize) -> bool {
-        self.state
-            .lock()
-            .unwrap()
-            .speculative
-            .remove(&key)
-            .is_some()
-    }
-
-    /// Diagnostic: number of windows currently parked in the speculative
-    /// side-slot (un-promoted, un-evicted).
-    pub fn speculative_len(&self) -> usize {
-        self.state.lock().unwrap().speculative.len()
     }
 }
 
@@ -474,128 +303,6 @@ mod tests {
         m.insert(50, window_of(0x01));
         m.insert(50, window_of(0x02));
         assert_eq!(m.get(50).unwrap().raw_bytes()[0], 0x02);
-    }
-
-    #[test]
-    fn speculative_slot_is_invisible_to_successor_resolution() {
-        // The whole correctness premise: an un-promoted speculative window
-        // must NEVER be reachable by get / get_predecessor / has_predecessor
-        // / contains — otherwise a successor resolves against an
-        // unconfirmed (possibly-stale) window and corrupts output.
-        let m = WindowMap::with_compression(CompressionType::None);
-        m.insert_speculative(1000, window_of(0xAB));
-        assert!(m.get(1000).is_none());
-        assert!(!m.contains(1000));
-        assert!(!m.has_predecessor(1000));
-        assert!(m.get_predecessor(1000).is_none());
-        assert!(
-            m.is_empty(),
-            "speculative entry must not count as a real entry"
-        );
-        assert_eq!(m.speculative_len(), 1);
-    }
-
-    #[test]
-    fn get_at_worker_reads_speculative_without_exposing_to_consumer_get() {
-        let m = WindowMap::with_compression(CompressionType::None);
-        m.insert_speculative(2000, window_of(0x55));
-        assert!(m.get(2000).is_none());
-        assert_eq!(m.get_at_worker(2000).unwrap().raw_bytes()[0], 0x55);
-    }
-
-    #[test]
-    fn get_predecessor_for_worker_merges_speculative() {
-        let m = WindowMap::with_compression(CompressionType::None);
-        m.insert(100, window_of(0x11));
-        m.insert_speculative(500, window_of(0x22));
-        let (k, w) = m.get_predecessor_for_worker(1000).unwrap();
-        assert_eq!(k, 500);
-        assert_eq!(w.raw_bytes()[0], 0x22);
-    }
-
-    #[test]
-    fn get_confirmed_predecessor_for_worker_ignores_speculative() {
-        let m = WindowMap::with_compression(CompressionType::None);
-        m.insert(100, window_of(0x11));
-        m.insert_speculative(500, window_of(0x22));
-        let (k, w) = m.get_confirmed_predecessor_for_worker(1000).unwrap();
-        assert_eq!(k, 100);
-        assert_eq!(w.raw_bytes()[0], 0x11);
-    }
-
-    #[test]
-    fn handoff_in_partition_merges_confirmed_and_speculative() {
-        let m = WindowMap::with_compression(CompressionType::None);
-        m.insert(100, window_of(0x11));
-        m.insert_speculative(5000, window_of(0x22));
-        m.insert(9000, window_of(0x33));
-        // Partition (1000, 10000]: largest key is 9000 confirmed.
-        let (k, w) = m.get_handoff_in_partition(1000, 10000).unwrap();
-        assert_eq!(k, 9000);
-        assert_eq!(w.raw_bytes()[0], 0x33);
-        // Partition (1000, 6000]: speculative 5000 wins over nothing else in range.
-        let (k2, w2) = m.get_handoff_in_partition(1000, 6000).unwrap();
-        assert_eq!(k2, 5000);
-        assert_eq!(w2.raw_bytes()[0], 0x22);
-        // Keys at or below low are excluded; empty interval returns None.
-        assert!(m.get_handoff_in_partition(9000, 9000).is_none());
-        assert!(m.get_handoff_in_partition(9500, 10000).is_none());
-    }
-
-    #[test]
-    fn promote_makes_speculative_window_visible_with_same_key_and_bytes() {
-        let m = WindowMap::with_compression(CompressionType::None);
-        m.insert_speculative(2048, window_of(0xCD));
-        assert!(m.get(2048).is_none());
-        assert!(m.promote_speculative(2048));
-        // Now visible to successor resolution, byte-identical.
-        let w = m.get(2048).expect("promoted into real map");
-        assert_eq!(w.raw_bytes()[0], 0xCD);
-        assert_eq!(w.raw_bytes()[32767], 0xCD);
-        assert!(m.contains(2048));
-        assert!(m.has_predecessor(2048));
-        // Speculative slot is now empty (moved, not copied).
-        assert_eq!(m.speculative_len(), 0);
-        // Promoting an absent key is a harmless no-op.
-        assert!(!m.promote_speculative(9999));
-    }
-
-    #[test]
-    fn evict_drops_speculative_window_so_it_can_never_promote() {
-        let m = WindowMap::with_compression(CompressionType::None);
-        m.insert_speculative(4096, window_of(0xEF));
-        assert!(m.evict_speculative(4096));
-        assert_eq!(m.speculative_len(), 0);
-        // Still invisible, and a later promote is a no-op (no stale window).
-        assert!(m.get(4096).is_none());
-        assert!(!m.promote_speculative(4096));
-        assert!(m.get(4096).is_none());
-        // Evicting an absent key is a harmless no-op.
-        assert!(!m.evict_speculative(123));
-    }
-
-    #[test]
-    fn speculative_overwrite_keeps_latest_then_promotes_latest() {
-        // A worker re-decode at the same key overwrites; promotion must
-        // surface the latest bytes.
-        let m = WindowMap::with_compression(CompressionType::None);
-        m.insert_speculative(64, window_of(0x11));
-        m.insert_speculative(64, window_of(0x22));
-        assert_eq!(m.speculative_len(), 1);
-        assert!(m.promote_speculative(64));
-        assert_eq!(m.get(64).unwrap().raw_bytes()[0], 0x22);
-    }
-
-    #[test]
-    fn speculative_owned_none_round_trips() {
-        let m = WindowMap::with_compression(CompressionType::None);
-        let bytes = vec![0x5A_u8; 32768];
-        m.insert_speculative_owned_none(800, bytes);
-        assert!(m.get(800).is_none());
-        assert!(m.promote_speculative(800));
-        let w = m.get(800).unwrap();
-        assert_eq!(w.compression_type(), CompressionType::None);
-        assert_eq!(w.raw_bytes()[0], 0x5A);
     }
 
     #[test]
