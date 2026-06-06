@@ -18,6 +18,8 @@ pub mod chunk_buffer_pool;
 pub mod chunk_data;
 #[cfg(parallel_sm)]
 pub mod chunk_fetcher;
+#[cfg(parallel_sm)]
+pub mod chunk_handle;
 pub mod compressed_vector;
 pub mod crc32;
 #[cfg(parallel_sm)]

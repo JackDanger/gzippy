@@ -53,6 +53,8 @@
 use crate::decompress::parallel::chunk_data::ChunkConfiguration;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::chunk_data::ChunkData;
+#[cfg(parallel_sm)]
+use crate::decompress::parallel::chunk_handle::{ChunkArc, SharedChunkData};
 use crate::decompress::parallel::gzip_chunk::ChunkDecodeError;
 #[cfg(parallel_sm)]
 use std::sync::Arc;
@@ -507,14 +509,13 @@ fn drive_impl<W: std::io::Write>(
     // no vendor counterpart. Both deleted; sizing now matches vendor.
     let cache_capacity = std::cmp::max(16, pool_size);
     let prefetch_capacity = pool_size * 2;
-    let block_fetcher: Arc<
-        BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
-    > = Arc::new(BlockFetcher::new(
-        cache_capacity,
-        prefetch_capacity,
-        FetchMultiStream::new(FETCH_MEMORY_PER_STREAM, FETCH_MAX_STREAM_COUNT),
-        pool_size,
-    ));
+    let block_fetcher: Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>> =
+        Arc::new(BlockFetcher::new(
+            cache_capacity,
+            prefetch_capacity,
+            FetchMultiStream::new(FETCH_MEMORY_PER_STREAM, FETCH_MAX_STREAM_COUNT),
+            pool_size,
+        ));
 
     // ── m_unsplitBlocks (vendor GzipChunkFetcher.hpp:781) ───────────
     // Subchunk-offset → parent-chunk-key reverse map; populated when a
@@ -979,7 +980,7 @@ fn consumer_loop<W: std::io::Write>(
     out_fd: Option<i32>,
     total_bits: usize,
     block_finder: &GzipBlockFinder,
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
+    block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
     block_map: &BlockMap,
     window_map: &WindowMap,
     unsplit_blocks: &UnsplitBlocks,
@@ -1152,7 +1153,7 @@ fn consumer_loop<W: std::io::Write>(
         // empty chunk.
         let prefetch_submit = |offset: usize,
                                next_offset: usize|
-         -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
+         -> mpsc::Receiver<Result<ChunkArc, ChunkDecodeError>> {
             let prefetch_stop_hint_bit = next_offset.max(offset);
             let prefetch_params = DecodeParams {
                 start_bit: offset,
@@ -1230,7 +1231,7 @@ fn consumer_loop<W: std::io::Write>(
         // GzipChunkFetcher.hpp:654).
         let _tv2_specf = trace_v2::SpanGuard::begin("consumer.try_take_prefetched");
         let partition_offset = partition_offset_for(&next_block_offset);
-        let mut chunk_arc_from_partition: Option<Arc<ChunkData>> = None;
+        let mut chunk_arc_from_partition: Option<ChunkArc> = None;
         if partition_offset != next_block_offset {
             // Lever H: while blocking on the in-flight prefetch's
             // `rx.recv`, pump `prefetch_new_blocks` every 1ms so the
@@ -1340,7 +1341,7 @@ fn consumer_loop<W: std::io::Write>(
                 );
                 let (chunk_arc_result, _prefetched) = block_fetcher.get_with_prefetch(
                     next_block_offset,
-                    |_key: usize| -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
+                    |_key: usize| -> mpsc::Receiver<Result<ChunkArc, ChunkDecodeError>> {
                         submit_decode_to_pool(
                             thread_pool,
                             input,
@@ -1367,9 +1368,9 @@ fn consumer_loop<W: std::io::Write>(
         let chunk_holder = {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.arc_take_or_clone");
             match Arc::try_unwrap(chunk_arc) {
-                Ok(c) => {
+                Ok(shared) => {
                     ARC_TRY_UNWRAP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    ConsumerChunkHold::Owned(c)
+                    ConsumerChunkHold::Owned(SharedChunkData::into_inner(shared))
                 }
                 Err(arc) => {
                     let real_offset = arc.encoded_offset_bits;
@@ -1391,7 +1392,7 @@ fn consumer_loop<W: std::io::Write>(
                         ConsumerChunkHold::Deferred { arc }
                     } else {
                         ARC_TRY_UNWRAP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        ConsumerChunkHold::Owned((*arc).clone())
+                        ConsumerChunkHold::Owned(SharedChunkData::take_or_clone(arc))
                     }
                 }
             }
@@ -1622,16 +1623,6 @@ fn consumer_loop<W: std::io::Write>(
                             None
                         }
                     };
-                    let rx = match reuse {
-                        Some(eager_rx) => eager_rx,
-                        None => submit_post_process_to_pool(
-                            thread_pool,
-                            chunk,
-                            consumer_pred_key.expect("marker branch sets pred_key"),
-                            window,
-                            partition_idx_for_trace,
-                        ),
-                    };
                     // Vendor GzipChunkFetcher.hpp:513 — queue successor
                     // post-processing while blocking on the head future.
                     queue_prefetched_marker_postprocess(
@@ -1646,12 +1637,28 @@ fn consumer_loop<W: std::io::Write>(
                         "wait.future_recv",
                         &format!(r#""chunk_id":{partition_idx_for_trace}"#),
                     );
-                    chunk = rx.recv().map_err(|_| {
-                        FetchError::Decode(ChunkDecodeError::ExactStopMissed {
-                            requested: partition_idx_for_trace,
-                            actual: 0,
-                        })
-                    })?;
+                    if let Some(eager_rx) = reuse {
+                        eager_rx.recv().map_err(|_| {
+                            FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+                                requested: partition_idx_for_trace,
+                                actual: 0,
+                            })
+                        })?;
+                    } else {
+                        let rx = submit_post_process_to_pool(
+                            thread_pool,
+                            chunk,
+                            consumer_pred_key.expect("marker branch sets pred_key"),
+                            window,
+                            partition_idx_for_trace,
+                        );
+                        chunk = rx.recv().map_err(|_| {
+                            FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+                                requested: partition_idx_for_trace,
+                                actual: 0,
+                            })
+                        })?;
+                    }
                 }
             }
             // Vendor `setEncodedOffset(*nextBlockOffset)` after post-process.
@@ -1923,9 +1930,9 @@ fn submit_decode_to_pool(
     input: InputSlice,
     params: DecodeParams,
     window_map: &WindowMap,
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
+    block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
     configuration: ChunkConfiguration,
-) -> mpsc::Receiver<Result<Arc<ChunkData>, ChunkDecodeError>> {
+) -> mpsc::Receiver<Result<ChunkArc, ChunkDecodeError>> {
     if trace::is_enabled() {
         trace::emit(
             "consumer",
@@ -1984,7 +1991,7 @@ fn submit_decode_to_pool(
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 fn eager_postprocess_prefetched(
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
+    block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
     window_map: &WindowMap,
     thread_pool: &Arc<ThreadPool>,
     in_flight: &mut EagerSubmitted,
@@ -2017,21 +2024,28 @@ fn submit_post_process_to_pool(
 /// the consumer thread (vendor queues work; the clone happens on the pool).
 #[cfg(parallel_sm)]
 fn submit_post_process_from_prefetch(
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
+    block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
     thread_pool: &Arc<ThreadPool>,
     cache_key: usize,
-    arc: Arc<ChunkData>,
+    arc: ChunkArc,
     pred_key: usize,
     predecessor_window: Window,
-) -> mpsc::Receiver<ChunkData> {
+) -> mpsc::Receiver<()> {
     let _ = (block_fetcher, cache_key);
-    submit_post_process_task(thread_pool, move || {
-        let working = match Arc::try_unwrap(arc) {
-            Ok(owned) => owned,
-            Err(shared) => (*shared).clone(),
-        };
-        run_post_process_task(working, pred_key, predecessor_window)
+    submit_post_process_void(thread_pool, move || {
+        run_post_process_in_place(&arc, pred_key, predecessor_window);
     })
+}
+
+/// Vendor `submitTaskWithHighPriority` completion signal — pool mutates the
+/// shared chunk in place; no `ChunkData` move through the channel.
+#[cfg(parallel_sm)]
+fn submit_post_process_void(
+    thread_pool: &Arc<ThreadPool>,
+    task: impl FnOnce() + Send + 'static,
+) -> mpsc::Receiver<()> {
+    let future = thread_pool.submit(task, /* priority */ -1);
+    future.into_receiver()
 }
 
 #[cfg(parallel_sm)]
@@ -2053,9 +2067,9 @@ fn run_decode_task(
     input: InputSlice,
     params: DecodeParams,
     window_map: &WindowMap,
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
+    block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
     configuration: ChunkConfiguration,
-) -> Result<Arc<ChunkData>, ChunkDecodeError> {
+) -> Result<ChunkArc, ChunkDecodeError> {
     let _tv2 = trace_v2::SpanGuard::begin_with(
         "worker.decode_chunk",
         &format!(
@@ -2086,7 +2100,7 @@ fn run_decode_task(
             params.stop_hint_bit,
             configuration,
         ) {
-            return Ok(Arc::new(chunk));
+            return Ok(SharedChunkData::new(chunk));
         }
     }
 
@@ -2096,7 +2110,7 @@ fn run_decode_task(
             params.stop_hint_bit,
             configuration,
         ) {
-            return Ok(Arc::new(chunk));
+            return Ok(SharedChunkData::new(chunk));
         }
     }
 
@@ -2223,9 +2237,9 @@ fn run_decode_task(
         );
     }
 
-    // Wrap in Arc to match BlockFetcher's `Value = Arc<ChunkData>`
-    // (vendor's `std::shared_ptr<BlockData>` at BlockFetcher.hpp:46).
-    let result = chunk_result.map(Arc::new);
+    // Wrap in `ChunkArc` to match BlockFetcher's `Value` type (vendor's
+    // `std::shared_ptr<BlockData>` at BlockFetcher.hpp:46).
+    let result = chunk_result.map(SharedChunkData::new);
 
     if trace::is_enabled() {
         let dur_us = t0.elapsed().as_micros();
@@ -2385,7 +2399,7 @@ fn publish_end_window_before_post_process(
 /// `m_windowMap->get(chunkData->encodedOffsetInBits)` only.
 #[cfg(parallel_sm)]
 fn queue_prefetched_marker_postprocess(
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
+    block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
     window_map: &WindowMap,
     thread_pool: &Arc<ThreadPool>,
     in_flight: &mut EagerSubmitted,
@@ -2445,9 +2459,48 @@ fn queue_prefetched_marker_postprocess(
     submitted
 }
 
-/// Pool-side execution of a post-process task. Mirror of the lambda
-/// body at `GzipChunkFetcher::queueChunkForPostProcessing`
-/// (vendor/.../GzipChunkFetcher.hpp:579-582).
+/// In-place pool post-process on a cache-shared chunk (vendor
+/// `GzipChunkFetcher.hpp:579-582` `chunkData->applyWindow`).
+#[cfg(parallel_sm)]
+fn run_post_process_in_place(arc: &SharedChunkData, pred_key: usize, predecessor_window: Window) {
+    let start_bit = arc.encoded_offset_bits;
+    let marker_bytes = arc.data_with_markers.len();
+    let _tv2 = trace_v2::SpanGuard::begin_with(
+        "post_process.task",
+        &format!(r#""start_bit":{start_bit},"marker_bytes":{marker_bytes},"in_place":true"#,),
+    );
+    let t_materialize = std::time::Instant::now();
+    let bytes = materialize_window(&predecessor_window);
+    let materialize_us = t_materialize.elapsed().as_micros();
+    let t_apply = std::time::Instant::now();
+    {
+        let _tv2 = trace_v2::SpanGuard::begin("post_process.apply_window");
+        arc.with_mut(|chunk| {
+            resolve_chunk_markers_on_chunk(chunk, pred_key, bytes.as_ref());
+        });
+    }
+    let apply_us = t_apply.elapsed().as_micros();
+    trace_v2::emit_instant(
+        "causal.tax",
+        &format!(
+            r#""start_bit":{start_bit},"marker_bytes":{marker_bytes},"resolve_us":{apply_us},"materialize_us":{materialize_us},"fused":{fused},"in_place":true"#,
+            fused = marker_bytes >= VENDOR_APPLY_WINDOW_LUT_ELEMENTS,
+        ),
+        "t",
+    );
+    if trace::is_enabled() {
+        trace::emit(
+            "post_process",
+            "post_process_span",
+            &format!(
+                r#""start_bit":{start_bit},"materialize_us":{materialize_us},"apply_window_us":{apply_us},"marker_bytes":{marker_bytes},"in_place":true"#,
+            ),
+        );
+    }
+}
+
+/// Pool-side execution of a uniquely-owned post-process task (consumer head
+/// chunk where `Arc::try_unwrap` succeeded on `get()`).
 #[cfg(parallel_sm)]
 fn run_post_process_task(
     mut chunk: ChunkData,
@@ -2582,7 +2635,7 @@ fn narrow_u16_to_u8(src: &[u16], dst: &mut crate::decompress::parallel::rpmalloc
 fn consumer_append_subchunks_vendor(
     block_map: &BlockMap,
     block_finder: &GzipBlockFinder,
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
+    block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
     chunk: &ChunkData,
     handoff_bit: usize,
     chunk_end_bit: usize,
@@ -2774,10 +2827,11 @@ pub static ARC_DEFERRED_INFLIGHT_RECV: std::sync::atomic::AtomicU64 =
 /// receiver when it reaches that offset, after validating the predecessor
 /// key still matches (byte-identity guard).
 #[cfg(parallel_sm)]
-type EagerSubmitted = std::collections::HashMap<usize, (usize, usize, mpsc::Receiver<ChunkData>)>;
-/// Harvested eager post-process results (vendor non-blocking `future.get()`).
+type EagerSubmitted = std::collections::HashMap<usize, (usize, usize, mpsc::Receiver<()>)>;
+/// Harvested eager post-process completions (vendor non-blocking `future.get()`).
+/// Resolved bytes live on the shared cache `ChunkArc` after in-place apply.
 #[cfg(parallel_sm)]
-type EagerCompleted = std::collections::HashMap<usize, (usize, ChunkData)>;
+type EagerCompleted = std::collections::HashMap<usize, usize>;
 
 /// Vendor `waitForReplacedMarkers` (:497-511): poll ready marker-replace
 /// futures without blocking the consumer on non-head chunks.
@@ -2791,8 +2845,8 @@ fn harvest_ready_postprocess(in_flight: &mut EagerSubmitted, completed: &mut Eag
             continue;
         };
         match rx.try_recv() {
-            Ok(chunk) => {
-                completed.insert(offset, (pred_key, chunk));
+            Ok(()) => {
+                completed.insert(offset, pred_key);
                 EAGER_HARVEST_READY.fetch_add(1, Ordering::Relaxed);
             }
             Err(TryRecvError::Empty) => {
@@ -2809,7 +2863,7 @@ enum ConsumerChunkHold {
     Owned(ChunkData),
     /// Resolve-ahead holds another `Arc` ref; borrow for publish, `recv` at dispatch.
     Deferred {
-        arc: Arc<ChunkData>,
+        arc: ChunkArc,
     },
 }
 
@@ -2841,18 +2895,15 @@ impl ConsumerChunkHold {
             }
             Self::Deferred { arc } => {
                 let real_offset = arc.encoded_offset_bits;
-                if chunk_matches_consumer_pred(arc.as_ref(), pred_key) {
-                    match Arc::try_unwrap(arc) {
-                        Ok(c) => return (c, true),
-                        Err(shared) => return ((*shared).clone(), true),
-                    }
+                if chunk_matches_consumer_pred(arc.get(), pred_key) {
+                    return (SharedChunkData::take_or_clone(arc), true);
                 }
-                if let Some((eager_pred_key, chunk)) = completed.remove(&real_offset) {
+                if let Some(eager_pred_key) = completed.remove(&real_offset) {
                     if pred_key == Some(eager_pred_key) {
                         EAGER_PROBE_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return (chunk, true);
+                        return (SharedChunkData::take_or_clone(arc), true);
                     }
-                    completed.insert(real_offset, (eager_pred_key, chunk));
+                    completed.insert(real_offset, eager_pred_key);
                 }
                 match inflight.remove(&real_offset) {
                     Some((eager_pred_key, _, rx)) if pred_key == Some(eager_pred_key) => {
@@ -2860,25 +2911,24 @@ impl ConsumerChunkHold {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         EAGER_PROBE_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let _tv2 = trace_v2::SpanGuard::begin("consumer.dispatch_recv");
-                        let chunk = rx.recv().unwrap_or_else(|_| {
+                        if rx.recv().is_err() {
                             ARC_TRY_UNWRAP_MISSES
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            (*arc).clone()
-                        });
-                        (chunk, true)
+                        }
+                        (SharedChunkData::take_or_clone(arc), true)
                     }
                     Some((eager_pred_key, cache_key, rx)) => {
                         EAGER_PROBE_REUSE_PRED_MISMATCH
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         inflight.insert(real_offset, (eager_pred_key, cache_key, rx));
                         ARC_TRY_UNWRAP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        ((*arc).clone(), false)
+                        (SharedChunkData::take_or_clone(arc), false)
                     }
                     None => {
                         EAGER_PROBE_REUSE_KEY_ABSENT
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         ARC_TRY_UNWRAP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        ((*arc).clone(), false)
+                        (SharedChunkData::take_or_clone(arc), false)
                     }
                 }
             }
@@ -3231,7 +3281,7 @@ fn drain_ready_pending_heads<W: std::io::Write>(
     out_fd: Option<i32>,
     total_crc: &mut CRC32Calculator,
     total_size: &mut usize,
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
+    block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
     thread_pool: &Arc<ThreadPool>,
     eager_inflight: &mut EagerSubmitted,
     eager_completed: &mut EagerCompleted,
@@ -3273,7 +3323,7 @@ fn drain_one_pending<W: std::io::Write>(
     out_fd: Option<i32>,
     total_crc: &mut CRC32Calculator,
     total_size: &mut usize,
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
+    block_fetcher: &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
     // Eager post-process context (GZIPPY_EAGER_POSTPROC=1). When the head
     // pending write is an in-flight post-process (`Async`), the consumer is
     // about to BLOCK on `rx.recv()` (the `wait.future_recv` span — the
