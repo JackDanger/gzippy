@@ -209,52 +209,55 @@ fn pool_index_for_take() -> usize {
     current_worker_pool_index().unwrap_or(0)
 }
 
+fn manual_buffer_pool_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| std::env::var_os("GZIPPY_MANUAL_BUFFER_POOL").is_some())
+}
+
 /// Take a `Vec<u8>` from the current worker's pool (or worker 0 if unbound).
 /// Decode tasks run on pool workers and record the correct index; trial
 /// decodes on the consumer thread bucket returns to worker 0's pool.
 pub fn take_u8(min_capacity: usize) -> U8 {
-    let idx = pool_index_for_take();
-    if let Ok(mut pool) = u8_pools()[idx].lock() {
-        if let Some(mut v) = pool.pop() {
-            TAKE_U8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            TAKE_U8_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            v.clear();
-            if v.capacity() < min_capacity {
-                v.reserve(min_capacity - v.capacity());
+    // Vendor FasterVector.hpp: rpmalloc per-thread cache only — no manual LIFO pool.
+    // `GZIPPY_MANUAL_BUFFER_POOL=1` restores the legacy mutex pool for A/B.
+    if manual_buffer_pool_enabled() {
+        let idx = pool_index_for_take();
+        if let Ok(mut pool) = u8_pools()[idx].lock() {
+            if let Some(mut v) = pool.pop() {
+                TAKE_U8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                TAKE_U8_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                v.clear();
+                if v.capacity() < min_capacity {
+                    v.reserve(min_capacity - v.capacity());
+                }
+                return v;
             }
-            return v;
         }
+        TAKE_U8_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TAKE_U8_MISSES_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    TAKE_U8_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    TAKE_U8_MISSES_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // FALSIFICATION 2026-05-28: L1 (madvise(MADV_HUGEPAGE)) was tried
-    // here for the 13.26% clear_page CPU. neurotic 10-trial A/B:
-    // default median 789 MB/s vs GZIPPY_HUGEPAGE=1 median 487 MB/s
-    // (-38%). khugepaged contention OR madvise call latency
-    // dominated. The `hugepage_hint` fn is left in place but no
-    // caller invokes it; future attempt must use a different shape
-    // (e.g. MADV_COLLAPSE for synchronous merge, OR direct mmap
-    // with MAP_HUGETLB rather than madvise hint).
     types::u8_with_capacity(min_capacity)
 }
 
 /// Take a `Vec<u16>` from the current worker's pool.
 #[allow(dead_code)]
 pub fn take_u16(min_capacity: usize) -> U16 {
-    let idx = pool_index_for_take();
-    if let Ok(mut pool) = u16_pools()[idx].lock() {
-        if let Some(mut v) = pool.pop() {
-            TAKE_U16_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            TAKE_U16_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            v.clear();
-            if v.capacity() < min_capacity {
-                v.reserve(min_capacity - v.capacity());
+    if manual_buffer_pool_enabled() {
+        let idx = pool_index_for_take();
+        if let Ok(mut pool) = u16_pools()[idx].lock() {
+            if let Some(mut v) = pool.pop() {
+                TAKE_U16_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                TAKE_U16_HITS_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                v.clear();
+                if v.capacity() < min_capacity {
+                    v.reserve(min_capacity - v.capacity());
+                }
+                return v;
             }
-            return v;
         }
+        TAKE_U16_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TAKE_U16_MISSES_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    TAKE_U16_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    TAKE_U16_MISSES_BY_WORKER[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     types::u16_with_capacity(min_capacity)
 }
 
@@ -262,6 +265,9 @@ pub fn take_u16(min_capacity: usize) -> U16 {
 pub fn return_u8_to_worker(owner_worker: usize, mut v: U8) {
     if v.capacity() == 0 {
         return;
+    }
+    if !manual_buffer_pool_enabled() {
+        return; // drop — rpmalloc thread cache retains pages (vendor model)
     }
     RETURN_U8_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let idx = owner_worker.min(MAX_WORKERS - 1);
@@ -278,6 +284,9 @@ pub fn return_u8_to_worker(owner_worker: usize, mut v: U8) {
 #[allow(dead_code)]
 pub fn return_u16_to_worker(owner_worker: usize, mut v: U16) {
     if v.capacity() == 0 {
+        return;
+    }
+    if !manual_buffer_pool_enabled() {
         return;
     }
     RETURN_U16_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -344,24 +353,26 @@ fn marker_segment_pools() -> &'static [Mutex<Vec<U16>>] {
 
 /// Take one 128 KiB rpmalloc-backed marker segment (`len == 0`).
 pub fn take_marker_segment() -> U16 {
-    let idx = pool_index_for_take();
-    if let Ok(mut pool) = marker_segment_pools()[idx].lock() {
-        if let Some(mut v) = pool.pop() {
-            MARKER_SEG_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            v.clear();
-            if v.capacity() < MARKER_SEGMENT_ELEMENTS {
-                v.reserve(MARKER_SEGMENT_ELEMENTS - v.capacity());
+    if manual_buffer_pool_enabled() {
+        let idx = pool_index_for_take();
+        if let Ok(mut pool) = marker_segment_pools()[idx].lock() {
+            if let Some(mut v) = pool.pop() {
+                MARKER_SEG_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                v.clear();
+                if v.capacity() < MARKER_SEGMENT_ELEMENTS {
+                    v.reserve(MARKER_SEGMENT_ELEMENTS - v.capacity());
+                }
+                return v;
             }
-            return v;
         }
+        MARKER_SEG_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    MARKER_SEG_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     types::u16_with_capacity(MARKER_SEGMENT_ELEMENTS)
 }
 
 /// Return marker segments to the owner worker's pool.
 pub fn return_marker_segments_to_worker(owner_worker: usize, segments: Vec<U16>) {
-    if segments.is_empty() {
+    if segments.is_empty() || !manual_buffer_pool_enabled() {
         return;
     }
     let idx = owner_worker.min(MAX_WORKERS - 1);
