@@ -6,6 +6,7 @@
 
 | Doc | Role |
 |-----|------|
+| [`structural-gap-closure.md`](structural-gap-closure.md) | **Active:** function-level closure plan (vendor port, bit contracts, phases 0–5) |
 | [`sm-parity-gap-matrix.md`](sm-parity-gap-matrix.md) | Gap matrix, closure designs (C–M), execution order |
 | [`wall-progress.md`](wall-progress.md) | Survived-disproof findings only (causal perturbation verdicts) |
 | [`parallel-sm-model.md`](parallel-sm-model.md) | Publish-chain + window-absent quantitative model |
