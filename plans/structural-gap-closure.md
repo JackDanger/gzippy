@@ -1,134 +1,164 @@
-# Plan: close structural gap to rapidgzip (parallel single-member)
+# Structural divergence: gzippy ↔ rapidgzip (decode path)
 
-**Branch:** `reimplement-isa-l` (`--no-default-features --features pure-rust-inflate`)  
-**Vendor blueprint:** `vendor/rapidgzip/librapidarchive/src/rapidgzip/chunkdecoding/`  
-**Bench:** `scripts/bench/run_locked_fulcrum.sh` (neurotic, frozen, interleaved N≥9, sha-verified)  
-**Verdict instrument:** causal perturbation only — Fulcrum proposes, slow-inject/oracle removal disposes.
+**Purpose:** Record runtime-observable divergences between gzippy and rapidgzip — for structural comparison and exploration, not lever ranking.
 
-**Wall reference (pre-closure):** gzippy T16 ~1.55s vs rapidgzip ~0.47s; Fulcrum `worker.block_body` ~4790ms busy vs vendor 0ms; ~90% runtime window-absent.
+**Sources:**
+- Fulcrum run `0462f88`, silesia-large, neurotic guest 199 (`/tmp/gzippy-locked-fulcrum-20260605-200740/`)
+- Forensic code audit (vendor `GzipChunk.hpp`, `deflate.hpp`, `BlockFetcher.hpp`, `FasterVector.hpp`; gzippy parallel SM modules)
 
-**Control-plane status (June 2026 alignment):** `run_decode_task` uses exact `WindowMap::get(start_bit)` only; no worker publish; `try_speculative_decode_candidate` always window-absent; eager `queue_prefetched_marker_postprocess` uses full scan (`None` key).
-
----
-
-## Done criterion
-
-1. Structure mirrors vendor decode pipeline (dispatch tree, tryToDecode, window publish, post-process).
-2. Wall TIE-or-better vs rapidgzip on silesia-large × T8/T16 (`scripts/measure.sh` / locked Fulcrum).
-3. All 850+ lib tests + routing tests pass; output byte-identical.
+**Headline:** Recent convergence is real and mostly faithful — dispatch, window map, output path (writev + vmsplice/SpliceVault), thread priorities, segmented buffers, and rpmalloc per-`Vec` with lazy per-thread init all match vendor. Two prior audit flags (C1, D3) are **stale** (dead code, not production path). Genuine remaining divergences are fewer than earlier audits implied.
 
 ---
 
-## Closure phases (strict order — later phases assume earlier oracles)
+## Fulcrum behavioral snapshot (`0462f88`, T8 trace)
 
-### Phase 0 — Validate instruments (gate, ~1 session)
+| Metric | gzippy | rapidgzip |
+|--------|--------|-----------|
+| T16 wall (interleaved min) | 0.986s | 0.475s |
+| T8 trace wall | 820ms | 473ms |
+| Decode decisions | 41 (4 clean, 37 window-absent) | — |
+| Runtime window-absent | 90.2% (vs 31% static boundary fraction) | — |
+| KEY-MISMATCH | 36/37 window-absent | — |
 
-| Step | Action | Pass |
-|------|--------|------|
-| 0.1 | Re-bench post-alignment uncommitted changes | Baseline wall recorded in `wall-progress.md` |
-| 0.2 | `fulcrum causal` on T8 trace | `worker.block_body` still wc ⇒ decode engine is lever |
-| 0.3 | Oracle: single-chunk known window + known until | gzippy bytes == rapidgzip bytes |
+**Path mix (gzippy verbose):** `flip_to_clean=29`, `bad_seed_resync=35`, `pred@seed=0`, `handoff_window_grows=0`.
 
-### Phase 1 — P0: vendor decode dispatch tree (wall lever)
+**Span diff (busy, Σ threads):**
 
-**Goal:** Replace MarkerRing-only path with vendor `decodeChunk` / `decodeChunkWithRapidgzip` / `finishDecodeChunkWithInexactOffset` / `decodeChunkWithInflateWrapper`.
+| Span | gzippy | rapidgzip | Notes |
+|------|--------|-----------|-------|
+| `worker.block_body` | 1982ms | 0ms | MarkerRing bootstrap; no vendor-equivalent span |
+| `worker.isal_stream_inflate` | 2519ms | 1376ms | Both present; gzippy 1.83× busy |
+| `worker.scan_run` | 4447ms | 3093ms | Same outer shape; gzippy +44% busy |
+| `post_process.apply_window` | 0ms wc | 236ms busy | Topology: resolve on pool vs consumer wait |
 
-| # | Function(s) | File | Vendor ref | Change |
-|---|-------------|------|------------|--------|
-| 1.1 | `finish_decode_chunk_with_inexact_offset` (**new**) | `gzip_chunk.rs` | `GzipChunk.hpp:280-410` | Port ISA-L loop: `setWindow`, `setStoppingPoints(END_OF_BLOCK \| END_OF_BLOCK_HEADER \| END_OF_STREAM_HEADER)`, preemptive stop at `untilOffset`, `append` buffers, `finalizeChunk` |
-| 1.2 | `decode_chunk` dispatch | `gzip_chunk.rs` | `GzipChunk.hpp:661-710` | `if window && until_exact` → inflate wrapper; `else if window` → `decode_chunk_with_rapidgzip`; else window-absent unified path |
-| 1.3 | `decode_chunk_with_rapidgzip` / `_impl` | `gzip_chunk.rs` | `hpp:413-654` | On `initialWindow` + ISAL: immediate `finish_decode...` (`hpp:440-444`); else `setInitialWindow` + block loop; at `clean_data_count >= 32768` → `finish_decode...` (`hpp:521-525`) |
-| 1.4 | `decode_chunk_unified_marker` | `gzip_chunk.rs` | marker phase only | Shrink to window-absent bootstrap; phase 2 must call 1.1 not MarkerRing clean loop |
-| 1.5 | `marker_decode_step` + `MarkerRing` | `gzip_chunk.rs`, `isal_lut_bulk.rs` | `deflate::Block` | Bootstrap-only: header 3-bit read, flip at vendor predicate, then hand off to 1.1 |
-| 1.6 | `resumable_resync` | `gzip_chunk.rs` | (none on success) | Restrict to internal bad-seed recovery inside tryToDecode; remove from window-present path |
-| 1.7 | `run_decode_task` | `chunk_fetcher.rs` | `GzipChunkFetcher.hpp:712-729` | When `get(hit)` and stop hint is chain-exact, pass `until_exact=true` into 1.2 |
-| 1.8 | `IsalInflateWrapper` | `inflate_wrapper.rs` | `IsalInflateWrapper.hpp` | Ensure `stoppedAt`, `isFinalBlock`, `compressionType`, `tellCompressed` support preemptive stop bits |
+**Publish-chain model:** gzippy `L_resolve` × N ≈ 814ms predicted vs 820ms observed (binds). rapidgzip model underpredicts (210ms pred vs 473ms obs) — different binding mechanism.
 
-**Bit contracts (must not drift):**
-
-- Block header: 3 bits LSB-first — BFINAL(1) + BTYPE(2).
-- Stored: align byte; LEN/NLEN 16+16 LE, `len == !nlen`; tryToDecode seeks to `offset.second` (see Phase 2).
-- Flip: `distance_to_last_marker >= 65536` OR (`>= 32768` AND `== decoded_bytes`) — `deflate.hpp:1282-1284`.
-- Marker: `u16 = 32768 + (32768 + pos + i - dist)`.
-- Stop hint: inexact until — first block header with `tell() >= until` unless last/fixed exception (`hpp:550-555`, `hpp:339-344`).
-
-**Oracle before merge:** single-member silesia chunk with oracle window → byte match libdeflate + rapidgzip; Fulcrum `worker.block_body` busy drops on window-present chunks.
-
-### Phase 2 — P1: block finder + tryToDecode seek semantics
-
-| # | Function(s) | File | Vendor ref | Change |
-|---|-------------|------|------------|--------|
-| 2.1 | `BlockBoundary` | `block_finder.rs` | pair in `tryToDecode` | Add `seek_bit: usize` (= `.second`; dynamic: `bit_offset`, stored: `byte_bit - 3`) |
-| 2.2 | `find_uncompressed_blocks` | `block_finder.rs` | `Uncompressed.hpp:21-95` | Emit both `earliest` and `seek_bit` |
-| 2.3 | `find_blocks` / search loop | `block_finder.rs`, `raw_block_finder.rs` | `hpp:803-845` | Replace merge-sort with inline alternating `findNextDynamic` / `findNextUncompressed` per 8 KiB chunk |
-| 2.4 | `try_speculative_decode_candidate` | `chunk_fetcher.rs` | `hpp:712-734` | Accept `OffsetPair`; decode at `seek_bit`; metadata `encoded=first`, `max=seek` |
-| 2.5 | `speculative_decode_find_boundary` | `chunk_fetcher.rs` | `hpp:796-846` | Wire 2.3 loop; pass pairs to 2.4 |
-
-### Phase 3 — P1: window map cleanup (structural fidelity)
-
-| # | Function(s) | File | Change |
-|---|-------------|------|--------|
-| 3.1 | `promote_speculative`, `evict_speculative`, `insert_speculative` | `window_map.rs` | Delete API + storage |
-| 3.2 | `consumer_loop` accept/reject | `chunk_fetcher.rs` | Remove promote/evict calls; vendor discard-only on reject |
-| 3.3 | `consumer_loop` accept guard | `chunk_fetcher.rs` | After chain proven: relax to `matches_encoded_offset(decode_start)` only (vendor `hpp:396-403`) |
-
-### Phase 4 — P0: data plane (publish chain throughput)
-
-| # | Function(s) | File | Change |
-|---|-------------|------|--------|
-| 4.1 | `ChunkData::get_last_window_vec` | `chunk_data.rs` | O(32K) tail extraction — contiguous ring or vendor-style single buffer |
-| 4.2 | `SegmentedU8` tail | `rpmalloc_alloc/types.rs` | `copy_last_32k` without multi-segment walk on hot path |
-| 4.3 | `prefill_window_prefix` / `data_prefix_len` | `chunk_data.rs` | Delete after Phase 1 inflate wrapper lands (vendor uses `setInitialWindow` only) |
-
-### Phase 5 — P2: scheduling + docs + cleanup
-
-| # | Action |
-|---|--------|
-| 5.1 | `submit_decode_to_pool`: priority 0 for all (perturb first) |
-| 5.2 | `submit_post_process_to_pool`: priority −1 (vendor) |
-| 5.3 | Update `docs/structural-gap-rapidgzip.md` — remove stale `get_at_worker` / handoff text |
-| 5.4 | Gate `decode_bypass` / `sleep_decode` to env-only |
-| 5.5 | Record survived-disproof findings in `wall-progress.md` only |
+**Fulcrum `[5] REMEDIATION` is stale** — recommends removed handoff/pred paths. Use binary counters, not Fulcrum remediation text.
 
 ---
 
-## Parallel implementation workstreams (subagents)
+## Re-verification of four flagged forensic items
 
-| Agent | Phase | Scope | Files (exclusive) |
-|-------|-------|-------|-------------------|
-| **A** | 1.1–1.6 | `finish_decode_chunk_with_inexact_offset` + gzip dispatch tree | `gzip_chunk.rs`, `inflate_wrapper.rs` (read-only extend if needed) |
-| **B** | 1.7 | `run_decode_task` until-exact branch | `chunk_fetcher.rs` (`run_decode_task` + `DecodeParams` if needed) |
-| **C** | 2.1–2.5 | Block finder pairs + alternating search | `block_finder.rs`, `raw_block_finder.rs`, `chunk_fetcher.rs` (`speculative_*` only) |
-| **D** | 3.1–3.2 | Remove speculative WindowMap side-slot | `window_map.rs`, `chunk_fetcher.rs` (consumer promote/evict only) |
-
-**Merge order:** A → B (B calls A's new API); C and D independent; resolve `chunk_fetcher.rs` conflicts by section.
+| ID | Claim | Verdict | Detail |
+|----|-------|---------|--------|
+| **D1** | Unaligned marker ring + LUTs | **CONFIRMED, real** | `isal_lut_bulk.rs:700` `ring: Box<[u16; RING_SIZE]>` via `vec![0u16; RING_SIZE].into_boxed_slice()` → align 2. Vendor `deflate.hpp:926` `alignas(64) PreDecodedBuffer m_window16`; LUT backings `alignas(64)` at `:958-960`. In-code “Rust cannot alignas(64) on stable” comment is **false**. |
+| **C1** | Missing dist==1 RLE in bulk-LUT copies | **STALE** | `copy_match` (:415) and `copy_match_u8` (:1093) off production path. Production flip returns `FlipToClean` → `finish_decode_chunk_with_inexact_offset` (`gzip_chunk.rs:686-703`), not `read_compressed_clean_u8`. Clean path uses `copy_match_fast` (`consume_first_decode.rs:504`) with dist==1 SIMD arm. Runtime impact ≈ 0. |
+| **D2** | Manual pool over rpmalloc | **CONFIRMED, real** | `chunk_buffer_pool.rs` per-worker `Mutex<Vec<U8/U16>>` LIFO, cap 12. Vendor `FasterVector.hpp:120-128` — rpmalloc thread cache only, no manual pool. |
+| **D3** | System-`Vec` marker scratch | **STALE** | `take_std_u16` (`chunk_buffer_pool.rs:308`) has **no production callers**. `data_with_markers` is `SegmentedU16` → `take_marker_segment()` → rpmalloc `U16`. Dead code to delete, not a live deviation. |
 
 ---
 
-## Verification checklist (every phase)
+## (A) Not implemented — faithful vendor items
 
-```bash
-cargo test --release -q
-cargo test --release routing -q
-make   # local 30s guard
-# After merge:
-BRANCH=reimplement-isa-l THREADS=16 N=9 scripts/bench/run_locked_fulcrum.sh
+| # | Item | gzippy ↔ vendor | Runtime-observable? | Notes |
+|---|------|-----------------|----------------------|-------|
+| **A1** | 64-byte alignment of marker ring + LUTs (D1) | `isal_lut_bulk.rs:700,728` ↔ `deflate.hpp:926,958-960` | Yes — cache-line splits on 32-byte SIMD drain/copy | Vendor-mandated. Fix: `#[repr(align(64))]` newtype on ring + `DecoderScratch` / LUT backings. |
+| **A2** | Window sparsity (`getUsedWindowSymbols`) | Absent (doc comment only) ↔ `GzipChunk.hpp:60-133` | Yes — larger `WindowMap` entries; extra compress CPU | Secondary. Port `determineUsedWindowSymbolsForLastSubchunk` + subchunk zeroing at `GzipChunk.hpp:93-96`. |
+| **A3** | dist==1 memset in bulk-LUT (C1) | `isal_lut_bulk.rs:1093,415` ↔ `deflate.hpp:1393-1398` | No — off production path | Inert unless bulk-LUT clean tail promoted over ResumableInflate2. Do not prioritize. |
+| **A4** | Multi-stream loop inside window-absent chunk | Single-member only ↔ `GzipChunk.hpp:468-654` `isAtStreamEnd` | Only if chunk spans gzip member boundary | Out of scope for routed single-member path. |
+
+---
+
+## (B) Implemented but divergent — runtime-observable
+
+| # | Deviation | gzippy ↔ vendor | What profiler sees | Verdict |
+|---|-----------|-----------------|-------------------|---------|
+| **B1** | Worker count clamped to **physical** cores | `chunk_fetcher.rs:304,462` `.min(get_physical())` ↔ `BlockFetcher.hpp:179` logical `availableCores()` | On SMT host at high T: ≤ physical threads vs vendor ≈2× logical | **Divergent.** Vendor never clamps requested parallelization down. |
+| **B2** | Manual `Mutex` buffer pool over rpmalloc (D2) | `chunk_buffer_pool.rs:215-292` ↔ `FasterVector.hpp:120-128` rpmalloc only | Extra mutex per take/Drop; cross-thread cache-line bounce; cap-12 reuse cliff | **Divergent.** Only structural allocator mismatch in page-fault dimension profiles flag. |
+| **B3** | Flip to clean **earlier** than vendor | `gzip_chunk.rs:957` `!contains_marker_bytes()` ↔ `GzipChunk.hpp:520-525` `cleanDataCount >= MAX_WINDOW_SIZE` after Block flip | Fewer bytes through marker engine, more through ISA-L/ResumableInflate2 | **Favorable — KEEP.** Correct and faster; do not converge to vendor here. |
+| **B4** | Dead allocator / clean-tail helpers | `take_std_u16`, `read_compressed_clean_u8`, `copy_match_u8` | None at runtime | Dead code — delete to prevent stale-audit confusion (C1/D3). |
+
+### B1 — exact change (faithful)
+
+```rust
+// chunk_fetcher.rs:304 and :462
+- let pool_size = parallelization.max(1).min(num_cpus::get_physical().max(1));
++ let pool_size = parallelization.max(1); // vendor BlockFetcher.hpp:179
 ```
 
-Assert: CRC + ISIZE; `fulcrum stats` shows `worker.isal_stream_inflate` rising and `worker.block_body` falling on window-present fraction.
+### B2 — exact change (faithful, needs causal A/B)
+
+Remove `take_u8` / `return_u8_to_worker` / `take_u16` mutex pools; `ChunkData::new_with_buffers` / `Drop` allocate and free `U8`/`U16` directly through `RpmallocAlloc`. Re-measure page faults (`asm_exc_page_fault` / `clear_page_erms` gap). Keep one-binary A/B — prewarm history makes this region treacherous.
+
+### A1 — exact change (faithful)
+
+```rust
+#[repr(align(64))]
+struct RingBuf([u16; RING_SIZE]);
+// MarkerRing.ring: Box<RingBuf>
+// Same on DecoderScratch / IsalLitLenCodePure / IsalDistCodePure backings
+```
 
 ---
 
-## Explicit non-goals (this plan)
+## Confirmed faithful (audit checked)
 
-- Novel inner-loop techniques (authorized separately in `CLAUDE.md` inner-loop scope).
-- arm64 parallel SM (still gated off ISA-L).
-- Thread priority revert without perturbation (Phase 5 only).
+| Subsystem | gzippy | vendor |
+|-----------|--------|--------|
+| Dispatch | `decode_chunk_until_exact` (`gzip_chunk.rs:271`) | `decodeChunk` (`GzipChunk.hpp:661`) — exact window → inflate wrapper; inexact window → inflate from seed; absent → marker → flip |
+| WindowMap | `BTreeMap` + `Mutex`, no Condvar, consumer-only publish | `WindowMap.hpp` |
+| Output | writev + vmsplice / SpliceVault | vendor I/O path |
+| Cache / prefetch | `max(16, P)`, `2*P` | `BlockFetcher.hpp:181-182` |
+| Thread pool spawn | `P==1 ? 0 : P` | `:185` |
+| Queue priorities | 0 decode / −1 post-process | vendor bands |
+| Buffers | `SegmentedU8` / `SegmentedU16` 128 KiB segments | `DecodedData` / `FasterVector` |
+| rpmalloc | Lazy per-thread init on workers | per-`Vec` `RpmallocAllocator` |
 
 ---
 
-## References
+## Synthesis: three behavioral divergences (Fulcrum + code)
 
-- Prior matrix: [`sm-parity-gap-matrix.md`](sm-parity-gap-matrix.md)
-- Survived findings: [`wall-progress.md`](wall-progress.md)
-- Falsified levers: [`x86-falsification-ledger.md`](x86-falsification-ledger.md)
+```mermaid
+flowchart LR
+  subgraph vendor["rapidgzip"]
+    A1[get exact key] --> B1{hit?}
+    B1 -->|yes| C1[deflate Block unified session]
+    B1 -->|no| D1[tryToDecode]
+    D1 --> C1
+    C1 --> E1[pool applyWindow]
+    E1 --> F1[consumer write]
+  end
+
+  subgraph gzippy["gzippy 0462f88"]
+    G1[get exact key] --> H1{hit? ~10%}
+    H1 -->|yes| I1[inflate wrapper]
+    H1 -->|no ~90%| J1[scan + MarkerRing]
+    J1 --> K1[bad_seed_resync]
+    K1 --> L1[finish_decode / ResumableInflate2]
+    L1 --> M1[post_process + consumer wait]
+    M1 --> N1[write]
+  end
+```
+
+1. **Bootstrap engine** — MarkerRing + resync vs inline `deflate::Block`; signature `block_body` 1982ms vs 0ms.
+2. **Path mix** — 90% window-absent / 97% KEY-MISMATCH; need rapidgzip path-mix counters to compare duty cycle under shared keying.
+3. **Consumer ↔ resolve coupling** — publish-chain binds gzippy wall; rapidgzip does not bind the same way.
+
+**Structural divergences independent of path mix:** B1 thread count, B2 buffer pool, A1 ring alignment. B3 early flip is favorable, not a gap.
+
+---
+
+## Exploration questions (numbers → code)
+
+| Question | Method |
+|----------|--------|
+| rapidgzip path mix on same file? | Trace patch: `initialWindow` set vs null per `decodeChunk` |
+| `bad_seed_resync` ↔ tryToDecode failures? | Correlate `SPEC_FAIL_*` per candidate bit |
+| Bit cursor at flip vs vendor? | Oracle chunk: `tell()` at flip and ISA-L entry |
+| B2 page-fault hypothesis? | Delete pool, causal perturbation on `asm_exc_page_fault` |
+| B1 thread-count effect? | `pool_size` physical vs logical on SMT box, wall only |
+| 4 clean chunks: which dispatch arm? | Assert `decode_chunk_with_inflate_wrapper` vs unified marker |
+
+---
+
+## Ranked remaining items (forensic, not perf levers)
+
+For **vendor structural convergence** experiments:
+
+1. **B2** — manual Mutex pool over rpmalloc (allocator-structure; page-fault dimension)
+2. **B1** — physical-core clamp (thread-count observable on SMT)
+3. **A1** — 64-byte ring + LUT alignment (vendor-mandated, cheap)
+
+**Do not prioritize:** A3 (C1 stale), D3 cleanup-only, B3 “fix” toward vendor.
+
+**Delete when convenient:** B4 dead helpers (`take_std_u16`, unused MarkerRing clean-u8 path).
