@@ -29,6 +29,7 @@
 //! window-construction and writev output paths are byte-for-byte
 //! transparent to the switch — only the physical layout differs.
 
+use super::segmented_markers::SegmentedU16;
 use crate::decompress::parallel::rpmalloc_alloc::types::{self, U8};
 
 /// Vendor's `ALLOCATION_CHUNK_SIZE` (`ChunkData.hpp:65`). Reused here as
@@ -345,6 +346,34 @@ impl SegmentedU8 {
         let mut nb =
             types::u8_with_capacity((bytes.len() + self.buf.len()).max(ALLOCATION_CHUNK_SIZE));
         nb.extend_from_slice(bytes);
+        nb.extend_from_slice(&self.buf);
+        self.buf = nb;
+    }
+
+    /// Prepend `n` in-place-narrowed marker bytes (u8 view over u16
+    /// segments) without an intermediate `Vec`. Vendor `applyWindow` swap
+    /// (`DecodedData.hpp:365-388`).
+    pub fn prepend_narrowed_from_markers(&mut self, markers: &SegmentedU16, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let mut nb = types::u8_with_capacity((n + self.buf.len()).max(ALLOCATION_CHUNK_SIZE));
+        let mut left = n;
+        for seg in markers.segments() {
+            if left == 0 {
+                break;
+            }
+            let take = left.min(seg.len());
+            // SAFETY: `resolve_and_narrow_in_place` wrote u8 at byte offsets
+            // `[0, seg.len())` in this segment's storage.
+            let sl = unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const u8, take) };
+            nb.extend_from_slice(sl);
+            left -= take;
+        }
+        debug_assert_eq!(
+            left, 0,
+            "prepend_narrowed_from_markers: short by {left} bytes"
+        );
         nb.extend_from_slice(&self.buf);
         self.buf = nb;
     }

@@ -1591,12 +1591,13 @@ impl ChunkData {
         if n == 0 {
             return;
         }
-        let mut merged = vec![0u8; n];
-        self.data_with_markers
-            .copy_narrowed_u8_range_into(0, n, &mut merged);
         if self.data_prefix_len == 0 {
-            self.data.prepend_bytes(&merged);
+            self.data
+                .prepend_narrowed_from_markers(&self.data_with_markers, n);
         } else {
+            let mut merged = vec![0u8; n];
+            self.data_with_markers
+                .copy_narrowed_u8_range_into(0, n, &mut merged);
             self.data.insert_logical_at(self.data_prefix_len, &merged);
         }
         self.narrowed_len = 0;

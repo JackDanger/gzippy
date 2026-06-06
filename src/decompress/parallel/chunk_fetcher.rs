@@ -1384,7 +1384,10 @@ fn consumer_loop<W: std::io::Write>(
                             "t",
                         );
                     }
-                    if resolved_pred_matches || prefetch_post_inflight.contains_key(&real_offset) {
+                    if resolved_pred_matches
+                        || prefetch_post_inflight.contains_key(&real_offset)
+                        || eager_completed.contains_key(&real_offset)
+                    {
                         ARC_DEFERRED_BORROW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         ConsumerChunkHold::Deferred { arc }
                     } else {
@@ -2323,6 +2326,16 @@ fn confirmed_predecessor_window(
     window_map.get(handoff_bit).map(|w| (handoff_bit, w))
 }
 
+/// Bit offset the consumer will use as `handoff_bit` / predecessor lookup
+/// when this chunk reaches the head of the publish chain. For range-speculative
+/// prefetches `encoded_offset_bits` stays at the partition seed while the
+/// predecessor window is keyed at the worker's decode start
+/// (`max_acceptable_start_bit` == vendor `offset.second`).
+#[cfg(parallel_sm)]
+fn chunk_consumer_handoff_bit(chunk: &ChunkData) -> usize {
+    chunk.max_acceptable_start_bit
+}
+
 /// Marker chunks eligible for prefetch post-process (vendor
 /// `queuePrefetchedChunkPostProcessing` + `hasBeenPostProcessed` gate,
 /// GzipChunkFetcher.hpp:539-546).
@@ -2332,7 +2345,7 @@ fn chunk_may_resolve_markers_early(chunk: &ChunkData, window_map: &WindowMap) ->
     if chunk.has_been_post_processed(false) {
         return false;
     }
-    window_map.get(chunk.encoded_offset_bits).is_some()
+    window_map.get(chunk_consumer_handoff_bit(chunk)).is_some()
 }
 
 /// Vendor `queueChunkForPostProcessing` footer empty-window branch
@@ -2412,8 +2425,9 @@ fn queue_prefetched_marker_postprocess(
         if arc.data_with_markers.is_empty() {
             continue;
         }
+        let handoff_bit = chunk_consumer_handoff_bit(arc.as_ref());
         let Some((pred_key, predecessor_window)) =
-            confirmed_predecessor_window(window_map, arc.encoded_offset_bits)
+            confirmed_predecessor_window(window_map, handoff_bit)
         else {
             continue;
         };
@@ -2854,10 +2868,20 @@ fn recv_post_process_blocking<F>(
         &mut EagerCompleted,
     )>,
 ) -> Result<F, FetchError> {
-    use std::sync::mpsc::RecvTimeoutError;
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
     use std::time::Duration;
     let mut rx = rx;
     loop {
+        match rx.try_recv() {
+            Ok(v) => return Ok(v),
+            Err(TryRecvError::Disconnected) => {
+                return Err(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+                    requested: partition_idx,
+                    actual: 0,
+                }));
+            }
+            Err(TryRecvError::Empty) => {}
+        }
         if let Some((block_fetcher, window_map, thread_pool, in_flight, completed)) =
             overlap.as_mut()
         {
@@ -3622,8 +3646,9 @@ mod tests {
     }
 
     #[test]
-    fn chunk_may_resolve_markers_early_uses_encoded_offset() {
-        // Vendor GzipChunkFetcher.hpp:544 — `m_windowMap->get(chunkData->encodedOffsetInBits)`.
+    fn chunk_may_resolve_markers_early_uses_consumer_handoff_bit() {
+        // Range-speculative chunk: predecessor window is at decode start
+        // (`max_acceptable_start_bit`), not partition seed.
         let cfg = ChunkConfiguration {
             split_chunk_size: 4 * 1024 * 1024,
             max_decoded_chunk_size: 64 * 1024 * 1024,
@@ -3636,9 +3661,9 @@ mod tests {
         chunk.encoded_offset_bits = 4_000_000;
         chunk.data_with_markers.push_slice(&[0u16, 1, 2]);
         let window_map = super::WindowMap::new();
-        window_map.insert_owned_none(5_000_000, vec![0u8; 32768]);
-        assert!(!super::chunk_may_resolve_markers_early(&chunk, &window_map));
         window_map.insert_owned_none(4_000_000, vec![0u8; 32768]);
+        assert!(!super::chunk_may_resolve_markers_early(&chunk, &window_map));
+        window_map.insert_owned_none(5_000_000, vec![0u8; 32768]);
         assert!(super::chunk_may_resolve_markers_early(&chunk, &window_map));
     }
 
