@@ -2,7 +2,9 @@
 
 **Goal:** Compare decode **path mix** between gzippy and rapidgzip on the same corpus — not wall time.
 
-**Reference run:** Fulcrum `0462f88` showed gzippy 90% window-absent / 97% KEY-MISMATCH; rapidgzip path mix not yet measured on the same counters.
+**Reference runs:**
+- `0462f88`: gzippy 90% window-absent / 97% KEY-MISMATCH.
+- `738dea6`: gzippy unchanged; `bad_seed_resync=0`; rapidgzip `worker.decode` spans=0 (stale binary — guest script fixed in `f8490b3` to always apply patches + rebuild when span missing).
 
 ---
 
