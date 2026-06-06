@@ -71,14 +71,33 @@ if ! cargo build --release --no-default-features --features "${GZIPPY_BUILD_FEAT
 fi
 GZIPPY="$REPO/target/release/gzippy"
 
-[ -x "$RG_TRACE" ] || {
-  say "## build-trace rapidgzip missing; building ..."
+install_rapidgzip_trace_patches() {
+  local patch_dir="$REPO/scripts/rapidgzip_trace_patch"
+  local core_hdr="$REPO/vendor/rapidgzip/librapidarchive/src/core/TraceV2.hpp"
+  [ -d "$patch_dir" ] || return 0
+  say "## rapidgzip trace patches (Gate 0 path-mix) ..."
+  mkdir -p "$(dirname "$core_hdr")"
+  cp -f "$patch_dir/TraceV2.hpp" "$core_hdr"
+  bash "$patch_dir/patch_vendor.sh" >>"$ARTDIR/build-rg-trace.log" 2>&1
+  bash "$patch_dir/patch_vendor_phase3b.sh" >>"$ARTDIR/build-rg-trace.log" 2>&1
+  bash "$patch_dir/patch_model_params.sh" >>"$ARTDIR/build-rg-trace.log" 2>&1
+}
+
+build_rapidgzip_trace() {
+  install_rapidgzip_trace_patches
+  say "## build-trace rapidgzip ..."
   BDIR="$REPO/vendor/rapidgzip/librapidarchive/build-trace"
   mkdir -p "$BDIR"
   (cd "$BDIR" && cmake .. -DCMAKE_BUILD_TYPE=Release >>"$ARTDIR/build-rg-trace.log" 2>&1 \
     && cmake --build . --target rapidgzip -j"$(nproc)" >>"$ARTDIR/build-rg-trace.log" 2>&1) \
     || { echo "RUN_TRUSTWORTHY=false"; echo "FAILURE=rapidgzip-trace-build"; exit 8; }
 }
+
+[ -x "$RG_TRACE" ] || build_rapidgzip_trace
+# Rebuild when path-mix patch is new (idempotent patches skip; binary may be stale).
+if ! grep -q 'worker.decode' "$REPO/vendor/rapidgzip/librapidarchive/src/rapidgzip/GzipChunkFetcher.hpp" 2>/dev/null; then
+  build_rapidgzip_trace
+fi
 [ -x "$RG_TRACE" ] || { echo "RUN_TRUSTWORTHY=false"; echo "FAILURE=no-rg-trace"; exit 8; }
 
 [ -f "$CORPUS" ] || { echo "RUN_TRUSTWORTHY=false"; echo "FAILURE=corpus"; exit 7; }
