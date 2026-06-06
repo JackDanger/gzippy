@@ -1468,26 +1468,40 @@ fn decode_huffman_body_resumable(
 
     // Outer loop alternates: try the fastloop, then run safe iterations
     // until either we can re-enter the fastloop OR a yield/EOB fires.
+    let cap_abs_byte = encoded_until_bits / 8;
+    let out_fl_end = output_len.saturating_sub(FASTLOOP_MARGIN);
     loop {
         // FASTLOOP entry condition. Bounds:
         //   - in_pos < in_data_len - 32: refill_fast! 8-byte loads safe
         //     (32-byte tail covers the ≤1 refill/iter, ≤7-byte advance)
-        //   - in_pos * 8 < encoded_until_bits: won't decode past cap
+        //   - abs bit position < encoded_until_bits: won't decode past cap
         //   - out_pos < output_len - FASTLOOP_MARGIN: any single iter's
         //     write fits (max match 258 + literals)
         //
-        // `cap_rel_byte_floor` is the encoded-until cap expressed relative
-        // to the current staging window base.
-        let cap_abs_byte = encoded_until_bits / 8;
+        // `cap_rel_byte_floor` is the encoded-until cap relative to the
+        // current staging window base — MUST be recomputed after every
+        // `refill_local!` slide (x86 repro: stale cap let in_pos run past
+        // `encoded_until_bits` once `buffer_base_byte` advanced).
         let cap_rel_byte_floor = cap_abs_byte.saturating_sub(buffer_base_byte);
         let in_fl_end = in_data_len
             .saturating_sub(FASTLOOP_INPUT_TAIL)
             .min(cap_rel_byte_floor);
-        let out_fl_end = output_len.saturating_sub(FASTLOOP_MARGIN);
 
-        if in_pos < in_fl_end && out_pos < out_fl_end {
+        if in_pos < in_fl_end
+            && out_pos < out_fl_end
+            && abs_bit_position(bitsleft, in_pos, buffer_base_byte) < encoded_until_bits
+        {
             BODY_RESUMABLE_FASTLOOP_ENTERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            while in_pos < in_fl_end && out_pos < out_fl_end {
+            while out_pos < out_fl_end {
+                let cap_rel_byte_floor = cap_abs_byte.saturating_sub(buffer_base_byte);
+                let in_fl_end = in_data_len
+                    .saturating_sub(FASTLOOP_INPUT_TAIL)
+                    .min(cap_rel_byte_floor);
+                if in_pos >= in_fl_end
+                    || abs_bit_position(bitsleft, in_pos, buffer_base_byte) >= encoded_until_bits
+                {
+                    break;
+                }
                 // FASTLOOP: branchless refill — the `in_pos < in_fl_end`
                 // bound makes the bounds check redundant (P1.1 tax-elide).
                 decode_one_symbol!(refill_fast);
