@@ -1008,26 +1008,18 @@ mod tests {
 
         let before = crate::decompress::parallel::chunk_fetcher::COORDINATOR_BOUNDARY_SEARCH_RUNS
             .load(Ordering::Relaxed);
-        let handoff_before = crate::decompress::parallel::chunk_fetcher::HANDOFF_DECODE_CLEAN_OK
-            .load(Ordering::Relaxed);
         let mut output = Vec::new();
         crate::decompress::decompress_single_member(&compressed, &mut output, 4).unwrap();
         assert_eq!(output, original);
         let after = crate::decompress::parallel::chunk_fetcher::COORDINATOR_BOUNDARY_SEARCH_RUNS
             .load(Ordering::Relaxed);
-        let handoff_after = crate::decompress::parallel::chunk_fetcher::HANDOFF_DECODE_CLEAN_OK
-            .load(Ordering::Relaxed);
 
         #[cfg(parallel_sm)]
         {
-            let clean = crate::decompress::parallel::chunk_fetcher::CLEAN_DECODE_VIA_PREDECESSOR
-                .load(Ordering::Relaxed);
             assert!(
-                after > before || clean > 0 || handoff_after > handoff_before,
-                "COORDINATOR_BOUNDARY_SEARCH_RUNS did not increment ({before} -> {after}), \
-                 no clean predecessor-anchor decode ({clean}), and no handoff clean decode \
-                 ({handoff_before} -> {handoff_after}); slow-path or clean speculative path \
-                 must run."
+                after > before,
+                "COORDINATOR_BOUNDARY_SEARCH_RUNS did not increment ({before} -> {after}); \
+                 vendor no-window path (block finder + tryToDecode) must run on this fixture."
             );
         }
         #[cfg(not(parallel_sm))]

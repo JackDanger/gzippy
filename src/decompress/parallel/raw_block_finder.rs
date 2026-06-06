@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::block_finder::BlockFinder;
+use super::block_finder::{BlockBoundary, BlockFinder};
 use super::streamed_results::{StreamedGetReturnCode, StreamedResults};
 
 // B-instrumentation: per-spawn cost breakdown for the BlockFinder
@@ -116,15 +116,43 @@ impl RawBlockFinderCoordinator {
         data: &[u8],
         start_bit: usize,
         max_end: usize,
-        mut try_candidate: impl FnMut(usize) -> Option<R>,
+        mut try_candidate: impl FnMut(BlockBoundary) -> Option<R>,
     ) -> Option<R> {
         let finder = BlockFinder::new(data);
         let mut chunk_begin = start_bit;
         while chunk_begin < max_end {
             let chunk_end = (chunk_begin + CHUNK_SIZE_BITS).min(max_end);
-            for block in finder.find_blocks(chunk_begin, chunk_end) {
+            let mut next_dynamic = finder.find_next_dynamic_block(chunk_begin, chunk_end);
+            let mut next_uncompressed = finder.find_next_uncompressed_block(chunk_begin, chunk_end);
+
+            while next_dynamic.is_some() || next_uncompressed.is_some() {
+                let use_dynamic = match (&next_dynamic, &next_uncompressed) {
+                    (Some(dynamic), Some(uncompressed)) => {
+                        (dynamic.bit_offset, dynamic.seek_bit)
+                            <= (uncompressed.bit_offset, uncompressed.seek_bit)
+                    }
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+
+                let block = if use_dynamic {
+                    let block = next_dynamic.take().unwrap();
+                    // Advance from the seek position we just consumed. For
+                    // stored blocks `seek_bit` is the byte-aligned header
+                    // (`offset.second`), which skips re-yielding the same pair.
+                    next_dynamic =
+                        finder.find_next_dynamic_block(block.seek_bit.saturating_add(1), chunk_end);
+                    block
+                } else {
+                    let block = next_uncompressed.take().unwrap();
+                    next_uncompressed = finder
+                        .find_next_uncompressed_block(block.seek_bit.saturating_add(1), chunk_end);
+                    block
+                };
+
                 if block.valid && block.bit_offset >= chunk_begin && block.bit_offset < chunk_end {
-                    if let Some(result) = try_candidate(block.bit_offset) {
+                    if let Some(result) = try_candidate(block) {
                         return Some(result);
                     }
                 }

@@ -187,6 +187,10 @@ struct DecodeParams {
     /// bit (vendor `untilOffset` when `untilOffsetIsExact == false`).
     /// NOT a hard byte cap on the ISA-L reader — see `decode_chunk`.
     stop_hint_bit: usize,
+    /// True when `stop_hint_bit` is already known to be the exact chain
+    /// end and the window-present decode may take the vendor
+    /// `untilOffsetIsExact` path.
+    stop_hint_is_exact: bool,
     /// True for partition-aligned prefetches that may run before the
     /// predecessor window is published (speculative path). False for
     /// on-demand decodes at a confirmed `block_finder` offset.
@@ -765,16 +769,6 @@ fn drive_impl<W: std::io::Write>(
             EARLY_WINDOW_TAIL_NOT_CLEAN.load(Ordering::Relaxed),
             EARLY_WINDOW_RANGE_SPECULATIVE.load(Ordering::Relaxed),
         );
-        // (Design B) Speculative side-slot: did early-published speculative
-        // windows get promoted (accept) off the consumer's serial chain, or
-        // evicted (reject)? High promoted = the serial window-resolution
-        // chain was broken for those chunks (the lever).
-        eprintln!(
-            "  Speculative window slot: spec_published={} promoted={} evicted={}",
-            EARLY_SPEC_PUBLISHED.load(Ordering::Relaxed),
-            EARLY_SPEC_PROMOTED.load(Ordering::Relaxed),
-            EARLY_SPEC_EVICTED.load(Ordering::Relaxed),
-        );
         // V6: Was the boundary search (scoped BlockFinder spawn) needed
         // for most slow-path decodes, or did the first-candidate try
         // win without it? If runs == ok_count, every slow-path needed
@@ -1100,10 +1094,19 @@ fn consumer_loop<W: std::io::Write>(
             total_bits,
             decode_start,
         );
+        let stop_hint_is_exact = stop_hint_is_exact_for(
+            block_finder,
+            next_unprocessed_block_index,
+            total_bits,
+            decode_start,
+            stop_hint_bit,
+            false,
+        );
         let partition_idx_for_trace = next_unprocessed_block_index;
         let params = DecodeParams {
             start_bit: decode_start,
             stop_hint_bit,
+            stop_hint_is_exact,
             is_speculative_prefetch: false,
             partition_idx: partition_idx_for_trace,
         };
@@ -1130,6 +1133,7 @@ fn consumer_loop<W: std::io::Write>(
             let prefetch_params = DecodeParams {
                 start_bit: offset,
                 stop_hint_bit: prefetch_stop_hint_bit,
+                stop_hint_is_exact: false,
                 is_speculative_prefetch: true,
                 partition_idx: usize::MAX, // trace marker for "prefetch"
             };
@@ -1272,12 +1276,6 @@ fn consumer_loop<W: std::io::Write>(
                 // — accepting on `next_block_offset` threw away valid work
                 // and forced an on-demand re-decode (refreshed-plan §1.4).
                 let handoff_at_decode_start = arc.max_acceptable_start_bit == decode_start;
-                // (Design B) The chunk's `encoded_end` — preserved by
-                // `set_encoded_offset` through the accept rewrite, so it
-                // equals both the consumer's post-accept `chunk_end_bit`
-                // AND the worker's speculative side-slot key. Used to
-                // promote (accept) / evict (reject) the speculative window.
-                let spec_key = arc.encoded_offset_bits + arc.encoded_size_bits;
                 if arc.matches_encoded_offset(decode_start) && handoff_at_decode_start {
                     if trace::is_enabled() {
                         trace::emit(
@@ -1292,20 +1290,7 @@ fn consumer_loop<W: std::io::Write>(
                         );
                     }
                     // ACCEPT: move the `Arc` (no extra refcount) into the consumer path.
-                    let accepted_real_offset = arc.encoded_offset_bits;
                     chunk_arc_from_partition = Some(arc);
-                    if window_map.promote_speculative(spec_key) {
-                        EARLY_SPEC_PROMOTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        queue_prefetched_marker_postprocess(
-                            block_fetcher,
-                            window_map,
-                            thread_pool,
-                            &mut prefetch_post_inflight,
-                            Some(spec_key),
-                            &[accepted_real_offset],
-                            &[partition_offset],
-                        );
-                    }
                 } else {
                     // Diagnostic counter (added 2026-05-19): a prefetch
                     // arrived at the consumer (matches the partition
@@ -1316,15 +1301,6 @@ fn consumer_loop<W: std::io::Write>(
                     // counted by `prefetch_cache_miss` and means a
                     // scheduling/timing miss, not a metadata mismatch.
                     PREFETCH_REJECT_BY_GUARD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // REJECT: this speculative chunk is discarded and
-                    // re-decoded at the real offset below. Evict its
-                    // speculative window so a stale unconfirmed tail can
-                    // never be promoted later (the re-decode publishes a
-                    // fresh, confirmed window). No-op if the worker skipped
-                    // early-publish for this chunk.
-                    if window_map.evict_speculative(spec_key) {
-                        EARLY_SPEC_EVICTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
                     if trace::is_enabled() {
                         trace::emit(
                             "consumer",
@@ -1939,6 +1915,62 @@ fn stop_hint_bit_for(
     total_bits
 }
 
+/// Conservative `untilOffsetIsExact` gate for the window-present path.
+/// We only mark on-demand decodes exact when the chosen stop hint is
+/// already in the confirmed block chain or is the EOF sentinel.
+#[cfg(parallel_sm)]
+fn stop_hint_is_exact_for(
+    block_finder: &GzipBlockFinder,
+    block_index: usize,
+    total_bits: usize,
+    start_bit: usize,
+    stop_hint_bit: usize,
+    is_speculative_prefetch: bool,
+) -> bool {
+    if is_speculative_prefetch || stop_hint_bit <= start_bit {
+        return false;
+    }
+    if stop_hint_bit >= total_bits {
+        return true;
+    }
+
+    let confirmed_count = block_finder.size();
+    for delta in 1..=8 {
+        let idx = block_index + delta;
+        let (candidate, code) = block_finder.get(idx);
+        let Some(candidate) = candidate else {
+            return false;
+        };
+        let candidate = candidate.max(start_bit).min(total_bits);
+        if candidate != stop_hint_bit {
+            continue;
+        }
+        return idx < confirmed_count
+            || (matches!(code, GetReturnCode::Failure) && candidate == total_bits);
+    }
+    false
+}
+
+#[cfg(parallel_sm)]
+#[inline]
+fn decode_chunk_with_until_exact(
+    input: &[u8],
+    encoded_offset_bits: usize,
+    stop_hint_bits: usize,
+    initial_window: &[u8],
+    until_exact: bool,
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    crate::decompress::parallel::gzip_chunk::decode_chunk_until_exact(
+        input,
+        encoded_offset_bits,
+        stop_hint_bits,
+        initial_window,
+        configuration,
+        until_exact,
+    )
+}
+
 /// Submit a decode task to the `ThreadPool`, returning the
 /// `mpsc::Receiver` that `BlockFetcher::get` will wait on. Mirror of
 /// vendor's `submitOnDemandTask(blockOffset, nextBlockOffset)` at
@@ -2112,110 +2144,6 @@ fn submit_post_process_task(
     future.into_receiver()
 }
 
-/// Experimental KEY-MISMATCH oracle (`GZIPPY_SPEC_PRED_CLEAN=1`). Production
-/// uses vendor `decodeBlock` routing in `run_decode_task` instead.
-#[cfg(parallel_sm)]
-#[allow(dead_code)]
-fn spec_pred_clean_enabled() -> bool {
-    match std::env::var_os("GZIPPY_SPEC_PRED_CLEAN") {
-        Some(v) => v != "0" && v != "false",
-        None => false,
-    }
-}
-
-/// Exact-key worker window: `get(blockOffset)` then KEY-MISMATCH handoff
-/// within `(partition_seed, decode_start]` (Fulcrum causal: 97% of window-absent
-/// is partition seed ≠ published boundary key; the window exists at the real key).
-#[cfg(parallel_sm)]
-fn worker_window_exact_at(
-    window_map: &WindowMap,
-    partition_seed: usize,
-    decode_start: usize,
-) -> Option<Window> {
-    if let Some(w) = window_map.get_at_worker(decode_start) {
-        return Some(w);
-    }
-    if decode_start > partition_seed {
-        if let Some((k, w)) = window_map.get_handoff_in_partition(partition_seed, decode_start) {
-            if k == decode_start {
-                return Some(w);
-            }
-        }
-    }
-    None
-}
-
-/// Handoff-ahead clean decode, else marker boundary search.
-#[cfg(parallel_sm)]
-fn try_handoff_or_boundary_search(
-    input_bytes: &[u8],
-    params: DecodeParams,
-    configuration: ChunkConfiguration,
-    window_map: &WindowMap,
-) -> Result<ChunkData, ChunkDecodeError> {
-    if let Some((handoff_key, w)) =
-        worker_handoff_ahead_in_partition(window_map, params.start_bit, params.stop_hint_bit)
-    {
-        let bytes = materialize_window(&w);
-        match decode_chunk(
-            input_bytes,
-            handoff_key,
-            params.stop_hint_bit,
-            &bytes,
-            configuration,
-        ) {
-            Ok(mut chunk)
-                if chunk.encoded_offset_bits == handoff_key
-                    && chunk.max_acceptable_start_bit == handoff_key =>
-            {
-                if params.is_speculative_prefetch && params.start_bit < handoff_key {
-                    rewrite_chunk_from_handoff_to_partition_seed(
-                        &mut chunk,
-                        params.start_bit,
-                        handoff_key,
-                    );
-                }
-                use std::sync::atomic::Ordering;
-                HANDOFF_DECODE_CLEAN_OK.fetch_add(1, Ordering::Relaxed);
-                return Ok(chunk);
-            }
-            Ok(mut chunk)
-                if params.is_speculative_prefetch
-                    && chunk.encoded_offset_bits > params.start_bit
-                    && chunk.encoded_offset_bits < params.stop_hint_bit =>
-            {
-                let hk = chunk.encoded_offset_bits;
-                rewrite_chunk_from_handoff_to_partition_seed(&mut chunk, params.start_bit, hk);
-                use std::sync::atomic::Ordering;
-                HANDOFF_DECODE_CLEAN_OK.fetch_add(1, Ordering::Relaxed);
-                return Ok(chunk);
-            }
-            Ok(_) | Err(_) => {}
-        }
-    }
-    speculative_decode_find_boundary(
-        input_bytes,
-        params.start_bit,
-        params.stop_hint_bit,
-        configuration,
-        window_map,
-    )
-}
-
-/// Largest published window in `(partition_seed, stop_hint]` — the real boundary
-/// key inside this partition when the spacing seed has no exact entry.
-#[cfg(parallel_sm)]
-fn worker_handoff_ahead_in_partition(
-    window_map: &WindowMap,
-    partition_seed: usize,
-    stop_hint: usize,
-) -> Option<(usize, Window)> {
-    if partition_seed >= stop_hint {
-        return None;
-    }
-    window_map.get_handoff_in_partition(partition_seed, stop_hint)
-}
-
 /// Vendor tryToDecode partition-seed rewrite (GzipChunk.hpp:716-722).
 #[cfg(parallel_sm)]
 fn rewrite_chunk_from_handoff_to_partition_seed(
@@ -2238,244 +2166,6 @@ fn rewrite_chunk_from_handoff_to_partition_seed(
             first_sc.encoded_offset_bits = partition_seed;
             first_sc.encoded_size_bits = first_sc_upper - partition_seed;
         }
-    }
-}
-
-/// Experimental clean decode oracle (`GZIPPY_SPEC_PRED_CLEAN=1` only).
-#[cfg(parallel_sm)]
-#[allow(dead_code)]
-fn try_clean_decode_with_pred_window(
-    input: &[u8],
-    params: &DecodeParams,
-    pred_window: &[u8],
-    configuration: ChunkConfiguration,
-    window_map: &WindowMap,
-) -> Result<ChunkData, ChunkDecodeError> {
-    let partition_seed = params.start_bit;
-    match decode_chunk(
-        input,
-        partition_seed,
-        params.stop_hint_bit,
-        pred_window,
-        configuration,
-    ) {
-        Ok(chunk)
-            if chunk.encoded_offset_bits == partition_seed
-                && chunk.max_acceptable_start_bit == partition_seed =>
-        {
-            use std::sync::atomic::Ordering;
-            CLEAN_DECODE_VIA_PREDECESSOR.fetch_add(1, Ordering::Relaxed);
-            Ok(chunk)
-        }
-        Ok(mut chunk)
-            if params.is_speculative_prefetch
-                && chunk.encoded_offset_bits > partition_seed
-                && chunk.encoded_offset_bits < params.stop_hint_bit =>
-        {
-            let handoff_key = chunk.encoded_offset_bits;
-            rewrite_chunk_from_handoff_to_partition_seed(&mut chunk, partition_seed, handoff_key);
-            use std::sync::atomic::Ordering;
-            SPEC_PRED_BOUNDARY_CLEAN.fetch_add(1, Ordering::Relaxed);
-            Ok(chunk)
-        }
-        Ok(_) | Err(_) => speculative_decode_find_boundary(
-            input,
-            partition_seed,
-            params.stop_hint_bit,
-            configuration,
-            window_map,
-        ),
-    }
-}
-
-/// H′ is only attempted when the confirmed predecessor is a tight spacing
-/// overshoot (real boundary just before the partition seed), not chunk-0
-/// across megabytes of stream.
-#[cfg(parallel_sm)]
-fn h_prime_gap_ok(start_bit: usize, pred_key: usize, _stop_hint: usize) -> bool {
-    pred_key > 0 && pred_key < start_bit && start_bit - pred_key <= 2 * 1024 * 1024
-}
-
-/// pred@seed: clean decode at partition seed using merged predecessor dict.
-#[cfg(parallel_sm)]
-fn try_clean_decode_at_seed_with_merged_pred(
-    input_bytes: &[u8],
-    params: DecodeParams,
-    configuration: ChunkConfiguration,
-    window_map: &WindowMap,
-) -> Option<Result<ChunkData, ChunkDecodeError>> {
-    let (_pred_key, w) = window_map.get_predecessor_for_worker(params.start_bit)?;
-    let bytes = materialize_window(&w);
-    match decode_chunk(
-        input_bytes,
-        params.start_bit,
-        params.stop_hint_bit,
-        &bytes,
-        configuration,
-    ) {
-        Ok(chunk)
-            if chunk.encoded_offset_bits == params.start_bit
-                && chunk.max_acceptable_start_bit == params.start_bit =>
-        {
-            use std::sync::atomic::Ordering;
-            CLEAN_DECODE_VIA_PREDECESSOR.fetch_add(1, Ordering::Relaxed);
-            Some(Ok(chunk))
-        }
-        Ok(mut chunk)
-            if params.is_speculative_prefetch
-                && chunk.encoded_offset_bits > params.start_bit
-                && chunk.encoded_offset_bits < params.stop_hint_bit =>
-        {
-            let hk = chunk.encoded_offset_bits;
-            rewrite_chunk_from_handoff_to_partition_seed(&mut chunk, params.start_bit, hk);
-            use std::sync::atomic::Ordering;
-            SPEC_PRED_BOUNDARY_CLEAN.fetch_add(1, Ordering::Relaxed);
-            Some(Ok(chunk))
-        }
-        Ok(_) | Err(_) => None,
-    }
-}
-
-/// After exact `get(blockOffset)` and explicit handoff miss: H′ → pred@seed → boundary scan.
-#[cfg(parallel_sm)]
-fn decode_pred_hprime_then_boundary(
-    input_bytes: &[u8],
-    params: DecodeParams,
-    configuration: ChunkConfiguration,
-    window_map: &WindowMap,
-) -> Result<ChunkData, ChunkDecodeError> {
-    if let Some((pred_key, w)) = window_map.get_confirmed_predecessor_for_worker(params.start_bit) {
-        if h_prime_gap_ok(params.start_bit, pred_key, params.stop_hint_bit) {
-            if let Ok(chunk) =
-                try_clean_decode_via_pred_key(input_bytes, &params, pred_key, &w, configuration)
-            {
-                return Ok(chunk);
-            }
-        }
-    }
-    if let Some(Ok(chunk)) =
-        try_clean_decode_at_seed_with_merged_pred(input_bytes, params, configuration, window_map)
-    {
-        return Ok(chunk);
-    }
-    speculative_decode_find_boundary(
-        input_bytes,
-        params.start_bit,
-        params.stop_hint_bit,
-        configuration,
-        window_map,
-    )
-}
-
-/// Design H′: predecessor window is keyed at `pred_key < partition_seed`
-/// (prior chunk end). Decode AT `pred_key` with that dict, then rewrite
-/// metadata to the partition seed. Chain-valid gate: confirmed `entries` only.
-#[cfg(parallel_sm)]
-fn try_clean_decode_via_pred_key(
-    input: &[u8],
-    params: &DecodeParams,
-    pred_key: usize,
-    w: &Window,
-    configuration: ChunkConfiguration,
-) -> Result<ChunkData, ChunkDecodeError> {
-    use std::sync::atomic::Ordering;
-
-    let partition_seed = params.start_bit;
-    debug_assert!(pred_key < partition_seed);
-    let bytes = materialize_window(w);
-    match decode_chunk(input, pred_key, params.stop_hint_bit, &bytes, configuration) {
-        Ok(chunk)
-            if chunk.encoded_offset_bits == partition_seed
-                && chunk.max_acceptable_start_bit == partition_seed =>
-        {
-            CLEAN_DECODE_VIA_PRED_KEY.fetch_add(1, Ordering::Relaxed);
-            Ok(chunk)
-        }
-        Ok(mut chunk)
-            if chunk.encoded_offset_bits >= partition_seed
-                && chunk.encoded_offset_bits < params.stop_hint_bit =>
-        {
-            let handoff_key = chunk.encoded_offset_bits;
-            if handoff_key > partition_seed || params.is_speculative_prefetch {
-                rewrite_chunk_from_handoff_to_partition_seed(
-                    &mut chunk,
-                    partition_seed,
-                    handoff_key,
-                );
-            }
-            CLEAN_DECODE_VIA_PRED_KEY.fetch_add(1, Ordering::Relaxed);
-            Ok(chunk)
-        }
-        Ok(mut chunk)
-            if params.is_speculative_prefetch
-                && chunk.encoded_offset_bits > pred_key
-                && chunk.encoded_offset_bits < params.stop_hint_bit =>
-        {
-            let handoff_key = chunk.encoded_offset_bits;
-            rewrite_chunk_from_handoff_to_partition_seed(&mut chunk, partition_seed, handoff_key);
-            CLEAN_DECODE_VIA_PRED_KEY.fetch_add(1, Ordering::Relaxed);
-            Ok(chunk)
-        }
-        Ok(_) | Err(_) => Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "pred_key clean miss",
-        ))),
-    }
-}
-
-/// Worker early window publish (vendor `WindowMap::emplace` at chunk end +
-/// handoff key for `get(blockOffset)` parity on confirmed boundaries).
-#[cfg(parallel_sm)]
-fn worker_publish_windows_after_decode(chunk: &ChunkData, window_map: &WindowMap) {
-    use std::sync::atomic::Ordering;
-
-    if chunk.encoded_size_bits == 0 {
-        return;
-    }
-
-    let chunk_end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-
-    if chunk.max_acceptable_start_bit == chunk.encoded_offset_bits && !chunk.markers_resolved {
-        if let Some(tail) = chunk.last_32kib_window_vec() {
-            window_map.insert_owned_none(chunk_end_bit, tail);
-            trace_v2::emit_instant(
-                "causal.window_publish",
-                &format!(
-                    r#""start_bit":{},"end_bit":{chunk_end_bit},"site":"worker_early""#,
-                    chunk.encoded_offset_bits
-                ),
-                "t",
-            );
-            EARLY_WINDOW_PUBLISHED.fetch_add(1, Ordering::Relaxed);
-        } else {
-            EARLY_WINDOW_TAIL_NOT_CLEAN.fetch_add(1, Ordering::Relaxed);
-        }
-        return;
-    }
-
-    if chunk.max_acceptable_start_bit > chunk.encoded_offset_bits {
-        // Vendor tryToDecode range: publish at handoff key so sibling
-        // prefetches hit `get(max_acceptable)` when the boundary aligns.
-        if let Some(prefix) = chunk.window_prefix_vec() {
-            let handoff_key = chunk.max_acceptable_start_bit;
-            if !window_map.contains(handoff_key) {
-                window_map.insert_owned_none(handoff_key, prefix);
-                HANDOFF_WINDOW_PUBLISHED.fetch_add(1, Ordering::Relaxed);
-                trace_v2::emit_instant(
-                    "causal.window_publish",
-                    &format!(
-                        r#""start_bit":{},"end_bit":{handoff_key},"site":"worker_handoff""#,
-                        chunk.encoded_offset_bits
-                    ),
-                    "t",
-                );
-            }
-        }
-        if let Some(tail) = chunk.last_32kib_window_vec() {
-            window_map.insert_speculative_owned_none(chunk_end_bit, tail);
-            EARLY_SPEC_PUBLISHED.fetch_add(1, Ordering::Relaxed);
-        }
-        EARLY_WINDOW_RANGE_SPECULATIVE.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -2521,19 +2211,6 @@ fn run_decode_task(
             params.stop_hint_bit,
             configuration,
         ) {
-            if chunk.max_acceptable_start_bit == chunk.encoded_offset_bits
-                && chunk.encoded_size_bits > 0
-            {
-                if let Some(tail) = chunk.last_32kib_window_vec() {
-                    let chunk_end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-                    window_map.insert_owned_none(chunk_end_bit, tail);
-                }
-            } else if chunk.encoded_size_bits > 0 {
-                if let Some(tail) = chunk.last_32kib_window_vec() {
-                    let key = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-                    window_map.insert_speculative_owned_none(key, tail);
-                }
-            }
             return Ok(Arc::new(chunk));
         }
     }
@@ -2544,21 +2221,6 @@ fn run_decode_task(
             params.stop_hint_bit,
             configuration,
         ) {
-            // Preserve the early-window-publish behavior the real decode
-            // path performs so successor resolution is unchanged.
-            if chunk.max_acceptable_start_bit == chunk.encoded_offset_bits
-                && chunk.encoded_size_bits > 0
-            {
-                if let Some(tail) = chunk.last_32kib_window_vec() {
-                    let chunk_end_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-                    window_map.insert_owned_none(chunk_end_bit, tail);
-                }
-            } else if chunk.encoded_size_bits > 0 {
-                if let Some(tail) = chunk.last_32kib_window_vec() {
-                    let key = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-                    window_map.insert_speculative_owned_none(key, tail);
-                }
-            }
             return Ok(Arc::new(chunk));
         }
     }
@@ -2593,22 +2255,18 @@ fn run_decode_task(
     // `decode_chunk` slice borrow is valid for the call's
     // duration without going through WindowMap. Non-chunk-0 worker
     // Vendor `decodeBlock` (GzipChunkFetcher.hpp:712-729): exact
-    // `get(blockOffset)`; workers merge speculative early-publish.
+    // `m_windowMap->get(blockOffset)` only — no predecessor scan, no
+    // speculative side-slot merge. Windows are published on the consumer
+    // path (`queueChunkForPostProcessing`, GzipChunkFetcher.hpp:557-574).
     let zero_window: [u8; 32768] = [0u8; 32768];
     let window_at_offset: Option<Window> = if params.start_bit == 0 {
         None
     } else {
-        window_map.get_at_worker(params.start_bit)
+        window_map.get(params.start_bit)
     };
+    let until_exact = window_at_offset.is_some() && params.stop_hint_is_exact;
 
-    let handoff_ahead = window_at_offset
-        .is_none()
-        .then(|| {
-            worker_handoff_ahead_in_partition(window_map, params.start_bit, params.stop_hint_bit)
-        })
-        .flatten();
-    let decode_mode_clean =
-        params.start_bit == 0 || window_at_offset.is_some() || handoff_ahead.is_some();
+    let decode_mode_clean = params.start_bit == 0 || window_at_offset.is_some();
     let mode_str = if decode_mode_clean {
         "clean"
     } else {
@@ -2625,10 +2283,11 @@ fn run_decode_task(
     trace_v2::emit_instant(
         "causal.decode_decision",
         &format!(
-            r#""start_bit":{},"window_present":{},"window_exact":{},"predecessor_available":false,"mode":"{mode_str}","stop_hint":{},"speculative":{}"#,
+            r#""start_bit":{},"window_present":{},"window_exact":{},"until_exact":{},"predecessor_available":false,"mode":"{mode_str}","stop_hint":{},"speculative":{}"#,
             params.start_bit,
             decode_mode_clean,
             window_at_offset.is_some(),
+            until_exact,
             params.stop_hint_bit,
             params.is_speculative_prefetch
         ),
@@ -2636,121 +2295,34 @@ fn run_decode_task(
     );
 
     let chunk_result = if params.start_bit == 0 {
-        decode_chunk(
+        decode_chunk_with_until_exact(
             input_bytes,
             params.start_bit,
             params.stop_hint_bit,
             &zero_window[..],
+            false,
             configuration,
         )
     } else if let Some(w) = window_at_offset.as_ref() {
         let bytes = materialize_window(w);
-        decode_chunk(
+        decode_chunk_with_until_exact(
             input_bytes,
             params.start_bit,
             params.stop_hint_bit,
             &bytes,
+            until_exact,
             configuration,
         )
-    } else if let Some((handoff_key, w)) = handoff_ahead {
-        let bytes = materialize_window(&w);
-        match decode_chunk(
-            input_bytes,
-            handoff_key,
-            params.stop_hint_bit,
-            &bytes,
-            configuration,
-        ) {
-            Ok(mut chunk)
-                if chunk.encoded_offset_bits == handoff_key
-                    && chunk.max_acceptable_start_bit == handoff_key =>
-            {
-                if params.is_speculative_prefetch && params.start_bit < handoff_key {
-                    rewrite_chunk_from_handoff_to_partition_seed(
-                        &mut chunk,
-                        params.start_bit,
-                        handoff_key,
-                    );
-                }
-                use std::sync::atomic::Ordering;
-                HANDOFF_DECODE_CLEAN_OK.fetch_add(1, Ordering::Relaxed);
-                Ok(chunk)
-            }
-            Ok(mut chunk)
-                if params.is_speculative_prefetch
-                    && chunk.encoded_offset_bits > params.start_bit
-                    && chunk.encoded_offset_bits < params.stop_hint_bit =>
-            {
-                let hk = chunk.encoded_offset_bits;
-                rewrite_chunk_from_handoff_to_partition_seed(&mut chunk, params.start_bit, hk);
-                use std::sync::atomic::Ordering;
-                HANDOFF_DECODE_CLEAN_OK.fetch_add(1, Ordering::Relaxed);
-                Ok(chunk)
-            }
-            Ok(_) | Err(_) => {
-                decode_pred_hprime_then_boundary(input_bytes, params, configuration, window_map)
-            }
-        }
     } else {
-        decode_pred_hprime_then_boundary(input_bytes, params, configuration, window_map)
+        speculative_decode_find_boundary(
+            input_bytes,
+            params.start_bit,
+            params.stop_hint_bit,
+            configuration,
+            window_map,
+        )
     };
 
-    // EARLY WINDOW PUBLISH (break the serial window-resolution chain).
-    //
-    // The in-order consumer is the wall: a successor chunk that decoded
-    // with markers can only be RESOLVED (apply_window) once its
-    // predecessor's tail-window is in the WindowMap, and historically
-    // that window appeared only as the consumer serially advanced to and
-    // resolved the predecessor (a strict N-1 → N chain). A probe (this
-    // branch's parent commit) confirmed ready prefetched successors sit
-    // idle because `get_predecessor` misses.
-    //
-    // The lever: a chunk's last 32 KiB is the exact window the NEXT chunk
-    // needs, and the worker has it RIGHT AFTER decode — long before the
-    // consumer reaches this chunk. Publish it now so successors'
-    // predecessor windows become available off the consumer's serial path
-    // (both the consumer's `has_predecessor` wait and
-    // `eager_postprocess_prefetched`'s `get_predecessor` then succeed).
-    //
-    // CORRECTNESS — three invariants make this byte-identical to the
-    // consumer's eventual publish:
-    //
-    //  1. KEY STABILITY. We key at `chunk_end_bit = encoded_offset_bits +
-    //     encoded_size_bits`. The consumer publishes at the same
-    //     expression AFTER `set_encoded_offset`, which holds that sum
-    //     invariant (ChunkData::set_encoded_offset: new_size = end - off,
-    //     new_off = off ⇒ off + new_size == end). So the worker's
-    //     `chunk_end_bit` equals the consumer's for any chunk the
-    //     consumer accepts.
-    //
-    //  2. ACCEPT DETERMINISM. We publish ONLY when
-    //     `max_acceptable_start_bit == encoded_offset_bits` — i.e. the
-    //     chunk decoded at an EXACT confirmed offset, not a speculative
-    //     RANGE. These are (a) fast-path `decode_chunk` chunks
-    //     (window known) and (b) marker-bootstrap chunks whose partition
-    //     seed already WAS the real boundary (`try_speculative_decode_
-    //     candidate` widens `max` past `encoded` only when
-    //     `partition_seed < decode_start`). Such chunks are always
-    //     accepted by the consumer's `matches_encoded_offset` +
-    //     `max == next_block_offset` guard with the SAME end, so the
-    //     window we publish is never stale/rejected. Range-speculative
-    //     chunks (`max > encoded`) may be rejected and re-decoded at a
-    //     different start/end — we never publish for those; they take the
-    //     existing serial consumer publish unchanged.
-    //
-    //  3. PROVABLY-CLEAN TAIL. We publish only `last_32kib_window_vec()`,
-    //     which returns `Some` IFF the trailing 32 KiB contains no
-    //     markers (resolved purely from clean bytes, no predecessor
-    //     needed). On a clean tail it is byte-identical to the consumer's
-    //     `get_last_window_vec(pred)` (which only consults the
-    //     predecessor for marker bytes in the tail — of which there are
-    //     none). When the tail straddles markers it returns `None` and we
-    //     publish nothing → the chunk falls back to the consumer's serial
-    //     `get_last_window_vec(pred)` publish, unchanged.
-    //
-    // `insert` uses overwrite semantics (WindowMap.hpp:65-76
-    // insert_or_assign), so the consumer's later publish at the same key
-    // is a harmless idempotent overwrite with identical bytes.
     // DECODE-BYPASS capture (campaign instrument, GZIPPY_BYPASS_CAPTURE).
     // Record this decode result keyed by (start_bit, stop_hint_bit) so a
     // later replay run can memcpy it back. No-op unless capture is on.
@@ -2760,10 +2332,6 @@ fn run_decode_task(
             params.stop_hint_bit,
             chunk,
         );
-    }
-
-    if let Ok(ref chunk) = chunk_result {
-        worker_publish_windows_after_decode(chunk, window_map);
     }
 
     // Wrap in Arc to match BlockFetcher's `Value = Arc<ChunkData>`
@@ -3193,22 +2761,9 @@ pub static EARLY_WINDOW_TAIL_NOT_CLEAN: std::sync::atomic::AtomicU64 =
 pub static EARLY_WINDOW_RANGE_SPECULATIVE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// (Design B) Speculative side-slot telemetry.
-/// PUBLISHED: worker published a range-speculative chunk's provably-clean
-/// tail into the speculative side-slot (subset of RANGE_SPECULATIVE that
-/// had a clean tail).
-/// PROMOTED: consumer accepted the speculative chunk and moved its window
-/// into the real map (identity-key move).
-/// EVICTED: consumer rejected the speculative chunk and dropped its
-/// stale window. PUBLISHED should ≈ PROMOTED + EVICTED (+ a small residue
-/// for entries whose chunk the consumer never reached, e.g. EOF).
-pub static EARLY_SPEC_PUBLISHED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 /// Worker published a confirmed window at `max_acceptable_start_bit` (handoff key).
 pub static HANDOFF_WINDOW_PUBLISHED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-pub static EARLY_SPEC_PROMOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static EARLY_SPEC_EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Worker resolve-ahead: attempts / successes.
 pub static RESOLVE_AHEAD_ATTEMPTS: std::sync::atomic::AtomicU64 =
@@ -3422,9 +2977,13 @@ fn eager_postproc_enabled() -> bool {
     }
 }
 
-/// Speculative try-decode at a block-finder candidate (vendor `tryToDecode`).
-/// When `pred_window` is `Some`, attempt clean [`decode_chunk`] first —
-/// a real boundary with the predecessor dict skips the marker bootstrap.
+/// Speculative try-decode at a block-finder candidate (vendor `tryToDecode`,
+/// GzipChunk.hpp:712-734): always `decodeChunkWithRapidgzip` with
+/// `initialWindow = nullopt` at the actual decode seek bit (`offset.second`),
+/// then rewrite metadata so `encoded_offset_bits = offset.first` and
+/// `max_acceptable_start_bit = offset.second`. No `WindowMap::get` on the
+/// candidate — only `decodeBlock` does an exact-key lookup before entering
+/// the no-window path.
 #[cfg(parallel_sm)]
 fn try_speculative_decode_candidate(
     input: &[u8],
@@ -3432,61 +2991,9 @@ fn try_speculative_decode_candidate(
     partition_seed: usize,
     stop_hint_bit: usize,
     configuration: ChunkConfiguration,
-    window_map: &WindowMap,
+    _window_map: &WindowMap,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    // Clean try when a window is at this exact bit, or KEY-MISMATCH handoff
-    // within the partition (seed → real boundary). `get_predecessor` alone is
-    // NOT used — false-positive candidates with a stale earlier dict corrupt CRC.
-    let result = if let Some(w) = worker_window_exact_at(window_map, partition_seed, decode_start) {
-        let pw = materialize_window(&w);
-        match decode_chunk(
-            input,
-            decode_start,
-            stop_hint_bit,
-            pw.as_ref(),
-            configuration,
-        ) {
-            Ok(chunk)
-                if chunk.encoded_offset_bits == decode_start
-                    && chunk.max_acceptable_start_bit == decode_start =>
-            {
-                SPEC_DECODE_CLEAN_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(chunk)
-            }
-            Ok(chunk) => {
-                let actual = chunk
-                    .encoded_offset_bits
-                    .saturating_add(chunk.encoded_size_bits);
-                Err(ChunkDecodeError::ExactStopMissed {
-                    requested: decode_start,
-                    actual,
-                })
-            }
-            Err(e) => Err(e),
-        }
-    } else if let Some((pred_key, w)) =
-        window_map.get_confirmed_predecessor_for_worker(decode_start)
-    {
-        let params = DecodeParams {
-            start_bit: partition_seed,
-            stop_hint_bit,
-            is_speculative_prefetch: partition_seed < decode_start,
-            partition_idx: usize::MAX,
-        };
-        if h_prime_gap_ok(decode_start, pred_key, stop_hint_bit) {
-            if let Ok(chunk) =
-                try_clean_decode_via_pred_key(input, &params, pred_key, &w, configuration)
-            {
-                Ok(chunk)
-            } else {
-                decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration)
-            }
-        } else {
-            decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration)
-        }
-    } else {
-        decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration)
-    };
+    let result = decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration);
     // V1: classify failures so we know which fix to attack.
     //   header_fail  → "deflate header at bit X" — could be caught by
     //                  precode pre-pass (CountAllocatedLeaves port)
@@ -3520,26 +3027,31 @@ fn try_speculative_decode_candidate(
     }
     let mut chunk = result?;
     // (Design B) Record the encoded bit the worker decoded byte 0 from.
-    // `decode_chunk_window_absent` anchored the chunk at
-    // `decode_start`, so that is the true origin regardless of the
-    // partition-seed rewrite below.
+    // `decode_chunk_window_absent` anchored the chunk at `decode_start`
+    // (`offset.second`), so that is the true origin regardless of the
+    // range rewrite below.
     chunk.decode_origin_bit = decode_start;
-    // Vendor tryToDecode metadata (GzipChunk.hpp:716-722): encoded =
-    // partition seed, max = actual decode start.
-    if partition_seed < decode_start {
-        let encoded_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
-        let first_sc_upper = chunk
-            .subchunks
-            .get(1)
-            .map(|sc| sc.encoded_offset_bits)
-            .unwrap_or(encoded_end);
-        chunk.encoded_offset_bits = partition_seed;
-        chunk.encoded_size_bits = encoded_end - partition_seed;
-        chunk.max_acceptable_start_bit = decode_start;
-        if let Some(first_sc) = chunk.subchunks.first_mut() {
-            first_sc.encoded_offset_bits = partition_seed;
-            first_sc.encoded_size_bits = first_sc_upper - partition_seed;
-        }
+    // Vendor tryToDecode metadata (GzipChunk.hpp:716-722):
+    //   encoded = offset.first
+    //   max     = offset.second
+    debug_assert!(
+        partition_seed <= decode_start,
+        "candidate first={} must not exceed seek={}",
+        partition_seed,
+        decode_start
+    );
+    let encoded_end = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+    let first_sc_upper = chunk
+        .subchunks
+        .get(1)
+        .map(|sc| sc.encoded_offset_bits)
+        .unwrap_or(encoded_end);
+    chunk.encoded_offset_bits = partition_seed;
+    chunk.encoded_size_bits = encoded_end - partition_seed;
+    chunk.max_acceptable_start_bit = decode_start;
+    if let Some(first_sc) = chunk.subchunks.first_mut() {
+        first_sc.encoded_offset_bits = partition_seed;
+        first_sc.encoded_size_bits = first_sc_upper - partition_seed;
     }
     Ok(chunk)
 }
@@ -3607,7 +3119,7 @@ fn speculative_decode_find_boundary(
         input,
         start_bit,
         max_end,
-        |cand_bit| {
+        |candidate| {
             // worker.scan_candidate span: one full-decode attempt at a
             // single bit position the scan flagged as a valid block
             // candidate. Matched on vendor side by the trace patch
@@ -3615,8 +3127,8 @@ fn speculative_decode_find_boundary(
             let _tv2_cand = trace_v2::SpanGuard::begin("worker.scan_candidate");
             match try_speculative_decode_candidate(
                 input,
-                cand_bit,
-                start_bit,
+                candidate.seek_bit,
+                candidate.bit_offset,
                 stop_hint_bit,
                 configuration,
                 window_map,
@@ -4117,6 +3629,50 @@ mod tests {
             until.saturating_sub(confirmed_end) >= spacing_bits,
             "until {until} must skip stale get(idx+1) guess {spacing_bits} (only 5b past end)"
         );
+    }
+
+    #[test]
+    fn stop_hint_is_exact_for_confirmed_successor() {
+        let spacing_bytes = 4 * 1024 * 1024;
+        let spacing_bits = spacing_bytes * 8;
+        let total_bits = spacing_bits * 10;
+        let finder = GzipBlockFinder::new(0, spacing_bytes, Some(total_bits));
+        let confirmed_end = spacing_bits - 5;
+        let confirmed_next = 2 * spacing_bits;
+        finder.insert(confirmed_end);
+        finder.insert(confirmed_next);
+
+        let until = super::stop_hint_bit_for(&finder, 1, total_bits, confirmed_end);
+        assert_eq!(until, confirmed_next);
+        assert!(super::stop_hint_is_exact_for(
+            &finder,
+            1,
+            total_bits,
+            confirmed_end,
+            until,
+            false,
+        ));
+    }
+
+    #[test]
+    fn stop_hint_is_exact_for_rejects_partition_guess() {
+        let spacing_bytes = 4 * 1024 * 1024;
+        let spacing_bits = spacing_bytes * 8;
+        let total_bits = spacing_bits * 10;
+        let finder = GzipBlockFinder::new(0, spacing_bytes, Some(total_bits));
+        let confirmed_end = spacing_bits - 5;
+        finder.insert(confirmed_end);
+
+        let until = super::stop_hint_bit_for(&finder, 1, total_bits, confirmed_end);
+        assert!(until > confirmed_end);
+        assert!(!super::stop_hint_is_exact_for(
+            &finder,
+            1,
+            total_bits,
+            confirmed_end,
+            until,
+            false,
+        ));
     }
 
     /// Regression for neurotic `make profile-decompression-x86_64` (64 MiB
