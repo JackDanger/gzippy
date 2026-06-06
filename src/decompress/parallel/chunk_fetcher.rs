@@ -680,16 +680,20 @@ fn drive_impl<W: std::io::Write>(
         {
             use crate::decompress::parallel::gzip_chunk::{
                 BAD_SEED_RESYNC, BULK_TAIL_RESUMABLE_FALLBACK, FINISHED_NO_FLIP_CHUNKS,
-                FLIP_TO_CLEAN_CHUNKS, HANDOFF_WINDOW_BUF_GROWS,
+                FINISH_DECODE_ENTRIES, FLIP_TO_CLEAN_CHUNKS, HANDOFF_WINDOW_BUF_GROWS,
+                INFLATE_WRAPPER_CHUNKS, WINDOW_SEEDED_CHUNKS,
             };
             eprintln!(
-                "  Unified decoder: flip_to_clean={} finished_no_flip={} bad_seed_resync={} resumable_resync_calls={} handoff_window_grows={}",
-                FLIP_TO_CLEAN_CHUNKS.load(Ordering::Relaxed),
-                FINISHED_NO_FLIP_CHUNKS.load(Ordering::Relaxed),
-                BAD_SEED_RESYNC.load(Ordering::Relaxed),
-                BULK_TAIL_RESUMABLE_FALLBACK.load(Ordering::Relaxed),
-                HANDOFF_WINDOW_BUF_GROWS.load(Ordering::Relaxed),
-            );
+            "  Unified decoder: flip_to_clean={} finished_no_flip={} finish_decode={} inflate_wrapper={} window_seeded={} bad_seed_resync={} resumable_resync_calls={} handoff_window_grows={}",
+            FLIP_TO_CLEAN_CHUNKS.load(Ordering::Relaxed),
+            FINISHED_NO_FLIP_CHUNKS.load(Ordering::Relaxed),
+            FINISH_DECODE_ENTRIES.load(Ordering::Relaxed),
+            INFLATE_WRAPPER_CHUNKS.load(Ordering::Relaxed),
+            WINDOW_SEEDED_CHUNKS.load(Ordering::Relaxed),
+            BAD_SEED_RESYNC.load(Ordering::Relaxed),
+            BULK_TAIL_RESUMABLE_FALLBACK.load(Ordering::Relaxed),
+            HANDOFF_WINDOW_BUF_GROWS.load(Ordering::Relaxed),
+        );
         }
         use crate::decompress::parallel::chunk_buffer_pool::*;
         eprintln!(
@@ -2966,28 +2970,47 @@ fn try_speculative_decode_candidate(
     //   stop_missed  → chunk size cap hit (not really a "failure")
     if let Err(ref e) = result {
         use std::sync::atomic::Ordering;
-        match e {
+        let fail_kind = match e {
             ChunkDecodeError::BootstrapFailed(io_err) => {
                 let msg = io_err.to_string();
                 if msg.contains("deflate header") {
                     SPEC_FAIL_HEADER.fetch_add(1, Ordering::Relaxed);
+                    "header"
                 } else if msg.contains("deflate body") {
                     SPEC_FAIL_BODY.fetch_add(1, Ordering::Relaxed);
+                    "body"
                 } else {
                     SPEC_FAIL_OTHER.fetch_add(1, Ordering::Relaxed);
+                    "other"
                 }
             }
             ChunkDecodeError::InflateFailed(_) => {
                 SPEC_FAIL_INFLATE.fetch_add(1, Ordering::Relaxed);
+                "inflate"
             }
             ChunkDecodeError::ExactStopMissed { .. } => {
                 SPEC_FAIL_STOP_MISSED.fetch_add(1, Ordering::Relaxed);
+                "stop_missed"
             }
             ChunkDecodeError::UnsupportedPlatform => {
                 SPEC_FAIL_OTHER.fetch_add(1, Ordering::Relaxed);
+                "other"
             }
-        }
+        };
+        trace_v2::emit_instant(
+            "worker.try_to_decode",
+            &format!(
+                r#""partition_seed":{partition_seed},"decode_start":{decode_start},"ok":false,"fail_kind":"{fail_kind}""#
+            ),
+            "t",
+        );
+        return result;
     }
+    trace_v2::emit_instant(
+        "worker.try_to_decode",
+        &format!(r#""partition_seed":{partition_seed},"decode_start":{decode_start},"ok":true"#),
+        "t",
+    );
     let mut chunk = result?;
     // (Design B) Record the encoded bit the worker decoded byte 0 from.
     // `decode_chunk_window_absent` anchored the chunk at `decode_start`
