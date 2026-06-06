@@ -510,19 +510,6 @@ where
         // once the worker finishes.
     }
 
-    /// Replace a prefetched entry in place when post-process completes on
-    /// the pool (vendor `hasBeenPostProcessed` on the same `shared_ptr`).
-    #[cfg(parallel_sm)]
-    pub fn replace_prefetch_if_present(&self, block_offset: Key, block_data: Value) -> bool {
-        let mut pc = self.prefetch_cache.lock().unwrap();
-        if pc.test(&block_offset) {
-            pc.insert(block_offset, block_data);
-            true
-        } else {
-            false
-        }
-    }
-
     /// Record that an on-demand fetch was issued. Bumps the on-demand
     /// counter. Mirror of `BlockFetcher::submitOnDemandTask`'s stats
     /// path (around BlockFetcher.hpp:600).
