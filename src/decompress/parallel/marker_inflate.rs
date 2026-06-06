@@ -345,8 +345,15 @@ pub struct Block {
     /// as the C `IsalLitLenCode` / `IsalDistCode` fields above).
     #[cfg(pure_inflate_decode)]
     isal_litlen_pure: crate::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure,
+    /// Distance Huffman decoder. Vendor rapidgzip explicitly REJECTED ISA-L
+    /// for distance and uses `HuffmanCodingReversedBitsCached` (gzip/deflate.hpp:336;
+    /// ISA-L distance commented out :338). Faithful transliteration of that choice —
+    /// mirrors the canonical fallback path's distance decode (see :1514-1586).
     #[cfg(pure_inflate_decode)]
-    isal_dist_pure: crate::decompress::parallel::isal_huffman_pure::IsalDistCodePure,
+    dist_hc:
+        crate::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached<
+            MAX_DISTANCE_SYMBOL_COUNT,
+        >,
     /// True after `read_header` built ISA-L LUTs for this block (vendor
     /// `m_literalHC` / `m_distanceHC` at deflate.hpp:1137-1141). Cleared
     /// on each new header so `read()` in the `while !eob` loop reuses them.
@@ -422,8 +429,8 @@ impl Block {
             isal_litlen_pure:
                 crate::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure::new_empty(),
             #[cfg(pure_inflate_decode)]
-            isal_dist_pure:
-                crate::decompress::parallel::isal_huffman_pure::IsalDistCodePure::new_empty(),
+            dist_hc:
+                crate::decompress::parallel::huffman_reversed_bits_cached::HuffmanCodingReversedBitsCached::new(),
             #[cfg(any(
                 all(
                     feature = "isal-compression",
@@ -839,7 +846,14 @@ impl Block {
                 if !self.isal_lut_litlen_rebuild(&FIXED_LIT_LEN_LENGTHS[..]) {
                     return Err(BlockError::InvalidCodeLengths);
                 }
-                if !self.isal_lut_dist_rebuild(&FIXED_DIST_LENGTHS[..]) {
+                // Vendor parity (gzip/deflate.hpp:336): distance via the cached
+                // reversed-bits decoder, not the ISA-L LUT. Mirror of the canonical
+                // fallback build at :1516-1519.
+                if self
+                    .dist_hc
+                    .initialize_from_lengths(&FIXED_DIST_LENGTHS[..], false)
+                    != super::error::Error::None
+                {
                     return Err(BlockError::InvalidCodeLengths);
                 }
             }
@@ -853,7 +867,14 @@ impl Block {
                 if !self.isal_lut_litlen_rebuild(&lit_stack[..split]) {
                     return Err(BlockError::InvalidCodeLengths);
                 }
-                if !self.isal_lut_dist_rebuild(&dist_stack[..end - split]) {
+                // Vendor parity (gzip/deflate.hpp:336): distance via the cached
+                // reversed-bits decoder, not the ISA-L LUT. Mirror of the canonical
+                // fallback build at :1516-1519.
+                if self
+                    .dist_hc
+                    .initialize_from_lengths(&dist_stack[..end - split], false)
+                    != super::error::Error::None
+                {
                     return Err(BlockError::InvalidCodeLengths);
                 }
             }
@@ -1139,34 +1160,6 @@ impl Block {
         pure_inflate_decode
     ))]
     #[inline(always)]
-    fn isal_lut_dist_rebuild(&mut self, dist_lens: &[u8]) -> bool {
-        #[cfg(pure_inflate_decode)]
-        {
-            self.isal_dist_pure.rebuild_from(dist_lens)
-        }
-        #[cfg(not(any(
-            all(
-                feature = "isal-compression",
-                not(feature = "pure-rust-inflate"),
-                target_arch = "x86_64"
-            ),
-            pure_inflate_decode
-        )))]
-        {
-            let _ = (self, dist_lens);
-            false
-        }
-    }
-
-    #[cfg(any(
-        all(
-            feature = "isal-compression",
-            not(feature = "pure-rust-inflate"),
-            target_arch = "x86_64"
-        ),
-        pure_inflate_decode
-    ))]
-    #[inline(always)]
     fn isal_lut_litlen_decode(&self, bits: &mut Bits) -> (u32, u32, u32) {
         #[cfg(pure_inflate_decode)]
         {
@@ -1184,34 +1177,6 @@ impl Block {
         {
             let _ = (self, bits);
             (0, 0, 0)
-        }
-    }
-
-    #[cfg(any(
-        all(
-            feature = "isal-compression",
-            not(feature = "pure-rust-inflate"),
-            target_arch = "x86_64"
-        ),
-        pure_inflate_decode
-    ))]
-    #[inline(always)]
-    fn isal_lut_dist_decode(&self, bits: &mut Bits) -> Option<(u32, u32)> {
-        #[cfg(pure_inflate_decode)]
-        {
-            self.isal_dist_pure.decode(bits)
-        }
-        #[cfg(not(any(
-            all(
-                feature = "isal-compression",
-                not(feature = "pure-rust-inflate"),
-                target_arch = "x86_64"
-            ),
-            pure_inflate_decode
-        )))]
-        {
-            let _ = (self, bits);
-            None
         }
     }
 
@@ -1398,11 +1363,14 @@ impl Block {
                 if length == 0 {
                     break;
                 }
-                let (dsym, dbit) = match self.isal_lut_dist_decode(bits) {
+                // Vendor parity (gzip/deflate.hpp:336): distance via the cached
+                // reversed-bits decoder. `decode` consumes the code bits
+                // internally and returns the raw distance symbol — extra bits
+                // are read below, exactly as the canonical fallback at :1580-1590.
+                let dsym = match self.dist_hc.decode(bits) {
                     Some(d) => d,
                     None => commit!(Err(BlockError::InvalidHuffmanCode)),
                 };
-                bits.consume(dbit);
                 if dsym as usize >= DISTANCE_BASE.len() {
                     commit!(Err(BlockError::InvalidHuffmanCode));
                 }
