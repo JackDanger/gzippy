@@ -2122,9 +2122,44 @@ fn spec_pred_clean_enabled() -> bool {
     }
 }
 
+/// Exact-key worker window: `get(blockOffset)` then KEY-MISMATCH handoff
+/// within `(partition_seed, decode_start]` (Fulcrum causal: 97% of window-absent
+/// is partition seed ≠ published boundary key; the window exists at the real key).
+#[cfg(parallel_sm)]
+fn worker_window_exact_at(
+    window_map: &WindowMap,
+    partition_seed: usize,
+    decode_start: usize,
+) -> Option<Window> {
+    if let Some(w) = window_map.get_at_worker(decode_start) {
+        return Some(w);
+    }
+    if decode_start > partition_seed {
+        if let Some((k, w)) = window_map.get_handoff_in_partition(partition_seed, decode_start) {
+            if k == decode_start {
+                return Some(w);
+            }
+        }
+    }
+    None
+}
+
+/// Largest published window in `(partition_seed, stop_hint]` — the real boundary
+/// key inside this partition when the spacing seed has no exact entry.
+#[cfg(parallel_sm)]
+fn worker_handoff_ahead_in_partition(
+    window_map: &WindowMap,
+    partition_seed: usize,
+    stop_hint: usize,
+) -> Option<(usize, Window)> {
+    if partition_seed >= stop_hint {
+        return None;
+    }
+    window_map.get_handoff_in_partition(partition_seed, stop_hint)
+}
+
 /// Vendor tryToDecode partition-seed rewrite (GzipChunk.hpp:716-722).
 #[cfg(parallel_sm)]
-#[allow(dead_code)]
 fn rewrite_chunk_from_handoff_to_partition_seed(
     chunk: &mut ChunkData,
     partition_seed: usize,
@@ -2373,7 +2408,14 @@ fn run_decode_task(
         window_map.get_at_worker(params.start_bit)
     };
 
-    let decode_mode_clean = params.start_bit == 0 || window_at_offset.is_some();
+    let handoff_ahead = window_at_offset
+        .is_none()
+        .then(|| {
+            worker_handoff_ahead_in_partition(window_map, params.start_bit, params.stop_hint_bit)
+        })
+        .flatten();
+    let decode_mode_clean =
+        params.start_bit == 0 || window_at_offset.is_some() || handoff_ahead.is_some();
     let mode_str = if decode_mode_clean {
         "clean"
     } else {
@@ -2417,6 +2459,54 @@ fn run_decode_task(
             &bytes,
             configuration,
         )
+    } else if let Some((handoff_key, w)) =
+        worker_handoff_ahead_in_partition(window_map, params.start_bit, params.stop_hint_bit)
+    {
+        // KEY-MISMATCH clean path: partition seed missed `get(start_bit)` but the
+        // predecessor window is already published at the real boundary inside this
+        // partition (causal: 0/37 were late-publish; all were wrong-key lookup).
+        let bytes = materialize_window(&w);
+        match decode_chunk(
+            input_bytes,
+            handoff_key,
+            params.stop_hint_bit,
+            &bytes,
+            configuration,
+        ) {
+            Ok(mut chunk)
+                if chunk.encoded_offset_bits == handoff_key
+                    && chunk.max_acceptable_start_bit == handoff_key =>
+            {
+                if params.is_speculative_prefetch && params.start_bit < handoff_key {
+                    rewrite_chunk_from_handoff_to_partition_seed(
+                        &mut chunk,
+                        params.start_bit,
+                        handoff_key,
+                    );
+                }
+                use std::sync::atomic::Ordering;
+                HANDOFF_DECODE_CLEAN_OK.fetch_add(1, Ordering::Relaxed);
+                Ok(chunk)
+            }
+            Ok(mut chunk)
+                if params.is_speculative_prefetch
+                    && chunk.encoded_offset_bits > params.start_bit
+                    && chunk.encoded_offset_bits < params.stop_hint_bit =>
+            {
+                let hk = chunk.encoded_offset_bits;
+                rewrite_chunk_from_handoff_to_partition_seed(&mut chunk, params.start_bit, hk);
+                use std::sync::atomic::Ordering;
+                HANDOFF_DECODE_CLEAN_OK.fetch_add(1, Ordering::Relaxed);
+                Ok(chunk)
+            }
+            Ok(_) | Err(_) => speculative_decode_find_boundary(
+                input_bytes,
+                params.start_bit,
+                params.stop_hint_bit,
+                configuration,
+                window_map,
+            ),
+        }
     } else {
         speculative_decode_find_boundary(
             input_bytes,
@@ -3162,12 +3252,10 @@ fn try_speculative_decode_candidate(
     configuration: ChunkConfiguration,
     window_map: &WindowMap,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    // Clean try only when a window is published at this exact bit (confirmed
-    // chunk end). `get_predecessor` is NOT used here — unlike
-    // `run_decode_task`, boundary-search candidates are often false
-    // positives; a stale earlier tail dict can pass metadata checks yet
-    // corrupt the assembled stream (CRC mismatch).
-    let result = if let Some(w) = window_map.get_at_worker(decode_start) {
+    // Clean try when a window is at this exact bit, or KEY-MISMATCH handoff
+    // within the partition (seed → real boundary). `get_predecessor` alone is
+    // NOT used — false-positive candidates with a stale earlier dict corrupt CRC.
+    let result = if let Some(w) = worker_window_exact_at(window_map, partition_seed, decode_start) {
         let pw = materialize_window(&w);
         match decode_chunk(
             input,
