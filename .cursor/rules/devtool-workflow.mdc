@@ -33,3 +33,11 @@ gzippy-dev losses     # Losses grouped by root cause
 ## When the Tool Is Missing Something
 
 If you find yourself doing manual analysis, add the capability to `tools/devtool/src/`.
+
+## Fulcrum: extend it before hand-rolling analysis
+
+When Fulcrum does not answer the hardest question (causal lever, sub-span split,
+KEY-MISMATCH remediation, verbose-counter ingestion, wall-regression guard), **upgrade
+Fulcrum first** (`~/www/fulcrum`), wire it into `scripts/bench/run_locked_fulcrum.sh`,
+then change gzippy. Do not parse `trace.log` by hand or enable `GZIPPY_TRACE_DETAIL` on
+wall benches — add `fulcrum stats`, causal `--verbose-log`, or a new subcommand instead.
