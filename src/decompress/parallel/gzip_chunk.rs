@@ -116,10 +116,15 @@ pub static BULK_TAIL_RESUMABLE_FALLBACK: std::sync::atomic::AtomicU64 =
 /// chunk (the seam is not actually cut).
 pub static HANDOFF_WINDOW_BUF_GROWS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-/// Chunks where the unified marker driver failed at a bad 4 MiB speculative seed
-/// and fell to the internal resumable re-sync (the goal's accepted re-sync).
-/// Should be ~0 for real-boundary chunks and bounded by the speculative-seed count.
+/// Legacy counter: non-vendor resync after marker bootstrap failure (removed Gate 1).
+/// Must stay 0 in production — any increment means tryToDecode is not vendor-shaped.
 pub static BAD_SEED_RESYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Chunks that entered `finish_decode_chunk_impl` (ISA-L / ResumableInflate2 tail).
+pub static FINISH_DECODE_ENTRIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Chunks that took vendor `decodeChunkWithInflateWrapper` (exact window + until_exact).
+pub static INFLATE_WRAPPER_CHUNKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// Chunks that took the marker→clean FLIP: a bounded u16 marker prefix then the
 /// fast u8 clean tail (vendor setInitialWindow). This is the FAST window-absent
 /// path; if it stays 0 while speculative chunks exist, every window-absent chunk
@@ -308,6 +313,7 @@ fn decode_chunk_with_inflate_wrapper(
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
+    INFLATE_WRAPPER_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
     finish_decode_chunk_impl(
         &mut chunk,
@@ -344,9 +350,9 @@ fn finish_decode_chunk_with_inexact_offset(
     )
 }
 
-/// Internal bad-seed recovery only. Production success-path dispatch stays on
-/// vendor `decodeChunk` / `decodeChunkWithRapidgzip` / `finishDecode...`.
+/// Retired non-vendor recovery path (Gate 1). Kept for reference until deleted.
 #[cfg(parallel_sm)]
+#[allow(dead_code)]
 fn resumable_resync(
     chunk: &mut ChunkData,
     input: &[u8],
@@ -377,6 +383,7 @@ fn finish_decode_chunk_impl(
     record_decode_duration: bool,
     until_exact: bool,
 ) -> Result<(), ChunkDecodeError> {
+    FINISH_DECODE_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let t_decode = std::time::Instant::now();
     let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
         "worker.isal_stream_inflate",
@@ -608,6 +615,13 @@ fn decode_chunk_with_rapidgzip_impl(
 
     if initial_window.len() == MAX_WINDOW_SIZE {
         WINDOW_SEEDED_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::decompress::parallel::trace_v2::emit_instant(
+            "worker.chunk_phase",
+            &format!(
+                r#""start_bit":{encoded_offset_bits},"phase":"window_seeded","until_exact":{until_exact}"#
+            ),
+            "t",
+        );
         let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
         if until_exact {
             finish_decode_chunk_impl(
@@ -633,27 +647,11 @@ fn decode_chunk_with_rapidgzip_impl(
         return Ok(chunk);
     }
 
-    match decode_chunk_unified_marker(input, encoded_offset_bits, stop_hint_bits, configuration) {
-        Ok(mut chunk) => {
-            chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
-            Ok(chunk)
-        }
-        Err(marker_err) => {
-            BAD_SEED_RESYNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
-            resumable_resync(
-                &mut chunk,
-                input,
-                encoded_offset_bits,
-                stop_hint_bits,
-                initial_window,
-                false,
-            )
-            .map_err(|_| marker_err)?;
-            chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
-            Ok(chunk)
-        }
-    }
+    // Vendor tryToDecode: bootstrap failure propagates; caller catches and tries next candidate.
+    let mut chunk =
+        decode_chunk_unified_marker(input, encoded_offset_bits, stop_hint_bits, configuration)?;
+    chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+    Ok(chunk)
 }
 
 /// The ONE unified decode driver — one `MarkerRing`, one bit cursor, the vendor
@@ -685,6 +683,13 @@ fn decode_chunk_unified_marker(
             MarkerStep::Continue => {}
             MarkerStep::FlipToClean { end_bit_offset, .. } => {
                 FLIP_TO_CLEAN_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::decompress::parallel::trace_v2::emit_instant(
+                    "worker.chunk_phase",
+                    &format!(
+                        r#""start_bit":{encoded_offset_bits},"phase":"flip_to_clean","end_bit":{end_bit_offset}"#
+                    ),
+                    "t",
+                );
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
                 let clean_window = chunk.last_32kib_window_vec().ok_or_else(|| {
                     ChunkDecodeError::BootstrapFailed(std::io::Error::new(
@@ -704,6 +709,13 @@ fn decode_chunk_unified_marker(
             }
             MarkerStep::Finished { end_bit_offset, .. } => {
                 FINISHED_NO_FLIP_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::decompress::parallel::trace_v2::emit_instant(
+                    "worker.chunk_phase",
+                    &format!(
+                        r#""start_bit":{encoded_offset_bits},"phase":"finished_no_flip","end_bit":{end_bit_offset}"#
+                    ),
+                    "t",
+                );
                 chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
                 chunk.finalize(end_bit_offset);
                 return Ok(chunk);
