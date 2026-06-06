@@ -94,7 +94,16 @@ build_rapidgzip_trace() {
 }
 
 install_rapidgzip_trace_patches
-if [ ! -x "$RG_TRACE" ] || ! grep -q 'worker.decode' "$REPO/vendor/rapidgzip/librapidarchive/src/rapidgzip/GzipChunkFetcher.hpp" 2>/dev/null; then
+GCF="$REPO/vendor/rapidgzip/librapidarchive/src/rapidgzip/GzipChunkFetcher.hpp"
+if ! grep -q 'worker.decode' "$GCF" 2>/dev/null; then
+  say "FAILURE=rapidgzip-patch-missing-worker.decode"
+  echo "RUN_TRUSTWORTHY=false"
+  exit 8
+fi
+if [ ! -x "$RG_TRACE" ]; then
+  build_rapidgzip_trace
+else
+  # Patches may have updated vendor sources; rebuild so the trace binary picks them up.
   build_rapidgzip_trace
 fi
 [ -x "$RG_TRACE" ] || { echo "RUN_TRUSTWORTHY=false"; echo "FAILURE=no-rg-trace"; exit 8; }
