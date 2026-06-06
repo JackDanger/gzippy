@@ -2288,6 +2288,85 @@ fn try_clean_decode_with_pred_window(
     }
 }
 
+/// H′ is only attempted when the confirmed predecessor is a tight spacing
+/// overshoot (real boundary just before the partition seed), not chunk-0
+/// across megabytes of stream.
+#[cfg(parallel_sm)]
+fn h_prime_gap_ok(start_bit: usize, pred_key: usize, _stop_hint: usize) -> bool {
+    pred_key > 0 && pred_key < start_bit && start_bit - pred_key <= 2 * 1024 * 1024
+}
+
+/// pred@seed: clean decode at partition seed using merged predecessor dict.
+#[cfg(parallel_sm)]
+fn try_clean_decode_at_seed_with_merged_pred(
+    input_bytes: &[u8],
+    params: DecodeParams,
+    configuration: ChunkConfiguration,
+    window_map: &WindowMap,
+) -> Option<Result<ChunkData, ChunkDecodeError>> {
+    let (_pred_key, w) = window_map.get_predecessor_for_worker(params.start_bit)?;
+    let bytes = materialize_window(&w);
+    match decode_chunk(
+        input_bytes,
+        params.start_bit,
+        params.stop_hint_bit,
+        &bytes,
+        configuration,
+    ) {
+        Ok(chunk)
+            if chunk.encoded_offset_bits == params.start_bit
+                && chunk.max_acceptable_start_bit == params.start_bit =>
+        {
+            use std::sync::atomic::Ordering;
+            CLEAN_DECODE_VIA_PREDECESSOR.fetch_add(1, Ordering::Relaxed);
+            Some(Ok(chunk))
+        }
+        Ok(mut chunk)
+            if params.is_speculative_prefetch
+                && chunk.encoded_offset_bits > params.start_bit
+                && chunk.encoded_offset_bits < params.stop_hint_bit =>
+        {
+            let hk = chunk.encoded_offset_bits;
+            rewrite_chunk_from_handoff_to_partition_seed(&mut chunk, params.start_bit, hk);
+            use std::sync::atomic::Ordering;
+            SPEC_PRED_BOUNDARY_CLEAN.fetch_add(1, Ordering::Relaxed);
+            Some(Ok(chunk))
+        }
+        Ok(_) | Err(_) => None,
+    }
+}
+
+/// After exact `get(blockOffset)` and explicit handoff miss: H′ → pred@seed → boundary scan.
+#[cfg(parallel_sm)]
+fn decode_pred_hprime_then_boundary(
+    input_bytes: &[u8],
+    params: DecodeParams,
+    configuration: ChunkConfiguration,
+    window_map: &WindowMap,
+) -> Result<ChunkData, ChunkDecodeError> {
+    if let Some((pred_key, w)) = window_map.get_confirmed_predecessor_for_worker(params.start_bit) {
+        if h_prime_gap_ok(params.start_bit, pred_key, params.stop_hint_bit) {
+            if let Ok(chunk) =
+                try_clean_decode_via_pred_key(input_bytes, &params, pred_key, &w, configuration)
+            {
+                return Ok(chunk);
+            }
+        }
+    }
+    if let Some(Ok(chunk)) =
+        try_clean_decode_at_seed_with_merged_pred(input_bytes, params, configuration, window_map)
+    {
+        return Ok(chunk);
+    }
+    speculative_decode_find_boundary(
+        input_bytes,
+        params.start_bit,
+        params.stop_hint_bit,
+        configuration,
+        window_map,
+    )
+}
+
 /// Design H′: predecessor window is keyed at `pred_key < partition_seed`
 /// (prior chunk end). Decode AT `pred_key` with that dict, then rewrite
 /// metadata to the partition seed. Chain-valid gate: confirmed `entries` only.
@@ -2609,60 +2688,11 @@ fn run_decode_task(
                 Ok(chunk)
             }
             Ok(_) | Err(_) => {
-                try_handoff_or_boundary_search(input_bytes, params, configuration, window_map)
-            }
-        }
-    } else if let Some((pred_key, w)) =
-        window_map.get_confirmed_predecessor_for_worker(params.start_bit)
-    {
-        let partition_width = params.stop_hint_bit.saturating_sub(params.start_bit);
-        let max_pred_gap = partition_width.saturating_mul(2).max(8 * 1024 * 1024);
-        if pred_key < params.start_bit && params.start_bit - pred_key <= max_pred_gap {
-            match try_clean_decode_via_pred_key(input_bytes, &params, pred_key, &w, configuration) {
-                Ok(chunk) => Ok(chunk),
-                Err(_) => {
-                    try_handoff_or_boundary_search(input_bytes, params, configuration, window_map)
-                }
-            }
-        } else {
-            try_handoff_or_boundary_search(input_bytes, params, configuration, window_map)
-        }
-    } else if let Some((_pred_key, w)) = window_map.get_predecessor_for_worker(params.start_bit) {
-        // Exact-key miss but speculative predecessor exists: try clean decode AT
-        // the partition seed with that dict (rare KEY-MISMATCH hit at seed).
-        let bytes = materialize_window(&w);
-        match decode_chunk(
-            input_bytes,
-            params.start_bit,
-            params.stop_hint_bit,
-            &bytes,
-            configuration,
-        ) {
-            Ok(chunk)
-                if chunk.encoded_offset_bits == params.start_bit
-                    && chunk.max_acceptable_start_bit == params.start_bit =>
-            {
-                use std::sync::atomic::Ordering;
-                CLEAN_DECODE_VIA_PREDECESSOR.fetch_add(1, Ordering::Relaxed);
-                Ok(chunk)
-            }
-            Ok(mut chunk)
-                if params.is_speculative_prefetch
-                    && chunk.encoded_offset_bits > params.start_bit
-                    && chunk.encoded_offset_bits < params.stop_hint_bit =>
-            {
-                let hk = chunk.encoded_offset_bits;
-                rewrite_chunk_from_handoff_to_partition_seed(&mut chunk, params.start_bit, hk);
-                use std::sync::atomic::Ordering;
-                SPEC_PRED_BOUNDARY_CLEAN.fetch_add(1, Ordering::Relaxed);
-                Ok(chunk)
-            }
-            Ok(_) | Err(_) => {
-                try_handoff_or_boundary_search(input_bytes, params, configuration, window_map)
+                decode_pred_hprime_then_boundary(input_bytes, params, configuration, window_map)
             }
         }
     } else {
-        try_handoff_or_boundary_search(input_bytes, params, configuration, window_map)
+        decode_pred_hprime_then_boundary(input_bytes, params, configuration, window_map)
     };
 
     // EARLY WINDOW PUBLISH (break the serial window-resolution chain).
@@ -3437,20 +3467,19 @@ fn try_speculative_decode_candidate(
     } else if let Some((pred_key, w)) =
         window_map.get_confirmed_predecessor_for_worker(decode_start)
     {
-        let partition_width = stop_hint_bit.saturating_sub(partition_seed.max(decode_start));
-        let max_pred_gap = partition_width.saturating_mul(2).max(8 * 1024 * 1024);
-        if pred_key < decode_start && decode_start - pred_key <= max_pred_gap {
-            let params = DecodeParams {
-                start_bit: partition_seed,
-                stop_hint_bit,
-                is_speculative_prefetch: partition_seed < decode_start,
-                partition_idx: usize::MAX,
-            };
-            match try_clean_decode_via_pred_key(input, &params, pred_key, &w, configuration) {
-                Ok(chunk) => Ok(chunk),
-                Err(_) => {
-                    decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration)
-                }
+        let params = DecodeParams {
+            start_bit: partition_seed,
+            stop_hint_bit,
+            is_speculative_prefetch: partition_seed < decode_start,
+            partition_idx: usize::MAX,
+        };
+        if h_prime_gap_ok(decode_start, pred_key, stop_hint_bit) {
+            if let Ok(chunk) =
+                try_clean_decode_via_pred_key(input, &params, pred_key, &w, configuration)
+            {
+                Ok(chunk)
+            } else {
+                decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration)
             }
         } else {
             decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration)
