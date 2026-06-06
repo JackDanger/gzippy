@@ -128,21 +128,6 @@ impl SegmentedU8 {
         unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), cap) }
     }
 
-    /// Full-buffer A3 decode view for the entire clean tail (not only the
-    /// first 128 KiB). Grows amortized spare by
-    /// [`ALLOCATION_CHUNK_SIZE`] and returns `(ptr, capacity, out_pos_start)`
-    /// for `read_stream_starting_at`. The caller must `commit(n)` before the
-    /// next call; no live raw pointer may span a `commit`.
-    pub fn a3_decode_view(&mut self) -> (*mut u8, usize, usize) {
-        let out_pos = self.buf.len();
-        let need_cap = out_pos.saturating_add(ALLOCATION_CHUNK_SIZE);
-        self.ensure_buf(need_cap);
-        while self.buf.capacity() < need_cap {
-            self.buf.reserve(ALLOCATION_CHUNK_SIZE);
-        }
-        (self.buf.as_mut_ptr(), self.buf.capacity(), out_pos)
-    }
-
     /// Write every decoded payload byte, skipping the first `skip_prefix`
     /// logical bytes (the A3 window image at the front of the buffer).
     pub fn write_payload_skipping_prefix<W: std::io::Write>(
