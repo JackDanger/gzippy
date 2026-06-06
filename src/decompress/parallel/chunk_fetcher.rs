@@ -2478,21 +2478,33 @@ fn predecessor_window_for_markers(
         .or_else(|| window_map.get_predecessor(handoff_bit))
 }
 
+/// Stream-start bit for predecessor lookup on a prefetched chunk.
+/// Vendor `tryToDecode` decodes at `offset.second` (GzipChunk.hpp:718); the
+/// window chain keys windows at confirmed stream starts, not partition seeds.
+#[cfg(parallel_sm)]
+fn prefetch_stream_start_bit(chunk: &ChunkData, handoff_key: Option<usize>) -> usize {
+    handoff_key.unwrap_or_else(|| {
+        if chunk.encoded_offset_bits != chunk.max_acceptable_start_bit {
+            chunk.max_acceptable_start_bit
+        } else {
+            chunk.encoded_offset_bits
+        }
+    })
+}
+
 /// Marker chunks safe for resolve-ahead post-process (vendor
 /// `queuePrefetchedChunkPostProcessing` + `hasBeenPostProcessed` gate).
 #[cfg(parallel_sm)]
-fn chunk_may_resolve_markers_early(chunk: &ChunkData, window_map: &WindowMap) -> bool {
+fn chunk_may_resolve_markers_early(
+    chunk: &ChunkData,
+    window_map: &WindowMap,
+    handoff_key: Option<usize>,
+) -> bool {
     if chunk.data_with_markers.is_empty() || chunk.markers_resolved {
         return false;
     }
-    if chunk.max_acceptable_start_bit == chunk.decode_origin_bit {
-        return true;
-    }
-    // Speculative seeds: allow when a predecessor window is published at or
-    // before the chunk's real start (vendor `get(encodedOffsetInBits)` miss
-    // is OK when `get_predecessor` finds the handoff tail).
-    predecessor_window_for_markers(window_map, chunk.encoded_offset_bits).is_some()
-        || predecessor_window_for_markers(window_map, chunk.max_acceptable_start_bit).is_some()
+    let start = prefetch_stream_start_bit(chunk, handoff_key);
+    confirmed_predecessor_window(window_map, start).is_some()
 }
 
 /// Re-anchor speculative prefetch chunks to the confirmed handoff bit
@@ -2587,7 +2599,7 @@ fn queue_prefetched_marker_postprocess(
                 continue;
             }
         }
-        if !chunk_may_resolve_markers_early(arc.as_ref(), window_map) {
+        if !chunk_may_resolve_markers_early(arc.as_ref(), window_map, handoff_key) {
             continue;
         }
         if in_flight.contains_key(&real_offset) {
@@ -2596,11 +2608,10 @@ fn queue_prefetched_marker_postprocess(
         if arc.data_with_markers.is_empty() {
             continue;
         }
-        let resolve_anchor = handoff_key.unwrap_or(arc.encoded_offset_bits);
-        // Vendor queuePrefetchedChunkPostProcessing:544 — exact
-        // `m_windowMap->get(chunkData->encodedOffsetInBits)` only.
+        let stream_start = prefetch_stream_start_bit(arc.as_ref(), handoff_key);
+        let resolve_anchor = stream_start;
         let Some((pred_key, predecessor_window)) =
-            confirmed_predecessor_window(window_map, arc.encoded_offset_bits)
+            confirmed_predecessor_window(window_map, stream_start)
         else {
             continue;
         };
@@ -3730,9 +3741,18 @@ mod tests {
         chunk.encoded_offset_bits = 4_000_000;
         chunk.data_with_markers.push_slice(&[0u16, 1, 2]);
         let window_map = super::WindowMap::new();
-        assert!(super::chunk_may_resolve_markers_early(&chunk, &window_map));
+        window_map.insert_owned_none(5_000_000, vec![0u8; 32768]);
+        assert!(super::chunk_may_resolve_markers_early(
+            &chunk,
+            &window_map,
+            None
+        ));
         chunk.max_acceptable_start_bit = 6_000_000;
-        assert!(!super::chunk_may_resolve_markers_early(&chunk, &window_map));
+        assert!(!super::chunk_may_resolve_markers_early(
+            &chunk,
+            &window_map,
+            None
+        ));
     }
 
     #[test]
