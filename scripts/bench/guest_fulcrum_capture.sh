@@ -191,8 +191,14 @@ for T in $THREADS; do
     read rsec rsha < <(run_cmd_timed "$mask" "$RG_TRACE" -d -c -f -P "$T" "$CORPUS")
     [ "$i" -eq 0 ] && continue
     GZ_T="$GZ_T $gsec"; RG_T="$RG_T $rsec"
-    [ "$gsha" = "$REF_SHA" ] || { say "DIVERGE gzippy T=$T"; DIVERGED=1; }
-    [ "$rsha" = "$REF_SHA" ] || { say "DIVERGE rapidgzip T=$T"; DIVERGED=1; }
+    if [ "$gsha" != "$REF_SHA" ]; then
+      say "DIVERGE gzippy T=$T iter=$i sha=$gsha"
+      DIVERGED=1
+    fi
+    if [ "$rsha" != "$REF_SHA" ]; then
+      say "DIVERGE rapidgzip T=$T iter=$i sha=$rsha"
+      DIVERGED=1
+    fi
   done
   read gmin gmed gsd < <(stats "$GZ_T")
   read rmin rmed rsd < <(stats "$RG_T")

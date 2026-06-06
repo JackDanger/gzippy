@@ -925,6 +925,39 @@ mod tests {
         );
     }
 
+    /// Repeated CRC gate on real silesia — catches rare (~1–2%) prefetch-path
+    /// corruption at T≥2 (GZIPPY_NO_PREFETCH=1 is clean; see fname-header test).
+    #[test]
+    #[cfg(parallel_sm)]
+    fn test_silesia_gzip_parallel_sm_crc_stress() {
+        use crate::tests::datasets;
+
+        let _guard = crate::decompress::parallel::single_member::MARKER_PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let Some(compressed) = datasets::load_silesia_gzip() else {
+            eprintln!("skip: benchmark_data/silesia-gzip.tar.gz not present");
+            return;
+        };
+        let threads = 8usize.min(num_cpus::get().max(2));
+        for run in 0..12 {
+            let mut out = Vec::new();
+            crate::decompress::decompress_single_member(&compressed, &mut out, threads)
+                .unwrap_or_else(|e| panic!("silesia CRC stress run {run} failed: {e:?}"));
+            assert_eq!(
+                out.len(),
+                211_968_000,
+                "silesia stress run {run}: ISIZE mismatch"
+            );
+            assert_eq!(
+                crc32fast::hash(&out),
+                0xf9ac_f2fe,
+                "silesia stress run {run}: payload CRC32 mismatch"
+            );
+        }
+    }
+
     /// High-entropy synthetic proxy — not gate 2 (real silesia.tar.gz).
     ///
     /// PRNG-compressed-via-flate2-best is adversarial: dense literals,
