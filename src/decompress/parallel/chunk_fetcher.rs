@@ -672,6 +672,10 @@ fn drive_impl<W: std::io::Write>(
             EAGER_PROBE_MAX_PER_RUN.load(Ordering::Relaxed),
             EAGER_PROBE_REUSED.load(Ordering::Relaxed),
         );
+        eprintln!(
+            "  Eager harvest ready: {}",
+            EAGER_HARVEST_READY.load(Ordering::Relaxed),
+        );
         // Unified-decoder migration counters (reimplement-isa-l):
         //   handoff_window_grows ≈ num_worker_threads (one per thread, then
         //     flat) PROVES the per-chunk `clean_window: Vec<u8>` alloc is gone.
@@ -991,6 +995,9 @@ fn consumer_loop<W: std::io::Write>(
     // Vendor `m_markersBeingReplaced` + resolve-ahead: pool post-process
     // for prefetched successors, keyed by partition `encoded_offset_bits`.
     let mut prefetch_post_inflight: EagerSubmitted = std::collections::HashMap::new();
+    // Vendor `waitForReplacedMarkers` (:497-511) non-blocking harvest of ready
+    // marker-replace futures while blocked on the current chunk's future.
+    let mut eager_completed: EagerCompleted = std::collections::HashMap::new();
     // Keep the last N drained chunks' buffers off the pool until the
     // pipeline moves on (lone-drain CRC bisect 2026-06-05: 1-chunk defer
     // insufficient; byte diff at chunk 4 boundary when lone emit races
@@ -1554,7 +1561,11 @@ fn consumer_loop<W: std::io::Write>(
                         total_crc,
                         total_size,
                         block_fetcher,
-                        Some((thread_pool, &mut prefetch_post_inflight)),
+                        Some((
+                            thread_pool,
+                            &mut prefetch_post_inflight,
+                            &mut eager_completed,
+                        )),
                         &mut recycle_deferral,
                     )?;
                 }
@@ -1698,8 +1709,12 @@ fn consumer_loop<W: std::io::Write>(
         // queue as immediately-ready for ordered write.
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.dispatch_post_process");
-            let (chunk, eager_already_done) =
-                chunk_holder.into_chunk_data(&mut prefetch_post_inflight, consumer_pred_key);
+            harvest_ready_postprocess(&mut prefetch_post_inflight, &mut eager_completed);
+            let (chunk, eager_already_done) = chunk_holder.into_chunk_data(
+                &mut prefetch_post_inflight,
+                &mut eager_completed,
+                consumer_pred_key,
+            );
             let pool_resolved = chunk.markers_resolved;
             match predecessor_window_for_postprocess {
                 Some(_window) if eager_already_done || pool_resolved => {
@@ -1771,6 +1786,7 @@ fn consumer_loop<W: std::io::Write>(
             block_fetcher,
             thread_pool,
             &mut prefetch_post_inflight,
+            &mut eager_completed,
             &mut recycle_deferral,
         )?;
         // Bound in-flight Async post-processes when the head is still
@@ -1784,7 +1800,11 @@ fn consumer_loop<W: std::io::Write>(
                 total_crc,
                 total_size,
                 block_fetcher,
-                Some((thread_pool, &mut prefetch_post_inflight)),
+                Some((
+                    thread_pool,
+                    &mut prefetch_post_inflight,
+                    &mut eager_completed,
+                )),
                 &mut recycle_deferral,
             )?;
             drain_ready_pending_heads(
@@ -1797,6 +1817,7 @@ fn consumer_loop<W: std::io::Write>(
                 block_fetcher,
                 thread_pool,
                 &mut prefetch_post_inflight,
+                &mut eager_completed,
                 &mut recycle_deferral,
             )?;
         }
@@ -1814,7 +1835,11 @@ fn consumer_loop<W: std::io::Write>(
             total_crc,
             total_size,
             block_fetcher,
-            Some((thread_pool, &mut prefetch_post_inflight)),
+            Some((
+                thread_pool,
+                &mut prefetch_post_inflight,
+                &mut eager_completed,
+            )),
             &mut recycle_deferral,
         )?;
     }
@@ -2413,15 +2438,21 @@ fn predecessor_window_for_markers(
         .or_else(|| window_map.get_predecessor(handoff_bit))
 }
 
-/// Marker chunks safe for worker resolve-ahead: decode anchored at
-/// `decode_origin_bit == max_acceptable_start_bit` (exact chunk or
-/// handoff/partition-trim). Range-speculative chunks with
-/// `max > decode_origin` stay consumer-serial.
+/// Marker chunks safe for resolve-ahead post-process (vendor
+/// `queuePrefetchedChunkPostProcessing` + `hasBeenPostProcessed` gate).
 #[cfg(parallel_sm)]
-fn chunk_may_resolve_markers_early(chunk: &ChunkData) -> bool {
-    !chunk.data_with_markers.is_empty()
-        && !chunk.markers_resolved
-        && chunk.max_acceptable_start_bit == chunk.decode_origin_bit
+fn chunk_may_resolve_markers_early(chunk: &ChunkData, window_map: &WindowMap) -> bool {
+    if chunk.data_with_markers.is_empty() || chunk.markers_resolved {
+        return false;
+    }
+    if chunk.max_acceptable_start_bit == chunk.decode_origin_bit {
+        return true;
+    }
+    // Speculative seeds: allow when a predecessor window is published at or
+    // before the chunk's real start (vendor `get(encodedOffsetInBits)` miss
+    // is OK when `get_predecessor` finds the handoff tail).
+    predecessor_window_for_markers(window_map, chunk.encoded_offset_bits).is_some()
+        || predecessor_window_for_markers(window_map, chunk.max_acceptable_start_bit).is_some()
 }
 
 /// Re-anchor speculative prefetch chunks to the confirmed handoff bit
@@ -2490,7 +2521,7 @@ fn queue_prefetched_marker_postprocess(
                 continue;
             }
         }
-        if !chunk_may_resolve_markers_early(arc.as_ref()) {
+        if !chunk_may_resolve_markers_early(arc.as_ref(), window_map) {
             continue;
         }
         if in_flight.contains_key(&real_offset) {
@@ -2501,7 +2532,8 @@ fn queue_prefetched_marker_postprocess(
         }
         let resolve_anchor = handoff_key.unwrap_or(arc.max_acceptable_start_bit);
         let Some((pred_key, predecessor_window)) =
-            confirmed_predecessor_window(window_map, resolve_anchor)
+            predecessor_window_for_markers(window_map, arc.encoded_offset_bits)
+                .or_else(|| predecessor_window_for_markers(window_map, resolve_anchor))
         else {
             continue;
         };
@@ -2520,6 +2552,7 @@ fn queue_prefetched_marker_postprocess(
                 let end_window = arc.get_last_window(pred_bytes.as_ref());
                 window_map.insert_owned_none(chunk_end_bit, end_window.to_vec());
                 PUBLISH_AHEAD_WINDOWS.fetch_add(1, Ordering::Relaxed);
+                EARLY_WINDOW_PUBLISHED.fetch_add(1, Ordering::Relaxed);
             }
         }
         let rx = submit_post_process_from_prefetch(
@@ -2832,6 +2865,33 @@ pub static ARC_DEFERRED_INFLIGHT_RECV: std::sync::atomic::AtomicU64 =
 /// key still matches (byte-identity guard).
 #[cfg(parallel_sm)]
 type EagerSubmitted = std::collections::HashMap<usize, (usize, mpsc::Receiver<ChunkData>)>;
+/// Harvested eager post-process results (vendor non-blocking `future.get()`).
+#[cfg(parallel_sm)]
+type EagerCompleted = std::collections::HashMap<usize, (usize, ChunkData)>;
+
+/// Vendor `waitForReplacedMarkers` (:497-511): poll ready marker-replace
+/// futures without blocking the consumer on non-head chunks.
+#[cfg(parallel_sm)]
+fn harvest_ready_postprocess(in_flight: &mut EagerSubmitted, completed: &mut EagerCompleted) {
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::TryRecvError;
+    let offsets: Vec<usize> = in_flight.keys().copied().collect();
+    for offset in offsets {
+        let Some((pred_key, rx)) = in_flight.remove(&offset) else {
+            continue;
+        };
+        match rx.try_recv() {
+            Ok(chunk) => {
+                completed.insert(offset, (pred_key, chunk));
+                EAGER_HARVEST_READY.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TryRecvError::Empty) => {
+                in_flight.insert(offset, (pred_key, rx));
+            }
+            Err(TryRecvError::Disconnected) => {}
+        }
+    }
+}
 
 /// Consumer chunk ownership across window publish vs post-process dispatch.
 #[cfg(parallel_sm)]
@@ -2861,12 +2921,20 @@ impl ConsumerChunkHold {
     fn into_chunk_data(
         self,
         inflight: &mut EagerSubmitted,
+        completed: &mut EagerCompleted,
         pred_key: Option<usize>,
     ) -> (ChunkData, bool) {
         match self {
             Self::Owned(c) => (c, false),
             Self::Deferred { arc } => {
                 let real_offset = arc.encoded_offset_bits;
+                if let Some((eager_pred_key, chunk)) = completed.remove(&real_offset) {
+                    if pred_key == Some(eager_pred_key) {
+                        EAGER_PROBE_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return (chunk, true);
+                    }
+                    completed.insert(real_offset, (eager_pred_key, chunk));
+                }
                 match inflight.remove(&real_offset) {
                     Some((eager_pred_key, rx)) if pred_key == Some(eager_pred_key) => {
                         ARC_DEFERRED_INFLIGHT_RECV
@@ -2939,6 +3007,8 @@ pub static EAGER_PROBE_REUSE_KEY_ABSENT: std::sync::atomic::AtomicU64 =
 /// match the consumer's (would have changed bytes — correctly rejected).
 pub static EAGER_PROBE_REUSE_PRED_MISMATCH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Non-blocking harvest of ready eager post-process futures (vendor :497-511).
+pub static EAGER_HARVEST_READY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// True iff `GZIPPY_EAGER_POSTPROC=1`. Read once and cached.
 #[cfg(parallel_sm)]
@@ -3235,6 +3305,7 @@ fn drain_ready_pending_heads<W: std::io::Write>(
     block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
     thread_pool: &Arc<ThreadPool>,
     eager_inflight: &mut EagerSubmitted,
+    eager_completed: &mut EagerCompleted,
     recycle_deferral: &mut std::collections::VecDeque<ChunkData>,
 ) -> Result<(), FetchError> {
     use std::sync::atomic::Ordering;
@@ -3253,7 +3324,7 @@ fn drain_ready_pending_heads<W: std::io::Write>(
             total_crc,
             total_size,
             block_fetcher,
-            Some((thread_pool, eager_inflight)),
+            Some((thread_pool, eager_inflight, eager_completed)),
             recycle_deferral,
         )?;
     }
@@ -3283,10 +3354,13 @@ fn drain_one_pending<W: std::io::Write>(
     // apply_window for ready prefetched successors whose CONFIRMED
     // predecessor window is published, so they run on the pool while the
     // consumer blocks on the head. `None` (eager disabled) skips it.
-    eager_ctx: Option<(&Arc<ThreadPool>, &mut EagerSubmitted)>,
+    mut eager_ctx: Option<(&Arc<ThreadPool>, &mut EagerSubmitted, &mut EagerCompleted)>,
     recycle_deferral: &mut std::collections::VecDeque<ChunkData>,
 ) -> Result<(), FetchError> {
     let _tv2 = trace_v2::SpanGuard::begin("consumer.drain");
+    if let Some((_, in_flight, completed)) = eager_ctx.as_mut() {
+        harvest_ready_postprocess(in_flight, completed);
+    }
     let head = match pending.pop_front() {
         Some(h) => h,
         None => return Ok(()),
@@ -3294,16 +3368,18 @@ fn drain_one_pending<W: std::io::Write>(
     // Vendor GzipChunkFetcher.hpp:513 — queue successor post-processing
     // BEFORE blocking on the head chunk's future, but only when the head is
     // actually an in-flight `Async` (else there is no wait to overlap).
-    if let (PendingWrite::Async { .. }, Some((thread_pool, in_flight))) = (&head, eager_ctx) {
-        queue_prefetched_marker_postprocess(
-            block_fetcher,
-            window_map,
-            thread_pool,
-            in_flight,
-            None,
-            &[],
-            &[],
-        );
+    if matches!(&head, PendingWrite::Async { .. }) {
+        if let Some((thread_pool, in_flight, _completed)) = eager_ctx.as_mut() {
+            queue_prefetched_marker_postprocess(
+                block_fetcher,
+                window_map,
+                thread_pool,
+                in_flight,
+                None,
+                &[],
+                &[],
+            );
+        }
     }
     let t_chunk = std::time::Instant::now();
     let t_recv = std::time::Instant::now();
@@ -3572,9 +3648,10 @@ mod tests {
         chunk.max_acceptable_start_bit = 5_000_000;
         chunk.encoded_offset_bits = 4_000_000;
         chunk.data_with_markers.push_slice(&[0u16, 1, 2]);
-        assert!(super::chunk_may_resolve_markers_early(&chunk));
+        let window_map = super::WindowMap::new();
+        assert!(super::chunk_may_resolve_markers_early(&chunk, &window_map));
         chunk.max_acceptable_start_bit = 6_000_000;
-        assert!(!super::chunk_may_resolve_markers_early(&chunk));
+        assert!(!super::chunk_may_resolve_markers_early(&chunk, &window_map));
     }
 
     #[test]
