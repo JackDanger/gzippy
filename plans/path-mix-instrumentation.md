@@ -4,7 +4,7 @@
 
 **Reference runs:**
 - `0462f88`: gzippy 90% window-absent / 97% KEY-MISMATCH.
-- `738dea6`: gzippy unchanged; `bad_seed_resync=0`; rapidgzip `worker.decode` spans=0 (stale binary — guest script fixed in `f8490b3` to always apply patches + rebuild when span missing).
+- `738dea6` / `ecd5a36`: gzippy unchanged; `bad_seed_resync=0`; rapidgzip `worker.decode` spans=0 — **patch regex missed vendor `untilOffset` comment** (fixed `bb36ef7`).
 
 ---
 

@@ -2234,15 +2234,29 @@ fn run_decode_task(
     let until_exact = window_at_offset.is_some() && params.stop_hint_is_exact;
 
     let decode_mode_clean = params.start_bit == 0 || window_at_offset.is_some();
+    // Fulcrum `model` reads `worker.decode` span mode tags (rapidgzip patch uses
+    // clean | window_absent). Keep boundary_search on causal instants only.
+    let worker_decode_mode = if decode_mode_clean {
+        "clean"
+    } else {
+        "window_absent"
+    };
     let mode_str = if decode_mode_clean {
         "clean"
     } else {
         "boundary_search"
     };
+    let _tv2_decode = trace_v2::SpanGuard::begin_with(
+        "worker.decode",
+        &format!(
+            r#""start_bit":{},"mode":"{worker_decode_mode}""#,
+            params.start_bit
+        ),
+    );
     trace_v2::emit_instant(
         "worker.decode_mode",
         &format!(
-            r#""start_bit":{},"mode":"{mode_str}","pred_available":false"#,
+            r#""start_bit":{},"mode":"{worker_decode_mode}","pred_available":false"#,
             params.start_bit
         ),
         "t",

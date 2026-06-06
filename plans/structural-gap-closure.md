@@ -27,7 +27,9 @@
 
 **Path mix (gzippy verbose):** `flip_to_clean=29`, `bad_seed_resync=0`, `pred@seed=0`, `handoff_window_grows=0`.
 
-**Gate 4 signal (T8):** `consumer.dispatch_recv` 268ms wall-crit; `post_process.resolve_markers` 130ms busy off wall; rapidgzip `post_process.apply_window` 218ms busy, 0 wall-crit — resolve topology diverges (gzippy consumer waits on pool post-process).
+**Path-mix (`bb36ef7`, T8):** rapidgzip `worker.decode` 97.4% window_absent (38/39); gzippy causal unchanged. `L_resolve` 18.8ms vs 10.3ms; publish-chain binds both.
+
+**Gate 4 signal (T8):** `consumer.dispatch_recv` ~279ms wall-crit; rapidgzip resolve off consumer wall-crit when eager-complete.
 
 **A1/B1/B2:** No measurable wall win at T16 (within 2.4% sd); bootstrap + KEY-MISMATCH dominate.
 
@@ -154,7 +156,7 @@ flowchart LR
 ```
 
 1. **Bootstrap engine** — MarkerRing + resync vs inline `deflate::Block`; signature `block_body` 1982ms vs 0ms.
-2. **Path mix** — 90% window-absent / 97% KEY-MISMATCH; need rapidgzip path-mix counters to compare duty cycle under shared keying.
+2. **Path mix** — **both tools ~97% window-absent at partition seed** (`bb36ef7` Fulcrum: gzippy causal 90% / RG `worker.decode` 97.4%). KEY-MISMATCH is shared keying, not gzippy-only. Gap is bootstrap cost (MarkerRing `block_body` 1960ms vs RG 0) and slower `d_w`/`L_resolve`, not higher window-absent rate.
 3. **Consumer ↔ resolve coupling** — publish-chain binds gzippy wall; rapidgzip does not bind the same way.
 
 **Structural divergences independent of path mix (pre-Fulcrum):** B1/B2/A1 landed; measure at `738dea6`. B3 early flip is favorable, not a gap.
