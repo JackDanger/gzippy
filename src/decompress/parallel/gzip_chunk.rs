@@ -162,6 +162,22 @@ pub static BULK_DECLINE_OUTPUT_OVERFLOW: std::sync::atomic::AtomicU64 =
 #[cfg(pure_inflate_decode)]
 pub static BULK_DECLINE_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Option A3+A4: predecessor window image in `chunk.data[0..32K]` so
+/// `read_stream_starting_at` hits the copy_match fast path. `=0` disables.
+/// Default ON (measured +4.2% T=16 silesia).
+#[cfg(parallel_sm)]
+fn option_a_prefill_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| match std::env::var("GZIPPY_OPTION_A_PREFILL") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
+/// Chunks that took the A3 output-prefix fast path in `finish_decode_chunk_impl`.
+#[cfg(parallel_sm)]
+pub static OPTION_A3_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(pure_inflate_decode)]
 #[allow(dead_code)]
 fn record_bulk_decline(err: crate::decompress::parallel::isal_lut_bulk::BulkDecodeError) {
@@ -377,7 +393,24 @@ fn finish_decode_chunk_impl(
         input.len() * 8
     };
     let mut wrapper = IsalInflateWrapper::with_until_bits(input, inflate_start_bit, read_cap)?;
-    wrapper.set_window(initial_window)?;
+
+    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
+    #[cfg(feature = "pure-rust-inflate")]
+    let use_a3 = option_a_prefill_enabled()
+        && initial_window.len() == MAX_WINDOW_SIZE
+        && chunk.data_prefix_len == 0
+        && chunk.data.is_empty();
+    #[cfg(not(feature = "pure-rust-inflate"))]
+    let use_a3 = false;
+
+    if use_a3 {
+        OPTION_A3_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        chunk.prefill_window_prefix(initial_window);
+        wrapper.set_window(&[])?;
+    } else {
+        wrapper.set_window(initial_window)?;
+    }
+
     wrapper.set_stopping_points(
         StoppingPoints::END_OF_BLOCK
             | StoppingPoints::END_OF_BLOCK_HEADER
@@ -397,9 +430,13 @@ fn finish_decode_chunk_impl(
 
     while !stopping_point_reached || wrapper.session_pending() {
         let prev_data_len = chunk.data.len();
-        let seg_tail: &mut [u8] = chunk.data.writable_tail();
-        let seg_ptr = seg_tail.as_mut_ptr();
-        let buffer_cap = seg_tail.len();
+        let (seg_ptr, buffer_cap, out_pos_base) = if use_a3 {
+            let (ptr, cap, out_pos) = chunk.data.a3_decode_view();
+            (ptr, cap.saturating_sub(out_pos), out_pos)
+        } else {
+            let seg_tail = chunk.data.writable_tail();
+            (seg_tail.as_mut_ptr(), seg_tail.len(), 0usize)
+        };
         let mut n_bytes_read: usize = 0;
         let mut last_per_call: usize = 0;
         let mut last_stopped_at = StoppingPoints::NONE;
@@ -413,10 +450,20 @@ fn finish_decode_chunk_impl(
                 && !wrapper.session_pending())
         {
             let bit_before_read = wrapper.tell_compressed();
-            let spare: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(seg_ptr.add(n_bytes_read), buffer_cap - n_bytes_read)
+            let r = if use_a3 {
+                let out_pos = out_pos_base + n_bytes_read;
+                let total_cap = out_pos_base + buffer_cap;
+                let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(seg_ptr, total_cap) };
+                wrapper.read_stream_starting_at(buf, out_pos)?
+            } else {
+                let spare: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        seg_ptr.add(n_bytes_read),
+                        buffer_cap - n_bytes_read,
+                    )
+                };
+                wrapper.read_stream(spare)?
             };
-            let r = wrapper.read_stream(spare)?;
             last_per_call = r.bytes_written;
             n_bytes_read += last_per_call;
             chunk.note_inner_decoded_bytes(last_per_call);
@@ -510,7 +557,11 @@ fn finish_decode_chunk_impl(
         }
         if append_len > 0 {
             if chunk.configuration.crc32_enabled {
-                let kept: &[u8] = unsafe { std::slice::from_raw_parts(seg_ptr, append_len) };
+                let kept: &[u8] = if use_a3 {
+                    unsafe { std::slice::from_raw_parts(seg_ptr.add(out_pos_base), append_len) }
+                } else {
+                    unsafe { std::slice::from_raw_parts(seg_ptr, append_len) }
+                };
                 if let Some(last_crc) = chunk.crc32s.last_mut() {
                     last_crc.update(kept);
                 }
