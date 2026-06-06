@@ -10,7 +10,7 @@
 
 **Headline:** Recent convergence is real and mostly faithful — dispatch, window map, output path (writev + vmsplice/SpliceVault), thread priorities, segmented buffers, and rpmalloc per-`Vec` with lazy per-thread init all match vendor. Two prior audit flags (C1, D3) are **stale** (dead code, not production path). Genuine remaining divergences are fewer than earlier audits implied.
 
-**Landed since `0462f88`:** Gate 1, A1, B1, B2, B4, Gate 0 bench hook (`0db757f`), `resumable_resync` deleted (`f8490b3`), Gate 4 harvest (`47a2c63`), structural slice (uncommitted): instrumentation (`worker.decode` per-attempt), consumer lifecycle (`consumer.window_publish`, `hasBeenPostProcessed` cache promote + harvest, `PREFETCH_*` counters), bootstrap default `marker_inflate::Block` (vendor `deflate::Block`; `GZIPPY_MARKER_RING=1` for LUT A/B).
+**Landed since `0462f88`:** Gate 1, A1, B1, B2, B4, Gate 0 (`0db757f`), Gate 4 harvest (`47a2c63`), `7bbe8da` Block bootstrap + hasBeenPostProcessed + worker.decode spans, `d47af52` harvest each consumer.iter, `8f8a90d` post_process.apply_window span, causal.window_publish vendor site tags (pending commit).
 
 ---
 
