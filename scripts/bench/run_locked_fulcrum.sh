@@ -107,8 +107,19 @@ CFG=gzippy
   "$FULCRUM_BIN" schedule "$GZ_TRACE" --config "$CFG" || true
   echo ""
 
-  echo "======== fulcrum causal ========"
-  "$FULCRUM_BIN" causal "$GZ_TRACE" --config "$CFG" --timeline 16 || true
+  TRACE_LOG="$ART_LOCAL/artifacts-fulcrum/trace.log"
+  echo "======== fulcrum stats (GZIPPY_VERBOSE counters from trace.log) ========"
+  if [ -s "$TRACE_LOG" ]; then
+    "$FULCRUM_BIN" stats "$TRACE_LOG" || true
+  else
+    echo "MISSING $TRACE_LOG"
+  fi
+  echo ""
+
+  echo "======== fulcrum causal (+ verbose-log remediation) ========"
+  CAUSAL_EXTRA=()
+  [ -s "$TRACE_LOG" ] && CAUSAL_EXTRA=(--verbose-log "$TRACE_LOG")
+  "$FULCRUM_BIN" causal "$GZ_TRACE" --timeline 16 "${CAUSAL_EXTRA[@]}" || true
   echo ""
 
   echo "======== fulcrum decompose (residual) ========"

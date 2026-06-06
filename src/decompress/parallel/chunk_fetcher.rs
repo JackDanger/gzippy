@@ -2144,6 +2144,63 @@ fn worker_window_exact_at(
     None
 }
 
+/// Handoff-ahead clean decode, else marker boundary search.
+#[cfg(parallel_sm)]
+fn try_handoff_or_boundary_search(
+    input_bytes: &[u8],
+    params: DecodeParams,
+    configuration: ChunkConfiguration,
+    window_map: &WindowMap,
+) -> Result<ChunkData, ChunkDecodeError> {
+    if let Some((handoff_key, w)) =
+        worker_handoff_ahead_in_partition(window_map, params.start_bit, params.stop_hint_bit)
+    {
+        let bytes = materialize_window(&w);
+        match decode_chunk(
+            input_bytes,
+            handoff_key,
+            params.stop_hint_bit,
+            &bytes,
+            configuration,
+        ) {
+            Ok(mut chunk)
+                if chunk.encoded_offset_bits == handoff_key
+                    && chunk.max_acceptable_start_bit == handoff_key =>
+            {
+                if params.is_speculative_prefetch && params.start_bit < handoff_key {
+                    rewrite_chunk_from_handoff_to_partition_seed(
+                        &mut chunk,
+                        params.start_bit,
+                        handoff_key,
+                    );
+                }
+                use std::sync::atomic::Ordering;
+                HANDOFF_DECODE_CLEAN_OK.fetch_add(1, Ordering::Relaxed);
+                return Ok(chunk);
+            }
+            Ok(mut chunk)
+                if params.is_speculative_prefetch
+                    && chunk.encoded_offset_bits > params.start_bit
+                    && chunk.encoded_offset_bits < params.stop_hint_bit =>
+            {
+                let hk = chunk.encoded_offset_bits;
+                rewrite_chunk_from_handoff_to_partition_seed(&mut chunk, params.start_bit, hk);
+                use std::sync::atomic::Ordering;
+                HANDOFF_DECODE_CLEAN_OK.fetch_add(1, Ordering::Relaxed);
+                return Ok(chunk);
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    speculative_decode_find_boundary(
+        input_bytes,
+        params.start_bit,
+        params.stop_hint_bit,
+        configuration,
+        window_map,
+    )
+}
+
 /// Largest published window in `(partition_seed, stop_hint]` — the real boundary
 /// key inside this partition when the spacing seed has no exact entry.
 #[cfg(parallel_sm)]
@@ -2459,33 +2516,24 @@ fn run_decode_task(
             &bytes,
             configuration,
         )
-    } else if let Some((handoff_key, w)) =
-        worker_handoff_ahead_in_partition(window_map, params.start_bit, params.stop_hint_bit)
-    {
-        // KEY-MISMATCH clean path: partition seed missed `get(start_bit)` but the
-        // predecessor window is already published at the real boundary inside this
-        // partition (causal: 0/37 were late-publish; all were wrong-key lookup).
+    } else if let Some((_pred_key, w)) = window_map.get_predecessor_for_worker(params.start_bit) {
+        // Fulcrum KEY-MISMATCH oracle: window is keyed at the predecessor's
+        // confirmed end, not the partition seed. Try clean decode AT the seed
+        // with that predecessor dict before marker bootstrap.
         let bytes = materialize_window(&w);
         match decode_chunk(
             input_bytes,
-            handoff_key,
+            params.start_bit,
             params.stop_hint_bit,
             &bytes,
             configuration,
         ) {
-            Ok(mut chunk)
-                if chunk.encoded_offset_bits == handoff_key
-                    && chunk.max_acceptable_start_bit == handoff_key =>
+            Ok(chunk)
+                if chunk.encoded_offset_bits == params.start_bit
+                    && chunk.max_acceptable_start_bit == params.start_bit =>
             {
-                if params.is_speculative_prefetch && params.start_bit < handoff_key {
-                    rewrite_chunk_from_handoff_to_partition_seed(
-                        &mut chunk,
-                        params.start_bit,
-                        handoff_key,
-                    );
-                }
                 use std::sync::atomic::Ordering;
-                HANDOFF_DECODE_CLEAN_OK.fetch_add(1, Ordering::Relaxed);
+                CLEAN_DECODE_VIA_PREDECESSOR.fetch_add(1, Ordering::Relaxed);
                 Ok(chunk)
             }
             Ok(mut chunk)
@@ -2496,25 +2544,15 @@ fn run_decode_task(
                 let hk = chunk.encoded_offset_bits;
                 rewrite_chunk_from_handoff_to_partition_seed(&mut chunk, params.start_bit, hk);
                 use std::sync::atomic::Ordering;
-                HANDOFF_DECODE_CLEAN_OK.fetch_add(1, Ordering::Relaxed);
+                SPEC_PRED_BOUNDARY_CLEAN.fetch_add(1, Ordering::Relaxed);
                 Ok(chunk)
             }
-            Ok(_) | Err(_) => speculative_decode_find_boundary(
-                input_bytes,
-                params.start_bit,
-                params.stop_hint_bit,
-                configuration,
-                window_map,
-            ),
+            Ok(_) | Err(_) => {
+                try_handoff_or_boundary_search(input_bytes, params, configuration, window_map)
+            }
         }
     } else {
-        speculative_decode_find_boundary(
-            input_bytes,
-            params.start_bit,
-            params.stop_hint_bit,
-            configuration,
-            window_map,
-        )
+        try_handoff_or_boundary_search(input_bytes, params, configuration, window_map)
     };
 
     // EARLY WINDOW PUBLISH (break the serial window-resolution chain).
