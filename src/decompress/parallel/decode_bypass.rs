@@ -252,6 +252,10 @@ impl CapturedChunk {
 }
 
 // ── Mode detection (read once) ────────────────────────────────────────
+//
+// Campaign instrumentation stays opt-in: replay/sleep only activate when the
+// corresponding explicit `GZIPPY_BYPASS_*` / `GZIPPY_SLEEP_DECODE_NS` env vars
+// are present.
 
 fn capture_path() -> Option<&'static str> {
     static P: OnceLock<Option<String>> = OnceLock::new();

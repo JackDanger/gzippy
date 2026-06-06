@@ -1,5 +1,12 @@
 # Wall-parity scoreboard — the trustworthy progress signal
 
+## 2026-06-05 — Structural gap phases 1-3 landed
+Bookkeeping note: phases 1-3 from `plans/structural-gap-closure.md` are now in
+tree on `reimplement-isa-l` — vendor-shaped decode dispatch, block-finder
+seek/pair semantics, and window-map cleanup. This is a factual campaign-state
+update only; remaining open work is Phase 5 scheduling parity, docs accuracy,
+and keeping the bypass/sleep instruments explicitly env-gated.
+
 ## 2026-06-05 — Worker window lookup fixup (post-977559c): get_at_worker
 Fulcrum showed KEY-MISMATCH oracle paths never fired because workers used `WindowMap::get`
 (confirmed-only) while **35/38** early publishes land in the **speculative** side-slot.

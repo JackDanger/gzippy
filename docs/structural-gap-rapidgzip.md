@@ -10,22 +10,25 @@ This document maps **structure** (vendor `vendor/rapidgzip/librapidarchive/src/r
 
 ## 1. What already matches (control plane)
 
-These are faithful ports; closing them moved the wall (eager window-chain: T16 −21% in one A/B).
+Phases 1-3 from `plans/structural-gap-closure.md` are landed: decode dispatch,
+block-finder seek semantics, and window-map cleanup now match the vendor control
+plane. The remaining gaps are data-plane cost, scheduler parity, and instrument
+gating.
 
 | Subsystem | Vendor | gzippy | Status |
 |-----------|--------|--------|--------|
 | Prefetcher loop | `BlockFetcher.hpp` | `block_fetcher.rs` | Aligned (+ cache-pollution guard ported; **inert** on silesia — see §5) |
 | In-order consumer | `GzipChunkFetcher::processNextChunk` | `consumer_loop` | Aligned |
 | Window map keying | `WindowMap::get(offset)` at chunk **start** | `insert` at chunk **end** (= next start) | Equivalent when chain exact |
-| Eager marker resolve chain | `queuePrefetchedChunkPostProcessing` | `queue_prefetched_marker_postprocess` (full scan) | **Closed** (f7868ab / 1351909) |
+| Eager marker resolve chain | `queuePrefetchedChunkPostProcessing` | `queue_prefetched_marker_postprocess` (full scan) | Aligned |
 | Speculative boundary search | `GzipChunk::decodeChunk` + `tryToDecode` | `speculative_decode_find_boundary` | Aligned shape |
 | Post-process | `applyWindow` on pool | `apply_window` / fused LUT | Aligned |
 | CRC / ISIZE | worker CRC + consumer combine | same | Aligned |
-| Chunk metadata | `encoded` / `max` / `tryToDecode` rewrite | `encoded_offset_bits` / `max_acceptable_start_bit` / `rewrite_chunk_from_handoff_to_partition_seed` | Aligned for `max > encoded` |
+| Chunk metadata | `encoded` / `max` / `tryToDecode` rewrite | `encoded_offset_bits` / `max_acceptable_start_bit` / partition-seed rewrite | Aligned |
 
 ---
 
-## 2. Primary wall lever: decode path selection (window-present vs window-absent)
+## 2. Worker lookup and decode dispatch
 
 ### rapidgzip
 
@@ -36,31 +39,36 @@ auto sharedWindow = m_windowMap->get( blockOffset );  // exact key only
 return GzipChunk::decodeChunk( ..., blockOffset, untilOffset, sharedWindow, ... );
 ```
 
-- **Window hit:** `decodeChunkWithRapidgzip` with 32 KiB dict → **clean** ISA-L stream (one loop, markers only when needed).
-- **Window miss:** `decodeChunk` → `tryToDecode({blockOffset, blockOffset})` then 8 KiB block-finder walk (`GzipChunk.hpp:712–841`). Still **one** `decodeChunkWithRapidgzip` session; metadata rewrite at `716–722`.
-
-Fulcrum on rapidgzip traces: **0%** runtime window-absent bootstrap wall-critical.
+- **Window hit:** `decodeChunkWithRapidgzip` with 32 KiB dict.
+- **Window miss:** `decodeChunk` → `tryToDecode({blockOffset, blockOffset})` then
+  8 KiB block-finder walk (`GzipChunk.hpp:712-841`).
 
 ### gzippy
 
 `run_decode_task` (`chunk_fetcher.rs`):
 
-1. `get_at_worker(start_bit)` — **fixup 2026-06:** merges speculative side-slot (early worker publish).
-2. Else `speculative_decode_find_boundary` → `try_speculative_decode_candidate` → on miss, **`decode_chunk_window_absent`** (full marker bootstrap).
-
-Fulcrum causal (T8 trace): **90.5%** runtime window-absent; **97%** labeled KEY-MISMATCH (predecessor window exists but not at partition seed key).
+1. `window_map.get(start_bit)` — exact lookup only, same keying rule as vendor.
+2. Else `speculative_decode_find_boundary` → `try_speculative_decode_candidate`
+   using the partition seed / seek-bit pair rules from the block finder.
+3. No worker-side speculative publish, `get_at_worker`, `pred`, or handoff-only
+   lookup path remains in the production control plane.
 
 ### Structural delta
 
 | Mechanism | rapidgzip | gzippy |
 |-----------|-----------|--------|
-| Predecessor lookup | `get(blockOffset)` exact | Was `get` confirmed-only; workers ignored speculative early-publish |
-| Miss path | Block finder + `tryToDecode` (no separate bootstrap engine) | Marker bootstrap (`deflate_block`) then resolve — **~644 ms wc** vs rg **0 ms** |
-| Causal instrument | N/A | `causal.decode_decision` fires **pre-decode** — overcounts window-absent even when post-path succeeds |
+| Predecessor lookup | `get(blockOffset)` exact | `get(start_bit)` exact |
+| Miss path | Block finder + `tryToDecode` | `speculative_decode_find_boundary` + `try_speculative_decode_candidate` |
+| Remaining open cost | clean/windowed tail + `applyWindow` chain | `deflate_block` bootstrap + segmented-tail publish |
 
-**Shipped (2026-06):** `run_decode_task` mirrors vendor `decodeBlock` exactly — `get_at_worker(blockOffset)` → clean `decode_chunk`, else `speculative_decode_find_boundary` (= `GzipChunk::decodeChunk` no-window). Removed non-vendor handoff/pred/oracle branches. `try_speculative_decode_candidate` no longer falls to window-absent when `get` hit but decode failed (vendor `tryToDecode` catch-and-continue). **Handoff-key publish:** workers insert confirmed windows at `max_acceptable_start_bit` when window-present decode seeded A3 prefix — enables sibling `get(handoff)` hits.
+**June 2026 alignment:** the worker lookup table is now the vendor-shaped exact
+`get(start)` path only. The earlier `get_at_worker` / worker-publish / H' /
+pred exploration is not part of the current production design and should not be
+read as an active gap.
 
-**Still open for wall parity:** bootstrap speed (`deflate_block` vs vendor `deflate::Block`), consumer `get_last_window` on segmented storage, inner clean-tail ISA-L parity.
+**Still open for wall parity:** bootstrap speed (`deflate_block` vs vendor
+`deflate::Block`), consumer `get_last_window` on segmented storage, and
+post-process / publish-chain cost.
 
 ---
 
@@ -125,7 +133,8 @@ Porting vendor range-accept without chain invariant risks corruption (`plans/wal
 
 ## 8. Priority order (structural, measurement-backed)
 
-1. **Window-present decode rate** — `get_at_worker` + faster publish-chain so `get(start)` hits before prefetch; reduce `decode_chunk_window_absent` share (644 ms wc).
+1. **Window-present decode rate** — faster publish-chain so exact `get(start)`
+   hits sooner and reduces bootstrap share.
 2. **Bootstrap / inner loop speed** — `deflate_block` toward ISA-L-class; causal bootstrap perturbation confirms ceiling work.
 3. **`get_last_window` / segmented tail** — contiguous 32 KiB extraction for consumer serial publish (~122 ms).
 4. **Marker resolve** — pool post-process parity (partial; eager chain done).
