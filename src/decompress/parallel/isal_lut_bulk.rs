@@ -692,13 +692,47 @@ enum MarkerComp {
     Compressed,
 }
 
+/// Vendor `alignas(64) PreDecodedBuffer m_window16` (deflate.hpp:926).
+#[repr(C, align(64))]
+struct AlignedMarkerRing([u16; RING_SIZE]);
+
+impl std::ops::Deref for AlignedMarkerRing {
+    type Target = [u16; RING_SIZE];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for AlignedMarkerRing {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Vendor `alignas(64)` Huffman LUT backing (deflate.hpp:958-960).
+#[repr(C, align(64))]
+struct AlignedDecoderScratch(DecoderScratch);
+
+impl std::ops::Deref for AlignedDecoderScratch {
+    type Target = DecoderScratch;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for AlignedDecoderScratch {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// Window-absent marker decoder: the marker arm of the unified fast loop.
 /// API mirrors the retired `marker_inflate::Block` so the chunk driver is a
 /// drop-in swap: `new`/`reset`/`read_header`/`read`/`eob`/`is_last_block`/
 /// `contains_marker_bytes`.
 pub struct MarkerRing {
-    ring: Box<[u16; RING_SIZE]>,
-    scratch: DecoderScratch,
+    ring: Box<AlignedMarkerRing>,
+    scratch: AlignedDecoderScratch,
     ring_pos: usize,
     ring_drained: usize,
     decoded_bytes: usize,
@@ -725,14 +759,11 @@ impl Default for MarkerRing {
 
 impl MarkerRing {
     pub fn new() -> Self {
-        let mut ring: Box<[u16; RING_SIZE]> = vec![0u16; RING_SIZE]
-            .into_boxed_slice()
-            .try_into()
-            .expect("RING_SIZE box");
+        let mut ring = Box::new(AlignedMarkerRing([0u16; RING_SIZE]));
         init_marker_zone(&mut ring);
         Self {
             ring,
-            scratch: DecoderScratch::new(),
+            scratch: AlignedDecoderScratch(DecoderScratch::new()),
             ring_pos: 0,
             ring_drained: 0,
             decoded_bytes: 0,
