@@ -462,47 +462,6 @@ mod tests {
         assert_eq!(output, payload);
     }
 
-    /// Option A3: `set_window(32K)` + `read_stream` must match prefill +
-    /// `set_window([])` + `read_stream_starting_at` for the full clean tail.
-    #[test]
-    #[cfg(feature = "pure-rust-inflate")]
-    fn a3_prefill_matches_set_window_for_32k_dictionary() {
-        const WIN: usize = 32 * 1024;
-        let prefix = vec![0xABu8; WIN];
-        let payload = vec![0u8; 200_000];
-        let deflate = make_deflate(&payload);
-
-        let mut out_ref = vec![0u8; payload.len() + 4096];
-        let mut w = IsalInflateWrapper::new(&deflate, 0).expect("init");
-        w.set_window(&prefix).expect("set_window");
-        let mut total = 0usize;
-        loop {
-            let spare = &mut out_ref[total..];
-            let r = w.read_stream(spare).expect("read_stream");
-            total += r.bytes_written;
-            if r.finished || r.bytes_written == 0 {
-                break;
-            }
-        }
-        out_ref.truncate(total);
-
-        let mut out_a3 = vec![0u8; WIN + payload.len() + 4096];
-        out_a3[..WIN].copy_from_slice(&prefix);
-        let mut w2 = IsalInflateWrapper::new(&deflate, 0).expect("init");
-        w2.set_window(&[]).expect("set_window empty");
-        let mut pos = WIN;
-        loop {
-            let r = w2
-                .read_stream_starting_at(&mut out_a3, pos)
-                .expect("read_stream_starting_at");
-            pos += r.bytes_written;
-            if r.finished || r.bytes_written == 0 {
-                break;
-            }
-        }
-        assert_eq!(&out_ref[..payload.len()], &out_a3[WIN..WIN + payload.len()]);
-    }
-
     #[test]
     fn stopping_at_end_of_block_records_a_bit_position() {
         let payload = vec![b'x'; 200_000];

@@ -49,6 +49,12 @@ pub trait MarkerSink {
         }
     }
 
+    /// Clean u8 bytes routed to `chunk.data` during the marker loop
+    /// (vendor `cleanDataCount`). Default 0 for marker-only sinks.
+    fn clean_appended_len(&self) -> usize {
+        0
+    }
+
     /// Trailing run of clean (`< MARKER_BASE`) values starting at logical
     /// index `from` (inclusive). Used by the bootstrap block loop.
     fn trailing_clean_since(&self, from: usize) -> usize {
@@ -722,13 +728,22 @@ impl Block {
         }
         let start_idx = self.ring_drained % RING_SIZE;
         let end_idx_excl = (self.ring_drained + new_bytes) % RING_SIZE;
-        if start_idx + new_bytes <= RING_SIZE {
-            // Contiguous slice — covers both the non-wrap case and
-            // the exactly-fills-to-end case (end_idx_excl == 0).
+        if !self.contains_marker_bytes {
+            // Vendor `result.data` u8 path after `setInitialWindow`
+            // (deflate.hpp:1285-1292).
+            let mut u8buf = Vec::with_capacity(new_bytes);
+            for i in 0..new_bytes {
+                let v = self.output_ring[(self.ring_drained + i) % RING_SIZE];
+                debug_assert!(
+                    (v as usize) < 256,
+                    "clean drain emitted marker value {v:#x}"
+                );
+                u8buf.push(v as u8);
+            }
+            output.push_clean_u8(&u8buf);
+        } else if start_idx + new_bytes <= RING_SIZE {
             output.push_slice(&self.output_ring[start_idx..start_idx + new_bytes]);
         } else {
-            // Wraps: first part `[start_idx..RING_SIZE)`, second part
-            // `[0..end_idx_excl)`.
             output.push_slice(&self.output_ring[start_idx..]);
             output.push_slice(&self.output_ring[..end_idx_excl]);
         }

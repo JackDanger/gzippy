@@ -162,23 +162,6 @@ pub static BULK_DECLINE_OUTPUT_OVERFLOW: std::sync::atomic::AtomicU64 =
 #[cfg(pure_inflate_decode)]
 pub static BULK_DECLINE_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Option A3+A4: predecessor window image in `chunk.data[0..32K]` so
-/// `read_stream_starting_at` hits the copy_match fast path. `=1` enables.
-/// Default OFF at T8 (full-buffer A3 regressed publish-chain +18% on locked
-/// Fulcrum 2026-06-06); prior +4.2% claim was T=16 — re-verify before default ON.
-#[cfg(parallel_sm)]
-fn option_a_prefill_enabled() -> bool {
-    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| match std::env::var("GZIPPY_OPTION_A_PREFILL") {
-        Ok(v) => v == "1",
-        Err(_) => false,
-    })
-}
-
-/// Chunks that took the A3 output-prefix fast path in `finish_decode_chunk_impl`.
-#[cfg(parallel_sm)]
-pub static OPTION_A3_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 #[cfg(pure_inflate_decode)]
 #[allow(dead_code)]
 fn record_bulk_decline(err: crate::decompress::parallel::isal_lut_bulk::BulkDecodeError) {
@@ -394,24 +377,7 @@ fn finish_decode_chunk_impl(
         input.len() * 8
     };
     let mut wrapper = IsalInflateWrapper::with_until_bits(input, inflate_start_bit, read_cap)?;
-
-    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
-    #[cfg(feature = "pure-rust-inflate")]
-    let use_a3 = option_a_prefill_enabled()
-        && initial_window.len() == MAX_WINDOW_SIZE
-        && chunk.data_prefix_len == 0
-        && chunk.data.is_empty();
-    #[cfg(not(feature = "pure-rust-inflate"))]
-    let use_a3 = false;
-
-    if use_a3 {
-        OPTION_A3_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        chunk.prefill_window_prefix(initial_window);
-        wrapper.set_window(&[])?;
-    } else {
-        wrapper.set_window(initial_window)?;
-    }
-
+    wrapper.set_window(initial_window)?;
     wrapper.set_stopping_points(
         StoppingPoints::END_OF_BLOCK
             | StoppingPoints::END_OF_BLOCK_HEADER
@@ -431,18 +397,9 @@ fn finish_decode_chunk_impl(
 
     while !stopping_point_reached || wrapper.session_pending() {
         let prev_data_len = chunk.data.len();
-        // A3 only for the first 128 KiB of decoded payload (after the 32 KiB
-        // prefix). Beyond that, `read_stream` on `writable_tail` reuses the
-        // sliding window built during A3 — never call `set_window` mid-stream.
-        let a3_active = use_a3
-            && chunk.data.len().saturating_sub(chunk.data_prefix_len) < ALLOCATION_CHUNK_SIZE;
-        let (seg_ptr, buffer_cap, out_pos_base) = if a3_active {
-            let (ptr, cap, out_pos) = chunk.data.a3_decode_view();
-            (ptr, cap.saturating_sub(out_pos), out_pos)
-        } else {
-            let seg_tail = chunk.data.writable_tail();
-            (seg_tail.as_mut_ptr(), seg_tail.len(), 0usize)
-        };
+        let seg_tail = chunk.data.writable_tail();
+        let seg_ptr = seg_tail.as_mut_ptr();
+        let buffer_cap = seg_tail.len();
         let mut n_bytes_read: usize = 0;
         let mut last_per_call: usize = 0;
         let mut last_stopped_at = StoppingPoints::NONE;
@@ -456,20 +413,10 @@ fn finish_decode_chunk_impl(
                 && !wrapper.session_pending())
         {
             let bit_before_read = wrapper.tell_compressed();
-            let r = if a3_active {
-                let out_pos = out_pos_base + n_bytes_read;
-                let total_cap = out_pos_base + buffer_cap;
-                let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(seg_ptr, total_cap) };
-                wrapper.read_stream_starting_at(buf, out_pos)?
-            } else {
-                let spare: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        seg_ptr.add(n_bytes_read),
-                        buffer_cap - n_bytes_read,
-                    )
-                };
-                wrapper.read_stream(spare)?
+            let spare: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(seg_ptr.add(n_bytes_read), buffer_cap - n_bytes_read)
             };
+            let r = wrapper.read_stream(spare)?;
             last_per_call = r.bytes_written;
             n_bytes_read += last_per_call;
             chunk.note_inner_decoded_bytes(last_per_call);
@@ -563,11 +510,7 @@ fn finish_decode_chunk_impl(
         }
         if append_len > 0 {
             if chunk.configuration.crc32_enabled {
-                let kept: &[u8] = if a3_active {
-                    unsafe { std::slice::from_raw_parts(seg_ptr.add(out_pos_base), append_len) }
-                } else {
-                    unsafe { std::slice::from_raw_parts(seg_ptr, append_len) }
-                };
+                let kept: &[u8] = unsafe { std::slice::from_raw_parts(seg_ptr, append_len) };
                 if let Some(last_crc) = chunk.crc32s.last_mut() {
                     last_crc.update(kept);
                 }
@@ -693,30 +636,67 @@ fn decode_chunk_with_rapidgzip_impl(
     Ok(chunk)
 }
 
-/// Records block boundaries during marker bootstrap, then applies them to
-/// [`ChunkData`] so vendor subchunk split + sparsity can run.
+/// Vendor `decodeChunkWithRapidgzip` append path: u16 markers into
+/// `dataWithMarkers`, clean u8 buffered then flushed to `data`
+/// (GzipChunk.hpp:576-580 `cleanDataCount += bufferViews.dataSize()`).
 #[cfg(parallel_sm)]
-struct RecordingMarkerSink<'a> {
-    inner: &'a mut crate::decompress::parallel::segmented_markers::SegmentedU16,
+struct UnifiedMarkerSink<'a> {
+    markers: &'a mut crate::decompress::parallel::segmented_markers::SegmentedU16,
+    committed_clean_len: usize,
+    pending_clean: &'a mut Vec<u8>,
     boundaries: &'a mut Vec<(usize, usize)>,
 }
 
 #[cfg(parallel_sm)]
-impl crate::decompress::parallel::marker_inflate::MarkerSink for RecordingMarkerSink<'_> {
+impl crate::decompress::parallel::marker_inflate::MarkerSink for UnifiedMarkerSink<'_> {
     fn push_slice(&mut self, values: &[u16]) {
-        self.inner.push_slice(values);
+        self.markers.push_slice(values);
+    }
+    fn push_clean_u8(&mut self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.pending_clean.extend_from_slice(bytes);
+        }
+    }
+    fn clean_appended_len(&self) -> usize {
+        self.committed_clean_len + self.pending_clean.len()
     }
     fn sink_len(&self) -> usize {
-        self.inner.sink_len()
+        self.markers.sink_len() + self.committed_clean_len + self.pending_clean.len()
     }
     fn as_slice(&self) -> &[u16] {
-        self.inner.as_slice()
+        self.markers.as_slice()
     }
     fn trailing_clean_since(&self, from: usize) -> usize {
-        self.inner.trailing_clean_since(from)
+        let marker_len = self.markers.sink_len();
+        let clean_len = self.committed_clean_len + self.pending_clean.len();
+        if from >= marker_len + clean_len {
+            return 0;
+        }
+        if from >= marker_len {
+            clean_len - (from - marker_len)
+        } else {
+            self.markers.trailing_clean_since(from) + clean_len
+        }
     }
     fn copy_last_n_clean_u8(&self, n: usize, out: &mut Vec<u8>) -> bool {
-        self.inner.copy_last_n_clean_u8(n, out)
+        let pending = self.pending_clean.len();
+        let total_clean = self.committed_clean_len + pending;
+        if total_clean < n {
+            return self.markers.copy_last_n_clean_u8(n, out);
+        }
+        let mut need = n;
+        if pending > 0 && need > 0 {
+            let take = need.min(pending);
+            let start = pending - take;
+            out.extend_from_slice(&self.pending_clean[start..]);
+            need -= take;
+        }
+        if need > 0 && self.committed_clean_len >= need {
+            // Committed clean bytes live in chunk.data; caller uses this
+            // only after flush in practice — marker path falls back.
+            return false;
+        }
+        !out.is_empty()
     }
     fn note_block_boundary(&mut self, encoded_offset_bits: usize, decoded_offset: usize) {
         self.boundaries.push((encoded_offset_bits, decoded_offset));
@@ -752,12 +732,21 @@ fn decode_chunk_unified_marker(
     chunk.data_with_markers.reserve(128 * 1024);
     let mut pending_boundaries: Vec<(usize, usize)> = Vec::new();
     loop {
-        let mut sink = RecordingMarkerSink {
-            inner: &mut chunk.data_with_markers,
+        let mut pending_clean: Vec<u8> = Vec::new();
+        let mut sink = UnifiedMarkerSink {
+            markers: &mut chunk.data_with_markers,
+            committed_clean_len: marker_ctx.clean_data_count,
+            pending_clean: &mut pending_clean,
             boundaries: &mut pending_boundaries,
         };
         let (step, flipped_clean) =
             marker_decode_step(&mut marker_ctx, input, stop_hint_bits, &[], &mut sink)?;
+        if !pending_clean.is_empty() {
+            let n = pending_clean.len();
+            chunk.append_clean(&pending_clean);
+            marker_ctx.clean_data_count += n;
+            UNIFIED_ROUTE_CLEAN_U8_BYTES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         apply_recorded_block_boundaries(&mut chunk, input, &pending_boundaries);
         pending_boundaries.clear();
         if flipped_clean {
@@ -806,18 +795,6 @@ fn decode_chunk_unified_marker(
             }
         }
     }
-}
-
-/// Window-present clean-decode (vendor `setInitialWindow`) toggle.
-/// `GZIPPY_NO_WINDOW_SEED=1` (or forced-u16) reverts to the old discard-the-
-/// window marker-every-chunk behavior for one-binary A/B.
-#[cfg(parallel_sm)]
-fn window_seed_enabled() -> bool {
-    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| {
-        std::env::var_os("GZIPPY_NO_WINDOW_SEED").is_none()
-            && std::env::var_os("GZIPPY_U16_CLEAN_TAIL").is_none()
-    })
 }
 
 /// Counter: chunks that took the window-present clean-from-block-0 fast path
@@ -912,12 +889,11 @@ struct MarkerDecodeCtx {
     data_base_byte: usize,
     current_bit_offset: usize,
     trailing_clean: usize,
+    /// Clean u8 bytes committed to `chunk.data` (vendor `cleanDataCount`).
+    clean_data_count: usize,
     block_primed: bool,
-    /// Set once the unified driver has consumed the single `FlipToClean`
-    /// signal and switched the decode sink to the clean u8 tail. Gates the
-    /// top-of-loop flip check so it fires EXACTLY once; subsequent steps
-    /// (now draining the clean sink) decode normally on the same `MarkerRing`
-    /// and the same bit cursor instead of re-returning `FlipToClean`.
+    /// Gates the vendor `cleanDataCount >= MAX_WINDOW_SIZE` handoff so it
+    /// fires exactly once per chunk.
     flipped: bool,
 }
 
@@ -935,6 +911,7 @@ impl MarkerDecodeCtx {
             data_base_byte,
             current_bit_offset: start_bit_offset,
             trailing_clean: 0,
+            clean_data_count: 0,
             block_primed: false,
             flipped: false,
         })
@@ -1209,7 +1186,10 @@ where
         let mut bits = ctx.open_bits(data);
         let next_block_offset = absolute_bit_pos(slice_byte, &bits);
 
-        if !block.contains_marker_bytes() && !ctx.flipped {
+        // Vendor GzipChunk.hpp:520-525 — hand off when clean u8 in `data`
+        // reaches 32 KiB (include not-yet-flushed post-flip drains).
+        if output.clean_appended_len() >= MAX_WINDOW_SIZE && !ctx.flipped {
+            ctx.flipped = true;
             let end_bit_offset = next_block_offset;
             ctx.current_bit_offset = end_bit_offset;
             return Ok((
