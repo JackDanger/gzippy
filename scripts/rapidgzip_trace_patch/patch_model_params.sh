@@ -58,12 +58,13 @@ fi
 # at ~714 also sets sharedWindow, so the predicate is evaluated AFTER it.
 if ! grep -q 'worker.decode' "$GCF"; then
     perl -i -0777 -pe '
-        s|(\n)(        return decodeBlock\(\n            m_sharedFileReader->clone\(\),\n            blockOffset,)|$1        ::tracev2::ScopedSpan _tv2_dec("worker.decode",\n            ([\&]{ static thread_local char _b[96];\n              std::snprintf(_b, sizeof(_b),\n                "\\"start_bit\\":%zu,\\"mode\\":\\"%s\\"",\n                blockOffset, sharedWindow ? "clean" : "window_absent");\n              return _b; }()));\n$2|;
+        s|(sharedWindow = std::make_shared<WindowMap::Window>\(\);\n        \}\n\n)(        return decodeBlock\()|$1        ::tracev2::ScopedSpan _tv2_dec("worker.decode",\n            ([\&]{ static thread_local char _b[96];\n              const bool _hasWin = static_cast<bool>(sharedWindow);\n              std::snprintf(_b, sizeof(_b),\n                "\\"start_bit\\":%zu,\\"mode\\":\\"%s\\"",\n                blockOffset, _hasWin ? "clean" : "window_absent");\n              return _b; }()));\n\n$2|s;
     ' "$GCF"
     if grep -q 'worker.decode' "$GCF"; then
         echo "PATCHED worker.decode (d_c/d_w): $GCF"
     else
-        echo "WARN: worker.decode patch did not match" >&2
+        echo "ERROR: worker.decode patch did not match $GCF" >&2
+        exit 1
     fi
 fi
 
