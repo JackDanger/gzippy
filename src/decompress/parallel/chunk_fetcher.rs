@@ -1619,13 +1619,10 @@ fn consumer_loop<W: std::io::Write>(
             // recompute was REDUNDANT — measured get_last_window calls=102 for ~39 chunks
             // (~1.5ms each). get_last_window is deterministic given the same predecessor, so
             // the eager-published window is byte-identical; skipping the recompute is byte-exact.
-            if !window_map.contains(chunk_end_bit) {
+            {
+                let _tv2 = trace_v2::SpanGuard::begin("consumer.get_last_window");
                 let window_bytes = materialize_window(&window);
-                let tail = {
-                    let _tv2 = trace_v2::SpanGuard::begin("consumer.get_last_window");
-                    chunk.get_last_window_vec(&window_bytes)
-                };
-                window_map.insert_owned_none(chunk_end_bit, tail);
+                publish_end_window_before_post_process(window_map, chunk, window_bytes.as_ref());
             }
             trace_v2::emit_instant(
                 "causal.window_publish",
@@ -2508,6 +2505,32 @@ fn reanchor_chunk_to_handoff(chunk: &mut ChunkData, handoff_bit: usize) {
     }
 }
 
+/// Vendor `queueChunkForPostProcessing` publish half (GzipChunkFetcher.hpp:557-575):
+/// caller thread inserts `getLastWindow(*previousWindow)` at
+/// `encodedOffsetInBits + encodedSizeInBits` BEFORE pool `applyWindow`.
+#[cfg(parallel_sm)]
+fn publish_end_window_before_post_process(
+    window_map: &WindowMap,
+    chunk: &ChunkData,
+    predecessor_window: &[u8],
+) {
+    use std::sync::atomic::Ordering;
+    if std::env::var_os("GZIPPY_NO_PUBLISH_AHEAD").is_some() {
+        return;
+    }
+    if chunk.encoded_size_bits == 0 {
+        return;
+    }
+    let window_offset = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+    if window_map.contains(window_offset) {
+        return;
+    }
+    let end_window = chunk.get_last_window(predecessor_window);
+    window_map.insert_owned_none(window_offset, end_window.to_vec());
+    PUBLISH_AHEAD_WINDOWS.fetch_add(1, Ordering::Relaxed);
+    EARLY_WINDOW_PUBLISHED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Vendor `queuePrefetchedChunkPostProcessing` (GzipChunkFetcher.hpp:520-551).
 /// Submits pool `run_post_process_task` on prefetched clones (never mutates
 /// the cached `Arc`). `handoff_key`: `Some(k)` after a confirmed tail publish
@@ -2574,39 +2597,17 @@ fn queue_prefetched_marker_postprocess(
             continue;
         }
         let resolve_anchor = handoff_key.unwrap_or(arc.encoded_offset_bits);
-        // Match consumer dispatch: exact handoff key first, then predecessor fallback.
+        // Vendor queuePrefetchedChunkPostProcessing:544 — exact
+        // `m_windowMap->get(chunkData->encodedOffsetInBits)` only.
         let Some((pred_key, predecessor_window)) =
-            confirmed_predecessor_window(window_map, resolve_anchor)
-                .or_else(|| predecessor_window_for_markers(window_map, arc.encoded_offset_bits))
-                .or_else(|| predecessor_window_for_markers(window_map, resolve_anchor))
+            confirmed_predecessor_window(window_map, arc.encoded_offset_bits)
         else {
             continue;
         };
-        // VENDOR queueChunkForPostProcessing (GzipChunkFetcher.hpp:557-575):
-        // EAGERLY publish THIS chunk's end window on the consumer (cheap,
-        // deterministic get_last_window) BEFORE the parallel marker resolve, so
-        // the NEXT confirmed chunk's predecessor becomes available and the whole
-        // confirmed chain resolves IN PARALLEL in one pass instead of one link
-        // at a time on the consumer's serial L_resolve path. Byte-exact:
-        // get_last_window is deterministic and window_map insert overwrites
-        // (WindowMap is overwrite-safe by design); only resolution TIMING moves.
-        // Publish end-window only for marker-free chunks. Unresolved marker
-        // bytes make `get_last_window` non-deterministic vs the post-resolve
-        // tail → rare CRC flake at T≥2 (~1%) when successors resolve against
-        // the early-published window (GZIPPY_NO_PUBLISH_AHEAD=1 disables all).
-        if arc.encoded_size_bits > 0
-            && arc.data_with_markers.is_empty()
-            && std::env::var_os("GZIPPY_NO_PUBLISH_AHEAD").is_none()
-        {
-            let chunk_end_bit = arc.encoded_offset_bits + arc.encoded_size_bits;
-            if !window_map.contains(chunk_end_bit) {
-                let pred_bytes = materialize_window(&predecessor_window);
-                let end_window = arc.get_last_window(pred_bytes.as_ref());
-                window_map.insert_owned_none(chunk_end_bit, end_window.to_vec());
-                PUBLISH_AHEAD_WINDOWS.fetch_add(1, Ordering::Relaxed);
-                EARLY_WINDOW_PUBLISHED.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        // Vendor queueChunkForPostProcessing:557-575 — publish end-window on
+        // caller thread before pool applyWindow (marker chunks included).
+        let pred_bytes = materialize_window(&predecessor_window);
+        publish_end_window_before_post_process(window_map, arc.as_ref(), pred_bytes.as_ref());
         let rx = submit_post_process_from_prefetch(
             block_fetcher,
             thread_pool,
