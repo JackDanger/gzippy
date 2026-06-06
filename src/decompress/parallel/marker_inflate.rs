@@ -341,6 +341,18 @@ pub struct Block {
     isal_litlen_pure: crate::decompress::parallel::isal_huffman_pure::IsalLitLenCodePure,
     #[cfg(pure_inflate_decode)]
     isal_dist_pure: crate::decompress::parallel::isal_huffman_pure::IsalDistCodePure,
+    /// True after `read_header` built ISA-L LUTs for this block (vendor
+    /// `m_literalHC` / `m_distanceHC` at deflate.hpp:1137-1141). Cleared
+    /// on each new header so `read()` in the `while !eob` loop reuses them.
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    block_huffman_luts_ready: bool,
 }
 
 #[cfg(parallel_sm)]
@@ -406,6 +418,15 @@ impl Block {
             #[cfg(pure_inflate_decode)]
             isal_dist_pure:
                 crate::decompress::parallel::isal_huffman_pure::IsalDistCodePure::new_empty(),
+            #[cfg(any(
+                all(
+                    feature = "isal-compression",
+                    not(feature = "pure-rust-inflate"),
+                    target_arch = "x86_64"
+                ),
+                pure_inflate_decode
+            ))]
+            block_huffman_luts_ready: false,
         }
     }
 
@@ -524,6 +545,17 @@ impl Block {
         self.ring_drained = 0;
         self.distance_to_last_marker_byte = 0;
         self.contains_marker_bytes = true;
+        #[cfg(any(
+            all(
+                feature = "isal-compression",
+                not(feature = "pure-rust-inflate"),
+                target_arch = "x86_64"
+            ),
+            pure_inflate_decode
+        ))]
+        {
+            self.block_huffman_luts_ready = false;
+        }
         init_marker_zone(&mut self.output_ring);
 
         // rapidgzip's `reset` ends with: `if (initialWindow) setInitialWindow(*initialWindow);`
@@ -724,6 +756,17 @@ impl Block {
         let bfinal = (bits.peek() & 1) != 0;
         bits.consume(1);
         self.is_last_block = bfinal;
+        #[cfg(any(
+            all(
+                feature = "isal-compression",
+                not(feature = "pure-rust-inflate"),
+                target_arch = "x86_64"
+            ),
+            pure_inflate_decode
+        ))]
+        {
+            self.block_huffman_luts_ready = false;
+        }
         if treat_last_block_as_error && bfinal {
             return Err(BlockError::UnexpectedLastBlock);
         }
@@ -750,6 +793,57 @@ impl Block {
         self.at_end_of_block = false;
         self.decoded_bytes_at_block_start = self.decoded_bytes;
         self.backreferences.clear();
+        #[cfg(any(
+            all(
+                feature = "isal-compression",
+                not(feature = "pure-rust-inflate"),
+                target_arch = "x86_64"
+            ),
+            pure_inflate_decode
+        ))]
+        {
+            self.build_huffman_luts_for_block()?;
+            self.block_huffman_luts_ready = true;
+        }
+        Ok(())
+    }
+
+    /// Build ISA-L lit/dist LUTs once per block header (vendor
+    /// `readDynamicHuffmanCoding` tail at deflate.hpp:1137-1141).
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    fn build_huffman_luts_for_block(&mut self) -> Result<(), BlockError> {
+        match self.compression_type {
+            CompressionType::FixedHuffman => {
+                if !self.isal_lut_litlen_rebuild(&FIXED_LIT_LEN_LENGTHS[..]) {
+                    return Err(BlockError::InvalidCodeLengths);
+                }
+                if !self.isal_lut_dist_rebuild(&FIXED_DIST_LENGTHS[..]) {
+                    return Err(BlockError::InvalidCodeLengths);
+                }
+            }
+            CompressionType::DynamicHuffman => {
+                let split = self.literal_code_count;
+                let end = split + self.distance_code_count;
+                let mut lit_stack = [0u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2];
+                let mut dist_stack = [0u8; MAX_DISTANCE_SYMBOL_COUNT + 2];
+                lit_stack[..split].copy_from_slice(&self.literal_cl[..split]);
+                dist_stack[..end - split].copy_from_slice(&self.literal_cl[split..end]);
+                if !self.isal_lut_litlen_rebuild(&lit_stack[..split]) {
+                    return Err(BlockError::InvalidCodeLengths);
+                }
+                if !self.isal_lut_dist_rebuild(&dist_stack[..end - split]) {
+                    return Err(BlockError::InvalidCodeLengths);
+                }
+            }
+            CompressionType::Uncompressed | CompressionType::Reserved => {}
+        }
         Ok(())
     }
 
@@ -1120,28 +1214,10 @@ impl Block {
         n_max_to_decode: usize,
     ) -> Result<usize, BlockError> {
         match self.compression_type {
-            CompressionType::FixedHuffman => {
-                if !self.isal_lut_litlen_rebuild(&FIXED_LIT_LEN_LENGTHS[..]) {
-                    return Err(BlockError::InvalidCodeLengths);
-                }
-                if !self.isal_lut_dist_rebuild(&FIXED_DIST_LENGTHS[..]) {
-                    return Err(BlockError::InvalidCodeLengths);
-                }
-            }
-            CompressionType::DynamicHuffman => {
-                let split = self.literal_code_count;
-                let end = split + self.distance_code_count;
-                // Stack copy: `rebuild_from` mutates LUT fields on `self` while
-                // lengths live in `literal_cl` (cannot hold two `&mut self` borrows).
-                let mut lit_stack = [0u8; MAX_LITERAL_OR_LENGTH_SYMBOLS + 2];
-                let mut dist_stack = [0u8; MAX_DISTANCE_SYMBOL_COUNT + 2];
-                lit_stack[..split].copy_from_slice(&self.literal_cl[..split]);
-                dist_stack[..end - split].copy_from_slice(&self.literal_cl[split..end]);
-                if !self.isal_lut_litlen_rebuild(&lit_stack[..split]) {
-                    return Err(BlockError::InvalidCodeLengths);
-                }
-                if !self.isal_lut_dist_rebuild(&dist_stack[..end - split]) {
-                    return Err(BlockError::InvalidCodeLengths);
+            CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {
+                if !self.block_huffman_luts_ready {
+                    self.build_huffman_luts_for_block()?;
+                    self.block_huffman_luts_ready = true;
                 }
             }
             _ => return Err(BlockError::InvalidCompression),
