@@ -163,14 +163,15 @@ pub static BULK_DECLINE_OUTPUT_OVERFLOW: std::sync::atomic::AtomicU64 =
 pub static BULK_DECLINE_OTHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Option A3+A4: predecessor window image in `chunk.data[0..32K]` so
-/// `read_stream_starting_at` hits the copy_match fast path. `=0` disables.
-/// Default ON (measured +4.2% T=16 silesia).
+/// `read_stream_starting_at` hits the copy_match fast path. `=1` enables.
+/// Default OFF at T8 (full-buffer A3 regressed publish-chain +18% on locked
+/// Fulcrum 2026-06-06); prior +4.2% claim was T=16 — re-verify before default ON.
 #[cfg(parallel_sm)]
 fn option_a_prefill_enabled() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EN.get_or_init(|| match std::env::var("GZIPPY_OPTION_A_PREFILL") {
-        Ok(v) => v != "0",
-        Err(_) => true,
+        Ok(v) => v == "1",
+        Err(_) => false,
     })
 }
 
