@@ -16,7 +16,10 @@ pub const INPUT_STAGING_BYTES: usize = 128 * 1024;
 pub struct StagedBitInput<'a> {
     full: &'a [u8],
     until_bits: usize,
-    buf: [u8; INPUT_STAGING_BYTES],
+    // Heap-backed: 128 KiB on the worker stack regressed x86 CLI decode
+    // (BTYPE=11 / InvalidLookback) while lib tests passed — see
+    // test_silesia_parallel_sm_mmap_fd_cli_shape vs gzippy binary.
+    buf: Box<[u8; INPUT_STAGING_BYTES]>,
     buf_len: usize,
     /// Absolute byte offset in `full` where `buf[0]` lives.
     buf_base_byte: usize,
@@ -35,7 +38,7 @@ impl<'a> StagedBitInput<'a> {
         let mut s = Self {
             full,
             until_bits,
-            buf: [0; INPUT_STAGING_BYTES],
+            buf: Box::new([0; INPUT_STAGING_BYTES]),
             buf_len: 0,
             buf_base_byte: 0,
             inner: Bits::new(&[]),
