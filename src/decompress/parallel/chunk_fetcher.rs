@@ -1623,27 +1623,19 @@ fn consumer_loop<W: std::io::Write>(
                             None
                         }
                     };
-                    // Vendor GzipChunkFetcher.hpp:513 — queue successor
-                    // post-processing while blocking on the head future.
-                    queue_prefetched_marker_postprocess(
-                        block_fetcher,
-                        window_map,
-                        thread_pool,
-                        &mut prefetch_post_inflight,
-                        &[],
-                        &[],
-                    );
                     let _tv2_wait = trace_v2::SpanGuard::begin_with(
                         "wait.future_recv",
                         &format!(r#""chunk_id":{partition_idx_for_trace}"#),
                     );
+                    let overlap = Some((
+                        block_fetcher,
+                        window_map,
+                        thread_pool,
+                        &mut prefetch_post_inflight,
+                        &mut eager_completed,
+                    ));
                     if let Some(eager_rx) = reuse {
-                        eager_rx.recv().map_err(|_| {
-                            FetchError::Decode(ChunkDecodeError::ExactStopMissed {
-                                requested: partition_idx_for_trace,
-                                actual: 0,
-                            })
-                        })?;
+                        recv_post_process_blocking(eager_rx, partition_idx_for_trace, overlap)?;
                     } else {
                         let rx = submit_post_process_to_pool(
                             thread_pool,
@@ -1652,12 +1644,7 @@ fn consumer_loop<W: std::io::Write>(
                             window,
                             partition_idx_for_trace,
                         );
-                        chunk = rx.recv().map_err(|_| {
-                            FetchError::Decode(ChunkDecodeError::ExactStopMissed {
-                                requested: partition_idx_for_trace,
-                                actual: 0,
-                            })
-                        })?;
+                        chunk = recv_post_process_blocking(rx, partition_idx_for_trace, overlap)?;
                     }
                 }
             }
@@ -2857,6 +2844,51 @@ fn harvest_ready_postprocess(in_flight: &mut EagerSubmitted, completed: &mut Eag
     }
 }
 
+/// Vendor `waitForReplacedMarkers` (:497-516): while blocking on the head
+/// post-process future, harvest ready non-head futures and queue successor
+/// prefetch post-processing (`queuePrefetchedChunkPostProcessing`).
+#[cfg(parallel_sm)]
+fn recv_post_process_blocking<F>(
+    rx: mpsc::Receiver<F>,
+    partition_idx: usize,
+    mut overlap: Option<(
+        &Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>>,
+        &WindowMap,
+        &Arc<ThreadPool>,
+        &mut EagerSubmitted,
+        &mut EagerCompleted,
+    )>,
+) -> Result<F, FetchError> {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Duration;
+    let mut rx = rx;
+    loop {
+        if let Some((block_fetcher, window_map, thread_pool, in_flight, completed)) =
+            overlap.as_mut()
+        {
+            harvest_ready_postprocess(in_flight, completed);
+            queue_prefetched_marker_postprocess(
+                block_fetcher,
+                window_map,
+                thread_pool,
+                in_flight,
+                &[],
+                &[],
+            );
+        }
+        match rx.recv_timeout(Duration::from_micros(100)) {
+            Ok(v) => return Ok(v),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
+                    requested: partition_idx,
+                    actual: 0,
+                }));
+            }
+        }
+    }
+}
+
 /// Consumer chunk ownership across window publish vs post-process dispatch.
 #[cfg(parallel_sm)]
 enum ConsumerChunkHold {
@@ -3344,21 +3376,6 @@ fn drain_one_pending<W: std::io::Write>(
         Some(h) => h,
         None => return Ok(()),
     };
-    // Vendor GzipChunkFetcher.hpp:513 — queue successor post-processing
-    // BEFORE blocking on the head chunk's future, but only when the head is
-    // actually an in-flight `Async` (else there is no wait to overlap).
-    if matches!(&head, PendingWrite::Async { .. }) {
-        if let Some((thread_pool, in_flight, _completed)) = eager_ctx.as_mut() {
-            queue_prefetched_marker_postprocess(
-                block_fetcher,
-                window_map,
-                thread_pool,
-                in_flight,
-                &[],
-                &[],
-            );
-        }
-    }
     let t_chunk = std::time::Instant::now();
     let t_recv = std::time::Instant::now();
     let (idx, mut chunk, cache_key, handoff_bit) = match head {
@@ -3378,12 +3395,10 @@ fn drain_one_pending<W: std::io::Write>(
                 "wait.future_recv",
                 &format!(r#""chunk_id":{idx}"#),
             );
-            let chunk = rx.recv().map_err(|_| {
-                FetchError::Decode(ChunkDecodeError::ExactStopMissed {
-                    requested: idx,
-                    actual: 0,
-                })
-            })?;
+            let overlap = eager_ctx
+                .as_mut()
+                .map(|ctx| (block_fetcher, window_map, &*ctx.0, &mut *ctx.1, &mut *ctx.2));
+            let chunk = recv_post_process_blocking(rx, idx, overlap)?;
             (idx, chunk, cache_key, handoff_bit)
         }
     };
