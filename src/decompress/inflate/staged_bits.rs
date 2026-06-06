@@ -139,10 +139,10 @@ impl<'a> StagedBitInput<'a> {
         let _ = self.reload_at_bit(bit);
     }
 
-    /// Rebuild the 128 KiB staging window from the full-input oracle at
-    /// `bit_pos`. Used when the Huffman fastloop mirrors `Bits` on the
-    /// mmap'd `full` slice and must push absolute progress back into
-    /// `StagedBitInput` for block-header entry (`try_enter_next_block`).
+    /// Rebuild staging from the full-input oracle at `bit_pos`. Used when the
+    /// Huffman fastloop mirrors `Bits` on the mmap'd `full` slice and must
+    /// push absolute progress back into `StagedBitInput` for block-header
+    /// entry (`try_enter_next_block`).
     pub(crate) fn sync_at_absolute_bit(&mut self, bit_pos: usize) {
         let _ = self.reload_at_bit(bit_pos);
     }
@@ -221,6 +221,28 @@ impl<'a> StagedBitInput<'a> {
             return Ok(());
         }
 
+        // Reconstruct reader state from the full input oracle so reload is
+        // bit-identical to direct `Bits` at the same absolute position.
+        let oracle = Bits::at_bit_offset(self.full, bit_pos);
+        let rel_pos = oracle.pos.saturating_sub(start_byte);
+
+        // Skip the 128 KiB memcpy when the window is already anchored at
+        // `start_byte` and still covers the oracle byte position (+8 for
+        // branchless refill).
+        if start_byte == self.buf_base_byte
+            && self.buf_len > 0
+            && rel_pos.saturating_add(8) <= self.buf_len
+        {
+            let slice: &'a [u8] = unsafe { std::mem::transmute(&self.buf[..self.buf_len]) };
+            self.inner = Bits {
+                data: slice,
+                pos: rel_pos,
+                bitbuf: oracle.bitbuf,
+                bitsleft: oracle.bitsleft,
+            };
+            return Ok(());
+        }
+
         let max_bytes = (until_byte - start_byte).min(INPUT_STAGING_BYTES);
         self.buf[..max_bytes].copy_from_slice(&self.full[start_byte..start_byte + max_bytes]);
         // Pad tail: branchless `Bits::refill` may read up to 7 bytes past the
@@ -231,15 +253,6 @@ impl<'a> StagedBitInput<'a> {
         self.buf_len = max_bytes;
         self.buf_base_byte = start_byte;
 
-        // SAFETY: `inner` only reads `buf` while we own it; reload reconstructs
-        // `inner` before any caller can hold an aliasing `&[u8]`.
-        // Reconstruct reader state from the full input oracle so reload is
-        // bit-identical to direct `Bits` at the same absolute position.
-        // `Bits::at_bit_offset` on the staging slice alone can diverge after
-        // `refill()` at window seams (silesia repro: bitbuf drift while
-        // bit_position still matched).
-        let oracle = Bits::at_bit_offset(self.full, bit_pos);
-        let rel_pos = oracle.pos.saturating_sub(start_byte);
         if rel_pos > self.buf_len {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
@@ -247,6 +260,8 @@ impl<'a> StagedBitInput<'a> {
             ));
         }
 
+        // SAFETY: `inner` only reads `buf` while we own it; reload reconstructs
+        // `inner` before any caller can hold an aliasing `&[u8]`.
         let slice: &'a [u8] = unsafe { std::mem::transmute(&self.buf[..self.buf_len]) };
         self.inner = Bits {
             data: slice,
@@ -400,6 +415,62 @@ mod tests {
             steps += 1;
         }
         assert_eq!(staged.bit_position(), direct.bit_position());
+    }
+
+    #[test]
+    fn reload_at_bit_skips_memcpy_when_anchor_unchanged() {
+        let payload = vec![0xABu8; 300_000];
+        let deflate = make_stored_deflate(&payload);
+        let until = deflate.len() * 8;
+        for &bit_pos in &[0usize, 17, 8000, 64_000] {
+            if bit_pos >= until {
+                continue;
+            }
+            let mut staged = StagedBitInput::with_until_bits(&deflate, bit_pos, until).unwrap();
+            let oracle = Bits::at_bit_offset(&deflate, bit_pos);
+            let buf_snapshot = *staged.buf;
+            staged.reload_at_bit(bit_pos).unwrap();
+            assert_eq!(*staged.buf, buf_snapshot, "memcpy at bit_pos {bit_pos}");
+            assert_eq!(staged.bit_position(), oracle.bit_position());
+            assert_eq!(staged.bitbuf(), oracle.bitbuf);
+        }
+    }
+
+    #[test]
+    fn reload_at_bit_matches_full_oracle_through_many_reloads() {
+        let payload = vec![0xABu8; 300_000];
+        let deflate = make_stored_deflate(&payload);
+        let until = deflate.len() * 8;
+        let mut staged = StagedBitInput::with_until_bits(&deflate, 0, until).unwrap();
+        let mut direct = Bits::at_bit_offset(&deflate, 0);
+        for step in 0..200_000 {
+            if direct.bit_position() >= until {
+                break;
+            }
+            let bit_pos = direct.bit_position();
+            let oracle = Bits::at_bit_offset(&deflate, bit_pos);
+            staged.reload_at_bit(bit_pos).unwrap();
+            assert_eq!(
+                staged.bit_position(),
+                oracle.bit_position(),
+                "bit_position drift at step {step}"
+            );
+            assert_eq!(
+                staged.bitbuf(),
+                oracle.bitbuf,
+                "bitbuf drift at step {step}"
+            );
+            assert_eq!(
+                staged.bitsleft(),
+                oracle.bitsleft,
+                "bitsleft drift at step {step}"
+            );
+            if direct.available() >= 5 {
+                direct.consume(5);
+            } else {
+                direct.refill();
+            }
+        }
     }
 
     #[test]
