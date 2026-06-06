@@ -184,4 +184,6 @@ For **vendor structural convergence** experiments:
 
 **Done (awaiting measurement):** B2, B1, A1, Gate 1, B4 partial.
 
-**Do not prioritize:** A3 (C1 stale), B3 “fix” toward vendor.
+**Gate 4 (in progress):** Vendor `waitForReplacedMarkers` (`GzipChunkFetcher.hpp:478-518`) blocks on the *current* chunk's `applyWindow` future but **non-blocking harvests** other ready futures from `m_markersBeingReplaced` and runs `queuePrefetchedChunkPostProcessing` during the wait. gzippy mirrors prefetch queue (`drain_one_pending` `:3283-3292`) but keeps a strict FIFO `pending` deque — `consumer.dispatch_recv` 268ms wall-crit @738dea6 is the serial wait for head `Async` post-process. rapidgzip `post_process.apply_window` 218ms busy sits off the consumer wall-crit path when work completed ahead of consume. Next: compare `EAGER_PROBE_*` / `markers_resolved` hit rate vs vendor `hasBeenPostProcessed` at `getBlock` time; re-Fulcrum after `f8490b3` RG path-mix spans.
+
+**Do not prioritize:** A3 (C1 stale), B3 “fix” toward vendor. Fulcrum `[5] REMEDIATION` handoff/pred paths — **stale**, do not re-wire.
