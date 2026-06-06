@@ -1,6 +1,8 @@
 # Structural divergence: gzippy ↔ rapidgzip (decode path)
 
-**Purpose:** Record runtime-observable divergences between gzippy and rapidgzip — for structural comparison and exploration, not lever ranking.
+**Purpose:** Record runtime-observable divergences between gzippy and rapidgzip — for **exact structural convergence** to vendor (`file:line`), not lever ranking.
+
+**Method:** Fulcrum numbers **guide** which divergences still show up at runtime (path-mix, span shape, publish-chain binding). They do **not** define done. A correct vendor-faithful change is **kept** on a TIE; a LOSS on wall with closed structure is progress. Done = gzippy's pipeline **matches** rapidgzip's structure and wall reaches parity on locked bench — not “we stopped when a number stopped moving.”
 
 **Sources:**
 - Fulcrum run `0462f88`, silesia-large, neurotic guest 199 (`/tmp/gzippy-locked-fulcrum-20260605-200740/`)
@@ -8,7 +10,7 @@
 
 **Headline:** Recent convergence is real and mostly faithful — dispatch, window map, output path (writev + vmsplice/SpliceVault), thread priorities, segmented buffers, and rpmalloc per-`Vec` with lazy per-thread init all match vendor. Two prior audit flags (C1, D3) are **stale** (dead code, not production path). Genuine remaining divergences are fewer than earlier audits implied.
 
-**Landed since `0462f88`:** Gate 1, A1, B1, B2, B4, Gate 0 bench hook (`0db757f`), `resumable_resync` deleted (`f8490b3`).
+**Landed since `0462f88`:** Gate 1, A1, B1, B2, B4, Gate 0 bench hook (`0db757f`), `resumable_resync` deleted (`f8490b3`), Gate 4 harvest (`47a2c63`), structural slice (uncommitted): instrumentation (`worker.decode` per-attempt), consumer lifecycle (`consumer.window_publish`, `hasBeenPostProcessed` cache promote + harvest, `PREFETCH_*` counters), bootstrap default `marker_inflate::Block` (vendor `deflate::Block`; `GZIPPY_MARKER_RING=1` for LUT A/B).
 
 ---
 
@@ -176,18 +178,19 @@ flowchart LR
 
 ---
 
-## Ranked remaining items (forensic, not perf levers)
+## Ranked remaining structural ports (numbers show where behavior still diverges)
 
-For **vendor structural convergence** experiments:
+| Priority | Structural gap | Vendor anchor | What numbers still show |
+|----------|------------------|---------------|-------------------------|
+| 1 | **Bootstrap session** — finish path tuning after `Block` restore | `deflate.hpp` / `GzipChunk.hpp:661` | **Default engine now vendor `Block`** (was `MarkerRing`). Fulcrum: `worker.block_body` span may still show busy (gzippy-only span); measure wall + path-mix. `GZIPPY_MARKER_RING=1` keeps LUT ring for A/B. |
+| 2 | **Consumer publish / resolve** — `L_resolve` + write-as-ready ordering | `GzipChunkFetcher.hpp:478-583` | **LANDED (uncommitted):** unified `consumer.window_publish`; pool + harvest `replace_prefetch_if_present`; `EagerSubmitted` carries `cache_key`; `hasBeenPostProcessed` take path. Remaining: lone-Ready drain policy (correctness-gated). Await Fulcrum `dispatch_recv` / `L_resolve`. |
+| 3 | **`worker.decode` instrumentation** | `GzipChunkFetcher.hpp:712` | **LANDED (uncommitted):** per-attempt `window_absent` in `try_speculative_decode_candidate`; clean-only spans in `run_decode_task`. Re-run Fulcrum path-mix. |
+| 4 | **A2** window sparsity | `GzipChunk.hpp:60-133` | secondary until 1–2 close |
 
-1. **Fulcrum @ `738dea6`** — wall T16, `bad_seed_resync==0`, path-mix gzippy vs rapidgzip (`fulcrum model`)
-2. **Gate 4** — consumer ↔ resolve topology (publish-chain binding)
-3. **A2** — window sparsity (`getUsedWindowSymbols`)
+**Landed (structural, numbers confirm closed or slack):** Gate 1 tryToDecode propagate, A1 align, B1 pool_size, B2 rpmalloc, B4 dead pool, Gate 0 path-mix patches, Gate 4 harvest + widen predecessor lookup (`47a2c63`).
 
-**Done (awaiting measurement):** B2, B1, A1, Gate 1, B4 partial.
+**Gate 4 numbers (`47a2c63`, N=9 trustworthy):** Wall TIE vs pre-port; structure now includes vendor harvest (`:497-511`) and `get_predecessor` resolve-ahead. Numbers: `dispatch_recv` −30ms wall-crit; `L_resolve` still 2× RG — **remaining gap is serial publish work per link**, not “abandon Gate 4.” **Consumer lifecycle slice (uncommitted):** unified `consumer.window_publish` span; pool `replace_prefetch_if_present` on post-process complete (`PREFETCH_POST_PROCESS_PROMOTED`); `into_chunk_data` short-circuit when `arc.markers_resolved`. Next Fulcrum: `worker.decode` WA% vs causal; `dispatch_recv` / `L_resolve` vs Gate 4 baseline.
 
-**Gate 4 (`47a2c63`, trustworthy N=9 @ `/tmp/gzippy-locked-fulcrum-20260605-212215/`):** TIE on wall — interleaved T8 **1.013s** vs pre-Gate-4 **~0.95s**; trace **861ms** vs **~809ms** (+6%, noise). `dispatch_recv` wall-crit **243ms** (−30ms vs **~272ms** pre). `L_resolve` **20.5ms** vs RG **10.5ms** unchanged binding. N=3 run had sha-diverge (flaky); N=9 clean. **Verdict: keep harvest/resolve-ahead changes; not a wall lever — bootstrap engine next.**
-
-**Gate 4 (detail):** Vendor `waitForReplacedMarkers` (`GzipChunkFetcher.hpp:478-518`) blocks on the *current* chunk's `applyWindow` future but **non-blocking harvests** other ready futures from `m_markersBeingReplaced` and runs `queuePrefetchedChunkPostProcessing` during the wait. gzippy mirrors prefetch queue (`drain_one_pending` `:3283-3292`) but keeps a strict FIFO `pending` deque — `consumer.dispatch_recv` 268ms wall-crit @738dea6 is the serial wait for head `Async` post-process. rapidgzip `post_process.apply_window` 218ms busy sits off the consumer wall-crit path when work completed ahead of consume. Next: compare `EAGER_PROBE_*` / `markers_resolved` hit rate vs vendor `hasBeenPostProcessed` at `getBlock` time; re-Fulcrum after `f8490b3` RG path-mix spans.
+**Gate 4 (detail):** Vendor `waitForReplacedMarkers` (`GzipChunkFetcher.hpp:478-518`) blocks on the *current* chunk's `applyWindow` future but **non-blocking harvests** other ready futures from `m_markersBeingReplaced` and runs `queuePrefetchedChunkPostProcessing` during the wait. gzippy now mirrors harvest + in-cache promote on pool complete. Remaining structural delta: FIFO `pending` write order vs vendor write-as-ready ordering.
 
 **Do not prioritize:** A3 (C1 stale), B3 “fix” toward vendor. Fulcrum `[5] REMEDIATION` handoff/pred paths — **stale**, do not re-wire.
