@@ -430,7 +430,12 @@ fn finish_decode_chunk_impl(
 
     while !stopping_point_reached || wrapper.session_pending() {
         let prev_data_len = chunk.data.len();
-        let (seg_ptr, buffer_cap, out_pos_base) = if use_a3 {
+        // A3 only for the first 128 KiB of decoded payload (after the 32 KiB
+        // prefix). Beyond that, `read_stream` on `writable_tail` reuses the
+        // sliding window built during A3 — never call `set_window` mid-stream.
+        let a3_active = use_a3
+            && chunk.data.len().saturating_sub(chunk.data_prefix_len) < ALLOCATION_CHUNK_SIZE;
+        let (seg_ptr, buffer_cap, out_pos_base) = if a3_active {
             let (ptr, cap, out_pos) = chunk.data.a3_decode_view();
             (ptr, cap.saturating_sub(out_pos), out_pos)
         } else {
@@ -450,7 +455,7 @@ fn finish_decode_chunk_impl(
                 && !wrapper.session_pending())
         {
             let bit_before_read = wrapper.tell_compressed();
-            let r = if use_a3 {
+            let r = if a3_active {
                 let out_pos = out_pos_base + n_bytes_read;
                 let total_cap = out_pos_base + buffer_cap;
                 let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(seg_ptr, total_cap) };
@@ -557,7 +562,7 @@ fn finish_decode_chunk_impl(
         }
         if append_len > 0 {
             if chunk.configuration.crc32_enabled {
-                let kept: &[u8] = if use_a3 {
+                let kept: &[u8] = if a3_active {
                     unsafe { std::slice::from_raw_parts(seg_ptr.add(out_pos_base), append_len) }
                 } else {
                     unsafe { std::slice::from_raw_parts(seg_ptr, append_len) }
