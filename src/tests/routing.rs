@@ -958,6 +958,51 @@ mod tests {
         }
     }
 
+    /// mmap input slice (CLI file path) without fd writev.
+    #[test]
+    #[cfg(parallel_sm)]
+    fn test_silesia_parallel_sm_mmap_slice() {
+        let path = std::path::Path::new("benchmark_data/silesia-gzip.tar.gz");
+        if !path.exists() {
+            eprintln!("skip: silesia-gzip.tar.gz missing");
+            return;
+        }
+        let file = std::fs::File::open(path).expect("open silesia");
+        let mmap = unsafe { memmap2::Mmap::map(&file).expect("mmap silesia") };
+        let mut out = Vec::with_capacity(211_968_000);
+        crate::decompress::decompress_single_member(&mmap[..], &mut out, 8)
+            .expect("mmap parallel SM");
+        assert_eq!(out.len(), 211_968_000);
+        assert_eq!(crc32fast::hash(&out), 0xf9ac_f2fe);
+    }
+
+    /// CLI-shaped entry: mmap input + fd writev (no MARKER_PIPELINE_TEST_LOCK).
+    #[test]
+    #[cfg(all(parallel_sm, unix))]
+    fn test_silesia_parallel_sm_mmap_fd_cli_shape() {
+        use std::fs::File;
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+
+        let path = std::path::Path::new("benchmark_data/silesia-gzip.tar.gz");
+        if !path.exists() {
+            eprintln!("skip: silesia-gzip.tar.gz missing");
+            return;
+        }
+        let file = File::open(path).expect("open silesia");
+        let mmap = unsafe { memmap2::Mmap::map(&file).expect("mmap silesia") };
+        let mut sink = Vec::new();
+        let mut drain = tempfile::NamedTempFile::new().expect("tempfile");
+        let out_fd = Some(drain.as_raw_fd());
+        let nbytes =
+            crate::decompress::decompress_single_member_fd(&mmap[..], &mut sink, out_fd, 8)
+                .expect("mmap+fd parallel SM");
+        assert_eq!(nbytes, 211_968_000);
+        let got = std::fs::read(drain.path()).expect("read drain file");
+        assert_eq!(got.len(), 211_968_000);
+        assert_eq!(crc32fast::hash(&got), 0xf9ac_f2fe);
+    }
+
     /// High-entropy synthetic proxy — not gate 2 (real silesia.tar.gz).
     ///
     /// PRNG-compressed-via-flate2-best is adversarial: dense literals,
