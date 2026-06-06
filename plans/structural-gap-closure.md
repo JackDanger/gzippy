@@ -10,7 +10,11 @@
 
 **Headline:** Recent convergence is real and mostly faithful — dispatch, window map, output path (writev + vmsplice/SpliceVault), thread priorities, segmented buffers, and rpmalloc per-`Vec` with lazy per-thread init all match vendor. Two prior audit flags (C1, D3) are **stale** (dead code, not production path). Genuine remaining divergences are fewer than earlier audits implied.
 
-**Landed since `0462f88`:** Gate 1, A1, B1, B2, B4, Gate 0 (`0db757f`), Gate 4 harvest (`47a2c63`), `7bbe8da` Block bootstrap + hasBeenPostProcessed + worker.decode spans, `d47af52` harvest each consumer.iter, `8f8a90d` post_process.apply_window span, causal.window_publish vendor site tags (pending commit).
+**Landed since `0462f88`:** Gate 1, A1, B1, B2, B4, Gate 0 (`0db757f`), Gate 4 harvest (`47a2c63`), vendor `Block` bootstrap (`7bbe8da` gzip_chunk), harvest each `consumer.iter` (`d47af52`), `post_process.apply_window` span (`8f8a90d`).
+
+**Reverted (CRC32 on silesia-gzip/silesia-large):** `7bbe8da`/`86bf0a8` `hasBeenPostProcessed` lifecycle (`replace_prefetch_if_present`, `arc.markers_resolved` defer + `into_chunk_data` bypass). Root cause: eager resolve promoted cache entries without consumer `pred_key` validation → wrong bytes on drain. Re-land requires storing `resolved_pred_key` on `ChunkData` and gating take on exact match.
+
+**Fulcrum `86bf0a8` (pre-revert, N=3, trace only — wall diverged CRC):** T8 trace wall 1202ms vs RG 449ms; LEVER marker-resolve wc +508ms; causal 90.2% window-absent, KEY-MISMATCH 97%; `dispatch_recv` 271ms wc. Model `worker.decode` WA% broken (0% vs 97% RG) — outer spans lack mode tag on boundary_search path.
 
 ---
 
@@ -183,7 +187,7 @@ flowchart LR
 | Priority | Structural gap | Vendor anchor | What numbers still show |
 |----------|------------------|---------------|-------------------------|
 | 1 | **Bootstrap session** — finish path tuning after `Block` restore | `deflate.hpp` / `GzipChunk.hpp:661` | **Default engine now vendor `Block`** (was `MarkerRing`). Fulcrum: `worker.block_body` span may still show busy (gzippy-only span); measure wall + path-mix. `GZIPPY_MARKER_RING=1` keeps LUT ring for A/B. |
-| 2 | **Consumer publish / resolve** — `L_resolve` + write-as-ready ordering | `GzipChunkFetcher.hpp:478-583` | **LANDED (uncommitted):** unified `consumer.window_publish`; pool + harvest `replace_prefetch_if_present`; `EagerSubmitted` carries `cache_key`; `hasBeenPostProcessed` take path. Remaining: lone-Ready drain policy (correctness-gated). Await Fulcrum `dispatch_recv` / `L_resolve`. |
+| 2 | **Consumer publish / resolve** — `L_resolve` + write-as-ready ordering | `GzipChunkFetcher.hpp:478-583` | Harvest each `consumer.iter` **LANDED**. `hasBeenPostProcessed` in-cache promote **REVERTED** (CRC32). Fulcrum: `dispatch_recv` +271ms wc, `L_resolve` 2× RG. Next: re-land promote with `resolved_pred_key` gate; lone-Ready drain still correctness-gated. |
 | 3 | **`worker.decode` instrumentation** | `GzipChunkFetcher.hpp:712` | **LANDED (uncommitted):** per-attempt `window_absent` in `try_speculative_decode_candidate`; clean-only spans in `run_decode_task`. Re-run Fulcrum path-mix. |
 | 4 | **A2** window sparsity | `GzipChunk.hpp:60-133` | secondary until 1–2 close |
 

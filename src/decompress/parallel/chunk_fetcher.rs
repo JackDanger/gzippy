@@ -676,12 +676,6 @@ fn drive_impl<W: std::io::Write>(
             "  Eager harvest ready: {}",
             EAGER_HARVEST_READY.load(Ordering::Relaxed),
         );
-        eprintln!(
-            "  Prefetch post-process: promoted={} harvest_promoted={} already_resolved_take={}",
-            PREFETCH_POST_PROCESS_PROMOTED.load(Ordering::Relaxed),
-            PREFETCH_HARVEST_PROMOTED.load(Ordering::Relaxed),
-            PREFETCH_ALREADY_RESOLVED.load(Ordering::Relaxed),
-        );
         // Unified-decoder migration counters (reimplement-isa-l):
         //   handoff_window_grows ≈ num_worker_threads (one per thread, then
         //     flat) PROVES the per-chunk `clean_window: Vec<u8>` alloc is gone.
@@ -1038,13 +1032,8 @@ fn consumer_loop<W: std::io::Write>(
         }
         prefetch_us_sum += t_prefetch.elapsed().as_micros();
         // Vendor `waitForReplacedMarkers` (:497-511): non-blocking harvest of
-        // ready marker-replace futures on every consumer iteration, not only
-        // during dispatch/drain stalls.
-        harvest_ready_postprocess(
-            block_fetcher,
-            &mut prefetch_post_inflight,
-            &mut eager_completed,
-        );
+        // ready marker-replace futures on every consumer iteration.
+        harvest_ready_postprocess(&mut prefetch_post_inflight, &mut eager_completed);
 
         // Vendor GzipChunkFetcher.hpp:318 — `m_blockFinder->get(m_nextUnprocessedBlockIndex)`.
         let t_finder = std::time::Instant::now();
@@ -1428,18 +1417,7 @@ fn consumer_loop<W: std::io::Write>(
                 }
                 Err(arc) => {
                     let real_offset = arc.encoded_offset_bits;
-                    // Vendor `hasBeenPostProcessed`: keep the cache `shared_ptr`
-                    // when resolve-ahead already finished or is in flight.
-                    if arc.markers_resolved {
-                        use std::sync::atomic::Ordering;
-                        PREFETCH_ALREADY_RESOLVED.fetch_add(1, Ordering::Relaxed);
-                        trace_v2::emit_instant(
-                            "causal.has_been_post_processed",
-                            &format!(r#""start_bit":{},"site":"consumer_take""#, real_offset),
-                            "t",
-                        );
-                    }
-                    if arc.markers_resolved || prefetch_post_inflight.contains_key(&real_offset) {
+                    if prefetch_post_inflight.contains_key(&real_offset) {
                         ARC_DEFERRED_BORROW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         ConsumerChunkHold::Deferred { arc }
                     } else {
@@ -1489,15 +1467,32 @@ fn consumer_loop<W: std::io::Write>(
             // on the consumer only (vendor queueChunkForPostProcessing:558-575).
             // Mirror vendor `getLastWindow(*previousWindow)` — not `last_32kib`
             // alone, which ignores the predecessor chain at stream start.
+            // B/E span: its DURATION is the INDEPENDENT per-link serial
+            // resolve/publish work Fulcrum's `model` view reads as L_resolve
+            // (NOT the inter-publish gap — that conflation is the tautology).
+            // `end_bit` keys the publish so the model orders + de-dups links.
+            let _tv2 = trace_v2::SpanGuard::begin_with(
+                "consumer.window_publish_clean",
+                &format!(r#""end_bit":{chunk_end_bit},"had_markers":false"#),
+            );
             if let Some((_pred_key, pred)) = predecessor_window_for_markers(window_map, handoff_bit)
             {
-                let bytes = materialize_window(&pred);
-                consumer_publish_end_window_if_absent(
-                    chunk,
-                    chunk_end_bit,
-                    &bytes,
-                    window_map,
-                    false,
+                // Vendor queueChunkForPostProcessing:558 — only publish if not already
+                // published (the eager full-scan may have done it ahead).
+                if !window_map.contains(chunk_end_bit) {
+                    let bytes = materialize_window(&pred);
+                    let tail = chunk
+                        .last_32kib_window_vec()
+                        .unwrap_or_else(|| chunk.get_last_window_vec(&bytes));
+                    window_map.insert_owned_none(chunk_end_bit, tail);
+                }
+                trace_v2::emit_instant(
+                    "causal.window_publish",
+                    &format!(
+                        r#""start_bit":{},"end_bit":{chunk_end_bit},"site":"consumer_clean""#,
+                        chunk.encoded_offset_bits
+                    ),
+                    "t",
                 );
                 // TRANSLITERATION (vendor `queuePrefetchedChunkPostProcessing`,
                 // GzipChunkFetcher.hpp:520-551, called from waitForReplacedMarkers:513
@@ -1578,6 +1573,15 @@ fn consumer_loop<W: std::io::Write>(
                     )?;
                 }
             }
+            // B/E span: DURATION = INDEPENDENT serial marker-resolve/publish
+            // work (L_resolve) for the model view; `end_bit` keys the link.
+            // The blocking WAIT for the predecessor is the SEPARATE
+            // `consumer.wait_replaced_markers` span above, so this span is the
+            // resolve WORK only, not the wait.
+            let _tv2_pred = trace_v2::SpanGuard::begin_with(
+                "consumer.window_publish_marker",
+                &format!(r#""end_bit":{chunk_end_bit},"had_markers":true"#),
+            );
             let (pred_key, window) = confirmed_predecessor_window(window_map, handoff_bit)
                 .or_else(|| predecessor_window_for_markers(window_map, handoff_bit))
                 .ok_or(FetchError::Decode(ChunkDecodeError::ExactStopMissed {
@@ -1585,13 +1589,31 @@ fn consumer_loop<W: std::io::Write>(
                     actual: furthest_decoded_bit,
                 }))?;
             consumer_pred_key = Some(pred_key);
-            let window_bytes = materialize_window(&window);
-            consumer_publish_end_window_if_absent(
-                chunk,
-                chunk_end_bit,
-                &window_bytes,
-                window_map,
-                true,
+            // Vendor `GzipChunkFetcher.hpp:341`: `sharedLastWindow->
+            // decompress()` materializes the bytes once. For
+            // CompressionType::None this is a zero-alloc slice borrow.
+            // TRANSLITERATION (vendor queueChunkForPostProcessing, GzipChunkFetcher.hpp:558
+            // `if ( !m_windowMap->get( windowOffset ) )`): only compute+publish this chunk's
+            // end window if it is NOT already published. With the eager full-scan
+            // (queuePrefetchedChunkPostProcessing) publishing end-windows ahead, the consumer's
+            // recompute was REDUNDANT — measured get_last_window calls=102 for ~39 chunks
+            // (~1.5ms each). get_last_window is deterministic given the same predecessor, so
+            // the eager-published window is byte-identical; skipping the recompute is byte-exact.
+            if !window_map.contains(chunk_end_bit) {
+                let window_bytes = materialize_window(&window);
+                let tail = {
+                    let _tv2 = trace_v2::SpanGuard::begin("consumer.get_last_window");
+                    chunk.get_last_window_vec(&window_bytes)
+                };
+                window_map.insert_owned_none(chunk_end_bit, tail);
+            }
+            trace_v2::emit_instant(
+                "causal.window_publish",
+                &format!(
+                    r#""start_bit":{},"end_bit":{chunk_end_bit},"site":"consumer_marker""#,
+                    chunk.encoded_offset_bits
+                ),
+                "t",
             );
             // TRANSLITERATION (vendor queuePrefetchedChunkPostProcessing, full sorted
             // scan on every consumed chunk; see clean-branch note above). `None`
@@ -1690,11 +1712,7 @@ fn consumer_loop<W: std::io::Write>(
         // queue as immediately-ready for ordered write.
         {
             let _tv2 = trace_v2::SpanGuard::begin("consumer.dispatch_post_process");
-            harvest_ready_postprocess(
-                block_fetcher,
-                &mut prefetch_post_inflight,
-                &mut eager_completed,
-            );
+            harvest_ready_postprocess(&mut prefetch_post_inflight, &mut eager_completed);
             let (chunk, eager_already_done) = chunk_holder.into_chunk_data(
                 &mut prefetch_post_inflight,
                 &mut eager_completed,
@@ -1713,7 +1731,7 @@ fn consumer_loop<W: std::io::Write>(
                 Some(window) => {
                     use std::sync::atomic::Ordering;
                     let reuse = match prefetch_post_inflight.remove(&chunk_offset_pre_set) {
-                        Some((eager_pred_key, _, eager_rx))
+                        Some((eager_pred_key, eager_rx))
                             if consumer_pred_key == Some(eager_pred_key) =>
                         {
                             EAGER_PROBE_REUSED.fetch_add(1, Ordering::Relaxed);
@@ -2059,7 +2077,7 @@ fn submit_decode_to_pool(
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 fn eager_postprocess_prefetched(
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
+    block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
     window_map: &WindowMap,
     thread_pool: &Arc<ThreadPool>,
     in_flight: &mut EagerSubmitted,
@@ -2099,27 +2117,15 @@ fn submit_post_process_to_pool(
 /// the consumer thread (vendor queues work; the clone happens on the pool).
 #[cfg(parallel_sm)]
 fn submit_post_process_from_prefetch(
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
     thread_pool: &Arc<ThreadPool>,
-    cache_key: usize,
     arc: Arc<ChunkData>,
     resolve_offset: usize,
     predecessor_window: Window,
 ) -> mpsc::Receiver<ChunkData> {
-    let bf = Arc::clone(block_fetcher);
     submit_post_process_task(thread_pool, move || {
-        // Vendor mutates the same `shared_ptr` payload when unique; clone only
-        // when other refs (cache + consumer `Deferred`) still hold the Arc.
-        let mut working = match Arc::try_unwrap(arc) {
-            Ok(owned) => owned,
-            Err(shared) => (*shared).clone(),
-        };
-        reanchor_chunk_to_handoff(&mut working, resolve_offset);
-        let resolved = run_post_process_task(working, predecessor_window);
-        if bf.replace_prefetch_if_present(cache_key, Arc::new(resolved.clone())) {
-            PREFETCH_POST_PROCESS_PROMOTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        resolved
+        let mut chunk_clone = (*arc).clone();
+        reanchor_chunk_to_handoff(&mut chunk_clone, resolve_offset);
+        run_post_process_task(chunk_clone, predecessor_window)
     })
 }
 
@@ -2256,11 +2262,33 @@ fn run_decode_task(
     let until_exact = window_at_offset.is_some() && params.stop_hint_is_exact;
 
     let decode_mode_clean = params.start_bit == 0 || window_at_offset.is_some();
+    // Fulcrum `model` reads `worker.decode` span mode tags (rapidgzip patch uses
+    // clean | window_absent). Keep boundary_search on causal instants only.
+    let worker_decode_mode = if decode_mode_clean {
+        "clean"
+    } else {
+        "window_absent"
+    };
     let mode_str = if decode_mode_clean {
         "clean"
     } else {
         "boundary_search"
     };
+    let _tv2_decode = trace_v2::SpanGuard::begin_with(
+        "worker.decode",
+        &format!(
+            r#""start_bit":{},"mode":"{worker_decode_mode}""#,
+            params.start_bit
+        ),
+    );
+    trace_v2::emit_instant(
+        "worker.decode_mode",
+        &format!(
+            r#""start_bit":{},"mode":"{worker_decode_mode}","pred_available":false"#,
+            params.start_bit
+        ),
+        "t",
+    );
     trace_v2::emit_instant(
         "causal.decode_decision",
         &format!(
@@ -2276,18 +2304,6 @@ fn run_decode_task(
     );
 
     let chunk_result = if params.start_bit == 0 {
-        let _tv2_decode = trace_v2::SpanGuard::begin_with(
-            "worker.decode",
-            &format!(r#""start_bit":{},"mode":"clean""#, params.start_bit),
-        );
-        trace_v2::emit_instant(
-            "worker.decode_mode",
-            &format!(
-                r#""start_bit":{},"mode":"clean","pred_available":false"#,
-                params.start_bit
-            ),
-            "t",
-        );
         decode_chunk_with_until_exact(
             input_bytes,
             params.start_bit,
@@ -2297,18 +2313,6 @@ fn run_decode_task(
             configuration,
         )
     } else if let Some(w) = window_at_offset.as_ref() {
-        let _tv2_decode = trace_v2::SpanGuard::begin_with(
-            "worker.decode",
-            &format!(r#""start_bit":{},"mode":"clean""#, params.start_bit),
-        );
-        trace_v2::emit_instant(
-            "worker.decode_mode",
-            &format!(
-                r#""start_bit":{},"mode":"clean","pred_available":false"#,
-                params.start_bit
-            ),
-            "t",
-        );
         let bytes = materialize_window(w);
         decode_chunk_with_until_exact(
             input_bytes,
@@ -2417,44 +2421,6 @@ fn resolve_chunk_markers_on_chunk(chunk: &mut ChunkData, predecessor_window: &[u
     chunk.markers_resolved = true;
 }
 
-/// Vendor `queueChunkForPostProcessing` end-window publish
-/// (GzipChunkFetcher.hpp:558-574): unified `consumer.window_publish` span.
-#[cfg(parallel_sm)]
-fn consumer_publish_end_window_if_absent(
-    chunk: &ChunkData,
-    chunk_end_bit: usize,
-    predecessor_bytes: &[u8],
-    window_map: &WindowMap,
-    had_markers: bool,
-) {
-    let _tv2 = trace_v2::SpanGuard::begin_with(
-        "consumer.window_publish",
-        &format!(
-            r#""start_bit":{},"end_bit":{chunk_end_bit},"site":"consumer","had_markers":{had_markers}"#,
-            chunk.encoded_offset_bits
-        ),
-    );
-    if !window_map.contains(chunk_end_bit) {
-        let tail = if had_markers {
-            let _tv2 = trace_v2::SpanGuard::begin("consumer.get_last_window");
-            chunk.get_last_window_vec(predecessor_bytes)
-        } else {
-            chunk
-                .last_32kib_window_vec()
-                .unwrap_or_else(|| chunk.get_last_window_vec(predecessor_bytes))
-        };
-        window_map.insert_owned_none(chunk_end_bit, tail);
-        trace_v2::emit_instant(
-            "causal.window_publish",
-            &format!(
-                r#""start_bit":{},"end_bit":{chunk_end_bit},"site":"consumer","had_markers":{had_markers}"#,
-                chunk.encoded_offset_bits
-            ),
-            "t",
-        );
-    }
-}
-
 /// Predecessor window for marker `apply_window` — vendor `WindowMap::get(*nextBlockOffset)`
 /// (GzipChunkFetcher.hpp:478-518), exact confirmed handoff key only.
 #[cfg(parallel_sm)]
@@ -2503,13 +2469,12 @@ fn reanchor_chunk_to_handoff(chunk: &mut ChunkData, handoff_bit: usize) {
 }
 
 /// Vendor `queuePrefetchedChunkPostProcessing` (GzipChunkFetcher.hpp:520-551).
-/// Submits pool `run_post_process_task` on prefetched clones; on completion
-/// replaces the cache entry in place (vendor `hasBeenPostProcessed`).
-/// `handoff_key`: `Some(k)` after a confirmed tail publish
+/// Submits pool `run_post_process_task` on prefetched clones (never mutates
+/// the cached `Arc`). `handoff_key`: `Some(k)` after a confirmed tail publish
 /// at `k` (resolve-ahead chain); `None` scans the whole cache during a stall.
 #[cfg(parallel_sm)]
 fn queue_prefetched_marker_postprocess(
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
+    block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
     window_map: &WindowMap,
     thread_pool: &Arc<ThreadPool>,
     in_flight: &mut EagerSubmitted,
@@ -2587,26 +2552,19 @@ fn queue_prefetched_marker_postprocess(
             let chunk_end_bit = arc.encoded_offset_bits + arc.encoded_size_bits;
             if !window_map.contains(chunk_end_bit) {
                 let pred_bytes = materialize_window(&predecessor_window);
-                consumer_publish_end_window_if_absent(
-                    arc.as_ref(),
-                    chunk_end_bit,
-                    &pred_bytes,
-                    window_map,
-                    !arc.data_with_markers.is_empty(),
-                );
+                let end_window = arc.get_last_window(pred_bytes.as_ref());
+                window_map.insert_owned_none(chunk_end_bit, end_window.to_vec());
                 PUBLISH_AHEAD_WINDOWS.fetch_add(1, Ordering::Relaxed);
                 EARLY_WINDOW_PUBLISHED.fetch_add(1, Ordering::Relaxed);
             }
         }
         let rx = submit_post_process_from_prefetch(
-            block_fetcher,
             thread_pool,
-            cache_key,
             Arc::clone(&arc),
             resolve_anchor,
             predecessor_window,
         );
-        in_flight.insert(real_offset, (pred_key, cache_key, rx));
+        in_flight.insert(real_offset, (pred_key, rx));
         submitted += 1;
         if handoff_key.is_some() {
             RESOLVE_AHEAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
@@ -2841,16 +2799,6 @@ pub static REANCHOR_AFTER_POSTPROCESS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static PUBLISH_AHEAD_WINDOWS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-/// Prefetch cache entries updated in place after pool post-process
-/// (vendor `hasBeenPostProcessed` on the same `shared_ptr`).
-pub static PREFETCH_POST_PROCESS_PROMOTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Consumer took a prefetch/cache `Arc` that already carried `markers_resolved`.
-pub static PREFETCH_ALREADY_RESOLVED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Harvest path promoted a resolved chunk into the prefetch cache.
-pub static PREFETCH_HARVEST_PROMOTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -2919,7 +2867,7 @@ pub static ARC_DEFERRED_INFLIGHT_RECV: std::sync::atomic::AtomicU64 =
 /// receiver when it reaches that offset, after validating the predecessor
 /// key still matches (byte-identity guard).
 #[cfg(parallel_sm)]
-type EagerSubmitted = std::collections::HashMap<usize, (usize, usize, mpsc::Receiver<ChunkData>)>;
+type EagerSubmitted = std::collections::HashMap<usize, (usize, mpsc::Receiver<ChunkData>)>;
 /// Harvested eager post-process results (vendor non-blocking `future.get()`).
 #[cfg(parallel_sm)]
 type EagerCompleted = std::collections::HashMap<usize, (usize, ChunkData)>;
@@ -2927,28 +2875,21 @@ type EagerCompleted = std::collections::HashMap<usize, (usize, ChunkData)>;
 /// Vendor `waitForReplacedMarkers` (:497-511): poll ready marker-replace
 /// futures without blocking the consumer on non-head chunks.
 #[cfg(parallel_sm)]
-fn harvest_ready_postprocess(
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
-    in_flight: &mut EagerSubmitted,
-    completed: &mut EagerCompleted,
-) {
+fn harvest_ready_postprocess(in_flight: &mut EagerSubmitted, completed: &mut EagerCompleted) {
     use std::sync::atomic::Ordering;
     use std::sync::mpsc::TryRecvError;
     let offsets: Vec<usize> = in_flight.keys().copied().collect();
     for offset in offsets {
-        let Some((pred_key, cache_key, rx)) = in_flight.remove(&offset) else {
+        let Some((pred_key, rx)) = in_flight.remove(&offset) else {
             continue;
         };
         match rx.try_recv() {
             Ok(chunk) => {
-                if block_fetcher.replace_prefetch_if_present(cache_key, Arc::new(chunk.clone())) {
-                    PREFETCH_HARVEST_PROMOTED.fetch_add(1, Ordering::Relaxed);
-                }
                 completed.insert(offset, (pred_key, chunk));
                 EAGER_HARVEST_READY.fetch_add(1, Ordering::Relaxed);
             }
             Err(TryRecvError::Empty) => {
-                in_flight.insert(offset, (pred_key, cache_key, rx));
+                in_flight.insert(offset, (pred_key, rx));
             }
             Err(TryRecvError::Disconnected) => {}
         }
@@ -2987,14 +2928,8 @@ impl ConsumerChunkHold {
         pred_key: Option<usize>,
     ) -> (ChunkData, bool) {
         match self {
-            Self::Owned(c) => {
-                let already = c.markers_resolved;
-                (c, already)
-            }
+            Self::Owned(c) => (c, false),
             Self::Deferred { arc } => {
-                if arc.markers_resolved {
-                    return ((*arc).clone(), true);
-                }
                 let real_offset = arc.encoded_offset_bits;
                 if let Some((eager_pred_key, chunk)) = completed.remove(&real_offset) {
                     if pred_key == Some(eager_pred_key) {
@@ -3004,7 +2939,7 @@ impl ConsumerChunkHold {
                     completed.insert(real_offset, (eager_pred_key, chunk));
                 }
                 match inflight.remove(&real_offset) {
-                    Some((eager_pred_key, _cache_key, rx)) if pred_key == Some(eager_pred_key) => {
+                    Some((eager_pred_key, rx)) if pred_key == Some(eager_pred_key) => {
                         ARC_DEFERRED_INFLIGHT_RECV
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         EAGER_PROBE_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3016,10 +2951,10 @@ impl ConsumerChunkHold {
                         });
                         (chunk, true)
                     }
-                    Some((eager_pred_key, cache_key, rx)) => {
+                    Some((eager_pred_key, rx)) => {
                         EAGER_PROBE_REUSE_PRED_MISMATCH
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        inflight.insert(real_offset, (eager_pred_key, cache_key, rx));
+                        inflight.insert(real_offset, (eager_pred_key, rx));
                         ARC_TRY_UNWRAP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         ((*arc).clone(), false)
                     }
@@ -3112,20 +3047,6 @@ fn try_speculative_decode_candidate(
     configuration: ChunkConfiguration,
     _window_map: &WindowMap,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    // Vendor tryToDecode + decodeBlock `worker.decode` span: nullopt window
-    // (GzipChunk.hpp:719-720, GzipChunkFetcher.hpp decodeBlock ~717).
-    let _tv2_decode = trace_v2::SpanGuard::begin_with(
-        "worker.decode",
-        &format!(r#""start_bit":{},"mode":"window_absent""#, partition_seed),
-    );
-    trace_v2::emit_instant(
-        "worker.decode_mode",
-        &format!(
-            r#""start_bit":{},"mode":"window_absent","pred_available":false"#,
-            partition_seed
-        ),
-        "t",
-    );
     let result = decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration);
     // V1: classify failures so we know which fix to attack.
     //   header_fail  → "deflate header at bit X" — could be caught by
@@ -3384,7 +3305,7 @@ fn drain_ready_pending_heads<W: std::io::Write>(
     out_fd: Option<i32>,
     total_crc: &mut CRC32Calculator,
     total_size: &mut usize,
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
+    block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
     thread_pool: &Arc<ThreadPool>,
     eager_inflight: &mut EagerSubmitted,
     eager_completed: &mut EagerCompleted,
@@ -3426,7 +3347,7 @@ fn drain_one_pending<W: std::io::Write>(
     out_fd: Option<i32>,
     total_crc: &mut CRC32Calculator,
     total_size: &mut usize,
-    block_fetcher: &Arc<BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>>,
+    block_fetcher: &BlockFetcher<usize, Arc<ChunkData>, FetchMultiStream, ChunkDecodeError>,
     // Eager post-process context (GZIPPY_EAGER_POSTPROC=1). When the head
     // pending write is an in-flight post-process (`Async`), the consumer is
     // about to BLOCK on `rx.recv()` (the `wait.future_recv` span — the
@@ -3441,7 +3362,7 @@ fn drain_one_pending<W: std::io::Write>(
 ) -> Result<(), FetchError> {
     let _tv2 = trace_v2::SpanGuard::begin("consumer.drain");
     if let Some((_, in_flight, completed)) = eager_ctx.as_mut() {
-        harvest_ready_postprocess(block_fetcher, in_flight, completed);
+        harvest_ready_postprocess(in_flight, completed);
     }
     let head = match pending.pop_front() {
         Some(h) => h,
@@ -3506,7 +3427,6 @@ fn drain_one_pending<W: std::io::Write>(
             )));
         };
         let bytes = materialize_window(&predecessor_window);
-        let _tv2 = trace_v2::SpanGuard::begin("post_process.apply_window");
         resolve_chunk_markers_on_chunk(&mut chunk, bytes.as_ref());
     }
     if std::env::var_os("GZIPPY_TRACE_DRAIN").is_some() {
