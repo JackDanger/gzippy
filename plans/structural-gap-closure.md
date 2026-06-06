@@ -8,11 +8,32 @@
 
 **Headline:** Recent convergence is real and mostly faithful — dispatch, window map, output path (writev + vmsplice/SpliceVault), thread priorities, segmented buffers, and rpmalloc per-`Vec` with lazy per-thread init all match vendor. Two prior audit flags (C1, D3) are **stale** (dead code, not production path). Genuine remaining divergences are fewer than earlier audits implied.
 
-**Landed since `0462f88` (head `738dea6`):** Gate 1 (`bad_seed_resync` removed), A1 (64-byte ring/scratch align), B1 (logical `pool_size`), B2 (rpmalloc default alloc), B4 (`take_std_u16` deleted), Gate 0 bench hook (rapidgzip `patch_model_params` on guest). **Pending Fulcrum** at `738dea6` to measure wall + path-mix delta vs snapshot below.
+**Landed since `0462f88`:** Gate 1, A1, B1, B2, B4, Gate 0 bench hook (`0db757f`), `resumable_resync` deleted (`f8490b3`).
 
 ---
 
-## Fulcrum behavioral snapshot (`0462f88`, T8 trace)
+## Fulcrum behavioral snapshot (`738dea6`, `/tmp/gzippy-locked-fulcrum-20260605-203323/`)
+
+| Metric | gzippy | rapidgzip | Δ vs `0462f88` gzippy |
+|--------|--------|-----------|------------------------|
+| T16 wall (interleaved min) | 0.9460s | 0.4743s | −4.1% wall (532 vs 511 MB/s) |
+| T8 trace wall | 807ms | 452ms | −1.6% trace wall |
+| Decode decisions | 41 (4 clean, 37 window-absent) | — | unchanged |
+| Runtime window-absent | 90.2% | — | unchanged |
+| KEY-MISMATCH | 36/37 | — | unchanged |
+| `bad_seed_resync` | **0** | — | Gate 1 verified |
+| `worker.block_body` busy | 1960ms | 0ms | −1% (A1 noise) |
+| Publish-chain model | binds (802ms pred) | slack (207ms pred vs 452ms obs) | RG `worker.decode` spans=0 — **patch not in binary @738dea6** |
+
+**Path mix (gzippy verbose):** `flip_to_clean=29`, `bad_seed_resync=0`, `pred@seed=0`, `handoff_window_grows=0`.
+
+**Gate 4 signal (T8):** `consumer.dispatch_recv` 268ms wall-crit; `post_process.resolve_markers` 130ms busy off wall; rapidgzip `post_process.apply_window` 218ms busy, 0 wall-crit — resolve topology diverges (gzippy consumer waits on pool post-process).
+
+**A1/B1/B2:** No measurable wall win at T16 (within 2.4% sd); bootstrap + KEY-MISMATCH dominate.
+
+---
+
+## Fulcrum behavioral snapshot (`0462f88`, T8 trace) — baseline
 
 | Metric | gzippy | rapidgzip |
 |--------|--------|-----------|
