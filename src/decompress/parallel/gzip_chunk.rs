@@ -218,12 +218,32 @@ pub fn decode_chunk_with_rapidgzip(
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
+    decode_chunk_with_rapidgzip_until_exact(
+        input,
+        encoded_offset_bits,
+        stop_hint_bits,
+        initial_window,
+        configuration,
+        false,
+    )
+}
+
+#[cfg(parallel_sm)]
+pub fn decode_chunk_with_rapidgzip_until_exact(
+    input: &[u8],
+    encoded_offset_bits: usize,
+    stop_hint_bits: usize,
+    initial_window: &[u8],
+    configuration: ChunkConfiguration,
+    until_exact: bool,
+) -> Result<ChunkData, ChunkDecodeError> {
     decode_chunk_with_rapidgzip_impl(
         input,
         encoded_offset_bits,
         stop_hint_bits,
         initial_window,
         configuration,
+        until_exact,
     )
 }
 
@@ -237,25 +257,95 @@ pub fn decode_chunk(
     initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    decode_chunk_with_rapidgzip(
+    decode_chunk_until_exact(
         input,
         encoded_offset_bits,
         stop_hint_bits,
         initial_window,
         configuration,
+        false,
     )
 }
 
-/// Option A3+A4 dispatch (`plans/unified-decoder.md` §6, commits
-/// `9e14bbe`/`757e7a4`/`a6076e1`). Pre-fills `chunk.data[0..32K]` with
-/// the predecessor's window image so every back-reference hits the
-/// AVX2 fast path; the consumer skips `chunk.data[..data_prefix_len]`
-/// when writing.
-///
-/// Measured +4.2% T=16 silesia on neurotic, byte-perfect across 11
-/// P2 unified clean tail (vendor `finishDecodeChunkWithInexactOffset`,
-/// GzipChunk.hpp:280-410): ISA-L LUT bulk loop first; ResumableInflate2 only
-/// when lookback is unavailable (< 32 KiB predecessor).
+#[cfg(parallel_sm)]
+pub fn decode_chunk_until_exact(
+    input: &[u8],
+    encoded_offset_bits: usize,
+    stop_hint_bits: usize,
+    initial_window: &[u8],
+    configuration: ChunkConfiguration,
+    until_exact: bool,
+) -> Result<ChunkData, ChunkDecodeError> {
+    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
+
+    if initial_window.len() == MAX_WINDOW_SIZE && until_exact {
+        return decode_chunk_with_inflate_wrapper(
+            input,
+            encoded_offset_bits,
+            stop_hint_bits,
+            initial_window,
+            configuration,
+        );
+    }
+
+    decode_chunk_with_rapidgzip_until_exact(
+        input,
+        encoded_offset_bits,
+        stop_hint_bits,
+        initial_window,
+        configuration,
+        until_exact,
+    )
+}
+
+/// Vendor `decodeChunkWithInflateWrapper` shape: exact known-window decode
+/// using the inflate wrapper only.
+#[cfg(parallel_sm)]
+fn decode_chunk_with_inflate_wrapper(
+    input: &[u8],
+    encoded_offset_bits: usize,
+    stop_hint_bits: usize,
+    initial_window: &[u8],
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
+    finish_decode_chunk_impl(
+        &mut chunk,
+        input,
+        encoded_offset_bits,
+        stop_hint_bits,
+        initial_window,
+        true,
+        true,
+    )?;
+    Ok(chunk)
+}
+
+/// Vendor `finishDecodeChunkWithInexactOffset` shape. Continues a chunk with a
+/// known clean 32 KiB window, stopping at the first deflate boundary at-or-past
+/// `stop_hint_bits` (or exactly at it on the exact path).
+#[cfg(parallel_sm)]
+fn finish_decode_chunk_with_inexact_offset(
+    chunk: &mut ChunkData,
+    input: &[u8],
+    inflate_start_bit: usize,
+    stop_hint_bits: usize,
+    initial_window: &[u8],
+    record_decode_duration: bool,
+) -> Result<(), ChunkDecodeError> {
+    finish_decode_chunk_impl(
+        chunk,
+        input,
+        inflate_start_bit,
+        stop_hint_bits,
+        initial_window,
+        record_decode_duration,
+        false,
+    )
+}
+
+/// Internal bad-seed recovery only. Production success-path dispatch stays on
+/// vendor `decodeChunk` / `decodeChunkWithRapidgzip` / `finishDecode...`.
 #[cfg(parallel_sm)]
 fn resumable_resync(
     chunk: &mut ChunkData,
@@ -265,135 +355,64 @@ fn resumable_resync(
     initial_window: &[u8],
     record_decode_duration: bool,
 ) -> Result<(), ChunkDecodeError> {
-    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
-
-    // `worker.isal_stream_inflate` span — wraps every invocation of
-    // gzippy's ISA-L stream-inflate path. Both call sites land here:
-    //   (a) the post-bootstrap call at gzip_chunk.rs:549 (after the
-    //       pure-Rust phase-1 produces a clean 32 KiB window)
-    //   (b) the non-speculative direct path via `decode_chunk`
-    //       at gzip_chunk.rs:150 (when the predecessor window is
-    //       already known and bootstrap is skipped)
-    //
-    // Pre-instrumentation the only proxy for ISA-L bulk-inflate time
-    // was `decode_chunk dur - bootstrap dur` — a derived value with
-    // no per-call visibility. With this span we can answer the
-    // post-Fix-#3 question: is the 1.5x per-chunk gap to vendor in
-    // bootstrap or in ISA-L bulk inflate?
-    //
-    // Args: `start_bit` (where decode starts) + `stop_hint` + a
-    // `has_window` flag distinguishing the two call paths above.
-    let t_decode = std::time::Instant::now();
-
-    // Option A3 (always on): pre-fill segment 0 with the predecessor's
-    // 32 KiB window so back-references hit copy_match_fast via
-    // `output[..out_pos]`. The consumer skips `data_prefix_len` when writing (A4).
-    let full_window_tail = initial_window.len() == MAX_WINDOW_SIZE;
-    // A3: seed lookback into `chunk.data[0..32K]` once, before any tail bytes.
-    // Resumable `set_window` must stay empty when prefilled — otherwise the
-    // 32 KiB window is applied twice (bulk + resumable ring) and stored blocks
-    // decode with wrong lengths.
-    if full_window_tail && chunk.data.is_empty() {
-        chunk.prefill_window_prefix(initial_window);
-    }
-    let resumable_window: &[u8] = if chunk.data_prefix_len >= MAX_WINDOW_SIZE {
-        &[]
-    } else {
-        initial_window
-    };
-
-    // Bad-seed RE-SYNC ONLY: this function is now reached solely as the internal
-    // fallback when the unified marker driver fails on a 4 MiB speculative seed.
-    // The bulk-LUT clean tail (finish_decode_chunk_bulk_lut) is deleted — it only
-    // ever declined here on a non-boundary seed anyway. ResumableInflate2 re-syncs
-    // from `inflate_start_bit` (the goal's accepted resumable re-sync).
     BULK_TAIL_RESUMABLE_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    finish_decode_chunk_impl(
+        chunk,
+        input,
+        inflate_start_bit,
+        stop_hint_bits,
+        initial_window,
+        record_decode_duration,
+        false,
+    )
+}
+
+#[cfg(parallel_sm)]
+fn finish_decode_chunk_impl(
+    chunk: &mut ChunkData,
+    input: &[u8],
+    inflate_start_bit: usize,
+    stop_hint_bits: usize,
+    initial_window: &[u8],
+    record_decode_duration: bool,
+    until_exact: bool,
+) -> Result<(), ChunkDecodeError> {
+    let t_decode = std::time::Instant::now();
     let _tv2 = crate::decompress::parallel::trace_v2::SpanGuard::begin_with(
-        "worker.stream_inflate",
+        "worker.isal_stream_inflate",
         &format!(
-            r#""start_bit":{inflate_start_bit},"stop_hint":{stop_hint_bits},"has_window":{}"#,
-            !initial_window.is_empty()
+            r#""start_bit":{inflate_start_bit},"stop_hint":{stop_hint_bits},"has_window":{},"until_exact":{}"#,
+            !initial_window.is_empty(),
+            until_exact
         ),
     );
-    // `stop_hint_bits` is an inexact stop *hint* (vendor `untilOffset`), not a hard
-    // read cap. Capping `refill_buffer` at a partition guess stops mid-block
-    // (e.g. silesia gzip-9 at 33554427 vs hint 33554432 → InvalidBlock on resume).
-    let read_cap = input.len() * 8;
+
+    let read_cap = if until_exact {
+        stop_hint_bits
+    } else {
+        input.len() * 8
+    };
     let mut wrapper = IsalInflateWrapper::with_until_bits(input, inflate_start_bit, read_cap)?;
-    wrapper.set_window(resumable_window)?;
-    // COALESCE (rapidgzip parity): decode many deflate blocks per read_stream
-    // call (warm FASTLOOP, like ISA-L's readStream) instead of returning at every
-    // block boundary. END_OF_BLOCK now returns only at the first pre-header EOB
-    // whose bit position reaches `stop_hint_bits` (the chunk's partition end);
-    // the boundaries crossed before that are recorded inline and drained below.
-    // END_OF_BLOCK_HEADER is dropped — stopping at the pre-header EOB subsumes its
-    // `not_fixed` guard (we never parse the post-stop_hint header).
+    wrapper.set_window(initial_window)?;
     wrapper.set_stopping_points(
         StoppingPoints::END_OF_BLOCK
-            | StoppingPoints::END_OF_STREAM_HEADER
-            | StoppingPoints::END_OF_STREAM,
+            | StoppingPoints::END_OF_BLOCK_HEADER
+            | StoppingPoints::END_OF_STREAM_HEADER,
     );
-    wrapper.set_coalesce_stop_hint(stop_hint_bits);
+    if !until_exact {
+        wrapper.set_coalesce_stop_hint(stop_hint_bits);
+    }
 
     let mut stopping_point_reached = false;
     let mut last_end_bit = inflate_start_bit;
     let mut last_eob_pos = inflate_start_bit;
-    let mut last_eob_decoded_bytes: usize = chunk.data.len();
-    let mut already_decoded: usize = 0;
-    // Set once the decoder reaches the genuine end of the input (final
-    // gzip member's footer consumed, or ISA-L reports `finished`). When
-    // true the chunk finalizes at `last_end_bit` (post-footer / post-
-    // final-block), NOT at `last_eob_pos` — the latter is the boundary
-    // BEFORE the BFINAL block, so finalizing there drops the final block
-    // from the chunk's encoded range and the consumer re-decodes it,
-    // duplicating its bytes in the output.
-    let mut reached_stream_end = false;
+    let mut last_eob_decoded_bytes: usize = chunk.decoded_size();
+    let mut already_decoded: usize = chunk.decoded_size();
     let mut pending_stop_after_flush = false;
-    // §5 step 5 (NEW wrapper / ResumableInflate2): the pure-rust backend no
-    // longer has a `session` accumulator, so `session_pending()` is always
-    // false. The old "keep looping to drain session" behavior (a6c0a8b) would
-    // run past the partition boundary, clobbering `last_end_bit` with the
-    // bit_position of the NEXT block's header — successor chunks would then
-    // resume at a non-block-boundary and decode garbage Huffman tables. With
-    // ResumableInflate2 the inner loop must STOP as soon as
-    // `pending_stop_after_flush` fires, same as the isal-only build.
     const STOP_INNER_ON_PENDING_FLUSH: bool = true;
 
     while !stopping_point_reached || wrapper.session_pending() {
-        // Write ISA-L output DIRECTLY into chunk.data's spare capacity.
-        // Previous version allocated a fresh `ALLOCATION_CHUNK_SIZE`
-        // (128 KiB) buffer per outer iteration, ran ISA-L into it, then
-        // called `append_owned_buffer` which either replaced
-        // chunk.data (first call — losing the 80 MiB pre-allocated
-        // pool buffer) or extend_from_slice'd it (subsequent calls —
-        // paying a memcpy + grow page faults). Per the bench-sm
-        // perf-dwarf profile this accounted for ~3.4% of total cycles
-        // (`append_owned_buffer → Vec::extend_from_slice → page fault`).
-        //
-        // Vendor pattern: `GzipChunk::readBlock` writes directly into
-        // the chunk's vector via `next_out`; no intermediate buffer.
-        // gzippy's `ChunkData::note_clean_bytes_written_in_place`
-        // helper was already in place (chunk_data.rs:405) — this just
-        // wires it up.
         let prev_data_len = chunk.data.len();
-        // FOOTPRINT-ALIGN: `chunk.data` is a `SegmentedU8`. Acquire a fresh
-        // 128 KiB segment tail to decode this outer iteration into. The
-        // returned slice is exactly ALLOCATION_CHUNK_SIZE bytes (a brand-new
-        // segment if the prior tail was full) — uninitialized but writable.
-        // We write into it across the inner `read_stream` calls, then
-        // `commit(append_len)` the bytes we keep. Back-refs reaching before
-        // this segment resolve via the wrapper's internal 32 KiB window ring
-        // (resumable.rs:653 feeds each call's output into `state.window`), so
-        // segment boundaries are transparent to correctness — vendor's
-        // `DecodedData::append` segments output the same way
-        // (DecodedData.hpp:243-289).
-        // `writable_tail` returns the CURRENT tail segment's spare — which is
-        // a FULL 128 KiB when the prior outer iteration filled (or there was
-        // none), or a partial remainder when the prior commit left the tail
-        // non-full. Either way `buffer_cap` is the real writable spare; the
-        // inner loop respects it and the outer loop simply runs again to fill
-        // the next segment. (No fixed-128KiB assumption — that was wrong for
-        // partially-committed tails and tripped the 2 MB decode test.)
         let seg_tail: &mut [u8] = chunk.data.writable_tail();
         let seg_ptr = seg_tail.as_mut_ptr();
         let buffer_cap = seg_tail.len();
@@ -401,7 +420,6 @@ fn resumable_resync(
         let mut last_per_call: usize = 0;
         let mut last_stopped_at = StoppingPoints::NONE;
         let mut last_finished = false;
-        let mut end_of_stream_hit = false;
 
         let decode_base = already_decoded;
         while n_bytes_read < buffer_cap
@@ -411,22 +429,10 @@ fn resumable_resync(
                 && !wrapper.session_pending())
         {
             let bit_before_read = wrapper.tell_compressed();
-            // A3: decode into segment 0's full backing store so back-refs
-            // resolve via `output[..out_pos]` (includes the prefilled window).
-            // Non-A3 / multi-segment: spare slice on the tail segment only;
-            // cross-chunk refs use the wrapper's window ring.
-            let r = if full_window_tail && chunk.data.all_in_first_segment() {
-                let out_buf = chunk.data.first_segment_a3_output();
-                wrapper.read_stream_starting_at(out_buf, prev_data_len + n_bytes_read)?
-            } else {
-                let spare: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        seg_ptr.add(n_bytes_read),
-                        buffer_cap - n_bytes_read,
-                    )
-                };
-                wrapper.read_stream(spare)?
+            let spare: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(seg_ptr.add(n_bytes_read), buffer_cap - n_bytes_read)
             };
+            let r = wrapper.read_stream(spare)?;
             last_per_call = r.bytes_written;
             n_bytes_read += last_per_call;
             chunk.note_inner_decoded_bytes(last_per_call);
@@ -435,36 +441,14 @@ fn resumable_resync(
             last_finished = r.finished;
             last_end_bit = r.bit_position;
 
-            // COALESCE drain (rapidgzip parity): this `read_stream` call may
-            // have warm-decoded across several deflate blocks before returning.
-            // Record each pre-header EOB it crossed so subchunk splitting
-            // (gated by `split_chunk_size`) still fires at vendor granularity.
-            // Offsets are relative to THIS call's start; rebase onto the
-            // cumulative decode. The final boundary (the one that returned
-            // END_OF_BLOCK) lands at `decode_base + n_bytes_read` and is
-            // deduped against the explicit append in the match arm below.
             let call_base = decode_base + (n_bytes_read - last_per_call);
             for (bp, rel_off) in wrapper.take_block_boundaries() {
-                chunk.append_block_boundary_at(bp, call_base + rel_off);
+                let decoded_offset = call_base + rel_off;
+                if decoded_offset > 0 {
+                    chunk.append_block_boundary_at(bp, decoded_offset);
+                }
             }
 
-            // Defense-in-depth termination guard. If `read_stream` made
-            // no progress whatsoever — no output, no stopping point, not
-            // finished, and the compressed cursor did not advance — then
-            // ISA-L is exhausted on this input and every further call
-            // would stall identically (the input is fixed; `read_stream`
-            // already looped internally until `!made_progress`). Finalize
-            // the chunk here instead of spinning forever.
-            //
-            // In production `consumer_loop`'s sub-byte-tail guard means a
-            // chunk too small to hold a deflate block is never scheduled;
-            // this is the backstop for any future caller that hands
-            // `decode_chunk` such a fragment directly.
-            //
-            // A genuinely truncated stream also stalls here; its
-            // already-decoded prefix is kept (appended by earlier
-            // iterations) and the short finalize is caught downstream by
-            // CRC32/ISIZE verification.
             if r.bytes_written == 0
                 && r.stopped_at == StoppingPoints::NONE
                 && !r.finished
@@ -474,27 +458,25 @@ fn resumable_resync(
                 break;
             }
 
-            // END_OF_STREAM must be detected even when ISA-L reports
-            // `finished` on the same call — `read_stream` returns both
-            // flags together at the final block. Checking `finished`
-            // first would skip the footer-reading branch below, leaving
-            // the chunk finalized at the pre-BFINAL-block EOB.
-            if r.stopped_at == StoppingPoints::END_OF_STREAM {
-                end_of_stream_hit = true;
-                break;
-            }
             if r.finished {
                 break;
             }
 
             match r.stopped_at {
                 sp if sp == StoppingPoints::END_OF_STREAM_HEADER => {
-                    chunk.append_block_boundary_at(r.bit_position, decode_base + n_bytes_read);
+                    if decode_base + n_bytes_read > 0 {
+                        chunk.append_block_boundary_at(r.bit_position, decode_base + n_bytes_read);
+                    }
                 }
                 sp if sp == StoppingPoints::END_OF_BLOCK => {
                     if !wrapper.is_final_block() {
-                        chunk.append_block_boundary_at(r.bit_position, decode_base + n_bytes_read);
-                        if r.bit_position >= stop_hint_bits {
+                        if decode_base + n_bytes_read > 0 {
+                            chunk.append_block_boundary_at(
+                                r.bit_position,
+                                decode_base + n_bytes_read,
+                            );
+                        }
+                        if !until_exact && r.bit_position >= stop_hint_bits {
                             // Do not keep filling this buffer from the next block
                             // before HEADER/NONE handling — finalize at pre-header EOB.
                             last_end_bit = r.bit_position;
@@ -505,55 +487,39 @@ fn resumable_resync(
                     last_eob_decoded_bytes = decode_base + n_bytes_read;
                 }
                 sp if sp == StoppingPoints::END_OF_BLOCK_HEADER => {
+                    let next_block_offset = wrapper.tell_compressed();
                     let not_final = !wrapper.is_final_block();
                     let not_fixed = wrapper.btype() != Some(DeflateCompressionType::FixedHuffman);
-                    if last_eob_pos >= stop_hint_bits && not_final && not_fixed {
+                    if !until_exact
+                        && ((next_block_offset >= stop_hint_bits && not_final && not_fixed)
+                            || next_block_offset == stop_hint_bits)
+                    {
                         last_end_bit = last_eob_pos;
                         pending_stop_after_flush = true;
                     }
                 }
                 sp if sp == StoppingPoints::NONE
+                    && !until_exact
                     && last_per_call == 0
                     && last_eob_pos >= stop_hint_bits =>
                 {
-                    // ISA-L can return 0 bytes between block boundaries.
-                    // Do not end the chunk early while still before `stop_hint_bits`.
                     last_end_bit = last_eob_pos;
                     pending_stop_after_flush = true;
                 }
                 _ => {}
             }
-            if end_of_stream_hit || last_finished {
+            if last_finished {
                 break;
             }
         }
 
         let mut append_len = n_bytes_read;
         if stopping_point_reached {
-            // Stopped on NONE+0 / HEADER after the prior END_OF_BLOCK was
-            // already appended in a previous outer iteration — do not
-            // emit bytes from the next block read into this buffer.
             append_len = last_eob_decoded_bytes.saturating_sub(decode_base);
         } else if pending_stop_after_flush {
-            // Session-flush outer iterations after the EOB hint fired:
-            // all bytes in this buffer are tail output from the same block.
             append_len = n_bytes_read;
         }
         if append_len > 0 {
-            // CRC the kept bytes FIRST (read them straight from the segment
-            // we just wrote, before `commit`), then commit `append_len` into
-            // the segmented buffer. Bytes `[append_len, n_bytes_read)` that
-            // the decoder wrote but we're discarding (between EOB and the
-            // truncate point) simply never get committed — the next outer
-            // iteration overwrites the segment tail from `append_len`.
-            //
-            // We deliberately do NOT touch `subchunks.last_mut().decoded_size`
-            // here because the inner loop already credited the FULL
-            // n_bytes_read via `note_inner_decoded_bytes(last_per_call)`.
-            //
-            // SAFETY: `append_len ≤ n_bytes_read ≤ buffer_cap`; the decoder
-            // wrote initialized bytes through `seg_ptr[0..n_bytes_read]`, so
-            // `seg_ptr[0..append_len]` is fully initialized.
             if chunk.configuration.crc32_enabled {
                 let kept: &[u8] = unsafe { std::slice::from_raw_parts(seg_ptr, append_len) };
                 if let Some(last_crc) = chunk.crc32s.last_mut() {
@@ -570,45 +536,11 @@ fn resumable_resync(
             stopping_point_reached = true;
         }
 
-        if end_of_stream_hit {
-            let (crc32, isize_field) = wrapper.read_footer_at_current()?;
-            let footer_end_bits = wrapper.tell_compressed();
-            chunk.append_footer(crc32, isize_field, footer_end_bits);
-
-            let remaining = wrapper.remaining_input();
-            if remaining.is_empty() {
-                last_end_bit = footer_end_bits;
-                reached_stream_end = true;
-                break;
-            }
-            let (_hdr, hdr_size) = crate::decompress::parallel::gzip_format::read_header(remaining)
-                .map_err(|e| {
-                    ChunkDecodeError::BootstrapFailed(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("multi-stream gzip header at bit {footer_end_bits}: {e}"),
-                    ))
-                })?;
-            wrapper.advance_input(hdr_size);
-            wrapper.reset_for_next_stream();
-            wrapper.set_stopping_points(
-                StoppingPoints::END_OF_BLOCK
-                    | StoppingPoints::END_OF_BLOCK_HEADER
-                    | StoppingPoints::END_OF_STREAM_HEADER
-                    | StoppingPoints::END_OF_STREAM,
-            );
-            wrapper.set_window(&[])?;
-            last_end_bit = wrapper.tell_compressed();
-            last_eob_pos = last_end_bit;
-            chunk.append_block_boundary_at(last_end_bit, already_decoded);
-            continue;
-        }
-
         if last_finished {
-            reached_stream_end = true;
             break;
         }
         if last_stopped_at == StoppingPoints::NONE && last_per_call == 0 {
-            if last_eob_pos >= stop_hint_bits {
+            if !until_exact && last_eob_pos >= stop_hint_bits {
                 last_end_bit = last_eob_pos;
                 break;
             }
@@ -619,30 +551,22 @@ fn resumable_resync(
     if record_decode_duration {
         chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
     }
-    // A4: window-image prefix STAYS in chunk.data through finalize
-    // and into the consumer. The consumer write site reads
-    // &chunk.data[chunk.data_prefix_len..] so the prefix never
-    // reaches the user's output. Downstream chunk methods that
-    // need the decoded portion (last_32kib_window, get_last_window,
-    // populate_subchunk_windows) skip data_prefix_len bytes;
-    // `resumable_resync` reads from
-    // `tail.data[tail.data_prefix_len..]`. Eliminating the trim
-    // memmove was measured at -3.81pp `__memmove_avx_unaligned_erms`
-    // CPU share vs A3-with-trim, lifting net throughput to +4.2%
-    // vs default at T=16 on neurotic silesia-gzip9.
-    let _ = full_window_tail; // consumed at decode-start (A3 prefill + bulk path)
-                              // When the reader runs past `stop_hint_bits` without an inexact
-                              // stop, `tell_compressed()` can land mid-block. Successor chunks must
-                              // resume at the last END_OF_BLOCK position (pre-header), not mid-block.
-    let final_bit = if stopping_point_reached || reached_stream_end {
+
+    let final_bit = if until_exact {
+        wrapper.tell_compressed()
+    } else if stopping_point_reached {
         last_end_bit
     } else if last_eob_pos > inflate_start_bit {
-        // Hit the until read cap without an inexact header-stop — finalize at
-        // the last pre-header EOB, never at a mid-block bit cursor.
         last_eob_pos
     } else {
         wrapper.tell_compressed()
     };
+    if until_exact && final_bit != stop_hint_bits {
+        return Err(ChunkDecodeError::ExactStopMissed {
+            requested: stop_hint_bits,
+            actual: final_bit,
+        });
+    }
     chunk.finalize(final_bit);
     Ok(())
 }
@@ -663,6 +587,7 @@ pub fn decode_chunk_window_absent(
         stop_hint_bits,
         &[],
         configuration,
+        false,
     )
 }
 
@@ -674,25 +599,41 @@ fn decode_chunk_with_rapidgzip_impl(
     stop_hint_bits: usize,
     initial_window: &[u8],
     configuration: ChunkConfiguration,
+    until_exact: bool,
 ) -> Result<ChunkData, ChunkDecodeError> {
+    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
+
     // Envelope span: `chunk_fetcher::run_decode_task` (`worker.decode_chunk`).
     let t_decode = std::time::Instant::now();
 
-    // ONE unified decode driver (vendor single deflate::Block shape): the marker
-    // engine decodes the WHOLE chunk into data_with_markers — emitting u16 markers
-    // while the predecessor window is absent and flipping mid-stream to clean u16
-    // without restarting — resolved later on the publish chain. There is no
-    // separate clean-tail entry. On a bad speculative-seed decode failure (4 MiB
-    // partition guesses that aren't real block boundaries), fall to the resumable
-    // re-sync, kept ONLY as an internal correctness strategy (the goal's accepted
-    // re-sync), never an outer fallback ladder.
-    match decode_chunk_unified_marker(
-        input,
-        encoded_offset_bits,
-        stop_hint_bits,
-        initial_window,
-        configuration,
-    ) {
+    if initial_window.len() == MAX_WINDOW_SIZE {
+        WINDOW_SEEDED_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
+        if until_exact {
+            finish_decode_chunk_impl(
+                &mut chunk,
+                input,
+                encoded_offset_bits,
+                stop_hint_bits,
+                initial_window,
+                false,
+                true,
+            )?;
+        } else {
+            finish_decode_chunk_with_inexact_offset(
+                &mut chunk,
+                input,
+                encoded_offset_bits,
+                stop_hint_bits,
+                initial_window,
+                false,
+            )?;
+        }
+        chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
+        return Ok(chunk);
+    }
+
+    match decode_chunk_unified_marker(input, encoded_offset_bits, stop_hint_bits, configuration) {
         Ok(mut chunk) => {
             chunk.statistics.decode_duration_ns += t_decode.elapsed().as_nanos() as u64;
             Ok(chunk)
@@ -716,103 +657,59 @@ fn decode_chunk_with_rapidgzip_impl(
 }
 
 /// The ONE unified decode driver — one `MarkerRing`, one bit cursor, the vendor
-/// single-`deflate::Block` shape. Phase 1 emits u16 markers into
-/// `data_with_markers` while the predecessor window is absent; at the flip
-/// (`!contains_marker_bytes()`, byte-for-byte vendor `!m_containsMarkerBytes`)
-/// phase 2 CONTINUES the SAME ring on the SAME cursor, draining its now-clean
-/// u16 output narrowed to u8 into `chunk.data` (the ring already holds the
-/// 32 KiB window, so back-refs resolve with no window copy and no second decode
-/// engine). The chunk ends at BFINAL or the `stop_hint` partition boundary.
-/// `resumable_resync` is NO LONGER on this path — it survives only as the
-/// bad-speculative-seed fallback in [`decode_chunk_with_rapidgzip_impl`].
-/// Returns `Err` on a bad seed so the caller can fall to that re-sync.
+/// single-`deflate::Block` shape, restricted to the window-absent bootstrap.
+/// Once 32 KiB of clean output exist at a block boundary, control hands off to
+/// `finish_decode_chunk_with_inexact_offset` with that clean window.
 #[cfg(parallel_sm)]
 fn decode_chunk_unified_marker(
     input: &[u8],
     encoded_offset_bits: usize,
     stop_hint_bits: usize,
-    initial_window: &[u8],
     configuration: ChunkConfiguration,
 ) -> Result<ChunkData, ChunkDecodeError> {
-    use crate::decompress::parallel::marker_inflate::MAX_WINDOW_SIZE;
     let mut chunk = ChunkData::new(encoded_offset_bits, configuration);
     let mut marker_ctx = MarkerDecodeCtx::new(input, encoded_offset_bits)?;
-
-    // WINDOW-PRESENT FAST PATH (vendor `setInitialWindow`, deflate.hpp:693): when
-    // the worker resolved a full 32 KiB predecessor window, seed it and decode
-    // CLEAN from block 0 — no markers, no flip, no marker-resolve. The old
-    // driver discarded `initial_window` and forced every non-zero chunk through
-    // full marker decode (the ~90% window-absent deviation).
-    let window_seeded = initial_window.len() == MAX_WINDOW_SIZE && window_seed_enabled();
-
-    if window_seeded {
-        WINDOW_SEEDED_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Skip phase 1; phase 2's first `marker_decode_step` primes the ring via
-        // `set_initial_window_u8` and decodes clean from the chunk start.
-        marker_ctx.flipped = true;
-    } else {
-        chunk.data_with_markers.reserve(128 * 1024);
-        // ── Phase 1: marker arm — drain u16 (markers + post-flip clean) into
-        // `data_with_markers` until the flip block boundary or chunk end. ──
-        loop {
-            let (step, flipped_clean) = marker_decode_step(
-                &mut marker_ctx,
-                input,
-                stop_hint_bits,
-                &[],
-                &mut chunk.data_with_markers,
-            )?;
-            if flipped_clean {
-                UNIFIED_MODE_CLEAN_FLIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            match step {
-                MarkerStep::Continue => {}
-                MarkerStep::FlipToClean { .. } => {
-                    FLIP_TO_CLEAN_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
-                    // Arm the single-fire flip gate and fall through to phase 2.
-                    // `ctx.current_bit_offset` is already at this block boundary;
-                    // the ring's window/`decoded_bytes`/clean state all persist.
-                    marker_ctx.flipped = true;
-                    break;
-                }
-                MarkerStep::Finished { end_bit_offset, .. } => {
-                    FINISHED_NO_FLIP_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
-                    chunk.finalize(end_bit_offset);
-                    return Ok(chunk);
-                }
-            }
-        }
-    }
-
-    // ── Phase 2: clean arm — keep decoding the SAME ring on the SAME cursor,
-    // narrowing its u8 drains into `chunk.data` (CRC + subchunk accounting).
-    // `ctx.flipped` suppresses the top-of-loop flip return. The window-seeded
-    // path passes `initial_window` so the first step primes the ring; the
-    // natural-flip path passes `&[]` (the ring already holds its own window). ──
-    let phase2_window: &[u8] = if window_seeded { initial_window } else { &[] };
-    let end_bit_offset = loop {
-        let mut sink = CleanTailSink {
-            chunk: &mut chunk,
-            pushed: 0,
-        };
-        let (step, _) = marker_decode_step(
+    chunk.data_with_markers.reserve(128 * 1024);
+    loop {
+        let (step, flipped_clean) = marker_decode_step(
             &mut marker_ctx,
             input,
             stop_hint_bits,
-            phase2_window,
-            &mut sink,
+            &[],
+            &mut chunk.data_with_markers,
         )?;
+        if flipped_clean {
+            UNIFIED_MODE_CLEAN_FLIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         match step {
             MarkerStep::Continue => {}
-            // Unreachable: `ctx.flipped` gates the flip return off after phase 1.
-            MarkerStep::FlipToClean { end_bit_offset, .. } => break end_bit_offset,
-            MarkerStep::Finished { end_bit_offset, .. } => break end_bit_offset,
+            MarkerStep::FlipToClean { end_bit_offset, .. } => {
+                FLIP_TO_CLEAN_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
+                let clean_window = chunk.last_32kib_window_vec().ok_or_else(|| {
+                    ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "flip reached without a clean 32 KiB window",
+                    ))
+                })?;
+                finish_decode_chunk_with_inexact_offset(
+                    &mut chunk,
+                    input,
+                    end_bit_offset,
+                    stop_hint_bits,
+                    &clean_window,
+                    false,
+                )?;
+                return Ok(chunk);
+            }
+            MarkerStep::Finished { end_bit_offset, .. } => {
+                FINISHED_NO_FLIP_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                chunk.statistics.non_marker_count += chunk.data_with_markers.len() as u64;
+                chunk.finalize(end_bit_offset);
+                return Ok(chunk);
+            }
         }
-    };
-    chunk.finalize(end_bit_offset);
-    Ok(chunk)
+    }
 }
 
 /// Window-present clean-decode (vendor `setInitialWindow`) toggle.
