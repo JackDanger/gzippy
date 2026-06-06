@@ -2425,12 +2425,28 @@ fn queue_prefetched_marker_postprocess(
         if arc.data_with_markers.is_empty() {
             continue;
         }
+        // The window that resolves THIS chunk's markers must be the one valid at the
+        // chunk's OWN decode-start (`max_acceptable_start_bit`). Re-keying this lookup
+        // to the offset-sorted predecessor's published end (`prev.encoded_offset_bits
+        // + prev.encoded_size_bits`, the §3.1 experiment) was REJECTED: for range-
+        // speculative chunks that key names a DIFFERENT published window, and the
+        // dense window map usually contains it, so the chunk gets resolved against the
+        // wrong predecessor window → CRC32 mismatch (test_coalesce_fixed_huffman /
+        // silesia parallel-SM, green on the seed key, red on the predecessor key).
         let handoff_bit = chunk_consumer_handoff_bit(arc.as_ref());
+        // F1 instrument: RESOLVE_AHEAD_* / HANDOFF_WINDOW_PUBLISHED were declared but
+        // NEVER incremented (the dead-counter trap behind `--verbose`'s "Worker
+        // resolve-ahead" / "handoff_key" lines, which always read 0). Count one
+        // attempt per chunk entering the predecessor lookup; the eligibility gate
+        // above (`chunk_may_resolve_markers_early`) pre-screens window presence, so OK
+        // tracks ATTEMPTS, but both are now LIVE on the production resolve-ahead path.
+        RESOLVE_AHEAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         let Some((pred_key, predecessor_window)) =
             confirmed_predecessor_window(window_map, handoff_bit)
         else {
             continue;
         };
+        RESOLVE_AHEAD_OK.fetch_add(1, Ordering::Relaxed);
         // Vendor queueChunkForPostProcessing:557-575 — publish end-window on
         // caller thread before pool applyWindow (marker chunks included).
         let pred_bytes = materialize_window(&predecessor_window);
@@ -2444,6 +2460,9 @@ fn queue_prefetched_marker_postprocess(
             predecessor_window,
         );
         in_flight.insert(real_offset, (pred_key, cache_key, rx));
+        // F1 instrument: resolve-ahead submitted ahead-work for this chunk (beside the
+        // batch EAGER_PROBE_SUBMITTED below).
+        HANDOFF_WINDOW_PUBLISHED.fetch_add(1, Ordering::Relaxed);
         submitted += 1;
     }
     EAGER_PROBE_INSPECTED.fetch_add(n_inspected as u64, Ordering::Relaxed);
