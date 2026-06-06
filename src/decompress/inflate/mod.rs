@@ -27,5 +27,6 @@ pub mod route_c_dynasm;
 #[cfg(all(target_arch = "x86_64", feature = "route-c-dynasm"))]
 pub mod route_c_fixed;
 pub mod specialized_decode;
+pub mod staged_bits;
 pub mod stopping_point;
 pub mod unified;

@@ -27,6 +27,7 @@ use std::io::{Error, ErrorKind, Result};
 use std::sync::atomic::AtomicU64;
 
 use super::consume_first_decode::{build_code_length_table, Bits};
+use super::staged_bits::StagedBitInput;
 
 /// FASTLOOP multi-literal hit/miss counters. Inspect via test
 /// harness or end-of-run print to verify the SIMD lookahead pays off
@@ -241,7 +242,10 @@ pub struct InflateStreamResult {
 /// `session: Vec<u8>`-accumulator `ResumableInflate` was deleted in
 /// §5 step 6).
 pub struct ResumableInflate2<'a> {
-    pub(crate) bits: Bits<'a>,
+    /// Vendor `IsalInflateWrapper::m_buffer` (`gzip/isal.hpp:205-250`): inner
+    /// `Bits` reads from a 128 KiB staging window into `full` so branchless
+    /// refills stay in-bounds on mmap'd multi-MiB input.
+    pub(crate) bits: StagedBitInput<'a>,
     pub(crate) window: SlidingWindow,
     pub(crate) block_state: BlockState,
     pub(crate) pending_match: Option<PendingMatch>,
@@ -291,7 +295,7 @@ impl<'a> ResumableInflate2<'a> {
             ));
         }
         Ok(Self {
-            bits: Bits::at_bit_offset(input, bit_offset),
+            bits: StagedBitInput::with_until_bits(input, bit_offset, until_bits)?,
             window: SlidingWindow::default(),
             block_state: BlockState::default(),
             pending_match: None,
@@ -404,7 +408,8 @@ impl<'a> ResumableInflate2<'a> {
     /// `consume_first_decode.rs:3012-3019`.
     pub fn remaining_input(&self) -> &'a [u8] {
         let start_byte = self.bits.bit_position() / 8;
-        &self.bits.data[start_byte.min(self.bits.data.len())..]
+        let full = self.bits.full_input();
+        &full[start_byte.min(full.len())..]
     }
 
     /// Advance the bit cursor by `n` bytes; widen `encoded_until_bits`
@@ -415,13 +420,12 @@ impl<'a> ResumableInflate2<'a> {
     /// trap pattern from §5 step 2).
     pub fn advance_input(&mut self, n: usize) {
         let cur = self.bits.bit_position() / 8;
-        let new_pos = (cur + n).min(self.bits.data.len());
-        self.bits.pos = new_pos;
-        self.bits.bitbuf = 0;
-        self.bits.bitsleft = 0;
-        let input_bits = self.bits.data.len() * 8;
+        let new_pos = (cur + n).min(self.bits.full_input().len());
+        self.bits.seek_abs_byte(new_pos);
+        let input_bits = self.bits.full_input().len() * 8;
         if input_bits > self.encoded_until_bits {
             self.encoded_until_bits = input_bits;
+            self.bits.set_until_bits(self.encoded_until_bits);
         }
     }
 
@@ -727,7 +731,7 @@ impl<'a> ResumableInflate2<'a> {
             return Ok(false);
         }
 
-        let header = self.bits.bitbuf & 0b111;
+        let header = self.bits.bitbuf() & 0b111;
         self.bits.consume(3);
         self.last_bfinal = (header & 1) != 0;
         let btype = ((header >> 1) & 0b11) as u8;
@@ -758,7 +762,24 @@ impl<'a> ResumableInflate2<'a> {
                 // Parse the dynamic-Huffman header atomically and stash
                 // the built tables on `self`. Vendor `isal.hpp:263-272`
                 // treats `readHeader` as atomic.
-                let tables = parse_dynamic_header(&mut self.bits)?;
+                let header_start = self.bits.bit_position();
+                let tables = parse_dynamic_header(&mut self.bits.inner)?;
+                // Staging caps visible input; verify true header extent on the
+                // full stream so a truncated-window parse cannot slip past cap.
+                let mut probe = Bits::at_bit_offset(self.bits.full_input(), header_start);
+                parse_dynamic_header(&mut probe)?;
+                if probe.bit_position() > self.encoded_until_bits {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "Dynamic header straddled encoded_until_bits cap: \
+                             bit_position={} > cap={}. Chunk boundary contract \
+                             expects boundaries at block boundaries.",
+                            probe.bit_position(),
+                            self.encoded_until_bits
+                        ),
+                    ));
+                }
                 // CLAUDE.md "no fallbacks" + vendor GzipReader contract:
                 // parallel-SM chunk boundaries land at block boundaries,
                 // so a dynamic header that straddles `encoded_until_bits`
@@ -869,20 +890,19 @@ pub fn resume_decode_stored_resumable(
     );
     let data_start_byte = state.bits.bit_position() / 8;
     let copy_n = (bytes_remaining as usize).min(output.len() - out_pos);
-    if data_start_byte + copy_n > state.bits.data.len() {
+    let full = state.bits.full_input();
+    if data_start_byte + copy_n > full.len() {
         return Err(Error::new(
             ErrorKind::UnexpectedEof,
             format!(
                 "Truncated stored block: need {copy_n} bytes from offset {data_start_byte}, have {}",
-                state.bits.data.len().saturating_sub(data_start_byte)
+                full.len().saturating_sub(data_start_byte)
             ),
         ));
     }
     output[out_pos..out_pos + copy_n]
-        .copy_from_slice(&state.bits.data[data_start_byte..data_start_byte + copy_n]);
-    state.bits.pos = data_start_byte + copy_n;
-    state.bits.bitbuf = 0;
-    state.bits.bitsleft = 0;
+        .copy_from_slice(&full[data_start_byte..data_start_byte + copy_n]);
+    state.bits.seek_abs_byte(data_start_byte + copy_n);
     out_pos += copy_n;
     bytes_remaining -= copy_n as u32;
 
@@ -1014,12 +1034,12 @@ fn decode_huffman_body_resumable(
     // `state.bits` (it only reads `state.window` and writes
     // `state.pending_match`), so we don't need to write back / re-lift
     // around that call — only at return sites.
-    let mut bitbuf: u64 = state.bits.bitbuf;
-    let mut bitsleft: u32 = state.bits.bitsleft;
-    let mut in_pos: usize = state.bits.pos;
-    let in_data: &[u8] = state.bits.data;
-    let in_data_len: usize = in_data.len();
-    let in_data_ptr: *const u8 = in_data.as_ptr();
+    let mut bitbuf: u64 = state.bits.bitbuf();
+    let mut bitsleft: u32 = state.bits.bitsleft();
+    let mut in_pos: usize = state.bits.pos();
+    let mut buffer_base_byte: usize = state.bits.buffer_base_byte();
+    let mut in_data_len: usize = state.bits.staging_len();
+    let mut in_data_ptr: *const u8 = state.bits.staging_ptr();
     let encoded_until_bits: usize = state.encoded_until_bits;
 
     // Lever T0 (tight-Huffman-decoder plan): lift output base pointer
@@ -1034,13 +1054,23 @@ fn decode_huffman_body_resumable(
     let output_ptr: *mut u8 = output.as_mut_ptr();
     let output_len: usize = output.len();
 
-    // Mirror of `Bits::bit_position` semantics
-    // (`consume_first_decode.rs:237-240`): bit position of the NEXT bit
-    // to consume = (in_pos in bytes × 8) − unread-bits-in-buffer.
     #[inline(always)]
-    fn bit_position_of(bitsleft: u32, in_pos: usize) -> usize {
-        let unread = (bitsleft as u8).min(64) as usize;
-        in_pos.saturating_mul(8).saturating_sub(unread)
+    fn abs_bit_position(bitsleft: u32, in_pos: usize, buffer_base_byte: usize) -> usize {
+        let unread = (bitsleft as u8).min(64) as isize;
+        let rel = (in_pos as isize) * 8 - unread;
+        let abs = (buffer_base_byte as isize) * 8 + rel;
+        abs.max(0) as usize
+    }
+
+    macro_rules! lift_staging_locals {
+        () => {{
+            bitbuf = state.bits.bitbuf();
+            bitsleft = state.bits.bitsleft();
+            in_pos = state.bits.pos();
+            buffer_base_byte = state.bits.buffer_base_byte();
+            in_data_len = state.bits.staging_len();
+            in_data_ptr = state.bits.staging_ptr();
+        }};
     }
 
     // Mirror of `Bits::refill`
@@ -1049,26 +1079,47 @@ fn decode_huffman_body_resumable(
     // arithmetic and underflow handling.
     macro_rules! refill_local {
         () => {{
-            let mut bits_u8 = bitsleft as u8;
-            if bits_u8 > 64 {
-                bitbuf = 0;
-                bits_u8 = 0;
-            }
-            if in_pos + 8 <= in_data_len {
-                let word = unsafe { (in_data_ptr.add(in_pos) as *const u64).read_unaligned() };
-                let word = u64::from_le(word);
-                bitbuf |= word << bits_u8;
-                in_pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
-                bitsleft = (bits_u8 as u32) | 56;
-            } else {
-                // Slow path: byte-by-byte until 56 bits filled or EOF.
-                let mut b = bits_u8;
-                while b <= 56 && in_pos < in_data_len {
-                    bitbuf |= (in_data[in_pos] as u64) << b;
-                    in_pos += 1;
-                    b = b.wrapping_add(8);
+            'staging_refill: loop {
+                let mut bits_u8 = bitsleft as u8;
+                if bits_u8 > 64 {
+                    bitbuf = 0;
+                    bits_u8 = 0;
                 }
-                bitsleft = b as u32;
+                if in_pos + 8 <= in_data_len {
+                    let word = unsafe { (in_data_ptr.add(in_pos) as *const u64).read_unaligned() };
+                    let word = u64::from_le(word);
+                    bitbuf |= word << bits_u8;
+                    in_pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
+                    bitsleft = (bits_u8 as u32) | 56;
+                } else {
+                    // Slow path: byte-by-byte until 56 bits filled or EOF.
+                    let mut b = bits_u8;
+                    while b <= 56 && in_pos < in_data_len {
+                        let byte = unsafe { *in_data_ptr.add(in_pos) };
+                        bitbuf |= (byte as u64) << b;
+                        in_pos += 1;
+                        b = b.wrapping_add(8);
+                    }
+                    bitsleft = b as u32;
+                }
+                let b = bitsleft as u8;
+                if in_pos < in_data_len {
+                    if b >= REFILL_THRESHOLD {
+                        writeback_bits!();
+                        break 'staging_refill;
+                    }
+                    continue 'staging_refill;
+                }
+                // Staging bytes exhausted; slide window (preserves bitbuf).
+                writeback_bits!();
+                let prev_base = buffer_base_byte;
+                state.bits.refill();
+                if state.bits.buffer_base_byte() != prev_base {
+                    lift_staging_locals!();
+                    continue 'staging_refill;
+                }
+                lift_staging_locals!();
+                break 'staging_refill;
             }
         }};
     }
@@ -1094,16 +1145,20 @@ fn decode_huffman_body_resumable(
     // guarantee).
     macro_rules! refill_fast {
         () => {{
-            let mut bits_u8 = bitsleft as u8;
-            if bits_u8 > 64 {
-                bitbuf = 0;
-                bits_u8 = 0;
+            if in_pos + 8 > in_data_len {
+                refill_local!();
+            } else {
+                let mut bits_u8 = bitsleft as u8;
+                if bits_u8 > 64 {
+                    bitbuf = 0;
+                    bits_u8 = 0;
+                }
+                let word = unsafe { (in_data_ptr.add(in_pos) as *const u64).read_unaligned() };
+                let word = u64::from_le(word);
+                bitbuf |= word << bits_u8;
+                in_pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
+                bitsleft = (bits_u8 as u32) | 56;
             }
-            let word = unsafe { (in_data_ptr.add(in_pos) as *const u64).read_unaligned() };
-            let word = u64::from_le(word);
-            bitbuf |= word << bits_u8;
-            in_pos += (7 - ((bits_u8 >> 3) & 7)) as usize;
-            bitsleft = (bits_u8 as u32) | 56;
         }};
     }
 
@@ -1111,9 +1166,7 @@ fn decode_huffman_body_resumable(
     // expects subsequent calls to observe the consumed bits.
     macro_rules! writeback_bits {
         () => {{
-            state.bits.bitbuf = bitbuf;
-            state.bits.bitsleft = bitsleft;
-            state.bits.pos = in_pos;
+            state.bits.set_local(in_pos, bitbuf, bitsleft);
         }};
     }
 
@@ -1423,15 +1476,13 @@ fn decode_huffman_body_resumable(
         //   - out_pos < output_len - FASTLOOP_MARGIN: any single iter's
         //     write fits (max match 258 + literals)
         //
-        // `cap_byte_floor = encoded_until_bits / 8` is a conservative
-        // floor: if in_pos < cap_byte_floor, in_pos*8 < cap_byte_floor*8
-        // ≤ encoded_until_bits, so bit_position_of(...) ≤ in_pos*8 <
-        // cap. The bound is strict enough that the fastloop body can
-        // omit the cap check entirely.
-        let cap_byte_floor = encoded_until_bits / 8;
+        // `cap_rel_byte_floor` is the encoded-until cap expressed relative
+        // to the current staging window base.
+        let cap_abs_byte = encoded_until_bits / 8;
+        let cap_rel_byte_floor = cap_abs_byte.saturating_sub(buffer_base_byte);
         let in_fl_end = in_data_len
             .saturating_sub(FASTLOOP_INPUT_TAIL)
-            .min(cap_byte_floor);
+            .min(cap_rel_byte_floor);
         let out_fl_end = output_len.saturating_sub(FASTLOOP_MARGIN);
 
         if in_pos < in_fl_end && out_pos < out_fl_end {
@@ -1454,7 +1505,7 @@ fn decode_huffman_body_resumable(
             writeback_bits!();
             return Ok(out_pos);
         }
-        if bit_position_of(bitsleft, in_pos) >= encoded_until_bits {
+        if abs_bit_position(bitsleft, in_pos, buffer_base_byte) >= encoded_until_bits {
             writeback_bits!();
             return Ok(out_pos);
         }
@@ -2028,6 +2079,27 @@ mod tests {
         let payload = b"ABCDEFGHIJ".repeat(50); // 500 bytes; many matches.
         let stream = raw_deflate(&payload, 9);
         let got = decode_via_resumable_in_chunks(&stream, 5);
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn staged_input_roundtrip_spans_multiple_windows() {
+        // Incompressible payload → stored blocks → compressed size exceeds
+        // 2× staging so decode must slide the 128 KiB window mid-stream.
+        let payload = vec![0xABu8; 300_000];
+        let stream = {
+            use flate2::write::DeflateEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let mut enc = DeflateEncoder::new(Vec::new(), Compression::new(0));
+            enc.write_all(&payload).unwrap();
+            enc.finish().unwrap()
+        };
+        assert!(
+            stream.len() > crate::decompress::inflate::staged_bits::INPUT_STAGING_BYTES + 4096,
+            "fixture must span multiple 128 KiB staging windows"
+        );
+        let got = decode_via_resumable_in_chunks(&stream, 4096);
         assert_eq!(got, payload);
     }
 
