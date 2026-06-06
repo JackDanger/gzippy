@@ -920,7 +920,8 @@ fn drive_impl<W: std::io::Write>(
             PREFETCH_REJECT_BY_GUARD.load(Ordering::Relaxed),
         );
         eprintln!(
-            "  Clean decode (pred@seed / handoff@stop / boundary@seed / candidate): {} / {} / {} / {}",
+            "  Clean decode (pred@key / pred@seed / handoff@stop / boundary@seed / candidate): {} / {} / {} / {} / {}",
+            CLEAN_DECODE_VIA_PRED_KEY.load(Ordering::Relaxed),
             CLEAN_DECODE_VIA_PREDECESSOR.load(Ordering::Relaxed),
             HANDOFF_DECODE_CLEAN_OK.load(Ordering::Relaxed),
             SPEC_PRED_BOUNDARY_CLEAN.load(Ordering::Relaxed),
@@ -2287,6 +2288,62 @@ fn try_clean_decode_with_pred_window(
     }
 }
 
+/// Design H′: predecessor window is keyed at `pred_key < partition_seed`
+/// (prior chunk end). Decode AT `pred_key` with that dict, then rewrite
+/// metadata to the partition seed. Chain-valid gate: confirmed `entries` only.
+#[cfg(parallel_sm)]
+fn try_clean_decode_via_pred_key(
+    input: &[u8],
+    params: &DecodeParams,
+    pred_key: usize,
+    w: &Window,
+    configuration: ChunkConfiguration,
+) -> Result<ChunkData, ChunkDecodeError> {
+    use std::sync::atomic::Ordering;
+
+    let partition_seed = params.start_bit;
+    debug_assert!(pred_key < partition_seed);
+    let bytes = materialize_window(w);
+    match decode_chunk(input, pred_key, params.stop_hint_bit, &bytes, configuration) {
+        Ok(chunk)
+            if chunk.encoded_offset_bits == partition_seed
+                && chunk.max_acceptable_start_bit == partition_seed =>
+        {
+            CLEAN_DECODE_VIA_PRED_KEY.fetch_add(1, Ordering::Relaxed);
+            Ok(chunk)
+        }
+        Ok(mut chunk)
+            if chunk.encoded_offset_bits >= partition_seed
+                && chunk.encoded_offset_bits < params.stop_hint_bit =>
+        {
+            let handoff_key = chunk.encoded_offset_bits;
+            if handoff_key > partition_seed || params.is_speculative_prefetch {
+                rewrite_chunk_from_handoff_to_partition_seed(
+                    &mut chunk,
+                    partition_seed,
+                    handoff_key,
+                );
+            }
+            CLEAN_DECODE_VIA_PRED_KEY.fetch_add(1, Ordering::Relaxed);
+            Ok(chunk)
+        }
+        Ok(mut chunk)
+            if params.is_speculative_prefetch
+                && chunk.encoded_offset_bits > pred_key
+                && chunk.encoded_offset_bits < params.stop_hint_bit =>
+        {
+            let handoff_key = chunk.encoded_offset_bits;
+            rewrite_chunk_from_handoff_to_partition_seed(&mut chunk, partition_seed, handoff_key);
+            CLEAN_DECODE_VIA_PRED_KEY.fetch_add(1, Ordering::Relaxed);
+            Ok(chunk)
+        }
+        Ok(_) | Err(_) => Err(ChunkDecodeError::BootstrapFailed(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "pred_key clean miss",
+        ))),
+    }
+}
+
 /// Worker early window publish (vendor `WindowMap::emplace` at chunk end +
 /// handoff key for `get(blockOffset)` parity on confirmed boundaries).
 #[cfg(parallel_sm)]
@@ -2516,10 +2573,63 @@ fn run_decode_task(
             &bytes,
             configuration,
         )
+    } else if let Some((handoff_key, w)) = handoff_ahead {
+        let bytes = materialize_window(&w);
+        match decode_chunk(
+            input_bytes,
+            handoff_key,
+            params.stop_hint_bit,
+            &bytes,
+            configuration,
+        ) {
+            Ok(mut chunk)
+                if chunk.encoded_offset_bits == handoff_key
+                    && chunk.max_acceptable_start_bit == handoff_key =>
+            {
+                if params.is_speculative_prefetch && params.start_bit < handoff_key {
+                    rewrite_chunk_from_handoff_to_partition_seed(
+                        &mut chunk,
+                        params.start_bit,
+                        handoff_key,
+                    );
+                }
+                use std::sync::atomic::Ordering;
+                HANDOFF_DECODE_CLEAN_OK.fetch_add(1, Ordering::Relaxed);
+                Ok(chunk)
+            }
+            Ok(mut chunk)
+                if params.is_speculative_prefetch
+                    && chunk.encoded_offset_bits > params.start_bit
+                    && chunk.encoded_offset_bits < params.stop_hint_bit =>
+            {
+                let hk = chunk.encoded_offset_bits;
+                rewrite_chunk_from_handoff_to_partition_seed(&mut chunk, params.start_bit, hk);
+                use std::sync::atomic::Ordering;
+                HANDOFF_DECODE_CLEAN_OK.fetch_add(1, Ordering::Relaxed);
+                Ok(chunk)
+            }
+            Ok(_) | Err(_) => {
+                try_handoff_or_boundary_search(input_bytes, params, configuration, window_map)
+            }
+        }
+    } else if let Some((pred_key, w)) =
+        window_map.get_confirmed_predecessor_for_worker(params.start_bit)
+    {
+        let partition_width = params.stop_hint_bit.saturating_sub(params.start_bit);
+        let max_pred_gap = partition_width.saturating_mul(2).max(8 * 1024 * 1024);
+        if pred_key < params.start_bit && params.start_bit - pred_key <= max_pred_gap {
+            match try_clean_decode_via_pred_key(input_bytes, &params, pred_key, &w, configuration) {
+                Ok(chunk) => Ok(chunk),
+                Err(_) => {
+                    try_handoff_or_boundary_search(input_bytes, params, configuration, window_map)
+                }
+            }
+        } else {
+            try_handoff_or_boundary_search(input_bytes, params, configuration, window_map)
+        }
     } else if let Some((_pred_key, w)) = window_map.get_predecessor_for_worker(params.start_bit) {
-        // Fulcrum KEY-MISMATCH oracle: window is keyed at the predecessor's
-        // confirmed end, not the partition seed. Try clean decode AT the seed
-        // with that predecessor dict before marker bootstrap.
+        // Exact-key miss but speculative predecessor exists: try clean decode AT
+        // the partition seed with that dict (rare KEY-MISMATCH hit at seed).
         let bytes = materialize_window(&w);
         match decode_chunk(
             input_bytes,
@@ -3102,6 +3212,10 @@ pub static COORDINATOR_BOUNDARY_SEARCH_RUNS: std::sync::atomic::AtomicU64 =
 pub static CLEAN_DECODE_VIA_PREDECESSOR: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Design H′: clean decode starting at confirmed `pred_key` before partition seed.
+pub static CLEAN_DECODE_VIA_PRED_KEY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Speculative partition prefetch: clean `decode_chunk` at the handoff key
 /// (`get_predecessor(stop_hint)`), not at the partition seed.
 pub static HANDOFF_DECODE_CLEAN_OK: std::sync::atomic::AtomicU64 =
@@ -3319,6 +3433,27 @@ fn try_speculative_decode_candidate(
                 })
             }
             Err(e) => Err(e),
+        }
+    } else if let Some((pred_key, w)) =
+        window_map.get_confirmed_predecessor_for_worker(decode_start)
+    {
+        let partition_width = stop_hint_bit.saturating_sub(partition_seed.max(decode_start));
+        let max_pred_gap = partition_width.saturating_mul(2).max(8 * 1024 * 1024);
+        if pred_key < decode_start && decode_start - pred_key <= max_pred_gap {
+            let params = DecodeParams {
+                start_bit: partition_seed,
+                stop_hint_bit,
+                is_speculative_prefetch: partition_seed < decode_start,
+                partition_idx: usize::MAX,
+            };
+            match try_clean_decode_via_pred_key(input, &params, pred_key, &w, configuration) {
+                Ok(chunk) => Ok(chunk),
+                Err(_) => {
+                    decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration)
+                }
+            }
+        } else {
+            decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration)
         }
     } else {
         decode_chunk_window_absent(input, decode_start, stop_hint_bit, configuration)
