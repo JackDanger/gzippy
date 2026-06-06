@@ -199,6 +199,10 @@ pub struct ChunkData {
     /// `m_markersResolved` flag pattern at ChunkData.hpp.
     #[allow(dead_code)] // set by apply_window; read in future seekable path
     pub markers_resolved: bool,
+    /// Window-map key used when `apply_window` last ran (`None` if never).
+    /// Consumer reuses eager/cache-resolved chunks only when this equals the
+    /// handoff predecessor key (vendor `hasBeenPostProcessed` byte-identity).
+    pub resolved_pred_key: Option<usize>,
     /// Real deflate block boundaries the decoder crossed during decode.
     /// Indexed into the combined `(data_with_markers ++ data)` stream.
     /// Per rapidgzip's pattern, an entry is appended whenever the
@@ -358,6 +362,7 @@ impl ChunkData {
             narrowed_len: 0,
             narrowed_crc: CRC32Calculator::new(),
             markers_resolved: false,
+            resolved_pred_key: None,
             subchunks: vec![first_subchunk],
             // Mirror of ChunkData.hpp:561 default-init:
             // `std::vector<CRC32Calculator>( 1 )`.
@@ -422,6 +427,7 @@ impl ChunkData {
             narrowed_len: 0,
             narrowed_crc: CRC32Calculator::new(),
             markers_resolved: false,
+            resolved_pred_key: None,
             subchunks,
             crc32s: vec![crc0],
             footers,
