@@ -2657,7 +2657,7 @@ fn run_post_process_task(mut chunk: ChunkData, predecessor_window: Window) -> Ch
     let materialize_us = t_materialize.elapsed().as_micros();
     let t_apply = std::time::Instant::now();
     {
-        let _tv2 = trace_v2::SpanGuard::begin("post_process.resolve_markers");
+        let _tv2 = trace_v2::SpanGuard::begin("post_process.apply_window");
         resolve_chunk_markers_on_chunk(&mut chunk, bytes.as_ref());
     }
     let apply_us = t_apply.elapsed().as_micros();
@@ -3509,6 +3509,7 @@ fn drain_one_pending<W: std::io::Write>(
             )));
         };
         let bytes = materialize_window(&predecessor_window);
+        let _tv2 = trace_v2::SpanGuard::begin("post_process.apply_window");
         resolve_chunk_markers_on_chunk(&mut chunk, bytes.as_ref());
     }
     if std::env::var_os("GZIPPY_TRACE_DRAIN").is_some() {
