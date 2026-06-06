@@ -62,6 +62,12 @@ use crate::decompress::parallel::chunk_buffer_pool;
 use crate::decompress::parallel::replace_markers::MARKER_BASE;
 use crate::decompress::parallel::rpmalloc_alloc::types::U16;
 
+thread_local! {
+    /// Per post-process worker: literal iota + zero mid-range initialized once.
+    static APPLY_WINDOW_LUT: std::cell::RefCell<Option<[u8; 65536]>> =
+        std::cell::RefCell::new(None);
+}
+
 /// Allocate (or recycle) one 128 KiB marker segment. Sources from the
 /// per-worker marker-segment pool so freed segments stay warm in
 /// rpmalloc's per-thread span cache across chunks — the vendor
@@ -457,12 +463,23 @@ impl SegmentedU16 {
             return;
         }
         debug_assert_eq!(window.len(), 32768);
-        let mut lut = [0u8; 65536];
-        for (i, slot) in lut[0..256].iter_mut().enumerate() {
-            *slot = i as u8;
-        }
-        lut[MARKER_BASE as usize..MARKER_BASE as usize + 32768].copy_from_slice(window);
-        for seg in &mut self.segments {
+        // Reuse a per-thread LUT (see `APPLY_WINDOW_LUT` above).
+        APPLY_WINDOW_LUT.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            let lut = opt.get_or_insert_with(|| {
+                let mut lut = [0u8; 65536];
+                for (i, slot) in lut[0..256].iter_mut().enumerate() {
+                    *slot = i as u8;
+                }
+                lut
+            });
+            lut[MARKER_BASE as usize..MARKER_BASE as usize + 32768].copy_from_slice(window);
+            Self::resolve_and_narrow_segments_in_place(&mut self.segments, lut);
+        });
+    }
+
+    fn resolve_and_narrow_segments_in_place(segments: &mut [U16], lut: &[u8; 65536]) {
+        for seg in segments {
             let n = seg.len();
             if n == 0 {
                 continue;

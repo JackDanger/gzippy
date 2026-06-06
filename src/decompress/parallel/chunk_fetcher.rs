@@ -60,7 +60,6 @@ use crate::decompress::parallel::gzip_chunk::ChunkDecodeError;
 use std::sync::Arc;
 
 #[cfg(parallel_sm)]
-use crate::decompress::parallel::apply_window::apply_window;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::block_fetcher::BlockFetcher;
 #[cfg(parallel_sm)]
@@ -84,8 +83,6 @@ use crate::decompress::parallel::trace;
 use crate::decompress::parallel::trace_v2;
 use crate::decompress::parallel::window_map::{Window, WindowMap};
 
-/// Vendor `DecodedData::applyWindow` LUT branch threshold (DecodedData.hpp:315).
-const VENDOR_APPLY_WINDOW_LUT_ELEMENTS: usize = 128 * 1024;
 #[cfg(parallel_sm)]
 use std::borrow::Cow;
 #[cfg(parallel_sm)]
@@ -2298,15 +2295,13 @@ fn resolve_chunk_markers_on_chunk(
     predecessor_window: &[u8],
 ) {
     let dwm_len_pre = chunk.data_with_markers.len();
-    if dwm_len_pre >= VENDOR_APPLY_WINDOW_LUT_ELEMENTS {
-        // Vendor DecodedData.hpp:315-338 — 64 KiB `fullWindow` LUT, in-place u8.
+    if dwm_len_pre > 0 {
+        // Always fused resolve+narrow (64 KiB u8 LUT, one pass). The old
+        // sub-128Ki-element branch ran `resolve_markers_u16` (128 KiB u16 LUT)
+        // plus a second narrow pass — Fulcrum T8 showed +411ms wall-critical
+        // vs rapidgzip in marker-resolve despite only 6/35 chunks on that path.
         POST_PROCESS_FUSED_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         chunk.resolve_and_narrow_markers_in_place(predecessor_window);
-    } else if dwm_len_pre > 0 {
-        // Vendor DecodedData.hpp:339-362 — `MapMarkers` per-element, in-place u8.
-        POST_PROCESS_SMALL_MARKERS_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        apply_window(chunk, predecessor_window);
-        chunk.narrow_markers_in_place();
     }
     chunk.update_narrowed_crc();
     // Vendor DecodedData.hpp:365-388 — swap narrowed marker buffers into `data`
@@ -2471,7 +2466,7 @@ fn run_post_process_in_place(arc: &SharedChunkData, pred_key: usize, predecessor
         "causal.tax",
         &format!(
             r#""start_bit":{start_bit},"marker_bytes":{marker_bytes},"resolve_us":{apply_us},"materialize_us":{materialize_us},"fused":{fused},"in_place":true"#,
-            fused = marker_bytes >= VENDOR_APPLY_WINDOW_LUT_ELEMENTS,
+            fused = marker_bytes > 0,
         ),
         "t",
     );
@@ -2514,7 +2509,7 @@ fn run_post_process_task(
     }
     let apply_us = t_apply.elapsed().as_micros();
     let resolve_us = apply_us as f64;
-    let fused = marker_bytes >= VENDOR_APPLY_WINDOW_LUT_ELEMENTS;
+    let fused = marker_bytes > 0;
     trace_v2::emit_instant(
         "causal.tax",
         &format!(
