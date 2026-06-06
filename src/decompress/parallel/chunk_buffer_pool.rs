@@ -300,48 +300,6 @@ pub fn return_u16_to_worker(owner_worker: usize, mut v: U16) {
     }
 }
 
-// ── Dedicated std `Vec<u16>` pool for the bootstrap marker buffer ──────────
-// The window-absent bootstrap decodes into `data_with_markers`. Measurement
-// (frozen interleaved x86 T8) showed decoding into the rpmalloc-backed `U16`
-// is ~3% slower per-byte than into a std `Vec<u16>` (the allocator the deleted
-// thread-local BOOTSTRAP_OUTPUT_POOL used). So `data_with_markers` is a std
-// `Vec<u16>` taken from THIS retained pool (warm pages, no per-chunk mmap)
-// and decoded into directly — no `append_markered` copy AND baseline decode
-// speed. The buffer cycles take → decode → resolve → return (recycle/drop).
-fn std_u16_pools() -> &'static [Mutex<Vec<Vec<u16>>>] {
-    static POOLS: OnceLock<Vec<Mutex<Vec<Vec<u16>>>>> = OnceLock::new();
-    POOLS.get_or_init(|| (0..MAX_WORKERS).map(|_| Mutex::new(Vec::new())).collect())
-}
-
-/// Take a std `Vec<u16>` from the current worker's pool (warm if recycled).
-pub fn take_std_u16(min_capacity: usize) -> Vec<u16> {
-    let idx = pool_index_for_take();
-    if let Ok(mut pool) = std_u16_pools()[idx].lock() {
-        if let Some(mut v) = pool.pop() {
-            v.clear();
-            if v.capacity() < min_capacity {
-                v.reserve(min_capacity - v.capacity());
-            }
-            return v;
-        }
-    }
-    Vec::with_capacity(min_capacity)
-}
-
-/// Return a std `Vec<u16>` to the owner worker's pool.
-pub fn return_std_u16_to_worker(owner_worker: usize, mut v: Vec<u16>) {
-    if v.capacity() == 0 {
-        return;
-    }
-    let idx = owner_worker.min(MAX_WORKERS - 1);
-    if let Ok(mut pool) = std_u16_pools()[idx].lock() {
-        if pool.len() < MAX_POOLED {
-            v.clear();
-            pool.push(v);
-        }
-    }
-}
-
 // ── Per-worker pool of 128 KiB U16 marker segments (SegmentedU16) ─────────
 const MARKER_SEGMENT_ELEMENTS: usize = 64 * 1024;
 const MAX_POOLED_SEGMENTS: usize = 64;
