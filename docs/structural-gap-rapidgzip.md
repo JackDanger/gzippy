@@ -113,11 +113,11 @@ Causal: `GZIPPY_SLOW_BOOTSTRAP` +100% → wall +48–61% (decode on critical pat
 
 | | rapidgzip | gzippy |
 |--|-----------|--------|
-| Offset match | `matchesEncodedOffset`: `encoded ≤ offset ≤ max` (`ChunkData.hpp:397–402`) | `matches_encoded_offset` range OK |
-| Prefetch accept | Range + chain | **Strict:** `max_acceptable_start_bit == decode_start` only (`chunk_fetcher.rs:1251`) |
-| Risk | Chain enforced by construction | Guard-rejects when spacing overshoots; safe but more on-demand re-decodes |
+| Offset match | `matchesEncodedOffset`: `encoded ≤ offset ≤ max` (`ChunkData.hpp:397–402`) | `matches_encoded_offset` — aligned |
+| Prefetch accept | `matchesEncodedOffset(blockOffset)` (`GzipChunkFetcher.hpp:646–648,670`) | Same — aligned (2026-06) |
+| Predecessor lookup | `WindowMap::get(offset)` exact | `confirmed_predecessor_window` exact — aligned (2026-06) |
 
-Porting vendor range-accept without chain invariant risks corruption (`plans/wall-progress.md` § overshoot-prefix).
+Chain invariant is vendor-assumed; correctness verified via CRC stress + routing tests.
 
 ---
 
@@ -128,6 +128,18 @@ Porting vendor range-accept without chain invariant risks corruption (`plans/wal
 | Output | `DecodedData` segmented `FasterVector` | `SegmentedU8` + `writev` (shipped `0a448d1`) |
 | Fulcrum | — | `consumer.writev` ~**0.6 ms** self — **slack**, not wall lever |
 | Lone mid-stream emit | vendor pair drain | **DISPROVED** — CRC at chunk boundary |
+
+---
+
+## 7b. Subchunk sparsity (`usedWindowSymbols`) — partial (2026-06)
+
+| | Vendor | gzippy (this tree) |
+|--|--------|---------------------|
+| Field | `Subchunk::usedWindowSymbols` (`ChunkData.hpp:144`) | `used_window_symbols: Vec<bool>` |
+| Population | `getUsedWindowSymbols` at split/finalize (`GzipChunk.hpp:61-133`) | `used_window_symbols.rs` + `determine_used_window_symbols_for_last_subchunk` |
+| Apply | Zero unused bytes before `CompressedVector` (`ChunkData.hpp:341-345`) | `populate_subchunk_windows` sparsity pass |
+| `hasBeenPostProcessed` | requires `usedWindowSymbols.empty()` | aligned |
+| Subchunk `window` type | zlib `CompressedVector` via `windowCompressionType()` | **Aligned** (2026-06) — `populate_subchunk_windows` + `publish_subchunk_windows` |
 
 ---
 

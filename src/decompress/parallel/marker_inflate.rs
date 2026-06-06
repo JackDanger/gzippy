@@ -449,6 +449,34 @@ impl Block {
     pub fn track_backreferences(&self) -> bool {
         self.track_backreferences
     }
+
+    pub fn backreferences(&self) -> &[Backreference] {
+        &self.backreferences
+    }
+
+    /// Vendor `resolveBackreference` tracking (`deflate.hpp:1354-1364`).
+    fn record_backreference_for_sparsity(
+        &mut self,
+        distance: usize,
+        length: usize,
+        emitted: usize,
+    ) {
+        if !self.track_backreferences {
+            return;
+        }
+        let decoded_in_block = self
+            .decoded_bytes
+            .saturating_sub(self.decoded_bytes_at_block_start)
+            .saturating_add(emitted);
+        if distance > decoded_in_block {
+            let stored_dist = (distance - decoded_in_block) as u16;
+            let stored_len = (length as u16).min(stored_dist);
+            self.backreferences.push(Backreference {
+                distance: stored_dist,
+                length: stored_len,
+            });
+        }
+    }
     /// True while back-refs may produce markers (pre mid-decode
     /// switch). Flipped to false by `pub fn read` once the chunk has
     /// accumulated 32 KiB of consecutive clean output AND the chunk
@@ -1331,13 +1359,8 @@ impl Block {
                         &mut distance_marker,
                     );
                 }
+                self.record_backreference_for_sparsity(distance, length, emitted);
                 emitted += length;
-                if self.track_backreferences {
-                    self.backreferences.push(Backreference {
-                        distance: distance as u16,
-                        length: length as u16,
-                    });
-                }
                 break;
             }
         }
@@ -1490,13 +1513,8 @@ impl Block {
                         );
                     }
                     phys = (pos & (RING_SIZE - 1)) as u16;
+                    self.record_backreference_for_sparsity(distance, length, emitted);
                     emitted += length;
-                    if self.track_backreferences {
-                        self.backreferences.push(Backreference {
-                            distance: distance as u16,
-                            length: length as u16,
-                        });
-                    }
                 }
                 self.ring_pos = pos;
                 self.decoded_bytes += emitted;
@@ -1836,13 +1854,10 @@ impl Block {
                                         );
                                     }
                                     phys = (pos & (RING_SIZE - 1)) as u16;
+                                    self.record_backreference_for_sparsity(
+                                        distance, length, emitted,
+                                    );
                                     emitted += length;
-                                    if self.track_backreferences {
-                                        self.backreferences.push(Backreference {
-                                            distance: distance as u16,
-                                            length: length as u16,
-                                        });
-                                    }
 
                                     // Refill + preload next entry.
                                     if (bits.bitsleft as u8) < REFILL_THRESHOLD {

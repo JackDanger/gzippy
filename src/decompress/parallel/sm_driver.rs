@@ -36,6 +36,8 @@ pub fn read_parallel_sm<W: std::io::Write>(
         split_chunk_size: target_compressed_chunk_bytes,
         max_decoded_chunk_size: 20 * target_compressed_chunk_bytes,
         crc32_enabled: true,
+        window_sparsity: true,
+        window_compression_type: None,
     };
 
     // Clean-window oracle (GZIPPY_CLEAN_WINDOW_ORACLE=1, default OFF): decode
