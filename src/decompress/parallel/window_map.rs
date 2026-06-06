@@ -218,6 +218,20 @@ impl WindowMap {
             .cloned()
     }
 
+    /// Worker-only predecessor from **confirmed** `entries` only.
+    /// Used for Design H′ (decode at `pred_key` before partition seed): speculative
+    /// side-slot keys can be chain-invalid on low-entropy fixtures.
+    pub fn get_confirmed_predecessor_for_worker(
+        &self,
+        encoded_offset_bits: usize,
+    ) -> Option<(usize, Window)> {
+        let g = self.state.lock().unwrap();
+        g.entries
+            .range(..=encoded_offset_bits)
+            .next_back()
+            .map(|(k, v)| (*k, v.clone()))
+    }
+
     /// Worker-only `get_predecessor` merging confirmed + speculative maps.
     pub fn get_predecessor_for_worker(
         &self,
@@ -497,6 +511,16 @@ mod tests {
         let (k, w) = m.get_predecessor_for_worker(1000).unwrap();
         assert_eq!(k, 500);
         assert_eq!(w.raw_bytes()[0], 0x22);
+    }
+
+    #[test]
+    fn get_confirmed_predecessor_for_worker_ignores_speculative() {
+        let m = WindowMap::with_compression(CompressionType::None);
+        m.insert(100, window_of(0x11));
+        m.insert_speculative(500, window_of(0x22));
+        let (k, w) = m.get_confirmed_predecessor_for_worker(1000).unwrap();
+        assert_eq!(k, 100);
+        assert_eq!(w.raw_bytes()[0], 0x11);
     }
 
     #[test]
