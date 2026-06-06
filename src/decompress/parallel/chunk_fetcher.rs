@@ -676,6 +676,12 @@ fn drive_impl<W: std::io::Write>(
             "  Eager harvest ready: {}",
             EAGER_HARVEST_READY.load(Ordering::Relaxed),
         );
+        eprintln!(
+            "  Prefetch post-process: promoted={} harvest_promoted={} already_resolved_take={}",
+            PREFETCH_POST_PROCESS_PROMOTED.load(Ordering::Relaxed),
+            PREFETCH_HARVEST_PROMOTED.load(Ordering::Relaxed),
+            PREFETCH_ALREADY_RESOLVED.load(Ordering::Relaxed),
+        );
         // Unified-decoder migration counters (reimplement-isa-l):
         //   handoff_window_grows ≈ num_worker_threads (one per thread, then
         //     flat) PROVES the per-chunk `clean_window: Vec<u8>` alloc is gone.
@@ -1031,6 +1037,14 @@ fn consumer_loop<W: std::io::Write>(
             block_fetcher.process_ready_prefetches();
         }
         prefetch_us_sum += t_prefetch.elapsed().as_micros();
+        // Vendor `waitForReplacedMarkers` (:497-511): non-blocking harvest of
+        // ready marker-replace futures on every consumer iteration, not only
+        // during dispatch/drain stalls.
+        harvest_ready_postprocess(
+            block_fetcher,
+            &mut prefetch_post_inflight,
+            &mut eager_completed,
+        );
 
         // Vendor GzipChunkFetcher.hpp:318 — `m_blockFinder->get(m_nextUnprocessedBlockIndex)`.
         let t_finder = std::time::Instant::now();
@@ -2976,7 +2990,10 @@ impl ConsumerChunkHold {
         pred_key: Option<usize>,
     ) -> (ChunkData, bool) {
         match self {
-            Self::Owned(c) => (c, false),
+            Self::Owned(c) => {
+                let already = c.markers_resolved;
+                (c, already)
+            }
             Self::Deferred { arc } => {
                 if arc.markers_resolved {
                     return ((*arc).clone(), true);
