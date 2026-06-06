@@ -350,29 +350,6 @@ fn finish_decode_chunk_with_inexact_offset(
     )
 }
 
-/// Retired non-vendor recovery path (Gate 1). Kept for reference until deleted.
-#[cfg(parallel_sm)]
-#[allow(dead_code)]
-fn resumable_resync(
-    chunk: &mut ChunkData,
-    input: &[u8],
-    inflate_start_bit: usize,
-    stop_hint_bits: usize,
-    initial_window: &[u8],
-    record_decode_duration: bool,
-) -> Result<(), ChunkDecodeError> {
-    BULK_TAIL_RESUMABLE_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    finish_decode_chunk_impl(
-        chunk,
-        input,
-        inflate_start_bit,
-        stop_hint_bits,
-        initial_window,
-        record_decode_duration,
-        false,
-    )
-}
-
 #[cfg(parallel_sm)]
 fn finish_decode_chunk_impl(
     chunk: &mut ChunkData,

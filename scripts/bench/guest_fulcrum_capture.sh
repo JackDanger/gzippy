@@ -93,9 +93,8 @@ build_rapidgzip_trace() {
     || { echo "RUN_TRUSTWORTHY=false"; echo "FAILURE=rapidgzip-trace-build"; exit 8; }
 }
 
-[ -x "$RG_TRACE" ] || build_rapidgzip_trace
-# Rebuild when path-mix patch is new (idempotent patches skip; binary may be stale).
-if ! grep -q 'worker.decode' "$REPO/vendor/rapidgzip/librapidarchive/src/rapidgzip/GzipChunkFetcher.hpp" 2>/dev/null; then
+install_rapidgzip_trace_patches
+if [ ! -x "$RG_TRACE" ] || ! grep -q 'worker.decode' "$REPO/vendor/rapidgzip/librapidarchive/src/rapidgzip/GzipChunkFetcher.hpp" 2>/dev/null; then
   build_rapidgzip_trace
 fi
 [ -x "$RG_TRACE" ] || { echo "RUN_TRUSTWORTHY=false"; echo "FAILURE=no-rg-trace"; exit 8; }
