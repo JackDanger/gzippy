@@ -8,6 +8,8 @@
 
 **Headline:** Recent convergence is real and mostly faithful — dispatch, window map, output path (writev + vmsplice/SpliceVault), thread priorities, segmented buffers, and rpmalloc per-`Vec` with lazy per-thread init all match vendor. Two prior audit flags (C1, D3) are **stale** (dead code, not production path). Genuine remaining divergences are fewer than earlier audits implied.
 
+**Landed since `0462f88` (head `738dea6`):** Gate 1 (`bad_seed_resync` removed), A1 (64-byte ring/scratch align), B1 (logical `pool_size`), B2 (rpmalloc default alloc), B4 (`take_std_u16` deleted), Gate 0 bench hook (rapidgzip `patch_model_params` on guest). **Pending Fulcrum** at `738dea6` to measure wall + path-mix delta vs snapshot below.
+
 ---
 
 ## Fulcrum behavioral snapshot (`0462f88`, T8 trace)
@@ -41,10 +43,10 @@
 
 | ID | Claim | Verdict | Detail |
 |----|-------|---------|--------|
-| **D1** | Unaligned marker ring + LUTs | **CONFIRMED, real** | `isal_lut_bulk.rs:700` `ring: Box<[u16; RING_SIZE]>` via `vec![0u16; RING_SIZE].into_boxed_slice()` → align 2. Vendor `deflate.hpp:926` `alignas(64) PreDecodedBuffer m_window16`; LUT backings `alignas(64)` at `:958-960`. In-code “Rust cannot alignas(64) on stable” comment is **false**. |
+| **D1** | Unaligned marker ring + LUTs | **FIXED (`fc3d61e`)** | `AlignedMarkerRing` / `AlignedDecoderScratch` `#[repr(C, align(64))]`. Re-verify on Fulcrum. |
 | **C1** | Missing dist==1 RLE in bulk-LUT copies | **STALE** | `copy_match` (:415) and `copy_match_u8` (:1093) off production path. Production flip returns `FlipToClean` → `finish_decode_chunk_with_inexact_offset` (`gzip_chunk.rs:686-703`), not `read_compressed_clean_u8`. Clean path uses `copy_match_fast` (`consume_first_decode.rs:504`) with dist==1 SIMD arm. Runtime impact ≈ 0. |
-| **D2** | Manual pool over rpmalloc | **CONFIRMED, real** | `chunk_buffer_pool.rs` per-worker `Mutex<Vec<U8/U16>>` LIFO, cap 12. Vendor `FasterVector.hpp:120-128` — rpmalloc thread cache only, no manual pool. |
-| **D3** | System-`Vec` marker scratch | **STALE** | `take_std_u16` (`chunk_buffer_pool.rs:308`) has **no production callers**. `data_with_markers` is `SegmentedU16` → `take_marker_segment()` → rpmalloc `U16`. Dead code to delete, not a live deviation. |
+| **D2** | Manual pool over rpmalloc | **FIXED (`534415c`)** | Default: rpmalloc alloc per take; `GZIPPY_MANUAL_BUFFER_POOL=1` for A/B. Re-verify page faults on Fulcrum. |
+| **D3** | System-`Vec` marker scratch | **FIXED (`738dea6`)** | `take_std_u16` deleted. |
 
 ---
 
@@ -52,7 +54,7 @@
 
 | # | Item | gzippy ↔ vendor | Runtime-observable? | Notes |
 |---|------|-----------------|----------------------|-------|
-| **A1** | 64-byte alignment of marker ring + LUTs (D1) | `isal_lut_bulk.rs:700,728` ↔ `deflate.hpp:926,958-960` | Yes — cache-line splits on 32-byte SIMD drain/copy | Vendor-mandated. Fix: `#[repr(align(64))]` newtype on ring + `DecoderScratch` / LUT backings. |
+| **A1** | 64-byte alignment of marker ring + LUTs (D1) | **LANDED `fc3d61e`** ↔ `deflate.hpp:926,958-960` | Awaiting Fulcrum | — |
 | **A2** | Window sparsity (`getUsedWindowSymbols`) | Absent (doc comment only) ↔ `GzipChunk.hpp:60-133` | Yes — larger `WindowMap` entries; extra compress CPU | Secondary. Port `determineUsedWindowSymbolsForLastSubchunk` + subchunk zeroing at `GzipChunk.hpp:93-96`. |
 | **A3** | dist==1 memset in bulk-LUT (C1) | `isal_lut_bulk.rs:1093,415` ↔ `deflate.hpp:1393-1398` | No — off production path | Inert unless bulk-LUT clean tail promoted over ResumableInflate2. Do not prioritize. |
 | **A4** | Multi-stream loop inside window-absent chunk | Single-member only ↔ `GzipChunk.hpp:468-654` `isAtStreamEnd` | Only if chunk spans gzip member boundary | Out of scope for routed single-member path. |
@@ -63,10 +65,10 @@
 
 | # | Deviation | gzippy ↔ vendor | What profiler sees | Verdict |
 |---|-----------|-----------------|-------------------|---------|
-| **B1** | Worker count clamped to **physical** cores | `chunk_fetcher.rs:304,462` `.min(get_physical())` ↔ `BlockFetcher.hpp:179` logical `availableCores()` | On SMT host at high T: ≤ physical threads vs vendor ≈2× logical | **Divergent.** Vendor never clamps requested parallelization down. |
-| **B2** | Manual `Mutex` buffer pool over rpmalloc (D2) | `chunk_buffer_pool.rs:215-292` ↔ `FasterVector.hpp:120-128` rpmalloc only | Extra mutex per take/Drop; cross-thread cache-line bounce; cap-12 reuse cliff | **Divergent.** Only structural allocator mismatch in page-fault dimension profiles flag. |
+| **B1** | Worker count clamped to **physical** cores | **LANDED `ff00aa0`** ↔ `BlockFetcher.hpp:179` | Awaiting Fulcrum wall at T16 | Was divergent; fix applied. |
+| **B2** | Manual `Mutex` buffer pool over rpmalloc (D2) | **LANDED `534415c`** ↔ `FasterVector.hpp:120-128` rpmalloc only | Awaiting Fulcrum page-fault / wall | Env-gated legacy pool for A/B. |
 | **B3** | Flip to clean **earlier** than vendor | `gzip_chunk.rs:957` `!contains_marker_bytes()` ↔ `GzipChunk.hpp:520-525` `cleanDataCount >= MAX_WINDOW_SIZE` after Block flip | Fewer bytes through marker engine, more through ISA-L/ResumableInflate2 | **Favorable — KEEP.** Correct and faster; do not converge to vendor here. |
-| **B4** | Dead allocator / clean-tail helpers | `take_std_u16`, `read_compressed_clean_u8`, `copy_match_u8` | None at runtime | Dead code — delete to prevent stale-audit confusion (C1/D3). |
+| **B4** | Dead allocator / clean-tail helpers | `take_std_u16` **deleted**; `read_compressed_clean_u8` / `copy_match_u8` remain inert in `isal_lut_bulk` | None at runtime | Partial cleanup done. |
 
 ### B1 — exact change (faithful)
 
@@ -123,7 +125,7 @@ flowchart LR
     G1[get exact key] --> H1{hit? ~10%}
     H1 -->|yes| I1[inflate wrapper]
     H1 -->|no ~90%| J1[scan + MarkerRing]
-    J1 --> K1[bad_seed_resync]
+    J1 --> K1[tryToDecode fail propagate]
     K1 --> L1[finish_decode / ResumableInflate2]
     L1 --> M1[post_process + consumer wait]
     M1 --> N1[write]
@@ -134,7 +136,7 @@ flowchart LR
 2. **Path mix** — 90% window-absent / 97% KEY-MISMATCH; need rapidgzip path-mix counters to compare duty cycle under shared keying.
 3. **Consumer ↔ resolve coupling** — publish-chain binds gzippy wall; rapidgzip does not bind the same way.
 
-**Structural divergences independent of path mix:** B1 thread count, B2 buffer pool, A1 ring alignment. B3 early flip is favorable, not a gap.
+**Structural divergences independent of path mix (pre-Fulcrum):** B1/B2/A1 landed; measure at `738dea6`. B3 early flip is favorable, not a gap.
 
 ---
 
@@ -155,10 +157,10 @@ flowchart LR
 
 For **vendor structural convergence** experiments:
 
-1. **B2** — manual Mutex pool over rpmalloc (allocator-structure; page-fault dimension)
-2. **B1** — physical-core clamp (thread-count observable on SMT)
-3. **A1** — 64-byte ring + LUT alignment (vendor-mandated, cheap)
+1. **Fulcrum @ `738dea6`** — wall T16, `bad_seed_resync==0`, path-mix gzippy vs rapidgzip (`fulcrum model`)
+2. **Gate 4** — consumer ↔ resolve topology (publish-chain binding)
+3. **A2** — window sparsity (`getUsedWindowSymbols`)
 
-**Do not prioritize:** A3 (C1 stale), D3 cleanup-only, B3 “fix” toward vendor.
+**Done (awaiting measurement):** B2, B1, A1, Gate 1, B4 partial.
 
-**Delete when convenient:** B4 dead helpers (`take_std_u16`, unused MarkerRing clean-u8 path).
+**Do not prioritize:** A3 (C1 stale), B3 “fix” toward vendor.
