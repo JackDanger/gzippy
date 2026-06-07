@@ -1,5 +1,91 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## MERGE-REMOVAL LANDED → rg's view-based applyWindow ported; T8 wall MOVED +12% (0.65×→0.73× rg), byte-exact, advisor-UPHELD [2026-06-07, OWNER turn, branch reimplement-isa-l]
+Executed step 1 of the bounded plan: port (ii) rg's view-based applyWindow = drop the redundant
+full-output memcpy in `merge_resolved_markers_into_data`. Charter CURRENT STATE updated. Advisor:
+plans/merge-removal-advisor-verdict.md. Brief: plans/merge-removal-advisor-brief.md.
+
+CHANGE (chunk_fetcher.rs:2453 resolve_chunk_markers_on_chunk + chunk_data.rs): DROP
+`merge_resolved_markers_into_data()` (~68MB full-output alloc+memcpy, segmented_buffer.rs:356) AND
+the eager `recycle_markers_after_resolution()`. Narrowed marker bytes stay in `data_with_markers`
+(narrowed_len set), emitted zero-copy via append_narrowed_iovecs; recycle DEFERRED behind the
+consumer writev (defer_chunk_recycle → recycle_decoded_buffers frees both buffers). `contains_markers`
+treats narrowed_len>0 as resolved (post-narrow u16 high bytes are stale). populate_subchunk_windows
+assert relaxed. + debug-only double-resolve tripwire (advisor rec, byte-transparent). New test
+populate_subchunk_windows_unmerged_view_based_apply_window.
+
+BYTE-EXACT: gzippy-isal native (guest) + gzippy-native (local arm64) sha 028bd002…cb410f T1+T8
+path=ParallelSM. 856 lib tests pass (1 fail = pre-existing flaky diff_ratio timing micro-test, fails
+identically on unmodified 507d6ecb). Seam + native_fold_parity green.
+
+REMOVE-AND-MEASURE (NOT the SUM, advisor Q4): locked guest 10.30.0.199 double-ssh, 16c gov=perf
+turbo-on, taskset 0,2,4,6,8,10,12,14, T8, measure.sh interleaved N=11, RAW=68229982, sha-OK every run.
+base(WITH merge) vs mergefix(REMOVED): run1 0.2291→0.2045 (+12.0%); run2 0.2128→0.1900 (+12.0%);
+run3 0.2006→0.1765 (+13.7%, cleanest 6-13% spread). rg ratio base ~0.65× → mergefix ~0.73×. Sign
+stable + load-invariant (1.64/2.80/1.86) ⇒ not a turbo artifact (interleaved = freq-neutral). KEEP.
+
+ADVISOR: C1 UPHELD, C2 + C3 UPHELD-WITH-CAVEATS. Vendor citation accurate (change is MORE faithful);
+no use-after-recycle on any emit path; re-resolution gates hold via !markers_resolved. Correction
+ADOPTED: double-resolve tripwire (merge used to empty the buffer as the guard; safety now rests on
+markers_resolved).
+
+NEW WHOLE-SYSTEM WALL vs rg: T8 ~0.73× (was ~0.65×). Still a LOSS. NEXT (do NOT start — supervisor
+gate): port (i) rg's multi-cached u16 marker loop (decodeBlock 1.69×, the larger gap), advisor-gated,
+remove-and-measure. GUEST: /root/gzippy reset to clean 507d6ecb (prior overlays stashed as
+owner-overlays-507turn) + /tmp/mergefix.patch. Builds /tmp/gzbuild-base (with merge) + /tmp/gzbuild-mergefix
+(removed), both sha 028bd002…cb410f. Drivers /tmp/merge_measure.sh + /tmp/sha_check.sh (bash). NO orphans.
+
+## CEILING BOUNDED → T8 TIE NEEDS TWO FAITHFUL PORTS (marker loop + view-based applyWindow); apply_window NOT at parity, divergence = a redundant memcpy [2026-06-07, OWNER turn, HEAD 507d6ecb +substep-timers-on-guest]
+Paid the OWED apply_window measurement + source-verified rg's u16 marker-decode mechanism first-hand,
+then DECOMPOSED gzippy's apply_window. Charter CURRENT STATE updated. Advisor:
+plans/marker-kernel-ceiling-advisor-verdict.md (all UPHELD-WITH-CAVEATS, none refuted). Brief:
+plans/marker-kernel-ceiling-brief.md. **SUPERVISOR GATE — fix build NOT started.**
+
+RG MARKER MECHANISM (source, vendor deflate.hpp): readInternal (:1428) dispatches by Huffman-coding
+TYPE not marker-vs-clean; with WITH_ISAL lit/len = readInternalCompressedMultiCached (:1453) for BOTH
+u16 markers AND u8 clean (templated on Window). ONE loop; containsMarkerBytes = constexpr from element
+type (:1600). Marker arms are cheap constexpr-gated only (dist-to-last-marker counter :1311-1317,
+post-memcpy back-scan :1379-1389, inverse range-check skip :1652-1655); resolveBackreference fast arm
+is std::memcpy for both (:1376). ⇒ NO separate slow marker path in rg; the 2× is gzippy's engine. The
+faithful target is PORT rg's multi-cached u16 loop, NOT bolt AVX onto gzippy's loop (= E234 0.41×
+plateau). Caveat: markers are u16 ⇒ ~2× clean traffic by construction; promise "marker == rg u16 loop."
+
+OWED MEASUREMENT (locked guest 10.30.0.199 double-ssh, 16c gov=perf turbo-on load~1.0, taskset
+0,2,4,6,8,10,12,14, T8, RAW=68229982, sha 028bd002…cb410f every run, /tmp/gzbuild-isal native,
+measurement-only sub-step timers byte-exact NOT committed, 3 runs):
+  decodeBlock gzippy 0.838s vs rg 0.497s = 1.69×.
+  apply_window decompose (SUM/15 marker chunks): gather 0.044-0.064s | crc 0.013-0.019s |
+  MERGE 0.116-0.134s | subwin 0.010-0.012s | TOTAL 0.19-0.27s.
+  rg --verbose first-hand: "applying the last window" = 0.032s (NOT charter's cached 0.113s = WRONG),
+  checksum 0.0096s.
+KEY: gather (rg's applyWindow analogue) is ~1.5-2× and ALGORITHMICALLY IDENTICAL (base[i]=lut[v] ↔
+rg target[i]=fullWindow[chunk[i]], DecodedData.hpp:335-337). The DOMINANT divergence = MERGE
+(chunk_data.rs:1589 → segmented_buffer.rs:356 prepend_narrowed_from_markers): a full ~68MB output-size
+memcpy that rg does as std::swap + in-place VectorViews (DecodedData.hpp:368-388). gzippy already has
+the zero-copy emit (append_narrowed_iovecs) ⇒ the merge-copy is REDUNDANT for the iovec writer.
+
+ADVISOR: all UPHELD-WITH-CAVEATS, none refuted. Q3 merge removable byte-exactly + faithful (every
+consumer supports un-merged state, traced) but a STRUCTURED change: defer marker-recycle behind
+consumer writev, relax populate_subchunk_windows narrowed_len==0 assert (chunk_data.rs:1291), keep
+narrowed_len through write. Q4 (LOAD-BEARING) do NOT trust −0.12s SUM as wall delta — merge runs on
+the pool; wall cost = only the un-overlapped fraction on consumer recv_post_process_blocking
+(chunk_fetcher.rs:1769) for un-pre-resolved head chunks, bounded by resolve-ahead hit rate
+(project_confirmed_offset_prefetch_gap). Provable ONLY remove-and-measure. Q5 ceiling DIRECTIONALLY
+SOUND, two ports right + faithful, NOT yet a proven TIE; third residual (gather/crc ~1.5× = segmented
+walk + per-chunk LUT rebuild vs rg contiguous + hoisted fullWindow) under-counted.
+
+BOUNDED CEILING (revised honest): T8 TIE plausibly pure-Rust via TWO faithful ports — (i) rg
+multi-cached u16 marker loop (decodeBlock 1.69×) + (ii) rg view-based applyWindow = drop the redundant
+merge memcpy (0.12-0.13s divergence). The prior "marker-COMPUTE only" ceiling was OPTIMISTIC exactly
+as advisor Q4 warned. SCOPED FIX next loop (do NOT start): land MERGE-REMOVAL FIRST (cheapest, payoff
+most uncertain ⇒ measure first) — swap+views model, defer recycle, relax assert, emit via
+append_narrowed_iovecs; byte-exact + measure interleaved T8 wall (freq-neutral). THEN the multi-cached
+u16 marker loop. Each advisor-gated, each remove-and-measure (never the SUM, never the slope).
+GUEST: /root/gzippy @7bf26096 + oracle overlay + decompose knobs + THIS turn's measurement-only
+sub-step timers in chunk_fetcher.rs (gather/crc/merge/subwin, via /tmp/patch_resolve.py +
+/tmp/patch_merge.py, NOT committed locally, byte-exact). Build /tmp/gzbuild-isal (native, rebuilt).
+Drivers /tmp/applywin_measure.sh + /tmp/substep2_measure.sh (bash). NO orphan processes.
+
 ## BUNDLE DECOMPOSED → T8 SUB-LEVER = marker-COMPUTE (gzippy window-absent u16 decode ~2× slower than rg) [2026-06-07, OWNER turn, HEAD 5e9905c8 +decompose-knobs]
 Decomposed the GZIPPY_SEED_WINDOWS bundle (advisor's 3-removal confound) on the whole-system T8
 wall. Charter CURRENT STATE updated. Advisor: plans/t8-decompose-advisor-verdict.md. Pre-reg:
