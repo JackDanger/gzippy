@@ -576,9 +576,19 @@ impl ChunkData {
 
     /// Vendor `ChunkData::containsMarkers` — any unresolved marker symbol in
     /// `data_with_markers` (values ≥ `MARKER_BASE`).
+    ///
+    /// `narrowed_len > 0` means `apply_window` already resolved+narrowed the
+    /// markers in place (u8 written into the low bytes of the u16 backing) under
+    /// the view-based emit model — the buffer is NOT cleared (its narrowed bytes
+    /// are the output views, recycled on writev). In that state `all_resolved()`
+    /// would misread the stale u16 high bytes, so treat narrowed == resolved
+    /// (vendor swaps the resolved buffer out, so its `containsMarkers` is false
+    /// post-`applyWindow` too).
     #[inline]
     pub fn contains_markers(&self) -> bool {
-        !self.data_with_markers.is_empty() && !self.data_with_markers.all_resolved()
+        self.narrowed_len == 0
+            && !self.data_with_markers.is_empty()
+            && !self.data_with_markers.all_resolved()
     }
 
     /// Vendor `ChunkData::hasBeenPostProcessed` (ChunkData.hpp:496-501).
@@ -1279,8 +1289,15 @@ impl ChunkData {
 
     /// Populate the `window` field of every subchunk with the 32 KiB
     /// window required to resume decode at that subchunk's start.
-    /// Must run AFTER `merge_resolved_markers_into_data` so
-    /// `getWindowAt` walks unified `data` (vendor post-swap order).
+    ///
+    /// Vendor `applyWindow` is `narrow (DecodedData.hpp:325-363) → swap+views
+    /// (:365-388)`; there is NO output-size copy. gzippy mirrors that: the
+    /// narrowed marker bytes stay in `data_with_markers` (the u8 view of the
+    /// u16 backing) and are emitted directly via `append_narrowed_iovecs`.
+    /// So this step may run with `narrowed_len > 0` (un-merged state) —
+    /// `copy_window_at_chunk_offset` reads the 3-part view
+    /// `predecessor ‖ markers ‖ data` and branches on `narrowed_len > 0`,
+    /// so `getWindowAt` is correct either merged or un-merged.
     ///
     /// Literal port of the window-emplacement step in rapidgzip's
     /// `appendSubchunksToIndexes` cascade
@@ -1288,10 +1305,6 @@ impl ChunkData {
     pub fn populate_subchunk_windows(&mut self, predecessor_window: &[u8]) {
         const W: usize = 32768;
         debug_assert_eq!(predecessor_window.len(), W);
-        debug_assert_eq!(
-            self.narrowed_len, 0,
-            "populate_subchunk_windows after merge_resolved_markers_into_data"
-        );
         let compression = self.window_compression_type();
         let offsets: Vec<usize> = self.subchunks.iter().map(|sc| sc.decoded_offset).collect();
 
@@ -1510,6 +1523,14 @@ impl ChunkData {
     /// no-copy path rather than a ~3% regression: the warm buffer cycles
     /// take → decode → resolve → return in time for the next take. Idempotent:
     /// leaves an empty buffer, so the `Drop` return becomes a no-op.
+    ///
+    /// NOTE: no longer called on the production post-process path. Under the
+    /// view-based applyWindow model (vendor swap+views, DecodedData.hpp:365-388)
+    /// the narrowed marker bytes stay in `data_with_markers` and ARE the output
+    /// views, so they must outlive the consumer's writev; recycling is deferred
+    /// behind the write via `defer_chunk_recycle` → `recycle_decoded_buffers`.
+    /// Kept for the legacy merge-then-recycle path + as vendor-parity surface.
+    #[allow(dead_code)]
     pub(crate) fn recycle_markers_after_resolution(&mut self) {
         // After `merge_resolved_markers_into_data`, marker segments are empty
         // and payload bytes live in `data` — safe to return u16 buffers to the
@@ -1556,6 +1577,17 @@ impl ChunkData {
         debug_assert_eq!(
             self.data_prefix_len, 0,
             "trim_window_prefix before resolve_and_narrow_markers_in_place"
+        );
+        // Double-resolution tripwire. Under the view-based applyWindow model the
+        // narrowed bytes stay in `data_with_markers` (NOT cleared by a merge), so
+        // `all_resolved()` can no longer catch a second resolve (it would read the
+        // stale u16 high bytes left by the first narrow and feed them through the
+        // LUT → silent corruption). The merge used to empty the buffer and act as
+        // that guard; now correctness rests on `markers_resolved` / `narrowed_len`,
+        // so assert them here. (Advisor: merge-removal-advisor-verdict.md.)
+        debug_assert!(
+            self.narrowed_len == 0 && !self.markers_resolved,
+            "resolve_and_narrow_markers_in_place: already resolved (double-resolve)"
         );
         let len = self.data_with_markers.len();
         if len > 0 {
@@ -2077,6 +2109,57 @@ mod tests {
         let mut iovecs = Vec::new();
         chunk.append_output_iovecs(&mut iovecs);
         assert_eq!(iovecs.iter().map(|s| s.len()).sum::<usize>(), payload_len);
+    }
+
+    /// View-based applyWindow (vendor swap+views, DecodedData.hpp:365-388):
+    /// the production post-process now SKIPS `merge_resolved_markers_into_data`
+    /// and leaves the narrowed marker bytes in `data_with_markers` with
+    /// `narrowed_len > 0`. Lock that un-merged state: subchunk windows populate,
+    /// `has_been_post_processed` is true, and the iovec emit yields the SAME
+    /// bytes (markers ‖ data) as the merged path.
+    #[test]
+    fn populate_subchunk_windows_unmerged_view_based_apply_window() {
+        const W: usize = 32768;
+        let mut prev = [0u8; W];
+        for (i, b) in prev.iter_mut().enumerate() {
+            *b = (i & 0xff) as u8;
+        }
+
+        let mut chunk = ChunkData::new(0, small_config());
+        chunk.append_markered(&[0x11, MARKER_BASE + 5, 0x22]);
+        chunk.append_clean(&[0xAAu8; W + 512]);
+        chunk.finalize(10_000);
+
+        // Production order: fused resolve+narrow → CRC → subchunk windows.
+        // NO merge, NO recycle (the swap+views model).
+        chunk.resolve_and_narrow_markers_in_place(&prev);
+        chunk.update_narrowed_crc();
+        assert!(
+            chunk.narrowed_len > 0,
+            "narrowed bytes must remain in markers"
+        );
+        chunk.populate_subchunk_windows(&prev);
+
+        // Resolved marker chunk reports done even un-merged.
+        assert!(!chunk.contains_markers());
+        assert!(chunk.has_been_post_processed(false));
+        assert!(chunk
+            .subchunks
+            .iter()
+            .all(|sc| sc.window.is_some() && sc.used_window_symbols.is_empty()));
+
+        // The iovec emit reads markers ‖ data directly (no unified `data`).
+        let mut iovecs = Vec::new();
+        chunk.append_output_iovecs(&mut iovecs);
+        let emitted: usize = iovecs.iter().map(|s| s.len()).sum();
+        assert_eq!(emitted, chunk.decoded_size());
+        // First narrowed byte is the resolved 0x11 literal; the marker
+        // MARKER_BASE+5 resolves to prev[5].
+        let flat: Vec<u8> = iovecs.iter().flat_map(|s| s.iter().copied()).collect();
+        assert_eq!(flat[0], 0x11);
+        assert_eq!(flat[1], prev[5]);
+        assert_eq!(flat[2], 0x22);
+        assert_eq!(flat[3], 0xAA);
     }
 
     #[test]

@@ -2465,11 +2465,20 @@ fn resolve_chunk_markers_on_chunk(
         chunk.resolve_and_narrow_markers_in_place(predecessor_window);
     }
     chunk.update_narrowed_crc();
-    // Vendor DecodedData.hpp:365-388 — swap narrowed marker buffers into `data`
-    // before subchunk window emplacement and CRC Iterator walk unified `data`.
-    chunk.merge_resolved_markers_into_data();
+    // Vendor `applyWindow` = narrow (DecodedData.hpp:325-363) → swap + in-place
+    // VectorViews (:365-388). There is NO output-size copy: rapidgzip's narrowed
+    // marker buffers ARE the output views, recycled when `writeAll` completes.
+    // gzippy mirrors this — the narrowed marker bytes stay in `data_with_markers`
+    // (the u8 view of the u16 backing) with `narrowed_len` set, and the consumer
+    // emits them zero-copy via `append_narrowed_iovecs` (chunk_data.rs:1609).
+    // We therefore DROP the redundant `merge_resolved_markers_into_data` full-
+    // output memcpy AND the eager `recycle_markers_after_resolution`: the marker
+    // segments must outlive the consumer's writev, so recycling is DEFERRED
+    // behind the write via `defer_chunk_recycle` → `recycle_decoded_buffers`
+    // (chunk_fetcher.rs:3486 / chunk_data.rs:1621, which frees BOTH `data` and
+    // `data_with_markers`). `populate_subchunk_windows` runs against the un-merged
+    // markers — `copy_window_at_chunk_offset` already branches on `narrowed_len>0`.
     chunk.populate_subchunk_windows(predecessor_window);
-    chunk.recycle_markers_after_resolution();
     chunk.markers_resolved = true;
     chunk.resolved_pred_key = Some(pred_key);
 }
