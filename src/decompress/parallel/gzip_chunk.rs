@@ -2294,6 +2294,17 @@ mod native_fold_parity {
         let mut total = 0usize;
         let mut diverged = 0usize;
         let mut flips = 0usize;
+        // SEAM RECONCILIATION (advisor residual on the fold milestone): the native
+        // fold stops at a DIFFERENT bit than the retired two-phase tail. The
+        // consumer reconciles that seam via `furthest_decoded_bit` /
+        // `block_finder.insert(chunk_end_bit)` (chunk_fetcher.rs:1074, 1419). The
+        // end-to-end DUAL-SHA already covers it, but this cheaper in-file check
+        // proves the seam directly: a SECOND folded chunk started at the first
+        // chunk's `final_bit`, windowed by the first chunk's resolved tail, must
+        // produce bytes that continue the output CONTIGUOUSLY from `final_bit`.
+        // A wrong stop-point handoff would desync this seam silently.
+        let mut seam_checks = 0usize;
+        let mut seam_diverged = 0usize;
 
         for &si in &starts {
             for until_exact in [false, true] {
@@ -2379,8 +2390,62 @@ mod native_fold_parity {
                         f.final_bit >= stop_hint
                     );
                 }
+
+                // SEAM CHECK: only on a correct, real seam (final_bit is a true
+                // EOB boundary) with a full 32 KiB resolved window available and
+                // room for a follow-on chunk. Decode a SECOND folded chunk at
+                // `final_bit` and assert its resolved bytes continue the output
+                // contiguously from `start_off + f.full.len()` — i.e. the seam the
+                // consumer reconciles is byte-continuous on the SAME cursor.
+                let seam_off = start_off + f.full.len();
+                let seam_window_lo = seam_off.saturating_sub(WINDOW);
+                let have_window = seam_off - seam_window_lo == WINDOW;
+                let room_past = boundary_bits.contains(&f.final_bit)
+                    && seam_off < decoded.len()
+                    && f.final_bit < input.len() * 8;
+                if ok && have_window && room_past {
+                    let seam_window = &decoded[seam_window_lo..seam_off];
+                    // Stop the follow-on chunk a modest span past the seam so the
+                    // decode is cheap but still crosses several blocks.
+                    let seam_stop = (f.final_bit + 64 * 1024).min(input.len() * 8);
+                    let f2 = folded_window_absent(input, f.final_bit, seam_stop, seam_window);
+                    seam_checks += 1;
+                    let avail = decoded.len() - seam_off;
+                    let take = f2.full.len().min(avail);
+                    let seam_truth = &decoded[seam_off..seam_off + take];
+                    if f2.full[..take] != *seam_truth {
+                        seam_diverged += 1;
+                        eprintln!(
+                            "[fold-gate] SEAM DIVERGE ({label}): final_bit={} seam_off={} \
+                             follow_len={} first_diff={:?}",
+                            f.final_bit,
+                            seam_off,
+                            f2.full.len(),
+                            f2.full[..take]
+                                .iter()
+                                .zip(seam_truth.iter())
+                                .position(|(x, y)| x != y)
+                        );
+                    }
+                }
             }
         }
+
+        // The seam handoff is the whole point of the in-place fold: assert the
+        // consumer-level stop-point reconciliation is byte-continuous on a healthy
+        // number of real seams (else the fold could regress the seam silently —
+        // the residual this assertion closes).
+        assert_eq!(
+            seam_diverged, 0,
+            "FOLD seam reconciliation desynced on {seam_diverged}/{seam_checks} seams \
+             (follow-on chunk at final_bit did not continue output contiguously)"
+        );
+        assert!(
+            seam_checks >= 3,
+            "seam reconciliation exercised on only {seam_checks} seams — too few; \
+             widen sampling"
+        );
+        eprintln!("[fold-gate] SEAM: {seam_checks} seams checked, all byte-continuous");
 
         eprintln!(
             "[fold-gate] SUMMARY: {} chunk-decodes, {} correct, {} diverged, {} FLIPPED \
