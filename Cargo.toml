@@ -184,6 +184,11 @@ harness = false
 required-features = ["isal-compression"]
 
 [[bench]]
+name = "engine_isolation"
+harness = false
+required-features = ["pure-rust-inflate", "isal-compression"]
+
+[[bench]]
 name = "bootstrap_marker_overhead"
 harness = false
 required-features = ["pure-rust-inflate"]
