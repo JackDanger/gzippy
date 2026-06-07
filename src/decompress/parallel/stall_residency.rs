@@ -50,6 +50,46 @@ pub static CONTAINING_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 /// the stalled offset → EVICTED/absent. The re-scope signal.
 pub static NOT_RESIDENT: AtomicU64 = AtomicU64::new(0);
 
+// --- SATURATION vs HORIZON occupancy channels (plans/prefetch-horizon-falsifier.md) ---
+// At each non-startup cold-get stall, classify WHY the decode hasn't started:
+/// All workers busy at the stall instant (idle_capacity == 0) — no free slot to
+/// start the marginal index's decode. SATURATION (engine) signal.
+pub static OCC_SAT: AtomicU64 = AtomicU64::new(0);
+/// Idle worker capacity existed AND the stalled index was NEVER enqueued to the
+/// prefetcher (no in-flight key covers it). HORIZON-too-shallow (structural) signal.
+pub static OCC_HORIZON_NOT_ENQUEUED: AtomicU64 = AtomicU64::new(0);
+/// Idle worker capacity existed AND the stalled index WAS in-flight but not done
+/// (a key covers it). The "in-flight-not-done" lead-length / engine-speed case the
+/// prior 3 attempts hit — NOT a horizon-DEPTH lever (it was dispatched).
+pub static OCC_HORIZON_ENQUEUED_NOT_DONE: AtomicU64 = AtomicU64::new(0);
+/// Sum of busy-worker counts over non-startup stalls (for a mean-busy report).
+pub static OCC_BUSY_SUM: AtomicU64 = AtomicU64::new(0);
+/// Sum of idle_capacity over non-startup stalls (for a mean-idle report).
+pub static OCC_IDLE_CAP_SUM: AtomicU64 = AtomicU64::new(0);
+
+/// Classify one non-startup cold-get stall by worker occupancy + enqueued status.
+///
+/// `busy` = workers actively running a task (`spawned - idle`).
+/// `idle_capacity` = parked idle workers + not-yet-spawned slots (lazy spawn).
+/// `enqueued` = an in-flight prefetch key covers `decode_start` (the index WAS
+/// dispatched, just not finished).
+///
+/// Counters only; the caller already gates on `enabled()` + non-startup.
+pub fn classify_occupancy(busy: usize, idle_capacity: usize, enqueued: bool) {
+    if !enabled() {
+        return;
+    }
+    OCC_BUSY_SUM.fetch_add(busy as u64, Ordering::Relaxed);
+    OCC_IDLE_CAP_SUM.fetch_add(idle_capacity as u64, Ordering::Relaxed);
+    if idle_capacity == 0 {
+        OCC_SAT.fetch_add(1, Ordering::Relaxed);
+    } else if enqueued {
+        OCC_HORIZON_ENQUEUED_NOT_DONE.fetch_add(1, Ordering::Relaxed);
+    } else {
+        OCC_HORIZON_NOT_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// One read-only residency snapshot at a cold-get stall.
 ///
 /// `cached`: `(encoded_offset_bits, max_acceptable_start_bit)` for every decoded
@@ -177,5 +217,41 @@ pub fn report() {
          | non_startup={non_startup} resident(non-startup-est)={resident} ({resident_pct:.1}% of non-startup) \
          | conservation_ok={}",
         cached + inflight + absent == total,
+    );
+
+    // SATURATION vs HORIZON occupancy report (plans/prefetch-horizon-falsifier.md).
+    let sat = OCC_SAT.load(Ordering::Relaxed);
+    let hz_ne = OCC_HORIZON_NOT_ENQUEUED.load(Ordering::Relaxed);
+    let hz_end = OCC_HORIZON_ENQUEUED_NOT_DONE.load(Ordering::Relaxed);
+    let busy_sum = OCC_BUSY_SUM.load(Ordering::Relaxed);
+    let idle_sum = OCC_IDLE_CAP_SUM.load(Ordering::Relaxed);
+    let occ_total = sat + hz_ne + hz_end;
+    let mean_busy = if occ_total > 0 {
+        busy_sum as f64 / occ_total as f64
+    } else {
+        0.0
+    };
+    let mean_idle = if occ_total > 0 {
+        idle_sum as f64 / occ_total as f64
+    } else {
+        0.0
+    };
+    let verdict = if occ_total == 0 {
+        "NONE"
+    } else if sat * 2 >= occ_total {
+        "SATURATION"
+    } else if hz_ne * 2 >= occ_total {
+        "HORIZON"
+    } else if hz_end >= sat && hz_end >= hz_ne {
+        "IN-FLIGHT-NOT-DONE"
+    } else {
+        "MIXED-AMBIGUOUS"
+    };
+    eprintln!(
+        "  STALL_OCCUPANCY_PROBE: non_startup_classified={occ_total} \
+         SAT={sat} HORIZON_NOT_ENQUEUED={hz_ne} HORIZON_ENQUEUED_NOT_DONE={hz_end} \
+         | mean_busy={mean_busy:.2} mean_idle_cap={mean_idle:.2} \
+         | conservation_ok={} VERDICT={verdict}",
+        occ_total == non_startup,
     );
 }

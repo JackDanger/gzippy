@@ -1044,3 +1044,65 @@ has no resident parent to reuse REGARDLESS of cache size. NO verdict now on bug-
    tie. Caveat: re-quote with production output-write for the true same-sink margin.
 No placement port / engine work started. Both subagents (advisor) read-only, synchronous, no orphans.
 Host freq RESTORE VERIFIED after every guest run. Awaiting supervisor gate.
+
+## PLACEMENT RE-SCOPE — LAG-CAUSALITY DIAGNOSIS [DONE 2026-06-07, placement-rescope leader]
+CHARTER plans/placement-rescope-diagnosis.md. Answer the pivotal question: is the ~318ms
+consumer-prefetcher lag STRUCTURAL or an EFFECT of the 2.38x slow engine? HEAD cb60842d.
+Falsifier PRE-REGISTERED before any run: plans/lag-causality-falsifier.md. Guest verified idle
+before; host RESTORE VERIFIED after (no_turbo=0, all guests thawed); freed ~1.7G stale guest
+clones (gzippy-{reimplement,consolidate}-verify) for build headroom. No orphans.
+
+### PERTURBATION (slow_knob sweep, native clean arm marker_inflate.rs:1307/1546, locked guest T8, N=7, sha-verified, NO DIVERGENCE)
+| combo | T8 wall | per-blk busy | STALL COUNT (non-startup) | wait.block_fetcher_get | wait/blk-busy |
+|---|---|---|---|---|---|
+| F0 | 1.1105s | 0.29963ms | 3 | 369.1ms | 1232 |
+| F50 spin | 1.2055s | 0.35335ms | 3 | 445.0ms | 1259 |
+| F100 spin | 1.3704s | 0.44310ms | 3 | 646.3ms | 1459 (+18.4%) |
+| F50 sleep | 1.1827s | 0.32327ms | 3 | 418.5ms | 1295 |
+| F100 sleep | 1.2340s | 0.36314ms | 3 | 507.5ms | 1398 (+13.5%) |
+Wall monotonic + survives sleep (clean compute on T8 crit path — known). STALL COUNT dead-flat
+at 3 across 0->+48% slowdown (both kinds). Injection symmetric (slows prefetch+on-demand alike).
+
+### VERDICT (advisor-corrected): MIXED — existence STRUCTURAL, magnitude materially ENGINE-COUPLED, separability UNPROVEN
+plans/lag-causality-verdict.md. First-draft "STRUCTURAL/engine-invariant, small residual" was
+OVERSTATED + the design rested on a VENDOR MISREAD; both corrected after the disproof advisor.
+- EXISTENCE structural: load-bearing signal has_nearest_le_start=0 (NOT the flat count — count is
+  a saturated/low-N/wrong-direction proxy per rule 3). The 3 overshoot-tail cold-gets exist at F0,
+  cost ~369ms cold-wait now, parent never-retained. Removing them is worth doing.
+- MAGNITUDE engine-coupled: normalized wait/blk-busy +18.4% spin / +13.5% sleep (survives the
+  frequency control) => ~24% of cold-wait growth under slowdown is genuine drift. The COST (wall)
+  is partly engine-set; a faster engine shrinks the 318ms cost while the count stays 3.
+- SEPARABILITY unproven: placement does NOT dissolve into engine (stalls cost wall at F0) but is
+  NOT cleanly separable co-primary either. Both levers stay co-primary; engine still +13.7% (A.2).
+
+### VENDOR PACING MAP [read-only subagent, plans/vendor-pacing-map.md]
+rapidgzip's ~0-17ms pacing STRUCTURE (prefetch depth 2xpar, separate un-evictable in-flight map,
+join-in-flight, lean off-path consumer post-proc) is FAITHFULLY PORTED in gzippy LINE-FOR-LINE
+(block_fetcher.rs:737/758/66/536, chunk_fetcher.rs:528-529/1542/1561). The generic machinery is
+NOT the defect; the SPECIFIC overshoot-reuse path is. Subagent's source-read leaned engine-induced
+(the causal perturbation refined this to MIXED — perturbation overrules attribution per CLAUDE.md).
+
+### RE-SCOPED DESIGN (advisor-corrected): block-finder OFFSET SUPPLY, NOT insert-relocation
+- REFUTED (advisor, leader-verified first-hand): "move the block-finder insert POOL-side" was a
+  vendor MISREAD. appendSubchunksToIndexes (the insert) runs IN-ORDER on the orchestrator
+  (GzipChunkFetcher.hpp:357); queueChunkForPostProcessing (:554-582) pool-submits only applyWindow.
+  gzippy ALREADY inserts in-order (consumer_append_subchunks_vendor chunk_fetcher.rs:1750/2790,
+  citing :343-357). Pool-side move would DIVERGE from vendor (guardrail violation).
+- CANDIDATE LEVER: the block-finder offset SUPPLY. Vendor GzipBlockFinder::get (:117-158) returns
+  the CONFIRMED offset for a known index, partition GUESS only for unknown. gzippy's strategy offers
+  ONLY the guess + never RE-OFFERS once prefetched (needs_confirmed_offset never fires) => the stale
+  overshoot guess-prefetch is never superseded. Faithful port = make gzippy re-target the overshot
+  index at the confirmed offset once the in-order insert records it.
+- OPEN MECHANISM QUESTION (advisor-mandated, answer BEFORE any build): vendor inserts in-order with
+  the SAME ~1-chunk lead the 3 prior gzippy attempts had — so HOW does vendor avoid the overshoot
+  cold-get? Re-derive first-hand (block-finder re-target within existing look-ahead vs interior
+  reuse vs less-overshoot). The prior mechanistic story was tied to the refuted pool-side premise.
+
+### CHECKPOINT REACHED — STOP for supervisor ratification. NO placement port, NO engine build started.
+Subagents (vendor map + disproof advisor) read-only, synchronous, collected in-turn, killed (no
+orphans). Guest run held by a Bash task holding the ssh; host RESTORE VERIFIED. Supervisor to
+ratify: (1) the MIXED verdict (existence structural, magnitude engine-coupled, separability
+unproven); (2) that the placement lever survives but its standalone payoff is smaller/engine-
+entangled; (3) authorize TIER-3 placement ONLY to re-derive the vendor lead mechanism (block-finder
+offset supply) + gate on STALL probe(3->1)+no-flood A/B — NOT the insert-relocation, NOT the
+cache-read getIndexedChunk. Engine front unchanged (co-primary, +13.7%, gated by §2.3 bench).
