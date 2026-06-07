@@ -1,5 +1,39 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## PLACEMENT PORT GATE — **FAILED (do NOT code attempt #4)** [2026-06-07, HEAD e52b0fc2]
+Charter: plans/placement-port-authorization.md. The HARD 3-prior-failures re-derivation
+gate ran (2 read-only subagents + 1 independent disproof advisor, all synchronous). Verdict:
+**GATE FAIL — STOP. No port code written.** Full advisor verdict: plans/placement-port-advisor-verdict.md.
+
+- The authorized lever's PREMISE IS FACTUALLY WRONG. Authorization said "gzippy never
+  re-targets an overshot index at its CONFIRMED offset; rapidgzip does (GzipBlockFinder.hpp
+  :117-158)." Source (leader + advisor + leader-reverified) shows gzippy ALREADY re-targets
+  at the confirmed offset at THREE faithful sites: gzip_block_finder.rs:180-182 (confirmed
+  idx→confirmed offset), chunk_fetcher.rs:1306 (matches_encoded_offset accept) + :1431
+  (get_with_prefetch cold get AT the confirmed offset), block_fetcher.rs:945 (submit_for uses
+  block_finder.get(index) = confirmed offset). The lever targets a NON-DIVERGENCE.
+- Leader-VERIFIED directly (not just advisor): `needs_confirmed_offset` has ZERO hits in src/;
+  block_fetcher.rs:784-790 pushes BOTH the confirmed off AND the partition offset (partition
+  secondary, exactly vendor BlockFetcher.hpp:485-490) — gzippy does NOT collapse to partition.
+- VENDOR reaches the SAME overshoot cold-get (GzipChunkFetcher.hpp:646-654 fallthrough to
+  on-demand decode at the real offset). It absorbs it via the 2·P guess-prefetch horizon +
+  pump-during-wait, NOT a distinct block-finder mechanism. The confirmed offset is born at the
+  in-order insert in BOTH (appendSubchunksToIndexes :357-375 ↔ consumer_append_subchunks_vendor
+  chunk_fetcher.rs:2788-2795) = ≤1-chunk lead in both. No lead-lengthening mechanism to port.
+- WHY prior 3 failed (corroborated): all supplied confirmed offset at the ≤1-chunk frontier;
+  Attempt 3 submitted the EXACT correct offset → fetcher_get UNCHANGED T8 449ms / WORSE T16
+  303→936ms (in-flight-not-done). The proposed port inherits the SAME ≤1-chunk lead AND has
+  nothing to change → attempt #4 with the same load-bearing constraint.
+- ANTI-ESCAPE-HATCH (advisor guardrail, NOT yet done): do NOT bundle this into "it's the
+  engine, placement done." The genuinely-distinct UNCLOSED structural question: stalls are
+  "all decode_NOT_STARTED" — either workers saturated (engine) OR the GUESS-prefetch for that
+  index was never dispatched DEEP ENOUGH AHEAD (prefetch-HORIZON/scheduling — structural,
+  distinct from offset supply). That is the pre-registered slow-knob perturbation in
+  placement-rescope-diagnosis.md. **Proposed next step (SUPERVISOR GATE): run the
+  decode_NOT_STARTED / prefetch-horizon perturbation — NOT the offset-supply port, NOT the
+  engine build.** STOPPED for supervisor.
+
+
 ## NEW MISSION (2026-06-06, user-set) — SUPERSEDES all prior arcs
 Prior "full ISA-L port as a 2nd engine" plan is DEAD (critically reviewed: redundant
 2nd inflate vs ONE-engine memory; x86-only strands arm64). This mission, in order:
@@ -1106,3 +1140,53 @@ unproven); (2) that the placement lever survives but its standalone payoff is sm
 entangled; (3) authorize TIER-3 placement ONLY to re-derive the vendor lead mechanism (block-finder
 offset supply) + gate on STALL probe(3->1)+no-flood A/B — NOT the insert-relocation, NOT the
 cache-read getIndexedChunk. Engine front unchanged (co-primary, +13.7%, gated by §2.3 bench).
+
+## PREFETCH-HORIZON vs SATURATION DIAGNOSIS [2026-06-07, prefetch-horizon leader, HEAD 85c67474]
+CHARTER plans/prefetch-horizon-diagnosis.md. Answer the anti-escape-hatch question: are the
+all-`decode_NOT_STARTED` head-of-line stalls WORKER SATURATION (engine) or PREFETCH-HORIZON
+too shallow (structural)? Falsifier PRE-REGISTERED before any run: plans/prefetch-horizon-falsifier.md.
+Guest verified idle before; host RESTORE VERIFIED after every run; no orphan procs (subagents killed).
+
+### INSTRUMENT (commit 85c67474, byte-exact, env-gated) — STALL_OCCUPANCY_PROBE
+At each non-startup cold-get stall (chunk_fetcher.rs:1357 None branch), snapshot worker occupancy
+(thread_pool busy/idle_capacity via new idle_thread_count() accessor) + whether the stalled index
+was enqueued (in-flight key covers decode_start). Classifies SAT (idle_cap==0) / HORIZON_NOT_ENQUEUED
+(idle_cap>0 & not enqueued) / HORIZON_ENQUEUED_NOT_DONE. Gated on GZIPPY_STALL_RESIDENCY_PROBE
+(OFF==identity); stall_residency mod now #[cfg(parallel_sm)] (was dead under default clippy).
+
+### DATA (locked guest, silesia-large 503MB, T8, N=7-9, sha-verified, RUN_TRUSTWORTHY=true, diverged=0)
+| combo | wall | SAT | HZ_NOT_ENQUEUED | mean_busy/8 | mean_idle_cap |
+|---|---|---|---|---|---|
+| F0 baseline | 1.125s | 1 | 2 | 5.3-6.0 | 2.0-2.67 |
+| F100 spin | 1.413s | 1 | 2 | 5.67 | 2.33 |
+| F100 sleep | 1.254s | 0 | 3 | 6.33 | 1.67 |
+Residency (same stalls): NOT_RESIDENT=4 has_nearest_le_start=0 (never-retained / consumer-pace).
+Source-cite (read-only subagent): horizon DEPTH is VENDOR-IDENTICAL (2·P candidate, P-1 concurrent,
+same ramp + 1ms pump). block_fetcher.rs:737/763 ↔ BlockFetcher.hpp:467/474.
+
+### VERDICT: NEITHER clean saturation NOR a confirmed horizon-DEPTH fix. (My first-draft "SATURATION→engine" was REFUTED by the disproof advisor; sustained.)
+- SATURATION is DISPROVED: idle_capacity>0 at EVERY stall (1.67-2.67, never 0 even under 2x slow);
+  a free worker existed; the on-demand decode submits onto it immediately (chunk_fetcher.rs:1450-1468).
+- My slow_knob "decisive" cross-check was CONFOUNDED: engine-slow raises busy GLOBALLY regardless of
+  stall cause (both hypotheses predict busy↑); the DISCRETE SAT bucket actually went 1→1→0 (falling)
+  while HZ_NOT_ENQUEUED rose 2→3 — by my own pre-registered rule that is the HORIZON signature.
+- I OVERRODE my own pre-registered map (HORIZON 3/3 rows) with a post-hoc continuous metric — the
+  exact "attribution forecloses measurement" the falsifier forbids. Process violation, advisor-caught.
+- BUT it is also NOT a confirmed horizon-DEPTH fix: a single snapshot can't tell NEVER-DISPATCHED
+  (with idle cap = real scheduling/horizon gap) from DISPATCHED-DECODED-EVICTED-before-arrival
+  (retention/anti-overrun, engine-lag-coupled). Both give NOT_RESIDENT+!enqueued. UNRUN discriminator.
+- Engine is a genuine CO-lever but via engine-lag→cache-overrun→eviction (a corrected mechanism that
+  REOPENS the placement/retention sub-question), NOT via "no free worker." NO engine redirect (that
+  was the escape hatch). NO fix attempted (sub-cause unresolved). NO inline-ASM build started.
+
+### OWED before deciding (advisor §6, the cheap unrun discriminator):
+(i) per-stall NEVER-DISPATCHED vs DISPATCHED-THEN-EVICTED (track if a covering task was submitted
+earlier + when evicted vs this arrival); (ii) split idle_capacity PARKED vs UNSPAWNED; (iii) N≫3
+(lower split_chunk_size / aggregate dozens of stalls). Then saturation-vs-horizon is DECIDED, not
+attributed. Distinct from the refuted offset-supply lever and from raw inner-loop speed.
+
+### CHECKPOINT — STOP for supervisor gate. Full findings: plans/prefetch-horizon-findings.md;
+advisor verdict: plans/prefetch-horizon-advisor-verdict.md. Subagents (source-cite + disproof
+advisor) read-only/synchronous/killed (no orphans). Guest run from Bash tasks holding the ssh;
+host RESTORE VERIFIED. Commit 85c67474 (probe) pushed to reimplement-isa-l. NO placement port,
+NO engine work, NO inline-ASM build started.
