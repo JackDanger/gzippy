@@ -70,6 +70,9 @@ pub mod slow_knob;
 pub mod sm_cfg;
 #[cfg(parallel_sm)]
 pub mod sm_driver;
+/// STEP-0 discriminator (a): byte-exact env-gated parent-cached-at-stall probe.
+/// See `stall_residency.rs` + plans/step0-discriminator-a-falsifier.md.
+pub mod stall_residency;
 pub mod statistics;
 /// Non-speculative parallel decode for stored-block-dominated (incompressible)
 /// single-member streams. Portable (depends only on crc32 + gzip_format), so it

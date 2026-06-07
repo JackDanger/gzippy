@@ -586,6 +586,18 @@ where
         v
     }
 
+    /// Read-only snapshot of the MAIN (post-consume promote) cache contents,
+    /// sorted by key. Like `prefetch_cache_contents_sorted` but for `self.cache`.
+    /// Used ONLY by the STEP-0 parent-cached-at-stall probe
+    /// (plans/step0-discriminator-a-falsifier.md) to classify the residency of
+    /// the chunk CONTAINING a stalled confirmed offset. Read-only, no LRU/evict.
+    #[cfg_attr(not(parallel_sm), allow(dead_code))]
+    pub fn cache_contents_sorted(&self) -> Vec<(Key, Value)> {
+        let mut v = self.cache.lock().unwrap().contents_snapshot();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
     /// Vendor's `m_parallelization` cap on simultaneous prefetches
     /// (BlockFetcher.hpp:467: `m_threadPool.capacity()`).
     #[allow(dead_code)] // vendor parity or unit-test surface

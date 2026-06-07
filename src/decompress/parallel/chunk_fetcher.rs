@@ -77,8 +77,9 @@ use crate::decompress::parallel::prefetcher::FetchMultiStream;
 #[cfg(parallel_sm)]
 use crate::decompress::parallel::raw_block_finder::RawBlockFinderCoordinator;
 #[cfg(parallel_sm)]
-use crate::decompress::parallel::thread_pool::ThreadPool;
+use crate::decompress::parallel::stall_residency;
 #[cfg(parallel_sm)]
+use crate::decompress::parallel::thread_pool::ThreadPool;
 use crate::decompress::parallel::trace;
 use crate::decompress::parallel::trace_v2;
 use crate::decompress::parallel::window_map::{Window, WindowMap};
@@ -524,8 +525,24 @@ fn drive_impl<W: std::io::Write>(
     // gzippy previously diverged: cache_capacity = pool_size*2 (vendor is
     // max(16,pool)) and a GZIPPY_BURST_PREFETCH lever on the saturation arg with
     // no vendor counterpart. Both deleted; sizing now matches vendor.
-    let cache_capacity = std::cmp::max(16, pool_size);
-    let prefetch_capacity = pool_size * 2;
+    let mut cache_capacity = std::cmp::max(16, pool_size);
+    let mut prefetch_capacity = pool_size * 2;
+    // STEP-0 discriminator (a) POSITIVE CONTROL (gated on the probe being on, so
+    // production is untouched / OFF==identity): GZIPPY_PREFETCH_CACHE_CAP=N
+    // overrides BOTH cache capacities. Shrinking to a tiny value MUST force the
+    // containing parent to be evicted before the lagging consumer reaches it ⇒
+    // NOT_RESIDENT must rise (validates the probe observes residency). A LARGE
+    // value should DROP NOT_RESIDENT. See plans/step0-discriminator-a-falsifier.md.
+    if stall_residency::enabled() {
+        if let Some(v) = std::env::var_os("GZIPPY_PREFETCH_CACHE_CAP") {
+            if let Ok(n) = v.to_string_lossy().parse::<usize>() {
+                let n = n.max(1);
+                cache_capacity = n;
+                prefetch_capacity = n;
+                eprintln!("  STALL_RESIDENCY_PROBE: POSITIVE-CONTROL cache caps overridden to {n}");
+            }
+        }
+    }
     let block_fetcher: Arc<BlockFetcher<usize, ChunkArc, FetchMultiStream, ChunkDecodeError>> =
         Arc::new(BlockFetcher::new(
             cache_capacity,
@@ -1340,6 +1357,29 @@ fn consumer_loop<W: std::io::Write>(
         let chunk_arc = match chunk_arc_from_partition {
             Some(arc) => arc,
             None => {
+                // STEP-0 discriminator (a): PARENT-CACHED-AT-STALL probe
+                // (plans/step0-discriminator-a-falsifier.md). This `None`
+                // branch IS the genuine head-of-line cold-get stall. Before
+                // blocking, classify whether the chunk CONTAINING `decode_start`
+                // is resident (interior-reuse fixable) or evicted (re-scope).
+                // Read-only snapshots; env-gated (OFF == identity).
+                if stall_residency::enabled() {
+                    let mut cached: Vec<(usize, usize)> = Vec::new();
+                    for (_k, arc) in block_fetcher.prefetch_cache_contents_sorted() {
+                        cached.push((arc.encoded_offset_bits, arc.max_acceptable_start_bit));
+                    }
+                    for (_k, arc) in block_fetcher.cache_contents_sorted() {
+                        cached.push((arc.encoded_offset_bits, arc.max_acceptable_start_bit));
+                    }
+                    let in_flight_keys = block_fetcher.prefetching_keys();
+                    let partition_span = configuration.split_chunk_size.saturating_mul(8);
+                    stall_residency::classify_stall(
+                        decode_start,
+                        &cached,
+                        &in_flight_keys,
+                        partition_span,
+                    );
+                }
                 // The head chunk is NOT in the prefetch cache → the
                 // consumer is about to BLOCK on its decode (the
                 // `wait.block_fetcher_get` span, the other real serial wait
@@ -1831,6 +1871,9 @@ fn consumer_loop<W: std::io::Write>(
             );
         }
     }
+
+    // STEP-0 discriminator (a) tally — see stall_residency::report.
+    stall_residency::report();
 
     Ok(())
 }
