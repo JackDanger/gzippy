@@ -800,3 +800,16 @@ infinite clean speedup buys ≤~0.4s/37% of wall), NOT the clean lever Oracle-P 
   (speculative re-decode) is the single largest recoverable item.
 NEXT: spawn independent disproof advisor (read-only) → plans/step-a-oracle-advisor-verdict.md.
 THEN STOP for supervisor gate. Do NOT start STEP B/C/D or TIER-3.
+
+### DISPROOF ADVISOR [DONE] → CHECKPOINT (STOP for supervisor)
+plans/step-a-oracle-advisor-verdict.md. Read-only, re-derived ALL numbers first-hand
+(all reproduce). VERDICT: Oracle-P "PLACEMENT SUFFICIENT" REFUTED → NECESSARY-BUT-
+INSUFFICIENT; Oracle-C CORROBORATE-WITH-CAVEATS (degenerate, GREY). Key correction:
+ramp-consistent placement-perfect gzippy = 0.56-0.66s vs rapidgzip 0.524s (7-26% loss);
+the 5.9s scan_candidate is first-pass MARKER decode (decoded once, expensively), not
+redundant re-decode; an ENGINE residual survives perfect placement (gzippy clean
+91ms/chunk vs rapidgzip 39ms = 2.3×) ⇒ class-C is CO-PRIMARY, not bounded-secondary.
+CHECKPOINT REACHED. Did NOT start STEP B/C/D or TIER-3. Awaiting supervisor gate.
+OWED before STEP-C (advisor): a CLEAN-ONLY T8 removal oracle (force all chunks through
+isal_stream_inflate w/ predecessor windows, measure busy) = the least-entangled engine
+ceiling signal both oracles missed.
