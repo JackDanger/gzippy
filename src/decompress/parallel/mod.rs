@@ -37,8 +37,6 @@ pub mod gzip_definitions;
 pub mod gzip_format;
 pub mod huffman_base;
 pub mod huffman_reversed_bits_cached;
-pub mod huffman_short_bits_cached_deflate;
-pub mod huffman_short_bits_multi_cached;
 pub mod huffman_symbols_per_length;
 #[cfg(parallel_sm)]
 pub mod inflate_wrapper;

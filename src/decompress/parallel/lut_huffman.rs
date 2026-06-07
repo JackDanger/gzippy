@@ -6,11 +6,10 @@
 //!
 //! `isal_huffman.rs` wraps the C versions via `isal::isal_sys::*` — only
 //! available on `feature = "isal-compression", target_arch = "x86_64"`. The
-//! pure-rust-inflate build was falling back to
-//! `HuffmanCodingShortBitsMultiCached` (vendor's MultiCached.hpp port), which
-//! per the May 27 2026 neurotic perf is the dominant cost in the marker-
-//! phase bootstrap decoder (~7.65% of total CPU, with the bootstrap caller
-//! at 81% children-time). MultiCached uses a simpler 11-bit cache that
+//! pure-rust-inflate build was falling back to a vendor MultiCached.hpp-style
+//! port, which per the May 27 2026 neurotic perf was the dominant cost in the
+//! marker-phase bootstrap decoder (~7.65% of total CPU, with the bootstrap
+//! caller at 81% children-time). That cache used a simpler 11-bit format that
 //! caps multi-symbol-packing at 2; ISA-L's `inflate_huff_code_large` uses
 //! 12-bit short + variable-length long lookup and packs up to 3 symbols per
 //! entry — measurably faster per-byte.

@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 //! Port of `rapidgzip/gzip/RFCTables.hpp` length/distance helpers used by
-//! `HuffmanCodingShortBitsCachedDeflate` LUT fill and slow-path decode.
+//! the Huffman LUT fill and slow-path decode.
 
 use crate::decompress::parallel::error::Error;
 use crate::decompress::parallel::huffman_base::LsbBitReader;
