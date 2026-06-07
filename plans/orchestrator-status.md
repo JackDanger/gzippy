@@ -1,5 +1,89 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## FAITHFUL u8 NATIVE REWRITE — IN PROGRESS [2026-06-07, leader fresh instance]
+Charter: plans/faithful-u8-native-rewrite.md. Leader-lock held (pid in /tmp).
+### STEP 1 DONE — production clean path ESTABLISHED (source-map subagent, exit 0, all file:line first-hand)
+- TWO native clean-bulk paths exist, selected by whether a 32KiB predecessor window is known:
+  (A) window-SEEDED chunks -> ResumableInflate2 via StreamingInflateWrapper (resumable.rs:469/494/507
+      writes u8-DIRECT into caller's &mut [u8]) -> ALREADY FAITHFUL u8, no u16, no narrow.
+  (B) window-ABSENT/speculative chunks -> Engine M marker_inflate::Block (output_ring: Box<[u16;65536]>,
+      marker_inflate.rs:290) -> the u16 ring + post-flip narrow-at-drain (drain_to_output :738-750).
+      THIS is the only u16 storage left; the FOLD (gzip_chunk.rs:1205) keeps Engine M running the
+      clean tail in-place on native (FlipToClean gated behind isal_clean_tail = OFF).
+- PRODUCTION MEASUREMENT (silesia T8, gzippy-native arm64, GZIPPY_VERBOSE, sha 028bd002...410f VERIFIED):
+  Unified decoder: finished_no_flip=16  flip_to_clean=0  window_seeded=2  inflate_wrapper=0  finish_decode=2
+  => 16/18 chunks (89%) go through Engine M's u16 ring (finish in marker+clean mode, NO flip), only 2
+  window-seeded (u8). So the u16 ring IS the production bulk path; the engine-bench PLATEAU measured a
+  representative architecture. The faithful u8 rewrite of Engine M is on-target (NOT a dead path).
+- The prior u8-direct port (5256075) landed in lut_bulk_inflate.rs::MarkerRing (conflate_to_clean_u8),
+  reached ONLY via GZIPPY_MARKER_RING env (gzip_chunk.rs:1018) — DEAD on production. NOT on Block.
+- Pre-req build fix: bench-only E2-E4 (read_clean_e234 / emit_backref_ring_clean / emit_avx2_copy_u16,
+  7bf26096) used x86_64-only AVX2 intrinsics under a pure_inflate_decode cfg that also fires on arm64 =>
+  arm64 build broke. Gated those three behind all(pure_inflate_decode, target_arch="x86_64"). Byte-
+  transparent (dead bench code; production sha unchanged 028bd002...410f).
+### STEP 2 — u8-width flip-in-place rewrite of Engine M: DONE (committed fc1c965b + test hardening).
+- The faithful u8-direct rewrite LANDED byte-exact. Engine M post-flip now decodes the clean bulk
+  u8-DIRECT into the u8 VIEW of the SAME output_ring backing (vendor getWindow() reinterpret
+  deflate.hpp:890-894); flip = drain_transition_narrow_u16 (one-shot) + flip_repack_to_u8 (vendor
+  setInitialWindow conflation 1762-1782: value-DOWNCAST (x&0xFF) the rotated 32KiB window into the u8
+  view upper half, re-base cursor to u8-logical BASE=U8_RING_SIZE). emit_backref_ring_u8 = faithful u8
+  port (8-byte word copy, distance>=8, RLE memset, overlap), no marker scan. set_initial_window_impl +
+  read_internal_uncompressed store u8 in clean mode. Marker (<true>) path const-folded byte-IDENTICAL.
+- BYTE-EXACT: silesia T1/T8/T16 == 028bd002...410f on gzippy-native (arm64) AND gzippy-isal (x86_64
+  Rosetta cross-compile); 851 lib tests; clippy clean. MANDATORY adversarial seam test added +
+  HARDENED: faithful_u8_flip_seam_max_distance_backref_vs_flate2 (6×A=192KiB so flip fires ~65278 and
+  the distance-32768 back-refs are UNAMBIGUOUSLY post-flip; asserted vs independent flate2 oracle;
+  sentinel at byte 163840 proves the repack rotation+downcast). native_fold_parity + the prior seam
+  unit tests all green.
+
+### STEP 4 — MEASUREMENT (leader-run, locked guest REDACTED_IP via -J neurotic): VERDICT = byte-exact TIE.
+- Guest: 16 cores, governor=performance, load ~1.0 (~6% on 16c, measure.sh did NOT flag busy). no_turbo
+  write was Permission-denied (guest VM; host controls turbo) — measure.sh's INTERLEAVED RELATIVE delta
+  is turbo-immune (both tools see the same per-trial state), so the ratio is the authoritative signal.
+- Uploaded /tmp/silesia.gz (decoded sha 028bd002...410f VERIFIED on guest). Built BOTH binaries on guest
+  (RUSTFLAGS=-C target-cpu=native): /tmp/gzippy-base (u16 baseline from git HEAD 7bf2609) + /tmp/gzippy-u8
+  (synced u8 source). Both byte-exact via path=ParallelSM.
+- 3-WAY INTERLEAVED measure.sh (RAW=211968000, sha-verified=OK, taskset-pinned):
+    T8 (CPUS=0,2,4,6,8,10,12,14, N=11): base 0.219s/968MB/s (spread 31%); u8 0.218s/972MB/s (spread 14%);
+      rapidgzip 0.1285s/1650MB/s.  => u8 1.004x vs base = TIE; rapidgzip 1.704x vs base.
+    T1 (CPUS=0, N=11 then N=15): base 0.521-0.526s/403-407MB/s (spread 7-9%); u8 0.537-0.539s/393-394MB/s
+      (spread 4%); rapidgzip 0.306s/694MB/s.  => u8 0.976x vs base = TIE; rapidgzip 1.705x vs base.
+- FINDINGS:
+  1. The faithful u8 rewrite is a byte-exact TIE at BOTH T1 and T8 (Δ 2.4% << spread). KEEP (faithful,
+     correct, layer-don't-revert).
+  2. The gzippy->rapidgzip gap is CONSTANT ~1.70x at T1 AND T8. A flat ratio across T is the signature of
+     a PER-THREAD decode-throughput gap (decode BINDS), NOT scheduling/placement.
+  3. CAUSAL DISPROOF of the traffic hypothesis: the u8 rewrite is a clean ~2x perturbation of clean-path
+     memory traffic (u16->u8 ring + u8 copies + no narrow) with a FLAT wall response => traffic is SLACK;
+     the binding term is per-symbol LUT-DECODE COMPUTE. This FALSIFIES round-2's "u8 clean ring is the
+     main lever" and confirms the round-2 PLATEAU (engine ~2.4x ISA-L on compute). The advisor's prior
+     prediction "flat-u8 stops binding above ~120MB/s" is FALSIFIED: u8 = 393MB/s single-core, still
+     1.70x off rapidgzip, decode still binds.
+  4. CAVEAT (not load-bearing): measure.sh absolutes (393-972 MB/s) are a different sink (stdout->mktemp)
+     than the charter's "0.604s same-sink wall" — NOT apples-to-apples. The verdict is RELATIVE (u8 vs
+     base, same harness) and stands; the 0.604s absolute question is answered only as "u8 did not change
+     the relative gap to rapidgzip."
+- INDEPENDENT DISPROOF ADVISOR (synchronous, read-only, plans/faithful-u8-native-advisor-verdict.md):
+  A byte-exact UPHELD; B seam UPHELD-WITH-CAVEATS (sentinel pinpoint softer than advertised — FIXED by
+  the test hardening above); C wall-TIE UPHELD (TIE band sound; mechanism inference is a valid causal
+  disproof; cross-harness 0.604s not load-bearing). Mandate SATISFIED structurally. REAL next lever =
+  inner Huffman LUT-decode compute kernel (igzip-class packed-table/speculative-store/preload), NOT
+  traffic/placement/ring.
+- STOPPED for supervisor gate. The asm-kernel port + gzippy-isal u8+FFI are LATER/contingent.
+
+## ASM-KERNEL FEASIBILITY SCOPE — CHECKPOINT REACHED [2026-06-07, leader fresh instance]
+Charter: plans/asm-kernel-feasibility-scope.md. ANALYSIS/DESIGN ONLY, no build. Answer the
+three questions (igzip-fast map / faithful integration cost+fork / tie projection), write
+plans/asm-kernel-feasibility-report.md, route a synchronous disproof advisor, then STOP.
+- igzip kernel source map DONE (synchronous read-only subagent, all file:line first-hand).
+  KEY: the 4 load-bearing fast tricks (packed-u32 short table, speculative 8-byte literal store
+  + next-sym/next-dist preload pipeline, MOVDQU overlap-doubling copy, slop-margin headroom
+  guard licensing unchecked over-read/write) ALL DEPEND on the flat-u8 output+window-in-place
+  model (asm:518/591/605/618, C:1641/1698). igzip uses SSE-width MOVDQU (xmm), NOT AVX2 ymm —
+  the "AVX2"/Haswell build differs mainly in BMI2 (SHLX/SHRX/BZHI), not vector width.
+- DELIVERABLE: plans/asm-kernel-feasibility-report.md + plans/asm-kernel-feasibility-advisor-verdict.md.
+- STOPPED for supervisor + USER ratification (faithfulness fork is a user-level call). No build.
+
 ## ENGINE BENCH ROUND 2 — IN PROGRESS [2026-06-07, leader fresh instance]
 Charter: plans/engine-bench-round2-authorization.md. SETTLE the plateau falsifier by building
 E2-E4 in the engine-isolation bench (standalone, NOT production integration).

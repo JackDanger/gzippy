@@ -1660,16 +1660,21 @@ mod tests {
         }
         a[0] = 0xA5; // sentinel: must reappear via the distance-32768 back-ref
         a[1] = 0x5A;
-        // payload = A ‖ A ‖ A: the 2nd A forces the flip at 32768 and immediately
-        // emits distance-32768 back-refs (reading the repacked window's oldest
-        // bytes); the 3rd A keeps the post-flip u8 ring decoding (distances 1..)
-        // so the seam is crossed AND continued.
-        let mut payload = Vec::with_capacity(3 * a.len());
-        payload.extend_from_slice(&a);
-        payload.extend_from_slice(&a);
-        payload.extend_from_slice(&a);
-        // A short RLE run + a 100-distance ref right after the seam to exercise
-        // the u8 RLE/overlap arms across the flip.
+        // payload = A repeated 6× (192 KiB). The Block flip is checked only AFTER
+        // a marker-mode read() call returns, and a call is capped at
+        // RING_SIZE - MAX_RUN_LENGTH = 65278 bytes — so the flip fires near
+        // ~65278, NOT at 32768 (advisor caveat). By repeating A six times the
+        // 4th/5th/6th copies' distance-32768 back-refs are UNAMBIGUOUSLY in the
+        // post-flip u8 region, reading the value-downcasted repacked window. The
+        // sentinel check below targets byte 5*32768 = 163840 (well past the flip)
+        // so it deterministically proves the u8 repack, not the marker path.
+        let reps = 6;
+        let mut payload = Vec::with_capacity(reps * a.len() + 400);
+        for _ in 0..reps {
+            payload.extend_from_slice(&a);
+        }
+        // A short RLE run + a 100-distance ref deep in the post-flip region to
+        // exercise the u8 RLE/overlap arms across/after the seam.
         payload.extend(std::iter::repeat_n(0x33u8, 300));
         payload.extend_from_slice(&a[..100]);
 
@@ -1698,9 +1703,15 @@ mod tests {
             out, oracle,
             "u8 seam decode bytes vs flate2 (flip + distance-32768 + RLE/overlap)"
         );
-        // The sentinel survived the value-downcast repack and the max-distance
-        // back-ref read it from the correct u8 slot.
-        assert_eq!(out[32 * 1024], 0xA5, "sentinel via distance-32768 backref");
+        // Sentinel at byte 5*32768 = 163840 is GUARANTEED past the ~65278 flip
+        // point, so this distance-32768 back-ref read the value-downcasted byte
+        // from the repacked u8 window (slot U8_RING_SIZE-32768) — proving the u8
+        // repack rotation + downcast, not the marker path.
+        assert_eq!(
+            out[5 * 32 * 1024],
+            0xA5,
+            "post-flip distance-32768 u8 backref read the repacked sentinel"
+        );
     }
 
     #[test]
