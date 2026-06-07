@@ -65,7 +65,117 @@ bypassPermissions` subagents. Rules that have cost whole turns:
   re-targets," the "window-discard" — has burned turns). Serialize builds via cargo-lock.sh.
 - Keep THIS charter + plans/orchestrator-status.md current so a fresh owner-spawn can resume.
 
-## CURRENT STATE (2026-06-07, HEAD fb3baec0) — T8 BINDER LOCATED = SERIAL/CONSUMER-WAIT, not u16 (causal + advisor-UPHELD)
+## CURRENT STATE (2026-06-07, HEAD f8260aa8 +bench) — PURE-RUST ENGINE CEILING BOUNDED → **PLATEAU** (≈0.6× ISA-L in isolation, advisor UPHELD); the 1.0×-vs-no-FFI FORK is REAL but its WALL hard-bound is OWED one parallel-wall engine-removal perturbation (advisor caveat)
+
+### THIS TURN — step (B) executed: built+measured the faithful-u8 engine CEILING vs ISA-L (isolation, bounded)
+- **VAR_VI added to benches/engine_isolation.rs** (`decode_var_vi`, x86_64) = VAR_V (faithful-u8
+  speculative software-pipelined flat-u8 loop + igzip packed-u32 multi-symbol table, tricks #1/#2/#3)
+  PLUS the two REMAINING igzip techniques: (1) **BMI2 BZHI** (`_bzhi_u64`) for the variable-width
+  distance extra-bits extraction; (2) **AVX2/SSE MOVDQU wide overlap-copy** back-ref (32B AVX2 bulk,
+  16B SSE distance>=16 overlap, RLE memset dist==1). trick #3 (packed-u32 short table) CONFIRMED
+  fully exploited (drives the same `LutLitLenCode::decode` packed packets, unpacks up to 3 lit/decode).
+- **MEASURED (locked guest 10.30.0.199 double-ssh; 16c gov=perf, load ~3.3, turbo on; taskset -c 0;
+  N=11 interleaved; native target-cpu ⇒ BMI2+AVX2 LIVE, avx2_detected=true; 2 independent runs, STABLE):**
+    | variant | aggregate MB/s | vs ISA-L | per-chunk vs ISA-L |
+    | VAR_III ISA-L | 847-851 | 1.000 | — |
+    | VAR_V (no BMI2/AVX) | 460-462 | 0.54× | 0.50-0.56 |
+    | **VAR_VI (+BMI2+AVX2)** | **504-525** | **0.59-0.62×** | **0.55-0.64** |
+  BMI2+AVX2 added ~9-14% over VAR_V but did NOT close the gap. SELFTEST=PASS (iii/i=2.73 ∈ [2.5,3.6]).
+- **BYTE-EXACT:** VAR_VI printed an MBps line (never VOID) on EVERY swept chunk ⇒ per the bench gate
+  (`exact[k]= o[..n]==scalar && scalar==isal`, engine_isolation.rs:744/802) VAR_VI is byte-identical
+  to BOTH the scalar reference AND ISA-L over the full timed window. (Top-line `SHA_ALL_EQUAL=no` is
+  the PRE-EXISTING VAR_IV_E234 failures — a separate path NOT touched this turn — not VAR_VI.)
+- **PRE-REGISTERED FALSIFIER FIRED → PLATEAU:** VAR_VI ≈ 0.6× ISA-L, ~23pp below the 0.85 PASS line,
+  WITH the full igzip stack + inline-ASM intrinsics. ⇒ pure-Rust igzip-class as a STANDALONE ENGINE
+  PRIMITIVE is NOT reached on this design.
+- **INDEPENDENT DISPROOF ADVISOR (synchronous, read-only, plans/engine-ceiling-advisor-verdict.md):
+  PLATEAU UPHELD-WITH-CAVEATS.** Source-verified all 5 techniques LIVE; fast loop (not the careful
+  tail) is the timed path; header/table-build symmetric with ISA-L's own header parse; byte-exact
+  reasoning airtight. The two minor under-representations (small-overlap 2≤dist<16 copy is scalar not
+  igzip-doubling; SHRX compiler-discretionary) + the only asymmetric confound (VAR_VI's final
+  `to_vec` ~few-%) ALL cut AGAINST plateau and together lift a "fixed" VAR_VI to at most ~0.65-0.68 —
+  STILL ~17-20pp short of 0.85. Structural reason supports plateau: a Rust port routed through a
+  `DecodedSymbol` struct-return + `while remaining` unpack carries codegen overhead a hand-scheduled
+  asm hot loop does not.
+- **LOAD-BEARING ADVISOR CAVEAT (the escalation correction):** the engine-PRIMITIVE ceiling is
+  UPHELD, but escalating to "the 1.0× WALL is HARD-BOUNDED at 0.6×" OVERREACHES isolation — that is
+  the forbidden extrapolation through an unlocated knee (Measurement PROCESS #3). To hard-bound the
+  WALL you must REMOVE the engine stage in the PRODUCTION PARALLEL pipeline and measure, not
+  extrapolate the isolation ratio. NOTE: the prior floor-to-floor T8 finding (engine 1.74× at the
+  wall, t8-engine-binder-advisor-verdict.md UPHELD) INDEPENDENTLY corroborates the engine gap
+  survives to the wall — so the fork is strongly implicated — but the clean WALL hard-bound is still
+  owed that one engine-removal perturbation.
+
+### THE FORK (escalate-candidate — supervisor/user call): pure-Rust 1.0× bar vs no-FFI
+- **HARD NUMBER (engine primitive, advisor-upheld): pure-Rust+ASM faithful-u8 engine = ~0.6× ISA-L
+  in isolation (ceiling ~0.65-0.68 crediting every caveat); the 0.85 igzip-class bar is NOT reached.**
+- **The 1.0× WALL-vs-no-FFI fork is REAL.** Two corroborating data points say the engine gap reaches
+  the wall: (i) the floor-to-floor T8 1.74× engine gap (advisor-upheld this campaign); (ii) the
+  constant ~1.70× gzippy↔rapidgzip ratio at BOTH T1 and T8 (per-thread-throughput signature).
+- **What is NOT yet a clean hard-bound:** the WALL number under an ENGINE-REMOVAL oracle in the
+  production parallel pipeline (Rule 3). Recommended BEFORE a final fork decision: run that
+  perturbation (replace the per-thread decode with a no-op/ISA-L oracle, measure the T8 wall) — if
+  the wall stays ~1.7× off rapidgzip the fork is hard-forced (no-FFI cannot reach 1.0×); if it ties,
+  a shared serial stage gates and pure-Rust CAN still tie despite the 0.6× engine.
+
+### NEXT (decision point — supervisor gate):
+- Either (a) ESCALATE the fork now with the engine-primitive hard number (~0.6× ISA-L, PLATEAU) +
+  the corroborating wall evidence, accepting the advisor's caveat that the wall hard-bound is owed
+  one more perturbation; OR (b) FIRST run the production-pipeline engine-removal oracle to convert
+  the engine ceiling into a clean WALL hard-bound, then escalate. The owner recommends (b) is cheap
+  and removes the last ambiguity, but the engine-primitive PLATEAU itself is settled.
+
+---
+## SUPERSEDED — PRIOR CURRENT STATE (2026-06-07, HEAD f8260aa8) — T8 BINDER RE-LOCATED to the ENGINE; the "serial/consumer-wait" binder is REFUTED (floor-to-floor + advisor-UPHELD)
+
+### THIS TURN — step (A) ceiling-bound; the prior "binder = serial/consumer-wait" was a UNIT ERROR; binder is the per-thread DECODE ENGINE
+- **THE PRIOR CHARTER BINDER ("decode floor 0.118s ALREADY ≈ rapidgzip's wall 0.130s, so the
+  whole 1.7× gap is scheduling/consumer-wait") IS REFUTED — it was a UNIT ERROR (advisor UPHELD,
+  plans/t8-engine-binder-advisor-verdict.md).** It compared gzippy's decode FLOOR (0.118s) to
+  rapidgzip's WALL (0.130s). The correct comparison is FLOOR-TO-FLOOR: rapidgzip's own
+  Theoretical-Optimal is 0.068s, NOT 0.130s. gzippy 0.118 vs rapidgzip 0.068 = **1.74× engine gap.**
+- **FIRST-HAND apples-to-apples --verbose pool stats this turn (locked guest 10.30.0.199 double-ssh,
+  16c gov=perf, box load ~2.5 ⇒ INTERNAL SPANS not wall absolutes; gzippy-mk2 byte-exact
+  028bd002…cb410f path=ParallelSM; rapidgzip 0.16.x --verbose; 3 runs each, STABLE), T8 silesia:**
+    | metric | gzippy | rapidgzip | ratio |
+    | decodeBlock (SUM/workers) | 0.93s | 0.50s | **1.86×** |
+    | Theoretical-Optimal (÷8) | 0.118s | 0.068s | 1.74× |
+    | Total Real Decode Duration | 0.139s | 0.086s | 1.61× |
+    | std::future::get (consumer wait) | 0.077-0.082s | 0.062-0.067s | ~1.25× |
+    | Pool Fill Factor | 85% | 78% | — |
+- **BINDER = the per-thread DECODE ENGINE** (decodeBlock 1.86×; body_rate 269 MB/s vs rapidgzip's
+  ~424 MB/s ISA-L = 1.58× raw + speculative/marker overhead, BOTH engine). The consumer future::get
+  gap (1.25×) is a MINORITY and largely DOWNSTREAM (the consumer waits longer because each chunk
+  decodes slower). This matches the long-observed CONSTANT ~1.7× ratio at BOTH T1 and T8 (flat-
+  across-T = the signature of a per-thread throughput gap, which the charter itself noted).
+- **CEILING-BOUND METHOD NOTE (Rule 3): the decode-bypass + sleep-decode oracles are CONFOUNDED**
+  (decode-FREE wall was 3.6-5.5× SLOWER than real decode — they bypass the buffer pool, do fresh
+  full-size zeroed allocs/faults per chunk, hold ≤33 ChunkData/660MB live, single-thread CRC 212MB
+  un-overlapped). The valid ceiling instrument is the FLOOR-TO-FLOOR --verbose span comparison.
+- **VENDOR SOURCE-VERIFIED (BlockFetcher.hpp:246-329, this turn):** rapidgzip's get() ALSO pumps
+  prefetchNewBlocks() in a `while(wait_for(1ms))` loop during the future wait (:314-316), exactly
+  as gzippy (chunk_fetcher.rs:1289 Lever H). The consumer-overlap STRUCTURE is already faithfully
+  ported; future::get is non-zero in BOTH. There is NO missing overlap mechanism to port.
+- **PROD DECODE-MODE SPLIT (T8): finished_no_flip=16, window_seeded=2, flip_to_clean=0.** 16/18
+  chunks take Engine M's speculative marker-bootstrap-then-u8-direct-tail path (window-absent at
+  high T, faithful — rapidgzip is also ~window-absent at runtime). The engine front IS the bulk path.
+
+### NEXT (per PROCESS — bottleneck is the ENGINE; step (B) = build+measure the faithful-u8 ceiling):
+- **The advisor's load-bearing caveat (D-D): the ENGINE-BENCH-ROUND-2 "2.4× plateau" that earlier
+  declared pure-Rust+ASM unreachable was measured on the DISCREDITED u16-RING architecture. It does
+  NOT bound the CURRENT faithful u8-direct flip-in-place engine (landed fc1c965b). So the
+  pure-Rust→1.0× question is OPEN, NOT settled by that plateau.**
+- **USER-CONSTRAINT FORK IMPLICATED (advisor-flagged, escalate-candidate):** is the 1.0× bar
+  reachable in pure-Rust+ASM (no FFI) given the engine is 1.86× ISA-L? Must be resolved by BUILDING
+  + measuring the faithful-u8 engine ceiling vs ISA-L on the production speculative path, NOT by
+  extrapolating the invalid u16 plateau. Lever: igzip-class inner-Huffman (packed-u32 short table,
+  speculative 8-byte literal store + next-sym/next-dist preload pipeline, BMI2 SHLX/SHRX/BZHI,
+  MOVDQU overlap-doubling copy, slop-margin headroom) on the u8-direct ring — authorized in scope.
+- Kernel is now the confirmed binder at BOTH T1 (was always) AND T8 (this turn). The consumer-wait
+  direction is DESCOPED (minority + already-faithful structure).
+
+---
+## SUPERSEDED — PRIOR CURRENT STATE (2026-06-07, HEAD fb3baec0) — "T8 BINDER = SERIAL/CONSUMER-WAIT" (REFUTED above as a unit error)
 
 ### THIS TURN — step (A) executed; u16-path premise FALSIFIED; binder LOCATED to the serial/consumer term
 - **u16-path "biggest prize" premise is FALSIFIED at the source (advisor UPHELD,
