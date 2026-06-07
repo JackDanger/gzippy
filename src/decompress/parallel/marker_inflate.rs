@@ -1645,6 +1645,178 @@ impl Block {
             // are all live and consistent.
         }
 
+        // ── MARKER (u16) SPECULATIVE SOFTWARE-PIPELINED FAST LOOP ──
+        // FAITHFUL PORT of rg's `readInternalCompressedMultiCached` (vendor
+        // deflate.hpp:1585-1666) for the u16 marker window. rg runs the SAME tight
+        // multi-cached loop for u16 markers as for u8 clean (it is templated on
+        // `Window`; there is no separate slow marker path — the only marker-vs-clean
+        // deltas are cheap constexpr-gated bookkeeping). gzippy's clean path already
+        // got this fast loop (above); before this port the MARKER path was stuck on
+        // the careful per-symbol loop while rg's marker path was its fast multi-cached
+        // loop — the structural source of the measured ~1.69× decodeBlock gap on the
+        // window-absent (34.5%-marker) workload.
+        //
+        // This mirrors the clean fast loop above with three faithful u16 deltas:
+        //   1. Literal store width is u16 (vendor `appendToWindow` stores
+        //      `Window::value_type` = uint16_t in marker mode, deflate.hpp:1319). The
+        //      speculative store widens the up-to-3 packed literal BYTES (each <256)
+        //      into u16 slots — value-identical to the careful loop's per-literal
+        //      `ring_ptr.add(..).write(code & 0xFF)`.
+        //   2. The marker counter `distance_marker` increments per clean literal
+        //      (vendor's `++m_distanceToLastMarkerByte`, deflate.hpp:1315; literals
+        //      are always <256 ⇒ always clean) and is recomputed across back-refs
+        //      inside `emit_backref_ring::<true>` (the backward marker scan).
+        //   3. NO `distance > decoded_bytes + emitted` window-range check — vendor
+        //      const-folds it away for marker windows (`!containsMarkerBytes`,
+        //      deflate.hpp:1652-1655). Back-refs in marker mode may legitimately
+        //      reach into the (not-yet-known) predecessor window = the marker bytes.
+        //
+        // On ANY break the bit cursor sits exactly before `pre`'s un-consumed bits
+        // and the careful loop below re-decodes from there — no state carried, no
+        // desync (identical contract to the clean fast loop). Const-folded away
+        // entirely on the clean path (`!CONTAINS_MARKERS`).
+        if CONTAINS_MARKERS && slow_spin == 0 && !slow_yield {
+            let in_end = bits.data.len();
+            bits.refill();
+            let mut pre = self.lut_litlen.decode(bits);
+            'mfast: loop {
+                // Resumable cap + wrap headroom + input slop. Headroom is in u16
+                // SLOTS (ring modulus is RING_SIZE = 65536 slots = 128 KiB).
+                let dst_phys = pos % RING_SIZE;
+                let out_ok = emitted + FAST_OUT_SLOP < n_max_to_decode
+                    && dst_phys + FAST_OUT_SLOP <= RING_SIZE;
+                let in_ok = bits.pos + FAST_IN_SLOP < in_end;
+                if !(out_ok && in_ok) {
+                    break 'mfast;
+                }
+                let sym0 = pre.symbol;
+                let sym_count0 = pre.sym_count;
+                let bit_count0 = pre.bit_count;
+                if bit_count0 == 0 {
+                    break 'mfast;
+                }
+                bits.consume(bit_count0);
+
+                // SPECULATIVE wide store of the (up-to-3) packed literal bytes,
+                // WIDENED to u16. Each packed byte b is stored as the u16 value b
+                // (< 256). One 8-byte unaligned write covers 4 u16 slots (≥ the 3
+                // possible literals); the trailing slot(s) past `lit_prefix` are
+                // overwritten by the next packet or the back-ref below. `dst_phys +
+                // FAST_OUT_SLOP <= RING_SIZE` (FAST_OUT_SLOP >= 4 u16 slots) ⇒ the
+                // 8-byte store never straddles the ring wrap. Value-identical to the
+                // careful loop's per-literal `write(code & 0xFF)`.
+                unsafe {
+                    let p = sym0 as u64;
+                    let widened: u64 = (p & 0xFF) | ((p & 0xFF00) << 8) | ((p & 0xFF_0000) << 16);
+                    (ring_ptr.add(dst_phys) as *mut u64).write_unaligned(widened);
+                }
+                let mut s = sym0;
+                let mut remaining = sym_count0;
+                let mut lit_prefix = 0usize;
+                let mut trailing_code: u16 = 0;
+                let mut have_trailing = false;
+                while remaining > 0 {
+                    let code = (s & 0xFFFF) as u16;
+                    if code <= 255 || remaining > 1 {
+                        if remaining == 1 && code > 255 {
+                            trailing_code = code;
+                            have_trailing = true;
+                            break;
+                        }
+                        lit_prefix += 1;
+                        remaining -= 1;
+                        s >>= 8;
+                        continue;
+                    }
+                    trailing_code = code;
+                    have_trailing = true;
+                    break;
+                }
+                pos += lit_prefix;
+                emitted += lit_prefix;
+                // Vendor: per clean literal `++m_distanceToLastMarkerByte`.
+                distance_marker += lit_prefix;
+
+                if have_trailing {
+                    let code = trailing_code;
+                    if code == END_OF_BLOCK_SYMBOL {
+                        self.at_end_of_block = true;
+                        self.ring_pos = pos;
+                        self.decoded_bytes += emitted;
+                        self.distance_to_last_marker_byte = distance_marker;
+                        return Ok(emitted);
+                    }
+                    if (code as u32) > MAX_LIT_LEN_SYM {
+                        self.ring_pos = pos;
+                        self.decoded_bytes += emitted;
+                        self.distance_to_last_marker_byte = distance_marker;
+                        return Err(BlockError::InvalidHuffmanCode);
+                    }
+                    let length = (code as usize).wrapping_sub(254);
+                    if length != 0 {
+                        let dsym = match self.dist_hc.decode(bits) {
+                            Some(d) => d,
+                            None => {
+                                self.ring_pos = pos;
+                                self.decoded_bytes += emitted;
+                                self.distance_to_last_marker_byte = distance_marker;
+                                return Err(BlockError::InvalidHuffmanCode);
+                            }
+                        };
+                        if dsym as usize >= DISTANCE_BASE.len() {
+                            self.ring_pos = pos;
+                            self.decoded_bytes += emitted;
+                            self.distance_to_last_marker_byte = distance_marker;
+                            return Err(BlockError::InvalidHuffmanCode);
+                        }
+                        let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                        let distance = if extra > 0 {
+                            if bits.available() < extra {
+                                bits.refill();
+                                if bits.available() < extra {
+                                    self.ring_pos = pos;
+                                    self.decoded_bytes += emitted;
+                                    self.distance_to_last_marker_byte = distance_marker;
+                                    return Err(BlockError::EndOfFile);
+                                }
+                            }
+                            let mask = (1u64 << extra) - 1;
+                            let v = (bits.peek() & mask) as usize;
+                            bits.consume(extra);
+                            DISTANCE_BASE[dsym as usize] as usize + v
+                        } else {
+                            DISTANCE_BASE[dsym as usize] as usize
+                        };
+                        if distance == 0 || distance > MAX_WINDOW_SIZE {
+                            self.ring_pos = pos;
+                            self.decoded_bytes += emitted;
+                            self.distance_to_last_marker_byte = distance_marker;
+                            return Err(BlockError::ExceededWindowRange);
+                        }
+                        // NO clean-mode `distance > decoded+emitted` check here —
+                        // vendor const-folds it out for marker windows.
+                        // Back-ref via the SAME production routine the careful loop
+                        // uses for markers; it maintains `distance_marker` (the fast
+                        // `>= distance` skip + backward marker scan) and is wrap-safe.
+                        unsafe {
+                            emit_backref_ring::<CONTAINS_MARKERS>(
+                                ring_ptr,
+                                &mut pos,
+                                distance,
+                                length,
+                                &mut distance_marker,
+                            );
+                        }
+                        self.record_backreference_for_sparsity(distance, length, emitted);
+                        emitted += length;
+                    }
+                }
+
+                bits.refill();
+                pre = self.lut_litlen.decode(bits);
+            }
+        }
+
         while emitted < n_max_to_decode {
             // One slow-knob injection per decode event (this outer iteration =
             // exactly one Huffman codeword decode). No-op when `slow_spin == 0`.
