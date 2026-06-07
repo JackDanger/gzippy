@@ -118,7 +118,11 @@ RAW_BYTES="$(gzip -dc "$CORPUS" | wc -c)"
 cat "$CORPUS" >/dev/null 2>&1
 
 DBG="$(GZIPPY_DEBUG=1 GZIPPY_FORCE_PARALLEL_SM=1 "$GZIPPY" -d -c -p 8 "$CORPUS" 2>&1 >/dev/null | grep -m1 'path=')"
-case "$DBG" in *IsalParallelSM*) ;; *) echo "RUN_TRUSTWORTHY=false"; echo "FAILURE=routing $DBG"; exit 9;; esac
+# Phase-1 naming-truth rename: the parallel-SM path now prints path=ParallelSM
+# (was IsalParallelSM — a FALSE-isal name on the pure-Rust build). Accept either
+# so the routing assert is stable across the rename. The pure-Rust marker engine
+# is the only thing this label can describe under --features pure-rust-inflate.
+case "$DBG" in *ParallelSM*) ;; *) echo "RUN_TRUSTWORTHY=false"; echo "FAILURE=routing $DBG"; exit 9;; esac
 
 GZIPPY_SHA="$(git rev-parse HEAD)"
 RG_VER="$("$RG_TRACE" --version 2>&1 | head -1)"
