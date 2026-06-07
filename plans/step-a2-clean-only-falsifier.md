@@ -114,3 +114,29 @@ wall, the STEP-A error); (c) the implied engine-bounded T8 wall = clean rate × 
   gzip_ref | gzippy_seeded(clean-only) | rapidgzip | gzippy_normal.
 - Self-test traces: one seeded T8 trace (assert window_absent→~0, publish-chain intact)
   + the unseeded baseline trace for the window_absent fraction comparison.
+
+---
+## RESULTS (2026-06-07, guest 199 locked, silesia-large 503MB, T8, N=9 interleaved)
+HEAD e89006b0. Host RESTORE VERIFIED (no_turbo=0, 8 guests thawed, shm cleaned).
+sha e114dd2b… (gzip ref) byte-exact on seeded + normal every iteration.
+
+SELF-TEST PASSES:
+- forced-clean: window_seeded 4→39 (ALL clean), finished_no_flip 38→0 (ZERO marker
+  decode), fused_lut 35→0 (ZERO marker resolution). hit%=100.0, sha=OK.
+- publish-chain-preserved: Early window publish=39 in BOTH normal AND seeded (NOT
+  collapsed like degenerate Oracle-C); seeded trace consumer.window_publish_clean
+  running at 0.06ms/chunk (cheap, but present).
+- off==identity by construction; routing 43/0.
+
+ENGINE CEILING:
+| arm | min | median | sd% | MB/s |
+|---|---|---|---|---|
+| gzippy clean-only (engine ceiling, publish chain intact) | 0.5896 | 0.6134 | 1.9 | 854 |
+| rapidgzip | 0.5347 | 0.5396 | 3.3 | 942 |
+| gzippy normal | 1.1157 | 1.1244 | 1.1 | 451 |
+
+VERDICT (pre-registered band): ENGINE-IS-RESIDUAL — clean-only median 0.6134 ≥ 0.58,
++13.7% over rapidgzip 0.5396 (Δ0.0738 ≫ spread) ⇒ engine gap SURVIVES all-clean ⇒
+class-C is a real CO-PRIMARY lever; the 2.3× clean-rate gap is confirmed AT THE WALL.
+Per-chunk clean busy (seeded trace, 39 chunks) = 92.7ms/chunk == advisor's 91ms;
+vs rapidgzip 39ms = 2.38×. The grey Oracle-C 0.4-0.7s is RESOLVED to ~0.61s.

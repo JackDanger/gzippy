@@ -813,3 +813,57 @@ CHECKPOINT REACHED. Did NOT start STEP B/C/D or TIER-3. Awaiting supervisor gate
 OWED before STEP-C (advisor): a CLEAN-ONLY T8 removal oracle (force all chunks through
 isal_stream_inflate w/ predecessor windows, measure busy) = the least-entangled engine
 ceiling signal both oracles missed.
+
+## TIER-2 STEP A.2 — CLEAN-ONLY ENGINE ORACLE [DONE 2026-06-07, A.2 leader, fresh instance]
+CHARTER plans/step-a2-clean-only-oracle.md. Falsifier PRE-REGISTERED before any run:
+plans/step-a2-clean-only-falsifier.md. HEAD e89006b0 (commits: instrument 4bd8ecb7,
+guest harness 96f98a16, driver e89006b0). Guest verified idle before launch; host
+RESTORE VERIFIED after (no_turbo=0, all 8 guests thawed, /dev/shm seed file removed).
+
+### INSTRUMENT (byte-exact, env-gated) — NOT the broken/degenerate prior oracles
+- NEW src/decompress/parallel/seed_windows.rs. GZIPPY_SEED_WINDOWS_CAPTURE (p=1 records
+  aligned start_bit→window pairs at the NATURAL clean path) + GZIPPY_SEED_WINDOWS
+  (pre-seed block_finder w/ aligned boundaries + clean-path window fallback). FORCES
+  every chunk clean while KEEPING real Huffman decode AND the production consumer/publish
+  chain — distinct from (a) the BROKEN drive_clean_window_oracle (GZIPPY_CLEAN_WINDOW_ORACLE,
+  bypasses the whole scheduler+consumer with a bespoke loop) and (b) the DEGENERATE
+  Oracle-C/decode_bypass (decode≈0 → publish-chain collapse).
+- STRUCTURAL FINDING (proven while building): clean-only is INCOMPATIBLE with production
+  speculative dispatch UNLESS boundaries are confirmed ahead — clean decode is only
+  possible at a real deflate boundary, but dispatch uses spacing GUESSES whose
+  WindowMap-key windows are MISALIGNED to the guess (first naive WindowMap-snapshot capture
+  hit 0%/diverged). Engine-isolation REQUIRES confirmed-boundary dispatch = the placement
+  fix itself ⇒ placement & engine are structurally COUPLED.
+
+### SELF-TEST PASSES (CLAUDE.md rule 4) — proves it isolated engine + preserved publish chain
+silesia-large 503MB, T8 (guest 199, locked, sha e114dd2b…):
+- forced-clean: SEED window_seeded 4→39 (ALL clean), finished_no_flip 38→0 (zero marker
+  decode), fused_lut 35→0 (zero marker resolution); hit%=100.0, sha=OK byte-exact.
+- publish-chain-preserved: Early window publish=39 in BOTH normal AND seeded (NOT collapsed
+  like Oracle-C); seeded trace consumer.window_publish_clean = 2.2ms total / 0.06ms per chunk
+  (running, just cheap with no markers).
+- off==identity (env unset = today's decode, by construction); routing 43/0 lib tests.
+
+### RESULT — ENGINE CEILING (the deliverable). VERDICT: ENGINE-IS-RESIDUAL (co-primary CONFIRMED)
+| arm (T8, N=9 interleaved, sha-OK) | min | median | sd% | MB/s |
+|---|---|---|---|---|
+| gzippy clean-only (ENGINE ceiling, publish chain intact) | 0.5896 | **0.6134** | 1.9 | 854 |
+| rapidgzip | 0.5347 | 0.5396 | 3.3 | 942 |
+| gzippy normal (baseline) | 1.1157 | 1.1244 | 1.1 | 451 |
+- **clean-only 0.6134 vs rapidgzip 0.5396 = +13.7% (Δ0.0738s ≫ ~2-3% spread) → NOT a TIE.**
+- Lands in the PRE-REGISTERED [0.58,0.72] ENGINE-IS-RESIDUAL band. Engine gap SURVIVES
+  forcing every chunk clean ⇒ the residual is the ENGINE, confirming class-C is co-primary.
+- Per-chunk CLEAN busy (seeded trace, 39 chunks): worker.isal_stream_inflate = **92.7ms/chunk**
+  — corroborates the advisor's independent 91ms derivation; vs rapidgzip 39ms = **2.38× engine
+  gap**, ramp-consistent. Implied engine-bounded wall = 39×92.7/8×1.36 ≈ 0.61s == measured.
+- RAMP-CONSISTENT (the STEP-A error fixed): clean-only WALL (0.61) vs rapidgzip WALL (0.54),
+  same treatment — no floor-vs-wall mismatch. Decode busy 3616ms/8 = 0.452 ideal, ×1.36 = 0.61.
+
+### CHECKPOINT — engine ceiling cleanly bounded. The grey 0.4-0.7s (Oracle-C) RESOLVED to ~0.61s.
+- Placement ceiling (Oracle-P, ramp-consistent): ~0.56-0.66s. Engine ceiling (this, A.2): ~0.61s.
+  rapidgzip 0.54s. BOTH levers needed for the 1.0× tie; both are real, both ~13% gaps.
+- 1b (u8-write traffic A/B) NOT run this window (engine oracle was the priority + landed; flag
+  as still-owed to rank class-T). Did NOT start STEP-C design revision or any TIER-3.
+NEXT: spawn ONE independent disproof advisor (read-only) → plans/step-a2-advisor-verdict.md to
+attack the oracle's validity (engine isolated? publish-chain preserved? ramp consistent?), then
+STOP for supervisor gate.
