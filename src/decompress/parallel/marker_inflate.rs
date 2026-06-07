@@ -1451,6 +1451,187 @@ impl Block {
         };
         let slow_yield: bool = !CONTAINS_MARKERS && super::slow_knob::yield_kind();
 
+        // ── VAR_V SPECULATIVE SOFTWARE-PIPELINED FAST LOOP (clean path only) ──
+        // igzip trick #2 ported faithfully ONTO the production wrapping u8 ring
+        // (NOT a flat buffer — the real `% U8_RING_SIZE` modulus, wrap-straddle
+        // handling, resumable `n_max_to_decode` cap, drain, and CRC are ALL kept;
+        // the bench's flat-buffer optimism is NOT reproduced). The fast loop runs
+        // only while the physical write region (and the back-ref source region)
+        // are far enough from the ring wrap that the speculative 8-byte packed
+        // store + the word-copy back-ref can over-write without straddling, and
+        // while input slop permits unchecked refills. When ANY guard fails it
+        // breaks and the existing per-symbol careful loop below takes over — it
+        // owns the wrap-straddle, the resumable boundary, and the block tail.
+        //
+        // Const-folded away entirely on the marker path (`CONTAINS_MARKERS`):
+        // the speculative packed store is unsound when bytes may be marker u16s,
+        // and `emit_backref_ring_u8` is u8-only, so the whole region is dead code
+        // there (the `if !CONTAINS_MARKERS` gate const-folds to false).
+        //
+        // Output headroom the fast loop reserves so it can over-write without a
+        // per-symbol bounds check: 8 speculative literal bytes + a 258-byte
+        // max-length back-ref + a 16-byte word-copy overshoot (igzip asm:511).
+        const FAST_OUT_SLOP: usize = 8 + MAX_RUN_LENGTH + 16;
+        // Input slop so a refill can always read an 8-byte word (igzip
+        // IN_BUFFER_SLOP, asm:48).
+        const FAST_IN_SLOP: usize = 8;
+        if !CONTAINS_MARKERS && slow_spin == 0 && !slow_yield {
+            let ring8_fast = ring8;
+            let in_end = bits.data.len();
+            // Preload (igzip pipeline): decode the first symbol before entering
+            // the loop so the back-ref branch resolves against an already-fetched
+            // next symbol. `pre` is ALWAYS a fresh, un-consumed decode at the top
+            // of each iteration (we consume its bits inside, then preload again),
+            // so on ANY break the bit cursor sits exactly before `pre`'s bits and
+            // the careful loop re-decodes from the same position — never desyncs.
+            bits.refill();
+            let mut pre = self.lut_litlen.decode(bits);
+            'fast: loop {
+                // Resumable cap + wrap headroom + input slop — all REAL overheads.
+                let dst_phys = pos % U8_RING_SIZE;
+                let out_ok = emitted + FAST_OUT_SLOP < n_max_to_decode
+                    && dst_phys + FAST_OUT_SLOP <= U8_RING_SIZE;
+                let in_ok = bits.pos + FAST_IN_SLOP < in_end;
+                if !(out_ok && in_ok) {
+                    break 'fast;
+                }
+                let sym0 = pre.symbol;
+                let sym_count0 = pre.sym_count;
+                let bit_count0 = pre.bit_count;
+                if bit_count0 == 0 {
+                    // Invalid code — let the careful loop produce the error with
+                    // the cursor at `pre`'s start (bits not yet consumed).
+                    break 'fast;
+                }
+                bits.consume(bit_count0);
+
+                // SPECULATIVE 8-byte store of the packed bytes (igzip asm:518):
+                // write all up-to-3 packed literal bytes unconditionally at the
+                // non-wrapping dst, then advance by the count of LEADING LITERALS
+                // only. Wrong trailing bytes are overwritten by the next packet
+                // (or by the back-ref below). dst_phys + 8 <= U8_RING_SIZE holds
+                // (FAST_OUT_SLOP >= 8), so the 8-byte store never straddles.
+                unsafe {
+                    let packed = (sym0 & 0x00FF_FFFF) as u64;
+                    (ring8_fast.add(dst_phys) as *mut u64).write_unaligned(packed);
+                }
+                let mut s = sym0;
+                let mut remaining = sym_count0;
+                let mut lit_prefix = 0usize;
+                let mut trailing_code: u16 = 0;
+                let mut have_trailing = false;
+                while remaining > 0 {
+                    let code = (s & 0xFFFF) as u16;
+                    if code <= 255 || remaining > 1 {
+                        if remaining == 1 && code > 255 {
+                            trailing_code = code;
+                            have_trailing = true;
+                            break;
+                        }
+                        lit_prefix += 1;
+                        remaining -= 1;
+                        s >>= 8;
+                        continue;
+                    }
+                    trailing_code = code;
+                    have_trailing = true;
+                    break;
+                }
+                pos += lit_prefix;
+                emitted += lit_prefix;
+
+                if have_trailing {
+                    let code = trailing_code;
+                    if code == END_OF_BLOCK_SYMBOL {
+                        self.at_end_of_block = true;
+                        self.ring_pos = pos;
+                        self.decoded_bytes += emitted;
+                        self.distance_to_last_marker_byte = distance_marker;
+                        return Ok(emitted);
+                    }
+                    if (code as u32) > MAX_LIT_LEN_SYM {
+                        self.ring_pos = pos;
+                        self.decoded_bytes += emitted;
+                        self.distance_to_last_marker_byte = distance_marker;
+                        return Err(BlockError::InvalidHuffmanCode);
+                    }
+                    let length = (code as usize).wrapping_sub(254);
+                    if length != 0 {
+                        // Distance via production's cached reversed-bits decoder
+                        // (self.dist_hc) — SAME as the careful loop, NOT the
+                        // bench's LutDistCode. Keeps byte-exactness + faithfulness.
+                        let dsym = match self.dist_hc.decode(bits) {
+                            Some(d) => d,
+                            None => {
+                                self.ring_pos = pos;
+                                self.decoded_bytes += emitted;
+                                self.distance_to_last_marker_byte = distance_marker;
+                                return Err(BlockError::InvalidHuffmanCode);
+                            }
+                        };
+                        if dsym as usize >= DISTANCE_BASE.len() {
+                            self.ring_pos = pos;
+                            self.decoded_bytes += emitted;
+                            self.distance_to_last_marker_byte = distance_marker;
+                            return Err(BlockError::InvalidHuffmanCode);
+                        }
+                        let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                        let distance = if extra > 0 {
+                            if bits.available() < extra {
+                                bits.refill();
+                                if bits.available() < extra {
+                                    self.ring_pos = pos;
+                                    self.decoded_bytes += emitted;
+                                    self.distance_to_last_marker_byte = distance_marker;
+                                    return Err(BlockError::EndOfFile);
+                                }
+                            }
+                            let mask = (1u64 << extra) - 1;
+                            let v = (bits.peek() & mask) as usize;
+                            bits.consume(extra);
+                            DISTANCE_BASE[dsym as usize] as usize + v
+                        } else {
+                            DISTANCE_BASE[dsym as usize] as usize
+                        };
+                        if distance == 0 || distance > MAX_WINDOW_SIZE {
+                            self.ring_pos = pos;
+                            self.decoded_bytes += emitted;
+                            self.distance_to_last_marker_byte = distance_marker;
+                            return Err(BlockError::ExceededWindowRange);
+                        }
+                        if distance > self.decoded_bytes + emitted {
+                            self.ring_pos = pos;
+                            self.decoded_bytes += emitted;
+                            self.distance_to_last_marker_byte = distance_marker;
+                            return Err(BlockError::ExceededWindowRange);
+                        }
+                        // Back-ref copy via the SAME production routine the
+                        // careful loop uses — fully wrap-safe (its non-overlap /
+                        // RLE / overlap arms each mask every index `% U8_RING_SIZE`
+                        // and only take the fast word-copy when the rounded run
+                        // fits without straddling). The dst word-copy headroom is
+                        // guaranteed by the top guard (`dst_phys + FAST_OUT_SLOP
+                        // <= U8_RING_SIZE`); the source straddle is handled inside.
+                        unsafe {
+                            emit_backref_ring_u8(ring8_fast, &mut pos, distance, length);
+                        }
+                        self.record_backreference_for_sparsity(distance, length, emitted);
+                        emitted += length;
+                    }
+                }
+
+                // Preload next symbol (pipeline). Refill first so the decode and
+                // any subsequent dist-extra reads have headroom.
+                bits.refill();
+                pre = self.lut_litlen.decode(bits);
+            }
+            // FALL THROUGH: `pre` was decoded but NOT consumed (we always break
+            // with a fresh un-consumed `pre`), so the bit cursor is positioned
+            // exactly before `pre`'s bits. The careful loop below re-decodes from
+            // here — no state carried, no desync. `pos`/`emitted`/`at_end_of_block`
+            // are all live and consistent.
+        }
+
         while emitted < n_max_to_decode {
             // One slow-knob injection per decode event (this outer iteration =
             // exactly one Huffman codeword decode). No-op when `slow_spin == 0`.

@@ -42,7 +42,12 @@
 ))]
 mod bench {
     use gzippy::decompress::inflate::consume_first_decode::Bits;
-    use gzippy::decompress::parallel::marker_inflate::{Block, MarkerSink, MAX_WINDOW_SIZE};
+    use gzippy::decompress::parallel::lut_huffman::MAX_LIT_LEN_SYM;
+    use gzippy::decompress::parallel::lut_huffman::{LutDistCode, LutLitLenCode};
+    use gzippy::decompress::parallel::marker_inflate::{
+        Block, CompressionType, MarkerSink, DISTANCE_BASE, DISTANCE_EXTRA, END_OF_BLOCK_SYMBOL,
+        MAX_WINDOW_SIZE,
+    };
     use gzippy::isal_decompress_oracle::decompress_deflate_from_bit;
     use std::time::Instant;
 
@@ -233,6 +238,424 @@ mod bench {
         sink
     }
 
+    // ── Variant (v): FLAT-u8 packed-table + SPECULATIVE SOFTWARE-PIPELINED loop ─
+    //
+    // This is the inner-Huffman-kernel LEVER (plans/inner-huffman-kernel.md): igzip's
+    // speculative pipeline (igzip_decode_block_stateless.asm:507-627), built on the
+    // FLAT-u8 path the faithful u8 rewrite enabled. It reuses the EXISTING igzip
+    // packed-flat-short-code table (LutLitLenCode/LutDistCode, lut_huffman.rs — trick
+    // #1, already production-live) and adds the missing trick #2:
+    //
+    //  * FLAT LINEAR u8 output buffer with the 32 KiB window prepended as the head
+    //    (NOT a ring): back-refs read out[out_pos - distance], always already-final
+    //    u8 — no `% RING_SIZE`, no wrap special-case inside the fast region. This is
+    //    igzip's "window is the tail of the same buffer" precondition (asm:518/591/605).
+    //  * SPECULATIVE 8-byte packed-literal store: write all 8 bytes of the packed
+    //    `sym` UNCONDITIONALLY (one u64 store), then advance out_pos by the ACTUAL
+    //    sym_count (1-3). Wrong-guess bytes are overwritten next iteration. Branchless
+    //    multi-literal output (asm:518-519).
+    //  * SLOP-MARGIN HEADROOM GUARD: the fast loop runs ONLY while there is
+    //    >= (16 + 258) bytes of output headroom AND >= 8 bytes of input slop; inside
+    //    that region there are NO per-symbol bounds checks (asm:48,488-512). A careful
+    //    per-symbol tail handles the boundary.
+    //  * PRELOAD: the next lit/len symbol is decoded BEFORE the current symbol's
+    //    back-ref branch resolves, hiding the dependent table-load latency (asm:524-525).
+    //  * WORD/overlap-doubling back-ref copy on the flat u8 buffer (asm:558-627):
+    //    8-byte word copy for distance>=8, RLE memset for distance==1, byte tail.
+    //
+    // Byte-exactness is the absolute gate: VAR_V must be SHA-equal to VAR_I scalar AND
+    // VAR_III ISA-L over the swept clean chunks, or the rate is VOID.
+
+    // RFC 1951 §3.2.6 fixed-Huffman code lengths (FIXED_LIT_LEN_LENGTHS is private in
+    // marker_inflate; reconstruct the 288-entry litlen table + 30-entry dist here).
+    fn fixed_litlen_lengths() -> [u8; 288] {
+        let mut t = [0u8; 288];
+        for (i, v) in t.iter_mut().enumerate() {
+            *v = if i < 144 {
+                8
+            } else if i < 256 {
+                9
+            } else if i < 280 {
+                7
+            } else {
+                8
+            };
+        }
+        t
+    }
+
+    /// Build the igzip packed-flat-short-code tables for ONE block from the code
+    /// lengths the driving `Block` parsed in `read_header`. Returns None on a
+    /// stored block or an invalid table (the speculative variant only handles
+    /// fixed/dynamic compressed blocks; stored blocks are handled inline).
+    fn build_block_tables(block: &Block) -> Option<(LutLitLenCode, LutDistCode)> {
+        let mut litlen = LutLitLenCode::new_empty();
+        let mut dist = LutDistCode::new_empty();
+        match block.compression_type() {
+            CompressionType::FixedHuffman => {
+                let ll = fixed_litlen_lengths();
+                let dl = [5u8; 30];
+                if !litlen.rebuild_from(&ll) || !dist.rebuild_from(&dl) {
+                    return None;
+                }
+            }
+            CompressionType::DynamicHuffman => {
+                let split = block.literal_code_count;
+                let end = split + block.distance_code_count;
+                if end > block.literal_cl.len() {
+                    return None;
+                }
+                let ll = &block.literal_cl[..split];
+                let dl = &block.literal_cl[split..end];
+                if !litlen.rebuild_from(ll) || !dist.rebuild_from(dl) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        Some((litlen, dist))
+    }
+
+    // Output headroom the fast loop reserves so it can over-write without a
+    // per-symbol bounds check: up to 8 speculative literal bytes + a 258-byte
+    // max-length back-ref + a 16-byte word-copy overshoot (igzip asm:511).
+    const OUT_SLOP: usize = 8 + 258 + 16;
+    // Input slop so the bit refill can always read an 8-byte word (igzip
+    // IN_BUFFER_SLOP, asm:48).
+    const IN_SLOP: usize = 8;
+
+    /// Word/overlap-doubling back-ref copy on a FLAT u8 buffer. `out_pos` is the
+    /// current write cursor; the source is `out_pos - distance`, always already-
+    /// final bytes (flat linear, window prepended). Caller guarantees
+    /// `out_pos + length + 16 <= out.len()` (headroom guard) so this over-writes
+    /// freely. Mirrors igzip large_byte_copy / small_byte_copy (asm:603-627).
+    #[inline(always)]
+    unsafe fn flat_backref_copy(out: *mut u8, out_pos: usize, distance: usize, length: usize) {
+        let dst0 = out.add(out_pos);
+        let src0 = out.add(out_pos - distance);
+        // Discriminator MIRRORS production emit_backref_ring_u8 (marker_inflate.rs
+        // :2704): the 8-byte word copy is correct ONLY for NON-overlapping copies
+        // (`distance >= length`), where the source run is fully `length` bytes
+        // behind the dest so the rounded-up 8-byte stride never aliases a not-yet-
+        // written byte. For `1 < distance < length` the copy overlaps and the word
+        // copy would read ahead of the just-written pattern — must go byte-by-byte
+        // (or distance-doubling). distance==1 is RLE.
+        if distance >= length {
+            if distance >= 8 {
+                // Word copy, may overshoot up to 7 bytes (headroom-licensed).
+                let mut src = src0;
+                let mut dst = dst0;
+                let mut copied = 0usize;
+                while copied < length {
+                    let w = (src as *const u64).read_unaligned();
+                    (dst as *mut u64).write_unaligned(w);
+                    src = src.add(8);
+                    dst = dst.add(8);
+                    copied += 8;
+                }
+            } else {
+                // distance < 8 but non-overlap (distance >= length so length < 8):
+                // exact byte copy.
+                for i in 0..length {
+                    *dst0.add(i) = *src0.add(i);
+                }
+            }
+        } else if distance == 1 {
+            // RLE memset.
+            let b = *src0;
+            std::ptr::write_bytes(dst0, b, length);
+        } else {
+            // Overlap (1 < distance < length): sequential self-replicating copy.
+            for i in 0..length {
+                *dst0.add(i) = *src0.add(i);
+            }
+        }
+    }
+
+    fn decode_var_v(deflate: &[u8], start_bit: usize, window: &[u8], target_n: usize) -> Vec<u8> {
+        // Flat linear output: [0..MAX_WINDOW_SIZE) = prepended window history,
+        // [MAX_WINDOW_SIZE..) = decoded bytes. Back-refs into history read the
+        // window region directly (no ring). Reserve OUT_SLOP so the fast loop can
+        // over-write past the logical end without a per-symbol bounds check.
+        let base = MAX_WINDOW_SIZE;
+        let cap = base + target_n + OUT_SLOP + 4096;
+        let mut out: Vec<u8> = vec![0u8; cap];
+        out[..base].copy_from_slice(&window[..base.min(window.len())]);
+        let out_ptr = out.as_mut_ptr();
+
+        // Drive a Block purely to PARSE block headers (BFINAL/BTYPE + dynamic
+        // code lengths). The decode itself is done by the speculative loop below,
+        // NOT by Block::read — Block here is a header parser only.
+        let mut block = Block::new();
+        {
+            let mut dummy: Vec<u16> = Vec::new();
+            // Prime so the header parser starts in clean mode (matches the other
+            // variants); the speculative loop does not use the Block ring at all.
+            block
+                .set_initial_window(&mut dummy, window)
+                .expect("prime window (v)");
+        }
+
+        let mut bits = Bits::at_bit_offset(deflate, start_bit);
+        let in_end = deflate.len();
+        // out_pos is the absolute write index into `out` (>= base).
+        let mut out_pos = base;
+        let target_end = base + target_n; // stop emitting once we reach target_n
+
+        'blocks: loop {
+            if block.read_header(&mut bits, false).is_err() {
+                break;
+            }
+            match block.compression_type() {
+                CompressionType::Uncompressed => {
+                    // Stored block: byte-aligned literal copy. Read length, copy.
+                    bits.align_to_byte();
+                    // LEN (16) then NLEN (16). Pull via read_u16.
+                    let len = bits.read_u16() as usize;
+                    let _nlen = bits.read_u16();
+                    for _ in 0..len {
+                        if bits.available() < 8 {
+                            bits.refill();
+                        }
+                        let b = (bits.peek() & 0xFF) as u8;
+                        bits.consume(8);
+                        unsafe {
+                            *out_ptr.add(out_pos) = b;
+                        }
+                        out_pos += 1;
+                    }
+                    if block.is_last_block() || out_pos >= target_end {
+                        break 'blocks;
+                    }
+                    continue 'blocks;
+                }
+                CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {}
+                CompressionType::Reserved => break 'blocks,
+            }
+
+            let (litlen, dist) = match build_block_tables(&block) {
+                Some(t) => t,
+                None => break 'blocks,
+            };
+
+            // ── SPECULATIVE SOFTWARE-PIPELINED FAST LOOP ──────────────────────
+            // Runs while headroom (out) AND slop (in) permit unchecked over-
+            // read/write (igzip asm:488-512). Preloads the next lit/len symbol
+            // before resolving the current packet's back-ref branch.
+            //
+            // PACKET SEMANTICS (production marker_inflate.rs:1492-1602): one
+            // `litlen.decode` returns a packet of `sym_count` elements packed
+            // low-byte-first. Elements are LITERALS while their value <= 255; a
+            // trailing element with value > 255 is a LENGTH code (igzip packs
+            // literal + (literal|length)). So the packet is: a literal PREFIX
+            // (speculative 8-byte store, advance by the count of leading
+            // literals) followed by an OPTIONAL trailing length code (back-ref).
+            let mut at_eob = false;
+            bits.refill();
+            let mut pre = litlen.decode(&mut bits); // PRELOAD
+            'fast: loop {
+                let out_ok = out_pos + OUT_SLOP < cap;
+                let in_ok = bits.pos + IN_SLOP < in_end;
+                if !(out_ok && in_ok) {
+                    break;
+                }
+                let sym = pre.symbol;
+                let sym_count = pre.sym_count;
+                if pre.bit_count == 0 {
+                    return out[base..out_pos.min(target_end)].to_vec();
+                }
+                bits.consume(pre.bit_count);
+
+                // SPECULATIVE 8-byte store of the packed bytes (igzip asm:518):
+                // write all up-to-3 packed bytes unconditionally, then advance by
+                // the count of LEADING LITERALS only. Wrong bytes are overwritten
+                // by the next packet (or by the back-ref below).
+                unsafe {
+                    let packed = (sym & 0x00FF_FFFF) as u64;
+                    (out_ptr.add(out_pos) as *mut u64).write_unaligned(packed);
+                }
+                // Count leading literals (production unpack loop semantics).
+                let mut s = sym;
+                let mut remaining = sym_count;
+                let mut lit_prefix = 0u32;
+                let mut trailing_code: Option<u16> = None;
+                while remaining > 0 {
+                    let code = (s & 0xFFFF) as u16;
+                    if code <= 255 || remaining > 1 {
+                        // Literal (multi-pack always literal except the last
+                        // element; the last element may be a length code).
+                        if remaining == 1 && code > 255 {
+                            trailing_code = Some(code);
+                            break;
+                        }
+                        lit_prefix += 1;
+                        remaining -= 1;
+                        s >>= 8;
+                        continue;
+                    }
+                    // remaining == 1, code > 255: trailing length/EOB.
+                    trailing_code = Some(code);
+                    break;
+                }
+                out_pos += lit_prefix as usize;
+
+                if let Some(code) = trailing_code {
+                    if code == END_OF_BLOCK_SYMBOL {
+                        at_eob = true;
+                        break 'fast;
+                    }
+                    if (code as u32) > MAX_LIT_LEN_SYM {
+                        return out[base..out_pos.min(target_end)].to_vec();
+                    }
+                    let length = (code as usize).wrapping_sub(254);
+                    if length != 0 {
+                        let (dsym, dbits) = match dist.decode(&mut bits) {
+                            Some(d) => d,
+                            None => return out[base..out_pos.min(target_end)].to_vec(),
+                        };
+                        bits.consume(dbits);
+                        if dsym as usize >= DISTANCE_BASE.len() {
+                            return out[base..out_pos.min(target_end)].to_vec();
+                        }
+                        let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                        let distance = if extra > 0 {
+                            if bits.available() < extra {
+                                bits.refill();
+                            }
+                            let mask = (1u64 << extra) - 1;
+                            let v = (bits.peek() & mask) as usize;
+                            bits.consume(extra);
+                            DISTANCE_BASE[dsym as usize] as usize + v
+                        } else {
+                            DISTANCE_BASE[dsym as usize] as usize
+                        };
+                        if distance == 0 || distance > out_pos {
+                            return out[base..out_pos.min(target_end)].to_vec();
+                        }
+                        unsafe {
+                            flat_backref_copy(out_ptr, out_pos, distance, length);
+                        }
+                        out_pos += length;
+                    }
+                }
+
+                bits.refill();
+                pre = litlen.decode(&mut bits); // PRELOAD next
+                if out_pos >= target_end {
+                    break 'fast;
+                }
+            }
+
+            // ── CAREFUL TAIL: per-symbol, bounds-checked, to the block boundary ─
+            // The fast loop ALWAYS consumed `pre`'s bits before preloading, so at
+            // every `break` `pre` is a FRESH un-consumed decode. Process it (and
+            // continue) with full bounds checks until EOB or target_end.
+            if !at_eob {
+                let mut cur = pre;
+                'careful: loop {
+                    if out_pos >= target_end {
+                        break;
+                    }
+                    let sym = cur.symbol;
+                    let sym_count = cur.sym_count;
+                    if cur.bit_count == 0 {
+                        return out[base..out_pos.min(target_end)].to_vec();
+                    }
+                    bits.consume(cur.bit_count);
+                    let mut s = sym;
+                    let mut remaining = sym_count;
+                    // Unpack literals (bounds-checked, byte-by-byte).
+                    while remaining > 0 {
+                        let code = (s & 0xFFFF) as u16;
+                        if code <= 255 || remaining > 1 {
+                            if remaining == 1 && code > 255 {
+                                break;
+                            }
+                            if out_pos >= cap {
+                                return out[base..target_end.min(out_pos)].to_vec();
+                            }
+                            unsafe {
+                                *out_ptr.add(out_pos) = (code & 0xFF) as u8;
+                            }
+                            out_pos += 1;
+                            remaining -= 1;
+                            s >>= 8;
+                            continue;
+                        }
+                        break;
+                    }
+                    if remaining == 1 {
+                        let code = (s & 0xFFFF) as u16;
+                        if code == END_OF_BLOCK_SYMBOL {
+                            // EOB: this block is done; the outer block loop reads
+                            // the next header. (No need to set `at_eob` — it is
+                            // only read to decide whether to ENTER this tail.)
+                            break 'careful;
+                        }
+                        if (code as u32) > MAX_LIT_LEN_SYM {
+                            return out[base..out_pos.min(target_end)].to_vec();
+                        }
+                        let length = (code as usize).wrapping_sub(254);
+                        if length != 0 {
+                            let (dsym, dbits) = match dist.decode(&mut bits) {
+                                Some(d) => d,
+                                None => return out[base..out_pos.min(target_end)].to_vec(),
+                            };
+                            bits.consume(dbits);
+                            if dsym as usize >= DISTANCE_BASE.len() {
+                                return out[base..out_pos.min(target_end)].to_vec();
+                            }
+                            let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                            let distance = if extra > 0 {
+                                if bits.available() < extra {
+                                    bits.refill();
+                                }
+                                let mask = (1u64 << extra) - 1;
+                                let v = (bits.peek() & mask) as usize;
+                                bits.consume(extra);
+                                DISTANCE_BASE[dsym as usize] as usize + v
+                            } else {
+                                DISTANCE_BASE[dsym as usize] as usize
+                            };
+                            if distance == 0 || distance > out_pos {
+                                return out[base..out_pos.min(target_end)].to_vec();
+                            }
+                            if out_pos + length + 16 > cap {
+                                for i in 0..length {
+                                    if out_pos + i >= cap {
+                                        break;
+                                    }
+                                    unsafe {
+                                        let v = *out_ptr.add(out_pos + i - distance);
+                                        *out_ptr.add(out_pos + i) = v;
+                                    }
+                                }
+                            } else {
+                                unsafe {
+                                    flat_backref_copy(out_ptr, out_pos, distance, length);
+                                }
+                            }
+                            out_pos += length;
+                        }
+                    }
+                    bits.refill();
+                    cur = litlen.decode(&mut bits);
+                }
+            }
+
+            if block.is_last_block() || out_pos >= target_end {
+                break 'blocks;
+            }
+            // The bit cursor is positioned just after this block's EOB symbol, so
+            // the next `read_header` parses the following block's BFINAL/BTYPE.
+        }
+
+        // Return ONLY the decoded region (drop the prepended window), clamped to
+        // target_n.
+        let end = out_pos.min(target_end);
+        out[base..end].to_vec()
+    }
+
     fn crc32(b: &[u8]) -> u32 {
         let mut h = crc32fast::Hasher::new();
         h.update(b);
@@ -256,7 +679,7 @@ mod bench {
     // interleaved timing + byte-exact gate. Order matters: index 0 = scalar
     // reference, index 2 = ISA-L oracle (both used as byte-exact denominators).
     type DecodeFn = fn(&[u8], usize, &[u8], usize) -> Vec<u8>;
-    const VARIANTS: [(&str, DecodeFn); 7] = [
+    const VARIANTS: [(&str, DecodeFn); 8] = [
         ("VAR_I_scalar_u16", decode_var_i),
         ("VAR_II_E1u8_part", decode_var_ii),
         ("VAR_III_isal", decode_var_iii),
@@ -269,13 +692,19 @@ mod bench {
         ("VAR_IV_E2", decode_var_iv::<true, false, false>),
         ("VAR_IV_E23", decode_var_iv::<true, true, false>),
         ("VAR_IV_E234", decode_var_iv::<true, true, true>),
+        // VAR_V is the inner-Huffman-kernel LEVER: igzip packed-flat-short-code
+        // table (trick #1) + the speculative software-pipelined loop (trick #2) on
+        // a FLAT-u8 linear buffer (the missing piece — production stores one u8 per
+        // iter with a ring modulo and never preloads). This is the variant the
+        // pre-registered falsifier gates: PASS if (V)/(III isal) >= 0.85.
+        ("VAR_V_specflat", decode_var_v),
     ];
 
     /// Per-chunk result: median MB/s per variant (index-aligned with VARIANTS)
     /// and whether every variant was byte-exact vs scalar AND scalar vs ISA-L.
     struct ChunkResult {
-        med_mbps: [f64; 7],
-        exact: [bool; 7],
+        med_mbps: [f64; 8],
+        exact: [bool; 8],
         all_equal: bool,
         r_iii_i: f64,
     }
@@ -310,7 +739,7 @@ mod bench {
         let scalar_eq_isal = scalar == isal;
         // Length-safe exact check: variant must be >= n_actual long AND match
         // scalar over [0, n_actual) AND scalar must match ISA-L.
-        let mut exact = [false; 7];
+        let mut exact = [false; 8];
         for (k, o) in outs.iter().enumerate() {
             exact[k] = o.len() >= n_actual && &o[..n_actual] == scalar && scalar_eq_isal;
         }
@@ -346,7 +775,7 @@ mod bench {
         for (_, f) in VARIANTS.iter() {
             let _ = f(deflate, start_bit, window, n_actual);
         }
-        let mut times: [Vec<f64>; 7] = Default::default();
+        let mut times: [Vec<f64>; 8] = Default::default();
         for _ in 0..ITERS {
             for (k, (_, f)) in VARIANTS.iter().enumerate() {
                 let s = Instant::now();
@@ -357,8 +786,8 @@ mod bench {
         }
 
         let mbps = |secs: f64| (n_actual as f64) / secs / 1e6;
-        let mut med_mbps = [0.0f64; 7];
-        for k in 0..7 {
+        let mut med_mbps = [0.0f64; 8];
+        for k in 0..8 {
             let (_min, med, _sig) = stats(&times[k]);
             med_mbps[k] = mbps(med);
         }
