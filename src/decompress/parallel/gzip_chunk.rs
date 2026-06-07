@@ -1766,3 +1766,332 @@ mod tests {
         worker.join().expect("decode worker panicked");
     }
 }
+
+// =========================================================================
+// STEP 1b GATE — pure-tail vs ISA-L-tail accounting differential
+// =========================================================================
+//
+// Decides whether routing the chunk clean-tail through real ISA-L (C FFI)
+// can reproduce, byte-for-byte, the ACCOUNTING the pure-Rust tail
+// (`finish_decode_chunk_impl`) produces:
+//   (a) committed decoded bytes      (b) committed length
+//   (c) final_bit handoff            (d) per-chunk CRC32 over committed span
+//   (e) deflate block-boundary list (bit offset + chunk-relative output off)
+//
+// LEFT (truth)   = production `finish_decode_chunk_impl` on a fresh ChunkData.
+// RIGHT (candidate ISA-L tail) = `decompress_deflate_from_bit_with_boundaries`
+//   over the full member tail, then a FROZEN coalesce post-processing rule:
+//     - until_exact=false: first recorded boundary with bit >= stop_hint_bits
+//     - until_exact=true : the recorded boundary with bit == stop_hint_bits
+//   truncate decoded bytes + recompute CRC + set final_bit at that boundary.
+//
+// The post-processing rule is frozen BEFORE running (advisor Q1): if it
+// disagrees with the pure tail's coalesce rule (gzip_chunk.rs:459-497, esp.
+// the END_OF_BLOCK_HEADER/last_eob_pos branch at :478-489) that disagreement
+// is the GATE FINDING, not a bug to patch out.
+#[cfg(all(test, isal_clean_tail))]
+mod isal_tail_parity {
+    use super::*;
+    use crate::decompress::parallel::crc32::crc32 as crc32_of;
+
+    const WINDOW: usize = 32 * 1024;
+
+    struct Boundary {
+        bit: usize,
+        out_off: usize,
+    }
+
+    /// Decode the whole raw-deflate member once with the pure wrapper,
+    /// recording every END_OF_BLOCK boundary (bit position = start of next
+    /// block header; output offset = decoded bytes just past finished block).
+    fn enumerate(input: &[u8]) -> (Vec<u8>, Vec<Boundary>) {
+        let mut wrapper =
+            StreamingInflateWrapper::with_until_bits(input, 0, input.len() * 8).expect("init");
+        wrapper.set_window(&[]).expect("empty window");
+        wrapper.set_stopping_points(
+            StoppingPoints::END_OF_BLOCK
+                | StoppingPoints::END_OF_BLOCK_HEADER
+                | StoppingPoints::END_OF_STREAM_HEADER,
+        );
+        let mut decoded: Vec<u8> = Vec::new();
+        let mut bounds: Vec<Boundary> = Vec::new();
+        let mut buf = vec![0u8; 128 * 1024];
+        let mut last_bit = 0usize;
+        loop {
+            let r = wrapper.read_stream(&mut buf).expect("read_stream");
+            decoded.extend_from_slice(&buf[..r.bytes_written]);
+            if r.stopped_at == StoppingPoints::END_OF_BLOCK {
+                bounds.push(Boundary {
+                    bit: r.bit_position,
+                    out_off: decoded.len(),
+                });
+            }
+            if r.finished {
+                break;
+            }
+            // No-progress guard.
+            if r.bytes_written == 0
+                && r.stopped_at == StoppingPoints::NONE
+                && r.bit_position == last_bit
+            {
+                break;
+            }
+            last_bit = r.bit_position;
+        }
+        (decoded, bounds)
+    }
+
+    /// One LEFT (production pure tail) decode on a fresh ChunkData.
+    /// Returns (committed bytes, len, final_bit, crc, in-span boundaries).
+    fn left_tail(
+        input: &[u8],
+        start_bit: usize,
+        stop_hint: usize,
+        window: &[u8],
+        until_exact: bool,
+        all: &[Boundary],
+    ) -> (Vec<u8>, usize, usize, u32, Vec<(usize, usize)>) {
+        let cfg = ChunkConfiguration::default();
+        let mut chunk = ChunkData::new(start_bit, cfg);
+        finish_decode_chunk_impl(
+            &mut chunk,
+            input,
+            start_bit,
+            stop_hint,
+            window,
+            false,
+            until_exact,
+        )
+        .expect("pure tail decode");
+
+        // Control LEFT state (advisor Q5).
+        assert_eq!(
+            chunk.data_prefix_len, 0,
+            "LEFT: unexpected window-image prefix"
+        );
+        assert_eq!(
+            chunk.narrowed_len, 0,
+            "LEFT: unexpected narrowed marker prefix"
+        );
+        assert_eq!(
+            chunk.crc32s.len(),
+            1,
+            "LEFT: expected exactly one CRC accumulator"
+        );
+        assert!(chunk.encoded_size_bits > 0, "LEFT: finalize did not run");
+
+        let bytes = chunk.data.to_contiguous();
+        let len = chunk.data.len();
+        let final_bit = chunk.encoded_offset_bits + chunk.encoded_size_bits;
+        let crc = chunk.crc32s[0].crc32();
+        // Cross-check the accumulator equals a fresh CRC of the committed span
+        // (so a CRC-algorithm mismatch can't masquerade as a (d) divergence).
+        assert_eq!(
+            crc,
+            crc32_of(&bytes),
+            "LEFT: CRC accumulator != crc32(committed)"
+        );
+
+        let start_off = all
+            .iter()
+            .find(|b| b.bit == start_bit)
+            .map(|b| b.out_off)
+            .unwrap_or(0);
+        let in_span: Vec<(usize, usize)> = all
+            .iter()
+            .filter(|b| b.bit > start_bit && b.bit <= final_bit)
+            .map(|b| (b.bit, b.out_off - start_off))
+            .collect();
+        (bytes, len, final_bit, crc, in_span)
+    }
+
+    /// One RIGHT (ISA-L FFI + frozen coalesce post-processing) decode.
+    fn right_tail(
+        input: &[u8],
+        start_bit: usize,
+        stop_hint: usize,
+        window: &[u8],
+        until_exact: bool,
+    ) -> Option<(Vec<u8>, usize, usize, u32, Vec<(usize, usize)>)> {
+        let mut throwaway = crc32fast::Hasher::new();
+        // Full member tail (advisor Q3): never a fixed margin.
+        let (out, _end, bnds) =
+            crate::backends::isal_decompress::decompress_deflate_from_bit_with_boundaries(
+                input,
+                start_bit,
+                window,
+                input.len(), // generous cap; ISA-L grows on demand
+                &mut throwaway,
+            )?;
+        // FROZEN coalesce rule.
+        let chosen = if until_exact {
+            bnds.iter().find(|b| b.bit_offset == stop_hint)
+        } else {
+            bnds.iter().find(|b| b.bit_offset >= stop_hint)
+        }?;
+        let truncate = chosen.output_offset;
+        let final_bit = chosen.bit_offset;
+        let bytes = out[..truncate].to_vec();
+        let crc = crc32_of(&bytes);
+        let in_span: Vec<(usize, usize)> = bnds
+            .iter()
+            .filter(|b| b.bit_offset > start_bit && b.bit_offset <= final_bit)
+            .map(|b| (b.bit_offset, b.output_offset))
+            .collect();
+        Some((bytes, truncate, final_bit, crc, in_span))
+    }
+
+    #[test]
+    fn isal_tail_matches_pure_tail_on_real_silesia_chunks() {
+        let gz = std::fs::read("benchmark_data/silesia-gzip.tar.gz")
+            .expect("benchmark_data/silesia-gzip.tar.gz must exist");
+        let hdr =
+            crate::decompress::parallel::single_member::skip_gzip_header(&gz).expect("gzip header");
+        let input = &gz[hdr..gz.len() - 8];
+
+        let (decoded, bounds) = enumerate(input);
+        assert!(
+            bounds.len() > 40,
+            "need many real deflate boundaries, got {}",
+            bounds.len()
+        );
+        eprintln!(
+            "[gate] raw deflate {} bytes -> {} decoded bytes, {} EOB boundaries",
+            input.len(),
+            decoded.len(),
+            bounds.len()
+        );
+
+        // Synthesize real chunk tail-decode inputs: 5 starts evenly spread
+        // across interior boundaries, each spanning K=8 blocks.
+        const K: usize = 8;
+        let n = bounds.len();
+        let mut starts: Vec<usize> = Vec::new();
+        for f in 1..=5usize {
+            let idx = (n * f) / 7;
+            if idx >= 1 && idx + K + 1 < n {
+                starts.push(idx);
+            }
+        }
+        starts.dedup();
+        assert!(!starts.is_empty(), "no usable chunk starts");
+
+        let mut total = 0usize;
+        let mut diverged = 0usize;
+
+        for &si in &starts {
+            for until_exact in [false, true] {
+                let start_b = &bounds[si];
+                let start_bit = start_b.bit;
+                let win_lo = start_b.out_off.saturating_sub(WINDOW);
+                // Exact available prefix, capped at 32 KiB (advisor Q4).
+                let window = &decoded[win_lo..start_b.out_off];
+
+                let stop_hint = if until_exact {
+                    // Exact later real boundary.
+                    bounds[si + K].bit
+                } else {
+                    // Mid-block: between boundary si+K-1 and si+K, so the pure
+                    // "first EOB at-or-past" should land on bounds[si+K].
+                    let a = bounds[si + K - 1].bit;
+                    let b = bounds[si + K].bit;
+                    a + (b - a) / 2
+                };
+
+                total += 1;
+                let label = format!(
+                    "start_idx={si} start_bit={start_bit} stop_hint={stop_hint} \
+                     until_exact={until_exact} win_len={}",
+                    window.len()
+                );
+
+                let (lb, ll, lf, lc, lbnd) =
+                    left_tail(input, start_bit, stop_hint, window, until_exact, &bounds);
+
+                let right = right_tail(input, start_bit, stop_hint, window, until_exact);
+                let Some((rb, rl, rf, rc, rbnd)) = right else {
+                    diverged += 1;
+                    eprintln!(
+                        "[gate] DIVERGE ({label}): ISA-L produced NO boundary matching the \
+                         frozen coalesce rule (until_exact={until_exact}); LEFT len={ll} final_bit={lf}"
+                    );
+                    continue;
+                };
+
+                let a_ok = lb == rb;
+                let b_ok = ll == rl;
+                let c_ok = lf == rf;
+                let d_ok = lc == rc;
+                let e_ok = lbnd == rbnd;
+
+                if a_ok && b_ok && c_ok && d_ok && e_ok {
+                    eprintln!(
+                        "[gate] MATCH ({label}): len={ll} final_bit={lf} crc={lc:#010x} \
+                         boundaries={}",
+                        lbnd.len()
+                    );
+                } else {
+                    diverged += 1;
+                    eprintln!("[gate] DIVERGE ({label}):");
+                    eprintln!(
+                        "    (a) bytes     : {}",
+                        if a_ok {
+                            "match".into()
+                        } else {
+                            format!(
+                                "DIFFER (left {} vs right {} bytes; first diff at {:?})",
+                                lb.len(),
+                                rb.len(),
+                                lb.iter().zip(rb.iter()).position(|(x, y)| x != y)
+                            )
+                        }
+                    );
+                    eprintln!(
+                        "    (b) length    : {}",
+                        if b_ok {
+                            "match".into()
+                        } else {
+                            format!("DIFFER left {ll} vs right {rl}")
+                        }
+                    );
+                    eprintln!(
+                        "    (c) final_bit : {}",
+                        if c_ok {
+                            "match".into()
+                        } else {
+                            format!("DIFFER left {lf} vs right {rf}")
+                        }
+                    );
+                    eprintln!(
+                        "    (d) crc       : {}",
+                        if d_ok {
+                            "match".into()
+                        } else {
+                            format!("DIFFER left {lc:#010x} vs right {rc:#010x}")
+                        }
+                    );
+                    eprintln!(
+                        "    (e) boundaries: {}",
+                        if e_ok {
+                            "match".into()
+                        } else {
+                            format!("DIFFER left {} vs right {} entries", lbnd.len(), rbnd.len())
+                        }
+                    );
+                }
+            }
+        }
+
+        eprintln!(
+            "[gate] SUMMARY: {} chunk-decodes, {} matched, {} diverged",
+            total,
+            total - diverged,
+            diverged
+        );
+        assert_eq!(
+            diverged, 0,
+            "ISA-L tail diverged from pure tail on {diverged}/{total} chunk-decodes \
+             (see [gate] lines above for the exact field + mechanism)"
+        );
+    }
+}
