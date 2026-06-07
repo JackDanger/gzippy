@@ -227,7 +227,10 @@ say ""
 say "================ TRACE CAPTURE (PMU/trace perturb wall — separate runs) ================"
 T=8
 mask="$(pin_mask "$T")"
-capture_trace "gzippy_T${T}" "$mask" "$GZIPPY" -d -c -p "$T" "$CORPUS" || true
+# LAG-CAUSALITY (placement-rescope): thread the byte-exact stall-residency probe so the
+# head-of-line cold-get STALL COUNT (the primary lag proxy) lands in trace.log. Counters
+# only, OFF==identity (proven dual-sha); the trace run is already a perturbed separate run.
+capture_trace "gzippy_T${T}" "$mask" env GZIPPY_STALL_RESIDENCY_PROBE=1 "$GZIPPY" -d -c -p "$T" "$CORPUS" || true
 capture_trace "rapidgzip_T${T}" "$mask" "$RG_TRACE" -d -c -f -P "$T" "$CORPUS" || true
 capture_trace "gzippy_spec_pred_off_T${T}" "$mask" env GZIPPY_SPEC_PRED_CLEAN=0 \
   "$GZIPPY" -d -c -p "$T" "$CORPUS" || true
