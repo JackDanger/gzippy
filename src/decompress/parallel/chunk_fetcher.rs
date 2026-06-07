@@ -495,7 +495,12 @@ fn drive_impl<W: std::io::Write>(
     // CLEAN path while the production consumer / publish chain runs unchanged.
     // No-op unless seed mode is on. Skip boundaries within one chunk of EOF (an
     // EOF-adjacent window key is a stream-end artifact, not a real chunk start).
-    {
+    // DECOMPOSE knob (GZIPPY_SEED_NO_BOUNDARIES=1, measurement-only): skip the
+    // block_finder pre-seed so dispatch lands on prod partition-GUESS boundaries
+    // even when windows are seeded. Isolates the boundary-ALIGNMENT sub-lever from
+    // the marker-COMPUTE sub-lever. OFF==identity. Byte-correct (partition guesses
+    // are corrected at the confirmed offset, as in unseeded prod).
+    if !crate::decompress::parallel::seed_windows::seed_no_boundaries() {
         let starts = crate::decompress::parallel::seed_windows::seedable_chunk_starts();
         for off in starts {
             if off + (32 * 1024 * 8) < total_bits {
