@@ -1,5 +1,64 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## ENGINE BENCH ROUND 2 — IN PROGRESS [2026-06-07, leader fresh instance]
+Charter: plans/engine-bench-round2-authorization.md. SETTLE the plateau falsifier by building
+E2-E4 in the engine-isolation bench (standalone, NOT production integration).
+- STEP 0 DONE: round-1 harness COMMITTED 5d5fc3b9 (pushed). Self-test band RECALIBRATED
+  [1.7,2.6]->[2.5,3.6] (round-1 FAIL was mis-calibrated: pure-ISA-L is a purer denominator
+  → larger honest ~3.1x ratio, advisor-confirmed iii/ii=3.10x).
+- KEY STRUCTURAL FACT (source-verified): production clean dynamic-block loop is
+  read_internal_compressed_specialized<false> (marker_inflate.rs:1191) — the multi-cached LUT
+  loop. Back-ref copy = emit_backref_ring<false> (:2137), writes into a u16 RING. Literal store
+  = single u16 (:1348). Refill = bits.refill() once per outer iter (:1324). THESE are the E2/E3/E4
+  targets. The u16 ring means every byte costs 2 bytes of mem traffic vs ISA-L's u8 buffer — the
+  prime suspect for the 3.1x gap (compute is already heavily optimized: word-copy, RLE fill, etc).
+- E2 (wide SIMD back-ref copy): emit_backref_ring already does 8-byte-word(=4 u16) copies + RLE
+  fill. Headroom = wider vectors (AVX2 32-byte = 16 u16) for the longer matches; main lever is
+  CLEAN u8 ring (halves copy traffic). E3 (packed multi-literal store): :1343 unpacks the
+  TRIPLE_SYM 1-3 packed literals one u16 at a time — collapse to one wide store. E4 (wide refill):
+  refill is already libdeflate-style (56-63 bits) once/iter; headroom = amortize over >1 symbol.
+- PLAN: prototype E2-E4 as new bench variants (byte-exact gate vs scalar + ISA-L), measure
+  separately + stacked, chunk-sweep 3-5 clean chunks, settle PASS/PLATEAU via tier1-design §3.
+  Delegated to a synchronous subagent (spec in plans/engine-bench-round2-impl-spec.md).
+
+### ROUND-2 SETTLED — VERDICT: **PLATEAU** [2026-06-07, committed 7bf26096]
+- COMMITTED 7bf26096 (pushed): bench-only E2-E4 in marker_inflate.rs (read_clean_e234<E2,E3,E4>
+  + drain_clean_u8 + emit_backref_ring_clean + emit_avx2_copy_u16, all cfg-gated like
+  read_internal_compressed_specialized; production read() dispatches ONLY to <true>/<false> —
+  read_clean_e234 has ZERO production callers, grep-verified). Added VAR_IV_E000 (<false,false,false>)
+  byte-exactness anchor to the bench.
+- BYTE-EXACT GATE: GUEST run SHA_ALL_EQUAL=yes on all 5 swept clean silesia chunks for all 7
+  variants incl VAR_IV_E000 (read_clean_e234<false,false,false> == scalar <false> == ISA-L,
+  byte-identical) AND the E2/E3/E4 stacks (AVX2 LIVE on guest, avx2_detected=true). Also SHA-clean
+  under Rosetta (scalar fallback). Guest freq-locked: no_turbo=1, GATE PASS, RESTORE VERIFIED.
+- GUEST AGGREGATE (median-of-per-chunk-medians, MB/s, 5 chunks, taskset core0, N=11 interleaved):
+    VAR_I scalar      104   (=92.7ms/chunk anchor; projects 0.615s == design's 0.6134s — model self-consistent)
+    VAR_IV_E000       108   (engine, no technique; +4% over scalar)
+    VAR_IV_E2         121 / VAR_IV_E23 120 / VAR_IV_E234 (stacked) 118
+    VAR_III ISA-L     283
+- **(ii_stacked E234)/(iii ISA-L) = 0.412** (per-chunk 0.356..0.466, sd 0.036). This is FIRMLY in
+  PLATEAU: ≤ the pre-registered 0.65 plateau line, **12.2σ below** the 0.85 PASS threshold. E234
+  adds only ~8.7% median over E000 — the engine stays ~2.4× SLOWER than ISA-L (pure-decoder class).
+- §3 PROJECTION (anchored 92.7ms↔104MB/s, 39 chunks, ramp 1.36, T8): E234 projects decode_wall
+  0.542s. APPEARS ≤ the 0.604s tie bar, BUT this is a NUMERICAL ARTIFACT — decode_wall(0.542)≈
+  total_wall(0.542), i.e. DECODE IS STILL THE BINDING TERM (it did NOT re-bind onto the ~0.54s
+  shared floor). The bar sits right at the scalar floor (0.615s) so a ~13% engine bump trips it
+  without decode ceasing to bind. The pre-registered PASS requires (ii)/(iii)≥0.85 so decode stops
+  binding; E234 (0.41) is ~2× short. RATIO criterion GOVERNS → PLATEAU.
+- FALSIFIER FIRED: residual gap to igzip-class (0.85-0.41=0.44) >> spread (sd 0.036, 12σ). Per the
+  pre-registered falsifier: engine front is **NOT PROVEN** in pure-Rust+ASM as prototyped. The
+  1.0× bar is NOT reachable via this E1-E4 inner-loop direction without FFI (or a revisited bar).
+  SUPERVISOR/USER-LEVEL FINDING. Do NOT integrate; do NOT start the multi-week engine build.
+- WHY pure-Rust+ASM plateaus (mechanism, not just a TIE): vendor's own bench has ISA-L at 2.1× the
+  best PURE decoder single-thread; this bench reproduces ~2.4×. The gap is the u16 ring (2 bytes/byte
+  mem traffic vs ISA-L's u8 buffer) + igzip's whole-AVX2 codegen; E2 (AVX2 copy on the STILL-u16 ring)
+  + E3 (packed store) + E4 (amortized refill) recover only ~9% because the dominant cost is the per-
+  symbol LUT-decode + u16 traffic that these techniques don't remove. A true E1 (u8 ring) was NOT
+  prototyped here (faithful u16 ring kept for byte-exactness); it is the remaining untested lever but
+  would diverge the ONE-engine ring storage from vendor's m_window16 — a supervisor call.
+- NEXT (SUPERVISOR GATE): independent disproof advisor verdict ->
+  plans/engine-bench-round2-advisor-verdict.md, then STOP for supervisor. No production integration.
+
 ## PLACEMENT PORT GATE — **FAILED (do NOT code attempt #4)** [2026-06-07, HEAD e52b0fc2]
 Charter: plans/placement-port-authorization.md. The HARD 3-prior-failures re-derivation
 gate ran (2 read-only subagents + 1 independent disproof advisor, all synchronous). Verdict:
@@ -1190,3 +1249,125 @@ advisor verdict: plans/prefetch-horizon-advisor-verdict.md. Subagents (source-ci
 advisor) read-only/synchronous/killed (no orphans). Guest run from Bash tasks holding the ssh;
 host RESTORE VERIFIED. Commit 85c67474 (probe) pushed to reimplement-isa-l. NO placement port,
 NO engine work, NO inline-ASM build started.
+
+---
+## SUPERVISOR ROUTING 2026-06-07 (strategic advisor aa214edf): PIVOT TO ENGINE BENCH
+After 3 placement diagnostic rounds (offset-supply refuted; saturation disproved; horizon-depth
+vendor-identical), strategic advisor verdict = PIVOT-TO-ENGINE-BENCH. The engine is the
+unbounded TIE-DETERMINING unknown (2.38× clean gap); placement is bounded +13.7% w/ diminishing
+returns. NEXT = §2.3 engine isolation bench (the only legit ceiling-bound, isolation oracle +
+ISA-L positive control), bundling 3 near-free riders: (a) re-read nearest_le_start @cap=256
+(closes placement never-retained-vs-evicted); (b) same-sink production-output floor (bench can't
+reach it; 0.61s was /dev/null); (c) bench self-test first. DROP "placement dissolves w/ faster
+engine" as load-bearing (only ~24% coupled, cold-gets structural). PRE-REGISTER the plateau
+falsifier before any engine build. See plans/engine-bench-authorization.md.
+
+## ENGINE ISOLATION BENCH — BUILT + RUN (2026-06-07, engine-bench leader, HEAD 249f25b5)
+Falsifier pre-registered: plans/engine-bench-falsifier.md. Bench: benches/engine_isolation.rs
+(uncommitted; + Cargo.toml [[bench]] stanza + src/lib.rs one doc-hidden re-export
+`isal_decompress_oracle` — measurement-only, decode graph untouched). Build combo
+`--features pure-rust-inflate,isal-compression` on x86_64 = BOTH variant-(i) marker_inflate
+clean loop (pure_inflate_decode) AND variant-(iii) ISA-L FFI in one binary; isal_clean_tail
+stays OFF (gzippy-isal unset) so production routing is unaffected (build.rs:94-101, verified).
+
+### GUEST RESULT (authoritative — native x86_64, freq-locked no_turbo=1/perf, single core 0,
+### interleaved best-of-11, host RESTORE VERIFIED). Driver scripts/bench/run_engine_isolation.sh.
+```
+ENGINE_BENCH start_bit=302012944 N_bytes=4194304 (one clean mid-stream silesia chunk, 32KiB window)
+VAR_I   scalar_u16  med=0.035545s  MBps_med=118  sigma=0.4%   (production marker_inflate::Block clean loop)
+VAR_II  E1_u8(part) med=0.033563s  MBps_med=125  sigma=0.2%   (u8-direct sink; ring still u16 — bounds OUTPUT-traffic only)
+VAR_III isal        med=0.010814s  MBps_med=388  sigma=6.9%   (ISA-L isal_inflate oracle, FFI measurement-only)
+RATIO ii/i=1.059  iii/i=3.287  ii/iii=0.322
+SHA_ALL_EQUAL=yes  CRC i=ii=iii=0xf24393b3  (BYTE-EXACT GATE PASSES every iter)
+```
+- BYTE-EXACT is solid: all three CRC identical over 4 MiB, sub-1% sigma on both Rust paths.
+  `block.contains_marker_bytes()==false` asserted ⇒ variant (i) is a GENUINE clean decode of
+  the production loop, no shortcut, not the markered arm. Bench genuinely isolates single-thread
+  inner clean-decode compute (no scheduler/publish/marker machinery).
+- (iii)/(i) = **3.287×** on the guest (LARGER than the prior campaign's 2.38× wall / ~2.1× s-t
+  framing). This is the PURE single-thread clean inner-loop gap (one chunk, no pipeline). The
+  prior 2.38× was clean-per-chunk-rate at the wall (92.7ms vs 39ms) which carries pipeline/drain;
+  the isolated inner loop gap is wider.
+- SELFTEST band [1.7,2.6] reads FAIL because 3.287 > 2.6 — but this is NOT a broken-instrument
+  signal (byte-exact + clean + sub-1% sigma); it is ISA-L beating our scalar clean loop by MORE
+  than the band. Band was a prior-number sanity range; the qualitative "ISA-L ~2-3× our scalar"
+  reproduces and EXCEEDS it. (Advisor to adjudicate whether 3.29× indicates a real wider gap or a
+  bench artifact — see checkpoint.)
+- E1 (u8-direct OUTPUT) buys only +6% (ii/i=1.059). FINDING: output write-width is a SMALL
+  component of the engine gap. The dominant ISA-L advantage is in the INNER HUFFMAN DECODE LOOP
+  (multi-symbol packing / asm), not output traffic. E1-partial keeps the u16 ring; a full E1
+  (u8 ring) would also cut ring traffic, but this bounds the output-side lever as minor.
+
+### RIDER 1 — ANSWERED (from committed cap-swept evidence, commit d764734c): has_nearest_le_start=0
+at ALL caps including cap=256 ⇒ NEVER-RETAINED / consumer-pace, NOT capacity-eviction. Interior-
+reuse (getIndexedChunk) port has no resident parent at any cache size. Placement never-retained-vs-
+evicted sub-question CLOSED.
+
+### RIDER 2 — DONE (same-sink, real file sink on /dev/shm, T8 silesia-large, N=9, freq-locked,
+### all sha OK, host RESTORE VERIFIED). Driver scripts/bench/run_same_sink_floor.sh.
+```
+gzippy_same_sink:    min=1.1915 med=1.2113 sd=1.3%
+rapidgzip_same_sink: min=0.5960 med=0.6042 sd=1.8%
+```
+- **rapidgzip's SAME-SINK wall = 0.604s, NOT 0.54s.** The §3 "0.54s" was the /dev/null number;
+  on a REAL file sink rapidgzip is 0.604s. The tie BAR moves UP to ~0.60s — slightly MORE
+  favorable to gzippy's reachability than the design feared. (/dev/shm is RAM-backed; a true
+  spinning-disk sink would lift both further — this is a fair apples-to-apples same-sink compare.)
+- gzippy same-sink 1.21s ≈ 2.0× rapidgzip — consistent with the ~2.1× baseline.
+- §3 contingency "same-sink floor ≤0.54s" RESOLVED: the comparison floor is rapidgzip's own
+  0.60s same-sink; gzippy's non-decode serial floor (~0.015s, step-0) + same-sink output is well
+  under that, so the consumer does NOT structurally forbid the tie at the corrected ~0.60s bar.
+
+### PLATEAU-FALSIFIER VERDICT (pre-registered plans/engine-bench-falsifier.md):
+- (ii) E1-partial = ii/iii = 0.322 (still ~3× slower than ISA-L). Per the pre-registered
+  thresholds: (ii)/(iii)=0.322 ≤ 0.65 ⇒ E1-OUTPUT plateaus near the scalar pure ceiling, FAR
+  below ISA-L, residual ≫ spread (sub-1% sigma). **E1 (output write-width) alone is NOT PROVEN**
+  as the engine lever. BUT this is only the OUTPUT-traffic sub-lever; E2 (SIMD back-ref copy) /
+  E3 (packed multi-literal store) / E4 (wide refill) — the INNER-LOOP techniques where the finding
+  says the gap actually lives — were NOT benched (out of scope for the first subagent). So the
+  PLATEAU verdict is: **E1 plateaus (output traffic is a minor +6% lever); the engine front is
+  NOT YET PROVEN because the inner-loop techniques (E2-E4, the dominant gap) are unmeasured.**
+  The bench is BUILT and the harness is proven (byte-exact, freq-locked, self-consistent) — it is
+  ready to measure E2-E4 if the supervisor authorizes that next bench round.
+### ADVISOR VERDICT (independent, read-only, disproof-driven — plans/engine-bench-advisor-verdict.md):
+- (a) BENCH VALIDITY = **CORROBORATE-WITH-CAVEATS.** Variant (i) traced to the PRODUCTION LUT
+  multi-cached/TRIPLE_SYM clean loop (marker_inflate.rs:968→981→1114→1191→1206), NOT a slow
+  fallback. ISA-L oracle does the same work (raw deflate, same dict, same N via cap, no
+  short-circuit) and is biased AGAINST itself (zeroes a 4MiB buffer INSIDE the timed region,
+  isal_decompress.rs:372 ⇒ the gap is CONSERVATIVE). Byte gate is full memcmp (bench:245-247),
+  not just CRC. The bench is a TRUSTWORTHY instrument for what it measures.
+- (b) THE 3.29× HEADLINE = **REFUTED → corrected to ~3.10×.** Variant (i) carries a u16-sink
+  re-widen tax (Vec<u16> uses the DEFAULT push_clean_u8) that PRODUCTION DOES NOT PAY —
+  production uses the u8-direct clean-tail sink (gzip_chunk.rs:842), which variant (ii) mirrors.
+  That tax is only ~6%. So the production-representative ceiling = **(iii)/(ii) ≈ 3.10×**, not
+  (iii)/(i)=3.29×. ~3.1× is PLAUSIBLE for ISA-L-AVX2-vs-scalar-u16 (libdeflate/ISA-L beat naive
+  scalar 2-4×), NOT a broken-instrument flag. It is LARGER than the prior 2.38× because the
+  DENOMINATORS DIFFER: 2.38× was gzippy-clean vs rapidgzip-SYSTEM per-chunk; 3.1× is
+  gzippy-current-clean-loop vs PURE-ISA-L-clean (purer denominator ⇒ larger ratio). Do NOT
+  conflate them. The SELFTEST "FAIL" is a MIS-CALIBRATED band (set from the 2.38× system number),
+  not a broken instrument — recalibrate to ~[2.5×,3.6×] and re-pass (rule 4).
+- (c) PLATEAU / NOT-PROVEN = **CORROBORATE (sharpened).** Cannot reject (rule 3/7: E1 was never
+  the closing lever; the u16 ring is still u16 so E2-E4 untested) and cannot declare proven. The
+  bench built only E1-partial, but the pre-registered falsifier is defined over (ii) AFTER E2-E4.
+- (d) RIDER-2 FLOOR = **CORROBORATE-WITH-CAVEATS.** /dev/shm is a legit same-sink ratio proxy
+  (neither tool fsyncs); bar moves 0.54→0.604s (favorable) but gzippy at 2.0× doesn't change the
+  verdict; the ~2× same-sink wall is consistent with the ~3.1× isolated inner-loop gap.
+
+### THREE OWED ITEMS before this number can authorize the multi-week engine build (advisor):
+1. Re-quote the ceiling as **(iii)/(ii) ≈ 3.10×** (production-representative), not 3.29×. [DONE here.]
+2. **Sweep ≥3-5 chunks** (text + binary regions) and report the range — one chunk is suggestive,
+   not a ceiling bound.
+3. **Build the E2-E4 prototype in variant (ii)** and re-run — the pre-registered falsifier
+   adjudicates (ii)-AFTER-E2-E4, which were NOT built this round.
+
+### CHECKPOINT — STOP for supervisor gate. NET: the engine isolation bench is BUILT, freq-locked-
+### guest-validated, byte-exact, and advisor-confirmed TRUSTWORTHY. The PRODUCTION-REPRESENTATIVE
+### single-thread clean inner-loop ceiling = **gzippy ~3.1× slower than pure ISA-L** (118-125 MB/s
+### vs 388 MB/s). E1 (output write-width) plateaus at +6% — output traffic is a MINOR lever; the
+### gap lives in the INNER HUFFMAN LOOP (E2 SIMD copy / E3 packed store / E4 wide refill), which
+### remain UNMEASURED. PLATEAU FALSIFIER: NOT-PROVEN-YET (E2-E4 unbenched), NOT refuted. Same-sink
+### tie bar corrected up to ~0.60s. Riders both answered. Per the charter: DO NOT start the
+### multi-week production engine integration/build. The decision the supervisor gates: authorize a
+### SECOND bench round (sweep chunks + prototype E2-E4 in-bench) to settle the plateau falsifier,
+### OR re-confront placement. No production code was changed (bench files uncommitted; lib.rs has a
+### measurement-only re-export). HEAD unchanged at 249f25b5.
