@@ -19,6 +19,7 @@ pub mod consume_first_table;
 pub mod jit_decode;
 pub mod libdeflate_decode;
 pub mod libdeflate_entry;
+pub mod mem_stats;
 pub mod resumable;
 pub mod specialized_decode;
 pub mod staged_bits;
