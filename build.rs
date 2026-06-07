@@ -63,6 +63,8 @@ fn emit_parallel_sm_cfgs() {
     // `unexpected_cfgs` lint (required since Rust 1.80).
     println!("cargo::rustc-check-cfg=cfg(parallel_sm)");
     println!("cargo::rustc-check-cfg=cfg(pure_inflate_decode)");
+    // Phase-2: the real-ISA-L clean tail (gzippy-isal). x86_64 only.
+    println!("cargo::rustc-check-cfg=cfg(isal_clean_tail)");
 
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let is_x86_64 = arch == "x86_64";
@@ -72,6 +74,17 @@ fn emit_parallel_sm_cfgs() {
     // `-` → `_`).
     let has_isal_compression = std::env::var_os("CARGO_FEATURE_ISAL_COMPRESSION").is_some();
     let has_pure_rust_inflate = std::env::var_os("CARGO_FEATURE_PURE_RUST_INFLATE").is_some();
+    let has_gzippy_isal = std::env::var_os("CARGO_FEATURE_GZIPPY_ISAL").is_some();
+
+    // gzippy-isal is an x86_64-only reference baseline: it links the ISA-L C lib
+    // (via isal-compression / isal-sys) which has no arm64 build. Fail loudly at
+    // build time rather than producing a broken arm64 binary.
+    if has_gzippy_isal && !is_x86_64 {
+        panic!(
+            "feature `gzippy-isal` is x86_64-only (it links the ISA-L C library, \
+             which has no aarch64 build). Use `gzippy-native` on this target."
+        );
+    }
 
     // The single-member parallel decode (the rapidgzip-shaped path) exists in
     // EXACTLY ONE config: pure-Rust. `isal-compression` no longer enables it —
@@ -82,11 +95,19 @@ fn emit_parallel_sm_cfgs() {
     let pure_inflate_decode = parallel_sm;
     let _ = has_isal_compression;
 
+    // gzippy-isal: route the chunk's clean tail through REAL ISA-L FFI instead of
+    // the pure-Rust StreamingInflateWrapper. x86_64 only (guarded above). When OFF
+    // (gzippy-native, and arm64 always), the clean tail stays pure-Rust.
+    let isal_clean_tail = is_x86_64 && has_gzippy_isal && parallel_sm;
+
     if parallel_sm {
         println!("cargo::rustc-cfg=parallel_sm");
     }
     if pure_inflate_decode {
         println!("cargo::rustc-cfg=pure_inflate_decode");
+    }
+    if isal_clean_tail {
+        println!("cargo::rustc-cfg=isal_clean_tail");
     }
 }
 

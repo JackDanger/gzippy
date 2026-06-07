@@ -66,6 +66,22 @@ counters = []     # Enable AtomicU64 hot-path counters in bgzf (always on in tes
 oracle = []
 # Pure-Rust resumable inflate with stopping points (Track B); no ISA-L in wrapper body.
 pure-rust-inflate = ["rpmalloc-caches"]
+# ── Phase-2 two-path decode (2026-06-06) ──────────────────────────────────────
+# gzippy-native (intended DEFAULT production once parallel-module lint debt is
+# cleared): ONE unified pure-Rust decode engine, NO C-FFI in the DECODE graph, on
+# every arch. It is a pure alias of `pure-rust-inflate`, so a native build is
+# byte-identical to today's shipped decode. NOTE: the FFI-free mandate is
+# DECODE-ONLY — x86_64 release builds may still ADD `isal-compression` on the
+# command line for the ISA-L *compression* backend (T1 L0–L3); that is layered by
+# the build/CI scripts per-target, NOT pulled here, so arm64 native stays C-free.
+gzippy-native = ["pure-rust-inflate"]
+# gzippy-isal (x86_64-only reference/comparison baseline, NOT default): FAITHFUL
+# rapidgzip — the pure-Rust marker engine runs to a 32 KiB clean window, then HANDS
+# OFF the clean tail to REAL ISA-L via FFI (vendor GzipChunk.hpp:520-525). It pulls
+# `isal-compression` to link the ISA-L C lib + FFI decode entry points, and sets the
+# build.rs `isal_clean_tail` cfg (x86_64 only). build.rs emits a compile_error! if
+# this feature is built on a non-x86_64 target (the ISA-L C lib has no arm64 build).
+gzippy-isal = ["pure-rust-inflate", "isal-compression"]
 arena-allocator = ["dep:allocator-api2", "dep:rpmalloc-sys"]
 # Allocator-visibility tooling: enable rpmalloc's ENABLE_STATISTICS so
 # dump_global_stats() reports mapped_total / unmapped_total / cached /
