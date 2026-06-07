@@ -1364,12 +1364,29 @@ fn consumer_loop<W: std::io::Write>(
                 // is resident (interior-reuse fixable) or evicted (re-scope).
                 // Read-only snapshots; env-gated (OFF == identity).
                 if stall_residency::enabled() {
-                    let mut cached: Vec<(usize, usize)> = Vec::new();
+                    // Snapshot each resident chunk's (start, max_start_tolerance,
+                    // encoded_END). The advisor (step0-advisor-verdict.md) caught
+                    // that [enc, max] is the speculative START-tolerance window
+                    // (decoded bytes BEGIN at max, chunk_data.rs:143-145), so the
+                    // containing-parent test must use the chunk's encoded RANGE
+                    // [enc, enc+encoded_size_bits) that its decoded content spans,
+                    // not [enc, max] (which collapses to enc==max after re-anchor).
+                    let mut cached: Vec<(usize, usize, usize)> = Vec::new();
                     for (_k, arc) in block_fetcher.prefetch_cache_contents_sorted() {
-                        cached.push((arc.encoded_offset_bits, arc.max_acceptable_start_bit));
+                        cached.push((
+                            arc.encoded_offset_bits,
+                            arc.max_acceptable_start_bit,
+                            arc.encoded_offset_bits
+                                .saturating_add(arc.encoded_size_bits),
+                        ));
                     }
                     for (_k, arc) in block_fetcher.cache_contents_sorted() {
-                        cached.push((arc.encoded_offset_bits, arc.max_acceptable_start_bit));
+                        cached.push((
+                            arc.encoded_offset_bits,
+                            arc.max_acceptable_start_bit,
+                            arc.encoded_offset_bits
+                                .saturating_add(arc.encoded_size_bits),
+                        ));
                     }
                     let in_flight_keys = block_fetcher.prefetching_keys();
                     let partition_span = configuration.split_chunk_size.saturating_mul(8);
