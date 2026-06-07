@@ -88,13 +88,16 @@ pub static BOOTSTRAP_HEADER_CALLS: std::sync::atomic::AtomicU64 =
 pub static BOOTSTRAP_BODY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BOOTSTRAP_BODY_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-/// Commit-1 instrumentation for the bootstrap-unification lever: bytes decoded
-/// into the u16 marker ring AFTER `contains_marker_bytes` flips false (the flip
-/// is permanent within a chunk — once 32 KiB clean exists, no back-ref can
-/// reach the unknown predecessor). These are the bytes that could instead be
-/// decoded into a u8 linear buffer with the fast copy path (Design B1). The
-/// ratio POST_FLIP / BODY_BYTES sizes the prize. No behavior change.
-pub static BOOTSTRAP_POST_FLIP_U16_BYTES: std::sync::atomic::AtomicU64 =
+/// Bootstrap instrumentation: output bytes belonging to bootstrap blocks that
+/// ended CLEAN (`!contains_marker_bytes()` — no marker bytes remain after the
+/// block). This is the marker-FREE *complement* of the marker-decode domain:
+/// the new u16 marker fast loop touches the OTHER bytes (blocks that still
+/// contain markers). NOTE: the old name `BOOTSTRAP_POST_FLIP_U16_BYTES` and its
+/// "decoded into the u16 marker ring after the flip" doc were BACKWARDS and had
+/// been read inverted multiple times — it counts clean-flipped bytes, NOT marker
+/// bytes. The ratio CLEAN_FLIPPED / BODY_BYTES sizes the clean-flipped sliver
+/// (small on marker-heavy workloads), NOT the marker-loop prize. No behavior change.
+pub static BOOTSTRAP_CLEAN_FLIPPED_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 /// P2 unified decode: clean literals/backrefs routed to `chunk.data` (u8) after
 /// `contains_marker_bytes` flips false — rapidgzip-shaped single output stream.
@@ -1488,7 +1491,7 @@ where
 
         let flipped_clean = !block.contains_marker_bytes();
         if flipped_clean {
-            BOOTSTRAP_POST_FLIP_U16_BYTES.fetch_add(
+            BOOTSTRAP_CLEAN_FLIPPED_BYTES.fetch_add(
                 (output.sink_len().saturating_sub(before_len)) as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
