@@ -555,3 +555,178 @@ interleaved best-of-9). Both arms byte-exact (sha e114dd2b... == gzip ref) via p
   positive control; (ii) PHASE 3 3-way locked Fulcrum reporting wall + RSS + per-thread working-set +
   L2/L3 MPKI to locate rapidgzip's real advantage (window-apply / ring layout / copy = cache surface,
   NOT inner ALU); (iii) gzippy-isal Design-A tail before PHASE 3 per the charter sequence.
+
+## NEW CHARTER (2026-06-06, supervisor) — TIER-APPROACH: 1.0x TIE bar, DESIGN→PROVE→ALIGN
+plans/tier-approach-mandate.md SUPERSEDES "faithful but accepted-slow". Pure-Rust + inline ASM allowed.
+Method is TIERED (no lever hill-climb). Leader re-driving. leader-lock held by persistent sentinel.
+SUBAGENT SPAWN WORKS this session: `claude -p --model opus --permission-mode bypassPermissions "<prompt>"`.
+
+### TIER-1 DIAGNOSIS DONE (2026-06-06) — 2 read-only research subagents + leader first-hand vendor read
+THE ROOT CAUSE, source-cited (this CORRECTS the prior "memory-bound / cache-mandate" framing):
+- **rapidgzip's measured ~0.46s wall is ~99% ISA-L (igzip C/SIMD).** Vendor GzipChunk.hpp dispatch:
+  known-window chunk -> 100% IsalInflateWrapper (:440-444, d_c); window-absent -> pure deflate::Block
+  ONLY for the <=32KiB markered prefix, then `cleanDataCount>=MAX_WINDOW_SIZE` hands the multi-MiB
+  remainder to ISA-L (:520-526, d_w). The pure marker engine (the thing gzippy ports for the WHOLE
+  chunk) runs <=32KiB/chunk in rapidgzip. The in-place u16->u8 flip exists in deflate::Block
+  (:1282-1289) but is VESTIGIAL in production (ISA-L takes over right after it would fire).
+- **u16-vs-u8 buffer-width hypothesis REFUTED.** rapidgzip uses the IDENTICAL 128KiB u16 ring
+  (deflate.hpp:805 `std::array<uint16_t,2*MAX_WINDOW_SIZE>`, alignas(64), reinterpret-cast to u8 in
+  place). gzippy's output_ring is a faithful port. Not narrower.
+- **BMI2/per-symbol-ALU REFUTED (prior arc) AND now explained:** the gap isn't one extract op; it's
+  that gzippy runs a SCALAR Rust marker loop for ~100% of bytes where rapidgzip runs igzip AVX2 ASM
+  (igzip_decode_block_stateless_04.asm via multibinary dispatch) for ~99%.
+- **VENDOR BENCH TABLE (deflate.hpp:72-93,137-145) is the TIER-2 ceiling evidence.** SINGLE-THREAD
+  silesia (memory-bw-reduced): ISA-L 720 MB/s; rapidgzip's OWN best PURE decoder ShortBitsMultiCached-11
+  337 MB/s; DoubleLiteralCached (what gzippy ported, class-of) 252 MB/s. => ISA-L is 2.1x faster than
+  the best pure decoder single-thread; a pure SCALAR loop tops ~337 MB/s. Multi-thread the gap shrinks
+  to 1.28x (5024 vs 3927) as the workload becomes DRAM-bandwidth-bound. gzippy measures 1.85x at T8 —
+  WORSE than rapidgzip's own 1.28x pure/ISAL, i.e. gzippy's pure engine underperforms even rapidgzip's
+  pure decoder, so there is BOTH pure-Rust headroom AND an irreducible ASM-class gap.
+- **gzippy native per-thread DECODE hot state ~279KiB** (subagent A, cited): output_ring 128KiB +
+  INLINE dist code_cache 128KiB (HuffmanCodingReversedBitsCached<30>, faithful to vendor deflate.hpp:336)
+  + lit/len short LUT 16KiB. Overflows 256KiB L2, fits >=512KiB L2. Cache-hostile: 128KiB dist cache
+  (scattered per-backref), backref source reads up to 64KiB back in ring. Per-chunk ~20MiB u16 buffer +
+  resolve pass are DRAM-bandwidth, not residency.
+- **3 PRIOR-NOTE DISCREPANCIES (subagent A, must reconcile):** (1) FIXED_TABLES/LitLenTable/DistTable
+  (libdeflate path) are NOT live on native — the prior "shared tables already done" checked a DEAD path;
+  live tables are per-thread, per-block-rebuilt, NO shared read-only table on the hot loop. (2) the dist
+  cache is a 128KiB INLINE (unboxed) array => thread_local Block is ~279KiB, TWO 128KiB structures not
+  one. (3) resolve streams the ~20MiB chunk buffer, not the 128KiB ring.
+- **STALE COMMENT found (structure-mandate target):** guest_fulcrum_capture.sh:69-71 claims
+  GZIPPY_BUILD_FEATURES=isal-compression gives "the SAME ISA-L clean decode rapidgzip uses (apples-to-
+  apples engine A/B)". build.rs:90-96 proves FALSE post-fold: isal-compression no longer enables ISA-L
+  DECODE; it would just rebuild the pure decoder. The only real-ISA-L gzippy build is gzippy-isal
+  (Design-A tail, deferred). => no in-one-binary engine-swap A/B currently exists.
+
+### CONSEQUENCE FOR THE DESIGN (TIER-1 conclusion)
+The 1.0x TIE bar => gzippy-native needs a pure-Rust+inline-ASM bulk DEFLATE decoder competitive with
+igzip's AVX2 inner loop for the CLEAN/known-window path (where rapidgzip spends ~99% of decode). This is
+NOT the cache-mandate (buffers are faithful/same-size) and NOT BMI2 (already on, scalar-loop-bound). The
+faithful-rapidgzip structure is NOT one-engine — it hands the clean tail to igzip; the governing
+"one MarkerRing engine, no 2nd engine, no FFI" memory is in TENSION with a TIE (flagged to supervisor).
+TIER-2 must PROVE feasibility (a standalone toy igzip-class Rust+ASM decoder benchmarked in isolation vs
+ISA-L on the guest, + a bandwidth-vs-compute model from the vendor bench constants) BEFORE TIER-3 build.
+Full TIER-1 design + TIER-2 proof plan: plans/tier1-design-and-tier2-proof.md (THIS checkpoint's deliverable).
+
+### INDEPENDENT ADVISOR DISPROOF PASS [DONE 2026-06-06] — verdict: sound-with-corrections
+Spawned an independent Opus advisor (read-only, disproof-driven) to attack the diagnosis by re-reading
+cited source. It first-hand re-verified CLAIM 1 (ISA-L dominance, all 3 handoffs GzipChunk.hpp:440/501/520),
+the 128KiB u16 ring identity, the 128KiB INLINE dist cache (huffman_reversed_bits_cached.rs 1<<15 x 4B,
+NOT boxed) + no-shared-table, the BMI2 rejection, AND that the guest trace binary is the ISA-L build
+(leader also confirmed: CMakeCache LIBRAPIDARCHIVE_WITH_ISAL:BOOL=ON, 42 isal symbols in nm). 5 corrections,
+ALL incorporated into tier1-design-and-tier2-proof.md:
+1. SEPARATE ring-STORAGE width [refuted, both 128KiB u16] from clean-bulk WRITE+RESOLVE traffic width
+   [LIVE lever: gzippy writes u16 per literal marker_inflate.rs:1526 + re-streams ~20MiB u16 resolve on
+   ~100% of bytes; rapidgzip ISA-L writes u8 direct isal.hpp:257 + markers only in <=32KiB prefix => ~0%].
+2. High-T convergence is partly CACHE CONTENTION (vendor deflate.hpp:170-172, "LUT too large when 2 HW
+   threads share a core"), NOT pure DRAM bandwidth => class-T traffic/residency levers must NOT be
+   pre-ranked below class-C SIMD compute. Lever ranking was a soft tier-discipline violation; removed.
+3. PROOF-2 validate-by-reproducing-the-2-walls is overfit-circular => added HOLD-OUT cross-validation
+   (fit T1/T2/T4, predict T8/T16) + DIRECT perf-stat binding-term measurement as the verdict.
+4. Vendor MB/s (337/720) are a Frankensystem CPU (deflate.hpp:96-107, +-20% variance) — illegitimate as
+   guest targets; gate on guest-measured RATIOS (in-bench ISA-L oracle) only.
+5. Added PROOF-0 PRE-GATE: cheapest decisive experiments FIRST — PG-A clean-loop slow-injection (causal
+   perturbation: monotonic T8-wall response => compute binds => build SIMD; flat => SIMD moot, falsified
+   in ~1hr not after a multi-week build) + PG-B u8-write+drop-clean-resolve A/B (isolates class-T traffic).
+   This is the gate the BMI2 arc lacked.
+Advisor bottom line: diagnosis sound to design on; design was partially mis-aimed (under-weighted class-T)
+— now fixed; PROOF-1 sound, PROOF-2 fixed, PRE-GATE is the missing decisive gate, run it first.
+
+## CHECKPOINT REACHED [2026-06-06] — TIER-1 design + TIER-2 proof plan delivered for supervisor/advisor
+NO TIER-3 implementation started (charter: deliver design+proof BEFORE building). Awaiting supervisor +
+independent-advisor ratification of: (1) governing-tension resolution (one no-FFI engine, igzip-class
+clean inner loop via pure-Rust+inline-ASM, inner-loop divergence accepted while architecture stays
+faithful); (2) the diagnosis; (3) the revised TIER-2 plan (PRE-GATE -> PROOF-1 -> PROOF-2). leader-lock
+held by persistent sentinel pid 156. Subagent spawn confirmed working: claude -p --model opus
+--permission-mode bypassPermissions.
+
+---
+## SUPERVISOR NOTE 2026-06-06 23:24 (lock hygiene)
+First leader (TIER-1) completed and exited but left an ORPHANED `sleep 86400`
+leader-lock sentinel (pid 156, ppid=1) + a redundant TIER-1 disproof advisor
+(pid 4391). The orphaned sleep held the leader-lock "alive" for 24h and would
+wedge any new leader's mkdir-mutex acquire. Supervisor killed both and cleared
+/tmp/gzippy-leader.lock.d. TIER-2 leader (current) is the SOLE live leader.
+RECOMMENDATION for any future leader: do NOT hold the leader-lock with a detached
+`sleep` sentinel that outlives you — it orphans on exit. The supervisor already
+enforces single-leader via pgrep before each spawn; the sleep-sentinel lock is
+net-negative. Prefer no sentinel (supervisor-enforced singleton) or a lock whose
+holder is the leader's own pid (auto-released on death).
+
+---
+## TIER-2 PRE-GATE — INSTRUMENT FIXED + SWEEP DONE [2026-06-07, TIER-2 leader]
+
+### TASK 1 (instrument-validity) — DONE. Injection moved to the NATIVE clean arm.
+The prior subagent had the slow-injection in resumable.rs (Engine C / gzippy-ISAL
+path) with a comment claiming "FlipToClean tail runs 100% through resumable" —
+WRONG for native. On gzippy-native (the 1.0x bar) the fold keeps Engine M
+(marker_inflate::Block) decoding the clean tail in-place (gzip_chunk.rs:1219,
+not(isal_clean_tail)); ~99% clean bytes decode through marker_inflate's
+CONTAINS_MARKERS=false arm. Injection is now wired into BOTH native clean sites:
+read_internal_compressed_specialized::<false> (the lut_litlen multi-symbol loop,
+the live native dynamic-Huffman path) AND read_internal_compressed_canonical_
+specialized::<false>. resumable injection KEPT (correct site for the isal control).
+PROVEN on perf-target build (Rosetta x86_64 gzippy-native, path=ParallelSM,
+silesia): GZIPPY_SLOW_HITS counter = 40,131,993 clean decode events for the ~203MB
+decode (∝ clean bytes, NOT ~0). Site is the live native clean loop. Commit d0aa1db.
+
+### TASK 2 (self-test) — PASS.
+- OFF byte-exact 028bd002...cb410f on BOTH gzippy-native AND gzippy-isal (x86_64),
+  T1 + T8, path=ParallelSM. OFF == identity by construction (hoistable spin==0).
+- POSITIVE CONTROL (locked harness, silesia-large 503MB, N=9): T1 F=0 3.7340s ->
+  T1 F=100 spin 6.3833s = +71% (sd 0.1%, massively out of spread). Knob really
+  slows the loop. The pause-hint "sleep" was too cheap to be a valid freq-neutral
+  control (~7% at 5x), so the sleep kind was reimplemented as a REAL batched
+  thread::sleep (yields the core, calibrated to the spin per-iter cost).
+
+### TASK 4 — PRE-GATE SWEEP (locked guest harness, silesia-large 503MB, T8, N=9 interleaved, sha-verified e114dd2b..., diverged=0 every run, RUN_TRUSTWORTHY=true)
+| F   | SPIN T8 wall | Δ vs F0 | SLEEP T8 wall | Δ vs F0 |
+|-----|-------------|---------|---------------|---------|
+| 0   | 1.1209s     | —       | 1.1209s       | —       |
+| 25  | 1.1597s     | +3.5%   | 1.1397s       | +1.7%   |
+| 50  | 1.2281s     | +9.6%   | 1.1990s       | +7.0%   |
+| 100 | 1.4368s     | +28.2%  | 1.2411s       | +10.7%  |
+(within-arm sd 0.8–4.4%; every Δ at F=50/100 is out of spread under BOTH kinds.)
+T1 positive control: F0 3.7340s -> F100 spin 6.3833s (+71%, sd 0.1%).
+
+### VERDICT: COMPUTE-BOUND (clean-loop compute IS on the T8 critical path).
+- MONOTONIC & PROPORTIONAL T8 response under SPIN (3.5/9.6/28.2%), out of spread.
+- The rise SURVIVES the frequency-neutral SLEEP control (1.7/7.0/10.7%, monotonic,
+  out of spread) — so the criticality is REAL, not a turbo artifact. Per the
+  pre-registered falsifier (plans/pre-gate-falsifier.md), monotonic-survives-sleep
+  ⇒ COMPUTE-BOUND ⇒ proceed to PROOF-1 (the SIMD-compute proof).
+- Spin slope (28%) > sleep slope (11%) at F=100: the gap IS the turbo-depression
+  the busy-spin causes (the exact confound the control isolates); the sleep slope
+  is the turbo-clean lower bound and it is still clearly positive.
+- DIAGNOSTIC: T1 F100 +71% vs T8 F100 +28% (spin) — at T8 the clean-loop compute
+  is partially overlapped by parallelism (wall is less compute-elastic than T1)
+  but STILL on the critical path. NOT flat ⇒ class-C (SIMD compute) is NOT moot.
+- 1b (u8-write / traffic A/B) NOT run in this window — flagged as the immediate
+  next experiment to rank class-T traffic as co-lever (matrix row: 1a MONOTONIC,
+  1b TBD ⇒ at minimum COMPUTE-BOUND→PROOF-1; class-T co-lever pending 1b).
+
+NEXT: supervisor + independent disproof advisor gate this verdict BEFORE PROOF-1/
+PROOF-2 or any SIMD build (per charter SEQUENCE). No TIER-3 started.
+
+### TASK 5 — INDEPENDENT DISPROOF ADVISOR [DONE] verdict: CORROBORATE-WITH-CAVEATS
+Full verdict: plans/pre-gate-advisor-verdict.md (independent Opus, read-only, read
+the cited source). It could NOT construct a path to FLAT/bandwidth-bound — the
+narrow claim survives. Corrections folded in (the VERDICT block above is AMENDED):
+- RELABEL: drop "COMPUTE-BOUND" (overreach). Correct claim = "clean-loop compute
+  is ON the T8 critical path; class-C (SIMD compute) is NOT moot." The wall is
+  MIXED; clean compute is only ~11–29% of the T8 wall (sleep floor 11% vs spin/T1
+  ~29% — methods in genuine tension; the T1 positive control +71% extrapolates to
+  ~29%, matching SPIN, so the usual "trust the sleep floor" likely UNDER-reports).
+- RULE 3 (mandatory): slowing the loop adds wall ≠ speeding it pays. The pre-gate
+  licenses ONLY "not-moot." PROOF-1 = the REMOVAL ORACLE (bound the speed-up
+  ceiling) is MANDATORY before ANY SIMD build. Do NOT start the SIMD stretch on
+  this pre-gate alone.
+- BIGGER LEVER (advisor): even infinite clean speed-up -> 0.79–1.00s vs rapidgzip
+  0.53s — still ~1.5–2x slower. T8 runs ~42% parallel-efficiency (1.121s vs 0.47s
+  ideal); ~58% lost to placement / head-of-line stalls (confirmed-offset-prefetch-
+  gap, ~40% of T8). THAT outranks class-C for closing the rapidgzip gap. Weigh the
+  placement lever before committing to the SIMD project.
+- INSTRUMENT: site re-asserted on the EXACT 503MB guest T8 build — GZIPPY_SLOW_HITS
+  = 94,887,526 clean decode events via path=ParallelSM (∝ clean bytes). Treat
+  F->%wall as approximate (T1-calibrated); good for monotonicity, not magnitude.
+- 1b (u8-write/traffic A/B) still not run — the next experiment to rank class-T.
