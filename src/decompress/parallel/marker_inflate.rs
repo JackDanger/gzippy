@@ -231,6 +231,17 @@ impl From<BlockError> for io::Error {
 /// concerns within a single read() call.
 pub const RING_SIZE: usize = 2 * MAX_WINDOW_SIZE;
 
+/// u8 view of the SAME `output_ring` backing store, post-flip. Vendor's
+/// `getWindow()` (deflate.hpp:890-894) `reinterpret_cast`s the 65536-element
+/// `m_window16` (128 KB) to a `uint8_t*` of `2 * MAX_WINDOW_SIZE * sizeof(u16)`
+/// = 131072 u8 slots over the identical bytes (DecodedBuffer, deflate.hpp:806).
+/// Post-flip (`m_containsMarkerBytes == false`) the clean tail decodes
+/// u8-DIRECT into this view, indexed `% U8_RING_SIZE` — half the memory
+/// traffic of the u16 ring, and the drain is a plain copy (no u16->u8 narrow).
+/// The flip's `setInitialWindow` repack (deflate.hpp:1772-1782) value-downcasts
+/// the surviving 32 KiB window into the upper half of this view.
+pub const U8_RING_SIZE: usize = 2 * RING_SIZE;
+
 /// Initialize the ring's marker zone — the upper half (slots
 /// `MAX_WINDOW_SIZE..RING_SIZE`) holds pre-computed marker values
 /// `MAX_WINDOW_SIZE..RING_SIZE`. Mirror of vendor's
@@ -681,22 +692,25 @@ impl Block {
         if initial_window.is_empty() {
             return Ok(());
         }
-        // Seed the RING with the initial window. Subsequent back-refs
-        // resolve via the ring (emit_backref_ring), so the window must
-        // land there — not in the caller's output Vec. Mirror of
-        // vendor's `std::memcpy(window.data(), initialWindow.data(), ...)`
-        // at deflate.hpp:1753 (window = m_window16 in the marker case,
-        // m_window in the clean case; we have a single ring buffer
-        // serving both since our markers are explicit values rather
-        // than ring-initialization bits).
+        // Seed the u8 VIEW of the ring with the initial window. This primes
+        // CLEAN mode (`contains_marker_bytes = false` below), which decodes
+        // u8-direct against the u8 view with u8-LOGICAL positions — so the seed
+        // must be raw u8 at u8 slots [0, len), exactly vendor's prime path
+        // `memcpy(window.data(), initialWindow.data(), size)` where
+        // `window = getWindow()` (u8 view), deflate.hpp:1748,1753. Subsequent
+        // back-refs resolve via the ring (emit_backref_ring_u8), so the window
+        // must land there — not in the caller's output Vec.
         //
-        // After this, ring_pos = initial_window.len() (so subsequent
-        // writes append AFTER the seed) and ring_drained = ring_pos (the
-        // seed itself is NOT drained to output — back-refs into it
-        // resolve to clean bytes which the consumer emits as part of the
-        // chunk's first block's decode).
+        // After this, ring_pos = initial_window.len() (u8-logical; subsequent
+        // writes append AFTER the seed) and ring_drained = ring_pos (the seed
+        // itself is NOT drained — back-refs into it resolve to clean bytes the
+        // consumer emits as part of the first block's decode).
+        // SAFETY: u8 view valid for [0, U8_RING_SIZE); len <= MAX_WINDOW_SIZE.
+        let ring8 = output_ring.as_mut_ptr() as *mut u8;
         for (i, &b) in initial_window.iter().enumerate() {
-            output_ring[i] = b as u16;
+            unsafe {
+                ring8.add(i).write(b);
+            }
         }
         *ring_pos = initial_window.len();
         *ring_drained = initial_window.len();
@@ -733,28 +747,99 @@ impl Block {
         if new_bytes == 0 {
             return;
         }
-        let start_idx = self.ring_drained % RING_SIZE;
-        let end_idx_excl = (self.ring_drained + new_bytes) % RING_SIZE;
         if !self.contains_marker_bytes {
-            // Vendor `result.data` u8 path after `setInitialWindow`
-            // (deflate.hpp:1285-1292).
+            // POST-FLIP clean tail: `output_ring` is the u8 view, positions
+            // are u8-LOGICAL (`% U8_RING_SIZE`). Plain u8 copy — no u16->u8
+            // narrow. Vendor `result.data` u8 path (deflate.hpp:1285-1292).
+            // SAFETY: `ring8` valid for [0, U8_RING_SIZE); each index masks.
+            let ring8 = self.output_ring.as_ptr() as *const u8;
             let mut u8buf = Vec::with_capacity(new_bytes);
             for i in 0..new_bytes {
-                let v = self.output_ring[(self.ring_drained + i) % RING_SIZE];
-                debug_assert!(
-                    (v as usize) < 256,
-                    "clean drain emitted marker value {v:#x}"
-                );
-                u8buf.push(v as u8);
+                let b = unsafe { *ring8.add((self.ring_drained + i) % U8_RING_SIZE) };
+                u8buf.push(b);
             }
             output.push_clean_u8(&u8buf);
-        } else if start_idx + new_bytes <= RING_SIZE {
-            output.push_slice(&self.output_ring[start_idx..start_idx + new_bytes]);
         } else {
-            output.push_slice(&self.output_ring[start_idx..]);
-            output.push_slice(&self.output_ring[..end_idx_excl]);
+            let start_idx = self.ring_drained % RING_SIZE;
+            let end_idx_excl = (self.ring_drained + new_bytes) % RING_SIZE;
+            if start_idx + new_bytes <= RING_SIZE {
+                output.push_slice(&self.output_ring[start_idx..start_idx + new_bytes]);
+            } else {
+                output.push_slice(&self.output_ring[start_idx..]);
+                output.push_slice(&self.output_ring[..end_idx_excl]);
+            }
         }
         self.ring_drained = self.ring_pos;
+    }
+
+    /// One-shot transition drain at the seam: the `read()` call that triggered
+    /// the flip ran in MARKER (u16) mode, so its freshly-decoded bytes in
+    /// `[ring_drained, ring_pos)` are still u16 in the u16 ring. The flip guard
+    /// guarantees they are all clean (the last ≥ `MAX_WINDOW_SIZE` bytes are
+    /// markerless), so narrow them u16->u8 ONCE here, in the still-u16
+    /// addressing, BEFORE `flip_repack_to_u8` repositions everything. This is
+    /// the only place `<false>` output is ever read through the u16 view.
+    fn drain_transition_narrow_u16(&mut self, output: &mut impl MarkerSink) {
+        let new_bytes = self.ring_pos - self.ring_drained;
+        if new_bytes == 0 {
+            return;
+        }
+        let mut u8buf = Vec::with_capacity(new_bytes);
+        for i in 0..new_bytes {
+            let v = self.output_ring[(self.ring_drained + i) % RING_SIZE];
+            debug_assert!(
+                (v as usize) < 256,
+                "transition drain emitted marker value {v:#x}"
+            );
+            u8buf.push(v as u8);
+        }
+        output.push_clean_u8(&u8buf);
+        self.ring_drained = self.ring_pos;
+    }
+
+    /// Repack the surviving 32 KiB window into the u8 VIEW of `output_ring` and
+    /// re-base the cursor to u8-logical, faithful to vendor `setInitialWindow`'s
+    /// conflation (deflate.hpp:1762-1782). Called exactly once, at the seam,
+    /// after `drain_transition_narrow_u16`. Precondition: `contains_marker_bytes`
+    /// is still true and the last `MAX_WINDOW_SIZE` decoded bytes (logically
+    /// `[ring_pos - MAX_WINDOW_SIZE, ring_pos)`) are clean (< 256) — guaranteed
+    /// by the flip guard in `read()`.
+    fn flip_repack_to_u8(&mut self) {
+        let p = self.ring_pos; // u16-logical write position
+        debug_assert!(self.decoded_bytes >= MAX_WINDOW_SIZE);
+        // 1. Value-DOWNCAST the rotated window into a scratch buffer. Scratch is
+        //    mandatory: the u8 dest region [98304, 131072) physically overlaps
+        //    the u16 source slots [49152, 65536), so an in-place repack would
+        //    corrupt mid-loop (vendor uses `conflatedBuffer`, deflate.hpp:1772).
+        //    `(v & 0xFF) as u8` is an explicit value-downcast — NOT a LE
+        //    bit-reinterpret (which would interleave zero high-bytes).
+        let mut tmp = [0u8; MAX_WINDOW_SIZE];
+        for k in 0..MAX_WINDOW_SIZE {
+            let v = self.output_ring[(p + RING_SIZE - MAX_WINDOW_SIZE + k) % RING_SIZE];
+            debug_assert!(
+                (v as usize) < 256,
+                "marker {v:#x} in window being repacked to u8"
+            );
+            tmp[k] = (v & 0xFF) as u8;
+        }
+        // 2. Write the window into the u8 view's upper half: u16 logical
+        //    `p - MAX_WINDOW_SIZE + k` -> u8 slot `U8_RING_SIZE - MAX_WINDOW_SIZE + k`
+        //    (= 98304 + k), so newest byte lands at slot 131071. A post-flip
+        //    distance-`d` back-ref reads u8 slot `U8_RING_SIZE - d`, sourcing the
+        //    byte logically `d` before the seam. Vendor dest offset
+        //    `window.size() - conflatedBuffer.size()` (deflate.hpp:1778).
+        let ring8 = self.output_ring.as_mut_ptr() as *mut u8;
+        for k in 0..MAX_WINDOW_SIZE {
+            unsafe {
+                ring8.add(U8_RING_SIZE - MAX_WINDOW_SIZE + k).write(tmp[k]);
+            }
+        }
+        // 3. Re-base cursor to u8-logical. BASE = U8_RING_SIZE (≡ phys 0,
+        //    vendor `m_windowPosition = 0`, deflate.hpp:1782); using the full
+        //    `U8_RING_SIZE` (not 0) keeps `pos - distance` from underflowing.
+        self.ring_pos = U8_RING_SIZE;
+        self.ring_drained = U8_RING_SIZE;
+        self.contains_marker_bytes = false;
     }
 
     /// BENCH-ONLY clean-mode drain that mirrors `drain_to_output`'s
@@ -1028,18 +1113,25 @@ impl Block {
         //      bytes so far, and 32 KiB of those are consecutive.
         //      The latter is the typical bootstrap-from-empty case
         //      (chunk has no marker emissions at all).
-        if self.contains_marker_bytes
+        let just_flipped = self.contains_marker_bytes
             && (self.distance_to_last_marker_byte >= RING_SIZE
                 || (self.distance_to_last_marker_byte >= MAX_WINDOW_SIZE
-                    && self.distance_to_last_marker_byte == self.decoded_bytes))
-        {
-            self.contains_marker_bytes = false;
+                    && self.distance_to_last_marker_byte == self.decoded_bytes));
+
+        if just_flipped {
+            // SEAM. This read's bytes are still u16 — drain them with the u16
+            // narrow ONCE (positions still u16-logical), THEN repack the 32 KiB
+            // window into the u8 view and re-base the cursor to u8-logical. From
+            // the next `read()` on, `<false>` decodes u8-DIRECT and the drain is
+            // a plain u8 copy. Mirror of vendor's flip at deflate.hpp:1282-1292.
+            self.drain_transition_narrow_u16(output);
+            self.flip_repack_to_u8();
+        } else {
+            // Always drain — even on Err, any bytes already written should be
+            // visible to the caller. `ring_drained` advances so subsequent calls
+            // don't re-emit. The clean branch here is the post-flip u8 path.
+            self.drain_to_output(output);
         }
-        // Always drain — even on Err, any bytes already written should
-        // be visible to the caller for inspection. The ring's
-        // `ring_drained` watermark advances accordingly so subsequent
-        // calls don't re-emit the same data.
-        self.drain_to_output(output);
         result
     }
 
@@ -1064,7 +1156,12 @@ impl Block {
         // most one drain at the end, no mid-call overflow check is
         // needed even at n_max_to_decode = usize::MAX.
         let to_read = self.uncompressed_size.min(n_max_to_decode);
+        // Marker mode writes u16 (`% RING_SIZE`); post-flip clean mode writes
+        // u8-DIRECT into the u8 view (`% U8_RING_SIZE`, u8-logical `pos`) — a
+        // stored block can occur after the flip.
+        let clean = !self.contains_marker_bytes;
         let ring_ptr = self.output_ring.as_mut_ptr();
+        let ring8 = self.output_ring.as_mut_ptr() as *mut u8;
         let mut pos = self.ring_pos;
         let mut read_count: usize = 0;
         // Pre-bind to keep error-path state-flush symmetric with the
@@ -1082,9 +1179,14 @@ impl Block {
             }
             let byte = (bits.peek() & 0xFF) as u16;
             bits.consume(8);
-            // SAFETY: pos % RING_SIZE in 0..RING_SIZE, ring_ptr valid.
+            // SAFETY: ring_ptr valid for [0, RING_SIZE); ring8 valid for
+            // [0, U8_RING_SIZE); index masks within each view's bound.
             unsafe {
-                ring_ptr.add(pos % RING_SIZE).write(byte);
+                if clean {
+                    ring8.add(pos % U8_RING_SIZE).write((byte & 0xFF) as u8);
+                } else {
+                    ring_ptr.add(pos % RING_SIZE).write(byte);
+                }
             }
             pos += 1;
             read_count += 1;
@@ -1286,18 +1388,35 @@ impl Block {
         // ends up both wrong-bytes and short of the gzip-trailer
         // ISIZE. Bootstrap's caller already loops on eob(), so the
         // returned `< n_max_to_decode` triggers another read() call.
-        let n_max_to_decode = n_max_to_decode.min(RING_SIZE - MAX_RUN_LENGTH);
+        // Ring modulus depends on storage width: marker mode (`<true>`)
+        // addresses the u16 ring (`RING_SIZE` slots); clean mode (`<false>`)
+        // addresses the SAME backing as a u8 ring (`U8_RING_SIZE` = 2× slots,
+        // vendor's `getWindow()` reinterpret — half the memory traffic). Both
+        // modulus and `pos` units flip at the seam (handled in `read()`'s flip
+        // hook before the first `<false>` call). Const-folded per instantiation.
+        let ring_modulus: usize = if CONTAINS_MARKERS {
+            RING_SIZE
+        } else {
+            U8_RING_SIZE
+        };
+        let n_max_to_decode = n_max_to_decode.min(ring_modulus - MAX_RUN_LENGTH);
 
         // All hot-path writes land in the ring buffer (vendor's
         // `m_window16` equivalent). `pos` is the LOGICAL write
-        // position (never wraps); physical slot is `pos % RING_SIZE`.
+        // position (never wraps); physical slot is `pos % ring_modulus`.
         //
-        // SAFETY: `ring_ptr` is derived from `&mut self.output_ring`
-        // (a fixed `[u16; RING_SIZE]` heap allocation); valid for all
-        // physical indices in [0, RING_SIZE). Every write below
-        // indexes via `pos % RING_SIZE`. There is no aliasing of this
-        // pointer elsewhere in this function.
+        // SAFETY: both pointers are derived from `&mut self.output_ring`
+        // (a fixed `[u16; RING_SIZE]` = 128 KB = 131072-byte heap
+        // allocation). `ring_ptr` (u16) is valid for [0, RING_SIZE);
+        // `ring8` (u8, alignment 1 over the same bytes — vendor's
+        // `reinterpret_cast`, deflate.hpp:893) is valid for
+        // [0, U8_RING_SIZE). Marker mode (`CONTAINS_MARKERS`) writes only
+        // through `ring_ptr % RING_SIZE`; clean mode writes only through
+        // `ring8 % U8_RING_SIZE`. The two views are never live for the
+        // same byte simultaneously (the seam flip is one-shot), and there
+        // is no aliasing of either pointer elsewhere in this function.
         let ring_ptr = self.output_ring.as_mut_ptr();
+        let ring8 = self.output_ring.as_mut_ptr() as *mut u8;
         let mut pos = self.ring_pos;
         let mut emitted: usize = 0;
         // Local copy of the marker counter — pulled into a register
@@ -1374,9 +1493,16 @@ impl Block {
             loop {
                 let code = (sym & 0xFFFF) as u16;
                 if code <= 255 || sym_count > 1 {
-                    // SAFETY: see ring_ptr SAFETY note above.
+                    // SAFETY: see ring_ptr / ring8 SAFETY note above. Marker
+                    // mode stores u16 (`code & 0xFF` < 256) into the u16 ring;
+                    // clean mode stores the byte u8-DIRECT into the u8 view
+                    // (vendor `appendToWindow`, deflate.hpp:1319, one u8 store).
                     unsafe {
-                        ring_ptr.add(pos % RING_SIZE).write(code & 0xFF);
+                        if CONTAINS_MARKERS {
+                            ring_ptr.add(pos % RING_SIZE).write(code & 0xFF);
+                        } else {
+                            ring8.add(pos % U8_RING_SIZE).write((code & 0xFF) as u8);
+                        }
                     }
                     pos += 1;
                     emitted += 1;
@@ -1457,13 +1583,19 @@ impl Block {
                     commit!(Err(BlockError::ExceededWindowRange));
                 }
                 unsafe {
-                    emit_backref_ring::<CONTAINS_MARKERS>(
-                        ring_ptr,
-                        &mut pos,
-                        distance,
-                        length,
-                        &mut distance_marker,
-                    );
+                    if CONTAINS_MARKERS {
+                        emit_backref_ring::<CONTAINS_MARKERS>(
+                            ring_ptr,
+                            &mut pos,
+                            distance,
+                            length,
+                            &mut distance_marker,
+                        );
+                    } else {
+                        // Clean tail: u8-direct copy (half the traffic, no
+                        // marker scan). Vendor readInternal<false> back-ref.
+                        emit_backref_ring_u8(ring8, &mut pos, distance, length);
+                    }
                 }
                 self.record_backreference_for_sparsity(distance, length, emitted);
                 emitted += length;
@@ -1502,7 +1634,7 @@ impl Block {
             not(feature = "pure-rust-inflate"),
             target_arch = "x86_64"
         ),
-        pure_inflate_decode
+        all(pure_inflate_decode, target_arch = "x86_64")
     ))]
     pub fn read_clean_e234<const E2: bool, const E3: bool, const E4: bool>(
         &mut self,
@@ -2530,6 +2662,102 @@ pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
     }
 }
 
+/// PRODUCTION post-flip clean-mode back-ref copy — **u8-direct** into the u8
+/// view of `output_ring` (vendor `getWindow()` reinterpret, deflate.hpp:893).
+/// Faithful port of `readInternal<false>`'s back-ref (deflate.hpp:1367-1399)
+/// with `sizeof(window.front()) == 1` (deflate.hpp:1376): the memcpy is
+/// `length` BYTES, not `length * 2`. No marker-counter maintenance and no
+/// backward marker scan — `containsMarkerBytes == false` const-folds them out
+/// in vendor (deflate.hpp:1367) and they are simply absent here.
+///
+/// Mirrors `emit_backref_ring::<false>`'s three arms at u8 width:
+///   * non-overlap (`distance >= length`): 8-BYTE unaligned word copy, run
+///     rounded up to a multiple of 8 bytes. The `distance >= 8` (BYTES) guard
+///     keeps the 8-byte stride non-aliasing (same invariant as the u16 path's
+///     `distance >= 4` u16 = 8 bytes). The ≤7-byte overshoot lies ahead of the
+///     advanced `*pos`, is never sourced by a later back-ref, and gets
+///     overwritten — invisible. Bounds-checked against `U8_RING_SIZE`.
+///   * RLE (`distance == 1`): `slice::fill` = vendor `memset` (deflate.hpp:1395).
+///   * general overlap (`1 < distance < length`): sequential per-byte copy.
+///
+/// SAFETY: `ring8` must be valid for all physical indices `[0, U8_RING_SIZE)`
+/// (it is `output_ring.as_mut_ptr() as *mut u8` — the 128 KB allocation is
+/// 131072 valid bytes, u8 alignment 1). `*pos` is the logical u8 write position.
+#[cfg(any(
+    all(
+        feature = "isal-compression",
+        not(feature = "pure-rust-inflate"),
+        target_arch = "x86_64"
+    ),
+    pure_inflate_decode
+))]
+#[inline]
+pub(crate) unsafe fn emit_backref_ring_u8(
+    ring8: *mut u8,
+    pos: &mut usize,
+    distance: usize,
+    length: usize,
+) {
+    let src_phys = (*pos + U8_RING_SIZE - distance) % U8_RING_SIZE;
+    let dst_phys = *pos % U8_RING_SIZE;
+
+    if distance >= length {
+        // Non-overlap. Vendor: `memcpy(&window[wp], &window[off], length)`
+        // (deflate.hpp:1376, sizeof==1). Word = 8 u8; round run up to 8.
+        let rounded = (length + 7) & !7;
+        let src_round_fits = src_phys + rounded <= U8_RING_SIZE;
+        let dst_round_fits = dst_phys + rounded <= U8_RING_SIZE;
+        if distance >= 8 && src_round_fits && dst_round_fits {
+            let s = ring8.add(src_phys);
+            let d = ring8.add(dst_phys);
+            (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
+            if length > 8 {
+                let mut s = s.add(8);
+                let mut d = d.add(8);
+                let dend = ring8.add(dst_phys + rounded);
+                while d < dend {
+                    (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
+                    s = s.add(8);
+                    d = d.add(8);
+                }
+            }
+        } else if src_phys + length <= U8_RING_SIZE && dst_phys + length <= U8_RING_SIZE {
+            // Non-wrap, distance < 8 (would alias the word stride): exact copy.
+            let src = ring8.add(src_phys);
+            let dst = ring8.add(dst_phys);
+            for i in 0..length {
+                dst.add(i).write(*src.add(i));
+            }
+        } else {
+            // Wrap-straddle non-overlap fallback.
+            for i in 0..length {
+                let v = *ring8.add((src_phys + i) % U8_RING_SIZE);
+                ring8.add((dst_phys + i) % U8_RING_SIZE).write(v);
+            }
+        }
+        *pos += length;
+    } else if distance == 1 {
+        // RLE memset (deflate.hpp:1393-1398).
+        let v = *ring8.add((*pos + U8_RING_SIZE - 1) % U8_RING_SIZE);
+        if dst_phys + length <= U8_RING_SIZE {
+            let dst = std::slice::from_raw_parts_mut(ring8.add(dst_phys), length);
+            dst.fill(v);
+        } else {
+            for i in 0..length {
+                ring8.add((dst_phys + i) % U8_RING_SIZE).write(v);
+            }
+        }
+        *pos += length;
+    } else {
+        // General overlap (1 < distance < length): sequential, wrap-safe.
+        for i in 0..length {
+            let v = *ring8.add((src_phys + i) % U8_RING_SIZE);
+            ring8.add((dst_phys + i) % U8_RING_SIZE).write(v);
+        }
+        *pos += length;
+    }
+}
+
 /// BENCH-ONLY clean-mode back-ref copy with the E2 AVX2 32-byte wide path.
 /// No marker-counter maintenance (clean path only). `use_avx2` is resolved by
 /// the caller via `is_x86_feature_detected!("avx2")`; when false (e.g. Rosetta
@@ -2544,7 +2772,7 @@ pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
         not(feature = "pure-rust-inflate"),
         target_arch = "x86_64"
     ),
-    pure_inflate_decode
+    all(pure_inflate_decode, target_arch = "x86_64")
 ))]
 #[inline]
 unsafe fn emit_backref_ring_clean(
@@ -2652,7 +2880,7 @@ unsafe fn emit_backref_ring_clean(
         not(feature = "pure-rust-inflate"),
         target_arch = "x86_64"
     ),
-    pure_inflate_decode
+    all(pure_inflate_decode, target_arch = "x86_64")
 ))]
 #[target_feature(enable = "avx2")]
 unsafe fn emit_avx2_copy_u16(mut src: *const u8, mut dst: *mut u8, n_u16: usize) {

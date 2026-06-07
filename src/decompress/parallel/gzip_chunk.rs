@@ -1638,6 +1638,71 @@ mod tests {
         );
     }
 
+    /// MANDATORY faithful-u8 seam trap (charter 2026-06-07). After the in-place
+    /// u16->u8 width flip at 32768, a distance-32768 back-ref must read the
+    /// OLDEST byte of the repacked u8 window (the value-downcasted survivor at
+    /// u8 slot `U8_RING_SIZE - 32768`). A wrong dest offset, a missing rotation,
+    /// or a LE bit-reinterpret instead of `(x & 0xFF)` downcast all corrupt this
+    /// byte. Decoded against an INDEPENDENT flate2 oracle over the whole stream
+    /// (not against the test's own construction), per the no-self-trust rule.
+    #[test]
+    fn faithful_u8_flip_seam_max_distance_backref_vs_flate2() {
+        use std::io::Read;
+        // First 32 KiB: distinct pseudo-random bytes, with a DISTINCTIVE sentinel
+        // at index 0 so the oldest-window byte is unambiguous after the flip.
+        let mut a = vec![0u8; 32 * 1024];
+        let mut s = 0xDEAD_BEEF_CAFE_F00Du64;
+        for b in &mut a {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (s >> 33) as u8;
+        }
+        a[0] = 0xA5; // sentinel: must reappear via the distance-32768 back-ref
+        a[1] = 0x5A;
+        // payload = A ‖ A ‖ A: the 2nd A forces the flip at 32768 and immediately
+        // emits distance-32768 back-refs (reading the repacked window's oldest
+        // bytes); the 3rd A keeps the post-flip u8 ring decoding (distances 1..)
+        // so the seam is crossed AND continued.
+        let mut payload = Vec::with_capacity(3 * a.len());
+        payload.extend_from_slice(&a);
+        payload.extend_from_slice(&a);
+        payload.extend_from_slice(&a);
+        // A short RLE run + a 100-distance ref right after the seam to exercise
+        // the u8 RLE/overlap arms across the flip.
+        payload.extend(std::iter::repeat_n(0x33u8, 300));
+        payload.extend_from_slice(&a[..100]);
+
+        let deflate = make_deflate(&payload);
+
+        // INDEPENDENT oracle: flate2 inflate of the same raw-deflate stream.
+        let mut oracle = Vec::new();
+        flate2::read::DeflateDecoder::new(&deflate[..])
+            .read_to_end(&mut oracle)
+            .expect("flate2 oracle decode");
+        assert_eq!(oracle, payload, "oracle sanity: flate2 == payload");
+
+        let cfg = ChunkConfiguration {
+            split_chunk_size: 1024 * 1024,
+            max_decoded_chunk_size: 20 * 1024 * 1024,
+            crc32_enabled: true,
+            ..Default::default()
+        };
+        let stop_hint_bits = deflate.len() * 8;
+        // Production window-absent speculative entry — the path that flips u16->u8.
+        let chunk =
+            decode_chunk_window_absent(&deflate, 0, stop_hint_bits, cfg).expect("u8 seam decode");
+        let out = flatten(&chunk);
+        assert_eq!(out.len(), oracle.len(), "u8 seam decode length");
+        assert_eq!(
+            out, oracle,
+            "u8 seam decode bytes vs flate2 (flip + distance-32768 + RLE/overlap)"
+        );
+        // The sentinel survived the value-downcast repack and the max-distance
+        // back-ref read it from the correct u8 slot.
+        assert_eq!(out[32 * 1024], 0xA5, "sentinel via distance-32768 backref");
+    }
+
     #[test]
     fn decode_chunk_stops_before_eof_when_stop_hint_bits_set() {
         let payload: Vec<u8> = (0u32..500_000)
