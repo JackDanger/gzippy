@@ -65,7 +65,28 @@ bypassPermissions` subagents. Rules that have cost whole turns:
   re-targets," the "window-discard" — has burned turns). Serialize builds via cargo-lock.sh.
 - Keep THIS charter + plans/orchestrator-status.md current so a fresh owner-spawn can resume.
 
-## CURRENT STATE (2026-06-07, owner turn, branch reimplement-isa-l, HEAD 04fda86d) — **PORT (i) LANDED: rg's multi-cached u16 marker FAST LOOP. Byte-exact. T8 wall = TIE (no move), KEPT per 7a. Advisor C1 UPHELD, C3 REFUTED my mechanism.** The marker decode SUM gap (decodeBlock ~1.9× rg) is SLACK-MASKED at the wall (Fill 87%, wall unchanged). Whole-system T8 wall STILL ~0.73× rg. NEXT = the binder is NOT the marker compute — re-perceive: the engine SUM is ~1.9× but slack-masked (matches Phase-0 oracle TIE-vs-TIE). **SUPERVISOR GATE — marker loop measured + committed (TIE, kept); next binder NOT yet located.**
+## CURRENT STATE (2026-06-07, owner turn, branch reimplement-isa-l, HEAD f1aceee1) — **COUNTER RENAMED (anti-inversion) + SCHEDULING/SERIAL CEILING BOUNDED via real oracles. ADVISOR REFUTED my arithmetic F2 over-reach.** The T8 TIE IS reachable (seedfull oracle = 1.029× T8, 1.121× T16 WIN, sha-exact) BUT scheduling-overlap AND the window-absent marker-engine rate are LIVE + ARCHITECTURALLY COUPLED terms — neither is cleanly isolable (window-present ⇒ clean engine, gzip_chunk.rs:790). **The prompt's "engine slack-masked, binder is scheduling" premise is NOT confirmed AND my counter-arithmetic "engine binds (F2)" is REFUTED** (Rule-3 extrapolation; the sum was a strict upper bound). Status = F3/both-live. **SUPERVISOR GATE — ceiling bounded, NO engine fix landed (binder coupled/unconfirmed); next loop must CAUSALLY perturb before any work-stretch.**
+
+### THIS TURN — renamed the inversion-prone counter (byte-exact), then BOUNDED the scheduling/serial ceiling with REAL removal oracles on the locked guest. Advisor (synchronous, read-only) REFUTED my arithmetic over-reach; resolution is oracle-grounded.
+- **COUNTER RENAME (commit f1aceee1, byte-transparent instrumentation):** `BOOTSTRAP_POST_FLIP_U16_BYTES` → `BOOTSTRAP_CLEAN_FLIPPED_BYTES` (gzip_chunk.rs:97/:1491 + chunk_fetcher.rs:947 + GZIPPY_VERBOSE label). It counts output bytes of bootstrap blocks that ended CLEAN (`!contains_marker_bytes`) — the marker-FREE COMPLEMENT, NOT "bytes decoded into the u16 marker ring after the flip" as the old name+doc claimed. It had been read backwards repeatedly (the exact C3 counter-inversion the prior advisor refuted). New label now self-documents: `clean_flipped_bytes=1425448 (2.0% of body = marker-FREE complement; marker loop owns the other 98.0%)`. Compiles clean; faithful_u8_flip_seam test green.
+- **FIRST-HAND VERBOSE (locked guest REDACTED_IP double-ssh, 16c gov=perf, gzippy-isal native synced to HEAD f1aceee1, sha 028bd002…cb410f every cell, T8):**
+    | metric | gzippy HEAD | rapidgzip | ratio |
+    | decodeBlock SUM | 0.803s | 0.502s | 1.60× |
+    | Theoretical Optimal (÷T) | 0.100s | 0.068s | 1.47× |
+    | Total Real Decode | 0.116s | 0.084s | 1.38× |
+    | std::future::get | 0.089s (T16: 0.046s) | 0.064s | 1.39× |
+    | serial tail (wall−RealDecode) | 0.058s | ~0.043s | 1.35× |
+    | WALL (interleaved best, measure.sh) | 0.174-0.177s | 0.130s | **0.736-0.755×** |
+  Note Real Decode 0.116 is BELOW rg's WALL 0.130 (the prompt's cached 0.137 was pre-mergefix/stale). T16: HEAD 0.162s = **0.885×** (rg slows to 0.144 at T16 on 17 chunks).
+- **REMOVAL ORACLE #1 — seedfull (GZIPPY_SEED_WINDOWS, sha-exact):** all 17 chunks window-seeded ⇒ CLEAN engine, 0 spec-failures, Fill 90%. T8 wall **0.128s = 1.029× rg = TIE**; T16 **0.128s = 1.121× rg = WIN**. seedfull's future::get 0.083s ≈ HEAD's 0.089s. **This IS the faithful "perfect window-overlap" oracle** — the ONLY way to give the consumer pre-resolved windows (remove head-of-line wait) is to seed windows, which ALSO flips the engine clean (coupling, gzip_chunk.rs:790 vs :826). A pure-scheduling oracle keeping the marker engine is IMPOSSIBLE in-architecture.
+- **NEGATIVE CONTROL — GZIPPY_NO_PREFETCH (sha-exact):** T8 wall **0.523s = 0.253× rg (3× SLOWER)**. Removing the prefetch overlap is catastrophic ⇒ scheduling is FIRMLY on the critical path. + future::get HALVES T8→T16 (0.089→0.046) = signature of CRITICALITY (slack does not scale with cores).
+- **INDEPENDENT DISPROOF ADVISOR (synchronous, read-only, plans/scheduling-ceiling-advisor-verdict.md):** C1 (engine reaches wall) UPHELD-WITH-CAVEATS (the HEAD→seedfull A/B moving 0.040s on the non-future::get axis is the real evidence, NOT the banned attribution ratios — but "reaches the wall" ≠ "is THE binder"). **C2 (scheduling not the binder) REFUTED** — I read future::get's halving backwards; it IS a criticality signature; NO_PREFETCH 3× regression confirms it. **C3 (arithmetic F2 ceiling = loss) REFUTED (load-bearing)** — 0.116+0.043 is my OWN strict upper bound (double-counts the overlapping tail); the only LOWER bound (decode-phase wall 0.116 = 0.89× rg) is in TIE territory; concluding F2 from a hand sum with no oracle violates Rule 3. **C4 (next binder = backward marker scan emit_backref_ring::<true> :3006-3027) UPHELD-WITH-CAVEATS → effectively UNCONFIRMED** — the scan is fast-path-skipped once `distance_marker>=distance` (:3002) and the isal build FLIPS to clean u8 at 32KiB (gzip_chunk.rs:949), confining it to the per-chunk bootstrap (<1% of a multi-MB chunk); implausible as the prime 1.6× term; needs a causal perturbation.
+- **BOUNDED CEILING (honest, oracle-grounded): the T8 TIE IS reachable** (seedfull proves it, F1) but BOTH the scheduling overlap AND the window-absent marker-engine rate are LIVE, COUPLED terms; neither is isolable in gzippy's architecture (window-present ⇒ clean). **rg ties UNSEEDED at the same 34.5% markers because its marker engine is fast (decodeBlock 0.502 vs 0.803 = 1.6×)** — so the faithful path is to make the window-absent decode cheaper at the wall.
+- **rg's MECHANISM (source-verified, vendor GzipChunkFetcher.hpp):** `waitForReplacedMarkers` (:479) queues the head chunk's marker-replace, then USES THE WAIT to harvest ready futures + `queuePrefetchedChunkPostProcessing` (:513, full sorted prefetch-cache scan, queue post-process for every chunk whose predecessor window is available). The LAST window is inserted by the MAIN thread (:559-561, *"the critical path that cannot be parallelized... do not compress the last window to save time"*) — rg explicitly names window-publish as THE serial critical path and minimizes it. gzippy ALREADY ports this (queue_prefetched_marker_postprocess chunk_fetcher.rs:1592/1702 + prefetch pump during wait). So the consumer STRUCTURE is faithfully ported; the residual is dispatch TIMING (windows published slightly later ⇒ more chunks window-absent at high T), NOT a missing mechanism and NOT horizon DEPTH (vendor-identical).
+- **SCOPED FIX for the NEXT loop (do NOT start — supervisor gate; must CAUSALLY PERTURB FIRST per advisor C4):** TWO coupled faithful candidates, each needs a confirming perturbation before a work-stretch: (a) faster window-absent u16 MARKER engine (the 1.6× decodeBlock gap reaching the wall via Real Decode 1.38×) — but C4's specific "backward marker scan" hypothesis is UNCONFIRMED/implausible (flip-to-clean at 32KiB confines it); the real remaining engine term is more likely the post-flip u8 CLEAN rate + u16 bootstrap traffic, which a SLOW-INJECT/oracle perturbation must locate; OR (b) publish predecessor windows EARLIER so more chunks hit the clean path at high T (closing project_confirmed_offset_prefetch_gap dispatch-TIMING). Bound each with a REMOVAL oracle; never the slow-down slope.
+- **GUEST STATE:** /root/gzippy/src rsynced to HEAD f1aceee1 (gzippy-isal native build /tmp/gzbuild-head, sha 028bd002…cb410f). Drivers /tmp/head_measure.sh, /tmp/seedfull_measure.sh, /tmp/t16_measure.sh, /tmp/noprefetch_measure.sh, /tmp/head_verbose.sh, /tmp/seedfull_verbose.sh, /tmp/rg_verbose.sh (all `bash`). Seeds /tmp/seeds.bin. NO orphan processes (advisor wrapper + sleep killed; guest pgrep clean).
+
+## SUPERSEDED — PRIOR CURRENT STATE (2026-06-07, owner turn, HEAD 04fda86d) — **PORT (i) LANDED: rg's multi-cached u16 marker FAST LOOP. Byte-exact. T8 wall = TIE (no move), KEPT per 7a. Advisor C1 UPHELD, C3 REFUTED my mechanism.** The marker decode SUM gap (decodeBlock ~1.9× rg) is SLACK-MASKED at the wall (Fill 87%, wall unchanged). Whole-system T8 wall STILL ~0.73× rg. NEXT = the binder is NOT the marker compute — re-perceive: the engine SUM is ~1.9× but slack-masked (matches Phase-0 oracle TIE-vs-TIE). **SUPERVISOR GATE — marker loop measured + committed (TIE, kept); next binder NOT yet located.**
 
 ### THIS TURN — ported rg's multi-cached u16 marker fast loop, byte-exact, remove-and-measure on the locked guest. Result: a faithful TIE (kept), and an important PREMISE CORRECTION.
 - **THE CHANGE (commit 04fda86d, faithful port of vendor `readInternalCompressedMultiCached` deflate.hpp:1585-1666):** added a speculative software-pipelined FAST LOOP to the u16 MARKER path (`read_internal_compressed_specialized::<true>`, marker_inflate.rs new `'mfast` loop), mirroring the clean path's existing fast loop. rg runs the SAME tight multi-cached loop for u16 markers as for u8 clean (templated on `Window`, no separate slow marker path); gzippy's clean path already had its fast loop but the MARKER path was stuck on the careful per-symbol loop. Three faithful u16 deltas: (1) literal store widened to u16 via an 8-byte speculative store `(p&0xFF)|((p&0xFF00)<<8)|((p&0xFF0000)<<16)`, value-identical to the careful loop's `write(code&0xFF)`; (2) `distance_marker += lit_prefix` per packet, back-refs via the SAME `emit_backref_ring::<true>` (marker scan maintained inside); (3) no `distance>decoded+emitted` range check (vendor const-folds it for marker windows).
@@ -421,3 +442,37 @@ removals — (1) u16 marker-compute, (2) block-finder real-boundary vs partition
 (3) 13 speculation-failure re-decodes. NEXT: DECOMPOSE the bundle (seed-only-boundaries vs
 seed-only-windows) to pinpoint the precise T8 sub-lever before fixing — likely boundary-ALIGNMENT
 = block-finder / prefetch-horizon (project_confirmed_offset_prefetch_gap), faithfully ported.
+
+---
+## PROCESS ADDENDUM — IT'S A RATCHET, not a flip-flop (user-set 2026-06-07)
+As performance improves, the binder WILL oscillate between the per-thread engine and the
+sequential/scheduling terms — that is the EXPECTED shape of whole-system bottleneck-following,
+not thrashing. Fix the current binder, it migrates to the next-largest term; fix that. The only
+metric of progress is the WHOLE-SYSTEM WALL RATCHETING DOWN. A banked byte-exact wall-moving
+change (e.g. merge-removal +12%, wall 0.65×→0.73× rg) is a ratchet tooth — it does NOT come back,
+even though the binder then moves on. Do NOT treat binder migration as a problem to avoid; keep
+banking ratchet teeth.
+DISTINCTION (the real discipline): separate (a) genuine binder MIGRATION (healthy ratchet) from
+(b) FALSE flips caused by measurement error (the unit error; the misnamed counter read backwards
+twice). (a) is fine and expected. (b) is the enemy — kill it: every binder claim must come from a
+CAUSAL perturbation on the WALL (not producer-side attribution), and counters must be named for
+what they actually count. Make every flip a REAL migration.
+
+---
+## PROCESS FIXES (supervisor coach review, plans/SUPERVISOR-FEEDBACK.md, 2026-06-07) — BINDING
+1. **The decider ORACLE gates each loop.** Before ANY binder-MECHANISM claim or fix, run the
+   registered removal oracle for that binder (for the current scheduling direction: the
+   `GZIPPY_PERFECT_OVERLAP` ceiling — NEVER YET RUN; it is the registered decider and the current
+   strategy rests on it unmeasured = a live Rule-3 violation). No mechanism claim without the
+   oracle.
+2. **Causal-perturbation-first; attribution is a FOOTNOTE.** Every binder claim must LEAD with a
+   causal perturbation on the WALL. SUMs / ratios / Fill% / counters are hypothesis-only and have
+   repeatedly produced inverted binders (the misnamed counter read backwards twice). Never let
+   attribution be the verdict.
+3. **No STOP/TIE/"done" without a validated removal oracle.** Two prior "victories" were reversed
+   (2026-06-02 STOP-EARNED; 2026-05-29 rescind on a broken oracle). Don't repeat.
+ALSO (coach-corrected facts): engine is CONCLUSIVELY NOT the T8 binder (seeded-pure TIE 1.002× +
+ISA-L oracle TIE-vs-TIE) — do NOT re-test the engine at T8 (that is the ~40% wasted re-derivation
+in the engine↔scheduling oscillation); the T8 lever is the named head-of-line stall
+([[project_confirmed_offset_prefetch_gap]], "fixable not architectural"). 0.73× is NOT "best ever"
+(June-2 ~0.85× was a different ISA-L-product basis) — never frame it as a regression OR a record.

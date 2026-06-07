@@ -1,5 +1,37 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
+## COUNTER RENAMED (anti-inversion) + SCHEDULING/SERIAL CEILING BOUNDED via real oracles; advisor REFUTED my arithmetic F2 over-reach [2026-06-07, OWNER turn, HEAD f1aceee1]
+Renamed the inversion-prone counter byte-exact (commit f1aceee1:
+`BOOTSTRAP_POST_FLIP_U16_BYTES` → `BOOTSTRAP_CLEAN_FLIPPED_BYTES`; it counts the
+marker-FREE CLEAN-flipped complement, NOT marker-ring bytes — the exact inversion
+that bit C3 repeatedly; verbose label now self-documents). Then bounded the
+scheduling/serial ceiling with REAL removal oracles on the locked guest (src rsynced
+to HEAD, /tmp/gzbuild-head, sha 028bd002…cb410f every cell). Charter CURRENT STATE +
+prereg updated. Advisor: plans/scheduling-ceiling-advisor-verdict.md. Pre-reg:
+plans/scheduling-ceiling-prereg.md. Brief: plans/scheduling-ceiling-advisor-brief.md.
+**SUPERVISOR GATE — ceiling bounded, NO engine fix landed (binder coupled/unconfirmed).**
+
+NUMBERS (T8, interleaved measure.sh, sha-exact): HEAD 0.174-0.177s = 0.736-0.755× rg
+(rg 0.130s). seedfull (GZIPPY_SEED_WINDOWS = the faithful perfect-window-overlap oracle)
+0.128s = 1.029× = TIE; T16 0.128s = 1.121× WIN. NO_PREFETCH negative control 0.523s =
+0.253× (3× SLOWER ⇒ scheduling firmly critical). Verbose: gzippy decodeBlock SUM 0.803
+vs rg 0.502 (1.6×); Real Decode 0.116 vs 0.084; future::get 0.089 (T16 0.046, HALVES).
+
+KEY (oracle-grounded, advisor-corrected): the T8 TIE IS reachable (seedfull, F1) BUT
+the scheduling overlap AND the window-absent marker-engine rate are LIVE + COUPLED
+(window-present ⇒ CLEAN engine, gzip_chunk.rs:790 vs :826) — neither isolable. My
+arithmetic "engine binds (F2)" was a forbidden Rule-3 extrapolation (the 0.116+0.043
+sum was a STRICT UPPER BOUND, double-counting the overlapping tail) — advisor REFUTED
+C2 (scheduling IS critical: future::get halving = criticality, NO_PREFETCH 3×) and C3
+(F2). C1 (engine reaches wall) UPHELD-WITH-CAVEATS. C4 (backward marker scan) UNCONFIRMED/
+implausible (flip-to-clean at 32KiB confines it). rg's mechanism source-verified
+(GzipChunkFetcher.hpp:479/:513/:559 — main-thread uncompressed last-window publish on
+the named serial critical path; gzippy ALREADY ports it) ⇒ residual is dispatch TIMING,
+not a missing mechanism nor horizon DEPTH (vendor-identical). SCOPED NEXT (gate, must
+CAUSALLY PERTURB FIRST): (a) faster window-absent marker engine OR (b) earlier window
+publish so more chunks hit clean at high T (project_confirmed_offset_prefetch_gap). NO
+orphan processes (advisor wrapper+sleep killed; guest clean).
+
 ## MARKER FAST LOOP LANDED → rg's multi-cached u16 marker loop ported; T8 wall = TIE (no move), byte-exact, KEPT per 7a. Advisor C1 UPHELD / C3 REFUTED my mechanism [2026-06-07, OWNER turn, HEAD 04fda86d]
 Ported step (i) of the bounded plan: rg's multi-cached u16 marker FAST LOOP
 (vendor `readInternalCompressedMultiCached` deflate.hpp:1585-1666). Added a
