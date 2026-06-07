@@ -253,6 +253,18 @@ impl ThreadPool {
         self.threads.lock().unwrap().len()
     }
 
+    /// Current count of worker threads parked in the condvar wait
+    /// (`m_idleThreadCount`, ThreadPool.hpp:235). Diagnostic-only read for
+    /// the SATURATION-vs-HORIZON stall probe (plans/prefetch-horizon-falsifier.md):
+    /// `busy = spawned_threads() - idle_thread_count()`, and
+    /// `idle_capacity = idle_thread_count() + (capacity() - spawned_threads())`
+    /// (lazy-spawn means an un-spawned slot is also available capacity). A
+    /// relaxed atomic read — an instantaneous snapshot, no decode effect.
+    #[allow(dead_code)] // diagnostic / probe surface
+    pub fn idle_thread_count(&self) -> usize {
+        self.idle_thread_count.load(Ordering::Relaxed)
+    }
+
     /// `size_t unprocessedTasksCount(std::optional<int> priority = {}) const`
     /// (ThreadPool.hpp:172-182).
     ///

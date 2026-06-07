@@ -70,8 +70,12 @@ pub mod slow_knob;
 pub mod sm_cfg;
 #[cfg(parallel_sm)]
 pub mod sm_driver;
-/// STEP-0 discriminator (a): byte-exact env-gated parent-cached-at-stall probe.
-/// See `stall_residency.rs` + plans/step0-discriminator-a-falsifier.md.
+/// STEP-0 discriminator (a): byte-exact env-gated parent-cached-at-stall probe +
+/// the SATURATION-vs-HORIZON occupancy probe (plans/prefetch-horizon-falsifier.md).
+/// See `stall_residency.rs` + plans/step0-discriminator-a-falsifier.md. Gated on
+/// `parallel_sm` because its only consumer (chunk_fetcher consumer loop) is — under
+/// default features it would be dead code (clippy -D warnings).
+#[cfg(parallel_sm)]
 pub mod stall_residency;
 pub mod statistics;
 /// Non-speculative parallel decode for stored-block-dominated (incompressible)

@@ -1396,6 +1396,25 @@ fn consumer_loop<W: std::io::Write>(
                         &in_flight_keys,
                         partition_span,
                     );
+                    // SATURATION vs HORIZON occupancy snapshot at the stall
+                    // instant (plans/prefetch-horizon-falsifier.md). Excludes the
+                    // startup stall (decode_start == 0, unavoidable). Worker
+                    // occupancy: lazy-spawn means an un-spawned slot is available
+                    // capacity, so idle_capacity = parked idle + (cap - spawned).
+                    if decode_start != 0 {
+                        let cap = thread_pool.capacity();
+                        let spawned = thread_pool.spawned_threads();
+                        let idle = thread_pool.idle_thread_count();
+                        let busy = spawned.saturating_sub(idle);
+                        let idle_capacity = idle.saturating_add(cap.saturating_sub(spawned));
+                        // `enqueued`: an in-flight prefetch key covers decode_start
+                        // (the index WAS dispatched, just not finished) — same
+                        // keyed estimate the residency probe uses for in-flight.
+                        let enqueued = in_flight_keys.iter().any(|&k| {
+                            k <= decode_start && decode_start < k.saturating_add(partition_span)
+                        });
+                        stall_residency::classify_occupancy(busy, idle_capacity, enqueued);
+                    }
                 }
                 // The head chunk is NOT in the prefetch cache → the
                 // consumer is about to BLOCK on its decode (the
