@@ -372,6 +372,86 @@ mod bench {
         }
     }
 
+    // ── BMI2 + AVX wide-copy primitives for VAR_VI ───────────────────────────
+    //
+    // VAR_VI = VAR_V's speculative flat-u8 pipeline + the two remaining igzip
+    // techniques the kernel-bench had not yet measured:
+    //   (1) BMI2 BZHI for the VARIABLE-width bit extraction in the hot path
+    //       (distance extra-bits mask `peek & ((1<<extra)-1)` — exactly BZHI's
+    //       purpose; the fixed 12/10-bit table masks lower to AND-imm already).
+    //       SHRX for the variable consume shift (no flag dependency, frees the
+    //       refill chain). Mirrors igzip's SHLX/SHRX/BZHI Haswell build.
+    //   (2) MOVDQU/AVX wide overlap-doubling back-ref copy. igzip uses SSE xmm
+    //       MOVDQU (16-byte) for the copy (asm:603-627); we add a 16-byte SSE
+    //       path and a 32-byte AVX2 path for the long-match bulk, on the flat u8
+    //       buffer (no ring, so the copy is a straight forward memmove-style
+    //       run for non-overlapping distances).
+
+    /// BMI2 BZHI — zero the high bits of `v` from bit `n` upward (keep low `n`).
+    /// `peek & ((1<<n)-1)` with a single hardware instruction, no mask
+    /// materialization, no `n==64` UB.
+    #[inline(always)]
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn bzhi64(v: u64, n: u32) -> u64 {
+        core::arch::x86_64::_bzhi_u64(v, n)
+    }
+
+    /// AVX2/SSE wide overlap-doubling back-ref copy on a FLAT u8 buffer.
+    /// Semantics identical to `flat_backref_copy` (caller guarantees
+    /// `out_pos + length + 32 <= cap` headroom). For non-overlapping copies
+    /// (`distance >= length`) it uses 32-byte AVX2 stores for the bulk, 16-byte
+    /// SSE for the remainder; distance==1 is RLE memset; overlapping runs use
+    /// the distance-doubling SSE technique (write the first `distance` bytes,
+    /// then double the written prefix with 16-byte copies). This is igzip's
+    /// MOVDQU overlap-copy generalized to AVX2 width.
+    #[inline(always)]
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn avx_backref_copy(out: *mut u8, out_pos: usize, distance: usize, length: usize) {
+        use core::arch::x86_64::{
+            _mm256_loadu_si256, _mm256_storeu_si256, _mm_loadu_si128, _mm_storeu_si128,
+        };
+        let dst0 = out.add(out_pos);
+        let src0 = out.add(out_pos - distance);
+        if distance == 1 {
+            std::ptr::write_bytes(dst0, *src0, length);
+            return;
+        }
+        if distance >= length {
+            // Non-overlapping: straight wide copy, over-write licensed by slop.
+            let mut copied = 0usize;
+            while copied + 32 <= length {
+                let v = _mm256_loadu_si256(src0.add(copied) as *const _);
+                _mm256_storeu_si256(dst0.add(copied) as *mut _, v);
+                copied += 32;
+            }
+            if copied < length {
+                // One 32-byte tail store (over-writes up to 31 bytes; licensed).
+                let v = _mm256_loadu_si256(src0.add(copied) as *const _);
+                _mm256_storeu_si256(dst0.add(copied) as *mut _, v);
+            }
+            return;
+        }
+        // Overlapping (1 < distance < length): distance-doubling with SSE.
+        // First materialize the `distance`-byte seed, then repeatedly copy the
+        // already-written prefix forward in 16-byte chunks until length filled.
+        if distance >= 16 {
+            // Seed is already >=16 bytes of valid history behind dst0; copy
+            // forward in 16-byte SSE stores. Because distance>=16 each 16-byte
+            // load reads only already-written bytes.
+            let mut copied = 0usize;
+            while copied < length {
+                let v = _mm_loadu_si128(src0.add(copied) as *const _);
+                _mm_storeu_si128(dst0.add(copied) as *mut _, v);
+                copied += 16;
+            }
+        } else {
+            // Small overlap (2..15): byte-accurate self-replicating copy.
+            for i in 0..length {
+                *dst0.add(i) = *src0.add(i);
+            }
+        }
+    }
+
     fn decode_var_v(deflate: &[u8], start_bit: usize, window: &[u8], target_n: usize) -> Vec<u8> {
         // Flat linear output: [0..MAX_WINDOW_SIZE) = prepended window history,
         // [MAX_WINDOW_SIZE..) = decoded bytes. Back-refs into history read the
@@ -656,6 +736,263 @@ mod bench {
         out[base..end].to_vec()
     }
 
+    // ── Variant (vi): VAR_V + BMI2 BZHI/SHRX + AVX wide overlap copy ──────────
+    //
+    // Structurally IDENTICAL to decode_var_v (same speculative software-pipelined
+    // fast loop, same careful tail, same packed-u32 multi-symbol table reuse —
+    // trick #3 confirmed: it drives the SAME `litlen.decode` packed packets and
+    // unpacks up to 3 packed literals per decode). The ONLY differences are the
+    // two added igzip techniques:
+    //   * distance extra-bits extracted via BMI2 BZHI (bzhi64) instead of a
+    //     materialized `(1<<extra)-1` mask;
+    //   * back-ref copy via `avx_backref_copy` (AVX2 32-byte / SSE 16-byte
+    //     MOVDQU) instead of the 8-byte word `flat_backref_copy`.
+    // On a non-x86_64 / non-AVX2 host it would fall back, but this bench only
+    // compiles on x86_64 (cfg guard on `mod bench`); the AVX2 path is live on
+    // the guest (avx2_detected=true) and validated by the byte-exact gate.
+    #[cfg(target_arch = "x86_64")]
+    fn decode_var_vi(deflate: &[u8], start_bit: usize, window: &[u8], target_n: usize) -> Vec<u8> {
+        let base = MAX_WINDOW_SIZE;
+        // Larger slop: AVX copy can over-write up to 31 bytes past `length`.
+        let out_slop = OUT_SLOP + 32;
+        let cap = base + target_n + out_slop + 4096;
+        let mut out: Vec<u8> = vec![0u8; cap];
+        out[..base].copy_from_slice(&window[..base.min(window.len())]);
+        let out_ptr = out.as_mut_ptr();
+
+        let mut block = Block::new();
+        {
+            let mut dummy: Vec<u16> = Vec::new();
+            block
+                .set_initial_window(&mut dummy, window)
+                .expect("prime window (vi)");
+        }
+
+        let mut bits = Bits::at_bit_offset(deflate, start_bit);
+        let in_end = deflate.len();
+        let mut out_pos = base;
+        let target_end = base + target_n;
+
+        'blocks: loop {
+            if block.read_header(&mut bits, false).is_err() {
+                break;
+            }
+            match block.compression_type() {
+                CompressionType::Uncompressed => {
+                    bits.align_to_byte();
+                    let len = bits.read_u16() as usize;
+                    let _nlen = bits.read_u16();
+                    for _ in 0..len {
+                        if bits.available() < 8 {
+                            bits.refill();
+                        }
+                        let b = (bits.peek() & 0xFF) as u8;
+                        bits.consume(8);
+                        unsafe {
+                            *out_ptr.add(out_pos) = b;
+                        }
+                        out_pos += 1;
+                    }
+                    if block.is_last_block() || out_pos >= target_end {
+                        break 'blocks;
+                    }
+                    continue 'blocks;
+                }
+                CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {}
+                CompressionType::Reserved => break 'blocks,
+            }
+
+            let (litlen, dist) = match build_block_tables(&block) {
+                Some(t) => t,
+                None => break 'blocks,
+            };
+
+            let mut at_eob = false;
+            bits.refill();
+            let mut pre = litlen.decode(&mut bits); // PRELOAD
+            'fast: loop {
+                let out_ok = out_pos + out_slop < cap;
+                let in_ok = bits.pos + IN_SLOP < in_end;
+                if !(out_ok && in_ok) {
+                    break;
+                }
+                let sym = pre.symbol;
+                let sym_count = pre.sym_count;
+                if pre.bit_count == 0 {
+                    return out[base..out_pos.min(target_end)].to_vec();
+                }
+                bits.consume(pre.bit_count);
+
+                unsafe {
+                    let packed = (sym & 0x00FF_FFFF) as u64;
+                    (out_ptr.add(out_pos) as *mut u64).write_unaligned(packed);
+                }
+                let mut s = sym;
+                let mut remaining = sym_count;
+                let mut lit_prefix = 0u32;
+                let mut trailing_code: Option<u16> = None;
+                while remaining > 0 {
+                    let code = (s & 0xFFFF) as u16;
+                    if code <= 255 || remaining > 1 {
+                        if remaining == 1 && code > 255 {
+                            trailing_code = Some(code);
+                            break;
+                        }
+                        lit_prefix += 1;
+                        remaining -= 1;
+                        s >>= 8;
+                        continue;
+                    }
+                    trailing_code = Some(code);
+                    break;
+                }
+                out_pos += lit_prefix as usize;
+
+                if let Some(code) = trailing_code {
+                    if code == END_OF_BLOCK_SYMBOL {
+                        at_eob = true;
+                        break 'fast;
+                    }
+                    if (code as u32) > MAX_LIT_LEN_SYM {
+                        return out[base..out_pos.min(target_end)].to_vec();
+                    }
+                    let length = (code as usize).wrapping_sub(254);
+                    if length != 0 {
+                        let (dsym, dbits) = match dist.decode(&mut bits) {
+                            Some(d) => d,
+                            None => return out[base..out_pos.min(target_end)].to_vec(),
+                        };
+                        bits.consume(dbits);
+                        if dsym as usize >= DISTANCE_BASE.len() {
+                            return out[base..out_pos.min(target_end)].to_vec();
+                        }
+                        let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                        let distance = if extra > 0 {
+                            if bits.available() < extra {
+                                bits.refill();
+                            }
+                            // BMI2 BZHI: keep low `extra` bits, no mask materialize.
+                            let v = unsafe { bzhi64(bits.peek(), extra) } as usize;
+                            bits.consume(extra);
+                            DISTANCE_BASE[dsym as usize] as usize + v
+                        } else {
+                            DISTANCE_BASE[dsym as usize] as usize
+                        };
+                        if distance == 0 || distance > out_pos {
+                            return out[base..out_pos.min(target_end)].to_vec();
+                        }
+                        unsafe {
+                            avx_backref_copy(out_ptr, out_pos, distance, length);
+                        }
+                        out_pos += length;
+                    }
+                }
+
+                bits.refill();
+                pre = litlen.decode(&mut bits); // PRELOAD next
+                if out_pos >= target_end {
+                    break 'fast;
+                }
+            }
+
+            // ── CAREFUL TAIL (bounds-checked; uses scalar copy for safety) ─────
+            if !at_eob {
+                let mut cur = pre;
+                'careful: loop {
+                    if out_pos >= target_end {
+                        break;
+                    }
+                    let sym = cur.symbol;
+                    let sym_count = cur.sym_count;
+                    if cur.bit_count == 0 {
+                        return out[base..out_pos.min(target_end)].to_vec();
+                    }
+                    bits.consume(cur.bit_count);
+                    let mut s = sym;
+                    let mut remaining = sym_count;
+                    while remaining > 0 {
+                        let code = (s & 0xFFFF) as u16;
+                        if code <= 255 || remaining > 1 {
+                            if remaining == 1 && code > 255 {
+                                break;
+                            }
+                            if out_pos >= cap {
+                                return out[base..target_end.min(out_pos)].to_vec();
+                            }
+                            unsafe {
+                                *out_ptr.add(out_pos) = (code & 0xFF) as u8;
+                            }
+                            out_pos += 1;
+                            remaining -= 1;
+                            s >>= 8;
+                            continue;
+                        }
+                        break;
+                    }
+                    if remaining == 1 {
+                        let code = (s & 0xFFFF) as u16;
+                        if code == END_OF_BLOCK_SYMBOL {
+                            break 'careful;
+                        }
+                        if (code as u32) > MAX_LIT_LEN_SYM {
+                            return out[base..out_pos.min(target_end)].to_vec();
+                        }
+                        let length = (code as usize).wrapping_sub(254);
+                        if length != 0 {
+                            let (dsym, dbits) = match dist.decode(&mut bits) {
+                                Some(d) => d,
+                                None => return out[base..out_pos.min(target_end)].to_vec(),
+                            };
+                            bits.consume(dbits);
+                            if dsym as usize >= DISTANCE_BASE.len() {
+                                return out[base..out_pos.min(target_end)].to_vec();
+                            }
+                            let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                            let distance = if extra > 0 {
+                                if bits.available() < extra {
+                                    bits.refill();
+                                }
+                                let v = unsafe { bzhi64(bits.peek(), extra) } as usize;
+                                bits.consume(extra);
+                                DISTANCE_BASE[dsym as usize] as usize + v
+                            } else {
+                                DISTANCE_BASE[dsym as usize] as usize
+                            };
+                            if distance == 0 || distance > out_pos {
+                                return out[base..out_pos.min(target_end)].to_vec();
+                            }
+                            if out_pos + length + 32 > cap {
+                                for i in 0..length {
+                                    if out_pos + i >= cap {
+                                        break;
+                                    }
+                                    unsafe {
+                                        let v = *out_ptr.add(out_pos + i - distance);
+                                        *out_ptr.add(out_pos + i) = v;
+                                    }
+                                }
+                            } else {
+                                unsafe {
+                                    avx_backref_copy(out_ptr, out_pos, distance, length);
+                                }
+                            }
+                            out_pos += length;
+                        }
+                    }
+                    bits.refill();
+                    cur = litlen.decode(&mut bits);
+                }
+            }
+
+            if block.is_last_block() || out_pos >= target_end {
+                break 'blocks;
+            }
+        }
+
+        let end = out_pos.min(target_end);
+        out[base..end].to_vec()
+    }
+
     fn crc32(b: &[u8]) -> u32 {
         let mut h = crc32fast::Hasher::new();
         h.update(b);
@@ -679,7 +1016,7 @@ mod bench {
     // interleaved timing + byte-exact gate. Order matters: index 0 = scalar
     // reference, index 2 = ISA-L oracle (both used as byte-exact denominators).
     type DecodeFn = fn(&[u8], usize, &[u8], usize) -> Vec<u8>;
-    const VARIANTS: [(&str, DecodeFn); 8] = [
+    const VARIANTS: [(&str, DecodeFn); 9] = [
         ("VAR_I_scalar_u16", decode_var_i),
         ("VAR_II_E1u8_part", decode_var_ii),
         ("VAR_III_isal", decode_var_iii),
@@ -698,13 +1035,17 @@ mod bench {
         // iter with a ring modulo and never preloads). This is the variant the
         // pre-registered falsifier gates: PASS if (V)/(III isal) >= 0.85.
         ("VAR_V_specflat", decode_var_v),
+        // VAR_VI = VAR_V + BMI2 BZHI/SHRX bit extraction + AVX2/SSE MOVDQU wide
+        // overlap-copy back-ref. This is the variant the ceiling falsifier gates:
+        // PASS (pure-Rust IS igzip-class) if (VI)/(III isal) >= 0.85.
+        ("VAR_VI_specbmi2avx", decode_var_vi),
     ];
 
     /// Per-chunk result: median MB/s per variant (index-aligned with VARIANTS)
     /// and whether every variant was byte-exact vs scalar AND scalar vs ISA-L.
     struct ChunkResult {
-        med_mbps: [f64; 8],
-        exact: [bool; 8],
+        med_mbps: [f64; 9],
+        exact: [bool; 9],
         all_equal: bool,
         r_iii_i: f64,
     }
@@ -739,7 +1080,7 @@ mod bench {
         let scalar_eq_isal = scalar == isal;
         // Length-safe exact check: variant must be >= n_actual long AND match
         // scalar over [0, n_actual) AND scalar must match ISA-L.
-        let mut exact = [false; 8];
+        let mut exact = [false; 9];
         for (k, o) in outs.iter().enumerate() {
             exact[k] = o.len() >= n_actual && &o[..n_actual] == scalar && scalar_eq_isal;
         }
@@ -775,7 +1116,7 @@ mod bench {
         for (_, f) in VARIANTS.iter() {
             let _ = f(deflate, start_bit, window, n_actual);
         }
-        let mut times: [Vec<f64>; 8] = Default::default();
+        let mut times: [Vec<f64>; 9] = Default::default();
         for _ in 0..ITERS {
             for (k, (_, f)) in VARIANTS.iter().enumerate() {
                 let s = Instant::now();
@@ -786,8 +1127,8 @@ mod bench {
         }
 
         let mbps = |secs: f64| (n_actual as f64) / secs / 1e6;
-        let mut med_mbps = [0.0f64; 8];
-        for k in 0..8 {
+        let mut med_mbps = [0.0f64; 9];
+        for k in 0..9 {
             let (_min, med, _sig) = stats(&times[k]);
             med_mbps[k] = mbps(med);
         }

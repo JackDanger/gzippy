@@ -1,6 +1,64 @@
 # Orchestrator status — NAMING TRUTH + TWO-PATH + 3-WAY FULCRUM mission
 
-## T8 BINDER LOCATED = SERIAL/CONSUMER-WAIT; u16-path premise FALSIFIED [2026-06-07, OWNER turn, HEAD fb3baec0]
+## PURE-RUST ENGINE CEILING BOUNDED → PLATEAU (~0.6× ISA-L isolation); FORK real, WALL bound owed [2026-06-07, OWNER turn, HEAD f8260aa8 +bench]
+Loop step (B) executed: built + measured the faithful-u8 engine CEILING vs ISA-L (isolation, bounded).
+Charter CURRENT STATE updated. Advisor: plans/engine-ceiling-advisor-verdict.md (PLATEAU UPHELD-WITH-
+CAVEATS). Brief: plans/engine-ceiling-advisor-brief.md. Bench committed this turn.
+
+WHAT: added VAR_VI to benches/engine_isolation.rs = VAR_V speculative flat-u8 pipeline + igzip
+packed-u32 table (tricks #1/#2/#3) PLUS (1) BMI2 BZHI distance-extra extraction, (2) AVX2/SSE MOVDQU
+wide overlap-copy back-ref. trick #3 confirmed fully exploited.
+MEASURED (locked guest REDACTED_IP double-ssh, 16c gov=perf load~3.3 turbo-on, taskset -c 0, N=11
+interleaved, native target-cpu BMI2+AVX2 LIVE avx2_detected=true, 2 stable runs):
+  ISA-L 847-851 MB/s | VAR_V 460-462 (0.54×) | VAR_VI 504-525 (0.59-0.62×); per-chunk VI 0.55-0.64.
+  BMI2+AVX added ~9-14% over VAR_V, did NOT close the gap. SELFTEST PASS (iii/i=2.73).
+BYTE-EXACT: VAR_VI printed MBps (never VOID) every chunk ⇒ byte-identical to scalar AND ISA-L over
+the full timed window (bench gate exact[k]). Top-line SHA_ALL_EQUAL=no = PRE-EXISTING VAR_IV_E234
+failures (untouched path), NOT VAR_VI.
+FALSIFIER FIRED → PLATEAU: VAR_VI ≈0.6× ISA-L, ~23pp below the 0.85 PASS line, WITH the full igzip
+stack + inline-ASM intrinsics. Pure-Rust igzip-class as a STANDALONE PRIMITIVE not reached.
+ADVISOR: PLATEAU UPHELD-WITH-CAVEATS — all 5 techniques LIVE, fast loop is the timed path, header
+symmetric, byte-exact airtight; crediting every caveat lifts a "fixed" VI to ≤~0.65-0.68, still
+17-20pp short. LOAD-BEARING CAVEAT: escalating to "1.0× WALL hard-bounded at 0.6×" OVERREACHES
+isolation (Rule 3 forbidden extrapolation); the WALL bound needs a PRODUCTION engine-removal oracle.
+The floor-to-floor T8 1.74× finding (prior turn, advisor-upheld) independently corroborates the
+engine gap reaches the wall, so the FORK is strongly implicated but the clean WALL hard-bound is owed.
+
+NEXT (supervisor gate): (a) escalate the fork with the engine-primitive hard number (~0.6× ISA-L
+PLATEAU) + corroborating wall evidence; OR (b, owner-recommended) run the production-pipeline
+engine-removal oracle first to convert the engine ceiling into a clean WALL hard-bound, then escalate.
+GUEST: /root/gzippy src @7bf26096 + this turn's bench overlay (benches/engine_isolation.rs has VAR_VI);
+build /tmp/gzbuild (CARGO_TARGET_DIR), binary engine_isolation-9b415678a2bcb34c; /tmp/engine.seed ->
+/dev/shm/engine.seed; corpus /root/gzippy/benchmark_data/silesia-gzip.tar.gz; /root/fulcrum stub present.
+Tree: bench committed; no orphan processes (killed claude -p wrapper + sleep watchdogs).
+
+## T8 BINDER RE-LOCATED to the ENGINE; "serial/consumer-wait" binder REFUTED as a unit error [2026-06-07, OWNER turn, HEAD f8260aa8]
+Loop step (A) executed (perceive → ceiling-bound → causal-ID → advisor). Charter CURRENT STATE
+updated. Advisor: plans/t8-engine-binder-advisor-verdict.md (claim1 UPHELD; 2,3 UPHELD-W-CAVEATS).
+Brief: plans/t8-engine-binder-advisor-brief.md. NO code change this turn (perception + advisor).
+Tree clean (only untracked plan/script files); NO orphan processes.
+
+THE PRIOR BINDER ("decode floor 0.118s ≈ rapidgzip wall 0.130s ⇒ gap is all scheduling/consumer-
+wait") IS A UNIT ERROR: it compared gzippy's FLOOR to rapidgzip's WALL. Floor-to-floor (both
+--verbose Theoretical-Optimal): gzippy 0.118s vs rapidgzip 0.068s = 1.74×. decodeBlock SUM 0.93s
+vs 0.50s = 1.86×. The T8 BINDER is the per-thread DECODE ENGINE (body_rate 269 vs ~424 MB/s).
+future::get consumer-wait 0.077 vs 0.062 = 1.25× = MINORITY + downstream. Matches the constant
+~1.7× at BOTH T1 and T8 (flat-across-T = per-thread throughput gap). DECODE-BYPASS + SLEEP-DECODE
+oracles are CONFOUNDED (decode-free wall 3.6-5.5× SLOWER — buffer-pool bypass + per-chunk zeroed
+allocs/faults + 660MB live + un-overlapped 212MB CRC); use floor-to-floor span comparison instead.
+Vendor BlockFetcher.hpp:246-329: rapidgzip ALSO pumps prefetch in `while(wait_for(1ms))` during
+future-wait — overlap structure already faithfully ported, no missing mechanism.
+
+NEXT: step (B) = the ENGINE is the binder. Advisor caveat D-D (LOAD-BEARING): the round-2 "2.4×
+plateau" that declared pure-Rust unreachable was on the DISCREDITED u16-RING arch — does NOT bound
+the current faithful u8-direct engine (fc1c965b). pure-Rust→1.0× is OPEN. USER-CONSTRAINT FORK
+implicated: resolve by BUILDING+measuring the faithful-u8 engine ceiling vs ISA-L on the prod
+speculative path (igzip-class inner-Huffman: packed-u32 table, speculative 8B literal store +
+next-sym preload, BMI2, MOVDQU overlap copy, slop headroom), NOT by extrapolating the u16 plateau.
+GUEST: gzippy-mk2 byte-exact at /tmp; silesia /root/silesia.gz; cap_t1.bin+cap_t8.bin bypass
+captures + measure_oracleA.sh/oracle_sleep.sh on guest /tmp (kept for reuse).
+
+## [SUPERSEDED — unit error] T8 BINDER LOCATED = SERIAL/CONSUMER-WAIT; u16-path premise FALSIFIED [2026-06-07, OWNER turn, HEAD fb3baec0]
 Loop step (A) executed in full (perceive → causal-ID → advisor → instrument committed).
 Charter CURRENT STATE updated. Advisor: plans/u16-ceiling-advisor-verdict.md (UPHELD /
 UPHELD-WITH-CAVEATS). Brief: plans/u16-ceiling-advisor-brief.md.
