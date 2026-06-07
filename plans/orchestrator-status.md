@@ -730,3 +730,73 @@ narrow claim survives. Corrections folded in (the VERDICT block above is AMENDED
   = 94,887,526 clean decode events via path=ParallelSM (∝ clean bytes). Treat
   F->%wall as approximate (T1-calibrated); good for monotonicity, not magnitude.
 - 1b (u8-write/traffic A/B) still not run — the next experiment to rank class-T.
+
+---
+## TIER-2 STEP A — REMOVAL ORACLES [2026-06-07, STEP-A leader, fresh instance]
+CHARTER: plans/tier2-revised-placement-primary.md. Bound BOTH ceilings with removal
+oracles (CLAUDE.md rule 3) BEFORE any design commit. Guest VERIFIED IDLE (load 1.04,
+no stray gzippy/cargo/rapidgzip/harness procs; /dev/shm clean). HEAD ce9fe6f.
+
+### Falsifiers PRE-REGISTERED (before any run)
+- plans/step-a-oracle-c-falsifier.md (clean-compute removal). Mechanism = existing
+  decode-bypass FLOOR (PASS A) with the prior leverB CONTAMINATION fixed (prebuilt-map
+  init out-of-wall; /dev/shm capture; swap gate; region-removed proof = clean-decode
+  span→≈0 in floor trace). Prediction to beat: ~0.79-1.00s (advisor) / 0.78-0.84 (model).
+- plans/step-a-oracle-p-falsifier.md (perfect-placement removal — DECISIVE). Mechanism
+  P1 = trace-derived optimal-makespan (LPT) bound on the EXISTING locked-Fulcrum T8
+  per-chunk decode-busy times (placement-free lower bound, no new code) + self-tests
+  (sum-conservation, max-chunk, Σ/8); P2 = bypass-FLOOR placement-residual cross-check.
+  Verdict: FLOOR_P ≤ ~0.55s ⇒ placement SUFFICIENT (proven path to tie).
+
+### KEY INFRA FINDING (saves a build): the Oracle-C engine ALREADY EXISTS and is byte-exact
+decode_bypass.rs CAPTURE/REPLAY (GZIPPY_BYPASS_CAPTURE/DECODE) + guest_ceiling.sh PASS A.
+Prebuilt path (decode_bypass.rs:460-471) = HashMap lookup + Option::take, no per-call
+memcpy. Prior leverB run (plans/leverB-ceiling.md) read 3.667s = LOAD-CONTAMINATED
+(one-time prebuilt rebuild in-wall + swap), declared a HYPOTHESIS not a ceiling, owed a
+re-run "from RAM, prebuilt out-of-wall". THIS is that re-run.
+
+### ORACLE-P [DONE — trace-derived, validated] → PLACEMENT SUFFICIENT
+plans/step-a-oracle-p-falsifier.md MEASURED RESULTS. Clean T8 trace (000148, HEAD
+d0aa1db = decode-identical parent of ce9fe6f). FLOOR_P (placement-free single-pass
+LPT makespan, gzippy engine fixed) = **0.41-0.49s ≤ rapidgzip 0.524s** ⇒ perfect
+placement reaches the tie band WITHOUT touching the engine. Positive control:
+actual/makespan = 1.36 on BOTH tools. MECHANISM: 5.90s of gzippy's 6.33s T8 decode
+busy = worker.scan_candidate (speculative re-decode at mispredicted boundaries);
+clean decode (isal_stream_inflate) only 0.365s; single-pass T1 = 3.734s. rapidgzip
+decode busy 2.99s (confirms boundaries ahead, never re-scans). VERDICT: PLACEMENT is
+the proven primary lever (faithful rapidgzip boundary-confirmation port). CAVEAT
+(honest): bound assumes the redundant scan is eliminable + single-pass balances — the
+port-feasibility question, NOT proven by the ceiling (advisor to attack).
+
+### ORACLE-C [RE-RUNNING] — first attempt ORPHANED (lesson)
+SUBAGENT-ORPHAN LESSON: the `claude -p` Oracle-C subagent printed an interim message
+and EXITED (treated the backgrounded guest run as auto-reinvokable) → SIGHUP killed
+its child driving-ssh → host_lock died → watchdog restored freq state → run produced
+only the build, no captures. FIX: leader runs the guest harness DIRECTLY via a
+background Bash task (parented to the persistent runner, not an exiting subagent).
+Re-run launched (task b486p1g4b, /tmp/oracle-c-run2.log) at HEAD a49c357 (warm_prebuilt
+fix + routing-assert fix both in). Guest verified idle (load 1.08, shm clean) before launch.
+
+### ORACLE-C [DONE — run2 a49c357] → class-C floor ~0.4-0.7s (instrument-entangled), GREY
+plans/step-a-oracle-c-falsifier.md MEASURED RESULTS. Locked harness, RESTORE VERIFIED.
+HARD gates PASS (sha=OK byte-exact, hit%=97.6, sd%=0.9, anchor 1.13s reproduced, no
+swap-thrash). REGION-REMOVED PROOF passes (decode_chunk busy 6.33s→0.076s in floor
+trace). BUT the raw CEIL_FLOOR_A=3.63s is DOUBLY contaminated: (1) +3.1s warm_prebuilt
+still in the whole-process wall (my fix moved it before drive_t0 but the harness times
+the process, not drive_t0 — fix incomplete); (2) decode≈0 frees windows ⇒ L_resolve
+collapses (162µs vs 19.93ms) ⇒ fulcrum critpath 336ms UNDER-states. Robust bracket:
+A2 0.444 / critpath 0.336 / A−warm−load ~0.5 / B-sleep66 0.732 ⇒ class-C floor ~0.4-0.7s,
+BELOW the advisor's 0.79-1.00s. KEY: full decode-removal is a DEGENERATE oracle — it
+co-collapses the publish-chain it should preserve. ⇒ class-C bounded (≤~0.7s floor ⇒
+infinite clean speedup buys ≤~0.4s/37% of wall), NOT the clean lever Oracle-P is.
+
+### BOTH CEILINGS LANDED — CHECKPOINT
+- Oracle-P (placement-free): **0.41-0.49s** ≤ rapidgzip 0.524s ⇒ PLACEMENT SUFFICIENT.
+- Oracle-C (decode-free): **~0.4-0.7s** (entangled, GREY) ⇒ class-C bounded-secondary.
+- Both land in the same ~0.4-0.7s band because gzippy's two costs (redundant
+  speculation = placement; publish-chain) OVERLAP in the parallel pipeline.
+- IMPLICATION: placement is the proven primary path to the 1.0× tie (faithful rapidgzip
+  boundary-confirmation-ahead port); class-C/class-T secondary. The 5.9s scan_candidate
+  (speculative re-decode) is the single largest recoverable item.
+NEXT: spawn independent disproof advisor (read-only) → plans/step-a-oracle-advisor-verdict.md.
+THEN STOP for supervisor gate. Do NOT start STEP B/C/D or TIER-3.
