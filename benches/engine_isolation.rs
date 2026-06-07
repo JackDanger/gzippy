@@ -191,6 +191,48 @@ mod bench {
             .expect("(iii) isal decode")
     }
 
+    // ── Variant (iv): clean E2/E3/E4 engine via read_clean_e234 ────────────────
+    // Drives the new `Block::read_clean_e234` clean-only sibling (const-generic
+    // E2/E3/E4 flags) and drains via `drain_clean_u8` into a Vec<u8> directly —
+    // same u8-direct sink as variant (ii), so the E-deltas isolate the inner
+    // technique, not the output-traffic component already in (ii).
+    fn decode_var_iv<const E2: bool, const E3: bool, const E4: bool>(
+        deflate: &[u8],
+        start_bit: usize,
+        window: &[u8],
+        target_n: usize,
+    ) -> Vec<u8> {
+        let mut block = Block::new();
+        let mut dummy: Vec<u16> = Vec::new();
+        block
+            .set_initial_window(&mut dummy, window)
+            .expect("prime window (iv)");
+        debug_assert!(
+            !block.contains_marker_bytes(),
+            "(iv) window-primed block must be clean"
+        );
+        let mut sink: Vec<u8> = Vec::with_capacity(target_n + 4096);
+        let mut bits = Bits::at_bit_offset(deflate, start_bit);
+        loop {
+            if block.read_header(&mut bits, false).is_err() {
+                break;
+            }
+            while !block.eob() {
+                if block
+                    .read_clean_e234::<E2, E3, E4>(&mut bits, usize::MAX)
+                    .is_err()
+                {
+                    return sink;
+                }
+                block.drain_clean_u8(&mut sink);
+            }
+            if block.is_last_block() || sink.len() >= target_n {
+                break;
+            }
+        }
+        sink
+    }
+
     fn crc32(b: &[u8]) -> u32 {
         let mut h = crc32fast::Hasher::new();
         h.update(b);
@@ -209,140 +251,220 @@ mod bench {
         (min, median, 100.0 * sigma / mean.max(1e-12))
     }
 
+    // Decode-variant table. Every entry has the SAME signature, so (i)/(ii)/
+    // (iii) and the const-generic (iv) stacks live in one array and share the
+    // interleaved timing + byte-exact gate. Order matters: index 0 = scalar
+    // reference, index 2 = ISA-L oracle (both used as byte-exact denominators).
+    type DecodeFn = fn(&[u8], usize, &[u8], usize) -> Vec<u8>;
+    const VARIANTS: [(&str, DecodeFn); 7] = [
+        ("VAR_I_scalar_u16", decode_var_i),
+        ("VAR_II_E1u8_part", decode_var_ii),
+        ("VAR_III_isal", decode_var_iii),
+        // VAR_IV_E000 is the engine WITH NO TECHNIQUE ON (E2=E3=E4=false). It
+        // is the byte-exactness anchor required by the round-2 charter: it must
+        // be SHA-identical to (i) scalar AND (iii) ISA-L, proving the new
+        // read_clean_e234 entry decodes byte-for-byte like the production
+        // <false> path before any technique can be trusted.
+        ("VAR_IV_E000", decode_var_iv::<false, false, false>),
+        ("VAR_IV_E2", decode_var_iv::<true, false, false>),
+        ("VAR_IV_E23", decode_var_iv::<true, true, false>),
+        ("VAR_IV_E234", decode_var_iv::<true, true, true>),
+    ];
+
+    /// Per-chunk result: median MB/s per variant (index-aligned with VARIANTS)
+    /// and whether every variant was byte-exact vs scalar AND scalar vs ISA-L.
+    struct ChunkResult {
+        med_mbps: [f64; 7],
+        exact: [bool; 7],
+        all_equal: bool,
+        r_iii_i: f64,
+    }
+
+    /// Run the full byte-exact gate + interleaved timing for one seed entry.
+    /// Returns None when the chunk is unusable (wrong window size, not mid-
+    /// stream, or decodes too little).
+    fn run_chunk(deflate: &[u8], entry: &SeedEntry) -> Option<ChunkResult> {
+        if entry.window.len() != MAX_WINDOW_SIZE {
+            return None;
+        }
+        let start_bit = entry.start_bit;
+        let window = &entry.window[..];
+        if !(start_bit > 64 && start_bit / 8 < deflate.len()) {
+            return None;
+        }
+
+        // N_actual from the scalar reference (clamps to BFINAL if early).
+        let probe = decode_var_i(deflate, start_bit, window, REQUESTED_N);
+        let n_actual = probe.len().min(REQUESTED_N);
+        if n_actual < 64 * 1024 {
+            return None;
+        }
+
+        // Decode every variant once for the byte-exact gate.
+        let outs: Vec<Vec<u8>> = VARIANTS
+            .iter()
+            .map(|(_, f)| f(deflate, start_bit, window, n_actual))
+            .collect();
+        let scalar = &outs[0][..n_actual];
+        let isal = &outs[2][..n_actual];
+        let scalar_eq_isal = scalar == isal;
+        // Length-safe exact check: variant must be >= n_actual long AND match
+        // scalar over [0, n_actual) AND scalar must match ISA-L.
+        let mut exact = [false; 7];
+        for (k, o) in outs.iter().enumerate() {
+            exact[k] = o.len() >= n_actual && &o[..n_actual] == scalar && scalar_eq_isal;
+        }
+        let all_equal = exact.iter().all(|&b| b);
+
+        if !all_equal {
+            eprintln!("BYTE-EXACT FAILURE chunk start_bit={start_bit}:");
+            for (k, (label, _)) in VARIANTS.iter().enumerate() {
+                if !exact[k] {
+                    let common = outs[k].len().min(n_actual);
+                    let fd = outs[k][..common]
+                        .iter()
+                        .zip(&scalar[..common])
+                        .position(|(p, q)| p != q);
+                    eprintln!(
+                        "  {label} VOID len={} (n_actual={n_actual}) first_diff={:?} crc={:#010x} (scalar={:#010x})",
+                        outs[k].len(),
+                        fd,
+                        crc32(&outs[k][..common]),
+                        crc32(&scalar[..common])
+                    );
+                    if let Some(d) = fd {
+                        let lo = d.saturating_sub(6);
+                        let hi = (d + 10).min(common);
+                        eprintln!("    scalar[{lo}..{hi}] = {:02x?}", &scalar[lo..hi]);
+                        eprintln!("    {label}[{lo}..{hi}] = {:02x?}", &outs[k][lo..hi]);
+                    }
+                }
+            }
+        }
+
+        // Warm-up (discarded) then interleaved best-of-N.
+        for (_, f) in VARIANTS.iter() {
+            let _ = f(deflate, start_bit, window, n_actual);
+        }
+        let mut times: [Vec<f64>; 7] = Default::default();
+        for _ in 0..ITERS {
+            for (k, (_, f)) in VARIANTS.iter().enumerate() {
+                let s = Instant::now();
+                let r = f(deflate, start_bit, window, n_actual);
+                times[k].push(s.elapsed().as_secs_f64());
+                std::hint::black_box(&r);
+            }
+        }
+
+        let mbps = |secs: f64| (n_actual as f64) / secs / 1e6;
+        let mut med_mbps = [0.0f64; 7];
+        for k in 0..7 {
+            let (_min, med, _sig) = stats(&times[k]);
+            med_mbps[k] = mbps(med);
+        }
+        let r_iii_i = med_mbps[2] / med_mbps[0];
+
+        // Per-chunk report.
+        println!(
+            "CHUNK start_bit={start_bit} N_bytes={n_actual} SHA_ALL_EQUAL={}",
+            if all_equal { "yes" } else { "no" }
+        );
+        for (k, (label, _)) in VARIANTS.iter().enumerate() {
+            if exact[k] {
+                println!(
+                    "  {:<17} MBps_med={:>6.0}  vs_i={:.3} vs_iii={:.3}",
+                    label,
+                    med_mbps[k],
+                    med_mbps[k] / med_mbps[0],
+                    med_mbps[k] / med_mbps[2]
+                );
+            } else {
+                println!("  {:<17} VOID (byte-exact gate failed)", label);
+            }
+        }
+
+        Some(ChunkResult {
+            med_mbps,
+            exact,
+            all_equal,
+            r_iii_i,
+        })
+    }
+
     pub fn run() {
+        // Note the AVX2 status: under Rosetta x86-64-v2 this is false, so E2's
+        // scalar word-copy fallback runs and the byte-exact gate validates IT;
+        // the AVX2 path itself is only exercised (and measured) on the guest.
+        eprintln!("avx2_detected={}", std::is_x86_feature_detected!("avx2"));
         let seed = load_seed();
         assert!(
             seed.len() >= 3,
-            "need >=3 seed entries to pick a mid-stream chunk, got {}",
+            "need >=3 seed entries to sweep, got {}",
             seed.len()
         );
         let deflate = load_deflate();
 
-        // Pick a genuine MID-STREAM clean chunk: median entry by start_bit, with a
-        // full 32 KiB window (so set_initial_window flips clean).
-        let mid = &seed[seed.len() / 2];
-        assert_eq!(
-            mid.window.len(),
-            MAX_WINDOW_SIZE,
-            "chosen seed window is not 32 KiB ({})",
-            mid.window.len()
-        );
-        let start_bit = mid.start_bit;
-        let window = &mid.window[..];
+        // Sweep chunks at 10/30/50/70/90% of the sorted-by-start_bit seed list.
+        // run_chunk() skips entries without a 32 KiB window or too-short decode,
+        // so we over-pick and keep the usable ones.
+        let pct = [10usize, 30, 50, 70, 90];
+        let mut results: Vec<ChunkResult> = Vec::new();
+        let mut median_chunk_idx: Option<usize> = None;
+        for (j, &p) in pct.iter().enumerate() {
+            let idx = (seed.len().saturating_sub(1) * p) / 100;
+            if let Some(r) = run_chunk(&deflate, &seed[idx]) {
+                if j == 2 {
+                    median_chunk_idx = Some(results.len());
+                }
+                results.push(r);
+            }
+        }
         assert!(
-            start_bit > 64 && start_bit / 8 < deflate.len(),
-            "start_bit {start_bit} not mid-stream in {}-byte deflate",
-            deflate.len()
+            !results.is_empty(),
+            "no usable chunks in the sweep (all skipped)"
         );
 
-        // Determine N_actual from variant (i) (clamps to BFINAL if it lands early).
-        let probe_i = decode_var_i(&deflate, start_bit, window, REQUESTED_N);
-        let n_actual = probe_i.len().min(REQUESTED_N);
-        assert!(
-            n_actual >= 64 * 1024,
-            "decoded only {n_actual} bytes — chunk too short, pick a deeper entry"
-        );
-
-        // Byte-exactness gate (the ABSOLUTE requirement).
-        let out_i = decode_var_i(&deflate, start_bit, window, n_actual);
-        let out_ii = decode_var_ii(&deflate, start_bit, window, n_actual);
-        let out_iii = decode_var_iii(&deflate, start_bit, window, n_actual);
-        let a = &out_i[..n_actual];
-        let b = &out_ii[..n_actual];
-        let c = &out_iii[..n_actual];
-
-        let eq_i_ii = a == b;
-        let eq_i_iii = a == c;
-        let all_equal = eq_i_ii && eq_i_iii;
-
-        if !all_equal {
-            eprintln!("BYTE-EXACT FAILURE — outputs diverge:");
-            eprintln!(
-                "  crc i={:#010x} ii={:#010x} iii={:#010x}",
-                crc32(a),
-                crc32(b),
-                crc32(c)
+        // Aggregate: median-of-per-chunk-medians + min/max spread per variant.
+        let med_of = |vals: &mut Vec<f64>| -> f64 {
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            vals[vals.len() / 2]
+        };
+        println!("\nAGGREGATE over {} chunk(s):", results.len());
+        for (k, (label, _)) in VARIANTS.iter().enumerate() {
+            // Only aggregate chunks where this variant passed the gate.
+            let mut vals: Vec<f64> = results
+                .iter()
+                .filter(|r| r.exact[k])
+                .map(|r| r.med_mbps[k])
+                .collect();
+            if vals.is_empty() {
+                println!("  {:<17} VOID (no byte-exact chunk)", label);
+                continue;
+            }
+            let min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let med = med_of(&mut vals);
+            println!(
+                "  {:<17} MBps_med_of_med={:>6.0}  min={:>6.0} max={:>6.0}",
+                label, med, min, max
             );
-            let first_diff = |x: &[u8], y: &[u8]| x.iter().zip(y).position(|(p, q)| p != q);
-            if !eq_i_ii {
-                eprintln!("  (i)vs(ii) first diff at {:?}", first_diff(a, b));
-            }
-            if !eq_i_iii {
-                eprintln!("  (i)vs(iii) first diff at {:?}", first_diff(a, c));
-            }
         }
 
-        // Warm up once (discarded).
-        let _ = decode_var_i(&deflate, start_bit, window, n_actual);
-        let _ = decode_var_ii(&deflate, start_bit, window, n_actual);
-        let _ = decode_var_iii(&deflate, start_bit, window, n_actual);
-
-        // Interleaved best-of-N: i, ii, iii, i, ii, iii, ...
-        let mut t_i = Vec::with_capacity(ITERS);
-        let mut t_ii = Vec::with_capacity(ITERS);
-        let mut t_iii = Vec::with_capacity(ITERS);
-        for _ in 0..ITERS {
-            let s = Instant::now();
-            let r = decode_var_i(&deflate, start_bit, window, n_actual);
-            t_i.push(s.elapsed().as_secs_f64());
-            std::hint::black_box(&r);
-
-            let s = Instant::now();
-            let r = decode_var_ii(&deflate, start_bit, window, n_actual);
-            t_ii.push(s.elapsed().as_secs_f64());
-            std::hint::black_box(&r);
-
-            let s = Instant::now();
-            let r = decode_var_iii(&deflate, start_bit, window, n_actual);
-            t_iii.push(s.elapsed().as_secs_f64());
-            std::hint::black_box(&r);
-        }
-
-        let (min_i, med_i, sig_i) = stats(&t_i);
-        let (min_ii, med_ii, sig_ii) = stats(&t_ii);
-        let (min_iii, med_iii, sig_iii) = stats(&t_iii);
-
-        let mbps = |secs: f64| (n_actual as f64) / secs / 1e6;
-        let mb_i = mbps(med_i);
-        let mb_ii = mbps(med_ii);
-        let mb_iii = mbps(med_iii);
-
-        // Ratios on median MB/s.
-        let r_ii_i = mb_ii / mb_i;
-        let r_iii_i = mb_iii / mb_i;
-        let r_ii_iii = mb_ii / mb_iii;
-
-        // RECALIBRATED round-2: [2.5x,3.6x] (gzippy-scalar-u16 vs pure-ISA-L is
-        // a purer denominator than the 2.1-2.38x system wall ratio).
+        // Self-test on the MEDIAN chunk (the 50% pick), preserved from round-2:
+        // (iii)/(i) should land in [2.5x, 3.6x] on the guest. Under Rosetta the
+        // absolute MB/s are garbage so the ratio can drift — the guest run is
+        // authoritative; we only HARD-gate byte-exactness here.
+        let all_chunks_exact = results.iter().all(|r| r.all_equal);
+        let sha_all = if all_chunks_exact { "yes" } else { "no" };
+        let r_iii_i = median_chunk_idx
+            .map(|i| results[i].r_iii_i)
+            .unwrap_or(results[0].r_iii_i);
         let selftest = r_iii_i >= 2.5 && r_iii_i <= 3.6;
-
-        println!("ENGINE_BENCH start_bit={start_bit} N_bytes={n_actual}");
         println!(
-            "VAR_I   scalar_u16  min={:.6} med={:.6} sigma={:.1}%  MBps_med={:.0}",
-            min_i, med_i, sig_i, mb_i
-        );
-        println!(
-            "VAR_II  E1_u8(part) min={:.6} med={:.6} sigma={:.1}%  MBps_med={:.0}",
-            min_ii, med_ii, sig_ii, mb_ii
-        );
-        println!(
-            "VAR_III isal        min={:.6} med={:.6} sigma={:.1}%  MBps_med={:.0}",
-            min_iii, med_iii, sig_iii, mb_iii
-        );
-        println!(
-            "RATIO ii/i={:.3} iii/i={:.3} ii/iii={:.3}",
-            r_ii_i, r_iii_i, r_ii_iii
-        );
-        println!(
-            "SHA_ALL_EQUAL={}  SELFTEST={}",
-            if all_equal { "yes" } else { "no" },
-            if selftest { "PASS" } else { "FAIL" }
-        );
-        println!(
-            "CRC i={:#010x} ii={:#010x} iii={:#010x}",
-            crc32(a),
-            crc32(b),
-            crc32(c)
+            "\nSHA_ALL_EQUAL={}  SELFTEST={}  (median-chunk iii/i={:.3})",
+            sha_all,
+            if selftest { "PASS" } else { "FAIL" },
+            r_iii_i
         );
         if !selftest {
             eprintln!(

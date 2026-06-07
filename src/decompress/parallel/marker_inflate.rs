@@ -757,6 +757,37 @@ impl Block {
         self.ring_drained = self.ring_pos;
     }
 
+    /// BENCH-ONLY clean-mode drain that mirrors `drain_to_output`'s
+    /// `contains_marker_bytes == false` branch, but appends straight into a
+    /// `Vec<u8>` (the engine-isolation bench's sink). Narrows each ring slot
+    /// u16 -> u8 (clean bytes are guaranteed < 256) and advances
+    /// `ring_drained`. NOT used by production routing.
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    pub fn drain_clean_u8(&mut self, out: &mut Vec<u8>) {
+        let new_bytes = self.ring_pos - self.ring_drained;
+        if new_bytes == 0 {
+            return;
+        }
+        debug_assert!(
+            !self.contains_marker_bytes,
+            "drain_clean_u8 requires clean (window-primed) mode"
+        );
+        out.reserve(new_bytes);
+        for i in 0..new_bytes {
+            let v = self.output_ring[(self.ring_drained + i) % RING_SIZE];
+            debug_assert!((v as usize) < 256, "clean drain emitted marker {v:#x}");
+            out.push(v as u8);
+        }
+        self.ring_drained = self.ring_pos;
+    }
+
     // ── Header parser (deflate.hpp:964-1156) ────────────────────────────────
 
     /// Literal port of `Block::readHeader<treatLastBlockAsError>`
@@ -1442,6 +1473,208 @@ impl Block {
         self.ring_pos = pos;
         self.decoded_bytes += emitted;
         self.distance_to_last_marker_byte = distance_marker;
+        Ok(emitted)
+    }
+
+    /// BENCH-ONLY clean-mode sibling of
+    /// `read_internal_compressed_specialized::<false>` with the round-2
+    /// inner-Huffman techniques layered in behind const-generic flags so the
+    /// engine-isolation bench can measure each stack independently:
+    ///
+    ///   * **E2** — AVX2 32-byte (16-u16) wide back-ref copy in the non-overlap
+    ///     arm, runtime-gated via `is_x86_feature_detected!("avx2")`. Under
+    ///     x86-64-v2 (Rosetta) the scalar word-copy fallback runs and is
+    ///     byte-identical to `emit_backref_ring::<false>`.
+    ///   * **E3** — packed multi-literal store: a TRIPLE_SYM pair/triple
+    ///     (`sym_count >= 2`, all guaranteed < 256) is written with ONE wide
+    ///     u32/u64 store instead of the per-lane shift loop.
+    ///   * **E4** — refill amortized over multiple symbols: the per-iteration
+    ///     `refill()` is elided when ≥ 48 bits are already buffered (a
+    ///     worst-case back-ref). The decode primitives keep their own < 32-bit
+    ///     safety refill, so this stays byte-exact.
+    ///
+    /// With `E2 = E3 = E4 = false` this decodes byte-for-byte identically to
+    /// `read_internal_compressed_specialized::<false>`. Requires CLEAN mode
+    /// (window-primed). NOT wired into production `read()` — bench-only.
+    #[cfg(any(
+        all(
+            feature = "isal-compression",
+            not(feature = "pure-rust-inflate"),
+            target_arch = "x86_64"
+        ),
+        pure_inflate_decode
+    ))]
+    pub fn read_clean_e234<const E2: bool, const E3: bool, const E4: bool>(
+        &mut self,
+        bits: &mut Bits,
+        n_max_to_decode: usize,
+    ) -> Result<usize, BlockError> {
+        debug_assert!(
+            !self.contains_marker_bytes,
+            "read_clean_e234 requires clean (window-primed) mode"
+        );
+        match self.compression_type {
+            CompressionType::FixedHuffman | CompressionType::DynamicHuffman => {
+                if !self.block_huffman_luts_ready {
+                    self.build_huffman_luts_for_block()?;
+                    self.block_huffman_luts_ready = true;
+                }
+            }
+            _ => return Err(BlockError::InvalidCompression),
+        }
+
+        const MAX_LIT_LEN_SYM: u32 = 512;
+        const MAX_RUN_LENGTH: usize = 258;
+        let n_max_to_decode = n_max_to_decode.min(RING_SIZE - MAX_RUN_LENGTH);
+
+        let ring_ptr = self.output_ring.as_mut_ptr();
+        let mut pos = self.ring_pos;
+        let mut emitted: usize = 0;
+
+        // E2 AVX2 dispatch resolved ONCE before the loop. `E2` is const, so
+        // when false the whole product folds to a compile-time `false` and the
+        // AVX2 arm in `emit_backref_ring_clean` is dead-stripped. Under Rosetta
+        // (x86-64-v2, no AVX2) this is false at runtime => scalar fallback.
+        let use_avx2 = E2 && std::is_x86_feature_detected!("avx2");
+
+        macro_rules! commit {
+            ($result:expr) => {{
+                self.ring_pos = pos;
+                self.decoded_bytes += emitted;
+                return $result;
+            }};
+        }
+
+        'outer: while emitted < n_max_to_decode {
+            // E4: amortize the refill across symbols. After a refill bitsleft is
+            // in [56, 63]; a worst-case back-ref consumes ~48 bits, so when ≥ 48
+            // are already buffered the refill is provably a no-op and is skipped.
+            // Without E4 we refill unconditionally (production behaviour).
+            if E4 {
+                if bits.available() < 48 {
+                    bits.refill();
+                }
+            } else {
+                bits.refill();
+            }
+            let (symbol, sym_count, bit_count) = self.lut_litlen_decode(bits);
+            if bit_count == 0 {
+                commit!(Err(BlockError::InvalidHuffmanCode));
+            }
+            bits.consume(bit_count);
+            let mut sym = symbol;
+            let mut sym_count = sym_count;
+
+            // E3: packed multi-literal store. In a TRIPLE_SYM entry only the
+            // first `sym_count - 1` symbols are GUARANTEED literals; the LAST
+            // one (when count reaches 1) may be a length/EOB code (verified on
+            // silesia: e.g. `sym=0x10273 cnt=2` = literal 0x73 + length-258).
+            // So this fast path applies ONLY when the last symbol is ALSO a
+            // literal (`last_code <= 255`) — then all lanes are bytes and we
+            // store them with one wide write, byte-identical to the per-lane
+            // `code & 0xFF` loop. Otherwise fall through to the faithful loop,
+            // which decodes the trailing length code (and its distance bits).
+            if E3 && (sym_count == 2 || sym_count == 3) {
+                let last_code = ((sym >> (8 * (sym_count - 1))) & 0xFFFF) as u16;
+                if last_code <= 255 {
+                    let dst_phys = pos % RING_SIZE;
+                    let b0 = (sym & 0xFF) as u64;
+                    let b1 = ((sym >> 8) & 0xFF) as u64;
+                    if sym_count == 2 && dst_phys + 2 <= RING_SIZE {
+                        // ONE u32 store = two u16 lanes [b0, b1].
+                        unsafe {
+                            (ring_ptr.add(dst_phys) as *mut u32)
+                                .write_unaligned((b0 | (b1 << 16)) as u32);
+                        }
+                        pos += 2;
+                        emitted += 2;
+                        continue 'outer;
+                    } else if sym_count == 3 && dst_phys + 4 <= RING_SIZE {
+                        // ONE u64 store = three u16 lanes [b0, b1, b2] (+ a zero
+                        // overshoot lane at dst+3, overwritten before drain).
+                        let b2 = ((sym >> 16) & 0xFF) as u64;
+                        unsafe {
+                            (ring_ptr.add(dst_phys) as *mut u64)
+                                .write_unaligned(b0 | (b1 << 16) | (b2 << 32));
+                        }
+                        pos += 3;
+                        emitted += 3;
+                        continue 'outer;
+                    }
+                    // else: near a ring wrap → fall through to the scalar loop.
+                }
+            }
+
+            // Faithful multi-symbol unpack — EXACT mirror of
+            // `read_internal_compressed_specialized::<false>` (deflate.hpp:1612).
+            // The `code <= 255 || sym_count > 1` test forces literal
+            // interpretation for every symbol except the last; the last is then
+            // a literal, EOB, or length code.
+            loop {
+                let code = (sym & 0xFFFF) as u16;
+                if code <= 255 || sym_count > 1 {
+                    unsafe {
+                        ring_ptr.add(pos % RING_SIZE).write(code & 0xFF);
+                    }
+                    pos += 1;
+                    emitted += 1;
+                    sym_count -= 1;
+                    if sym_count == 0 {
+                        break;
+                    }
+                    sym >>= 8;
+                    continue;
+                }
+                if code == END_OF_BLOCK_SYMBOL {
+                    self.at_end_of_block = true;
+                    commit!(Ok(emitted));
+                }
+                if (code as u32) > MAX_LIT_LEN_SYM {
+                    commit!(Err(BlockError::InvalidHuffmanCode));
+                }
+                let length = (code as usize).wrapping_sub(254);
+                if length == 0 {
+                    break;
+                }
+                let dsym = match self.dist_hc.decode(bits) {
+                    Some(d) => d,
+                    None => commit!(Err(BlockError::InvalidHuffmanCode)),
+                };
+                if dsym as usize >= DISTANCE_BASE.len() {
+                    commit!(Err(BlockError::InvalidHuffmanCode));
+                }
+                let extra = DISTANCE_EXTRA[dsym as usize] as u32;
+                let distance = if extra > 0 {
+                    if bits.available() < extra {
+                        bits.refill();
+                        if bits.available() < extra {
+                            commit!(Err(BlockError::EndOfFile));
+                        }
+                    }
+                    let mask = (1u64 << extra) - 1;
+                    let v = (bits.peek() & mask) as usize;
+                    bits.consume(extra);
+                    DISTANCE_BASE[dsym as usize] as usize + v
+                } else {
+                    DISTANCE_BASE[dsym as usize] as usize
+                };
+                if distance == 0 || distance > MAX_WINDOW_SIZE {
+                    commit!(Err(BlockError::ExceededWindowRange));
+                }
+                // Clean-mode distance check (vendor deflate.hpp:1652-1655).
+                if distance > self.decoded_bytes + emitted {
+                    commit!(Err(BlockError::ExceededWindowRange));
+                }
+                unsafe {
+                    emit_backref_ring_clean(ring_ptr, &mut pos, distance, length, use_avx2);
+                }
+                self.record_backreference_for_sparsity(distance, length, emitted);
+                emitted += length;
+                break;
+            }
+        }
+        self.ring_pos = pos;
+        self.decoded_bytes += emitted;
         Ok(emitted)
     }
 
@@ -2294,6 +2527,142 @@ pub(crate) unsafe fn emit_backref_ring<const CONTAINS_MARKERS: bool>(
             }
         }
         *distance_marker += length;
+    }
+}
+
+/// BENCH-ONLY clean-mode back-ref copy with the E2 AVX2 32-byte wide path.
+/// No marker-counter maintenance (clean path only). `use_avx2` is resolved by
+/// the caller via `is_x86_feature_detected!("avx2")`; when false (e.g. Rosetta
+/// x86-64-v2) the scalar word-copy fallback runs and is byte-identical to
+/// `emit_backref_ring::<false>`'s non-overlap / RLE / overlap arms.
+///
+/// SAFETY: `ring_ptr` must be valid for all physical indices `[0, RING_SIZE)`;
+/// `*pos` is the logical write position. Same contract as `emit_backref_ring`.
+#[cfg(any(
+    all(
+        feature = "isal-compression",
+        not(feature = "pure-rust-inflate"),
+        target_arch = "x86_64"
+    ),
+    pure_inflate_decode
+))]
+#[inline]
+unsafe fn emit_backref_ring_clean(
+    ring_ptr: *mut u16,
+    pos: &mut usize,
+    distance: usize,
+    length: usize,
+    use_avx2: bool,
+) {
+    let src_phys = (*pos + RING_SIZE - distance) % RING_SIZE;
+    let dst_phys = *pos % RING_SIZE;
+
+    if distance >= length {
+        // E2: AVX2 32-byte (16-u16) wide copy. Safe only when `distance >= 16`
+        // u16 (32 bytes) — the 32-byte stride then never aliases the just-
+        // written dest for the REAL output bytes (each real byte at src+i with
+        // i < length*2 <= distance*2 is read before any write reaches it; the
+        // rounded-up overshoot lies AHEAD of the advanced `*pos`, is overwritten
+        // before drain, and is never read as a back-ref source) — and when the
+        // rounded run fits the ring without wrapping.
+        let rounded16 = (length + 15) & !15;
+        let did_avx2 = if use_avx2
+            && distance >= 16
+            && src_phys + rounded16 <= RING_SIZE
+            && dst_phys + rounded16 <= RING_SIZE
+        {
+            emit_avx2_copy_u16(
+                ring_ptr.add(src_phys) as *const u8,
+                ring_ptr.add(dst_phys) as *mut u8,
+                rounded16,
+            );
+            true
+        } else {
+            false
+        };
+
+        if !did_avx2 {
+            // Scalar word-copy fallback — byte-identical to `emit_backref_ring`
+            // (see the SAFETY / overshoot reasoning there).
+            let rounded = (length + 3) & !3;
+            let src_round_fits = src_phys + rounded <= RING_SIZE;
+            let dst_round_fits = dst_phys + rounded <= RING_SIZE;
+            if distance >= 4 && src_round_fits && dst_round_fits {
+                let s = ring_ptr.add(src_phys) as *const u8;
+                let d = ring_ptr.add(dst_phys) as *mut u8;
+                (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
+                if length > 4 {
+                    if length <= 8 {
+                        (d.add(8) as *mut u64)
+                            .write_unaligned((s.add(8) as *const u64).read_unaligned());
+                    } else {
+                        let mut s = s.add(8);
+                        let mut d = d.add(8);
+                        let dend = (ring_ptr.add(dst_phys + rounded)) as *mut u8;
+                        while d < dend {
+                            (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
+                            s = s.add(8);
+                            d = d.add(8);
+                        }
+                    }
+                }
+            } else if src_phys + length <= RING_SIZE && dst_phys + length <= RING_SIZE {
+                let src = ring_ptr.add(src_phys);
+                let dst = ring_ptr.add(dst_phys);
+                for i in 0..length {
+                    dst.add(i).write(*src.add(i));
+                }
+            } else {
+                for i in 0..length {
+                    let v = *ring_ptr.add((src_phys + i) % RING_SIZE);
+                    ring_ptr.add((dst_phys + i) % RING_SIZE).write(v);
+                }
+            }
+        }
+        *pos += length;
+    } else if distance == 1 {
+        let v = *ring_ptr.add((*pos + RING_SIZE - 1) % RING_SIZE);
+        if dst_phys + length <= RING_SIZE {
+            let dst = std::slice::from_raw_parts_mut(ring_ptr.add(dst_phys), length);
+            dst.fill(v);
+        } else {
+            for i in 0..length {
+                ring_ptr.add((dst_phys + i) % RING_SIZE).write(v);
+            }
+        }
+        *pos += length;
+    } else {
+        for i in 0..length {
+            let v = *ring_ptr.add((src_phys + i) % RING_SIZE);
+            ring_ptr.add((dst_phys + i) % RING_SIZE).write(v);
+        }
+        *pos += length;
+    }
+}
+
+/// E2 AVX2 copy helper: copies `n_u16` u16 slots (a multiple of 16, i.e. a
+/// multiple of 32 bytes) forward in 32-byte `_mm256` load/store steps. Only
+/// called when the caller has verified `is_x86_feature_detected!("avx2")` and
+/// `distance >= 16` u16 (so the real output bytes never alias an earlier
+/// write). Compiles under x86-64-v2 (the `target_feature` attribute makes the
+/// AVX2 intrinsics available) but is never CALLED there.
+#[cfg(any(
+    all(
+        feature = "isal-compression",
+        not(feature = "pure-rust-inflate"),
+        target_arch = "x86_64"
+    ),
+    pure_inflate_decode
+))]
+#[target_feature(enable = "avx2")]
+unsafe fn emit_avx2_copy_u16(mut src: *const u8, mut dst: *mut u8, n_u16: usize) {
+    use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
+    let end = dst.add(n_u16 * 2);
+    while dst < end {
+        let v = _mm256_loadu_si256(src as *const __m256i);
+        _mm256_storeu_si256(dst as *mut __m256i, v);
+        src = src.add(32);
+        dst = dst.add(32);
     }
 }
 
