@@ -738,7 +738,8 @@ fn drive_impl<W: std::io::Write>(
             use crate::decompress::parallel::gzip_chunk::{
                 BAD_SEED_RESYNC, BULK_TAIL_RESUMABLE_FALLBACK, FINISHED_NO_FLIP_CHUNKS,
                 FINISH_DECODE_ENTRIES, FLIP_TO_CLEAN_CHUNKS, HANDOFF_WINDOW_BUF_GROWS,
-                INFLATE_WRAPPER_CHUNKS, WINDOW_SEEDED_CHUNKS,
+                INFLATE_WRAPPER_CHUNKS, ISAL_ENGINE_ORACLE_CHUNKS, ISAL_ENGINE_ORACLE_FALLBACKS,
+                WINDOW_SEEDED_CHUNKS,
             };
             eprintln!(
             "  Unified decoder: flip_to_clean={} finished_no_flip={} finish_decode={} inflate_wrapper={} window_seeded={} bad_seed_resync={} resumable_resync_calls={} handoff_window_grows={}",
@@ -751,6 +752,11 @@ fn drive_impl<W: std::io::Write>(
             BULK_TAIL_RESUMABLE_FALLBACK.load(Ordering::Relaxed),
             HANDOFF_WINDOW_BUF_GROWS.load(Ordering::Relaxed),
         );
+            eprintln!(
+                "  ISA-L ENGINE ORACLE (measurement-only): isal_oracle_chunks={} isal_oracle_fallbacks={}",
+                ISAL_ENGINE_ORACLE_CHUNKS.load(Ordering::Relaxed),
+                ISAL_ENGINE_ORACLE_FALLBACKS.load(Ordering::Relaxed),
+            );
         }
         use crate::decompress::parallel::chunk_buffer_pool::*;
         eprintln!(
