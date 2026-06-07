@@ -1169,8 +1169,35 @@ fn decode_huffman_body_resumable(
     // so the FASTLOOP and SAFE loop produce bit-identical output and the
     // FASTLOOP→SAFE handoff carries exactly the same `bitbuf` / `bitsleft`
     // / `in_pos` state regardless of which loop emitted a given symbol.
+    // Slow-knob snapshot (read ONCE, before the hot loop, into hoistable
+    // locals — declared before the macro so its body resolves them in this
+    // scope). `slow_spin == 0` when OFF, making the per-event injection a
+    // single predicted branch the optimizer hoists. See parallel::slow_knob.
+    let slow_spin: u64 = crate::decompress::parallel::slow_knob::spin_iters();
+    let slow_yield: bool = crate::decompress::parallel::slow_knob::yield_kind();
+
     macro_rules! decode_one_symbol {
         ($refill:ident) => {{
+            // Causal-perturbation slow-injection knob (CLEAN-mode inner loop).
+            // SITE NOTE (corrected 2026-06-06): resumable IS the clean decoder
+            // ONLY on the gzippy-ISAL build (Engine C / StreamingInflateWrapper,
+            // the two-phase FlipToClean tail). On gzippy-NATIVE (the default
+            // perf build and the 1.0× bar) the fold keeps Engine M
+            // (marker_inflate::Block) decoding the clean tail in-place
+            // (gzip_chunk.rs:1219, `not(isal_clean_tail)`), so ~99% of clean
+            // bytes decode through marker_inflate's CONTAINS_MARKERS=false arm,
+            // NOT here. This injection is therefore the correct site for the
+            // gzippy-ISAL CONTROL build; the NATIVE pre-gate fires the sibling
+            // injection in marker_inflate.rs. One injection per macro expansion
+            // = one primary decode event (this body emits 1-3 chained literals
+            // OR one match), keeping added work ∝ decode events. `slow_spin`
+            // is a hoistable local snapshotted ONCE before the outer loop; it
+            // is `0` (a single predicted branch, byte- and perf-transparent —
+            // DUAL-SHA gate) unless GZIPPY_SLOW_MODE is set. The injected work
+            // only touches a black-boxed scratch accumulator — never `bitbuf`/
+            // `bitsleft`/`out_pos`/`entry`. See parallel::slow_knob.
+            crate::decompress::parallel::slow_knob::inject(slow_spin, slow_yield);
+
             // saved_bitbuf for length / dist-extra extraction. Captured
             // BEFORE consume so the same bits the entry was decoded from
             // are available for extra-bit reads.

@@ -119,6 +119,9 @@ fn main() {
     // Debug-only memory accounting (no-op unless GZIPPY_MEM_STATS is set).
     // Emitted here because `process::exit` below skips destructors.
     decompress::inflate::mem_stats::report();
+    // Instrument-validity hit counter (no-op unless GZIPPY_SLOW_HITS=1) — proves
+    // the slow-knob injection site is the live native clean loop (TASK 1).
+    decompress::parallel::slow_knob::report_hits();
 
     match result {
         Ok(exit_code) => process::exit(exit_code),

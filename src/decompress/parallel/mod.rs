@@ -60,6 +60,9 @@ pub mod segmented_buffer;
 #[cfg(parallel_sm)]
 pub mod segmented_markers;
 pub mod single_member;
+/// Byte-transparent env-gated slow-injection knob for the clean-mode inner
+/// decode loop (causal-perturbation pre-gate). See `slow_knob.rs`.
+pub mod slow_knob;
 pub mod sm_cfg;
 #[cfg(parallel_sm)]
 pub mod sm_driver;
